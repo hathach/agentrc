@@ -1,8 +1,10 @@
 # Agent compatibility
 - This is the canonical user-wide instruction file for Claude Code and Codex.
   Keep its wording LLM-neutral and keep `~/.codex/AGENTS.md` as a symlink to it.
-- Same pattern in repos: `CLAUDE.md` and `.claude/{agents,skills,workflows}` are
-  canonical; keep `AGENTS.md -> CLAUDE.md` and `.agents -> .claude`.
+- In repos that adopt the same layout, `CLAUDE.md` and
+  `.claude/{agents,skills,workflows}` are canonical; keep `AGENTS.md ->
+  CLAUDE.md` and `.agents -> .claude`. Migrating a repo to it is its own task,
+  never a side effect.
 
 # Working rules
 Bias toward caution over speed. For trivial tasks, use judgment.
@@ -37,8 +39,10 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   system configs) without asking for permission or a password.
 - Still confirm with me before destructive or irreversible actions
   (deleting data, wiping/formatting, force-overwriting configs)
-- Worktrees: for branch or multi-step work, `git worktree add
-  .worktrees/<branch> -b <branch>`; never switch the primary checkout.
+- Worktrees: for branch or multi-step work use a worktree under
+  `.worktrees/<branch>`; never switch the primary checkout. Reuse the task's
+  existing worktree; create one (`git worktree add .worktrees/<branch> -b
+  <branch>`, or without `-b` for an existing branch) only when there is none.
   Concurrent writers need separate worktrees; otherwise yield the worktree
   until delegated edits finish.
 
@@ -55,7 +59,8 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 - Same rule for commit messages and PR descriptions: imperative subject, and a
   body only when there is a *why* the diff cannot show (cause, trade-off,
   measurement, spec/issue reference). A one-line message is a fine message.
-  Keep scope focused, link relevant issues, and include test/build evidence.
+- PR descriptions: keep scope focused, link relevant issues, and state the
+  test/build evidence there rather than in commit bodies.
 - Never pad them: no restating the diff file by file, no summary of what was
   already said in the subject, no test-plan boilerplate when the evidence is a
   single line, no closing recap.
@@ -81,16 +86,19 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 # Collaboration
 - `peer-agent` is for read-only consultation with another agent session in
   the same worktree; it is a peer, not a subagent.
-- Use `/codex:review` for independent read-only review,
-  `/codex:adversarial-review` to challenge a design, and `/codex:rescue` for
-  bounded implementation or diagnosis.
+- In Claude Code, `/codex:review` gives an independent read-only review,
+  `/codex:adversarial-review` challenges a design, and `/codex:rescue` hands
+  off bounded implementation or diagnosis. In Codex these have no equivalent;
+  use `peer-agent` or say the step was skipped.
 
 # Follow-ups
-- Separate scope gets a separate PR/session. Create one GitHub issue per topic
-  with the repo's follow-up label; link the originating PR and preserve the
-  full handoff in the issue body: evidence, remaining work, and why deferred.
-  Add revalidation, new findings and changes to remaining work as issue
-  comments. Close the issue when its implementing PR lands.
+- Separate scope gets a separate PR/session. Where the repo has an issue
+  tracker, create one issue per deferred topic, labelled as the repo's
+  follow-up convention if it has one; link the originating PR or session and
+  preserve the full handoff in the issue body: evidence, remaining work, and
+  why deferred. Add revalidation, new findings and changes to remaining work
+  as issue comments. Close the issue when its implementing PR lands. Without a
+  tracker, put the same handoff in the final message.
 
 # Reference docs
 - Hardware manuals, datasheets, reference manuals, errata, schematics and spec

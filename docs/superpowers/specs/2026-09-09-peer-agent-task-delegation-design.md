@@ -2,13 +2,13 @@
 
 Date: 2026-09-09
 Status: reference only. Drafted by a smaller model; kept as prior art for the
-problem framing. A fresh design supersedes it before any implementation.
+problem framing. Do not implement this draft; write a fresh design first.
 
 ## Goal
 
 `peer-agent` today is read-only by convention: `AUTHORITY` defaults to "no
 edits, no commits" and every request restates it. That covers review and
-investigation but not "go do this and report back" — tinyusb issue #3901. Add a
+investigation but not "go do this and report back" — hathach/tinyusb#3901. Add a
 second envelope pair, `PEER TASK REQUEST` / `PEER TASK RESULT`, that lets a
 peer edit and commit inside a workspace the caller assigns it, and defines
 what it must report back so the caller can verify rather than trust.
@@ -20,10 +20,10 @@ what it must report back so the caller can verify rather than trust.
   whatever that operator gave it. `AUTHORITY` cannot grant more than that,
   and nothing here stops an operator's peer from ignoring the envelope. Real
   enforcement — a sandbox that makes disobedience impossible — is
-  `codex-agent.py`'s domain and is tinyusb issue #3903's problem, not this one.
+  `codex-agent.py`'s domain and is hathach/tinyusb#3903's problem, not this one.
 - **This change does not touch `codex-agent.py`.** `READ_ONLY_ROLES` and any
   future capability table stay exactly as they are. The shared
-  workspace/result shape below is a candidate integration point for #3903,
+  workspace/result shape below is a candidate integration point for hathach/tinyusb#3903,
   not a dependency it needs.
 - **The existing review envelope (`PEER CONSULT` / `PEER RESULT`) is
   unchanged.** Task delegation is a new, separate pair, not new optional
