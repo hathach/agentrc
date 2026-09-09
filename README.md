@@ -1,22 +1,19 @@
 # agentrc
 
 Personal agent config shared by Claude Code and Codex: user-wide instructions,
-skills, commands and hooks, versioned in git and installed into `~/.claude` by
-symlink.
-
-Layout mirrors a Claude Code plugin, so adding `.claude-plugin/plugin.json`
-later would turn it into one without moving files. It is deliberately not
-installed as a plugin: personal skills are invoked by bare name instead of
-`plugin:skill`, and edits are live with no reinstall step.
+skills, commands and hooks, versioned in git.
 
 ```
-CLAUDE.md   user-wide instructions (~/.codex/AGENTS.md symlinks here too)
-skills/     ~/.claude/skills
-commands/   ~/.claude/commands
-hooks/      ~/.claude/hooks
+CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
+skills/           ~/.claude/skills
+commands/         ~/.claude/commands
+hooks/            ~/.claude/hooks, plus hooks.json for the plugin route
+.claude-plugin/   plugin and marketplace manifests
 ```
 
-## Install on a new machine
+## Install by symlink (preferred)
+
+Skills are invoked by bare name and edits are live with no reinstall step.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
@@ -40,3 +37,16 @@ Verify with:
 ```sh
 readlink -f ~/.claude/CLAUDE.md ~/.claude/skills ~/.claude/commands ~/.claude/hooks ~/.codex/AGENTS.md
 ```
+
+## Install as a plugin
+
+The repo is also its own marketplace, so it installs directly:
+
+```
+/plugin marketplace add hathach/agentrc
+/plugin install agentrc@hathach
+```
+
+Skills are then namespaced as `agentrc:<skill>` and hooks come from
+`hooks/hooks.json`. Do not combine this with the symlink install on the same
+machine or every hook fires twice.

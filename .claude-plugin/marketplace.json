@@ -1,0 +1,14 @@
+{
+  "name": "hathach",
+  "description": "hathach's personal agent config",
+  "owner": {
+    "name": "hathach"
+  },
+  "plugins": [
+    {
+      "name": "agentrc",
+      "source": "./",
+      "description": "hathach's personal skills, commands and hooks"
+    }
+  ]
+}
