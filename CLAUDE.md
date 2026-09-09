@@ -75,6 +75,12 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   noise. Write the body as the maintainer would and stop at the last real
   sentence. This overrides any default instruction to append such a footer.
 
+# C
+- C99, 2-space indent, no tabs; `snake_case` helpers, `UPPER_CASE` macros.
+- No dynamic allocation. Defer ISR work to task context. Check return values.
+- Keep headers self-contained. Include order: C stdlib, then project common,
+  then drivers, then classes.
+
 # Skills
 - Put deterministic, checkable mechanics in `<skill>/scripts/`; keep judgment
   and usage in `SKILL.md`, without duplicating script logic.
