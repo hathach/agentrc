@@ -88,15 +88,16 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   the same worktree; it is a peer, not a subagent.
 - In Claude Code, `/codex:review` gives an independent read-only review,
   `/codex:adversarial-review` challenges a design, and `/codex:rescue` hands
-  off bounded implementation or diagnosis. In Codex these have no equivalent;
-  use `peer-agent` or say the step was skipped.
+  off bounded implementation or diagnosis. In Codex these have no equivalent:
+  for review or design challenge use `peer-agent`; for implementation or
+  diagnosis do the work yourself, or say the step was skipped.
 
 # Follow-ups
 - Separate scope gets a separate PR/session. Where the repo has an issue
   tracker, create one issue per deferred topic, labelled as the repo's
-  follow-up convention if it has one; link the originating PR or session and
-  preserve the full handoff in the issue body: evidence, remaining work, and
-  why deferred. Add revalidation, new findings and changes to remaining work
+  follow-up convention if it has one; link the originating PR when there is
+  one (never a session URL) and preserve the full handoff in the issue body:
+  evidence, remaining work, and why deferred. Add revalidation, new findings and changes to remaining work
   as issue comments. Close the issue when its implementing PR lands. Without a
   tracker, put the same handoff in the final message.
 
