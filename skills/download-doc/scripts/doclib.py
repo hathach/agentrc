@@ -388,8 +388,8 @@ class Library:
     @staticmethod
     def _server_creds():
         """Optional write-through-the-GUI credentials, read from the gitignored
-        `~/.config/download-doc/secret.yml` (or `$DOWNLOAD_DOC_SECRET`) so they are
-        never typed into a command by hand:
+        `secret.yml` beside SKILL.md (or `$DOWNLOAD_DOC_SECRET`) so they are never
+        typed into a command by hand:
 
             calibre:
               server_url: http://localhost:8080
@@ -401,13 +401,9 @@ class Library:
         username and password -> Add user, with write access). With one defined,
         imports work while the GUI is open instead of waiting for the lock.
         """
-        # User-level skill: config lives under ~/.config; the homelab repo's secret.yml
-        # is where the block historically lived, so it stays a fallback.
-        candidates = [Path(os.environ["DOWNLOAD_DOC_SECRET"])] if os.environ.get("DOWNLOAD_DOC_SECRET") else []
-        candidates += [Path.home() / ".config" / "download-doc" / "secret.yml",
-                       Path.home() / "code" / "homelab" / "secret.yml"]
-        f = next((c for c in candidates if c.exists()), None)
-        if f is None:
+        env = os.environ.get("DOWNLOAD_DOC_SECRET")
+        f = Path(env) if env else Path(__file__).resolve().parent.parent / "secret.yml"
+        if not f.exists():
             return None
         blk = re.search(r"^calibre:\s*$(.*?)(?=^\S|\Z)", f.read_text(), re.M | re.S)
         if not blk:
