@@ -1,6 +1,6 @@
 {
   "name": "agentrc",
-  "description": "hathach's personal skills, commands and hooks",
+  "description": "hathach's personal skills and commands",
   "version": "0.1.0",
   "author": { "name": "hathach" }
 }
