@@ -402,9 +402,14 @@ class Library:
         imports work while the GUI is open instead of waiting for the lock.
         """
         env = os.environ.get("DOWNLOAD_DOC_SECRET")
-        f = Path(env) if env else Path(__file__).resolve().parent.parent / "secret.yml"
-        if not f.exists():
-            return None
+        if env:
+            f = Path(env).expanduser()
+            if not f.exists():
+                raise FileNotFoundError(f"DOWNLOAD_DOC_SECRET points at a missing file: {f}")
+        else:
+            f = Path(__file__).resolve().parent.parent / "secret.yml"
+            if not f.exists():
+                return None
         blk = re.search(r"^calibre:\s*$(.*?)(?=^\S|\Z)", f.read_text(), re.M | re.S)
         if not blk:
             return None

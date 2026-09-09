@@ -73,6 +73,9 @@ part. Re-derive from datasheets (`pdftotext -f 1 -l 6 … | grep -i otg`), not r
 
 ## Before you touch the library
 
+Every command below runs from the skill directory (`~/.claude/skills/download-doc`
+once installed); the scripts import each other by bare name.
+
 Run the plan first and *read it*:
 
 ```bash
