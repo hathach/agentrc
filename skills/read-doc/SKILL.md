@@ -41,13 +41,14 @@ Not for general concepts, repo/code questions, or when no such doc is likely.
 ## Find
 
 Keywords supplied as skill arguments, else derived from the question (part
-number, peripheral, spec name). `search.py` ANDs them across every metadata
+number, peripheral, spec name). `search.py` sits beside this SKILL.md; run it
+from wherever the skill was loaded. It ANDs the keywords across every metadata
 field and prints the best matches first — at most 40, and the header says when
 more matched:
 
 ```bash
-python3 ~/.claude/skills/read-doc/search.py errata RT1064      # AND (default)
-python3 ~/.claude/skills/read-doc/search.py RT1060 RT1064 --any
+python3 <skill dir>/search.py errata RT1064      # AND (default)
+python3 <skill dir>/search.py RT1060 RT1064 --any
 ```
 
 Exit 0 matched, 1 nothing matched, 2 bad usage or no library — 2 means the

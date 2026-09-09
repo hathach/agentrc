@@ -4,6 +4,7 @@ Personal agent config shared by Claude Code and Codex: user-wide instructions,
 skills and commands, versioned in git.
 
 ```
+install.sh        symlink this checkout into ~/.claude and ~/.codex
 CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
 skills/           ~/.claude/skills
 commands/         ~/.claude/commands
@@ -16,20 +17,14 @@ Skills are invoked by bare name and edits are live with no reinstall step.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
-mkdir -p ~/.claude ~/.codex
-for d in skills commands; do
-  rmdir ~/.claude/$d 2>/dev/null
-  ln -s ~/code/agentrc/$d ~/.claude/$d
-done
-ln -s ~/code/agentrc/CLAUDE.md ~/.claude/CLAUDE.md
-ln -s ../.claude/CLAUDE.md ~/.codex/AGENTS.md
+~/code/agentrc/install.sh
 ```
 
-Verify with:
-
-```sh
-readlink -f ~/.claude/CLAUDE.md ~/.claude/skills ~/.claude/commands ~/.codex/AGENTS.md
-```
+This links `CLAUDE.md`, `skills/` and `commands/` into `~/.claude`, points
+`~/.codex/AGENTS.md` at the same `CLAUDE.md`, and links each skill into
+`~/.codex/skills` (Codex scans that directory, not `~/.claude/skills`, and
+manages `.system` inside it, so skills are linked one by one). Rerun it after
+adding a skill so Codex picks it up.
 
 ## Install as a plugin
 
