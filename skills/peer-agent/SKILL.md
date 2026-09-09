@@ -7,8 +7,8 @@ description: Use when you want to ask a peer, collab with a peer, or otherwise r
 
 A Herdr pane in this worktree may hold another agent session. It is a peer, not
 a subagent: its own conversation, its own memory, and no knowledge of anything
-you have not told it. The channel is symmetric — Codex reaches this file through
-the `.agents -> .claude` symlink and uses the same commands.
+you have not told it. The channel is symmetric: Claude and Codex both load this
+skill and use the same commands.
 
 `scripts/peer.py` owns the mechanics. This file is the judgment.
 
