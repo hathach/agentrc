@@ -1,7 +1,8 @@
 # Peer-Agent Task Delegation
 
 Date: 2026-09-09
-Branch: `fix-3901`
+Status: reference only. Drafted by a smaller model; kept as prior art for the
+problem framing. A fresh design supersedes it before any implementation.
 
 ## Goal
 
