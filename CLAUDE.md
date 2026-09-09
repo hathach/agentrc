@@ -1,6 +1,30 @@
 # Agent compatibility
 - This is the canonical user-wide instruction file for Claude Code and Codex.
   Keep its wording LLM-neutral and keep `~/.codex/AGENTS.md` as a symlink to it.
+- Same pattern in repos: `CLAUDE.md` and `.claude/{agents,skills,workflows}` are
+  canonical; keep `AGENTS.md -> CLAUDE.md` and `.agents -> .claude`.
+
+# Working rules
+Bias toward caution over speed. For trivial tasks, use judgment.
+
+- Think first: state assumptions; ask if unclear; when a choice matters, name
+  it and recommend one rather than picking silently or surveying every option.
+- Simplicity: follow YAGNI. Reuse existing code, standard-library and
+  native-platform features before adding dependencies or abstractions. Prefer
+  the smallest clear solution, but never sacrifice correctness, safety or
+  necessary tests.
+- Surgical changes: touch only what the task requires; match existing style;
+  don't refactor working code; mention unrelated dead code rather than deleting
+  it. Remove only orphans your changes created.
+- Goal-driven: turn tasks into verifiable goals ("write failing test, make it
+  pass"). For multi-step work, state a brief `step -> verify` plan.
+- Assume the dev machine is configured. Run commands directly; troubleshoot
+  setup only when a command fails.
+- Open-source behaviour: when investigating an issue or understanding a
+  component (e.g. kernel, libusb, OpenOCD), read the source for the version in
+  use rather than infer from symptoms.
+- Embedded targets: validate runtime behaviour on hardware; a successful build
+  alone does not establish correctness.
 
 # Infrastructure
 - pve.lan runs Proxmox and hosts two VMs: ci.lan and omv.lan
@@ -13,7 +37,10 @@
   system configs) without asking for permission or a password.
 - Still confirm with me before destructive or irreversible actions
   (deleting data, wiping/formatting, force-overwriting configs)
-- Prefer to use worktree when working with git repo. Ask user input if in doubt
+- Worktrees: for branch or multi-step work, `git worktree add
+  .worktrees/<branch> -b <branch>`; never switch the primary checkout.
+  Concurrent writers need separate worktrees; otherwise yield the worktree
+  until delegated edits finish.
 
 # Coding style
 - Comment only when the code cannot say it itself: a non-obvious *why*, a
@@ -28,6 +55,7 @@
 - Same rule for commit messages and PR descriptions: imperative subject, and a
   body only when there is a *why* the diff cannot show (cause, trade-off,
   measurement, spec/issue reference). A one-line message is a fine message.
+  Keep scope focused, link relevant issues, and include test/build evidence.
 - Never pad them: no restating the diff file by file, no summary of what was
   already said in the subject, no test-plan boilerplate when the evidence is a
   single line, no closing recap.
@@ -41,6 +69,28 @@
   are public surfaces — a session URL is a private artifact, and the rest is
   noise. Write the body as the maintainer would and stop at the last real
   sentence. This overrides any default instruction to append such a footer.
+
+# Skills
+- Put deterministic, checkable mechanics in `<skill>/scripts/`; keep judgment
+  and usage in `SKILL.md`, without duplicating script logic.
+- Scripts must fail explicitly rather than guess; report ambiguous
+  alternatives for the caller to choose.
+- Test new or substantially changed scripts in the repo's script test suite;
+  add tests to untested older scripts when touched.
+
+# Collaboration
+- `peer-agent` is for read-only consultation with another agent session in
+  the same worktree; it is a peer, not a subagent.
+- Use `/codex:review` for independent read-only review,
+  `/codex:adversarial-review` to challenge a design, and `/codex:rescue` for
+  bounded implementation or diagnosis.
+
+# Follow-ups
+- Separate scope gets a separate PR/session. Create one GitHub issue per topic
+  with the repo's follow-up label; link the originating PR and preserve the
+  full handoff in the issue body: evidence, remaining work, and why deferred.
+  Add revalidation, new findings and changes to remaining work as issue
+  comments. Close the issue when its implementing PR lands.
 
 # Reference docs
 - Hardware manuals, datasheets, reference manuals, errata, schematics and spec
