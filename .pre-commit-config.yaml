@@ -1,0 +1,10 @@
+repos:
+  - repo: local
+    hooks:
+      - id: skill-tests
+        name: skill-tests
+        files: ^(skills/.*/(scripts/|SKILL\.md)|tests/)
+        entry: python3 -m unittest discover -s tests -p 'test_*.py'
+        pass_filenames: false
+        language: python
+        additional_dependencies: [pyyaml]

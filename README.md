@@ -8,6 +8,7 @@ install.sh        symlink this checkout into ~/.claude and ~/.codex
 CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
 skills/           ~/.claude/skills
 commands/         ~/.claude/commands
+tests/            unit tests for skill scripts
 .claude-plugin/   plugin and marketplace manifests
 ```
 
@@ -41,3 +42,11 @@ The repo is also its own marketplace, so it installs directly:
 
 Skills are then namespaced as `agentrc:<skill>`. Do not combine this with the
 symlink install on the same machine or every skill shows up twice.
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+The same command runs from the pre-commit hook (`pre-commit install`).
