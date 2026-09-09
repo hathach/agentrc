@@ -141,8 +141,7 @@ def enumerate_docs(types=None, device="Arm MCU", limit=None) -> list:
             start += len(results)
             if limit and len(out) >= limit:
                 break
-            if start < total:
-                time.sleep(PACE_SECONDS)
+            time.sleep(PACE_SECONDS)
     return list(out.values())
 
 

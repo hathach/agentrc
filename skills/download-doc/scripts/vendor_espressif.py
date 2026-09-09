@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -77,6 +78,7 @@ def _index_html(refresh: bool = False) -> str:
     data = http_get(INDEX, timeout=45, accept="text/html",
                     validate=lambda b: b"views-field-field-version" in b)
     f.write_bytes(data)
+    time.sleep(1)
     return data.decode("utf-8", errors="replace")
 
 

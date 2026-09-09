@@ -6,6 +6,8 @@ description: Enumerate, download, and import vendor hardware documentation — d
 # download-doc
 
 Fetch vendor documentation into the Calibre library, and keep it current.
+`CALIBRE_LIBRARY` overrides the library location for every script here, the same
+variable `read-doc` honours; imports and replacements then target that library.
 
 The library at `~/Documents/calibre-library` is the house archive of hardware docs
 (~3,000 books). It is also the first place to look before searching the web for a
