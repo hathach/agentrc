@@ -11,12 +11,13 @@ claimable() {
   echo "install.sh: $1 exists and is not a symlink; move it aside first" >&2
   return 1
 }
-dests="$HOME/.claude/skills $HOME/.claude/commands $HOME/.claude/CLAUDE.md $HOME/.codex/AGENTS.md"
-for s in "$repo"/skills/*/; do
-  dests="$dests $HOME/.codex/skills/$(basename "$s")"
-done
-for p in $dests; do claimable "$p"; done
-for p in $dests; do [ -d "$p" ] && [ ! -L "$p" ] && rmdir "$p"; done
+rm_empty() { [ -d "$1" ] && [ ! -L "$1" ] && rmdir "$1"; :; }
+each_dest() {
+  for p in ~/.claude/skills ~/.claude/commands ~/.claude/CLAUDE.md ~/.codex/AGENTS.md; do "$1" "$p"; done
+  for s in "$repo"/skills/*/; do "$1" ~/.codex/skills/"$(basename "$s")"; done
+}
+each_dest claimable
+each_dest rm_empty
 
 mkdir -p ~/.claude ~/.codex/skills
 ln -sfn "$repo/skills" ~/.claude/skills
