@@ -3,37 +3,38 @@
 set -eu
 repo="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 
+# One "target destination" pair per link. Codex scans ~/.codex/skills, not
+# ~/.claude/skills, and owns the .system dir there, so each skill is linked
+# individually instead of the directory.
+links() {
+  printf '%s\n' "$repo/skills $HOME/.claude/skills" \
+                "$repo/commands $HOME/.claude/commands" \
+                "$repo/CLAUDE.md $HOME/.claude/CLAUDE.md" \
+                "../.claude/CLAUDE.md $HOME/.codex/AGENTS.md"
+  for s in "$repo"/skills/*/; do
+    printf '%s\n' "${s%/} $HOME/.codex/skills/$(basename "$s")"
+  done
+}
+
 # A destination may be absent, an empty directory, or a symlink we can replace.
 # Anything else is the user's own content: refuse before touching anything.
-claimable() {
-  [ -L "$1" ] || [ ! -e "$1" ] && return 0
-  [ -d "$1" ] && [ -z "$(ls -A "$1")" ] && return 0
-  echo "install.sh: $1 exists and is not a symlink; move it aside first" >&2
-  return 1
-}
-rm_empty() { [ -d "$1" ] && [ ! -L "$1" ] && rmdir "$1"; :; }
-each_dest() {
-  for p in ~/.claude/skills ~/.claude/commands ~/.claude/CLAUDE.md ~/.codex/AGENTS.md; do "$1" "$p"; done
-  for s in "$repo"/skills/*/; do "$1" ~/.codex/skills/"$(basename "$s")"; done
-}
-each_dest claimable
-each_dest rm_empty
+links | while read -r _ dst; do
+  [ -L "$dst" ] || [ ! -e "$dst" ] && continue
+  [ -d "$dst" ] && [ -z "$(ls -A "$dst")" ] && continue
+  echo "install.sh: $dst exists and is not a symlink; move it aside first" >&2
+  exit 1
+done
 
 mkdir -p ~/.claude ~/.codex/skills
-ln -sfn "$repo/skills" ~/.claude/skills
-ln -sfn "$repo/commands" ~/.claude/commands
-ln -sfn "$repo/CLAUDE.md" ~/.claude/CLAUDE.md
-ln -sfn ../.claude/CLAUDE.md ~/.codex/AGENTS.md
-
-# Codex scans ~/.codex/skills, not ~/.claude/skills, and owns the .system dir
-# there, so link each skill individually instead of the directory.
-for s in "$repo"/skills/*/; do
-  ln -sfn "${s%/}" ~/.codex/skills/"$(basename "$s")"
+links | while read -r src dst; do
+  [ -d "$dst" ] && [ ! -L "$dst" ] && rmdir "$dst"
+  ln -sfn "$src" "$dst"
 done
+
 # Prune links of ours whose skill left the repo; leave other people's links alone.
 for l in ~/.codex/skills/*; do
   [ -L "$l" ] || continue
   case "$(readlink "$l")" in "$repo"/skills/*) [ -e "$l" ] || rm "$l" ;; esac
 done
 
-readlink -f ~/.claude/CLAUDE.md ~/.claude/skills ~/.claude/commands ~/.codex/AGENTS.md ~/.codex/skills/*
+links | while read -r _ dst; do readlink -f "$dst"; done

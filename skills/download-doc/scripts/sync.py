@@ -293,10 +293,11 @@ def main() -> int:
 
     print("\n" + "=" * 68)
     print(f"IMPORTED  {added} new" + (f" + {replaced} replaced" if replaced else ""))
+    skipped_ids = {s_id for s_id, _ in skipped}
     for doc in fetchable:
-        if not any(doc.doc_id == s_id for s_id, _ in skipped):
+        if doc.doc_id not in skipped_ids:
             print(f"    + {doc.doc_id[:44]:<44} {doc.doc_type}")
-    print(f"LEFT OUT")
+    print("LEFT OUT")
     if non_usb:
         print(f"    {len(non_usb):>3} " + ("not confirmed USB (--usb-only)" if args.usb_only
                                              else "no USB controller in that family"))

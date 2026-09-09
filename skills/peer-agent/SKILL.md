@@ -1,6 +1,6 @@
 ---
 name: peer-agent
-description: Use when you want to ask a peer, collab with a peer, or otherwise reach another coding-agent session running beside you in the same worktree — to review a diff or design, challenge a claim before you act on it, or investigate something and report back. Works in either direction between agents. Read-only — the peer may look, run and report, but not edit, commit or post. Interactive only; schema'd one-shot jobs belong in `.claude/codex-agent.py`. Requires HERDR_ENV=1.
+description: Use when you want to ask a peer, collab with a peer, or otherwise reach another coding-agent session running beside you in the same worktree — to review a diff or design, challenge a claim before you act on it, or investigate something and report back. Works in either direction between agents. Read-only — the peer may look, run and report, but not edit, commit or post. Interactive only; schema'd one-shot jobs belong in a project's one-shot runner, if it has one. Requires HERDR_ENV=1.
 ---
 
 # Consulting a peer agent session
@@ -82,8 +82,9 @@ limit answers `INCOMPLETE` rather than skimming.
   an issue, or any other outward action.
 - **Alternate-screen truncation.** When `read` reports it, ask the peer to write
   its full answer to a scratch file and reply with the path. Fallback only.
-- **Not a workflow transport.** Schema'd one-shot jobs go through
-  `.claude/codex-agent.py`, which has real completion and failure boundaries.
+- **Not a workflow transport.** Schema'd one-shot jobs go through the project's
+  one-shot runner if it has one (tinyusb: `.claude/codex-agent.py`), which has
+  real completion and failure boundaries.
 - **Leave the layout alone.** Do not close or move panes you did not create.
 
 ## Converging
@@ -102,6 +103,6 @@ does not hold, with the reason, is part of the job.
 ## The other channel
 
 This channel is for argument. For finding defects, a schema'd `codex exec` run
-via `.claude/codex-agent.py` is stronger: a narrow question and a structured
+via the project's one-shot runner, where one exists, is stronger: a narrow question and a structured
 answer push the peer to build harness cases instead of reading. Decide *what* to
 build here; check what you built there.

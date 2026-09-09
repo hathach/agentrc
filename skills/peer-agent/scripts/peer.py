@@ -75,33 +75,37 @@ def herdr(*args):
     return json.loads(herdr_raw(*args))
 
 
-def find_peers(cwd=None, me=None):
+def agent_list():
+    return herdr('agent', 'list')['result']['agents']
+
+
+def find_peers(cwd=None, me=None, agents=None):
     """Every live agent sharing our cwd that is not us. Never picks one."""
     if os.environ.get('HERDR_ENV') != '1':
         die('not inside Herdr (HERDR_ENV != 1)', 2)
     here = os.path.realpath(cwd or os.getcwd())
     me = me or os.environ.get('HERDR_PANE_ID')
-    return [a for a in herdr('agent', 'list')['result']['agents']
+    return [a for a in (agents if agents is not None else agent_list())
             if os.path.realpath(a.get('cwd', '')) == here and a.get('pane_id') != me]
 
 
-def require_peer(pane, me=None):
+def require_peer(pane, me=None, agents=None):
     """A pane id is not proof of a peer. A stale or copied one names a session
     in another worktree, which must neither receive our request context nor
     have its output read back."""
-    found = [p['pane_id'] for p in find_peers(me=me)]
+    found = [p['pane_id'] for p in find_peers(me=me, agents=agents)]
     if pane not in found:
         die(f'{pane} is not an agent pane sharing this worktree; discovered: '
             f'{", ".join(found) or "none"}', 2)
 
 
-def own_identity():
+def own_identity(agents=None):
     """This pane's id and agent kind, from Herdr. Guessing either is how a
     request ends up misattributed to the wrong assistant."""
     me = os.environ.get('HERDR_PANE_ID')
     if not me:
         die('HERDR_PANE_ID is unset; cannot identify this pane', 2)
-    for a in herdr('agent', 'list')['result']['agents']:
+    for a in (agents if agents is not None else agent_list()):
         if a.get('pane_id') == me:
             return me, a.get('agent', 'unknown')
     die(f'pane {me} is not in the agent list', 2)
@@ -302,8 +306,9 @@ def main():
         return 0
 
     if a.cmd == 'send':
-        me, kind = own_identity()
-        require_peer(a.to, me)
+        agents = agent_list()
+        me, kind = own_identity(agents)
+        require_peer(a.to, me, agents)
         req_id = next_id(me)
         ask = read_arg(a.ask, a.ask_file, 'ask')
         if not ask:

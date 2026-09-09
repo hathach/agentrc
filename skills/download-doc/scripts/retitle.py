@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import collections
-import json
 import pathlib
 import re
 import sqlite3
@@ -37,10 +36,10 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import doclib   # noqa: E402
+import sync     # noqa: E402
 
 LIB = doclib.LIBRARY
-VENDORS = {"st", "nxp", "espressif", "rpi", "renesas", "microchip", "ti", "silabs",
-           "allwinner", "wch", "hpmicro", "geehy"}
+VENDORS = set(sync.VENDORS)
 LEAD = re.compile(r"^(UM|AN|DS|ES|RM|PM|TN|UG|DRM)\d{3,8}\b", re.I)
 DOCNUM = re.compile(r"^(?:UM|AN|DS|ES|RM|PM|TN|UG|DRM)[_-]?\d{3,6}$", re.I)
 # Microchip trails its id, not always with the DS: USB2517-…-Data-Sheet-00001598C

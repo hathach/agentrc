@@ -17,12 +17,11 @@ a broken entry.
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import UA, Doc, http_get   # noqa: E402
+from doclib import Doc, http_get, last_modified   # noqa: E402
 
 AUTHOR = "Silicon Labs"
 BSP = Path.home() / "code" / "tinyusb" / "hw" / "bsp" / "efm32"
@@ -60,13 +59,6 @@ def _families_from_bsp() -> set:
     return fams
 
 
-def _last_modified(url: str) -> str | None:
-    p = subprocess.run(["curl", "-sgIL", "-m", "25", "-A", UA, url],
-                       capture_output=True, text=True)
-    m = re.search(r"^last-modified:\s*(.+)$", p.stdout or "", re.I | re.M)
-    return m.group(1).strip() if m else None
-
-
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
     want = {f.lower() for f in families} if families else None
     docs = []
@@ -84,7 +76,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
                 continue          # this family simply has no document of that kind
             docs.append(Doc(
                 vendor="silabs", doc_id=f"{fam}-{kind}", doc_type=kind,
-                version=_last_modified(url),
+                version=last_modified(url),
                 title=f"{fam.upper()} {kind.replace('-', ' ').title()}",
                 url=url, author=AUTHOR, family=[fam.upper()], desc="",
                 verify_id=False, aliases=[f"{fam.upper()} {kind}"]))

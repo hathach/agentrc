@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-LIBRARY = Path.home() / "Documents" / "calibre-library"
+LIBRARY = Path(os.environ.get("CALIBRE_LIBRARY") or "~/Documents/calibre-library").expanduser()
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/139.0.0.0 Safari/537.36")
 
@@ -61,6 +61,15 @@ def _curl(url: str, timeout: int, accept: str) -> bytes:
     p = subprocess.run(["curl", "-sg", "--compressed", "-m", str(timeout),
                         "-A", UA, "-H", f"Accept: {accept}", url], capture_output=True)
     return p.stdout if p.returncode == 0 else b""
+
+
+def last_modified(url: str) -> str | None:
+    """Last-Modified of a URL via HEAD: a revision substitute for vendors that
+    publish none, and proof that the file exists."""
+    p = subprocess.run(["curl", "-sgIL", "-m", "25", "-A", UA, url],
+                       capture_output=True, text=True)
+    m = re.search(r"^last-modified:\s*(.+)$", p.stdout or "", re.I | re.M)
+    return m.group(1).strip() if m else None
 
 
 def http_get(url: str, timeout: int = 60, accept: str = "application/json",
@@ -376,9 +385,9 @@ def rev_from_comments(text) -> str | None:
 class Library:
     """calibredb wrapper.
 
-    The GUI takes an exclusive write lock, so imports need it closed. Its content
-    server on :8080 accepts reads but rejects writes ("Forbidden") because no server
-    users are configured — so it is not a way around the lock, just a read path.
+    The GUI takes an exclusive write lock, so imports need it closed unless
+    content-server credentials are configured (see _server_creds), in which case
+    writes go through the running GUI's server instead.
     """
 
     def __init__(self, path: Path = LIBRARY):

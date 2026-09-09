@@ -73,13 +73,10 @@ part. Re-derive from datasheets (`pdftotext -f 1 -l 6 … | grep -i otg`), not r
 
 ## Before you touch the library
 
-Every command below runs from the skill directory (`~/.claude/skills/download-doc`
-once installed); the scripts import each other by bare name.
-
 Run the plan first and *read it*:
 
 ```bash
-python3 scripts/sync.py st --family STM32H7 --types datasheet,errata
+python3 <skill dir>/scripts/sync.py st --family STM32H7 --types datasheet,errata
 ```
 
 This prints, per document, the resolved doc ID and the `old -> new` revision pair,
@@ -92,19 +89,21 @@ The listing is how you catch it.
 Then apply:
 
 ```bash
-python3 scripts/sync.py st --family STM32H7 --types datasheet,errata --apply
-python3 scripts/sync.py nxp --types errata --device "i.MX RT" --apply
+python3 <skill dir>/scripts/sync.py st --family STM32H7 --types datasheet,errata --apply
+python3 <skill dir>/scripts/sync.py nxp --types errata --device "i.MX RT" --apply
 ```
 
 `--apply` refuses to run while something else holds the library:
 
 - **The Calibre GUI holds an exclusive write lock.** Ask the user to close it; don't
-  kill it. Its content server on `:8080` accepts reads but rejects writes
-  ("Forbidden"), so it is not a workaround.
+  kill it. With a content-server user configured in the gitignored `secret.yml`
+  beside this file (`calibre:` block with `server_url`, `username`, `password`;
+  `Library._server_creds` documents the shape) imports go through the running
+  GUI's server instead, and the lock is not a blocker.
 - **A FreeFileSync `calibre-library.ffs_batch` mirror.** Importing mid-sync races a
   17 GB mirror to omv and produces spurious "another calibre program is running"
-  errors. Let it finish. (The "Calibre library" section of `~/code/homelab/CLAUDE.md`
-  describes that sync.)
+  errors. Let it finish. (That batch is the scheduled FreeFileSync mirror of the
+  library to omv.)
 
 ## Conventions that must not drift
 
@@ -287,5 +286,5 @@ searchable across vendors, and put the vendor's quirks in `references/<name>.md`
 rather than in the core. Then add it to `VENDORS` in `sync.py`. If you find yourself
 special-casing a vendor inside `doclib.py`, the abstraction is leaking.
 
-Run `python3 scripts/doclib.py` for the self-test (revision parsing and doc-ID regexes,
+Run `python3 <skill dir>/scripts/doclib.py` for the self-test (revision parsing and doc-ID regexes,
 with the real-world values as fixtures) after touching the core.

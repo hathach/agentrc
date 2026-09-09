@@ -21,13 +21,11 @@ understands in RFC-1123 form.
 """
 from __future__ import annotations
 
-import re
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import UA, Doc   # noqa: E402
+from doclib import Doc, last_modified   # noqa: E402
 
 # Both RP2040 and RP2350 carry a USB 1.1 device/host controller, and every board here
 # is built on one, so a USB filter selects the whole catalogue. None means "no
@@ -72,14 +70,6 @@ CATALOGUE = [
 # adapter for --types errata therefore correctly returns nothing.
 
 
-def _last_modified(url: str) -> str | None:
-    """Vendor revision substitute. A HEAD is enough and also proves the file exists."""
-    p = subprocess.run(["curl", "-sgIL", "-m", "25", "-A", UA, url],
-                       capture_output=True, text=True)
-    m = re.search(r"^last-modified:\s*(.+)$", p.stdout or "", re.I | re.M)
-    return m.group(1).strip() if m else None
-
-
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
     want = {f.lower() for f in families} if families else None
     docs = []
@@ -91,7 +81,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
         url = f"{BASE}/{path}"
         docs.append(Doc(
             vendor="rpi", doc_id=Path(path).stem, doc_type=kind,
-            version=_last_modified(url), title=title, url=url, author=AUTHOR,
+            version=last_modified(url), title=title, url=url, author=AUTHOR,
             family=list(fams), desc=title,
             # No document-code scheme exists, so nothing on page 1 can confirm identity.
             verify_id=False,

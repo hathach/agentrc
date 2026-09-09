@@ -49,4 +49,4 @@ symlink install on the same machine or every skill shows up twice.
 python3 -m unittest discover -s tests
 ```
 
-The same command runs from the pre-commit hook (`pre-commit install`).
+Needs PyYAML. The same command runs from the pre-commit hook (`pre-commit install`).

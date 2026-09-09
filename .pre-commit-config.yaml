@@ -3,8 +3,8 @@ repos:
     hooks:
       - id: skill-tests
         name: skill-tests
-        files: ^(skills/.*/(scripts/|SKILL\.md)|tests/)
-        entry: python3 -m unittest discover -s tests -p 'test_*.py'
+        files: ^(skills/|tests/)
+        entry: python3 -m unittest discover -s tests
         pass_filenames: false
         language: python
         additional_dependencies: [pyyaml]

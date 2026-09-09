@@ -201,9 +201,6 @@ class IdentityTest(unittest.TestCase):
             peer.own_identity()
 
 
-if __name__ == '__main__':
-    unittest.main()
-
 
 class Frontmatter(unittest.TestCase):
     """A bare `word: ` inside an unquoted description is a YAML mapping, not
@@ -219,3 +216,6 @@ class Frontmatter(unittest.TestCase):
         fm = yaml.safe_load(self.head())
         self.assertEqual(fm['name'], 'peer-agent')
         self.assertTrue(fm['description'].strip())
+
+if __name__ == '__main__':
+    unittest.main()

@@ -19,12 +19,11 @@ silently omitted.
 from __future__ import annotations
 
 import re
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import UA, Doc, http_get   # noqa: E402
+from doclib import Doc, http_get, last_modified   # noqa: E402
 
 AUTHOR = "Texas Instruments"
 BSP = Path.home() / "code" / "tinyusb" / "hw" / "bsp"
@@ -49,6 +48,7 @@ def _parts_from_bsp() -> dict:
         if not root.is_dir():
             continue
         for f in root.rglob("*"):
+            out.update({m.lower(): fam for m in rx.findall(f.name)})
             if not f.is_file() or f.suffix.lower() not in (".c", ".h", ".mk", ".cmake", ".txt", ".ld", ""):
                 continue
             try:
@@ -56,15 +56,7 @@ def _parts_from_bsp() -> dict:
                     out[m.lower()] = fam
             except OSError:
                 continue
-        out.update({m.lower(): fam for p in root.rglob("*") for m in rx.findall(p.name)})
     return out
-
-
-def _last_modified(url: str) -> str | None:
-    p = subprocess.run(["curl", "-sgIL", "-m", "25", "-A", UA, url],
-                       capture_output=True, text=True)
-    m = re.search(r"^last-modified:\s*(.+)$", p.stdout or "", re.I | re.M)
-    return m.group(1).strip() if m else None
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
@@ -84,7 +76,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
             continue
         docs.append(Doc(
             vendor="ti", doc_id=part.upper(), doc_type="datasheet",
-            version=_last_modified(url), title=f"{part.upper()} Datasheet",
+            version=last_modified(url), title=f"{part.upper()} Datasheet",
             url=url, author=AUTHOR, family=[fam], desc="", verify_id=False,
             aliases=[f"{part.upper()} Datasheet", part.upper()]))
     return docs

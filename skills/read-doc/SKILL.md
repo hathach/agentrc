@@ -7,7 +7,7 @@ description: Use when you need authoritative hardware/protocol facts from a prim
 
 ## Overview
 
-Some maintainers keep datasheets, manuals, and books in a Calibre library at
+Datasheets, manuals and books live in the Calibre library at
 `$HOME/Documents/calibre-library/`. For hardware/protocol facts — registers,
 bitfields, memory maps, pinouts, electrical/timing specs, errata, USB spec —
 read the doc instead of answering from training knowledge or the web.
@@ -41,14 +41,14 @@ Not for general concepts, repo/code questions, or when no such doc is likely.
 ## Find
 
 Keywords supplied as skill arguments, else derived from the question (part
-number, peripheral, spec name). `search.py` sits beside this SKILL.md; run it
+number, peripheral, spec name). `scripts/search.py` sits under this skill; run it
 from wherever the skill was loaded. It ANDs the keywords across every metadata
 field and prints the best matches first — at most 40, and the header says when
 more matched:
 
 ```bash
-python3 <skill dir>/search.py errata RT1064      # AND (default)
-python3 <skill dir>/search.py RT1060 RT1064 --any
+python3 <skill dir>/scripts/search.py errata RT1064      # AND (default)
+python3 <skill dir>/scripts/search.py RT1060 RT1064 --any
 ```
 
 Exit 0 matched, 1 nothing matched, 2 bad usage or no library — 2 means the
