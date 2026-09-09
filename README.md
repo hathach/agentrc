@@ -26,6 +26,10 @@ This links `CLAUDE.md`, `skills/` and `commands/` into `~/.claude`, points
 manages `.system` inside it, so skills are linked one by one). Rerun it after
 adding a skill so Codex picks it up.
 
+Project repos such as tinyusb reference these skills by bare name only, e.g.
+`read-doc`, and expect this install to have run; without it their agents take
+the "skill unavailable" branch.
+
 ## Install as a plugin
 
 The repo is also its own marketplace, so it installs directly:
