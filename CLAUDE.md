@@ -43,16 +43,9 @@
   sentence. This overrides any default instruction to append such a footer.
 
 # Reference docs
-- When you need a technical document for hardware (motherboard user manual,
-  datasheet, reference/programming manual, schematic, spec sheet), check my
-  Calibre library FIRST before searching online — hardware manuals and spec
-  sheets are archived there.
-- Search it by querying the library's Calibre database
-  (`~/Documents/calibre-library/metadata.db`), never the filesystem tree. The
-  database indexes title, authors, tags, series, publisher, description and
-  filename; most part numbers live in the tags, which the file/directory names
-  do not carry, so `find`/`ls`/`grep` over the library will miss documents that
-  are there.
-- e.g. `sqlite3 ~/Documents/calibre-library/metadata.db` joining `books`,
-  `tags`, `authors` — and only then open the matching PDF under
-  `<Author or "Unknown">/<Title>/…pdf`.
+- Hardware manuals, datasheets, reference manuals, errata, schematics and spec
+  sheets are archived in my Calibre library. Before answering
+  register/bitfield/pinout/errata/timing questions from memory or the web, use
+  the `read-doc` skill to check it and report if the document is missing.
+- Never search the library tree directly; the skill owns its location and
+  search.
