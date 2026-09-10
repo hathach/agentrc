@@ -8,7 +8,8 @@ install.sh        symlink this checkout into ~/.claude and ~/.codex
 CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
 skills/           ~/.claude/skills
 commands/         ~/.claude/commands
-tests/            unit tests for skill scripts
+hooks/            Claude Code hooks, switched on per repository (see below)
+tests/            unit tests for skill scripts and hooks
 .claude-plugin/   plugin and marketplace manifests
 ```
 
@@ -43,6 +44,31 @@ The repo is also its own marketplace, so it installs directly:
 
 Skills are then namespaced as `agentrc:<skill>`. Do not combine this with the
 symlink install on the same machine or every skill shows up twice.
+
+## Simplify gate (per repository)
+
+`hooks/simplify_gate.py` records the files a Claude Code session edits (main
+session and its subagents alike) and, when the session stops, sends that patch
+to a read-only `codex exec` YAGNI challenge: at most two rounds per user turn,
+one retry on Codex failure, then it lets the stop through with a notice. Codex
+never edits; Claude applies or rejects each finding.
+
+Install the hooks once per machine, then switch the gate on per repository:
+
+```sh
+python3 ~/code/agentrc/hooks/simplify_gate.py --install    # --remove undoes it
+cd ~/code/tinyusb && /simplify-gate on                     # or: skills/simplify-gate/scripts/gate.py on
+```
+
+`--install` merges five entries into `~/.claude/settings.json` (backup kept
+beside it, idempotent, replaces older entries of its own). Each entry runs
+`hooks/simplify-gate`, which costs one `git rev-parse` in every checkout and
+starts the Python gate only where `<git common dir>/simplify-gate` exists, so
+one marker covers a repository and all of its worktrees. `/simplify-gate status`
+prints the state with the effective model and effort; `on --model M --effort E`
+stores overrides in the marker, the defaults are the constants at the top of
+`simplify_gate.py`. Per-session state lives under
+`~/.cache/agentrc/simplify-gate/`.
 
 ## Tests
 

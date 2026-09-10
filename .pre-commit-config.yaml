@@ -3,7 +3,7 @@ repos:
     hooks:
       - id: skill-tests
         name: skill-tests
-        files: ^(skills/|tests/)
+        files: ^(skills/|tests/|hooks/)
         entry: python3 -m unittest discover -s tests
         pass_filenames: false
         language: python
