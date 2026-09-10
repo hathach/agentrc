@@ -15,8 +15,8 @@ Scope is the turn: every worktree of the repository (index blob ids, with
 dirty and untracked files hashed into the object store as git would store
 them) is snapshotted when a prompt arrives and again at Stop, and the diff of
 the two is queued as a batch. A peer sharing the checkout may have made some
-of it, which the challenge says, so Claude rejects findings on files it did
-not write. Batches stay queued until a review covers them, so edits after the
+of it, which the challenge says, so Claude rejects findings on files it
+neither wrote nor commissioned. Batches stay queued until a review covers them, so edits after the
 round limit, a failed run, or a Stop while a review is still running are
 reviewed in a later turn. At Stop the queued patch goes to `codex exec`, one
 review at a time and at most two rounds per user turn; Codex never edits.
@@ -319,7 +319,7 @@ def incomplete(state):
 
 
 SCOPE = (' Scope is what changed in the checkout this turn, which may include a peer\'s edits: '
-         'reject findings on files you did not write.')
+         'reject findings on files you neither wrote nor had a coworker write for you.')
 
 
 def queue_delta(root, directory, state, now):
@@ -554,6 +554,8 @@ def main():
     if args.remove:
         remove(args.settings)
         return
+    if os.environ.get('COWORK_TURN'):
+        return  # a headless coworker turn (skills/cowork); the caller reviews it
     payload = json.load(sys.stdin)
     # A Bash call can leave its shell in another directory and the payload's
     # cwd follows it; the project directory names the checkout under review.

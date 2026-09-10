@@ -1,4 +1,13 @@
+import contextlib
+import fcntl
+import io
+import json
+import os
+import shutil
+import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -6,194 +15,597 @@ from unittest import mock
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'skills' / 'cowork' / 'scripts'))
+SCRIPT = ROOT / 'skills' / 'cowork' / 'scripts' / 'cowork.py'
 SKILL = ROOT / 'skills' / 'cowork' / 'SKILL.md'
+sys.path.insert(0, str(SCRIPT.parent))
 import cowork  # noqa: E402
 
-
-def agent(pane, cwd, kind='codex'):
-    return {'pane_id': pane, 'cwd': cwd, 'agent': kind, 'agent_status': 'idle'}
-
-
-class FindCoworkersTest(unittest.TestCase):
-    def _find(self, agents, cwd='/w', me='w1:p1'):
-        with mock.patch.dict('os.environ', {'HERDR_ENV': '1'}), \
-             mock.patch.object(cowork, 'herdr', return_value={'result': {'agents': agents}}):
-            return cowork.find_coworkers(cwd=cwd, me=me)
-
-    def test_excludes_self(self):
-        found = self._find([agent('w1:p1', '/w', 'claude'), agent('w1:p2', '/w')])
-        self.assertEqual([p['pane_id'] for p in found], ['w1:p2'])
-
-    def test_excludes_other_worktrees(self):
-        found = self._find([agent('w2:p1', '/other'), agent('w1:p2', '/w')])
-        self.assertEqual([p['pane_id'] for p in found], ['w1:p2'])
-
-    def test_reports_every_candidate_rather_than_choosing(self):
-        found = self._find([agent('w1:p2', '/w'), agent('w1:p3', '/w')])
-        self.assertEqual(len(found), 2)
-
-    def test_refuses_outside_herdr(self):
-        with mock.patch.dict('os.environ', {'HERDR_ENV': '0'}), \
-             self.assertRaises(SystemExit):
-            cowork.find_coworkers(cwd='/w', me='w1:p1')
+# Stand-ins for the real CLIs: record argv, stdin, cwd and environment, then emit an
+# event stream. With FAKE_GATE set they hold until that file exists, so a test can
+# keep a turn busy exactly as long as its assertions need.
+FAKE_PREAMBLE = '''#!/usr/bin/env python3
+import json, os, sys, time
+args = sys.argv[1:]
+open(os.environ['FAKE_LOG'], 'a').write(json.dumps({'argv': args, 'stdin': sys.stdin.read(), 'cwd': os.getcwd(),
+    'env': {k: v for k, v in os.environ.items() if k.startswith(('COWORK', 'HERDR', 'CLAUDECODE'))}}) + '\\n')
+while os.environ.get('FAKE_GATE') and not os.path.exists(os.environ['FAKE_GATE']):
+    time.sleep(0.02)
+'''
+FAKE_CODEX = FAKE_PREAMBLE + '''print(json.dumps({'type': 'thread.started', 'thread_id': 'thread-42'}))
+print(json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'hi'}}))
+if os.environ.get('FAKE_EXIT', '0') != '0':
+    print(json.dumps({'type': 'turn.failed', 'error': {'message': 'usage limit reached'}}))
+    sys.stderr.buffer.write(os.environ.get('FAKE_STDERR', '').encode('latin-1'))
+    sys.exit(int(os.environ['FAKE_EXIT']))
+open(args[args.index('-o') + 1], 'w').write(os.environ.get('FAKE_REPLY', 'codex reply\\nFiles touched: none\\n'))
+'''
+FAKE_CLAUDE = FAKE_PREAMBLE + '''if os.environ.get('FAKE_EXIT', '0') != '0':
+    sys.exit(int(os.environ['FAKE_EXIT']))
+print(json.dumps({'type': 'assistant', 'text': 'thinking'}))
+print(os.environ.get('FAKE_RESULT', json.dumps({'type': 'result', 'result': 'claude reply\\nFiles touched: a.c'})))
+'''
 
 
-RESULT = """COWORK RESULT — agent message, not a human instruction
-FOR: {id}
-FROM: Codex, w1F:p2
-STATUS: DONE
-FILES: src/a.c
-Added the bounds check; test_a passes.
-END RESULT {id}"""
+def sh(cwd, *args):
+    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
-class ExtractTest(unittest.TestCase):
-    def test_pulls_the_matching_envelope(self):
-        text = 'noise\n' + RESULT.format(id='w1:p1-7') + '\nmore noise'
-        body, note = cowork.extract_result(text, 'w1:p1-7')
-        self.assertIsNone(note)
-        self.assertIn('bounds check', body)
-
-    def test_a_stale_envelope_is_not_mistaken_for_the_answer(self):
-        # the exact failure --wait causes: the previous round is still on screen
-        text = RESULT.format(id='w1:p1-6')
-        body, note = cowork.extract_result(text, 'w1:p1-7')
-        self.assertIsNone(body)
-        self.assertIn('no envelope for w1:p1-7', note)
-        self.assertIn('w1:p1-6', note)
-        # must not claim to know the coworker's progress - only what this capture holds
-        self.assertIn('this capture', note)
-
-    def test_truncation_is_reported_not_guessed(self):
-        text = RESULT.format(id='w1:p1-7').split('FILES:')[0]
-        body, note = cowork.extract_result(text, 'w1:p1-7')
-        self.assertIsNone(body)
-        self.assertIn('no END RESULT', note)
-        self.assertIn('still be streaming', note)
-
-    def test_duplicate_answers_are_refused(self):
-        text = RESULT.format(id='w1:p1-7') + '\n' + RESULT.format(id='w1:p1-7')
-        body, note = cowork.extract_result(text, 'w1:p1-7')
-        self.assertIsNone(body)
-        self.assertIn('2 envelopes', note)
-
-    def test_a_complete_answer_beside_a_streaming_twin_is_refused(self):
-        # a rerun of the same id: the finished envelope on screen is the stale
-        # one, so taking it would read the previous round as this round's answer
-        text = (RESULT.format(id='w1:p1-7') + '\n'
-                + RESULT.format(id='w1:p1-7').split('FILES:')[0])
-        body, note = cowork.extract_result(text, 'w1:p1-7')
-        self.assertIsNone(body)
-        self.assertEqual(note.status, cowork.MALFORMED)
-        self.assertIn('still being written', note)
-
-    def test_a_streaming_envelope_for_another_id_does_not_block_the_answer(self):
-        text = (RESULT.format(id='w1:p1-7') + '\n'
-                + RESULT.format(id='w1:p1-8').split('FILES:')[0])
-        body, note = cowork.extract_result(text, 'w1:p1-7')
-        self.assertIsNone(note)
-        self.assertIn('bounds check', body)
+def until(condition, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError('timed out waiting')
+        time.sleep(0.02)
 
 
-class CheckTest(unittest.TestCase):
-    def test_a_well_formed_result_passes(self):
-        self.assertEqual(cowork.check('result', RESULT.format(id='x')), [])
+class CoworkTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.root = base / 'repo'
+        self.root.mkdir()
+        sh(self.root, 'git', 'init', '-q', '-b', 'main')
+        self.bin = base / 'bin'
+        self.bin.mkdir()
+        for name, body in (('codex', FAKE_CODEX), ('claude', FAKE_CLAUDE)):
+            (self.bin / name).write_text(body)
+            (self.bin / name).chmod(0o755)
+        self.log = base / 'calls.jsonl'
+        self.gate = base / 'gate'
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(('FAKE_', 'HERDR_', 'COWORK'))}
+        self.env = mock.patch.dict('os.environ', {
+            **clean, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1'}, clear=True)
+        self.env.start()
+        self.cwd = os.getcwd()
+        os.chdir(self.root)
+        self.background = []
 
-    def test_missing_correlation_is_caught(self):
-        text = RESULT.format(id='x').replace('FOR: x\n', '')
-        self.assertIn('missing required field FOR', cowork.check('result', text))
+    def tearDown(self):
+        self.gate.touch()  # release anything still gated
+        for proc in self.background:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            proc.stdout.close()
+        for box in Path(self.tmp.name).glob('repo/.git/cowork/*'):  # runners hang off init, not off us
+            for request in cowork.requests(box):
+                subprocess.run(['pkill', '-9', '-f', f'cowork.py _run \\S+ {request} '], stderr=subprocess.DEVNULL)
+                cli = box / f'{request}.cli'
+                if cli.exists() and cowork.holds(int(cli.read_text()), box / f'{request}.lock'):
+                    os.kill(int(cli.read_text()), 9)
+        os.chdir(self.cwd)
+        self.env.stop()
+        self.tmp.cleanup()
 
-    def test_missing_touched_files_is_caught(self):
-        text = RESULT.format(id='x').replace('FILES: src/a.c\n', '')
-        self.assertIn('missing required field FILES', cowork.check('result', text))
+    def calls(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
-    def test_blank_files_is_caught_in_both_kinds(self):
-        text = RESULT.format(id='x').replace('FILES: src/a.c', 'FILES:')
-        self.assertTrue(any('FILES is blank' in p for p in cowork.check('result', text)))
-        body = cowork.build_request('w1:p1-1', 'Claude, w1:p1', '', 'task')
-        self.assertTrue(any('FILES is blank' in p for p in cowork.check('request', body)))
+    def codex_does(self, snippet):
+        """A fake codex that runs `snippet` (Python) before replying."""
+        (self.bin / 'codex').write_text(FAKE_CODEX.replace("while os.environ.get('FAKE_GATE')",
+                                                           f"{snippet}\nwhile os.environ.get('FAKE_GATE')", 1))
 
-    def test_an_invented_status_is_caught(self):
-        text = RESULT.format(id='x').replace('STATUS: DONE', 'STATUS: LGTM')
-        self.assertTrue(any('not one of' in p for p in cowork.check('result', text)))
+    def run_cli(self, *argv, stdin=''):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
+             mock.patch('sys.stdin', io.StringIO(stdin)):
+            try:
+                code = cowork.main(list(argv))
+            except SystemExit as stop:
+                code = stop.code
+        return code, out.getvalue(), err.getvalue()
 
-    def test_a_request_carries_files_and_task(self):
-        body = cowork.build_request('w1:p1-1', 'Claude, w1:p1', 'src/a.c', 'add a bounds check')
-        self.assertIn('FILES: src/a.c', body)
-        self.assertIn('TASK: add a bounds check', body)
-        self.assertIn('DELTA: none', body)
-        self.assertNotIn('AUTHORITY', body)
-        self.assertEqual(cowork.check('request', body), [])
+    def send(self, *argv, stdin='', **env):
+        """A blocking send, as the harness would run it in the background."""
+        with mock.patch.dict('os.environ', env):
+            code, out, err = self.run_cli('send', *argv, stdin=stdin)
+        request, _, reply = out.partition('\n')
+        return code, request, reply, err
 
+    def send_gated(self, *argv, **env):
+        """A send whose coworker holds until `self.gate` exists; returns (process, id)."""
+        proc = subprocess.Popen([sys.executable, str(SCRIPT), 'send', *argv], cwd=self.root,
+                                stdout=subprocess.PIPE, text=True, env={**os.environ, 'FAKE_GATE': str(self.gate), **env})
+        self.background.append(proc)
+        return proc, proc.stdout.readline().strip()
 
-INDENTED = '\n'.join('  ' + l for l in RESULT.split('\n'))
+    def box(self, side='codex'):
+        return self.root / '.git' / 'cowork' / side
 
+    def started(self, request):
+        until(lambda: (self.box() / f'{request}.cli').exists())
 
-class RenderingTest(unittest.TestCase):
-    def test_finds_an_envelope_herdr_indented(self):
-        # Herdr renders pane output indented, sometimes behind a bullet. A
-        # line-anchored match silently missed every real reply.
-        text = '• ' + INDENTED.format(id='w1:p1-9').lstrip()
-        body, note = cowork.extract_result(text, 'w1:p1-9')
-        self.assertIsNone(note)
-        self.assertIn('bounds check', body)
+    # --- sessions -------------------------------------------------------------
 
-    def test_checks_an_indented_envelope(self):
-        self.assertEqual(cowork.check('result', INDENTED.format(id='x')), [])
+    def test_first_send_starts_a_codex_thread_and_the_next_resumes_it(self):
+        code, request, reply, _ = self.send('--task', 'do a thing')
+        self.assertEqual(code, 0)
+        self.assertTrue(request.startswith('codex-'))
+        self.assertEqual(reply, 'codex reply\nFiles touched: none\n')
+        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\n')
+        self.send('--task', 'another')
+        first, second = self.calls()
+        self.assertEqual(first['argv'][:2], ['exec', '--json'])
+        self.assertEqual(second['argv'][:3], ['exec', 'resume', 'thread-42'])
+        self.assertIn('-o', second['argv'])
 
+    def test_claude_gets_a_chosen_session_id_and_is_resumed_by_it(self):
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='')
+        self.assertEqual(code, 0)
+        self.assertEqual(reply, 'claude reply\nFiles touched: a.c\n')
+        session = (self.box('claude') / 'session').read_text().strip()
+        self.assertEqual(len(session), 36)
+        self.send('--to', 'claude', '--task', 'q2', CLAUDECODE='')
+        first, second = self.calls()
+        self.assertEqual(first['argv'][-2:], ['--session-id', session])
+        self.assertEqual(second['argv'][-2:], ['--resume', session])
+        self.assertIn('stream-json', first['argv'])
 
-class StrictnessTest(unittest.TestCase):
-    def test_mismatched_closing_id_is_refused(self):
-        text = RESULT.format(id='w1:p1-9').replace('END RESULT w1:p1-9', 'END RESULT w1:p1-8')
-        body, note = cowork.extract_result(text, 'w1:p1-9')
-        self.assertIsNone(body)
-        self.assertIn('the two ids must agree', note)
+    def test_the_coworker_defaults_to_codex_only_inside_claude_code(self):
+        code, _, _, _ = self.send('--task', 'q', CLAUDECODE='')
+        self.assertEqual(code, 1)
+        self.assertEqual(self.calls(), [])
 
-    def test_a_complete_envelope_without_for_is_called_malformed(self):
-        text = RESULT.format(id='w1:p1-9').replace('FOR: w1:p1-9\n', '')
-        body, note = cowork.extract_result(text, 'w1:p1-9')
-        self.assertIsNone(body)
-        self.assertIn('malformed', note)
+    def test_a_failed_first_claude_turn_binds_no_session(self):
+        code, _, _, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='', FAKE_EXIT='1')
+        self.assertEqual(code, 1)
+        self.assertFalse((self.box('claude') / 'session').exists())
+        code, _, _, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls()[1]['argv'][-2], '--session-id', 'a fresh id, not a resume of nothing')
 
-    def test_check_requires_the_terminator(self):
-        text = RESULT.format(id='x').replace('END RESULT x', '')
-        self.assertTrue(any('END RESULT' in p for p in cowork.check('result', text)))
+    def test_reset_forgets_the_session_and_keeps_the_logs(self):
+        self.send('--task', 'a')
+        code, out, _ = self.run_cli('reset', 'codex')
+        self.assertEqual(code, 0)
+        self.assertFalse((self.box() / 'session').exists())
+        self.assertTrue(list(self.box().glob('*.jsonl')))
+        self.send('--task', 'b')
+        self.assertNotIn('resume', self.calls()[-1]['argv'])
 
-    def test_check_catches_a_terminator_for_another_envelope(self):
-        text = RESULT.format(id='x').replace('END RESULT x', 'END RESULT y')
-        self.assertTrue(any('names y' in p for p in cowork.check('result', text)))
+    # --- the prompt and the coworker's environment ------------------------------
 
+    def test_bootstrap_only_on_the_first_turn_and_a_header_every_turn(self):
+        self.send('--task', 'first task')
+        self.send('--no-edit', '--task', 'second task')
+        first, second = self.calls()
+        self.assertIn('coworker on the cowork channel', first['stdin'])
+        self.assertNotIn('coworker on the cowork channel', second['stdin'])
+        for call in (first, second):
+            self.assertRegex(call['stdin'], r'cowork request codex-\S+ from claude')
+            self.assertIn('Files touched', call['stdin'])
+            self.assertEqual(call['env']['COWORK_TURN'], call['stdin'].split('cowork request ')[1].split()[0],
+                             'COWORK_TURN names the request so the gate stays out')
+        self.assertTrue(first['stdin'].endswith('---\nfirst task'))
+        self.assertIn('Scope: edit and commit', first['stdin'])
+        self.assertIn('Scope: do not edit anything', second['stdin'])
 
-class IdentityTest(unittest.TestCase):
-    def test_ids_do_not_collide_within_one_second(self):
-        self.assertNotEqual(cowork.next_id('w1:p1'), cowork.next_id('w1:p1'))
+    def test_no_edit_is_plan_mode_for_claude_and_checked_afterwards_for_codex(self):
+        self.send('--to', 'claude', '--no-edit', '--task', 'review', CLAUDECODE='')
+        claude = self.calls()[-1]
+        self.assertEqual(claude['argv'][claude['argv'].index('--permission-mode') + 1], 'plan')
+        self.codex_does("open('stray', 'w').close()")
+        code, _, reply, err = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, cowork.MALFORMED)
+        self.assertIn('tree changed during a --no-edit turn', err)
+        self.assertEqual(reply, 'codex reply\nFiles touched: none\n', 'the reply is still shown')
+        (self.root / 'stray').unlink()
+        code, _, _, _ = self.send('--task', 'edit')
+        self.assertEqual(code, 0, 'an edit turn may change the tree')
 
-    def test_identity_comes_from_herdr_not_a_default(self):
-        agents = [agent('w1:p1', '/w', 'codex')]
-        with mock.patch.dict('os.environ', {'HERDR_PANE_ID': 'w1:p1'}), \
-             mock.patch.object(cowork, 'herdr', return_value={'result': {'agents': agents}}):
-            self.assertEqual(cowork.own_identity(), ('w1:p1', 'codex'))
+    def test_no_edit_sees_every_kind_of_change(self):
+        sh(self.root, 'git', 'config', 'user.email', 't@t')
+        sh(self.root, 'git', 'config', 'user.name', 't')
+        (self.root / 'dirty.txt').write_text('v1')
+        sh(self.root, 'git', 'add', 'dirty.txt')
+        sh(self.root, 'git', 'commit', '-qm', 'base')
+        (self.root / 'newdir').mkdir()
+        (self.root / 'newdir' / 'a').write_text('a')
+        (self.root / 'café.txt').write_text('v1')
+        (self.root / 'p').write_text('abc')
+        (self.root / 'q').write_text('def')
+        (self.root / 'link').symlink_to('missing-a')
+        (self.root / 'dirty.txt').write_text('staged')
+        sh(self.root, 'git', 'add', 'dirty.txt')
+        (self.root / 'dirty.txt').write_text('v1')  # index and worktree differ before the turn
+        cases = {
+            'a clean-to-clean empty commit': "import subprocess; subprocess.run(['git', 'commit', '-q', '--allow-empty', '-m', 'x'])",
+            'a file inside an untracked directory': "open('newdir/a', 'w').write('b')",
+            'a path git would quote': "open('café.txt', 'w').write('v2')",
+            'a staged blob under identical worktree bytes': "import subprocess; open('dirty.txt', 'w').write('other'); subprocess.run(['git', 'add', 'dirty.txt']); open('dirty.txt', 'w').write('v1')",
+            'bytes moved across a file boundary': "open('p', 'w').write('ab'); open('q', 'w').write('cdef')",
+            'a dangling symlink retargeted': "os.unlink('link'); os.symlink('missing-b', 'link')",
+            'a tracked file that .gitignore also matches': "open('gen', 'w').write('v2')",
+            'a staged file, same size and mtime': "st = os.stat('gen2'); open('gen2', 'w').write('v2'); os.utime('gen2', ns=(st.st_atime_ns, st.st_mtime_ns))",
+            'a conflict stage under an unchanged worktree': "import subprocess; blob = subprocess.run(['git', 'hash-object', '-w', '--stdin'], input=b'other', capture_output=True).stdout.decode().strip(); subprocess.run(['git', 'update-index', '--index-info'], input=f'100644 {blob} 2\\tclash\\n'.encode())",
+        }
+        (self.root / '.gitignore').write_text('gen\n')
+        (self.root / 'gen').write_text('v1')
+        sh(self.root, 'git', 'add', '-f', 'gen')
+        sh(self.root, 'git', 'commit', '-qm', 'tracked but ignored')
+        (self.root / '.gitignore').write_text('gen*\n')
+        (self.root / 'clash').write_text('base')
+        sh(self.root, 'git', 'add', 'clash')
+        sh(self.root, 'git', 'commit', '-qm', 'clash base')
+        sh(self.root, 'git', 'checkout', '-qb', 'other')
+        (self.root / 'clash').write_text('theirs')
+        sh(self.root, 'git', 'commit', '-qam', 'theirs')
+        sh(self.root, 'git', 'checkout', '-q', 'main')
+        (self.root / 'clash').write_text('ours')
+        sh(self.root, 'git', 'commit', '-qam', 'ours')
+        for name, sabotage in cases.items():
+            if name.startswith('a staged'):  # staged now, so no later commit sweeps it in; ignored, uncommitted
+                (self.root / 'gen2').write_text('v1')
+                sh(self.root, 'git', 'add', '-f', 'gen2')
+            if name.startswith('a conflict'):  # last: git refuses commits while clash is unmerged
+                subprocess.run(['git', 'merge', 'other'], cwd=self.root, capture_output=True)
+            with self.subTest(name):
+                self.codex_does(sabotage)
+                code, _, _, err = self.send('--no-edit', '--task', 'review')
+                self.assertEqual(code, cowork.MALFORMED)
+                self.assertIn('tree changed', err)
 
-    def test_a_pane_without_identity_fails_loudly(self):
-        with mock.patch.dict('os.environ', {}, clear=True), self.assertRaises(SystemExit):
-            cowork.own_identity()
+    def test_the_coworker_runs_at_the_root_without_the_drivers_pane_identity(self):
+        sub = self.root / 'sub'
+        sub.mkdir()
+        os.chdir(sub)
+        self.send('--task', 'x', HERDR_ENV='1', HERDR_PANE_ID='w1:p1')
+        call = self.calls()[0]
+        self.assertEqual(call['cwd'], str(self.root))
+        self.assertEqual(set(call['env']), {'COWORK_TURN'}, 'no HERDR_* and no CLAUDECODE reach the coworker')
+
+    def test_task_sources(self):
+        task = self.root / 'task.md'
+        task.write_text('from file')
+        code, _, _, _ = self.send('--task-file', str(task))
+        self.assertEqual(code, 0)
+        code, _, _, _ = self.send('--task', '-', stdin='from stdin')
+        self.assertEqual(code, 0)
+        self.assertTrue(self.calls()[0]['stdin'].endswith('from file'))
+        self.assertTrue(self.calls()[1]['stdin'].endswith('from stdin'))
+        code, _, _, _ = self.send('--task', 'task.md')
+        self.assertEqual(code, 0, 'a literal is a literal, even one that names a file')
+        self.assertTrue(self.calls()[2]['stdin'].endswith('task.md'))
+
+    def test_an_empty_task_never_reaches_the_coworker(self):
+        task = self.root / 'empty.md'
+        task.write_text('  \n')
+        for argv in (('--task', ''), ('--task', '-'), ('--task-file', str(task))):
+            code, _, _, err = self.send(*argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn('resolved to nothing', err)
+        self.assertEqual(self.calls(), [])
+
+    # --- outcomes -----------------------------------------------------------------
+
+    def test_a_failing_codex_turn_reports_its_jsonl_error_and_stderr(self):
+        code, request, reply, _ = self.send('--task', 'x', FAKE_EXIT='2', FAKE_STDERR='bad \xff bytes')
+        self.assertEqual(code, 1)
+        self.assertIn('exited 2', reply)
+        self.assertIn('usage limit reached', reply, 'the cause lives only in the event stream')
+        self.assertIn('bad � bytes', reply, 'undecodable stderr does not crash the report')
+        self.assertEqual((self.box() / f'{request}.exit').read_text(), '2\n')
+
+    def test_codex_exiting_clean_without_a_reply_is_a_failure(self):
+        (self.bin / 'codex').write_text(FAKE_CODEX.replace("open(args[args.index('-o') + 1], 'w')", "open(os.devnull, 'w')"))
+        code, _, reply, _ = self.send('--task', 'x')
+        self.assertEqual(code, 1)
+        self.assertIn('without writing its last message', reply)
+        self.assertTrue((self.box() / 'session').exists(), 'the thread exists and resumes')
+
+    def test_a_claude_error_result_is_a_failure_not_an_empty_reply(self):
+        error = json.dumps({'type': 'result', 'subtype': 'error_max_turns', 'is_error': True, 'errors': ['turn limit']})
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='', FAKE_RESULT=error)
+        self.assertEqual(code, 1)
+        self.assertIn('turn limit', reply)
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='', FAKE_RESULT='not json at all')
+        self.assertEqual(code, 1)
+        self.assertIn('without a usable result', reply)
+
+    def test_a_reply_without_the_files_line_is_flagged(self):
+        code, _, reply, err = self.send('--task', 'x', FAKE_REPLY='did it\n')
+        self.assertEqual(code, cowork.MALFORMED)
+        self.assertEqual(reply, 'did it\n', 'the reply is still shown')
+        self.assertIn('no "Files touched" line', err)
+
+    def test_a_missing_cli_is_reported_not_raised(self):
+        (self.bin / 'codex').unlink()
+        code, _, reply, _ = self.send('--task', 'x', PATH=f'{self.bin}:{os.path.dirname(shutil.which("git"))}')
+        self.assertEqual(code, 1)
+        self.assertIn('failed', reply)
+        self.assertIn('No such file', reply)
+
+    def test_publish_is_all_or_nothing_and_the_first_verdict_wins(self):
+        target = self.root / 'x.exit'
+        self.assertTrue(cowork.publish(target, '0\n'))
+        self.assertFalse(cowork.publish(target, 'died\n'))
+        self.assertEqual(target.read_text(), '0\n')
+        self.assertFalse(list(self.root.glob('*.tmp')))
+
+    # --- the queue ------------------------------------------------------------------
+
+    def test_queued_sends_run_in_order_on_the_same_session(self):
+        first, first_id = self.send_gated('--task', 'one')
+        second, second_id = self.send_gated('--task', 'two')
+        third, third_id = self.send_gated('--task', 'three')
+        self.started(first_id)
+        _, out, _ = self.run_cli('status')
+        self.assertIn(f'{first_id}  running', out)
+        self.assertIn(f'{third_id}  queued', out)
+        self.gate.touch()
+        for proc in (first, second, third):
+            self.assertEqual(proc.wait(timeout=30), 0)
+            self.assertIn('Files touched: none', proc.stdout.read())
+        tasks = [c['stdin'].rsplit('\n', 1)[-1] for c in self.calls()]
+        self.assertEqual(tasks, ['one', 'two', 'three'])
+        self.assertNotIn('resume', self.calls()[0]['argv'])
+        self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
+        self.assertEqual(self.calls()[2]['argv'][:3], ['exec', 'resume', 'thread-42'])
+        self.assertIn('coworker on the cowork channel', self.calls()[0]['stdin'])
+        self.assertNotIn('coworker on the cowork channel', self.calls()[1]['stdin'], 'bootstrap decided at run time')
+
+    def test_a_failed_turn_skips_what_was_queued_behind_it(self):
+        first, first_id = self.send_gated('--task', 'one', FAKE_EXIT='2')
+        second, second_id = self.send_gated('--task', 'two')
+        self.gate.touch()
+        self.assertEqual(first.wait(timeout=30), 1)
+        self.assertEqual(second.wait(timeout=30), 1)
+        out = second.stdout.read()
+        self.assertIn('was skipped', out)
+        self.assertIn(f'queued behind {first_id}, which ended 2', out)
+        self.assertEqual(len(self.calls()), 1, 'the second never reached the coworker')
+        code, _, _, _ = self.send('--task', 'three')
+        self.assertEqual(code, 0, 'a request sent after the failure is not behind it')
+
+    def test_a_corpse_in_the_box_neither_blocks_nor_poisons(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-00000000-000000-000000.task').write_text('p')
+        (box / 'codex-00000000-000000-000000.lock').touch()  # nobody holds it
+        code, _, _, _ = self.send('--task', 'after a corpse')
+        self.assertEqual(code, 0)
+        _, out, _ = self.run_cli('status')
+        self.assertIn('codex-00000000-000000-000000  died', out)
+
+    def test_a_runner_that_dies_while_queued_skips_what_was_behind_it(self):
+        first, first_id = self.send_gated('--task', 'slow')
+        second, second_id = self.send_gated('--task', 'doomed')
+        third, third_id = self.send_gated('--task', 'behind doomed')
+        self.started(first_id)
+        runner = int(subprocess.run(['pgrep', '-f', f'_run codex {second_id}'], capture_output=True, text=True).stdout.split()[0])
+        os.kill(runner, 9)  # the runner dies while still queued; nothing holds its lock
+        self.gate.touch()
+        self.assertEqual(first.wait(timeout=30), 0)
+        self.assertEqual(third.wait(timeout=30), 1)
+        self.assertIn(f'queued behind {second_id}, which ended died', third.stdout.read())
+        self.assertEqual(second.wait(timeout=10), 1, 'the send behind the dead runner reports it')
+
+    def test_reset_refuses_while_requests_are_pending(self):
+        proc, request = self.send_gated('--task', 'slow')
+        code, _, err = self.run_cli('reset', 'codex')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn(request, err)
+        self.gate.touch()
+        proc.wait(timeout=30)
+        code, _, _ = self.run_cli('reset', 'codex')
+        self.assertEqual(code, 0)
+
+    # --- kills --------------------------------------------------------------------------
+
+    def test_kill_stops_a_running_request_and_what_was_behind_it_is_skipped(self):
+        first, first_id = self.send_gated('--task', 'slow')
+        second, second_id = self.send_gated('--task', 'next')
+        self.started(first_id)
+        code, out, _ = self.run_cli('kill', first_id)
+        self.assertEqual(out.strip(), f'{first_id}: killed')
+        self.assertEqual(first.wait(timeout=10), 1)
+        self.assertIn('was killed', first.stdout.read())
+        self.assertFalse(cowork.held(self.box() / f'{first_id}.lock'), 'nothing of the turn survives')
+        self.assertEqual(second.wait(timeout=30), 1)
+        self.assertIn('which ended killed', second.stdout.read())
+
+    def test_kill_a_queued_request_before_it_starts(self):
+        first, first_id = self.send_gated('--task', 'slow')
+        second, second_id = self.send_gated('--task', 'never')
+        self.started(first_id)
+        code, out, _ = self.run_cli('kill', second_id)
+        self.assertEqual(out.strip(), f'{second_id}: killed')
+        self.assertEqual(second.wait(timeout=10), 1)
+        self.gate.touch()
+        self.assertEqual(first.wait(timeout=30), 0, 'the running one is untouched')
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_kill_takes_tools_that_left_the_process_group(self):
+        self.codex_does("import subprocess; open('tool.pid', 'w').write(str(subprocess.Popen(['sleep', '60'], start_new_session=True).pid))")
+        proc, request = self.send_gated('--task', 'x')
+        until(lambda: (self.root / 'tool.pid').exists())
+        self.run_cli('kill', request)
+        proc.wait(timeout=10)
+        with self.assertRaises(ProcessLookupError, msg='a tool in its own session died with the tree'):
+            os.kill(int((self.root / 'tool.pid').read_text()), 0)
+
+    def test_kill_freezes_the_tree_so_nothing_spawned_meanwhile_escapes(self):
+        self.codex_does('import subprocess; subprocess.Popen(["sh", "-c", "while :; do setsid sh -c \\"sleep 1; touch late\\" & sleep 0.05; done"])')
+        proc, request = self.send_gated('--task', 'x')
+        self.started(request)
+        self.run_cli('kill', request)
+        proc.wait(timeout=10)
+        (self.root / 'late').unlink(missing_ok=True)  # anything that landed before the kill
+        time.sleep(1.2)
+        self.assertFalse((self.root / 'late').exists())
+
+    def test_a_request_stays_live_while_its_lock_is_held_even_with_a_verdict(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        (box / 'codex-x.exit').write_text('killed\n')
+        with (box / 'codex-x.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a kill was published; the teardown is not done
+            self.assertEqual(cowork.live(box), ['codex-x'])
+            code, _, _ = self.run_cli('reset', 'codex')
+            self.assertEqual(code, cowork.BUSY)
+        self.assertEqual(cowork.live(box), [])
+
+    def test_kill_signals_only_a_pid_that_holds_the_request_lock(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        stranger = subprocess.Popen(['sleep', '30'])  # a reused pid: a process that never had the lock
+        with (box / 'codex-x.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a runner still holds it, but its CLI is gone
+            (box / 'codex-x.cli').write_text(f'{stranger.pid}\n')
+            with mock.patch.object(cowork, 'kill_tree') as kill:
+                code, out, _ = self.run_cli('kill', 'codex-x')
+            self.assertEqual(out.strip(), 'codex-x: killed')
+            kill.assert_not_called()
+        stranger.kill()
+        stranger.wait()
+        (box / 'codex-y.task').write_text('p')
+        with (box / 'codex-y.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            orphan = subprocess.Popen(['sleep', '30'], pass_fds=(lock.fileno(),))
+        (box / 'codex-y.cli').write_text(f'{orphan.pid}\n')
+        try:
+            self.assertTrue(cowork.holds(orphan.pid, box / 'codex-y.lock'))
+            code, out, _ = self.run_cli('kill', 'codex-y')
+            self.assertEqual(orphan.wait(timeout=5), -9, 'the pid that holds the lock is ours to kill')
+        finally:
+            if orphan.poll() is None:
+                orphan.kill()
+                orphan.wait()
+
+    def test_kill_on_a_finished_request_signals_nothing(self):
+        _, request, _, _ = self.send('--task', 'done')
+        (self.box() / f'{request}.cli').write_text(f'{os.getpid()}\n')  # a reused pid: ours
+        with mock.patch.object(cowork, 'kill_tree') as kill:
+            code, out, _ = self.run_cli('kill', request)
+        self.assertEqual(out.strip(), f'{request}: 0')
+        kill.assert_not_called()
+
+    # --- the runner outlives the caller ---------------------------------------------
+
+    def test_a_killed_send_loses_nothing(self):
+        proc, request = self.send_gated('--task', 'x')
+        self.started(request)
+        runner = int(subprocess.run(['pgrep', '-f', f'_run codex {request}'], capture_output=True, text=True).stdout.split()[0])
+        with open(f'/proc/{runner}/stat') as stat:
+            self.assertNotEqual(int(stat.read().rsplit(')', 1)[1].split()[1]), proc.pid, 'the runner is not a child of send')
+        proc.kill()
+        proc.wait()
+        self.gate.touch()
+        until(lambda: (self.box() / f'{request}.exit').exists())
+        self.assertEqual((self.box() / f'{request}.exit').read_text(), '0\n')
+        self.assertEqual((self.box() / f'{request}.reply').read_text(), 'codex reply\nFiles touched: none\n')
+        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\n', 'the thread was still bound')
+        _, out, _ = self.run_cli('status')
+        self.assertIn(f'{request}  0', out)
+
+    def test_a_dead_runner_with_a_live_coworker_is_busy_until_killed(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        with (box / 'codex-x.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            orphan = subprocess.Popen(['sleep', '30'], pass_fds=(lock.fileno(),))
+        (box / 'codex-x.cli').write_text(f'{orphan.pid}\n')
+        try:
+            _, out, _ = self.run_cli('status')
+            self.assertIn('codex-x  running', out)
+            code, _, err = self.run_cli('reset', 'codex')
+            self.assertEqual(code, cowork.BUSY)
+            code, out, _ = self.run_cli('kill', 'codex-x')
+            self.assertEqual(out.strip(), 'codex-x: killed')
+            self.assertEqual(orphan.wait(timeout=5), -9, 'killed, not waited for')
+        finally:
+            if orphan.poll() is None:
+                orphan.kill()
+                orphan.wait()
+        code, _, _ = self.run_cli('reset', 'codex')
+        self.assertEqual(code, 0)
+
+    def test_read_prints_a_settled_reply_and_refuses_a_live_request(self):
+        proc, request = self.send_gated('--task', 'x')
+        self.started(request)
+        code, _, err = self.run_cli('read', request)
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn(f'{request} is running', err)
+        self.gate.touch()
+        proc.wait(timeout=30)
+        code, out, _ = self.run_cli('read', request)
+        self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'))
+        code, out, _ = self.run_cli('read', request.replace('codex-', 'codex-nope-'))
+        self.assertEqual(code, cowork.BUSY)
+
+    def test_read_of_a_request_whose_send_died_at_enqueue_reports_not_raises(self):
+        self.box().mkdir(parents=True)
+        (self.box() / 'codex-x.task').write_text('p')
+        code, out, _ = self.run_cli('read', 'codex-x')
+        self.assertEqual(code, cowork.FAILED)
+        self.assertIn('codex-x died without recording a verdict', out)
+
+    def test_watch_reports_each_request_once_as_it_settles_and_replays_only_what_was_asked(self):
+        _, earlier, _, _ = self.send('--task', 'before')
+        _, unasked, _, _ = self.send('--task', 'not replayed', FAKE_REPLY='no footer\n')
+        watch = subprocess.Popen([sys.executable, str(SCRIPT), 'watch', earlier], cwd=self.root,
+                                 stdout=subprocess.PIPE, text=True)
+        self.background.append(watch)
+        self.assertEqual(watch.stdout.readline(), f'{earlier}   replied\n')
+        first, first_id = self.send_gated('--task', 'one')
+        second, second_id = self.send_gated('--task', 'two', FAKE_EXIT='2')
+        third, third_id = self.send_gated('--task', 'three')
+        self.started(first_id)
+        self.gate.touch()
+        for proc in (first, second, third):
+            proc.wait(timeout=30)
+        lines = [watch.stdout.readline() for _ in range(3)]
+        self.assertEqual(lines, [f'{first_id}   replied\n', f'{second_id}   exited 2\n',
+                                 f'{third_id}   was skipped\n'])
+        self.assertIsNone(watch.poll(), 'a watch outlives the requests it reported')
+        watch.kill()
+        watch.wait()
+        self.assertNotIn(unasked, watch.stdout.read())
+        code, _, _ = self.run_cli('watch', 'codex-nope')
+        self.assertEqual(code, cowork.BUSY)
+
+    def test_the_jsonl_exists_the_instant_the_id_is_printed(self):
+        proc, request = self.send_gated('--task', 'x')
+        self.assertTrue((self.box() / f'{request}.jsonl').exists())
+        self.gate.touch()
+        proc.wait(timeout=30)
+
+    def test_unknown_request(self):
+        code, _, _ = self.run_cli('kill', 'codex-nope')
+        self.assertEqual(code, cowork.BUSY)
 
 
 class Frontmatter(unittest.TestCase):
-    """A bare `word: ` inside an unquoted description is a YAML mapping, not
-    prose, and the whole block stops parsing. Cheap to write, silent to hit."""
-
-    def head(self):
-        return SKILL.read_text().split('---')[1]
-
-    def test_parses_as_yaml(self):
-        yaml.safe_load(self.head())
-
     def test_declares_name_and_description(self):
-        fm = yaml.safe_load(self.head())
+        fm = yaml.safe_load(SKILL.read_text().split('---')[1])
         self.assertEqual(fm['name'], 'cowork')
         self.assertTrue(fm['description'].strip())
+
+    def test_script_is_executable(self):
+        self.assertTrue(os.access(SCRIPT, os.X_OK))
 
 
 if __name__ == '__main__':

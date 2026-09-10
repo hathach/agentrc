@@ -298,6 +298,7 @@ class GateTest(unittest.TestCase):
         reply = self.review([FINDING])
         self.assertIn('peer wrote this', self.s.prompts[0])
         self.assertIn("may include a peer's edits", reply['reason'])
+        self.assertIn('nor had a coworker write for you', reply['reason'], 'commissioned edits are ours to defend')
         self.assertIn('a peer sharing the checkout may have made some', self.s.prompts[0])
 
     def test_an_interrupted_turn_keeps_its_edits_for_the_next_review(self):
@@ -636,8 +637,10 @@ class ActivationTest(unittest.TestCase):
             gate.remove(settings)
         self.assertNotIn('hooks', json.loads(settings.read_text()))
 
-    def run_hook(self, cwd, payload, project=None):
+    def run_hook(self, cwd, payload, project=None, **extra):
         env = {**os.environ, 'XDG_CACHE_HOME': str(self.base / 'cache'), 'CLAUDE_PROJECT_DIR': str(project or cwd)}
+        env.pop('COWORK_TURN', None)  # the suite itself may run inside a cowork turn
+        env.update(extra)
         return subprocess.run([str(WRAPPER)], input=json.dumps({'session_id': 's', 'cwd': str(cwd), **payload}),
                               capture_output=True, text=True, env=env, check=True)
 
@@ -651,6 +654,11 @@ class ActivationTest(unittest.TestCase):
         sh(self.root, 'git', 'worktree', 'add', '-q', str(self.base / 'wt'), '-b', 'wt')
         self.run_hook(self.base / 'wt', prompt)
         self.assertTrue(list((self.base / 'cache' / 'agentrc' / 'simplify-gate').iterdir()), 'worktrees share the marker')
+
+    def test_a_cowork_turn_is_left_alone(self):
+        out = self.run_hook(self.root, {'hook_event_name': 'UserPromptSubmit', 'prompt': 'hi'}, COWORK_TURN='codex-1').stdout
+        self.assertEqual(out, '')
+        self.assertFalse((self.base / 'cache').exists())
 
     def test_the_project_dir_names_the_checkout_not_the_shell_cwd(self):
         prompt = {'hook_event_name': 'UserPromptSubmit', 'prompt': 'hi'}

@@ -54,7 +54,7 @@ retry on Codex failure, then it lets the stop through with a notice. One
 review runs at a time; edits a round did not cover, or made while one was
 running, stay queued for the next turn. A peer sharing the checkout
 may have made some of the diff; the challenge says so, and Claude rejects
-findings on files it did not write. Codex never edits.
+findings on files it neither wrote nor commissioned. Codex never edits.
 
 Install the hooks once per machine, then switch the gate on per repository:
 
