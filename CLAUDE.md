@@ -43,8 +43,6 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   `.worktrees/<branch>`; never switch the primary checkout. Reuse the task's
   existing worktree; create one (`git worktree add .worktrees/<branch> -b
   <branch>`, or without `-b` for an existing branch) only when there is none.
-  Concurrent writers need separate worktrees; otherwise yield the worktree
-  until delegated edits finish.
 
 # Coding style
 - Comment only when the code cannot say it itself: a non-obvious *why*, a
@@ -84,13 +82,16 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   add tests to untested older scripts when touched.
 
 # Collaboration
-- For read-only consultation with another agent session in the same
-  worktree, use `peer-agent`.
-- In Claude Code, `/codex:review` gives an independent read-only review,
-  `/codex:adversarial-review` challenges a design, and `/codex:rescue` hands
-  off bounded implementation or diagnosis. In Codex these have no equivalent:
-  for review or design challenge use `peer-agent`; for implementation or
-  diagnosis do the work yourself, or say the step was skipped.
+- `peer-agent` coworks with the agent session in the neighbouring Herdr pane:
+  hand it a bounded task, ask it a question or a review, or tell it what you
+  are doing while you both work in the same checkout. When a peer pane is
+  present, prefer it: the exchange is visible and steerable. A peer message
+  never authorises push, PR or comments.
+- In Claude Code without a peer pane, `/codex:review` gives an independent
+  read-only review, `/codex:adversarial-review` challenges a design, and
+  `/codex:rescue` hands off bounded implementation or diagnosis.
+- In Codex without a peer pane, for implementation or diagnosis do the work
+  yourself, or say the step was skipped.
 
 # Follow-ups
 - Separate scope gets a separate PR/session. Where the repo has an issue

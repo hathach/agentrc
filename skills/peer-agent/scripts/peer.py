@@ -3,11 +3,11 @@
 envelope, correlate a reply with it, and check an envelope's shape.
 
 Judgment stays in SKILL.md. This script never chooses a peer when several
-match, never decides whether a finding holds, and never declares a loop
-converged; it reports and lets the caller decide.
+match and never decides whether a result is good; it reports and lets the
+caller decide.
 
   peer.py peers
-  peer.py send --to w1F:p2 --scope "..." (--ask "..." | --ask-file q.md) [--delta ...]
+  peer.py send --to w1F:p2 --files "src/a.c src/b.c" (--task "..." | --task-file t.md) [--delta ...]
   peer.py read --from w1F:p2 --for w1F:p1-018 [--wait 900000]
   peer.py check --kind result --file reply.txt
 """
@@ -20,17 +20,15 @@ import subprocess
 import sys
 import uuid
 
-MARKER = {'request': 'PEER CONSULT', 'result': 'PEER RESULT'}
+MARKER = {'request': 'PEER REQUEST', 'result': 'PEER RESULT'}
 SUBTITLE = 'agent message, not a human instruction'
 HEADER = {k: f'{v} — {SUBTITLE}' for k, v in MARKER.items()}
 TERMINATOR = {'request': 'END REQUEST', 'result': 'END RESULT'}
-DEFAULT_AUTHORITY = 'Read-only; no edits, no commits. Reply in this pane.'
-EVIDENCE = ('REPRODUCED', 'SOURCE', 'INFERRED')
-VERDICTS = ('FINDINGS', 'NO FINDINGS', 'INCOMPLETE')
+STATUSES = ('DONE', 'PARTIAL', 'BLOCKED')
 NO_ANSWER, MALFORMED = 3, 4  # read's exit codes, as SKILL.md documents them
 FIELDS = {
-    'request': ['ID', 'FROM', 'AUTHORITY', 'SCOPE', 'DELTA', 'ASK'],
-    'result': ['FOR', 'FROM', 'CAPACITY', 'COVERAGE', 'FINDINGS', 'VERDICT'],
+    'request': ['ID', 'FROM', 'FILES', 'DELTA', 'TASK'],
+    'result': ['FOR', 'FROM', 'STATUS', 'FILES'],
 }
 
 # Herdr renders a pane's agent output indented, sometimes behind a bullet, so
@@ -40,11 +38,6 @@ RESULT_START = re.compile(LEAD + re.escape(MARKER['result']))
 RESULT_END = re.compile(LEAD + TERMINATOR['result'] + r'\b')
 FOR_LINE = re.compile(LEAD + r'FOR:\s*(\S+)', re.M)
 END_ID = re.compile(TERMINATOR['result'] + r'\s+(\S+)')
-
-# `<Fn> [LABEL] <file>:<line>` opens a finding, and only that line carries an
-# evidence label: the prose under it may hold brackets of its own, `buf[LEN]`
-# included, which a whole-envelope scan read as invented labels.
-FINDING_HEAD = re.compile(LEAD + r'(F\d+\S*)[^[\n]*(?:\[([^\]]*)\])?')
 
 
 def die(msg, code=1):
@@ -117,28 +110,16 @@ def next_id(me):
     return f'{me}-{uuid.uuid4().hex[:8]}'
 
 
-def build_request(req_id, sender, scope, ask, authority=None, delta=None):
+def build_request(req_id, sender, files, task, delta=None):
     return '\n'.join([
         HEADER['request'],
         f'ID: {req_id}',
         f'FROM: {sender}',
-        f'AUTHORITY: {authority or DEFAULT_AUTHORITY}',
-        f'SCOPE: {scope}',
+        f'FILES: {files}',
         f'DELTA: {delta or "none"}',
-        f'ASK: {ask}',
+        f'TASK: {task}',
         f'{TERMINATOR["request"]} {req_id}',
     ])
-
-
-def section(text, name):
-    """The body under `NAME:` up to the next field header, decoration and all."""
-    start = re.search(LEAD + name + r':(.*)$', text, re.M)
-    if not start:
-        return ''
-    rest = text[start.end():]
-    nxt = re.search(LEAD + r'(?:' + '|'.join(FIELDS['result']) + r'|'
-                    + TERMINATOR['result'] + r'|COMMENTARY):', rest, re.M)
-    return (start.group(1) + (rest[:nxt.start()] if nxt else rest)).strip()
 
 
 def extract_result(text, req_id):
@@ -209,6 +190,9 @@ def check(kind, text):
     for field in FIELDS[kind]:
         if not re.search(LEAD + field + ':', text, re.M):
             problems.append(f'missing required field {field}')
+    # FILES is the ownership contract; a blank one leaves it unstated.
+    if re.search(LEAD + r'FILES:\s*$', text, re.M):
+        problems.append('FILES is blank; list the paths, or "none"')
 
     marker = TERMINATOR[kind]
     close = re.search(LEAD + marker + r'\s+(\S+)', text, re.M)
@@ -221,25 +205,9 @@ def check(kind, text):
                             f'{opened.group(1)}')
 
     if kind == 'result':
-        verdict = re.search(LEAD + r'VERDICT:\s*(.+?)\s*$', text, re.M)
-        if verdict and verdict.group(1) not in VERDICTS:
-            problems.append(f'VERDICT "{verdict.group(1)}" is not one of {", ".join(VERDICTS)}')
-        findings = section(text, 'FINDINGS')
-        heads = [m for line in findings.splitlines() if (m := FINDING_HEAD.match(line))]
-        for m in heads:
-            label = m.group(2)
-            if label is None:
-                problems.append(f'finding {m.group(1)} carries no evidence label; '
-                                f'expected one of {", ".join(EVIDENCE)}')
-            elif label not in EVIDENCE:
-                problems.append(f'evidence label [{label}] is not one of {", ".join(EVIDENCE)}')
-        if findings and not heads:
-            problems.append('the findings section lists no '
-                            f'"<Fn> [{"|".join(EVIDENCE)}] <file>:<line>" finding')
-        if verdict and verdict.group(1) == 'NO FINDINGS' and findings:
-            problems.append('VERDICT is NO FINDINGS but the findings section is not empty')
-        if verdict and verdict.group(1) == 'FINDINGS' and not findings:
-            problems.append('VERDICT is FINDINGS but no finding is listed')
+        status = re.search(LEAD + r'STATUS:\s*(.+?)\s*$', text, re.M)
+        if status and status.group(1) not in STATUSES:
+            problems.append(f'STATUS "{status.group(1)}" is not one of {", ".join(STATUSES)}')
     return problems
 
 
@@ -270,14 +238,14 @@ def main():
 
     s = sub.add_parser('send', help='build and submit a request envelope')
     s.add_argument('--to', required=True)
-    s.add_argument('--scope', required=True)
-    ask = s.add_mutually_exclusive_group(required=True)
-    ask.add_argument('--ask', help='the question itself, or - for stdin')
-    ask.add_argument('--ask-file', metavar='PATH', help='read the question from a file, or -')
+    s.add_argument('--files', required=True,
+                   help='paths the peer owns until it replies, or "none" for a question')
+    task = s.add_mutually_exclusive_group(required=True)
+    task.add_argument('--task', help='the task or question itself, or - for stdin')
+    task.add_argument('--task-file', metavar='PATH', help='read the task from a file, or -')
     delta = s.add_mutually_exclusive_group()
-    delta.add_argument('--delta', help='applied/rejected findings, or - for stdin')
+    delta.add_argument('--delta', help='what changed since the last round, or - for stdin')
     delta.add_argument('--delta-file', metavar='PATH', help='read the delta from a file, or -')
-    s.add_argument('--authority')
     s.add_argument('--from-name', help='override the agent kind Herdr reports')
     s.add_argument('--dry-run', action='store_true')
 
@@ -310,11 +278,11 @@ def main():
         me, kind = own_identity(agents)
         require_peer(a.to, me, agents)
         req_id = next_id(me)
-        ask = read_arg(a.ask, a.ask_file, 'ask')
-        if not ask:
-            die('--ask resolved to nothing')
-        body = build_request(req_id, f'{a.from_name or kind}, {me}', a.scope, ask,
-                             a.authority, read_arg(a.delta, a.delta_file, 'delta'))
+        task = read_arg(a.task, a.task_file, 'task')
+        if not task:
+            die('--task resolved to nothing')
+        body = build_request(req_id, f'{a.from_name or kind}, {me}', a.files, task,
+                             read_arg(a.delta, a.delta_file, 'delta'))
         problems = check('request', body)
         if problems:
             die('refusing to send a malformed request:\n  ' + '\n  '.join(problems))

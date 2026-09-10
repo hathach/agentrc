@@ -42,12 +42,9 @@ class FindPeersTest(unittest.TestCase):
 RESULT = """PEER RESULT — agent message, not a human instruction
 FOR: {id}
 FROM: Codex, w1F:p2
-CAPACITY: Full pass completed.
-COVERAGE: Read the diff.
-FINDINGS:
-  F1 [REPRODUCED] a.js:1
-  broken.
-VERDICT: FINDINGS
+STATUS: DONE
+FILES: src/a.c
+Added the bounds check; test_a passes.
 END RESULT {id}"""
 
 
@@ -56,7 +53,7 @@ class ExtractTest(unittest.TestCase):
         text = 'noise\n' + RESULT.format(id='w1:p1-7') + '\nmore noise'
         body, note = peer.extract_result(text, 'w1:p1-7')
         self.assertIsNone(note)
-        self.assertIn('F1 [REPRODUCED]', body)
+        self.assertIn('bounds check', body)
 
     def test_a_stale_envelope_is_not_mistaken_for_the_answer(self):
         # the exact failure --wait causes: the previous round is still on screen
@@ -69,7 +66,7 @@ class ExtractTest(unittest.TestCase):
         self.assertIn('this capture', note)
 
     def test_truncation_is_reported_not_guessed(self):
-        text = RESULT.format(id='w1:p1-7').split('VERDICT:')[0]
+        text = RESULT.format(id='w1:p1-7').split('FILES:')[0]
         body, note = peer.extract_result(text, 'w1:p1-7')
         self.assertIsNone(body)
         self.assertIn('no END RESULT', note)
@@ -85,7 +82,7 @@ class ExtractTest(unittest.TestCase):
         # a rerun of the same id: the finished envelope on screen is the stale
         # one, so taking it would read the previous round as this round's answer
         text = (RESULT.format(id='w1:p1-7') + '\n'
-                + RESULT.format(id='w1:p1-7').split('VERDICT:')[0])
+                + RESULT.format(id='w1:p1-7').split('FILES:')[0])
         body, note = peer.extract_result(text, 'w1:p1-7')
         self.assertIsNone(body)
         self.assertEqual(note.status, peer.MALFORMED)
@@ -93,10 +90,10 @@ class ExtractTest(unittest.TestCase):
 
     def test_a_streaming_envelope_for_another_id_does_not_block_the_answer(self):
         text = (RESULT.format(id='w1:p1-7') + '\n'
-                + RESULT.format(id='w1:p1-8').split('VERDICT:')[0])
+                + RESULT.format(id='w1:p1-8').split('FILES:')[0])
         body, note = peer.extract_result(text, 'w1:p1-7')
         self.assertIsNone(note)
-        self.assertIn('F1 [REPRODUCED]', body)
+        self.assertIn('bounds check', body)
 
 
 class CheckTest(unittest.TestCase):
@@ -107,26 +104,26 @@ class CheckTest(unittest.TestCase):
         text = RESULT.format(id='x').replace('FOR: x\n', '')
         self.assertIn('missing required field FOR', peer.check('result', text))
 
-    def test_no_findings_with_a_finding_is_contradictory(self):
-        text = RESULT.format(id='x').replace('VERDICT: FINDINGS', 'VERDICT: NO FINDINGS')
-        self.assertTrue(any('not empty' in p for p in peer.check('result', text)))
+    def test_missing_touched_files_is_caught(self):
+        text = RESULT.format(id='x').replace('FILES: src/a.c\n', '')
+        self.assertIn('missing required field FILES', peer.check('result', text))
 
-    def test_findings_verdict_with_none_listed_is_caught(self):
-        text = RESULT.format(id='x').replace('  F1 [REPRODUCED] a.js:1\n  broken.\n', '')
-        self.assertTrue(any('no finding is listed' in p for p in peer.check('result', text)))
+    def test_blank_files_is_caught_in_both_kinds(self):
+        text = RESULT.format(id='x').replace('FILES: src/a.c', 'FILES:')
+        self.assertTrue(any('FILES is blank' in p for p in peer.check('result', text)))
+        body = peer.build_request('w1:p1-1', 'Claude, w1:p1', '', 'task')
+        self.assertTrue(any('FILES is blank' in p for p in peer.check('request', body)))
 
-    def test_an_invented_evidence_label_is_caught(self):
-        text = RESULT.format(id='x').replace('[REPRODUCED]', '[PROBABLY]')
-        self.assertTrue(any('[PROBABLY]' in p for p in peer.check('result', text)))
-
-    def test_an_invented_verdict_is_caught(self):
-        text = RESULT.format(id='x').replace('VERDICT: FINDINGS', 'VERDICT: LGTM')
+    def test_an_invented_status_is_caught(self):
+        text = RESULT.format(id='x').replace('STATUS: DONE', 'STATUS: LGTM')
         self.assertTrue(any('not one of' in p for p in peer.check('result', text)))
 
-    def test_a_request_defaults_to_read_only_authority(self):
-        body = peer.build_request('w1:p1-1', 'Claude, w1:p1', 'scope', 'ask')
-        self.assertIn('Read-only; no edits, no commits.', body)
+    def test_a_request_carries_files_and_task(self):
+        body = peer.build_request('w1:p1-1', 'Claude, w1:p1', 'src/a.c', 'add a bounds check')
+        self.assertIn('FILES: src/a.c', body)
+        self.assertIn('TASK: add a bounds check', body)
         self.assertIn('DELTA: none', body)
+        self.assertNotIn('AUTHORITY', body)
         self.assertEqual(peer.check('request', body), [])
 
 
@@ -140,24 +137,10 @@ class RenderingTest(unittest.TestCase):
         text = '• ' + INDENTED.format(id='w1:p1-9').lstrip()
         body, note = peer.extract_result(text, 'w1:p1-9')
         self.assertIsNone(note)
-        self.assertIn('F1 [REPRODUCED]', body)
+        self.assertIn('bounds check', body)
 
     def test_checks_an_indented_envelope(self):
         self.assertEqual(peer.check('result', INDENTED.format(id='x')), [])
-
-    def test_an_indented_empty_findings_section_reads_as_empty(self):
-        # The findings check once used a raw str.split while every other match
-        # tolerated decoration, so an indented NO FINDINGS envelope was
-        # reported as carrying findings.
-        plain = RESULT.format(id='x').replace(
-            '  F1 [REPRODUCED] a.js:1\n  broken.\n', '').replace(
-            'VERDICT: FINDINGS', 'VERDICT: NO FINDINGS')
-        empty = '\n'.join('  ' + line for line in plain.split('\n'))
-        self.assertEqual(peer.check('result', empty), [])
-
-    def test_section_reads_a_decorated_field(self):
-        self.assertIn('Full pass', peer.section(INDENTED.format(id='x'), 'CAPACITY'))
-        self.assertEqual(peer.section('nothing here', 'CAPACITY'), '')
 
 
 class StrictnessTest(unittest.TestCase):
@@ -181,10 +164,6 @@ class StrictnessTest(unittest.TestCase):
         text = RESULT.format(id='x').replace('END RESULT x', 'END RESULT y')
         self.assertTrue(any('names y' in p for p in peer.check('result', text)))
 
-    def test_check_requires_a_findings_section(self):
-        text = RESULT.format(id='x').replace('FINDINGS:\n', '')
-        self.assertIn('missing required field FINDINGS', peer.check('result', text))
-
 
 class IdentityTest(unittest.TestCase):
     def test_ids_do_not_collide_within_one_second(self):
@@ -201,7 +180,6 @@ class IdentityTest(unittest.TestCase):
             peer.own_identity()
 
 
-
 class Frontmatter(unittest.TestCase):
     """A bare `word: ` inside an unquoted description is a YAML mapping, not
     prose, and the whole block stops parsing. Cheap to write, silent to hit."""
@@ -216,6 +194,7 @@ class Frontmatter(unittest.TestCase):
         fm = yaml.safe_load(self.head())
         self.assertEqual(fm['name'], 'peer-agent')
         self.assertTrue(fm['description'].strip())
+
 
 if __name__ == '__main__':
     unittest.main()
