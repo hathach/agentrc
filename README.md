@@ -21,11 +21,12 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 ~/code/agentrc/install.sh
 ```
 
-This links `CLAUDE.md`, `skills/` and `commands/` into `~/.claude`, points
-`~/.codex/AGENTS.md` at the same `CLAUDE.md`, and links each skill into
-`~/.codex/skills` (Codex scans that directory, not `~/.claude/skills`, and
-manages `.system` inside it, so skills are linked one by one). Rerun it after
-adding a skill so Codex picks it up.
+This links `CLAUDE.md` and `commands/` into `~/.claude`, points
+`~/.codex/AGENTS.md` at the same `CLAUDE.md`, and links each skill one by one
+into `~/.claude/skills` and `~/.codex/skills`. Those directories stay real
+directories, so a machine can keep its own skills, or ones added with `npx
+skills add`, beside the linked ones; only links into this repo are pruned when a
+skill is removed. Rerun it after adding a skill.
 
 Project repos such as tinyusb reference these skills by bare name only, e.g.
 `read-doc`, and expect this install to have run; without it their agents take
