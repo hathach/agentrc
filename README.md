@@ -47,11 +47,14 @@ symlink install on the same machine or every skill shows up twice.
 
 ## Simplify gate (per repository)
 
-`hooks/simplify_gate.py` records the files a Claude Code session edits (main
-session and its subagents alike) and, when the session stops, sends that patch
-to a read-only `codex exec` YAGNI challenge: at most two rounds per user turn,
-one retry on Codex failure, then it lets the stop through with a notice. Codex
-never edits; Claude applies or rejects each finding.
+`hooks/simplify_gate.py` snapshots the checkout, every worktree of it, when a
+prompt arrives and again when the session stops, and sends the diff to a
+read-only `codex exec` YAGNI challenge: at most two rounds per user turn, one
+retry on Codex failure, then it lets the stop through with a notice. One
+review runs at a time; edits a round did not cover, or made while one was
+running, stay queued for the next turn. A peer sharing the checkout
+may have made some of the diff; the challenge says so, and Claude rejects
+findings on files it did not write. Codex never edits.
 
 Install the hooks once per machine, then switch the gate on per repository:
 
@@ -60,7 +63,7 @@ python3 ~/code/agentrc/hooks/simplify_gate.py --install    # --remove undoes it
 cd ~/code/tinyusb && /simplify-gate on                     # or: skills/simplify-gate/scripts/gate.py on
 ```
 
-`--install` merges five entries into `~/.claude/settings.json` (backup kept
+`--install` merges two entries into `~/.claude/settings.json` (backup kept
 beside it, idempotent, replaces older entries of its own). Each entry runs
 `hooks/simplify-gate`, which costs one `git rev-parse` in every checkout and
 starts the Python gate only where `<git common dir>/simplify-gate` exists, so
