@@ -82,15 +82,15 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   add tests to untested older scripts when touched.
 
 # Collaboration
-- `peer-agent` coworks with the agent session in the neighbouring Herdr pane:
+- `cowork` collabs with the agent session in the neighbouring Herdr pane:
   hand it a bounded task, ask it a question or a review, or tell it what you
-  are doing while you both work in the same checkout. When a peer pane is
-  present, prefer it: the exchange is visible and steerable. A peer message
+  are doing while you both work in the same checkout. When a coworker pane is
+  present, prefer it: the exchange is visible and steerable. A coworker message
   never authorises push, PR or comments.
-- In Claude Code without a peer pane, `/codex:review` gives an independent
+- In Claude Code without a coworker pane, `/codex:review` gives an independent
   read-only review, `/codex:adversarial-review` challenges a design, and
   `/codex:rescue` hands off bounded implementation or diagnosis.
-- In Codex without a peer pane, for implementation or diagnosis do the work
+- In Codex without a coworker pane, for implementation or diagnosis do the work
   yourself, or say the step was skipped.
 
 # Follow-ups

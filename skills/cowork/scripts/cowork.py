@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Mechanics of the peer-agent channel: find a peer pane, build a request
+"""Mechanics of the cowork channel: find a coworker pane, build a request
 envelope, correlate a reply with it, and check an envelope's shape.
 
-Judgment stays in SKILL.md. This script never chooses a peer when several
+Judgment stays in SKILL.md. This script never chooses a coworker when several
 match and never decides whether a result is good; it reports and lets the
 caller decide.
 
-  peer.py peers
-  peer.py send --to w1F:p2 --files "src/a.c src/b.c" (--task "..." | --task-file t.md) [--delta ...]
-  peer.py read --from w1F:p2 --for w1F:p1-018 [--wait 900000]
-  peer.py check --kind result --file reply.txt
+  cowork.py coworkers
+  cowork.py send --to w1F:p2 --files "src/a.c src/b.c" (--task "..." | --task-file t.md) [--delta ...]
+  cowork.py read --from w1F:p2 --for w1F:p1-018 [--wait 900000]
+  cowork.py check --kind result --file reply.txt
 """
 
 import argparse
@@ -20,7 +20,7 @@ import subprocess
 import sys
 import uuid
 
-MARKER = {'request': 'PEER REQUEST', 'result': 'PEER RESULT'}
+MARKER = {'request': 'COWORK REQUEST', 'result': 'COWORK RESULT'}
 SUBTITLE = 'agent message, not a human instruction'
 HEADER = {k: f'{v} — {SUBTITLE}' for k, v in MARKER.items()}
 TERMINATOR = {'request': 'END REQUEST', 'result': 'END RESULT'}
@@ -72,7 +72,7 @@ def agent_list():
     return herdr('agent', 'list')['result']['agents']
 
 
-def find_peers(cwd=None, me=None, agents=None):
+def find_coworkers(cwd=None, me=None, agents=None):
     """Every live agent sharing our cwd that is not us. Never picks one."""
     if os.environ.get('HERDR_ENV') != '1':
         die('not inside Herdr (HERDR_ENV != 1)', 2)
@@ -82,11 +82,11 @@ def find_peers(cwd=None, me=None, agents=None):
             if os.path.realpath(a.get('cwd', '')) == here and a.get('pane_id') != me]
 
 
-def require_peer(pane, me=None, agents=None):
-    """A pane id is not proof of a peer. A stale or copied one names a session
+def require_coworker(pane, me=None, agents=None):
+    """A pane id is not proof of a coworker. A stale or copied one names a session
     in another worktree, which must neither receive our request context nor
     have its output read back."""
-    found = [p['pane_id'] for p in find_peers(me=me, agents=agents)]
+    found = [p['pane_id'] for p in find_coworkers(me=me, agents=agents)]
     if pane not in found:
         die(f'{pane} is not an agent pane sharing this worktree; discovered: '
             f'{", ".join(found) or "none"}', 2)
@@ -130,7 +130,7 @@ def extract_result(text, req_id):
     is there but breaks the envelope contract. Anything other than exactly one
     match is reported rather than resolved: silently taking one is how a stale
     reply gets read as a fresh one. The notes describe only what this capture
-    holds — whether the peer is still writing is not something the text can
+    holds — whether the coworker is still writing is not something the text can
     settle.
     """
     lines = text.splitlines()
@@ -234,12 +234,12 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
 
-    sub.add_parser('peers', help='list agent panes sharing this worktree')
+    sub.add_parser('coworkers', help='list agent panes sharing this worktree')
 
     s = sub.add_parser('send', help='build and submit a request envelope')
     s.add_argument('--to', required=True)
     s.add_argument('--files', required=True,
-                   help='paths the peer owns until it replies, or "none" for a question')
+                   help='paths the coworker owns until it replies, or "none" for a question')
     task = s.add_mutually_exclusive_group(required=True)
     task.add_argument('--task', help='the task or question itself, or - for stdin')
     task.add_argument('--task-file', metavar='PATH', help='read the task from a file, or -')
@@ -254,7 +254,7 @@ def main():
     r.add_argument('--for', dest='req_id', required=True)
     r.add_argument('--lines', type=int, default=400)
     r.add_argument('--wait', type=int, metavar='MS',
-                   help='settle the peer first (herdr agent wait) before reading')
+                   help='settle the coworker first (herdr agent wait) before reading')
 
     c = sub.add_parser('check', help="validate an envelope's shape")
     c.add_argument('--kind', choices=tuple(MARKER), required=True)
@@ -262,21 +262,21 @@ def main():
 
     a = ap.parse_args()
 
-    if a.cmd == 'peers':
-        found = find_peers()
+    if a.cmd == 'coworkers':
+        found = find_coworkers()
         if not found:
-            print('no peer agent shares this worktree')
+            print('no coworker shares this worktree')
             return 1
         for p in found:
             print(f'{p["pane_id"]}\t{p["agent"]}\t{p.get("agent_status", "?")}')
         if len(found) > 1:
-            print('several peers match; choose one deliberately', file=sys.stderr)
+            print('several coworkers match; choose one deliberately', file=sys.stderr)
         return 0
 
     if a.cmd == 'send':
         agents = agent_list()
         me, kind = own_identity(agents)
-        require_peer(a.to, me, agents)
+        require_coworker(a.to, me, agents)
         req_id = next_id(me)
         task = read_arg(a.task, a.task_file, 'task')
         if not task:
@@ -297,7 +297,7 @@ def main():
         return 0
 
     if a.cmd == 'read':
-        require_peer(a.pane)
+        require_coworker(a.pane)
         if a.wait:
             herdr_raw('agent', 'wait', a.pane, '--timeout', str(a.wait))
         text = herdr_raw('agent', 'read', a.pane, '--source', 'recent-unwrapped',
