@@ -75,11 +75,19 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 
 # Skills
 - Put deterministic, checkable mechanics in `<skill>/scripts/`; keep judgment
-  and usage in `SKILL.md`, without duplicating script logic.
+  and usage in `SKILL.md`, without duplicating script logic. Mechanics is
+  what an agent would otherwise re-derive each run: chains of commands,
+  output parsing that decides the next step, computed values, retries, file
+  generation. A recipe the human types once may stay prose, and a script
+  that only wraps one tool's command line is not mechanics: call the tool
+  and keep its flags in the recipe.
 - Scripts must fail explicitly rather than guess; report ambiguous
-  alternatives for the caller to choose.
+  alternatives for the caller to choose. No silent default for a value the
+  caller could get wrong (bus, speed, version).
 - Test new or substantially changed scripts in the repo's script test suite;
-  add tests to untested older scripts when touched.
+  add tests to untested older scripts when touched. Stubs prove the plumbing
+  only: a hardware path is verified by a real run, and without hardware it is
+  reported unverified, never given a dry-run that passes anyway.
 
 # Collaboration
 - `cowork` drives the other coding agent's CLI headless in this worktree, one
