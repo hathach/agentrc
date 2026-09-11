@@ -838,8 +838,6 @@ class CoworkTest(unittest.TestCase):
         self.assertIn(f'Your checkout is the worktree {tree} on branch cowork/main/codex-impl, based on {base[:12]} '
                       'of the host checkout; commit there.', prompt)
         self.assertEqual(self.head(tree), base)
-        self.assertIn('.worktrees/', (self.root / '.gitignore').read_text())
-        self.assertIn('.gitignore; commit it', err)
         code, out, _ = self.run_cli('status')
         self.assertIn(f'codex/impl: session thread-42, gpt-6-astra at medium effort, in {tree}', out)
         self.assertNotIn('codex/main', out)
@@ -1026,12 +1024,6 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.BUSY)
         self.assertIn(f"{tree} is not lane impl's worktree", err)
         self.assertEqual(self.calls(), [])
-
-    def test_the_ignore_rule_is_appended_on_its_own_line(self):
-        self.commit('a.txt', 'a')
-        (self.root / '.gitignore').write_text('build/')
-        self.send('--lane', 'impl', '--task', 'x')
-        self.assertEqual((self.root / '.gitignore').read_text(), 'build/\n.worktrees/\n')
 
     def test_tail_of_a_vanished_stream_names_the_sides_store(self):
         code, _, err = self.run_cli('tail', 'codex-main-20260911-000000-000000')

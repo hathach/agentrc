@@ -165,11 +165,6 @@ def sync_lane(root, box):
         if host.returncode:
             die("the host checkout is detached; a worktree lane names its branch after the host's", BUSY)
         branch = f'cowork/{host.stdout.strip()}/{box.parent.name}-{lane}'
-        if git(root, 'check-ignore', '-q', '.worktrees', check=False).returncode:
-            ignore = root / '.gitignore'
-            text = ignore.read_text() if ignore.exists() else ''
-            ignore.write_text(text + ('' if not text or text.endswith('\n') else '\n') + '.worktrees/\n')
-            print(f'added .worktrees/ to {ignore}; commit it', file=sys.stderr)
         known = git(root, 'rev-parse', '-q', '--verify', f'refs/heads/{branch}', check=False).returncode == 0
         if known and not (box / 'base').exists():  # a branch left by an earlier lane: which of its commits are its own?
             die(f'branch {branch} exists but lane {lane} has no record of its base; delete or rename the branch', BUSY)
