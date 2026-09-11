@@ -86,13 +86,15 @@ class CoworkTest(unittest.TestCase):
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
-            proc.stdout.close()
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe:
+                    pipe.close()
         for box in Path(self.tmp.name).glob('repo/.git/cowork/*'):  # runners hang off init, not off us
             for request in cowork.requests(box):
                 subprocess.run(['pkill', '-9', '-f', f'cowork.py _run \\S+ {request} '], stderr=subprocess.DEVNULL)
-                cli = box / f'{request}.cli'
-                if cli.exists() and cowork.holds(int(cli.read_text()), box / f'{request}.lock'):
-                    os.kill(int(cli.read_text()), 9)
+                pid = cowork.lock_lines((box / f'{request}.lock').read_text())[0]
+                if pid and cowork.holds(int(pid), box / f'{request}.lock'):
+                    os.kill(int(pid), 9)
         os.chdir(self.cwd)
         self.env.stop()
         self.tmp.cleanup()
@@ -133,7 +135,23 @@ class CoworkTest(unittest.TestCase):
         return self.root / '.git' / 'cowork' / side
 
     def started(self, request):
-        until(lambda: (self.box() / f'{request}.cli').exists())
+        until(lambda: cowork.lock_lines((self.box() / f'{request}.lock').read_text())[0] != '')
+
+    def reaped(self, *argv, **env):
+        """A gated send whose process is killed before it can deliver, as the
+        harness reaper would; returns the request id, still undelivered."""
+        proc, request = self.send_gated(*argv, **env)
+        self.started(request)
+        proc.kill()
+        proc.wait()
+        return request
+
+    def settled(self, request):
+        self.gate.touch()
+        until(lambda: not cowork.held(self.box() / f'{request}.lock'))
+
+    def leftovers(self, request):
+        return sorted(p.suffix for p in self.box().glob(f'{request}.*'))
 
     # --- sessions -------------------------------------------------------------
 
@@ -174,13 +192,16 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.calls()[1]['argv'][-2], '--session-id', 'a fresh id, not a resume of nothing')
 
-    def test_reset_forgets_the_session_and_keeps_the_logs(self):
+    def test_reset_forgets_the_session_and_removes_undelivered_requests(self):
         self.send('--task', 'a')
+        undelivered = self.reaped('--task', 'b')
+        self.settled(undelivered)
         code, out, _ = self.run_cli('reset', 'codex')
         self.assertEqual(code, 0)
-        self.assertFalse((self.box() / 'session').exists())
-        self.assertTrue(list(self.box().glob('*.jsonl')))
-        self.send('--task', 'b')
+        self.assertIn('1 undelivered request(s) removed', out)
+        self.assertEqual(sorted(p.name for p in self.box().iterdir()), ['lock'])
+        self.gate.unlink()
+        self.send('--task', 'c')
         self.assertNotIn('resume', self.calls()[-1]['argv'])
 
     # --- the prompt and the coworker's environment ------------------------------
@@ -304,7 +325,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('exited 2', reply)
         self.assertIn('usage limit reached', reply, 'the cause lives only in the event stream')
         self.assertIn('bad � bytes', reply, 'undecodable stderr does not crash the report')
-        self.assertEqual((self.box() / f'{request}.exit').read_text(), '2\n')
+        self.assertEqual(self.leftovers(request), [], 'delivered, so nothing stays')
 
     def test_codex_exiting_clean_without_a_reply_is_a_failure(self):
         (self.bin / 'codex').write_text(FAKE_CODEX.replace("open(args[args.index('-o') + 1], 'w')", "open(os.devnull, 'w')"))
@@ -462,6 +483,8 @@ class CoworkTest(unittest.TestCase):
         with (box / 'codex-x.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)  # a kill was published; the teardown is not done
             self.assertEqual(cowork.live(box), ['codex-x'])
+            code, _, _ = self.run_cli('read', 'codex-x')
+            self.assertEqual(code, cowork.BUSY, 'a verdict does not make teardown complete')
             code, _, _ = self.run_cli('reset', 'codex')
             self.assertEqual(code, cowork.BUSY)
         self.assertEqual(cowork.live(box), [])
@@ -473,7 +496,8 @@ class CoworkTest(unittest.TestCase):
         stranger = subprocess.Popen(['sleep', '30'])  # a reused pid: a process that never had the lock
         with (box / 'codex-x.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)  # a runner still holds it, but its CLI is gone
-            (box / 'codex-x.cli').write_text(f'{stranger.pid}\n')
+            lock.write(f'{stranger.pid}\n')
+            lock.flush()
             with mock.patch.object(cowork, 'kill_tree') as kill:
                 code, out, _ = self.run_cli('kill', 'codex-x')
             self.assertEqual(out.strip(), 'codex-x: killed')
@@ -484,7 +508,7 @@ class CoworkTest(unittest.TestCase):
         with (box / 'codex-y.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             orphan = subprocess.Popen(['sleep', '30'], pass_fds=(lock.fileno(),))
-        (box / 'codex-y.cli').write_text(f'{orphan.pid}\n')
+            lock.write(f'{orphan.pid}\n')
         try:
             self.assertTrue(cowork.holds(orphan.pid, box / 'codex-y.lock'))
             code, out, _ = self.run_cli('kill', 'codex-y')
@@ -495,12 +519,55 @@ class CoworkTest(unittest.TestCase):
                 orphan.wait()
 
     def test_kill_on_a_finished_request_signals_nothing(self):
-        _, request, _, _ = self.send('--task', 'done')
-        (self.box() / f'{request}.cli').write_text(f'{os.getpid()}\n')  # a reused pid: ours
+        request = self.reaped('--task', 'done')
+        self.settled(request)
+        (self.box() / f'{request}.lock').write_text(f'{os.getpid()}\n0\n')  # a reused pid: ours
         with mock.patch.object(cowork, 'kill_tree') as kill:
             code, out, _ = self.run_cli('kill', request)
         self.assertEqual(out.strip(), f'{request}: 0')
         kill.assert_not_called()
+
+    def test_a_kill_that_wins_during_conclude_is_the_verdict_the_successor_reads(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        (box / 'codex-x.jsonl').touch()
+        (box / 'codex-x.err').touch()
+        with (box / 'codex-x.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+
+            def kill_meanwhile(*args, **kwargs):
+                cowork.publish(box / 'codex-x.exit', 'killed\n')
+                return '0'
+            with mock.patch.object(cowork, 'conclude', kill_meanwhile), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                cowork.run('codex', box, self.root, 'codex-x', None, None, False, lock.fileno())
+            self.assertEqual(cowork.lock_lines((box / 'codex-x.lock').read_text())[1], 'killed')
+            self.assertEqual((box / 'codex-x.exit').read_text(), 'killed\n')
+
+    def test_a_successor_reading_the_verdict_does_not_look_like_a_live_runner(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.lock').write_text('4242\n0\n')  # the runner wrote its verdict and is exiting
+        (box / 'codex-x.exit').write_text('0\n')
+        (box / 'codex-x.reply').write_text('done\nFiles touched: none\n')
+        (box / 'codex-x.err').touch()
+        with (box / 'codex-x.lock').open('r+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # something the CLI spawned still has the runner's lock
+            self.assertTrue(cowork.held(box / 'codex-x.lock'), 'a verdict line is not release')
+            code, _, _ = self.run_cli('read', 'codex-x')
+            self.assertEqual(code, cowork.BUSY)
+        with (box / 'codex-x.lock').open() as reader:
+            fcntl.flock(reader, fcntl.LOCK_SH)
+            self.assertFalse(cowork.held(box / 'codex-x.lock'))
+            code, out, _ = self.run_cli('read', 'codex-x')
+            self.assertEqual((code, out), (0, 'done\nFiles touched: none\n'))
+
+    def test_kill_of_a_delivered_request_leaves_no_orphan_verdict(self):
+        _, request, _, _ = self.send('--task', 'done')
+        code, _, err = self.run_cli('kill', request)
+        self.assertEqual(code, cowork.BUSY)
+        self.assertEqual(self.leftovers(request), [])
 
     # --- the runner outlives the caller ---------------------------------------------
 
@@ -512,13 +579,15 @@ class CoworkTest(unittest.TestCase):
             self.assertNotEqual(int(stat.read().rsplit(')', 1)[1].split()[1]), proc.pid, 'the runner is not a child of send')
         proc.kill()
         proc.wait()
-        self.gate.touch()
-        until(lambda: (self.box() / f'{request}.exit').exists())
+        self.settled(request)
         self.assertEqual((self.box() / f'{request}.exit').read_text(), '0\n')
         self.assertEqual((self.box() / f'{request}.reply').read_text(), 'codex reply\nFiles touched: none\n')
         self.assertEqual((self.box() / 'session').read_text(), 'thread-42\n', 'the thread was still bound')
         _, out, _ = self.run_cli('status')
-        self.assertIn(f'{request}  0', out)
+        self.assertIn(f'{request}  0', out, 'undelivered, so still listed')
+        code, out, _ = self.run_cli('read', request)
+        self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'))
+        self.assertEqual(self.leftovers(request), [])
 
     def test_a_dead_runner_with_a_live_coworker_is_busy_until_killed(self):
         box = self.box()
@@ -527,7 +596,7 @@ class CoworkTest(unittest.TestCase):
         with (box / 'codex-x.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             orphan = subprocess.Popen(['sleep', '30'], pass_fds=(lock.fileno(),))
-        (box / 'codex-x.cli').write_text(f'{orphan.pid}\n')
+            lock.write(f'{orphan.pid}\n')
         try:
             _, out, _ = self.run_cli('status')
             self.assertIn('codex-x  running', out)
@@ -543,29 +612,59 @@ class CoworkTest(unittest.TestCase):
         code, _, _ = self.run_cli('reset', 'codex')
         self.assertEqual(code, 0)
 
-    def test_read_prints_a_settled_reply_and_refuses_a_live_request(self):
+    def test_read_delivers_once_what_a_dead_send_left_and_refuses_a_live_request(self):
         proc, request = self.send_gated('--task', 'x')
         self.started(request)
         code, _, err = self.run_cli('read', request)
         self.assertEqual(code, cowork.BUSY)
         self.assertIn(f'{request} is running', err)
-        self.gate.touch()
-        proc.wait(timeout=30)
+        proc.kill()
+        proc.wait()
+        self.settled(request)
         code, out, _ = self.run_cli('read', request)
         self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'))
-        code, out, _ = self.run_cli('read', request.replace('codex-', 'codex-nope-'))
+        self.assertEqual(self.leftovers(request), [])
+        code, _, err = self.run_cli('read', request)
         self.assertEqual(code, cowork.BUSY)
+        self.assertIn('delivered already', err)
 
-    def test_read_of_a_request_whose_send_died_at_enqueue_reports_not_raises(self):
+    def test_send_delivers_and_leaves_nothing_of_the_request(self):
+        _, request, _, _ = self.send('--task', 'x')
+        self.assertEqual(self.leftovers(request), [])
+        self.assertEqual(sorted(p.name for p in self.box().iterdir()), ['lock', 'session'])
+        code, _, err = self.run_cli('read', request)
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('delivered already', err)
+
+    def test_read_reports_a_reaped_send_exactly_as_send_would_have(self):
+        for env, want in (({}, (0, 'codex reply\nFiles touched: none\n', '')),
+                          ({'FAKE_REPLY': 'missing footer\n'}, (cowork.MALFORMED, 'missing footer\n', 'no "Files touched" line')),
+                          ({'FAKE_EXIT': '2'}, (cowork.FAILED, 'exited 2', ''))):
+            with self.subTest(env=env):
+                request = self.reaped('--task', 'x', **env)
+                self.settled(request)
+                code, out, err = self.run_cli('read', request)
+                self.assertEqual(code, want[0])
+                self.assertIn(want[1], out)
+                self.assertIn(want[2], err)
+                self.gate.unlink()
+
+    def test_a_runner_killed_outright_is_delivered_as_died(self):
         self.box().mkdir(parents=True)
         (self.box() / 'codex-x.task').write_text('p')
+        (self.box() / 'codex-x.lock').touch()  # the runner never wrote a verdict; nobody holds the lock
         code, out, _ = self.run_cli('read', 'codex-x')
         self.assertEqual(code, cowork.FAILED)
         self.assertIn('codex-x died without recording a verdict', out)
+        self.assertEqual(self.leftovers('codex-x'), [])
 
-    def test_watch_reports_each_request_once_as_it_settles_and_replays_only_what_was_asked(self):
-        _, earlier, _, _ = self.send('--task', 'before')
-        _, unasked, _, _ = self.send('--task', 'not replayed', FAKE_REPLY='no footer\n')
+    def test_watch_reports_each_undelivered_request_once_and_replays_only_what_was_asked(self):
+        earlier = self.reaped('--task', 'before')
+        self.settled(earlier)
+        self.gate.unlink()
+        unasked = self.reaped('--task', 'not replayed', FAKE_REPLY='no footer\n')
+        self.settled(unasked)
+        self.gate.unlink()
         watch = subprocess.Popen([sys.executable, str(SCRIPT), 'watch', earlier], cwd=self.root,
                                  stdout=subprocess.PIPE, text=True)
         self.background.append(watch)
@@ -574,9 +673,10 @@ class CoworkTest(unittest.TestCase):
         second, second_id = self.send_gated('--task', 'two', FAKE_EXIT='2')
         third, third_id = self.send_gated('--task', 'three')
         self.started(first_id)
+        for proc in (first, second, third):  # reaped before delivery, so the watch is the only ping
+            proc.kill()
+            proc.wait()
         self.gate.touch()
-        for proc in (first, second, third):
-            proc.wait(timeout=30)
         lines = [watch.stdout.readline() for _ in range(3)]
         self.assertEqual(lines, [f'{first_id}   replied\n', f'{second_id}   exited 2\n',
                                  f'{third_id}   was skipped\n'])
@@ -584,8 +684,41 @@ class CoworkTest(unittest.TestCase):
         watch.kill()
         watch.wait()
         self.assertNotIn(unasked, watch.stdout.read())
+        for request in (first_id, second_id, third_id):
+            self.run_cli('read', request)
+        self.assertEqual(self.leftovers(first_id), [])
         code, _, _ = self.run_cli('watch', 'codex-nope')
         self.assertEqual(code, cowork.BUSY)
+
+    def test_tail_follows_until_the_turn_settles_and_refuses_a_delivered_request(self):
+        proc, request = self.send_gated('--task', 'x')
+        self.started(request)
+        tail = subprocess.Popen([sys.executable, str(SCRIPT), 'tail', request], cwd=self.root, stdout=subprocess.PIPE, text=True)
+        self.background.append(tail)
+        time.sleep(0.5)
+        self.assertIsNone(tail.poll(), 'follows while the turn runs')
+        self.gate.touch()
+        self.assertEqual(tail.wait(timeout=10), 0, 'exits by itself once the lock is released')
+        out = tail.stdout.read()
+        self.assertIn('thread.started', out)
+        self.assertIn('agent_message', out)
+        proc.wait(timeout=30)
+        code, _, err = self.run_cli('tail', request)
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('delivered already', err)
+        self.assertIn('~/.codex/sessions', err)
+
+    def test_tail_exits_quietly_when_its_reader_leaves(self):
+        proc, request = self.send_gated('--task', 'x')
+        self.started(request)
+        tail = subprocess.Popen([sys.executable, str(SCRIPT), 'tail', request], cwd=self.root,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.background.append(tail)
+        tail.stdout.close()  # like `tail | head`
+        self.gate.touch()
+        self.assertEqual(tail.wait(timeout=10), 0)
+        self.assertEqual(tail.stderr.read(), '')
+        proc.wait(timeout=30)
 
     def test_the_jsonl_exists_the_instant_the_id_is_printed(self):
         proc, request = self.send_gated('--task', 'x')

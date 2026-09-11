@@ -20,11 +20,11 @@ S=<skill dir>/scripts/cowork.py
 
 python3 $S send (--task "..." | --task-file F | --task -) [--no-edit]
 python3 $S kill <id>             # queued or running, with all it spawned
-python3 $S read <id>             # the reply of a settled request
-python3 $S watch [<id>...]       # one line per request as it settles, forever
-python3 $S status
-python3 $S tail [<id>]           # follow the event stream, for a human
-python3 $S reset codex|claude    # forget the session; the next send starts one
+python3 $S read <id>             # deliver the reply of a request whose send died
+python3 $S watch [<id>...]       # one line per undelivered request as it settles, forever
+python3 $S status                # sessions and undelivered requests
+python3 $S tail [<id>]           # follow the event stream while the turn runs
+python3 $S reset codex|claude    # forget the session and its requests; the next send starts anew
 ```
 
 `send` prints the request id, then blocks until the reply is in and prints
@@ -35,7 +35,12 @@ earlier reply; if an earlier one fails or is killed, the ones queued behind
 it are skipped with exit 1 and say so, and you resend what still matters.
 There is no timeout: a turn runs until the CLI ends or you `kill` it. The
 turn runs in a detached runner, so a `send` that dies loses nothing: `status`
-shows every request and `read <id>` prints the reply.
+shows the request and `read <id>` delivers the reply.
+
+Delivery by `send` or `read` removes the request's files; `reset` also
+removes undelivered requests with the side's session. The coworker's
+own store keeps the whole session, prompts included: `~/.codex/sessions` and
+`~/.claude/projects`, where `codex resume` / `claude --resume` find it.
 
 A background shell is not a safe place for the ping in Claude Code: under
 memory pressure in a long session it reaps idle background shells, and a
@@ -43,10 +48,13 @@ memory pressure in a long session it reaps idle background shells, and a
 so there arm `watch <id>...` with the requests in flight; each line it prints
 (`<id>  replied`, `was killed`, `exited 2`, ...) arrives as a notification,
 and you `read <id>` for the reply. Passing the ids means a request that
-settled before the watch started is still reported. Stop the watch once
-every request you named has reported: it never exits on its own, and a
-watch left armed is a task that never ends. Codex has no such tool: run
-`send` in the foreground, or check `status` between your own steps.
+settled before the watch started is still reported. A request its own
+`send` delivered is not reported, since that `send`'s exit was the ping;
+the watch covers the ones whose `send` died. Stop the watch once every
+request you named has reported or been delivered: it never exits on its
+own, and a watch left armed is a task that never ends. Codex has no such
+tool: run `send` in the foreground, or check `status` between your own
+steps.
 
 From Claude Code the coworker defaults to Codex; from Codex pass
 `--to claude`. `--no-edit` puts Claude in plan mode; Codex is asked and then
@@ -55,10 +63,16 @@ suite needs. Exit codes: 1 the turn failed or was skipped, 3 unknown request
 or reset refused, 4 the reply lacks its "Files touched" line or the tree
 changed under `--no-edit`.
 
-Everything a request produced stays under `<git dir>/cowork/<side>/`, so a
-human can read the stream after the fact or `codex resume` /
-`claude --resume` the session between turns. Never open the session
-interactively while a request is running.
+Never open the session interactively while a request is running.
+
+## Show the exchange
+
+The human sees none of this channel unless you show it. For every round,
+put the task you sent and the reply you got in the transcript verbatim,
+each in its own code block, before any summary or action on it. A review
+round is the human's evidence for what you applied and what you rejected;
+a paraphrase hides the coworker's exact words. Say, per finding, whether
+you reproduced it or only read the code.
 
 ## What you decide
 
