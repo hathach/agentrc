@@ -1,0 +1,3 @@
+# ataradov usb-sniffer capture port, and a blank FX2LP before its firmware is loaded
+ATTRS{idVendor}=="6666", ATTRS{idProduct}=="6620", MODE="0666"
+ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="8613", MODE="0666"
