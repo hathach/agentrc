@@ -21,7 +21,7 @@ S=<skill dir>/scripts/cowork.py
 python3 $S send (--task "..." | --task-file F | --task -) [--no-edit] [--model M] [--effort E]
 python3 $S kill <id>             # queued or running, with all it spawned
 python3 $S read <id>             # deliver the reply of a request whose send died
-python3 $S watch [<id>...]       # one line per undelivered request as it settles, forever
+python3 $S watch [<id>...]       # one line per undelivered request as it settles; exits once the named ones are done
 python3 $S status                # sessions and undelivered requests
 python3 $S tail [<id>]           # follow the event stream while the turn runs
 python3 $S reset codex|claude    # forget the session and its requests; the next send starts anew
@@ -50,9 +50,9 @@ so there arm `watch <id>...` with the requests in flight; each line it prints
 and you `read <id>` for the reply. Passing the ids means a request that
 settled before the watch started is still reported. A request its own
 `send` delivered is not reported, since that `send`'s exit was the ping;
-the watch covers the ones whose `send` died. Stop the watch once every
-request you named has reported or been delivered: it never exits on its
-own, and a watch left armed is a task that never ends. Codex has no such
+the watch covers the ones whose `send` died. A watch given ids exits by
+itself once each of them is reported or delivered, so the monitor ends
+with the work; only the id-less form runs until stopped. Codex has no such
 tool: run `send` in the foreground, or check `status` between your own
 steps.
 

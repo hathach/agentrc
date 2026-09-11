@@ -779,30 +779,42 @@ class CoworkTest(unittest.TestCase):
         unasked = self.reaped('--task', 'not replayed', FAKE_REPLY='no footer\n')
         self.settled(unasked)
         self.gate.unlink()
-        watch = subprocess.Popen([sys.executable, str(SCRIPT), 'watch', earlier], cwd=self.root,
-                                 stdout=subprocess.PIPE, text=True)
-        self.background.append(watch)
-        self.assertEqual(watch.stdout.readline(), f'{earlier}   replied\n')
         first, first_id = self.send_gated('--task', 'one')
         second, second_id = self.send_gated('--task', 'two', FAKE_EXIT='2')
         third, third_id = self.send_gated('--task', 'three')
         self.started(first_id)
+        watch = subprocess.Popen([sys.executable, str(SCRIPT), 'watch', earlier, first_id, second_id, third_id],
+                                 cwd=self.root, stdout=subprocess.PIPE, text=True)
+        self.background.append(watch)
+        self.assertEqual(watch.stdout.readline(), f'{earlier}   replied\n')
         for proc in (first, second, third):  # reaped before delivery, so the watch is the only ping
             proc.kill()
             proc.wait()
         self.gate.touch()
-        lines = [watch.stdout.readline() for _ in range(3)]
-        self.assertEqual(lines, [f'{first_id}   replied\n', f'{second_id}   exited 2\n',
-                                 f'{third_id}   was skipped\n'])
-        self.assertIsNone(watch.poll(), 'a watch outlives the requests it reported')
-        watch.kill()
-        watch.wait()
-        self.assertNotIn(unasked, watch.stdout.read())
+        self.assertEqual(watch.wait(timeout=30), 0, 'exits once every named request is reported')
+        self.assertEqual(watch.stdout.read(), f'{first_id}   replied\n{second_id}   exited 2\n{third_id}   was skipped\n')
         for request in (first_id, second_id, third_id):
             self.run_cli('read', request)
         self.assertEqual(self.leftovers(first_id), [])
         code, _, _ = self.run_cli('watch', 'codex-nope')
         self.assertEqual(code, cowork.BUSY)
+
+    def test_a_watch_ends_with_a_delivery_it_never_saw_and_an_unnamed_watch_never_ends(self):
+        request = self.reaped('--task', 'x')
+        scans, sleep = [], time.sleep
+
+        def deliver_between_scans(_):  # the watch saw the request live; settle and read it before its next scan
+            time.sleep = sleep  # once: the waits below sleep for real
+            self.settled(request)
+            scans.append(self.run_cli('read', request)[0])
+
+        with mock.patch('time.sleep', deliver_between_scans):
+            code, out, _ = self.run_cli('watch', request)
+        self.assertEqual((code, out, scans), (0, '', [0]), 'the read was the ping, the watch just ends')
+        forever = subprocess.Popen([sys.executable, str(SCRIPT), 'watch'], cwd=self.root, stdout=subprocess.PIPE, text=True)
+        self.background.append(forever)
+        time.sleep(1)
+        self.assertIsNone(forever.poll())
 
     def test_tail_follows_until_the_turn_settles_and_refuses_a_delivered_request(self):
         proc, request = self.send_gated('--task', 'x')

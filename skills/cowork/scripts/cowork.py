@@ -579,8 +579,9 @@ def main(argv=None):
     send.add_argument('--effort', choices=EFFORTS, help='its reasoning effort from now on; first send defaults to yours')
     sub.add_parser('kill', help='stop a request, queued or running, and everything its coworker spawned').add_argument('request')
     sub.add_parser('read', help='print the reply of a settled request whose send died, and remove it').add_argument('request')
-    watch = sub.add_parser('watch', help='print "<id>  <what happened>" for each request as it settles, forever')
-    watch.add_argument('request', nargs='*', help='already settled requests to report first')
+    watch = sub.add_parser('watch', help='print "<id>  <what happened>" for each request as it settles; '
+                                        'with ids, exit once each is reported or delivered, else run forever')
+    watch.add_argument('request', nargs='*', help='requests to wait for, reported even if already settled')
     sub.add_parser('status', help='sessions and undelivered requests in this worktree')
     tail = sub.add_parser('tail', help='follow the event stream of a request (default: the latest) until it settles')
     tail.add_argument('request', nargs='?')
@@ -636,6 +637,9 @@ def main(argv=None):
                 if request not in seen:
                     seen.add(request)
                     print(request, ' ', what, flush=True)
+            if a.request and all(r in seen or not (gitdir / 'cowork' / r.split('-')[0] / f'{r}.lock').exists()
+                                 for r in a.request):  # each named request reported, or delivered by its own send
+                return 0
             time.sleep(0.5)
 
     if a.cmd == 'status':
