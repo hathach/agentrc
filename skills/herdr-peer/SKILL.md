@@ -85,17 +85,11 @@ failure; a silent `DONE` over unfinished work is.
   project's one-shot runner if it has one (tinyusb: `.claude/codex-agent.py`),
   which has real completion and failure boundaries.
 
-## Show the exchange
-
-The pane shows the peer's side live, but the transcript does not. For every
-round, put the task you sent and the result you got in the transcript
-verbatim, each in its own code block, before any summary or action on it.
-Say, per finding, whether you reproduced it or only read the code.
-
 ## Review rounds
 
 For a review ask, the loop is: send, apply what verifies, say in the next
-`DELTA` what you applied and what you rejected and why, ask again. Stop when
+`DELTA` what you applied and what you rejected and why, ask again. Say, per
+finding, whether you reproduced it or only read the code. Stop when
 the peer reports nothing left and you agree, when its context budget in the
 pane footer runs low, or when a round turns into re-litigating documented
 behaviour. Do not automate that loop: a well-formed `DONE` establishes neither
