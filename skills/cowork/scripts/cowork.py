@@ -1,31 +1,40 @@
 #!/usr/bin/env python3
-"""Run coworker turns in a detached process, resuming one session per side, one turn at a time.
+"""Run coworker turns in a detached process, resuming one session per lane, one turn at a time per lane.
 
-  cowork.py send [--to codex|claude] [--no-edit] [--model M] [--effort E] (--task TEXT | --task-file F | --task -)
+  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] (--task TEXT | --task-file F | --task -)
   cowork.py kill <id>
   cowork.py read <id>
   cowork.py watch [<id>...]
   cowork.py status
   cowork.py tail [<id>]
-  cowork.py reset <side>
+  cowork.py reset <side> <lane>|all
 
-Files live under <git dir>/cowork/<side>/: `session` holds the session id,
-the model and the effort in use. The first send on a side sets the model
-and effort from the flags, else from the caller's own session record mapped
-to the same token-cost tier on the other side; later sends reuse them until
-flags replace them or reset forgets them.
+A lane is one resumed session of a side, with files under
+<git dir>/cowork/<side>/<lane>/: `session` holds the session id, the model
+and the effort in use. The first send on a lane sets the model and effort
+from the flags, else from the caller's own session record mapped to the same
+token-cost tier on the other side; later sends reuse them until flags
+replace them or reset forgets them. Three kinds of lane: `main` works in
+this checkout; a lane created with --read-only works in this checkout too
+and every send to it is --no-edit; any other lane works in its own worktree
+.worktrees/cowork-<side>-<lane> on branch cowork/<host branch>/<side>-<lane>,
+created on its first send and brought to this checkout's HEAD before every
+send: its own commits, those after the `base` it was last synced to, are
+rebased onto HEAD; refused when dirty or conflicting. Its kind is the
+`read-only` marker file or the absence of one.
 A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
 teardown, so liveness does not depend on pid reuse; the CLI pid is written
 inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
-(the verdict, first writer wins). One request per side is in flight: a send
+(the verdict, first writer wins). One request per lane is in flight: a send
 while one is refused.
 
 send waits for the reply, prints it and removes the request; read does the
 same for a reply whose send died; watch reports settled requests still
-undelivered; reset removes everything of a side. Exit codes: 1 failed,
-3 unknown or delivered request, a side busy, or reset refused, 4 missing
+undelivered; reset removes everything of a lane, its worktree included once
+its branch is merged. Exit codes: 1 failed, 3 unknown or delivered request,
+a lane busy, not ready or of the wrong kind, or reset refused, 4 missing
 "Files touched" line or a changed tree during --no-edit.
 """
 
@@ -48,12 +57,14 @@ from pathlib import Path
 SIDES = ('codex', 'claude')
 FAILED, BUSY, MALFORMED = 1, 3, 4
 FOOTER = re.compile(r'^Files touched: \S', re.M)
+LANE = re.compile(r'^(?!all$)[a-z0-9-]{1,40}$')
 BOOTSTRAP = (
     'You are the {side} coworker on the cowork channel of the checkout at {root}: a headless,\n'
     'resumed session driven by the other coding agent, not by a human. Load the `cowork` skill\n'
     'for the rules. Never push, open a PR or post a comment on a request from this channel.\n\n')
-HEADER = ('cowork request {id} from {me}, answered by {model} at {effort} effort. Scope: {scope}. End your reply\n'
-          'with a line "Files touched: <paths>" or "Files touched: none".\n---\n')
+HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at {effort} effort. Scope: {scope}.\n'
+          '{where}End your reply with a line "Files touched: <paths>" or "Files touched: none".\n---\n')
+WHERE = 'Your checkout is the worktree {root} on branch {branch}, based on {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 STORE = {'codex': '~/.codex/sessions', 'claude': '~/.claude/projects'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # Claude's names; Codex has minimal..xhigh
@@ -75,6 +86,121 @@ def git_dir():
         die('not inside a git checkout')
     root, gitdir = Path(out[0]), Path(out[1])
     return root, gitdir if gitdir.is_absolute() else root / gitdir
+
+
+def git(cwd, *args, check=True):
+    done = subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True)
+    if check and done.returncode:
+        die(f'git {args[0]} in {cwd}: {done.stderr.strip()}')
+    return done
+
+
+def box_of(gitdir, side, lane):
+    """A lane's box. The pre-lane layout, files directly under the side,
+    becomes its `main`: under that layout's own admission lock, and not
+    while a request of it still runs, since its runner would settle at the
+    old paths."""
+    side_dir = gitdir / 'cowork' / side
+    if side_dir.is_dir():
+        with admission(side_dir):  # that layout's lock, which stays where it is: whoever is moving files holds it
+            if (side_dir / 'session').is_file():
+                if any(held(lock) for lock in side_dir.glob('*.lock')):
+                    die(f'a request from the previous cowork layout still runs under {side_dir}; wait for it', BUSY)
+                (side_dir / 'main').mkdir(exist_ok=True)
+                for old in sorted(side_dir.iterdir(), key=lambda f: f.name == 'session'):  # the session last
+                    if old.is_file() and old.name != 'lock':
+                        old.rename(side_dir / 'main' / old.name)
+    return side_dir / lane
+
+
+def lanes(gitdir, side):
+    side_dir = box_of(gitdir, side, 'main').parent
+    return sorted(p.name for p in side_dir.iterdir() if p.is_dir()) if side_dir.is_dir() else []
+
+
+def boxes(gitdir):
+    return [gitdir / 'cowork' / side / lane for side in SIDES for lane in lanes(gitdir, side)]
+
+
+def kind(box):
+    if box.name == 'main':
+        return 'main'
+    return 'read-only' if (box / 'read-only').exists() else 'worktree'
+
+
+def lane_root(root, box):
+    return root / '.worktrees' / f'cowork-{box.parent.name}-{box.name}'
+
+
+def tree_of(box, host):
+    """Where a lane's coworker works: its worktree, or the host checkout."""
+    return lane_root(host, box) if kind(box) == 'worktree' else host
+
+
+def claim(tree, box):
+    """The tree is this lane's worktree, on its branch, and clean; else refuse
+    before any git command that would move or delete it. Returns the branch."""
+    top = git(tree, 'rev-parse', '--show-toplevel', check=False).stdout.strip()
+    branch = git(tree, 'symbolic-ref', '--short', 'HEAD', check=False).stdout.strip()
+    if top != str(tree) or not (branch.startswith('cowork/') and branch.endswith(f'/{box.parent.name}-{box.name}')):
+        die(f'{tree} is not lane {box.name}\'s worktree (toplevel {top or "none"}, branch {branch or "none"}); '
+            f'move it aside', BUSY)
+    dirty = git(tree, 'status', '--porcelain').stdout
+    if dirty:
+        die(f'lane {box.name} has uncommitted changes in {tree}; commit or discard them first:\n{dirty}', BUSY)
+    return branch
+
+
+def sync_lane(root, box):
+    """The lane's worktree at the host's HEAD with the lane's own commits,
+    those since the base it was last synced to, rebased on top; created on
+    first use. Refused while dirty or when the rebase conflicts. The base
+    rather than ancestry, so a host history rewritten under the lane still
+    syncs. Under admission."""
+    tree, lane = lane_root(root, box), box.name
+    head = git(root, 'rev-parse', 'HEAD').stdout.strip()
+    if not tree.exists():
+        git(root, 'worktree', 'prune')
+        host = git(root, 'symbolic-ref', '--short', 'HEAD', check=False)
+        if host.returncode:
+            die("the host checkout is detached; a worktree lane names its branch after the host's", BUSY)
+        branch = f'cowork/{host.stdout.strip()}/{box.parent.name}-{lane}'
+        if git(root, 'check-ignore', '-q', '.worktrees', check=False).returncode:
+            ignore = root / '.gitignore'
+            text = ignore.read_text() if ignore.exists() else ''
+            ignore.write_text(text + ('' if not text or text.endswith('\n') else '\n') + '.worktrees/\n')
+            print(f'added .worktrees/ to {ignore}; commit it', file=sys.stderr)
+        known = git(root, 'rev-parse', '-q', '--verify', f'refs/heads/{branch}', check=False).returncode == 0
+        if known and not (box / 'base').exists():  # a branch left by an earlier lane: which of its commits are its own?
+            die(f'branch {branch} exists but lane {lane} has no record of its base; delete or rename the branch', BUSY)
+        git(root, 'worktree', 'add', '-q', *([] if known else ['-b', branch]), str(tree), branch if known else 'HEAD')
+        if not known:
+            (box / 'base').write_text(head + '\n')
+    claim(tree, box)
+    base = (box / 'base').read_text().strip()
+    if git(tree, 'rev-parse', 'HEAD').stdout.strip() == base:
+        git(tree, 'reset', '-q', '--hard', head)
+    elif git(tree, 'rebase', '-q', '--onto', head, base, check=False).returncode:
+        files = git(tree, 'diff', '--name-only', '--diff-filter=U').stdout
+        git(tree, 'rebase', '--abort', check=False)
+        die(f'lane {lane} does not rebase onto {head[:12]}; integrate or reset it first, conflicts in:\n{files}', BUSY)
+    (box / 'base').write_text(head + '\n')
+
+
+def drop_lane(root, box):
+    """Remove a worktree lane's tree and branch; refused while the tree is
+    dirty or the branch has commits the host does not."""
+    tree, lane, side = lane_root(root, box), box.name, box.parent.name
+    git(root, 'worktree', 'prune')
+    if not tree.exists():
+        return
+    branch = claim(tree, box)
+    if git(root, 'merge-base', '--is-ancestor', branch, 'HEAD', check=False).returncode:
+        die(f'lane {lane} has commits on {branch} that HEAD lacks; merge or cherry-pick them first, '
+            f'or delete the branch', BUSY)
+    git(root, 'worktree', 'remove', str(tree))
+    git(root, 'branch', '-q', '-d', branch)
+    print(f'{side}/{lane}: worktree {tree} removed, branch {branch} deleted')
 
 
 def caller():
@@ -245,9 +371,9 @@ def session_of(box):
     return side_state(box)[0]
 
 
-def compose(session, side, request, task, no_edit, root, model, effort):
+def compose(session, side, request, task, no_edit, root, model, effort, lane, where):
     sender = 'claude' if side == 'codex' else 'codex'
-    header = HEADER.format(id=request, me=sender, scope=SCOPE[no_edit], model=model, effort=effort)
+    header = HEADER.format(id=request, me=sender, lane=lane, scope=SCOPE[no_edit], model=model, effort=effort, where=where)
     return ('' if session else BOOTSTRAP.format(side=side, root=root)) + header + task
 
 
@@ -304,18 +430,23 @@ def kill_tree(pid):
             os.kill(victim, signal.SIGKILL)
 
 
-def run(side, box, root, request, no_edit, lock_fd):
+def run(side, box, host, request, no_edit, lock_fd):
     """One coworker turn, in the detached runner, whose stderr is <id>.err.
     Publishes the verdict unless `kill` got there first, then lets go."""
     exit_file, reply, stream = (box / f'{request}.{ext}' for ext in ('exit', 'reply', 'jsonl'))
     status, child, before = 'error', None, None
+    root = tree_of(box, host)
     try:
         if exit_file.exists():  # killed before it started
             status = 'killed'
             return
         session, model, effort = side_state(box)  # settled by start, under the lock this runner holds
+        where = ''
+        if kind(box) == 'worktree':
+            where = WHERE.format(root=root, branch=git(root, 'symbolic-ref', '--short', 'HEAD').stdout.strip(),
+                                 base=git(host, 'rev-parse', '--short=12', 'HEAD').stdout.strip())
         task = box / f'{request}.task'
-        prompt = compose(session, side, request, task.read_text(), no_edit, root, model, effort)
+        prompt = compose(session, side, request, task.read_text(), no_edit, root, model, effort, box.name, where)
         task.unlink()
         argv, new_session = command(side, session, reply, no_edit, model, effort)
         env = {k: v for k, v in os.environ.items()  # the coworker is nobody's driver
@@ -447,19 +578,21 @@ def settled(gitdir):
     runner has let go and whose reply is still here. Read under admission,
     so a request being created or delivered is never seen half-made."""
     done = {}
-    for side in SIDES:
-        box = gitdir / 'cowork' / side
-        if box.exists():
-            with admission(box):
-                for request in requests(box):
-                    if not held(box / f'{request}.lock'):
-                        done[request] = verdict(box, request)[0]
+    for box in boxes(gitdir):
+        with admission(box):
+            for request in requests(box):
+                if not held(box / f'{request}.lock'):
+                    done[request] = verdict(box, request)[0]
     return done
 
 
+def locate(gitdir, request):
+    return next((box for box in boxes(gitdir) if (box / f'{request}.lock').exists()), None)
+
+
 def find(gitdir, request):
-    box = gitdir / 'cowork' / request.split('-')[0]
-    if not (box / f'{request}.lock').exists():
+    box = locate(gitdir, request)
+    if box is None:
         die(f'no request {request} in this worktree: delivered already, or never sent', BUSY)
     return box
 
@@ -471,7 +604,7 @@ def follow(box, request):
         handle = stream.open('rb')  # not exists() first: a delivery may remove it in between
     except FileNotFoundError:
         die(f'{request} has no stream here: delivered already, or never sent; its turn is in the '
-            f'coworker\'s own session store ({STORE[box.name]})', BUSY)
+            f'coworker\'s own session store ({STORE[box.parent.name]})', BUSY)
     try:
         with handle:
             done = False
@@ -490,20 +623,35 @@ def follow(box, request):
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
-def start(box, root, side, task, no_edit, model, effort):
+def start(box, root, side, task, no_edit, read_only, model, effort):
     """Record the request and start its runner, which holds the request lock
-    from birth; the caller keeps nothing open. Refused while one is in flight."""
+    from birth; the caller keeps nothing open. Refused while one is in flight,
+    and for a lane not ready: --read-only on a worktree lane, a worktree that
+    is dirty or does not rebase."""
+    lane = box.name
     with admission(box):
         busy = running(box)
         if busy:
-            die(f'{side} is busy with {busy}; wait for it, or kill it', BUSY)
+            die(f'{side}/{lane} is busy with {busy}; wait for it, or kill it', BUSY)
+        if lane == 'main':
+            if read_only:
+                die('main is this checkout and writable; --read-only creates a named lane', BUSY)
+        else:
+            if read_only and (box / 'session').exists() and kind(box) != 'read-only':
+                die(f'{side}/{lane} is a worktree lane; --read-only creates a lane, it cannot convert one', BUSY)
+            if read_only:
+                (box / 'read-only').touch()
+            if kind(box) == 'read-only':
+                no_edit = True
+            else:
+                sync_lane(root, box)
         settle_pair(box, model, effort)
-        request = f'{side}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
+        request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task)
         (box / f'{request}.jsonl').touch()  # so `tail` has a file the instant the id is printed
         with (box / f'{request}.lock').open('w') as lock, (box / f'{request}.err').open('ab') as err:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            argv = [sys.executable, __file__, '_run', side, request, str(int(no_edit)), str(lock.fileno())]
+            argv = [sys.executable, __file__, '_run', side, lane, request, str(int(no_edit)), str(lock.fileno())]
             # Double fork: the runner's parent exits at once, so it hangs off init, in its own
             # session, and a harness that kills `send` with its descendants cannot reach it.
             middle = os.fork()
@@ -515,11 +663,41 @@ def start(box, root, side, task, no_edit, model, effort):
     return request
 
 
+def reset(root, gitdir, side, lane):
+    """Forget a lane: its session, requests, marker, base and worktree. The
+    box and its admission lock stay, so a send waiting on that lock is not
+    left holding an unlinked inode."""
+    box = box_of(gitdir, side, lane)
+    if not box.exists():
+        print(f'{side}/{lane}: no session')
+        return
+    with admission(box):
+        busy = running(box)
+        if busy:
+            die(f'{side}/{lane} is busy with {busy}; not resetting under it', BUSY)
+        if kind(box) == 'worktree':
+            drop_lane(root, box)
+        gone = requests(box)
+        for request in gone:
+            remove(box, request)
+        had = (box / 'session').exists()
+        for name in ('session', 'read-only', 'base'):  # a lane half-made by a failed first send goes too
+            (box / name).unlink(missing_ok=True)
+        if had:
+            print(f'{side}/{lane}: session forgotten' + (f', {len(gone)} undelivered request(s) removed' if gone else ''))
+        else:
+            print(f'{side}/{lane}: no session')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='cmd', required=True)
     send = sub.add_parser('send', help='one turn of the coworker; prints the request id, then the reply')
     send.add_argument('--to', choices=SIDES, help='which coworker; defaults to codex when run from Claude Code')
+    send.add_argument('--lane', default='main', help='which session of that coworker (default: main, this checkout); '
+                                                    'any other lane works in its own worktree unless created --read-only')
+    send.add_argument('--read-only', action='store_true',
+                      help='on a lane\'s first send: it works in this checkout and every send to it is --no-edit')
     task = send.add_mutually_exclusive_group(required=True)
     task.add_argument('--task', help='literal text, or - for stdin')
     task.add_argument('--task-file', type=Path)
@@ -531,24 +709,28 @@ def main(argv=None):
     watch = sub.add_parser('watch', help='print "<id>  <what happened>" for each request as it settles; '
                                         'with ids, exit once each is reported or delivered, else run forever')
     watch.add_argument('request', nargs='*', help='requests to wait for, reported even if already settled')
-    sub.add_parser('status', help='sessions and undelivered requests in this worktree')
+    sub.add_parser('status', help='lanes and undelivered requests in this worktree')
     tail = sub.add_parser('tail', help='follow the event stream of a request (default: the latest) until it settles')
     tail.add_argument('request', nargs='?')
-    reset = sub.add_parser('reset', help='forget a side\'s session and its requests; the next send starts anew')
-    reset.add_argument('side', choices=SIDES)
+    reset_ = sub.add_parser('reset', help='forget a lane\'s session and its requests, remove its worktree once merged; '
+                                          'the next send starts anew')
+    reset_.add_argument('side', choices=SIDES)
+    reset_.add_argument('lane', help='a lane name, or all')
     runner = sub.add_parser('_run', help=argparse.SUPPRESS)  # the detached child of `send`
-    for name in ('side', 'request', 'no_edit', 'lock_fd'):
+    for name in ('side', 'lane', 'request', 'no_edit', 'lock_fd'):
         runner.add_argument(name)
     a = parser.parse_args(argv)
 
     root, gitdir = git_dir()
     if a.cmd == '_run':
-        run(a.side, gitdir / 'cowork' / a.side, root, a.request, a.no_edit == '1', int(a.lock_fd))
+        run(a.side, gitdir / 'cowork' / a.side / a.lane, root, a.request, a.no_edit == '1', int(a.lock_fd))
         return 0
 
     if a.cmd == 'send':
         side = coworker(a.to)
-        box = gitdir / 'cowork' / side
+        if not LANE.match(a.lane):
+            die(f'lane names are [a-z0-9-], up to 40, and not "all": {a.lane!r}')
+        box = box_of(gitdir, side, a.lane)
         box.mkdir(parents=True, exist_ok=True)
         if a.task_file:
             task = a.task_file.read_text()
@@ -556,7 +738,7 @@ def main(argv=None):
             task = sys.stdin.read() if a.task == '-' else a.task
         if not task.strip():
             die('the task resolved to nothing')
-        request = start(box, root, side, task, a.no_edit, a.model, a.effort)
+        request = start(box, root, side, task, a.no_edit, a.read_only, a.model, a.effort)
         print(request, flush=True)
         held(box / f'{request}.lock', wait=True)  # wait through teardown, even if the verdict exists
         return deliver(box, request)
@@ -585,32 +767,43 @@ def main(argv=None):
                 if request not in seen:
                     seen.add(request)
                     print(request, ' ', what, flush=True)
-            if a.request and all(r in seen or not (gitdir / 'cowork' / r.split('-')[0] / f'{r}.lock').exists()
+            if a.request and all(r in seen or locate(gitdir, r) is None
                                  for r in a.request):  # each named request reported, or delivered by its own send
                 return 0
             time.sleep(0.5)
 
     if a.cmd == 'status':
         for side in SIDES:
-            box = gitdir / 'cowork' / side
-            if not box.exists():
-                print(f'{side}: session none')
-                continue
-            with admission(box):  # a delivery in progress would remove files under state()
-                session, model, effort = side_state(box)
-                print(f'{side}: session {session or "none"}' + (f', {model} at {effort} effort' if model else ''))
-                for request in requests(box):
-                    print(f'  {request}  {state(box, request)}')
+            shown = 0
+            for lane in lanes(gitdir, side):
+                box = gitdir / 'cowork' / side / lane
+                with admission(box):  # a delivery in progress would remove files under state()
+                    if not (box / 'session').exists() and not requests(box):
+                        continue  # reset, and nothing since
+                    shown += 1
+                    session, model, effort = side_state(box)
+                    where = {'main': '', 'read-only': ', read-only', 'worktree': f', in {lane_root(root, box)}'}[kind(box)]
+                    print(f'{side}/{lane}: session {session or "none"}' + (f', {model} at {effort} effort' if model else '') + where)
+                    for request in requests(box):
+                        print(f'  {request}  {state(box, request)}')
+            if not shown:
+                print(f'{side}: no lane')
         return 0
 
     if a.cmd == 'tail':
         if a.request:
-            follow(gitdir / 'cowork' / a.request.split('-')[0], a.request)
+            box = locate(gitdir, a.request)
+            if box is None:
+                side = a.request.split('-')[0]
+                die(f'{a.request} has no stream here: delivered already, or never sent; its turn is in the '
+                    f'coworker\'s own session store ({STORE.get(side, "?")})', BUSY)
+            follow(box, a.request)
             return 0
         streams = []
-        for stream in (gitdir / 'cowork').glob('*/*.jsonl'):
-            with contextlib.suppress(FileNotFoundError):  # delivered between glob and stat
-                streams.append((stream.stat().st_mtime, stream))
+        for box in boxes(gitdir):
+            for stream in box.glob('*.jsonl'):
+                with contextlib.suppress(FileNotFoundError):  # delivered between glob and stat
+                    streams.append((stream.stat().st_mtime, stream))
         if not streams:
             die('no undelivered request in this worktree', BUSY)
         latest = max(streams)[1]
@@ -618,23 +811,10 @@ def main(argv=None):
         return 0
 
     if a.cmd == 'reset':
-        box = gitdir / 'cowork' / a.side
-        if not box.exists():
-            print(f'{a.side}: no session')
-            return 0
-        with admission(box):
-            busy = running(box)
-            if busy:
-                die(f'{a.side} is busy with {busy}; not resetting under it', BUSY)
-            gone = requests(box)
-            for request in gone:
-                remove(box, request)
-            session = box / 'session'
-            if session.exists():
-                session.unlink()
-                print(f'{a.side}: session forgotten' + (f', {len(gone)} undelivered request(s) removed' if gone else ''))
-            else:
-                print(f'{a.side}: no session')
+        if a.lane != 'all' and not LANE.match(a.lane):
+            die(f'lane names are [a-z0-9-], up to 40: {a.lane!r}')
+        for lane in lanes(gitdir, a.side) if a.lane == 'all' else [a.lane]:
+            reset(root, gitdir, a.side, lane)
         return 0
 
 

@@ -88,7 +88,8 @@ class CoworkTest(unittest.TestCase):
         self.env = mock.patch.dict('os.environ', {
             **clean, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1',
             'CLAUDE_CODE_SESSION_ID': SID, 'CLAUDE_EFFORT': 'medium', 'CLAUDE_CONFIG_DIR': str(base / 'claude'),
-            'CODEX_HOME': str(base / 'codex')}, clear=True)
+            'CODEX_HOME': str(base / 'codex'), 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
+            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}, clear=True)
         self.env.start()
         self.cwd = os.getcwd()
         os.chdir(self.root)
@@ -103,9 +104,9 @@ class CoworkTest(unittest.TestCase):
             for pipe in (proc.stdout, proc.stderr):
                 if pipe:
                     pipe.close()
-        for box in Path(self.tmp.name).glob('repo/.git/cowork/*'):  # runners hang off init, not off us
+        for box in Path(self.tmp.name).glob('repo/.git/cowork/*/*'):  # runners hang off init, not off us
             for request in cowork.requests(box):
-                subprocess.run(['pkill', '-9', '-f', f'cowork.py _run \\S+ {request} '], stderr=subprocess.DEVNULL)
+                subprocess.run(['pkill', '-9', '-f', f'cowork.py _run \\S+ \\S+ {request} '], stderr=subprocess.DEVNULL)
                 pid = cowork.cli_pid(box / f'{request}.lock')
                 if pid and cowork.holds(int(pid), box / f'{request}.lock'):
                     os.kill(int(pid), 9)
@@ -145,8 +146,8 @@ class CoworkTest(unittest.TestCase):
         self.background.append(proc)
         return proc, proc.stdout.readline().strip()
 
-    def box(self, side='codex'):
-        return self.root / '.git' / 'cowork' / side
+    def box(self, side='codex', lane='main'):
+        return self.root / '.git' / 'cowork' / side / lane
 
     def started(self, request):
         until(lambda: cowork.cli_pid(self.box() / f'{request}.lock') != '')
@@ -212,7 +213,7 @@ class CoworkTest(unittest.TestCase):
         self.send('--task', 'a')
         undelivered = self.reaped('--task', 'b')
         self.settled(undelivered)
-        code, out, _ = self.run_cli('reset', 'codex')
+        code, out, _ = self.run_cli('reset', 'codex', 'main')
         self.assertEqual(code, 0)
         self.assertIn('1 undelivered request(s) removed', out)
         self.assertEqual(sorted(p.name for p in self.box().iterdir()), ['lock'])
@@ -231,7 +232,7 @@ class CoworkTest(unittest.TestCase):
         self.transcript.write_text('{"type":"assistant","message":{"model":"claude-sonnet-5"}}\n'
                                    '{"type":"assistant","message":{"model":"<synthetic>"}}\n')
         with mock.patch.dict('os.environ', {'CLAUDE_EFFORT': 'max'}):
-            self.run_cli('reset', 'codex')
+            self.run_cli('reset', 'codex', 'main')
             self.send('--task', 'from a cheaper claude')
         argv = self.calls()[1]['argv']
         self.assertEqual(argv[argv.index('-m') + 1], 'gpt-5.6-terra')
@@ -241,7 +242,7 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(argv[argv.index('--model') + 1], 'fable')
         self.assertEqual(argv[argv.index('--effort') + 1], 'medium')
         self.rollout.write_text('{"type":"turn_context","payload":{"model":"gpt-5.6-luna","effort":"minimal"}}\n')
-        self.run_cli('reset', 'claude')
+        self.run_cli('reset', 'claude', 'main')
         self.send('--task', 'from a cheaper codex', **CODEX)
         argv = self.calls()[3]['argv']
         self.assertEqual(argv[argv.index('--model') + 1], 'haiku')
@@ -251,14 +252,14 @@ class CoworkTest(unittest.TestCase):
         for argv in (('--model', 'gpt-5.6-terra', '--effort', 'high', '--task', 'a'), ('--task', 'b'),
                      ('--effort', 'low', '--task', 'c'), ('--model', 'gpt-5.6-luna', '--task', 'd'), ('--task', 'e')):
             self.assertEqual(self.send(*argv)[0], 0)
-        self.run_cli('reset', 'codex')
+        self.run_cli('reset', 'codex', 'main')
         self.send('--task', 'f')
         seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
         self.assertEqual(seen, [('gpt-5.6-terra', 'model_reasoning_effort=high'), ('gpt-5.6-terra', 'model_reasoning_effort=high'),
                                 ('gpt-5.6-terra', 'model_reasoning_effort=low'), ('gpt-5.6-luna', 'model_reasoning_effort=low'),
                                 ('gpt-5.6-luna', 'model_reasoning_effort=low'), ('gpt-6-astra', 'model_reasoning_effort=medium')])
         _, out, _ = self.run_cli('status')
-        self.assertIn('codex: session thread-42, gpt-6-astra at medium effort', out)
+        self.assertIn('codex/main: session thread-42, gpt-6-astra at medium effort', out)
 
     def test_a_field_update_keeps_the_bound_thread(self):
         self.assertEqual(self.send('--task', 'one')[0], 0)
@@ -294,7 +295,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn("cannot find this Claude Code session's transcript", err)
         code, _, _, _ = self.send('--model', 'gpt-6-astra', '--effort', 'high', '--task', 'q')
         self.assertEqual(code, 0, 'both flags need no record of the caller')
-        self.run_cli('reset', 'codex')
+        self.run_cli('reset', 'codex', 'main')
         self.transcript.write_text('{"type":"assistant","message":{"model":"claude-mythos-5-1"}}\n')
         code, _, _, _ = self.send('--model', 'gpt-6-astra', '--task', 'q')
         self.assertEqual(code, 0, 'an explicit model needs no tier; the effort still comes from the caller')
@@ -505,12 +506,12 @@ class CoworkTest(unittest.TestCase):
 
     def test_reset_refuses_while_a_request_runs(self):
         proc, request = self.send_gated('--task', 'slow')
-        code, _, err = self.run_cli('reset', 'codex')
+        code, _, err = self.run_cli('reset', 'codex', 'main')
         self.assertEqual(code, cowork.BUSY)
         self.assertIn(request, err)
         self.gate.touch()
         proc.wait(timeout=30)
-        code, _, _ = self.run_cli('reset', 'codex')
+        code, _, _ = self.run_cli('reset', 'codex', 'main')
         self.assertEqual(code, 0)
 
     # --- kills --------------------------------------------------------------------------
@@ -567,7 +568,7 @@ class CoworkTest(unittest.TestCase):
             self.assertEqual(cowork.running(box), 'codex-x')
             code, _, _ = self.run_cli('read', 'codex-x')
             self.assertEqual(code, cowork.BUSY, 'a verdict does not make teardown complete')
-            code, _, _ = self.run_cli('reset', 'codex')
+            code, _, _ = self.run_cli('reset', 'codex', 'main')
             self.assertEqual(code, cowork.BUSY)
         self.assertIsNone(cowork.running(box))
 
@@ -656,7 +657,7 @@ class CoworkTest(unittest.TestCase):
     def test_a_killed_send_loses_nothing(self):
         proc, request = self.send_gated('--task', 'x')
         self.started(request)
-        runner = int(subprocess.run(['pgrep', '-f', f'_run codex {request}'], capture_output=True, text=True).stdout.split()[0])
+        runner = int(subprocess.run(['pgrep', '-f', f'_run codex main {request}'], capture_output=True, text=True).stdout.split()[0])
         with open(f'/proc/{runner}/stat') as stat:
             self.assertNotEqual(int(stat.read().rsplit(')', 1)[1].split()[1]), proc.pid, 'the runner is not a child of send')
         proc.kill()
@@ -682,7 +683,7 @@ class CoworkTest(unittest.TestCase):
         try:
             _, out, _ = self.run_cli('status')
             self.assertIn('codex-x  running', out)
-            code, _, err = self.run_cli('reset', 'codex')
+            code, _, err = self.run_cli('reset', 'codex', 'main')
             self.assertEqual(code, cowork.BUSY)
             code, out, _ = self.run_cli('kill', 'codex-x')
             self.assertEqual(out.strip(), 'codex-x: killed')
@@ -691,7 +692,7 @@ class CoworkTest(unittest.TestCase):
             if orphan.poll() is None:
                 orphan.kill()
                 orphan.wait()
-        code, _, _ = self.run_cli('reset', 'codex')
+        code, _, _ = self.run_cli('reset', 'codex', 'main')
         self.assertEqual(code, 0)
 
     def test_read_delivers_once_what_a_dead_send_left_and_refuses_a_live_request(self):
@@ -812,6 +813,247 @@ class CoworkTest(unittest.TestCase):
         self.assertTrue((self.box() / f'{request}.jsonl').exists())
         self.gate.touch()
         proc.wait(timeout=30)
+
+    # --- lanes ----------------------------------------------------------------
+
+    def commit(self, name, text, cwd=None):
+        cwd = cwd or self.root
+        (cwd / name).write_text(text)
+        sh(cwd, 'git', 'add', name)
+        sh(cwd, 'git', 'commit', '-q', '-m', name)
+        return sh(cwd, 'git', 'rev-parse', 'HEAD').strip()
+
+    def head(self, cwd):
+        return sh(cwd, 'git', 'rev-parse', 'HEAD').strip()
+
+    def test_a_worktree_lane_works_in_its_own_tree_and_resumes(self):
+        base = self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        code, request, _, err = self.send('--lane', 'impl', '--task', 'x')
+        self.assertEqual(code, 0, err)
+        self.assertTrue(request.startswith('codex-impl-'))
+        self.assertEqual(self.calls()[0]['cwd'], str(tree))
+        prompt = self.calls()[0]['stdin']
+        self.assertIn(f'on lane impl,', prompt)
+        self.assertIn(f'Your checkout is the worktree {tree} on branch cowork/main/codex-impl, based on {base[:12]} '
+                      'of the host checkout; commit there.', prompt)
+        self.assertEqual(self.head(tree), base)
+        self.assertIn('.worktrees/', (self.root / '.gitignore').read_text())
+        self.assertIn('.gitignore; commit it', err)
+        code, out, _ = self.run_cli('status')
+        self.assertIn(f'codex/impl: session thread-42, gpt-6-astra at medium effort, in {tree}', out)
+        self.assertNotIn('codex/main', out)
+        self.send('--lane', 'impl', '--task', 'y')
+        self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
+        self.assertEqual(self.head(tree), base)
+
+    def test_a_read_only_lane_is_this_checkout_and_every_send_is_no_edit(self):
+        self.commit('a.txt', 'a')
+        code, _, _, err = self.send('--lane', 'review', '--read-only', '--task', 'x')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls()[0]['cwd'], str(self.root))
+        self.assertIn('Scope: do not edit anything', self.calls()[0]['stdin'])
+        self.assertFalse((self.root / '.worktrees').exists())
+        code, out, _ = self.run_cli('status')
+        self.assertIn('codex/review: session thread-42, gpt-6-astra at medium effort, read-only', out)
+        self.codex_does("open('edited.txt', 'w').write('!')")
+        code, _, _, err = self.send('--lane', 'review', '--task', 'y')  # no --no-edit: the lane implies it
+        self.assertEqual(code, cowork.MALFORMED)
+        self.assertIn('tree changed during a --no-edit turn', err)
+        (self.root / 'edited.txt').unlink()
+        self.send('--lane', 'impl', '--task', 'z')
+        code, _, _, err = self.send('--lane', 'impl', '--read-only', '--task', 'w')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('codex/impl is a worktree lane; --read-only creates a lane', err)
+        code, _, _, err = self.send('--read-only', '--task', 'v')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('main is this checkout and writable', err)
+
+    def test_lanes_run_concurrently_with_one_request_in_flight_each(self):
+        self.commit('a.txt', 'a')
+        proc, first = self.send_gated('--task', 'slow')
+        self.started(first)
+        code, _, _, err = self.send('--lane', 'review', '--read-only', '--task', 'meanwhile')
+        self.assertEqual(code, 0, err)
+        code, _, _, err = self.send('--task', 'again')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn(f'codex/main is busy with {first}', err)
+        self.gate.touch()
+        proc.wait(timeout=30)
+
+    def test_a_worktree_lane_follows_the_host_head_and_rebases_its_own_commits(self):
+        self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        self.send('--lane', 'impl', '--task', 'x')
+        moved = self.commit('b.txt', 'b')
+        self.send('--lane', 'impl', '--task', 'y')
+        self.assertEqual(self.head(tree), moved, 'a lane without commits of its own is moved to HEAD')
+        self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
+                        "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
+        self.send('--lane', 'impl', '--task', 'commit something')
+        self.codex_does('')
+        moved = self.commit('c.txt', 'c')
+        self.send('--lane', 'impl', '--task', 'z')
+        self.assertEqual(sh(tree, 'git', 'rev-list', '--count', f'{moved}..HEAD').strip(), '1', 'rebased on the new HEAD')
+        self.assertEqual(sh(tree, 'git', 'log', '-1', '--format=%s').strip(), 'lane')
+        self.commit('lane.txt', 'host version')
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'conflict')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('does not rebase onto', err)
+        self.assertIn('lane.txt', err)
+        self.assertEqual(sh(tree, 'git', 'status', '--porcelain'), '', 'the rebase was aborted')
+        self.assertFalse(self.calls()[-1]['stdin'].endswith('conflict'))
+        (tree / 'scratch.txt').write_text('left behind')
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'dirty')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('uncommitted changes', err)
+        self.assertIn('scratch.txt', err)
+
+    def test_reset_of_a_worktree_lane_needs_its_branch_merged(self):
+        self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
+                        "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
+        self.send('--lane', 'impl', '--task', 'x')
+        code, _, err = self.run_cli('reset', 'codex', 'impl')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('commits on cowork/main/codex-impl that HEAD lacks', err)
+        self.assertTrue(tree.exists())
+        sh(self.root, 'git', 'merge', '-q', '--ff-only', 'cowork/main/codex-impl')
+        code, out, _ = self.run_cli('reset', 'codex', 'impl')
+        self.assertEqual(code, 0)
+        self.assertIn(f'codex/impl: worktree {tree} removed, branch cowork/main/codex-impl deleted', out)
+        self.assertIn('codex/impl: session forgotten', out)
+        self.assertFalse(tree.exists())
+        self.assertEqual(sorted(p.name for p in self.box(lane='impl').iterdir()), ['lock'], 'the admission lock stays')
+        self.assertNotIn('cowork/main/codex-impl', sh(self.root, 'git', 'branch'))
+        self.assertNotIn('codex/impl', self.run_cli('status')[1])
+        self.codex_does('')
+        self.send('--lane', 'review', '--read-only', '--task', 'x')
+        self.send('--task', 'x')
+        code, out, _ = self.run_cli('reset', 'codex', 'all')
+        self.assertEqual(out.count('session forgotten'), 2)
+        self.assertEqual(self.run_cli('status')[1], 'codex: no lane\nclaude: no lane\n')
+        code, out, _ = self.run_cli('reset', 'codex', 'nope')
+        self.assertEqual((code, out.strip()), (0, 'codex/nope: no session'))
+        code, _, err = self.run_cli('reset', 'codex', '../..')
+        self.assertEqual(code, cowork.FAILED)
+        self.assertIn('lane names are', err)
+        self.send('--lane', 'review', '--read-only', '--task', 'again')  # a reset lane can be created anew, of either kind
+        self.assertEqual(self.calls()[-1]['cwd'], str(self.root))
+
+    def test_the_pre_lane_box_becomes_main(self):
+        old = self.box().parent
+        old.mkdir(parents=True)
+        (old / 'session').write_text('thread-42\ngpt-6-astra\nmedium\n')
+        (old / 'lock').touch()
+        (old / 'codex-x.task').write_text('p')
+        with (old / 'codex-x.lock').open('w') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # a runner of the old layout, still there
+            code, _, err = self.run_cli('status')
+            self.assertEqual(code, cowork.BUSY)
+            self.assertIn('previous cowork layout still runs', err)
+            self.assertTrue((old / 'session').exists(), 'nothing moved')
+        (old / 'codex-x.task').unlink()
+        (old / 'codex-x.lock').unlink()
+        code, out, _ = self.run_cli('status')
+        self.assertIn('codex/main: session thread-42, gpt-6-astra at medium effort', out)
+        self.assertEqual(sorted(p.name for p in old.iterdir()), ['lock', 'main'], 'the legacy lock stays: it serialized the move')
+        self.send('--task', 'x')
+        self.assertEqual(self.calls()[0]['argv'][:3], ['exec', 'resume', 'thread-42'])
+
+    def test_a_worktree_lane_survives_a_rewritten_host_history(self):
+        self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        self.send('--lane', 'impl', '--task', 'x')
+        sh(self.root, 'git', 'commit', '-q', '--amend', '-m', 'a, amended')
+        amended = self.head(self.root)
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'y')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.head(tree), amended, 'no commits of its own since the last base: moved, not rebased')
+        self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
+                        "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
+        self.send('--lane', 'impl', '--task', 'commit')
+        self.codex_does('')
+        sh(self.root, 'git', 'commit', '-q', '--amend', '-m', 'a, amended twice')
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'z')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sh(tree, 'git', 'log', '--format=%s').split(), ['lane', 'a,', 'amended', 'twice'])
+
+    def test_a_removed_tree_comes_back_with_the_lanes_own_commits(self):
+        self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
+                        "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
+        self.send('--lane', 'impl', '--task', 'commit')
+        self.codex_does('')
+        sh(self.root, 'git', 'worktree', 'remove', str(tree))
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'again')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sh(tree, 'git', 'log', '-1', '--format=%s').strip(), 'lane', 'its own commit is not the base')
+        (self.box(lane='impl') / 'base').unlink()
+        sh(self.root, 'git', 'worktree', 'remove', str(tree))
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'no base')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('has no record of its base', err)
+
+    def test_reset_refuses_a_tree_that_is_not_on_the_lanes_branch(self):
+        self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        self.send('--lane', 'impl', '--task', 'x')
+        sh(tree, 'git', 'checkout', '-q', '-b', 'unrelated')
+        code, _, err = self.run_cli('reset', 'codex', 'impl')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn("is not lane impl's worktree", err)
+        self.assertIn('unrelated', sh(self.root, 'git', 'branch'))
+
+    def test_reset_clears_a_lane_a_failed_first_send_left_half_made(self):
+        box = self.box(lane='review')
+        box.mkdir(parents=True)
+        (box / 'read-only').touch()  # the first send died before settle_pair wrote the session
+        code, out, _ = self.run_cli('reset', 'codex', 'review')
+        self.assertEqual((code, out.strip()), (0, 'codex/review: no session'))
+        self.assertFalse((box / 'read-only').exists())
+        self.commit('a.txt', 'a')
+        self.send('--lane', 'review', '--task', 'x')
+        self.assertEqual(self.calls()[0]['cwd'], str(self.root / '.worktrees' / 'cowork-codex-review'))
+
+    def test_a_stray_directory_is_not_taken_for_the_lanes_worktree(self):
+        self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        tree.mkdir(parents=True)
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'x')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn(f"{tree} is not lane impl's worktree", err)
+        self.assertEqual(self.calls(), [])
+
+    def test_the_ignore_rule_is_appended_on_its_own_line(self):
+        self.commit('a.txt', 'a')
+        (self.root / '.gitignore').write_text('build/')
+        self.send('--lane', 'impl', '--task', 'x')
+        self.assertEqual((self.root / '.gitignore').read_text(), 'build/\n.worktrees/\n')
+
+    def test_tail_of_a_vanished_stream_names_the_sides_store(self):
+        code, _, err = self.run_cli('tail', 'codex-main-20260911-000000-000000')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('~/.codex/sessions', err)
+        box = self.box()
+        box.mkdir(parents=True)
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            cowork.follow(box, 'codex-main-x')  # located, then its stream was delivered away
+        self.assertIn('~/.codex/sessions', err.getvalue())
+
+    def test_lane_names_are_restricted_and_a_detached_host_gets_no_worktree_lane(self):
+        self.commit('a.txt', 'a')
+        for bad in ('Review', 'a_b', 'all', ''):
+            code, _, _, err = self.send('--lane', bad, '--task', 'x')
+            self.assertEqual(code, cowork.FAILED, bad)
+            self.assertIn('lane names are [a-z0-9-]', err)
+        sh(self.root, 'git', 'checkout', '-q', '--detach')
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'x')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('detached', err)
+        self.assertEqual(self.calls(), [])
 
     def test_unknown_request(self):
         code, _, _ = self.run_cli('kill', 'codex-nope')
