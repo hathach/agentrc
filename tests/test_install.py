@@ -62,7 +62,8 @@ class InstallTest(unittest.TestCase):
         skills = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
         self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), skills)
         self.assertEqual(os.readlink(self.claude / 'agents' / 'pvs-studio.md'), str(ROOT / 'agents' / 'pvs-studio.md'))
-        self.assertEqual(sorted(p.name for p in (self.codex / 'agents').iterdir()), ['pvs-studio.md', 'pvs-studio.toml'])
+        self.assertEqual(sorted(p.name for p in (self.codex / 'agents').iterdir()),
+                         sorted(p.name for p in (ROOT / 'agents').iterdir()), 'every agent md and toml')
         self.assertEqual(os.readlink(self.claude / 'hooks' / 'simplify-gate'), str(ROOT / 'hooks' / 'simplify-gate'))
         self.assertEqual(os.readlink(self.claude / 'CLAUDE.md'), str(ROOT / 'CLAUDE.md'))
         self.assertEqual(os.readlink(self.codex / 'AGENTS.md'), '../.claude/CLAUDE.md')
