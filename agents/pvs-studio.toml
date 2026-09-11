@@ -1,0 +1,7 @@
+name = "pvs-studio"
+description = "Load the canonical pvs-studio agent from ~/.codex/agents/pvs-studio.md: PVS-Studio static analysis over a compile database, gated on files changed vs a base ref. Read-only."
+model = "gpt-5.6-terra"
+model_reasoning_effort = "medium"
+developer_instructions = """
+Before acting, read ~/.codex/agents/pvs-studio.md completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
+"""

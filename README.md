@@ -7,6 +7,7 @@ skills and commands, versioned in git.
 install.sh        symlink this checkout into ~/.claude and ~/.codex
 CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
 skills/           ~/.claude/skills
+agents/           ~/.claude/agents (Claude only: Codex has no user-level subagents)
 commands/         ~/.claude/commands
 hooks/            Claude Code hooks, switched on per repository (see below)
 tests/            unit tests for skill scripts and hooks
@@ -24,10 +25,11 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 
 This links `CLAUDE.md` and `commands/` into `~/.claude`, points
 `~/.codex/AGENTS.md` at the same `CLAUDE.md`, and links each skill one by one
-into `~/.claude/skills` and `~/.codex/skills`. Those directories stay real
-directories, so a machine can keep its own skills, or ones added with `npx
-skills add`, beside the linked ones; only links into this repo are pruned when a
-skill is removed. Rerun it after adding a skill.
+into `~/.claude/skills` and `~/.codex/skills`, and each agent into
+`~/.claude/agents`. Those directories stay real directories, so a machine can
+keep its own skills, or ones added with `npx skills add`, beside the linked
+ones; only links into this repo are pruned when a skill or agent is removed.
+Rerun it after adding a skill or agent.
 
 Project repos such as tinyusb reference these skills by bare name only, e.g.
 `read-doc`, and expect this install to have run; without it their agents take
