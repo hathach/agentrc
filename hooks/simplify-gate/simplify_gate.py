@@ -314,10 +314,6 @@ def incomplete(state):
     return 'challenge incomplete: ' + '; '.join(state['errors'])
 
 
-SCOPE = (' Scope is what changed in the checkout this turn, which may include a peer\'s edits: '
-         'reject findings on files you neither wrote nor had a coworker write for you.')
-
-
 def queue_delta(root, directory, state, now):
     """Diff the cursor against `now` into a new batch, blobs cached; the first
     snapshot is the cursor and nothing else."""
@@ -401,17 +397,16 @@ def finish(root, directory, state, job, findings, error):
         return reply(state, missed + f'YAGNI challenge round {round_number}: no findings.')
     listed = '\n'.join(f"- {f['file']}:{f['line']}: {f['problem']} Alternative: {f['alternative']}"
                        for f in findings)
+    scope = "reject findings outside this turn's work by you or a coworker acting for you"
     if round_number < ROUNDS:
-        head_text = (f'{CHALLENGE} (round {round_number} of {ROUNDS}): evaluate each finding; apply '
-                     'the useful ones or give a concrete reason for rejecting it. Preserve behavior, input '
-                     'contracts, tests and unrelated work; re-run the checks your edits call for. A follow-up '
-                     'review runs after edits.')
+        head_text = (f'{CHALLENGE} (round {round_number} of {ROUNDS}): apply each finding or reject it with '
+                     f'a reason; {scope}; a follow-up review runs after edits.')
     else:
-        head_text = (f'{CHALLENGE} (round {ROUNDS}, final): these findings remain. Apply or reject them '
-                     'with reasons in your reply; no further review will run.')
+        head_text = (f'{CHALLENGE} (round {ROUNDS}, final): apply each finding or reject it with a reason '
+                     f'in your reply; {scope}; no further review runs.')
     notes = reply(state).get('systemMessage', '')
     prefix = notes.removeprefix('simplifyGate: ') + '; ' if notes else ''
-    return {'decision': 'block', 'reason': prefix + head_text + SCOPE + '\n' + listed}
+    return {'decision': 'block', 'reason': prefix + head_text + '\n' + listed}
 
 
 def new_state():

@@ -297,8 +297,7 @@ class GateTest(unittest.TestCase):
         self.write('c.txt', 'peer wrote this\n')
         reply = self.review([FINDING])
         self.assertIn('peer wrote this', self.s.prompts[0])
-        self.assertIn("may include a peer's edits", reply['reason'])
-        self.assertIn('nor had a coworker write for you', reply['reason'], 'commissioned edits are ours to defend')
+        self.assertIn('a coworker acting for you', reply['reason'], 'commissioned edits are ours to defend')
         self.assertIn('a peer sharing the checkout may have made some', self.s.prompts[0])
 
     def test_an_interrupted_turn_keeps_its_edits_for_the_next_review(self):
