@@ -106,7 +106,7 @@ class CoworkTest(unittest.TestCase):
         for box in Path(self.tmp.name).glob('repo/.git/cowork/*'):  # runners hang off init, not off us
             for request in cowork.requests(box):
                 subprocess.run(['pkill', '-9', '-f', f'cowork.py _run \\S+ {request} '], stderr=subprocess.DEVNULL)
-                pid = cowork.lock_lines((box / f'{request}.lock').read_text())[0]
+                pid = cowork.cli_pid(box / f'{request}.lock')
                 if pid and cowork.holds(int(pid), box / f'{request}.lock'):
                     os.kill(int(pid), 9)
         os.chdir(self.cwd)
@@ -149,7 +149,7 @@ class CoworkTest(unittest.TestCase):
         return self.root / '.git' / 'cowork' / side
 
     def started(self, request):
-        until(lambda: cowork.lock_lines((self.box() / f'{request}.lock').read_text())[0] != '')
+        until(lambda: cowork.cli_pid(self.box() / f'{request}.lock') != '')
 
     def reaped(self, *argv, **env):
         """A gated send whose process is killed before it can deliver, as the
@@ -248,36 +248,22 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(argv[argv.index('--effort') + 1], 'low', 'Claude has no minimal')
 
     def test_model_and_effort_flags_persist_until_replaced_or_reset(self):
-        self.send('--model', 'gpt-5.6-terra', '--effort', 'high', '--task', 'a')
-        self.send('--task', 'b')
-        self.send('--effort', 'low', '--task', 'c')
+        for argv in (('--model', 'gpt-5.6-terra', '--effort', 'high', '--task', 'a'), ('--task', 'b'),
+                     ('--effort', 'low', '--task', 'c'), ('--model', 'gpt-5.6-luna', '--task', 'd'), ('--task', 'e')):
+            self.assertEqual(self.send(*argv)[0], 0)
         self.run_cli('reset', 'codex')
-        self.send('--task', 'd')
+        self.send('--task', 'f')
         seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
         self.assertEqual(seen, [('gpt-5.6-terra', 'model_reasoning_effort=high'), ('gpt-5.6-terra', 'model_reasoning_effort=high'),
-                                ('gpt-5.6-terra', 'model_reasoning_effort=low'), ('gpt-6-astra', 'model_reasoning_effort=medium')])
+                                ('gpt-5.6-terra', 'model_reasoning_effort=low'), ('gpt-5.6-luna', 'model_reasoning_effort=low'),
+                                ('gpt-5.6-luna', 'model_reasoning_effort=low'), ('gpt-6-astra', 'model_reasoning_effort=medium')])
         _, out, _ = self.run_cli('status')
         self.assertIn('codex: session thread-42, gpt-6-astra at medium effort', out)
 
-    def test_each_request_keeps_the_pair_it_was_sent_with(self):
-        first, first_id = self.send_gated('--task', 'one')
-        second, second_id = self.send_gated('--effort', 'high', '--task', 'two')
-        third, third_id = self.send_gated('--model', 'gpt-5.6-luna', '--effort', 'low', '--task', 'three')
-        self.started(first_id)
-        self.gate.touch()
-        for proc in (first, second, third):
-            self.assertEqual(proc.wait(timeout=30), 0)
-        seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
-        self.assertEqual(seen, [('gpt-6-astra', 'model_reasoning_effort=medium'), ('gpt-6-astra', 'model_reasoning_effort=high'),
-                                ('gpt-5.6-luna', 'model_reasoning_effort=low')])
-
-    def test_a_send_changing_the_model_does_not_erase_a_thread_bound_meanwhile(self):
-        first, first_id = self.send_gated('--task', 'one')
-        self.started(first_id)
-        self.gate.touch()
-        first.wait(timeout=30)
+    def test_a_field_update_keeps_the_bound_thread(self):
+        self.assertEqual(self.send('--task', 'one')[0], 0)
         self.assertEqual(cowork.session_of(self.box()), 'thread-42')
-        cowork.update_side(self.box(), effort='high')  # what a concurrent send does after reading stale state
+        cowork.update_side(self.box(), effort='high')
         self.assertEqual(cowork.side_state(self.box()), ('thread-42', 'gpt-6-astra', 'high'), 'a field-wise update')
         self.send('--task', 'two')
         self.assertEqual(self.calls()[-1]['argv'][:3], ['exec', 'resume', 'thread-42'])
@@ -477,40 +463,35 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(target.read_text(), '0\n')
         self.assertFalse(list(self.root.glob('*.tmp')))
 
-    # --- the queue ------------------------------------------------------------------
+    # --- one request in flight -----------------------------------------------------------
 
-    def test_queued_sends_run_in_order_on_the_same_session(self):
+    def test_one_request_in_flight_per_side_and_the_next_resumes_the_same_session(self):
         first, first_id = self.send_gated('--task', 'one')
-        second, second_id = self.send_gated('--task', 'two')
-        third, third_id = self.send_gated('--task', 'three')
         self.started(first_id)
         _, out, _ = self.run_cli('status')
         self.assertIn(f'{first_id}  running', out)
-        self.assertIn(f'{third_id}  queued', out)
+        before = sorted(p.name for p in self.box().iterdir())
+        code, _, _, err = self.send('--task', 'two')
+        self.assertEqual(code, cowork.BUSY, 'a second send while one runs is refused')
+        self.assertIn(first_id, err)
+        self.assertEqual(sorted(p.name for p in self.box().iterdir()), before, 'the refused send left nothing')
         self.gate.touch()
-        for proc in (first, second, third):
-            self.assertEqual(proc.wait(timeout=30), 0)
-            self.assertIn('Files touched: none', proc.stdout.read())
+        self.assertEqual(first.wait(timeout=30), 0)
+        self.assertIn('Files touched: none', first.stdout.read())
+        code, _, _, _ = self.send('--task', 'two')
+        self.assertEqual(code, 0)
         tasks = [c['stdin'].rsplit('\n', 1)[-1] for c in self.calls()]
-        self.assertEqual(tasks, ['one', 'two', 'three'])
+        self.assertEqual(tasks, ['one', 'two'])
         self.assertNotIn('resume', self.calls()[0]['argv'])
         self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
-        self.assertEqual(self.calls()[2]['argv'][:3], ['exec', 'resume', 'thread-42'])
         self.assertIn('coworker on the cowork channel', self.calls()[0]['stdin'])
         self.assertNotIn('coworker on the cowork channel', self.calls()[1]['stdin'], 'bootstrap decided at run time')
 
-    def test_a_failed_turn_skips_what_was_queued_behind_it(self):
-        first, first_id = self.send_gated('--task', 'one', FAKE_EXIT='2')
-        second, second_id = self.send_gated('--task', 'two')
-        self.gate.touch()
-        self.assertEqual(first.wait(timeout=30), 1)
-        self.assertEqual(second.wait(timeout=30), 1)
-        out = second.stdout.read()
-        self.assertIn('was skipped', out)
-        self.assertIn(f'queued behind {first_id}, which ended 2', out)
-        self.assertEqual(len(self.calls()), 1, 'the second never reached the coworker')
-        code, _, _, _ = self.send('--task', 'three')
-        self.assertEqual(code, 0, 'a request sent after the failure is not behind it')
+    def test_a_failed_turn_does_not_block_the_next_send(self):
+        code, _, _, _ = self.send('--task', 'one', FAKE_EXIT='2')
+        self.assertEqual(code, 1)
+        code, _, _, _ = self.send('--task', 'two')
+        self.assertEqual(code, 0)
 
     def test_a_corpse_in_the_box_neither_blocks_nor_poisons(self):
         box = self.box()
@@ -522,20 +503,7 @@ class CoworkTest(unittest.TestCase):
         _, out, _ = self.run_cli('status')
         self.assertIn('codex-00000000-000000-000000  died', out)
 
-    def test_a_runner_that_dies_while_queued_skips_what_was_behind_it(self):
-        first, first_id = self.send_gated('--task', 'slow')
-        second, second_id = self.send_gated('--task', 'doomed')
-        third, third_id = self.send_gated('--task', 'behind doomed')
-        self.started(first_id)
-        runner = int(subprocess.run(['pgrep', '-f', f'_run codex {second_id}'], capture_output=True, text=True).stdout.split()[0])
-        os.kill(runner, 9)  # the runner dies while still queued; nothing holds its lock
-        self.gate.touch()
-        self.assertEqual(first.wait(timeout=30), 0)
-        self.assertEqual(third.wait(timeout=30), 1)
-        self.assertIn(f'queued behind {second_id}, which ended died', third.stdout.read())
-        self.assertEqual(second.wait(timeout=10), 1, 'the send behind the dead runner reports it')
-
-    def test_reset_refuses_while_requests_are_pending(self):
+    def test_reset_refuses_while_a_request_runs(self):
         proc, request = self.send_gated('--task', 'slow')
         code, _, err = self.run_cli('reset', 'codex')
         self.assertEqual(code, cowork.BUSY)
@@ -547,28 +515,28 @@ class CoworkTest(unittest.TestCase):
 
     # --- kills --------------------------------------------------------------------------
 
-    def test_kill_stops_a_running_request_and_what_was_behind_it_is_skipped(self):
+    def test_kill_stops_a_running_request_and_frees_the_side(self):
         first, first_id = self.send_gated('--task', 'slow')
-        second, second_id = self.send_gated('--task', 'next')
         self.started(first_id)
         code, out, _ = self.run_cli('kill', first_id)
         self.assertEqual(out.strip(), f'{first_id}: killed')
         self.assertEqual(first.wait(timeout=10), 1)
         self.assertIn('was killed', first.stdout.read())
         self.assertFalse(cowork.held(self.box() / f'{first_id}.lock'), 'nothing of the turn survives')
-        self.assertEqual(second.wait(timeout=30), 1)
-        self.assertIn('which ended killed', second.stdout.read())
+        code, _, _, _ = self.send('--task', 'next')
+        self.assertEqual(code, 0)
 
-    def test_kill_a_queued_request_before_it_starts(self):
-        first, first_id = self.send_gated('--task', 'slow')
-        second, second_id = self.send_gated('--task', 'never')
-        self.started(first_id)
-        code, out, _ = self.run_cli('kill', second_id)
-        self.assertEqual(out.strip(), f'{second_id}: killed')
-        self.assertEqual(second.wait(timeout=10), 1)
-        self.gate.touch()
-        self.assertEqual(first.wait(timeout=30), 0, 'the running one is untouched')
-        self.assertEqual(len(self.calls()), 1)
+    def test_a_kill_that_lands_before_the_runner_starts_runs_nothing(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        cowork.publish(box / 'codex-x.exit', 'killed\n')
+        with (box / 'codex-x.lock').open('w') as lock, contextlib.redirect_stderr(io.StringIO()):
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            cowork.write_side(box, model='gpt-6-astra', effort='medium')
+            cowork.run('codex', box, self.root, 'codex-x', False, lock.fileno())
+        self.assertEqual(self.calls(), [])
+        self.assertTrue((box / 'codex-x.task').exists(), 'unread')
 
     def test_kill_takes_tools_that_left_the_process_group(self):
         self.codex_does("import subprocess; open('tool.pid', 'w').write(str(subprocess.Popen(['sleep', '60'], start_new_session=True).pid))")
@@ -596,12 +564,12 @@ class CoworkTest(unittest.TestCase):
         (box / 'codex-x.exit').write_text('killed\n')
         with (box / 'codex-x.lock').open('w') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)  # a kill was published; the teardown is not done
-            self.assertEqual(cowork.live(box), ['codex-x'])
+            self.assertEqual(cowork.running(box), 'codex-x')
             code, _, _ = self.run_cli('read', 'codex-x')
             self.assertEqual(code, cowork.BUSY, 'a verdict does not make teardown complete')
             code, _, _ = self.run_cli('reset', 'codex')
             self.assertEqual(code, cowork.BUSY)
-        self.assertEqual(cowork.live(box), [])
+        self.assertIsNone(cowork.running(box))
 
     def test_kill_signals_only_a_pid_that_holds_the_request_lock(self):
         box = self.box()
@@ -635,13 +603,13 @@ class CoworkTest(unittest.TestCase):
     def test_kill_on_a_finished_request_signals_nothing(self):
         request = self.reaped('--task', 'done')
         self.settled(request)
-        (self.box() / f'{request}.lock').write_text(f'{os.getpid()}\n0\n')  # a reused pid: ours
+        (self.box() / f'{request}.lock').write_text(f'{os.getpid()}\n')  # a reused pid: ours
         with mock.patch.object(cowork, 'kill_tree') as kill:
             code, out, _ = self.run_cli('kill', request)
         self.assertEqual(out.strip(), f'{request}: 0')
         kill.assert_not_called()
 
-    def test_a_kill_that_wins_during_conclude_is_the_verdict_the_successor_reads(self):
+    def test_a_kill_that_wins_during_conclude_is_the_verdict(self):
         box = self.box()
         box.mkdir(parents=True)
         (box / 'codex-x.task').write_text('p')
@@ -655,14 +623,14 @@ class CoworkTest(unittest.TestCase):
                 return '0'
             with mock.patch.object(cowork, 'conclude', kill_meanwhile), \
                  contextlib.redirect_stderr(io.StringIO()):
-                cowork.run('codex', box, self.root, 'codex-x', None, None, False, lock.fileno(), 'gpt-6-astra', 'medium')
-            self.assertEqual(cowork.lock_lines((box / 'codex-x.lock').read_text())[1], 'killed')
+                cowork.write_side(box, model='gpt-6-astra', effort='medium')
+                cowork.run('codex', box, self.root, 'codex-x', False, lock.fileno())
             self.assertEqual((box / 'codex-x.exit').read_text(), 'killed\n')
 
-    def test_a_successor_reading_the_verdict_does_not_look_like_a_live_runner(self):
+    def test_a_shared_reader_of_the_lock_does_not_look_like_a_live_runner(self):
         box = self.box()
         box.mkdir(parents=True)
-        (box / 'codex-x.lock').write_text('4242\n0\n')  # the runner wrote its verdict and is exiting
+        (box / 'codex-x.lock').write_text('4242\n')  # the runner is exiting
         (box / 'codex-x.exit').write_text('0\n')
         (box / 'codex-x.reply').write_text('done\nFiles touched: none\n')
         (box / 'codex-x.err').touch()
@@ -779,22 +747,15 @@ class CoworkTest(unittest.TestCase):
         unasked = self.reaped('--task', 'not replayed', FAKE_REPLY='no footer\n')
         self.settled(unasked)
         self.gate.unlink()
-        first, first_id = self.send_gated('--task', 'one')
-        second, second_id = self.send_gated('--task', 'two', FAKE_EXIT='2')
-        third, third_id = self.send_gated('--task', 'three')
-        self.started(first_id)
-        watch = subprocess.Popen([sys.executable, str(SCRIPT), 'watch', earlier, first_id, second_id, third_id],
+        first_id = self.reaped('--task', 'one', FAKE_EXIT='2')  # reaped before delivery, so the watch is the only ping
+        watch = subprocess.Popen([sys.executable, str(SCRIPT), 'watch', earlier, first_id],
                                  cwd=self.root, stdout=subprocess.PIPE, text=True)
         self.background.append(watch)
         self.assertEqual(watch.stdout.readline(), f'{earlier}   replied\n')
-        for proc in (first, second, third):  # reaped before delivery, so the watch is the only ping
-            proc.kill()
-            proc.wait()
         self.gate.touch()
         self.assertEqual(watch.wait(timeout=30), 0, 'exits once every named request is reported')
-        self.assertEqual(watch.stdout.read(), f'{first_id}   replied\n{second_id}   exited 2\n{third_id}   was skipped\n')
-        for request in (first_id, second_id, third_id):
-            self.run_cli('read', request)
+        self.assertEqual(watch.stdout.read(), f'{first_id}   exited 2\n')
+        self.run_cli('read', first_id)
         self.assertEqual(self.leftovers(first_id), [])
         code, _, _ = self.run_cli('watch', 'codex-nope')
         self.assertEqual(code, cowork.BUSY)

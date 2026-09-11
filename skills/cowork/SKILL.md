@@ -1,6 +1,6 @@
 ---
 name: cowork
-description: Cowork with the other coding agent headless, in this worktree, through its own CLI - Claude drives `codex exec`, Codex drives `claude -p` - with one resumed session per side so context carries across requests. Hand it a bounded task, ask a question or a review, queue several and get each reply as it lands, and let a human follow its reasoning with `tail`. The coworker edits and commits locally; push, PRs and comments stay with the human.
+description: Cowork with the other coding agent headless, in this worktree, through its own CLI - Claude drives `codex exec`, Codex drives `claude -p` - with one resumed session per side so context carries across requests. Hand it a bounded task, ask a question or a review, one request in flight per side, and let a human follow its reasoning with `tail`. The coworker edits and commits locally; push, PRs and comments stay with the human.
 ---
 
 # Coworking with the other agent's CLI
@@ -19,7 +19,7 @@ same commands; the checkout is shared.
 S=<skill dir>/scripts/cowork.py
 
 python3 $S send (--task "..." | --task-file F | --task -) [--no-edit] [--model M] [--effort E]
-python3 $S kill <id>             # queued or running, with all it spawned
+python3 $S kill <id>             # the running request, with all it spawned
 python3 $S read <id>             # deliver the reply of a request whose send died
 python3 $S watch [<id>...]       # one line per undelivered request as it settles; exits once the named ones are done
 python3 $S status                # sessions and undelivered requests
@@ -29,11 +29,9 @@ python3 $S reset codex|claude    # forget the session and its requests; the next
 
 `send` prints the request id, then blocks until the reply is in and prints
 it. Run it in your harness's background: its exit is the notification, and
-you keep working meanwhile. Several `send`s queue and run one after another
-on the same session, in the order sent, so a later message may build on an
-earlier reply; if an earlier one fails or is killed, the ones queued behind
-it are skipped with exit 1 and say so, and you resend what still matters.
-There is no timeout: a turn runs until the CLI ends or you `kill` it. The
+you keep working meanwhile. One request per side is in flight: a `send`
+while one runs is refused with exit 3 naming it, so wait for the reply, or
+`kill` it, before the next. There is no timeout: a turn runs until the CLI ends or you `kill` it. The
 turn runs in a detached runner, so a `send` that dies loses nothing: `status`
 shows the request and `read <id>` delivers the reply.
 
@@ -59,8 +57,8 @@ steps.
 The coworker defaults to the other CLI: Codex from Claude Code, Claude from
 Codex; `--to` overrides. `--no-edit` puts Claude in plan mode; Codex is asked
 and then checked, since its read-only sandbox would also forbid the temp
-files a test suite needs. Exit codes: 1 the turn failed or was skipped, 3
-unknown or delivered request, or reset refused, 4 the reply lacks its "Files
+files a test suite needs. Exit codes: 1 the turn failed, 3 unknown or
+delivered request, the side busy, or reset refused, 4 the reply lacks its "Files
 touched" line or the tree changed under `--no-edit`.
 
 The coworker's model and effort are per side and persist with the session.
@@ -90,8 +88,6 @@ you reproduced it or only read the code.
 - **TASK**: what done looks like, with the context the coworker lacks. It
   has none of your conversation; say which files it owns and what to leave
   alone. `--no-edit` for a question or a review.
-- **What to queue**: a message queued behind another should say what it
-  assumes from the earlier reply; the coworker sees both in order.
 - **Whether the result holds.** Re-read every file the reply lists under
   "Files touched" before you build on it. A claim of done is a claim.
 - **When to reset.** When the coworker's context is spent or the topic

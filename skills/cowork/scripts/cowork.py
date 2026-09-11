@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run queued coworker turns in a detached process, resuming one session per side.
+"""Run coworker turns in a detached process, resuming one session per side, one turn at a time.
 
   cowork.py send [--to codex|claude] [--no-edit] [--model M] [--effort E] (--task TEXT | --task-file F | --task -)
   cowork.py kill <id>
@@ -17,16 +17,15 @@ flags replace them or reset forgets them.
 A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
-teardown, so liveness does not depend on pid reuse; the CLI pid and then
-the verdict are written inside), .jsonl (CLI stdout), .err (stderr), and at
-settle .reply and .exit (the verdict, first writer wins). A successor reads
-its predecessor's verdict through a descriptor of that lock opened at send,
-so delivery may delete the file underneath; a failed predecessor skips it.
+teardown, so liveness does not depend on pid reuse; the CLI pid is written
+inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
+(the verdict, first writer wins). One request per side is in flight: a send
+while one is refused.
 
 send waits for the reply, prints it and removes the request; read does the
 same for a reply whose send died; watch reports settled requests still
-undelivered; reset removes everything of a side. Exit codes: 1 failed or
-skipped, 3 unknown or delivered request, busy, or reset refused, 4 missing
+undelivered; reset removes everything of a side. Exit codes: 1 failed,
+3 unknown or delivered request, a side busy, or reset refused, 4 missing
 "Files touched" line or a changed tree during --no-edit.
 """
 
@@ -48,7 +47,6 @@ from pathlib import Path
 
 SIDES = ('codex', 'claude')
 FAILED, BUSY, MALFORMED = 1, 3, 4
-GOOD = ('0', 'edited')  # a turn that produced a reply
 FOOTER = re.compile(r'^Files touched: \S', re.M)
 BOOTSTRAP = (
     'You are the {side} coworker on the cowork channel of the checkout at {root}: a headless,\n'
@@ -152,7 +150,7 @@ def publish(path, text):
 
 @contextlib.contextmanager
 def admission(box):
-    """Only one process reads or changes the queue at a time."""
+    """Only one process reads or changes a side's requests at a time."""
     with (box / 'lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
@@ -160,9 +158,7 @@ def admission(box):
 
 def held(lock_file, wait=False):
     """True while a runner, its CLI or anything they spawned still holds this
-    request's lock exclusively; with `wait`, block until they let go. Probed
-    shared, so a successor reading the verdict through its own shared lock is
-    not mistaken for them."""
+    request's lock exclusively; with `wait`, block until they let go."""
     try:
         with lock_file.open('r') as handle:
             fcntl.flock(handle, fcntl.LOCK_SH | (0 if wait else fcntl.LOCK_NB))
@@ -182,11 +178,9 @@ def holds(pid, lock_file):
         return False
 
 
-def lock_lines(content):
-    """(CLI pid, verdict) written into a request lock by its runner; either
-    is '' before the runner got there."""
-    lines = content.split('\n') + ['', '']
-    return lines[0], lines[1]
+def cli_pid(lock_file):
+    """The CLI pid the runner wrote into the request lock, '' before it got there."""
+    return lock_file.read_text().strip()
 
 
 def requests(box):
@@ -197,16 +191,7 @@ def state(box, request):
     exit_file, lock = box / f'{request}.exit', box / f'{request}.lock'
     if exit_file.exists():
         return exit_file.read_text().strip()
-    if not held(lock):
-        return 'died'
-    return 'running' if lock_lines(lock.read_text())[0] else 'queued'
-
-
-def materialise(box, request):
-    """A runner killed outright leaves an unheld lock and no verdict: record
-    one, so the request can be delivered like any other."""
-    if not held(box / f'{request}.lock'):
-        publish(box / f'{request}.exit', 'died\n')
+    return 'running' if held(lock) else 'died'
 
 
 def remove(box, request):
@@ -214,10 +199,10 @@ def remove(box, request):
         leftover.unlink()
 
 
-def live(box):
-    """Requests whose runner or CLI is still there, in ticket order: a verdict
-    alone does not free the side, a killed turn is still being torn down."""
-    return [r for r in requests(box) if held(box / f'{r}.lock')]
+def running(box):
+    """The request whose runner or CLI is still there, if any: a verdict alone
+    does not free the side, a killed turn is still being torn down."""
+    return next((r for r in requests(box) if held(box / f'{r}.lock')), None)
 
 
 def side_state(box):
@@ -230,9 +215,8 @@ def side_state(box):
 
 def write_side(box, **fields):
     """Change some of a side's session id, model and effort: a field-wise
-    merge, replaced in one step so a reader never sees a truncated file. The
-    caller holds admission, so a runner binding its thread and a send
-    changing the model never overwrite each other."""
+    merge, replaced in one step so a reader never sees a truncated file.
+    The caller holds admission."""
     current = dict(zip(('session', 'model', 'effort'), side_state(box)))
     current.update(fields)
     tmp = box / f'session.{os.getpid()}.tmp'
@@ -248,14 +232,13 @@ def update_side(box, **fields):
 def settle_pair(box, model, effort):
     """The model and effort for a request: the flags, else the side's saved
     pair, else the caller's own tier; whatever was missing on the side is
-    saved for later sends. Under admission with the enqueue."""
+    saved for later sends. Under admission with the start."""
     saved_model, saved_effort = side_state(box)[1:]
     model, effort = model or saved_model, effort or saved_effort
     if not (model and effort):  # first send on this side: start from what drives it
         own_model, own_effort = own_model_and_effort()
         model, effort = model or equivalent(own_model), effort or own_effort
     write_side(box, model=model, effort=effort)
-    return model, effort
 
 
 def session_of(box):
@@ -321,42 +304,16 @@ def kill_tree(pid):
             os.kill(victim, signal.SIGKILL)
 
 
-def take_turn(box, request, behind, behind_fd):
-    """Block until the request queued just before this one lets go of its
-    lock, then read the verdict its runner wrote inside, through the
-    descriptor `send` opened while the file still existed: delivery may have
-    removed it since. Returns the reason not to run: a verdict already
-    published for this request (`kill`), or the predecessor ending in
-    anything but a reply; skips chain, so nothing runs after an earlier
-    failure, kill or dead runner."""
-    while True:
-        if (box / f'{request}.exit').exists():
-            return 'killed'
-        if behind_fd is None:
-            return None
-        try:
-            fcntl.flock(behind_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)  # still running, or still being torn down
-        except BlockingIOError:
-            time.sleep(0.1)
-            continue
-        verdict = lock_lines(os.pread(behind_fd, 4096, 0).decode())[1] or 'died'
-        os.close(behind_fd)
-        return None if verdict in GOOD else f'skipped: queued behind {behind}, which ended {verdict}'
-
-
-def run(side, box, root, request, behind, behind_fd, no_edit, lock_fd, model, effort):
+def run(side, box, root, request, no_edit, lock_fd):
     """One coworker turn, in the detached runner, whose stderr is <id>.err.
-    Publishes the verdict unless `kill` got there first, then leaves it in
-    the lock for the successor and lets go."""
+    Publishes the verdict unless `kill` got there first, then lets go."""
     exit_file, reply, stream = (box / f'{request}.{ext}' for ext in ('exit', 'reply', 'jsonl'))
     status, child, before = 'error', None, None
     try:
-        reason = take_turn(box, request, behind, behind_fd)
-        if reason:
-            status = reason.split(':')[0]
-            print(reason, file=sys.stderr)
+        if exit_file.exists():  # killed before it started
+            status = 'killed'
             return
-        session = session_of(box)
+        session, model, effort = side_state(box)  # settled by start, under the lock this runner holds
         task = box / f'{request}.task'
         prompt = compose(session, side, request, task.read_text(), no_edit, root, model, effort)
         task.unlink()
@@ -383,9 +340,7 @@ def run(side, box, root, request, behind, behind_fd, no_edit, lock_fd, model, ef
         if child is not None:
             status = conclude(side, box, status, reply, stream, new_session, before, root)
         sys.stderr.flush()
-        publish(exit_file, status + '\n')
-        verdict = exit_file.read_text().strip()  # `kill` may have won during conclude()
-        os.pwrite(lock_fd, f'{child.pid if child else ""}\n{verdict}\n'.encode(), 0)
+        publish(exit_file, status + '\n')  # `kill` may have won during conclude()
 
 
 def conclude(side, box, status, reply, stream, new_session, before, root):
@@ -411,7 +366,7 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
     if status == '0' and before is not None and tree_state(root) != before:
         print('the tree changed during a --no-edit turn; check git status', file=sys.stderr)
         status = 'edited'
-    if side == 'codex' and status not in GOOD + ('killed',):
+    if side == 'codex' and status not in ('0', 'edited', 'killed'):  # a turn that produced a reply, or was cut
         # Codex reports an in-turn failure only as a JSONL event, with nothing on stderr
         for event in events(stream):
             if event.get('type') in ('error', 'turn.failed'):
@@ -448,10 +403,11 @@ def events(stream):
 
 
 def verdict(box, request):
-    """(what happened, exit code) of a request whose runner has let go."""
+    """(what happened, exit code) of a request whose runner has let go. A
+    runner killed outright left no verdict: record one, so the request is
+    delivered like any other."""
     exit_file = box / f'{request}.exit'
-    if not exit_file.exists():
-        return 'died without recording a verdict', FAILED
+    publish(exit_file, 'died\n')
     status = exit_file.read_text().strip()
     if status == 'edited':
         return 'the tree changed during a --no-edit turn; check git status', MALFORMED
@@ -459,7 +415,7 @@ def verdict(box, request):
         if FOOTER.search(text_of(box / f'{request}.reply')):
             return 'replied', 0
         return 'the reply has no "Files touched" line; re-read the tree yourself', MALFORMED
-    return {'error': 'failed', 'killed': 'was killed', 'skipped': 'was skipped',
+    return {'error': 'failed', 'killed': 'was killed',
             'died': 'died without recording a verdict'}.get(status, f'exited {status}'), FAILED
 
 
@@ -473,7 +429,6 @@ def deliver(box, request):
             die(f'no request {request} in this worktree: delivered already, or never sent', BUSY)
         if held(lock):
             die(f'{request} is {state(box, request)}; read it once it settles', BUSY)
-        materialise(box, request)
         what, code = verdict(box, request)
         if code == FAILED:
             err = box / f'{request}.err'  # absent if send died before starting the runner
@@ -490,7 +445,7 @@ def deliver(box, request):
 def settled(gitdir):
     """{request: what happened} for every request in this worktree whose
     runner has let go and whose reply is still here. Read under admission,
-    so a request being enqueued or delivered is never seen half-made."""
+    so a request being created or delivered is never seen half-made."""
     done = {}
     for side in SIDES:
         box = gitdir / 'cowork' / side
@@ -498,7 +453,6 @@ def settled(gitdir):
             with admission(box):
                 for request in requests(box):
                     if not held(box / f'{request}.lock'):
-                        materialise(box, request)
                         done[request] = verdict(box, request)[0]
     return done
 
@@ -536,40 +490,35 @@ def follow(box, request):
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
-def enqueue(box, root, side, task, no_edit, model, effort):
-    """Record the request behind the last live one and start its runner,
-    which holds the request lock from birth; the caller keeps nothing open."""
+def start(box, root, side, task, no_edit, model, effort):
+    """Record the request and start its runner, which holds the request lock
+    from birth; the caller keeps nothing open. Refused while one is in flight."""
     with admission(box):
-        model, effort = settle_pair(box, model, effort)
-        for request in requests(box):
-            materialise(box, request)
-        queue = live(box)
+        busy = running(box)
+        if busy:
+            die(f'{side} is busy with {busy}; wait for it, or kill it', BUSY)
+        settle_pair(box, model, effort)
         request = f'{side}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task)
         (box / f'{request}.jsonl').touch()  # so `tail` has a file the instant the id is printed
-        behind = os.open(box / f'{queue[-1]}.lock', os.O_RDONLY) if queue else None
         with (box / f'{request}.lock').open('w') as lock, (box / f'{request}.err').open('ab') as err:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            fds = (lock.fileno(),) + ((behind,) if queue else ())
-            argv = [sys.executable, __file__, '_run', side, request, queue[-1] if queue else '-',
-                    str(behind if queue else '-'), str(int(no_edit)), str(lock.fileno()), model, effort]
+            argv = [sys.executable, __file__, '_run', side, request, str(int(no_edit)), str(lock.fileno())]
             # Double fork: the runner's parent exits at once, so it hangs off init, in its own
             # session, and a harness that kills `send` with its descendants cannot reach it.
             middle = os.fork()
             if middle == 0:
                 subprocess.Popen(argv, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
-                                 start_new_session=True, pass_fds=fds)
+                                 start_new_session=True, pass_fds=(lock.fileno(),))
                 os._exit(0)
             os.waitpid(middle, 0)
-        if queue:
-            os.close(behind)
     return request
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='cmd', required=True)
-    send = sub.add_parser('send', help='queue one turn of the coworker; prints the request id, then the reply')
+    send = sub.add_parser('send', help='one turn of the coworker; prints the request id, then the reply')
     send.add_argument('--to', choices=SIDES, help='which coworker; defaults to codex when run from Claude Code')
     task = send.add_mutually_exclusive_group(required=True)
     task.add_argument('--task', help='literal text, or - for stdin')
@@ -577,7 +526,7 @@ def main(argv=None):
     send.add_argument('--no-edit', action='store_true', help='a question or review: the coworker must not edit')
     send.add_argument('--model', help='the coworker\'s model from now on; first send defaults to your own tier')
     send.add_argument('--effort', choices=EFFORTS, help='its reasoning effort from now on; first send defaults to yours')
-    sub.add_parser('kill', help='stop a request, queued or running, and everything its coworker spawned').add_argument('request')
+    sub.add_parser('kill', help='stop a running request and everything its coworker spawned').add_argument('request')
     sub.add_parser('read', help='print the reply of a settled request whose send died, and remove it').add_argument('request')
     watch = sub.add_parser('watch', help='print "<id>  <what happened>" for each request as it settles; '
                                         'with ids, exit once each is reported or delivered, else run forever')
@@ -588,14 +537,13 @@ def main(argv=None):
     reset = sub.add_parser('reset', help='forget a side\'s session and its requests; the next send starts anew')
     reset.add_argument('side', choices=SIDES)
     runner = sub.add_parser('_run', help=argparse.SUPPRESS)  # the detached child of `send`
-    for name in ('side', 'request', 'behind', 'behind_fd', 'no_edit', 'lock_fd', 'model', 'effort'):
+    for name in ('side', 'request', 'no_edit', 'lock_fd'):
         runner.add_argument(name)
     a = parser.parse_args(argv)
 
     root, gitdir = git_dir()
     if a.cmd == '_run':
-        run(a.side, gitdir / 'cowork' / a.side, root, a.request, None if a.behind == '-' else a.behind,
-            None if a.behind_fd == '-' else int(a.behind_fd), a.no_edit == '1', int(a.lock_fd), a.model, a.effort)
+        run(a.side, gitdir / 'cowork' / a.side, root, a.request, a.no_edit == '1', int(a.lock_fd))
         return 0
 
     if a.cmd == 'send':
@@ -608,7 +556,7 @@ def main(argv=None):
             task = sys.stdin.read() if a.task == '-' else a.task
         if not task.strip():
             die('the task resolved to nothing')
-        request = enqueue(box, root, side, task, a.no_edit, a.model, a.effort)
+        request = start(box, root, side, task, a.no_edit, a.model, a.effort)
         print(request, flush=True)
         held(box / f'{request}.lock', wait=True)  # wait through teardown, even if the verdict exists
         return deliver(box, request)
@@ -622,7 +570,7 @@ def main(argv=None):
         with admission(box):  # not after a delivery removed the request, which would leave an orphan verdict
             if not lock.exists():
                 die(f'no request {a.request} in this worktree: delivered already', BUSY)
-            pid = lock_lines(lock.read_text())[0]
+            pid = cli_pid(lock)
             if publish(exit_file, 'killed\n') and pid and holds(int(pid), lock):
                 kill_tree(int(pid))  # our CLI, orphaned or not; a runner still there also sees the verdict
             print(f'{a.request}: {exit_file.read_text().strip()}')
@@ -675,9 +623,9 @@ def main(argv=None):
             print(f'{a.side}: no session')
             return 0
         with admission(box):
-            queue = live(box)
-            if queue:
-                die(f'{a.side} still has {len(queue)} request(s) pending, first {queue[0]}; not resetting under them', BUSY)
+            busy = running(box)
+            if busy:
+                die(f'{a.side} is busy with {busy}; not resetting under it', BUSY)
             gone = requests(box)
             for request in gone:
                 remove(box, request)
