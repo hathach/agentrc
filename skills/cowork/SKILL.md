@@ -18,7 +18,7 @@ same commands; the checkout is shared.
 ```bash
 S=<skill dir>/scripts/cowork.py
 
-python3 $S send (--task "..." | --task-file F | --task -) [--no-edit]
+python3 $S send (--task "..." | --task-file F | --task -) [--no-edit] [--model M] [--effort E]
 python3 $S kill <id>             # queued or running, with all it spawned
 python3 $S read <id>             # deliver the reply of a request whose send died
 python3 $S watch [<id>...]       # one line per undelivered request as it settles, forever
@@ -56,12 +56,23 @@ own, and a watch left armed is a task that never ends. Codex has no such
 tool: run `send` in the foreground, or check `status` between your own
 steps.
 
-From Claude Code the coworker defaults to Codex; from Codex pass
-`--to claude`. `--no-edit` puts Claude in plan mode; Codex is asked and then
-checked, since its read-only sandbox would also forbid the temp files a test
-suite needs. Exit codes: 1 the turn failed or was skipped, 3 unknown request
-or reset refused, 4 the reply lacks its "Files touched" line or the tree
-changed under `--no-edit`.
+The coworker defaults to the other CLI: Codex from Claude Code, Claude from
+Codex; `--to` overrides. `--no-edit` puts Claude in plan mode; Codex is asked
+and then checked, since its read-only sandbox would also forbid the temp
+files a test suite needs. Exit codes: 1 the turn failed or was skipped, 3
+unknown or delivered request, or reset refused, 4 the reply lacks its "Files
+touched" line or the tree changed under `--no-edit`.
+
+The coworker's model and effort are per side and persist with the session.
+The first `send` sets them: `--model` and `--effort` if given, else your own
+model and effort read from your session's record, mapped to the same
+token-cost tier on the other side (fable and astra, opus and sol, sonnet and
+terra, haiku and luna; effort by name, `max` becoming Codex `xhigh`). Later
+sends reuse them; a flag replaces the value from then on; `reset` forgets
+them. A model outside those four families has no equivalent and `send`
+refuses until you pass `--model`. Codex reads its own model from the
+rollout of `CODEX_THREAD_ID`, so no flag is needed there either. The
+request header tells the coworker what model and effort answer it.
 
 Never open the session interactively while a request is running.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run queued coworker turns in a detached process, resuming one session per side.
 
-  cowork.py send [--to codex|claude] [--no-edit] (--task TEXT | --task-file F | --task -)
+  cowork.py send [--to codex|claude] [--no-edit] [--model M] [--effort E] (--task TEXT | --task-file F | --task -)
   cowork.py kill <id>
   cowork.py read <id>
   cowork.py watch [<id>...]
@@ -9,7 +9,11 @@
   cowork.py tail [<id>]
   cowork.py reset <side>
 
-Files live under <git dir>/cowork/<side>/: `session` holds the session id.
+Files live under <git dir>/cowork/<side>/: `session` holds the session id,
+the model and the effort in use. The first send on a side sets the model
+and effort from the flags, else from the caller's own session record mapped
+to the same token-cost tier on the other side; later sends reuse them until
+flags replace them or reset forgets them.
 A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
@@ -50,10 +54,14 @@ BOOTSTRAP = (
     'You are the {side} coworker on the cowork channel of the checkout at {root}: a headless,\n'
     'resumed session driven by the other coding agent, not by a human. Load the `cowork` skill\n'
     'for the rules. Never push, open a PR or post a comment on a request from this channel.\n\n')
-HEADER = ('cowork request {id} from {me}. Scope: {scope}. End your reply with a line\n'
-          '"Files touched: <paths>" or "Files touched: none".\n---\n')
+HEADER = ('cowork request {id} from {me}, answered by {model} at {effort} effort. Scope: {scope}. End your reply\n'
+          'with a line "Files touched: <paths>" or "Files touched: none".\n---\n')
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 STORE = {'codex': '~/.codex/sessions', 'claude': '~/.claude/projects'}
+EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # Claude's names; Codex has minimal..xhigh
+TIERS = {  # the same token cost on the other side, by the family word in the model name (2026-09 list prices)
+    'fable': 'gpt-6-astra', 'opus': 'gpt-5.6-sol', 'sonnet': 'gpt-5.6-terra', 'haiku': 'gpt-5.6-luna',
+    'astra': 'fable', 'sol': 'opus', 'terra': 'sonnet', 'luna': 'haiku'}
 
 
 def die(message, code=FAILED):
@@ -71,11 +79,57 @@ def git_dir():
     return root, gitdir if gitdir.is_absolute() else root / gitdir
 
 
+def caller():
+    """Which CLI is driving, from its environment: Claude Code sets CLAUDECODE,
+    Codex sets CODEX_THREAD_ID."""
+    if os.environ.get('CLAUDECODE'):
+        return 'claude'
+    if os.environ.get('CODEX_THREAD_ID'):
+        return 'codex'
+    return None
+
+
 def coworker(explicit):
-    side = explicit or ('codex' if os.environ.get('CLAUDECODE') else None)
+    side = explicit or {'claude': 'codex', 'codex': 'claude'}.get(caller())
     if side is None:
-        die('say --to codex or --to claude; only Claude Code identifies itself in the environment')
+        die('say --to codex or --to claude; neither Claude Code nor Codex identifies itself in the environment')
     return side
+
+
+def own_model_and_effort():
+    """What the driving session runs right now, from its own record: Claude
+    Code's transcript (last assistant message) and CLAUDE_EFFORT; Codex's
+    rollout, last turn_context."""
+    if caller() is None:
+        die('neither Claude Code nor Codex identifies itself in the environment; pass --model and --effort')
+    if caller() == 'claude':
+        sid = os.environ.get('CLAUDE_CODE_SESSION_ID', '')
+        home = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+        transcript = next(iter(home.glob(f'projects/*/{sid}.jsonl')), None) if sid else None
+        if transcript is None:
+            die('cannot find this Claude Code session\'s transcript to read its model; pass --model')
+        model = next((e['message']['model'] for e in events(transcript)
+                      if e.get('type') == 'assistant' and not e['message'].get('model', '<').startswith('<')), None)
+        if model is None:
+            die(f'{transcript} has no assistant message naming a model yet; pass --model')
+        return model, os.environ.get('CLAUDE_EFFORT') or 'medium'
+    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+    thread = os.environ['CODEX_THREAD_ID']
+    rollout = next(iter(home.glob(f'sessions/**/rollout-*-{thread}.jsonl')), None)
+    if rollout is None:
+        die(f'cannot find the rollout of Codex thread {thread} under {home}/sessions; pass --model')
+    context = next((e['payload'] for e in events(rollout) if e.get('type') == 'turn_context'), None)
+    if not context or not context.get('model'):
+        die(f'{rollout} has no turn_context naming a model yet; pass --model')
+    return context['model'], {'minimal': 'low'}.get(context.get('effort'), context.get('effort') or 'medium')
+
+
+def equivalent(model):
+    """The other side's model at the same token cost."""
+    word = next((w for w in TIERS if w in model), None)
+    if word is None:
+        die(f'no known price tier for {model}: pass --model')
+    return TIERS[word]
 
 
 def text_of(path):
@@ -166,26 +220,64 @@ def live(box):
     return [r for r in requests(box) if held(box / f'{r}.lock')]
 
 
+def side_state(box):
+    """(session id or None, model, effort) of a side; the session id is empty
+    until the first turn binds one."""
+    lines = (box / 'session').read_text().split('\n') if (box / 'session').exists() else []
+    lines += [''] * 3
+    return lines[0] or None, lines[1], lines[2]
+
+
+def write_side(box, **fields):
+    """Change some of a side's session id, model and effort: a field-wise
+    merge, replaced in one step so a reader never sees a truncated file. The
+    caller holds admission, so a runner binding its thread and a send
+    changing the model never overwrite each other."""
+    current = dict(zip(('session', 'model', 'effort'), side_state(box)))
+    current.update(fields)
+    tmp = box / f'session.{os.getpid()}.tmp'
+    tmp.write_text(f'{current["session"] or ""}\n{current["model"] or ""}\n{current["effort"] or ""}\n')
+    os.replace(tmp, box / 'session')
+
+
+def update_side(box, **fields):
+    with admission(box):
+        write_side(box, **fields)
+
+
+def settle_pair(box, model, effort):
+    """The model and effort for a request: the flags, else the side's saved
+    pair, else the caller's own tier; whatever was missing on the side is
+    saved for later sends. Under admission with the enqueue."""
+    saved_model, saved_effort = side_state(box)[1:]
+    model, effort = model or saved_model, effort or saved_effort
+    if not (model and effort):  # first send on this side: start from what drives it
+        own_model, own_effort = own_model_and_effort()
+        model, effort = model or equivalent(own_model), effort or own_effort
+    write_side(box, model=model, effort=effort)
+    return model, effort
+
+
 def session_of(box):
-    session = box / 'session'
-    return session.read_text().strip() if session.exists() else None
+    return side_state(box)[0]
 
 
-def compose(session, side, request, task, no_edit, root):
+def compose(session, side, request, task, no_edit, root, model, effort):
     sender = 'claude' if side == 'codex' else 'codex'
-    header = HEADER.format(id=request, me=sender, scope=SCOPE[no_edit])
+    header = HEADER.format(id=request, me=sender, scope=SCOPE[no_edit], model=model, effort=effort)
     return ('' if session else BOOTSTRAP.format(side=side, root=root)) + header + task
 
 
-def command(side, session, reply_file, no_edit):
+def command(side, session, reply_file, no_edit, model, effort):
     """The CLI argv and, for a first Claude turn, the id it is told to use;
     that id is bound only once the turn succeeds. Claude enforces `--no-edit`
     in plan mode; Codex's read-only sandbox would also forbid the temp files a
     test suite needs, so its turn is checked afterwards instead (tree_state)."""
     if side == 'codex':
         argv = ['codex', 'exec'] + (['resume', session] if session else [])
+        argv += ['-m', model, '-c', f'model_reasoning_effort={"xhigh" if effort == "max" else effort}']
         return argv + ['--json', '-o', str(reply_file), '-'], None
-    argv = ['claude', '-p', '--output-format', 'stream-json', '--verbose']
+    argv = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--model', model, '--effort', effort]
     if no_edit:
         argv += ['--permission-mode', 'plan']
     if session:
@@ -252,7 +344,7 @@ def take_turn(box, request, behind, behind_fd):
         return None if verdict in GOOD else f'skipped: queued behind {behind}, which ended {verdict}'
 
 
-def run(side, box, root, request, behind, behind_fd, no_edit, lock_fd):
+def run(side, box, root, request, behind, behind_fd, no_edit, lock_fd, model, effort):
     """One coworker turn, in the detached runner, whose stderr is <id>.err.
     Publishes the verdict unless `kill` got there first, then leaves it in
     the lock for the successor and lets go."""
@@ -266,10 +358,11 @@ def run(side, box, root, request, behind, behind_fd, no_edit, lock_fd):
             return
         session = session_of(box)
         task = box / f'{request}.task'
-        prompt = compose(session, side, request, task.read_text(), no_edit, root)
+        prompt = compose(session, side, request, task.read_text(), no_edit, root, model, effort)
         task.unlink()
-        argv, new_session = command(side, session, reply, no_edit)
-        env = {k: v for k, v in os.environ.items() if not k.startswith('HERDR_') and k != 'CLAUDECODE'}
+        argv, new_session = command(side, session, reply, no_edit, model, effort)
+        env = {k: v for k, v in os.environ.items()  # the coworker is nobody's driver
+               if not k.startswith('HERDR_') and k not in ('CLAUDECODE', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID')}
         env['COWORK_TURN'] = request  # tells the simplify gate to stay out
         before = tree_state(root) if no_edit else None
         with tempfile.TemporaryFile() as stdin, stream.open('ab') as out:
@@ -302,7 +395,7 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
         if not session_of(box):
             thread = next((e['thread_id'] for e in events(stream) if 'thread_id' in e), None)
             if thread:
-                (box / 'session').write_text(thread + '\n')  # a thread that exists resumes, even after a failed turn
+                update_side(box, session=thread)  # a thread that exists resumes, even after a failed turn
         if status == '0' and not reply.exists():
             print('codex exited 0 without writing its last message', file=sys.stderr)
             status = 'error'
@@ -314,7 +407,7 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
         else:
             reply.write_text(result.get('result') or '', encoding='utf-8')
             if new_session:
-                (box / 'session').write_text(new_session + '\n')
+                update_side(box, session=new_session)
     if status == '0' and before is not None and tree_state(root) != before:
         print('the tree changed during a --no-edit turn; check git status', file=sys.stderr)
         status = 'edited'
@@ -443,10 +536,11 @@ def follow(box, request):
         os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
 
 
-def enqueue(box, root, side, task, no_edit):
+def enqueue(box, root, side, task, no_edit, model, effort):
     """Record the request behind the last live one and start its runner,
     which holds the request lock from birth; the caller keeps nothing open."""
     with admission(box):
+        model, effort = settle_pair(box, model, effort)
         for request in requests(box):
             materialise(box, request)
         queue = live(box)
@@ -458,7 +552,7 @@ def enqueue(box, root, side, task, no_edit):
             fcntl.flock(lock, fcntl.LOCK_EX)
             fds = (lock.fileno(),) + ((behind,) if queue else ())
             argv = [sys.executable, __file__, '_run', side, request, queue[-1] if queue else '-',
-                    str(behind if queue else '-'), str(int(no_edit)), str(lock.fileno())]
+                    str(behind if queue else '-'), str(int(no_edit)), str(lock.fileno()), model, effort]
             # Double fork: the runner's parent exits at once, so it hangs off init, in its own
             # session, and a harness that kills `send` with its descendants cannot reach it.
             middle = os.fork()
@@ -481,6 +575,8 @@ def main(argv=None):
     task.add_argument('--task', help='literal text, or - for stdin')
     task.add_argument('--task-file', type=Path)
     send.add_argument('--no-edit', action='store_true', help='a question or review: the coworker must not edit')
+    send.add_argument('--model', help='the coworker\'s model from now on; first send defaults to your own tier')
+    send.add_argument('--effort', choices=EFFORTS, help='its reasoning effort from now on; first send defaults to yours')
     sub.add_parser('kill', help='stop a request, queued or running, and everything its coworker spawned').add_argument('request')
     sub.add_parser('read', help='print the reply of a settled request whose send died, and remove it').add_argument('request')
     watch = sub.add_parser('watch', help='print "<id>  <what happened>" for each request as it settles, forever')
@@ -491,14 +587,14 @@ def main(argv=None):
     reset = sub.add_parser('reset', help='forget a side\'s session and its requests; the next send starts anew')
     reset.add_argument('side', choices=SIDES)
     runner = sub.add_parser('_run', help=argparse.SUPPRESS)  # the detached child of `send`
-    for name in ('side', 'request', 'behind', 'behind_fd', 'no_edit', 'lock_fd'):
+    for name in ('side', 'request', 'behind', 'behind_fd', 'no_edit', 'lock_fd', 'model', 'effort'):
         runner.add_argument(name)
     a = parser.parse_args(argv)
 
     root, gitdir = git_dir()
     if a.cmd == '_run':
         run(a.side, gitdir / 'cowork' / a.side, root, a.request, None if a.behind == '-' else a.behind,
-            None if a.behind_fd == '-' else int(a.behind_fd), a.no_edit == '1', int(a.lock_fd))
+            None if a.behind_fd == '-' else int(a.behind_fd), a.no_edit == '1', int(a.lock_fd), a.model, a.effort)
         return 0
 
     if a.cmd == 'send':
@@ -511,7 +607,7 @@ def main(argv=None):
             task = sys.stdin.read() if a.task == '-' else a.task
         if not task.strip():
             die('the task resolved to nothing')
-        request = enqueue(box, root, side, task, a.no_edit)
+        request = enqueue(box, root, side, task, a.no_edit, a.model, a.effort)
         print(request, flush=True)
         held(box / f'{request}.lock', wait=True)  # wait through teardown, even if the verdict exists
         return deliver(box, request)
@@ -549,7 +645,8 @@ def main(argv=None):
                 print(f'{side}: session none')
                 continue
             with admission(box):  # a delivery in progress would remove files under state()
-                print(f'{side}: session {session_of(box) or "none"}')
+                session, model, effort = side_state(box)
+                print(f'{side}: session {session or "none"}' + (f', {model} at {effort} effort' if model else ''))
                 for request in requests(box):
                     print(f'  {request}  {state(box, request)}')
         return 0

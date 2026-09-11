@@ -46,6 +46,10 @@ print(os.environ.get('FAKE_RESULT', json.dumps({'type': 'result', 'result': 'cla
 '''
 
 
+SID, THREAD = '11111111-2222-4333-8444-555555555555', '01a08a2e-cbbb-7de2-8b6f-b2e769c5b9d8'
+CODEX = {'CLAUDECODE': '', 'CODEX_THREAD_ID': THREAD}  # a send driven by a Codex session
+
+
 def sh(cwd, *args):
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
 
@@ -72,9 +76,19 @@ class CoworkTest(unittest.TestCase):
             (self.bin / name).chmod(0o755)
         self.log = base / 'calls.jsonl'
         self.gate = base / 'gate'
-        clean = {k: v for k, v in os.environ.items() if not k.startswith(('FAKE_', 'HERDR_', 'COWORK'))}
+        # What each driving CLI records about its own session: the caller's model and effort come from here.
+        self.transcript = base / 'claude' / 'projects' / '-repo' / f'{SID}.jsonl'
+        self.transcript.parent.mkdir(parents=True)
+        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-fable-5-1"}}\n')
+        self.rollout = base / 'codex' / 'sessions' / '2026' / '09' / '11' / f'rollout-2026-09-11T00-00-00-{THREAD}.jsonl'
+        self.rollout.parent.mkdir(parents=True)
+        self.rollout.write_text('{"type":"session_meta","payload":{"id":"%s"}}\n'
+                                '{"type":"turn_context","payload":{"model":"gpt-6-astra","effort":"medium"}}\n' % THREAD)
+        clean = {k: v for k, v in os.environ.items() if not k.startswith(('FAKE_', 'HERDR_', 'COWORK', 'CODEX_', 'CLAUDE_'))}
         self.env = mock.patch.dict('os.environ', {
-            **clean, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1'}, clear=True)
+            **clean, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1',
+            'CLAUDE_CODE_SESSION_ID': SID, 'CLAUDE_EFFORT': 'medium', 'CLAUDE_CONFIG_DIR': str(base / 'claude'),
+            'CODEX_HOME': str(base / 'codex')}, clear=True)
         self.env.start()
         self.cwd = os.getcwd()
         os.chdir(self.root)
@@ -160,35 +174,37 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(request.startswith('codex-'))
         self.assertEqual(reply, 'codex reply\nFiles touched: none\n')
-        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\n')
+        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\ngpt-6-astra\nmedium\n')
         self.send('--task', 'another')
         first, second = self.calls()
-        self.assertEqual(first['argv'][:2], ['exec', '--json'])
+        self.assertEqual(first['argv'][:6], ['exec', '-m', 'gpt-6-astra', '-c', 'model_reasoning_effort=medium', '--json'])
         self.assertEqual(second['argv'][:3], ['exec', 'resume', 'thread-42'])
         self.assertIn('-o', second['argv'])
 
     def test_claude_gets_a_chosen_session_id_and_is_resumed_by_it(self):
-        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='')
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', **CODEX)
         self.assertEqual(code, 0)
         self.assertEqual(reply, 'claude reply\nFiles touched: a.c\n')
-        session = (self.box('claude') / 'session').read_text().strip()
+        session = cowork.session_of(self.box('claude'))
         self.assertEqual(len(session), 36)
-        self.send('--to', 'claude', '--task', 'q2', CLAUDECODE='')
+        self.send('--to', 'claude', '--task', 'q2', **CODEX)
         first, second = self.calls()
         self.assertEqual(first['argv'][-2:], ['--session-id', session])
         self.assertEqual(second['argv'][-2:], ['--resume', session])
         self.assertIn('stream-json', first['argv'])
 
-    def test_the_coworker_defaults_to_codex_only_inside_claude_code(self):
+    def test_the_coworker_defaults_to_the_other_cli_and_needs_naming_otherwise(self):
         code, _, _, _ = self.send('--task', 'q', CLAUDECODE='')
         self.assertEqual(code, 1)
         self.assertEqual(self.calls(), [])
+        code, _, reply, _ = self.send('--task', 'q', **CODEX)
+        self.assertEqual((code, reply), (0, 'claude reply\nFiles touched: a.c\n'), 'Codex drives Claude without --to')
 
     def test_a_failed_first_claude_turn_binds_no_session(self):
-        code, _, _, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='', FAKE_EXIT='1')
+        code, _, _, _ = self.send('--to', 'claude', '--task', 'q', **CODEX, FAKE_EXIT='1')
         self.assertEqual(code, 1)
-        self.assertFalse((self.box('claude') / 'session').exists())
-        code, _, _, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='')
+        self.assertIsNone(cowork.session_of(self.box('claude')))
+        code, _, _, _ = self.send('--to', 'claude', '--task', 'q', **CODEX)
         self.assertEqual(code, 0)
         self.assertEqual(self.calls()[1]['argv'][-2], '--session-id', 'a fresh id, not a resume of nothing')
 
@@ -203,6 +219,104 @@ class CoworkTest(unittest.TestCase):
         self.gate.unlink()
         self.send('--task', 'c')
         self.assertNotIn('resume', self.calls()[-1]['argv'])
+
+    # --- model and effort ---------------------------------------------------------
+
+    def test_the_coworker_starts_at_the_callers_tier_and_effort(self):
+        self.send('--task', 'from claude')
+        argv = self.calls()[0]['argv']
+        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6-astra', 'fable and astra cost the same')
+        self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=medium')
+        self.assertIn('answered by gpt-6-astra at medium effort', self.calls()[0]['stdin'])
+        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-sonnet-5"}}\n'
+                                   '{"type":"assistant","message":{"model":"<synthetic>"}}\n')
+        with mock.patch.dict('os.environ', {'CLAUDE_EFFORT': 'max'}):
+            self.run_cli('reset', 'codex')
+            self.send('--task', 'from a cheaper claude')
+        argv = self.calls()[1]['argv']
+        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-5.6-terra')
+        self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=xhigh', 'Codex has no max')
+        self.send('--task', 'from codex', **CODEX)
+        argv = self.calls()[2]['argv']
+        self.assertEqual(argv[argv.index('--model') + 1], 'fable')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'medium')
+        self.rollout.write_text('{"type":"turn_context","payload":{"model":"gpt-5.6-luna","effort":"minimal"}}\n')
+        self.run_cli('reset', 'claude')
+        self.send('--task', 'from a cheaper codex', **CODEX)
+        argv = self.calls()[3]['argv']
+        self.assertEqual(argv[argv.index('--model') + 1], 'haiku')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'low', 'Claude has no minimal')
+
+    def test_model_and_effort_flags_persist_until_replaced_or_reset(self):
+        self.send('--model', 'gpt-5.6-terra', '--effort', 'high', '--task', 'a')
+        self.send('--task', 'b')
+        self.send('--effort', 'low', '--task', 'c')
+        self.run_cli('reset', 'codex')
+        self.send('--task', 'd')
+        seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
+        self.assertEqual(seen, [('gpt-5.6-terra', 'model_reasoning_effort=high'), ('gpt-5.6-terra', 'model_reasoning_effort=high'),
+                                ('gpt-5.6-terra', 'model_reasoning_effort=low'), ('gpt-6-astra', 'model_reasoning_effort=medium')])
+        _, out, _ = self.run_cli('status')
+        self.assertIn('codex: session thread-42, gpt-6-astra at medium effort', out)
+
+    def test_each_request_keeps_the_pair_it_was_sent_with(self):
+        first, first_id = self.send_gated('--task', 'one')
+        second, second_id = self.send_gated('--effort', 'high', '--task', 'two')
+        third, third_id = self.send_gated('--model', 'gpt-5.6-luna', '--effort', 'low', '--task', 'three')
+        self.started(first_id)
+        self.gate.touch()
+        for proc in (first, second, third):
+            self.assertEqual(proc.wait(timeout=30), 0)
+        seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
+        self.assertEqual(seen, [('gpt-6-astra', 'model_reasoning_effort=medium'), ('gpt-6-astra', 'model_reasoning_effort=high'),
+                                ('gpt-5.6-luna', 'model_reasoning_effort=low')])
+
+    def test_a_send_changing_the_model_does_not_erase_a_thread_bound_meanwhile(self):
+        first, first_id = self.send_gated('--task', 'one')
+        self.started(first_id)
+        self.gate.touch()
+        first.wait(timeout=30)
+        self.assertEqual(cowork.session_of(self.box()), 'thread-42')
+        cowork.update_side(self.box(), effort='high')  # what a concurrent send does after reading stale state
+        self.assertEqual(cowork.side_state(self.box()), ('thread-42', 'gpt-6-astra', 'high'), 'a field-wise update')
+        self.send('--task', 'two')
+        self.assertEqual(self.calls()[-1]['argv'][:3], ['exec', 'resume', 'thread-42'])
+
+    def test_a_flag_writes_back_only_its_own_field(self):
+        self.send('--task', 'a')
+        with mock.patch.object(cowork, 'side_state', return_value=('thread-42', 'gpt-5.6-luna', 'medium')):
+            cowork.settle_pair(self.box(), None, 'high')  # an effort-only send that read the side before someone saved luna
+        self.assertEqual(cowork.side_state(self.box())[1:], ('gpt-5.6-luna', 'high'))
+        self.assertFalse(list(self.box().glob('session.*.tmp')), 'the session file is replaced, never truncated')
+
+    def test_the_callers_model_is_the_assistant_message_not_any_model_field(self):
+        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-fable-5-1"}}\n'
+                                   '{"type":"assistant","message":{"model":"claude-opus-5","content":[{"input":{"model":"haiku"}}]}}\n'
+                                   '{"type":"user","message":{"model":"claude-haiku-4-5"}}\n')
+        self.send('--task', 'q')
+        argv = self.calls()[0]['argv']
+        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-5.6-sol')
+
+    def test_an_unmapped_caller_or_a_bad_effort_is_refused_not_guessed(self):
+        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-mythos-5-1"}}\n')
+        code, _, _, err = self.send('--task', 'q')
+        self.assertEqual(code, 1)
+        self.assertIn('no known price tier for claude-mythos-5-1', err)
+        self.transcript.unlink()
+        code, _, _, err = self.send('--task', 'q')
+        self.assertEqual(code, 1)
+        self.assertIn("cannot find this Claude Code session's transcript", err)
+        code, _, _, _ = self.send('--model', 'gpt-6-astra', '--effort', 'high', '--task', 'q')
+        self.assertEqual(code, 0, 'both flags need no record of the caller')
+        self.run_cli('reset', 'codex')
+        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-mythos-5-1"}}\n')
+        code, _, _, _ = self.send('--model', 'gpt-6-astra', '--task', 'q')
+        self.assertEqual(code, 0, 'an explicit model needs no tier; the effort still comes from the caller')
+        self.assertEqual(cowork.side_state(self.box())[1:], ('gpt-6-astra', 'medium'))
+        code, _, _, err = self.send('--effort', 'bogus', '--task', 'q')
+        self.assertEqual(code, 2)
+        self.assertIn('invalid choice', err)
+        self.assertEqual(len(self.calls()), 2, 'only the two explicit sends reached the coworker')
 
     # --- the prompt and the coworker's environment ------------------------------
 
@@ -222,7 +336,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('Scope: do not edit anything', second['stdin'])
 
     def test_no_edit_is_plan_mode_for_claude_and_checked_afterwards_for_codex(self):
-        self.send('--to', 'claude', '--no-edit', '--task', 'review', CLAUDECODE='')
+        self.send('--to', 'claude', '--no-edit', '--task', 'review', **CODEX)
         claude = self.calls()[-1]
         self.assertEqual(claude['argv'][claude['argv'].index('--permission-mode') + 1], 'plan')
         self.codex_does("open('stray', 'w').close()")
@@ -336,10 +450,10 @@ class CoworkTest(unittest.TestCase):
 
     def test_a_claude_error_result_is_a_failure_not_an_empty_reply(self):
         error = json.dumps({'type': 'result', 'subtype': 'error_max_turns', 'is_error': True, 'errors': ['turn limit']})
-        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='', FAKE_RESULT=error)
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', **CODEX, FAKE_RESULT=error)
         self.assertEqual(code, 1)
         self.assertIn('turn limit', reply)
-        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', CLAUDECODE='', FAKE_RESULT='not json at all')
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q', **CODEX, FAKE_RESULT='not json at all')
         self.assertEqual(code, 1)
         self.assertIn('without a usable result', reply)
 
@@ -541,7 +655,7 @@ class CoworkTest(unittest.TestCase):
                 return '0'
             with mock.patch.object(cowork, 'conclude', kill_meanwhile), \
                  contextlib.redirect_stderr(io.StringIO()):
-                cowork.run('codex', box, self.root, 'codex-x', None, None, False, lock.fileno())
+                cowork.run('codex', box, self.root, 'codex-x', None, None, False, lock.fileno(), 'gpt-6-astra', 'medium')
             self.assertEqual(cowork.lock_lines((box / 'codex-x.lock').read_text())[1], 'killed')
             self.assertEqual((box / 'codex-x.exit').read_text(), 'killed\n')
 
@@ -582,7 +696,7 @@ class CoworkTest(unittest.TestCase):
         self.settled(request)
         self.assertEqual((self.box() / f'{request}.exit').read_text(), '0\n')
         self.assertEqual((self.box() / f'{request}.reply').read_text(), 'codex reply\nFiles touched: none\n')
-        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\n', 'the thread was still bound')
+        self.assertEqual(cowork.session_of(self.box()), 'thread-42', 'the thread was still bound')
         _, out, _ = self.run_cli('status')
         self.assertIn(f'{request}  0', out, 'undelivered, so still listed')
         code, out, _ = self.run_cli('read', request)
