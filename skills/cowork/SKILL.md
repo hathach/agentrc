@@ -76,12 +76,13 @@ Never open the session interactively while a request is running.
 
 ## Show the exchange
 
-The human sees none of this channel unless you show it. For every round,
-put the task you sent and the reply you got in the transcript verbatim,
-each in its own code block, before any summary or action on it. A review
-round is the human's evidence for what you applied and what you rejected;
-a paraphrase hides the coworker's exact words. Say, per finding, whether
-you reproduced it or only read the code.
+For every `send`, paste the task sent and reply received verbatim in your
+own messages, each in its own code block, before summarizing or acting on
+the reply. This includes non-review requests and replies delivered by
+`read`. Tool output does not count: the harness folds it away, and the
+human reads unattended sessions back from your messages.
+
+For each finding, say whether you reproduced it or only read the code.
 
 ## What you decide
 
