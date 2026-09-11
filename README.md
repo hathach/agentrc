@@ -4,32 +4,40 @@ Personal agent config shared by Claude Code and Codex: user-wide instructions,
 skills and commands, versioned in git.
 
 ```
-install.sh        symlink this checkout into ~/.claude and ~/.codex
+install.py        symlink chosen parts of this checkout into ~/.claude and ~/.codex
 CLAUDE.md         user-wide instructions (~/.codex/AGENTS.md symlinks here too)
-skills/           ~/.claude/skills
-agents/           ~/.claude/agents (Claude only: Codex has no user-level subagents)
-commands/         ~/.claude/commands
-hooks/            Claude Code hooks, switched on per repository (see below)
-tests/            unit tests for skill scripts and hooks
+skills/           ~/.claude/skills and ~/.codex/skills
+agents/           <name>.md for Claude, plus <name>.toml for Codex, into ~/.claude/agents and ~/.codex/agents
+hooks/            Claude Code hooks, one folder each with a hooks.json; switched on per repository (see below)
+tests/            unit tests for skill scripts, hooks and the installer
 .claude-plugin/   plugin and marketplace manifests
 ```
 
 ## Install by symlink (preferred)
 
 Skills are invoked by bare name and edits are live with no reinstall step.
+Nothing is installed by default: name what you want, or `all` per category.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
-~/code/agentrc/install.sh
+~/code/agentrc/install.py install --skill all --agent all --hook all --claude-md
+~/code/agentrc/install.py install --skill read-doc --skill cowork   # cherry-pick
+~/code/agentrc/install.py remove --hook simplify-gate
 ```
 
-This links `CLAUDE.md` and `commands/` into `~/.claude`, points
-`~/.codex/AGENTS.md` at the same `CLAUDE.md`, and links each skill one by one
-into `~/.claude/skills` and `~/.codex/skills`, and each agent into
-`~/.claude/agents`. Those directories stay real directories, so a machine can
-keep its own skills, or ones added with `npx skills add`, beside the linked
-ones; only links into this repo are pruned when a skill or agent is removed.
-Rerun it after adding a skill or agent.
+`--claude-md` links `~/.claude/CLAUDE.md` and points `~/.codex/AGENTS.md` at
+it. Skills link one by one into `~/.claude/skills` and `~/.codex/skills`;
+agents link their `.md` into `~/.claude/agents` and `~/.codex/agents` and
+their `.toml` into `~/.codex/agents`, where Codex discovers it; hooks link
+into `~/.claude/hooks` and register the events from their `hooks.json` in
+`~/.claude/settings.json` (first-time backup kept beside it, idempotent).
+Those directories stay real directories, so a machine can keep its own
+skills, or ones added with `npx skills add`, beside the linked ones. The
+installer refuses before touching anything if a destination holds something
+that is not a link; `remove` unlinks whatever the named link points to but
+never deletes a real file or directory, and removes the CLAUDE.md links only
+when they point into this checkout. Rerun after adding a skill, agent or
+hook: dead links into this repo are pruned, other people's links stay.
 
 Project repos such as tinyusb reference these skills by bare name only, e.g.
 `read-doc`, and expect this install to have run; without it their agents take
@@ -49,7 +57,7 @@ symlink install on the same machine or every skill shows up twice.
 
 ## Simplify gate (per repository)
 
-`hooks/simplify_gate.py` snapshots the checkout, every worktree of it, when a
+`hooks/simplify-gate/simplify_gate.py` snapshots the checkout, every worktree of it, when a
 prompt arrives and again when the session stops, and sends the diff to a
 read-only `codex exec` YAGNI challenge: at most two rounds per user turn, one
 retry on Codex failure, then it lets the stop through with a notice. One
@@ -61,13 +69,12 @@ findings on files it neither wrote nor commissioned. Codex never edits.
 Install the hooks once per machine, then switch the gate on per repository:
 
 ```sh
-python3 ~/code/agentrc/hooks/simplify_gate.py --install    # --remove undoes it
+~/code/agentrc/install.py install --hook simplify-gate     # remove undoes it
 cd ~/code/tinyusb && /simplify-gate on                     # or: skills/simplify-gate/scripts/gate.py on
 ```
 
-`--install` merges two entries into `~/.claude/settings.json` (backup kept
-beside it, idempotent, replaces older entries of its own). Each entry runs
-`hooks/simplify-gate`, which costs one `git rev-parse` in every checkout and
+Each registered entry runs the linked `simplify-gate` launcher, which costs
+one `git rev-parse` in every checkout and
 starts the Python gate only where `<git common dir>/simplify-gate` exists, so
 one marker covers a repository and all of its worktrees. `/simplify-gate status`
 prints the state with the effective model and effort; `on --model M --effort E`

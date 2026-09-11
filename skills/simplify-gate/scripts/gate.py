@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-HOOK = Path(__file__).resolve().parents[3] / 'hooks' / 'simplify_gate.py'
+HOOK = Path(__file__).resolve().parents[3] / 'hooks' / 'simplify-gate' / 'simplify_gate.py'
 spec = importlib.util.spec_from_file_location('simplify_gate', HOOK)
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)

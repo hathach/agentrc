@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-HOOK = Path(__file__).resolve().parents[1] / 'hooks' / 'simplify_gate.py'
+HOOK = Path(__file__).resolve().parents[1] / 'hooks' / 'simplify-gate' / 'simplify_gate.py'
 WRAPPER = HOOK.with_name('simplify-gate')
 GATE = Path(__file__).resolve().parents[1] / 'skills' / 'simplify-gate' / 'scripts' / 'gate.py'
 spec = importlib.util.spec_from_file_location('simplify_gate', HOOK)
@@ -592,50 +592,6 @@ class ActivationTest(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
-
-    def ours(self, data):
-        return {event: [h for g in data.get('hooks', {}).get(event, []) for h in g['hooks'] if gate.ours(h)]
-                for event in gate.EVENTS}
-
-    def test_install_replaces_older_entries_keeps_other_hooks_and_is_idempotent(self):
-        settings = self.base / 'settings.json'
-        old = f'python3 {HOOK} --repository /some/repo'
-        settings.write_text(json.dumps({'model': 'x', 'hooks': {
-            'SessionStart': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'other'}]}],
-            'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': str(WRAPPER)}]}],
-            'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'},
-                                {'type': 'command', 'command': old}]}]}}))
-        gate.install(settings)
-        gate.install(settings)
-        data = json.loads(settings.read_text())
-        self.assertEqual(data['model'], 'x')
-        self.assertEqual(data['hooks']['SessionStart'][0]['hooks'][0]['command'], 'other')
-        self.assertEqual([h['command'] for g in data['hooks']['Stop'] for h in g['hooks']], ['other-stop', str(WRAPPER)])
-        self.assertNotIn(old, settings.read_text())
-        self.assertNotIn('PreToolUse', data['hooks'], 'the five-hook install is gone')
-        for event, hooks in self.ours(data).items():
-            self.assertEqual(len(hooks), 1, event)
-            self.assertEqual(hooks[0]['timeout'], 650 if event == 'Stop' else 30)
-            self.assertNotIn('matcher', data['hooks'][event][-1])
-        backup = json.loads((self.base / 'settings.json.before-simplify-gate').read_text())
-        self.assertIn(old, json.dumps(backup))
-
-        gate.remove(settings)
-        data = json.loads(settings.read_text())
-        self.assertEqual(sum(len(v) for v in self.ours(data).values()), 0)
-        self.assertEqual(data['hooks']['Stop'][0]['hooks'][0]['command'], 'other-stop')
-        self.assertNotIn('UserPromptSubmit', data['hooks'])
-        self.assertEqual(data['hooks']['SessionStart'][0]['hooks'][0]['command'], 'other')
-
-    def test_the_hook_command_is_shell_quoted(self):
-        settings = self.base / 'settings.json'
-        with mock.patch.object(gate, 'WRAPPER', Path('/opt/my agentrc/hooks/simplify-gate')):
-            gate.install(settings)
-            data = json.loads(settings.read_text())
-            command = data['hooks']['Stop'][0]['hooks'][0]['command']
-            self.assertEqual(command, "'/opt/my agentrc/hooks/simplify-gate'")
-            gate.remove(settings)
-        self.assertNotIn('hooks', json.loads(settings.read_text()))
 
     def run_hook(self, cwd, payload, project=None, **extra):
         env = {**os.environ, 'XDG_CACHE_HOME': str(self.base / 'cache'), 'CLAUDE_PROJECT_DIR': str(project or cwd)}

@@ -20,7 +20,7 @@ flags keeps the overrides already in the marker; `off` deletes them with the
 marker. A change takes effect at the next tool call, no session restart.
 
 Status shows `on`/`off`, then the model and effort with their source: `(repo)`
-from the marker, `(default)` from `hooks/simplify_gate.py`. The hooks
-themselves are installed once per machine with
-`python3 ~/code/agentrc/hooks/simplify_gate.py --install`; if status says on
+from the marker, `(default)` from `hooks/simplify-gate/simplify_gate.py`. The
+hooks themselves are installed once per machine with
+`~/code/agentrc/install.py install --hook simplify-gate`; if status says on
 but no challenge ever runs, check that first.

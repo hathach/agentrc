@@ -1,0 +1,4 @@
+{
+  "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "simplify-gate", "timeout": 30}]}],
+  "Stop": [{"hooks": [{"type": "command", "command": "simplify-gate", "timeout": 650}]}]
+}

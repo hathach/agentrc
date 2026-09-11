@@ -2,13 +2,13 @@
 """Claude Code hooks: snapshot the checkout at each user prompt and at Stop,
 and run a bounded read-only Codex YAGNI challenge over what changed in between.
 
-Install the two hooks once per machine; they call `hooks/simplify-gate`, which
-runs this script only where the marker file `<git common dir>/simplify-gate`
-exists. The `simplify-gate` skill owns that marker, per repository and all of
-its worktrees, and may set `model=`/`effort=` lines in it to override the
-defaults below.
+`install.py install --hook simplify-gate` registers the two events (see
+hooks.json beside this file); they call `simplify-gate`, which runs this script
+only where the marker file `<git common dir>/simplify-gate` exists. The
+`simplify-gate` skill owns that marker, per repository and all of its
+worktrees, and may set `model=`/`effort=` lines in it to override the defaults
+below.
 
-    python3 simplify_gate.py --install      # or --remove
     /simplify-gate [on [--model M] [--effort E] | off]
 
 Scope is the turn: every worktree of the repository (index blob ids, with
@@ -23,14 +23,12 @@ review at a time and at most two rounds per user turn; Codex never edits.
 State lives under $XDG_CACHE_HOME/agentrc/simplify-gate/<checkout+session>.
 """
 
-import argparse
 import difflib
 import fcntl
 import hashlib
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -44,8 +42,6 @@ CODEX_TIMEOUT = 300  # seconds per attempt; two attempts fit in the Stop hook's 
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh')
 DEFAULTS = {'model': MODEL, 'effort': EFFORT}
 SCRIPT = Path(__file__).resolve()
-WRAPPER = SCRIPT.parent / 'simplify-gate'
-EVENTS = ('UserPromptSubmit', 'Stop')
 SCHEMA = {
     'type': 'object', 'additionalProperties': False, 'required': ['findings'],
     'properties': {'findings': {'type': 'array', 'items': {
@@ -486,74 +482,7 @@ def handle(root, directory, payload):
         job['lock'].close()
 
 
-# --- installation -------------------------------------------------------------
-
-def ours(hook):
-    """Any entry, current or older shape, that runs something out of our hooks
-    directory; the command is parsed so quoting cannot hide the path."""
-    try:
-        words = shlex.split(hook.get('command', ''))
-    except ValueError:
-        return False
-    return any(word.startswith(str(WRAPPER.parent)) for word in words)
-
-
-def strip(hooks):
-    """Drop this gate's entries, any version, from a settings `hooks` map."""
-    for event in list(hooks):
-        groups = []
-        for group in hooks[event]:
-            kept = [h for h in group.get('hooks', []) if not ours(h)]
-            if kept:
-                groups.append({**group, 'hooks': kept})
-        if groups:
-            hooks[event] = groups
-        else:
-            del hooks[event]
-
-
-def save(settings, data):
-    backup = settings.with_name(settings.name + '.before-simplify-gate')
-    if settings.exists() and not backup.exists():
-        backup.write_bytes(settings.read_bytes())
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(json.dumps(data, indent=2) + '\n')
-
-
-def install(settings):
-    """Register the wrapper for the two events, once, keeping every other hook."""
-    existing = json.loads(settings.read_text()) if settings.exists() else {}
-    hooks = existing.setdefault('hooks', {})
-    strip(hooks)
-    for event in EVENTS:
-        hooks.setdefault(event, []).append({'hooks': [
-            {'type': 'command', 'command': shlex.quote(str(WRAPPER)), 'timeout': 650 if event == 'Stop' else 30}]})
-    save(settings, existing)
-
-
-def remove(settings):
-    if not settings.exists():
-        return
-    existing = json.loads(settings.read_text())
-    strip(existing.get('hooks', {}))
-    if not existing.get('hooks'):
-        existing.pop('hooks', None)
-    save(settings, existing)
-
-
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    action = parser.add_mutually_exclusive_group()
-    action.add_argument('--install', action='store_true', help='add the hooks to the settings file')
-    action.add_argument('--remove', action='store_true', help='remove them again')
-    parser.add_argument('--settings', type=Path, default=Path.home() / '.claude/settings.json')
-    args = parser.parse_args()
-    if args.install:
-        install(args.settings)
-        return
-    if args.remove:
-        remove(args.settings)
-        return
     if os.environ.get('COWORK_TURN'):
         return  # a headless coworker turn (skills/cowork); the caller reviews it
     payload = json.load(sys.stdin)
