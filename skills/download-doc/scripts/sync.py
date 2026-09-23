@@ -11,6 +11,7 @@ it. Pass --apply once the plan looks right.
   sync.py st  --family STM32H7 --types datasheet,errata
   sync.py st  --family STM32H7 --types datasheet,errata --apply
   sync.py nxp --types errata --device "i.MX RT"
+  sync.py ti  --parts ina3221,tca9548a
 """
 from __future__ import annotations
 
@@ -55,6 +56,9 @@ def enumerate_vendor(name: str, args) -> list:
                                          limit=args.limit)
     if name == "st":
         return vendor_st.enumerate_docs(refresh=args.refresh, **common)
+    if name == "ti":
+        return vendor_ti.enumerate_docs(
+            parts=args.parts.split(",") if args.parts else None, **common)
     # VENDORS is the single source of truth: argparse takes its choices from it and
     # dispatch reads it here. A second copy of this table is what let "wch" be
     # accepted by one and rejected by the other.
@@ -72,6 +76,7 @@ def main() -> int:
     ap.add_argument("--family", help="ST only: STM32H7,STM32U5,... (default: all grids)")
     ap.add_argument("--device", default="Arm MCU", help="NXP only: taxonomy branch")
     ap.add_argument("--chips", help="Espressif only: esp32-s3,esp32-p4 (default: USB-OTG parts)")
+    ap.add_argument("--parts", help="TI only: ina3221,tca9548a (default: parts in the TinyUSB BSP)")
     ap.add_argument("--limit", type=int, help="stop after N documents (smoke tests)")
     ap.add_argument("--refresh", action="store_true", help="re-fetch cached indexes")
     ap.add_argument("--apply", action="store_true", help="actually import/replace")
@@ -85,6 +90,8 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero if any revision cannot be parsed (for automation)")
     args = ap.parse_args()
+    if args.parts and args.vendor != "ti":
+        ap.error("--parts is TI only")
 
     lib = doclib.Library()
     blockers = lib.blockers()
@@ -102,7 +109,7 @@ def main() -> int:
         args.types = ",".join(sorted(doclib.TECHNICAL_TYPES))
         print("scope: technical documents only (datasheet, errata, manuals, app notes) "
               "— --all-types to widen", file=sys.stderr)
-    named_device = any([args.family, args.chips, args.vendor == "nxp" and
+    named_device = any([args.family, args.chips, args.parts, args.vendor == "nxp" and
                         args.device != "Arm MCU"])
     usb_scope = getattr(mod, "USB_SCOPE", None)
     note = getattr(mod, "USB_SCOPE_NOTE", "")

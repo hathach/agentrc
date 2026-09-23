@@ -5,11 +5,13 @@ TI needs no document index at all, because its datasheet URLs are derived from t
 part number: `ti.com/lit/ds/symlink/<part>.pdf`. Verified for msp430f5529,
 msp432e401y, tm4c123gh6pm and tm4c1294ncpdt.
 
-That leaves the opposite problem — where does the *part list* come from? Here it comes
-from the TinyUSB BSP tree, which is the reason we want these documents in the first
-place. A part TinyUSB doesn't support isn't in scope, so scanning `hw/bsp` both
+That leaves the opposite problem — where does the *part list* come from? By default it
+comes from the TinyUSB BSP tree, which is the reason we want these documents in the
+first place. A part TinyUSB doesn't support isn't in scope, so scanning `hw/bsp` both
 supplies the list and bounds it. Every candidate is probed and only real PDFs are kept,
-so a wrong guess yields nothing rather than a phantom entry.
+so a wrong guess yields nothing rather than a phantom entry. `parts` replaces the BSP
+list with named parts (`ina3221`, `tca9548a`); a named part with no datasheet is an
+error, since the caller asked for it by name.
 
 ⚠️ Datasheets only. Errata and technical reference manuals are published under TI
 literature numbers (`/lit/er/slaz…`, `/lit/ug/spmu…`) that cannot be derived from a
@@ -59,12 +61,13 @@ def _parts_from_bsp() -> dict:
     return out
 
 
-def enumerate_docs(families=None, types=None, refresh=False) -> list:
+def enumerate_docs(families=None, types=None, refresh=False, parts=None) -> list:
     if types and "datasheet" not in types:
         return []
     want = {f.upper() for f in families} if families else None
-    docs = []
-    for part, fam in sorted(_parts_from_bsp().items()):
+    catalogue = {p.lower(): p.upper() for p in parts} if parts else _parts_from_bsp()
+    docs, missing = [], []
+    for part, fam in sorted(catalogue.items()):
         if want and fam not in want:
             continue
         url = DS.format(part)
@@ -73,12 +76,15 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
                      validate=lambda b: b.startswith(b"%PDF"))
         except RuntimeError:
             print(f"  no datasheet at ti.com/lit/ds/symlink/{part}", file=sys.stderr)
+            missing.append(part)
             continue
         docs.append(Doc(
             vendor="ti", doc_id=part.upper(), doc_type="datasheet",
             version=last_modified(url), title=f"{part.upper()} Datasheet",
             url=url, author=AUTHOR, family=[fam], desc="", verify_id=False,
             aliases=[f"{part.upper()} Datasheet", part.upper()]))
+    if parts and missing:
+        raise SystemExit(f"no TI datasheet for named part(s): {', '.join(missing)}")
     return docs
 
 

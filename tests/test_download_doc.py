@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'download-doc' / 'scripts'))
 import doclib  # noqa: E402
+import vendor_ti  # noqa: E402
 
 
 def doc(doc_id, aliases=()):
@@ -51,6 +52,39 @@ class Legacy(unittest.TestCase):
     def test_a_book_with_an_identifier_is_compared_by_revision_not_title(self):
         p = doclib.plan([doc('RM0433')], {'st:RM0433': {'rev': '8.0'}}, legacy('RM0433 manual'))
         self.assertEqual((p['current'], p['legacy']), ([doc('RM0433')], []))
+
+
+class TiParts(unittest.TestCase):
+    """Named parts replace the BSP scan; a named part with no datasheet is an error."""
+
+    def setUp(self):
+        saved = (vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp)
+        self.addCleanup(lambda: setattr_all(saved))
+        vendor_ti.last_modified = lambda url: 'Fri, 27 Mar 2026 05:34:41 GMT'
+        vendor_ti._parts_from_bsp = lambda: self.fail('BSP scanned despite named parts')
+
+    def serve(self, *present):
+        def http_get(url, **kw):
+            if not any(url.endswith(f'/{p}.pdf') for p in present):
+                raise RuntimeError('404')
+            return b'%PDF'
+        vendor_ti.http_get = http_get
+
+    def test_named_parts_replace_the_bsp_list(self):
+        self.serve('ina3221', 'tca9548a')
+        docs = vendor_ti.enumerate_docs(parts=['INA3221', 'tca9548a'])
+        self.assertEqual([(d.ident, d.url, d.family) for d in docs], [
+            ('ti:INA3221', 'https://www.ti.com/lit/ds/symlink/ina3221.pdf', ['INA3221']),
+            ('ti:TCA9548A', 'https://www.ti.com/lit/ds/symlink/tca9548a.pdf', ['TCA9548A'])])
+
+    def test_a_named_part_without_a_datasheet_fails(self):
+        self.serve('ina3221')
+        with self.assertRaisesRegex(SystemExit, 'ina32211'):
+            vendor_ti.enumerate_docs(parts=['ina3221', 'ina32211'])
+
+
+def setattr_all(saved):
+    vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp = saved
 
 
 if __name__ == '__main__':
