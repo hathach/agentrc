@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -66,9 +67,27 @@ def links(kind, name):
             (Path('../.claude/CLAUDE.md'), Path.home() / '.codex' / 'AGENTS.md')]
 
 
+def canonical(path):
+    """Comparable absolute path text, including dead Windows symlink targets."""
+    value = os.path.normcase(os.path.abspath(os.path.normpath(path)))
+    return value[4:] if os.name == 'nt' and value.startswith('\\\\?\\') else value
+
+
+def target(path):
+    value = os.readlink(path)
+    return canonical(value if os.path.isabs(value) else path.parent / value)
+
+
+def inside(path, directory):
+    try:
+        return os.path.commonpath((canonical(path), canonical(directory))) == canonical(directory)
+    except ValueError:
+        return False
+
+
 def ours(path):
     """A symlink whose target resolves inside this checkout."""
-    return path.is_symlink() and path.resolve().is_relative_to(REPO)
+    return path.is_symlink() and inside(path.resolve(strict=False), REPO)
 
 
 def refuse(reason):
@@ -94,7 +113,8 @@ def preflight(pairs):
 
 
 def link(src, dst):
-    if dst.is_symlink() and os.readlink(dst) == str(src):
+    expected = src if src.is_absolute() else dst.parent / src
+    if dst.is_symlink() and target(dst) == canonical(expected):
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.is_symlink() or dst.exists():
@@ -130,7 +150,7 @@ def prune(kind):
         for path in parent.iterdir() if parent.is_dir() else ():
             if not path.is_symlink() or path.exists():
                 continue
-            if Path(os.path.normpath(parent / os.readlink(path))).is_relative_to(source):
+            if inside(target(path), source):
                 unlink(path)
 
 
@@ -140,11 +160,15 @@ def hook_entry(hook, name):
     """Is this settings entry ours: the command runs out of the linked hook
     directory, or out of this repo's hooks (an older install)?"""
     try:
-        words = shlex.split(hook.get('command', ''))
+        words = shlex.split(hook.get('command', ''), posix=os.name != 'nt')
     except ValueError:
         return False
-    dirs = (str(Path.home() / '.claude' / 'hooks' / name) + '/', str(REPO / 'hooks') + '/')
-    return any(word.startswith(dirs) for word in words)
+    roots = (Path.home() / '.claude' / 'hooks' / name, REPO / 'hooks')
+    return any(inside(word.strip('"\''), root) for word in words for root in roots)
+
+
+def quote_command(path):
+    return subprocess.list2cmdline([str(path)]) if os.name == 'nt' else shlex.quote(str(path))
 
 
 def strip(hooks, name):
@@ -178,7 +202,7 @@ def plan_settings(names, install):
             linked = Path.home() / '.claude' / 'hooks' / name
             for event, groups in json.loads((REPO / 'hooks' / name / 'hooks.json').read_text()).items():
                 for group in groups:
-                    entries = [{**h, 'command': shlex.quote(str(linked / h['command']))} for h in group['hooks']]
+                    entries = [{**h, 'command': quote_command(linked / h['command'])} for h in group['hooks']]
                     hooks.setdefault(event, []).append({**group, 'hooks': entries})
     if not hooks:
         del data['hooks']

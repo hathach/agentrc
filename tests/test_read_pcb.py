@@ -12,6 +12,9 @@ import unittest.mock
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
+if os.name == 'nt':
+    raise unittest.SkipTest('read-pcb requires POSIX file locking')
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'skills' / 'read-pcb' / 'scripts'))
 import pcb  # noqa: E402

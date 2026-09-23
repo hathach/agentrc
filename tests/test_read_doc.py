@@ -15,6 +15,9 @@ import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
+if os.name == 'nt':
+    raise unittest.SkipTest('read-doc requires POSIX file locking')
+
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'skills' / 'read-doc' / 'scripts'
 FIXTURE = ROOT / 'tests' / 'data' / 'three-pages.pdf'

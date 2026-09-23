@@ -133,7 +133,7 @@ requires a fresh exchange.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s tests
+python -X utf8 -m unittest discover -s tests
 ```
 
 Needs PyYAML; the pre-commit hook runs the same command (`pre-commit install`).

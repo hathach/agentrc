@@ -1,14 +1,18 @@
 import contextlib
+import os
+import unittest
+
+if os.name == 'nt':
+    raise unittest.SkipTest('cowork requires POSIX file locking and process semantics')
+
 import fcntl
 import io
 import json
-import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
-import unittest
 from pathlib import Path
 from unittest import mock
 

@@ -49,6 +49,7 @@ class SetAddressesTest(unittest.TestCase):
 DATA = ROOT / 'tests' / 'data' / 'usb_sniffer'   # slices of real captures of an rp2040 enumerating at FS
 
 
+@unittest.skipIf(os.name == 'nt', 'capture harness requires POSIX process semantics')
 @unittest.skipUnless(shutil.which('tshark') and shutil.which('editcap'), 'needs Wireshark\'s tshark and editcap')
 class CaptureTest(unittest.TestCase):
     """Only the hardware is a stub: usb_sniffer writes a real capture and, like the
@@ -209,6 +210,7 @@ class CaptureTest(unittest.TestCase):
             os.kill(self.tool_pid, 0)
 
 
+@unittest.skipIf(os.name == 'nt', 'tshark stub requires POSIX executable semantics')
 class AddrTest(unittest.TestCase):
     def run_cli(self, args, tshark=''):
         with tempfile.TemporaryDirectory() as d:

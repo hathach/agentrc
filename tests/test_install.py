@@ -14,7 +14,7 @@ SKILL = SKILLS[0]
 
 class InstallTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(dir=ROOT.parent if os.name == 'nt' else None)
         self.home = Path(self.tmp.name)
         self.claude, self.codex = self.home / '.claude', self.home / '.codex'
 
@@ -23,7 +23,7 @@ class InstallTest(unittest.TestCase):
 
     def run_cli(self, *argv):
         return subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True,
-                              env={**os.environ, 'HOME': str(self.home)})
+                              env={**os.environ, 'HOME': str(self.home), 'USERPROFILE': str(self.home)})
 
     def ok(self, *argv):
         done = self.run_cli(*argv)
@@ -50,7 +50,7 @@ class InstallTest(unittest.TestCase):
     def test_skills_link_into_both_cli_dirs_and_nothing_else(self):
         out = self.ok('install', '--skill')
         for d in (self.claude / 'skills', self.codex / 'skills'):
-            self.assertEqual(os.readlink(d / SKILL), str(ROOT / 'skills' / SKILL))
+            self.assertTrue(os.path.samefile(d / SKILL, ROOT / 'skills' / SKILL))
             self.assertEqual(sorted(p.name for p in d.iterdir()), SKILLS)
         self.assertEqual(out.count('->'), 2 * len(SKILLS) + 1, 'and the one hook')
         self.assertFalse((self.claude / 'CLAUDE.md').exists())
@@ -60,16 +60,17 @@ class InstallTest(unittest.TestCase):
     def test_each_flag_covers_its_kind_and_a_skill_brings_its_hook(self):
         self.ok('install', '--skill', '--agent', '--workflow', '--claude-md')
         self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), SKILLS)
-        self.assertEqual(os.readlink(self.claude / 'agents' / 'pvs-studio.md'), str(ROOT / 'agents' / 'pvs-studio.md'))
+        self.assertTrue(os.path.samefile(self.claude / 'agents' / 'pvs-studio.md', ROOT / 'agents' / 'pvs-studio.md'))
         self.assertEqual(sorted(p.name for p in (self.codex / 'agents').iterdir()),
                          sorted(p.name for p in (ROOT / 'agents').iterdir()), 'every agent md and toml')
-        self.assertEqual(os.readlink(self.claude / 'hooks' / 'simplify-gate'), str(ROOT / 'hooks' / 'simplify-gate'))
-        self.assertEqual(os.readlink(self.claude / 'workflows' / 'fix-issue.js'), str(ROOT / 'workflows' / 'fix-issue.js'))
-        self.assertEqual(os.readlink(self.claude / 'workflows' / 'code-audit.js'), str(ROOT / 'workflows' / 'code-audit.js'))
+        self.assertTrue(os.path.samefile(self.claude / 'hooks' / 'simplify-gate', ROOT / 'hooks' / 'simplify-gate'))
+        self.assertTrue(os.path.samefile(self.claude / 'workflows' / 'fix-issue.js', ROOT / 'workflows' / 'fix-issue.js'))
+        self.assertTrue(os.path.samefile(self.claude / 'workflows' / 'code-audit.js', ROOT / 'workflows' / 'code-audit.js'))
         self.assertFalse((self.codex / 'workflows').exists(), 'workflows are Claude only')
-        self.assertEqual(os.readlink(self.claude / 'CLAUDE.md'), str(ROOT / 'CLAUDE.md'))
-        self.assertEqual(os.readlink(self.codex / 'AGENTS.md'), '../.claude/CLAUDE.md')
+        self.assertTrue(os.path.samefile(self.claude / 'CLAUDE.md', ROOT / 'CLAUDE.md'))
+        self.assertTrue(os.path.samefile(self.codex / 'AGENTS.md', ROOT / 'CLAUDE.md'))
         self.assertEqual((self.codex / 'AGENTS.md').read_text(), (ROOT / 'CLAUDE.md').read_text())
+        self.assertEqual(self.ok('install', '--claude-md'), '', 'relative Codex link is idempotent outside HOME')
 
     def test_a_skill_hook_is_registered_once_with_absolute_quoted_commands_and_older_entries_replaced(self):
         old = str(ROOT / 'hooks' / 'simplify-gate')  # the pre-folder install pointed straight into the repo
@@ -79,7 +80,7 @@ class InstallTest(unittest.TestCase):
             'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': old}]}],
             'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'}, {'type': 'command', 'command': old}]}]}}))
         self.ok('install', '--skill')
-        launcher = f"{self.claude}/hooks/simplify-gate/simplify-gate"
+        launcher = str(self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate')
         data = self.settings()
         self.assertEqual(data['model'], 'x')
         self.assertEqual(self.commands(data), {'SessionStart': ['other'], 'Stop': ['other-stop', launcher],
@@ -95,10 +96,13 @@ class InstallTest(unittest.TestCase):
         home = self.home / 'my home'
         home.mkdir()
         done = subprocess.run([sys.executable, str(SCRIPT), 'install', '--skill'],
-                              capture_output=True, text=True, env={**os.environ, 'HOME': str(home)})
+                              capture_output=True, text=True,
+                              env={**os.environ, 'HOME': str(home), 'USERPROFILE': str(home)})
         self.assertEqual(done.returncode, 0, done.stderr)
         data = json.loads((home / '.claude' / 'settings.json').read_text())
-        self.assertEqual(data['hooks']['Stop'][0]['hooks'][0]['command'], f"'{home}/.claude/hooks/simplify-gate/simplify-gate'")
+        launcher = str(home / '.claude' / 'hooks' / 'simplify-gate' / 'simplify-gate')
+        want = subprocess.list2cmdline([launcher]) if os.name == 'nt' else f"'{launcher}'"
+        self.assertEqual(data['hooks']['Stop'][0]['hooks'][0]['command'], want)
 
     def test_a_dead_link_of_ours_is_pruned_and_foreign_links_and_content_stay(self):
         (self.claude / 'skills').mkdir(parents=True)

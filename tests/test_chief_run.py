@@ -54,6 +54,7 @@ def result(body='chief: stage · done', is_error=False, subtype='success'):
     return {'type': 'result', 'subtype': subtype, 'is_error': is_error, 'result': body}
 
 
+@unittest.skipIf(os.name == 'nt', 'headless-chief requires /proc and POSIX signals')
 class ChiefRun(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()

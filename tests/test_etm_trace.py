@@ -6,6 +6,7 @@ import contextlib
 import importlib.util
 import io
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -204,8 +205,9 @@ class ResolveJdebug(unittest.TestCase):
     def test_no_hook_and_no_script_emits_nothing_and_a_cli_script_is_synthesized(self):
         cfg = {'ref': '--device'}
         self.assertEqual(capture.before_connect_hook(cfg, None), '')
-        hook = capture.before_connect_hook(cfg, '/abs/demo.pex')
-        self.assertIn('Project.SetJLinkScript ("/abs/demo.pex");', hook)
+        script = str(Path('/abs/demo.pex').resolve())
+        hook = capture.before_connect_hook(cfg, script)
+        self.assertIn(f'Project.SetJLinkScript ("{script}");', hook)
 
     def test_a_cli_script_conflicts_with_the_references_own(self):
         cfg = capture.resolve_jdebug(str(self.ref))
@@ -277,6 +279,7 @@ class ResolveJdebug(unittest.TestCase):
         self.assertIn('not found', str(cm.exception))
 
 
+@unittest.skipIf(os.name == 'nt', 'ETM capture is Linux-only')
 class CaptureCli(unittest.TestCase):
     """Argument contract only: every run here exits before Ozone is looked up."""
 
@@ -351,6 +354,7 @@ class CaptureCli(unittest.TestCase):
             self.assertIn('clamped to 10000000', r.stderr)
             self.assertIn('reference project not found', r.stderr)
 
+    @unittest.skipUnless(shutil.which('xvfb-run'), 'needs xvfb-run')
     def test_a_used_output_dir_is_refused(self):
         with tempfile.NamedTemporaryFile(suffix='.elf') as elf, tempfile.TemporaryDirectory() as d:
             stale = Path(d) / 'code_profile.txt'
@@ -369,6 +373,7 @@ class CaptureCli(unittest.TestCase):
         self.assertNotIn('--board', r.stdout)
 
 
+@unittest.skipIf(os.name == 'nt', 'ETM capture requires POSIX process semantics')
 class Session(unittest.TestCase):
     """Session ownership with a stub `ozone` on PATH; nothing here speaks the
     automation protocol, so a capture that works is proven on hardware only."""
@@ -690,6 +695,7 @@ time.sleep(600)
         self.assert_gone(ozone)
 
 
+@unittest.skipIf(os.name == 'nt', 'ETM capture is Linux-only')
 class InstructionCache(unittest.TestCase):
     def test_only_code_that_startup_copies_is_read_into_the_cache(self):
         self.assertEqual(capture.ram_code_sections('fw.elf'), [('.data', 0x20000110, 0x28e0)])
