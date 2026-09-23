@@ -4,11 +4,12 @@
     chief_run.py --out DIR --worktree PATH --task-file FILE [--permission-mode MODE]
 
 DIR must not exist. It receives stream.jsonl (every stdout line, raw), progress.log
-(`<seq> <HH:MM:SS> <line>`: the launcher's own lines and chief's status lines),
+(`<seq> <HH:MM:SS> <line>`: the launcher's own lines, chief's status lines and notes),
 report.md (the final result's text), session (the session id) and stderr.log.
 
 A status line is the first line of one of chief's own messages (agents/chief.md);
-exit codes and usage are in SKILL.md.
+a note is a progress note, joined onto one line, that chief's model returns as a `thinking`
+block. Exit codes and usage are in SKILL.md.
 """
 import argparse
 import json
@@ -131,6 +132,9 @@ def main(argv=None):
                 elif kind == 'assistant' and event.get('parent_tool_use_id') is None:
                     msg = event['message']
                     for block in msg['content']:
+                        note = (block.get('thinking') or '').strip() if block.get('type') == 'thinking' else ''
+                        if note:   # a between-tool note that Opus 5.5 returns as thinking
+                            progress.line('note: ' + ' '.join(note.splitlines()))
                         if block.get('type') != 'text':
                             continue
                         text = block['text'].lstrip('\n')

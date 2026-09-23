@@ -23,7 +23,9 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    the run.
 3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`. Each line is
    `<seq> <HH:MM:SS> <text>`: `launcher:` lines (started, session, a parse
-   warning, exit) and chief's `chief: <event> · ...` lines. An `attention`
+   warning, exit), chief's `chief: <event> · ...` lines, and `note:` lines,
+   a progress note, joined onto one line, that the model returned as a `thinking` block
+   instead of text; a note can carry an event whose status line never came. An `attention`
    line is chief asking for something; relay it. Monitor expires after 30
    minutes: re-arm with `tail -n +<last seq received + 1> -F`, a few lines
    earlier when unsure.

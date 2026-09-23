@@ -121,16 +121,10 @@ python3 <skill dir>/scripts/locate.py build --all          # the whole library
 python3 <skill dir>/scripts/locate.py build --book 2125    # one book
 ```
 
-It re-extracts only what changed, so a run over an unchanged library costs a
-stat per book, and it prunes books that lost their PDF. It does retry the books
-with no text layer, cheaply and in case one was replaced by a better scan: 3 s
-for 4800 books, of which 4750 are only stat'ed. It
-compares against the source, not the extracted text, so it reindexes a replaced
-revision without re-reading the index. A `find` checks the page count and
-length its index file claims, so an extraction cut short is caught and redone;
-content corrupted in place at the same length is not, which is why extraction
-writes a temporary file and renames it. Run it after importing documents, or
-nightly:
+It reuses current indexes and extracts PDFs whose indexes are missing or
+stale, including retrying PDFs with no text layer, and prunes index entries
+for books that no longer have a PDF in the library metadata. Run it after
+importing documents, or nightly:
 
 ```cron
 17 3 * * * python3 ~/.claude/skills/read-doc/scripts/locate.py build --all >/dev/null

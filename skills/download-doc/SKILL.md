@@ -69,9 +69,8 @@ and all score zero, because those descriptions are truncated marketing text. Tha
 heuristic silently drops whole series. When capability can't be derived, the adapter
 says so in the run output rather than applying a filter that quietly under-reports.
 
-A chip list written from memory goes stale the same way: the ESP32-S31 was missing from
-the USB scope until the user asked about it, because the model's snapshot predated the
-part. Re-derive from datasheets (`pdftotext -f 1 -l 6 … | grep -i otg`), not recall.
+Derive USB-capable part lists from current datasheets (`pdftotext -f 1 -l 6 … | grep -i otg`)
+rather than model recall, which can omit newer parts.
 
 ## Before you touch the library
 
@@ -164,16 +163,10 @@ it can take out every client in the process at once. Indexes are cached under
 `~/.cache/download-doc/` and paced apart for this reason. An empty result usually
 means "backed off", not "wrong URL": wait and re-run, and cached progress is kept.
 
-**The channel has to exist in the signature, not just in the printing.** Every silent
-failure this skill has had was a *correct* refusal that looked like a success, and the
-fix each time was widening what the code can say — never making the decision smarter.
-The decisions were right all along. So `compare_rev()` returns
-`newer | current | incomparable | unparseable` with a detail string, and `rev_newer()`
-is a thin boolean wrapper for callers that genuinely don't care. Report from
-`compare_rev`. A boolean cannot distinguish "up to date" from "cannot be checked", and
-no discipline at the call site recovers information the return type has already
-thrown away — a passing test on the boolean can't see the difference either, which is
-how this survived a test suite that asserted the correct value.
+**Report revision-comparison outcomes explicitly.** `compare_rev()` returns
+`newer | current | incomparable | unparseable` with a detail string. Use it for
+reports so "up to date" remains distinguishable from "cannot be checked";
+`rev_newer()` is the boolean wrapper for callers that do not need that distinction.
 
 **So is a revision the vendor re-schemed.** If the local book records `1.1` and the
 vendor now reports `30 January 2024` — or `2` becomes `B` after a rewrite — both parse
@@ -219,7 +212,7 @@ errata sheets. A mismatch blocks the import; an unfindable code only warns.
 
 **Reconcile coverage per type, and print it.** `catalogue == new + current + legacy +
 outdated + gated`, per document type, every run. This is the one check that catches a
-silent drop, which is the failure this skill has actually suffered twice — and unlike
+silent drop — and unlike
 an exception, a silent drop reports as a confident success. It's also what lets you
 *prove* a fix cost nothing rather than argue about it: `124 = 91 + 33 + 0`.
 

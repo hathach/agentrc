@@ -76,7 +76,7 @@ const triage = await agent(
   'disable its internal repairs and its own review stages (a coworker lane reviews later) and set its base to the current HEAD ' +
   'SHA: { name, args, limitation: null }. When it cannot be run that way, { name, args: null, limitation: <why> }; null only ' +
   'when no such workflow exists. ' +
-  'branch: `git rev-parse --abbrev-ref HEAD`; head: `git rev-parse HEAD`. Read only. Return ONLY JSON matching the schema.',
+  'branch: `git rev-parse --abbrev-ref HEAD`; head: `git rev-parse HEAD`. Read only.',
   { label: 'triage', phase: 'Triage', agentType: 'Explore', schema: TRIAGE },
 ).catch(e => { log(`triage errored — ${e && e.message}`); return null })
 if (!triage) return { pass: false, reason: 'triage-died', target }
@@ -121,8 +121,7 @@ const verified = await agent(
   'branch = `git rev-parse --abbrev-ref HEAD`; ' +
   `commits = the lines of \`git log --oneline ${triage.head}..HEAD\`; dirty = the lines of \`git status --porcelain\`; ` +
   `outOfScope = the paths of \`git log --name-only --no-renames --format= ${triage.head}..HEAD\` (every commit, so an edit ` +
-  `later reverted still counts) outside ${JSON.stringify(scope)} or matching test/hil/*.json (direct children only). ` +
-  'Return ONLY JSON matching the schema.',
+  `later reverted still counts) outside ${JSON.stringify(scope)} or matching test/hil/*.json (direct children only).`,
   { label: 'verify', phase: 'Verify', model: 'haiku', effort: 'low', schema: VERIFY },
 ).catch(e => { log(`verify errored — ${e && e.message}`); return null }) ?? { pass: false, detail: 'verify agent died', branch: '', commits: [], dirty: [], outOfScope: [] }
 

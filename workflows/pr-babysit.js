@@ -817,7 +817,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
     `${IN_CHECKOUT}Editing and committing nothing: branch = \`git rev-parse --abbrev-ref HEAD\`; ` +
     'pushUrls = the lines of `git remote get-url --push --all` for the remote that branch tracks; ' +
     'head = `git rev-parse HEAD`; staged = the lines of `git diff --cached --name-only`; ' +
-    `status = the lines of \`${STATUS_RECIPE}\`. Return ONLY JSON matching the schema.`,
+    `status = the lines of \`${STATUS_RECIPE}\`.`,
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low',
       schema: { type: 'object', additionalProperties: false, required: ['branch', 'pushUrls', 'head', 'staged', 'status'],
         properties: { branch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
@@ -863,7 +863,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
     `If .pre-commit-config.yaml exists: run \`pre-commit run --files ${quoted}\`, and once more if it exited non-zero; ` +
     'ran = true, passed = whether the last run exited 0, modifiedBy = the ids of the hooks whose output said "files were modified by this hook". ' +
     'Otherwise ran = false, passed = true, modifiedBy = []. ' +
-    'after = the status lines again; snapshotAfter = the snapshot lines again. Return ONLY JSON matching the schema.',
+    'after = the status lines again; snapshotAfter = the snapshot lines again.',
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: HOOKS },
   ).catch(e => { log(`hooks#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
@@ -939,7 +939,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
     `leftover = the lines of \`git status --porcelain -z -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`, ` +
     'the owned paths still changed after the commit; ' +
     `entries = the lines of \`git ls-tree -z HEAD -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`; ` +
-    'message = the output of `git log -1 --format=%B HEAD`, verbatim. Return ONLY JSON matching the schema.',
+    'message = the output of `git log -1 --format=%B HEAD`, verbatim.',
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
@@ -1471,7 +1471,7 @@ const pinned = await agent(
   'remote = the remote that branch tracks, `git rev-parse --abbrev-ref @{u}` up to the slash; ' +
   'pushUrls = the lines of `git remote get-url --push --all <that remote>` — the push URLs, which a ' +
   'configured pushurl can point somewhere the fetch URL does not; ' +
-  'head = `git rev-parse HEAD`; dirty = the lines of `git status --porcelain`. Return ONLY JSON matching the schema.',
+  'head = `git rev-parse HEAD`; dirty = the lines of `git status --porcelain`.',
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 ).catch(e => { log(`preflight errored — ${e && e.message}`); return null })
 if (!pinned) return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-died' })
@@ -1547,7 +1547,7 @@ if (adoptHead !== null) {
     '`git show -s --format=%P <sha>` split into a list, every parent; ' +
     'paths = run `git diff-tree --no-commit-id --no-renames --name-only -r -z <sha>` and split its output only on NUL, dropping the ' +
     'terminal empty element; each complete filename is one JSON string, embedded newlines and whitespace preserved; ' +
-    'message = the output of `git log -1 --format=%B <sha>`, verbatim. Return ONLY JSON matching the schema.',
+    'message = the output of `git log -1 --format=%B <sha>`, verbatim.',
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   ).catch(e => { log(`adopt:audit errored — ${e && e.message}`); return null })
   const commits = audit ? audit.commits : []
@@ -1597,7 +1597,7 @@ const adopt = async (entry) => {
       return { pass: false, cycles: entry.cycle, history, reason: 'adopt-push-failed', detail: entry.adoption.detail }
     }
     const seen = await agent(
-      `${IN_CHECKOUT}Editing nothing, report prHead = headRefOid from \`gh pr view ${args.pr} --json headRefOid\`, verbatim. Return ONLY JSON matching the schema.`,
+      `${IN_CHECKOUT}Editing nothing, report prHead = headRefOid from \`gh pr view ${args.pr} --json headRefOid\`, verbatim.`,
       { label: 'adopt:readback', phase: 'Push', model: 'haiku', effort: 'low', schema: READBACK },
     ).catch(e => { log(`adopt:readback errored — ${e && e.message}`); return null })
     const landed = !!push && !!seen && seen.prHead.trim() === to

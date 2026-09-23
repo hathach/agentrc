@@ -165,6 +165,18 @@ class ChiefRun(unittest.TestCase):
             'launcher: warning: a status line later in a message was not forwarded; see stream.jsonl',
             'chief: stage · ü → ✓'])
 
+    def test_a_progress_note_in_thinking_is_forwarded_as_a_note(self):
+        self.stream(
+            init(),
+            {'type': 'assistant', 'parent_tool_use_id': None, 'message': {'id': 'm1', 'content': [
+                {'type': 'thinking', 'thinking': 'Cycle 2/5 wrapped: pushed abc.\nSecond line.'}]}},
+            {'type': 'assistant', 'parent_tool_use_id': 'toolu_1', 'message': {'id': 'w1', 'content': [
+                {'type': 'thinking', 'thinking': 'a worker note'}]}},
+            text('m2', 'chief: cycle · 2/5'),
+            result())
+        self.assertEqual(self.run_it().returncode, 0)
+        self.assertEqual(self.texts()[2:-1], ['note: Cycle 2/5 wrapped: pushed abc. Second line.', 'chief: cycle · 2/5'])
+
     def test_the_report_keeps_its_indentation(self):
         self.stream(init(), result('    first command\n    second command\n\n'))
         self.assertEqual(self.run_it().returncode, 0)

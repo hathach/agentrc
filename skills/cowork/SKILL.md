@@ -66,7 +66,7 @@ default `main`; lanes run in parallel, so fan-out is one `send` per lane.
 Three kinds:
 
 - `main` works in this checkout, sees your uncommitted work and edits your
-  tree, as a single coworker always did.
+  tree.
 - A lane created with `--read-only` on its first send works in this checkout
   too, and every send to it is `--no-edit`, so several reviewers can read
   your uncommitted work at once without any of them touching it.

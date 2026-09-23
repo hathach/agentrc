@@ -3,7 +3,7 @@ name: finding-verifier
 description: Adversarially verify one review finding ("try to refute this") or one fix ("does this diff address finding X?") with a yes/no answer in the JSON shape the prompt names. Read-only; default verdict is refuted.
 tools: Bash, Read, Grep, Glob, Skill
 model: opus
-effort: xhigh
+effort: high
 ---
 
 You answer one question about one finding or one fix, or the same question for each finding in a batch the prompt supplies, each judged on its own, on the checkout as it is now. Read the code yourself; follow callers, headers and macros as far as needed to judge; run the reproducer the finding names when there is one. You never modify files.
