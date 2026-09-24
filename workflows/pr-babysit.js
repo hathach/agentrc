@@ -1648,46 +1648,82 @@ const runCycle = async (cycle, entry) => {
       return { pass: false, cycles: cycle, history, reason: 'duplicate-finding-ids' }
     }
 
-    // A dismissal about to be posted closes the reviewer's thread, so it is the
-    // one verdict worth a second opinion before it goes out.
-    const contested = r.findings.filter(f => f.verdict !== 'valid')
-    if (contested.length > 0) {
-      const submitted = contested.map((f, id) => ({
-        id, commentId: f.commentId, file: f.file, line: f.line,
-        claim: f.claim, verdict: f.verdict, reason: f.reason,
-      }))
+    // The earlier decision a finding answers to: the one its hold named until
+    // reconciled with it, else the one the validator related it to, else its own.
+    const priorOf = (f) => {
+      const ref = (holds.get(f.findingId) || {}).against || f.related || f.findingId
+      const d = decisions.get(ref) || decisions.get(f.findingId)
+      return d && { ref, ...d }
+    }
+    const prior = new Map(r.findings.map(f => [f, priorOf(f)]))
+    // A verdict that turns an earlier one around (a dismissal now valid, a
+    // valid finding now invalid) is settled by a challenger shown both, never by
+    // the validator's word alone. Valid to stale is a fix landing.
+    const turned = (was, now) => (was !== 'valid' && now === 'valid') || (was === 'valid' && now === 'invalid')
+    const reversal = (f) => { const p = prior.get(f); return p && turned(p.verdict, f.verdict) ? p : null }
+    const holdOn = (f, why) => {
+      const p = reversal(f)
+      if (p) f.against = p.ref
+      f.hold = p ? `contradicts the earlier ${p.verdict} verdict on ${p.ref}: ${why}` : why
+    }
+    const recordHold = (f) => {
+      holds.set(f.findingId, { commentId: f.commentId, reason: f.hold, against: f.against || (holds.get(f.findingId) || {}).against || null })
+      log(`cycle ${cycle}: ${f.findingId} held — ${f.hold}`)
+    }
+
+    // A dismissal about to be posted closes the reviewer's thread, and a
+    // reversal is about to be fixed or answered: both get a second opinion first.
+    const challenged = r.findings.filter(f => f.verdict !== 'valid' || reversal(f))
+    if (challenged.length > 0) {
+      const submitted = challenged.map((f, id) => {
+        const p = prior.get(f)
+        return {
+          id, commentId: f.commentId, file: f.file, line: f.line, claim: f.claim, verdict: f.verdict, reason: f.reason,
+          ...(p ? { earlier: { verdict: p.verdict, reason: p.reason, reviewedSha: p.reviewedSha }, changeReason: f.changeReason } : {}),
+        }
+      })
       // The challenger is a second Claude role, not an independent model: an
       // independent second opinion is the chief session's coworker lane.
       const ch = await agent(
-        `${IN_CHECKOUT}Another reviewer dismissed these findings on PR #${args.pr}; each ` +
-          "dismissal is about to be posted publicly and will close the reviewer's thread. " +
-          "For every id, decide whether the dismissal holds: verdict 'justified' when it is correct and " +
-          "the finding really is invalid or already fixed; 'valid' when the finding is real and must be " +
-          "fixed; 'unknown' when you cannot establish either. reason is the evidence either way. " +
+        `${IN_CHECKOUT}Another reviewer judged these findings on PR #${args.pr}. A dismissal (any verdict but 'valid') ` +
+          "is about to be posted publicly and will close the reviewer's thread; a finding called 'valid' against an earlier " +
+          'dismissal is about to be fixed. For every id, decide whether the finding is real: ' +
+          "verdict 'valid' when it is real and must be fixed; 'justified' when it really is invalid or already fixed; " +
+          "'unknown' when you cannot establish either. reason is the evidence either way. " +
+          "An entry with `earlier` carries an earlier review's verdict on the same finding, and changeReason the reviewer's " +
+          'reason for departing from it (possibly null): a verdict of yours that differs from `earlier` also says the earlier one ' +
+          'no longer holds, and your reason must say why. ' +
           'Return exactly one verdict per submitted id and no others.\n' +
           `Findings: ${JSON.stringify(submitted)}.`,
         { label: `challenge#${cycle}`, phase: 'Triage', agentType: 'finding-verifier', schema: CHALLENGE },
       ).catch(e => { log(`cycle ${cycle}: challenger errored — ${e && e.message}`); return null })
 
-      // ids are indexes into contested, so a bad one indexes to undefined.
+      // ids are indexes into challenged, so a bad one indexes to undefined.
       const seen = new Set()
       const complete = ch && Array.isArray(ch.verdicts) &&
-        ch.verdicts.length === contested.length &&
-        ch.verdicts.every(v => contested[v.id] && !seen.has(v.id) && (seen.add(v.id), true))
+        ch.verdicts.length === challenged.length &&
+        ch.verdicts.every(v => challenged[v.id] && !seen.has(v.id) && (seen.add(v.id), true))
       if (!complete) {
         // Silence must never become a public claim that a reviewer was wrong.
+        // An unchecked reversal stays held, so a later harvest that omits it
+        // does not let the earlier verdict stand unanswered.
+        for (const f of challenged.filter(reversal)) { holdOn(f, 'the reversal was not checked'); recordHold(f) }
         log(`cycle ${cycle}: challenge incomplete — refutations withheld`)
         entry.error = 'review challenger died'
         return { pass: false, cycles: cycle, history, reason: 'review-challenger-died' }
       }
 
       for (const v of ch.verdicts) {
-        const f = contested[v.id]
-        // Failing to prove a dismissal does not prove the finding: it is held,
-        // neither posted as refuted nor fixed.
-        if (v.verdict === 'unknown') f.hold = `the challenge could not settle the dismissal: ${v.reason}`
-        if (v.verdict !== 'valid') continue
-        f.challengeReason = v.reason
+        const f = challenged[v.id]
+        // Failing to prove a verdict does not prove the other: the finding is
+        // held, neither posted as refuted nor fixed. Nor does a verdict with no evidence.
+        const unsettled = !v.reason.trim() ? 'the challenger gave no evidence'
+          : v.verdict === 'unknown' ? `the challenger could not settle it: ${v.reason}`
+          : v.verdict === 'justified' && f.verdict === 'valid' ? `the challenger upheld the earlier dismissal: ${v.reason}` : null
+        if (unsettled) { holdOn(f, unsettled); continue }
+        const overturns = v.verdict === 'valid' && f.verdict !== 'valid'
+        if (overturns || reversal(f)) f.challengeReason = v.reason
+        if (!overturns) continue
         f.verdict = 'valid'
         f.overturned = true   // rendered by cycleSummary's valid arm
         // The evidence leads; the harvested hint stays, advisory, for the fixer.
@@ -1696,37 +1732,18 @@ const runCycle = async (cycle, entry) => {
       }
     }
 
-    // A verdict that turns an earlier one around (a dismissal now valid, a
-    // valid finding now invalid) is held unless the validator said what changed
-    // or the challenger overturned it: an unexplained flip is not fixed or
-    // answered until reconciled. Valid to stale is a fix landing.
-    const turned = (was, now) => (was !== 'valid' && now === 'valid') || (was === 'valid' && now === 'invalid')
+    // A dismissal we already posted, now a fix: reported, never answered here.
+    // Every reversal left unheld was settled by the challenger.
     for (const f of r.findings) {
-      // A held finding answers to the decision it contradicted until reconciled
-      // with it, whatever this harvest names as related.
-      const ref = (holds.get(f.findingId) || {}).against || f.related || f.findingId
-      const prior = decisions.get(ref) || decisions.get(f.findingId)
-      if (!prior || f.hold || !turned(prior.verdict, f.verdict)) continue
-      const why = f.overturned ? `the challenger: ${f.challengeReason}` : f.changeReason && f.changeReason.trim()
-      if (!why) {
-        f.against = ref
-        f.hold = `contradicts the earlier ${prior.verdict} verdict on ${ref} with no reason given`
-        continue
-      }
-      // A dismissal we already posted, now a fix: reported, never answered here.
-      if (f.verdict === 'valid' && (answeredWith.get(prior.commentId) || {}).how === 'refutation') {
-        const c = { findingId: f.findingId, earlier: { findingId: ref, verdict: prior.verdict, reason: prior.reason }, now: why }
-        corrections.push(c)
-        log(`cycle ${cycle}: ${f.findingId} was refuted in a posted reply and is valid now (${why}) — reported, no correction posted`)
-      }
+      const p = reversal(f)
+      if (!p || f.hold || f.verdict !== 'valid' || (answeredWith.get(p.commentId) || {}).how !== 'refutation') continue
+      const now = `the challenger: ${f.challengeReason}`
+      corrections.push({ findingId: f.findingId, earlier: { findingId: p.ref, verdict: p.verdict, reason: p.reason }, now })
+      log(`cycle ${cycle}: ${f.findingId} was refuted in a posted reply and is valid now (${now}) — reported, no correction posted`)
     }
     const cut = (t) => String(t).slice(0, 300)
     for (const f of r.findings) {
-      if (f.hold) {
-        holds.set(f.findingId, { commentId: f.commentId, reason: f.hold, against: f.against || (holds.get(f.findingId) || {}).against || null })
-        log(`cycle ${cycle}: ${f.findingId} held — ${f.hold}`)
-        continue
-      }
+      if (f.hold) { recordHold(f); continue }
       if (holds.delete(f.findingId)) log(`cycle ${cycle}: ${f.findingId} reconciled`)
       decisions.set(f.findingId, {
         commentId: f.commentId, digest: f.commentDigest, reviewedSha: r.headSha, file: f.file, line: f.line,

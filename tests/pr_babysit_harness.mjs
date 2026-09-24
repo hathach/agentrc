@@ -289,9 +289,13 @@ async function run(opts = {}) {
         ? { verdicts: c.verdicts.map(({ upheld, ...v }) => upheld === undefined ? v : { ...v, verdict: upheld ? 'justified' : 'valid' }) } : c
       if (opts.challengePerCycle) return tri(opts.challengePerCycle())
       if (!('challenge' in opts)) {
-        // default: uphold every submitted dismissal
-        const ids = [...String(prompt).matchAll(/"id":(\d+)/g)].map(m => Number(m[1]))
-        return { verdicts: ids.map(id => ({ id, verdict: 'justified', reason: 'stands' })) }
+        // default: uphold every submitted dismissal; leave a reversal to valid unsettled
+        const submitted = JSON.parse(String(prompt).match(/Findings: (\[.*\])\.$/s)[1])
+        return { verdicts: submitted.map(x => x.verdict === 'valid' ? { id: x.id, verdict: 'unknown', reason: 'cannot tell' } : { id: x.id, verdict: 'justified', reason: 'stands' }) }
+      }
+      if (typeof opts.challenge === 'function') {
+        const submitted = JSON.parse(String(prompt).match(/Findings: (\[.*\])\.$/s)[1])
+        return conforms(options.schema, { verdicts: submitted.map(x => ({ id: x.id, ...opts.challenge(x) })) }, label)
       }
       return opts.challenge === null ? null : tri(structuredClone(opts.challenge))
     }
@@ -2648,13 +2652,15 @@ test('a dry run applies a deferral but posts nothing', async () => {
 // --- decision continuity ---
 
 // A launch refutes comment 1 and posts it; the resumed launch harvests `then`.
-const refutedThen = async (then) => {
+const refutedThen = async (then, over = {}) => {
   const first = await run({
     reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
     args: { maxCycles: 3, yieldAfterCycle: true },
   })
-  return run({ reviews: then, args: { maxCycles: 3, state: first.result.state } })
+  return run({ ...over, reviews: then, args: { maxCycles: 3, state: first.result.state } })
 }
+// A challenger that confirms every finding called valid and upholds every dismissal.
+const confirming = (reason = 'real now') => (x) => x.verdict === 'valid' ? { verdict: 'valid', reason } : { verdict: 'justified', reason: 'stands' }
 
 test('each verdict is kept in the state and handed to the validator on a resumed launch', async () => {
   const first = await run({ reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }, args: { maxCycles: 3, yieldAfterCycle: true } })
@@ -2666,7 +2672,7 @@ test('each verdict is kept in the state and handed to the validator on a resumed
   assert.match(prompt, /Earlier verdicts on this PR \(set related and changeReason against them per your procedure\): \[\{"findingId":"1#1","commentId":1,.*"verdict":"invalid","reason":"the caller checks it"\}\]/)
 })
 
-test('a verdict that flips without a reason is held: not fixed, not answered, still owed', async () => {
+test('a reversal the challenger cannot settle is held: not fixed, not answered, still owed', async () => {
   for (const [then, earlier] of [
     [{ findings: [finding()], replies: [], bots: 'reviewed' }, 'invalid'],
     [{ findings: [finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1' })], replies: [], bots: 'reviewed' }, 'invalid'],
@@ -2674,7 +2680,7 @@ test('a verdict that flips without a reason is held: not fixed, not answered, st
     const { result, labels, logs } = await refutedThen(then)
     assert.equal(labels.some(l => l.startsWith('fix:')), false)
     assert.notEqual(result.pass, true)
-    assert.ok(logs.some(l => new RegExp(`held — contradicts the earlier ${earlier} verdict on 1#1 with no reason given`).test(l)), logs.join('\n'))
+    assert.ok(logs.some(l => new RegExp(`held — contradicts the earlier ${earlier} verdict on 1#1: the challenger could not settle it: cannot tell`).test(l)), logs.join('\n'))
     assert.match(rowsOf(summaries(logs)[0])[0][3], /^held: contradicts the earlier/)
   }
 })
@@ -2694,7 +2700,7 @@ test('a hold survives a harvest that omits the finding, within a launch and acro
   const held = await run({ reviews: flipped, args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
   const resumed = await run({ reviews: empty, args: { maxCycles: 5, state: held.result.state } })
   assert.notEqual(resumed.result.pass, true, 'nor across a resume')
-  const explained = await run({ reviews: { findings: [finding({ changeReason: 'new evidence: the ISR path skips the check' })], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, yieldAfterCycle: true, state: held.result.state } })
+  const explained = await run({ reviews: { findings: [finding({ changeReason: 'new evidence: the ISR path skips the check' })], replies: [], bots: 'reviewed' }, challenge: confirming(), args: { maxCycles: 5, yieldAfterCycle: true, state: held.result.state } })
   assert.deepEqual(explained.result.state.holds, [])
   assert.ok(explained.logs.some(l => /1#1 reconciled/.test(l)))
 })
@@ -2724,7 +2730,7 @@ test('a held finding stays held against its earlier decision when a later harves
   })
   const related = finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1' })
   const held = await run({ reviews: { findings: [related], replies: [], bots: 'reviewed' }, args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
-  assert.deepEqual(held.result.state.holds, [['5#1', { commentId: 5, reason: 'contradicts the earlier invalid verdict on 1#1 with no reason given', against: '1#1' }]])
+  assert.deepEqual(held.result.state.holds, [['5#1', { commentId: 5, reason: 'contradicts the earlier invalid verdict on 1#1: the challenger could not settle it: cannot tell', against: '1#1' }]])
   const dropped = await run({ reviews: { findings: [{ ...related, related: null }], replies: [], bots: 'reviewed' }, args: { maxCycles: 3, state: held.result.state } })
   assert.equal(dropped.labels.some(l => l.startsWith('fix:')), false)
   assert.ok(!dropped.logs.some(l => /5#1 reconciled/.test(l)))
@@ -2769,7 +2775,7 @@ test('a finding related to another comment keeps its own debt, and settling one 
   const { result } = await refutedThen({ findings: [
     invalidFinding({ reason: 'the caller checks it' }),
     finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1', changeReason: 'new evidence: b.c has no caller check' }),
-  ], replies: [], bots: 'reviewed' })
+  ], replies: [], bots: 'reviewed' }, { challenge: confirming() })
   assert.deepEqual(result.state.answeredWith.map(([id]) => id), [1, 5], 'comment 1 stays answered by its refutation, comment 5 gets its own note')
   const first = await run({
     reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
@@ -2777,35 +2783,97 @@ test('a finding related to another comment keeps its own debt, and settling one 
   })
   const unsettled = await run({
     reviews: { findings: [finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1', changeReason: 'new evidence' })], replies: [], bots: 'reviewed' },
-    args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state }, posting: () => null,
+    args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state }, posting: () => null, challenge: confirming(),
   })
   assert.ok(unsettled.result.state.debt.find(([id]) => id === 5), 'comment 5 owes its note')
   assert.deepEqual(unsettled.result.state.answeredWith.map(([id]) => id), [1], 'comment 1 answered, comment 5 not')
 })
 
-test('a valid finding that turns invalid without a reason is held too, while valid to stale is a fix landing', async () => {
+test('a valid finding now dismissed goes to the challenger with the earlier verdict, which settles the reversal', async () => {
+  const run2 = (challenge) => {
+    let cycle = 0
+    return run({
+      args: { autoPush: true, maxCycles: 2 }, ...(challenge ? { challenge } : {}),
+      reviewsPerCycle: () => ++cycle === 1 ? oneValid
+        : { findings: [invalidFinding({ changeReason: 'the fix landed differently' })], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' },
+    })
+  }
+  const confirmed = await run2()
+  const ch = confirmed.calls.find(c => c.label === 'challenge#2')
+  assert.match(ch.prompt, /"earlier":\{"verdict":"valid","reason":"","reviewedSha":"[0-9a-f]{40}"\},"changeReason":"the fix landed differently"/)
+  assert.match(ch.prompt, /also says the earlier one no longer holds, and your reason must say why/)
+  assert.ok(!confirmed.logs.some(l => /1#1 held/.test(l)), 'a justified reversal is not held')
+  const unsure = await run2({ verdicts: [{ id: 0, verdict: 'unknown', reason: 'cannot tell' }] })
+  assert.ok(unsure.logs.some(l => /1#1 held — contradicts the earlier valid verdict on 1#1: the challenger could not settle it: cannot tell/.test(l)))
+  assert.equal(unsure.result.state.holds[0][1].against, '1#1', 'the hold names the decision it contradicts')
+  assert.equal(unsure.labels.filter(l => l.startsWith('replies#')).length, 0)
   let cycle = 0
-  const turned = await run({
-    args: { autoPush: true, maxCycles: 2 },
-    reviewsPerCycle: () => ++cycle === 1 ? oneValid : { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' },
-  })
-  assert.ok(turned.logs.some(l => /1#1 held — contradicts the earlier valid verdict/.test(l)))
-  assert.equal(turned.labels.filter(l => l.startsWith('replies#')).length, 0)
-  cycle = 0
   const landed = await run({
     args: { autoPush: true, maxCycles: 2 },
     reviewsPerCycle: () => ++cycle === 1 ? oneValid : { findings: [finding({ verdict: 'stale' })], replies: [], bots: 'reviewed' },
   })
-  assert.ok(!landed.logs.some(l => /held/.test(l)))
+  assert.ok(!landed.logs.some(l => /held/.test(l)), 'valid to stale is a fix landing')
+})
+
+test('a challenger overturning a posted dismissal is shown the earlier verdict', async () => {
+  const again = { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+  const { calls, labels, result } = await refutedThen(again, { challenge: { verdicts: [{ id: 0, verdict: 'valid', reason: 'the ISR path skips the check' }] } })
+  assert.match(calls.find(c => c.label.startsWith('challenge#')).prompt, /"earlier":\{"verdict":"invalid","reason":"the caller checks it"/)
+  assert.ok(labels.includes('fix:src/a.c'), 'an overturn with evidence, against the earlier verdict it saw, is acted on')
+  assert.deepEqual(result.corrections.map(c => c.now), ['the challenger: the ISR path skips the check'], 'the reversal the overturn made is reported')
+})
+
+test('a challenger verdict with no evidence, or a verdict list with a stray id, settles nothing', async () => {
+  const flipped = { findings: [finding({ changeReason: 'new evidence' })], replies: [], bots: 'reviewed' }
+  const blank = await refutedThen(flipped, { challenge: () => ({ verdict: 'valid', reason: ' ' }) })
+  assert.equal(blank.labels.some(l => l.startsWith('fix:')), false)
+  assert.ok(blank.logs.some(l => /1#1 held — .*the challenger gave no evidence/.test(l)))
+  const stray = await refutedThen(flipped, { challenge: { verdicts: [{ id: 0, verdict: 'valid', reason: 'real' }, { id: 99, verdict: 'valid', reason: 'real' }] } })
+  assert.equal(stray.labels.some(l => l.startsWith('fix:')), false)
+  assert.equal(stray.result.reason, 'review-challenger-died')
+  assert.ok(stray.logs.some(l => /1#1 held — .*the reversal was not checked/.test(l)))
+  const silent = await run({ reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, verdict: 'justified', reason: '' }] }, args: { maxCycles: 1 } })
+  assert.equal(silent.labels.some(l => l.startsWith('replies#')), false, 'a dismissal nobody gave evidence for is not posted')
+  assert.ok(silent.logs.some(l => /1#1 held — the challenger gave no evidence/.test(l)))
+})
+
+test('a dismissal the validator turns valid is checked by the challenger, and its reason alone settles nothing', async () => {
+  const flipped = { findings: [finding({ changeReason: 'new evidence: the ISR path skips the check' })], replies: [], bots: 'reviewed' }
+  const upheld = await refutedThen(flipped, { challenge: () => ({ verdict: 'justified', reason: 'the caller still checks it' }) })
+  assert.equal(upheld.labels.some(l => l.startsWith('fix:')), false)
+  assert.ok(upheld.logs.some(l => /1#1 held — contradicts the earlier invalid verdict on 1#1: the challenger upheld the earlier dismissal: the caller still checks it/.test(l)), upheld.logs.join('\n'))
+  const ch = upheld.calls.find(c => c.label.startsWith('challenge#'))
+  assert.match(ch.prompt, /"verdict":"valid","reason":"","earlier":\{"verdict":"invalid","reason":"the caller checks it","reviewedSha":"[0-9a-f]{40}"\},"changeReason":"new evidence: the ISR path skips the check"/)
+  const confirmed = await refutedThen(flipped, { challenge: () => ({ verdict: 'valid', reason: 'the ISR path skips it' }) })
+  assert.ok(confirmed.labels.includes('fix:src/a.c'))
+  assert.equal(confirmed.result.corrections[0].now, 'the challenger: the ISR path skips it')
+  const unexplained = await refutedThen({ findings: [finding()], replies: [], bots: 'reviewed' }, { challenge: () => ({ verdict: 'valid', reason: 'the ISR path skips it' }) })
+  assert.ok(unexplained.labels.includes('fix:src/a.c'), 'the challenger settles a reversal the validator left unexplained')
+})
+
+test('an unchecked reversal is held before the run stops, and a resume that omits it is still blocked', async () => {
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true },
+  })
+  const dead = await run({ reviews: { findings: [finding({ changeReason: 'new evidence' })], replies: [], bots: 'reviewed' }, challenge: null, args: { maxCycles: 5, state: first.result.state } })
+  assert.equal(dead.result.reason, 'review-challenger-died')
+  assert.deepEqual(dead.result.state.holds, [['1#1', { commentId: 1, reason: 'contradicts the earlier invalid verdict on 1#1: the reversal was not checked', against: '1#1' }]])
+  assert.equal(dead.result.state.decisions[0][1].verdict, 'invalid', 'the earlier decision is not updated')
+  const omitted = await run({ reviews: { findings: [], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, state: dead.result.state } })
+  assert.notEqual(omitted.result.pass, true)
+  assert.deepEqual(omitted.result.state.holds.map(([id]) => id), ['1#1'])
 })
 
 test('an explained flip on a posted refutation is fixed and reported as a correction, with no reply', async () => {
-  const { result, labels, logs } = await refutedThen({ findings: [finding({ changeReason: 'earlier error: the caller does not check it on the ISR path' })], replies: [], bots: 'reviewed' })
+  const { result, labels, logs } = await refutedThen({ findings: [finding({ changeReason: 'earlier error: the caller does not check it on the ISR path' })], replies: [], bots: 'reviewed' },
+    { challenge: confirming('the caller does not check it on the ISR path') })
   assert.ok(labels.includes('fix:src/a.c'))
   assert.equal(labels.some(l => l.startsWith('resolve#')), false, 'no correction reply')
   assert.deepEqual(result.corrections, [{
     findingId: '1#1', earlier: { findingId: '1#1', verdict: 'invalid', reason: 'the caller checks it' },
-    now: 'earlier error: the caller does not check it on the ISR path',
+    now: 'the challenger: the caller does not check it on the ISR path',
   }])
   assert.ok(logs.some(l => /1#1 was refuted in a posted reply and is valid now .* reported, no correction posted/.test(l)))
 })
@@ -2817,7 +2885,7 @@ test('a challenger that cannot settle a dismissal neither posts it nor fixes the
     challenge: { verdicts: [{ id: 0, verdict: 'unknown', reason: 'the ISR path is not visible from here' }] },
   })
   assert.equal(labels.some(l => /^(replies#|fix:)/.test(l)), false)
-  assert.ok(logs.some(l => /1#1 held — the challenge could not settle the dismissal: the ISR path/.test(l)))
+  assert.ok(logs.some(l => /1#1 held — the challenger could not settle it: the ISR path/.test(l)))
   assert.deepEqual(result.state.debt.find(([id]) => id === 1)[1].dismissals, ['1#1'])
   assert.equal(result.state.decisions.length, 0, 'a held verdict is not recorded as a decision')
 })
@@ -2825,7 +2893,7 @@ test('a challenger that cannot settle a dismissal neither posts it nor fixes the
 test('the challenger is asked for three verdicts', async () => {
   const { calls } = await run({ reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } })
   const ch = calls.find(c => c.label === 'challenge#1')
-  assert.match(ch.prompt, /'justified' when it is correct/)
+  assert.match(ch.prompt, /'justified' when it really is invalid or already fixed/)
   assert.match(ch.prompt, /'unknown' when you cannot establish either/)
   assert.deepEqual(ch.schema.properties.verdicts.items.properties.verdict.enum, ['justified', 'valid', 'unknown'])
 })
@@ -3074,7 +3142,7 @@ test('an offered answer the comment outgrew is a repair, not a reuse or a repost
         ? { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no bug exists' }], bots: 'reviewed' }
         : { findings: [finding({ commentId: 2, line: 4, verdict: 'valid', changeReason: 'new evidence: the caller does reach it' })], replies: [], bots: 'reviewed' }
     },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    challenge: confirming(),
   })
   assert.equal(flipped.calls.some(c => c.label.startsWith('resolve#')), false, 'the refutation must not go out as a fix note')
   assert.equal(flipped.result.pass, false)
