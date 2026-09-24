@@ -606,11 +606,19 @@ const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPus
 // comment accrues no further debt until the reviewer edits it, which the
 // digest catches.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
-// commentId -> { dismissals, note }: dismissals relied on without telling the
-// reviewer, and whether a landed fix still owes its note. Standing debt, not a
-// snapshot: a harvest that drops a finding does not settle it.
+// commentId -> { dismissals, notes }: dismissals relied on without telling the
+// reviewer, and the valid or deferred findings still owed a note. Standing
+// debt, not a snapshot: a harvest that drops a finding does not settle it.
+// A state from before `notes` owes a note it cannot name: NO_ID stands in, so
+// no harvest ever shows every point of it. One from before `seenSinceEdit`
+// counts every carried id of a renumbered comment as seen since the edit.
+const NO_ID = '(unnamed)'
 const debt = new Map(restored
-  ? restored.debt.map(([id, d]) => [id, { dismissals: new Set(d.dismissals), note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }])
+  ? restored.debt.map(([id, d]) => {
+    const notes = new Set(d.notes || (d.note ? [NO_ID] : []))
+    const seen = d.renumbered ? { seenSinceEdit: new Set(d.seenSinceEdit || [...d.dismissals, ...notes]) } : {}
+    return [id, { dismissals: new Set(d.dismissals), notes, renumbered: !!d.renumbered, ...seen, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]
+  })
   : [])
 for (const a of (restored && restored.acceptedFailures) || []) {
   if (!acceptedArg.some(x => failureKey(x) === failureKey(a))) log(`accepted failure not renewed by this launch, no longer accepted: ${a.workflow} / ${a.job}${a.cell ? ` / ${a.cell}` : ''}: ${a.signature}`)
@@ -669,7 +677,7 @@ const stateOut = () => {
     acceptedFailures: acceptedArg,
     decisions: [...decisions],
     holds: [...holds],
-    debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
+    debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], renumbered: !!d.renumbered, ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
   return { ...st, digest: sealOf(st) }
@@ -1396,12 +1404,12 @@ const pay = (commentId, how, digest) => {
   answeredWith.set(commentId, { how, digest })
   const d = debt.get(commentId)
   if (!d) return
-  d.note = false
+  d.notes.clear()
   delete d.attempt
-  if (how === 'refutation') { d.dismissals.clear(); d.renumbered = false }
+  if (how === 'refutation') { d.dismissals.clear(); d.renumbered = false; delete d.seenSinceEdit }
   // A deferral reply goes out only with no dismissal carried, so no reused id
   // is left for the renumbering to protect.
-  if (how === 'deferral') d.renumbered = false
+  if (how === 'deferral') { d.renumbered = false; delete d.seenSinceEdit }
   if (d.dismissals.size === 0 && !d.renumbered) debt.delete(commentId)
 }
 
@@ -1412,7 +1420,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   // comment keeps its debt, and the next cycle must not answer it again on
   // top of the wrong one.
   const repair = (commentId, replyId, error) => {
-    const d = debt.get(commentId) || (debt.set(commentId, { dismissals: new Set(), note: false }), debt.get(commentId))
+    const d = debt.get(commentId) || (debt.set(commentId, { dismissals: new Set(), notes: new Set() }), debt.get(commentId))
     d.repair = { replyId, error }
     log(`cycle ${cycle}: reply ${replyId} to comment ${commentId} exists with the wrong content (${error}) — needs a human repair, not another reply`)
   }
@@ -1807,14 +1815,18 @@ const runCycle = async (cycle, entry) => {
       }
       const answered = answeredWith.has(f.commentId)
       let d = debt.get(f.commentId)
-      const open = () => (d || (debt.set(f.commentId, d = { dismissals: new Set(), note: false }), d))
+      const open = () => (d || (debt.set(f.commentId, d = { dismissals: new Set(), notes: new Set() }), d))
       if (d && d.digest !== f.commentDigest) {
         // Renumbered under us. Keep everything owed and let the run end
         // unresolved rather than retire a dismissal by a reused id.
         log(`cycle ${cycle}: comment ${f.commentId} was edited — its finding ids no longer identify what we owe`)
         d.digest = f.commentDigest
         d.renumbered = true
+        d.seenSinceEdit = new Set()
       }
+      // Ids reported against the edited body do name its points, answered or not:
+      // a fix note leaves the comment's dismissals owed.
+      if (d && d.renumbered) d.seenSinceEdit.add(dismissalKey(f))
       if (f.verdict !== 'valid') {
         if (!answered) { const e = open(); e.dismissals.add(dismissalKey(f)); e.digest = f.commentDigest }
         continue
@@ -1825,16 +1837,25 @@ const runCycle = async (cycle, entry) => {
       // never be discharged. Except on a comment whose body was edited: its
       // ids were renumbered, so the id that would retire A may now name B.
       if (d && !d.renumbered) d.dismissals.delete(dismissalKey(f))
-      if (!answered) { const e = open(); e.note = true; if (e.digest === undefined) e.digest = f.commentDigest }
-      if (d && d.dismissals.size === 0 && !d.note && !d.renumbered) debt.delete(f.commentId)
+      if (!answered) { const e = open(); e.notes.add(dismissalKey(f)); if (e.digest === undefined) e.digest = f.commentDigest }
+      if (d && d.dismissals.size === 0 && d.notes.size === 0 && !d.renumbered) debt.delete(f.commentId)
     }
 
-    // Only a comment whose every carried dismissal is in this harvest: the
-    // verifier judges the points it is shown, and paying settles them all.
+    // An answer is built from this harvest, and paying it settles the points
+    // its comment carries: a refutation or a reused reply all of them, a fix
+    // note or deferral reply its notes. So a comment is answered only when this
+    // harvest shows every point the answer settles; the next is asked for them.
+    // On a renumbered comment only the ids reported since the edit name its
+    // points; one never is settled on a reused reply.
     const harvested = new Set(r.findings.map(dismissalKey))
+    const showsAll = (id, dismissalsToo) => {
+      const d = debt.get(id)
+      return !d || [...(dismissalsToo ? d.dismissals : []), ...d.notes]
+        .every(k => harvested.has(k) || (d.renumbered && !d.seenSinceEdit.has(k)))
+    }
     const stuck = [...debt]
       .filter(([id, d]) => d.repair && d.repair.replyId && ['refutation', 'fixNote', 'deferral'].includes(owed(id)) &&
-        !d.renumbered && [...d.dismissals].every(k => harvested.has(k)))
+        !d.renumbered && showsAll(id, true))
       .map(([commentId, d]) => ({ commentId, replyId: d.repair.replyId, how: owed(commentId) }))
     if (stuck.length) {
       const pointsOf = (commentId) => r.findings.filter(f => f.commentId === commentId)
@@ -1849,7 +1870,7 @@ const runCycle = async (cycle, entry) => {
     let withheld = 0
     const replyFor = new Map()
     for (const x of r.replies) {
-      if (owed(x.commentId) !== 'refutation' || !owesDismissal(x.commentId) || debt.get(x.commentId).repair) { withheld++; continue }
+      if (owed(x.commentId) !== 'refutation' || !owesDismissal(x.commentId) || debt.get(x.commentId).repair || !showsAll(x.commentId, true)) { withheld++; continue }
       const prev = replyFor.get(x.commentId)
       if (prev) prev.body += `\n\n${x.body}`
       else replyFor.set(x.commentId, { commentId: x.commentId, body: x.body })
@@ -1863,7 +1884,7 @@ const runCycle = async (cycle, entry) => {
     }
     // A comment whose every point is deferred is answered now: no fix is coming.
     const deferralReplies = [...ledger.keys()]
-      .filter(id => owed(id) === 'deferral' && debt.has(id) && debt.get(id).note && !debt.get(id).repair && !owesDismissal(id))
+      .filter(id => owed(id) === 'deferral' && debt.has(id) && debt.get(id).notes.size > 0 && !debt.get(id).repair && !owesDismissal(id) && showsAll(id, false))
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
@@ -1901,7 +1922,7 @@ const runCycle = async (cycle, entry) => {
       // only a text the workflow decided on.
       const answerable = new Map()
       for (const f of validFindings) {
-        if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair) continue
+        if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair || !showsAll(f.commentId, false)) continue
         const line = `- ${f.file}:${f.line}: ${f.claim}`
         const prev = answerable.get(f.commentId)
         if (prev) prev.body += `\n${line}`
