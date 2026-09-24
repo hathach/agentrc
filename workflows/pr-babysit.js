@@ -318,6 +318,16 @@ const COMMIT = {
   required: ['committed', 'detail'],
   properties: { committed: { type: 'boolean' }, detail: { type: 'string' } },
 }
+// What the pin must still match before a commit, as PREFLIGHT_SCRIPT --recheck reports it.
+const RECHECK = {
+  type: 'object', additionalProperties: false,
+  required: ['branch', 'pushUrls', 'head', 'staged', 'status'],
+  properties: {
+    error: { type: 'string' },
+    branch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } }, head: { type: 'string' },
+    staged: { type: 'array', items: { type: 'string' } }, status: { type: 'array', items: { type: 'string' } },
+  },
+}
 // What running the repository's hooks on the owned paths did, as HOOKS_SCRIPT
 // reports it: the tree before and after, the owned files' blob hashes before and
 // after, and which hooks said they modified files. The workflow decides from
@@ -333,8 +343,6 @@ const HOOKS = {
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
 }
-// Read NUL-separated: porcelain would otherwise quote a name holding a space or a quote.
-const STATUS_RECIPE = "git status --porcelain -z | tr '\\0' '\\n'"
 // One `<mode> <blob> <path>` line per path, as HOOKS_SCRIPT reports the
 // working tree and COMMITS_SCRIPT the commit (`git ls-tree` spells it
 // `<mode> blob <sha>\t<path>`). The working-tree mode is git's, 644 or 755 by
@@ -880,16 +888,11 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // rebase. Identity is an exact SHA, never a count: a one-for-one replacement,
   // a reset behind the pin, or a foreign commit all keep the count plausible.
   const now = await agent(
-    `${IN_CHECKOUT}Editing and committing nothing: branch = \`git rev-parse --abbrev-ref HEAD\`; ` +
-    'pushUrls = the lines of `git remote get-url --push --all` for the remote that branch tracks; ' +
-    'head = `git rev-parse HEAD`; staged = the lines of `git diff --cached --name-only`; ' +
-    `status = the lines of \`${STATUS_RECIPE}\`.`,
-    { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low',
-      schema: { type: 'object', additionalProperties: false, required: ['branch', 'pushUrls', 'head', 'staged', 'status'],
-        properties: { branch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
-          head: { type: 'string' }, staged: { type: 'array', items: { type: 'string' } }, status: { type: 'array', items: { type: 'string' } } } } },
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
+    { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
   ).catch(e => { log(`recheck#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
+  if (now.error) return { pass: false, committed: false, detail: `recheck could not read the checkout: ${now.error}`, sha: '' }
   const moved = now.branch.trim() !== pinned.branch.trim() ? `branch is ${now.branch}, not ${pinned.branch}`
     : now.pushUrls.join('\n') !== pinned.pushUrls.join('\n') ? `${pinned.remote} now pushes to ${now.pushUrls.join(', ') || '(nowhere)'}`
     : now.head.trim() !== expectedHead ? `HEAD is ${now.head.trim().slice(0, 7)}, not the ${expectedHead.slice(0, 7)} this run left`

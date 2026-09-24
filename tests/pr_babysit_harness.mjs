@@ -1045,6 +1045,7 @@ test('the publisher rechecks the checkout and refuses to publish onto a moved on
     [{ head: FOREIGN }, 'checkout moved: HEAD is c0ffee1, not the 0f1e2d3 this run left'],
     [{ staged: ['src/other.c', 'src/more.c'] }, 'checkout moved: 2 path(s) already staged by somebody else'],
     [null, 'recheck agent died'],
+    [{ error: 'git rev-parse HEAD: fatal: not a git repository' }, 'recheck could not read the checkout: git rev-parse HEAD: fatal: not a git repository'],
   ]) {
     const { result, logs, labels, calls } = await run({ reviews: oneValid, recheck })
     assert.equal(result.reason, 'push-failed', detail)
@@ -1055,8 +1056,7 @@ test('the publisher rechecks the checkout and refuses to publish onto a moved on
     assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed, COMMIT FAILED/, detail)
     const re = calls.find(c => c.label === 'recheck#1-review')
     assert.match(re.prompt, /Editing and committing nothing/)
-    assert.match(re.prompt, /head = `git rev-parse HEAD`/, 'identity is an exact SHA, never a count')
-    assert.match(re.prompt, /staged = the lines of `git diff --cached --name-only`/)
+    assert.ok(re.prompt.includes('preflight.py --recheck`'), re.prompt)
     assert.deepEqual(re.schema.required.slice().sort(), ['branch', 'head', 'pushUrls', 'staged', 'status'])
   }
 })

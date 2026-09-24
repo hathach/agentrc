@@ -14,6 +14,7 @@ missing. Each script's docstring says what it reports.
 ```bash
 S=~/.claude/skills/pr-babysit/scripts
 python3 $S/preflight.py --pr N               # the checkout and the PR it must stay
+python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py head 'src/a.c'         # the commit at HEAD and its scope
 python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SHAs

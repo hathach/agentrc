@@ -88,8 +88,21 @@ class PreflightTest(unittest.TestCase):
             self.assertEqual(status, 2, answer)
             self.assertIn(want, out['error'], answer)
 
+    def test_recheck_reads_the_local_facts_without_gh(self):
+        self.git('remote', 'set-url', '--push', 'origin', 'git@github.com:someone/tinyusb.git')
+        self.fake_gh('', 1)
+        (self.repo / 'a name.c').write_text('x')
+        (self.repo / 'staged.c').write_text('x')
+        self.git('add', 'staged.c')
+        code, out = self.pin('--recheck')
+        self.assertEqual(code, 0)
+        self.assertEqual(out, {'branch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
+                               'head': self.git('rev-parse', 'HEAD').strip(), 'staged': ['staged.c'],
+                               'status': ['A  staged.c', '?? a name.c']})
+
     def test_usage(self):
-        self.assertIn('usage', self.pin('--pr', 'x')[1]['error'])
+        for argv in (['--pr', 'x'], ['--pr', '7', '--recheck'], ['--frob']):
+            self.assertIn('usage', self.pin(*argv)[1]['error'], argv)
 
 
 if __name__ == '__main__':
