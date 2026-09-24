@@ -121,6 +121,13 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(snap['b.txt'], ['absent', '-'])
         self.assertEqual(snap['c.txt'][0], '644')
 
+    def test_a_status_that_is_not_utf8_is_an_error(self):
+        self.configure()
+        (self.repo / b'bad\xff.c'.decode('utf-8', 'surrogateescape')).write_text('stray\n')
+        code, out = self.run_script('a.txt')
+        self.assertEqual(code, 2)
+        self.assertIn('not UTF-8', out['error'])
+
     def test_refuses_outside_the_top_level(self):
         self.configure()
         code, out = self.run_script('a.txt', cwd=self.repo / 'hooks')

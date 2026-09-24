@@ -1114,7 +1114,7 @@ test('the commit is read back by an agent that did not write it', async () => {
   // A committer reporting on its own commit is the one witness not to rely on.
   assert.match(audit.prompt, /Editing and committing nothing/)
   assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths', 'leftover', 'entries', 'message'])
-  assert.match(audit.prompt, /every parent, not only the first/)
+  assert.match(audit.prompt, /commits\.py head 'src\/a\.c'/)
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.deepEqual(commit.schema.required, ['committed', 'detail'],
     'the committer is not asked what its own commit contains')
@@ -2587,7 +2587,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.equal(audit.phase, 'Triage')
   assert.deepEqual(audit.schema.required, ['commits'])
   assert.deepEqual(audit.schema.properties.commits.items.required, ['sha', 'parents', 'paths', 'message'])
-  assert.match(audit.prompt, /--no-renames/)
+  assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
   assert.ok(push.prompt.includes("git push 'origin' '1111111111111111111111111111111111111111:refs/heads/claude/foo'"))
@@ -2657,6 +2657,16 @@ test('an omitted intermediate commit or a list not ending at the candidate is re
     assert.equal(result.state.cyclesUsed, state.cyclesUsed)
     assert.deepEqual(result.state.history, state.history)
   }
+})
+
+test('a chain the audit script cannot read back is refused with its error', async () => {
+  const { result, labels } = await run({
+    args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
+    adoptAudit: { error: 'git rev-list: fatal: bad revision', commits: [] },
+  })
+  assert.equal(result.reason, 'adopt-audit-failed')
+  assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
+  assert.deepEqual(labels, ['preflight', 'adopt:audit'])
 })
 
 test('adoptHead argument errors throw before any agent runs', async () => {
@@ -2791,10 +2801,6 @@ test('protected modifications, deletions, and either side of a rename fail adopt
     })
     assert.equal(result.reason, 'adopt-audit-failed', name)
     assert.deepEqual(labels, ['preflight', 'adopt:audit'])
-    const prompt = calls.find(c => c.label === 'adopt:audit').prompt
-    assert.match(prompt, /--no-renames/, 'both rename sides must be visible to the path check')
-    assert.match(prompt, /split its output only on NUL/, 'a filename must reach the check whole')
-    assert.doesNotMatch(prompt, /tr '\\0' '\\n'/, 'turning NULs into newlines splits a name that holds one')
   }
 })
 
@@ -3117,8 +3123,15 @@ test('a path with a space or a quote survives status, snapshot, diff-tree and ls
     assert.deepEqual(pathLine(calls.find(c => c.label === 'commit#1-review').prompt), [p], 'the path itself was committed')
     assert.deepEqual(hookQuoted(calls.find(c => c.label === 'hooks#1-review').prompt), [p], 'the hook script gets the path itself')
     const audit = calls.find(c => c.label === 'audit#1-review').prompt
-    assert.ok(audit.includes('ls-tree -z HEAD') && audit.includes("--name-only -r -z HEAD | tr '\\0' '\\n'"), 'and so are the commit paths')
+    assert.ok(audit.includes(`commits.py head '${p}'`), 'the audit script gets the path itself')
   }
+})
+
+test('a commit the audit script cannot read back is not pushed', async () => {
+  const { result, labels } = await run({ ...publishing, audit: { error: 'HEAD moved from a to b while it was read', sha: '', paths: [], entries: [], message: '' } })
+  assert.match(result.history[0].reviewPushFailed.detail, /^commit failed audit: the commit could not be read back: HEAD moved/)
+  assert.equal(result.history[0].reviewPushFailed.committed, true)
+  assert.ok(!labels.includes('push#1-review'))
 })
 
 test('a hook script that reports no evidence stops publication with its error', async () => {
@@ -3149,7 +3162,7 @@ test('the committer is told the authorship rule and the audit reads the message 
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.match(commit.prompt, /no Co-Authored-By, Claude-Session, Generated-with or the like: the repository's human is the sole author/)
   const audit = calls.find(c => c.label === 'audit#1-review')
-  assert.match(audit.prompt, /message = the output of `git log -1 --format=%B HEAD`, verbatim/)
+  assert.match(audit.prompt, /commits\.py head /)
 })
 
 test('a commit whose message credits an agent, model, tool or session is never pushed', async () => {

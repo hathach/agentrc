@@ -288,6 +288,7 @@ const ADOPT_AUDIT = {
   type: 'object', additionalProperties: false,
   required: ['commits'],
   properties: {
+    error: { type: 'string' },
     commits: {
       type: 'array',
       items: {
@@ -350,6 +351,7 @@ const AUDIT = {
   type: 'object', additionalProperties: false,
   required: ['sha', 'parents', 'paths', 'leftover', 'entries', 'message'],
   properties: {
+    error: { type: 'string' },
     sha: { type: 'string' }, parents: { type: 'array', items: { type: 'string' } },
     paths: { type: 'array', items: { type: 'string' } },
     leftover: { type: 'array', items: { type: 'string' } },
@@ -380,6 +382,11 @@ const SCOPE = {
 // and every one of them came back 201.
 const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
 const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
+const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
+// How a fact collector's agent relays the script's last stdout line, and what it
+// says when there is no line or the line is an error.
+const relayed = (empty) => 'and return the JSON object on its last stdout line unchanged. ' +
+  `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty}.`
 // The body's checksum rides in the manifest and comes back in the receipt, so a
 // body the posting agent transcribed wrong is refused by the script and a
 // receipt for a different body is refused here. Same function in reply.py.
@@ -906,8 +913,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   const quoted = checked.map(f => `'${f}'`).join(' ')
   const hooks = await agent(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
-    'and return the JSON object on its last stdout line unchanged. ' +
-    'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ran = false, passed = false and every list empty.',
+    relayed('ran = false, passed = false and every list empty'),
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
   ).catch(e => { log(`hooks#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
@@ -980,14 +986,8 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // work is the one report most likely to be wrong about it. This catches
   // misreporting and a tree that moved underneath, not a determined lie.
   const seen = await agent(
-    `${IN_CHECKOUT}Editing and committing nothing, report the commit at HEAD: ` +
-    'sha = `git rev-parse HEAD`; parents = the space-separated output of `git show -s --format=%P HEAD` ' +
-    'split into a list — every parent, not only the first; ' +
-    "paths = the lines of `git diff-tree --no-commit-id --no-renames --name-only -r -z HEAD | tr '\\0' '\\n'`; " +
-    `leftover = the lines of \`git status --porcelain -z -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`, ` +
-    'the owned paths still changed after the commit; ' +
-    `entries = the lines of \`git ls-tree -z HEAD -- ${scope.map(f => `'${f}'`).join(' ')} | tr '\\0' '\\n'\`; ` +
-    'message = the output of `git log -1 --format=%B HEAD`, verbatim.',
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(f => `'${f}'`).join(' ')}\` ` +
+    relayed("sha = '', message = '' and every list empty"),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
@@ -1011,7 +1011,8 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // Absent evidence is not evidence of a clean commit: an empty path list, a
   // half-written SHA, or a SHA equal to the parent all mean the report does not
   // describe a commit we can vouch for.
-  const why = !/^[0-9a-f]{40}$/.test(sha) ? `commit reported no full SHA: ${JSON.stringify(seen.sha)}`
+  const why = seen.error ? `the commit could not be read back: ${seen.error}`
+    : !/^[0-9a-f]{40}$/.test(sha) ? `commit reported no full SHA: ${JSON.stringify(seen.sha)}`
     : sha === expectedHead ? 'commit SHA equals the parent: nothing was committed'
     : seen.parents.length !== 1 ? `commit has ${seen.parents.length} parents: a merge brings history this run never audited`
     : seen.parents[0].trim() !== expectedHead ? `commit sits on ${seen.parents[0].trim().slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
@@ -1590,12 +1591,8 @@ if (adoptHead !== null) {
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-pending', pending: p })
   }
   const audit = await agent(
-    `${IN_CHECKOUT}Editing and committing nothing, report every commit in ${X}..${adoptHead}, oldest first: ` +
-    `the SHAs are the lines of \`git rev-list --reverse ${X}..${adoptHead}\`; for each, parents = the space-separated output of ` +
-    '`git show -s --format=%P <sha>` split into a list, every parent; ' +
-    'paths = run `git diff-tree --no-commit-id --no-renames --name-only -r -z <sha>` and split its output only on NUL, dropping the ' +
-    'terminal empty element; each complete filename is one JSON string, embedded newlines and whitespace preserved; ' +
-    'message = the output of `git log -1 --format=%B <sha>`, verbatim.',
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead}\` ` +
+    relayed('commits = []'),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   ).catch(e => { log(`adopt:audit errored — ${e && e.message}`); return null })
   const commits = audit ? audit.commits : []
@@ -1605,6 +1602,7 @@ if (adoptHead !== null) {
   const guarded = protectedRe ? [...new Set(paths.map(canon).filter(f => f && protectedRe.test(f)))] : []
   const signed = commits.find(c => attributionIn(c.message))
   const why = !audit ? 'the audit agent died'
+    : audit.error ? `the chain could not be read back: ${audit.error}`
     : !commits.length ? `no commits reported in ${X.slice(0, 7)}..${adoptHead.slice(0, 7)}`
     : shas.some(h => !FULL_SHA.test(h)) ? `a commit reported no full SHA: ${JSON.stringify(shas.find(h => !FULL_SHA.test(h)))}`
     : new Set(shas).size !== shas.length ? 'a commit is reported twice'

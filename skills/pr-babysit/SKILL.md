@@ -12,11 +12,17 @@ collected or contradict each other: the workflow refuses to publish, and the
 caller never fills in what is missing.
 
 ```bash
-H=~/.claude/skills/pr-babysit/scripts/hooks.py
-python3 $H 'src/a.c' 'docs/b.rst'   # from the checkout's top level
+S=~/.claude/skills/pr-babysit/scripts
+python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
+python3 $S/commits.py head 'src/a.c'         # the commit at HEAD and its scope
+python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SHAs
 ```
 
 `hooks.py` runs the repository's pre-commit hooks on the paths, once more if
 the first run fails, and reports the tree status and blob snapshots around
 them, with the ids of the hooks pre-commit itself said modified files. A marker
 a hook prints in its own output is not read as pre-commit's.
+
+`commits.py` reads back what commits hold: parents, paths, message, and for
+`head` the scope's leftover changes and tree entries. It reads HEAD once and
+refuses if HEAD moved meanwhile, so every fact is about one commit.

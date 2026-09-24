@@ -39,7 +39,11 @@ def git(*argv):
     done = subprocess.run(['git', *argv], capture_output=True)
     if done.returncode:
         raise Unusable(f"git {' '.join(argv)}: {done.stderr.decode(errors='replace').strip()}")
-    return done.stdout.decode()
+    try:
+        return done.stdout.decode()
+    except UnicodeDecodeError:
+        # Replacing the bad bytes could make two different paths read as one.
+        raise Unusable(f"git {' '.join(argv)}: output is not UTF-8")
 
 
 def status():
