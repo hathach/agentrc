@@ -285,6 +285,14 @@ async function run(opts = {}) {
       if (typeof opts.verify === 'function') return opts.verify(label)
       return structuredClone(opts.verify ?? { addresses: true, reason: 'verified' })
     }
+    if (label.startsWith('compat#')) {
+      assert.equal(options.agentType, 'finding-verifier')
+      // opts.compat is every check's verdict, a function of the label for one per
+      // check, or null for a dead verifier.
+      const over = typeof opts.compat === 'function' ? opts.compat(label) : opts.compat
+      if (over === null) return null
+      return conforms(options.schema, structuredClone(over ?? { compatible: true, evidence: 'no consumer relies on it' }), label)
+    }
     throw new Error(`unstubbed agent label ${label}`)
   }
   // Match the host: a thrown thunk or stage settles its slot to null, in place,
@@ -688,6 +696,58 @@ test('only live writers with a passing build are verified, and one bad group sti
   assert.match(outcomes(logs)[0], /withheld/)
   assert.match(outcomes(logs)[1], /unverified: targeted build failed: boom/)
   assert.match(outcomes(logs)[2], /^fixed/)
+})
+
+test('a batch that breaks, or may break, code relying on it is not published', async () => {
+  for (const [compat, why] of [
+    [{ compatible: false, evidence: 'test/hil/mtp_raw.py expects 0x2001' }, /unverified: breaks code that relies on it: test\/hil/],
+    [{ compatible: null, evidence: 'no search ran' }, /unverified: compatibility not established: no search ran/],
+    [null, /unverified: compatibility verifier died/],
+  ]) {
+    const { result, logs, labels } = await run({ reviews: twoValid, compat })
+    assert.equal(result.reason, 'fix-verification-failed')
+    assert.equal(labels.some(l => /^(recheck|commit|push)#/.test(l)), false, 'nothing is committed or pushed')
+    for (const o of outcomes(logs)) assert.match(o, why, 'every fix in the batch carries the reason')
+  }
+  const { result } = await run({ reviews: twoValid, throwOn: 'compat#' })
+  assert.equal(result.reason, 'fix-verification-failed', 'a thrown verifier is a dead one')
+})
+
+test('one compatibility check per batch sees every change and the writers\' notes, before anything is committed', async () => {
+  const { result, calls, labels } = await run({
+    reviews: twoValid, fix: (label) => ({ notes: `changed the status code in ${label.slice(4)}` }),
+  })
+  assert.equal(result.history[0].reviewPush.sha, shaFor(1), 'the checked batch is published')
+  const compat = calls.filter(c => c.label.startsWith('compat#'))
+  assert.deepEqual(compat.map(c => c.label), ['compat#1-review'])
+  assert.match(compat[0].prompt, /src\/a\.c, src\/b\.c/)
+  assert.match(compat[0].prompt, /changed the status code in src\/a\.c[\s\S]*changed the status code in src\/b\.c/)
+  assert.ok(labels.indexOf('compat#1-review') < labels.indexOf('recheck#1-review'))
+})
+
+test('consumers inside the batch\'s own files are searched too', async () => {
+  const { calls } = await run({ reviews: oneValid })
+  const prompt = calls.find(c => c.label.startsWith('compat#')).prompt
+  assert.match(prompt, /search the whole repository, those paths included/)
+})
+
+test('the CI lane gets its own compatibility check', async () => {
+  const { calls } = await run({
+    args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 },
+    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
+  })
+  assert.deepEqual(calls.filter(c => c.label.startsWith('compat#')).map(c => c.label), ['compat#1-ci'])
+})
+
+test('a batch already failing its own checks pays for no compatibility check', async () => {
+  const { labels } = await run({ reviews: oneValid, verify: { addresses: false, reason: 'no' } })
+  assert.equal(labels.some(l => l.startsWith('compat#')), false)
+})
+
+test('the writer keeps outside expectations and reports the change they would need', async () => {
+  const { calls } = await run({ reviews: oneValid })
+  assert.match(calls.find(c => c.label.startsWith('fix:')).prompt,
+    /never edit it or its assertion to fit; report the change it would need as out of scope/)
 })
 
 test('groups the overlap merge joins get one writer and one verifier, and every finding keeps its row', async () => {
@@ -3242,6 +3302,23 @@ test('a declared build-regenerated path is checked by the hooks, committed, audi
   assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ pushed, with regenerated hw\/bsp\/family\.json/)
   const both = await run({ ...regen, hooks: gen })
   assert.deepEqual(both.result.history[0].reviewPush.generated, [CATALOG, 'docs/boards.rst'])
+})
+
+test('build and hook output joining the batch is checked with it before the commit', async () => {
+  for (const [opts, generated] of [[{ ...publishing, hooks: gen }, ['docs/boards.rst']], [regen, [CATALOG]]]) {
+    const { result, calls, labels } = await run(opts)
+    assert.equal(result.history[0].reviewPush.pass, true)
+    const check = calls.find(c => c.label === 'compat#1-review-generated')
+    assert.ok(check, 'the widened candidate gets its own check')
+    for (const f of ['src/a.c', ...generated]) assert.ok(check.prompt.includes(f), `${f} is in the checked candidate`)
+    assert.ok(labels.indexOf('compat#1-review-generated') < labels.indexOf('commit#1-review'))
+    const broken = await run({ ...opts, compat: (label) => label.endsWith('-generated') ? { compatible: false, evidence: 'catalog drops a board' } : undefined })
+    assert.equal(broken.result.reason, 'push-failed')
+    assert.match(broken.result.history[0].reviewPushFailed.detail, /breaks code that relies on it: catalog drops a board/)
+    assert.ok(!broken.labels.some(l => l.startsWith('commit#')), 'nothing is committed')
+  }
+  const { labels } = await run(publishing)
+  assert.ok(!labels.some(l => l.endsWith('-generated')), 'no second check when nothing joined the batch')
 })
 
 test('the same modification is a stray without the declaration', async () => {
