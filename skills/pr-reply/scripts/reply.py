@@ -164,7 +164,7 @@ class Poster:
         """The comment as it stands now, not as the cached listing had it."""
         if kind == 'review-body':
             return api('GET', f'repos/{self.repo}/pulls/{self.pr}/reviews/{comment_id}')
-        return api('GET', f'repos/{self.repo}/{"pulls" if kind == "review" else "issues"}/comments/{comment_id}')
+        return self.read_reply(kind, comment_id)
 
     def read_reply(self, kind, reply_id):
         return api('GET', f'repos/{self.repo}/{"pulls" if kind == "review" else "issues"}/comments/{reply_id}')
@@ -319,37 +319,34 @@ def handle(poster, item):
     return rc
 
 
-def load_manifest(path):
+def load_entries(path, key, what, check):
+    """The non-empty `key` list of the JSON file at path, each entry passing check, one per commentId."""
     with open(path) as f:
         m = json.load(f)
-    replies = m.get('replies') if isinstance(m, dict) else None
-    if not isinstance(replies, list) or not replies:
-        raise ValueError('manifest needs a non-empty "replies" list')
+    entries = m.get(key) if isinstance(m, dict) else None
+    if not isinstance(entries, list) or not entries:
+        raise ValueError(f'{what} needs a non-empty "{key}" list')
     seen = set()
-    for r in replies:
-        if not isinstance(r.get('commentId'), int) or not isinstance(r.get('body'), str) or not r['body'].strip():
-            raise ValueError(f'bad manifest entry: {r!r}')
-        if not isinstance(r.get('digest'), str):
-            raise ValueError(f'manifest entry without a digest: {r!r}')
+    for r in entries:
+        if not isinstance(r, dict) or not isinstance(r.get('commentId'), int):
+            raise ValueError(f'bad {what} entry: {r!r}')
+        check(r)
         if r['commentId'] in seen:
             raise ValueError(f'commentId {r["commentId"]} listed twice')
         seen.add(r['commentId'])
-    return replies
+    return entries
 
 
-def load_reuses(path):
-    with open(path) as f:
-        m = json.load(f)
-    reuses = m.get('reuses') if isinstance(m, dict) else None
-    if not isinstance(reuses, list) or not reuses:
-        raise ValueError('reuse file needs a non-empty "reuses" list')
-    for r in reuses:
-        if not (isinstance(r, dict) and isinstance(r.get('commentId'), int) and isinstance(r.get('replyId'), int)
-                and isinstance(r.get('bodyDigest'), str) and isinstance(r.get('originalDigest'), str)):
-            raise ValueError(f'bad reuse entry: {r!r}')
-    if len({r['commentId'] for r in reuses}) != len(reuses):
-        raise ValueError('a commentId is listed twice')
-    return reuses
+def check_reply(r):
+    if not isinstance(r.get('body'), str) or not r['body'].strip():
+        raise ValueError(f'bad manifest entry: {r!r}')
+    if not isinstance(r.get('digest'), str):
+        raise ValueError(f'manifest entry without a digest: {r!r}')
+
+
+def check_reuse(r):
+    if not (isinstance(r.get('replyId'), int) and isinstance(r.get('bodyDigest'), str) and isinstance(r.get('originalDigest'), str)):
+        raise ValueError(f'bad reuse file entry: {r!r}')
 
 
 def pair(text):
@@ -375,8 +372,8 @@ def main(argv=None):
     if a.pr is None or (a.manifest, a.inspect, a.reuse) == (None, None, None):
         p.error('--pr and one of --manifest, --inspect or --reuse are required')
     try:
-        replies = load_manifest(a.manifest) if a.manifest else None
-        reuses = load_reuses(a.reuse) if a.reuse else None
+        replies = load_entries(a.manifest, 'replies', 'manifest', check_reply) if a.manifest else None
+        reuses = load_entries(a.reuse, 'reuses', 'reuse file', check_reuse) if a.reuse else None
     except (OSError, ValueError, json.JSONDecodeError) as e:
         print(f'reply.py: {e}', file=sys.stderr)
         return 2

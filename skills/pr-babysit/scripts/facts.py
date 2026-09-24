@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import re
 import subprocess
 
@@ -34,6 +35,14 @@ def run(*argv, ok=(0,)):
 
 def git(*argv):
     return run('git', *argv)[1]
+
+
+def checkout_top():
+    """The checkout's top level, Unusable unless it is the current directory."""
+    top = git('rev-parse', '--show-toplevel').strip()
+    if os.path.realpath(top) != os.path.realpath('.'):
+        raise Unusable(f'run from the checkout top level {top}, not {os.getcwd()}')
+    return top
 
 
 def report(collect, argv):

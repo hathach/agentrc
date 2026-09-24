@@ -19,7 +19,7 @@ python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py head 'src/a.c'         # the commit at HEAD and its scope
 python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SHAs
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
-python3 $S/build_compare.py candidate --command 'make -C <BUILD>' [--target T]
+python3 $S/build_compare.py candidate --path 'src/a.c' --command 'make -C <BUILD>'
 python3 $S/build_compare.py base --rev <sha> [--setup CMD] --command 'make -C <BUILD>'
 ```
 

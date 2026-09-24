@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Unusable, git, report  # noqa: E402
+from facts import Unusable, checkout_top, git, report  # noqa: E402
 
 CONFIG = '.pre-commit-config.yaml'
 HOOK_ID = '- hook id: '
@@ -108,9 +108,7 @@ def run_hooks(paths):
 def collect(paths):
     if not paths:
         raise Unusable('usage: hooks.py PATH...')
-    top = git('rev-parse', '--show-toplevel').strip()
-    if os.path.realpath(top) != os.path.realpath('.'):
-        raise Unusable(f'run from the checkout top level {top}, not {os.getcwd()}')
+    checkout_top()
     before = status()
     snapshot_before = snapshot(paths, before)
     ran, passed, ids = run_hooks(paths)

@@ -38,11 +38,9 @@ class BuildCompareTest(unittest.TestCase):
 
     def test_candidate_builds_the_checkout_as_it_stands_in_a_fresh_dir(self):
         (self.repo / 'src.c').write_text('int broken\n')
-        code, out = self.run_script('candidate', '--path=.', '--command', 'grep -q "int ok;" src.c && touch <BUILD>/out',
-                                    '--target', 'board_a', '--option', 'LOG=1')
+        code, out = self.run_script('candidate', '--path=.', '--command', 'grep -q "int ok;" src.c && touch <BUILD>/out')
         self.assertEqual(code, 0)
         self.assertEqual((out['side'], out['revision'], out['exit'], out['setupExit']), ('candidate', self.base, 1, None))
-        self.assertEqual((out['targets'], out['options']), (['board_a'], ['LOG=1']))
         self.assertIn(out['buildDir'], out['command'])
         self.assertNotIn('<BUILD>', out['command'])
         self.assertTrue(out['cleanup']['ok'])
@@ -82,8 +80,8 @@ class BuildCompareTest(unittest.TestCase):
 
     def test_a_retained_build_dir_is_reported(self):
         code, out = self.run_script('candidate', '--path=.', '--command', 'mkdir <BUILD>/ro && touch <BUILD>/ro/f && chmod 555 <BUILD>/ro')
-        self.addCleanup(lambda: subprocess.run(['chmod', '-R', 'u+w', out['buildDir']]) and None)
         self.addCleanup(lambda: subprocess.run(['rm', '-rf', out['buildDir']]))
+        self.addCleanup(lambda: subprocess.run(['chmod', '-R', 'u+w', out['buildDir']]))
         if os.geteuid() == 0:
             self.skipTest('root can remove a read-only directory')
         self.assertEqual((code, out['exit']), (0, 0))
@@ -100,8 +98,8 @@ class BuildCompareTest(unittest.TestCase):
         self.assertEqual(out['snapshot'], out['snapshotAfter'], 'a path outside the candidate may change')
 
     def test_values_may_start_with_a_dash(self):
-        code, out = self.run_script('candidate', '--path=src.c', '--command=true', '--option=-DBOARD=x', '--target=-weird')
-        self.assertEqual((code, out['options'], out['targets']), (0, ['-DBOARD=x'], ['-weird']))
+        code, out = self.run_script('candidate', '--path=-weird', '--command=true')
+        self.assertEqual((code, out['exit']), (0, 0), out)
 
     def test_a_filesystem_error_is_reported_and_cleaned_up(self):
         if os.geteuid() == 0:
@@ -130,7 +128,8 @@ class BuildCompareTest(unittest.TestCase):
             self.assertIn(why, out['error'])
         (self.repo / 'sub').mkdir()
         code, out = self.run_script('candidate', '--path=.', '--command', 'true', cwd=self.repo / 'sub')
-        self.assertEqual((code, out['error']), (2, "run from the checkout's top level"))
+        self.assertEqual(code, 2)
+        self.assertIn('run from the checkout top level', out['error'])
         self.assertEqual(len(self.git('worktree', 'list').splitlines()), 1)
 
 

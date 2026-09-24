@@ -2,9 +2,11 @@
 import importlib.util
 import io
 import json
+import os
 import re
+import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -115,23 +117,38 @@ class FakeGitHub:
             'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}}}), ''
 
 
-class ReplyTest(unittest.TestCase):
+class ReplyCase(unittest.TestCase):
+    """The fake GitHub and reply.py's entry point; no tests of its own."""
+
     def setUp(self):
         self.gh = FakeGitHub()
         patcher = mock.patch.object(reply, 'gh', self.gh.gh)
         patcher.start()
         self.addCleanup(patcher.stop)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
 
-    def run_script(self, replies, raw=False):
-        import tempfile
-        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
-            json.dump({'replies': replies if raw else [{'digest': reply.fnv1a(r['body']), **r} if isinstance(r.get('body'), str) else r
-                                                      for r in replies]}, f)
+    def json_file(self, obj):
+        fd, path = tempfile.mkstemp(suffix='.json', dir=self.tmp)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(obj, f)
+        return path
+
+    def main(self, *args):
         out = io.StringIO()
         with redirect_stdout(out):
-            rc = reply.main(['--pr', str(PR), '--manifest', f.name, '--repo', REPO])
+            rc = reply.main(['--pr', str(PR), '--repo', REPO, *args])
         lines = out.getvalue().strip().splitlines()
-        return rc, json.loads(lines[-1])['receipts'] if lines else []
+        return rc, json.loads(lines[-1]) if lines else None
+
+
+class ReplyTest(ReplyCase):
+    def run_script(self, replies, raw=False):
+        path = self.json_file({'replies': replies if raw else [{'digest': reply.fnv1a(r['body']), **r} if isinstance(r.get('body'), str) else r
+                                                               for r in replies]})
+        rc, out = self.main('--manifest', path)
+        return rc, out['receipts'] if out else []
 
     def test_review_reply_is_posted_read_back_and_resolved(self):
         self.gh.review_comment(10)
@@ -358,21 +375,11 @@ class ReplyTest(unittest.TestCase):
         self.assertLessEqual(methods, {'GET', 'POST'})
 
 
-class ReconcileTest(ReplyTest):
+class ReconcileTest(ReplyCase):
     """--inspect and --reuse: settle on a reply of ours already there, never posting."""
 
-    def main(self, *args):
-        out = io.StringIO()
-        with redirect_stdout(out):
-            rc = reply.main(['--pr', str(PR), '--repo', REPO, *args])
-        lines = out.getvalue().strip().splitlines()
-        return rc, json.loads(lines[-1]) if lines else None
-
     def reuse(self, *items):
-        import tempfile
-        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
-            json.dump({'reuses': list(items)}, f)
-        rc, out = self.main('--reuse', f.name)
+        rc, out = self.main('--reuse', self.json_file({'reuses': list(items)}))
         return rc, out['receipts'] if out else None
 
     def reworded(self):
@@ -485,12 +492,15 @@ class ReconcileTest(ReplyTest):
         with self.assertRaises(SystemExit) as e:
             self.main('--inspect', '20-901')
         self.assertEqual(e.exception.code, 2)
-        import tempfile
-        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
-            json.dump({'reuses': [{'commentId': 20, 'replyId': 901, 'bodyDigest': 'x'}]}, f)
-        self.assertEqual(self.main('--reuse', f.name)[0], 2)
+        path = self.json_file({'reuses': [{'commentId': 20, 'replyId': 901, 'bodyDigest': 'x'}]})
+        self.assertEqual(self.main('--reuse', path)[0], 2)
+        dup = {'commentId': 20, 'replyId': 901, 'bodyDigest': 'x', 'originalDigest': 'y'}
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(self.main('--reuse', self.json_file({'reuses': [dup, dup]}))[0], 2)
+        self.assertIn('commentId 20 listed twice', err.getvalue())
         with self.assertRaises(SystemExit):
-            self.main('--reuse', f.name, '--inspect', '20:901')
+            self.main('--reuse', path, '--inspect', '20:901')
 
 
 if __name__ == '__main__':

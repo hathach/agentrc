@@ -42,7 +42,10 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const seal = ({ digest, ...st }) => ({ ...st, digest: fnv1a(canonical(JSON.parse(JSON.stringify(st)))) })
-const manifestOf = (calls, label) => JSON.parse(calls.find(c => c.label === label).prompt.match(/Manifest: (\{.*\})$/)[1]).replies
+// The JSON a prompt ends with after `key: `, or its trailing list on a line of its own.
+const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`${key}: (\\{.*\\})$`))[1])
+const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
+const manifestOf = (calls, label) => payloadOf(calls.find(c => c.label === label).prompt, 'Manifest').replies
 // The nth commit a run makes. Each is distinct, as a real commit is, because the
 // audit rejects one whose SHA equals its parent.
 const shaFor = (n) => (SHA.slice(0, 38) + String(n).padStart(2, '0')).toLowerCase()
@@ -304,7 +307,7 @@ async function run(opts = {}) {
       assert.equal(options.agentType, 'finding-verifier')
       if (opts.covers === null) return null
       // opts.covers(findingId) is whether its issue covers it; true by default.
-      const ids = JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1)).map(x => x.findingId)
+      const ids = trailingList(prompt).map(x => x.findingId)
       return conforms(options.schema, { verdicts: ids.map(findingId => ({
         findingId, covers: opts.covers ? opts.covers(findingId) : true, reason: 'stub issue read',
       })) }, label)
@@ -324,14 +327,14 @@ async function run(opts = {}) {
       assert.equal(options.agentType, 'finding-verifier')
       // opts.answers(commentId) is the verdict on its reply; unanswered by default,
       // so a repair stands unless a case says the reply answers it.
-      const ids = JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1)).map(x => x.commentId)
+      const ids = trailingList(prompt).map(x => x.commentId)
       return conforms(options.schema, { verdicts: ids.map(commentId => ({
         commentId, answers: opts.answers ? opts.answers(commentId) : false, reason: 'stub verdict',
       })) }, label)
     }
     if (label.startsWith('reuse#')) {
       if (opts.reuse === null) return null
-      const { reuses } = JSON.parse(String(prompt).match(/Reuses: (\{.*\})$/)[1])
+      const { reuses } = payloadOf(prompt, 'Reuses')
       return conforms(options.schema, { receipts: reuses.map(u => ({
         commentId: u.commentId, kind: 'review', replyId: u.replyId, digest: u.bodyDigest,
         sent: false, posted: false, verified: true, resolved: true, error: null,
@@ -362,7 +365,7 @@ async function run(opts = {}) {
         side: name, revision: name === 'base' ? String(prompt).match(/--rev=([0-9a-f]{40})/)[1] : head,
         snapshot: name === 'base' ? null : 'snap', snapshotAfter: name === 'base' ? null : 'snap',
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? null,
-        targets: asked('target'), options: asked('option'), buildDir: '/tmp/b', setupExit: null, exit,
+        buildDir: '/tmp/b', setupExit: null, exit,
         log: `/tmp/${name}.log`, cleanup: { ok: true, retained: [], error: null },
         ...(typeof over === 'function' ? over(label) : over),
       }, label)
@@ -740,7 +743,7 @@ test('a batch whose build fails where the base builds is not published', async (
   assert.equal(labels.some(l => l.startsWith('push#')), false, 'the publisher is not dispatched')
   assert.ok(labels.includes('check:src/a.c'), 'the issue check runs whatever the writer\'s own build said')
   assert.deepEqual(labels.filter(l => l.startsWith('build:')), ['build:resolve#1-review', 'build:candidate#1-review', 'build:base#1-review', 'build:compare#1-review'])
-  assert.match(calls.find(c => c.label === 'build:base#1-review').prompt, new RegExp(`build_compare\\.py base --rev=${HEAD} --setup='tools/get_deps\\.py' --command='make -C <BUILD> all' --target='board_a'\``))
+  assert.match(calls.find(c => c.label === 'build:base#1-review').prompt, new RegExp(`build_compare\\.py base --rev=${HEAD} --setup='tools/get_deps\\.py' --command='make -C <BUILD> all'\``))
   assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: build regression against the base/)
   assert.equal(labels.some(l => l.startsWith('compat#')), false, 'no compatibility check on a broken batch')
 })
@@ -749,7 +752,7 @@ test('the batch build is resolved from the contract when the caller named none, 
   const resolved = await run({ reviews: twoValid })
   const resolve = resolved.calls.find(c => c.label === 'build:resolve#1-review')
   assert.match(resolve.prompt, /for a change to src\/a\.c, src\/b\.c\./)
-  assert.match(resolved.calls.find(c => c.label === 'build:candidate#1-review').prompt, /build_compare\.py candidate --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all' --target='board_a'`/)
+  assert.match(resolved.calls.find(c => c.label === 'build:candidate#1-review').prompt, /build_compare\.py candidate --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all'`/)
   assert.equal(resolved.labels.some(l => l.startsWith('build:base#')), false, 'a passing candidate needs no base')
   assert.equal(resolved.result.history[0].reviewPush.pass, true)
   const given = await run({ reviews: oneValid, args: { build: "make BOARD='x y' <BUILD>" } })
@@ -779,7 +782,6 @@ test('a build receipt counts only as the run that was asked for', async () => {
     [{ revision: 'f'.repeat(40) }, /the receipt is for candidate at fffffff, not candidate at/],
     [{ side: 'base', snapshot: null }, /the receipt is for base at/],
     [{ command: 'make other' }, /the receipt is for another command/],
-    [{ options: ['-O2'] }, /the receipt is for another command/],
     [{ snapshotAfter: null }, /no snapshot of the candidate/],
     [{ snapshotAfter: 'other' }, /the build changed src\/a\.c, which were verified before it/],
   ]) {
@@ -791,10 +793,11 @@ test('a build receipt counts only as the run that was asked for', async () => {
   assert.equal(result.reason, 'fix-verification-failed')
 })
 
-test('options that start with a dash reach the script as values', async () => {
-  const { calls, result } = await run({ reviews: oneValid, buildPlan: { options: ['-DBOARD=x'] } })
-  assert.match(calls.find(c => c.label === 'build:candidate#1-review').prompt, /--option='-DBOARD=x'`/)
-  assert.equal(result.history[0].reviewPush.pass, true)
+test('the declared targets and options go to the comparison, not the script', async () => {
+  const { calls } = await run({ reviews: oneValid, buildPlan: { options: ['-DBOARD=x'] }, candidate: { exit: 1 } })
+  assert.doesNotMatch(calls.find(c => c.label === 'build:candidate#1-review').prompt, /--target|--option/)
+  assert.match(calls.find(c => c.label === 'build:compare#1-review').prompt,
+    /Declared for this build \(the logs decide what actually ran\): \{"targets":\["board_a"\],"options":\["-DBOARD=x"\]\}/)
 })
 
 test('the caller\'s build still prepares the base with the repository\'s setup', async () => {
@@ -1288,6 +1291,13 @@ test('a run red only from accepted failures passes, listing them, and is never c
   assert.deepEqual(result.state.acceptedFailures, [accept()])
 })
 
+test('a green run is called green and lists no accepted failures', async () => {
+  const { result, logs } = await run({ reviews: { findings: [], replies: [], bots: 'reviewed' } })
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.equal('acceptedFailures' in result, false)
+  assert.ok(logs.some(l => /PR is green with no unresolved valid findings/.test(l)), logs.join('\n'))
+})
+
 test('accepted failures with replies still owed are not called green', async () => {
   const { logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()], maxCycles: 2 }, dropDoneIds: () => true,
     reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } })
@@ -1298,6 +1308,10 @@ test('accepted failures with replies still owed are not called green', async () 
 test('pending checks keep an accepted-only report from passing', async () => {
   const { result } = await run({ ci: { status: 'running', infraRerun: [], realFailures: [PVS] }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
   assert.notEqual(result.pass, true)
+  const rerun = await run({ ci: { status: 'red', infraRerun: ['build / flaky'], realFailures: [PVS] }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
+  assert.notEqual(rerun.result.pass, true)
+  assert.match(summaries(rerun.logs)[0], /^cycle 1 summary — CI red,/)
+  assert.doesNotMatch(summaries(rerun.logs)[0], /accepted failures only/, 'an infra re-run still settling is not accepted-only')
 })
 
 test('an accepted failure the watcher calls real is still not fixed', async () => {
@@ -2273,7 +2287,6 @@ const heldForRepair = (over = {}) => ({
   args: { autoPush: true, maxCycles: 2 },
   wrongBody: (id) => id === 2,
   reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
-  challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   ...over,
 })
 
@@ -2286,7 +2299,7 @@ test('a reply already there that answers every point settles the comment, postin
   assert.match(judged.prompt, /"reply":"answered already, in other words"/)
   const reuse = calls.find(c => c.label === 'reuse#2')
   assert.match(reuse.prompt, /--reuse <that file>/)
-  assert.deepEqual(JSON.parse(reuse.prompt.match(/Reuses: (\{.*\})$/)[1]).reuses,
+  assert.deepEqual(payloadOf(reuse.prompt, 'Reuses').reuses,
     [{ commentId: 2, replyId: 502, bodyDigest: fnv1a('answered already, in other words'), originalDigest: 'd2' }])
   assert.equal(calls.filter(c => c.label.startsWith('replies#')).length, 1, 'nothing reposted')
   assert.equal(result.state.debt.find(([id]) => id === 2), undefined, 'repair and debt cleared')
@@ -2520,8 +2533,7 @@ test('each verdict is kept in the state and handed to the validator on a resumed
   assert.deepEqual(d, { commentId: 1, digest: 'd1', reviewedSha: HEAD, file: 'src/a.c', line: 1, claim: 'bad', verdict: 'invalid', reason: 'the caller checks it' })
   const second = await run({ reviews: oneValid, args: { maxCycles: 3, state: first.result.state } })
   const prompt = second.calls.find(c => c.label.startsWith('reviews#')).prompt
-  assert.match(prompt, /Earlier verdicts: \[\{"findingId":"1#1","commentId":1,.*"verdict":"invalid","reason":"the caller checks it"\}\]/)
-  assert.match(prompt, /set related to that record's findingId/)
+  assert.match(prompt, /Earlier verdicts on this PR \(set related and changeReason against them per your procedure\): \[\{"findingId":"1#1","commentId":1,.*"verdict":"invalid","reason":"the caller checks it"\}\]/)
 })
 
 test('a verdict that flips without a reason is held: not fixed, not answered, still owed', async () => {
@@ -2607,6 +2619,20 @@ test('a held finding keeps its earlier decision through a new uncertainty and a 
     assert.equal(again.labels.some(l => l.startsWith('fix:')), false, `related ${rel}`)
     assert.ok(again.logs.some(l => /5#1 held — contradicts the earlier invalid verdict on 1#1/.test(l)), `related ${rel}`)
   }
+})
+
+test('a hold on an answered comment is named in every exit that lists what is owed', async () => {
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true },
+  })
+  const flipped = { findings: [finding()], replies: [], bots: 'reviewed' }
+  const yielded = await run({ reviews: flipped, args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
+  assert.deepEqual(yielded.result.state.debt, [], 'comment 1 is answered, so it accrues no debt')
+  assert.deepEqual(yielded.result.deferred, [1])
+  const spent = await run({ reviews: flipped, args: { maxCycles: 5, state: yielded.result.state } })
+  assert.equal(spent.result.reason, 'deferred-replies-unresolved')
+  assert.deepEqual(spent.result.deferred, [1])
 })
 
 test('a finding related to another comment keeps its own debt, and settling one does not settle the other', async () => {

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Build one side of pr-babysit's build comparison and report what ran.
 
-  build_compare.py candidate --path P... --command CMD [--target T]... [--option O]...
-  build_compare.py base --rev SHA [--setup CMD] --command CMD [--target T]... [--option O]...
+  build_compare.py candidate --path P... --command CMD
+  build_compare.py base --rev SHA [--setup CMD] --command CMD
 
 Pass values as --flag=VALUE when one may start with a dash. Run from the
 checkout's top level. `candidate` builds the checkout as it stands,
@@ -14,12 +14,11 @@ adds a detached temporary worktree at SHA, runs SETUP there (the dependency
 preparation a fresh checkout of the repository needs), builds, and removes the
 worktree; the checkout itself is not touched. Each side gets a
 fresh build directory, which `<BUILD>` in CMD or SETUP names, removed
-afterwards; the log of both commands is kept. Targets and options are the
-caller's account of what CMD builds, echoed so the receipt carries them.
+afterwards; the log of both commands is kept.
 
 stdout ends with one JSON line {side, revision, snapshot, snapshotAfter,
-command, setup, targets, options, buildDir, setupExit, exit, log, cleanup: {ok,
-retained, error}}: revision is HEAD or SHA, both snapshots null for the base,
+command, setup, buildDir, setupExit, exit, log, cleanup: {ok, retained,
+error}}: revision is HEAD or SHA, both snapshots null for the base,
 command and setup with <BUILD> expanded, setupExit null without SETUP, exit the build's status or
 null when the setup failed and the build never ran. Exit 0 with that line,
 whatever the build did; exit 2 with {"error": ...} when the side could not be
@@ -35,7 +34,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, git, report  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, checkout_top, git, report  # noqa: E402
 
 LOGS = Path(tempfile.gettempdir()) / 'pr-babysit-builds'
 
@@ -67,8 +66,6 @@ def collect(argv):
     p.add_argument('--setup')
     p.add_argument('--path', action='append', default=[])
     p.add_argument('--command', required=True)
-    p.add_argument('--target', action='append', default=[])
-    p.add_argument('--option', action='append', default=[])
     a = p.parse_args(argv)
     if a.side == 'base' and not (a.rev and FULL_SHA.match(a.rev)):
         raise Unusable('base needs --rev <full SHA>')
@@ -76,9 +73,7 @@ def collect(argv):
         raise Unusable('candidate builds the checkout as it stands: no --rev or --setup')
     if (a.side == 'candidate') != bool(a.path):
         raise Unusable('--path names the candidate\'s sources, and only the candidate\'s')
-    top = git('rev-parse', '--show-toplevel').strip()
-    if Path(top).resolve() != Path.cwd().resolve():
-        raise Unusable("run from the checkout's top level")
+    top = checkout_top()
 
     LOGS.mkdir(exist_ok=True)
     fd, log = tempfile.mkstemp(prefix=f'{a.side}-', suffix='.log', dir=LOGS)
@@ -121,8 +116,7 @@ def collect(argv):
         c = cleanup()
         raise Unusable(str(e) if c['ok'] else f"{e}; cleanup left {c['retained']} {c['error'] or ''}".rstrip())
     return {'side': a.side, 'revision': revision, 'snapshot': snap, 'snapshotAfter': after, 'command': expand(a.command),
-            'setup': expand(a.setup) if a.setup else None, 'targets': a.target, 'options': a.option,
-            'buildDir': build, 'setupExit': setup_exit, 'exit': build_exit, 'log': log, 'cleanup': cleanup()}
+            'setup': expand(a.setup) if a.setup else None, 'buildDir': build, 'setupExit': setup_exit, 'exit': build_exit, 'log': log, 'cleanup': cleanup()}
 
 
 if __name__ == '__main__':
