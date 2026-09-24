@@ -1,4 +1,5 @@
 import json
+import re
 import tomllib
 import unittest
 from pathlib import Path
@@ -20,6 +21,14 @@ class AgentFiles(unittest.TestCase):
                     toml = tomllib.loads((AGENTS / f'{stem}.toml').read_text())
                     self.assertEqual(toml['name'], stem)
                     self.assertIn(f'~/.codex/agents/{stem}.md', toml['developer_instructions'])
+
+    def test_chief_accepts_the_changed_criteria_hw_debugger_reports_on(self):
+        """chief cannot read hw-debugger.md, so each carries the list of what counts
+        as a changed round; the two copies must not drift."""
+        lists = [re.search(r'a valid first reproduction;[^.]*?demonstrated', (AGENTS / f'{name}.md').read_text())
+                 for name in ('chief', 'hw-debugger')]
+        self.assertTrue(all(lists), 'the criteria list is no longer found')
+        self.assertEqual(lists[0][0], lists[1][0])
 
     def test_pr_review_validator_keeps_the_keys_tinyusb_dismissals_are_keyed_on(self):
         """tinyusb's pr-babysit keys dismissal debt on findingId and detects

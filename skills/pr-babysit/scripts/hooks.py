@@ -17,11 +17,14 @@ Exit 0 with that line; exit 2 with {"error": ...} when the facts cannot be
 collected or pre-commit's output contradicts its exit status.
 """
 
-import json
 import os
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+from facts import Unusable, git, report  # noqa: E402
 
 CONFIG = '.pre-commit-config.yaml'
 HOOK_ID = '- hook id: '
@@ -29,21 +32,6 @@ MODIFIED = '- files were modified by this hook'
 # pre-commit pads a hook's name with dots to its result, then prints the
 # hook's `- ` block only when it failed or runs verbose (commands/run.py).
 RESULT = re.compile(r'\.(Passed|Failed)$')
-
-
-class Unusable(Exception):
-    pass
-
-
-def git(*argv):
-    done = subprocess.run(['git', *argv], capture_output=True)
-    if done.returncode:
-        raise Unusable(f"git {' '.join(argv)}: {done.stderr.decode(errors='replace').strip()}")
-    try:
-        return done.stdout.decode()
-    except UnicodeDecodeError:
-        # Replacing the bad bytes could make two different paths read as one.
-        raise Unusable(f"git {' '.join(argv)}: output is not UTF-8")
 
 
 def status():
@@ -118,6 +106,8 @@ def run_hooks(paths):
 
 
 def collect(paths):
+    if not paths:
+        raise Unusable('usage: hooks.py PATH...')
     top = git('rev-parse', '--show-toplevel').strip()
     if os.path.realpath(top) != os.path.realpath('.'):
         raise Unusable(f'run from the checkout top level {top}, not {os.getcwd()}')
@@ -129,18 +119,5 @@ def collect(paths):
             'snapshotBefore': snapshot_before, 'snapshotAfter': snapshot(paths, after)}
 
 
-def main(argv):
-    if not argv:
-        print(json.dumps({'error': 'usage: hooks.py PATH...'}))
-        return 2
-    try:
-        facts = collect(argv)
-    except Unusable as e:
-        print(json.dumps({'error': str(e)}))
-        return 2
-    print(json.dumps(facts))
-    return 0
-
-
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:]))

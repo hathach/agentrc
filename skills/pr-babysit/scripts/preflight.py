@@ -14,33 +14,16 @@ stdout ends with one JSON line with exactly those keys. Exit 0 with it; exit 2
 with {"error": ...} when git or gh cannot answer; the caller then pins nothing.
 """
 
-import argparse
 import json
-import subprocess
 import sys
+from pathlib import Path
 
-
-class Unusable(Exception):
-    pass
-
-
-class Parser(argparse.ArgumentParser):
-    def error(self, message):
-        raise Unusable(f'usage: {message}')
-
-
-def run(*argv, ok=(0,)):
-    done = subprocess.run(argv, capture_output=True)
-    if done.returncode not in ok:
-        raise Unusable(f"{' '.join(argv)}: {done.stderr.decode(errors='replace').strip()}")
-    try:
-        return done.returncode, done.stdout.decode()
-    except UnicodeDecodeError:
-        raise Unusable(f"{' '.join(argv)}: output is not UTF-8")
+sys.path.insert(0, str(Path(__file__).parent))
+from facts import Parser, Unusable, git, report, run  # noqa: E402
 
 
 def pin(pr):
-    branch = run('git', 'rev-parse', '--abbrev-ref', 'HEAD')[1].strip()
+    branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
     fields = 'headRefName,headRefOid,headRepositoryOwner,headRepository,url'
     try:
         view = json.loads(run('gh', 'pr', 'view', str(pr), '--json', fields)[1])
@@ -53,24 +36,18 @@ def pin(pr):
     # Git alone says whether the branch tracks anything (a remote without a merge
     # ref does not); the config names the remote whole, a `/` in it included.
     tracks = not run('git', 'rev-parse', '--abbrev-ref', '@{u}', ok=(0, 128))[0]
-    remote = run('git', 'config', '--get', f'branch.{branch}.remote')[1].strip() if tracks else ''
-    urls = run('git', 'remote', 'get-url', '--push', '--all', remote)[1].splitlines() if remote else []
+    remote = git('config', '--get', f'branch.{branch}.remote').strip() if tracks else ''
+    urls = git('remote', 'get-url', '--push', '--all', remote).splitlines() if remote else []
     return {'branch': branch, **pr_facts, 'remote': remote, 'pushUrls': urls,
-            'head': run('git', 'rev-parse', 'HEAD')[1].strip(),
-            'dirty': run('git', 'status', '--porcelain')[1].splitlines()}
+            'head': git('rev-parse', 'HEAD').strip(),
+            'dirty': git('status', '--porcelain').splitlines()}
 
 
-def main(argv):
-    try:
-        p = Parser(prog='preflight.py', add_help=False)
-        p.add_argument('--pr', type=int, required=True)
-        facts = pin(p.parse_args(argv).pr)
-    except Unusable as e:
-        print(json.dumps({'error': str(e)}))
-        return 2
-    print(json.dumps(facts))
-    return 0
+def collect(argv):
+    p = Parser(prog='preflight.py', add_help=False)
+    p.add_argument('--pr', type=int, required=True)
+    return pin(p.parse_args(argv).pr)
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:]))

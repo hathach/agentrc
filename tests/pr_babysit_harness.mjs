@@ -261,8 +261,7 @@ async function run(opts = {}) {
       return { sha: made, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...opts.audit }
     }
     if (label.startsWith('push#')) {
-      // This stage may not commit and is handed the SHA, so it reports only
-      // whether the send worked; the workflow supplies committed and sha.
+      // push.py's receipt; the workflow supplies committed and sha.
       if (opts.push === null) return receiptOf(head, undefined, 'push rejected', false)
       const push = conforms(options.schema, { ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }, label)
       if (push.pushed) head = made // the pushed commit is where the checkout now sits
@@ -561,12 +560,11 @@ test('a tracked remote that is not the PR head repository refuses', async () => 
 })
 
 test('a preflight the script could not pin stops the run with its error', async () => {
-  const { result, labels, calls } = await run({ reviews: oneValid, preflight: { error: 'gh pr view 3888: unexpected answer' } })
+  const { result, labels } = await run({ reviews: oneValid, preflight: { error: 'gh pr view 3888: unexpected answer' } })
   assert.equal(result.reason, 'preflight-failed')
   assert.equal(result.detail, 'gh pr view 3888: unexpected answer')
   assert.equal(result.cycles, 0)
   assert.deepEqual(labels, ['preflight'])
-  assert.ok(calls[0].prompt.includes('preflight.py --pr 3888`'), calls[0].prompt)
 })
 
 test('a dead preflight stops the run with nothing else dispatched', async () => {
@@ -2628,7 +2626,7 @@ test('an unpublished adoption without autoPush is a zero-cycle dry run', async (
   assert.deepEqual(labels, ['preflight', 'adopt:audit'])
   assert.equal(result.state.cyclesUsed, before.cyclesUsed)
   assert.equal(result.state.expectedHead, HEAD)
-  assert.deepEqual(result.state.history, before.history)
+  assert.deepEqual(result.state.last, before.last)
   assert.deepEqual(result.state.debt, before.debt)
   assert.deepEqual(state, before, 'the supplied state itself is not mutated')
 })
@@ -2661,7 +2659,7 @@ test('an omitted intermediate commit or a list not ending at the candidate is re
     assert.equal(typeof result.detail, 'string')
     assert.deepEqual(labels, ['preflight', 'adopt:audit'])
     assert.equal(result.state.cyclesUsed, state.cyclesUsed)
-    assert.deepEqual(result.state.history, state.history)
+    assert.deepEqual(result.state.last, state.last)
   }
 })
 
@@ -2709,7 +2707,7 @@ test('adoption keeps ordinary preflight refusals ahead of its own checks', async
     assert.equal(result.reason, reason)
     assert.deepEqual(labels, ['preflight'], `${reason}: the audit is later in preflight`)
     assert.equal(result.state.cyclesUsed, state.cyclesUsed)
-    assert.deepEqual(result.state.history, state.history)
+    assert.deepEqual(result.state.last, state.last)
   }
   for (const preflight of [null]) {
     const state = adoptionState()
@@ -2801,7 +2799,7 @@ test('protected modifications, deletions, and either side of a rename fail adopt
     ['a name with a newline, kept whole', ['protected/\nconfig.json']],
   ]) {
     const state = adoptionState({ protected: '^protected/' })
-    const { result, labels, calls } = await run({
+    const { result, labels } = await run({
       args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
       adoptAudit: { commits: [adoptCommit(ADOPT, [HEAD], paths)] },
     })
@@ -2925,7 +2923,7 @@ test('an exhausted budget refuses adoption before preflight', async () => {
   assert.equal(result.reason, 'budget-exhausted')
   assert.deepEqual(labels, [])
   assert.equal(result.state.cyclesUsed, 2)
-  assert.deepEqual(result.state.history, state.history)
+  assert.deepEqual(result.state.last, state.last)
 })
 
 test('a continuation after adoption omits adoptHead and advances normally', async () => {
@@ -3152,7 +3150,10 @@ test('a commit the audit script cannot read back is not pushed', async () => {
 })
 
 test('a hook script that reports no evidence stops publication with its error', async () => {
-  const { result, labels } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
+  const { result, labels, calls } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
+  assert.match(calls.find(c => c.label === 'hooks#1-review').prompt,
+    /as error, with ran = false, passed = false, modifiedBy = \[\], before = \[\], after = \[\], snapshotBefore = \[\], snapshotAfter = \[\]\.$/,
+    'the error-case values come from the schema')
   assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
   assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')
 })
@@ -3174,12 +3175,10 @@ test('a commit whose audit died is a pending candidate with an unknown SHA', asy
 
 // --- the commit message: the human is the sole author ---
 
-test('the committer is told the authorship rule and the audit reads the message back', async () => {
+test('the committer is told the authorship rule', async () => {
   const { calls } = await run({ ...publishing })
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.match(commit.prompt, /no Co-Authored-By, Claude-Session, Generated-with or the like: the repository's human is the sole author/)
-  const audit = calls.find(c => c.label === 'audit#1-review')
-  assert.match(audit.prompt, /commits\.py head /)
 })
 
 test('a commit whose message credits an agent, model, tool or session is never pushed', async () => {

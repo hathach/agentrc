@@ -333,16 +333,15 @@ const HOOKS = {
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
 }
+// Read NUL-separated: porcelain would otherwise quote a name holding a space or a quote.
+const STATUS_RECIPE = "git status --porcelain -z | tr '\\0' '\\n'"
 // One `<mode> <blob> <path>` line per path, as HOOKS_SCRIPT reports the
-// working tree and the audit reports the commit (`git ls-tree` spells it
+// working tree and COMMITS_SCRIPT the commit (`git ls-tree` spells it
 // `<mode> blob <sha>\t<path>`). The working-tree mode is git's, 644 or 755 by
 // the executable bit, since the filesystem's own bits (664, 775) are not what
 // git stores; ls-tree's 100644 compares on its last three digits, so a
 // symlink (120000) never matches and stops publication. A path that does not
 // exist is `absent`, so a deletion is evidence too, not a missing line.
-// Every path goes through `-z` and NUL-to-newline: with a space or a quote in
-// the name, porcelain and ls-tree would otherwise quote it and ls-tree not.
-const STATUS_RECIPE = "git status --porcelain -z | tr '\\0' '\\n'"
 const snapshotOf = (lines) => {
   const out = new Map()
   for (const l of lines) {
@@ -390,9 +389,16 @@ const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
 const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 // How a fact collector's agent relays the script's last stdout line, and what it
-// says when there is no line or the line is an error.
-const relayed = (empty) => 'and return the JSON object on its last stdout line unchanged. ' +
-  `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty}.`
+// fills the schema's required fields with when there is no line or it is an error.
+const relayed = (schema) => {
+  const EMPTY = { boolean: 'false', string: "''", array: '[]' }
+  const empty = schema.required.map(k => {
+    if (!(schema.properties[k].type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
+    return `${k} = ${EMPTY[schema.properties[k].type]}`
+  })
+  return 'and return the JSON object on its last stdout line unchanged. ' +
+    `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
+}
 // The body's checksum rides in the manifest and comes back in the receipt, so a
 // body the posting agent transcribed wrong is refused by the script and a
 // receipt for a different body is refused here. Same function in reply.py.
@@ -919,7 +925,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   const quoted = checked.map(f => `'${f}'`).join(' ')
   const hooks = await agent(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
-    relayed('ran = false, passed = false and every list empty'),
+    relayed(HOOKS),
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
   ).catch(e => { log(`hooks#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
@@ -993,7 +999,7 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // misreporting and a tree that moved underneath, not a determined lie.
   const seen = await agent(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(f => `'${f}'`).join(' ')}\` ` +
-    relayed("sha = '', message = '' and every list empty"),
+    relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
@@ -1050,7 +1056,7 @@ const pushExact = async (sha, label, prToo = false) => {
     `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
     `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.branch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
-    relayed("pushed = false, detail = '' and heads = []"),
+    relayed(PUSH),
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH },
   ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
   if (!r) return null
@@ -1542,7 +1548,7 @@ if (cyclesUsed >= maxCycles) {
 }
 const pinned = await agent(
   `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}\` ` +
-  relayed("every string '' and every list empty"),
+  relayed(PIN),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 ).catch(e => { log(`preflight errored — ${e && e.message}`); return null })
 if (!pinned) return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-died' })
@@ -1618,7 +1624,7 @@ if (adoptHead !== null) {
   }
   const audit = await agent(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead}\` ` +
-    relayed('commits = []'),
+    relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   ).catch(e => { log(`adopt:audit errored — ${e && e.message}`); return null })
   const commits = audit ? audit.commits : []

@@ -56,7 +56,7 @@ class PushTest(unittest.TestCase):
             argv += ['--pr', str(pr)]
         out = io.StringIO()
         with redirect_stdout(out):
-            code = push.main(argv)
+            code = push.report(push.publish, argv)
         return code, json.loads(out.getvalue().splitlines()[-1])
 
     def test_a_push_that_lands_reads_back_the_sha(self):
@@ -105,7 +105,7 @@ class PushTest(unittest.TestCase):
                            (['--remote', 'origin', '--branch', 'fix', '--sha', 'HEAD', '--push-url', self.a], 'not a full SHA')):
             out = io.StringIO()
             with redirect_stdout(out):
-                self.assertEqual(push.main(argv), 2)
+                self.assertEqual(push.report(push.publish, argv), 2)
             self.assertIn(want, json.loads(out.getvalue())['error'])
 
     def fake_gh(self, script):

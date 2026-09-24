@@ -19,27 +19,20 @@ that line; exit 2 with {"error": ...} when the arguments are wrong or R's push
 URLs changed, and then nothing was pushed.
 """
 
-import argparse
-import json
-import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-FULL_SHA = re.compile(r'^[0-9a-f]{40}$')
-PR_TRIES, PR_WAIT = 5, 3  # seconds between reads of the PR head
+sys.path.insert(0, str(Path(__file__).parent))
+from facts import FULL_SHA, Parser, Unusable, report  # noqa: E402
 
-
-class Unusable(Exception):
-    pass
-
-
-class Parser(argparse.ArgumentParser):
-    def error(self, message):
-        raise Unusable(f'usage: {message}')
+PR_TRIES = 5
+PR_WAIT = 3  # seconds between reads of the PR head
 
 
 def run(*argv):
+    """Unlike facts.run, a failure here is part of the receipt, not an error."""
     done = subprocess.run(argv, capture_output=True, text=True, errors='replace')
     return done.returncode, done.stdout, done.stderr
 
@@ -89,15 +82,5 @@ def publish(argv):
     return receipt
 
 
-def main(argv):
-    try:
-        receipt = publish(argv)
-    except Unusable as e:
-        print(json.dumps({'error': str(e)}))
-        return 2
-    print(json.dumps(receipt))
-    return 0
-
-
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(report(publish, sys.argv[1:]))

@@ -53,7 +53,7 @@ class PreflightTest(unittest.TestCase):
     def pin(self, *argv):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = preflight.main(list(argv) or ['--pr', '7'])
+            code = preflight.report(preflight.collect, list(argv) or ['--pr', '7'])
         return code, json.loads(out.getvalue().splitlines()[-1])
 
     def test_pins_the_checkout_and_the_pr_in_the_flat_shape(self):

@@ -133,14 +133,13 @@ const reason = !verified.pass ? 'verify-failed'
 if (reason) log(`verify: ${reason} — ${verified.detail}`)
 const review = 'review rounds via coworker read-only lanes; a Codex finding naming reviewed SHA, command and observed failure goes to code-writer to reproduce before editing, every other finding to finding-verifier before a fix'
 const v = triage.validate
-const first = 'confirm the implement notes carry hook evidence, then one simplification challenge on a read-only coworker lane; '
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
-  : v && v.args
-    ? `${first}Workflow /${v.name} ${JSON.stringify(v.args)}; clean its artifacts out of the checkout; ${review}; /${v.name} again if HEAD moved; then the human opens the PR`
+  : 'confirm the implement notes carry hook evidence, then one simplification challenge on a read-only coworker lane; ' + (v && v.args
+    ? `Workflow /${v.name} ${JSON.stringify(v.args)}; clean its artifacts out of the checkout; ${review}; /${v.name} again if HEAD moved; then the human opens the PR`
     : v
-      ? `${first}workflow /${v.name} cannot run with repairs and its own reviews disabled (${v.limitation}) — launch its component stages separately, one read-only stage at a time; clean their artifacts; ${review}; those stages again if HEAD moved; then the human opens the PR`
-      : `${first}no validation workflow named by the repository's instructions — ${verify} is the only check; ${review}; that check again if HEAD moved; then the human opens the PR`
+      ? `workflow /${v.name} cannot run with repairs and its own reviews disabled (${v.limitation}) — launch its component stages separately, one read-only stage at a time; clean their artifacts; ${review}; those stages again if HEAD moved; then the human opens the PR`
+      : `no validation workflow named by the repository's instructions — ${verify} is the only check; ${review}; that check again if HEAD moved; then the human opens the PR`)
 return {
   pass: !reason, reason, target, issue: triage.issue, kind: triage.kind, disposition: triage.disposition,
   triage, implement: dev, commits: verified.commits, verify: verified, validate: triage.validate, next,
