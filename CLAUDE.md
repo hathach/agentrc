@@ -39,6 +39,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   system configs) without asking for permission or a password.
 - Still confirm with me before destructive or irreversible actions
   (deleting data, wiping/formatting, force-overwriting configs)
+- Hardware operations within an assigned task (rig repair, roster edits,
+  host USB recovery, forced-lock recovery) need task scope, not a separate
+  grant; follow the project's locking, recovery and cleanup procedures.
+  That scope never authorizes destroying unrelated data, and a headless
+  session still needs me for a host or VM reboot.
 - Worktrees: for branch or multi-step work use a worktree under
   `.worktrees/<branch>`; never switch the primary checkout. Reuse the task's
   existing worktree; create one (`git worktree add .worktrees/<branch> -b
@@ -131,6 +136,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   `co-review` the findings and apply only what verifies, run the applicable
   checks, including hardware validation under Working rules, `co-review`
   the diff that applying them made, then ask for a full review.
+  In a `chief` session, chief's own sequence (commit check, one
+  simplification pass, validation, whole-task review) replaces this
+  paragraph's per-step review and `/simplify` mechanics, and chief's
+  hardware guard stands in for the citation rule; every other instruction
+  here still applies.
 - `co-fix`: for a task without a plan, do it, then take its diff through the
   same rounds before reporting it done.
 - `co-test`: have the other agent write the tests from the brief while you
@@ -160,8 +170,10 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   one (never a session URL) and preserve the full handoff in the issue body:
   evidence, remaining work, and why deferred. Add revalidation, new findings
   and changes to remaining work as issue comments. Close the issue when its
-  implementing PR lands. Without a tracker, put the same handoff in the final
-  message.
+  implementing PR lands and its acceptance criteria are met. Without a
+  tracker, or without authority to publish to it (a headless session), put
+  the same issue-ready handoff in the final message and name the action
+  that needs my authorization.
 
 # Reference docs
 - Hardware manuals, datasheets, reference manuals, errata, schematics and spec
