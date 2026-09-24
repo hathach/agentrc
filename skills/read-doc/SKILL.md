@@ -27,7 +27,8 @@ directory:
 ```
 
 Absent → the skill does not apply; fall back to normal sources silently (don't
-mention the library unless the user named it).
+mention the library unless the user named it). For a claim record (below),
+report the failed gate as unavailable instead of silently falling back.
 
 ## When to use
 
@@ -172,6 +173,24 @@ repeats one.
 python3 <skill dir>/scripts/history.py list [--session PREFIX] [--term TEXT] [--since YYYY-MM-DD]
 python3 <skill dir>/scripts/history.py show <id>   # the record, and a command that repeats it
 ```
+
+## Reporting a claim
+
+When a lookup decides whether a claim or a proposed change holds, such as a
+review finding, record one outcome per claim:
+
+- **verified** or **refuted**: book id, title, revision, section, page and
+  lookup ids, and the reasoning that ties them to the claim. For a proposed
+  change, explain how the source change preserves the cited semantics for
+  every affected variant, or where it breaks them.
+- **undocumented in the checked sources**: after searching and reading the
+  relevant pages of the base document, the errata and any applicable IP-core
+  documentation of every affected part; name the books, terms and lookup ids,
+  and the premise nothing supports.
+- **unavailable**: exit 3, a `MISSING` file or a failed gate; the attempted
+  command, its diagnostic and the lookup id when one was logged.
+- **pending**: the lookup did not run or did not finish, an exit 2 not yet
+  corrected and retried included. Never report it as undocumented.
 
 ## Common mistakes
 

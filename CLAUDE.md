@@ -120,29 +120,30 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   elsewhere). It applies regardless of change size, file type or task entry
   point; trivial-task judgment does not waive it, and ordinary review rounds
   and the automatic turn-level `simplify-gate` hook do not replace it.
-  A finding whose safety depends on hardware
-  semantics (register side effects, access width or order, barriers,
-  timing, DMA or cache, chip workarounds), or that either side suspects may
-  depend on them, verifies only with a `read-doc` citation, document
-  revision and section, showing the change preserves those semantics for
-  every affected variant; without one it stays unapplied and reported.
-  `co-review` the findings, a no-findings result included, and apply only
-  what verifies; run the applicable checks, including hardware validation
-  under Working rules; `co-review` the diff that applying them made, if any,
-  which needs no new Phase 1; then ask for a full review. Coverage of
-  unchanged content carries over to later triggers; a later change gets this
-  sequence again for what changed, with the whole task as context, and any
-  checks its changed inputs require. State its outcome in the completion
-  report; a stage that could not run is pending, never done.
+  The Phase 1 brief asks reviewers to name, for a hardware flag, the
+  operation the change could alter (register side effects, access width,
+  count or order, barriers, timing, DMA or cache, chip workarounds). Each
+  finding whose safety depends on hardware semantics, or that either side
+  suspects does, gets a `read-doc` review of every affected variant before
+  the co-review, run or assigned by the lead; it verifies only with a
+  verified outcome in `read-doc`'s claim record. `co-review` the findings and
+  their records, a no-findings result included, and apply only what verifies
+  and is worth applying; run the applicable checks, including hardware
+  validation under Working rules; `co-review` the diff that applying them
+  made, if any, which needs no new Phase 1; then ask for a full review.
+  Coverage of unchanged content carries over to later triggers; a later change
+  gets this sequence again for what changed, with the whole task as context,
+  and any checks its changed inputs require. State its outcome in the
+  completion report; a stage that could not run is pending, never done.
   An authorized `pr-babysit` with `autoPush: true` may publish its own
   repairs, not commits adopted through `adoptHead`, before their completion
   review; each launch that made repairs is followed by this sequence on them
   before relaunching, publishing further task changes or reporting done, as
   the workflow's `whenToUse` details.
-  In a `chief` session, chief's own sequence (commit check, one
-  simplification pass, validation, whole-task review) replaces the per-step
-  review and this bullet, and chief's hardware guard stands in for the
-  citation rule; every other instruction here still applies.
+  In a `chief` session, chief's own sequence (commit check, one simplification
+  pass, validation, whole-task review) replaces the per-step review and this
+  bullet, and chief's hardware guard stands in for this bullet's apply rule;
+  every other instruction here still applies.
 - The agent leading my task owns the exchanges below; a coworker answering
   one returns its result rather than commissioning its own. When I say one
   of the words below, it holds for that task.
@@ -195,5 +196,7 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   sheets are archived in my Calibre library. Before answering
   register/bitfield/pinout/errata/timing questions from memory or the web, use
   the `read-doc` skill to check it and report if the document is missing.
+  Report a fact as undocumented only after the lookup ran; one not run is
+  pending.
 - Never search the library tree directly; the skill owns its location and
   search.

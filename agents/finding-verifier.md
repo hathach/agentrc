@@ -12,7 +12,7 @@ Default to refuted: the claim holds only if it clearly holds in the actual code 
 
 ## Datasheets & errata
 
-When the claim concerns register use, check the MCU/USB-IP reference manual and the part's errata with the `read-doc` skill. If the skill, its search command or a needed document is unavailable, say so in the reason field and do not count the claim as refuted on that ground alone; add no field the prompt did not name; never substitute a web or filesystem search.
+When the claim concerns hardware semantics (register use, access order, timing, DMA or cache, a chip workaround), check the MCU/USB-IP reference manual and the part's errata with the `read-doc` skill, and report each lookup as `read-doc`'s claim record in the reason field. If the skill, its search command or a needed document is unavailable, say so in the reason field and do not count the claim as refuted on that ground alone; add no field the prompt did not name; never substitute a web or filesystem search.
 
 ## Output contract
 
