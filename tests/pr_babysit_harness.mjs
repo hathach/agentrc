@@ -173,7 +173,16 @@ async function run(opts = {}) {
       const over = typeof opts.recheck === 'function' ? opts.recheck(label) : opts.recheck
       return patch({ ...RECHECK, head }, over)
     }
-    if (label.startsWith('ci#')) return conforms(options.schema, structuredClone(ci), 'ci')
+    if (label.startsWith('ci#')) {
+      // A fixture names what its case is about; the rest of the watcher's report
+      // is the plain case: this run's head, one run, every failure of a job listed.
+      const c = structuredClone(ci)
+      if (c && Array.isArray(c.realFailures)) {
+        c.headSha ??= head
+        c.realFailures = c.realFailures.map(rf => ({ workflow: 'ci', job: rf.check, cell: null, signature: rf.firstError, runId: 1, complete: true, ...rf }))
+      }
+      return conforms(options.schema, c, 'ci')
+    }
     if (label.startsWith('reviews#')) {
       if (reviews instanceof Error) throw reviews
       const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle() : reviews)
@@ -1081,9 +1090,100 @@ test('ciNotes reach the watcher prompt verbatim, and only when given', async () 
 test('the CI contract names the three verdicts and nothing else', async () => {
   const { calls } = await run({})
   const item = calls.find(c => c.label === 'ci#1').schema.properties.realFailures.items
-  assert.deepEqual(item.required, ['check', 'firstError', 'files', 'verdict'])
+  assert.deepEqual(item.required, ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'])
+  assert.deepEqual(calls.find(c => c.label === 'ci#1').schema.required, ['headSha', 'status', 'infraRerun', 'realFailures'])
   assert.deepEqual(item.properties.verdict.enum, ['real', 'rig-side', 'unclassified'])
   assert.equal(item.additionalProperties, false)
+})
+
+// --- caller-accepted CI failures ---
+
+const PVS = { check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', firstError: 'exit 2 after Analysis finished', files: [], verdict: 'rig-side' }
+const accept = (over = {}) => ({ workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
+const redWith = (...failures) => ({ ci: { status: 'red', infraRerun: [], realFailures: failures } })
+
+test('acceptedFailures are checked for shape before anything runs', async () => {
+  for (const acceptedFailures of ['pvs', [{ ...accept(), cell: undefined }], [accept({ signature: '' })], [accept({ scope: ' ' })], [accept({ cell: '' })], [accept(), accept()]]) {
+    const trace = []
+    await assert.rejects(run({ args: { acceptedFailures }, trace }), /acceptedFailures must be/, JSON.stringify(acceptedFailures))
+    assert.deepEqual(trace, [])
+  }
+})
+
+test('a run red only from accepted failures passes, listing them, and is never called green', async () => {
+  const { result, logs, labels } = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()] } })
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.deepEqual(result.acceptedFailures, [{ check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', verdict: 'rig-side', reason: 'PVS license renewal pending', scope: 'until the license is renewed' }])
+  assert.match(summaries(logs)[0], /^cycle 1 summary — CI red, accepted failures only/)
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /^accepted, not fixed: PVS license renewal pending/)
+  assert.equal(rowsOf(summaries(logs)[0])[0][2], 'rig-side', 'the watcher\'s classification is kept')
+  assert.ok(logs.some(l => /CI red only from 1 accepted failure\(s\)/.test(l)))
+  assert.ok(!logs.some(l => /PR is green/.test(l)))
+  assert.equal(labels.some(l => l.startsWith('fix:')), false)
+  assert.deepEqual(result.state.acceptedFailures, [accept()])
+})
+
+test('accepted failures with replies still owed are not called green', async () => {
+  const { logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()], maxCycles: 2 }, dropDoneIds: () => true,
+    reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } })
+  assert.ok(logs.some(l => /CI red only from accepted failures but 1 comment\(s\) still owed an answer/.test(l)), logs.join('\n'))
+  assert.ok(!logs.some(l => /PR green/.test(l)))
+})
+
+test('pending checks keep an accepted-only report from passing', async () => {
+  const { result } = await run({ ci: { status: 'running', infraRerun: [], realFailures: [PVS] }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
+  assert.notEqual(result.pass, true)
+})
+
+test('an accepted failure the watcher calls real is still not fixed', async () => {
+  const real = { ...PVS, verdict: 'real', files: ['src/a.c'] }
+  const { result, labels } = await run({ ...redWith(real), args: { acceptedFailures: [accept()] } })
+  assert.equal(labels.some(l => l.startsWith('fix:')), false)
+  assert.equal(result.pass, true)
+})
+
+test('only the exact failure is accepted: another diagnostic, another cell, another workflow or a second failure is not', async () => {
+  for (const [failures, label] of [
+    [[{ ...PVS, signature: 'license expired' }], 'a new diagnostic on the accepted cell'],
+    [[{ ...PVS, cell: 'arm' }], 'a cell where null was accepted'],
+    [[{ ...PVS, workflow: 'ci' }], 'the same job in another workflow'],
+    [[PVS, { ...PVS, signature: 'V501 identical sub-expressions', firstError: 'V501', verdict: 'unclassified' }], 'a second failure in the accepted cell'],
+  ]) {
+    const { result } = await run({ ...redWith(...failures), args: { acceptedFailures: [accept()] } })
+    assert.notEqual(result.pass, true, label)
+  }
+})
+
+test('a CI report for another head is not fixed, accepted or counted green', async () => {
+  for (const ci of [
+    { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
+    { ...redWith(PVS).ci },
+    GREEN,
+  ]) {
+    const { result, labels, logs } = await run({ ci: { ...ci, headSha: 'f'.repeat(40) }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
+    assert.notEqual(result.pass, true)
+    assert.equal(labels.some(l => /^(fix:|commit#|push#)/.test(l)), false)
+    assert.ok(logs.some(l => /CI report is for fffffff, not the head .* re-arming/.test(l)), logs.join('\n'))
+  }
+})
+
+test('an acceptance needs a complete listing of the job and covers one failure', async () => {
+  for (const [failures, why] of [
+    [[{ ...PVS, complete: false }], /not accepted — the watcher did not list every failure of its job/],
+    [[PVS, { ...PVS, check: 'pvs / analyze (2)' }], /not accepted — the same failure is listed 2 times; one acceptance covers one/],
+  ]) {
+    const { result, logs } = await run({ ...redWith(...failures), args: { acceptedFailures: [accept()] } })
+    assert.notEqual(result.pass, true)
+    assert.ok(logs.some(l => why.test(l)), logs.join('\n'))
+  }
+})
+
+test('an acceptance not renewed on a resumed launch no longer applies, and says so', async () => {
+  const first = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()], maxCycles: 3, yieldAfterCycle: true } })
+  const { result, logs } = await run({ ...redWith(PVS), args: { maxCycles: 3, state: first.result.state } })
+  assert.ok(logs.some(l => /accepted failure not renewed by this launch, no longer accepted: static \/ pvs: license expires in 12 days/.test(l)))
+  assert.notEqual(result.pass, true)
+  assert.deepEqual(result.state.acceptedFailures, [])
 })
 
 test('a mislabeled commit SHA is not shown as a commit', async () => {

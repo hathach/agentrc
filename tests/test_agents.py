@@ -47,7 +47,8 @@ class AgentFiles(unittest.TestCase):
         example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
         failure = example['realFailures'][0]
         self.assertEqual(example['status'], 'red', 'a listed failure is red; the example must not teach green-with-failures')
-        self.assertEqual(sorted(failure), ['check', 'files', 'firstError', 'verdict'])
+        self.assertEqual(sorted(failure), ['cell', 'check', 'complete', 'files', 'firstError', 'job', 'runId', 'signature', 'verdict', 'workflow'])
+        self.assertIn('headSha', example, 'an accepted failure is matched only on the head it was read from')
         self.assertIn(failure['verdict'], ('real', 'rig-side', 'unclassified'))
         for verdict in ('"real"', '"rig-side"', '"unclassified"'):
             self.assertIn(verdict, body)

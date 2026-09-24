@@ -21,6 +21,9 @@ export const meta = {
 //          ciWait?: number (minutes to wait on pending checks, default 30),
 //          ciNotes?: string (what the caller already established about this PR's CI, handed
 //            to the watcher verbatim: an investigated exit code, a check known rig-side),
+//          acceptedFailures?: [{ workflow, job, cell, signature, reason, scope }] (CI failures the caller
+//            accepts for this launch, matched exactly on workflow, job, cell (null only for a job with one
+//            result) and first diagnostic: never fixed, and a run red only from them passes, listing them),
 //          deferrals?: [{ findingId, commentDigest, issueUrl, reason }] (valid findings the caller
 //            leaves to an existing GitHub issue: not fixed, answered with the issue and the reason;
 //            kept in the state while the comment body stands),
@@ -39,7 +42,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, deferrals?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -82,6 +85,16 @@ const ciWait = args.ciWait ?? 30
 const ciNotes = args.ciNotes == null ? '' : String(args.ciNotes).trim()
 if (!Number.isInteger(ciWait) || ciWait < 1) {
   throw new Error('ciWait must be a positive integer number of minutes')
+}
+// Per launch, like autoPush: the caller authorizes them on each launch; the
+// state records the last list, so an entry not renewed is reported.
+const acceptedArg = args.acceptedFailures ?? []
+const acceptedShaped = (a) => a && typeof a === 'object' && 'cell' in a &&
+  ['workflow', 'job', 'signature', 'reason', 'scope'].every(k => typeof a[k] === 'string' && a[k].trim().length > 0) &&
+  (a.cell === null || (typeof a.cell === 'string' && a.cell.trim().length > 0))
+const failureKey = (x) => JSON.stringify([x.workflow, x.job, x.cell, x.signature])
+if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(failureKey)).size !== acceptedArg.length) {
+  throw new Error('acceptedFailures must be [{ workflow, job, cell: string or null for a job with one result, signature, reason, scope }], one per failure')
 }
 // Per launch, like autoPush: the decision is the caller's each time, while the
 // ones already applied ride in the state.
@@ -159,6 +172,7 @@ if (args.state !== undefined && args.state !== null) {
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
     typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
     (st.deferrals === undefined || Array.isArray(st.deferrals)) &&
+    (st.acceptedFailures === undefined || Array.isArray(st.acceptedFailures)) &&
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
@@ -189,18 +203,25 @@ const STOPS = 'Do not push, create a PR, or post an issue or PR comment. Do not 
 
 const CI = {
   type: 'object', additionalProperties: false,
-  required: ['status', 'infraRerun', 'realFailures'],
+  required: ['headSha', 'status', 'infraRerun', 'realFailures'],
   properties: {
+    headSha: { type: 'string' },
     status: { type: 'string', enum: ['green', 'red', 'running'] },
     infraRerun: { type: 'array', items: { type: 'string' } },
     realFailures: {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['check', 'firstError', 'files', 'verdict'],
+        required: ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'],
         properties: {
           check: { type: 'string' }, firstError: { type: 'string' },
           files: { type: 'array', items: { type: 'string' } },
+          // One failure's identity, what an accepted failure is matched on: cell
+          // is the matrix leg, null only for a job with one result; signature
+          // its first diagnostic line verbatim; complete whether every failure
+          // of that job was read and listed.
+          workflow: { type: 'string' }, job: { type: 'string' }, cell: { type: ['string', 'null'] },
+          signature: { type: 'string' }, runId: { type: 'integer' }, complete: { type: 'boolean' },
           // pr-ci-watcher's call: `real` is the PR's to fix; `rig-side` is the rig's
           // (a board that will not enumerate, a cable, a lock, a tool's own status
           // exit seen elsewhere too); `unclassified` is a failure its evidence could
@@ -528,6 +549,9 @@ const answeredWith = new Map(restored ? restored.answeredWith : [])
 const debt = new Map(restored
   ? restored.debt.map(([id, d]) => [id, { dismissals: new Set(d.dismissals), note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }])
   : [])
+for (const a of (restored && restored.acceptedFailures) || []) {
+  if (!acceptedArg.some(x => failureKey(x) === failureKey(a))) log(`accepted failure not renewed by this launch, no longer accepted: ${a.workflow} / ${a.job}${a.cell ? ` / ${a.cell}` : ''}: ${a.signature}`)
+}
 // findingId -> { digest, issueUrl, reason }: a caller's deferral once its issue
 // was read to cover the finding. It holds while the comment body it named stands.
 const deferrals = new Map(restored && restored.deferrals ? restored.deferrals : [])
@@ -564,6 +588,7 @@ const stateOut = () => {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, cyclesUsed, maxCycles,
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
+    acceptedFailures: acceptedArg,
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
@@ -971,13 +996,15 @@ const cycleSummary = (entry) => {
       cell(`ci:${rf.check}`, 24),
       cell(rf.firstError),
       rf.verdict === 'real' ? 'ci-real' : rf.verdict,
-      rf.verdict === 'rig-side' ? 'left red for the rig'
+      rf.accepted ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
+      : rf.verdict === 'rig-side' ? 'left red for the rig'
         : rf.verdict === 'unclassified' ? 'left red: not placed by its evidence'
           : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
-      rf.verdict === 'real' ? shaOf(entry.ciPush) : '-',
+      rf.verdict === 'real' && !rf.accepted ? shaOf(entry.ciPush) : '-',
     ])
   }
-  const head = `cycle ${entry.cycle} summary — CI ${entry.ci ? entry.ci.status : entry.lane === 'reviews' ? 'not observed this launch' : 'unknown'}, ` +
+  const acceptedOnly = entry.ci && entry.ci.status === 'red' && entry.ci.realFailures.length > 0 && entry.ci.realFailures.every(rf => rf.accepted)
+  const head = `cycle ${entry.cycle} summary — CI ${acceptedOnly ? 'red, accepted failures only' : entry.ci ? entry.ci.status : entry.lane === 'reviews' ? 'not observed this launch' : 'unknown'}, ` +
     `${entry.lane === 'ci' ? 'reviews not observed this launch' : reviewers.length === 0 ? 'no reviewers requested'
       : entry.bots ? `reviews: ${botsLine(entry.bots)}` : 'no review data'}` +
     `${entry.error ? `, ERROR: ${entry.error}` : ''}`
@@ -1705,12 +1732,30 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: review-lane push superseded the CI run — re-arming`)
       return null
     }
+    // A report on another head says nothing about this one: nothing in it is
+    // fixed, accepted or counted green.
+    if (c.headSha !== expectedHead) {
+      log(`cycle ${cycle}: CI report is for ${c.headSha.slice(0, 7) || 'no head'}, not the head ${expectedHead.slice(0, 7)} — re-arming`)
+      return null
+    }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
+    // A caller's acceptance covers one exact failure, and only when the
+    // watcher listed every failure of its job: a known first diagnostic must
+    // not hide another one behind it, nor one acceptance cover two failures.
+    const seenTimes = (rf) => c.realFailures.filter(x => failureKey(x) === failureKey(rf)).length
+    for (const rf of c.realFailures) {
+      const a = acceptedArg.find(x => failureKey(x) === failureKey(rf))
+      if (!a) continue
+      const why = !rf.complete ? 'the watcher did not list every failure of its job'
+        : seenTimes(rf) > 1 ? `the same failure is listed ${seenTimes(rf)} times; one acceptance covers one` : null
+      if (why) log(`cycle ${cycle}: ${rf.check} matches an accepted failure but is not accepted — ${why}`)
+      else rf.accepted = { reason: a.reason, scope: a.scope }
+    }
     // Only a failure the watcher placed on the PR is fixed; the rig's and the
     // ones its evidence could not place are reported and left red.
-    const unfixable = c.realFailures.filter(rf => rf.verdict !== 'real')
+    const unfixable = c.realFailures.filter(rf => rf.verdict !== 'real' && !rf.accepted)
     for (const rf of unfixable) log(`cycle ${cycle}: ${rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
-    const fixable = c.realFailures.filter(rf => rf.verdict === 'real')
+    const fixable = c.realFailures.filter(rf => rf.verdict === 'real' && !rf.accepted)
     if (fixable.length > 0) {
       const work = groupWork(fixable.map(rf => ({
         id: rf.id, scopeFile: rf.files[0] || rf.check, files: rf.files,
@@ -1739,7 +1784,8 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
       return null
     }
-    if (reviewsSettled && c.status === 'green') {
+    const acceptedOnly = c.status === 'red' && c.realFailures.length > 0 && c.realFailures.every(rf => rf.accepted) && c.infraRerun.length === 0
+    if (reviewsSettled && (c.status === 'green' || acceptedOnly)) {
       const outstanding = [...debt.keys()]
       if (outstanding.length > 0) {
         if (args.autoPush !== true) {
@@ -1750,14 +1796,18 @@ const runCycle = async (cycle, entry) => {
           return { pass: false, cycles: cycle, history, dryRun: true }
         }
         if (cycle < maxCycles) {
-          log(`cycle ${cycle}: PR green but ${outstanding.length} comment(s) still owed an answer — re-arming`)
+          log(`cycle ${cycle}: ${acceptedOnly ? 'CI red only from accepted failures' : 'PR green'} but ${outstanding.length} comment(s) still owed an answer — re-arming`)
           napMs = 60000 * cycle
           return null
         }
         return unresolvedVerdict(cycle, outstanding)
       }
-      log(`cycle ${cycle}: PR is green with no unresolved valid findings${deferrals.size ? `; ${deferrals.size} deferred to tracked issues` : ''}`)
-      return { pass: true, cycles: cycle, history, ...(deferrals.size ? { deferrals: [...deferrals].map(([findingId, d]) => ({ findingId, issueUrl: d.issueUrl })) } : {}) }
+      log(`cycle ${cycle}: ${acceptedOnly ? `CI red only from ${c.realFailures.length} accepted failure(s)` : 'PR is green'} with no unresolved valid findings${deferrals.size ? `; ${deferrals.size} deferred to tracked issues` : ''}`)
+      return {
+        pass: true, cycles: cycle, history,
+        ...(acceptedOnly ? { acceptedFailures: c.realFailures.map(rf => ({ check: rf.check, workflow: rf.workflow, job: rf.job, cell: rf.cell, signature: rf.signature, verdict: rf.verdict, ...rf.accepted })) } : {}),
+        ...(deferrals.size ? { deferrals: [...deferrals].map(([findingId, d]) => ({ findingId, issueUrl: d.issueUrl })) } : {}),
+      }
     }
     if (unfixable.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {
       // Two honest stops. An unclassified failure needs someone to place it
