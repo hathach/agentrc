@@ -46,7 +46,7 @@ print(os.environ.get('FAKE_RESULT', json.dumps({'type': 'result', 'result': 'cla
 '''
 
 
-SID, THREAD = '11111111-2222-4333-8444-555555555555', '01a08a2e-cbbb-7de2-8b6f-b2e769c5b9d8'
+THREAD = '01a08a2e-cbbb-7de2-8b6f-b2e769c5b9d8'
 CODEX = {'CLAUDECODE': '', 'CODEX_THREAD_ID': THREAD}  # a send driven by a Codex session
 
 
@@ -76,19 +76,10 @@ class CoworkTest(unittest.TestCase):
             (self.bin / name).chmod(0o755)
         self.log = base / 'calls.jsonl'
         self.gate = base / 'gate'
-        # What each driving CLI records about its own session: the caller's model and effort come from here.
-        self.transcript = base / 'claude' / 'projects' / '-repo' / f'{SID}.jsonl'
-        self.transcript.parent.mkdir(parents=True)
-        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-fable-5-1"}}\n')
-        self.rollout = base / 'codex' / 'sessions' / '2026' / '09' / '11' / f'rollout-2026-09-11T00-00-00-{THREAD}.jsonl'
-        self.rollout.parent.mkdir(parents=True)
-        self.rollout.write_text('{"type":"session_meta","payload":{"id":"%s"}}\n'
-                                '{"type":"turn_context","payload":{"model":"gpt-6-astra","effort":"medium"}}\n' % THREAD)
         clean = {k: v for k, v in os.environ.items() if not k.startswith(('FAKE_', 'HERDR_', 'COWORK', 'CODEX_', 'CLAUDE_'))}
         self.env = mock.patch.dict('os.environ', {
             **clean, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1',
-            'CLAUDE_CODE_SESSION_ID': SID, 'CLAUDE_EFFORT': 'medium', 'CLAUDE_CONFIG_DIR': str(base / 'claude'),
-            'CODEX_HOME': str(base / 'codex'), 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
+            'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
             'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}, clear=True)
         self.env.start()
         self.cwd = os.getcwd()
@@ -183,10 +174,10 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(request.startswith('codex-'))
         self.assertEqual(reply, 'codex reply\nFiles touched: none\n')
-        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\ngpt-6-astra\nmedium\n')
+        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\ngpt-6-sol\nhigh\n')
         self.send('--task', 'another')
         first, second = self.calls()
-        self.assertEqual(first['argv'][:6], ['exec', '-m', 'gpt-6-astra', '-c', 'model_reasoning_effort=medium', '--json'])
+        self.assertEqual(first['argv'][:6], ['exec', '-m', 'gpt-6-sol', '-c', 'model_reasoning_effort=high', '--json'])
         self.assertEqual(second['argv'][:3], ['exec', 'resume', 'thread-42'])
         self.assertIn('-o', second['argv'])
 
@@ -231,30 +222,19 @@ class CoworkTest(unittest.TestCase):
 
     # --- model and effort ---------------------------------------------------------
 
-    def test_the_coworker_starts_at_the_callers_tier_and_effort(self):
+    def test_a_new_lane_starts_at_its_sides_default_whatever_drives_it(self):
         self.send('--task', 'from claude')
         argv = self.calls()[0]['argv']
-        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6-astra', 'fable and astra cost the same')
-        self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=medium')
-        self.assertIn('answered by gpt-6-astra at medium effort', self.calls()[0]['stdin'])
-        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-sonnet-5"}}\n'
-                                   '{"type":"assistant","message":{"model":"<synthetic>"}}\n')
-        with mock.patch.dict('os.environ', {'CLAUDE_EFFORT': 'max'}):
-            self.run_cli('reset', 'codex', 'main')
-            self.send('--task', 'from a cheaper claude')
+        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6-sol')
+        self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=high')
+        self.assertIn('answered by gpt-6-sol at high effort', self.calls()[0]['stdin'])
+        self.send('--effort', 'max', '--task', 'max')
         argv = self.calls()[1]['argv']
-        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-5.6-terra')
         self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=xhigh', 'Codex has no max')
         self.send('--task', 'from codex', **CODEX)
         argv = self.calls()[2]['argv']
-        self.assertEqual(argv[argv.index('--model') + 1], 'fable')
-        self.assertEqual(argv[argv.index('--effort') + 1], 'medium')
-        self.rollout.write_text('{"type":"turn_context","payload":{"model":"gpt-5.6-luna","effort":"minimal"}}\n')
-        self.run_cli('reset', 'claude', 'main')
-        self.send('--task', 'from a cheaper codex', **CODEX)
-        argv = self.calls()[3]['argv']
-        self.assertEqual(argv[argv.index('--model') + 1], 'haiku')
-        self.assertEqual(argv[argv.index('--effort') + 1], 'low', 'Claude has no minimal')
+        self.assertEqual(argv[argv.index('--model') + 1], 'opus')
+        self.assertEqual(argv[argv.index('--effort') + 1], 'high')
 
     def test_model_and_effort_flags_persist_until_replaced_or_reset(self):
         for argv in (('--model', 'gpt-5.6-terra', '--effort', 'high', '--task', 'a'), ('--task', 'b'),
@@ -265,53 +245,30 @@ class CoworkTest(unittest.TestCase):
         seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
         self.assertEqual(seen, [('gpt-5.6-terra', 'model_reasoning_effort=high'), ('gpt-5.6-terra', 'model_reasoning_effort=high'),
                                 ('gpt-5.6-terra', 'model_reasoning_effort=low'), ('gpt-5.6-luna', 'model_reasoning_effort=low'),
-                                ('gpt-5.6-luna', 'model_reasoning_effort=low'), ('gpt-6-astra', 'model_reasoning_effort=medium')])
+                                ('gpt-5.6-luna', 'model_reasoning_effort=low'), ('gpt-6-sol', 'model_reasoning_effort=high')])
         _, out, _ = self.run_cli('status')
-        self.assertIn('codex/main: session thread-42, gpt-6-astra at medium effort', out)
+        self.assertIn('codex/main: session thread-42, gpt-6-sol at high effort', out)
 
     def test_a_field_update_keeps_the_bound_thread(self):
         self.assertEqual(self.send('--task', 'one')[0], 0)
         self.assertEqual(cowork.session_of(self.box()), 'thread-42')
-        cowork.update_side(self.box(), effort='high')
-        self.assertEqual(cowork.side_state(self.box()), ('thread-42', 'gpt-6-astra', 'high'), 'a field-wise update')
+        cowork.update_side(self.box(), effort='low')
+        self.assertEqual(cowork.side_state(self.box()), ('thread-42', 'gpt-6-sol', 'low'), 'a field-wise update')
         self.send('--task', 'two')
         self.assertEqual(self.calls()[-1]['argv'][:3], ['exec', 'resume', 'thread-42'])
 
     def test_a_flag_writes_back_only_its_own_field(self):
         self.send('--task', 'a')
         with mock.patch.object(cowork, 'side_state', return_value=('thread-42', 'gpt-5.6-luna', 'medium')):
-            cowork.settle_pair(self.box(), None, 'high')  # an effort-only send that read the side before someone saved luna
+            cowork.settle_pair(self.box(), 'codex', None, 'high')  # an effort-only send that read the side before someone saved luna
         self.assertEqual(cowork.side_state(self.box())[1:], ('gpt-5.6-luna', 'high'))
         self.assertFalse(list(self.box().glob('session.*.tmp')), 'the session file is replaced, never truncated')
 
-    def test_the_callers_model_is_the_assistant_message_not_any_model_field(self):
-        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-fable-5-1"}}\n'
-                                   '{"type":"assistant","message":{"model":"claude-opus-5","content":[{"input":{"model":"haiku"}}]}}\n'
-                                   '{"type":"user","message":{"model":"claude-haiku-4-5"}}\n')
-        self.send('--task', 'q')
-        argv = self.calls()[0]['argv']
-        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-5.6-sol')
-
-    def test_an_unmapped_caller_or_a_bad_effort_is_refused_not_guessed(self):
-        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-mythos-5-1"}}\n')
-        code, _, _, err = self.send('--task', 'q')
-        self.assertEqual(code, 1)
-        self.assertIn('no known price tier for claude-mythos-5-1', err)
-        self.transcript.unlink()
-        code, _, _, err = self.send('--task', 'q')
-        self.assertEqual(code, 1)
-        self.assertIn("cannot find this Claude Code session's transcript", err)
-        code, _, _, _ = self.send('--model', 'gpt-6-astra', '--effort', 'high', '--task', 'q')
-        self.assertEqual(code, 0, 'both flags need no record of the caller')
-        self.run_cli('reset', 'codex', 'main')
-        self.transcript.write_text('{"type":"assistant","message":{"model":"claude-mythos-5-1"}}\n')
-        code, _, _, _ = self.send('--model', 'gpt-6-astra', '--task', 'q')
-        self.assertEqual(code, 0, 'an explicit model needs no tier; the effort still comes from the caller')
-        self.assertEqual(cowork.side_state(self.box())[1:], ('gpt-6-astra', 'medium'))
+    def test_a_bad_effort_is_refused_not_guessed(self):
         code, _, _, err = self.send('--effort', 'bogus', '--task', 'q')
         self.assertEqual(code, 2)
         self.assertIn('invalid choice', err)
-        self.assertEqual(len(self.calls()), 2, 'only the two explicit sends reached the coworker')
+        self.assertEqual(self.calls(), [], 'nothing reached the coworker')
 
     # --- the prompt and the coworker's environment ------------------------------
 
@@ -837,7 +794,7 @@ class CoworkTest(unittest.TestCase):
                       'of the host checkout; commit there.', prompt)
         self.assertEqual(self.head(tree), base)
         code, out, _ = self.run_cli('status')
-        self.assertIn(f'codex/impl: session thread-42, gpt-6-astra at medium effort, in {tree}', out)
+        self.assertIn(f'codex/impl: session thread-42, gpt-6-sol at high effort, in {tree}', out)
         self.assertNotIn('codex/main', out)
         self.send('--lane', 'impl', '--task', 'y')
         self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
@@ -851,7 +808,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('Scope: do not edit anything', self.calls()[0]['stdin'])
         self.assertFalse((self.root / '.worktrees').exists())
         code, out, _ = self.run_cli('status')
-        self.assertIn('codex/review: session thread-42, gpt-6-astra at medium effort, read-only', out)
+        self.assertIn('codex/review: session thread-42, gpt-6-sol at high effort, read-only', out)
         self.codex_does("open('edited.txt', 'w').write('!')")
         code, _, _, err = self.send('--lane', 'review', '--task', 'y')  # no --no-edit: the lane implies it
         self.assertEqual(code, cowork.MALFORMED)

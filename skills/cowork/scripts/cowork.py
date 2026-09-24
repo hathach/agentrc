@@ -10,9 +10,8 @@
 A lane is one resumed session of a side, with files under
 <git dir>/cowork/<side>/<lane>/: `session` holds the session id, the model
 and the effort in use. The first send on a lane sets the model and effort
-from the flags, else from the caller's own session record mapped to the same
-token-cost tier on the other side; later sends reuse them until flags
-replace them or reset forgets them. Three kinds of lane: `main` works in
+from the flags, else the side's default (DEFAULTS); later sends reuse them
+until flags replace them or reset forgets them. Three kinds of lane: `main` works in
 this checkout; a lane created with --read-only works in this checkout too
 and every send to it is --no-edit; any other lane works in its own worktree
 .worktrees/cowork-<side>-<lane> on branch cowork/<host branch>/<side>-<lane>,
@@ -65,9 +64,7 @@ HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at 
 WHERE = 'Your checkout is the worktree {root} on branch {branch}, based on {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # Claude's names; Codex has minimal..xhigh
-TIERS = {  # the same token cost on the other side, by the family word in the model name (2026-09 list prices)
-    'fable': 'gpt-6-astra', 'opus': 'gpt-5.6-sol', 'sonnet': 'gpt-5.6-terra', 'haiku': 'gpt-5.6-luna',
-    'astra': 'fable', 'sol': 'opus', 'terra': 'sonnet', 'luna': 'haiku'}
+DEFAULTS = {'codex': ('gpt-6-sol', 'high'), 'claude': ('opus', 'high')}  # a new lane's model and effort
 
 
 def die(message, code=FAILED):
@@ -212,42 +209,6 @@ def coworker(explicit):
     return side
 
 
-def own_model_and_effort():
-    """What the driving session runs right now, from its own record: Claude
-    Code's transcript (last assistant message) and CLAUDE_EFFORT; Codex's
-    rollout, last turn_context."""
-    if caller() is None:
-        die('neither Claude Code nor Codex identifies itself in the environment; pass --model and --effort')
-    if caller() == 'claude':
-        sid = os.environ.get('CLAUDE_CODE_SESSION_ID', '')
-        home = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
-        transcript = next(iter(home.glob(f'projects/*/{sid}.jsonl')), None) if sid else None
-        if transcript is None:
-            die('cannot find this Claude Code session\'s transcript to read its model; pass --model')
-        model = next((e['message']['model'] for e in events(transcript)
-                      if e.get('type') == 'assistant' and not e['message'].get('model', '<').startswith('<')), None)
-        if model is None:
-            die(f'{transcript} has no assistant message naming a model yet; pass --model')
-        return model, os.environ.get('CLAUDE_EFFORT') or 'medium'
-    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
-    thread = os.environ['CODEX_THREAD_ID']
-    rollout = next(iter(home.glob(f'sessions/**/rollout-*-{thread}.jsonl')), None)
-    if rollout is None:
-        die(f'cannot find the rollout of Codex thread {thread} under {home}/sessions; pass --model')
-    context = next((e['payload'] for e in events(rollout) if e.get('type') == 'turn_context'), None)
-    if not context or not context.get('model'):
-        die(f'{rollout} has no turn_context naming a model yet; pass --model')
-    return context['model'], {'minimal': 'low'}.get(context.get('effort'), context.get('effort') or 'medium')
-
-
-def equivalent(model):
-    """The other side's model at the same token cost."""
-    word = next((w for w in TIERS if w in model), None)
-    if word is None:
-        die(f'no known price tier for {model}: pass --model')
-    return TIERS[word]
-
-
 def text_of(path):
     return path.read_bytes().decode('utf-8', errors='replace')
 
@@ -347,16 +308,13 @@ def update_side(box, **fields):
         write_side(box, **fields)
 
 
-def settle_pair(box, model, effort):
+def settle_pair(box, side, model, effort):
     """The model and effort for a request: the flags, else the side's saved
-    pair, else the caller's own tier; whatever was missing on the side is
-    saved for later sends. Under admission with the start."""
+    pair, else its default; whatever was missing on the side is saved for
+    later sends. Under admission with the start."""
     saved_model, saved_effort = side_state(box)[1:]
-    model, effort = model or saved_model, effort or saved_effort
-    if not (model and effort):  # first send on this side: start from what drives it
-        own_model, own_effort = own_model_and_effort()
-        model, effort = model or equivalent(own_model), effort or own_effort
-    write_side(box, model=model, effort=effort)
+    default_model, default_effort = DEFAULTS[side]
+    write_side(box, model=model or saved_model or default_model, effort=effort or saved_effort or default_effort)
 
 
 def session_of(box):
@@ -594,7 +552,7 @@ def start(box, root, side, task, no_edit, read_only, model, effort):
                 no_edit = True
             else:
                 sync_lane(root, box)
-        settle_pair(box, model, effort)
+        settle_pair(box, side, model, effort)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task)
         (box / f'{request}.jsonl').touch()
@@ -649,8 +607,8 @@ def main(argv=None):
                       help='on a lane\'s first send: it works in this checkout and every send to it is --no-edit')
     send.add_argument('--task', required=True, help='literal text, or - for stdin')
     send.add_argument('--no-edit', action='store_true', help='a question or review: the coworker must not edit')
-    send.add_argument('--model', help='the coworker\'s model from now on; first send defaults to your own tier')
-    send.add_argument('--effort', choices=EFFORTS, help='its reasoning effort from now on; first send defaults to yours')
+    send.add_argument('--model', help=f'the coworker\'s model from now on; a new lane defaults to {DEFAULTS["codex"][0]} (codex) or {DEFAULTS["claude"][0]} (claude)')
+    send.add_argument('--effort', choices=EFFORTS, help=f'its reasoning effort from now on; a new lane defaults to {DEFAULTS["codex"][1]}')
     sub.add_parser('kill', help='stop a running request and everything its coworker spawned').add_argument('request')
     read = sub.add_parser('read', help='print the reply of a request whose send died, and remove it')
     read.add_argument('request')

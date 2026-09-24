@@ -86,24 +86,21 @@ branch has commits your HEAD lacks. `reset <side> all` does every lane.
 Lane names are `[a-z0-9-]`. `status` shows each lane with its kind.
 
 The coworker's model and effort are per lane and persist with the session.
-The first `send` sets them: `--model` and `--effort` if given, else your own
-model and effort read from your session's record, mapped to the same
-token-cost tier on the other side (fable and astra, opus and sol, sonnet and
-terra, haiku and luna; effort by name, `max` becoming Codex `xhigh`). Later
-sends reuse them; a flag replaces the value from then on; `reset` forgets
-them. A model outside those four families has no equivalent and `send`
-refuses until you pass `--model`. Codex reads its own model from the
-rollout of `CODEX_THREAD_ID`, so no flag is needed there either. The
-request header tells the coworker what model and effort answer it.
+The first `send` sets them: `--model` and `--effort` if given, else the
+side's default, `gpt-6-sol` at `high` for Codex and `opus` at `high` for
+Claude. Later sends reuse them, even after a default changes; a flag
+replaces the value from then on (`max` becomes Codex `xhigh`); `reset`
+forgets them. The request header tells the coworker what model and effort
+answer it.
 
-Use these pairs by lane role, setting both flags on the first send and when
-changing the pair. Examples target Codex; for Claude, use the mapping above.
+Pairs by lane role; examples target Codex, and a Claude coworker takes its
+default unless you name another:
 
-- `main` and worktree lanes, the routine writers: `--model gpt-5.6-sol --effort xhigh`
+- `main` and worktree lanes, the routine writers: `--model gpt-6-sol --effort xhigh`
 - `expert`, a worktree lane for writing where a wrong first attempt costs a
   debugging session: `--model gpt-6-astra --effort high`
-- `plan` and review lanes: `--model gpt-6-astra --effort high`
-- `read-doc` and other lookup lanes: `--model gpt-5.6-sol --effort medium`
+- `plan` and review lanes: the default, no flags on a new lane
+- `read-doc` and other lookup lanes: `--model gpt-6-sol --effort medium`
 
 Never open the session interactively while a request is running.
 
