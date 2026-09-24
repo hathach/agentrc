@@ -109,6 +109,35 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   separately so each uses the unchanged channel. If the required channel is
   unavailable, report review and simplification as pending rather than
   substituting the skill under edit.
+- After each implementation step of a plan, send the other agent that step's
+  diff for review and suggestions, and address them before starting the next
+  step.
+- Completion review: before reporting a change task done, or opening or
+  updating its PR, collect simplification findings on the task's whole diff
+  against its base, including uncommitted changes and task-owned untracked
+  files (`/simplify` stopped after its Phase 1 review, its reviewers
+  launched as fresh `model: "opus"` agents, in Claude Code; by inspection
+  elsewhere). It applies regardless of change size, file type or task entry
+  point; trivial-task judgment does not waive it, and ordinary review rounds
+  and the automatic turn-level `simplify-gate` hook do not replace it.
+  A finding whose safety depends on hardware
+  semantics (register side effects, access width or order, barriers,
+  timing, DMA or cache, chip workarounds), or that either side suspects may
+  depend on them, verifies only with a `read-doc` citation, document
+  revision and section, showing the change preserves those semantics for
+  every affected variant; without one it stays unapplied and reported.
+  `co-review` the findings, a no-findings result included, and apply only
+  what verifies; run the applicable checks, including hardware validation
+  under Working rules; `co-review` the diff that applying them made, if any,
+  which needs no new Phase 1; then ask for a full review. Coverage of
+  unchanged content carries over to later triggers; a later change gets this
+  sequence again for what changed, with the whole task as context, and any
+  checks its changed inputs require. State its outcome in the completion
+  report; a stage that could not run is pending, never done.
+  In a `chief` session, chief's own sequence (commit check, one
+  simplification pass, validation, whole-task review) replaces the per-step
+  review and this bullet, and chief's hardware guard stands in for the
+  citation rule; every other instruction here still applies.
 - The agent leading my task owns the exchanges below; a coworker answering
   one returns its result rather than commissioning its own. When I say one
   of the words below, it holds for that task.
@@ -121,28 +150,9 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   review the combined plan together under `cowork`'s Review rounds. Bring me
   the agreed plan and what changed in review, or the disagreement that
   remains. Without the word, plan alone.
-- After each implementation step of a plan, send the other agent that step's
-  diff for review and suggestions, and address them before starting the next
-  step. When a major part or the whole feature lands, collect simplification
-  findings on the task's whole diff against its base, uncommitted changes
-  included (`/simplify` stopped after its Phase 1 review, its reviewers
-  launched as fresh `model: "opus"` agents, in Claude Code; by inspection
-  elsewhere). A finding whose safety depends on hardware
-  semantics (register side effects, access width or order, barriers,
-  timing, DMA or cache, chip workarounds), or that either side suspects may
-  depend on them, verifies only with a `read-doc` citation, document
-  revision and section, showing the change preserves those semantics for
-  every affected variant; without one it stays unapplied and reported.
-  `co-review` the findings and apply only what verifies, run the applicable
-  checks, including hardware validation under Working rules, `co-review`
-  the diff that applying them made, then ask for a full review.
-  In a `chief` session, chief's own sequence (commit check, one
-  simplification pass, validation, whole-task review) replaces this
-  paragraph's per-step review and `/simplify` mechanics, and chief's
-  hardware guard stands in for the citation rule; every other instruction
-  here still applies.
-- `co-fix`: for a task without a plan, do it, then take its diff through the
-  same rounds before reporting it done.
+- `co-fix` (also `co-do`): for a task without a plan, do it, then take its
+  diff through the same rounds and the completion review before reporting
+  it done.
 - `co-test`: have the other agent write the tests from the brief while you
   implement it, neither seeing the other's work, then take both through the
   same rounds.
