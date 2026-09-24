@@ -2,6 +2,8 @@
 """Post PR review replies from a manifest, read each back, resolve its thread.
 
   reply.py --pr N --manifest FILE [--repo OWNER/NAME]
+  reply.py --pr N --inspect COMMENT:REPLY [COMMENT:REPLY ...] [--repo OWNER/NAME]
+  reply.py --pr N --reuse FILE [--repo OWNER/NAME]
 
 FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>"}, ...]},
 digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
@@ -29,9 +31,24 @@ matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
 reply, resolved; 1 otherwise; 2 on a usage or manifest error.
+
+--inspect reads, never writes: for each pair, whether REPLY is ours answering
+COMMENT on this PR, its exact body with the body's digest, and the original's
+digest as the validator computes it (sha256, 12 hex). stdout ends with
+{"inspected": [{"commentId", "replyId", "kind", "body", "bodyDigest",
+"originalDigest", "error"}]}; body is null when error is set. Exit 0 when every
+pair was read and is ours, 1 otherwise.
+
+--reuse settles a comment on a reply already there, and never posts: FILE is
+{"reuses": [{"commentId", "replyId", "bodyDigest", "originalDigest"}]}, the
+digests an inspection returned. Each pair is read again, and only a reply still
+ours, still that body, on a comment still that body, counts as verified; its
+review thread is then resolved. Receipts as above, sent and posted false, digest
+being the reply body's as read now.
 """
 
 import argparse
+import hashlib
 import json
 import subprocess
 import sys
@@ -143,21 +160,34 @@ class Poster:
             c = api('POST', f'repos/{self.repo}/issues/{self.pr}/comments', {'body': body})
         return c['id']
 
+    def read_original(self, kind, comment_id):
+        """The comment as it stands now, not as the cached listing had it."""
+        if kind == 'review-body':
+            return api('GET', f'repos/{self.repo}/pulls/{self.pr}/reviews/{comment_id}')
+        return api('GET', f'repos/{self.repo}/{"pulls" if kind == "review" else "issues"}/comments/{comment_id}')
+
+    def read_reply(self, kind, reply_id):
+        return api('GET', f'repos/{self.repo}/{"pulls" if kind == "review" else "issues"}/comments/{reply_id}')
+
+    def misplaced(self, kind, comment_id, c):
+        """What makes reply c not ours answering comment_id on this PR, by name."""
+        if kind == 'review':
+            checks = [('parent', c.get('in_reply_to_id') == comment_id),
+                      ('author', c.get('user', {}).get('login') == self.me),
+                      ('pr', str(c.get('pull_request_url', '')).endswith(f'/pulls/{self.pr}'))]
+        else:
+            checks = [('author', c.get('user', {}).get('login') == self.me),
+                      ('pr', str(c.get('issue_url', '')).endswith(f'/issues/{self.pr}'))]
+        return [name for name, ok in checks if not ok]
+
     def verify(self, kind, comment_id, reply_id, body):
         """(True, None) on a matching read-back, (False, why) on a mismatch,
         (None, why) when the reply could not be fetched."""
         try:
-            c = api('GET', f'repos/{self.repo}/{"pulls" if kind == "review" else "issues"}/comments/{reply_id}')
+            c = self.read_reply(kind, reply_id)
         except ApiError as e:
             return None, f'read-back unavailable: {e}'
-        if kind == 'review':
-            checks = [('body', c.get('body') == body), ('parent', c.get('in_reply_to_id') == comment_id),
-                      ('author', c.get('user', {}).get('login') == self.me),
-                      ('pr', str(c.get('pull_request_url', '')).endswith(f'/pulls/{self.pr}'))]
-        else:
-            checks = [('body', c.get('body') == body), ('author', c.get('user', {}).get('login') == self.me),
-                      ('pr', str(c.get('issue_url', '')).endswith(f'/issues/{self.pr}'))]
-        bad = [name for name, ok in checks if not ok]
+        bad = ([] if c.get('body') == body else ['body']) + self.misplaced(kind, comment_id, c)
         return (True, None) if not bad else (False, f'read-back mismatch on {", ".join(bad)}')
 
     def resolve(self, comment_id):
@@ -187,6 +217,72 @@ def issue_body(original, body):
 def is_fix_note(body):
     """pr-babysit's note for a landed fix, a different answer from a refutation of the same comment."""
     return body.partition('\n\n')[2].startswith('Fixed in ')
+
+
+def comment_digest(body):
+    """The validator's digest of a reviewer's comment: sha256 of its body, 12 hex."""
+    return hashlib.sha256((body or '').encode()).hexdigest()[:12]
+
+
+def read_pair(poster, kind, original, comment_id, reply_id):
+    """(reply, why): why names what makes the reply not ours answering that
+    comment, None when it is."""
+    if kind == 'none':
+        return None, f'comment {comment_id} is not on PR #{poster.pr}'
+    c = poster.read_reply(kind, reply_id)
+    bad = poster.misplaced(kind, comment_id, c)
+    if kind != 'review' and not str(c.get('body', '')).startswith(issue_body(original, '')):
+        bad.append('quote')
+    return c, f'reply {reply_id} is not ours on comment {comment_id}: mismatch on {", ".join(bad)}' if bad else None
+
+
+def inspect(poster, comment_id, reply_id):
+    out = {'commentId': comment_id, 'replyId': reply_id, 'kind': None, 'body': None, 'bodyDigest': None,
+           'originalDigest': None, 'error': None}
+    try:
+        kind, original = poster.kind_of(comment_id)
+        out['kind'] = kind
+        if original is not None:
+            out['originalDigest'] = comment_digest(original.get('body'))
+        c, why = read_pair(poster, kind, original, comment_id, reply_id)
+        if why:
+            out['error'] = why
+        else:
+            out['body'], out['bodyDigest'] = c['body'], fnv1a(c['body'])
+    except ApiError as e:
+        out['error'] = str(e)
+    return out
+
+
+def reuse(poster, item):
+    rc = {'commentId': item['commentId'], 'kind': None, 'replyId': item['replyId'], 'digest': item['bodyDigest'],
+          'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
+    try:
+        kind, _ = poster.kind_of(item['commentId'])
+        rc['kind'] = kind
+        # Afresh for each entry: settling an earlier one may have moved this one.
+        original = poster.read_original(kind, item['commentId']) if kind != 'none' else None
+        c, why = read_pair(poster, kind, original, item['commentId'], item['replyId'])
+        if c is not None:
+            rc['digest'] = fnv1a(c.get('body', ''))
+        if not why and comment_digest(original.get('body')) != item['originalDigest']:
+            why = f'comment {item["commentId"]} was edited since the inspection'
+        if not why and rc['digest'] != item['bodyDigest']:
+            why = f'reply {item["replyId"]} was edited since the inspection'
+        if why:
+            rc['error'] = why
+            return rc
+        rc['verified'] = True
+        if kind == 'review':
+            rc['error'] = poster.resolve(item['commentId'])
+            rc['resolved'] = rc['error'] is None
+    except ApiError as e:
+        # Once the comment is found, a failed read leaves the reply unknown; a
+        # failed resolve leaves it verified and the thread open.
+        if not rc['verified']:
+            rc['verified'] = None if rc['kind'] is not None else False
+        rc['error'] = str(e)
+    return rc
 
 
 def handle(poster, item):
@@ -241,20 +337,46 @@ def load_manifest(path):
     return replies
 
 
+def load_reuses(path):
+    with open(path) as f:
+        m = json.load(f)
+    reuses = m.get('reuses') if isinstance(m, dict) else None
+    if not isinstance(reuses, list) or not reuses:
+        raise ValueError('reuse file needs a non-empty "reuses" list')
+    for r in reuses:
+        if not (isinstance(r, dict) and isinstance(r.get('commentId'), int) and isinstance(r.get('replyId'), int)
+                and isinstance(r.get('bodyDigest'), str) and isinstance(r.get('originalDigest'), str)):
+            raise ValueError(f'bad reuse entry: {r!r}')
+    if len({r['commentId'] for r in reuses}) != len(reuses):
+        raise ValueError('a commentId is listed twice')
+    return reuses
+
+
+def pair(text):
+    comment, sep, reply_id = text.partition(':')
+    if not (sep and comment.isdigit() and reply_id.isdigit()):
+        raise argparse.ArgumentTypeError(f'expected COMMENT:REPLY ids, got {text!r}')
+    return int(comment), int(reply_id)
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--pr', type=int)
-    p.add_argument('--manifest')
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--manifest')
+    mode.add_argument('--inspect', nargs='+', type=pair, metavar='COMMENT:REPLY')
+    mode.add_argument('--reuse', metavar='FILE')
     p.add_argument('--repo', help='OWNER/NAME (default: gh repo view)')
     p.add_argument('--digest', metavar='TEXT', help='print the digest of TEXT and exit')
     a = p.parse_args(argv)
     if a.digest is not None:
         print(fnv1a(a.digest))
         return 0
-    if a.pr is None or a.manifest is None:
-        p.error('--pr and --manifest are required')
+    if a.pr is None or (a.manifest, a.inspect, a.reuse) == (None, None, None):
+        p.error('--pr and one of --manifest, --inspect or --reuse are required')
     try:
-        replies = load_manifest(a.manifest)
+        replies = load_manifest(a.manifest) if a.manifest else None
+        reuses = load_reuses(a.reuse) if a.reuse else None
     except (OSError, ValueError, json.JSONDecodeError) as e:
         print(f'reply.py: {e}', file=sys.stderr)
         return 2
@@ -270,7 +392,11 @@ def main(argv=None):
     except ApiError as e:
         print(f'reply.py: {e}', file=sys.stderr)
         return 2
-    receipts = [handle(poster, item) for item in replies]
+    if a.inspect:
+        inspected = [inspect(poster, c, r) for c, r in a.inspect]
+        print(json.dumps({'inspected': inspected}))
+        return 0 if all(i['error'] is None for i in inspected) else 1
+    receipts = [reuse(poster, item) for item in reuses] if reuses else [handle(poster, item) for item in replies]
     print(json.dumps({'receipts': receipts}))
     ok = all(r['verified'] is True and (r['kind'] != 'review' or r['resolved']) for r in receipts)
     return 0 if ok else 1

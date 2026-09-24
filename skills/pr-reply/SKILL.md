@@ -23,6 +23,9 @@ R=~/.claude/skills/pr-reply/scripts/reply.py
 python3 $R --pr <N> --manifest <file.json>
 # file.json: {"replies": [{"commentId": 4013179956, "body": "...", "digest": "<8 hex>"}]}
 python3 $R --digest "$body"      # the digest of a body, for a manifest written by hand
+python3 $R --pr <N> --inspect <commentId>:<replyId> ...   # read our replies, post nothing
+python3 $R --pr <N> --reuse <file.json>
+# file.json: {"reuses": [{"commentId": ..., "replyId": ..., "bodyDigest": "...", "originalDigest": "..."}]}
 ```
 
 Every entry carries the body's digest (FNV-1a, 32-bit, over code points); the
@@ -53,7 +56,11 @@ unreachable repo.
   only what is missing.
 - **Receipts, verbatim.** Return the JSON line unchanged to whoever asked. A
   receipt with `verified: false` and a `replyId` is a reply that exists with the
-  wrong content; that is a repair for a human, not a reason to post again.
+  wrong content; that is a repair, not a reason to post again. It is settled
+  on that reply only when someone judged the body `--inspect` returned to
+  answer every point the comment is owed now: `--reuse` with the digests from
+  that inspection reads both again, posts nothing and resolves the thread.
+  Otherwise it stays for a human.
 - **A reply is not agreement.** A resolved thread means our answer was
   published, not that the reviewer accepted it; what the reviewer says next
   is a new comment to read, not something this script knows about.

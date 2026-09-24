@@ -127,7 +127,8 @@ lines while it runs and its report when it exits.
 
 For headless PR publishing, follow `agents/chief.md`'s Authorization exception
 before launching. Include the named PR, head repository and branch, expected
-HEAD, worktree, task scope, and the verbatim authorization exchange in the
+HEAD, worktree, task scope, the verbatim authorization exchange and, when it
+continues an earlier chief's run, that run's last reported `stateRef` in the
 task. Leave the checkout to chief until it exits. Each new chief invocation
 requires a fresh exchange.
 

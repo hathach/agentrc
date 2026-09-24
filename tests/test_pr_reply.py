@@ -96,6 +96,9 @@ class FakeGitHub:
         m = re.fullmatch(rf'repos/{REPO}/issues/comments/(\d+)', path)
         if m and method == 'GET':
             return self.issue[int(m.group(1))]
+        m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/reviews/(\d+)', path)
+        if m and method == 'GET':
+            return self.reviews[int(m.group(1))]
         self.mutations.append(('unexpected', method, path))
         raise KeyError(path)
 
@@ -353,6 +356,141 @@ class ReplyTest(unittest.TestCase):
         self.run_script([{'commentId': 10, 'body': 'right text'}])
         methods = {a[2] for a in self.gh.calls if a[0] == 'api' and len(a) > 3 and a[1] == '-X'}
         self.assertLessEqual(methods, {'GET', 'POST'})
+
+
+class ReconcileTest(ReplyTest):
+    """--inspect and --reuse: settle on a reply of ours already there, never posting."""
+
+    def main(self, *args):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = reply.main(['--pr', str(PR), '--repo', REPO, *args])
+        lines = out.getvalue().strip().splitlines()
+        return rc, json.loads(lines[-1]) if lines else None
+
+    def reuse(self, *items):
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            json.dump({'reuses': list(items)}, f)
+        rc, out = self.main('--reuse', f.name)
+        return rc, out['receipts'] if out else None
+
+    def reworded(self):
+        """Comment 20 and our quoting answer 901 in other words than any manifest now holds."""
+        self.gh.issue_comment(20, 'three points')
+        body = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\nall three answered'
+        self.gh.issue_comment(901, body, ME)
+        return body
+
+    def test_inspect_reads_our_reply_and_both_digests(self):
+        body = self.reworded()
+        rc, out = self.main('--inspect', '20:901')
+        self.assertEqual(rc, 0)
+        self.assertEqual(out['inspected'], [{'commentId': 20, 'replyId': 901, 'kind': 'issue', 'body': body,
+                                             'bodyDigest': reply.fnv1a(body), 'originalDigest': reply.comment_digest('three points'),
+                                             'error': None}])
+        self.assertEqual(reply.comment_digest('three points'),
+                         __import__('hashlib').sha256(b'three points').hexdigest()[:12], 'the validator\'s digest')
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_inspect_refuses_a_reply_that_is_not_ours_on_that_comment(self):
+        self.reworded()
+        self.gh.issue_comment(902, 'someone else', 'bot')
+        self.gh.issue_comment(903, f'> https://github.com/{REPO}/pull/{PR}#issuecomment-77\n\nelsewhere', ME)
+        self.gh.review_comment(10)
+        self.gh.review_comment(55, 'ours, other thread', ME, parent=11)
+        rc, out = self.main('--inspect', '20:902', '20:903', '10:55', '99:901')
+        self.assertEqual(rc, 1)
+        errors = [i['error'] for i in out['inspected']]
+        self.assertIn('mismatch on author', errors[0])
+        self.assertIn('mismatch on quote', errors[1])
+        self.assertIn('mismatch on parent', errors[2])
+        self.assertEqual(errors[3], f'comment 99 is not on PR #{PR}')
+        self.assertTrue(all(i['body'] is None for i in out['inspected']))
+
+    def test_reuse_settles_without_posting_and_resolves_an_inline_thread(self):
+        self.gh.review_comment(10, 'two points')
+        self.gh.review_comment(55, 'both answered', ME, thread='T10', parent=10)
+        rc, receipts = self.reuse({'commentId': 10, 'replyId': 55, 'bodyDigest': reply.fnv1a('both answered'),
+                                   'originalDigest': reply.comment_digest('two points')})
+        self.assertEqual(rc, 0)
+        self.assertEqual(receipts, [{'commentId': 10, 'kind': 'review', 'replyId': 55, 'digest': reply.fnv1a('both answered'),
+                                     'sent': False, 'posted': False, 'verified': True, 'resolved': True, 'error': None}])
+        self.assertEqual(self.gh.mutations, [('resolve', 'T10')])
+        body = self.reworded()
+        rc, receipts = self.reuse({'commentId': 20, 'replyId': 901, 'bodyDigest': reply.fnv1a(body),
+                                   'originalDigest': reply.comment_digest('three points')})
+        self.assertEqual((rc, receipts[0]['kind'], receipts[0]['verified'], receipts[0]['resolved']), (0, 'issue', True, None))
+        self.assertEqual(self.gh.mutations, [('resolve', 'T10')], 'nothing posted, nothing more resolved')
+
+    def test_reuse_refuses_anything_changed_since_the_inspection(self):
+        body = self.reworded()
+        good = {'commentId': 20, 'replyId': 901, 'bodyDigest': reply.fnv1a(body), 'originalDigest': reply.comment_digest('three points')}
+        for change, expected in [
+            (lambda: self.gh.issue[20].update(body='four points'), 'comment 20 was edited since the inspection'),
+            (lambda: self.gh.issue[901].update(body=body + ' and more'), 'reply 901 was edited since the inspection'),
+            (lambda: self.gh.issue[901]['user'].update(login='bot'), 'mismatch on author'),
+        ]:
+            self.setUp()
+            body = self.reworded()
+            change()
+            rc, receipts = self.reuse(good)
+            self.assertEqual((rc, receipts[0]['verified']), (1, False))
+            self.assertIn(expected, receipts[0]['error'])
+            self.assertEqual(self.gh.mutations, [])
+        self.setUp()
+        self.reworded()
+        del self.gh.issue[901]
+        rc, receipts = self.reuse(good)
+        self.assertEqual((rc, receipts[0]['verified']), (1, None), 'an unreadable reply is unknown, not a mismatch')
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_each_reuse_reads_its_comment_afresh(self):
+        self.gh.review_comment(10, 'two points')
+        self.gh.review_comment(55, 'both answered', ME, thread='T10', parent=10)
+        body = self.reworded()
+        real = self.gh.graphql
+
+        def resolve_then_edit(args):
+            out = real(args)
+            if any(a.startswith('query=mutation') for a in args):
+                self.gh.issue[20]['body'] = 'three points and a fourth'  # edited while comment 10 settled
+            return out
+        self.gh.graphql = resolve_then_edit
+        rc, receipts = self.reuse(
+            {'commentId': 10, 'replyId': 55, 'bodyDigest': reply.fnv1a('both answered'), 'originalDigest': reply.comment_digest('two points')},
+            {'commentId': 20, 'replyId': 901, 'bodyDigest': reply.fnv1a(body), 'originalDigest': reply.comment_digest('three points')})
+        self.assertEqual(rc, 1)
+        self.assertEqual([r['verified'] for r in receipts], [True, False])
+        self.assertEqual(receipts[1]['error'], 'comment 20 was edited since the inspection')
+
+    def test_reuse_reads_a_review_body_afresh_too(self):
+        self.gh.add_review(30, 'outside the diff: x')
+        quoted = f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\nnot so'
+        self.gh.issue_comment(901, quoted, ME)
+        rc, receipts = self.reuse({'commentId': 30, 'replyId': 901, 'bodyDigest': reply.fnv1a(quoted),
+                                   'originalDigest': reply.comment_digest('outside the diff: x')})
+        self.assertEqual((rc, receipts[0]['kind'], receipts[0]['verified']), (0, 'review-body', True))
+
+    def test_a_failed_resolve_keeps_the_reuse_verified_and_the_thread_open(self):
+        self.gh.review_comment(10, 'two points')
+        self.gh.review_comment(55, 'both answered', ME, thread='T10', parent=10)
+        self.gh.graphql = lambda args: (1, '', 'HTTP 502')
+        rc, receipts = self.reuse({'commentId': 10, 'replyId': 55, 'bodyDigest': reply.fnv1a('both answered'),
+                                   'originalDigest': reply.comment_digest('two points')})
+        self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved']), (1, True, None))
+        self.assertIn('502', receipts[0]['error'])
+
+    def test_bad_pairs_and_reuse_files_are_usage_errors(self):
+        with self.assertRaises(SystemExit) as e:
+            self.main('--inspect', '20-901')
+        self.assertEqual(e.exception.code, 2)
+        import tempfile
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
+            json.dump({'reuses': [{'commentId': 20, 'replyId': 901, 'bodyDigest': 'x'}]}, f)
+        self.assertEqual(self.main('--reuse', f.name)[0], 2)
+        with self.assertRaises(SystemExit):
+            self.main('--reuse', f.name, '--inspect', '20:901')
 
 
 if __name__ == '__main__':
