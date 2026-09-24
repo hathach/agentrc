@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run coworker turns in a detached process, resuming one session per lane, one turn at a time per lane.
 
-  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] (--task TEXT | --task -)
+  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] [--detach] (--task TEXT | --task -)
   cowork.py kill <id>
   cowork.py read [--wait] <id>
   cowork.py status
@@ -27,10 +27,11 @@ inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
 (the verdict, first writer wins). One request per lane is in flight: a send
 while one is refused.
 
-send waits for the reply, prints it and removes the request; read does the
-same for a reply whose send died, waiting for release with --wait and
-refusing a running request otherwise; reset removes everything of a lane, its
-worktree included once its branch is merged. Exit codes: 1 failed, 3 unknown
+send waits for the reply, prints it and removes the request, or with --detach
+prints only the id and leaves the reply to read; read delivers a reply whose
+send died or detached, waiting for release with --wait and refusing a running
+request otherwise; reset removes everything of a lane, its worktree included
+once its branch is merged. Exit codes: 1 failed, 3 unknown
 or delivered request, a lane busy, not ready or of the wrong kind, or reset
 refused, 4 missing "Files touched" line or a changed tree during --no-edit.
 """
@@ -599,7 +600,7 @@ def reset(root, gitdir, side, lane):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='cmd', required=True)
-    send = sub.add_parser('send', help='one turn of the coworker; prints the request id, then the reply')
+    send = sub.add_parser('send', help='one turn of the coworker; prints the request id, then the reply unless --detach')
     send.add_argument('--to', choices=SIDES, help='which coworker; defaults to codex when run from Claude Code')
     send.add_argument('--lane', default='main', help='which session of that coworker (default: main, this checkout); '
                                                     'any other lane works in its own worktree unless created --read-only')
@@ -609,8 +610,9 @@ def main(argv=None):
     send.add_argument('--no-edit', action='store_true', help='a question or review: the coworker must not edit')
     send.add_argument('--model', help=f'the coworker\'s model from now on; a new lane defaults to {DEFAULTS["codex"][0]} (codex) or {DEFAULTS["claude"][0]} (claude)')
     send.add_argument('--effort', choices=EFFORTS, help=f'its reasoning effort from now on; a new lane defaults to {DEFAULTS["codex"][1]}')
+    send.add_argument('--detach', action='store_true', help='print the request id and return; collect the reply with read --wait')
     sub.add_parser('kill', help='stop a running request and everything its coworker spawned').add_argument('request')
-    read = sub.add_parser('read', help='print the reply of a request whose send died, and remove it')
+    read = sub.add_parser('read', help='print the reply of a request whose send detached or died, and remove it')
     read.add_argument('request')
     read.add_argument('--wait', action='store_true', help='wait until the runner and its descendants release the request')
     sub.add_parser('status', help='lanes and undelivered requests in this worktree')
@@ -639,6 +641,8 @@ def main(argv=None):
             die('the task resolved to nothing')
         request = start(box, root, side, task, a.no_edit, a.read_only, a.model, a.effort)
         print(request, flush=True)
+        if a.detach:
+            return 0
         held(box / f'{request}.lock', wait=True)  # wait through teardown, even if the verdict exists
         return deliver(box, request)
 

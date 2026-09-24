@@ -124,7 +124,7 @@ class CoworkTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def send(self, *argv, stdin='', **env):
-        """A blocking send, as the harness would run it in the background."""
+        """A send run in-process: blocking, as the harness would run it in the background, or --detach."""
         with mock.patch.dict('os.environ', env):
             code, out, err = self.run_cli('send', *argv, stdin=stdin)
         request, _, reply = out.partition('\n')
@@ -700,6 +700,25 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.FAILED)
         self.assertIn('codex-x died without recording a verdict', out)
         self.assertEqual(self.leftovers('codex-x'), [])
+
+    def test_send_detach_returns_the_id_at_once_and_read_wait_delivers_it(self):
+        code, request, reply, err = self.send('--detach', '--task', 'x', FAKE_GATE=str(self.gate))
+        self.assertEqual((code, reply, err), (0, '', ''), 'only the id is printed')
+        self.assertTrue(request.startswith('codex-main-'), request)
+        self.assertTrue(cowork.held(self.box() / f'{request}.lock'), 'the runner still holds the request')
+        reader = self.read_wait(request)
+        self.gate.touch()
+        out, err = reader.communicate(timeout=10)
+        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual(self.leftovers(request), [])
+
+    def test_send_detach_exits_and_closes_its_output_while_the_runner_works(self):
+        done = subprocess.run([sys.executable, str(SCRIPT), 'send', '--detach', '--task', 'x'], cwd=self.root,
+                              capture_output=True, text=True, timeout=10, env={**os.environ, 'FAKE_GATE': str(self.gate)})
+        request = done.stdout.strip()
+        self.assertEqual((done.returncode, done.stderr, done.stdout), (0, '', request + '\n'))
+        self.assertTrue(cowork.held(self.box() / f'{request}.lock'), 'the runner still holds the request')
+        self.settled(request)
 
     def test_read_wait_recovers_a_dead_sender_and_binds_the_session(self):
         request = self.reaped('--task', 'x')

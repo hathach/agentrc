@@ -18,22 +18,23 @@ same commands; the checkout is shared.
 ```bash
 S=<skill dir>/scripts/cowork.py
 
-python3 $S send (--task "..." | --task -) [--lane L] [--read-only] [--no-edit] [--model M] [--effort E]
+python3 $S send (--task "..." | --task -) [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] [--detach]
 python3 $S kill <id>             # the running request, with all it spawned
-python3 $S read [--wait] <id>    # recover a dead sender's reply; --wait blocks until ready
+python3 $S read [--wait] <id>    # a detached or dead sender's reply; --wait blocks until ready
 python3 $S status                # lanes and undelivered requests
 python3 $S reset codex|claude <lane>|all   # forget the lane and its requests; a worktree lane's tree goes once merged
 ```
 
 `send` prints the request id, then blocks until the reply is in and prints
-it. In an ordinary Claude session, run `send` in a background Bash and arm
-Monitor on `python3 $S read --wait <id>`, using the id printed by `send`:
-a background shell may be reaped, while the runner is detached and Monitor
-is not reaped. If the send shell died before delivery, Monitor delivers the reply; if
-`send` delivered first, Monitor exits 3 with an already-delivered diagnostic
-and the send's output holds the reply. Monitor can also win while the send
-is alive: use the output that delivered the reply, and expect exit 3 from
-the other consumer. For fan-out, use one send and one Monitor per lane.
+it; `--detach` returns after the id. In an ordinary Claude session, run
+`send --detach` in the foreground and arm Monitor, at its maximum
+`timeout_ms`, on `python3 $S read --wait <id>` from the same checkout as the
+request's only reader: Claude Code may reap a background shell under memory
+pressure, while Monitor is exempt. When Monitor expires or its reader dies,
+arm it again and report whatever the reader returns. Exit 3 with "no request"
+means it is absent here: check earlier Monitor events for the reply,
+otherwise report its delivery as unknown. For fan-out, use one send and one
+Monitor per lane.
 The `coworker` agent from agentrc is the transport for sessions without
 Bash, such as `chief`, on read-only lanes only. In Codex, run
 `send` in the foreground, or check `status` between your own steps.
@@ -43,13 +44,15 @@ exit 3 naming it, so wait for the reply, or `kill` it, or use another lane.
 There is no timeout: a turn runs until the CLI ends or you `kill` it.
 Plain `read <id>` refuses a request that is still running.
 Before finishing, run `status` and use `read --wait <id>` only for undelivered
-requests you sent, never the request you are answering (`COWORK_TURN`) or
-another caller's request.
+requests you sent that have no reader left, never the request you are
+answering (`COWORK_TURN`) or another caller's request.
 
-Delivery by `send` or `read` removes the request's files; `reset` also
-removes undelivered requests with the lane's session. The coworker's
-own store keeps the whole session, prompts included: `~/.codex/sessions` and
-`~/.claude/projects`, where `codex resume` / `claude --resume` find it.
+Delivery by `send` or `read` prints the reply, then removes the request's
+files, so a reader killed between the two lets a later one print it again;
+`reset` also removes undelivered requests with the lane's session. The
+coworker's own store keeps the whole session, prompts included:
+`~/.codex/sessions` and `~/.claude/projects`, where `codex resume` /
+`claude --resume` find it.
 
 The coworker defaults to the other CLI: Codex from Claude Code, Claude from
 Codex; `--to` overrides. `--no-edit` puts Claude in plan mode; Codex is asked
