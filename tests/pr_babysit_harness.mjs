@@ -207,7 +207,7 @@ async function run(opts = {}) {
         buildOk: true, board: '', notes: '', ...over,
       }
     }
-    if (label.startsWith('replies#') || label.startsWith('resolve#')) {
+    if (label.startsWith('replies#') || label.startsWith('resolve#') || label.startsWith('defer#')) {
       if (opts.posting === null || (typeof opts.posting === 'function' && opts.posting(label) === null)) return null // a dead posting agent
       // The script's receipts, one per manifest entry, echoing each body's
       // digest: posted, read back and resolved unless a case says the batch
@@ -283,6 +283,15 @@ async function run(opts = {}) {
       if ('verify' in opts && opts.verify === null) return null
       if (typeof opts.verify === 'function') return opts.verify(label)
       return structuredClone(opts.verify ?? { addresses: true, reason: 'verified' })
+    }
+    if (label.startsWith('issue#')) {
+      assert.equal(options.agentType, 'finding-verifier')
+      if (opts.covers === null) return null
+      // opts.covers(findingId) is whether its issue covers it; true by default.
+      const ids = JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1)).map(x => x.findingId)
+      return conforms(options.schema, { verdicts: ids.map(findingId => ({
+        findingId, covers: opts.covers ? opts.covers(findingId) : true, reason: 'stub issue read',
+      })) }, label)
     }
     if (label.startsWith('inspect#')) {
       // reply.py --inspect: our reply as it stands on each pair, the comment's
@@ -2086,6 +2095,146 @@ test('a settled reuse survives a resumed launch and nothing is posted twice', as
   assert.ok(second.labels.includes('reuse#2'))
   const third = await run({ ...heldForRepair({ answers: () => true }), args: { autoPush: true, maxCycles: 3, state: second.result.state } })
   assert.equal(third.labels.some(l => /^(inspect|reconcile|reuse|replies)#/.test(l)), false, 'an answered comment owes nothing')
+})
+
+// --- caller-approved deferrals ---
+
+const ISSUE = 'https://github.com/hathach/tinyusb/issues/4000'
+const deferral = (over = {}) => ({ findingId: '1#1', commentDigest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR', ...over })
+
+test('deferrals are checked for shape before anything runs', async () => {
+  for (const deferrals of ['1#1', [{ ...deferral(), findingId: '1' }], [deferral({ issueUrl: 'https://github.com/o/r/pull/3' })],
+    [deferral({ reason: ' ' })], [deferral({ commentDigest: '' })], [deferral(), deferral()]]) {
+    const trace = []
+    await assert.rejects(run({ args: { deferrals }, trace }), /deferrals must be/, JSON.stringify(deferrals))
+    assert.deepEqual(trace, [])
+  }
+})
+
+test('a deferred finding is not fixed, is answered with its issue, and the run passes listing it', async () => {
+  const { result, calls, labels, logs } = await run({ reviews: oneValid, args: { deferrals: [deferral()] } })
+  assert.equal(labels.some(l => l.startsWith('fix:')), false, 'no writer for a deferred finding')
+  const issue = calls.find(c => c.label === 'issue#1')
+  assert.ok(issue.prompt.includes(ISSUE) && issue.prompt.includes('src/a.c:1: bad'))
+  const [posted] = manifestOf(calls, 'defer#1')
+  assert.equal(posted.body, `- src/a.c:1: bad\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.deepEqual(result.deferrals, [{ findingId: '1#1', issueUrl: ISSUE }])
+  assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR' }]])
+  assert.deepEqual(result.state.answeredWith.find(([id]) => id === 1)[1], { how: 'deferral', digest: 'd1' })
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /^deferred, answered with the issue: https:\/\/github\.com\/hathach\/tinyusb\/issues\/4000$/)
+})
+
+test('a deferral reply that is not verified leaves the comment owed', async () => {
+  const { result } = await run({ reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 1 }, dropDoneIds: () => true })
+  assert.notEqual(result.pass, true)
+  assert.ok(result.state.debt.find(([id]) => id === 1), 'still owed an answer')
+})
+
+test('a deferral naming no current valid finding, or its issue not covering it, stops the run', async () => {
+  for (const [over, why] of [
+    [{ args: { deferrals: [deferral({ findingId: '9#9' })] } }, /9#9: no such finding in this harvest/],
+    [{ args: { deferrals: [deferral({ commentDigest: 'd0' })] } }, /1#1: its comment changed since the decision/],
+    [{ args: { deferrals: [deferral()] }, reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } }, /1#1: the finding is invalid, not valid/],
+    [{ args: { deferrals: [deferral()] }, covers: () => false }, /does not cover it/],
+    [{ args: { deferrals: [deferral()] }, covers: () => null }, /could not be read/],
+    [{ args: { deferrals: [deferral()] }, covers: null }, /its issue was not checked/],
+  ]) {
+    const { result, labels } = await run({ reviews: oneValid, ...over })
+    assert.equal(result.reason, 'deferral-refused')
+    assert.match(result.detail, why)
+    assert.equal(labels.some(l => /^(fix:|defer#|replies#|resolve#)/.test(l)), false, 'nothing fixed or posted')
+  }
+})
+
+test('a deferral applied once holds on a resumed launch without being passed again, until the comment is edited', async () => {
+  const first = await run({ reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 3, yieldAfterCycle: true, autoPush: false } })
+  const again = await run({ reviews: oneValid, args: { maxCycles: 3, state: first.result.state } })
+  assert.notEqual(again.result.reason, 'budget-exhausted')
+  assert.equal(again.labels.some(l => /^(issue#|fix:)/.test(l)), false, 'no second issue read, still no writer')
+  const edited = await run({
+    reviews: { findings: [finding({ commentDigest: 'd1-edited' })], replies: [], bots: 'reviewed' },
+    args: { maxCycles: 3, state: first.result.state },
+  })
+  assert.equal(edited.result.reason, 'deferral-refused')
+  assert.match(edited.result.detail, /1#1: its comment was edited since it was deferred; decide again/)
+})
+
+test('a deferred point rides in the one reply its mixed comment gets', async () => {
+  const deferredPoint = finding({ findingId: '1#1', claim: 'deferred point' })
+  const fixedPoint = finding({ findingId: '1#2', line: 2, claim: 'in scope' })
+  const withFix = await run({
+    reviews: { findings: [deferredPoint, fixedPoint], replies: [], bots: 'reviewed' },
+    args: { deferrals: [deferral()] },
+  })
+  assert.equal(withFix.calls.filter(c => c.label.startsWith('fix:')).length, 1)
+  assert.doesNotMatch(withFix.calls.find(c => c.label.startsWith('fix:')).prompt, /deferred point/)
+  const [note] = manifestOf(withFix.calls, 'resolve#1')
+  assert.match(note.body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:2: in scope\n\n- src\/a\.c:1: deferred point\n  Real, and out of this PR's scope/)
+  assert.equal(withFix.labels.some(l => l.startsWith('defer#')), false, 'one reply per comment')
+  const refutedPoint = invalidFinding({ findingId: '1#2', line: 2, claim: 'wrong' })
+  const withRefutation = await run({
+    reviews: { findings: [deferredPoint, refutedPoint], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { deferrals: [deferral()] },
+  })
+  const [reply] = manifestOf(withRefutation.calls, 'replies#1')
+  assert.match(reply.body, /^not so\n\n- src\/a\.c:1: deferred point\n  Real, and out of this PR's scope/)
+  assert.equal(withRefutation.labels.some(l => l.startsWith('defer#')), false)
+})
+
+test('a deferral reply waits while a sibling dismissal is still owed', async () => {
+  // Cycle 1: deferred, valid and refuted points on one comment wait on each other.
+  const points = [finding({ findingId: '1#1' }), finding({ findingId: '1#2', line: 2 }), invalidFinding({ findingId: '1#3', line: 3 })]
+  const first = await run({
+    reviews: { findings: points, replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' },
+    args: { deferrals: [deferral()], maxCycles: 3, yieldAfterCycle: true, autoPush: false },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.deepEqual(first.result.state.debt.find(([id]) => id === 1)[1].dismissals, ['1#3'])
+  // Cycle 2 reports only the deferred point: answering it would close the thread over 1#3.
+  const second = await run({ reviews: oneValid, args: { maxCycles: 3, state: first.result.state } })
+  assert.equal(second.labels.some(l => l.startsWith('defer#')), false)
+  assert.ok(second.result.state.debt.find(([id]) => id === 1))
+})
+
+test('a deferral renewed after an edit settles the comment', async () => {
+  const first = await run({ reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 3, yieldAfterCycle: true, autoPush: false } })
+  const edited = { findings: [finding({ commentDigest: 'd1-edited' })], replies: [], bots: 'reviewed' }
+  const { result, labels } = await run({ reviews: edited, args: { deferrals: [deferral({ commentDigest: 'd1-edited' })], maxCycles: 3, state: first.result.state } })
+  assert.ok(labels.includes('issue#2') && labels.includes('defer#2'))
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.deepEqual(result.state.answeredWith.find(([id]) => id === 1)[1], { how: 'deferral', digest: 'd1-edited' })
+})
+
+test('a deferral already answered cannot be changed to another issue or reason', async () => {
+  const first = await run({ reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 3, yieldAfterCycle: true } })
+  assert.ok(first.result.state.answeredWith.find(([id]) => id === 1))
+  for (const changed of [deferral({ issueUrl: 'https://github.com/hathach/tinyusb/issues/4001' }), deferral({ reason: 'another reason' })]) {
+    const { result, labels } = await run({ reviews: oneValid, args: { deferrals: [changed], maxCycles: 3, state: first.result.state } })
+    assert.equal(result.reason, 'deferral-refused')
+    assert.match(result.detail, /already answered as tracked in https:\/\/github\.com\/hathach\/tinyusb\/issues\/4000/)
+    assert.equal(labels.some(l => l.startsWith('issue#')), false)
+  }
+})
+
+test('a deferral reply held for repair is reconciled with its disposition in view', async () => {
+  const { result, calls } = await run({
+    reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 2 }, wrongBody: (id) => id === 1, answers: () => true,
+  })
+  const judged = calls.find(c => c.label === 'reconcile#2')
+  assert.ok(judged, 'the deferral repair is judged')
+  assert.match(judged.prompt, /"owed":"deferral"/)
+  assert.match(judged.prompt, /deferred: broken on master too; own PR; tracked in https:\/\/github\.com\/hathach\/tinyusb\/issues\/4000/)
+  assert.match(judged.prompt, /names the issue listed with it/)
+  assert.ok(calls.some(c => c.label === 'reuse#2'))
+  assert.equal(result.state.debt.find(([id]) => id === 1), undefined)
+})
+
+test('a dry run applies a deferral but posts nothing', async () => {
+  const { result, labels } = await run({ reviews: oneValid, args: { deferrals: [deferral()], autoPush: false } })
+  assert.equal(result.dryRun, true)
+  assert.equal(labels.some(l => /^(defer#|fix:)/.test(l)), false)
+  assert.deepEqual(result.state.deferrals.map(([id]) => id), ['1#1'])
 })
 
 test('a receipt for a different body settles nothing', async () => {
