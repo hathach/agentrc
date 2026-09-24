@@ -5,9 +5,10 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-// args: { pr: number, reviewers?: string[] (of codex, copilot, coderabbit, greptile; default
-//            ['copilot', 'coderabbit', 'greptile']; [] runs no review lane),
-//          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default: reviewers),
+// args: { pr: number, reviewers?: string[] (of codex, copilot, coderabbit, greptile, code-scanning; default
+//            ['copilot', 'coderabbit', 'greptile', 'code-scanning']; [] runs no review lane),
+//          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default:
+//            reviewers but code-scanning, which is harvested only and never named here),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 5), autoPush?: boolean (default false = dry run),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
 //          protected?: string (regex over canonical repo-relative paths; matches are
@@ -53,8 +54,11 @@ if (!Number.isInteger(maxCycles) || maxCycles < 1) {
 }
 // The validator knows these bots and nothing else, so an unknown name would
 // silently review nothing; fail before dispatch instead.
-const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'greptile']
-const DEFAULT_REVIEWERS = ['copilot', 'coderabbit', 'greptile']
+const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'greptile', 'code-scanning']
+const DEFAULT_REVIEWERS = ['copilot', 'coderabbit', 'greptile', 'code-scanning']
+// Code-scanning comments arrive with the analysis workflow, a CI check with no
+// review verdict to wait for: they are harvested, never waited on.
+const HARVEST_ONLY = ['code-scanning']
 const reviewersArg = args.reviewers ?? DEFAULT_REVIEWERS
 if (!Array.isArray(reviewersArg)) {
   throw new Error(`reviewers must be an array of ${KNOWN_REVIEWERS.join(', ')}; [] runs no review lane`)
@@ -66,10 +70,10 @@ if (unknown.length) {
 }
 // Harvesting and settling are different lists: a bot that reviews only on
 // demand is harvested when it has spoken but never waited for.
-const autoRun = Array.isArray(args.autoRun ?? reviewers)
-  ? (args.autoRun ?? reviewers).map(r => typeof r === 'string' ? r.trim().toLowerCase() : r) : null
-if (!autoRun || autoRun.some(r => !reviewers.includes(r))) {
-  throw new Error(`autoRun must be a subset of reviewers ${JSON.stringify(reviewers)}; got ${JSON.stringify(args.autoRun)}`)
+const autoRun = args.autoRun == null ? reviewers.filter(r => !HARVEST_ONLY.includes(r))
+  : Array.isArray(args.autoRun) ? args.autoRun.map(r => typeof r === 'string' ? r.trim().toLowerCase() : r) : null
+if (!autoRun || autoRun.some(r => !reviewers.includes(r) || HARVEST_ONLY.includes(r))) {
+  throw new Error(`autoRun must be a subset of reviewers ${JSON.stringify(reviewers)} without ${HARVEST_ONLY.join(', ')}; got ${JSON.stringify(args.autoRun)}`)
 }
 const ciWait = args.ciWait ?? 30
 const ciNotes = args.ciNotes == null ? '' : String(args.ciNotes).trim()

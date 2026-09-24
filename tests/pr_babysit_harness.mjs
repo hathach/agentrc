@@ -179,9 +179,8 @@ async function run(opts = {}) {
       const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle() : reviews)
       // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
       // state; explicit records are filled the same way, one field at a time.
-      // run() launches with ['codex'] unless a test sets reviewers; set to null/undefined, the workflow's default applies
-      const named = opts.args && 'reviewers' in opts.args ? opts.args.reviewers ?? ['copilot', 'coderabbit', 'greptile'] : ['codex']
-      const autoRun = (opts.args?.autoRun ?? named).map(b => b.trim().toLowerCase())
+      // The auto-running bots are the ones the workflow's prompt names.
+      const autoRun = (String(prompt).match(/of those, (.+?) auto-run on every push/)?.[1].split(', ')) ?? []
       const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
         : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
           : r.bots
@@ -371,10 +370,11 @@ test('args validation', async () => {
 test('an unknown reviewer or a malformed protected pattern throws before any agent runs', async () => {
   for (const [args, expected] of [
     [{ reviewers: ['codex', 'gpt'] }, /unknown reviewer\(s\) \["gpt"\]/],
-    [{ reviewers: 'codex' }, /reviewers must be an array of codex, copilot, coderabbit, greptile; \[\] runs no review lane/],
+    [{ reviewers: 'codex' }, /reviewers must be an array of codex, copilot, coderabbit, greptile, code-scanning; \[\] runs no review lane/],
     [{ reviewers: [4] }, /unknown reviewer/],
     [{ reviewers: ['codex'], autoRun: ['copilot'] }, /autoRun must be a subset of reviewers \["codex"\]/],
     [{ reviewers: ['codex'], autoRun: 'codex' }, /autoRun must be a subset/],
+    [{ reviewers: ['codex', 'code-scanning'], autoRun: ['codex', ' Code-Scanning'] }, /autoRun must be a subset of reviewers \["codex","code-scanning"\] without code-scanning/],
     [{ protected: '^test/hil/(' }, /protected is not a valid regex/],
     [{ protected: '   ' }, /non-empty regex string/],
     [{ protected: 7 }, /non-empty regex string/],
@@ -392,13 +392,26 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
   assert.equal(none.result.pass, true)
 })
 
-test('omitted reviewers default to copilot, coderabbit and greptile, all auto-running', async () => {
+test('omitted reviewers default to copilot, coderabbit and greptile auto-running, and code-scanning harvested only', async () => {
   for (const reviewers of [undefined, null]) {
     const { calls, result } = await run({ args: { reviewers } })
     assert.equal(result.pass, true)
     const prompt = calls.find(c => c.label.startsWith('reviews#')).prompt
-    assert.match(prompt, /harvest on this PR are copilot, coderabbit, greptile, and no others; of those, copilot, coderabbit, greptile auto-run on every push/)
+    assert.match(prompt, /harvest on this PR are copilot, coderabbit, greptile, code-scanning, and no others; of those, copilot, coderabbit, greptile auto-run on every push/)
+    assert.deepEqual(result.state.config.autoRun, ['copilot', 'coderabbit', 'greptile'])
   }
+})
+
+test('code-scanning is never waited for, and its findings are fixed like any bot\'s', async () => {
+  const alone = await run({ args: { reviewers: ['code-scanning'] } })
+  assert.match(alone.calls.find(c => c.label.startsWith('reviews#')).prompt, /harvest on this PR are code-scanning, and no others; none of them auto-run: report no bot records/)
+  assert.equal(alone.result.pass, true, JSON.stringify(alone.result.reason))
+  const { calls, logs } = await run({
+    args: { reviewers: ['code-scanning'] },
+    reviews: { findings: [finding({ source: 'code-scanning', claim: 'PVS-Studio: a part of conditional expression is always false' })], replies: [], bots: 'reviewed' },
+  })
+  assert.match(calls.find(c => c.label.startsWith('fix:')).prompt, /\[code-scanning\] PVS-Studio: a part of conditional expression/)
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /^fixed \+ pushed/)
 })
 
 test('the requested reviewers, normalized, are the ones the validator is asked for', async () => {
