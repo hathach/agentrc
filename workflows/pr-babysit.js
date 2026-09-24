@@ -25,12 +25,14 @@ export const meta = {
 //          lane?: 'both' | 'ci' | 'reviews' (which lane this launch runs, default both; a single lane
 //            needs yieldAfterCycle and never declares the PR done),
 //          state?: object (a previous launch's returned state, handed back unchanged),
+//          stateRef?: { outputFile, digest } (instead of state: the saved Workflow output holding
+//            that result and its stateDigest; a loader reads it, so no model retypes the state),
 //          adoptHead?: string (full SHA of commits the caller made and audited on top of the
 //            state's expectedHead, a hardware repair say: this launch audits the chain, publishes
 //            it under autoPush and continues from it with the same state; per launch, never saved) }
 if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -96,17 +98,52 @@ if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'bo
 if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
 const ciLane = lane !== 'reviews'
 const reviewLane = lane !== 'ci'
-const STATE_VERSION = 2
+const STATE_VERSION = 3
+// A state crosses its caller between launches, so it is sealed: key order and
+// spacing are canonical, and any other change to it fails the digest.
+const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
+  : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
+  : JSON.stringify(v)
+const sealOf = ({ digest, ...st }) => fnv1a(canonical(JSON.parse(JSON.stringify(st))))
+if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
+if (args.stateRef != null) {
+  const ref = args.stateRef
+  // The path goes into a shell command: a saved Workflow output path needs no more than this alphabet.
+  if (!ref || typeof ref.outputFile !== 'string' || !/^\/[A-Za-z0-9._/-]+$/.test(ref.outputFile) || ref.outputFile.includes('..') ||
+      !/^[0-9a-f]{8}$/.test(ref.digest || '')) {
+    throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._/-]), digest: the result\'s 8-hex stateDigest }')
+  }
+  const LOADED = { type: 'object', additionalProperties: false, required: ['state'], properties: { state: { type: 'string' } } }
+  let why = ''
+  for (let attempt = 1; attempt <= 2 && args.state == null; attempt++) {
+    const got = await agent(
+      `Run exactly: python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["result"]["state"], separators=(",", ":")))' '${ref.outputFile}'\n` +
+      'Return its stdout, one line of JSON, unchanged as state; change and add nothing. If the command fails, return its error text as state.',
+      { label: `state:load#${attempt}`, model: 'sonnet', effort: 'low', schema: LOADED },
+    ).catch(e => { why = `loader died: ${e && e.message}`; return null })
+    if (!got) continue
+    let st = null
+    try { st = JSON.parse(got.state) } catch { why = `not JSON: ${got.state.slice(0, 200)}`; continue }
+    if (!st || st.digest !== ref.digest || sealOf(st) !== ref.digest) { why = 'the loaded state does not match stateRef.digest'; continue }
+    args.state = st
+  }
+  if (args.state == null) {
+    log(`state: ${why}; the output file is untouched`)
+    return { pass: false, status: 'blocked', reason: 'state-transfer-failed', detail: why, stateRef: ref }
+  }
+}
 const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null, build: buildCmd }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
   const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
   const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
-    typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) && Array.isArray(st.history) &&
+    typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
+    (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
+  if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
     throw new Error(`state was made by a run with different arguments: ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
   }
@@ -343,7 +380,7 @@ const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
 // The body's checksum rides in the manifest and comes back in the receipt, so a
 // body the posting agent transcribed wrong is refused by the script and a
 // receipt for a different body is refused here. Same function in reply.py.
-const fnv1a = (text) => {
+function fnv1a (text) {
   let h = 0x811c9dc5
   for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
   return h.toString(16).padStart(8, '0')
@@ -367,7 +404,10 @@ const RECEIPTS = {
   },
 }
 
-const history = restored ? restored.history : []
+// Across launches only the last cycle's publication outcome is read (pendingOf);
+// its reports and the older cycles stay in the results that carried them.
+const history = restored && restored.last ? [restored.last] : []
+const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
 // commentId -> { how, digest }: how the comment was answered ('refutation' or
 // 'fixNote') and the digest of the body that answer addressed. An answered
 // comment accrues no further debt until the reviewer edits it, which the
@@ -407,12 +447,15 @@ const pendingOf = () => {
   }
   return null
 }
-const stateOut = () => ({
-  version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, cyclesUsed, maxCycles,
-  answeredWith: [...answeredWith],
-  debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
-  history,
-})
+const stateOut = () => {
+  const st = {
+    version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, cyclesUsed, maxCycles,
+    answeredWith: [...answeredWith],
+    debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
+    last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
+  }
+  return { ...st, digest: sealOf(st) }
+}
 // Every result carries a status the caller can act on without reading the reason
 // (complete: passed; paused: a whole cycle ran and another may follow; blocked:
 // something needs attention first), what the last cycle observed, and the state.
@@ -428,7 +471,8 @@ const finish = (verdict, status) => {
       adoption: last.adoption || null,
     } : null,
   }
-  return { ...verdict, status: status || (verdict.pass ? 'complete' : 'blocked'), observation, state: stateOut() }
+  const state = stateOut()
+  return { stateDigest: state.digest, ...verdict, status: status || (verdict.pass ? 'complete' : 'blocked'), observation, state }
 }
 const owesDismissal = (commentId) => {
   const d = debt.get(commentId)

@@ -37,6 +37,11 @@ const fnv1a = (text) => {
   for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
   return h.toString(16).padStart(8, '0')
 }
+// pr-babysit's state seal, so a hand-built state is one a launch could have returned
+const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
+  : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
+  : JSON.stringify(v)
+const seal = ({ digest, ...st }) => ({ ...st, digest: fnv1a(canonical(JSON.parse(JSON.stringify(st)))) })
 const manifestOf = (calls, label) => JSON.parse(calls.find(c => c.label === label).prompt.match(/Manifest: (\{.*\})$/)[1]).replies
 // The nth commit a run makes. Each is distinct, as a real commit is, because the
 // audit rejects one whose SHA equals its parent.
@@ -65,15 +70,15 @@ const adoptCommit = (sha = ADOPT, parents = [HEAD], paths = ['src/adopted.c'], o
 const adoptionState = ({
   maxCycles = 4, cyclesUsed = 1, reviewers = ['codex'], autoRun = reviewers,
   protected: protectedPattern = null, pin = STATE_PIN, ...over
-} = {}) => ({
-  version: 2, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
+} = {}) => seal({
+  version: 3, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
   config: {
     pr: 3888, reviewers, autoRun, maxCycles, checkoutDir: '.', ciWait: 30,
     protected: protectedPattern === null ? null : new RegExp(protectedPattern).source,
     generated: null, build: null,
   },
   cyclesUsed, maxCycles, answeredWith: [], debt: [],
-  history: cyclesUsed ? [{ cycle: cyclesUsed, head: HEAD }] : [], ...over,
+  last: cyclesUsed ? { cycle: cyclesUsed, head: HEAD } : null, ...over,
 })
 const adoptionArgs = (state, over = {}) => ({
   reviewers: state.config.reviewers, autoRun: state.config.autoRun,
@@ -135,6 +140,11 @@ async function run(opts = {}) {
       phase: options.phase, schema: options.schema,
     })
     if (opts.throwOn && label.startsWith(opts.throwOn)) throw new Error(`${label} exploded`)
+    if (label.startsWith('state:load#')) {
+      const answer = typeof opts.load === 'function' ? await opts.load(label) : opts.load
+      if (answer instanceof Error) throw answer
+      return answer === null ? null : conforms(options.schema, { state: answer }, label)
+    }
     if (label === 'preflight') return patch({ ...PIN, head, prHead }, opts.preflight)
     if (label === 'adopt:audit') {
       const fallback = { commits: [adoptCommit(opts.args?.adoptHead, [opts.args?.state?.expectedHead ?? HEAD])] }
@@ -2198,7 +2208,8 @@ test('the lane is not part of the state a launch must match', async () => {
   assert.equal(second.result.state.cyclesUsed, 2, 'the budget is shared across lanes')
   const third = await run({ args: { yieldAfterCycle: true, maxCycles: 3, state: second.result.state }, reviews: { findings: [], replies: [], bots: 'reviewed' } })
   assert.equal(third.result.status, 'complete', `only the both launch completes (got ${third.result.reason})`)
-  assert.deepEqual(third.result.history.map(e => e.lane), ['ci', 'reviews', 'both'])
+  assert.deepEqual(third.result.history.map(e => e.lane), ['reviews', 'both'], 'a launch carries only the previous launch\'s last cycle')
+  assert.equal(third.result.state.last.lane, 'both')
 })
 
 test('debt and the pushed head carry across a lane switch', async () => {
@@ -2501,7 +2512,7 @@ test('the cycle budget is cumulative across launches and refuses before any agen
 
 test('a resumed launch refuses a head the previous launch did not leave', async () => {
   const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
-  const moved = { ...first.result.state, expectedHead: FOREIGN }
+  const moved = seal({ ...first.result.state, expectedHead: FOREIGN })
   const second = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: moved }, reviews: owing })
   assert.equal(second.result.reason, 'stale-head')
   assert.equal(second.result.expected, FOREIGN)
@@ -2866,7 +2877,7 @@ test('rejected or dead adoption pushes preserve the ledger and recover without r
     const recovered = await run({
       args: adoptionArgs(failed.result.state), preflight: { head: ADOPT, prHead: ADOPT },
     })
-    assert.equal(recovered.result.history[2].adoption.publication, 'already-published')
+    assert.equal(recovered.result.history.at(-1).adoption.publication, 'already-published')
     assert.equal(recovered.result.state.expectedHead, ADOPT)
     assert.equal(recovered.result.state.pending, null)
     assert.deepEqual(recovered.result.state.debt, state.debt)
@@ -3434,4 +3445,68 @@ test('a push in a yielding launch leaves the old clock; the resume starts a new 
   })
   assert.equal(b.result.reason, 'yielded', `${b.result.reason}: twenty minutes on the old head do not count`)
   assert.deepEqual(b.result.state.reviewClock, { sha: shaFor(1), eventAt: null, since: at(20) })
+})
+
+test('a returned state is sealed, compact and leads with its digest', async () => {
+  const first = await run({ args: { yieldAfterCycle: true, maxCycles: 4 } })
+  const { state } = first.result
+  assert.equal(Object.keys(first.result)[0], 'stateDigest', 'the digest survives a truncated result')
+  assert.equal(first.result.stateDigest, state.digest)
+  assert.equal(state.version, 3)
+  assert.equal('history' in state, false)
+  assert.equal(state.last.cycle, 1)
+  assert.deepEqual(Object.keys(state.last).filter(k => !['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed'].includes(k)), [],
+    'reports stay in the result, not the state')
+  const second = await run({ args: { yieldAfterCycle: true, maxCycles: 4, state } })
+  const third = await run({ args: { yieldAfterCycle: true, maxCycles: 4, state: second.result.state } })
+  assert.equal(third.result.state.cyclesUsed, 3)
+  assert.ok(JSON.stringify(third.result.state).length < JSON.stringify(state).length + 200, 'launches do not accumulate history')
+})
+
+test('a changed or old-format state is refused before anything runs', async () => {
+  const { state } = (await run({ args: { yieldAfterCycle: true, maxCycles: 3 } })).result
+  const trace = []
+  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...state, cyclesUsed: 0 } } }), /state digest mismatch/)
+  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: JSON.stringify(state).replace('"cyclesUsed":1', '"cyclesUsed":0') } }), /state digest mismatch/)
+  const { last, digest, ...rest } = state
+  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...rest, version: 2, history: [last] } } }), /not a pr-babysit state of version 3/)
+  assert.deepEqual(trace, [], 'no agent ran')
+})
+
+test('stateRef loads the saved state through a loader and checks it against the digest', async () => {
+  const first = await run({ args: { yieldAfterCycle: true, maxCycles: 3 } })
+  const { state, stateDigest } = first.result
+  const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: stateDigest }
+  const line = JSON.stringify(state)
+  const loaded = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: line })
+  assert.equal(loaded.labels[0], 'state:load#1')
+  assert.equal(loaded.labels[1], 'preflight')
+  assert.match(loaded.calls[0].prompt, /\["result"\]\["state"\]/)
+  assert.match(loaded.calls[0].prompt, / '\/tmp\/tasks\/w1\.output'\n/)
+  assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded state carries the budget')
+
+  let n = 0
+  const retried = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: () => (++n === 1 ? line.replace('"cyclesUsed":1', '"cyclesUsed":0') : line) })
+  assert.deepEqual(retried.labels.slice(0, 3), ['state:load#1', 'state:load#2', 'preflight'])
+  assert.equal(retried.result.state.cyclesUsed, 2)
+
+  const garbled = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: () => line.slice(0, -5) })
+  assert.equal(garbled.result.reason, 'state-transfer-failed')
+  assert.equal(garbled.result.status, 'blocked')
+  assert.deepEqual(garbled.labels, ['state:load#1', 'state:load#2'], 'nothing past the loader runs')
+  assert.deepEqual(garbled.result.stateRef, stateRef)
+
+  const dead = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: new Error('boom') })
+  assert.equal(dead.result.reason, 'state-transfer-failed')
+  assert.match(dead.result.detail, /loader died/)
+})
+
+test('stateRef is refused when malformed or given with state', async () => {
+  const { state, stateDigest } = (await run({ args: { yieldAfterCycle: true, maxCycles: 3 } })).result
+  await assert.rejects(run({ args: { stateRef: { outputFile: '/x', digest: stateDigest }, state } }), /state or stateRef, not both/)
+  await assert.rejects(run({ args: { stateRef: { outputFile: 'rel/x', digest: stateDigest } } }), /stateRef must be/)
+  await assert.rejects(run({ args: { stateRef: { outputFile: '/x', digest: 'nothex!!' } } }), /stateRef must be/)
+  for (const outputFile of ['/tmp/$(printf injected).output', '/tmp/`id`.output', "/tmp/a'b.output", '/tmp/a b.output', '/tmp/../etc/x']) {
+    await assert.rejects(run({ args: { stateRef: { outputFile, digest: stateDigest } } }), /stateRef must be/, outputFile)
+  }
 })
