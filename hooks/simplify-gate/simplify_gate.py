@@ -478,10 +478,29 @@ def handle(root, directory, payload):
         job['lock'].close()
 
 
+def chief_session(transcript_path):
+    """True when the transcript's header records the chief agent; unreadable means no."""
+    try:
+        with open(transcript_path, encoding='utf-8') as transcript:
+            for line in transcript:
+                record = json.loads(line)
+                if not isinstance(record, dict):
+                    return False
+                if record.get('type') in ('user', 'assistant'):
+                    return False
+                if record.get('type') == 'agent-setting':
+                    return record.get('agentSetting') == 'chief'
+    except (TypeError, OSError, ValueError):
+        pass
+    return False
+
+
 def main():
     if os.environ.get('COWORK_TURN'):
         return  # a headless coworker turn (skills/cowork); the caller reviews it
     payload = json.load(sys.stdin)
+    if chief_session(payload.get('transcript_path')):
+        return  # chief runs its own simplification pass (agents/chief.md)
     # A Bash call can leave its shell in another directory and the payload's
     # cwd follows it; the project directory names the checkout under review.
     project = os.environ.get('CLAUDE_PROJECT_DIR') or payload['cwd']

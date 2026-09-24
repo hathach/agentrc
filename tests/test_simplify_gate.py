@@ -2,6 +2,7 @@ import fcntl
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -620,6 +621,26 @@ class ActivationTest(unittest.TestCase):
         out = self.run_hook(self.root, {'hook_event_name': 'UserPromptSubmit', 'prompt': 'hi'}, COWORK_TURN='codex-1').stdout
         self.assertEqual(out, '')
         self.assertFalse((self.base / 'cache').exists())
+
+    def test_a_chief_session_is_left_alone(self):
+        prompt = {'hook_event_name': 'UserPromptSubmit', 'prompt': 'hi'}
+        headers = {
+            'chief': ['{"type":"agent-setting","agentSetting":"chief","sessionId":"s"}'],
+            'titled': ['{"type":"ai-title","aiTitle":"t"}', '{"type":"agent-setting","agentSetting":"chief"}'],
+            'writer': ['{"type":"agent-setting","agentSetting":"code-writer"}'],
+            'late': ['{"type":"user","message":{}}', '{"type":"agent-setting","agentSetting":"chief"}'],
+            'garbled': ['not json'],
+            'array': ['[]', '{"type":"agent-setting","agentSetting":"chief"}'],
+        }
+        for name, lines in headers.items():
+            path = self.base / f'{name}.jsonl'
+            path.write_text('\n'.join(lines) + '\n')
+            self.run_hook(self.root, {**prompt, 'transcript_path': str(path)})
+            ran = (self.base / 'cache').exists()
+            self.assertEqual(ran, name not in ('chief', 'titled'), name)
+            shutil.rmtree(self.base / 'cache', ignore_errors=True)
+        self.run_hook(self.root, {**prompt, 'transcript_path': str(self.base / 'missing.jsonl')})
+        self.assertTrue((self.base / 'cache').exists(), 'an unreadable transcript gets no exemption')
 
     def test_the_project_dir_names_the_checkout_not_the_shell_cwd(self):
         prompt = {'hook_event_name': 'UserPromptSubmit', 'prompt': 'hi'}
