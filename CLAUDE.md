@@ -134,6 +134,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   sequence again for what changed, with the whole task as context, and any
   checks its changed inputs require. State its outcome in the completion
   report; a stage that could not run is pending, never done.
+  An authorized `pr-babysit` with `autoPush: true` may publish its own
+  repairs, not commits adopted through `adoptHead`, before their completion
+  review; each launch that made repairs is followed by this sequence on them
+  before relaunching, publishing further task changes or reporting done, as
+  the workflow's `whenToUse` details.
   In a `chief` session, chief's own sequence (commit check, one
   simplification pass, validation, whole-task review) replaces the per-step
   review and this bullet, and chief's hardware guard stands in for the

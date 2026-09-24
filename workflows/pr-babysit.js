@@ -1,7 +1,7 @@
 export const meta = {
   name: 'pr-babysit',
   description: 'Drive a PR to green: a fast review lane (validate bot findings, fix, push without waiting on CI) overlapped with a CI-watch lane; code-writer fixes, finding-verifier verification, at most one push per lane per cycle, and a bot/finding/outcome/commit table logged per cycle',
-  whenToUse: 'After opening a PR, from a clean checkout of the PR branch, with no other writer in that checkout: an edit to a path this run already owns is indistinguishable from its own and would be published. Default is a dry run (fixes left uncommitted, nothing posted); passing autoPush: true is what tells the workflow to push and to post PR comments.',
+  whenToUse: 'After opening a PR, from a clean checkout of the PR branch, with no other writer in that checkout: an edit to a path this run already owns is indistinguishable from its own and would be published. Default is a dry run (fixes left uncommitted, nothing posted); passing autoPush: true is what tells the workflow to push and to post PR comments. With autoPush, its own repairs may be published before the caller\'s completion review (CLAUDE.md): a caller other than chief launches with yieldAfterCycle: true and, after each return or interruption, records the repairs and their publishing status, including uncertainty, as completion review pending, recovers partial work and uncertain publishing outcomes, then reviews them before relaunching, publishing further task changes or reporting done; chief uses its own sequence.',
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
