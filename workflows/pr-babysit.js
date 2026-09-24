@@ -313,20 +313,22 @@ const COMMIT = {
   required: ['committed', 'detail'],
   properties: { committed: { type: 'boolean' }, detail: { type: 'string' } },
 }
-// What running the repository's hooks on the owned paths did: the tree before
-// and after, the owned files' blob hashes before and after, and which hooks said
-// they modified files. The workflow decides from these what a hook regenerated.
+// What running the repository's hooks on the owned paths did, as HOOKS_SCRIPT
+// reports it: the tree before and after, the owned files' blob hashes before and
+// after, and which hooks said they modified files. The workflow decides from
+// these what a hook regenerated.
 const HOOKS = {
   type: 'object', additionalProperties: false,
   required: ['ran', 'passed', 'modifiedBy', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
   properties: {
+    error: { type: 'string' },
     ran: { type: 'boolean' }, passed: { type: 'boolean' },
     modifiedBy: { type: 'array', items: { type: 'string' } },
     before: { type: 'array', items: { type: 'string' } }, after: { type: 'array', items: { type: 'string' } },
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
 }
-// One `<mode> <blob> <path>` line per path, as the hook agent reports the
+// One `<mode> <blob> <path>` line per path, as HOOKS_SCRIPT reports the
 // working tree and the audit reports the commit (`git ls-tree` spells it
 // `<mode> blob <sha>\t<path>`). The working-tree mode is git's, 644 or 755 by
 // the executable bit, since the filesystem's own bits (664, 775) are not what
@@ -336,9 +338,6 @@ const HOOKS = {
 // Every path goes through `-z` and NUL-to-newline: with a space or a quote in
 // the name, porcelain and ls-tree would otherwise quote it and ls-tree not.
 const STATUS_RECIPE = "git status --porcelain -z | tr '\\0' '\\n'"
-const snapshotRecipe = (owned) =>
-  `{ printf '%s\\n' ${owned.map(f => `'${f}'`).join(' ')}; ${STATUS_RECIPE} | cut -c4-; } | sort -u | ` +
-  'while IFS= read -r f; do if [ -e "$f" ]; then printf \'%s %s %s\\n\' "$([ -x "$f" ] && echo 755 || echo 644)" "$(git hash-object -- "$f")" "$f"; else printf \'absent - %s\\n\' "$f"; fi; done'
 const snapshotOf = (lines) => {
   const out = new Map()
   for (const l of lines) {
@@ -380,6 +379,7 @@ const SCOPE = {
 // is not: the wrong gh flag once put a file path into thirteen public replies
 // and every one of them came back 201.
 const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
+const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
 // The body's checksum rides in the manifest and comes back in the receipt, so a
 // body the posting agent transcribed wrong is refused by the script and a
 // receipt for a different body is refused here. Same function in reply.py.
@@ -905,15 +905,16 @@ const commitAndPush = async (cycle, what, owned = []) => {
   // list and never chooses a path itself.
   const quoted = checked.map(f => `'${f}'`).join(' ')
   const hooks = await agent(
-    `${IN_CHECKOUT}Editing nothing by hand. before = the lines of \`${STATUS_RECIPE}\`; ` +
-    `snapshotBefore = the lines of: ${snapshotRecipe(checked)}\n` +
-    `If .pre-commit-config.yaml exists: run \`pre-commit run --files ${quoted}\`, and once more if it exited non-zero; ` +
-    'ran = true, passed = whether the last run exited 0, modifiedBy = the ids of the hooks whose output said "files were modified by this hook". ' +
-    'Otherwise ran = false, passed = true, modifiedBy = []. ' +
-    'after = the status lines again; snapshotAfter = the snapshot lines again.',
-    { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: HOOKS },
+    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
+    'and return the JSON object on its last stdout line unchanged. ' +
+    'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ran = false, passed = false and every list empty.',
+    { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
   ).catch(e => { log(`hooks#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
+  if (hooks.error) {
+    log(`push#${cycle}-${what}: refusing to publish — no hook evidence: ${hooks.error}`)
+    return { pass: false, committed: false, detail: `no hook evidence: ${hooks.error}`, sha: '' }
+  }
   const checkedSet = new Set(checked.map(canon))
   const beforePaths = withoutIdeDrift(hooks.before).map(pathOf)
   const outside = beforePaths.filter(f => !checkedSet.has(f))

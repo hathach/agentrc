@@ -111,7 +111,7 @@ const pathLine = (prompt) => {
 }
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
-const hookQuoted = (prompt) => [...(String(prompt).match(/pre-commit run --files ((?:'[^']*' ?)+)/) || ['', ''])[1].matchAll(/'([^']*)'/g)].map(m => m[1])
+const hookQuoted = (prompt) => [...(String(prompt).match(/hooks\.py ((?:'[^']*' ?)+)/) || ['', ''])[1].matchAll(/'([^']*)'/g)].map(m => m[1])
 const lsTreeOf = (paths) => paths.map(f => `100644 blob ${blobOf(f)}\t${f}`)
 
 // Drive the workflow against stub agents. Every cycle gets the same `reviews`
@@ -3115,10 +3115,16 @@ test('a path with a space or a quote survives status, snapshot, diff-tree and ls
     const { result, calls } = await run({ ...publishing, reviews: { findings: [finding({ file: p })], replies: [], bots: 'reviewed' } })
     assert.equal((result.history[0].reviewPush || {}).pass, true, JSON.stringify(result.history[0].reviewPushFailed))
     assert.deepEqual(pathLine(calls.find(c => c.label === 'commit#1-review').prompt), [p], 'the path itself was committed')
-    assert.ok(calls.find(c => c.label === 'hooks#1-review').prompt.includes("--porcelain -z | tr '\\0' '\\n'"), 'status is read NUL-separated, never quoted')
+    assert.deepEqual(hookQuoted(calls.find(c => c.label === 'hooks#1-review').prompt), [p], 'the hook script gets the path itself')
     const audit = calls.find(c => c.label === 'audit#1-review').prompt
     assert.ok(audit.includes('ls-tree -z HEAD') && audit.includes("--name-only -r -z HEAD | tr '\\0' '\\n'"), 'and so are the commit paths')
   }
+})
+
+test('a hook script that reports no evidence stops publication with its error', async () => {
+  const { result, labels } = await run({ ...publishing, hooks: { error: 'pre-commit exited 0 but reported hook fmt failed', ran: false, passed: false } })
+  assert.match(result.history[0].reviewPushFailed.detail, /^no hook evidence: pre-commit exited 0/)
+  assert.ok(!labels.some(l => l.startsWith('commit#')), 'nothing is committed')
 })
 
 test('a file a hook created and staged is refused like an untracked one', async () => {
