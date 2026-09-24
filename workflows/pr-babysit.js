@@ -30,7 +30,10 @@ export const meta = {
 //          adoptHead?: string (full SHA of commits the caller made and audited on top of the
 //            state's expectedHead, a hardware repair say: this launch audits the chain, publishes
 //            it under autoPush and continues from it with the same state; per launch, never saved) }
-if (typeof args === 'string') { try { args = JSON.parse(args) } catch { /* not JSON: shape check below reports it */ } }
+if (typeof args === 'string') {
+  // A caller that retyped a large state here most likely truncated it: say where the parse broke.
+  try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
+}
 if (!args || !args.pr) {
   throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
 }

@@ -304,7 +304,7 @@ async function run(opts = {}) {
       'args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget',
       ...ABSENT, body)
     const result = await fn(
-      { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['codex'], ...opts.args },
+      opts.rawArgs ?? { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['codex'], ...opts.args },
       agent, pipeline, parallel, () => {}, (m) => logs.push(String(m)), workflow, null,
       ...ABSENT.map(() => undefined))
     return { result, logs, labels: calls.map(c => c.label), calls, napPoints }
@@ -348,6 +348,8 @@ test('meta names the three phases the workflow dispatches into', async () => {
 
 test('args validation', async () => {
   await assert.rejects(run({ args: { pr: undefined } }), /args must be/)
+  await assert.rejects(run({ rawArgs: '{"pr": 3888, "state": {"version": 3' }), /args is not valid JSON \(.+\); pass an object/)
+  await assert.rejects(run({ rawArgs: '{"pr": 0}' }), /args must be/, 'valid JSON still gets the shape check')
   await assert.rejects(run({ args: { pr: 0 } }), /args must be/)
   await assert.rejects(run({ args: { pr: -3 } }), /positive integer/)
   await assert.rejects(run({ args: { pr: 'abc' } }), /positive integer/)
