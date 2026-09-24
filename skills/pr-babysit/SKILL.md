@@ -21,9 +21,10 @@ python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SH
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 python3 $S/build_compare.py candidate --path 'src/a.c' --command 'make -C <BUILD>'
 python3 $S/build_compare.py base --rev <sha> [--setup CMD] --command 'make -C <BUILD>'
+python3 $S/state_transfer.py <saved output> [--chunks I,J]  # a stateRef's state as checksummed base64 chunks
 ```
 
-`preflight.py` and `commits.py` only read; `hooks.py` runs the repository's
+`preflight.py`, `commits.py` and `state_transfer.py` only read; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build_compare.py` builds the checkout, or the
 given revision in a temporary worktree it removes, in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed. Run it by hand only with the user's authorization to push.
