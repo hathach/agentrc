@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
@@ -105,6 +108,18 @@ const conforms = (schema, value, at) => {
   return value
 }
 
+// state_transfer.py's envelope for a saved output holding `state`, all chunks or `chunks` ("1,3").
+const STATE_TRANSFER = new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url).pathname
+const transferOf = (state, chunks) => {
+  const dir = mkdtempSync(join(tmpdir(), 'pr-babysit-state-'))
+  try {
+    const file = join(dir, 'w.output')
+    writeFileSync(file, JSON.stringify({ result: { state } }))
+    const done = spawnSync('python3', [STATE_TRANSFER, file, ...(chunks ? ['--chunks', chunks] : [])], { encoding: 'utf8' })
+    return JSON.parse(done.stdout.trim().split('\n').at(-1))
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+}
+
 // The paths a publishing prompt names, read from the one line that carries
 // nothing else: quoted fragments elsewhere in the prompt (commands, hook names)
 // are not paths.
@@ -150,9 +165,12 @@ async function run(opts = {}) {
     })
     if (opts.throwOn && label.startsWith(opts.throwOn)) throw new Error(`${label} exploded`)
     if (label.startsWith('state:load#')) {
-      const answer = typeof opts.load === 'function' ? await opts.load(label) : opts.load
-      if (answer instanceof Error) throw answer
-      return answer === null ? null : conforms(options.schema, { state: answer }, label)
+      // The real state_transfer.py on a saved output holding opts.load, then
+      // opts.copy(envelope, label) for what the loader agent hands back.
+      if (opts.load instanceof Error) throw opts.load
+      const envelope = transferOf(opts.load, (String(prompt).match(/ --chunks ([\d,]+)\n/) || [])[1])
+      const answer = opts.copy ? await opts.copy(envelope, label) : envelope
+      return answer === null ? null : conforms(options.schema, answer, label)
     }
     if (label === 'preflight') return patch({ ...PIN, head, prHead }, opts.preflight)
     if (label === 'adopt:audit') {
@@ -4535,32 +4553,144 @@ test('a changed or old-format state is refused before anything runs', async () =
   assert.deepEqual(trace, [], 'no agent ran')
 })
 
-test('stateRef loads the saved state through a loader and checks it against the digest', async () => {
-  const first = await run({ args: { yieldAfterCycle: true, maxCycles: 3 } })
+// The state a launch saves after refuting `findings`, and a stateRef to it.
+const saved = async (findings) => {
+  const first = await run({
+    reviews: { findings, replies: findings.map(f => ({ commentId: f.commentId, body: 'not so' })), bots: 'reviewed' },
+    args: { maxCycles: 3, yieldAfterCycle: true },
+  })
   const { state, stateDigest } = first.result
-  const stateRef = { outputFile: '/tmp/tasks/w1.output', digest: stateDigest }
-  const line = JSON.stringify(state)
-  const loaded = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: line })
-  assert.equal(loaded.labels[0], 'state:load#1')
-  assert.equal(loaded.labels[1], 'preflight')
-  assert.match(loaded.calls[0].prompt, /\["result"\]\["state"\]/)
-  assert.match(loaded.calls[0].prompt, / '\/tmp\/tasks\/w1\.output'\n/)
+  return { state, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: stateDigest } }
+}
+// A decision reason a copying model might "correct".
+const REASON = 'SKILL.md:146 at head (144 at eda9a913) — é ✓ "q" \\ end'
+const savedForLoad = () => saved([invalidFinding({ reason: REASON })])
+const loadWith = (state, stateRef, copy) => run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, copy })
+const asks = (calls) => calls.filter(c => c.label.startsWith('state:load#')).map(c => (c.prompt.match(/ --chunks ([\d,]+)\n/) || [null, 'all'])[1])
+const flip = (data) => (data[0] === 'A' ? 'B' : 'A') + data.slice(1)
+const once = (change) => (env, label) => label === 'state:load#1' ? change(structuredClone(env)) : env
+// The live loader's "correction" (146 -> 144) made in a chunk together with its
+// sum: the state stays well formed, so only the seal can tell.
+const forged = (env) => {
+  const c = env.chunks.find(c => Buffer.from(c.data, 'base64').toString('latin1').includes('SKILL.md:146'))
+  if (!c) throw new Error('fixture: no chunk holds SKILL.md:146 whole')
+  c.data = Buffer.from(Buffer.from(c.data, 'base64').toString('latin1').replace('SKILL.md:146', 'SKILL.md:144'), 'latin1').toString('base64')
+  c.sum = fnv1a(c.data)
+  return env
+}
+
+test('stateRef loads the saved state as checksummed chunks, exactly', async () => {
+  const { state, stateRef } = await savedForLoad()
+  assert.ok(transferOf(state).chunks.length > 1, 'the fixture spans several chunks')
+  const loaded = await loadWith(state, stateRef)
+  assert.deepEqual(loaded.labels.slice(0, 2), ['state:load#1', 'preflight'])
+  assert.match(loaded.calls[0].prompt, /state_transfer\.py '\/tmp\/tasks\/w1\.output'\n/)
   assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded state carries the budget')
+  assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
+})
 
-  let n = 0
-  const retried = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: () => (++n === 1 ? line.replace('"cyclesUsed":1', '"cyclesUsed":0') : line) })
-  assert.deepEqual(retried.labels.slice(0, 3), ['state:load#1', 'state:load#2', 'preflight'])
-  assert.equal(retried.result.state.cyclesUsed, 2)
+test('a mis-copied, missing or duplicated chunk is asked for again alone', async () => {
+  const { state, stateRef } = await savedForLoad()
+  const last = transferOf(state).chunks.length - 1
+  const cases = [
+    [env => { env.chunks[1].data = flip(env.chunks[1].data); return env }, '1'], // sum no longer matches
+    [env => { env.chunks.splice(last, 1); return env }, String(last)], // dropped
+    [env => { env.chunks.push({ ...env.chunks[0], data: flip(env.chunks[0].data) }); return env }, '0'], // two copies of 0
+    [env => { env.chunks[0].data = '!' + env.chunks[0].data.slice(1); env.chunks[0].sum = fnv1a(env.chunks[0].data); return env }, '0'], // not base64
+    [env => { env.chunks[1].data = env.chunks[1].data.slice(4); env.chunks[1].sum = fnv1a(env.chunks[1].data); return env }, '1'], // short
+    [env => { delete env.chunks[1].sum; return env }, '1'], // copied without its sum
+    [env => { delete env.chunks[1].data; return env }, '1'], // copied without its data
+  ]
+  for (const [change, again] of cases) {
+    const got = await loadWith(state, stateRef, once(change))
+    assert.deepEqual(asks(got.calls), ['all', again])
+    assert.equal(got.labels[2], 'preflight')
+    assert.deepEqual(got.result.state.decisions, state.decisions)
+  }
+  // An index out of range or not asked for settles nothing and costs nothing more.
+  const extra = await loadWith(state, stateRef, (env, label) => label === 'state:load#1'
+    ? { ...env, chunks: [...env.chunks.slice(1), { i: 999, data: 'AAAA', sum: fnv1a('AAAA') }] }
+    : { ...env, chunks: [...env.chunks, { ...transferOf(state).chunks[last] }] })
+  assert.deepEqual(asks(extra.calls), ['all', '0'])
+  assert.equal(extra.labels[2], 'preflight')
+})
 
-  const garbled = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: () => line.slice(0, -5) })
-  assert.equal(garbled.result.reason, 'state-transfer-failed')
-  assert.equal(garbled.result.status, 'blocked')
-  assert.deepEqual(garbled.labels, ['state:load#1', 'state:load#2'], 'nothing past the loader runs')
-  assert.deepEqual(garbled.result.stateRef, stateRef)
+test('changed metadata, or a chunk changed with its sum, asks for the whole state again', async () => {
+  const { state, stateRef } = await savedForLoad()
+  // A length off by one looks consistent alone: the last chunk seems short, so it is
+  // asked for again, and the true length in that reply then drops everything.
+  const offByOne = await loadWith(state, stateRef, once(env => ({ ...env, length: env.length + 1 })))
+  assert.deepEqual(asks(offByOne.calls), ['all', String(transferOf(state).chunks.length - 1), 'all'])
+  assert.equal(offByOne.labels[3], 'preflight')
+  for (const change of [
+    env => ({ ...env, length: 256 * 1024 + 1 }),
+    env => ({ ...env, digest: '00000000' }),
+    env => ({ ...env, v: 2 }),
+    forged,
+  ]) {
+    const got = await loadWith(state, stateRef, once(change))
+    assert.deepEqual(asks(got.calls), ['all', 'all'])
+    assert.equal(got.labels[2], 'preflight')
+  }
+  // A partial reply whose length differs from the retained chunks' drops them too.
+  const partial = await loadWith(state, stateRef, (env, label) =>
+    label === 'state:load#1' ? { ...env, chunks: env.chunks.slice(1) } : label === 'state:load#2' ? { ...env, length: env.length - 1 } : env)
+  assert.deepEqual(asks(partial.calls), ['all', '0', 'all'])
+  assert.equal(partial.labels[3], 'preflight')
+})
 
+// Nine chunks, as the live #3975 state: more than one reply may carry.
+const savedLarge = async () => {
+  const large = await saved([...Array(7).keys()].map(k => invalidFinding({ commentId: k + 1, reason: `r${k} `.padEnd(300, 'x') })))
+  assert.equal(Math.ceil(transferOf(large.state).length / 512), 9, 'the fixture is nine chunks')
+  return large
+}
+
+test('a large state arrives four chunks per call, and a mangled batch costs only its bad chunks', async () => {
+  const { state, stateRef } = await savedLarge()
+  const clean = await loadWith(state, stateRef)
+  assert.deepEqual(asks(clean.calls), ['all', '4,5,6,7', '8'])
+  assert.equal(clean.labels[3], 'preflight')
+  assert.deepEqual(clean.result.state.decisions, state.decisions)
+  // The live copy's faults: a chunk spliced, a chunk without its sum, a chunk altered with its sum kept.
+  const live = await loadWith(state, stateRef, (env, label) => {
+    const e = structuredClone(env)
+    if (label === 'state:load#1') e.chunks[3].data = e.chunks[3].data.slice(0, 100) + e.chunks[3].data.slice(-100)
+    if (label === 'state:load#2') { delete e.chunks[2].sum; e.chunks[3].data = flip(e.chunks[3].data) }
+    return e
+  })
+  assert.deepEqual(asks(live.calls), ['all', '3,4,5,6', '5,6,7,8'])
+  assert.equal(live.labels[3], 'preflight')
+  // A short copied length sizes a short budget; the true length, once accepted, grows it.
+  const short = await loadWith(state, stateRef, (env, label) => {
+    const e = structuredClone(env)
+    if (label === 'state:load#1') e.length = 4 * 512 - 10
+    if (label === 'state:load#4') for (const c of e.chunks) if (c.i !== 7) c.data = flip(c.data)
+    if (label === 'state:load#5') for (const c of e.chunks) if (c.i !== 8) c.data = flip(c.data)
+    return e
+  })
+  assert.deepEqual(asks(short.calls), ['all', '3', 'all', '4,5,6,7', '4,5,6,8', '4,5,6'])
+  assert.equal(short.labels[6], 'preflight')
+  // Progress undone by every other reply stops at the budget: 3 + 2 per batch of four.
+  const seesaw = await loadWith(state, stateRef, (env, label) =>
+    Number(label.split('#')[1]) % 2 ? env : { ...env, length: env.length - 1 })
+  assert.equal(seesaw.result.reason, 'state-transfer-failed')
+  assert.equal(seesaw.labels.length, 9)
+})
+
+test('a transfer that never checks out blocks before preflight with the stateRef untouched', async () => {
+  const { state, stateRef } = await savedForLoad()
+  const always = await loadWith(state, stateRef, (env) => forged(structuredClone(env)))
+  assert.equal(always.result.reason, 'state-transfer-failed')
+  assert.equal(always.result.status, 'blocked')
+  assert.deepEqual(always.labels, ['state:load#1', 'state:load#2'], 'two calls without a new chunk end it; nothing past the loader runs')
+  assert.deepEqual(always.result.stateRef, stateRef)
+  assert.match(always.result.detail, /does not match stateRef\.digest/)
   const dead = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: new Error('boom') })
   assert.equal(dead.result.reason, 'state-transfer-failed')
   assert.match(dead.result.detail, /loader died/)
+  const refused = await loadWith(state, stateRef, () => ({ error: 'cannot read /tmp/tasks/w1.output: No such file or directory' }))
+  assert.match(refused.result.detail, /state_transfer\.py: cannot read/)
 })
 
 test('stateRef is refused when malformed or given with state', async () => {

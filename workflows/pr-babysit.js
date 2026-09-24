@@ -34,7 +34,8 @@ export const meta = {
 //            needs yieldAfterCycle and never declares the PR done),
 //          state?: object (a previous launch's returned state, handed back unchanged),
 //          stateRef?: { outputFile, digest } (instead of state: the saved Workflow output holding
-//            that result and its stateDigest; a loader reads it, so no model retypes the state),
+//            that result and its stateDigest; a loader agent copies it as checksummed chunks,
+//            and a copy that fails the stateDigest is asked for again or refused),
 //          adoptHead?: string (full SHA of commits the caller made and audited on top of the
 //            state's expectedHead, a hardware repair say: this launch audits the chain, publishes
 //            it under autoPush and continues from it with the same state; per launch, never saved) }
@@ -146,19 +147,61 @@ if (args.stateRef != null) {
       !/^[0-9a-f]{8}$/.test(ref.digest || '')) {
     throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._/-]), digest: the result\'s 8-hex stateDigest }')
   }
-  const LOADED = { type: 'object', additionalProperties: false, required: ['state'], properties: { state: { type: 'string' } } }
+  // Only an agent can read the file, and a model copying text "corrects" it, so
+  // the loader copies state_transfer.py's opaque base64 chunks instead; each
+  // chunk's sum finds a mis-copy to ask for again, and the seal checks the whole.
+  const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
+  const SIZE = 512
+  const PER_CALL = 4 // a live sonnet copy of 9 chunks truncated and spliced them
+  const MAX = 64 * 1024
+  const ENVELOPE = {
+    type: 'object', additionalProperties: false,
+    properties: {
+      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, error: { type: 'string' },
+      // Chunk fields are optional so one chunk copied without its sum costs that chunk, not the reply.
+      chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
+        properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
+    },
+  }
   let why = ''
-  for (let attempt = 1; attempt <= 2 && args.state == null; attempt++) {
-    const got = await agent(
-      `Run exactly: python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["result"]["state"], separators=(",", ":")))' '${ref.outputFile}'\n` +
-      'Return its stdout, one line of JSON, unchanged as state; change and add nothing. If the command fails, return its error text as state.',
-      { label: `state:load#${attempt}`, model: 'sonnet', effort: 'low', schema: LOADED },
+  let length = 0 // of the envelope the retained chunks came from; 0 asks for a first batch
+  let most = 0 // the longest length accepted: a copied length can be short, so it only grows the budget
+  let got = new Map() // chunk index -> its checked bytes
+  let idle = 0 // consecutive calls that checked no new chunk
+  const reset = (reason) => { why = reason; length = 0; got = new Map() }
+  for (let call = 1; args.state == null && idle < 2 && call <= 3 + 2 * Math.ceil(most / SIZE / PER_CALL); call++) {
+    idle++
+    const asked = length ? [...Array(Math.ceil(length / SIZE)).keys()].filter(i => !got.has(i)).slice(0, PER_CALL) : null
+    const env = await agent(
+      `Run exactly: python3 ${STATE_SCRIPT} '${ref.outputFile}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
+      'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
+      'copy every character exactly and change, reorder, drop or add nothing.',
+      { label: `state:load#${call}`, model: 'sonnet', effort: 'low', schema: ENVELOPE },
     ).catch(e => { why = `loader died: ${e && e.message}`; return null })
-    if (!got) continue
+    if (!env) continue
+    if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; continue }
+    const fresh = env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
+      env.digest === ref.digest && Array.isArray(env.chunks)
+    if (!fresh || (length && env.length !== length)) { reset('the envelope metadata is malformed or changed'); continue }
+    length = env.length
+    most = Math.max(most, length)
+    const total = Math.ceil(length / SIZE)
+    const want = new Set(asked || [...Array(Math.min(total, PER_CALL)).keys()])
+    const byIndex = new Map()
+    for (const c of env.chunks) byIndex.set(c.i, byIndex.has(c.i) ? null : c) // a duplicate settles neither copy
+    let added = false
+    for (const [i, c] of byIndex) {
+      if (!c || !want.has(i) || typeof c.data !== 'string' || c.sum !== fnv1a(c.data)) continue
+      const bytes = fromBase64(c.data)
+      if (bytes !== null && bytes.length === Math.min(SIZE, length - i * SIZE)) { got.set(i, bytes); added = true }
+    }
+    const missing = [...Array(total).keys()].filter(i => !got.has(i))
+    if (missing.length) { if (added) idle = 0; why = `chunks ${missing.join(',')} missing or mis-copied`; continue }
     let st = null
-    try { st = JSON.parse(got.state) } catch { why = `not JSON: ${got.state.slice(0, 200)}`; continue }
-    if (!st || st.digest !== ref.digest || sealOf(st) !== ref.digest) { why = 'the loaded state does not match stateRef.digest'; continue }
-    args.state = st
+    try { st = JSON.parse([...Array(total).keys()].map(i => got.get(i)).join('')) } catch {}
+    if (st && st.digest === ref.digest && sealOf(st) === ref.digest) { args.state = st; break }
+    // Every chunk passed its sum yet the whole fails: a chunk and its sum were changed together.
+    reset('the reassembled state does not match stateRef.digest')
   }
   if (args.state == null) {
     log(`state: ${why}; the output file is untouched`)
@@ -515,6 +558,17 @@ const runReplyScript = (label, mode, task, rules, payload) => agent(
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+// Standard base64 to a string of byte values, or null for anything else.
+function fromBase64 (text) {
+  if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  let out = ''
+  for (let k = 0; k < text.length; k += 4) {
+    const n = [...text.slice(k, k + 4)].reduce((acc, ch) => (acc << 6) | Math.max(B64.indexOf(ch), 0), 0)
+    out += String.fromCharCode((n >> 16) & 255, (n >> 8) & 255, n & 255)
+  }
+  return out.slice(0, out.length - (text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0))
+}
 // The body's checksum rides in the manifest and comes back in the receipt, so a
 // body the posting agent transcribed wrong is refused by the script and a
 // receipt for a different body is refused here. Same function in reply.py.
