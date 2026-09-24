@@ -187,6 +187,8 @@ async function run(opts = {}) {
     if (label.startsWith('reviews#')) {
       if (reviews instanceof Error) throw reviews
       const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle() : reviews)
+      // A finding that relates to no earlier verdict, unless a case says it does.
+      if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, ...f }))
       // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
       // state; explicit records are filled the same way, one field at a time.
       // The auto-running bots are the ones the workflow's prompt names.
@@ -279,13 +281,16 @@ async function run(opts = {}) {
     }
     if (label.startsWith('challenge#')) {
       assert.equal(options.agentType, 'finding-verifier')
-      if (opts.challengePerCycle) return opts.challengePerCycle()
+      // Fixtures say upheld true/false for justified/valid; unknown is spelled out.
+      const tri = (c) => c && Array.isArray(c.verdicts)
+        ? { verdicts: c.verdicts.map(({ upheld, ...v }) => upheld === undefined ? v : { ...v, verdict: upheld ? 'justified' : 'valid' }) } : c
+      if (opts.challengePerCycle) return tri(opts.challengePerCycle())
       if (!('challenge' in opts)) {
-        // default: uphold every submitted dismissal, i.e. today's behaviour
+        // default: uphold every submitted dismissal
         const ids = [...String(prompt).matchAll(/"id":(\d+)/g)].map(m => Number(m[1]))
-        return { verdicts: ids.map(id => ({ id, upheld: true, reason: 'stands' })) }
+        return { verdicts: ids.map(id => ({ id, verdict: 'justified', reason: 'stands' })) }
       }
-      return opts.challenge === null ? null : structuredClone(opts.challenge)
+      return opts.challenge === null ? null : tri(structuredClone(opts.challenge))
     }
     if (label.startsWith('check:')) {
       assert.equal(options.agentType, 'finding-verifier')
@@ -2497,6 +2502,178 @@ test('a dry run applies a deferral but posts nothing', async () => {
   assert.deepEqual(result.state.deferrals.map(([id]) => id), ['1#1'])
 })
 
+// --- decision continuity ---
+
+// A launch refutes comment 1 and posts it; the resumed launch harvests `then`.
+const refutedThen = async (then) => {
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 3, yieldAfterCycle: true },
+  })
+  return run({ reviews: then, args: { maxCycles: 3, state: first.result.state } })
+}
+
+test('each verdict is kept in the state and handed to the validator on a resumed launch', async () => {
+  const first = await run({ reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }, args: { maxCycles: 3, yieldAfterCycle: true } })
+  const [[id, d]] = first.result.state.decisions
+  assert.equal(id, '1#1')
+  assert.deepEqual(d, { commentId: 1, digest: 'd1', reviewedSha: HEAD, file: 'src/a.c', line: 1, claim: 'bad', verdict: 'invalid', reason: 'the caller checks it' })
+  const second = await run({ reviews: oneValid, args: { maxCycles: 3, state: first.result.state } })
+  const prompt = second.calls.find(c => c.label.startsWith('reviews#')).prompt
+  assert.match(prompt, /Earlier verdicts: \[\{"findingId":"1#1","commentId":1,.*"verdict":"invalid","reason":"the caller checks it"\}\]/)
+  assert.match(prompt, /set related to that record's findingId/)
+})
+
+test('a verdict that flips without a reason is held: not fixed, not answered, still owed', async () => {
+  for (const [then, earlier] of [
+    [{ findings: [finding()], replies: [], bots: 'reviewed' }, 'invalid'],
+    [{ findings: [finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1' })], replies: [], bots: 'reviewed' }, 'invalid'],
+  ]) {
+    const { result, labels, logs } = await refutedThen(then)
+    assert.equal(labels.some(l => l.startsWith('fix:')), false)
+    assert.notEqual(result.pass, true)
+    assert.ok(logs.some(l => new RegExp(`held — contradicts the earlier ${earlier} verdict on 1#1 with no reason given`).test(l)), logs.join('\n'))
+    assert.match(rowsOf(summaries(logs)[0])[0][3], /^held: contradicts the earlier/)
+  }
+})
+
+test('a hold survives a harvest that omits the finding, within a launch and across a resume, until reconciled', async () => {
+  const flipped = { findings: [finding()], replies: [], bots: 'reviewed' }
+  const empty = { findings: [], replies: [], bots: 'reviewed' }
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true },
+  })
+  let cycle = 0
+  const within = await run({ reviewsPerCycle: () => ++cycle === 1 ? flipped : empty, args: { maxCycles: 5, state: first.result.state } })
+  assert.notEqual(within.result.pass, true, 'omitting the held finding settles nothing')
+  assert.deepEqual(within.result.state.holds.map(([id]) => id), ['1#1'])
+  assert.match(within.calls.filter(c => c.label.startsWith('reviews#')).at(-1).prompt, /report their findings again so they can be reconciled: \[1\]/)
+  const held = await run({ reviews: flipped, args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
+  const resumed = await run({ reviews: empty, args: { maxCycles: 5, state: held.result.state } })
+  assert.notEqual(resumed.result.pass, true, 'nor across a resume')
+  const explained = await run({ reviews: { findings: [finding({ changeReason: 'new evidence: the ISR path skips the check' })], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, yieldAfterCycle: true, state: held.result.state } })
+  assert.deepEqual(explained.result.state.holds, [])
+  assert.ok(explained.logs.some(l => /1#1 reconciled/.test(l)))
+})
+
+test('a comment with a held finding is not answered while a later harvest omits it', async () => {
+  let cycle = 0
+  const { result, labels } = await run({
+    args: { maxCycles: 3 },
+    reviewsPerCycle: () => ++cycle === 1
+      ? { findings: [invalidFinding(), invalidFinding({ line: 2 })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+      : { findings: [invalidFinding({ line: 2 })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    challengePerCycle: () => cycle === 1
+      ? { verdicts: [{ id: 0, verdict: 'unknown', reason: 'cannot tell' }, { id: 1, upheld: true, reason: 'stands' }] }
+      : { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.ok(cycle >= 2, 'the omitting harvest ran')
+  assert.equal(labels.some(l => l.startsWith('replies#')), false, 'the held point keeps the thread open')
+  assert.deepEqual(result.state.answeredWith, [])
+  assert.deepEqual(result.state.holds.map(([id]) => id), ['1#1'])
+  assert.notEqual(result.pass, true)
+})
+
+test('a held finding stays held against its earlier decision when a later harvest drops `related`', async () => {
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 3, yieldAfterCycle: true },
+  })
+  const related = finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1' })
+  const held = await run({ reviews: { findings: [related], replies: [], bots: 'reviewed' }, args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
+  assert.deepEqual(held.result.state.holds, [['5#1', { commentId: 5, reason: 'contradicts the earlier invalid verdict on 1#1 with no reason given', against: '1#1' }]])
+  const dropped = await run({ reviews: { findings: [{ ...related, related: null }], replies: [], bots: 'reviewed' }, args: { maxCycles: 3, state: held.result.state } })
+  assert.equal(dropped.labels.some(l => l.startsWith('fix:')), false)
+  assert.ok(!dropped.logs.some(l => /5#1 reconciled/.test(l)))
+  assert.ok(dropped.logs.some(l => /5#1 held — contradicts the earlier invalid verdict on 1#1/.test(l)))
+})
+
+test('a held finding keeps its earlier decision through a new uncertainty and a different `related`', async () => {
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 5, yieldAfterCycle: true },
+  })
+  const related = finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1' })
+  const held = await run({ reviews: { findings: [related], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
+  const unsure = await run({
+    reviews: { findings: [{ ...related, verdict: 'invalid', related: null }], replies: [{ commentId: 5, body: 'not so' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, verdict: 'unknown', reason: 'cannot tell' }] },
+    args: { maxCycles: 5, yieldAfterCycle: true, state: held.result.state },
+  })
+  assert.equal(unsure.result.state.holds[0][1].against, '1#1', 'a new uncertainty keeps the earlier reference')
+  for (const [state, rel] of [[unsure.result.state, null], [held.result.state, '5#1']]) {
+    const again = await run({ reviews: { findings: [{ ...related, related: rel }], replies: [], bots: 'reviewed' }, args: { maxCycles: 5, state } })
+    assert.equal(again.labels.some(l => l.startsWith('fix:')), false, `related ${rel}`)
+    assert.ok(again.logs.some(l => /5#1 held — contradicts the earlier invalid verdict on 1#1/.test(l)), `related ${rel}`)
+  }
+})
+
+test('a finding related to another comment keeps its own debt, and settling one does not settle the other', async () => {
+  const { result } = await refutedThen({ findings: [
+    invalidFinding({ reason: 'the caller checks it' }),
+    finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1', changeReason: 'new evidence: b.c has no caller check' }),
+  ], replies: [], bots: 'reviewed' })
+  assert.deepEqual(result.state.answeredWith.map(([id]) => id), [1, 5], 'comment 1 stays answered by its refutation, comment 5 gets its own note')
+  const first = await run({
+    reviews: { findings: [invalidFinding({ reason: 'the caller checks it' })], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    args: { maxCycles: 3, yieldAfterCycle: true },
+  })
+  const unsettled = await run({
+    reviews: { findings: [finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1', changeReason: 'new evidence' })], replies: [], bots: 'reviewed' },
+    args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state }, posting: () => null,
+  })
+  assert.ok(unsettled.result.state.debt.find(([id]) => id === 5), 'comment 5 owes its note')
+  assert.deepEqual(unsettled.result.state.answeredWith.map(([id]) => id), [1], 'comment 1 answered, comment 5 not')
+})
+
+test('a valid finding that turns invalid without a reason is held too, while valid to stale is a fix landing', async () => {
+  let cycle = 0
+  const turned = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ++cycle === 1 ? oneValid : { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' },
+  })
+  assert.ok(turned.logs.some(l => /1#1 held — contradicts the earlier valid verdict/.test(l)))
+  assert.equal(turned.labels.filter(l => l.startsWith('replies#')).length, 0)
+  cycle = 0
+  const landed = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ++cycle === 1 ? oneValid : { findings: [finding({ verdict: 'stale' })], replies: [], bots: 'reviewed' },
+  })
+  assert.ok(!landed.logs.some(l => /held/.test(l)))
+})
+
+test('an explained flip on a posted refutation is fixed and reported as a correction, with no reply', async () => {
+  const { result, labels, logs } = await refutedThen({ findings: [finding({ changeReason: 'earlier error: the caller does not check it on the ISR path' })], replies: [], bots: 'reviewed' })
+  assert.ok(labels.includes('fix:src/a.c'))
+  assert.equal(labels.some(l => l.startsWith('resolve#')), false, 'no correction reply')
+  assert.deepEqual(result.corrections, [{
+    findingId: '1#1', earlier: { findingId: '1#1', verdict: 'invalid', reason: 'the caller checks it' },
+    now: 'earlier error: the caller does not check it on the ISR path',
+  }])
+  assert.ok(logs.some(l => /1#1 was refuted in a posted reply and is valid now .* reported, no correction posted/.test(l)))
+})
+
+test('a challenger that cannot settle a dismissal neither posts it nor fixes the finding', async () => {
+  const { result, labels, logs } = await run({
+    args: { maxCycles: 1 },
+    reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, verdict: 'unknown', reason: 'the ISR path is not visible from here' }] },
+  })
+  assert.equal(labels.some(l => /^(replies#|fix:)/.test(l)), false)
+  assert.ok(logs.some(l => /1#1 held — the challenge could not settle the dismissal: the ISR path/.test(l)))
+  assert.deepEqual(result.state.debt.find(([id]) => id === 1)[1].dismissals, ['1#1'])
+  assert.equal(result.state.decisions.length, 0, 'a held verdict is not recorded as a decision')
+})
+
+test('the challenger is asked for three verdicts', async () => {
+  const { calls } = await run({ reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } })
+  const ch = calls.find(c => c.label === 'challenge#1')
+  assert.match(ch.prompt, /'justified' when it is correct/)
+  assert.match(ch.prompt, /'unknown' when you cannot establish either/)
+  assert.deepEqual(ch.schema.properties.verdicts.items.properties.verdict.enum, ['justified', 'valid', 'unknown'])
+})
+
 test('a receipt for a different body settles nothing', async () => {
   // The posting agent transcribed the manifest wrong, or answered with some
   // other reply's receipt: the digest does not match the body the workflow
@@ -2739,7 +2916,7 @@ test('an offered answer the comment outgrew is a repair, not a reuse or a repost
       cycle++
       return cycle === 1
         ? { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no bug exists' }], bots: 'reviewed' }
-        : { findings: [finding({ commentId: 2, line: 4, verdict: 'valid' })], replies: [], bots: 'reviewed' }
+        : { findings: [finding({ commentId: 2, line: 4, verdict: 'valid', changeReason: 'new evidence: the caller does reach it' })], replies: [], bots: 'reviewed' }
     },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })

@@ -174,6 +174,8 @@ if (args.state !== undefined && args.state !== null) {
     typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
     (st.deferrals === undefined || Array.isArray(st.deferrals)) &&
     (st.acceptedFailures === undefined || Array.isArray(st.acceptedFailures)) &&
+    (st.decisions === undefined || Array.isArray(st.decisions)) &&
+    (st.holds === undefined || Array.isArray(st.holds)) &&
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
@@ -246,9 +248,9 @@ const CHALLENGE = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['id', 'upheld', 'reason'],
+        required: ['id', 'verdict', 'reason'],
         properties: {
-          id: { type: 'integer' }, upheld: { type: 'boolean' }, reason: { type: 'string' },
+          id: { type: 'integer' }, verdict: { type: 'string', enum: ['justified', 'valid', 'unknown'] }, reason: { type: 'string' },
         },
       },
     },
@@ -282,8 +284,11 @@ const REVIEWS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint'],
+        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'related', 'changeReason'],
         properties: {
+          // related: the earlier decision's findingId this finding is the same
+          // problem as; changeReason: why the verdict differs from it, or null.
+          related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] },
           source: { type: 'string' }, findingId: { type: 'string' },
           commentDigest: { type: 'string' }, commentId: { type: 'integer' },
           file: { type: 'string' }, line: { type: 'integer' }, claim: { type: 'string' },
@@ -601,6 +606,19 @@ const debt = new Map(restored
 for (const a of (restored && restored.acceptedFailures) || []) {
   if (!acceptedArg.some(x => failureKey(x) === failureKey(a))) log(`accepted failure not renewed by this launch, no longer accepted: ${a.workflow} / ${a.job}${a.cell ? ` / ${a.cell}` : ''}: ${a.signature}`)
 }
+// findingId -> { commentId, digest, reviewedSha, file, line, claim, verdict,
+// reason }: the last settled verdict on each finding, so a later harvest that
+// contradicts it has to say why. Never evicted: a finding can come back after
+// any number of cycles, reworded or moved.
+const decisions = new Map(restored && restored.decisions ? restored.decisions : [])
+// findingId -> { commentId, reason, against }: a held verdict stays held, and
+// its comment unanswered, across cycles and launches until a harvest reports
+// that finding again without a hold; a harvest that merely omits it settles
+// nothing. `against` is the earlier decision it contradicted, if any.
+const holds = new Map(restored && restored.holds ? restored.holds : [])
+const heldComments = () => new Set([...holds.values()].map(h => h.commentId))
+// Posted refutations this launch found wrong, for the caller to correct.
+const corrections = []
 // findingId -> { digest, issueUrl, reason }: a caller's deferral once its issue
 // was read to cover the finding. It holds while the comment body it named stands.
 const deferrals = new Map(restored && restored.deferrals ? restored.deferrals : [])
@@ -638,6 +656,8 @@ const stateOut = () => {
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
     acceptedFailures: acceptedArg,
+    decisions: [...decisions],
+    holds: [...holds],
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], note: !!d.note, renumbered: !!d.renumbered, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
@@ -659,7 +679,7 @@ const finish = (verdict, status) => {
     } : null,
   }
   const state = stateOut()
-  return { stateDigest: state.digest, ...verdict, status: status || (verdict.pass ? 'complete' : 'blocked'), observation, state }
+  return { stateDigest: state.digest, ...verdict, ...(corrections.length ? { corrections } : {}), status: status || (verdict.pass ? 'complete' : 'blocked'), observation, state }
 }
 const owesDismissal = (commentId) => {
   const d = debt.get(commentId)
@@ -1101,12 +1121,13 @@ const cycleSummary = (entry) => {
   const findings = [...((entry.reviews && entry.reviews.findings) || [])]
     .sort((a, b) => (VERDICT_ORDER[a.verdict] ?? 3) - (VERDICT_ORDER[b.verdict] ?? 3))
   for (const f of findings) {
-    const valid = f.verdict === 'valid' && !f.deferral
+    const valid = f.verdict === 'valid' && !f.deferral && !f.hold
     rows.push([
       cell(f.source, 16),
       cell(`${f.file}:${f.line} ${f.claim}`),
       cell(f.overturned ? 'overturned' : f.verdict, 8),
-      f.deferral ? cell(`deferred, ${answerState(f.commentId)}: ${f.deferral.issueUrl}`, 120)
+      f.hold ? cell(`held: ${f.hold}`, 60)
+      : f.deferral ? cell(`deferred, ${answerState(f.commentId)}: ${f.deferral.issueUrl}`, 120)
       : valid ? cell((f.overturned ? 'refuted, then overturned, ' : '') +
         fixCell(entry.reviewFixes, f.commentId, entry.reviewPush, entry.reviewPushFailed), 60)
         : cell(`${f.verdict === 'stale' ? 'already fixed' : 'refuted'}, ${
@@ -1551,14 +1572,19 @@ const runCycle = async (cycle, entry) => {
       }).catch(e => { log(`cycle ${cycle}: pr-ci-watcher errored — ${e && e.message}`); return null })
     }
 
-    const owedLastCycle = [...debt.keys()]
+    const owedLastCycle = [...new Set([...debt.keys(), ...heldComments()])]
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
       `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others; ` +
       `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push: report one record for each and no other` : 'none of them auto-run: report no bot records'}. ${IN_CHECKOUT}` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report their findings again ' +
-          `so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '')
+          `so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +
+      (decisions.size > 0
+        ? 'Earlier verdicts on this PR follow. For each finding that is the same problem as one of them (the same findingId, or reworded, moved or in another file), ' +
+          "set related to that record's findingId, else null; when your verdict differs from it (valid against invalid or stale), set changeReason to what changed: " +
+          'the code since its reviewedSha, new evidence, or an error in the earlier verdict, with the specifics; else null. ' +
+          `Earlier verdicts: ${JSON.stringify([...decisions].map(([findingId, d]) => ({ findingId, ...d })))}. ` : '')
     // reviewers: [] is a CI-only run: there is nobody to harvest, so the lane is
     // skipped rather than asked to validate nothing. A `ci` launch skips it too:
     // nobody looked, so nothing settled.
@@ -1617,9 +1643,9 @@ const runCycle = async (cycle, entry) => {
       const ch = await agent(
         `${IN_CHECKOUT}Another reviewer dismissed these findings on PR #${args.pr}; each ` +
           "dismissal is about to be posted publicly and will close the reviewer's thread. " +
-          'For every id, decide whether the dismissal holds. upheld=true means the dismissal is ' +
-          'correct and the finding really is invalid or already fixed; upheld=false means the ' +
-          'finding is real and must be fixed, and reason is the evidence that shows it. ' +
+          "For every id, decide whether the dismissal holds: verdict 'justified' when it is correct and " +
+          "the finding really is invalid or already fixed; 'valid' when the finding is real and must be " +
+          "fixed; 'unknown' when you cannot establish either. reason is the evidence either way. " +
           'Return exactly one verdict per submitted id and no others.\n' +
           `Findings: ${JSON.stringify(submitted)}.`,
         { label: `challenge#${cycle}`, phase: 'Triage', agentType: 'finding-verifier', schema: CHALLENGE },
@@ -1638,14 +1664,56 @@ const runCycle = async (cycle, entry) => {
       }
 
       for (const v of ch.verdicts) {
-        if (v.upheld) continue
         const f = contested[v.id]
+        // Failing to prove a dismissal does not prove the finding: it is held,
+        // neither posted as refuted nor fixed.
+        if (v.verdict === 'unknown') f.hold = `the challenge could not settle the dismissal: ${v.reason}`
+        if (v.verdict !== 'valid') continue
+        f.challengeReason = v.reason
         f.verdict = 'valid'
         f.overturned = true   // rendered by cycleSummary's valid arm
         // The evidence leads; the harvested hint stays, advisory, for the fixer.
         f.fixHint = `Challenger evidence: ${v.reason}` +
           (f.fixHint ? `\nOriginal fix hint (advisory): ${f.fixHint}` : '')
       }
+    }
+
+    // A verdict that turns an earlier one around (a dismissal now valid, a
+    // valid finding now invalid) is held unless the validator said what changed
+    // or the challenger overturned it: an unexplained flip is not fixed or
+    // answered until reconciled. Valid to stale is a fix landing.
+    const turned = (was, now) => (was !== 'valid' && now === 'valid') || (was === 'valid' && now === 'invalid')
+    for (const f of r.findings) {
+      // A held finding answers to the decision it contradicted until reconciled
+      // with it, whatever this harvest names as related.
+      const ref = (holds.get(f.findingId) || {}).against || f.related || f.findingId
+      const prior = decisions.get(ref) || decisions.get(f.findingId)
+      if (!prior || f.hold || !turned(prior.verdict, f.verdict)) continue
+      const why = f.overturned ? `the challenger: ${f.challengeReason}` : f.changeReason && f.changeReason.trim()
+      if (!why) {
+        f.against = ref
+        f.hold = `contradicts the earlier ${prior.verdict} verdict on ${ref} with no reason given`
+        continue
+      }
+      // A dismissal we already posted, now a fix: reported, never answered here.
+      if (f.verdict === 'valid' && (answeredWith.get(prior.commentId) || {}).how === 'refutation') {
+        const c = { findingId: f.findingId, earlier: { findingId: ref, verdict: prior.verdict, reason: prior.reason }, now: why }
+        entry.corrections = [...(entry.corrections || []), c]
+        corrections.push(c)
+        log(`cycle ${cycle}: ${f.findingId} was refuted in a posted reply and is valid now (${why}) — reported, no correction posted`)
+      }
+    }
+    for (const f of r.findings) {
+      if (f.hold) { holds.set(f.findingId, { commentId: f.commentId, reason: f.hold, against: f.against || (holds.get(f.findingId) || {}).against || null }); log(`cycle ${cycle}: ${f.findingId} held — ${f.hold}`) }
+      else if (holds.delete(f.findingId)) log(`cycle ${cycle}: ${f.findingId} reconciled`)
+    }
+    const cut = (t) => String(t).slice(0, 300)
+    for (const f of r.findings) {
+      if (f.hold) continue
+      decisions.set(f.findingId, {
+        commentId: f.commentId, digest: f.commentDigest, reviewedSha: r.headSha, file: f.file, line: f.line,
+        claim: cut(f.claim), verdict: f.verdict, reason: cut(f.challengeReason || f.reason),
+      })
     }
 
     // A new deferral must name a valid finding of this harvest by id and body,
@@ -1700,7 +1768,8 @@ const runCycle = async (cycle, entry) => {
 
     // What a comment still owes, derived from this harvest, never stored:
     //   wait       - both a valid and a refuted finding: refuting now would
-    //                resolve the thread over a fix that has not landed.
+    //                resolve the thread over a fix that has not landed; or a
+    //                held finding, from this harvest or an earlier one.
     //   refutation - refuted findings only; the drafted reply answers it.
     //   fixNote    - valid findings only; the post-fix note answers it.
     //   deferral   - deferred findings only; the deferral reply answers it.
@@ -1709,11 +1778,13 @@ const runCycle = async (cycle, entry) => {
     const digestOf = new Map()
     for (const f of r.findings) {
       const e = ledger.get(f.commentId) || { valid: 0, refuted: 0, deferred: 0 }
-      if (f.deferral) e.deferred++; else if (f.verdict === 'valid') e.valid++; else e.refuted++
+      if (!f.hold) e[f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : 'refuted']++
       ledger.set(f.commentId, e)
       digestOf.set(f.commentId, f.commentDigest)
     }
+    const held = heldComments()
     const owed = (commentId) => {
+      if (held.has(commentId)) return 'wait'
       const e = ledger.get(commentId)
       if (!e) return 'none'
       if (e.valid && e.refuted) return 'wait'
@@ -1796,7 +1867,7 @@ const runCycle = async (cycle, entry) => {
     }
 
     // ---- review lane: fix + push without waiting for CI ----
-    const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral)
+    const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
     let reviewPushed = false
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
@@ -1827,7 +1898,8 @@ const runCycle = async (cycle, entry) => {
       // only a text the workflow decided on.
       const answerable = new Map()
       for (const f of validFindings) {
-        if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair) continue
+        // A posted refutation is corrected by whoever reads the corrections, not by a note on top.
+        if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair || (answeredWith.get(f.commentId) || {}).how === 'refutation') continue
         const line = `- ${f.file}:${f.line}: ${f.claim}`
         const prev = answerable.get(f.commentId)
         if (prev) prev.body += `\n${line}`
@@ -1909,7 +1981,8 @@ const runCycle = async (cycle, entry) => {
     }
     const acceptedOnly = c.status === 'red' && c.realFailures.length > 0 && c.realFailures.every(rf => rf.accepted) && c.infraRerun.length === 0
     if (reviewsSettled && (c.status === 'green' || acceptedOnly)) {
-      const outstanding = [...debt.keys()]
+      // A held verdict owes a reconciliation even on a comment already answered.
+      const outstanding = [...new Set([...debt.keys(), ...heldComments()])]
       if (outstanding.length > 0) {
         if (args.autoPush !== true) {
           // Nothing can be posted in a dry run, so the debt is an artefact of
