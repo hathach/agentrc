@@ -2376,60 +2376,74 @@ test('a settled reuse survives a resumed launch and nothing is posted twice', as
   assert.equal(third.labels.some(l => /^(inspect|reconcile|reuse|replies)#/.test(l)), false, 'an answered comment owes nothing')
 })
 
+// A launch that harvests `reviews` at `state`, resumed at its pushed head.
+const resumeAt = (state, over) => run({ ...over, preflight: { head: state.expectedHead, prHead: state.expectedHead }, args: { ...over.args, state } })
+const debtOf = (result, id) => result.state.debt.find(([c]) => c === id)[1]
+
 test('a reply already there is not reused while the harvest leaves out a point it owes', async () => {
-  const both = { findings: [finding({ commentId: 2, line: 4 }), finding({ commentId: 2, line: 5 })], replies: [], bots: 'reviewed' }
-  const first = await run({ args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true }, wrongBody: (id) => id === 2, reviews: both })
-  const [, d] = first.result.state.debt.find(([id]) => id === 2)
-  assert.deepEqual([d.notes, !!d.repair], [['2#4', '2#5'], true])
   const stale = (line) => finding({ commentId: 2, line, verdict: 'stale' })
-  const partial = await run({ args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true, state: first.result.state }, preflight: { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }, answers: () => true,
+  const first = await run(heldForRepair({
+    args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true },
+    reviews: { findings: [finding({ commentId: 2, line: 4 }), finding({ commentId: 2, line: 5 })], replies: [], bots: 'reviewed' },
+  }))
+  assert.deepEqual([debtOf(first.result, 2).notes, !!debtOf(first.result, 2).repair], [['2#4', '2#5'], true])
+  const partial = await resumeAt(first.result.state, { args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true }, answers: () => true,
     reviews: { findings: [stale(4)], replies: [], bots: 'reviewed' } })
   assert.equal(partial.labels.some(l => /^(inspect|reconcile|reuse)#/.test(l)), false, 'the verifier would judge one point of two')
   assert.notEqual(partial.result.pass, true)
-  assert.deepEqual(partial.result.state.debt.find(([id]) => id === 2)[1].notes, ['2#4', '2#5'])
-  const whole = await run({ args: { autoPush: true, maxCycles: 5, state: partial.result.state }, preflight: { head: partial.result.state.expectedHead, prHead: partial.result.state.expectedHead }, answers: () => true,
+  assert.deepEqual(debtOf(partial.result, 2).notes, ['2#4', '2#5'])
+  const whole = await resumeAt(partial.result.state, { args: { autoPush: true, maxCycles: 5 }, answers: () => true,
     reviews: { findings: [stale(4), stale(5)], replies: [], bots: 'reviewed' } })
   assert.ok(whole.labels.includes('reuse#3'), whole.labels.join(' '))
 })
 
-test('no fresh answer goes out while the harvest leaves out a point it would settle', async () => {
-  const two = { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' }
-  const dry = await run({ reviews: two, args: { autoPush: false, maxCycles: 5, deferrals: [deferral(), deferral({ findingId: '1#2' })] } })
-  assert.deepEqual(dry.result.state.debt.find(([id]) => id === 1)[1].notes, ['1#1', '1#2'])
-  const deferred = await run({ reviews: { ...two, findings: [finding()] }, args: { autoPush: true, maxCycles: 5, state: dry.result.state } })
-  assert.equal(deferred.labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of two')
-  assert.notEqual(deferred.result.pass, true)
+// Comment 1 with two deferred points, left owed by a dry run.
+const twoDeferred = { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' }
+const deferredTwo = () => run({ reviews: twoDeferred, args: { autoPush: false, maxCycles: 5, deferrals: [deferral(), deferral({ findingId: '1#2' })] } })
+
+test('no deferral reply goes out while the harvest leaves out a point it would settle', async () => {
+  const dry = await deferredTwo()
+  assert.deepEqual(debtOf(dry.result, 1).notes, ['1#1', '1#2'])
+  const { labels, result, calls } = await run({ reviews: { ...twoDeferred, findings: [finding()] }, args: { autoPush: true, maxCycles: 5, state: dry.result.state } })
+  assert.equal(labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of two')
+  assert.notEqual(result.pass, true)
+  assert.match(calls.find(c => c.label === 'reviews#2').prompt,
+    /report every finding on each as its body stands now, those listed by findingId among them, so they can be reconciled: \[\{"commentId":1,"findingIds":\["1#1","1#2"\]\}\]/)
+})
+
+test('no refutation goes out while the harvest leaves out a dismissal it would settle', async () => {
   let cycle = 0
-  const refuted = await run({
+  const { labels, result } = await run({
     args: { autoPush: true, maxCycles: 2 },
     reviewsPerCycle: () => ++cycle === 1
       ? { findings: [invalidFinding({ commentId: 7 }), invalidFinding({ commentId: 7, line: 9 })], replies: [], bots: 'reviewed' }
       : { findings: [invalidFinding({ commentId: 7, line: 9 })], replies: [{ commentId: 7, body: 'wrong' }], bots: 'reviewed' },
     challengePerCycle: () => ({ verdicts: [{ id: 0, upheld: true, reason: 'stands' }, { id: 1, upheld: true, reason: 'stands' }].slice(0, cycle === 1 ? 2 : 1) }),
   })
-  assert.equal(refuted.labels.some(l => l.startsWith('replies#')), false, 'a refutation of one point of two')
-  assert.deepEqual(refuted.result.deferred, [7])
-  cycle = 0
-  const noted = await run({
+  assert.equal(labels.some(l => l.startsWith('replies#')), false, 'a refutation of one point of two')
+  assert.deepEqual(result.deferred, [7])
+})
+
+test('no fix note goes out while the harvest leaves out a note it would settle', async () => {
+  let cycle = 0
+  const { labels } = await run({
     args: { autoPush: true, maxCycles: 2 }, dropDoneIds: (label) => label === 'resolve#1',
     reviewsPerCycle: () => ++cycle === 1 ? { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' } : oneValid,
   })
-  assert.ok(noted.labels.includes('resolve#1') && noted.labels.includes('fix:src/a.c'))
-  assert.equal(noted.labels.includes('resolve#2'), false, 'a fix note naming one point of two')
-  // After an edit, the ids reported against the new body still count.
+  assert.ok(labels.includes('resolve#1') && labels.includes('fix:src/a.c'))
+  assert.equal(labels.includes('resolve#2'), false, 'a fix note naming one point of two')
+})
+
+test('after an edit, the points reported against the new body must all be shown', async () => {
   const edited = (f) => ({ ...f, commentDigest: 'd2' })
   const both = { findings: [edited(finding()), edited(finding({ line: 2 }))], replies: [], bots: 'reviewed' }
-  const renewed = [deferral({ commentDigest: 'd2' }), deferral({ findingId: '1#2', commentDigest: 'd2' })]
-  const seen = await run({ reviews: both, args: { autoPush: false, maxCycles: 5, state: dry.result.state, deferrals: renewed } })
-  assert.equal(seen.result.state.debt.find(([id]) => id === 1)[1].renumbered, true)
-  const afterEdit = await run({ reviews: { ...both, findings: [edited(finding())] }, args: { autoPush: true, maxCycles: 5, state: seen.result.state } })
-  assert.equal(afterEdit.labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of the edited body\'s two')
-  assert.notEqual(afterEdit.result.pass, true)
-  // A state from before seenSinceEdit resumes, and counts every carried id as current.
-  const legacy = { ...seen.result.state, debt: seen.result.state.debt.map(([id, { seenSinceEdit, ...d }]) => [id, d]) }
-  const resumed = await run({ reviews: { ...both, findings: [edited(finding())] }, args: { autoPush: true, maxCycles: 5, state: seal(legacy) } })
-  assert.notEqual(resumed.result.reason, 'cycle-threw', JSON.stringify(resumed.result.error))
-  assert.equal(resumed.labels.some(l => l.startsWith('defer#')), false)
+  const dry = await deferredTwo()
+  const seen = await run({ reviews: both, args: { autoPush: false, maxCycles: 5, state: dry.result.state,
+    deferrals: [deferral({ commentDigest: 'd2' }), deferral({ findingId: '1#2', commentDigest: 'd2' })] } })
+  assert.equal(debtOf(seen.result, 1).renumbered, true)
+  const { labels, result } = await run({ reviews: { ...both, findings: [edited(finding())] }, args: { autoPush: true, maxCycles: 5, state: seen.result.state } })
+  assert.equal(labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of the edited body\'s two')
+  assert.notEqual(result.pass, true)
 })
 
 test('an edited comment answered with a fix note still counts the points reported since the edit', async () => {
@@ -2438,7 +2452,7 @@ test('an edited comment answered with a fix note still counts the points reporte
   // with only stale A must not settle B.
   let cycle = 0
   const at2 = (f) => ({ ...f, commentDigest: 'd2' })
-  const { labels, result } = await run({
+  const { labels, result, calls } = await run({
     args: { autoPush: true, maxCycles: 4 },
     reviewsPerCycle: () => {
       cycle++
@@ -2451,16 +2465,44 @@ test('an edited comment answered with a fix note still counts the points reporte
   assert.ok(labels.includes('resolve#2'), labels.join(' '))
   assert.equal(labels.some(l => l.startsWith('replies#')), false, 'a reply about A settling B')
   assert.notEqual(result.pass, true)
+  assert.match(calls.find(c => c.label === 'reviews#3').prompt, /\{"commentId":7,"findingIds":\[\]\}/, 'a pre-edit id is not named as the edited body\'s')
 })
 
-test('a state from before notes were named never reconciles the note it owes', async () => {
-  const first = await run({ args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true }, wrongBody: (id) => id === 2,
-    reviews: { findings: [finding({ commentId: 2, line: 4 })], replies: [], bots: 'reviewed' } })
+test('a held id from before an edit is not named as the edited body\'s', async () => {
+  let cycle = 0
+  const { calls, result } = await run({
+    args: { maxCycles: 3 },
+    reviewsPerCycle: () => ++cycle === 1
+      ? { findings: [invalidFinding(), invalidFinding({ line: 2 })], replies: [], bots: 'reviewed' }
+      : { findings: [{ ...invalidFinding(), commentDigest: 'd2' }], replies: [], bots: 'reviewed' },
+    challengePerCycle: () => cycle === 1
+      ? { verdicts: [{ id: 0, upheld: true, reason: 'stands' }, { id: 1, verdict: 'unknown', reason: 'cannot tell' }] }
+      : { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.deepEqual(result.state.holds.map(([id]) => id), ['1#2'], 'the hold itself is kept')
+  assert.deepEqual(debtOf(result, 1).seenSinceEdit, ['1#1'])
+  assert.match(calls.find(c => c.label === 'reviews#3').prompt, /\[\{"commentId":1,"findingIds":\["1#1"\]\}\]/)
+})
+
+test('a state from before notes or seenSinceEdit resumes conservatively', async () => {
+  const first = await run(heldForRepair({
+    args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true },
+    reviews: { findings: [finding({ commentId: 2, line: 4 })], replies: [], bots: 'reviewed' },
+  }))
   const old = { ...first.result.state, debt: first.result.state.debt.map(([id, { notes, ...d }]) => [id, { ...d, note: notes.length > 0 }]) }
-  const { labels, result } = await run({ args: { autoPush: true, maxCycles: 5, state: seal(old) }, preflight: { head: old.expectedHead, prHead: old.expectedHead }, answers: () => true,
+  const unnamed = await resumeAt(seal(old), { args: { autoPush: true, maxCycles: 5 }, answers: () => true,
     reviews: { findings: [finding({ commentId: 2, line: 4, verdict: 'stale' })], replies: [], bots: 'reviewed' } })
-  assert.equal(labels.some(l => /^reuse#/.test(l)), false)
-  assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].notes, ['(unnamed)'])
+  assert.equal(unnamed.labels.some(l => /^reuse#/.test(l)), false, 'a note it cannot name is never reconciled')
+  assert.deepEqual(debtOf(unnamed.result, 2).notes, ['(unnamed)'])
+  assert.match(unnamed.calls.find(c => c.label.startsWith('reviews#')).prompt, /\{"commentId":2,"findingIds":\[\]\}/, 'the placeholder is never named as a finding')
+  // Renumbered with no seenSinceEdit: every carried id counts as current.
+  const dry = await deferredTwo()
+  const seen = await run({ reviews: { ...twoDeferred, findings: twoDeferred.findings.map(f => ({ ...f, commentDigest: 'd2' })) },
+    args: { autoPush: false, maxCycles: 5, state: dry.result.state, deferrals: [deferral({ commentDigest: 'd2' }), deferral({ findingId: '1#2', commentDigest: 'd2' })] } })
+  const legacy = { ...seen.result.state, debt: seen.result.state.debt.map(([id, { seenSinceEdit, ...d }]) => [id, d]) }
+  const resumed = await run({ reviews: { ...twoDeferred, findings: [{ ...finding(), commentDigest: 'd2' }] }, args: { autoPush: true, maxCycles: 5, state: seal(legacy) } })
+  assert.notEqual(resumed.result.reason, 'cycle-threw', JSON.stringify(resumed.result.error))
+  assert.equal(resumed.labels.some(l => l.startsWith('defer#')), false)
 })
 
 // --- caller-approved deferrals ---
@@ -2648,7 +2690,7 @@ test('a hold survives a harvest that omits the finding, within a launch and acro
   const within = await run({ reviewsPerCycle: () => ++cycle === 1 ? flipped : empty, args: { maxCycles: 5, state: first.result.state } })
   assert.notEqual(within.result.pass, true, 'omitting the held finding settles nothing')
   assert.deepEqual(within.result.state.holds.map(([id]) => id), ['1#1'])
-  assert.match(within.calls.filter(c => c.label.startsWith('reviews#')).at(-1).prompt, /report their findings again so they can be reconciled: \[1\]/)
+  assert.match(within.calls.filter(c => c.label.startsWith('reviews#')).at(-1).prompt, /so they can be reconciled: \[\{"commentId":1,"findingIds":\["1#1"\]\}\]/)
   const held = await run({ reviews: flipped, args: { maxCycles: 5, yieldAfterCycle: true, state: first.result.state } })
   const resumed = await run({ reviews: empty, args: { maxCycles: 5, state: held.result.state } })
   assert.notEqual(resumed.result.pass, true, 'nor across a resume')
@@ -3349,7 +3391,7 @@ test('state carries the ledger to the next launch, which re-reports what is owed
     reviews: owing, challenge: upheld,
   })
   const prompt = second.calls.find(c => c.label === 'reviews#2').prompt
-  assert.ok(prompt.includes('[5]'), 'the validator is told which comment still owes an answer')
+  assert.ok(prompt.includes('[{"commentId":5,"findingIds":["5#1"]}]'), 'the validator is told which comment still owes an answer, and for which finding')
   assert.equal(second.result.state.cyclesUsed, 2)
   assert.deepEqual(second.result.deferred, [5], 'an obligation survives the launch boundary')
 })
