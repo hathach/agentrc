@@ -33,7 +33,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-MODEL = 'gpt-6-astra'  # codex exec -m
+MODEL = 'gpt-6-sol'  # codex exec -m
 EFFORT = 'low'  # model_reasoning_effort
 ROUNDS = 2  # YAGNI rounds per user turn
 CHALLENGE = 'Codex YAGNI challenge'
