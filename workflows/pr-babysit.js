@@ -1417,7 +1417,7 @@ const runCycle = async (cycle, entry) => {
         return { pass: false, cycles: cycle, history, reason: 'ci-red-unclassified', deferred: [...debt.keys()] }
       }
       if (reviewsSettled) {
-        log(`cycle ${cycle}: CI red only from rig-side failures — human/rig attention needed, nothing to fix in the PR`)
+        log(`cycle ${cycle}: CI red only from rig-side failures — rig attention needed (chief or a human), nothing to fix in the PR`)
         return { pass: false, cycles: cycle, history, reason: 'ci-red-rig-side', deferred: [...debt.keys()] }
       }
     }
