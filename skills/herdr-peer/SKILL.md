@@ -18,16 +18,17 @@ skill and use the same commands. Both write to the same checkout.
 S=<skill dir>/scripts/peer.py
 
 python3 $S peers                       # agents sharing this worktree, minus you
-python3 $S send --to <pane> --files "..." --task "..." [--delta "..."]
+python3 $S send --to <pane> --files "..." (--task "..." | --task-file <path>) [--delta ...]
 python3 $S read --from <pane> --for <id> [--wait <ms>]
 python3 $S check --kind result --file reply.txt
 ```
 
 `send` prints the request id; pass it to `read --for`. `--task` and `--delta`
-take literal text, a file path, or `-`. `--dry-run` prints the envelope. `read`
-exits 3 when nothing answers that id, 4 when the envelope is malformed. Each
-subcommand refuses rather than guesses: `peers` makes you choose, and `read`
-will not hand you a reply to a different request.
+take literal text, `--task-file` and `--delta-file` a path, and `-` reads stdin
+for any of them; a literal that names an existing path is refused. `--dry-run`
+prints the envelope. `read` exits 3 when nothing answers that id, 4 when the
+envelope is malformed. Each subcommand refuses rather than guesses: `peers`
+makes you choose, and `read` will not hand you a reply to a different request.
 
 ## What you decide
 
