@@ -388,6 +388,7 @@ const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
 const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
 const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
 const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
+const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 // How a fact collector's agent relays the script's last stdout line, and what it
 // says when there is no line or the line is an error.
 const relayed = (empty) => 'and return the JSON object on its last stdout line unchanged. ' +
@@ -1527,6 +1528,7 @@ const PIN = {
   type: 'object', additionalProperties: false,
   required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'pushUrls', 'head', 'dirty'],
   properties: {
+    error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
     prHead: { type: 'string' }, prRepo: { type: 'string' }, prUrl: { type: 'string' },
     remote: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
@@ -1539,17 +1541,15 @@ if (cyclesUsed >= maxCycles) {
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'budget-exhausted' })
 }
 const pinned = await agent(
-  `${IN_CHECKOUT}Editing and committing nothing, report this checkout: ` +
-  'branch = `git rev-parse --abbrev-ref HEAD`; ' +
-  `prBranch, prHead, prRepo and prUrl from one call: \`gh pr view ${args.pr} --json headRefName,headRefOid,headRepositoryOwner,headRepository,url\` ` +
-  '— headRefName, headRefOid, owner/name joined with a slash, and url; report them verbatim even when they disagree with git; ' +
-  'remote = the remote that branch tracks, `git rev-parse --abbrev-ref @{u}` up to the slash; ' +
-  'pushUrls = the lines of `git remote get-url --push --all <that remote>` — the push URLs, which a ' +
-  'configured pushurl can point somewhere the fetch URL does not; ' +
-  'head = `git rev-parse HEAD`; dirty = the lines of `git status --porcelain`.',
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}\` ` +
+  relayed("every string '' and every list empty"),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 ).catch(e => { log(`preflight errored — ${e && e.message}`); return null })
 if (!pinned) return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-died' })
+if (pinned.error) {
+  log(`preflight: nothing pinned — ${pinned.error}`)
+  return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-failed', detail: pinned.error })
+}
 const dirty = withoutIdeDrift(pinned.dirty)
 if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
 if (dirty.length) {

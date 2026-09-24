@@ -13,11 +13,16 @@ caller never fills in what is missing.
 
 ```bash
 S=~/.claude/skills/pr-babysit/scripts
+python3 $S/preflight.py --pr N                 # the checkout and the PR it must stay
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py head 'src/a.c'         # the commit at HEAD and its scope
 python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SHAs
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 ```
+
+`preflight.py` pins what every later step must still be true of: the branch
+and HEAD, the PR's head branch, SHA, repository and URL, the remote the branch
+tracks with its push URLs, and the dirty paths.
 
 `hooks.py` runs the repository's pre-commit hooks on the paths, once more if
 the first run fails, and reports the tree status and blob snapshots around

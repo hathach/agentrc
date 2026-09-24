@@ -449,10 +449,7 @@ test('the preflight pins the checkout without touching it', async () => {
   const pre = calls[0]
   assert.equal(pre.label, 'preflight')
   assert.match(pre.prompt, /Editing and committing nothing/)
-  // Branch, head SHA and head repository in one call — a name alone is not an identity.
-  assert.match(pre.prompt, /gh pr view 3888 --json headRefName,headRefOid,headRepositoryOwner,headRepository,url/)
-  assert.match(pre.prompt, /git remote get-url --push --all/)
-  assert.match(pre.prompt, /git status --porcelain/)
+  assert.ok(pre.prompt.includes('preflight.py --pr 3888`'), pre.prompt)
   assert.deepEqual(pre.schema.required.slice().sort(),
     ['branch', 'dirty', 'head', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote'])
   assert.ok(logs.some(l =>
@@ -561,6 +558,15 @@ test('a tracked remote that is not the PR head repository refuses', async () => 
     assert.deepEqual(labels, ['preflight'])
     assert.ok(logs.some(l => /not PR #3888's head repository/.test(l)), logs.join('\n'))
   }
+})
+
+test('a preflight the script could not pin stops the run with its error', async () => {
+  const { result, labels, calls } = await run({ reviews: oneValid, preflight: { error: 'gh pr view 3888: unexpected answer' } })
+  assert.equal(result.reason, 'preflight-failed')
+  assert.equal(result.detail, 'gh pr view 3888: unexpected answer')
+  assert.equal(result.cycles, 0)
+  assert.deepEqual(labels, ['preflight'])
+  assert.ok(calls[0].prompt.includes('preflight.py --pr 3888`'), calls[0].prompt)
 })
 
 test('a dead preflight stops the run with nothing else dispatched', async () => {
