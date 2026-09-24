@@ -275,12 +275,21 @@ const CHECK = {
   required: ['addresses', 'reason'],
   properties: { addresses: { type: 'boolean' }, reason: { type: 'string' } },
 }
-// The push stage may not commit, and the SHA it sends is already known, so it
-// reports only whether the send succeeded.
+// PUSH_SCRIPT's receipt: whether git push succeeded, and what the branch holds
+// at each pinned push URL afterwards (and the PR head, for an adoption).
 const PUSH = {
   type: 'object', additionalProperties: false,
-  required: ['pass', 'detail'],
-  properties: { pass: { type: 'boolean' }, detail: { type: 'string' } },
+  required: ['pushed', 'detail', 'heads'],
+  properties: {
+    error: { type: 'string' },
+    pushed: { type: 'boolean' }, detail: { type: 'string' },
+    heads: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, required: ['url', 'head'],
+        properties: { url: { type: 'string' }, head: { type: ['string', 'null'] } } },
+    },
+    prHead: { type: ['string', 'null'] },
+  },
 }
 // The chain a caller asks this run to adopt, oldest first, read back commit by
 // commit so every one is audited, not only the tip.
@@ -301,11 +310,6 @@ const ADOPT_AUDIT = {
       },
     },
   },
-}
-const READBACK = {
-  type: 'object', additionalProperties: false,
-  required: ['prHead'],
-  properties: { prHead: { type: 'string' } },
 }
 // The agent that makes the commit says only that it made one; what the commit
 // actually contains is read back in a separate turn that is asked not to edit.
@@ -383,6 +387,7 @@ const SCOPE = {
 const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
 const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
 const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
+const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
 // How a fact collector's agent relays the script's last stdout line, and what it
 // says when there is no line or the line is an error.
 const relayed = (empty) => 'and return the JSON object on its last stdout line unchanged. ' +
@@ -449,7 +454,7 @@ const pendingOf = () => {
   for (const [lane, key] of [['review', 'reviewPushFailed'], ['ci', 'ciPushFailed']]) {
     const f = last && last[key]
     if (f && f.committed && f.sha) {
-      return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : 'push-failed' }
+      return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : f.published === 'unknown' ? 'publication-unknown' : 'push-failed' }
     }
     // A commit that landed but whose read-back died is real and unlocated.
     if (f && f.committed) return { sha: null, parent: expectedHead, lane, stage: 'audit-unknown' }
@@ -794,7 +799,7 @@ const fixCell = (fixes, id, push, pushFailed) => {
     const detail = pushFailed.detail || 'no detail'
     if (pushFailed.committed === null) return `fixed, COMMIT OUTCOME UNKNOWN: ${detail} — inspect HEAD and the worktree${stat}`
     return pushFailed.committed
-      ? `fixed + committed ${pushFailed.sha ? pushFailed.sha.slice(0, 7) : '(SHA unknown)'}, NOT PUSHED: ${detail}${stat}`
+      ? `fixed + committed ${pushFailed.sha ? pushFailed.sha.slice(0, 7) : '(SHA unknown)'}, ${pushFailed.published === 'unknown' ? 'PUBLICATION UNKNOWN' : 'NOT PUSHED'}: ${detail}${stat}`
       : `fixed, COMMIT FAILED: ${detail}${stat}`
   }
   const hook = push && push.generated && push.generated.length ? `, with regenerated ${push.generated.join(', ')}` : ''
@@ -1029,19 +1034,40 @@ const commitAndPush = async (cycle, what, owned = []) => {
   }
 
   const push = await pushExact(sha, `push#${cycle}-${what}`)
-  if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha }
+  if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha, published: 'unknown' }
   if (push.pass) expectedHead = sha
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
 
-// Publishes one audited SHA to the pinned branch; null when the agent died.
-const pushExact = (sha, label) => agent(
-  `${IN_CHECKOUT}Run exactly: git push '${pinned.remote.trim()}' '${sha}:refs/heads/${pinned.branch.trim()}'\n` +
-  'That refspec is the point: pushing the branch instead would publish whatever HEAD has become, ' +
-  'not the commit that was audited. Commit nothing, amend nothing, force nothing, add no flags. ' +
-  'pass = whether the push succeeded; detail = one line on what was pushed.',
-  { label, phase: 'Push', model: 'sonnet', schema: PUSH },
-).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+// Publishes one audited SHA to the pinned branch, never the branch itself, which
+// would publish whatever HEAD has become. It landed when every pinned push URL
+// (and, for an adoption, the PR) reads back that SHA; it failed only when every
+// URL answered without it; anything else is unknown, never "not pushed".
+// null when the agent died.
+const pushExact = async (sha, label, prToo = false) => {
+  const r = await agent(
+    `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
+    `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.branch.trim()}' --sha ${sha} ` +
+    `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
+    relayed("pushed = false, detail = '' and heads = []"),
+    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH },
+  ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  if (!r) return null
+  const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
+  if (r.error) return unknown(r.error)
+  if (r.heads.map(h => h.url).join('\n') !== pinned.pushUrls.join('\n')) return unknown(`the receipt names ${r.heads.map(h => h.url).join(', ') || 'no destination'}`)
+  const heads = r.heads.map(h => h.head === null ? null : h.head.trim())
+  const prHead = !prToo ? sha : typeof r.prHead === 'string' ? r.prHead.trim() : null
+  if (heads.every(h => h === sha) && prHead === sha) return { pass: true, detail: r.detail }
+  if (heads.every(h => h !== null && h !== sha)) {
+    return { pass: false, detail: (!r.pushed && r.detail) || `${r.heads[0].url} heads ${heads[0].slice(0, 7) || 'nothing'} after the push, not ${sha.slice(0, 7)}` }
+  }
+  const unread = r.heads.filter((h, i) => heads[i] === null).map(h => h.url)
+  return unknown(unread.length ? `no read-back from ${unread.join(', ')}`
+    : prHead === null ? `PR #${args.pr} head unreadable after the push`
+    : prHead !== sha ? `PR #${args.pr} heads ${prHead.slice(0, 7)} after the push, not ${sha.slice(0, 7)}`
+    : 'the push landed on some push URLs and not others')
+}
 
 let napMs = 0 // backoff owed from the previous cycle, taken after its summary
 
@@ -1637,20 +1663,15 @@ const adopt = async (entry) => {
   if (adoption.published) {
     Object.assign(entry.adoption, { publication: 'already-published', detail: `PR #${args.pr} already heads ${to.slice(0, 7)}` })
   } else {
-    const push = await pushExact(to, 'adopt:push')
-    if (push && !push.pass) {
-      Object.assign(entry.adoption, { publication: 'failed', detail: push.detail || 'push refused' })
-      return { pass: false, cycles: entry.cycle, history, reason: 'adopt-push-failed', detail: entry.adoption.detail }
-    }
-    const seen = await agent(
-      `${IN_CHECKOUT}Editing nothing, report prHead = headRefOid from \`gh pr view ${args.pr} --json headRefOid\`, verbatim.`,
-      { label: 'adopt:readback', phase: 'Push', model: 'haiku', effort: 'low', schema: READBACK },
-    ).catch(e => { log(`adopt:readback errored — ${e && e.message}`); return null })
-    const landed = !!push && !!seen && seen.prHead.trim() === to
-    if (!landed) {
-      const detail = !push ? 'the push agent died' : !seen ? 'the read-back agent died' : `PR #${args.pr} heads ${seen.prHead.trim().slice(0, 7)} after the push, not ${to.slice(0, 7)}`
+    const push = await pushExact(to, 'adopt:push', true)
+    if (!push || push.published === 'unknown') {
+      const detail = push ? push.detail : 'the push agent died'
       Object.assign(entry.adoption, { publication: 'unknown', detail })
       return { pass: false, cycles: entry.cycle, history, reason: 'adopt-push-unknown', detail }
+    }
+    if (!push.pass) {
+      Object.assign(entry.adoption, { publication: 'failed', detail: push.detail || 'push refused' })
+      return { pass: false, cycles: entry.cycle, history, reason: 'adopt-push-failed', detail: entry.adoption.detail }
     }
     Object.assign(entry.adoption, { publication: 'pushed', detail: push.detail })
   }

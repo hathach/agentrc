@@ -111,6 +111,11 @@ const pathLine = (prompt) => {
 }
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
+// push.py's receipt: what the pinned push URL holds after the push, and the PR
+// head when the workflow asked for it.
+const receiptOf = (head, prHead, detail, pushed = true) => ({
+  pushed, detail, heads: PIN.pushUrls.map(url => ({ url, head })), ...(prHead === undefined ? {} : { prHead }),
+})
 const hookQuoted = (prompt) => [...(String(prompt).match(/hooks\.py ((?:'[^']*' ?)+)/) || ['', ''])[1].matchAll(/'([^']*)'/g)].map(m => m[1])
 const lsTreeOf = (paths) => paths.map(f => `100644 blob ${blobOf(f)}\t${f}`)
 
@@ -154,19 +159,15 @@ async function run(opts = {}) {
       return answer === null ? null : conforms(options.schema, structuredClone(answer), label)
     }
     if (label === 'adopt:push') {
+      // push.py's receipt: by default the push landed on every pinned URL and the PR.
+      const to = opts.args.adoptHead
       const answer = typeof opts.adoptPush === 'function' ? await opts.adoptPush(label)
-        : opts.adoptPush === undefined ? { pass: true, detail: 'pushed adopted head' } : opts.adoptPush
+        : opts.adoptPush === undefined ? receiptOf(to, to, 'pushed adopted head') : opts.adoptPush
       if (answer instanceof Error) throw answer
       if (answer === null) return null
       const push = conforms(options.schema, structuredClone(answer), label)
-      if (push.pass) prHead = opts.args.adoptHead
+      if (push.pushed) prHead = to
       return push
-    }
-    if (label === 'adopt:readback') {
-      const answer = typeof opts.adoptReadback === 'function' ? await opts.adoptReadback(label)
-        : opts.adoptReadback === undefined ? { prHead } : opts.adoptReadback
-      if (answer instanceof Error) throw answer
-      return answer === null ? null : conforms(options.schema, structuredClone(answer), label)
     }
     if (label.startsWith('recheck#')) {
       const over = typeof opts.recheck === 'function' ? opts.recheck(label) : opts.recheck
@@ -262,9 +263,9 @@ async function run(opts = {}) {
     if (label.startsWith('push#')) {
       // This stage may not commit and is handed the SHA, so it reports only
       // whether the send worked; the workflow supplies committed and sha.
-      if (opts.push === null) return { pass: false, detail: 'push rejected' }
-      const push = { pass: true, detail: 'pushed to claude/foo', ...opts.push }
-      if (push.pass) head = made // the pushed commit is where the checkout now sits
+      if (opts.push === null) return receiptOf(head, undefined, 'push rejected', false)
+      const push = conforms(options.schema, { ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }, label)
+      if (push.pushed) head = made // the pushed commit is where the checkout now sits
       return push
     }
     if (label.startsWith('challenge#')) {
@@ -763,11 +764,10 @@ test('the publisher stages exactly the owned paths, never a protected one', asyn
   const push = calls.find(c => c.label === 'push#1-review')
   // The exact refspec is the point: pushing the branch would publish whatever
   // HEAD became after the audit, not the commit that was audited.
-  assert.match(push.prompt, new RegExp(`git push 'origin' '${shaFor(1)}:refs/heads/claude/foo'`))
-  assert.match(push.prompt, /Commit nothing, amend nothing, force nothing, add no flags\./)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git'\``), push.prompt)
+  assert.match(push.prompt, /Committing, amending and forcing nothing/)
   // The stage cannot commit and already knows the SHA, so it is asked for neither.
-  assert.deepEqual(push.schema.required, ['pass', 'detail'])
-  assert.deepEqual(Object.keys(push.schema.properties), ['pass', 'detail'])
+  assert.deepEqual(push.schema.required, ['pushed', 'detail', 'heads'])
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
 })
 
@@ -976,7 +976,7 @@ test('a mislabeled commit SHA is not shown as a commit', async () => {
   const { logs } = await run({ reviews: oneValid, audit: { sha: 'committed 1234567 insertions' } })
   assert.equal(rowsOf(summaries(logs)[0])[0][4], '-')
   // And the pusher cannot rename it: the table reports the commit that was audited.
-  const relabeled = await run({ reviews: oneValid, push: { sha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } })
+  const relabeled = await run({ reviews: oneValid, push: { detail: 'pushed deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' } })
   assert.equal(rowsOf(summaries(relabeled.logs)[0])[0][4], shaFor(1).slice(0, 8))
 })
 
@@ -1182,18 +1182,18 @@ test('a reply poster that throws leaves the debt owed, not the cycle dead', asyn
 test('a publisher agent that throws is a failed push, not a crash', async () => {
   // Each publisher turn is guarded, so a rejection there becomes a push verdict
   // the summary can report rather than an unexplained dead cycle.
-  for (const [throwOn, detail, committed] of [
-    ['recheck#', 'recheck agent died', false],
-    ['commit#', 'commit agent died', null], // no receipt either way: neither true nor false is earned
-    ['push#', 'push agent died after the commit landed', true],
+  for (const [throwOn, detail, committed, row] of [
+    ['recheck#', 'recheck agent died', false, /fixed, COMMIT FAILED/],
+    ['commit#', 'commit agent died', null, /fixed, COMMIT OUTCOME UNKNOWN: commit agent died/], // no receipt either way: neither true nor false is earned
+    // It may have pushed before it died: the outcome is unknown, not a failure.
+    ['push#', 'push agent died after the commit landed', true, /fixed \+ committed [0-9a-f]{7}, PUBLICATION UNKNOWN/],
   ]) {
     const { result, logs } = await run({ reviews: oneValid, throwOn })
     assert.equal(result.reason, 'push-failed', throwOn)
     assert.equal(result.history[0].reviewPushFailed.detail, detail)
     assert.equal(result.history[0].reviewPushFailed.committed, committed)
-    assert.match(rowsOf(summaries(logs)[0])[0][3],
-      committed === null ? /fixed, COMMIT OUTCOME UNKNOWN: commit agent died/
-        : committed ? /fixed \+ committed [0-9a-f]{7}, NOT PUSHED/ : /fixed, COMMIT FAILED/, throwOn)
+    assert.match(rowsOf(summaries(logs)[0])[0][3], row, throwOn)
+    if (throwOn === 'push#') assert.equal(result.state.pending.stage, 'publication-unknown')
   }
 })
 
@@ -2569,9 +2569,10 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   const { result, labels, calls } = await run({
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
   })
-  assert.deepEqual(labels.slice(0, 4), ['preflight', 'adopt:audit', 'adopt:push', 'adopt:readback'])
-  assert.ok(labels.indexOf('adopt:readback') < labels.indexOf('ci#2'), 'publication is confirmed before either watcher')
-  assert.ok(labels.indexOf('adopt:readback') < labels.indexOf('reviews#2'))
+  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.ok(labels.indexOf('adopt:push') < labels.indexOf('ci#2'), 'publication is confirmed before either watcher')
+  assert.ok(labels.indexOf('adopt:push') < labels.indexOf('reviews#2'))
+  assert.equal(labels.includes('adopt:readback'), false, 'the push receipt carries the read-back')
   assert.equal(result.history[1].cycle, 2, 'adoption occupies the next carried cycle')
   assert.equal(result.history[1].head, ADOPT)
   assert.equal(result.state.cyclesUsed, 2)
@@ -2590,8 +2591,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
-  assert.ok(push.prompt.includes("git push 'origin' '1111111111111111111111111111111111111111:refs/heads/claude/foo'"))
-  assert.match(calls.find(c => c.label === 'adopt:readback').prompt, /gh pr view 3888 --json headRefOid/)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --pr 3888\``), push.prompt)
 })
 
 test('an already-published adopted head needs no push even in a dry-run launch', async () => {
@@ -2603,7 +2603,7 @@ test('an already-published adopted head needs no push even in a dry-run launch',
     assert.ok(result.history[1]?.adoption, 'the adopted head must get a receipt in the next cycle')
     assert.equal(result.history[1].adoption.publication, 'already-published', String(autoPush))
     assert.equal(result.state.expectedHead, ADOPT)
-    assert.equal(labels.some(l => l === 'adopt:push' || l === 'adopt:readback'), false)
+    assert.equal(labels.includes('adopt:push'), false)
     assert.ok(labels.includes('ci#2') && labels.includes('reviews#2'), 'the normal cycle still runs')
   }
 })
@@ -2840,16 +2840,19 @@ test('unrelated or unknown pending publication blocks adoption before the audit'
 })
 
 test('a successful adoption push with no confirming read-back is unknown', async () => {
-  for (const [name, adoptReadback] of [
-    ['dead', null],
-    ['thrown', new Error('read-back exploded')],
-    ['contradictory', { prHead: FOREIGN }],
+  for (const [name, adoptPush, detail] of [
+    ['unreadable URL', receiptOf(null, ADOPT, 'pushed'), 'no read-back from git@github.com:hathach/tinyusb.git'],
+    ['unreadable PR', receiptOf(ADOPT, null, 'pushed'), 'PR #3888 head unreadable after the push'],
+    ['contradictory PR', receiptOf(ADOPT, FOREIGN, 'pushed'), `PR #3888 heads ${FOREIGN.slice(0, 7)} after the push, not ${ADOPT.slice(0, 7)}`],
+    ['script error', { error: 'no JSON line', pushed: false, detail: '', heads: [] }, 'no JSON line'],
+    ['other destination', { ...receiptOf(ADOPT, ADOPT, 'pushed'), heads: [{ url: 'git@evil.example:x.git', head: ADOPT }] }, 'the receipt names git@evil.example:x.git'],
   ]) {
     const state = adoptionState()
     const { result, labels } = await run({
-      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptReadback,
+      args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptPush,
     })
     assert.equal(result.reason, 'adopt-push-unknown', name)
+    assert.equal(result.detail, detail, name)
     assert.equal(result.history[1].adoption.publication, 'unknown')
     assert.equal(result.state.expectedHead, HEAD)
     assert.equal(result.state.cyclesUsed, 2, 'the publication attempt consumes its cycle')
@@ -2862,7 +2865,7 @@ test('a successful adoption push with no confirming read-back is unknown', async
 
 test('rejected or dead adoption pushes preserve the ledger and recover without repushing', async () => {
   for (const [name, adoptPush, publication, reason, stage] of [
-    ['rejected', { pass: false, detail: 'non-fast-forward' }, 'failed', 'adopt-push-failed', 'adopt-push-failed'],
+    ['rejected', receiptOf(HEAD, HEAD, ' ! [rejected] non-fast-forward', false), 'failed', 'adopt-push-failed', 'adopt-push-failed'],
     ['dead', null, 'unknown', 'adopt-push-unknown', 'adopt-push-unknown'],
     ['thrown', new Error('publisher exploded'), 'unknown', 'adopt-push-unknown', 'adopt-push-unknown'],
   ]) {
@@ -3072,6 +3075,14 @@ test('a commit that landed but was not pushed is a pending candidate in the stat
   assert.equal(rejected.result.state.pending.stage, 'push-failed')
   const unknown = await run({ ...publishing, commit: null })
   assert.deepEqual(unknown.result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' })
+  const unread = await run({ ...publishing, push: { heads: [{ url: PIN.pushUrls[0], head: null }] } })
+  assert.deepEqual(unread.result.state.pending, { sha: shaFor(1), parent: HEAD, lane: 'review', stage: 'publication-unknown' })
+  assert.equal(unread.result.history[0].reviewPushFailed.detail, `no read-back from ${PIN.pushUrls[0]}`)
+  assert.equal(unread.labels.some(l => l.startsWith('resolve#')), false, 'no fix note for an unconfirmed push')
+  assert.match(rowsOf(summaries(unread.logs)[0])[0][3], /PUBLICATION UNKNOWN: no read-ba/)
+  const elsewhere = await run({ ...publishing, push: { heads: [{ url: PIN.pushUrls[0], head: FOREIGN }] } })
+  assert.equal(elsewhere.result.state.pending.stage, 'push-failed')
+  assert.equal(elsewhere.result.history[0].reviewPushFailed.detail, `${PIN.pushUrls[0]} heads ${FOREIGN.slice(0, 7)} after the push, not ${shaFor(1).slice(0, 7)}`)
   const pushed = await run(publishing)
   assert.equal(pushed.result.state.pending, null)
   assert.equal(pushed.result.state.expectedHead, shaFor(1))
