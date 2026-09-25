@@ -224,7 +224,10 @@ if (args.stateRef != null) {
 // it may have), and the digest of each verdict per check run, whose link names
 // the run. The verdicts themselves stay in collect.py's store beside the evidence;
 // an entry without a digest, from an earlier v3 that carried them inline, is judged again.
+// judgedHead is the last head whose verdicts were stored: the judge of a later
+// head sees them beside the matching failures, as evidence to reconfirm.
 const ciCacheShaped = (c) => c && typeof c === 'object' && typeof c.notesDigest === 'string' &&
+  (c.judgedHead === undefined || c.judgedHead === null || /^[0-9a-f]{40}$/.test(c.judgedHead)) &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket'].every(k => typeof e[k] === 'string') &&
     (e.digest === undefined || typeof e.digest === 'string'))
@@ -735,6 +738,7 @@ const noteRerun = (r) => {
 }
 const notesDigest = fnv1a(ciNotes)
 const ciVerdicts = new Map()
+let ciJudgedHead = (restored && restored.ciCache && restored.ciCache.judgedHead) || null
 if (restored && restored.ciCache) {
   if (restored.ciCache.notesDigest === notesDigest) {
     for (const e of restored.ciCache.entries) if (e.digest) ciVerdicts.set(e.link, { ...e })
@@ -820,7 +824,7 @@ const stateOut = () => {
     decisions: [...decisions],
     holds: [...holds],
     ciCache: {
-      notesDigest, reruns: ciReruns.filter(r => r.head === expectedHead),
+      notesDigest, judgedHead: ciJudgedHead, reruns: ciReruns.filter(r => r.head === expectedHead),
       entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest }) => ({ head, link, bucket, digest })),
     },
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], renumbered: !!d.seenSinceEdit, ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
@@ -1818,7 +1822,8 @@ const ciLaneRun = async (cycle, lanes) => {
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
-  const ev = await collect(`ci:collect#${cycle}.f`, `failures ${links.map(l => `--check ${shq(l)}`).join(' ')}`, EVIDENCE)
+  const prior = ciJudgedHead && ciJudgedHead !== inv.head ? ` --prior-head ${ciJudgedHead}` : ''
+  const ev = await collect(`ci:collect#${cycle}.f`, `failures ${links.map(l => `--check ${shq(l)}`).join(' ')}${prior}`, EVIDENCE)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
   if (lanes.reviewPushed || lanes.ended) return report
   const evFault = faultOf(ev, inv.head)
@@ -1860,6 +1865,7 @@ const ciLaneRun = async (cycle, lanes) => {
   if (fresh.length && !lanes.reviewPushed) {
     const why = faultOf(await collect(`ci:collect#${cycle}.w`, 'remember', REMEMBERED, fresh), inv.head)
     if (why) log(`cycle ${cycle}: ${fresh.length} CI verdict(s) not stored — ${why}; judged again by a later launch`)
+    else ciJudgedHead = inv.head
   }
   report.infraRerun = judged.infraRerun
   report.realFailures.push(...judged.checks.flatMap(j => j.failures))

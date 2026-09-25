@@ -2,7 +2,7 @@
 """Collect a PR's CI state for a watcher, so no model spends turns waiting or listing.
 
   collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S]
-  collect.py failures --repo OWNER/NAME --pr N --head SHA --check LINK...
+  collect.py failures --repo OWNER/NAME --pr N --head SHA --check LINK... [--prior-head SHA]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK...
 
@@ -28,7 +28,24 @@ Actions job, but only tails for the others: the last 150 lines of each failed
 CircleCI step, and Read the Docs' notes with 40-line tails of failed commands.
 For an Actions job the entry also holds the newest run on the base branch in
 which the same job ran, with its conclusion and the diagnostic lines both
-share. A --check that is no longer a failing check of the head is a stale
+share, and `cells`. Cells are an adapter for tinyusb's test/hil/hil_test.py:
+each terminal failure row (`Failed:` or `Flash Failed:`) of its result table,
+`[<time> ]<board>  <test>  ...  <outcome>`, as {cell "<board> <test>",
+signature ("<cell>: " and the outcome up to the two spaces before the board's
+captured output, without workspace paths and durations), lineNo, line, files,
+onBase, baseLineNo, baseLine, prior}; line and baseLine are 500-character
+previews of rows the saved logs hold whole. onBase compares the base run's row
+for the cell: same-failure, other-failure, passed, other (a skip), not-run, or
+null without a comparable base run. A signature is the error's first segment,
+so two different errors can share one: same-failure and prior are leads. With
+--prior-head, prior lists the verdicts stored for the same check, cell and
+signature on that head, [{head, verdict, firstError}], more than one when
+ambiguous, and is absent when none match. A cell row is left out of
+`diagnostics` and `shared`, on both sides; `firstError` still reads it. A failed
+step that ran hil_test.py but printed no parsed row gets `cellsError` instead.
+When any check was read, the detail file lists the PR's `changed`
+paths (null with `changedError` when they could not be read or may be
+incomplete), and the PR head is read again after them. A --check that is no longer a failing check of the head is a stale
 snapshot: exit 1, before anything is read. Read the Docs needs RTD_TOKEN (see rtd.py).
 
 remember: stores a judge's verdicts for the head beside its evidence, so a
@@ -66,6 +83,10 @@ DIAGNOSTIC = re.compile(r'\b(?:error|Error|ERROR|FAIL|FAILED|Failed|failed|[Aa]s
 DURATION = re.compile(r'\s+in \d+(?:\.\d+)?s\b')
 FILES = re.compile(r'[\w./-]+\.(?:c|h|cc|cpp|hpp|py|S|s|ld|cmake|mk|ya?ml|json)\b')
 KEEP = 20
+SHA = re.compile(r'[0-9a-f]{40}')
+HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HIL_PROFILE=1 prefixes epoch seconds
+HIL_FAILED = ('Failed:', 'Flash Failed:')
+LINE = 500
 
 
 class Failed(Exception):
@@ -223,11 +244,55 @@ def signature(line):
     return DURATION.sub('', WORKSPACE.sub('', line or '')).strip()
 
 
-def evidence(lines, exit_line):
+def files_in(line):
+    return sorted(set(FILES.findall(WORKSPACE.sub('', line))))
+
+
+def evidence(lines, exit_line, omit=()):
+    """The first error and the diagnostics; `omit` lines are left out of the list, never out of firstError."""
     found = diagnostics(lines)
     first = found[0] if found else exit_line or next((line for line in reversed(lines) if line.strip()), '')
-    return {'firstError': first, 'signature': signature(first), 'files': sorted(set(FILES.findall(WORKSPACE.sub('', first)))),
-            'diagnostics': found[:KEEP]}
+    return {'firstError': first, 'signature': signature(first), 'files': files_in(first),
+            'diagnostics': [line for line in found if line not in omit][:KEEP]}
+
+
+def hil_rows(lines):
+    """{cell: (outcome, line number, line)}, the last row per cell: a retried cell's final result."""
+    rows = {}
+    for n, line in enumerate(lines, 1):
+        m = HIL_ROW.match(line)
+        if m:
+            rows[f'{m[1]} {m[2]}'] = (m[3], n, line)
+    return rows
+
+
+def cell_signature(cell, outcome):
+    # The runner prints `Failed: <error>`, then two spaces before the board's captured
+    # output, a `COMMAND FAILED:` tail or the duration: only the error is the same run to run.
+    return f'{cell}: {signature(outcome.split("  ")[0])}'
+
+
+def failed_rows(lines):
+    return {cell: row for cell, row in hil_rows(lines).items() if row[0].startswith(HIL_FAILED)}
+
+
+def on_base(cell, sig, theirs):
+    if theirs is None:
+        return 'not-run'
+    if theirs[0].startswith(HIL_FAILED):
+        return 'same-failure' if cell_signature(cell, theirs[0]) == sig else 'other-failure'
+    return 'passed' if theirs[0].startswith('OK') else 'other'
+
+
+def cells(failed, base_rows):
+    """One record per failed cell; base_rows is None without a comparable base log."""
+    out = []
+    for cell, (outcome, n, line) in failed.items():
+        sig, theirs = cell_signature(cell, outcome), (base_rows or {}).get(cell)
+        out.append({'cell': cell, 'signature': sig, 'lineNo': n, 'line': line[:LINE], 'files': files_in(line),
+                    'onBase': None if base_rows is None else on_base(cell, sig, theirs),
+                    'baseLineNo': theirs[1] if theirs else None, 'baseLine': theirs[2][:LINE] if theirs else None})
+    return out
 
 
 def save(folder, name, lines):
@@ -262,16 +327,24 @@ def actions(repo, head, base_ref, job, folder, cache):
         raise Failed(f'job {job} ran on {record.get("head_sha")}, not the head {head}')
     full = actions_log(repo, job)
     section, exit_line = failed_steps(full)
+    failed = failed_rows(full)
     entry = {'name': record['name'], 'workflow': record.get('workflow_name', ''), 'runId': record.get('run_id'),
-             'runAttempt': record.get('run_attempt'), 'log': save(folder, f'actions-{job}.log', full), **evidence(section, exit_line)}
+             'runAttempt': record.get('run_attempt'), 'log': save(folder, f'actions-{job}.log', full),
+             **evidence(section, exit_line, {row[2] for row in failed.values()})}
     base = base_run(repo, base_ref, entry['workflow'], record['name'], cache)
-    if base and base['conclusion'] == 'failure':
+    base_rows = None
+    if base and (base['conclusion'] == 'failure' or (failed and base['conclusion'] == 'success')):
         base_full = actions_log(repo, base['jobId'])
-        theirs = diagnostics(failed_steps(base_full)[0])
-        ours = {signature(line) for line in entry['diagnostics']}
-        base = {**base, 'log': save(folder, f'base-actions-{base["jobId"]}.log', base_full),
-                'shared': [line for line in theirs if signature(line) in ours][:KEEP], 'diagnostics': theirs[:KEEP]}
+        base_rows = hil_rows(base_full)
+        base = {**base, 'log': save(folder, f'base-actions-{base["jobId"]}.log', base_full)}
+        if base['conclusion'] == 'failure':
+            theirs = [line for line in diagnostics(failed_steps(base_full)[0]) if line not in {row[2] for row in base_rows.values()}]
+            ours = {signature(line) for line in entry['diagnostics']}
+            base.update(shared=[line for line in theirs if signature(line) in ours][:KEEP], diagnostics=theirs[:KEEP])
     entry['base'] = base
+    entry['cells'] = cells(failed, base_rows)
+    if not failed and any('hil_test.py' in line for line in section):
+        entry['cellsError'] = 'a failed hil_test.py step printed no result row this reads; read its log'
     return entry
 
 
@@ -295,7 +368,31 @@ def circle(repo, number, folder):
     return {'name': f'job {number}', 'log': save(folder, f'circleci-{number}.log', lines), 'base': None, **entry}
 
 
-def failures(repo, pr, head, links):
+def prior_verdicts(repo, pr, head, entries):
+    """Each cell's stored verdicts on another head, matched on check, cell and signature."""
+    index = {}
+    for stored in stored_verdicts(evidence_dir(repo, pr, head)).values():
+        for f in stored.get('failures') or []:
+            index.setdefault((f.get('check'), f.get('cell'), f.get('signature')), []).append(f)
+    for entry in entries:
+        for c in entry.get('cells') or []:
+            found = index.get((entry['name'], c['cell'], c['signature']))
+            if found:
+                c['prior'] = [{'head': head, 'verdict': f.get('verdict'), 'firstError': f.get('firstError')} for f in found]
+
+
+def changed_paths(repo, pr):
+    """(the PR's paths, None) or (None, why). GitHub lists at most 3000 files."""
+    try:
+        names = [f['filename'] for page in gh('api', '--paginate', '--slurp', f'repos/{repo}/pulls/{pr}/files?per_page=100') for f in page]
+    except (Failed, KeyError, TypeError) as e:
+        return None, f'the PR files could not be read: {e}'
+    if len(names) >= 3000:
+        return None, f'GitHub listed {len(names)} files, its cap: the list may be incomplete'
+    return names, None
+
+
+def failures(repo, pr, head, links, prior_head=None):
     now = inventory(repo, pr, head, 0)
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
     stale = [link for link in links if link not in failing]
@@ -320,8 +417,19 @@ def failures(repo, pr, head, links):
         except (Failed, rtd.Failed, circleci.Failed) as e:
             entry['error'] = str(e)
         checks.append(entry)
+    if prior_head:
+        prior_verdicts(repo, pr, prior_head, checks)
+    out = {'head': head, 'baseRef': now['baseRef']}
+    if any(c['error'] is None for c in checks):
+        out['changed'], why = changed_paths(repo, pr)
+        if why:
+            out['changedError'] = why
+        # The paths must be this head's, like every log above.
+        after = pull(repo, pr)['headRefOid']
+        if after != head:
+            raise Failed(f'PR #{pr} head moved to {after} while collecting')
     detail = folder / f'failures-{time.time_ns()}.json'
-    detail.write_text(json.dumps({'head': head, 'baseRef': now['baseRef'], 'checks': checks}, indent=1))
+    detail.write_text(json.dumps({**out, 'checks': checks}, indent=1))
     return {'head': head, 'detail': str(detail), 'error': None}
 
 
@@ -333,16 +441,19 @@ def main(argv=None):
     p.add_argument('--head', required=True, help='the head SHA the caller expects')
     p.add_argument('--wait-seconds', type=int, default=0)
     p.add_argument('--check', action='append', default=[], metavar='LINK')
+    p.add_argument('--prior-head', help='failures: the head whose stored verdicts to show beside matching cells')
     a = p.parse_args(argv)
+    if a.prior_head and (a.command != 'failures' or not SHA.fullmatch(a.prior_head) or a.prior_head == a.head):
+        p.error('--prior-head is for failures: a full 40-hex SHA other than --head')
     if (a.command in ('failures', 'recall')) != bool(a.check):
         p.error('--check is for failures and recall, which need at least one')
-    if not re.fullmatch(r'[0-9a-f]{40}', a.head):
+    if not SHA.fullmatch(a.head):
         p.error('--head must be a full 40-hex SHA')
     try:
         if a.command == 'inventory':
             out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)))
         elif a.command == 'failures':
-            out = failures(a.repo, a.pr, a.head, a.check)
+            out = failures(a.repo, a.pr, a.head, a.check, a.prior_head)
         elif a.command == 'remember':
             out = remember(a.repo, a.pr, a.head, sys.stdin.read())
         else:

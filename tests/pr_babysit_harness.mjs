@@ -1419,6 +1419,19 @@ test('a same-head relaunch recalls the judged verdicts from the store: no judge'
   assert.ok(noted.logs.some(l => /ciNotes changed: 1 cached CI verdict\(s\) judged again/.test(l)))
 })
 
+test('the last judged head is carried, and a later head\'s evidence shows its verdicts beside the matching failures', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.doesNotMatch(first.calls.find(c => c.label === 'ci:collect#1.f').prompt, /--prior-head/, 'nothing judged before')
+  assert.equal(first.result.state.ciCache.judgedHead, HEAD)
+  const st = first.result.state
+  const OLD = 'b'.repeat(40)
+  const later = await run({ store, args: { ...YIELD, state: seal({ ...st, ciCache: { ...st.ciCache, judgedHead: OLD, entries: [] } }) }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.match(later.calls.find(c => c.label === 'ci:collect#2.f').prompt, / --prior-head b{40} --repo /)
+  assert.equal(later.result.state.ciCache.judgedHead, HEAD)
+  await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache: { ...st.ciCache, judgedHead: 'b; rm -rf ~' } }) } }), /not a pr-babysit state/)
+})
+
 test('the same head in a later cycle is not judged again, and an unclassified verdict always is', async () => {
   const within = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w', 'ci:collect#2.1'])
