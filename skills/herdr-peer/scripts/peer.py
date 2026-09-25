@@ -31,9 +31,9 @@ FIELDS = {
     'result': ['FOR', 'FROM', 'STATUS', 'FILES'],
 }
 
-# Herdr renders a pane's agent output indented, sometimes behind a bullet, so
-# every match has to tolerate leading decoration.
-LEAD = r'^[\s•>|-]*'
+# Herdr renders a pane's agent output indented, sometimes behind the message
+# bullet (Codex •, Claude Code ●, ⏺ on macOS), so every match tolerates it.
+LEAD = r'^[\s•●⏺>|-]*'
 RESULT_START = re.compile(LEAD + re.escape(MARKER['result']))
 RESULT_END = re.compile(LEAD + TERMINATOR['result'] + r'\b')
 FOR_LINE = re.compile(LEAD + r'FOR:\s*(\S+)', re.M)

@@ -142,6 +142,23 @@ class RenderingTest(unittest.TestCase):
     def test_checks_an_indented_envelope(self):
         self.assertEqual(peer.check('result', INDENTED.format(id='x')), [])
 
+    def test_finds_an_envelope_behind_claude_codes_bullet(self):
+        # Claude Code's message bullet is ● (⏺ on macOS), not Codex's •.
+        for glyph in ('●', '⏺'):
+            with self.subTest(glyph=glyph):
+                text = glyph + ' ' + INDENTED.format(id='w1:p1-9').lstrip()
+                body, note = peer.extract_result(text, 'w1:p1-9')
+                self.assertIsNone(note)
+                self.assertIn('bounds check', body)
+                self.assertEqual(peer.check('result', text), [])
+
+    def test_a_marker_behind_prose_is_not_an_envelope(self):
+        text = '● as quoted: ' + RESULT.format(id='w1:p1-9')
+        body, note = peer.extract_result(text, 'w1:p1-9')
+        self.assertIsNone(body)
+        self.assertIn('no result envelope', note)
+        self.assertIn('missing the result header line', peer.check('result', text))
+
 
 class StrictnessTest(unittest.TestCase):
     def test_mismatched_closing_id_is_refused(self):
