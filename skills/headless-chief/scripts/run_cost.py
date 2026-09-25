@@ -170,15 +170,17 @@ def collect(session):
 
 def priced(rows, state):
     """Sets each row's share of its model's recorded cost, or None, and whether it is estimated."""
+    if state is None:
+        for r in rows:
+            rate = rate_of(r['model'])
+            if rate:
+                r['cost'], r['est'] = priced_at(rate, r['tokens']), True
+        return rows
     tokens = defaultdict(Counter)
     for r in rows:
         tokens[r['model']].update(r['tokens'])
     for model, total in tokens.items():
         rate = rate_of(model)
-        if state is None:
-            for r in (r for r in rows if r['model'] == model and rate):
-                r['cost'], r['est'] = priced_at(rate, r['tokens']), True
-            continue
         cost, recorded = state.get(model, (None, None))
         if cost is None:
             continue
@@ -188,7 +190,7 @@ def priced(rows, state):
         for r in (r for r in rows if r['model'] == model):
             r['cost'], r['est'] = (cost * weight(r['tokens']) / weight(total) if weight(total) else None), est
     # a model claude billed that no transcript on disk shows: its cost stays in the total, unallocated
-    for model, (cost, _) in (state or {}).items():
+    for model, (cost, _) in state.items():
         if cost is not None and model not in tokens:
             rows.append(row('-', 'unallocated: no transcript', model, cost=cost))
     return rows

@@ -29,7 +29,7 @@ const finish = (result, validation) => {
     ['HIL', 'if needed', 'only when the task needs hardware evidence; otherwise not needed'], ['PR', 'pending', 'the human opens it']]
     .map(([s, outcome, fact]) => [s, 'caller', result.pass ? outcome : 'not run', result.pass ? fact : ''])
   log(['| stage | agent | outcome | key fact |', '|---|---|---|---|',
-    ...[...rows, ...later, ...caller].map(r => `| ${r.map(c => String(c).replace(/\|/g, '\\|')).join(' | ')} |`)].join('\n'))
+    ...[...rows, ...later, ...caller].map(r => `| ${r.map(c => String(c).replace(/\\/g, '\\\\').replace(/\|/g, '\\|')).join(' | ')} |`)].join('\n'))
   return result
 }
 
@@ -64,9 +64,9 @@ const DEV = {
 }
 const VERIFY = {
   type: 'object', additionalProperties: false,
-  required: ['pass', 'detail', 'branch', 'head', 'commits', 'dirty', 'outOfScope'],
+  required: ['pass', 'detail', 'branch', 'commits', 'dirty', 'outOfScope'],
   properties: {
-    pass: { type: 'boolean' }, detail: { type: 'string' }, branch: { type: 'string' }, head: { type: 'string' },
+    pass: { type: 'boolean' }, detail: { type: 'string' }, branch: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } },
     dirty: { type: 'array', items: { type: 'string' } },
     outOfScope: { type: 'array', items: { type: 'string' } },
@@ -147,12 +147,12 @@ const verified = await agent(
   'pass = exit 0, or the command\'s build-contract skill defines the outcome as verified; ' +
   'detail = that contract\'s reason, otherwise a one-line summary or the first error. ' +
   'Then, editing and committing nothing: ' +
-  'branch = `git rev-parse --abbrev-ref HEAD`; head = `git rev-parse HEAD`; ' +
+  'branch = `git rev-parse --abbrev-ref HEAD`; ' +
   `commits = the lines of \`git log --oneline ${triage.head}..HEAD\`; dirty = the lines of \`git status --porcelain\`; ` +
   `outOfScope = the paths of \`git log --name-only --no-renames --format= ${triage.head}..HEAD\` (every commit, so an edit ` +
   `later reverted still counts) outside ${JSON.stringify(scope)} or matching test/hil/*.json (direct children only).`,
   { label: 'verify', phase: 'Verify', model: 'haiku', effort: 'low', schema: VERIFY },
-).catch(e => { log(`verify errored — ${e && e.message}`); return null }) ?? { pass: false, detail: 'verify agent died', branch: '', head: '', commits: [], dirty: [], outOfScope: [] }
+).catch(e => { log(`verify errored — ${e && e.message}`); return null }) ?? { pass: false, detail: 'verify agent died', branch: '', commits: [], dirty: [], outOfScope: [] }
 
 const reason = !verified.pass ? 'verify-failed'
   : verified.branch !== triage.branch ? 'wrong-branch'
@@ -160,15 +160,15 @@ const reason = !verified.pass ? 'verify-failed'
   : verified.dirty.length ? 'dirty-tree'
   : verified.outOfScope.length ? 'out-of-scope' : null
 if (reason) log(`verify: ${reason} — ${verified.detail}`)
-ran('verify', 'haiku', reason || 'pass', `${verified.commits.length} commit(s) on ${verified.branch || '?'}, ${triage.head}..${verified.head || '?'}; ${cut(verified.detail)}`)
+ran('verify', 'haiku', reason || 'pass', `${verified.commits.length} commit(s) on ${verified.branch || '?'}, ${triage.head}..${verified.commits.length ? verified.commits[0].split(' ')[0] : triage.head}; ${cut(verified.detail)}`)
 const v = triage.validate
-const check = v && v.args ? `Workflow /${v.name} ${JSON.stringify(v.args)}, its artifacts then cleaned out of the checkout`
-  : v ? `the component stages of /${v.name}, launched separately one read-only stage at a time since it cannot run with repairs and its own reviews disabled (${v.limitation}), their artifacts then cleaned`
-    : `${verify} alone, no validation workflow being named by the repository's instructions`
+const [check, checkLabel] = v && v.args ? [`Workflow /${v.name} ${JSON.stringify(v.args)}, its artifacts then cleaned out of the checkout`, `/${v.name}`]
+  : v ? [`the component stages of /${v.name}, launched separately one read-only stage at a time since it cannot run with repairs and its own reviews disabled (${v.limitation}), their artifacts then cleaned`, `/${v.name} by its component stages`]
+    : [`${verify} alone, no validation workflow being named by the repository's instructions`, `${verify} alone`]
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
-  : `confirm the implement notes carry hook evidence; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence) with ${check} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl>\`'s spend table, which names each stage's model; then the human opens the PR`
+  : `confirm the implement notes carry hook evidence; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence) with ${check} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and, unless your report already tables the session's spend (chief does), ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl>\`'s spend table, which names each stage's model; then the human opens the PR`
 return finish({
   pass: !reason, reason, target, issue: triage.issue, kind: triage.kind, disposition: triage.disposition,
   triage, implement: dev, commits: verified.commits, verify: verified, validate: triage.validate, next,
-}, v ? `/${v.name}${v.args ? '' : ' by its component stages'}` : `${verify} alone`)
+}, checkLabel)

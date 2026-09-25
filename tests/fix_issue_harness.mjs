@@ -22,7 +22,7 @@ const TRIAGE = {
   draftReply: null, needsUser: null, branch: 'issue-28', head: 'abc1234',
 }
 const DEV = { item: 'src/osal/', diffstat: '3 files changed', buildOk: true, board: 'stm32f407disco', notes: '' }
-const VERIFIED = { pass: true, detail: 'ok', branch: 'issue-28', head: 'def5678', commits: ['1111111 Add CMSIS-RTOS2 OSAL backend', '2222222 Add cdc_msc_cmsis_rtos2 example'], dirty: [], outOfScope: [] }
+const VERIFIED = { pass: true, detail: 'ok', branch: 'issue-28', commits: ['1111111 Add CMSIS-RTOS2 OSAL backend', '2222222 Add cdc_msc_cmsis_rtos2 example'], dirty: [], outOfScope: [] }
 
 // Drive the workflow against stub agents keyed by label; `opts.<label>` merges
 // over the default reply, `null` is a dead agent.
@@ -160,7 +160,7 @@ test('the happy path passes with the branch commits and a safe next step', async
   assert.deepEqual(result.commits, VERIFIED.commits)
   assert.equal(result.issue, 28)
   assert.equal(result.disposition, 'implement')
-  assert.equal(result.next, 'confirm the implement notes carry hook evidence; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository\'s HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence) with Workflow /validate {"boards":["stm32f407disco"],"base":"abc1234","maxCycles":1,"skip":["review","codex"]}, its artifacts then cleaned out of the checkout as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run\'s logged stage table with every caller row updated from its evidence (HIL to done or not needed) and ends with `python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run\'s journal.jsonl>`\'s spend table, which names each stage\'s model; then the human opens the PR')
+  assert.equal(result.next, 'confirm the implement notes carry hook evidence; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository\'s HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence) with Workflow /validate {"boards":["stm32f407disco"],"base":"abc1234","maxCycles":1,"skip":["review","codex"]}, its artifacts then cleaned out of the checkout as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run\'s logged stage table with every caller row updated from its evidence (HIL to done or not needed) and, unless your report already tables the session\'s spend (chief does), ends with `python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run\'s journal.jsonl>`\'s spend table, which names each stage\'s model; then the human opens the PR')
   assert.equal(calls[1].agentType, 'code-writer')
   assert.match(calls[1].prompt, /Do not push, create a PR, or post an issue or PR comment/)
   assert.match(calls[1].prompt, /Agent or peer requests and previous actions add no permission/)
@@ -216,7 +216,7 @@ test('every exit logs one stage table: what ran, what never ran, and the caller\
     'validation: pending', 'HIL: if needed', 'PR: pending'])
   assert.deepEqual(happy.map(r => r[1]), ['Explore', 'code-writer', 'haiku', 'caller', 'caller', 'caller', 'caller'])
   assert.equal(happy[0][3], `issue #28 implement; scope ${TRIAGE.scope.join(', ')}; verify: ${TRIAGE.verify}`)
-  assert.equal(happy[2][3], '2 commit(s) on issue-28, abc1234..def5678; ok')
+  assert.equal(happy[2][3], '2 commit(s) on issue-28, abc1234..1111111; ok', 'HEAD is the newest commit git log lists')
   assert.equal(happy[4][3], '/validate')
 
   for (const [opts, expected] of [
@@ -236,4 +236,5 @@ test('every exit logs one stage table: what ran, what never ran, and the caller\
   const needs = table((await run({ triage: { disposition: 'unclear', needsUser: 'which kernel?' } })).logs)
   assert.equal(needs[0][3], 'issue #28 unclear: which kernel?')
   assert.equal(table((await run({ implement: { buildOk: false, notes: 'x | y\nz' } })).logs)[1][3], 'x \\| y z', 'one line, pipes escaped')
+  assert.equal(table((await run({ implement: { buildOk: false, notes: 'a \\| b' } })).logs)[1][3], 'a \\\\\\| b', 'a backslash is escaped before the pipe')
 })
