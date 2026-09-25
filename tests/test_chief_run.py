@@ -4,6 +4,7 @@ data/chief_run/stream.jsonl is a trimmed real capture (claude 2.1.280, one subag
 the subagent's reply reaches the stream only inside a top-level user tool_result, and no
 worker assistant event was streamed, so worker exclusion is shown on the event types
 that do appear."""
+import importlib.util
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'headless-chief' / 'scripts' / 'chief_run.py'
 CAPTURE = Path(__file__).resolve().parent / 'data' / 'chief_run' / 'stream.jsonl'
@@ -70,8 +72,9 @@ class ChiefRun(unittest.TestCase):
         self.task = self.root / 'task.md'
         self.task.write_text('Babysit PR 1.\n')
         self.out = self.root / 'run'
+        # HOME holds the transcripts run_cost.py reads: none, unless a test writes them
         self.env = {**os.environ, 'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'FAKE_DIR': str(self.fake),
-                    'CLAUDECODE': '1', 'HERDR_PANE_ID': 'p1', 'HERDR_ENV': '1'}
+                    'CLAUDECODE': '1', 'HERDR_PANE_ID': 'p1', 'HERDR_ENV': '1', 'HOME': str(self.root)}
 
     def stream(self, *events):
         self.fake.joinpath('stream.jsonl').write_text(
@@ -228,6 +231,43 @@ class ChiefRun(unittest.TestCase):
                 self.assertTrue(self.texts()[-1].startswith(f'launcher: exit {want} ({reason})'), self.texts())
                 self.assertEqual((self.out / 'report.md').exists(), report)
                 shutil.rmtree(self.out)
+
+    def test_the_session_cost_is_tabled_and_ends_the_exit_line(self):
+        session = self.root / '.claude' / 'projects' / '-wt' / 's-1'
+        run = session / 'subagents' / 'workflows' / 'wf_a'
+        run.mkdir(parents=True)
+        usage = {'input_tokens': 50000, 'output_tokens': 10000, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+        turn = lambda mid: json.dumps({'type': 'assistant', 'timestamp': '2026-09-25T10:00:00Z',
+                                       'message': {'id': mid, 'model': 'claude-haiku-4-5', 'usage': usage}}) + '\n'
+        (run / 'agent-a1.meta.json').write_text(json.dumps({'description': 'preflight'}))
+        (run / 'agent-a1.jsonl').write_text(turn('m1'))
+        state = {'type': 'cost-state', 'modelUsage': {'claude-haiku-4-5': {
+            'costUSD': 0.2, 'inputTokens': 100000, 'outputTokens': 20000, 'cacheReadInputTokens': 0, 'cacheCreationInputTokens': 0}}}
+        session.with_suffix('.jsonl').write_text(turn('m2') + json.dumps(state) + '\n')
+        self.stream(init(), result())
+        self.assertEqual(self.run_it().returncode, 0)
+        self.assertTrue(self.texts()[-1].endswith(' · cost $0.20'), self.texts())
+        table = (self.out / 'cost.md').read_text(encoding='utf-8')
+        self.assertIn('| wf_a | preflight | haiku-4-5 |', table)
+        self.assertEqual((self.out / 'report.md').read_text(encoding='utf-8'),
+                         f'chief: stage · done\n\n## Cost by stage\n\n{table}')
+
+    def test_a_cost_it_cannot_write_still_leaves_an_exit_line(self):
+        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        blocker = self.root / 'not-a-dir'
+        blocker.write_text('')
+        with mock.patch.object(chief_run.run_cost, 'summary', lambda session: ('| t |', '1.00')), \
+                mock.patch.object(chief_run.run_cost, 'session_dir', lambda session_id: self.root):
+            self.assertRegex(chief_run.cost(blocker, 's-1', blocker / 'report.md'), r'^cost none \((NotADirectoryError|FileNotFoundError): ')
+
+    def test_a_cost_it_cannot_read_leaves_the_run_as_it_was(self):
+        self.stream(init(), result())
+        self.assertEqual(self.run_it().returncode, 0)
+        self.assertRegex(self.texts()[-1], r' · cost none \(run_cost: 0 transcripts named s-1\.jsonl under .*\)$')
+        self.assertFalse((self.out / 'cost.md').exists())
+        self.assertEqual((self.out / 'report.md').read_text(encoding='utf-8'), 'chief: stage · done\n')
 
     def test_an_existing_out_dir_is_refused_untouched(self):
         self.out.mkdir()

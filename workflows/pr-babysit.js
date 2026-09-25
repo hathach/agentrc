@@ -704,6 +704,7 @@ const deferralLine = (f) => `- ${f.file}:${f.line}: ${f.claim}\n  Real, and out 
 // Across launches only the last cycle's publication outcome is read (pendingOf);
 // its reports and the older cycles stay in the results that carried them.
 const history = restored && restored.last ? [restored.last] : []
+const launchFrom = history.length
 // The checks the CI judge re-ran, per head: until its re-run registers, a check
 // still shows its old link, and a check by the same name is never re-run twice.
 const ciReruns = restored && restored.ciCache ? restored.ciCache.reruns : []
@@ -815,6 +816,43 @@ const stateOut = () => {
 // Every result carries a status the caller can act on without reading the reason
 // (complete: passed; paused: a whole cycle ran and another may follow; blocked:
 // something needs attention first), what the last cycle observed, and the state.
+// What became of a finding or a CI failure, for the per-cycle table and the launch
+// rollup alike; each words a `valid` finding or a `real` failure its own way.
+const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
+const ciState = (rf) => rf.accepted ? 'accepted' : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
+// This launch in counts a caller can table across launches: each finding and
+// CI failure once, as its last cycle here left it, except that a fix this launch
+// pushed is not recounted as stale.
+const launchRollup = () => {
+  const findings = new Map()
+  const ci = new Map()
+  const pushed = []
+  const reran = new Set()
+  let replies = 0
+  const fixedBy = (fixes, id, push) => !!(push && fixes && fixes.some(x => x.ids.includes(id) && x.addresses === true))
+  for (const e of history.slice(launchFrom)) {
+    for (const f of (e.reviews && e.reviews.findings) || []) {
+      const state = findingState(f)
+      const now = state !== 'valid' ? state : fixedBy(e.reviewFixes, f.commentId, e.reviewPush) ? 'fixed' : 'open'
+      if (!(now === 'stale' && findings.get(f.findingId) === 'fixed')) findings.set(f.findingId, now)
+    }
+    for (const rf of (e.ci && e.ci.realFailures) || []) {
+      const state = ciState(rf)
+      ci.set(failureKey(rf), state !== 'real' ? state : fixedBy(e.ciFixes, rf.id, e.ciPush) ? 'fixed' : 'open')
+    }
+    for (const r of (e.ci && e.ci.infraRerun) || []) reran.add(r)
+    if (e.adoption && e.adoption.publication === 'pushed') pushed.push(e.adoption.to.slice(0, 8))
+    for (const p of [e.reviewPush, e.ciPush]) if (shaOf(p) !== '-') pushed.push(shaOf(p))
+    for (const p of [e.refutedPosts, e.deferralPosts, e.fixNotePosts]) replies += ((p && p.replied) || []).length
+  }
+  const tally = (m, keys) => Object.fromEntries([['total', m.size], ...keys.map(k => [k, [...m.values()].filter(v => v === k).length])])
+  return {
+    cycles: history.slice(launchFrom).map(e => e.cycle),
+    findings: tally(findings, ['fixed', 'open', 'refuted', 'stale', 'deferred', 'held']),
+    ci: tally(ci, ['fixed', 'open', 'accepted', 'rigSide', 'unclassified']),
+    reran: reran.size, pushed, replies,
+  }
+}
 const finish = (verdict, status) => {
   const last = history[history.length - 1] || null
   const observation = {
@@ -828,7 +866,7 @@ const finish = (verdict, status) => {
     } : null,
   }
   const state = stateOut()
-  return { stateDigest: state.digest, ...verdict, ...(corrections.length ? { corrections } : {}), status: status || (verdict.pass ? 'complete' : 'blocked'), observation, state }
+  return { stateDigest: state.digest, ...verdict, ...(corrections.length ? { corrections } : {}), status: status || (verdict.pass ? 'complete' : 'blocked'), rollup: launchRollup(), observation, state }
 }
 const owesDismissal = (commentId) => {
   const d = debt.get(commentId)
@@ -1272,28 +1310,29 @@ const cycleSummary = (entry) => {
   const findings = [...((entry.reviews && entry.reviews.findings) || [])]
     .sort((a, b) => (VERDICT_ORDER[a.verdict] ?? 3) - (VERDICT_ORDER[b.verdict] ?? 3))
   for (const f of findings) {
-    const valid = f.verdict === 'valid' && !f.deferral && !f.hold
+    const state = findingState(f)
     rows.push([
       cell(f.source, 16),
       cell(`${f.file}:${f.line} ${f.claim}`),
       cell(f.overturned ? 'overturned' : f.verdict, 8),
-      f.hold ? cell(`held: ${f.hold}`, 60)
-      : f.deferral ? cell(`deferred, ${answerState(f.commentId)}: ${f.deferral.issueUrl}`, 120)
-      : valid ? cell((f.overturned ? 'refuted, then overturned, ' : '') +
+      state === 'held' ? cell(`held: ${f.hold}`, 60)
+      : state === 'deferred' ? cell(`deferred, ${answerState(f.commentId)}: ${f.deferral.issueUrl}`, 120)
+      : state === 'valid' ? cell((f.overturned ? 'refuted, then overturned, ' : '') +
         fixCell(entry.reviewFixes, f.commentId, entry.reviewPush, entry.reviewPushFailed), 60)
-        : cell(`${f.verdict === 'stale' ? 'already fixed' : 'refuted'}, ${
+        : cell(`${state === 'stale' ? 'already fixed' : 'refuted'}, ${
           answerState(f.commentId)}`, 60),
-      valid ? shaOf(entry.reviewPush) : '-',
+      state === 'valid' ? shaOf(entry.reviewPush) : '-',
     ])
   }
   for (const rf of ((entry.ci && entry.ci.realFailures) || [])) {
+    const state = ciState(rf)
     rows.push([
       cell(`ci:${rf.check}`, 24),
       cell(rf.firstError),
       rf.verdict === 'real' ? 'ci-real' : rf.verdict,
-      rf.accepted ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
-      : rf.verdict === 'rig-side' ? 'left red for the rig'
-        : rf.verdict === 'unclassified' ? 'left red: not placed by its evidence'
+      state === 'accepted' ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
+      : state === 'rigSide' ? 'left red for the rig'
+        : state === 'unclassified' ? 'left red: not placed by its evidence'
           : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
       rf.verdict === 'real' && !rf.accepted ? shaOf(entry.ciPush) : '-',
     ])
@@ -1579,6 +1618,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   const expected = new Map(replies.map(r => [r.commentId, r.digest]))
   const receipts = out ? out.receipts.filter(r => expected.has(r.commentId)) : [] // a stray id answers nothing
   const settled = new Set()
+  const replied = []
   for (const [commentId, digest] of expected) {
     const mine = receipts.filter(r => r.commentId === commentId)
     // A receipt that is not trusted may still name a reply that exists:
@@ -1608,7 +1648,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
       else log(`cycle ${cycle}: ${label} receipt for comment ${commentId} says none and a POST — not trusted`)
       continue
     }
-    if (settles(r)) { pay(commentId, how, digestOf.get(commentId)); settled.add(commentId) }
+    if (settles(r)) { pay(commentId, how, digestOf.get(commentId)); settled.add(commentId); replied.push(commentId) }
     else if (r.verified === false && r.replyId !== null) repair(commentId, r.replyId, r.error || 'read-back mismatch')
     else if (r.verified === null && r.replyId !== null) log(`cycle ${cycle}: reply ${r.replyId} to comment ${commentId} could not be read back (${r.error}) — retried next cycle`)
   }
@@ -1619,7 +1659,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     detail: !out ? 'agent died'
       : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
         gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
-    receipts,
+    receipts, replied,
   }
   if (!receipt.pass) log(`cycle ${cycle}: ${label} incomplete — ${receipt.detail}`)
   return receipt

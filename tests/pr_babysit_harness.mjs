@@ -773,6 +773,40 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.deepEqual([rows[1][4], rows[2][4]], ['-', '-'], 'only fixed findings carry a commit')
   assert.match(rows[2][1], /refuted \\\| with a pipe/, 'a pipe in a claim is escaped, not table-breaking')
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
+  assert.deepEqual(result.rollup, {
+    cycles: [1], findings: { total: 3, fixed: 1, open: 0, refuted: 1, stale: 1, deferred: 0, held: 0 },
+    ci: { total: 0, fixed: 0, open: 0, accepted: 0, rigSide: 0, unclassified: 0 }, reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
+  })
+})
+
+test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
+  const red = redWith(RIG, PVS, UNPLACED).ci
+  const first = await run({ args: { ...YIELD, acceptedFailures: [accept()] }, reviews: WAITING, ci: red })
+  assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, rigSide: 1, unclassified: 1 })
+  const dry = await run({ args: { autoPush: false, maxCycles: 3 }, reviews: { findings: [finding()], replies: [], bots: 'reviewed' } })
+  assert.deepEqual(dry.result.rollup.findings, { total: 1, fixed: 0, open: 1, refuted: 0, stale: 0, deferred: 0, held: 0 }, 'a dry run fixes nothing')
+  const twice = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual([twice.result.rollup.cycles, twice.result.rollup.ci.total], [[1, 2], 1])
+  const again = await run({ args: { ...YIELD, state: first.result.state, acceptedFailures: [accept()] }, reviews: WAITING, ci: red })
+  assert.deepEqual(again.result.rollup.cycles, [2], 'the carried cycle is the previous launch\'s')
+  let cycle = 0
+  const fixedThenStale = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ({ findings: [finding({ verdict: ++cycle === 1 ? 'valid' : 'stale' })], replies: [], bots: 'reviewed' }),
+  })
+  assert.deepEqual([fixedThenStale.result.rollup.cycles, fixedThenStale.result.rollup.findings.fixed, fixedThenStale.result.rollup.findings.stale], [[1, 2], 1, 0],
+    'a fix this launch pushed is not recounted as stale')
+  // fixed in cycle 1, then called invalid: a reversal the challenger cannot settle is held
+  cycle = 0
+  const reopened = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ++cycle === 1 ? { findings: [finding()], replies: [], bots: 'reviewed' }
+      : { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' },
+    challenge: () => ({ verdict: 'unknown', reason: 'cannot tell' }),
+  })
+  assert.ok(reopened.logs.some(l => /held — contradicts the earlier valid verdict on 1#1/.test(l)), reopened.logs.join('\n'))
+  assert.deepEqual([reopened.result.rollup.cycles, reopened.result.rollup.findings.fixed, reopened.result.rollup.findings.held], [[1, 2], 0, 1],
+    'a fixed finding the last cycle holds again is held, not fixed')
 })
 
 test('a claim already containing a backslash-pipe stays one cell', async () => {
@@ -1815,7 +1849,7 @@ test('a reply poster that throws leaves the debt owed, not the cycle dead', asyn
   assert.equal(result.pass, false)
   assert.equal(result.reason, 'deferred-replies-unresolved', 'the debt is what is unresolved')
   assert.equal(result.history.length, 1, 'the verdict keeps the history it was built from')
-  assert.deepEqual(result.history[0].fixNotePosts, { pass: false, detail: 'agent died', receipts: [] },
+  assert.deepEqual(result.history[0].fixNotePosts, { pass: false, detail: 'agent died', receipts: [], replied: [] },
     'the receipt exists even though the poster died')
   assert.ok(logs.some(l => /resolve#1 errored — resolve#1 exploded/.test(l)), logs.join('\n'))
   assert.equal(summaries(logs).length, 1, 'the scoreboard survives an agent-failure cycle')
@@ -1902,11 +1936,11 @@ test('the cycle records what each posting lane reported', async () => {
     },
   })
   const entry = result.history[0]
-  assert.deepEqual(entry.refutedPosts, { pass: true, detail: 'posted and read back', receipts: [receiptFor(2, 'no')] })
+  assert.deepEqual(entry.refutedPosts, { pass: true, detail: 'posted and read back', receipts: [receiptFor(2, 'no')], replied: [2] })
   assert.equal(entry.fixNotePosts.pass, true)
   assert.equal(entry.fixNotePosts.receipts[0].digest, fnv1a(manifestOf(calls, 'resolve#1')[0].body))
   const dead = await run({ reviews: oneValid, posting: null })
-  assert.deepEqual(dead.result.history[0].fixNotePosts, { pass: false, detail: 'agent died', receipts: [] })
+  assert.deepEqual(dead.result.history[0].fixNotePosts, { pass: false, detail: 'agent died', receipts: [], replied: [] })
 })
 
 test('every dismissal is challenged before it is posted', async () => {
@@ -3157,6 +3191,7 @@ test('a receipt for a different body settles nothing', async () => {
   assert.equal(result.pass, false)
   assert.deepEqual(result.deferred, [2])
   assert.ok(logs.some(l => /receipt for comment 2 is for a different body/.test(l)), logs.join('\n'))
+  assert.equal(result.rollup.replies, 0, 'an untrusted receipt is no reply')
 })
 
 test('two receipts for one comment, or success without a reply id, settle nothing', async () => {
@@ -3166,6 +3201,7 @@ test('two receipts for one comment, or success without a reply id, settle nothin
     receipts: (rs) => [{ ...rs[0], verified: false, error: 'read-back mismatch on body' }, rs[0]],
   })
   assert.deepEqual(twice.result.deferred, [2], 'a mismatch followed by a success is contradictory')
+  assert.equal(twice.result.rollup.replies, 0)
   assert.deepEqual(twice.result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'contradictory receipts' },
     'the reply the receipts name is kept so nothing is posted over it')
   const noId = await run({
@@ -3769,6 +3805,7 @@ test('the cycle budget is cumulative across launches and refuses before any agen
   assert.equal(second.result.status, 'blocked')
   assert.equal(second.result.reason, 'budget-exhausted')
   assert.deepEqual(second.labels, [], 'not even the preflight')
+  assert.deepEqual(second.result.rollup.cycles, [])
 })
 
 test('a resumed launch refuses a head the previous launch did not leave', async () => {

@@ -5,7 +5,9 @@
 
 DIR must not exist. It receives stream.jsonl (every stdout line, raw), progress.log
 (`<seq> <HH:MM:SS> <line>`: the launcher's own lines, chief's status lines and notes),
-report.md (the final result's text), session (the session id) and stderr.log.
+report.md (the final result's text), session (the session id), stderr.log and, when
+the session's cost can be tabled, cost.md (run_cost.py's table, also appended to
+report.md). The exit line ends with that total, or `cost none (<why>)`.
 
 A status line is the first line of one of chief's own messages (agents/chief.md);
 a note is a progress note, joined onto one line, that chief's model returns as a `thinking`
@@ -19,6 +21,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import run_cost  # noqa: E402
 
 MARKER = 'chief: '
 
@@ -79,6 +84,23 @@ def verdict(rc, result, body):
     return 0, 'result ok'
 
 
+def cost(out, sid, report):
+    """The exit line's cost field; writes cost.md and appends it to the report."""
+    if not sid:
+        return 'cost none (no session id)'
+    try:
+        md, total = run_cost.summary(run_cost.session_dir(session_id=sid))
+        (out / 'cost.md').write_text(md + '\n', encoding='utf-8')
+        if report.exists():
+            with report.open('a', encoding='utf-8') as f:
+                f.write(f'\n## Cost by stage\n\n{md}\n')
+    except run_cost.Failed as e:
+        return f'cost none (run_cost: {e})'
+    except Exception as e:   # noqa: BLE001 - chief has finished; a cost it cannot table must not lose the exit line
+        return f'cost none ({type(e).__name__}: {e})'
+    return 'cost none (no cost record; see cost.md)' if total == '-' else f'cost ${total}'
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('--out', required=True, type=Path)
@@ -100,7 +122,7 @@ def main(argv=None):
         cmd += ['--permission-mode', a.permission_mode]
 
     progress = Progress(a.out / 'progress.log')
-    seen, result, warned = set(), None, set()
+    seen, result, warned, sid = set(), None, set(), ''
 
     def warn(key, text):
         if key not in warned:
@@ -157,7 +179,7 @@ def main(argv=None):
     report = a.out / 'report.md'
     if body.strip():
         report.write_text(body.rstrip('\n') + '\n', encoding='utf-8')   # Markdown: keep its indentation
-    progress.line(f'launcher: exit {code} ({reason}) · report {report if body.strip() else "none"}')
+    progress.line(f'launcher: exit {code} ({reason}) · report {report if body.strip() else "none"} · {cost(a.out, sid, report)}')
     return code
 
 

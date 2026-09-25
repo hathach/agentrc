@@ -31,8 +31,13 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    earlier when unsure.
 4. **On exit**, stop the Monitor and read the lines it had not delivered;
    then read `report.md`, chief's final report, or, when there is none, the
-   exit line and `stderr.log`. The exit code says how the run ended, not
-   whether the task passed:
+   exit line and `stderr.log`. When it can table the session's cost, the
+   launcher appends `cost.md` to the report: `scripts/run_cost.py`'s table of
+   the spend by Workflow run, stage and model, in claude's own dollars; the
+   exit line ends with its total, or with `cost none` and why.
+   Relay chief's launch table and that total; a stage that dwarfs the work
+   it did is worth a word.
+   The exit code says how the run ended, not whether the task passed:
 
    | Exit | Meaning |
    |---|---|
