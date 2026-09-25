@@ -137,7 +137,7 @@ const check = v && v.args ? `Workflow /${v.name} ${JSON.stringify(v.args)}, its 
     : `${verify} alone, no validation workflow being named by the repository's instructions`
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
-  : `confirm the implement notes carry hook evidence, then run your completion review (CLAUDE.md; chief uses its own sequence) with ${check} as its validation; state its outcome in your report; then the human opens the PR`
+  : `confirm the implement notes carry hook evidence; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence) with ${check} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report; then the human opens the PR`
 return {
   pass: !reason, reason, target, issue: triage.issue, kind: triage.kind, disposition: triage.disposition,
   triage, implement: dev, commits: verified.commits, verify: verified, validate: triage.validate, next,
