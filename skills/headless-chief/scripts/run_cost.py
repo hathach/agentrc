@@ -19,8 +19,10 @@ figure. A model's figures are marked est. when its rate is unknown (generic weig
 then), when the rates priced over its tokens miss claude's cost by a cent or more
 (fast mode, a price change), or when its tokens in the transcripts differ from what
 the record counted (a session still running, a missing transcript). A model the
-record lists and no transcript shows keeps its cost on an `unallocated` row. With no
-record, or for a model it does not list, `$` is `-`.
+record lists and no transcript shows keeps its cost on an `unallocated` row; a model it
+does not list has `-`. With no record at all, every row is priced at RATES and marked est.
+(`-` for a model with no rate). A note under the table says the figures cover the whole
+session, and when there was no record.
 """
 import argparse
 import json
@@ -172,10 +174,14 @@ def priced(rows, state):
     for r in rows:
         tokens[r['model']].update(r['tokens'])
     for model, total in tokens.items():
-        cost, recorded = (state or {}).get(model, (None, None))
+        rate = rate_of(model)
+        if state is None:
+            for r in (r for r in rows if r['model'] == model and rate):
+                r['cost'], r['est'] = priced_at(rate, r['tokens']), True
+            continue
+        cost, recorded = state.get(model, (None, None))
         if cost is None:
             continue
-        rate = rate_of(model)
         weight = lambda t: priced_at(rate or GENERIC, t)
         counted = [total['in'], total['out'], total['read'], total['w5m'] + total['w1h']]
         est = rate is None or abs(weight(total) - cost) >= 0.01 or recorded != counted
@@ -214,8 +220,12 @@ def summary(session):
     transcript = session.with_suffix('.jsonl')
     if not transcript.exists():
         raise Failed(f'no transcript {transcript}')
-    rows = priced(collect(session), cost_state(transcript))
-    return table(rows), total_cell(rows)
+    state = cost_state(transcript)
+    rows = priced(collect(session), state)
+    notes = [f'Scope: the whole session {session.name}, every Workflow run and agent in it and its own turns, not one workflow alone.']
+    if state is None:
+        notes.append('No cost-state record in the transcript: every $ is its tokens at RATES, an estimate.')
+    return table(rows) + '\n\n' + '\n'.join(notes), total_cell(rows)
 
 
 def main(argv=None):

@@ -75,7 +75,10 @@ class RunCostTest(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def rows(self, text):
-        return {(c[0], c[1], c[2]): c for c in ([x.strip() for x in line.strip('|').split('|')] for line in text.splitlines()[2:-1])}
+        return {(c[0], c[1], c[2]): c for c in ([x.strip() for x in line.strip('|').split('|')] for line in self.table(text)[2:-1])}
+
+    def table(self, text):
+        return [line for line in text.splitlines() if line.startswith('|')]
 
     def test_stages_and_models_share_claudes_own_cost(self):
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
@@ -87,7 +90,7 @@ class RunCostTest(unittest.TestCase):
         self.assertIn(('wf_aaa', 'fix', 'opus-5-5'), rows, 'a path label is staged by its prefix')
         self.assertIn(('chief', 'chief:Explore', 'opus-5-5'), rows)
         self.assertIn(('chief', 'chief', 'opus-5-5'), rows)
-        self.assertRegex(out.splitlines()[-1], r'\*\*5\.68\*\*', 'the rows add up to claude\'s total, exact where the rates price it')
+        self.assertRegex(self.table(out)[-1], r'\*\*5\.68\*\*', 'the rows add up to claude\'s total, exact where the rates price it')
         # Opus reads cost 0.05x input: the read-heavy Explore row gets less than flat 0.1x weights would give it
         self.assertEqual(rows[('chief', 'chief:Explore', 'opus-5-5')][7], '0.60')
 
@@ -107,20 +110,29 @@ class RunCostTest(unittest.TestCase):
         rows = self.rows(out)
         self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34', 'a model the record counted in full is exact')
         self.assertTrue(rows[('wf_aaa', 'fix', 'opus-5-5')][7].endswith(' est.'))
-        self.assertIn('**3.18 est.**', out.splitlines()[-1])
+        self.assertIn('**3.18 est.**', self.table(out)[-1])
         # a transcript missing from disk is the same mismatch the other way
         (self.session / 'subagents' / 'agent-b1.jsonl').unlink()
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
         self.assertTrue(self.rows(self.main('--session-id', SID)[1])[('wf_aaa', 'fix', 'opus-5-5')][7].endswith(' est.'))
 
-    def test_no_cost_record_or_an_unlisted_model_leaves_dollars_out(self):
+    def test_no_cost_record_prices_every_row_at_rates_as_an_estimate(self):
         write(self.session.with_suffix('.jsonl'), self.chief)
         out = self.main('--session-id', SID)[1]
-        self.assertTrue(out.splitlines()[-1].endswith('| **-** | |'))
+        rows = self.rows(out)
+        self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '0.34 est.')
+        self.assertEqual(rows[('wf_aaa', 'fix', 'opus-5-5')][7], f'{run_cost.priced_at(run_cost.RATES["claude-opus-5-5"], {"out": 20000, "read": 1200000, "w1h": 200000, "in": 0, "w5m": 0}):.2f} est.')
+        self.assertIn('**5.68 est.**', self.table(out)[-1], 'the same dollars a record would hold, marked')
+        self.assertIn('No cost-state record in the transcript', out)
+        self.assertIn(f'Scope: the whole session {SID}', out)
+        with mock.patch.dict(run_cost.RATES, clear=True):
+            self.assertTrue(self.table(self.main('--session-id', SID)[1])[-1].endswith('| **-** | |'), 'no rate, no dollars')
+
+    def test_an_unlisted_model_leaves_dollars_out(self):
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': (5.34, OPUS)})])
         out = self.main('--session-id', SID)[1]
         self.assertEqual(self.rows(out)[('wf_aaa', 'ci:collect', 'haiku-4-5')][7], '-')
-        self.assertIn('5.34 (partial)', out.splitlines()[-1])
+        self.assertIn('5.34 (partial)', self.table(out)[-1])
 
     def test_a_billed_model_with_no_transcript_keeps_its_cost_unallocated(self):
         for aid in ('a1', 'a2'):
@@ -128,7 +140,7 @@ class RunCostTest(unittest.TestCase):
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
         out = self.main('--session-id', SID)[1]
         self.assertEqual(self.rows(out)[('-', 'unallocated: no transcript', 'haiku-4-5')][7], '0.34')
-        self.assertIn('**5.68**', out.splitlines()[-1], 'the total stays claude\'s')
+        self.assertIn('**5.68**', self.table(out)[-1], 'the total stays claude\'s')
 
     def test_a_rate_belongs_to_its_model_and_its_suffixed_ids_only(self):
         opus = run_cost.RATES['claude-opus-5-5']
@@ -153,7 +165,7 @@ class RunCostTest(unittest.TestCase):
         for model in ('opus-5-5', 'haiku-4-5'):
             self.assertEqual(rows[('chief', 'chief', model)][3::5], ['1', '-'], model)
         self.assertEqual(rows[('wf_aaa', 'ci:collect', 'haiku-4-5')][8], '5 s', 'single-model transcripts keep their spans')
-        self.assertEqual(out.splitlines()[-1].split('|')[4].strip(), '5', 'the total counts each transcript once')
+        self.assertEqual(self.table(out)[-1].split('|')[4].strip(), '5', 'the total counts each transcript once')
 
     def test_a_session_it_cannot_place_is_refused(self):
         rc, _, err = self.main('--session-id', 'nope')
