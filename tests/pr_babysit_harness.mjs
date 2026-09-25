@@ -198,15 +198,14 @@ async function run(opts = {}) {
     if (label.startsWith('ci:collect#')) {
       // A fixture names the report the CI lane should compose; collect.py's
       // answers follow from it: each listed failure is one failing Actions job
-      // whose link names its run; a running fixture also has a check still pending.
+      // whose link names its run; a running fixture also counts one pending check.
       const failed = (ci.realFailures || []).map((rf, i) => ({
-        name: rf.check, workflow: 'ci', bucket: 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}`,
+        name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}`,
       }))
-      const pending = ci.status === 'running' ? [{ name: 'slow', workflow: 'ci', bucket: 'pending', link: 'https://github.com/o/r/actions/runs/1/job/99', attempt: 'actions:99' }] : []
       if (!/ inventory /.test(String(prompt)) && opts.evidence) await opts.evidence(calls)
       const answer = / inventory /.test(String(prompt))
-        ? { head: ci.headSha ?? head, baseRef: 'master', baseSha: 'b'.repeat(40), waited: 0, checks: [...failed, ...pending], error: null, status: ci.status }
-        : { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', checks: failed.map(f => ({ link: f.link, error: null })), error: null }
+        ? { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
+        : { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', error: null }
       return conforms(options.schema, answer, label)
     }
     if (label.startsWith('ci:judge#')) {
@@ -1400,8 +1399,8 @@ test('a re-run carries across a launch: its old run is still settling', async ()
 })
 
 test('a verdict over its bound, or past the budget, is judged again rather than cut', async () => {
-  // 1000 arrows or DELs are 1000 characters but 6000 bytes once state_transfer.py escapes them
-  for (const firstError of ['x'.repeat(5000), '→'.repeat(1000), '\x7f'.repeat(1000)]) {
+  // 3000 arrows or DELs are 3000 characters but 18000 bytes once state_transfer.py escapes them
+  for (const firstError of ['x'.repeat(17000), '→'.repeat(3000), '\x7f'.repeat(3000)]) {
     const over = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith({ ...RIG, firstError }).ci })
     assert.ok(over.logs.some(l => /CI verdict for hil \/ pico not cached/.test(l)), firstError.slice(0, 3))
     assert.ok(over.labels.includes('ci:judge#2'))
@@ -1414,11 +1413,25 @@ test('a verdict over its bound, or past the budget, is judged again rather than 
   assert.ok(JSON.stringify(full.result.state).length < 64 * 1024)
 })
 
+test('a cached verdict is reused only while its check keeps the same conclusion', async () => {
+  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.equal(first.result.state.ciCache.entries[0].bucket, 'fail')
+  const cancelled = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: { ...redWith(RIG).ci, bucket: 'cancel' } })
+  assert.ok(cancelled.labels.includes('ci:judge#2'), 'a conclusion updated under the same link is judged again')
+  assert.equal(cancelled.result.state.ciCache.entries[0].bucket, 'cancel', 'and its new verdict replaces the old')
+  // a replacement is budgeted without the entry it replaces: 10 KB twice would not fit, once does
+  const big = { ...RIG, firstError: 'x'.repeat(5000) } // about 10 KB: the stub copies it into the signature
+  const cached = await run({ args: YIELD, reviews: WAITING, ci: redWith(big).ci })
+  const replaced = await run({ args: { ...YIELD, state: cached.result.state }, reviews: WAITING, ci: { ...redWith(big).ci, bucket: 'cancel' } })
+  assert.deepEqual(replaced.result.state.ciCache.entries.map(e => e.bucket), ['cancel'], replaced.logs.join('\n'))
+})
+
 test('a state whose CI cache is malformed is refused', async () => {
   const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const { digest, ...st } = first.result.state
   for (const ciCache of [{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', failures: [{ ...st.ciCache.entries[0].failures[0], verdict: 'unclassified' }] }] },
-    { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [], reruns: [] }]) {
+    { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [], reruns: [] },
+    { ...st.ciCache, entries: st.ciCache.entries.map(({ bucket, ...e }) => e) }]) {
     await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache }) } }), /not a pr-babysit state/)
   }
 })
@@ -1439,6 +1452,7 @@ test('the CI contract names the three verdicts and nothing else', async () => {
   assert.deepEqual(item.required, ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'])
   assert.deepEqual(judge.schema.required, ['checks', 'infraRerun'])
   assert.deepEqual(item.properties.verdict.enum, ['real', 'rig-side', 'unclassified'])
+  assert.deepEqual(item.properties.runId.type, ['integer', 'null'], 'a check whose link names no run has no run id')
   assert.equal(item.additionalProperties, false)
 })
 

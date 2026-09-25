@@ -5,31 +5,29 @@
   collect.py failures --repo OWNER/NAME --pr N --head SHA --check LINK...
 
 inventory: waits up to S seconds (default 0) while any check is pending, then
-prints one JSON object {repo, pr, head, baseRef, baseSha, status, waited,
-counts, checks, error}. `status` is green, red (a check failed or was
-cancelled) or running (still pending, or no checks registered yet). `checks`
-lists only the checks that did not pass or skip, each {name, workflow, bucket,
-link, attempt}: `attempt` is the per-run id in a link that has one (an Actions
-job, a Read the Docs build, a CircleCI job; each re-run mints a new one), and
-null for a link that stays the same across runs (a docs preview, a review
-bot's page, none), so only a non-null attempt can tell one run from the next.
-`repo` must own the PR number, which for a fork PR is not the head repository. Exit 0
-with the object, 1 with `error` set (a gh failure, or the PR head is no longer
---head), 2 on a usage error.
+prints one JSON object {head, status, pending, checks, error}. `status` is
+green, red (a check failed or was cancelled) or running (still pending, or no
+checks registered yet); `pending` counts the pending checks. `checks` lists
+the failed and cancelled ones, each {name, workflow, bucket, link, attempt}:
+`attempt` is the per-run id in a link that has one (an Actions job, a Read the
+Docs build, a CircleCI job; each re-run mints a new one), and null for a link
+that stays the same across runs (a docs preview, a review bot's page, none),
+so only a non-null attempt can tell one run from the next. `repo` must own the
+PR number, which for a fork PR is not the head repository. Exit 0 with the
+object, 1 with `error` set (a gh failure, or the PR head is no longer --head),
+2 on a usage error.
 
 failures: for each --check (an inventory link), reads the failure and writes
 the evidence for a judge to <tmp>/ci-collect/<repo>/<pr>/<head>/failures-<ns>.json,
-one file per call: the job's log without ANSI codes, NULs and timestamps
-saved whole, the diagnostic lines of every step that reported an error, and for an Actions job the newest run on the base
-branch in which the same job ran, with its conclusion and the diagnostic lines
-both share. It prints a compact copy, {head, detail, checks: [{link, attempt,
-name, provider, runId and runAttempt for an Actions job, firstError (its first
-200 characters), files, complete, base
-(with the count of shared lines), error}]}; the lines themselves, each check's
-signature and its log path are in the detail file. `complete` is always false here: a log's diagnostic
-lines do not prove every failure was listed. A --check that is no longer a
-failing check of the head is stale: exit 1 with `stale` listing them, before
-anything is read. Read the Docs needs RTD_TOKEN (see rtd.py).
+one file per call, and prints {head, detail, error}. Each check's entry holds
+its saved `log` and the diagnostic lines of every step that reported an error.
+The log is the job's whole log without ANSI codes, NULs and timestamps for an
+Actions job, but only tails for the others: the last 150 lines of each failed
+CircleCI step, and Read the Docs' notes with 40-line tails of failed commands.
+For an Actions job the entry also holds the newest run on the base branch in
+which the same job ran, with its conclusion and the diagnostic lines both
+share. A --check that is no longer a failing check of the head is a stale
+snapshot: exit 1, before anything is read. Read the Docs needs RTD_TOKEN (see rtd.py).
 """
 
 import argparse
@@ -48,7 +46,6 @@ import rtd  # noqa: E402
 POLL = 30
 ATTEMPT = (
     ('actions', re.compile(r'^https://github\.com/[^/]+/[^/]+/actions/runs/\d+/job/(\d+)')),
-    ('readthedocs', re.compile(r'^https://app\.readthedocs\.(?:org|com)/projects/[\w-]+/builds/(\d+)/?$')),
     ('circleci', re.compile(r'^https://circleci\.com/gh/[^/]+/[^/]+/(\d+)$')),
 )
 
@@ -66,23 +63,19 @@ class Failed(Exception):
     pass
 
 
-class Stale(Failed):
-    def __init__(self, links):
-        super().__init__('stale snapshot: no longer failing checks of the head: ' + ', '.join(links))
-        self.links = links
-
-
 def gh(*args, raw=False):
     try:
-        done = subprocess.run(['gh', *args], capture_output=True, text=True)
+        done = subprocess.run(['gh', *args], capture_output=True)
     except OSError as e:
         raise Failed(f'gh: {e}')
     if done.returncode != 0:
-        raise Failed(f'gh {args[0]} {args[1]}: {done.stderr.strip() or f"exit {done.returncode}"}')
+        err = done.stderr.decode(errors='replace').strip()
+        raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}')
+    # A job log is whatever the job printed; anything parsed stays strict.
     if raw:
-        return done.stdout
+        return done.stdout.decode(errors='replace')
     try:
-        return json.loads(done.stdout)
+        return json.loads(done.stdout.decode())
     except ValueError:
         raise Failed(f'gh {args[0]} {args[1]}: not JSON: {done.stdout[:200]!r}')
 
@@ -105,7 +98,8 @@ def attempt(link):
         m = pattern.match(link or '')
         if m:
             return f'{kind}:{m.group(1)}'
-    return None
+    m = rtd.BUILD.match(link or '')
+    return f'readthedocs:{m.group(3)}' if m else None
 
 
 def summary(checks):
@@ -134,8 +128,13 @@ def inventory(repo, pr, head, wait):
     if after != head:
         raise Failed(f'PR #{pr} head moved to {after} while collecting')
     listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
-    return {'repo': repo, 'pr': pr, 'head': head, 'baseRef': before['baseRefName'], 'baseSha': before['baseRefOid'],
-            'status': status, 'waited': waited, 'counts': counts, 'checks': listed, 'error': None}
+    return {'head': head, 'baseRef': before['baseRefName'], 'status': status, 'counts': counts, 'checks': listed}
+
+
+def printed(inv):
+    """What the caller reads: the failing checks by name, the pending ones by count."""
+    return {'head': inv['head'], 'status': inv['status'], 'pending': inv['counts'].get('pending', 0),
+            'checks': [c for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')], 'error': None}
 
 
 def clean(text):
@@ -196,19 +195,18 @@ def actions_log(repo, job):
 
 def base_run(repo, base_ref, workflow, name, cache):
     """The newest completed run on the base branch in which a job of this name ran."""
-    if (workflow, name) not in cache:
-        cache[workflow, name] = None
-        for run in gh('run', 'list', '--repo', repo, '--branch', base_ref, '--workflow', workflow,
-                      '--limit', '20', '--json', 'databaseId,headSha,status'):
-            if run['status'] != 'completed':
-                continue
-            jobs = gh('run', 'view', str(run['databaseId']), '--repo', repo, '--json', 'jobs')['jobs']
-            job = next((j for j in jobs if j['name'] == name and j.get('conclusion') not in (None, '', 'skipped', 'cancelled')), None)
-            if job:
-                cache[workflow, name] = {'sha': run['headSha'], 'runId': run['databaseId'], 'jobId': job['databaseId'],
-                                         'conclusion': job['conclusion']}
-                break
-    return cache[workflow, name]
+    runs = cache.setdefault('runs', {})
+    if workflow not in runs:
+        runs[workflow] = [run for run in gh('run', 'list', '--repo', repo, '--branch', base_ref, '--workflow', workflow,
+                                             '--limit', '20', '--json', 'databaseId,headSha,status')
+                           if run['status'] == 'completed']
+    for run in runs[workflow]:
+        if 'jobs' not in run:
+            run['jobs'] = gh('run', 'view', str(run['databaseId']), '--repo', repo, '--json', 'jobs')['jobs']
+        job = next((j for j in run['jobs'] if j['name'] == name and j.get('conclusion') not in (None, '', 'skipped', 'cancelled')), None)
+        if job:
+            return {'sha': run['headSha'], 'runId': run['databaseId'], 'jobId': job['databaseId'], 'conclusion': job['conclusion']}
+    return None
 
 
 def actions(repo, head, base_ref, job, folder, cache):
@@ -230,8 +228,10 @@ def actions(repo, head, base_ref, job, folder, cache):
     return entry
 
 
-def readthedocs(link, folder):
-    build, record, notes, failed = rtd.reason(link, rtd.token())
+def readthedocs(link, folder, cache):
+    if 'token' not in cache:
+        cache['token'] = rtd.token()
+    build, record, notes, failed = rtd.reason(link, cache['token'])
     lines = [f'error: {record["error"]}'] * bool(record.get('error')) + [f'{h}: {b}' for _, h, b in notes]
     for code, command, tail in failed:
         lines += [f'command exited {code}: {command}', *tail.splitlines()]
@@ -253,7 +253,7 @@ def failures(repo, pr, head, links):
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
     stale = [link for link in links if link not in failing]
     if stale:
-        raise Stale(stale)
+        raise Failed('stale snapshot: no longer failing checks of the head: ' + ', '.join(stale))
     folder = Path(tempfile.gettempdir()) / 'ci-collect' / repo.replace('/', '_') / str(pr) / head
     folder.mkdir(parents=True, exist_ok=True)
     cache, checks = {}, []
@@ -261,12 +261,12 @@ def failures(repo, pr, head, links):
         check = failing[link]
         kind, _, ident = (check['attempt'] or 'other:').partition(':')
         entry = {'link': link, 'attempt': check['attempt'], 'bucket': check['bucket'], 'provider': kind,
-                 'name': check['name'], 'complete': False, 'error': None}
+                 'name': check['name'], 'error': None}
         try:
             if kind == 'actions':
                 entry.update(actions(repo, head, now['baseRef'], ident, folder, cache))
             elif kind == 'readthedocs':
-                entry.update(readthedocs(link, folder))
+                entry.update(readthedocs(link, folder, cache))
             elif kind == 'circleci':
                 entry.update(circle(repo, ident, folder))
             else:
@@ -276,13 +276,7 @@ def failures(repo, pr, head, links):
         checks.append(entry)
     detail = folder / f'failures-{time.time_ns()}.json'
     detail.write_text(json.dumps({'head': head, 'baseRef': now['baseRef'], 'checks': checks}, indent=1))
-    compact = [{k: v for k, v in c.items() if k not in ('diagnostics', 'log', 'signature')} for c in checks]
-    for c in compact:
-        c['firstError'] = (c.get('firstError') or '')[:200]
-        if c.get('base') and 'diagnostics' in c['base']:
-            c['base'] = {k: v for k, v in c['base'].items() if k not in ('diagnostics', 'log')}
-            c['base']['shared'] = len(c['base']['shared'])
-    return {'head': head, 'detail': str(detail), 'checks': compact, 'error': None}
+    return {'head': head, 'detail': str(detail), 'error': None}
 
 
 def main(argv=None):
@@ -299,13 +293,11 @@ def main(argv=None):
     if not re.fullmatch(r'[0-9a-f]{40}', a.head):
         p.error('--head must be a full 40-hex SHA')
     try:
-        out = (inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)) if a.command == 'inventory'
+        out = (printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds))) if a.command == 'inventory'
                else failures(a.repo, a.pr, a.head, a.check))
         rc = 0
     except Failed as e:
-        out, rc = {'repo': a.repo, 'pr': a.pr, 'head': a.head, 'error': str(e)}, 1
-        if isinstance(e, Stale):
-            out['stale'] = e.links
+        out, rc = {'head': a.head, 'error': str(e)}, 1
     print(json.dumps(out))
     return rc
 

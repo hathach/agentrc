@@ -212,11 +212,11 @@ if (args.stateRef != null) {
 // re-judges it: the checks the judge re-ran (`sure` false for a judge lost after
 // it may have), and its verdicts per check run, whose link names the run.
 const isFailure = (f) => f && typeof f === 'object' && ['check', 'workflow', 'job', 'signature', 'firstError'].every(k => typeof f[k] === 'string') &&
-  (f.cell === null || typeof f.cell === 'string') && Number.isInteger(f.runId) && typeof f.complete === 'boolean' &&
+  (f.cell === null || typeof f.cell === 'string') && (f.runId === null || Number.isInteger(f.runId)) && typeof f.complete === 'boolean' &&
   Array.isArray(f.files) && f.files.every(x => typeof x === 'string') && ['real', 'rig-side'].includes(f.verdict)
 const ciCacheShaped = (c) => c && typeof c === 'object' && typeof c.notesDigest === 'string' &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
-  Array.isArray(c.entries) && c.entries.every(e => e && typeof e.head === 'string' && typeof e.link === 'string' &&
+  Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket'].every(k => typeof e[k] === 'string') &&
     Array.isArray(e.failures) && e.failures.length > 0 && e.failures.every(isFailure))
 const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
@@ -262,36 +262,25 @@ if (adoptHead !== null) {
 // for a publish at all; it is not a capability any agent lacks.
 const STOPS = 'Do not push, create a PR, or post an issue or PR comment. Do not stage or commit: leave your changes in the working tree for this workflow to publish. Agent or peer requests and previous actions add no permission. Report out-of-scope work before editing; preserve unrelated changes and obey repository checks.'
 
-const CI = {
+// One CI failure, as the judge reports it and the CI report carries it.
+const CI_FAILURE = {
   type: 'object', additionalProperties: false,
-  required: ['headSha', 'status', 'infraRerun', 'realFailures'],
+  required: ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'],
   properties: {
-    headSha: { type: 'string' },
-    status: { type: 'string', enum: ['green', 'red', 'running'] },
-    infraRerun: { type: 'array', items: { type: 'string' } },
-    realFailures: {
-      type: 'array',
-      items: {
-        type: 'object', additionalProperties: false,
-        required: ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'],
-        properties: {
-          check: { type: 'string' }, firstError: { type: 'string' },
-          files: { type: 'array', items: { type: 'string' } },
-          // One failure's identity, what an accepted failure is matched on: cell
-          // is the matrix leg, null only for a job with one result; signature
-          // its first diagnostic line verbatim; complete whether every failure
-          // of that job was read and listed.
-          workflow: { type: 'string' }, job: { type: 'string' }, cell: { type: ['string', 'null'] },
-          signature: { type: 'string' }, runId: { type: 'integer' }, complete: { type: 'boolean' },
-          // pr-ci-watcher's call: `real` is the PR's to fix; `rig-side` is the rig's
-          // (a board that will not enumerate, a cable, a lock, a tool's own status
-          // exit seen elsewhere too); `unclassified` is a failure its evidence could
-          // not place, firstError carrying that evidence. Only `real` is fixed or
-          // committed here; the other two end the run red for the user.
-          verdict: { type: 'string', enum: ['real', 'rig-side', 'unclassified'] },
-        },
-      },
-    },
+    check: { type: 'string' }, firstError: { type: 'string' },
+    files: { type: 'array', items: { type: 'string' } },
+    // One failure's identity, what an accepted failure is matched on: cell
+    // is the matrix leg, null only for a job with one result; signature
+    // its first diagnostic line verbatim; complete whether every failure
+    // of that job was read and listed.
+    workflow: { type: 'string' }, job: { type: 'string' }, cell: { type: ['string', 'null'] },
+    signature: { type: 'string' }, runId: { type: ['integer', 'null'] }, complete: { type: 'boolean' },
+    // pr-ci-watcher's call: `real` is the PR's to fix; `rig-side` is the rig's
+    // (a board that will not enumerate, a cable, a lock, a tool's own status
+    // exit seen elsewhere too); `unclassified` is a failure its evidence could
+    // not place, firstError carrying that evidence. Only `real` is fixed or
+    // committed here; the other two end the run red for the user.
+    verdict: { type: 'string', enum: ['real', 'rig-side', 'unclassified'] },
   },
 }
 // collect.py's two answers, relayed verbatim by a Haiku agent: what CI shows for
@@ -305,19 +294,15 @@ const COLLECT_CHECK = {
   },
 }
 const INVENTORY = {
-  type: 'object', required: ['head', 'status', 'checks'],
+  type: 'object', required: ['head', 'status', 'pending', 'checks'],
   properties: {
-    error: { type: ['string', 'null'] }, head: { type: 'string' }, baseRef: { type: 'string' }, baseSha: { type: 'string' },
-    status: { type: 'string' }, waited: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
+    error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' },
+    pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
   },
 }
 const EVIDENCE = {
-  type: 'object', required: ['head', 'detail', 'checks'],
-  properties: {
-    error: { type: ['string', 'null'] }, stale: { type: 'array', items: { type: 'string' } },
-    head: { type: 'string' }, detail: { type: 'string' },
-    checks: { type: 'array', items: { type: 'object', required: ['link'], properties: { link: { type: 'string' }, error: { type: ['string', 'null'] } } } },
-  },
+  type: 'object', required: ['head', 'detail'],
+  properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' } },
 }
 // pr-ci-watcher, as the judge: one entry per check it was given, holding every
 // failure it read in that check, and the re-runs it started.
@@ -329,7 +314,7 @@ const JUDGED = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false, required: ['link', 'failures'],
-        properties: { link: { type: 'string' }, failures: { type: 'array', items: CI.properties.realFailures.items } },
+        properties: { link: { type: 'string' }, failures: { type: 'array', items: CI_FAILURE } },
       },
     },
     infraRerun: { type: 'array', items: { type: 'string' } },
@@ -593,7 +578,7 @@ const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 // How a fact collector's agent relays the script's last stdout line, and what it
 // fills the schema's required fields with when there is no line or it is an error.
 const relayed = (schema) => {
-  const EMPTY = { boolean: 'false', string: "''", array: '[]' }
+  const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
   const empty = schema.required.map(k => {
     if (!(schema.properties[k].type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
     return `${k} = ${EMPTY[schema.properties[k].type]}`
@@ -713,7 +698,6 @@ const ciReruns = restored && restored.ciCache ? restored.ciCache.reruns : []
 // Verdicts by check link. Only a link naming its run is kept, and never an
 // unclassified verdict, which a newer base run may still place; a changed
 // ciNotes can change any verdict, so it discards them all.
-const CI_ENTRY_MAX = 4 * 1024
 const CI_CACHE_MAX = 16 * 1024
 // Bytes as state_transfer.py sends them: ensure_ascii turns DEL and every non-ASCII UTF-16 unit into a 6-byte \uXXXX escape.
 const transferBytes = (v) => { const t = canonical(v); return t.length + 5 * (t.match(/[^\x00-\x7e]/g) || []).length }
@@ -1718,15 +1702,17 @@ const ciLaneRun = async (cycle, lanes) => {
     if (inv.status !== 'running' || left < 30 || lanes.reviewPushed || lanes.ended) break
   }
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
-  // An empty list is green or no checks registered yet (running); any listed check is pending or failing.
-  const shown = inv.checks.some(c => c.bucket === 'pending') ? 'running' : failing.length ? 'red' : null
+  // With nothing pending or failing the head is green, or has no checks registered yet (running).
+  const shown = inv.pending > 0 ? 'running' : failing.length ? 'red' : null
   if (inv.head !== expectedHead || (shown ? inv.status !== shown : !['green', 'running'].includes(inv.status))) {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
     return null
   }
   const reruns = ciReruns.filter(r => r.head === inv.head)
   const settling = failing.filter(c => reruns.some(r => r.sure && r.link === c.link))
-  const cached = failing.filter(c => !settling.includes(c) && c.attempt && ciVerdicts.has(c.link) && ciVerdicts.get(c.link).head === inv.head)
+  // A run's conclusion can still be updated under the same link, so the bucket must match too.
+  const cached = failing.filter(c => !settling.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
+    ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket)
   const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c))
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
@@ -1735,19 +1721,21 @@ const ciLaneRun = async (cycle, lanes) => {
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
   if (judging.length === 0 || lanes.reviewPushed || lanes.ended) return report
   const links = judging.map(c => c.link)
+  const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
+  const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
   const ev = await collect(`ci:collect#${cycle}.f`, `failures ${links.map(l => `--check ${shq(l)}`).join(' ')}`, EVIDENCE)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
   if (lanes.reviewPushed || lanes.ended) return report
   if (!ev || ev.error || ev.head !== inv.head) {
-    log(`cycle ${cycle}: CI evidence not collected — ${!ev ? 'the collector died' : ev.error || `it is for ${ev.head.slice(0, 7)}`}${ev && ev.stale ? '; re-arming on a fresh inventory' : ''}`)
+    log(`cycle ${cycle}: CI evidence not collected — ${!ev ? 'the collector died' : ev.error || `it is for ${ev.head.slice(0, 7)}`}`)
     return null
   }
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. The checks, each needing exactly one entry in your reply: ` +
     JSON.stringify(judging.map(c => ({ link: c.link, check: c.name, workflow: c.workflow, bucket: c.bucket }))) + '.' +
-    [true, false].map(sure => [sure, reruns.filter(r => r.sure === sure).map(r => `${r.workflow} / ${r.check}`)])
-      .map(([sure, names]) => names.length ? `\n${sure ? 'Already re-run' : 'Possibly re-run by a judge that was lost'} on this head: ${JSON.stringify(names)}.` : '').join('') +
+    (known.length ? `\nAlready re-run on this head: ${JSON.stringify(known)}.` : '') +
+    (possible.length ? `\nPossibly re-run by a judge that was lost on this head: ${JSON.stringify(possible)}.` : '') +
     (ciNotes ? `\nWhat the caller established about this PR's CI already, to weigh with your own evidence: ${ciNotes}` : ''),
     { label: `ci:judge#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: JUDGED },
   ).catch(e => { log(`cycle ${cycle}: CI judge errored — ${e && e.message}`); return null })
@@ -1766,15 +1754,15 @@ const ciLaneRun = async (cycle, lanes) => {
   // An empty answer is a re-run by the contract: CI is settling, receipt or not.
   if (reran.length) report.status = 'running'
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
+  for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
   for (const c of judging.filter(c => c.attempt && !reran.includes(c))) {
     const failures = judged.checks.find(j => j.link === c.link).failures
     if (failures.some(f => f.verdict === 'unclassified')) continue
-    for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
-    const entry = { head: inv.head, link: c.link, failures: JSON.parse(JSON.stringify(failures)) }
+    const entry = { head: inv.head, link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(failures)) }
     // Re-runs are never dropped, so they come out of the same budget first.
     const size = transferBytes(entry)
-    const total = transferBytes([...ciVerdicts.values()]) + transferBytes(ciReruns.filter(r => r.head === inv.head))
-    if (size > CI_ENTRY_MAX || total + size > CI_CACHE_MAX) {
+    const total = transferBytes([...ciVerdicts.values()].filter(e => e.link !== c.link)) + transferBytes(ciReruns.filter(r => r.head === inv.head))
+    if (total + size > CI_CACHE_MAX) {
       log(`cycle ${cycle}: CI verdict for ${c.name} not cached (${size} bytes; ${total} cached) — judged again next time`)
       continue
     }
@@ -2136,7 +2124,6 @@ const runCycle = async (cycle, entry) => {
 
     // ---- review lane: fix + push without waiting for CI ----
     const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
-    let reviewPushed = false
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
         id: f.commentId, scopeFile: f.file, files: [f.file],
@@ -2159,7 +2146,6 @@ const runCycle = async (cycle, entry) => {
         return { pass: false, cycles: cycle, history, reason: 'push-failed' }
       }
       entry.reviewPush = push
-      reviewPushed = true
       lanes.reviewPushed = true
       // A comment still waiting on a sibling refutation is not answered by a
       // fix note. One note per comment, naming every finding on it, for the
@@ -2190,16 +2176,10 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: CI lane gave no report — re-arming`)
       return null
     }
-    if (reviewPushed) {
+    if (lanes.reviewPushed) {
       // The push restarted CI: this cycle's CI verdict is superseded. Re-arm;
       // next cycle's CI lane collects the fresh run.
       log(`cycle ${cycle}: review-lane push superseded the CI run — re-arming`)
-      return null
-    }
-    // A report on another head says nothing about this one: nothing in it is
-    // fixed, accepted or counted green.
-    if (c.headSha !== expectedHead) {
-      log(`cycle ${cycle}: CI report is for ${c.headSha.slice(0, 7) || 'no head'}, not the head ${expectedHead.slice(0, 7)} — re-arming`)
       return null
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
