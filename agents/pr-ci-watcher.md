@@ -2,7 +2,7 @@
 name: pr-ci-watcher
 description: Judge one PR's failing CI checks from the evidence collect.py gathered, classify each failure (infra flake / real / rig-side / unclassified), re-run infra ones once, report every failure with its first error and files. CI only; never waits on or lists checks, never reads review comments, never edits code, never pushes.
 tools: Bash, Read, Grep, Glob
-model: sonnet
+model: opus
 effort: medium
 ---
 
