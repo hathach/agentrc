@@ -5,9 +5,10 @@
   reply.py --pr N --inspect COMMENT:REPLY [COMMENT:REPLY ...] [--repo OWNER/NAME]
   reply.py --pr N --reuse FILE [--repo OWNER/NAME]
 
-FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>"}, ...]},
+FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>", "resolve": <bool>}, ...]},
 digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
-which the body must match before anything is posted. Each commentId names one
+which the body must match before anything is posted; resolve (default true)
+false leaves a review reply's thread open, for an answer that upholds a point. Each commentId names one
 of three things on the PR: a review comment (an inline thread), an issue comment,
 or a review whose body carries the finding (a bot's summary, or a point GitHub
 would not anchor inline). A review reply is read back and must match the body,
@@ -311,7 +312,7 @@ def handle(poster, item):
             rc['posted'] = True
         rc['replyId'] = reply_id
         rc['verified'], rc['error'] = poster.verify(kind, item['commentId'], reply_id, body)
-        if rc['verified'] and kind == 'review':
+        if rc['verified'] and kind == 'review' and item.get('resolve', True):
             rc['error'] = poster.resolve(item['commentId'])
             rc['resolved'] = rc['error'] is None
     except ApiError as e:
@@ -342,6 +343,8 @@ def check_reply(r):
         raise ValueError(f'bad manifest entry: {r!r}')
     if not isinstance(r.get('digest'), str):
         raise ValueError(f'manifest entry without a digest: {r!r}')
+    if not isinstance(r.get('resolve', True), bool):
+        raise ValueError(f'manifest entry resolve must be true or false: {r!r}')
 
 
 def check_reuse(r):
@@ -395,7 +398,8 @@ def main(argv=None):
         return 0 if all(i['error'] is None for i in inspected) else 1
     receipts = [reuse(poster, item) for item in reuses] if reuses else [handle(poster, item) for item in replies]
     print(json.dumps({'receipts': receipts}))
-    ok = all(r['verified'] is True and (r['kind'] != 'review' or r['resolved']) for r in receipts)
+    kept_open = {item['commentId'] for item in replies or [] if item.get('resolve') is False}
+    ok = all(r['verified'] is True and (r['kind'] != 'review' or r['resolved'] or r['commentId'] in kept_open) for r in receipts)
     return 0 if ok else 1
 
 

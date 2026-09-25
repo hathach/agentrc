@@ -134,3 +134,36 @@ test('verdicts stay attached to their finding when verifiers finish in reverse o
   assert.deepEqual(result.confirmed[0].findings.map(f => f.why), ['first'])
   assert.deepEqual(result.unverified[0].findings.map(f => f.why), ['second'])
 })
+
+test('diff pins every scan and verify unit to base..head of its own dir', async () => {
+  const base = 'a'.repeat(40), head = 'b'.repeat(40)
+  const scans = { 'src/portable/x|correctness': [finding(1, 'introduced')] }
+  const { calls } = await run({ ...ONE, diff: { base, head } }, { scans, verdicts: { introduced: true } })
+  for (const c of calls) {
+    assert.ok(c.prompt.includes(`The checkout is at ${head}. Judge only what \`git diff ${base} ${head} -- src/portable/x\` introduces or breaks`.replace('-- src/portable/x', "-- ':(literal,top)src/portable/x'")), c.prompt)
+  }
+})
+
+test('a diff without two full SHAs is rejected before any agent runs', async () => {
+  for (const diff of [{}, { base: 'a'.repeat(40) }, { base: 'HEAD~1', head: 'b'.repeat(40) }, { base: 'a'.repeat(40), head: 'B'.repeat(40) }, { base: ['a'.repeat(40)], head: 'b'.repeat(40) }, 'main']) {
+    await assert.rejects(run({ ...ONE, diff }), /args\.diff/, JSON.stringify(diff))
+  }
+})
+
+test('a diff dir with spaces or quotes is one shell-quoted pathspec', async () => {
+  const base = 'a'.repeat(40), head = 'b'.repeat(40)
+  const { calls } = await run({ dirs: ["src/it's x"], dimensions: ['correctness'], diff: { base, head } }, { scans: { "src/it's x|correctness": [] } })
+  assert.ok(calls[0].prompt.includes(`-- ':(literal,top)src/it'\\''s x'\``), calls[0].prompt)
+})
+
+test('the root group diffs the whole change, with no pathspec', async () => {
+  const base = 'a'.repeat(40), head = 'b'.repeat(40)
+  const { calls } = await run({ dirs: ['.'], dimensions: ['correctness'], diff: { base, head } }, { scans: { '.|correctness': [] } })
+  assert.ok(calls[0].prompt.includes(`\`git diff ${base} ${head}\` introduces`), calls[0].prompt)
+})
+
+test('a dir that looks like pathspec magic stays a literal path', async () => {
+  const base = 'a'.repeat(40), head = 'b'.repeat(40)
+  const { calls } = await run({ dirs: [':(exclude)src'], dimensions: ['correctness'], diff: { base, head } }, { scans: { ':(exclude)src|correctness': [] } })
+  assert.ok(calls[0].prompt.includes("-- ':(literal,top):(exclude)src'`"), calls[0].prompt)
+})

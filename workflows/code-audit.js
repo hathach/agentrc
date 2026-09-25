@@ -8,8 +8,11 @@ export const meta = {
   ],
 }
 
-// args: { dirs: string[], dimensions: string[] }, both nonempty; no defaults,
-// since `dimensions: []` would review nothing and look like a clean pass.
+// args: { dirs: string[], dimensions: string[], diff?: { base, head } }, dirs and
+// dimensions nonempty; no defaults, since `dimensions: []` would review nothing
+// and look like a clean pass. `diff` (two full SHAs, the checkout at head) narrows
+// every unit to what base..head introduces or breaks, as a PR review needs; the
+// caller checks that the checkout is clean and at head before launching.
 const list = (v, name) => {
   if (!Array.isArray(v) || v.length === 0 || !v.every(s => typeof s === 'string' && s.trim())) {
     throw new Error(`args.${name} must be a nonempty array of nonblank strings; args is { dirs: string[], dimensions: string[] }`)
@@ -19,6 +22,18 @@ const list = (v, name) => {
 if (!args || typeof args !== 'object') throw new Error('args must be { dirs: string[], dimensions: string[] }')
 const dirs = list(args.dirs, 'dirs')
 const dims = list(args.dimensions, 'dimensions')
+const SHA = /^[0-9a-f]{40}$/
+const isSha = v => typeof v === 'string' && SHA.test(v)
+if (args.diff != null && !(isSha(args.diff.base) && isSha(args.diff.head))) {
+  throw new Error('args.diff must be { base, head }, two full 40-hex SHAs')
+}
+// Pinned SHAs, not HEAD: a checkout that moves under the run must not change what was reviewed.
+const shellQuote = s => `'${s.replace(/'/g, `'\\''`)}'`
+// A literal "." pathspec matches nothing, so the root group takes the whole diff.
+const pathspec = dir => dir === '.' ? '' : ` -- ${shellQuote(`:(literal,top)${dir}`)}`
+const scopeOf = dir => args.diff
+  ? ` The checkout is at ${args.diff.head}. Judge only what \`git diff ${args.diff.base} ${args.diff.head}${pathspec(dir)}\` introduces or breaks, reading the surrounding code for context.`
+  : ''
 
 const FINDINGS = {
   type: 'object', additionalProperties: false,
@@ -51,7 +66,7 @@ const results = await pipeline(
   pairs,
 
   p => agent(
-    `Review ${p.dir} for exactly one dimension: ${p.dim}. Read the sources yourself. Coverage-first: report everything, a verifier filters.`,
+    `Review ${p.dir} for exactly one dimension: ${p.dim}. Read the sources yourself.${scopeOf(p.dir)} Report each \`file\` relative to the repository root. Coverage-first: report everything, a verifier filters.`,
     { label: `scan:${p.id}`, phase: 'Scan', agentType: 'code-verifier', schema: FINDINGS },
   ),
 
@@ -61,7 +76,7 @@ const results = await pipeline(
     return parallel(scan.findings.map((f, k) => () =>
       agent(
         `Adversarially verify ONE review finding about ${p.dir}.\nDimension: ${p.dim}\nFinding: ${JSON.stringify(f)}\n` +
-        'Read the cited code and enough surrounding context to judge. Try to REFUTE it; real=true only if it survives your best attempt.',
+        `Read the cited code and enough surrounding context to judge.${scopeOf(p.dir)} Try to REFUTE it; real=true only if it survives your best attempt.`,
         { label: `verify:${p.id}:${k}`, phase: 'Verify', agentType: 'finding-verifier', schema: VERDICT },
       ).then(v => v && { ...f, verdict: v })
     )).then(vs => {
