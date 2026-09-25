@@ -88,7 +88,7 @@ const adoptionState = ({
 })
 const adoptionArgs = (state, over = {}) => ({
   reviewers: state.config.reviewers, autoRun: state.config.autoRun,
-  maxCycles: state.config.maxCycles, ciWait: state.config.ciWait,
+  maxCycles: state.maxCycles, ciWait: state.config.ciWait,
   protected: state.config.protected, generated: state.config.generated, build: state.config.build,
   yieldAfterCycle: true, state, adoptHead: ADOPT, ...over,
 })
@@ -953,6 +953,17 @@ test('a resumed launch may change the build, keeping the debt and the budget', a
   assert.ok(logs.some(l => l === 'build changed since the last launch: "make a" → "make b"'))
   assert.equal(result.state.cyclesUsed, 2)
   assert.ok(result.state.debt.find(([id]) => id === 1))
+})
+
+test('a resumed launch may raise the cycle ceiling, keeping the cycles used', async () => {
+  const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' }
+  const first = await run({ args: { maxCycles: 1, yieldAfterCycle: true }, reviews, dropDoneIds: () => true })
+  const spent = await run({ args: { maxCycles: undefined, yieldAfterCycle: true, state: first.result.state }, reviews, dropDoneIds: () => true })
+  assert.equal(spent.result.reason, 'budget-exhausted', 'an omitted ceiling is the state\'s, not the default')
+  const { result, logs } = await run({ args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state }, reviews, dropDoneIds: () => true })
+  assert.ok(logs.includes('cycle ceiling changed since the last launch: 1 → 3, 1 used'))
+  assert.equal(result.state.cyclesUsed, 2)
+  assert.equal(result.state.maxCycles, 3)
 })
 
 test('a dead code-writer withholds the fix', async () => {
@@ -3963,6 +3974,15 @@ test('a chain the audit script cannot read back is refused with its error', asyn
   assert.equal(result.reason, 'adopt-audit-failed')
   assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
   assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+})
+
+test('a state whose config still carries maxCycles may raise it', async () => {
+  const { result, logs } = await run({
+    args: adoptionArgs(adoptionState({ maxCycles: 2, cyclesUsed: 2 }), { maxCycles: 3 }), preflight: { head: ADOPT, prHead: HEAD },
+    adoptAudit: { error: 'git rev-list: fatal: bad revision', commits: [] },
+  })
+  assert.ok(logs.includes('cycle ceiling changed since the last launch: 2 → 3, 2 used'))
+  assert.equal(result.reason, 'adopt-audit-failed', 'past the argument check and the budget')
 })
 
 test('adoptHead argument errors throw before any agent runs', async () => {

@@ -9,7 +9,8 @@ export const meta = {
 //            ['copilot', 'coderabbit', 'greptile', 'code-scanning']; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default:
 //            reviewers but code-scanning, which is harvested only and never named here),
-//          maxCycles?: number (ceiling on review/fix/CI cycles, default 5), autoPush?: boolean (default false = dry run),
+//          maxCycles?: number (ceiling on review/fix/CI cycles, default 5; a resumed launch
+//            defaults to its state's), autoPush?: boolean (default false = dry run),
 //          checkoutDir?: string (PR branch checkout; default: the session working dir),
 //          protected?: string (regex over canonical repo-relative paths; matches are
 //            dropped from a fix scope and never committed),
@@ -56,8 +57,7 @@ if (typeof checkoutDir !== 'string') {
 }
 const IN_CHECKOUT = checkoutDir === '.' ? 'The working tree IS the PR checkout. '
   : `The PR branch checkout is at ${checkoutDir} - run every git/build/file command there, not in the session directory. `
-const maxCycles = args.maxCycles ?? 5
-if (!Number.isInteger(maxCycles) || maxCycles < 1) {
+if (args.maxCycles != null && (!Number.isInteger(args.maxCycles) || args.maxCycles < 1)) {
   throw new Error('maxCycles must be an integer >= 1')
 }
 // The validator knows these bots and nothing else, so an unknown name would
@@ -217,11 +217,12 @@ const ciCacheShaped = (c) => c && typeof c === 'object' && typeof c.notesDigest 
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket'].every(k => typeof e[k] === 'string') &&
     (e.digest === undefined || typeof e.digest === 'string'))
-const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
+const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
   const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
   const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
+    Number.isInteger(st.maxCycles) && st.maxCycles >= 1 &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
     typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
     (st.deferrals === undefined || Array.isArray(st.deferrals)) &&
@@ -234,15 +235,17 @@ if (args.state !== undefined && args.state !== null) {
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
-  // build left config after the seal was checked: a state from before carries
-  // it there, and a changed build is logged rather than refused.
-  const { build: priorBuild = st.build, ...priorConfig } = st.config
+  // build and maxCycles are per launch: a state from before carries them in
+  // config, so they are dropped before comparing, and a change is logged.
+  const { build: priorBuild = st.build, maxCycles: _, ...priorConfig } = st.config
   if (JSON.stringify(priorConfig) !== JSON.stringify(config)) {
     throw new Error(`state was made by a run with different arguments: ${JSON.stringify(priorConfig)} vs ${JSON.stringify(config)}`)
   }
   if (priorBuild !== undefined && priorBuild !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(priorBuild)} → ${JSON.stringify(buildCmd)}`)
   restored = st
 }
+const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 5)
+if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
 let cyclesUsed = restored ? restored.cyclesUsed : 0
 // Adoption continues a state from commits its caller made, so it needs the
 // state and the published head that state pinned; the caller's audit is the
