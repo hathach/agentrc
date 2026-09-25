@@ -163,6 +163,7 @@ if (args.stateRef != null) {
   const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
   const SIZE = 512
   const PER_CALL = 4 // a live sonnet copy of 9 chunks truncated and spliced them
+  // sonnet, not haiku: on five real 4-6 KB states haiku never loaded three, mis-copying the same chunks on every retry (2026-09-25)
   const MAX = 64 * 1024
   const ENVELOPE = {
     type: 'object', additionalProperties: false,
