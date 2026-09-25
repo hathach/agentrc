@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Link parts of this checkout into ~/.claude and ~/.codex, by explicit choice.
 
-    install.py install --skill --agent --workflow --claude-md
+    install.py install --skill --agent --workflow --claude-md --statusline
     install.py remove --skill
 
 Skills link into ~/.claude/skills and ~/.codex/skills; agents into
@@ -9,15 +9,18 @@ Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 a skill's hooks of the same name into ~/.claude/hooks, with their hooks.json
 merged into ~/.claude/settings.json; workflows into ~/.claude/workflows
 (Claude only);
---claude-md links ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md. Each flag
-takes every entry of its kind; nothing is selected by default. Everything is
-a symlink, so edits are live and a rerun after a change is a no-op.
+--claude-md links ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; --statusline
+links the statusline/ files into ~/.claude and sets statusLine in its
+settings.json. Each flag takes every entry of its kind; nothing is selected
+by default. Everything is a symlink, so edits are live and a rerun after a
+change is a no-op.
 
 Refuses before touching anything when a destination holds something that is
 not a link, or a directory to link into is a file or a dangling link. `remove`
 unlinks the named entries whatever they point to but never deletes a real
-file or directory; --claude-md is removed only when it links into this
-checkout.
+file or directory; --claude-md and --statusline links are removed only when
+they link into this checkout, and statusLine only when it is the one install
+writes.
 """
 import argparse
 import json
@@ -30,6 +33,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 KINDS = ('skill', 'agent', 'hook', 'workflow')
 FLAGS = ('skill', 'agent', 'workflow')  # hooks come with the skill of the same name
+STATUSLINE = {'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'}
 
 
 def available(kind):
@@ -62,6 +66,8 @@ def links(kind, name):
         return [(REPO / 'hooks' / name, dirs(kind)[0] / name)]
     if kind == 'workflow':
         return [(REPO / 'workflows' / f'{name}.js', dirs(kind)[0] / f'{name}.js')]
+    if kind == 'statusline':  # statusline.sh runs its Codex fetcher from $HOME/.claude
+        return [(REPO / 'statusline' / f, Path.home() / '.claude' / f) for f in ('statusline.sh', 'statusline-codex-usage.py')]
     return [(REPO / 'CLAUDE.md', Path.home() / '.claude' / 'CLAUDE.md'),
             (Path('../.claude/CLAUDE.md'), Path.home() / '.codex' / 'AGENTS.md')]
 
@@ -164,24 +170,32 @@ def settings():
     return Path.home() / '.claude' / 'settings.json'
 
 
-def plan_settings(names, install):
-    """(before, after) texts for registering or unregistering these hooks, or
-    None when nothing would change. Computed before any link moves, so a
-    settings file of the wrong shape refuses instead of leaving a half job."""
+def plan_settings(names, install, statusline):
+    """(before, after) texts for registering or unregistering these hooks and
+    the status line, or None when nothing would change. Computed before any
+    link moves, so a settings file of the wrong shape refuses instead of
+    leaving a half job."""
     path = settings()
     before = path.read_text() if path.exists() else ''
     data = json.loads(before) if before else {}
-    hooks = data.setdefault('hooks', {})
-    for name in names:
-        strip(hooks, name)
-        if install:
-            linked = Path.home() / '.claude' / 'hooks' / name
-            for event, groups in json.loads((REPO / 'hooks' / name / 'hooks.json').read_text()).items():
-                for group in groups:
-                    entries = [{**h, 'command': shlex.quote(str(linked / h['command']))} for h in group['hooks']]
-                    hooks.setdefault(event, []).append({**group, 'hooks': entries})
-    if not hooks:
-        del data['hooks']
+    if names:
+        hooks = data.setdefault('hooks', {})
+        for name in names:
+            strip(hooks, name)
+            if install:
+                linked = Path.home() / '.claude' / 'hooks' / name
+                for event, groups in json.loads((REPO / 'hooks' / name / 'hooks.json').read_text()).items():
+                    for group in groups:
+                        entries = [{**h, 'command': shlex.quote(str(linked / h['command']))} for h in group['hooks']]
+                        hooks.setdefault(event, []).append({**group, 'hooks': entries})
+        if not hooks:
+            del data['hooks']
+    if statusline and install:
+        if data.get('statusLine', STATUSLINE) != STATUSLINE:
+            refuse(f'{path} has another statusLine; remove it first')
+        data['statusLine'] = STATUSLINE
+    elif statusline and data.get('statusLine') == STATUSLINE:
+        del data['statusLine']
     if data == (json.loads(before) if before else {}):
         return None
     return before, json.dumps(data, indent=2) + '\n'
@@ -204,6 +218,8 @@ def selection(parser, args):
     chosen += [('hook', name) for kind, name in chosen if kind == 'skill' and name in available('hook')]
     if args.claude_md:
         chosen.append(('claude-md', None))
+    if args.statusline:
+        chosen.append(('statusline', None))
     if not chosen:
         parser.error('nothing selected')
     return chosen
@@ -215,19 +231,20 @@ def main(argv=None):
     for kind in FLAGS:
         parser.add_argument(f'--{kind}', action='store_true', help=f'every {kind}')
     parser.add_argument('--claude-md', action='store_true', help='CLAUDE.md, also as ~/.codex/AGENTS.md')
+    parser.add_argument('--statusline', action='store_true', help='the Claude Code status line')
     args = parser.parse_args(argv)
     chosen = selection(parser, args)
     pairs = [(kind, pair) for kind, name in chosen for pair in links(kind, name)]
     hooks = [name for kind, name in chosen if kind == 'hook']
     planned = None
-    if hooks:
+    if hooks or args.statusline:
         try:
-            planned = plan_settings(hooks, args.action == 'install')
+            planned = plan_settings(hooks, args.action == 'install', args.statusline)
         except (ValueError, TypeError, AttributeError, KeyError) as err:
             refuse(f'{settings()} cannot be edited ({err!r}); fix it first')
 
     if args.action == 'remove':
-        foreign = [dst for kind, (_, dst) in pairs if kind == 'claude-md' and not ours(dst)]
+        foreign = [dst for kind, (_, dst) in pairs if kind in ('claude-md', 'statusline') and not ours(dst)]
         for kind, (_, dst) in pairs:  # ownership settled before any unlink: the Codex link is relative
             if dst in foreign:
                 print(f'{dst} does not link into this checkout, left alone')

@@ -155,6 +155,32 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((self.claude / 'settings.json').read_text(), '{"model": "x"}', 'a no-op keeps the file byte for byte')
         self.assertFalse((self.claude / 'settings.json.before-agentrc').exists())
 
+    def test_statusline_links_both_files_and_sets_the_setting_once(self):
+        self.claude.mkdir()
+        (self.claude / 'settings.json').write_text(json.dumps({'model': 'x', 'hooks': {}}))
+        self.ok('install', '--statusline')
+        for name in ('statusline.sh', 'statusline-codex-usage.py'):
+            self.assertEqual(os.readlink(self.claude / name), str(ROOT / 'statusline' / name))
+        self.assertEqual(self.settings(), {'model': 'x', 'hooks': {}, 'statusLine': {
+            'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'}}, 'hooks untouched')
+        self.assertEqual(self.ok('install', '--statusline'), '', 'a rerun is silent')
+        self.ok('remove', '--statusline')
+        self.assertFalse((self.claude / 'statusline.sh').is_symlink())
+        self.assertEqual(self.settings(), {'model': 'x', 'hooks': {}})
+
+    def test_another_statusline_refuses_install_and_survives_remove(self):
+        self.claude.mkdir()
+        mine = {'statusLine': {'type': 'command', 'command': 'bash ~/.claude/statusline.sh'}}
+        (self.claude / 'settings.json').write_text(json.dumps(mine))
+        done = self.run_cli('install', '--statusline')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('another statusLine', done.stderr)
+        self.assertFalse((self.claude / 'statusline.sh').is_symlink(), 'refused before linking')
+        os.symlink('/dotfiles/statusline.sh', self.claude / 'statusline.sh')
+        self.assertIn('left alone', self.ok('remove', '--statusline'))
+        self.assertEqual(self.settings(), mine)
+        self.assertEqual(os.readlink(self.claude / 'statusline.sh'), '/dotfiles/statusline.sh', 'the link it runs stays')
+
     # --- refusals ---------------------------------------------------------------
 
     def test_refuses_before_touching_anything(self):
@@ -164,6 +190,7 @@ class InstallTest(unittest.TestCase):
             'a file where a link dir goes': lambda: (self.claude.mkdir(), (self.claude / 'agents').write_text('x')),
             'a dangling link dir': lambda: (self.claude.mkdir(), os.symlink('/nonexistent', self.claude / 'hooks')),
             'a real CLAUDE.md': lambda: (self.claude.mkdir(), (self.claude / 'CLAUDE.md').write_text('mine')),
+            'a real status line script': lambda: (self.claude.mkdir(), (self.claude / 'statusline.sh').write_text('mine')),
         }
         for case, arrange in cases.items():
             with self.subTest(case):
@@ -171,7 +198,7 @@ class InstallTest(unittest.TestCase):
                 self.setUp()
                 arrange()
                 before = sorted(str(p) for p in self.home.rglob('*'))
-                done = self.run_cli('install', '--skill', '--agent', '--workflow', '--claude-md')
+                done = self.run_cli('install', '--skill', '--agent', '--workflow', '--claude-md', '--statusline')
                 self.assertEqual(done.returncode, 1, case)
                 self.assertIn('move it aside first', done.stderr)
                 self.assertEqual(sorted(str(p) for p in self.home.rglob('*')), before, 'nothing changed')

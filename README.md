@@ -9,6 +9,7 @@ skills/      skills for both agents
 agents/      <name>.md for both agents, plus <name>.toml for Codex
 hooks/       Claude Code hooks, one folder each with a hooks.json
 workflows/   saved workflows (Claude only)
+statusline/  the Claude Code status line and its Codex usage fetcher
 tests/       unit tests for skill scripts, hooks and the installer
 ```
 
@@ -19,7 +20,7 @@ its kind; nothing is installed by default.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
-~/code/agentrc/install.py install --skill --agent --workflow --claude-md
+~/code/agentrc/install.py install --skill --agent --workflow --claude-md --statusline
 ~/code/agentrc/install.py remove --skill
 ```
 
@@ -30,6 +31,9 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
   `.toml`, if any, into `~/.codex/agents`.
 - `--workflow`: into `~/.claude/workflows`.
 - `--claude-md`: `~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` to it.
+- `--statusline`: both `statusline/` files into `~/.claude`, and `statusLine`
+  in `~/.claude/settings.json`; `install` refuses if another one is set. The
+  command names `$HOME/.claude`, so another `CLAUDE_CONFIG_DIR` can reuse it.
 
 The target directories stay real, so local entries sit beside the links.
 `install` refuses before touching anything if a target is a file or a
