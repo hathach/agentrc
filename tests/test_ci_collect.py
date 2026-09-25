@@ -158,7 +158,7 @@ class FailuresTest(unittest.TestCase):
         self.checks = [{'name': 'hil (x.json)', 'workflow': 'Build', 'bucket': 'fail', 'link': JOB.format(3)},
                        {'name': 'docs', 'workflow': '', 'bucket': 'fail', 'link': RTD.format(9)},
                        {'name': 'bot', 'workflow': '', 'bucket': 'fail', 'link': 'https://greptile.com/'}]
-        self.jobs = {'3': {'name': 'hil (x.json)', 'workflow_name': 'Build', 'run_id': 7, 'head_sha': HEAD},
+        self.jobs = {'3': {'name': 'hil (x.json)', 'workflow_name': 'Build', 'run_id': 7, 'run_attempt': 2, 'head_sha': HEAD},
                      '40': {'name': 'hil (x.json)', 'workflow_name': 'Build', 'run_id': 70, 'head_sha': BASE}}
         self.logs = {'3': log(*STEP), '40': log(*STEP[:9], 'Total failed: 1', *STEP[11:])}
         self.base_runs = [{'databaseId': 71, 'headSha': 'd' * 40, 'status': 'in_progress'},
@@ -204,6 +204,7 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         c = r['checks'][0]
         self.assertEqual((c['provider'], c['name'], c['complete'], c['error']), ('actions', 'hil (x.json)', False, None))
+        self.assertEqual((c['runId'], c['runAttempt']), (7, 2), 'a re-run shows in its attempt, so the judge re-runs once')
         self.assertEqual(c['firstError'], 'pico  host/msc  ...  Failed: /home/runner/work/r/r/src/host/msc.c timeout in 9.4s')
         self.assertEqual(c['files'], ['src/host/msc.c'])
         self.assertEqual(c['base'], {'sha': BASE, 'runId': 70, 'jobId': 40, 'conclusion': 'failure', 'shared': 1})

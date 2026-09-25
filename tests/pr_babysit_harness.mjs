@@ -161,7 +161,7 @@ async function run(opts = {}) {
     const label = options.label
     calls.push({
       label, prompt: String(prompt), agentType: options.agentType,
-      phase: options.phase, schema: options.schema,
+      phase: options.phase, schema: options.schema, model: options.model,
     })
     if (opts.throwOn && label.startsWith(opts.throwOn)) throw new Error(`${label} exploded`)
     if (label.startsWith('state:load#')) {
@@ -195,15 +195,27 @@ async function run(opts = {}) {
       const over = typeof opts.recheck === 'function' ? opts.recheck(label) : opts.recheck
       return patch({ ...RECHECK, head }, over)
     }
-    if (label.startsWith('ci#')) {
-      // A fixture names what its case is about; the rest of the watcher's report
-      // is the plain case: this run's head, one run, every failure of a job listed.
-      const c = structuredClone(ci)
-      if (c && Array.isArray(c.realFailures)) {
-        c.headSha ??= head
-        c.realFailures = c.realFailures.map(rf => ({ workflow: 'ci', job: rf.check, cell: null, signature: rf.firstError, runId: 1, complete: true, ...rf }))
-      }
-      return conforms(options.schema, c, 'ci')
+    if (label.startsWith('ci:collect#')) {
+      // A fixture names the report the CI lane should compose; collect.py's
+      // answers follow from it: each listed failure is one failing Actions job
+      // whose link names its run; a running fixture also has a check still pending.
+      const failed = (ci.realFailures || []).map((rf, i) => ({
+        name: rf.check, workflow: 'ci', bucket: 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}`,
+      }))
+      const pending = ci.status === 'running' ? [{ name: 'slow', workflow: 'ci', bucket: 'pending', link: 'https://github.com/o/r/actions/runs/1/job/99', attempt: 'actions:99' }] : []
+      if (!/ inventory /.test(String(prompt)) && opts.evidence) await opts.evidence(calls)
+      const answer = / inventory /.test(String(prompt))
+        ? { head: ci.headSha ?? head, baseRef: 'master', baseSha: 'b'.repeat(40), waited: 0, checks: [...failed, ...pending], error: null, status: ci.status }
+        : { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', checks: failed.map(f => ({ link: f.link, error: null })), error: null }
+      return conforms(options.schema, answer, label)
+    }
+    if (label.startsWith('ci:judge#')) {
+      // The rest of each failure is the plain case: one run, every failure of a job listed.
+      const links = JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1]).map(x => x.link)
+      const failures = structuredClone(ci.realFailures)
+        .map(rf => ({ workflow: 'ci', job: rf.check, cell: null, signature: rf.firstError, runId: 1, complete: true, ...rf }))
+      const judged = { checks: links.map((link, i) => ({ link, failures: [failures[i]] })), infraRerun: ci.infraRerun }
+      return conforms(options.schema, opts.judge ? opts.judge(judged) : judged, label)
     }
     if (label.startsWith('reviews#')) {
       if (reviews instanceof Error) throw reviews
@@ -1105,11 +1117,20 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
   assert.doesNotMatch(fix2.prompt, /build contract/)
 })
 
-test('the CI watcher is given a wait budget, 30 minutes by default', async () => {
-  const { calls } = await run()
-  assert.match(calls.find(c => c.label === 'ci#1').prompt, /wait budget for pending checks: 30 minutes\./)
-  const long = await run({ args: { ciWait: 90 } })
-  assert.match(long.calls.find(c => c.label === 'ci#1').prompt, /wait budget for pending checks: 90 minutes\./)
+test('the CI lane waits out its budget in slices, 30 minutes by default', async () => {
+  const running = { status: 'running', infraRerun: [], realFailures: [] }
+  const slices = (calls) => calls.filter(c => c.label.startsWith('ci:collect#1.'))
+    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+) --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
+  const { calls } = await run({ ci: running, args: { maxCycles: 1 } })
+  assert.equal(slices(calls).reduce((a, b) => a + b), 30 * 60)
+  assert.equal(slices(calls)[0], 180, 'short while the review lane may still push')
+  assert.equal(calls.find(c => c.label === 'ci:collect#1.1').model, 'haiku')
+  const long = await run({ ci: running, args: { ciWait: 90, maxCycles: 1 } })
+  assert.equal(slices(long.calls).reduce((a, b) => a + b), 90 * 60)
+  const ciOnly = await run({ ci: running, args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 1 } })
+  assert.equal(slices(ciOnly.calls)[0], 540, 'no review lane to wait for')
+  const green = await run()
+  assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge')
 })
 
 test('a path whose name has a leading or trailing space is rejected, not trimmed', async () => {
@@ -1209,22 +1230,20 @@ test('beside a real CI failure only the real one is fixed; the unclassified row 
   assert.notEqual(result.pass, true)
 })
 
-test('a green status with a failure listed is read as red, in the observation too', async () => {
-  const { result, logs } = await run({
-    reviews: { findings: [], replies: [], bots: 'reviewed' },
-    ci: { status: 'green', infraRerun: [], realFailures: [UNPLACED] },
-  })
-  assert.notEqual(result.pass, true)
-  assert.equal(result.reason, 'ci-red-unclassified')
-  assert.ok(logs.some(l => /reported green with 1 failure\(s\) listed/.test(l)))
-  // a dry run with a valid finding returns before the CI lane reads the result:
-  // the observation it hands back must already say red
-  const early = await run({
-    args: { autoPush: false }, reviews: oneValid,
-    ci: { status: 'green', infraRerun: [], realFailures: [UNPLACED] },
-  })
-  assert.equal(early.result.dryRun, true)
-  assert.equal(early.result.observation.ci.status, 'red')
+test('the judge places every failing check once, or the lane re-arms', async () => {
+  const two = { status: 'red', infraRerun: [], realFailures: [UNPLACED, { ...UNPLACED, check: 'build / b' }] }
+  const judge = await run({ ci: two, args: { maxCycles: 1 } })
+  assert.match(judge.calls.find(c => c.label === 'ci:collect#1.f').prompt,
+    / failures --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/1' --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/2' --repo /)
+  assert.match(judge.calls.find(c => c.label === 'ci:judge#1').prompt, /evidence for them is in \/tmp\/ci-collect\/failures-1\.json\./)
+  assert.doesNotMatch(judge.calls.find(c => c.label === 'ci:judge#1').prompt, /Already re-run/)
+  for (const reshape of [j => ({ ...j, checks: j.checks.slice(1) }), j => ({ ...j, checks: [j.checks[0], j.checks[0]] })]) {
+    const { result, logs, labels } = await run({ ci: two, judge: reshape, args: { maxCycles: 1 } })
+    assert.ok(logs.some(l => /CI judge answered .* — re-arming/.test(l)), logs.join('\n'))
+    assert.ok(logs.some(l => /CI lane gave no report — re-arming/.test(l)))
+    assert.equal(labels.some(l => l.startsWith('fix:')), false)
+    assert.notEqual(result.pass, true)
+  }
 })
 
 test('an unclassified failure stops at once, reviews settled or not, and the debt survives a resumed launch', async () => {
@@ -1264,24 +1283,73 @@ test('a CI reply in the old rigSide shape is a dead watcher, never a fix', async
     [{ check: 'x', firstError: 'y', files: ['src/a.c'] }, /missing verdict/],
   ]) {
     const { result, logs, labels } = await run({ ci: { status: 'red', infraRerun: [], realFailures: [failure] } })
-    assert.ok(logs.some(l => /pr-ci-watcher errored/.test(l) && why.test(l)), `${JSON.stringify(failure)} refused`)
+    assert.ok(logs.some(l => /CI judge errored/.test(l) && why.test(l)), `${JSON.stringify(failure)} refused`)
     assert.equal(labels.some(l => l.startsWith('fix:')), false)
     assert.notEqual(result.pass, true)
   }
 })
 
-test('ciNotes reach the watcher prompt verbatim, and only when given', async () => {
-  const noted = await run({ args: { ciNotes: 'PVS-Studio exit 2 is the license expiry warning: rig-side, see run 35171132943' } })
-  assert.match(noted.calls.find(c => c.label === 'ci#1').prompt, /caller established[\s\S]*license expiry warning: rig-side, see run 35171132943/)
-  const bare = await run({})
-  assert.doesNotMatch(bare.calls.find(c => c.label === 'ci#1').prompt, /caller established/)
+test('a check the judge re-ran is settling until its re-run registers, and never re-run twice', async () => {
+  const two = { status: 'red', infraRerun: ['35171132943'], realFailures: [UNPLACED, { ...UNPLACED, check: 'build / b' }] }
+  const rerunFirst = j => ({ ...j, checks: [{ ...j.checks[0], failures: [] }, ...j.checks.slice(1)] })
+  const { calls, logs } = await run({ ci: two, judge: rerunFirst, args: { maxCycles: 2 } })
+  assert.doesNotMatch(calls.find(c => c.label === 'ci:judge#1').prompt, /Already re-run/)
+  const second = calls.find(c => c.label === 'ci:judge#2').prompt
+  assert.match(second, /\nAlready re-run on this head: \["ci \/ PVS-Studio \(raspberry_pi_pico\)"\]\./)
+  assert.doesNotMatch(second, /job\/1"/, 'the old run of the re-run check is not judged again')
+  assert.match(calls.find(c => c.label === 'ci:collect#2.f').prompt, / failures --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/2' --repo /)
+  assert.ok(logs.some(l => /CI still settling/.test(l)))
+  const alone = await run({ ci: { ...two, realFailures: [UNPLACED] }, judge: j => ({ ...j, checks: [{ ...j.checks[0], failures: [] }] }), args: { maxCycles: 2 } })
+  assert.equal(alone.labels.includes('ci:judge#2'), false, 'nothing left to judge while the re-run registers')
+  const bare = await run({ ci: { ...two, infraRerun: [], realFailures: [UNPLACED] }, judge: j => ({ ...j, checks: [{ ...j.checks[0], failures: [] }] }), args: { maxCycles: 1 } })
+  assert.ok(bare.logs.some(l => /re-ran 1 check\(s\) without a receipt/.test(l)))
+  assert.equal(bare.result.history[0].ci.status, 'running', 'still settling, never an unactionable red')
+  assert.notEqual(bare.result.reason, 'unactionable')
+  // a push moves the head: the same check fails there for the first time
+  const pushed = await run({ ci: two, judge: rerunFirst, reviews: oneValid, args: { autoPush: true, maxCycles: 2 } })
+  const onNew = pushed.calls.filter(c => c.label.startsWith('ci:judge#')).at(-1)
+  assert.doesNotMatch(onNew.prompt, /Already re-run/, onNew.label)
+  assert.match(onNew.prompt, /job\/1"/, 'and it is judged, not settling')
+})
+
+test('an inventory whose status or head contradicts its checks is never read as green', async () => {
+  for (const ci of [{ status: 'green', infraRerun: [], realFailures: [UNPLACED] }, { ...GREEN, headSha: 'f'.repeat(40) }]) {
+    const { result, labels, logs } = await run({ ci, args: { maxCycles: 1 } })
+    assert.ok(logs.some(l => /CI inventory is inconsistent/.test(l)), logs.join('\n'))
+    assert.equal(labels.some(l => l.startsWith('ci:judge#')), false)
+    assert.notEqual(result.pass, true)
+  }
+})
+
+test('a review push that lands while the evidence is read supersedes the judge', async () => {
+  const { labels, logs } = await run({
+    reviews: oneValid, args: { autoPush: true, maxCycles: 1 },
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] },
+    evidence: async (calls) => {
+      for (let i = 0; i < 1000 && !calls.some(c => c.label.startsWith('push#')); i++) await new Promise(r => setTimeout(r, 0))
+      for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0))
+    },
+  })
+  assert.ok(labels.includes('ci:collect#1.f'))
+  assert.equal(labels.includes('ci:judge#1'), false)
+  assert.ok(logs.some(l => /review-lane push superseded the CI run/.test(l)), logs.join('\n'))
+})
+
+test('ciNotes reach the judge prompt verbatim, and only when given', async () => {
+  const red = { status: 'red', infraRerun: [], realFailures: [UNPLACED] }
+  const noted = await run({ ci: red, args: { maxCycles: 1, ciNotes: 'PVS-Studio exit 2 is the license expiry warning: rig-side, see run 35171132943' } })
+  assert.match(noted.calls.find(c => c.label === 'ci:judge#1').prompt, /caller established[\s\S]*license expiry warning: rig-side, see run 35171132943/)
+  const bare = await run({ ci: red, args: { maxCycles: 1 } })
+  assert.doesNotMatch(bare.calls.find(c => c.label === 'ci:judge#1').prompt, /caller established/)
 })
 
 test('the CI contract names the three verdicts and nothing else', async () => {
-  const { calls } = await run({})
-  const item = calls.find(c => c.label === 'ci#1').schema.properties.realFailures.items
+  const { calls } = await run({ ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, args: { maxCycles: 1 } })
+  const judge = calls.find(c => c.label === 'ci:judge#1')
+  assert.equal(judge.agentType, 'pr-ci-watcher')
+  const item = judge.schema.properties.checks.items.properties.failures.items
   assert.deepEqual(item.required, ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'])
-  assert.deepEqual(calls.find(c => c.label === 'ci#1').schema.required, ['headSha', 'status', 'infraRerun', 'realFailures'])
+  assert.deepEqual(judge.schema.required, ['checks', 'infraRerun'])
   assert.deepEqual(item.properties.verdict.enum, ['real', 'rig-side', 'unclassified'])
   assert.equal(item.additionalProperties, false)
 })
@@ -1364,7 +1432,7 @@ test('a CI report for another head is not fixed, accepted or counted green', asy
     const { result, labels, logs } = await run({ ci: { ...ci, headSha: 'f'.repeat(40) }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
     assert.notEqual(result.pass, true)
     assert.equal(labels.some(l => /^(fix:|commit#|push#)/.test(l)), false)
-    assert.ok(logs.some(l => /CI report is for fffffff, not the head .* re-arming/.test(l)), logs.join('\n'))
+    assert.ok(logs.some(l => /CI inventory is inconsistent — head fffffff for /.test(l)), logs.join('\n'))
   }
 })
 
@@ -1400,7 +1468,7 @@ test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')
   assert.equal(result.history[0].error, 'pr-review-validator died')
-  assert.deepEqual(labels.slice(0, 2), ['preflight', 'ci#1'], 'the CI lane was launched')
+  assert.deepEqual(labels.slice(0, 2), ['preflight', 'ci:collect#1.1'], 'the CI lane was launched')
   assert.equal(result.history[0].ci.status, 'green', 'and awaited, so no agent outlives the workflow')
   assert.equal(summaries(logs).length, 1)
 })
@@ -1645,7 +1713,7 @@ test('reviews go to the validator role directly, and no lane leaves the roles', 
   })
   const calls = [...wide.calls, ...scoped.calls]
   assert.equal(calls.find(c => c.label.startsWith('reviews#')).agentType, 'pr-review-validator')
-  assert.equal(calls.find(c => c.label.startsWith('ci#')).agentType, 'pr-ci-watcher')
+  assert.equal(calls.find(c => c.label.startsWith('ci:judge#')).agentType, 'pr-ci-watcher')
   for (const c of calls) {
     if (c.agentType !== undefined) assert.ok(ROLES.includes(c.agentType), `${c.label} dispatched to ${c.agentType}`)
   }
@@ -3189,7 +3257,7 @@ test('a ci launch watches CI and never runs the validator', async () => {
     ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
   })
   assert.equal(labels.some(l => l.startsWith('reviews#') || l.startsWith('challenge#') || l.startsWith('replies#')), false)
-  assert.ok(labels.some(l => l === 'ci#1'))
+  assert.ok(labels.includes('ci:collect#1.1') && labels.includes('ci:judge#1'))
   assert.ok(labels.some(l => l.startsWith('fix:')), 'the CI fix still runs')
   assert.equal(result.status, 'paused')
   assert.equal(result.observation.lane, 'ci')
@@ -3424,7 +3492,7 @@ test('every agent that acts on GitHub is told which checkout the PR lives in', a
     },
     args: { checkoutDir: '/srv/other/repo' },
   })
-  for (const label of ['ci#1', 'reviews#1', 'replies#1', 'resolve#1']) {
+  for (const label of ['ci:collect#1.1', 'reviews#1', 'replies#1', 'resolve#1']) {
     const c = calls.find(c => c.label === label)
     assert.ok(c, `${label} ran in this scenario`)
     assert.match(c.prompt, /\/srv\/other\/repo/, `${label} must name the checkout`)
@@ -3600,7 +3668,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
   })
   assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
-  assert.ok(labels.indexOf('adopt:push') < labels.indexOf('ci#2'), 'publication is confirmed before either watcher')
+  assert.ok(labels.indexOf('adopt:push') < labels.indexOf('ci:collect#2.1'), 'publication is confirmed before either watcher')
   assert.ok(labels.indexOf('adopt:push') < labels.indexOf('reviews#2'))
   assert.equal(labels.includes('adopt:readback'), false, 'the push receipt carries the read-back')
   assert.equal(result.history[1].cycle, 2, 'adoption occupies the next carried cycle')
@@ -3634,7 +3702,7 @@ test('an already-published adopted head needs no push even in a dry-run launch',
     assert.equal(result.history[1].adoption.publication, 'already-published', String(autoPush))
     assert.equal(result.state.expectedHead, ADOPT)
     assert.equal(labels.includes('adopt:push'), false)
-    assert.ok(labels.includes('ci#2') && labels.includes('reviews#2'), 'the normal cycle still runs')
+    assert.ok(labels.includes('ci:collect#2.1') && labels.includes('reviews#2'), 'the normal cycle still runs')
   }
 })
 
@@ -3970,7 +4038,7 @@ test('a continuation after adoption omits adoptHead and advances normally', asyn
   assert.equal(next.result.state.expectedHead, ADOPT)
   assert.equal(next.result.observation.actions.adoption, null)
   assert.equal(next.labels.some(l => l.startsWith('adopt:')), false)
-  assert.ok(next.labels.includes('ci#3') && next.labels.includes('reviews#3'))
+  assert.ok(next.labels.includes('ci:collect#3.1') && next.labels.includes('reviews#3'))
 })
 
 test('every result carries a status, an observation and the state', async () => {

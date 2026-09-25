@@ -42,24 +42,25 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('`commentDigest` of the first 12 hex characters of that body\'s sha256', body)
 
     def test_pr_ci_watcher_example_carries_the_verdict_pr_babysit_keys_on(self):
-        """pr-babysit fixes only verdict 'real' and stops honestly on 'unclassified'."""
+        """pr-babysit fixes only verdict 'real', stops honestly on 'unclassified', and needs one entry per check."""
         body = (AGENTS / 'pr-ci-watcher.md').read_text()
         example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
-        failure = example['realFailures'][0]
-        self.assertEqual(example['status'], 'red', 'a listed failure is red; the example must not teach green-with-failures')
+        self.assertEqual(sorted(example), ['checks', 'infraRerun'])
+        self.assertEqual(sorted(example['checks'][0]), ['failures', 'link'])
+        failure = example['checks'][0]['failures'][0]
         self.assertEqual(sorted(failure), ['cell', 'check', 'complete', 'files', 'firstError', 'job', 'runId', 'signature', 'verdict', 'workflow'])
-        self.assertIn('headSha', example, 'an accepted failure is matched only on the head it was read from')
         self.assertIn(failure['verdict'], ('real', 'rig-side', 'unclassified'))
         for verdict in ('"real"', '"rig-side"', '"unclassified"'):
             self.assertIn(verdict, body)
         self.assertNotIn('rigSide', body)
 
-    def test_pr_ci_watcher_waits_in_the_foreground_before_reading_logs(self):
-        """A background watch cost ci#2 on tinyusb #3978 31 polling turns at ~100k context."""
+    def test_pr_ci_watcher_judges_collected_evidence_without_waiting(self):
+        """Waiting and listing cost ci#2 on tinyusb #3978 31 polling turns at ~100k context; collect.py owns them now."""
         watcher = ' '.join((AGENTS / 'pr-ci-watcher.md').read_text().split())
-        for part in ('wait before reading any log, in the foreground with a Bash timeout of 600000 ms',
-                     'gh pr checks <N> --watch --interval 30 >/dev/null', 'no background watch'):
-            self.assertIn(part, watcher)
+        self.assertIn('never list checks, watch them or wait', watcher)
+        self.assertNotIn('gh pr checks', watcher)
+        self.assertIn('Re-run a check once, never twice', watcher)
+        self.assertIn('`runAttempt` is above 1', watcher)
 
     def test_hw_validator_example_carries_what_chief_adjudicates_on(self):
         """chief reads status apart from verdict and trusts a board only on a cleanup receipt."""

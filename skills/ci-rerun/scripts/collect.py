@@ -23,7 +23,8 @@ one file per call: the job's log without ANSI codes, NULs and timestamps
 saved whole, the diagnostic lines of every step that reported an error, and for an Actions job the newest run on the base
 branch in which the same job ran, with its conclusion and the diagnostic lines
 both share. It prints a compact copy, {head, detail, checks: [{link, attempt,
-name, provider, firstError (its first 200 characters), files, complete, base
+name, provider, runId and runAttempt for an Actions job, firstError (its first
+200 characters), files, complete, base
 (with the count of shared lines), error}]}; the lines themselves, each check's
 signature and its log path are in the detail file. `complete` is always false here: a log's diagnostic
 lines do not prove every failure was listed. A --check that is no longer a
@@ -217,7 +218,7 @@ def actions(repo, head, base_ref, job, folder, cache):
     full = actions_log(repo, job)
     section, exit_line = failed_steps(full)
     entry = {'name': record['name'], 'workflow': record.get('workflow_name', ''), 'runId': record.get('run_id'),
-             'log': save(folder, f'actions-{job}.log', full), **evidence(section, exit_line)}
+             'runAttempt': record.get('run_attempt'), 'log': save(folder, f'actions-{job}.log', full), **evidence(section, exit_line)}
     base = base_run(repo, base_ref, entry['workflow'], record['name'], cache)
     if base and base['conclusion'] == 'failure':
         base_full = actions_log(repo, base['jobId'])

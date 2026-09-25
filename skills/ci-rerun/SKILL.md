@@ -39,6 +39,19 @@ and exits 1 when any build could not be re-run; builds of one version share one
 new build. The token is `RTD_TOKEN`, from the environment or a login shell; without it
 the script exits 2.
 
+# A PR's CI for a judge
+
+`scripts/collect.py` is `pr-babysit`'s CI lane without a model: `inventory`
+waits a bounded time and lists a head's non-passing checks, and `failures`
+saves each failing check's log and diagnostics, with the base branch's run of
+the same job, for the `pr-ci-watcher` judge. Its docstring is the contract.
+
+```bash
+K=~/.claude/skills/ci-rerun/scripts/collect.py
+python3 $K inventory --repo <owner/name> --pr <N> --head <sha> --wait-seconds 540
+python3 $K failures --repo <owner/name> --pr <N> --head <sha> --check <link>...
+```
+
 # Judgment
 
 - **Classify first.** Read the log; re-run only a failure that is the
