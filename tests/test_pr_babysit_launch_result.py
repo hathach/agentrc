@@ -18,7 +18,7 @@ NEXT = 'b' * 40
 
 def failure(cell, verdict='rig-side', complete=True, accepted=False):
     return {'check': 'hil-tinyusb (tinyusb.json)', 'workflow': 'Build', 'job': 'hil-tinyusb', 'cell': cell,
-            'signature': f'{cell} ... Failed', 'complete': complete, 'verdict': verdict, 'accepted': accepted,
+            'signature': f'{cell} ... Failed', 'key': cell.encode().hex().ljust(16, '0')[:16], 'complete': complete, 'verdict': verdict, 'accepted': accepted,
             'firstError': f'{cell} failed ' + 'x' * 400}
 
 
@@ -83,7 +83,8 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['observation']['findings'], [{'id': '7#1', 'digest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid', 'at': 'a.c:3'}])
         ci = s['observation']['ci']
         self.assertEqual(ci['verdicts'], {'rig-side': 1, 'real': 1})
-        self.assertEqual(ci['settledCells'], {'hil-tinyusb (tinyusb.json)': ['f072 cdc']})
+        self.assertEqual(ci['settledCells'], {'hil-tinyusb (tinyusb.json)': [{'cell': 'f072 cdc', 'key': failure('f072 cdc')['key']}]},
+                         'the key a caller passes back to accept it')
         self.assertEqual(ci['attention'], [failure('pico host', verdict='real')], 'an unsettled failure is shown in full')
         self.assertEqual(s['receipts']['replies'], [{'batch': 'fixNotePosts', 'commentId': 7, 'kind': 'review-body', 'replyId': 8, 'sent': True,
                                                      'posted': True, 'verified': True, 'resolved': None, 'error': None}], 'receipts verbatim')
@@ -144,16 +145,8 @@ class LaunchResultTest(unittest.TestCase):
         for k, v in (('pending', pending), ('detail', 'x'), ('acceptedFailures', [{'cell': 'c'}]), ('deferrals', [{'issue': 'https://example/1'}])):
             self.assertEqual(s['result'][k], v)
 
-    def test_candidate_accepted_failures_copy_the_watcher_fields(self):
-        target = self.dir / 'accepted.json'
-        _, s = self.run_it(output(), '--accepted-out', str(target), '--reason', 'rig', '--scope', 'this head')
-        entries = json.loads(target.read_text())
-        self.assertEqual(entries, [{'workflow': 'Build', 'job': 'hil-tinyusb', 'cell': 'f072 cdc', 'signature': 'f072 cdc ... Failed',
-                                    'reason': 'rig', 'scope': 'this head'}], 'rig-side only, never a real failure')
-        self.assertEqual(s['acceptedCandidates'], {'file': str(target), 'entries': 1})
-
     def test_unusable_inputs_are_refused(self):
-        for argv, why in ((['--state-ref', 'nodigest'], 'FILE:DIGEST'), (['--accepted-out', 'x'], 'needs --reason and --scope')):
+        for argv, why in ((['--state-ref', 'nodigest'], 'FILE:DIGEST'), (['--accepted-out', 'x'], 'unrecognized arguments')):
             rc, s = self.run_it(output(), *argv)
             self.assertEqual(rc, 2)
             self.assertIn(why, s['error'])
@@ -166,8 +159,6 @@ class LaunchResultTest(unittest.TestCase):
         with redirect_stdout(out):
             rc = launch_result.report(launch_result.collect, ['--output', str(self.dir / 'bad')])
         self.assertEqual((rc, 'cannot read --output' in json.loads(out.getvalue())['error']), (2, True), 'not UTF-8')
-        rc, s = self.run_it(output(), '--accepted-out', str(self.dir / 'no' / 'such' / 'dir.json'), '--reason', 'r', '--scope', 's')
-        self.assertEqual((rc, 'cannot write --accepted-out' in s['error']), (2, True))
 
 
 if __name__ == '__main__':

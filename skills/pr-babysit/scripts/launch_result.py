@@ -2,14 +2,12 @@
 """One pr-babysit launch, condensed for its caller from the launch's saved Workflow output.
 
     launch_result.py --output FILE [--state-ref FILE:DIGEST] [--checkout DIR]
-                     [--accepted-out FILE --reason TEXT --scope TEXT]
 
 --output is the launch's Workflow output file. It is empty when the launch threw
 before returning, and then --state-ref, the stateRef that launch was given, is
 the one to continue from. --checkout adds the checkout's branch, HEAD and dirty
-paths. --accepted-out writes, for every CI failure the judge called rig-side, an
-acceptedFailures entry with its watcher fields copied exactly and the given
-reason and scope; writing it accepts nothing.
+paths. Every CI failure carries the `key` a caller passes back as
+acceptedFailures: [{ key, reason, scope }].
 
 `result` keeps every top-level result field verbatim except history, observation
 and state, which are condensed; receipts are kept verbatim. `blockers` lists what
@@ -84,12 +82,12 @@ def receipts(actions):
 
 
 def ci_summary(ci):
-    """Counts by verdict; complete rig-side or accepted failures as cells per check; every other failure verbatim."""
+    """Counts by verdict; complete rig-side or accepted failures as {cell, key} per check; every other failure verbatim."""
     failures = ci.get('realFailures') or []
     settled = lambda f: f.get('complete') is True and (f.get('accepted') or f.get('verdict') == 'rig-side')
     cells = {}
     for f in filter(settled, failures):
-        cells.setdefault(f.get('check'), []).append(f.get('cell'))
+        cells.setdefault(f.get('check'), []).append({'cell': f.get('cell'), 'key': f.get('key')})
     return {'status': ci.get('status'), 'headSha': ci.get('headSha'), 'infraRerun': ci.get('infraRerun'),
             'verdicts': dict(Counter('accepted' if f.get('accepted') else f.get('verdict') for f in failures)),
             'settledCells': cells, 'attention': [f for f in failures if not settled(f)]}
@@ -108,11 +106,6 @@ def checkout(path):
     return {'branch': git('-C', path, 'rev-parse', '--abbrev-ref', 'HEAD').strip(),
             'head': git('-C', path, 'rev-parse', 'HEAD').strip(),
             'dirty': [l for l in git('-C', path, 'status', '--porcelain').splitlines() if l]}
-
-
-def accepted_entries(failures, reason, scope):
-    return [{'workflow': f['workflow'], 'job': f['job'], 'cell': f.get('cell'), 'signature': f['signature'],
-             'reason': reason, 'scope': scope} for f in failures if f.get('verdict') == 'rig-side']
 
 
 def summarize(output, output_path, state_ref=None, tree=None):
@@ -165,29 +158,14 @@ def collect(argv):
     p.add_argument('--output', required=True)
     p.add_argument('--state-ref')
     p.add_argument('--checkout')
-    p.add_argument('--accepted-out')
-    p.add_argument('--reason')
-    p.add_argument('--scope')
     a = p.parse_args(argv)
-    if a.accepted_out and not (a.reason and a.scope):
-        raise Unusable('--accepted-out needs --reason and --scope, the user\'s own words for the acceptance')
     ref = None
     if a.state_ref:
         file, sep, digest = a.state_ref.rpartition(':')
         if not sep or not file or not re.fullmatch(r'[0-9a-f]{8}', digest):
             raise Unusable(f'--state-ref must be FILE:DIGEST with an 8-hex digest, not {a.state_ref!r}')
         ref = {'outputFile': file, 'digest': digest}
-    output = load_output(a.output)
-    summary = summarize(output, str(Path(a.output).resolve()), ref, checkout(a.checkout) if a.checkout else None)
-    if a.accepted_out:
-        failures = (((summary['result'] and output['result'].get('observation')) or {}).get('ci') or {}).get('realFailures') or []
-        entries = accepted_entries(failures, a.reason, a.scope)
-        try:
-            Path(a.accepted_out).write_text(json.dumps(entries, indent=1) + '\n', encoding='utf-8')
-        except OSError as e:
-            raise Unusable(f'cannot write --accepted-out {a.accepted_out}: {e.strerror}')
-        summary['acceptedCandidates'] = {'file': a.accepted_out, 'entries': len(entries)}
-    return summary
+    return summarize(load_output(a.output), str(Path(a.output).resolve()), ref, checkout(a.checkout) if a.checkout else None)
 
 
 if __name__ == '__main__':

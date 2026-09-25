@@ -22,9 +22,10 @@ export const meta = {
 //          ciWait?: number (minutes to wait on pending checks, default 30),
 //          ciNotes?: string (what the caller already established about this PR's CI, handed
 //            to the watcher verbatim: an investigated exit code, a check known rig-side),
-//          acceptedFailures?: [{ workflow, job, cell, signature, reason, scope }] (CI failures the caller
-//            accepts for this launch, matched exactly on workflow, job, cell (null only for a job with one
-//            result) and first diagnostic: never fixed, and a run red only from them passes, listing them),
+//          acceptedFailures?: [{ key, reason, scope } | { workflow, job, cell, signature, reason, scope }] (CI
+//            failures the caller accepts for this launch, matched exactly on workflow, job, cell (null only for
+//            a job with one result) and first diagnostic, or on the 16-hex `key` of those four that the result
+//            reports beside each failure: never fixed, and a run red only from them passes, listing them),
 //          deferrals?: [{ findingId, commentDigest, issueUrl, reason }] (valid findings the caller
 //            leaves to an existing GitHub issue: not fixed, answered with the issue and the reason;
 //            kept in the state while the comment body stands),
@@ -91,12 +92,21 @@ if (!Number.isInteger(ciWait) || ciWait < 1) {
 // Per launch, like autoPush: the caller authorizes them on each launch; the
 // state records the last list, so an entry not renewed is reported.
 const acceptedArg = args.acceptedFailures ?? []
-const acceptedShaped = (a) => a && typeof a === 'object' && 'cell' in a &&
-  ['workflow', 'job', 'signature', 'reason', 'scope'].every(k => typeof a[k] === 'string' && a[k].trim().length > 0) &&
-  (a.cell === null || (typeof a.cell === 'string' && a.cell.trim().length > 0))
+const said = (a, keys) => keys.every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
+const acceptedShaped = (a) => a && typeof a === 'object' && said(a, ['reason', 'scope']) && ('key' in a
+  ? typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) && Object.keys(a).length === 3
+  : 'cell' in a && said(a, ['workflow', 'job', 'signature']) && (a.cell === null || (typeof a.cell === 'string' && a.cell.trim().length > 0)))
 const failureKey = (x) => JSON.stringify([x.workflow, x.job, x.cell, x.signature])
-if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(failureKey)).size !== acceptedArg.length) {
-  throw new Error('acceptedFailures must be [{ workflow, job, cell: string or null for a job with one result, signature, reason, scope }], one per failure')
+// 64-bit FNV-1a of the failure's identity: a caller copies 16 hex digits
+// instead of a raw diagnostic, and a mistyped key matches nothing.
+const keyOf = (x) => {
+  let h = 0xcbf29ce484222325n
+  for (const ch of failureKey(x)) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
+  return h.toString(16).padStart(16, '0')
+}
+const acceptedKey = (a) => a.key || keyOf(a)
+if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(acceptedKey)).size !== acceptedArg.length) {
+  throw new Error('acceptedFailures must be [{ key: 16 hex, reason, scope } or { workflow, job, cell: string or null for a job with one result, signature, reason, scope }], one per failure')
 }
 // Per launch, like autoPush: the decision is the caller's each time, while the
 // ones already applied ride in the state.
@@ -751,7 +761,7 @@ const debt = new Map(restored
   })
   : [])
 for (const a of (restored && restored.acceptedFailures) || []) {
-  if (!acceptedArg.some(x => failureKey(x) === failureKey(a))) log(`accepted failure not renewed by this launch, no longer accepted: ${a.workflow} / ${a.job}${a.cell ? ` / ${a.cell}` : ''}: ${a.signature}`)
+  if (!acceptedArg.some(x => acceptedKey(x) === acceptedKey(a))) log(`accepted failure not renewed by this launch, no longer accepted: ${a.key ? `key ${a.key}` : `${a.workflow} / ${a.job}${a.cell ? ` / ${a.cell}` : ''}: ${a.signature}`}`)
 }
 // findingId -> { commentId, digest, reviewedSha, file, line, claim, verdict,
 // reason }: the last settled verdict on each finding, so a later harvest that
@@ -1867,7 +1877,8 @@ const runCycle = async (cycle, entry) => {
     // CI: it validates, fixes, and pushes while the CI lane is still watching.
     entry.lane = lane
     if (ciLane) {
-      ciPromise = ciLaneRun(cycle, lanes)
+      // Keyed here, so every report that can reach the result carries the key a caller accepts it by.
+      ciPromise = ciLaneRun(cycle, lanes).then(r => { if (r && r.realFailures) for (const rf of r.realFailures) rf.key = keyOf(rf); return r })
         .catch(e => { log(`cycle ${cycle}: CI lane errored — ${e && e.message}`); return null })
     }
 
@@ -2267,14 +2278,17 @@ const runCycle = async (cycle, entry) => {
     // A caller's acceptance covers one exact failure, and only when the
     // watcher listed every failure of its job: a known first diagnostic must
     // not hide another one behind it, nor one acceptance cover two failures.
-    const seenTimes = (rf) => c.realFailures.filter(x => failureKey(x) === failureKey(rf)).length
+    const seenTimes = (rf) => c.realFailures.filter(x => x.key === rf.key).length
     for (const rf of c.realFailures) {
-      const a = acceptedArg.find(x => failureKey(x) === failureKey(rf))
+      const a = acceptedArg.find(x => acceptedKey(x) === rf.key)
       if (!a) continue
       const why = !rf.complete ? 'the watcher did not list every failure of its job'
         : seenTimes(rf) > 1 ? `the same failure is listed ${seenTimes(rf)} times; one acceptance covers one` : null
       if (why) log(`cycle ${cycle}: ${rf.check} matches an accepted failure but is not accepted — ${why}`)
       else rf.accepted = { reason: a.reason, scope: a.scope }
+    }
+    for (const a of acceptedArg) {
+      if (!c.realFailures.some(rf => rf.key === acceptedKey(a))) log(`cycle ${cycle}: accepted failure ${acceptedKey(a)} matches no failure on this head`)
     }
     // Only a failure the watcher placed on the PR is fixed; the rig's and the
     // ones its evidence could not place are reported and left red.
@@ -2330,7 +2344,7 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: ${acceptedOnly(c) ? `CI red only from ${c.realFailures.length} accepted failure(s)` : 'PR is green'} with no unresolved valid findings${deferrals.size ? `; ${deferrals.size} deferred to tracked issues` : ''}`)
       return {
         pass: true, cycles: cycle, history,
-        ...(acceptedOnly(c) ? { acceptedFailures: c.realFailures.map(rf => ({ check: rf.check, workflow: rf.workflow, job: rf.job, cell: rf.cell, signature: rf.signature, verdict: rf.verdict, ...rf.accepted })) } : {}),
+        ...(acceptedOnly(c) ? { acceptedFailures: c.realFailures.map(rf => ({ check: rf.check, workflow: rf.workflow, job: rf.job, cell: rf.cell, signature: rf.signature, key: rf.key, verdict: rf.verdict, ...rf.accepted })) } : {}),
         ...(deferrals.size ? { deferrals: [...deferrals].map(([findingId, d]) => ({ findingId, issueUrl: d.issueUrl })) } : {}),
       }
     }

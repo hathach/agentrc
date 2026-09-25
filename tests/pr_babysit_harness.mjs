@@ -1566,8 +1566,26 @@ const PVS = { check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null
 const accept = (over = {}) => ({ workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
 const redWith = (...failures) => ({ ci: { status: 'red', infraRerun: [], realFailures: failures } })
 
+// fnv1a64 of JSON.stringify(['static', 'pvs', null, 'license expires in 12 days']), computed outside the workflow.
+const PVS_KEY = '8f5a706886f8c791'
+const byKey = (over = {}) => ({ key: PVS_KEY, reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
+
+test('an accepted failure named by its key is accepted like the full entry, and a wrong key accepts nothing', async () => {
+  const { result, logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()] } })
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.equal(result.acceptedFailures[0].key, PVS_KEY)
+  assert.equal(result.observation.ci.realFailures[0].key, PVS_KEY, 'the observed report carries the key a caller accepts it by')
+  assert.deepEqual(result.state.acceptedFailures, [byKey()])
+  const wrong = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey({ key: '0'.repeat(16) })] } })
+  assert.notEqual(wrong.result.pass, true)
+  assert.ok(wrong.logs.some(l => /accepted failure 0{16} matches no failure on this head/.test(l)), wrong.logs.join('\n'))
+  const twice = await run({ ...redWith(PVS, { ...PVS }), args: { acceptedFailures: [byKey()] } })
+  assert.notEqual(twice.result.pass, true, 'a key that names two observed failures accepts neither')
+  assert.ok(twice.logs.some(l => /listed 2 times; one acceptance covers one/.test(l)))
+})
+
 test('acceptedFailures are checked for shape before anything runs', async () => {
-  for (const acceptedFailures of ['pvs', [{ ...accept(), cell: undefined }], [accept({ signature: '' })], [accept({ scope: ' ' })], [accept({ cell: '' })], [accept(), accept()]]) {
+  for (const acceptedFailures of [[byKey({ key: 'abc' })], [byKey({ key: PVS_KEY.toUpperCase() })], [byKey({ cell: null })], [byKey({ reason: ' ' })], [byKey(), accept()], [{ ...accept(), cell: undefined }], [accept({ signature: '' })], [accept({ scope: ' ' })], [accept({ cell: '' })], [accept(), accept()]]) {
     const trace = []
     await assert.rejects(run({ args: { acceptedFailures }, trace }), /acceptedFailures must be/, JSON.stringify(acceptedFailures))
     assert.deepEqual(trace, [])
@@ -1577,7 +1595,7 @@ test('acceptedFailures are checked for shape before anything runs', async () => 
 test('a run red only from accepted failures passes, listing them, and is never called green', async () => {
   const { result, logs, labels } = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()] } })
   assert.equal(result.pass, true, JSON.stringify(result.reason))
-  assert.deepEqual(result.acceptedFailures, [{ check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', verdict: 'rig-side', reason: 'PVS license renewal pending', scope: 'until the license is renewed' }])
+  assert.deepEqual(result.acceptedFailures, [{ check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', key: PVS_KEY, verdict: 'rig-side', reason: 'PVS license renewal pending', scope: 'until the license is renewed' }])
   assert.match(summaries(logs)[0], /^cycle 1 summary — CI red, accepted failures only/)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /^accepted, not fixed: PVS license renewal pending/)
   assert.equal(rowsOf(summaries(logs)[0])[0][2], 'rig-side', 'the watcher\'s classification is kept')
