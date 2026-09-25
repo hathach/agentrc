@@ -208,6 +208,16 @@ if (args.stateRef != null) {
     return { pass: false, status: 'blocked', reason: 'state-transfer-failed', detail: why, stateRef: ref }
   }
 }
+// What a launch learned about CI on its head, so a relaunch neither re-reads nor
+// re-judges it: the checks the judge re-ran (`sure` false for a judge lost after
+// it may have), and its verdicts per check run, whose link names the run.
+const isFailure = (f) => f && typeof f === 'object' && ['check', 'workflow', 'job', 'signature', 'firstError'].every(k => typeof f[k] === 'string') &&
+  (f.cell === null || typeof f.cell === 'string') && Number.isInteger(f.runId) && typeof f.complete === 'boolean' &&
+  Array.isArray(f.files) && f.files.every(x => typeof x === 'string') && ['real', 'rig-side'].includes(f.verdict)
+const ciCacheShaped = (c) => c && typeof c === 'object' && typeof c.notesDigest === 'string' &&
+  Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
+  Array.isArray(c.entries) && c.entries.every(e => e && typeof e.head === 'string' && typeof e.link === 'string' &&
+    Array.isArray(e.failures) && e.failures.length > 0 && e.failures.every(isFailure))
 const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
@@ -219,6 +229,7 @@ if (args.state !== undefined && args.state !== null) {
     (st.acceptedFailures === undefined || Array.isArray(st.acceptedFailures)) &&
     (st.decisions === undefined || Array.isArray(st.decisions)) &&
     (st.holds === undefined || Array.isArray(st.holds)) &&
+    (st.ciCache === undefined || ciCacheShaped(st.ciCache)) &&
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
@@ -696,9 +707,28 @@ const deferralLine = (f) => `- ${f.file}:${f.line}: ${f.claim}\n  Real, and out 
 // Across launches only the last cycle's publication outcome is read (pendingOf);
 // its reports and the older cycles stay in the results that carried them.
 const history = restored && restored.last ? [restored.last] : []
-// The checks the CI judge re-ran this launch, per head: until its re-run registers,
-// a check still shows its old link, and a check by the same name is never re-run twice.
-const ciReruns = []
+// The checks the CI judge re-ran, per head: until its re-run registers, a check
+// still shows its old link, and a check by the same name is never re-run twice.
+const ciReruns = restored && restored.ciCache ? restored.ciCache.reruns : []
+// Verdicts by check link. Only a link naming its run is kept, and never an
+// unclassified verdict, which a newer base run may still place; a changed
+// ciNotes can change any verdict, so it discards them all.
+const CI_ENTRY_MAX = 4 * 1024
+const CI_CACHE_MAX = 16 * 1024
+// Bytes as state_transfer.py sends them: ensure_ascii turns DEL and every non-ASCII UTF-16 unit into a 6-byte \uXXXX escape.
+const transferBytes = (v) => { const t = canonical(v); return t.length + 5 * (t.match(/[^\x00-\x7e]/g) || []).length }
+// One record per check run on a head; a known re-run replaces a possible one.
+const noteRerun = (r) => {
+  const i = ciReruns.findIndex(x => x.head === r.head && x.link === r.link)
+  if (i < 0) ciReruns.push(r)
+  else if (r.sure) ciReruns[i] = r
+}
+const notesDigest = fnv1a(ciNotes)
+const ciVerdicts = new Map()
+if (restored && restored.ciCache) {
+  if (restored.ciCache.notesDigest === notesDigest) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, e)
+  else if (restored.ciCache.entries.length) log(`ciNotes changed: ${restored.ciCache.entries.length} cached CI verdict(s) judged again`)
+}
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
 // commentId -> { how, digest }: how the comment was answered ('refutation' or
 // 'fixNote') and the digest of the body that answer addressed. An answered
@@ -778,6 +808,7 @@ const stateOut = () => {
     acceptedFailures: acceptedArg,
     decisions: [...decisions],
     holds: [...holds],
+    ciCache: { notesDigest, reruns: ciReruns.filter(r => r.head === expectedHead), entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead) },
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], renumbered: !!d.seenSinceEdit, ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
@@ -1694,9 +1725,14 @@ const ciLaneRun = async (cycle, lanes) => {
     return null
   }
   const reruns = ciReruns.filter(r => r.head === inv.head)
-  const settling = failing.filter(c => reruns.some(r => r.link === c.link))
-  const judging = failing.filter(c => !settling.includes(c))
-  const report = { headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [], realFailures: [] }
+  const settling = failing.filter(c => reruns.some(r => r.sure && r.link === c.link))
+  const cached = failing.filter(c => !settling.includes(c) && c.attempt && ciVerdicts.has(c.link) && ciVerdicts.get(c.link).head === inv.head)
+  const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c))
+  const report = {
+    headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
+    realFailures: cached.flatMap(c => JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures))),
+  }
+  if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
   if (judging.length === 0 || lanes.reviewPushed || lanes.ended) return report
   const links = judging.map(c => c.link)
   const ev = await collect(`ci:collect#${cycle}.f`, `failures ${links.map(l => `--check ${shq(l)}`).join(' ')}`, EVIDENCE)
@@ -1710,26 +1746,42 @@ const ciLaneRun = async (cycle, lanes) => {
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. The checks, each needing exactly one entry in your reply: ` +
     JSON.stringify(judging.map(c => ({ link: c.link, check: c.name, workflow: c.workflow, bucket: c.bucket }))) + '.' +
-    (reruns.length ? `\nAlready re-run on this head: ${JSON.stringify(reruns.map(r => `${r.workflow} / ${r.check}`))}.` : '') +
+    [true, false].map(sure => [sure, reruns.filter(r => r.sure === sure).map(r => `${r.workflow} / ${r.check}`)])
+      .map(([sure, names]) => names.length ? `\n${sure ? 'Already re-run' : 'Possibly re-run by a judge that was lost'} on this head: ${JSON.stringify(names)}.` : '').join('') +
     (ciNotes ? `\nWhat the caller established about this PR's CI already, to weigh with your own evidence: ${ciNotes}` : ''),
     { label: `ci:judge#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: JUDGED },
   ).catch(e => { log(`cycle ${cycle}: CI judge errored — ${e && e.message}`); return null })
-  if (!judged) return null
-  const answered = judged.checks.map(j => j.link)
-  if (answered.length !== links.length || links.some(l => !answered.includes(l))) {
-    log(`cycle ${cycle}: CI judge answered ${JSON.stringify(answered)} for ${JSON.stringify(links)} — re-arming`)
+  const answered = judged ? judged.checks.map(j => j.link) : []
+  if (!judged || answered.length !== links.length || links.some(l => !answered.includes(l))) {
+    if (judged) log(`cycle ${cycle}: CI judge answered ${JSON.stringify(answered)} for ${JSON.stringify(links)} — re-arming`)
+    // It may have re-run any of them: none is re-run again on this head.
+    for (const c of judging) noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: false })
     return null
   }
   const reran = judging.filter(c => judged.checks.find(j => j.link === c.link).failures.length === 0)
   for (const c of reran) {
     if (reruns.some(r => r.workflow === c.workflow && r.check === c.name)) log(`cycle ${cycle}: CI judge re-ran ${c.workflow} / ${c.name} a second time`)
-    ciReruns.push({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name })
+    noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true })
   }
   // An empty answer is a re-run by the contract: CI is settling, receipt or not.
   if (reran.length) report.status = 'running'
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
+  for (const c of judging.filter(c => c.attempt && !reran.includes(c))) {
+    const failures = judged.checks.find(j => j.link === c.link).failures
+    if (failures.some(f => f.verdict === 'unclassified')) continue
+    for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
+    const entry = { head: inv.head, link: c.link, failures: JSON.parse(JSON.stringify(failures)) }
+    // Re-runs are never dropped, so they come out of the same budget first.
+    const size = transferBytes(entry)
+    const total = transferBytes([...ciVerdicts.values()]) + transferBytes(ciReruns.filter(r => r.head === inv.head))
+    if (size > CI_ENTRY_MAX || total + size > CI_CACHE_MAX) {
+      log(`cycle ${cycle}: CI verdict for ${c.name} not cached (${size} bytes; ${total} cached) — judged again next time`)
+      continue
+    }
+    ciVerdicts.set(c.link, entry)
+  }
   report.infraRerun = judged.infraRerun
-  report.realFailures = judged.checks.flatMap(j => j.failures)
+  report.realFailures.push(...judged.checks.flatMap(j => j.failures))
   return report
 }
 

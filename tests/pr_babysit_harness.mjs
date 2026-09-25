@@ -1335,6 +1335,94 @@ test('a review push that lands while the evidence is read supersedes the judge',
   assert.ok(logs.some(l => /review-lane push superseded the CI run/.test(l)), logs.join('\n'))
 })
 
+// --- CI verdicts carried in the state ---
+
+const RIG = { check: 'hil / pico', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }
+const WAITING = { findings: [], replies: [], bots: 'pending' }
+const YIELD = { autoPush: true, maxCycles: 3, yieldAfterCycle: true }
+const ciLabels = (labels) => labels.filter(l => l.startsWith('ci:'))
+
+test('a same-head relaunch reuses the judged verdicts: inventory only', async () => {
+  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.equal(first.result.state.ciCache.entries.length, 1)
+  const again = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1'])
+  assert.equal(again.result.history.at(-1).ci.realFailures[0].firstError, 'board did not enumerate')
+  assert.ok(again.logs.some(l => /CI verdicts reused for 1 check\(s\)/.test(l)))
+  const noted = await run({ args: { ...YIELD, state: first.result.state, ciNotes: 'the pico probe is flaky' }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.ok(noted.labels.includes('ci:judge#2'), 'changed ciNotes re-judge')
+  assert.ok(noted.logs.some(l => /ciNotes changed: 1 cached CI verdict\(s\) judged again/.test(l)))
+})
+
+test('the same head in a later cycle is not judged again, and an unclassified verdict always is', async () => {
+  const within = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#2.1'])
+  // an unclassified failure stops the launch at once; its relaunch reads it again
+  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
+  assert.equal(first.result.reason, 'ci-red-unclassified')
+  const { calls } = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
+  const second = calls.find(c => c.label === 'ci:collect#2.f').prompt
+  assert.doesNotMatch(second, /job\/1'/, 'the rig-side verdict is reused')
+  assert.match(second, /job\/2'/, 'the unclassified one is read again')
+})
+
+test('an accepted failure resumed from the cache still passes', async () => {
+  const first = await run({ ...redWith(PVS), args: { ...YIELD, acceptedFailures: [accept()] }, reviews: WAITING })
+  const done = await run({ ...redWith(PVS), args: { ...YIELD, acceptedFailures: [accept()], state: first.result.state } })
+  assert.equal(done.labels.includes('ci:judge#2'), false)
+  assert.equal(done.result.pass, true, JSON.stringify(done.result.reason))
+  assert.equal(done.result.acceptedFailures.length, 1)
+})
+
+test('a judge lost after it may have re-run is never followed by a re-run of those checks', async () => {
+  const { calls, logs } = await run({ throwOn: 'ci:judge#1', args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.ok(logs.some(l => /CI judge errored/.test(l)))
+  assert.match(calls.find(c => c.label === 'ci:collect#2.f').prompt, /job\/1'/, 'not settling: no re-run is known to exist')
+  assert.match(calls.find(c => c.label === 'ci:judge#2').prompt, /\nPossibly re-run by a judge that was lost on this head: \["ci \/ hil \/ pico"\]/)
+})
+
+test('a check keeps one re-run record per head, and a known re-run replaces a possible one', async () => {
+  const lost = await run({ throwOn: 'ci:judge#', args: { autoPush: true, maxCycles: 3 }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.equal(lost.labels.filter(l => l.startsWith('ci:judge#')).length, 3)
+  assert.deepEqual(lost.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', false]])
+  const rerun = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
+  const known = await run({ throwOn: 'ci:judge#1', judge: rerun, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(known.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
+})
+
+test('a re-run carries across a launch: its old run is still settling', async () => {
+  const rerun = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
+  const first = await run({ args: YIELD, reviews: WAITING, ci: { status: 'red', infraRerun: ['7'], realFailures: [RIG] }, judge: rerun })
+  assert.deepEqual(first.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
+  const again = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1'])
+  assert.equal(again.result.history.at(-1).ci.status, 'running')
+})
+
+test('a verdict over its bound, or past the budget, is judged again rather than cut', async () => {
+  // 1000 arrows or DELs are 1000 characters but 6000 bytes once state_transfer.py escapes them
+  for (const firstError of ['x'.repeat(5000), '→'.repeat(1000), '\x7f'.repeat(1000)]) {
+    const over = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith({ ...RIG, firstError }).ci })
+    assert.ok(over.logs.some(l => /CI verdict for hil \/ pico not cached/.test(l)), firstError.slice(0, 3))
+    assert.ok(over.labels.includes('ci:judge#2'))
+  }
+  const many = Array.from({ length: 12 }, (_, i) => ({ ...RIG, check: `hil / b${i}`, firstError: `${i} `.padEnd(1500, 'y') }))
+  const full = await run({ args: YIELD, reviews: WAITING, ci: redWith(...many).ci })
+  const cache = full.result.state.ciCache
+  assert.ok(cache.entries.length > 0 && cache.entries.length < 12, String(cache.entries.length))
+  assert.ok(JSON.stringify(cache).length <= 16 * 1024 + 512)
+  assert.ok(JSON.stringify(full.result.state).length < 64 * 1024)
+})
+
+test('a state whose CI cache is malformed is refused', async () => {
+  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const { digest, ...st } = first.result.state
+  for (const ciCache of [{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', failures: [{ ...st.ciCache.entries[0].failures[0], verdict: 'unclassified' }] }] },
+    { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [], reruns: [] }]) {
+    await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache }) } }), /not a pr-babysit state/)
+  }
+})
+
 test('ciNotes reach the judge prompt verbatim, and only when given', async () => {
   const red = { status: 'red', infraRerun: [], realFailures: [UNPLACED] }
   const noted = await run({ ci: red, args: { maxCycles: 1, ciNotes: 'PVS-Studio exit 2 is the license expiry warning: rig-side, see run 35171132943' } })
