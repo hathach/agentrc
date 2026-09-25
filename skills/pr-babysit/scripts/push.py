@@ -19,26 +19,19 @@ that line; exit 2 with {"error": ...} when the arguments are wrong or R's push
 URLs changed, and then nothing was pushed.
 """
 
-import subprocess
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, report  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, report  # noqa: E402
 
 PR_TRIES = 5
 PR_WAIT = 3  # seconds between reads of the PR head
 
 
-def run(*argv):
-    """Unlike facts.run, a failure here is part of the receipt, not an error."""
-    done = subprocess.run(argv, capture_output=True, text=True, errors='replace')
-    return done.returncode, done.stdout, done.stderr
-
-
 def branch_head(url, branch):
-    code, out, _ = run('git', 'ls-remote', url, f'refs/heads/{branch}')
+    code, out, _ = attempt('git', 'ls-remote', url, f'refs/heads/{branch}')
     if code:
         return None
     heads = [line.split('\t')[0] for line in out.splitlines() if line.endswith(f'\trefs/heads/{branch}')]
@@ -47,10 +40,10 @@ def branch_head(url, branch):
 
 def pr_head(pr, sha):
     head = None
-    for attempt in range(PR_TRIES):
-        if attempt:
+    for tried in range(PR_TRIES):
+        if tried:
             time.sleep(PR_WAIT)
-        code, out, _ = run('gh', 'pr', 'view', str(pr), '--json', 'headRefOid', '-q', '.headRefOid')
+        code, out, _ = attempt('gh', 'pr', 'view', str(pr), '--json', 'headRefOid', '-q', '.headRefOid')
         head = out.strip() if not code else None
         if head == sha:
             break
@@ -67,12 +60,12 @@ def publish(argv):
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.sha):
         raise Unusable(f'not a full SHA: {a.sha!r}')
-    code, out, err = run('git', 'remote', 'get-url', '--push', '--all', a.remote)
+    code, out, err = attempt('git', 'remote', 'get-url', '--push', '--all', a.remote)
     if code:
         raise Unusable(f'git remote get-url --push --all {a.remote}: {err.strip()}')
     if out.splitlines() != a.urls:
         raise Unusable(f"{a.remote} now pushes to {', '.join(out.splitlines()) or '(nowhere)'}, not {', '.join(a.urls)}")
-    code, _, err = run('git', 'push', a.remote, f'{a.sha}:refs/heads/{a.branch}')
+    code, _, err = attempt('git', 'push', a.remote, f'{a.sha}:refs/heads/{a.branch}')
     said = [line for line in err.splitlines() if line.strip() and not line.startswith('hint:')]
     refused = [line for line in said if line.startswith(' ! ')]
     receipt = {'pushed': not code, 'detail': (refused or said or [''])[-1].strip(),

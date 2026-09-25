@@ -40,9 +40,14 @@ class CommitsTest(unittest.TestCase):
         self.git('commit', '-q', '-m', message)
         return self.git('rev-parse', 'HEAD').strip()
 
-    def run_script(self, *argv, cwd=None):
+    def hook(self, body):
+        hook = self.repo / '.git' / 'hooks' / 'pre-commit'
+        hook.write_text(f'#!/bin/sh\n{body}\n')
+        hook.chmod(0o755)
+
+    def run_script(self, *argv, cwd=None, stdin=''):
         done = subprocess.run([sys.executable, str(SCRIPT), *argv], cwd=cwd or self.repo, env=ENV,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, input=stdin)
         return done.returncode, json.loads(done.stdout.splitlines()[-1])
 
     def test_head_reads_the_commit_and_the_scope_unquoted(self):
@@ -110,9 +115,51 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('not UTF-8', out['error'])
 
+    def test_commit_takes_exactly_its_paths_with_the_message_on_stdin(self):
+        for f in ('-x.c', 'space name.c', 'other.c'):
+            self.write(f, 'new\n')
+        self.git('add', '--', 'other.c')
+        code, out = self.run_script('commit', '-x.c', 'space name.c', stdin='Fix the thing\n\nWhy.\n')
+        self.assertEqual((code, out['committed']), (0, True), out)
+        self.assertEqual(sorted(self.git('show', '--name-only', '--format=', 'HEAD').split('\n')[:-1]), ['-x.c', 'space name.c'])
+        self.assertEqual(self.git('log', '-1', '--format=%B'), 'Fix the thing\n\nWhy.\n\n')
+        self.assertIn('A  other.c', self.git('status', '--porcelain'), 'what was staged beside it stays staged, uncommitted')
+
+    def test_commit_refused_by_a_hook_is_not_committed(self):
+        self.hook('echo "trailing whitespace fixed in a.c" >&2\nexit 1')
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, False))
+        self.assertIn('trailing whitespace', out['detail'])
+        self.assertEqual(self.git('rev-parse', 'HEAD').strip(), self.base)
+
+    def test_commit_reads_a_path_named_like_pathspec_magic_literally(self):
+        self.write(':(top)*', 'odd\n')
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', ':(top)*', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, True), out)
+        self.assertEqual(self.git('show', '--name-only', '--format=', 'HEAD').split('\n')[:-1], [':(top)*'])
+        self.assertIn(' M a.c', self.git('status', '--porcelain'))
+        code, seen = self.run_script('head', ':(top)*')
+        self.assertEqual((code, seen['leftover'], len(seen['entries'])), (0, [], 1), 'the audit reads back the same one file')
+
+    def test_a_hook_that_moves_head_and_fails_is_no_clean_refusal(self):
+        self.hook('git commit -q --allow-empty -m nested --no-verify\nexit 1')
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='Fix\n')
+        self.assertEqual(code, 2)
+        self.assertIn('HEAD moved', out['error'])
+
+    def test_a_blank_message_commits_and_stages_nothing(self):
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin=' \n\n')
+        self.assertEqual((code, out['committed']), (0, False))
+        self.assertIn('blank', out['detail'])
+        self.assertEqual(self.git('status', '--porcelain'), ' M a.c\n', 'nothing was staged')
+
     def test_errors(self):
         for argv, want in ((['chain', 'HEAD~1', 'HEAD'], 'not a full SHA'), (['chain', self.base], 'usage'),
-                           (['head'], 'usage'), (['frob'], 'usage'),
+                           (['head'], 'usage'), (['frob'], 'usage'), (['commit'], 'usage'),
                            (['chain', self.base, 'f' * 40], 'git rev-list')):
             code, out = self.run_script(*argv)
             self.assertEqual(code, 2, argv)

@@ -42,11 +42,11 @@ LOGS = Path(tempfile.gettempdir()) / 'pr-babysit-builds'
 def snapshot(paths):
     """The uncommitted state of paths, as one digest."""
     h = hashlib.sha256()
-    diff = subprocess.run(['git', 'diff', '--binary', 'HEAD', '--', *paths], capture_output=True)
+    diff = subprocess.run(['git', '--literal-pathspecs', 'diff', '--binary', 'HEAD', '--', *paths], capture_output=True)
     if diff.returncode != 0:
         raise Unusable(f"git diff: {diff.stderr.decode(errors='replace').strip()}")
     h.update(diff.stdout)
-    for f in sorted(p for p in git('ls-files', '--others', '--exclude-standard', '-z', '--', *paths).split('\0') if p):
+    for f in sorted(p for p in git('--literal-pathspecs', 'ls-files', '--others', '--exclude-standard', '-z', '--', *paths).split('\0') if p):
         h.update(f.encode() + b'\0')
         h.update(Path(f).read_bytes() if Path(f).is_file() else b'')
     return h.hexdigest()

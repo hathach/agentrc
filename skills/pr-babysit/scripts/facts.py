@@ -33,6 +33,15 @@ def run(*argv, ok=(0,)):
         raise Unusable(f"{' '.join(argv)}: output is not UTF-8")
 
 
+def attempt(*argv, input=None):
+    """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, errors='replace', input=input)
+    except FileNotFoundError:
+        raise Unusable(f'{argv[0]} is not installed')
+    return done.returncode, done.stdout, done.stderr
+
+
 def git(*argv):
     return run('git', *argv)[1]
 

@@ -443,10 +443,11 @@ const COMPAT = {
 // when the caller named none; command null when no build applies to the paths.
 const BUILD_PLAN = {
   type: 'object', additionalProperties: false,
-  required: ['command', 'setup', 'targets', 'options', 'reason', 'error'],
+  required: ['command', 'setup', 'targets', 'options', 'contract', 'reason', 'error'],
   properties: {
     command: { type: ['string', 'null'] }, setup: { type: ['string', 'null'] },
     targets: { type: 'array', items: { type: 'string' } }, options: { type: 'array', items: { type: 'string' } },
+    contract: { type: 'array', items: { type: 'string' } },
     reason: { type: 'string' }, error: { type: ['string', 'null'] },
   },
 }
@@ -521,7 +522,7 @@ const ADOPT_AUDIT = {
 const COMMIT = {
   type: 'object', additionalProperties: false,
   required: ['committed', 'detail'],
-  properties: { committed: { type: 'boolean' }, detail: { type: 'string' } },
+  properties: { error: { type: 'string' }, committed: { type: 'boolean' }, detail: { type: 'string' } },
 }
 // What the pin must still match before a commit, as PREFLIGHT_SCRIPT --recheck reports it.
 const RECHECK = {
@@ -1049,7 +1050,7 @@ const groupWork = (notes) => {
     if (!groups.has(key)) groups.set(key, { key, files: new Set(), notes: [] })
     const g = groups.get(key)
     n.files.forEach(f => { const c = canon(f); if (c) g.files.add(c) })
-    g.notes.push({ id: n.id, text: n.text })
+    g.notes.push({ id: n.id, text: n.text, claim: n.claim ?? n.text })
   }
   return [...groups.values()]
 }
@@ -1059,21 +1060,34 @@ const groupWork = (notes) => {
 // candidate is compared with the pinned head, since a target broken there is
 // broken for every fix. { block } when it may not be published, else { note },
 // what the build left unverified.
+// A resolved build plan per owned path set, reused by later cycles of this launch
+// with the setup a base build resolved into it. It is dropped once a pushed
+// commit changes a file its resolver says it read the contract from, and one
+// whose contract is among its own paths is never kept.
+const buildPlans = new Map()
+const contractTouched = (plan, paths) => plan.contract.some(f => paths.has(canon(f)))
+// The caller's build still needs the repository's setup for the base, resolved
+// once per launch, and only if a base build is needed (setup undefined until then).
+const callerPlan = buildCmd && { command: buildCmd, setup: undefined, targets: [], options: [], reason: "the caller's build", error: null }
 const buildCheck = async (tag, owned) => {
-  // The caller's build still needs the repository's setup for the base, which
-  // is resolved only if a base build is needed (setup undefined until then).
-  let plan = buildCmd && { command: buildCmd, setup: undefined, targets: [], options: [], reason: "the caller's build", error: null }
+  let plan = callerPlan
   if (!plan) {
-    plan = await agent(
-      `${IN_CHECKOUT}Editing and building nothing, resolve the repository's build contract (its agent instructions and build docs) for a change to ${owned.join(', ')}. ` +
-      "command = the shell command, run from the checkout's top level, that builds what these paths affect, with `<BUILD>` where the contract takes a fresh build directory; " +
-      'setup = the command a fresh checkout of this repository first needs for that build\'s dependencies, or null; targets and options = what it builds and with which settings, concretely; ' +
-      'command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
-      { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
-    ).catch(e => { log(`build:resolve#${tag} errored — ${e && e.message}`); return null })
-    if (!plan || plan.error) return { block: `build contract not resolved: ${plan ? plan.error : 'resolver died'}` }
-    if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return { note: null } }
+    const ownedSet = new Set(owned.map(canon))
+    const planKey = JSON.stringify([...ownedSet].sort())
+    plan = buildPlans.get(planKey)
+    if (!plan) {
+      plan = await agent(
+        `${IN_CHECKOUT}Editing and building nothing, resolve the repository's build contract (its agent instructions and build docs) for a change to ${owned.join(', ')}. ` +
+        "command = the shell command, run from the checkout's top level, that builds what these paths affect, with `<BUILD>` where the contract takes a fresh build directory; " +
+        'setup = the command a fresh checkout of this repository first needs for that build\'s dependencies, or null; targets and options = what it builds and with which settings, concretely; ' +
+        'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
+        { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
+      ).catch(e => { log(`build:resolve#${tag} errored — ${e && e.message}`); return null })
+      if (!plan || plan.error) return { block: `build contract not resolved: ${plan ? plan.error : 'resolver died'}` }
+      if (!contractTouched(plan, ownedSet)) buildPlans.set(planKey, plan)
+    }
   }
+  if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return { note: null } }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
   const side = (name, extra) => agent(
     `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${BUILD_SCRIPT} ${name}${extra} --command=${shq(plan.command)}\` ` +
@@ -1238,7 +1252,8 @@ const fixAndVerify = async (workIn, tag) => {
   for (const f of unverified) log(`fix for ${f.item}: failed verification — ${f.checkReason}`)
   const verified = unscoped.length === 0 && withheld.length === 0 && alive.length === work.length && unverified.length === 0
   const owned = [...new Set(work.flatMap(w => [...w.files]))]
-  const brief = { issues: work.map(textOf), notes: alive.map(f => f.notes).filter(Boolean) }
+  // claims: the issues without their hints, which only the commit message needs.
+  const brief = { issues: work.map(textOf), claims: work.flatMap(w => w.notes.map(n => n.claim)), notes: alive.map(f => f.notes).filter(Boolean) }
   const fail = (why) => {
     for (const f of alive) Object.assign(f, { addresses: false, checkReason: why })
     unverified = alive
@@ -1426,7 +1441,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   // only after a hook reported modifying files, while the checked files' contents
   // stayed what the fix verifier saw. The committer is then handed the widened
   // list and never chooses a path itself.
-  const quoted = checked.map(f => `'${f}'`).join(' ')
+  const quoted = checked.map(shq).join(' ')
   const hooks = await agent(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
     relayed(HOOKS),
@@ -1494,23 +1509,27 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   // leaves the machine: what a `git commit` picks up is not what `git add`
   // staged if anything ran in between.
   const made = await agent(
-    `${IN_CHECKOUT}On branch ${pinned.branch}: run \`git add --\` with exactly these paths and no others, ` +
-    `then \`git commit --only --\` with the same paths, never a bare \`git commit\` (imperative message summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, repo commit conventions; ` +
-    'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author). ' +
-    `The \`--\` matters: a path may look like an option. If a hook modifies a file during the commit, report committed = false and say which; do not add it and retry.\n${scope.map(f => `'${f}'`).join(' ')}\n` +
-    'Do not push. Leave every other working-tree change alone. Report committed = whether the commit was ' +
-    'created, and detail = one line on what you committed.',
-    { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'sonnet', schema: COMMIT },
+    `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to a new temporary file outside the checkout: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
+    'in the style `git log -5 --format=%s` shows, and a body only for a why the diff cannot show; ' +
+    'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
+    `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
+    // A file, not a here-document: no delimiter can collide with a line of the message.
+    `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < <that file>; rm -f <that file>\`. ` +
+    'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
+    relayed(COMMIT),
+    { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT },
   ).catch(e => { log(`commit#${cycle}-${what} errored — ${e && e.message}`); return null })
-  // A dead commit agent leaves no receipt either way: null, never a guess.
+  // A dead commit agent leaves no receipt either way: null, never a guess. Nor
+  // does an error: the relay reports one for output it never saw, after git may have run.
   if (!made) return { pass: false, committed: null, detail: 'commit agent died', sha: '' }
+  if (made.error) return { pass: false, committed: null, detail: made.error, sha: '' }
   if (!made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
 
   // Read the commit back in a separate turn: a committer reporting on its own
   // work is the one report most likely to be wrong about it. This catches
   // misreporting and a tree that moved underneath, not a determined lie.
   const seen = await agent(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(f => `'${f}'`).join(' ')}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(shq).join(' ')}\` ` +
     relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
@@ -1554,7 +1573,10 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
 
   const push = await pushExact(sha, `push#${cycle}-${what}`)
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha, published: 'unknown' }
-  if (push.pass) expectedHead = sha
+  if (push.pass) {
+    expectedHead = sha
+    for (const [key, plan] of buildPlans) if (contractTouched(plan, scopeSet)) buildPlans.delete(key)
+  }
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
 
@@ -2229,6 +2251,7 @@ const runCycle = async (cycle, entry) => {
       const work = groupWork(validFindings.map(f => ({
         id: f.commentId, scopeFile: f.file, files: [f.file],
         text: `${f.file}:${f.line} [${f.source}] ${f.claim} — hint: ${f.fixHint}`,
+        claim: `${f.file}:${f.line} ${f.claim}`,
       })))
       const { ok, fixes, owned, brief } = await fixAndVerify(work, `${cycle}-review`)
       entry.reviewFixes = fixes

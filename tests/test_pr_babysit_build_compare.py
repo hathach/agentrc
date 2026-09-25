@@ -97,6 +97,14 @@ class BuildCompareTest(unittest.TestCase):
         code, out = self.run_script('candidate', '--path=src.c', '--command', 'echo y > other.c && touch <BUILD>/o')
         self.assertEqual(out['snapshot'], out['snapshotAfter'], 'a path outside the candidate may change')
 
+    def test_a_path_named_like_pathspec_magic_snapshots_only_itself(self):
+        (self.repo / ':(top)*').write_text('odd')
+        snap = lambda: self.run_script('candidate', '--path=:(top)*', '--command', 'true')[1]['snapshot']
+        before = snap()
+        (self.repo / 'src.c').write_text('int x;\n')
+        (self.repo / 'new.c').write_text('a')
+        self.assertEqual(snap(), before, 'no other path joins the snapshot')
+
     def test_values_may_start_with_a_dash(self):
         code, out = self.run_script('candidate', '--path=-weird', '--command=true')
         self.assertEqual((code, out['exit']), (0, 0), out)
