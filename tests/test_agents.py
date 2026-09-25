@@ -54,6 +54,13 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(verdict, body)
         self.assertNotIn('rigSide', body)
 
+    def test_pr_ci_watcher_waits_in_the_foreground_before_reading_logs(self):
+        """A background watch cost ci#2 on tinyusb #3978 31 polling turns at ~100k context."""
+        watcher = ' '.join((AGENTS / 'pr-ci-watcher.md').read_text().split())
+        for part in ('wait before reading any log, in the foreground with a Bash timeout of 600000 ms',
+                     'gh pr checks <N> --watch --interval 30 >/dev/null', 'no background watch'):
+            self.assertIn(part, watcher)
+
     def test_hw_validator_example_carries_what_chief_adjudicates_on(self):
         """chief reads status apart from verdict and trusts a board only on a cleanup receipt."""
         body = (AGENTS / 'hw-validator.md').read_text()
