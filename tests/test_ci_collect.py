@@ -305,5 +305,45 @@ class FailuresTest(unittest.TestCase):
             collect.main(['failures', '--repo', 'o/r', '--pr', '5', '--head', HEAD])
 
 
+class VerdictsTest(unittest.TestCase):
+    ENTRY = {'link': JOB.format(3), 'bucket': 'fail', 'failures': [
+        {'check': 'hil', 'workflow': 'Build', 'job': 'hil', 'cell': 'pico → rp2040', 'signature': 'a "quoted"\ttab\x01ctl\x7f',
+         'runId': 7, 'complete': True, 'firstError': 'line\nbreak 😀 Љ', 'files': ['src/a.c'], 'verdict': 'rig-side'}]}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.object(collect.tempfile, 'gettempdir', lambda: self.tmp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def main(self, command, *argv, stdin=''):
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch('sys.stdin', io.StringIO(stdin)):
+            rc = collect.main([command, '--repo', 'o/r', '--pr', '5', '--head', HEAD, *argv])
+        return rc, json.loads(out.getvalue())
+
+    def test_recall_returns_what_was_remembered_unchanged_and_skips_unknown_links(self):
+        self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY])), (0, {'head': HEAD, 'error': None}))
+        rc, r = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))
+        self.assertEqual((rc, r['verdicts']), (0, [self.ENTRY]))
+
+    def test_a_later_verdict_for_a_link_replaces_the_earlier(self):
+        self.main('remember', stdin=json.dumps([self.ENTRY]))
+        other = {**self.ENTRY, 'link': JOB.format(4)}
+        self.main('remember', stdin=json.dumps([{**self.ENTRY, 'bucket': 'cancel'}, other]))
+        verdicts = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))[1]['verdicts']
+        self.assertEqual([(v['link'], v['bucket']) for v in verdicts], [(JOB.format(3), 'cancel'), (JOB.format(4), 'fail')])
+
+    def test_nothing_remembered_recalls_nothing(self):
+        self.assertEqual(self.main('recall', '--check', JOB.format(3)), (0, {'head': HEAD, 'verdicts': [], 'error': None}))
+
+    def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
+        for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}])):
+            rc, r = self.main('remember', stdin=text)
+            self.assertEqual(rc, 1, text)
+            self.assertIn('verdicts on stdin', r['error'])
+
+
 if __name__ == '__main__':
     unittest.main()

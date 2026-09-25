@@ -210,14 +210,13 @@ if (args.stateRef != null) {
 }
 // What a launch learned about CI on its head, so a relaunch neither re-reads nor
 // re-judges it: the checks the judge re-ran (`sure` false for a judge lost after
-// it may have), and its verdicts per check run, whose link names the run.
-const isFailure = (f) => f && typeof f === 'object' && ['check', 'workflow', 'job', 'signature', 'firstError'].every(k => typeof f[k] === 'string') &&
-  (f.cell === null || typeof f.cell === 'string') && (f.runId === null || Number.isInteger(f.runId)) && typeof f.complete === 'boolean' &&
-  Array.isArray(f.files) && f.files.every(x => typeof x === 'string') && ['real', 'rig-side'].includes(f.verdict)
+// it may have), and the digest of each verdict per check run, whose link names
+// the run. The verdicts themselves stay in collect.py's store beside the evidence;
+// an entry without a digest, from an earlier v3 that carried them inline, is judged again.
 const ciCacheShaped = (c) => c && typeof c === 'object' && typeof c.notesDigest === 'string' &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket'].every(k => typeof e[k] === 'string') &&
-    Array.isArray(e.failures) && e.failures.length > 0 && e.failures.every(isFailure))
+    (e.digest === undefined || typeof e.digest === 'string'))
 const config = { pr: args.pr, reviewers, autoRun, maxCycles, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
@@ -303,6 +302,19 @@ const INVENTORY = {
 const EVIDENCE = {
   type: 'object', required: ['head', 'detail'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' } },
+}
+// A judged check's verdict as collect.py stores it, and its stored digests.
+const VERDICT = {
+  type: 'object', additionalProperties: false, required: ['link', 'bucket', 'failures'],
+  properties: { link: { type: 'string' }, bucket: { type: 'string' }, failures: { type: 'array', items: CI_FAILURE } },
+}
+const RECALLED = {
+  type: 'object', required: ['head', 'verdicts'],
+  properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT } },
+}
+const REMEMBERED = {
+  type: 'object', required: ['head'],
+  properties: { error: { type: ['string', 'null'] }, head: { type: 'string' } },
 }
 // pr-ci-watcher, as the judge: one entry per check it was given, holding every
 // failure it read in that check, and the re-runs it started.
@@ -697,10 +709,8 @@ const history = restored && restored.last ? [restored.last] : []
 const ciReruns = restored && restored.ciCache ? restored.ciCache.reruns : []
 // Verdicts by check link. Only a link naming its run is kept, and never an
 // unclassified verdict, which a newer base run may still place; a changed
-// ciNotes can change any verdict, so it discards them all.
-const CI_CACHE_MAX = 16 * 1024
-// Bytes as state_transfer.py sends them: ensure_ascii turns DEL and every non-ASCII UTF-16 unit into a 6-byte \uXXXX escape.
-const transferBytes = (v) => { const t = canonical(v); return t.length + 5 * (t.match(/[^\x00-\x7e]/g) || []).length }
+// ciNotes can change any verdict, so it discards them all. An entry holds its
+// failures once judged or recalled.
 // One record per check run on a head; a known re-run replaces a possible one.
 const noteRerun = (r) => {
   const i = ciReruns.findIndex(x => x.head === r.head && x.link === r.link)
@@ -710,8 +720,9 @@ const noteRerun = (r) => {
 const notesDigest = fnv1a(ciNotes)
 const ciVerdicts = new Map()
 if (restored && restored.ciCache) {
-  if (restored.ciCache.notesDigest === notesDigest) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, e)
-  else if (restored.ciCache.entries.length) log(`ciNotes changed: ${restored.ciCache.entries.length} cached CI verdict(s) judged again`)
+  if (restored.ciCache.notesDigest === notesDigest) {
+    for (const e of restored.ciCache.entries) if (e.digest) ciVerdicts.set(e.link, { ...e })
+  } else if (restored.ciCache.entries.length) log(`ciNotes changed: ${restored.ciCache.entries.length} cached CI verdict(s) judged again`)
 }
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
 // commentId -> { how, digest }: how the comment was answered ('refutation' or
@@ -792,7 +803,10 @@ const stateOut = () => {
     acceptedFailures: acceptedArg,
     decisions: [...decisions],
     holds: [...holds],
-    ciCache: { notesDigest, reruns: ciReruns.filter(r => r.head === expectedHead), entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead) },
+    ciCache: {
+      notesDigest, reruns: ciReruns.filter(r => r.head === expectedHead),
+      entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest }) => ({ head, link, bucket, digest })),
+    },
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], renumbered: !!d.seenSinceEdit, ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
@@ -1683,11 +1697,16 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: CI not collected — no PR repository in ${JSON.stringify(pin && pin.prUrl)}`)
     return null
   }
-  const collect = (label, command, schema) => agent(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}\` ` +
-    'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema),
+  const collect = (label, command, schema, payload) => agent(
+    `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file and ' : ''}` +
+    `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? ' < <that file>' : ''}\` ` +
+    'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
+    (payload ? `\n${JSON.stringify(payload)}` : ''),
     { label, phase: 'Triage', model: 'haiku', effort: 'low', schema },
   ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  // What went wrong with a collector's answer for `head`, or null when nothing did.
+  const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
+  const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
   // collect.py polls every 30 s, so a slice shorter than that would only list.
   let inv = null
   let left = ciWait * 60
@@ -1711,8 +1730,24 @@ const ciLaneRun = async (cycle, lanes) => {
   const reruns = ciReruns.filter(r => r.head === inv.head)
   const settling = failing.filter(c => reruns.some(r => r.sure && r.link === c.link))
   // A run's conclusion can still be updated under the same link, so the bucket must match too.
-  const cached = failing.filter(c => !settling.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
-    ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket)
+  const reusable = (c) => !settling.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
+    ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
+  const unread = failing.filter(c => reusable(c) && !ciVerdicts.get(c.link).failures)
+  if (unread.length) {
+    const got = await collect(`ci:collect#${cycle}.r`, `recall ${unread.map(c => `--check ${shq(c.link)}`).join(' ')}`, RECALLED)
+    const why = faultOf(got, inv.head)
+    if (why) log(`cycle ${cycle}: CI verdicts not recalled — ${why}`)
+    for (const c of unread) {
+      const e = ciVerdicts.get(c.link)
+      const v = why ? undefined : got.verdicts.find(v => v.link === c.link)
+      if (v && verdictDigest(v) === e.digest) e.failures = v.failures
+      else {
+        if (!why) log(`cycle ${cycle}: CI verdict for ${c.name} ${v ? 'recalled with another digest' : 'not in the store'} — judged again`)
+        ciVerdicts.delete(c.link)
+      }
+    }
+  }
+  const cached = failing.filter(reusable)
   const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c))
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
@@ -1726,8 +1761,9 @@ const ciLaneRun = async (cycle, lanes) => {
   const ev = await collect(`ci:collect#${cycle}.f`, `failures ${links.map(l => `--check ${shq(l)}`).join(' ')}`, EVIDENCE)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
   if (lanes.reviewPushed || lanes.ended) return report
-  if (!ev || ev.error || ev.head !== inv.head) {
-    log(`cycle ${cycle}: CI evidence not collected — ${!ev ? 'the collector died' : ev.error || `it is for ${ev.head.slice(0, 7)}`}`)
+  const evFault = faultOf(ev, inv.head)
+  if (evFault) {
+    log(`cycle ${cycle}: CI evidence not collected — ${evFault}`)
     return null
   }
   const judged = await agent(
@@ -1755,18 +1791,15 @@ const ciLaneRun = async (cycle, lanes) => {
   if (reran.length) report.status = 'running'
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
   for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
-  for (const c of judging.filter(c => c.attempt && !reran.includes(c))) {
-    const failures = judged.checks.find(j => j.link === c.link).failures
-    if (failures.some(f => f.verdict === 'unclassified')) continue
-    const entry = { head: inv.head, link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(failures)) }
-    // Re-runs are never dropped, so they come out of the same budget first.
-    const size = transferBytes(entry)
-    const total = transferBytes([...ciVerdicts.values()].filter(e => e.link !== c.link)) + transferBytes(ciReruns.filter(r => r.head === inv.head))
-    if (total + size > CI_CACHE_MAX) {
-      log(`cycle ${cycle}: CI verdict for ${c.name} not cached (${size} bytes; ${total} cached) — judged again next time`)
-      continue
-    }
-    ciVerdicts.set(c.link, entry)
+  const fresh = judging.filter(c => c.attempt && !reran.includes(c))
+    .map(c => ({ link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(judged.checks.find(j => j.link === c.link).failures)) }))
+    .filter(v => !v.failures.some(f => f.verdict === 'unclassified'))
+  for (const v of fresh) ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v })
+  // A push since judging moved the head on: those verdicts will never be recalled.
+  // One the store lost or garbled fails its digest on recall and is judged again.
+  if (fresh.length && !lanes.reviewPushed) {
+    const why = faultOf(await collect(`ci:collect#${cycle}.w`, 'remember', REMEMBERED, fresh), inv.head)
+    if (why) log(`cycle ${cycle}: ${fresh.length} CI verdict(s) not stored — ${why}; judged again by a later launch`)
   }
   report.infraRerun = judged.infraRerun
   report.realFailures.push(...judged.checks.flatMap(j => j.failures))

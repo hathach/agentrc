@@ -3,6 +3,8 @@
 
   collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S]
   collect.py failures --repo OWNER/NAME --pr N --head SHA --check LINK...
+  collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
+  collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK...
 
 inventory: waits up to S seconds (default 0) while any check is pending, then
 prints one JSON object {head, status, pending, checks, error}. `status` is
@@ -28,6 +30,13 @@ For an Actions job the entry also holds the newest run on the base branch in
 which the same job ran, with its conclusion and the diagnostic lines both
 share. A --check that is no longer a failing check of the head is a stale
 snapshot: exit 1, before anything is read. Read the Docs needs RTD_TOKEN (see rtd.py).
+
+remember: stores a judge's verdicts for the head beside its evidence, so a
+later launch recalls them instead of carrying them in its state. It reads a
+JSON list of {link, bucket, failures} on stdin, replaces any stored entry for
+the same link, and prints {head, error}. recall prints {head, verdicts, error}:
+the stored entries for the --check links it has, unchanged; a link it has none
+for is left out. The caller checks what comes back against its own digests.
 """
 
 import argparse
@@ -135,6 +144,44 @@ def printed(inv):
     """What the caller reads: the failing checks by name, the pending ones by count."""
     return {'head': inv['head'], 'status': inv['status'], 'pending': inv['counts'].get('pending', 0),
             'checks': [c for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')], 'error': None}
+
+
+def evidence_dir(repo, pr, head):
+    path = Path(tempfile.gettempdir()) / 'ci-collect' / repo.replace('/', '_') / str(pr) / head
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def stored_verdicts(folder):
+    try:
+        return json.loads((folder / 'verdicts.json').read_text())
+    except FileNotFoundError:
+        return {}
+    except ValueError as e:
+        raise Failed(f'verdicts.json: {e}')
+
+
+def remember(repo, pr, head, text):
+    try:
+        entries = json.loads(text)
+    except ValueError as e:
+        raise Failed(f'verdicts on stdin: {e}')
+    if not (isinstance(entries, list) and all(isinstance(e, dict) and sorted(e) == ['bucket', 'failures', 'link'] and
+                                              isinstance(e['link'], str) and isinstance(e['bucket'], str) and
+                                              isinstance(e['failures'], list) for e in entries)):
+        raise Failed('verdicts on stdin must be a list of {link, bucket, failures}')
+    folder = evidence_dir(repo, pr, head)
+    stored = stored_verdicts(folder)
+    stored.update((e['link'], e) for e in entries)
+    tmp = folder / f'verdicts.json.{time.time_ns()}'
+    tmp.write_text(json.dumps(stored, ensure_ascii=False))
+    tmp.replace(folder / 'verdicts.json')
+    return {'head': head, 'error': None}
+
+
+def recall(repo, pr, head, links):
+    stored = stored_verdicts(evidence_dir(repo, pr, head))
+    return {'head': head, 'verdicts': [stored[link] for link in links if link in stored], 'error': None}
 
 
 def clean(text):
@@ -254,8 +301,7 @@ def failures(repo, pr, head, links):
     stale = [link for link in links if link not in failing]
     if stale:
         raise Failed('stale snapshot: no longer failing checks of the head: ' + ', '.join(stale))
-    folder = Path(tempfile.gettempdir()) / 'ci-collect' / repo.replace('/', '_') / str(pr) / head
-    folder.mkdir(parents=True, exist_ok=True)
+    folder = evidence_dir(repo, pr, head)
     cache, checks = {}, []
     for link in links:
         check = failing[link]
@@ -281,20 +327,26 @@ def failures(repo, pr, head, links):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('command', choices=['inventory', 'failures'])
+    p.add_argument('command', choices=['inventory', 'failures', 'remember', 'recall'])
     p.add_argument('--repo', required=True, help='OWNER/NAME of the repository that owns the PR number')
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True, help='the head SHA the caller expects')
     p.add_argument('--wait-seconds', type=int, default=0)
     p.add_argument('--check', action='append', default=[], metavar='LINK')
     a = p.parse_args(argv)
-    if (a.command == 'failures') != bool(a.check):
-        p.error('--check is for failures, which needs at least one')
+    if (a.command in ('failures', 'recall')) != bool(a.check):
+        p.error('--check is for failures and recall, which need at least one')
     if not re.fullmatch(r'[0-9a-f]{40}', a.head):
         p.error('--head must be a full 40-hex SHA')
     try:
-        out = (printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds))) if a.command == 'inventory'
-               else failures(a.repo, a.pr, a.head, a.check))
+        if a.command == 'inventory':
+            out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)))
+        elif a.command == 'failures':
+            out = failures(a.repo, a.pr, a.head, a.check)
+        elif a.command == 'remember':
+            out = remember(a.repo, a.pr, a.head, sys.stdin.read())
+        else:
+            out = recall(a.repo, a.pr, a.head, a.check)
         rc = 0
     except Failed as e:
         out, rc = {'head': a.head, 'error': str(e)}, 1

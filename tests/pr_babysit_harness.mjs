@@ -145,6 +145,7 @@ async function run(opts = {}) {
   const napPoints = [] // logs.length when a backoff started, to prove ordering
   const reviews = opts.reviews ?? { findings: [], replies: [], bots: 'reviewed' }
   const ci = opts.ci ?? GREEN
+  const store = opts.store ?? new Map()
   const patch = (base, over) => over === null ? null : { ...structuredClone(base), ...over }
   // The stub checkout's HEAD: the PR head until this run pushes, then the SHA it
   // pushed — the same rule the workflow's own expectedHead follows, so a second
@@ -202,11 +203,27 @@ async function run(opts = {}) {
       const failed = (ci.realFailures || []).map((rf, i) => ({
         name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}`,
       }))
-      if (!/ inventory /.test(String(prompt)) && opts.evidence) await opts.evidence(calls)
-      const answer = / inventory /.test(String(prompt))
-        ? { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
-        : { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', error: null }
-      return conforms(options.schema, answer, label)
+      // recall and remember use opts.store, collect.py's verdict store: a Map by
+      // head and link that a relaunch shares with the launch before it.
+      const text = String(prompt)
+      const key = (link) => `${head} ${link}`
+      let answer
+      if (/ recall /.test(text)) {
+        const links = [...text.matchAll(/--check '([^']*)'/g)].map(m => m[1])
+        answer = { head, verdicts: links.filter(l => store.has(key(l))).map(l => structuredClone(store.get(key(l)))), error: null }
+        if (opts.recall) answer = opts.recall(answer)
+      } else if (/ remember /.test(text)) {
+        const verdicts = trailingList(text)
+        for (const v of verdicts) store.set(key(v.link), v)
+        answer = { head, error: null }
+        if (opts.remember) answer = opts.remember(answer, store)
+      } else if (/ inventory /.test(text)) {
+        answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
+      } else {
+        if (opts.evidence) await opts.evidence(calls)
+        answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', error: null }
+      }
+      return answer === null ? null : conforms(options.schema, answer, label)
     }
     if (label.startsWith('ci:judge#')) {
       // The rest of each failure is the plain case: one run, every failure of a job listed.
@@ -1334,40 +1351,47 @@ test('a review push that lands while the evidence is read supersedes the judge',
   assert.ok(logs.some(l => /review-lane push superseded the CI run/.test(l)), logs.join('\n'))
 })
 
-// --- CI verdicts carried in the state ---
+// --- CI verdicts: digests carried in the state, verdicts in collect.py's store ---
 
 const RIG = { check: 'hil / pico', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }
 const WAITING = { findings: [], replies: [], bots: 'pending' }
 const YIELD = { autoPush: true, maxCycles: 3, yieldAfterCycle: true }
 const ciLabels = (labels) => labels.filter(l => l.startsWith('ci:'))
 
-test('a same-head relaunch reuses the judged verdicts: inventory only', async () => {
-  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.equal(first.result.state.ciCache.entries.length, 1)
-  const again = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1'])
+test('a same-head relaunch recalls the judged verdicts from the store: no judge', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(first.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w'])
+  assert.deepEqual(Object.keys(first.result.state.ciCache.entries[0]).sort(), ['bucket', 'digest', 'head', 'link'], 'the state keeps digests only')
+  const again = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r'])
+  assert.match(again.calls.find(c => c.label === 'ci:collect#2.r').prompt, / recall --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/1' --repo /)
   assert.equal(again.result.history.at(-1).ci.realFailures[0].firstError, 'board did not enumerate')
   assert.ok(again.logs.some(l => /CI verdicts reused for 1 check\(s\)/.test(l)))
-  const noted = await run({ args: { ...YIELD, state: first.result.state, ciNotes: 'the pico probe is flaky' }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(again.result.state.ciCache.entries, first.result.state.ciCache.entries, 'a recalled verdict stays remembered')
+  const noted = await run({ store, args: { ...YIELD, state: first.result.state, ciNotes: 'the pico probe is flaky' }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.ok(noted.labels.includes('ci:judge#2'), 'changed ciNotes re-judge')
   assert.ok(noted.logs.some(l => /ciNotes changed: 1 cached CI verdict\(s\) judged again/.test(l)))
 })
 
 test('the same head in a later cycle is not judged again, and an unclassified verdict always is', async () => {
   const within = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#2.1'])
+  assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w', 'ci:collect#2.1'])
   // an unclassified failure stops the launch at once; its relaunch reads it again
-  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   assert.equal(first.result.reason, 'ci-red-unclassified')
-  const { calls } = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
+  assert.deepEqual(trailingList(first.calls.find(c => c.label === 'ci:collect#1.w').prompt).map(v => v.link), ['https://github.com/o/r/actions/runs/1/job/1'])
+  const { calls } = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   const second = calls.find(c => c.label === 'ci:collect#2.f').prompt
   assert.doesNotMatch(second, /job\/1'/, 'the rig-side verdict is reused')
   assert.match(second, /job\/2'/, 'the unclassified one is read again')
 })
 
 test('an accepted failure resumed from the cache still passes', async () => {
-  const first = await run({ ...redWith(PVS), args: { ...YIELD, acceptedFailures: [accept()] }, reviews: WAITING })
-  const done = await run({ ...redWith(PVS), args: { ...YIELD, acceptedFailures: [accept()], state: first.result.state } })
+  const store = new Map()
+  const first = await run({ ...redWith(PVS), store, args: { ...YIELD, acceptedFailures: [accept()] }, reviews: WAITING })
+  const done = await run({ ...redWith(PVS), store, args: { ...YIELD, acceptedFailures: [accept()], state: first.result.state } })
   assert.equal(done.labels.includes('ci:judge#2'), false)
   assert.equal(done.result.pass, true, JSON.stringify(done.result.reason))
   assert.equal(done.result.acceptedFailures.length, 1)
@@ -1398,38 +1422,73 @@ test('a re-run carries across a launch: its old run is still settling', async ()
   assert.equal(again.result.history.at(-1).ci.status, 'running')
 })
 
-test('a verdict over its bound, or past the budget, is judged again rather than cut', async () => {
-  // 3000 arrows or DELs are 3000 characters but 18000 bytes once state_transfer.py escapes them
-  for (const firstError of ['x'.repeat(17000), '→'.repeat(3000), '\x7f'.repeat(3000)]) {
-    const over = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith({ ...RIG, firstError }).ci })
-    assert.ok(over.logs.some(l => /CI verdict for hil \/ pico not cached/.test(l)), firstError.slice(0, 3))
-    assert.ok(over.labels.includes('ci:judge#2'))
+test('verdicts of any size cost the state a digest each', async () => {
+  const many = Array.from({ length: 12 }, (_, i) => ({ ...RIG, check: `hil / b${i}`, firstError: `${i} →\x7f`.padEnd(5000, 'y') }))
+  const store = new Map()
+  const full = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(...many).ci })
+  assert.equal(full.result.state.ciCache.entries.length, 12)
+  assert.ok(JSON.stringify(full.result.state.ciCache).length < 3 * 1024)
+  const again = await run({ store, args: { ...YIELD, state: full.result.state }, reviews: WAITING, ci: redWith(...many).ci })
+  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r'])
+  assert.equal(again.result.history.at(-1).ci.realFailures.length, 12)
+})
+
+test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
+  const garble = (answer, store) => { for (const [k, v] of store) store.set(k, { ...v, bucket: 'cancel' }); return answer }
+  const lose = (answer, store) => { store.clear(); return answer }
+  const cases = [[garble, null], [lose, null], [(a, store) => lose(null, store), /the collector died/], [(a, store) => lose({ ...a, error: 'disk full' }, store), /disk full/]]
+  for (const [remember, why] of cases) {
+    const store = new Map()
+    const first = await run({ store, remember, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+    assert.equal(first.logs.some(l => /1 CI verdict\(s\) not stored — .*judged again by a later launch/.test(l) && why.test(l)), !!why, first.logs.join('\n'))
+    const within = await run({ store: new Map(), remember, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
+    assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w', 'ci:collect#2.1'], 'its own launch reuses it')
+    const again = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+    assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
   }
-  const many = Array.from({ length: 12 }, (_, i) => ({ ...RIG, check: `hil / b${i}`, firstError: `${i} `.padEnd(1500, 'y') }))
-  const full = await run({ args: YIELD, reviews: WAITING, ci: redWith(...many).ci })
-  const cache = full.result.state.ciCache
-  assert.ok(cache.entries.length > 0 && cache.entries.length < 12, String(cache.entries.length))
-  assert.ok(JSON.stringify(cache).length <= 16 * 1024 + 512)
-  assert.ok(JSON.stringify(full.result.state).length < 64 * 1024)
+})
+
+test('a recalled verdict that is missing or fails its digest is judged again', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const tampered = (answer) => ({ ...answer, verdicts: answer.verdicts.map(v => ({ ...v, failures: v.failures.map(f => ({ ...f, verdict: 'real' })) })) })
+  for (const [over, why] of [[{ recall: tampered }, /recalled with another digest/], [{ store: new Map() }, /not in the store/]]) {
+    const again = await run({ store, ...over, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+    assert.ok(again.logs.some(l => why.test(l)), again.logs.join('\n'))
+    assert.ok(again.labels.includes('ci:judge#2'))
+    assert.equal(again.result.history.at(-1).ci.realFailures[0].verdict, 'rig-side')
+  }
+  for (const recall of [() => null, (a) => ({ ...a, error: 'gone', verdicts: [] })]) {
+    const again = await run({ store, recall, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+    assert.ok(again.logs.some(l => /CI verdicts not recalled/.test(l)), again.logs.join('\n'))
+    assert.ok(again.labels.includes('ci:judge#2'))
+  }
 })
 
 test('a cached verdict is reused only while its check keeps the same conclusion', async () => {
-  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   assert.equal(first.result.state.ciCache.entries[0].bucket, 'fail')
-  const cancelled = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: { ...redWith(RIG).ci, bucket: 'cancel' } })
+  const cancelled = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: { ...redWith(RIG).ci, bucket: 'cancel' } })
+  assert.equal(cancelled.labels.includes('ci:collect#2.r'), false, 'nothing to recall for another conclusion')
   assert.ok(cancelled.labels.includes('ci:judge#2'), 'a conclusion updated under the same link is judged again')
-  assert.equal(cancelled.result.state.ciCache.entries[0].bucket, 'cancel', 'and its new verdict replaces the old')
-  // a replacement is budgeted without the entry it replaces: 10 KB twice would not fit, once does
-  const big = { ...RIG, firstError: 'x'.repeat(5000) } // about 10 KB: the stub copies it into the signature
-  const cached = await run({ args: YIELD, reviews: WAITING, ci: redWith(big).ci })
-  const replaced = await run({ args: { ...YIELD, state: cached.result.state }, reviews: WAITING, ci: { ...redWith(big).ci, bucket: 'cancel' } })
-  assert.deepEqual(replaced.result.state.ciCache.entries.map(e => e.bucket), ['cancel'], replaced.logs.join('\n'))
+  assert.deepEqual(cancelled.result.state.ciCache.entries.map(e => e.bucket), ['cancel'], 'and its new verdict replaces the old')
+})
+
+test('a state from before the verdict store keeps everything but its verdicts', async () => {
+  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const { digest, ...st } = first.result.state
+  const failures = [{ ...RIG, workflow: 'ci', job: RIG.check, cell: null, signature: RIG.firstError, runId: 1, complete: true }]
+  const entries = st.ciCache.entries.map(({ digest, ...e }) => ({ ...e, failures }))
+  const old = await run({ args: { ...YIELD, state: seal({ ...st, ciCache: { ...st.ciCache, entries } }) }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(old.labels), ['ci:collect#2.1', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
+  assert.equal(old.result.state.cyclesUsed, 2)
 })
 
 test('a state whose CI cache is malformed is refused', async () => {
   const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const { digest, ...st } = first.result.state
-  for (const ciCache of [{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', failures: [{ ...st.ciCache.entries[0].failures[0], verdict: 'unclassified' }] }] },
+  for (const ciCache of [{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', bucket: 'fail', digest: 7 }] },
     { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [], reruns: [] },
     { ...st.ciCache, entries: st.ciCache.entries.map(({ bucket, ...e }) => e) }]) {
     await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache }) } }), /not a pr-babysit state/)
