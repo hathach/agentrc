@@ -131,15 +131,13 @@ const reason = !verified.pass ? 'verify-failed'
   : verified.dirty.length ? 'dirty-tree'
   : verified.outOfScope.length ? 'out-of-scope' : null
 if (reason) log(`verify: ${reason} — ${verified.detail}`)
-const review = 'review rounds via coworker read-only lanes; a Codex finding naming reviewed SHA, command and observed failure goes to code-writer to reproduce before editing, every other finding to finding-verifier before a fix'
 const v = triage.validate
+const check = v && v.args ? `Workflow /${v.name} ${JSON.stringify(v.args)}, its artifacts then cleaned out of the checkout`
+  : v ? `the component stages of /${v.name}, launched separately one read-only stage at a time since it cannot run with repairs and its own reviews disabled (${v.limitation}), their artifacts then cleaned`
+    : `${verify} alone, no validation workflow being named by the repository's instructions`
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
-  : 'confirm the implement notes carry hook evidence, then one simplification challenge on a read-only coworker lane; ' + (v && v.args
-    ? `Workflow /${v.name} ${JSON.stringify(v.args)}; clean its artifacts out of the checkout; ${review}; /${v.name} again if HEAD moved; then the human opens the PR`
-    : v
-      ? `workflow /${v.name} cannot run with repairs and its own reviews disabled (${v.limitation}) — launch its component stages separately, one read-only stage at a time; clean their artifacts; ${review}; those stages again if HEAD moved; then the human opens the PR`
-      : `no validation workflow named by the repository's instructions — ${verify} is the only check; ${review}; that check again if HEAD moved; then the human opens the PR`)
+  : `confirm the implement notes carry hook evidence, then run your completion review (CLAUDE.md; chief uses its own sequence) with ${check} as its validation; state its outcome in your report; then the human opens the PR`
 return {
   pass: !reason, reason, target, issue: triage.issue, kind: triage.kind, disposition: triage.disposition,
   triage, implement: dev, commits: verified.commits, verify: verified, validate: triage.validate, next,
