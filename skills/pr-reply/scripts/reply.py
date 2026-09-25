@@ -34,7 +34,7 @@ reply, resolved; 1 otherwise; 2 on a usage or manifest error.
 
 --inspect reads, never writes: for each pair, whether REPLY is ours answering
 COMMENT on this PR, its exact body with the body's digest, and the original's
-digest as the validator computes it (sha256, 12 hex). stdout ends with
+digest as pr-babysit's harvest.py computes it (sha256, 12 hex). stdout ends with
 {"inspected": [{"commentId", "replyId", "kind", "body", "bodyDigest",
 "originalDigest", "error"}]}; body is null when error is set. Exit 0 when every
 pair was read and is ours, 1 otherwise.
@@ -220,7 +220,7 @@ def is_fix_note(body):
 
 
 def comment_digest(body):
-    """The validator's digest of a reviewer's comment: sha256 of its body, 12 hex."""
+    """harvest.py's digest of a reviewer's comment: sha256 of its body, 12 hex."""
     return hashlib.sha256((body or '').encode()).hexdigest()[:12]
 
 

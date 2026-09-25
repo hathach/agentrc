@@ -598,6 +598,7 @@ const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
 const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
 const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
+const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build_compare.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
@@ -1896,6 +1897,7 @@ const runCycle = async (cycle, entry) => {
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
       `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others; ` +
       `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push: report one record for each and no other` : 'none of them auto-run: report no bot records'}. ${IN_CHECKOUT}` +
+      `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${autoRun.length ? ` --auto-run ${autoRun.join(',')}` : ''}\`. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
           `those listed by findingId among them, so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +

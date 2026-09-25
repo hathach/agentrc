@@ -15,6 +15,7 @@ missing. Each script's docstring says what it reports.
 S=~/.claude/skills/pr-babysit/scripts
 python3 $S/preflight.py --pr N               # the checkout and the PR it must stay
 python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
+python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py head 'src/a.c'         # the commit at HEAD and its scope
 python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SHAs
@@ -27,7 +28,7 @@ python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkou
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch and lists the `blockers` to settle before continuing.
-`preflight.py`, `commits.py`, `state_transfer.py` and `launch_result.py` only read, except that
+`preflight.py`, `harvest.py`, `commits.py`, `state_transfer.py` and `launch_result.py` only read, except that
 `launch_result.py --accepted-out` writes its candidate entries; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build_compare.py` builds the checkout, or the
 given revision in a temporary worktree it removes, in a fresh build directory; `push.py` publishes `<sha>` and reads back

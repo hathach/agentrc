@@ -39,7 +39,7 @@ class AgentFiles(unittest.TestCase):
         self.assertEqual(finding['findingId'], f"{finding['commentId']}#1")
         self.assertRegex(finding['commentDigest'], r'^[0-9a-f]{12}$')
         self.assertIn('`findingId` of `<commentId>#<n>`', body)
-        self.assertIn('`commentDigest` of the first 12 hex characters of that body\'s sha256', body)
+        self.assertIn("its comment's `digest` as `commentDigest`", body)
 
     def test_pr_ci_watcher_example_carries_the_verdict_pr_babysit_keys_on(self):
         """pr-babysit fixes only verdict 'real', stops honestly on 'unclassified', and needs one entry per check."""
