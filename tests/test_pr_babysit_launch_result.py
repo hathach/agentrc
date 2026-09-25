@@ -32,7 +32,7 @@ def output(**over):
         'pending': [{'bot': 'copilot', 'state': 'absent', 'reason': 'no request'}],
         'observation': {'reviewedHead': HEAD, 'lane': 'both',
                         'reviews': {'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
-                                    'findings': [{'findingId': '7#1', 'commentDigest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid',
+                                    'findings': [{'findingId': '7#1', 'commentId': 7, 'commentDigest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid',
                                                   'file': 'a.c', 'line': 3}]},
                         'ci': {'status': 'red', 'headSha': HEAD, 'infraRerun': [],
                                'realFailures': [failure('f072 cdc'), failure('pico host', verdict='real')]},
@@ -86,7 +86,7 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(ci['settledCells'], {'hil-tinyusb (tinyusb.json)': [{'cell': 'f072 cdc', 'key': failure('f072 cdc')['key']}]},
                          'the key a caller passes back to accept it')
         self.assertEqual(ci['attention'], [failure('pico host', verdict='real')], 'an unsettled failure is shown in full')
-        self.assertEqual(s['receipts']['replies'], [{'batch': 'fixNotePosts', 'commentId': 7, 'kind': 'review-body', 'replyId': 8, 'sent': True,
+        self.assertEqual(s['receipts']['replies'], [{'batch': 'fixNotePosts', 'findingVerdicts': ['valid'], 'commentId': 7, 'kind': 'review-body', 'replyId': 8, 'sent': True,
                                                      'posted': True, 'verified': True, 'resolved': None, 'error': None}], 'receipts verbatim')
         self.assertEqual(s['receipts']['pushes'][0]['committed'], True)
         self.assertEqual(s['result']['pending'][0]['bot'], 'copilot', 'result fields other than history/observation/state stay verbatim')
@@ -104,6 +104,18 @@ class LaunchResultTest(unittest.TestCase):
         self.assertIn('threw before returning', s['blockers'][0])
         self.assertIn("the checkout is dirty: ['?? left.txt']", s['blockers'], 'even without a result')
         self.assertIn('no new state', s['notes'][0])
+
+    def test_a_reply_receipt_names_the_verdicts_it_answered(self):
+        data = output()
+        obs = data['result']['observation']
+        obs['reviews']['findings'] += [{'findingId': '41#1', 'commentId': 41, 'verdict': 'stale'},
+                                       {'findingId': '41#2', 'commentId': 41, 'verdict': 'invalid'},
+                                       {'findingId': '41#3', 'commentId': 410, 'verdict': 'valid'}]
+        obs['actions']['refutedPosts'] = {'pass': True, 'detail': '', 'receipts': [{'commentId': 41, 'kind': 'review', 'posted': True}]}
+        _, s = self.run_it(json.dumps(data))
+        self.assertEqual([(r['batch'], r['commentId'], r['findingVerdicts']) for r in s['receipts']['replies']],
+                         [('refutedPosts', 41, ['invalid', 'stale']), ('fixNotePosts', 7, ['valid'])],
+                         'a refutation of a stale finding says so; the join is on commentId, not the findingId prefix')
 
     def test_what_chief_must_settle_is_a_blocker(self):
         data = output()
@@ -126,7 +138,7 @@ class LaunchResultTest(unittest.TestCase):
             'CI evidence incomplete for hil-tinyusb (tinyusb.json) / l476 msc',
             f"heads disagree: {{'result': '{NEXT}', 'state': '{HEAD}'}}"])
         self.assertEqual(s['receipts']['pushes'][0]['detail'], 'push died' + ' z' * 200, 'a push receipt is never cut')
-        self.assertEqual(s['receipts']['replies'][0], {'batch': 'refutedPosts', 'commentId': 9, 'kind': 'review', 'sent': True,
+        self.assertEqual(s['receipts']['replies'][0], {'batch': 'refutedPosts', 'findingVerdicts': [], 'commentId': 9, 'kind': 'review', 'sent': True,
                                                        'posted': True, 'verified': False, 'error': None})
 
     def test_the_checkout_is_compared_with_the_state(self):

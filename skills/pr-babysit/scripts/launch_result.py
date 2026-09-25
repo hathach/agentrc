@@ -10,7 +10,10 @@ paths. Every CI failure carries the `key` a caller passes back as
 acceptedFailures: [{ key, reason, scope }].
 
 `result` keeps every top-level result field verbatim except history, observation
-and state, which are condensed; receipts are kept verbatim. `blockers` lists what
+and state, which are condensed; receipts are kept verbatim, each reply receipt
+with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings on
+its comment (a refutedPosts reply answers stale findings as well as invalid ones).
+`blockers` lists what
 the caller must settle before trusting or continuing the launch, `notes` what is
 absent but harmless.
 """
@@ -56,7 +59,12 @@ def elapsed(progress):
     return round((max(e for _, e in spans) - min(s for s, _ in spans)) / 1000) if spans else None
 
 
-def receipts(actions):
+def finding_verdicts(findings, comment_id):
+    """The verdicts of the findings harvested on one comment."""
+    return sorted({f.get('verdict') for f in findings if f.get('commentId') == comment_id})
+
+
+def receipts(actions, findings):
     """Pushes, replies and the adoption the last cycle recorded, verbatim, and what about them blocks.
 
     A reply batch's `pass` is the workflow's own verdict that every comment it
@@ -72,7 +80,7 @@ def receipts(actions):
     for kind in ('refutedPosts', 'fixNotePosts', 'deferralPosts'):
         posts = actions.get(kind)
         if posts:
-            replies += [{'batch': kind, **r} for r in posts.get('receipts') or []]
+            replies += [{'batch': kind, 'findingVerdicts': finding_verdicts(findings, r.get('commentId')), **r} for r in posts.get('receipts') or []]
             if posts.get('pass') is not True:
                 blocking.append(f'reply batch did not pass: {kind}: {cut(posts.get("detail", ""))}')
     adoption = actions.get('adoption')
@@ -133,7 +141,7 @@ def summarize(output, output_path, state_ref=None, tree=None):
                           'at': f'{f.get("file")}:{f.get("line")}'} for f in reviews.get('findings') or []],
             'ci': ci and ci_summary(ci),
         }
-        summary['receipts'], blocking = receipts(actions)
+        summary['receipts'], blocking = receipts(actions, reviews.get('findings') or [])
         blockers += blocking
         if actions.get('error'):
             blockers.append(f'action error: {cut(actions["error"])}')

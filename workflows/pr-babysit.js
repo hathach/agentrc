@@ -2133,7 +2133,8 @@ const runCycle = async (cycle, entry) => {
     //   wait       - both a valid and a refuted finding: refuting now would
     //                resolve the thread over a fix that has not landed; or a
     //                held finding, from this harvest or an earlier one.
-    //   refutation - refuted findings only; the drafted reply answers it.
+    //   refutation - dismissed findings only (invalid, or stale: already fixed on
+    //                the head); the drafted reply answers it.
     //   fixNote    - valid findings only; the post-fix note answers it, unless
     //                we refuted the comment in a posted reply: that is a
     //                correction, reported to the caller, never a note on top.
@@ -2222,16 +2223,27 @@ const runCycle = async (cycle, entry) => {
     // no one's authority. One body per comment: the script posts one reply and
     // resolves the thread, and pay() retires every dismissal on it, so sibling
     // drafts merge into that body.
-    let withheld = 0
+    const whyWithheld = (id) => {
+      const how = owed(id)
+      if (how === 'wait') return held.has(id) ? 'held' : 'awaiting the fix for its valid points'
+      if (how === 'none') return ledger.has(id) ? 'already answered' : 'no finding in this harvest'
+      if (how !== 'refutation') return `owes a ${how}`
+      if (!owesDismissal(id)) return 'already answered'
+      if (debt.get(id).repair) return 'reply repair pending'
+      if (!showsAll(id, true)) return 'harvest shows only part of the comment'
+      return null
+    }
+    const withheld = new Map()
     const replyFor = new Map()
     for (const x of r.replies) {
-      if (owed(x.commentId) !== 'refutation' || !owesDismissal(x.commentId) || debt.get(x.commentId).repair || !showsAll(x.commentId, true)) { withheld++; continue }
+      const why = whyWithheld(x.commentId)
+      if (why) { withheld.set(why, (withheld.get(why) || 0) + 1); continue }
       const prev = replyFor.get(x.commentId)
       if (prev) prev.body += `\n\n${x.body}`
       else replyFor.set(x.commentId, { commentId: x.commentId, body: x.body })
     }
     const freshReplies = [...replyFor.values()].map(x => ({ ...x, body: withDeferred(x.commentId, x.body) }))
-    if (withheld > 0) log(`cycle ${cycle}: ${withheld} drafted reply/replies withheld`)
+    if (withheld.size) log(`cycle ${cycle}: drafted reply/replies withheld — ${[...withheld].map(([why, n]) => `${why}: ${n}`).join(', ')}`)
     if (freshReplies.length > 0 && args.autoPush === true) {
       // Keep the receipt before anything later can fail: a cycle that dies after
       // posting must still be able to say what went out.

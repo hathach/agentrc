@@ -2572,7 +2572,7 @@ test('an answered comment is not replied to again for a stale re-report', async 
   // The fix note already resolved the thread. A drafted "already fixed" reply
   // for the same finding is a second answer to a closed thread.
   let cycle = 0
-  const { calls } = await run({
+  const { calls, logs } = await run({
     args: { autoPush: true, maxCycles: 2 },
     reviewsPerCycle: () => {
       cycle++
@@ -2583,6 +2583,23 @@ test('an answered comment is not replied to again for a stale re-report', async 
   })
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false,
     'a resolved thread was answered twice')
+  assert.ok(logs.includes('cycle 2: drafted reply/replies withheld — already answered: 1'), 'the log says why')
+})
+
+test('a stale finding never answered gets the dismissal reply; a refuted one is not answered again', async () => {
+  let cycle = 0
+  const { calls, logs } = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => {
+      cycle++
+      const findings = [invalidFinding({ commentId: 1 }), ...(cycle === 2 ? [finding({ commentId: 2, line: 2, verdict: 'stale' })] : [])]
+      const replies = findings.map(f => ({ commentId: f.commentId, body: `about ${f.commentId}` }))
+      return { findings, replies: cycle === 2 ? [...replies, { commentId: 99, body: 'about 99' }] : replies, bots: cycle === 1 ? 'pending' : 'reviewed' }
+    },
+  })
+  assert.deepEqual(calls.filter(c => c.label.startsWith('replies#')).map(c => c.label), ['replies#1', 'replies#2'])
+  assert.deepEqual(manifestOf(calls, 'replies#2'), [{ commentId: 2, body: 'about 2', digest: fnv1a('about 2') }])
+  assert.ok(logs.includes('cycle 2: drafted reply/replies withheld — already answered: 1, no finding in this harvest: 1'))
 })
 
 const receiptFor = (commentId, body) =>
