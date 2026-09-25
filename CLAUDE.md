@@ -29,9 +29,8 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   alone does not establish correctness.
 
 # Infrastructure
-- pve.lan runs Proxmox and hosts two VMs: ci.lan and omv.lan
-- ci.lan is the main HIL (hardware-in-the-loop) rig for testing ~/code/tinyusb
-- SSH from this PC: hathach@ci.lan (passwordless sudo); root@pve.lan and root@omv.lan
+- ci.lan, a VM on the pve.lan Proxmox host, is the main HIL (hardware-in-the-loop) rig for testing tinyusb and other projects
+- SSH from this PC: ci.lan and pve.lan
 
 # Environment
 - This account (hathach) has passwordless sudo. Use it as needed for
