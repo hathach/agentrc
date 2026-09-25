@@ -106,21 +106,27 @@ def rerun(urls, key):
     return 0 if not errors else 1
 
 
-def log(url, key):
+def reason(url, key):
+    """The build's record, its notifications and each failed command's last 40 output lines."""
     host, api, build = parse(url)
     record = call(f'{api}/builds/{build}/', key)
+    notes = [(m.get('type'), m.get('header'), html.unescape(re.sub(r'<[^>]+>', '', m.get('body') or '')))
+             for m in (n.get('message') or {} for n in call(f'{api}/builds/{build}/notifications/', key).get('results', []))]
+    failed = [(c['exit_code'], c.get('command'), '\n'.join((c.get('output') or '').splitlines()[-40:]))
+              for c in call(f'{host}/api/v2/build/{build}/', key).get('commands', []) if c.get('exit_code')]
+    return build, record, notes, failed
+
+
+def log(url, key):
+    build, record, notes, failed = reason(url, key)
     state = (record.get('state') or {}).get('code')
     print(f'build {build}: {state}, success {record.get("success")}, {record.get("duration")} s, commit {record.get("commit")}')
     if record.get('error'):
         print(f'error: {record["error"]}')
-    notes = call(f'{api}/builds/{build}/notifications/', key).get('results', [])
-    for n in notes:
-        m = n.get('message') or {}
-        print(f'== {m.get("type")}: {m.get("header")}\n{html.unescape(re.sub(r"<[^>]+>", "", m.get("body") or ""))}')
-    failed = [c for c in call(f'{host}/api/v2/build/{build}/', key).get('commands', []) if c.get('exit_code')]
-    for c in failed:
-        tail = '\n'.join((c.get('output') or '').splitlines()[-40:])
-        print(f'== command exited {c["exit_code"]}: {c.get("command")}\n{tail}')
+    for kind, header, body in notes:
+        print(f'== {kind}: {header}\n{body}')
+    for code, command, tail in failed:
+        print(f'== command exited {code}: {command}\n{tail}')
     if not notes and not failed and not record.get('error') and record.get('success') is False:
         print('no failure reason recorded by the API')
     return 0

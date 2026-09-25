@@ -71,14 +71,18 @@ def rerun(repo, numbers):
     return 0 if not errors else 1
 
 
-def log(repo, number, lines):
+def failed_steps(repo, number, lines):
+    """(step name, its output's last `lines` lines) for each failed step."""
     failed = [(s['name'], a['output_url']) for s in job(repo, number).get('steps', [])
               for a in s.get('actions', []) if a.get('status') not in ('success', 'skipped') and a.get('output_url')]
     if not failed:
         raise Failed(f'job {number}: no failed step with output')
-    for name, url in failed:
-        text = ''.join(x.get('message', '') for x in fetch(url))
-        print(f'== {name}\n' + '\n'.join(text.splitlines()[-lines:]))
+    return [(name, '\n'.join(''.join(x.get('message', '') for x in fetch(url)).splitlines()[-lines:])) for name, url in failed]
+
+
+def log(repo, number, lines):
+    for name, tail in failed_steps(repo, number, lines):
+        print(f'== {name}\n{tail}')
     return 0
 
 
