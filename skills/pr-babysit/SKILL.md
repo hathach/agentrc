@@ -28,8 +28,7 @@ python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkou
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch and lists the `blockers` to settle before continuing.
-`preflight.py`, `harvest.py`, `commits.py`, `state_transfer.py` and `launch_result.py` only read, except that
-`launch_result.py --accepted-out` writes its candidate entries; `hooks.py` runs the repository's
+`preflight.py`, `harvest.py`, `commits.py`, `state_transfer.py` and `launch_result.py` only read; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build_compare.py` builds the checkout, or the
 given revision in a temporary worktree it removes, in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed. Run it by hand only with the user's authorization to push.
