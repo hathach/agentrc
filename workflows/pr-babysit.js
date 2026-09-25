@@ -869,7 +869,12 @@ const finish = (verdict, status) => {
     } : null,
   }
   const state = stateOut()
-  return { stateDigest: state.digest, ...verdict, ...(corrections.length ? { corrections } : {}), status: status || (verdict.pass ? 'complete' : 'blocked'), rollup: launchRollup(), observation, state }
+  // A caller's completion notice shows the result's head: what decides comes first, the bulk last.
+  const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
+  return {
+    stateDigest: state.digest, status: status || (pass ? 'complete' : 'blocked'), ...(reason !== undefined ? { reason } : {}), pass, cycles,
+    rollup: launchRollup(), ...rest, ...(corrections.length ? { corrections } : {}), history: cycleHistory, observation, state,
+  }
 }
 const owesDismissal = (commentId) => {
   const d = debt.get(commentId)

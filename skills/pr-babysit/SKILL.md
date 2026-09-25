@@ -1,6 +1,6 @@
 ---
 name: pr-babysit
-description: Fact collectors the pr-babysit workflow runs in a PR checkout, and the push it publishes with. Use when a pr-babysit prompt names one of these scripts, or to reproduce by hand what the workflow saw; the workflow, not the script, decides whether to publish.
+description: Fact collectors the pr-babysit workflow runs in a PR checkout, the push it publishes with, and its caller's reader of a finished launch. Use when a pr-babysit prompt names one of these scripts, to reproduce by hand what the workflow saw, or to read a launch's result; the workflow, not the script, decides whether to publish.
 ---
 
 # pr-babysit's scripts
@@ -22,9 +22,13 @@ python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--
 python3 $S/build_compare.py candidate --path 'src/a.c' --command 'make -C <BUILD>'
 python3 $S/build_compare.py base --rev <sha> [--setup CMD] --command 'make -C <BUILD>'
 python3 $S/state_transfer.py <saved output> [--chunks I,J]  # a stateRef's state as checksummed base64 chunks
+python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR]  # the caller's reading of a launch
 ```
 
-`preflight.py`, `commits.py` and `state_transfer.py` only read; `hooks.py` runs the repository's
+`launch_result.py` is the caller's, not the workflow's: it condenses a finished
+launch and lists the `blockers` to settle before continuing.
+`preflight.py`, `commits.py`, `state_transfer.py` and `launch_result.py` only read, except that
+`launch_result.py --accepted-out` writes its candidate entries; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build_compare.py` builds the checkout, or the
 given revision in a temporary worktree it removes, in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed. Run it by hand only with the user's authorization to push.
