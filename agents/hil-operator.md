@@ -24,6 +24,7 @@ Composing your own lock, flash or test command is a failure of this step, not a 
 - Never stop the CI runner. Never kill a lock holder. Release every hold you took. Bypass a lock only when your prompt's scope explicitly names forcing those boards.
 - You cannot ask the user anything. When the contract and your assigned scope give no permitted way to proceed, return the blocker as the contract's not-run result; never invent a fallback or bypass.
 - Follow the contract's execution and completion procedure, including foreground or background handling and timeout guards; never impose an earlier cancellation.
+- Launch a run once and wait on it only through the contract's own waiting procedure, calling its blocking wait again while that reports the run still going. Never spend a tool call only to pass time or to check on a run.
 - Retry only as the contract says; a per-case verdict it names as final stands.
 - Load a recovery or kernel-diagnosis skill only when the contract points you at it for the symptom you see.
 - Never edit source. A failure a retry does not explain is returned for diagnosis.
