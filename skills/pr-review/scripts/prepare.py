@@ -9,7 +9,9 @@ a later push can be diffed against them) and the base branch, pins head, base
 and merge base, and puts branch pr-review-<N> at the head in
 .worktrees/pr-review-<N>. An existing worktree is reused only when it is clean
 and its branch tip is a head this script pinned; anything else is refused, never
-reset. It reads the ledger to choose the mode: `same` when the head was
+reset. It first settles the pending reviews of ours on the ledger (post.py
+--sync): what the human submitted or deleted on GitHub is recorded, and one still
+pending, or a post never confirmed, refuses the run. It reads the ledger to choose the mode: `same` when the head was
 reviewed already, `incremental` when the last reviewed head is an ancestor and
 the merge base is unchanged (scope: last head..head), else `full` (scope:
 merge base..head); --full forces full. The scope's changed directories become
@@ -36,7 +38,8 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import last, ledger_dir, ledger_path, load, refuse_unsettled, repo_of  # noqa: E402
+from ledger import ONLINE, last, ledger_dir, ledger_path, load, locked, refuse_unsettled, repo_of, store  # noqa: E402
+from post import sync  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, checkout_top, git, report, run  # noqa: E402
@@ -161,13 +164,19 @@ def prepare(a):
     if info.get('state') != 'OPEN':
         raise Unusable(f"PR {a.pr} is {info.get('state')}; pr-review reviews open PRs")
     head, base, merge_base = pin(remote_for(repo), repo, a.pr, info)
-    led = load(ledger_path(repo, a.pr), repo, a.pr)
+    path = ledger_path(repo, a.pr)
+    with locked(path):
+        led = load(path, repo, a.pr)
+        synced = sync(repo, a.pr, led, lambda: store(path, led))
     # A partial review is on the PR, so its threads can still be discussed; save refuses a second draft.
     refuse_unsettled(led, head, ('pending',))
-    lost = [r for r in led['reviews'] if r['status'] == 'uncertain']
-    if lost:
-        raise Unusable(f"a review POST for {lost[-1]['head']} may have landed unseen: reconcile it first with "
-                       f"post.py --pr {a.pr} --expected-head {lost[-1]['head']}, which only looks for it by its marker")
+    online = [r for r in led['reviews'] if r['status'] in ONLINE]
+    if online and online[-1]['status'] == 'drafted':
+        raise Unusable(f"your pending review of {online[-1]['head']} is still open on the PR: submit or delete it on GitHub first")
+    if online:
+        auto = ' --auto' if online[-1].get('publish') == 'auto' else ''
+        raise Unusable(f"a review POST for {online[-1]['head']} may have landed unseen: reconcile it first with "
+                       f"post.py --pr {a.pr} --expected-head {online[-1]['head']}{auto}, which only looks for it by its marker")
     mode, scope_base, prior = mode_of(led, head, merge_base, a.full)
     wt, branch = worktree(top, a.pr, head)
     pr_paths = changed(merge_base, head)
@@ -192,7 +201,7 @@ def prepare(a):
         'mode': mode, 'scopeBase': scope_base, 'priorHead': prior,
         'changed': len(pr_paths), 'scoped': len(scope), 'groups': groups, 'overCap': over,
         'tooling': [p for p in pr_paths if TOOLING.search(p)], 'ci': ci,
-        'ledger': str(ledger_path(repo, a.pr)), 'facts': str(facts), 'changedFile': changed_file and str(changed_file),
+        'ledger': str(path), 'facts': str(facts), 'synced': synced, 'changedFile': changed_file and str(changed_file),
     }
 
 

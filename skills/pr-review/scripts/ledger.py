@@ -10,9 +10,10 @@ one per PR, shared by every worktree of the clone. Only this script and
 post.py write it, under an exclusive lock, by write-then-rename.
 
 show prints the last review that reached the PR (posted or partial:
-head, mergeBase, verdict, status), its standing findings (open,
-upheld, disputed: id, file, line, severity, claim cut short) and the thread
-answers drafted and not yet posted, each with the replies it answers (author,
+head, mergeBase, verdict, status), its standing findings (open, upheld,
+disputed, or any whose thread resolve was deferred: id, file, line, severity,
+claim cut short) and the thread answers drafted and not yet published, each
+with the replies it answers (author,
 excerpt, from the threads snapshot it was judged on, null once edited), the
 recheck's reason and
 the thread's link; --finding prints one finding's whole
@@ -29,7 +30,8 @@ key. Only ids, digests and authors are printed, never bodies.
 
 A `discussion` result (same head, pushback only) posts no new review: save
 merges its dispute records and statuses into the findings of the last review
-of that head instead of appending one. save reads a pr-review Workflow output file ({"result": ...}),
+of that head, and appends an answer record (mode discussion, no findings) that
+post.py publishes the new answers through. save reads a pr-review Workflow output file ({"result": ...}),
 checks it is a result for this PR, and appends it as a review whose draft is
 `pending`: each comment anchored on a line the PR diff adds or keeps, else
 moved into the body, and the draft's digest fixed before anything is posted.
@@ -110,7 +112,15 @@ def digest(value):
 
 # An uncertain review may not be on the PR at all: it is reconciled before anything builds on it.
 REACHED = ('posted', 'partial')
-UNSETTLED = ('pending', 'partial', 'uncertain')
+UNSETTLED = ('pending', 'drafted', 'partial', 'uncertain')
+# A drafted review is a pending review of ours on GitHub; an uncertain one may be.
+ONLINE = ('drafted', 'uncertain')
+# Not yet on the PR, or not known to be: a second draft for the head waits for it.
+DRAFTS = ('pending', *ONLINE)
+
+
+def now():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def reached(led):
@@ -126,7 +136,18 @@ def refuse_unsettled(led, head, statuses=UNSETTLED):
 
 
 def last(led):
-    return (reached(led) or [None])[-1]
+    """The last review on the PR that holds findings; an answer record only publishes answers to its findings."""
+    return ([r for r in reached(led) if r.get('mode') != 'discussion'] or [None])[-1]
+
+
+def findings_of(led, review):
+    """The findings whose answers a review publishes: an answer record's are the last review's."""
+    if review.get('mode') != 'discussion':
+        return review['findings']
+    rev = last(led)
+    if not rev or rev['head'] != review['head'] or review.get('origin') not in (None, rev['draft']['digest']):
+        raise Unusable(f"the answers for {review['head']} belong to a review that is not on the PR yet: settle it first")
+    return rev['findings']
 
 
 def cut(text):
@@ -154,9 +175,11 @@ def thread_context(d, root, snapshots):
 
 def show(led, finding=None, draft=False):
     if draft:
-        if not led['reviews']:
+        # An answer record has no draft of its own to show.
+        revs = [r for r in led['reviews'] if r.get('mode') != 'discussion']
+        if not revs:
             raise Unusable('no review on the ledger')
-        rev = led['reviews'][-1]
+        rev = revs[-1]
         return {'head': rev['head'], 'status': rev['status'], 'draft': rev['draft']}
     rev = last(led)
     if finding:
@@ -171,15 +194,14 @@ def show(led, finding=None, draft=False):
     answers = [{'findingId': f['id'], 'commentId': f.get('commentId'), 'state': d['state'], 'resolve': d['answer']['resolve'],
                 'body': d['answer']['body'], 'reason': d.get('reason'),
                 **thread_context(d, f.get('commentId'), snapshots)}
-               for f in rev.get('findings', []) for d in f.get('disputes', [])[-1:]
-               if d.get('answer') and not (d['answer'].get('receipt') or {}).get('verified')]
+               for f, d in open_disputes(rev.get('findings', []), rev['head'])]
     return {
         'reviews': len(led['reviews']),
         'last': {k: rev.get(k) for k in ('head', 'mergeBase', 'mode', 'status', 'reviewedAt')} | {'event': rev['verdict']['event']},
         'answers': answers,
         'open': [{'id': f['id'], 'status': f['status'], 'file': f['file'], 'line': f['line'], 'severity': f.get('severity'),
-                  'claim': cut(f['why']), 'commentId': f.get('commentId')}
-                 for f in rev.get('findings', []) if f['status'] in OPEN],
+                  'claim': cut(f['why']), 'commentId': f.get('commentId'), 'resolveDeferred': f.get('resolveDeferred')}
+                 for f in rev.get('findings', []) if f['status'] in OPEN or f.get('resolveDeferred')],
     }
 
 
@@ -219,7 +241,11 @@ def number(led, result):
         if f.get('id'):
             if f['id'] not in prior:
                 raise Unusable(f"the output carries {f['id']}, which is not on the ledger")
-            f = {**prior[f['id']], **f, 'disputes': prior[f['id']].get('disputes', []) + f.get('disputes', [])}
+            f = hold_withdrawal({**prior[f['id']], **f, 'disputes': prior[f['id']].get('disputes', []) + f.get('disputes', [])},
+                                prior[f['id']]['status'])
+            if f['status'] in OPEN:
+                # Standing again: its thread stays open, so no resolve is due.
+                f.pop('resolveDeferred', None)
         else:
             k += 1
             f = {**f, 'id': f"pr{led['pr']}-f{k}"}
@@ -228,15 +254,13 @@ def number(led, result):
 
 
 def answered_ids(led):
-    """Our replies that a verified receipt records: the only comments of ours that settle pushback."""
+    """Our replies a receipt records as published, the human's edits of them included: the only comments of ours
+    that settle pushback."""
     ids = set()
     for r in led['reviews']:
-        ids |= {x.get('replyId') for x in (r.get('receipts') or {}).get('replies') or [] if x.get('verified')}
-        for f in r['findings']:
-            for d in f.get('disputes') or []:
-                rc = (d.get('answer') or {}).get('receipt') or {}
-                if rc.get('verified'):
-                    ids.add(rc.get('replyId'))
+        rec = r.get('receipts') or {}
+        ids |= {x.get('replyId') for x in rec.get('replies') or [] if x.get('verified')}
+        ids |= {x.get('replyId') for x in rec.get('staged') or [] if x.get('state') in ('published', 'edited', 'landed')}
     ids.discard(None)
     return ids
 
@@ -276,19 +300,56 @@ def disputes(led, snapshot, head):
     return out
 
 
+def answer_record(led, head, answers, origin=None):
+    """Append the record that publishes `answers` ((finding id, answer digest) pairs) to the findings of the last
+    review of `head`; `origin` names the draft digest of the review they came with."""
+    draft = {'event': None, 'body': '', 'comments': [], 'replies': []}
+    draft['digest'] = digest({'head': head, 'origin': origin, 'answers': answers})
+    led['reviews'].append({'mode': 'discussion', 'head': head, 'origin': origin, 'status': 'pending', 'findings': [],
+                           'draft': draft, 'receipts': {}, 'verdict': {'event': None, 'reasons': []},
+                           'reviewedAt': now()})
+
+
+def open_disputes(findings, head=None):
+    """(finding, dispute) for each finding whose last dispute holds an answer not yet published or settled, judged
+    on `head` when named: an answer to an earlier head is never published on a later one."""
+    return [(f, d) for f in findings for d in f.get('disputes', [])[-1:]
+            if d.get('answer') and not d['answer'].get('outcome') and head in (None, d.get('judgedHead'))]
+
+
+def hold_withdrawal(f, standing):
+    """A concession still to publish leaves its finding as it stood: the answer carries the withdrawal, which
+    post.py applies once the PR shows the concession as drafted."""
+    d = (f.get('disputes') or [None])[-1]
+    if f['status'] == 'withdrawn' and d and d.get('answer') and not d['answer'].get('outcome'):
+        d['answer']['status'] = 'withdrawn'
+        f['status'] = standing
+    return f
+
+
+def open_answers(findings):
+    return [(f['id'], d['answer']['digest']) for f, d in open_disputes(findings)]
+
+
 def merge_discussion(led, result):
     rev = last(led)
     if not rev or rev['head'] != result['head']:
         raise Unusable(f"a discussion result is for the last reviewed head, and {result['head']} is not it")
+    refuse_unsettled(led, result['head'], DRAFTS)
     by_id = {f['id']: f for f in rev['findings']}
     for f in result['findings']:
         old = by_id.get(f.get('id'))
         if old is None:
             raise Unusable(f"the discussion result names {f.get('id')}, not a finding of the last review")
+        standing = old['status']
         old.update({k: v for k, v in f.items() if k != 'disputes'})
         old['disputes'] = old.get('disputes', []) + f.get('disputes', [])
+        hold_withdrawal(old, standing)
+    answers = open_answers(by_id[f['id']] for f in result['findings'])
+    if answers:
+        answer_record(led, result['head'], answers)
     return {'saved': True, 'head': result['head'], 'mode': 'discussion', 'findings': len(result['findings']),
-            'answers': sum(bool(d.get('answer')) for f in result['findings'] for d in f.get('disputes', []))}
+            'answers': len(answers)}
 
 
 def with_answer_digests(result):
@@ -296,7 +357,7 @@ def with_answer_digests(result):
     for f in result['findings']:
         for d in f.get('disputes', []):
             if d.get('answer'):
-                d['answer'] = {**d['answer'], 'digest': digest(d['answer']['body']), 'receipt': None}
+                d['answer'] = {**d['answer'], 'digest': digest(d['answer']['body'])}
     return result
 
 
@@ -329,7 +390,7 @@ def save(led, result, reason):
     draft = anchor({**result['draft'], 'comments': comments}, result['mergeBase'], result['head'])
     draft['digest'] = digest({k: draft[k] for k in ('event', 'body', 'comments', 'replies')})
     review = {**result, 'findings': findings, 'draft': draft, 'status': 'pending', 'receipts': {},
-              'reason': reason, 'reviewedAt': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}
+              'reason': reason, 'reviewedAt': now()}
     led['reviews'].append(review)
     return {'saved': True, 'head': result['head'], 'draftDigest': draft['digest'], 'event': draft['event'],
             'inline': len(draft['comments']), 'moved': len(result['draft']['comments']) - len(draft['comments']),

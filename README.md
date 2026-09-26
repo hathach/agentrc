@@ -55,7 +55,7 @@ Agent collaboration and PRs:
 | [`simplify-gate`](skills/simplify-gate/SKILL.md) | switch the per-repository Codex YAGNI check at Stop (below) | `/simplify-gate status\|on\|off` |
 | [`pr-reply`](skills/pr-reply/SKILL.md) | post PR review replies from a manifest, read each back, resolve verified review threads | `reply.py --pr N --manifest f.json` |
 | [`pr-babysit`](skills/pr-babysit/SKILL.md) | the fact collectors the pr-babysit workflow runs before it commits a fix | `preflight.py --pr N`, `hooks.py <path>...` |
-| [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR: pin it, pick rig boards, run the pr-review workflow, post its verdict on approval; re-review after a push | `prepare.py --pr N` |
+| [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR: pin it, pick rig boards, run the pr-review workflow, leave it as a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's log, rerun its failed jobs once after an infra failure | `circleci.py log <job>`, `rerun <job>...` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
 
@@ -133,8 +133,8 @@ skill, which runs `claude -p --agent chief` and gives the caller chief's status
 lines while it runs and its report when it exits.
 
 For headless PR publishing, follow `agents/chief.md`'s Authorization exception
-before launching; a PR review posts under its own PR review exception, as
-`skills/pr-review/SKILL.md` asks it. Include the named PR, head repository and branch, expected
+before launching; a PR review submits under its own PR review exception, as
+`skills/pr-review/SKILL.md` asks it; its pending reviews need no exchange, under chief's standing exception. Include the named PR, head repository and branch, expected
 HEAD, worktree, task scope and the verbatim authorization exchange in the
 task, and, when a pr-babysit launch continues an earlier chief's run, that
 run's last reported `stateRef`. Leave the checkout to chief until it exits. Each new chief invocation

@@ -188,6 +188,27 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.deepEqual(fixed.result.draft.replies.map(r => [r.commentId, r.body]), [[901, 'Fixed in bbbbbbbbbbbb.'], [902, 'Fixed in bbbbbbbbbbbb.']])
   assert.equal(fixed.result.verdict.event, 'APPROVE')
   assert.match(fixed.result.draft.body, /the changes since cccccccccccc/)
+  assert.deepEqual(fixed.result.draft.resolves, [])
+  const deferred = { reviews: 1, open: [{ ...ledger.open[0], status: 'fixed', resolveDeferred: { commentId: 901, head: OLD, why: 'moved' } }, ledger.open[1]] }
+  const again = await run(inc, { ledger: deferred, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
+  assert.deepEqual(again.result.draft.replies.map(r => r.commentId), [902], 'a deferred resolve already has its fix note')
+  assert.deepEqual(again.result.draft.resolves, [{ findingId: 'pr7-f1', commentId: 901 }])
+  assert.match(again.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /judge that text, not the draft/)
+  const reopened = await run(inc, { ledger: deferred, recheck: () => ({ state: 'open', reason: 'back' }), check: pinned(inc) })
+  assert.deepEqual(reopened.result.draft.resolves, [], 'standing again: nothing to resolve')
+  const noted = { reviews: 1, open: [{ ...deferred.open[0], resolveDeferred: { ...deferred.open[0].resolveDeferred, replied: false } }] }
+  const renote = await run(inc, { ledger: noted, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
+  assert.deepEqual([renote.result.draft.replies.map(r => r.commentId), renote.result.draft.resolves], [[901], []],
+    'a deleted fix note is drafted again; the thread resolves once that one is published')
+  const unsent = { reviews: 1, open: [{ ...noted.open[0], resolveDeferred: { ...noted.open[0].resolveDeferred, note: 'Fixed in 0123456789ab.' } }] }
+  const same = await run(inc, { ledger: unsent, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
+  assert.deepEqual(same.result.draft.replies.map(r => r.body), ['Fixed in 0123456789ab.'], 'an unconfirmed note is drafted again word for word')
+  const unjudged = await run(inc, { ledger: deferred, recheck: () => null, check: pinned(inc) })
+  assert.deepEqual(unjudged.result.draft.resolves, [], 'no recheck on this head, no resolve')
+  const conceded = { reviews: 1, open: [{ ...deferred.open[0], status: 'withdrawn' }] }
+  const kept = await run(inc, { ledger: conceded, recheck: () => ({ state: 'withdrawn', reason: 'still wrong' }), check: pinned(inc) })
+  assert.match(kept.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /withdrawn if it was withdrawn earlier/)
+  assert.deepEqual(kept.result.draft.resolves, [{ findingId: 'pr7-f1', commentId: 901 }])
   const open = await run(inc, { ledger, check: pinned(inc), recheck: (p) => /pr7-f1/.test(p) ? { state: 'open', reason: 'still' } : { state: 'na', reason: 'gone' } })
   assert.equal(open.result.verdict.event, 'REQUEST_CHANGES')
   assert.deepEqual(open.result.findings.map(f => [f.id, f.severity]), [['pr7-f1', 'high'], ['pr7-f2', 'low']], 'the result keeps a carried severity')
@@ -238,12 +259,13 @@ test('upheld keeps its severity and leaves the thread open; disputed only blocks
   const blocker = await run(inc, { ...base, ledger: LEDGER, recheck: (p) => /pr7-f1/.test(p) ? { state: 'disputed', reason: 'x' } : { state: 'open', reason: 'y' },
     audit: audited(finding('independent overrun')) })
   assert.equal(blocker.result.verdict.event, 'REQUEST_CHANGES', 'an independent blocker still requests changes')
-  assert.match(blocker.result.draft.body, /Disputed, waiting for a maintainer and not counted as a blocker: `src\/core\/a\.c:10`\. The verdict rests on: `src\/core\/a\.c:10`\./)
+  assert.match(blocker.result.draft.body, /Blocking: `src\/core\/a\.c:10`; disputed, waiting for a maintainer: `src\/core\/a\.c:10`\./)
+  assert.doesNotMatch(blocker.result.draft.body, /Verdict/, 'the human picks the event: the body proposes none')
   assert.doesNotMatch(upheld.result.draft.body, /Disputed/, 'no dispute, no label')
   const bodyClaim = { claims: [{ commentId: 56, threadId: null, author: 'greptile[bot]', bot: true, path: null, line: null, claim: 'race' }] }
   const pathless = await run(inc, { ...base, recheck: () => ({ state: 'disputed', reason: 'x' }), claims: bodyClaim,
     judge: () => ({ verdict: 'confirmed', severity: 'high', reason: 'yes' }) })
-  assert.match(pathless.result.draft.body, /The verdict rests on: @greptile\[bot\]'s comment\./, 'a claim with no path is named by its author')
+  assert.match(pathless.result.draft.body, /Blocking: @greptile\[bot\]'s comment; disputed/, 'a claim with no path is named by its author')
   const dead = await run(inc, { ...base, recheck: () => null })
   assert.equal(dead.result.findings[0].disputes, undefined)
   assert.deepEqual(dead.result.coverage.unjudged, [{ kind: 'recheck', id: 'pr7-f1' }])

@@ -177,6 +177,9 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   babysit it through `pr-babysit` with `autoPush: true`. Before asking, read
   and follow `~/code/agentrc/README.md`'s headless PR publishing recipe and
   `~/code/agentrc/agents/chief.md`'s Authorization exception.
+- Standing grant: on a PR I asked `pr-review` to review, its `post.py` may
+  create a pending review and later resolve our own threads whose reply I
+  submitted; submitting any review stays mine.
 
 # Follow-ups
 - Separate scope gets a separate PR/session. Where the repo has an issue

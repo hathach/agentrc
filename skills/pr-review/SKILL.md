@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Review a pull request, mostly another contributor's - pin its head, ask which test-rig boards to validate on, run the pr-review workflow (code-audit over the change, earlier findings and pushback rechecked, open threads judged, a fixed verdict rule), keep the result in a per-PR ledger, and post the review on approval or under auto-post; a later launch reviews only the new push. Use for "review PR N", a re-review after a contributor pushes, or replies to our review comments.
+description: Review a pull request, mostly another contributor's - pin its head, ask which test-rig boards to validate on, run the pr-review workflow (code-audit over the change, earlier findings and pushback rechecked, open threads judged, a fixed verdict rule), keep the result in a per-PR ledger, and publish it as a pending GitHub review the human finishes, or submit it under auto-post; a later launch reviews only the new push. Use for "review PR N", a re-review after a contributor pushes, or replies to our review comments.
 ---
 
 # pr-review
@@ -17,18 +17,21 @@ S=~/.claude/skills/pr-review/scripts
 python3 $S/prepare.py --pr N [--repo O/R] [--full]            # primary checkout top level: pin, worktree, mode
 python3 $S/prepare.py --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 $S/threads.py --pr N --out FILE                         # every comment and thread, bodies in FILE
-python3 $S/ledger.py show --pr N [--finding ID] [--draft]       # standing findings, unposted answers; --draft: the saved review
+python3 $S/ledger.py show --pr N [--finding ID] [--draft]       # standing findings, unpublished answers; --draft: the saved review
 python3 $S/ledger.py disputes --pr N --threads FILE --head SHA  # replies on our threads still to judge
 python3 $S/ledger.py save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
-python3 $S/post.py --pr N --expected-head SHA [--event COMMENT] [--review-only] [--auto]
-python3 $S/post.py --pr N --expected-head SHA --threads --approve ID[,ID]
+python3 $S/post.py --pr N --expected-head SHA [--auto]         # a pending GitHub review; --auto: submit it
 python3 $S/post.py --pr N --expected-head SHA --decline --reason TEXT
+python3 $S/post.py --pr N --sync                                # record what the human did on GitHub (prepare runs it)
 python3 $S/result.py --output FILE                              # a launch, condensed: counts, never bodies
 ```
 
 ## 1. Pin
 
-Run `prepare.py` from the repository's primary checkout. It makes
+Run `prepare.py` from the repository's primary checkout. It first records what
+the human did with our pending reviews on GitHub, and refuses while one is
+still pending or a post was never confirmed: finish or delete the pending
+review on the PR, or reconcile what it names. It makes
 `.worktrees/pr-review-<N>` on branch `pr-review-<N>` at the PR head and picks
 the mode: `full` on a first review or after a force-push or rebase,
 `incremental` when the last reviewed head is an ancestor, `same` when this
@@ -71,17 +74,23 @@ included, never a default.
 
 ## 3. Ask how to publish
 
-Ask mode (the default): nothing is posted until the human sees the draft.
-Auto-post: the review is posted without a second question, as `COMMENT` or
+Pending (the default): the draft becomes a pending review on the PR under the
+human's account: body, inline comments, fix notes and thread answers, no
+event. Only the human sees it until they submit it on GitHub, choosing the
+event (the proposed one is in chief's report); deleting a comment or reply
+first declines it. Creating it, and later resolving the threads whose reply
+the human submitted, is the standing grant in the user's instructions: no
+question is asked, and nothing is ever submitted for them.
+Auto-post: the review is submitted without a question, as `COMMENT` or
 `REQUEST_CHANGES`, never `APPROVE`, with fix notes and resolves on our own
 threads whose fix a recheck verified. Answers to pushback (a concession or a
-rebuttal) are never auto-posted. Pushback is a human's reply on one of our
-threads; a bot's reply there is not judged. For a headless chief, auto-post
-needs the exchange `agents/chief.md` names under its PR review exception: ask
-it with the repository, the PR URL, the head repository and branch, the
-expected head and exactly those actions, and pass the question and the answer
-verbatim. A new chief needs a new exchange, a relaunch after stopping at a
-question included.
+rebuttal) are never submitted: they go into a pending review for the human.
+Pushback is a human's reply on one of our threads; a bot's reply there is not
+judged. For a headless chief, auto-post needs the exchange `agents/chief.md`
+names under its PR review exception: ask it with the repository, the PR URL,
+the head repository and branch, the expected head and exactly those actions,
+and pass the question and the answer verbatim. A new chief needs a new
+exchange, a relaunch after stopping at a question included.
 
 ## 4. Launch
 
@@ -106,25 +115,26 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
    comes from the project's instruction file when it names review dimensions.
 4. `result.py --output <the launch's output file>`, then `ledger.py save
    --output <it>`. A `blocked` or `nothing-new` result saves nothing.
-5. Auto-post: one unit runs `post.py --auto`. Ask mode, and every discussion
-   run: stop there; pushback answers go back to the launcher, never under the
-   auto-post grant.
+5. One unit runs `post.py` (pending) or `post.py --auto` (auto-post) with
+   `--expected-head`. Its exit 1 names what it could not confirm.
 6. Report the verdict and its reasons, the counts, coverage lost, the CI and
    HIL rows, and the receipts; never the draft's text.
 
 ## 5. After the launch
 
-Read chief's report. In ask mode, show `ledger.py show --draft`: the event, the
-body and each inline comment; then `ledger.py show`'s unposted thread answers,
-each beside the replies it answers, the recheck's reason and the thread's link.
-A discussion run has only the answers: skip `--draft` and the next question,
-and ask only the multi-select below. Ask once: post as proposed / post as
-`COMMENT` (`--event COMMENT`) / post the review without the fix notes
-(`--review-only`) / do not post (`--decline --reason`). Thread answers are a
-separate multi-select, one per answer; run `post.py --threads --approve
-<finding ids>` for those chosen. `post.py` reports `uncertain` when it cannot
-prove what landed: it never sends again blind, and the next run finds its
-marker; reconcile by hand what it names.
+Read chief's report and tell the human: the PR link, the proposed event and
+its reasons, and that a pending review waits for them there, with its thread
+answers beside the replies they answer (`ledger.py show` lists each with the
+recheck's reason and the thread's link). They edit, delete or add, pick the
+event and submit, or delete the whole review. The next `prepare.py` records
+the outcome: a deleted comment drops its finding; an edited one stands, and
+its next recheck reads the text published; a concession withdraws its finding
+only when submitted as drafted; the threads of published concessions and fix
+notes are resolved unless the head moved or someone replied since, in which
+case the next review rechecks them first (`post.py`'s docstring has the
+rules). `post.py` reports `uncertain` or `partial` when it cannot prove what landed:
+it never sends again blind, and the next run looks for it; reconcile by hand
+what it names.
 
 A later push is a new `/pr-review N`: prepare picks the mode and the ledger
 carries the earlier findings, replies and receipts.
@@ -140,6 +150,6 @@ carries the earlier findings, replies and receipts.
   names it apart from the findings the verdict rests on;
   approval needs nothing open above a nit, no finding under dispute, every
   scan and verifier accounted for, green CI and hardware covered when the
-  change touches it. The human may post a weaker event; post.py offers no
-  stronger one.
+  change touches it. On a pending review the human picks the event; auto-post
+  never approves.
 - Review comments carry no footer or attribution.
