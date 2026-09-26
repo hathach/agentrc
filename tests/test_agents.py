@@ -193,6 +193,15 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(phrase, exception)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
 
+    def test_chief_verifies_a_round_in_one_batch_and_reviews_each_handed_on_head_once(self):
+        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
+        for phrase in ('in one dispatch per review round that names each finding by a stable id with the reviewed SHA',
+                       'leaves that finding unresolved, never refuted', 'a refutation stands for the same claim on unchanged code',
+                       'checked by one `finding-verifier` dispatch asking whether its diff addresses each finding, not by a new review',
+                       'the whole-diff review runs once on each HEAD to be adopted or accepted',
+                       'Findings routed to `finding-verifier` from any review are sent in one batch per review round'):
+            self.assertIn(phrase, chief)
+
     def test_hardware_is_task_scope_not_a_grant(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())
         self.assertIn('Hardware work needs task scope, not a human grant or verbatim authorization exchange; a human or agent launcher may supply that scope.', chief)
