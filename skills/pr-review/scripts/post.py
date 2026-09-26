@@ -42,11 +42,12 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from ledger import after_ours, answered_ids, reached, digest as ledger_digest, ledger_path, load, locked, repo_of, store  # noqa: E402
+from ledger import answered_ids, pushback, reached, digest as ledger_digest, ledger_path, load, locked, repo_of, store  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, attempt  # noqa: E402
 from harvest import digest, gh_json, pages  # noqa: E402
+from threads import record  # noqa: E402
 from state_transfer import fnv1a  # noqa: E402
 
 REPLY = Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts' / 'reply.py'
@@ -154,19 +155,20 @@ def answered(a):
 
 
 def live_thread(comments, root):
-    return sorted((c for c in comments if c.get('in_reply_to_id') == root), key=lambda c: (c.get('created_at') or '', c['id']))
+    """The replies to root, oldest first, as threads.py records them, so ledger.pushback applies unchanged."""
+    return [record('review', c) for c in sorted((c for c in comments if c.get('in_reply_to_id') == root),
+                                                key=lambda c: (c.get('created_at') or '', c['id']))]
 
 
 def live_key(thread, login, known):
     """The pushback in the thread, keyed as ledger.py disputes keys it."""
-    replies = after_ours(thread, lambda c: c['id'] in known, lambda c: (c.get('user') or {}).get('login') == login)
-    return ledger_digest([[c['id'], digest(c.get('body'))] for c in replies])
+    return ledger_digest([[c['id'], c['digest']] for c in pushback(thread, known, login)])
 
 
 def reconcile(repo, pr, root, mine, thread, a, login):
     """Settle an answer of ours already in the thread; never posts."""
     rc = {'sent': True, 'posted': True, 'verified': True, 'replyId': mine['id'], 'resolved': None, 'error': None}
-    later = [c for c in thread[thread.index(mine) + 1:] if (c.get('user') or {}).get('login') != login]
+    later = pushback(thread[thread.index(mine) + 1:], set(), login)
     if not a['resolve']:
         return rc
     if later:
@@ -213,7 +215,7 @@ def post_answers(repo, pr, led, head, approve, persist):
         # Only a reply after the pushback it answers can be this answer; an older identical one is not.
         judged = {r['id'] for r in d['replies']}
         start = max((k + 1 for k, c in enumerate(thread) if c['id'] in judged), default=len(thread))
-        visible = [c for c in thread[start:] if (c.get('user') or {}).get('login') == login and c.get('body') == a['body']]
+        visible = [c for c in thread[start:] if c['author'] == login and c['body'] == a['body']]
         if f.get('commentId') not in own:
             a['receipt'] = {'sent': False, 'verified': None, 'error': 'not a comment our reviews posted; not answered'}
         elif visible:

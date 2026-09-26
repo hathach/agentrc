@@ -552,9 +552,9 @@ class Pushback(PostCase):
 
     def snapshot(self, *thread):
         """thread: (id, author, body, bot) after our root comment."""
-        comments = [{'id': self.root, 'author': ME, 'bot': False, 'digest': 'r0', 'body': 'root'}]
+        comments = [{'id': self.root, 'author': ME, 'bot': False, 'digest': 'r0', 'body': 'root', 'url': 'https://x/r0'}]
         comments += [{'id': i, 'author': who, 'bot': bot, 'digest': harvest.digest(body), 'body': body} for i, who, body, bot in thread]
-        f = self.tmp / 'threads.json'
+        f = Path(self.p['facts']).parent / f'threads-{self.head}.json'
         f.write_text(json.dumps({'pr': PR, 'viewer': ME, 'comments': comments,
                                  'threads': [{'threadId': 'T', 'resolved': False, 'outdated': False, 'commentIds': [c['id'] for c in comments]}]}))
         return f
@@ -563,15 +563,17 @@ class Pushback(PostCase):
         return self.call(ledger, ['disputes', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head])['disputes']
 
     def discuss(self, state, answer=None, key=None):
-        d = self.disputes(self.snapshot((950, 'contrib', 'intentional', False)))[0]
-        rec = {'key': key or d['key'], 'replies': d['replies'], 'judgedHead': self.head, 'state': state, 'reason': 'r',
+        snap = self.snapshot((950, 'contrib', 'intentional', False))
+        d = self.disputes(snap)[0]
+        rec = {'key': key or d['key'], 'replies': d['replies'], 'judgedHead': self.head, 'threadsFile': str(snap), 'state': state, 'reason': 'r',
                **({'answer': answer} if answer else {})}
         return self.save(self.result_for(self.p, mode='discussion', findings=[{'id': 'pr7-f1', 'status': state, 'disputes': [rec]}]))
 
-    def test_replies_after_our_last_comment_are_pushback_bots_included_ours_excluded(self):
+    def test_replies_after_our_last_comment_are_pushback_ours_and_bots_excluded(self):
         self.assertEqual(self.disputes(self.snapshot()), [])
+        self.assertEqual(self.disputes(self.snapshot((951, 'coderabbitai[bot]', 'agree', True))), [], 'a bot reply is not pushback')
         got = self.disputes(self.snapshot((950, 'contrib', 'intentional', False), (951, 'coderabbitai[bot]', 'agree', True)))
-        self.assertEqual([r['id'] for r in got[0]['replies']], [950, 951])
+        self.assertEqual([r['id'] for r in got[0]['replies']], [950])
         self.assertEqual((got[0]['findingId'], got[0]['rootCommentId']), ('pr7-f1', self.root))
         chat = self.disputes(self.snapshot((950, 'contrib', 'intentional', False), (960, ME, 'thanks', False)))
         self.assertEqual([r['id'] for r in chat[0]['replies']], [950], 'a comment of ours no receipt verified settles nothing')
@@ -587,7 +589,12 @@ class Pushback(PostCase):
         self.assertEqual(f['disputes'][0]['answer']['digest'], ledger.digest('Agreed, withdrawing.'))
         self.assertEqual(self.disputes(self.snapshot((950, 'contrib', 'intentional', False))), [])
         shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
-        self.assertEqual(shown['answers'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'state': 'withdrawn', 'resolve': True, 'body': 'Agreed, withdrawing.'}])
+        self.assertEqual(shown['answers'], [{'findingId': 'pr7-f1', 'commentId': self.root, 'state': 'withdrawn', 'resolve': True,
+                                             'body': 'Agreed, withdrawing.', 'reason': 'r', 'url': 'https://x/r0',
+                                             'replies': [{'author': 'contrib', 'excerpt': 'intentional'}]}])
+        self.snapshot((950, 'contrib', 'the opposite claim', False))
+        shown = self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
+        self.assertEqual(shown['answers'][0]['replies'], [{'author': 'contrib', 'excerpt': None}], 'an edited reply is not the one judged')
 
     def test_a_verified_answer_settles_the_pushback_before_it(self):
         self.discuss('upheld', {'body': 'Still stands.', 'resolve': False})
@@ -695,6 +702,12 @@ class Pushback(PostCase):
         self.assertEqual((calls, out['answers'][0]['error']), ([], 'sent earlier and not visible yet; reconcile by hand'))
         self.gh.inline.append({'id': 961, 'in_reply_to_id': self.root, 'body': 'Still stands.', 'user': {'login': ME}, 'created_at': '2'})
         self.assertEqual(self.post('--threads', '--approve', 'pr7-f1')['status'], 'posted', 'visible now: reply.py reuses it')
+
+    def test_a_bot_reply_after_the_judgment_leaves_the_answer_current(self):
+        self.discuss('upheld', {'body': 'Still stands: line 12.', 'resolve': False})
+        self.gh.inline = [{'id': 950, 'in_reply_to_id': self.root, 'body': 'intentional', 'user': {'login': 'contrib'}, 'created_at': '1'},
+                          {'id': 955, 'in_reply_to_id': self.root, 'body': 'agree', 'user': {'login': 'coderabbitai[bot]', 'type': 'Bot'}, 'created_at': '2'}]
+        self.assertEqual(self.post('--threads', '--approve', 'pr7-f1')['status'], 'posted')
 
     def test_a_reply_after_the_judgment_makes_the_answer_stale(self):
         self.discuss('upheld', {'body': 'Still stands.', 'resolve': False})

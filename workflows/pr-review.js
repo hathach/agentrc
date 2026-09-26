@@ -99,7 +99,7 @@ if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return b
 if (!prior || prior.error) return blocked('ledger-failed', prior ? prior.error : 'the ledger relay died')
 const DISPUTES = { type: 'object', properties: { error: { type: 'string' }, disputes: { type: 'array', items: { type: 'object', required: ['findingId', 'key', 'replies'],
   properties: { findingId: { type: 'string' }, key: { type: 'string' }, rootCommentId: { type: 'integer' }, outdated: { type: 'boolean' },
-    replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' }, bot: { type: 'boolean' } } } } } } } } }
+    replies: { type: 'array', items: { type: 'object', properties: { id: { type: 'integer' }, digest: { type: 'string' }, author: { type: 'string' } } } } } } } } }
 const pushback = await relay('disputes', 'Context', `python3 ${S}/ledger.py disputes --pr ${pr} --repo ${repo} --threads '${threadsFile}' --head ${head}`, DISPUTES)
 if (!pushback || pushback.error || !Array.isArray(pushback.disputes)) return blocked('disputes-failed', pushback ? pushback.error : 'the disputes relay died')
 const disputeOf = Object.fromEntries(pushback.disputes.map(d => [d.findingId, d]))
@@ -186,12 +186,12 @@ const answerOf = (f, v) => {
 // A dead verifier records no dispute, so the same replies are judged on the next run.
 const carriedOut = carried.map((f, i) => {
   const v = rechecked[i]
-  const base = { id: f.id, severity: sev(f.severity) }
+  const base = { id: f.id, severity: sev(f.severity), file: f.file, line: f.line }
   if (!v) return { ...base, status: f.status || 'open', recheckReason: 'unjudged' }
   const d = disputeOf[f.id]
   const out = { ...base, status: statusOf(f, v), recheckReason: v.reason }
   if (d && ['withdrawn', 'upheld', 'disputed', 'fixed', 'na'].includes(v.state)) {
-    out.disputes = [{ key: d.key, replies: d.replies, judgedHead: head, state: v.state, reason: v.reason,
+    out.disputes = [{ key: d.key, replies: d.replies, judgedHead: head, threadsFile, state: v.state, reason: v.reason,
       ...(['withdrawn', 'upheld'].includes(v.state) ? { answer: answerOf(f, v) } : {}) }]
   }
   return out
@@ -200,14 +200,18 @@ const carriedOut = carried.map((f, i) => {
 // The verdict is this rule, not a model's judgment.
 const BLOCKING = ['critical', 'high']
 const MINOR = ['nit']
+const where = (file, line) => `\`${file}${line ? `:${line}` : ''}\``
 // A covered finding is its thread's confirmed claim: counted once, as the claim.
-const openFindings = [...ours.filter(f => f.status === 'open').map(f => f.severity),
-  ...carriedOut.filter(f => ['open', 'upheld'].includes(f.status)).map(f => f.severity), ...confirmedClaims.map(c => c.severity)]
+const openFindings = [...ours.filter(f => f.status === 'open'), ...carriedOut.filter(f => ['open', 'upheld'].includes(f.status))]
+  .map(f => ({ severity: f.severity, at: where(f.file, f.line) }))
+  .concat(confirmedClaims.map(c => ({ severity: c.severity, at: c.path ? where(c.path, c.line) : `@${c.author}'s comment` })))
+const blocking = openFindings.filter(o => BLOCKING.includes(o.severity))
 // A disputed finding waits for a maintainer: it never requests changes, and it keeps approval off.
-const disputed = carriedOut.filter(f => f.status === 'disputed').length
+const disputedAt = carriedOut.filter(f => f.status === 'disputed').map(f => where(f.file, f.line))
+const disputed = disputedAt.length
 const lost = audit.dropped.length + audit.unverified.length + unjudged.length
 const reasons = []
-const blockers = openFindings.filter(s => BLOCKING.includes(s)).length
+const blockers = blocking.length
 const regressions = hil.choice === 'boards' ? hil.boards.filter(b => b.regression === 'verified') : []
 let event
 if (blockers || regressions.length) {
@@ -215,7 +219,7 @@ if (blockers || regressions.length) {
   if (blockers) reasons.push(`${blockers} blocking finding(s) open`)
   if (regressions.length) reasons.push(`verified HIL regression on ${regressions.map(b => b.board).join(', ')}`)
 } else {
-  const nonMinor = openFindings.filter(s => !MINOR.includes(s)).length
+  const nonMinor = openFindings.filter(o => !MINOR.includes(o.severity)).length
   const hilOk = hil.choice === 'boards' ? hil.boards.every(b => b.verdict === 'pass') : !args.hardwareRelevant
   if (nonMinor) reasons.push(`${nonMinor} open finding(s) above nit`)
   if (disputed) reasons.push(`${disputed} finding(s) disputed, waiting for a maintainer`)
@@ -268,7 +272,12 @@ lines.push(`Reviewed ${args.mode === 'incremental' ? `the changes since ${scopeB
   `${ours.length} new finding(s)${ours.length ? ` (${tally(ours, 'status')})` : ''}` +
   `${carried.length ? `; earlier findings: ${tally(carriedOut, 'status')}` : ''}` +
   `${claimsOut.length ? `; open thread claims: ${tally(claimsOut, 'verdict')}` : ''}.`)
-if (confirmedClaims.length) lines.push('', 'Confirmed from existing threads:', ...confirmedClaims.map(c => `- @${c.author}${c.path ? ` on \`${c.path}${c.line ? `:${c.line}` : ''}\`` : ''}: ${c.claim}`))
+// A dispute is named apart from the blockers, so the contributor sees it is not part of the request.
+if (disputed) {
+  lines.push('', `Disputed, waiting for a maintainer and not counted as a blocker: ${disputedAt.join(', ')}.` +
+    (blocking.length ? ` The verdict rests on: ${blocking.map(o => o.at).join(', ')}.` : ''))
+}
+if (confirmedClaims.length) lines.push('', 'Confirmed from existing threads:', ...confirmedClaims.map(c => `- @${c.author}${c.path ? ` on ${where(c.path, c.line)}` : ''}: ${c.claim}`))
 lines.push('', `CI: ${ci.state}.`)
 if (hil.choice === 'boards') lines.push('', row(['Board', 'HIL', 'Regression']), row(['---', '---', '---']), ...hil.boards.map(b => row([b.board, b.verdict, b.regression])))
 else lines.push('', 'Hardware: not run.')

@@ -75,11 +75,13 @@ Ask mode (the default): nothing is posted until the human sees the draft.
 Auto-post: the review is posted without a second question, as `COMMENT` or
 `REQUEST_CHANGES`, never `APPROVE`, with fix notes and resolves on our own
 threads whose fix a recheck verified. Answers to pushback (a concession or a
-rebuttal) are never auto-posted. For a headless chief, auto-post needs the
-exchange `agents/chief.md` names under its PR review exception: ask it with
-the repository, the PR URL, the head repository and branch, the expected head
-and exactly those actions, and pass the question and the answer verbatim. A new
-chief needs a new exchange, a relaunch after stopping at a question included.
+rebuttal) are never auto-posted. Pushback is a human's reply on one of our
+threads; a bot's reply there is not judged. For a headless chief, auto-post
+needs the exchange `agents/chief.md` names under its PR review exception: ask
+it with the repository, the PR URL, the head repository and branch, the
+expected head and exactly those actions, and pass the question and the answer
+verbatim. A new chief needs a new exchange, a relaunch after stopping at a
+question included.
 
 ## 4. Launch
 
@@ -112,16 +114,17 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
 
 ## 5. After the launch
 
-Read chief's report. In ask mode, show `ledger.py show --draft`: the event,
-the body and each inline comment; then `ledger.py show`'s unposted thread
-answers. A discussion run has only the answers: skip `--draft` and the next
-question, and ask only the multi-select below. Ask
-once: post as proposed / post as `COMMENT` (`--event COMMENT`) / post the
-review without the fix notes (`--review-only`) / do not post (`--decline
---reason`). Thread answers are a separate multi-select, one per answer; run
-`post.py --threads --approve <finding ids>` for those chosen. `post.py`
-reports `uncertain` when it cannot prove what landed: it never sends again
-blind, and the next run finds its marker; reconcile by hand what it names.
+Read chief's report. In ask mode, show `ledger.py show --draft`: the event, the
+body and each inline comment; then `ledger.py show`'s unposted thread answers,
+each beside the replies it answers, the recheck's reason and the thread's link.
+A discussion run has only the answers: skip `--draft` and the next question,
+and ask only the multi-select below. Ask once: post as proposed / post as
+`COMMENT` (`--event COMMENT`) / post the review without the fix notes
+(`--review-only`) / do not post (`--decline --reason`). Thread answers are a
+separate multi-select, one per answer; run `post.py --threads --approve
+<finding ids>` for those chosen. `post.py` reports `uncertain` when it cannot
+prove what landed: it never sends again blind, and the next run finds its
+marker; reconcile by hand what it names.
 
 A later push is a new `/pr-review N`: prepare picks the mode and the ledger
 carries the earlier findings, replies and receipts.
@@ -133,7 +136,8 @@ carries the earlier findings, replies and receipts.
 - The verdict is the workflow's rule, not a model's: blocking findings
   (critical or high, code-verifier's major counting as high, including
   earlier ones still standing and confirmed thread claims) or a verified HIL
-  regression request changes;
+  regression request changes. A disputed finding never blocks, and the body
+  names it apart from the findings the verdict rests on;
   approval needs nothing open above a nit, no finding under dispute, every
   scan and verifier accounted for, green CI and hardware covered when the
   change touches it. The human may post a weaker event; post.py offers no

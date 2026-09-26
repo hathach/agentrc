@@ -207,7 +207,7 @@ test('args that differ from the pins prepare recorded for this head are blocked 
 
 const LEDGER = { reviews: 1, open: [{ id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 },
   { id: 'pr7-f2', status: 'open', file: 'src/core/a.c', line: 30, severity: 'medium', commentId: 902 }] }
-const DISPUTE = { findingId: 'pr7-f1', key: 'k1', rootCommentId: 901, outdated: false, replies: [{ id: 950, digest: 'd', author: 'contrib', bot: false }] }
+const DISPUTE = { findingId: 'pr7-f1', key: 'k1', rootCommentId: 901, outdated: false, replies: [{ id: 950, digest: 'd', author: 'contrib' }] }
 
 test('pushback on our thread is judged with the replies as evidence and answered as a draft', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
@@ -219,7 +219,7 @@ test('pushback on our thread is judged with the replies as evidence and answered
   assert.doesNotMatch(calls.find(c => c.label === 'recheck:pr7-f2').prompt, /drew replies/)
   const f1 = result.findings.find(f => f.id === 'pr7-f1')
   assert.equal(f1.status, 'withdrawn')
-  assert.deepEqual(f1.disputes, [{ key: 'k1', replies: DISPUTE.replies, judgedHead: H, state: 'withdrawn', reason: 'the IRQ is masked by the caller',
+  assert.deepEqual(f1.disputes, [{ key: 'k1', replies: DISPUTE.replies, judgedHead: H, threadsFile: `${BASE.factsDir}/threads-${H}.json`, state: 'withdrawn', reason: 'the IRQ is masked by the caller',
     answer: { body: 'Agreed, the caller masks the IRQ first.', resolve: true } }])
   assert.deepEqual(result.draft.replies, [], 'a concession is a thread answer awaiting approval, not an auto-granted fix note')
   assert.equal(result.verdict.event, 'COMMENT', 'withdrawn drops the high finding; the medium one still caps')
@@ -238,6 +238,12 @@ test('upheld keeps its severity and leaves the thread open; disputed only blocks
   const blocker = await run(inc, { ...base, ledger: LEDGER, recheck: (p) => /pr7-f1/.test(p) ? { state: 'disputed', reason: 'x' } : { state: 'open', reason: 'y' },
     audit: audited(finding('independent overrun')) })
   assert.equal(blocker.result.verdict.event, 'REQUEST_CHANGES', 'an independent blocker still requests changes')
+  assert.match(blocker.result.draft.body, /Disputed, waiting for a maintainer and not counted as a blocker: `src\/core\/a\.c:10`\. The verdict rests on: `src\/core\/a\.c:10`\./)
+  assert.doesNotMatch(upheld.result.draft.body, /Disputed/, 'no dispute, no label')
+  const bodyClaim = { claims: [{ commentId: 56, threadId: null, author: 'greptile[bot]', bot: true, path: null, line: null, claim: 'race' }] }
+  const pathless = await run(inc, { ...base, recheck: () => ({ state: 'disputed', reason: 'x' }), claims: bodyClaim,
+    judge: () => ({ verdict: 'confirmed', severity: 'high', reason: 'yes' }) })
+  assert.match(pathless.result.draft.body, /The verdict rests on: @greptile\[bot\]'s comment\./, 'a claim with no path is named by its author')
   const dead = await run(inc, { ...base, recheck: () => null })
   assert.equal(dead.result.findings[0].disputes, undefined)
   assert.deepEqual(dead.result.coverage.unjudged, [{ kind: 'recheck', id: 'pr7-f1' }])

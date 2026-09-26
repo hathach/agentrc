@@ -12,15 +12,18 @@ post.py write it, under an exclusive lock, by write-then-rename.
 show prints the last review that reached the PR (posted or partial:
 head, mergeBase, verdict, status), its standing findings (open,
 upheld, disputed: id, file, line, severity, claim cut short) and the thread
-answers drafted and not yet posted; --finding prints one finding's whole
+answers drafted and not yet posted, each with the replies it answers (author,
+excerpt, from the threads snapshot it was judged on, null once edited), the
+recheck's reason and
+the thread's link; --finding prints one finding's whole
 record from those reviews; --draft prints the newest review's saved draft as it
 would be posted (event, body, anchored inline comments, fix notes), with its
 status and digest.
 
 disputes joins a threads.py snapshot to the findings whose inline comment our
 own verified review posted (commentId, recorded by post.py from its read-back):
-on each such thread, the replies by anyone but us after our last comment there
-are pushback to judge. Its key is the ordered reply ids and body digests; a key
+on each such thread, the replies by anyone but us or a bot after our last
+verified answer there are pushback to judge (pushback()). Its key is the ordered reply ids and body digests; a key
 already judged on this head is not listed again, and an edited reply is a new
 key. Only ids, digests and authors are printed, never bodies.
 
@@ -131,6 +134,24 @@ def cut(text):
     return text if len(text) <= CUT else text[:CUT] + '…'
 
 
+def thread_context(d, root, snapshots):
+    """What an answer replies to, from the threads snapshot it was judged on: authors, excerpts (null for a reply
+    gone or edited since) and the thread's link. `snapshots` caches each file's comments by path."""
+    path = d.get('threadsFile')
+    if path not in snapshots:
+        try:
+            snapshots[path] = {c['id']: c for c in json.loads(Path(path).read_text(encoding='utf-8')).get('comments', [])}
+        except (OSError, TypeError, ValueError):
+            snapshots[path] = None
+    by_id = snapshots[path]
+    if by_id is None:
+        return {'replies': None, 'url': None}
+    same = lambda r: r['id'] in by_id and by_id[r['id']]['digest'] == r['digest']  # noqa: E731
+    return {'replies': [{'author': r.get('author'), 'excerpt': cut(by_id[r['id']]['body']) if same(r) else None}
+                        for r in d.get('replies', [])],
+            'url': (by_id.get(root) or {}).get('url')}
+
+
 def show(led, finding=None, draft=False):
     if draft:
         if not led['reviews']:
@@ -146,8 +167,10 @@ def show(led, finding=None, draft=False):
         raise Unusable(f'no finding {finding} on the ledger')
     if not rev:
         return {'reviews': 0, 'last': None, 'open': []}
+    snapshots = {}
     answers = [{'findingId': f['id'], 'commentId': f.get('commentId'), 'state': d['state'], 'resolve': d['answer']['resolve'],
-                'body': d['answer']['body']}
+                'body': d['answer']['body'], 'reason': d.get('reason'),
+                **thread_context(d, f.get('commentId'), snapshots)}
                for f in rev.get('findings', []) for d in f.get('disputes', [])[-1:]
                if d.get('answer') and not (d['answer'].get('receipt') or {}).get('verified')]
     return {
@@ -218,10 +241,11 @@ def answered_ids(led):
     return ids
 
 
-def after_ours(replies, answered, mine):
-    """The replies to a thread's root after our last verified answer, ours excluded: the pushback still to answer."""
-    last = max((k for k, c in enumerate(replies) if answered(c)), default=-1)
-    return [c for c in replies[last + 1:] if not mine(c)]
+def pushback(replies, answered, viewer):
+    """threads.py records replying to a root, after our last verified answer (an id in `answered`), neither ours
+    nor a bot's: the pushback still to answer."""
+    last = max((k for k, c in enumerate(replies) if c['id'] in answered), default=-1)
+    return [c for c in replies[last + 1:] if c['author'] != viewer and not c['bot']]
 
 
 def disputes(led, snapshot, head):
@@ -240,7 +264,7 @@ def disputes(led, snapshot, head):
         if f['status'] not in OPEN or not t:
             continue
         thread = [by_id[i] for i in t['commentIds'] if i in by_id]
-        replies = after_ours(thread[1:], lambda c: c['id'] in known, lambda c: c['author'] == viewer)
+        replies = pushback(thread[1:], known, viewer)
         if not replies:
             continue
         key = digest([[c['id'], c['digest']] for c in replies])
@@ -248,7 +272,7 @@ def disputes(led, snapshot, head):
             continue
         out.append({'findingId': f['id'], 'threadId': t['threadId'], 'rootCommentId': f['commentId'], 'key': key,
                     'outdated': t['outdated'], 'resolved': t['resolved'],
-                    'replies': [{'id': c['id'], 'digest': c['digest'], 'author': c['author'], 'bot': c['bot']} for c in replies]})
+                    'replies': [{'id': c['id'], 'digest': c['digest'], 'author': c['author']} for c in replies]})
     return out
 
 
