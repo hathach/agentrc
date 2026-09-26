@@ -1,5 +1,6 @@
 """Tests for pr-babysit's build_compare.py against fake build commands in a temp repository."""
 import json
+import re
 import os
 import subprocess
 import sys
@@ -77,6 +78,15 @@ class BuildCompareTest(unittest.TestCase):
         code, out = self.run_script('base', '--rev', self.base, '--setup', 'test -d deps', '--command', 'touch built')
         self.assertEqual((code, out['setupExit'], out['exit']), (0, 1, None))
         self.assertTrue(out['cleanup']['ok'])
+
+    def test_a_setup_bash_cannot_parse_is_refused_before_anything_runs(self):
+        setup = 'null (see reason: dependency fetching is inline via the command\'s own --fetch-deps flag)'
+        code, out = self.run_script('base', '--rev', self.base, '--setup', setup, '--command', 'touch built')
+        self.assertEqual(code, 2)
+        # pr-babysit.js re-resolves the setup on exactly this prefix.
+        marker = re.search(r"const BAD_SETUP = '([^']+)'", (SCRIPT.parents[3] / 'workflows' / 'pr-babysit.js').read_text())[1]
+        self.assertTrue(out['error'].startswith(marker + ': '), out['error'])
+        self.assertEqual(self.git('worktree', 'list').count('\n'), 1)
 
     def test_a_retained_build_dir_is_reported(self):
         code, out = self.run_script('candidate', '--path=.', '--command', 'mkdir <BUILD>/ro && touch <BUILD>/ro/f && chmod 555 <BUILD>/ro')

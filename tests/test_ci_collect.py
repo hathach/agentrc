@@ -60,8 +60,8 @@ class InventoryTest(unittest.TestCase):
                           self.check('hil', 'fail', JOB.format(3)), self.check('docs', 'fail', RTD.format(9)),
                           self.check('lint', 'cancel', 'https://example.com/x')]]
         rc, r = self.main()
-        self.assertEqual((rc, r['status'], r['pending'], r['error']), (0, 'red', 0, None))
-        self.assertEqual(sorted(r), ['checks', 'error', 'head', 'pending', 'status'], 'only what the workflow reads')
+        self.assertEqual((rc, r['status'], r['pending']), (0, 'red', 0))
+        self.assertEqual(sorted(r), ['checks', 'head', 'pending', 'status'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
 
@@ -207,7 +207,7 @@ class FailuresTest(unittest.TestCase):
 
     def entries(self, *links):
         rc, r = self.main(*links)
-        self.assertEqual((rc, sorted(r)), (0, ['detail', 'error', 'head']), 'the evidence is in the detail file')
+        self.assertEqual((rc, sorted(r)), (0, ['detail', 'head']), 'the evidence is in the detail file')
         return json.loads(Path(r['detail']).read_text())['checks']
 
     def test_actions_evidence_is_the_failed_steps_diagnostics_with_the_base_runs_shared_lines(self):
@@ -429,7 +429,7 @@ class VerdictsTest(unittest.TestCase):
         return rc, json.loads(out.getvalue())
 
     def test_recall_returns_what_was_remembered_unchanged_and_skips_unknown_links(self):
-        self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY])), (0, {'head': HEAD, 'error': None}))
+        self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY])), (0, {'head': HEAD}))
         rc, r = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))
         self.assertEqual((rc, r['verdicts']), (0, [self.ENTRY]))
 
@@ -441,7 +441,7 @@ class VerdictsTest(unittest.TestCase):
         self.assertEqual([(v['link'], v['bucket']) for v in verdicts], [(JOB.format(3), 'cancel'), (JOB.format(4), 'fail')])
 
     def test_nothing_remembered_recalls_nothing(self):
-        self.assertEqual(self.main('recall', '--check', JOB.format(3)), (0, {'head': HEAD, 'verdicts': [], 'error': None}))
+        self.assertEqual(self.main('recall', '--check', JOB.format(3)), (0, {'head': HEAD, 'verdicts': []}))
 
     def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
         for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}])):

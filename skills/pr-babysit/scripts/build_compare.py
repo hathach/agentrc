@@ -22,7 +22,9 @@ error}}: revision is HEAD or SHA, both snapshots null for the base,
 command and setup with <BUILD> expanded, setupExit null without SETUP, exit the build's status or
 null when the setup failed and the build never ran. Exit 0 with that line,
 whatever the build did; exit 2 with {"error": ...} when the side could not be
-set up, naming anything cleanup had to leave behind.
+set up, naming anything cleanup had to leave behind. A SETUP bash cannot parse
+is refused before anything runs, with an error starting "setup is not a shell
+command".
 """
 
 import hashlib
@@ -73,6 +75,10 @@ def collect(argv):
         raise Unusable('candidate builds the checkout as it stands: no --rev or --setup')
     if (a.side == 'candidate') != bool(a.path):
         raise Unusable('--path names the candidate\'s sources, and only the candidate\'s')
+    if a.setup:
+        parsed = subprocess.run(['bash', '-n', '-c', a.setup], capture_output=True, text=True)
+        if parsed.returncode:
+            raise Unusable(f'setup is not a shell command: {parsed.stderr.strip() or a.setup}')
     top = checkout_top()
 
     LOGS.mkdir(exist_ok=True)

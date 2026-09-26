@@ -7,7 +7,8 @@
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK...
 
 inventory: waits up to S seconds (default 0) while any check is pending, then
-prints one JSON object {head, status, pending, checks, error}. `status` is
+prints one JSON object {head, status, pending, checks}, plus `error` when set
+(a relaying agent can drop a trailing null, so no line carries a null error). `status` is
 green, red (a check failed or was cancelled) or running (still pending, or no
 checks registered yet); `pending` counts the pending checks. `checks` lists
 the failed and cancelled ones, each {name, workflow, bucket, link, attempt}:
@@ -164,7 +165,7 @@ def inventory(repo, pr, head, wait):
 def printed(inv):
     """What the caller reads: the failing checks by name, the pending ones by count."""
     return {'head': inv['head'], 'status': inv['status'], 'pending': inv['counts'].get('pending', 0),
-            'checks': [c for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')], 'error': None}
+            'checks': [c for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
 
 
 def evidence_dir(repo, pr, head):
@@ -197,12 +198,12 @@ def remember(repo, pr, head, text):
     tmp = folder / f'verdicts.json.{time.time_ns()}'
     tmp.write_text(json.dumps(stored, ensure_ascii=False))
     tmp.replace(folder / 'verdicts.json')
-    return {'head': head, 'error': None}
+    return {'head': head}
 
 
 def recall(repo, pr, head, links):
     stored = stored_verdicts(evidence_dir(repo, pr, head))
-    return {'head': head, 'verdicts': [stored[link] for link in links if link in stored], 'error': None}
+    return {'head': head, 'verdicts': [stored[link] for link in links if link in stored]}
 
 
 def clean(text):
@@ -430,7 +431,7 @@ def failures(repo, pr, head, links, prior_head=None):
             raise Failed(f'PR #{pr} head moved to {after} while collecting')
     detail = folder / f'failures-{time.time_ns()}.json'
     detail.write_text(json.dumps({**out, 'checks': checks}, indent=1))
-    return {'head': head, 'detail': str(detail), 'error': None}
+    return {'head': head, 'detail': str(detail)}
 
 
 def main(argv=None):

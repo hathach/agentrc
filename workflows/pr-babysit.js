@@ -604,6 +604,8 @@ const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build_compare.py'
+// How BUILD_SCRIPT starts its error for a setup bash cannot parse.
+const BAD_SETUP = 'setup is not a shell command'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 // How a fact collector's agent relays the script's last stdout line, and what it
@@ -1079,7 +1081,7 @@ const buildCheck = async (tag, owned) => {
       plan = await agent(
         `${IN_CHECKOUT}Editing and building nothing, resolve the repository's build contract (its agent instructions and build docs) for a change to ${owned.join(', ')}. ` +
         "command = the shell command, run from the checkout's top level, that builds what these paths affect, with `<BUILD>` where the contract takes a fresh build directory; " +
-        'setup = the command a fresh checkout of this repository first needs for that build\'s dependencies, or null; targets and options = what it builds and with which settings, concretely; ' +
+        'setup = the command a fresh checkout of this repository first needs for that build\'s dependencies, or JSON null when it needs none, never an explanation; targets and options = what it builds and with which settings, concretely; ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(e => { log(`build:resolve#${tag} errored — ${e && e.message}`); return null })
@@ -1109,16 +1111,29 @@ const buildCheck = async (tag, owned) => {
   if (why(cand, 'candidate')) return { block: `candidate build did not count: ${why(cand, 'candidate')}` }
   tidy(cand)
   if (cand.exit === 0) return { note: null }
-  if (plan.setup === undefined) {
+  // The base's setup, from the contract; `refused` is build_compare.py's reason
+  // for rejecting the one resolved before, asked about once.
+  const resolveSetup = async (refused) => {
     const got = await agent(
       `${IN_CHECKOUT}Editing and building nothing, from the repository's build contract (its agent instructions and build docs) name the command a fresh checkout of it needs, run from its top level, ` +
-      `to fetch the dependencies of this build: ${plan.command}. setup = that command, with \`<BUILD>\` where it takes the build directory, or null when it needs none; error = why the contract could not say, else null.`,
+      `to fetch the dependencies of this build: ${plan.command}. setup = that command, with \`<BUILD>\` where it takes the build directory, or JSON null when it needs none, never an explanation; error = why the contract could not say, else null.` +
+      (refused ? ` The setup resolved before was refused: ${refused}` : ''),
       { label: `build:setup#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_SETUP },
     ).catch(e => { log(`build:setup#${tag} errored — ${e && e.message}`); return null })
     if (!got || got.error) return { block: `candidate build failed and the base's setup was not resolved: ${got ? got.error : 'resolver died'}` }
     plan.setup = got.setup
+    return null
   }
-  const base = await side('base', ` --rev=${expectedHead}${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}`)
+  const buildBase = () => side('base', ` --rev=${expectedHead}${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}`)
+  const unresolved = plan.setup === undefined && await resolveSetup(null)
+  if (unresolved) return unresolved
+  let base = await buildBase()
+  if (base && String(base.error).startsWith(BAD_SETUP)) {
+    log(`build:base#${tag}: ${base.error}; resolving the setup again`)
+    const refused = await resolveSetup(base.error)
+    if (refused) return refused
+    base = await buildBase()
+  }
   if (why(base, 'base')) return { block: `candidate build failed and the base build did not count: ${why(base, 'base')}` }
   tidy(base)
   const v = await agent(
@@ -1409,10 +1424,11 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   ).catch(e => { log(`recheck#${cycle}-${what} errored — ${e && e.message}`); return null })
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
   if (now.error) return { pass: false, committed: false, detail: `recheck could not read the checkout: ${now.error}`, sha: '' }
+  const staged = now.staged.filter(p => !ideDrift(p))
   const moved = now.branch.trim() !== pinned.branch.trim() ? `branch is ${now.branch}, not ${pinned.branch}`
     : now.pushUrls.join('\n') !== pinned.pushUrls.join('\n') ? `${pinned.remote} now pushes to ${now.pushUrls.join(', ') || '(nowhere)'}`
     : now.head.trim() !== expectedHead ? `HEAD is ${now.head.trim().slice(0, 7)}, not the ${expectedHead.slice(0, 7)} this run left`
-    : now.staged.length ? `${now.staged.length} path(s) already staged by somebody else`
+    : staged.length ? `${staged.length} path(s) already staged by somebody else`
     : null
   if (moved) {
     log(`push#${cycle}-${what}: refusing to publish — ${moved}`)
@@ -1783,13 +1799,18 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: CI not collected — no PR repository in ${JSON.stringify(pin && pin.prUrl)}`)
     return null
   }
-  const collect = (label, command, schema, payload) => agent(
-    `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file and ' : ''}` +
-    `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? ' < <that file>' : ''}\` ` +
-    'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
-    (payload ? `\n${JSON.stringify(payload)}` : ''),
-    { label, phase: 'Triage', model: 'haiku', effort: 'low', schema },
-  ).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  // A relay that dies (a mangled StructuredOutput repeats within one agent) gets
+  // one fresh agent, which does not wait again; an error collect.py reports is its answer.
+  const collect = async (label, command, schema, payload) => {
+    const relay = (as, command) => agent(
+      `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file and ' : ''}` +
+      `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? ' < <that file>' : ''}\` ` +
+      'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
+      (payload ? `\n${JSON.stringify(payload)}` : ''),
+      { label: as, phase: 'Triage', model: 'haiku', effort: 'low', schema },
+    ).catch(e => { log(`${as} errored — ${e && e.message}`); return null })
+    return (await relay(label, command)) ?? relay(`${label}.retry`, command.replace(/--wait-seconds \d+/, '--wait-seconds 0'))
+  }
   // What went wrong with a collector's answer for `head`, or null when nothing did.
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))

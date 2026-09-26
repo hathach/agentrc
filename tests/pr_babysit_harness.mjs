@@ -165,7 +165,7 @@ async function run(opts = {}) {
       label, prompt: String(prompt), agentType: options.agentType,
       phase: options.phase, schema: options.schema, model: options.model,
     })
-    if (opts.throwOn && label.startsWith(opts.throwOn)) throw new Error(`${label} exploded`)
+    if (opts.throwOn && (typeof opts.throwOn === 'function' ? opts.throwOn(label) : label.startsWith(opts.throwOn))) throw new Error(`${label} exploded`)
     if (label.startsWith('state:load#')) {
       // The real state_transfer.py on a saved output holding opts.load, then
       // opts.copy(envelope, label) for what the loader agent hands back.
@@ -418,7 +418,7 @@ async function run(opts = {}) {
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? null,
         buildDir: '/tmp/b', setupExit: null, exit,
         log: `/tmp/${name}.log`, cleanup: { ok: true, retained: [], error: null },
-        ...(typeof over === 'function' ? over(label) : over),
+        ...(typeof over === 'function' ? over(label, String(prompt)) : over),
       }, label)
     }
     if (label.startsWith('build:compare#')) {
@@ -921,6 +921,27 @@ test('a build receipt counts only as the run that was asked for', async () => {
   }
   const { result } = await run({ reviews: oneValid, candidate: { exit: 1 }, base: { revision: 'f'.repeat(40) } })
   assert.equal(result.reason, 'fix-verification-failed')
+})
+
+test('a setup the build script refuses is resolved again once, then the base builds', async () => {
+  const prose = 'null (see reason: fetched by the command)'
+  const refused = (label, prompt) => prompt.includes(`--setup='${prose}'`) ? { error: `setup is not a shell command: bash: syntax error near unexpected token \`('` } : { exit: 1 }
+  const fixed = await run({ reviews: oneValid, buildPlan: { setup: prose }, candidate: { exit: 1 }, base: refused, buildSetup: { setup: null } })
+  assert.deepEqual(fixed.labels.filter(l => l.startsWith('build:')),
+    ['build:resolve#1-review', 'build:candidate#1-review', 'build:base#1-review', 'build:setup#1-review', 'build:base#1-review', 'build:compare#1-review'])
+  assert.match(fixed.calls.find(c => c.label === 'build:setup#1-review').prompt, /The setup resolved before was refused: setup is not a shell command/)
+  assert.doesNotMatch(fixed.calls.filter(c => c.label === 'build:base#1-review')[1].prompt, /--setup=/)
+  assert.ok(fixed.labels.some(l => l.startsWith('push#')), fixed.logs.join('\n'))
+  for (const [buildSetup, why] of [
+    [{ error: 'no docs' }, /candidate build failed and the base's setup was not resolved: no docs/],
+    [{ setup: prose }, /base build did not count: setup is not a shell command/],
+  ]) {
+    const { result, labels, logs } = await run({ reviews: oneValid, buildPlan: { setup: prose }, candidate: { exit: 1 }, base: refused, buildSetup })
+    assert.equal(result.reason, 'fix-verification-failed', JSON.stringify(buildSetup))
+    assert.deepEqual(labels.filter(l => l.startsWith('build:setup#') || l.startsWith('build:candidate#')), ['build:candidate#1-review', 'build:setup#1-review'])
+    assert.equal(labels.some(l => /^(compat#|push#)/.test(l)), false)
+    assert.ok(logs.some(l => why.test(l)), `${why}\n${logs.join('\n')}`)
+  }
 })
 
 test('the declared targets and options go to the comparison, not the script', async () => {
@@ -1534,16 +1555,27 @@ test('verdicts of any size cost the state a digest each', async () => {
   assert.equal(again.result.history.at(-1).ci.realFailures.length, 12)
 })
 
+test('a collector that dies gets one fresh agent; a second death leaves the cycle without CI', async () => {
+  const revived = await run({ reviews: WAITING, ci: redWith(RIG).ci, throwOn: (l) => l === 'ci:collect#1.1' })
+  assert.deepEqual(ciLabels(revived.labels).slice(0, 3), ['ci:collect#1.1', 'ci:collect#1.1.retry', 'ci:collect#1.f'])
+  assert.match(revived.calls.find(c => c.label === 'ci:collect#1.1.retry').prompt, / inventory --wait-seconds 0 /, 'the slice was waited once')
+  assert.equal(revived.logs.some(l => /CI inventory failed/.test(l)), false)
+  const dead = await run({ reviews: WAITING, ci: redWith(RIG).ci, throwOn: 'ci:collect#1.1' })
+  assert.deepEqual(ciLabels(dead.labels).slice(0, 2), ['ci:collect#1.1', 'ci:collect#1.1.retry'])
+  assert.ok(dead.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), dead.logs.join('\n'))
+  assert.equal(dead.labels.includes('ci:judge#1'), false)
+})
+
 test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
   const garble = (answer, store) => { for (const [k, v] of store) store.set(k, { ...v, bucket: 'cancel' }); return answer }
   const lose = (answer, store) => { store.clear(); return answer }
-  const cases = [[garble, null], [lose, null], [(a, store) => lose(null, store), /the collector died/], [(a, store) => lose({ ...a, error: 'disk full' }, store), /disk full/]]
-  for (const [remember, why] of cases) {
+  const cases = [[garble, null, []], [lose, null, []], [(a, store) => lose(null, store), /the collector died/, ['ci:collect#1.w.retry']], [(a, store) => lose({ ...a, error: 'disk full' }, store), /disk full/, []]]
+  for (const [remember, why, retried] of cases) {
     const store = new Map()
     const first = await run({ store, remember, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
     assert.equal(first.logs.some(l => /1 CI verdict\(s\) not stored — .*judged again by a later launch/.test(l) && why.test(l)), !!why, first.logs.join('\n'))
     const within = await run({ store: new Map(), remember, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
-    assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w', 'ci:collect#2.1'], 'its own launch reuses it')
+    assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w', ...retried, 'ci:collect#2.1'], 'its own launch reuses it')
     const again = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
     assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
   }
@@ -1870,6 +1902,14 @@ test('a path somebody else staged refuses before the commit agent runs', async (
     'checkout moved: 1 path(s) already staged by somebody else')
   assert.deepEqual(labels.filter(l => /^(recheck|commit|push)#/.test(l)), ['recheck#1-review'])
   assert.ok(logs.some(l => /refusing to publish — 1 path\(s\) already staged/.test(l)))
+})
+
+test('staged IDE metadata does not refuse the push; anything else staged beside it does', async () => {
+  const ide = await run({ reviews: oneValid, recheck: { staged: ['.idea/cmake.xml'] } })
+  assert.equal(ide.result.history[0].reviewPushFailed, undefined, ide.logs.join('\n'))
+  assert.ok(ide.labels.includes('push#1-review'))
+  const mixed = await run({ reviews: oneValid, recheck: { staged: ['.idea/cmake.xml', 'src/theirs.c'] } })
+  assert.equal(mixed.result.history[0].reviewPushFailed.detail, 'checkout moved: 1 path(s) already staged by somebody else')
 })
 
 test('the commit is read back by an agent that did not write it', async () => {
