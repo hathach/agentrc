@@ -23,6 +23,11 @@ record lists and no transcript shows keeps its cost on an `unallocated` row; a m
 does not list has `-`. With no record at all, every row is priced at RATES and marked est.
 (`-` for a model with no rate). A note under the table says the figures cover the whole
 session, and when there was no record.
+
+Two breakout tables follow, each summing the rows above with its share of the total:
+by part (each Workflow run, named by its saved workflow; chief's own turns; each role
+chief ran itself; any unallocated cost) and by model. A sum carries est. from any of its
+rows, and `(partial)` when one of them has no dollars.
 """
 import argparse
 import json
@@ -217,6 +222,37 @@ def table(rows):
     return '\n'.join(out)
 
 
+def breakout(rows, session):
+    """The two breakout tables: spend by part and by model, each with its share of the total."""
+    def part(r):
+        if r['group'] == 'chief':
+            return 'chief (own turns)' if r['stage'] == 'chief' else r['stage']
+        if r['group'] == '-':
+            return 'unallocated'
+        name = workflow_name(session, r['group'])
+        return f'{r["group"]} ({name})' if name else r['group']
+    total = sum(r['cost'] for r in rows if r['cost'] is not None)
+    def lines(key, head):
+        groups = defaultdict(list)
+        for r in rows:
+            groups[key(r)].append(r)
+        known = lambda g: sum(r['cost'] for r in g if r['cost'] is not None)
+        out = [f'| {head} | $ | share |', '|---|---:|---:|']
+        for name, g in sorted(groups.items(), key=lambda kv: -known(kv[1])):
+            share = f'{100 * known(g) / total:.0f}%' if total and any(r['cost'] is not None for r in g) else '-'
+            out.append(f'| {name} | {total_cell(g)} | {share} |')
+        return out
+    return '\n'.join(lines(part, 'part')) + '\n\n' + '\n'.join(lines(lambda r: r['model'].removeprefix('claude-'), 'model'))
+
+
+def workflow_name(session, run):
+    """The saved workflow a run executed, from its record beside the transcripts, or None."""
+    try:
+        return json.loads((session / 'workflows' / f'{run}.json').read_text()).get('workflowName')
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def summary(session):
     """(the Markdown table, its total cell) of a session directory."""
     transcript = session.with_suffix('.jsonl')
@@ -227,7 +263,7 @@ def summary(session):
     notes = [f'Scope: the whole session {session.name}, every Workflow run and agent in it and its own turns, not one workflow alone.']
     if state is None:
         notes.append('No cost-state record in the transcript: every $ is its tokens at RATES, an estimate.')
-    return table(rows) + '\n\n' + '\n'.join(notes), total_cell(rows)
+    return table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + '\n'.join(notes), total_cell(rows)
 
 
 def main(argv=None):

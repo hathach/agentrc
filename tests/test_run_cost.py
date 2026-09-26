@@ -77,8 +77,18 @@ class RunCostTest(unittest.TestCase):
     def rows(self, text):
         return {(c[0], c[1], c[2]): c for c in ([x.strip() for x in line.strip('|').split('|')] for line in self.table(text)[2:-1])}
 
-    def table(self, text):
-        return [line for line in text.splitlines() if line.startswith('|')]
+    def table(self, text, n=0):
+        """The nth Markdown table of the output: the cost table, then the two breakouts."""
+        blocks, lines = [], text.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith('|') and (i == 0 or not lines[i - 1].startswith('|')):
+                blocks.append([])
+            if line.startswith('|'):
+                blocks[-1].append(line)
+        return blocks[n]
+
+    def breakout(self, text, n):
+        return {c[0]: c[1:] for c in ([x.strip() for x in line.strip('|').split('|')] for line in self.table(text, n)[2:])}
 
     def test_stages_and_models_share_claudes_own_cost(self):
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
@@ -93,6 +103,26 @@ class RunCostTest(unittest.TestCase):
         self.assertRegex(self.table(out)[-1], r'\*\*5\.68\*\*', 'the rows add up to claude\'s total, exact where the rates price it')
         # Opus reads cost 0.05x input: the read-heavy Explore row gets less than flat 0.1x weights would give it
         self.assertEqual(rows[('chief', 'chief:Explore', 'opus-5-5')][7], '0.60')
+
+    def test_the_breakouts_sum_the_rows_by_part_and_by_model(self):
+        (self.session / 'workflows').mkdir(parents=True)
+        (self.session / 'workflows' / 'wf_aaa.json').write_text(json.dumps({'runId': 'wf_aaa', 'workflowName': 'pr-babysit'}))
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (5.34, OPUS)})])
+        out = self.main('--session-id', SID)[1]
+        rows, parts, models = self.rows(out), self.breakout(out, 1), self.breakout(out, 2)
+        self.assertEqual(set(parts), {'wf_aaa (pr-babysit)', 'chief (own turns)', 'chief:Explore'}, 'a run is named by its saved workflow')
+        run = sum(float(c[7]) for k, c in rows.items() if k[0] == 'wf_aaa')
+        self.assertAlmostEqual(float(parts['wf_aaa (pr-babysit)'][0]), run, delta=0.011, msg='a part sums its rows across models')
+        self.assertEqual(parts['chief:Explore'], ['0.60', '11%'])
+        self.assertEqual(models, {'opus-5-5': ['5.34', '94%'], 'haiku-4-5': ['0.34', '6%']})
+        self.assertEqual(list(parts)[0], 'wf_aaa (pr-babysit)', 'largest first')
+        # without the run's record the id alone names it; an estimate carries into every sum it is in
+        (self.session / 'workflows' / 'wf_aaa.json').unlink()
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': (5.34, OPUS)})])
+        out = self.main('--session-id', SID)[1]
+        parts, models = self.breakout(out, 1), self.breakout(out, 2)
+        self.assertTrue(parts['wf_aaa'][0].endswith(' (partial)'), 'its Haiku rows have no dollars')
+        self.assertEqual(models['haiku-4-5'], ['-', '-'])
 
     def test_a_cost_the_rates_do_not_price_or_an_unknown_model_is_estimated(self):
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': (0.342, HAIKU), 'claude-opus-5-5': (4.00, OPUS)})])
