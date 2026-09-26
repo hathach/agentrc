@@ -228,7 +228,7 @@ def anchor(draft, merge_base, head):
     body = draft['body']
     if moved:
         body += '\n\n' + '\n\n'.join(f"**{c['path']}:{c['line']}**: {c['body']}" for c in moved)
-    return {**draft, 'body': body, 'comments': inline}
+    return {**draft, 'body': body, 'comments': inline, 'moved': moved}
 
 
 def number(led, result):

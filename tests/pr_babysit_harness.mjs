@@ -3570,6 +3570,39 @@ test('the offered body survives a restart', async () => {
   assert.equal(second.result.pass, true)
 })
 
+test('a reply with a point over the length limit is a repair, never posted or cut', async () => {
+  const wordy = 'w '.repeat(61).trim()
+  const long = await run({
+    args: { autoPush: true, maxCycles: 1 },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: wordy }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.equal(long.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'nothing is posted')
+  assert.match(long.result.state.debt.find(([id]) => id === 2)[1].repair.error, /^over length: a point exceeds 60 words/)
+  const points = await run({
+    args: { autoPush: true, maxCycles: 1 },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: `${'w '.repeat(60).trim()}\n\n- ${'w '.repeat(60).trim()}` }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.equal(manifestOf(points.calls, 'replies#1').length, 1, 'each point at its limit, bullet marker aside: posted')
+  // A state from before the limit may hold an offered body over it: it is neither resent nor redrafted.
+  const first = await run({
+    args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true },
+    posting: null,
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'first wording' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  const state = structuredClone(first.result.state)
+  state.debt.find(([id]) => id === 2)[1].attempt.body = wordy
+  const old = await run({
+    args: { autoPush: true, maxCycles: 2, state: seal(state) },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'short' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.equal(old.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'the stored long body is not resent')
+  assert.match(old.result.state.debt.find(([id]) => id === 2)[1].repair.error, /^over length/)
+})
+
 test('an offered answer the comment outgrew is a repair, not a reuse or a repost', async () => {
   // The reply failed to settle, then the reviewer edited the comment: the old
   // body may be on the thread and no longer answers what is asked. Same when

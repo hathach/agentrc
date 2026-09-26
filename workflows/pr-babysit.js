@@ -734,6 +734,11 @@ const COVERS = {
 }
 // The answer a deferred point gets, in whichever reply its comment receives.
 const deferralLine = (f) => `- ${f.file}:${f.line}: ${f.claim}\n  Real, and out of this PR's scope: ${f.deferral.reason}. Tracked in ${f.deferral.issueUrl}.`
+// A reply is measured as posted, point by point (a merged one has a point per finding), and never cut: a
+// point over the limit is a human repair, not a post.
+const REPLY_WORDS = 60, REPLY_LINE_CHARS = 300 // words per point; about 3 rendered lines
+const overLength = (body) => body.split(/\n\s*\n|\n(?=[-*+] )/).some(p => p.split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length > REPLY_WORDS) ||
+  body.split('\n').some(l => l.length > REPLY_LINE_CHARS)
 
 // Across launches only the last cycle's publication outcome is read (pendingOf);
 // its reports and the older cycles stay in the results that carried them.
@@ -1681,6 +1686,11 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     const a = d && d.attempt
     if (a && (a.how !== how || a.digest !== digestOf.get(commentId))) {
       repair(commentId, null, `offered ${a.how} is stale (${a.how !== how ? `now owes a ${how}` : 'comment edited'})`)
+      continue
+    }
+    // An offered body may be on the thread already: one over the limit is neither reused nor redrafted.
+    if (overLength(a ? a.body : body)) {
+      repair(commentId, null, `over length: a point exceeds ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters`)
       continue
     }
     if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)

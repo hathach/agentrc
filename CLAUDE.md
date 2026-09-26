@@ -75,6 +75,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   are public surfaces — a session URL is a private artifact, and the rest is
   noise. Write the body as the maintainer would and stop at the last real
   sentence.
+- Review comments, review bodies and PR or issue replies are read by
+  experienced developers: lead with the fact, one point per comment, bullets
+  or short Markdown for evidence and steps, `file:line` and identifiers in
+  backticks. No greeting, preamble, filler, restated code or recap; keep a
+  qualification only where the evidence is uncertain.
 
 # Skills
 - Put deterministic, checkable mechanics in `<skill>/scripts/`; keep judgment

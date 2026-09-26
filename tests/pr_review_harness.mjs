@@ -38,7 +38,7 @@ async function run(args, stubs = {}) {
     if (options.label in defaults) return defaults[options.label]
     if (options.label === 'write') {
       const fs = JSON.parse(/Findings: (\[.*\])$/s.exec(prompt)[1])
-      return { summary: 'Overall fine.', comments: fs.map(f => ({ finding: f.finding, body: `Please fix: ${f.why}` })) }
+      return { summary: '- Overall fine.', comments: fs.map(f => ({ finding: f.finding, body: `**${f.severity}**: ${f.why}` })) }
     }
     if (options.label === 'check-draft') return { bad: [], summaryBad: false }
     if (options.label === 'covered') return { matches: [] }
@@ -59,6 +59,7 @@ async function run(args, stubs = {}) {
 
 const pinned = (a) => ({ ok: true, head: H, top: '/w', ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
 const board = (verdict, regression, testedHead = H) => ({ board: 'b1', verdict, regression, testedHead, report: '/r/b1.json' })
+const words = (s) => s.split(/\s+/).filter(Boolean).length
 const audited = (...fs) => ({ confirmed: [{ dir: 'src/core', dim: 'correctness: x', findings: fs }], dropped: [], unverified: [] })
 
 test('meta names the workflow and its phases', async () => {
@@ -124,7 +125,7 @@ test('CI not green, lost coverage or a failed board cap the verdict at COMMENT',
 test('a blocking finding or a verified regression requests changes; minor ones only comment', async () => {
   const high = await run(BASE, { audit: audited(finding('buffer overrun')) })
   assert.equal(high.result.verdict.event, 'REQUEST_CHANGES')
-  assert.deepEqual(high.result.draft.comments, [{ path: 'src/core/a.c', line: 10, finding: 0, body: 'Please fix: buffer overrun' }])
+  assert.deepEqual(high.result.draft.comments, [{ path: 'src/core/a.c', line: 10, finding: 0, body: '**high**: buffer overrun' }])
   assert.equal(high.result.findings[0].why, 'buffer overrun', 'a comment indexes the result findings')
   const low = await run(BASE, { audit: audited(finding('naming', 'low')) })
   assert.equal(low.result.verdict.event, 'COMMENT', 'only a nit leaves approval open')
@@ -148,12 +149,47 @@ test('a blocking finding or a verified regression requests changes; minor ones o
 
 test('a drafted comment that adds a claim, or is lost, falls back to the finding\'s own words', async () => {
   const flagged = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), 'check-draft': { bad: [1] } })
-  assert.deepEqual(flagged.result.draft.comments.map(c => c.body), ['Please fix: a', '**high** (correctness): b'])
+  assert.deepEqual(flagged.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
   assert.match(flagged.result.draft.body, /Overall fine/, 'a clean summary stays when one comment is flagged')
   const summary = await run(BASE, { audit: audited(finding('a')), 'check-draft': { bad: [], summaryBad: true } })
   assert.doesNotMatch(summary.result.draft.body, /Overall fine/, 'a summary that adds a claim is dropped')
   const dead = await run(BASE, { audit: audited(finding('a')), write: null })
-  assert.deepEqual(dead.result.draft.comments.map(c => c.body), ['**high** (correctness): a'])
+  assert.deepEqual(dead.result.draft.comments.map(c => c.body), ['**high**: a'])
+})
+
+test('text over its limit is shortened once, then marked long for the human, never cut', async () => {
+  const wordy = (n) => 'w '.repeat(n).trim()
+  const long = { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: wordy(81) }, { finding: 1, body: '**high**: b' }] }
+  const fixed = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: long,
+    shorten: { comments: [{ finding: 0, body: '**high**: a' }], answers: [], summary: '- a is broken' } })
+  const ask = fixed.calls.find(c => c.label === 'shorten')
+  assert.match(ask.prompt, /"finding":0/)
+  assert.doesNotMatch(ask.prompt, /"body":"\*\*high\*\*: b"/, 'only the text over its limit is sent')
+  assert.deepEqual(fixed.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
+  assert.ok(!fixed.logs.some(l => /over length/.test(l)))
+  assert.match(fixed.result.draft.body, /^- a is broken$/m)
+  assert.equal(fixed.calls.find(c => c.label === 'check-draft').prompt.includes('**high**: a'), true, 'the claim check reads the shortened text')
+
+  const kept = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose.', comments: [{ finding: 0, body: `**high**: ${wordy(80)}` }] }, shorten: null })
+  assert.equal(words(kept.result.draft.comments[0].body), 81, 'never cut')
+  assert.doesNotMatch(kept.result.draft.body, /Prose/, 'a summary still over its format is left out')
+  assert.ok(kept.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10, summary \(left out\)/.test(l)))
+  const line = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: `**high**: ${'x'.repeat(301)}` }] }, shorten: null })
+  assert.ok(line.logs.some(l => /over length, for the human to shorten: src\/core\/a\.c:10/.test(l)), 'a line over about three rendered lines is long')
+  const edge = await run(BASE, { audit: audited(finding('a')), write: { summary: '- 1\n- 2\n- 3', comments: [{ finding: 0, body: `**high**: ${wordy(77)}\n- ${wordy(2)}` }] } })
+  assert.equal(edge.labels.includes('shorten'), false, 'at the limit nothing is shortened')
+  const bare = { summary: '- ok', comments: [{ finding: 0, body: 'No heading here.' }, { finding: 1, body: '**high**: b\n- 1\n- 2\n- 3\n- 4' }] }
+  const off = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), write: bare, shorten: null })
+  assert.match(off.calls.find(c => c.label === 'shorten').prompt, /No heading here[\s\S]*- 4/, 'a comment off its format is rewritten')
+  assert.deepEqual(off.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'], 'still off its format: the template')
+  const wrong = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**low**: a' }] }, shorten: null })
+  assert.deepEqual(wrong.result.draft.comments.map(c => c.body), ['**high**: a'], 'a heading must name its finding\'s severity')
+  const empty = await run(BASE, { audit: audited(finding('a'), finding('b', 'high', 20)), shorten: null,
+    write: { summary: '- ok', comments: [{ finding: 0, body: '**high**: ' }, { finding: 1, body: '**high**: b\n+ 1\n+ 2\n+ 3\n+ 4' }] } })
+  assert.deepEqual(empty.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'], 'no problem after the heading, or 4 bullets of any marker')
+  assert.match(edge.result.draft.body, /- 3/)
+  const plus = await run(BASE, { audit: audited(finding('a')), write: { summary: '+ one', comments: [{ finding: 0, body: '**high**: a' }] } })
+  assert.equal(plus.labels.includes('shorten'), false, 'a `+` bullet summary is in format')
 })
 
 test('open thread claims are judged; a confirmed one covers our same finding and counts once', async () => {
@@ -283,4 +319,24 @@ test('a discussion run judges only answered findings, with no audit and no claim
   assert.equal(result.mode, 'discussion')
   const idle = await run(disc, { check: { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }, ledger: LEDGER })
   assert.equal(idle.result.status, 'nothing-new')
+})
+
+test('a thread answer over its limit is shortened, then marked long; the answer prompt carries the format', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const base = { check: pinned(inc), ledger: { reviews: 1, open: [LEDGER.open[0]] }, disputes: { disputes: [DISPUTE] } }
+  const wordy = 'w '.repeat(61).trim()
+  const short = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
+    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands: `a.c:12` reads it unmasked.' }] }, 'check-draft': { bad: [], summaryBad: false, answersBad: [] } })
+  assert.match(short.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /at most 60 words/)
+  assert.deepEqual(short.result.findings[0].disputes[0].answer, { body: 'Still stands: `a.c:12` reads it unmasked.', resolve: false })
+  const kept = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }), shorten: null })
+  assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: wordy, resolve: false })
+  assert.ok(kept.logs.some(l => /over length, for the human to shorten: answer on pr7-f1/.test(l)))
+  const added = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
+    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands, and it leaks.' }] }, 'check-draft': { bad: [], summaryBad: false, answersBad: ['pr7-f1'] } })
+  assert.deepEqual(added.result.findings[0].disputes[0].answer, { body: wordy, resolve: false }, 'a shortening that adds a claim is undone')
+  assert.match(added.calls.find(c => c.label === 'check-draft').prompt, /"shortened":"Still stands, and it leaks\."/, 'with no new comment the one check still runs')
+  const dead = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
+    shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands.' }] }, 'check-draft': null })
+  assert.equal(dead.result.findings[0].disputes[0].answer.body, wordy, 'an unchecked shortening is undone')
 })

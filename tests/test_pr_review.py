@@ -599,6 +599,43 @@ class Post(PostCase):
             self.post()
         self.assertEqual(self.gh.posts, [])
 
+    def test_text_marked_long_is_never_auto_posted_and_is_named_in_a_pending_review(self):
+        draft = self.result_for(self.p)['draft']
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': ' '.join(['w'] * 81)}]}))
+        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:21\)'):
+            self.post('--auto')
+        self.assertEqual(self.gh.posts, [])
+        out = self.post()
+        self.assertEqual((out['status'], out['overLength']), ('drafted', ['src/core/a.c:21']))
+        self.assertEqual(self.gh.posts[0]['comments'][0]['body'], ' '.join(['w'] * 81), 'the text is never cut')
+
+    def test_auto_post_measures_what_it_would_submit_whatever_the_draft_marks(self):
+        draft = self.result_for(self.p)['draft']
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [{**draft['comments'][0], 'body': ' '.join(['w'] * 81)}]}))
+        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:21\)'):
+            self.post('--auto')
+        self.post('--decline', '--reason', 'next')
+        self.save(self.result_for(self.p, draft={**draft, 'replies': [{'commentId': 5010, 'body': ' '.join(['w'] * 61), 'findingId': 'pr7-f1'}]}), reason='note')
+        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(fix note on pr7-f1\)'):
+            self.post('--auto')
+        self.assertEqual(self.gh.posts, [])
+
+    def test_a_long_comment_moved_into_the_body_still_stops_auto_post(self):
+        draft = self.result_for(self.p)['draft']
+        self.save(self.result_for(self.p, draft={**draft, 'comments': [draft['comments'][0], {**draft['comments'][1], 'body': ' '.join(['w'] * 81)}]}))
+        self.assertEqual([c['line'] for c in self.review()['draft']['moved']], [1], 'moved into the body, kept as the comment it was')
+        with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:1\)'):
+            self.post('--auto')
+
+    def test_auto_post_refuses_a_draft_saved_before_the_length_check(self):
+        self.save(self.result_for(self.p))
+        led = json.loads(Path(self.p['ledger']).read_text())
+        del led['reviews'][-1]['draft']['moved']
+        Path(self.p['ledger']).write_text(json.dumps(led))
+        with self.assertRaisesRegex(facts.Unusable, 'predates the length check'):
+            self.post('--auto')
+        self.assertEqual(self.post()['status'], 'drafted', 'the human can still check it in a pending review')
+
     def test_decline_settles_a_draft_never_created(self):
         self.save(self.result_for(self.p))
         self.assertEqual(self.post('--decline', '--reason', 'not now')['status'], 'declined')
@@ -983,6 +1020,12 @@ class Pushback(PostCase):
         edited = self.disputes(self.snapshot((950, 'contrib', 'intentional, see line 3', False)))
         self.assertNotEqual(edited[0]['key'], got[0]['key'])
 
+    def test_a_long_answer_is_named_in_its_pending_review(self):
+        self.discuss('upheld', {'body': ' '.join(['w'] * 61), 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        out = self.post()
+        self.assertEqual((out['status'], out['overLength']), ('drafted', ['answer on pr7-f1']))
+
     def test_a_discussion_merges_into_the_review_and_appends_an_answer_record(self):
         out = self.discuss('withdrawn', {'body': 'Agreed, withdrawing.', 'resolve': True})
         self.assertEqual((out['mode'], out['answers']), ('discussion', 1))
@@ -1098,6 +1141,14 @@ class Pushback(PostCase):
         self.comment(950, 'contrib', 'intentional')
         self.comment(955, 'coderabbitai[bot]', 'agree', bot=True)
         self.assertEqual(self.post()['staged'][0]['state'], 'staged')
+
+    def test_auto_posts_despite_a_long_answer_and_names_it_in_the_answers_pending_review(self):
+        rec = self.dispute('upheld', {'body': ' '.join(['w'] * 61), 'resolve': False})
+        self.comment(950, 'contrib', 'intentional')
+        self.save(self.result_for(self.p, findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': [rec]}],
+                                  draft={'event': 'COMMENT', 'body': 'Again.', 'comments': [], 'replies': []}), reason='again')
+        out = self.post('--auto')
+        self.assertEqual((out['status'], out['answers']['overLength']), ('posted', ['answer on pr7-f1']))
 
     def test_auto_hands_its_answers_to_one_pending_review_even_across_a_crash(self):
         rec = self.dispute('upheld', {'body': 'Still stands.', 'resolve': False})

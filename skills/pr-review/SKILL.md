@@ -118,14 +118,16 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
 5. One unit runs `post.py` (pending) or `post.py --auto` (auto-post) with
    `--expected-head`. Its exit 1 names what it could not confirm.
 6. Report the verdict and its reasons, the counts, coverage lost, the CI and
-   HIL rows, and the receipts; never the draft's text.
+   HIL rows, the receipts and `post.py`'s `overLength`; never the draft's text.
 
 ## 5. After the launch
 
 Read chief's report and tell the human: the PR link, the proposed event and
 its reasons, and that a pending review waits for them there, with its thread
 answers beside the replies they answer (`ledger.py show` lists each with the
-recheck's reason and the thread's link). They edit, delete or add, pick the
+recheck's reason and the thread's link). Name each text in `overLength` (and
+`answers.overLength` under `--auto`) for the human to shorten before
+submitting. They edit, delete or add, pick the
 event and submit, or delete the whole review. The next `prepare.py` records
 the outcome: a deleted comment drops its finding; an edited one stands, and
 its next recheck reads the text published; a concession withdraws its finding

@@ -19,6 +19,10 @@ threads (GraphQL addPullRequestReviewThreadReply), an answer only while the thre
 it was judged on and the answer still matches its digest. Nothing is public until the human submits it on
 GitHub, choosing the event; deleting a comment or reply before that declines it. The review is `drafted`.
 
+Text over its length limit, measured here (a comment moved into the body as the comment it was), is never cut: a
+pending review names it in overLength for the human to shorten, and --auto refuses to submit it, or a draft saved
+before the check; an answer counts only where it is published, never under --auto.
+
 --auto submits the review with its draft's event, refusing APPROVE, posts the fix notes through pr-reply's
 reply.py, which reads each back and resolves its thread, and resolves the threads deferred to it. Thread answers
 are never submitted: the review's are put in an answer record of the head (ledger.py's mode discussion) stored
@@ -492,6 +496,28 @@ def publish_draft(repo, pr, led, review, login, recovering, persist):
     return {'status': 'drafted' if done else 'partial' if ok else 'uncertain', 'review': rec['review'], 'staged': staged}
 
 
+# The workflow's limits (workflows/pr-review.js LIMIT), measured again at the gate: a saved draft is not trusted to
+# carry its own marks.
+COMMENT_WORDS, REPLY_WORDS, LINE_CHARS = 80, 60, 300
+
+
+def too_long(text, limit):
+    text = text or ''
+    return len([w for w in text.split() if w not in ('-', '*', '+')]) > limit or any(len(x) > LINE_CHARS for x in text.split('\n'))
+
+
+def over_length(led, review, answers=True):
+    """What is too long for its limit, named for the human to shorten before submitting; a comment moved into the
+    body is measured as the comment it was."""
+    d = review['draft']
+    long = [f"{c['path']}:{c['line']}" for c in d['comments'] + d.get('moved', []) if too_long(c['body'], COMMENT_WORDS)]
+    long += [f"fix note on {r['findingId']}" for r in d['replies'] if too_long(r['body'], REPLY_WORDS)]
+    if answers:
+        long += [f"answer on {f['id']}" for f, x in open_disputes(findings_of(led, review), review['head'])
+                 if too_long(x['answer']['body'], REPLY_WORDS)]
+    return list(dict.fromkeys(long))
+
+
 def collect(argv):
     p = Parser(prog='post.py')
     p.add_argument('--pr', type=int, required=True)
@@ -535,6 +561,12 @@ def collect(argv):
         event = review['draft']['event']
         if a.auto and event == 'APPROVE':
             raise Unusable('auto-post never approves; publish it without --auto for the human to submit')
+        long = over_length(led, review, answers=not a.auto)
+        if a.auto and review['status'] == 'pending' and 'moved' not in review['draft']:
+            raise Unusable('the draft predates the length check, which cannot measure what it moved into the body: '
+                           'publish it without --auto for the human to check')
+        if a.auto and long and review['status'] == 'pending':
+            raise Unusable(f"over-length text ({', '.join(long)}): publish it without --auto for the human to shorten")
         rec = review['receipts']
         sent = bool((rec.get('review') or {}).get('sent')) and not (rec.get('review') or {}).get('verified')
         head = pr_head(repo, a.pr)
@@ -544,11 +576,12 @@ def collect(argv):
             raise Unusable(f'the PR head moved to {head}; the draft reviewed {a.expected_head}')
         login = gh_json('api', 'user')['login']
         if not a.auto:
-            return publish_draft(repo, a.pr, led, review, login, recovering, persist)
+            return {**publish_draft(repo, a.pr, led, review, login, recovering, persist), 'overLength': long}
         out = publish_auto(repo, a.pr, led, review, event, login, recovering, persist)
         answers = [r for r in led['reviews'] if r.get('origin') == review['draft']['digest'] and r['status'] in DRAFTS]
         if answers and review['status'] in ('posted', 'partial') and not recovering:
-            out['answers'] = publish_draft(repo, a.pr, led, answers[-1], login, False, persist)
+            out['answers'] = {**publish_draft(repo, a.pr, led, answers[-1], login, False, persist),
+                              'overLength': over_length(led, answers[-1])}
         return out
 
 
