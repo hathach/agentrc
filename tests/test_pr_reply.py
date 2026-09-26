@@ -142,13 +142,21 @@ class ReplyCase(unittest.TestCase):
         lines = out.getvalue().strip().splitlines()
         return rc, json.loads(lines[-1]) if lines else None
 
+    def receipts(self, out):
+        """The printed receipts, with the nulls the script leaves out put back as pr-babysit does."""
+        if not out:
+            return None
+        for r in out['receipts']:
+            self.assertNotIn(None, (r.get('resolved', False), r.get('error', '')), 'a null resolved or error is printed')
+        return [{'resolved': None, 'error': None, **r} for r in out['receipts']]
+
 
 class ReplyTest(ReplyCase):
     def run_script(self, replies, raw=False):
         path = self.json_file({'replies': replies if raw else [{'digest': reply.fnv1a(r['body']), **r} if isinstance(r.get('body'), str) else r
                                                                for r in replies]})
         rc, out = self.main('--manifest', path)
-        return rc, out['receipts'] if out else []
+        return rc, self.receipts(out) or []
 
     def test_review_reply_is_posted_read_back_and_resolved(self):
         self.gh.review_comment(10)
@@ -390,7 +398,7 @@ class ReconcileTest(ReplyCase):
 
     def reuse(self, *items):
         rc, out = self.main('--reuse', self.json_file({'reuses': list(items)}))
-        return rc, out['receipts'] if out else None
+        return rc, self.receipts(out)
 
     def reworded(self):
         """Comment 20 and our quoting answer 901 in other words than any manifest now holds."""

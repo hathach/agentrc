@@ -39,8 +39,10 @@ and the id is on none of them, so the caller owes it nothing; `null` when a
 lookup failed before that was known), `replyId`, `digest`, `sent` (a POST was issued;
 with `replyId` null the response was lost and the reply may exist), `posted`
 (false when an identical reply was reused), `verified` (true, false on a
-mismatch, null when the read-back could not be fetched), `resolved` (null for
-the two kinds without a thread), `error`. Exit 0 when every reply is verified
+mismatch, null when the read-back could not be fetched), `resolved` (true when the
+thread was resolved, false when GitHub refused to resolve it, left out when
+unknown: for the two kinds without a thread, or when an API error cut the
+resolve short), `error` (left out when there is none). Exit 0 when every reply is verified
 and every review thread resolved, 1 otherwise, 2 for a bad manifest or an
 unreachable repo.
 

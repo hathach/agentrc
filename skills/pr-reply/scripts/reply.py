@@ -31,7 +31,8 @@ reply may exist), posted that GitHub answered it, verified is true on a
 matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
-reply, resolved; 1 otherwise; 2 on a usage or manifest error.
+reply, resolved; 1 otherwise; 2 on a usage or manifest error. A null resolved or
+error is left out of the line: a model relaying it drops a trailing null.
 
 --inspect reads, never writes: for each pair, whether REPLY is ours answering
 COMMENT on this PR, its exact body with the body's digest, and the original's
@@ -397,7 +398,8 @@ def main(argv=None):
         print(json.dumps({'inspected': inspected}))
         return 0 if all(i['error'] is None for i in inspected) else 1
     receipts = [reuse(poster, item) for item in reuses] if reuses else [handle(poster, item) for item in replies]
-    print(json.dumps({'receipts': receipts}))
+    print(json.dumps({'receipts': [{k: v for k, v in r.items() if v is not None or k not in ('resolved', 'error')}
+                                   for r in receipts]}))
     kept_open = {item['commentId'] for item in replies or [] if item.get('resolve') is False}
     ok = all(r['verified'] is True and (r['kind'] != 'review' or r['resolved'] or r['commentId'] in kept_open) for r in receipts)
     return 0 if ok else 1

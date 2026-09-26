@@ -136,6 +136,8 @@ const receiptOf = (head, prHead, detail, pushed = true) => ({
   pushed, detail, heads: PIN.pushUrls.map(url => ({ url, head })), ...(prHead === undefined ? {} : { prHead }),
 })
 const hookQuoted = quotedAfter(/hooks\.py/)
+// reply.py's printed receipts leave out a null resolved or error.
+const printed = (receipts) => receipts.map(r => Object.fromEntries(Object.entries(r).filter(([k, v]) => v !== null || !['resolved', 'error'].includes(k))))
 const lsTreeOf = (paths) => paths.map(f => `100644 blob ${blobOf(f)}\t${f}`)
 
 // Drive the workflow against stub agents. Every cycle gets the same `reviews`
@@ -174,8 +176,11 @@ async function run(opts = {}) {
       const answer = opts.copy ? await opts.copy(envelope, label) : envelope
       return answer === null ? null : conforms(options.schema, answer, label)
     }
-    if (label === 'preflight') return patch({ ...PIN, head, prHead }, opts.preflight)
-    if (label === 'adopt:audit') {
+    if (label === 'preflight' || label === 'preflight.retry') {
+      const over = typeof opts.preflight === 'function' ? opts.preflight(label) : opts.preflight
+      return patch({ ...PIN, head, prHead }, over)
+    }
+    if (label === 'adopt:audit' || label === 'adopt:audit.retry') {
       const fallback = { commits: [adoptCommit(opts.args?.adoptHead, [opts.args?.state?.expectedHead ?? HEAD])] }
       const answer = typeof opts.adoptAudit === 'function' ? await opts.adoptAudit(label)
         : opts.adoptAudit === undefined ? fallback : opts.adoptAudit
@@ -220,6 +225,7 @@ async function run(opts = {}) {
         if (opts.remember) answer = opts.remember(answer, store)
       } else if (/ inventory /.test(text)) {
         answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
+        if (opts.inventory) answer = opts.inventory(answer, label)
       } else {
         if (opts.evidence) await opts.evidence(calls)
         answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', error: null }
@@ -295,7 +301,7 @@ async function run(opts = {}) {
               ? { commentId, kind: 'review', replyId: 500 + commentId, digest, sent: true, posted: true, verified: null, resolved: null, error: 'read-back unavailable: HTTP 502' }
               : { commentId, kind: 'review', replyId: 500 + commentId, digest, sent: true, posted: true, verified: true, resolved: true, error: null }
       const receipts = [...entries.map(receipt), ...(opts.strayDoneIds || []).map(id => receipt({ commentId: id, digest: 'deadbeef' }))]
-      return { receipts: opts.receipts ? opts.receipts(receipts, label) : receipts }
+      return { receipts: printed(opts.receipts ? opts.receipts(receipts, label) : receipts) }
     }
     if (label.startsWith('hooks#')) {
       if (opts.hooks === null) return null // a dead hook agent
@@ -317,10 +323,11 @@ async function run(opts = {}) {
       return { committed: true, detail: 'committed', ...opts.commit }
     }
     if (label.startsWith('audit#')) {
-      if (opts.audit === null) return null // a dead read-back agent
+      const over = typeof opts.audit === 'function' ? opts.audit(label) : opts.audit
+      if (over === null) return null // a dead read-back agent
       // ls-tree of the commit: what the stub committed is what the tree held.
       const entries = staged.map(f => `100644 blob ${blobOf(f)}\t${f}`)
-      return { sha: made, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...opts.audit }
+      return { sha: made, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...over }
     }
     if (label.startsWith('push#')) {
       // push.py's receipt; the workflow supplies committed and sha.
@@ -386,11 +393,11 @@ async function run(opts = {}) {
     if (label.startsWith('reuse#')) {
       if (opts.reuse === null) return null
       const { reuses } = payloadOf(prompt, 'Reuses')
-      return conforms(options.schema, { receipts: reuses.map(u => ({
+      return conforms(options.schema, { receipts: printed(reuses.map(u => ({
         commentId: u.commentId, kind: 'review', replyId: u.replyId, digest: u.bodyDigest,
         sent: false, posted: false, verified: true, resolved: true, error: null,
         ...(opts.reuse ? opts.reuse(u.commentId) : {}),
-      })) }, label)
+      }))) }, label)
     }
     if (label.startsWith('build:resolve#')) {
       // The repository's build for the batch, resolved when the caller named none.
@@ -740,7 +747,31 @@ test('a dead preflight stops the run with nothing else dispatched', async () => 
     assert.equal(result.reason, 'preflight-died', JSON.stringify(opts))
     assert.equal(result.cycles, 0)
     assert.deepEqual(result.history, [])
-    assert.deepEqual(labels, ['preflight'])
+    assert.deepEqual(labels, ['preflight', 'preflight.retry'], 'one fresh agent, then nothing else')
+  }
+})
+
+test('a relay that copies an impossible SHA gets one fresh agent; a second bad copy is refused as before', async () => {
+  // #3986: the preflight relay cut adoptHead to 35 characters and the launch was lost.
+  const cut = (sha) => sha.slice(0, 35)
+  const adopting = await run({ args: adoptionArgs(adoptionState()), preflight: (l) => ({ head: l === 'preflight' ? cut(ADOPT) : ADOPT, prHead: HEAD }) })
+  assert.deepEqual(adopting.labels.slice(0, 3), ['preflight', 'preflight.retry', 'adopt:audit'])
+  assert.notEqual(adopting.result.reason, 'adopt-head-mismatch')
+
+  const plain = await run({ preflight: (l) => l === 'preflight' ? { head: cut(HEAD) } : undefined })
+  assert.equal(plain.result.pass, true)
+  assert.deepEqual(plain.labels.slice(0, 2), ['preflight', 'preflight.retry'])
+
+  const twice = await run({ preflight: () => ({ head: cut(HEAD) }) })
+  assert.equal(twice.result.reason, 'wrong-head')
+  assert.deepEqual(twice.labels, ['preflight', 'preflight.retry'])
+
+  for (const [name, over] of [['recheck', { recheck: (l) => l.endsWith('.retry') ? undefined : { head: cut(HEAD) } }],
+    ['audit', { audit: (l) => l.endsWith('.retry') ? undefined : { sha: cut(SHA) } }]]) {
+    const { labels, result } = await run({ reviews: oneValid, ...over })
+    assert.ok(labels.some(l => l.startsWith(`${name}#`) && l.endsWith('.retry')), name)
+    assert.ok(labels.some(l => l.startsWith('push#')), `${name}: the push went ahead`)
+    assert.notEqual(result.reason, 'push-failed', name)
   }
 })
 
@@ -1564,6 +1595,8 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
   assert.deepEqual(ciLabels(dead.labels).slice(0, 2), ['ci:collect#1.1', 'ci:collect#1.1.retry'])
   assert.ok(dead.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), dead.logs.join('\n'))
   assert.equal(dead.labels.includes('ci:judge#1'), false)
+  const cut = await run({ reviews: WAITING, ci: redWith(RIG).ci, inventory: (a, l) => l.endsWith('.retry') ? a : { ...a, head: a.head.slice(0, 35) } })
+  assert.deepEqual(ciLabels(cut.labels).slice(0, 3), ['ci:collect#1.1', 'ci:collect#1.1.retry', 'ci:collect#1.f'], 'a cut head is asked once more')
 })
 
 test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
@@ -4156,12 +4189,12 @@ test('adoption keeps ordinary preflight refusals ahead of its own checks', async
     const state = adoptionState()
     const { result, labels } = await run({ args: adoptionArgs(state), preflight })
     assert.equal(result.reason, 'preflight-died')
-    assert.deepEqual(labels, ['preflight'])
+    assert.deepEqual(labels, ['preflight', 'preflight.retry'])
   }
   const state = adoptionState()
   const thrown = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, throwOn: 'preflight' })
   assert.equal(thrown.result.reason, 'preflight-died')
-  assert.deepEqual(thrown.labels, ['preflight'])
+  assert.deepEqual(thrown.labels, ['preflight', 'preflight.retry'])
 })
 
 test('adoption refuses a local head other than the candidate and a remote head outside the pair', async () => {
@@ -4196,15 +4229,15 @@ test('an audit that dies, throws, or omits required evidence is refused without 
     })
     assert.equal(result.reason, 'adopt-audit-failed', name)
     assert.equal(typeof result.detail, 'string')
-    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    assert.deepEqual(labels, ['preflight', 'adopt:audit', 'adopt:audit.retry'])
     assert.equal(result.state.cyclesUsed, state.cyclesUsed)
   }
 })
 
 test('empty, malformed, duplicate, or pathless audit commits are refused', async () => {
-  for (const [name, commits] of [
+  for (const [name, commits, retried] of [
     ['empty chain', []],
-    ['malformed SHA', [adoptCommit('bad', [HEAD]), adoptCommit(ADOPT, ['bad'])]],
+    ['malformed SHA', [adoptCommit('bad', [HEAD]), adoptCommit(ADOPT, ['bad'])], true],
     ['duplicate SHA', [adoptCommit(ADOPT, [HEAD]), adoptCommit(ADOPT, [ADOPT])]],
     ['empty paths', [adoptCommit(ADOPT, [HEAD], [])]],
   ]) {
@@ -4213,7 +4246,7 @@ test('empty, malformed, duplicate, or pathless audit commits are refused', async
       args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: { commits },
     })
     assert.equal(result.reason, 'adopt-audit-failed', name)
-    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    assert.deepEqual(labels, ['preflight', 'adopt:audit', ...(retried ? ['adopt:audit.retry'] : [])], name)
     assert.equal(result.state.cyclesUsed, state.cyclesUsed)
   }
 })

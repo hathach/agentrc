@@ -619,6 +619,17 @@ const relayed = (schema) => {
   return 'and return the JSON object on its last stdout line unchanged. ' +
     `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
 }
+// A relay that died, or copied a value `valid` rejects (a live one cut a SHA to
+// 35 characters), gets one fresh agent; an error the script reported is its
+// answer. Only for a script that is safe to run twice.
+const relayOnce = async (prompt, opts, valid = () => true, retryPrompt = prompt) => {
+  const run = (p, label) => agent(p, { ...opts, label }).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  const first = await run(prompt, opts.label)
+  if (first && (first.error || valid(first))) return first
+  if (first) log(`${opts.label}: the relayed answer is impossible, asking a fresh agent`)
+  return run(retryPrompt, `${opts.label}.retry`)
+}
+const isSha = (s) => FULL_SHA.test(String(s).trim())
 // A verified reply that settles its comment: a review thread only once resolved.
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
@@ -628,7 +639,8 @@ const runReplyScript = (label, mode, task, rules, payload) => agent(
   `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return the receipts from its last stdout line unchanged. ` +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
-).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+).then(r => r && { ...r, receipts: r.receipts.map(x => ({ resolved: null, error: null, ...x })) })
+  .catch(e => { log(`${label} errored — ${e && e.message}`); return null })
 // Standard base64 to a string of byte values, or null for anything else.
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
@@ -656,7 +668,8 @@ const RECEIPTS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified', 'resolved', 'error'],
+        // reply.py leaves out a null resolved or error; runReplyScript puts it back.
+        required: ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified'],
         properties: {
           commentId: { type: 'integer' }, kind: { type: ['string', 'null'] }, replyId: { type: ['integer', 'null'] },
           digest: { type: 'string' }, sent: { type: 'boolean' }, posted: { type: 'boolean' }, verified: { type: ['boolean', 'null'] }, resolved: { type: ['boolean', 'null'] },
@@ -1418,10 +1431,11 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   // The tree can have moved since the preflight: another session, a hook, a
   // rebase. Identity is an exact SHA, never a count: a one-for-one replacement,
   // a reset behind the pin, or a foreign commit all keep the count plausible.
-  const now = await agent(
+  const now = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
-  ).catch(e => { log(`recheck#${cycle}-${what} errored — ${e && e.message}`); return null })
+    r => isSha(r.head),
+  )
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
   if (now.error) return { pass: false, committed: false, detail: `recheck could not read the checkout: ${now.error}`, sha: '' }
   const staged = now.staged.filter(p => !ideDrift(p))
@@ -1544,11 +1558,12 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   // Read the commit back in a separate turn: a committer reporting on its own
   // work is the one report most likely to be wrong about it. This catches
   // misreporting and a tree that moved underneath, not a determined lie.
-  const seen = await agent(
+  const seen = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(shq).join(' ')}\` ` +
     relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
-  ).catch(e => { log(`audit#${cycle}-${what} errored — ${e && e.message}`); return null })
+    a => isSha(a.sha) && a.parents.every(isSha),
+  )
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
 
   // Audit the commit itself, not the intent: its parent must be where this run
@@ -1799,17 +1814,15 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: CI not collected — no PR repository in ${JSON.stringify(pin && pin.prUrl)}`)
     return null
   }
-  // A relay that dies (a mangled StructuredOutput repeats within one agent) gets
-  // one fresh agent, which does not wait again; an error collect.py reports is its answer.
-  const collect = async (label, command, schema, payload) => {
-    const relay = (as, command) => agent(
+  // A retry does not wait again.
+  const collect = (label, command, schema, payload) => {
+    const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file and ' : ''}` +
       `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? ' < <that file>' : ''}\` ` +
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
-      (payload ? `\n${JSON.stringify(payload)}` : ''),
-      { label: as, phase: 'Triage', model: 'haiku', effort: 'low', schema },
-    ).catch(e => { log(`${as} errored — ${e && e.message}`); return null })
-    return (await relay(label, command)) ?? relay(`${label}.retry`, command.replace(/--wait-seconds \d+/, '--wait-seconds 0'))
+      (payload ? `\n${JSON.stringify(payload)}` : '')
+    return relayOnce(prompt(command), { label, phase: 'Triage', model: 'haiku', effort: 'low', schema },
+      x => isSha(x.head), prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')))
   }
   // What went wrong with a collector's answer for `head`, or null when nothing did.
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
@@ -2473,11 +2486,12 @@ if (cyclesUsed >= maxCycles) {
   log(`state: ${cyclesUsed} of ${maxCycles} cycles already used — nothing left to run`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'budget-exhausted' })
 }
-const pinned = await agent(
+const pinned = await relayOnce(
   `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}\` ` +
   relayed(PIN),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
-).catch(e => { log(`preflight errored — ${e && e.message}`); return null })
+  p => isSha(p.head) && isSha(p.prHead),
+)
 if (!pinned) return finish({ pass: false, cycles: cyclesUsed, history, reason: 'preflight-died' })
 if (pinned.error) {
   log(`preflight: nothing pinned — ${pinned.error}`)
@@ -2549,11 +2563,12 @@ if (adoptHead !== null) {
     log(`preflight: the state holds an unpublished candidate (${p.stage}); resolve it before adopting`)
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-pending', pending: p })
   }
-  const audit = await agent(
+  const audit = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead}\` ` +
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
-  ).catch(e => { log(`adopt:audit errored — ${e && e.message}`); return null })
+    a => a.commits.every(c => isSha(c.sha) && c.parents.every(isSha)),
+  )
   const commits = audit ? audit.commits : []
   const shas = commits.map(c => String(c.sha).trim())
   const paths = commits.flatMap(c => c.paths)
