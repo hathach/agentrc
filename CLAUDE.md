@@ -44,9 +44,14 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   That scope never authorizes destroying unrelated data, and a headless
   session still needs me for a host or VM reboot.
 - Worktrees: for branch or multi-step work use a worktree under
-  `.worktrees/<branch>`; never switch the primary checkout. Reuse the task's
-  existing worktree; create one (`git worktree add .worktrees/<branch> -b
-  <branch>`, or without `-b` for an existing branch) only when there is none.
+  `.worktrees/<branch>`; never switch the primary checkout. Before creating
+  one, inspect the active branch and existing worktrees. If the target branch
+  or changes are already active in another checkout, ask whether to reuse it
+  instead of creating another branch or worktree. Create one (`git worktree
+  add .worktrees/<branch> -b <branch>`, or without `-b` for an existing
+  branch) only when there is none. Before removing one, inspect its dependency
+  symlinks or junctions and verify that removal deletes only the links and
+  worktree, not their shared targets.
 
 # Coding style
 - Comment only when the code cannot say it itself: a non-obvious *why*, a
