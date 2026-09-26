@@ -230,6 +230,15 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('It also returns the HIL contract\'s path and its caller rules for a run\'s result', chief)
         self.assertIn('reporting rules it cannot find as a blocker', chief)
 
+    def test_an_unclassified_hil_cell_starts_on_the_harness(self):
+        """#3968 paid a desk placement unit and a reset-only validator before the CI cell's own A/B reproduced it."""
+        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
+        self.assertIn('skip that unit: the investigation starts with two `hil-operator` runs of the cell with CI\'s seed, order and retry count', chief)
+        self.assertIn('reproduces the symptom, not its cause', chief)
+        self.assertIn('Launch it as `{ pr, autoPush, yieldAfterCycle: true, lane, stateRef }`', chief)
+        self.assertIn('Before launching a workflow other than `pr-babysit`, whose launch its paragraph under Dispatch gives, have `Explore` resolve', chief)
+        self.assertIn('unless the run is on a CI firmware artifact fetched as the repository\'s HIL contract describes, is built by one Sonnet unit', chief)
+
     def test_hil_operator_resolves_the_project_contract_and_refuses_without_it(self):
         """The rig procedure lives in the project's HIL contract; the role only knows how to find and obey it."""
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
