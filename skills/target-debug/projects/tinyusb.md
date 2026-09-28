@@ -2,9 +2,10 @@
 
 What is specific to this project when using `target-debug`, `rtt`, `etm-trace`,
 `esp-target-debug`, `usb-sniffer` or `usb-kernel-debug` on it: names to inspect,
-what a symptom usually means, which example proves what. How to BUILD a debug
-variant and how to take a rig board are the project's own contracts (its
-`CLAUDE.md`: `Build contract:`, `HIL contract:`), not this file.
+what a symptom usually means, which example proves what. For building a debug
+variant, taking a rig board or handling a failed `usbtest` case, follow the
+project's own `CLAUDE.md` (`Build contract:`, `HIL contract:`,
+`usbtest battery:`), not this file.
 
 Every entry says how it is known: `verified <date> <revision> <board>: <how>`,
 or `carried over` for knowledge moved here with the skills on 2026-09-17 and not
