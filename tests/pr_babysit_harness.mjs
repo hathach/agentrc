@@ -408,6 +408,20 @@ async function run(opts = {}) {
         commentId, answers: opts.answers ? opts.answers(commentId) : false, reason: 'stub verdict',
       })) }, label)
     }
+    if (label.startsWith('shorten#')) {
+      // opts.shorten(draft) is one draft's rewrite, 'short' by default; null a dead shortener.
+      if (opts.shorten === null) return null
+      return conforms(options.schema, { replies: trailingList(prompt).map(x => ({
+        commentId: x.commentId, body: opts.shorten ? opts.shorten(x) : 'short',
+      })) }, label)
+    }
+    if (label.startsWith('check-reply#')) {
+      // opts.faithful(pair) is one rewrite's verdict, faithful by default; null a dead checker.
+      if (opts.faithful === null) return null
+      return conforms(options.schema, { verdicts: trailingList(prompt).map(x => ({
+        commentId: x.commentId, faithful: opts.faithful ? opts.faithful(x) : true, reason: 'stub check',
+      })) }, label)
+    }
     if (label.startsWith('reuse#')) {
       if (opts.reuse === null) return null
       const { reuses } = payloadOf(prompt, 'Reuses')
@@ -3847,6 +3861,7 @@ test('the drafter is told both reply limits, and a draft within the words but ov
     args: { autoPush: true, maxCycles: 2 },
     reviewsPerCycle: () => reviews(++cycle === 1 ? long : 'Not so: line 3.'),
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    shorten: null,
   })
   assert.match(calls.find(c => c.label === 'reviews#1').prompt, /each point has at most 60 words and no line is over 300 characters/)
   assert.ok(logs.some(l => /no reply posted to comment 2 \(over length: .* a line 300 characters\) — withheld until a shorter draft/.test(l)), logs.join('\n'))
@@ -3860,6 +3875,7 @@ test('a reply with a point over the length limit is never posted or cut, and a s
     args: { autoPush: true, maxCycles: 1 },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: wordy }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    shorten: null,
   })
   assert.equal(long.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'nothing is posted')
   assert.ok(long.logs.some(l => /no reply posted to comment 2 \(over length: a point exceeds 60 words.*\) — withheld until a shorter draft/.test(l)), long.logs.join('\n'))
@@ -3889,11 +3905,85 @@ test('a reply with a point over the length limit is never posted or cut, and a s
   state.debt.find(([id]) => id === 2)[1].attempt.body = wordy
   const old = await run({
     args: { autoPush: true, maxCycles: 2, state: seal(state) },
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'short' }], bots: 'reviewed' },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: wordy }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(old.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'the stored long body is not resent')
+  assert.ok(!old.calls.some(c => c.label.startsWith('shorten#')), 'an offered body is never redrafted, so its long redraft is not shortened')
   assert.match(old.result.state.debt.find(([id]) => id === 2)[1].repair.error, /^over length/)
+})
+
+test('an over-length refutation draft is shortened once and posted when the rewrite fits and is found faithful', async () => {
+  // tinyusb#4019: a two-point draft whose first point was one 338-character line stayed withheld until the launch ran out.
+  const long = `- Not so: ${'x'.repeat(330)}\n- Docstring coverage: no repo check enforces it.`
+  const wordy = 'w '.repeat(61).trim()
+  const reviews = {
+    findings: [invalidFinding({ commentId: 2, line: 4 }), invalidFinding({ commentId: 3, line: 5 }), invalidFinding({ commentId: 4, line: 6 })],
+    replies: [{ commentId: 2, body: long }, { commentId: 3, body: wordy }, { commentId: 4, body: 'Not so: line 9.' }], bots: 'reviewed',
+  }
+  const { calls, result } = await run({
+    args: { autoPush: true, maxCycles: 1 }, reviews, shorten: (x) => `short ${x.commentId}`,
+  })
+  const shorten = calls.find(c => c.label === 'shorten#1')
+  assert.equal(shorten.model, 'sonnet')
+  assert.deepEqual(trailingList(shorten.prompt), [{ commentId: 2, body: long }, { commentId: 3, body: wordy }], 'only the drafts over the limits')
+  assert.deepEqual(shorten.schema.properties.replies.items.properties.commentId.enum, [2, 3])
+  assert.deepEqual(trailingList(calls.find(c => c.label === 'check-reply#1').prompt),
+    [{ commentId: 2, original: long, shortened: 'short 2' }, { commentId: 3, original: wordy, shortened: 'short 3' }])
+  assert.deepEqual(manifestOf(calls, 'replies#1').map(r => [r.commentId, r.body]), [[2, 'short 2'], [3, 'short 3'], [4, 'Not so: line 9.']])
+  assert.equal(result.pass, true, result.reason)
+  const within = await run({ args: { autoPush: true, maxCycles: 1 }, reviews: { ...reviews, replies: [reviews.replies[2]] } })
+  assert.ok(!within.calls.some(c => c.label.startsWith('shorten#')), 'a draft within the limits is not rewritten')
+})
+
+test('a shortened draft keeps the deferral lines the workflow appends', async () => {
+  const long = `Not so: ${'x'.repeat(300)}`
+  const { calls } = await run({
+    reviews: {
+      findings: [finding({ findingId: '1#1', claim: 'deferred point' }), invalidFinding({ findingId: '1#2', line: 2, claim: 'wrong' })],
+      replies: [{ commentId: 1, body: long }], bots: 'reviewed',
+    },
+    args: { deferrals: [deferral()] },
+  })
+  assert.deepEqual(trailingList(calls.find(c => c.label === 'shorten#1').prompt), [{ commentId: 1, body: long }], 'the deferral lines are not rewritten')
+  assert.match(manifestOf(calls, 'replies#1')[0].body, /^short\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
+})
+
+test('a rewrite that is lost, still long, unchecked or unfaithful leaves the draft withheld and owed', async () => {
+  const long = `Not so: ${'x'.repeat(300)}`
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: long }], bots: 'reviewed' }
+  const cases = [
+    [{ shorten: null }, 'no rewrite came back'],
+    [{ shorten: () => `still ${'y'.repeat(300)}` }, 'the rewrite is still over length'],
+    [{ faithful: () => false }, 'the rewrite changes what it says: stub check'],
+    [{ faithful: null }, 'the rewrite was not checked'],
+  ]
+  for (const [over, why] of cases) {
+    const { calls, logs, result } = await run({ args: { autoPush: true, maxCycles: 1 }, reviews, ...over })
+    assert.ok(logs.includes(`cycle 1: comment 2's over-length draft not shortened — ${why}`), logs.join('\n'))
+    assert.ok(logs.some(l => /no reply posted to comment 2 \(over length/.test(l)), logs.join('\n'))
+    assert.ok(!calls.some(c => c.label.startsWith('replies#')), 'nothing is posted')
+    assert.equal(result.reason, 'deferred-replies-unresolved')
+    assert.equal(result.state.debt.find(([id]) => id === 2)[1].attempt, undefined, 'a withheld draft is not offered')
+  }
+  const dry = await run({ args: { autoPush: false, maxCycles: 1 }, reviews })
+  assert.ok(!dry.calls.some(c => c.label.startsWith('shorten#')), 'a dry run posts nothing, so nothing is shortened')
+})
+
+test('an id the shortener or the checker answers twice gets no rewrite, and its sibling left out gets none either', async () => {
+  const long = `Not so: ${'x'.repeat(300)}`
+  const reviews = {
+    findings: [invalidFinding({ commentId: 2, line: 4 }), invalidFinding({ commentId: 3, line: 5 })],
+    replies: [{ commentId: 2, body: long }, { commentId: 3, body: long }], bots: 'reviewed',
+  }
+  for (const [garble, why] of [
+    [(l, a) => l.startsWith('shorten#') ? { replies: [a.replies[0], a.replies[0]] } : a, 'no rewrite came back'],
+    [(l, a) => l.startsWith('check-reply#') ? { verdicts: [a.verdicts[1], a.verdicts[1]] } : a, 'the rewrite was not checked'],
+  ]) {
+    const { calls, logs } = await run({ args: { autoPush: true, maxCycles: 1 }, reviews, garble })
+    for (const id of [2, 3]) assert.ok(logs.includes(`cycle 1: comment ${id}'s over-length draft not shortened — ${why}`), logs.join('\n'))
+    assert.ok(!calls.some(c => c.label.startsWith('replies#')))
+  }
 })
 
 test('an offered answer the comment outgrew is a repair, not a reuse or a repost', async () => {
