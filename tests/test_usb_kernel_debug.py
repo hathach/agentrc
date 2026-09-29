@@ -17,6 +17,7 @@ DYNDBG = SCRIPT.with_name('usb_dyndbg.sh')
 spec = importlib.util.spec_from_file_location('usbcap', SCRIPT)
 usbcap = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(usbcap)
+IS_ROOT = hasattr(os, 'geteuid') and os.geteuid() == 0
 
 LSUSB = """\
 Bus 001 Device 001: ID 1d6b:0002 Linux Foundation 2.0 root hub
@@ -64,6 +65,7 @@ class ResolveTest(unittest.TestCase):
 DATA = Path(__file__).resolve().parent / 'data' / 'usb_kernel_debug'   # real usbmon captures, host metadata stripped
 
 
+@unittest.skipIf(os.name == 'nt', 'usbmon capture requires Linux')
 @unittest.skipUnless(shutil.which('capinfos'), "needs Wireshark's capinfos")
 class CliTest(unittest.TestCase):
     """lsusb and the capturing tshark are stubs on PATH; tshark records its arguments and
@@ -227,6 +229,7 @@ drivers/usb/host/xhci-ring.c:10 [xhci_hcd]xhci_ring =flmt "no print flag\\n"
 '''
 
 
+@unittest.skipIf(os.name == 'nt', 'kernel dynamic debug requires Linux')
 class DyndbgTest(unittest.TestCase):
     """The control file is a fixture; the kernel format is file:line [module]function =flags "format"."""
 
@@ -252,6 +255,7 @@ class DyndbgTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2, 'no action is a usage error')
         self.assertIn('usage:', r.stderr)
 
+    @unittest.skipIf(IS_ROOT, 'root can traverse mode-000 directories')
     def test_missing_debugfs_and_unreadable_debugfs_are_distinct(self):
         missing = Path(self.tmp.name) / 'missing' / 'dynamic_debug' / 'control'
         missing.parent.parent.mkdir()
@@ -286,6 +290,7 @@ class DyndbgTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2, 'a second module would be silently ignored otherwise')
         self.assertIn('usage:', r.stderr)
 
+    @unittest.skipIf(IS_ROOT, 'root can read mode-000 files')
     def test_status_reports_an_unreadable_control_file(self):
         self.ctl.chmod(0o000)
         r = self._run('status')

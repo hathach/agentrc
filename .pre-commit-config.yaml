@@ -4,7 +4,7 @@ repos:
       - id: skill-tests
         name: skill-tests
         files: ^(skills/|tests/|hooks/|workflows/|install\.py$)
-        entry: python3 -m unittest discover -s tests
+        entry: python -X utf8 -m unittest discover -s tests
         pass_filenames: false
         language: python
         additional_dependencies: [pyyaml]

@@ -92,6 +92,7 @@ class ParseTest(unittest.TestCase):
         self.assertNotIn('Sleep 0', pc_sample.jlink_script(1, 0))
 
 
+@unittest.skipIf(os.name == 'nt', 'J-Link and addr2line stubs require POSIX executable semantics')
 class CliTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()

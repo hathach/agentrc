@@ -568,7 +568,7 @@ class CliSelection(unittest.TestCase):
             '1-2': {'idVendor': '2e8a', 'idProduct': '000c', 'serial': 'E661BBBB'},
             '1-3': {'idVendor': '2e8a', 'idProduct': '000c'},               # no serial string
             '1-4': {'idVendor': '0483', 'idProduct': '374b', 'serial': 'STLINK'},
-            '1-0:1.0': {},                                                  # an interface node
+            ('1-0_1.0' if os.name == 'nt' else '1-0:1.0'): {},              # an interface node
         })
         self.assertEqual(rtt.usb_serials('0x2e8a 0x000c', sysfs), ['E661AAAA', 'E661BBBB', ''])
         self.assertEqual(rtt.usb_serials('0x0483 0x374B', sysfs), ['STLINK'])

@@ -36,6 +36,7 @@ sys.exit(int(os.environ.get('FAKE_RC', '0')))
 VERIFIED = 'Info : something|RESULT verified 31136 bytes in 0.043000s|DHCSR 0x01000001'
 
 
+@unittest.skipIf(os.name == 'nt', 'OpenOCD and nm stubs require POSIX executable semantics')
 class Rp2040VerifyTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

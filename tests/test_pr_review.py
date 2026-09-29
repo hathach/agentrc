@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1730,6 +1731,7 @@ class Compare(unittest.TestCase):
 
 
 class Workflow(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_stub_harness_passes(self):
         done = subprocess.run(['node', str(ROOT / 'tests' / 'pr_review_harness.mjs')], capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)

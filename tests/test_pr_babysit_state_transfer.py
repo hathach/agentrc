@@ -3,6 +3,7 @@ import base64
 import importlib.util
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -104,6 +105,7 @@ class StateTransferTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn(f'(max {transfer.MAX})', out['error'])
 
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_sum_matches_the_workflows_fnv1a(self):
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
         fn = re.search(r'^function fnv1a \(text\) \{.*?^\}', source, re.S | re.M).group(0)

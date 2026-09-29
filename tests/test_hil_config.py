@@ -134,6 +134,7 @@ class Resolver(Config):
             self.assertTrue(MODULES['rtt'].hil_jlink_device(name, flasher), name)
 
 
+@unittest.skipIf(os.name == 'nt', 'probe CLI stubs require POSIX executable semantics')
 class Cli(Config):
     """Every probe tool is a recorder that must not run on a refusal."""
 

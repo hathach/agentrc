@@ -1,12 +1,16 @@
+import os
+import unittest
+
+if os.name == 'nt':
+    raise unittest.SkipTest('simplify-gate requires POSIX file locking')
+
 import fcntl
 import importlib.util
 import json
-import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import unittest
 from pathlib import Path
 from unittest import mock
 
