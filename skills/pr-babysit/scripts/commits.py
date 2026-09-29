@@ -11,7 +11,8 @@ lines, when git made no commit (a hook that fails or modifies a file stops it),
 or before staging anything when the message is blank.
 
 Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
--r -z`, one string per filename, unquoted) and message (`%B`, verbatim).
+-r -z`, one string per filename, unquoted) and message (`%B` without its
+trailing whitespace, which a relay drops and the seal would then refuse).
 `head` resolves HEAD once, reads everything from that SHA and adds leftover
 (`git status --porcelain -z -- PATH` records) and entries (`git ls-tree -z
 <sha> -- PATH` lines); HEAD moving while it reads is an error. PATH is never
@@ -38,7 +39,7 @@ def commit(sha):
     return {'sha': sha,
             'parents': git('show', '-s', '--format=%P', sha).split(),
             'paths': records(git('diff-tree', '--no-commit-id', '--no-renames', '--name-only', '-r', '-z', sha)),
-            'message': git('log', '-1', '--format=%B', sha)}
+            'message': git('log', '-1', '--format=%B', sha).rstrip()}
 
 
 def head(paths):

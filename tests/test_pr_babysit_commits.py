@@ -63,7 +63,7 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(out['sha'], sha)
         self.assertEqual(out['parents'], [self.base])
         self.assertEqual(sorted(out['paths']), sorted(odd))
-        self.assertEqual(out['message'], 'fix: the thing\n\nWhy it matters.\n\n')
+        self.assertEqual(out['message'], 'fix: the thing\n\nWhy it matters.')
         self.assertEqual(sorted(out['leftover']), [' M a.c', ' M src/space name.c'])
         self.assertEqual(len(out['entries']), 4)
         blob = self.git('rev-parse', f'{sha}:src/quote"name.c').strip()
@@ -112,7 +112,15 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual([c['sha'] for c in out['commits']], [one, two])
         self.assertEqual([c['parents'] for c in out['commits']], [[self.base], [one]])
         self.assertEqual([c['paths'] for c in out['commits']], [['b.c'], ['c\nd.c']], 'a name holding a newline stays whole')
-        self.assertEqual(out['commits'][1]['message'], 'two\n\n')
+        self.assertEqual(out['commits'][1]['message'], 'two')
+
+    def test_a_message_is_read_without_its_trailing_whitespace(self):
+        # A relay drops it (tinyusb#4019), and the copy then fails its seal.
+        self.write('b.c', 'b\n')
+        self.git('add', 'b.c')
+        self.git('commit', '-q', '--cleanup=verbatim', '-m', 'subject\n\nbody ends in spaces   \n\n')
+        code, out = self.run_script('head', 'b.c')
+        self.assertEqual((code, out['message']), (0, 'subject\n\nbody ends in spaces'))
 
     def test_a_name_that_is_not_utf8_is_an_error_not_a_lookalike(self):
         self.write('bad\ufffd.c', 'owned\n')
