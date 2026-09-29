@@ -225,7 +225,7 @@ async function run(opts = {}) {
       let answer
       if (/ recall /.test(text)) {
         const links = [...text.matchAll(/--check '([^']*)'/g)].map(m => m[1])
-        answer = { head, verdicts: links.filter(l => store.has(key(l))).map(l => structuredClone(store.get(key(l)))), error: null }
+        answer = { head, verdicts: links.filter(l => store.has(key(l))).map(l => structuredClone(store.get(key(l)))), left: [], error: null }
         if (opts.recall) answer = opts.recall(answer)
       } else if (/ remember /.test(text)) {
         const verdicts = trailingList(text)
@@ -1744,6 +1744,35 @@ test('a recall copy that fails its seal costs its own batch a fresh relay, and a
   assert.ok(twice.logs.some(l => /CI verdicts reused for 1 check/.test(l)), 'the other batch is recalled')
   const judged = twice.calls.find(c => c.label === 'ci:judge#2').prompt
   assert.ok(['b0', 'b1', 'b2', 'b3', 'b4'].every(b => judged.includes(`hil / ${b}`)) && !judged.includes('hil / b5'), 'only the lost batch is judged again')
+})
+
+test('a link the recall held back for room is recalled alone, and one too large to relay is judged again', async () => {
+  // tinyusb#4019: one recall line of 51 KB, a HIL job's 113 failures in it, that no relay could copy.
+  const four = Array.from({ length: 4 }, (_, i) => ({ ...RIG, check: `hil / b${i}`, cell: `b${i}` }))
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(...four).ci })
+  const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
+  // b0 never fits the line; b2 and b3 do not fit beside b1, and each comes back on a recall of its own.
+  const bounded = (alone) => (a) => a.verdicts.some(v => v.link === job(2))
+    ? { ...a, verdicts: a.verdicts.filter(v => v.link === job(2)), left: [job(3), job(4)] } : alone(a)
+  const again = (alone) => run({ store, recall: bounded(alone), args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(...four).ci })
+  const judgedOf = (r) => ['b0', 'b1', 'b2', 'b3'].filter(b => r.calls.find(c => c.label === 'ci:judge#2').prompt.includes(`hil / ${b}`))
+
+  const ok = await again(a => a)
+  assert.deepEqual(ciLabels(ok.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.2', 'ci:collect#2.r1.3', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
+  assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.2').prompt, new RegExp(` recall --check '${job(3)}' --repo `))
+  assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.3').prompt, new RegExp(` recall --check '${job(4)}' --repo `))
+  assert.ok(ok.logs.includes('cycle 2: CI verdict for hil / b0 not returned by the recall (too large to relay, or not in the store) — judged again'), ok.logs.join('\n'))
+  assert.ok(ok.logs.some(l => /CI verdicts reused for 3 check/.test(l)), ok.logs.join('\n'))
+  assert.deepEqual(judgedOf(ok), ['b0'])
+
+  const b3 = (a) => a.verdicts.some(v => v.link === job(4))
+  for (const [alone, why] of [[(a) => b3(a) ? { ...a, error: 'gone', verdicts: [], left: [] } : a, 'gone'], [(a) => b3(a) ? { ...a, verdicts: [] } : a, 'its own recall did not return it']]) {
+    const failed = await again(alone)
+    assert.ok(failed.logs.includes(`cycle 2: CI verdict not recalled for hil / b3 — ${why}`), failed.logs.join('\n'))
+    assert.ok(failed.logs.some(l => /CI verdicts reused for 2 check/.test(l)), 'the first recall and the other alone stand')
+    assert.deepEqual(judgedOf(failed), ['b0', 'b3'])
+  }
 })
 
 test('a cached verdict is reused only while its check keeps the same conclusion', async () => {

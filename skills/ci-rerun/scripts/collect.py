@@ -64,9 +64,13 @@ again after the gates too.
 remember: stores a judge's verdicts for the head beside its evidence, so a
 later launch recalls them instead of carrying them in its state. It reads a
 JSON list of {link, bucket, failures} on stdin, replaces any stored entry for
-the same link, and prints {head, error}. recall prints {head, verdicts, error}:
-the stored entries for the --check links it has, unchanged; a link it has none
-for is left out. The caller checks what comes back against its own digests.
+the same link, and prints {head, error}. recall prints {head, verdicts, left, error}:
+the stored entries for the --check links it has, unchanged and in the order
+asked, while the printed line stays within RECALL_BYTES, the most a relaying
+agent is trusted to copy whole. `left` lists the links held back only for room,
+each of which fits a recall of its own; a link it has none for, or whose entry
+cannot fit the line even alone, is left out of both. The caller checks what comes back
+against its own digests.
 """
 
 import argparse
@@ -101,6 +105,7 @@ DIAGNOSTIC = re.compile(r'\b(?:error|Error|ERROR|FAIL|FAILED|Failed|failed|[Aa]s
 DURATION = re.compile(r'\s+in \d+(?:\.\d+)?s\b')
 FILES = re.compile(r'[\w./-]+\.(?:c|h|cc|cpp|hpp|py|S|s|ld|cmake|mk|ya?ml|json)\b')
 KEEP = 20
+RECALL_BYTES = 8192  # unmeasured: a relay copied 3.5 KB whole and failed at 28 KB and 51 KB (agentrc#9, #23, #20)
 SHA = re.compile(r'[0-9a-f]{40}')
 HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HIL_PROFILE=1 prefixes epoch seconds
 HIL_FAILED = ('Failed:', 'Flash Failed:')
@@ -248,7 +253,21 @@ def remember(repo, pr, head, text):
 
 def recall(repo, pr, head, links):
     stored = stored_verdicts(evidence_dir(repo, pr, head))
-    return {'head': head, 'verdicts': [stored[link] for link in links if link in stored]}
+    known = [link for link in links if link in stored]
+
+    def fits(verdicts, left):
+        return len(json.dumps(sealed({'head': head, 'verdicts': verdicts, 'left': left}))) + 1 <= RECALL_BYTES
+
+    # Room is kept for every link still to come, so the line holds whatever is held back;
+    # a link held back fits a recall of its own, which lists none.
+    verdicts, left = [], []
+    for i, link in enumerate(known):
+        rest = known[i + 1:]
+        if fits([*verdicts, stored[link]], left + rest):
+            verdicts.append(stored[link])
+        elif fits([stored[link]], []) and fits(verdicts, [*left, link, *rest]):
+            left.append(link)
+    return {'head': head, 'verdicts': verdicts, 'left': left}
 
 
 def clean(text):

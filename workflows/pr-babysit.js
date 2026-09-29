@@ -367,10 +367,15 @@ const VERDICT = {
   type: 'object', additionalProperties: false, required: ['link', 'bucket', 'failures'],
   properties: { link: { type: 'string' }, bucket: { type: 'string' }, failures: { type: 'array', items: CI_FAILURE } },
 }
-const RECALL_PER_CALL = 5 // about 700 bytes a verdict on #3988, whose 40 in one line failed their seal twice
+// collect.py's RECALL_BYTES bounds a recall line; the count keeps the calls parallel and a
+// failed seal's cost to its own batch (#9: #3988's 40 verdicts in one line failed twice).
+const RECALL_PER_CALL = 5
+// `left`: the asked links collect.py held back to keep its line short enough to relay.
 const RECALLED = withSeal({
-  type: 'object', required: ['head', 'verdicts'],
-  properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT } },
+  type: 'object', required: ['head', 'verdicts', 'left'],
+  properties: {
+    error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT }, left: { type: 'array', items: { type: 'string' } },
+  },
 })
 const REMEMBERED = withSeal({
   type: 'object', required: ['head'],
@@ -2148,25 +2153,39 @@ const ciLaneRun = async (cycle, lanes) => {
   const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
   const unread = failing.filter(c => reusable(c) && !ciVerdicts.get(c.link).failures)
-  // A few links to a call: one sealed line grows with the HIL matrix, and a copy that
-  // fails its seal costs its own batch a fresh relay, the rest nothing (#9).
-  const batches = groupsOf(unread, RECALL_PER_CALL)
-  const recalled = await parallel(batches.map((batch, k) => () =>
-    collect(`ci:collect#${cycle}.r${k + 1}`, `recall ${batch.map(c => `--check ${shq(c.link)}`).join(' ')}`, RECALLED)))
-  batches.forEach((batch, k) => {
-    const got = recalled[k]
+  // A few links to a call: a copy that fails its seal costs its own batch a fresh
+  // relay, the rest nothing (#9). collect.py bounds each line; a link it held back
+  // for room is recalled alone, which always fits.
+  const recallOf = (label, links) => collect(label, `recall ${links.map(c => `--check ${shq(c.link)}`).join(' ')}`, RECALLED)
+  const recallBatch = async (batch, k) => {
+    const label = `ci:collect#${cycle}.r${k + 1}`
+    const got = await recallOf(label, batch)
     const why = faultOf(got, inv.head)
     if (why) log(`cycle ${cycle}: CI verdicts not recalled for ${batch.map(c => c.name).join(', ')} — ${why}`)
+    const verdicts = why ? [] : [...got.verdicts]
+    const lost = why ? [...batch] : []
+    const heldBack = why ? [] : batch.filter(c => got.left.includes(c.link))
+    const alone = await parallel(heldBack.map((c, j) => () => recallOf(`${label}.${j + 2}`, [c])))
+    heldBack.forEach((c, j) => {
+      const fault = faultOf(alone[j], inv.head)
+      const v = fault ? undefined : alone[j].verdicts.find(v => v.link === c.link)
+      if (v) verdicts.push(v)
+      else {
+        lost.push(c)
+        log(`cycle ${cycle}: CI verdict not recalled for ${c.name} — ${fault || 'its own recall did not return it'}`)
+      }
+    })
     for (const c of batch) {
       const e = ciVerdicts.get(c.link)
-      const v = why ? undefined : got.verdicts.find(v => v.link === c.link)
+      const v = verdicts.find(v => v.link === c.link)
       if (v && verdictDigest(v) === e.digest) e.failures = v.failures
       else {
-        if (!why) log(`cycle ${cycle}: CI verdict for ${c.name} ${v ? 'recalled with another digest' : 'not in the store'} — judged again`)
+        if (!lost.includes(c)) log(`cycle ${cycle}: CI verdict for ${c.name} ${v ? 'recalled with another digest' : 'not returned by the recall (too large to relay, or not in the store)'} — judged again`)
         ciVerdicts.delete(c.link)
       }
     }
-  })
+  }
+  await parallel(groupsOf(unread, RECALL_PER_CALL).map((batch, k) => () => recallBatch(batch, k)))
   const cached = failing.filter(reusable)
   const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c) && !gated.includes(c))
   const report = {

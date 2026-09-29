@@ -543,7 +543,11 @@ class VerdictsTest(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out), mock.patch('sys.stdin', io.StringIO(stdin)):
             rc = collect.main([command, '--repo', 'o/r', '--pr', '5', '--head', HEAD, *argv])
-        return rc, unsealed(out.getvalue())
+        self.printed = out.getvalue()
+        return rc, unsealed(self.printed)
+
+    def entry(self, n, size, link=JOB):
+        return {**self.ENTRY, 'link': link.format(n), 'failures': [{**self.ENTRY['failures'][0], 'firstError': 'x' * size}]}
 
     def test_recall_returns_what_was_remembered_unchanged_and_skips_unknown_links(self):
         self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY])), (0, {'head': HEAD}))
@@ -558,7 +562,53 @@ class VerdictsTest(unittest.TestCase):
         self.assertEqual([(v['link'], v['bucket']) for v in verdicts], [(JOB.format(3), 'cancel'), (JOB.format(4), 'fail')])
 
     def test_nothing_remembered_recalls_nothing(self):
-        self.assertEqual(self.main('recall', '--check', JOB.format(3)), (0, {'head': HEAD, 'verdicts': []}))
+        self.assertEqual(self.main('recall', '--check', JOB.format(3)), (0, {'head': HEAD, 'verdicts': [], 'left': []}))
+
+    def test_recall_holds_back_what_does_not_fit_the_line_and_leaves_out_what_never_fits(self):
+        # tinyusb#4019: one 51 KB line, a HIL job's 113 failures among them, no relay could copy.
+        huge, small, other, medium = self.entry(3, 3000), self.entry(4, 300), self.entry(5, 300), self.entry(6, 900)
+        self.main('remember', stdin=json.dumps([huge, small, other, medium]))
+        with mock.patch.object(collect, 'RECALL_BYTES', 2000):
+            _, r = self.main('recall', *[a for n in (3, 4, 5, 6) for a in ('--check', JOB.format(n))])
+            self.assertLessEqual(len(self.printed), 2000, 'the printed line, seal and newline included')
+            self.assertEqual((r['verdicts'], r['left']), ([small, other], [JOB.format(6)]), 'the huge one is in neither')
+            rc, again = self.main('recall', '--check', JOB.format(6))
+            self.assertEqual((rc, again['verdicts'], again['left']), (0, [medium], []), 'a held-back link fits the next recall')
+
+    def test_a_verdict_that_fits_only_without_the_links_already_taken_is_still_returned(self):
+        # Room is reserved for the links still to come, not for those already in the line.
+        entries = [self.entry(n, 10) for n in (3, 4, 5, 6)] + [self.entry(7, 0)]
+        self.main('remember', stdin=json.dumps(entries))
+        checks = [a for n in (3, 4, 5, 6, 7) for a in ('--check', JOB.format(n))]
+        with mock.patch.object(collect, 'RECALL_BYTES', 10 ** 6):
+            self.main('recall', *checks)
+        budget = len(self.printed)  # all five, exactly: the last one fits only with no left to list
+        with mock.patch.object(collect, 'RECALL_BYTES', budget):
+            _, r = self.main('recall', *checks)
+        self.assertEqual((r['verdicts'], r['left']), (entries, []))
+
+    def test_a_verdict_that_fits_alone_but_not_beside_the_other_links_is_held_back_not_dropped(self):
+        big, smalls = self.entry(3, 3000), [self.entry(n, 10) for n in (4, 5, 6, 7)]
+        self.main('remember', stdin=json.dumps([big, *smalls]))
+        self.main('recall', '--check', JOB.format(3))
+        alone = len(self.printed)
+        checks = [a for n in (3, 4, 5, 6, 7) for a in ('--check', JOB.format(n))]
+        with mock.patch.object(collect, 'RECALL_BYTES', alone + 50):  # less than the other four links take to list
+            _, r = self.main('recall', *checks)
+            self.assertEqual((r['verdicts'], r['left']), (smalls, [JOB.format(3)]))
+            self.assertEqual(self.main('recall', '--check', JOB.format(3))[1]['verdicts'], [big], 'recalled alone')
+
+    def test_links_held_back_never_push_the_line_over_its_bound(self):
+        # Long links take room to list: listing them all in `left` must not break the bound.
+        link = 'https://ci.example/' + 'y' * 600 + '/{}'
+        entries = [self.entry(n, 10, link) for n in range(5)]
+        self.main('remember', stdin=json.dumps(entries))
+        with mock.patch.object(collect, 'RECALL_BYTES', 3000):
+            _, r = self.main('recall', *[a for e in entries for a in ('--check', e['link'])])
+            self.assertLessEqual(len(self.printed), 3000)
+            self.assertTrue(r['left'], 'the fixture holds some back')
+            for held in r['left']:
+                self.assertEqual(self.main('recall', '--check', held)[1]['verdicts'], [next(e for e in entries if e['link'] == held)], 'each fits alone')
 
     def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
         for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}])):
