@@ -5534,6 +5534,29 @@ test('stateRef loads the saved state as checksummed chunks, exactly', async () =
   assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
 })
 
+test('a state whose cycles are spent stops after the first loader, before the rest loads', async () => {
+  // tinyusb#4019: a relaunch at 5 of 5 ran five state:load agents only to stop.
+  const { state, stateRef } = await savedForLoad()
+  const spent = { args: { yieldAfterCycle: true, maxCycles: 1, stateRef }, load: state }
+  const stopped = await run(spent)
+  assert.deepEqual(stopped.labels, ['state:load#1'])
+  assert.deepEqual(stopped.result, { pass: false, status: 'blocked', reason: 'budget-exhausted-unverified',
+    detail: "the loader's copy of the state shows 1 of 1 cycles used, unverified by its seal", stateRef })
+  const full = seal({ ...state, maxCycles: 1 })
+  const fullRef = { ...stateRef, digest: full.digest }
+  const byState = await run({ args: { yieldAfterCycle: true, stateRef: fullRef }, load: full })
+  assert.equal(byState.result.reason, 'budget-exhausted-unverified', 'the state\'s own ceiling when the launch names none')
+  const raised = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef: fullRef }, load: full })
+  assert.deepEqual(raised.labels.slice(0, 2), ['state:load#1', 'preflight'], 'a larger maxCycles loads and runs')
+  // A budget mis-copied without its seal is ignored; the full load's check still stops the launch.
+  const miscopied = await run({ ...spent, copy: (env) => ({ ...env, budget: { ...env.budget, cyclesUsed: 0 } }) })
+  assert.equal(miscopied.result.reason, 'budget-exhausted')
+  assert.ok(miscopied.result.state, 'stopped by the sealed state')
+  // One "corrected" together with its seal passes: why the early stop is only unverified.
+  const corrected = await run({ ...spent, copy: (env) => ({ ...env, budget: sealLine({ cyclesUsed: 0, maxCycles: 1 }) }) })
+  assert.equal(corrected.result.reason, 'budget-exhausted', 'a copy that says cycles are left loads the state, whose check decides')
+})
+
 test('a mis-copied, missing or duplicated chunk is asked for again alone', async () => {
   const { state, stateRef } = await savedForLoad()
   const last = transferOf(state).chunks.length - 1

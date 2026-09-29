@@ -70,6 +70,7 @@ class StateTransferTest(unittest.TestCase):
             size = transfer.SIZE if c['i'] < total - 1 else env['length'] - transfer.SIZE * (total - 1)
             self.assertEqual(len(base64.b64decode(c['data'], validate=True)), size, 'each chunk decodes alone')
             self.assertEqual(c['sum'], transfer.fnv1a(c['data']))
+        self.assertEqual(env['budget'], transfer.sealed({'cyclesUsed': 3, 'maxCycles': 5}), 'the budget, sealed, checkable before the rest loads')
 
     def test_chunks_names_a_subset_with_the_same_metadata(self):
         _, full = self.run_script(self.file)

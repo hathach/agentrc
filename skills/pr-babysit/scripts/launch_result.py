@@ -14,8 +14,9 @@ complete) is listed by its cell per check, and --keys adds each one's key.
 and state, which are condensed; receipts are kept verbatim, each reply receipt
 with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings on
 its comment (a refutedPosts reply answers stale findings as well as invalid ones).
-`blockers` lists what
-the caller must settle before trusting or continuing the launch, `notes` what is
+`budget` is the returned state's
+cyclesUsed and maxCycles. `blockers` lists what the caller must settle before
+trusting or continuing the launch, a spent cycle budget included; `notes` what is
 absent but harmless.
 """
 import json
@@ -127,7 +128,7 @@ def checkout(path):
 
 def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     blockers, notes = [], []
-    summary = {'launch': None, 'result': None, 'stateRef': None, 'observation': None, 'receipts': None,
+    summary = {'launch': None, 'result': None, 'stateRef': None, 'budget': None, 'observation': None, 'receipts': None,
                'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
     result = output.get('result') if output else None
     if output is None:
@@ -141,6 +142,13 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         summary['result'] = {k: v for k, v in result.items() if k not in CONDENSED}
         if result.get('state') and result.get('stateDigest'):
             summary['stateRef'] = {'outputFile': output_path, 'digest': result['stateDigest']}
+            used, most = result['state'].get('cyclesUsed'), result['state'].get('maxCycles')
+            summary['budget'] = {'cyclesUsed': used, 'maxCycles': most}
+            if result.get('pass') is not True and isinstance(used, int) and isinstance(most, int) and used >= most:
+                blockers.append(f'cycle budget spent: {used} of {most}; a relaunch needs a larger maxCycles, the user\'s decision')
+        if result.get('reason') == 'budget-exhausted-unverified':
+            blockers.append('the launch stopped before loading its state, whose copy showed the cycle budget spent; '
+                            'the launch that saved that state is the authority: read it before relaunching')
         obs = result.get('observation') or {}
         reviews, ci, actions = obs.get('reviews') or {}, obs.get('ci'), obs.get('actions') or {}
         summary['observation'] = {

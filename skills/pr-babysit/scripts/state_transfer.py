@@ -11,8 +11,10 @@ carries sum, the FNV-1a of its data as the workflow computes it: it locates a
 copy error, while the state's own seal stays the check on the whole.
 
 stdout ends with one JSON line {v, digest, length, size, chunks: [{i, data,
-sum}]}: the first PER_CALL chunks, or those --chunks names, at most PER_CALL;
-a model copying more mangles or truncates them. Exit 0 with that line; exit 2
+sum}], budget}: the first PER_CALL chunks, or those --chunks names, at most PER_CALL;
+a model copying more mangles or truncates them. budget is the state's
+{cyclesUsed, maxCycles} with its facts.sealed seal, so a launch whose cycles are
+spent can stop before loading the rest. Exit 0 with that line; exit 2
 with {"error": ...} when FILE holds no state, the state exceeds MAX bytes or
 the arguments are wrong. Never writes.
 """
@@ -23,7 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Parser, Unusable, fnv1a, report  # noqa: E402
+from facts import Parser, Unusable, fnv1a, report, sealed  # noqa: E402
 
 VERSION = 1
 SIZE = 512
@@ -75,7 +77,8 @@ def collect(argv):
     for i in ids:
         data = base64.b64encode(payload[i * SIZE:(i + 1) * SIZE]).decode('ascii')
         chunks.append({'i': i, 'data': data, 'sum': fnv1a(data)})
-    return {'v': VERSION, 'digest': state['digest'], 'length': len(payload), 'size': SIZE, 'chunks': chunks}
+    budget = sealed({'cyclesUsed': state.get('cyclesUsed'), 'maxCycles': state.get('maxCycles')})
+    return {'v': VERSION, 'digest': state['digest'], 'length': len(payload), 'size': SIZE, 'chunks': chunks, 'budget': budget}
 
 
 if __name__ == '__main__':

@@ -121,6 +121,23 @@ class LaunchResultTest(unittest.TestCase):
         self.assertIn("the checkout is dirty: ['?? left.txt']", s['blockers'], 'even without a result')
         self.assertIn('no new state', s['notes'][0])
 
+    def test_a_spent_cycle_budget_is_a_blocker(self):
+        rc, s = self.run_it(output(result={'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}))
+        self.assertEqual(s['budget'], {'cyclesUsed': 5, 'maxCycles': 5})
+        self.assertIn("cycle budget spent: 5 of 5; a relaunch needs a larger maxCycles, the user's decision", s['blockers'])
+        rc, s = self.run_it(output(result={'state': {'expectedHead': NEXT, 'cyclesUsed': 4, 'maxCycles': 5}}))
+        self.assertEqual((s['budget'], s['blockers']), ({'cyclesUsed': 4, 'maxCycles': 5}, []))
+        rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}))
+        self.assertEqual(s['blockers'], [], 'a launch that passed on its last cycle needs no relaunch')
+
+    def test_a_launch_stopped_at_load_is_a_blocker_and_keeps_the_state_it_was_given(self):
+        # tinyusb#4019: a relaunch at 5 of 5 loaded its whole state only to stop.
+        stopped = {'agentCount': 1, 'totalTokens': 30000, 'logs': [], 'workflowProgress': [], 'result': {
+            'pass': False, 'status': 'blocked', 'reason': 'budget-exhausted-unverified', 'detail': 'shows 5 of 5', 'stateRef': {'outputFile': '/t/w1.output', 'digest': '4841042f'}}}
+        rc, s = self.run_it(stopped, '--state-ref', '/t/w1.output:4841042f')
+        self.assertEqual((s['stateRef'], s['budget']), ({'outputFile': '/t/w1.output', 'digest': '4841042f'}, None))
+        self.assertTrue(any(b.startswith('the launch stopped before loading its state') for b in s['blockers']), s['blockers'])
+
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):
         data = output()
         obs = data['result']['observation']

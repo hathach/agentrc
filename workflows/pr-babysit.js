@@ -158,6 +158,11 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const sealOf = ({ digest, ...st }) => fnv1a(canonical(JSON.parse(JSON.stringify(st))))
+// facts.py's seal: fnv1a over the canonical JSON with null members left out. A
+// checked line has no error, so one a relay filled in (error: '') is not hashed.
+const bare = (v) => Array.isArray(v) ? v.map(bare)
+  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
+const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
 // The schema of a script line facts.py seals; relayAgent checks the copy against it.
 const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
@@ -185,6 +190,8 @@ if (args.stateRef != null) {
       // Chunk fields are optional so one chunk copied without its sum costs that chunk, not the reply.
       chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
+      budget: { type: 'object', additionalProperties: false,
+        properties: { cyclesUsed: { type: 'integer' }, maxCycles: { type: 'integer' }, seal: { type: 'string' } } },
     },
   }
   let why = ''
@@ -193,14 +200,14 @@ if (args.stateRef != null) {
   let idle = 0 // consecutive rounds that checked no new chunk
   let call = 0
   const reset = (reason) => { why = reason; length = 0; got = new Map() }
+  const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
+    env.digest === ref.digest && Array.isArray(env.chunks)
   // One reply: false when it dropped what was retained, else whether it added a chunk.
   const take = (env, asked) => {
     if (!env) return false
     if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
-    const fresh = env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
-      env.digest === ref.digest && Array.isArray(env.chunks)
     // A malformed copy costs its own reply; a differing length drops what was retained.
-    if (!fresh) { why = 'the envelope metadata is malformed'; return false }
+    if (!fresh(env)) { why = 'the envelope metadata is malformed'; return false }
     if (length && env.length !== length) { reset('the envelope length changed'); return false }
     length = env.length
     const want = new Set(asked || indices().slice(0, PER_CALL))
@@ -227,6 +234,17 @@ if (args.stateRef != null) {
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, model: 'sonnet', effort: 'low', schema: ENVELOPE },
     ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
+    // Spent cycles stop the load early. The seal catches a mis-copied number but not one
+    // "corrected" together with it, so the stop is unverified: the launch that saved the
+    // state is the authority, and this one returns the stateRef it was given.
+    const budget = replies.map(env => env && fresh(env) && env.budget)
+      .find(b => b && Number.isInteger(b.cyclesUsed) && Number.isInteger(b.maxCycles) && sealMatches(b))
+    const ceiling = budget && (args.maxCycles ?? budget.maxCycles)
+    if (budget && ceiling <= budget.cyclesUsed) {
+      const detail = `the loader's copy of the state shows ${budget.cyclesUsed} of ${ceiling} cycles used, unverified by its seal`
+      log(`state: ${detail} — nothing loaded further`)
+      return { pass: false, status: 'blocked', reason: 'budget-exhausted-unverified', detail, stateRef: ref }
+    }
     let added = false
     replies.forEach((env, g) => { added = take(env, groups[g]) || added })
     const left = missingOf()
@@ -731,11 +749,6 @@ const relayAgent = async (prompt, opts) => {
 const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(e => { log(`${opts.label} errored — ${e && e.message}`); return null })
 const retryOpts = (opts) => ({ ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
 const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRun(retryPrompt, retryOpts(opts))
-// facts.py's seal: fnv1a over the canonical JSON with null members left out. A
-// checked line has no error, so one a relay filled in (error: '') is not hashed.
-const bare = (v) => Array.isArray(v) ? v.map(bare)
-  : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
-const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 // A verified reply that settles its comment: a review thread only once resolved.
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
