@@ -366,6 +366,7 @@ const VERDICT = {
   type: 'object', additionalProperties: false, required: ['link', 'bucket', 'failures'],
   properties: { link: { type: 'string' }, bucket: { type: 'string' }, failures: { type: 'array', items: CI_FAILURE } },
 }
+const RECALL_PER_CALL = 5 // about 700 bytes a verdict on #3988, whose 40 in one line failed their seal twice
 const RECALLED = withSeal({
   type: 'object', required: ['head', 'verdicts'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT } },
@@ -2061,11 +2062,16 @@ const ciLaneRun = async (cycle, lanes) => {
   const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
   const unread = failing.filter(c => reusable(c) && !ciVerdicts.get(c.link).failures)
-  if (unread.length) {
-    const got = await collect(`ci:collect#${cycle}.r`, `recall ${unread.map(c => `--check ${shq(c.link)}`).join(' ')}`, RECALLED)
+  // A few links to a call: one sealed line grows with the HIL matrix, and a copy that
+  // fails its seal costs its own batch a fresh relay, the rest nothing (#9).
+  const batches = [...Array(Math.ceil(unread.length / RECALL_PER_CALL)).keys()].map(k => unread.slice(k * RECALL_PER_CALL, (k + 1) * RECALL_PER_CALL))
+  const recalled = await parallel(batches.map((batch, k) => () =>
+    collect(`ci:collect#${cycle}.r${k + 1}`, `recall ${batch.map(c => `--check ${shq(c.link)}`).join(' ')}`, RECALLED)))
+  batches.forEach((batch, k) => {
+    const got = recalled[k]
     const why = faultOf(got, inv.head)
-    if (why) log(`cycle ${cycle}: CI verdicts not recalled — ${why}`)
-    for (const c of unread) {
+    if (why) log(`cycle ${cycle}: CI verdicts not recalled for ${batch.map(c => c.name).join(', ')} — ${why}`)
+    for (const c of batch) {
       const e = ciVerdicts.get(c.link)
       const v = why ? undefined : got.verdicts.find(v => v.link === c.link)
       if (v && verdictDigest(v) === e.digest) e.failures = v.failures
@@ -2074,7 +2080,7 @@ const ciLaneRun = async (cycle, lanes) => {
         ciVerdicts.delete(c.link)
       }
     }
-  }
+  })
   const cached = failing.filter(reusable)
   const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c) && !gated.includes(c))
   const report = {

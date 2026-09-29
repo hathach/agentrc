@@ -1578,8 +1578,8 @@ test('a same-head relaunch recalls the judged verdicts from the store: no judge'
   assert.deepEqual(ciLabels(first.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w'])
   assert.deepEqual(Object.keys(first.result.state.ciCache.entries[0]).sort(), ['bucket', 'digest', 'head', 'link'], 'the state keeps digests only')
   const again = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r'])
-  assert.match(again.calls.find(c => c.label === 'ci:collect#2.r').prompt, / recall --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/1' --repo /)
+  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r1'])
+  assert.match(again.calls.find(c => c.label === 'ci:collect#2.r1').prompt, / recall --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/1' --repo /)
   assert.equal(again.result.history.at(-1).ci.realFailures[0].firstError, 'board did not enumerate')
   assert.ok(again.logs.some(l => /CI verdicts reused for 1 check\(s\)/.test(l)))
   assert.deepEqual(again.result.state.ciCache.entries, first.result.state.ciCache.entries, 'a recalled verdict stays remembered')
@@ -1656,7 +1656,7 @@ test('verdicts of any size cost the state a digest each', async () => {
   assert.equal(full.result.state.ciCache.entries.length, 12)
   assert.ok(JSON.stringify(full.result.state.ciCache).length < 3 * 1024)
   const again = await run({ store, args: { ...YIELD, state: full.result.state }, reviews: WAITING, ci: redWith(...many).ci })
-  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r'])
+  assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r2', 'ci:collect#2.r3'], 'five links to a recall')
   assert.equal(again.result.history.at(-1).ci.realFailures.length, 12)
 })
 
@@ -1687,7 +1687,7 @@ test('a verdict the store lost or garbled is reused by its launch, then judged a
     const within = await run({ store: new Map(), remember, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
     assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w', ...retried, 'ci:collect#2.1'], 'its own launch reuses it')
     const again = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
-    assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
+    assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
   }
 })
 
@@ -1708,12 +1708,30 @@ test('a recalled verdict that is missing or fails its digest is judged again', a
   }
 })
 
+test('a recall copy that fails its seal costs its own batch a fresh relay, and a re-judge only if that fails too', async () => {
+  // #3988: one 28 KB recall line lost every failure's cell, then a firstError; the seal voided all 40 verdicts.
+  const six = Array.from({ length: 6 }, (_, i) => ({ ...RIG, check: `hil / b${i}`, cell: `b${i}` }))
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(...six).ci })
+  const dropCell = (a) => ({ ...a, verdicts: a.verdicts.map(v => ({ ...v, failures: v.failures.map(({ cell, ...f }) => f) })) })
+  const again = (only) => run({ store, garble: (l, a) => only(l) ? dropCell(a) : a, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(...six).ci })
+  const once = await again(l => l === 'ci:collect#2.r1')
+  assert.deepEqual(ciLabels(once.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r2', 'ci:collect#2.r1.retry'])
+  assert.equal(once.calls.find(c => c.label === 'ci:collect#2.r1.retry').model, 'sonnet')
+  assert.equal(once.result.history.at(-1).ci.realFailures.length, 6)
+  const twice = await again(l => l.startsWith('ci:collect#2.r1'))
+  assert.ok(twice.logs.some(l => /CI verdicts not recalled for hil \/ b0, .*hil \/ b4 — the collector died/.test(l)), twice.logs.join('\n'))
+  assert.ok(twice.logs.some(l => /CI verdicts reused for 1 check/.test(l)), 'the other batch is recalled')
+  const judged = twice.calls.find(c => c.label === 'ci:judge#2').prompt
+  assert.ok(['b0', 'b1', 'b2', 'b3', 'b4'].every(b => judged.includes(`hil / ${b}`)) && !judged.includes('hil / b5'), 'only the lost batch is judged again')
+})
+
 test('a cached verdict is reused only while its check keeps the same conclusion', async () => {
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   assert.equal(first.result.state.ciCache.entries[0].bucket, 'fail')
   const cancelled = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: { ...redWith(RIG).ci, bucket: 'cancel' } })
-  assert.equal(cancelled.labels.includes('ci:collect#2.r'), false, 'nothing to recall for another conclusion')
+  assert.equal(cancelled.labels.includes('ci:collect#2.r1'), false, 'nothing to recall for another conclusion')
   assert.ok(cancelled.labels.includes('ci:judge#2'), 'a conclusion updated under the same link is judged again')
   assert.deepEqual(cancelled.result.state.ciCache.entries.map(e => e.bucket), ['cancel'], 'and its new verdict replaces the old')
 })
