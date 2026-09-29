@@ -266,6 +266,7 @@ if (args.state !== undefined && args.state !== null) {
     (st.acceptedFailures === undefined || Array.isArray(st.acceptedFailures)) &&
     (st.decisions === undefined || Array.isArray(st.decisions)) &&
     (st.holds === undefined || Array.isArray(st.holds)) &&
+    (st.reanswer === undefined || Array.isArray(st.reanswer)) &&
     (st.ciCache === undefined || ciCacheShaped(st.ciCache)) &&
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
@@ -863,6 +864,9 @@ const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPus
 // the SonarCloud issue it may name is not settled; kept without markSonar too,
 // so a later launch that has it can still mark it.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
+// Comments edited after we answered them, until answered again: the one reply
+// of ours reply.py may post beside, since without it any reply of ours holds.
+const reanswer = new Set((restored && restored.reanswer) || [])
 // commentId -> { dismissals, notes }: dismissals relied on without telling the
 // reviewer, and the valid or deferred findings still owed a note. Standing
 // debt, not a snapshot: a harvest that drops a finding does not settle it.
@@ -943,6 +947,7 @@ const stateOut = () => {
     acceptedFailures: acceptedArg,
     decisions: [...decisions],
     holds: [...holds],
+    ...(reanswer.size ? { reanswer: [...reanswer] } : {}),
     ciCache: {
       notesDigest, judgedHead: ciJudgedHead, reruns: ciReruns.filter(r => r.head === expectedHead),
       entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest }) => ({ head, link, bucket, digest })),
@@ -1773,6 +1778,7 @@ let napMs = 0 // backoff owed from the previous cycle, taken after its summary
 // comment body's the answer addressed.
 const pay = (commentId, how, digest, sonarNote) => {
   answeredWith.set(commentId, { how, digest, ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
+  reanswer.delete(commentId)
   const d = debt.get(commentId)
   if (!d) return
   d.notes.clear()
@@ -1822,7 +1828,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)
     const out = a ? a.body : body
     if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId) }
-    replies.push({ commentId, body: out, digest: fnv1a(out) })
+    replies.push({ commentId, body: out, digest: fnv1a(out), ...(reanswer.has(commentId) ? { secondAnswer: true } : {}) })
     if (scanning) sonarNotes.set(commentId, out)
   }
   if (replies.length === 0) return { pass: false, detail: 'nothing publishable', receipts: [] }
@@ -1857,7 +1863,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
       // contradictory and can neither retire nor pay.
       if (r.replyId === null && !r.sent && !r.posted && r.verified === false && r.resolved === null) {
         log(`cycle ${cycle}: comment ${commentId} is not on PR #${args.pr} — owes nothing`)
-        debt.delete(commentId); retired.add(commentId); settled.add(commentId)
+        debt.delete(commentId); reanswer.delete(commentId); retired.add(commentId); settled.add(commentId)
       } else if (r.replyId !== null) repair(commentId, r.replyId, 'contradictory receipt')
       else log(`cycle ${cycle}: ${label} receipt for comment ${commentId} says none and a POST — not trusted`)
       continue
@@ -2384,6 +2390,7 @@ const runCycle = async (cycle, entry) => {
       if (prior && prior.digest !== undefined && prior.digest !== f.commentDigest) {
         log(`cycle ${cycle}: comment ${f.commentId} was edited after we answered it — its points owe an answer again`)
         answeredWith.delete(f.commentId)
+        reanswer.add(f.commentId)
       }
       const answered = answeredWith.has(f.commentId)
       let d = debt.get(f.commentId)

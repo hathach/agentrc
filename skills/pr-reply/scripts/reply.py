@@ -5,8 +5,8 @@
   reply.py --pr N --inspect COMMENT:REPLY [COMMENT:REPLY ...] [--repo OWNER/NAME]
   reply.py --pr N --reuse FILE [--repo OWNER/NAME]
 
-FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>", "resolve": <bool>}, ...]},
-digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
+FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>", "resolve": <bool>,
+"secondAnswer": <bool>}, ...]}, digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
 which the body must match before anything is posted; resolve (default true)
 false leaves a review reply's thread open, for an answer that upholds a point. Each commentId names one
 of three things on the PR: a review comment (an inline thread), an issue comment,
@@ -15,12 +15,15 @@ would not anchor inline). A review reply is read back and must match the body,
 the parent, our login and the PR before its thread is resolved; the other two
 have no thread: the reply is an issue comment whose body is the original's URL
 as a quote line plus the text. A reply of ours with the identical body already
-there is reused, never posted twice. That thread is never resolved, so a run
-that lost its state would answer it again in new words: a reply of ours quoting
-it with the same kind of answer (a fix note, which starts with "Fixed in ", or
-anything else) in other words is not posted over and not verified; its receipt
-names it with verified false, for a human to reconcile. Nothing is ever edited
-or deleted.
+there is reused, never posted twice. A caller that lost its state would answer
+a comment again in new words, so any other reply of ours to it (an inline
+reply in its thread, or a comment of ours quoting it) is not posted over and
+not verified; its receipt names it with verified false, for a human to
+reconcile. secondAnswer (default false) true says the caller knows it answered
+before and owes a new answer, to a comment edited since: an inline reply is
+then posted, while a comment of ours quoting it with the same kind of answer (a
+fix note, which starts with "Fixed in ", or anything else) still blocks, since
+that thread is never resolved. Nothing is ever edited or deleted.
 
 stdout ends with one JSON line {"receipts": [{"commentId", "kind", "replyId",
 "digest", "sent", "posted", "verified", "resolved", "error"}]}: kind is
@@ -145,15 +148,20 @@ class Poster:
             raise ApiError(f'id {comment_id} is ambiguous on PR #{self.pr}: {", ".join(k for k, _ in found)}')
         return found[0] if found else ('none', None)
 
-    def existing(self, kind, comment_id, body):
-        """The (id, body) of our identical reply, else of our quoting reply giving the same kind of answer, or None."""
+    def existing(self, kind, comment_id, body, second_answer=False):
+        """The (id, body) of our identical reply, else of the reply of ours this one must not be posted over:
+        any other, or with second_answer only a quoting one giving the same kind of answer; None when there is none."""
         if kind == 'review':
-            return next(((c['id'], c['body']) for c in self.review_comments() if c['user']['login'] == self.me
-                         and c.get('in_reply_to_id') == comment_id and c['body'] == body), None)
-        quote = body.partition('\n\n')[0] + '\n\n'
-        ours = [c for c in self.issue_comments() if c['user']['login'] == self.me and c['body'].startswith(quote)]
-        same = [c for c in ours if c['body'] == body] or [c for c in ours if is_fix_note(c['body']) == is_fix_note(body)]
-        return (same[0]['id'], same[0]['body']) if same else None
+            ours = [c for c in self.review_comments() if c['user']['login'] == self.me and c.get('in_reply_to_id') == comment_id]
+        else:
+            quote = body.partition('\n\n')[0] + '\n\n'
+            ours = [c for c in self.issue_comments() if c['user']['login'] == self.me and c['body'].startswith(quote)]
+        blocking = [c for c in ours if c['body'] == body]
+        if not blocking and not second_answer:
+            blocking = ours
+        elif not blocking and kind != 'review':
+            blocking = [c for c in ours if is_fix_note(c['body']) == is_fix_note(body)]
+        return (blocking[0]['id'], blocking[0]['body']) if blocking else None
 
     def post(self, kind, comment_id, body):
         if kind == 'review':
@@ -300,10 +308,10 @@ def handle(poster, item):
             rc['error'] = f'comment {item["commentId"]} is not on PR #{poster.pr}'
             return rc
         body = item['body'] if kind == 'review' else issue_body(original, item['body'])
-        found = poster.existing(kind, item['commentId'], body)
+        found = poster.existing(kind, item['commentId'], body, item.get('secondAnswer', False))
         if found and found[1] != body:
             rc['replyId'] = found[0]
-            rc['error'] = f'reply {found[0]} of ours already answers this in other words; reconcile by hand'
+            rc['error'] = f'reply {found[0]} of ours is already on this comment in other words; reconcile by hand'
             return rc
         if found:
             reply_id = found[0]
@@ -346,6 +354,8 @@ def check_reply(r):
         raise ValueError(f'manifest entry without a digest: {r!r}')
     if not isinstance(r.get('resolve', True), bool):
         raise ValueError(f'manifest entry resolve must be true or false: {r!r}')
+    if not isinstance(r.get('secondAnswer', False), bool):
+        raise ValueError(f'manifest entry secondAnswer must be true or false: {r!r}')
 
 
 def check_reuse(r):

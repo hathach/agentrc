@@ -176,6 +176,8 @@ class ReplyTest(ReplyCase):
         self.assertFalse(self.gh.threads['T10']['resolved'])
         rc, _ = self.run_script([{'commentId': 10, 'body': 'x', 'resolve': 'no'}])
         self.assertEqual(rc, 2)
+        rc, _ = self.run_script([{'commentId': 10, 'body': 'x', 'secondAnswer': 1}])
+        self.assertEqual(rc, 2)
 
     def test_identical_existing_reply_is_reused_not_reposted(self):
         self.gh.review_comment(10)
@@ -258,25 +260,38 @@ class ReplyTest(ReplyCase):
         rc, receipts = self.run_script([{'commentId': 20, 'body': 'Not so: see line 3.'}])
         self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted'], receipts[0]['verified']), (0, 61, False, True))
 
-    def test_a_fix_note_and_a_refutation_of_one_comment_are_both_posted(self):
+    def test_a_second_answer_posts_a_fix_note_beside_a_refutation(self):
         self.gh.add_review(30)
         quote = f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\n'
         self.gh.issue_comment(60, quote + 'Fixed in abc1234.\n\n- a.c:3: x', ME)
-        rc, receipts = self.run_script([{'commentId': 30, 'body': 'Not applying the second point: y.'}])
+        rc, receipts = self.run_script([{'commentId': 30, 'body': 'Not applying the second point: y.', 'secondAnswer': True}])
         self.assertEqual((rc, receipts[0]['posted']), (0, True))
         self.gh.issue_comment(20)
         quote = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\n'
         self.gh.issue_comment(61, quote + 'Not applying the first point: y.', ME)
-        rc, receipts = self.run_script([{'commentId': 20, 'body': 'Fixed in def5678.'}])
+        rc, receipts = self.run_script([{'commentId': 20, 'body': 'Fixed in def5678.', 'secondAnswer': True}])
         self.assertEqual((rc, receipts[0]['posted']), (0, True))
 
-    def test_other_quotes_and_inline_rewordings_are_not_reused(self):
+    def test_without_second_answer_any_reply_of_ours_holds(self):
+        # A caller that lost its state: a fix note, or an inline reply in other words, is ours already.
+        self.gh.add_review(30)
+        self.gh.issue_comment(60, f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\nFixed in abc1234.', ME)
+        self.gh.review_comment(10)
+        self.gh.review_comment(55, 'Fixed in abc1234.', ME, thread='T10', parent=10)
+        rc, receipts = self.run_script([{'commentId': 30, 'body': 'Not applying this: y.'}, {'commentId': 10, 'body': 'Not so: see line 3.'}])
+        self.assertEqual(rc, 1)
+        self.assertEqual([(r['replyId'], r['sent'], r['verified']) for r in receipts], [(60, False, False), (55, False, False)])
+        self.assertTrue(all('reconcile' in r['error'] for r in receipts))
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_other_quotes_and_second_inline_answers_are_not_reused(self):
         self.gh.add_review(3)
         self.gh.issue_comment(60, f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\nNot so.', ME)
         self.gh.issue_comment(61, f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-3\n\nNot so.', 'someone')
         self.gh.review_comment(10)
         self.gh.review_comment(55, 'said differently', ME, thread='T10', parent=10)
-        rc, receipts = self.run_script([{'commentId': 3, 'body': 'Not so either.'}, {'commentId': 10, 'body': 'said again'}])
+        self.gh.review_comment(56, 'said by someone', 'someone', thread='T10', parent=10)
+        rc, receipts = self.run_script([{'commentId': 3, 'body': 'Not so either.'}, {'commentId': 10, 'body': 'said again', 'secondAnswer': True}])
         self.assertEqual(rc, 0)
         self.assertEqual([r['posted'] for r in receipts], [True, True])
 

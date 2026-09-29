@@ -2672,6 +2672,39 @@ test('an edit to an answered comment owes an answer again', async () => {
   assert.deepEqual(result.deferred, [1])
 })
 
+test('the answer owed after an edit may go beside ours, in this launch or a later one', async () => {
+  // Without secondAnswer reply.py holds on any reply of ours; the edit is what allows the second.
+  const edited = { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' }
+  let cycle = 0
+  const same = await run({ args: { autoPush: true, maxCycles: 3 }, reviewsPerCycle: () => ++cycle === 1 ? structuredClone(oneValid) : structuredClone(edited) })
+  assert.equal(manifestOf(same.calls, 'resolve#1')[0].secondAnswer, undefined, 'a first answer is no second')
+  assert.equal(manifestOf(same.calls, 'replies#2')[0].secondAnswer, true)
+  assert.equal(same.result.state.reanswer, undefined, 'the answer clears the marker')
+
+  const first = await run({ reviews: oneValid, args: { ...YIELD } })
+  const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
+  const seen = await run({ reviews: { ...edited, replies: [] }, preflight: at, args: { ...YIELD, state: first.result.state } })
+  assert.deepEqual(seen.result.state.reanswer, [1])
+  const later = await run({ reviews: edited, preflight: at, args: { ...YIELD, state: seen.result.state } })
+  assert.equal(manifestOf(later.calls, 'replies#3')[0].secondAnswer, true)
+})
+
+test('a released repair asks reply.py for a first answer and settles on the reply of ours it finds', async () => {
+  // #3988: the thread already held an earlier run's reply in other words; reply.py names it and posts nothing.
+  const frozen = { dismissals: ['1#1'], notes: [], digest: 'd1', repair: { replyId: null, error: 'over length: a point exceeds 60 words or a line 300 characters' } }
+  const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' }
+  const base = (await run({ args: { ...YIELD } })).result.state
+  const held = (rs) => rs.map(r => ({ ...r, replyId: 77, sent: false, posted: false, verified: false, resolved: null, error: 'reply 77 of ours is already on this comment in other words; reconcile by hand' }))
+  const owed = await run({ reviews, receipts: held, args: { ...YIELD, state: seal({ ...base, debt: [[1, frozen]] }) } })
+  const [entry] = manifestOf(owed.calls, owed.labels.find(l => l.startsWith('replies#')))
+  assert.equal(entry.secondAnswer, undefined)
+  assert.deepEqual(owed.result.state.debt.find(([id]) => id === 1)[1].repair.replyId, 77)
+  const next = await run({ reviews, answers: () => true, args: { ...YIELD, state: owed.result.state } })
+  assert.equal(next.labels.some(l => l.startsWith('replies#')), false, 'nothing is posted over our reply')
+  assert.ok(next.labels.some(l => l.startsWith('reconcile#')))
+  assert.equal(next.result.state.debt.length, 0, 'settled on the reply already there')
+})
+
 test('a fix note reads as deferred only while it still owes a dismissal', async () => {
   // Nothing is outstanding here: the fix note closed the thread, so calling it
   // deferred names a next cycle that has nothing to do.
