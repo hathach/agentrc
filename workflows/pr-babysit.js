@@ -2174,6 +2174,7 @@ const runCycle = async (cycle, entry) => {
       `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others; ` +
       `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push: report one record for each and no other` : 'none of them auto-run: report no bot records'}. ${IN_CHECKOUT}` +
       `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${autoRun.length ? ` --auto-run ${autoRun.join(',')}` : ''}\`. ` +
+      `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
           `those listed by findingId among them, so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +

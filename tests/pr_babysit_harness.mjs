@@ -3778,6 +3778,22 @@ test('the offered body survives a restart', async () => {
   assert.equal(second.result.pass, true)
 })
 
+test('the drafter is told both reply limits, and a draft within the words but over the line limit is withheld', async () => {
+  // #3988: a draft with one line over 300 characters was withheld twice and the reply stayed owed.
+  const long = `Not so: ${'x'.repeat(295)}`
+  const reviews = (body) => ({ findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body }], bots: 'reviewed' })
+  let cycle = 0
+  const { calls, logs, result } = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => reviews(++cycle === 1 ? long : 'Not so: line 3.'),
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /each point has at most 60 words and no line is over 300 characters/)
+  assert.ok(logs.some(l => /no reply posted to comment 2 \(over length: .* a line 300 characters\) — withheld until a shorter draft/.test(l)), logs.join('\n'))
+  assert.deepEqual(calls.filter(c => c.label.startsWith('replies#')).map(c => manifestOf(calls, c.label)[0].body), ['Not so: line 3.'])
+  assert.equal(result.pass, true, result.reason)
+})
+
 test('a reply with a point over the length limit is never posted or cut, and a shorter redraft posts later', async () => {
   const wordy = 'w '.repeat(61).trim()
   const long = await run({
