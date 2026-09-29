@@ -12,8 +12,10 @@ which the body must match before anything is posted; resolve (default true)
 false leaves a review reply's thread open, for an answer that upholds a point. Each commentId names one
 of three things on the PR: a review comment (an inline thread), an issue comment,
 or a review whose body carries the finding (a bot's summary, or a point GitHub
-would not anchor inline). A review reply is read back and must match the body,
-the parent, our login and the PR before its thread is resolved; the other two
+would not anchor inline). A review reply goes to the thread's first comment, where
+GitHub files every reply, and is read back: it must match the body, sit in that
+thread after the comment it answers, and carry our login and the PR, before the
+thread is resolved; the other two
 have no thread: the reply is an issue comment whose body is the original's URL
 as a quote line plus the text. A reply of ours with the identical body already
 there is reused, never posted twice. A caller that lost its state would answer
@@ -176,11 +178,11 @@ class Poster:
             raise ApiError(f'id {comment_id} is ambiguous on PR #{self.pr}: {", ".join(k for k, _ in found)}')
         return found[0] if found else ('none', None)
 
-    def existing(self, kind, comment_id, body, second_answer=False):
+    def existing(self, kind, target, body, second_answer=False):
         """The (id, body) of our identical reply, else of the reply of ours this one must not be posted over:
         any other, or with second_answer only a quoting one giving the same kind of answer; None when there is none."""
         if kind == 'review':
-            ours = [c for c in self.review_comments() if c['user']['login'] == self.me and c.get('in_reply_to_id') == comment_id]
+            ours = [c for c in self.review_comments() if c['user']['login'] == self.me and in_thread_after(c, target)]
         else:
             quote = body.partition('\n\n')[0] + '\n\n'
             ours = [c for c in self.issue_comments() if c['user']['login'] == self.me and c['body'].startswith(quote)]
@@ -191,9 +193,9 @@ class Poster:
             blocking = [c for c in ours if is_fix_note(c['body']) == is_fix_note(body)]
         return (blocking[0]['id'], blocking[0]['body']) if blocking else None
 
-    def post(self, kind, comment_id, body):
+    def post(self, kind, target, body):
         if kind == 'review':
-            c = api('POST', f'repos/{self.repo}/pulls/{self.pr}/comments/{comment_id}/replies', {'body': body})
+            c = api('POST', f'repos/{self.repo}/pulls/{self.pr}/comments/{thread_root(target)}/replies', {'body': body})
         else:
             c = api('POST', f'repos/{self.repo}/issues/{self.pr}/comments', {'body': body})
         return c['id']
@@ -210,10 +212,10 @@ class Poster:
     def read_reply(self, kind, reply_id):
         return api('GET', f'repos/{self.repo}/{"pulls" if kind == "review" else "issues"}/comments/{reply_id}')
 
-    def misplaced(self, kind, comment_id, c):
-        """What makes reply c not ours answering comment_id on this PR, by name."""
+    def misplaced(self, kind, target, c):
+        """What makes reply c not ours answering the target comment on this PR, by name."""
         if kind == 'review':
-            checks = [('parent', c.get('in_reply_to_id') == comment_id),
+            checks = [('parent', in_thread_after(c, target)),
                       ('author', c.get('user', {}).get('login') == self.me),
                       ('pr', str(c.get('pull_request_url', '')).endswith(f'/pulls/{self.pr}'))]
         else:
@@ -221,14 +223,14 @@ class Poster:
                       ('pr', str(c.get('issue_url', '')).endswith(f'/issues/{self.pr}'))]
         return [name for name, ok in checks if not ok]
 
-    def verify(self, kind, comment_id, reply_id, body):
+    def verify(self, kind, target, reply_id, body):
         """(True, None) on a matching read-back, (False, why) on a mismatch,
         (None, why) when the reply could not be fetched."""
         try:
             c = self.read_reply(kind, reply_id)
         except ApiError as e:
             return None, f'read-back unavailable: {e}'
-        bad = ([] if c.get('body') == body else ['body']) + self.misplaced(kind, comment_id, c)
+        bad = ([] if c.get('body') == body else ['body']) + self.misplaced(kind, target, c)
         return (True, None) if not bad else (False, f'read-back mismatch on {", ".join(bad)}')
 
     def resolve(self, comment_id):
@@ -249,6 +251,16 @@ class Poster:
             if not page['pageInfo']['hasNextPage']:
                 return f'no review thread contains comment {comment_id}'
             cursor = page['pageInfo']['endCursor']
+
+
+def thread_root(target):
+    """The first comment of a review comment's thread: GitHub files every reply there, a reply to a reply too."""
+    return target.get('in_reply_to_id') or target['id']
+
+
+def in_thread_after(c, target):
+    """Whether review comment c is a reply in target's thread posted after target, the only kind that can answer it."""
+    return c.get('in_reply_to_id') == thread_root(target) and c['id'] > target['id']
 
 
 def issue_body(original, body):
@@ -276,7 +288,7 @@ def read_pair(poster, kind, original, comment_id, reply_id):
     if kind == 'none':
         return None, f'comment {comment_id} is not on PR #{poster.pr}'
     c = poster.read_reply(kind, reply_id)
-    bad = poster.misplaced(kind, comment_id, c)
+    bad = poster.misplaced(kind, original, c)
     if kind != 'review' and not str(c.get('body', '')).startswith(issue_body(original, '')):
         bad.append('quote')
     return c, f'reply {reply_id} is not ours on comment {comment_id}: mismatch on {", ".join(bad)}' if bad else None
@@ -358,7 +370,7 @@ def edit(poster, item):
             rc['sent'] = True
             poster.edit(kind, item['replyId'], body)
             rc['posted'] = True
-        rc['verified'], rc['error'] = poster.verify(kind, item['commentId'], item['replyId'], body)
+        rc['verified'], rc['error'] = poster.verify(kind, original, item['replyId'], body)
         if rc['verified'] and kind == 'review':
             rc['error'] = poster.resolve(item['commentId'])
             rc['resolved'] = rc['error'] is None
@@ -380,7 +392,7 @@ def handle(poster, item):
             rc['error'] = f'comment {item["commentId"]} is not on PR #{poster.pr}'
             return rc
         body = reply_body(kind, original, item['body'])
-        found = poster.existing(kind, item['commentId'], body, item.get('secondAnswer', False))
+        found = poster.existing(kind, original, body, item.get('secondAnswer', False))
         if found and found[1] != body:
             rc['replyId'] = found[0]
             rc['error'] = f'reply {found[0]} of ours is already on this comment in other words; reconcile by hand'
@@ -389,10 +401,10 @@ def handle(poster, item):
             reply_id = found[0]
         else:
             rc['sent'] = True
-            reply_id = poster.post(kind, item['commentId'], body)
+            reply_id = poster.post(kind, original, body)
             rc['posted'] = True
         rc['replyId'] = reply_id
-        rc['verified'], rc['error'] = poster.verify(kind, item['commentId'], reply_id, body)
+        rc['verified'], rc['error'] = poster.verify(kind, original, reply_id, body)
         if rc['verified'] and kind == 'review' and item.get('resolve', True):
             rc['error'] = poster.resolve(item['commentId'])
             rc['resolved'] = rc['error'] is None

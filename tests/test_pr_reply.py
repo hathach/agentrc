@@ -90,7 +90,8 @@ class FakeGitHub:
             self.mutations.append(('post-reply', parent, body['body']))
             cid = self.next_id = self.next_id + 1
             thread = next(t for t, v in self.threads.items() if parent in v['ids'])
-            self.review_comment(cid, body['body'], ME, thread=thread, parent=parent)
+            # GitHub files a reply to a reply under the thread's first comment.
+            self.review_comment(cid, body['body'], ME, thread=thread, parent=self.review[parent]['in_reply_to_id'] or parent)
             return self.review[cid]
         m = re.fullmatch(rf'repos/{REPO}/(pulls|issues)/comments/(\d+)', path)
         pool = m and (self.review if m.group(1) == 'pulls' else self.issue)
@@ -152,14 +153,18 @@ class ReplyCase(unittest.TestCase):
             self.assertNotIn(None, (r.get('resolved', False), r.get('error', '')), 'a null resolved or error is printed')
         return [{'resolved': None, 'error': None, **r} for r in out['receipts']]
 
-
-class ReplyTest(ReplyCase):
     def run_script(self, replies, raw=False):
         path = self.json_file({'replies': replies if raw else [{'digest': reply.fnv1a(r['body']), **r} if isinstance(r.get('body'), str) else r
                                                                for r in replies]})
         rc, out = self.main('--manifest', path)
         return rc, self.receipts(out) or []
 
+    def edit(self, *items):
+        rc, out = self.main('--edit', self.json_file({'edits': [{'digest': reply.fnv1a(i['body']), **i} for i in items]}))
+        return rc, self.receipts(out)
+
+
+class ReplyTest(ReplyCase):
     def test_review_reply_is_posted_read_back_and_resolved(self):
         self.gh.review_comment(10)
         rc, receipts = self.run_script([{'commentId': 10, 'body': 'not so: see line 3'}])
@@ -410,6 +415,57 @@ class ReplyTest(ReplyCase):
         self.assertLessEqual(methods, {'GET', 'POST'})
 
 
+class FollowUpTest(ReplyCase):
+    """A bot's follow-up in a thread: every reply, ours included, is filed under the thread's first comment (#18)."""
+
+    def thread(self, *ours):
+        """#3988's shape: root 10, our early reply 15 to it, the follow-up 20, then any (id, body) replies of ours."""
+        self.gh.review_comment(10, 'root finding')
+        self.gh.review_comment(15, 'answer to the root', ME, thread='T10', parent=10)
+        self.gh.review_comment(20, 'follow-up', 'bot', thread='T10', parent=10)
+        for cid, body in ours:
+            self.gh.review_comment(cid, body, ME, thread='T10', parent=10)
+
+    def test_a_reply_to_a_follow_up_is_filed_under_the_root_and_verifies(self):
+        self.thread()
+        rc, receipts = self.run_script([{'commentId': 20, 'body': 'not so: line 3'}])
+        self.assertEqual(rc, 0, receipts)
+        self.assertEqual((receipts[0]['verified'], receipts[0]['resolved']), (True, True))
+        self.assertEqual(self.gh.mutations, [('post-reply', 10, 'not so: line 3'), ('resolve', 'T10')],
+                         'posted to the root, not over our earlier reply to it')
+
+    def test_only_a_reply_of_ours_after_the_target_counts_as_its_answer(self):
+        self.thread((25, 'not so: line 3'))
+        rc, receipts = self.run_script([{'commentId': 20, 'body': 'not so: line 3'}])
+        self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted']), (0, 25, False))
+        rc, receipts = self.run_script([{'commentId': 20, 'body': 'said otherwise'}])
+        self.assertEqual((receipts[0]['replyId'], receipts[0]['sent']), (25, False))
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'root again'}])
+        self.assertEqual((receipts[0]['replyId'], receipts[0]['sent']), (15, False), 'for the root, every later reply of ours counts')
+
+    def test_inspect_reuse_and_edit_pair_a_reply_with_the_follow_up_it_came_after(self):
+        self.thread((25, 'deliberately'))
+        rc, out = self.main('--inspect', '20:25', '20:15')
+        self.assertEqual(rc, 1)
+        good, early = out['inspected']
+        self.assertEqual((good['error'], good['body']), (None, 'deliberately'))
+        self.assertIn('mismatch on parent', early['error'], 'our reply from before the follow-up cannot answer it')
+        pair = {'commentId': 20, 'replyId': 25, 'bodyDigest': reply.fnv1a('deliberately'), 'originalDigest': reply.comment_digest('follow-up')}
+        rc, receipts = self.edit({**pair, 'body': 'precisely'})
+        self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved']), (0, True, True))
+        mutations = len(self.gh.mutations)
+        rc, out = self.main('--reuse', self.json_file({'reuses': [{**pair, 'bodyDigest': reply.fnv1a('precisely')}]}))
+        self.assertEqual((rc, out['receipts'][0]['verified']), (0, True))
+        self.assertEqual([m[0] for m in self.gh.mutations[mutations:]], [], 'the thread was already resolved: nothing written')
+
+    def test_a_reply_in_another_thread_fails_on_parent(self):
+        self.thread()
+        self.gh.review_comment(30, 'elsewhere')
+        self.gh.review_comment(35, 'not so', ME, thread='T30', parent=30)
+        rc, out = self.main('--inspect', '20:35')
+        self.assertIn('mismatch on parent', out['inspected'][0]['error'])
+
+
 class SealTest(ReplyCase):
     """The seal pr-babysit checks a relayed copy against, as its facts.py computes it."""
 
@@ -539,10 +595,6 @@ class ReconcileTest(ReplyCase):
                                    'originalDigest': reply.comment_digest('two points')})
         self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved']), (1, True, None))
         self.assertIn('502', receipts[0]['error'])
-
-    def edit(self, *items):
-        rc, out = self.main('--edit', self.json_file({'edits': [{'digest': reply.fnv1a(i['body']), **i} for i in items]}))
-        return rc, self.receipts(out)
 
     def test_edit_puts_the_intended_body_on_our_reply_and_resolves(self):
         self.gh.review_comment(10, 'two points')

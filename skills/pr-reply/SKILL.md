@@ -10,10 +10,10 @@ of `{commentId, body, digest}` entries and, for each: finds which of three
 things on the PR the id names (an inline review comment, an issue comment, or
 a review whose body carries the finding), reuses an identical reply of ours if
 one is already there, otherwise posts the body once, reads the posted comment
-back, and resolves the review thread only when body, parent, author and PR all
+back, and resolves the review thread only when body, thread, author and PR all
 match. An issue comment and a review body have no thread: the reply is a PR
 comment quoting the original's URL, and nothing is resolved. Any other reply of
-ours to the comment (in its thread, or quoting it) blocks the post: its receipt
+ours to the comment (in its thread after it, or quoting it) blocks the post: its receipt
 names that reply with `verified: false`, for a human to reconcile. An entry
 with `"secondAnswer": true`, for a comment edited after we answered it, may go
 beside our inline reply; a quoting reply of ours that gives the same kind of

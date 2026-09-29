@@ -2932,6 +2932,27 @@ test('a reply that landed with the wrong body is edited to the offered body next
   assert.ok(dry.logs.some(l => /reply\/replies 502 would be edited to the offered body \(dry run\)/.test(l)))
 })
 
+test('a reply that reads back as the offered body settles on it with no verdict and no edit', async () => {
+  // #18: the reply to a follow-up went out word for word, and read-back failed only on its parent.
+  const wrong = {
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+    inspect: () => ({ body: 'not so', bodyDigest: fnv1a('not so') }),
+  }
+  const parent = (rs, l) => l === 'replies#1' ? rs.map(r => ({ ...r, verified: false, resolved: null, error: 'read-back mismatch on parent' })) : rs
+  const { result, labels, calls } = await run({ ...wrong, args: { autoPush: true, maxCycles: 2 }, receipts: parent })
+  assert.deepEqual(labels.filter(l => /^(replies|inspect|reconcile|edit|reuse)#/.test(l)), ['replies#1', 'inspect#2', 'reuse#2'])
+  assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#2').prompt, 'Reuses').reuses,
+    [{ commentId: 2, replyId: 502, bodyDigest: fnv1a('not so'), originalDigest: 'd2' }])
+  assert.equal(result.pass, true, result.reason)
+  // A state from before `posted`, as the installed workflow saved #3988's, settles the same way.
+  const first = await run({ ...wrong, args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true }, receipts: parent })
+  const legacy = { ...first.result.state, debt: first.result.state.debt.map(([id, { repair: { posted, ...repair }, ...d }]) => [id, { ...d, repair }]) }
+  const resumed = await run({ ...wrong, args: { autoPush: true, maxCycles: 2, state: seal(legacy) } })
+  assert.deepEqual(resumed.labels.filter(l => /^(replies|inspect|reconcile|edit|reuse)#/.test(l)), ['inspect#2', 'reuse#2'])
+  assert.equal(resumed.result.pass, true, resumed.result.reason)
+})
+
 test('a repair obligation survives a restart and still blocks a repost', async () => {
   const first = await run({
     args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true },
