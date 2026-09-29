@@ -832,9 +832,11 @@ const COVERS = {
     },
   },
 }
-// The answer a deferred point gets, in whichever reply its comment receives.
-const deferralAnswer = (d) => `  Real, and out of this PR's scope: ${d.reason}. Tracked in ${d.issueUrl}.`
-const deferralLine = (f) => `- ${f.file}:${f.line}: ${f.claim}\n${deferralAnswer(f.deferral)}`
+// The answer a deferred point gets, in whichever reply its comment receives. A
+// workflow-built line names its finding by place: the validator's claim has no
+// length bound, and no redraft would shorten it.
+const deferralAnswer = (d) => `Real, and out of this PR's scope: ${d.reason}. Tracked in ${d.issueUrl}.`
+const deferralLine = (f) => `- ${f.file}:${f.line}: ${deferralAnswer(f.deferral)}`
 // A reply is measured as posted, point by point (a merged one has a point per finding), and never cut: a
 // point over the limit is never posted.
 const REPLY_WORDS = 60, REPLY_LINE_CHARS = 300 // words per point; about 3 rendered lines
@@ -2409,7 +2411,7 @@ const runCycle = async (cycle, entry) => {
       if (!d || f.verdict !== 'valid') continue
       if (d.digest !== f.commentDigest) return refusedDeferral(`${f.findingId}: its comment was edited since it was deferred; decide again`)
       f.deferral = { issueUrl: d.issueUrl, reason: d.reason }
-      // The claim is the validator's wording this cycle, so the whole point is measured here.
+      // The place is the validator's this cycle, so the whole point is measured here.
       if (overLength(deferralLine(f))) return refusedDeferral(`${f.findingId}: its reply point would exceed ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters; pass a shorter reason`)
     }
     const deferredOn = (commentId) => r.findings.filter(f => f.deferral && f.commentId === commentId)
@@ -2584,7 +2586,7 @@ const runCycle = async (cycle, entry) => {
       const answerable = new Map()
       for (const f of validFindings) {
         if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair || !showsAll(f.commentId, false)) continue
-        const line = `- ${f.file}:${f.line}: ${f.claim}`
+        const line = `- ${f.file}:${f.line}`
         const prev = answerable.get(f.commentId)
         if (prev) prev.body += `\n${line}`
         else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId) })

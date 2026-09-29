@@ -2366,7 +2366,8 @@ test('no fix note is dispatched when the push answers no comment', async () => {
 
 test('two valid findings on one comment share one fix note', async () => {
   // One note per thread, as postReplyRecipe posts it - and it has to name both
-  // claims, because paying the comment settles both.
+  // findings, because paying the comment settles both; by place, as a claim of
+  // any length would put it over the reply limit.
   let cycle = 0
   const { calls, result } = await run({
     args: { autoPush: true, maxCycles: 2 },
@@ -2374,14 +2375,15 @@ test('two valid findings on one comment share one fix note', async () => {
       cycle++
       return cycle === 1
         ? { findings: [finding({ commentId: 1, claim: 'the first leak' }),
-          finding({ commentId: 1, line: 9, claim: 'the second leak' })], replies: [], bots: 'reviewed' }
+          finding({ commentId: 1, line: 9, claim: 'the second leak '.repeat(30) })], replies: [], bots: 'reviewed' }
         : { findings: [], replies: [], bots: 'reviewed' }
     },
   })
   const resolve = calls.filter(c => c.label.startsWith('resolve#'))
   assert.equal(resolve.length, 1)
   assert.equal([...resolve[0].prompt.matchAll(/"commentId":1\b/g)].length, 1, 'one note for the thread')
-  assert.match(resolve[0].prompt, /the first leak\\n- src\/a\.c:9: the second leak/, 'both findings named in the one note')
+  assert.match(resolve[0].prompt, /Fixed in [0-9a-f]{40}\.\\n\\n- src\/a\.c:1\\n- src\/a\.c:9"/, 'both findings named in the one note')
+  assert.doesNotMatch(resolve[0].prompt, /leak/)
   assert.equal(result.pass, true, `the comment must be settled (got ${result.reason})`)
 })
 
@@ -2898,7 +2900,7 @@ test('a reply is published by the script from a workflow-built manifest', async 
   const notes = manifestOf(calls, 'resolve#1')
   assert.equal(notes.length, 1)
   assert.equal(notes[0].commentId, 1)
-  assert.match(notes[0].body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:3: off by one$/, 'the note names the pushed SHA and the finding')
+  assert.match(notes[0].body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:3$/, 'the note names the pushed SHA and the finding\'s place')
   assert.equal(notes[0].digest, fnv1a(notes[0].body))
   const replies = manifestOf(calls, 'replies#1')
   assert.deepEqual(replies, [{ commentId: 2, body: 'not so', digest: fnv1a('not so') }])
@@ -3220,7 +3222,7 @@ test('a deferred finding is not fixed, is answered with its issue, and the run p
   const issue = calls.find(c => c.label === 'issue#1')
   assert.ok(issue.prompt.includes(ISSUE) && issue.prompt.includes('src/a.c:1: bad'))
   const [posted] = manifestOf(calls, 'defer#1')
-  assert.equal(posted.body, `- src/a.c:1: bad\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
+  assert.equal(posted.body, `- src/a.c:1: Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.deferrals, [{ findingId: '1#1', issueUrl: ISSUE }])
   assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR' }]])
@@ -3259,9 +3261,11 @@ test('a deferral whose reason alone breaks the reply limit is refused before any
   assert.ok(calls.length > 0, 'a reason within the limit runs')
 })
 
-test('a deferral whose whole reply point, claim included, breaks the limit is refused when it meets its finding', async () => {
-  const wordyClaim = { findings: [finding({ claim: 'w '.repeat(30).trim() })], replies: [], bots: 'reviewed' }
-  const { result, calls } = await run({ reviews: wordyClaim, args: { deferrals: [deferral({ reason: 'r '.repeat(35).trim() })], maxCycles: 2 } })
+test('a deferral point quotes no claim, and is refused only when its location takes it over the limit', async () => {
+  const wordyClaim = { findings: [finding({ claim: 'w '.repeat(80) + 'x'.repeat(300) })], replies: [], bots: 'reviewed' }
+  const posted = await run({ reviews: wordyClaim, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
+  assert.equal(manifestOf(posted.calls, 'defer#1')[0].body, `- src/a.c:1: Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
+  const { result, calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(50).trim() })], maxCycles: 2 } })
   assert.equal(result.reason, 'deferral-refused')
   assert.match(result.detail, /^1#1: its reply point would exceed 60 words or a line 300 characters; pass a shorter reason$/)
   assert.equal(calls.some(c => c.label.startsWith('defer#')), false, 'nothing is posted')
@@ -3290,7 +3294,7 @@ test('a deferred point rides in the one reply its mixed comment gets', async () 
   assert.equal(withFix.calls.filter(c => c.label.startsWith('fix:')).length, 1)
   assert.doesNotMatch(withFix.calls.find(c => c.label.startsWith('fix:')).prompt, /deferred point/)
   const [note] = manifestOf(withFix.calls, 'resolve#1')
-  assert.match(note.body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:2: in scope\n\n- src\/a\.c:1: deferred point\n  Real, and out of this PR's scope/)
+  assert.match(note.body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:2\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
   assert.equal(withFix.labels.some(l => l.startsWith('defer#')), false, 'one reply per comment')
   const refutedPoint = invalidFinding({ findingId: '1#2', line: 2, claim: 'wrong' })
   const withRefutation = await run({
@@ -3298,7 +3302,7 @@ test('a deferred point rides in the one reply its mixed comment gets', async () 
     args: { deferrals: [deferral()] },
   })
   const [reply] = manifestOf(withRefutation.calls, 'replies#1')
-  assert.match(reply.body, /^not so\n\n- src\/a\.c:1: deferred point\n  Real, and out of this PR's scope/)
+  assert.match(reply.body, /^not so\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
   assert.equal(withRefutation.labels.some(l => l.startsWith('defer#')), false)
 })
 
