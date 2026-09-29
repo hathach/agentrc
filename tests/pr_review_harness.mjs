@@ -66,6 +66,8 @@ async function run(args, stubs = {}) {
 const pinned = (a) => ({ ok: true, head: H, top: '/w', ci: { state: 'green' }, pins: { mergeBase: a.mergeBase, scopeBase: a.scopeBase, mode: a.mode, groups: a.groups } })
 const board = (verdict, regression, testedHead = H) => ({ board: 'b1', verdict, regression, testedHead, report: '/r/b1.json' })
 const words = (s) => s.split(/\s+/).filter(Boolean).length
+// A list's [minItems, maxItems, id enum], as the runtime is asked to hold an answer to.
+const sized = (schema, key, id) => { const l = schema.properties[key]; return [l.minItems, l.maxItems, l.items.properties[id].enum] }
 const audited = (...fs) => ({ confirmed: [{ dir: 'src/core', dim: 'correctness: x', findings: fs }], dropped: [], unverified: [] })
 
 test('meta names the workflow and its phases', async () => {
@@ -172,6 +174,13 @@ test('text over its limit is shortened once, then marked long for the human, nev
     shorten: { comments: [{ finding: 0, body: '**high**: a' }], answers: [], summary: '- a is broken' } })
   const ask = fixed.calls.find(c => c.label === 'shorten')
   assert.match(ask.prompt, /"finding":0/)
+  // Each list names exactly the ids asked, so the runtime has the agent correct a short answer; no ids, no enum.
+  assert.deepEqual(sized(fixed.calls.find(c => c.label === 'write').options.schema, 'comments', 'finding'), [2, 2, [0, 1]])
+  assert.deepEqual(sized(ask.options.schema, 'comments', 'finding'), [1, 1, [0]])
+  assert.deepEqual(sized(ask.options.schema, 'answers', 'finding'), [0, 0, undefined])
+  const prose = await run(BASE, { audit: audited(finding('a')), write: { summary: 'Prose, not bullets.', comments: [{ finding: 0, body: '**high**: a' }] }, shorten: null })
+  const summaryOnly = prose.calls.find(c => c.label === 'shorten').options.schema
+  assert.deepEqual([sized(summaryOnly, 'comments', 'finding'), sized(summaryOnly, 'answers', 'finding')], [[0, 0, undefined], [0, 0, undefined]])
   assert.doesNotMatch(ask.prompt, /"body":"\*\*high\*\*: b"/, 'only the text over its limit is sent')
   assert.deepEqual(fixed.result.draft.comments.map(c => c.body), ['**high**: a', '**high**: b'])
   assert.ok(!fixed.logs.some(l => /over length/.test(l)))
@@ -479,6 +488,7 @@ test('a thread answer over its limit is shortened, then marked long; the answer 
     shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands: `a.c:12` reads it unmasked.' }] }, 'check-draft': { bad: [], summaryBad: false, answersBad: [] } })
   assert.match(short.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /at most 60 words/)
   assert.deepEqual(short.result.findings[0].disputes[0].answer, { body: 'Still stands: `a.c:12` reads it unmasked.', resolve: false })
+  assert.deepEqual(sized(short.calls.find(c => c.label === 'shorten').options.schema, 'answers', 'finding'), [1, 1, ['pr7-f1']])
   const kept = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }), shorten: null })
   assert.deepEqual(kept.result.findings[0].disputes[0].answer, { body: wordy, resolve: false })
   assert.ok(kept.logs.some(l => /over length, for the human to shorten: answer on pr7-f1/.test(l)))

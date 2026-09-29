@@ -345,13 +345,21 @@ const FORMAT = 'Each comment: first line `**<severity>**: <the problem, one sent
   `the impact, and a fix only where the finding supports one; at most ${LIMIT.comment} words; a question only when genuinely asking. ` +
   `The summary: 1 to ${LIMIT.summaryBullets} Markdown bullets, one per distinct problem, not repeating the comments in full. `
 const COMMENTS = { type: 'array', items: { type: 'object', required: ['finding', 'body'], properties: { finding: { type: 'integer' }, body: { type: 'string' } } } }
+// The runtime validates an answer against its schema and has the same agent correct one that fails, so a list short of
+// an id is fixed there; the fallbacks below still cover a runtime that does not. An empty enum is no valid schema.
+const exactly = (schema, key, idField, ids) => {
+  const list = schema.properties[key]
+  const id = list.items.properties[idField]
+  return { ...schema, properties: { ...schema.properties, [key]: { ...list, minItems: ids.length, maxItems: ids.length,
+    items: { ...list.items, properties: { ...list.items.properties, [idField]: ids.length ? { ...id, enum: ids } : id } } } } }
+}
 const WRITE = { type: 'object', required: ['summary', 'comments'], properties: { summary: { type: 'string' }, comments: COMMENTS } }
 const written = toPost.length ? await agent(
   `Write the inline comments of a code review for a contributor's PR, one per finding below, and its summary. ${FORMAT}${STYLE}` +
   'Use ONLY what each finding states: add no new claim, number, API or file. A finding with `alsoState` must also state that issue, as far as its ' +
   'finding and evidence support it. No sign-off, no attribution.\n' +
   `Findings: ${JSON.stringify(toPost.map((f, i) => ({ finding: i, file: f.file, line: f.line, severity: f.severity, dimension: f.dimension, why: f.why, evidence: f.verdictReason, alsoState: f.beside || undefined })))}`,
-  { label: 'write', phase: 'Draft', model: 'sonnet', effort: 'medium', schema: WRITE },
+  { label: 'write', phase: 'Draft', model: 'sonnet', effort: 'medium', schema: exactly(WRITE, 'comments', 'finding', toPost.map((_, i) => i)) },
 ) : { summary: '', comments: [] }
 const bodies = toPost.map((f, i) => ((written && written.comments) || []).find(c => c.finding === i))
 let summary = (written && written.summary) || ''
@@ -372,7 +380,8 @@ if (longBodies.length || longAnswers.length || summaryLong) {
     `Shorten these review texts and put each in its format. Keep every fact each states and add none. ${FORMAT}Each answer: at most ${LIMIT.answer} words, bullets for more than one point. ${STYLE}\n` +
     `Texts: ${JSON.stringify({ comments: longBodies.map(i => ({ finding: i, severity: toPost[i].severity, body: bodies[i].body })),
       answers: longAnswers.map(x => ({ finding: x.finding, body: x.a.body })), summary: summaryLong ? summary : null })}`,
-    { label: 'shorten', phase: 'Draft', model: 'sonnet', effort: 'low', schema: SHORT },
+    { label: 'shorten', phase: 'Draft', model: 'sonnet', effort: 'low',
+      schema: exactly(exactly(SHORT, 'comments', 'finding', longBodies), 'answers', 'finding', longAnswers.map(x => x.finding)) },
   )
   for (const c of (shorter && shorter.comments) || []) if (longBodies.includes(c.finding)) bodies[c.finding] = c
   const shortAnswer = new Map(((shorter && shorter.answers) || []).map(c => [c.finding, c.body]))
