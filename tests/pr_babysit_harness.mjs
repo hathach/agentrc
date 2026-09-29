@@ -108,7 +108,10 @@ const conforms = (schema, value, at) => {
       if (!(k in (schema.properties || {}))) { if (schema.additionalProperties === false) throw new Error(`${at}: unexpected ${k}`); continue }
       conforms(schema.properties[k], value[k], `${at}.${k}`)
     }
-  } else if (schema.type === 'array') value.forEach((v, i) => conforms(schema.items, v, `${at}[${i}]`))
+  } else if (schema.type === 'array') {
+    if (value.length < (schema.minItems ?? 0) || value.length > (schema.maxItems ?? Infinity)) throw new Error(`${at}: ${value.length} items`)
+    value.forEach((v, i) => conforms(schema.items, v, `${at}[${i}]`))
+  }
   return value
 }
 
@@ -2422,6 +2425,13 @@ test('ids a challenger left unjudged go to one fresh challenger, alone', async (
   const revived = await run({ reviews, challengePerCycle: answers(null, [0, 1]), args: { autoPush: true, maxCycles: 1 } })
   assert.notEqual(revived.result.reason, 'review-challenger-died', 'a dead challenger gets one fresh one for every id')
   assert.deepEqual(JSON.parse(revived.calls.find(c => c.label === 'challenge#1.retry').prompt.match(/Findings: (\[.*\])\.$/s)[1]).map(x => x.id), [0, 1])
+
+  // Each schema names exactly the ids asked, so the runtime has that agent correct a short answer.
+  const [firstAsk, retryAsk] = ['challenge#1', 'challenge#1.retry'].map(l => healed.calls.find(c => c.label === l).schema.properties.verdicts)
+  assert.deepEqual([firstAsk.minItems, firstAsk.maxItems, firstAsk.items.properties.id.enum], [2, 2, [0, 1]])
+  assert.deepEqual([retryAsk.minItems, retryAsk.maxItems, retryAsk.items.properties.id.enum], [1, 1, [1]])
+  assert.throws(() => conforms(retryAsk, [{ id: 0, verdict: 'justified', reason: 'x' }], 'v'), /not in 1/)
+  assert.throws(() => conforms(firstAsk, [{ id: 0, verdict: 'justified', reason: 'x' }], 'v'), /1 items/)
 
   const still = await run({ reviews, challengePerCycle: answers([0], [0]), args: { autoPush: true, maxCycles: 1 } })
   assert.equal(still.result.reason, 'review-challenger-died', 'the fresh one must judge exactly the ids left')

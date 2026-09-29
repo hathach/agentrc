@@ -407,6 +407,14 @@ const CHALLENGE = {
     },
   },
 }
+// The runtime validates an answer against its schema and has the same agent
+// correct one that fails, so an answer short of an id is fixed there, not by a
+// fresh challenger; `usable` still refuses a duplicate standing in for one.
+const challengeOf = (ids) => {
+  const { verdicts } = CHALLENGE.properties
+  return { ...CHALLENGE, properties: { verdicts: { ...verdicts, minItems: ids.length, maxItems: ids.length,
+    items: { ...verdicts.items, properties: { ...verdicts.items.properties, id: { type: 'integer', enum: ids } } } } } }
+}
 
 // One record per auto-running bot, in the validator's six states. The workflow
 // decides only block-or-settle from `state`; `kind` and `reason` say why.
@@ -2279,7 +2287,7 @@ const runCycle = async (cycle, entry) => {
           'no longer holds, and your reason must say why. ' +
           'Return exactly one verdict per submitted id and no others.\n' +
           `Findings: ${JSON.stringify(ids.map(id => submitted[id]))}.`,
-        { label, phase: 'Triage', agentType: 'finding-verifier', schema: CHALLENGE },
+        { label, phase: 'Triage', agentType: 'finding-verifier', schema: challengeOf(ids) },
       ).catch(e => { log(`cycle ${cycle}: challenger errored — ${e && e.message}`); return null })
       // A response is usable only when each id it judges was asked, once; ids are
       // indexes into challenged. The ids it left out go to one fresh challenger.
