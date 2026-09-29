@@ -1470,13 +1470,16 @@ test('the judge places every failing check once, or the lane re-arms', async () 
     / failures --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/1' --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/2' --repo /)
   assert.match(judge.calls.find(c => c.label === 'ci:judge#1').prompt, /evidence for them is in \/tmp\/ci-collect\/failures-1\.json\./)
   assert.doesNotMatch(judge.calls.find(c => c.label === 'ci:judge#1').prompt, /Already re-run/)
-  for (const reshape of [j => ({ ...j, checks: j.checks.slice(1) }), j => ({ ...j, checks: [j.checks[0], j.checks[0]] })]) {
-    const { result, logs, labels } = await run({ ci: two, judge: reshape, args: { maxCycles: 1 } })
-    assert.ok(logs.some(l => /CI judge answered .* — re-arming/.test(l)), logs.join('\n'))
-    assert.ok(logs.some(l => /CI lane gave no report — re-arming/.test(l)))
-    assert.equal(labels.some(l => l.startsWith('fix:')), false)
-    assert.notEqual(result.pass, true)
-  }
+  const asked = judge.calls.find(c => c.label === 'ci:judge#1').schema.properties.checks
+  assert.deepEqual([asked.minItems, asked.maxItems, asked.items.properties.link.enum],
+    [2, 2, ['https://github.com/o/r/actions/runs/1/job/1', 'https://github.com/o/r/actions/runs/1/job/2']])
+  assert.throws(() => conforms(asked, [{ link: 'https://github.com/o/r/actions/runs/1/job/1', failures: [] }], 'c'), /1 items/)
+  // The schema lets no short answer through; one link twice still counts two.
+  const { result, logs, labels } = await run({ ci: two, judge: j => ({ ...j, checks: [j.checks[0], j.checks[0]] }), args: { maxCycles: 1 } })
+  assert.ok(logs.some(l => /CI judge answered .* — re-arming/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /CI lane gave no report — re-arming/.test(l)))
+  assert.equal(labels.some(l => l.startsWith('fix:')), false)
+  assert.notEqual(result.pass, true)
 })
 
 test('an unclassified failure stops at once, reviews settled or not, and the debt survives a resumed launch', async () => {
@@ -2986,6 +2989,8 @@ test('a reply already there that answers every point settles the comment, postin
   const judged = calls.find(c => c.label === 'reconcile#2')
   assert.match(judged.prompt, /"owed":"refutation"/)
   assert.match(judged.prompt, /"reply":"answered already, in other words"/)
+  const verdicts = judged.schema.properties.verdicts
+  assert.deepEqual([verdicts.minItems, verdicts.maxItems, verdicts.items.properties.commentId.enum], [1, 1, [2]])
   const reuse = calls.find(c => c.label === 'reuse#2')
   assert.match(reuse.prompt, /--reuse <that file>/)
   assert.deepEqual(payloadOf(reuse.prompt, 'Reuses').reuses,
@@ -3091,6 +3096,8 @@ const deferredTwo = () => run({ reviews: twoDeferred, args: { autoPush: false, m
 
 test('no deferral reply goes out while the harvest leaves out a point it would settle', async () => {
   const dry = await deferredTwo()
+  const covers = dry.calls.find(c => c.label === 'issue#1').schema.properties.verdicts
+  assert.deepEqual([covers.minItems, covers.maxItems, covers.items.properties.findingId.enum], [2, 2, ['1#1', '1#2']])
   assert.deepEqual(debtOf(dry.result, 1).notes, ['1#1', '1#2'])
   const { labels, result, calls } = await run({ reviews: { ...twoDeferred, findings: [finding()] }, args: { autoPush: true, maxCycles: 5, state: dry.result.state } })
   assert.equal(labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of two')
