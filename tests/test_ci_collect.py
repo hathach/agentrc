@@ -564,6 +564,16 @@ class VerdictsTest(unittest.TestCase):
     def test_nothing_remembered_recalls_nothing(self):
         self.assertEqual(self.main('recall', '--check', JOB.format(3)), (0, {'head': HEAD, 'verdicts': [], 'left': []}))
 
+    def joined(self, held):
+        """The entry a held-back {link, starts} names, from one --offset recall per page, each line within the bound."""
+        failures = []
+        for start in held['starts']:
+            rc, r = self.main('recall', '--check', held['link'], '--offset', str(start))
+            self.assertLessEqual(len(self.printed), collect.RECALL_BYTES, 'each page line, seal and newline included')
+            self.assertEqual((rc, [v['link'] for v in r['verdicts']], r['left']), (0, [held['link']], []))
+            failures += r['verdicts'][0]['failures']
+        return {**r['verdicts'][0], 'failures': failures}
+
     def test_recall_holds_back_what_does_not_fit_the_line_and_leaves_out_what_never_fits(self):
         # tinyusb#4019: one 51 KB line, a HIL job's 113 failures among them, no relay could copy.
         huge, small, other, medium = self.entry(3, 3000), self.entry(4, 300), self.entry(5, 300), self.entry(6, 900)
@@ -571,9 +581,47 @@ class VerdictsTest(unittest.TestCase):
         with mock.patch.object(collect, 'RECALL_BYTES', 2000):
             _, r = self.main('recall', *[a for n in (3, 4, 5, 6) for a in ('--check', JOB.format(n))])
             self.assertLessEqual(len(self.printed), 2000, 'the printed line, seal and newline included')
-            self.assertEqual((r['verdicts'], r['left']), ([small, other], [JOB.format(6)]), 'the huge one is in neither')
-            rc, again = self.main('recall', '--check', JOB.format(6))
-            self.assertEqual((rc, again['verdicts'], again['left']), (0, [medium], []), 'a held-back link fits the next recall')
+            self.assertEqual((r['verdicts'], r['left']), ([small, other], [{'link': JOB.format(6), 'starts': [0]}]), 'the huge one is in neither')
+            self.assertEqual(self.joined(r['left'][0]), medium, 'a held-back link fits one page')
+            self.assertEqual(self.main('recall', '--check', JOB.format(3))[1], {'head': HEAD, 'verdicts': [], 'left': []}, 'nor alone')
+    def test_a_verdict_too_large_for_a_line_is_held_back_then_recalled_in_pages_that_join_into_it(self):
+        # tinyusb#4019: a HIL job's 113 failures, about 46 KB, judged again on every launch (#25).
+        many = {**self.ENTRY, 'failures': [{**self.ENTRY['failures'][0], 'firstError': f'{n:03} ' + 'x' * 150} for n in range(40)]}
+        small = self.entry(4, 10)
+        self.main('remember', stdin=json.dumps([many, small]))
+        with mock.patch.object(collect, 'RECALL_BYTES', 2000):
+            for checks in ((3, 4), (3,)):
+                _, r = self.main('recall', *[a for n in checks for a in ('--check', JOB.format(n))])
+                self.assertLessEqual(len(self.printed), 2000)
+                self.assertEqual((r['verdicts'], [h['link'] for h in r['left']]), ([small] if 4 in checks else [], [many['link']]))
+                self.assertGreater(len(r['left'][0]['starts']), 3)
+                self.assertEqual(self.joined(r['left'][0]), many)
+            rc, bad = self.main('recall', '--check', JOB.format(3), '--offset', str(r['left'][0]['starts'][1] + 1))
+            self.assertEqual(rc, 1)
+            self.assertIn('starts no page', bad['error'])
+    def test_a_verdict_with_one_failure_too_large_for_a_page_or_too_many_pages_to_list_is_not_paged(self):
+        huge = {**self.ENTRY, 'failures': [{**self.ENTRY['failures'][0], 'firstError': 'x' * 3000}, self.ENTRY['failures'][0]]}
+        many = {**self.ENTRY, 'link': JOB.format(5), 'failures': [{**self.ENTRY['failures'][0], 'firstError': 'x' * 700} for _ in range(1000)]}
+        self.main('remember', stdin=json.dumps([huge, self.entry(4, 10), many]))
+        with mock.patch.object(collect, 'RECALL_BYTES', 2000):  # two of many's failures to a page: 500 starts outgrow the line
+            _, r = self.main('recall', *[a for n in (3, 4, 5) for a in ('--check', JOB.format(n))])
+            self.assertEqual(([v['link'] for v in r['verdicts']], r['left']), ([JOB.format(4)], []), 'neither returned nor held back')
+            for n in (3, 5):
+                self.assertEqual(self.main('recall', '--check', JOB.format(n))[1]['left'], [])
+                self.assertEqual(self.main('recall', '--check', JOB.format(n), '--offset', '0')[0], 1)
+
+    def test_a_verdict_with_no_failures_held_back_is_one_empty_page(self):
+        empty = {**self.ENTRY, 'link': JOB.format(4), 'failures': []}
+        self.main('remember', stdin=json.dumps([self.entry(3, 1500), empty]))
+        with mock.patch.object(collect, 'RECALL_BYTES', 2000):
+            _, r = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))
+            self.assertIn({'link': JOB.format(4), 'starts': [0]}, r['left'])
+            self.assertEqual(self.joined({'link': JOB.format(4), 'starts': [0]}), empty)
+    def test_offset_is_for_recall_with_exactly_one_check(self):
+        for argv in (('recall', '--check', JOB.format(3), '--check', JOB.format(4), '--offset', '0'), ('failures', '--check', JOB.format(3), '--offset', '0')):
+            with self.assertRaises(SystemExit):
+                with mock.patch('sys.stderr', io.StringIO()):
+                    collect.main([argv[0], '--repo', 'o/r', '--pr', '5', '--head', HEAD, *argv[1:]])
 
     def test_a_verdict_that_fits_only_without_the_links_already_taken_is_still_returned(self):
         # Room is reserved for the links still to come, not for those already in the line.
@@ -595,9 +643,8 @@ class VerdictsTest(unittest.TestCase):
         checks = [a for n in (3, 4, 5, 6, 7) for a in ('--check', JOB.format(n))]
         with mock.patch.object(collect, 'RECALL_BYTES', alone + 50):  # less than the other four links take to list
             _, r = self.main('recall', *checks)
-            self.assertEqual((r['verdicts'], r['left']), (smalls, [JOB.format(3)]))
-            self.assertEqual(self.main('recall', '--check', JOB.format(3))[1]['verdicts'], [big], 'recalled alone')
-
+            self.assertEqual((r['verdicts'], r['left']), (smalls, [{'link': JOB.format(3), 'starts': [0]}]))
+            self.assertEqual(self.joined(r['left'][0]), big, 'recalled alone')
     def test_links_held_back_never_push_the_line_over_its_bound(self):
         # Long links take room to list: listing them all in `left` must not break the bound.
         link = 'https://ci.example/' + 'y' * 600 + '/{}'
@@ -608,8 +655,7 @@ class VerdictsTest(unittest.TestCase):
             self.assertLessEqual(len(self.printed), 3000)
             self.assertTrue(r['left'], 'the fixture holds some back')
             for held in r['left']:
-                self.assertEqual(self.main('recall', '--check', held)[1]['verdicts'], [next(e for e in entries if e['link'] == held)], 'each fits alone')
-
+                self.assertEqual(self.joined(held), next(e for e in entries if e['link'] == held['link']), 'each fits one page')
     def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
         for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}])):
             rc, r = self.main('remember', stdin=text)

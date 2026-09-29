@@ -4,7 +4,7 @@
   collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S]
   collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...] [--prior-head SHA]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
-  collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK...
+  collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while any check is pending, then
 prints one JSON object {head, status, pending, checks}, plus `error` when set
@@ -67,10 +67,13 @@ JSON list of {link, bucket, failures} on stdin, replaces any stored entry for
 the same link, and prints {head, error}. recall prints {head, verdicts, left, error}:
 the stored entries for the --check links it has, unchanged and in the order
 asked, while the printed line stays within RECALL_BYTES, the most a relaying
-agent is trusted to copy whole. `left` lists the links held back only for room,
-each of which fits a recall of its own; a link it has none for, or whose entry
-cannot fit the line even alone, is left out of both. The caller checks what comes back
-against its own digests.
+agent is trusted to copy whole. `left` lists the links held back for room, each
+{link, starts}: where each page of its entry's failures starts, one page when the
+entry fits a line alone. A lone --check with --offset at one of those starts prints
+that page as its one verdict, the entry with only that page's failures, and the
+pages in order join into the entry. A link it has none for, or whose entry has a
+failure or a list of starts too large for a line, is left out of both. The caller checks what comes
+back against its own digests.
 """
 
 import argparse
@@ -251,23 +254,60 @@ def remember(repo, pr, head, text):
     return {'head': head}
 
 
-def recall(repo, pr, head, links):
+def line(head, verdicts=(), left=()):
+    return {'head': head, 'verdicts': list(verdicts), 'left': list(left)}
+
+
+def fits_line(out):
+    return len(json.dumps(sealed(out))) + 1 <= RECALL_BYTES
+
+
+def page(entry, start, end):
+    return {**entry, 'failures': entry['failures'][start:end]}
+
+
+def page_starts(head, entry):
+    """Where each page of the entry's failures starts, each page as long as its line allows,
+    so [0] for an entry that fits a line whole; None when one failure fits no line, or the starts."""
+    starts, start, n = [], 0, len(entry['failures'])
+    while True:
+        end = min(start + 1, n)
+        if not fits_line(line(head, [page(entry, start, end)])):
+            return None
+        while end < n and fits_line(line(head, [page(entry, start, end + 1)])):
+            end += 1
+        starts.append(start)
+        if end == n:
+            return starts if fits_line(line(head, left=[{'link': entry['link'], 'starts': starts}])) else None
+        start = end
+
+
+def recall(repo, pr, head, links, offset=None):
     stored = stored_verdicts(evidence_dir(repo, pr, head))
     known = [link for link in links if link in stored]
+    starts = {link: page_starts(head, stored[link]) for link in known}
+    if offset is not None:
+        pages = starts.get(links[0]) or []
+        if offset not in pages:
+            raise Failed(f'--offset {offset} starts no page of a stored verdict for {links[0]}: its pages start at {pages}')
+        return line(head, [page(stored[links[0]], offset, next((s for s in pages if s > offset), None))])
 
     def fits(verdicts, left):
-        return len(json.dumps(sealed({'head': head, 'verdicts': verdicts, 'left': left}))) + 1 <= RECALL_BYTES
+        return fits_line(line(head, verdicts, left))
+
+    def held(links):
+        return [{'link': link, 'starts': starts[link]} for link in links if starts[link]]
 
     # Room is kept for every link still to come, so the line holds whatever is held back;
-    # a link held back fits a recall of its own, which lists none.
+    # a link held back comes back in the pages its starts name, each from a recall of its own.
     verdicts, left = [], []
     for i, link in enumerate(known):
-        rest = known[i + 1:]
+        rest = held(known[i + 1:])
         if fits([*verdicts, stored[link]], left + rest):
             verdicts.append(stored[link])
-        elif fits([stored[link]], []) and fits(verdicts, [*left, link, *rest]):
-            left.append(link)
-    return {'head': head, 'verdicts': verdicts, 'left': left}
+        elif starts[link] and fits(verdicts, [*left, *held([link]), *rest]):
+            left += held([link])
+    return line(head, verdicts, left)
 
 
 def clean(text):
@@ -556,9 +596,12 @@ def main(argv=None):
     p.add_argument('--check', action='append', default=[], metavar='LINK')
     p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
     p.add_argument('--prior-head', help='failures: the head whose stored verdicts to show beside matching cells')
+    p.add_argument('--offset', type=int, help='recall: where the page to print starts, of the lone --check')
     a = p.parse_args(argv)
     if a.prior_head and (a.command != 'failures' or not SHA.fullmatch(a.prior_head) or a.prior_head == a.head):
         p.error('--prior-head is for failures: a full 40-hex SHA other than --head')
+    if a.offset is not None and (a.command != 'recall' or len(a.check) != 1):
+        p.error('--offset is for recall with exactly one --check')
     if a.gate and a.command != 'failures':
         p.error('--gate is for failures')
     if (a.command in ('failures', 'recall')) != bool(a.check or a.gate):
@@ -575,7 +618,7 @@ def main(argv=None):
         elif a.command == 'remember':
             out = remember(a.repo, a.pr, a.head, sys.stdin.read())
         else:
-            out = recall(a.repo, a.pr, a.head, a.check)
+            out = recall(a.repo, a.pr, a.head, a.check, a.offset)
         out, rc = sealed(out), 0
     except Failed as e:
         out, rc = {'head': a.head, 'error': str(e)}, 1

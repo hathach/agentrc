@@ -388,11 +388,16 @@ const VERDICT = {
 // collect.py's RECALL_BYTES bounds a recall line; the count keeps the calls parallel and a
 // failed seal's cost to its own batch (#9: #3988's 40 verdicts in one line failed twice).
 const RECALL_PER_CALL = 5
-// `left`: the asked links collect.py held back to keep its line short enough to relay.
+// `left`: the asked links collect.py held back to keep its line short enough to relay,
+// each with where the pages of its verdict start.
 const RECALLED = withSeal({
   type: 'object', required: ['head', 'verdicts', 'left'],
   properties: {
-    error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT }, left: { type: 'array', items: { type: 'string' } },
+    error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT },
+    left: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, required: ['link', 'starts'], properties: { link: { type: 'string' }, starts: { type: 'array', minItems: 1, items: { type: 'integer' } } } },
+    },
   },
 })
 const REMEMBERED = withSeal({
@@ -2168,8 +2173,18 @@ const ciLaneRun = async (cycle, lanes) => {
   const unread = failing.filter(c => reusable(c) && !ciVerdicts.get(c.link).failures)
   // A few links to a call: a copy that fails its seal costs its own batch a fresh
   // relay, the rest nothing (#9). collect.py bounds each line; a link it held back
-  // for room is recalled alone, which always fits.
-  const recallOf = (label, links) => collect(label, `recall ${links.map(c => `--check ${shq(c.link)}`).join(' ')}`, RECALLED)
+  // for room comes back in pages, each a recall of its own.
+  const recallOf = (label, links, offset) =>
+    collect(label, `recall ${links.map(c => `--check ${shq(c.link)}`).join(' ')}${offset === undefined ? '' : ` --offset ${offset}`}`, RECALLED)
+  // A held-back verdict comes back in the pages its starts name, recalled together;
+  // the digest check below judges their join.
+  const inPages = async (label, c, starts) => {
+    const pages = await parallel(starts.map((o, i) => () => recallOf(`${label}.p${i + 1}`, [c], o)))
+    const slices = pages.map(p => faultOf(p, inv.head) ? undefined : p.verdicts.find(v => v.link === c.link))
+    const bad = slices.findIndex(v => !v)
+    if (bad >= 0) return { fault: `page ${bad + 1} of ${pages.length}: ${faultOf(pages[bad], inv.head) || 'its recall did not return it'}` }
+    return { v: { link: c.link, bucket: slices[0].bucket, failures: slices.flatMap(v => v.failures) } }
+  }
   const recallBatch = async (batch, k) => {
     const label = `ci:collect#${cycle}.r${k + 1}`
     const got = await recallOf(label, batch)
@@ -2177,15 +2192,14 @@ const ciLaneRun = async (cycle, lanes) => {
     if (why) log(`cycle ${cycle}: CI verdicts not recalled for ${batch.map(c => c.name).join(', ')} — ${why}`)
     const verdicts = why ? [] : [...got.verdicts]
     const lost = why ? [...batch] : []
-    const heldBack = why ? [] : batch.filter(c => got.left.includes(c.link))
-    const alone = await parallel(heldBack.map((c, j) => () => recallOf(`${label}.${j + 2}`, [c])))
+    const heldBack = why ? [] : batch.filter(c => got.left.some(h => h.link === c.link))
+    const joined = await parallel(heldBack.map((c, j) => () => inPages(`${label}.${j + 2}`, c, got.left.find(h => h.link === c.link).starts)))
     heldBack.forEach((c, j) => {
-      const fault = faultOf(alone[j], inv.head)
-      const v = fault ? undefined : alone[j].verdicts.find(v => v.link === c.link)
+      const { fault, v } = joined[j]
       if (v) verdicts.push(v)
       else {
         lost.push(c)
-        log(`cycle ${cycle}: CI verdict not recalled for ${c.name} — ${fault || 'its own recall did not return it'}`)
+        log(`cycle ${cycle}: CI verdict not recalled for ${c.name} — ${fault}`)
       }
     })
     for (const c of batch) {

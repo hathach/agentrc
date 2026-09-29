@@ -225,8 +225,16 @@ async function run(opts = {}) {
       let answer
       if (/ recall /.test(text)) {
         const links = [...text.matchAll(/--check '([^']*)'/g)].map(m => m[1])
-        answer = { head, verdicts: links.filter(l => store.has(key(l))).map(l => structuredClone(store.get(key(l)))), left: [], error: null }
-        if (opts.recall) answer = opts.recall(answer)
+        // opts.held: the page starts of each link collect.py holds back, its verdict too large for the line.
+        const offset = text.match(/ --offset (\d+) /)?.[1]
+        if (offset !== undefined) {
+          const v = store.get(key(links[0])), o = Number(offset)
+          answer = { head, verdicts: [{ ...structuredClone(v), failures: v.failures.slice(o, opts.held.get(v.link).find(s => s > o)) }], left: [], error: null }
+        } else {
+          const known = links.filter(l => store.has(key(l)))
+          answer = { head, verdicts: known.filter(l => !opts.held?.has(l)).map(l => structuredClone(store.get(key(l)))), left: known.filter(l => opts.held?.has(l)).map(link => ({ link, starts: opts.held.get(link) })), error: null }
+        }
+        if (opts.recall) answer = opts.recall(answer, text)
       } else if (/ remember /.test(text)) {
         const verdicts = trailingList(text)
         for (const v of verdicts) store.set(key(v.link), v)
@@ -1591,6 +1599,7 @@ const RIG = { check: 'hil / pico', firstError: 'board did not enumerate', files:
 const WAITING = { findings: [], replies: [], bots: 'pending' }
 const YIELD = { autoPush: true, maxCycles: 3, yieldAfterCycle: true }
 const ciLabels = (labels) => labels.filter(l => l.startsWith('ci:'))
+const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
 
 test('a same-head relaunch recalls the judged verdicts from the store: no judge', async () => {
   const store = new Map()
@@ -1746,32 +1755,62 @@ test('a recall copy that fails its seal costs its own batch a fresh relay, and a
   assert.ok(['b0', 'b1', 'b2', 'b3', 'b4'].every(b => judged.includes(`hil / ${b}`)) && !judged.includes('hil / b5'), 'only the lost batch is judged again')
 })
 
-test('a link the recall held back for room is recalled alone, and one too large to relay is judged again', async () => {
+test('a link the recall held back for room comes back in its own recall, and one too large to relay is judged again', async () => {
   // tinyusb#4019: one recall line of 51 KB, a HIL job's 113 failures in it, that no relay could copy.
   const four = Array.from({ length: 4 }, (_, i) => ({ ...RIG, check: `hil / b${i}`, cell: `b${i}` }))
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(...four).ci })
-  const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
-  // b0 never fits the line; b2 and b3 do not fit beside b1, and each comes back on a recall of its own.
-  const bounded = (alone) => (a) => a.verdicts.some(v => v.link === job(2))
-    ? { ...a, verdicts: a.verdicts.filter(v => v.link === job(2)), left: [job(3), job(4)] } : alone(a)
-  const again = (alone) => run({ store, recall: bounded(alone), args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(...four).ci })
+  // b0 has a failure too large for any line; b2 and b3 do not fit beside b1, and each comes back as one page.
+  const held = new Map([[job(3), [0]], [job(4), [0]]])
+  const dropped = (lost) => (a, text) => lost(({ ...a, verdicts: a.verdicts.filter(v => v.link !== job(1)) }), text)
+  const again = (lost) => run({ store, held, recall: dropped(lost), args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(...four).ci })
   const judgedOf = (r) => ['b0', 'b1', 'b2', 'b3'].filter(b => r.calls.find(c => c.label === 'ci:judge#2').prompt.includes(`hil / ${b}`))
 
   const ok = await again(a => a)
-  assert.deepEqual(ciLabels(ok.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.2', 'ci:collect#2.r1.3', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
-  assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.2').prompt, new RegExp(` recall --check '${job(3)}' --repo `))
-  assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.3').prompt, new RegExp(` recall --check '${job(4)}' --repo `))
+  assert.deepEqual(ciLabels(ok.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.2.p1', 'ci:collect#2.r1.3.p1', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
+  assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.2.p1').prompt, new RegExp(` recall --check '${job(3)}' --offset 0 --repo `))
+  assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.3.p1').prompt, new RegExp(` recall --check '${job(4)}' --offset 0 --repo `))
   assert.ok(ok.logs.includes('cycle 2: CI verdict for hil / b0 not returned by the recall (too large to relay, or not in the store) — judged again'), ok.logs.join('\n'))
   assert.ok(ok.logs.some(l => /CI verdicts reused for 3 check/.test(l)), ok.logs.join('\n'))
   assert.deepEqual(judgedOf(ok), ['b0'])
 
-  const b3 = (a) => a.verdicts.some(v => v.link === job(4))
-  for (const [alone, why] of [[(a) => b3(a) ? { ...a, error: 'gone', verdicts: [], left: [] } : a, 'gone'], [(a) => b3(a) ? { ...a, verdicts: [] } : a, 'its own recall did not return it']]) {
-    const failed = await again(alone)
-    assert.ok(failed.logs.includes(`cycle 2: CI verdict not recalled for hil / b3 — ${why}`), failed.logs.join('\n'))
-    assert.ok(failed.logs.some(l => /CI verdicts reused for 2 check/.test(l)), 'the first recall and the other alone stand')
+  const b3 = (text) => text.includes(`--check '${job(4)}' --offset`)
+  for (const [lost, why] of [[(a, text) => b3(text) ? { ...a, error: 'gone', verdicts: [] } : a, 'gone'], [(a, text) => b3(text) ? { ...a, verdicts: [] } : a, 'its recall did not return it']]) {
+    const failed = await again(lost)
+    assert.ok(failed.logs.includes(`cycle 2: CI verdict not recalled for hil / b3 — page 1 of 1: ${why}`), failed.logs.join('\n'))
+    assert.ok(failed.logs.some(l => /CI verdicts reused for 2 check/.test(l)), 'the first recall and the other held-back link stand')
     assert.deepEqual(judgedOf(failed), ['b0', 'b3'])
+  }
+})
+
+test('a verdict too large for one line is recalled in pages that join into it, and a lost or changed page is judged again', async () => {
+  // #25: tinyusb#4019's 113-failure HIL verdict was judged again on every launch.
+  const two = [{ ...RIG, check: 'hil / b0', cell: 'b0' }, { ...RIG, check: 'hil / b1', cell: 'b1' }]
+  const many = (judged) => ({ ...judged, checks: judged.checks.map(c => c.link !== job(1) ? c
+    : { ...c, failures: [0, 1, 2].map(n => ({ ...c.failures[0], firstError: `board ${n} did not enumerate`, signature: `board ${n}` })) }) })
+  const held = new Map([[job(1), [0, 2]]])
+  // Beside another link or alone, the big one is held back with its page starts.
+  for (const ci of [redWith(...two).ci, redWith(two[0]).ci]) {
+    const store = new Map()
+    const first = await run({ store, judge: many, args: YIELD, reviews: WAITING, ci })
+    const again = (recall) => run({ store, held, recall, judge: many, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci })
+    const ok = await again()
+    assert.deepEqual(ciLabels(ok.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.2.p1', 'ci:collect#2.r1.2.p2'])
+    assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.2.p2').prompt, new RegExp(` recall --check '${job(1)}' --offset 2 --repo `))
+    assert.ok(ok.logs.some(l => new RegExp(`CI verdicts reused for ${ci.realFailures.length} check`).test(l)), ok.logs.join('\n'))
+    assert.deepEqual(ok.result.history.at(-1).ci.realFailures.filter(f => f.check === 'hil / b0').map(f => f.firstError),
+      ['board 0 did not enumerate', 'board 1 did not enumerate', 'board 2 did not enumerate'])
+
+    const second = (text) => / --offset 2 /.test(text)
+    for (const [recall, why] of [
+      [(a, text) => second(text) ? null : a, 'CI verdict not recalled for hil / b0 — page 2 of 2: the collector died'],
+      [(a, text) => second(text) ? { ...a, verdicts: [] } : a, 'CI verdict not recalled for hil / b0 — page 2 of 2: its recall did not return it'],
+      [(a, text) => second(text) ? { ...a, verdicts: a.verdicts.map(v => ({ ...v, failures: [] })) } : a, 'CI verdict for hil / b0 recalled with another digest — judged again'],
+    ]) {
+      const failed = await again(recall)
+      assert.ok(failed.logs.includes(`cycle 2: ${why}`), failed.logs.join('\n'))
+      assert.ok(failed.calls.find(c => c.label === 'ci:judge#2').prompt.includes('hil / b0'))
+    }
   }
 })
 
