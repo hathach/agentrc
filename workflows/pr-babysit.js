@@ -9,7 +9,7 @@ export const meta = {
 //            ['coderabbit', 'greptile', 'code-scanning']; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default:
 //            reviewers but code-scanning, which is harvested only and never named here),
-//          maxCycles?: number (ceiling on review/fix/CI cycles, default 5; a resumed launch
+//          maxCycles?: number (ceiling on review/fix/CI cycles, default 10; a resumed launch
 //            defaults to its state's), autoPush?: boolean (default false = dry run),
 //          markSonar?: boolean (with autoPush: the SonarCloud issue behind a code-scanning comment
 //            this run refuted, or fixed while SonarCloud still flags it on the head it analysed, is
@@ -284,7 +284,7 @@ if (args.state !== undefined && args.state !== null) {
   if (priorBuild !== undefined && priorBuild !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(priorBuild)} → ${JSON.stringify(buildCmd)}`)
   restored = st
 }
-const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 5)
+const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 10)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
 let cyclesUsed = restored ? restored.cyclesUsed : 0
 // Adoption continues a state from commits its caller made, so it needs the
