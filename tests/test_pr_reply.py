@@ -92,12 +92,14 @@ class FakeGitHub:
             thread = next(t for t, v in self.threads.items() if parent in v['ids'])
             self.review_comment(cid, body['body'], ME, thread=thread, parent=parent)
             return self.review[cid]
-        m = re.fullmatch(rf'repos/{REPO}/pulls/comments/(\d+)', path)
+        m = re.fullmatch(rf'repos/{REPO}/(pulls|issues)/comments/(\d+)', path)
+        pool = m and (self.review if m.group(1) == 'pulls' else self.issue)
         if m and method == 'GET':
-            return self.review[int(m.group(1))]
-        m = re.fullmatch(rf'repos/{REPO}/issues/comments/(\d+)', path)
-        if m and method == 'GET':
-            return self.issue[int(m.group(1))]
+            return pool[int(m.group(2))]
+        if m and method == 'PATCH':
+            self.mutations.append(('edit', int(m.group(2)), body['body']))
+            pool[int(m.group(2))]['body'] = body['body']
+            return pool[int(m.group(2))]
         m = re.fullmatch(rf'repos/{REPO}/pulls/{PR}/reviews/(\d+)', path)
         if m and method == 'GET':
             return self.reviews[int(m.group(1))]
@@ -536,6 +538,71 @@ class ReconcileTest(ReplyCase):
                                    'originalDigest': reply.comment_digest('two points')})
         self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved']), (1, True, None))
         self.assertIn('502', receipts[0]['error'])
+
+    def edit(self, *items):
+        rc, out = self.main('--edit', self.json_file({'edits': [{'digest': reply.fnv1a(i['body']), **i} for i in items]}))
+        return rc, self.receipts(out)
+
+    def test_edit_puts_the_intended_body_on_our_reply_and_resolves(self):
+        self.gh.review_comment(10, 'two points')
+        self.gh.review_comment(55, 'deliberately', ME, thread='T10', parent=10)
+        rc, receipts = self.edit({'commentId': 10, 'replyId': 55, 'body': 'precisely', 'bodyDigest': reply.fnv1a('deliberately'),
+                                  'originalDigest': reply.comment_digest('two points')})
+        self.assertEqual(rc, 0)
+        self.assertEqual(receipts, [{'commentId': 10, 'kind': 'review', 'replyId': 55, 'digest': reply.fnv1a('precisely'),
+                                     'sent': True, 'posted': True, 'verified': True, 'resolved': True, 'error': None}])
+        self.assertEqual(self.gh.mutations, [('edit', 55, 'precisely'), ('resolve', 'T10')])
+        body = self.reworded()
+        rc, receipts = self.edit({'commentId': 20, 'replyId': 901, 'body': 'the draft', 'bodyDigest': reply.fnv1a(body),
+                                  'originalDigest': reply.comment_digest('three points')})
+        self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved']), (0, True, None))
+        self.assertEqual(self.gh.mutations[-1], ('edit', 901, f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\nthe draft'))
+
+    def test_edit_refuses_anything_changed_since_the_inspection(self):
+        body = self.reworded()
+        good = {'commentId': 20, 'replyId': 901, 'body': 'the draft', 'bodyDigest': reply.fnv1a(body), 'originalDigest': reply.comment_digest('three points')}
+        for change, expected in [
+            (lambda: self.gh.issue[20].update(body='four points'), 'comment 20 was edited since the inspection'),
+            (lambda: self.gh.issue[901].update(body=body + ' and more'), 'reply 901 was edited since the inspection'),
+            (lambda: self.gh.issue[901]['user'].update(login='bot'), 'mismatch on author'),
+        ]:
+            self.setUp()
+            self.reworded()
+            change()
+            rc, receipts = self.edit(good)
+            self.assertEqual((rc, receipts[0]['sent'], receipts[0]['verified']), (1, False, False))
+            self.assertIn(expected, receipts[0]['error'])
+            self.assertEqual(self.gh.mutations, [])
+        rc, out = self.main('--edit', self.json_file({'edits': [{**good, 'digest': reply.fnv1a('other')}]}))
+        self.assertEqual((rc, out['receipts'][0]['error']), (1, 'edit body does not match its digest'))
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_a_rerun_after_a_lost_receipt_finds_its_edit_and_makes_no_other(self):
+        self.gh.review_comment(10, 'two points')
+        self.gh.review_comment(55, 'deliberately', ME, thread='T10', parent=10)
+        body = self.reworded()
+        items = [{'commentId': 10, 'replyId': 55, 'body': 'precisely', 'bodyDigest': reply.fnv1a('deliberately'),
+                  'originalDigest': reply.comment_digest('two points')},
+                 {'commentId': 20, 'replyId': 901, 'body': 'the draft', 'bodyDigest': reply.fnv1a(body),
+                  'originalDigest': reply.comment_digest('three points')}]
+        self.edit(*items)
+        edits = [m for m in self.gh.mutations if m[0] == 'edit']
+        self.gh.threads['T10']['resolved'] = False
+        rc, receipts = self.edit(*items)
+        self.assertEqual(rc, 0)
+        self.assertEqual([(r['sent'], r['posted'], r['verified']) for r in receipts], [(False, False, True)] * 2)
+        self.assertEqual([m for m in self.gh.mutations if m[0] == 'edit'], edits, 'no second edit')
+        self.assertTrue(self.gh.threads['T10']['resolved'])
+
+    def test_edit_that_does_not_read_back_is_not_verified(self):
+        self.gh.review_comment(10, 'two points')
+        self.gh.review_comment(55, 'deliberately', ME, thread='T10', parent=10)
+        real = self.gh.rest
+        self.gh.rest = lambda method, path, body, paginate: real(method, path, {'body': body['body'] + ' '} if method == 'PATCH' else body, paginate)
+        rc, receipts = self.edit({'commentId': 10, 'replyId': 55, 'body': 'precisely', 'bodyDigest': reply.fnv1a('deliberately'),
+                                  'originalDigest': reply.comment_digest('two points')})
+        self.assertEqual((rc, receipts[0]['posted'], receipts[0]['verified'], receipts[0]['resolved']), (1, True, False, None))
+        self.assertFalse(self.gh.threads['T10']['resolved'])
 
     def test_bad_pairs_and_reuse_files_are_usage_errors(self):
         with self.assertRaises(SystemExit) as e:

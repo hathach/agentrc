@@ -28,6 +28,8 @@ python3 $R --digest "$body"      # the digest of a body, for a manifest written 
 python3 $R --pr <N> --inspect <commentId>:<replyId> ...   # read our replies, post nothing
 python3 $R --pr <N> --reuse <file.json>
 # file.json: {"reuses": [{"commentId": ..., "replyId": ..., "bodyDigest": "...", "originalDigest": "..."}]}
+python3 $R --pr <N> --edit <file.json>
+# file.json: {"edits": [{"commentId": ..., "replyId": ..., "body": "...", "digest": "...", "bodyDigest": "...", "originalDigest": "..."}]}
 ```
 
 Every entry carries the body's digest (FNV-1a, 32-bit, over code points); the
@@ -54,8 +56,8 @@ unreachable repo.
   were given; do not paraphrase, shorten, quote or annotate it. A reply that
   is a PR comment gets the original's URL as a quote line above the text, so
   the reader can find what it answers; the script adds that itself.
-- **Once.** Never post by hand with `gh api`, never a trial or placeholder
-  comment, never an edit, never a delete. If a run's outcome is unknown, run
+- **Once.** Never post or edit by hand with `gh api`, never a trial or
+  placeholder comment, never a delete. If a run's outcome is unknown, run
   the script again with the same manifest: it reuses what it finds and posts
   only what is missing.
 - **Receipts, verbatim.** Return the JSON line unchanged to whoever asked. A
@@ -64,7 +66,10 @@ unreachable repo.
   on that reply only when someone judged the body `--inspect` returned to
   answer every point the comment is owed now: `--reuse` with the digests from
   that inspection reads both again, posts nothing and resolves the thread.
-  Otherwise it stays for a human.
+  A reply your own manifest posted with a body other than the one you offered
+  may instead be put right with `--edit`, the offered body and the same
+  inspection's digests: it reads both again, edits only that reply, reads it
+  back and resolves the thread. Otherwise it stays for a human.
 - **A reply is not agreement.** A resolved thread means our answer was
   published, not that the reviewer accepted it; what the reviewer says next
   is a new comment to read, not something this script knows about.

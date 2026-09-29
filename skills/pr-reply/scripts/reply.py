@@ -4,6 +4,7 @@
   reply.py --pr N --manifest FILE [--repo OWNER/NAME]
   reply.py --pr N --inspect COMMENT:REPLY [COMMENT:REPLY ...] [--repo OWNER/NAME]
   reply.py --pr N --reuse FILE [--repo OWNER/NAME]
+  reply.py --pr N --edit FILE [--repo OWNER/NAME]
 
 FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>", "resolve": <bool>,
 "secondAnswer": <bool>}, ...]}, digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
@@ -23,7 +24,7 @@ reconcile. secondAnswer (default false) true says the caller knows it answered
 before and owes a new answer, to a comment edited since: an inline reply is
 then posted, while a comment of ours quoting it with the same kind of answer (a
 fix note, which starts with "Fixed in ", or anything else) still blocks, since
-that thread is never resolved. Nothing is ever edited or deleted.
+that thread is never resolved. Only --edit changes a reply, and nothing is ever deleted.
 
 stdout ends with one JSON line {"receipts": [{"commentId", "kind", "replyId",
 "digest", "sent", "posted", "verified", "resolved", "error"}], "seal"}, the seal
@@ -51,6 +52,15 @@ digests an inspection returned. Each pair is read again, and only a reply still
 ours, still that body, on a comment still that body, counts as verified; its
 review thread is then resolved. Receipts as above, sent and posted false, digest
 being the reply body's as read now.
+
+--edit puts the intended body on a reply of ours that went out with another: FILE is
+{"edits": [{"commentId", "replyId", "body", "digest", "bodyDigest", "originalDigest"}]},
+digest the body's as in a manifest, the other two what an inspection returned. Each
+pair is read again as for --reuse, and only a reply still ours, still that body, on a
+comment still that body, is edited to the body (quoted for the two kinds without a
+thread), read back and, for a review reply, its thread resolved; one already carrying
+the body, from a rerun, is read back and resolved without another edit. Receipts as
+for a manifest, sent and posted meaning the edit.
 """
 
 import argparse
@@ -187,6 +197,9 @@ class Poster:
             c = api('POST', f'repos/{self.repo}/issues/{self.pr}/comments', {'body': body})
         return c['id']
 
+    def edit(self, kind, reply_id, body):
+        api('PATCH', f'repos/{self.repo}/{"pulls" if kind == "review" else "issues"}/comments/{reply_id}', {'body': body})
+
     def read_original(self, kind, comment_id):
         """The comment as it stands now, not as the cached listing had it."""
         if kind == 'review-body':
@@ -281,26 +294,35 @@ def inspect(poster, comment_id, reply_id):
     return out
 
 
+def read_again(poster, item, rc, done=None):
+    """(original, reply, why) as they stand now, rc's kind set once known; why names
+    what makes the pair not ours or changed since the inspection, None when neither.
+    A reply already carrying `done` (an edit that landed; quoted as issue_body quotes it) has not changed."""
+    kind, _ = poster.kind_of(item['commentId'])
+    rc['kind'] = kind
+    # Afresh for each entry: settling an earlier one may have moved this one.
+    original = poster.read_original(kind, item['commentId']) if kind != 'none' else None
+    c, why = read_pair(poster, kind, original, item['commentId'], item['replyId'])
+    if not why and comment_digest(original.get('body')) != item['originalDigest']:
+        why = f'comment {item["commentId"]} was edited since the inspection'
+    if not why and fnv1a(c.get('body', '')) != item['bodyDigest'] and (
+            done is None or c.get('body') != (done if kind == 'review' else issue_body(original, done))):
+        why = f'reply {item["replyId"]} was edited since the inspection'
+    return original, c, why
+
+
 def reuse(poster, item):
     rc = {'commentId': item['commentId'], 'kind': None, 'replyId': item['replyId'], 'digest': item['bodyDigest'],
           'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
     try:
-        kind, _ = poster.kind_of(item['commentId'])
-        rc['kind'] = kind
-        # Afresh for each entry: settling an earlier one may have moved this one.
-        original = poster.read_original(kind, item['commentId']) if kind != 'none' else None
-        c, why = read_pair(poster, kind, original, item['commentId'], item['replyId'])
+        _, c, why = read_again(poster, item, rc)
         if c is not None:
             rc['digest'] = fnv1a(c.get('body', ''))
-        if not why and comment_digest(original.get('body')) != item['originalDigest']:
-            why = f'comment {item["commentId"]} was edited since the inspection'
-        if not why and rc['digest'] != item['bodyDigest']:
-            why = f'reply {item["replyId"]} was edited since the inspection'
         if why:
             rc['error'] = why
             return rc
         rc['verified'] = True
-        if kind == 'review':
+        if rc['kind'] == 'review':
             rc['error'] = poster.resolve(item['commentId'])
             rc['resolved'] = rc['error'] is None
     except ApiError as e:
@@ -308,6 +330,33 @@ def reuse(poster, item):
         # failed resolve leaves it verified and the thread open.
         if not rc['verified']:
             rc['verified'] = None if rc['kind'] is not None else False
+        rc['error'] = str(e)
+    return rc
+
+
+def edit(poster, item):
+    rc = {'commentId': item['commentId'], 'kind': None, 'replyId': item['replyId'], 'digest': fnv1a(item['body']),
+          'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
+    if item['digest'] != rc['digest']:
+        rc['error'] = 'edit body does not match its digest'
+        return rc
+    try:
+        original, c, why = read_again(poster, item, rc, item['body'])
+        if why:
+            rc['error'] = why
+            return rc
+        kind = rc['kind']
+        body = item['body'] if kind == 'review' else issue_body(original, item['body'])
+        # A rerun after a lost receipt finds its own edit there and does not make another.
+        if c.get('body') != body:
+            rc['sent'] = True
+            poster.edit(kind, item['replyId'], body)
+            rc['posted'] = True
+        rc['verified'], rc['error'] = poster.verify(kind, item['commentId'], item['replyId'], body)
+        if rc['verified'] and kind == 'review':
+            rc['error'] = poster.resolve(item['commentId'])
+            rc['resolved'] = rc['error'] is None
+    except ApiError as e:
         rc['error'] = str(e)
     return rc
 
@@ -380,6 +429,12 @@ def check_reuse(r):
         raise ValueError(f'bad reuse file entry: {r!r}')
 
 
+def check_edit(r):
+    check_reuse(r)
+    if not isinstance(r.get('body'), str) or not r['body'].strip() or not isinstance(r.get('digest'), str):
+        raise ValueError(f'bad edit file entry: {r!r}')
+
+
 def pair(text):
     comment, sep, reply_id = text.partition(':')
     if not (sep and comment.isdigit() and reply_id.isdigit()):
@@ -394,17 +449,19 @@ def main(argv=None):
     mode.add_argument('--manifest')
     mode.add_argument('--inspect', nargs='+', type=pair, metavar='COMMENT:REPLY')
     mode.add_argument('--reuse', metavar='FILE')
+    mode.add_argument('--edit', metavar='FILE')
     p.add_argument('--repo', help='OWNER/NAME (default: gh repo view)')
     p.add_argument('--digest', metavar='TEXT', help='print the digest of TEXT and exit')
     a = p.parse_args(argv)
     if a.digest is not None:
         print(fnv1a(a.digest))
         return 0
-    if a.pr is None or (a.manifest, a.inspect, a.reuse) == (None, None, None):
-        p.error('--pr and one of --manifest, --inspect or --reuse are required')
+    if a.pr is None or (a.manifest, a.inspect, a.reuse, a.edit) == (None, None, None, None):
+        p.error('--pr and one of --manifest, --inspect, --reuse or --edit are required')
     try:
         replies = load_entries(a.manifest, 'replies', 'manifest', check_reply) if a.manifest else None
         reuses = load_entries(a.reuse, 'reuses', 'reuse file', check_reuse) if a.reuse else None
+        edits = load_entries(a.edit, 'edits', 'edit file', check_edit) if a.edit else None
     except (OSError, ValueError, json.JSONDecodeError) as e:
         print(f'reply.py: {e}', file=sys.stderr)
         return 2
@@ -424,7 +481,8 @@ def main(argv=None):
         inspected = [inspect(poster, c, r) for c, r in a.inspect]
         print(json.dumps(sealed({'inspected': inspected})))
         return 0 if all(i['error'] is None for i in inspected) else 1
-    receipts = [reuse(poster, item) for item in reuses] if reuses else [handle(poster, item) for item in replies]
+    receipts = ([reuse(poster, item) for item in reuses] if reuses else [edit(poster, item) for item in edits] if edits
+                else [handle(poster, item) for item in replies])
     print(json.dumps(sealed({'receipts': [{k: v for k, v in r.items() if v is not None or k not in ('resolved', 'error')}
                                           for r in receipts]})))
     kept_open = {item['commentId'] for item in replies or [] if item.get('resolve') is False}
