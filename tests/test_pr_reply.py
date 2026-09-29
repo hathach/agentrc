@@ -424,6 +424,7 @@ class SealTest(ReplyCase):
             _, out = self.main(*args)
             line = {k: v for k, v in out.items() if k != 'seal'}
             self.assertEqual(out['seal'], facts.sealed(line)['seal'], args)
+        self.assertEqual(reply.sealed({'receipts': [], 'error': 'x'})['seal'], facts.sealed({'receipts': [], 'error': 'x'})['seal'])
 
 
 class ReconcileTest(ReplyCase):

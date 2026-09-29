@@ -158,6 +158,7 @@ const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const sealOf = ({ digest, ...st }) => fnv1a(canonical(JSON.parse(JSON.stringify(st))))
+const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
 // The schema of a script line facts.py seals; relayAgent checks the copy against it.
 const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
@@ -219,7 +220,7 @@ if (args.stateRef != null) {
   const missingOf = () => indices().filter(i => !got.has(i))
   for (let round = 1; args.state == null && idle < 2 && round <= ROUNDS; round++) {
     const missing = length ? missingOf() : null
-    const groups = missing ? [...Array(Math.ceil(missing.length / PER_CALL)).keys()].map(g => missing.slice(g * PER_CALL, (g + 1) * PER_CALL)) : [null]
+    const groups = missing ? groupsOf(missing, PER_CALL) : [null]
     const replies = await parallel(groups.map(asked => () => agent(
       `Run exactly: python3 ${STATE_SCRIPT} '${ref.outputFile}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
@@ -2073,7 +2074,7 @@ const ciLaneRun = async (cycle, lanes) => {
   const unread = failing.filter(c => reusable(c) && !ciVerdicts.get(c.link).failures)
   // A few links to a call: one sealed line grows with the HIL matrix, and a copy that
   // fails its seal costs its own batch a fresh relay, the rest nothing (#9).
-  const batches = [...Array(Math.ceil(unread.length / RECALL_PER_CALL)).keys()].map(k => unread.slice(k * RECALL_PER_CALL, (k + 1) * RECALL_PER_CALL))
+  const batches = groupsOf(unread, RECALL_PER_CALL)
   const recalled = await parallel(batches.map((batch, k) => () =>
     collect(`ci:collect#${cycle}.r${k + 1}`, `recall ${batch.map(c => `--check ${shq(c.link)}`).join(' ')}`, RECALLED)))
   batches.forEach((batch, k) => {

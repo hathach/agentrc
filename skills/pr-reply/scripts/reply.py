@@ -98,7 +98,8 @@ def sealed(facts):
         if isinstance(v, list):
             return [bare(x) for x in v]
         return v
-    text = json.dumps(bare(facts), separators=(',', ':'), ensure_ascii=False)
+    # Top-level error stays out: a checked line has none, and a relay may fill in error: ''.
+    text = json.dumps(bare({k: v for k, v in facts.items() if k != 'error'}), separators=(',', ':'), ensure_ascii=False)
     # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
     return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
 
@@ -254,6 +255,11 @@ def issue_body(original, body):
     return f"> {original['html_url']}\n\n{body}"
 
 
+def reply_body(kind, original, body):
+    """What a reply of that kind says on GitHub: a review reply the body, any other one it quoting the original."""
+    return body if kind == 'review' else issue_body(original, body)
+
+
 def is_fix_note(body):
     """pr-babysit's note for a landed fix, a different answer from a refutation of the same comment."""
     return body.partition('\n\n')[2].startswith('Fixed in ')
@@ -306,7 +312,7 @@ def read_again(poster, item, rc, done=None):
     if not why and comment_digest(original.get('body')) != item['originalDigest']:
         why = f'comment {item["commentId"]} was edited since the inspection'
     if not why and fnv1a(c.get('body', '')) != item['bodyDigest'] and (
-            done is None or c.get('body') != (done if kind == 'review' else issue_body(original, done))):
+            done is None or c.get('body') != reply_body(kind, original, done)):
         why = f'reply {item["replyId"]} was edited since the inspection'
     return original, c, why
 
@@ -346,7 +352,7 @@ def edit(poster, item):
             rc['error'] = why
             return rc
         kind = rc['kind']
-        body = item['body'] if kind == 'review' else issue_body(original, item['body'])
+        body = reply_body(kind, original, item['body'])
         # A rerun after a lost receipt finds its own edit there and does not make another.
         if c.get('body') != body:
             rc['sent'] = True
@@ -373,7 +379,7 @@ def handle(poster, item):
         if kind == 'none':
             rc['error'] = f'comment {item["commentId"]} is not on PR #{poster.pr}'
             return rc
-        body = item['body'] if kind == 'review' else issue_body(original, item['body'])
+        body = reply_body(kind, original, item['body'])
         found = poster.existing(kind, item['commentId'], body, item.get('secondAnswer', False))
         if found and found[1] != body:
             rc['replyId'] = found[0]
@@ -431,8 +437,7 @@ def check_reuse(r):
 
 def check_edit(r):
     check_reuse(r)
-    if not isinstance(r.get('body'), str) or not r['body'].strip() or not isinstance(r.get('digest'), str):
-        raise ValueError(f'bad edit file entry: {r!r}')
+    check_reply(r)
 
 
 def pair(text):
