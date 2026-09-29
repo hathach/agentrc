@@ -26,7 +26,8 @@ fix note, which starts with "Fixed in ", or anything else) still blocks, since
 that thread is never resolved. Nothing is ever edited or deleted.
 
 stdout ends with one JSON line {"receipts": [{"commentId", "kind", "replyId",
-"digest", "sent", "posted", "verified", "resolved", "error"}]}: kind is
+"digest", "sent", "posted", "verified", "resolved", "error"}], "seal"}, the seal
+being pr-babysit's check on a relayed copy (fnv1a over the canonical JSON, nulls left out): kind is
 "review", "issue" or "review-body", "none" when all three were searched and the
 id is on none of them (the caller owes it nothing), null when a lookup failed
 before that was known; sent says a POST was issued (a lost response leaves sent true and replyId null: the
@@ -41,7 +42,7 @@ error is left out of the line: a model relaying it drops a trailing null.
 COMMENT on this PR, its exact body with the body's digest, and the original's
 digest as pr-babysit's harvest.py computes it (sha256, 12 hex). stdout ends with
 {"inspected": [{"commentId", "replyId", "kind", "body", "bodyDigest",
-"originalDigest", "error"}]}; body is null when error is set. Exit 0 when every
+"originalDigest", "error"}], "seal"}; body is null when error is set. Exit 0 when every
 pair was read and is ours, 1 otherwise.
 
 --reuse settles a comment on a reply already there, and never posts: FILE is
@@ -55,6 +56,7 @@ being the reply body's as read now.
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 
@@ -74,6 +76,21 @@ def fnv1a(text):
     for ch in text:
         h = ((h ^ ord(ch)) * 0x01000193) & 0xffffffff
     return f'{h:08x}'
+
+
+def sealed(facts):
+    """facts plus pr-babysit's seal, as its facts.py computes it: fnv1a over the canonical
+    JSON with null members left out, so a relay that copies a line wrong is caught."""
+    def bare(v):
+        # Keys in UTF-16 code-unit order, as JavaScript's sort() compares them.
+        if isinstance(v, dict):
+            return {k: bare(v[k]) for k in sorted(v, key=lambda k: k.encode('utf-16-be', 'surrogatepass')) if v[k] is not None}
+        if isinstance(v, list):
+            return [bare(x) for x in v]
+        return v
+    text = json.dumps(bare(facts), separators=(',', ':'), ensure_ascii=False)
+    # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
+    return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
 
 
 def gh(args, stdin=None):
@@ -405,11 +422,11 @@ def main(argv=None):
         return 2
     if a.inspect:
         inspected = [inspect(poster, c, r) for c, r in a.inspect]
-        print(json.dumps({'inspected': inspected}))
+        print(json.dumps(sealed({'inspected': inspected})))
         return 0 if all(i['error'] is None for i in inspected) else 1
     receipts = [reuse(poster, item) for item in reuses] if reuses else [handle(poster, item) for item in replies]
-    print(json.dumps({'receipts': [{k: v for k, v in r.items() if v is not None or k not in ('resolved', 'error')}
-                                   for r in receipts]}))
+    print(json.dumps(sealed({'receipts': [{k: v for k, v in r.items() if v is not None or k not in ('resolved', 'error')}
+                                          for r in receipts]})))
     kept_open = {item['commentId'] for item in replies or [] if item.get('resolve') is False}
     ok = all(r['verified'] is True and (r['kind'] != 'review' or r['resolved'] or r['commentId'] in kept_open) for r in receipts)
     return 0 if ok else 1

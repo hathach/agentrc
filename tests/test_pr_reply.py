@@ -408,6 +408,22 @@ class ReplyTest(ReplyCase):
         self.assertLessEqual(methods, {'GET', 'POST'})
 
 
+class SealTest(ReplyCase):
+    """The seal pr-babysit checks a relayed copy against, as its facts.py computes it."""
+
+    def test_receipts_and_inspected_lines_carry_facts_seal(self):
+        facts_spec = importlib.util.spec_from_file_location('facts', SCRIPT.parents[2] / 'pr-babysit' / 'scripts' / 'facts.py')
+        facts = importlib.util.module_from_spec(facts_spec)
+        facts_spec.loader.exec_module(facts)
+        self.gh.review_comment(10)
+        path = self.json_file({'replies': [{'commentId': 10, 'body': 'naïve ✓ "q"', 'digest': reply.fnv1a('naïve ✓ "q"')},
+                                           {'commentId': 99, 'body': 'x', 'digest': reply.fnv1a('x')}]})
+        for args in (['--manifest', path], ['--inspect', '10:901']):
+            _, out = self.main(*args)
+            line = {k: v for k, v in out.items() if k != 'seal'}
+            self.assertEqual(out['seal'], facts.sealed(line)['seal'], args)
+
+
 class ReconcileTest(ReplyCase):
     """--inspect and --reuse: settle on a reply of ours already there, never posting."""
 

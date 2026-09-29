@@ -35,7 +35,7 @@ script refuses an entry whose body does not match it, so a body copied wrong
 never reaches the PR. A workflow computes the digests itself; by hand, use
 `--digest`.
 
-The last stdout line is `{"receipts": [...]}`, one per manifest entry:
+The last stdout line is `{"receipts": [...], "seal": ...}`, one receipt per manifest entry (the seal is pr-babysit's check that a relayed copy is exact):
 `kind` (`review`, `issue` or `review-body`; `none` when all three were searched
 and the id is on none of them, so the caller owes it nothing; `null` when a
 lookup failed before that was known), `replyId`, `digest`, `sent` (a POST was issued;

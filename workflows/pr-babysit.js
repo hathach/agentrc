@@ -710,10 +710,9 @@ const relayAgent = async (prompt, opts) => {
 // A relay that died or did not match its seal gets one fresh agent, on Sonnet:
 // Haiku mis-copies a long line. An error the script reported is its answer. Only
 // for a script that is safe to run twice.
-const relayOnce = async (prompt, opts, retryPrompt = prompt) => {
-  const run = (p, o) => relayAgent(p, o).catch(e => { log(`${o.label} errored — ${e && e.message}`); return null })
-  return (await run(prompt, opts)) ?? run(retryPrompt, { ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
-}
+const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(e => { log(`${opts.label} errored — ${e && e.message}`); return null })
+const retryOpts = (opts) => ({ ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
+const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRun(retryPrompt, retryOpts(opts))
 // facts.py's seal: fnv1a over the canonical JSON with null members left out. A
 // checked line has no error, so one a relay filled in (error: '') is not hashed.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
@@ -723,12 +722,13 @@ const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
 // One reply.py run relayed by an agent; `rules` says what it must leave to the script.
-const runReplyScript = (label, mode, task, rules, payload) => relayAgent(
+// A rerun is safe: reply.py reuses a reply of ours it finds rather than post again.
+const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file and run ` +
-  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return the receipts from its last stdout line unchanged. ` +
+  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return its last stdout line unchanged. ` +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
-).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+)
 // Standard base64 to a string of byte values, or null for anything else.
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
@@ -748,7 +748,7 @@ function fnv1a (text) {
   for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
   return h.toString(16).padStart(8, '0')
 }
-const RECEIPTS = {
+const RECEIPTS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['receipts'],
   properties: {
@@ -765,10 +765,10 @@ const RECEIPTS = {
       },
     },
   },
-}
+})
 
 // reply.py --inspect: our reply on each comment as it stands, and both digests.
-const INSPECTED = {
+const INSPECTED = withSeal({
   type: 'object', additionalProperties: false,
   required: ['inspected'],
   properties: {
@@ -785,7 +785,7 @@ const INSPECTED = {
       },
     },
   },
-}
+})
 // Whether a reply already there answers every point its comment is owed; null
 // when that could not be told.
 const ANSWERS = {
@@ -1741,18 +1741,16 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
 // URL answered without it; anything else is unknown, never "not pushed".
 // null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
-  const attempt = (l) => relayAgent(
-    `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
+  const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
     `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.branch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
-    relayed(PUSH),
-    { label: l, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH },
-  ).catch(e => { log(`${l} errored — ${e && e.message}`); return null })
-  // push.py pushes one exact SHA without force and reads it back, so a retry
-  // finds a push that landed; it cannot prove one did not, since the branch may
-  // have moved on since.
-  const first = await attempt(label)
-  const r = first ?? await attempt(`${label}.retry`)
+    relayed(PUSH)
+  const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
+  // relayOnce's two attempts, kept apart: push.py pushes one exact SHA without
+  // force and reads it back, so a retry finds a push that landed; it cannot prove
+  // one did not, since the branch may have moved on since.
+  const first = await relayRun(prompt, opts)
+  const r = first ?? await relayRun(prompt, retryOpts(opts))
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
   if (r.error) return unknown(r.error)
@@ -1919,11 +1917,11 @@ const settleSonar = async (cycle, entry) => {
 // inspection, before the comment is paid and its repair cleared. A dry run
 // inspects and judges, and settles nothing.
 const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
-  const got = await relayAgent(
+  const got = await relayOnce(
     `${IN_CHECKOUT}Posting and editing nothing, run exactly \`python3 ${REPLY_SCRIPT} --pr ${args.pr} --inspect ${stuck.map(s => `${s.commentId}:${s.replyId}`).join(' ')}\` ` +
-    'and return the inspected list from its last stdout line unchanged; if there is no such line, return inspected = [].',
+    'and return its last stdout line unchanged; if there is no such line, return inspected = [] and seal = \'\'.',
     { label: `inspect#${cycle}`, phase: 'Push', model: 'haiku', effort: 'low', schema: INSPECTED },
-  ).catch(e => { log(`inspect#${cycle} errored — ${e && e.message}`); return null })
+  )
   const notYet = (s, why) => log(`cycle ${cycle}: reply ${s.replyId} to comment ${s.commentId} still needs repair — ${why}`)
   const readable = []
   for (const s of stuck) {

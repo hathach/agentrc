@@ -2114,6 +2114,7 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
   // A push relay gets one fresh agent: push.py reads back a push that landed.
   const pushed = await run({ reviews: oneValid, garble: (l, a) => l === 'push#1-review' ? cutHead(a) : a })
   assert.ok(pushed.labels.includes('push#1-review.retry'))
+  assert.equal(pushed.calls.find(c => c.label === 'push#1-review.retry').model, 'sonnet')
   assert.equal(pushed.result.history[0].reviewPushFailed, undefined)
   // A retry that finds the branch elsewhere cannot prove the lost first attempt missed.
   const rejected = ({ seal, ...a }) => sealLine({ ...a, pushed: false, detail: ' ! [rejected] non-fast-forward', heads: a.heads.map(h => ({ ...h, head: FOREIGN })) })
@@ -3687,6 +3688,18 @@ test('an unavailable read-back is retried, not repaired', async () => {
   assert.equal(result.history[0].refutedPosts.receipts[0].verified, null)
 })
 
+test('a reply receipt whose copy does not match its seal gets one fresh relay on Sonnet', async () => {
+  // #3988: a Haiku relay nulled replyId and kind, and two posted replies went unsettled for a cycle.
+  const nulled = (a) => ({ ...a, receipts: a.receipts.map(r => ({ ...r, replyId: null, kind: null })) })
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+  const { result, labels, calls, logs } = await run({ reviews, garble: (l, a) => l === 'replies#1' ? nulled(a) : a })
+  assert.ok(logs.some(l => l === 'replies#1: the relayed copy does not match its seal'), logs.join('\n'))
+  assert.deepEqual(labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'])
+  assert.equal(calls.find(c => c.label === 'replies#1.retry').model, 'sonnet')
+  assert.deepEqual(manifestOf(calls, 'replies#1.retry'), manifestOf(calls, 'replies#1'), 'the same manifest: reply.py reuses what landed')
+  assert.equal(result.pass, true, result.reason)
+})
+
 test('a retry offers the body first posted, not the redraft', async () => {
   // A lost receipt or a failed resolve leaves a reply on the thread. The script
   // reuses only an identical body, so the next cycle must hand it the same text
@@ -3702,8 +3715,8 @@ test('a retry offers the body first posted, not the redraft', async () => {
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(result.pass, true, `settled on the retry (got ${result.reason})`)
-  const bodies = calls.filter(c => c.label.startsWith('replies#')).map(c => manifestOf(calls, c.label)[0].body)
-  assert.deepEqual(bodies, ['first wording', 'first wording'])
+  const bodies = calls.filter(c => c.label.startsWith('replies#')).map(c => [c.label, manifestOf(calls, c.label)[0].body])
+  assert.deepEqual(bodies, [['replies#1', 'first wording'], ['replies#1.retry', 'first wording'], ['replies#2', 'first wording']])
   assert.ok(logs.some(l => /comment 2 keeps the body already offered/.test(l)), logs.join('\n'))
   assert.equal(result.state.debt.length, 0, 'paid debt carries no attempt')
 })
@@ -3801,7 +3814,7 @@ test('an offered answer the comment outgrew is a repair, not a reuse or a repost
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(edited.result.pass, false)
-  assert.equal(edited.calls.filter(c => c.label.startsWith('replies#')).length, 1, 'no repost under the edited comment')
+  assert.deepEqual(edited.labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'], 'no repost under the edited comment')
   assert.deepEqual(edited.result.state.debt.find(([id]) => id === 2)[1].repair,
     { replyId: null, error: 'offered refutation is stale (comment edited)' })
   assert.match(rowsOf(summaries(edited.logs)[1])[0][3], /NEEDS REPAIR: offered refutation is stale/)
