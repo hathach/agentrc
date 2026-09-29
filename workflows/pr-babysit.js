@@ -1956,10 +1956,13 @@ const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
   // meant to: it settles with no verdict and no edit, as a read-back mismatch on a
   // parent that was right all along (#18) does.
   const text = (s) => s.kind === 'review' ? s.body : s.body.slice(s.body.indexOf('\n\n') + 2)
-  const exact = readable.filter(s => s.attempted !== undefined && text(s) === s.attempted)
-  const edits = readable.filter(s => !exact.includes(s) && s.attempted !== undefined && s.posted)
+  const exact = [], edits = [], judging = []
+  for (const s of readable) {
+    if (s.attempted !== undefined && text(s) === s.attempted) exact.push(s)
+    else if (s.attempted !== undefined && s.posted) edits.push(s)
+    else judging.push(s)
+  }
   if (edits.length) await editReplies(cycle, edits, notYet)
-  const judging = readable.filter(s => !exact.includes(s) && !edits.includes(s))
   const answered = [...exact, ...(judging.length ? await judge(cycle, judging, pointsOf, notYet) : [])]
   if (!answered.length) return
   if (args.autoPush !== true) {

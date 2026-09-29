@@ -215,7 +215,7 @@ class Poster:
     def misplaced(self, kind, target, c):
         """What makes reply c not ours answering the target comment on this PR, by name."""
         if kind == 'review':
-            checks = [('parent', in_thread_after(c, target)),
+            checks = [('thread', in_thread_after(c, target)),
                       ('author', c.get('user', {}).get('login') == self.me),
                       ('pr', str(c.get('pull_request_url', '')).endswith(f'/pulls/{self.pr}'))]
         else:
@@ -329,9 +329,14 @@ def read_again(poster, item, rc, done=None):
     return original, c, why
 
 
+def receipt(comment_id, reply_id, digest):
+    """A receipt that has sent, posted and verified nothing yet."""
+    return {'commentId': comment_id, 'kind': None, 'replyId': reply_id, 'digest': digest,
+            'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
+
+
 def reuse(poster, item):
-    rc = {'commentId': item['commentId'], 'kind': None, 'replyId': item['replyId'], 'digest': item['bodyDigest'],
-          'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
+    rc = receipt(item['commentId'], item['replyId'], item['bodyDigest'])
     try:
         _, c, why = read_again(poster, item, rc)
         if c is not None:
@@ -353,8 +358,7 @@ def reuse(poster, item):
 
 
 def edit(poster, item):
-    rc = {'commentId': item['commentId'], 'kind': None, 'replyId': item['replyId'], 'digest': fnv1a(item['body']),
-          'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
+    rc = receipt(item['commentId'], item['replyId'], fnv1a(item['body']))
     if item['digest'] != rc['digest']:
         rc['error'] = 'edit body does not match its digest'
         return rc
@@ -380,8 +384,7 @@ def edit(poster, item):
 
 
 def handle(poster, item):
-    rc = {'commentId': item['commentId'], 'kind': None, 'replyId': None, 'digest': fnv1a(item['body']),
-          'sent': False, 'posted': False, 'verified': False, 'resolved': None, 'error': None}
+    rc = receipt(item['commentId'], None, fnv1a(item['body']))
     if item['digest'] != rc['digest']:
         rc['error'] = 'manifest body does not match its digest'
         return rc

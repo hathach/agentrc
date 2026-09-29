@@ -449,7 +449,7 @@ class FollowUpTest(ReplyCase):
         self.assertEqual(rc, 1)
         good, early = out['inspected']
         self.assertEqual((good['error'], good['body']), (None, 'deliberately'))
-        self.assertIn('mismatch on parent', early['error'], 'our reply from before the follow-up cannot answer it')
+        self.assertIn('mismatch on thread', early['error'], 'our reply from before the follow-up cannot answer it')
         pair = {'commentId': 20, 'replyId': 25, 'bodyDigest': reply.fnv1a('deliberately'), 'originalDigest': reply.comment_digest('follow-up')}
         rc, receipts = self.edit({**pair, 'body': 'precisely'})
         self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved']), (0, True, True))
@@ -463,7 +463,7 @@ class FollowUpTest(ReplyCase):
         self.gh.review_comment(30, 'elsewhere')
         self.gh.review_comment(35, 'not so', ME, thread='T30', parent=30)
         rc, out = self.main('--inspect', '20:35')
-        self.assertIn('mismatch on parent', out['inspected'][0]['error'])
+        self.assertIn('mismatch on thread', out['inspected'][0]['error'])
 
 
 class SealTest(ReplyCase):
@@ -519,7 +519,7 @@ class ReconcileTest(ReplyCase):
         errors = [i['error'] for i in out['inspected']]
         self.assertIn('mismatch on author', errors[0])
         self.assertIn('mismatch on quote', errors[1])
-        self.assertIn('mismatch on parent', errors[2])
+        self.assertIn('mismatch on thread', errors[2])
         self.assertEqual(errors[3], f'comment 99 is not on PR #{PR}')
         self.assertTrue(all(i['body'] is None for i in out['inspected']))
 

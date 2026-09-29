@@ -2939,7 +2939,7 @@ test('a reply that reads back as the offered body settles on it with no verdict 
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
     inspect: () => ({ body: 'not so', bodyDigest: fnv1a('not so') }),
   }
-  const parent = (rs, l) => l === 'replies#1' ? rs.map(r => ({ ...r, verified: false, resolved: null, error: 'read-back mismatch on parent' })) : rs
+  const parent = (rs, l) => l === 'replies#1' ? rs.map(r => ({ ...r, verified: false, resolved: null, error: 'read-back mismatch on thread' })) : rs
   const { result, labels, calls } = await run({ ...wrong, args: { autoPush: true, maxCycles: 2 }, receipts: parent })
   assert.deepEqual(labels.filter(l => /^(replies|inspect|reconcile|edit|reuse)#/.test(l)), ['replies#1', 'inspect#2', 'reuse#2'])
   assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#2').prompt, 'Reuses').reuses,
