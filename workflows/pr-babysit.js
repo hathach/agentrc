@@ -42,7 +42,8 @@ export const meta = {
 //            that result and its stateDigest; a loader agent copies it as checksummed chunks,
 //            and a copy that fails the stateDigest is asked for again or refused),
 //          adoptHead?: string (full SHA of commits the caller made and audited on top of the
-//            state's expectedHead, a hardware repair say: this launch audits the chain, publishes
+//            state's expectedHead, a hardware repair say, or a push made outside the workflow, the PR
+//            then heading a commit of that chain: this launch audits the chain, publishes
 //            it under autoPush and continues from it with the same state; while the PR still heads
 //            expectedHead it also decides an unpublished candidate the state holds, unless this
 //            run's audit refused it; per launch, never saved) }
@@ -2785,8 +2786,9 @@ if (!expectedOrigin || badPush !== undefined) {
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-remote', remoteUrl: badPush, expected: expectedOrigin || `${HOST}/${pinned.prRepo.trim().toLowerCase()}` })
 }
 // Adoption stands in for the two head checks above: the checkout must be at the
-// named commit, the PR at the state's head or already at that commit, and the
-// chain between them audited commit by commit before anything is published.
+// named commit, the PR at the state's head, at that commit or at one between them
+// (a push made outside this workflow), and the chain audited commit by commit
+// before anything is published.
 let adoption = null
 if (adoptHead !== null) {
   const X = restored.expectedHead
@@ -2794,10 +2796,6 @@ if (adoptHead !== null) {
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-head-mismatch', head: pinned.head.trim(), expected: adoptHead })
-  }
-  if (prHead !== X && prHead !== adoptHead) {
-    log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor ${adoptHead.slice(0, 7)}`)
-    return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-head', head: prHead, expected: [X, adoptHead] })
   }
   // An unpublished candidate of this run's own is the caller's decision, made by a
   // retry of the same adoption or, while the PR heads the state's head, by a chain
@@ -2838,7 +2836,11 @@ if (adoptHead !== null) {
     log(`preflight: adoption refused — ${why}`)
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-audit-failed', detail: why })
   }
-  if (prHead === X && args.autoPush !== true) {
+  if (prHead !== X && !shas.includes(prHead)) {
+    log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor a commit of the chain to ${adoptHead.slice(0, 7)}`)
+    return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-head', head: prHead, expected: [X, adoptHead] })
+  }
+  if (prHead !== adoptHead && args.autoPush !== true) {
     log(`preflight: ${adoptHead.slice(0, 7)} is audited but unpublished, and this is a dry run`)
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-needs-push', dryRun: true })
   }

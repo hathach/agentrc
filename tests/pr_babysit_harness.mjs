@@ -4474,7 +4474,7 @@ test('adoption keeps ordinary preflight refusals ahead of its own checks', async
   assert.deepEqual(thrown.labels, ['preflight', 'preflight.retry'])
 })
 
-test('adoption refuses a local head other than the candidate and a remote head outside the pair', async () => {
+test('adoption refuses a local head other than the candidate and a remote head outside the chain', async () => {
   const mismatch = adoptionState()
   const local = await run({
     args: adoptionArgs(mismatch), preflight: { head: HEAD, prHead: HEAD },
@@ -4491,7 +4491,22 @@ test('adoption refuses a local head other than the candidate and a remote head o
   assert.equal(remote.result.reason, 'wrong-head')
   assert.equal(remote.result.head, FOREIGN)
   assert.deepEqual(remote.result.expected, [HEAD, ADOPT])
-  assert.deepEqual(remote.labels, ['preflight'])
+  assert.deepEqual(remote.labels, ['preflight', 'adopt:audit'], 'only the audit can say which commits the chain holds')
+})
+
+test('a PR head pushed outside the workflow inside the audited chain is adopted up to the candidate', async () => {
+  // #3988: 9cf0097 was pushed by hand after a launch, and the state's expectedHead no longer matched.
+  const chain = { commits: [adoptCommit(ADOPT_MID, [HEAD], ['src/mid.c']), adoptCommit(ADOPT, [ADOPT_MID])] }
+  const pushed = await run({ args: adoptionArgs(adoptionState(), { autoPush: true }), preflight: { head: ADOPT, prHead: ADOPT_MID }, adoptAudit: chain })
+  assert.deepEqual(pushed.labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.equal(pushed.result.history[1].adoption.publication, 'pushed')
+  assert.equal(pushed.result.state.expectedHead, ADOPT)
+  const dry = await run({ args: adoptionArgs(adoptionState(), { autoPush: false }), preflight: { head: ADOPT, prHead: ADOPT_MID }, adoptAudit: chain })
+  assert.equal(dry.result.reason, 'adopt-needs-push')
+  assert.equal(dry.result.state.expectedHead, HEAD, 'a dry run adopts nothing')
+  const done = await run({ args: adoptionArgs(adoptionState(), { autoPush: true }), preflight: { head: ADOPT, prHead: ADOPT }, adoptAudit: chain })
+  assert.equal(done.labels.includes('adopt:push'), false)
+  assert.equal(done.result.history[1].adoption.publication, 'already-published')
 })
 
 test('an audit that dies, throws, or omits required evidence is refused without a cycle', async () => {
