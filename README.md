@@ -120,10 +120,10 @@ whether credits are enabled; if not, it stays off for that session. Otherwise
 it blocks the prompt, or denies the next tool call and ends the session, once
 any plan limit reaches 100%. Usage is re-read on a window that shrinks with
 headroom and burn rate (`HEADROOM` in `credit_guard.py`, tuned from
-`credit-guard/readings.log`); a read that fails once the window runs out,
-or a payload it cannot parse, blocks. It cannot stop a model call already
-running, a subagent's next turn, or a hook that Claude Code kills on timeout,
-and it does not know the session's model.
+`credit-guard/readings.log`); a read that fails, or a payload it cannot
+parse, keeps the last reading, and blocks only when there is none. It cannot
+stop a model call already running, a subagent's next turn, or a hook that
+Claude Code kills on timeout, and it does not know the session's model.
 
 `install.py` does not register it. Register it per config dir that needs it
 (`~/.claude-ada` here); the recipe refuses a dir that already has it:

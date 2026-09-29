@@ -9,7 +9,8 @@ call, measured on 2.1.283), once any plan limit is at 100%.
 
 An armed check reuses the config dir's last reading while it is trusted; the
 trust window shrinks with headroom and with the burn rate between readings.
-Any failure while armed blocks: Claude Code lets a hook that errors, prints
+A failed refresh keeps the last reading, retried every FLOOR seconds. Any
+other failure while armed blocks: Claude Code lets a hook that errors, prints
 nothing or times out proceed. State lives in $CLAUDE_CONFIG_DIR/credit-guard/:
 usage.json (the shared reading), readings.log (every fetch, for tuning
 HEADROOM) and sessions/<session_id>.off (the session's guard is off).
@@ -118,10 +119,9 @@ def load(d):
         return None
 
 
-def store(d, data, now, prev):
-    used = limits(data)
+def store(d, used, now, prev):
     until = now + trust_window(now, used, prev)
-    # refresh FLOOR before trust ends, so one failed refresh still has a retry in the window
+    # begin refreshing FLOOR before the trust window ends
     rec = {'at': now, 'used': used, 'until': until, 'retry_at': max(now + FLOOR, until - FLOOR)}
     (d / 'usage.json').write_text(json.dumps(rec))
     log = d / 'readings.log'
@@ -133,24 +133,22 @@ def store(d, data, now, prev):
 
 
 def reading(now):
-    """The config dir's current reading; refreshes when due, raises when no trusted one is left."""
+    """The config dir's current reading; refreshes when due, raises when there is none or on a state error."""
     d = state_dir()
     with locked(d):
         now = max(now, time.time())  # time spent waiting for the lock counts against the reading
         last = load(d)
         if last and now < last['retry_at']:
-            if now < last['until']:
-                return last
-            raise RuntimeError('usage refresh failed and is not due again yet')
+            return last
         try:
-            return store(d, fetch(), now, last)
+            used = limits(fetch())
         except Exception:
-            now = max(now, time.time())  # and so does a fetch that timed out
-            if last:
-                (d / 'usage.json').write_text(json.dumps({**last, 'retry_at': now + FLOOR}))
-                if now < last['until']:
-                    return last
-            raise
+            if not last:
+                raise
+            # a failed refresh assumes usage has not changed since the last reading
+            (d / 'usage.json').write_text(json.dumps({**last, 'retry_at': max(now, time.time()) + FLOOR}))
+            return last
+        return store(d, used, now, last)
 
 
 def off_marker(session_id):
@@ -172,7 +170,7 @@ def session_start(event, now):
     with locked(d):  # the first prompt reuses this reading instead of fetching again
         last = load(d)
         if not last or last['at'] <= now:  # another session may have stored a newer one meanwhile
-            store(d, data, now, last)
+            store(d, limits(data), now, last)
 
 
 def armed(event):

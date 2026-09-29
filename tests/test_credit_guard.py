@@ -6,7 +6,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -125,34 +124,30 @@ class Guard(unittest.TestCase):
         # a window reset (usage fell) is no burn
         self.assertEqual(cg.trust_window(T0 + 60, {'s': 5}, {'at': T0, 'used': {'s': 90}}), 600)
 
-    def test_a_failed_refresh_keeps_a_trusted_reading_then_blocks_without_refetching(self):
+    def test_a_failed_refresh_keeps_the_last_reading_and_retries_every_floor(self):
         self.open_session(usage(session=10))
         self.replies.append(OSError('429'))
-        self.assertIsNone(cg.handle(ev('PreToolUse'), T0 + 580), 'still inside the 600 s trust')
-        self.assertIsNone(cg.handle(ev('PreToolUse'), T0 + 590), 'retry waits FLOOR')
-        self.assertEqual(self.calls, 2)
-        self.replies.append(OSError('429'))
-        out = cg.handle(ev('PreToolUse'), T0 + 611)
-        self.assertBlocks(out)
-        self.assertIn('cannot read plan usage', out['stopReason'])
-        self.assertBlocks(cg.handle(ev('PreToolUse'), T0 + 620))
-        self.assertEqual(self.calls, 3, 'hooks behind a failed refresh block without fetching again')
+        self.assertIsNone(cg.handle(ev('PreToolUse'), T0 + 580))
+        self.assertIsNone(cg.handle(ev('PreToolUse'), T0 + 609), 'past the 600 s trust, before the retry')
+        self.assertEqual(self.calls, 2, 'hooks behind a failed refresh do not fetch again')
+        self.replies.append({'limits': []})  # an unparseable payload is a failed refresh too
+        self.assertIsNone(cg.handle(ev('PreToolUse'), T0 + 611))
+        self.assertEqual(self.calls, 3)
+        self.replies.append(usage(session=100))
+        self.assertBlocks(cg.handle(ev('PreToolUse'), T0 + 3640))
 
-    def test_a_lock_wait_that_crosses_the_trust_window_does_not_reuse_the_reading(self):
-        self.state.mkdir()
-        t = time.time()  # reading() re-reads the clock once it holds the lock
-        (self.state / 'usage.json').write_text(json.dumps(
-            {'at': t - 600, 'used': {'session': 10}, 'until': t - 1, 'retry_at': t + 100}))
-        self.assertBlocks(cg.handle(ev('PreToolUse'), t - 10))
-        self.assertEqual(self.calls, 0)
-
-    def test_a_failed_fetch_that_outlasts_the_trust_window_blocks(self):
-        self.state.mkdir()
-        (self.state / 'usage.json').write_text(json.dumps(
-            {'at': T0 - 100, 'used': {'session': 10}, 'until': T0 + 5, 'retry_at': T0}))
+    def test_a_failed_refresh_of_a_reading_at_100_still_blocks(self):
+        self.open_session(usage(session=100))
         self.replies.append(OSError('timed out'))
-        with mock.patch.object(cg.time, 'time', side_effect=[T0, T0 + 10]):  # at the lock, after the fetch
-            self.assertBlocks(cg.handle(ev('PreToolUse'), T0))
+        self.assertBlocks(cg.handle(ev('PreToolUse'), T0 + 3600))
+        self.assertEqual(self.calls, 2)
+
+    def test_a_fresh_reading_that_cannot_be_stored_blocks(self):
+        self.open_session(usage(session=10))
+        (self.state / 'readings.log').unlink()
+        (self.state / 'readings.log').mkdir()
+        self.replies.append(usage(session=100))
+        self.assertBlocks(cg.handle(ev('PreToolUse'), T0 + 600))
 
     def test_an_opening_does_not_overwrite_a_newer_reading(self):
         self.open_session(usage(session=100), now=T0 + 50)
