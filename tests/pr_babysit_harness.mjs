@@ -1794,7 +1794,7 @@ test('an accepted failure named by its key is accepted like the full entry, and 
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.equal(result.acceptedFailures[0].key, PVS_KEY)
   assert.equal(result.observation.ci.realFailures[0].key, PVS_KEY, 'the observed report carries the key a caller accepts it by')
-  assert.deepEqual(result.state.acceptedFailures, [byKey()])
+  assert.deepEqual(result.state.acceptedFailures, [{ key: PVS_KEY }], 'the state keeps the key alone')
   const wrong = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey({ key: '0'.repeat(16) })] } })
   assert.notEqual(wrong.result.pass, true)
   assert.ok(wrong.logs.some(l => /accepted failure 0{16} matches no failure on this head/.test(l)), wrong.logs.join('\n'))
@@ -1821,7 +1821,7 @@ test('a run red only from accepted failures passes, listing them, and is never c
   assert.ok(logs.some(l => /CI red only from 1 accepted failure\(s\)/.test(l)))
   assert.ok(!logs.some(l => /PR is green/.test(l)))
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
-  assert.deepEqual(result.state.acceptedFailures, [accept()])
+  assert.deepEqual(result.state.acceptedFailures, [{ key: PVS_KEY }], 'a full entry is saved by its key')
 })
 
 test('a green run is called green and lists no accepted failures', async () => {
@@ -1893,7 +1893,7 @@ test('an acceptance needs a complete listing of the job and covers one failure',
 test('an acceptance not renewed on a resumed launch no longer applies, and says so', async () => {
   const first = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()], maxCycles: 3, yieldAfterCycle: true } })
   const { result, logs } = await run({ ...redWith(PVS), args: { maxCycles: 3, state: first.result.state } })
-  assert.ok(logs.some(l => /accepted failure not renewed by this launch, no longer accepted: static \/ pvs: license expires in 12 days/.test(l)))
+  assert.ok(logs.some(l => new RegExp(`accepted failure not renewed by this launch, no longer accepted: key ${PVS_KEY}$`).test(l)))
   assert.notEqual(result.pass, true)
   assert.deepEqual(result.state.acceptedFailures, [])
 })

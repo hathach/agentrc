@@ -954,7 +954,8 @@ const stateOut = () => {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
-    acceptedFailures: acceptedArg,
+    // Only to name the acceptances a later launch did not renew: each launch passes its own.
+    acceptedFailures: acceptedArg.map(a => ({ key: acceptedKey(a) })),
     decisions: [...decisions],
     holds: [...holds],
     ...(reanswer.size ? { reanswer: [...reanswer] } : {}),
