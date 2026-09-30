@@ -389,6 +389,32 @@ class GateTest(unittest.TestCase):
         self.assertIn('no findings', self.review()['systemMessage'])
         self.assertIn('-a\n+a2\n', self.s.prompts[-1], 'the unreviewed batch was retried')
 
+    def test_an_oversized_prompt_is_skipped_without_calling_codex_or_retrying_later(self):
+        self.write('a.txt', 'a2\n')
+        with mock.patch.object(gate, 'PROMPT_LIMIT', 100):
+            reply = self.s.stop()
+        self.assertNotIn('decision', reply)
+        self.assertRegex(reply['systemMessage'], r'challenge skipped: prompt has \d+ characters, over the 100')
+        self.assertEqual(self.s.calls, [])
+        self.assertEqual(self.s.state()['batches'], [])
+        self.new_turn()
+        self.write('a.txt', 'a3\n')
+        self.assertIn('no findings', self.review()['systemMessage'])
+        self.assertNotIn('-a\n+a2\n', self.s.prompts[-1], 'the skipped batch is not replayed')
+
+    def test_a_skipped_challenge_still_reports_a_failed_snapshot(self):
+        self.write('a.txt', 'a2\n')
+        real_snapshot, taken = gate.snapshot, []
+        def second_fails(root, blobs):
+            taken.append(1)
+            if len(taken) > 1:
+                raise ValueError('index is unmerged')
+            return real_snapshot(root, blobs)
+        with mock.patch.object(gate, 'PROMPT_LIMIT', 100), mock.patch.object(gate, 'snapshot', second_fails):
+            message = self.s.stop()['systemMessage']
+        self.assertIn('could not be captured: index is unmerged', message)
+        self.assertIn('challenge skipped', message)
+
     def test_a_failure_rendering_the_patch_is_not_silent(self):
         self.write('a.txt', 'a2\n')
         with mock.patch.object(gate, 'patch_text', side_effect=OSError('blob store gone')):
