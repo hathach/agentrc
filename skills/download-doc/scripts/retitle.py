@@ -83,20 +83,28 @@ def build_plan(use_pdf: bool) -> tuple:
     ids = collections.defaultdict(dict)
     for book, typ, val in con.execute("select book, type, val from identifiers"):
         ids[book][typ] = val
-    pdfs = {}
-    for book, path, name in con.execute(
-            "select b.id, b.path, d.name from books b join data d on d.book=b.id "
-            "where upper(d.format)='PDF'"):
-        pdfs.setdefault(book, LIB / path / f"{name}.pdf")
+    files = collections.defaultdict(list)
+    for book, path, name, fmt in con.execute(
+            "select b.id, b.path, d.name, d.format from books b join data d on d.book=b.id"):
+        files[book].append(LIB / path / f"{name}.{fmt.lower()}")
 
-    plan, stats, conflicts = [], collections.Counter(), []
-    for book, title in con.execute("select id, title from books"):
+    plan, stats, conflicts, absent = [], collections.Counter(), [], []
+
+    def propose(book, folder, title, new):
+        if new == title:
+            return
+        # calibre moves a renamed book's files out of the folder the database names;
+        # when they are not there, the rename can empty the folder that does hold them
+        if not (LIB / folder).is_dir() or not all(f.is_file() for f in files[book]):
+            absent.append(book)
+            return
+        plan.append((book, title, new))
+
+    for book, title, folder in con.execute("select id, title, path from books"):
         title = (title or "").strip()
         if LEAD.match(title):
             stats["already prefixed"] += 1
-            new = reprefixed(title)
-            if new != title:
-                plan.append((book, title, new))
+            propose(book, folder, title, reprefixed(title))
             continue
         vend = {k: v for k, v in ids.get(book, {}).items() if k in VENDORS}
         doc = None
@@ -107,8 +115,9 @@ def build_plan(use_pdf: bool) -> tuple:
                 f"DS{m.group(1) or m.group(2)}" if m else None)
             if doc:
                 stats["from identifier"] += 1
-        if not doc and use_pdf and book in pdfs and pdfs[book].exists():
-            doc, how, clash = from_pdf(pdfs[book])
+        pdf = next((f for f in files[book] if f.suffix == ".pdf"), None)
+        if not doc and use_pdf and pdf and pdf.exists():
+            doc, how, clash = from_pdf(pdf)
             if doc:
                 stats[f"from pdf ({how})"] += 1
             if clash:
@@ -116,10 +125,8 @@ def build_plan(use_pdf: bool) -> tuple:
         if not doc:
             stats["no document number"] += 1
             continue
-        new = id_first(title, doc)
-        if new != title:
-            plan.append((book, title, new))
-    return plan, stats, conflicts
+        propose(book, folder, title, id_first(title, doc))
+    return plan, stats, conflicts, absent
 
 
 def main() -> int:
@@ -130,10 +137,13 @@ def main() -> int:
     ap.add_argument("--audit", action="store_true", help="only report where the two page-1 rules disagree")
     args = ap.parse_args()
 
-    plan, stats, conflicts = build_plan(use_pdf=not args.no_pdf)
+    plan, stats, conflicts, absent = build_plan(use_pdf=not args.no_pdf)
     for k, v in stats.most_common():
         print(f"  {v:>6}  {k}")
     print(f"\n  {len(plan)} renames planned")
+    if absent:
+        print(f"  ⚠️  {len(absent)} renames withheld: the database names files that are not on disk "
+              f"(repair the library first): #{', #'.join(map(str, absent[:20]))}")
     if conflicts:
         print(f"  ⚠️  {len(conflicts)} books where the leading id and the rev-adjacent id differ:")
         for b, t, a, c in conflicts[:10]:
@@ -145,13 +155,19 @@ def main() -> int:
     if not args.apply:
         print("\n  dry run — nothing written. Re-run with --apply")
         return 0
+    lib = doclib.Library()
+    blockers = lib.blockers()
+    for b in blockers:
+        print(f"BLOCKED: {b}", file=sys.stderr)
+    if blockers:
+        return 2
 
     roll = pathlib.Path.home() / ".local/share/download-doc" / f"retitle-{time.strftime('%Y%m%d-%H%M%S')}.tsv"
     roll.parent.mkdir(parents=True, exist_ok=True)
     roll.write_text("".join(f"{b}\t{o}\t{n}\n" for b, o, n in plan))
     print(f"  rollback: {roll}")
 
-    lib, ok, fail = doclib.Library(), 0, 0
+    ok, fail = 0, 0
     for n, (b, o, new) in enumerate(plan, 1):
         try:
             lib._run("set_metadata", "--field", f"title:{new}", str(b))

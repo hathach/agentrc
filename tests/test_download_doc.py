@@ -1,6 +1,10 @@
 """Tests for download-doc's plan(): a document already filed by hand is
 reported as legacy, never imported a second time."""
+import contextlib
+import io
+import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -110,6 +114,68 @@ class IdFirstTitle(unittest.TestCase):
     def test_the_device_hint_sees_the_title_without_the_id(self):
         doc = {'code': 'RM0433', 'type': 'Reference Manual', 'version': '8', 'title': 'RM0433 reference manual'}
         self.assertEqual(titles.title(doc, None, 'STM32H7'), 'RM0433 STM32H7 reference manual Rev 8')
+
+
+class RetitlePlan(unittest.TestCase):
+    """A rename is planned only for a book whose files are where the database says."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.lib = Path(tmp.name)
+        saved = retitle.LIB
+        self.addCleanup(lambda: setattr(retitle, 'LIB', saved))
+        retitle.LIB = self.lib
+        self.con = sqlite3.connect(self.lib / 'metadata.db')
+        self.addCleanup(self.con.close)
+        self.con.executescript('create table books (id integer primary key, title text, path text);'
+                               'create table identifiers (book integer, type text, val text);'
+                               'create table data (book integer, format text, name text);')
+
+    def book(self, id, title, folder=True, formats={'PDF': True}):
+        """formats: each format the database lists, and whether its file is on disk."""
+        path = f'NXP/{title} ({id})'
+        self.con.execute('insert into books values (?, ?, ?)', (id, title, path))
+        self.con.execute('insert into identifiers values (?, ?, ?)', (id, 'nxp', 'UM10503'))
+        for fmt in formats:
+            self.con.execute('insert into data values (?, ?, ?)', (id, fmt, 'manual'))
+        self.con.commit()
+        if folder:
+            (self.lib / path).mkdir(parents=True)
+            for fmt, on_disk in formats.items():
+                if on_disk:
+                    (self.lib / path / f'manual.{fmt.lower()}').write_bytes(b'%PDF')
+
+    def test_a_book_whose_files_are_not_on_disk_is_withheld(self):
+        self.book(1, 'LPC43xx manual (UM10503)')
+        self.book(2, 'LPC43xx guide (UM10503)', folder=False)
+        self.book(3, 'LPC43xx notes (UM10503)', formats={'PDF': False})
+        self.book(4, 'UM10503 LPC43xx sheet UM10503', folder=False)
+        self.book(5, 'LPC43xx book (UM10503)', formats={'PDF': True, 'EPUB': False})
+        self.book(6, 'LPC43xx ebook (UM10503)', formats={'PDF': True, 'EPUB': True})
+        self.book(7, 'LPC43xx card (UM10503)', folder=False, formats={})
+        self.book(8, 'LPC43xx leaflet (UM10503)', formats={})
+        plan, stats, conflicts, absent = retitle.build_plan(use_pdf=False)
+        self.assertEqual(plan, [(1, 'LPC43xx manual (UM10503)', 'UM10503 LPC43xx manual'),
+                                (6, 'LPC43xx ebook (UM10503)', 'UM10503 LPC43xx ebook'),
+                                (8, 'LPC43xx leaflet (UM10503)', 'UM10503 LPC43xx leaflet')])
+        self.assertEqual(absent, [2, 3, 4, 5, 7])
+
+    def test_apply_refuses_while_something_holds_the_library(self):
+        class Held:
+            def blockers(self):
+                return ['The Calibre GUI is open']
+
+            def _run(self, *a):
+                raise AssertionError('wrote to a held library')
+        saved = (retitle.build_plan, retitle.doclib.Library, sys.argv)
+        self.addCleanup(lambda: (setattr(retitle, 'build_plan', saved[0]),
+                                 setattr(retitle.doclib, 'Library', saved[1]), setattr(sys, 'argv', saved[2])))
+        retitle.build_plan = lambda use_pdf: ([(1, 'old', 'new')], retitle.collections.Counter(), [], [])
+        retitle.doclib.Library = Held
+        sys.argv = ['retitle.py', '--apply']
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(retitle.main(), 2)
 
 
 class TiParts(unittest.TestCase):
