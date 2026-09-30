@@ -16,8 +16,8 @@ with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings 
 its comment (a refutedPosts reply answers stale findings as well as invalid ones).
 `budget` is the returned state's
 cyclesUsed and maxCycles. `blockers` lists what the caller must settle before
-trusting or continuing the launch, a spent cycle budget included; `notes` what is
-absent but harmless.
+trusting or continuing the launch, a spent cycle budget and a refused launch
+included, the latter with the caller's response; `notes` what is absent but harmless.
 """
 import json
 import re
@@ -31,6 +31,16 @@ from facts import Parser, Unusable, git, report  # noqa: E402
 CONDENSED = ('history', 'observation', 'state')
 NOT_FIXING = re.compile(r'^cycle \d+: rig-side CI failure \(not fixing\)')
 CUT = 300
+ADOPTION_REFUSED = 'the adoption was refused: investigate and report it, never answer it with a reset or a fabricated state'
+REFUSED = {
+    'budget-exhausted-unverified': 'the launch stopped before loading its state, whose copy showed the cycle budget spent; '
+                                   'the launch that saved that state is the authority: read it before relaunching',
+    'state-transfer-failed': 'the state did not load: keep the output file it came from and report it, never reset or reconstruct the state',
+    'state-mismatch': "the PR or its remote differs from the state's pin (compare the result's pin with expected): report it; "
+                      "starting over is the user's decision, never a reset or a fresh launch",
+    'adopt-head-mismatch': ADOPTION_REFUSED, 'adopt-pending': ADOPTION_REFUSED, 'adopt-audit-failed': ADOPTION_REFUSED,
+    'deferral-refused': 'a deferral was refused: it needs a new decision before it is passed again',
+}
 
 
 def load_output(path):
@@ -144,9 +154,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             summary['budget'] = {'cyclesUsed': used, 'maxCycles': most}
             if result.get('pass') is not True and isinstance(used, int) and isinstance(most, int) and used >= most:
                 blockers.append(f'cycle budget spent: {used} of {most}; a relaunch needs a larger maxCycles, the user\'s decision')
-        if result.get('reason') == 'budget-exhausted-unverified':
-            blockers.append('the launch stopped before loading its state, whose copy showed the cycle budget spent; '
-                            'the launch that saved that state is the authority: read it before relaunching')
+        if result.get('reason') in REFUSED:
+            blockers.append(REFUSED[result['reason']])
         obs = result.get('observation') or {}
         reviews, ci, actions = obs.get('reviews') or {}, obs.get('ci'), obs.get('actions') or {}
         summary['observation'] = {

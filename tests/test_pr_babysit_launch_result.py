@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import re
 import subprocess
 import tempfile
 import unittest
@@ -137,6 +138,33 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(stopped, '--state-ref', '/t/w1.output:4841042f')
         self.assertEqual((s['stateRef'], s['budget']), ({'outputFile': '/t/w1.output', 'digest': '4841042f'}, None))
         self.assertTrue(any(b.startswith('the launch stopped before loading its state') for b in s['blockers']), s['blockers'])
+
+    def test_a_refused_launch_is_a_blocker_that_forbids_starting_over(self):
+        for reason, says in (('state-transfer-failed', 'never reset or reconstruct the state'),
+                             ('state-mismatch', "starting over is the user's decision"),
+                             ('adopt-head-mismatch', 'never answer it with a reset or a fabricated state'),
+                             ('adopt-pending', 'never answer it with a reset or a fabricated state'),
+                             ('adopt-audit-failed', 'never answer it with a reset or a fabricated state'),
+                             ('deferral-refused', 'it needs a new decision')):
+            with self.subTest(reason):
+                refused = {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
+                           'result': {'pass': False, 'status': 'blocked', 'reason': reason}}
+                rc, s = self.run_it(refused, '--state-ref', '/t/w1.output:4841042f')
+                self.assertEqual(len(s['blockers']), 1, s['blockers'])
+                self.assertIn(says, s['blockers'][0])
+
+    def test_every_stop_reason_of_the_workflow_is_refused_or_handled_elsewhere(self):
+        handled_elsewhere = {  # blocked by receipts, budget, heads or CI fields, or left to chief's judgment
+            'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'ci-red-rig-side',
+            'ci-red-sonar-gate', 'ci-red-unclassified', 'cycle-threw', 'maxCycles reached', 'deferred-replies-unresolved', 'dirty-start',
+            'duplicate-finding-ids', 'fix-verification-failed', 'preflight-died', 'preflight-failed', 'push-failed',
+            'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending', 'stale-head',
+            'unactionable', 'wrong-branch', 'wrong-head', 'wrong-remote', 'yielded'}
+        source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
+        reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
+        self.assertFalse(handled_elsewhere & set(launch_result.REFUSED))
+        self.assertEqual(reasons, handled_elsewhere | set(launch_result.REFUSED),
+                         'a stop reason was added or renamed: give it a REFUSED response or name it here')
 
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):
         data = output()
