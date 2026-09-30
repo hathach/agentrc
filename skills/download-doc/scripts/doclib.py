@@ -351,6 +351,10 @@ class Doc:
     # Whether the downloaded PDF can be checked against this ID. False where the ID
     # is a filename stem rather than something printed in the document (Espressif).
     verify_id: bool = True
+    # The number a document prints where doc_id is a filename stem (verify_id False) and
+    # the adapter can derive it (Microchip). The title leads with it; without one, a stem
+    # trails the title in parentheses, as older books have it, and keeps it unique.
+    number: str | None = None
 
     @property
     def ident(self) -> str:
@@ -362,7 +366,13 @@ class Doc:
         titles are junk far more often than you would expect (raw URLs, "untitled",
         "Microsoft Word - FRDM-K32L3A6_Errata.doc")."""
         import titles
-        return titles.title({"code": self.doc_id, "title": self.title,
+        if self.number is not None:
+            code, stem = self.number, ""
+        elif self.verify_id:
+            code, stem = self.doc_id, ""
+        else:
+            code, stem = "", self.doc_id
+        return titles.title({"code": code, "stem": stem, "title": self.title,
                              "summary": self.desc, "version": self.version,
                              "type": VENDOR_TYPE.get(self.doc_type, ""),
                              "link": self.url})

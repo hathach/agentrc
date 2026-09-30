@@ -119,11 +119,12 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
         if stem in seen:
             continue
         seen.add(stem)
+        num = _ds(stem)[0]
         docs.append(Doc(
             vendor="microchip", doc_id=stem, doc_type=kind, version=_rev(name) or mod,
             title=stem.replace("-", " ").replace("_", " "), url=url, author=AUTHOR,
             family=[fam], desc="", verify_id=False,
-            aliases=[stem.replace("-", " ")]))
+            aliases=[stem.replace("-", " ")], number=f"DS{num}" if num else None))
     rolling = {num for num, letter in map(_ds, (d.doc_id for d in docs))
                if num and letter is None}
     return [d for d in docs if _rev(d.doc_id) is None or _ds(d.doc_id)[0] not in rolling]

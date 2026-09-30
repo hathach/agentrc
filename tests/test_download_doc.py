@@ -13,6 +13,7 @@ import doclib  # noqa: E402
 import retitle  # noqa: E402
 import titles  # noqa: E402
 import vendor_arm  # noqa: E402
+import vendor_microchip  # noqa: E402
 import vendor_ti  # noqa: E402
 
 
@@ -66,6 +67,16 @@ class IdFirstTitle(unittest.TestCase):
         d = doclib.Doc(vendor='st', doc_id='ES0392', doc_type='errata', version='15.0',
                        title='STM32H7 device errata', url='u', author='STMicroelectronics')
         self.assertEqual(d.calibre_title(), 'ES0392 STM32H7 device errata Rev 15.0')
+
+    def test_a_filename_stem_trails_the_title_and_keeps_it_unique(self):
+        def stem_doc(doc_id, title, version=None):
+            return doclib.Doc(vendor='x', doc_id=doc_id, doc_type='errata', version=version, title=title,
+                              url='u', author='x', verify_id=False).calibre_title()
+        self.assertEqual(stem_doc('esp32-s3_trm_en', 'ESP32-S3 Technical Reference Manual', '1.8'),
+                         'ESP32-S3 Technical Reference Manual (esp32-s3_trm_en) Rev 1.8')
+        self.assertEqual(stem_doc('ug-1', '_EVB USB2514 Users Guide'), '_EVB USB2514 Users Guide (ug-1)')
+        self.assertEqual({stem_doc('rx130-errata', ''), stem_doc('rx210-errata', '')},
+                         {'Errata (rx130-errata)', 'Errata (rx210-errata)'})
 
     def test_only_an_exact_copy_of_the_id_is_dropped(self):
         self.assertEqual(titles.id_first('LPC55S6x manual (UM11126)', 'UM11126'), 'UM11126 LPC55S6x manual')
@@ -176,6 +187,31 @@ class RetitlePlan(unittest.TestCase):
         sys.argv = ['retitle.py', '--apply']
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(retitle.main(), 2)
+
+
+class MicrochipNumber(unittest.TestCase):
+    """The title leads with the number the filename carries; the identifier keeps the stem."""
+
+    def test_the_adapter_titles_by_the_printed_number(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = 'https://ww1.microchip.com/downloads/aemDocuments/documents/UNG/ProductDocuments'
+        cache = Path(tmp.name) / 'docs.txt'
+        cache.write_text(f'{base}/DataSheets/USB251xB-xBi-Data-Sheet-DS00001692.pdf\t2024-10-04\n'
+                         f'{base}/DataSheets/USB2517-USB2517i-Data-Sheet-00001598C.pdf\t2024-05-23\n'
+                         f'{base}/UserGuides/EVB-USB2514BCEvaluationBoardUsersGuide_A_0p4.pdf\t2025-11-20\n')
+        saved = vendor_microchip.CACHE
+        self.addCleanup(lambda: setattr(vendor_microchip, 'CACHE', saved))
+        vendor_microchip.CACHE = cache
+        got = {d.ident: d.calibre_title() for d in vendor_microchip.enumerate_docs()}
+        self.assertEqual(got, {
+            'microchip:USB251xB-xBi-Data-Sheet-DS00001692': 'DS00001692 USB251xB xBi Data Sheet',
+            'microchip:USB2517-USB2517i-Data-Sheet-00001598C':
+                'DS00001598 USB2517 USB2517i Data Sheet 00001598C',
+            'microchip:EVB-USB2514BCEvaluationBoardUsersGuide_A_0p4':
+                'EVB USB2514BCEvaluationBoardUsersGuide A 0p4 — User manual '
+                '(EVB-USB2514BCEvaluationBoardUsersGuide_A_0p4)',
+        })
 
 
 class TiParts(unittest.TestCase):

@@ -114,6 +114,8 @@ def strip_id(title, doc):
     """Remove a copy of the id the title already carries — but only an exact one.
     A qualified parenthetical like "(UM11750-V3)" is what distinguishes three
     otherwise identically titled books, so it must survive."""
+    if not doc:
+        return title
     d = re.escape(doc)
     t = re.sub(r"\s*\(\s*" + d + r"\s*\)\s*", " ", title, flags=re.I)
     # a bare hyphen before a trailing id glues it into a filename stem
@@ -134,6 +136,7 @@ def id_first(title, doc):
 def title(doc, pdf=None, device_hint=None):
     pdf = pdf or {}
     code = (doc.get('code') or '').strip()
+    stem = (doc.get('stem') or '').strip()
     lines = [clean(l) for l in (pdf.get('lines') or [])][:8]
     word = TYPE_WORD.get(doc.get('type', ''), doc.get('type') or '')
 
@@ -158,7 +161,7 @@ def title(doc, pdf=None, device_hint=None):
             candidates.append(clean(src))
 
     head = candidates[0] if candidates else (device_hint or code)
-    head = strip_id(head, code)
+    head = strip_id(strip_id(head, code), stem)
 
     # datasheets: prefix the part number, the description alone is generic
     part = part_from_link(doc.get('link', ''))
@@ -184,7 +187,8 @@ def title(doc, pdf=None, device_hint=None):
     # Espressif reports "v1.8"; strip the marker rather than discarding the revision.
     numeric_ver = re.sub(r'^v', '', ver, flags=re.I) \
         if re.fullmatch(r'v?\d+(\.\d+)*', ver, re.I) else ''
-    return f"{code} {head}".strip() + (f" Rev {numeric_ver}" if numeric_ver else '')
+    return f"{code} {head}".strip() + (f" ({stem})" if stem else '') + \
+        (f" Rev {numeric_ver}" if numeric_ver else '')
 
 
 # ------------------------------------------------------------------- tests --
