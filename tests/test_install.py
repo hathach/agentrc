@@ -67,10 +67,24 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(os.path.samefile(self.claude / 'workflows' / 'fix-issue.js', ROOT / 'workflows' / 'fix-issue.js'))
         self.assertTrue(os.path.samefile(self.claude / 'workflows' / 'code-audit.js', ROOT / 'workflows' / 'code-audit.js'))
         self.assertFalse((self.codex / 'workflows').exists(), 'workflows are Claude only')
-        self.assertTrue(os.path.samefile(self.claude / 'CLAUDE.md', ROOT / 'CLAUDE.md'))
-        self.assertTrue(os.path.samefile(self.codex / 'AGENTS.md', ROOT / 'CLAUDE.md'))
-        self.assertEqual((self.codex / 'AGENTS.md').read_text(), (ROOT / 'CLAUDE.md').read_text())
+        user = ROOT / 'instructions' / 'user.md'
+        self.assertTrue(os.path.samefile(self.claude / 'CLAUDE.md', user))
+        self.assertTrue(os.path.samefile(self.codex / 'AGENTS.md', user))
+        self.assertEqual((self.codex / 'AGENTS.md').read_text(), user.read_text())
         self.assertEqual(self.ok('install', '--claude-md'), '', 'relative Codex link is idempotent outside HOME')
+
+    def test_a_link_to_the_old_root_file_moves_to_the_user_file_and_can_roll_back(self):
+        self.claude.mkdir()
+        os.symlink(ROOT / 'CLAUDE.md', self.claude / 'CLAUDE.md')
+        self.ok('install', '--claude-md')
+        user = ROOT / 'instructions' / 'user.md'
+        self.assertTrue(os.path.samefile(self.claude / 'CLAUDE.md', user))
+        self.assertEqual((self.codex / 'AGENTS.md').read_text(), user.read_text())
+        saved = self.home / 'CLAUDE.md.pre-split'
+        saved.write_text('the old text')
+        (self.claude / 'CLAUDE.md').unlink()
+        os.symlink(saved, self.claude / 'CLAUDE.md')
+        self.assertEqual((self.codex / 'AGENTS.md').read_text(), 'the old text', 'Codex follows the rollback')
 
     def test_a_skill_hook_is_registered_once_with_absolute_quoted_commands(self):
         (self.claude).mkdir()

@@ -9,7 +9,7 @@ Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 a skill's hooks of the same name into ~/.claude/hooks, with their hooks.json
 merged into ~/.claude/settings.json; workflows into ~/.claude/workflows
 (Claude only);
---claude-md links ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; --statusline
+--claude-md links instructions/user.md as ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; --statusline
 links the statusline/ files into ~/.claude and sets statusLine in its
 settings.json. Each flag takes every entry of its kind; nothing is selected
 by default. Everything is a symlink, so edits are live and a rerun after a
@@ -69,7 +69,7 @@ def links(kind, name):
         return [(REPO / 'workflows' / f'{name}.js', dirs(kind)[0] / f'{name}.js')]
     if kind == 'statusline':  # statusline.sh runs its Codex fetcher from $HOME/.claude
         return [(REPO / 'statusline' / f, Path.home() / '.claude' / f) for f in ('statusline.sh', 'statusline-codex-usage.py')]
-    return [(REPO / 'CLAUDE.md', Path.home() / '.claude' / 'CLAUDE.md'),
+    return [(REPO / 'instructions' / 'user.md', Path.home() / '.claude' / 'CLAUDE.md'),
             (Path('../.claude/CLAUDE.md'), Path.home() / '.codex' / 'AGENTS.md')]
 
 
@@ -253,7 +253,7 @@ def main(argv=None):
     parser.add_argument('action', choices=('install', 'remove'))
     for kind in FLAGS:
         parser.add_argument(f'--{kind}', action='store_true', help=f'every {kind}')
-    parser.add_argument('--claude-md', action='store_true', help='CLAUDE.md, also as ~/.codex/AGENTS.md')
+    parser.add_argument('--claude-md', action='store_true', help='instructions/user.md as ~/.claude/CLAUDE.md, also ~/.codex/AGENTS.md')
     parser.add_argument('--statusline', action='store_true', help='the Claude Code status line')
     args = parser.parse_args(argv)
     chosen = selection(parser, args)

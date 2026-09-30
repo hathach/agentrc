@@ -4,7 +4,8 @@ Personal agent config shared by Claude Code and Codex, versioned in git.
 
 ```
 install.py   symlinks chosen parts of this checkout into ~/.claude and ~/.codex
-CLAUDE.md    user-wide instructions, also ~/.codex/AGENTS.md
+instructions/user.md  user-wide instructions: ~/.claude/CLAUDE.md, also ~/.codex/AGENTS.md
+CLAUDE.md    instructions for work in this repository
 skills/      skills for both agents
 agents/      <name>.md for both agents, plus <name>.toml for Codex
 hooks/       Claude Code hooks, one folder each with a hooks.json
@@ -30,7 +31,8 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 - `--agent`: the `.md` into `~/.claude/agents` and `~/.codex/agents`, the
   `.toml`, if any, into `~/.codex/agents`.
 - `--workflow`: into `~/.claude/workflows`.
-- `--claude-md`: `~/.claude/CLAUDE.md`, and `~/.codex/AGENTS.md` to it.
+- `--claude-md`: `instructions/user.md` as `~/.claude/CLAUDE.md`, and
+  `~/.codex/AGENTS.md` to it.
 - `--statusline`: both `statusline/` files into `~/.claude`, and `statusLine`
   in `~/.claude/settings.json`; `install` refuses if another one is set. The
   command names `$HOME/.claude`, so another `CLAUDE_CONFIG_DIR` can reuse it.
