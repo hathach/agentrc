@@ -25,7 +25,7 @@ export const meta = {
 //          ciWait?: number (minutes to wait on pending checks, default 30),
 //          ciNotes?: string (what the caller already established about this PR's CI, handed
 //            to the watcher verbatim: an investigated exit code, a check known rig-side; it
-//            reaches only the checks judged, and a verdict stored on the head stands),
+//            reaches only the failures judged, and a placed verdict stored on the head stands),
 //          acceptedFailures?: [{ key, reason, scope } | { workflow, job, cell, signature, reason, scope }] (CI
 //            failures the caller accepts for this launch, matched exactly on workflow, job, cell (null only for
 //            a job with one result) and first diagnostic, or on the 16-hex `key` of those four that the result
@@ -892,9 +892,9 @@ const noteRerun = (r) => {
   if (i < 0) ciReruns.push(r)
   else if (r.sure) ciReruns[i] = r
 }
-// Verdicts by check link. Only a link naming its run is kept, and never an
-// unclassified verdict, which a newer base run or the caller's ciNotes may still
-// place. An entry holds its failures once judged or recalled.
+// Verdicts by check link. Only a link naming its run is kept; an unclassified
+// failure in it, which a newer base run or the caller's ciNotes may still place,
+// is judged again. An entry holds its failures once judged or recalled.
 const ciVerdicts = new Map()
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
@@ -2173,7 +2173,14 @@ const ciLaneRun = async (cycle, lanes) => {
     }
   }
   await parallel(groupsOf(unread, RECALL_PER_CALL).map((batch, k) => () => recallBatch(batch, k)))
-  const cached = failing.filter(reusable)
+  // A stored check with an unclassified failure is judged again for those failures
+  // alone when its enumeration can carry the placed ones: all complete, each once.
+  const storedOf = (c) => ciVerdicts.get(c.link).failures
+  const unplaced = (c) => storedOf(c).filter(f => f.verdict === 'unclassified')
+  const reused = failing.filter(reusable)
+  const cached = reused.filter(c => unplaced(c).length === 0)
+  const partial = reused.filter(c => !cached.includes(c) && storedOf(c).every(f => f.complete) &&
+    new Set(storedOf(c).map(failureKey)).size === storedOf(c).length)
   const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c) && !gated.includes(c))
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
@@ -2202,7 +2209,13 @@ const ciLaneRun = async (cycle, lanes) => {
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. The checks, each needing exactly one entry in your reply: ` +
-    JSON.stringify(judging.map(c => ({ link: c.link, check: c.name, workflow: c.workflow, bucket: c.bucket }))) + '.' +
+    JSON.stringify(judging.map(c => ({
+      link: c.link, check: c.name, workflow: c.workflow, bucket: c.bucket,
+      ...(partial.includes(c) ? {
+        judgeOnly: unplaced(c).map(({ job, cell, signature }) => ({ job, cell, signature })),
+        retained: storedOf(c).filter(f => f.verdict !== 'unclassified').map(({ job, cell, signature, verdict }) => ({ job, cell, signature, verdict })),
+      } : {}),
+    }))) + '.' +
     (known.length ? `\nAlready re-run on this head: ${JSON.stringify(known)}.` : '') +
     (possible.length ? `\nPossibly re-run by a judge that was lost on this head: ${JSON.stringify(possible)}.` : '') +
     (ciNotes ? `\nWhat the caller established about this PR's CI already, to weigh with your own evidence: ${ciNotes}` : ''),
@@ -2219,14 +2232,31 @@ const ciLaneRun = async (cycle, lanes) => {
   for (const c of reran) {
     if (reruns.some(r => r.workflow === c.workflow && r.check === c.name)) log(`cycle ${cycle}: CI judge re-ran ${c.workflow} / ${c.name} a second time`)
     noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true })
+    ciVerdicts.delete(c.link)
   }
   // An empty answer is a re-run by the contract: CI is settling, receipt or not.
   if (reran.length) report.status = 'running'
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
+  // A partly judged check's answer is its judgeOnly failures, complete, merged in
+  // place, or every failure of the check, as for any check. Any other answer drops
+  // the check from the store and re-arms once the other checks' verdicts are stored,
+  // so it is judged whole next time.
+  const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
+  const unsettled = []
+  for (const c of partial.filter(c => !reran.includes(c))) {
+    const got = new Map(failuresOf.get(c.link).map(f => [failureKey(f), f]))
+    const distinct = got.size === failuresOf.get(c.link).length
+    if (distinct && sameLinks([...got.keys()], unplaced(c).map(failureKey)) && [...got.values()].every(f => f.complete)) {
+      failuresOf.set(c.link, storedOf(c).map(f => got.get(failureKey(f)) ?? f))
+    } else if (!distinct || !storedOf(c).every(f => got.has(failureKey(f)))) {
+      log(`cycle ${cycle}: CI judge answered ${c.name} with neither its judgeOnly failures nor every failure — re-arming to judge it whole`)
+      unsettled.push(c)
+    }
+  }
+  for (const c of unsettled) ciVerdicts.delete(c.link)
   for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
-  const fresh = judging.filter(c => c.attempt && !reran.includes(c))
-    .map(c => ({ link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(judged.checks.find(j => j.link === c.link).failures)) }))
-    .filter(v => !v.failures.some(f => f.verdict === 'unclassified'))
+  const fresh = judging.filter(c => c.attempt && !reran.includes(c) && !unsettled.includes(c))
+    .map(c => ({ link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(failuresOf.get(c.link))) }))
   for (const v of fresh) ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v })
   // A push since judging moved the head on: those verdicts will never be recalled.
   // One the store lost or garbled fails its digest on recall and is judged again.
@@ -2234,8 +2264,9 @@ const ciLaneRun = async (cycle, lanes) => {
     const why = faultOf(await collect(`ci:collect#${cycle}.w`, 'remember', REMEMBERED, fresh), inv.head)
     if (why) log(`cycle ${cycle}: ${fresh.length} CI verdict(s) not stored — ${why}; judged again by a later launch`)
   }
+  if (unsettled.length) return null
   report.infraRerun = judged.infraRerun
-  report.realFailures.push(...judged.checks.flatMap(j => j.failures))
+  report.realFailures.push(...judging.flatMap(c => failuresOf.get(c.link)))
   return report
 }
 
