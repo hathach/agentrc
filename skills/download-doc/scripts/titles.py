@@ -114,10 +114,16 @@ def strip_id(title, doc):
     """Remove a copy of the id the title already carries — but only an exact one.
     A qualified parenthetical like "(UM11750-V3)" is what distinguishes three
     otherwise identically titled books, so it must survive."""
-    t = re.sub(r"\s*\(\s*" + re.escape(doc) + r"\s*\)\s*", " ", title, flags=re.I)
-    t = re.sub(r"[\s\-–—,:]*\b" + re.escape(doc) + r"\b\s*$", "", t, flags=re.I)
-    # a hyphen with no space after it qualifies the id rather than separating it
-    t = re.sub(r"^\s*" + re.escape(doc) + r"(?=$|[\s–—:,]|-(?:\s|$))", "", t, flags=re.I)
+    d = re.escape(doc)
+    t = re.sub(r"\s*\(\s*" + d + r"\s*\)\s*", " ", title, flags=re.I)
+    # a bare hyphen before a trailing id glues it into a filename stem
+    t = re.sub(r"[\s\-–—,:]*(?<![^\s–—,:])" + d + r"\b\s*$", "", t, flags=re.I)
+    # a hyphen with no space after it qualifies the id rather than separating it;
+    # an underscore joins it to the rest of a filename stem
+    t = re.sub(r"^\s*" + d + r"(?:_|(?=$|[\s–—:,]|-(?:\s|$)))", "", t, flags=re.I)
+    # a standalone word only: "-Sheet-DS00001692" inside a filename stem is not a copy.
+    # Last, so removing it never leaves a stem's own copy at an edge for the rules above.
+    t = re.sub(r"(?<!\S)" + d + r"(?!\S)", " ", t, flags=re.I)
     return re.sub(r"\s{2,}", " ", t).strip(' -–—,:')
 
 

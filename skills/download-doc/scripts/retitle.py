@@ -68,6 +68,16 @@ def from_pdf(pdf: pathlib.Path) -> tuple:
     return (doc, "lead" if lead else "adj", None)
 
 
+def reprefixed(title: str) -> str:
+    """An already-prefixed title with the copies of its leading id that strip_id
+    now drops, so a later strip_id fix reaches books a past run prefixed. A
+    qualified lead ("UM11750-V3 ...") is its own id and stays as it is."""
+    lead = LEAD.match(title)
+    if re.match(r"-\S", title[lead.end():]):
+        return title
+    return id_first(title, lead.group(0))
+
+
 def build_plan(use_pdf: bool) -> tuple:
     con = sqlite3.connect(f"file:{LIB / 'metadata.db'}?mode=ro", uri=True)
     ids = collections.defaultdict(dict)
@@ -84,6 +94,9 @@ def build_plan(use_pdf: bool) -> tuple:
         title = (title or "").strip()
         if LEAD.match(title):
             stats["already prefixed"] += 1
+            new = reprefixed(title)
+            if new != title:
+                plan.append((book, title, new))
             continue
         vend = {k: v for k, v in ids.get(book, {}).items() if k in VENDORS}
         doc = None

@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'download-doc' / 'scripts'))
 import doclib  # noqa: E402
+import retitle  # noqa: E402
 import titles  # noqa: E402
 import vendor_arm  # noqa: E402
 import vendor_ti  # noqa: E402
@@ -71,11 +72,40 @@ class IdFirstTitle(unittest.TestCase):
         self.assertEqual(titles.id_first('UM11750-V3 MCX manual', 'UM11750'), 'UM11750 UM11750-V3 MCX manual')
         self.assertEqual(titles.id_first('RM04331 manual', 'RM0433'), 'RM0433 RM04331 manual')
 
+    def test_a_filename_stem_loses_its_leading_id_but_keeps_its_inner_copies(self):
+        self.assertEqual(titles.id_first('AN4497_LCF_for_Qorivva — Application note (AN4497) Rev 2', 'AN4497'),
+                         'AN4497 LCF_for_Qorivva — Application note Rev 2')
+        self.assertEqual(titles.id_first('USB251xB xBi Data Sheet DS00001692 (USB251xB-xBi-Data-Sheet-DS00001692)',
+                                         'DS00001692'),
+                         'DS00001692 USB251xB xBi Data Sheet (USB251xB-xBi-Data-Sheet-DS00001692)')
+        self.assertEqual(titles.id_first('USB2514B Checklist DS00004541 — Application note', 'DS00004541'),
+                         'DS00004541 USB2514B Checklist — Application note')
+        self.assertEqual(titles.id_first('USB251xB xBi Errata DS80000627D', 'DS80000627'),
+                         'DS80000627 USB251xB xBi Errata DS80000627D')
+        self.assertEqual(titles.id_first('USB251xB-Sheet-DS00001692 DS00001692', 'DS00001692'),
+                         'DS00001692 USB251xB-Sheet-DS00001692')
+        self.assertEqual(titles.id_first('DS1 DS1_foo', 'DS1'), 'DS1 DS1_foo')
+
     def test_a_title_never_carries_the_id_twice(self):
         rm = {'code': 'RM0433', 'type': 'Reference Manual', 'version': '8.0'}
         self.assertEqual(titles.title({**rm, 'title': ''}), 'RM0433 Reference manual Rev 8.0')
         self.assertEqual(titles.title({**rm, 'title': 'RM0433–STM32H7 reference manual'}),
                          'RM0433 STM32H7 reference manual Rev 8.0')
+
+    def test_a_prefixed_title_loses_the_copies_a_past_run_left(self):
+        self.assertEqual(retitle.reprefixed('DS60001477 SAM L21 Data Sheet DS60001477 (SAM-L21-Data-Sheet-DS60001477)'),
+                         'DS60001477 SAM L21 Data Sheet (SAM-L21-Data-Sheet-DS60001477)')
+        self.assertEqual(retitle.reprefixed('AN1141, USB Host Guide'), 'AN1141 USB Host Guide')
+        self.assertEqual(retitle.reprefixed('UM11750-V3 MCX manual'), 'UM11750-V3 MCX manual')
+        self.assertEqual(retitle.reprefixed('RM0433 STM32H7 manual'), 'RM0433 STM32H7 manual')
+        self.assertEqual(retitle.reprefixed('UM11750 UM11750-V3 MCX manual UM11750'), 'UM11750 UM11750-V3 MCX manual')
+
+    def test_a_second_run_changes_nothing(self):
+        for t in ('DS00001692 USB251xB-Sheet-DS00001692 DS00001692', 'DS100 DS100_foo', 'AN1141, USB Host Guide'):
+            once = retitle.reprefixed(t)
+            self.assertEqual(retitle.reprefixed(once), once, t)
+        self.assertEqual(retitle.reprefixed('DS00001692 USB251xB-Sheet-DS00001692 DS00001692'),
+                         'DS00001692 USB251xB-Sheet-DS00001692')
 
     def test_the_device_hint_sees_the_title_without_the_id(self):
         doc = {'code': 'RM0433', 'type': 'Reference Manual', 'version': '8', 'title': 'RM0433 reference manual'}
