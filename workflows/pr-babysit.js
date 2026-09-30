@@ -24,7 +24,8 @@ export const meta = {
 //            the commit on the caller's word that the repository hooks validate it),
 //          ciWait?: number (minutes to wait on pending checks, default 30),
 //          ciNotes?: string (what the caller already established about this PR's CI, handed
-//            to the watcher verbatim: an investigated exit code, a check known rig-side),
+//            to the watcher verbatim: an investigated exit code, a check known rig-side; it
+//            reaches only the checks judged, and a verdict stored on the head stands),
 //          acceptedFailures?: [{ key, reason, scope } | { workflow, job, cell, signature, reason, scope }] (CI
 //            failures the caller accepts for this launch, matched exactly on workflow, job, cell (null only for
 //            a job with one result) and first diagnostic, or on the 16-hex `key` of those four that the result
@@ -269,7 +270,7 @@ if (args.stateRef != null) {
 // the run. The verdicts themselves stay in collect.py's store beside the evidence.
 // judgedHead is the last head whose verdicts were stored: the judge of a later
 // head sees them beside the matching failures, as evidence to reconfirm.
-const ciCacheShaped = (c) => c && typeof c === 'object' && typeof c.notesDigest === 'string' &&
+const ciCacheShaped = (c) => c && typeof c === 'object' &&
   (c.judgedHead === null || /^[0-9a-f]{40}$/.test(c.judgedHead)) &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string'))
@@ -892,18 +893,12 @@ const noteRerun = (r) => {
   if (i < 0) ciReruns.push(r)
   else if (r.sure) ciReruns[i] = r
 }
-const notesDigest = fnv1a(ciNotes)
 // Verdicts by check link. Only a link naming its run is kept, and never an
-// unclassified verdict, which a newer base run may still place; a changed
-// ciNotes can change any verdict, so it discards them all. An entry holds its
-// failures once judged or recalled.
+// unclassified verdict, which a newer base run or the caller's ciNotes may still
+// place. An entry holds its failures once judged or recalled.
 const ciVerdicts = new Map()
 let ciJudgedHead = restored ? restored.ciCache.judgedHead : null
-if (restored) {
-  if (restored.ciCache.notesDigest === notesDigest) {
-    for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
-  } else if (restored.ciCache.entries.length) log(`ciNotes changed: ${restored.ciCache.entries.length} cached CI verdict(s) judged again`)
-}
+if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
 // commentId -> { how, digest, sonar? }: how the comment was answered ('refutation' or
 // 'fixNote') and the digest of the body that answer addressed. An answered
@@ -986,7 +981,7 @@ const stateOut = () => {
     holds: [...holds],
     ...(reanswer.size ? { reanswer: [...reanswer] } : {}),
     ciCache: {
-      notesDigest, judgedHead: ciJudgedHead, reruns: ciReruns.filter(r => r.head === expectedHead),
+      judgedHead: ciJudgedHead, reruns: ciReruns.filter(r => r.head === expectedHead),
       entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest }) => ({ head, link, bucket, digest })),
     },
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),

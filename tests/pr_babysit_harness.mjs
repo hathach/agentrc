@@ -87,7 +87,7 @@ const adoptionState = ({
     protected: protectedPattern === null ? null : new RegExp(protectedPattern).source, generated: null,
   },
   build: null, cyclesUsed, maxCycles, answeredWith: [], deferrals: [], acceptedFailures: [], decisions: [], holds: [],
-  ciCache: { notesDigest: fnv1a(''), judgedHead: null, reruns: [], entries: [] }, debt: [],
+  ciCache: { judgedHead: null, reruns: [], entries: [] }, debt: [],
   last: cyclesUsed ? { cycle: cyclesUsed, head: HEAD } : null, ...over,
 })
 const adoptionArgs = (state, over = {}) => ({
@@ -1624,9 +1624,10 @@ test('a same-head relaunch recalls the judged verdicts from the store: no judge'
   assert.equal(again.result.history.at(-1).ci.realFailures[0].firstError, 'board did not enumerate')
   assert.ok(again.logs.some(l => /CI verdicts reused for 1 check\(s\)/.test(l)))
   assert.deepEqual(again.result.state.ciCache.entries, first.result.state.ciCache.entries, 'a recalled verdict stays remembered')
-  const noted = await run({ store, args: { ...YIELD, state: first.result.state, ciNotes: 'the pico probe is flaky' }, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.ok(noted.labels.includes('ci:judge#2'), 'changed ciNotes re-judge')
-  assert.ok(noted.logs.some(l => /ciNotes changed: 1 cached CI verdict\(s\) judged again/.test(l)))
+  const st = first.result.state
+  const older = seal({ ...st, ciCache: { ...st.ciCache, notesDigest: fnv1a('') } })
+  const noted = await run({ store, args: { ...YIELD, state: older, ciNotes: 'the pico probe is flaky' }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(noted.labels), ['ci:collect#2.1', 'ci:collect#2.r1'], 'new ciNotes leave a stored verdict standing, in a state saved with notesDigest too')
 })
 
 test('the last judged head is carried, and a later head\'s evidence shows its verdicts beside the matching failures', async () => {
