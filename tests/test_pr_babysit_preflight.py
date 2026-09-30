@@ -69,7 +69,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(out, {
             'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prRepo': 'someone/tinyusb',
-            'prUrl': VIEW['url'], 'remote': 'origin', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
+            'prUrl': VIEW['url'], 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
             'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o']})
 
     def test_a_branch_tracking_nothing_has_no_remote_and_no_push_url(self):
@@ -79,6 +79,17 @@ class PreflightTest(unittest.TestCase):
         self.git('config', 'branch.fix.remote', 'origin')
         code, out = self.pin()
         self.assertEqual((code, out['remote'], out['pushUrls']), (0, '', []), 'a remote without a merge ref tracks nothing')
+
+    def test_upstream_branch_is_the_remote_side_name_whatever_the_local_one(self):
+        self.git('branch', '-m', 'worktree/x')
+        code, out = self.pin()
+        self.assertEqual((code, out['branch'], out['upstreamBranch']), (0, 'worktree/x', 'fix'))
+        self.git('branch', '--unset-upstream')
+        self.assertEqual(self.pin()[1]['upstreamBranch'], '')
+
+    def test_upstream_branch_follows_the_first_merge_value_as_git_does(self):
+        self.git('config', '--add', 'branch.fix.merge', 'refs/heads/other')
+        self.assertEqual(self.pin()[1]['upstreamBranch'], 'fix')
 
     def test_a_remote_named_with_a_slash_is_named_whole(self):
         self.git('remote', 'rename', 'origin', 'up/stream')

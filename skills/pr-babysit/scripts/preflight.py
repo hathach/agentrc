@@ -7,7 +7,8 @@
 Reports what every later step must still be true of: branch (`git rev-parse
 --abbrev-ref HEAD`), prBranch, prHead, prRepo (owner/name) and prUrl from one
 `gh pr view N`, verbatim even when they disagree with git; remote, the remote
-the branch tracks, "" when it tracks none; pushUrls (`git remote get-url
+the branch tracks, "" when it tracks none; upstreamBranch, the branch it
+tracks there, "" when none; pushUrls (`git remote get-url
 --push --all <remote>`, which a pushurl can point away from the fetch URL);
 head; and dirty, the lines of `git status --porcelain`.
 
@@ -41,6 +42,14 @@ def push_urls(branch):
     return remote, git('remote', 'get-url', '--push', '--all', remote).splitlines() if remote else []
 
 
+def upstream_branch(branch, remote):
+    """The branch name the local branch tracks on its remote, "" when none."""
+    if not remote:
+        return ''
+    ref = git('for-each-ref', '--format=%(upstream:remoteref)', f'refs/heads/{branch}').strip()
+    return ref.removeprefix('refs/heads/') if ref.startswith('refs/heads/') else ''
+
+
 def recheck():
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
     return {'branch': branch, 'pushUrls': push_urls(branch)[1], 'head': git('rev-parse', 'HEAD').strip(),
@@ -60,7 +69,8 @@ def pin(pr):
         # A deleted head fork comes back as a null headRepository.
         raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')
     remote, urls = push_urls(branch)
-    return {'branch': branch, **pr_facts, 'remote': remote, 'pushUrls': urls,
+    return {'branch': branch, **pr_facts, 'remote': remote, 'upstreamBranch': upstream_branch(branch, remote),
+            'pushUrls': urls,
             'head': git('rev-parse', 'HEAD').strip(),
             'dirty': git('status', '--porcelain').splitlines()}
 

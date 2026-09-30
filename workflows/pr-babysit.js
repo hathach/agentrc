@@ -1,7 +1,7 @@
 export const meta = {
   name: 'pr-babysit',
   description: 'Drive a PR to green: a fast review lane (validate bot findings, fix, push without waiting on CI) overlapped with a CI-watch lane; code-writer fixes, finding-verifier verification, at most one push per lane per cycle, and a bot/finding/outcome/commit table logged per cycle',
-  whenToUse: 'After opening a PR, from a clean checkout of the PR branch, with no other writer in that checkout: an edit to a path this run already owns is indistinguishable from its own and would be published. Default is a dry run (fixes left uncommitted, nothing posted); passing autoPush: true is what tells the workflow to push and to post PR comments. With autoPush, its own repairs may be published before the caller\'s completion review (CLAUDE.md): a caller other than chief launches with yieldAfterCycle: true and, after each return or interruption, records the repairs and their publishing status, including uncertainty, as completion review pending, recovers partial work and uncertain publishing outcomes, then reviews them before relaunching, publishing further task changes or reporting done; chief uses its own sequence.',
+  whenToUse: 'After opening a PR, from a clean checkout of the PR head (its local branch may be named otherwise if it tracks the PR head branch), with no other writer in that checkout: an edit to a path this run already owns is indistinguishable from its own and would be published. Default is a dry run (fixes left uncommitted, nothing posted); passing autoPush: true is what tells the workflow to push and to post PR comments. With autoPush, its own repairs may be published before the caller\'s completion review (CLAUDE.md): a caller other than chief launches with yieldAfterCycle: true and, after each return or interruption, records the repairs and their publishing status, including uncertainty, as completion review pending, recovers partial work and uncertain publishing outcomes, then reviews them before relaunching, publishing further task changes or reporting done; chief uses its own sequence.',
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
@@ -1763,14 +1763,14 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
 
-// Publishes one audited SHA to the pinned branch, never the branch itself, which
+// Publishes one audited SHA to the PR's head branch, never the branch itself, which
 // would publish whatever HEAD has become. It landed when every pinned push URL
 // (and, for an adoption, the PR) reads back that SHA; it failed only when every
 // URL answered without it; anything else is unknown, never "not pushed".
 // null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
   const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
-    `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.branch.trim()}' --sha ${sha} ` +
+    `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
     relayed(PUSH)
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
@@ -2827,12 +2827,12 @@ const runCycle = async (cycle, entry) => {
 // indistinguishable from a writer's and could be swept into the PR.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'pushUrls', 'head', 'dirty'],
+  required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty'],
   properties: {
     error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
     prHead: { type: 'string' }, prRepo: { type: 'string' }, prUrl: { type: 'string' },
-    remote: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
+    remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
   },
@@ -2857,7 +2857,8 @@ if (dirty.length) {
   log(`preflight: the checkout is dirty — ${dirty.length} path(s); commit or stash before babysitting`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'dirty-start', dirty })
 }
-if (pinned.prBranch.trim() !== pinned.branch.trim()) {
+// A local branch may carry another name (a worktree tool's) if it tracks the PR head branch.
+if (pinned.prBranch.trim() !== pinned.branch.trim() && pinned.upstreamBranch.trim() !== pinned.prBranch.trim()) {
   log(`preflight: checked out ${pinned.branch}, but PR #${args.pr} heads ${pinned.prBranch}`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-branch', branch: pinned.branch, expected: pinned.prBranch.trim() })
 }

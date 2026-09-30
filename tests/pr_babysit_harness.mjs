@@ -63,7 +63,7 @@ const FOREIGN = 'c0ffee11223344556677889900aabbccddeeff01'
 const PIN = {
   branch: 'claude/foo', prBranch: 'claude/foo',
   prHead: HEAD, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
-  remote: 'origin',
+  remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
 }
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
@@ -691,7 +691,7 @@ test('the preflight pins the checkout without touching it', async () => {
   assert.match(pre.prompt, /Editing and committing nothing/)
   assert.ok(pre.prompt.includes('preflight.py --pr 3888`'), pre.prompt)
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['branch', 'dirty', 'head', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote'])
+    ['branch', 'dirty', 'head', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -734,9 +734,19 @@ test('.idea/ drift is the one dirt a start tolerates, and it never enters a comm
   assert.deepEqual(pathLine(commit.prompt), ['src/a.c'])
 })
 
+test('a local branch tracking the PR head branch is accepted and pushes to the PR branch', async () => {
+  const { result, calls } = await run({
+    reviews: oneValid,
+    preflight: { branch: 'worktree/x', upstreamBranch: 'claude/foo' },
+    recheck: { branch: 'worktree/x' },
+  })
+  assert.notEqual(result.reason, 'wrong-branch')
+  assert.ok(calls.find(c => c.label === 'push#1-review').prompt.includes("--branch 'claude/foo' --sha"))
+})
+
 test('a checkout on the wrong branch refuses before any writer runs', async () => {
   const { result, labels, logs } = await run({
-    reviews: oneValid, preflight: { branch: 'main', prBranch: 'claude/foo' },
+    reviews: oneValid, preflight: { branch: 'main', prBranch: 'claude/foo', upstreamBranch: 'main' },
   })
   assert.equal(result.reason, 'wrong-branch')
   assert.equal(result.branch, 'main')
@@ -4581,7 +4591,7 @@ test('adoption keeps ordinary preflight refusals ahead of its own checks', async
   const badPush = 'git@evil.example:hathach/tinyusb.git'
   const cases = [
     ['dirty-start', adoptionState(), { head: ADOPT, prHead: FOREIGN, dirty: [' M src/a.c'] }],
-    ['wrong-branch', adoptionState(), { head: ADOPT, prHead: FOREIGN, branch: 'main' }],
+    ['wrong-branch', adoptionState(), { head: ADOPT, prHead: FOREIGN, branch: 'main', upstreamBranch: 'main' }],
     ['state-mismatch', adoptionState(), {
       head: ADOPT, prHead: FOREIGN, prRepo: 'someone/tinyusb',
       prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'],
