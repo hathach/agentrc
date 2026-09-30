@@ -70,14 +70,12 @@ OPEN = ('open', 'upheld', 'disputed')
 # The one scale (finding-verifier.md's Severity section); P0-P4 are its report aliases.
 LEVELS = ('critical', 'high', 'medium', 'low', 'nit')
 CONFIDENCE = ('high', 'medium', 'low')
-# Older reviews stored code-verifier's own words; they are read onto the scale, never rewritten.
-LEGACY = {'blocker': 'critical', 'major': 'high', 'minor': 'low', 'info': 'nit'}
 
 
 def level(severity):
     if severity is None:
         return None
-    v = LEGACY.get(str(severity).lower(), str(severity).lower())
+    v = str(severity).lower()
     if v not in LEVELS:
         raise Unusable(f'severity {severity!r} is on no known scale')
     return v
@@ -132,19 +130,6 @@ def load(path, repo, pr):
         led = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, ValueError) as e:
         raise Unusable(f'ledger {path} unreadable: {e}')
-    if isinstance(led, dict) and led.get('v') == 1:
-        # Version 2 keeps answers on the review they answer; version 1 kept them as reviews of their own, and posted
-        # auto fix notes through reply.py.
-        if any(r.get('mode') == 'discussion' or (r.get('receipts') or {}).get('replies') for r in led.get('reviews', [])):
-            raise Unusable(f'ledger {path} holds version 1 answer records (mode discussion) or reply.py receipts, settled '
-                           'ones included, which this version cannot read: migrate them by hand')
-        # Version 2 derives a due resolve (resolve_due) instead of storing it, and keeps each resolve's state.
-        for r in led.get('reviews', []):
-            for f in r.get('findings', []):
-                f.pop('resolveDeferred', None)
-            for m in (r.get('receipts') or {}).get('resolved') or []:
-                m.setdefault('state', 'resolved' if m.pop('resolved', False) else 'deferred')
-        led['v'] = VERSION
     if not isinstance(led, dict) or led.get('v') != VERSION:
         raise Unusable(f'ledger {path} is version {led.get("v") if isinstance(led, dict) else "?"}, this script reads {VERSION}')
     if led.get('repo') != repo or led.get('pr') != pr:

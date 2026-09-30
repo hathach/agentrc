@@ -509,9 +509,10 @@ class Ledger(Case):
         with self.assertRaisesRegex(facts.Unusable, 'nothing to save'):
             self.save({'status': 'blocked', 'reason': 'head-moved'})
         Path(self.p['ledger']).parent.mkdir(parents=True, exist_ok=True)
-        Path(self.p['ledger']).write_text(json.dumps({'v': 99, 'repo': REPO, 'pr': PR, 'reviews': []}))
-        with self.assertRaisesRegex(facts.Unusable, 'version 99'):
-            self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
+        for v in (1, 99):
+            Path(self.p['ledger']).write_text(json.dumps({'v': v, 'repo': REPO, 'pr': PR, 'reviews': []}))
+            with self.assertRaisesRegex(facts.Unusable, f'is version {v}, this script reads 2'):
+                self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
 
 
 class PostCase(Case):
@@ -851,15 +852,6 @@ class Post(PostCase):
         self.assertEqual([c['line'] for c in self.review()['draft']['moved']], [1], 'moved into the body, kept as the comment it was')
         with self.assertRaisesRegex(facts.Unusable, r'over-length text \(src/core/a\.c:1\)'):
             self.post('--auto')
-
-    def test_auto_post_refuses_a_draft_saved_before_the_length_check(self):
-        self.save(self.result_for(self.p))
-        led = json.loads(Path(self.p['ledger']).read_text())
-        del led['reviews'][-1]['draft']['moved']
-        Path(self.p['ledger']).write_text(json.dumps(led))
-        with self.assertRaisesRegex(facts.Unusable, 'predates the length check'):
-            self.post('--auto')
-        self.assertEqual(self.post()['status'], 'drafted', 'the human can still check it in a pending review')
 
     def test_decline_settles_a_draft_never_created(self):
         self.save(self.result_for(self.p))
@@ -1319,37 +1311,6 @@ class Pushback(PostCase):
         with self.assertRaisesRegex(facts.Unusable, 'a pending draft'):
             self.save(self.result_for(self.p, mode='discussion', findings=[{'id': 'pr7-f1', 'status': 'upheld', 'disputes': []}]))
 
-    def test_a_version_1_ledger_loads_unless_it_holds_answer_records(self):
-        led = self.led()
-        led['v'] = 1
-        Path(self.p['ledger']).write_text(json.dumps(led))
-        self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['last']['head'], self.head)
-        led['reviews'].append({'mode': 'discussion', 'head': self.head, 'status': 'pending', 'findings': [], 'draft': {}})
-        Path(self.p['ledger']).write_text(json.dumps(led))
-        with self.assertRaisesRegex(facts.Unusable, 'version 1 answer records'):
-            self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
-        led['reviews'].pop()
-        led['reviews'][0]['receipts']['replies'] = [{'commentId': self.root, 'verified': True}]
-        Path(self.p['ledger']).write_text(json.dumps(led))
-        with self.assertRaisesRegex(facts.Unusable, 'reply.py receipts'):
-            self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])
-
-    def test_a_version_1_ledger_keeps_its_resolves_as_marks_and_derives_what_is_due(self):
-        led = self.led()
-        led['v'] = 1
-        f = led['reviews'][0]['findings'][0]
-        f.update(status='fixed', resolveDeferred={'commentId': self.root, 'head': self.head, 'why': 'moved', 'replied': True})
-        led['reviews'][0]['receipts']['resolved'] = [{'findingId': f['id'], 'commentId': self.root, 'resolved': False, 'error': 'moved'}]
-        Path(self.p['ledger']).write_text(json.dumps(led))
-        snap = str(self.snapshot())
-        show = lambda: self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', snap])  # noqa: E731
-        self.assertEqual([(o['id'], o['resolveDue']) for o in show()['open']], [(f['id'], {'replied': False})])
-        got = ledger.load(Path(self.p['ledger']), REPO, PR)['reviews'][0]
-        self.assertEqual((got['receipts']['resolved'][0]['state'], 'resolveDeferred' in got['findings'][0]), ('deferred', False))
-        led['reviews'][0]['receipts']['resolved'][0]['resolved'] = True
-        Path(self.p['ledger']).write_text(json.dumps(led))
-        self.assertEqual([h['why'] for h in show()['heldThreads']], ['reopened after it was resolved'])
-
     def test_an_answer_publication_carries_only_its_own_answers(self):
         self.discuss('upheld', {'body': 'Still stands.', 'resolve': False})
         led = self.led()
@@ -1559,23 +1520,17 @@ class Result(unittest.TestCase):
 
 
 class Severity(unittest.TestCase):
-    """The one scale: older words read onto it, reports ordered by it, every copy of it the same."""
+    """The one scale: no other word read, reports ordered by it, every copy of it the same."""
 
     def led(self, *findings):
         rev = {'status': 'posted', 'head': 'a' * 40, 'mergeBase': 'b' * 40, 'mode': 'full', 'reviewedAt': 't',
                'verdict': {'event': 'COMMENT'}, 'findings': [{'status': 'open', 'file': 'src/a.c', 'line': 1, 'why': 'w', **f} for f in findings]}
         return {'v': ledger.VERSION, 'repo': REPO, 'pr': PR, 'reviews': [rev]}
 
-    def test_older_words_are_read_onto_the_scale_and_never_rewritten(self):
-        led = self.led({'id': 'f1', 'severity': 'major'}, {'id': 'f2', 'severity': 'Minor'}, {'id': 'f3', 'severity': 'blocker'},
-                       {'id': 'f4', 'severity': 'info'}, {'id': 'f5', 'severity': None})
-        before = json.dumps(led, sort_keys=True)
-        shown = {f['id']: (f['severity'], f['priority']) for f in ledger.show(led)['open']}
-        self.assertEqual(shown, {'f1': ('high', 'P1'), 'f2': ('low', 'P3'), 'f3': ('critical', 'P0'), 'f4': ('nit', 'P4'), 'f5': (None, None)})
-        self.assertEqual(ledger.show(led, finding='f1')['finding']['severity'], 'high')
-        self.assertEqual(json.dumps(led, sort_keys=True), before, 'the stored history keeps its own words')
-        with self.assertRaisesRegex(facts.Unusable, "severity 'severe' is on no known scale"):
-            ledger.show(self.led({'id': 'f1', 'severity': 'severe'}))
+    def test_a_word_off_the_scale_is_refused(self):
+        for word in ('major', 'severe'):
+            with self.assertRaisesRegex(facts.Unusable, f"severity '{word}' is on no known scale"):
+                ledger.show(self.led({'id': 'f1', 'severity': word}))
 
     def test_fixed_and_withdrawn_ids_stay_on_their_record_and_are_never_recycled(self):
         led = self.led({'id': f'pr{PR}-f1', 'status': 'fixed', 'severity': 'high'}, {'id': f'pr{PR}-f2', 'status': 'withdrawn', 'severity': 'low'},

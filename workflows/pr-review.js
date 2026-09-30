@@ -22,7 +22,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message})`) }
 }
 const SHA = /^[0-9a-f]{40}$/
-// The one scale, defined in finding-verifier.md's Severity section; ledger.py reads older words onto it.
+// The one scale, defined in finding-verifier.md's Severity section.
 const LEVELS = ['critical', 'high', 'medium', 'low', 'nit']
 const CONFIDENCE = ['high', 'medium', 'low']
 const IMPACT = {

@@ -20,8 +20,8 @@ it was judged on and the answer still matches its digest. Nothing is public unti
 GitHub, choosing the event; deleting a comment or reply before that declines it. The review is `drafted`.
 
 Text over its length limit, measured here (a comment moved into the body as the comment it was), is never cut: a
-pending review names it in overLength for the human to shorten, and --auto refuses to submit it, or a draft saved
-before the check; an answer counts only where it is published, never under --auto.
+pending review names it in overLength for the human to shorten, and --auto refuses to submit it; an answer
+counts only where it is published, never under --auto.
 
 --auto takes the same path, refusing APPROVE: the pending review with its fix notes (never its answers), then,
 while the head is still the draft's and every note reads back, a submit with the draft's event (its intent stored
@@ -585,9 +585,6 @@ def collect(argv):
         if a.auto and event == 'APPROVE':
             raise Unusable('auto-post never approves; publish it without --auto for the human to submit')
         long = over_length(led, review, answers=not a.auto)
-        if a.auto and review['status'] == 'pending' and 'moved' not in review['draft']:
-            raise Unusable('the draft predates the length check, which cannot measure what it moved into the body: '
-                           'publish it without --auto for the human to check')
         if a.auto and long and review['status'] == 'pending':
             raise Unusable(f"over-length text ({', '.join(long)}): publish it without --auto for the human to shorten")
         rec = review['receipts']
