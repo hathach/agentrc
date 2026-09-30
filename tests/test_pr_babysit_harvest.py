@@ -43,21 +43,6 @@ def greptile_run(status_, conclusion=None, summary='Greptile has reviewed the Pu
 
 
 class SettleRules(unittest.TestCase):
-    def test_copilot(self):
-        bot = 'copilot-pull-request-reviewer[bot]'
-        cases = [
-            ([review(bot, HEAD, '## Pull request overview')], [], ('reviewed', None)),
-            ([review(bot, HEAD, 'no header at all')], [], ('reviewed', None)),
-            ([review(bot, HEAD, harvest.COPILOT_LIMITED + ' more')], [], ('settled', 'limited')),
-            ([review(bot, HEAD, harvest.COPILOT_FAILED + '.')], [], ('settled', 'failed')),
-            ([review(bot, OLD, 'old')], [{'login': 'Copilot'}], ('queued', None)),
-            ([review(bot, OLD, 'old')], [], ('absent', None)),
-        ]
-        for reviews, requested, want in cases:
-            r = harvest.copilot(HEAD, reviews, requested)
-            self.assertEqual((r['state'], r['kind']), want, (reviews, requested))
-        self.assertIsNone(harvest.copilot(HEAD, [review(bot, OLD, 'old')], [])['sha'], 'an older review is evidence, never the sha')
-
     def test_coderabbit_status_and_check_run(self):
         cases = [
             ([status('pending', 'Review queued')], [], ('queued', None)),
@@ -119,18 +104,6 @@ class SettleRules(unittest.TestCase):
             self.assertEqual(harvest.digest(body), reply.comment_digest(body), body)
             self.assertEqual(harvest.digest(body), hashlib.sha256((body or '').encode()).hexdigest()[:12])
 
-    def test_codex(self):
-        bot = 'chatgpt-codex-connector[bot]'
-        sticky = lambda row: comment(bot, f'{harvest.CODEX_MARKER}\n| Review | Status | Commit |\n{row}\n| 🔒 Security Review | ✅ **Completed** | {OLD[:7]} |')
-        self.assertEqual(harvest.codex(HEAD, [sticky(f'| 📝 Code Review | ✅ **Completed** | {HEAD[:7]} |')], [])['state'], 'reviewed')
-        self.assertEqual(harvest.codex(HEAD, [sticky(f'| 📝 Code Review | ✅ **Completed** | {OLD[:7]} |')], [])['state'], 'absent',
-                         'the Security Review row tracks the opening commit and never settles')
-        self.assertEqual(harvest.codex(HEAD, [sticky(f'| 📝 Code Review | ⏳ In progress | {HEAD[:7]} |')], [])['state'], 'working')
-        self.assertEqual(harvest.codex(HEAD, [sticky(f'| 📝 Code Review | 🤔 Pondering | {HEAD[:7]} |')], [])['state'], 'unknown')
-        self.assertEqual(harvest.codex(HEAD, [], [review(bot, HEAD, f'**Reviewed commit:** {HEAD[:7]}')])['state'], 'reviewed')
-        self.assertEqual(harvest.codex(HEAD, [], [])['state'], 'absent')
-
-
 class FailClosed(unittest.TestCase):
     """What a first review found failing open: each case must end unknown or with the older, provable state."""
 
@@ -141,12 +114,6 @@ class FailClosed(unittest.TestCase):
         self.assertEqual(harvest.greptile(HEAD, [queued], [], [], EVENT)['state'], 'queued', 'a lone queued run needs no ordering')
         cr = {'id': 11, 'name': 'CodeRabbit', 'status': 'queued', 'conclusion': None, 'started_at': None}
         self.assertEqual(harvest.coderabbit(HEAD, [], [cr], [], EVENT)['state'], 'queued')
-
-    def test_an_undated_copilot_review_among_several_on_the_head_cannot_be_ordered(self):
-        bot = 'copilot-pull-request-reviewer[bot]'
-        undated = review(bot, HEAD, harvest.COPILOT_LIMITED, at=None, id_=5)
-        self.assertEqual(harvest.copilot(HEAD, [review(bot, HEAD, 'ok'), undated], [])['state'], 'unknown')
-        self.assertEqual(harvest.copilot(HEAD, [undated], [])['kind'], 'limited', 'a lone review needs no ordering')
 
     def test_coderabbit_reads_the_newer_of_its_status_and_check_run(self):
         queued = status('pending', 'Review queued', '2026-09-25T09:00:00Z')
@@ -160,10 +127,6 @@ class FailClosed(unittest.TestCase):
 
     def test_disagreeing_artifacts_at_one_timestamp_are_unknown(self):
         at = '2026-09-25T09:00:00Z'
-        cx = 'chatgpt-codex-connector[bot]'
-        proven = review(cx, HEAD, f'**Reviewed commit:** `{HEAD[:7]}`', at=at)
-        failed = comment(cx, f'{harvest.CODEX_MARKER}\n| Review | Status | Commit |\n|---|---|---|\n| 📝 Code Review | ❌ Failed | {HEAD[:7]} |', updated=at)
-        self.assertEqual(harvest.codex(HEAD, [failed], [proven])['state'], 'unknown')
         run_ = {'id': 11, 'name': 'CodeRabbit', 'status': 'in_progress', 'conclusion': None, 'started_at': at}
         self.assertEqual(harvest.coderabbit(HEAD, [status('success', 'Review completed', at)], [run_], [], EVENT)['state'], 'unknown')
         done = {**run_, 'status': 'completed', 'conclusion': 'success', 'completed_at': at}
@@ -195,9 +158,6 @@ class FailClosed(unittest.TestCase):
             self.assertEqual(harvest.coderabbit(HEAD, [done], [], issue, EVENT)['kind'], 'paused', 'the newest pause decides, in either order')
         mixed = greptile_run('completed', 'success', 'Greptile encountered an error while reviewing this PR. Try again')
         self.assertEqual(harvest.greptile(HEAD, [mixed], [], [], EVENT)['state'], 'unknown', 'an error summary under success is conflicting')
-        cp = 'copilot-pull-request-reviewer[bot]'
-        self.assertEqual(harvest.copilot(HEAD, [review(cp, HEAD, 'ok', at=at), review(cp, HEAD, harvest.COPILOT_FAILED, at=at, id_=2)], [])['state'], 'unknown')
-        self.assertEqual(harvest.copilot(HEAD, [review(cp, HEAD, 'ok', at=at), review(cp, HEAD, 'fine too', at=at, id_=2)], [])['state'], 'reviewed')
 
     def test_an_edited_rate_notice_is_unknown_in_any_order(self):
         bot = 'coderabbitai[bot]'
@@ -215,29 +175,8 @@ class FailClosed(unittest.TestCase):
         self.assertEqual(harvest.coderabbit(HEAD, [at_once], [], [tie], EVENT)['state'], 'unknown', 'one timestamp orders nothing')
         self.assertEqual(harvest.coderabbit(HEAD, [at_once], [], [comment(bot, harvest.CR_PAUSED, at='2026-09-25T09:00:00Z')], EVENT)['state'], 'unknown')
 
-    def test_codex_needs_its_proof_and_the_newest_artifact_wins(self):
-        bot = 'chatgpt-codex-connector[bot]'
-        self.assertEqual(harvest.codex(HEAD, [], [review(bot, HEAD, 'looks fine')])['state'], 'absent', 'a review without Reviewed commit proves nothing')
-        proven = review(bot, HEAD, f'**Reviewed commit:** `{HEAD[:7]}`', at='2026-09-25T09:00:00Z')
-        failed = comment(bot, f'{harvest.CODEX_MARKER}\n| Review | Status | Commit |\n|---|---|---|\n| 📝 Code Review | ❌ Failed | {HEAD[:7]} |',
-                         updated='2026-09-25T10:00:00Z')
-        got = harvest.codex(HEAD, [failed], [proven])
-        self.assertEqual((got['state'], got['kind']), ('settled', 'failed'), 'the newer failed row beats the older review')
-
     def test_unfamiliar_artifacts_are_unknown(self):
-        bot = 'chatgpt-codex-connector[bot]'
-        table = lambda status, commit: comment(bot, f'{harvest.CODEX_MARKER}\n| Review | Status | Commit |\n| 📝 Code Review | {status} | {commit} |')
-        self.assertEqual(harvest.codex(HEAD, [table('✅ **Completed**', '—')], [])['state'], 'unknown', 'a row with no readable commit')
-        self.assertEqual(harvest.codex(HEAD, [table(f'✅ **Completed** (was {HEAD[:7]})', OLD[:7])], [])['state'], 'absent',
-                         'a head SHA outside the Commit column names nothing')
         self.assertEqual(harvest.coderabbit(HEAD, [status('success', 'Something new')], [], [], EVENT)['state'], 'unknown')
-        renamed = comment(bot, f'{harvest.CODEX_MARKER}\n| Review | Status text | Commit |\n| 📝 Code Review | ✅ **Completed** | {HEAD[:7]} |')
-        self.assertEqual(harvest.codex(HEAD, [renamed], [])['state'], 'unknown', 'a renamed column is unread, not a crash')
-        self.assertEqual(harvest.codex(HEAD, [table('❌ Pondering', HEAD[:7])], [])['state'], 'unknown')
-        old = comment(bot, f'{harvest.CODEX_MARKER}\nsomething new', updated='2026-09-25T08:30:00Z')
-        proven = review(bot, HEAD, f'**Reviewed commit:** {HEAD[:7]}', at='2026-09-25T09:00:00Z')
-        self.assertEqual(harvest.codex(HEAD, [old], [proven])['state'], 'reviewed', 'a newer proving review outlives an unreadable summary')
-        self.assertEqual(harvest.codex(HEAD, [comment(bot, f'{harvest.CODEX_MARKER}\nsomething new', updated='2026-09-25T09:30:00Z')], [proven])['state'], 'unknown')
         undated = greptile_run('completed', 'success', at=None)
         refusal = comment('greptile-apps[bot]', harvest.GREPTILE_STATUS + '\nToo many files changed for review', at='2026-09-25T09:30:00Z')
         self.assertEqual(harvest.greptile(HEAD, [undated], [refusal], [], EVENT)['state'], 'unknown')
@@ -288,11 +227,11 @@ class EndToEnd(unittest.TestCase):
 
     def answers(self, heads):
         R, N = 'o/r', 7
-        view = lambda h: {'headRefOid': h, 'headRefName': 'fix', 'headRepository': {'name': 'r', 'nameWithOwner': 'o/r'}, 'reviewRequests': []}
+        view = lambda h: {'headRefOid': h, 'headRefName': 'fix', 'headRepository': {'name': 'r', 'nameWithOwner': 'o/r'}}
         run = lambda id_, event, path, at, h=HEAD: {'id': id_, 'event': event, 'path': path, 'created_at': at, 'head_sha': h,
                                                     'head_branch': 'fix', 'head_repository': {'full_name': 'o/r'}}
         a = {'repo view --json nameWithOwner': [{'nameWithOwner': R}],
-             f'pr view {N} --json headRefOid,headRefName,headRepository,reviewRequests': [view(h) for h in heads],
+             f'pr view {N} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
              f'pr view {N} --json headRefOid': [{'headRefOid': h} for h in heads[1:] + heads[-1:]]}
         for h in set(heads):
             a[f'api --paginate --slurp repos/{R}/actions/runs?head_sha={h}&per_page=100'] = [[{'workflow_runs': [
@@ -330,6 +269,17 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(got['comments'][0]['digest'], harvest.digest('fix this'))
         self.assertEqual(got['comments'][0]['body'], 'fix this')
 
+    def test_copilot_is_harvested_when_named_but_never_settled(self):
+        answers = self.answers([HEAD])
+        answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].append(review('copilot-pull-request-reviewer[bot]', HEAD, '## Pull request overview', id_=32))
+        answers['api --paginate --slurp repos/o/r/pulls/7/comments?per_page=100'][0][0].append(
+            {'id': 41, 'user': user('Copilot'), 'body': 'nit', 'path': 'a.c', 'line': 5, 'commit_id': HEAD, 'created_at': EVENT, 'updated_at': EVENT,
+             'in_reply_to_id': None, 'html_url': 'u/41'})
+        code, got = self.harvest(answers)
+        self.assertEqual(code, 0, got)
+        self.assertEqual([(c['kind'], c['commentId']) for c in got['comments'] if c['source'] == 'copilot'], [('review', 41), ('review-body', 32)])
+        self.assertEqual([b['bot'] for b in got['bots']], ['coderabbit'])
+
     def test_a_moving_head_is_read_again_then_refused(self):
         code, got = self.harvest(self.answers([OLD, HEAD]))
         self.assertEqual((code, got['headSha']), (0, HEAD))
@@ -355,7 +305,8 @@ class EndToEnd(unittest.TestCase):
 
     def test_usage(self):
         for argv in (['--pr', '7', '--reviewers', 'coderabbit', '--auto-run', 'greptile'], ['--pr', '7', '--reviewers', 'bard'], ['--pr', '7'],
-                     ['--pr', '7', '--reviewers', 'code-scanning', '--auto-run', 'code-scanning']):
+                     ['--pr', '7', '--reviewers', 'code-scanning', '--auto-run', 'code-scanning'],
+                     ['--pr', '7', '--reviewers', 'copilot', '--auto-run', 'copilot'], ['--pr', '7', '--reviewers', 'codex']):
             code, got = self.harvest({}, *argv)
             self.assertEqual(code, 2, argv)
 

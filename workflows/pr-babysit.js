@@ -5,10 +5,10 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-// args: { pr: number, reviewers?: string[] (of codex, copilot, coderabbit, greptile, code-scanning; default
+// args: { pr: number, reviewers?: string[] (of copilot, coderabbit, greptile, code-scanning; default
 //            ['coderabbit', 'greptile', 'code-scanning']; [] runs no review lane),
 //          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default:
-//            reviewers but code-scanning, which is harvested only and never named here),
+//            reviewers but copilot and code-scanning, which are harvested only and never named here),
 //          maxCycles?: number (ceiling on review/fix/CI cycles, default 10; a resumed launch
 //            defaults to its state's), autoPush?: boolean (default false = dry run),
 //          markSonar?: boolean (with autoPush: the SonarCloud issue behind a code-scanning comment
@@ -69,11 +69,12 @@ if (args.maxCycles != null && (!Number.isInteger(args.maxCycles) || args.maxCycl
 }
 // The validator knows these bots and nothing else, so an unknown name would
 // silently review nothing; fail before dispatch instead.
-const KNOWN_REVIEWERS = ['codex', 'copilot', 'coderabbit', 'greptile', 'code-scanning']
+const KNOWN_REVIEWERS = ['copilot', 'coderabbit', 'greptile', 'code-scanning']
 const DEFAULT_REVIEWERS = ['coderabbit', 'greptile', 'code-scanning']
 // Code-scanning comments arrive with the analysis workflow, a CI check with no
-// review verdict to wait for: they are harvested, never waited on.
-const HARVEST_ONLY = ['code-scanning']
+// review verdict to wait for, and harvest.py reads no Copilot verdict: both are
+// harvested, never waited on.
+const HARVEST_ONLY = ['copilot', 'code-scanning']
 const reviewersArg = args.reviewers ?? DEFAULT_REVIEWERS
 if (!Array.isArray(reviewersArg)) {
   throw new Error(`reviewers must be an array of ${KNOWN_REVIEWERS.join(', ')}; [] runs no review lane`)

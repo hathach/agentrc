@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Where each auto-running review bot stands on a PR's head, and every comment its reviewers left.
 
-  harvest.py --pr N --reviewers codex,copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile
+  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile
 
---auto-run names only bots it settles: code-scanning is harvested, never settled.
+--auto-run names only bots it settles: copilot and code-scanning are harvested, never settled.
 
 Run from the PR checkout. It settles first and harvests second: the bots'
 artifacts are read, then the three comment endpoints, then the head again; a
@@ -27,7 +27,6 @@ import base64
 import functools
 import hashlib
 import json
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,13 +36,10 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, Unusable, report, run  # noqa: E402
 
-KNOWN = ('codex', 'copilot', 'coderabbit', 'greptile', 'code-scanning')
-SETTLED = ('codex', 'copilot', 'coderabbit', 'greptile')
+KNOWN = ('copilot', 'coderabbit', 'greptile', 'code-scanning')
+SETTLED = ('coderabbit', 'greptile')
 AUTHOR = {'code-scanning': 'github-advanced-security'}
 HEAD_ACTIVITIES = {'opened', 'synchronize', 'reopened', 'ready_for_review'}
-COPILOT_LIMITED = 'Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.'
-COPILOT_FAILED = 'Copilot encountered an error and was unable to review this pull request'
-CODEX_MARKER = '<!-- codex-pull-request-review-summary -->'
 CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 GREPTILE_PAUSED = 'Greptile has paused reviews on this repository'
@@ -116,87 +112,6 @@ def applies(created, event_at):
     if event_at is None:
         return None
     return stamp(created) > stamp(event_at)
-
-
-def codex_row(body):
-    """(the Code Review row's status cell, its Commit cell), or None when the table does not read that way."""
-    lines = body.splitlines()
-    header = next((i for i, l in enumerate(lines) if l.lstrip().startswith('|') and 'Commit' in l and 'Status' in l), None)
-    row = next((l for l in lines if l.lstrip().startswith('|') and '📝' in l and 'Code Review' in l), None)
-    if header is None or row is None:
-        return None
-    names = [c.strip() for c in lines[header].strip().strip('|').split('|')]
-    cells = [c.strip() for c in row.strip().strip('|').split('|')]
-    if len(cells) != len(names) or 'Status' not in names or 'Commit' not in names:
-        return None
-    return cells[names.index('Status')], cells[names.index('Commit')]
-
-
-def codex(head, issue, reviews):
-    """The newest of a review proving the head and the summary's Code Review row naming it."""
-    found = []
-    for r in reviews:
-        proof = re.search(r'\*\*Reviewed commit:\*\*\s*`?([0-9a-f]{7,40})`?', r.get('body') or '')
-        if 'codex' in (r['user']['login'] or '').lower() and r.get('commit_id') == head and proof and head.startswith(proof.group(1)):
-            found.append((r['submitted_at'], record('codex', 'reviewed', 'a review proving the head', [f"review {r['id']} on {head[:8]}"], head)))
-    sticky = [c for c in issue if CODEX_MARKER in (c.get('body') or '')]
-    if sticky:
-        c = max(sticky, key=lambda x: stamp(x['updated_at']))  # an undated one among several raises: unordered
-        read = codex_row(c['body'])
-        ev = [f"summary comment {c['id']} updated {c['updated_at']}"]
-        sha = read and re.fullmatch(r'`?([0-9a-f]{7,40})`?', read[1])
-        if read:
-            ev.append(f'Code Review row: {read[0]} | {read[1]}')
-        # An unreadable summary is itself the newest word when nothing proves the head after it.
-        if not sha:
-            found.append((c['updated_at'], record('codex', 'unknown', 'the summary has no Code Review row and commit this reads', ev)))
-        elif head.startswith(sha.group(1)):
-            status, why = read[0], f'Code Review row {read[0]} for this head'
-            if '✅' in status and 'Completed' in status:
-                rec = record('codex', 'reviewed', why, ev, head)
-            elif '❌' in status and re.search(r'fail|error', status, re.I):
-                rec = record('codex', 'settled', why, ev, head, 'failed')
-            elif re.search(r'progress|running|queued|pending|⏳', status, re.I):
-                rec = record('codex', 'working', why, ev, head)
-            else:
-                rec = record('codex', 'unknown', 'the Code Review row status is not one this reads', ev)
-            found.append((c['updated_at'], rec))
-    if not found:
-        return record('codex', 'absent', 'no review proving the head and no summary row naming it')
-    top = max(stamp(t) for t, _ in found)
-    newest_ = [r for t, r in found if stamp(t) == top]
-    if len({(r['state'], r['kind']) for r in newest_}) > 1:
-        return record('codex', 'unknown', 'a review and the summary row disagree at one timestamp', [e for r in newest_ for e in r['evidence']])
-    return newest_[0]
-
-
-def copilot_outcome(review):
-    body = review.get('body') or ''
-    return 'limited' if body.startswith(COPILOT_LIMITED) else 'failed' if body.startswith(COPILOT_FAILED) else None
-
-
-def copilot(head, reviews, requested):
-    mine = [r for r in reviews if 'copilot' in (r['user']['login'] or '').lower()]
-    on_head = [r for r in mine if r.get('commit_id') == head]
-    older = [f"review {r['id']} on {(r.get('commit_id') or '')[:8]}" for r in mine if r.get('commit_id') != head]
-    if on_head:
-        undated = [r for r in on_head if not r.get('submitted_at')]
-        if undated and len(on_head) > 1:
-            return record('copilot', 'unknown', f"review {undated[0]['id']} on the head has no time to order it by",
-                          [f"review {r['id']} on {head[:8]}" for r in on_head])
-        r, tied = (undated[0], '') if undated else newest_reading(on_head, 'submitted_at', copilot_outcome)
-        if tied:
-            return record('copilot', 'unknown', f'reviews on the head {tied}', [f"review {x['id']} on {head[:8]}" for x in on_head])
-        ev = [f"review {r['id']} on {head[:8]}", *older]
-        kind = copilot_outcome(r)
-        if kind == 'limited':
-            return record('copilot', 'settled', 'quota limit on the head', ev, head, 'limited')
-        if kind == 'failed':
-            return record('copilot', 'settled', 'review failed on the head', ev, head, 'failed')
-        return record('copilot', 'reviewed', 'a review on the head', ev, head)
-    if any('copilot' in (x.get('login') or x.get('name') or '').lower() for x in requested):
-        return record('copilot', 'queued', 'requested, no review on the head yet', older)
-    return record('copilot', 'absent', 'no request outstanding and no review on the head', older)
 
 
 def coderabbit(head, statuses, checks, issue, event_at):
@@ -392,22 +307,18 @@ def comments(repo, n, reviewers):
 
 
 def observe(repo, n, reviewers, auto):
-    view = gh_json('pr', 'view', str(n), '--json', 'headRefOid,headRefName,headRepository,reviewRequests')
+    view = gh_json('pr', 'view', str(n), '--json', 'headRefOid,headRefName,headRepository')
     head = view['headRefOid']
     if not FULL_SHA.match(head or ''):
         raise Unusable(f'gh pr view {n}: no head SHA')
     event_at, event_why = head_event(repo, n, view, head) if auto else (None, 'no reviewer auto-runs, so no head event is read')
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
-    checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if {'coderabbit', 'greptile'} & set(auto) else []
-    issue = pages(f'repos/{repo}/issues/{n}/comments') if {'codex', 'coderabbit', 'greptile'} & set(auto) else []
-    reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if {'codex', 'copilot', 'greptile'} & set(auto) else []
+    checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
+    issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else []
+    reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if 'greptile' in auto else []
     bots = []
     for bot in auto:
-        if bot == 'codex':
-            bots.append(codex(head, issue, reviews))
-        elif bot == 'copilot':
-            bots.append(copilot(head, reviews, view.get('reviewRequests') or []))
-        elif bot == 'coderabbit':
+        if bot == 'coderabbit':
             bots.append(coderabbit(head, statuses, checks, issue, event_at))
         elif bot == 'greptile':
             bots.append(greptile(head, checks, issue, reviews, event_at))

@@ -19,7 +19,7 @@ const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer'
 const GREEN = { status: 'green', infraRerun: [], realFailures: [] }
 const finding = (over = {}) => {
   const f = {
-    source: 'codex', commentId: 1, file: 'src/a.c', line: 1,
+    source: 'coderabbit', commentId: 1, file: 'src/a.c', line: 1,
     claim: 'bad', verdict: 'valid', reason: '', fixHint: 'fix it', ...over,
   }
   return { findingId: `${f.commentId}#${f.line}`, commentDigest: `d${f.commentId}`, ...f } // overridable
@@ -78,7 +78,7 @@ const adoptCommit = (sha = ADOPT, parents = [HEAD], paths = ['src/adopted.c'], o
   sha, parents, paths, message: 'Adopt the hardware fix\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...over,
 })
 const adoptionState = ({
-  maxCycles = 4, cyclesUsed = 1, reviewers = ['codex'], autoRun = reviewers,
+  maxCycles = 4, cyclesUsed = 1, reviewers = ['coderabbit'], autoRun = reviewers,
   protected: protectedPattern = null, pin = STATE_PIN, ...over
 } = {}) => seal({
   version: 3, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
@@ -521,7 +521,7 @@ async function run(opts = {}) {
       'args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget',
       ...ABSENT, body)
     const result = await fn(
-      opts.rawArgs ?? { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['codex'], ...opts.args },
+      opts.rawArgs ?? { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['coderabbit'], ...opts.args },
       // Each stub answers as its script before facts.py seals the line; the seal goes on
       // here (an error line's relay fills it with ''), then opts.garble is the relay's copy.
       async (prompt, options) => {
@@ -587,12 +587,14 @@ test('args validation', async () => {
 
 test('an unknown reviewer or a malformed protected pattern throws before any agent runs', async () => {
   for (const [args, expected] of [
-    [{ reviewers: ['codex', 'gpt'] }, /unknown reviewer\(s\) \["gpt"\]/],
-    [{ reviewers: 'codex' }, /reviewers must be an array of codex, copilot, coderabbit, greptile, code-scanning; \[\] runs no review lane/],
+    [{ reviewers: ['coderabbit', 'gpt'] }, /unknown reviewer\(s\) \["gpt"\]/],
+    [{ reviewers: ['codex'] }, /unknown reviewer\(s\) \["codex"\]/],
+    [{ reviewers: 'coderabbit' }, /reviewers must be an array of copilot, coderabbit, greptile, code-scanning; \[\] runs no review lane/],
     [{ reviewers: [4] }, /unknown reviewer/],
-    [{ reviewers: ['codex'], autoRun: ['copilot'] }, /autoRun must be a subset of reviewers \["codex"\]/],
-    [{ reviewers: ['codex'], autoRun: 'codex' }, /autoRun must be a subset/],
-    [{ reviewers: ['codex', 'code-scanning'], autoRun: ['codex', ' Code-Scanning'] }, /autoRun must be a subset of reviewers \["codex","code-scanning"\] without code-scanning/],
+    [{ reviewers: ['coderabbit'], autoRun: ['greptile'] }, /autoRun must be a subset of reviewers \["coderabbit"\]/],
+    [{ reviewers: ['coderabbit'], autoRun: 'coderabbit' }, /autoRun must be a subset/],
+    [{ reviewers: ['coderabbit', 'code-scanning'], autoRun: ['coderabbit', ' Code-Scanning'] }, /autoRun must be a subset of reviewers \["coderabbit","code-scanning"\] without copilot, code-scanning/],
+    [{ reviewers: ['copilot'], autoRun: ['copilot'] }, /autoRun must be a subset of reviewers \["copilot"\] without copilot, code-scanning/],
     [{ protected: '^test/hil/(' }, /protected is not a valid regex/],
     [{ protected: '   ' }, /non-empty regex string/],
     [{ protected: 7 }, /non-empty regex string/],
@@ -604,7 +606,7 @@ test('an unknown reviewer or a malformed protected pattern throws before any age
     assert.deepEqual(trace, [], 'nothing may be dispatched before the args are checked')
   }
   // Names are normalized, and an empty roster is a legal value, not a typo.
-  const named = await run({ args: { reviewers: ['  CodeX ', 'CopIlot'] } })
+  const named = await run({ args: { reviewers: ['  CodeRabbit ', 'CopIlot'] } })
   assert.equal(named.result.pass, true)
   const none = await run({ args: { reviewers: [] } })
   assert.equal(none.result.pass, true)
@@ -633,20 +635,20 @@ test('code-scanning is never waited for, and its findings are fixed like any bot
 })
 
 test('the requested reviewers, normalized, are the ones the validator is asked for', async () => {
-  const { calls } = await run({ args: { reviewers: ['  CodeX ', 'CopIlot'] } })
+  const { calls } = await run({ args: { reviewers: ['  CodeRabbit ', 'CopIlot'] } })
   const reviews = calls.find(c => c.label.startsWith('reviews#'))
-  assert.match(reviews.prompt, /the reviewers to harvest on this PR are codex, copilot, and no others/)
-  assert.doesNotMatch(reviews.prompt, /coderabbit/i, 'an unrequested bot must not be harvested')
+  assert.match(reviews.prompt, /the reviewers to harvest on this PR are coderabbit, copilot, and no others/)
+  assert.doesNotMatch(reviews.prompt, /greptile/i, 'an unrequested bot must not be harvested')
 })
 
 test('the auto-running reviewers are named apart from the harvest list', async () => {
   // Harvest-only Copilot must never become a settlement requirement.
-  const split = await run({ args: { reviewers: ['codex', 'copilot'], autoRun: [' Codex '] } })
+  const split = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'], autoRun: [' CodeRabbit '] } })
   const prompt = split.calls.find(c => c.label.startsWith('reviews#')).prompt
-  assert.match(prompt, /harvest on this PR are codex, copilot, and no others; of those, codex auto-run on every push: report one record for each and no other/)
-  // Default: everybody harvested is also waited for, as before the split.
-  const same = await run({ args: { reviewers: ['codex', 'copilot'] } })
-  assert.match(same.calls.find(c => c.label.startsWith('reviews#')).prompt, /of those, codex, copilot auto-run/)
+  assert.match(prompt, /harvest on this PR are greptile, coderabbit, copilot, and no others; of those, coderabbit auto-run on every push: report one record for each and no other/)
+  // Default: everybody harvested but copilot is also waited for.
+  const same = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'] } })
+  assert.match(same.calls.find(c => c.label.startsWith('reviews#')).prompt, /of those, greptile, coderabbit auto-run/)
   const nobody = await run({ args: { reviewers: ['copilot'], autoRun: [] } })
   assert.match(nobody.calls.find(c => c.label.startsWith('reviews#')).prompt, /none of them auto-run: report no bot records/)
 })
@@ -660,12 +662,12 @@ test('greptile is harvested and waited for, or harvested only', async () => {
   assert.equal(harvested.result.pass, true, JSON.stringify(harvested.result.reason))
 })
 
-test('the usual launch, copilot and coderabbit, settles without codex', async () => {
+test('the usual launch, copilot and coderabbit, waits for coderabbit only', async () => {
   const { calls, result } = await run({ args: { reviewers: ['copilot', 'coderabbit'] } })
   const reviews = calls.find(c => c.label.startsWith('reviews#'))
   assert.match(reviews.prompt, /the reviewers to harvest on this PR are copilot, coderabbit, and no others/)
   assert.deepEqual(result.state.config.reviewers, ['copilot', 'coderabbit'])
-  assert.deepEqual(result.state.config.autoRun, ['copilot', 'coderabbit'])
+  assert.deepEqual(result.state.config.autoRun, ['coderabbit'])
   assert.equal(result.pass, true, JSON.stringify(result.reason))
 })
 
@@ -868,7 +870,7 @@ test('a clean green PR passes and still logs a summary', async () => {
   const { result, logs } = await run()
   assert.equal(result.pass, true)
   assert.deepEqual(summaries(logs).length, 1)
-  assert.match(summaries(logs)[0], /^cycle 1 summary — CI green, reviews: codex reviewed 0f1e2d3\n\(no bot findings/)
+  assert.match(summaries(logs)[0], /^cycle 1 summary — CI green, reviews: coderabbit reviewed 0f1e2d3\n\(no bot findings/)
   assert.equal(result.history[0].summary, summaries(logs)[0])
 })
 
@@ -4512,7 +4514,7 @@ test('N cycles over N launches dispatch the validator N times, no more', async (
 
 test('a state from a run with other arguments, or of another shape, is refused', async () => {
   const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
-  await assert.rejects(run({ args: { maxCycles: 3, reviewers: ['codex', 'copilot'], state: first.result.state } }),
+  await assert.rejects(run({ args: { maxCycles: 3, reviewers: ['coderabbit', 'copilot'], state: first.result.state } }),
     /different arguments/)
   await assert.rejects(run({ args: { maxCycles: 3, state: { version: 0 } } }), /not a pr-babysit state/)
 })
@@ -4909,13 +4911,13 @@ test('rejected or dead adoption pushes preserve the ledger and recover without r
 })
 
 test('old bot timing cannot settle reviewers on a newly adopted head', async () => {
-  const reviewers = ['codex', 'copilot', 'coderabbit']
+  const reviewers = ['greptile', 'coderabbit']
   const state = adoptionState({
     maxCycles: 2, reviewers, reviewClock: { sha: HEAD, eventAt: null, since: at(-100) },
   })
   const { result } = await run({
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 20,
-    reviews: { findings: [], replies: [], bots: [bot('codex'), bot('copilot', { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }), bot('coderabbit')] },
+    reviews: { findings: [], replies: [], bots: [bot('greptile', { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }), bot('coderabbit')] },
   })
   assert.equal(result.reason, 'reviews-pending')
   assert.deepEqual(result.state.reviewClock, { sha: ADOPT, eventAt: null, since: at(20) },
@@ -5338,7 +5340,7 @@ test('a restored state records the generated pattern in its config', async () =>
 
 const absent = (name, over = {}) => bot(name, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head', ...over })
 const quiet = (bots) => ({ findings: [], replies: [], bots })
-const THREE = { reviewers: ['codex', 'copilot', 'coderabbit'] }
+const THREE = { reviewers: ['greptile', 'coderabbit', 'copilot'] }
 const headLine = (logs) => summaries(logs).map(s => s.split('\n')[0])
 
 test('the validator contract is per-bot records, not a done flag', async () => {
@@ -5350,24 +5352,24 @@ test('the validator contract is per-bot records, not a done flag', async () => {
 })
 
 test('claude is no longer a reviewer the workflow knows', async () => {
-  await assert.rejects(run({ args: { reviewers: ['codex', 'claude'] } }), /unknown reviewer\(s\) \["claude"\]/)
+  await assert.rejects(run({ args: { reviewers: ['coderabbit', 'claude'] } }), /unknown reviewer\(s\) \["claude"\]/)
 })
 
 test('a harvest that leaves an auto-running bot unaccounted for is refused, not read as settled', async () => {
-  // The run-7 failure: Codex had no review of the head, and the run said done.
+  // The run-7 failure: a bot had no review of the head, and the run said done.
   for (const [bots, why] of [
-    [[bot('codex')], /no record for copilot, coderabbit/],
-    [[bot('codex'), bot('codex'), bot('copilot'), bot('coderabbit')], /two records for codex/],
-    [[bot('codex'), bot('copilot'), bot('coderabbit'), bot('claude')], /record for claude, which does not auto-run here/],
-    [[bot('codex', { sha: FOREIGN }), bot('copilot'), bot('coderabbit')], /codex record names c0ffee1, not the head/],
-    [[bot('codex', { sha: 'abc' }), bot('copilot'), bot('coderabbit')], /codex record names "abc", not the head/],
-    [[bot('codex', { sha: null }), bot('copilot'), bot('coderabbit')], /codex reviewed with no SHA/],
-    [[bot('codex', { evidence: [] }), bot('copilot'), bot('coderabbit')], /codex reviewed with no evidence/],
-    [[bot('codex'), bot('copilot', { state: 'settled', kind: 'limited', evidence: ['  '], reason: 'quota' }), bot('coderabbit')], /copilot settled with no evidence/],
-    [[bot('codex', { state: 'settled', kind: null, reason: 'declined' }), bot('copilot'), bot('coderabbit')], /codex is settled with kind null/],
-    [[bot('codex', { kind: 'paused' }), bot('copilot'), bot('coderabbit')], /codex is reviewed with kind "paused"/],
-    [[bot('codex', { state: 'settled', kind: 'skipped', sha: null, evidence: [], reason: 'declined' }), bot('copilot'), bot('coderabbit')], /codex settled with no evidence/],
-    [[absent('codex', { reason: ' ' }), bot('copilot'), bot('coderabbit')], /codex absent with no reason/],
+    [[bot('greptile')], /no record for coderabbit/],
+    [[bot('greptile'), bot('greptile'), bot('coderabbit')], /two records for greptile/],
+    [[bot('greptile'), bot('coderabbit'), bot('copilot')], /record for copilot, which does not auto-run here/],
+    [[bot('greptile', { sha: FOREIGN }), bot('coderabbit')], /greptile record names c0ffee1, not the head/],
+    [[bot('greptile', { sha: 'abc' }), bot('coderabbit')], /greptile record names "abc", not the head/],
+    [[bot('greptile', { sha: null }), bot('coderabbit')], /greptile reviewed with no SHA/],
+    [[bot('greptile', { evidence: [] }), bot('coderabbit')], /greptile reviewed with no evidence/],
+    [[bot('greptile', { state: 'settled', kind: 'limited', evidence: ['  '], reason: 'quota' }), bot('coderabbit')], /greptile settled with no evidence/],
+    [[bot('greptile', { state: 'settled', kind: null, reason: 'declined' }), bot('coderabbit')], /greptile is settled with kind null/],
+    [[bot('greptile', { kind: 'paused' }), bot('coderabbit')], /greptile is reviewed with kind "paused"/],
+    [[bot('greptile', { state: 'settled', kind: 'skipped', sha: null, evidence: [], reason: 'declined' }), bot('coderabbit')], /greptile settled with no evidence/],
+    [[absent('greptile', { reason: ' ' }), bot('coderabbit')], /greptile absent with no reason/],
   ]) {
     const { result, logs, labels } = await run({ args: THREE, reviews: quiet(bots) })
     assert.equal(result.reason, 'review-report-unusable', `${why}: got ${result.reason}`)
@@ -5391,42 +5393,41 @@ test('a harvest about another head, or with an unusable clock, is refused', asyn
 })
 
 test('a bot that reported it could not review settles at once, and the summary says so', async () => {
-  // Copilot out of quota, CodeRabbit paused: neither will ever review this head.
+  // Greptile out of credits, CodeRabbit paused: neither will ever review this head.
   const { result, logs } = await run({
     args: THREE,
     reviews: quiet([
-      bot('codex'),
-      bot('copilot', { state: 'settled', kind: 'limited', evidence: ['review 5107622579'], reason: 'quota limit reached' }),
+      bot('greptile', { state: 'settled', kind: 'limited', evidence: ['review 5107622579'], reason: 'quota limit reached' }),
       bot('coderabbit', { state: 'settled', kind: 'paused', sha: null, evidence: ['sticky 12'], reason: 'reviews paused after 5 commits' }),
     ]),
   })
   assert.equal(result.pass, true, result.reason)
   assert.equal(headLine(logs)[0],
-    'cycle 1 summary — CI green, reviews: codex reviewed 0f1e2d3 · copilot settled (limited: quota limit reached) · coderabbit settled (paused: reviews paused after 5 commits)')
+    'cycle 1 summary — CI green, reviews: greptile settled (limited: quota limit reached) · coderabbit settled (paused: reviews paused after 5 commits)')
 })
 
 test('a silent bot blocks until the cap, then the head is declared unreviewed by it', async () => {
   // One minute between validator dispatches: cycle 3 has waited two.
-  const early = await run({ args: { ...THREE, maxCycles: 3 }, reviews: quiet([bot('codex'), absent('copilot'), bot('coderabbit')]) })
+  const early = await run({ args: { ...THREE, maxCycles: 3 }, reviews: quiet([absent('greptile'), bot('coderabbit')]) })
   assert.equal(early.result.reason, 'reviews-pending')
   assert.equal(early.result.head, HEAD)
-  assert.deepEqual(early.result.pending, [absent('copilot', { sha: null })])
-  assert.equal(headLine(early.logs)[0], 'cycle 1 summary — CI green, reviews: codex reviewed 0f1e2d3 · copilot absent (nothing on head, 10m to cap) · coderabbit reviewed 0f1e2d3')
-  assert.equal(headLine(early.logs)[2], 'cycle 3 summary — CI green, reviews: codex reviewed 0f1e2d3 · copilot absent (nothing on head, 8m to cap) · coderabbit reviewed 0f1e2d3')
-  assert.ok(early.logs.some(l => l === 'cycle 1: auto-review still pending (copilot absent (nothing on head, 10m to cap)) — re-arming after a wait'))
-  assert.ok(early.logs.some(l => l === 'cycle 3: auto-review still pending (copilot absent (nothing on head, 8m to cap)) — cycle budget exhausted'))
+  assert.deepEqual(early.result.pending, [absent('greptile', { sha: null })])
+  assert.equal(headLine(early.logs)[0], 'cycle 1 summary — CI green, reviews: greptile absent (nothing on head, 10m to cap) · coderabbit reviewed 0f1e2d3')
+  assert.equal(headLine(early.logs)[2], 'cycle 3 summary — CI green, reviews: greptile absent (nothing on head, 8m to cap) · coderabbit reviewed 0f1e2d3')
+  assert.ok(early.logs.some(l => l === 'cycle 1: auto-review still pending (greptile absent (nothing on head, 10m to cap)) — re-arming after a wait'))
+  assert.ok(early.logs.some(l => l === 'cycle 3: auto-review still pending (greptile absent (nothing on head, 8m to cap)) — cycle budget exhausted'))
   // Ten minutes between dispatches: cycle 2 observes the cap passed.
-  const late = await run({ args: { ...THREE, maxCycles: 3 }, minutesPerCycle: 10, reviews: quiet([bot('codex'), absent('copilot', { state: 'queued', reason: 'review requested' }), bot('coderabbit')]) })
+  const late = await run({ args: { ...THREE, maxCycles: 3 }, minutesPerCycle: 10, reviews: quiet([absent('greptile', { state: 'queued', reason: 'review requested' }), bot('coderabbit')]) })
   assert.equal(late.result.pass, true, late.result.reason)
   assert.equal(late.result.cycles, 2)
-  assert.equal(headLine(late.logs)[1], 'cycle 2 summary — CI green, reviews: codex reviewed 0f1e2d3 · copilot queued, wait expired after 10m: head unreviewed (review requested) · coderabbit reviewed 0f1e2d3')
+  assert.equal(headLine(late.logs)[1], 'cycle 2 summary — CI green, reviews: greptile queued, wait expired after 10m: head unreviewed (review requested) · coderabbit reviewed 0f1e2d3')
 })
 
 test('a bot seen working, or one that could not be read, waits past the cap', async () => {
   for (const state of ['working', 'unknown']) {
     const { result, logs } = await run({
       args: { ...THREE, maxCycles: 2 }, minutesPerCycle: 30,
-      reviews: quiet([bot('codex'), bot('copilot'), absent('coderabbit', { state, reason: state === 'working' ? 'Review in progress' : 'statuses endpoint 502' })]),
+      reviews: quiet([bot('greptile'), absent('coderabbit', { state, reason: state === 'working' ? 'Review in progress' : 'statuses endpoint 502' })]),
     })
     assert.equal(result.reason, 'reviews-pending', state)
     assert.equal(result.pending[0].state, state)
@@ -5436,40 +5437,40 @@ test('a bot seen working, or one that could not be read, waits past the cap', as
 
 test('the cap runs from the head event when the validator can date it, else from first sight', async () => {
   // Dated: a push fifteen minutes before the first look has already expired.
-  const dated = await run({ args: THREE, reviews: { ...quiet([bot('codex'), absent('copilot'), bot('coderabbit')]), headEventAt: at(-15) } })
+  const dated = await run({ args: THREE, reviews: { ...quiet([absent('greptile'), bot('coderabbit')]), headEventAt: at(-15) } })
   assert.equal(dated.result.pass, true, dated.result.reason)
-  assert.match(headLine(dated.logs)[0], /copilot absent, wait expired after 15m/)
+  assert.match(headLine(dated.logs)[0], /greptile absent, wait expired after 15m/)
   // Kept: a later harvest that cannot date the event does not fall back to first sight.
   let n = 0
   const kept = await run({
     args: { ...THREE, maxCycles: 2 }, minutesPerCycle: 5,
-    reviewsPerCycle: () => ({ ...quiet([bot('codex'), absent('copilot'), bot('coderabbit')]), headEventAt: ++n === 1 ? at(-5) : null }),
+    reviewsPerCycle: () => ({ ...quiet([absent('greptile'), bot('coderabbit')]), headEventAt: ++n === 1 ? at(-5) : null }),
   })
   assert.equal(kept.result.pass, true, kept.result.reason)
-  assert.match(headLine(kept.logs)[1], /copilot absent, wait expired after 10m/)
+  assert.match(headLine(kept.logs)[1], /greptile absent, wait expired after 10m/)
   // Restarted: a newer event on the same SHA (reopen, ready) starts the wait over.
   n = 0
   const restarted = await run({
     args: { ...THREE, maxCycles: 2 }, minutesPerCycle: 3,
-    reviewsPerCycle: () => ({ ...quiet([bot('codex'), absent('copilot'), bot('coderabbit')]), headEventAt: ++n === 1 ? at(-8) : at(2) }),
+    reviewsPerCycle: () => ({ ...quiet([absent('greptile'), bot('coderabbit')]), headEventAt: ++n === 1 ? at(-8) : at(2) }),
   })
   assert.equal(restarted.result.reason, 'reviews-pending')
-  assert.match(headLine(restarted.logs)[1], /copilot absent \(nothing on head, 9m to cap\)/)
+  assert.match(headLine(restarted.logs)[1], /greptile absent \(nothing on head, 9m to cap\)/)
 })
 
 test('the clock is keyed by head: this run\'s own push starts a new one, a resume keeps it', async () => {
   let n = 0
   const pushed = await run({
     args: { ...THREE, autoPush: true, maxCycles: 2 }, minutesPerCycle: 20,
-    reviewsPerCycle: () => ++n === 1 ? { findings: [finding()], replies: [], bots: [bot('codex'), bot('copilot'), bot('coderabbit')] }
-      : quiet([bot('codex'), absent('copilot'), bot('coderabbit')]),
+    reviewsPerCycle: () => ++n === 1 ? { findings: [finding()], replies: [], bots: [bot('greptile'), bot('coderabbit')] }
+      : quiet([absent('greptile'), bot('coderabbit')]),
   })
   assert.equal(pushed.result.reason, 'reviews-pending', 'twenty minutes since first sight of the old head do not count against the new one')
   assert.deepEqual(pushed.result.state.reviewClock, { sha: shaFor(1), eventAt: null, since: at(20) })
-  const a = await run({ args: { ...THREE, autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: quiet([bot('codex'), absent('copilot'), bot('coderabbit')]) })
+  const a = await run({ args: { ...THREE, autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: quiet([absent('greptile'), bot('coderabbit')]) })
   assert.equal(a.result.reason, 'yielded')
   assert.deepEqual(a.result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0) })
-  const b = await run({ args: { ...THREE, autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: a.result.state }, clockOffset: 10, reviews: quiet([bot('codex'), absent('copilot'), bot('coderabbit')]) })
+  const b = await run({ args: { ...THREE, autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: a.result.state }, clockOffset: 10, reviews: quiet([absent('greptile'), bot('coderabbit')]) })
   assert.equal(b.result.pass, true, `${b.result.reason}: the wait began in the previous launch`)
   assert.equal(b.result.state.reviewClock.since, at(0))
   await assert.rejects(run({ args: { ...THREE, maxCycles: 3, state: { ...a.result.state, reviewClock: { sha: HEAD, since: 'never' } } } }), /not a pr-babysit state/)
@@ -5480,7 +5481,7 @@ test('settled bots forgive neither a valid finding nor a reply owed, and debt ou
   assert.ok(fixed.labels.some(l => l.startsWith('fix:')), 'the valid finding is fixed')
   const owed = await run({
     args: { ...THREE, autoPush: false, maxCycles: 1 },
-    reviews: { findings: [invalidFinding({ commentId: 5 })], replies: [], bots: [bot('codex'), absent('copilot'), bot('coderabbit')] },
+    reviews: { findings: [invalidFinding({ commentId: 5 })], replies: [], bots: [absent('greptile'), bot('coderabbit')] },
   })
   assert.equal(owed.result.reason, 'deferred-replies-unresolved')
 })
@@ -5488,7 +5489,7 @@ test('settled bots forgive neither a valid finding nor a reply owed, and debt ou
 test('a last cycle that pushed reports the budget spent, not old-head records on the new head', async () => {
   const { result } = await run({
     args: { ...THREE, autoPush: true, maxCycles: 1 },
-    reviews: { findings: [finding()], replies: [], bots: [bot('codex'), absent('copilot', { state: 'working', reason: 'Review in progress' }), bot('coderabbit')] },
+    reviews: { findings: [finding()], replies: [], bots: [absent('greptile', { state: 'working', reason: 'Review in progress' }), bot('coderabbit')] },
   })
   assert.equal(result.state.expectedHead, shaFor(1))
   assert.equal(result.reason, 'maxCycles reached')
@@ -5498,14 +5499,14 @@ test('a last cycle that pushed reports the budget spent, not old-head records on
 test('a push in a yielding launch leaves the old clock; the resume starts a new one on the pushed head', async () => {
   const a = await run({
     args: { ...THREE, autoPush: true, maxCycles: 3, yieldAfterCycle: true },
-    reviews: { findings: [finding()], replies: [], bots: [bot('codex'), absent('copilot'), bot('coderabbit')] },
+    reviews: { findings: [finding()], replies: [], bots: [absent('greptile'), bot('coderabbit')] },
   })
   assert.equal(a.result.state.expectedHead, shaFor(1))
   assert.equal(a.result.state.reviewClock.sha, HEAD)
   const b = await run({
     args: { ...THREE, autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: a.result.state }, clockOffset: 20,
     preflight: { head: shaFor(1), prHead: shaFor(1) },
-    reviews: quiet([bot('codex'), absent('copilot'), bot('coderabbit')]),
+    reviews: quiet([absent('greptile'), bot('coderabbit')]),
   })
   assert.equal(b.result.reason, 'yielded', `${b.result.reason}: twenty minutes on the old head do not count`)
   assert.deepEqual(b.result.state.reviewClock, { sha: shaFor(1), eventAt: null, since: at(20) })
