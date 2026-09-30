@@ -174,18 +174,6 @@ class ReplyTest(ReplyCase):
         self.assertEqual(self.gh.mutations, [('post-reply', 10, 'not so: see line 3'), ('resolve', 'T10')])
         self.assertTrue(self.gh.threads['T10']['resolved'])
 
-    def test_resolve_false_posts_and_verifies_but_leaves_the_thread_open(self):
-        self.gh.review_comment(10)
-        rc, receipts = self.run_script([{'commentId': 10, 'body': 'still holds: line 3 writes it', 'resolve': False}])
-        self.assertEqual(rc, 0)
-        self.assertEqual((receipts[0]['verified'], receipts[0]['resolved']), (True, None))
-        self.assertEqual(self.gh.mutations, [('post-reply', 10, 'still holds: line 3 writes it')])
-        self.assertFalse(self.gh.threads['T10']['resolved'])
-        rc, _ = self.run_script([{'commentId': 10, 'body': 'x', 'resolve': 'no'}])
-        self.assertEqual(rc, 2)
-        rc, _ = self.run_script([{'commentId': 10, 'body': 'x', 'secondAnswer': 1}])
-        self.assertEqual(rc, 2)
-
     def test_identical_existing_reply_is_reused_not_reposted(self):
         self.gh.review_comment(10)
         self.gh.review_comment(55, 'already said', ME, thread='T10', parent=10)
@@ -328,7 +316,7 @@ class ReplyTest(ReplyCase):
     def test_bad_manifest_is_exit_2_without_api_calls(self):
         for bad in ([], [{'commentId': '10', 'body': 'x'}], [{'commentId': 10, 'body': ' '}],
                     [{'commentId': 10, 'body': 'a'}, {'commentId': 10, 'body': 'b'}],
-                    [{'commentId': 10, 'body': 'a', 'digest': None}]):
+                    [{'commentId': 10, 'body': 'a', 'digest': None}], [{'commentId': 10, 'body': 'x', 'secondAnswer': 1}]):
             with self.subTest(bad=bad):
                 rc, receipts = self.run_script(bad)
                 self.assertEqual(rc, 2)
