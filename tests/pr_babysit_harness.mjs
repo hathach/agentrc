@@ -137,14 +137,14 @@ const quotedAfter = (prefix) => (prompt) => {
 const pathLine = quotedAfter(/commits\.py commit/)
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
-// push.py's receipt: what the pinned push URL holds after the push, and the PR
-// head when the workflow asked for it.
 // The failing checks collect.py lists for a CI fixture: a failure with no
 // workflow is a SonarCloud-style check whose link names no run (its own `link`
 // when the fixture gives one); every other one is an Actions job.
 const failedChecks = (ci) => (ci.realFailures || []).map((rf, i) => rf.workflow === ''
   ? { name: rf.check, workflow: '', bucket: ci.bucket ?? 'fail', link: rf.link ?? `https://sonarcloud.io/dashboard?id=o_r&pullRequest=${i + 1}`, attempt: null }
   : { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}` })
+// push.py's receipt: what the pinned push URL holds after the push, and the PR
+// head when the workflow asked for it.
 const receiptOf = (head, prHead, detail, pushed = true) => ({
   pushed, detail, heads: PIN.pushUrls.map(url => ({ url, head })), ...(prHead === undefined ? {} : { prHead }),
 })
@@ -1595,7 +1595,7 @@ test('a review push that lands while the evidence is read supersedes the judge',
   assert.ok(logs.some(l => /review-lane push superseded the CI run/.test(l)), logs.join('\n'))
 })
 
-// --- CI verdicts: digests carried in the state, verdicts in collect.py's store ---
+// CI verdicts: digests carried in the state, verdicts in collect.py's store
 
 const RIG = { check: 'hil / pico', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }
 const WAITING = { findings: [], replies: [], bots: 'pending' }
@@ -1865,7 +1865,7 @@ test('the CI contract names the three verdicts and nothing else', async () => {
   assert.equal(item.additionalProperties, false)
 })
 
-// --- caller-accepted CI failures ---
+// caller-accepted CI failures
 
 const PVS = { check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', firstError: 'exit 2 after Analysis finished', files: [], verdict: 'rig-side' }
 const accept = (over = {}) => ({ workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
@@ -2538,9 +2538,7 @@ test('the summary marks an overturned finding', async () => {
 })
 
 test('a deferred obligation is cleared only by a posted reply', async () => {
-  // Cycle 1 defers comment 7 (one overturned, one upheld). A later cycle sees
-  // the upheld one and the fixed one, now stale, posts it, and that posting is
-  // what clears the deferral.
+  // Cycle 1 defers comment 7; only a later cycle's posted refutation clears it.
   let cycle = 0
   const { result } = await run({
     args: { autoPush: true, maxCycles: 4 },
@@ -2704,9 +2702,7 @@ test('an already-answered comment is not deferred for a missing draft', async ()
 })
 
 test('an obligation dies with the finding that created it', async () => {
-  // Cycle 1 defers a mixed comment. Cycle 2 overturns its refuted half, so
-  // nothing is owed but a fix note. A stored obligation would outlive its
-  // cause here and end the run as unresolved with nothing actually owed.
+  // Cycle 2 overturns the refuted half of cycle 1's mixed comment: only a fix note is owed.
   let cycle = 0
   const { result } = await run({
     args: { autoPush: true, maxCycles: 4 },
@@ -2726,9 +2722,7 @@ test('an obligation dies with the finding that created it', async () => {
 })
 
 test('overturning one refutation does not excuse a vanished sibling', async () => {
-  // Comment 7 owes two refutations. The next harvest drops one and the
-  // challenger overturns the other; the fix note then resolves the thread. The
-  // dropped dismissal was never answered, so it still holds the loop open.
+  // Of comment 7's two refutations one is dropped and one overturned: the dropped one is still owed.
   let cycle = 0
   const { result } = await run({
     args: { autoPush: true, maxCycles: 4 },
@@ -2864,9 +2858,7 @@ test('a dry run reports refutations it would post rather than deferring them', a
 })
 
 test('a dropped dismissal survives a later harvest that reports fewer', async () => {
-  // Comment 7 owes two refutations. The next harvest reports only one, and the
-  // one after overturns and fixes it. Taking that shrinking harvest as the
-  // standing debt would forget the dismissal nobody ever answered.
+  // Comment 7 owes two refutations; later harvests report one, then overturn and fix it.
   let cycle = 0
   const { result } = await run({
     args: { autoPush: true, maxCycles: 5 },
@@ -3241,7 +3233,7 @@ test('a held id from before an edit is not named as the edited body\'s', async (
   assert.match(calls.find(c => c.label === 'reviews#3').prompt, /\[\{"commentId":1,"findingIds":\["1#1"\]\}\]/)
 })
 
-// --- caller-approved deferrals ---
+// caller-approved deferrals
 
 const ISSUE = 'https://github.com/hathach/tinyusb/issues/4000'
 const deferral = (over = {}) => ({ findingId: '1#1', commentDigest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR', ...over })
@@ -3400,7 +3392,7 @@ test('a dry run applies a deferral but posts nothing', async () => {
   assert.deepEqual(result.state.deferrals.map(([id]) => id), ['1#1'])
 })
 
-// --- decision continuity ---
+// decision continuity
 
 // A launch refutes comment 1 and posts it; the resumed launch harvests `then`.
 const refutedThen = async (then, over = {}) => {
@@ -4107,9 +4099,7 @@ test('the lane is not part of the state a launch must match', async () => {
 })
 
 test('debt and the pushed head carry across a lane switch', async () => {
-  // A reviews launch pushes a fix and leaves a refutation owed; the ci launch
-  // after it must start at the pushed head and keep the debt; the both launch
-  // then pays it and completes.
+  // reviews pushes and owes a refutation, ci keeps both, both pays it and completes.
   const reviews1 = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
   const first = await run({
     args: { lane: 'reviews', yieldAfterCycle: true, maxCycles: 4 },
@@ -4152,9 +4142,7 @@ test('a dry run still runs the fixers it is allowed to run', async () => {
 })
 
 test('re-overturning a finding does not retire a different dismissal', async () => {
-  // Comment 7 owes A and B. B is overturned and fixed, then reported and
-  // overturned again in a later cycle. Retiring by count would spend that
-  // second overturn on A, which nobody ever answered.
+  // B is overturned twice; retiring by count would spend the second on A, never answered.
   let cycle = 0
   const { result } = await run({
     args: { autoPush: true, maxCycles: 5 },
@@ -4194,9 +4182,7 @@ test('a dry run runs the CI fixer before reporting withheld replies', async () =
 })
 
 test('a dismissal survives the fix that moves its line', async () => {
-  // Comment 7 owes A and B. B is overturned and fixed; A comes back at a new
-  // line after that fix, is overturned and fixed too. Keying the dismissal on
-  // the location would leave A's original key outstanding forever.
+  // A returns at a new line after B's fix: a location key would leave A's first key owed forever.
   let cycle = 0
   const A = (over) => invalidFinding({ commentId: 7, findingId: '7#1', line: 10, ...over })
   const { result } = await run({
@@ -4308,7 +4294,7 @@ test('a commit that leaves an owned change behind is not pushed', async () => {
   assert.ok(logs.some(l => /committed but NOT pushed — commit left owned change/.test(l)))
 })
 
-// --- yielding launches: one cycle per launch, the ledger carried in `state` ---
+// yielding launches: one cycle per launch, the ledger carried in `state`
 
 // A debt-bearing first launch: one dismissal the validator drafted no reply for,
 // so the cycle re-arms instead of passing. Yielding turns that re-arm into a pause.
@@ -4457,7 +4443,7 @@ test('a state from a run with other arguments, or of another shape, is refused',
   await assert.rejects(run({ args: { maxCycles: 3, state: { version: 0 } } }), /not a pr-babysit state/)
 })
 
-// --- adopting an audited local chain without resetting the carried ledger ---
+// adopting an audited local chain without resetting the carried ledger
 
 test('adoption publishes before cycle watchers and reviews the adopted head', async () => {
   const state = adoptionState()
@@ -4898,7 +4884,7 @@ test('every result carries a status, an observation and the state', async () => 
 })
 
 
-// --- hook-regenerated paths: admitted from the hooks' own evidence, never by the committer ---
+// hook-regenerated paths: admitted from the hooks' own evidence, never by the committer
 
 const gen = (base, extra = {}) => ({
   after: [...base.after, ' M docs/boards.rst'], modifiedBy: ['gen-doc'],
@@ -5019,9 +5005,7 @@ test('a commit that landed but was not pushed is a pending candidate in the stat
 
 
 test('an owned path the fix did not change, or deleted, is still complete evidence', async () => {
-  // Scope {a.c, b.c}, the fix touched only a.c: b.c is snapshotted unchanged, and
-  // ls-tree still lists it. A deleted owned path is `absent` before and after and
-  // must be absent from the commit's tree too.
+  // b.c is unchanged and still in ls-tree; a deleted owned path is `absent` on every side.
   const twoFiles = (b) => ({ ...publishing, reviews: { findings: [finding(), finding({ file: b, line: 2 })], replies: [], bots: 'reviewed' } })
   const quiet = await run({
     ...twoFiles('src/b.c'),
@@ -5098,7 +5082,7 @@ test('a commit whose audit died is a pending candidate with an unknown SHA', asy
   assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ committed \(SHA unknown\), NOT PUSHED: audit agent/)
 })
 
-// --- the commit message: the human is the sole author ---
+// the commit message: the human is the sole author
 
 test('the committer is told the authorship rule', async () => {
   const { calls } = await run({ ...publishing })
@@ -5144,7 +5128,7 @@ test('a message that talks about attribution, or a human sign-off, is not attrib
   }
 })
 
-// --- build-regenerated paths: a declared tracked modification, vouched for by the hooks ---
+// build-regenerated paths: a declared tracked modification, vouched for by the hooks
 
 const CATALOG = 'hw/bsp/family.json'
 const regen = { ...publishing, args: { ...publishing.args, generated: '^hw/bsp/family\\.json$' }, recheck: { status: [' M src/a.c', ` M ${CATALOG}`] } }
@@ -5249,7 +5233,7 @@ test('a restored state records the generated pattern in its config', async () =>
   await assert.rejects(run({ ...publishing, args: { ...publishing.args, yieldAfterCycle: true, maxCycles: 2, state: first.result.state } }), /different arguments/)
 })
 
-// ---- reviewer state: one record per auto-running bot, settled by the workflow ----
+// reviewer state: one record per auto-running bot, settled by the workflow
 
 const absent = (name, over = {}) => bot(name, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head', ...over })
 const quiet = (bots) => ({ findings: [], replies: [], bots })

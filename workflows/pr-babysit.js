@@ -178,10 +178,10 @@ if (args.stateRef != null) {
   // Only an agent can read the file, and a model copying text "corrects" it, so
   // the loader copies state_transfer.py's opaque base64 chunks instead; each
   // chunk's sum finds a mis-copy to ask for again, and the seal checks the whole.
+  // Sonnet, not Haiku: Haiku mis-copies the same chunks on every retry.
   const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
   const SIZE = 512
-  const PER_CALL = 4 // a live sonnet copy of 9 chunks truncated and spliced them
-  // sonnet, not haiku: on five real 4-6 KB states haiku never loaded three, mis-copying the same chunks on every retry (2026-09-25)
+  const PER_CALL = 4 // more chunks to a call come back truncated and spliced
   const MAX = 64 * 1024
   const ROUNDS = 6
   const ENVELOPE = {
@@ -378,7 +378,7 @@ const VERDICT = {
   properties: { link: { type: 'string' }, bucket: { type: 'string' }, failures: { type: 'array', items: CI_FAILURE } },
 }
 // collect.py's RECALL_BYTES bounds a recall line; the count keeps the calls parallel and a
-// failed seal's cost to its own batch (#9: #3988's 40 verdicts in one line failed twice).
+// failed seal's cost to its own batch (#9).
 const RECALL_PER_CALL = 5
 // `left`: the asked links collect.py held back to keep its line short enough to relay,
 // each with where the pages of its verdict start.
@@ -621,9 +621,7 @@ const RECHECK = withSeal({
   },
 })
 // What running the repository's hooks on the owned paths did, as HOOKS_SCRIPT
-// reports it: the tree before and after, the owned files' blob hashes before and
-// after, and which hooks said they modified files. The workflow decides from
-// these what a hook regenerated.
+// reports it; the workflow decides from it what a hook regenerated.
 const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['ran', 'passed', 'modifiedBy', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
@@ -730,8 +728,7 @@ const withNulls = (s, v) => {
   return out
 }
 // A copy that does not match the seal its script put on the line is no answer: the
-// caller's dead-relay path, never a value a relay changed (a live one cut a SHA to 35
-// characters). An error line carries no seal.
+// caller's dead-relay path, never a value a relay changed. An error line carries no seal.
 const relayAgent = async (prompt, opts) => {
   const v = await agent(prompt, { ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
   if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
@@ -889,10 +886,6 @@ const launchFrom = history.length
 // The checks the CI judge re-ran, per head: until its re-run registers, a check
 // still shows its old link, and a check by the same name is never re-run twice.
 const ciReruns = restored ? restored.ciCache.reruns : []
-// Verdicts by check link. Only a link naming its run is kept, and never an
-// unclassified verdict, which a newer base run may still place; a changed
-// ciNotes can change any verdict, so it discards them all. An entry holds its
-// failures once judged or recalled.
 // One record per check run on a head; a known re-run replaces a possible one.
 const noteRerun = (r) => {
   const i = ciReruns.findIndex(x => x.head === r.head && x.link === r.link)
@@ -900,6 +893,10 @@ const noteRerun = (r) => {
   else if (r.sure) ciReruns[i] = r
 }
 const notesDigest = fnv1a(ciNotes)
+// Verdicts by check link. Only a link naming its run is kept, and never an
+// unclassified verdict, which a newer base run may still place; a changed
+// ciNotes can change any verdict, so it discards them all. An entry holds its
+// failures once judged or recalled.
 const ciVerdicts = new Map()
 let ciJudgedHead = restored ? restored.ciCache.judgedHead : null
 if (restored) {
@@ -940,7 +937,6 @@ const decisions = new Map(restored ? restored.decisions : [])
 // nothing. `against` is the earlier decision it contradicted, if any.
 const holds = new Map(restored ? restored.holds : [])
 const heldComments = () => new Set([...holds.values()].map(h => h.commentId))
-// Every comment still owed an answer: its debt, or a held point on it.
 const outstanding = () => [...new Set([...debt.keys(), ...heldComments()])]
 // Posted refutations this launch found wrong, for the caller to correct.
 const corrections = []
@@ -998,9 +994,6 @@ const stateOut = () => {
   }
   return { ...st, digest: sealOf(st) }
 }
-// Every result carries a status the caller can act on without reading the reason
-// (complete: passed; paused: a whole cycle ran and another may follow; blocked:
-// something needs attention first), what the last cycle observed, and the state.
 // What became of a finding or a CI failure, for the per-cycle table and the launch
 // rollup alike; each words a `valid` finding or a `real` failure its own way.
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
@@ -1041,6 +1034,9 @@ const launchRollup = () => {
     reran: reran.size, pushed, replies,
   }
 }
+// Every result carries a status the caller can act on without reading the reason
+// (complete: passed; paused: a whole cycle ran and another may follow; blocked:
+// something needs attention first), what the last cycle observed, and the state.
 const finish = (verdict, status) => {
   const last = history[history.length - 1] || null
   const observation = {
@@ -1073,11 +1069,11 @@ const owesDismissal = (commentId) => {
 // the claim, either of which would strand the dismissal it was meant to retire.
 // The contract that makes it stable lives in pr-review-validator.md.
 const dismissalKey = (f) => f.findingId
-// dryRun says the debt was never postable, so a caller can tell an intentionally
-// unposted obligation from a reply workflow that failed.
 // Red only from failures the caller accepted, with nothing still re-running.
 const acceptedOnly = (c) => c.status === 'red' && c.realFailures.length > 0 && c.realFailures.every(rf => rf.accepted) && c.infraRerun.length === 0
 
+// dryRun says the debt was never postable, so a caller can tell an intentionally
+// unposted obligation from a reply workflow that failed.
 const unresolvedVerdict = (cycles, deferred, dryRun = false) =>
   ({ pass: false, cycles, history, reason: 'deferred-replies-unresolved', deferred, dryRun })
 
@@ -1144,7 +1140,6 @@ const botCell = (b, waitedMin) => {
 const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
   : rs.bots.map(b => `${b.bot} ${botCell(b, rs.waitedMin)}`).join(' · ')
 
-// Backoff between cycles that have nothing to do but wait.
 const nap = (ms) => new Promise(res => setTimeout(res, ms))
 
 // The only host this workflow will ask a publisher to push to. Widening it is
@@ -1209,9 +1204,8 @@ const IDE_DRIFT = /^(?:.*\/)?\.idea\//
 const ideDrift = (path) => IDE_DRIFT.test(path)
 const withoutIdeDrift = (lines) => lines.filter(l => !ideDrift(pathOf(l)))
 
-// Group actionable notes by top-level scope (plain JS — no model tokens).
-// A note keeps its id alongside its text so the cycle summary can still map a
-// finding to the fix that handled it after grouping and merging.
+// Group actionable notes by top-level scope. A note keeps its id so the cycle
+// summary can still map a finding to the fix that handled it after merging.
 const groupWork = (notes) => {
   const groups = new Map()
   for (const n of notes) {
@@ -1224,11 +1218,6 @@ const groupWork = (notes) => {
   return [...groups.values()]
 }
 
-// The batch built once, as it settled: a writer's own build ran beside its
-// siblings' unfinished edits and proves nothing about the whole. A failing
-// candidate is compared with the pinned head, since a target broken there is
-// broken for every fix. { block } when it may not be published, else { note },
-// what the build left unverified.
 // A resolved build plan per owned path set, reused by later cycles of this launch
 // with the setup a base build resolved into it. It is dropped once a pushed
 // commit changes a file its resolver says it read the contract from, and one
@@ -1238,6 +1227,11 @@ const contractTouched = (plan, paths) => plan.contract.some(f => paths.has(canon
 // The caller's build still needs the repository's setup for the base, resolved
 // once per launch, and only if a base build is needed (setup undefined until then).
 const callerPlan = buildCmd && { command: buildCmd, setup: undefined, targets: [], options: [], reason: "the caller's build", error: null }
+// The batch built once, as it settled: a writer's own build ran beside its
+// siblings' unfinished edits and proves nothing about the whole. A failing
+// candidate is compared with the pinned head, since a target broken there is
+// broken for every fix. { block } when it may not be published, else { note },
+// what the build left unverified.
 const buildCheck = async (tag, owned) => {
   let plan = callerPlan
   if (!plan) {
@@ -1340,8 +1334,7 @@ const checkCompat = async (label, paths, brief) => {
 // was scoped, fixed by a live worker, AND passed finding-verifier verification.
 const fixAndVerify = async (workIn, tag) => {
   const textOf = (w) => w.notes.map(n => n.text).join('\n- ')
-  // The note ids ride along on the fix so the cycle summary can say which
-  // finding each fix answered, after grouping and the overlap merge.
+  // Note ids ride on the fix so the cycle summary can say which finding each fix answered.
   const verdictOf = (fix, w, addresses, checkReason) =>
     ({ ...fix, ids: w.notes.map(n => n.id), addresses, checkReason })
   // code-writer's contract needs an explicit file set: a group whose notes named no
@@ -1355,9 +1348,8 @@ const fixAndVerify = async (workIn, tag) => {
       'files = repo-relative paths; empty only if genuinely undeterminable.',
       { label: `scope:${w.key}`, phase: 'Fix', model: 'sonnet', schema: SCOPE },
     ).then(s => s && s.files.forEach(f => { const c = canon(f); if (c) w.files.add(c) }))))
-  // Scoped paths are model output: keep only what git ls-files confirms exists.
-  // The check is executed (by a mechanical agent) and intersected here — a dead
-  // checker drops every candidate, so unconfirmed groups fall through to withheld.
+  // Scoped paths are model output: keep only what git ls-files confirms exists. A dead
+  // checker confirms nothing, so its groups fall through to withheld.
   const candidates = [...new Set(fileless.flatMap(w => [...w.files]))]
   if (candidates.length > 0) {
     const v = await agent(
@@ -1464,7 +1456,6 @@ const fixAndVerify = async (workIn, tag) => {
   }
 }
 
-// ---- per-cycle scoreboard ----
 // One markdown row per validated bot finding (and real CI failure): what the bot
 // claimed, the verdict, what happened to it, and the commit carrying the fix.
 // A finding is identified by its commentId (as it already is for replies); a CI
@@ -2116,7 +2107,6 @@ const ciLaneRun = async (cycle, lanes) => {
     return relayOnce(prompt(command), { label, phase: 'Triage', model: 'haiku', effort: 'low', schema },
       prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')))
   }
-  // What went wrong with a collector's answer for `head`, or null when nothing did.
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
   // An answer covers the asked links (distinct) when it names each exactly once.
@@ -2641,7 +2631,7 @@ const runCycle = async (cycle, entry) => {
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
-    // ---- review lane: fix + push without waiting for CI ----
+    // Review lane: fix and push without waiting for CI.
     const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
@@ -2685,7 +2675,7 @@ const runCycle = async (cycle, entry) => {
       }
     }
 
-    // ---- CI lane result ----
+    // CI lane result.
     lanes.reviewDone = true
     if (!ciLane) {
       log(`cycle ${cycle}: reviews lane only — CI not observed, no verdict this launch`)
@@ -2813,9 +2803,8 @@ const runCycle = async (cycle, entry) => {
       return null
     }
     if (!reviewsSettled) {
-      // A bot has not reported for this head SHA yet. With CI already green there is
-      // nothing else to wait on, so back off before re-arming or the cycle budget
-      // burns on back-to-back re-harvests of the same unchanged PR.
+      // CI is green and only a bot is pending: back off, or the cycle budget burns on
+      // back-to-back re-harvests of the same unchanged PR.
       const who = pendingBots.map(b => `${b.bot} ${botCell(b, entry.bots.waitedMin)}`).join('; ')
       if (cycle < maxCycles) {
         log(`cycle ${cycle}: auto-review still pending (${who}) — re-arming after a wait`)
