@@ -2,7 +2,7 @@
 """Collect a PR's CI state for a watcher, so no model spends turns waiting or listing.
 
   collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S]
-  collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...] [--prior-head SHA]
+  collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
@@ -39,10 +39,11 @@ onBase, baseLineNo, baseLine, prior}; line and baseLine are 500-character
 previews of rows the saved logs hold whole. onBase compares the base run's row
 for the cell: same-failure, other-failure, passed, other (a skip), not-run, or
 null without a comparable base run. A signature is the error's first segment,
-so two different errors can share one: same-failure and prior are leads. With
---prior-head, prior lists the verdicts stored for the same check, cell and
-signature on that head, [{head, verdict, firstError}], more than one when
-ambiguous, and is absent when none match. A cell row is left out of
+so two different errors can share one: same-failure and prior are leads. prior
+lists the verdicts stored for the same workflow, check, cell and signature on the
+newest other head of the PR that has one, [{head, verdict, firstError}], more than
+one when ambiguous, and is absent when none match; the detail file's `priorErrors`
+names each other head whose store could not be read and was left out. A cell row is left out of
 `diagnostics` and `shared`, on both sides; `firstError` still reads it. A failed
 step that ran hil_test.py but printed no parsed row gets `cellsError` instead.
 When any check was read, the detail file lists the PR's `changed`
@@ -520,16 +521,40 @@ def circle(repo, number, folder):
 
 
 def prior_verdicts(repo, pr, head, entries):
-    """Each cell's stored verdicts on another head, matched on check, cell and signature."""
-    index = {}
-    for stored in stored_verdicts(evidence_dir(repo, pr, head)).values():
-        for f in stored.get('failures') or []:
-            index.setdefault((f.get('check'), f.get('cell'), f.get('signature')), []).append(f)
+    """Each cell's verdicts from the newest other head of the PR that stored one for its workflow,
+    check, cell and signature: a head judged only in part leaves the rest to an older one. Two
+    workflows may name a job alike, so a verdict with no workflow name matches nothing. Returns the
+    other heads whose store could not be read, which are left out."""
+    if not any(entry.get('cells') for entry in entries):
+        return []
+    index, unread, stores = {}, [], []
+    for folder in evidence_dir(repo, pr, head).parent.iterdir():
+        try:
+            stores.append(((folder / 'verdicts.json').stat().st_mtime, folder))
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            unread.append(f'{folder.name}: {e}')
+    for _, folder in sorted(stores, reverse=True):
+        if folder.name == head:
+            continue
+        found = {}
+        try:
+            for stored in stored_verdicts(folder).values():
+                for f in stored.get('failures') or []:
+                    if f.get('workflow'):
+                        found.setdefault((f['workflow'], f.get('check'), f.get('cell'), f.get('signature')), []).append(
+                            {'head': folder.name, 'verdict': f.get('verdict'), 'firstError': f.get('firstError')})
+        except (Failed, OSError, AttributeError, TypeError) as e:
+            unread.append(f'{folder.name}: {e}')
+            continue
+        index = {**found, **index}
     for entry in entries:
         for c in entry.get('cells') or []:
-            found = index.get((entry['name'], c['cell'], c['signature']))
-            if found:
-                c['prior'] = [{'head': head, 'verdict': f.get('verdict'), 'firstError': f.get('firstError')} for f in found]
+            prior = index.get((entry.get('workflow'), entry['name'], c['cell'], c['signature']))
+            if prior:
+                c['prior'] = prior
+    return unread
 
 
 def changed_paths(repo, pr):
@@ -543,7 +568,7 @@ def changed_paths(repo, pr):
     return names, None
 
 
-def failures(repo, pr, head, links, prior_head=None, gates=()):
+def failures(repo, pr, head, links, gates=()):
     now = inventory(repo, pr, head, 0)
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
     stale = [link for link in (*links, *gates) if link not in failing]
@@ -568,10 +593,9 @@ def failures(repo, pr, head, links, prior_head=None, gates=()):
         except (Failed, rtd.Failed, circleci.Failed) as e:
             entry['error'] = str(e)
         checks.append(entry)
-    if prior_head:
-        prior_verdicts(repo, pr, prior_head, checks)
+    unread = prior_verdicts(repo, pr, head, checks)
     read = [gate(link, pr) for link in gates]
-    out = {'head': head, 'baseRef': now['baseRef']}
+    out = {'head': head, 'baseRef': now['baseRef'], **({'priorErrors': unread} if unread else {})}
     if any(c['error'] is None for c in checks):
         out['changed'], why = changed_paths(repo, pr)
         if why:
@@ -595,11 +619,8 @@ def main(argv=None):
     p.add_argument('--wait-seconds', type=int, default=0)
     p.add_argument('--check', action='append', default=[], metavar='LINK')
     p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
-    p.add_argument('--prior-head', help='failures: the head whose stored verdicts to show beside matching cells')
     p.add_argument('--offset', type=int, help='recall: where the page to print starts, of the lone --check')
     a = p.parse_args(argv)
-    if a.prior_head and (a.command != 'failures' or not SHA.fullmatch(a.prior_head) or a.prior_head == a.head):
-        p.error('--prior-head is for failures: a full 40-hex SHA other than --head')
     if a.offset is not None and (a.command != 'recall' or len(a.check) != 1):
         p.error('--offset is for recall with exactly one --check')
     if a.gate and a.command != 'failures':
@@ -614,7 +635,7 @@ def main(argv=None):
         if a.command == 'inventory':
             out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)))
         elif a.command == 'failures':
-            out = failures(a.repo, a.pr, a.head, a.check, a.prior_head, a.gate)
+            out = failures(a.repo, a.pr, a.head, a.check, a.gate)
         elif a.command == 'remember':
             out = remember(a.repo, a.pr, a.head, sys.stdin.read())
         else:

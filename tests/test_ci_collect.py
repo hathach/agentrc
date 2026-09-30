@@ -2,6 +2,7 @@
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -350,25 +351,54 @@ class FailuresTest(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(collect.main(['remember', '--repo', 'o/r', '--pr', '5', '--head', head]), 0)
 
-    def test_a_prior_verdict_shows_beside_the_cell_it_matches_by_check_cell_and_signature(self):
-        judged = {'check': 'hil (x.json)', 'cell': 'pico host/msc', 'signature': 'pico host/msc: Failed: src/host/msc.c timeout',
-                  'verdict': 'rig-side', 'firstError': 'probe'}
-        self.remember_on(OTHER, [judged, {**judged, 'cell': 'rp2 device/hid', 'signature': 'something else'}])
-        rc, r = self.main(JOB.format(3), extra=('--prior-head', OTHER))
-        cells = json.loads(Path(r['detail']).read_text())['checks'][0]['cells']
-        self.assertEqual([x.get('prior') for x in cells], [[{'head': OTHER, 'verdict': 'rig-side', 'firstError': 'probe'}], None])
-        self.assertNotIn('prior', self.entries(JOB.format(3))[0]['cells'][0], 'only when the caller names the head')
-        self.remember_on(OTHER, [judged, {**judged, 'verdict': 'real'}])
-        rc, r = self.main(JOB.format(3), extra=('--prior-head', OTHER))
-        self.assertEqual([v['verdict'] for v in json.loads(Path(r['detail']).read_text())['checks'][0]['cells'][0]['prior']],
-                         ['rig-side', 'real'], 'both, for the judge to weigh: ambiguous')
+    def cell_priors(self):
+        return [x.get('prior') for x in self.entries(JOB.format(3))[0]['cells']]
 
-    def test_prior_head_is_a_full_sha_other_than_the_head_and_only_for_failures(self):
-        for extra in (['--prior-head', HEAD], ['--prior-head', 'b' * 7]):
-            with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
-                self.main(JOB.format(3), extra=extra)
-        with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
-            collect.main(['inventory', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--prior-head', OTHER])
+    def test_a_prior_verdict_shows_beside_the_cell_it_matches_by_workflow_check_cell_and_signature(self):
+        judged = {'workflow': 'Build', 'check': 'hil (x.json)', 'cell': 'pico host/msc', 'signature': 'pico host/msc: Failed: src/host/msc.c timeout',
+                  'verdict': 'rig-side', 'firstError': 'probe'}
+        self.assertEqual(self.cell_priors(), [None, None], 'nothing stored yet')
+        self.remember_on(OTHER, [judged, {**judged, 'cell': 'rp2 device/hid', 'signature': 'something else'}])
+        self.remember_on(HEAD, [{**judged, 'verdict': 'real'}])
+        self.assertEqual(self.cell_priors(), [[{'head': OTHER, 'verdict': 'rig-side', 'firstError': 'probe'}], None], 'another head\'s, never its own')
+        self.remember_on(OTHER, [{**judged, 'workflow': 'Nightly'}])
+        self.assertEqual(self.cell_priors()[0], None, 'another workflow\'s job of the same name')
+        self.remember_on(OTHER, [judged, {**judged, 'verdict': 'real'}])
+        self.assertEqual([v['verdict'] for v in self.cell_priors()[0]], ['rig-side', 'real'], 'both, for the judge to weigh: ambiguous')
+        self.remember_on(OTHER, [{**judged, 'workflow': ''}])
+        self.jobs['3']['workflow_name'] = ''
+        self.assertEqual(self.cell_priors()[0], None, 'no workflow name on either side matches nothing')
+
+    def test_each_cell_takes_the_newest_other_head_that_judged_it(self):
+        first, second = ({'workflow': 'Build', 'check': 'hil (x.json)', 'cell': c['cell'], 'signature': c['signature'], 'verdict': 'rig-side', 'firstError': 'old'}
+                         for c in self.entries(JOB.format(3))[0]['cells'])
+        newer = 'c' * 40
+        self.remember_on(OTHER, [first, second])
+        self.remember_on(newer, [{**first, 'verdict': 'real', 'firstError': 'new'}])
+        os.utime(collect.evidence_dir('o/r', 5, OTHER) / 'verdicts.json', (1, 1))
+        self.assertEqual([[(p['head'], p['firstError']) for p in x] for x in self.cell_priors()], [[(newer, 'new')], [(OTHER, 'old')]],
+                         'a head judged in part leaves the rest to an older one')
+
+    def test_an_unreadable_store_of_another_head_is_named_and_left_out(self):
+        judged = {'workflow': 'Build', 'check': 'hil (x.json)', 'cell': 'pico host/msc', 'signature': 'pico host/msc: Failed: src/host/msc.c timeout',
+                  'verdict': 'rig-side', 'firstError': 'probe'}
+        self.remember_on(OTHER, [judged])
+        for garbled in ('{', '{"x": 7}'):
+            (collect.evidence_dir('o/r', 5, 'c' * 40) / 'verdicts.json').write_text(garbled)
+            rc, r = self.main(JOB.format(3))
+            detail = json.loads(Path(r['detail']).read_text())
+            self.assertEqual(rc, 0)
+            self.assertEqual([e.split(':')[0] for e in detail['priorErrors']], ['c' * 40])
+            self.assertEqual(detail['checks'][0]['cells'][0]['prior'][0]['head'], OTHER)
+        self.assertNotIn('priorErrors', json.loads(Path(self.main(RTD.format(9))[1]['detail']).read_text()), 'no cells, no store read')
+        denied = collect.evidence_dir('o/r', 5, 'c' * 40) / 'verdicts.json'
+        read, stat = collect.stored_verdicts, Path.stat
+        for patch in (mock.patch.object(collect, 'stored_verdicts', lambda folder: (_ for _ in ()).throw(PermissionError('denied')) if folder == denied.parent else read(folder)),
+                      mock.patch.object(Path, 'stat', lambda path, **kw: (_ for _ in ()).throw(PermissionError('denied')) if path == denied else stat(path, **kw))):
+            with patch:
+                rc, r = self.main(JOB.format(3))
+            detail = json.loads(Path(r['detail']).read_text())
+            self.assertEqual((rc, detail['priorErrors'], detail['checks'][0]['cells'][0]['prior'][0]['head']), (0, [f'{"c" * 40}: denied'], OTHER))
 
     def test_read_the_docs_evidence_is_the_failed_commands_last_line(self):
         c = self.entries(RTD.format(9))[0]

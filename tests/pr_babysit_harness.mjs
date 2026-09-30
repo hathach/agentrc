@@ -87,7 +87,7 @@ const adoptionState = ({
     protected: protectedPattern === null ? null : new RegExp(protectedPattern).source, generated: null,
   },
   build: null, cyclesUsed, maxCycles, answeredWith: [], deferrals: [], acceptedFailures: [], decisions: [], holds: [],
-  ciCache: { judgedHead: null, reruns: [], entries: [] }, debt: [],
+  ciCache: { reruns: [], entries: [] }, debt: [],
   last: cyclesUsed ? { cycle: cyclesUsed, head: HEAD } : null, ...over,
 })
 const adoptionArgs = (state, over = {}) => ({
@@ -1630,17 +1630,15 @@ test('a same-head relaunch recalls the judged verdicts from the store: no judge'
   assert.deepEqual(ciLabels(noted.labels), ['ci:collect#2.1', 'ci:collect#2.r1'], 'new ciNotes leave a stored verdict standing, in a state saved with notesDigest too')
 })
 
-test('the last judged head is carried, and a later head\'s evidence shows its verdicts beside the matching failures', async () => {
+test('the evidence of every head is read without a prior head: collect.py finds the other heads\' verdicts itself', async () => {
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.doesNotMatch(first.calls.find(c => c.label === 'ci:collect#1.f').prompt, /--prior-head/, 'nothing judged before')
-  assert.equal(first.result.state.ciCache.judgedHead, HEAD)
+  assert.doesNotMatch(first.calls.find(c => c.label === 'ci:collect#1.f').prompt, /--prior-head/)
   const st = first.result.state
-  const OLD = 'b'.repeat(40)
-  const later = await run({ store, args: { ...YIELD, state: seal({ ...st, ciCache: { ...st.ciCache, judgedHead: OLD, entries: [] } }) }, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.match(later.calls.find(c => c.label === 'ci:collect#2.f').prompt, / --prior-head b{40} --repo /)
-  assert.equal(later.result.state.ciCache.judgedHead, HEAD)
-  await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache: { ...st.ciCache, judgedHead: 'b; rm -rf ~' } }) } }), /not a pr-babysit state/)
+  assert.deepEqual(Object.keys(st.ciCache).sort(), ['entries', 'reruns'])
+  const older = await run({ store, args: { ...YIELD, state: seal({ ...st, ciCache: { ...st.ciCache, judgedHead: 'b'.repeat(40) } }) }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.equal(older.result.pass, false, 'an older state\'s judgedHead still loads')
+  assert.deepEqual(Object.keys(older.result.state.ciCache).sort(), ['entries', 'reruns'])
 })
 
 test('the same head in a later cycle is not judged again, and an unclassified verdict always is', async () => {
@@ -1841,7 +1839,7 @@ test('a state whose CI cache is malformed is refused', async () => {
   const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const { digest, ...st } = first.result.state
   for (const ciCache of [{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', bucket: 'fail', digest: 7 }] },
-    { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [], reruns: [] },
+    { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [] },
     { ...st.ciCache, entries: st.ciCache.entries.map(({ bucket, ...e }) => e) },
     { ...st.ciCache, entries: st.ciCache.entries.map(({ digest, ...e }) => e) }]) {
     await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache }) } }), /not a pr-babysit state/)
