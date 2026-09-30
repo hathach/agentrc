@@ -91,30 +91,16 @@ def git(cwd, *args, check=True):
 
 
 def box_of(gitdir, side, lane):
-    """A lane's box. The pre-lane layout, files directly under the side,
-    becomes its `main`: under that layout's own admission lock, and not
-    while a request of it still runs, since its runner would settle at the
-    old paths."""
-    side_dir = gitdir / 'cowork' / side
-    if side_dir.is_dir():
-        with admission(side_dir):  # that layout's lock, which stays where it is: whoever is moving files holds it
-            if (side_dir / 'session').is_file():
-                if any(held(lock) for lock in side_dir.glob('*.lock')):
-                    die(f'a request from the previous cowork layout still runs under {side_dir}; wait for it', BUSY)
-                (side_dir / 'main').mkdir(exist_ok=True)
-                for old in sorted(side_dir.iterdir(), key=lambda f: f.name == 'session'):  # the session last
-                    if old.is_file() and old.name != 'lock':
-                        old.rename(side_dir / 'main' / old.name)
-    return side_dir / lane
+    return gitdir / 'cowork' / side / lane
 
 
 def lanes(gitdir, side):
-    side_dir = box_of(gitdir, side, 'main').parent
+    side_dir = gitdir / 'cowork' / side
     return sorted(p.name for p in side_dir.iterdir() if p.is_dir()) if side_dir.is_dir() else []
 
 
 def boxes(gitdir):
-    return [gitdir / 'cowork' / side / lane for side in SIDES for lane in lanes(gitdir, side)]
+    return [box_of(gitdir, side, lane) for side in SIDES for lane in lanes(gitdir, side)]
 
 
 def kind(box):
@@ -627,7 +613,7 @@ def main(argv=None):
 
     root, gitdir = git_dir()
     if a.cmd == '_run':
-        run(a.side, gitdir / 'cowork' / a.side / a.lane, root, a.request, a.no_edit == '1', int(a.lock_fd))
+        run(a.side, box_of(gitdir, a.side, a.lane), root, a.request, a.no_edit == '1', int(a.lock_fd))
         return 0
 
     if a.cmd == 'send':
@@ -668,7 +654,7 @@ def main(argv=None):
         for side in SIDES:
             shown = 0
             for lane in lanes(gitdir, side):
-                box = gitdir / 'cowork' / side / lane
+                box = box_of(gitdir, side, lane)
                 with admission(box):  # a delivery in progress would remove files under state()
                     if not (box / 'session').exists() and not requests(box):
                         continue  # reset, and nothing since

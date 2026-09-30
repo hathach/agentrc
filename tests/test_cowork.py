@@ -918,26 +918,6 @@ class CoworkTest(unittest.TestCase):
         self.send('--lane', 'review', '--read-only', '--task', 'again')  # a reset lane can be created anew, of either kind
         self.assertEqual(self.calls()[-1]['cwd'], str(self.root))
 
-    def test_the_pre_lane_box_becomes_main(self):
-        old = self.box().parent
-        old.mkdir(parents=True)
-        (old / 'session').write_text('thread-42\ngpt-6-astra\nmedium\n')
-        (old / 'lock').touch()
-        (old / 'codex-x.task').write_text('p')
-        with (old / 'codex-x.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # a runner of the old layout, still there
-            code, _, err = self.run_cli('status')
-            self.assertEqual(code, cowork.BUSY)
-            self.assertIn('previous cowork layout still runs', err)
-            self.assertTrue((old / 'session').exists(), 'nothing moved')
-        (old / 'codex-x.task').unlink()
-        (old / 'codex-x.lock').unlink()
-        code, out, _ = self.run_cli('status')
-        self.assertIn('codex/main: session thread-42, gpt-6-astra at medium effort', out)
-        self.assertEqual(sorted(p.name for p in old.iterdir()), ['lock', 'main'], 'the legacy lock stays: it serialized the move')
-        self.send('--task', 'x')
-        self.assertEqual(self.calls()[0]['argv'][:3], ['exec', 'resume', 'thread-42'])
-
     def test_a_worktree_lane_survives_a_rewritten_host_history(self):
         self.commit('a.txt', 'a')
         tree = self.root / '.worktrees' / 'cowork-codex-impl'
