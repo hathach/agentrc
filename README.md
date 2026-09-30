@@ -3,15 +3,16 @@
 Personal agent config shared by Claude Code and Codex, versioned in git.
 
 ```
-install.py   symlinks chosen parts of this checkout into ~/.claude and ~/.codex
-instructions/user.md  user-wide instructions: ~/.claude/CLAUDE.md, also ~/.codex/AGENTS.md
-CLAUDE.md    instructions for work in this repository
-skills/      skills for both agents
-agents/      <name>.md for both agents, plus <name>.toml for Codex
-hooks/       Claude Code hooks, one folder each with a hooks.json
-workflows/   saved workflows (Claude only)
-statusline/  the Claude Code status line and its Codex usage fetcher
-tests/       unit tests for skill scripts, hooks and the installer
+install.py     symlinks chosen parts of this checkout into ~/.claude and ~/.codex
+instructions/  user.md, the user-wide instructions
+CLAUDE.md      instructions for work in this repository
+AGENTS.md      -> CLAUDE.md, for Codex
+skills/        skills for both agents
+agents/        <name>.md for both agents, plus <name>.toml for Codex
+hooks/         Claude Code hooks, one folder each with a hooks.json
+workflows/     saved workflows (Claude only)
+statusline/    the Claude Code status line and its Codex usage fetcher
+tests/         unit tests for skill scripts, hooks and the installer
 ```
 
 ## Install

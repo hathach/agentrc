@@ -9,11 +9,11 @@ Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 a skill's hooks of the same name into ~/.claude/hooks, with their hooks.json
 merged into ~/.claude/settings.json; workflows into ~/.claude/workflows
 (Claude only);
---claude-md links instructions/user.md as ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md; --statusline
-links the statusline/ files into ~/.claude and sets statusLine in its
-settings.json. Each flag takes every entry of its kind; nothing is selected
-by default. Everything is a symlink, so edits are live and a rerun after a
-change is a no-op.
+--claude-md links instructions/user.md as ~/.claude/CLAUDE.md and
+~/.codex/AGENTS.md; --statusline links the statusline/ files into ~/.claude
+and sets statusLine in its settings.json. Each flag takes every entry of its
+kind; nothing is selected by default. Everything is a symlink, so edits are
+live and a rerun after a change is a no-op.
 
 Refuses before touching anything when a destination holds something that is
 not a link, or a directory to link into is a file or a dangling link. `remove`

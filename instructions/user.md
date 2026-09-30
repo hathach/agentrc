@@ -1,6 +1,6 @@
 # Agent compatibility
 - This is the canonical user-wide instruction file for Claude Code and Codex.
-  Keep its wording LLM-neutral and keep `~/.codex/AGENTS.md` as a symlink to it.
+  Keep its wording LLM-neutral.
 - In repos that adopt the same layout, `CLAUDE.md` and
   `.claude/{agents,skills,workflows}` are canonical; keep `AGENTS.md ->
   CLAUDE.md` and `.agents -> .claude`. Migrating a repo to it is its own task,
@@ -111,13 +111,6 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   issue or comment); those require authorization from the user.
 - `herdr-peer` is the same idea through the agent session in the neighbouring
   Herdr pane, for when the human wants to watch and steer the exchange live.
-- For both Claude and Codex, changes to `cowork` (instructions, scripts or
-  tests) require review and simplification through `herdr-peer`; changes to
-  `herdr-peer` require both through `cowork`. Never use the skill being
-  changed to consult its own peer. If both need changes, handle them
-  separately so each uses the unchanged channel. If the required channel is
-  unavailable, report review and simplification as pending rather than
-  substituting the skill under edit.
 - After each implementation step of a plan, send the other agent that step's
   diff for review and suggestions, and address them before starting the next
   step.
