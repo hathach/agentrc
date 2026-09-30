@@ -102,9 +102,8 @@ def refuse(reason):
 
 
 def preflight(pairs):
-    """Every destination must be absent, a symlink, an empty directory, or one
-    of our skills seen through the whole-dir link an earlier installer made;
-    every directory linked into must be a real directory or absent."""
+    """Every destination must be absent, a symlink or an empty directory; every
+    directory linked into must be a real directory or absent."""
     for _, dst in pairs:
         parent = dst.parent
         if (parent.exists() or parent.is_symlink()) and not parent.is_dir():
@@ -112,8 +111,6 @@ def preflight(pairs):
         if dst.is_symlink() or not dst.exists():
             continue
         if dst.is_dir() and not any(dst.iterdir()):
-            continue
-        if parent.resolve() == REPO / 'skills':
             continue
         refuse(f'{dst} exists and is not a symlink; move it aside first')
 
@@ -163,16 +160,16 @@ def prune(kind):
 # --- hook registration in settings.json --------------------------------------
 
 def hook_entry(hook, name):
-    """Is this settings entry ours: the command runs out of the linked hook
-    directory, or out of this repo's hooks (an older install)?"""
+    """Is this settings entry ours: does the command run out of the linked hook
+    directory?"""
     try:
         words = shlex.split(hook.get('command', ''), posix=os.name != 'nt')
     except ValueError:
         return False
-    roots = (Path.home() / '.claude' / 'hooks' / name, REPO / 'hooks')
+    root = Path.home() / '.claude' / 'hooks' / name
     # only absolute words: a relative one would resolve against the cwd
     paths = [p for p in (word.strip('"\'') for word in words) if os.path.isabs(p)]
-    return any(inside(p, root) for p in paths for root in roots)
+    return any(inside(p, root) for p in paths)
 
 
 def quote_command(path):
@@ -281,10 +278,6 @@ def main(argv=None):
         return
 
     preflight([pair for _, pair in pairs])
-    if any(kind == 'skill' for kind, _ in chosen):
-        for d in dirs('skill'):
-            if d.is_symlink() and d.resolve() == REPO / 'skills':
-                d.unlink()  # the whole-dir link an earlier installer made
     for _, (src, dst) in pairs:
         link(src, dst)
     for kind in {kind for kind, _ in chosen if kind in KINDS}:

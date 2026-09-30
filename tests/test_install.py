@@ -72,13 +72,12 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((self.codex / 'AGENTS.md').read_text(), (ROOT / 'CLAUDE.md').read_text())
         self.assertEqual(self.ok('install', '--claude-md'), '', 'relative Codex link is idempotent outside HOME')
 
-    def test_a_skill_hook_is_registered_once_with_absolute_quoted_commands_and_older_entries_replaced(self):
-        old = str(ROOT / 'hooks' / 'simplify-gate')  # the pre-folder install pointed straight into the repo
+    def test_a_skill_hook_is_registered_once_with_absolute_quoted_commands(self):
         (self.claude).mkdir()
-        (self.claude / 'settings.json').write_text(json.dumps({'model': 'x', 'hooks': {
+        before = {'model': 'x', 'hooks': {
             'SessionStart': [{'matcher': '*', 'hooks': [{'type': 'command', 'command': 'other'}]}],
-            'PreToolUse': [{'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': old}]}],
-            'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'}, {'type': 'command', 'command': old}]}]}}))
+            'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'}]}]}}
+        (self.claude / 'settings.json').write_text(json.dumps(before))
         self.ok('install', '--skill')
         launcher = str(self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate')
         data = self.settings()
@@ -88,7 +87,7 @@ class InstallTest(unittest.TestCase):
         stop = data['hooks']['Stop'][-1]['hooks'][0]
         self.assertEqual(stop['timeout'], 650)
         self.assertNotIn('matcher', data['hooks']['Stop'][-1])
-        self.assertEqual(json.loads((self.claude / 'settings.json.before-agentrc').read_text())['hooks']['PreToolUse'][0]['hooks'][0]['command'], old)
+        self.assertEqual(json.loads((self.claude / 'settings.json.before-agentrc').read_text()), before)
         self.assertEqual(self.ok('install', '--skill'), '', 'idempotent')
         self.assertEqual(self.settings(), data)
 
@@ -121,15 +120,6 @@ class InstallTest(unittest.TestCase):
         self.ok('install', '--skill')
         names = sorted(p.name for p in (self.claude / 'skills').iterdir())
         self.assertEqual(names, sorted(SKILLS + ['foreign', 'mine']))
-
-    def test_the_whole_dir_link_of_an_earlier_installer_is_replaced_only_when_skills_are_selected(self):
-        self.claude.mkdir()
-        os.symlink(ROOT / 'skills', self.claude / 'skills')
-        self.ok('install', '--agent')
-        self.assertTrue((self.claude / 'skills').is_symlink(), 'an agent install leaves the skills alone')
-        self.ok('install', '--skill')
-        self.assertFalse((self.claude / 'skills').is_symlink())
-        self.assertTrue((self.claude / 'skills' / SKILL).is_symlink())
 
     def test_replacing_a_link_never_touches_a_neighbouring_file(self):
         (self.claude / 'skills').mkdir(parents=True)
