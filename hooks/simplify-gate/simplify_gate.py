@@ -33,8 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-MODEL = 'gpt-6-sol'  # codex exec -m
-EFFORT = 'low'  # model_reasoning_effort
+MODEL = 'gpt-6.1-sol'  # codex exec -m
+EFFORT = 'medium'  # model_reasoning_effort
 ROUNDS = 2  # YAGNI rounds per user turn
 CHALLENGE = 'Codex YAGNI challenge'
 FED_BACK = re.compile(re.escape(CHALLENGE) + r' \(round \d')

@@ -64,8 +64,8 @@ HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at 
           '{where}End your reply with a line "Files touched: <paths>" or "Files touched: none".\n---\n')
 WHERE = 'Your checkout is the worktree {root} on branch {branch}, based on {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
-EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # Claude's names; Codex has minimal..xhigh
-DEFAULTS = {'codex': ('gpt-6-sol', 'high'), 'claude': ('opus', 'high')}  # a new lane's model and effort
+EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # names both CLIs accept
+DEFAULTS = {'codex': ('gpt-6-astra', 'high'), 'claude': ('opus', 'high')}  # a new lane's model and effort
 
 
 def die(message, code=FAILED):
@@ -335,7 +335,7 @@ def command(side, session, reply_file, no_edit, model, effort):
     test suite needs, so its turn is checked afterwards instead (tree_state)."""
     if side == 'codex':
         argv = ['codex', 'exec'] + (['resume', session] if session else [])
-        argv += ['-m', model, '-c', f'model_reasoning_effort={"xhigh" if effort == "max" else effort}']
+        argv += ['-m', model, '-c', f'model_reasoning_effort={effort}']
         return argv + ['--json', '-o', str(reply_file), '-'], None
     argv = ['claude', '-p', '--output-format', 'stream-json', '--verbose', '--model', model, '--effort', effort]
     if no_edit:

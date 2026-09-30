@@ -90,20 +90,18 @@ Lane names are `[a-z0-9-]`. `status` shows each lane with its kind.
 
 The coworker's model and effort are per lane and persist with the session.
 The first `send` sets them: `--model` and `--effort` if given, else the
-side's default, `gpt-6-sol` at `high` for Codex and `opus` at `high` for
+side's default, `gpt-6-astra` at `high` for Codex and `opus` at `high` for
 Claude. Later sends reuse them, even after a default changes; a flag
-replaces the value from then on (`max` becomes Codex `xhigh`); `reset`
-forgets them. The request header tells the coworker what model and effort
-answer it.
+replaces the value from then on; `reset` forgets them. The request header
+tells the coworker what model and effort answer it.
 
 Pairs by lane role; examples target Codex, and a Claude coworker takes its
 default unless you name another:
 
-- `main` and worktree lanes, the routine writers: `--model gpt-6-sol --effort xhigh`
+- `main`, worktree, `plan` and review lanes: the default, no flags on a new lane
 - `expert`, a worktree lane for writing where a wrong first attempt costs a
-  debugging session: `--model gpt-6-astra --effort high`
-- `plan` and review lanes: the default, no flags on a new lane
-- `read-doc` and other lookup lanes: `--model gpt-6-sol --effort medium`
+  debugging session: `--model gpt-6-astra --effort xhigh`
+- `read-doc` and other lookup lanes: `--model gpt-6.1-sol --effort high`
 
 Never open the session interactively while a request is running.
 
