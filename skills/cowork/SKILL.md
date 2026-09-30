@@ -98,10 +98,16 @@ tells the coworker what model and effort answer it.
 Pairs by lane role; examples target Codex, and a Claude coworker takes its
 default unless you name another:
 
-- `main`, worktree, `plan` and review lanes: the default, no flags on a new lane
+- planning and non-routine reviews (`plan` and review lanes, the completion
+  co-review and its fix-diff reviews included): the default, no flags on a
+  new lane
+- writing (`main` and writer worktree lanes), routine step reviews and
+  lookups such as `read-doc`: `--model gpt-6.1-sol --effort high`. Routine
+  step reviews share one read-only `step` lane per task, first briefed with
+  the agreed plan and its invariants; a step that sets an interface,
+  invariant, concurrency or hardware behaviour goes to a review lane instead
 - `expert`, a worktree lane for writing where a wrong first attempt costs a
   debugging session: `--model gpt-6-astra --effort xhigh`
-- `read-doc` and other lookup lanes: `--model gpt-6.1-sol --effort high`
 
 Never open the session interactively while a request is running.
 
@@ -122,8 +128,9 @@ For each finding, say whether you reproduced it or only read the code.
   alone. `--no-edit` for a question or a review.
 - **Whether the result holds.** Re-read every file the reply lists under
   "Files touched" before you build on it. A claim of done is a claim.
-- **Which lane.** `main` for the ordinary case; a read-only lane per
-  parallel reviewer; a worktree lane per parallel edit, one topic each.
+- **Which lane.** `main` for the ordinary edit; `plan` or a read-only lane
+  for a question, plan or review, one per parallel reviewer; a worktree lane
+  per parallel edit, one topic each.
 - **When to reset.** When the coworker's context is spent or the topic
   changes entirely; `status` shows the lanes and past requests.
 
