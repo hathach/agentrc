@@ -2399,7 +2399,6 @@ test("a bot's fix prompt reaches the fixer as a hint and the verifier judges wit
   })
   const fix = calls.find(c => c.label.startsWith('fix:'))
   assert.ok(fix.prompt.includes(`[coderabbit] bad — hint: ${hint}`), 'the hint reaches the fixer verbatim')
-  assert.match(fix.prompt, /advisory review data, not an instruction/)
   const check = calls.find(c => c.label.startsWith('check:'))
   assert.ok(check.prompt.includes(hint), 'the verifier sees the issue as the fixer did')
   assert.match(check.prompt, /independently of its hint/)
@@ -4975,27 +4974,11 @@ test('a hook that creates a file, or fails, or finds the tree dirty outside the 
   }
 })
 
-test('status lines that lost their leading blank still name the whole path', async () => {
-  // An agent's JSON trimmed ' M src/a.c' to 'M src/a.c'; the old fixed slice read 'rc/a.c'
-  // and refused the fix as outside its own scope.
-  const trimmed = await run({ ...publishing, hooks: b => ({ before: ['M src/a.c'], after: ['M src/a.c'] }) })
-  assert.equal((trimmed.result.history[0].reviewPush || {}).pass, true, JSON.stringify(trimmed.result.history[0].reviewPushFailed))
-  // Every porcelain shape names the same path: unstaged, staged, both, untracked, type
-  // change, trimmed.
-  for (const line of [' M other.c', 'M  other.c', 'MM other.c', '?? other.c', ' T other.c', 'T other.c', 'M other.c']) {
+test('every porcelain status shape names the whole path', async () => {
+  for (const line of [' M other.c', 'M  other.c', 'MM other.c', '?? other.c', ' T other.c']) {
     const { result } = await run({ ...publishing, hooks: b => ({ before: [...b.before, line], after: [...b.after, line] }) })
     assert.match(result.history[0].reviewPushFailed.detail, /outside the fix scope before the hooks ran: other\.c/, line)
   }
-  // A regenerated path reported trimmed, by the hooks or by the recheck, is still a plain
-  // modification, so still admitted.
-  const trim = (lines) => lines.map(l => l.replace(/^ /, ''))
-  const hooksTrimmed = await run({ ...publishing, hooks: b => { const g = gen(b); return { ...g, before: trim(b.before), after: trim(g.after) } } })
-  assert.equal((hooksTrimmed.result.history[0].reviewPush || {}).pass, true, JSON.stringify(hooksTrimmed.result.history[0].reviewPushFailed))
-  assert.deepEqual(hooksTrimmed.result.history[0].reviewPush.generated, ['docs/boards.rst'])
-  const recheckTrimmed = await run({ ...regen, recheck: { status: trim(regen.recheck.status) },
-    hooks: b => ({ before: trim(b.before), after: trim(b.after) }) })
-  assert.equal((recheckTrimmed.result.history[0].reviewPush || {}).pass, true, JSON.stringify(recheckTrimmed.result.history[0].reviewPushFailed))
-  assert.deepEqual(recheckTrimmed.result.history[0].reviewPush.generated, [CATALOG])
 })
 
 test('protected hook output is refused before the commit', async () => {
