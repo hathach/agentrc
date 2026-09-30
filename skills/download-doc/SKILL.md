@@ -121,7 +121,7 @@ The ~1,800 already-imported books follow these, and dedup depends on matching th
 exactly:
 
 - `authors` — the vendor: `STMicroelectronics`, `NXP Semiconductors`
-- `title` — `<description> (<DOCID>) Rev <n>`, e.g. `Errata sheet LPC55S6x (ES_LPC55S6X) Rev 2.9`
+- `title` — `<DOCID> <description> Rev <n>`, e.g. `ES0392 STM32H7 device errata Rev 15` (`retitle.py` fixes id-last ones)
 - `identifiers` — `st:<DOCID>` / `nxp:<DOCID>`, **set at import time**
 - `tags` — kind (`datasheet`, `errata`, `reference-manual`, `user-manual`,
   `programming-manual`, `application-note`) + vendor + family (`STM32H7`, `i.MX RT`, `LPC`)

@@ -69,7 +69,7 @@ dozens of parts. The actual part number appears only in the PDF filename:
 /resource/en/datasheet/stm32h743zi.pdf  ->  STM32H743ZI
 ```
 
-So title datasheets `<PART> — <description> (<DSxxxxx>) Rev n`. Without this, a
+So title datasheets `<DSxxxxx> <PART> — <description> Rev n`. Without this, a
 library search for a part number finds nothing.
 
 ## Downloading

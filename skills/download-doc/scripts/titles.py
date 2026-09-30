@@ -5,7 +5,7 @@ Extracted from the NXP (~1,500 docs) and ST (~800 docs) imports of 2026-08.
 Vendor index titles are junk far more often than you'd expect, so this is a
 fallback chain over four sources with a cleanup pass on the result.
 
-    title(doc, pdf) -> "STM32H742xI/G ... device errata (ES0392) Rev 15.0"
+    title(doc, pdf) -> "ES0392 STM32H742xI/G ... device errata Rev 15.0"
 
 `doc`  = {code, title, summary, version, type, link}   from the vendor index
 `pdf`  = {pdftitle, lines}                             from pdfinfo / pdftotext -f 1 -l 1
@@ -110,6 +110,21 @@ def _drop_redundant_grade(s):
     return re.sub(r'\s+', ' ', s).strip(' -–,:')
 
 
+def strip_id(title, doc):
+    """Remove a copy of the id the title already carries — but only an exact one.
+    A qualified parenthetical like "(UM11750-V3)" is what distinguishes three
+    otherwise identically titled books, so it must survive."""
+    t = re.sub(r"\s*\(\s*" + re.escape(doc) + r"\s*\)\s*", " ", title, flags=re.I)
+    t = re.sub(r"[\s\-–—,:]*\b" + re.escape(doc) + r"\b\s*$", "", t, flags=re.I)
+    # a hyphen with no space after it qualifies the id rather than separating it
+    t = re.sub(r"^\s*" + re.escape(doc) + r"(?=$|[\s–—:,]|-(?:\s|$))", "", t, flags=re.I)
+    return re.sub(r"\s{2,}", " ", t).strip(' -–—,:')
+
+
+def id_first(title, doc):
+    return f"{doc} {strip_id(title, doc)}".strip()
+
+
 def title(doc, pdf=None, device_hint=None):
     pdf = pdf or {}
     code = (doc.get('code') or '').strip()
@@ -137,14 +152,13 @@ def title(doc, pdf=None, device_hint=None):
             candidates.append(clean(src))
 
     head = candidates[0] if candidates else (device_hint or code)
+    head = strip_id(head, code)
 
     # datasheets: prefix the part number, the description alone is generic
     part = part_from_link(doc.get('link', ''))
     if word == 'Datasheet' and part and part.lower() not in head.lower():
         head = f"{part} — {trim(head, 62)}"
 
-    # strip a leading repeat of the document code
-    head = re.sub(r'^%s[ ,:—-]+' % re.escape(code), '', head, flags=re.I).strip(' -–,:')
     # NXP errata titles repeat the ES_ family prefix: "ES_LPC436x Flash Errata Sheet".
     # Drop the prefix if the remainder still names a part, else just unprefix it.
     w = head.split()
@@ -157,14 +171,14 @@ def title(doc, pdf=None, device_hint=None):
 
     head = trim(head)
     if word and not DOCLINE.search(head):
-        head = f"{head} — {word}"
+        head = f"{head} — {word}" if head else word
 
     head = _drop_redundant_grade(_dedupe_words(head))
     ver = str(doc.get('version') or '').strip()
     # Espressif reports "v1.8"; strip the marker rather than discarding the revision.
     numeric_ver = re.sub(r'^v', '', ver, flags=re.I) \
         if re.fullmatch(r'v?\d+(\.\d+)*', ver, re.I) else ''
-    return f"{head} ({code})" + (f" Rev {numeric_ver}" if numeric_ver else '')
+    return f"{code} {head}".strip() + (f" Rev {numeric_ver}" if numeric_ver else '')
 
 
 # ------------------------------------------------------------------- tests --
@@ -177,7 +191,7 @@ if __name__ == '__main__':
           'link': '/resource/en/datasheet/stm32f378cc.pdf',
           'summary': 'ARM®Cortex®-M4 32b MCU+FPU, up to 256KB Flash+32KB SRAM'},
          None, None,
-         "STM32F378CC — Arm Cortex-M4 32b MCU+FPU, up to 256KB Flash+32KB SRAM — Datasheet (DS10062) Rev 4.0"),
+         "DS10062 STM32F378CC — Arm Cortex-M4 32b MCU+FPU, up to 256KB Flash+32KB SRAM — Datasheet Rev 4.0"),
 
         # and the hyphenated variant must NOT be re-split into "Arm Cortex"
         ("ARM-based stays hyphenated (DS10036)",
@@ -185,19 +199,19 @@ if __name__ == '__main__':
           'link': '/resource/en/datasheet/stm32f358cc.pdf',
           'summary': 'ARM®-based Cortex®-M4 32b MCU+FPU, up to 256KB Flash'},
          None, None,
-         "STM32F358CC — Arm-based Cortex-M4 32b MCU+FPU, up to 256KB Flash — Datasheet (DS10036) Rev 4.0"),
+         "DS10036 STM32F358CC — Arm-based Cortex-M4 32b MCU+FPU, up to 256KB Flash — Datasheet Rev 4.0"),
 
         ("ES_ prefix dropped, no doubled 'Flash' (real NXP title)",
          {'code': 'ES_LPC436X_FLASH', 'type': 'Errata Sheet', 'version': '2.3',
           'title': 'ES_LPC436x Flash Errata Sheet'},
          None, None,
-         "LPC436x Flash Errata Sheet (ES_LPC436X_FLASH) Rev 2.3"),
+         "ES_LPC436X_FLASH LPC436x Flash Errata Sheet Rev 2.3"),
 
         ("redundant grade parenthetical",
          {'code': 'IMXRT1010CEC', 'type': 'Datasheet', 'version': '0',
           'summary': 'i.MX RT1010 Crossover Processors Data Sheet for Consumer Products.'},
          None, 'i.MX RT1010 (Consumer grade)',
-         "i.MX RT1010 Crossover Processors Data Sheet for Consumer Products (IMXRT1010CEC) Rev 0"),
+         "IMXRT1010CEC i.MX RT1010 Crossover Processors Data Sheet for Consumer Products Rev 0"),
 
         # --- junk index titles -------------------------------------------------
         ("url title falls through to summary",
@@ -205,46 +219,46 @@ if __name__ == '__main__':
           'title': 'https://www.nxp.com/webapp/ext_download.jsp?code=ES_MCXW23',
           'summary': 'MCX W23 Mask set Errata'},
          None, None,
-         "MCX W23 Mask set Errata (ES_MCXW23) Rev 1.2"),
+         "ES_MCXW23 MCX W23 Mask set Errata Rev 1.2"),
 
         ("Microsoft Word filename title",
          {'code': 'UM12442', 'type': 'User Manual', 'version': '1.0',
           'title': 'Microsoft Word - FRDM-MCXA174.doc'},
          {'pdftitle': 'FRDM-MCXA174 Board User Manual'}, None,
-         "FRDM-MCXA174 Board User Manual (UM12442) Rev 1.0"),
+         "UM12442 FRDM-MCXA174 Board User Manual Rev 1.0"),
 
         ("pdfinfo title that is a filename is rejected",
          {'code': 'IMXRT1170BAEC', 'type': 'Datasheet', 'version': '1',
           'summary': 'i.MX RT1170 Crossover Processors Data Sheet for Automotive Products'},
          {'pdftitle': 'IMXRT1170BAEC_Rev.1'}, None,
-         "i.MX RT1170 Crossover Processors Data Sheet for Automotive Products (IMXRT1170BAEC) Rev 1"),
+         "IMXRT1170BAEC i.MX RT1170 Crossover Processors Data Sheet for Automotive Products Rev 1"),
 
         # --- the substantive rule ---------------------------------------------
         ("bare doc-type heading is rejected in favour of the real one",
          {'code': 'K64P144M120SF5RM', 'type': 'Reference Manual', 'version': '5'},
          {'lines': ['Reference Manual', 'K64 Sub-Family Reference Manual',
                     'Document Number: K64P144M120SF5RM']}, None,
-         "K64 Sub-Family Reference Manual (K64P144M120SF5RM) Rev 5"),
+         "K64P144M120SF5RM K64 Sub-Family Reference Manual Rev 5"),
 
         ("prose summary is not a title",
          {'code': 'IMXRT1170ACE', 'type': 'Errata Sheet', 'version': '1.6',
           'title': 'Chip Errata',
           'summary': 'This document details all known silicon errata for the i.MX RT1170A.'},
          {'lines': ['Chip Errata for i.MX RT1170A', 'Rev. 1.6']}, None,
-         "Chip Errata for i.MX RT1170A (IMXRT1170ACE) Rev 1.6"),
+         "IMXRT1170ACE Chip Errata for i.MX RT1170A Rev 1.6"),
 
         # --- normal path -------------------------------------------------------
         ("ST errata straight from the index",
          {'code': 'ES0392', 'type': 'Errata Sheet', 'version': '15.0',
           'summary': 'STM32H742xI/G, STM32H743xI/G, STM32H750xB, STM32H753xI device errata'},
          None, None,
-         "STM32H742xI/G, STM32H743xI/G, STM32H750xB, STM32H753xI device errata (ES0392) Rev 15.0"),
+         "ES0392 STM32H742xI/G, STM32H743xI/G, STM32H750xB, STM32H753xI device errata Rev 15.0"),
 
         ("non-numeric revision is omitted from the title",
          {'code': 'KINETIS_L_1N52N', 'type': 'Errata Sheet', 'version': '11 Sep 019',
           'title': 'Mask Set Errata for Mask 1N52N'},
          None, None,
-         "Mask Set Errata for Mask 1N52N (KINETIS_L_1N52N)"),
+         "KINETIS_L_1N52N Mask Set Errata for Mask 1N52N"),
     ]
 
     ok = True

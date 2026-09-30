@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'download-doc' / 'scripts'))
 import doclib  # noqa: E402
+import titles  # noqa: E402
 import vendor_arm  # noqa: E402
 import vendor_ti  # noqa: E402
 
@@ -53,6 +54,32 @@ class Legacy(unittest.TestCase):
     def test_a_book_with_an_identifier_is_compared_by_revision_not_title(self):
         p = doclib.plan([doc('RM0433')], {'st:RM0433': {'rev': '8.0'}}, legacy('RM0433 manual'))
         self.assertEqual((p['current'], p['legacy']), ([doc('RM0433')], []))
+
+
+class IdFirstTitle(unittest.TestCase):
+    def test_a_new_import_is_titled_vendor_id_first(self):
+        d = doclib.Doc(vendor='st', doc_id='ES0392', doc_type='errata', version='15.0',
+                       title='STM32H7 device errata', url='u', author='STMicroelectronics')
+        self.assertEqual(d.calibre_title(), 'ES0392 STM32H7 device errata Rev 15.0')
+
+    def test_only_an_exact_copy_of_the_id_is_dropped(self):
+        self.assertEqual(titles.id_first('LPC55S6x manual (UM11126)', 'UM11126'), 'UM11126 LPC55S6x manual')
+        self.assertEqual(titles.id_first('MCX manual (UM11750-V3)', 'UM11750'), 'UM11750 MCX manual (UM11750-V3)')
+
+    def test_a_leading_copy_of_the_id_is_dropped_but_not_a_qualified_one(self):
+        self.assertEqual(titles.id_first('RM0433: STM32H7 manual', 'RM0433'), 'RM0433 STM32H7 manual')
+        self.assertEqual(titles.id_first('UM11750-V3 MCX manual', 'UM11750'), 'UM11750 UM11750-V3 MCX manual')
+        self.assertEqual(titles.id_first('RM04331 manual', 'RM0433'), 'RM0433 RM04331 manual')
+
+    def test_a_title_never_carries_the_id_twice(self):
+        rm = {'code': 'RM0433', 'type': 'Reference Manual', 'version': '8.0'}
+        self.assertEqual(titles.title({**rm, 'title': ''}), 'RM0433 Reference manual Rev 8.0')
+        self.assertEqual(titles.title({**rm, 'title': 'RM0433–STM32H7 reference manual'}),
+                         'RM0433 STM32H7 reference manual Rev 8.0')
+
+    def test_the_device_hint_sees_the_title_without_the_id(self):
+        doc = {'code': 'RM0433', 'type': 'Reference Manual', 'version': '8', 'title': 'RM0433 reference manual'}
+        self.assertEqual(titles.title(doc, None, 'STM32H7'), 'RM0433 STM32H7 reference manual Rev 8')
 
 
 class TiParts(unittest.TestCase):

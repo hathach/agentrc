@@ -357,8 +357,8 @@ class Doc:
         return f"{self.vendor}:{self.doc_id}"
 
     def calibre_title(self) -> str:
-        """`<description> (<DOCID>) Rev <n>` — the convention the ~1,800 imported
-        books already follow. The heuristics live in titles.py because vendor index
+        """`<DOCID> <description> Rev <n>` — the form retitle.py gives the rest of
+        the library. The heuristics live in titles.py because vendor index
         titles are junk far more often than you would expect (raw URLs, "untitled",
         "Microsoft Word - FRDM-K32L3A6_Errata.doc")."""
         import titles

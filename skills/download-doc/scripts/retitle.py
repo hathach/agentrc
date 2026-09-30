@@ -37,6 +37,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import doclib   # noqa: E402
 import sync     # noqa: E402
+from titles import id_first   # noqa: E402
 
 LIB = doclib.LIBRARY
 VENDORS = set(sync.VENDORS)
@@ -46,15 +47,6 @@ DOCNUM = re.compile(r"^(?:UM|AN|DS|ES|RM|PM|TN|UG|DRM)[_-]?\d{3,6}$", re.I)
 MCHP = re.compile(r"(?:DS(\d{5,8})|(?<![0-9A-Za-z])(\d{8}))[A-Z]?$", re.I)
 ANY = re.compile(r"\b(UM|AN|DS|ES|RM|PM|TN|UG|DRM)\s?(\d{3,8})\b", re.I)
 ADJ = re.compile(r"\b(UM|AN|DS|ES|RM|PM|TN|UG|DRM)\s?(\d{3,8})\b\s*[-–—]?\s*(?:Rev|Revision|V\d)", re.I)
-
-
-def _clean(title: str, doc: str) -> str:
-    """Prepend the id, removing a copy it already carries — but only an exact one.
-    A qualified parenthetical like "(UM11750-V3)" is what distinguishes three
-    otherwise identically titled books, so it must survive."""
-    t = re.sub(r"\s*\(\s*" + re.escape(doc) + r"\s*\)\s*", " ", title, flags=re.I)
-    t = re.sub(r"[\s\-–—,:]*\b" + re.escape(doc) + r"\b\s*$", "", t, flags=re.I)
-    return re.sub(r"\s{2,}", " ", f"{doc} {t.strip(' -–—,:')}").strip()
 
 
 def from_pdf(pdf: pathlib.Path) -> tuple:
@@ -111,7 +103,7 @@ def build_plan(use_pdf: bool) -> tuple:
         if not doc:
             stats["no document number"] += 1
             continue
-        new = _clean(title, doc)
+        new = id_first(title, doc)
         if new != title:
             plan.append((book, title, new))
     return plan, stats, conflicts
