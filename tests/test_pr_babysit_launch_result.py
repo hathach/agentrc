@@ -16,10 +16,10 @@ HEAD = 'a' * 40
 NEXT = 'b' * 40
 
 
-def failure(cell, verdict='rig-side', complete=True, accepted=False):
+def failure(cell, verdict='rig-side', state='rigSide', complete=True):
     return {'check': 'hil-tinyusb (tinyusb.json)', 'workflow': 'Build', 'job': 'hil-tinyusb', 'cell': cell,
-            'signature': f'{cell} ... Failed', 'key': cell.encode().hex().ljust(16, '0')[:16], 'complete': complete, 'verdict': verdict, 'accepted': accepted,
-            'firstError': f'{cell} failed ' + 'x' * 400}
+            'signature': f'{cell} ... Failed', 'key': cell.encode().hex().ljust(16, '0')[:16], 'complete': complete, 'verdict': verdict,
+            'state': state, 'firstError': f'{cell} failed ' + 'x' * 400}
 
 
 def output(**over):
@@ -29,13 +29,13 @@ def output(**over):
     result = {
         'stateDigest': '0123abcd', 'pass': False, 'status': 'paused', 'reason': 'yielded', 'cycles': 2, 'head': NEXT,
         'rollup': {'cycles': [2], 'findings': {'total': 1, 'fixed': 1}, 'ci': {'total': 2}, 'reran': 0, 'pushed': [NEXT[:8]], 'replies': 1},
-        'pending': [{'bot': 'copilot', 'state': 'absent', 'reason': 'no request'}],
+        'pending': [{'bot': 'greptile', 'state': 'absent', 'reason': 'no check run'}],
         'observation': {'reviewedHead': HEAD, 'lane': 'both',
                         'reviews': {'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
                                     'findings': [{'findingId': '7#1', 'commentId': 7, 'commentDigest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid',
                                                   'file': 'a.c', 'line': 3}]},
                         'ci': {'status': 'red', 'headSha': HEAD, 'infraRerun': [],
-                               'realFailures': [failure('f072 cdc'), failure('pico host', verdict='real')]},
+                               'realFailures': [failure('f072 cdc'), failure('pico host', verdict='real', state='real')]},
                         'actions': actions},
         'state': {'expectedHead': NEXT},
     }
@@ -84,7 +84,7 @@ class LaunchResultTest(unittest.TestCase):
         ci = s['observation']['ci']
         self.assertEqual(ci['verdicts'], {'rig-side': 1, 'real': 1})
         self.assertEqual(ci['settledCells'], {'hil-tinyusb (tinyusb.json)': ['f072 cdc']}, 'a settled failure by its cell, to investigate')
-        pico = failure('pico host', verdict='real')
+        pico = failure('pico host', verdict='real', state='real')
         self.assertEqual(ci['attention'], [{'check': pico['check'], 'cell': 'pico host', 'state': 'real', 'verdict': 'real', 'key': pico['key'],
                                            'complete': True, 'files': None, 'firstError': launch_result.cut(pico['firstError'])}],
                          'an unsettled failure by the fields a caller acts on, with the key that accepts it')
@@ -95,7 +95,7 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['receipts']['replies'], [{'batch': 'fixNotePosts', 'findingVerdicts': ['valid'], 'commentId': 7, 'kind': 'review-body', 'replyId': 8, 'sent': True,
                                                      'posted': True, 'verified': True, 'resolved': None, 'error': None}], 'receipts verbatim')
         self.assertEqual(s['receipts']['pushes'][0]['committed'], True)
-        self.assertEqual(s['result']['pending'][0]['bot'], 'copilot', 'result fields other than history/observation/state stay verbatim')
+        self.assertEqual(s['result']['pending'][0]['bot'], 'greptile', 'result fields other than history/observation/state stay verbatim')
         self.assertNotIn('state', s['result'])
         self.assertEqual(s['launch'], {'agents': 3, 'tokens': 1000, 'secs': 9}, 'first start to last end')
         self.assertEqual(s['notes'], [])

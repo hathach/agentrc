@@ -266,15 +266,13 @@ if (args.stateRef != null) {
 // What a launch learned about CI on its head, so a relaunch neither re-reads nor
 // re-judges it: the checks the judge re-ran (`sure` false for a judge lost after
 // it may have), and the digest of each verdict per check run, whose link names
-// the run. The verdicts themselves stay in collect.py's store beside the evidence;
-// an entry without a digest, from an earlier v3 that carried them inline, is judged again.
+// the run. The verdicts themselves stay in collect.py's store beside the evidence.
 // judgedHead is the last head whose verdicts were stored: the judge of a later
 // head sees them beside the matching failures, as evidence to reconfirm.
 const ciCacheShaped = (c) => c && typeof c === 'object' && typeof c.notesDigest === 'string' &&
-  (c.judgedHead === undefined || c.judgedHead === null || /^[0-9a-f]{40}$/.test(c.judgedHead)) &&
+  (c.judgedHead === null || /^[0-9a-f]{40}$/.test(c.judgedHead)) &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
-  Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket'].every(k => typeof e[k] === 'string') &&
-    (e.digest === undefined || typeof e.digest === 'string'))
+  Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string'))
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
@@ -283,24 +281,17 @@ if (args.state !== undefined && args.state !== null) {
     Number.isInteger(st.maxCycles) && st.maxCycles >= 1 &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
     typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
-    (st.deferrals === undefined || Array.isArray(st.deferrals)) &&
-    (st.acceptedFailures === undefined || Array.isArray(st.acceptedFailures)) &&
-    (st.decisions === undefined || Array.isArray(st.decisions)) &&
-    (st.holds === undefined || Array.isArray(st.holds)) &&
-    (st.reanswer === undefined || Array.isArray(st.reanswer)) &&
-    (st.ciCache === undefined || ciCacheShaped(st.ciCache)) &&
+    [st.deferrals, st.acceptedFailures, st.decisions, st.holds].every(Array.isArray) && (st.build === null || typeof st.build === 'string') &&
+    (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
-  // build and maxCycles are per launch: a state from before carries them in
-  // config, so they are dropped before comparing, and a change is logged.
-  const { build: priorBuild = st.build, maxCycles: _, ...priorConfig } = st.config
-  if (JSON.stringify(priorConfig) !== JSON.stringify(config)) {
-    throw new Error(`state was made by a run with different arguments: ${JSON.stringify(priorConfig)} vs ${JSON.stringify(config)}`)
+  if (JSON.stringify(st.config) !== JSON.stringify(config)) {
+    throw new Error(`state was made by a run with different arguments: ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
   }
-  if (priorBuild !== undefined && priorBuild !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(priorBuild)} → ${JSON.stringify(buildCmd)}`)
+  if (st.build !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(st.build)} → ${JSON.stringify(buildCmd)}`)
   restored = st
 }
 const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 10)
@@ -897,7 +888,7 @@ const history = restored && restored.last ? [restored.last] : []
 const launchFrom = history.length
 // The checks the CI judge re-ran, per head: until its re-run registers, a check
 // still shows its old link, and a check by the same name is never re-run twice.
-const ciReruns = restored && restored.ciCache ? restored.ciCache.reruns : []
+const ciReruns = restored ? restored.ciCache.reruns : []
 // Verdicts by check link. Only a link naming its run is kept, and never an
 // unclassified verdict, which a newer base run may still place; a changed
 // ciNotes can change any verdict, so it discards them all. An entry holds its
@@ -910,10 +901,10 @@ const noteRerun = (r) => {
 }
 const notesDigest = fnv1a(ciNotes)
 const ciVerdicts = new Map()
-let ciJudgedHead = (restored && restored.ciCache && restored.ciCache.judgedHead) || null
-if (restored && restored.ciCache) {
+let ciJudgedHead = restored ? restored.ciCache.judgedHead : null
+if (restored) {
   if (restored.ciCache.notesDigest === notesDigest) {
-    for (const e of restored.ciCache.entries) if (e.digest) ciVerdicts.set(e.link, { ...e })
+    for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
   } else if (restored.ciCache.entries.length) log(`ciNotes changed: ${restored.ciCache.entries.length} cached CI verdict(s) judged again`)
 }
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
@@ -930,35 +921,24 @@ const reanswer = new Set((restored && restored.reanswer) || [])
 // commentId -> { dismissals, notes }: dismissals relied on without telling the
 // reviewer, and the valid or deferred findings still owed a note. Standing
 // debt, not a snapshot: a harvest that drops a finding does not settle it.
-// A state from before `notes` owes a note it cannot name: NO_ID stands in, so
-// no harvest ever shows every point of it. `seenSinceEdit`, present only on a
-// comment edited after its ids were carried (renumbered), holds the ids
-// reported against the edited body; a state from before it counts every
-// carried id as seen.
-const NO_ID = '(unnamed)'
+// `seenSinceEdit`, present only on a comment edited after its ids were carried
+// (renumbered), holds the ids reported against the edited body.
 const debt = new Map(restored
-  ? restored.debt.map(([id, d]) => {
-    const notes = new Set(d.notes || (d.note ? [NO_ID] : []))
-    const seen = d.renumbered ? { seenSinceEdit: new Set(d.seenSinceEdit || [...d.dismissals, ...notes]) } : {}
-    // A repair naming no reply of ours and no offered body (an over-length draft an
-    // earlier version froze) has nothing on the thread to repair: the comment is owed afresh.
-    const repair = d.repair && (d.repair.replyId || d.attempt) ? { repair: d.repair } : {}
-    return [id, { dismissals: new Set(d.dismissals), notes, ...seen, ...(d.digest !== undefined ? { digest: d.digest } : {}), ...repair, ...(d.attempt ? { attempt: d.attempt } : {}) }]
-  })
+  ? restored.debt.map(([id, d]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes), ...(d.seenSinceEdit ? { seenSinceEdit: new Set(d.seenSinceEdit) } : {}) }])
   : [])
-for (const a of (restored && restored.acceptedFailures) || []) {
-  if (!acceptedArg.some(x => acceptedKey(x) === acceptedKey(a))) log(`accepted failure not renewed by this launch, no longer accepted: ${a.key ? `key ${a.key}` : `${a.workflow} / ${a.job}${a.cell ? ` / ${a.cell}` : ''}: ${a.signature}`}`)
+for (const { key } of restored ? restored.acceptedFailures : []) {
+  if (!acceptedArg.some(x => acceptedKey(x) === key)) log(`accepted failure not renewed by this launch, no longer accepted: key ${key}`)
 }
 // findingId -> { commentId, digest, reviewedSha, file, line, claim, verdict,
 // reason }: the last settled verdict on each finding, so a later harvest that
 // contradicts it has to say why. Never evicted: a finding can come back after
 // any number of cycles, reworded or moved.
-const decisions = new Map(restored && restored.decisions ? restored.decisions : [])
+const decisions = new Map(restored ? restored.decisions : [])
 // findingId -> { commentId, reason, against }: a held verdict stays held, and
 // its comment unanswered, across cycles and launches until a harvest reports
 // that finding again without a hold; a harvest that merely omits it settles
 // nothing. `against` is the earlier decision it contradicted, if any.
-const holds = new Map(restored && restored.holds ? restored.holds : [])
+const holds = new Map(restored ? restored.holds : [])
 const heldComments = () => new Set([...holds.values()].map(h => h.commentId))
 // Every comment still owed an answer: its debt, or a held point on it.
 const outstanding = () => [...new Set([...debt.keys(), ...heldComments()])]
@@ -966,7 +946,7 @@ const outstanding = () => [...new Set([...debt.keys(), ...heldComments()])]
 const corrections = []
 // findingId -> { digest, issueUrl, reason }: a caller's deferral once its issue
 // was read to cover the finding. It holds while the comment body it named stands.
-const deferrals = new Map(restored && restored.deferrals ? restored.deferrals : [])
+const deferrals = new Map(restored ? restored.deferrals : [])
 // Set once sonar.py reports an error (no SONAR_TOKEN, say): nothing more is asked this launch.
 let sonarDown = null
 // commentId -> sonar.py's last result for it this launch.
@@ -1013,7 +993,7 @@ const stateOut = () => {
       notesDigest, judgedHead: ciJudgedHead, reruns: ciReruns.filter(r => r.head === expectedHead),
       entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest }) => ({ head, link, bucket, digest })),
     },
-    debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], renumbered: !!d.seenSinceEdit, ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
+    debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
   }
   return { ...st, digest: sealOf(st) }
@@ -2301,12 +2281,12 @@ const runCycle = async (cycle, entry) => {
     }
 
     // The ids a comment still owes answers to, as its current body numbers
-    // them: never NO_ID, and on an edited comment only ids reported since.
+    // them: on an edited comment only ids reported since.
     const owedIds = (commentId) => {
       const d = debt.get(commentId)
       const held = [...holds].filter(([, h]) => h.commentId === commentId).map(([findingId]) => findingId)
       return [...new Set([...(d ? [...d.dismissals, ...d.notes] : []), ...held])]
-        .filter(k => k !== NO_ID && !(d && d.seenSinceEdit && !d.seenSinceEdit.has(k)))
+        .filter(k => !(d && d.seenSinceEdit && !d.seenSinceEdit.has(k)))
     }
     const owedLastCycle = outstanding().map(commentId => ({ commentId, findingIds: owedIds(commentId) }))
     const reviewPrompt =

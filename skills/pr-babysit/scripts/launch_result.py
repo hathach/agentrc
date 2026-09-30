@@ -98,16 +98,14 @@ def ci_summary(ci, keys=False):
     """Counts by verdict, accepted and sonarGate apart; complete rig-side or accepted failures as their cells per check, or
     with keys as {cell, key}; every other failure by the fields a caller acts on, its firstError cut."""
     failures = ci.get('realFailures') or []
-    # The workflow stamps each failure's state; an output from before the stamp predates the sonarGate state too.
-    state = lambda f: f.get('state') or ('accepted' if f.get('accepted') else {'rig-side': 'rigSide'}.get(f.get('verdict'), f.get('verdict')))
-    settled = lambda f: f.get('complete') is True and state(f) in ('accepted', 'rigSide')
+    settled = lambda f: f.get('complete') is True and f.get('state') in ('accepted', 'rigSide')
     cells = {}
     for f in filter(settled, failures):
         cells.setdefault(f.get('check'), []).append({'cell': f.get('cell'), 'key': f.get('key')} if keys else f.get('cell'))
     return {'status': ci.get('status'), 'headSha': ci.get('headSha'), 'infraRerun': ci.get('infraRerun'),
-            'verdicts': dict(Counter(f.get('verdict') if state(f) in ('rigSide', 'real', 'unclassified') else state(f) for f in failures)),
+            'verdicts': dict(Counter(f.get('verdict') if f.get('state') in ('rigSide', 'real', 'unclassified') else f.get('state') for f in failures)),
             'settledCells': cells,
-            'attention': [{**{k: f.get(k) for k in ATTENTION}, 'state': state(f), 'firstError': cut(f.get('firstError', ''))}
+            'attention': [{**{k: f.get(k) for k in ATTENTION}, 'firstError': cut(f.get('firstError', ''))}
                           for f in failures if not settled(f)]}
 
 

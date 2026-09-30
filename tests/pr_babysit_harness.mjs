@@ -83,17 +83,17 @@ const adoptionState = ({
 } = {}) => seal({
   version: 3, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
   config: {
-    pr: 3888, reviewers, autoRun, maxCycles, checkoutDir: '.', ciWait: 30,
-    protected: protectedPattern === null ? null : new RegExp(protectedPattern).source,
-    generated: null, build: null,
+    pr: 3888, reviewers, autoRun, checkoutDir: '.', ciWait: 30,
+    protected: protectedPattern === null ? null : new RegExp(protectedPattern).source, generated: null,
   },
-  cyclesUsed, maxCycles, answeredWith: [], debt: [],
+  build: null, cyclesUsed, maxCycles, answeredWith: [], deferrals: [], acceptedFailures: [], decisions: [], holds: [],
+  ciCache: { notesDigest: fnv1a(''), judgedHead: null, reruns: [], entries: [] }, debt: [],
   last: cyclesUsed ? { cycle: cyclesUsed, head: HEAD } : null, ...over,
 })
 const adoptionArgs = (state, over = {}) => ({
   reviewers: state.config.reviewers, autoRun: state.config.autoRun,
   maxCycles: state.maxCycles, ciWait: state.config.ciWait,
-  protected: state.config.protected, generated: state.config.generated, build: state.config.build,
+  protected: state.config.protected, generated: state.config.generated, build: state.build,
   yieldAfterCycle: true, state, adoptHead: ADOPT, ...over,
 })
 
@@ -646,7 +646,7 @@ test('the auto-running reviewers are named apart from the harvest list', async (
   const split = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'], autoRun: [' CodeRabbit '] } })
   const prompt = split.calls.find(c => c.label.startsWith('reviews#')).prompt
   assert.match(prompt, /harvest on this PR are greptile, coderabbit, copilot, and no others; of those, coderabbit auto-run on every push: report one record for each and no other/)
-  // Default: everybody harvested but copilot is also waited for.
+  // Default: everybody harvested; copilot, harvest-only, is not waited for.
   const same = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'] } })
   assert.match(same.calls.find(c => c.label.startsWith('reviews#')).prompt, /of those, greptile, coderabbit auto-run/)
   const nobody = await run({ args: { reviewers: ['copilot'], autoRun: [] } })
@@ -1826,23 +1826,22 @@ test('a cached verdict is reused only while its check keeps the same conclusion'
   assert.deepEqual(cancelled.result.state.ciCache.entries.map(e => e.bucket), ['cancel'], 'and its new verdict replaces the old')
 })
 
-test('a state from before the verdict store keeps everything but its verdicts', async () => {
-  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
-  const { digest, ...st } = first.result.state
-  const failures = [{ ...RIG, workflow: 'ci', job: RIG.check, cell: null, signature: RIG.firstError, runId: 1, complete: true }]
-  const entries = st.ciCache.entries.map(({ digest, ...e }) => ({ ...e, failures }))
-  const old = await run({ args: { ...YIELD, state: seal({ ...st, ciCache: { ...st.ciCache, entries } }) }, reviews: WAITING, ci: redWith(RIG).ci })
-  assert.deepEqual(ciLabels(old.labels), ['ci:collect#2.1', 'ci:collect#2.f', 'ci:judge#2', 'ci:collect#2.w'])
-  assert.equal(old.result.state.cyclesUsed, 2)
-})
-
 test('a state whose CI cache is malformed is refused', async () => {
   const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const { digest, ...st } = first.result.state
   for (const ciCache of [{ ...st.ciCache, entries: [{ head: HEAD, link: 'x', bucket: 'fail', digest: 7 }] },
     { ...st.ciCache, reruns: [{ head: HEAD, link: 'x' }] }, { entries: [], reruns: [] },
-    { ...st.ciCache, entries: st.ciCache.entries.map(({ bucket, ...e }) => e) }]) {
+    { ...st.ciCache, entries: st.ciCache.entries.map(({ bucket, ...e }) => e) },
+    { ...st.ciCache, entries: st.ciCache.entries.map(({ digest, ...e }) => e) }]) {
     await assert.rejects(run({ args: { ...YIELD, state: seal({ ...st, ciCache }) } }), /not a pr-babysit state/)
+  }
+})
+
+test('a state missing a field the writer always saves is refused', async () => {
+  const { digest, ...st } = (await run({ args: YIELD })).result.state
+  for (const key of ['deferrals', 'acceptedFailures', 'decisions', 'holds', 'ciCache', 'build']) {
+    const { [key]: _, ...partial } = st
+    await assert.rejects(run({ args: { ...YIELD, state: seal(partial) } }), /state is not a pr-babysit state of version 3/, key)
   }
 })
 
@@ -2820,22 +2819,6 @@ test('the answer owed after an edit may go beside ours, in this launch or a late
   assert.equal(manifestOf(later.calls, 'replies#3')[0].secondAnswer, true)
 })
 
-test('a released repair asks reply.py for a first answer and settles on the reply of ours it finds', async () => {
-  // #3988: the thread already held an earlier run's reply in other words; reply.py names it and posts nothing.
-  const frozen = { dismissals: ['1#1'], notes: [], digest: 'd1', repair: { replyId: null, error: 'over length: a point exceeds 60 words or a line 300 characters' } }
-  const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' }
-  const base = (await run({ args: { ...YIELD } })).result.state
-  const held = (rs) => rs.map(r => ({ ...r, replyId: 77, sent: false, posted: false, verified: false, resolved: null, error: 'reply 77 of ours is already on this comment in other words; reconcile by hand' }))
-  const owed = await run({ reviews, receipts: held, args: { ...YIELD, state: seal({ ...base, debt: [[1, frozen]] }) } })
-  const [entry] = manifestOf(owed.calls, owed.labels.find(l => l.startsWith('replies#')))
-  assert.equal(entry.secondAnswer, undefined)
-  assert.deepEqual(owed.result.state.debt.find(([id]) => id === 1)[1].repair.replyId, 77)
-  const next = await run({ reviews, answers: () => true, args: { ...YIELD, state: owed.result.state } })
-  assert.equal(next.labels.some(l => l.startsWith('replies#')), false, 'nothing is posted over our reply')
-  assert.ok(next.labels.some(l => l.startsWith('reconcile#')))
-  assert.equal(next.result.state.debt.length, 0, 'settled on the reply already there')
-})
-
 test('a fix note reads as deferred only while it still owes a dismissal', async () => {
   // Nothing is outstanding here: the fix note closed the thread, so calling it
   // deferred names a next cycle that has nothing to do.
@@ -3034,12 +3017,6 @@ test('a reply that reads back as the offered body settles on it with no verdict 
   assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#2').prompt, 'Reuses').reuses,
     [{ commentId: 2, replyId: 502, bodyDigest: fnv1a('not so'), originalDigest: 'd2' }])
   assert.equal(result.pass, true, result.reason)
-  // A state from before `posted`, as the installed workflow saved #3988's, settles the same way.
-  const first = await run({ ...wrong, args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true }, receipts: parent })
-  const legacy = { ...first.result.state, debt: first.result.state.debt.map(([id, { repair: { posted, ...repair }, ...d }]) => [id, { ...d, repair }]) }
-  const resumed = await run({ ...wrong, args: { autoPush: true, maxCycles: 2, state: seal(legacy) } })
-  assert.deepEqual(resumed.labels.filter(l => /^(replies|inspect|reconcile|edit|reuse)#/.test(l)), ['inspect#2', 'reuse#2'])
-  assert.equal(resumed.result.pass, true, resumed.result.reason)
 })
 
 test('a repair obligation survives a restart and still blocks a repost', async () => {
@@ -3221,7 +3198,7 @@ test('after an edit, the points reported against the new body must all be shown'
   const dry = await deferredTwo()
   const seen = await run({ reviews: both, args: { autoPush: false, maxCycles: 5, state: dry.result.state,
     deferrals: [deferral({ commentDigest: 'd2' }), deferral({ findingId: '1#2', commentDigest: 'd2' })] } })
-  assert.equal(debtOf(seen.result, 1).renumbered, true)
+  assert.ok(debtOf(seen.result, 1).seenSinceEdit)
   const { labels, result } = await run({ reviews: { ...both, findings: [edited(finding())] }, args: { autoPush: true, maxCycles: 5, state: seen.result.state } })
   assert.equal(labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of the edited body\'s two')
   assert.notEqual(result.pass, true)
@@ -3263,27 +3240,6 @@ test('a held id from before an edit is not named as the edited body\'s', async (
   assert.deepEqual(result.state.holds.map(([id]) => id), ['1#2'], 'the hold itself is kept')
   assert.deepEqual(debtOf(result, 1).seenSinceEdit, ['1#1'])
   assert.match(calls.find(c => c.label === 'reviews#3').prompt, /\[\{"commentId":1,"findingIds":\["1#1"\]\}\]/)
-})
-
-test('a state from before notes or seenSinceEdit resumes conservatively', async () => {
-  const first = await run(heldForRepair({
-    args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true },
-    reviews: { findings: [finding({ commentId: 2, line: 4 })], replies: [], bots: 'reviewed' },
-  }))
-  const old = { ...first.result.state, debt: first.result.state.debt.map(([id, { notes, ...d }]) => [id, { ...d, note: notes.length > 0 }]) }
-  const unnamed = await resumeAt(seal(old), { args: { autoPush: true, maxCycles: 5 }, answers: () => true,
-    reviews: { findings: [finding({ commentId: 2, line: 4, verdict: 'stale' })], replies: [], bots: 'reviewed' } })
-  assert.equal(unnamed.labels.some(l => /^reuse#/.test(l)), false, 'a note it cannot name is never reconciled')
-  assert.deepEqual(debtOf(unnamed.result, 2).notes, ['(unnamed)'])
-  assert.match(unnamed.calls.find(c => c.label.startsWith('reviews#')).prompt, /\{"commentId":2,"findingIds":\[\]\}/, 'the placeholder is never named as a finding')
-  // Renumbered with no seenSinceEdit: every carried id counts as current.
-  const dry = await deferredTwo()
-  const seen = await run({ reviews: { ...twoDeferred, findings: twoDeferred.findings.map(f => ({ ...f, commentDigest: 'd2' })) },
-    args: { autoPush: false, maxCycles: 5, state: dry.result.state, deferrals: [deferral({ commentDigest: 'd2' }), deferral({ findingId: '1#2', commentDigest: 'd2' })] } })
-  const legacy = { ...seen.result.state, debt: seen.result.state.debt.map(([id, { seenSinceEdit, ...d }]) => [id, d]) }
-  const resumed = await run({ reviews: { ...twoDeferred, findings: [{ ...finding(), commentDigest: 'd2' }] }, args: { autoPush: true, maxCycles: 5, state: seal(legacy) } })
-  assert.notEqual(resumed.result.reason, 'cycle-threw', JSON.stringify(resumed.result.error))
-  assert.equal(resumed.labels.some(l => l.startsWith('defer#')), false)
 })
 
 // --- caller-approved deferrals ---
@@ -3964,23 +3920,6 @@ test('a reply with a point over the length limit is never posted or cut, and a s
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(manifestOf(points.calls, 'replies#1').length, 1, 'each point at its limit, bullet marker aside: posted')
-  // A state from before the limit may hold an offered body over it: it is neither resent nor redrafted.
-  const first = await run({
-    args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true },
-    posting: null,
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'first wording' }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })
-  const state = structuredClone(first.result.state)
-  state.debt.find(([id]) => id === 2)[1].attempt.body = wordy
-  const old = await run({
-    args: { autoPush: true, maxCycles: 2, state: seal(state) },
-    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: wordy }], bots: 'reviewed' },
-    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-  })
-  assert.equal(old.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'the stored long body is not resent')
-  assert.ok(!old.calls.some(c => c.label.startsWith('shorten#')), 'an offered body is never redrafted, so its long redraft is not shortened')
-  assert.match(old.result.state.debt.find(([id]) => id === 2)[1].repair.error, /^over length/)
 })
 
 test('an over-length refutation draft is shortened once and posted when the rewrite fits and is found faithful', async () => {
@@ -4397,7 +4336,7 @@ test('state carries the ledger to the next launch, which re-reports what is owed
   const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
   assert.equal(first.result.status, 'paused')
   assert.deepEqual(first.result.deferred, [5])
-  assert.deepEqual(first.result.state.debt, [[5, { dismissals: ['5#1'], notes: [], renumbered: false, digest: 'd5' }]])
+  assert.deepEqual(first.result.state.debt, [[5, { dismissals: ['5#1'], notes: [], digest: 'd5' }]])
   const second = await run({
     args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
     reviews: owing, challenge: upheld,
@@ -4578,7 +4517,7 @@ test('an already-published adopted head needs no push even in a dry-run launch',
 
 test('an unpublished adoption without autoPush is a zero-cycle dry run', async () => {
   const state = adoptionState({
-    debt: [[5, { dismissals: ['5#1'], notes: [], renumbered: false, digest: 'd5' }]],
+    debt: [[5, { dismissals: ['5#1'], notes: [], digest: 'd5' }]],
   })
   const before = structuredClone(state)
   const { result, labels } = await run({
@@ -4635,15 +4574,6 @@ test('a chain the audit script cannot read back is refused with its error', asyn
   assert.equal(result.reason, 'adopt-audit-failed')
   assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
   assert.deepEqual(labels, ['preflight', 'adopt:audit'])
-})
-
-test('a state whose config still carries maxCycles may raise it', async () => {
-  const { result, logs } = await run({
-    args: adoptionArgs(adoptionState({ maxCycles: 2, cyclesUsed: 2 }), { maxCycles: 3 }), preflight: { head: ADOPT, prHead: HEAD },
-    adoptAudit: { error: 'git rev-list: fatal: bad revision', commits: [] },
-  })
-  assert.ok(logs.includes('cycle ceiling changed since the last launch: 2 → 3, 2 used'))
-  assert.equal(result.reason, 'adopt-audit-failed', 'past the argument check and the budget')
 })
 
 test('adoptHead argument errors throw before any agent runs', async () => {
@@ -4883,7 +4813,7 @@ test('rejected or dead adoption pushes preserve the ledger and recover without r
     ['thrown', new Error('publisher exploded'), 'unknown', 'adopt-push-unknown', 'adopt-push-unknown'],
   ]) {
     const state = adoptionState({
-      debt: [[5, { dismissals: ['5#1'], notes: [], renumbered: false, digest: 'd5' }]],
+      debt: [[5, { dismissals: ['5#1'], notes: [], digest: 'd5' }]],
       answeredWith: [[6, { how: 'refutation', digest: 'd6' }]],
     })
     const failed = await run({
@@ -5757,13 +5687,11 @@ test('without markSonar nothing goes to SonarCloud and the issue stays owed in t
   assert.deepEqual(result.state.answeredWith, [[3, { how: 'refutation', digest: 'd3', sonar: 'Not injectable: a list argv.' }]])
 })
 
-test('a repair naming no reply and no offered body is owed afresh; one with an offered body stays held', async () => {
-  const frozen = { dismissals: ['1#1'], notes: [], digest: 'd1', repair: { replyId: null, error: 'over length: a point exceeds 60 words or a line 300 characters' } }
+test('a repair naming no reply but an offered body stays held', async () => {
   const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' }
   const base = (await run({ args: { ...YIELD } })).result.state
-  const owed = await run({ reviews, args: { ...YIELD, autoPush: true, state: seal({ ...base, debt: [[1, frozen]] }) } })
-  assert.deepEqual(manifestOf(owed.calls, owed.labels.find(l => l.startsWith('replies#'))).map(r => r.commentId), [1])
-  const offered = { ...frozen, attempt: { body: 'no', how: 'refutation', digest: 'd1' } }
+  const offered = { dismissals: ['1#1'], notes: [], digest: 'd1', repair: { replyId: null, error: 'offered refutation is stale (comment edited)' },
+    attempt: { body: 'no', how: 'refutation', digest: 'd1' } }
   const held = await run({ reviews, args: { ...YIELD, autoPush: true, state: seal({ ...base, debt: [[1, offered]] }) } })
   assert.equal(held.labels.some(l => l.startsWith('replies#')), false, 'an offered body may be on the thread: a human reconciles')
 })
