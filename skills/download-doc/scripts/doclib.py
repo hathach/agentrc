@@ -291,26 +291,14 @@ def rev_newer(new, old) -> bool:
     return compare_rev(new, old)[0] == "newer"
 
 
-# Doc IDs as they appear in titles and on PDF cover pages. The trailing `Rev` is
-# load-bearing: ST errata sheets cite their reference manual on the cover, so a bare
-# ID match tags an errata sheet as RMxxxx. Requiring the adjacent revision marker
-# keeps you on the document's *own* ID.
+# Doc IDs as they appear on PDF cover pages. The trailing `Rev` is load-bearing: ST
+# errata sheets cite their reference manual on the cover, so a bare ID match tags an
+# errata sheet as RMxxxx. Requiring the adjacent revision marker keeps you on the
+# document's *own* ID.
 #
 # Do NOT "helpfully" write 0?(\d{3,5}) to absorb a leading zero — the optional zero
 # eats the first digit, RM0433 becomes RM433, and matching silently stops working.
-DOCID_IN_TITLE = re.compile(r"\((DS|RM|ES|PM|UM|AN|TN)\s?(\d{3,5})\)", re.I)
 DOCID_IN_PDF = re.compile(r"\b(DS|RM|ES|PM|UM|AN|TN)\s?(\d{3,5})\b\s*[-–]?\s*Rev", re.I)
-
-
-def doc_id_from_pdf(path: Path) -> str | None:
-    """Last-resort ID recovery: read the cover page. Only used for books whose title
-    doesn't carry the ID (older hand-added entries)."""
-    if not shutil.which("pdftotext"):
-        return None
-    p = subprocess.run(["pdftotext", "-f", "1", "-l", "2", str(path), "-"],
-                       capture_output=True, text=True)
-    m = DOCID_IN_PDF.search(p.stdout or "")
-    return f"{m.group(1).upper()}{m.group(2)}" if m else None
 
 
 # ---------------------------------------------------------------- documents
@@ -974,9 +962,8 @@ if __name__ == "__main__":   # run `python3 doclib.py` to sanity check
     assert not rev_newer("1.1", "06 Jul 2020")
     assert rev_newer("16OCT2015", "10DEC2013") and not rev_newer("10DEC2013", "16OCT2015")
     # doc ids
-    assert DOCID_IN_PDF.search("RM0433 Rev 8") and not DOCID_IN_PDF.search("see RM0433 for details")
-    assert DOCID_IN_TITLE.search("Errata sheet (ES0392) Rev 5").group(2) == "0392"
-    assert DOCID_IN_TITLE.search("(RM0433)").group(2) == "0433"      # not "433"
+    assert DOCID_IN_PDF.search("RM0433 Rev 8").group(2) == "0433"    # not "433"
+    assert not DOCID_IN_PDF.search("see RM0433 for details")
     # Real page-1 text from ST's ES0392 errata sheet: the reference manual it cites
     # appears BEFORE its own ID, so a bare ID match picks the wrong document.
     es0392 = ("STM32H742xI/G STM32H743xI/G ... device errata ... based on RM0433 "
