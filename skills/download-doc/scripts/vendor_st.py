@@ -134,12 +134,6 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
     return list(found.values())
 
 
-# When you know only an ID, this prefix-resolves: the trailing hyphen is required
-# (es0392 404s, es0392- works) because ST's paths are <id>-<slug>.pdf.
-def url_from_id(doc_id: str, kind: str) -> str:
-    return f"{BASE}/resource/en/{kind.replace('-', '_')}/{doc_id.lower()}-.pdf"
-
-
 if __name__ == "__main__":
     docs = enumerate_docs(types=sys.argv[1].split(",") if len(sys.argv) > 1 else None)
     print(f"{len(docs)} docs")
