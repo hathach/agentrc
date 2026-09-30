@@ -71,12 +71,12 @@ Hardware documentation, from the Calibre library at `~/Documents/calibre-library
 | [`read-doc`](skills/read-doc/SKILL.md) | look up hardware manuals, specs and errata in Calibre instead of answering from memory | `search.py --kind reference-manual stm32h7` |
 | [`download-doc`](skills/download-doc/SKILL.md) | fetch vendor datasheets, manuals and errata into the library, refresh stale revisions | `sync.py st --family STM32H7 --types datasheet,errata` (dry run; `--apply` imports) |
 
-Board designs, from EAGLE and KiCad schematics in `adafruit/MBAdafruitBoards`,
-`hathach/pcb` or a directory you name:
+Board designs, from KiCad schematics in `hathach/pcb`, or EAGLE and KiCad
+schematics in a directory you name:
 
 | Skill | Use it to | Start with |
 |---|---|---|
-| [`read-pcb`](skills/read-pcb/SKILL.md) | answer board-wiring questions (which pin, net, part or revision) from the schematic | `pcb.py find feather rp2040`, then `net <sch> NEOPIX` |
+| [`read-pcb`](skills/read-pcb/SKILL.md) | answer board-wiring questions (which pin, net, part or revision) from the schematic | `pcb.py find --in <dir> <board>`, then `net <sch> <net>` |
 
 Firmware and USB debugging on real hardware; `target-debug` maps which one
 answers what, and the project supplies the build variant and board locks

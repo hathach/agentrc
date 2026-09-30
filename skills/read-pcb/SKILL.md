@@ -1,6 +1,6 @@
 ---
 name: read-pcb
-description: Use when a board-wiring question should be answered from the board's schematic rather than memory or a pinout image — which MCU pin or GPIO drives a signal, what sits on a net, what a connector, jumper or switch connects, a part's value, MPN or package, or what a given revision says — for Adafruit boards (adafruit/MBAdafruitBoards, EAGLE), the user's own boards (hathach/pcb, KiCad), or a design directory the user names; including while writing or debugging firmware for that board.
+description: Use when a board-wiring question should be answered from the board's schematic rather than memory or a pinout image — which MCU pin or GPIO drives a signal, what sits on a net, what a connector, jumper or switch connects, a part's value, MPN or package, or what a given revision says — for the user's boards in hathach/pcb (KiCad) and any other board repo READ_PCB_SOURCES lists (EAGLE or KiCad), or a design directory the user names; including while writing or debugging firmware for that board.
 ---
 
 # Read PCB
@@ -13,14 +13,16 @@ stands for that, and `pcb.py --help` lists the commands.
 
 ## Sources
 
-- `adafruit/MBAdafruitBoards`: Adafruit's board repo, EAGLE, private.
-- `hathach/pcb`: the user's boards, KiCad.
+- `hathach/pcb`: the user's boards, KiCad, the default source.
+- `READ_PCB_SOURCES` lists the source repos as `owner/repo`, separated like
+  `PATH`, in place of that default. On the user's PC it adds their other board
+  repos; a session without it sees `hathach/pcb` only.
 - Any location the user names, such as `~/code/jtrace/metro_m7_1011_trace`:
   `find --in PATH`, then query its files by filesystem path. It is not
   remembered; the user names it again next time.
 
-On the user's PC, `READ_PCB_CLONES=~/code/adafruit/MBAdafruitBoards:~/code/pcb`
-answers from those working trees. Elsewhere, as in a cloud session, answers
+On the user's PC, `READ_PCB_CLONES` lists its working trees of those repos,
+and answers come from them. Elsewhere, as in a cloud session, answers
 come from a cache the script fetches on every command. Where GitHub access is
 SSH only, set `READ_PCB_REMOTE_BASE=git@github.com:` before the first use; an
 existing cache keeps its origin, so delete `~/.cache/read-pcb/<owner>/<repo>`

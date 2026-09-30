@@ -8,7 +8,8 @@ Usage: pcb.py find KEYWORD...            schematics in the source repos
        pcb.py part SCH REF               one part and the net on each pin
        pcb.py net SCH NAME               every terminal on one net
 
-SCH is `owner/repo:path` in a source repo (SOURCES) or a filesystem path.
+SCH is `owner/repo:path` in a source repo or a filesystem path.
+READ_PCB_SOURCES lists the source repos as owner/repo (default hathach/pcb).
 READ_PCB_CLONES lists this machine's clones of the source repos; a source
 without one is read from a shallow, blobless clone under
 ~/.cache/read-pcb, fetched before every command. READ_PCB_REMOTE_BASE sets
@@ -357,11 +358,11 @@ def load_kicad_netlist(data, path):
 
 # ---- sources -----------------------------------------------------------------
 
-SOURCES = ("adafruit/MBAdafruitBoards", "hathach/pcb")
+REPO = r"[\w.-]+/[\w.-]+"
 SCHEMATICS = (".sch", ".kicad_sch")
 ORIGIN = re.compile(r"^(?:https://(?:[^@/\s]+@)?github\.com/|git@github\.com:|ssh://git@github\.com(?::22)?/)"
                     r"([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", re.I)
-SPEC = re.compile(r"^([\w.-]+/[\w.-]+):(.+)$")
+SPEC = re.compile(rf"^({REPO}):(.+)$")
 
 
 def git(repo, *args, lazy=False, fail=None):
@@ -396,8 +397,19 @@ def escapes(rel):
     return rel == ".." or rel.startswith("../") or rel.startswith("/")
 
 
+def sources():
+    listed = list(filter(None, os.environ.get("READ_PCB_SOURCES", "").split(os.pathsep)))
+    folded = [s.lower() for s in listed]
+    for i, s in enumerate(listed):
+        if not re.fullmatch(REPO, s) or {".", ".."} & set(s.split("/")):
+            raise Refusal(3, f"READ_PCB_SOURCES: {s!r} is not owner/repo")
+        if folded.index(folded[i]) != i:
+            raise Refusal(3, f"READ_PCB_SOURCES names {s} twice")
+    return tuple(listed) or ("hathach/pcb",)
+
+
 def source_named(name):
-    return next((s for s in SOURCES if s.lower() == name.lower()), None)
+    return next((s for s in sources() if s.lower() == name.lower()), None)
 
 
 def toplevel(path):
@@ -407,7 +419,7 @@ def toplevel(path):
 
 def clones():
     """{source: clone dir} from READ_PCB_CLONES; any doubt about an entry refuses."""
-    found = {}
+    found, listed = {}, sources()
     for entry in filter(None, os.environ.get("READ_PCB_CLONES", "").split(os.pathsep)):
         path = os.path.expanduser(entry)
         top = toplevel(path) if os.path.isdir(path) else None
@@ -418,7 +430,7 @@ def clones():
         repo = source_named(f"{m.group(1)}/{m.group(2)}") if m else None
         if repo is None:
             raise Refusal(3, f"READ_PCB_CLONES: {entry} has origin {out(url) or '(none)'}, "
-                             f"which is not one of {', '.join(SOURCES)}")
+                             f"which is not one of {', '.join(listed)}; list it in READ_PCB_SOURCES")
         if repo in found:
             raise Refusal(3, f"READ_PCB_CLONES names two clones of {repo}: {found[repo]} and {top}")
         found[repo] = top
@@ -596,7 +608,7 @@ def cmd_find(keywords, where):
         candidates = dir_candidates(where)
     else:
         candidates, local = [], clones()
-        for repo in SOURCES:
+        for repo in sources():
             try:
                 candidates += (git_candidates(local[repo], local[repo], f"{repo}:") if repo in local
                                else cache_candidates(repo))

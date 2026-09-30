@@ -44,6 +44,15 @@ os.utime(sch, ns=(st.st_atime_ns, st.st_mtime_ns))
 """
 
 
+def setUpModule():
+    # The host's own read-pcb settings would decide which clones and sources the tests see.
+    patcher = unittest.mock.patch.dict(os.environ)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+    for k in ('READ_PCB_CLONES', 'READ_PCB_SOURCES', 'READ_PCB_REMOTE_BASE'):
+        os.environ.pop(k, None)
+
+
 def run(*args):
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
@@ -394,7 +403,8 @@ class Repos(Tmp):
     def setUp(self):
         super().setUp()
         env = {'XDG_CACHE_HOME': str(self.tmp / 'cache'),
-               'READ_PCB_REMOTE_BASE': f'file://{self.tmp}/remotes/', 'READ_PCB_CLONES': ''}
+               'READ_PCB_REMOTE_BASE': f'file://{self.tmp}/remotes/', 'READ_PCB_CLONES': '',
+               'READ_PCB_SOURCES': os.pathsep.join(('acme/boards', 'hathach/pcb'))}
         patcher = unittest.mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -448,12 +458,32 @@ class Clones(Repos, Refusals):
             self.assertEqual(pcb.clones(), {'hathach/pcb': str(path)})
 
     def test_a_lookalike_host_is_not_github(self):
-        for i, url in enumerate(('https://notgithub.com/adafruit/MBAdafruitBoards.git',
-                                 'https://example.invalid/github.com/adafruit/MBAdafruitBoards.git',
-                                 'git@github.com.evil:adafruit/MBAdafruitBoards.git')):
+        for i, url in enumerate(('https://notgithub.com/acme/boards.git',
+                                 'https://example.invalid/github.com/acme/boards.git',
+                                 'git@github.com.evil:acme/boards.git')):
             self.clones(self.repo(f'h{i}', {}, url))
             with self.refused('is not one of'):
                 pcb.clones()
+
+    def test_the_sources_are_hathach_pcb_unless_listed(self):
+        self.assertEqual(pcb.sources(), ('acme/boards', 'hathach/pcb'))
+        with unittest.mock.patch.dict(os.environ, {'READ_PCB_SOURCES': ''}):
+            self.assertEqual(pcb.sources(), ('hathach/pcb',))
+
+    def test_a_source_that_is_not_one_owner_repo_or_is_listed_twice_is_refused(self):
+        for listed, why in ((('acme/boards', 'boards'), "'boards' is not owner/repo"),
+                            (('../outside',), "'../outside' is not owner/repo"),
+                            (('acme/..',), "'acme/..' is not owner/repo"),
+                            (('acme/boards\n',), "is not owner/repo"),
+                            (('ACME/Boards', 'acme/boards'), 'names acme/boards twice')):
+            with self.subTest(listed), unittest.mock.patch.dict(os.environ, {'READ_PCB_SOURCES': os.pathsep.join(listed)}), \
+                    self.refused(why):
+                pcb.sources()
+
+    def test_a_clone_of_an_unlisted_repo_is_refused(self):
+        self.clones(self.repo('b', {}, 'git@github.com:acme/boards.git'))
+        with unittest.mock.patch.dict(os.environ, {'READ_PCB_SOURCES': ''}), self.refused('is not one of hathach/pcb; list it in READ_PCB_SOURCES'):
+            pcb.clones()
 
     def test_doubtful_entries_are_refused_by_name(self):
         other = self.repo('other', {}, 'git@github.com:someone/else.git')
@@ -469,13 +499,13 @@ class Clones(Repos, Refusals):
 class LocalClone(Repos):
     def setUp(self):
         super().setUp()
-        self.clone = self.repo('mb clone', {'boards/Hub Rev A.sch': EAGLE.read_bytes(),
+        self.clone = self.repo('boards clone', {'boards/Hub Rev A.sch': EAGLE.read_bytes(),
                                             'boards/Hub Rev B.sch': EAGLE.read_bytes(),
                                             'boards/notes.txt': 'x'},
-                               'git@github.com:adafruit/MBAdafruitBoards.git')
+                               'git@github.com:acme/boards.git')
         self.pcb = self.repo('pcb', {}, 'git@github.com:hathach/pcb.git')
         self.clones(self.clone, self.pcb)
-        self.name = 'adafruit/MBAdafruitBoards:boards/Hub Rev B.sch'
+        self.name = 'acme/boards:boards/Hub Rev B.sch'
 
     def header(self, spec=None):
         code, out, err = run('nets', spec or self.name)
@@ -485,14 +515,14 @@ class LocalClone(Repos):
     def test_find_lists_every_revision_with_its_source_name(self):
         code, out, _ = run('find', 'hub')
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines(), ['adafruit/MBAdafruitBoards:boards/Hub Rev A.sch  [eagle]',
-                                            'adafruit/MBAdafruitBoards:boards/Hub Rev B.sch  [eagle]'])
+        self.assertEqual(out.splitlines(), ['acme/boards:boards/Hub Rev A.sch  [eagle]',
+                                            'acme/boards:boards/Hub Rev B.sch  [eagle]'])
         self.assertEqual(run('find', 'hub', 'rev b')[1].count('\n'), 1, 'keywords AND together')
         self.assertEqual(run('find', 'nosuch')[0], 1)
 
     def test_find_marks_modified_and_untracked_files(self):
-        self.write('mb clone/boards/Hub Rev B.sch', EAGLE.read_text().replace('10k', '22k'))
-        self.write('mb clone/boards/Hub Rev C.sch', EAGLE.read_bytes())
+        self.write('boards clone/boards/Hub Rev B.sch', EAGLE.read_text().replace('10k', '22k'))
+        self.write('boards clone/boards/Hub Rev C.sch', EAGLE.read_bytes())
         out = run('find', 'hub')[1]
         self.assertIn('Hub Rev B.sch  [eagle] [modified]', out)
         self.assertIn('Hub Rev C.sch  [eagle] [untracked]', out)
@@ -500,27 +530,27 @@ class LocalClone(Repos):
     def test_a_staged_rename_marks_only_the_new_path(self):
         git(self.clone, 'mv', 'boards/Hub Rev A.sch', 'boards/Hub Rev A2.sch')
         out = run('find', 'hub')[1].splitlines()
-        self.assertIn('adafruit/MBAdafruitBoards:boards/Hub Rev A2.sch  [eagle] [modified]', out)
-        self.assertIn('adafruit/MBAdafruitBoards:boards/Hub Rev B.sch  [eagle]', out)
+        self.assertIn('acme/boards:boards/Hub Rev A2.sch  [eagle] [modified]', out)
+        self.assertIn('acme/boards:boards/Hub Rev B.sch  [eagle]', out)
 
     def test_every_input_is_compared_with_the_one_commit_the_header_cites(self):
         old = git(self.clone, 'rev-parse', 'HEAD')
-        path = self.write('mb clone/boards/Hub Rev B.sch', EAGLE.read_text().replace('10k', '22k'))
+        path = self.write('boards clone/boards/Hub Rev B.sch', EAGLE.read_text().replace('10k', '22k'))
         git(self.clone, 'commit', '-qam', 'newer')
         self.assertEqual(pcb.worktree_state(str(self.clone), old, str(path), path.read_bytes()), 'modified')
         self.assertIn('working tree clean', run('nets', self.name)[1])
 
     def test_a_path_after_the_colon_cannot_leave_the_repository(self):
         self.write('outside.sch', EAGLE.read_bytes())
-        for spec in ('adafruit/MBAdafruitBoards:../outside.sch', f'adafruit/MBAdafruitBoards:{self.tmp}/outside.sch',
-                     'adafruit/MBAdafruitBoards:boards/../../outside.sch'):
-            self.assertRefused('must stay inside adafruit/MBAdafruitBoards', 'nets', spec, code=2)
+        for spec in ('acme/boards:../outside.sch', f'acme/boards:{self.tmp}/outside.sch',
+                     'acme/boards:boards/../../outside.sch'):
+            self.assertRefused('must stay inside acme/boards', 'nets', spec, code=2)
 
     def test_a_name_starting_with_two_dots_is_inside_the_repository(self):
-        self.write('mb clone/..board.sch', EAGLE.read_bytes())
+        self.write('boards clone/..board.sch', EAGLE.read_bytes())
         git(self.clone, 'add', '..board.sch')
         git(self.clone, 'commit', '-qm', 'dots')
-        name = 'adafruit/MBAdafruitBoards:..board.sch'
+        name = 'acme/boards:..board.sch'
         self.assertIn(f'source: {name} @', self.header(str(self.clone / '..board.sch')))
         self.assertIn('working tree clean', self.header(name))
 
@@ -535,7 +565,7 @@ class LocalClone(Repos):
     def test_a_deleted_file_is_skipped_and_the_rest_still_listed(self):
         (self.clone / 'boards' / 'Hub Rev A.sch').unlink()
         code, out, _ = run('find', 'hub')
-        self.assertEqual((code, out.splitlines()), (0, ['adafruit/MBAdafruitBoards:boards/Hub Rev B.sch  [eagle]']))
+        self.assertEqual((code, out.splitlines()), (0, ['acme/boards:boards/Hub Rev B.sch  [eagle]']))
         self.assertEqual(run('find', '--in', self.clone)[1].splitlines(), [f'{self.clone}/boards/Hub Rev B.sch  [eagle]'])
 
     def test_an_unreadable_candidate_is_reported_and_the_rest_still_listed(self):
@@ -551,10 +581,10 @@ class LocalClone(Repos):
         self.assertIn('search incomplete: 1 file(s) could not be classified', out)
 
     def test_a_git_failure_is_provenance_unavailable_not_a_state(self):
-        self.write('mb clone/boards/New.sch', EAGLE.read_bytes())
+        self.write('boards clone/boards/New.sch', EAGLE.read_bytes())
         (self.clone / '.git' / 'index').write_bytes(b'corrupt')
         self.assertIn('working tree clean', self.header(), 'a committed file needs only the commit')
-        self.assertIn('working tree provenance unavailable', self.header('adafruit/MBAdafruitBoards:boards/New.sch'))
+        self.assertIn('working tree provenance unavailable', self.header('acme/boards:boards/New.sch'))
 
     def test_a_clean_file_cites_its_source_commit_and_clone(self):
         sha = git(self.clone, 'rev-parse', 'HEAD')[:12]
@@ -565,14 +595,14 @@ class LocalClone(Repos):
         self.assertIn(f'source: {self.name} @', self.header(str(self.clone / 'boards' / 'Hub Rev B.sch')))
 
     def test_modified_means_the_bytes_read_differ_from_head_including_staged_only(self):
-        path = self.write('mb clone/boards/Hub Rev B.sch', EAGLE.read_text().replace('10k', '22k'))
+        path = self.write('boards clone/boards/Hub Rev B.sch', EAGLE.read_text().replace('10k', '22k'))
         self.assertIn('working tree modified', self.header())
         git(self.clone, 'add', str(path))
         self.assertIn('working tree modified', self.header(), 'staged but not committed')
 
     def test_untracked_and_no_head_are_named(self):
-        self.write('mb clone/boards/New.sch', EAGLE.read_bytes())
-        self.assertIn('working tree untracked', self.header('adafruit/MBAdafruitBoards:boards/New.sch'))
+        self.write('boards clone/boards/New.sch', EAGLE.read_bytes())
+        self.assertIn('working tree untracked', self.header('acme/boards:boards/New.sch'))
         empty = self.repo('empty', {'x.sch': EAGLE.read_bytes()}, commit=False)
         self.assertIn('@ (no HEAD)', self.header(str(empty / 'x.sch')))
 
@@ -658,20 +688,20 @@ class FindIn(Repos):
 
 
 class Cache(Repos, Refusals):
-    name = 'adafruit/MBAdafruitBoards:hub/Hub Rev A.sch'
+    name = 'acme/boards:hub/Hub Rev A.sch'
 
     def setUp(self):
         super().setUp()
-        self.mb = self.remote('adafruit/MBAdafruitBoards', {'hub/Hub Rev A.sch': EAGLE.read_bytes()})
+        self.boards = self.remote('acme/boards', {'hub/Hub Rev A.sch': EAGLE.read_bytes()})
         self.pcb = self.remote('hathach/pcb', kicad_files('k/'))
 
     def test_find_lists_eagle_untyped_and_only_kicad_roots(self):
         code, out, err = run('find', 'hub')
-        self.assertEqual((code, out.splitlines()), (0, ['adafruit/MBAdafruitBoards:hub/Hub Rev A.sch  [?]']), err)
+        self.assertEqual((code, out.splitlines()), (0, ['acme/boards:hub/Hub Rev A.sch  [?]']), err)
         self.assertEqual(run('find', 'kicad_sch')[1].splitlines(), ['hathach/pcb:k/board.kicad_sch  [kicad]'])
 
     def test_a_query_reads_the_fetched_commit_and_cites_it(self):
-        sha = git(self.mb, 'rev-parse', 'HEAD')[:12]
+        sha = git(self.boards, 'rev-parse', 'HEAD')[:12]
         code, out, err = run('net', self.name, 'SIG')
         self.assertEqual(code, 0, err)
         self.assertRegex(out.splitlines()[0], rf'^source: {self.name} @ {sha} '
@@ -679,14 +709,14 @@ class Cache(Repos, Refusals):
 
     def test_each_command_fetches_so_a_new_commit_is_read(self):
         self.assertIn('10k', run('parts', self.name, 'R1')[1])
-        self.push(self.mb, {'hub/Hub Rev A.sch': EAGLE.read_text().replace('value="10k"', 'value="47k"')})
+        self.push(self.boards, {'hub/Hub Rev A.sch': EAGLE.read_text().replace('value="10k"', 'value="47k"')})
         self.assertIn('47k', run('parts', self.name, 'R1')[1])
 
     def test_a_renamed_default_branch_is_followed(self):
         run('nets', self.name)
-        self.push(self.mb, {'hub/Hub Rev A.sch': EAGLE.read_text().replace('value="10k"', 'value="68k"')},
+        self.push(self.boards, {'hub/Hub Rev A.sch': EAGLE.read_text().replace('value="10k"', 'value="68k"')},
                   branch='trunk')
-        git(self.tmp / 'remotes' / 'adafruit/MBAdafruitBoards.git', 'symbolic-ref', 'HEAD', 'refs/heads/trunk')
+        git(self.tmp / 'remotes' / 'acme/boards.git', 'symbolic-ref', 'HEAD', 'refs/heads/trunk')
         self.assertIn('68k', run('parts', self.name, 'R1')[1])
 
     def test_two_first_uses_at_once_share_one_cache(self):
@@ -697,8 +727,8 @@ class Cache(Repos, Refusals):
             out, err = p.communicate()
             self.assertEqual(p.returncode, 0, err)
             self.assertIn('Hub Rev A.sch', out)
-        self.assertEqual({p.name for p in (self.tmp / 'cache' / 'read-pcb' / 'adafruit').iterdir()},
-                         {'MBAdafruitBoards', 'MBAdafruitBoards.lock'})
+        self.assertEqual({p.name for p in (self.tmp / 'cache' / 'read-pcb' / 'acme').iterdir()},
+                         {'boards', 'boards.lock'})
 
     def test_a_kicad_blob_that_cannot_be_read_makes_the_search_incomplete(self):
         real = pcb.Cache.read
@@ -716,11 +746,11 @@ class Cache(Repos, Refusals):
 
     def test_a_reachable_source_answers_while_the_other_fails(self):
         self.push(self.pcb, {'e/board.sch': EAGLE.read_bytes()})
-        shutil.rmtree(self.tmp / 'remotes' / 'adafruit')
+        shutil.rmtree(self.tmp / 'remotes' / 'acme')
         code, out, _ = run('find', 'kicad_sch')
         self.assertEqual(code, 3)
         self.assertEqual(out.splitlines()[0], 'hathach/pcb:k/board.kicad_sch  [kicad]')
-        self.assertIn('search incomplete: adafruit/MBAdafruitBoards unavailable', out)
+        self.assertIn('search incomplete: acme/boards unavailable', out)
         self.assertEqual(run('net', 'hathach/pcb:e/board.sch', 'SIG')[0], 0)
         self.assertRefused('cannot clone', 'nets', self.name)
 
