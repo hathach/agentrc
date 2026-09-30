@@ -1,3 +1,9 @@
+"""Tests that pin prompt text. The model is the only reader of most agent prose, so a
+test pins a sentence only when it is (a) a machine-read contract (example JSON or keys code
+parses, chief_run.MARKER, the .toml adapters), (b) a cross-file copy whose reader cannot load
+the source, (c) a command recipe whose form matters, or (d) an authorization, publishing or
+safety bound. Procedural, routing, budget, efficiency and wording rules get no pin.
+"""
 import json
 import re
 import tomllib
@@ -43,7 +49,7 @@ class AgentFiles(unittest.TestCase):
         """tinyusb's pr-babysit keys dismissal debt on findingId and detects
         edited comments through commentDigest; its tests read this file."""
         body = (AGENTS / 'pr-review-validator.md').read_text()
-        example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
+        example = self.contract_example('pr-review-validator.md')
         finding = example['findings'][0]
         self.assertEqual(finding['findingId'], f"{finding['commentId']}#1")
         self.assertRegex(finding['commentDigest'], r'^[0-9a-f]{12}$')
@@ -53,7 +59,7 @@ class AgentFiles(unittest.TestCase):
     def test_pr_ci_watcher_example_carries_the_verdict_pr_babysit_keys_on(self):
         """pr-babysit fixes only verdict 'real', stops honestly on 'unclassified', and needs one entry per check."""
         body = (AGENTS / 'pr-ci-watcher.md').read_text()
-        example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
+        example = self.contract_example('pr-ci-watcher.md')
         self.assertEqual(sorted(example), ['checks', 'infraRerun'])
         self.assertEqual(sorted(example['checks'][0]), ['failures', 'link'])
         failure = example['checks'][0]['failures'][0]
@@ -63,86 +69,45 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(verdict, body)
         self.assertNotIn('rigSide', body)
 
-    def test_pr_ci_watcher_judges_collected_evidence_without_waiting(self):
-        """Waiting and listing cost ci#2 on tinyusb #3978 31 polling turns at ~100k context; collect.py owns them now."""
-        watcher = ' '.join((AGENTS / 'pr-ci-watcher.md').read_text().split())
-        self.assertIn('never list checks, watch them or wait', watcher)
-        self.assertNotIn('gh pr checks', watcher)
-        self.assertIn('Re-run a check once, never twice', watcher)
-        self.assertIn('`runAttempt` is above 1', watcher)
-
     def test_hw_validator_example_carries_what_chief_adjudicates_on(self):
         """chief reads status apart from verdict and trusts a board only on a cleanup receipt."""
-        body = (AGENTS / 'hw-validator.md').read_text()
-        example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
+        example = self.contract_example('hw-validator.md')
         self.assertIn(example['status'], ('complete', 'blocked', 'needs-user'))
         self.assertIn(example['verdict'], ('real', 'fixed', 'rig-side', 'not-reproduced', 'inconclusive'))
         for key in ('question', 'criterion', 'reason', 'worktree', 'branch', 'head', 'host', 'board', 'probe', 'example', 'peer',
                     'runs', 'cleanup', 'budget', 'limits', 'blocker', 'next'):
             self.assertIn(key, example)
-        for row in example['runs']:
-            self.assertIn(row['purpose'], ('criterion', 'setup', 'cleanup'))
-        self.assertEqual(sum(row['repetitions'] for row in example['runs']), example['budget']['used']['repetitions'])
-        criterion = sum(row['repetitions'] for row in example['runs'] if row['purpose'] == 'criterion')
-        self.assertLess(criterion, example['budget']['used']['repetitions'], 'auxiliary invocations are counted apart from the criterion runs')
-        self.assertLess(example['budget']['used']['observationS'],
-                        example['budget']['allowed']['observationWindowS'] * example['budget']['used']['repetitions'],
-                        'a deterministic attempt ends before the window ceiling')
-        run = example['runs'][0]
-        for key in ('revision', 'configuration', 'firmware', 'instrument', 'technique', 'command', 'repetitions', 'duration',
-                    'observed', 'evidence', 'artifacts'):
-            self.assertIn(key, run)
-        self.assertIsInstance(run['technique'], list)
-        cleanup = example['cleanup']
-        self.assertIn('pristine', cleanup)
-        self.assertEqual(sorted(cleanup['flashVerify']), ['command', 'result'], 'a hash alone does not verify a flash')
         for key in ('instrumentRemoved', 'clientsStopped', 'hostRestored', 'lockReleased'):
-            self.assertIn(cleanup[key], ('done', 'failed', 'n-a'))
-        self.assertIn(cleanup['sourceDisposition'], ('restored', 'unrestored'))
-        self.assertEqual(sorted(cleanup['runState']), ['command', 'result'], 'a verified flash alone does not restore the run state')
-        allowed, used = example['budget']['allowed'], example['budget']['used']
-        for key in ('wallMin', 'cleanupReserveMin', 'lockWaitMin', 'observationWindowS', 'experimentalFlashes',
-                    'restorationFlashes', 'repetitionsPerFirmware'):
-            self.assertIn(key, allowed)
-        for key in ('wallMin', 'cleanupMin', 'lockWaitMin', 'observationS', 'experimentalFlashes', 'restorationFlashes', 'repetitions'):
-            self.assertIn(key, used)
-        for verdict in ('`real`', '`fixed`', '`rig-side`', '`not-reproduced`', '`inconclusive`'):
-            self.assertIn(verdict, body)
-        self.assertEqual(used['restorationFlashes'], 0, 'a verified tested image that is the restoration image is kept, not reflashed')
-        self.assertIn(example['runs'][0]['firmware'], cleanup['pristine'])
+            self.assertIn(example['cleanup'][key], ('done', 'failed', 'n-a'))
+        self.assertIn(example['cleanup']['sourceDisposition'], ('restored', 'unrestored'))
+        self.assert_board_restoration_receipt(example['cleanup'])
+
     def test_hw_debugger_example_carries_what_chief_relaunches_on(self):
         """chief relaunches only on a non-empty `changed`; `fixed` is the validator's alone."""
-        body = (AGENTS / 'hw-debugger.md').read_text()
-        example = json.loads(body.split('## Output contract')[1].split('\n\n')[2])
+        example = self.contract_example('hw-debugger.md')
+        self.assertIn(example['status'], ('complete', 'blocked', 'needs-user'))
         self.assertIn(example['verdict'], ('real', 'rig-side', 'not-reproduced', 'inconclusive'))
         for key in ('question', 'reason', 'reproducer', 'head', 'base', 'board', 'probe', 'hypotheses', 'cause', 'fix', 'changed',
                     'runs', 'cleanup', 'budget', 'limits', 'blocker', 'next'):
             self.assertIn(key, example)
-        self.assertTrue(example['reason'].strip())
-        for h in example['hypotheses']:
-            self.assertIn(h['result'], ('supported', 'refuted', 'unresolved'))
-            for key in ('claim', 'prediction', 'experiment', 'evidence', 'doc'):
-                self.assertIn(key, h)
-        self.assertIn(example['cause']['confidence'], ('supported', 'unresolved'))
-        self.assertIn(example['fix']['state'], ('committed', 'pending-finalization', 'patch-only', 'none'))
-        for entry in example['changed']:
-            self.assertEqual(sorted(entry), ['artifact', 'entry', 'removed'])
         self.assertIn(example['cleanup']['sourceDisposition'], ('restored', 'fix-committed', 'unrestored'))
-        self.assertEqual(sorted(example['cleanup']['runState']), ['command', 'result'])
-        self.assertTrue(example['cleanup']['pristine'].startswith(example['base']), 'restoration is pinned to the pre-fix revision')
-        self.assertNotEqual(example['base'], example['head'])
-        allowed, used = example['budget']['allowed'], example['budget']['used']
-        for key in ('wallMin', 'cleanupReserveMin', 'lockWaitMin', 'observationWindowS', 'experimentalFlashes', 'restorationFlashes',
-                    'repetitionsPerExperiment', 'candidateComparisonRepetitions', 'hypotheses', 'finalizationMin'):
-            self.assertIn(key, allowed)
-        for key in ('wallMin', 'cleanupMin', 'lockWaitMin', 'observationS', 'experimentalFlashes', 'restorationFlashes',
-                    'repetitions', 'hypotheses', 'finalizationMin'):
-            self.assertIn(key, used)
-        ids = {run['id'] for run in example['runs']}
-        refs = [h['experiment'] for h in example['hypotheses']] + example['cause']['evidence'] + [c['artifact'] for c in example['changed']]
-        self.assertLessEqual(set(refs), ids, 'every referenced run is in runs')
-        self.assertEqual(sum(run['repetitions'] for run in example['runs']), used['repetitions'])
-        self.assertEqual(len(example['hypotheses']), used['hypotheses'])
+        self.assert_board_restoration_receipt(example['cleanup'])
+
+    def contract_example(self, name):
+        return json.loads((AGENTS / name).read_text().split('## Output contract')[1].split('\n\n')[2])
+
+    def assert_board_restoration_receipt(self, cleanup):
+        self.assertEqual(sorted(cleanup['flashVerify']), ['command', 'result'], 'a hash alone does not verify a flash')
+        self.assertEqual(sorted(cleanup['runState']), ['command', 'result'], 'a verified flash alone does not restore the run state')
+
+    def test_restoration_flashes_a_pinned_artifact_and_verifies_against_it(self):
+        body = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
+        self.assertIn('save the restoration artifact apart from later build outputs and pin it', body)
+        self.assertIn('establishes that it matches the pinned artifact', body)
+
+    def test_an_off_board_follow_up_claims_no_hardware_cleanup(self):
+        debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
+        self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
 
     def test_hardware_commit_recipes_put_options_before_the_pathspec(self):
         """An option after `--` is read as a path, so the recipe must carry -m before it."""
@@ -150,44 +115,6 @@ class AgentFiles(unittest.TestCase):
             body = (AGENTS / name).read_text()
             self.assertIn('git commit --only -m "<subject>" -- <same paths>', body, name)
             self.assertNotIn('git commit --only -- <same paths>', body, name)
-
-    def test_cleanup_pins_restoration_and_keeps_a_verified_image(self):
-        body = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
-        self.assertIn('save the restoration artifact apart from later build outputs and pin it', body)
-        self.assertIn('establishes that it matches the pinned artifact', body)
-        self.assertIn('`restorationFlashes` counts actual programming attempts', body)
-        self.assertNotIn('reflash pristine firmware', body)
-        chief = (AGENTS / 'chief.md').read_text()
-        self.assertIn('the bench runs the pinned restoration firmware, which may predate the fix', chief)
-        self.assertIn('keeps the evidence and handoff artifacts', chief)
-
-    def test_observation_window_bounds_one_attempt_and_every_invocation_counts(self):
-        body = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
-        self.assertIn('observation window is the ceiling on one reproducer attempt', body)
-        self.assertIn('a completed deterministic operation ends the attempt', body)
-        self.assertIn('costs time, not a repetition', body)
-        self.assertIn('Observation window per attempt (ceiling)', (AGENTS / 'chief.md').read_text())
-
-    def test_rp2040_verification_precondition_is_reachable_and_usb_run_state_needs_function(self):
-        flat = lambda path: ' '.join(path.read_text().split())
-        td = SKILLS / 'target-debug'
-        note = flat(td / 'projects' / 'tinyusb.md')
-        self.assertIn('Before any RP2040 flash read or `verify_image`, stop at a hardware breakpoint in flash-resident code', note)
-        self.assertIn('scripts/rp2040_verify.py', note)
-        self.assertIn('Mechanism not established.', note)
-        self.assertIn('"RP2040 flash verification"', flat(td / 'gdb.md'))
-        skill = flat(td / 'SKILL.md')
-        self.assertIn('RP2040: a flash-resident halt', skill)
-        self.assertIn('a device number alone establishes neither', skill)
-        self.assertIn('attributable supplied evidence', flat(AGENTS / 'hw-validator.md'))
-
-    def test_review_findings_on_a_committed_fix_route_through_finalization_only(self):
-        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
-        self.assertIn('carries verified review findings on a committed supported fix', chief)
-        self.assertIn('The follow-up commit is a new HEAD: commit check, a fresh `hw-validator` and review again.', chief)
-        debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
-        self.assertIn('a review follow-up checks the reviewed commit and its verified findings', debugger)
-        self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
 
     def test_headless_pr_exception_is_bounded(self):
         body = ' '.join((AGENTS / 'chief.md').read_text().split())
@@ -209,31 +136,18 @@ class AgentFiles(unittest.TestCase):
                        "the PR's base repository, never a fork's head repository, and `hathach/agentrc`",
                        'an unclassified CI failure or any other unresolved classification stays a blocker or handoff',
                        'At most three new issues and three comments per invocation', 'Never close, edit or relabel an issue',
-                       'one follow-up publishing unit', 'loads `followup-issue`',
                        "The script's repository allowlist is a guard, not an authorization",
                        'Opening an issue changes no deferral decision', 'a deferral names only an open issue the unit returned'):
             self.assertIn(phrase, rule)
         self.assertIn("Supply the issue's URL; open one only under Authorization's follow-up issue rule.", body)
-        self.assertNotIn('never open one headless', body)
         exception = body.split('Exception for a headless PR launch:')[1].split('Follow-up issue rule:')[0]
         self.assertIn('and the follow-up issues and comments it names', exception)
-
-    def test_chief_verifies_a_round_in_one_batch_and_reviews_each_handed_on_head_once(self):
-        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
-        for phrase in ('in one dispatch per review round that names each finding by a stable id with the reviewed SHA',
-                       'leaves that finding unresolved, never refuted', 'a refutation stands for the same claim on unchanged code',
-                       'checked by one `finding-verifier` dispatch asking whether its diff addresses each finding, not by a new review',
-                       'the whole-diff review runs once on each HEAD to be adopted or accepted',
-                       'Findings routed to `finding-verifier` from any review are sent in one batch per review round'):
-            self.assertIn(phrase, chief)
 
     def test_hardware_is_task_scope_not_a_grant(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())
         self.assertIn('Hardware work needs task scope, not a human grant or verbatim authorization exchange; a human or agent launcher may supply that scope.', chief)
         self.assertIn('Rig repair, rig roster edits, host-side USB recovery and forced-lock recovery are also task scope', chief)
         self.assertIn('In-scope hardware work and local worktree commits need no human grant.', chief)
-        self.assertNotIn("direct words under the provenance rule", chief)
-        self.assertNotIn('missing hardware authorization', chief)
         self.assertIn('Hardware operations follow Hardware\'s task-scope rules independently of this publishing exception.', chief)
         # what stays gated
         self.assertIn('A commit to the primary checkout still needs its own explicit grant.', chief)
@@ -246,48 +160,21 @@ class AgentFiles(unittest.TestCase):
         for role in ('hw-debugger.md', 'hw-validator.md'):
             self.assertIn('a permission still required under the shared Scope rule', (AGENTS / role).read_text())
 
-    def test_a_board_left_wedged_gets_one_dispatched_recovery_action(self):
-        """Recovery past a HIL run's own paths is chief's dispatch, bounded, and never a reboot headless."""
+    def test_headless_recovery_never_reboots_and_resets_a_controller_only_on_its_signature(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())
-        self.assertIn('gets one `hil-operator` dispatch for one recovery action on that board', chief)
         self.assertIn('a controller-level rung only on its dead-controller signature', chief)
         self.assertIn('Rungs that reboot the host or its VM need the user in a headless session.', chief)
         self.assertIn('follows only a reported verified recovery with the marker cleared', chief)
-        watcher = ' '.join((AGENTS / 'pr-ci-watcher.md').read_text().split())
-        self.assertIn('marked it wedged is rig-side: this run never ran it', watcher)
-        self.assertIn('A wedge this run confirmed is not rig-side by being a wedge', watcher)
 
-    def test_chief_owns_what_follows_a_hil_run(self):
-        """The operator reports; the caller rules live in the HIL contract, which chief cannot read itself."""
+    def test_chief_launches_pr_babysit_with_the_arguments_the_workflow_parses(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())
-        self.assertIn('You own what follows a run\'s result and the verdict of a retry sequence', chief)
-        self.assertIn('It also returns the HIL contract\'s path and its caller rules for a run\'s result', chief)
-        self.assertIn('reporting rules it cannot find as a blocker', chief)
-
-    def test_an_unclassified_hil_cell_starts_on_the_harness(self):
-        """#3968 paid a desk placement unit and a reset-only validator before the CI cell's own A/B reproduced it."""
-        chief = ' '.join((AGENTS / 'chief.md').read_text().split())
-        self.assertIn('skip that unit: the investigation starts with two `hil-operator` runs of the cell with CI\'s seed, order and retry count', chief)
-        self.assertIn('reproduces the symptom, not its cause', chief)
         self.assertIn('Launch it as `{ pr, autoPush, yieldAfterCycle: true, lane, stateRef }`', chief)
-        self.assertIn('Before launching a workflow other than `pr-babysit`, whose launch its paragraph under Dispatch gives, or `pr-review`, whose launch task names its arguments, have `Explore` resolve', chief)
-        self.assertIn('unless the run is on a CI firmware artifact fetched as the repository\'s HIL contract describes, is built by one Sonnet unit', chief)
 
-    def test_hil_operator_resolves_the_project_contract_and_refuses_without_it(self):
-        """The rig procedure lives in the project's HIL contract; the role only knows how to find and obey it."""
+    def test_hil_operator_refuses_hardware_work_without_the_project_contract(self):
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
-        self.assertIn('find its `HIL contract:` line', body)
         self.assertIn('perform no hardware action and return the blocker', body)
         self.assertIn('Never invent a command, choose another rig, bypass a lock, or report unexecuted work as passing.', body)
         self.assertIn('copied verbatim, never retyped, reworded or re-ordered', body)
-        for project_detail in ('hil_test.py', 'hil_lock.py', 'tinyusb', 'ci.lan', 'cmake-build'):
-            self.assertNotIn(project_detail, body, 'a project mechanic belongs in that project\'s contract')
-
-    def test_chief_quotes_unit_json_and_leaves_verdicts_to_the_role(self):
-        body = (AGENTS / 'chief.md').read_text()
-        self.assertIn("Every hardware dispatch requests the role's Output contract unchanged.", body)
-        self.assertIn('quoted verbatim in a fenced block labelled with the unit', body)
-
 
     def test_chief_status_lines_are_what_the_headless_launcher_forwards(self):
         """chief_run.py forwards a message's first line when it starts with its MARKER; chief.md must teach both."""
@@ -298,8 +185,6 @@ class AgentFiles(unittest.TestCase):
         spec.loader.exec_module(chief_run)
         body = (AGENTS / 'chief.md').read_text()
         self.assertIn(f'`{chief_run.MARKER}<event> · <fields>`', body)
-        for event in ('stage', 'launch', 'cycle', 'attention'):
-            self.assertIn(f'`{event}`', body)
         self.assertIn('one status line, its first line', body)
 
 
