@@ -162,6 +162,7 @@ class LaunchResultTest(unittest.TestCase):
             'unactionable', 'wrong-branch', 'wrong-head', 'wrong-remote', 'yielded'}
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
+        reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
         self.assertFalse(handled_elsewhere & set(launch_result.REFUSED))
         self.assertEqual(reasons, handled_elsewhere | set(launch_result.REFUSED),
                          'a stop reason was added or renamed: give it a REFUSED response or name it here')
