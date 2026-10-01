@@ -65,8 +65,9 @@ The workflow's own contract (`workflows/pr-babysit.js`).
   result shows beside a failure: never fixed, and a run red only from them
   passes, listing them. Per launch.
 - `deferrals`: `[{ findingId, commentDigest, issueUrl, reason }]`: valid
-  findings left to an existing issue, answered with it; kept in the state
-  while the comment body stands.
+  findings left to an existing issue, answered with it; without `issueUrl`,
+  left as is by the PR owner's decision, answered with its reason. Kept in
+  the state while the comment body stands.
 - `yieldAfterCycle`: run one cycle and return the state for the next launch.
 - `lane`: `both` (default), `ci` or `reviews`; a single lane needs
   `yieldAfterCycle` and never declares the PR done.

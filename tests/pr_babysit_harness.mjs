@@ -3189,31 +3189,33 @@ test('a reply already there is not reused while the harvest leaves out a point i
   assert.match(whole.result.handoffs.find(h => h.commentId === 2).why, /^reply 502: .*; it offered a \w[\w ]*, the comment now owes a refutation$/)
 })
 
-test('a partial harvest preserves a mixed fix and deferral reply for later exact reuse', async () => {
-  const args = { autoPush: true, maxCycles: 5, yieldAfterCycle: true,
-    deferrals: [deferral({ findingId: '2#5', commentDigest: 'd2' })] }
-  const reviews = { findings: [finding({ commentId: 2, line: 4 }), finding({ commentId: 2, line: 5 })],
-    replies: [], bots: 'reviewed' }
-  const first = await run(heldForRepair({ args, reviews }))
-  const attempt = { ...debtOf(first.result, 2).attempt }
-  assert.equal(attempt.how, 'fixNote')
-  assert.equal(debtOf(first.result, 2).repair.replyId, 502)
-  const offered = asOffered(attempt.body)
+test('a partial harvest preserves a mixed fix and deferral reply for later exact reuse, the deferral tracked or the owner\'s', async () => {
+  for (const issueUrl of [ISSUE, undefined]) {
+    const args = { autoPush: true, maxCycles: 5, yieldAfterCycle: true,
+      deferrals: [deferral({ findingId: '2#5', commentDigest: 'd2', issueUrl })] }
+    const reviews = { findings: [finding({ commentId: 2, line: 4 }), finding({ commentId: 2, line: 5 })],
+      replies: [], bots: 'reviewed' }
+    const first = await run(heldForRepair({ args, reviews }))
+    const attempt = { ...debtOf(first.result, 2).attempt }
+    assert.equal(attempt.how, 'fixNote')
+    assert.equal(debtOf(first.result, 2).repair.replyId, 502)
+    const offered = asOffered(attempt.body)
 
-  const partial = await resumeAt(first.result.state, { args, ...offered,
-    reviews: { ...reviews, findings: [reviews.findings[1]] } })
-  assert.deepEqual(debtOf(partial.result, 2).attempt, attempt)
-  assert.deepEqual(debtOf(partial.result, 2).notes, ['2#4', '2#5'])
-  assert.equal(partial.result.handoffs, undefined)
-  assert.equal(partial.labels.some(l => /^(inspect|reuse)#/.test(l)), false)
+    const partial = await resumeAt(first.result.state, { args, ...offered,
+      reviews: { ...reviews, findings: [reviews.findings[1]] } })
+    assert.deepEqual(debtOf(partial.result, 2).attempt, attempt)
+    assert.deepEqual(debtOf(partial.result, 2).notes, ['2#4', '2#5'])
+    assert.equal(partial.result.handoffs, undefined)
+    assert.equal(partial.labels.some(l => /^(inspect|reuse)#/.test(l)), false)
 
-  const whole = await resumeAt(partial.result.state, { args, ...offered, reviews })
-  assert.ok(whole.labels.includes('inspect#3'))
-  assert.ok(whole.labels.includes('reuse#3'))
-  assert.ok(whole.logs.some(l => /cycle 3: comment 2 settled on reply 502, already there/.test(l)))
-  assert.equal(whole.result.state.debt.some(([id]) => id === 2), false)
-  assert.equal(whole.result.state.answeredWith.find(([id]) => id === 2)[1].how, 'fixNote')
-  assert.equal(whole.result.handoffs, undefined)
+    const whole = await resumeAt(partial.result.state, { args, ...offered, reviews })
+    assert.ok(whole.labels.includes('inspect#3'))
+    assert.ok(whole.labels.includes('reuse#3'))
+    assert.ok(whole.logs.some(l => /cycle 3: comment 2 settled on reply 502, already there/.test(l)))
+    assert.equal(whole.result.state.debt.some(([id]) => id === 2), false)
+    assert.equal(whole.result.state.answeredWith.find(([id]) => id === 2)[1].how, 'fixNote')
+    assert.equal(whole.result.handoffs, undefined)
+  }
 })
 
 // Comment 1 with two deferred points, left owed by a dry run.
@@ -3312,7 +3314,7 @@ const ISSUE = 'https://github.com/hathach/tinyusb/issues/4000'
 const deferral = (over = {}) => ({ findingId: '1#1', commentDigest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR', ...over })
 
 test('deferrals are checked for shape before anything runs', async () => {
-  for (const deferrals of ['1#1', [{ ...deferral(), findingId: '1' }], [deferral({ issueUrl: 'https://github.com/o/r/pull/3' })],
+  for (const deferrals of ['1#1', [{ ...deferral(), findingId: '1' }], [deferral({ issueUrl: 'https://github.com/o/r/pull/3' })], [deferral({ issueUrl: null })],
     [deferral({ reason: ' ' })], [deferral({ commentDigest: '' })], [deferral(), deferral()]]) {
     const trace = []
     await assert.rejects(run({ args: { deferrals }, trace }), /deferrals must be/, JSON.stringify(deferrals))
@@ -3331,7 +3333,24 @@ test('a deferred finding is not fixed, is answered with its issue, and the run p
   assert.deepEqual(result.deferrals, [{ findingId: '1#1', issueUrl: ISSUE }])
   assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR' }]])
   assert.deepEqual(result.state.answeredWith.find(([id]) => id === 1)[1], { how: 'deferral', digest: 'd1' })
-  assert.match(rowsOf(summaries(logs)[0])[0][3], /^deferred, answered with the issue: https:\/\/github\.com\/hathach\/tinyusb\/issues\/4000$/)
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /^deferred, answered as deferred: https:\/\/github\.com\/hathach\/tinyusb\/issues\/4000$/)
+})
+
+test("a finding the PR owner decided not to fix is deferred with no issue: not fixed, answered with the decision, listed on pass (#37)", async () => {
+  const owner = deferral({ issueUrl: undefined, reason: 'the unpinned install is intentional' })
+  const { result, calls, labels } = await run({ reviews: oneValid, args: { deferrals: [owner] } })
+  assert.equal(labels.some(l => /^(fix:|issue#)/.test(l)), false, 'no writer, and no issue to read')
+  assert.equal(manifestOf(calls, 'defer#1')[0].body, "- src/a.c:1: Left as is, by the PR owner's decision: the unpinned install is intentional.")
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.deepEqual(result.deferrals, [{ findingId: '1#1', ownerDecision: 'the unpinned install is intentional' }])
+  assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', reason: 'the unpinned install is intentional' }]])
+  // Resumed with the decision passed again, it is the same decision, not a changed one.
+  const again = await run({ reviews: oneValid, args: { deferrals: [owner], state: result.state, maxCycles: 3 } })
+  assert.notEqual(again.result.reason, 'deferral-refused', JSON.stringify(again.result.detail))
+  // On a mixed comment it rides in the fix note.
+  const mixed = { findings: [finding({ findingId: '1#1', claim: 'pin it' }), finding({ findingId: '1#2', line: 2, claim: 'in scope' })], replies: [], bots: 'reviewed' }
+  const withFix = await run({ reviews: mixed, args: { deferrals: [owner] } })
+  assert.match(manifestOf(withFix.calls, 'resolve#1')[0].body, /\n\n- src\/a\.c:1: Left as is, by the PR owner's decision: the unpinned install is intentional\.$/)
 })
 
 test('a deferral reply that is not verified leaves the comment owed', async () => {
