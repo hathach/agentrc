@@ -30,6 +30,7 @@ from facts import Parser, Unusable, git, report  # noqa: E402
 
 CONDENSED = ('history', 'observation', 'state')
 NOT_FIXING = re.compile(r'^cycle \d+: rig-side CI failure \(not fixing\)')
+IDE_DRIFT = re.compile(r'(?:.*/)?\.idea/')
 CUT = 300
 ADOPTION_REFUSED = 'the adoption was refused: investigate and report it, never answer it with a reset or a fabricated state'
 # budget-exhausted-unverified is no longer produced; kept so an older launch's output still reads.
@@ -129,6 +130,11 @@ def logs(lines):
     return kept + ([f'({dropped} rig-side "not fixing" lines, one per failure listed under ci)'] if dropped else [])
 
 
+def ide_drift(line):
+    """The workflow's IDE_DRIFT rule over a `git status --porcelain` line: every path it names lies under an .idea/ directory."""
+    return all(IDE_DRIFT.match(p) for p in line[3:].split(' -> '))
+
+
 def checkout(path):
     return {'branch': git('-C', path, 'rev-parse', '--abbrev-ref', 'HEAD').strip(),
             'head': git('-C', path, 'rev-parse', 'HEAD').strip(),
@@ -185,8 +191,11 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
                                    ('checkout', tree and tree['head'])) if v}
         if len(set(heads.values())) > 1:
             blockers.append(f'heads disagree: {heads}')
-    if tree and tree['dirty']:
-        blockers.append(f'the checkout is dirty: {tree["dirty"][:10]}')
+    dirty = [l for l in (tree or {}).get('dirty') or [] if not ide_drift(l)]
+    if tree and len(dirty) < len(tree['dirty']):
+        notes.append(f'ignoring {len(tree["dirty"]) - len(dirty)} dirty .idea/ path(s) (IDE metadata)')
+    if dirty:
+        blockers.append(f'the checkout is dirty: {dirty[:10]}')
     if summary['stateRef'] is None and state_ref:
         summary['stateRef'] = state_ref
         notes.append('this launch returned no new state: continue from the stateRef it was given')

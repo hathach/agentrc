@@ -234,6 +234,17 @@ class LaunchResultTest(unittest.TestCase):
         self.assertTrue(any(b.startswith('heads disagree') and "'checkout'" in b for b in s['blockers']))
         self.assertIn("the checkout is dirty: ['?? left.txt']", s['blockers'])
 
+    def test_dirty_ide_metadata_is_a_note_as_in_the_workflow_preflight(self):
+        tree = {'branch': 'pr', 'head': NEXT, 'dirty': [' M .idea/misc.xml', '?? .idea/inspectionProfiles/', ' M sub/.idea/x.xml']}
+        s = launch_result.summarize(output(), '/t/w.output', tree=tree)
+        self.assertEqual(s['blockers'], [])
+        self.assertIn('ignoring 3 dirty .idea/ path(s) (IDE metadata)', s['notes'])
+        self.assertEqual(s['checkout']['dirty'], tree['dirty'], 'the checkout is reported raw')
+        for other in ('?? .idea-like/a', ' M src/.idea.c', 'R  .idea/a -> src/b.c', 'R  src/b.c -> sub/.idea/a', '?? "a\\tb.c"'):
+            with self.subTest(other):
+                s = launch_result.summarize(output(), '/t/w.output', tree={**tree, 'dirty': [' M .idea/misc.xml', other]})
+                self.assertEqual(s['blockers'], [f'the checkout is dirty: {[other]}'])
+
     def test_any_stop_reason_keeps_its_own_fields(self):
         pending = {'lane': 'adopt', 'sha': NEXT, 'parent': HEAD, 'stage': 'push-unknown'}
         data = output(result={'reason': 'adopt-pending', 'pending': pending, 'detail': 'x', 'acceptedFailures': [{'cell': 'c'}],
