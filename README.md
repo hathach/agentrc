@@ -164,15 +164,20 @@ Headless, launch it through the [`headless-chief`](skills/headless-chief/SKILL.m
 skill, which runs `claude -p --agent chief` and gives the caller chief's status
 lines while it runs and its report when it exits.
 
-For headless PR publishing, follow `agents/chief.md`'s Authorization exception
-before launching; a PR review submits under its own PR review exception, as
-`skills/pr-review/SKILL.md` asks it; its pending reviews need no exchange, under chief's standing exception. The PR launch question also names opening follow-up issues and commenting on
-them in the PR's base repository and `hathach/agentrc`; an exchange without
-it lets chief open none. Include the named PR, head repository and branch, expected
-HEAD, worktree, task scope and the verbatim authorization exchange in the
-task, and, when a pr-babysit launch continues an earlier chief's run, that
-run's last reported `stateRef`. Leave the checkout to chief until it exits. Each new chief invocation
-requires a fresh exchange.
+For headless PR publishing, follow `agents/chief.md`'s Authorization exception:
+the human's request to launch chief to babysit a PR, or their yes to the
+offer, is the grant, with no further question. Include that message verbatim
+(with the offer it answered when it is a yes, and any later restriction), the
+PR resolved from it (repository, PR URL, head repository and branch, expected
+HEAD, worktree) and the task scope, and, when a pr-babysit launch continues an
+earlier chief's run, that run's last reported `stateRef`; ask only when the PR,
+repository or worktree is ambiguous. A relaunch for the same PR task copies
+the grant verbatim from the earlier launch task, without asking again, until
+the task is done, the PR changes, or the human narrows or withdraws it; a
+later restriction rides along verbatim. A PR review submits under its own PR
+review exception, as `skills/pr-review/SKILL.md` asks it; its pending reviews
+need no exchange, under chief's standing exception. Leave the checkout to chief
+until it exits.
 
 ## Tests
 

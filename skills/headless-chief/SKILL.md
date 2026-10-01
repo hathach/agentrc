@@ -16,8 +16,8 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
   --permission-mode bypassPermissions
 ```
 
-1. **Before launching**: a task that publishes to a PR carries its
-   authorization exchange verbatim, per the README's headless recipe.
+1. **Before launching**: a task that publishes to a PR carries its grant
+   verbatim, per the README's headless recipe.
 2. **Launch** in the foreground: it checks the arguments, starts the
    launcher in its own session, prints its pid and returns. A chief
    runs as long as it needs; a background command would end it at the tool's
@@ -56,7 +56,7 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
 
 Leave the worktree to chief until it exits. A signal to the launcher is passed
 on to chief; the launcher still writes the exit line. A relaunch needs a new
-`--out` and, when it publishes to a PR, a fresh authorization exchange.
+`--out`; its grant follows the README's headless recipe.
 
 The rest of the directory is for autopsy: `stream.jsonl` (every event,
 raw), `stderr.log`, and `session`, whose id names the transcript:
