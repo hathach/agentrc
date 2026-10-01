@@ -412,10 +412,10 @@ async function run(opts = {}) {
     }
     if (label.startsWith('topic#')) {
       assert.equal(options.agentType, 'finding-verifier')
-      // opts.topic(pairId) is whether the topic's issue covers the finding, '<findingId>@<topic>'; false by default, undefined drops it.
+      // opts.topic(pairId) is whether the topic's issue covers the finding, '<findingId>@<topic>', false by default; opts.topicVerdicts(ids) the whole list.
       const ids = trailingList(prompt).map(x => x.findingId)
-      return conforms({ ...options.schema, properties: { verdicts: { type: 'array', items: options.schema.properties.verdicts.items } } }, { verdicts: ids
-        .map(findingId => ({ findingId, covers: opts.topic ? opts.topic(findingId) : false, reason: 'stub topic read' })).filter(v => v.covers !== undefined) }, label)
+      return conforms(options.schema, { verdicts: opts.topicVerdicts ? opts.topicVerdicts(ids)
+        : ids.map(findingId => ({ findingId, covers: opts.topic ? opts.topic(findingId) : false, reason: 'stub topic read' })) }, label)
     }
     if (label.startsWith('issue#')) {
       assert.equal(options.agentType, 'finding-verifier')
@@ -429,7 +429,8 @@ async function run(opts = {}) {
     if (label.startsWith('inspect#')) {
       // reply.py --inspect: our reply as it stands on each pair, the comment's
       // digest being the harness finding's; opts.inspect reshapes one per pair.
-      // A bare COMMENT is our newest reply to it: none unless opts.byHand(commentId) gives { replyId, body }.
+      // A bare COMMENT is our newest reply to it: none unless opts.byHand(commentId) gives { replyId, body }; with none, the comment
+      // read is opts.unanswered (its digest) or the harness finding's.
       const targets = String(prompt).match(/--inspect ([\d: ]+)`/)[1].trim().split(' ').map(t => t.split(':').map(Number))
       const body = 'answered already, in other words'
       const got = targets.map(([commentId, replyId]) => {
@@ -440,7 +441,7 @@ async function run(opts = {}) {
         const hand = opts.byHand && opts.byHand(commentId)
         return hand
           ? { commentId, kind: 'review', bodyDigest: fnv1a(hand.body), original: `comment ${commentId}`, originalDigest: `d${commentId}`, error: null, ...hand }
-          : { commentId, replyId: null, kind: 'review', body: null, bodyDigest: null, originalDigest: `d${commentId}`, error: `no reply of ours on comment ${commentId}` }
+          : { commentId, replyId: null, kind: 'review', body: null, bodyDigest: null, originalDigest: opts.unanswered ?? `d${commentId}`, error: `no reply of ours on comment ${commentId}` }
       })
       return conforms(options.schema, bare({ inspected: got }), label)
     }
@@ -2879,7 +2880,7 @@ test('the answer owed after an edit may go beside ours, in this launch or a late
   // Without secondAnswer reply.py holds on any reply of ours; the edit is what allows the second.
   const edited = { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' }
   let cycle = 0
-  const same = await run({ args: { autoPush: true, maxCycles: 3 }, reviewsPerCycle: () => ++cycle === 1 ? structuredClone(oneValid) : structuredClone(edited) })
+  const same = await run({ args: { autoPush: true, maxCycles: 3 }, unanswered: 'edited', reviewsPerCycle: () => ++cycle === 1 ? structuredClone(oneValid) : structuredClone(edited) })
   assert.equal(manifestOf(same.calls, 'resolve#1')[0].secondAnswer, undefined, 'a first answer is no second')
   assert.equal(manifestOf(same.calls, 'replies#2')[0].secondAnswer, true)
   assert.equal(same.result.state.reanswer, undefined, 'the answer clears the marker')
@@ -2888,7 +2889,9 @@ test('the answer owed after an edit may go beside ours, in this launch or a late
   const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
   const seen = await run({ reviews: { ...edited, replies: [] }, preflight: at, args: { ...YIELD, state: first.result.state } })
   assert.deepEqual(seen.result.state.reanswer, [1])
-  const later = await run({ reviews: edited, preflight: at, args: { ...YIELD, state: seen.result.state } })
+  const later = await run({ reviews: edited, preflight: at, unanswered: 'edited', args: { ...YIELD, state: seen.result.state } })
+  const elsewhere = await run({ reviews: edited, preflight: at, args: { ...YIELD, state: seen.result.state } })
+  assert.equal(elsewhere.calls.some(c => c.label === 'replies#3'), false, 'no reply of ours on another version of the comment allows nothing')
   assert.equal(manifestOf(later.calls, 'replies#3')[0].secondAnswer, true)
 })
 
@@ -3398,10 +3401,14 @@ test('an out-of-scope topic holds a finding its issue covers before the first ha
   const free = await run({ reviews: oneValid, args: { autoPush: true, deferrals: [topic] } })
   assert.ok(free.labels.some(l => l.startsWith('fix:')), 'judged outside the topic, it is fixed')
   assert.ok(free.labels.includes('push#1-review'))
-  for (const over of [{ topic: () => null }, { topic: () => undefined }, { throwOn: 'topic#' }]) {
+  // A verdict list can hold one id twice and miss another within exactly()'s bounds: neither finding is released.
+  const two = { findings: [finding(), finding({ commentId: 2 })], replies: [], bots: 'reviewed' }
+  const twice = (ids) => [ids[0], ids[0]].map(findingId => ({ findingId, covers: false, reason: 'twice' }))
+  for (const over of [{ topic: () => null }, { throwOn: 'topic#' }, { topicVerdicts: twice, reviews: two }]) {
     const { labels, result } = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 1, deferrals: [topic] }, ...over })
     assert.equal(labels.some(l => l.startsWith('fix:')), false, JSON.stringify(over))
-    assert.match(result.state.holds[0][1].reason, /^not yet judged outside the out-of-scope topic /)
+    assert.ok(result.state.holds.length >= 1 && result.state.holds.every(([, h]) => /^not yet judged outside the out-of-scope topic /.test(h.reason)))
+    assert.equal(result.state.holds.length, (over.reviews || oneValid).findings.length)
   }
   // Deferred by id, the finding is no longer the topic's to judge, and the hold is reconciled.
   const deferred = await run({ reviews: oneValid, args: { autoPush: true, deferrals: [topic, deferral()], state: held.result.state, maxCycles: 3 } })
