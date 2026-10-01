@@ -989,7 +989,8 @@ test('an unresolved build contract, or a build that did not run, blocks the batc
   for (const [over, why] of [
     [{ buildPlan: { error: 'no build docs' } }, /build contract not resolved: no build docs/],
     [{ buildPlan: null }, /build contract not resolved: resolver died/],
-    [{ candidate: null }, /the build did not count: agent died/],
+    [{ candidate: null }, /the build did not count: no sealed receipt \(the relay died or its copy failed its seal\)/],
+    [{ garble: (l, a) => l.startsWith('build#') ? { ...a, exit: 1 - a.exit } : a }, /the build did not count: no sealed receipt/],
     [{ candidate: { error: 'usage: ...' } }, /the build did not count: usage/],
     [{ candidate: { exit: 2 } }, /the build failed \(exit 2\)/],
   ]) {

@@ -906,7 +906,7 @@ const buildCheck = async (tag, owned) => {
     relayed(BUILD_RUN),
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
   )
-  const why = !r ? 'agent died' : r.error ? r.error
+  const why = !r ? 'no sealed receipt (the relay died or its copy failed its seal)' : r.error ? r.error
     : r.revision !== expectedHead ? `the receipt is for ${String(r.revision).slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
     : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir) ? 'the receipt is for another command'
     : r.snapshot !== r.snapshotAfter ? `the build changed ${owned.join(', ')}, which were verified before it`
