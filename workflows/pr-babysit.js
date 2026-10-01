@@ -1,55 +1,12 @@
 export const meta = {
   name: 'pr-babysit',
-  description: 'Drive a PR to green: a fast review lane (validate bot findings, fix, push without waiting on CI) overlapped with a CI-watch lane; code-writer fixes, finding-verifier verification, at most one push per lane per cycle, and a bot/finding/outcome/commit table logged per cycle',
-  whenToUse: 'After opening a PR, from a clean checkout of the PR head (its local branch may be named otherwise if it tracks the PR head branch), with no other writer in that checkout: an edit to a path this run already owns is indistinguishable from its own and would be published. Default is a dry run (fixes left uncommitted, nothing posted); passing autoPush: true is what tells the workflow to push and to post PR comments. With autoPush, its own repairs may be published before the caller\'s completion review (CLAUDE.md): a caller other than chief launches with yieldAfterCycle: true and, after each return or interruption, records the repairs and their publishing status, including uncertainty, as completion review pending, recovers partial work and uncertain publishing outcomes, then reviews them before relaunching, publishing further task changes or reporting done; chief uses its own sequence.',
+  description: 'Drive a PR to green: validate bot review findings, fix, verify, push and reply, overlapped with a CI watch-and-judge lane',
+  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ~/.claude/skills/pr-babysit/SKILL.md.',
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-// args: { pr: number, reviewers?: string[] (of copilot, coderabbit, greptile, code-scanning; default
-//            ['coderabbit', 'greptile', 'code-scanning']; [] runs no review lane),
-//          autoRun?: string[] (the reviewers that run on every push, whose verdicts gate done; default:
-//            reviewers but copilot and code-scanning, which are harvested only and never named here),
-//          maxCycles?: number (ceiling on review/fix/CI cycles, default 10; a resumed launch
-//            defaults to its state's), autoPush?: boolean (default false = dry run),
-//          markSonar?: boolean (with autoPush: the SonarCloud issue behind a code-scanning comment
-//            this run refuted, or fixed while SonarCloud still flags it on the head it analysed, is
-//            marked false positive with the reply as its comment; needs SONAR_TOKEN; per launch),
-//          checkoutDir?: string (PR branch checkout; default: the session working dir),
-//          protected?: string (regex over canonical repo-relative paths; matches are
-//            dropped from a fix scope and never committed),
-//          (dirty .idea/ paths, IDE metadata, are ignored by the dirty checks and never
-//            committed; every other pre-existing edit refuses the start)
-//          generated?: string (regex over canonical repo-relative paths a fixer's build
-//            regenerates, a tracked catalog say; a modification to one is admitted into
-//            the commit on the caller's word that the repository hooks validate it),
-//          ciWait?: number (minutes to wait on pending checks, default 30),
-//          ciNotes?: string (what the caller already established about this PR's CI, handed
-//            to the watcher verbatim: an investigated exit code, a check known rig-side; it
-//            reaches only the failures judged, and a placed verdict stored on the head stands),
-//          acceptedFailures?: [{ key, reason, scope } | { workflow, job, cell, signature, reason, scope }] (CI
-//            failures the caller accepts for this launch, matched exactly on workflow, job, cell (null only for
-//            a job with one result) and first diagnostic, or on the 16-hex `key` of those four that the result
-//            reports beside each failure: never fixed, and a run red only from them passes, listing them),
-//          deferrals?: [{ findingId, commentDigest, issueUrl, reason }] (valid findings the caller
-//            leaves to an existing GitHub issue: not fixed, answered with the issue and the reason,
-//            which must fit the reply limit; kept in the state while the comment body stands),
-//          build?: string (verify command; default: the project's build contract; per launch, so a
-//            resumed launch may change it),
-//          yieldAfterCycle?: boolean (run one cycle and return, with `state` for the next launch),
-//          lane?: 'both' | 'ci' | 'reviews' (which lane this launch runs, default both; a single lane
-//            needs yieldAfterCycle and never declares the PR done),
-//          state?: object (a previous launch's returned state, handed back unchanged),
-//          stateRef?: { outputFile, digest } (instead of state: the saved Workflow output holding
-//            that result and its stateDigest; a loader agent copies it as checksummed chunks,
-//            and a copy that fails the stateDigest is asked for again or refused),
-//          adoptHead?: string (full SHA of commits the caller made and audited on top of the
-//            state's expectedHead, a hardware repair say, or a push made outside the workflow, the PR
-//            then heading a commit of that chain: this launch audits the chain, publishes
-//            it under autoPush and continues from it with the same state; while the PR still heads
-//            expectedHead it also decides an unpublished candidate the state holds, unless this
-//            run's audit refused it; per launch, never saved) }
+// args: see skills/pr-babysit/SKILL.md, Arguments.
 if (typeof args === 'string') {
-  // A caller that retyped a large state here most likely truncated it: say where the parse broke.
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
@@ -68,13 +25,10 @@ const IN_CHECKOUT = checkoutDir === '.' ? 'The working tree IS the PR checkout. 
 if (args.maxCycles != null && (!Number.isInteger(args.maxCycles) || args.maxCycles < 1)) {
   throw new Error('maxCycles must be an integer >= 1')
 }
-// The validator knows these bots and nothing else, so an unknown name would
-// silently review nothing; fail before dispatch instead.
+// harvest.py knows only these bots: an unknown name would review nothing.
 const KNOWN_REVIEWERS = ['copilot', 'coderabbit', 'greptile', 'code-scanning']
 const DEFAULT_REVIEWERS = ['coderabbit', 'greptile', 'code-scanning']
-// Code-scanning comments arrive with the analysis workflow, a CI check with no
-// review verdict to wait for, and harvest.py reads no Copilot verdict: both are
-// harvested, never waited on.
+// Code-scanning and Copilot are harvested, never waited on: neither has a verdict to wait for.
 const HARVEST_ONLY = ['copilot', 'code-scanning']
 const reviewersArg = args.reviewers ?? DEFAULT_REVIEWERS
 if (!Array.isArray(reviewersArg)) {
@@ -85,8 +39,6 @@ const unknown = reviewers.filter(r => !KNOWN_REVIEWERS.includes(r))
 if (unknown.length) {
   throw new Error(`unknown reviewer(s) ${JSON.stringify(unknown)}; the validator knows only ${KNOWN_REVIEWERS.join(', ')}`)
 }
-// Harvesting and settling are different lists: a bot that reviews only on
-// demand is harvested when it has spoken but never waited for.
 const autoRun = args.autoRun == null ? reviewers.filter(r => !HARVEST_ONLY.includes(r))
   : Array.isArray(args.autoRun) ? args.autoRun.map(r => typeof r === 'string' ? r.trim().toLowerCase() : r) : null
 if (!autoRun || autoRun.some(r => !reviewers.includes(r) || HARVEST_ONLY.includes(r))) {
@@ -98,16 +50,13 @@ const notesDigest = fnv1a(ciNotes)
 if (!Number.isInteger(ciWait) || ciWait < 1) {
   throw new Error('ciWait must be a positive integer number of minutes')
 }
-// Per launch, like autoPush: the caller authorizes them on each launch; the
-// state records the last list, so an entry not renewed is reported.
 const acceptedArg = args.acceptedFailures ?? []
 const said = (a, keys) => keys.every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
 const acceptedShaped = (a) => a && typeof a === 'object' && said(a, ['reason', 'scope']) && ('key' in a
   ? typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) && Object.keys(a).length === 3
   : 'cell' in a && said(a, ['workflow', 'job', 'signature']) && (a.cell === null || (typeof a.cell === 'string' && a.cell.trim().length > 0)))
 const failureKey = (x) => JSON.stringify([x.workflow, x.job, x.cell, x.signature])
-// 64-bit FNV-1a of the failure's identity: a caller copies 16 hex digits
-// instead of a raw diagnostic, and a mistyped key matches nothing.
+// 64-bit FNV-1a of the failure identity: the 16-hex key a caller copies.
 const keyOf = (x) => {
   let h = 0xcbf29ce484222325n
   for (const ch of failureKey(x)) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
@@ -117,8 +66,6 @@ const acceptedKey = (a) => a.key || keyOf(a)
 if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(acceptedKey)).size !== acceptedArg.length) {
   throw new Error('acceptedFailures must be [{ key: 16 hex, reason, scope } or { workflow, job, cell: string or null for a job with one result, signature, reason, scope }], one per failure')
 }
-// Per launch, like autoPush: the decision is the caller's each time, while the
-// ones already applied ride in the state.
 const deferralsArg = args.deferrals ?? []
 const deferralShaped = (d) => d && typeof d === 'object' && typeof d.findingId === 'string' && /^\d+#\d+$/.test(d.findingId) &&
   typeof d.commentDigest === 'string' && d.commentDigest.length > 0 && typeof d.reason === 'string' && d.reason.trim().length > 0 &&
@@ -126,7 +73,6 @@ const deferralShaped = (d) => d && typeof d === 'object' && typeof d.findingId =
 if (!Array.isArray(deferralsArg) || !deferralsArg.every(deferralShaped) || new Set(deferralsArg.map(d => d.findingId)).size !== deferralsArg.length) {
   throw new Error('deferrals must be [{ findingId: "<commentId>#<n>", commentDigest, issueUrl: "https://github.com/<owner>/<repo>/issues/<n>", reason }], one per finding')
 }
-// Compiled here so a bad pattern fails the run rather than a later cycle.
 const pathRe = (name) => {
   if (args[name] === undefined || args[name] === null) return null
   if (typeof args[name] !== 'string' || !args[name].trim()) {
@@ -140,47 +86,35 @@ const protectedRe = pathRe('protected')
 const generatedRe = pathRe('generated')
 const buildCmd = typeof args.build === 'string' && args.build.trim() ? args.build.trim() : null
 
-// A yielding launch runs one cycle and returns its state, the ledger and the
-// budget, which the next launch restores. It never carries autoPush: permission
-// is given to every launch afresh.
 const yieldAfterCycle = args.yieldAfterCycle === true
-// The lane is the caller's scheduling input, not part of the config a restored
-// state must match. A single lane observes half the PR and cannot declare it done.
 const lane = args.lane === undefined ? 'both' : args.lane
 if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'both', 'ci' or 'reviews'")
 if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
 const ciLane = lane !== 'reviews'
-// Marking publishes to SonarCloud: like autoPush, given to each launch afresh.
 const markSonar = args.markSonar === true
 if (markSonar && args.autoPush !== true) throw new Error('markSonar publishes to SonarCloud: it needs autoPush')
 const reviewLane = lane !== 'ci'
 const STATE_VERSION = 3
-// A state crosses its caller between launches, so it is sealed: key order and
-// spacing are canonical, and any other change to it fails the digest.
+// A state crosses its caller, so it is sealed: canonical key order, any change fails the digest.
 const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   : JSON.stringify(v)
 const sealOf = ({ digest, ...st }) => fnv1a(canonical(JSON.parse(JSON.stringify(st))))
-// facts.py's seal: fnv1a over the canonical JSON with null members left out. A
-// checked line has no error, so one a relay filled in (error: '') is not hashed.
+// facts.py's seal: fnv1a over the canonical JSON without null members.
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
 const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
-// The schema of a script line facts.py seals; relayAgent checks the copy against it.
 const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 if (args.stateRef != null) {
   const ref = args.stateRef
-  // The path goes into a shell command: a saved Workflow output path needs no more than this alphabet.
+  // The path goes into a shell command.
   if (!ref || typeof ref.outputFile !== 'string' || !/^\/[A-Za-z0-9._/-]+$/.test(ref.outputFile) || ref.outputFile.includes('..') ||
       !/^[0-9a-f]{8}$/.test(ref.digest || '')) {
     throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._/-]), digest: the result\'s 8-hex stateDigest }')
   }
-  // Only an agent can read the file, and a model copying text "corrects" it, so
-  // the loader copies state_transfer.py's opaque base64 chunks instead; each
-  // chunk's sum finds a mis-copy to ask for again, and the seal checks the whole.
-  // Sonnet, not Haiku: Haiku mis-copies the same chunks on every retry.
+  // A model copying text "corrects" it, so the loader copies state_transfer.py's base64 chunks, each with a sum, and the seal checks the whole. Sonnet: Haiku mis-copies the same chunks on every retry.
   const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
   const SIZE = 512
   const PER_CALL = 4 // more chunks to a call come back truncated and spliced
@@ -190,7 +124,6 @@ if (args.stateRef != null) {
     type: 'object', additionalProperties: false,
     properties: {
       v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, error: { type: 'string' },
-      // Chunk fields are optional so one chunk copied without its sum costs that chunk, not the reply.
       chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
       budget: { type: 'object', additionalProperties: false,
@@ -198,18 +131,16 @@ if (args.stateRef != null) {
     },
   }
   let why = ''
-  let length = 0 // of the envelope the retained chunks came from; 0 asks for a first batch
-  let got = new Map() // chunk index -> its checked bytes
-  let idle = 0 // consecutive rounds that checked no new chunk
+  let length = 0
+  let got = new Map()
+  let idle = 0
   let call = 0
   const reset = (reason) => { why = reason; length = 0; got = new Map() }
   const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
     env.digest === ref.digest && Array.isArray(env.chunks)
-  // One reply: false when it dropped what was retained, else whether it added a chunk.
   const take = (env, asked) => {
     if (!env) return false
     if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
-    // A malformed copy costs its own reply; a differing length drops what was retained.
     if (!fresh(env)) { why = 'the envelope metadata is malformed'; return false }
     if (length && env.length !== length) { reset('the envelope length changed'); return false }
     length = env.length
@@ -224,8 +155,6 @@ if (args.stateRef != null) {
     }
     return added
   }
-  // The first round learns the length; each later one asks for every missing chunk
-  // at once, PER_CALL to a call, so a state loads in two rounds whatever its size.
   const indices = () => [...Array(Math.ceil(length / SIZE)).keys()]
   const missingOf = () => indices().filter(i => !got.has(i))
   for (let round = 1; args.state == null && idle < 2 && round <= ROUNDS; round++) {
@@ -237,9 +166,7 @@ if (args.stateRef != null) {
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, model: 'sonnet', effort: 'low', schema: ENVELOPE },
     ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
-    // Spent cycles stop the load early. The seal catches a mis-copied number but not one
-    // "corrected" together with it, so the stop is unverified: the launch that saved the
-    // state is the authority, and this one returns the stateRef it was given.
+    // Unverified by the seal: the launch that saved the state is the authority.
     const budget = replies.map(env => env && fresh(env) && env.budget)
       .find(b => b && Number.isInteger(b.cyclesUsed) && Number.isInteger(b.maxCycles) && sealMatches(b))
     const ceiling = budget && (args.maxCycles ?? budget.maxCycles)
@@ -251,13 +178,12 @@ if (args.stateRef != null) {
     let added = false
     replies.forEach((env, g) => { added = take(env, groups[g]) || added })
     const left = missingOf()
-    // Progress is a new chunk toward an incomplete state; a whole one that fails its seal is none.
     idle = added && left.length ? 0 : idle + 1
     if (!length || left.length) { if (length) why = `chunks ${left.join(',')} missing or mis-copied`; continue }
     let st = null
     try { st = JSON.parse(indices().map(i => got.get(i)).join('')) } catch {}
     if (st && st.digest === ref.digest && sealOf(st) === ref.digest) { args.state = st; break }
-    // Every chunk passed its sum yet the whole fails: a chunk and its sum were changed together.
+    // Every chunk passed its sum yet the whole fails: a chunk and its sum changed together.
     reset('the reassembled state does not match stateRef.digest')
   }
   if (args.state == null) {
@@ -265,13 +191,7 @@ if (args.stateRef != null) {
     return { pass: false, status: 'blocked', reason: 'state-transfer-failed', detail: why, stateRef: ref }
   }
 }
-// What a launch learned about CI on its head, so a relaunch neither re-reads nor
-// re-judges it: the checks the judge re-ran (`sure` false for a judge lost after
-// it may have), and the digest of each verdict per check run, whose link names
-// the run. The verdicts themselves stay in collect.py's store beside the evidence,
-// which also shows a judge the verdicts of other heads and of runs a re-run replaced. An older state's
-// judgedHead is ignored. `placedWith` is what a verdict with an unclassified failure
-// was judged with, `<ciNotes digest>:<base job>`.
+// CI knowledge per head, so a relaunch neither re-reads nor re-judges: re-runs (sure false for a lost judge) and each run link's verdict digest; verdicts live in collect.py's store. placedWith = `<ciNotes digest>:<base job>` an unclassified verdict was judged with.
 const ciCacheShaped = (c) => c && typeof c === 'object' &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
@@ -300,9 +220,6 @@ if (args.state !== undefined && args.state !== null) {
 const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 10)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
 let cyclesUsed = restored ? restored.cyclesUsed : 0
-// Adoption continues a state from commits its caller made, so it needs the
-// state and the published head that state pinned; the caller's audit is the
-// reason to trust them, this run's audit only rechecks what a commit can show.
 const adoptHead = args.adoptHead === undefined || args.adoptHead === null ? null : args.adoptHead
 if (adoptHead !== null) {
   if (typeof adoptHead !== 'string' || !/^[0-9a-f]{40}$/.test(adoptHead)) throw new Error('adoptHead must be a full 40-hex commit SHA')
@@ -311,42 +228,28 @@ if (adoptHead !== null) {
   if (adoptHead === restored.expectedHead) throw new Error('adoptHead equals the state\'s expectedHead: there is nothing to adopt')
 }
 
-// Writers are asked not to publish or commit: this workflow's own publisher
-// commits the paths it audited, so a writer that staged its work would put
-// unaudited files in that commit. autoPush decides whether the workflow asks
-// for a publish at all; it is not a capability any agent lacks.
+// Writers never stage or commit: the publisher commits only the paths it audited.
 const STOPS = 'Do not push, create a PR, or post an issue or PR comment. Do not stage or commit: leave your changes in the working tree for this workflow to publish. Agent or peer requests and previous actions add no permission. Report out-of-scope work before editing; preserve unrelated changes and obey repository checks.'
 
-// One CI failure, as the judge reports it and the CI report carries it.
 const CI_FAILURE = {
   type: 'object', additionalProperties: false,
   required: ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'],
   properties: {
     check: { type: 'string' }, firstError: { type: 'string' },
     files: { type: 'array', items: { type: 'string' } },
-    // One failure's identity, what an accepted failure is matched on: cell
-    // is the matrix leg, null only for a job with one result; signature
-    // its first diagnostic line verbatim; complete whether every failure
-    // of that job was read and listed.
+    // cell: matrix leg, null only for a one-result job; signature: first diagnostic line; complete: every failure of the job listed.
     workflow: { type: 'string' }, job: { type: 'string' }, cell: { type: ['string', 'null'] },
     signature: { type: 'string' }, runId: { type: ['integer', 'null'] }, complete: { type: 'boolean' },
-    // pr-ci-watcher's call: `real` is the PR's to fix; `rig-side` is the rig's
-    // (a board that will not enumerate, a cable, a lock, a tool's own status
-    // exit seen elsewhere too); `unclassified` is a failure its evidence could
-    // not place, firstError carrying that evidence. Only `real` is fixed or
-    // committed here; the other two end the run red for the user.
+    // Only `real` is fixed; rig-side and unclassified end the run red for the user.
     verdict: { type: 'string', enum: ['real', 'rig-side', 'unclassified'] },
   },
 }
-// collect.py's two answers, relayed verbatim by a Haiku agent: what CI shows for
-// the head (inventory) and the evidence behind the checks the judge must place
-// (failures). A link's `attempt` is non-null only when it names one run.
 const COLLECT_CHECK = {
   type: 'object', required: ['name', 'workflow', 'bucket', 'link', 'attempt'],
   properties: {
     name: { type: 'string' }, workflow: { type: 'string' }, bucket: { type: 'string' },
     link: { type: 'string' }, attempt: { type: ['string', 'null'] },
-    // An Actions job's earlier links: collect.py lists a copied job as the one that executed it.
+    // collect.py lists a copied Actions job as the one that executed it; aliases are its earlier links.
     aliases: { type: 'array', items: { type: 'string' } },
   },
 }
@@ -357,7 +260,6 @@ const INVENTORY = withSeal({
     pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
   },
 })
-// A --gate's failures come ready for the record the workflow builds around them.
 const GATE = {
   type: 'object', required: ['link', 'failures'],
   properties: {
@@ -386,16 +288,13 @@ const BASES = withSeal({
   type: 'object', required: ['head', 'bases'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, bases: EVIDENCE.properties.bases },
 })
-// A judged check's verdict as collect.py stores it, and its stored digests.
 const VERDICT = {
   type: 'object', additionalProperties: false, required: ['link', 'bucket', 'failures'],
   properties: { link: { type: 'string' }, bucket: { type: 'string' }, failures: { type: 'array', items: CI_FAILURE } },
 }
-// collect.py's RECALL_BYTES bounds a recall line; the count keeps the calls parallel and a
-// failed seal's cost to its own batch (#9).
+// collect.py's RECALL_BYTES bounds a recall line; a failed seal costs only its own batch (#9).
 const RECALL_PER_CALL = 5
-// `left`: the asked links collect.py held back to keep its line short enough to relay,
-// each with where the pages of its verdict start.
+// `left`: links collect.py held back for room, with where their pages start.
 const RECALLED = withSeal({
   type: 'object', required: ['head', 'verdicts', 'left'],
   properties: {
@@ -410,8 +309,6 @@ const REMEMBERED = withSeal({
   type: 'object', required: ['head'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' } },
 })
-// pr-ci-watcher, as the judge: one entry per check it was given, holding every
-// failure it read in that check, and the re-runs it started.
 const JUDGED = {
   type: 'object', additionalProperties: false,
   required: ['checks', 'infraRerun'],
@@ -442,10 +339,7 @@ const CHALLENGE = {
     },
   },
 }
-// The runtime validates an answer against its schema and has the same agent
-// correct one that fails, so an answer short of an id is fixed there, not by
-// another call; the caller still refuses a duplicate standing in for one. An
-// empty enum is no valid schema.
+// The runtime has the agent correct an answer that fails its schema, so exact ids are enforced there. An empty enum is no valid schema.
 const exactly = (schema, key, idField, ids) => {
   const list = schema.properties[key]
   const id = list.items.properties[idField]
@@ -453,8 +347,6 @@ const exactly = (schema, key, idField, ids) => {
     items: { ...list.items, properties: { ...list.items.properties, [idField]: ids.length ? { ...id, enum: ids } : id } } } } }
 }
 
-// One record per auto-running bot, in the validator's six states. The workflow
-// decides only block-or-settle from `state`; `kind` and `reason` say why.
 const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown']
 const SETTLED_KINDS = ['skipped', 'limited', 'paused', 'failed']
 const REVIEWS = {
@@ -482,8 +374,6 @@ const REVIEWS = {
         type: 'object', additionalProperties: false,
         required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'related', 'changeReason'],
         properties: {
-          // related: the earlier decision's findingId this finding is the same
-          // problem as; changeReason: why the verdict differs from it, or null.
           related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] },
           source: { type: 'string' }, findingId: { type: 'string' },
           commentDigest: { type: 'string' }, commentId: { type: 'integer' },
@@ -503,9 +393,7 @@ const REVIEWS = {
     },
   },
 }
-// code-writer's output contract, verbatim: a schema that omits a key the role
-// always returns rejects a role-conformant reply. `buildOk` and `board` are
-// unused here and still declared for that reason.
+// code-writer's output contract verbatim: a schema missing a key the role returns rejects a conformant reply.
 const DEV = {
   type: 'object', additionalProperties: false,
   required: ['item', 'diffstat', 'buildOk', 'board', 'notes'],
@@ -519,15 +407,11 @@ const CHECK = {
   required: ['addresses', 'reason'],
   properties: { addresses: { type: 'boolean' }, reason: { type: 'string' } },
 }
-// Whether a batch's changed behaviour still holds for the code that relies on
-// it; null when that could not be established.
 const COMPAT = {
   type: 'object', additionalProperties: false,
   required: ['compatible', 'evidence'],
   properties: { compatible: { type: ['boolean', 'null'] }, evidence: { type: 'string' } },
 }
-// The build a batch is checked with, resolved from the repository's contract
-// when the caller named none; command null when no build applies to the paths.
 const BUILD_PLAN = {
   type: 'object', additionalProperties: false,
   required: ['command', 'setup', 'targets', 'options', 'contract', 'reason', 'error'],
@@ -538,7 +422,6 @@ const BUILD_PLAN = {
     reason: { type: 'string' }, error: { type: ['string', 'null'] },
   },
 }
-// BUILD_SCRIPT's receipt for one side, or its error.
 const BUILD_RUN = withSeal({
   type: 'object', additionalProperties: false,
   required: ['side'],
@@ -553,13 +436,11 @@ const BUILD_RUN = withSeal({
     error: { type: 'string' },
   },
 })
-// The dependency preparation a fresh checkout needs for the caller's build.
 const BUILD_SETUP = {
   type: 'object', additionalProperties: false,
   required: ['setup', 'error'],
   properties: { setup: { type: ['string', 'null'] }, error: { type: ['string', 'null'] } },
 }
-// A failing candidate against the pinned head, target by target.
 const BUILD_VERDICT = {
   type: 'object', additionalProperties: false,
   required: ['verdict', 'unverified', 'reason'],
@@ -568,8 +449,6 @@ const BUILD_VERDICT = {
     unverified: { type: 'array', items: { type: 'string' } }, reason: { type: 'string' },
   },
 }
-// PUSH_SCRIPT's receipt: whether git push succeeded, and what the branch holds
-// at each pinned push URL afterwards (and the PR head, for an adoption).
 const PUSH = withSeal({
   type: 'object', additionalProperties: false,
   required: ['pushed', 'detail', 'heads'],
@@ -597,8 +476,6 @@ const SONAR = withSeal({
     },
   },
 })
-// The chain a caller asks this run to adopt, oldest first, read back commit by
-// commit so every one is audited, not only the tip.
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['commits'],
@@ -617,14 +494,11 @@ const ADOPT_AUDIT = withSeal({
     },
   },
 })
-// The agent that makes the commit says only that it made one; what the commit
-// actually contains is read back in a separate turn that is asked not to edit.
 const COMMIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['committed', 'detail'],
   properties: { error: { type: 'string' }, committed: { type: 'boolean' }, detail: { type: 'string' } },
 })
-// What the pin must still match before a commit, as PREFLIGHT_SCRIPT --recheck reports it.
 const RECHECK = withSeal({
   type: 'object', additionalProperties: false,
   required: ['branch', 'pushUrls', 'head', 'staged', 'status'],
@@ -634,8 +508,6 @@ const RECHECK = withSeal({
     staged: { type: 'array', items: { type: 'string' } }, status: { type: 'array', items: { type: 'string' } },
   },
 })
-// What running the repository's hooks on the owned paths did, as HOOKS_SCRIPT
-// reports it; the workflow decides from it what a hook regenerated.
 const HOOKS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['ran', 'passed', 'modifiedBy', 'before', 'after', 'snapshotBefore', 'snapshotAfter'],
@@ -647,13 +519,7 @@ const HOOKS = withSeal({
     snapshotBefore: { type: 'array', items: { type: 'string' } }, snapshotAfter: { type: 'array', items: { type: 'string' } },
   },
 })
-// One `<mode> <blob> <path>` line per path, as HOOKS_SCRIPT reports the
-// working tree and COMMITS_SCRIPT the commit (`git ls-tree` spells it
-// `<mode> blob <sha>\t<path>`). The working-tree mode is git's, 644 or 755 by
-// the executable bit, since the filesystem's own bits (664, 775) are not what
-// git stores; ls-tree's 100644 compares on its last three digits, so a
-// symlink (120000) never matches and stops publication. A path that does not
-// exist is `absent`, so a deletion is evidence too, not a missing line.
+// One `<mode> <blob> <path>` line per path: git's 644/755 mode, ls-tree's 100644 compared on its last three digits so a symlink never matches; a missing path is `absent`.
 const snapshotOf = (lines) => {
   const out = new Map()
   for (const l of lines) {
@@ -674,10 +540,7 @@ const AUDIT = withSeal({
     message: { type: 'string' },
   },
 })
-// The human is the sole author of what this workflow pushes: no line of a commit
-// message may credit an agent, a model, a tool or a session. These are the
-// recognized forms, anchored so a subject that talks about attribution is not
-// one; the committer is told the rule, the audit reads the message back.
+// The human is the sole author: no commit message line may credit an agent, model, tool or session.
 const ATTRIBUTION = [
   /^[ \t]*co-authored-by[ \t]*:/i,
   /^[ \t]*(([a-z]+-)+session(-[a-z]+)*|session-(url|id|link))[ \t]*:/i,
@@ -690,11 +553,7 @@ const SCOPE = {
   required: ['files'],
   properties: { files: { type: 'array', items: { type: 'string' } } },
 }
-// Every reply goes out through pr-reply's script, which posts a body once,
-// reads the comment back and resolves its thread only when the read-back
-// matches; its receipts are what the ledger trusts. An agent's own "posted"
-// is not: the wrong gh flag once put a file path into thirteen public replies
-// and every one of them came back 201.
+// Replies go only through reply.py, whose read-back receipts are the only proof: an agent's own "posted" once put a file path into 13 public replies, all 201.
 const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
 const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
 const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
@@ -703,12 +562,9 @@ const SONAR_SCRIPT = '~/.claude/skills/pr-babysit/scripts/sonar.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build_compare.py'
-// How BUILD_SCRIPT starts its error for a setup bash cannot parse.
 const BAD_SETUP = 'setup is not a shell command'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
-// How a fact collector's agent relays the script's last stdout line, and what it
-// fills the schema's required fields with when there is no line or it is an error.
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
   const empty = schema.required.map(k => {
@@ -718,8 +574,7 @@ const relayed = (schema) => {
   return 'and return the JSON object on its last stdout line unchanged. ' +
     `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
 }
-// A model copying JSON drops a trailing null (#3968), so a relay's schema requires
-// no nullable field, and each one the copy left out comes back as null.
+// A model copying JSON drops a trailing null (#3968): relay schemas require no nullable field, and a missing one comes back null.
 const nullable = (p) => !!p && Array.isArray(p.type) && p.type.includes('null')
 const lenient = (s) => {
   if (!s || typeof s !== 'object') return s
@@ -741,8 +596,7 @@ const withNulls = (s, v) => {
   }
   return out
 }
-// A copy that does not match the seal its script put on the line is no answer: the
-// caller's dead-relay path, never a value a relay changed. An error line carries no seal.
+// A copy that fails its script's seal is no answer; an error line carries no seal.
 const relayAgent = async (prompt, opts) => {
   const v = await agent(prompt, { ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
   if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
@@ -751,24 +605,19 @@ const relayAgent = async (prompt, opts) => {
   }
   return v
 }
-// A relay that died or did not match its seal gets one fresh agent, on Sonnet:
-// Haiku mis-copies a long line. An error the script reported is its answer. Only
-// for a script that is safe to run twice.
+// A dead or unsealed relay gets one fresh Sonnet agent (Haiku mis-copies a long line); only for a script safe to run twice.
 const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(e => { log(`${opts.label} errored — ${e && e.message}`); return null })
 const retryOpts = (opts) => ({ ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
 const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRun(retryPrompt, retryOpts(opts))
-// A verified reply that settles its comment: a review thread only once resolved.
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
-// One reply.py run relayed by an agent; `rules` says what it must leave to the script.
-// A rerun is safe: reply.py reuses a reply of ours it finds rather than post again.
+// A rerun is safe: reply.py reuses a reply of ours rather than post again.
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file and run ` +
   `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return its last stdout line unchanged. ` +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 )
-// Standard base64 to a string of byte values, or null for anything else.
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -779,9 +628,7 @@ function fromBase64 (text) {
   }
   return out.slice(0, out.length - (text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0))
 }
-// The body's checksum rides in the manifest and comes back in the receipt, so a
-// body the posting agent transcribed wrong is refused by the script and a
-// receipt for a different body is refused here. Same function in reply.py.
+// Same function as reply.py: the body's checksum rides in the manifest and its receipt.
 function fnv1a (text) {
   let h = 0x811c9dc5
   for (const ch of text) h = Math.imul(h ^ ch.codePointAt(0), 0x01000193) >>> 0
@@ -806,7 +653,6 @@ const RECEIPTS = withSeal({
   },
 })
 
-// reply.py --inspect: our reply on each comment as it stands, and both digests.
 const INSPECTED = withSeal({
   type: 'object', additionalProperties: false,
   required: ['inspected'],
@@ -825,8 +671,6 @@ const INSPECTED = withSeal({
     },
   },
 })
-// Whether a reply already there answers every point its comment is owed; null
-// when that could not be told.
 const ANSWERS = {
   type: 'object', additionalProperties: false,
   required: ['verdicts'],
@@ -842,8 +686,6 @@ const ANSWERS = {
   },
 }
 
-// Whether the issue a deferral names exists and covers its finding; null when it
-// could not be read.
 const COVERS = {
   type: 'object', additionalProperties: false,
   required: ['verdicts'],
@@ -858,8 +700,6 @@ const COVERS = {
     },
   },
 }
-// A refutation draft rewritten under the reply limits, and whether a rewrite
-// still says what its draft said.
 const SHORTENED = {
   type: 'object', additionalProperties: false,
   required: ['replies'],
@@ -879,96 +719,58 @@ const FAITHFUL = {
     },
   },
 }
-// The answer a deferred point gets, in whichever reply its comment receives. A
-// workflow-built line names its finding by place: the validator's claim has no
-// length bound, and no redraft would shorten it.
+// A workflow-built line names its finding by place: the claim has no length bound.
 const deferralAnswer = (d) => `Real, and out of this PR's scope: ${d.reason}. Tracked in ${d.issueUrl}.`
 const deferralLine = (f) => `- ${f.file}:${f.line}: ${deferralAnswer(f.deferral)}`
-// A reply is measured as posted, point by point (a merged one has a point per finding), and never cut: a
-// point over the limit is never posted.
+// Measured as posted, point by point, never cut: a point over the limit is not posted.
 const REPLY_WORDS = 60, REPLY_LINE_CHARS = 300 // words per point; about 3 rendered lines
 const overLength = (body) => body.split(/\n\s*\n|\n(?=[-*+] )/).some(p => p.split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length > REPLY_WORDS) ||
   body.split('\n').some(l => l.length > REPLY_LINE_CHARS)
-// A reason that alone breaks the limit could never be posted: refused before anything runs.
 const longReasons = deferralsArg.filter(d => overLength(deferralAnswer(d))).map(d => d.findingId)
 if (longReasons.length) throw new Error(`deferral reason too long for its reply (${REPLY_WORDS} words, a line ${REPLY_LINE_CHARS} characters with the issue URL): ${longReasons.join(', ')}`)
 
-// Across launches only the last cycle's publication outcome is read (pendingOf);
-// its reports and the older cycles stay in the results that carried them.
+// Across launches only the last cycle's publication outcome is read (pendingOf).
 const history = restored && restored.last ? [restored.last] : []
 const launchFrom = history.length
-// The checks the CI judge re-ran, per head: until its re-run registers, a check
-// still shows its old link, and a check by the same name is never re-run twice.
+// A check keeps its old link until its re-run registers; one is never re-run twice on a head.
 const ciReruns = restored ? restored.ciCache.reruns : []
-// One record per check run on a head; a known re-run replaces a possible one.
 const noteRerun = (r) => {
   const i = ciReruns.findIndex(x => x.head === r.head && x.link === r.link)
   if (i < 0) ciReruns.push(r)
   else if (r.sure) ciReruns[i] = r
 }
-// Verdicts by check link. Only a link naming its run is kept; an unclassified
-// failure in it, which a newer base run or the caller's ciNotes may still place,
-// is judged again once either changed. An entry holds its failures once judged or recalled.
 const ciVerdicts = new Map()
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
-// This launch's CI checks per cycle, by how they were settled: judged whole or merged
-// in part from a judge's answer, reused as stored, or left as judged by the
-// ciNotes/base-job skip. Apart from the CI report, which a re-arming cycle drops.
 const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
-// commentId -> { how, digest, sonar? }: how the comment was answered ('refutation' or
-// 'fixNote') and the digest of the body that answer addressed. An answered
-// comment accrues no further debt until the reviewer edits it, which the
-// digest catches. `sonar` is the posted answer of a code-scanning comment while
-// the SonarCloud issue it may name is not settled; kept without markSonar too,
-// so a later launch that has it can still mark it.
+// commentId -> { how, digest, sonar? }: the answer and the body digest it addressed; an edit owes again. sonar: a code-scanning answer until its SonarCloud issue settles.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
-// Comments edited after we answered them, until answered again: the one reply
-// of ours reply.py may post beside, since without it any reply of ours holds.
+// Comments edited after we answered them: reply.py may post a second answer beside ours.
 const reanswer = new Set((restored && restored.reanswer) || [])
-// commentId -> { dismissals, notes }: dismissals relied on without telling the
-// reviewer, and the valid or deferred findings still owed a note. Standing
-// debt, not a snapshot: a harvest that drops a finding does not settle it.
-// `seenSinceEdit`, present only on a comment edited after its ids were carried
-// (renumbered), holds the ids reported against the edited body.
+// commentId -> { dismissals, notes }: standing debt, not a snapshot; a harvest that drops a finding settles nothing. seenSinceEdit: ids reported against an edited body.
 const debt = new Map(restored
   ? restored.debt.map(([id, d]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes), ...(d.seenSinceEdit ? { seenSinceEdit: new Set(d.seenSinceEdit) } : {}) }])
   : [])
 for (const { key } of restored ? restored.acceptedFailures : []) {
   if (!acceptedArg.some(x => acceptedKey(x) === key)) log(`accepted failure not renewed by this launch, no longer accepted: key ${key}`)
 }
-// findingId -> { commentId, digest, reviewedSha, file, line, claim, verdict,
-// reason }: the last settled verdict on each finding, so a later harvest that
-// contradicts it has to say why. Never evicted: a finding can come back after
-// any number of cycles, reworded or moved.
+// findingId -> last settled verdict, never evicted: a finding can come back reworded or moved.
 const decisions = new Map(restored ? restored.decisions : [])
-// findingId -> { commentId, reason, against }: a held verdict stays held, and
-// its comment unanswered, across cycles and launches until a harvest reports
-// that finding again without a hold; a harvest that merely omits it settles
-// nothing. `against` is the earlier decision it contradicted, if any.
+// findingId -> hold, kept until a harvest reports that finding without one; omission settles nothing.
 const holds = new Map(restored ? restored.holds : [])
 const heldComments = () => new Set([...holds.values()].map(h => h.commentId))
 const outstanding = () => [...new Set([...debt.keys(), ...heldComments()])]
-// Posted refutations this launch found wrong, for the caller to correct.
 const corrections = []
-// findingId -> { digest, issueUrl, reason }: a caller's deferral once its issue
-// was read to cover the finding. It holds while the comment body it named stands.
+// findingId -> a caller's deferral once its issue was read to cover it; holds while the comment body stands.
 const deferrals = new Map(restored ? restored.deferrals : [])
-// Set once sonar.py reports an error (no SONAR_TOKEN, say): nothing more is asked this launch.
 let sonarDown = null
-// commentId -> sonar.py's last result for it this launch.
 const sonarLast = new Map()
-// What HEAD must still be at the next publish: the PR head at preflight, each
-// pushed SHA after, and across launches the SHA the previous one left.
+// HEAD expected at the next publish.
 let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
-// When the wait for a silent bot began, keyed by head: the latest head event
-// the validator could date, else the first observation of that head. Kept
-// across launches so a resumed run does not restart the cap; a new head, this
-// run's own push included, starts a new clock.
+// When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
 let reviewClock = restored ? restored.reviewClock : null
-// A commit that landed but was not pushed is a candidate the caller must
-// decide on, never the next baseline: expectedHead stays at the published head.
+// A landed but unpushed commit is the caller's to decide, never the next baseline.
 const pendingOf = () => {
   const last = history[history.length - 1]
   const a = last && last.adoption
@@ -980,7 +782,6 @@ const pendingOf = () => {
     if (f && f.committed && f.sha) {
       return { sha: f.sha, parent: expectedHead, lane, stage: f.detail.startsWith('commit failed audit') ? 'audit-blocked' : f.published === 'unknown' ? 'publication-unknown' : 'push-failed' }
     }
-    // A commit that landed but whose read-back died is real and unlocated.
     if (f && f.committed) return { sha: null, parent: expectedHead, lane, stage: 'audit-unknown' }
     if (f && f.committed === null) return { sha: null, parent: expectedHead, lane, stage: 'push-unknown' }
   }
@@ -991,7 +792,6 @@ const stateOut = () => {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
-    // Only to name the acceptances a later launch did not renew: each launch passes its own.
     acceptedFailures: acceptedArg.map(a => ({ key: acceptedKey(a) })),
     decisions: [...decisions],
     holds: [...holds],
@@ -1005,16 +805,10 @@ const stateOut = () => {
   }
   return { ...st, digest: sealOf(st) }
 }
-// What became of a finding or a CI failure, for the per-cycle table and the launch
-// rollup alike; each words a `valid` finding or a `real` failure its own way.
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
-// SonarCloud's own check, not an Actions job that runs the scanner: its gate is
-// SonarCloud's verdict on the PR, never a CI-lane fix.
+// SonarCloud's own check, not an Actions job: its gate is never a CI-lane fix.
 const sonarGate = (rf) => !rf.workflow && /^SonarCloud\b/.test(rf.check)
 const ciState = (rf) => rf.accepted ? 'accepted' : sonarGate(rf) ? 'sonarGate' : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
-// This launch in counts a caller can table across launches: each finding and
-// CI failure once, as its last cycle here left it, except that a fix this launch
-// pushed is not recounted as stale.
 const launchRollup = () => {
   const findings = new Map()
   const ci = new Map()
@@ -1045,9 +839,7 @@ const launchRollup = () => {
     ciChecks: { ...ciChecks }, reran: reran.size, pushed, replies,
   }
 }
-// Every result carries a status the caller can act on without reading the reason
-// (complete: passed; paused: a whole cycle ran and another may follow; blocked:
-// something needs attention first), what the last cycle observed, and the state.
+// status: complete, paused (a cycle ran, another may follow) or blocked.
 const finish = (verdict, status) => {
   const last = history[history.length - 1] || null
   const observation = {
@@ -1062,10 +854,8 @@ const finish = (verdict, status) => {
     } : null,
   }
   const state = stateOut()
-  // What markSonar was asked for and did not get, so a green launch does not read as all marked.
   const sonarUnmarked = !markSonar ? [] : [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, how: a.how, last: sonarLast.get(commentId) || (sonarDown ? { outcome: 'not asked', detail: sonarDown } : null) }))
-  // A caller's completion notice shows the result's head: what decides comes first, the bulk last.
   const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
   return {
     stateDigest: state.digest, status: status || (pass ? 'complete' : 'blocked'), ...(reason !== undefined ? { reason } : {}), pass, cycles,
@@ -1076,26 +866,18 @@ const owesDismissal = (commentId) => {
   const d = debt.get(commentId)
   return !!d && d.dismissals.size > 0
 }
-// findingId, not the location: a fix shifts the line and a re-harvest rewords
-// the claim, either of which would strand the dismissal it was meant to retire.
-// The contract that makes it stable lives in pr-review-validator.md.
+// findingId, not the location: a fix moves the line and a re-harvest rewords the claim (pr-review-validator.md).
 const dismissalKey = (f) => f.findingId
-// Red only from failures the caller accepted, with nothing still re-running.
 const acceptedOnly = (c) => c.status === 'red' && c.realFailures.length > 0 && c.realFailures.every(rf => rf.accepted) && c.infraRerun.length === 0
 
-// dryRun says the debt was never postable, so a caller can tell an intentionally
-// unposted obligation from a reply workflow that failed.
+// dryRun: the debt was never postable.
 const unresolvedVerdict = (cycles, deferred, dryRun = false) =>
   ({ pass: false, cycles, history, reason: 'deferred-replies-unresolved', deferred, dryRun })
 
-// Minutes a bot that has not started may stay silent before the head is
-// declared unreviewed by it. Ten is a policy, not proof it cannot still come.
+// Minutes a bot that has not started may stay silent: a policy, not proof.
 const REVIEW_CAP_MIN = 10
 const FULL_SHA = /^[0-9a-f]{40}$/
-// Why a harvest cannot be accounted for, or null. Structural only: the
-// validator interprets GitHub, this checks that what it claims is about this
-// head and names its evidence, since a full but older SHA is exactly how a
-// bot's stale review once passed for a fresh one.
+// Structural only: a full but older SHA is how a stale bot review once passed for a fresh one.
 const reviewsWhy = (r) => {
   if (r.headSha !== expectedHead) return `validator observed head ${r.headSha.slice(0, 7)}, expected ${expectedHead.slice(0, 7)}`
   const observed = Date.parse(r.observedAt)
@@ -1120,9 +902,7 @@ const reviewsWhy = (r) => {
   if (missing.length) return `no record for ${missing.join(', ')}`
   return null
 }
-// Advance the clock for this head from a harvest, then say where each bot
-// stands: reviewed and settled are done; queued and absent are done once the
-// cap has passed, and say so; working and unknown wait without a cap.
+// reviewed and settled are done; queued and absent once the cap passed; working and unknown wait uncapped.
 const settleBots = (r) => {
   if (!reviewClock || reviewClock.sha !== r.headSha) reviewClock = { sha: r.headSha, eventAt: r.headEventAt, since: r.observedAt }
   else if (r.headEventAt !== null && (reviewClock.eventAt === null || Date.parse(r.headEventAt) > Date.parse(reviewClock.eventAt))) {
@@ -1153,15 +933,9 @@ const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
 
 const nap = (ms) => new Promise(res => setTimeout(res, ms))
 
-// The only host this workflow will ask a publisher to push to. Widening it is
-// one constant and the two tests that name it.
+// The only host a publisher may push to.
 const HOST = 'github.com'
-// host/owner/repo out of a git remote URL: `user@host:owner/repo` or an
-// https/ssh URL. Plain http and git:// are unauthenticated and carry no push.
-// The path must be exactly owner/repo, and the delimiter after the host is
-// mandatory and per form (`/` for a URL, `:` for scp-like): accepting either
-// for both makes `git@github.com/owner/repo` look right while git reads it as
-// a local path.
+// scp-like needs `:` and a URL `/` after the host: accepting either makes `git@github.com/owner/repo` look right while git reads a local path.
 const ORIGIN = /^(?:(?:https|ssh):\/\/(?:[^@/]*@)?([^/:]+)(?::\d+)?\/|(?:[^@/\s]+@)([^/:]+):)([^/]+)\/([^/]+?)(?:\.git)?$/
 const originOf = (url) => {
   const m = ORIGIN.exec(String(url).trim().replace(/\/+$/, ''))
@@ -1169,27 +943,17 @@ const originOf = (url) => {
   const host = (m[1] || m[2]).toLowerCase()
   return host === HOST ? `${host}/${m[3]}/${m[4]}`.toLowerCase() : ''
 }
-// The host a PR lives on. The workflow sandbox has no `URL`, so this is parsed
-// like every other URL here; https only, since that is what `gh pr view --json
-// url` returns. The PR URL names the BASE repository, which is why owner/repo
-// comes from the head repository instead: on a fork PR they differ.
+// The sandbox has no `URL`. The PR URL names the base repository; owner/repo comes from the head repository, which differs on a fork.
 const PR_ORIGIN = /^https:\/\/([^/:?#]+)\//
 const hostOf = (url) => {
   const m = PR_ORIGIN.exec(String(url).trim())
   return m && m[1].toLowerCase() === HOST ? HOST : ''
 }
 
-// Canonicalize a repo-relative path for set/collision comparison: resolve ./..
-// segments, unify separators; '' for a path that escapes the repo or whose
-// spelling would name a different file.
+// '' for a path that escapes the repo or whose spelling names another file.
 const canon = (p) => {
   const s = String(p).replace(/\\/g, '/')
-  // Git allows a name that starts or ends with a space. Trimming would silently
-  // name a different file, so reject instead.
   if (s !== s.trim()) return ''
-  // Absolute (CI-runner) paths: reject rather than corrupt into a bogus relative
-  // path — the file-less group then routes through the scoper, which recovers the
-  // real repo path and is existence-checked.
   if (s.startsWith('/')) return ''
   const out = []
   for (const seg of s.split('/')) {
@@ -1199,7 +963,7 @@ const canon = (p) => {
   return out.join('/')
 }
 
-// Status lines arrive in sealed relay lines, so a relay that trims a leading blank fails its seal.
+// A relay that trims a leading blank fails its seal.
 const STATUS_LINE = /^([ MADRCUT?!])([ MADRCUT?!]) (.+)$/
 const statusOf = (line) => {
   const m = STATUS_LINE.exec(line)
@@ -1207,16 +971,11 @@ const statusOf = (line) => {
 }
 const pathOf = (line) => (statusOf(line) || {}).path || ''
 const modified = (lines) => new Set(lines.map(statusOf).filter(t => t && t.x === ' ' && t.y === 'M').map(t => t.path))
-// IDE metadata is the one drift this workflow tolerates: an open CLion project rewrites
-// .idea/ in every checkout it touches, and blocking on it stopped every launch on such a
-// tree. It is ignored by the dirty checks, never admitted into a fix scope or a commit,
-// and nothing else is tolerated: a second exception would need its own reason here.
+// IDE metadata (.idea/, rewritten by an open CLion project) is the one tolerated drift: ignored by dirty checks, never in a scope or commit.
 const IDE_DRIFT = /^(?:.*\/)?\.idea\//
 const ideDrift = (path) => IDE_DRIFT.test(path)
 const withoutIdeDrift = (lines) => lines.filter(l => !ideDrift(pathOf(l)))
 
-// Group actionable notes by top-level scope. A note keeps its id so the cycle
-// summary can still map a finding to the fix that handled it after merging.
 const groupWork = (notes) => {
   const groups = new Map()
   for (const n of notes) {
@@ -1229,20 +988,11 @@ const groupWork = (notes) => {
   return [...groups.values()]
 }
 
-// A resolved build plan per owned path set, reused by later cycles of this launch
-// with the setup a base build resolved into it. It is dropped once a pushed
-// commit changes a file its resolver says it read the contract from, and one
-// whose contract is among its own paths is never kept.
+// Build plan per owned path set, dropped once a push changes a contract file it was read from.
 const buildPlans = new Map()
 const contractTouched = (plan, paths) => plan.contract.some(f => paths.has(canon(f)))
-// The caller's build still needs the repository's setup for the base, resolved
-// once per launch, and only if a base build is needed (setup undefined until then).
 const callerPlan = buildCmd && { command: buildCmd, setup: undefined, targets: [], options: [], reason: "the caller's build", error: null }
-// The batch built once, as it settled: a writer's own build ran beside its
-// siblings' unfinished edits and proves nothing about the whole. A failing
-// candidate is compared with the pinned head, since a target broken there is
-// broken for every fix. { block } when it may not be published, else { note },
-// what the build left unverified.
+// The batch is built once, as it settled; a failing candidate is compared with the pinned head, since a target broken there is broken for every fix.
 const buildCheck = async (tag, owned) => {
   let plan = callerPlan
   if (!plan) {
@@ -1268,9 +1018,6 @@ const buildCheck = async (tag, owned) => {
     relayed(BUILD_RUN),
     { label: `build:${name}#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
   ).catch(e => { log(`build:${name}#${tag} errored — ${e && e.message}`); return null })
-  // A receipt counts only as the run that was asked for: its side, the pinned
-  // head, the command as asked with its build dir filled in, and for the
-  // candidate sources the build left as the checks saw them.
   const why = (r, name) => !r ? 'agent died' : r.error ? r.error
     : r.side !== name || r.revision !== expectedHead ? `the receipt is for ${r.side} at ${String(r.revision).slice(0, 7)}, not ${name} at ${expectedHead.slice(0, 7)}`
     : typeof r.buildDir !== 'string' || typeof r.log !== 'string' || !r.cleanup || !('exit' in r) ? 'incomplete receipt'
@@ -1283,8 +1030,6 @@ const buildCheck = async (tag, owned) => {
   if (why(cand, 'candidate')) return { block: `candidate build did not count: ${why(cand, 'candidate')}` }
   tidy(cand)
   if (cand.exit === 0) return { note: null }
-  // The base's setup, from the contract; `refused` is build_compare.py's reason
-  // for rejecting the one resolved before, asked about once.
   const resolveSetup = async (refused) => {
     const got = await agent(
       `${IN_CHECKOUT}Editing and building nothing, from the repository's build contract (its agent instructions and build docs) name the command a fresh checkout of it needs, run from its top level, ` +
@@ -1323,8 +1068,6 @@ const buildCheck = async (tag, owned) => {
   return { note: `unverified, the base fails too: ${v.unverified.join(', ') || 'no target named'}` }
 }
 
-// Whether the uncommitted changes to `paths` keep every consumer of the
-// behaviour they change working; the failure reason, or null when they do.
 const checkCompat = async (label, paths, brief) => {
   const compat = await agent(
     `${IN_CHECKOUT}Editing nothing, check the uncommitted changes to ${paths.join(', ')} (\`git diff -- <those paths>\`, and read any of them that are new untracked files), made to fix:\n- ${brief.issues.join('\n- ')}\n` +
@@ -1341,17 +1084,12 @@ const checkCompat = async (label, paths, brief) => {
     : null
 }
 
-// Fix + verify one work list; returns { ok, fixes } — ok only if every group
-// was scoped, fixed by a live worker, AND passed finding-verifier verification.
+// ok only if every group was scoped, fixed and verified.
 const fixAndVerify = async (workIn, tag) => {
   const textOf = (w) => w.notes.map(n => n.text).join('\n- ')
-  // Note ids ride on the fix so the cycle summary can say which finding each fix answered.
   const verdictOf = (fix, w, addresses, checkReason) =>
     ({ ...fix, ids: w.notes.map(n => n.id), addresses, checkReason })
-  // code-writer's contract needs an explicit file set: a group whose notes named no
-  // files (a CI failure whose log yielded no paths) is scoped by a dedicated agent
-  // first; if that fails too, the group is withheld (ok=false → human review) rather
-  // than dispatched with an invalid scope.
+  // A group naming no file (a CI log with no path) is scoped first; an unscoped one is withheld for a human.
   const fileless = workIn.filter(w => w.files.size === 0)
   await parallel(fileless.map(w => () =>
     agent(
@@ -1359,8 +1097,7 @@ const fixAndVerify = async (workIn, tag) => {
       'files = repo-relative paths; empty only if genuinely undeterminable.',
       { label: `scope:${w.key}`, phase: 'Fix', model: 'sonnet', schema: SCOPE },
     ).then(s => s && s.files.forEach(f => { const c = canon(f); if (c) w.files.add(c) }))))
-  // Scoped paths are model output: keep only what git ls-files confirms exists. A dead
-  // checker confirms nothing, so its groups fall through to withheld.
+  // Scoped paths are model output: keep only what git ls-files confirms.
   const candidates = [...new Set(fileless.flatMap(w => [...w.files]))]
   if (candidates.length > 0) {
     const v = await agent(
@@ -1373,8 +1110,7 @@ const fixAndVerify = async (workIn, tag) => {
   }
   const unscoped = workIn.filter(w => w.files.size === 0)
   for (const w of unscoped) log(`fix for ${w.key}: no file scope determinable — withheld for human review`)
-  // Scoping can make groups overlap (two checks resolving to the same file); merge
-  // intersecting groups (to closure) so no two fixers are given one file to edit.
+  // Merge groups sharing a file so no two writers edit one file.
   const work = []
   for (let g of workIn.filter(w => w.files.size > 0)) {
     for (let i; (i = work.findIndex(m => [...g.files].some(f => m.files.has(f)))) >= 0;) {
@@ -1384,10 +1120,7 @@ const fixAndVerify = async (workIn, tag) => {
     }
     work.push(g)
   }
-  // A protected path describes something the caller owns and this run must not
-  // touch — a HIL rig roster naming physical hardware, say, where reshaping the
-  // fixture papers over a real failure. Matches leave the scope, and a group
-  // that needed nothing else stays red for the user.
+  // A protected path is the caller's (a HIL rig roster, say): dropped from scope; a group needing only it stays red.
   const withheld = []
   for (const w of work) {
     for (const f of [...w.files]) {
@@ -1436,7 +1169,6 @@ const fixAndVerify = async (workIn, tag) => {
   for (const f of unverified) log(`fix for ${f.item}: failed verification — ${f.checkReason}`)
   const verified = unscoped.length === 0 && withheld.length === 0 && alive.length === work.length && unverified.length === 0
   const owned = [...new Set(work.flatMap(w => [...w.files]))]
-  // claims: the issues without their hints, which only the commit message needs.
   const brief = { issues: work.map(textOf), claims: work.flatMap(w => w.notes.map(n => n.claim)), notes: alive.map(f => f.notes).filter(Boolean) }
   const fail = (why) => {
     for (const f of alive) Object.assign(f, { addresses: false, checkReason: why })
@@ -1451,8 +1183,7 @@ const fixAndVerify = async (workIn, tag) => {
       for (const f of alive) f.buildNote = built.note
     }
   }
-  // Each group's check sees its own issues; only the whole batch shows what the
-  // change does to code that relies on it, wherever that code lives.
+  // Only the whole batch shows what the change does to code relying on it.
   if (verified && unverified.length === 0) {
     const why = await checkCompat(`compat#${tag}`, owned, brief)
     if (why) fail(why)
@@ -1461,21 +1192,12 @@ const fixAndVerify = async (workIn, tag) => {
     ok: verified && unverified.length === 0,
     fixes: alive,
     brief,
-    // What the publisher may stage: the scoped paths of the groups that survived,
-    // never the whole working tree.
     owned,
   }
 }
 
-// One markdown row per validated bot finding (and real CI failure): what the bot
-// claimed, the verdict, what happened to it, and the commit carrying the fix.
-// A finding is identified by its commentId (as it already is for replies); a CI
-// failure gets an `id` stamped on it where the watcher's list arrives, because
-// two matrix legs of one job report the same `check`.
 
-// Markdown cells break on newlines and bare pipes; long claims need a cap.
-// Backslashes go first: escaping pipes in `\|` without it yields `\\|`, whose
-// doubled backslash GFM eats, leaving the pipe live to split the row.
+// Backslashes first, or GFM eats `\\|` and the pipe splits the row.
 const cell = (s, max = 90) => {
   const t = String(s ?? '').replace(/\s+/g, ' ').replace(/\\/g, '\\\\').replace(/\|/g, '\\|').trim()
   if (!t) return '-'
@@ -1486,23 +1208,18 @@ const mdTable = (headers, rows) => {
   const line = (cells) => `| ${cells.map((c, i) => c.padEnd(w[i])).join(' | ')} |`
   return [line(headers), line(w.map(n => '-'.repeat(n))), ...rows.map(line)].join('\n')
 }
-// Validate the pushed SHA rather than trusting it: it is model output, and a
-// mislabeled commit in the table is worse than no commit at all.
+// The SHA is model output: a mislabeled commit in the table is worse than none.
 const shaOf = (push) => {
   const s = push && push.sha && String(push.sha).trim()
   return s && /^[0-9a-f]{7,40}$/.test(s) ? s.slice(0, 8) : '-'
 }
 const fixCell = (fixes, id, push, pushFailed) => {
-  // No fixes array at all = that lane never got to dispatch this cycle (a dead
-  // agent, or a push in the other lane that superseded it).
   if (!fixes) return 'no fix attempted this cycle'
   const fix = fixes.find(x => x.ids.includes(id))
   if (!fix) return 'withheld (no fix dispatched)'
   if (fix.addresses !== true) return `unverified: ${fix.checkReason}`
   const stat = fix.diffstat ? ` — ${fix.diffstat}` : ''
-  // Two different recoveries, so never infer one from the other: a rejected push
-  // leaves the fix committed locally, while a failed commit leaves it only in the
-  // working tree with nothing in git to recover.
+  // A rejected push leaves the fix committed; a failed commit leaves it only in the tree.
   if (pushFailed) {
     const detail = pushFailed.detail || 'no detail'
     if (pushFailed.committed === null) return `fixed, COMMIT OUTCOME UNKNOWN: ${detail} — inspect HEAD and the worktree${stat}`
@@ -1515,9 +1232,7 @@ const fixCell = (fixes, id, push, pushFailed) => {
   return `${push ? 'fixed + pushed' : 'fixed, uncommitted'}${hook}${built}${stat}`
 }
 const VERDICT_ORDER = { valid: 0, stale: 1, invalid: 2 }
-// Comments the script found on none of the PR's three id spaces this cycle:
-// they owe nothing and no reply was posted, so the summary must not read
-// "pending". Per cycle, since a later harvest of the same id owes anew.
+// Comments on none of the PR's id spaces owe nothing; per cycle.
 const retired = new Set()
 const answerState = (commentId) => (debt.get(commentId) || {}).repair
   ? `NEEDS REPAIR: ${debt.get(commentId).repair.replyId ? `reply ${debt.get(commentId).repair.replyId} has the wrong body` : debt.get(commentId).repair.error}`
@@ -1569,24 +1284,14 @@ const cycleSummary = (entry) => {
     : `${head}\n${mdTable(['Bot', 'Finding', 'Verdict', 'Outcome', 'Commit'], rows)}`
 }
 
-// The publisher is dispatched only after verification, so an unverified or
-// partial edit is never what this workflow asks to be pushed. A dead agent
-// becomes a pass=false verdict of its own.
 const commitAndPush = async (cycle, what, owned = [], brief) => {
-  // Commit by explicit path, never `git add -A`: a stray edit on a path this
-  // run does not own would otherwise ride along in the push. An edit on a path
-  // it does own is indistinguishable from its own and is not caught here. Protected
-  // paths are already out of `owned` by the time a group gets here, so one
-  // arriving means that filter broke: refuse the push rather than quietly drop
-  // it, because a silent drop publishes a fix that is no longer the fix.
+  // Commit by explicit path: a stray edit on an unowned path must not ride along (one on an owned path is indistinguishable from ours). A protected path here means the scope filter broke.
   const sneaked = protectedRe ? owned.filter(f => protectedRe.test(f)) : []
   if (sneaked.length) {
     log(`push#${cycle}-${what}: refusing to publish — protected path in scope: ${sneaked.join(', ')}`)
     return { pass: false, committed: false, detail: `protected path in scope: ${sneaked.join(', ')}`, sha: '' }
   }
-  // The tree can have moved since the preflight: another session, a hook, a
-  // rebase. Identity is an exact SHA, never a count: a one-for-one replacement,
-  // a reset behind the pin, or a foreign commit all keep the count plausible.
+  // Identity is an exact SHA, never a count.
   const now = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
@@ -1604,13 +1309,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     return { pass: false, committed: false, detail: `checkout moved: ${moved}`, sha: '' }
   }
 
-  // A fixer's build can rewrite a tracked path the caller declared as build
-  // output (a catalog the configure step maintains). That is not the fix and
-  // not a stray: it is admitted on the caller's word that the repository hooks
-  // validate it, so the hooks run over it too, and only a plain unstaged
-  // modification qualifies — an addition, a deletion, a rename or a staging is
-  // somebody else's doing. The snapshots below then show it stayed put across
-  // the hooks; they say nothing about which process wrote it.
+  // Build output the caller declared `generated` is admitted on its word that the hooks validate it; only a plain unstaged modification qualifies.
   const ownedSet = new Set(owned.map(canon))
   const regenerated = generatedRe ? [...modified(now.status)].filter(f => f && !ownedSet.has(f) && !ideDrift(f) && generatedRe.test(f)) : []
   const regeneratedProtected = protectedRe ? regenerated.filter(f => protectedRe.test(f)) : []
@@ -1619,13 +1318,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     return { pass: false, committed: false, detail: `the build regenerated a protected path: ${regeneratedProtected.join(', ')}`, sha: '' }
   }
   const checked = [...owned, ...regenerated]
-  // A required hook can regenerate a file outside the fix scope (a generated
-  // doc, a formatter's output), and pre-commit refuses a commit whose hook
-  // modified a file. Run the hooks first, on the checked paths, and admit what
-  // they changed from the evidence they leave: a path that appeared in the tree
-  // only after a hook reported modifying files, while the checked files' contents
-  // stayed what the fix verifier saw. The committer is then handed the widened
-  // list and never chooses a path itself.
+  // A required hook may regenerate files outside the scope: run the hooks first and admit only what appeared after they reported changes, the checked files unchanged; the committer never picks a path.
   const quoted = checked.map(shq).join(' ')
   const hooks = await relayAgent(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
@@ -1640,19 +1333,13 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   const checkedSet = new Set(checked.map(canon))
   const beforePaths = withoutIdeDrift(hooks.before).map(pathOf)
   const outside = beforePaths.filter(f => !checkedSet.has(f))
-  // The recheck's status is a moment older than the hooks' own: a candidate
-  // that is no longer a plain modification by then is not the one admitted.
   const beforeModified = modified(hooks.before)
   const unsteady = regenerated.filter(f => !beforeModified.has(f))
   const generated = withoutIdeDrift(hooks.after).filter(l => !beforePaths.includes(pathOf(l)))
-  // Anything staged after the hooks (X not blank) was staged by a hook: an
-  // addition the tree never held, or a rename. Untracked (`??`) is new too.
   const created = generated.filter(l => (statusOf(l) || { x: '?' }).x !== ' ')
   const hookPaths = generated.map(pathOf)
   const generatedProtected = protectedRe ? hookPaths.filter(f => protectedRe.test(f)) : []
-  // Evidence must be complete before it says anything: one snapshot entry per
-  // owned path on both sides, and one per admitted path after. Two empty lists
-  // are equal and prove nothing.
+  // Two empty snapshot lists are equal and prove nothing: every checked path needs both sides.
   const snapBefore = snapshotOf(hooks.snapshotBefore)
   const snapAfter = snapshotOf(hooks.snapshotAfter)
   const unsnapped = [...checked.map(canon).filter(f => !snapBefore.has(f) || !snapAfter.has(f)), ...hookPaths.filter(f => !snapAfter.has(f))]
@@ -1681,7 +1368,6 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   const generatedPaths = [...new Set([...regenerated, ...hookPaths])]
   const scope = [...new Set([...owned, ...generatedPaths].map(canon))]
   const scopeSet = new Set(scope)
-  // The batch was checked before the build and hook output joined it.
   if (generatedPaths.length) {
     const why = await checkCompat(`compat#${cycle}-${what}-generated`, scope, brief)
     if (why) {
@@ -1690,29 +1376,22 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     }
   }
 
-  // Commit and push are separate turns so the commit can be audited before it
-  // leaves the machine: what a `git commit` picks up is not what `git add`
-  // staged if anything ran in between.
+  // Commit and push are separate turns so the commit is audited before it leaves.
   const made = await relayAgent(
     `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to a new temporary file outside the checkout: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
     'in the style `git log -5 --format=%s` shows, and a body only for a why the diff cannot show; ' +
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
-    // A file, not a here-document: no delimiter can collide with a line of the message.
+    // A file, not a here-document: no delimiter can collide with the message.
     `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < <that file>; rm -f <that file>\`. ` +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
     { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT },
   ).catch(e => { log(`commit#${cycle}-${what} errored — ${e && e.message}`); return null })
-  // A dead commit agent leaves no receipt either way, nor does an error: the
-  // relay reports one for output it never saw, after git may have run. The
-  // read-back below settles it, and without one the outcome stays null.
+  // A dead committer or relay error leaves no receipt: the read-back settles it, else committed stays null.
   const lost = made ? made.error : 'commit agent died'
   if (!lost && !made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
 
-  // Read the commit back in a separate turn: a committer reporting on its own
-  // work is the one report most likely to be wrong about it. This catches
-  // misreporting and a tree that moved underneath, not a determined lie.
   const seen = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(shq).join(' ')}\` ` +
     relayed(AUDIT),
@@ -1724,20 +1403,15 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
       : seen.error ? `the read-back failed: ${seen.error}`
       : !FULL_SHA.test(sha) ? 'the read-back named no full SHA' : null
     if (unread) return { pass: false, committed: null, detail: `${lost}; ${unread}`, sha: '' }
-    // Unmoved proves nothing: the relay may write an error for output it never saw, while git still runs.
+    // Unmoved proves nothing: git may still be running.
     if (sha === expectedHead) return { pass: false, committed: null, detail: `${lost}; HEAD is still ${expectedHead.slice(0, 7)}, but the committer may not have finished`, sha: '' }
     log(`push#${cycle}-${what}: ${lost}, but HEAD moved to ${sha.slice(0, 7)}; auditing it as this cycle's commit`)
   }
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
 
-  // Audit the commit itself, not the intent: its parent must be where this run
-  // left HEAD, it must carry nothing beyond the paths we owned, and nothing the
-  // writers changed in those paths may be left behind — a partial commit would
-  // otherwise be pushed and every finding announced fixed.
+  // Audit the commit, not the intent: its parent, its paths, nothing owned left behind.
   const strays = seen.paths.map(canon).filter(f => !scopeSet.has(f))
-  // What the commit holds for each path must be what the hooks left: the fix
-  // the verifier saw and the regeneration the hook made, byte for byte and mode
-  // for mode. An edit between the hooks and the commit is caught here.
+  // Committed blobs and modes must be what the hooks left.
   const committed = snapshotOf(seen.entries)
   const unbound = scope.map(canon).filter(f => {
     const want = snapAfter.get(f); const got = committed.get(f)
@@ -1745,9 +1419,6 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     if (want.mode === 'absent') return got !== undefined
     return !got || want.blob !== got.blob || want.mode !== got.mode
   })
-  // Absent evidence is not evidence of a clean commit: an empty path list, a
-  // half-written SHA, or a SHA equal to the parent all mean the report does not
-  // describe a commit we can vouch for.
   const why = seen.error ? `the commit could not be read back: ${seen.error}`
     : !/^[0-9a-f]{40}$/.test(sha) ? `commit reported no full SHA: ${JSON.stringify(seen.sha)}`
     : sha === expectedHead ? 'commit SHA equals the parent: nothing was committed'
@@ -1774,20 +1445,14 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
 }
 
-// Publishes one audited SHA to the PR's head branch, never the branch itself, which
-// would publish whatever HEAD has become. It landed when every pinned push URL
-// (and, for an adoption, the PR) reads back that SHA; it failed only when every
-// URL answered without it; anything else is unknown, never "not pushed".
-// null when the agent died.
+// Push one audited SHA, never the branch. Landed only when every pinned URL (and the PR, for an adoption) reads it back; failed only when every URL answered without it; else unknown. null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
   const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
     `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
     relayed(PUSH)
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
-  // relayOnce's two attempts, kept apart: push.py pushes one exact SHA without
-  // force and reads it back, so a retry finds a push that landed; it cannot prove
-  // one did not, since the branch may have moved on since.
+  // A retry finds a push that landed; it cannot prove one did not.
   const first = await relayRun(prompt, opts)
   const r = first ?? await relayRun(prompt, retryOpts(opts))
   if (!r) return null
@@ -1808,11 +1473,9 @@ const pushExact = async (sha, label, prToo = false) => {
     : 'the push landed on some push URLs and not others')
 }
 
-let napMs = 0 // backoff owed from the previous cycle, taken after its summary
+let napMs = 0
 
-// A refutation settles the comment outright; a fix note ("fixed in X") is
-// not the answer a dismissal owes, so it settles only the note. digest is the
-// comment body's the answer addressed.
+// A refutation settles the comment; a fix note settles only its notes.
 const pay = (commentId, how, digest, sonarNote) => {
   answeredWith.set(commentId, { how, digest, ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
   reanswer.delete(commentId)
@@ -1821,19 +1484,12 @@ const pay = (commentId, how, digest, sonarNote) => {
   d.notes.clear()
   delete d.attempt
   if (how === 'refutation') { d.dismissals.clear(); delete d.seenSinceEdit }
-  // A deferral reply goes out only with no dismissal carried, so no reused id
-  // is left for the renumbering to protect.
   if (how === 'deferral') delete d.seenSinceEdit
   if (d.dismissals.size === 0 && !d.seenSinceEdit) debt.delete(commentId)
 }
 
-// Posting is the script's; the workflow settles each comment by its receipt
-// alone, and a receipt can only pay, repair or retire a comment.
 const publishReplies = async (label, drafts, how, cycle, digestOf) => {
-  // A reply that exists with the wrong content is a repair: the comment keeps
-  // its debt, and the next cycle must not answer it again on top of the wrong
-  // one. `posted` says this attempt's own POST made it, so the next cycle may
-  // edit it to the offered body; any other is settled on or left to a human.
+  // A reply that exists with the wrong content is a repair, never answered again on top. posted: our own POST made it, so it may be edited to the offered body.
   const repair = (commentId, replyId, error, posted = false) => {
     const d = debt.get(commentId) || (debt.set(commentId, { dismissals: new Set(), notes: new Set() }), debt.get(commentId))
     d.repair = { replyId, error, ...(posted ? { posted } : {}) }
@@ -1844,11 +1500,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
         : `cycle ${cycle}: no reply posted to comment ${commentId} (${error}) — a human answers it, checking the thread for an earlier attempt`)
   }
   const ownPost = (r) => r.sent === true && r.posted === true && r.replyId !== null
-  // The body first offered is kept in the debt as an attempt (body, digest,
-  // answer type) until the comment is paid: no receipt proves an earlier
-  // POST never landed, and the script reuses only an identical body. A
-  // reviewer's edit or a verdict flip since makes it stale: neither reused
-  // nor reposted; a human reconciles.
+  // The first offered body is kept as the attempt until paid: no receipt proves an earlier POST never landed, and reply.py reuses only an identical body.
   const replies = []
   const sonarNotes = new Map()
   for (const { commentId, body, scanning } of drafts) {
@@ -1858,8 +1510,6 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
       repair(commentId, null, `offered ${a.how} is stale (${a.how !== how ? `now owes a ${how}` : 'comment edited'})`)
       continue
     }
-    // An offered body may be on the thread already: one over the limit is neither reused nor redrafted.
-    // A draft never offered is only withheld, so a shorter one can go out later.
     if (overLength(a ? a.body : body)) {
       const why = `over length: a point exceeds ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters`
       if (a) repair(commentId, null, why)
@@ -1877,13 +1527,11 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
     `Manifest: ${JSON.stringify({ replies })}`)
   const expected = new Map(replies.map(r => [r.commentId, r.digest]))
-  const receipts = out ? out.receipts.filter(r => expected.has(r.commentId)) : [] // a stray id answers nothing
+  const receipts = out ? out.receipts.filter(r => expected.has(r.commentId)) : []
   const settled = new Set()
   const replied = []
   for (const [commentId, digest] of expected) {
     const mine = receipts.filter(r => r.commentId === commentId)
-    // A receipt that is not trusted may still name a reply that exists:
-    // that id is kept as the repair, so nothing is posted over it.
     const sideEffect = mine.find(r => r.replyId !== null)
     if (mine.length !== 1) {
       if (mine.length > 1) log(`cycle ${cycle}: ${label} returned ${mine.length} receipts for comment ${commentId} — none trusted`)
@@ -1897,11 +1545,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
       continue
     }
     if (r.kind === 'none') {
-      // Every id space was searched and none has it: nothing can ever pay
-      // this, so it is dropped rather than carried. answeredWith is left
-      // alone, since no reply exists. Only the script's exact absence
-      // shape says so; a "none" that also claims a POST or a reply is
-      // contradictory and can neither retire nor pay.
+      // Only reply.py's exact absence shape retires a comment.
       if (r.replyId === null && !r.sent && !r.posted && r.verified === false && r.resolved === null) {
         log(`cycle ${cycle}: comment ${commentId} is not on PR #${args.pr} — owes nothing`)
         debt.delete(commentId); reanswer.delete(commentId); retired.add(commentId); settled.add(commentId)
@@ -1926,9 +1570,6 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   return receipt
 }
 
-// A refutation draft over the reply limits is rewritten once; the rewrite replaces
-// it only when it fits and a second agent finds it says what the draft said.
-// Anything else keeps the draft, which publishReplies withholds.
 const shortenReplies = async (cycle, long) => {
   const ids = long.map(x => x.commentId)
   const got = await agent(
@@ -1965,12 +1606,7 @@ const shortenReplies = async (cycle, long) => {
   return shortened
 }
 
-// SonarCloud keeps its quality gate red on an issue until it is resolved, so
-// sonar.py marks the issue behind each answered code-scanning comment false
-// positive: a refutation at once, a fix only while SonarCloud still flags it on
-// the head it analysed. One ask per cycle; a waiting or failed issue is asked
-// about again, and the result lists what is still unmarked. Returns how many
-// were marked.
+// SonarCloud keeps its gate red until an issue is resolved: mark the issue behind each answered code-scanning comment false positive.
 const settleSonar = async (cycle, entry) => {
   const items = [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, commentDigest: a.digest, how: a.how, note: a.sonar, digest: fnv1a(a.sonar) }))
@@ -1992,14 +1628,7 @@ const settleSonar = async (cycle, entry) => {
   return entry.sonar.filter(x => x.outcome === 'marked').length
 }
 
-// A comment held for repair because a reply of ours already answers it in
-// other words (reply.py will not post over that) settles on that reply when a
-// verifier finds it answers every point the comment is owed now. Nothing is
-// posted: reply.py reads the reply and the comment again, unchanged since the
-// inspection, before the comment is paid and its repair cleared. A reply our
-// own POST put there with another body than the attempt's (`attempted`) is
-// instead edited to it, after the same inspection. A dry run inspects and
-// judges, and settles nothing.
+// A repair settles on a reply already there that a verifier finds answers every point; reply.py re-reads both first. A reply our POST made with another body is edited to the attempt.
 const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
   const got = await relayOnce(
     `${IN_CHECKOUT}Posting and editing nothing, run exactly \`python3 ${REPLY_SCRIPT} --pr ${args.pr} --inspect ${stuck.map(s => `${s.commentId}:${s.replyId}`).join(' ')}\` ` +
@@ -2018,9 +1647,7 @@ const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
     if (why) notYet(s, why)
     else readable.push({ ...s, kind: i.kind, body: i.body, bodyDigest: i.bodyDigest, originalDigest: i.originalDigest })
   }
-  // A reply that is the attempt offered, word for word, says what that attempt was
-  // meant to: it settles with no verdict and no edit, as a read-back mismatch on a
-  // parent that was right all along (#18) does.
+  // The attempt, word for word, settles with no verdict (#18).
   const text = (s) => s.kind === 'review' ? s.body : s.body.slice(s.body.indexOf('\n\n') + 2)
   const exact = [], edits = [], judging = []
   for (const s of readable) {
@@ -2051,7 +1678,6 @@ const reconcileReplies = async (cycle, stuck, pointsOf, digestOf) => {
   }
 }
 
-// The replies a verifier finds answer every point their comments are owed now.
 const judge = async (cycle, judging, pointsOf, notYet) => {
   const judged = await agent(
     `${IN_CHECKOUT}Editing and posting nothing, judge whether each reply below, already posted on PR #${args.pr}, answers every point its comment is owed now. ` +
@@ -2070,9 +1696,6 @@ const judge = async (cycle, judging, pointsOf, notYet) => {
   })
 }
 
-// reply.py re-reads each pair before the edit; a comment is paid only on a receipt
-// for exactly the offered body. One that does not verify is not edited again:
-// what the reply says now is unknown, so it goes to the verifier next cycle.
 const editReplies = async (cycle, edits, notYet) => {
   if (args.autoPush !== true) {
     log(`cycle ${cycle}: reply/replies ${edits.map(s => s.replyId).join(', ')} would be edited to the offered body (dry run)`)
@@ -2096,19 +1719,13 @@ const editReplies = async (cycle, edits, notYet) => {
   }
 }
 
-// The CI lane: collect.py waits and lists without a model (ci:collect, one Haiku
-// call per wait slice), and the judge reads only the failing checks' evidence.
-// A SonarCloud gate is never judged: collect.py reads its failing conditions.
-// It composes the report the rest of the cycle reads, or returns null to re-arm.
-// Waits are short while the review lane may still push (its push supersedes this
-// run) and stop once it has pushed or the cycle has ended.
+// collect.py waits and lists without a model; the judge reads only the failing checks' evidence. Waits stay short while the review lane may still push.
 const ciLaneRun = async (cycle, lanes) => {
   const repo = ((pin && pin.prUrl) || '').match(/github\.com\/([^/]+\/[^/]+)\/pull\//)?.[1]
   if (!repo) {
     log(`cycle ${cycle}: CI not collected — no PR repository in ${JSON.stringify(pin && pin.prUrl)}`)
     return null
   }
-  // A retry does not wait again.
   const collect = (label, command, schema, payload) => {
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file and ' : ''}` +
@@ -2120,9 +1737,8 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
-  // An answer covers the asked links (distinct) when it names each exactly once.
   const sameLinks = (got, want) => got.length === want.length && want.every(l => got.includes(l))
-  // collect.py polls every 30 s, so a slice shorter than that would only list.
+  // collect.py polls every 30 s, so a shorter slice would only list.
   let inv = null
   let left = ciWait * 60
   for (let k = 1; ; k++) {
@@ -2136,7 +1752,6 @@ const ciLaneRun = async (cycle, lanes) => {
     if (inv.status !== 'running' || left < 30 || lanes.reviewPushed || lanes.ended) break
   }
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
-  // With nothing pending or failing the head is green, or has no checks registered yet (running).
   const shown = inv.pending > 0 ? 'running' : failing.length ? 'red' : null
   if (inv.head !== expectedHead || (shown ? inv.status !== shown : !['green', 'running'].includes(inv.status))) {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
@@ -2144,19 +1759,13 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
   const reruns = ciReruns.filter(r => r.head === inv.head)
-  // A re-run recorded under a link that now resolves to the execution it copied still settles.
   const settling = failing.filter(c => reruns.some(r => r.sure && [c.link, ...(c.aliases || [])].includes(r.link)))
-  // A run's conclusion can still be updated under the same link, so the bucket must match too.
+  // A run's conclusion can change under the same link, so the bucket must match too.
   const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
   const unread = failing.filter(c => reusable(c) && !ciVerdicts.get(c.link).failures)
-  // A few links to a call: a copy that fails its seal costs its own batch a fresh
-  // relay, the rest nothing (#9). collect.py bounds each line; a link it held back
-  // for room comes back in pages, each a recall of its own.
   const recallOf = (label, links, offset) =>
     collect(label, `recall ${links.map(c => `--check ${shq(c.link)}`).join(' ')}${offset === undefined ? '' : ` --offset ${offset}`}`, RECALLED)
-  // A held-back verdict comes back in the pages its starts name, recalled together;
-  // the digest check below judges their join.
   const inPages = async (label, c, starts) => {
     const pages = await parallel(starts.map((o, i) => () => recallOf(`${label}.p${i + 1}`, [c], o)))
     const slices = pages.map(p => faultOf(p, inv.head) ? undefined : p.verdicts.find(v => v.link === c.link))
@@ -2192,17 +1801,14 @@ const ciLaneRun = async (cycle, lanes) => {
     }
   }
   await parallel(groupsOf(unread, RECALL_PER_CALL).map((batch, k) => () => recallBatch(batch, k)))
-  // A stored check with an unclassified failure is judged again for those failures
-  // alone when its enumeration can carry the placed ones: all complete, each once.
+  // A stored check is judged again only for its unclassified failures, when its stored list is complete and distinct.
   const storedOf = (c) => ciVerdicts.get(c.link).failures
   const unplaced = (c) => storedOf(c).filter(f => f.verdict === 'unclassified')
   const reused = failing.filter(reusable)
   const placed = reused.filter(c => unplaced(c).length === 0)
   const partial = reused.filter(c => !placed.includes(c) && storedOf(c).every(f => f.complete) &&
     new Set(storedOf(c).map(failureKey)).size === storedOf(c).length)
-  // A retry policy, not proof nothing changed: such a check whose unclassified failures
-  // were judged with these ciNotes and its current base job stands as stored. Other
-  // branches' runs and other heads' verdicts are not watched.
+  // Retry policy, not proof: unclassified failures judged with these ciNotes and the current base job stand as stored.
   const placedKey = (base) => `${notesDigest}:${base}`
   const candidates = partial.filter(c => ciVerdicts.get(c.link).placedWith?.startsWith(`${notesDigest}:`))
   let unchanged = []
@@ -2269,16 +1875,12 @@ const ciLaneRun = async (cycle, lanes) => {
     noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true })
     ciVerdicts.delete(c.link)
   }
-  // An empty answer is a re-run by the contract: CI is settling, receipt or not.
+  // An empty answer is a re-run by the contract.
   if (reran.length) report.status = 'running'
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
-  // A partly judged check's answer is its judgeOnly failures, complete, merged in
-  // place, or every failure of the check, as for any check. Any other answer drops
-  // the check from the store and re-arms once the other checks' verdicts are stored,
-  // so it is judged whole next time.
+  // A partly judged check is answered by its judgeOnly failures or by all of them; anything else is judged whole next time.
   const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
   const unsettled = []
-  // A merged check is stored as a patch; the store keeps the rest.
   const patches = new Map()
   for (const c of partial.filter(c => judging.includes(c) && !reran.includes(c))) {
     const got = new Map(failuresOf.get(c.link).map(f => [failureKey(f), f]))
@@ -2302,8 +1904,7 @@ const ciLaneRun = async (cycle, lanes) => {
     const placedWith = v.failures.some(f => f.verdict === 'unclassified') ? { placedWith: placedKey(base) } : {}
     ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v, ...placedWith })
   }
-  // A push since judging moved the head on: those verdicts will never be recalled.
-  // One the store lost or garbled fails its digest on recall and is judged again.
+  // After a push these verdicts are never recalled; a lost one fails its digest and is judged again.
   if (fresh.length && !lanes.reviewPushed) {
     const stored = fresh.map(v => patches.has(v.link) ? { link: v.link, bucket: v.bucket, patch: patches.get(v.link) } : v)
     const why = faultOf(await collect(`ci:collect#${cycle}.w`, 'remember', REMEMBERED, stored), inv.head)
@@ -2315,26 +1916,18 @@ const ciLaneRun = async (cycle, lanes) => {
   return report
 }
 
-// One cycle: returns null to re-arm, or the workflow's final result to stop.
-// Records what happened on `entry` as it goes, so the caller can report a cycle
-// that ended early.
+// Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
   let ciPromise = null
   const lanes = { reviewDone: !reviewLane, reviewPushed: false, ended: false }
-  // Every early return below can leave the CI lane still running: settle it in a
-  // finally so no CI agent outlives the workflow, even on a throw.
+  // Settle the CI lane in finally so no CI agent outlives the workflow.
   try {
-    // Two independent lanes, launched together. The review lane never waits on
-    // CI: it validates, fixes, and pushes while the CI lane is still watching.
     entry.lane = lane
     if (ciLane) {
-      // Keyed here, so every report that can reach the result carries the key a caller accepts it by.
       ciPromise = ciLaneRun(cycle, lanes).then(r => { if (r && r.realFailures) for (const rf of r.realFailures) rf.key = keyOf(rf); return r })
         .catch(e => { log(`cycle ${cycle}: CI lane errored — ${e && e.message}`); return null })
     }
 
-    // The ids a comment still owes answers to, as its current body numbers
-    // them: on an edited comment only ids reported since.
     const owedIds = (commentId) => {
       const d = debt.get(commentId)
       const held = [...holds].filter(([, h]) => h.commentId === commentId).map(([findingId]) => findingId)
@@ -2353,9 +1946,6 @@ const runCycle = async (cycle, entry) => {
           `those listed by findingId among them, so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +
       (decisions.size > 0
         ? `Earlier verdicts on this PR (set related and changeReason against them per your procedure): ${JSON.stringify([...decisions].map(([findingId, d]) => ({ findingId, ...d })))}. ` : '')
-    // reviewers: [] is a CI-only run: there is nobody to harvest, so the lane is
-    // skipped rather than asked to validate nothing. A `ci` launch skips it too:
-    // nobody looked, so nothing settled.
     const nobody = { findings: [], replies: [], bots: [] }
     const r = !reviewLane || reviewers.length === 0
       ? nobody
@@ -2368,9 +1958,7 @@ const runCycle = async (cycle, entry) => {
     }
     if (reviewLane && reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
     entry.reviews = reviewLane ? r : null
-    // A harvest that is not about this head, or that leaves an auto-running bot
-    // unaccounted for, settles nothing: refuse it rather than read silence as
-    // a verdict.
+    // A harvest not about this head, or missing an auto-run bot, settles nothing.
     if (r !== nobody) {
       const why = reviewsWhy(r)
       if (why) {
@@ -2379,17 +1967,13 @@ const runCycle = async (cycle, entry) => {
         return { pass: false, cycles: cycle, history, reason: 'review-report-unusable', detail: why }
       }
     }
-    // A `ci` launch observed no reviews, so nothing is settled there.
     entry.bots = r === nobody
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)
     const reviewsSettled = !!entry.bots && entry.bots.bots.every(b => b.done)
     const pendingBots = entry.bots ? entry.bots.bots.filter(b => !b.done) : []
 
-    // findingId is the only thing telling one dismissal on a comment from
-    // another. Two findings sharing one would silently collapse into a single
-    // obligation, so a harvest that reuses an id is not a harvest we can account
-    // for at all.
+    // Two findings sharing an id would collapse into one obligation.
     const idsSeen = new Set()
     const reused = r.findings.find(f => idsSeen.size === idsSeen.add(f.findingId).size)
     if (reused) {
@@ -2398,17 +1982,13 @@ const runCycle = async (cycle, entry) => {
       return { pass: false, cycles: cycle, history, reason: 'duplicate-finding-ids' }
     }
 
-    // The earlier decision a finding answers to: the one its hold named until
-    // reconciled with it, else the one the validator related it to, else its own.
     const priorOf = (f) => {
       const ref = (holds.get(f.findingId) || {}).against || f.related || f.findingId
       const d = decisions.get(ref) || decisions.get(f.findingId)
       return d && { ref, ...d }
     }
     const prior = new Map(r.findings.map(f => [f, priorOf(f)]))
-    // A verdict that turns an earlier one around (a dismissal now valid, a
-    // valid finding now invalid) is settled by a challenger shown both, never by
-    // the validator's word alone. Valid to stale is a fix landing.
+    // A reversal is settled by a challenger shown both verdicts; valid to stale is a fix landing.
     const turned = (was, now) => (was !== 'valid' && now === 'valid') || (was === 'valid' && now === 'invalid')
     const reversal = (f) => { const p = prior.get(f); return p && turned(p.verdict, f.verdict) ? p : null }
     const holdOn = (f, why) => {
@@ -2421,8 +2001,7 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: ${f.findingId} held — ${f.hold}`)
     }
 
-    // A dismissal about to be posted closes the reviewer's thread, and a
-    // reversal is about to be fixed or answered: both get a second opinion first.
+    // A dismissal about to be posted closes the thread, and a reversal is about to be fixed: both get a second opinion.
     const challenged = r.findings.filter(f => f.verdict !== 'valid' || reversal(f))
     if (challenged.length > 0) {
       const submitted = challenged.map((f, id) => {
@@ -2432,8 +2011,7 @@ const runCycle = async (cycle, entry) => {
           ...(p ? { earlier: { verdict: p.verdict, reason: p.reason, reviewedSha: p.reviewedSha }, changeReason: f.changeReason } : {}),
         }
       })
-      // The challenger is a second Claude role, not an independent model: an
-      // independent second opinion is the chief session's coworker lane.
+      // The challenger is another Claude role; an independent opinion is chief's coworker lane.
       const ask = (ids, label) => agent(
         `${IN_CHECKOUT}Another reviewer judged these findings on PR #${args.pr}. A dismissal (any verdict but 'valid') ` +
           "is about to be posted publicly and will close the reviewer's thread; a finding called 'valid' against an earlier " +
@@ -2447,8 +2025,6 @@ const runCycle = async (cycle, entry) => {
           `Findings: ${JSON.stringify(ids.map(id => submitted[id]))}.`,
         { label, phase: 'Triage', agentType: 'finding-verifier', schema: exactly(CHALLENGE, 'verdicts', 'id', ids) },
       ).catch(e => { log(`cycle ${cycle}: challenger errored — ${e && e.message}`); return null })
-      // A response is usable only when each id it judges was asked, once; ids are
-      // indexes into challenged. The ids it left out go to one fresh challenger.
       const usable = (ch, ids) => {
         const want = new Set(ids)
         return ch && Array.isArray(ch.verdicts) && ch.verdicts.every(v => want.delete(v.id)) ? ch.verdicts : []
@@ -2460,8 +2036,6 @@ const runCycle = async (cycle, entry) => {
       const verdicts = missing.length > 0 ? [...first, ...usable(await ask(missing, `challenge#${cycle}.retry`), missing)] : first
       if (verdicts.length !== challenged.length) {
         // Silence must never become a public claim that a reviewer was wrong.
-        // An unchecked reversal stays held, so a later harvest that omits it
-        // does not let the earlier verdict stand unanswered.
         for (const f of challenged.filter(reversal)) { holdOn(f, 'the reversal was not checked'); recordHold(f) }
         log(`cycle ${cycle}: challenge incomplete — refutations withheld`)
         entry.error = 'review challenger died'
@@ -2470,8 +2044,7 @@ const runCycle = async (cycle, entry) => {
 
       for (const v of verdicts) {
         const f = challenged[v.id]
-        // Failing to prove a verdict does not prove the other: the finding is
-        // held, neither posted as refuted nor fixed. Nor does a verdict with no evidence.
+        // An unproven verdict does not prove the other: hold it.
         const unsettled = !v.reason.trim() ? 'the challenger gave no evidence'
           : v.verdict === 'unknown' ? `the challenger could not settle it: ${v.reason}`
           : v.verdict === 'justified' && f.verdict === 'valid' ? `the challenger upheld the earlier dismissal: ${v.reason}` : null
@@ -2480,15 +2053,12 @@ const runCycle = async (cycle, entry) => {
         if (overturns || reversal(f)) f.challengeReason = v.reason
         if (!overturns) continue
         f.verdict = 'valid'
-        f.overturned = true   // rendered by cycleSummary's valid arm
-        // The evidence leads; the harvested hint stays, advisory, for the fixer.
+        f.overturned = true
         f.fixHint = `Challenger evidence: ${v.reason}` +
           (f.fixHint ? `\nOriginal fix hint (advisory): ${f.fixHint}` : '')
       }
     }
 
-    // A dismissal we already posted, now a fix: reported, never answered here.
-    // Every reversal left unheld was settled by the challenger.
     for (const f of r.findings) {
       const p = reversal(f)
       if (!p || f.hold || f.verdict !== 'valid' || (answeredWith.get(p.commentId) || {}).how !== 'refutation') continue
@@ -2506,11 +2076,7 @@ const runCycle = async (cycle, entry) => {
       })
     }
 
-    // A new deferral must name a valid finding of this harvest by id and body,
-    // and its issue must be read to cover it; one already applied holds while
-    // the comment body it named stands. Anything else is the caller's to decide
-    // again, so the run stops rather than fix or answer a finding it was told
-    // to leave.
+    // A new deferral must name a valid finding of this harvest by id and body, and its issue must cover it; anything else stops the run.
     const current = new Map(r.findings.map(f => [f.findingId, f]))
     const fresh = deferralsArg.filter(d => {
       const had = deferrals.get(d.findingId)
@@ -2551,24 +2117,16 @@ const runCycle = async (cycle, entry) => {
       if (!d || f.verdict !== 'valid') continue
       if (d.digest !== f.commentDigest) return refusedDeferral(`${f.findingId}: its comment was edited since it was deferred; decide again`)
       f.deferral = { issueUrl: d.issueUrl, reason: d.reason }
-      // The place is the validator's this cycle, so the whole point is measured here.
       if (overLength(deferralLine(f))) return refusedDeferral(`${f.findingId}: its reply point would exceed ${REPLY_WORDS} words or a line ${REPLY_LINE_CHARS} characters; pass a shorter reason`)
     }
     const deferredOn = (commentId) => r.findings.filter(f => f.deferral && f.commentId === commentId)
     const withDeferred = (commentId, body) => deferredOn(commentId).length
       ? `${body}\n\n${deferredOn(commentId).map(deferralLine).join('\n')}` : body
 
-    // What a comment still owes, derived from this harvest, never stored:
-    //   wait       - both a valid and a refuted finding: refuting now would
-    //                resolve the thread over a fix that has not landed; or a
-    //                held finding, from this harvest or an earlier one.
-    //   refutation - dismissed findings only (invalid, or stale: already fixed on
-    //                the head); the drafted reply answers it.
-    //   fixNote    - valid findings only; the post-fix note answers it, unless
-    //                we refuted the comment in a posted reply: that is a
-    //                correction, reported to the caller, never a note on top.
-    //   deferral   - deferred findings only; the deferral reply answers it.
-    // Deferred points ride in the refutation or fix note of a mixed comment.
+    // What a comment owes, from this harvest:
+    //   wait: valid and refuted points (a refutation would resolve the thread over a pending fix), or held
+    //   refutation: dismissed points only; fixNote: valid only, unless we posted a refutation (a correction, reported)
+    //   deferral: deferred points only; deferred points ride in a mixed comment's reply
     const ledger = new Map()
     const digestOf = new Map()
     for (const f of r.findings) {
@@ -2586,14 +2144,9 @@ const runCycle = async (cycle, entry) => {
       if (e.valid && !e.refuted && (answeredWith.get(commentId) || {}).how === 'refutation') return 'none'
       return e.refuted ? 'refutation' : e.valid ? 'fixNote' : e.deferred ? 'deferral' : 'none'
     }
-    // Accrue this harvest. An answered comment accrues nothing: a stale
-    // re-report of a fixed finding is our own fix's consequence. Dismissals are
-    // held by identity, not counted: overturning one retires that one, and a
-    // comment the validator stopped reporting keeps everything it owed.
+    // Dismissals are held by identity: overturning one retires that one; a dropped finding keeps its debt.
     for (const f of r.findings) {
       const prior = answeredWith.get(f.commentId)
-      // Edited after we answered it: the reply that resolved the thread spoke to
-      // a body that no longer stands, so it settles nothing about this one.
       if (prior && prior.digest !== undefined && prior.digest !== f.commentDigest) {
         log(`cycle ${cycle}: comment ${f.commentId} was edited after we answered it — its points owe an answer again`)
         answeredWith.delete(f.commentId)
@@ -2603,36 +2156,23 @@ const runCycle = async (cycle, entry) => {
       let d = debt.get(f.commentId)
       const open = () => (d || (debt.set(f.commentId, d = { dismissals: new Set(), notes: new Set() }), d))
       if (d && d.digest !== f.commentDigest) {
-        // Renumbered under us. Keep everything owed and let the run end
-        // unresolved rather than retire a dismissal by a reused id.
+        // Renumbered: keep everything owed rather than retire a dismissal by a reused id.
         log(`cycle ${cycle}: comment ${f.commentId} was edited — its finding ids no longer identify what we owe`)
         d.digest = f.commentDigest
         d.seenSinceEdit = new Set()
       }
-      // Ids reported against the edited body do name its points, answered or not:
-      // a fix note leaves the comment's dismissals owed.
       if (d && d.seenSinceEdit) d.seenSinceEdit.add(dismissalKey(f))
       if (f.verdict !== 'valid') {
         if (!answered) { const e = open(); e.dismissals.add(dismissalKey(f)); e.digest = f.commentDigest }
         continue
       }
-      // Valid now, whether the challenge overturned it or it always was: it is
-      // no longer a dismissal. Retiring one is always allowed, even on an
-      // answered comment - otherwise a debt the challenge later overturns can
-      // never be discharged. Except on a comment whose body was edited: its
-      // ids were renumbered, so the id that would retire A may now name B.
+      // Retiring a dismissal is always allowed, except on an edited comment whose ids may now name another point.
       if (d && !d.seenSinceEdit) d.dismissals.delete(dismissalKey(f))
       if (!answered) { const e = open(); e.notes.add(dismissalKey(f)); if (e.digest === undefined) e.digest = f.commentDigest }
       if (d && d.dismissals.size === 0 && d.notes.size === 0 && !d.seenSinceEdit) debt.delete(f.commentId)
     }
 
-    // An answer is built from this harvest, and paying it settles the points
-    // its comment carries: a refutation all of them, a fix note or deferral
-    // reply its notes. A reused reply resolves the thread whatever it settles,
-    // so it needs every point shown. A comment is answered only when this
-    // harvest shows what its answer needs; the next is asked for the rest.
-    // On a renumbered comment only the ids reported since the edit name its
-    // points; one never is settled on a reused reply.
+    // A comment is answered only when this harvest shows every point its answer settles; a reused reply resolves the thread, so it needs them all.
     const harvested = new Set(r.findings.map(dismissalKey))
     const scanning = new Set(r.findings.filter(f => f.source === 'code-scanning').map(f => f.commentId))
     const showsAll = (id, dismissalsToo) => {
@@ -2654,10 +2194,7 @@ const runCycle = async (cycle, entry) => {
       await reconcileReplies(cycle, stuck, pointsOf, digestOf)
     }
 
-    // A draft for a comment that owes no refutation would refute a reviewer on
-    // no one's authority. One body per comment: the script posts one reply and
-    // resolves the thread, and pay() retires every dismissal on it, so sibling
-    // drafts merge into that body.
+    // One body per comment: reply.py resolves the thread and pay() retires every dismissal, so sibling drafts merge.
     const whyWithheld = (id) => {
       const how = owed(id)
       if (how === 'wait') return held.has(id) ? 'held' : 'awaiting the fix for its valid points'
@@ -2677,7 +2214,6 @@ const runCycle = async (cycle, entry) => {
       if (prev) prev.body += `\n\n${x.body}`
       else replyFor.set(x.commentId, { commentId: x.commentId, body: x.body })
     }
-    // publishReplies posts an offered attempt, never this cycle's draft: only a fresh one is worth shortening.
     const long = [...replyFor.values()].filter(x => overLength(x.body) && !(debt.get(x.commentId) || {}).attempt)
     if (long.length > 0 && args.autoPush === true) {
       for (const [commentId, body] of await shortenReplies(cycle, long)) replyFor.get(commentId).body = body
@@ -2685,12 +2221,10 @@ const runCycle = async (cycle, entry) => {
     const freshReplies = [...replyFor.values()].map(x => ({ ...x, body: withDeferred(x.commentId, x.body), scanning: scanning.has(x.commentId) }))
     if (withheld.size) log(`cycle ${cycle}: drafted reply/replies withheld — ${[...withheld].map(([why, n]) => `${why}: ${n}`).join(', ')}`)
     if (freshReplies.length > 0 && args.autoPush === true) {
-      // Keep the receipt before anything later can fail: a cycle that dies after
-      // posting must still be able to say what went out.
+      // Keep the receipt first: a cycle that dies after posting must still say what went out.
       entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
       entry.sonarMarked = await settleSonar(cycle, entry)
     }
-    // A comment whose every point is deferred is answered now: no fix is coming.
     const deferralReplies = [...ledger.keys()]
       .filter(id => owed(id) === 'deferral' && debt.has(id) && debt.get(id).notes.size > 0 && !debt.get(id).repair && !owesDismissal(id) && showsAll(id, false))
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
@@ -2698,7 +2232,6 @@ const runCycle = async (cycle, entry) => {
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
-    // Review lane: fix and push without waiting for CI.
     const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
@@ -2724,10 +2257,7 @@ const runCycle = async (cycle, entry) => {
       }
       entry.reviewPush = push
       lanes.reviewPushed = true
-      // A comment still waiting on a sibling refutation is not answered by a
-      // fix note. One note per comment, naming every finding on it, for the
-      // reason refutations are merged; built here, since the read-back proves
-      // only a text the workflow decided on.
+      // One fix note per comment, built here: the read-back proves only a text the workflow chose.
       const answerable = new Map()
       for (const f of validFindings) {
         if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair || !showsAll(f.commentId, false)) continue
@@ -2742,7 +2272,6 @@ const runCycle = async (cycle, entry) => {
       }
     }
 
-    // CI lane result.
     lanes.reviewDone = true
     if (!ciLane) {
       log(`cycle ${cycle}: reviews lane only — CI not observed, no verdict this launch`)
@@ -2754,22 +2283,17 @@ const runCycle = async (cycle, entry) => {
       return null
     }
     if (lanes.reviewPushed) {
-      // The push restarted CI: this cycle's CI verdict is superseded. Re-arm;
-      // next cycle's CI lane collects the fresh run.
       log(`cycle ${cycle}: review-lane push superseded the CI run — re-arming`)
       return null
     }
-    // A mark this cycle may clear the SonarCloud gate this CI run failed on:
-    // the next cycle reads CI again rather than fixing a check that may be passing.
+    // A mark may clear the SonarCloud gate this run failed on: read CI again rather than fix it.
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
     if (marked > 0 && c.realFailures.some(sonarGate)) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
       return null
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
-    // A caller's acceptance covers one exact failure, and only when the
-    // watcher listed every failure of its job: a known first diagnostic must
-    // not hide another one behind it, nor one acceptance cover two failures.
+    // One acceptance covers one exact failure, and only when the watcher listed every failure of its job.
     const seenTimes = (rf) => c.realFailures.filter(x => x.key === rf.key).length
     for (const rf of c.realFailures) {
       const a = acceptedArg.find(x => acceptedKey(x) === rf.key)
@@ -2782,8 +2306,6 @@ const runCycle = async (cycle, entry) => {
     for (const a of acceptedArg) {
       if (!c.realFailures.some(rf => rf.key === acceptedKey(a))) log(`cycle ${cycle}: accepted failure ${acceptedKey(a)} matches no failure on this head`)
     }
-    // Only a failure the watcher placed on the PR is fixed; the rig's, the ones
-    // its evidence could not place and a SonarCloud gate are reported and left red.
     const unfixable = c.realFailures.filter(rf => !['real', 'accepted'].includes(ciState(rf)))
     for (const rf of unfixable) log(`cycle ${cycle}: ${sonarGate(rf) ? 'SonarCloud gate' : rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
     const fixable = c.realFailures.filter(rf => ciState(rf) === 'real')
@@ -2809,20 +2331,17 @@ const runCycle = async (cycle, entry) => {
         return { pass: false, cycles: cycle, history, reason: 'push-failed' }
       }
       entry.ciPush = ciPush
-      return null // pushed: fresh CI run next cycle
+      return null
     }
     if (!reviewLane) {
       log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
       return null
     }
     if (reviewsSettled && (c.status === 'green' || acceptedOnly(c))) {
-      // A held verdict owes a reconciliation even on a comment already answered.
       const owedNow = outstanding()
       if (owedNow.length > 0) {
         if (args.autoPush !== true) {
-          // Nothing can be posted in a dry run, so the debt is an artefact of
-          // that, not a deferral. Reported here rather than earlier so every
-          // fix lane this run is allowed to exercise has already run.
+          // In a dry run nothing is postable, so the debt is no deferral.
           log('autoPush not set: replies left unposted (dry run)')
           return { pass: false, cycles: cycle, history, dryRun: true }
         }
@@ -2841,11 +2360,7 @@ const runCycle = async (cycle, entry) => {
       }
     }
     if (unfixable.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {
-      // Two honest stops. An unclassified failure needs someone to place it
-      // before anyone fixes anything, so it stops at once, reviews settled or
-      // not: another cycle would only meet the same unexplained exit, and the
-      // reply debt rides along in the state. The rig's failures wait for the
-      // reviews first, then need the rig.
+      // An unclassified failure stops at once; rig-side ones wait for the reviews first.
       const unclassified = unfixable.filter(rf => ciState(rf) === 'unclassified')
       if (unclassified.length > 0) {
         log(`cycle ${cycle}: CI red with ${unclassified.length} failure(s) the watcher could not place — no justified fix; investigate before relaunching`)
@@ -2870,12 +2385,11 @@ const runCycle = async (cycle, entry) => {
       return null
     }
     if (!reviewsSettled) {
-      // CI is green and only a bot is pending: back off, or the cycle budget burns on
-      // back-to-back re-harvests of the same unchanged PR.
+      // Back off, or the budget burns on re-harvests of an unchanged PR.
       const who = pendingBots.map(b => `${b.bot} ${botCell(b, entry.bots.waitedMin)}`).join('; ')
       if (cycle < maxCycles) {
         log(`cycle ${cycle}: auto-review still pending (${who}) — re-arming after a wait`)
-        napMs = 60000 * cycle // taken at the top of the next cycle, after this one's summary
+        napMs = 60000 * cycle
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }
@@ -2889,9 +2403,7 @@ const runCycle = async (cycle, entry) => {
   }
 }
 
-// Pin what every later step must still be true of, and refuse to start on a
-// dirty tree: the publisher commits by path, so a pre-existing edit would be
-// indistinguishable from a writer's and could be swept into the PR.
+// Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
   required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty'],
@@ -2924,19 +2436,16 @@ if (dirty.length) {
   log(`preflight: the checkout is dirty — ${dirty.length} path(s); commit or stash before babysitting`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'dirty-start', dirty })
 }
-// A local branch may carry another name (a worktree tool's) if it tracks the PR head branch.
+// A local branch may carry another name if it tracks the PR head branch.
 if (pinned.prBranch.trim() !== pinned.branch.trim() && pinned.upstreamBranch.trim() !== pinned.prBranch.trim()) {
   log(`preflight: checked out ${pinned.branch}, but PR #${args.pr} heads ${pinned.prBranch}`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-branch', branch: pinned.branch, expected: pinned.prBranch.trim() })
 }
-// A branch name is not an identity: the same name can be stale, ahead, or from
-// another fork entirely, and its commits would then become the trusted baseline.
+// A branch name is not an identity.
 if (adoptHead === null && pinned.head.trim() !== pinned.prHead.trim()) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but PR #${args.pr} heads ${pinned.prHead.slice(0, 7)}`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-head', head: pinned.head.trim(), expected: pinned.prHead.trim() })
 }
-// A resumed launch continues from the SHA the previous one left; a PR head that
-// moved since is somebody else's work, not this run's baseline.
 const currentPin = { prRepo: pinned.prRepo.trim(), prBranch: pinned.prBranch.trim(), prUrl: pinned.prUrl, remote: pinned.remote, pushUrls: pinned.pushUrls }
 if (restored && restored.pin && JSON.stringify(currentPin) !== JSON.stringify(restored.pin)) {
   log(`preflight: this is not the PR the state belongs to — ${JSON.stringify(currentPin)} vs ${JSON.stringify(restored.pin)}`)
@@ -2946,26 +2455,18 @@ if (adoptHead === null && restored && restored.pin && pinned.head.trim() !== res
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but the previous launch left ${restored.expectedHead.slice(0, 7)}`)
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'stale-head', head: pinned.head.trim(), expected: restored.expectedHead })
 }
-// The PR's URL carries the host; the HEAD repository carries owner/repo, and on
-// a fork PR that is not the base repository the URL names. Together they are the
-// only remote that can update this PR.
+// Host from the PR URL, owner/repo from the head repository: on a fork they differ.
 const prHost = hostOf(pinned.prUrl)
 const expectedOrigin = prHost && pinned.prRepo.trim()
   ? `${prHost}/${pinned.prRepo.trim().toLowerCase()}` : ''
-// Every effective push URL, not the fetch URL: `git push <remote>` follows
-// pushurl, so a remote that fetches from GitHub can push somewhere else.
+// `git push` follows pushurl: check every push URL, not the fetch URL.
 const badPush = !pinned.pushUrls.length ? '(no push URL)'
   : pinned.pushUrls.find(u => originOf(u) !== expectedOrigin)
 if (!expectedOrigin || badPush !== undefined) {
   log(`preflight: ${pinned.remote} pushes to ${originOf(badPush) || badPush}, not PR #${args.pr}'s head repository ${expectedOrigin || `${HOST}/${pinned.prRepo}`} (only ${HOST} over https or ssh)`)
-  // With an off-host PR URL there is no derivable expectation, so report the
-  // only one this workflow supports rather than a bare repo name.
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'wrong-remote', remoteUrl: badPush, expected: expectedOrigin || `${HOST}/${pinned.prRepo.trim().toLowerCase()}` })
 }
-// Adoption stands in for the two head checks above: the checkout must be at the
-// named commit, the PR at the state's head, at that commit or at one between them
-// (a push made outside this workflow), and the chain audited commit by commit
-// before anything is published.
+// Adoption replaces the head checks: checkout at adoptHead, PR at the state's head or a chain commit, the chain audited commit by commit.
 let adoption = null
 if (adoptHead !== null) {
   const X = restored.expectedHead
@@ -2974,10 +2475,7 @@ if (adoptHead !== null) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
     return finish({ pass: false, cycles: cyclesUsed, history, reason: 'adopt-head-mismatch', head: pinned.head.trim(), expected: adoptHead })
   }
-  // An unpublished candidate of this run's own is the caller's decision, made by a
-  // retry of the same adoption or, while the PR heads the state's head, by a chain
-  // from it: the audit below names every commit that may publish, and the push only
-  // fast-forwards. A commit this run's own audit refused is not overridden that way.
+  // An unpublished candidate is decided by a retry of the same adoption or, while the PR heads the state's head, a chain from it; never one this run's audit refused.
   const p = restored.pending
   const retry = !!p && p.lane === 'adopt' && p.sha === adoptHead
   if (p && !retry && (prHead !== X || p.stage === 'audit-blocked')) {
@@ -3027,9 +2525,7 @@ expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
 
-// Runs as the prelude of the launch's first cycle, before any watcher: the
-// record exists before any dispatch, so an exception cannot erase the attempt,
-// and only a read-back of the PR head proves the push landed.
+// Runs before any watcher so the attempt is recorded first; only a PR head read-back proves the push.
 const adopt = async (entry) => {
   const { from, to, commits, paths } = adoption
   entry.adoption = { from, to, commits, paths, publication: 'unknown', detail: 'publication not attempted yet' }
@@ -3061,8 +2557,7 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   const entry = { cycle, head: expectedHead }
   retired.clear()
   history.push(entry)
-  // A worker's rejection must still reach the scoreboard: a failure verdict
-  // keeps `history`, a rethrow would drop it.
+  // A failure verdict keeps history; a rethrow would drop it.
   let verdict
   try {
     verdict = adoption && cycle === firstCycle ? await adopt(entry) : null
@@ -3078,12 +2573,9 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (verdict) return finish(verdict)
 }
 if (yieldAfterCycle && cyclesUsed < maxCycles) {
-  // The cycle would have re-armed; the caller decides whether, and when, it does.
   return finish({ pass: false, cycles: cyclesUsed, history, reason: 'yielded', deferred: outstanding() }, 'paused')
 }
-// Reply debt outranks a silent bot: it names something this run owes, while a
-// pending bot only names what it is still waiting for. A last cycle that pushed
-// observed the head before it: its records say nothing about the new one.
+// Reply debt outranks a silent bot; a last cycle that pushed says nothing about the new head.
 const last = history[history.length - 1]
 const stillPending = last.bots && last.head === expectedHead ? last.bots.bots.filter(b => !b.done) : []
 return finish(outstanding().length > 0

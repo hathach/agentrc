@@ -35,3 +35,46 @@ launch and lists the `blockers` to settle before continuing.
 hooks, which may rewrite files; `build_compare.py` builds the checkout, or the
 given revision in a temporary worktree it removes, in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, and `sonar.py` comments on and resolves SonarCloud issues. Run either by hand only with the user's authorization to publish there.
+
+## Arguments
+
+The workflow's own contract (`workflows/pr-babysit.js`).
+
+- `pr` (number, required).
+- `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
+  default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
+- `autoRun`: the reviewers that run on every push and gate done; default
+  `reviewers` without `copilot` and `code-scanning`, which are only harvested.
+- `maxCycles`: cycle ceiling, default 10; a resumed launch defaults to its state's.
+- `autoPush` (default false, a dry run: fixes left uncommitted, nothing posted)
+  and `markSonar` (needs `autoPush` and `SONAR_TOKEN`: marks the SonarCloud
+  issue behind a refuted code-scanning comment, or a fixed one SonarCloud still
+  flags, false positive): per launch, never restored from a state.
+- `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
+  paths are ignored; any other pre-existing edit refuses the start.
+- `protected`: regex over repo-relative paths dropped from every fix scope and
+  never committed.
+- `generated`: regex over repo-relative paths a fixer's build regenerates; a
+  plain modification to one is admitted into the commit on the caller's word
+  that the repository hooks validate it.
+- `build`: verify command, `<BUILD>` for a fresh build directory; default the
+  repository's build contract; per launch.
+- `ciWait`: minutes to wait on pending checks, default 30.
+- `ciNotes`: what the caller established about this PR's CI, handed to the
+  judge verbatim; it never revises a placed verdict stored on the head, while
+  a stored unclassified failure is judged again once the notes change.
+- `acceptedFailures`: `[{ key, reason, scope }]`, `key` the 16-hex one the
+  result shows beside a failure: never fixed, and a run red only from them
+  passes, listing them. Per launch.
+- `deferrals`: `[{ findingId, commentDigest, issueUrl, reason }]`: valid
+  findings left to an existing issue, answered with it; kept in the state
+  while the comment body stands.
+- `yieldAfterCycle`: run one cycle and return the state for the next launch.
+- `lane`: `both` (default), `ci` or `reviews`; a single lane needs
+  `yieldAfterCycle` and never declares the PR done.
+- `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or
+  the saved output holding it and its `stateDigest`, loaded as checksummed chunks.
+- `adoptHead`: full SHA of audited commits on top of the state's
+  `expectedHead` (a caller's repair, or a push made outside the workflow):
+  the chain is audited, published under `autoPush`, and the run continues
+  from it; per launch.
