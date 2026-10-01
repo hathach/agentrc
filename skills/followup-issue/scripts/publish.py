@@ -30,19 +30,13 @@ receipt.
 
 import argparse
 import json
-import re
 import subprocess
 import sys
+from pathlib import Path
 from urllib.parse import quote
 
-# The same forms pr-babysit's commit audit refuses, plus a Claude or ChatGPT session link anywhere.
-ATTRIBUTION = [
-    re.compile(r'^[ \t]*co-authored-by[ \t]*:', re.I | re.M),
-    re.compile(r'^[ \t]*(([a-z]+-)+session(-[a-z]+)*|session-(url|id|link))[ \t]*:', re.I | re.M),
-    re.compile(r'^[ \t]*(🤖[ \t]*)?(generated|authored|written|created|made)[ \t-]*(with|by)[ \t]*:?[ \t]*\[?'
-               r'(claude|codex|chatgpt|gpt|copilot|openai|anthropic|an? (ai|llm|agent))\b', re.I | re.M),
-    re.compile(r'claude\.ai/code/session_|chatgpt\.com/(c|codex|share)/', re.I),
-]
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
+from facts import attribution_in  # noqa: E402
 
 
 class ApiError(Exception):
@@ -71,10 +65,6 @@ def api(method, path, body=None, paginate=False):
         raise ApiError(err.strip() or out.strip())
     data = json.loads(out) if out.strip() else None
     return [x for page in data for x in page] if paginate else data
-
-
-def attribution(text):
-    return next((m.group(0).strip() for p in ATTRIBUTION for m in [p.search(text)] if m), None)
 
 
 class Issues:
@@ -244,7 +234,7 @@ def main(argv=None):
             body = f.read()
         if not body.strip():
             raise Refused('empty body')
-        found = attribution(f'{getattr(args, "title", "")}\n{body}')
+        found = attribution_in(f'{getattr(args, "title", "")}\n{body}')
         if found:
             raise Refused(f'attribution or session link: {found!r}')
         gi = Issues(args.repo)

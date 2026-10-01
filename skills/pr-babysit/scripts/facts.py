@@ -7,6 +7,20 @@ import re
 import subprocess
 
 FULL_SHA = re.compile(r'^[0-9a-f]{40}$')
+# The human is the sole author: no line may credit an agent, model, tool or session, nor link a Claude or ChatGPT session anywhere.
+# ASCII on purpose: \b ends at a non-ASCII letter, and Unicode case folds (ſession) are not recognized spellings.
+ATTRIBUTION = tuple(re.compile(p, re.I | re.ASCII) for p in (
+    r'^[ \t]*co-authored-by[ \t]*:',
+    r'^[ \t]*(([a-z]+-)+session(-[a-z]+)*|session-(url|id|link))[ \t]*:',
+    r'^[ \t]*(🤖[ \t]*)?(generated|authored|written|created|made)[ \t-]*(with|by)[ \t]*:?[ \t]*\[?'
+    r'(claude|codex|chatgpt|gpt|copilot|openai|anthropic|an? (ai|llm|agent))\b',
+    r'claude\.ai/code/session_|chatgpt\.com/(c|codex|share)/',
+))
+
+
+def attribution_in(text):
+    """The first line of text that credits an agent or links a session, stripped; None when there is none."""
+    return next((line.strip() for line in text.split('\n') if any(p.search(line) for p in ATTRIBUTION)), None)
 
 
 class Unusable(Exception):

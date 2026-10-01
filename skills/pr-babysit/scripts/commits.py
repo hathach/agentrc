@@ -11,11 +11,10 @@ lines, when git made no commit (a hook that fails or modifies a file stops it),
 or before staging anything when the message is blank.
 
 Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
--r -z`, one string per filename, unquoted) and message (`%B` without its
-trailing whitespace, so a CRLF footer still ends its line).
+-r -z`, one string per filename, unquoted) and message (`%B`).
 A link of a chain, or the head commit, is refused when it is a merge or a root,
 does not sit on the commit before it, touches no path, or has a message line
-crediting an agent, model, tool or session.
+crediting an agent, model, tool or session or linking a session (facts.attribution_in).
 `chain` reports from and to as given, commits (the SHAs of FROM..TO, oldest
 first), paths (each path any of them touches, once) and refusal, "" or why
 the chain cannot be adopted: empty, not ending at TO, or a link refused.
@@ -32,26 +31,11 @@ with its `seal` (facts.sealed). Exit 0 with that line; exit 2
 with {"error": ...} when git cannot answer or the arguments are wrong.
 """
 
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Unusable, attempt, git, report  # noqa: E402
-
-
-# The human is the sole author: no commit message line may credit an agent, model, tool or session.
-ATTRIBUTION = [re.compile(p, re.I | re.ASCII) for p in (
-    r'^[ \t]*co-authored-by[ \t]*:',
-    r'^[ \t]*(([a-z]+-)+session(-[a-z]+)*|session-(url|id|link))[ \t]*:',
-    r'^[ \t]*(🤖[ \t]*)?(generated|authored|written|created|made)[ \t-]*(with|by)[ \t]*:?[ \t]*\[?'
-    r'(claude|codex|chatgpt|gpt|copilot|openai|anthropic|an? (ai|llm|agent))\b',
-    r'^[ \t]*https?://claude\.ai/code/session_[a-z0-9]+[ \t]*$',
-)]
-
-
-def attribution_in(message):
-    return next((line for line in message.split('\n') if any(r.search(line) for r in ATTRIBUTION)), None)
+from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report  # noqa: E402
 
 
 def records(text):
@@ -62,7 +46,7 @@ def commit(sha):
     return {'sha': sha,
             'parents': git('show', '-s', '--format=%P', sha).split(),
             'paths': records(git('diff-tree', '--no-commit-id', '--no-renames', '--name-only', '-r', '-z', sha)),
-            'message': git('log', '-1', '--format=%B', sha).rstrip()}
+            'message': git('log', '-1', '--format=%B', sha)}
 
 
 def full(sha):
@@ -80,7 +64,7 @@ def link_refusal(c, parent):
     if not c['paths']:
         return f'{sha} touches no path'
     said = attribution_in(c['message'])
-    return f'commit message carries attribution: {said.strip()}' if said else ''
+    return f'commit message carries attribution: {said}' if said else ''
 
 
 def head(parent, paths):
