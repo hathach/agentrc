@@ -64,8 +64,10 @@ again after the gates too.
 
 remember: stores a judge's verdicts for the head beside its evidence, so a
 later launch recalls them instead of carrying them in its state. It reads a
-JSON list of {link, bucket, failures} on stdin, replaces any stored entry for
-the same link, and prints {head, error}. recall prints {head, verdicts, left, error}:
+JSON list of {link, bucket, failures} on stdin, each replacing any stored entry
+for the same link, or {link, bucket, patch}, whose failures each replace the one
+failure of the stored entry, same bucket, with the same workflow, job, cell and
+signature; it stores all of them or, on any mismatch, none, and prints {head, error}. recall prints {head, verdicts, left, error}:
 the stored entries for the --check links it has, unchanged and in the order
 asked, while the printed line stays within RECALL_BYTES, the most a relaying
 agent is trusted to copy whole. `left` lists the links held back for room, each
@@ -242,17 +244,35 @@ def remember(repo, pr, head, text):
         entries = json.loads(text)
     except ValueError as e:
         raise Failed(f'verdicts on stdin: {e}')
-    if not (isinstance(entries, list) and all(isinstance(e, dict) and sorted(e) == ['bucket', 'failures', 'link'] and
+    if not (isinstance(entries, list) and all(isinstance(e, dict) and sorted(e) in (['bucket', 'failures', 'link'], ['bucket', 'link', 'patch']) and
                                               isinstance(e['link'], str) and isinstance(e['bucket'], str) and
-                                              isinstance(e['failures'], list) for e in entries)):
-        raise Failed('verdicts on stdin must be a list of {link, bucket, failures}')
+                                              isinstance(e.get('failures', e.get('patch')), list) and
+                                              all(isinstance(f, dict) for f in e.get('failures', e.get('patch'))) for e in entries)):
+        raise Failed('verdicts on stdin must be a list of {link, bucket, failures} or {link, bucket, patch}')
     folder = evidence_dir(repo, pr, head)
     stored = stored_verdicts(folder)
-    stored.update((e['link'], e) for e in entries)
+    for e in entries:
+        stored[e['link']] = patched(stored.get(e['link']), e) if 'patch' in e else e
     tmp = folder / f'verdicts.json.{time.time_ns()}'
     tmp.write_text(json.dumps(stored, ensure_ascii=False))
     tmp.replace(folder / 'verdicts.json')
     return {'head': head}
+
+
+def failure_key(f):
+    return (f.get('workflow'), f.get('job'), f.get('cell'), f.get('signature'))
+
+
+def patched(entry, patch):
+    """The stored entry with each patch failure in place of the one stored failure of its key."""
+    if not entry or entry['bucket'] != patch['bucket']:
+        raise Failed(f'patch for {patch["link"]}: no stored entry with bucket {patch["bucket"]}')
+    keys = [failure_key(f) for f in entry['failures']]
+    new = {failure_key(f): f for f in patch['patch']}
+    missing = [k for k in new if keys.count(k) != 1]
+    if missing or len(new) != len(patch['patch']):
+        raise Failed(f'patch for {patch["link"]}: its failures must each match one stored failure, once: {missing}')
+    return {**entry, 'failures': [new.get(k, f) for k, f in zip(keys, entry['failures'])]}
 
 
 def line(head, verdicts=(), left=()):

@@ -2243,11 +2243,15 @@ const ciLaneRun = async (cycle, lanes) => {
   // so it is judged whole next time.
   const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
   const unsettled = []
+  // A merged check is stored as a patch of the failures it changed: the store
+  // holds the rest, so they need not cross the relay again.
+  const patches = new Map()
   for (const c of partial.filter(c => !reran.includes(c))) {
     const got = new Map(failuresOf.get(c.link).map(f => [failureKey(f), f]))
     const distinct = got.size === failuresOf.get(c.link).length
     if (distinct && sameLinks([...got.keys()], unplaced(c).map(failureKey)) && [...got.values()].every(f => f.complete)) {
       failuresOf.set(c.link, storedOf(c).map(f => got.get(failureKey(f)) ?? f))
+      patches.set(c.link, [...got.values()])
     } else if (!distinct || !storedOf(c).every(f => got.has(failureKey(f)))) {
       log(`cycle ${cycle}: CI judge answered ${c.name} with neither its judgeOnly failures nor every failure — re-arming to judge it whole`)
       unsettled.push(c)
@@ -2261,7 +2265,8 @@ const ciLaneRun = async (cycle, lanes) => {
   // A push since judging moved the head on: those verdicts will never be recalled.
   // One the store lost or garbled fails its digest on recall and is judged again.
   if (fresh.length && !lanes.reviewPushed) {
-    const why = faultOf(await collect(`ci:collect#${cycle}.w`, 'remember', REMEMBERED, fresh), inv.head)
+    const stored = fresh.map(v => patches.has(v.link) ? { link: v.link, bucket: v.bucket, patch: patches.get(v.link) } : v)
+    const why = faultOf(await collect(`ci:collect#${cycle}.w`, 'remember', REMEMBERED, stored), inv.head)
     if (why) log(`cycle ${cycle}: ${fresh.length} CI verdict(s) not stored — ${why}; judged again by a later launch`)
   }
   if (unsettled.length) return null

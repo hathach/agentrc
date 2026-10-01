@@ -591,6 +591,24 @@ class VerdictsTest(unittest.TestCase):
         verdicts = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))[1]['verdicts']
         self.assertEqual([(v['link'], v['bucket']) for v in verdicts], [(JOB.format(3), 'cancel'), (JOB.format(4), 'fail')])
 
+    def test_a_patch_replaces_the_stored_failures_of_its_keys_in_place_or_stores_nothing(self):
+        first = self.ENTRY['failures'][0]
+        entry = {**self.ENTRY, 'failures': [first, {**first, 'cell': 'b', 'verdict': 'unclassified'}, {**first, 'cell': 'c'}]}
+        self.main('remember', stdin=json.dumps([entry]))
+        placed = {**first, 'cell': 'b', 'verdict': 'rig-side', 'firstError': 'placed'}
+        self.assertEqual(self.main('remember', stdin=json.dumps([{'link': JOB.format(3), 'bucket': 'fail', 'patch': [placed]}])), (0, {'head': HEAD}))
+        recalled = self.main('recall', '--check', JOB.format(3))[1]['verdicts'][0]
+        self.assertEqual(recalled, {**entry, 'failures': [first, placed, {**first, 'cell': 'c'}]})
+        other = {**self.ENTRY, 'link': JOB.format(4)}
+        for patch in ({'link': JOB.format(3), 'bucket': 'fail', 'patch': [{**first, 'cell': 'd'}]},
+                      {'link': JOB.format(3), 'bucket': 'cancel', 'patch': [placed]},
+                      {'link': JOB.format(5), 'bucket': 'fail', 'patch': [placed]},
+                      {'link': JOB.format(3), 'bucket': 'fail', 'patch': [placed, placed]}):
+            rc, r = self.main('remember', stdin=json.dumps([other, patch]))
+            self.assertEqual(rc, 1, patch)
+            self.assertIn('patch for', r['error'])
+        self.assertEqual(self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))[1]['verdicts'], [recalled], 'all or nothing')
+
     def test_nothing_remembered_recalls_nothing(self):
         self.assertEqual(self.main('recall', '--check', JOB.format(3)), (0, {'head': HEAD, 'verdicts': [], 'left': []}))
 
@@ -687,7 +705,8 @@ class VerdictsTest(unittest.TestCase):
             for held in r['left']:
                 self.assertEqual(self.joined(held), next(e for e in entries if e['link'] == held['link']), 'each fits one page')
     def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
-        for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}])):
+        for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}]),
+                     json.dumps([{'link': 'x', 'bucket': 'fail', 'patch': [7]}]), json.dumps([{'link': 'x', 'bucket': 'fail', 'failures': [], 'patch': []}])):
             rc, r = self.main('remember', stdin=text)
             self.assertEqual(rc, 1, text)
             self.assertIn('verdicts on stdin', r['error'])

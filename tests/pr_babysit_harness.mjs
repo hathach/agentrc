@@ -238,8 +238,11 @@ async function run(opts = {}) {
         }
         if (opts.recall) answer = opts.recall(answer, text)
       } else if (/ remember /.test(text)) {
-        const verdicts = trailingList(text)
-        for (const v of verdicts) store.set(key(v.link), v)
+        // A patch replaces the stored failures of its keys, as collect.py does.
+        const fk = (f) => JSON.stringify([f.workflow, f.job, f.cell, f.signature])
+        for (const v of trailingList(text)) {
+          store.set(key(v.link), v.patch ? { ...store.get(key(v.link)), failures: store.get(key(v.link)).failures.map(f => v.patch.find(p => fk(p) === fk(f)) ?? f) } : v)
+        }
         answer = { head, error: null }
         if (opts.remember) answer = opts.remember(answer, store)
       } else if (/ inventory /.test(text)) {
@@ -1675,7 +1678,7 @@ test('a stored check with an unclassified failure is judged again for that failu
   const report = again.result.history.at(-1).ci.realFailures
   assert.deepEqual(report.map(f => [f.cell, f.verdict, f.firstError]), [['pico a', 'rig-side', 'pico a failed'], ['pico b', 'rig-side', 'placed by the notes'], ['pico c', 'rig-side', 'pico c failed']])
   assert.notEqual(again.result.reason, 'ci-red-unclassified')
-  assert.deepEqual(trailingList(again.calls.find(c => c.label === 'ci:collect#2.w').prompt)[0].failures.map(f => f.verdict), ['rig-side', 'rig-side', 'rig-side'], 'the merged check is stored')
+  assert.deepEqual(trailingList(again.calls.find(c => c.label === 'ci:collect#2.w').prompt), [{ link: 'https://github.com/o/r/actions/runs/1/job/1', bucket: 'fail', patch: [placed] }], 'stored as a patch of what changed')
   const settled = await run({ store, args: { ...YIELD, state: again.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.equal(settled.labels.includes('ci:judge#3'), false, 'then reused whole')
 })
