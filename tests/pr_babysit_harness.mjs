@@ -672,12 +672,22 @@ test('reviewers: [] runs no review lane at all and still completes', async () =>
   assert.deepEqual(result.history[0].reviews, { findings: [], replies: [], bots: [] })
 })
 
+test('a script the cached workflow calls and the install lacks stops the launch at preflight (#38)', async () => {
+  const error = 'stale workflow definition: ~/.claude/skills/pr-babysit/scripts/build_compare.py missing; reload the workflow (a fresh session) before relaunching'
+  const { result, labels } = await run({ preflight: { error } })
+  assert.equal(result.reason, 'stale-workflow')
+  assert.equal(result.detail, error)
+  assert.deepEqual(labels, ['preflight'])
+})
+
 test('the preflight pins the checkout without touching it', async () => {
   const { calls, logs } = await run()
   const pre = calls[0]
   assert.equal(pre.label, 'preflight')
   assert.match(pre.prompt, /Editing and committing nothing/)
-  assert.ok(pre.prompt.includes('preflight.py --pr 3888`'), pre.prompt)
+  assert.ok(pre.prompt.includes('preflight.py --pr 3888 --needs '), pre.prompt)
+  const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
+  assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
     ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
@@ -985,7 +995,7 @@ test('the committer gets the claims without their hints, and the message on stdi
   assert.match(commit, /commits\.py commit 'src\/a\.c' < <that file>; rm -f <that file>`/)
 })
 
-test('an unresolved build contract, or a build that did not run, blocks the batch', async () => {
+test('an unresolved build contract, or a build that did not run, blocks the batch as unverifiable, a failed build as unverified', async () => {
   for (const [over, why] of [
     [{ buildPlan: { error: 'no build docs' } }, /build contract not resolved: no build docs/],
     [{ buildPlan: null }, /build contract not resolved: resolver died/],
@@ -995,7 +1005,9 @@ test('an unresolved build contract, or a build that did not run, blocks the batc
     [{ candidate: { exit: 2 } }, /the build failed \(exit 2\)/],
   ]) {
     const { result, labels, logs } = await run({ reviews: oneValid, ...over })
-    assert.equal(result.reason, 'fix-verification-failed', JSON.stringify(over))
+    const failed = String(why).includes('build failed')
+    assert.equal(result.reason, failed ? 'fix-verification-failed' : 'build-unverifiable', JSON.stringify(over))
+    if (!failed) assert.match(result.detail, why)
     assert.equal(labels.some(l => /^(compat#|push#)/.test(l)), false)
     assert.ok(logs.some(l => why.test(l)), `${why}\n${logs.join('\n')}`)
   }
@@ -1008,7 +1020,7 @@ test('a build receipt counts only as the run that was asked for', async () => {
     [{ snapshotAfter: 'other' }, /the build changed src\/a\.c, which were verified before it/],
   ]) {
     const { result, logs } = await run({ reviews: oneValid, candidate })
-    assert.equal(result.reason, 'fix-verification-failed', JSON.stringify(candidate))
+    assert.equal(result.reason, 'build-unverifiable', JSON.stringify(candidate))
     assert.ok(logs.some(l => why.test(l)), `${why}\n${logs.join('\n')}`)
   }
 })

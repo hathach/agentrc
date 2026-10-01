@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pin the checkout and the PR that pr-babysit is about to babysit.
 
-  preflight.py --pr N
+  preflight.py --pr N [--needs PATH...]
   preflight.py --recheck
 
 Reports what every later step must still be true of: branch (`git rev-parse
@@ -15,6 +15,10 @@ badPushUrl, the first push URL that is not github.com/<prRepo> over https or
 ssh (case-insensitive), every one when prUrl is not https on
 github.com, "(no push URL)" when there is none, "(empty push URL)" for an
 empty one, "" when all are.
+
+--needs names a script the workflow will call; any that is not a file means
+the session runs a workflow definition older than the installed scripts, and
+nothing is pinned.
 
 --recheck reads, before a commit, what the pin must still match, without gh:
 branch, pushUrls and head as above, staged (`git diff --cached --name-only -z`
@@ -110,7 +114,13 @@ def collect(argv):
     which = p.add_mutually_exclusive_group(required=True)
     which.add_argument('--pr', type=int)
     which.add_argument('--recheck', action='store_true')
+    p.add_argument('--needs', action='append', default=[])
     a = p.parse_args(argv)
+    if a.recheck and a.needs:
+        p.error('--needs is for --pr')
+    missing = [n for n in a.needs if not Path(n).expanduser().is_file()]
+    if missing:
+        raise Unusable(f"stale workflow definition: {', '.join(missing)} missing; reload the workflow (a fresh session) before relaunching")
     return recheck() if a.recheck else pin(a.pr)
 
 

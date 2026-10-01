@@ -42,6 +42,7 @@ REFUSED = {
                       "starting over is the user's decision, never a reset or a fresh launch",
     'adopt-head-mismatch': ADOPTION_REFUSED, 'adopt-pending': ADOPTION_REFUSED, 'adopt-audit-failed': ADOPTION_REFUSED,
     'deferral-refused': 'a deferral was refused: it needs a new decision before it is passed again',
+    'stale-workflow': "this session's cached workflow definition calls a script the install lacks: relaunch from a fresh session, never by hand",
 }
 
 

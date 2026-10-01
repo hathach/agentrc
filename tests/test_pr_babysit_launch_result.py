@@ -145,7 +145,8 @@ class LaunchResultTest(unittest.TestCase):
                              ('adopt-head-mismatch', 'never answer it with a reset or a fabricated state'),
                              ('adopt-pending', 'never answer it with a reset or a fabricated state'),
                              ('adopt-audit-failed', 'never answer it with a reset or a fabricated state'),
-                             ('deferral-refused', 'it needs a new decision')):
+                             ('deferral-refused', 'it needs a new decision'),
+                             ('stale-workflow', 'relaunch from a fresh session')):
             with self.subTest(reason):
                 refused = {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
                            'result': {'pass': False, 'status': 'blocked', 'reason': reason}}
@@ -155,7 +156,7 @@ class LaunchResultTest(unittest.TestCase):
 
     def test_every_stop_reason_of_the_workflow_is_refused_or_handled_elsewhere(self):
         handled_elsewhere = {  # blocked by receipts, budget, heads or CI fields, or left to chief's judgment
-            'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'ci-red-rig-side',
+            'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable', 'ci-red-rig-side',
             'ci-red-sonar-gate', 'ci-red-unclassified', 'cycle-threw', 'maxCycles reached', 'deferred-replies-unresolved', 'dirty-start',
             'duplicate-finding-ids', 'fix-verification-failed', 'preflight-died', 'preflight-failed', 'push-failed',
             'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending', 'stale-head',

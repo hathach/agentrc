@@ -13,7 +13,7 @@ missing. Each script's docstring says what it reports.
 
 ```bash
 S=~/.claude/skills/pr-babysit/scripts
-python3 $S/preflight.py --pr N               # the checkout and the PR it must stay
+python3 $S/preflight.py --pr N [--needs P]   # the checkout and the PR it must stay; P a script the workflow calls
 python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
 python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level

@@ -160,8 +160,19 @@ class PreflightTest(unittest.TestCase):
                                'head': self.git('rev-parse', 'HEAD').strip(), 'staged': ['staged.c'],
                                'status': ['A  staged.c', '?? a name.c']})
 
+    def test_a_script_the_workflow_needs_and_lacks_is_a_stale_definition(self):
+        there = self.root / 'there.py'
+        there.write_text('')
+        code, out = self.pin('--pr', '7', '--needs', str(there))
+        self.assertEqual((code, out['pr']), (0, 7))
+        self.fake_gh('', 1)
+        code, out = self.pin('--pr', '7', '--needs', str(there), '--needs', str(self.root / 'gone.py'), '--needs', str(self.root))
+        self.assertEqual(code, 2)
+        self.assertEqual(out['error'], f"stale workflow definition: {self.root / 'gone.py'}, {self.root} missing; "
+                                       'reload the workflow (a fresh session) before relaunching')
+
     def test_usage(self):
-        for argv in (['--pr', 'x'], ['--pr', '7', '--recheck'], ['--frob']):
+        for argv in (['--pr', 'x'], ['--pr', '7', '--recheck'], ['--frob'], ['--recheck', '--needs', 'x']):
             self.assertIn('usage', self.pin(*argv)[1]['error'], argv)
 
 

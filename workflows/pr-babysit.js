@@ -106,6 +106,7 @@ const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare
 const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
 const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
+const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
 if (args.stateRef != null) {
   const ref = args.stateRef
   // The path goes into a shell command.
@@ -114,7 +115,6 @@ if (args.stateRef != null) {
     throw new Error('stateRef must be { outputFile: a plain absolute path ([A-Za-z0-9._/-]), digest: the result\'s 8-hex stateDigest }')
   }
   // A model copying text "corrects" it, so the loader copies state_transfer.py's base64 chunks, each with a sum, and the seal checks the whole. Sonnet: Haiku mis-copies the same chunks on every retry.
-  const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
   const SIZE = 512
   const PER_CALL = 4 // more chunks to a call come back truncated and spliced
   const MAX = 64 * 1024
@@ -501,6 +501,8 @@ const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
+// The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
@@ -776,6 +778,7 @@ const dismissalKey = (f) => f.findingId
 const acceptedOnly = (c) => c.status === 'red' && c.realFailures.length > 0 && c.realFailures.every(rf => rf.accepted) && c.infraRerun.length === 0
 
 const stop = (cycles, reason, extra) => ({ pass: false, cycles, history, reason, ...extra })
+const unverifiedStop = (cycles, unverifiable) => unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable }) : stop(cycles, 'fix-verification-failed')
 // dryRun: the debt was never postable.
 const unresolvedVerdict = (cycles, deferred, dryRun = false) =>
   stop(cycles, 'deferred-replies-unresolved', { deferred, dryRun })
@@ -1023,9 +1026,12 @@ const fixAndVerify = async (workIn, tag) => {
     unverified = alive
     log(`batch ${tag} failed verification — ${why}`)
   }
+  // A build that did not run or count says nothing about the fix (#38): its stop names the tooling, not the fix.
+  let unverifiable = null
   if (verified) {
     const blocked = await buildCheck(tag, owned)
     if (blocked) fail(blocked)
+    if (blocked && !blocked.startsWith('the build failed')) unverifiable = blocked
   }
   // Only the whole batch shows what the change does to code relying on it.
   if (verified && unverified.length === 0) {
@@ -1037,6 +1043,7 @@ const fixAndVerify = async (workIn, tag) => {
     fixes: alive,
     brief,
     owned,
+    unverifiable,
   }
 }
 
@@ -2064,7 +2071,7 @@ const runCycle = async (cycle, entry) => {
         text: `${f.file}:${f.line} [${f.source}] ${f.claim} — hint: ${f.fixHint}`,
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
-      const { ok, fixes, owned, brief } = await fixAndVerify(work, `${cycle}-review`)
+      const { ok, fixes, owned, brief, unverifiable } = await fixAndVerify(work, `${cycle}-review`)
       entry.reviewFixes = fixes
       if (args.autoPush !== true) {
         log('autoPush not set: review-lane fixes left uncommitted (dry run)')
@@ -2072,7 +2079,7 @@ const runCycle = async (cycle, entry) => {
       }
       if (!ok) {
         log(`cycle ${cycle}: review-lane fixes left uncommitted for human review — not pushing unverified changes`)
-        return stop(cycle, 'fix-verification-failed')
+        return unverifiedStop(cycle, unverifiable)
       }
       const push = await commitAndPush(cycle, 'review', owned, brief)
       if (!push.pass) {
@@ -2139,7 +2146,7 @@ const runCycle = async (cycle, entry) => {
         id: rf.id, scopeFile: rf.files[0] || rf.check, files: rf.files,
         text: `CI ${rf.check}: ${rf.firstError}`,
       })))
-      const { ok, fixes, owned, brief } = await fixAndVerify(work, `${cycle}-ci`)
+      const { ok, fixes, owned, brief, unverifiable } = await fixAndVerify(work, `${cycle}-ci`)
       entry.ciFixes = fixes
       if (args.autoPush !== true) {
         log('autoPush not set: CI-lane fixes left uncommitted (dry run)')
@@ -2147,7 +2154,7 @@ const runCycle = async (cycle, entry) => {
       }
       if (!ok) {
         log(`cycle ${cycle}: CI-lane fixes left uncommitted for human review — not pushing unverified changes`)
-        return stop(cycle, 'fix-verification-failed')
+        return unverifiedStop(cycle, unverifiable)
       }
       const ciPush = await commitAndPush(cycle, 'ci', owned, brief)
       if (!ciPush.pass) {
@@ -2248,13 +2255,14 @@ if (cyclesUsed >= maxCycles) {
   return finish(stop(cyclesUsed, 'budget-exhausted'))
 }
 const pinned = await relayOnce(
-  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}\` ` +
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}\` ` +
   relayed(PIN),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 )
 if (!pinned) return finish(stop(cyclesUsed, 'preflight-died'))
 if (pinned.error) {
   log(`preflight: nothing pinned — ${pinned.error}`)
+  if (pinned.error.startsWith('stale workflow definition')) return finish(stop(cyclesUsed, 'stale-workflow', { detail: pinned.error }))
   return finish(stop(cyclesUsed, 'preflight-failed', { detail: pinned.error }))
 }
 if (pinned.pr !== args.pr) {
