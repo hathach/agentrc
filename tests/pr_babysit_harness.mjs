@@ -480,38 +480,22 @@ async function run(opts = {}) {
       // The repository's build for the batch, resolved when the caller named none.
       const plan = typeof opts.buildPlan === 'function' ? opts.buildPlan(label) : opts.buildPlan
       if (plan === null) return null
-      return conforms(options.schema, { command: 'make -C <BUILD> all', setup: 'tools/get_deps.py', targets: ['board_a'], options: [], contract: ['AGENTS.md'], reason: 'stub contract', error: null, ...plan }, label)
+      return conforms(options.schema, { command: 'make -C <BUILD> all', contract: ['AGENTS.md'], reason: 'stub contract', error: null, ...plan }, label)
     }
-    if (label.startsWith('build:setup#')) {
-      if (opts.buildSetup === null) return null
-      return conforms(options.schema, { setup: 'tools/get_deps.py', error: null, ...opts.buildSetup }, label)
-    }
-    if (label.startsWith('build:candidate#') || label.startsWith('build:base#')) {
-      // build_compare.py's receipt: the candidate fails when a writer's build did,
-      // the base builds; opts.candidate / opts.base reshape each, null is a dead agent.
-      const name = label.startsWith('build:candidate#') ? 'candidate' : 'base'
-      const over = opts[name]
-      const exit = name === 'candidate' ? (brokenWriter ? 1 : 0) : 0
-      if (name === 'candidate') brokenWriter = false
+    if (label.startsWith('build#')) {
+      // build.py's receipt: the build fails when a writer's did; opts.candidate reshapes it, null is a dead agent.
+      const over = opts.candidate
+      const exit = brokenWriter ? 1 : 0
+      brokenWriter = false
       if (over === null) return null
-      // What the prompt asked build_compare.py for, each value shell-quoted as --flag='value'.
+      // What the prompt asked build.py for, each value shell-quoted as --flag='value'.
       const asked = (flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
       return conforms(options.schema, bare({
-        side: name, revision: name === 'base' ? String(prompt).match(/--rev=([0-9a-f]{40})/)[1] : head,
-        snapshot: name === 'base' ? null : 'snap', snapshotAfter: name === 'base' ? null : 'snap',
-        command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), setup: asked('setup')[0] ?? null,
-        buildDir: '/tmp/b', setupExit: null, exit,
-        log: `/tmp/${name}.log`, cleanup: { ok: true, retained: [], error: null },
+        revision: head, snapshot: 'snap', snapshotAfter: 'snap',
+        command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), buildDir: '/tmp/b', exit,
+        log: '/tmp/candidate.log', cleanup: { ok: true, retained: [], error: null },
         ...(typeof over === 'function' ? over(label, String(prompt)) : over),
       }), label)
-    }
-    if (label.startsWith('build:compare#')) {
-      assert.equal(options.agentType, 'finding-verifier')
-      if (opts.buildVerdict === null) return null
-      const base = JSON.parse(String(prompt).match(/\nBase: (\{.*\})$/)[1])
-      return conforms(options.schema, opts.buildVerdict ?? (base.exit !== 0
-        ? { verdict: 'baseline-only', unverified: ['board_a'], reason: 'fails on the base too' }
-        : { verdict: 'regression', unverified: [], reason: 'board_a builds on the base' }), label)
     }
     if (label.startsWith('compat#')) {
       assert.equal(options.agentType, 'finding-verifier')
@@ -972,7 +956,7 @@ test('a claim already containing a backslash-pipe stays one cell', async () => {
   assert.equal(cells[1], 'src/a.c:1 the regex \\| splits the row', 'and renders the backslash and pipe literally')
 })
 
-test('a batch whose build fails where the base builds is not published', async () => {
+test('a batch whose build fails is not published', async () => {
   const { result, logs, labels, calls } = await run({
     reviews: oneValid, fix: { buildOk: false, notes: 'uncovered: src/class/bth/bth_device.c' },
   })
@@ -980,9 +964,9 @@ test('a batch whose build fails where the base builds is not published', async (
   assert.equal(result.reason, 'fix-verification-failed')
   assert.equal(labels.some(l => l.startsWith('push#')), false, 'the publisher is not dispatched')
   assert.ok(labels.includes('check:src/a.c'), 'the issue check runs whatever the writer\'s own build said')
-  assert.deepEqual(labels.filter(l => l.startsWith('build:')), ['build:resolve#1-review', 'build:candidate#1-review', 'build:base#1-review', 'build:compare#1-review'])
-  assert.match(calls.find(c => c.label === 'build:base#1-review').prompt, new RegExp(`build_compare\\.py base --rev=${HEAD} --setup='tools/get_deps\\.py' --command='make -C <BUILD> all'\``))
-  assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: build regression against the base/)
+  assert.deepEqual(labels.filter(l => /^build[:#]/.test(l)), ['build:resolve#1-review', 'build#1-review'])
+  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --command='make -C <BUILD> all'`/)
+  assert.match(rowsOf(summaries(logs)[0])[0][3], /unverified: the build failed \(exit 1\); log \/tmp\/cand/)
   assert.equal(labels.some(l => l.startsWith('compat#')), false, 'no compatibility check on a broken batch')
 })
 
@@ -990,12 +974,11 @@ test('the batch build is resolved from the contract when the caller named none, 
   const resolved = await run({ reviews: twoValid })
   const resolve = resolved.calls.find(c => c.label === 'build:resolve#1-review')
   assert.match(resolve.prompt, /for a change to src\/a\.c, src\/b\.c\./)
-  assert.match(resolved.calls.find(c => c.label === 'build:candidate#1-review').prompt, /build_compare\.py candidate --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all'`/)
-  assert.equal(resolved.labels.some(l => l.startsWith('build:base#')), false, 'a passing candidate needs no base')
+  assert.match(resolved.calls.find(c => c.label === 'build#1-review').prompt, /build\.py --path='src\/a\.c' --path='src\/b\.c' --command='make -C <BUILD> all'`/)
   assert.equal(resolved.result.history[0].reviewPush.pass, true)
   const given = await run({ reviews: oneValid, args: { build: "make BOARD='x y' <BUILD>" } })
   assert.equal(given.labels.some(l => l.startsWith('build:resolve#')), false)
-  assert.match(given.calls.find(c => c.label === 'build:candidate#1-review').prompt, /--command='make BOARD='\\''x y'\\'' <BUILD>'`/)
+  assert.match(given.calls.find(c => c.label === 'build#1-review').prompt, /--command='make BOARD='\\''x y'\\'' <BUILD>'`/)
   assert.equal(given.result.history[0].reviewPush.pass, true, 'the receipt echoes the quoted command back')
 })
 
@@ -1009,7 +992,7 @@ test('a build plan resolved for one path set is reused by a later cycle, and a n
     },
   })
   assert.deepEqual(labels.filter(l => l.startsWith('build:resolve#')), ['build:resolve#1-review', 'build:resolve#3-review'])
-  assert.ok(labels.includes('build:candidate#2-review'), 'the reused plan still builds')
+  assert.ok(labels.includes('build#2-review'), 'the reused plan still builds')
   cycle = 0
   const edited = await run({
     args: { autoPush: true, maxCycles: 2 }, buildPlan: { contract: ['src/a.c'] },
@@ -1044,24 +1027,13 @@ test('the committer gets the claims without their hints, and the message on stdi
   assert.match(commit, /commits\.py commit 'src\/a\.c' < <that file>; rm -f <that file>`/)
 })
 
-test('the caller\'s build resolves its base setup once per launch', async () => {
-  let cycle = 0
-  const { labels } = await run({
-    args: { autoPush: true, maxCycles: 2, build: 'make <BUILD>' }, candidate: { exit: 1 }, base: { exit: 1 },
-    reviewsPerCycle: () => ({ findings: [finding({ commentId: ++cycle, line: cycle })], replies: [], bots: 'reviewed' }),
-  })
-  assert.ok(labels.includes('build:base#2-review'), 'the second cycle built the base too')
-  assert.deepEqual(labels.filter(l => l.startsWith('build:setup#')), ['build:setup#1-review'])
-})
-
 test('an unresolved build contract, or a build that did not run, blocks the batch', async () => {
   for (const [over, why] of [
     [{ buildPlan: { error: 'no build docs' } }, /build contract not resolved: no build docs/],
     [{ buildPlan: null }, /build contract not resolved: resolver died/],
-    [{ candidate: null }, /candidate build did not count: agent died/],
-    [{ candidate: { error: 'usage: ...' } }, /candidate build did not count: usage/],
-    [{ candidate: { exit: 1 }, base: null }, /base build did not count: agent died/],
-    [{ candidate: { exit: 1 }, buildVerdict: null }, /comparison died/],
+    [{ candidate: null }, /the build did not count: agent died/],
+    [{ candidate: { error: 'usage: ...' } }, /the build did not count: usage/],
+    [{ candidate: { exit: 2 } }, /the build failed \(exit 2\)/],
   ]) {
     const { result, labels, logs } = await run({ reviews: oneValid, ...over })
     assert.equal(result.reason, 'fix-verification-failed', JSON.stringify(over))
@@ -1072,101 +1044,38 @@ test('an unresolved build contract, or a build that did not run, blocks the batc
 
 test('a build receipt counts only as the run that was asked for', async () => {
   for (const [candidate, why] of [
-    [{ revision: 'f'.repeat(40) }, /the receipt is for candidate at fffffff, not candidate at/],
-    [{ side: 'base', snapshot: null }, /the receipt is for base at/],
+    [{ revision: 'f'.repeat(40) }, /the receipt is for fffffff, not /],
     [{ command: 'make other' }, /the receipt is for another command/],
-    [{ snapshotAfter: null }, /no snapshot of the candidate/],
+    [{ exit: null }, /incomplete receipt/],
+    [{ snapshotAfter: null }, /no snapshot of the batch/],
     [{ snapshotAfter: 'other' }, /the build changed src\/a\.c, which were verified before it/],
   ]) {
     const { result, logs } = await run({ reviews: oneValid, candidate })
     assert.equal(result.reason, 'fix-verification-failed', JSON.stringify(candidate))
     assert.ok(logs.some(l => why.test(l)), `${why}\n${logs.join('\n')}`)
   }
-  const { result } = await run({ reviews: oneValid, candidate: { exit: 1 }, base: { revision: 'f'.repeat(40) } })
-  assert.equal(result.reason, 'fix-verification-failed')
-})
-
-test('a setup the build script refuses is resolved again once, then the base builds', async () => {
-  const prose = 'null (see reason: fetched by the command)'
-  const refused = (label, prompt) => prompt.includes(`--setup='${prose}'`) ? { error: `setup is not a shell command: bash: syntax error near unexpected token \`('` } : { exit: 1 }
-  const fixed = await run({ reviews: oneValid, buildPlan: { setup: prose }, candidate: { exit: 1 }, base: refused, buildSetup: { setup: null } })
-  assert.deepEqual(fixed.labels.filter(l => l.startsWith('build:')),
-    ['build:resolve#1-review', 'build:candidate#1-review', 'build:base#1-review', 'build:setup#1-review', 'build:base#1-review', 'build:compare#1-review'])
-  assert.match(fixed.calls.find(c => c.label === 'build:setup#1-review').prompt, /The setup resolved before was refused: setup is not a shell command/)
-  assert.doesNotMatch(fixed.calls.filter(c => c.label === 'build:base#1-review')[1].prompt, /--setup=/)
-  assert.ok(fixed.labels.some(l => l.startsWith('push#')), fixed.logs.join('\n'))
-  for (const [buildSetup, why] of [
-    [{ error: 'no docs' }, /candidate build failed and the base's setup was not resolved: no docs/],
-    [{ setup: prose }, /base build did not count: setup is not a shell command/],
-  ]) {
-    const { result, labels, logs } = await run({ reviews: oneValid, buildPlan: { setup: prose }, candidate: { exit: 1 }, base: refused, buildSetup })
-    assert.equal(result.reason, 'fix-verification-failed', JSON.stringify(buildSetup))
-    assert.deepEqual(labels.filter(l => l.startsWith('build:setup#') || l.startsWith('build:candidate#')), ['build:candidate#1-review', 'build:setup#1-review'])
-    assert.equal(labels.some(l => /^(compat#|push#)/.test(l)), false)
-    assert.ok(logs.some(l => why.test(l)), `${why}\n${logs.join('\n')}`)
-  }
-})
-
-test('the declared targets and options go to the comparison, not the script', async () => {
-  const { calls } = await run({ reviews: oneValid, buildPlan: { options: ['-DBOARD=x'] }, candidate: { exit: 1 } })
-  assert.doesNotMatch(calls.find(c => c.label === 'build:candidate#1-review').prompt, /--target|--option/)
-  assert.match(calls.find(c => c.label === 'build:compare#1-review').prompt,
-    /Declared for this build \(the logs decide what actually ran\): \{"targets":\["board_a"\],"options":\["-DBOARD=x"\]\}/)
-})
-
-test('the caller\'s build still prepares the base with the repository\'s setup', async () => {
-  const { calls, labels } = await run({ reviews: oneValid, args: { build: 'make <BUILD>' }, candidate: { exit: 1 } })
-  assert.ok(labels.includes('build:setup#1-review'))
-  assert.match(calls.find(c => c.label === 'build:setup#1-review').prompt, /dependencies of this build: make <BUILD>\./)
-  assert.match(calls.find(c => c.label === 'build:base#1-review').prompt, /--setup='tools\/get_deps\.py' --command='make <BUILD>'`/)
-  const passing = await run({ reviews: oneValid, args: { build: 'make <BUILD>' } })
-  assert.equal(passing.labels.some(l => l.startsWith('build:setup#')), false, 'resolved only when a base build is needed')
-  const unresolved = await run({ reviews: oneValid, args: { build: 'make <BUILD>' }, candidate: { exit: 1 }, buildSetup: { error: 'no docs' } })
-  assert.equal(unresolved.result.reason, 'fix-verification-failed')
-  assert.ok(unresolved.logs.some(l => /the base's setup was not resolved: no docs/.test(l)))
 })
 
 test('a batch no build applies to is published with the reason logged', async () => {
   const { result, labels, logs } = await run({ reviews: oneValid, buildPlan: { command: null, reason: 'docs only' } })
   assert.equal(result.history[0].reviewPush.pass, true)
-  assert.equal(labels.some(l => l.startsWith('build:candidate#')), false)
+  assert.equal(labels.some(l => l.startsWith('build#')), false)
   assert.ok(logs.some(l => /build#1-review: no build applies — docs only/.test(l)))
 })
 
 test('writers whose own builds passed still do not publish a combined candidate that fails', async () => {
   const { result, labels } = await run({ reviews: twoValid, candidate: { exit: 2 } })
   assert.equal(result.reason, 'fix-verification-failed')
-  assert.ok(labels.includes('build:base#1-review') && labels.includes('build:compare#1-review'))
+  assert.ok(labels.includes('build#1-review'))
   assert.equal(labels.some(l => l.startsWith('push#')), false)
-})
-
-test('a failure the base shares continues, noted, and still needs the issue and compatibility checks', async () => {
-  const shared = { candidate: { exit: 1 }, base: { exit: 1 } }
-  const { result, calls, logs } = await run({ reviews: oneValid, ...shared })
-  assert.equal(result.history[0].reviewPush.pass, true)
-  assert.match(rowsOf(summaries(logs)[0])[0][3], /^fixed \+ pushed; unverified, the base fails too: board_a/)
-  assert.ok(logs.some(l => l === 'batch 1-review: unverified, the base fails too: board_a'))
-  const compare = calls.find(c => c.label === 'build:compare#1-review').prompt
-  assert.match(compare, /same command text can select different targets on two revisions/)
-  assert.match(compare, /'unknown' when the coverage differs/)
-  const rejected = await run({ reviews: oneValid, ...shared, verify: { addresses: false, reason: 'misses the point' } })
+  const rejected = await run({ reviews: oneValid, candidate: { exit: 1 }, verify: { addresses: false, reason: 'misses the point' } })
   assert.equal(rejected.result.reason, 'fix-verification-failed')
-  assert.equal(rejected.labels.some(l => l.startsWith('build:')), false, 'nothing is built for a batch its checks reject')
-  const incompatible = await run({ reviews: oneValid, ...shared, compat: { compatible: false, evidence: 'breaks a test' } })
-  assert.equal(incompatible.result.reason, 'fix-verification-failed')
+  assert.equal(rejected.labels.some(l => /^build[:#]/.test(l)), false, 'nothing is built for a batch its checks reject')
 })
 
-test('a regression or an unknown comparison blocks', async () => {
-  for (const buildVerdict of [{ verdict: 'regression', unverified: [], reason: 'board_a' }, { verdict: 'unknown', unverified: [], reason: 'the two sides built different targets' }]) {
-    const { result, logs } = await run({ reviews: oneValid, candidate: { exit: 1 }, base: { exit: 1 }, buildVerdict })
-    assert.equal(result.reason, 'fix-verification-failed')
-    assert.match(rowsOf(summaries(logs)[0])[0][3], new RegExp(`unverified: build ${buildVerdict.verdict} against the base`))
-  }
-})
-
-test('a build directory or worktree left behind is logged', async () => {
+test('a build directory left behind is logged', async () => {
   const { logs } = await run({ reviews: oneValid, candidate: { cleanup: { ok: false, retained: ['/tmp/b'], error: null } } })
-  assert.ok(logs.some(l => /build:candidate#1-review: cleanup left \/tmp\/b/.test(l)))
+  assert.ok(logs.some(l => /build#1-review: cleanup left \/tmp\/b/.test(l)))
 })
 
 test('a resumed launch may change the build, keeping the debt and the budget', async () => {
@@ -1247,7 +1156,7 @@ test('every live writer is verified, and one dead group blocks the batch before 
   })
   assert.deepEqual(calls.filter(c => c.label.startsWith('check:')).map(c => c.label).sort(), ['check:src/b.c', 'check:src/c.c'])
   assert.equal(result.reason, 'fix-verification-failed')
-  assert.equal(labels.some(l => /^(build:|push#)/.test(l)), false)
+  assert.equal(labels.some(l => /^(build[:#]|push#)/.test(l)), false)
   assert.match(outcomes(logs)[0], /withheld/)
 })
 

@@ -22,8 +22,7 @@ python3 $S/commits.py head 'src/a.c'         # the commit at HEAD and its scope
 python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SHAs
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 python3 $S/sonar.py --pr N --head <sha> --manifest <file>  # mark answered code-scanning comments' SonarCloud issues false positive
-python3 $S/build_compare.py candidate --path 'src/a.c' --command 'make -C <BUILD>'
-python3 $S/build_compare.py base --rev <sha> [--setup CMD] --command 'make -C <BUILD>'
+python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>'  # build the checkout as it stands
 python3 $S/state_transfer.py <saved output> [--chunks I,J]  # a stateRef's state as checksummed base64 chunks
 python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR]  # the caller's reading of a launch
 ```
@@ -32,8 +31,7 @@ python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkou
 launch and lists the `blockers` to settle before continuing.
 `preflight.py`, `harvest.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 `commits.py commit` stages and commits exactly its paths; `hooks.py` runs the repository's
-hooks, which may rewrite files; `build_compare.py` builds the checkout, or the
-given revision in a temporary worktree it removes, in a fresh build directory; `push.py` publishes `<sha>` and reads back
+hooks, which may rewrite files; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, and `sonar.py` comments on and resolves SonarCloud issues. Run either by hand only with the user's authorization to publish there.
 
 ## Arguments

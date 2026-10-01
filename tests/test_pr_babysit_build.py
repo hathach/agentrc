@@ -1,6 +1,5 @@
-"""Tests for pr-babysit's build_compare.py against fake build commands in a temp repository."""
+"""Tests for pr-babysit's build.py against fake build commands in a temp repository."""
 import json
-import re
 import os
 import subprocess
 import sys
@@ -8,10 +7,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'build_compare.py'
+SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'build.py'
 
 
-class BuildCompareTest(unittest.TestCase):
+class BuildTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -39,9 +38,9 @@ class BuildCompareTest(unittest.TestCase):
 
     def test_candidate_builds_the_checkout_as_it_stands_in_a_fresh_dir(self):
         (self.repo / 'src.c').write_text('int broken\n')
-        code, out = self.run_script('candidate', '--path=.', '--command', 'grep -q "int ok;" src.c && touch <BUILD>/out')
+        code, out = self.run_script('--path=.', '--command', 'grep -q "int ok;" src.c && touch <BUILD>/out')
         self.assertEqual(code, 0)
-        self.assertEqual((out['side'], out['revision'], out['exit'], out['setupExit']), ('candidate', self.base, 1, None))
+        self.assertEqual((out['revision'], out['exit']), (self.base, 1))
         self.assertIn(out['buildDir'], out['command'])
         self.assertNotIn('<BUILD>', out['command'])
         self.assertTrue(out['cleanup']['ok'])
@@ -53,43 +52,11 @@ class BuildCompareTest(unittest.TestCase):
         for change in (lambda: None, lambda: (self.repo / 'src.c').write_text('int x;\n'),
                        lambda: (self.repo / 'new.c').write_text('a'), lambda: (self.repo / 'new.c').write_text('b')):
             change()
-            snaps.append(self.run_script('candidate', '--path=.', '--command', 'true')[1]['snapshot'])
+            snaps.append(self.run_script('--path=.', '--command', 'true')[1]['snapshot'])
         self.assertEqual(len(set(snaps)), 4)
 
-    def test_base_builds_in_its_own_worktree_and_leaves_the_checkout_alone(self):
-        (self.repo / 'src.c').write_text('int broken\n')
-        (self.repo / 'untracked.c').write_text('x')
-        status = self.git('status', '--porcelain')
-        code, out = self.run_script('base', '--rev', self.base, '--setup', 'touch <BUILD>/deps',
-                                    '--command', 'test -f <BUILD>/deps && grep -q "int ok;" src.c')
-        self.assertEqual((code, out['side'], out['revision'], out['snapshot']), (0, 'base', self.base, None))
-        self.assertEqual((out['setupExit'], out['exit']), (0, 0))
-        self.assertTrue(out['cleanup']['ok'])
-        self.assertEqual(self.git('status', '--porcelain'), status)
-        self.assertEqual(len(self.git('worktree', 'list').splitlines()), 1, 'the temporary worktree is gone')
-
-    def test_each_side_gets_its_own_build_dir(self):
-        a = self.run_script('candidate', '--path=.', '--command', 'test -z "$(ls <BUILD>)" && touch <BUILD>/x')[1]
-        b = self.run_script('base', '--rev', self.base, '--command', 'test -z "$(ls <BUILD>)" && touch <BUILD>/x')[1]
-        self.assertNotEqual(a['buildDir'], b['buildDir'])
-        self.assertEqual((a['exit'], b['exit']), (0, 0), 'each started empty')
-
-    def test_a_failed_baseline_setup_is_reported_and_nothing_is_built(self):
-        code, out = self.run_script('base', '--rev', self.base, '--setup', 'test -d deps', '--command', 'touch built')
-        self.assertEqual((code, out['setupExit'], out['exit']), (0, 1, None))
-        self.assertTrue(out['cleanup']['ok'])
-
-    def test_a_setup_bash_cannot_parse_is_refused_before_anything_runs(self):
-        setup = 'null (see reason: dependency fetching is inline via the command\'s own --fetch-deps flag)'
-        code, out = self.run_script('base', '--rev', self.base, '--setup', setup, '--command', 'touch built')
-        self.assertEqual(code, 2)
-        # pr-babysit.js re-resolves the setup on exactly this prefix.
-        marker = re.search(r"const BAD_SETUP = '([^']+)'", (SCRIPT.parents[3] / 'workflows' / 'pr-babysit.js').read_text())[1]
-        self.assertTrue(out['error'].startswith(marker + ': '), out['error'])
-        self.assertEqual(self.git('worktree', 'list').count('\n'), 1)
-
     def test_a_retained_build_dir_is_reported(self):
-        code, out = self.run_script('candidate', '--path=.', '--command', 'mkdir <BUILD>/ro && touch <BUILD>/ro/f && chmod 555 <BUILD>/ro')
+        code, out = self.run_script('--path=.', '--command', 'mkdir <BUILD>/ro && touch <BUILD>/ro/f && chmod 555 <BUILD>/ro')
         self.addCleanup(lambda: subprocess.run(['rm', '-rf', out['buildDir']]))
         self.addCleanup(lambda: subprocess.run(['chmod', '-R', 'u+w', out['buildDir']]))
         if os.geteuid() == 0:
@@ -101,22 +68,22 @@ class BuildCompareTest(unittest.TestCase):
     def test_a_build_that_rewrites_the_candidate_sources_shows_in_the_snapshots(self):
         (self.repo / 'src.c').write_text('int fixed;\n')
         (self.repo / 'other.c').write_text('x')
-        code, out = self.run_script('candidate', '--path=src.c', '--command', 'git checkout -- src.c')
+        code, out = self.run_script('--path=src.c', '--command', 'git checkout -- src.c')
         self.assertEqual(code, 0)
         self.assertNotEqual(out['snapshot'], out['snapshotAfter'])
-        code, out = self.run_script('candidate', '--path=src.c', '--command', 'echo y > other.c && touch <BUILD>/o')
+        code, out = self.run_script('--path=src.c', '--command', 'echo y > other.c && touch <BUILD>/o')
         self.assertEqual(out['snapshot'], out['snapshotAfter'], 'a path outside the candidate may change')
 
     def test_a_path_named_like_pathspec_magic_snapshots_only_itself(self):
         (self.repo / ':(top)*').write_text('odd')
-        snap = lambda: self.run_script('candidate', '--path=:(top)*', '--command', 'true')[1]['snapshot']
+        snap = lambda: self.run_script('--path=:(top)*', '--command', 'true')[1]['snapshot']
         before = snap()
         (self.repo / 'src.c').write_text('int x;\n')
         (self.repo / 'new.c').write_text('a')
         self.assertEqual(snap(), before, 'no other path joins the snapshot')
 
     def test_values_may_start_with_a_dash(self):
-        code, out = self.run_script('candidate', '--path=-weird', '--command=true')
+        code, out = self.run_script('--path=-weird', '--command=true')
         self.assertEqual((code, out['exit']), (0, 0), out)
 
     def test_a_filesystem_error_is_reported_and_cleaned_up(self):
@@ -126,29 +93,24 @@ class BuildCompareTest(unittest.TestCase):
         os.chmod(self.repo / 'secret.c', 0)
         self.addCleanup(os.chmod, self.repo / 'secret.c', 0o644)
         before = set(Path(tempfile.gettempdir()).glob('pr-babysit-build-*'))
-        code, out = self.run_script('candidate', '--path=.', '--command', 'true')
+        code, out = self.run_script('--path=.', '--command', 'true')
         self.assertEqual(code, 2)
         self.assertIn('Permission denied', out['error'])
         self.assertEqual(set(Path(tempfile.gettempdir()).glob('pr-babysit-build-*')), before, 'the build dir is gone')
 
     def test_refusals(self):
         for argv, why in [
-            (['base', '--command', 'true'], 'base needs --rev'),
-            (['base', '--rev', 'HEAD', '--command', 'true'], 'base needs --rev'),
-            (['candidate', '--path=.', '--rev', self.base, '--command', 'true'], 'no --rev or --setup'),
-            (['candidate', '--command', 'true'], '--path names the candidate'),
-            (['base', '--rev', self.base, '--path=.', '--command', 'true'], '--path names the candidate'),
-            (['candidate'], 'usage'),
-            (['base', '--rev', 'f' * 40, '--command', 'true'], 'git worktree add'),
+            (['--command', 'true'], 'usage'),
+            (['--path=.'], 'usage'),
+            (['--path=.', '--rev', self.base, '--command', 'true'], 'usage'),
         ]:
             code, out = self.run_script(*argv)
             self.assertEqual(code, 2, argv)
             self.assertIn(why, out['error'])
         (self.repo / 'sub').mkdir()
-        code, out = self.run_script('candidate', '--path=.', '--command', 'true', cwd=self.repo / 'sub')
+        code, out = self.run_script('--path=.', '--command', 'true', cwd=self.repo / 'sub')
         self.assertEqual(code, 2)
         self.assertIn('run from the checkout top level', out['error'])
-        self.assertEqual(len(self.git('worktree', 'list').splitlines()), 1)
 
 
 if __name__ == '__main__':
