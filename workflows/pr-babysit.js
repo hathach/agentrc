@@ -52,12 +52,14 @@ if (!Number.isInteger(ciWait) || ciWait < 1) {
 }
 const acceptedArg = args.acceptedFailures ?? []
 const failureKey = (x) => JSON.stringify([x.workflow, x.job, x.cell, x.signature])
-// 64-bit FNV-1a of the failure identity: the 16-hex key a caller copies.
-const keyOf = (x) => {
+// The 16-hex key a caller copies: 64-bit FNV-1a of the collector's workflow and check and the failure's signature, never the judge's
+// workflow, job or cell labels, which a re-judgement can change (#36). A HIL cell is in its signature, a matrix leg in its check name.
+const keyOf = (c, f) => {
   let h = 0xcbf29ce484222325n
-  for (const ch of failureKey(x)) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
+  for (const ch of JSON.stringify([c.workflow, c.name, f.signature])) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
   return h.toString(16).padStart(16, '0')
 }
+const keyed = (c, failures) => failures.map(f => ({ ...f, key: keyOf(c, f) }))
 const acceptedShaped = (a) => a && typeof a === 'object' && Object.keys(a).length === 3 && typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) &&
   ['reason', 'scope'].every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
 if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(a => a.key)).size !== acceptedArg.length) {
@@ -1636,7 +1638,7 @@ const ciLaneRun = async (cycle, lanes) => {
   ciChecks.unchanged += unchanged.length
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
-    realFailures: cached.flatMap(c => JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures))),
+    realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)))),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
   if ((judging.length === 0 && gated.length === 0) || lanes.reviewPushed || lanes.ended) return report
@@ -1655,8 +1657,8 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: SonarCloud gate evidence came back for ${JSON.stringify(ev.gates.map(g => g.link))}, asked for ${JSON.stringify(gated.map(c => c.link))} — re-arming`)
     return null
   }
-  report.realFailures.push(...gated.flatMap(c => ev.gates.find(g => g.link === c.link).failures
-    .map(f => ({ check: c.name, workflow: '', job: c.name, cell: null, runId: null, files: [], verdict: 'real', ...f }))))
+  report.realFailures.push(...gated.flatMap(c => keyed(c, ev.gates.find(g => g.link === c.link).failures
+    .map(f => ({ check: c.name, workflow: '', job: c.name, cell: null, runId: null, files: [], verdict: 'real', ...f })))))
   if (judging.length === 0) return report
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} at head ${report.headSha} per your procedure. ` +
@@ -1723,7 +1725,7 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   if (unsettled.length) return null
   report.infraRerun = judged.infraRerun
-  report.realFailures.push(...judging.flatMap(c => failuresOf.get(c.link)))
+  report.realFailures.push(...judging.flatMap(c => keyed(c, failuresOf.get(c.link))))
   return report
 }
 
@@ -1735,8 +1737,7 @@ const runCycle = async (cycle, entry) => {
   try {
     entry.lane = lane
     if (ciLane) {
-      ciPromise = ciLaneRun(cycle, lanes).then(r => { if (r && r.realFailures) for (const rf of r.realFailures) rf.key = keyOf(rf); return r })
-        .catch(quiet(`cycle ${cycle}: CI lane`))
+      ciPromise = ciLaneRun(cycle, lanes).catch(quiet(`cycle ${cycle}: CI lane`))
     }
 
     // An edited comment's carried ids may name other points now: none is named to the validator.

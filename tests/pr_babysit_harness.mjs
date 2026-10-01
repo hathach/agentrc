@@ -54,10 +54,11 @@ const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`$
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
 // The workflow's failure identity.
 const failureKey = (f) => JSON.stringify([f.workflow, f.job, f.cell, f.signature])
-// The 16-hex key a caller accepts a failure by: 64-bit FNV-1a of its identity.
+// The 16-hex key a caller accepts a failure by: 64-bit FNV-1a of the collector's workflow (failedChecks: '' for a
+// SonarCloud check, 'ci' for any other) and check, and the failure's signature.
 const keyOf = (f) => {
   let h = 0xcbf29ce484222325n
-  for (const ch of failureKey(f)) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
+  for (const ch of JSON.stringify([f.workflow === '' ? '' : 'ci', f.check, f.signature])) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
   return h.toString(16).padStart(16, '0')
 }
 // The checks a CI judge prompt asks about.
@@ -1903,9 +1904,9 @@ const PVS = { check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null
 const longForm = (over = {}) => ({ workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
 const redWith = (...failures) => ({ ci: { status: 'red', infraRerun: [], realFailures: failures } })
 
-// fnv1a64 of JSON.stringify(['static', 'pvs', null, 'license expires in 12 days']), computed outside the workflow.
-const PVS_KEY = '8f5a706886f8c791'
-assert.equal(keyOf(longForm()), PVS_KEY)
+// fnv1a64 of JSON.stringify(['ci', 'pvs / analyze', 'license expires in 12 days']), computed outside the workflow.
+const PVS_KEY = '1f1a4bfe929a72bb'
+assert.equal(keyOf(PVS), PVS_KEY)
 const byKey = (over = {}) => ({ key: PVS_KEY, reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
 
 test('an accepted failure is named by its key, and a wrong key accepts nothing', async () => {
@@ -1973,11 +1974,23 @@ test('an accepted failure the watcher calls real is still not fixed', async () =
   assert.equal(result.pass, true)
 })
 
-test('only the exact failure is accepted: another diagnostic, another cell, another workflow or a second failure is not', async () => {
+test('the key holds no judge label, so a failure judged again with another cell, job or workflow keeps its acceptance (#36)', async () => {
+  const MSP = { check: 'cmake (msp430-gcc) / family (msp430)', workflow: 'cmake', job: 'family', cell: 'msp430', signature: '##[error]Process completed with exit code 1.', firstError: 'exit 1', files: [], verdict: 'rig-side' }
+  const named = await run({ ...redWith(MSP), args: { acceptedFailures: [byKey()] } })
+  const key = named.result.observation.ci.realFailures[0].key
+  assert.equal(key, keyOf(MSP))
+  const { result } = await run({ ...redWith({ ...MSP, cell: null, job: 'family (msp430)', workflow: 'cmake (msp430-gcc)' }), args: { acceptedFailures: [byKey({ key })] } })
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  const hil = await run({ ...redWith(cellFailure('pico a', 'rig-side'), cellFailure('pico b', 'rig-side')), args: { acceptedFailures: [byKey()] } })
+  const keys = hil.result.observation.ci.realFailures.map(f => f.key)
+  assert.deepEqual(keys, [keyOf(cellFailure('pico a')), keyOf(cellFailure('pico b'))])
+  assert.notEqual(keys[0], keys[1], 'a HIL cell is told apart by the signature collect.py prefixes with it')
+})
+
+test('only the exact failure is accepted: another diagnostic, another check or a second failure is not', async () => {
   for (const [failures, label] of [
-    [[{ ...PVS, signature: 'license expired' }], 'a new diagnostic on the accepted cell'],
-    [[{ ...PVS, cell: 'arm' }], 'a cell where null was accepted'],
-    [[{ ...PVS, workflow: 'ci' }], 'the same job in another workflow'],
+    [[{ ...PVS, signature: 'license expired' }], 'a new diagnostic on the accepted check'],
+    [[{ ...PVS, check: 'pvs / analyze (arm)' }], 'the same diagnostic on another check'],
     [[PVS, { ...PVS, signature: 'V501 identical sub-expressions', firstError: 'V501', verdict: 'unclassified' }], 'a second failure in the accepted cell'],
   ]) {
     const { result } = await run({ ...redWith(...failures), args: { acceptedFailures: [byKey()] } })
@@ -2001,7 +2014,7 @@ test('a CI report for another head is not fixed, accepted or counted green', asy
 test('an acceptance needs a complete listing of the job and covers one failure', async () => {
   for (const [failures, why] of [
     [[{ ...PVS, complete: false }], /not accepted — the watcher did not list every failure of its job/],
-    [[PVS, { ...PVS, check: 'pvs / analyze (2)' }], /not accepted — the same failure is listed 2 times; one acceptance covers one/],
+    [[PVS, { ...PVS, cell: 'arm' }], /not accepted — the same failure is listed 2 times; one acceptance covers one/],
   ]) {
     const { result, logs } = await run({ ...redWith(...failures), args: { acceptedFailures: [byKey()] } })
     assert.notEqual(result.pass, true)
