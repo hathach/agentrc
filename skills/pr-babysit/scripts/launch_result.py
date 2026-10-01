@@ -32,6 +32,7 @@ CONDENSED = ('history', 'observation', 'state')
 NOT_FIXING = re.compile(r'^cycle \d+: rig-side CI failure \(not fixing\)')
 CUT = 300
 ADOPTION_REFUSED = 'the adoption was refused: investigate and report it, never answer it with a reset or a fabricated state'
+# budget-exhausted-unverified is no longer produced; kept so an older launch's output still reads.
 REFUSED = {
     'budget-exhausted-unverified': 'the launch stopped before loading its state, whose copy showed the cycle budget spent; '
                                    'the launch that saved that state is the authority: read it before relaunching',
@@ -169,6 +170,13 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         blockers += blocking
         if actions.get('error'):
             blockers.append(f'action error: {cut(actions["error"])}')
+        for h in result.get('handoffs') or []:
+            repair = h.get('repair') or {}
+            why = ('edited after its finding ids were carried' if h.get('edited')
+                   else f"reply {repair['replyId']} has the wrong body ({cut(repair.get('error') or '')}); it settles only if it is the offered body word for word"
+                   if repair.get('replyId') else cut(repair.get('error') or 'no reply posted'))
+            blockers.append(f"comment {h.get('commentId')} needs a human answer, which a relaunch does not give: {why}"
+                            + (f"; draft: {cut(repair['draft'])}" if repair.get('draft') else ''))
         for u in result.get('sonarUnmarked') or []:
             last = u.get('last') or {}
             blockers.append(f"SonarCloud issue of comment {u.get('commentId')} not marked false positive: "

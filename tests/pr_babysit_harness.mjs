@@ -426,29 +426,6 @@ async function run(opts = {}) {
       }))
       return conforms(options.schema, bare({ inspected: got }), label)
     }
-    if (label.startsWith('reconcile#')) {
-      assert.equal(options.agentType, 'finding-verifier')
-      // opts.answers(commentId) is the verdict on its reply; unanswered by default,
-      // so a repair stands unless a case says the reply answers it.
-      const ids = trailingList(prompt).map(x => x.commentId)
-      return conforms(options.schema, { verdicts: ids.map(commentId => ({
-        commentId, answers: opts.answers ? opts.answers(commentId) : false, reason: 'stub verdict',
-      })) }, label)
-    }
-    if (label.startsWith('shorten#')) {
-      // opts.shorten(draft) is one draft's rewrite, 'short' by default; null a dead shortener.
-      if (opts.shorten === null) return null
-      return conforms(options.schema, { replies: trailingList(prompt).map(x => ({
-        commentId: x.commentId, body: opts.shorten ? opts.shorten(x) : 'short',
-      })) }, label)
-    }
-    if (label.startsWith('check-reply#')) {
-      // opts.faithful(pair) is one rewrite's verdict, faithful by default; null a dead checker.
-      if (opts.faithful === null) return null
-      return conforms(options.schema, { verdicts: trailingList(prompt).map(x => ({
-        commentId: x.commentId, faithful: opts.faithful ? opts.faithful(x) : true, reason: 'stub check',
-      })) }, label)
-    }
     if (label.startsWith('reuse#')) {
       if (opts.reuse === null) return null
       const { reuses } = payloadOf(prompt, 'Reuses')
@@ -456,16 +433,6 @@ async function run(opts = {}) {
         commentId: u.commentId, kind: 'review', replyId: u.replyId, digest: u.bodyDigest,
         sent: false, posted: false, verified: true, resolved: true, error: null,
         ...(opts.reuse ? opts.reuse(u.commentId) : {}),
-      }))) }, label)
-    }
-    if (label.startsWith('edit#')) {
-      // reply.py --edit: every reply edited to its body, read back and resolved unless opts.edit says otherwise.
-      if (opts.edit === null) return null
-      const { edits } = payloadOf(prompt, 'Edits')
-      return conforms(options.schema, { receipts: printed(edits.map(e => ({
-        commentId: e.commentId, kind: 'review', replyId: e.replyId, digest: e.digest,
-        sent: true, posted: true, verified: true, resolved: true, error: null,
-        ...(opts.edit ? opts.edit(e.commentId) : {}),
       }))) }, label)
     }
     if (label.startsWith('sonar#')) {
@@ -3042,35 +3009,22 @@ test('a reply is published by the script from a workflow-built manifest', async 
   assert.deepEqual(replies, [{ commentId: 2, body: 'not so', digest: fnv1a('not so') }])
 })
 
-test('a reply that landed with the wrong body is edited to the offered body next cycle, never reposted', async () => {
-  // #2: the reply went out as "deliberately" where the draft said "precisely".
-  // The thread stays open and the comment keeps its debt with the reply id; the
-  // next cycle inspects that reply and edits it to the body offered.
+test('a reply that landed with the wrong body is a repair for a human, never reposted or edited', async () => {
   const wrong = {
     args: { autoPush: true, maxCycles: 2 },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   }
-  for (const [name, bad] of [['read-back', { wrongBody: (id) => id === 2 }],
-    ['other body', { receipts: (rs, l) => l === 'replies#1' ? rs.map(r => ({ ...r, digest: fnv1a('deliberately') })) : rs }]]) {
-    const { result, logs, calls, labels } = await run({ ...wrong, ...bad })
+  for (const [name, bad, error] of [['read-back', { wrongBody: (id) => id === 2 }, 'read-back mismatch on body'],
+    ['other body', { receipts: (rs, l) => l === 'replies#1' ? rs.map(r => ({ ...r, digest: fnv1a('deliberately') })) : rs }, 'receipt for a different body']]) {
+    const { result, logs, labels } = await run({ ...wrong, ...bad })
     assert.equal(result.history[0].refutedPosts.pass, false, name)
-    assert.ok(logs.some(l => /reply 502 to comment 2 went out with the wrong content .* edited to the offered body next cycle/.test(l)), name)
-    assert.deepEqual(labels.filter(l => /^(replies|inspect|reconcile|edit)#/.test(l)), ['replies#1', 'inspect#2', 'edit#2'], name)
-    assert.deepEqual(payloadOf(calls.find(c => c.label === 'edit#2').prompt, 'Edits').edits,
-      [{ commentId: 2, replyId: 502, body: 'not so', digest: fnv1a('not so'), bodyDigest: fnv1a('answered already, in other words'), originalDigest: 'd2' }], name)
-    assert.equal(result.pass, true, `${name}: ${result.reason}`)
-    assert.deepEqual(result.state.answeredWith.find(([id]) => id === 2)[1], { how: 'refutation', digest: 'd2' })
+    assert.ok(logs.some(l => /reply 502 to comment 2 exists with the wrong content .* needs a human repair, not another reply/.test(l)), name)
+    assert.deepEqual(labels.filter(l => /^(replies|inspect|reuse)#/.test(l)), ['replies#1', 'inspect#2'], name)
+    assert.ok(logs.some(l => /reply 502 to comment 2 still needs repair — the reply there is not the offered body: a human answers it/.test(l)), name)
+    assert.notEqual(result.pass, true, name)
+    assert.deepEqual(result.handoffs, [{ commentId: 2, repair: { replyId: 502, error } }], name)
   }
-  // An edit that does not verify is not tried again: the verifier judges the reply next.
-  const { result, labels } = await run({ ...wrong, args: { autoPush: true, maxCycles: 3 }, wrongBody: (id) => id === 2, edit: () => ({ verified: false, resolved: null, error: 'read-back mismatch on body' }) })
-  assert.deepEqual(labels.filter(l => /^(replies|edit|reconcile)#/.test(l)), ['replies#1', 'edit#2', 'reconcile#3'])
-  assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'read-back mismatch on body' })
-  // A dry run edits nothing.
-  const first = await run({ ...wrong, args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true }, wrongBody: (id) => id === 2 })
-  const dry = await run({ ...wrong, args: { autoPush: false, maxCycles: 2, state: first.result.state } })
-  assert.equal(dry.labels.some(l => l.startsWith('edit#')), false)
-  assert.ok(dry.logs.some(l => /reply\/replies 502 would be edited to the offered body \(dry run\)/.test(l)))
 })
 
 test('a reply that reads back as the offered body settles on it with no verdict and no edit', async () => {
@@ -3100,13 +3054,15 @@ test('a repair obligation survives a restart and still blocks a repost', async (
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
-  assert.deepEqual(first.result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'read-back mismatch on body', posted: true })
+  assert.deepEqual(first.result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'read-back mismatch on body' })
   assert.equal(second.calls.some(c => c.label.startsWith('replies#')), false, 'reposted over a reply that needs repair')
-  assert.ok(second.labels.includes('edit#2'), 'the restored repair is still edited')
+  assert.ok(second.result.handoffs.some(h => h.commentId === 2), 'the restored repair is still handed off')
 })
 
 // Comment 2 was answered by a reply (502) whose body reply.py will not post over.
 const HELD = { replyId: 502, error: 'reply 502 of ours is already on this comment in other words; reconcile by hand' }
+// reply.py --inspect finding the offered body word for word.
+const asOffered = (body = 'not so') => ({ inspect: () => ({ body, bodyDigest: fnv1a(body) }) })
 const heldForRepair = (over = {}) => ({
   args: { autoPush: true, maxCycles: 2 },
   alreadyThere: (id) => id === 2,
@@ -3114,32 +3070,14 @@ const heldForRepair = (over = {}) => ({
   ...over,
 })
 
-test('a reply already there that answers every point settles the comment, posting nothing', async () => {
-  const { result, calls, logs } = await run(heldForRepair({ answers: () => true }))
+test('a reply already there in other words keeps the repair for a human, with no verifier', async () => {
+  const { result, calls, labels, logs } = await run(heldForRepair())
   const inspect = calls.find(c => c.label === 'inspect#2')
   assert.match(inspect.prompt, /reply\.py --pr \d+ --inspect 2:502`/)
-  const judged = calls.find(c => c.label === 'reconcile#2')
-  assert.match(judged.prompt, /"owed":"refutation"/)
-  assert.match(judged.prompt, /"reply":"answered already, in other words"/)
-  const verdicts = judged.schema.properties.verdicts
-  assert.deepEqual([verdicts.minItems, verdicts.maxItems, verdicts.items.properties.commentId.enum], [1, 1, [2]])
-  const reuse = calls.find(c => c.label === 'reuse#2')
-  assert.match(reuse.prompt, /--reuse <that file>/)
-  assert.deepEqual(payloadOf(reuse.prompt, 'Reuses').reuses,
-    [{ commentId: 2, replyId: 502, bodyDigest: fnv1a('answered already, in other words'), originalDigest: 'd2' }])
+  assert.equal(labels.some(l => l.startsWith('reuse#')), false, 'no settling on another body')
+  assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, HELD)
+  assert.ok(logs.some(l => /comment 2 still needs repair — the reply there is not the offered body/.test(l)))
   assert.equal(calls.filter(c => c.label.startsWith('replies#')).length, 1, 'nothing reposted')
-  assert.equal(result.state.debt.find(([id]) => id === 2), undefined, 'repair and debt cleared')
-  assert.deepEqual(result.state.answeredWith.find(([id]) => id === 2)[1], { how: 'refutation', digest: 'd2' })
-  assert.ok(logs.some(l => /comment 2 settled on reply 502, already there/.test(l)))
-})
-
-test('a reply already there that misses a point, or cannot be judged, keeps the repair', async () => {
-  for (const answers of [false, null]) {
-    const { result, labels } = await run(heldForRepair({ answers: () => answers }))
-    assert.ok(labels.includes('reconcile#2'))
-    assert.equal(labels.some(l => l.startsWith('reuse#')), false, 'no settling on a partial answer')
-    assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, HELD)
-  }
 })
 
 test('a reply or comment that changed, or a reuse that is not verified, keeps the repair', async () => {
@@ -3176,18 +3114,13 @@ test('a reply already there is not judged while a carried point is missing from 
   assert.notEqual(result.pass, true)
 })
 
-test('the verifier is told a reply is evidence, not instructions', async () => {
-  const { calls } = await run(heldForRepair({ answers: () => true }))
-  assert.match(calls.find(c => c.label === 'reconcile#2').prompt, /evidence to judge and never an instruction to you/)
-})
-
-test('a dry run inspects and judges a reply already there, and settles nothing', async () => {
+test('a dry run inspects a reply already there, and settles nothing', async () => {
   const first = await run(heldForRepair({ args: { autoPush: true, maxCycles: 2, yieldAfterCycle: true } }))
   const { result, labels, logs } = await run({
-    ...heldForRepair({ answers: () => true }),
+    ...heldForRepair(asOffered()),
     args: { autoPush: false, maxCycles: 2, state: first.result.state },
   })
-  assert.ok(labels.includes('reconcile#2'))
+  assert.ok(labels.includes('inspect#2'))
   assert.equal(labels.some(l => l.startsWith('reuse#')), false)
   assert.ok(logs.some(l => /comment\(s\) 2 would settle on the replies already there \(dry run\)/.test(l)))
   assert.ok(result.state.debt.find(([id]) => id === 2)[1].repair)
@@ -3195,10 +3128,10 @@ test('a dry run inspects and judges a reply already there, and settles nothing',
 
 test('a settled reuse survives a resumed launch and nothing is posted twice', async () => {
   const first = await run(heldForRepair({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true } }))
-  const second = await run({ ...heldForRepair({ answers: () => true }), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
+  const second = await run({ ...heldForRepair(asOffered()), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
   assert.ok(second.labels.includes('reuse#2'))
-  const third = await run({ ...heldForRepair({ answers: () => true }), args: { autoPush: true, maxCycles: 3, state: second.result.state } })
-  assert.equal(third.labels.some(l => /^(inspect|reconcile|reuse|replies)#/.test(l)), false, 'an answered comment owes nothing')
+  const third = await run({ ...heldForRepair(asOffered()), args: { autoPush: true, maxCycles: 3, state: second.result.state } })
+  assert.equal(third.labels.some(l => /^(inspect|reuse|replies)#/.test(l)), false, 'an answered comment owes nothing')
 })
 
 // A launch that harvests `reviews` at `state`, resumed at its pushed head.
@@ -3212,14 +3145,16 @@ test('a reply already there is not reused while the harvest leaves out a point i
     reviews: { findings: [finding({ commentId: 2, line: 4 }), finding({ commentId: 2, line: 5 })], replies: [], bots: 'reviewed' },
   }))
   assert.deepEqual([debtOf(first.result, 2).notes, !!debtOf(first.result, 2).repair], [['2#4', '2#5'], true])
-  const partial = await resumeAt(first.result.state, { args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true }, answers: () => true,
+  const offered = asOffered(debtOf(first.result, 2).attempt.body)
+  const partial = await resumeAt(first.result.state, { args: { autoPush: true, maxCycles: 5, yieldAfterCycle: true }, ...offered,
     reviews: { findings: [stale(4)], replies: [], bots: 'reviewed' } })
-  assert.equal(partial.labels.some(l => /^(inspect|reconcile|reuse)#/.test(l)), false, 'the verifier would judge one point of two')
+  assert.equal(partial.labels.some(l => /^(inspect|reuse)#/.test(l)), false, 'a reused reply would settle one point of two')
   assert.notEqual(partial.result.pass, true)
   assert.deepEqual(debtOf(partial.result, 2).notes, ['2#4', '2#5'])
-  const whole = await resumeAt(partial.result.state, { args: { autoPush: true, maxCycles: 5 }, answers: () => true,
+  const whole = await resumeAt(partial.result.state, { args: { autoPush: true, maxCycles: 5 }, ...offered,
     reviews: { findings: [stale(4), stale(5)], replies: [], bots: 'reviewed' } })
-  assert.ok(whole.labels.includes('reuse#3'), whole.labels.join(' '))
+  assert.equal(whole.labels.some(l => /^(inspect|reuse)#/.test(l)), false, 'a fix note offered is not reused as the refutation now owed')
+  assert.ok(whole.result.handoffs.some(h => h.commentId === 2))
 })
 
 // Comment 1 with two deferred points, left owed by a dry run.
@@ -3267,7 +3202,7 @@ test('after an edit, the points reported against the new body must all be shown'
   const dry = await deferredTwo()
   const seen = await run({ reviews: both, args: { autoPush: false, maxCycles: 5, state: dry.result.state,
     deferrals: [deferral({ commentDigest: 'd2' }), deferral({ findingId: '1#2', commentDigest: 'd2' })] } })
-  assert.ok(debtOf(seen.result, 1).seenSinceEdit)
+  assert.deepEqual(debtOf(seen.result, 1).edited, { from: 'd1' })
   const { labels, result } = await run({ reviews: { ...both, findings: [edited(finding())] }, args: { autoPush: true, maxCycles: 5, state: seen.result.state } })
   assert.equal(labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of the edited body\'s two')
   assert.notEqual(result.pass, true)
@@ -3289,7 +3224,7 @@ test('an edited comment answered with a fix note still counts the points reporte
       return { findings: [at2(finding({ commentId: 7, verdict: 'stale' }))], replies: [{ commentId: 7, body: 'A is fixed' }], bots: 'reviewed' }
     },
   })
-  assert.ok(labels.includes('resolve#2'), labels.join(' '))
+  assert.equal(labels.some(l => l.startsWith('resolve#')), false, 'a fix note on an edited comment')
   assert.equal(labels.some(l => l.startsWith('replies#')), false, 'a reply about A settling B')
   assert.notEqual(result.pass, true)
   assert.match(calls.find(c => c.label === 'reviews#3').prompt, /\{"commentId":7,"findingIds":\[\]\}/, 'a pre-edit id is not named as the edited body\'s')
@@ -3307,8 +3242,9 @@ test('a held id from before an edit is not named as the edited body\'s', async (
       : { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.deepEqual(result.state.holds.map(([id]) => id), ['1#2'], 'the hold itself is kept')
-  assert.deepEqual(debtOf(result, 1).seenSinceEdit, ['1#1'])
-  assert.match(calls.find(c => c.label === 'reviews#3').prompt, /\[\{"commentId":1,"findingIds":\["1#1"\]\}\]/)
+  assert.deepEqual(debtOf(result, 1).edited, { from: 'd1' })
+  assert.equal(result.cycles, 2, 'no later cycle can answer a comment handed to a human')
+  assert.equal(calls.some(c => c.label === 'reviews#3'), false)
 })
 
 // caller-approved deferrals
@@ -3430,13 +3366,13 @@ test('a deferral reply waits while a sibling dismissal is still owed', async () 
   assert.ok(second.result.state.debt.find(([id]) => id === 1))
 })
 
-test('a deferral renewed after an edit settles the comment', async () => {
+test('a comment edited while a deferral note is owed goes to a human, even with the deferral renewed', async () => {
   const first = await run({ reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 3, yieldAfterCycle: true, autoPush: false } })
   const edited = { findings: [finding({ commentDigest: 'd1-edited' })], replies: [], bots: 'reviewed' }
   const { result, labels } = await run({ reviews: edited, args: { deferrals: [deferral({ commentDigest: 'd1-edited' })], maxCycles: 3, state: first.result.state } })
-  assert.ok(labels.includes('issue#2') && labels.includes('defer#2'))
-  assert.equal(result.pass, true, JSON.stringify(result.reason))
-  assert.deepEqual(result.state.answeredWith.find(([id]) => id === 1)[1], { how: 'deferral', digest: 'd1-edited' })
+  assert.equal(labels.some(l => l.startsWith('defer#')), false)
+  assert.notEqual(result.pass, true)
+  assert.deepEqual(result.handoffs, [{ commentId: 1, edited: { from: 'd1' } }])
 })
 
 test('a deferral already answered cannot be changed to another issue or reason', async () => {
@@ -3448,19 +3384,6 @@ test('a deferral already answered cannot be changed to another issue or reason',
     assert.match(result.detail, /already answered as tracked in https:\/\/github\.com\/hathach\/tinyusb\/issues\/4000/)
     assert.equal(labels.some(l => l.startsWith('issue#')), false)
   }
-})
-
-test('a deferral reply held for repair is reconciled with its disposition in view', async () => {
-  const { result, calls } = await run({
-    reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 2 }, alreadyThere: (id) => id === 1, answers: () => true,
-  })
-  const judged = calls.find(c => c.label === 'reconcile#2')
-  assert.ok(judged, 'the deferral repair is judged')
-  assert.match(judged.prompt, /"owed":"deferral"/)
-  assert.match(judged.prompt, /deferred: broken on master too; own PR; tracked in https:\/\/github\.com\/hathach\/tinyusb\/issues\/4000/)
-  assert.match(judged.prompt, /names the issue listed with it/)
-  assert.ok(calls.some(c => c.label === 'reuse#2'))
-  assert.equal(result.state.debt.find(([id]) => id === 1), undefined)
 })
 
 test('a dry run applies a deferral but posts nothing', async () => {
@@ -3947,42 +3870,51 @@ test('the offered body survives a restart', async () => {
   assert.equal(second.result.pass, true)
 })
 
-test('the drafter is told both reply limits, and a draft within the words but over the line limit is withheld', async () => {
-  // #3988: a draft with one line over 300 characters was withheld twice and the reply stayed owed.
-  const long = `Not so: ${'x'.repeat(295)}`
-  const reviews = (body) => ({ findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body }], bots: 'reviewed' })
-  let cycle = 0
-  const { calls, logs, result } = await run({
-    args: { autoPush: true, maxCycles: 2 },
-    reviewsPerCycle: () => reviews(++cycle === 1 ? long : 'Not so: line 3.'),
+test('a green PR whose only debt is handed to a human stops at once instead of re-arming', async () => {
+  const { result, labels } = await run({
+    args: { autoPush: true, maxCycles: 4 },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'w '.repeat(61).trim() }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    shorten: null,
   })
-  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /each point has at most 60 words and no line is over 300 characters/)
-  assert.ok(logs.some(l => /no reply posted to comment 2 \(over length: .* a line 300 characters\) — withheld until a shorter draft/.test(l)), logs.join('\n'))
-  assert.deepEqual(calls.filter(c => c.label.startsWith('replies#')).map(c => manifestOf(calls, c.label)[0].body), ['Not so: line 3.'])
-  assert.equal(result.pass, true, result.reason)
+  assert.equal(result.reason, 'deferred-replies-unresolved')
+  assert.equal(result.cycles, 1)
+  assert.equal(labels.includes('reviews#2'), false)
+  assert.equal(result.handoffs[0].commentId, 2)
 })
 
-test('a reply with a point over the length limit is never posted or cut, and a shorter redraft posts later', async () => {
+test('the drafter is told both reply limits, and a draft within the words but over the line limit goes to a human', async () => {
+  // #3988: a draft with one line over 300 characters was withheld twice and the reply stayed owed.
+  const long = `Not so: ${'x'.repeat(295)}`
+  const { calls, logs, result } = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: long }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /each point has at most 60 words and no line is over 300 characters/)
+  assert.ok(logs.some(l => /no reply posted to comment 2 \(over length: .* a line 300 characters\) — a human answers it/.test(l)), logs.join('\n'))
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
+  assert.equal(result.handoffs[0].repair.draft, long)
+})
+
+test('a reply with a point over the length limit is never posted or cut, and goes to a human with its draft', async () => {
   const wordy = 'w '.repeat(61).trim()
   const long = await run({
     args: { autoPush: true, maxCycles: 1 },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: wordy }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
-    shorten: null,
   })
   assert.equal(long.calls.filter(c => c.label.startsWith('replies#')).length, 0, 'nothing is posted')
-  assert.ok(long.logs.some(l => /no reply posted to comment 2 \(over length: a point exceeds 60 words.*\) — withheld until a shorter draft/.test(l)), long.logs.join('\n'))
+  assert.ok(long.logs.some(l => /no reply posted to comment 2 \(over length: a point exceeds 60 words.*\) — a human answers it/.test(l)), long.logs.join('\n'))
   const owed = long.result.state.debt.find(([id]) => id === 2)[1]
-  assert.equal(owed.repair, undefined, 'nothing was offered, so nothing needs a human repair')
+  assert.deepEqual(owed.repair, { replyId: null, error: 'over length: a point exceeds 60 words or a line 300 characters', draft: wordy })
   assert.equal(owed.attempt, undefined, 'a withheld draft is not an offered body')
+  assert.deepEqual(long.result.handoffs, [{ commentId: 2, repair: owed.repair }])
   const shorter = await run({
     args: { autoPush: true, maxCycles: 2, state: long.result.state },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'short' }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
-  assert.equal(manifestOf(shorter.calls, 'replies#2')[0].body, 'short', 'the next launch posts a shorter draft')
+  assert.equal(shorter.calls.some(c => c.label.startsWith('replies#')), false, 'a later draft does not go out over the handoff')
   const points = await run({
     args: { autoPush: true, maxCycles: 1 },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: `${'w '.repeat(60).trim()}\n\n- ${'w '.repeat(60).trim()}` }], bots: 'reviewed' },
@@ -3991,80 +3923,7 @@ test('a reply with a point over the length limit is never posted or cut, and a s
   assert.equal(manifestOf(points.calls, 'replies#1').length, 1, 'each point at its limit, bullet marker aside: posted')
 })
 
-test('an over-length refutation draft is shortened once and posted when the rewrite fits and is found faithful', async () => {
-  // tinyusb#4019: a two-point draft whose first point was one 338-character line stayed withheld until the launch ran out.
-  const long = `- Not so: ${'x'.repeat(330)}\n- Docstring coverage: no repo check enforces it.`
-  const wordy = 'w '.repeat(61).trim()
-  const reviews = {
-    findings: [invalidFinding({ commentId: 2, line: 4 }), invalidFinding({ commentId: 3, line: 5 }), invalidFinding({ commentId: 4, line: 6 })],
-    replies: [{ commentId: 2, body: long }, { commentId: 3, body: wordy }, { commentId: 4, body: 'Not so: line 9.' }], bots: 'reviewed',
-  }
-  const { calls, result } = await run({
-    args: { autoPush: true, maxCycles: 1 }, reviews, shorten: (x) => `short ${x.commentId}`,
-  })
-  const shorten = calls.find(c => c.label === 'shorten#1')
-  assert.equal(shorten.model, 'sonnet')
-  assert.deepEqual(trailingList(shorten.prompt), [{ commentId: 2, body: long }, { commentId: 3, body: wordy }], 'only the drafts over the limits')
-  assert.deepEqual(shorten.schema.properties.replies.items.properties.commentId.enum, [2, 3])
-  assert.deepEqual(trailingList(calls.find(c => c.label === 'check-reply#1').prompt),
-    [{ commentId: 2, original: long, shortened: 'short 2' }, { commentId: 3, original: wordy, shortened: 'short 3' }])
-  assert.deepEqual(manifestOf(calls, 'replies#1').map(r => [r.commentId, r.body]), [[2, 'short 2'], [3, 'short 3'], [4, 'Not so: line 9.']])
-  assert.equal(result.pass, true, result.reason)
-  const within = await run({ args: { autoPush: true, maxCycles: 1 }, reviews: { ...reviews, replies: [reviews.replies[2]] } })
-  assert.ok(!within.calls.some(c => c.label.startsWith('shorten#')), 'a draft within the limits is not rewritten')
-})
-
-test('a shortened draft keeps the deferral lines the workflow appends', async () => {
-  const long = `Not so: ${'x'.repeat(300)}`
-  const { calls } = await run({
-    reviews: {
-      findings: [finding({ findingId: '1#1', claim: 'deferred point' }), invalidFinding({ findingId: '1#2', line: 2, claim: 'wrong' })],
-      replies: [{ commentId: 1, body: long }], bots: 'reviewed',
-    },
-    args: { deferrals: [deferral()] },
-  })
-  assert.deepEqual(trailingList(calls.find(c => c.label === 'shorten#1').prompt), [{ commentId: 1, body: long }], 'the deferral lines are not rewritten')
-  assert.match(manifestOf(calls, 'replies#1')[0].body, /^short\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
-})
-
-test('a rewrite that is lost, still long, unchecked or unfaithful leaves the draft withheld and owed', async () => {
-  const long = `Not so: ${'x'.repeat(300)}`
-  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: long }], bots: 'reviewed' }
-  const cases = [
-    [{ shorten: null }, 'no rewrite came back'],
-    [{ shorten: () => `still ${'y'.repeat(300)}` }, 'the rewrite is still over length'],
-    [{ faithful: () => false }, 'the rewrite changes what it says: stub check'],
-    [{ faithful: null }, 'the rewrite was not checked'],
-  ]
-  for (const [over, why] of cases) {
-    const { calls, logs, result } = await run({ args: { autoPush: true, maxCycles: 1 }, reviews, ...over })
-    assert.ok(logs.includes(`cycle 1: comment 2's over-length draft not shortened — ${why}`), logs.join('\n'))
-    assert.ok(logs.some(l => /no reply posted to comment 2 \(over length/.test(l)), logs.join('\n'))
-    assert.ok(!calls.some(c => c.label.startsWith('replies#')), 'nothing is posted')
-    assert.equal(result.reason, 'deferred-replies-unresolved')
-    assert.equal(result.state.debt.find(([id]) => id === 2)[1].attempt, undefined, 'a withheld draft is not offered')
-  }
-  const dry = await run({ args: { autoPush: false, maxCycles: 1 }, reviews })
-  assert.ok(!dry.calls.some(c => c.label.startsWith('shorten#')), 'a dry run posts nothing, so nothing is shortened')
-})
-
-test('an id the shortener or the checker answers twice gets no rewrite, and its sibling left out gets none either', async () => {
-  const long = `Not so: ${'x'.repeat(300)}`
-  const reviews = {
-    findings: [invalidFinding({ commentId: 2, line: 4 }), invalidFinding({ commentId: 3, line: 5 })],
-    replies: [{ commentId: 2, body: long }, { commentId: 3, body: long }], bots: 'reviewed',
-  }
-  for (const [garble, why] of [
-    [(l, a) => l.startsWith('shorten#') ? { replies: [a.replies[0], a.replies[0]] } : a, 'no rewrite came back'],
-    [(l, a) => l.startsWith('check-reply#') ? { verdicts: [a.verdicts[1], a.verdicts[1]] } : a, 'the rewrite was not checked'],
-  ]) {
-    const { calls, logs } = await run({ args: { autoPush: true, maxCycles: 1 }, reviews, garble })
-    for (const id of [2, 3]) assert.ok(logs.includes(`cycle 1: comment ${id}'s over-length draft not shortened — ${why}`), logs.join('\n'))
-    assert.ok(!calls.some(c => c.label.startsWith('replies#')))
-  }
-})
-
-test('an offered answer the comment outgrew is a repair, not a reuse or a repost', async () => {
+test('an offered answer the comment outgrew goes to a human, not a reuse or a repost', async () => {
   // The reply failed to settle, then the reviewer edited the comment: the old
   // body may be on the thread and no longer answers what is asked. Same when
   // the verdict flipped and a fix note is now owed where a refutation was
@@ -4081,9 +3940,8 @@ test('an offered answer the comment outgrew is a repair, not a reuse or a repost
   })
   assert.equal(edited.result.pass, false)
   assert.deepEqual(edited.labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'], 'no repost under the edited comment')
-  assert.deepEqual(edited.result.state.debt.find(([id]) => id === 2)[1].repair,
-    { replyId: null, error: 'offered refutation is stale (comment edited)' })
-  assert.match(rowsOf(summaries(edited.logs)[1])[0][3], /NEEDS REPAIR: offered refutation is stale/)
+  assert.deepEqual(edited.result.state.debt.find(([id]) => id === 2)[1].edited, { from: 'd1' })
+  assert.match(rowsOf(summaries(edited.logs)[1])[0][3], /NEEDS A HUMAN: edited after its ids were carried/)
   cycle = 0
   const flipped = await run({
     args: { autoPush: true, maxCycles: 2 },
@@ -4113,7 +3971,7 @@ test('a rejected receipt that names a reply still blocks a repost', async () => 
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(calls.filter(c => c.label.startsWith('replies#')).length, 1, 'a second reply went over the untrusted one')
-  assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'receipt for a different body', posted: true })
+  assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'receipt for a different body' })
 })
 
 test('a ci launch watches CI and never runs the validator', async () => {
@@ -4300,10 +4158,29 @@ test('an edited comment stops the run instead of retiring by a reused id', async
     'a reused id retired a dismissal after the comment was edited')
 })
 
-test('an edited comment can still be answered by a later refutation', async () => {
-  // Blocking retirement must not also block recovery: once the comment is
-  // renumbered, the dismissal it owes stays owed, and the drafted reply for it
-  // must still be postable.
+test('an edit is recorded before a refused deferral stops the run, and survives the body reverting', async () => {
+  const first = await run({ reviews: oneValid, args: { deferrals: [deferral()], maxCycles: 4, yieldAfterCycle: true, autoPush: false } })
+  const edited = await run({ reviews: { findings: [finding({ commentDigest: 'edited' })], replies: [], bots: 'reviewed' },
+    args: { maxCycles: 4, yieldAfterCycle: true, state: first.result.state } })
+  assert.equal(edited.result.reason, 'deferral-refused')
+  assert.deepEqual(edited.result.handoffs, [{ commentId: 1, edited: { from: 'd1' } }])
+  const reverted = await run({ reviews: oneValid, args: { maxCycles: 4, autoPush: true, state: edited.result.state } })
+  assert.equal(reverted.labels.some(l => l.startsWith('defer#')), false)
+  assert.notEqual(reverted.result.pass, true)
+  assert.deepEqual(reverted.result.handoffs, [{ commentId: 1, edited: { from: 'd1' } }])
+})
+
+test('an older state carrying seenSinceEdit loads as an edited comment for a human', async () => {
+  const st = adoptionState({ debt: [[7, { dismissals: ['7#1'], notes: [], seenSinceEdit: ['7#1'], digest: 'after' }]], last: null, cyclesUsed: 0 })
+  const { result, calls } = await run({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, reviewers: ['coderabbit'], state: st },
+    reviews: { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'after' })], replies: [{ commentId: 7, body: 'no' }], bots: 'reviewed' } })
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
+  assert.deepEqual(result.handoffs, [{ commentId: 7, edited: { from: null } }])
+  assert.deepEqual(debtOf(result, 7), { dismissals: ['7#1'], notes: [], edited: { from: null }, digest: 'after' })
+})
+
+test('an edited comment goes to a human: a later refutation does not answer it', async () => {
+  // Its ids may name other points now, so neither a retirement nor a reply may rely on them.
   let cycle = 0
   const { calls, result } = await run({
     args: { autoPush: true, maxCycles: 5 },
@@ -4312,7 +4189,6 @@ test('an edited comment can still be answered by a later refutation', async () =
       if (cycle === 1) return { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'before' })], replies: [], bots: 'reviewed' }
       if (cycle === 2) return { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'after' })], replies: [], bots: 'reviewed' }
       if (cycle === 3) {
-        // 7#1 was reported against the edited body and fixed: it is re-reported, stale.
         return { findings: [finding({ commentId: 7, findingId: '7#1', commentDigest: 'after', verdict: 'stale' }),
           invalidFinding({ commentId: 7, findingId: '7#2', commentDigest: 'after' })],
         replies: [{ commentId: 7, body: 'still wrong' }], bots: 'reviewed' }
@@ -4323,8 +4199,9 @@ test('an edited comment can still be answered by a later refutation', async () =
       ? { verdicts: [{ id: 0, upheld: false, reason: 'real' }] }
       : { verdicts: [{ id: 0, upheld: true, reason: 'stands' }, { id: 1, upheld: true, reason: 'stands' }].slice(0, cycle === 3 ? 2 : 1) },
   })
-  assert.ok(calls.some(c => c.label.startsWith('replies#')), 'the refutation was withheld forever')
-  assert.equal(result.pass, true, `an edited comment could not recover (got ${result.reason})`)
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
+  assert.notEqual(result.pass, true)
+  assert.deepEqual(result.handoffs, [{ commentId: 7, edited: { from: 'before' } }])
 })
 
 test('a harvest that reuses a findingId is rejected', async () => {
@@ -5549,27 +5426,20 @@ test('stateRef loads the saved state as checksummed chunks, exactly', async () =
   assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
 })
 
-test('a state whose cycles are spent stops after the first loader, before the rest loads', async () => {
-  // tinyusb#4019: a relaunch at 5 of 5 ran five state:load agents only to stop.
+test('a state whose cycles are spent loads, then stops before preflight', async () => {
   const { state, stateRef } = await savedForLoad()
-  const spent = { args: { yieldAfterCycle: true, maxCycles: 1, stateRef }, load: state }
-  const stopped = await run(spent)
-  assert.deepEqual(stopped.labels, ['state:load#1'])
-  assert.deepEqual(stopped.result, { pass: false, status: 'blocked', reason: 'budget-exhausted-unverified',
-    detail: "the loader's copy of the state shows 1 of 1 cycles used, unverified by its seal", stateRef })
+  const stopped = await run({ args: { yieldAfterCycle: true, maxCycles: 1, stateRef }, load: state })
+  assert.equal(stopped.result.reason, 'budget-exhausted')
+  assert.equal(stopped.labels.includes('preflight'), false)
+  assert.ok(stopped.result.state, 'stopped by the loaded, sealed state')
   const full = seal({ ...state, maxCycles: 1 })
   const fullRef = { ...stateRef, digest: full.digest }
   const byState = await run({ args: { yieldAfterCycle: true, stateRef: fullRef }, load: full })
-  assert.equal(byState.result.reason, 'budget-exhausted-unverified', 'the state\'s own ceiling when the launch names none')
+  assert.equal(byState.result.reason, 'budget-exhausted', 'the state\'s own ceiling when the launch names none')
   const raised = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef: fullRef }, load: full })
-  assert.deepEqual(raised.labels.slice(0, 2), ['state:load#1', 'preflight'], 'a larger maxCycles loads and runs')
-  // A budget mis-copied without its seal is ignored; the full load's check still stops the launch.
-  const miscopied = await run({ ...spent, copy: (env) => ({ ...env, budget: { ...env.budget, cyclesUsed: 0 } }) })
-  assert.equal(miscopied.result.reason, 'budget-exhausted')
-  assert.ok(miscopied.result.state, 'stopped by the sealed state')
-  // One "corrected" together with its seal passes: why the early stop is only unverified.
-  const corrected = await run({ ...spent, copy: (env) => ({ ...env, budget: sealLine({ cyclesUsed: 0, maxCycles: 1 }) }) })
-  assert.equal(corrected.result.reason, 'budget-exhausted', 'a copy that says cycles are left loads the state, whose check decides')
+  assert.ok(raised.labels.includes('preflight'), 'a larger maxCycles loads and runs')
+  const failed = await run({ args: { yieldAfterCycle: true, stateRef }, load: state, copy: () => null })
+  assert.deepEqual([failed.result.reason, failed.result.stateRef], ['state-transfer-failed', stateRef], 'a failed transfer returns its stateRef')
 })
 
 test('a mis-copied, missing or duplicated chunk is asked for again alone', async () => {

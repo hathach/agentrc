@@ -163,8 +163,9 @@ class LaunchResultTest(unittest.TestCase):
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
+        historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced
         self.assertFalse(handled_elsewhere & set(launch_result.REFUSED))
-        self.assertEqual(reasons, handled_elsewhere | set(launch_result.REFUSED),
+        self.assertEqual(reasons, handled_elsewhere | (set(launch_result.REFUSED) - historical),
                          'a stop reason was added or renamed: give it a REFUSED response or name it here')
 
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):
@@ -202,6 +203,19 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['receipts']['pushes'][0]['detail'], 'push died' + ' z' * 200, 'a push receipt is never cut')
         self.assertEqual(s['receipts']['replies'][0], {'batch': 'refutedPosts', 'findingVerdicts': [], 'commentId': 9, 'kind': 'review', 'sent': True,
                                                        'posted': True, 'verified': False, 'error': None})
+
+    def test_a_comment_only_a_human_can_answer_is_a_blocker(self):
+        data = output()
+        data['result']['handoffs'] = [
+            {'commentId': 5, 'edited': {'from': 'd5'}},
+            {'commentId': 6, 'repair': {'replyId': 66, 'error': 'read-back mismatch'}},
+            {'commentId': 7, 'repair': {'replyId': None, 'error': 'over length', 'draft': 'a long draft'}}]
+        _, s = self.run_it(data)
+        self.assertEqual([b for b in s['blockers'] if 'needs a human answer' in b], [
+            'comment 5 needs a human answer, which a relaunch does not give: edited after its finding ids were carried',
+            'comment 6 needs a human answer, which a relaunch does not give: reply 66 has the wrong body (read-back mismatch); '
+            'it settles only if it is the offered body word for word',
+            'comment 7 needs a human answer, which a relaunch does not give: over length; draft: a long draft'])
 
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [
