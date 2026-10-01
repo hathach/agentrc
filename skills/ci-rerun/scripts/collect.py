@@ -23,8 +23,10 @@ object, 1 with `error` set (a gh failure, or the PR head is no longer --head),
 
 failures: for each --check (an inventory link), reads the failure and writes
 the evidence for a judge to <tmp>/ci-collect/<repo>/<pr>/<head>/failures-<ns>.json,
-one file per call, and prints {head, detail, error}. Each check's entry holds
-its saved `log` and the diagnostic lines of every step that reported an error.
+one file per call, and prints {head, detail, gates, bases, error}, `bases` each
+--check's `base` as "runId:jobId:conclusion" (null without one); the bases
+command prints {head, bases, error}, the same tokens, reading no log. Each
+check's entry holds its saved `log` and the diagnostic lines of every step that reported an error.
 The log is the job's whole log without ANSI codes, NULs and timestamps for an
 Actions job, but only tails for the others: the last 150 lines of each failed
 CircleCI step and Read the Docs' notes with 40-line tails of failed commands.
@@ -64,10 +66,10 @@ again after the gates too.
 
 remember: stores a judge's verdicts for the head beside its evidence, so a
 later launch recalls them instead of carrying them in its state. It reads a
-JSON list of {link, bucket, failures} on stdin, each replacing any stored entry
+JSON list on stdin of {link, bucket, failures}, each replacing any stored entry
 for the same link, or {link, bucket, patch}, whose failures each replace the one
 failure of the stored entry, same bucket, with the same workflow, job, cell and
-signature; it stores all of them or, on any mismatch, none, and prints {head, error}. recall prints {head, verdicts, left, error}:
+signature. It stores all of them or, on any mismatch, none, and prints {head, error}. recall prints {head, verdicts, left, error}:
 the stored entries for the --check links it has, unchanged and in the order
 asked, while the printed line stays within RECALL_BYTES, the most a relaying
 agent is trusted to copy whole. `left` lists the links held back for room, each
@@ -246,8 +248,8 @@ def remember(repo, pr, head, text):
         raise Failed(f'verdicts on stdin: {e}')
     if not (isinstance(entries, list) and all(isinstance(e, dict) and sorted(e) in (['bucket', 'failures', 'link'], ['bucket', 'link', 'patch']) and
                                               isinstance(e['link'], str) and isinstance(e['bucket'], str) and
-                                              isinstance(e.get('failures', e.get('patch')), list) and
-                                              all(isinstance(f, dict) for f in e.get('failures', e.get('patch'))) for e in entries)):
+                                              isinstance(fs := e.get('failures', e.get('patch')), list) and
+                                              all(isinstance(f, dict) for f in fs) for e in entries)):
         raise Failed('verdicts on stdin must be a list of {link, bucket, failures} or {link, bucket, patch}')
     folder = evidence_dir(repo, pr, head)
     stored = stored_verdicts(folder)
@@ -627,12 +629,40 @@ def failures(repo, pr, head, links, gates=()):
             raise Failed(f'PR #{pr} head moved to {after} while collecting')
     detail = folder / f'failures-{time.time_ns()}.json'
     detail.write_text(json.dumps({**out, 'checks': checks}, indent=1))
-    return {'head': head, 'detail': str(detail), 'gates': read}
+    return {'head': head, 'detail': str(detail), 'gates': read,
+            'bases': [{'link': c['link'], 'base': base_token(c.get('base'))} for c in checks]}
+
+
+def base_token(base):
+    return f"{base['runId']}:{base['jobId']}:{base['conclusion']}" if base else None
+
+
+def bases(repo, pr, head, links):
+    """Each --check's base job token as `failures` prints it, without reading a log."""
+    now = inventory(repo, pr, head, 0)
+    failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
+    stale = [link for link in links if link not in failing]
+    if stale:
+        raise Failed('stale snapshot: no longer failing checks of the head: ' + ', '.join(stale))
+    cache, out = {}, []
+    for link in links:
+        kind, _, ident = (failing[link]['attempt'] or 'other:').partition(':')
+        base = None
+        if kind == 'actions':
+            record = gh('api', f'repos/{repo}/actions/jobs/{ident}')
+            if record.get('head_sha') != head:
+                raise Failed(f'job {ident} ran on {record.get("head_sha")}, not the head {head}')
+            base = base_run(repo, now['baseRef'], record.get('workflow_name', ''), record['name'], cache)
+        out.append({'link': link, 'base': base_token(base)})
+    after = pull(repo, pr)['headRefOid']
+    if after != head:
+        raise Failed(f'PR #{pr} head moved to {after} while collecting')
+    return {'head': head, 'bases': out}
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('command', choices=['inventory', 'failures', 'remember', 'recall'])
+    p.add_argument('command', choices=['inventory', 'failures', 'bases', 'remember', 'recall'])
     p.add_argument('--repo', required=True, help='OWNER/NAME of the repository that owns the PR number')
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True, help='the head SHA the caller expects')
@@ -645,8 +675,8 @@ def main(argv=None):
         p.error('--offset is for recall with exactly one --check')
     if a.gate and a.command != 'failures':
         p.error('--gate is for failures')
-    if (a.command in ('failures', 'recall')) != bool(a.check or a.gate):
-        p.error('--check is for failures and recall, which need at least one (failures: a --check or a --gate)')
+    if (a.command in ('failures', 'bases', 'recall')) != bool(a.check or a.gate):
+        p.error('--check is for failures, bases and recall, which need at least one (failures: a --check or a --gate)')
     if len({*a.check, *a.gate}) != len(a.check) + len(a.gate):
         p.error('a link is given more than once')
     if not SHA.fullmatch(a.head):
@@ -656,6 +686,8 @@ def main(argv=None):
             out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)))
         elif a.command == 'failures':
             out = failures(a.repo, a.pr, a.head, a.check, a.gate)
+        elif a.command == 'bases':
+            out = bases(a.repo, a.pr, a.head, a.check)
         elif a.command == 'remember':
             out = remember(a.repo, a.pr, a.head, sys.stdin.read())
         else:

@@ -52,6 +52,8 @@ const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
 // The JSON a prompt ends with after `key: `, or its trailing list on a line of its own.
 const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`${key}: (\\{.*\\})$`))[1])
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
+// The workflow's failure identity.
+const failureKey = (f) => JSON.stringify([f.workflow, f.job, f.cell, f.signature])
 // The checks a CI judge prompt asks about.
 const askedOf = (prompt) => JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1])
 const manifestOf = (calls, label) => payloadOf(calls.find(c => c.label === label).prompt, 'Manifest').replies
@@ -224,9 +226,11 @@ async function run(opts = {}) {
       // head and link that a relaunch shares with the launch before it.
       const text = String(prompt)
       const key = (link) => `${head} ${link}`
+      const links = [...text.matchAll(/--check '([^']*)'/g)].map(m => m[1])
+      // opts.base: each --check's base job, 'b1' by default, or a function of the call's label and the link.
+      const baseOf = (link) => typeof opts.base === 'function' ? opts.base(label, link) : opts.base === undefined ? 'b1' : opts.base
       let answer
       if (/ recall /.test(text)) {
-        const links = [...text.matchAll(/--check '([^']*)'/g)].map(m => m[1])
         // opts.held: the page starts of each link collect.py holds back, its verdict too large for the line.
         const offset = text.match(/ --offset (\d+) /)?.[1]
         if (offset !== undefined) {
@@ -238,13 +242,15 @@ async function run(opts = {}) {
         }
         if (opts.recall) answer = opts.recall(answer, text)
       } else if (/ remember /.test(text)) {
-        // A patch replaces the stored failures of its keys, as collect.py does.
-        const fk = (f) => JSON.stringify([f.workflow, f.job, f.cell, f.signature])
+        // A patch replaces the stored failures of its keys; the stub refuses no patch.
         for (const v of trailingList(text)) {
-          store.set(key(v.link), v.patch ? { ...store.get(key(v.link)), failures: store.get(key(v.link)).failures.map(f => v.patch.find(p => fk(p) === fk(f)) ?? f) } : v)
+          const old = store.get(key(v.link))
+          store.set(key(v.link), v.patch ? { ...old, failures: old.failures.map(f => v.patch.find(p => failureKey(p) === failureKey(f)) ?? f) } : v)
         }
         answer = { head, error: null }
         if (opts.remember) answer = opts.remember(answer, store)
+      } else if (/collect\.py bases /.test(text)) {
+        answer = { head, bases: links.map(link => ({ link, base: baseOf(link) })), error: null }
       } else if (/ inventory /.test(text)) {
         answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
       } else {
@@ -254,7 +260,7 @@ async function run(opts = {}) {
           const rf = ci.realFailures[failed.findIndex(c => c.link === m[1])]
           return { link: m[1], failures: [{ firstError: rf.firstError, signature: rf.firstError, complete: true }], ...rf.gate }
         })
-        answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', gates, error: null }
+        answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', gates, bases: links.map(link => ({ link, base: baseOf(link) })), error: null }
         if (opts.gates) answer = opts.gates(answer)
       }
       return answer === null ? null : conforms(options.schema, bare(answer), label)
@@ -1567,7 +1573,8 @@ test('a CI reply in the old rigSide shape is a dead watcher, never a fix', async
 test('a check the judge re-ran is settling until its re-run registers, and never re-run twice', async () => {
   const two = { status: 'red', infraRerun: ['35171132943'], realFailures: [UNPLACED, { ...UNPLACED, check: 'build / b' }] }
   const rerunFirst = j => ({ ...j, checks: [{ ...j.checks[0], failures: [] }, ...j.checks.slice(1)] })
-  const { calls, logs } = await run({ ci: two, judge: rerunFirst, args: { maxCycles: 2 } })
+  // a newer base run, so the unclassified check is judged again in cycle 2
+  const { calls, logs } = await run({ ci: two, judge: rerunFirst, args: { maxCycles: 2 }, base: (label) => label.startsWith('ci:collect#2') ? 'b2' : 'b1' })
   assert.doesNotMatch(calls.find(c => c.label === 'ci:judge#1').prompt, /Already re-run/)
   const second = calls.find(c => c.label === 'ci:judge#2').prompt
   assert.match(second, /\nAlready re-run on this head: \["ci \/ PVS-Studio \(raspberry_pi_pico\)"\]\./)
@@ -1646,15 +1653,15 @@ test('the evidence of every head is read without a prior head: collect.py finds 
   assert.deepEqual(Object.keys(older.result.state.ciCache).sort(), ['entries', 'reruns'])
 })
 
-test('the same head in a later cycle is not judged again, and an unclassified verdict always is', async () => {
+test('the same head in a later cycle is not judged again, and an unclassified verdict is once its base job changed', async () => {
   const within = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(within.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w', 'ci:collect#2.1'])
-  // an unclassified failure stops the launch at once; its relaunch reads it again
+  // an unclassified failure stops the launch at once; a relaunch after its base job changed reads it again
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   assert.equal(first.result.reason, 'ci-red-unclassified')
   assert.deepEqual(trailingList(first.calls.find(c => c.label === 'ci:collect#1.w').prompt).map(v => v.link), ['https://github.com/o/r/actions/runs/1/job/1', 'https://github.com/o/r/actions/runs/1/job/2'])
-  const { calls } = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
+  const { calls } = await run({ store, base: 'b2', args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG, UNPLACED).ci })
   const second = calls.find(c => c.label === 'ci:collect#2.f').prompt
   assert.doesNotMatch(second, /job\/1'/, 'the rig-side verdict is reused')
   assert.match(second, /job\/2'/, 'the unclassified one is read again')
@@ -1683,18 +1690,56 @@ test('a stored check with an unclassified failure is judged again for that failu
   assert.equal(settled.labels.includes('ci:judge#3'), false, 'then reused whole')
 })
 
+test('an unclassified failure is judged again only once ciNotes or its check\'s base run changed', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
+  assert.equal(first.result.state.ciCache.entries[0].placedWith, `${fnv1a('')}:b1`)
+  const same = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(same.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.b'], 'its base job looked up, no evidence read, no judge')
+  assert.ok(same.logs.some(l => /unclassified CI failures left as judged for hil \/ pico — ciNotes and base job unchanged/.test(l)))
+  assert.deepEqual(same.result.history.at(-1).ci.realFailures.map(f => [f.cell, f.verdict]), MIXED.map(f => [f.cell, f.verdict]))
+  assert.equal(same.result.reason, 'ci-red-unclassified')
+  for (const over of [{ args: { ciNotes: 'pico b is the probe' } }, { base: 'b2' }, { base: null }]) {
+    const again = await run({ store, ...over, args: { ...YIELD, state: first.result.state, ...over.args }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith([MIXED[1]]) })
+    assert.ok(again.labels.includes('ci:judge#2'), JSON.stringify(over))
+    assert.equal(again.labels.includes('ci:collect#2.b'), !over.args, 'new ciNotes need no base job lookup')
+    assert.equal(again.result.state.ciCache.entries[0].placedWith, `${fnv1a(over.args?.ciNotes ?? '')}:${over.base === undefined ? 'b1' : over.base}`, 'and records what it was judged with')
+  }
+  const placed = await run({ store, args: { ...YIELD, state: first.result.state, ciNotes: 'n' }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith([{ ...MIXED[1], verdict: 'rig-side' }]) })
+  assert.equal(placed.result.state.ciCache.entries[0].placedWith, undefined, 'nothing unclassified, nothing to record')
+  await assert.rejects(run({ args: { ...YIELD, state: seal({ ...first.result.state, ciCache: { ...first.result.state.ciCache, entries: [{ ...first.result.state.ciCache.entries[0], placedWith: 7 }] } }) } }), /not a pr-babysit state/)
+  // an unchanged check beside a newly failing one: only the new one is judged, and both are reported
+  const fresh = new Map()
+  const mixed = (await run({ store: fresh, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })).result.state
+  const beside = await run({ store: fresh, args: { ...YIELD, state: mixed }, reviews: WAITING, ci: redWith(RIG, RIG).ci })
+  assert.deepEqual(askedOf(judgePrompt(beside.calls, 2)).map(c => c.link), ['https://github.com/o/r/actions/runs/1/job/2'])
+  assert.deepEqual(beside.result.history.at(-1).ci.realFailures.map(f => f.cell), [...MIXED.map(f => f.cell), null])
+  // of two such checks, only the one whose base job changed is judged again
+  const two = new Map()
+  const both = (await run({ store: two, args: YIELD, reviews: WAITING, ci: redWith(RIG, RIG).ci, judge: judgeWith(MIXED) })).result.state
+  const moved = await run({ store: two, base: (label, link) => link.endsWith('job/2') ? 'b2' : 'b1', args: { ...YIELD, state: both }, reviews: WAITING, ci: redWith(RIG, RIG).ci, judge: judgeWith([MIXED[1]]) })
+  assert.deepEqual(askedOf(judgePrompt(moved.calls, 2)).map(c => c.link), ['https://github.com/o/r/actions/runs/1/job/2'])
+  // a read that was incomplete is judged again, the log may be readable now
+  const unread = [MIXED[0], { ...MIXED[1], complete: false }]
+  const kept = new Map()
+  const st = (await run({ store: kept, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(unread) })).result.state
+  const reread = await run({ store: kept, args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(unread) })
+  assert.ok(reread.labels.includes('ci:collect#2.r1'), 'recalled, then judged')
+  assert.ok(reread.labels.includes('ci:judge#2'))
+})
+
 test('a partly judged check answered with every failure is taken whole, and with anything else is judged whole again', async () => {
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
   const whole = [cellFailure('pico a', 'real'), cellFailure('pico b', 'rig-side'), cellFailure('pico c', 'rig-side'), cellFailure('pico d', 'rig-side')]
-  const listed = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(whole) })
+  const listed = await run({ store, base: 'b2', args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(whole) })
   assert.deepEqual(listed.result.history.at(-1).ci.realFailures.map(f => [f.cell, f.verdict]), whole.map(f => [f.cell, f.verdict]))
   for (const answer of [[cellFailure('pico d', 'rig-side')], [MIXED[1], MIXED[1]], [cellFailure('pico a', 'rig-side'), cellFailure('pico b', 'rig-side')],
     [{ ...MIXED[1], verdict: 'rig-side', complete: false }], [...MIXED, MIXED[0]]]) {
     const store = new Map()
     const st = (await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })).result.state
     // a second check, new on this launch, is judged in the same call
-    const odd = await run({ store, args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG, RIG).ci,
+    const odd = await run({ store, base: 'b2', args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG, RIG).ci,
       judge: (j) => ({ ...j, checks: j.checks.map((c, i) => i === 0 ? { ...c, failures: structuredClone(answer) } : c) }) })
     assert.ok(odd.logs.some(l => /answered hil \/ pico with neither its judgeOnly failures nor every failure/.test(l)), JSON.stringify(answer.map(f => f.cell)))
     assert.equal(odd.result.history.at(-1).ci, null, 'the cycle re-arms')
@@ -1708,7 +1753,7 @@ test('a partly judged check answered badly never passes on its stored failures, 
   const store = new Map()
   const acceptedFailures = MIXED.map(({ workflow, job, cell, signature }) => ({ workflow, job, cell, signature, reason: 'rig', scope: 'this PR' }))
   const st = (await run({ store, args: { ...YIELD, acceptedFailures }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })).result.state
-  const odd = await run({ store, args: { ...YIELD, acceptedFailures, state: st }, reviews: { findings: [], replies: [] }, ci: redWith(RIG).ci, judge: judgeWith([cellFailure('pico d', 'real')]) })
+  const odd = await run({ store, base: 'b2', args: { ...YIELD, acceptedFailures, state: st }, reviews: { findings: [], replies: [] }, ci: redWith(RIG).ci, judge: judgeWith([cellFailure('pico d', 'real')]) })
   assert.equal(odd.result.pass, false)
 })
 
@@ -1716,12 +1761,12 @@ test('a partial judgment needs a complete enumeration of distinct failures, and 
   for (const snapshot of [[MIXED[0], { ...MIXED[1], complete: false }], [MIXED[0], MIXED[0], MIXED[1]]]) {
     const store = new Map()
     const st = (await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(snapshot) })).result.state
-    const again = await run({ store, args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(snapshot) })
+    const again = await run({ store, base: 'b2', args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(snapshot) })
     assert.equal(askedOf(judgePrompt(again.calls, 2))[0].judgeOnly, undefined)
   }
   const store = new Map()
   const st = (await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })).result.state
-  const rerun = await run({ store, args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith([]) })
+  const rerun = await run({ store, base: 'b2', args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith([]) })
   assert.equal(rerun.result.history.at(-1).ci.status, 'running')
   assert.deepEqual(rerun.result.state.ciCache.reruns.map(r => r.sure), [true])
   assert.deepEqual(rerun.result.state.ciCache.entries, [], 'the re-run check\'s snapshot is dropped')

@@ -223,8 +223,10 @@ class FailuresTest(unittest.TestCase):
 
     def entries(self, *links):
         rc, r = self.main(*links)
-        self.assertEqual((rc, sorted(r), r['gates']), (0, ['detail', 'gates', 'head'], []), 'the evidence is in the detail file')
-        return json.loads(Path(r['detail']).read_text())['checks']
+        self.assertEqual((rc, sorted(r), r['gates']), (0, ['bases', 'detail', 'gates', 'head'], []), 'the evidence is in the detail file')
+        checks = json.loads(Path(r['detail']).read_text())['checks']
+        self.assertEqual(r['bases'], [{'link': c['link'], 'base': collect.base_token(c.get('base'))} for c in checks], 'each check\'s base job')
+        return checks
 
     def test_actions_evidence_is_the_failed_steps_diagnostics_with_the_base_runs_shared_lines(self):
         c = self.entries(JOB.format(3))[0]
@@ -378,6 +380,42 @@ class FailuresTest(unittest.TestCase):
         os.utime(collect.evidence_dir('o/r', 5, OTHER) / 'verdicts.json', (1, 1))
         self.assertEqual([[(p['head'], p['firstError']) for p in x] for x in self.cell_priors()], [[(newer, 'new')], [(OTHER, 'old')]],
                          'a head judged in part leaves the rest to an older one')
+
+    def test_a_base_job_rerun_in_the_same_run_is_another_base(self):
+        base = {'runId': 70, 'jobId': 40, 'conclusion': 'failure'}
+        tokens = [collect.base_token(b) for b in (base, {**base, 'jobId': 41}, {**base, 'conclusion': 'success'}, None)]
+        self.assertEqual(tokens, ['70:40:failure', '70:41:failure', '70:40:success', None])
+
+    def test_bases_prints_the_tokens_failures_prints_without_reading_a_log(self):
+        rc, r = self.main(JOB.format(3), RTD.format(9))
+        out = io.StringIO()
+        with mock.patch.object(collect, 'actions_log', side_effect=AssertionError('a log was read')), redirect_stdout(out):
+            rc = collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(3), '--check', RTD.format(9)])
+        self.assertEqual((rc, unsealed(out.getvalue())), (0, {'head': HEAD, 'bases': r['bases']}))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(99)]), 1)
+        self.assertIn('stale snapshot', json.loads(out.getvalue())['error'])
+
+    def test_bases_refuses_a_job_of_another_head_and_a_head_that_moved(self):
+        def bases():
+            out = io.StringIO()
+            with redirect_stdout(out):
+                rc = collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(3)])
+            return rc, json.loads(out.getvalue())['error']
+        self.jobs['3']['head_sha'] = OTHER
+        rc, error = bases()
+        self.assertEqual(rc, 1)
+        self.assertIn(f'ran on {OTHER}', error)
+        self.jobs['3']['head_sha'] = HEAD
+        pull, seen = collect.pull, []
+        def moving(repo, pr):
+            seen.append(pr)
+            return {**pull(repo, pr), **({'headRefOid': OTHER} if len(seen) > 2 else {})}
+        with mock.patch.object(collect, 'pull', moving):
+            rc, error = bases()
+        self.assertEqual((rc, len(seen)), (1, 3), 'read again after the base lookups')
+        self.assertIn(f'head moved to {OTHER}', error)
 
     def test_an_unreadable_store_of_another_head_is_named_and_left_out(self):
         judged = {'workflow': 'Build', 'check': 'hil (x.json)', 'cell': 'pico host/msc', 'signature': 'pico host/msc: Failed: src/host/msc.c timeout',

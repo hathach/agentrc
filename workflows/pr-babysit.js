@@ -94,6 +94,7 @@ if (!autoRun || autoRun.some(r => !reviewers.includes(r) || HARVEST_ONLY.include
 }
 const ciWait = args.ciWait ?? 30
 const ciNotes = args.ciNotes == null ? '' : String(args.ciNotes).trim()
+const notesDigest = fnv1a(ciNotes)
 if (!Number.isInteger(ciWait) || ciWait < 1) {
   throw new Error('ciWait must be a positive integer number of minutes')
 }
@@ -269,10 +270,12 @@ if (args.stateRef != null) {
 // it may have), and the digest of each verdict per check run, whose link names
 // the run. The verdicts themselves stay in collect.py's store beside the evidence,
 // which also shows a later head's judge the other heads' verdicts. An older state's
-// judgedHead is ignored.
+// judgedHead is ignored. `placedWith` is what a verdict with an unclassified failure
+// was judged with, `<ciNotes digest>:<base job>`.
 const ciCacheShaped = (c) => c && typeof c === 'object' &&
   Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
-  Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string'))
+  Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
+    (e.placedWith === undefined || typeof e.placedWith === 'string'))
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
 let restored = null
 if (args.state !== undefined && args.state !== null) {
@@ -366,11 +369,20 @@ const GATE = {
     },
   },
 }
+// `bases`: each --check's base job as `run:job:conclusion`, null without one.
 const EVIDENCE = withSeal({
-  type: 'object', required: ['head', 'detail', 'gates'],
+  type: 'object', required: ['head', 'detail', 'gates', 'bases'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' }, gates: { type: 'array', items: GATE },
+    bases: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, required: ['link', 'base'], properties: { link: { type: 'string' }, base: { type: ['string', 'null'] } } },
+    },
   },
+})
+const BASES = withSeal({
+  type: 'object', required: ['head', 'bases'],
+  properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, bases: EVIDENCE.properties.bases },
 })
 // A judged check's verdict as collect.py stores it, and its stored digests.
 const VERDICT = {
@@ -894,7 +906,7 @@ const noteRerun = (r) => {
 }
 // Verdicts by check link. Only a link naming its run is kept; an unclassified
 // failure in it, which a newer base run or the caller's ciNotes may still place,
-// is judged again. An entry holds its failures once judged or recalled.
+// is judged again once either changed. An entry holds its failures once judged or recalled.
 const ciVerdicts = new Map()
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
@@ -980,7 +992,7 @@ const stateOut = () => {
     ...(reanswer.size ? { reanswer: [...reanswer] } : {}),
     ciCache: {
       reruns: ciReruns.filter(r => r.head === expectedHead),
-      entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest }) => ({ head, link, bucket, digest })),
+      entries: [...ciVerdicts.values()].filter(e => e.head === expectedHead).map(({ head, link, bucket, digest, placedWith }) => ({ head, link, bucket, digest, ...(placedWith ? { placedWith } : {}) })),
     },
     debt: [...debt].map(([id, d]) => [id, { dismissals: [...d.dismissals], notes: [...d.notes], ...(d.seenSinceEdit ? { seenSinceEdit: [...d.seenSinceEdit] } : {}), ...(d.digest !== undefined ? { digest: d.digest } : {}), ...(d.repair ? { repair: d.repair } : {}), ...(d.attempt ? { attempt: d.attempt } : {}) }]),
     last: history.length ? Object.fromEntries(CARRIED.filter(k => k in history[history.length - 1]).map(k => [k, history[history.length - 1][k]])) : null,
@@ -2178,9 +2190,23 @@ const ciLaneRun = async (cycle, lanes) => {
   const storedOf = (c) => ciVerdicts.get(c.link).failures
   const unplaced = (c) => storedOf(c).filter(f => f.verdict === 'unclassified')
   const reused = failing.filter(reusable)
-  const cached = reused.filter(c => unplaced(c).length === 0)
-  const partial = reused.filter(c => !cached.includes(c) && storedOf(c).every(f => f.complete) &&
+  const placed = reused.filter(c => unplaced(c).length === 0)
+  const partial = reused.filter(c => !placed.includes(c) && storedOf(c).every(f => f.complete) &&
     new Set(storedOf(c).map(failureKey)).size === storedOf(c).length)
+  // A retry policy, not proof nothing changed: such a check whose unclassified failures
+  // were judged with these ciNotes and its current base job stands as stored. Other
+  // branches' runs and other heads' verdicts are not watched.
+  const placedKey = (base) => `${notesDigest}:${base}`
+  const candidates = partial.filter(c => ciVerdicts.get(c.link).placedWith?.startsWith(`${notesDigest}:`))
+  let unchanged = []
+  if (candidates.length) {
+    const got = await collect(`ci:collect#${cycle}.b`, `bases ${candidates.map(c => `--check ${shq(c.link)}`).join(' ')}`, BASES)
+    const why = faultOf(got, inv.head)
+    if (why) log(`cycle ${cycle}: CI base jobs not read — ${why}; judging the unclassified failures again`)
+    else unchanged = candidates.filter(c => got.bases.some(b => b.link === c.link && placedKey(b.base) === ciVerdicts.get(c.link).placedWith))
+    if (unchanged.length) log(`cycle ${cycle}: unclassified CI failures left as judged for ${unchanged.map(c => c.name).join(', ')} — ciNotes and base job unchanged`)
+  }
+  const cached = reused.filter(c => placed.includes(c) || unchanged.includes(c))
   const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c) && !gated.includes(c))
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
@@ -2243,10 +2269,9 @@ const ciLaneRun = async (cycle, lanes) => {
   // so it is judged whole next time.
   const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
   const unsettled = []
-  // A merged check is stored as a patch of the failures it changed: the store
-  // holds the rest, so they need not cross the relay again.
+  // A merged check is stored as a patch; the store keeps the rest.
   const patches = new Map()
-  for (const c of partial.filter(c => !reran.includes(c))) {
+  for (const c of partial.filter(c => judging.includes(c) && !reran.includes(c))) {
     const got = new Map(failuresOf.get(c.link).map(f => [failureKey(f), f]))
     const distinct = got.size === failuresOf.get(c.link).length
     if (distinct && sameLinks([...got.keys()], unplaced(c).map(failureKey)) && [...got.values()].every(f => f.complete)) {
@@ -2261,7 +2286,11 @@ const ciLaneRun = async (cycle, lanes) => {
   for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
   const fresh = judging.filter(c => c.attempt && !reran.includes(c) && !unsettled.includes(c))
     .map(c => ({ link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(failuresOf.get(c.link))) }))
-  for (const v of fresh) ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v })
+  for (const v of fresh) {
+    const base = ev.bases.find(b => b.link === v.link)?.base ?? null
+    const placedWith = v.failures.some(f => f.verdict === 'unclassified') ? { placedWith: placedKey(base) } : {}
+    ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v, ...placedWith })
+  }
   // A push since judging moved the head on: those verdicts will never be recalled.
   // One the store lost or garbled fails its digest on recall and is judged again.
   if (fresh.length && !lanes.reviewPushed) {
