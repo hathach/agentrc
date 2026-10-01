@@ -135,7 +135,7 @@ class AgentFiles(unittest.TestCase):
         for phrase in ("a headless exchange whose question names this action and both repositories",
                        "the PR's base repository, never a fork's head repository, and `hathach/agentrc`",
                        'an unclassified CI failure or any other unresolved classification stays a blocker or handoff',
-                       'At most three new issues and three comments per invocation', 'Never close, edit or relabel an issue',
+                       'At most five new issues and three comments per invocation', 'Never close, edit or relabel an issue',
                        "The script's repository allowlist is a guard, not an authorization",
                        'Opening an issue changes no deferral decision', 'a deferral names only an open issue the unit returned'):
             self.assertIn(phrase, rule)
