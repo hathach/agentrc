@@ -42,10 +42,11 @@ previews of rows the saved logs hold whole. onBase compares the base run's row
 for the cell: same-failure, other-failure, passed, other (a skip), not-run, or
 null without a comparable base run. A signature is the error's first segment,
 so two different errors can share one: same-failure and prior are leads. prior
-lists the verdicts stored for the same workflow, check, cell and signature on the
-newest other head of the PR that has one, [{head, verdict, firstError}], more than
-one when ambiguous, and is absent when none match; the detail file's `priorErrors`
-names each other head whose store could not be read and was left out. A cell row is left out of
+lists the verdicts stored for the same workflow, check, cell and signature in the
+newest store of the PR that has one, [{head, verdict, firstError}], more than
+one when ambiguous, and is absent when none match; this head's own store counts
+only for runs a re-run replaced, not for the checks read now. The detail file's
+`priorErrors` names each head whose store could not be read and was left out. A cell row is left out of
 `diagnostics` and `shared`, on both sides; `firstError` still reads it. A failed
 step that ran hil_test.py but printed no parsed row gets `cellsError` instead.
 When any check was read, the detail file lists the PR's `changed`
@@ -543,10 +544,11 @@ def circle(repo, number, folder):
 
 
 def prior_verdicts(repo, pr, head, entries):
-    """Each cell's verdicts from the newest other head of the PR that stored one for its workflow,
-    check, cell and signature: a head judged only in part leaves the rest to an older one. Two
-    workflows may name a job alike, so a verdict with no workflow name matches nothing. Returns the
-    other heads whose store could not be read, which are left out."""
+    """Each cell's verdicts from the newest store of the PR that holds one for its workflow, check,
+    cell and signature: a head judged only in part leaves the rest to an older one. This head's own
+    store counts only for the links not read now, the runs a re-run replaced. Two workflows may name
+    a job alike, so a verdict with no workflow name matches nothing. Returns the heads whose store
+    could not be read, which are left out."""
     if not any(entry.get('cells') for entry in entries):
         return []
     index, unread, stores = {}, [], []
@@ -557,16 +559,21 @@ def prior_verdicts(repo, pr, head, entries):
             pass
         except OSError as e:
             unread.append(f'{folder.name}: {e}')
+    reading = {entry['link'] for entry in entries}
     for _, folder in sorted(stores, reverse=True):
-        if folder.name == head:
-            continue
         found = {}
         try:
-            for stored in stored_verdicts(folder).values():
+            for link, stored in stored_verdicts(folder).items():
+                if folder.name == head and link in reading:
+                    continue
                 for f in stored.get('failures') or []:
-                    if f.get('workflow'):
-                        found.setdefault((f['workflow'], f.get('check'), f.get('cell'), f.get('signature')), []).append(
-                            {'head': folder.name, 'verdict': f.get('verdict'), 'firstError': f.get('firstError')})
+                    if not f.get('workflow'):
+                        continue
+                    # a re-run judged alike is one verdict, not an ambiguity
+                    seen = found.setdefault((f['workflow'], f.get('check'), f.get('cell'), f.get('signature')), [])
+                    v = {'head': folder.name, 'verdict': f.get('verdict'), 'firstError': f.get('firstError')}
+                    if v not in seen:
+                        seen.append(v)
         except (Failed, OSError, AttributeError, TypeError) as e:
             unread.append(f'{folder.name}: {e}')
             continue

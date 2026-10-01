@@ -269,7 +269,7 @@ if (args.stateRef != null) {
 // re-judges it: the checks the judge re-ran (`sure` false for a judge lost after
 // it may have), and the digest of each verdict per check run, whose link names
 // the run. The verdicts themselves stay in collect.py's store beside the evidence,
-// which also shows a later head's judge the other heads' verdicts. An older state's
+// which also shows a judge the verdicts of other heads and of runs a re-run replaced. An older state's
 // judgedHead is ignored. `placedWith` is what a verdict with an unclassified failure
 // was judged with, `<ciNotes digest>:<base job>`.
 const ciCacheShaped = (c) => c && typeof c === 'object' &&

@@ -348,8 +348,8 @@ class FailuresTest(unittest.TestCase):
         rc, r = self.main(JOB.format(3))
         self.assertEqual(json.loads(Path(r['detail']).read_text())['changed'], ['src/host/msc.c', 'test/hil/tiny usb.json'], 'a path with a space stays one path')
 
-    def remember_on(self, head, failures):
-        with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps([{'link': JOB.format(3), 'bucket': 'fail', 'failures': failures}]))):
+    def remember_on(self, head, failures, link=JOB.format(3)):
+        with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps([{'link': link, 'bucket': 'fail', 'failures': failures}]))):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(collect.main(['remember', '--repo', 'o/r', '--pr', '5', '--head', head]), 0)
 
@@ -362,7 +362,7 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(self.cell_priors(), [None, None], 'nothing stored yet')
         self.remember_on(OTHER, [judged, {**judged, 'cell': 'rp2 device/hid', 'signature': 'something else'}])
         self.remember_on(HEAD, [{**judged, 'verdict': 'real'}])
-        self.assertEqual(self.cell_priors(), [[{'head': OTHER, 'verdict': 'rig-side', 'firstError': 'probe'}], None], 'another head\'s, never its own')
+        self.assertEqual(self.cell_priors(), [[{'head': OTHER, 'verdict': 'rig-side', 'firstError': 'probe'}], None], 'another head\'s, not the check read now')
         self.remember_on(OTHER, [{**judged, 'workflow': 'Nightly'}])
         self.assertEqual(self.cell_priors()[0], None, 'another workflow\'s job of the same name')
         self.remember_on(OTHER, [judged, {**judged, 'verdict': 'real'}])
@@ -380,6 +380,16 @@ class FailuresTest(unittest.TestCase):
         os.utime(collect.evidence_dir('o/r', 5, OTHER) / 'verdicts.json', (1, 1))
         self.assertEqual([[(p['head'], p['firstError']) for p in x] for x in self.cell_priors()], [[(newer, 'new')], [(OTHER, 'old')]],
                          'a head judged in part leaves the rest to an older one')
+
+    def test_a_run_a_rerun_replaced_on_this_head_is_the_newest_prior(self):
+        judged = {'workflow': 'Build', 'check': 'hil (x.json)', 'cell': 'pico host/msc', 'signature': 'pico host/msc: Failed: src/host/msc.c timeout',
+                  'verdict': 'real', 'firstError': 'old head'}
+        self.remember_on(OTHER, [judged])
+        os.utime(collect.evidence_dir('o/r', 5, OTHER) / 'verdicts.json', (1, 1))
+        placed = {**judged, 'verdict': 'rig-side', 'firstError': 'attempt 1'}
+        self.remember_on(HEAD, [placed, placed], link=JOB.format(2))
+        self.assertEqual(self.cell_priors()[0], [{'head': HEAD, 'verdict': 'rig-side', 'firstError': 'attempt 1'}],
+                         'the replaced run on this head, newer than the other head, once')
 
     def test_a_base_job_rerun_in_the_same_run_is_another_base(self):
         base = {'runId': 70, 'jobId': 40, 'conclusion': 'failure'}
