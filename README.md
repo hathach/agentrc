@@ -62,6 +62,7 @@ Agent collaboration and PRs:
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR: pin it, pick rig boards, run the pr-review workflow, leave it as a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's log, rerun its failed jobs once after an infra failure | `circleci.py log <job>`, `rerun <job>...` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
+| [`worktree-reset`](skills/worktree-reset/SKILL.md) | recycle a worktree slot once its work merged: next numbered branch at the default branch, cowork lanes reset, ignored files kept | `worktree_reset.py [--dry-run] [--pending <item>]` |
 
 Hardware documentation, from the Calibre library at `~/Documents/calibre-library`
 (`CALIBRE_LIBRARY` overrides):
