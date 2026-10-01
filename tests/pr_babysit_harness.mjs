@@ -54,6 +54,12 @@ const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`$
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
 // The workflow's failure identity.
 const failureKey = (f) => JSON.stringify([f.workflow, f.job, f.cell, f.signature])
+// The 16-hex key a caller accepts a failure by: 64-bit FNV-1a of its identity.
+const keyOf = (f) => {
+  let h = 0xcbf29ce484222325n
+  for (const ch of failureKey(f)) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
+  return h.toString(16).padStart(16, '0')
+}
 // The checks a CI judge prompt asks about.
 const askedOf = (prompt) => JSON.parse(String(prompt).match(/each needing exactly one entry in your reply: (\[.*\])\./)[1])
 const manifestOf = (calls, label) => payloadOf(calls.find(c => c.label === label).prompt, 'Manifest').replies
@@ -928,14 +934,14 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
 
 test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
   const red = redWith(RIG, PVS, UNPLACED).ci
-  const first = await run({ args: { ...YIELD, acceptedFailures: [accept()] }, reviews: WAITING, ci: red })
+  const first = await run({ args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
   assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, sonarGate: 0, rigSide: 1, unclassified: 1 })
   const dry = await run({ args: { autoPush: false, maxCycles: 3 }, reviews: { findings: [finding()], replies: [], bots: 'reviewed' } })
   assert.deepEqual(dry.result.rollup.findings, { total: 1, fixed: 0, open: 1, refuted: 0, stale: 0, deferred: 0, held: 0 }, 'a dry run fixes nothing')
   const twice = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual([twice.result.rollup.cycles, twice.result.rollup.ci.total], [[1, 2], 1])
   assert.deepEqual(twice.result.rollup.ciChecks, { judged: 1, partial: 0, reused: 1, unchanged: 0 }, 'per cycle, summed')
-  const again = await run({ args: { ...YIELD, state: first.result.state, acceptedFailures: [accept()] }, reviews: WAITING, ci: red })
+  const again = await run({ args: { ...YIELD, state: first.result.state, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
   assert.deepEqual(again.result.rollup.cycles, [2], 'the carried cycle is the previous launch\'s')
   let cycle = 0
   const fixedThenStale = await run({
@@ -1771,7 +1777,7 @@ test('a partly judged check answered with every failure is taken whole, and with
 
 test('a partly judged check answered badly never passes on its stored failures, even all accepted', async () => {
   const store = new Map()
-  const acceptedFailures = MIXED.map(({ workflow, job, cell, signature }) => ({ workflow, job, cell, signature, reason: 'rig', scope: 'this PR' }))
+  const acceptedFailures = MIXED.map(f => ({ key: keyOf(f), reason: 'rig', scope: 'this PR' }))
   const st = (await run({ store, args: { ...YIELD, acceptedFailures }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })).result.state
   const odd = await run({ store, base: 'b2', args: { ...YIELD, acceptedFailures, state: st }, reviews: { findings: [], replies: [] }, ci: redWith(RIG).ci, judge: judgeWith([cellFailure('pico d', 'real')]) })
   assert.equal(odd.result.pass, false)
@@ -1795,8 +1801,8 @@ test('a partial judgment needs a complete enumeration of distinct failures, and 
 
 test('an accepted failure resumed from the cache still passes', async () => {
   const store = new Map()
-  const first = await run({ ...redWith(PVS), store, args: { ...YIELD, acceptedFailures: [accept()] }, reviews: WAITING })
-  const done = await run({ ...redWith(PVS), store, args: { ...YIELD, acceptedFailures: [accept()], state: first.result.state } })
+  const first = await run({ ...redWith(PVS), store, args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING })
+  const done = await run({ ...redWith(PVS), store, args: { ...YIELD, acceptedFailures: [byKey()], state: first.result.state } })
   assert.equal(done.labels.includes('ci:judge#2'), false)
   assert.equal(done.result.pass, true, JSON.stringify(done.result.reason))
   assert.equal(done.result.acceptedFailures.length, 1)
@@ -2029,14 +2035,16 @@ test('the CI contract names the three verdicts and nothing else', async () => {
 // caller-accepted CI failures
 
 const PVS = { check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', firstError: 'exit 2 after Analysis finished', files: [], verdict: 'rig-side' }
-const accept = (over = {}) => ({ workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
+// The retired long form, refused: a caller copies the key the result shows.
+const longForm = (over = {}) => ({ workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
 const redWith = (...failures) => ({ ci: { status: 'red', infraRerun: [], realFailures: failures } })
 
 // fnv1a64 of JSON.stringify(['static', 'pvs', null, 'license expires in 12 days']), computed outside the workflow.
 const PVS_KEY = '8f5a706886f8c791'
+assert.equal(keyOf(longForm()), PVS_KEY)
 const byKey = (over = {}) => ({ key: PVS_KEY, reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
 
-test('an accepted failure named by its key is accepted like the full entry, and a wrong key accepts nothing', async () => {
+test('an accepted failure is named by its key, and a wrong key accepts nothing', async () => {
   const { result, logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()] } })
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.equal(result.acceptedFailures[0].key, PVS_KEY)
@@ -2051,7 +2059,7 @@ test('an accepted failure named by its key is accepted like the full entry, and 
 })
 
 test('acceptedFailures are checked for shape before anything runs', async () => {
-  for (const acceptedFailures of [[byKey({ key: 'abc' })], [byKey({ key: PVS_KEY.toUpperCase() })], [byKey({ cell: null })], [byKey({ reason: ' ' })], [byKey(), accept()], [{ ...accept(), cell: undefined }], [accept({ signature: '' })], [accept({ scope: ' ' })], [accept({ cell: '' })], [accept(), accept()]]) {
+  for (const acceptedFailures of [[byKey({ key: 'abc' })], [byKey({ key: PVS_KEY.toUpperCase() })], [byKey({ cell: null })], [byKey({ reason: ' ' })], [byKey({ scope: ' ' })], [byKey(), byKey()], [longForm()], [{ ...longForm(), key: PVS_KEY }]]) {
     const trace = []
     await assert.rejects(run({ args: { acceptedFailures }, trace }), /acceptedFailures must be/, JSON.stringify(acceptedFailures))
     assert.deepEqual(trace, [])
@@ -2059,7 +2067,7 @@ test('acceptedFailures are checked for shape before anything runs', async () => 
 })
 
 test('a run red only from accepted failures passes, listing them, and is never called green', async () => {
-  const { result, logs, labels } = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()] } })
+  const { result, logs, labels } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()] } })
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.acceptedFailures, [{ check: 'pvs / analyze', workflow: 'static', job: 'pvs', cell: null, signature: 'license expires in 12 days', key: PVS_KEY, verdict: 'rig-side', reason: 'PVS license renewal pending', scope: 'until the license is renewed' }])
   assert.match(summaries(logs)[0], /^cycle 1 summary — CI red, accepted failures only/)
@@ -2068,7 +2076,7 @@ test('a run red only from accepted failures passes, listing them, and is never c
   assert.ok(logs.some(l => /CI red only from 1 accepted failure\(s\)/.test(l)))
   assert.ok(!logs.some(l => /PR is green/.test(l)))
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
-  assert.deepEqual(result.state.acceptedFailures, [{ key: PVS_KEY }], 'a full entry is saved by its key')
+  assert.deepEqual(result.state.acceptedFailures, [{ key: PVS_KEY }], 'the state keeps the key alone')
 })
 
 test('a green run is called green and lists no accepted failures', async () => {
@@ -2079,16 +2087,16 @@ test('a green run is called green and lists no accepted failures', async () => {
 })
 
 test('accepted failures with replies still owed are not called green', async () => {
-  const { logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()], maxCycles: 2 }, dropDoneIds: () => true,
+  const { logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()], maxCycles: 2 }, dropDoneIds: () => true,
     reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' } })
   assert.ok(logs.some(l => /CI red only from accepted failures but 1 comment\(s\) still owed an answer/.test(l)), logs.join('\n'))
   assert.ok(!logs.some(l => /PR green/.test(l)))
 })
 
 test('pending checks keep an accepted-only report from passing', async () => {
-  const { result } = await run({ ci: { status: 'running', infraRerun: [], realFailures: [PVS] }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
+  const { result } = await run({ ci: { status: 'running', infraRerun: [], realFailures: [PVS] }, args: { acceptedFailures: [byKey()], maxCycles: 1 } })
   assert.notEqual(result.pass, true)
-  const rerun = await run({ ci: { status: 'red', infraRerun: ['build / flaky'], realFailures: [PVS] }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
+  const rerun = await run({ ci: { status: 'red', infraRerun: ['build / flaky'], realFailures: [PVS] }, args: { acceptedFailures: [byKey()], maxCycles: 1 } })
   assert.notEqual(rerun.result.pass, true)
   assert.match(summaries(rerun.logs)[0], /^cycle 1 summary — CI red,/)
   assert.doesNotMatch(summaries(rerun.logs)[0], /accepted failures only/, 'an infra re-run still settling is not accepted-only')
@@ -2096,7 +2104,7 @@ test('pending checks keep an accepted-only report from passing', async () => {
 
 test('an accepted failure the watcher calls real is still not fixed', async () => {
   const real = { ...PVS, verdict: 'real', files: ['src/a.c'] }
-  const { result, labels } = await run({ ...redWith(real), args: { acceptedFailures: [accept()] } })
+  const { result, labels } = await run({ ...redWith(real), args: { acceptedFailures: [byKey()] } })
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
   assert.equal(result.pass, true)
 })
@@ -2108,7 +2116,7 @@ test('only the exact failure is accepted: another diagnostic, another cell, anot
     [[{ ...PVS, workflow: 'ci' }], 'the same job in another workflow'],
     [[PVS, { ...PVS, signature: 'V501 identical sub-expressions', firstError: 'V501', verdict: 'unclassified' }], 'a second failure in the accepted cell'],
   ]) {
-    const { result } = await run({ ...redWith(...failures), args: { acceptedFailures: [accept()] } })
+    const { result } = await run({ ...redWith(...failures), args: { acceptedFailures: [byKey()] } })
     assert.notEqual(result.pass, true, label)
   }
 })
@@ -2119,7 +2127,7 @@ test('a CI report for another head is not fixed, accepted or counted green', asy
     { ...redWith(PVS).ci },
     GREEN,
   ]) {
-    const { result, labels, logs } = await run({ ci: { ...ci, headSha: 'f'.repeat(40) }, args: { acceptedFailures: [accept()], maxCycles: 1 } })
+    const { result, labels, logs } = await run({ ci: { ...ci, headSha: 'f'.repeat(40) }, args: { acceptedFailures: [byKey()], maxCycles: 1 } })
     assert.notEqual(result.pass, true)
     assert.equal(labels.some(l => /^(fix:|commit#|push#)/.test(l)), false)
     assert.ok(logs.some(l => /CI inventory is inconsistent — head fffffff for /.test(l)), logs.join('\n'))
@@ -2131,14 +2139,14 @@ test('an acceptance needs a complete listing of the job and covers one failure',
     [[{ ...PVS, complete: false }], /not accepted — the watcher did not list every failure of its job/],
     [[PVS, { ...PVS, check: 'pvs / analyze (2)' }], /not accepted — the same failure is listed 2 times; one acceptance covers one/],
   ]) {
-    const { result, logs } = await run({ ...redWith(...failures), args: { acceptedFailures: [accept()] } })
+    const { result, logs } = await run({ ...redWith(...failures), args: { acceptedFailures: [byKey()] } })
     assert.notEqual(result.pass, true)
     assert.ok(logs.some(l => why.test(l)), logs.join('\n'))
   }
 })
 
 test('an acceptance not renewed on a resumed launch no longer applies, and says so', async () => {
-  const first = await run({ ...redWith(PVS), args: { acceptedFailures: [accept()], maxCycles: 3, yieldAfterCycle: true } })
+  const first = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()], maxCycles: 3, yieldAfterCycle: true } })
   const { result, logs } = await run({ ...redWith(PVS), args: { maxCycles: 3, state: first.result.state } })
   assert.ok(logs.some(l => new RegExp(`accepted failure not renewed by this launch, no longer accepted: key ${PVS_KEY}$`).test(l)))
   assert.notEqual(result.pass, true)

@@ -51,10 +51,6 @@ if (!Number.isInteger(ciWait) || ciWait < 1) {
   throw new Error('ciWait must be a positive integer number of minutes')
 }
 const acceptedArg = args.acceptedFailures ?? []
-const said = (a, keys) => keys.every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
-const acceptedShaped = (a) => a && typeof a === 'object' && said(a, ['reason', 'scope']) && ('key' in a
-  ? typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) && Object.keys(a).length === 3
-  : 'cell' in a && said(a, ['workflow', 'job', 'signature']) && (a.cell === null || (typeof a.cell === 'string' && a.cell.trim().length > 0)))
 const failureKey = (x) => JSON.stringify([x.workflow, x.job, x.cell, x.signature])
 // 64-bit FNV-1a of the failure identity: the 16-hex key a caller copies.
 const keyOf = (x) => {
@@ -62,9 +58,10 @@ const keyOf = (x) => {
   for (const ch of failureKey(x)) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
   return h.toString(16).padStart(16, '0')
 }
-const acceptedKey = (a) => a.key || keyOf(a)
-if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(acceptedKey)).size !== acceptedArg.length) {
-  throw new Error('acceptedFailures must be [{ key: 16 hex, reason, scope } or { workflow, job, cell: string or null for a job with one result, signature, reason, scope }], one per failure')
+const acceptedShaped = (a) => a && typeof a === 'object' && Object.keys(a).length === 3 && typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) &&
+  ['reason', 'scope'].every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
+if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(a => a.key)).size !== acceptedArg.length) {
+  throw new Error('acceptedFailures must be [{ key: the 16 hex a result shows beside the failure, reason, scope }], one per failure')
 }
 const deferralsArg = args.deferrals ?? []
 const deferralShaped = (d) => d && typeof d === 'object' && typeof d.findingId === 'string' && /^\d+#\d+$/.test(d.findingId) &&
@@ -705,7 +702,7 @@ const debt = new Map(restored
   ? restored.debt.map(([id, d]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes), ...(d.seenSinceEdit ? { seenSinceEdit: new Set(d.seenSinceEdit) } : {}) }])
   : [])
 for (const { key } of restored ? restored.acceptedFailures : []) {
-  if (!acceptedArg.some(x => acceptedKey(x) === key)) log(`accepted failure not renewed by this launch, no longer accepted: key ${key}`)
+  if (!acceptedArg.some(x => x.key === key)) log(`accepted failure not renewed by this launch, no longer accepted: key ${key}`)
 }
 // findingId -> last settled verdict, never evicted: a finding can come back reworded or moved.
 const decisions = new Map(restored ? restored.decisions : [])
@@ -745,7 +742,7 @@ const stateOut = () => {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
-    acceptedFailures: acceptedArg.map(a => ({ key: acceptedKey(a) })),
+    acceptedFailures: acceptedArg.map(a => ({ key: a.key })),
     decisions: [...decisions],
     holds: [...holds],
     ...(reanswer.size ? { reanswer: [...reanswer] } : {}),
@@ -2250,7 +2247,7 @@ const runCycle = async (cycle, entry) => {
     // One acceptance covers one exact failure, and only when the watcher listed every failure of its job.
     const seenTimes = (rf) => c.realFailures.filter(x => x.key === rf.key).length
     for (const rf of c.realFailures) {
-      const a = acceptedArg.find(x => acceptedKey(x) === rf.key)
+      const a = acceptedArg.find(x => x.key === rf.key)
       if (!a) continue
       const why = !rf.complete ? 'the watcher did not list every failure of its job'
         : seenTimes(rf) > 1 ? `the same failure is listed ${seenTimes(rf)} times; one acceptance covers one` : null
@@ -2258,7 +2255,7 @@ const runCycle = async (cycle, entry) => {
       else rf.accepted = { reason: a.reason, scope: a.scope }
     }
     for (const a of acceptedArg) {
-      if (!c.realFailures.some(rf => rf.key === acceptedKey(a))) log(`cycle ${cycle}: accepted failure ${acceptedKey(a)} matches no failure on this head`)
+      if (!c.realFailures.some(rf => rf.key === a.key)) log(`cycle ${cycle}: accepted failure ${a.key} matches no failure on this head`)
     }
     const unfixable = c.realFailures.filter(rf => !['real', 'accepted'].includes(ciState(rf)))
     for (const rf of unfixable) log(`cycle ${cycle}: ${sonarGate(rf) ? 'SonarCloud gate' : rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
