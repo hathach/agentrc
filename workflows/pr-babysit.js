@@ -909,6 +909,10 @@ const noteRerun = (r) => {
 // is judged again once either changed. An entry holds its failures once judged or recalled.
 const ciVerdicts = new Map()
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
+// This launch's CI checks per cycle, by how they were settled: judged whole or merged
+// in part from a judge's answer, reused as stored, or left as judged by the
+// ciNotes/base-job skip. Apart from the CI report, which a re-arming cycle drops.
+const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
 const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
 // commentId -> { how, digest, sonar? }: how the comment was answered ('refutation' or
 // 'fixNote') and the digest of the body that answer addressed. An answered
@@ -1036,7 +1040,7 @@ const launchRollup = () => {
     cycles: history.slice(launchFrom).map(e => e.cycle),
     findings: tally(findings, ['fixed', 'open', 'refuted', 'stale', 'deferred', 'held']),
     ci: tally(ci, ['fixed', 'open', 'accepted', 'sonarGate', 'rigSide', 'unclassified']),
-    reran: reran.size, pushed, replies,
+    ciChecks: { ...ciChecks }, reran: reran.size, pushed, replies,
   }
 }
 // Every result carries a status the caller can act on without reading the reason
@@ -2208,6 +2212,8 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   const cached = reused.filter(c => placed.includes(c) || unchanged.includes(c))
   const judging = failing.filter(c => !settling.includes(c) && !cached.includes(c) && !gated.includes(c))
+  ciChecks.reused += placed.length
+  ciChecks.unchanged += unchanged.length
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
     realFailures: cached.flatMap(c => JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures))),
@@ -2283,6 +2289,8 @@ const ciLaneRun = async (cycle, lanes) => {
     }
   }
   for (const c of unsettled) ciVerdicts.delete(c.link)
+  ciChecks.partial += patches.size
+  ciChecks.judged += judging.length - patches.size - unsettled.length
   for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
   const fresh = judging.filter(c => c.attempt && !reran.includes(c) && !unsettled.includes(c))
     .map(c => ({ link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(failuresOf.get(c.link))) }))

@@ -919,7 +919,8 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
   assert.deepEqual(result.rollup, {
     cycles: [1], findings: { total: 3, fixed: 1, open: 0, refuted: 1, stale: 1, deferred: 0, held: 0 },
-    ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, rigSide: 0, unclassified: 0 }, reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
+    ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, rigSide: 0, unclassified: 0 }, ciChecks: { judged: 0, partial: 0, reused: 0, unchanged: 0 },
+    reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
   })
 })
 
@@ -931,6 +932,7 @@ test('a launch rollup counts its own cycles, each finding and CI failure once', 
   assert.deepEqual(dry.result.rollup.findings, { total: 1, fixed: 0, open: 1, refuted: 0, stale: 0, deferred: 0, held: 0 }, 'a dry run fixes nothing')
   const twice = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual([twice.result.rollup.cycles, twice.result.rollup.ci.total], [[1, 2], 1])
+  assert.deepEqual(twice.result.rollup.ciChecks, { judged: 1, partial: 0, reused: 1, unchanged: 0 }, 'per cycle, summed')
   const again = await run({ args: { ...YIELD, state: first.result.state, acceptedFailures: [accept()] }, reviews: WAITING, ci: red })
   assert.deepEqual(again.result.rollup.cycles, [2], 'the carried cycle is the previous launch\'s')
   let cycle = 0
@@ -1604,7 +1606,7 @@ test('an inventory whose status or head contradicts its checks is never read as 
 })
 
 test('a review push that lands while the evidence is read supersedes the judge', async () => {
-  const { labels, logs } = await run({
+  const { labels, logs, result } = await run({
     reviews: oneValid, args: { autoPush: true, maxCycles: 1 },
     ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] },
     evidence: async (calls) => {
@@ -1615,6 +1617,7 @@ test('a review push that lands while the evidence is read supersedes the judge',
   assert.ok(labels.includes('ci:collect#1.f'))
   assert.equal(labels.includes('ci:judge#1'), false)
   assert.ok(logs.some(l => /review-lane push superseded the CI run/.test(l)), logs.join('\n'))
+  assert.deepEqual(result.rollup.ciChecks, { judged: 0, partial: 0, reused: 0, unchanged: 0 }, 'a check the judge never saw is not counted judged')
 })
 
 // CI verdicts: digests carried in the state, verdicts in collect.py's store
@@ -1728,12 +1731,26 @@ test('an unclassified failure is judged again only once ciNotes or its check\'s 
   assert.ok(reread.labels.includes('ci:judge#2'))
 })
 
+test('a launch rollup counts the CI checks judged whole, judged in part, reused and left as judged', async () => {
+  const store = new Map()
+  const counts = (r) => r.result.rollup.ciChecks
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
+  assert.deepEqual(counts(first), { judged: 1, partial: 0, reused: 0, unchanged: 0 })
+  const same = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(counts(same), { judged: 0, partial: 0, reused: 0, unchanged: 1 })
+  const moved = await run({ store, base: 'b2', args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith([{ ...MIXED[1], verdict: 'rig-side' }]) })
+  assert.deepEqual(counts(moved), { judged: 0, partial: 1, reused: 0, unchanged: 0 })
+  const placed = await run({ store, args: { ...YIELD, state: moved.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(counts(placed), { judged: 0, partial: 0, reused: 1, unchanged: 0 })
+})
+
 test('a partly judged check answered with every failure is taken whole, and with anything else is judged whole again', async () => {
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
   const whole = [cellFailure('pico a', 'real'), cellFailure('pico b', 'rig-side'), cellFailure('pico c', 'rig-side'), cellFailure('pico d', 'rig-side')]
   const listed = await run({ store, base: 'b2', args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(whole) })
   assert.deepEqual(listed.result.history.at(-1).ci.realFailures.map(f => [f.cell, f.verdict]), whole.map(f => [f.cell, f.verdict]))
+  assert.deepEqual(listed.result.rollup.ciChecks, { judged: 1, partial: 0, reused: 0, unchanged: 0 }, 'asked in part, answered whole')
   for (const answer of [[cellFailure('pico d', 'rig-side')], [MIXED[1], MIXED[1]], [cellFailure('pico a', 'rig-side'), cellFailure('pico b', 'rig-side')],
     [{ ...MIXED[1], verdict: 'rig-side', complete: false }], [...MIXED, MIXED[0]]]) {
     const store = new Map()
@@ -1744,6 +1761,7 @@ test('a partly judged check answered with every failure is taken whole, and with
     assert.ok(odd.logs.some(l => /answered hil \/ pico with neither its judgeOnly failures nor every failure/.test(l)), JSON.stringify(answer.map(f => f.cell)))
     assert.equal(odd.result.history.at(-1).ci, null, 'the cycle re-arms')
     assert.deepEqual(odd.result.state.ciCache.entries.map(e => e.link), ['https://github.com/o/r/actions/runs/1/job/2'], 'the other check\'s verdict is kept')
+    assert.deepEqual(odd.result.rollup.ciChecks, { judged: 1, partial: 0, reused: 0, unchanged: 0 }, 'and counted, though the cycle re-arms')
     const next = await run({ store, args: { ...YIELD, state: odd.result.state }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
     assert.equal(askedOf(judgePrompt(next.calls, 3))[0].judgeOnly, undefined, 'judged whole next')
   }
@@ -1770,6 +1788,7 @@ test('a partial judgment needs a complete enumeration of distinct failures, and 
   assert.equal(rerun.result.history.at(-1).ci.status, 'running')
   assert.deepEqual(rerun.result.state.ciCache.reruns.map(r => r.sure), [true])
   assert.deepEqual(rerun.result.state.ciCache.entries, [], 'the re-run check\'s snapshot is dropped')
+  assert.deepEqual(rerun.result.rollup.ciChecks, { judged: 1, partial: 0, reused: 0, unchanged: 0 }, 'a re-run is a judgment, not a merge')
 })
 
 test('an accepted failure resumed from the cache still passes', async () => {
