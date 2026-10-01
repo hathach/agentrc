@@ -6,7 +6,8 @@
 
 Nothing is sent to a repository outside --allow-repo, with a title or body that
 credits an agent or links a Claude or ChatGPT session, or with a label the
-repository lacks; the allowlist guards the caller's grant, it grants nothing.
+repository lacks; the allowlist guards the caller's grant, it grants nothing. The
+attribution patterns are pr-babysit's (scripts/facts.py), installed beside it.
 create first lists the open issues: ours with the same title and body is the
 earlier run's issue, another with the same title is a collision for the caller
 to judge, so nothing is created; a listing that fails creates nothing. comment

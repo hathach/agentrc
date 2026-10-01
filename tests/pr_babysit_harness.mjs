@@ -3949,8 +3949,9 @@ test('a comment handed to a human settles on a reply answered by hand once a ver
   assert.equal(settled.calls.some(c => c.label.startsWith('replies#')), false, 'nothing posted over the human\'s answer')
   const dry = await run({ byHand: () => ({ replyId: 701, body: 'Refuted: see the caller check at a.c:3.' }), judge: () => true,
     args: { autoPush: false, maxCycles: 4, state: again.result.state }, reviews: owing, challenge: upheldOnce })
-  assert.equal(dry.labels.some(l => l.startsWith('reuse#')), false, 'a dry run settles nothing')
-  assert.ok(dry.logs.some(l => /comment\(s\) 2 would settle on the replies already there \(dry run\)/.test(l)))
+  assert.equal(dry.labels.some(l => /^(judge|reuse)#/.test(l)), false, 'a dry run judges and settles nothing')
+  assert.ok(dry.logs.some(l => /the replies on comment\(s\) 2 would be judged as answers by hand \(dry run\)/.test(l)), dry.logs.join('\n'))
+  assert.equal(debtOf(dry.result, 2).judged, debtOf(again.result, 2).judged, 'nor records a judgement')
 })
 
 test('an answer by hand is judged only on a complete harvest, again when its context changes, and leaves the comment to the human', async () => {
@@ -3967,9 +3968,13 @@ test('an answer by hand is judged only on a complete harvest, again when its con
   const short = await run({ ...hand, judge: () => false, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: partial.result.state },
     reviews: { findings: two, replies: [], bots: 'reviewed' }, challenge: upheldTwo })
   assert.ok(short.labels.some(l => l.startsWith('judge#')))
-  const otherComment = await run({ ...hand, judge: () => false, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: short.result.state },
-    inspect: () => ({}), reviews: { findings: two.map(f => ({ ...f, reason: 'reworded since' })), replies: [], bots: 'reviewed' }, challenge: upheldTwo })
-  assert.ok(otherComment.labels.some(l => l.startsWith('judge#')), 'another reading of its points is judged again')
+  const reworded = await run({ ...hand, judge: () => false, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: short.result.state },
+    reviews: { findings: two.map(f => ({ ...f, claim: 'reworded', reason: 'reworded since' })).reverse(), replies: [], bots: 'reviewed' }, challenge: upheldTwo })
+  assert.ok(reworded.labels.some(l => /^inspect#\d+-by-hand$/.test(l)))
+  assert.equal(reworded.labels.some(l => l.startsWith('judge#')), false, 'the same points worded or ordered otherwise: not judged again')
+  const otherComment = await run({ ...hand, judge: () => false, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: reworded.result.state },
+    reviews: { findings: [two[0], { ...two[1], verdict: 'stale' }], replies: [], bots: 'reviewed' }, challenge: upheldTwo })
+  assert.ok(otherComment.labels.some(l => l.startsWith('judge#')), 'a point with another disposition is judged again')
   const settled = await run({ ...hand, judge: () => true, args: { autoPush: true, maxCycles: 6, state: otherComment.result.state },
     reviews: { findings: two, replies: [], bots: 'reviewed' }, challenge: upheldTwo })
   assert.ok(settled.logs.some(l => /comment 2 settled on reply 700, answered by hand/.test(l)))

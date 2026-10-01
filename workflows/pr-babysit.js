@@ -1309,7 +1309,7 @@ const pushExact = async (sha, label, prToo = false) => {
 
 let napMs = 0
 
-// A refutation settles the comment; a fix note settles only its notes.
+// A refutation or an answer by hand settles the comment; a fix note settles only its notes.
 const pay = (commentId, how, digest, sonarNote) => {
   answeredWith.set(commentId, { how, digest, ...(sonarNote && how !== 'deferral' ? { sonar: sonarNote } : {}) })
   reanswer.delete(commentId)
@@ -1317,9 +1317,11 @@ const pay = (commentId, how, digest, sonarNote) => {
   if (!d) return
   d.notes.clear()
   delete d.attempt
-  if (how === 'refutation') d.dismissals.clear()
+  if (how === 'refutation' || how === 'byHand') d.dismissals.clear()
   if (d.dismissals.size === 0) debt.delete(commentId)
 }
+// While its body stands, none of a comment's findings is this run's to fix or answer once a human answered it.
+const answeredByHand = (f) => { const a = answeredWith.get(f.commentId); return !!a && a.how === 'byHand' && a.digest === f.commentDigest }
 
 const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   // A reply that exists with the wrong content, or a draft that cannot be posted, is a repair: a human's, never answered again on top.
@@ -1446,7 +1448,7 @@ const reuseExact = async (cycle, stuck, digestOf) => {
     const { i, why } = inspectionOf(got, s.commentId, digestOf)
     if (why || i.replyId !== s.replyId) { notYet(s, why || `the inspection read reply ${i.replyId}`); continue }
     if (text(i) !== s.attempted) {
-      // Proven another body: no later cycle can settle it.
+      // Proven another body: exact reuse cannot settle it.
       const d = debt.get(s.commentId)
       d.repair.error = `${d.repair.error}; the reply there is not the offered body`
       delete d.attempt
@@ -1460,21 +1462,27 @@ const reuseExact = async (cycle, stuck, digestOf) => {
 
 // A comment handed to a human settles on our newest reply to it once a verifier finds it answers the whole comment: an answer by hand, or any adequate
 // reply of ours already there, whenever posted. Outside a review thread a reply is ours to it only when it quotes the comment's link first.
-const settleByHand = async (cycle, items, findings, digestOf) => {
-  const got = await inspectReplies(`inspect#${cycle}-by-hand`, items.map(s => String(s.commentId)))
+const settleByHand = async (cycle, ids, findings, digestOf) => {
+  const got = await inspectReplies(`inspect#${cycle}-by-hand`, ids.map(String))
   const notYet = (s, why) => log(`cycle ${cycle}: comment ${s.commentId} is still a human's — ${why}`)
-  const pointsOf = (commentId) => findings.filter(f => f.commentId === commentId)
-    .map(f => `${f.file}:${f.line}: ${f.claim} (${f.deferral ? `deferred: ${f.deferral.reason}; tracked in ${f.deferral.issueUrl}` : `${f.verdict}: ${f.reason}`})`)
-  // A verdict holds for this reply, comment, points and head only.
-  const contextOf = (s, i) => fnv1a(canonical({ reply: i.bodyDigest, comment: i.originalDigest, points: pointsOf(s.commentId), head: expectedHead }))
+  const of = (commentId) => findings.filter(f => f.commentId === commentId)
+  const pointsOf = (commentId) => of(commentId).map(f => `${f.file}:${f.line}: ${f.claim} (${f.deferral ? deferralAnswer(f.deferral) : `${f.verdict}: ${f.reason}`})`)
+  // A verdict holds for this reply, comment, head and these points' dispositions, however the harvest words or orders them.
+  const contextOf = (commentId, i) => fnv1a(canonical({ reply: i.bodyDigest, comment: i.originalDigest, head: expectedHead,
+    points: of(commentId).map(f => [f.findingId, f.file, f.line, f.verdict, f.deferral || null]).sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0) }))
   const judging = []
-  for (const s of items) {
-    const { i, why } = inspectionOf(got, s.commentId, digestOf)
-    // No reply of ours yet, no comment text to judge it against (an older reply.py), or judged short in this context already.
-    if (why || typeof i.original !== 'string' || debt.get(s.commentId).judged === contextOf(s, i)) continue
-    judging.push({ ...s, replyId: i.replyId, kind: i.kind, body: i.body, bodyDigest: i.bodyDigest, original: i.original, originalDigest: i.originalDigest, context: contextOf(s, i) })
+  for (const commentId of ids) {
+    const { i, why } = inspectionOf(got, commentId, digestOf)
+    // No reply of ours yet, or no comment text to judge it against (an older reply.py).
+    if (why || typeof i.original !== 'string') continue
+    const context = contextOf(commentId, i)
+    if (debt.get(commentId).judged !== context) judging.push({ ...i, how: 'byHand', scanning: false, context })
   }
   if (!judging.length) return []
+  if (args.autoPush !== true) {
+    log(`cycle ${cycle}: the replies on comment(s) ${judging.map(s => s.commentId).join(', ')} would be judged as answers by hand (dry run)`)
+    return []
+  }
   const judged = await agent(
     `${IN_CHECKOUT}Editing and posting nothing, judge whether each reply below, already posted on PR #${args.pr}, answers every point its comment raises as the comment stands now; ` +
     'the points listed are the validator\'s reading of it, and the comment may raise more. ' +
@@ -1488,16 +1496,16 @@ const settleByHand = async (cycle, items, findings, digestOf) => {
   const answered = judging.filter(s => {
     const v = (judged ? judged.verdicts : []).filter(v => v.commentId === s.commentId)
     if (v.length === 1 && v[0].answers === true) return true
-    // A body judged short is read again only once it changes; a dead judge leaves it unjudged.
+    // A reply judged short is judged again only once its context changes; a dead judge leaves it unjudged.
     if (v.length === 1 && v[0].answers === false) debt.get(s.commentId).judged = s.context
     notYet(s, v.length === 1 ? `reply ${s.replyId} does not answer every point: ${v[0].reason}` : 'no verdict on its reply')
     return false
   })
-  return settleOn(cycle, answered, notYet, true)
+  return settleOn(cycle, answered, notYet)
 }
 
-// Settle each comment on the reply already there; whole: the reply answers everything the comment owes. Returns the comment ids settled.
-const settleOn = async (cycle, answered, notYet, whole = false) => {
+// Settle each comment on the reply already there. Returns the comment ids settled.
+const settleOn = async (cycle, answered, notYet) => {
   if (!answered.length) return []
   if (args.autoPush !== true) {
     log(`cycle ${cycle}: comment(s) ${answered.map(s => s.commentId).join(', ')} would settle on the replies already there (dry run)`)
@@ -1514,9 +1522,8 @@ const settleOn = async (cycle, answered, notYet, whole = false) => {
     if (r && r.kind === s.kind && r.replyId === s.replyId && r.digest === s.bodyDigest && !r.sent && !r.posted && settles(r)) {
       pay(s.commentId, s.how, s.originalDigest, s.scanning ? s.body : undefined)
       const d = debt.get(s.commentId)
-      if (whole) debt.delete(s.commentId)
-      else if (d) delete d.repair
-      log(`cycle ${cycle}: comment ${s.commentId} settled on reply ${s.replyId}, ${whole ? 'answered by hand' : 'already there'}`)
+      if (d) delete d.repair
+      log(`cycle ${cycle}: comment ${s.commentId} settled on reply ${s.replyId}, ${s.how === 'byHand' ? 'answered by hand' : 'already there'}`)
       settled.push(s.commentId)
     } else notYet(s, r ? r.error || 'reuse not verified' : 'no reuse receipt')
   }
@@ -1787,8 +1794,7 @@ const runCycle = async (cycle, entry) => {
       return stop(cycle, 'duplicate-finding-ids')
     }
 
-    // A comment answered by hand is the human's while its body stands: none of its findings is this run's to fix or answer.
-    const byHandNow = r.findings.filter(f => (answeredWith.get(f.commentId) || {}).how === 'byHand' && answeredWith.get(f.commentId).digest === f.commentDigest)
+    const byHandNow = r.findings.filter(answeredByHand)
     if (byHandNow.length) {
       log(`cycle ${cycle}: ${byHandNow.length} finding(s) on comment(s) ${[...new Set(byHandNow.map(f => f.commentId))].join(', ')} left as answered by hand`)
       r.findings = r.findings.filter(f => !byHandNow.includes(f))
@@ -2009,13 +2015,10 @@ const runCycle = async (cycle, entry) => {
     if (stuck.length) await reuseExact(cycle, stuck, digestOf)
     // Judged against the whole comment as it stands; an unedited one also needs every point it owes in this harvest. A held point is not decided yet.
     const byHand = [...debt].filter(([id, d]) => handedOff(id) && digestOf.has(id) && !held.has(id) && owed(id) !== 'none' && (d.edited || showsAll(id, true)))
-      .map(([commentId]) => ({ commentId, how: 'byHand', scanning: false }))
+      .map(([commentId]) => commentId)
     const settledByHand = byHand.length ? await settleByHand(cycle, byHand, r.findings, digestOf) : []
-    // Nothing more of this cycle fixes or answers what a human answered.
-    if (settledByHand.length) {
-      r.findings = r.findings.filter(f => !settledByHand.includes(f.commentId))
-      settledByHand.forEach(id => ledger.delete(id))
-    }
+    settledByHand.forEach(id => ledger.delete(id))
+    r.findings = r.findings.filter(f => !answeredByHand(f))
 
     // One body per comment: reply.py resolves the thread and pay() retires every dismissal, so sibling drafts merge.
     const whyWithheld = (id) => {
