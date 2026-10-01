@@ -18,9 +18,12 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
 
 1. **Before launching**: a task that publishes to a PR carries its
    authorization exchange verbatim, per the README's headless recipe.
-2. **Launch** as a tracked background command, never `nohup ... &` (it
-   outlives the tool shell untracked). Its exit notification is the end of
-   the run.
+2. **Launch** in the foreground: it checks the arguments, starts the
+   launcher in its own session, prints its pid and returns. A chief
+   runs as long as it needs; a background command would end it at the tool's
+   time limit. A refused argument exits 2 at once. The
+   `launcher: exit` line in `progress.log` is the end of the run;
+   `kill <launcher pid>` stops it early.
 3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`. Each line is
    `<seq> <HH:MM:SS> <text>`: `launcher:` lines (started, session, a parse
    warning, exit), chief's `chief: <event> · ...` lines, and `note:` lines,
@@ -40,7 +43,8 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    table, the total and `cost.md`'s two breakout tables, spend by part and
    by model, and its time table, verbatim; a stage that dwarfs the work it
    did, or a stage kind that dwarfs the run's wall, is worth a word.
-   The exit code says how the run ended, not whether the task passed:
+   The exit code, the number on the `launcher: exit` line, says how the run
+   ended, not whether the task passed:
 
    | Exit | Meaning |
    |---|---|

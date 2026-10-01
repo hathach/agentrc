@@ -82,12 +82,12 @@ class ChiefRun(unittest.TestCase):
             ''.join(e if isinstance(e, str) else json.dumps(e, ensure_ascii=False) + '\n' for e in events),
             encoding='utf-8')
 
-    def argv(self, *extra, worktree=None):
+    def argv(self, *extra, worktree=None, detached=False):
         return [sys.executable, str(SCRIPT), '--out', str(self.out), '--worktree', str(worktree or self.worktree),
-                '--task-file', str(self.task), *extra]
+                '--task-file', str(self.task), *([] if detached else ['--foreground']), *extra]
 
-    def run_it(self, *extra, worktree=None, **env):
-        return subprocess.run(self.argv(*extra, worktree=worktree), env={**self.env, **env},
+    def run_it(self, *extra, worktree=None, detached=False, **env):
+        return subprocess.run(self.argv(*extra, worktree=worktree, detached=detached), env={**self.env, **env},
                               capture_output=True, text=True, timeout=30)
 
     def start(self, *argv, **kw):
@@ -302,6 +302,48 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=10), 128 + sig)
         self.assertFalse(Path(f'/proc/{pid}').exists(), 'chief outlived the launcher')
         self.assertTrue(self.texts()[-1].startswith(f'launcher: exit {128 + sig} (claude killed by signal {sig})'), self.texts())
+
+    def test_it_returns_at_once_and_the_launcher_runs_on_in_its_own_session(self):
+        self.stream(init(), text('m1', 'chief: stage · live'), '#gate go\n', result())
+        r = self.run_it(detached=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        pid = int(r.stdout.split('launcher pid ')[1].split(',')[0])
+        self.addCleanup(lambda: Path(f'/proc/{pid}').exists() and os.kill(pid, signal.SIGKILL))
+        self.assertIn(str(self.out / 'progress.log'), r.stdout)
+        self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
+        self.assertNotEqual(os.getsid(pid), os.getsid(0), 'a caller ending its process group does not reach it')
+        (self.fake / 'go').touch()
+        self.wait_until('the exit line', lambda: self.logged('launcher: exit 0 (result ok)'))
+        self.assertEqual((self.out / 'report.md').read_text(encoding='utf-8'), 'chief: stage · done\n')
+        r = self.run_it(detached=True)
+        self.assertEqual((r.returncode, r.stdout), (2, ''), 'an argument it refuses is refused before it detaches')
+        self.assertIn('exists', r.stderr)
+
+    def test_a_launcher_that_fails_detached_still_writes_its_exit_line(self):
+        self.task.chmod(0)
+        r = self.run_it(detached=True)
+        self.assertEqual((r.returncode, self.out.exists()), (2, False), 'an unreadable task is refused before it detaches')
+        self.assertIn('cannot be read', r.stderr)
+        self.task.chmod(0o644)
+        failing = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'
+                   'def launch(a, task):\n    chief_run.Progress(a.out / "progress.log").line("launcher: started")\n    raise RuntimeError("boom")\n'
+                   'chief_run.launch = launch\nsys.exit(chief_run.main(sys.argv[1:]))')
+        r = subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_until('the exit line', lambda: self.logged('launcher: exit 1'))
+        self.assertEqual(self.progress(), [(1, 'launcher: started'), (2, 'launcher: exit 1 (launcher failed: RuntimeError: boom) · report none')])
+        self.assertIn('RuntimeError: boom', (self.out / 'stderr.log').read_text())
+
+    def test_a_launcher_that_fails_while_chief_runs_stops_chief_before_its_exit_line(self):
+        self.stream(init(), 'not json\n', '#gate never\n', result())
+        failing = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import chief_run\n'
+                   'line = chief_run.Progress.line\n'
+                   'def broken(self, text):\n    if text.startswith("launcher: warning"): raise OSError("disk full")\n    line(self, text)\n'
+                   'chief_run.Progress.line = broken\nsys.exit(chief_run.main(sys.argv[1:]))')
+        r = subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.wait_until('the exit line', lambda: self.logged('launcher: exit 1 (launcher failed: OSError: disk full)'))
+        self.assertFalse(Path(f'/proc/{int((self.fake / "pid").read_text())}').exists(), 'chief stopped before the exit line')
 
     def test_a_claude_that_cannot_start_is_recorded(self):
         empty = self.root / 'empty'

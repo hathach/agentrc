@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a headless chief and keep a numbered log of its `chief:` status lines.
 
-    chief_run.py --out DIR --worktree PATH --task-file FILE [--permission-mode MODE]
+    chief_run.py --out DIR --worktree PATH --task-file FILE [--permission-mode MODE] [--foreground]
 
 DIR must not exist. It receives stream.jsonl (every stdout line, raw), progress.log
 (`<seq> <HH:MM:SS> <line>`: the launcher's own lines, chief's status lines and notes),
@@ -11,7 +11,9 @@ report.md). The exit line ends with that total, or `cost none (<why>)`.
 
 A status line is the first line of one of chief's own messages (agents/chief.md);
 a note is a progress note, joined onto one line, that chief's model returns as a `thinking`
-block. Exit codes and usage are in SKILL.md.
+block. It returns at once and leaves the launcher in its own session, so no caller's
+command timeout ends the run; --foreground runs it in place. Exit codes and usage are
+in SKILL.md.
 """
 import argparse
 import json
@@ -20,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -35,8 +38,9 @@ def fail(msg):
 
 class Progress:
     def __init__(self, path):
-        self.f = path.open('a', encoding='utf-8')
-        self.seq = 0
+        self.f = path.open('a+', encoding='utf-8')
+        self.f.seek(0)
+        self.seq = sum(1 for _ in self.f)   # a line appended after a failed launch keeps the count
 
     def line(self, text):
         self.seq += 1
@@ -109,6 +113,7 @@ def main(argv=None):
     p.add_argument('--worktree', required=True, type=Path)
     p.add_argument('--task-file', required=True, type=Path)
     p.add_argument('--permission-mode')
+    p.add_argument('--foreground', action='store_true')
     a = p.parse_args(argv)
     if a.out.exists():
         fail(f'{a.out} exists; each run needs a new directory')
@@ -118,7 +123,34 @@ def main(argv=None):
         fail(f'{a.task_file} is not a file')
     if pids := running_chiefs(a.worktree):
         fail(f'a chief already runs in {a.worktree} (pid {", ".join(map(str, pids))})')
+    try:
+        task = a.task_file.open('rb')
+    except OSError as e:
+        fail(f'{a.task_file} cannot be read: {e}')
     a.out.mkdir(parents=True)
+    if a.foreground:
+        return launch(a, task)
+    if pid := os.fork():
+        print(f'chief_run: launcher pid {pid}, progress {a.out / "progress.log"}')
+        return 0
+    os.setsid()
+    for fd, path, flags in ((0, os.devnull, os.O_RDONLY), (1, a.out / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND)):
+        opened = os.open(path, flags, 0o644)
+        os.dup2(opened, fd)
+        os.close(opened)
+    os.dup2(1, 2)
+    code = 1
+    try:
+        code = launch(a, task)
+    except BaseException as e:   # noqa: BLE001 - nobody watches this process; the exit line must still come
+        traceback.print_exc()
+        Progress(a.out / 'progress.log').line(f'launcher: exit 1 (launcher failed: {type(e).__name__}: {e}) · report none')
+    finally:
+        sys.stderr.flush()
+        os._exit(code)
+
+
+def launch(a, task):
     cmd = ['claude', '-p', '--agent', 'chief', '--output-format', 'stream-json', '--verbose']
     if a.permission_mode:
         cmd += ['--permission-mode', a.permission_mode]
@@ -131,7 +163,7 @@ def main(argv=None):
             warned.add(key)
             progress.line(f'launcher: warning: {text}')
 
-    with a.task_file.open('rb') as task, (a.out / 'stderr.log').open('ab') as err, \
+    with task, (a.out / 'stderr.log').open('ab') as err, \
             (a.out / 'stream.jsonl').open('ab') as stream:
         try:
             child = subprocess.Popen(cmd, cwd=a.worktree, stdin=task, stdout=subprocess.PIPE, stderr=err,
@@ -142,40 +174,49 @@ def main(argv=None):
             return 127
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             signal.signal(sig, lambda signum, _frame: child.send_signal(signum))
-        progress.line(f'launcher: started pid {child.pid}, out {a.out}')
-        for raw in iter(child.stdout.readline, b''):
-            stream.write(raw)
-            stream.flush()
+        try:
+            progress.line(f'launcher: started pid {child.pid}, out {a.out}')
+            for raw in iter(child.stdout.readline, b''):
+                stream.write(raw)
+                stream.flush()
+                try:
+                    event = json.loads(raw)
+                    kind = event.get('type')
+                    if kind == 'system' and event.get('subtype') == 'init':
+                        sid = event.get('session_id', '')
+                        (a.out / 'session').write_text(f'{sid}\n')
+                        progress.line(f'launcher: session {sid}')
+                    elif kind == 'assistant' and event.get('parent_tool_use_id') is None:
+                        msg = event['message']
+                        for block in msg['content']:
+                            note = (block.get('thinking') or '').strip() if block.get('type') == 'thinking' else ''
+                            if note:   # a between-tool note that Opus 5.5 returns as thinking
+                                progress.line('note: ' + ' '.join(note.splitlines()))
+                            if block.get('type') != 'text':
+                                continue
+                            text = block['text'].lstrip('\n')
+                            if msg.get('id') not in seen:   # the message's first text: where a status line goes
+                                seen.add(msg.get('id'))
+                                first, _, text = text.partition('\n')
+                                if first.startswith(MARKER):
+                                    progress.line(first)
+                            if any(line.startswith(MARKER) for line in text.splitlines()):
+                                warn('late', 'a status line later in a message was not forwarded; see stream.jsonl')
+                    elif kind == 'result':
+                        result = event
+                except Exception as e:   # noqa: BLE001 - any bad record is skipped: chief's stdout must keep draining
+                    err.write(f'chief_run: unusable stdout line ({type(e).__name__}: {e}): '.encode() + raw)
+                    err.flush()
+                    warn('unusable', 'unusable stdout lines; see stderr.log')
+            rc = child.wait()
+        except BaseException:   # the exit line must not come while chief still runs in the worktree
+            child.terminate()
             try:
-                event = json.loads(raw)
-                kind = event.get('type')
-                if kind == 'system' and event.get('subtype') == 'init':
-                    sid = event.get('session_id', '')
-                    (a.out / 'session').write_text(f'{sid}\n')
-                    progress.line(f'launcher: session {sid}')
-                elif kind == 'assistant' and event.get('parent_tool_use_id') is None:
-                    msg = event['message']
-                    for block in msg['content']:
-                        note = (block.get('thinking') or '').strip() if block.get('type') == 'thinking' else ''
-                        if note:   # a between-tool note that Opus 5.5 returns as thinking
-                            progress.line('note: ' + ' '.join(note.splitlines()))
-                        if block.get('type') != 'text':
-                            continue
-                        text = block['text'].lstrip('\n')
-                        if msg.get('id') not in seen:   # the message's first text: where a status line goes
-                            seen.add(msg.get('id'))
-                            first, _, text = text.partition('\n')
-                            if first.startswith(MARKER):
-                                progress.line(first)
-                        if any(line.startswith(MARKER) for line in text.splitlines()):
-                            warn('late', 'a status line later in a message was not forwarded; see stream.jsonl')
-                elif kind == 'result':
-                    result = event
-            except Exception as e:   # noqa: BLE001 - any bad record is skipped: chief's stdout must keep draining
-                err.write(f'chief_run: unusable stdout line ({type(e).__name__}: {e}): '.encode() + raw)
-                err.flush()
-                warn('unusable', 'unusable stdout lines; see stderr.log')
-        rc = child.wait()
+                child.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            raise
     body = str(result.get('result') or '') if result is not None else ''
     if result is not None and result.get('num_turns') == 0:
         body = ''   # a hook refused the prompt: not chief's report
