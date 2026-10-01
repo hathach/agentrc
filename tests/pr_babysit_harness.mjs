@@ -421,13 +421,27 @@ async function run(opts = {}) {
     if (label.startsWith('inspect#')) {
       // reply.py --inspect: our reply as it stands on each pair, the comment's
       // digest being the harness finding's; opts.inspect reshapes one per pair.
-      const pairs = [...String(prompt).matchAll(/(\d+):(\d+)/g)].map(m => [Number(m[1]), Number(m[2])])
+      // A bare COMMENT is our newest reply to it: none unless opts.byHand(commentId) gives { replyId, body }.
+      const targets = String(prompt).match(/--inspect ([\d: ]+)`/)[1].trim().split(' ').map(t => t.split(':').map(Number))
       const body = 'answered already, in other words'
-      const got = pairs.map(([commentId, replyId]) => ({
-        commentId, replyId, kind: 'review', body, bodyDigest: fnv1a(body), originalDigest: `d${commentId}`, error: null,
-        ...(opts.inspect ? opts.inspect(commentId) : {}),
-      }))
+      const got = targets.map(([commentId, replyId]) => {
+        if (replyId !== undefined) {
+          return { commentId, replyId, kind: 'review', body, bodyDigest: fnv1a(body), originalDigest: `d${commentId}`, error: null,
+            ...(opts.inspect ? opts.inspect(commentId) : {}) }
+        }
+        const hand = opts.byHand && opts.byHand(commentId)
+        return hand
+          ? { commentId, kind: 'review', bodyDigest: fnv1a(hand.body), original: `comment ${commentId}`, originalDigest: `d${commentId}`, error: null, ...hand }
+          : { commentId, replyId: null, kind: 'review', body: null, bodyDigest: null, originalDigest: `d${commentId}`, error: `no reply of ours on comment ${commentId}` }
+      })
       return conforms(options.schema, bare({ inspected: got }), label)
+    }
+    if (label.startsWith('judge#')) {
+      // The verifier on replies answered by hand: opts.judge(commentId) is its answers, false by default.
+      const ids = trailingList(prompt).map(x => x.commentId)
+      return conforms(options.schema, { verdicts: ids.map(commentId => ({
+        commentId, answers: opts.judge ? opts.judge(commentId) : false, reason: 'stub judgement',
+      })) }, label)
     }
     if (label.startsWith('reuse#')) {
       if (opts.reuse === null) return null
@@ -2977,7 +2991,7 @@ test('a reply that landed with the wrong body is a repair for a human, never rep
     const { result, logs, labels } = await run({ ...wrong, ...bad })
     assert.equal(result.history[0].refutedPosts.pass, false, name)
     assert.ok(logs.some(l => /reply 502 to comment 2 exists with the wrong content .* needs a human repair, not another reply/.test(l)), name)
-    assert.deepEqual(labels.filter(l => /^(replies|inspect|reuse)#/.test(l)), ['replies#1', 'inspect#2'], name)
+    assert.deepEqual(labels.filter(l => /^(replies|inspect|reuse)#/.test(l)), ['replies#1', 'inspect#2', 'inspect#2-by-hand'], name)
     assert.ok(logs.some(l => /reply 502 to comment 2 still needs repair — the reply there is not the offered body: a human answers it/.test(l)), name)
     assert.notEqual(result.pass, true, name)
     assert.deepEqual(result.handoffs, [{ commentId: 2, why: `reply 502: ${error}; the reply there is not the offered body` }], name)
@@ -3114,7 +3128,7 @@ test('a reply already there is not reused while the harvest leaves out a point i
   assert.deepEqual(debtOf(partial.result, 2).notes, ['2#4', '2#5'])
   const whole = await resumeAt(partial.result.state, { args: { autoPush: true, maxCycles: 5 }, ...offered,
     reviews: { findings: [stale(4), stale(5)], replies: [], bots: 'reviewed' } })
-  assert.equal(whole.labels.some(l => /^(inspect|reuse)#/.test(l)), false, 'a fix note offered is not reused as the refutation now owed')
+  assert.equal(whole.labels.some(l => /^(inspect|reuse)#\d+$/.test(l)), false, 'a fix note offered is not reused as the refutation now owed')
   assert.match(whole.result.handoffs.find(h => h.commentId === 2).why, /^reply 502: .*; it offered a \w[\w ]*, the comment now owes a refutation$/)
 })
 
@@ -3909,6 +3923,108 @@ test('a reply with a point over the length limit is never posted or cut, and goe
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.equal(manifestOf(points.calls, 'replies#1').length, 1, 'each point at its limit, bullet marker aside: posted')
+})
+
+test('a comment handed to a human settles on a reply answered by hand once a verifier finds it answers every point', async () => {
+  const owing = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'w '.repeat(61).trim() }], bots: 'reviewed' }
+  const upheldOnce = { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] }
+  const long = await run({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true }, reviews: owing, challenge: upheldOnce })
+  assert.equal(long.result.handoffs.length, 1)
+  const byHand = { byHand: (id) => id === 2 && { replyId: 700, body: 'Not a defect: the length is checked by the caller.' } }
+  const short = await run({ ...byHand, judge: () => false, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, state: long.result.state },
+    reviews: owing, challenge: upheldOnce })
+  assert.ok(short.labels.includes('inspect#2-by-hand'), 'a later cycle looks for an answer by hand')
+  assert.ok(short.logs.some(l => /comment 2 is still a human's — reply 700 does not answer every point: stub judgement/.test(l)), short.logs.join('\n'))
+  assert.match(debtOf(short.result, 2).judged, /^[0-9a-f]{8}$/)
+  assert.equal(short.result.handoffs.length, 1)
+  const again = await run({ ...byHand, judge: () => true, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, state: short.result.state },
+    reviews: owing, challenge: upheldOnce })
+  assert.equal(again.labels.some(l => l.startsWith('judge#')), false, 'a body judged short is not judged again until it changes')
+  const settled = await run({ byHand: () => ({ replyId: 701, body: 'Refuted: see the caller check at a.c:3.' }), judge: () => true,
+    args: { autoPush: true, maxCycles: 4, state: again.result.state }, reviews: owing, challenge: upheldOnce })
+  assert.ok(settled.labels.some(l => /^judge#\d+$/.test(l)) && settled.labels.some(l => /^reuse#\d+$/.test(l)))
+  assert.ok(settled.logs.some(l => /comment 2 settled on reply 701, answered by hand/.test(l)), settled.logs.join('\n'))
+  assert.equal(settled.result.state.debt.some(([id]) => id === 2), false)
+  assert.equal(settled.result.handoffs, undefined)
+  assert.equal(settled.calls.some(c => c.label.startsWith('replies#')), false, 'nothing posted over the human\'s answer')
+  const dry = await run({ byHand: () => ({ replyId: 701, body: 'Refuted: see the caller check at a.c:3.' }), judge: () => true,
+    args: { autoPush: false, maxCycles: 4, state: again.result.state }, reviews: owing, challenge: upheldOnce })
+  assert.equal(dry.labels.some(l => l.startsWith('reuse#')), false, 'a dry run settles nothing')
+  assert.ok(dry.logs.some(l => /comment\(s\) 2 would settle on the replies already there \(dry run\)/.test(l)))
+})
+
+test('an answer by hand is judged only on a complete harvest, again when its context changes, and leaves the comment to the human', async () => {
+  const two = [invalidFinding({ commentId: 2, line: 4 }), invalidFinding({ commentId: 2, line: 5 })]
+  const wordy = 'w '.repeat(61).trim()
+  const upheldTwo = { verdicts: [{ id: 0, upheld: true, reason: 'stands' }, { id: 1, upheld: true, reason: 'stands' }] }
+  const long = await run({ args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true },
+    reviews: { findings: two, replies: [{ commentId: 2, body: wordy }], bots: 'reviewed' }, challenge: upheldTwo })
+  const hand = { byHand: () => ({ replyId: 700, body: 'Both refuted by hand.' }) }
+  const partial = await run({ ...hand, judge: () => true, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: long.result.state },
+    reviews: { findings: [two[0]], replies: [], bots: 'reviewed' }, challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] } })
+  assert.equal(partial.labels.some(l => l.startsWith('judge#')), false, 'a point missing from this harvest: no judgement')
+  assert.deepEqual(debtOf(partial.result, 2).dismissals.length, 2)
+  const short = await run({ ...hand, judge: () => false, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: partial.result.state },
+    reviews: { findings: two, replies: [], bots: 'reviewed' }, challenge: upheldTwo })
+  assert.ok(short.labels.some(l => l.startsWith('judge#')))
+  const otherComment = await run({ ...hand, judge: () => false, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: short.result.state },
+    inspect: () => ({}), reviews: { findings: two.map(f => ({ ...f, reason: 'reworded since' })), replies: [], bots: 'reviewed' }, challenge: upheldTwo })
+  assert.ok(otherComment.labels.some(l => l.startsWith('judge#')), 'another reading of its points is judged again')
+  const settled = await run({ ...hand, judge: () => true, args: { autoPush: true, maxCycles: 6, state: otherComment.result.state },
+    reviews: { findings: two, replies: [], bots: 'reviewed' }, challenge: upheldTwo })
+  assert.ok(settled.logs.some(l => /comment 2 settled on reply 700, answered by hand/.test(l)))
+  assert.equal(settled.calls.some(c => c.label.startsWith('replies#')), false)
+  assert.equal(settled.result.state.answeredWith.find(([id]) => id === 2)[1].how, 'byHand')
+  const later = await run({ args: { autoPush: true, maxCycles: 7, state: settled.result.state }, reviews: { findings: two, replies: [], bots: 'reviewed' }, challenge: upheldTwo })
+  assert.ok(later.logs.some(l => /2 finding\(s\) on comment\(s\) 2 left as answered by hand/.test(l)), 'a later launch leaves it to the human')
+  assert.equal(later.labels.some(l => /^(judge|inspect|replies|challenge)#/.test(l)), false, later.labels.join(' '))
+})
+
+test('a fix note owed and a mixed comment can both settle by hand, and nothing is fixed or posted for them after', async () => {
+  let cycle = 0
+  const mixedAt = (digest) => [finding({ commentId: 2, line: 4, commentDigest: digest }), invalidFinding({ commentId: 2, line: 5, commentDigest: digest })]
+  const edited = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => { cycle++; return { findings: mixedAt(`d${cycle}`), replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' } },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  assert.equal(debtOf(edited.result, 2).edited, true)
+  const settled = await resumeAt(edited.result.state, { byHand: () => ({ replyId: 703, body: 'Fixed one by hand, refuted the other.' }), judge: () => true,
+    args: { autoPush: true, maxCycles: 4 },
+    reviews: { findings: mixedAt('d2'), replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] } })
+  assert.ok(settled.logs.some(l => /comment 2 settled on reply 703, answered by hand/.test(l)), settled.logs.join('\n'))
+  const afterSettle = settled.labels.slice(settled.labels.findIndex(l => /^reuse#/.test(l)))
+  assert.equal(afterSettle.some(l => /^(fix|commit|resolve|replies)#/.test(l)), false, afterSettle.join(' '))
+  assert.equal(settled.result.handoffs, undefined)
+})
+
+test('an edited comment settles on an answer by hand to its new points', async () => {
+  let cycle = 0
+  const edited = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    posting: () => cycle === 1 ? null : true,
+    reviewsPerCycle: () => {
+      cycle++
+      return { findings: [invalidFinding({ commentId: 2, line: 4, commentDigest: `d${cycle}` })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+    },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
+  })
+  const st = edited.result.state
+  assert.equal(debtOf(edited.result, 2).edited, true)
+  for (const original of [null, undefined]) {
+    const blind = await run({ byHand: () => ({ replyId: 702, body: 'Answered the edited point.', original }), judge: () => true,
+      args: { autoPush: true, maxCycles: 4, state: st },
+      reviews: { findings: [invalidFinding({ commentId: 2, line: 4, commentDigest: debtOf(edited.result, 2).digest })], replies: [], bots: 'reviewed' },
+      challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] } })
+    assert.equal(blind.labels.some(l => /^(judge|reuse)#/.test(l)), false, `no comment text (${original}): nothing to judge against`)
+    assert.equal(blind.result.handoffs.length, 1)
+  }
+  const settled = await run({ byHand: () => ({ replyId: 702, body: 'Answered the edited point.' }), judge: () => true,
+    args: { autoPush: true, maxCycles: 4, state: st },
+    reviews: { findings: [invalidFinding({ commentId: 2, line: 4, commentDigest: debtOf(edited.result, 2).digest })], replies: [], bots: 'reviewed' },
+    challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] } })
+  assert.equal(settled.result.state.debt.some(([id]) => id === 2), false, JSON.stringify(settled.result.handoffs))
 })
 
 test('an offered answer the comment outgrew goes to a human, not a reuse or a repost', async () => {

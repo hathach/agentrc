@@ -171,7 +171,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         if actions.get('error'):
             blockers.append(f'action error: {cut(actions["error"])}')
         for h in result.get('handoffs') or []:
-            blockers.append(f"comment {h.get('commentId')} needs a human answer, which a relaunch does not give: {cut(h.get('why') or '')}"
+            blockers.append(f"comment {h.get('commentId')} needs a human answer by hand, which a later launch settles once a verifier finds it answers the whole comment (outside a review thread, the reply starts by quoting the comment's link): {cut(h.get('why') or '')}"
                             + (f"; draft: {cut(h['draft'])}" if h.get('draft') else ''))
         for u in result.get('sonarUnmarked') or []:
             last = u.get('last') or {}

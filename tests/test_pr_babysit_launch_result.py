@@ -211,8 +211,12 @@ class LaunchResultTest(unittest.TestCase):
             {'commentId': 7, 'why': 'no reply posted: over length', 'draft': 'a long draft'}]
         _, s = self.run_it(data)
         self.assertEqual([b for b in s['blockers'] if 'needs a human answer' in b], [
-            'comment 5 needs a human answer, which a relaunch does not give: edited after its finding ids were carried',
-            'comment 7 needs a human answer, which a relaunch does not give: no reply posted: over length; draft: a long draft'])
+            'comment 5 needs a human answer by hand, which a later launch settles once a verifier finds it answers the whole comment '
+            '(outside a review thread, the reply starts by quoting the comment\'s link): '
+            'edited after its finding ids were carried',
+            'comment 7 needs a human answer by hand, which a later launch settles once a verifier finds it answers the whole comment '
+            '(outside a review thread, the reply starts by quoting the comment\'s link): '
+            'no reply posted: over length; draft: a long draft'])
 
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [

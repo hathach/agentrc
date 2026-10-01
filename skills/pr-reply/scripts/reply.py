@@ -2,7 +2,7 @@
 """Post PR review replies from a manifest, read each back, resolve its thread.
 
   reply.py --pr N --manifest FILE [--repo OWNER/NAME]
-  reply.py --pr N --inspect COMMENT:REPLY [COMMENT:REPLY ...] [--repo OWNER/NAME]
+  reply.py --pr N --inspect COMMENT[:REPLY] [COMMENT[:REPLY] ...] [--repo OWNER/NAME]
   reply.py --pr N --reuse FILE [--repo OWNER/NAME]
   reply.py --pr N --edit FILE [--repo OWNER/NAME]
 
@@ -41,10 +41,12 @@ reply, resolved; 1 otherwise; 2 on a usage or manifest error. A null resolved or
 error is left out of the line: a model relaying it drops a trailing null.
 
 --inspect reads, never writes: for each pair, whether REPLY is ours answering
-COMMENT on this PR, its exact body with the body's digest, and the original's
-digest as pr-babysit's harvest.py computes it (sha256, 12 hex). stdout ends with
-{"inspected": [{"commentId", "replyId", "kind", "body", "bodyDigest",
-"originalDigest", "error"}], "seal"}; body is null when error is set. Exit 0 when every
+COMMENT on this PR (a bare COMMENT names our newest reply to it, an error when
+there is none), its exact body with the body's digest, and the original's
+digest as pr-babysit's harvest.py computes it (sha256, 12 hex), and the original's
+text. stdout ends with {"inspected": [{"commentId", "replyId", "kind", "body",
+"bodyDigest", "original", "originalDigest", "error"}], "seal"}; body is null when
+error is set. Exit 0 when every
 pair was read and is ours, 1 otherwise.
 
 --reuse settles a comment on a reply already there, and never posts: FILE is
@@ -177,14 +179,17 @@ class Poster:
             raise ApiError(f'id {comment_id} is ambiguous on PR #{self.pr}: {", ".join(k for k, _ in found)}')
         return found[0] if found else ('none', None)
 
+    def ours(self, kind, target):
+        """Our replies to target: in its thread after it, or quoting it."""
+        if kind == 'review':
+            return [c for c in self.review_comments() if c['user']['login'] == self.me and in_thread_after(c, target)]
+        quote = issue_body(target, '')
+        return [c for c in self.issue_comments() if c['user']['login'] == self.me and c['body'].startswith(quote)]
+
     def existing(self, kind, target, body, second_answer=False):
         """The (id, body) of our identical reply, else of the reply of ours this one must not be posted over:
         any other, or with second_answer only a quoting one giving the same kind of answer; None when there is none."""
-        if kind == 'review':
-            ours = [c for c in self.review_comments() if c['user']['login'] == self.me and in_thread_after(c, target)]
-        else:
-            quote = body.partition('\n\n')[0] + '\n\n'
-            ours = [c for c in self.issue_comments() if c['user']['login'] == self.me and c['body'].startswith(quote)]
+        ours = self.ours(kind, target)
         blocking = [c for c in ours if c['body'] == body]
         if not blocking and not second_answer:
             blocking = ours
@@ -295,12 +300,18 @@ def read_pair(poster, kind, original, comment_id, reply_id):
 
 def inspect(poster, comment_id, reply_id):
     out = {'commentId': comment_id, 'replyId': reply_id, 'kind': None, 'body': None, 'bodyDigest': None,
-           'originalDigest': None, 'error': None}
+           'original': None, 'originalDigest': None, 'error': None}
     try:
         kind, original = poster.kind_of(comment_id)
         out['kind'] = kind
         if original is not None:
-            out['originalDigest'] = comment_digest(original.get('body'))
+            out['original'], out['originalDigest'] = original.get('body') or '', comment_digest(original.get('body'))
+        if reply_id is None and kind != 'none':
+            ids = [c['id'] for c in poster.ours(kind, original)]
+            if not ids:
+                out['error'] = f'no reply of ours on comment {comment_id}'
+                return out
+            reply_id = out['replyId'] = max(ids)
         c, why = read_pair(poster, kind, original, comment_id, reply_id)
         if why:
             out['error'] = why
@@ -454,9 +465,9 @@ def check_edit(r):
 
 def pair(text):
     comment, sep, reply_id = text.partition(':')
-    if not (sep and comment.isdigit() and reply_id.isdigit()):
-        raise argparse.ArgumentTypeError(f'expected COMMENT:REPLY ids, got {text!r}')
-    return int(comment), int(reply_id)
+    if not (comment.isdigit() and (not sep or reply_id.isdigit())):
+        raise argparse.ArgumentTypeError(f'expected COMMENT[:REPLY] ids, got {text!r}')
+    return int(comment), int(reply_id) if sep else None
 
 
 def main(argv=None):
@@ -464,7 +475,7 @@ def main(argv=None):
     p.add_argument('--pr', type=int)
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--manifest')
-    mode.add_argument('--inspect', nargs='+', type=pair, metavar='COMMENT:REPLY')
+    mode.add_argument('--inspect', nargs='+', type=pair, metavar='COMMENT[:REPLY]')
     mode.add_argument('--reuse', metavar='FILE')
     mode.add_argument('--edit', metavar='FILE')
     p.add_argument('--repo', help='OWNER/NAME (default: gh repo view)')

@@ -490,10 +490,27 @@ class ReconcileTest(ReplyCase):
         rc, out = self.main('--inspect', '20:901')
         self.assertEqual(rc, 0)
         self.assertEqual(out['inspected'], [{'commentId': 20, 'replyId': 901, 'kind': 'issue', 'body': body,
-                                             'bodyDigest': reply.fnv1a(body), 'originalDigest': reply.comment_digest('three points'),
+                                             'bodyDigest': reply.fnv1a(body), 'original': 'three points',
+                                             'originalDigest': reply.comment_digest('three points'),
                                              'error': None}])
         self.assertEqual(reply.comment_digest('three points'),
                          __import__('hashlib').sha256(b'three points').hexdigest()[:12], 'the validator\'s digest')
+        self.assertEqual(self.gh.mutations, [])
+
+    def test_a_bare_comment_inspects_our_newest_reply_to_it(self):
+        body = self.reworded()
+        self.gh.issue_comment(905, 'someone else quoting', 'bot')
+        later = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\nanswered by hand'
+        self.gh.issue_comment(906, later, ME)
+        self.gh.review_comment(10, 'one point')
+        self.gh.review_comment(55, 'first answer', ME, thread='T10', parent=10)
+        self.gh.review_comment(57, 'newer answer', ME, thread='T10', parent=10)
+        self.gh.review_comment(12)
+        rc, out = self.main('--inspect', '20', '10', '12')
+        self.assertEqual(rc, 1)
+        self.assertEqual([(i['replyId'], i['body'], i['error']) for i in out['inspected']],
+                         [(906, later, None), (57, 'newer answer', None), (None, None, 'no reply of ours on comment 12')])
+        self.assertNotEqual(body, later)
         self.assertEqual(self.gh.mutations, [])
 
     def test_inspect_refuses_a_reply_that_is_not_ours_on_that_comment(self):
