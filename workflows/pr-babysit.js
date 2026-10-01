@@ -858,23 +858,6 @@ const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
 
 const nap = (ms) => new Promise(res => setTimeout(res, ms))
 
-// The only host a publisher may push to.
-const HOST = 'github.com'
-// scp-like needs `:` and a URL `/` after the host: accepting either makes `git@github.com/owner/repo` look right while git reads a local path.
-const ORIGIN = /^(?:(?:https|ssh):\/\/(?:[^@/]*@)?([^/:]+)(?::\d+)?\/|(?:[^@/\s]+@)([^/:]+):)([^/]+)\/([^/]+?)(?:\.git)?$/
-const originOf = (url) => {
-  const m = ORIGIN.exec(String(url).trim().replace(/\/+$/, ''))
-  if (!m) return ''
-  const host = (m[1] || m[2]).toLowerCase()
-  return host === HOST ? `${host}/${m[3]}/${m[4]}`.toLowerCase() : ''
-}
-// The sandbox has no `URL`. The PR URL names the base repository; owner/repo comes from the head repository, which differs on a fork.
-const PR_ORIGIN = /^https:\/\/([^/:?#]+)\//
-const hostOf = (url) => {
-  const m = PR_ORIGIN.exec(String(url).trim())
-  return m && m[1].toLowerCase() === HOST ? HOST : ''
-}
-
 // '' for a path that escapes the repo or whose spelling names another file.
 const canon = (p) => {
   const s = String(p).replace(/\\/g, '/')
@@ -2193,7 +2176,7 @@ const runCycle = async (cycle, entry) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty'],
+  required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'expectedOrigin', 'badPushUrl'],
   properties: {
     error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
@@ -2201,6 +2184,7 @@ const PIN = withSeal({
     remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
+    pr: { type: 'integer' }, expectedOrigin: { type: 'string' }, badPushUrl: { type: 'string' },
   },
 })
 if (cyclesUsed >= maxCycles) {
@@ -2216,6 +2200,10 @@ if (!pinned) return finish(stop(cyclesUsed, 'preflight-died'))
 if (pinned.error) {
   log(`preflight: nothing pinned — ${pinned.error}`)
   return finish(stop(cyclesUsed, 'preflight-failed', { detail: pinned.error }))
+}
+if (pinned.pr !== args.pr) {
+  log(`preflight: the pin is of PR #${pinned.pr}, not #${args.pr}`)
+  return finish(stop(cyclesUsed, 'preflight-failed', { detail: `the pin is of PR #${pinned.pr}` }))
 }
 const dirty = withoutIdeDrift(pinned.dirty)
 if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
@@ -2242,16 +2230,9 @@ if (adoptHead === null && restored && restored.pin && pinned.head.trim() !== res
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but the previous launch left ${restored.expectedHead.slice(0, 7)}`)
   return finish(stop(cyclesUsed, 'stale-head', { head: pinned.head.trim(), expected: restored.expectedHead }))
 }
-// Host from the PR URL, owner/repo from the head repository: on a fork they differ.
-const prHost = hostOf(pinned.prUrl)
-const expectedOrigin = prHost && pinned.prRepo.trim()
-  ? `${prHost}/${pinned.prRepo.trim().toLowerCase()}` : ''
-// `git push` follows pushurl: check every push URL, not the fetch URL.
-const badPush = !pinned.pushUrls.length ? '(no push URL)'
-  : pinned.pushUrls.find(u => originOf(u) !== expectedOrigin)
-if (!expectedOrigin || badPush !== undefined) {
-  log(`preflight: ${pinned.remote} pushes to ${originOf(badPush) || badPush}, not PR #${args.pr}'s head repository ${expectedOrigin || `${HOST}/${pinned.prRepo}`} (only ${HOST} over https or ssh)`)
-  return finish(stop(cyclesUsed, 'wrong-remote', { remoteUrl: badPush, expected: expectedOrigin || `${HOST}/${pinned.prRepo.trim().toLowerCase()}` }))
+if (pinned.badPushUrl) {
+  log(`preflight: ${pinned.remote} pushes to ${pinned.badPushUrl}, not PR #${args.pr}'s head repository ${pinned.expectedOrigin} (only github.com over https or ssh)`)
+  return finish(stop(cyclesUsed, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected: pinned.expectedOrigin }))
 }
 // Adoption replaces the head checks: checkout at adoptHead, PR at the state's head or a chain commit, the chain audited commit by commit.
 let adoption = null

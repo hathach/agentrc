@@ -10,7 +10,11 @@ Reports what every later step must still be true of: branch (`git rev-parse
 the branch tracks, "" when it tracks none; upstreamBranch, the branch it
 tracks there, "" when none; pushUrls (`git remote get-url
 --push --all <remote>`, which a pushurl can point away from the fetch URL);
-head; and dirty, the lines of `git status --porcelain`.
+head; dirty, the lines of `git status --porcelain`; pr, echoed; expectedOrigin,
+github.com/<prRepo> lowercased; and badPushUrl, the first push URL that is not
+expectedOrigin over https or ssh, every one when prUrl is not https on
+github.com, "(no push URL)" when there is none, "(empty push URL)" for an
+empty one, "" when all are.
 
 --recheck reads, before a commit, what the pin must still match, without gh:
 branch, pushUrls and head as above, staged (`git diff --cached --name-only -z`
@@ -22,11 +26,35 @@ with {"error": ...} when git or gh cannot answer; the caller then pins nothing.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Parser, Unusable, git, report, run  # noqa: E402
+
+
+HOST = 'github.com'
+# scp-like needs `:` and a URL `/` after the host: accepting either makes `git@github.com/owner/repo` look right while git reads a local path.
+ORIGIN = re.compile(r'(?:(?:https|ssh)://(?:[^@/]*@)?([^/:]+)(?::[0-9]+)?/|(?:[^@/\s]+@)([^/:]+):)([^/]+)/([^/]+?)(?:\.git)?')
+
+
+def origin_of(url):
+    m = ORIGIN.fullmatch(url.strip().rstrip('/'))
+    if not m:
+        return ''
+    host = (m[1] or m[2]).lower()
+    return f'{host}/{m[3]}/{m[4]}'.lower() if host == HOST else ''
+
+
+def bad_push_url(pr_url, expected, urls):
+    """The first push URL `git push` would send elsewhere; the PR URL names the base repo, so it gives only the host."""
+    if not urls:
+        return '(no push URL)'
+    m = re.match(r'https://([^/:?#]+)/', pr_url.strip())
+    on_host = bool(m) and m[1].lower() == HOST
+    bad = next((u for u in urls if not on_host or origin_of(u) != expected), None)
+    return '' if bad is None else bad or '(empty push URL)'
 
 
 def records(text):
@@ -69,10 +97,12 @@ def pin(pr):
         # A deleted head fork comes back as a null headRepository.
         raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')
     remote, urls = push_urls(branch)
+    expected = f"{HOST}/{pr_facts['prRepo'].lower()}"
     return {'branch': branch, **pr_facts, 'remote': remote, 'upstreamBranch': upstream_branch(branch, remote),
             'pushUrls': urls,
             'head': git('rev-parse', 'HEAD').strip(),
-            'dirty': git('status', '--porcelain').splitlines()}
+            'dirty': git('status', '--porcelain').splitlines(),
+            'pr': pr, 'expectedOrigin': expected, 'badPushUrl': bad_push_url(pr_facts['prUrl'], expected, urls)}
 
 
 def collect(argv):

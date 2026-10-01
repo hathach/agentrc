@@ -75,6 +75,7 @@ const PIN = {
   prHead: HEAD, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
+  pr: 3888, expectedOrigin: 'github.com/hathach/tinyusb', badPushUrl: '',
 }
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
 const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [], status: [] }
@@ -661,7 +662,7 @@ test('the preflight pins the checkout without touching it', async () => {
   assert.match(pre.prompt, /Editing and committing nothing/)
   assert.ok(pre.prompt.includes('preflight.py --pr 3888`'), pre.prompt)
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['branch', 'dirty', 'head', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'expectedOrigin', 'head', 'pr', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -736,48 +737,21 @@ test('the right branch name at the wrong commit refuses', async () => {
   assert.ok(logs.some(l => /HEAD is c0ffee1, but PR #3888 heads 0f1e2d3/.test(l)))
 })
 
-test('a tracked remote that is not the PR head repository refuses', async () => {
-  // The PR heads a fork, or the checkout tracks one: either way the push would
-  // land somewhere other than the PR this run is babysitting.
-  for (const [preflight, expected] of [
-    // A fork PR: the URL still names the BASE repo, so the expected remote comes
-    // from the head repository, and a checkout tracking the base is wrong.
-    [{ prRepo: 'contributor/tinyusb' }, 'github.com/contributor/tinyusb'],
-    [{ pushUrls: ['git@github.com:contributor/tinyusb.git'] }, 'github.com/hathach/tinyusb'],
-    // The host is half the identity: the right path on the wrong host updates
-    // nothing on GitHub.
-    [{ pushUrls: ['git@evil.example:hathach/tinyusb.git'] }, 'github.com/hathach/tinyusb'],
-    // A name that merely starts the same is a different repository.
-    [{ pushUrls: ['https://github.com/hathach/tinyusb-backup.git'] }, 'github.com/hathach/tinyusb'],
-    // Forms git accepts as remotes but GitHub is not: a relative local path, a
-    // file URL, a deeper path, an absolute path.
-    [{ pushUrls: ['github.com/hathach/tinyusb'] }, 'github.com/hathach/tinyusb'],
-    [{ pushUrls: ['file://github.com/hathach/tinyusb'] }, 'github.com/hathach/tinyusb'],
-    [{ pushUrls: ['https://github.com/hathach/tinyusb/extra'] }, 'github.com/hathach/tinyusb'],
-    [{ pushUrls: ['/srv/hathach/tinyusb'] }, 'github.com/hathach/tinyusb'],
-    // Unauthenticated transports carry no push: github.com is not enough.
-    [{ pushUrls: ['http://github.com/hathach/tinyusb'] }, 'github.com/hathach/tinyusb'],
-    [{ pushUrls: ['git://github.com/hathach/tinyusb'] }, 'github.com/hathach/tinyusb'],
-    [{ pushUrls: [] }, 'github.com/hathach/tinyusb'],
-    // A push URL that is a local path to git, because the delimiter is wrong.
-    [{ pushUrls: ['git@github.com/hathach/tinyusb'] }, 'github.com/hathach/tinyusb'],
-    // Several push URLs: one bad one is enough.
-    [{ pushUrls: ['git@github.com:hathach/tinyusb.git', 'git@evil.example:hathach/tinyusb.git'] },
-      'github.com/hathach/tinyusb'],
-    // github.com only for now; another host is refused rather than pushed to.
-    [{ pushUrls: ['https://ghe.corp.example/hathach/tinyusb.git'] }, 'github.com/hathach/tinyusb'],
-    [{ prUrl: 'https://ghe.corp.example/hathach/tinyusb/pull/3888' }, 'github.com/hathach/tinyusb'],
-    [{ prUrl: 'http://github.com/hathach/tinyusb/pull/3888' }, 'github.com/hathach/tinyusb'],
-  ]) {
-    const { result, labels, logs } = await run({ reviews: oneValid, preflight })
-    assert.equal(result.reason, 'wrong-remote', JSON.stringify(preflight))
-    assert.equal(result.expected, expected)
-    // The refusal names a push URL it actually rejected, or says there was none.
-    const urls = preflight.pushUrls ?? ['git@github.com:hathach/tinyusb.git']
-    assert.ok(urls.includes(result.remoteUrl) || result.remoteUrl === '(no push URL)', result.remoteUrl)
-    assert.deepEqual(labels, ['preflight'])
-    assert.ok(logs.some(l => /not PR #3888's head repository/.test(l)), logs.join('\n'))
-  }
+test('a push URL preflight finds outside the PR head repository refuses', async () => {
+  const bad = 'git@evil.example:hathach/tinyusb.git'
+  const { result, labels, logs } = await run({ reviews: oneValid, preflight: { pushUrls: [bad], badPushUrl: bad } })
+  assert.equal(result.reason, 'wrong-remote')
+  assert.equal(result.remoteUrl, bad)
+  assert.equal(result.expected, 'github.com/hathach/tinyusb')
+  assert.deepEqual(labels, ['preflight'])
+  assert.ok(logs.some(l => /not PR #3888's head repository/.test(l)), logs.join('\n'))
+})
+
+test('a pin of another PR stops the run', async () => {
+  const { result, labels } = await run({ reviews: oneValid, preflight: { pr: 3887 } })
+  assert.equal(result.reason, 'preflight-failed')
+  assert.equal(result.detail, 'the pin is of PR #3887')
+  assert.deepEqual(labels, ['preflight'])
 })
 
 test('a preflight the script could not pin stops the run with its error', async () => {
@@ -4542,7 +4516,7 @@ test('adoption keeps ordinary preflight refusals ahead of its own checks', async
       prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'],
     }],
     ['wrong-remote', adoptionState({ pin: { ...STATE_PIN, pushUrls: [badPush] } }), {
-      head: ADOPT, prHead: FOREIGN, pushUrls: [badPush],
+      head: ADOPT, prHead: FOREIGN, pushUrls: [badPush], badPushUrl: badPush,
     }],
   ]
   for (const [reason, state, preflight] of cases) {

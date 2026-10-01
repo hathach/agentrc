@@ -40,8 +40,8 @@ class PreflightTest(unittest.TestCase):
         self.git('push', '-q', '-u', 'origin', 'fix')
         self.fake_gh(json.dumps(VIEW))
 
-    def git(self, *argv):
-        return subprocess.run(['git', *argv], check=True, capture_output=True, text=True).stdout
+    def git(self, *argv, check=True):
+        return subprocess.run(['git', *argv], check=check, capture_output=True, text=True).stdout
 
     def fake_gh(self, answer, code=0):
         (self.root / 'answer').write_text(answer)
@@ -70,7 +70,50 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(out, {
             'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prRepo': 'someone/tinyusb',
             'prUrl': VIEW['url'], 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
-            'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o']})
+            'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o'],
+            'pr': 7, 'expectedOrigin': 'github.com/someone/tinyusb', 'badPushUrl': ''})
+
+    def test_a_push_url_outside_the_pr_head_repository_is_named(self):
+        good = 'git@github.com:someone/tinyusb.git'
+        for urls, bad in (
+            # A fork PR: its URL names the base repo, so a checkout pushing there is wrong.
+            (['git@github.com:hathach/tinyusb.git'], 0),
+            # Case and https forms of the same repository are the same repository.
+            (['https://x@GitHub.com/SomeOne/tinyusb.git/', 'ssh://git@github.com:22/someone/tinyusb'], None),
+            (['git@evil.example:someone/tinyusb.git'], 0),
+            (['https://github.com/someone/tinyusb-backup.git'], 0),
+            # Forms git accepts as remotes but GitHub is not, or not for push.
+            (['github.com/someone/tinyusb'], 0), (['file://github.com/someone/tinyusb'], 0),
+            (['https://github.com/someone/tinyusb/extra'], 0), (['/srv/someone/tinyusb'], 0),
+            (['http://github.com/someone/tinyusb'], 0), (['git://github.com/someone/tinyusb'], 0),
+            # The wrong delimiter makes git read a local path.
+            (['git@github.com/someone/tinyusb'], 0),
+            ([good, 'git@evil.example:someone/tinyusb.git'], 1),
+            (['https://ghe.corp.example/someone/tinyusb.git'], 0),
+            # A port is ASCII digits only.
+            (['ssh://git@github.com:２２/someone/tinyusb'], 0),
+        ):
+            self.git('config', '--unset-all', 'remote.origin.pushurl', check=False)
+            for u in urls:
+                self.git('config', '--add', 'remote.origin.pushurl', u)
+            out = self.pin()[1]
+            self.assertEqual(out['pushUrls'], urls)
+            self.assertEqual(out['badPushUrl'], '' if bad is None else urls[bad], urls)
+
+    def test_an_empty_push_url_is_named_not_passed(self):
+        self.git('remote', 'set-url', '--push', 'origin', '\ngit@github.com:someone/tinyusb.git')
+        out = self.pin()[1]
+        self.assertEqual(out['pushUrls'], ['', 'git@github.com:someone/tinyusb.git'])
+        self.assertEqual(out['badPushUrl'], '(empty push URL)')
+
+    def test_no_push_url_or_a_pr_off_github_https_is_refused(self):
+        self.git('branch', '--unset-upstream')
+        self.assertEqual(self.pin()[1]['badPushUrl'], '(no push URL)')
+        self.git('branch', '-u', 'origin/fix')
+        self.git('remote', 'set-url', '--push', 'origin', 'git@github.com:someone/tinyusb.git')
+        for url in ('https://ghe.corp.example/hathach/tinyusb/pull/7', 'http://github.com/hathach/tinyusb/pull/7'):
+            self.fake_gh(json.dumps({**VIEW, 'url': url}))
+            self.assertEqual(self.pin()[1]['badPushUrl'], 'git@github.com:someone/tinyusb.git', url)
 
     def test_a_branch_tracking_nothing_has_no_remote_and_no_push_url(self):
         self.git('branch', '--unset-upstream')
