@@ -1083,6 +1083,9 @@ const fixCell = (fixes, id, push, pushFailed) => {
 const VERDICT_ORDER = { valid: 0, stale: 1, invalid: 2 }
 // Comments on none of the PR's id spaces owe nothing; per cycle.
 const retired = new Set()
+// Edited comments whose earlier answer of ours the judge found short in this cycle's context: only these get a second answer (#31); per cycle.
+const judgedShort = new Set()
+const awaitingJudgement = (commentId) => reanswer.has(commentId) && !judgedShort.has(commentId)
 const answerState = (commentId) => {
   const d = debt.get(commentId)
   const a = answeredWith.get(commentId)
@@ -1362,7 +1365,8 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     replies.push({ commentId, body: out, digest: fnv1a(out), ...(reanswer.has(commentId) ? { secondAnswer: true } : {}) })
     if (scanning) sonarNotes.set(commentId, out)
   }
-  if (replies.length === 0) return { pass: false, detail: 'nothing publishable', receipts: [] }
+  // Every draft went to a human: the handoffs name them, and no batch was sent.
+  if (replies.length === 0) return null
   const out = await runReplyScript(label, 'manifest', `Publish these replies on PR #${args.pr}`,
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
     `Manifest: ${JSON.stringify({ replies })}`)
@@ -1484,9 +1488,13 @@ const settleByHand = async (cycle, ids, findings, digestOf) => {
   for (const commentId of ids) {
     const { i, why } = inspectionOf(got, commentId, digestOf)
     // No reply of ours yet, or no comment text to judge it against (an older reply.py).
-    if (why || typeof i.original !== 'string') continue
+    if (why || typeof i.original !== 'string') {
+      if (i && i.replyId === null && /^no reply of ours/.test(i.error || '')) judgedShort.add(commentId)
+      continue
+    }
     const context = contextOf(commentId, i)
     if (debt.get(commentId).judged !== context) judging.push({ ...i, how: 'byHand', scanning: false, context })
+    else judgedShort.add(commentId)
   }
   if (!judging.length) return []
   if (args.autoPush !== true) {
@@ -1507,7 +1515,7 @@ const settleByHand = async (cycle, ids, findings, digestOf) => {
     const v = (judged ? judged.verdicts : []).filter(v => v.commentId === s.commentId)
     if (v.length === 1 && v[0].answers === true) return true
     // A reply judged short is judged again only once its context changes; a dead judge leaves it unjudged.
-    if (v.length === 1 && v[0].answers === false) debt.get(s.commentId).judged = s.context
+    if (v.length === 1 && v[0].answers === false) { debt.get(s.commentId).judged = s.context; judgedShort.add(s.commentId) }
     notYet(s, v.length === 1 ? `reply ${s.replyId} does not answer every point: ${v[0].reason}` : 'no verdict on its reply')
     return false
   })
@@ -2023,7 +2031,8 @@ const runCycle = async (cycle, entry) => {
       .map(([commentId, d]) => ({ commentId, replyId: d.repair.replyId, how: owed(commentId), scanning: scanning.has(commentId), attempted: d.attempt.body }))
     if (stuck.length) await reuseExact(cycle, stuck, digestOf)
     // Judged against the whole comment as it stands; an unedited one also needs every point it owes in this harvest. A held point is not decided yet.
-    const byHand = [...debt].filter(([id, d]) => handedOff(id) && digestOf.has(id) && !held.has(id) && owed(id) !== 'none' && (d.edited || showsAll(id, true)))
+    // An answered comment edited since is judged the same way before it gets a second answer.
+    const byHand = [...debt].filter(([id, d]) => (handedOff(id) || reanswer.has(id)) && digestOf.has(id) && !held.has(id) && owed(id) !== 'none' && (d.edited || showsAll(id, true)))
       .map(([commentId]) => commentId)
     const settledByHand = byHand.length ? await settleByHand(cycle, byHand, r.findings, digestOf) : []
     settledByHand.forEach(id => ledger.delete(id))
@@ -2034,6 +2043,7 @@ const runCycle = async (cycle, entry) => {
       const how = owed(id)
       if (how === 'wait') return held.has(id) ? 'held' : 'awaiting the fix for its valid points'
       if (how === 'none') return ledger.has(id) ? 'already answered' : 'no finding in this harvest'
+      if (awaitingJudgement(id)) return 'awaiting the judgement of our earlier answer'
       if (how !== 'refutation') return `owes a ${how}`
       if (!owesDismissal(id)) return 'already answered'
       if (debt.get(id).repair) return 'reply repair pending'
@@ -2058,7 +2068,7 @@ const runCycle = async (cycle, entry) => {
       entry.sonarMarked = await settleSonar(cycle, entry)
     }
     const deferralReplies = [...ledger.keys()]
-      .filter(id => owed(id) === 'deferral' && debt.has(id) && debt.get(id).notes.size > 0 && !debt.get(id).repair && !owesDismissal(id) && showsAll(id, false))
+      .filter(id => owed(id) === 'deferral' && debt.has(id) && debt.get(id).notes.size > 0 && !debt.get(id).repair && !owesDismissal(id) && showsAll(id, false) && !awaitingJudgement(id))
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
@@ -2092,7 +2102,7 @@ const runCycle = async (cycle, entry) => {
       // One fix note per comment, built here: the read-back proves only a text the workflow chose.
       const answerable = new Map()
       for (const f of validFindings) {
-        if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair || !showsAll(f.commentId, false)) continue
+        if (owed(f.commentId) !== 'fixNote' || (debt.get(f.commentId) || {}).repair || !showsAll(f.commentId, false) || awaitingJudgement(f.commentId)) continue
         const line = `- ${f.file}:${f.line}`
         const prev = answerable.get(f.commentId)
         if (prev) prev.body += `\n${line}`
@@ -2381,6 +2391,7 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
   const entry = { cycle, head: expectedHead }
   retired.clear()
+  judgedShort.clear()
   history.push(entry)
   // A failure verdict keeps history; a rethrow would drop it.
   let verdict

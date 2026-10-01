@@ -2837,6 +2837,37 @@ test('an edit to an answered comment owes an answer again', async () => {
   assert.deepEqual(result.deferred, [1])
 })
 
+test('an answered comment edited since is judged against our reply before a second answer goes beside it (#31)', async () => {
+  // tinyusb#4030: CodeRabbit withdrew its finding after our reply, then edited the body; the answer owed again was over length and blocked.
+  const edited = (digest) => ({ findings: [invalidFinding({ commentDigest: digest })], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' })
+  const ours = { replyId: 501, body: 'Fixed in abc.', originalDigest: 'edited' }
+  const launch = (opts, perCycle = (c) => c === 1 ? structuredClone(oneValid) : edited('edited')) => {
+    let cycle = 0
+    return run({ args: { autoPush: true, maxCycles: 3 }, byHand: () => ours, ...opts, reviewsPerCycle: () => perCycle(++cycle) })
+  }
+  const answered = await launch({ judge: () => true })
+  assert.equal(answered.result.pass, true, JSON.stringify(answered.result.reason))
+  assert.equal(answered.calls.some(c => /^replies#/.test(c.label)), false, 'our reply still answers it: no second answer')
+  assert.ok(answered.logs.includes('cycle 2: comment 1 settled on reply 501, answered by hand'), answered.logs.join('\n'))
+  assert.equal(answered.result.state.reanswer, undefined)
+
+  const short = await launch({ judge: () => false })
+  assert.equal(manifestOf(short.calls, 'replies#2')[0].secondAnswer, true, 'judged short: the second answer goes')
+
+  const unjudged = await launch({ throwOn: 'judge#' })
+  assert.equal(unjudged.calls.some(c => /^replies#[23]$/.test(c.label)), false, 'no verdict, no second answer')
+  assert.ok(unjudged.logs.some(l => /withheld — awaiting the judgement of our earlier answer: 1/.test(l)), unjudged.logs.join('\n'))
+
+  // A short verdict holds for its context only: unchanged, it lets the answer go without a new judge; the comment edited again needs one.
+  for (const [last, goes] of [['edited', true], ['edited twice', false]]) {
+    let now = 'edited'
+    const again = await launch({ judge: () => false, throwOn: 'judge#3', byHand: () => ({ ...ours, originalDigest: now }) },
+      (c) => c === 1 ? structuredClone(oneValid) : c === 2 ? { ...edited(now), replies: [] } : edited(now = last))
+    assert.ok(again.labels.includes('judge#2'), again.labels.join(' '))
+    assert.equal(again.calls.some(c => c.label === 'replies#3'), goes, `${last}: ${again.labels.join(' ')}`)
+  }
+})
+
 test('the answer owed after an edit may go beside ours, in this launch or a later one', async () => {
   // Without secondAnswer reply.py holds on any reply of ours; the edit is what allows the second.
   const edited = { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' }
@@ -3937,6 +3968,7 @@ test('a reply with a point over the length limit is never posted or cut, and goe
   assert.deepEqual(owed.repair, { replyId: null, error: 'over length: a point exceeds 60 words or a line 300 characters', draft: wordy })
   assert.equal(owed.attempt, undefined, 'a withheld draft is not an offered body')
   assert.deepEqual(long.result.handoffs, [{ commentId: 2, why: `no reply posted: ${owed.repair.error}`, draft: wordy }])
+  assert.equal(long.result.observation.actions.refutedPosts, null, 'no batch was sent, so none failed beside the handoff (#31)')
   const shorter = await run({
     args: { autoPush: true, maxCycles: 2, state: long.result.state },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'short' }], bots: 'reviewed' },
