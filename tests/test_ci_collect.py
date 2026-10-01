@@ -49,6 +49,9 @@ class InventoryTest(unittest.TestCase):
                 head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
                 return mock.Mock(returncode=0, stdout=json.dumps(
                     {'headRefOid': head, 'baseRefName': 'master', 'baseRefOid': BASE}).encode())
+            if argv[1] == 'api':   # a failing Actions job's record: a first attempt, its own execution
+                job = int(argv[2].split('/jobs/')[1])
+                return mock.Mock(returncode=0, stdout=json.dumps({'id': job, 'run_id': 7, 'run_attempt': 1, 'head_sha': HEAD}).encode())
             answer = self.listings.pop(0) if len(self.listings) > 1 else self.listings[0]
             if isinstance(answer, tuple):
                 return mock.Mock(returncode=answer[0], stdout=b'', stderr=answer[1].encode())
@@ -175,8 +178,10 @@ class FailuresTest(unittest.TestCase):
         self.checks = [{'name': 'hil (x.json)', 'workflow': 'Build', 'bucket': 'fail', 'link': JOB.format(3)},
                        {'name': 'docs', 'workflow': '', 'bucket': 'fail', 'link': RTD.format(9)},
                        {'name': 'bot', 'workflow': '', 'bucket': 'fail', 'link': 'https://greptile.com/'}]
-        self.jobs = {'3': {'name': 'hil (x.json)', 'workflow_name': 'Build', 'run_id': 7, 'run_attempt': 2, 'head_sha': HEAD},
-                     '40': {'name': 'hil (x.json)', 'workflow_name': 'Build', 'run_id': 70, 'head_sha': BASE}}
+        self.jobs = {'3': {'id': 3, 'name': 'hil (x.json)', 'workflow_name': 'Build', 'run_id': 7, 'run_attempt': 2, 'head_sha': HEAD},
+                     '40': {'id': 40, 'name': 'hil (x.json)', 'workflow_name': 'Build', 'run_id': 70, 'head_sha': BASE}}
+        self.attempts = {}   # attempt number -> the jobs of run 7 at that attempt, on one page
+        self.paged = {}      # attempt number -> its pages as gh --slurp prints them, when not one
         self.logs = {'3': log(*STEP), '40': log(*STEP[:9], 'Total failed: 1', *STEP[11:])}
         self.base_runs = [{'databaseId': 71, 'headSha': 'd' * 40, 'status': 'in_progress'},
                           {'databaseId': 72, 'headSha': 'e' * 40, 'status': 'completed'},
@@ -193,6 +198,10 @@ class FailuresTest(unittest.TestCase):
                 return ok({'headRefOid': HEAD, 'baseRefName': 'master', 'baseRefOid': BASE})
             if argv[1:3] == ['pr', 'checks']:
                 return ok(self.checks)
+            if argv[1:3] == ['api', '--paginate'] and '/attempts/' in argv[4]:
+                n = int(argv[4].split('/attempts/')[1].split('/')[0])
+                jobs = self.attempts.get(n, [])
+                return ok(self.paged.get(n) or [{'total_count': len(jobs), 'jobs': jobs}])
             if argv[1:3] == ['api', '--paginate']:
                 if self.changed is None:
                     return mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 500')
@@ -232,7 +241,7 @@ class FailuresTest(unittest.TestCase):
         c = self.entries(JOB.format(3))[0]
         self.assertEqual((c['provider'], c['name'], c['error']), ('actions', 'hil (x.json)', None))
         self.assertNotIn('complete', c, 'the judge decides that')
-        self.assertEqual((c['runId'], c['runAttempt']), (7, 2), 'a re-run shows in its attempt, so the judge re-runs once')
+        self.assertEqual((c['runId'], c['runAttempt']), (7, 2), 'the attempt that executed it')
         self.assertEqual(c['firstError'], 'pico  host/msc  ...  Failed: /home/runner/work/r/r/src/host/msc.c timeout in 9.4s')
         self.assertEqual(c['files'], ['src/host/msc.c'])
         self.assertEqual({k: c['base'][k] for k in ('sha', 'runId', 'jobId', 'conclusion')},
@@ -457,6 +466,121 @@ class FailuresTest(unittest.TestCase):
         c = self.entries('https://greptile.com/')[0]
         self.assertEqual((c['provider'], c['error']), ('other', 'no reader for this check: its link names no run'))
 
+    T1, T2, T3 = ('01:00:00Z', '01:05:00Z'), ('02:00:00Z', '02:05:00Z'), ('03:00:00Z', '03:05:00Z')
+
+    def run_job(self, job, attempt, times, **over):
+        start, end = times or (None, None)
+        return {'id': job, 'name': 'hil (x.json)', 'workflow_name': 'Build', 'head_sha': HEAD, 'run_id': 7, 'run_attempt': attempt,
+                'status': 'completed', 'conclusion': 'failure', 'started_at': start, 'completed_at': end, 'runner_id': 5, **over}
+
+    def listed_as(self, listed, earlier):
+        """The failing check listed under job `listed` (the last of `earlier`'s attempts + 1), its earlier attempts given."""
+        self.jobs[str(listed['id'])] = listed
+        self.logs[str(listed['id'])] = self.logs['3']
+        for j in (j for jobs in earlier.values() for j in jobs):
+            self.jobs[str(j['id'])], self.logs[str(j['id'])] = j, self.logs['3']
+        self.attempts = earlier
+        self.checks[0]['link'] = JOB.format(listed['id'])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = collect.main(['inventory', '--repo', 'o/r', '--pr', '5', '--head', HEAD])
+        r = unsealed(out.getvalue())
+        return rc, r, (next(c for c in r['checks'] if c['workflow'] == 'Build') if rc == 0 else None)
+
+    def executed_before(self, link):
+        return self.entries(link)[0]['executedBefore']
+
+    def test_a_job_a_rerun_copied_is_listed_as_the_job_that_executed_it(self):
+        # #3956: attempt 3 re-ran another job; this one was copied from attempt 2, which executed it again after attempt 1
+        self.calls.clear()
+        rc, r, c = self.listed_as(self.run_job(13, 3, self.T2), {2: [self.run_job(12, 2, self.T2)], 1: [self.run_job(11, 1, self.T1)]})
+        self.assertEqual((rc, c['link'], c['attempt'], c['aliases']), (0, JOB.format(12), 'actions:12', [JOB.format(13)]))
+        self.assertNotIn('executedBefore', c, 'evidence for the judge, not the caller\'s inventory')
+        at = lambda want: max(i for i, call in enumerate(self.calls) if want(call))
+        self.assertGreater(at(lambda call: call[:2] == ['pr', 'view']), at(lambda call: '/attempts/' in ' '.join(call)), 'the head is read again after')
+        entry = self.entries(JOB.format(12))[0]
+        self.assertEqual((entry['runAttempt'], entry['executedBefore'], entry['log'].endswith('actions-12.log')), (2, True, True))
+        rc, r = self.main(JOB.format(13))
+        self.assertIn('stale snapshot', r['error'], 'the copy\'s link is not a check of its own')
+
+    def test_a_copy_of_a_copy_resolves_to_the_first_execution_once_per_attempt(self):
+        rc, r, c = self.listed_as(self.run_job(13, 3, self.T1), {2: [self.run_job(12, 2, self.T1)], 1: [self.run_job(11, 1, self.T1)]})
+        self.assertEqual((c['link'], c['aliases']), (JOB.format(11), [JOB.format(13), JOB.format(12)]))
+        self.assertIs(self.executed_before(JOB.format(11)), False, 'attempt 1 executed it first')
+        self.calls.clear()
+        self.checks.append({**self.checks[0], 'name': 'build (y)', 'link': JOB.format(23)})
+        self.jobs['23'] = self.run_job(23, 3, self.T1, name='build (y)')
+        self.attempts = {2: [self.run_job(12, 2, self.T1), self.run_job(22, 2, self.T1, name='build (y)')],
+                         1: [self.run_job(11, 1, self.T1), self.run_job(21, 1, self.T1, name='build (y)')]}
+        self.listed_as(self.jobs['13'], self.attempts)
+        self.assertEqual(sorted(c[3] for c in self.calls if '/attempts/' in ' '.join(c)),
+                         [f'repos/o/r/actions/runs/7/attempts/{n}/jobs?per_page=100' for n in (1, 2)], 'one read per attempt, shared')
+
+    def test_a_job_of_another_head_is_not_resolved(self):
+        rc, r, c = self.listed_as(self.run_job(13, 3, self.T2, head_sha='f' * 40), {2: [self.run_job(12, 2, self.T2)], 1: []})
+        self.assertEqual((c['link'], 'aliases' in c), (JOB.format(13), False))
+
+    def test_legs_a_truncated_name_shares_are_told_apart_by_their_execution(self):
+        twin = self.run_job(14, 2, self.T1, runner_id=6)
+        rc, r, c = self.listed_as(self.run_job(13, 3, self.T2), {2: [twin, self.run_job(12, 2, self.T2)], 1: []})
+        self.assertEqual((c['link'], c['aliases']), (JOB.format(12), [JOB.format(13)]))
+
+    def test_a_job_a_rerun_executed_again_is_its_own(self):
+        rc, r, c = self.listed_as(self.run_job(13, 3, self.T3), {2: [self.run_job(12, 2, self.T2)], 1: [self.run_job(11, 1, self.T1)]})
+        self.assertEqual((c['link'], 'aliases' in c), (JOB.format(13), False))
+        self.assertIs(self.executed_before(JOB.format(13)), True)
+
+    def test_an_execution_after_a_skipped_attempt_was_executed_before(self):
+        rc, r, c = self.listed_as(self.run_job(13, 3, self.T3), {2: [], 1: [self.run_job(11, 1, self.T1)]})
+        self.assertEqual(c['link'], JOB.format(13))
+        self.assertIs(self.executed_before(JOB.format(13)), True)
+        rc, r, c = self.listed_as(self.run_job(13, 3, self.T3), {2: [], 1: []})
+        self.assertIs(self.executed_before(JOB.format(13)), False, 'first executed in a later attempt')
+        self.listed_as(self.run_job(13, 3, self.T3), {2: [self.run_job(12, 2, self.T2, conclusion='skipped')], 1: []})
+        self.assertIs(self.executed_before(JOB.format(13)), False, 'a skipped job has times but ran nothing')
+        self.calls.clear()
+        rc, r, c = self.listed_as(self.run_job(3, 1, self.T1), {})
+        self.assertIs(self.executed_before(JOB.format(3)), False)
+        self.assertFalse([c for c in self.calls if '/attempts/' in ' '.join(c)], 'attempt 1 has nothing before it')
+
+    def test_what_cannot_be_told_apart_is_not_resolved(self):
+        # the listed job stays itself, and whether it executed before cannot be told
+        for why, listed, earlier in [
+            ('two candidates', self.run_job(13, 3, self.T2), {2: [self.run_job(12, 2, self.T2), self.run_job(14, 2, self.T2)], 1: []}),
+            ('no times', self.run_job(13, 3, None), {2: [self.run_job(12, 2, None)], 1: []}),
+            ('another runner', self.run_job(13, 3, self.T2), {2: [self.run_job(12, 2, self.T2, runner_id=6)], 1: []}),
+            ('another outcome', self.run_job(13, 3, self.T2), {2: [self.run_job(12, 2, self.T2, conclusion='cancelled')], 1: []}),
+            ('never started', self.run_job(13, 3, None), {2: [], 1: []}),
+            ('an earlier one never started', self.run_job(13, 3, self.T3), {2: [self.run_job(12, 2, None)], 1: []}),
+        ]:
+            rc, r, c = self.listed_as(listed, earlier)
+            self.assertEqual((rc, c['link'], 'aliases' in c), (0, JOB.format(13), False), why)
+            self.assertIsNone(self.executed_before(JOB.format(13)), why)
+        self.listed_as(self.run_job(13, 2, self.T2), {1: [self.run_job(12, 1, self.T2)]})
+        self.jobs['13'] = {**self.jobs['13'], 'id': 12}
+        out = io.StringIO()
+        with redirect_stdout(out):
+            collect.main(['inventory', '--repo', 'o/r', '--pr', '5', '--head', HEAD])
+        self.assertEqual(unsealed(out.getvalue())['checks'][0]['link'], JOB.format(13), 'a record not of the listed job is not resolved')
+
+    def test_attempt_pages_are_read_whole_or_not_at_all(self):
+        copy, executed = self.run_job(13, 2, self.T2), self.run_job(12, 1, self.T2)
+        filler = [self.run_job(100 + i, 1, self.T1, name=f'other {i}') for i in range(2)]
+        self.paged = {1: [{'total_count': 3, 'jobs': filler}, {'total_count': 3, 'jobs': [executed]}]}
+        rc, r, c = self.listed_as(copy, {})
+        self.assertEqual(c['link'], JOB.format(12), 'the match on the second page')
+        self.paged = {1: [{'total_count': 4, 'jobs': filler + [executed]}]}
+        rc, r, c = self.listed_as(copy, {})
+        self.assertEqual(rc, 1)
+        self.assertIn('run 7 attempt 1: listed 3 jobs of 4', r['error'])
+
+    def test_bases_reads_the_job_that_executed(self):
+        self.listed_as(self.run_job(13, 2, self.T2), {1: [self.run_job(12, 1, self.T2)]})
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(12)])
+        self.assertEqual((rc, [b['link'] for b in unsealed(out.getvalue())['bases']]), (0, [JOB.format(12)]))
+
     def test_a_job_from_another_head_is_refused(self):
         self.jobs['3']['head_sha'] = OTHER
         c = self.entries(JOB.format(3))[0]
@@ -471,7 +595,7 @@ class FailuresTest(unittest.TestCase):
 
     def test_jobs_of_one_workflow_share_one_base_run_lookup(self):
         self.checks.append({'name': 'build (x)', 'workflow': 'Build', 'bucket': 'fail', 'link': JOB.format(4)})
-        self.jobs['4'] = {**self.jobs['3'], 'name': 'build (x)'}
+        self.jobs['4'] = {**self.jobs['3'], 'id': 4, 'name': 'build (x)'}
         self.logs['4'] = self.logs['3']
         self.run_jobs['70'].append({'name': 'build (x)', 'conclusion': 'success', 'databaseId': 42})
         self.logs['42'] = log('pico  host/msc  ...  OK in 1.0s')
@@ -571,7 +695,7 @@ class FailuresTest(unittest.TestCase):
     def test_gates_alone_write_an_empty_detail_file_read_no_changed_paths_and_check_the_head_again(self):
         r, _ = self.gates({'status': 'ERROR', 'conditions': []})
         self.assertEqual(json.loads(Path(r['detail']).read_text()), {'head': HEAD, 'baseRef': 'master', 'checks': []})
-        self.assertFalse([c for c in self.calls if c[:2] == ['api', '--paginate']])
+        self.assertFalse([c for c in self.calls if c[:2] == ['api', '--paginate'] and '/pulls/' in c[3]], 'no changed paths')
         self.assertEqual(sum(c[:2] == ['pr', 'view'] for c in self.calls), 3, 'inventory reads the head twice, the gates once more')
 
     def test_a_gate_no_longer_failing_is_stale(self):

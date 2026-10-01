@@ -346,6 +346,8 @@ const COLLECT_CHECK = {
   properties: {
     name: { type: 'string' }, workflow: { type: 'string' }, bucket: { type: 'string' },
     link: { type: 'string' }, attempt: { type: ['string', 'null'] },
+    // An Actions job's earlier links: collect.py lists a copied job as the one that executed it.
+    aliases: { type: 'array', items: { type: 'string' } },
   },
 }
 const INVENTORY = withSeal({
@@ -2142,7 +2144,8 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
   const reruns = ciReruns.filter(r => r.head === inv.head)
-  const settling = failing.filter(c => reruns.some(r => r.sure && r.link === c.link))
+  // A re-run recorded under a link that now resolves to the execution it copied still settles.
+  const settling = failing.filter(c => reruns.some(r => r.sure && [c.link, ...(c.aliases || [])].includes(r.link)))
   // A run's conclusion can still be updated under the same link, so the bucket must match too.
   const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket

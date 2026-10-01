@@ -16,7 +16,11 @@ the failed and cancelled ones, each {name, workflow, bucket, link, attempt}:
 `attempt` is the per-run id in a link that has one (an Actions job, a Read the
 Docs build, a CircleCI job; each re-run mints a new one), and null for a link
 that stays the same across runs (a docs preview, a review bot's page, none),
-so only a non-null attempt can tell one run from the next. `repo` must own the
+so only a non-null attempt can tell one run from the next. A re-run of some
+jobs copies the run's other finished jobs into the new attempt under new ids,
+the same execution: a failing Actions job listed as such a copy is given as the
+job that executed it, its link and attempt, with `aliases`, the copies' links,
+when exactly one job of the earlier attempt is that execution. `repo` must own the
 PR number, which for a fork PR is not the head repository. Exit 0 with the
 object, 1 with `error` set (a gh failure, or the PR head is no longer --head),
 2 on a usage error.
@@ -30,7 +34,9 @@ check's entry holds its saved `log` and the diagnostic lines of every step that 
 The log is the job's whole log without ANSI codes, NULs and timestamps for an
 Actions job, but only tails for the others: the last 150 lines of each failed
 CircleCI step and Read the Docs' notes with 40-line tails of failed commands.
-For an Actions job the entry also holds the newest run on the base branch in
+For an Actions job the entry also holds `runAttempt`, the attempt that
+executed it, and `executedBefore`, whether an earlier attempt executed the same
+job (null when that cannot be told), and the newest run on the base branch in
 which the same job ran, with its conclusion and the diagnostic lines both
 share, and `cells`. Cells are an adapter for tinyusb's test/hil/hil_test.py:
 each terminal failure row (`Failed:` or `Flash Failed:`) of its result table,
@@ -167,6 +173,67 @@ def attempt(link):
     return f'readthedocs:{m.group(3)}' if m else None
 
 
+def attempt_jobs(repo, run, n, cache):
+    """Every job of a run's attempt n, the whole paginated list or Failed."""
+    if (run, n) not in cache:
+        pages = gh('api', '--paginate', '--slurp', f'repos/{repo}/actions/runs/{run}/attempts/{n}/jobs?per_page=100')
+        jobs = [j for page in pages for j in page.get('jobs') or []]
+        if not pages or len(jobs) != pages[0].get('total_count'):
+            raise Failed(f'run {run} attempt {n}: listed {len(jobs)} jobs of {pages[0].get("total_count") if pages else "?"}')
+        cache[run, n] = jobs
+    return cache[run, n]
+
+
+def same_execution(a, b):
+    """A re-run of other jobs copies a finished job into the new attempt under a new id,
+    with the times, runner and outcome of the execution it copies (both of one run)."""
+    return (a.get('name') == b.get('name') and all(a.get(k) and a.get(k) == b.get(k) for k in ('started_at', 'completed_at'))
+            and all(a.get(k) == b.get(k) for k in ('status', 'conclusion'))
+            and not (a.get('runner_id') and b.get('runner_id') and a['runner_id'] != b['runner_id']))
+
+
+def origin(repo, record, cache):
+    """(the job record that executed this one, the ids of its copies passed on the way, whether an
+    earlier attempt executed the same job: True, False, or None when that cannot be told).
+    Each step back needs exactly one job of that attempt to be the same execution: GitHub truncates
+    long names, so matrix legs can share one."""
+    run, executed, copies = record['run_id'], record, []
+    named = lambda n: [j for j in attempt_jobs(repo, run, n, cache) if j.get('name') == executed.get('name')]
+    for n in range((record.get('run_attempt') or 1) - 1, 0, -1):
+        same = [j for j in attempt_jobs(repo, run, n, cache) if same_execution(j, executed)]
+        if len(same) != 1:
+            break
+        copies.append(executed['id'])
+        executed = same[0]
+    before = False if executed.get('started_at') and executed.get('completed_at') else None
+    for n in range((executed.get('run_attempt') or 1) - 1, 0, -1):
+        same = [j for j in named(n) if j.get('conclusion') != 'skipped']   # a skipped job has times but ran nothing
+        times = len(same) == 1 and (same[0].get('started_at'), same[0].get('completed_at'))
+        if times and all(times) and times != (executed['started_at'], executed['completed_at']):
+            return executed, copies, True
+        if same:
+            before = None   # an attempt whose job cannot be told apart from this execution
+    return executed, copies, before
+
+
+def with_job(link, job):
+    m = ATTEMPT[0][1].match(link)
+    return link[:m.start(1)] + str(job) + link[m.end(1):]
+
+
+def resolved(repo, head, check, cache):
+    """A failing Actions check under the job that executed it: a re-run of other jobs in its run
+    lists it under a copy's link, and the store keys verdicts by the execution."""
+    job = check['attempt'].partition(':')[2]
+    record = gh('api', f'repos/{repo}/actions/jobs/{job}')
+    if record.get('head_sha') != head or str(record.get('id')) != job:
+        return {**check, 'executedBefore': None}   # failures reads it and reports where it ran
+    executed, copies, before = origin(repo, record, cache)
+    out = {**check, 'link': with_job(check['link'], executed['id']), 'attempt': f'actions:{executed["id"]}',
+           'executedBefore': before, 'record': executed}
+    return {**out, 'aliases': [with_job(check['link'], c) for c in copies]} if copies else out
+
+
 def summary(checks):
     counts = {}
     for c in checks:
@@ -188,11 +255,14 @@ def inventory(repo, pr, head, wait):
         if status != 'running' or waited + POLL > wait:
             break
         time.sleep(POLL)
+    listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
+    cache = {}
+    listed = [resolved(repo, head, c, cache) if c['bucket'] in ('fail', 'cancel') and (c['attempt'] or '').startswith('actions:') else c
+              for c in listed]
     # The listing reads the PR's last commit: a push during it would describe another head.
     after = pull(repo, pr)['headRefOid']
     if after != head:
         raise Failed(f'PR #{pr} head moved to {after} while collecting')
-    listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
     return {'head': head, 'baseRef': before['baseRefName'], 'status': status, 'counts': counts, 'checks': listed}
 
 
@@ -221,10 +291,13 @@ def sealed(facts):
     return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
 
 
+INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for failures and bases
+
+
 def printed(inv):
     """What the caller reads: the failing checks by name, the pending ones by count."""
     return {'head': inv['head'], 'status': inv['status'], 'pending': inv['counts'].get('pending', 0),
-            'checks': [c for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
+            'checks': [{k: v for k, v in c.items() if k not in INTERNAL} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
 
 
 def evidence_dir(repo, pr, head):
@@ -450,8 +523,8 @@ def base_run(repo, base_ref, workflow, name, cache):
     return None
 
 
-def actions(repo, head, base_ref, job, folder, cache):
-    record = gh('api', f'repos/{repo}/actions/jobs/{job}')
+def actions(repo, head, base_ref, job, folder, cache, record=None):
+    record = record or gh('api', f'repos/{repo}/actions/jobs/{job}')
     if record.get('head_sha') != head:
         raise Failed(f'job {job} ran on {record.get("head_sha")}, not the head {head}')
     full = actions_log(repo, job)
@@ -612,7 +685,8 @@ def failures(repo, pr, head, links, gates=()):
                  'name': check['name'], 'error': None}
         try:
             if kind == 'actions':
-                entry.update(actions(repo, head, now['baseRef'], ident, folder, cache))
+                entry['executedBefore'] = check['executedBefore']
+                entry.update(actions(repo, head, now['baseRef'], ident, folder, cache, check.get('record')))
             elif kind == 'readthedocs':
                 entry.update(readthedocs(link, folder, cache))
             elif kind == 'circleci':
@@ -656,7 +730,7 @@ def bases(repo, pr, head, links):
         kind, _, ident = (failing[link]['attempt'] or 'other:').partition(':')
         base = None
         if kind == 'actions':
-            record = gh('api', f'repos/{repo}/actions/jobs/{ident}')
+            record = failing[link].get('record') or gh('api', f'repos/{repo}/actions/jobs/{ident}')
             if record.get('head_sha') != head:
                 raise Failed(f'job {ident} ran on {record.get("head_sha")}, not the head {head}')
             base = base_run(repo, now['baseRef'], record.get('workflow_name', ''), record['name'], cache)

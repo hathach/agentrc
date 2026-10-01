@@ -144,9 +144,11 @@ const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xfff
 // The failing checks collect.py lists for a CI fixture: a failure with no
 // workflow is a SonarCloud-style check whose link names no run (its own `link`
 // when the fixture gives one); every other one is an Actions job.
-const failedChecks = (ci) => (ci.realFailures || []).map((rf, i) => rf.workflow === ''
-  ? { name: rf.check, workflow: '', bucket: ci.bucket ?? 'fail', link: rf.link ?? `https://sonarcloud.io/dashboard?id=o_r&pullRequest=${i + 1}`, attempt: null }
-  : { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link: `https://github.com/o/r/actions/runs/1/job/${i + 1}`, attempt: `actions:${i + 1}` })
+const failedChecks = (ci) => (ci.realFailures || []).map((rf, i) => {
+  if (rf.workflow === '') return { name: rf.check, workflow: '', bucket: ci.bucket ?? 'fail', link: rf.link ?? `https://sonarcloud.io/dashboard?id=o_r&pullRequest=${i + 1}`, attempt: null }
+  const link = rf.link ?? `https://github.com/o/r/actions/runs/1/job/${i + 1}`
+  return { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link, attempt: `actions:${link.split('/').at(-1)}`, ...(rf.aliases ? { aliases: rf.aliases } : {}) }
+})
 // push.py's receipt: what the pinned push URL holds after the push, and the PR
 // head when the workflow asked for it.
 const receiptOf = (head, prHead, detail, pushed = true) => ({
@@ -1823,6 +1825,20 @@ test('a re-run carries across a launch: its old run is still settling', async ()
   const again = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1'])
   assert.equal(again.result.history.at(-1).ci.status, 'running')
+})
+
+test('a re-run recorded under a copy\'s link still settles the execution it copied', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const st = first.result.state
+  const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
+  // an older launch re-ran it under J2, a copy; the listing now shows J3, a copy of J2, resolved to J1
+  const old = seal({ ...st, ciCache: { ...st.ciCache, reruns: [{ head: st.ciCache.entries[0].head, link: job(2), workflow: 'ci', check: 'hil / pico', sure: true }] } })
+  const copied = await run({ store, args: { ...YIELD, state: old }, reviews: WAITING, ci: redWith({ ...RIG, link: job(1), aliases: [job(3), job(2)] }).ci })
+  assert.deepEqual(ciLabels(copied.labels), ['ci:collect#2.1'], 'not reused as red: still settling')
+  assert.equal(copied.result.history.at(-1).ci.status, 'running')
+  const executed = await run({ store, args: { ...YIELD, state: old }, reviews: WAITING, ci: redWith({ ...RIG, link: job(4) }).ci })
+  assert.ok(executed.labels.includes('ci:judge#2'), 'a new execution is no longer settling')
 })
 
 test('verdicts of any size cost the state a digest each', async () => {
