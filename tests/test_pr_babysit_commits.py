@@ -78,29 +78,24 @@ class CommitsTest(unittest.TestCase):
         code, out = self.run_script('head', '--parent', self.base, 'a.c')
         self.assertEqual((code, out['entries'], out['refusal']), (0, [], ''))
 
-    def head_refusal(self, parent, *paths):
-        code, out = self.run_script('head', '--parent', parent, *paths)
-        self.assertEqual(code, 0)
-        return out['refusal']
-
     def test_head_refuses_a_commit_it_cannot_publish(self):
-        self.assertEqual(self.head_refusal(self.base, 'a.c'), 'nothing was committed: HEAD is still the parent')
+        self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c'), 'nothing was committed: HEAD is still the parent')
         self.write('a.c', 'one\n')
         self.write('b.c', 'b\n')
         one = self.commit('one', 'a.c', 'b.c')
-        self.assertIn(f'sits on {self.base[:7]}, not 1111111', self.head_refusal('1' * 40, 'a.c', 'b.c'))
-        self.assertEqual(self.head_refusal(self.base, 'a.c'), 'the commit carries unowned path(s): b.c')
+        self.assertIn(f'sits on {self.base[:7]}, not 1111111', self.refusal('head', '--parent', '1' * 40, 'a.c', 'b.c'))
+        self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c'), 'the commit carries unowned path(s): b.c')
         self.write('c.c', 'c\n')
-        self.assertEqual(self.head_refusal(self.base, 'a.c', 'b.c', 'c.c'), 'the commit left owned change(s) behind: ?? c.c')
+        self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c', 'c.c'), 'the commit left owned change(s) behind: ?? c.c')
         self.git('commit', '-q', '--amend', '--allow-empty-message', '-m', '')
-        self.assertEqual(self.head_refusal(self.base, 'a.c', 'b.c'), 'the commit has no message')
+        self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c'), 'the commit has no message')
         # A merge whose first parent is right still brings history nothing audited.
         self.git('checkout', '-q', '-b', 'side', self.base)
         self.write('s.c', 's\n')
         side = self.commit('side', 's.c')
         self.git('checkout', '-q', '--detach', one)
         self.git('merge', '-q', '--no-ff', '--no-edit', side)
-        self.assertIn('has 2 parents', self.head_refusal(one, 's.c'))
+        self.assertIn('has 2 parents', self.refusal('head', '--parent', one, 's.c'))
 
     def test_head_moving_while_read_is_an_error(self):
         real = commits.git
@@ -126,28 +121,28 @@ class CommitsTest(unittest.TestCase):
             'from': self.base, 'to': two, 'commits': [one, two], 'refusal': '',
             'paths': ['b.c', 'c\nd.c']}, 'each path once, a name holding a newline whole')
 
-    def refusal(self, start, end):
-        code, out = self.run_script('chain', start, end)
+    def refusal(self, *argv):
+        code, out = self.run_script(*argv)
         self.assertEqual(code, 0)
         return out['refusal']
 
     def test_a_chain_that_cannot_be_adopted_is_refused(self):
         self.write('b.c', 'b\n')
         one = self.commit('one', 'b.c')
-        self.assertIn('no commits in', self.refusal(one, self.base))
+        self.assertIn('no commits in', self.refusal('chain', one, self.base))
         self.git('commit', '-q', '--allow-empty', '-m', 'nothing')
-        self.assertIn('touches no path', self.refusal(self.base, self.git('rev-parse', 'HEAD').strip()))
+        self.assertIn('touches no path', self.refusal('chain', self.base, self.git('rev-parse', 'HEAD').strip()))
         # A side commit on `one` merged back with --no-ff: the merge is no single-parent link.
         self.git('checkout', '-q', '-b', 'side', one)
         self.write('s.c', 's\n')
         side = self.commit('side', 's.c')
         self.git('checkout', '-q', '--detach', one)
         self.git('merge', '-q', '--no-ff', '--no-edit', side)
-        self.assertIn('has 2 parents', self.refusal(one, self.git('rev-parse', 'HEAD').strip()))
+        self.assertIn('has 2 parents', self.refusal('chain', one, self.git('rev-parse', 'HEAD').strip()))
         # From a commit beside the chain: its first commit does not sit on it.
         self.git('checkout', '-q', '--detach', one)
         self.write('t.c', 't\n')
-        self.assertIn(f'sits on {one[:7]}, not {side[:7]}', self.refusal(side, self.commit('two', 't.c')))
+        self.assertIn(f'sits on {one[:7]}, not {side[:7]}', self.refusal('chain', side, self.commit('two', 't.c')))
 
     def test_a_message_crediting_an_agent_is_refused(self):
         for line, said in (
@@ -168,16 +163,16 @@ class CommitsTest(unittest.TestCase):
             self.git('reset', '-q', '--hard', self.base)
             self.write('b.c', line)
             sha = self.commit(f'Fix the finding\n\n{line}\n', 'b.c')
-            self.assertIn(f'commit message carries attribution: {said}', self.refusal(self.base, sha), line)
-            self.assertIn(f'commit message carries attribution: {said}', self.head_refusal(self.base, 'b.c'), line)
+            self.assertIn(f'commit message carries attribution: {said}', self.refusal('chain', self.base, sha), line)
+            self.assertIn(f'commit message carries attribution: {said}', self.refusal('head', '--parent', self.base, 'b.c'), line)
 
     def test_a_crlf_footer_is_attribution_too(self):
         self.write('b.c', 'b\n')
         self.git('add', 'b.c')
         self.git('commit', '-q', '--cleanup=verbatim', '-m', 'Fix it\r\n\r\nhttps://claude.ai/code/session_abc\r\n')
         sha = self.git('rev-parse', 'HEAD').strip()
-        self.assertIn('carries attribution', self.refusal(self.base, sha))
-        self.assertIn('carries attribution', self.head_refusal(self.base, 'b.c'))
+        self.assertIn('carries attribution', self.refusal('chain', self.base, sha))
+        self.assertIn('carries attribution', self.refusal('head', '--parent', self.base, 'b.c'))
 
     def test_a_message_that_talks_about_attribution_is_not_attribution(self):
         for message in (
@@ -190,7 +185,7 @@ class CommitsTest(unittest.TestCase):
             self.git('reset', '-q', '--hard', self.base)
             self.write('b.c', message)
             sha = self.commit(message, 'b.c')
-            self.assertEqual(self.refusal(self.base, sha), '', message)
+            self.assertEqual(self.refusal('chain', self.base, sha), '', message)
 
     def test_a_name_that_is_not_utf8_is_an_error_not_a_lookalike(self):
         self.write('bad\ufffd.c', 'owned\n')

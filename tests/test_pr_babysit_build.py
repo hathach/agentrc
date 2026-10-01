@@ -43,7 +43,7 @@ class BuildTest(unittest.TestCase):
         self.assertEqual((out['revision'], out['exit']), (self.base, 1))
         self.assertIn(out['buildDir'], out['command'])
         self.assertNotIn('<BUILD>', out['command'])
-        self.assertTrue(out['cleanup']['ok'])
+        self.assertEqual(out['retained'], [])
         self.assertFalse(os.path.exists(out['buildDir']))
         self.assertIn('$ grep -q', Path(out['log']).read_text(), 'the log is kept')
 
@@ -62,8 +62,7 @@ class BuildTest(unittest.TestCase):
         if os.geteuid() == 0:
             self.skipTest('root can remove a read-only directory')
         self.assertEqual((code, out['exit']), (0, 0))
-        self.assertEqual(out['cleanup']['retained'], [out['buildDir']])
-        self.assertFalse(out['cleanup']['ok'])
+        self.assertEqual(out['retained'], [out['buildDir']])
 
     def test_a_build_that_rewrites_the_candidate_sources_shows_in_the_snapshots(self):
         (self.repo / 'src.c').write_text('int fixed;\n')

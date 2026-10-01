@@ -171,12 +171,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         if actions.get('error'):
             blockers.append(f'action error: {cut(actions["error"])}')
         for h in result.get('handoffs') or []:
-            repair = h.get('repair') or {}
-            why = ('edited after its finding ids were carried' if h.get('edited')
-                   else f"reply {repair['replyId']} has the wrong body ({cut(repair.get('error') or '')}); it settles only if it is the offered body word for word"
-                   if repair.get('replyId') else cut(repair.get('error') or 'no reply posted'))
-            blockers.append(f"comment {h.get('commentId')} needs a human answer, which a relaunch does not give: {why}"
-                            + (f"; draft: {cut(repair['draft'])}" if repair.get('draft') else ''))
+            blockers.append(f"comment {h.get('commentId')} needs a human answer, which a relaunch does not give: {cut(h.get('why') or '')}"
+                            + (f"; draft: {cut(h['draft'])}" if h.get('draft') else ''))
         for u in result.get('sonarUnmarked') or []:
             last = u.get('last') or {}
             blockers.append(f"SonarCloud issue of comment {u.get('commentId')} not marked false positive: "

@@ -10,9 +10,9 @@ Reports what every later step must still be true of: branch (`git rev-parse
 the branch tracks, "" when it tracks none; upstreamBranch, the branch it
 tracks there, "" when none; pushUrls (`git remote get-url
 --push --all <remote>`, which a pushurl can point away from the fetch URL);
-head; dirty, the lines of `git status --porcelain`; pr, echoed; expectedOrigin,
-github.com/<prRepo> lowercased; and badPushUrl, the first push URL that is not
-expectedOrigin over https or ssh, every one when prUrl is not https on
+head; dirty, the lines of `git status --porcelain`; pr, echoed; and
+badPushUrl, the first push URL that is not github.com/<prRepo> over https or
+ssh (case-insensitive), every one when prUrl is not https on
 github.com, "(no push URL)" when there is none, "(empty push URL)" for an
 empty one, "" when all are.
 
@@ -102,7 +102,7 @@ def pin(pr):
             'pushUrls': urls,
             'head': git('rev-parse', 'HEAD').strip(),
             'dirty': git('status', '--porcelain').splitlines(),
-            'pr': pr, 'expectedOrigin': expected, 'badPushUrl': bad_push_url(pr_facts['prUrl'], expected, urls)}
+            'pr': pr, 'badPushUrl': bad_push_url(pr_facts['prUrl'], expected, urls)}
 
 
 def collect(argv):

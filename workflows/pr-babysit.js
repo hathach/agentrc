@@ -399,15 +399,11 @@ const BUILD_PLAN = {
 }
 const BUILD_RUN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['revision'],
+  required: ['revision', 'snapshot', 'snapshotAfter', 'command', 'buildDir', 'exit', 'log', 'retained'],
   properties: {
     revision: { type: 'string' }, snapshot: { type: 'string' }, snapshotAfter: { type: 'string' },
     command: { type: 'string' }, buildDir: { type: 'string' }, exit: { type: 'integer' }, log: { type: 'string' },
-    cleanup: {
-      type: 'object', additionalProperties: false, required: ['ok', 'retained', 'error'],
-      properties: { ok: { type: 'boolean' }, retained: { type: 'array', items: { type: 'string' } }, error: { type: ['string', 'null'] } },
-    },
-    error: { type: 'string' },
+    retained: { type: 'array', items: { type: 'string' } }, error: { type: 'string' },
   },
 })
 const PUSH = withSeal({
@@ -641,10 +637,10 @@ const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPus
 const answeredWith = new Map(restored ? restored.answeredWith : [])
 // Comments edited after we answered them: reply.py may post a second answer beside ours.
 const reanswer = new Set((restored && restored.reanswer) || [])
-// commentId -> { dismissals, notes }: standing debt, not a snapshot; a harvest that drops a finding settles nothing. edited: { from }, the body digest
-// its ids were carried under, once the comment changed: its ids may now name other points, so only a human settles it.
+// commentId -> { dismissals, notes }: standing debt, not a snapshot; a harvest that drops a finding settles nothing. edited: the comment changed
+// after its ids were carried: they may now name other points, so only a human settles it.
 const debt = new Map(restored
-  ? restored.debt.map(([id, { seenSinceEdit, ...d }]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes), ...(seenSinceEdit ? { edited: { from: null } } : {}) }])
+  ? restored.debt.map(([id, { seenSinceEdit, ...d }]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes), ...(seenSinceEdit ? { edited: true } : {}) }])
   : [])
 for (const { key } of restored ? restored.acceptedFailures : []) {
   if (!acceptedArg.some(x => x.key === key)) log(`accepted failure not renewed by this launch, no longer accepted: key ${key}`)
@@ -750,8 +746,8 @@ const finish = (verdict, status) => {
   }
   const state = stateOut()
   // Comments only a human can answer now; a relaunch does not clear them.
-  const handoffs = [...debt].filter(([, d]) => d.edited || d.repair)
-    .map(([commentId, d]) => ({ commentId, ...(d.edited ? { edited: d.edited } : {}), ...(d.repair ? { repair: d.repair } : {}) }))
+  const handoffs = [...debt].filter(([, d]) => handoffWhy(d))
+    .map(([commentId, d]) => ({ commentId, why: handoffWhy(d), ...(d.repair && d.repair.draft ? { draft: d.repair.draft } : {}) }))
   const sonarUnmarked = !markSonar ? [] : [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, how: a.how, last: sonarLast.get(commentId) || (sonarDown ? { outcome: 'not asked', detail: sonarDown } : null) }))
   const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
@@ -760,11 +756,13 @@ const finish = (verdict, status) => {
     rollup: launchRollup(), ...rest, ...(corrections.length ? { corrections } : {}), ...(handoffs.length ? { handoffs } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
   }
 }
-// Only a human answers it now: edited, or a repair with no offered body that may still be the one on the thread.
-const handedOff = (commentId) => {
-  const d = debt.get(commentId)
-  return !!d && (!!d.edited || (!!d.repair && !(d.repair.replyId && d.attempt)))
-}
+// Why only a human answers it now, or null: a repair whose reply may still be the offered body settles by exact reuse.
+const handoffWhy = (d) => !d ? null
+  : d.edited ? 'edited after its finding ids were carried'
+  : !d.repair || (d.repair.replyId && d.attempt) ? null
+  : d.repair.replyId ? `reply ${d.repair.replyId}: ${d.repair.error}`
+  : `no reply posted: ${d.repair.error}`
+const handedOff = (commentId) => !!handoffWhy(debt.get(commentId))
 const owesDismissal = (commentId) => {
   const d = debt.get(commentId)
   return !!d && d.dismissals.size > 0
@@ -899,20 +897,18 @@ const buildCheck = async (tag, owned) => {
   }
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
-  const r = await relayAgent(
+  const r = await relayRun(
     `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}\` ` +
     relayed(BUILD_RUN),
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
-  ).catch(quiet(`build#${tag}`))
+  )
   const why = !r ? 'agent died' : r.error ? r.error
     : r.revision !== expectedHead ? `the receipt is for ${String(r.revision).slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
-    : typeof r.buildDir !== 'string' || typeof r.log !== 'string' || !r.cleanup || !Number.isInteger(r.exit) ? 'incomplete receipt'
     : r.command !== plan.command.replaceAll('<BUILD>', r.buildDir) ? 'the receipt is for another command'
-    : typeof r.snapshot !== 'string' || typeof r.snapshotAfter !== 'string' ? 'no snapshot of the batch'
     : r.snapshot !== r.snapshotAfter ? `the build changed ${owned.join(', ')}, which were verified before it`
     : null
   if (why) return `the build did not count: ${why}`
-  if (!r.cleanup.ok) log(`build#${tag}: cleanup left ${r.cleanup.retained.join(', ') || 'nothing'}${r.cleanup.error ? ` — ${r.cleanup.error}` : ''}`)
+  if (r.retained.length) log(`build#${tag}: cleanup left ${r.retained.join(', ')}`)
   return r.exit === 0 ? null : `the build failed (exit ${r.exit}); log ${r.log}`
 }
 
@@ -925,7 +921,7 @@ const checkCompat = async (label, paths, brief) => {
     'compatible = true when every consumer found still holds, false when one would break or need changing, null when you could not establish it; ' +
     'evidence = the behaviours, the searches you ran and what each consumer expects.',
     { label, phase: 'Fix', agentType: 'finding-verifier', schema: COMPAT },
-  ).catch(quiet(`${label}`))
+  ).catch(quiet(label))
   return !compat ? 'compatibility verifier died'
     : compat.compatible === false ? `breaks code that relies on it: ${compat.evidence}`
     : compat.compatible !== true ? `compatibility not established: ${compat.evidence}`
@@ -951,7 +947,7 @@ const fixAndVerify = async (workIn, tag) => {
     const v = await agent(
       `${IN_CHECKOUT}Run exactly: git -c core.quotePath=false ls-files -- ${candidates.map(c => `'${c}'`).join(' ')}\nReturn files = the paths that command printed, verbatim — no additions, no substitutions.`,
       { label: 'scope:verify', phase: 'Fix', model: 'haiku', schema: SCOPE },
-    ).catch(quiet(`scope:verify`))
+    ).catch(quiet('scope:verify'))
     const exists = new Set((v ? v.files : []).map(canon))
     for (const w of fileless) for (const f of [...w.files])
       if (!exists.has(f)) { w.files.delete(f); log(`scope:${w.key}: dropped ${f} — not confirmed as a repo file`) }
@@ -1076,14 +1072,17 @@ const fixCell = (fixes, id, push, pushFailed) => {
 const VERDICT_ORDER = { valid: 0, stale: 1, invalid: 2 }
 // Comments on none of the PR's id spaces owe nothing; per cycle.
 const retired = new Set()
-const answerState = (commentId) => (debt.get(commentId) || {}).edited ? 'NEEDS A HUMAN: edited after its ids were carried'
-  : (debt.get(commentId) || {}).repair
-  ? `NEEDS REPAIR: ${debt.get(commentId).repair.replyId ? `reply ${debt.get(commentId).repair.replyId} has the wrong body` : debt.get(commentId).repair.error}`
-  : retired.has(commentId) ? 'no reply: comment is not on the PR'
-  : !answeredWith.has(commentId) ? 'reply pending'
-  : answeredWith.get(commentId).how === 'refutation' ? 'replied'
-  : answeredWith.get(commentId).how === 'deferral' ? 'answered with the issue'
+const answerState = (commentId) => {
+  const d = debt.get(commentId)
+  const a = answeredWith.get(commentId)
+  return handoffWhy(d) ? `NEEDS A HUMAN: ${handoffWhy(d)}`
+    : d && d.repair ? `NEEDS REPAIR: reply ${d.repair.replyId} (${d.repair.error}) settles only as the offered body`
+    : retired.has(commentId) ? 'no reply: comment is not on the PR'
+    : !a ? 'reply pending'
+    : a.how === 'refutation' ? 'replied'
+    : a.how === 'deferral' ? 'answered with the issue'
     : owesDismissal(commentId) ? 'deferred to next cycle' : 'answered by fix note'
+}
 
 const cycleSummary = (entry) => {
   const rows = []
@@ -1163,11 +1162,11 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   const checked = [...owned, ...regenerated]
   // A required hook may regenerate files outside the scope: run the hooks first and admit only what appeared after they reported changes, the checked files unchanged; the committer never picks a path.
   const quoted = checked.map(shq).join(' ')
-  const hooks = await relayAgent(
+  const hooks = await relayRun(
     `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
     relayed(HOOKS),
     { label: `hooks#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: HOOKS },
-  ).catch(quiet(`hooks#${cycle}-${what}`))
+  )
   if (!hooks) return { pass: false, committed: false, detail: 'hook agent died', sha: '' }
   if (hooks.error) {
     log(`push#${cycle}-${what}: refusing to publish — no hook evidence: ${hooks.error}`)
@@ -1220,7 +1219,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   }
 
   // Commit and push are separate turns so the commit is audited before it leaves.
-  const made = await relayAgent(
+  const made = await relayRun(
     `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to a new temporary file outside the checkout: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
     'in the style `git log -5 --format=%s` shows, and a body only for a why the diff cannot show; ' +
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
@@ -1230,7 +1229,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
     { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT },
-  ).catch(quiet(`commit#${cycle}-${what}`))
+  )
   // A dead committer or relay error leaves no receipt: the read-back settles it, else committed stays null.
   const lost = made ? made.error : 'commit agent died'
   if (!lost && !made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
@@ -1439,7 +1438,9 @@ const reuseExact = async (cycle, stuck, digestOf) => {
     if (why) { notYet(s, why); continue }
     if (text(i) !== s.attempted) {
       // Proven another body: no later cycle can settle it.
-      delete debt.get(s.commentId).attempt
+      const d = debt.get(s.commentId)
+      d.repair.error = `${d.repair.error}; the reply there is not the offered body`
+      delete d.attempt
       notYet(s, 'the reply there is not the offered body: a human answers it')
       continue
     }
@@ -1734,7 +1735,7 @@ const runCycle = async (cycle, entry) => {
     for (const f of r.findings) {
       const d = debt.get(f.commentId)
       if (!d || d.digest === undefined || d.digest === f.commentDigest) continue
-      if (!d.edited) d.edited = { from: d.digest }
+      d.edited = true
       log(`cycle ${cycle}: comment ${f.commentId} was edited — its finding ids no longer identify what we owe; a human answers it`)
       d.digest = f.commentDigest
     }
@@ -1929,6 +1930,15 @@ const runCycle = async (cycle, entry) => {
     const showsAll = (id, dismissalsToo) => {
       const d = debt.get(id)
       return !d || (!d.edited && [...(dismissalsToo ? d.dismissals : []), ...d.notes].every(k => harvested.has(k)))
+    }
+    // An offered body that answers what the whole comment no longer owes can never settle it; a partial harvest proves nothing.
+    for (const [id, d] of debt) {
+      const how = owed(id)
+      if (!(d.repair && d.repair.replyId && d.attempt) || how === 'wait' || how === 'none' || how === d.attempt.how || !showsAll(id, true)) continue
+      const why = `it offered a ${d.attempt.how}, the comment now owes a ${how}`
+      d.repair.error = `${d.repair.error}; ${why}`
+      delete d.attempt
+      log(`cycle ${cycle}: reply ${d.repair.replyId} to comment ${id}: ${why} — a human answers it`)
     }
     const stuck = [...debt]
       .filter(([id, d]) => d.repair && d.repair.replyId && d.attempt && d.attempt.how === owed(id) && d.attempt.digest === digestOf.get(id) && showsAll(id, true))
@@ -2145,7 +2155,7 @@ const runCycle = async (cycle, entry) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'expectedOrigin', 'badPushUrl'],
+  required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl'],
   properties: {
     error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
@@ -2153,7 +2163,7 @@ const PIN = withSeal({
     remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
-    pr: { type: 'integer' }, expectedOrigin: { type: 'string' }, badPushUrl: { type: 'string' },
+    pr: { type: 'integer' }, badPushUrl: { type: 'string' },
   },
 })
 if (cyclesUsed >= maxCycles) {
@@ -2200,8 +2210,9 @@ if (adoptHead === null && restored && restored.pin && pinned.head.trim() !== res
   return finish(stop(cyclesUsed, 'stale-head', { head: pinned.head.trim(), expected: restored.expectedHead }))
 }
 if (pinned.badPushUrl) {
-  log(`preflight: ${pinned.remote} pushes to ${pinned.badPushUrl}, not PR #${args.pr}'s head repository ${pinned.expectedOrigin} (only github.com over https or ssh)`)
-  return finish(stop(cyclesUsed, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected: pinned.expectedOrigin }))
+  const expected = `github.com/${pinned.prRepo.trim().toLowerCase()}`
+  log(`preflight: ${pinned.remote} pushes to ${pinned.badPushUrl}, not PR #${args.pr}'s head repository ${expected} (only github.com over https or ssh)`)
+  return finish(stop(cyclesUsed, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected }))
 }
 // Adoption replaces the head checks: checkout at adoptHead, PR at the state's head or a chain commit, the chain audited commit by commit.
 let adoption = null

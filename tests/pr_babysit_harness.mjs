@@ -75,7 +75,7 @@ const PIN = {
   prHead: HEAD, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
-  pr: 3888, expectedOrigin: 'github.com/hathach/tinyusb', badPushUrl: '',
+  pr: 3888, badPushUrl: '',
 }
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
 const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [], status: [] }
@@ -463,7 +463,7 @@ async function run(opts = {}) {
       return conforms(options.schema, bare({
         revision: head, snapshot: 'snap', snapshotAfter: 'snap',
         command: asked('command')[0].replaceAll('<BUILD>', '/tmp/b'), buildDir: '/tmp/b', exit,
-        log: '/tmp/candidate.log', cleanup: { ok: true, retained: [], error: null },
+        log: '/tmp/candidate.log', retained: [],
         ...(typeof over === 'function' ? over(label, String(prompt)) : over),
       }), label)
     }
@@ -664,7 +664,7 @@ test('the preflight pins the checkout without touching it', async () => {
   assert.match(pre.prompt, /Editing and committing nothing/)
   assert.ok(pre.prompt.includes('preflight.py --pr 3888`'), pre.prompt)
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'expectedOrigin', 'head', 'pr', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -989,8 +989,6 @@ test('a build receipt counts only as the run that was asked for', async () => {
   for (const [candidate, why] of [
     [{ revision: 'f'.repeat(40) }, /the receipt is for fffffff, not /],
     [{ command: 'make other' }, /the receipt is for another command/],
-    [{ exit: null }, /incomplete receipt/],
-    [{ snapshotAfter: null }, /no snapshot of the batch/],
     [{ snapshotAfter: 'other' }, /the build changed src\/a\.c, which were verified before it/],
   ]) {
     const { result, logs } = await run({ reviews: oneValid, candidate })
@@ -1017,7 +1015,7 @@ test('writers whose own builds passed still do not publish a combined candidate 
 })
 
 test('a build directory left behind is logged', async () => {
-  const { logs } = await run({ reviews: oneValid, candidate: { cleanup: { ok: false, retained: ['/tmp/b'], error: null } } })
+  const { logs } = await run({ reviews: oneValid, candidate: { retained: ['/tmp/b'] } })
   assert.ok(logs.some(l => /build#1-review: cleanup left \/tmp\/b/.test(l)))
 })
 
@@ -2982,7 +2980,7 @@ test('a reply that landed with the wrong body is a repair for a human, never rep
     assert.deepEqual(labels.filter(l => /^(replies|inspect|reuse)#/.test(l)), ['replies#1', 'inspect#2'], name)
     assert.ok(logs.some(l => /reply 502 to comment 2 still needs repair — the reply there is not the offered body: a human answers it/.test(l)), name)
     assert.notEqual(result.pass, true, name)
-    assert.deepEqual(result.handoffs, [{ commentId: 2, repair: { replyId: 502, error } }], name)
+    assert.deepEqual(result.handoffs, [{ commentId: 2, why: `reply 502: ${error}; the reply there is not the offered body` }], name)
   }
 })
 
@@ -3013,7 +3011,8 @@ test('a repair obligation survives a restart and still blocks a repost', async (
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' },
     challenge: { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
-  assert.deepEqual(first.result.state.debt.find(([id]) => id === 2)[1].repair, { replyId: 502, error: 'read-back mismatch on body' })
+  assert.equal(debtOf(first.result, 2).repair.replyId, 502)
+  assert.match(debtOf(first.result, 2).repair.error, /^read-back mismatch on body/)
   assert.equal(second.calls.some(c => c.label.startsWith('replies#')), false, 'reposted over a reply that needs repair')
   assert.ok(second.result.handoffs.some(h => h.commentId === 2), 'the restored repair is still handed off')
 })
@@ -3034,7 +3033,7 @@ test('a reply already there in other words keeps the repair for a human, with no
   const inspect = calls.find(c => c.label === 'inspect#2')
   assert.match(inspect.prompt, /reply\.py --pr \d+ --inspect 2:502`/)
   assert.equal(labels.some(l => l.startsWith('reuse#')), false, 'no settling on another body')
-  assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, HELD)
+  assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, { ...HELD, error: `${HELD.error}; the reply there is not the offered body` })
   assert.ok(logs.some(l => /comment 2 still needs repair — the reply there is not the offered body/.test(l)))
   assert.equal(calls.filter(c => c.label.startsWith('replies#')).length, 1, 'nothing reposted')
 })
@@ -3050,7 +3049,8 @@ test('a reply or comment that changed, or a reuse that is not verified, keeps th
     { reuse: null },
   ]) {
     const { result, logs } = await run(heldForRepair({ answers: () => true, ...over }))
-    assert.deepEqual(result.state.debt.find(([id]) => id === 2)[1].repair, HELD, JSON.stringify(over))
+    const { replyId, error } = result.state.debt.find(([id]) => id === 2)[1].repair
+    assert.ok(replyId === HELD.replyId && error.startsWith(HELD.error), JSON.stringify(over))
     assert.ok(logs.some(l => /reply 502 to comment 2 still needs repair/.test(l)), JSON.stringify(over))
   }
 })
@@ -3087,8 +3087,10 @@ test('a dry run inspects a reply already there, and settles nothing', async () =
 
 test('a settled reuse survives a resumed launch and nothing is posted twice', async () => {
   const first = await run(heldForRepair({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true } }))
+  assert.equal(first.result.handoffs, undefined, 'a repair exact reuse can still settle is not a human\'s yet')
   const second = await run({ ...heldForRepair(asOffered()), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
   assert.ok(second.labels.includes('reuse#2'))
+  assert.equal(second.result.handoffs, undefined)
   const third = await run({ ...heldForRepair(asOffered()), args: { autoPush: true, maxCycles: 3, state: second.result.state } })
   assert.equal(third.labels.some(l => /^(inspect|reuse|replies)#/.test(l)), false, 'an answered comment owes nothing')
 })
@@ -3113,7 +3115,34 @@ test('a reply already there is not reused while the harvest leaves out a point i
   const whole = await resumeAt(partial.result.state, { args: { autoPush: true, maxCycles: 5 }, ...offered,
     reviews: { findings: [stale(4), stale(5)], replies: [], bots: 'reviewed' } })
   assert.equal(whole.labels.some(l => /^(inspect|reuse)#/.test(l)), false, 'a fix note offered is not reused as the refutation now owed')
-  assert.ok(whole.result.handoffs.some(h => h.commentId === 2))
+  assert.match(whole.result.handoffs.find(h => h.commentId === 2).why, /^reply 502: .*; it offered a \w[\w ]*, the comment now owes a refutation$/)
+})
+
+test('a partial harvest preserves a mixed fix and deferral reply for later exact reuse', async () => {
+  const args = { autoPush: true, maxCycles: 5, yieldAfterCycle: true,
+    deferrals: [deferral({ findingId: '2#5', commentDigest: 'd2' })] }
+  const reviews = { findings: [finding({ commentId: 2, line: 4 }), finding({ commentId: 2, line: 5 })],
+    replies: [], bots: 'reviewed' }
+  const first = await run(heldForRepair({ args, reviews }))
+  const attempt = { ...debtOf(first.result, 2).attempt }
+  assert.equal(attempt.how, 'fixNote')
+  assert.equal(debtOf(first.result, 2).repair.replyId, 502)
+  const offered = asOffered(attempt.body)
+
+  const partial = await resumeAt(first.result.state, { args, ...offered,
+    reviews: { ...reviews, findings: [reviews.findings[1]] } })
+  assert.deepEqual(debtOf(partial.result, 2).attempt, attempt)
+  assert.deepEqual(debtOf(partial.result, 2).notes, ['2#4', '2#5'])
+  assert.equal(partial.result.handoffs, undefined)
+  assert.equal(partial.labels.some(l => /^(inspect|reuse)#/.test(l)), false)
+
+  const whole = await resumeAt(partial.result.state, { args, ...offered, reviews })
+  assert.ok(whole.labels.includes('inspect#3'))
+  assert.ok(whole.labels.includes('reuse#3'))
+  assert.ok(whole.logs.some(l => /cycle 3: comment 2 settled on reply 502, already there/.test(l)))
+  assert.equal(whole.result.state.debt.some(([id]) => id === 2), false)
+  assert.equal(whole.result.state.answeredWith.find(([id]) => id === 2)[1].how, 'fixNote')
+  assert.equal(whole.result.handoffs, undefined)
 })
 
 // Comment 1 with two deferred points, left owed by a dry run.
@@ -3161,7 +3190,7 @@ test('after an edit, the points reported against the new body must all be shown'
   const dry = await deferredTwo()
   const seen = await run({ reviews: both, args: { autoPush: false, maxCycles: 5, state: dry.result.state,
     deferrals: [deferral({ commentDigest: 'd2' }), deferral({ findingId: '1#2', commentDigest: 'd2' })] } })
-  assert.deepEqual(debtOf(seen.result, 1).edited, { from: 'd1' })
+  assert.equal(debtOf(seen.result, 1).edited, true)
   const { labels, result } = await run({ reviews: { ...both, findings: [edited(finding())] }, args: { autoPush: true, maxCycles: 5, state: seen.result.state } })
   assert.equal(labels.some(l => l.startsWith('defer#')), false, 'a deferral reply naming one point of the edited body\'s two')
   assert.notEqual(result.pass, true)
@@ -3201,7 +3230,7 @@ test('a held id from before an edit is not named as the edited body\'s', async (
       : { verdicts: [{ id: 0, upheld: true, reason: 'stands' }] },
   })
   assert.deepEqual(result.state.holds.map(([id]) => id), ['1#2'], 'the hold itself is kept')
-  assert.deepEqual(debtOf(result, 1).edited, { from: 'd1' })
+  assert.equal(debtOf(result, 1).edited, true)
   assert.equal(result.cycles, 2, 'no later cycle can answer a comment handed to a human')
   assert.equal(calls.some(c => c.label === 'reviews#3'), false)
 })
@@ -3331,7 +3360,7 @@ test('a comment edited while a deferral note is owed goes to a human, even with 
   const { result, labels } = await run({ reviews: edited, args: { deferrals: [deferral({ commentDigest: 'd1-edited' })], maxCycles: 3, state: first.result.state } })
   assert.equal(labels.some(l => l.startsWith('defer#')), false)
   assert.notEqual(result.pass, true)
-  assert.deepEqual(result.handoffs, [{ commentId: 1, edited: { from: 'd1' } }])
+  assert.deepEqual(result.handoffs, [{ commentId: 1, why: 'edited after its finding ids were carried' }])
 })
 
 test('a deferral already answered cannot be changed to another issue or reason', async () => {
@@ -3852,7 +3881,7 @@ test('the drafter is told both reply limits, and a draft within the words but ov
   assert.match(calls.find(c => c.label === 'reviews#1').prompt, /each point has at most 60 words and no line is over 300 characters/)
   assert.ok(logs.some(l => /no reply posted to comment 2 \(over length: .* a line 300 characters\) — a human answers it/.test(l)), logs.join('\n'))
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
-  assert.equal(result.handoffs[0].repair.draft, long)
+  assert.equal(result.handoffs[0].draft, long)
 })
 
 test('a reply with a point over the length limit is never posted or cut, and goes to a human with its draft', async () => {
@@ -3867,7 +3896,7 @@ test('a reply with a point over the length limit is never posted or cut, and goe
   const owed = long.result.state.debt.find(([id]) => id === 2)[1]
   assert.deepEqual(owed.repair, { replyId: null, error: 'over length: a point exceeds 60 words or a line 300 characters', draft: wordy })
   assert.equal(owed.attempt, undefined, 'a withheld draft is not an offered body')
-  assert.deepEqual(long.result.handoffs, [{ commentId: 2, repair: owed.repair }])
+  assert.deepEqual(long.result.handoffs, [{ commentId: 2, why: `no reply posted: ${owed.repair.error}`, draft: wordy }])
   const shorter = await run({
     args: { autoPush: true, maxCycles: 2, state: long.result.state },
     reviews: { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'short' }], bots: 'reviewed' },
@@ -3899,8 +3928,8 @@ test('an offered answer the comment outgrew goes to a human, not a reuse or a re
   })
   assert.equal(edited.result.pass, false)
   assert.deepEqual(edited.labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'], 'no repost under the edited comment')
-  assert.deepEqual(edited.result.state.debt.find(([id]) => id === 2)[1].edited, { from: 'd1' })
-  assert.match(rowsOf(summaries(edited.logs)[1])[0][3], /NEEDS A HUMAN: edited after its ids were carried/)
+  assert.equal(edited.result.state.debt.find(([id]) => id === 2)[1].edited, true)
+  assert.match(rowsOf(summaries(edited.logs)[1])[0][3], /NEEDS A HUMAN: edited after its finding ids/)
   cycle = 0
   const flipped = await run({
     args: { autoPush: true, maxCycles: 2 },
@@ -4122,11 +4151,11 @@ test('an edit is recorded before a refused deferral stops the run, and survives 
   const edited = await run({ reviews: { findings: [finding({ commentDigest: 'edited' })], replies: [], bots: 'reviewed' },
     args: { maxCycles: 4, yieldAfterCycle: true, state: first.result.state } })
   assert.equal(edited.result.reason, 'deferral-refused')
-  assert.deepEqual(edited.result.handoffs, [{ commentId: 1, edited: { from: 'd1' } }])
+  assert.deepEqual(edited.result.handoffs, [{ commentId: 1, why: 'edited after its finding ids were carried' }])
   const reverted = await run({ reviews: oneValid, args: { maxCycles: 4, autoPush: true, state: edited.result.state } })
   assert.equal(reverted.labels.some(l => l.startsWith('defer#')), false)
   assert.notEqual(reverted.result.pass, true)
-  assert.deepEqual(reverted.result.handoffs, [{ commentId: 1, edited: { from: 'd1' } }])
+  assert.deepEqual(reverted.result.handoffs, [{ commentId: 1, why: 'edited after its finding ids were carried' }])
 })
 
 test('an older state carrying seenSinceEdit loads as an edited comment for a human', async () => {
@@ -4134,8 +4163,8 @@ test('an older state carrying seenSinceEdit loads as an edited comment for a hum
   const { result, calls } = await run({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, reviewers: ['coderabbit'], state: st },
     reviews: { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'after' })], replies: [{ commentId: 7, body: 'no' }], bots: 'reviewed' } })
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
-  assert.deepEqual(result.handoffs, [{ commentId: 7, edited: { from: null } }])
-  assert.deepEqual(debtOf(result, 7), { dismissals: ['7#1'], notes: [], edited: { from: null }, digest: 'after' })
+  assert.deepEqual(result.handoffs, [{ commentId: 7, why: 'edited after its finding ids were carried' }])
+  assert.deepEqual(debtOf(result, 7), { dismissals: ['7#1'], notes: [], edited: true, digest: 'after' })
 })
 
 test('an edited comment goes to a human: a later refutation does not answer it', async () => {
@@ -4160,7 +4189,7 @@ test('an edited comment goes to a human: a later refutation does not answer it',
   })
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
   assert.notEqual(result.pass, true)
-  assert.deepEqual(result.handoffs, [{ commentId: 7, edited: { from: 'before' } }])
+  assert.deepEqual(result.handoffs, [{ commentId: 7, why: 'edited after its finding ids were carried' }])
 })
 
 test('a harvest that reuses a findingId is rejected', async () => {

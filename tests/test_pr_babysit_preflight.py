@@ -71,7 +71,7 @@ class PreflightTest(unittest.TestCase):
             'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prRepo': 'someone/tinyusb',
             'prUrl': VIEW['url'], 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
             'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o'],
-            'pr': 7, 'expectedOrigin': 'github.com/someone/tinyusb', 'badPushUrl': ''})
+            'pr': 7, 'badPushUrl': ''})
 
     def test_a_push_url_outside_the_pr_head_repository_is_named(self):
         good = 'git@github.com:someone/tinyusb.git'

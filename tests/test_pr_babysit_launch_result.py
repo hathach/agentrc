@@ -207,15 +207,12 @@ class LaunchResultTest(unittest.TestCase):
     def test_a_comment_only_a_human_can_answer_is_a_blocker(self):
         data = output()
         data['result']['handoffs'] = [
-            {'commentId': 5, 'edited': {'from': 'd5'}},
-            {'commentId': 6, 'repair': {'replyId': 66, 'error': 'read-back mismatch'}},
-            {'commentId': 7, 'repair': {'replyId': None, 'error': 'over length', 'draft': 'a long draft'}}]
+            {'commentId': 5, 'why': 'edited after its finding ids were carried'},
+            {'commentId': 7, 'why': 'no reply posted: over length', 'draft': 'a long draft'}]
         _, s = self.run_it(data)
         self.assertEqual([b for b in s['blockers'] if 'needs a human answer' in b], [
             'comment 5 needs a human answer, which a relaunch does not give: edited after its finding ids were carried',
-            'comment 6 needs a human answer, which a relaunch does not give: reply 66 has the wrong body (read-back mismatch); '
-            'it settles only if it is the offered body word for word',
-            'comment 7 needs a human answer, which a relaunch does not give: over length; draft: a long draft'])
+            'comment 7 needs a human answer, which a relaunch does not give: no reply posted: over length; draft: a long draft'])
 
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [

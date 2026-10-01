@@ -12,9 +12,9 @@ before the build and again after it as `snapshotAfter`: a build that rewrote
 the batch's sources shows as two different digests.
 
 stdout ends with one JSON line {revision, snapshot, snapshotAfter, command,
-buildDir, exit, log, cleanup: {ok, retained, error}, seal} (seal:
-facts.sealed): revision is HEAD, command with <BUILD> expanded, exit the
-build's status. Exit 0 with that line, whatever the build did; exit 2 with
+buildDir, exit, log, retained, seal} (seal: facts.sealed): revision is
+HEAD, command with <BUILD> expanded, exit the build's status, retained what
+cleanup had to leave behind. Exit 0 with that line, whatever the build did; exit 2 with
 {"error": ...} when the build could not be set up, naming anything cleanup had
 to leave behind.
 """
@@ -60,8 +60,7 @@ def collect(argv):
 
     def cleanup():
         shutil.rmtree(build, ignore_errors=True)
-        retained = [build] if os.path.exists(build) else []
-        return {'ok': not retained, 'retained': retained, 'error': None}
+        return [build] if os.path.exists(build) else []
 
     command = a.command.replace('<BUILD>', build)
     try:
@@ -72,10 +71,10 @@ def collect(argv):
             build_exit = subprocess.run(['bash', '-c', command], cwd=top, stdout=out, stderr=subprocess.STDOUT).returncode
         after = snapshot(a.path)
     except (Unusable, OSError) as e:
-        c = cleanup()
-        raise Unusable(str(e) if c['ok'] else f"{e}; cleanup left {c['retained']}")
+        retained = cleanup()
+        raise Unusable(f'{e}; cleanup left {retained}' if retained else str(e))
     return {'revision': revision, 'snapshot': snap, 'snapshotAfter': after, 'command': command,
-            'buildDir': build, 'exit': build_exit, 'log': log, 'cleanup': cleanup()}
+            'buildDir': build, 'exit': build_exit, 'log': log, 'retained': cleanup()}
 
 
 if __name__ == '__main__':
