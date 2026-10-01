@@ -57,15 +57,11 @@ class CommitsTest(unittest.TestCase):
         self.write('a.c', 'changed\n')
         self.write('left.c', 'left\n')
         sha = self.commit('fix: the thing\n\nWhy it matters.', *odd)
-        self.write('src/space name.c', 'edited after\n')
-        code, out = self.run_script('head', *odd, 'a.c')
+        code, out = self.run_script('head', '--parent', self.base, *odd)
         self.assertEqual(code, 0)
-        self.assertEqual(out['sha'], sha)
-        self.assertEqual(out['parents'], [self.base])
-        self.assertEqual(sorted(out['paths']), sorted(odd))
-        self.assertEqual(out['message'], 'fix: the thing\n\nWhy it matters.')
-        self.assertEqual(sorted(out['leftover']), [' M a.c', ' M src/space name.c'])
-        self.assertEqual(len(out['entries']), 4)
+        self.assertEqual((out['sha'], out['parent'], out['scope'], out['refusal']), (sha, self.base, odd, ''),
+                         'a change outside the scope is not left behind')
+        self.assertEqual(len(out['entries']), 3)
         blob = self.git('rev-parse', f'{sha}:src/quote"name.c').strip()
         self.assertIn(f'100644 blob {blob}\tsrc/quote"name.c', out['entries'])
         rest = {k: v for k, v in out.items() if k != 'seal'}
@@ -76,19 +72,35 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(sealed({'a': 1, 'b': None, 'c': [{'d': None, 'e': 'é'}]})['seal'], sealed({'c': [{'e': 'é'}], 'a': 1})['seal'])
         self.assertNotEqual(sealed({'a': 'x' * 40})['seal'], sealed({'a': 'x' * 35})['seal'])
 
-    def test_head_reports_a_deletion_by_its_absence_and_every_parent_of_a_merge(self):
+    def test_head_reports_a_deletion_by_its_absence(self):
         self.git('rm', '-q', 'a.c')
         self.git('commit', '-q', '-m', 'drop')
-        code, out = self.run_script('head', 'a.c')
-        self.assertEqual((code, out['paths'], out['entries']), (0, ['a.c'], []))
-        self.git('checkout', '-q', '-b', 'side', self.base)
+        code, out = self.run_script('head', '--parent', self.base, 'a.c')
+        self.assertEqual((code, out['entries'], out['refusal']), (0, [], ''))
+
+    def head_refusal(self, parent, *paths):
+        code, out = self.run_script('head', '--parent', parent, *paths)
+        self.assertEqual(code, 0)
+        return out['refusal']
+
+    def test_head_refuses_a_commit_it_cannot_publish(self):
+        self.assertEqual(self.head_refusal(self.base, 'a.c'), 'nothing was committed: HEAD is still the parent')
+        self.write('a.c', 'one\n')
         self.write('b.c', 'b\n')
-        side = self.commit('side', 'b.c')
-        self.git('checkout', '-q', '-')
-        self.git('merge', '-q', '--no-edit', 'side')
-        code, out = self.run_script('head', 'b.c')
-        self.assertEqual(len(out['parents']), 2)
-        self.assertIn(side, out['parents'])
+        one = self.commit('one', 'a.c', 'b.c')
+        self.assertIn(f'sits on {self.base[:7]}, not 1111111', self.head_refusal('1' * 40, 'a.c', 'b.c'))
+        self.assertEqual(self.head_refusal(self.base, 'a.c'), 'the commit carries unowned path(s): b.c')
+        self.write('c.c', 'c\n')
+        self.assertEqual(self.head_refusal(self.base, 'a.c', 'b.c', 'c.c'), 'the commit left owned change(s) behind: ?? c.c')
+        self.git('commit', '-q', '--amend', '--allow-empty-message', '-m', '')
+        self.assertEqual(self.head_refusal(self.base, 'a.c', 'b.c'), 'the commit has no message')
+        # A merge whose first parent is right still brings history nothing audited.
+        self.git('checkout', '-q', '-b', 'side', self.base)
+        self.write('s.c', 's\n')
+        side = self.commit('side', 's.c')
+        self.git('checkout', '-q', '--detach', one)
+        self.git('merge', '-q', '--no-ff', '--no-edit', side)
+        self.assertIn('has 2 parents', self.head_refusal(one, 's.c'))
 
     def test_head_moving_while_read_is_an_error(self):
         real = commits.git
@@ -98,7 +110,7 @@ class CommitsTest(unittest.TestCase):
             os.chdir(self.repo)
             try:
                 with self.assertRaisesRegex(commits.Unusable, 'HEAD moved'):
-                    commits.head(['a.c'])
+                    commits.head(self.base, ['a.c'])
             finally:
                 os.chdir(cwd)
 
@@ -131,43 +143,60 @@ class CommitsTest(unittest.TestCase):
         side = self.commit('side', 's.c')
         self.git('checkout', '-q', '--detach', one)
         self.git('merge', '-q', '--no-ff', '--no-edit', side)
-        self.assertIn('is a merge or a root', self.refusal(one, self.git('rev-parse', 'HEAD').strip()))
+        self.assertIn('has 2 parents', self.refusal(one, self.git('rev-parse', 'HEAD').strip()))
         # From a commit beside the chain: its first commit does not sit on it.
         self.git('checkout', '-q', '--detach', one)
         self.write('t.c', 't\n')
-        self.assertIn('does not sit on the commit before it', self.refusal(side, self.commit('two', 't.c')))
+        self.assertIn(f'sits on {one[:7]}, not {side[:7]}', self.refusal(side, self.commit('two', 't.c')))
 
     def test_a_message_crediting_an_agent_is_refused(self):
-        for message, said in (
-                ('fix\n\nCo-authored-by: Claude <noreply@anthropic.com>', 'Co-authored-by: Claude'),
-                ('fix\n\nClaude-Session: https://claude.ai/code/session_abc', 'Claude-Session:'),
-                ('fix\n\n🤖 Generated with [Claude Code](https://claude.com)', '🤖 Generated with'),
-                ('fix\n\nGenerated by Codex', 'Generated by Codex'),
+        for line, said in (
+                ('Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>', 'Co-Authored-By: Claude Sonnet 5'),
+                # A human co-author is still not this run's to claim.
+                ('co-authored-by: Ha Thach <thach@tinyusb.org>', 'co-authored-by: Ha Thach'),
+                ('Claude-Session: https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ', 'Claude-Session:'),
+                ('Codex-Session-Id: 0192', 'Codex-Session-Id: 0192'),
+                ('Session-URL: https://example', 'Session-URL:'),
+                ('🤖 Generated with [Claude Code](https://claude.com/claude-code)', '🤖 Generated with [Claude Code]'),
+                ('Generated by Codex', 'Generated by Codex'),
                 # \b is ASCII, as in the JavaScript it was ported from.
-                ('fix\n\nGenerated by Codex助手', 'Generated by Codex助手'),
-                ('fix\n\nhttps://claude.ai/code/session_abc', 'https://claude.ai/code/session_abc')):
+                ('Generated by Codex助手', 'Generated by Codex助手'),
+                ('Generated with ChatGPT', 'Generated with ChatGPT'),
+                ('Authored-by: Claude', 'Authored-by: Claude'),
+                ('Written by an AI agent', 'Written by an AI agent'),
+                ('https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ', 'https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ')):
+            self.git('reset', '-q', '--hard', self.base)
+            self.write('b.c', line)
+            sha = self.commit(f'Fix the finding\n\n{line}\n', 'b.c')
+            self.assertIn(f'commit message carries attribution: {said}', self.refusal(self.base, sha), line)
+            self.assertIn(f'commit message carries attribution: {said}', self.head_refusal(self.base, 'b.c'), line)
+
+    def test_a_crlf_footer_is_attribution_too(self):
+        self.write('b.c', 'b\n')
+        self.git('add', 'b.c')
+        self.git('commit', '-q', '--cleanup=verbatim', '-m', 'Fix it\r\n\r\nhttps://claude.ai/code/session_abc\r\n')
+        sha = self.git('rev-parse', 'HEAD').strip()
+        self.assertIn('carries attribution', self.refusal(self.base, sha))
+        self.assertIn('carries attribution', self.head_refusal(self.base, 'b.c'))
+
+    def test_a_message_that_talks_about_attribution_is_not_attribution(self):
+        for message in (
+                'Fix handling of claude.ai/code/ URLs in the reply script\n',
+                'Session: reject expired tokens\n',
+                'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n',
+                'Refuse a commit generated with a session trailer\n\nThe audit reads the message back.\n',
+                'Drop the Generated-with footer from PR bodies\n',
+                'Generated by GPTimer\n\nWritten by an aide, generated by an aircraft simulator.\n'):
             self.git('reset', '-q', '--hard', self.base)
             self.write('b.c', message)
             sha = self.commit(message, 'b.c')
-            self.assertIn(f'commit message carries attribution: {said}', self.refusal(self.base, sha), message)
-        self.git('reset', '-q', '--hard', self.base)
-        self.write('b.c', 'x')
-        sha = self.commit('fix\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\nmade with care', 'b.c')
-        self.assertEqual(self.refusal(self.base, sha), '')
-
-    def test_a_message_is_read_without_its_trailing_whitespace(self):
-        # A relay drops it (tinyusb#4019), and the copy then fails its seal.
-        self.write('b.c', 'b\n')
-        self.git('add', 'b.c')
-        self.git('commit', '-q', '--cleanup=verbatim', '-m', 'subject\n\nbody ends in spaces   \n\n')
-        code, out = self.run_script('head', 'b.c')
-        self.assertEqual((code, out['message']), (0, 'subject\n\nbody ends in spaces'))
+            self.assertEqual(self.refusal(self.base, sha), '', message)
 
     def test_a_name_that_is_not_utf8_is_an_error_not_a_lookalike(self):
         self.write('bad\ufffd.c', 'owned\n')
         (self.repo / b'bad\xff.c'.decode('utf-8', 'surrogateescape')).write_text('stray\n')
         self.commit('both', '.')
-        code, out = self.run_script('head', 'bad\ufffd.c')
+        code, out = self.run_script('head', '--parent', self.base, 'bad\ufffd.c')
         self.assertEqual(code, 2)
         self.assertIn('not UTF-8', out['error'])
 
@@ -196,8 +225,8 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual((code, out['committed']), (0, True), out)
         self.assertEqual(self.git('show', '--name-only', '--format=', 'HEAD').split('\n')[:-1], [':(top)*'])
         self.assertIn(' M a.c', self.git('status', '--porcelain'))
-        code, seen = self.run_script('head', ':(top)*')
-        self.assertEqual((code, seen['leftover'], len(seen['entries'])), (0, [], 1), 'the audit reads back the same one file')
+        code, seen = self.run_script('head', '--parent', self.base, ':(top)*')
+        self.assertEqual((code, seen['refusal'], len(seen['entries'])), (0, '', 1), 'the audit reads back the same one file')
 
     def test_a_hook_that_moves_head_and_fails_is_no_clean_refusal(self):
         self.hook('git commit -q --allow-empty -m nested --no-verify\nexit 1')
@@ -215,7 +244,8 @@ class CommitsTest(unittest.TestCase):
 
     def test_errors(self):
         for argv, want in ((['chain', 'HEAD~1', 'HEAD'], 'not a full SHA'), (['chain', self.base], 'usage'),
-                           (['head'], 'usage'), (['frob'], 'usage'), (['commit'], 'usage'),
+                           (['head'], 'usage'), (['head', 'a.c'], 'usage'), (['head', '--parent', 'HEAD', 'a.c'], 'not a full SHA'),
+                           (['frob'], 'usage'), (['commit'], 'usage'),
                            (['chain', self.base, 'f' * 40], 'git rev-list')):
             code, out = self.run_script(*argv)
             self.assertEqual(code, 2, argv)

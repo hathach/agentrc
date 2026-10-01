@@ -2,7 +2,7 @@
 """Commit by path, and read back what commits hold, for pr-babysit to audit before it publishes.
 
   commits.py commit PATH...  commit exactly PATH, with the message on stdin
-  commits.py head PATH...    the commit at HEAD, and PATH as the tree has it
+  commits.py head --parent P PATH...  audit the commit at HEAD, made on P from PATH
   commits.py chain FROM TO   audit FROM..TO for adoption (full SHAs)
 
 `commit` stages PATH and runs `git commit --only`, so nothing staged beside
@@ -12,20 +12,23 @@ or before staging anything when the message is blank.
 
 Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
 -r -z`, one string per filename, unquoted) and message (`%B` without its
-trailing whitespace, which a relay drops and the seal would then refuse).
+trailing whitespace, so a CRLF footer still ends its line).
+A link of a chain, or the head commit, is refused when it is a merge or a root,
+does not sit on the commit before it, touches no path, or has a message line
+crediting an agent, model, tool or session.
 `chain` reports from and to as given, commits (the SHAs of FROM..TO, oldest
 first), paths (each path any of them touches, once) and refusal, "" or why
-the chain cannot be adopted: empty, not ending at TO, a merge or a root, a
-commit not on the one before it, a commit touching no path, or a message line
-crediting an agent, model, tool or session.
-`head` resolves HEAD once, reads everything from that SHA and adds leftover
-(`git status --porcelain -z -- PATH` records) and entries (`git ls-tree -z
-<sha> -- PATH` lines); HEAD moving while it reads is an error. PATH is never
-read as an option or as pathspec magic.
+the chain cannot be adopted: empty, not ending at TO, or a link refused.
+`head` resolves HEAD once and reads everything from that SHA; HEAD moving while
+it reads is an error. It reports parent and scope (PATH) as given, sha, entries
+(`git ls-tree -z <sha> -- PATH` lines) and refusal, "" or why the commit cannot
+be published: HEAD still at P, the link refused, a path outside PATH, a change
+to PATH left uncommitted (`git status --porcelain -z -- PATH`), or a blank
+message. PATH is never read as an option or as pathspec magic.
 
-stdout ends with one JSON line: `head` prints {sha, parents, paths, leftover,
-entries, message}, `chain` {from, to, commits, paths, refusal}, each line but an error one with its
-`seal` (facts.sealed). Exit 0 with that line; exit 2
+stdout ends with one JSON line: `head` prints {parent, scope, sha, entries,
+refusal}, `chain` {from, to, commits, paths, refusal}, each line but an error one
+with its `seal` (facts.sealed). Exit 0 with that line; exit 2
 with {"error": ...} when git cannot answer or the arguments are wrong.
 """
 
@@ -62,22 +65,44 @@ def commit(sha):
             'message': git('log', '-1', '--format=%B', sha).rstrip()}
 
 
-def head(paths):
+def full(sha):
+    if not FULL_SHA.match(sha):
+        raise Unusable(f'not a full SHA: {sha!r}')
+    return sha
+
+
+def link_refusal(c, parent):
+    sha = c['sha'][:7]
+    if len(c['parents']) != 1:
+        return f"{sha} has {len(c['parents'])} parents: history this run cannot audit"
+    if c['parents'][0] != parent:
+        return f"{sha} sits on {c['parents'][0][:7]}, not {parent[:7]}"
+    if not c['paths']:
+        return f'{sha} touches no path'
+    said = attribution_in(c['message'])
+    return f'commit message carries attribution: {said.strip()}' if said else ''
+
+
+def head(parent, paths):
+    full(parent)
     sha = git('rev-parse', 'HEAD').strip()
-    facts = {**commit(sha),
-             'leftover': records(git('--literal-pathspecs', 'status', '--porcelain', '-z', '--', *paths)),
-             'entries': records(git('--literal-pathspecs', 'ls-tree', '-z', sha, '--', *paths))}
+    c = commit(sha)
+    leftover = records(git('--literal-pathspecs', 'status', '--porcelain', '-z', '--', *paths))
+    entries = records(git('--literal-pathspecs', 'ls-tree', '-z', sha, '--', *paths))
     now = git('rev-parse', 'HEAD').strip()
     if now != sha:
         raise Unusable(f'HEAD moved from {sha} to {now} while it was read')
-    return facts
+    strays = [f for f in c['paths'] if f not in paths]
+    refusal = ('nothing was committed: HEAD is still the parent' if sha == parent
+               else link_refusal(c, parent)
+               or (strays and f"the commit carries unowned path(s): {', '.join(strays)}")
+               or (leftover and f"the commit left owned change(s) behind: {', '.join(leftover)}")
+               or ('the commit has no message' if not c['message'].strip() else ''))
+    return {'parent': parent, 'scope': paths, 'sha': sha, 'entries': entries, 'refusal': refusal}
 
 
 def chain(start, end):
-    for sha in (start, end):
-        if not FULL_SHA.match(sha):
-            raise Unusable(f'not a full SHA: {sha!r}')
-    found = [commit(sha) for sha in git('rev-list', '--reverse', f'{start}..{end}').split()]
+    found = [commit(sha) for sha in git('rev-list', '--reverse', f'{full(start)}..{full(end)}').split()]
     return {'from': start, 'to': end, 'commits': [c['sha'] for c in found],
             'paths': list(dict.fromkeys(p for c in found for p in c['paths'])),
             'refusal': chain_refusal(start, end, found)}
@@ -90,15 +115,9 @@ def chain_refusal(start, end, found):
         return f"the chain ends at {found[-1]['sha'][:7]}, not {end[:7]}"
     before = start
     for c in found:
-        sha = c['sha'][:7]
-        if len(c['parents']) != 1:
-            return f'{sha} is a merge or a root: history this run cannot audit'
-        if c['parents'][0] != before:
-            return f'{sha} does not sit on the commit before it in the chain from {start[:7]}'
-        if not c['paths']:
-            return f'{sha} touches no path'
-        if attribution_in(c['message']):
-            return f"commit message carries attribution: {attribution_in(c['message']).strip()}"
+        refusal = link_refusal(c, before)
+        if refusal:
+            return refusal
         before = c['sha']
     return ''
 
@@ -127,11 +146,11 @@ def make(paths):
 def collect(argv):
     if len(argv) > 1 and argv[0] == 'commit':
         return make(argv[1:])
-    if len(argv) > 1 and argv[0] == 'head':
-        return head(argv[1:])
+    if len(argv) > 3 and argv[:2] == ['head', '--parent']:
+        return head(argv[2], argv[3:])
     if len(argv) == 3 and argv[0] == 'chain':
         return chain(argv[1], argv[2])
-    raise Unusable('usage: commits.py commit PATH... | commits.py head PATH... | commits.py chain FROM TO')
+    raise Unusable('usage: commits.py commit PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO')
 
 
 if __name__ == '__main__':

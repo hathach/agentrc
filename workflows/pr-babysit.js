@@ -482,24 +482,12 @@ const snapshotOf = (lines) => {
 }
 const AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['sha', 'parents', 'paths', 'leftover', 'entries', 'message'],
+  required: ['parent', 'scope', 'sha', 'entries', 'refusal'],
   properties: {
-    error: { type: 'string' },
-    sha: { type: 'string' }, parents: { type: 'array', items: { type: 'string' } },
-    paths: { type: 'array', items: { type: 'string' } },
-    leftover: { type: 'array', items: { type: 'string' } },
-    entries: { type: 'array', items: { type: 'string' } },
-    message: { type: 'string' },
+    error: { type: 'string' }, parent: { type: 'string' }, scope: { type: 'array', items: { type: 'string' } },
+    sha: { type: 'string' }, entries: { type: 'array', items: { type: 'string' } }, refusal: { type: 'string' },
   },
 })
-// The human is the sole author: no commit message line may credit an agent, model, tool or session.
-const ATTRIBUTION = [
-  /^[ \t]*co-authored-by[ \t]*:/i,
-  /^[ \t]*(([a-z]+-)+session(-[a-z]+)*|session-(url|id|link))[ \t]*:/i,
-  /^[ \t]*(🤖[ \t]*)?(generated|authored|written|created|made)[ \t-]*(with|by)[ \t]*:?[ \t]*\[?(claude|codex|chatgpt|gpt|copilot|openai|anthropic|an? (ai|llm|agent))\b/i,
-  /^[ \t]*https?:\/\/claude\.ai\/code\/session_[a-z0-9]+[ \t]*$/i,
-]
-const attributionIn = (message) => message.split('\n').find(l => ATTRIBUTION.some(re => re.test(l)))
 const SCOPE = {
   type: 'object', additionalProperties: false,
   required: ['files'],
@@ -1248,7 +1236,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   if (!lost && !made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
 
   const seen = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head ${scope.map(shq).join(' ')}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
     relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   )
@@ -1264,8 +1252,6 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
   }
   if (!seen) return { pass: false, committed: true, detail: 'audit agent died after the commit landed', sha: '' }
 
-  // Audit the commit, not the intent: its parent, its paths, nothing owned left behind.
-  const strays = seen.paths.map(canon).filter(f => !scopeSet.has(f))
   // Committed blobs and modes must be what the hooks left.
   const committed = snapshotOf(seen.entries)
   const unbound = scope.map(canon).filter(f => {
@@ -1275,17 +1261,9 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     return !got || want.blob !== got.blob || want.mode !== got.mode
   })
   const why = seen.error ? `the commit could not be read back: ${seen.error}`
-    : !/^[0-9a-f]{40}$/.test(sha) ? `commit reported no full SHA: ${JSON.stringify(seen.sha)}`
-    : sha === expectedHead ? 'commit SHA equals the parent: nothing was committed'
-    : seen.parents.length !== 1 ? `commit has ${seen.parents.length} parents: a merge brings history this run never audited`
-    : seen.parents[0].trim() !== expectedHead ? `commit sits on ${seen.parents[0].trim().slice(0, 7)}, not ${expectedHead.slice(0, 7)}`
-    : seen.paths.length === 0 ? 'commit reported no paths'
-    : strays.length ? `commit carries unowned path(s): ${strays.join(', ')}`
-    : seen.leftover.length ? `commit left owned change(s) behind: ${seen.leftover.join(', ')}`
-    : unbound.length ? `commit content differs from what the hooks left: ${unbound.join(', ')}`
-    : !seen.message.trim() ? 'commit reported no message'
-    : attributionIn(seen.message) ? `commit message carries attribution: ${attributionIn(seen.message).trim()}`
-    : null
+    : seen.parent !== expectedHead || seen.scope.join('\0') !== scope.join('\0') ? `the audit read ${seen.scope.join(', ')} on ${seen.parent.slice(0, 7)}, not this commit`
+    : !FULL_SHA.test(sha) ? `commit reported no full SHA: ${JSON.stringify(seen.sha)}`
+    : seen.refusal || (unbound.length ? `commit content differs from what the hooks left: ${unbound.join(', ')}` : null)
   if (why) {
     log(`push#${cycle}-${what}: committed but NOT pushed — ${why}`)
     return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }

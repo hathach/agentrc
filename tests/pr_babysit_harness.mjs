@@ -146,6 +146,7 @@ const quotedAfter = (prefix) => (prompt) => {
   return m ? [...m[1].matchAll(SHQ)].map(t => t[0].slice(1, -1).replaceAll(`'\\''`, `'`)) : []
 }
 const pathLine = quotedAfter(/commits\.py commit/)
+const auditScope = quotedAfter(/commits\.py head --parent [0-9a-f]{40}/)
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
 // The failing checks collect.py lists for a CI fixture: a failure with no
@@ -373,7 +374,8 @@ async function run(opts = {}) {
       // ls-tree of the commit: what the stub committed is what the tree held.
       const entries = staged.map(f => `100644 blob ${blobOf(f)}\t${f}`)
       // Before any commit, HEAD is where the run started.
-      return { sha: commits ? made : head, parents: [head], paths: staged, leftover: [], entries, message: 'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n', ...opts.audit }
+      const parent = prompt.match(/head --parent ([0-9a-f]{40})/)[1]
+      return { parent, scope: auditScope(prompt), sha: commits ? made : head, entries, refusal: '', ...opts.audit }
     }
     if (label.startsWith('push#')) {
       // push.py's receipt; the workflow supplies committed and sha.
@@ -2153,8 +2155,8 @@ test('the commit is read back by an agent that did not write it', async () => {
   const audit = calls.find(c => c.label === 'audit#1-review')
   // A committer reporting on its own commit is the one witness not to rely on.
   assert.match(audit.prompt, /Editing and committing nothing/)
-  assert.deepEqual(audit.schema.required, ['sha', 'parents', 'paths', 'leftover', 'entries', 'message'])
-  assert.match(audit.prompt, /commits\.py head 'src\/a\.c'/)
+  assert.deepEqual(audit.schema.required, ['parent', 'scope', 'sha', 'entries', 'refusal'])
+  assert.ok(audit.prompt.includes(`commits.py head --parent ${HEAD} 'src/a.c'\``), audit.prompt)
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.deepEqual(commit.schema.required, ['committed', 'detail'],
     'the committer is not asked what its own commit contains')
@@ -2165,10 +2167,8 @@ test('the commit is read back by an agent that did not write it', async () => {
   assert.equal(dead.labels.includes('push#1-review'), false, 'an unread commit must not leave the machine')
 })
 
-test('a commit on the wrong parent is committed but never pushed', async () => {
-  // Something landed between the recheck and the commit: the commit carries work
-  // this run never audited, so it stops on the machine.
-  const { result, logs, labels } = await run({ reviews: oneValid, audit: { parents: [FOREIGN] } })
+test('a commit the audit script refuses is committed but never pushed', async () => {
+  const { result, logs, labels } = await run({ reviews: oneValid, audit: { refusal: 'commit sits on c0ffee1, not 0f1e2d3' } })
   assert.equal(result.reason, 'push-failed')
   assert.deepEqual(result.history[0].reviewPushFailed, {
     pass: false, committed: true, sha: shaFor(1),
@@ -2179,27 +2179,12 @@ test('a commit on the wrong parent is committed but never pushed', async () => {
   assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed \+ committed [0-9a-f]{7}, NOT PUSHED: commit failed audit/)
 })
 
-test('a merge commit is never pushed, even on the right first parent', async () => {
-  // Its first parent is where the run left HEAD, so a first-parent check passes
-  // while the second parent brings history nothing audited.
-  const { result, labels } = await run({ reviews: oneValid, audit: { parents: [HEAD, FOREIGN] } })
-  assert.equal(result.reason, 'push-failed')
-  assert.match(result.history[0].reviewPushFailed.detail,
-    /commit failed audit: commit has 2 parents: a merge brings history this run never audited/)
-  assert.equal(labels.includes('push#1-review'), false)
-})
-
-test('a commit carrying a path the run did not own is never pushed', async () => {
-  const { result, logs, labels } = await run({
-    reviews: oneValid,
-    audit: { paths: ['src/a.c', 'test/hil/tinyusb.json'] },
-  })
-  assert.equal(result.reason, 'push-failed')
-  assert.equal(result.history[0].reviewPushFailed.committed, true)
-  assert.equal(result.history[0].reviewPushFailed.detail,
-    'commit failed audit: commit carries unowned path(s): test/hil/tinyusb.json')
-  assert.equal(labels.includes('push#1-review'), false)
-  assert.ok(logs.some(l => /committed but NOT pushed — commit carries unowned path/.test(l)))
+test('an audit of another parent or scope is not this commit\'s audit', async () => {
+  for (const audit of [{ parent: FOREIGN }, { scope: ['src/a.c', 'src/z.c'] }]) {
+    const { result, labels } = await run({ reviews: oneValid, audit })
+    assert.match(result.history[0].reviewPushFailed.detail, /^commit failed audit: the audit read .* not this commit$/, JSON.stringify(audit))
+    assert.equal(labels.includes('push#1-review'), false)
+  }
 })
 
 test('a reply poster that throws leaves the debt owed, not the cycle dead', async () => {
@@ -4210,19 +4195,6 @@ test('every agent that acts on GitHub is told which checkout the PR lives in', a
   }
 })
 
-test('a commit that leaves an owned change behind is not pushed', async () => {
-  // Subset was the whole audit: committed ⊆ owned. A committer that took one of
-  // two fixed files passed it, and the push announced both findings fixed.
-  const { result, labels, logs } = await run({
-    reviews: oneValid, audit: { leftover: [' M src/a.c'] },
-  })
-  assert.equal(result.pass, false)
-  assert.equal(result.reason, 'push-failed')
-  assert.equal(labels.some(l => l.startsWith('push#')), false, 'the publisher is not dispatched')
-  assert.match(result.history[0].reviewPushFailed.detail, /commit left owned change\(s\) behind:  M src\/a\.c/)
-  assert.ok(logs.some(l => /committed but NOT pushed — commit left owned change/.test(l)))
-})
-
 // yielding launches: one cycle per launch, the ledger carried in `state`
 
 // A debt-bearing first launch: one dismissal the validator drafted no reply for,
@@ -4859,14 +4831,13 @@ test('protected hook output is refused before the commit', async () => {
   assert.ok(!labels.some(l => l.startsWith('commit#')))
 })
 
-test('a hook-admitted path does not excuse an unowned one in the same commit', async () => {
-  const { result, labels } = await run({ ...publishing, hooks: gen, audit: { paths: ['src/a.c', 'docs/boards.rst', 'src/z.c'] } })
-  assert.match(result.history[0].reviewPushFailed.detail, /unowned path\(s\): src\/z\.c/)
-  assert.ok(!labels.some(l => l.startsWith('push#')))
+test('the audit scope is the fix scope widened by hook output, nothing more', async () => {
+  const { calls } = await run({ ...publishing, hooks: gen })
+  assert.deepEqual(auditScope(calls.find(c => c.label === 'audit#1-review').prompt), ['src/a.c', 'docs/boards.rst'])
 })
 
 test('a commit that landed but was not pushed is a pending candidate in the state, not the next head', async () => {
-  const blocked = await run({ ...publishing, audit: { paths: ['src/a.c', 'src/z.c'] } })
+  const blocked = await run({ ...publishing, audit: { refusal: 'the commit carries unowned path(s): src/z.c' } })
   assert.deepEqual(blocked.result.state.pending, { sha: shaFor(1), parent: HEAD, lane: 'review', stage: 'audit-blocked' })
   assert.equal(blocked.result.state.expectedHead, HEAD)
   const rejected = await run({ ...publishing, push: null })
@@ -4896,21 +4867,21 @@ test('an owned path the fix did not change, or deleted, is still complete eviden
   const quiet = await run({
     ...twoFiles('src/b.c'),
     hooks: b => ({ before: [' M src/a.c'], after: [' M src/a.c'] }),
-    audit: { paths: ['src/a.c', 'src/b.c'], entries: lsTreeOf(['src/a.c', 'src/b.c']) },
+    audit: { entries: lsTreeOf(['src/a.c', 'src/b.c']) },
   })
   assert.equal((quiet.result.history[0].reviewPush || {}).pass, true, JSON.stringify(quiet.result.history[0].reviewPushFailed))
   const deleted = await run({
     ...twoFiles('src/gone.c'),
     hooks: b => ({ before: [' M src/a.c', ' D src/gone.c'], after: [' M src/a.c', ' D src/gone.c'],
       snapshotBefore: [b.snapshotBefore[0], 'absent - src/gone.c'], snapshotAfter: [b.snapshotAfter[0], 'absent - src/gone.c'] }),
-    audit: { paths: ['src/a.c', 'src/gone.c'], entries: lsTreeOf(['src/a.c']) },
+    audit: { entries: lsTreeOf(['src/a.c']) },
   })
   assert.equal(deleted.result.history[0].reviewPush.pass, true, JSON.stringify(deleted.result.history[0].reviewPushFailed))
   const resurrected = await run({
     ...twoFiles('src/gone.c'),
     hooks: b => ({ before: [' M src/a.c', ' D src/gone.c'], after: [' M src/a.c', ' D src/gone.c'],
       snapshotBefore: [b.snapshotBefore[0], 'absent - src/gone.c'], snapshotAfter: [b.snapshotAfter[0], 'absent - src/gone.c'] }),
-    audit: { paths: ['src/a.c', 'src/gone.c'], entries: lsTreeOf(['src/a.c', 'src/gone.c']) },
+    audit: { entries: lsTreeOf(['src/a.c', 'src/gone.c']) },
   })
   assert.match(resurrected.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: src\/gone\.c/)
 })
@@ -4933,12 +4904,12 @@ test('a path with a space or a quote survives status, snapshot, diff-tree and ls
     assert.deepEqual(pathLine(calls.find(c => c.label === 'commit#1-review').prompt), [p], 'the path itself was committed')
     assert.deepEqual(hookQuoted(calls.find(c => c.label === 'hooks#1-review').prompt), [p], 'the hook script gets the path itself')
     const audit = calls.find(c => c.label === 'audit#1-review').prompt
-    assert.ok(audit.includes(`commits.py head '${p.replaceAll("'", "'\\''")}'`), 'the audit script gets the path itself')
+    assert.deepEqual(auditScope(audit), [p], 'the audit script gets the path itself')
   }
 })
 
 test('a commit the audit script cannot read back is not pushed', async () => {
-  const { result, labels } = await run({ ...publishing, audit: { error: 'HEAD moved from a to b while it was read', sha: '', paths: [], entries: [], message: '' } })
+  const { result, labels } = await run({ ...publishing, audit: { error: 'HEAD moved from a to b while it was read', parent: '', scope: [], sha: '', entries: [], refusal: '' } })
   assert.match(result.history[0].reviewPushFailed.detail, /^commit failed audit: the commit could not be read back: HEAD moved/)
   assert.equal(result.history[0].reviewPushFailed.committed, true)
   assert.ok(!labels.includes('push#1-review'))
@@ -4974,44 +4945,6 @@ test('the committer is told the authorship rule', async () => {
   const { calls } = await run({ ...publishing })
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.match(commit.prompt, /no Co-Authored-By, Claude-Session, Generated-with or the like: the repository's human is the sole author/)
-})
-
-test('a commit whose message credits an agent, model, tool or session is never pushed', async () => {
-  for (const [line, shown] of [
-    ['Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>', 'Co-Authored-By: Claude Sonnet 5'],
-    ['co-authored-by: Ha Thach <thach@tinyusb.org>', 'co-authored-by: Ha Thach'], // a human co-author is still not this run's to claim
-    ['Claude-Session: https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ', 'Claude-Session:'],
-    ['Codex-Session-Id: 0192', 'Codex-Session-Id: 0192'],
-    ['Session-URL: https://example', 'Session-URL:'],
-    ['🤖 Generated with [Claude Code](https://claude.com/claude-code)', '🤖 Generated with \\[Claude Code\\]'],
-    ['Generated by Codex', 'Generated by Codex'],
-    ['Generated with ChatGPT', 'Generated with ChatGPT'],
-    ['Authored-by: Claude', 'Authored-by: Claude'],
-    ['Written by an AI agent', 'Written by an AI agent'],
-    ['https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ', 'https://claude.ai/code/session_01BtCFFdnNVDJfQU8Y1umjeQ'],
-  ]) {
-    const { result, labels } = await run({ ...publishing, audit: { message: `Fix the finding\n\n${line}\n` } })
-    assert.equal(result.reason, 'push-failed', line)
-    assert.equal(result.history[0].reviewPushFailed.committed, true, line)
-    assert.match(result.history[0].reviewPushFailed.detail, new RegExp(`commit failed audit: commit message carries attribution: ${shown}`), line)
-    assert.ok(!labels.some(l => l.startsWith('push#')), line)
-  }
-  const blank = await run({ ...publishing, audit: { message: '\n  \n' } })
-  assert.match(blank.result.history[0].reviewPushFailed.detail, /commit reported no message/)
-})
-
-test('a message that talks about attribution, or a human sign-off, is not attribution', async () => {
-  for (const message of [
-    'Fix handling of claude.ai/code/ URLs in the reply script\n',
-    'Session: reject expired tokens\n',
-    'Fix the finding\n\nSigned-off-by: Ha Thach <thach@tinyusb.org>\n',
-    'Refuse a commit generated with a session trailer\n\nThe audit reads the message back.\n',
-    'Drop the Generated-with footer from PR bodies\n',
-    'Generated by GPTimer\n\nWritten by an aide, generated by an aircraft simulator.\n',
-  ]) {
-    const { result } = await run({ ...publishing, audit: { message } })
-    assert.equal(result.history[0].reviewPush.pass, true, message)
-  }
 })
 
 // build-regenerated paths: a declared tracked modification, vouched for by the hooks
@@ -5101,10 +5034,6 @@ test('the audit binds a regenerated path like any other', async () => {
   const edited = await run({ ...regen, audit: { entries: [`100644 blob ${blobOf('src/a.c')}\tsrc/a.c`, `100644 blob ${'e'.repeat(40)}\t${CATALOG}`] } })
   assert.match(edited.result.history[0].reviewPushFailed.detail, /differs from what the hooks left: hw\/bsp\/family\.json/)
   assert.deepEqual(edited.result.history[0].reviewPushFailed.generated, [CATALOG])
-  const left = await run({ ...regen, audit: { leftover: [` M ${CATALOG}`] } })
-  assert.match(left.result.history[0].reviewPushFailed.detail, /left owned change\(s\) behind/)
-  const extra = await run({ ...regen, audit: { paths: ['src/a.c', CATALOG, 'other.c'] } })
-  assert.match(extra.result.history[0].reviewPushFailed.detail, /unowned path\(s\): other\.c/)
 })
 
 test('a protected path the build regenerated is refused before the hooks run', async () => {
