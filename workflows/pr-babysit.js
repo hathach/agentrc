@@ -508,7 +508,8 @@ const relayed = (schema) => {
     if (!(schema.properties[k].type in EMPTY)) throw new Error(`relayed: no empty value for ${k}`)
     return `${k} = ${EMPTY[schema.properties[k].type]}`
   })
-  return 'and return the JSON object on its last stdout line unchanged. ' +
+  // #33: a Haiku copy of a line without error once wrote `"error": ,` five times over.
+  return 'and return the JSON object on its last stdout line unchanged; a line without error gets no error member. ' +
     `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
 }
 // A model copying JSON drops a trailing null (#3968): relay schemas require no nullable field, and a missing one comes back null.
