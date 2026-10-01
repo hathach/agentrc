@@ -439,20 +439,11 @@ const SONAR = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['commits'],
+  required: ['from', 'to', 'commits', 'paths', 'refusal'],
   properties: {
-    error: { type: 'string' },
-    commits: {
-      type: 'array',
-      items: {
-        type: 'object', additionalProperties: false,
-        required: ['sha', 'parents', 'paths', 'message'],
-        properties: {
-          sha: { type: 'string' }, parents: { type: 'array', items: { type: 'string' } },
-          paths: { type: 'array', items: { type: 'string' } }, message: { type: 'string' },
-        },
-      },
-    },
+    error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' },
+    commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
+    refusal: { type: 'string' },
   },
 })
 const COMMIT = withSeal({
@@ -2256,24 +2247,16 @@ if (adoptHead !== null) {
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )
-  const commits = audit ? audit.commits : []
-  const shas = commits.map(c => String(c.sha).trim())
-  const paths = commits.flatMap(c => c.paths)
+  const shas = audit ? audit.commits : []
+  const paths = audit ? audit.paths : []
   const badPath = paths.find(f => !canon(f))
   const guarded = protectedRe ? [...new Set(paths.map(canon).filter(f => f && protectedRe.test(f)))] : []
-  const signed = commits.find(c => attributionIn(c.message))
   const why = !audit ? 'the audit agent died'
     : audit.error ? `the chain could not be read back: ${audit.error}`
-    : !commits.length ? `no commits reported in ${X.slice(0, 7)}..${adoptHead.slice(0, 7)}`
-    : shas.some(h => !FULL_SHA.test(h)) ? `a commit reported no full SHA: ${JSON.stringify(shas.find(h => !FULL_SHA.test(h)))}`
-    : new Set(shas).size !== shas.length ? 'a commit is reported twice'
-    : shas[shas.length - 1] !== adoptHead ? `the chain ends at ${shas[shas.length - 1].slice(0, 7)}, not ${adoptHead.slice(0, 7)}`
-    : commits.some((c, i) => c.parents.length !== 1) ? `${shas[commits.findIndex(c => c.parents.length !== 1)].slice(0, 7)} is a merge or a root: history this run cannot audit`
-    : commits.some((c, i) => c.parents[0].trim() !== (i ? shas[i - 1] : X)) ? `${shas[commits.findIndex((c, i) => c.parents[0].trim() !== (i ? shas[i - 1] : X))].slice(0, 7)} does not sit on the commit before it in the chain from ${X.slice(0, 7)}`
-    : commits.some(c => !c.paths.length) ? `${shas[commits.findIndex(c => !c.paths.length)].slice(0, 7)} reported no paths`
+    : audit.from !== X || audit.to !== adoptHead ? `the audit read ${audit.from}..${audit.to}, not ${X}..${adoptHead}`
+    : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
     : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}`
-    : signed ? `commit message carries attribution: ${attributionIn(signed.message).trim()}`
     : null
   if (why) {
     log(`preflight: adoption refused — ${why}`)

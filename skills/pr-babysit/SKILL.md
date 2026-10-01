@@ -19,7 +19,7 @@ python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabb
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
 python3 $S/commits.py head 'src/a.c'         # the commit at HEAD and its scope
-python3 $S/commits.py chain <from> <to>      # every commit in from..to, full SHAs
+python3 $S/commits.py chain <from> <to>      # audit from..to for adoption, full SHAs
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 python3 $S/sonar.py --pr N --head <sha> --manifest <file>  # mark answered code-scanning comments' SonarCloud issues false positive
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>'  # build the checkout as it stands
