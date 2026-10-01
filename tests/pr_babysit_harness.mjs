@@ -410,6 +410,13 @@ async function run(opts = {}) {
       if (typeof opts.verify === 'function') return opts.verify(label)
       return structuredClone(opts.verify ?? { addresses: true, reason: 'verified' })
     }
+    if (label.startsWith('topic#')) {
+      assert.equal(options.agentType, 'finding-verifier')
+      // opts.topic(pairId) is whether the topic's issue covers the finding, '<findingId>@<topic>'; false by default, undefined drops it.
+      const ids = trailingList(prompt).map(x => x.findingId)
+      return conforms({ ...options.schema, properties: { verdicts: { type: 'array', items: options.schema.properties.verdicts.items } } }, { verdicts: ids
+        .map(findingId => ({ findingId, covers: opts.topic ? opts.topic(findingId) : false, reason: 'stub topic read' })).filter(v => v.covers !== undefined) }, label)
+    }
     if (label.startsWith('issue#')) {
       assert.equal(options.agentType, 'finding-verifier')
       if (opts.covers === null) return null
@@ -3314,7 +3321,8 @@ const ISSUE = 'https://github.com/hathach/tinyusb/issues/4000'
 const deferral = (over = {}) => ({ findingId: '1#1', commentDigest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR', ...over })
 
 test('deferrals are checked for shape before anything runs', async () => {
-  for (const deferrals of ['1#1', [{ ...deferral(), findingId: '1' }], [deferral({ issueUrl: 'https://github.com/o/r/pull/3' })], [deferral({ issueUrl: null })],
+  for (const deferrals of ['1#1', [{ ...deferral(), findingId: '1' }], [deferral({ issueUrl: 'https://github.com/o/r/pull/3' })], [deferral({ issueUrl: null })], [deferral({ issueUrl: [ISSUE] })],
+    [{ issueUrl: ISSUE, reason: ' ' }], [{ issueUrl: ISSUE }], [{ issueUrl: ISSUE, reason: 'r' }, { issueUrl: ISSUE, reason: 's' }], [{ findingId: '1#1', issueUrl: ISSUE, reason: 'r' }],
     [deferral({ reason: ' ' })], [deferral({ commentDigest: '' })], [deferral(), deferral()]]) {
     const trace = []
     await assert.rejects(run({ args: { deferrals }, trace }), /deferrals must be/, JSON.stringify(deferrals))
@@ -3375,11 +3383,41 @@ test('a deferral naming no current valid finding, or its issue not covering it, 
   }
 })
 
+test('an out-of-scope topic holds a finding its issue covers before the first harvest can fix it, and anything short of a clear no holds too (#39)', async () => {
+  // tinyusb#4056: launch 1 fixed and pushed a finding on a gap the task had ruled out, and its "Fixed in" note had to be reverted.
+  const topic = { issueUrl: ISSUE, reason: 'hub port stuck at HIL start' }
+  const held = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 1, deferrals: [topic] }, topic: () => true })
+  assert.equal(held.labels.some(l => /^(fix:|push#|resolve#|replies#|defer#)/.test(l)), false, 'not fixed, nothing posted')
+  assert.notEqual(held.result.pass, true)
+  assert.deepEqual(held.result.state.holds.map(([id, h]) => [id, h.reason]),
+    [['1#1', `out of scope per ${ISSUE} (hub port stuck at HIL start): defer it by findingId, or drop the topic`]])
+  assert.equal(held.result.observation.reviews.findings[0].hold, held.result.state.holds[0][1].reason, 'the reading shows it held')
+  const prompt = held.calls.find(c => c.label === 'topic#1').prompt
+  assert.ok(prompt.includes(ISSUE) && prompt.includes('src/a.c:1: bad') && prompt.includes('"findingId":"1#1@0"'), prompt)
+
+  const free = await run({ reviews: oneValid, args: { autoPush: true, deferrals: [topic] } })
+  assert.ok(free.labels.some(l => l.startsWith('fix:')), 'judged outside the topic, it is fixed')
+  assert.ok(free.labels.includes('push#1-review'))
+  for (const over of [{ topic: () => null }, { topic: () => undefined }, { throwOn: 'topic#' }]) {
+    const { labels, result } = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 1, deferrals: [topic] }, ...over })
+    assert.equal(labels.some(l => l.startsWith('fix:')), false, JSON.stringify(over))
+    assert.match(result.state.holds[0][1].reason, /^not yet judged outside the out-of-scope topic /)
+  }
+  // Deferred by id, the finding is no longer the topic's to judge, and the hold is reconciled.
+  const deferred = await run({ reviews: oneValid, args: { autoPush: true, deferrals: [topic, deferral()], state: held.result.state, maxCycles: 3 } })
+  assert.equal(deferred.labels.some(l => l.startsWith('topic#')), false)
+  assert.equal(deferred.result.pass, true, JSON.stringify(deferred.result.reason))
+})
+
 test('a deferral whose reason alone breaks the reply limit is refused before anything runs', async () => {
   await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'w '.repeat(55).trim() })] } }),
     /deferral reason too long for its reply \(60 words, a line 300 characters with the issue URL\): 1#1/)
   await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral(), deferral({ findingId: '1#2', reason: 'x'.repeat(250) })] } }),
     /: 1#2$/, 'a long line is refused too, and only the offending finding is named')
+  const trace = []
+  await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, deferrals: [deferral({ reason: 'w '.repeat(55).trim() })] } }),
+    /deferral reason too long/)
+  assert.deepEqual(trace, [], 'refused before the state loader starts an agent (#39)')
   const { calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'w '.repeat(40).trim() })], maxCycles: 1 } })
   assert.ok(calls.length > 0, 'a reason within the limit runs')
 })

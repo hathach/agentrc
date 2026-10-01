@@ -170,7 +170,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             'lane': obs.get('lane'), 'reviewedHead': obs.get('reviewedHead'),
             'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'sha': (b.get('sha') or '')[:8] or None} for b in reviews.get('bots') or []],
             'findings': [{'id': f.get('findingId'), 'digest': f.get('commentDigest'), 'source': f.get('source'), 'verdict': f.get('verdict'),
-                          'at': f'{f.get("file")}:{f.get("line")}'} for f in reviews.get('findings') or []],
+                          'at': f'{f.get("file")}:{f.get("line")}', **({'held': cut(f['hold'])} if f.get('hold') else {})}
+                         for f in reviews.get('findings') or []],
             'ci': ci and ci_summary(ci, keys),
         }
         summary['receipts'], blocking = receipts(actions, reviews.get('findings') or [])

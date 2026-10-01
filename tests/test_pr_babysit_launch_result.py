@@ -235,6 +235,15 @@ class LaunchResultTest(unittest.TestCase):
         self.assertTrue(any(b.startswith('heads disagree') and "'checkout'" in b for b in s['blockers']))
         self.assertIn("the checkout is dirty: ['?? left.txt']", s['blockers'])
 
+    def test_a_held_finding_says_why(self):
+        data = output()
+        data['result']['observation']['reviews']['findings'].append(
+            {'findingId': '9#1', 'commentId': 9, 'commentDigest': 'd9', 'source': 'greptile', 'verdict': 'valid', 'file': 'b.c', 'line': 2,
+             'hold': 'out of scope per https://github.com/o/r/issues/1 (gap): defer it by findingId, or drop the topic'})
+        _, s = self.run_it(data)
+        self.assertNotIn('held', s['observation']['findings'][0])
+        self.assertEqual(s['observation']['findings'][1]['held'], data['result']['observation']['reviews']['findings'][1]['hold'])
+
     def test_dirty_ide_metadata_is_a_note_as_in_the_workflow_preflight(self):
         tree = {'branch': 'pr', 'head': NEXT, 'dirty': [' M .idea/misc.xml', '?? .idea/inspectionProfiles/', ' M sub/.idea/x.xml']}
         s = launch_result.summarize(output(), '/t/w.output', tree=tree)
