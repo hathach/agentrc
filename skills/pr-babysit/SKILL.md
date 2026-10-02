@@ -65,12 +65,21 @@ The workflow's own contract (`workflows/pr-babysit.js`).
   result shows beside a failure: never fixed, and a run red only from them
   passes, listing them. Per launch.
 - `deferrals`: `[{ findingId, commentDigest, issueUrl, reason }]`: valid
-  findings left to an existing issue, answered with it; without `issueUrl`,
+  findings left to an existing issue, answered with it, on the caller's word
+  that the issue covers the finding; without `issueUrl`,
   left as is by the PR owner's decision, answered with its reason. Kept in
   the state while the comment body stands. `{ issueUrl, reason }` alone is an
   out-of-scope topic, passed on every launch: a valid finding no deferral
   names is held from the fixer, unanswered, unless judged outside every
   topic's issue; the caller defers a held one by id.
+- `replySettlements`: `[{ commentId, commentDigest, replyId, bodyDigest, headSha }]`:
+  the caller's verified reply on a comment the result handed off, judged to
+  answer it whole at `headSha`. Under `autoPush`, a cycle that harvests
+  reviews settles it when `headSha` is the expected HEAD after any adoption,
+  no point of the comment is held, and `reply.py --reuse` returns a settling
+  receipt: both digests read back and, in a review thread, the thread
+  resolved. The result's `settlements` say which settled and why the rest did
+  not. Per launch.
 - `yieldAfterCycle`: run one cycle and return the state for the next launch.
 - `lane`: `both` (default), `ci` or `reviews`; a single lane needs
   `yieldAfterCycle` and never declares the PR done.

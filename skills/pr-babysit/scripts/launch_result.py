@@ -178,9 +178,13 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         blockers += blocking
         if actions.get('error'):
             blockers.append(f'action error: {cut(actions["error"])}')
+        unsettled = {st.get('commentId'): f"settlement {st.get('outcome')}: {cut(st.get('why') or '')}"
+                     for st in result.get('settlements') or [] if st.get('outcome') != 'settled'}
         for h in result.get('handoffs') or []:
-            blockers.append(f"comment {h.get('commentId')} needs a human answer by hand, which a later launch settles once a verifier finds it answers the whole comment (outside a review thread, the reply starts by quoting the comment's link): {cut(h.get('why') or '')}"
-                            + (f"; draft: {cut(h['draft'])}" if h.get('draft') else ''))
+            blockers.append(f"comment {h.get('commentId')} is the caller's to answer (chief's reply takeover rule), then to settle through replySettlements: {cut(h.get('why') or '')}"
+                            + (f"; draft: {cut(h['draft'])}" if h.get('draft') else '')
+                            + (f"; {unsettled.pop(h.get('commentId'))}" if h.get('commentId') in unsettled else ''))
+        blockers += [f'comment {c}: {why}' for c, why in unsettled.items()]
         for u in result.get('sonarUnmarked') or []:
             last = u.get('last') or {}
             blockers.append(f"SonarCloud issue of comment {u.get('commentId')} not marked false positive: "

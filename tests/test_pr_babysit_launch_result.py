@@ -205,19 +205,23 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['receipts']['replies'][0], {'batch': 'refutedPosts', 'findingVerdicts': [], 'commentId': 9, 'kind': 'review', 'sent': True,
                                                        'posted': True, 'verified': False, 'error': None})
 
-    def test_a_comment_only_a_human_can_answer_is_a_blocker(self):
+    def test_a_handed_off_comment_and_a_settlement_that_did_not_settle_are_blockers(self):
         data = output()
         data['result']['handoffs'] = [
-            {'commentId': 5, 'why': 'edited after its finding ids were carried'},
+            {'commentId': 5, 'commentDigest': 'd5', 'why': 'edited after its finding ids were carried'},
             {'commentId': 7, 'why': 'no reply posted: over length', 'draft': 'a long draft'}]
+        data['result']['settlements'] = [
+            {'commentId': 3, 'outcome': 'settled', 'replyId': 30},
+            {'commentId': 5, 'outcome': 'refused', 'why': 'a point of the comment is held'},
+            {'commentId': 6, 'outcome': 'not processed', 'why': 'no review harvest in this launch'}]
         _, s = self.run_it(data)
-        self.assertEqual([b for b in s['blockers'] if 'needs a human answer' in b], [
-            'comment 5 needs a human answer by hand, which a later launch settles once a verifier finds it answers the whole comment '
-            '(outside a review thread, the reply starts by quoting the comment\'s link): '
-            'edited after its finding ids were carried',
-            'comment 7 needs a human answer by hand, which a later launch settles once a verifier finds it answers the whole comment '
-            '(outside a review thread, the reply starts by quoting the comment\'s link): '
-            'no reply posted: over length; draft: a long draft'])
+        self.assertEqual([b for b in s['blockers'] if b.startswith('comment ')], [
+            "comment 5 is the caller's to answer (chief's reply takeover rule), then to settle through replySettlements: "
+            'edited after its finding ids were carried; settlement refused: a point of the comment is held',
+            "comment 7 is the caller's to answer (chief's reply takeover rule), then to settle through replySettlements: "
+            'no reply posted: over length; draft: a long draft',
+            'comment 6: settlement not processed: no review harvest in this launch'])
+        self.assertEqual(s['result']['handoffs'][0]['commentDigest'], 'd5', 'the whole handoff stays in the reading')
 
     def test_an_unmarked_sonarcloud_issue_is_a_blocker_even_on_a_green_launch(self):
         data = output(result={'pass': True, 'status': 'complete', 'sonarUnmarked': [

@@ -20,7 +20,7 @@ as a quote line plus the text. A reply of ours with the identical body already
 there is reused, never posted twice. A caller that lost its state would answer
 a comment again in new words, so any other reply of ours to it (an inline
 reply in its thread, or a comment of ours quoting it) is not posted over and
-not verified; its receipt names it with verified false, for a human to
+not verified; its receipt names it with verified false, for the caller to
 reconcile. secondAnswer (default false) true says the caller knows it answered
 before and owes a new answer, to a comment edited since: an inline reply is
 then posted, while a comment of ours quoting it with the same kind of answer (a
@@ -408,7 +408,7 @@ def handle(poster, item):
         found = poster.existing(kind, original, body, item.get('secondAnswer', False))
         if found and found[1] != body:
             rc['replyId'] = found[0]
-            rc['error'] = f'reply {found[0]} of ours is already on this comment in other words; reconcile by hand'
+            rc['error'] = f'reply {found[0]} of ours is already on this comment in other words; the caller reconciles it'
             return rc
         if found:
             reply_id = found[0]

@@ -14,7 +14,7 @@ back, and resolves the review thread only when body, thread, author and PR all
 match. An issue comment and a review body have no thread: the reply is a PR
 comment quoting the original's URL, and nothing is resolved. Any other reply of
 ours to the comment (in its thread after it, or quoting it) blocks the post: its receipt
-names that reply with `verified: false`, for a human to reconcile. An entry
+names that reply with `verified: false`, for the caller to reconcile. An entry
 with `"secondAnswer": true`, for a comment edited after we answered it, may go
 beside our inline reply; a quoting reply of ours that gives the same kind of
 answer (a `Fixed in ` note, or anything else) still blocks it. Its receipts are
@@ -66,10 +66,10 @@ unreachable repo.
   on that reply only when someone judged the body `--inspect` returned to
   answer every point the comment is owed now: `--reuse` with the digests from
   that inspection reads both again, posts nothing and resolves the thread.
-  A reply your own manifest posted with a body other than the one you offered
-  may instead be put right with `--edit`, the offered body and the same
-  inspection's digests: it reads both again, edits only that reply, reads it
-  back and resolves the thread. Otherwise it stays for a human.
+  A reply your task's own recorded attempt posted may instead be put right
+  with `--edit`, the offered body or an evidence-backed correction of it, and
+  the same inspection's digests: it reads both again, edits only that reply,
+  reads it back and resolves the thread. Otherwise it stays for the caller.
 - **A reply is not agreement.** A resolved thread means our answer was
   published, not that the reviewer accepted it; what the reviewer says next
   is a new comment to read, not something this script knows about.
