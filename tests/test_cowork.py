@@ -178,10 +178,10 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(request.startswith('codex-'))
         self.assertEqual(reply, 'codex reply\nFiles touched: none\n')
-        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\ngpt-6-astra\nhigh\n')
+        self.assertEqual((self.box() / 'session').read_text(), 'thread-42\ngpt-6.1-sol\nhigh\n')
         self.send('--task', 'another')
         first, second = self.calls()
-        self.assertEqual(first['argv'][:6], ['exec', '-m', 'gpt-6-astra', '-c', 'model_reasoning_effort=high', '--json'])
+        self.assertEqual(first['argv'][:6], ['exec', '-m', 'gpt-6.1-sol', '-c', 'model_reasoning_effort=high', '--json'])
         self.assertEqual(second['argv'][:3], ['exec', 'resume', 'thread-42'])
         self.assertIn('-o', second['argv'])
 
@@ -229,9 +229,9 @@ class CoworkTest(unittest.TestCase):
     def test_a_new_lane_starts_at_its_sides_default_whatever_drives_it(self):
         self.send('--task', 'from claude')
         argv = self.calls()[0]['argv']
-        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6-astra')
+        self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6.1-sol')
         self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=high')
-        self.assertIn('answered by gpt-6-astra at high effort', self.calls()[0]['stdin'])
+        self.assertIn('answered by gpt-6.1-sol at high effort', self.calls()[0]['stdin'])
         self.send('--effort', 'max', '--task', 'max')
         argv = self.calls()[1]['argv']
         self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=max')
@@ -249,15 +249,15 @@ class CoworkTest(unittest.TestCase):
         seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
         self.assertEqual(seen, [('gpt-5.6-terra', 'model_reasoning_effort=high'), ('gpt-5.6-terra', 'model_reasoning_effort=high'),
                                 ('gpt-5.6-terra', 'model_reasoning_effort=low'), ('gpt-5.6-luna', 'model_reasoning_effort=low'),
-                                ('gpt-5.6-luna', 'model_reasoning_effort=low'), ('gpt-6-astra', 'model_reasoning_effort=high')])
+                                ('gpt-5.6-luna', 'model_reasoning_effort=low'), ('gpt-6.1-sol', 'model_reasoning_effort=high')])
         _, out, _ = self.run_cli('status')
-        self.assertIn('codex/main: session thread-42, gpt-6-astra at high effort', out)
+        self.assertIn('codex/main: session thread-42, gpt-6.1-sol at high effort', out)
 
     def test_a_field_update_keeps_the_bound_thread(self):
         self.assertEqual(self.send('--task', 'one')[0], 0)
         self.assertEqual(cowork.session_of(self.box()), 'thread-42')
         cowork.update_side(self.box(), effort='low')
-        self.assertEqual(cowork.side_state(self.box()), ('thread-42', 'gpt-6-astra', 'low'), 'a field-wise update')
+        self.assertEqual(cowork.side_state(self.box()), ('thread-42', 'gpt-6.1-sol', 'low'), 'a field-wise update')
         self.send('--task', 'two')
         self.assertEqual(self.calls()[-1]['argv'][:3], ['exec', 'resume', 'thread-42'])
 
@@ -817,7 +817,7 @@ class CoworkTest(unittest.TestCase):
                       'of the host checkout; commit there.', prompt)
         self.assertEqual(self.head(tree), base)
         code, out, _ = self.run_cli('status')
-        self.assertIn(f'codex/impl: session thread-42, gpt-6-astra at high effort, in {tree}', out)
+        self.assertIn(f'codex/impl: session thread-42, gpt-6.1-sol at high effort, in {tree}', out)
         self.assertNotIn('codex/main', out)
         self.send('--lane', 'impl', '--task', 'y')
         self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
@@ -831,7 +831,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('Scope: do not edit anything', self.calls()[0]['stdin'])
         self.assertFalse((self.root / '.worktrees').exists())
         code, out, _ = self.run_cli('status')
-        self.assertIn('codex/review: session thread-42, gpt-6-astra at high effort, read-only', out)
+        self.assertIn('codex/review: session thread-42, gpt-6.1-sol at high effort, read-only', out)
         self.codex_does("open('edited.txt', 'w').write('!')")
         code, _, _, err = self.send('--lane', 'review', '--task', 'y')  # no --no-edit: the lane implies it
         self.assertEqual(code, cowork.MALFORMED)

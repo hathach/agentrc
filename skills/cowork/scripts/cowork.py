@@ -65,7 +65,7 @@ HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at 
 WHERE = 'Your checkout is the worktree {root} on branch {branch}, based on {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # names both CLIs accept
-DEFAULTS = {'codex': ('gpt-6-astra', 'high'), 'claude': ('opus', 'high')}  # a new lane's model and effort
+DEFAULTS = {'codex': ('gpt-6.1-sol', 'high'), 'claude': ('opus', 'high')}  # a new lane's model and effort
 
 
 def die(message, code=FAILED):
