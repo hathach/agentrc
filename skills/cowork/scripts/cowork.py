@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Run coworker turns in a detached process, resuming one session per lane, one turn at a time per lane.
 
-  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] [--detach] (--task TEXT | --task -)
+  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach] (--task TEXT | --task -)
+  cowork.py default [astra|sol]
   cowork.py kill <id>
   cowork.py read [--wait] <id>
   cowork.py status
@@ -9,9 +10,8 @@
 
 A lane is one resumed session of a side, with files under
 <git dir>/cowork/<side>/<lane>/: `session` holds the session id, the model
-and the effort in use. The first send on a lane sets the model and effort
-from the flags, else the side's default (DEFAULTS); later sends reuse them
-until flags replace them or reset forgets them. Three kinds of lane: `main` works in
+and the effort in use, and a Codex lane's tier (TIERS, PRESETS; see
+settle_pair). reset forgets them. Three kinds of lane: `main` works in
 this checkout; a lane created with --read-only works in this checkout too
 and every send to it is --no-edit; any other lane works in its own worktree
 .worktrees/cowork-<side>-<lane> on branch cowork/<host branch>/<side>-<lane>,
@@ -65,7 +65,11 @@ HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at 
 WHERE = 'Your checkout is the worktree {root} on branch {branch}, based on {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # names both CLIs accept
-DEFAULTS = {'codex': ('gpt-6.1-sol', 'high'), 'claude': ('opus', 'high')}  # a new lane's model and effort
+DEFAULTS = {'claude': ('opus', 'high')}  # a new Claude lane's model and effort
+TIERS = {'review': ('gpt-6-astra', 'high'), 'expert': ('gpt-6-astra', 'xhigh')}  # Codex; `default` is the preset
+PRESETS = {'astra': ('gpt-6-astra', 'high'), 'sol': ('gpt-6.1-sol', 'high')}
+PRESET = 'sol'  # the Codex default while no preference file names one
+FIELDS = ('session', 'model', 'effort', 'tier')
 
 
 def die(message, code=FAILED):
@@ -271,23 +275,43 @@ def running(box):
     return next((r for r in requests(box) if held(box / f'{r}.lock')), None)
 
 
-def side_state(box):
-    """(session id or None, model, effort) of a side; the session id is empty
-    until the first turn binds one."""
+def lane_fields(box):
+    """The session file as FIELDS; empty strings for what it lacks: the
+    session id until the first turn binds one, the tier on a pinned pair."""
     lines = (box / 'session').read_text().split('\n') if (box / 'session').exists() else []
-    lines += [''] * 3
-    return lines[0] or None, lines[1], lines[2]
+    return dict(zip(FIELDS, lines + [''] * len(FIELDS)))
+
+
+def replace_text(path, text):
+    """Write `path` in one step, so a reader never sees it truncated."""
+    tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
+    tmp.write_text(text)
+    os.replace(tmp, path)
 
 
 def write_side(box, **fields):
-    """Change some of a side's session id, model and effort: a field-wise
-    merge, replaced in one step so a reader never sees a truncated file.
-    The caller holds admission."""
-    current = dict(zip(('session', 'model', 'effort'), side_state(box)))
-    current.update(fields)
-    tmp = box / f'session.{os.getpid()}.tmp'
-    tmp.write_text(f'{current["session"] or ""}\n{current["model"] or ""}\n{current["effort"] or ""}\n')
-    os.replace(tmp, box / 'session')
+    """Change some of a side's FIELDS, a field-wise merge. The caller holds admission."""
+    current = lane_fields(box)
+    current.update({k: v or '' for k, v in fields.items()})
+    replace_text(box / 'session', ''.join(f'{current[k]}\n' for k in FIELDS))
+
+
+def preset_file():
+    return Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'agentrc' / 'cowork-default'
+
+
+def preset():
+    """The Codex default preset: the preference file's, else PRESET; refused
+    when the file names none."""
+    path = preset_file()
+    name = path.read_text().strip() if path.exists() else PRESET
+    if name not in PRESETS:
+        die(f'{path}: expected one of {", ".join(PRESETS)}, got {name!r}; set it with `cowork.py default <preset>`')
+    return name
+
+
+def tier_pair(tier):
+    return PRESETS[preset()] if tier == 'default' else TIERS[tier]
 
 
 def update_side(box, **fields):
@@ -295,17 +319,21 @@ def update_side(box, **fields):
         write_side(box, **fields)
 
 
-def settle_pair(box, side, model, effort):
-    """The model and effort for a request: the flags, else the side's saved
-    pair, else its default; whatever was missing on the side is saved for
-    later sends. Under admission with the start."""
-    saved_model, saved_effort = side_state(box)[1:]
-    default_model, default_effort = DEFAULTS[side]
-    write_side(box, model=model or saved_model or default_model, effort=effort or saved_effort or default_effort)
+def settle_pair(box, side, model, effort, tier):
+    """Save the model and effort a request runs on. Under admission with the
+    start; the runner reads them back, so a later flip cannot change it.
+    --model/--effort pin a pair over the one in effect; else a Codex lane
+    runs on the named or saved tier, resolved now, so a flipped default
+    reaches it; a pinned lane keeps its pair; a new Codex lane starts on
+    `default`, a new Claude lane on DEFAULTS."""
+    saved = lane_fields(box)
+    tier = '' if side == 'claude' else tier or saved['tier'] or ('' if saved['model'] else 'default')
+    base = tier_pair(tier) if tier else (saved['model'], saved['effort']) if saved['model'] else DEFAULTS['claude']
+    write_side(box, model=model or base[0], effort=effort or base[1], tier='' if model or effort else tier)
 
 
 def session_of(box):
-    return side_state(box)[0]
+    return lane_fields(box)['session'] or None
 
 
 def compose(session, side, request, task, no_edit, root, model, effort, lane, where):
@@ -377,7 +405,8 @@ def run(side, box, host, request, no_edit, lock_fd):
         if exit_file.exists():  # killed before it started
             status = 'killed'
             return
-        session, model, effort = side_state(box)  # settled by start, under the lock this runner holds
+        fields = lane_fields(box)  # settled by start, under the lock this runner holds
+        session, model, effort = fields['session'] or None, fields['model'], fields['effort']
         where = ''
         if kind(box) == 'worktree':
             where = WHERE.format(root=root, branch=git(root, 'symbolic-ref', '--short', 'HEAD').stdout.strip(),
@@ -517,7 +546,7 @@ def find(gitdir, request):
     return box
 
 
-def start(box, root, side, task, no_edit, read_only, model, effort):
+def start(box, root, side, task, no_edit, read_only, model, effort, tier):
     """Record the request and start its runner, which holds the request lock
     from birth; the caller keeps nothing open. Refused while one is in flight,
     and for a lane not ready: --read-only on a worktree lane, a worktree that
@@ -539,7 +568,7 @@ def start(box, root, side, task, no_edit, read_only, model, effort):
                 no_edit = True
             else:
                 sync_lane(root, box)
-        settle_pair(box, side, model, effort)
+        settle_pair(box, side, model, effort, tier)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task)
         (box / f'{request}.jsonl').touch()
@@ -594,14 +623,17 @@ def main(argv=None):
                       help='on a lane\'s first send: it works in this checkout and every send to it is --no-edit')
     send.add_argument('--task', required=True, help='literal text, or - for stdin')
     send.add_argument('--no-edit', action='store_true', help='a question or review: the coworker must not edit')
-    send.add_argument('--model', help=f'the coworker\'s model from now on; a new lane defaults to {DEFAULTS["codex"][0]} (codex) or {DEFAULTS["claude"][0]} (claude)')
-    send.add_argument('--effort', choices=EFFORTS, help=f'its reasoning effort from now on; a new lane defaults to {DEFAULTS["codex"][1]}')
+    send.add_argument('--tier', choices=('default', *TIERS), help='a Codex lane\'s tier from now on; a new lane starts on default')
+    send.add_argument('--model', help=f'pin the coworker\'s model from now on; a new Claude lane defaults to {DEFAULTS["claude"][0]}')
+    send.add_argument('--effort', choices=EFFORTS, help='pin its reasoning effort from now on')
     send.add_argument('--detach', action='store_true', help='print the request id and return; collect the reply with read --wait')
     sub.add_parser('kill', help='stop a running request and everything its coworker spawned').add_argument('request')
     read = sub.add_parser('read', help='print the reply of a request whose send detached or died, and remove it')
     read.add_argument('request')
     read.add_argument('--wait', action='store_true', help='wait until the runner and its descendants release the request')
     sub.add_parser('status', help='lanes and undelivered requests in this worktree')
+    default = sub.add_parser('default', help='show, or set, the Codex default tier\'s preset for this user on this host')
+    default.add_argument('preset', nargs='?', choices=tuple(PRESETS))
     reset_ = sub.add_parser('reset', help='forget a lane\'s session and its requests, remove its worktree once merged; '
                                           'the next send starts anew')
     reset_.add_argument('side', choices=SIDES)
@@ -610,6 +642,18 @@ def main(argv=None):
     for name in ('side', 'lane', 'request', 'no_edit', 'lock_fd'):
         runner.add_argument(name)
     a = parser.parse_args(argv)
+    if a.cmd == 'send' and a.tier and (a.model or a.effort):
+        parser.error('--tier names a pair; --model/--effort pin one: give one or the other')
+
+    if a.cmd == 'default':
+        path = preset_file()
+        if a.preset:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            replace_text(path, a.preset + '\n')
+        name = preset()
+        model, effort = PRESETS[name]
+        print(f'codex default: {name}, {model} at {effort} effort ({path if path.exists() else "built in"})')
+        return 0
 
     root, gitdir = git_dir()
     if a.cmd == '_run':
@@ -618,6 +662,10 @@ def main(argv=None):
 
     if a.cmd == 'send':
         side = coworker(a.to)
+        if a.tier and side == 'claude':
+            parser.error('--tier is for Codex lanes; a Claude lane takes --model/--effort')
+        if side == 'codex':
+            preset()  # a bad preference file is refused before the lane is touched
         if not LANE.match(a.lane):
             die(f'lane names are [a-z0-9-], up to 40, and not "all": {a.lane!r}')
         box = box_of(gitdir, side, a.lane)
@@ -625,7 +673,7 @@ def main(argv=None):
         task = sys.stdin.read() if a.task == '-' else a.task
         if not task.strip():
             die('the task resolved to nothing')
-        request = start(box, root, side, task, a.no_edit, a.read_only, a.model, a.effort)
+        request = start(box, root, side, task, a.no_edit, a.read_only, a.model, a.effort, a.tier)
         print(request, flush=True)
         if a.detach:
             return 0
@@ -659,9 +707,13 @@ def main(argv=None):
                     if not (box / 'session').exists() and not requests(box):
                         continue  # reset, and nothing since
                     shown += 1
-                    session, model, effort = side_state(box)
+                    fields = lane_fields(box)
+                    model, tier = fields['model'], fields['tier']
                     where = {'main': '', 'read-only': ', read-only', 'worktree': f', in {lane_root(root, box)}'}[kind(box)]
-                    print(f'{side}/{lane}: session {session or "none"}' + (f', {model} at {effort} effort' if model else '') + where)
+                    pair = f', {model} at {fields["effort"]} effort' if model else ''
+                    if side == 'codex' and model:
+                        pair += f', tier {tier}' if tier else ', pinned'
+                    print(f'{side}/{lane}: session {fields["session"] or "none"}{pair}{where}')
                     for request in requests(box):
                         print(f'  {request}  {state(box, request)}')
             if not shown:

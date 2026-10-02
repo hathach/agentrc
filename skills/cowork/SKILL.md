@@ -18,10 +18,11 @@ same commands; the checkout is shared.
 ```bash
 S=<skill dir>/scripts/cowork.py
 
-python3 $S send (--task "..." | --task -) [--lane L] [--read-only] [--no-edit] [--model M] [--effort E] [--detach]
+python3 $S send (--task "..." | --task -) [--lane L] [--read-only] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach]
 python3 $S kill <id>             # the running request, with all it spawned
 python3 $S read [--wait] <id>    # a detached or dead sender's reply; --wait blocks until ready
 python3 $S status                # lanes and undelivered requests
+python3 $S default [astra|sol]   # show or flip the Codex default tier's preset
 python3 $S reset codex|claude <lane>|all   # forget the lane and its requests; a worktree lane's tree goes once merged
 ```
 
@@ -88,30 +89,36 @@ the tree and deletes the branch, and refuses while the tree is dirty or the
 branch has commits your HEAD lacks. `reset <side> all` does every lane.
 Lane names are `[a-z0-9-]`. `status` shows each lane with its kind.
 
-The coworker's model and effort are per lane and persist with the session.
-The first `send` sets them: `--model` and `--effort` if given, else the
-side's default, `gpt-6.1-sol` at `high` for Codex and `opus` at `high` for
-Claude. Later sends reuse them, even after a default changes; a flag
-replaces the value from then on; `reset` forgets them. The request header
-tells the coworker what model and effort answer it.
+A Codex lane runs on a tier, chosen by role:
 
-Pairs by lane role; examples target Codex, and a Claude coworker takes its
-default unless you name another:
+- `--tier review`, `gpt-6-astra` at `high`: planning, `co-ask`, `co-debug`
+  and `co-review` exchanges and non-routine reviews, the completion co-review
+  and its fix-diff reviews included.
+- `--tier expert`, `gpt-6-astra` at `xhigh`: a worktree lane for writing where
+  a wrong first attempt costs a debugging session.
+- `default`, the preset `cowork.py default` saves for you on this host:
+  `astra` (`gpt-6-astra` at `high`) or `sol` (`gpt-6.1-sol` at `high`, also
+  when unset); flip it to `sol` when the weekly Codex quota is tight. Writing
+  (`main` and writer worktree lanes, `co-test` tests), routine step reviews,
+  `co-fix`/`co-do` and `co-test` rounds before their completion co-review,
+  and lookups such as `read-doc`.
 
-- planning, `co-ask`, `co-debug` and `co-review` exchanges and non-routine
-  reviews (`plan` and review lanes, the completion co-review and its
-  fix-diff reviews included): `--model gpt-6-astra --effort high`
-- writing (`main` and writer worktree lanes, `co-test` tests), routine step
-  reviews, `co-fix`/`co-do` and `co-test` rounds before their completion
-  co-review, and lookups such as `read-doc`: the default, no flags on a new
-  lane. Routine step reviews share one read-only `step` lane per task, first
-  briefed with the agreed plan and its invariants; a step that sets an
-  interface, invariant, concurrency or hardware behaviour goes to a review
-  lane instead. For the completion co-review, move that read-only lane to
-  astra with both flags rather than opening a fresh one: it keeps the
-  history, and a writer worktree lane cannot see uncommitted host changes
-- `expert`, a worktree lane for writing where a wrong first attempt costs a
-  debugging session: `--model gpt-6-astra --effort xhigh`
+A new lane starts on `default`, and a send without `--tier` keeps the lane's
+tier. A flip reaches every `default` lane on its next send; the model
+change likely forfeits an active lane's prompt cache on that turn, so flip
+between tasks. Either `--model` or `--effort` pins a lane outside the
+tiers, keeping the other value; a lane from before tiers stays
+pinned until a send names one. A Claude coworker has no tiers: it takes
+`--model` and `--effort`, else `opus` at `high`, and keeps them. `reset`
+forgets all of it; `status` shows each lane's pair and its tier or `pinned`,
+and the request header tells the coworker its pair.
+
+Routine step reviews share one read-only `step` lane per task, first briefed
+with the agreed plan and its invariants; a step that sets an interface,
+invariant, concurrency or hardware behaviour goes to a `review` lane
+instead. For the completion co-review, move that lane with `--tier review`
+rather than opening a fresh one: it keeps the history, and a writer worktree
+lane cannot see uncommitted host changes.
 
 Never open the session interactively while a request is running.
 
