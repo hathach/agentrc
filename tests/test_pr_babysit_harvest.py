@@ -96,13 +96,14 @@ class SettleRules(unittest.TestCase):
         paused['commit_id'] = HEAD
         self.assertEqual(harvest.greptile(HEAD, [], [], [paused], EVENT)['kind'], 'limited')
 
-    def test_digest_matches_the_one_pr_reply_reads_back(self):
-        spec_ = importlib.util.spec_from_file_location('pr_reply', SCRIPT.parents[2] / 'pr-reply' / 'scripts' / 'reply.py')
-        reply = importlib.util.module_from_spec(spec_)
-        spec_.loader.exec_module(reply)
-        for body in (None, '', 'fix this', '📝 nit\r\nline'):
-            self.assertEqual(harvest.digest(body), reply.comment_digest(body), body)
-            self.assertEqual(harvest.digest(body), hashlib.sha256((body or '').encode()).hexdigest()[:12])
+    def test_digest_and_aliases_are_pr_replys_comment_digest(self):
+        rabbit = 'x\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit a3f8bc8'
+        for body, login in ((None, 'a'), ('', 'a'), ('fix this', 'a'), ('📝 nit\r\nline', 'a'), (rabbit, 'coderabbitai[bot]')):
+            got = harvest.entry('review', {'id': 1, 'user': {'login': login}, 'html_url': 'u'}, 'coderabbit', body, 't', 't')
+            self.assertEqual([got['digest'], *got.get('aliases', [])], harvest.comment_digest.digests(body, login), body)
+            if login == 'a':
+                self.assertEqual(got['digest'], hashlib.sha256((body or '').encode()).hexdigest()[:12])
+                self.assertNotIn('aliases', got)
 
 class FailClosed(unittest.TestCase):
     """What a first review found failing open: each case must end unknown or with the older, provable state."""

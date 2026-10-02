@@ -43,7 +43,7 @@ error is left out of the line: a model relaying it drops a trailing null.
 --inspect reads, never writes: for each pair, whether REPLY is ours answering
 COMMENT on this PR (a bare COMMENT names our newest reply to it, an error when
 there is none), its exact body with the body's digest, and the original's
-digest as pr-babysit's harvest.py computes it (sha256, 12 hex), and the original's
+digest as pr-babysit's harvest.py computes it (comment_digest.py), and the original's
 text. stdout ends with {"inspected": [{"commentId", "replyId", "kind", "body",
 "bodyDigest", "original", "originalDigest", "error"}], "seal"}; body is null when
 error is set. Exit 0 when every
@@ -67,11 +67,14 @@ for a manifest, sent and posted meaning the edit.
 """
 
 import argparse
-import hashlib
 import json
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import comment_digest  # noqa: E402
 
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owner:$o,name:$r){'
                  'pullRequest(number:$p){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor}'
@@ -281,9 +284,9 @@ def is_fix_note(body):
     return body.partition('\n\n')[2].startswith('Fixed in ')
 
 
-def comment_digest(body):
-    """harvest.py's digest of a reviewer's comment: sha256 of its body, 12 hex."""
-    return hashlib.sha256((body or '').encode()).hexdigest()[:12]
+def original_digest(original):
+    """harvest.py's digest of a reviewer's comment."""
+    return comment_digest.digests(original.get('body'), (original.get('user') or {}).get('login'))[0]
 
 
 def read_pair(poster, kind, original, comment_id, reply_id):
@@ -305,7 +308,7 @@ def inspect(poster, comment_id, reply_id):
         kind, original = poster.kind_of(comment_id)
         out['kind'] = kind
         if original is not None:
-            out['original'], out['originalDigest'] = original.get('body') or '', comment_digest(original.get('body'))
+            out['original'], out['originalDigest'] = original.get('body') or '', original_digest(original)
         if reply_id is None and kind != 'none':
             ids = [c['id'] for c in poster.ours(kind, original)]
             if not ids:
@@ -331,7 +334,7 @@ def read_again(poster, item, rc, done=None):
     # Afresh for each entry: settling an earlier one may have moved this one.
     original = poster.read_original(kind, item['commentId']) if kind != 'none' else None
     c, why = read_pair(poster, kind, original, item['commentId'], item['replyId'])
-    if not why and comment_digest(original.get('body')) != item['originalDigest']:
+    if not why and original_digest(original) != item['originalDigest']:
         why = f'comment {item["commentId"]} was edited since the inspection'
     if not why and fnv1a(c.get('body', '')) != item['bodyDigest'] and (
             done is None or c.get('body') != reply_body(kind, original, done)):

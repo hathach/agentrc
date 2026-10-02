@@ -111,7 +111,7 @@ const adoptionArgs = (state, over = {}) => ({
 
 // The runtime validates a stub's reply against its schema; the harness does the
 // same for the CI stub, the one whose shape changed, so a fixture in the old
-// shape fails here as a stale watcher would there.
+// shape fails here as a stale watcher would there, and for a relay's garbled copy.
 const conforms = (schema, value, at) => {
   if (schema.enum && !schema.enum.includes(value)) throw new Error(`${at}: ${JSON.stringify(value)} not in ${schema.enum}`)
   if (schema.type === 'object') {
@@ -491,8 +491,9 @@ async function run(opts = {}) {
         const schema = sealing ? { ...options.schema, required: options.schema.required.filter(k => k !== 'seal') } : options.schema
         const line = await agent(prompt, { ...options, schema })
         const sealed = !line || !sealing || 'seal' in line ? line : line.error ? { ...line, seal: '' } : sealLine(line)
-        const copy = opts.garble ? opts.garble(options.label, sealed) : sealed
-        return copy && opts.garble ? conforms(options.schema, copy, options.label) : copy
+        if (!opts.garble) return sealed
+        const copy = opts.garble(options.label, sealed)
+        return copy && conforms(options.schema, copy, options.label)
       }, pipeline, parallel, () => {}, (m) => logs.push(String(m)), workflow, null,
       ...ABSENT.map(() => undefined))
     return { result, logs, labels: calls.map(c => c.label), calls, napPoints }
@@ -3315,6 +3316,65 @@ test('a deferral naming no current valid finding stops the run', async () => {
     assert.match(result.detail, why)
     assert.equal(labels.some(l => /^(fix:|defer#|replies#|resolve#)/.test(l)), false, 'nothing fixed or posted')
   }
+})
+
+// #48: a digest recorded before CodeRabbit rewrote its comment's end is one of the comment's aliases now.
+const rewritten = (over = {}) => finding({ commentDigest: 'canon', commentAliases: ['raw'], ...over })
+
+test('a deferral recorded before CodeRabbit rewrote its comment stays deferred on every resume, with or without the argument (#48)', async () => {
+  const before = await run({ reviews: { findings: [finding({ commentDigest: 'raw' })], replies: [], bots: 'reviewed' }, args: { deferrals: [deferral({ commentDigest: 'raw' })], maxCycles: 6 } })
+  assert.equal(before.result.pass, true, before.result.reason)
+  let state = before.result.state
+  for (const deferrals of [[deferral({ commentDigest: 'raw' })], undefined, [deferral({ commentDigest: 'raw' })]]) {
+    const { result, logs } = await run({ reviews: { findings: [rewritten()], replies: [], bots: 'reviewed' }, args: { deferrals, state, maxCycles: 6 } })
+    assert.notEqual(result.reason, 'deferral-refused', result.detail)
+    assert.equal(result.pass, true, result.reason)
+    assert.equal(result.handoffs, undefined)
+    assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'canon', issueUrl: ISSUE, reason: 'broken on master too; own PR' }]])
+    assert.ok(logs.some(l => /digest\(s\) recorded before CodeRabbit rewrote its comment's end now name the current body/.test(l)) || deferrals === undefined, logs.join('\n'))
+    state = result.state
+  }
+  const edited = await run({ reviews: { findings: [rewritten({ commentDigest: 'other', commentAliases: ['another'] })], replies: [], bots: 'reviewed' }, args: { state, maxCycles: 6 } })
+  assert.equal(edited.result.reason, 'deferral-refused', 'a real edit is still refused')
+})
+
+test('an answer recorded before CodeRabbit rewrote its comment stays paid; an unrelated digest is still an edit (#48)', async () => {
+  const refute = (over) => ({ findings: [invalidFinding({ commentId: 2, line: 4, ...over })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' })
+  const first = await run({ reviews: refute({ commentDigest: 'raw' }), args: { ...YIELD } })
+  assert.deepEqual(first.result.state.answeredWith.find(([id]) => id === 2)[1].digest, 'raw')
+  const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
+  const same = await run({ reviews: refute({ commentDigest: 'canon', commentAliases: ['raw'] }), preflight: at, args: { ...YIELD, state: structuredClone(first.result.state) } })
+  assert.equal(same.logs.some(l => l.includes('edited after we answered it')), false, same.logs.join('\n'))
+  assert.equal(same.result.handoffs, undefined)
+  assert.equal(same.result.state.answeredWith.find(([id]) => id === 2)[1].digest, 'canon')
+  const other = await run({ reviews: refute({ commentDigest: 'canon', commentAliases: ['older'] }), preflight: at, args: { ...YIELD, state: structuredClone(first.result.state) } })
+  assert.deepEqual(other.result.handoffs.map(h => [h.commentId, h.why]), [[2, 'edited after we answered it']])
+})
+
+test('a settlement or a by-hand answer recorded before CodeRabbit rewrote its comment still holds (#48)', async () => {
+  const { edited, at, state, settlement } = await reanswered()
+  const now = { findings: [invalidFinding({ commentDigest: 'canon', commentAliases: ['edited'] })], replies: [], bots: 'reviewed' }
+  // Each launch gets its own copy: a launch re-pins the state it restored in place.
+  const settled = await run({ reviews: now, preflight: at, args: { ...YIELD, state: structuredClone(state), replySettlements: [{ ...settlement }] } })
+  assert.deepEqual(settled.result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
+  assert.equal(payloadOf(settled.calls.find(c => c.label === 'reuse#3').prompt, 'Reuses').reuses[0].originalDigest, 'canon')
+  assert.deepEqual(settled.result.state.answeredWith.find(([id]) => id === 1), [1, { how: 'byHand', digest: 'canon' }])
+  // Settled on the digest of the day, then rewritten: still the caller's answer.
+  const byHand = await run({ reviews: edited, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] } })
+  assert.deepEqual(byHand.result.state.answeredWith.find(([id]) => id === 1), [1, { how: 'byHand', digest: 'edited' }])
+  const later = await run({ reviews: now, preflight: at, args: { ...YIELD, maxCycles: 4, state: byHand.result.state } })
+  assert.ok(later.logs.some(l => /left as answered by hand/.test(l)), later.logs.join('\n'))
+  assert.equal(later.result.handoffs, undefined)
+})
+
+test("findings that disagree on their comment's digest stop the run (#48)", async () => {
+  const split = { findings: [rewritten(), rewritten({ findingId: '1#2', line: 2, commentAliases: ['raw', 'other'] })], replies: [], bots: 'reviewed' }
+  const { result, labels } = await run({ reviews: split })
+  assert.equal(result.reason, 'review-report-unusable')
+  assert.equal(result.detail, "comment 1's findings disagree on its digest")
+  const reordered = { findings: [rewritten({ commentAliases: ['raw', 'other'] }), rewritten({ findingId: '1#2', line: 2, commentAliases: ['other', 'raw'] })], replies: [], bots: 'reviewed' }
+  assert.notEqual((await run({ reviews: reordered })).result.reason, 'review-report-unusable', 'the same aliases in another order agree')
+  assert.equal(labels.some(l => /^(fix:|replies#|resolve#|defer#)/.test(l)), false)
 })
 
 test('an out-of-scope topic holds a finding its issue covers before the first harvest can fix it, and anything short of a clear no holds too (#39)', async () => {

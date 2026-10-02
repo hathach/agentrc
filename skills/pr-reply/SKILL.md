@@ -35,7 +35,10 @@ python3 $R --pr <N> --edit <file.json>
 Every entry carries the body's digest (FNV-1a, 32-bit, over code points); the
 script refuses an entry whose body does not match it, so a body copied wrong
 never reaches the PR. A workflow computes the digests itself; by hand, use
-`--digest`.
+`--digest`. The original's digest is `scripts/comment_digest.py`'s, the one
+pr-babysit harvests with: what CodeRabbit rewrites at its comment's end does
+not change it. An inspection from before that rule has another digest: inspect
+again.
 
 The last stdout line is `{"receipts": [...], "seal": ...}`, one receipt per manifest entry (the seal is pr-babysit's check that a relayed copy is exact):
 `kind` (`review`, `issue` or `review-body`; `none` when all three were searched

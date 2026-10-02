@@ -379,7 +379,7 @@ const REVIEWS = {
         properties: {
           related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] },
           source: { type: 'string' }, findingId: { type: 'string' },
-          commentDigest: { type: 'string' }, commentId: { type: 'integer' },
+          commentDigest: { type: 'string' }, commentAliases: { type: 'array', items: { type: 'string' } }, commentId: { type: 'integer' },
           file: { type: 'string' }, line: { type: 'integer' }, claim: { type: 'string' },
           verdict: { type: 'string', enum: ['valid', 'invalid', 'stale'] },
           reason: { type: 'string' }, fixHint: { type: 'string' },
@@ -815,6 +815,13 @@ const reviewsWhy = (r) => {
   }
   const missing = autoRun.filter(bot => !seen.has(bot))
   if (missing.length) return `no record for ${missing.join(', ')}`
+  // A comment's findings carry its one digest; any other cannot say which body was judged.
+  const bodyOf = new Map()
+  for (const f of r.findings) {
+    const key = JSON.stringify([f.commentDigest, [...(f.commentAliases || [])].sort()])
+    if ((bodyOf.get(f.commentId) ?? key) !== key) return `comment ${f.commentId}'s findings disagree on its digest`
+    bodyOf.set(f.commentId, key)
+  }
   return null
 }
 // reviewed and settled are done; queued and absent once the cap passed; working and unknown wait uncapped.
@@ -1324,6 +1331,24 @@ const pushExact = async (sha, label, prToo = false) => {
 
 let napMs = 0
 
+// A digest recorded before CodeRabbit rewrote its comment's end is one of the comment's aliases now (comment_digest.py): the same body.
+const repin = (cycle, findings) => {
+  const now = new Map(findings.filter(f => f.commentAliases && f.commentAliases.length).map(f => [f.commentId, f]))
+  if (!now.size) return
+  let moved = 0
+  const fix = (commentId, holder, key = 'digest') => {
+    const f = now.get(commentId)
+    if (holder && f && f.commentAliases.includes(holder[key])) { holder[key] = f.commentDigest; moved++ }
+  }
+  const commentOf = (findingId) => Number(String(findingId).split('#')[0])
+  for (const [id, a] of answeredWith) { fix(id, a); fix(id, a.sonarOf) }
+  for (const [id, d] of debt) { fix(id, d); fix(id, d.attempt) }
+  for (const [findingId, d] of deferrals) fix(commentOf(findingId), d)
+  for (const [, d] of decisions) fix(d.commentId, d)
+  for (const d of deferralsArg) if (d) fix(commentOf(d.findingId), d, 'commentDigest')
+  for (const s of settlementsArg) fix(s.commentId, s, 'commentDigest')
+  if (moved) log(`cycle ${cycle}: ${moved} digest(s) recorded before CodeRabbit rewrote its comment's end now name the current body`)
+}
 // The comment's debt, created empty (with digest, when given) if it has none.
 const debtEntry = (commentId, digest) => {
   if (!debt.has(commentId)) debt.set(commentId, { dismissals: new Set(), notes: new Set(), ...(digest !== undefined ? { digest } : {}) })
@@ -1746,6 +1771,8 @@ const runCycle = async (cycle, entry) => {
       entry.error = 'duplicate findingId'
       return stop(cycle, 'duplicate-finding-ids')
     }
+
+    repin(cycle, r.findings)
 
     const byHandNow = r.findings.filter(answeredByHand)
     if (byHandNow.length) {

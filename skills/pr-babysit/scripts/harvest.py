@@ -18,14 +18,15 @@ run or timeline event dates the head, or no bot auto-runs), headEventEvidence, b
 --auto-run name: bot, state, kind, sha, evidence, reason), and comments (every
 inline comment, issue comment and review body by a --reviewers author: kind
 review|issue|review-body, commentId, source, author, body verbatim, digest
-(sha256 of the body, 12 hex), path, line, commitId, createdAt, updatedAt,
-inReplyTo, url). Exit 2 with {"error": ...} when gh cannot answer the PR, the
+(pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
+CodeRabbit rewrites at its end), aliases (the digests a body's earlier forms
+may have been recorded under; left out when there are none), path, line,
+commitId, createdAt, updatedAt, inReplyTo, url). Exit 2 with {"error": ...} when gh cannot answer the PR, the
 head, or a comment endpoint.
 """
 
 import base64
 import functools
-import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -35,6 +36,10 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, Unusable, report, run  # noqa: E402
+
+# reply.py checks a comment against the same digest, so both skills share one definition.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
+import comment_digest  # noqa: E402
 
 KNOWN = ('copilot', 'coderabbit', 'greptile', 'code-scanning')
 SETTLED = ('coderabbit', 'greptile')
@@ -68,7 +73,8 @@ def source_of(login, reviewers):
 
 
 def digest(body):
-    return hashlib.sha256((body or '').encode()).hexdigest()[:12]
+    """The raw body's: what pr-review and sonar.py compare, with no CodeRabbit rule."""
+    return comment_digest.sha12(body or '')
 
 
 def stamp(t):
@@ -284,7 +290,10 @@ def pr_types(repo, path, sha):
 
 
 def entry(kind, c, src, body, created, updated, path=None, line=None, commit=None, reply_to=None):
-    return {'kind': kind, 'commentId': c['id'], 'source': src, 'author': c['user']['login'], 'body': body or '', 'digest': digest(body),
+    author = c['user']['login']
+    first, *also = comment_digest.digests(body, author)
+    return {'kind': kind, 'commentId': c['id'], 'source': src, 'author': author, 'body': body or '',
+            'digest': first, **({'aliases': also} if also else {}),
             'path': path, 'line': line, 'commitId': commit, 'createdAt': created, 'updatedAt': updated, 'inReplyTo': reply_to, 'url': c['html_url']}
 
 
