@@ -539,13 +539,15 @@ const relayed = (schema) => {
     `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
 }
 // A model copying JSON drops a trailing null (#3968): relay schemas require no nullable field, and a missing one comes back null.
+// A schema naming `nullsOmitted` relaxes only those: its script prints every other member, and a copy that dropped one is no copy (#47).
 const nullable = (p) => !!p && Array.isArray(p.type) && p.type.includes('null')
 const lenient = (s) => {
   if (!s || typeof s !== 'object') return s
-  const out = { ...s }
+  const { nullsOmitted, ...out } = s
   if (s.properties) {
     out.properties = Object.fromEntries(Object.entries(s.properties).map(([k, p]) => [k, lenient(p)]))
-    if (s.required) out.required = s.required.filter(k => !nullable(s.properties[k]))
+    const relaxed = nullsOmitted ? (k) => nullsOmitted.includes(k) : (k) => nullable(s.properties[k])
+    if (s.required) out.required = s.required.filter(k => !relaxed(k))
   }
   if (s.items) out.items = lenient(s.items)
   return out
@@ -579,7 +581,7 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 // A rerun is safe: reply.py reuses a reply of ours rather than post again.
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file and run ` +
-  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return its last stdout line unchanged. ` +
+  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 )
@@ -608,6 +610,7 @@ const RECEIPTS = withSeal({
       items: {
         type: 'object', additionalProperties: false,
         required: ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified', 'resolved', 'error'],
+        nullsOmitted: ['resolved', 'error'],
         properties: {
           commentId: { type: 'integer' }, kind: { type: ['string', 'null'] }, replyId: { type: ['integer', 'null'] },
           digest: { type: 'string' }, sent: { type: 'boolean' }, posted: { type: 'boolean' }, verified: { type: ['boolean', 'null'] }, resolved: { type: ['boolean', 'null'] },

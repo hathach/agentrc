@@ -484,13 +484,15 @@ async function run(opts = {}) {
     const result = await fn(
       opts.rawArgs ?? { pr: 3888, maxCycles: 1, autoPush: true, reviewers: ['coderabbit'], ...opts.args },
       // Each stub answers as its script before facts.py seals the line; the seal goes on
-      // here (an error line's relay fills it with ''), then opts.garble is the relay's copy.
+      // here (an error line's relay fills it with ''), then opts.garble is the relay's copy,
+      // held to the schema the relay was given as the runtime's StructuredOutput holds it.
       async (prompt, options) => {
         const sealing = !!options.schema?.properties?.seal
         const schema = sealing ? { ...options.schema, required: options.schema.required.filter(k => k !== 'seal') } : options.schema
         const line = await agent(prompt, { ...options, schema })
         const sealed = !line || !sealing || 'seal' in line ? line : line.error ? { ...line, seal: '' } : sealLine(line)
-        return opts.garble ? opts.garble(options.label, sealed) : sealed
+        const copy = opts.garble ? opts.garble(options.label, sealed) : sealed
+        return copy && opts.garble ? conforms(options.schema, copy, options.label) : copy
       }, pipeline, parallel, () => {}, (m) => logs.push(String(m)), workflow, null,
       ...ABSENT.map(() => undefined))
     return { result, logs, labels: calls.map(c => c.label), calls, napPoints }
@@ -2872,6 +2874,14 @@ test('a settlement is refused at another head, on a held, changed or not handed-
   assert.deepEqual(ciOnly.result.settlements, [{ commentId: 1, outcome: 'not processed', why: 'no review harvest in this launch' }])
 })
 
+test('a reuse relay that drops a member gets one fresh relay, and the settlement still lands (#47)', async () => {
+  const { edited, at, state, settlement } = await reanswered()
+  const { result, labels } = await run({ reviews: edited, preflight: at, args: { ...YIELD, state, replySettlements: [settlement] },
+    garble: (l, a) => l === 'reuse#3' ? { ...a, receipts: a.receipts.map(({ replyId, ...r }) => r) } : a })
+  assert.deepEqual(labels.filter(l => l.startsWith('reuse#')), ['reuse#3', 'reuse#3.retry'])
+  assert.deepEqual(result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
+})
+
 test('replySettlements must be well formed, one per comment', async () => {
   const ok = { commentId: 1, commentDigest: 'd1', replyId: 2, bodyDigest: 'ab', headSha: SHA }
   for (const bad of [{}, [{ ...ok, headSha: 'abc' }], [{ ...ok, replyId: 0 }], [{ ...ok, bodyDigest: '' }], [ok, { ...ok, replyId: 3 }]]) {
@@ -3908,6 +3918,26 @@ test('a reply receipt whose copy does not match its seal gets one fresh relay on
   assert.equal(calls.find(c => c.label === 'replies#1.retry').model, 'sonnet')
   assert.deepEqual(manifestOf(calls, 'replies#1.retry'), manifestOf(calls, 'replies#1'), 'the same manifest: reply.py reuses what landed')
   assert.equal(result.pass, true, result.reason)
+})
+
+test('a reply relay must copy every member reply.py prints: a dropped one is refused by the schema, an invented one by the seal (#47)', async () => {
+  // tinyusb#4055: a Haiku copy left out kind and replyId and gave a review-body receipt resolved: false.
+  const reviews = { findings: [invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+  const first = (l) => l === 'replies#1'
+  const dropped = await run({ reviews, garble: (l, a) => first(l) ? { ...a, receipts: a.receipts.map(({ kind, replyId, ...r }) => r) } : a })
+  assert.ok(dropped.logs.some(l => /^replies#1 errored — .*missing kind/.test(l)), dropped.logs.join('\n'))
+  const required = dropped.calls.find(c => c.label === 'replies#1').schema.properties.receipts.items
+  assert.deepEqual(required.required, ['commentId', 'kind', 'replyId', 'digest', 'sent', 'posted', 'verified'])
+  assert.equal('nullsOmitted' in required, false, 'the runtime never sees the annotation')
+  const invented = await run({ reviews, garble: (l, a) => first(l) ? { ...a, receipts: a.receipts.map(r => ({ ...r, resolved: !r.resolved })) } : a })
+  assert.ok(invented.logs.includes('replies#1: the relayed copy does not match its seal'), invented.logs.join('\n'))
+  for (const { result, labels } of [dropped, invented]) {
+    assert.deepEqual(labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'])
+    assert.equal(result.pass, true, result.reason)
+  }
+  // A receipt with no resolved or error, as reply.py prints a null one, still matches its seal.
+  const bare = await run({ reviews, garble: (l, a) => first(l) ? { ...a, receipts: a.receipts.map(({ error, ...r }) => r) } : a })
+  assert.deepEqual(bare.labels.filter(l => l.startsWith('replies#')), ['replies#1'])
 })
 
 test('a retry offers the body first posted, not the redraft', async () => {
