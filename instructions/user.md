@@ -178,7 +178,8 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 # Pull requests
 - Right after opening a PR, or pushing to one that no chief is babysitting,
   ask me whether to launch a headless `chief` in its worktree to babysit it
-  through `pr-babysit` with `autoPush: true`, unless I already asked for one.
+  through `pr-babysit` with `autoPush: true` and `markSonar: true`, unless I
+  already asked for one.
   My request to launch chief to babysit a PR, or my yes to that offer, is the
   grant unless I narrow it: launch without a further question, following
   `~/code/agentrc/README.md`'s headless PR publishing recipe.

@@ -147,6 +147,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
         rules = ' '.join((AGENTS.parent / 'instructions' / 'user.md').read_text().split())
         self.assertIn('My request to launch chief to babysit a PR, or my yes to that offer, is the grant unless I narrow it', rules)
+        self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '
                       'until the task is done, the PR changes, or the human narrows or withdraws it', readme)
@@ -189,7 +190,13 @@ class AgentFiles(unittest.TestCase):
 
     def test_chief_launches_pr_babysit_with_the_arguments_the_workflow_parses(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())
-        self.assertIn('Launch it as `{ pr, autoPush, yieldAfterCycle: true, lane, stateRef }`', chief)
+        self.assertIn('Launch it as `{ pr, autoPush, markSonar, yieldAfterCycle: true, lane, stateRef }`, `markSonar` set with '
+                      '`autoPush` unless the human withheld Sonar marking', chief)
+        self.assertNotIn('the grant includes SonarCloud marking', chief)
+        relaunch = chief.split('A `ci-red-sonar-gate` stop')[1].split('Only a unit')[0]
+        self.assertIn('Relaunch with `markSonar`, unless the human withheld Sonar marking, only when', relaunch)
+        switches = chief.split('A workflow carries a grant only through')[1].split('A workflow with no such argument')[0]
+        self.assertIn('a grant covering those answers covers `markSonar` on that PR unless the human withheld Sonar marking', switches)
 
     def test_hil_operator_refuses_hardware_work_without_the_project_contract(self):
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
