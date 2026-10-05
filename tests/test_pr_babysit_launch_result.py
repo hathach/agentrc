@@ -145,6 +145,9 @@ class LaunchResultTest(unittest.TestCase):
                              ('adopt-head-mismatch', 'never answer it with a reset or a fabricated state'),
                              ('adopt-pending', 'never answer it with a reset or a fabricated state'),
                              ('adopt-audit-failed', 'never answer it with a reset or a fabricated state'),
+                             ('rebase-refused', 'never answer it with a reset or a fabricated state'),
+                             ('stale-head', "only on the user's word"),
+                             ('wrong-head', 'check out the PR head'),
                              ('deferral-refused', 'it needs a new decision'),
                              ('stale-workflow', 'relaunch from a fresh session')):
             with self.subTest(reason):
@@ -159,8 +162,8 @@ class LaunchResultTest(unittest.TestCase):
             'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable', 'ci-red-rig-side',
             'ci-red-sonar-gate', 'ci-red-unclassified', 'cycle-threw', 'maxCycles reached', 'deferred-replies-unresolved', 'dirty-start',
             'duplicate-finding-ids', 'fix-verification-failed', 'preflight-died', 'preflight-failed', 'push-failed',
-            'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending', 'stale-head',
-            'unactionable', 'wrong-branch', 'wrong-head', 'wrong-remote', 'yielded'}
+            'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending',
+            'unactionable', 'wrong-branch', 'wrong-remote', 'yielded'}
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}

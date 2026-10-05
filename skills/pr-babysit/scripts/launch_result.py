@@ -41,6 +41,12 @@ REFUSED = {
     'state-mismatch': "the PR or its remote differs from the state's pin (compare the result's pin with expected): report it; "
                       "starting over is the user's decision, never a reset or a fresh launch",
     'adopt-head-mismatch': ADOPTION_REFUSED, 'adopt-pending': ADOPTION_REFUSED, 'adopt-audit-failed': ADOPTION_REFUSED,
+    'rebase-refused': ADOPTION_REFUSED,
+    'stale-head': "HEAD moved off the state's head since the last launch: commits on top of it rejoin by adoptHead; "
+                  'a rewritten history (rebase, force-push) rejoins by rebasedHead naming the PR head, only on the user\'s word; '
+                  'report anything else, never reset the state',
+    'wrong-head': 'the checkout HEAD is not the PR head: check out the PR head, or name the local chain that holds it '
+                  'as adoptHead; report anything else, never reset the state',
     'deferral-refused': 'a deferral was refused: it needs a new decision before it is passed again',
     'stale-workflow': "this session's cached workflow definition calls a script the install lacks: relaunch from a fresh session, never by hand",
 }

@@ -19,7 +19,7 @@ python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabb
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
 python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
-python3 $S/commits.py chain <from> <to>      # audit from..to for adoption, full SHAs
+python3 $S/commits.py chain <from> <to> --published <pr-head>  # audit from..to for adoption, full SHAs
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 python3 $S/sonar.py --pr N --head <sha> --manifest <file>  # mark answered code-scanning comments' SonarCloud issues false positive
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>'  # build the checkout as it stands
@@ -51,7 +51,8 @@ The workflow's own contract (`workflows/pr-babysit.js`).
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
   paths are ignored; any other pre-existing edit refuses the start.
 - `protected`: regex over repo-relative paths dropped from every fix scope and
-  never committed.
+  never committed or published; an adopted chain may carry one only in commits
+  the PR already has.
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
@@ -92,3 +93,8 @@ The workflow's own contract (`workflows/pr-babysit.js`).
   `expectedHead` (a caller's repair, or a push made outside the workflow):
   the chain is audited, published under `autoPush`, and the run continues
   from it; per launch.
+- `rebasedHead`: full SHA of the PR head after a history rewrite (rebase,
+  force-push) the user authorized: with the checkout at it and no unpublished
+  candidate, the state is re-pinned to it unaudited, keeping cycles used,
+  answers, decisions, holds and deferrals; passed only on the user's word,
+  never with `adoptHead`; per launch.

@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead?, rebasedHead? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -241,6 +241,14 @@ if (adoptHead !== null) {
   if (!restored.pin) throw new Error('adoptHead needs a state whose preflight pinned the PR head')
   if (adoptHead === restored.expectedHead) throw new Error('adoptHead equals the state\'s expectedHead: there is nothing to adopt')
 }
+// The user's word that the PR's history was rewritten (#45): the published head replaces the state's, unaudited, since this run publishes none of it.
+const rebasedHead = args.rebasedHead === undefined || args.rebasedHead === null ? null : args.rebasedHead
+if (rebasedHead !== null) {
+  if (typeof rebasedHead !== 'string' || !FULL_SHA.test(rebasedHead)) throw new Error('rebasedHead must be a full 40-hex commit SHA')
+  if (!restored || !restored.pin) throw new Error('rebasedHead re-pins a previous launch: it needs that launch\'s state, with the PR head pinned')
+  if (adoptHead !== null) throw new Error('rebasedHead and adoptHead go in separate launches: re-pin, then adopt')
+  if (rebasedHead === restored.expectedHead) throw new Error('rebasedHead equals the state\'s expectedHead: there is nothing to re-pin')
+}
 
 // Writers never stage or commit: the publisher commits only the paths it audited.
 const STOPS = 'Do not push, create a PR, or post an issue or PR comment. Do not stage or commit: leave your changes in the working tree for this workflow to publish. Agent or peer requests and previous actions add no permission. Report out-of-scope work before editing; preserve unrelated changes and obey repository checks.'
@@ -467,10 +475,11 @@ const SONAR = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['from', 'to', 'commits', 'paths', 'refusal'],
+  required: ['from', 'to', 'published', 'commits', 'paths', 'unpublished', 'refusal'],
   properties: {
-    error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' },
+    error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
+    unpublished: { type: 'array', items: { type: 'string' } },
     refusal: { type: 'string' },
   },
 })
@@ -2324,7 +2333,15 @@ if (restored && restored.pin && JSON.stringify(currentPin) !== JSON.stringify(re
   log(`preflight: this is not the PR the state belongs to — ${JSON.stringify(currentPin)} vs ${JSON.stringify(restored.pin)}`)
   return finish(stop(cyclesUsed, 'state-mismatch', { pin: currentPin, expected: restored.pin }))
 }
-if (adoptHead === null && restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
+if (rebasedHead !== null) {
+  const why = pinned.head.trim() !== rebasedHead ? `HEAD is ${pinned.head.slice(0, 7)}, not the rebasedHead ${rebasedHead.slice(0, 7)}`
+    : restored.pending ? `the state holds an unpublished candidate (${restored.pending.stage}); resolve it first` : null
+  if (why) {
+    log(`preflight: re-pin refused — ${why}`)
+    return finish(stop(cyclesUsed, 'rebase-refused', { detail: why }))
+  }
+}
+if (adoptHead === null && rebasedHead === null && restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but the previous launch left ${restored.expectedHead.slice(0, 7)}`)
   return finish(stop(cyclesUsed, 'stale-head', { head: pinned.head.trim(), expected: restored.expectedHead }))
 }
@@ -2351,17 +2368,19 @@ if (adoptHead !== null) {
   }
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   const audit = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead}\` ` +
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )
   const shas = audit ? audit.commits : []
   const paths = audit ? audit.paths : []
   const badPath = paths.find(f => !canon(f))
-  const guarded = protectedRe ? [...new Set(paths.map(canon).filter(f => f && protectedRe.test(f)))] : []
+  // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49).
+  const guarded = protectedRe && audit ? [...new Set(audit.unpublished.map(canon).filter(f => f && protectedRe.test(f)))] : []
   const why = !audit ? 'the audit agent died'
     : audit.error ? `the chain could not be read back: ${audit.error}`
-    : audit.from !== X || audit.to !== adoptHead ? `the audit read ${audit.from}..${audit.to}, not ${X}..${adoptHead}`
+    : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead
+      ? `the audit read ${audit.from}..${audit.to} published at ${audit.published}, not ${X}..${adoptHead} published at ${prHead}`
     : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
     : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}`
@@ -2380,6 +2399,8 @@ if (adoptHead !== null) {
   }
   adoption = { from: X, to: adoptHead, commits: shas, paths: [...new Set(paths.map(canon))], published: prHead === adoptHead }
 }
+const rebased = rebasedHead !== null ? { from: restored.expectedHead, to: rebasedHead } : null
+if (rebased) log(`preflight: re-pinned ${rebased.from.slice(0, 7)} -> ${rebased.to.slice(0, 7)}, the PR history the caller rewrote, unaudited; cycles, answers, decisions, holds and deferrals kept`)
 expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
@@ -2413,7 +2434,7 @@ const firstCycle = cyclesUsed + 1
 const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
 for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
-  const entry = { cycle, head: expectedHead }
+  const entry = { cycle, head: expectedHead, ...(rebased && cycle === firstCycle ? { rebased } : {}) }
   retired.clear()
   history.push(entry)
   // A failure verdict keeps history; a rethrow would drop it.

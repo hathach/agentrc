@@ -3,7 +3,7 @@
 
   commits.py commit PATH...  commit exactly PATH, with the message on stdin
   commits.py head --parent P PATH...  audit the commit at HEAD, made on P from PATH
-  commits.py chain FROM TO   audit FROM..TO for adoption (full SHAs)
+  commits.py chain FROM TO --published P  audit FROM..TO for adoption (full SHAs), P the PR's head
 
 `commit` stages PATH and runs `git commit --only`, so nothing staged beside
 it is taken; it prints {committed, detail}: committed false, with git's last
@@ -15,9 +15,10 @@ Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
 A link of a chain, or the head commit, is refused when it is a merge or a root,
 does not sit on the commit before it, touches no path, or has a message line
 crediting an agent, model, tool or session or linking a session (facts.attribution_in).
-`chain` reports from and to as given, commits (the SHAs of FROM..TO, oldest
-first), paths (each path any of them touches, once) and refusal, "" or why
-the chain cannot be adopted: empty, not ending at TO, or a link refused.
+`chain` reports from, to and published as given, commits (the SHAs of FROM..TO, oldest
+first), paths (each path any of them touches, once), unpublished (each path
+the commits after P touch, once; all of them when P is not a chain commit) and refusal, "" or why the chain cannot be adopted: empty, not ending
+at TO, or a link refused.
 `head` resolves HEAD once and reads everything from that SHA; HEAD moving while
 it reads is an error. It reports parent and scope (PATH) as given, sha, entries
 (`git ls-tree -z <sha> -- PATH` lines) and refusal, "" or why the commit cannot
@@ -26,7 +27,7 @@ to PATH left uncommitted (`git status --porcelain -z -- PATH`), or a blank
 message. PATH is never read as an option or as pathspec magic.
 
 stdout ends with one JSON line: `head` prints {parent, scope, sha, entries,
-refusal}, `chain` {from, to, commits, paths, refusal}, each line but an error one
+refusal}, `chain` {from, to, published, commits, paths, unpublished, refusal}, each line but an error one
 with its `seal` (facts.sealed). Exit 0 with that line; exit 2
 with {"error": ...} when git cannot answer or the arguments are wrong.
 """
@@ -85,10 +86,15 @@ def head(parent, paths):
     return {'parent': parent, 'scope': paths, 'sha': sha, 'entries': entries, 'refusal': refusal}
 
 
-def chain(start, end):
+def touched(found):
+    return list(dict.fromkeys(p for c in found for p in c['paths']))
+
+
+def chain(start, end, published):
     found = [commit(sha) for sha in git('rev-list', '--reverse', f'{full(start)}..{full(end)}').split()]
-    return {'from': start, 'to': end, 'commits': [c['sha'] for c in found],
-            'paths': list(dict.fromkeys(p for c in found for p in c['paths'])),
+    shas = [c['sha'] for c in found]
+    after = shas.index(published) + 1 if full(published) in shas else 0
+    return {'from': start, 'to': end, 'published': published, 'commits': shas, 'paths': touched(found), 'unpublished': touched(found[after:]),
             'refusal': chain_refusal(start, end, found)}
 
 
@@ -132,9 +138,9 @@ def collect(argv):
         return make(argv[1:])
     if len(argv) > 3 and argv[:2] == ['head', '--parent']:
         return head(argv[2], argv[3:])
-    if len(argv) == 3 and argv[0] == 'chain':
-        return chain(argv[1], argv[2])
-    raise Unusable('usage: commits.py commit PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO')
+    if len(argv) == 5 and argv[0] == 'chain' and argv[3] == '--published':
+        return chain(argv[1], argv[2], argv[4])
+    raise Unusable('usage: commits.py commit PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO --published P')
 
 
 if __name__ == '__main__':
