@@ -1588,6 +1588,18 @@ test('a refused review push still supersedes the judge, and says so', async () =
   assert.ok(logs.some(l => /1 failing CI check\(s\) left unjudged — the review lane attempted to publish/.test(l)), logs.join('\n'))
 })
 
+test('a review publish refused before any push leaves the concluded CI failures judged', async () => {
+  for (const [name, over, waitFor] of [['before the commit', { recheck: { branch: 'main' } }, 'recheck#'], ['after the commit, by its audit', { audit: { refusal: 'commit sits on c0ffee1, not 0f1e2d3' } }, 'audit#']]) {
+    const { labels, result } = await run({
+      reviews: oneValid, args: { autoPush: true, maxCycles: 1 }, ...over,
+      ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane(waitFor),
+    })
+    assert.equal(result.reason, 'push-failed', name)
+    assert.equal(labels.some(l => l.startsWith('push#')), false, name)
+    assert.ok(labels.includes('ci:judge#1'), `${name}: nothing reached the remote, so CI still stands`)
+  }
+})
+
 // CI verdicts: digests carried in the state, verdicts in collect.py's store
 
 const RIG = { check: 'hil / pico', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }

@@ -1195,7 +1195,8 @@ const cycleSummary = (entry) => {
     : `${head}\n${mdTable(['Bot', 'Finding', 'Verdict', 'Outcome', 'Commit'], rows)}`
 }
 
-const commitAndPush = async (cycle, what, owned = [], brief) => {
+// beforePush runs at once before the push, the first step that can restart CI.
+const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => {}) => {
   // Commit by explicit path: a stray edit on an unowned path must not ride along (one on an owned path is indistinguishable from ours). A protected path here means the scope filter broke.
   const sneaked = protectedRe ? owned.filter(f => protectedRe.test(f)) : []
   if (sneaked.length) {
@@ -1337,6 +1338,7 @@ const commitAndPush = async (cycle, what, owned = [], brief) => {
     return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
 
+  beforePush()
   const push = await pushExact(sha, `push#${cycle}-${what}`)
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha, published: 'unknown' }
   if (push.pass) {
@@ -2123,9 +2125,8 @@ const runCycle = async (cycle, entry) => {
         return unverifiedStop(cycle, unverifiable)
       }
       if (owned.length > 0) {
-        // Any attempt may have restarted CI, a refused or unknown one included.
-        lanes.reviewPublishing = true
-        const push = await commitAndPush(cycle, 'review', owned, brief)
+        // Any push attempt may have restarted CI, a refused or unknown one included.
+        const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true })
         if (!push.pass) {
           entry.reviewPushFailed = push
           log(`cycle ${cycle}: review-lane push failed (${push.detail}) — stopping`)
