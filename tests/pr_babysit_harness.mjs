@@ -1133,7 +1133,7 @@ test('a finding its writer rejects is held, judged again next cycle, and refuted
   assert.match(calls.find(c => c.label.startsWith('check:')).prompt, /make no change at all: the writer rejected every issue/)
   assert.equal(labels.some(l => /^(build[:#]|compat#|push#|resolve#)/.test(l)), false, 'nothing to build, check or publish')
   assert.ok(logs.some(l => /1#1 held — its fix writer rejected it with evidence; judged again next cycle/.test(l)), logs.join('\n'))
-  assert.match(calls.filter(c => c.label.startsWith('reviews#'))[1].prompt, /"rejection":\{"digest":"d1","sha":"[0-9a-f]{40}","evidence":"make test passes on HEAD for 1#1"\}/)
+  assert.match(calls.filter(c => c.label.startsWith('reviews#'))[1].prompt, /"rejection":\{"sha":"[0-9a-f]{40}","evidence":"make test passes on HEAD for 1#1"\}/)
   assert.ok(labels.includes('challenge#2') && labels.includes('replies#2'), 'the reversal is challenged, then the refutation posts')
 })
 
@@ -1165,6 +1165,15 @@ test('a second rejection of the same finding, across a resumed launch, stops for
   assert.equal(dry.result.dryRun, true)
   const afterDry = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: dry.result.state } })
   assert.equal(afterDry.result.reason, 'fix-verification-failed', 'a dry run keeps the rejection it verified')
+  // An answered comment owes no debt: only the hold keeps a twice-rejected finding outstanding (#44).
+  const answered = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true } })
+  const at = { head: answered.result.state.expectedHead, prHead: answered.result.state.expectedHead }
+  const once = await run({ reviews: oneValid, fix: rejecting('1#1'), preflight: at, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: answered.result.state } })
+  const twice = await run({ reviews: oneValid, fix: rejecting('1#1'), preflight: at, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: once.result.state } })
+  assert.equal(twice.result.reason, 'fix-verification-failed')
+  assert.deepEqual(twice.result.state.holds.map(([id, h]) => [id, h.reason]), [['1#1', 'its fix writer rejected it again; the caller decides']])
+  const omitted = await run({ reviews: { findings: [], replies: [], bots: 'reviewed' }, preflight: at, args: { autoPush: true, maxCycles: 6, yieldAfterCycle: true, state: twice.result.state } })
+  assert.notEqual(omitted.result.pass, true, 'a harvest that drops the finding settles nothing')
 })
 
 test('a rejection of an issue the writer was not given, or in the CI lane, is an unverified fix', async () => {

@@ -15,10 +15,11 @@ Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
 A link of a chain, or the head commit, is refused when it is a merge or a root,
 does not sit on the commit before it, touches no path, or has a message line
 crediting an agent, model, tool or session or linking a session (facts.attribution_in).
-`chain` reports from, to and published as given, commits (the SHAs of FROM..TO, oldest
-first), paths (each path any of them touches, once), unpublished (each path
-the commits after P touch, once; all of them when P is not a chain commit) and refusal, "" or why the chain cannot be adopted: empty, not ending
-at TO, or a link refused.
+`chain` reports from, to and published as given, commits (the SHAs of
+FROM..TO, oldest first), paths (each path any of them touches, once),
+unpublished (each path the commits after P touch, once; all of them when P is
+not a chain commit) and refusal, "" or why the chain cannot be adopted: empty,
+not ending at TO, or a link refused.
 `head` resolves HEAD once and reads everything from that SHA; HEAD moving while
 it reads is an error. It reports parent and scope (PATH) as given, sha, entries
 (`git ls-tree -z <sha> -- PATH` lines) and refusal, "" or why the commit cannot
@@ -27,9 +28,10 @@ to PATH left uncommitted (`git status --porcelain -z -- PATH`), or a blank
 message. PATH is never read as an option or as pathspec magic.
 
 stdout ends with one JSON line: `head` prints {parent, scope, sha, entries,
-refusal}, `chain` {from, to, published, commits, paths, unpublished, refusal}, each line but an error one
-with its `seal` (facts.sealed). Exit 0 with that line; exit 2
-with {"error": ...} when git cannot answer or the arguments are wrong.
+refusal}, `chain` {from, to, published, commits, paths, unpublished,
+refusal}, each line but an error one with its `seal` (facts.sealed). Exit 0
+with that line; exit 2 with {"error": ...} when git cannot answer or the
+arguments are wrong.
 """
 
 import sys
@@ -91,9 +93,10 @@ def touched(found):
 
 
 def chain(start, end, published):
+    published = full(published)
     found = [commit(sha) for sha in git('rev-list', '--reverse', f'{full(start)}..{full(end)}').split()]
     shas = [c['sha'] for c in found]
-    after = shas.index(published) + 1 if full(published) in shas else 0
+    after = shas.index(published) + 1 if published in shas else 0
     return {'from': start, 'to': end, 'published': published, 'commits': shas, 'paths': touched(found), 'unpublished': touched(found[after:]),
             'refusal': chain_refusal(start, end, found)}
 

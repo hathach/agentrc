@@ -41,7 +41,8 @@ REFUSED = {
     'state-mismatch': "the PR or its remote differs from the state's pin (compare the result's pin with expected): report it; "
                       "starting over is the user's decision, never a reset or a fresh launch",
     'adopt-head-mismatch': ADOPTION_REFUSED, 'adopt-pending': ADOPTION_REFUSED, 'adopt-audit-failed': ADOPTION_REFUSED,
-    'rebase-refused': ADOPTION_REFUSED,
+    'rebase-refused': 'the re-pin was refused: check out the rebasedHead or resolve the pending candidate, else report it; '
+                      'never reset the state',
     'stale-head': "HEAD moved off the state's head since the last launch: commits on top of it rejoin by adoptHead; "
                   'a rewritten history (rebase, force-push) rejoins by rebasedHead naming the PR head, only on the user\'s word; '
                   'report anything else, never reset the state',
