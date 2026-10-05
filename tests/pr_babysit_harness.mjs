@@ -318,7 +318,7 @@ async function run(opts = {}) {
       if (over && over.buildOk === false) brokenWriter = true
       return {
         item: label.slice(4), diffstat: `stat:${label.slice(4)}`,
-        buildOk: true, board: '', notes: '', ...over,
+        buildOk: true, board: '', notes: '', rejected: [], ...over,
       }
     }
     if (label.startsWith('replies#') || label.startsWith('resolve#') || label.startsWith('defer#')) {
@@ -1117,6 +1117,66 @@ test('every live writer is verified, and one dead group blocks the batch before 
   assert.match(outcomes(logs)[0], /withheld/)
 })
 
+// A writer's evidenced rejection (#44): judged again next cycle, never dismissed by the writer's word.
+const rejecting = (...ids) => () => ({ rejected: ids.map(id => ({ id, evidence: `make test passes on HEAD for ${id}` })) })
+
+test('a finding its writer rejects is held, judged again next cycle, and refuted once the challenger agrees', async () => {
+  let cycle = 0
+  const { calls, labels, logs } = await run({
+    reviewsPerCycle: () => ++cycle === 1 ? oneValid
+      : { findings: [invalidFinding({ changeReason: 'the writer could not reproduce it' })], replies: [{ commentId: 1, body: 'not reproducible' }], bots: 'reviewed' },
+    fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 2 },
+  })
+  assert.match(calls.find(c => c.label.startsWith('fix:')).prompt, /\n- \[1#1\] src\/a\.c:1 /)
+  assert.match(calls.find(c => c.label.startsWith('check:')).prompt, /make no change at all: the writer rejected every issue/)
+  assert.equal(labels.some(l => /^(build[:#]|compat#|push#|resolve#)/.test(l)), false, 'nothing to build, check or publish')
+  assert.ok(logs.some(l => /1#1 held — its fix writer rejected it with evidence; judged again next cycle/.test(l)), logs.join('\n'))
+  assert.match(calls.filter(c => c.label.startsWith('reviews#'))[1].prompt, /"rejection":\{"digest":"d1","sha":"[0-9a-f]{40}","evidence":"make test passes on HEAD for 1#1"\}/)
+  assert.ok(labels.includes('challenge#2') && labels.includes('replies#2'), 'the reversal is challenged, then the refutation posts')
+})
+
+test('a rejected point holds its whole comment: the fixed sibling is pushed, but no fix note resolves the thread', async () => {
+  const { result, calls, labels, logs } = await run({
+    reviews: { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' },
+    fix: rejecting('1#2'), args: { autoPush: true, maxCycles: 1 },
+  })
+  assert.match(calls.find(c => c.label.startsWith('check:')).prompt, /address these issues:\n- \[1#1\] .*The writer left these unfixed, rejected:\n- \[1#2\] .*every issue to address is addressed and no change serves only a rejected issue/s)
+  assert.ok(labels.some(l => l.startsWith('push#')))
+  assert.equal(labels.some(l => l.startsWith('resolve#')), false)
+  assert.notEqual(result.pass, true)
+  const rows = rowsOf(summaries(logs)[0])
+  assert.match(rows.find(r => r[1].includes('src/a.c:1'))[3], /^fixed \+ pushed/)
+  assert.match(rows.find(r => r[1].includes('src/a.c:2'))[3], /^rejected by its writer, judged again next cycle/)
+  assert.deepEqual([result.rollup.findings.fixed, result.rollup.findings.open], [1, 1], 'the rejected point is not counted fixed')
+})
+
+test('a second rejection of the same finding, across a resumed launch, stops for the caller', async () => {
+  const first = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true } })
+  assert.equal(first.result.reason, 'yielded')
+  const again = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
+  assert.equal(again.result.reason, 'fix-verification-failed')
+  assert.match(again.result.detail, /^1#1: rejected again by its writer — make test passes on HEAD for 1#1/)
+  const rewrittenEnd = { ...oneValid, findings: [finding({ commentDigest: 'd1new', commentAliases: ['d1'] })] }
+  const aliased = await run({ reviews: rewrittenEnd, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
+  assert.equal(aliased.result.reason, 'fix-verification-failed', 'a digest CodeRabbit only rewrote the end of is the same body')
+  const dry = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: false, maxCycles: 3, yieldAfterCycle: true } })
+  assert.equal(dry.result.dryRun, true)
+  const afterDry = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: dry.result.state } })
+  assert.equal(afterDry.result.reason, 'fix-verification-failed', 'a dry run keeps the rejection it verified')
+})
+
+test('a rejection of an issue the writer was not given, or in the CI lane, is an unverified fix', async () => {
+  const stray = await run({ reviews: oneValid, fix: rejecting('9#9') })
+  assert.equal(stray.result.reason, 'fix-verification-failed')
+  assert.match(outcomes(stray.logs)[0], /unverified: the writer rejected an issue it was not given/)
+  const ci = await run({
+    reviews: { findings: [], replies: [], bots: 'reviewed' }, fix: rejecting('ci:0:build / arm'),
+    ci: { status: 'red', infraRerun: [], realFailures: [{ check: 'build / arm', firstError: 'boom', files: ['src/a.c'], verdict: 'real' }] },
+  })
+  assert.equal(ci.result.reason, 'fix-verification-failed')
+  assert.equal(ci.labels.some(l => l.startsWith('push#')), false)
+})
+
 test('a batch that breaks, or may break, code relying on it is not published', async () => {
   for (const [compat, why] of [
     [{ compatible: false, evidence: 'test/hil/mtp_raw.py expects 0x2001' }, /unverified: breaks code that relies on it: test\/hil/],
@@ -1262,8 +1322,8 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
   // Read the expected keys from code-writer's own output contract. A list
   // hardcoded here pins whatever the schema happens to say, which is how `board`
   // came to be rejected: the role always returns it, and this schema forbade it.
-  const roleKeys = [...readFileSync(new URL('../agents/code-writer.md', import.meta.url), 'utf8')
-    .match(/^\{"item".*\}$/m)[0].matchAll(/"(\w+)":/g)].map(m => m[1]).sort()
+  const roleKeys = Object.keys(JSON.parse(readFileSync(new URL('../agents/code-writer.md', import.meta.url), 'utf8')
+    .match(/^\{"item".*\}$/m)[0])).sort()
   assert.deepEqual(fix.schema.required.slice().sort(), roleKeys)
   const built = await run({ reviews: oneValid, args: { build: '  make check  ' } })
   const fix2 = built.calls.find(c => c.label.startsWith('fix:'))

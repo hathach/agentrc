@@ -56,10 +56,12 @@ const TRIAGE = {
 // code-writer's own output contract; it is returned unchanged.
 const DEV = {
   type: 'object', additionalProperties: false,
-  required: ['item', 'diffstat', 'buildOk', 'board', 'notes'],
+  required: ['item', 'diffstat', 'buildOk', 'board', 'notes', 'rejected'],
   properties: {
     item: { type: 'string' }, diffstat: { type: 'string' }, buildOk: { type: 'boolean' },
     board: { type: 'string' }, notes: { type: 'string' },
+    // code-writer's contract; this workflow hands it no finding ids, so it stays [].
+    rejected: { type: 'array', items: { type: 'object' } },
   },
 }
 const VERIFY = {

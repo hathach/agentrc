@@ -401,10 +401,14 @@ const REVIEWS = {
 // code-writer's output contract verbatim: a schema missing a key the role returns rejects a conformant reply.
 const DEV = {
   type: 'object', additionalProperties: false,
-  required: ['item', 'diffstat', 'buildOk', 'board', 'notes'],
+  required: ['item', 'diffstat', 'buildOk', 'board', 'notes', 'rejected'],
   properties: {
     item: { type: 'string' }, diffstat: { type: 'string' }, buildOk: { type: 'boolean' },
     board: { type: 'string' }, notes: { type: 'string' },
+    rejected: {
+      type: 'array',
+      items: { type: 'object', additionalProperties: false, required: ['id', 'evidence'], properties: { id: { type: 'string' }, evidence: { type: 'string' } } },
+    },
   },
 }
 const CHECK = {
@@ -719,7 +723,7 @@ const launchRollup = () => {
   for (const e of history.slice(launchFrom)) {
     for (const f of (e.reviews && e.reviews.findings) || []) {
       const state = findingState(f)
-      const now = state !== 'valid' ? state : fixedBy(e.reviewFixes, f.commentId, e.reviewPush) ? 'fixed' : 'open'
+      const now = state !== 'valid' ? state : fixedBy(e.reviewFixes, f.findingId, e.reviewPush) ? 'fixed' : 'open'
       if (!(now === 'stale' && findings.get(f.findingId) === 'fixed')) findings.set(f.findingId, now)
     }
     for (const rf of (e.ci && e.ci.realFailures) || []) {
@@ -952,10 +956,21 @@ const checkCompat = async (label, paths, brief) => {
 }
 
 // ok only if every group was scoped, fixed and verified.
-const fixAndVerify = async (workIn, tag) => {
-  const textOf = (w) => w.notes.map(n => n.text).join('\n- ')
+// rejectable: a writer may reject an issue with evidence instead of fixing it; the issue is then judged again, never dismissed here (#44).
+const fixAndVerify = async (workIn, tag, rejectable = false) => {
+  const listOf = (notes) => notes.map(n => rejectable ? `[${n.id}] ${n.text}` : n.text).join('\n- ')
+  const textOf = (w) => listOf(w.notes)
   const verdictOf = (fix, w, addresses, checkReason) =>
-    ({ ...fix, ids: w.notes.map(n => n.id), addresses, checkReason })
+    ({ ...fix, ids: w.notes.map(n => n.id).filter(id => !fix.rejected.some(x => x.id === id)), addresses, checkReason })
+  // A rejection names one of the group's issues, once, with evidence; anything else is no rejection.
+  const badRejection = (fix, w) => {
+    const ids = fix.rejected.map(x => x.id)
+    const foreign = ids.filter(id => !w.notes.some(n => n.id === id))
+    return fix.rejected.length && !rejectable ? 'the writer rejected an issue this lane cannot reject'
+      : foreign.length ? `the writer rejected an issue it was not given: ${foreign.join(', ')}`
+      : new Set(ids).size !== ids.length ? 'the writer rejected one issue twice'
+      : fix.rejected.some(x => !x.evidence.trim()) ? 'the writer rejected an issue without evidence' : null
+  }
   // A group naming no file (a CI log with no path) is scoped first; an unscoped one is withheld for the caller.
   const fileless = workIn.filter(w => w.files.size === 0)
   await parallel(fileless.map(w => () =>
@@ -1016,15 +1031,28 @@ const fixAndVerify = async (workIn, tag) => {
         ? `Verify with: ${buildCmd} (a \`<BUILD>\` placeholder becomes a fresh \`mktemp -d\`).\n`
         : "Verify with the repository's build contract, resolved for your scope; do not invent a command.\n") +
       STOPS + '\n' +
+      (rejectable
+        ? 'Each issue starts with its [id]. An issue your procedure rejects (it does not reproduce, or is no in-scope defect) goes in `rejected` as { id, evidence: the command and what you observed }, with no change of yours left for it; else `rejected` is [].\n'
+        : '`rejected` is [].\n') +
       'Code outside your scope that relies on behaviour you change (a test, a script, a documented value) keeps its expectation: never edit it or its assertion to fit; report the change it would need as out of scope.\n' +
       `Scope: ${scopeOf(w)}\nIssues:\n- ${textOf(w)}`,
       { label: `fix:${w.key}`, phase: 'Fix', agentType: 'code-writer', schema: DEV },
     ).catch(quiet(`fix:${w.key}`))
     if (!fix) { fixes.push(null); continue }
+    const bad = badRejection(fix, w)
+    if (bad) { fixes.push(verdictOf({ ...fix, rejected: [] }, w, false, bad)); continue }
+    const rejected = w.notes.filter(n => fix.rejected.some(x => x.id === n.id))
+    const kept = w.notes.filter(n => !rejected.includes(n))
+    // A rejected issue's experiment must not ride along with the fixes that are kept.
+    const ask = kept.length
+      ? `address these issues:\n- ${listOf(kept)}\n` +
+        'Judge whether the diff addresses each issue independently of its hint: following the hint is neither necessary nor sufficient. ' +
+        (rejected.length ? `The writer left these unfixed, rejected:\n- ${listOf(rejected)}\n` : '') +
+        `addresses=true only when every issue to address is addressed${rejected.length ? ' and no change serves only a rejected issue' : ''}. `
+      : `make no change at all: the writer rejected every issue it was given:\n- ${listOf(rejected)}\naddresses=true only when there is no change for those files. `
     const v = await agent(
-      `${IN_CHECKOUT}Verify the uncommitted changes for ${scopeOf(w)} (use git diff -- <the files above>, and read any newly created untracked files directly) address these issues:\n- ${textOf(w)}\n` +
-      'Judge whether the diff addresses each issue independently of its hint: following the hint is neither necessary nor sufficient. ' +
-      'addresses=true only when every listed issue is addressed. Return {"addresses": bool, "reason": string}.',
+      `${IN_CHECKOUT}Verify the uncommitted changes for ${scopeOf(w)} (use git diff -- <the files above>, and read any newly created untracked files directly) ${ask}` +
+      'Return {"addresses": bool, "reason": string}.',
       { label: `check:${w.key}`, phase: 'Fix', agentType: 'finding-verifier', schema: CHECK },
     ).catch(quiet(`check:${w.key}`))
     fixes.push(verdictOf(fix, w, !!(v && v.addresses), v ? v.reason : 'verifier died'))
@@ -1033,9 +1061,14 @@ const fixAndVerify = async (workIn, tag) => {
   if (alive.length < work.length) log(`${work.length - alive.length} fix group(s) lost to dead workers`)
   let unverified = alive.filter(f => f.addresses !== true)
   for (const f of unverified) log(`fix for ${f.item}: failed verification — ${f.checkReason}`)
+  // A rejection its group's verifier confirmed stands whatever the batch build says: nothing was changed for it.
+  const rejected = alive.filter(f => f.addresses === true).flatMap(f => f.rejected)
   const verified = unscoped.length === 0 && withheld.length === 0 && alive.length === work.length && unverified.length === 0
-  const owned = [...new Set(work.flatMap(w => [...w.files]))]
-  const brief = { issues: work.map(textOf), claims: work.flatMap(w => w.notes.map(n => n.claim)), notes: alive.map(f => f.notes).filter(Boolean) }
+  // Only what a writer fixed is built, checked and published; a group whose every issue was rejected changed nothing.
+  const fixedOf = (w) => { const f = fixes[work.indexOf(w)]; return w.notes.filter(n => !f || f.ids.includes(n.id)) }
+  const changing = work.filter(w => fixedOf(w).length > 0)
+  const owned = [...new Set(changing.flatMap(w => [...w.files]))]
+  const brief = { issues: changing.map(w => listOf(fixedOf(w))), claims: changing.flatMap(w => fixedOf(w).map(n => n.claim)), notes: alive.map(f => f.notes).filter(Boolean) }
   const fail = (why) => {
     for (const f of alive) Object.assign(f, { addresses: false, checkReason: why })
     unverified = alive
@@ -1043,15 +1076,15 @@ const fixAndVerify = async (workIn, tag) => {
   }
   // A build that did not run or count says nothing about the fix (#38): its stop names the tooling, not the fix.
   let unverifiable = null
-  if (verified) {
+  if (verified && owned.length) {
     const blocked = await buildCheck(tag, owned)
     if (blocked) fail(blocked)
     if (blocked && !blocked.startsWith(BUILD_FAILED)) unverifiable = blocked
-  }
-  // Only the whole batch shows what the change does to code relying on it.
-  if (verified && unverified.length === 0) {
-    const why = await checkCompat(`compat#${tag}`, owned, brief)
-    if (why) fail(why)
+    // Only the whole batch shows what the change does to code relying on it.
+    if (unverified.length === 0) {
+      const why = await checkCompat(`compat#${tag}`, owned, brief)
+      if (why) fail(why)
+    }
   }
   return {
     ok: verified && unverified.length === 0,
@@ -1059,6 +1092,7 @@ const fixAndVerify = async (workIn, tag) => {
     brief,
     owned,
     unverifiable,
+    rejected,
   }
 }
 
@@ -1080,9 +1114,11 @@ const shaOf = (push) => {
 }
 const fixCell = (fixes, id, push, pushFailed) => {
   if (!fixes) return 'no fix attempted this cycle'
-  const fix = fixes.find(x => x.ids.includes(id))
+  const fix = fixes.find(x => x.ids.includes(id) || x.rejected.some(r => r.id === id))
   if (!fix) return 'withheld (no fix dispatched)'
   if (fix.addresses !== true) return `unverified: ${fix.checkReason}`
+  const rejection = fix.rejected.find(x => x.id === id)
+  if (rejection) return `rejected by its writer, judged again next cycle: ${rejection.evidence}`
   const stat = fix.diffstat ? ` — ${fix.diffstat}` : ''
   // A rejected push leaves the fix committed; a failed commit leaves it only in the tree.
   if (pushFailed) {
@@ -1122,7 +1158,7 @@ const cycleSummary = (entry) => {
       state === 'held' ? cell(`held: ${f.hold}`, 60)
       : state === 'deferred' ? cell(`deferred, ${answerState(f.commentId)}: ${f.deferral.issueUrl || 'the PR owner\'s decision'}`, 120)
       : state === 'valid' ? cell((f.overturned ? 'refuted, then overturned, ' : '') +
-        fixCell(entry.reviewFixes, f.commentId, entry.reviewPush, entry.reviewPushFailed), 60)
+        fixCell(entry.reviewFixes, f.findingId, entry.reviewPush, entry.reviewPushFailed), 60)
         : cell(`${state === 'stale' ? 'already fixed' : 'refuted'}, ${
           answerState(f.commentId)}`, 60),
       state === 'valid' ? shaOf(entry.reviewPush) : '-',
@@ -1345,7 +1381,7 @@ const repin = (cycle, findings) => {
   for (const [id, a] of answeredWith) { fix(id, a); fix(id, a.sonarOf) }
   for (const [id, d] of debt) { fix(id, d); fix(id, d.attempt) }
   for (const [findingId, d] of deferrals) fix(commentOf(findingId), d)
-  for (const [, d] of decisions) fix(d.commentId, d)
+  for (const [, d] of decisions) { fix(d.commentId, d); fix(d.commentId, d.rejection) }
   for (const d of deferralsArg) if (d) fix(commentOf(d.findingId), d, 'commentDigest')
   for (const s of settlementsArg) fix(s.commentId, s, 'commentDigest')
   if (moved) log(`cycle ${cycle}: ${moved} digest(s) recorded before CodeRabbit rewrote its comment's end now name the current body`)
@@ -1919,9 +1955,12 @@ const runCycle = async (cycle, entry) => {
     for (const f of r.findings) {
       if (f.hold) { recordHold(f); continue }
       if (holds.delete(f.findingId)) log(`cycle ${cycle}: ${f.findingId} reconciled`)
+      // A writer's rejection stands while the comment does: a second one on the same body stops the run.
+      const { rejection } = decisions.get(f.findingId) || {}
       decisions.set(f.findingId, {
         commentId: f.commentId, digest: f.commentDigest, reviewedSha: r.headSha, file: f.file, line: f.line,
         claim: cut(f.claim), verdict: f.verdict, reason: cut(f.challengeReason || f.reason),
+        ...(rejection && rejection.digest === f.commentDigest ? { rejection } : {}),
       })
     }
 
@@ -2047,12 +2086,24 @@ const runCycle = async (cycle, entry) => {
     const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
-        id: f.commentId, scopeFile: f.file, files: [f.file],
+        id: f.findingId, scopeFile: f.file, files: [f.file],
         text: `${f.file}:${f.line} [${f.source}] ${f.claim} — hint: ${f.fixHint}`,
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
-      const { ok, fixes, owned, brief, unverifiable } = await fixAndVerify(work, `${cycle}-review`)
+      const { ok, fixes, owned, brief, unverifiable, rejected } = await fixAndVerify(work, `${cycle}-review`, true)
       entry.reviewFixes = fixes
+      // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
+      const again = rejected.filter(x => decisions.get(x.id).rejection)
+      if (again.length) {
+        const detail = again.map(x => `${x.id}: rejected again by its writer — ${x.evidence}`).join('; ')
+        log(`cycle ${cycle}: ${detail}`)
+        return stop(cycle, 'fix-verification-failed', { detail })
+      }
+      for (const x of rejected) {
+        const d = decisions.get(x.id)
+        d.rejection = { digest: d.digest, sha: expectedHead, evidence: cut(x.evidence) }
+        recordHold({ findingId: x.id, commentId: d.commentId, hold: 'its fix writer rejected it with evidence; judged again next cycle' })
+      }
       if (args.autoPush !== true) {
         log('autoPush not set: review-lane fixes left uncommitted (dry run)')
         return { pass: false, cycles: cycle, history, dryRun: true }
@@ -2061,27 +2112,29 @@ const runCycle = async (cycle, entry) => {
         log(`cycle ${cycle}: review-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
         return unverifiedStop(cycle, unverifiable)
       }
-      // Any attempt may have restarted CI, a refused or unknown one included.
-      lanes.reviewPublishing = true
-      const push = await commitAndPush(cycle, 'review', owned, brief)
-      if (!push.pass) {
-        entry.reviewPushFailed = push
-        log(`cycle ${cycle}: review-lane push failed (${push.detail}) — stopping`)
-        return stop(cycle, 'push-failed')
-      }
-      entry.reviewPush = push
-      // One fix note per comment, built here: the read-back proves only a text the workflow chose.
-      const answerable = new Map()
-      for (const f of validFindings) {
-        if (owed(f.commentId) !== 'fixNote' || handedOff(f.commentId) || !showsAll(f.commentId, false)) continue
-        const line = `- ${f.file}:${f.line}`
-        const prev = answerable.get(f.commentId)
-        if (prev) prev.body += `\n${line}`
-        else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId) })
-      }
-      for (const x of answerable.values()) x.body = withDeferred(x.commentId, x.body)
-      if (answerable.size > 0) {
-        entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
+      if (owned.length > 0) {
+        // Any attempt may have restarted CI, a refused or unknown one included.
+        lanes.reviewPublishing = true
+        const push = await commitAndPush(cycle, 'review', owned, brief)
+        if (!push.pass) {
+          entry.reviewPushFailed = push
+          log(`cycle ${cycle}: review-lane push failed (${push.detail}) — stopping`)
+          return stop(cycle, 'push-failed')
+        }
+        entry.reviewPush = push
+        // One fix note per comment, built here: the read-back proves only a text the workflow chose.
+        const answerable = new Map()
+        for (const f of validFindings) {
+          if (owed(f.commentId) !== 'fixNote' || heldComments().has(f.commentId) || handedOff(f.commentId) || !showsAll(f.commentId, false)) continue
+          const line = `- ${f.file}:${f.line}`
+          const prev = answerable.get(f.commentId)
+          if (prev) prev.body += `\n${line}`
+          else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId) })
+        }
+        for (const x of answerable.values()) x.body = withDeferred(x.commentId, x.body)
+        if (answerable.size > 0) {
+          entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
+        }
       }
     }
 
