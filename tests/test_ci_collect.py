@@ -83,6 +83,7 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(sorted(r), ['checks', 'head', 'pending', 'status'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
+        self.assertEqual([c['aliases'] for c in r['checks']], [[], [], []], 'printed empty, so a relay has nothing to add (#50)')
 
     def test_attempt_only_from_a_link_that_names_one_run(self):
         self.heads = [HEAD]
@@ -518,7 +519,7 @@ class FailuresTest(unittest.TestCase):
 
     def test_a_job_of_another_head_is_not_resolved(self):
         rc, r, c = self.listed_as(self.run_job(13, 3, self.T2, head_sha='f' * 40), {2: [self.run_job(12, 2, self.T2)], 1: []})
-        self.assertEqual((c['link'], 'aliases' in c), (JOB.format(13), False))
+        self.assertEqual((c['link'], c['aliases']), (JOB.format(13), []))
 
     def test_legs_a_truncated_name_shares_are_told_apart_by_their_execution(self):
         twin = self.run_job(14, 2, self.T1, runner_id=6)
@@ -527,7 +528,7 @@ class FailuresTest(unittest.TestCase):
 
     def test_a_job_a_rerun_executed_again_is_its_own(self):
         rc, r, c = self.listed_as(self.run_job(13, 3, self.T3), {2: [self.run_job(12, 2, self.T2)], 1: [self.run_job(11, 1, self.T1)]})
-        self.assertEqual((c['link'], 'aliases' in c), (JOB.format(13), False))
+        self.assertEqual((c['link'], c['aliases']), (JOB.format(13), []))
         self.assertIs(self.executed_before(JOB.format(13)), True)
 
     def test_an_execution_after_a_skipped_attempt_was_executed_before(self):
@@ -554,7 +555,7 @@ class FailuresTest(unittest.TestCase):
             ('an earlier one never started', self.run_job(13, 3, self.T3), {2: [self.run_job(12, 2, None)], 1: []}),
         ]:
             rc, r, c = self.listed_as(listed, earlier)
-            self.assertEqual((rc, c['link'], 'aliases' in c), (0, JOB.format(13), False), why)
+            self.assertEqual((rc, c['link'], c['aliases']), (0, JOB.format(13), []), why)
             self.assertIsNone(self.executed_before(JOB.format(13)), why)
         self.listed_as(self.run_job(13, 2, self.T2), {1: [self.run_job(12, 1, self.T2)]})
         self.jobs['13'] = {**self.jobs['13'], 'id': 12}

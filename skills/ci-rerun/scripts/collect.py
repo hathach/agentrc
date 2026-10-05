@@ -12,7 +12,7 @@ prints one JSON object {head, status, pending, checks}, plus `error` when set
 line but an error one also carries `seal`, pr-babysit's facts.py seal. `status` is
 green, red (a check failed or was cancelled) or running (still pending, or no
 checks registered yet); `pending` counts the pending checks. `checks` lists
-the failed and cancelled ones, each {name, workflow, bucket, link, attempt}:
+the failed and cancelled ones, each {name, workflow, bucket, link, attempt, aliases}:
 `attempt` is the per-run id in a link that has one (an Actions job, a Read the
 Docs build, a CircleCI job; each re-run mints a new one), and null for a link
 that stays the same across runs (a docs preview, a review bot's page, none),
@@ -20,7 +20,8 @@ so only a non-null attempt can tell one run from the next. A re-run of some
 jobs copies the run's other finished jobs into the new attempt under new ids,
 the same execution: a failing Actions job listed as such a copy is given as the
 job that executed it, its link and attempt, with `aliases`, the copies' links,
-when exactly one job of the earlier attempt is that execution. `repo` must own the
+when exactly one job of the earlier attempt is that execution; `aliases` is
+otherwise empty, never left out, so a relay has nothing to add. `repo` must own the
 PR number, which for a fork PR is not the head repository. Exit 0 with the
 object, 1 with `error` set (a gh failure, or the PR head is no longer --head),
 2 on a usage error.
@@ -297,7 +298,7 @@ INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for fa
 def printed(inv):
     """What the caller reads: the failing checks by name, the pending ones by count."""
     return {'head': inv['head'], 'status': inv['status'], 'pending': inv['counts'].get('pending', 0),
-            'checks': [{k: v for k, v in c.items() if k not in INTERNAL} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
+            'checks': [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
 
 
 def evidence_dir(repo, pr, head):

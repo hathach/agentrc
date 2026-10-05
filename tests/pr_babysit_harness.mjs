@@ -154,9 +154,9 @@ const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xfff
 // workflow is a SonarCloud-style check whose link names no run (its own `link`
 // when the fixture gives one); every other one is an Actions job.
 const failedChecks = (ci) => (ci.realFailures || []).map((rf, i) => {
-  if (rf.workflow === '') return { name: rf.check, workflow: '', bucket: ci.bucket ?? 'fail', link: rf.link ?? `https://sonarcloud.io/dashboard?id=o_r&pullRequest=${i + 1}`, attempt: null }
+  if (rf.workflow === '') return { name: rf.check, workflow: '', bucket: ci.bucket ?? 'fail', link: rf.link ?? `https://sonarcloud.io/dashboard?id=o_r&pullRequest=${i + 1}`, attempt: null, aliases: [] }
   const link = rf.link ?? `https://github.com/o/r/actions/runs/1/job/${i + 1}`
-  return { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link, attempt: `actions:${link.split('/').at(-1)}`, ...(rf.aliases ? { aliases: rf.aliases } : {}) }
+  return { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link, attempt: `actions:${link.split('/').at(-1)}`, aliases: rf.aliases ?? [] }
 })
 // push.py's receipt: what the pinned push URL holds after the push, and the PR
 // head when the workflow asked for it.
@@ -223,7 +223,7 @@ async function run(opts = {}) {
         : opts.adoptPush === undefined ? receiptOf(to, to, 'pushed adopted head') : opts.adoptPush
       if (answer instanceof Error) throw answer
       if (answer === null) return null
-      const push = conforms(options.schema, bare(structuredClone(answer)), label)
+      const push = conforms(options.schema, structuredClone(answer), label)
       if (push.pushed) prHead = to
       return push
     }
@@ -248,10 +248,10 @@ async function run(opts = {}) {
         const offset = text.match(/ --offset (\d+) /)?.[1]
         if (offset !== undefined) {
           const v = store.get(key(links[0])), o = Number(offset)
-          answer = { head, verdicts: [{ ...structuredClone(v), failures: v.failures.slice(o, opts.held.get(v.link).find(s => s > o)) }], left: [], error: null }
+          answer = { head, verdicts: [{ ...structuredClone(v), failures: v.failures.slice(o, opts.held.get(v.link).find(s => s > o)) }], left: [] }
         } else {
           const known = links.filter(l => store.has(key(l)))
-          answer = { head, verdicts: known.filter(l => !opts.held?.has(l)).map(l => structuredClone(store.get(key(l)))), left: known.filter(l => opts.held?.has(l)).map(link => ({ link, starts: opts.held.get(link) })), error: null }
+          answer = { head, verdicts: known.filter(l => !opts.held?.has(l)).map(l => structuredClone(store.get(key(l)))), left: known.filter(l => opts.held?.has(l)).map(link => ({ link, starts: opts.held.get(link) })) }
         }
         if (opts.recall) answer = opts.recall(answer, text)
       } else if (/ remember /.test(text)) {
@@ -260,12 +260,12 @@ async function run(opts = {}) {
           const old = store.get(key(v.link))
           store.set(key(v.link), v.patch ? { ...old, failures: old.failures.map(f => v.patch.find(p => failureKey(p) === failureKey(f)) ?? f) } : v)
         }
-        answer = { head, error: null }
+        answer = { head }
         if (opts.remember) answer = opts.remember(answer, store)
       } else if (/collect\.py bases /.test(text)) {
-        answer = { head, bases: links.map(link => ({ link, base: baseOf(link) })), error: null }
+        answer = { head, bases: links.map(link => ({ link, base: baseOf(link) })) }
       } else if (/ inventory /.test(text)) {
-        answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed, error: null }
+        answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed }
       } else {
         if (opts.evidence) await opts.evidence(calls)
         // A --gate's answer is its fixture's gate, by default one complete failure per fixture.
@@ -273,10 +273,11 @@ async function run(opts = {}) {
           const rf = ci.realFailures[failed.findIndex(c => c.link === m[1])]
           return { link: m[1], failures: [{ firstError: rf.firstError, signature: rf.firstError, complete: true }], ...rf.gate }
         })
-        answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', gates, bases: links.map(link => ({ link, base: baseOf(link) })), error: null }
+        answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', gates, bases: links.map(link => ({ link, base: baseOf(link) })) }
         if (opts.gates) answer = opts.gates(answer)
       }
-      return answer === null ? null : conforms(options.schema, bare(answer), label)
+      // collect.py prints every member, a null one too, but no null error.
+      return answer === null ? null : conforms(options.schema, answer, label)
     }
     if (label.startsWith('ci:judge#')) {
       // The rest of each failure is the plain case: one run, every failure of a job listed.
@@ -383,7 +384,7 @@ async function run(opts = {}) {
     if (label.startsWith('push#')) {
       // push.py's receipt; the workflow supplies committed and sha.
       if (opts.push === null) return receiptOf(head, undefined, 'push rejected', false)
-      const push = conforms(options.schema, bare({ ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }), label)
+      const push = conforms(options.schema, { ...receiptOf(made, undefined, 'pushed to claude/foo'), ...opts.push }, label)
       if (push.pushed) head = made // the pushed commit is where the checkout now sits
       return push
     }
@@ -791,10 +792,12 @@ test('a relayed copy that does not match its seal gets one fresh agent; a second
   assert.equal(plain.result.pass, true)
   assert.deepEqual(plain.labels.slice(0, 2), ['preflight', 'preflight.retry'])
   assert.deepEqual(plain.calls.slice(0, 2).map(c => c.model), ['haiku', 'sonnet'], 'the fresh agent copies on Sonnet')
+  assert.ok(plain.logs.includes('preflight: relay recovered on the Sonnet retry'), plain.logs.join('\n'))
 
   const twice = await run({ garble: (l, a) => l.startsWith('preflight') ? cut('head')(l, a) : a })
   assert.equal(twice.result.reason, 'preflight-died', 'a second bad copy is a dead relay')
   assert.deepEqual(twice.labels, ['preflight', 'preflight.retry'])
+  assert.equal(twice.logs.some(l => l.endsWith('relay recovered on the Sonnet retry')), false)
 
   // What the script itself printed is its answer, however odd: the seal matches it.
   const printed = await run({ preflight: { head: HEAD.slice(0, 35) } })
@@ -1682,6 +1685,7 @@ test('an unclassified failure is judged again only once ciNotes or its check\'s 
   assert.equal(first.result.state.ciCache.entries[0].placedWith, `${fnv1a('')}:b1`)
   const same = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(same.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.b'], 'its base job looked up, no evidence read, no judge')
+  assert.ok(same.calls.find(c => c.label === 'ci:collect#2.b').schema.properties.bases.items.required.includes('base'), 'a copy keeps a base collect.py printed (#50)')
   assert.ok(same.logs.some(l => /unclassified CI failures left as judged for hil \/ pico — ciNotes and base job unchanged/.test(l)))
   assert.deepEqual(same.result.history.at(-1).ci.realFailures.map(f => [f.cell, f.verdict]), MIXED.map(f => [f.cell, f.verdict]))
   assert.equal(same.result.reason, 'ci-red-unclassified')
@@ -1940,6 +1944,8 @@ test('a verdict too large for one line is recalled in pages that join into it, a
     const again = (recall) => run({ store, held, recall, judge: many, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci })
     const ok = await again()
     assert.deepEqual(ciLabels(ok.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.2.p1', 'ci:collect#2.r1.2.p2'])
+    const page = ok.calls.find(c => c.label === 'ci:collect#2.r1.2.p1').schema.properties.verdicts.items.properties.failures.items
+    assert.ok(['cell', 'runId'].every(k => page.required.includes(k)), 'a page keeps each failure\'s cell and runId (#50)')
     assert.match(ok.calls.find(c => c.label === 'ci:collect#2.r1.2.p2').prompt, new RegExp(` recall --check '${job(1)}' --offset 2 --repo `))
     assert.ok(ok.logs.some(l => new RegExp(`CI verdicts reused for ${ci.realFailures.length} check`).test(l)), ok.logs.join('\n'))
     assert.deepEqual(ok.result.history.at(-1).ci.realFailures.filter(f => f.check === 'hil / b0').map(f => f.firstError),
@@ -2375,6 +2381,7 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
   assert.ok(pushed.labels.includes('push#1-review.retry'))
   assert.equal(pushed.calls.find(c => c.label === 'push#1-review.retry').model, 'sonnet')
   assert.equal(pushed.result.history[0].reviewPushFailed, undefined)
+  assert.ok(pushed.logs.includes('push#1-review: relay recovered on the Sonnet retry'), pushed.logs.join('\n'))
   // A retry that finds the branch elsewhere cannot prove the lost first attempt missed.
   const rejected = ({ seal, ...a }) => sealLine({ ...a, pushed: false, detail: ' ! [rejected] non-fast-forward', heads: a.heads.map(h => ({ ...h, head: FOREIGN })) })
   const moved = await run({ reviews: oneValid, garble: (l, a) => l === 'push#1-review' ? null : l === 'push#1-review.retry' ? rejected(a) : a })
@@ -4132,8 +4139,9 @@ test('a reply relay must copy every member reply.py prints: a dropped one is ref
   assert.equal('nullsOmitted' in required, false, 'the runtime never sees the annotation')
   const invented = await run({ reviews, garble: (l, a) => first(l) ? { ...a, receipts: a.receipts.map(r => ({ ...r, resolved: !r.resolved })) } : a })
   assert.ok(invented.logs.includes('replies#1: the relayed copy does not match its seal'), invented.logs.join('\n'))
-  for (const { result, labels } of [dropped, invented]) {
+  for (const { result, labels, logs } of [dropped, invented]) {
     assert.deepEqual(labels.filter(l => l.startsWith('replies#')), ['replies#1', 'replies#1.retry'])
+    assert.ok(logs.includes('replies#1: relay recovered on the Sonnet retry'), logs.join('\n'))
     assert.equal(result.pass, true, result.reason)
   }
   // A receipt with no resolved or error, as reply.py prints a null one, still matches its seal.
@@ -5915,6 +5923,40 @@ test('markSonar marks the SonarCloud issue of a refuted code-scanning comment wi
   assert.deepEqual(result.history[0].sonar, [{ commentId: 3, issue: 'K3', outcome: 'marked', detail: 'false positive' }])
   assert.equal('sonarUnmarked' in result, false)
   assert.deepEqual(sonarOf(result.state), [])
+})
+
+test('a relay copies every member its script prints: a dropped one is refused, and a recovery on the retry is logged (#50)', async () => {
+  // tinyusb#4098: Haiku recall copies left out each failure's cell and runId; inventory copies added an empty aliases.
+  const placed = { ...RIG, cell: 'pico host/msc' }
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(placed).ci })
+  assert.equal(first.logs.some(l => l.endsWith('relay recovered on the Sonnet retry')), false, 'an exact copy needs no retry')
+  const sonar = await run({ reviews: scanRefuted, args: { autoPush: true, markSonar: true, maxCycles: 1 } })
+  const pushed = await run({ reviews: oneValid })
+  const rows = [
+    [first, 'ci:collect#1.1', (s) => s.properties.checks.items, ['attempt', 'aliases']],
+    [first, 'ci:collect#1.f', (s) => s.properties.bases.items, ['base']],
+    [sonar, 'sonar#1', (s) => s.properties.results.items, ['issue']],
+    [pushed, 'push#1-review', (s) => s.properties.heads.items, ['head']],
+  ]
+  for (const [{ calls }, label, rowOf, members] of rows) {
+    const row = rowOf(calls.find(c => c.label === label).schema)
+    for (const k of members) assert.ok(row.required.includes(k), `${label} requires ${k}`)
+  }
+
+  const dropped = (a) => ({ ...a, verdicts: a.verdicts.map(v => ({ ...v, failures: v.failures.map(({ cell, runId, ...f }) => f) })) })
+  const again = (garble) => run({ store, garble, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(placed).ci })
+  const recovered = await again((l, a) => l === 'ci:collect#2.r1' ? dropped(a) : a)
+  const failures = recovered.calls.find(c => c.label === 'ci:collect#2.r1').schema.properties.verdicts.items.properties.failures.items
+  assert.ok(['cell', 'runId'].every(k => failures.required.includes(k)))
+  assert.ok(recovered.logs.some(l => /^ci:collect#2\.r1 errored — .*missing cell/.test(l)), recovered.logs.join('\n'))
+  assert.deepEqual(ciLabels(recovered.labels), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.r1.retry'], 'no judge')
+  assert.ok(recovered.logs.includes('ci:collect#2.r1: relay recovered on the Sonnet retry'), recovered.logs.join('\n'))
+  assert.equal(recovered.result.history.at(-1).ci.realFailures[0].cell, 'pico host/msc')
+  // A retry that relays the script's error recovers nothing.
+  const erred = await again((l, a) => l === 'ci:collect#2.r1' ? dropped(a) : l === 'ci:collect#2.r1.retry' ? { ...a, error: 'gone' } : a)
+  assert.equal(erred.logs.some(l => l.endsWith('relay recovered on the Sonnet retry')), false, erred.logs.join('\n'))
+  assert.ok(erred.labels.includes('ci:judge#2'))
 })
 
 test('without markSonar nothing goes to SonarCloud and the issue stays owed in the state', async () => {

@@ -267,7 +267,7 @@ const CI_FAILURE = {
   },
 }
 const COLLECT_CHECK = {
-  type: 'object', required: ['name', 'workflow', 'bucket', 'link', 'attempt'],
+  type: 'object', required: ['name', 'workflow', 'bucket', 'link', 'attempt', 'aliases'],
   properties: {
     name: { type: 'string' }, workflow: { type: 'string' }, bucket: { type: 'string' },
     link: { type: 'string' }, attempt: { type: ['string', 'null'] },
@@ -553,16 +553,15 @@ const relayed = (schema) => {
   return 'and return the JSON object on its last stdout line unchanged; a line without error gets no error member. ' +
     `If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with ${empty.join(', ')}.`
 }
-// A model copying JSON drops a trailing null (#3968): relay schemas require no nullable field, and a missing one comes back null.
-// A schema naming `nullsOmitted` relaxes only those: its script prints every other member, and a copy that dropped one is no copy (#47).
+// A relay copy must hold every member its script prints, a null one too: an optional one lets a copy drop a real value (#47, #50).
+// Only what a schema names in `nullsOmitted`, members its script leaves out when null, may be missing; one that is comes back null.
 const nullable = (p) => !!p && Array.isArray(p.type) && p.type.includes('null')
 const lenient = (s) => {
   if (!s || typeof s !== 'object') return s
   const { nullsOmitted, ...out } = s
   if (s.properties) {
     out.properties = Object.fromEntries(Object.entries(s.properties).map(([k, p]) => [k, lenient(p)]))
-    const relaxed = nullsOmitted ? (k) => nullsOmitted.includes(k) : (k) => nullable(s.properties[k])
-    if (s.required) out.required = s.required.filter(k => !relaxed(k))
+    if (s.required && nullsOmitted) out.required = s.required.filter(k => !nullsOmitted.includes(k))
   }
   if (s.items) out.items = lenient(s.items)
   return out
@@ -589,8 +588,13 @@ const relayAgent = async (prompt, opts) => {
 // A dead or unsealed relay gets one fresh Sonnet agent (Haiku mis-copies a long line); only for a script safe to run twice.
 const quiet = (label) => (e) => { log(`${label} errored — ${e && e.message}`); return null }
 const relayRun = (prompt, opts) => relayAgent(prompt, opts).catch(quiet(opts.label))
-const retryOpts = (opts) => ({ ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
-const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRun(retryPrompt, retryOpts(opts))
+// A recovery is logged: a lone mismatch line reads as an open failure (#50).
+const relayRetry = async (prompt, opts) => {
+  const r = await relayRun(prompt, { ...opts, label: `${opts.label}.retry`, model: 'sonnet' })
+  if (r && !r.error) log(`${opts.label}: relay recovered on the Sonnet retry`)
+  return r
+}
+const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRetry(retryPrompt, opts)
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
 // A rerun is safe: reply.py reuses a reply of ours rather than post again.
@@ -1355,7 +1359,7 @@ const pushExact = async (sha, label, prToo = false) => {
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
   // A retry finds a push that landed; it cannot prove one did not.
   const first = await relayRun(prompt, opts)
-  const r = first ?? await relayRun(prompt, retryOpts(opts))
+  const r = first ?? await relayRetry(prompt, opts)
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
   if (r.error) return unknown(r.error)
@@ -1596,7 +1600,7 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
   const reruns = ciReruns.filter(r => r.head === inv.head)
-  const settling = failing.filter(c => reruns.some(r => r.sure && [c.link, ...(c.aliases || [])].includes(r.link)))
+  const settling = failing.filter(c => reruns.some(r => r.sure && [c.link, ...c.aliases].includes(r.link)))
   // A run's conclusion can change under the same link, so the bucket must match too.
   const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
