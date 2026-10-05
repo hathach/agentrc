@@ -39,6 +39,7 @@ def unsealed(text):
 class InventoryTest(unittest.TestCase):
     def setUp(self):
         self.heads = []      # headRefOid per `gh pr view`, last one repeats
+        self.mergeable = ['MERGEABLE']   # mergeable per `gh pr view`, last one repeats
         self.listings = []   # `gh pr checks` answers in order: a list of checks, or (rc, stderr)
         self.calls = []
         self.clock = [0]
@@ -47,8 +48,9 @@ class InventoryTest(unittest.TestCase):
             self.calls.append(argv[1:3])
             if argv[1:3] == ['pr', 'view']:
                 head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
+                mergeable = self.mergeable.pop(0) if len(self.mergeable) > 1 else self.mergeable[0]
                 return mock.Mock(returncode=0, stdout=json.dumps(
-                    {'headRefOid': head, 'baseRefName': 'master', 'baseRefOid': BASE}).encode())
+                    {'headRefOid': head, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': mergeable}).encode())
             if argv[1] == 'api':   # a failing Actions job's record: a first attempt, its own execution
                 job = int(argv[2].split('/jobs/')[1])
                 return mock.Mock(returncode=0, stdout=json.dumps({'id': job, 'run_id': 7, 'run_attempt': 1, 'head_sha': HEAD}).encode())
@@ -80,7 +82,7 @@ class InventoryTest(unittest.TestCase):
                           self.check('lint', 'cancel', 'https://example.com/x')]]
         rc, r = self.main()
         self.assertEqual((rc, r['status'], r['pending']), (0, 'red', 0))
-        self.assertEqual(sorted(r), ['checks', 'head', 'pending', 'status'], 'only what the workflow reads, and no null error')
+        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'status'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
         self.assertEqual([c['aliases'] for c in r['checks']], [[], [], []], 'printed empty, so a relay has nothing to add (#50)')
@@ -110,7 +112,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('hil', 'pending', JOB.format(3))]]
         rc, r = self.main('--wait-seconds', '70')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []), 'pending checks are counted, not listed')
-        self.assertEqual(self.calls.count(['pr', 'checks']), 3)
+        self.assertEqual((self.calls.count(['pr', 'checks']), self.calls.count(['pr', 'view'])), (3, 2), 'a settled mergeable is read before and after only')
 
     def test_no_wait_budget_reports_what_stands(self):
         self.heads = [HEAD]
@@ -123,6 +125,43 @@ class InventoryTest(unittest.TestCase):
         self.listings = [(1, "no checks reported on the 'x' branch")]
         rc, r = self.main()
         self.assertEqual((rc, r['status'], r['checks']), (0, 'running', []))
+
+    def test_a_conflicting_pr_is_never_green_and_waits_for_nothing(self):
+        self.heads = [HEAD]
+        self.mergeable = ['CONFLICTING']
+        for listing in ([self.check('pre-commit', 'pass', JOB.format(1))], [self.check('hil', 'pending', JOB.format(3))],
+                        [self.check('hil', 'fail', JOB.format(3))], (1, "no checks reported on the 'x' branch")):
+            self.listings, self.clock[0] = [listing], 0
+            rc, r = self.main('--wait-seconds', '600')
+            self.assertEqual((rc, r['status'], r['mergeable'], self.clock[0]), (0, 'conflicting', 'CONFLICTING', 0), listing)
+        self.assertEqual([c['name'] for c in r['checks']], [], 'no checks, none listed')
+        self.listings = [[self.check('hil', 'fail', JOB.format(3))]]
+        self.assertEqual([c['name'] for c in self.main()[1]['checks']], ['hil'], 'a failed check is still listed')
+
+    def test_unknown_mergeability_is_running_until_github_decides(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('hil', 'fail', JOB.format(3))]]
+        self.mergeable = ['UNKNOWN']
+        rc, r = self.main('--wait-seconds', '70')
+        self.assertEqual((r['status'], r['mergeable'], r['pending'], self.calls.count(['pr', 'checks'])), ('running', 'UNKNOWN', 0, 3),
+                         'never red, so no accepted failure can pass it; never green')
+        self.clock[0] = 0
+        self.calls.clear()
+        self.mergeable = ['UNKNOWN', 'MERGEABLE']
+        rc, r = self.main('--wait-seconds', '600')
+        self.assertEqual((r['status'], r['mergeable'], self.clock[0]), ('red', 'MERGEABLE', 30), 'read again on every poll')
+        self.mergeable = ['MERGEABLE', 'CONFLICTING']
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['mergeable']), ('conflicting', 'CONFLICTING'), 'the last read decides')
+
+    def test_an_unexpected_mergeable_is_an_error(self):
+        self.heads = [HEAD]
+        self.listings = [[]]
+        for value in (None, 'DIRTY'):
+            self.mergeable = [value]
+            rc, r = self.main()
+            self.assertEqual(rc, 1)
+            self.assertIn(f'mergeable is {value!r}', r['error'])
 
     def test_a_gh_failure_is_an_error_not_a_status(self):
         self.heads = [HEAD]
@@ -196,7 +235,7 @@ class FailuresTest(unittest.TestCase):
             self.calls.append(argv[1:])
             ok = lambda out: mock.Mock(returncode=0, stdout=out if isinstance(out, bytes) else (out if isinstance(out, str) else json.dumps(out)).encode(), stderr=b'')
             if argv[1:3] == ['pr', 'view']:
-                return ok({'headRefOid': HEAD, 'baseRefName': 'master', 'baseRefOid': BASE})
+                return ok({'headRefOid': HEAD, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': 'MERGEABLE'})
             if argv[1:3] == ['pr', 'checks']:
                 return ok(self.checks)
             if argv[1:3] == ['api', '--paginate'] and '/attempts/' in argv[4]:
@@ -347,7 +386,7 @@ class FailuresTest(unittest.TestCase):
         real = collect.subprocess.run
         def moving(argv, **kw):
             if argv[1:3] == ['pr', 'view']:
-                return mock.Mock(returncode=0, stdout=json.dumps({'headRefOid': next(views), 'baseRefName': 'master', 'baseRefOid': BASE}).encode(), stderr=b'')
+                return mock.Mock(returncode=0, stdout=json.dumps({'headRefOid': next(views), 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': 'MERGEABLE'}).encode(), stderr=b'')
             return real(argv, **kw)
         with mock.patch.object(collect.subprocess, 'run', moving), redirect_stdout(io.StringIO()) as out:
             rc = collect.main(['failures', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(3)])

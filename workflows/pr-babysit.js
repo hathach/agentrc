@@ -276,9 +276,9 @@ const COLLECT_CHECK = {
   },
 }
 const INVENTORY = withSeal({
-  type: 'object', required: ['head', 'status', 'pending', 'checks'],
+  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'checks'],
   properties: {
-    error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' },
+    error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
     pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
   },
 })
@@ -475,9 +475,9 @@ const SONAR = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['from', 'to', 'published', 'commits', 'paths', 'unpublished', 'refusal'],
+  required: ['from', 'to', 'published', 'base', 'commits', 'paths', 'unpublished', 'refusal'],
   properties: {
-    error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' },
+    error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' }, base: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
     unpublished: { type: 'array', items: { type: 'string' } },
     refusal: { type: 'string' },
@@ -1593,11 +1593,14 @@ const ciLaneRun = async (cycle, lanes) => {
     if (inv.status !== 'running' || left < 30 || lanes.reviewPublishing || lanes.ended) break
   }
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
-  const shown = inv.pending > 0 ? 'running' : failing.length ? 'red' : null
+  const shown = inv.mergeable === 'CONFLICTING' ? 'conflicting'
+    : inv.pending > 0 || inv.mergeable === 'UNKNOWN' ? 'running' : failing.length ? 'red' : null
   if (inv.head !== expectedHead || (shown ? inv.status !== shown : !['green', 'running'].includes(inv.status))) {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
     return null
   }
+  // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
+  if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
   const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
   const reruns = ciReruns.filter(r => r.head === inv.head)
   const settling = failing.filter(c => reruns.some(r => r.sure && [c.link, ...c.aliases].includes(r.link)))
@@ -2168,6 +2171,10 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: review-lane push superseded the CI run — re-arming`)
       return null
     }
+    if (c.status === 'conflicting') {
+      log(`cycle ${cycle}: PR #${args.pr} conflicts with its base — no check result stands for it`)
+      return stop(cycle, 'pr-conflicting', { outstanding: outstanding() })
+    }
     // A mark may clear the SonarCloud gate this run failed on: read CI again rather than fix it.
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
     if (marked > 0 && c.realFailures.some(sonarGate)) {
@@ -2289,11 +2296,11 @@ const runCycle = async (cycle, entry) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl'],
+  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl'],
   properties: {
     error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
-    prHead: { type: 'string' }, prRepo: { type: 'string' }, prUrl: { type: 'string' },
+    prHead: { type: 'string' }, prBase: { type: 'string' }, prRepo: { type: 'string' }, prUrl: { type: 'string' },
     remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
@@ -2362,6 +2369,7 @@ let adoption = null
 if (adoptHead !== null) {
   const X = restored.expectedHead
   const prHead = pinned.prHead.trim()
+  const base = pinned.prBase.trim()
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
     return finish(stop(cyclesUsed, 'adopt-head-mismatch', { head: pinned.head.trim(), expected: adoptHead }))
@@ -2375,7 +2383,7 @@ if (adoptHead !== null) {
   }
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   const audit = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base}\` ` +
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )
@@ -2386,8 +2394,8 @@ if (adoptHead !== null) {
   const guarded = protectedRe && audit ? [...new Set(audit.unpublished.map(canon).filter(f => f && protectedRe.test(f)))] : []
   const why = !audit ? 'the audit agent died'
     : audit.error ? `the chain could not be read back: ${audit.error}`
-    : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead
-      ? `the audit read ${audit.from}..${audit.to} published at ${audit.published}, not ${X}..${adoptHead} published at ${prHead}`
+    : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead || audit.base !== base
+      ? `the audit read ${audit.from}..${audit.to} published at ${audit.published} on base ${audit.base}, not ${X}..${adoptHead} published at ${prHead} on base ${base}`
     : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
     : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}`

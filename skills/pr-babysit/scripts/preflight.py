@@ -5,8 +5,8 @@
   preflight.py --recheck
 
 Reports what every later step must still be true of: branch (`git rev-parse
---abbrev-ref HEAD`), prBranch, prHead, prRepo (owner/name) and prUrl from one
-`gh pr view N`, verbatim even when they disagree with git; remote, the remote
+--abbrev-ref HEAD`), prBranch, prHead, prBase (the base branch's head), prRepo
+(owner/name) and prUrl from one `gh pr view N`, verbatim even when they disagree with git; remote, the remote
 the branch tracks, "" when it tracks none; upstreamBranch, the branch it
 tracks there, "" when none; pushUrls (`git remote get-url
 --push --all <remote>`, which a pushurl can point away from the fetch URL);
@@ -91,10 +91,10 @@ def recheck():
 
 def pin(pr):
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
-    fields = 'headRefName,headRefOid,headRepositoryOwner,headRepository,url'
+    fields = 'headRefName,headRefOid,baseRefOid,headRepositoryOwner,headRepository,url'
     try:
         view = json.loads(run('gh', 'pr', 'view', str(pr), '--json', fields)[1])
-        pr_facts = {'prBranch': view['headRefName'], 'prHead': view['headRefOid'],
+        pr_facts = {'prBranch': view['headRefName'], 'prHead': view['headRefOid'], 'prBase': view['baseRefOid'],
                     'prRepo': f"{view['headRepositoryOwner']['login']}/{view['headRepository']['name']}",
                     'prUrl': view['url']}
     except (ValueError, KeyError, TypeError) as e:

@@ -17,7 +17,7 @@ preflight = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(preflight)
 
 ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
-VIEW = {'headRefName': 'fix', 'headRefOid': 'f' * 40, 'headRepositoryOwner': {'id': 'x', 'login': 'someone'},
+VIEW = {'headRefName': 'fix', 'headRefOid': 'f' * 40, 'baseRefOid': 'b' * 40, 'headRepositoryOwner': {'id': 'x', 'login': 'someone'},
         'headRepository': {'id': 'y', 'name': 'tinyusb'}, 'url': 'https://github.com/hathach/tinyusb/pull/7'}
 
 
@@ -68,7 +68,7 @@ class PreflightTest(unittest.TestCase):
         code, out = self.pin()
         self.assertEqual(code, 0)
         self.assertEqual(out, {
-            'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prRepo': 'someone/tinyusb',
+            'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prRepo': 'someone/tinyusb',
             'prUrl': VIEW['url'], 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
             'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o'],
             'pr': 7, 'badPushUrl': ''})

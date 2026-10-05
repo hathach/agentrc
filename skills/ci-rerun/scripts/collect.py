@@ -6,12 +6,15 @@
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
-inventory: waits up to S seconds (default 0) while any check is pending, then
-prints one JSON object {head, status, pending, checks}, plus `error` when set
+inventory: waits up to S seconds (default 0) while the status is running, then
+prints one JSON object {head, status, mergeable, pending, checks}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error); every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. `status` is
-green, red (a check failed or was cancelled) or running (still pending, or no
-checks registered yet); `pending` counts the pending checks. `checks` lists
+conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
+may not have run, so no check result stands for the PR), else running (a check
+pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
+failed or was cancelled) or green; `mergeable` is GitHub's, read last;
+`pending` counts the pending checks. `checks` lists
 the failed and cancelled ones, each {name, workflow, bucket, link, attempt, aliases}:
 `attempt` is the per-run id in a link that has one (an Actions job, a Read the
 Docs build, a CircleCI job; each re-run mints a new one), and null for a link
@@ -153,7 +156,7 @@ def gh(*args, raw=False):
 
 
 def pull(repo, pr):
-    return gh('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid,baseRefName,baseRefOid')
+    return gh('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid,baseRefName,baseRefOid,mergeable')
 
 
 def listing(repo, pr):
@@ -235,36 +238,43 @@ def resolved(repo, head, check, cache):
     return {**out, 'aliases': [with_job(check['link'], c) for c in copies]} if copies else out
 
 
-def summary(checks):
+def summary(checks, mergeable):
+    if mergeable not in ('MERGEABLE', 'CONFLICTING', 'UNKNOWN'):
+        raise Failed(f'the PR\'s mergeable is {mergeable!r}')
     counts = {}
     for c in checks:
         counts[c['bucket']] = counts.get(c['bucket'], 0) + 1
-    if not checks or counts.get('pending'):
+    if mergeable == 'CONFLICTING':
+        return 'conflicting', counts
+    if not checks or counts.get('pending') or mergeable == 'UNKNOWN':
         return 'running', counts
     return ('red' if counts.get('fail') or counts.get('cancel') else 'green'), counts
 
 
 def inventory(repo, pr, head, wait):
-    before = pull(repo, pr)
+    view = before = pull(repo, pr)
     if before['headRefOid'] != head:
         raise Failed(f'PR #{pr} head is {before["headRefOid"]}, not {head}')
     start = time.monotonic()
     while True:
         checks = listing(repo, pr)
-        status, counts = summary(checks)
+        status, counts = summary(checks, view.get('mergeable'))
         waited = int(time.monotonic() - start)
         if status != 'running' or waited + POLL > wait:
             break
         time.sleep(POLL)
+        if view.get('mergeable') == 'UNKNOWN':
+            view = pull(repo, pr)
     listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
     cache = {}
     listed = [resolved(repo, head, c, cache) if c['bucket'] in ('fail', 'cancel') and (c['attempt'] or '').startswith('actions:') else c
               for c in listed]
     # The listing reads the PR's last commit: a push during it would describe another head.
-    after = pull(repo, pr)['headRefOid']
-    if after != head:
-        raise Failed(f'PR #{pr} head moved to {after} while collecting')
-    return {'head': head, 'baseRef': before['baseRefName'], 'status': status, 'counts': counts, 'checks': listed}
+    after = pull(repo, pr)
+    if after['headRefOid'] != head:
+        raise Failed(f'PR #{pr} head moved to {after["headRefOid"]} while collecting')
+    return {'head': head, 'baseRef': before['baseRefName'], 'status': summary(checks, after.get('mergeable'))[0],
+            'mergeable': after['mergeable'], 'counts': counts, 'checks': listed}
 
 
 def fnv1a(text):
@@ -297,7 +307,7 @@ INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for fa
 
 def printed(inv):
     """What the caller reads: the failing checks by name, the pending ones by count."""
-    return {'head': inv['head'], 'status': inv['status'], 'pending': inv['counts'].get('pending', 0),
+    return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
             'checks': [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
 
 

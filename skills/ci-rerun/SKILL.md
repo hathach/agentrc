@@ -43,7 +43,8 @@ the script exits 2.
 
 `scripts/collect.py` is `pr-babysit`'s CI lane without a model: `inventory`
 waits a bounded time and lists a head's failed and cancelled checks with a
-count of pending ones, and `failures` saves each failing check's log and
+count of pending ones, calling a PR that conflicts with its base
+`conflicting`, and `failures` saves each failing check's log and
 diagnostics, with the base branch's run of the same job, for the
 `pr-ci-watcher` judge; `remember` and `recall` keep the judge's verdicts beside
 that evidence, so a relaunch reuses them. Its docstring is the contract.

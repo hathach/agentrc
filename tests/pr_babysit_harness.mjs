@@ -70,10 +70,11 @@ const shaFor = (n) => (SHA.slice(0, 38) + String(n).padStart(2, '0')).toLowerCas
 const HEAD = '0f1e2d3c4b5a69788796a5b4c3d2e1f0deadbee5'
 // Somebody else's commit: a plausible HEAD that is not one this run made.
 const FOREIGN = 'c0ffee11223344556677889900aabbccddeeff01'
+const BASE = 'ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e'
 // What the preflight pins, and what the pre-publish recheck must still find.
 const PIN = {
   branch: 'claude/foo', prBranch: 'claude/foo',
-  prHead: HEAD, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
+  prHead: HEAD, prBase: BASE, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
   pr: 3888, badPushUrl: '',
@@ -212,9 +213,9 @@ async function run(opts = {}) {
       const answer = typeof opts.adoptAudit === 'function' ? await opts.adoptAudit(label)
         : opts.adoptAudit === undefined ? fallback : opts.adoptAudit
       if (answer instanceof Error) throw answer
-      // commits.py echoes the --published it was given, unless a case says otherwise.
-      const published = String(prompt).match(/ --published ([0-9a-f]{40})`/)[1]
-      return answer === null ? null : conforms(options.schema, { published, ...structuredClone(answer) }, label)
+      // commits.py echoes the --published and --base it was given, unless a case says otherwise.
+      const [, published, base] = String(prompt).match(/ --published ([0-9a-f]{40}) --base ([0-9a-f]{40})`/)
+      return answer === null ? null : conforms(options.schema, { published, base, ...structuredClone(answer) }, label)
     }
     if (label === 'adopt:push' || label === 'adopt:push.retry') {
       // push.py's receipt: by default the push landed on every pinned URL and the PR.
@@ -265,7 +266,10 @@ async function run(opts = {}) {
       } else if (/collect\.py bases /.test(text)) {
         answer = { head, bases: links.map(link => ({ link, base: baseOf(link) })) }
       } else if (/ inventory /.test(text)) {
-        answer = { head: ci.headSha ?? head, status: ci.status, pending: ci.status === 'running' ? 1 : 0, checks: failed }
+        answer = {
+          head: ci.headSha ?? head, status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
+          pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
+        }
       } else {
         if (opts.evidence) await opts.evidence(calls)
         // A --gate's answer is its fixture's gate, by default one complete failure per fixture.
@@ -670,7 +674,7 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -2024,6 +2028,39 @@ const redWith = (...failures) => ({ ci: { status: 'red', infraRerun: [], realFai
 const PVS_KEY = '1f1a4bfe929a72bb'
 assert.equal(keyOf(PVS), PVS_KEY)
 const byKey = (over = {}) => ({ key: PVS_KEY, reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
+
+test('a PR conflicting with its base stops, judging nothing, whatever its checks say (#51)', async () => {
+  for (const [name, over] of [
+    ['passing checks', {}],
+    ['only accepted failures', { realFailures: [PVS], args: { acceptedFailures: [byKey()] } }],
+    ['the CI lane alone', { args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } }],
+  ]) {
+    const { result, labels, logs } = await run({
+      ci: { status: 'conflicting', infraRerun: [], realFailures: over.realFailures ?? [] }, args: { maxCycles: 3, ...over.args },
+    })
+    assert.equal(result.pass, false, name)
+    assert.equal(result.reason, 'pr-conflicting', name)
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], `${name}: no evidence read, no judge`)
+    assert.ok(logs.some(l => /conflicts with its base — no check result stands for it/.test(l)), logs.join('\n'))
+  }
+  const { result, logs } = await run({
+    reviews: oneValid, args: { autoPush: true, maxCycles: 1 }, ci: { status: 'conflicting', infraRerun: [], realFailures: [] },
+  })
+  assert.notEqual(result.reason, 'pr-conflicting', 'the review push made a new head, whose CI is read next')
+  assert.ok(logs.some(l => /review-lane push superseded the CI run/.test(l)), logs.join('\n'))
+})
+
+test('unknown mergeability is never green, nor red that an acceptance could pass (#51)', async () => {
+  const { result, logs } = await run({
+    ci: { status: 'running', mergeable: 'UNKNOWN', pending: 0, infraRerun: [], realFailures: [PVS] },
+    args: { acceptedFailures: [byKey()], maxCycles: 1 },
+  })
+  assert.notEqual(result.pass, true)
+  assert.equal(logs.some(l => /CI inventory is inconsistent/.test(l)), false, 'running with no pending check is consistent while GitHub decides')
+  const contradicted = await run({ ci: { ...GREEN, mergeable: 'CONFLICTING' }, args: { maxCycles: 1 } })
+  assert.ok(contradicted.logs.some(l => /CI inventory is inconsistent/.test(l)), 'green on a conflicting PR is no inventory')
+  assert.notEqual(contradicted.result.pass, true)
+})
 
 test('an accepted failure is named by its key, and a wrong key accepts nothing', async () => {
   const { result, logs } = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()] } })
@@ -4769,8 +4806,8 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.equal(JSON.stringify(result.state).includes('adoptHead'), false, 'the launch argument is not persisted')
   const audit = calls.find(c => c.label === 'adopt:audit')
   assert.equal(audit.phase, 'Triage')
-  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'commits', 'paths', 'unpublished', 'refusal'])
-  assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD}\``), audit.prompt)
+  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'commits', 'paths', 'unpublished', 'refusal'])
+  assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
   assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --pr 3888\``), push.prompt)
@@ -4836,8 +4873,10 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
   for (const [audit, detail] of [
     [chainAudit([ADOPT], undefined, { refusal: 'commit message carries attribution: Generated by Codex' }),
       'commit message carries attribution: Generated by Codex'],
-    [chainAudit([ADOPT], undefined, { from: ADOPT_MID }), `the audit read ${ADOPT_MID}..${ADOPT} published at ${HEAD}, not ${HEAD}..${ADOPT} published at ${HEAD}`],
-    [chainAudit([ADOPT_MID]), `the audit read ${HEAD}..${ADOPT_MID} published at ${HEAD}, not ${HEAD}..${ADOPT} published at ${HEAD}`],
+    [chainAudit([ADOPT], undefined, { from: ADOPT_MID }), `the audit read ${ADOPT_MID}..${ADOPT} published at ${HEAD} on base ${BASE}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE}`],
+    [chainAudit([ADOPT_MID]), `the audit read ${HEAD}..${ADOPT_MID} published at ${HEAD} on base ${BASE}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE}`],
+    // A merge vouched for by another base than the PR's is no merge from its base.
+    [chainAudit([ADOPT], undefined, { base: FOREIGN }), `the audit read ${HEAD}..${ADOPT} published at ${HEAD} on base ${FOREIGN}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE}`],
   ]) {
     const state = adoptionState()
     const { result, labels } = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit })
@@ -4852,7 +4891,7 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
 test('a chain the audit script cannot read back is refused with its error', async () => {
   const { result, labels } = await run({
     args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
-    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', commits: [], paths: [], unpublished: [], refusal: '' },
+    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', commits: [], paths: [], unpublished: [], refusal: '' },
   })
   assert.equal(result.reason, 'adopt-audit-failed')
   assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
@@ -5028,7 +5067,7 @@ test('a protected path the PR already carries is adopted; one this run would pub
   })
   assert.notEqual(published.result.reason, 'adopt-audit-failed', published.result.detail)
   assert.equal(published.result.history[1].adoption.publication, 'already-published')
-  assert.ok(published.calls.find(c => c.label === 'adopt:audit').prompt.includes(`--published ${ADOPT}\``))
+  assert.ok(published.calls.find(c => c.label === 'adopt:audit').prompt.includes(`--published ${ADOPT} --base ${BASE}\``))
   const suffix = await run({
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: ADOPT_MID },
     adoptAudit: chainAudit([ADOPT_MID, ADOPT], roster, { unpublished: ['test/hil/tinyusb.json'] }),
@@ -5041,7 +5080,7 @@ test('a protected path the PR already carries is adopted; one this run would pub
     adoptAudit: chainAudit([ADOPT_MID, ADOPT], roster, { published: ADOPT, unpublished: [] }),
   })
   assert.equal(elsewhere.result.reason, 'adopt-audit-failed', 'a receipt drawn at another publication boundary is no audit')
-  assert.match(elsewhere.result.detail, /published at 1{40}, not .* published at 0f1e2d3c/)
+  assert.match(elsewhere.result.detail, /published at 1{40} on base .*, not .* published at 0f1e2d3c/)
   assert.equal(elsewhere.labels.includes('adopt:push'), false)
 })
 

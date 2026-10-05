@@ -115,10 +115,10 @@ class CommitsTest(unittest.TestCase):
         self.write('c\nd.c', 'c\n')
         self.write('b.c', 'bb\n')
         two = self.commit('two', 'c\nd.c', 'b.c')
-        code, out = self.run_script('chain', self.base, two, '--published', self.base)
+        code, out = self.run_script('chain', self.base, two, '--published', self.base, '--base', self.base)
         self.assertEqual(code, 0)
         self.assertEqual({k: v for k, v in out.items() if k != 'seal'}, {
-            'from': self.base, 'to': two, 'published': self.base, 'commits': [one, two], 'refusal': '',
+            'from': self.base, 'to': two, 'published': self.base, 'base': self.base, 'commits': [one, two], 'refusal': '',
             'paths': ['b.c', 'c\nd.c'], 'unpublished': ['b.c', 'c\nd.c']}, 'each path once, a name holding a newline whole')
 
     def test_unpublished_holds_only_what_the_commits_after_the_published_head_touch(self):
@@ -129,7 +129,7 @@ class CommitsTest(unittest.TestCase):
         self.write('b.c', 'bb\n')
         three = self.commit('three', 'b.c')
         for published, want in ((self.base, ['b.c', 'c.c']), (one, ['c.c', 'b.c']), (two, ['b.c']), (three, []), ('f' * 40, ['b.c', 'c.c'])):
-            code, out = self.run_script('chain', self.base, three, '--published', published)
+            code, out = self.run_script('chain', self.base, three, '--published', published, '--base', self.base)
             self.assertEqual(code, 0)
             self.assertEqual(out['unpublished'], want, f'{published[:7]}: a published path edited again later is unpublished again; a foreign head publishes nothing')
 
@@ -138,8 +138,8 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(code, 0)
         return out['refusal']
 
-    def chain_refusal(self, start, end):
-        return self.refusal('chain', start, end, '--published', start)
+    def chain_refusal(self, start, end, base=None):
+        return self.refusal('chain', start, end, '--published', start, '--base', base or self.base)
 
     def test_a_chain_that_cannot_be_adopted_is_refused(self):
         self.write('b.c', 'b\n')
@@ -153,11 +153,100 @@ class CommitsTest(unittest.TestCase):
         side = self.commit('side', 's.c')
         self.git('checkout', '-q', '--detach', one)
         self.git('merge', '-q', '--no-ff', '--no-edit', side)
-        self.assertIn('has 2 parents', self.chain_refusal(one, self.git('rev-parse', 'HEAD').strip()))
+        merge = self.git('rev-parse', 'HEAD').strip()
+        self.assertIn(f"{merge[:7]} merges {side[:7]}, which is not on the PR's base {self.base[:7]}", self.chain_refusal(one, merge))
         # From a commit beside the chain: its first commit does not sit on it.
         self.git('checkout', '-q', '--detach', one)
         self.write('t.c', 't\n')
         self.assertIn(f'sits on {one[:7]}, not {side[:7]}', self.chain_refusal(side, self.commit('two', 't.c')))
+
+    def base_merge(self, base_files=None, pr_files=None, resolve=None, message='Merge the base', start=None):
+        """A PR commit and base's own commit beside it on start, and the PR merging base, after resolve() edits the tree: (one, tip, merge)."""
+        self.git('checkout', '-q', '-b', 'main', start or self.base)
+        for path, text in (base_files or {'m.c': 'base\n'}).items():
+            self.write(path, text)
+        tip = self.commit('base moved')
+        self.git('checkout', '-q', '-b', 'pr', start or self.base)
+        for path, text in (pr_files or {'b.c': 'pr\n'}).items():
+            self.write(path, text)
+        one = self.commit('one')
+        subprocess.run(['git', 'merge', '-q', '--no-ff', '--no-commit', tip], cwd=self.repo, env=ENV, capture_output=True)
+        if resolve:
+            resolve()
+        return one, tip, self.commit(message)
+
+    def chain_of(self, end, published, base):
+        code, out = self.run_script('chain', self.base, end, '--published', published, '--base', base)
+        self.assertEqual(code, 0, out)
+        return out
+
+    def test_a_merge_from_the_base_is_one_link_owning_only_what_it_leaves_unlike_both_parents(self):
+        one, tip, merge = self.base_merge()
+        self.write('c.c', 'c\n')
+        two = self.commit('two', 'c.c')
+        out = self.chain_of(two, one, tip)
+        self.assertEqual((out['commits'], out['paths'], out['unpublished'], out['refusal']), ([one, merge, two], ['b.c', 'c.c'], ['c.c'], ''),
+                         "the base's own commit is no link, and what it alone changed is not the merge's")
+        self.git('checkout', '-q', 'main')
+        self.write('n.c', 'n\n')
+        later = self.commit('base moved on', 'n.c')
+        self.assertEqual(self.chain_of(two, one, later)['refusal'], '', 'a base that moved on still holds the merged commit')
+        self.assertEqual(self.chain_of(merge, tip, tip)['unpublished'], ['b.c'], 'a PR head on the merged side is no chain commit, so it publishes nothing')
+        self.assertEqual(self.refusal('chain', merge, two, '--published', merge, '--base', 'e' * 40), '', 'a chain without a merge never reads the base')
+
+    def test_a_merge_owns_each_path_whose_entry_differs_from_both_parents(self):
+        self.write('l.c', ''.join(f'{n}\n' for n in range(1, 8)))
+        lines = self.commit('lines', 'l.c')
+        conflict = {'base_files': {'a.c': 'base\n'}, 'pr_files': {'a.c': 'pr\n'}}
+        for name, case, owned in (
+                ('a novel resolution', {**conflict, 'resolve': lambda: self.write('a.c', 'resolved\n')}, ['a.c']),
+                ("the base's side of a conflict", {**conflict, 'resolve': lambda: self.write('a.c', 'base\n')}, []),
+                ("the PR's side of a conflict", {**conflict, 'resolve': lambda: self.write('a.c', 'pr\n')}, []),
+                ('a clean merge of both sides of one file',
+                 {'start': lines, 'base_files': {'l.c': '1b\n2\n3\n4\n5\n6\n7\n'}, 'pr_files': {'l.c': '1\n2\n3\n4\n5\n6\n7p\n'}}, ['l.c']),
+                ('a new mode', {'resolve': lambda: (self.repo / 'a.c').chmod(0o755)}, ['a.c']),
+                ('a deletion of a file both parents hold', {'resolve': lambda: self.git('rm', '-q', 'a.c')}, ['a.c'])):
+            with self.subTest(name):
+                self.git('checkout', '-q', '--detach', self.base)
+                for branch in ('main', 'pr'):
+                    subprocess.run(['git', 'branch', '-q', '-D', branch], cwd=self.repo, env=ENV, capture_output=True)
+                one, tip, merge = self.base_merge(**case)
+                self.assertEqual(self.chain_of(merge, one, tip)['unpublished'], owned)
+
+    def test_a_merge_that_changes_no_path_is_still_a_link(self):
+        self.git('checkout', '-q', '-b', 'main')
+        self.write('m.c', 'm\n')
+        tip = self.commit('base moved', 'm.c')
+        self.git('checkout', '-q', '-b', 'pr', self.base)
+        self.git('merge', '-q', '--no-ff', '-s', 'ours', '-m', 'Merge the base, keeping ours', tip)
+        merge = self.git('rev-parse', 'HEAD').strip()
+        out = self.chain_of(merge, self.base, tip)
+        self.assertEqual((out['commits'], out['paths'], out['refusal']), ([merge], [], ''))
+
+    def test_a_merge_the_base_cannot_vouch_for_is_refused(self):
+        one, tip, merge = self.base_merge(message='Merge the base\n\nClaude-Session: https://claude.ai/code/session_x')
+        self.assertIn('commit message carries attribution', self.chain_refusal(self.base, merge, tip))
+        self.git('checkout', '-q', '-b', 'other', self.base)
+        self.write('o.c', 'o\n')
+        other = self.commit('other', 'o.c')
+        self.git('checkout', '-q', '--detach', one)
+        self.git('merge', '-q', '--no-ff', '--no-edit', tip, other)
+        self.assertIn('has 3 parents', self.chain_refusal(self.base, self.git('rev-parse', 'HEAD').strip(), tip))
+        self.assertIn(f'not on the PR\'s base {self.base[:7]}', self.chain_refusal(self.base, merge, self.base),
+                      'the merged commit is newer than the base given')
+
+    def test_a_merge_link_needs_the_base_in_the_checkout_and_reports_git_failing(self):
+        one, tip, merge = self.base_merge()
+        code, out = self.run_script('chain', self.base, merge, '--published', one, '--base', 'e' * 40)
+        self.assertEqual(code, 2)
+        self.assertEqual(out['error'], f"the PR's base {'e' * 40} is not in the checkout: fetch it")
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        try:
+            with self.assertRaisesRegex(commits.Unusable, 'merge-base --is-ancestor 1{40} .*: fatal: Not a valid commit name 1{40}'):
+                commits.on_base('1' * 40, tip)
+        finally:
+            os.chdir(cwd)
 
     def test_a_message_crediting_an_agent_is_refused(self):
         for line, said in (
@@ -266,11 +355,13 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(self.git('status', '--porcelain'), ' M a.c\n', 'nothing was staged')
 
     def test_errors(self):
-        for argv, want in ((['chain', 'HEAD~1', 'HEAD', '--published', 'HEAD~1'], 'not a full SHA'),
-                           (['chain', self.base, self.base, '--published', 'not-a-sha'], 'not a full SHA'), (['chain', self.base], 'usage'), (['chain', self.base, self.base], 'usage'),
+        chain = ['chain', self.base, self.base, '--published', self.base]
+        for argv, want in ((['chain', 'HEAD~1', 'HEAD', '--published', 'HEAD~1', '--base', self.base], 'not a full SHA'),
+                           ([*chain[:4], 'not-a-sha', '--base', self.base], 'not a full SHA'), (['chain', self.base], 'usage'), (['chain', self.base, self.base], 'usage'),
+                           (chain, 'usage'), ([*chain, '--base', 'HEAD'], 'not a full SHA'),
                            (['head'], 'usage'), (['head', 'a.c'], 'usage'), (['head', '--parent', 'HEAD', 'a.c'], 'not a full SHA'),
                            (['frob'], 'usage'), (['commit'], 'usage'),
-                           (['chain', self.base, 'f' * 40, '--published', self.base], 'git rev-list')):
+                           (['chain', self.base, 'f' * 40, '--published', self.base, '--base', self.base], 'git rev-list')):
             code, out = self.run_script(*argv)
             self.assertEqual(code, 2, argv)
             self.assertIn(want, out['error'], argv)

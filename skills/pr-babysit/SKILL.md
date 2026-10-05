@@ -19,7 +19,7 @@ python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabb
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
 python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
-python3 $S/commits.py chain <from> <to> --published <pr-head>  # audit from..to for adoption, full SHAs
+python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head>  # audit from..to for adoption, full SHAs
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 python3 $S/sonar.py --pr N --head <sha> --manifest <file>  # mark answered code-scanning comments' SonarCloud issues false positive
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>'  # build the checkout as it stands
@@ -52,7 +52,8 @@ The workflow's own contract (`workflows/pr-babysit.js`).
   paths are ignored; any other pre-existing edit refuses the start.
 - `protected`: regex over repo-relative paths dropped from every fix scope and
   never committed or published; an adopted chain may carry one only in commits
-  the PR already has.
+  the PR already has, or in a merge from the base that takes either parent's
+  version of it.
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
@@ -92,7 +93,9 @@ The workflow's own contract (`workflows/pr-babysit.js`).
 - `adoptHead`: full SHA of audited commits on top of the state's
   `expectedHead` (a caller's repair, or a push made outside the workflow):
   the chain is audited, published under `autoPush`, and the run continues
-  from it; per launch.
+  from it; per launch. A merge from the PR's base branch is one link, its
+  paths those it leaves unlike both parents. A PR that conflicts with its base
+  stops `pr-conflicting`; the merge that resolves it rejoins by `adoptHead`.
 - `rebasedHead`: full SHA of the PR head after a history rewrite (rebase,
   force-push) the user authorized: with the checkout at it and no unpublished
   candidate, the state is re-pinned to it unaudited, keeping cycles used,

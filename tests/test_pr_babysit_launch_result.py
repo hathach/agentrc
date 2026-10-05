@@ -149,6 +149,7 @@ class LaunchResultTest(unittest.TestCase):
                              ('stale-head', "only on the user's word"),
                              ('wrong-head', 'check out the PR head'),
                              ('deferral-refused', 'it needs a new decision'),
+                             ('pr-conflicting', 'relaunch with adoptHead naming that merge'),
                              ('stale-workflow', 'relaunch from a fresh session')):
             with self.subTest(reason):
                 refused = {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],

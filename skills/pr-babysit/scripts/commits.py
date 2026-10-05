@@ -3,7 +3,7 @@
 
   commits.py commit PATH...  commit exactly PATH, with the message on stdin
   commits.py head --parent P PATH...  audit the commit at HEAD, made on P from PATH
-  commits.py chain FROM TO --published P  audit FROM..TO for adoption (full SHAs), P the PR's head
+  commits.py chain FROM TO --published P --base B  audit FROM..TO for adoption (full SHAs), P the PR's head, B its base branch's
 
 `commit` stages PATH and runs `git commit --only`, so nothing staged beside
 it is taken; it prints {committed, detail}: committed false, with git's last
@@ -11,11 +11,16 @@ lines, when git made no commit (a hook that fails or modifies a file stops it),
 or before staging anything when the message is blank.
 
 Per commit: sha, parents (every parent), paths (`git diff-tree --no-renames
--r -z`, one string per filename, unquoted) and message (`%B`).
-A link of a chain, or the head commit, is refused when it is a merge or a root,
-does not sit on the commit before it, touches no path, or has a message line
-crediting an agent, model, tool or session or linking a session (facts.attribution_in).
-`chain` reports from, to and published as given, commits (the SHAs of
+-r -z`, one string per filename, unquoted; for a merge `-c`, the paths whose
+entry differs from both parents, so what the base alone changed is not its)
+and message (`%B`).
+A link of a chain, or the head commit, is refused when it is a root, does not
+sit on the commit before it, touches no path, or has a message line crediting
+an agent, model, tool or session or linking a session (facts.attribution_in).
+A chain link may be a merge of a commit B holds, a merge from the base branch,
+which may touch no path; any other merge, and a merge at the head, is refused.
+`chain` follows first parents only, so the base's own commits are no links. It
+reports from, to, published and base as given, commits (the SHAs of
 FROM..TO, oldest first), paths (each path any of them touches, once),
 unpublished (each path the commits after P touch, once; all of them when P is
 not a chain commit) and refusal, "" or why the chain cannot be adopted: empty,
@@ -28,17 +33,17 @@ to PATH left uncommitted (`git status --porcelain -z -- PATH`), or a blank
 message. PATH is never read as an option or as pathspec magic.
 
 stdout ends with one JSON line: `head` prints {parent, scope, sha, entries,
-refusal}, `chain` {from, to, published, commits, paths, unpublished,
+refusal}, `chain` {from, to, published, base, commits, paths, unpublished,
 refusal}, each line but an error one with its `seal` (facts.sealed). Exit 0
 with that line; exit 2 with {"error": ...} when git cannot answer or the
-arguments are wrong.
+arguments are wrong, or a merge link's B is not in the checkout.
 """
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report  # noqa: E402
+from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run  # noqa: E402
 
 
 def records(text):
@@ -46,9 +51,9 @@ def records(text):
 
 
 def commit(sha):
-    return {'sha': sha,
-            'parents': git('show', '-s', '--format=%P', sha).split(),
-            'paths': records(git('diff-tree', '--no-commit-id', '--no-renames', '--name-only', '-r', '-z', sha)),
+    parents = git('show', '-s', '--format=%P', sha).split()
+    return {'sha': sha, 'parents': parents,
+            'paths': records(git('diff-tree', '--no-commit-id', '--no-renames', '--name-only', '-r', '-z', *(['-c'] if len(parents) > 1 else []), sha)),
             'message': git('log', '-1', '--format=%B', sha)}
 
 
@@ -58,13 +63,22 @@ def full(sha):
     return sha
 
 
-def link_refusal(c, parent):
+def on_base(sha, base):
+    if attempt('git', 'cat-file', '-e', f'{base}^{{commit}}')[0]:
+        raise Unusable(f"the PR's base {base} is not in the checkout: fetch it")
+    return run('git', 'merge-base', '--is-ancestor', sha, base, ok=(0, 1))[0] == 0
+
+
+def link_refusal(c, parent, base=None):
     sha = c['sha'][:7]
-    if len(c['parents']) != 1:
+    merge = base is not None and len(c['parents']) == 2
+    if len(c['parents']) != 1 and not merge:
         return f"{sha} has {len(c['parents'])} parents: history this run cannot audit"
     if c['parents'][0] != parent:
         return f"{sha} sits on {c['parents'][0][:7]}, not {parent[:7]}"
-    if not c['paths']:
+    if merge and not on_base(c['parents'][1], base):
+        return f"{sha} merges {c['parents'][1][:7]}, which is not on the PR's base {base[:7]}"
+    if not c['paths'] and not merge:
         return f'{sha} touches no path'
     said = attribution_in(c['message'])
     return f'commit message carries attribution: {said}' if said else ''
@@ -92,23 +106,23 @@ def touched(found):
     return list(dict.fromkeys(p for c in found for p in c['paths']))
 
 
-def chain(start, end, published):
-    published = full(published)
-    found = [commit(sha) for sha in git('rev-list', '--reverse', f'{full(start)}..{full(end)}').split()]
+def chain(start, end, published, base):
+    published, base = full(published), full(base)
+    found = [commit(sha) for sha in git('rev-list', '--reverse', '--first-parent', f'{full(start)}..{full(end)}').split()]
     shas = [c['sha'] for c in found]
     after = shas.index(published) + 1 if published in shas else 0
-    return {'from': start, 'to': end, 'published': published, 'commits': shas, 'paths': touched(found), 'unpublished': touched(found[after:]),
-            'refusal': chain_refusal(start, end, found)}
+    return {'from': start, 'to': end, 'published': published, 'base': base, 'commits': shas, 'paths': touched(found),
+            'unpublished': touched(found[after:]), 'refusal': chain_refusal(start, end, base, found)}
 
 
-def chain_refusal(start, end, found):
+def chain_refusal(start, end, base, found):
     if not found:
         return f'no commits in {start[:7]}..{end[:7]}'
     if found[-1]['sha'] != end:
         return f"the chain ends at {found[-1]['sha'][:7]}, not {end[:7]}"
     before = start
     for c in found:
-        refusal = link_refusal(c, before)
+        refusal = link_refusal(c, before, base)
         if refusal:
             return refusal
         before = c['sha']
@@ -141,9 +155,9 @@ def collect(argv):
         return make(argv[1:])
     if len(argv) > 3 and argv[:2] == ['head', '--parent']:
         return head(argv[2], argv[3:])
-    if len(argv) == 5 and argv[0] == 'chain' and argv[3] == '--published':
-        return chain(argv[1], argv[2], argv[4])
-    raise Unusable('usage: commits.py commit PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO --published P')
+    if len(argv) == 7 and argv[0] == 'chain' and argv[3] == '--published' and argv[5] == '--base':
+        return chain(argv[1], argv[2], argv[4], argv[6])
+    raise Unusable('usage: commits.py commit PATH... | commits.py head --parent P PATH... | commits.py chain FROM TO --published P --base B')
 
 
 if __name__ == '__main__':

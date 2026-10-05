@@ -49,6 +49,8 @@ REFUSED = {
     'wrong-head': 'the checkout HEAD is not the PR head: check out the PR head, or name the local chain that holds it '
                   'as adoptHead; report anything else, never reset the state',
     'deferral-refused': 'a deferral was refused: it needs a new decision before it is passed again',
+    'pr-conflicting': 'the PR conflicts with its base, so passing checks establish nothing: resolve the conflict in a merge from the base, '
+                      "then relaunch with adoptHead naming that merge; rebasedHead is only for a rewrite on the user's word",
     'stale-workflow': "this session's cached workflow definition calls a script the install lacks: relaunch from a fresh session, never by hand",
 }
 
