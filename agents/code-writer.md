@@ -19,7 +19,7 @@ Whenever a conclusion, hypothesis, review finding, experiment or code change dep
 
 ## Finish checklist (in order)
 
-1. Build. Which command you run depends on what the prompt gave you.
+1. Build. Which command you run depends on what the prompt gave you. Either way, clean up only the build directories you created, each by its exact path, never by a glob that can match a sibling's.
 
    **The prompt names a command** — run it exactly as given. Fill a `<BUILD>` placeholder with `mktemp -d` first; parallel siblings share the checkout, so the prompt owns build-dir isolation.
 

@@ -502,6 +502,8 @@ async function run(opts = {}) {
   }
 }
 
+// One macrotask: lets every agent stub that is ready settle.
+const tick = () => new Promise(r => setTimeout(r, 0))
 const summaries = (logs) => logs.filter(l => l.startsWith('cycle ') && l.includes(' summary '))
 // Split on the padded delimiter, not on a bare pipe: an escaped `\|` inside a
 // cell must stay part of that cell.
@@ -1092,6 +1094,16 @@ test('a thrown writer is a dead one: its group is withheld and the survivor is s
   assert.deepEqual(calls.filter(c => c.label.startsWith('check:')).map(c => c.label), ['check:src/b.c'])
   assert.match(outcomes(logs)[0], /withheld/)
   assert.match(outcomes(logs)[1], /^fixed/)
+})
+
+test('writers share the checkout one at a time: the next starts only after the previous one is verified', async () => {
+  const seen = []
+  await run({
+    reviews: twoValid,
+    fix: async (label) => { seen.push(`start ${label}`); await tick(); return {} },
+    verify: async (label) => { await tick(); seen.push(`done ${label}`); return { addresses: true, reason: 'ok' } },
+  })
+  assert.deepEqual(seen, ['start fix:src/a.c', 'done check:src/a.c', 'start fix:src/b.c', 'done check:src/b.c'])
 })
 
 test('every live writer is verified, and one dead group blocks the batch before it is built', async () => {

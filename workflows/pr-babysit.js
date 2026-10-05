@@ -899,7 +899,7 @@ const groupWork = (notes) => {
 const buildPlans = new Map()
 const contractTouched = (plan, paths) => plan.contract.some(f => paths.has(canon(f)))
 const callerPlan = buildCmd && { command: buildCmd, contract: [], reason: "the caller's build", error: null }
-// The batch is built once, as it settled: a writer's own build ran beside its siblings' unfinished edits. A failure blocks.
+// The batch is built once, as it settled: a writer's own build ran before later writers' edits. A failure blocks.
 const BUILD_FAILED = 'the build failed'
 const buildCheck = async (tag, owned) => {
   let plan = callerPlan
@@ -1006,9 +1006,10 @@ const fixAndVerify = async (workIn, tag) => {
   }
   for (const w of withheld) work.splice(work.indexOf(w), 1)
   const scopeOf = (w) => [...w.files].join(', ')
-  const fixes = await pipeline(
-    work,
-    w => agent(
+  // One writer at a time: a writer's build reads the whole checkout, so a sibling's unfinished edit or experiment would break it (#43).
+  const fixes = []
+  for (const w of work) {
+    const fix = await agent(
       `Fix the following issues on the PR branch. ${IN_CHECKOUT}\n` +
       (protectedRe ? `Constraint: never modify a path matching ${protectedRe.source} — it is the caller's, and a failure that needs it changed stays red for the user.\n` : '') +
       (buildCmd
@@ -1018,18 +1019,16 @@ const fixAndVerify = async (workIn, tag) => {
       'Code outside your scope that relies on behaviour you change (a test, a script, a documented value) keeps its expectation: never edit it or its assertion to fit; report the change it would need as out of scope.\n' +
       `Scope: ${scopeOf(w)}\nIssues:\n- ${textOf(w)}`,
       { label: `fix:${w.key}`, phase: 'Fix', agentType: 'code-writer', schema: DEV },
-    ),
-    (fix, w) => {
-      if (!fix) return null
-      return agent(
-        `${IN_CHECKOUT}Verify the uncommitted changes for ${scopeOf(w)} (use git diff -- <the files above>, and read any newly created untracked files directly) address these issues:\n- ${textOf(w)}\n` +
-        'Judge whether the diff addresses each issue independently of its hint: following the hint is neither necessary nor sufficient. ' +
-        'addresses=true only when every listed issue is addressed. Return {"addresses": bool, "reason": string}.',
-        { label: `check:${w.key}`, phase: 'Fix', agentType: 'finding-verifier', schema: CHECK },
-      ).catch(quiet(`check:${w.key}`))
-        .then(v => verdictOf(fix, w, !!(v && v.addresses), v ? v.reason : 'verifier died'))
-    },
-  )
+    ).catch(quiet(`fix:${w.key}`))
+    if (!fix) { fixes.push(null); continue }
+    const v = await agent(
+      `${IN_CHECKOUT}Verify the uncommitted changes for ${scopeOf(w)} (use git diff -- <the files above>, and read any newly created untracked files directly) address these issues:\n- ${textOf(w)}\n` +
+      'Judge whether the diff addresses each issue independently of its hint: following the hint is neither necessary nor sufficient. ' +
+      'addresses=true only when every listed issue is addressed. Return {"addresses": bool, "reason": string}.',
+      { label: `check:${w.key}`, phase: 'Fix', agentType: 'finding-verifier', schema: CHECK },
+    ).catch(quiet(`check:${w.key}`))
+    fixes.push(verdictOf(fix, w, !!(v && v.addresses), v ? v.reason : 'verifier died'))
+  }
   const alive = fixes.filter(Boolean)
   if (alive.length < work.length) log(`${work.length - alive.length} fix group(s) lost to dead workers`)
   let unverified = alive.filter(f => f.addresses !== true)
