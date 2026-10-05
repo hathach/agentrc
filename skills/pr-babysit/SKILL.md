@@ -79,7 +79,10 @@ The workflow's own contract (`workflows/pr-babysit.js`).
   no point of the comment is held, and `reply.py --reuse` returns a settling
   receipt: both digests read back and, in a review thread, the thread
   resolved. The result's `settlements` say which settled and why the rest did
-  not. Per launch.
+  not. An entry's `sonar: { how: 'refutation' | 'fixNote', note }`, `note` the
+  reply body `bodyDigest` digests, makes a settled code-scanning comment owe
+  its SonarCloud marking under `markSonar`, unless our earlier answer still
+  owes one. Per launch.
 - `yieldAfterCycle`: run one cycle and return the state for the next launch.
 - `lane`: `both` (default), `ci` or `reviews`; a single lane needs
   `yieldAfterCycle` and never declares the PR done.

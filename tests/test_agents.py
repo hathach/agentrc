@@ -138,7 +138,8 @@ class AgentFiles(unittest.TestCase):
         self.assertNotIn('affirmative answer', exception)
         takeover = body.split('Reply takeover rule:')[1].split('Exception for a headless PR review launch:')[0]
         for phrase in ('the reply obligations a launch returns in `handoffs`', 'editing only a reply this task\'s recorded attempt posted',
-                       'It permits no delete, no reply to another comment, no review and no SonarCloud action, and a dry run withholds it',
+                       'It permits no delete, no reply to another comment, no review and no SonarCloud action by its units, and a dry run withholds it',
+                       'add `sonar: { how, note }`, `how` `fixNote` when any point was fixed, else `refutation`, and `note` the exact reply body',
                        'Answer only when every point the comment raises as it stands now is fixed on the PR branch, refuted with evidence or deferred',
                        '`replySettlements: [{ commentId, commentDigest, replyId, bodyDigest, headSha }]`'):
             self.assertIn(phrase, takeover)

@@ -92,9 +92,11 @@ const FULL_SHA = /^[0-9a-f]{40}$/
 // The caller's verified replies on comments this run handed it, each judged to answer the whole comment at headSha.
 const settlementsArg = args.replySettlements ?? []
 const settlementShaped = (s) => s && typeof s === 'object' && [s.commentId, s.replyId].every(n => Number.isInteger(n) && n > 0) &&
-  [s.commentDigest, s.bodyDigest].every(d => typeof d === 'string' && d.length > 0) && typeof s.headSha === 'string' && FULL_SHA.test(s.headSha)
+  [s.commentDigest, s.bodyDigest].every(d => typeof d === 'string' && d.length > 0) && typeof s.headSha === 'string' && FULL_SHA.test(s.headSha) &&
+  (s.sonar === undefined || (s.sonar && ['refutation', 'fixNote'].includes(s.sonar.how) && typeof s.sonar.note === 'string' && s.sonar.note.trim() !== '' &&
+    fnv1a(s.sonar.note) === s.bodyDigest))
 if (!Array.isArray(settlementsArg) || !settlementsArg.every(settlementShaped) || new Set(settlementsArg.map(s => s.commentId)).size !== settlementsArg.length) {
-  throw new Error('replySettlements must be [{ commentId, commentDigest, replyId, bodyDigest, headSha: the full SHA its answer was judged at }], one per comment')
+  throw new Error('replySettlements must be [{ commentId, commentDigest, replyId, bodyDigest, headSha: the full SHA its answer was judged at, sonar?: { how: refutation|fixNote, note: the reply body bodyDigest digests } }], one per comment')
 }
 const pathRe = (name) => {
   if (args[name] === undefined || args[name] === null) return null
@@ -1498,10 +1500,12 @@ const settleCaller = async (cycle, digestOf, held) => {
       refuse(s, r ? r.error || 'reuse not verified' : 'no reuse receipt')
       continue
     }
-    // The caller's answer adds no SonarCloud marking, and keeps one our earlier answer still owes (a correction cancelled any it disproved).
+    // A marking our earlier answer still owes keeps that answer (a correction cancelled any it disproved); else the caller's answer owes one when its settlement names how.
     const prior = answeredWith.get(s.commentId)
     pay(s.commentId, 'byHand', s.commentDigest)
-    if (prior && prior.sonar) Object.assign(answeredWith.get(s.commentId), { sonar: prior.sonar, sonarOf: prior.sonarOf || { how: prior.how, digest: prior.digest } })
+    const owed = prior && prior.sonar ? { sonar: prior.sonar, sonarOf: prior.sonarOf || { how: prior.how, digest: prior.digest } }
+      : s.sonar ? { sonar: s.sonar.note, sonarOf: { how: s.sonar.how, digest: s.commentDigest } } : null
+    if (owed) Object.assign(answeredWith.get(s.commentId), owed)
     settlements.push({ commentId: s.commentId, outcome: 'settled', replyId: s.replyId })
     log(`cycle ${cycle}: comment ${s.commentId} settled on the caller's reply ${s.replyId}`)
     settled.push(s.commentId)

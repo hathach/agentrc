@@ -3788,6 +3788,26 @@ test('a SonarCloud marking our fix note still owes outlives the caller\'s settle
   assert.deepEqual(result.sonarUnmarked.map(u => [u.commentId, u.how]), [[2, 'fixNote']])
 })
 
+test('a settlement that names how makes the caller\'s answer owe its SonarCloud marking, with the reply body as the note', async () => {
+  const st = adoptionState({ reviewers: ['coderabbit', 'code-scanning'], autoRun: ['coderabbit'],
+    answeredWith: [[2, { how: 'fixNote', digest: 'd2' }]],
+    debt: [[2, { dismissals: ['2#5'], notes: [], digest: 'd2', repair: { replyId: 502, error: 'read-back mismatch on body' } }]] })
+  const items = []
+  const note = 'Fixed in abc: the bound is checked first.'
+  const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a(note), headSha: HEAD, sonar: { how: 'fixNote', note } }
+  const launch = (s) => run({ args: adoptionArgs(st, { adoptHead: undefined, autoPush: true, markSonar: true, replySettlements: [s] }),
+    reviews: { findings: [invalidFinding({ source: 'code-scanning', commentId: 2, line: 5 })], replies: [], bots: 'reviewed' },
+    sonar: sonarWaiting(items) })
+  const { result } = await launch(settlement)
+  assert.deepEqual(result.settlements, [{ commentId: 2, outcome: 'settled', replyId: 502 }])
+  assert.deepEqual(items.map(x => [x.commentId, x.how, x.commentDigest, x.note]), [[2, 'fixNote', 'd2', note]])
+  assert.deepEqual(result.state.answeredWith.find(([id]) => id === 2)[1], { how: 'byHand', digest: 'd2', sonar: note, sonarOf: { how: 'fixNote', digest: 'd2' } })
+  for (const sonar of [{ how: 'fixNote', note: 'another body' }, { how: 'deferral', note }]) {
+    await assert.rejects(launch({ ...settlement, sonar }), /replySettlements must be/, JSON.stringify(sonar))
+  }
+  await assert.rejects(launch({ ...settlement, bodyDigest: fnv1a(' '), sonar: { how: 'refutation', note: ' ' } }), /replySettlements must be/, 'a blank note')
+})
+
 test('a challenger that cannot settle a dismissal neither posts it nor fixes the finding', async () => {
   const { result, labels, logs } = await run({
     args: { maxCycles: 1 },
