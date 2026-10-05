@@ -6,8 +6,9 @@
 DIR must not exist. It receives stream.jsonl (every stdout line, raw), progress.log
 (`<seq> <HH:MM:SS> <line>`: the launcher's own lines, chief's status lines and notes),
 report.md (the final result's text), session (the session id), stderr.log and, when
-the session's cost can be tabled, cost.md (run_cost.py's table, also appended to
-report.md). The exit line ends with that total, or `cost none (<why>)`.
+the session's cost can be tabled, cost.md (run_cost.py's full output; its brief form,
+the Launches and Usage tables, goes into report.md before chief's first `## ` section).
+The exit line ends with that total, or `cost none (<why>)`.
 
 A status line is the first line of one of chief's own messages (agents/chief.md);
 a note is a progress note, joined onto one line, that chief's model returns as a `thinking`
@@ -18,6 +19,7 @@ in SKILL.md.
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -90,16 +92,30 @@ def verdict(rc, result, body):
     return 0, 'result ok'
 
 
+def with_brief(text, brief):
+    """The report with the brief tables before its first `## ` section outside a fenced block, or after it all."""
+    lines = text.rstrip('\n').split('\n')
+    fence, at = None, len(lines)
+    for i, line in enumerate(lines):
+        mark = re.match(r' {0,3}(`{3,}|~{3,})', line)
+        if mark and fence is None:
+            fence = mark.group(1)
+        elif mark and mark.group(1)[0] == fence[0] and len(mark.group(1)) >= len(fence) and not line.strip()[len(mark.group(1)):].strip():
+            fence = None
+        elif fence is None and line.startswith('## '):
+            at = i
+            break
+    return '\n'.join(lines[:at]).rstrip('\n') + f'\n\n{brief}\n' + ('\n' + '\n'.join(lines[at:]) + '\n' if at < len(lines) else '')
+
+
 def cost(out, sid, report):
-    """The exit line's cost field; writes cost.md and appends it to the report."""
+    """The exit line's cost field; writes cost.md and puts its brief form into the report."""
     if not sid:
         return 'cost none (no session id)'
     try:
-        md, total = run_cost.summary(run_cost.session_dir(session_id=sid))
-        (out / 'cost.md').write_text(md + '\n', encoding='utf-8')
+        brief, _, total = run_cost.report(run_cost.session_dir(session_id=sid), out / 'cost.md')
         if report.exists():
-            with report.open('a', encoding='utf-8') as f:
-                f.write(f'\n## Cost by stage\n\n{md}\n')
+            report.write_text(with_brief(report.read_text(encoding='utf-8'), brief), encoding='utf-8')
     except run_cost.Failed as e:
         return f'cost none (run_cost: {e})'
     except Exception as e:   # noqa: BLE001 - chief has finished; a cost it cannot table must not lose the exit line

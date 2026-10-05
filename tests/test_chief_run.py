@@ -252,8 +252,24 @@ class ChiefRun(unittest.TestCase):
         self.assertTrue(self.texts()[-1].endswith(' · cost $0.20'), self.texts())
         table = (self.out / 'cost.md').read_text(encoding='utf-8')
         self.assertIn('| wf_a | preflight | haiku-4-5 |', table)
-        self.assertEqual((self.out / 'report.md').read_text(encoding='utf-8'),
-                         f'chief: stage · done\n\n## Cost by stage\n\n{table}')
+        report = (self.out / 'report.md').read_text(encoding='utf-8')
+        self.assertTrue(report.startswith('chief: stage · done\n\n## Launches\n\n| # | outcome |'), report)
+        self.assertIn('## Usage by stage and agent', report)
+        self.assertTrue(report.endswith(f'Per launch × stage × model and the time breakdown: {self.out / "cost.md"}\n'), report)
+        self.assertNotIn('| wf_a | preflight |', report, 'the full table stays in cost.md')
+
+    def test_the_brief_tables_go_before_chiefs_first_section(self):
+        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        self.assertEqual(chief_run.with_brief('chief: x\n\n# PR\n\nverdict\n\n## Final state\n- HEAD\n', 'B'),
+                         'chief: x\n\n# PR\n\nverdict\n\nB\n\n## Final state\n- HEAD\n')
+        self.assertEqual(chief_run.with_brief('chief: x\n', 'B'), 'chief: x\n\nB\n', 'no section: after it all')
+        fenced = 'chief: x\n\n```md\n## quoted\n```\n\n## Final\n'
+        self.assertEqual(chief_run.with_brief(fenced, 'B'), 'chief: x\n\n```md\n## quoted\n```\n\nB\n\n## Final\n', 'not inside a fence')
+        tilde = 'chief: x\n\n~~~~\n```\n## quoted\n~~~\n~~~~\n\n## Final\n'
+        self.assertEqual(chief_run.with_brief(tilde, 'B'), 'chief: x\n\n~~~~\n```\n## quoted\n~~~\n~~~~\n\nB\n\n## Final\n',
+                         'only a fence of its character and length closes it')
 
     def test_a_cost_it_cannot_write_still_leaves_an_exit_line(self):
         spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
@@ -261,7 +277,7 @@ class ChiefRun(unittest.TestCase):
         spec.loader.exec_module(chief_run)
         blocker = self.root / 'not-a-dir'
         blocker.write_text('')
-        with mock.patch.object(chief_run.run_cost, 'summary', lambda session: ('| t |', '1.00')), \
+        with mock.patch.object(chief_run.run_cost, 'report', lambda session, full_path: (full_path.write_text('| t |'), 'B', '1.00')), \
                 mock.patch.object(chief_run.run_cost, 'session_dir', lambda session_id: self.root):
             self.assertRegex(chief_run.cost(blocker, 's-1', blocker / 'report.md'), r'^cost none \((NotADirectoryError|FileNotFoundError): ')
 

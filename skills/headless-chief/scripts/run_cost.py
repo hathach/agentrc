@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What a chief session spent, by Workflow run, stage and model, from its transcripts.
 
-    run_cost.py (--session-id ID | --journal PATH)
+    run_cost.py (--session-id ID | --journal PATH) [--full FILE]
 
 --session-id finds ~/.claude/projects/*/ID.jsonl; --journal is any Workflow journal of
 the session (<session>/subagents/workflows/<run>/journal.jsonl), which an interactive
@@ -29,6 +29,15 @@ of its rows has no dollars.
 A time table ends it: each Workflow run's wall, the busy time of its stages by kind
 (setup: state:load and preflight; CI: the ci: stages; other: the rest) and the gap
 before it; the note under the table defines them.
+
+With --full, that output goes to FILE, and stdout gets the report's brief form, pointing
+to FILE: a Launches table, one row per Workflow run from its record beside the
+transcripts (outcome, what it did, its wall with the CI lane's busy time, its tokens and
+dollars), chief's own turns, its units and the total, with any run its record shows
+refused before an agent ran listed under it and a State line from the last pr-babysit
+launch's record (its expected head, which may precede chief's later commits, non-zero
+finding and CI counts, cycles used); then a Usage table, one row per stage or chief role summed
+over runs, the rows under FOLD dollars folded into one, its total split by model.
 """
 import argparse
 import functools
@@ -251,6 +260,7 @@ def breakout(rows, session):
 
 
 SETUP = ('state:load', 'preflight')
+FOLD = 0.60   # dollars: a Usage row below it folds into `other`
 
 
 def lane_of(stage):
@@ -268,51 +278,213 @@ def busy(intervals):
     return total
 
 
-def timeline(session):
-    """The Markdown time table: each Workflow run's wall and the busy time of its stages by kind, and the gap before it."""
-    minutes = lambda s: f'{s / 60:.1f}'
+def minutes(s):
+    return f'{s / 60:.1f}'
+
+
+def walls_of(session):
+    """([(run name, first record, last record, {kind: busy seconds})] in start order, session wall seconds, runs' union seconds)."""
     _, s0, s1 = usage_of(session.with_suffix('.jsonl'))
-    out = ['| run | start UTC | wall min | setup min | CI lane min | other work min | gap before it min |',
-           '|---|---|---:|---:|---:|---:|---:|']
-    last, walls = s0, []
+    runs, last = [], s0
     for _, name, agents in runs_of(session):
         spans = [(lane_of(stage), *usage_of(p)[1:]) for stage, p in agents]
         spans = [(lane, t0, t1) for lane, t0, t1 in spans if t0 and t1]
         if not spans:
             continue
         r0, r1 = min(t0 for _, t0, _ in spans), max(t1 for _, _, t1 in spans)
-        lane = {k: busy([(t0, t1) for x, t0, t1 in spans if x == k]) for k in ('setup', 'ci', 'other')}
-        walls.append((r0, r1))
+        runs.append((name, r0, r1, {k: busy([(t0, t1) for x, t0, t1 in spans if x == k]) for k in ('setup', 'ci', 'other')}))
+        last = max(last, r1) if last else r1
+    return runs, seconds(s0, max(s1 or '', last or '')), busy([(r0, r1) for _, r0, r1, _ in runs])
+
+
+def timeline(session, walls):
+    """The Markdown time table: each Workflow run's wall and the busy time of its stages by kind, and the gap before it."""
+    out = ['| run | start UTC | wall min | setup min | CI lane min | other work min | gap before it min |',
+           '|---|---|---:|---:|---:|---:|---:|']
+    runs, session_wall, union = walls
+    last = usage_of(session.with_suffix('.jsonl'))[1]
+    for name, r0, r1, lane in runs:
         out.append(f'| {name} | {r0[11:19]} | {minutes(seconds(r0, r1))} | {minutes(lane["setup"])} | {minutes(lane["ci"])} | '
                    f'{minutes(lane["other"])} | {minutes(max(0.0, seconds(last, r0)))} |')
         last = max(last, r1) if last else r1
-    session_wall = seconds(s0, max(s1 or '', last or ''))
-    out.append(f'\nSession wall {minutes(session_wall)} min, of which Workflow runs {minutes(busy(walls))} min. A run\'s wall runs from its '
+    out.append(f'\nSession wall {minutes(session_wall)} min, of which Workflow runs {minutes(union)} min. A run\'s wall runs from its '
                'first agent record to its last; a kind\'s time is the union of its agents\' spans, idle waits included (ci:collect waits '
                'on CI), and kinds overlap. The gap before a run is everything chief did since the previous one: its own turns, its '
                'units, writers, checks and review rounds.')
     return '\n'.join(out)
 
 
-def workflow_name(session, run):
-    """The saved workflow a run executed, from its record beside the transcripts, or None."""
+@functools.lru_cache(maxsize=None)
+def record_of(session, run):
+    """A run's record beside the transcripts, or {}."""
     try:
-        return json.loads((session / 'workflows' / f'{run}.json').read_text()).get('workflowName')
-    except (OSError, ValueError, AttributeError):
-        return None
+        r = json.loads((session / 'workflows' / f'{run}.json').read_text())
+    except (OSError, ValueError):
+        return {}
+    return r if isinstance(r, dict) else {}
 
 
-def summary(session):
-    """(the Markdown table, its total cell) of a session directory."""
+def workflow_name(session, run):
+    """The saved workflow a run executed, or None."""
+    return record_of(session, run).get('workflowName')
+
+
+def cell(text):
+    """Text safe in one Markdown table cell."""
+    return ' '.join(str(text).replace('|', '\\|').split())
+
+
+def outcome(record):
+    result, error = record.get('result'), record.get('error')
+    if isinstance(result, dict) and result.get('status'):
+        return ': '.join(str(x) for x in (result['status'], result.get('reason')) if x)
+    if error:
+        return str(error).splitlines()[0].removeprefix('Error: ')
+    return record.get('status') or 'no record'
+
+
+def rollup_of(record):
+    result = record.get('result')
+    return (result.get('rollup') if isinstance(result, dict) else None) or {}
+
+
+def did(record):
+    """What a pr-babysit run's rollup says it changed, or '–'."""
+    ro = rollup_of(record)
+    fixed = sum(((ro.get(k) or {}).get('fixed') or 0) for k in ('findings', 'ci'))
+    replies = ro.get('replies') or 0
+    parts = ([f'fixed {fixed}'] if fixed else []) + ([f'{replies} repl{"y" if replies == 1 else "ies"}'] if replies else [])
+    if ro.get('pushed'):
+        parts.append('pushed ' + ', '.join(str(sha)[:7] for sha in ro['pushed']))
+    return ', '.join(parts) or '–'
+
+
+FINDINGS = (('fixed', 'fixed'), ('open', 'open'), ('refuted', 'refuted'), ('stale', 'stale'), ('deferred', 'deferred'), ('held', 'held'))
+CI = (('fixed', 'fixed'), ('open', 'open'), ('accepted', 'accepted'), ('sonarGate', 'Sonar gate'), ('rigSide', 'rig-side'),
+      ('unclassified', 'unclassified'))
+
+
+def state_line(numbered):
+    """The State line of the last pr-babysit launch in [(number, record)], or ''."""
+    last = next(((i, r) for i, r in reversed(numbered) if r.get('workflowName') == 'pr-babysit'), None)
+    if last is None:
+        return ''
+    i, rec = last
+    result = rec.get('result')
+    st = result.get('state') if isinstance(result, dict) else None
+    if not isinstance(st, dict):
+        return f'State after launch {i}: not recorded.'
+    ro = rollup_of(rec)
+    def words(counts, names):
+        if not isinstance(counts, dict):
+            return 'unavailable'
+        return ' · '.join(f'{counts[k]} {w}' for k, w in names if counts.get(k)) or 'none'
+    return (f'State after launch {i}: {str(st.get("expectedHead") or "?")[:7]}; findings {words(ro.get("findings"), FINDINGS)}; '
+            f'CI {words(ro.get("ci"), CI)}; {st.get("cyclesUsed", "?")}/{st.get("maxCycles", "?")} cycles used.')
+
+
+def kilo(n):
+    return f'{n / 1000:.0f} k' if n else '–'
+
+
+def paths(rows):
+    return set().union(*(r['paths'] for r in rows))
+
+
+def launches(session, rows, walls):
+    """The brief form's Launches table, the runs refused before any agent ran, and the State line."""
+    runs, session_wall, union = walls
+    timed = {name: (seconds(r0, r1), lane['ci']) for name, r0, r1, lane in runs}
+    names = {r['group'] for r in rows if r['group'] not in ('chief', '-')} | {p.stem for p in (session / 'workflows').glob('wf_*.json')}
+    names = sorted(names, key=lambda n: (record_of(session, n).get('startTime') or 0, n))
+    out = ['| # | outcome | did | time | tokens | $ |', '|---|---|---|---:|---:|---:|']
+    refused, numbered = [], []
+    for name in names:
+        rec, mine = record_of(session, name), [r for r in rows if r['group'] == name]
+        if rec.get('agentCount') == 0 and not rec.get('totalTokens') and rec.get('error') and not mine and name not in timed:
+            refused.append(f'{name} ({outcome(rec)})')
+            continue
+        numbered.append((len(numbered) + 1, rec))
+        i = len(numbered)
+        wall, ci = timed.get(name, ((rec.get('durationMs') or 0) / 1000, 0.0))
+        when = f'{minutes(wall)} m' + (f' ({minutes(ci)} CI)' if ci else '')
+        out.append(f'| {i} | {cell(outcome(rec))} | {cell(did(rec))} | {when} | {kilo(rec.get("totalTokens") or 0)} | '
+                   f'{total_cell(mine) if mine else "-"} |')
+    own = [r for r in rows if r['group'] == 'chief' and r['stage'] == 'chief']
+    units = [r for r in rows if r['group'] == 'chief' and r['stage'] != 'chief']
+    out.append(f'| chief | own turns | | {minutes(max(0.0, session_wall - union))} m | | {total_cell(own) if own else "-"} |')
+    if units:
+        by_role = defaultdict(list)
+        for r in units:
+            by_role[r['stage']].append(r)
+        role, g = max(by_role.items(), key=lambda kv: sum(r['cost'] or 0 for r in kv[1]))
+        label = 'biggest known' if any(r['cost'] is None for r in units) else 'biggest'
+        out.append(f'| chief units | {label}: {cell(role.removeprefix("chief:"))} ×{len(paths(g))} | | | | {total_cell(units)} |')
+    out.append(f'| **total** | | | **{minutes(session_wall)} m** | | **{total_cell(rows)}** |')
+    if refused:
+        out.append(f'\nRefused before any agent ran: {cell("; ".join(refused))}.')
+    line = state_line(numbered)
+    return '\n'.join(out) + (f'\n\n{line}' if line else '')
+
+
+def family(model):
+    return model.removeprefix('claude-').split('-')[0]
+
+
+def usage(rows):
+    """The brief form's Usage table: each stage or chief role summed over runs, the small ones folded."""
+    groups = defaultdict(list)
+    for r in rows:
+        groups['chief (own turns)' if (r['group'], r['stage']) == ('chief', 'chief') else r['stage']].append(r)
+    known = lambda g: sum(r['cost'] for r in g if r['cost'] is not None)
+    order = sorted(groups.items(), key=lambda kv: -known(kv[1]))
+    small = {k for k, g in order if all(r['cost'] is not None for r in g) and known(g) < FOLD}
+    if len(small) < 2:
+        small = set()
+    out = ['| stage / agent | model | launches | agents | output | busy | $ |', '|---|---|---:|---:|---:|---:|---:|']
+    for name, g in order:
+        if name in small:
+            continue
+        runs = {r['group'] for r in g}
+        secs = None if name == 'chief (own turns)' or any(r['secs'] is None for r in g) else sum(r['secs'] for r in g)
+        out.append(f'| {cell(name)} | {cell(", ".join(sorted({family(r["model"]) for r in g})))} | {"–" if runs & {"chief", "-"} else len(runs)} | '
+                   f'{len(paths(g))} | {kilo(sum(r["tokens"]["out"] for r in g))} | {"–" if secs is None else minutes(secs) + " m"} | {total_cell(g)} |')
+    if small:
+        g = [r for k in small for r in groups[k]]
+        out.append(f'| other ({len(small)} under ${FOLD:.2f}) | | | {len(paths(g))} | {kilo(sum(r["tokens"]["out"] for r in g))} | | {total_cell(g)} |')
+    total = known(rows)
+    by_model = defaultdict(float)
+    for r in rows:
+        by_model[family(r['model'])] += r['cost'] or 0
+    split = ' · '.join(f'{cell(m)} {100 * c / total:.0f}%' for m, c in sorted(by_model.items(), key=lambda kv: -kv[1])) if total else ''
+    out.append(f'| **total** | {split} | | {len(paths(rows))} | {kilo(sum(r["tokens"]["out"] for r in rows))} | | **{total_cell(rows)}** |')
+    return '\n'.join(out)
+
+
+def report(session, full_path=None):
+    """(the brief form, or None without full_path, the full output, its total cell) of a session directory; with
+    full_path, the full output is written there and the brief points to it."""
     transcript = session.with_suffix('.jsonl')
     if not transcript.exists():
         raise Failed(f'no transcript {transcript}')
+    record_of.cache_clear()   # records change between calls in one process
     state = cost_state(transcript)
-    rows = priced(collect(session), state)
+    rows, walls = priced(collect(session), state), walls_of(session)
     notes = [f'Scope: the whole session {session.name}, every Workflow run and agent in it and its own turns, not one workflow alone.']
     if state is None:
         notes.append('No cost-state record in the transcript: every $ is its tokens at RATES.')
-    return table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + timeline(session) + '\n\n' + '\n'.join(notes), total_cell(rows)
+    full = table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + timeline(session, walls) + '\n\n' + '\n'.join(notes)
+    if full_path is None:
+        return None, full, total_cell(rows)
+    full_path.write_text(full + '\n', encoding='utf-8')
+    brief = (f'## Launches\n\n{launches(session, rows, walls)}\n\n## Usage by stage and agent\n\n{usage(rows)}\n\n'
+             + ''.join(n + '\n' for n in notes[1:]) + f'Per launch × stage × model and the time breakdown: {full_path}')
+    return brief, full, total_cell(rows)
+
+
+def summary(session):
+    """(the full Markdown output, its total cell) of a session directory."""
+    return report(session)[1:]
 
 
 def main(argv=None):
@@ -320,9 +492,11 @@ def main(argv=None):
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument('--session-id')
     g.add_argument('--journal')
+    p.add_argument('--full', type=Path, help='write the full output here and print the brief form')
     a = p.parse_args(argv)
     try:
-        print(summary(session_dir(a.session_id, a.journal))[0])
+        brief, full, _ = report(session_dir(a.session_id, a.journal), a.full)
+        print(brief if a.full else full)
     except Failed as e:
         print(f'run_cost: {e}', file=sys.stderr)
         return 1

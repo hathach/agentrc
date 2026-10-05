@@ -214,6 +214,52 @@ class RunCostTest(unittest.TestCase):
         self.assertIn('Session wall 11.0 min, of which Workflow runs 7.5 min.', self.main('--session-id', SID)[1])
         self.assertEqual(run_cost.lane_of(run_cost.stage_of('preflight.retry')), 'setup', 'a relay retry keeps its stage kind')
 
+    def test_the_brief_form_tables_launches_and_usage_and_writes_the_full_output(self):
+        records = self.session / 'workflows'
+        records.mkdir(parents=True)
+        rollup = {'findings': {'total': 3, 'fixed': 1, 'refuted': 2, 'open': 0}, 'ci': {'total': 4, 'fixed': 1, 'rigSide': 3},
+                  'replies': 2, 'pushed': ['44563dc0abc', 'e5380505def']}
+        state = {'expectedHead': '9a8b7c6d5e4f', 'cyclesUsed': 4, 'maxCycles': 10}
+        (records / 'wf_aaa.json').write_text(json.dumps({'runId': 'wf_aaa', 'startTime': 2, 'totalTokens': 271025, 'agentCount': 3, 'workflowName': 'pr-babysit',
+                                                         'result': {'status': 'paused', 'reason': 'yielded', 'rollup': rollup, 'state': state}}))
+        (records / 'wf_bad.json').write_text(json.dumps({'runId': 'wf_bad', 'startTime': 1, 'totalTokens': 0, 'status': 'failed',
+                                                         'agentCount': 0, 'error': 'Error: deferral reason too long\n    at x'}))
+        # an agent ran but left no usage: a failed run, not a refusal; a pipe in its reason stays in its cell
+        (records / 'wf_died.json').write_text(json.dumps({'runId': 'wf_died', 'startTime': 3, 'totalTokens': 0, 'status': 'failed',
+                                                          'agentCount': 1, 'error': 'Error: how must be refutation|fixNote'}))
+        write(self.session.with_suffix('.jsonl'), self.chief + [turn('m9', 'claude-opus-5-5', '2026-09-25T10:10:00Z', out=1),
+                                                                 cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': OPUS})])
+        full = self.projects / 'cost.md'
+        rc, out, _ = self.main('--session-id', SID, '--full', str(full))
+        self.assertEqual(rc, 0)
+        self.assertEqual(full.read_text(), self.main('--session-id', SID)[1], 'the full output, unchanged, goes to the file')
+        launches = self.breakout(out, 0)
+        self.assertEqual(launches['1'], ['paused: yielded', 'fixed 2, 2 replies, pushed 44563dc, e538050', '2.5 m (0.1 CI)', '271 k', '2.58'], 'its rows, as the part breakout sums them')
+        self.assertEqual(launches['chief'], ['own turns', '', '8.5 m', '', '2.50'], 'the session wall less the runs')
+        self.assertEqual(launches['chief units'], ['biggest: Explore ×1', '', '', '', '0.60'])
+        self.assertEqual(launches['**total**'], ['', '', '**11.0 m**', '', '**5.68**'])
+        self.assertIn('Refused before any agent ran: wf_bad (deferral reason too long).', out)
+        self.assertIn('State after launch 1: 9a8b7c6; findings 1 fixed · 2 refuted; CI 1 fixed · 3 rig-side; 4/10 cycles used.', out)
+        usage = self.breakout(out, 1)
+        self.assertEqual(usage['chief (own turns)'], ['opus', '–', '1', '5 k', '–', '2.50'])
+        self.assertEqual(usage['fix'], ['opus', '1', '1', '20 k', '0.5 m', '2.24'])
+        self.assertEqual(usage['other (2 under $0.60)'], ['', '', '3', '38 k', '', '0.94'], 'ci:collect and chief:Explore fold')
+        self.assertEqual(usage['**total**'], ['opus 94% · haiku 6%', '', '5', '63 k', '', '**5.68**'])
+        self.assertTrue(out.rstrip().endswith(f'Per launch × stage × model and the time breakdown: {full}'))
+        self.assertIn('| 2 | how must be refutation\\|fixNote | – | 0.0 m | – | - |', out)
+        # a later pr-babysit launch that failed has no state: the line says so rather than show an older launch's
+        rec = json.loads((records / 'wf_died.json').read_text())
+        (records / 'wf_died.json').write_text(json.dumps({**rec, 'workflowName': 'pr-babysit'}))
+        self.assertIn('State after launch 2: not recorded.', self.main('--session-id', SID, '--full', str(full))[1], 'records reread per report')
+        # a record claiming no agent ran, beside an agent's rows, is a normal row
+        rec = json.loads((records / 'wf_aaa.json').read_text())
+        (records / 'wf_aaa.json').write_text(json.dumps({**rec, 'agentCount': 0, 'totalTokens': 0, 'error': 'Error: odd'}))
+        self.assertIn('| 1 | paused: yielded |', self.main('--session-id', SID, '--full', str(full))[1])
+        # a run with an unpriced row says so
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': OPUS})])
+        out = self.main('--session-id', SID, '--full', str(full))[1]
+        self.assertTrue(self.breakout(out, 0)['1'][-1].endswith(' (partial)'), out)
+
     def test_a_session_it_cannot_place_is_refused(self):
         rc, _, err = self.main('--session-id', 'nope')
         self.assertEqual(rc, 1)
