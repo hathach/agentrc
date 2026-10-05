@@ -1148,8 +1148,11 @@ test('a rejected point holds its whole comment: the fixed sibling is pushed, but
   assert.notEqual(result.pass, true)
   const rows = rowsOf(summaries(logs)[0])
   assert.match(rows.find(r => r[1].includes('src/a.c:1'))[3], /^fixed \+ pushed/)
-  assert.match(rows.find(r => r[1].includes('src/a.c:2'))[3], /^rejected by its writer, judged again next cycle/)
-  assert.deepEqual([result.rollup.findings.fixed, result.rollup.findings.open], [1, 1], 'the rejected point is not counted fixed')
+  const rejectedRow = rows.find(r => r[1].includes('src/a.c:2'))
+  assert.equal(rejectedRow[2], 'valid')
+  assert.match(rejectedRow[3], /^held: its fix writer rejected it with evidence/)
+  assert.deepEqual([result.rollup.findings.fixed, result.rollup.findings.held, result.rollup.findings.open], [1, 1, 0], 'reported held, as the state holds it')
+  assert.equal(result.observation.reviews.findings.find(f => f.findingId === '1#2').hold, 'its fix writer rejected it with evidence; judged again next cycle')
 })
 
 test('a second rejection of the same finding, across a resumed launch, stops for the caller', async () => {

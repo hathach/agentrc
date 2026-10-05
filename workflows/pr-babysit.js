@@ -1125,8 +1125,6 @@ const fixCell = (fixes, id, push, pushFailed) => {
   const fix = fixes.find(x => x.ids.includes(id) || x.rejected.some(r => r.id === id))
   if (!fix) return 'withheld (no fix dispatched)'
   if (fix.addresses !== true) return `unverified: ${fix.checkReason}`
-  const rejection = fix.rejected.find(x => x.id === id)
-  if (rejection) return `rejected by its writer, judged again next cycle: ${rejection.evidence}`
   const stat = fix.diffstat ? ` — ${fix.diffstat}` : ''
   // A rejected push leaves the fix committed; a failed commit leaves it only in the tree.
   if (pushFailed) {
@@ -2108,8 +2106,10 @@ const runCycle = async (cycle, entry) => {
       for (const x of rejected) {
         const d = decisions.get(x.id)
         if (!d.rejection) d.rejection = { sha: expectedHead, evidence: cut(x.evidence) }
-        recordHold({ findingId: x.id, commentId: d.commentId,
-          hold: again.includes(x) ? 'its fix writer rejected it again; the caller decides' : 'its fix writer rejected it with evidence; judged again next cycle' })
+        // Held on the harvested finding too, so the summary, rollup and launch_result report it as the state does; its verdict stays valid.
+        const f = current.get(x.id)
+        f.hold = again.includes(x) ? 'its fix writer rejected it again; the caller decides' : 'its fix writer rejected it with evidence; judged again next cycle'
+        recordHold(f)
       }
       if (again.length) {
         const detail = again.map(x => `${x.id}: rejected again by its writer — ${x.evidence}`).join('; ')
