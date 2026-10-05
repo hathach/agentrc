@@ -1479,19 +1479,42 @@ test('an inventory whose status or head contradicts its checks is never read as 
   }
 })
 
+// The evidence read waits until the review lane has ended at `label`.
+const afterReviewLane = (label) => async (calls) => {
+  for (let i = 0; i < 1000 && !calls.some(c => c.label.startsWith(label)); i++) await tick()
+  for (let i = 0; i < 20; i++) await tick()
+}
+
 test('a review push that lands while the evidence is read supersedes the judge', async () => {
   const { labels, logs, result } = await run({
     reviews: oneValid, args: { autoPush: true, maxCycles: 1 },
-    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] },
-    evidence: async (calls) => {
-      for (let i = 0; i < 1000 && !calls.some(c => c.label.startsWith('push#')); i++) await new Promise(r => setTimeout(r, 0))
-      for (let i = 0; i < 20; i++) await new Promise(r => setTimeout(r, 0))
-    },
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane('push#'),
   })
   assert.ok(labels.includes('ci:collect#1.f'))
   assert.equal(labels.includes('ci:judge#1'), false)
   assert.ok(logs.some(l => /review-lane push superseded the CI run/.test(l)), logs.join('\n'))
   assert.deepEqual(result.rollup.ciChecks, { judged: 0, partial: 0, reused: 0, unchanged: 0 }, 'a check the judge never saw is not counted judged')
+})
+
+test('a review lane that stops without publishing still has the concluded CI failures judged', async () => {
+  const { labels, result } = await run({
+    reviews: oneValid, verify: { addresses: false, reason: 'not addressed' }, args: { autoPush: true, maxCycles: 1 },
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane('check:'),
+  })
+  assert.equal(result.reason, 'fix-verification-failed')
+  assert.ok(labels.includes('ci:judge#1'))
+  assert.equal(result.rollup.ciChecks.judged, 1)
+  assert.equal(result.observation.ci.realFailures.length, 1)
+})
+
+test('a refused review push still supersedes the judge, and says so', async () => {
+  const { labels, logs, result } = await run({
+    reviews: oneValid, push: null, args: { autoPush: true, maxCycles: 1 },
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane('push#'),
+  })
+  assert.equal(result.reason, 'push-failed')
+  assert.equal(labels.includes('ci:judge#1'), false)
+  assert.ok(logs.some(l => /1 failing CI check\(s\) left unjudged — the review lane attempted to publish/.test(l)), logs.join('\n'))
 })
 
 // CI verdicts: digests carried in the state, verdicts in collect.py's store

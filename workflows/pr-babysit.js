@@ -1542,7 +1542,7 @@ const ciLaneRun = async (cycle, lanes) => {
       return null
     }
     left -= slice
-    if (inv.status !== 'running' || left < 30 || lanes.reviewPushed || lanes.ended) break
+    if (inv.status !== 'running' || left < 30 || lanes.reviewPublishing || lanes.ended) break
   }
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
   const shown = inv.pending > 0 ? 'running' : failing.length ? 'red' : null
@@ -1621,13 +1621,20 @@ const ciLaneRun = async (cycle, lanes) => {
     realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)))),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
-  if ((judging.length === 0 && gated.length === 0) || lanes.reviewPushed || lanes.ended) return report
+  if (judging.length === 0 && gated.length === 0) return report
+  // A review lane that ended without publishing leaves CI as it was: its concluded failures are still judged (#41).
+  const superseded = () => {
+    if (!lanes.reviewPublishing) return false
+    log(`cycle ${cycle}: ${judging.length + gated.length} failing CI check(s) left unjudged — the review lane attempted to publish`)
+    return true
+  }
+  if (superseded()) return report
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
   const ev = await collect(`ci:collect#${cycle}.f`, `failures ${[...links.map(l => `--check ${shq(l)}`), ...gated.map(c => `--gate ${shq(c.link)}`)].join(' ')}`, EVIDENCE)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
-  if (lanes.reviewPushed || lanes.ended) return report
+  if (superseded()) return report
   const evFault = faultOf(ev, inv.head)
   if (evFault) {
     log(`cycle ${cycle}: CI evidence not collected — ${evFault}`)
@@ -1698,7 +1705,7 @@ const ciLaneRun = async (cycle, lanes) => {
     ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v, ...placedWith })
   }
   // After a push these verdicts are never recalled; a lost one fails its digest and is judged again.
-  if (fresh.length && !lanes.reviewPushed) {
+  if (fresh.length && !lanes.reviewPublishing) {
     const stored = fresh.map(v => patches.has(v.link) ? { link: v.link, bucket: v.bucket, patch: patches.get(v.link) } : v)
     const why = faultOf(await collect(`ci:collect#${cycle}.w`, 'remember', REMEMBERED, stored), inv.head)
     if (why) log(`cycle ${cycle}: ${fresh.length} CI verdict(s) not stored — ${why}; judged again by a later launch`)
@@ -1712,7 +1719,7 @@ const ciLaneRun = async (cycle, lanes) => {
 // Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
   let ciPromise = null
-  const lanes = { reviewDone: !reviewLane, reviewPushed: false, ended: false }
+  const lanes = { reviewDone: !reviewLane, reviewPublishing: false, ended: false }
   // Settle the CI lane in finally so no CI agent outlives the workflow.
   try {
     entry.lane = lane
@@ -2054,6 +2061,8 @@ const runCycle = async (cycle, entry) => {
         log(`cycle ${cycle}: review-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
         return unverifiedStop(cycle, unverifiable)
       }
+      // Any attempt may have restarted CI, a refused or unknown one included.
+      lanes.reviewPublishing = true
       const push = await commitAndPush(cycle, 'review', owned, brief)
       if (!push.pass) {
         entry.reviewPushFailed = push
@@ -2061,7 +2070,6 @@ const runCycle = async (cycle, entry) => {
         return stop(cycle, 'push-failed')
       }
       entry.reviewPush = push
-      lanes.reviewPushed = true
       // One fix note per comment, built here: the read-back proves only a text the workflow chose.
       const answerable = new Map()
       for (const f of validFindings) {
@@ -2087,7 +2095,7 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: CI lane gave no report — re-arming`)
       return null
     }
-    if (lanes.reviewPushed) {
+    if (lanes.reviewPublishing) {
       log(`cycle ${cycle}: review-lane push superseded the CI run — re-arming`)
       return null
     }
