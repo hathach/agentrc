@@ -458,6 +458,71 @@ class FollowUpTest(ReplyCase):
         self.assertIn('mismatch on thread', out['inspected'][0]['error'])
 
 
+class ReceiptFileTest(ReplyCase):
+    """--receipt: a relay retry gets the first run's receipt back instead of a rerun's (#53)."""
+
+    def run_saved(self, path, body='not so'):
+        manifest = self.json_file({'replies': [{'commentId': 10, 'body': body, 'digest': reply.fnv1a(body)}]})
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = reply.main(['--pr', str(PR), '--repo', REPO, '--manifest', manifest, '--receipt', path])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_a_saved_receipt_is_replayed_without_calling_github(self):
+        self.gh.review_comment(10)
+        path = os.path.join(self.tmp, 'replies#1.json')
+        rc, first, _ = self.run_saved(path)
+        r = json.loads(first)['receipts'][0]
+        self.assertEqual((rc, r['sent'], r['posted']), (0, True, True))
+        with mock.patch.object(reply, 'gh', side_effect=AssertionError('a replay calls GitHub')):
+            self.assertEqual(self.run_saved(path)[:2], (0, first))
+        self.assertEqual(self.gh.mutations, [('post-reply', 10, 'not so'), ('resolve', 'T10')])
+
+    def test_a_saved_unverified_run_replays_its_exit_code_and_a_new_path_reads_again(self):
+        self.gh.review_comment(10)
+        real = self.gh.rest
+
+        def flaky(method, path, body, paginate):
+            if method == 'GET' and re.fullmatch(rf'repos/{REPO}/pulls/comments/\d+', path):
+                raise KeyError('HTTP 502')
+            return real(method, path, body, paginate)
+        self.gh.rest = flaky
+        path = os.path.join(self.tmp, 'replies#1.json')
+        rc, first, _ = self.run_saved(path)
+        self.assertEqual((rc, json.loads(first)['receipts'][0]['verified']), (1, None))
+        self.gh.rest = real
+        self.assertEqual(self.run_saved(path)[:2], (1, first))
+        rc, again, _ = self.run_saved(os.path.join(self.tmp, 'replies#2.json'))
+        r = json.loads(again)['receipts'][0]
+        self.assertEqual((rc, r['replyId'], r['sent'], r['posted'], r['verified'], r['resolved']), (0, 901, False, False, True, True))
+
+    def test_a_receipt_that_is_not_this_requests_sealed_line_is_refused_and_nothing_posts(self):
+        self.gh.review_comment(10)
+        path = os.path.join(self.tmp, 'replies#1.json')
+        self.run_saved(path)
+        saved = json.loads(Path(path).read_text())
+        tampered = {**saved, 'line': {**saved['line'], 'receipts': [{**saved['line']['receipts'][0], 'sent': False}]}}
+        for content, why in [('{"line"', 'unreadable'), (json.dumps({**saved, 'code': 3}), 'malformed'),
+                             (json.dumps(saved), 'another request'), (json.dumps(tampered), 'seal')]:
+            Path(path).write_text(content)
+            rc, out, err = self.run_saved(path, body='other words' if why == 'another request' else 'not so')
+            self.assertEqual((rc, out), (2, ''), why)
+            self.assertIn(why, err)
+        self.assertEqual(len(self.gh.mutations), 2, 'only the first run posted')
+
+    def test_a_receipt_that_cannot_be_saved_is_exit_2_with_the_line(self):
+        self.gh.review_comment(10)
+        path = os.path.join(self.tmp, 'replies#1.json')
+        with mock.patch.object(reply.os, 'replace', side_effect=OSError('disk full')):
+            rc, out, err = self.run_saved(path)
+        self.assertEqual((rc, json.loads(out)['receipts'][0]['posted'], os.path.exists(path)), (2, True, False))
+        self.assertIn('receipt not saved: disk full', err)
+
+    def test_inspect_takes_no_receipt(self):
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            reply.main(['--pr', str(PR), '--repo', REPO, '--inspect', '10', '--receipt', os.path.join(self.tmp, 'x')])
+
+
 class SealTest(ReplyCase):
     """The seal pr-babysit checks a relayed copy against, as its facts.py computes it."""
 

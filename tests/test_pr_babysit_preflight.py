@@ -39,6 +39,7 @@ class PreflightTest(unittest.TestCase):
         self.git('commit', '-q', '--allow-empty', '-m', 'one')
         self.git('push', '-q', '-u', 'origin', 'fix')
         self.fake_gh(json.dumps(VIEW))
+        self.enterContext(mock.patch.object(tempfile, 'tempdir', str(self.root)))
 
     def git(self, *argv, check=True):
         return subprocess.run(['git', *argv], check=check, capture_output=True, text=True).stdout
@@ -67,6 +68,9 @@ class PreflightTest(unittest.TestCase):
         (self.root / 'repo' / 'junk.o').write_text('x')
         code, out = self.pin()
         self.assertEqual(code, 0)
+        receipts = out.pop('receipts')
+        self.assertEqual((Path(receipts).parent, list(Path(receipts).iterdir())), (self.root / 'pr-babysit-receipts', []), 'a new empty directory')
+        self.assertNotEqual(self.pin()[1]['receipts'], receipts, 'one per launch')
         self.assertEqual(out, {
             'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prRepo': 'someone/tinyusb',
             'prUrl': VIEW['url'], 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],

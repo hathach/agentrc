@@ -77,7 +77,7 @@ const PIN = {
   prHead: HEAD, prBase: BASE, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
-  pr: 3888, badPushUrl: '',
+  pr: 3888, badPushUrl: '', receipts: '/tmp/pr-babysit-receipts-x',
 }
 // What the pre-publish recheck must still find: HEAD exactly where the run left it.
 const RECHECK = { branch: 'claude/foo', pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, staged: [], status: [] }
@@ -189,6 +189,8 @@ async function run(opts = {}) {
   let staged = [] // what the committer put in it, read back by the audit agent
   let validatorCalls = 0
   let brokenWriter = false // a writer reported a failed build since the last candidate build
+  const receiptFiles = new Map() // reply.py --receipt path -> the line its first run saved there
+  const replied = new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
 
   const agent = async (prompt, options) => {
     const label = options.label
@@ -355,8 +357,14 @@ async function run(opts = {}) {
             : opts.unreadable && opts.unreadable(commentId)
               ? { commentId, kind: 'review', replyId: 500 + commentId, digest, sent: true, posted: true, verified: null, resolved: null, error: 'read-back unavailable: HTTP 502' }
               : { commentId, kind: 'review', replyId: 500 + commentId, digest, sent: true, posted: true, verified: true, resolved: true, error: null }
+      const path = String(prompt).match(/--receipt '([^']+)'/)?.[1]
+      if (path && receiptFiles.has(path)) return receiptFiles.get(path)
       const receipts = [...entries.map(receipt), ...(opts.strayDoneIds || []).map(id => receipt({ commentId: id, digest: 'deadbeef' }))]
-      return { receipts: printed(opts.receipts ? opts.receipts(receipts, label) : receipts) }
+        .map(r => opts.rerunReuses && r.posted && replied.has(r.commentId) ? { ...r, sent: false, posted: false } : r)
+      for (const r of receipts) if (r.posted) replied.add(r.commentId)
+      const line = { receipts: printed(opts.receipts ? opts.receipts(receipts, label) : receipts) }
+      if (path) receiptFiles.set(path, line)
+      return line
     }
     if (label.startsWith('hooks#')) {
       if (opts.hooks === null) return null // a dead hook agent
@@ -674,7 +682,7 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -2504,6 +2512,23 @@ test('the cycle records what each posting lane reported', async () => {
   assert.equal(entry.fixNotePosts.receipts[0].digest, fnv1a(manifestOf(calls, 'resolve#1')[0].body))
   const dead = await run({ reviews: oneValid, posting: null })
   assert.deepEqual(dead.result.history[0].fixNotePosts, { pass: false, detail: 'agent died', receipts: [], replied: [] })
+})
+
+test("a posting relay whose copy fails its seal gets the first run's receipt back, not a rerun's (#53)", async () => {
+  const garble = (l, a) => a && /^(replies|resolve)#\d+$/.test(l) ? { ...a, seal: 'garbled' } : a
+  const { result, calls } = await run({
+    reviews: { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed' },
+    garble, rerunReuses: true,
+  })
+  for (const label of ['replies#1', 'resolve#1']) {
+    const paths = calls.filter(c => c.label.startsWith(label)).map(c => [c.label, c.prompt.match(/--receipt '([^']+)'/)?.[1]])
+    assert.deepEqual(paths, [[label, `${PIN.receipts}/${label}.json`], [`${label}.retry`, `${PIN.receipts}/${label}.json`]], 'the retry names the same file')
+  }
+  const { refutedPosts, fixNotePosts } = result.history[0]
+  for (const posts of [refutedPosts, fixNotePosts]) {
+    assert.equal(posts.pass, true)
+    assert.deepEqual(posts.receipts.map(r => [r.sent, r.posted]), [[true, true]], 'what the first run did')
+  }
 })
 
 test('every dismissal is challenged before it is posted', async () => {

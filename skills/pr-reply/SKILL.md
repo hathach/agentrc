@@ -30,6 +30,7 @@ python3 $R --pr <N> --reuse <file.json>
 # file.json: {"reuses": [{"commentId": ..., "replyId": ..., "bodyDigest": "...", "originalDigest": "..."}]}
 python3 $R --pr <N> --edit <file.json>
 # file.json: {"edits": [{"commentId": ..., "replyId": ..., "body": "...", "digest": "...", "bodyDigest": "...", "originalDigest": "..."}]}
+python3 $R --pr <N> --manifest <file.json> --receipt <path>   # also --reuse, --edit: replay a saved run
 ```
 
 Every entry carries the body's digest (FNV-1a, 32-bit, over code points); the
@@ -51,7 +52,11 @@ thread was resolved, false when GitHub refused to resolve it, left out when
 unknown: for the two kinds without a thread, or when an API error cut the
 resolve short), `error` (left out when there is none). Exit 0 when every reply is verified
 and every review thread resolved, 1 otherwise, 2 for a bad manifest or an
-unreachable repo.
+unreachable repo. `sent` and `posted` describe the run that recorded them, so a
+rerun that finds its earlier post reports both false; `verified` and `resolved`
+say whether the reply stands. A caller that may lose a run's output passes
+`--receipt <path>`: the same path again to get that run's receipt back, a
+fresh path when the replies must be read back anew.
 
 ## Judgment
 

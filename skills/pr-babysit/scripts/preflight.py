@@ -14,7 +14,8 @@ head; dirty, the lines of `git status --porcelain`; pr, echoed; and
 badPushUrl, the first push URL that is not github.com/<prRepo> over https or
 ssh (case-insensitive), every one when prUrl is not https on
 github.com, "(no push URL)" when there is none, "(empty push URL)" for an
-empty one, "" when all are.
+empty one, "" when all are; and receipts, a new empty directory under
+<tmp>/pr-babysit-receipts for this launch's reply.py --receipt files.
 
 --needs names a script the workflow will call; any that is not a file means
 the session runs a workflow definition older than the installed scripts, and
@@ -32,6 +33,7 @@ with {"error": ...} when git or gh cannot answer; the caller then pins nothing.
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -89,6 +91,12 @@ def recheck():
             'status': records(git('status', '--porcelain', '-z'))}
 
 
+def receipts_dir():
+    parent = Path(tempfile.gettempdir()) / 'pr-babysit-receipts'
+    parent.mkdir(exist_ok=True)
+    return tempfile.mkdtemp(dir=parent)
+
+
 def pin(pr):
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
     fields = 'headRefName,headRefOid,baseRefOid,headRepositoryOwner,headRepository,url'
@@ -106,7 +114,8 @@ def pin(pr):
             'pushUrls': urls,
             'head': git('rev-parse', 'HEAD').strip(),
             'dirty': git('status', '--porcelain').splitlines(),
-            'pr': pr, 'badPushUrl': bad_push_url(pr_facts['prUrl'], expected, urls)}
+            'pr': pr, 'badPushUrl': bad_push_url(pr_facts['prUrl'], expected, urls),
+            'receipts': receipts_dir()}
 
 
 def collect(argv):

@@ -597,10 +597,11 @@ const relayRetry = async (prompt, opts) => {
 const relayOnce = async (prompt, opts, retryPrompt = prompt) => (await relayRun(prompt, opts)) ?? relayRetry(retryPrompt, opts)
 const settles = (r) => r.verified === true && r.replyId !== null &&
   (r.kind === 'issue' || r.kind === 'review-body' || (r.kind === 'review' && r.resolved === true))
-// A rerun is safe: reply.py reuses a reply of ours rather than post again.
+// A rerun is safe: reply.py reuses a reply of ours rather than post again. The retry replays the first run's
+// saved receipt instead, so a reply that run posted is not reported as found there (#53).
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file and run ` +
-  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file>\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
+  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} <that file> --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 )
@@ -2296,7 +2297,7 @@ const runCycle = async (cycle, entry) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl'],
+  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
   properties: {
     error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
@@ -2304,7 +2305,7 @@ const PIN = withSeal({
     remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
-    pr: { type: 'integer' }, badPushUrl: { type: 'string' },
+    pr: { type: 'integer' }, badPushUrl: { type: 'string' }, receipts: { type: 'string' },
   },
 })
 if (cyclesUsed >= maxCycles) {

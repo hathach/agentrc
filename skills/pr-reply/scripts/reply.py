@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Post PR review replies from a manifest, read each back, resolve its thread.
 
-  reply.py --pr N --manifest FILE [--repo OWNER/NAME]
+  reply.py --pr N --manifest FILE [--repo OWNER/NAME] [--receipt PATH]
   reply.py --pr N --inspect COMMENT[:REPLY] [COMMENT[:REPLY] ...] [--repo OWNER/NAME]
-  reply.py --pr N --reuse FILE [--repo OWNER/NAME]
-  reply.py --pr N --edit FILE [--repo OWNER/NAME]
+  reply.py --pr N --reuse FILE [--repo OWNER/NAME] [--receipt PATH]
+  reply.py --pr N --edit FILE [--repo OWNER/NAME] [--receipt PATH]
 
 FILE: {"replies": [{"commentId": <int>, "body": "<text>", "digest": "<fnv1a>",
 "secondAnswer": <bool>}, ...]}, digest being the caller's FNV-1a (32-bit, over code points, 8 hex) of the body,
@@ -64,10 +64,22 @@ comment still that body, is edited to the body (quoted for the two kinds without
 thread), read back and, for a review reply, its thread resolved; one already carrying
 the body, from a rerun, is read back and resolved without another edit. Receipts as
 for a manifest, sent and posted meaning the edit.
+
+sent and posted describe the run that recorded them; a rerun that finds the
+reply there reports both false. verified and resolved say whether a reply
+stands. --receipt keeps the run's receipt line for a caller that may have to
+run the same request again after losing its output: PATH absent, the request
+runs and its line and exit code are saved to PATH before printing, or, when
+the save fails, the line is printed with exit 2; PATH present, the saved line
+is printed and its code returned with no GitHub call, when PATH holds this
+request ({repo as given, pr, mode, entries}) and a line whose seal matches;
+anything else there exits 2. A run that dies or fails to save leaves no
+receipt, and its rerun reports only what it did itself.
 """
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -473,6 +485,25 @@ def pair(text):
     return int(comment), int(reply_id) if sep else None
 
 
+def saved_receipt(path, request):
+    """The (line, code) saved at path for request, None when path is absent; ValueError for anything else there."""
+    try:
+        with open(path) as f:
+            saved = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise ValueError(f'receipt {path} is unreadable: {e}')
+    line = saved.get('line') if isinstance(saved, dict) else None
+    if not isinstance(line, dict) or saved.get('code') not in (0, 1) or not isinstance(line.get('receipts'), list):
+        raise ValueError(f'receipt {path} is malformed')
+    if saved.get('request') != request:
+        raise ValueError(f'receipt {path} is for another request')
+    if sealed({k: v for k, v in line.items() if k != 'seal'})['seal'] != line.get('seal'):
+        raise ValueError(f'receipt {path} does not match its seal')
+    return line, saved['code']
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--pr', type=int)
@@ -483,19 +514,28 @@ def main(argv=None):
     mode.add_argument('--edit', metavar='FILE')
     p.add_argument('--repo', help='OWNER/NAME (default: gh repo view)')
     p.add_argument('--digest', metavar='TEXT', help='print the digest of TEXT and exit')
+    p.add_argument('--receipt', metavar='PATH', help='replay the receipt saved at PATH, else save this run\'s there')
     a = p.parse_args(argv)
     if a.digest is not None:
         print(fnv1a(a.digest))
         return 0
     if a.pr is None or (a.manifest, a.inspect, a.reuse, a.edit) == (None, None, None, None):
         p.error('--pr and one of --manifest, --inspect, --reuse or --edit are required')
+    if a.receipt and a.inspect:
+        p.error('--receipt is for --manifest, --reuse and --edit')
     try:
         replies = load_entries(a.manifest, 'replies', 'manifest', check_reply) if a.manifest else None
         reuses = load_entries(a.reuse, 'reuses', 'reuse file', check_reuse) if a.reuse else None
         edits = load_entries(a.edit, 'edits', 'edit file', check_edit) if a.edit else None
+        request = {'repo': a.repo, 'pr': a.pr, 'mode': 'manifest' if replies else 'reuse' if reuses else 'edit',
+                   'entries': replies or reuses or edits}
+        saved = saved_receipt(a.receipt, request) if a.receipt else None
     except (OSError, ValueError, json.JSONDecodeError) as e:
         print(f'reply.py: {e}', file=sys.stderr)
         return 2
+    if saved:
+        print(json.dumps(saved[0]))
+        return saved[1]
     repo = a.repo
     if not repo:
         rc, out, err = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'])
@@ -514,10 +554,18 @@ def main(argv=None):
         return 0 if all(i['error'] is None for i in inspected) else 1
     receipts = ([reuse(poster, item) for item in reuses] if reuses else [edit(poster, item) for item in edits] if edits
                 else [handle(poster, item) for item in replies])
-    print(json.dumps(sealed({'receipts': [{k: v for k, v in r.items() if v is not None or k not in ('resolved', 'error')}
-                                          for r in receipts]})))
-    ok = all(r['verified'] is True and (r['kind'] != 'review' or r['resolved']) for r in receipts)
-    return 0 if ok else 1
+    line = sealed({'receipts': [{k: v for k, v in r.items() if v is not None or k not in ('resolved', 'error')} for r in receipts]})
+    code = 0 if all(r['verified'] is True and (r['kind'] != 'review' or r['resolved']) for r in receipts) else 1
+    if a.receipt:
+        try:
+            with open(a.receipt + '.tmp', 'w') as f:
+                json.dump({'request': request, 'line': line, 'code': code}, f)
+            os.replace(a.receipt + '.tmp', a.receipt)
+        except OSError as e:
+            print(f'reply.py: receipt not saved: {e}', file=sys.stderr)
+            code = 2
+    print(json.dumps(line))
+    return code
 
 
 if __name__ == '__main__':
