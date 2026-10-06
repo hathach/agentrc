@@ -1501,9 +1501,11 @@ const settleSonar = async (cycle, entry) => {
     .map(([commentId, a]) => ({ commentId, commentDigest: (a.sonarOf || a).digest, how: (a.sonarOf || a).how, note: a.sonar, digest: fnv1a(a.sonar) }))
   if (!markSonar || sonarDown || entry.sonar || items.length === 0) return 0
   const label = `sonar#${cycle}`
+  // One receipt per request and cycle: a retry, or the CI lane after both copies were lost, replays the run that marked (#55).
+  const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
   const r = await relayOnce(
     `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file and run ` +
-    `\`python3 ${SONAR_SCRIPT} --pr ${args.pr} --head ${expectedHead} --manifest <that file>\` ` + relayed(SONAR) +
+    `\`python3 ${SONAR_SCRIPT} --pr ${args.pr} --head ${expectedHead} --manifest <that file> --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
     ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`,
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }

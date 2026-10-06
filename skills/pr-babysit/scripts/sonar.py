@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Mark the SonarCloud issues behind a PR's code-scanning comments false positive.
 
-  sonar.py --pr N --head SHA --manifest FILE
+  sonar.py --pr N --head SHA --manifest FILE [--receipt PATH]
 
 FILE holds {"items": [{"commentId", "commentDigest", "how", "note", "digest"}]}:
 how is "refutation" or "fixNote", digest the workflow's fnv1a of note, and
@@ -22,7 +22,15 @@ $SONAR_TOKEN, which goes to https://sonarcloud.io only. Each item's outcome:
 
 stdout ends with one JSON line {results: [{commentId, issue, outcome, detail}],
 seal} (seal: facts.sealed). Exit 2 with {"error": ...} when the arguments or
-manifest are wrong or SONAR_TOKEN is unset, and then nothing was changed.
+manifest are wrong, SONAR_TOKEN is unset or the receipt is refused, and then
+nothing was changed.
+
+A rerun finds an issue the first run marked already resolved, so a caller that
+may lose a run's output passes --receipt: PATH absent, the run's line is saved
+there, or "receipt not saved" goes to stderr; PATH present, the saved line is
+printed with no GitHub or SonarCloud call when it is for this request ({pr,
+head, items}) and matches its seal, anything else there is refused. A fresh
+PATH reads every issue again.
 """
 
 import base64
@@ -36,7 +44,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, attempt, fnv1a, report  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, fnv1a, report, sealed  # noqa: E402
 from harvest import digest  # noqa: E402
 
 HOST = 'https://sonarcloud.io'
@@ -161,15 +169,46 @@ def items_of(path):
     return items
 
 
+def saved_results(path, request):
+    """The results saved at path for request, None when path is absent; Unusable for anything else there."""
+    try:
+        saved = json.loads(Path(path).read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise Unusable(f'receipt {path} is unreadable: {e}')
+    line = saved.get('line') if isinstance(saved, dict) else None
+    if not isinstance(line, dict) or not isinstance(line.get('results'), list):
+        raise Unusable(f'receipt {path} is malformed')
+    if saved.get('request') != request:
+        raise Unusable(f'receipt {path} is for another request')
+    if sealed({'results': line['results']})['seal'] != line.get('seal'):
+        raise Unusable(f'receipt {path} does not match its seal')
+    return line['results']
+
+
+def save(path, request, results):
+    try:
+        Path(path + '.tmp').write_text(json.dumps({'request': request, 'line': sealed({'results': results})}))
+        os.replace(path + '.tmp', path)
+    except OSError as e:
+        print(f'sonar.py: receipt not saved: {e}', file=sys.stderr)
+
+
 def mark(argv):
     p = Parser(prog='sonar.py', add_help=False)
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True)
     p.add_argument('--manifest', required=True)
+    p.add_argument('--receipt')
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.head):
         raise Unusable(f'not a full SHA: {a.head!r}')
     items = items_of(a.manifest)
+    request = {'pr': a.pr, 'head': a.head, 'items': items}
+    saved = saved_results(a.receipt, request) if a.receipt else None
+    if saved is not None:
+        return {'results': saved}
     token = os.environ.get('SONAR_TOKEN', '').strip()
     if not token:
         raise Unusable('SONAR_TOKEN is not set')
@@ -180,6 +219,8 @@ def mark(argv):
         except Failed as e:
             key, outcome, detail = None, 'failed', str(e)
         results.append({'commentId': item['commentId'], 'issue': key, 'outcome': outcome, 'detail': detail})
+    if a.receipt:
+        save(a.receipt, request, results)
     return {'results': results}
 
 

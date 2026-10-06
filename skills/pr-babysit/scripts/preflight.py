@@ -15,7 +15,8 @@ badPushUrl, the first push URL that is not github.com/<prRepo> over https or
 ssh (case-insensitive), every one when prUrl is not https on
 github.com, "(no push URL)" when there is none, "(empty push URL)" for an
 empty one, "" when all are; and receipts, a new empty directory under
-<tmp>/pr-babysit-receipts for this launch's reply.py --receipt files.
+<tmp>/pr-babysit-receipts for this launch's reply.py and sonar.py --receipt
+files.
 
 --needs names a script the workflow will call; any that is not a file means
 the session runs a workflow definition older than the installed scripts, and

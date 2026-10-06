@@ -21,7 +21,7 @@ python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, th
 python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
 python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head>  # audit from..to for adoption, full SHAs
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
-python3 $S/sonar.py --pr N --head <sha> --manifest <file>  # mark answered code-scanning comments' SonarCloud issues false positive
+python3 $S/sonar.py --pr N --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>'  # build the checkout as it stands
 python3 $S/state_transfer.py <saved output> [--chunks I,J]  # a stateRef's state as checksummed base64 chunks
 python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR]  # the caller's reading of a launch

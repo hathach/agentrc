@@ -7,7 +7,7 @@ import os
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -57,7 +57,8 @@ class SonarTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.manifest = Path(tmp.name) / 'm.json'
+        self.tmp = Path(tmp.name)
+        self.manifest = self.tmp / 'm.json'
         self.comments = {}
         self.enterContext(mock.patch.dict(os.environ, {'SONAR_TOKEN': 'tok'}))
         self.enterContext(mock.patch.object(sonar, 'attempt', self.gh))
@@ -68,13 +69,14 @@ class SonarTest(unittest.TestCase):
             return 1, '', 'gh: Not Found (HTTP 404)'
         return 0, json.dumps(self.comments[cid]), ''
 
-    def run_mark(self, fake, items, head=HEAD, manifest=None):
+    def run_mark(self, fake, items, head=HEAD, manifest=None, receipt=None):
         self.manifest.write_text(json.dumps(manifest or {'items': [
             {'commentId': c, 'commentDigest': self.digest(c), 'how': how, 'note': note, 'digest': sonar.fnv1a(note)}
             for c, how, note in items]}))
-        out = io.StringIO()
-        with mock.patch.object(sonar, 'sonar', fake), redirect_stdout(out):
-            code = sonar.report(sonar.mark, ['--pr', '7', '--head', head, '--manifest', str(self.manifest)], seal=True)
+        out, self.stderr = io.StringIO(), io.StringIO()
+        argv = ['--pr', '7', '--head', head, '--manifest', str(self.manifest)] + (['--receipt', str(receipt)] if receipt else [])
+        with mock.patch.object(sonar, 'sonar', fake), redirect_stdout(out), redirect_stderr(self.stderr):
+            code = sonar.report(sonar.mark, argv, seal=True)
         line = json.loads(out.getvalue().splitlines()[-1])
         return code, line
 
@@ -176,6 +178,43 @@ class SonarTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn('does not match its digest', line['error'])
         self.assertEqual(fake.calls, [])
+
+    def test_a_saved_receipt_is_replayed_without_github_sonarcloud_or_a_token_and_a_fresh_path_reads_again(self):
+        # A relay retry reruns the script: without the receipt it finds the issue resolved by the first run (#55).
+        self.comments[1] = scanning('K1')
+        fake = FakeSonar({'K1': 'OPEN'})
+        first = self.run_mark(fake, [(1, 'refutation', 'n')], receipt=self.tmp / 'sonar-1.json')
+        self.assertEqual(self.outcomes(first[1]), {1: ('marked', 'K1')})
+        calls = len(fake.calls)
+        with mock.patch.object(sonar, 'attempt', side_effect=AssertionError('a replay reads GitHub')), \
+                mock.patch.dict(os.environ, {'SONAR_TOKEN': ''}):
+            self.assertEqual(self.run_mark(fake, [(1, 'refutation', 'n')], receipt=self.tmp / 'sonar-1.json'), first)
+        self.assertEqual(len(fake.calls), calls, 'a replay asks SonarCloud nothing')
+        _, again = self.run_mark(fake, [(1, 'refutation', 'n')], receipt=self.tmp / 'sonar-2.json')
+        self.assertEqual(self.outcomes(again), {1: ('resolved', 'K1')})
+
+    def test_a_receipt_that_is_not_this_requests_sealed_line_is_refused_and_nothing_is_asked(self):
+        self.comments[1] = scanning('K1')
+        path = self.tmp / 'sonar-1.json'
+        self.run_mark(FakeSonar({'K1': 'OPEN'}), [(1, 'refutation', 'n')], receipt=path)
+        saved = json.loads(path.read_text())
+        tampered = {**saved, 'line': {**saved['line'], 'results': [{**saved['line']['results'][0], 'outcome': 'resolved'}]}}
+        for content, why, head in [('{"line"', 'unreadable', HEAD), (json.dumps({**saved, 'line': {}}), 'malformed', HEAD),
+                                   (json.dumps(saved), 'another request', OTHER), (json.dumps(tampered), 'seal', HEAD)]:
+            path.write_text(content)
+            fake = FakeSonar({'K1': 'OPEN'})
+            code, line = self.run_mark(fake, [(1, 'refutation', 'n')], head=head, receipt=path)
+            self.assertEqual(code, 2, why)
+            self.assertIn(why, line['error'])
+            self.assertEqual((fake.calls, fake.issues['K1']['status']), ([], 'OPEN'), why)
+
+    def test_a_receipt_that_cannot_be_saved_still_reports_the_run(self):
+        self.comments[1] = scanning('K1')
+        path = self.tmp / 'sonar-1.json'
+        with mock.patch.object(sonar.os, 'replace', side_effect=OSError('disk full')):
+            code, line = self.run_mark(FakeSonar({'K1': 'OPEN'}), [(1, 'refutation', 'n')], receipt=path)
+        self.assertEqual((code, self.outcomes(line), path.exists()), (0, {1: ('marked', 'K1')}, False))
+        self.assertIn('receipt not saved: disk full', self.stderr.getvalue())
 
     def test_the_token_is_not_sent_on_to_a_redirect(self):
         seen = []

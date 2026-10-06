@@ -189,7 +189,8 @@ async function run(opts = {}) {
   let staged = [] // what the committer put in it, read back by the audit agent
   let validatorCalls = 0
   let brokenWriter = false // a writer reported a failed build since the last candidate build
-  const receiptFiles = new Map() // reply.py --receipt path -> the line its first run saved there
+  const receiptFiles = new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
+  const sonarMarked = new Set() // comments whose SonarCloud issue a sonar.py run marked
   const replied = new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
 
   const agent = async (prompt, options) => {
@@ -442,12 +443,19 @@ async function run(opts = {}) {
       }))) }, label)
     }
     if (label.startsWith('sonar#')) {
-      // sonar.py's sealed line: every item marked unless opts.sonar(items, label) answers otherwise.
+      // sonar.py's sealed line: every item marked unless opts.sonar(items, label) answers otherwise, one this
+      // launch marked found resolved by a rerun; a --receipt path its first run saved replays that run's line.
+      const path = String(prompt).match(/--receipt '([^']+)'/)?.[1]
+      if (path && receiptFiles.has(path)) return receiptFiles.get(path)
       const items = payloadOf(prompt, 'Manifest').items
       const answer = typeof opts.sonar === 'function' ? opts.sonar(items, label)
-        : { results: items.map(x => ({ commentId: x.commentId, issue: `K${x.commentId}`, outcome: 'marked', detail: 'false positive' })) }
+        : { results: items.map(x => ({ commentId: x.commentId, issue: `K${x.commentId}`,
+          ...sonarMarked.has(x.commentId) ? { outcome: 'resolved', detail: 'RESOLVED FALSE-POSITIVE' } : { outcome: 'marked', detail: 'false positive' } })) }
       if (answer === null) return null
-      return conforms(options.schema, answer.error ? answer : sealLine(answer), label)
+      for (const x of answer.results || []) if (x.outcome === 'marked') sonarMarked.add(x.commentId)
+      const line = conforms(options.schema, answer.error ? answer : sealLine(answer), label)
+      if (path && !answer.error) receiptFiles.set(path, line)
+      return line
     }
     if (label.startsWith('build:resolve#')) {
       // The repository's build for the batch, resolved when the caller named none.
@@ -6109,6 +6117,40 @@ test('a waiting or failed issue stays owed and is listed unmarked, and a relay e
   assert.ok(down.calls.some(c => c.label === 'replies#2'), 'cycle 2 answered another code-scanning comment')
   assert.deepEqual(sonarOf(down.result.state).map(([id]) => id), [3, 4, 5])
   assert.deepEqual(down.result.sonarUnmarked.map(x => x.last.outcome), ['not asked', 'not asked', 'not asked'])
+})
+
+test("a sonar relay that loses the run that marked gets its line back and the SonarCloud gate is read again (#55)", async () => {
+  const sonarRed = { status: 'red', infraRerun: [], realFailures: [{ check: 'SonarCloud', workflow: '', firstError: 'Quality Gate failed', files: [], verdict: 'real' }] }
+  const receiptOf = (c) => [c.label, c.prompt.match(/--receipt '([^']+)'/)?.[1]]
+  const garbled = await run({ reviews: scanRefuted, ci: sonarRed, args: { autoPush: true, markSonar: true, maxCycles: 1 },
+    garble: (l, a) => l === 'sonar#1' ? { ...a, seal: 'garbled' } : a })
+  const [first, retry] = garbled.calls.filter(c => c.label.startsWith('sonar#')).map(receiptOf)
+  assert.match(first[1], new RegExp(`^${PIN.receipts}/sonar-1-[0-9a-f]{8}\\.json$`))
+  assert.deepEqual([first[0], retry], ['sonar#1', ['sonar#1.retry', first[1]]], 'the retry names the same file')
+  assert.deepEqual(garbled.result.history[0].sonar.map(x => x.outcome), ['marked'], 'what the first run did')
+  assert.ok(garbled.logs.some(l => /cycle 1: 1 SonarCloud issue\(s\) marked false positive — re-arming/.test(l)), garbled.logs.join('\n'))
+  // Both copies after the replies lost: the CI lane asks the same request again and gets the same run back.
+  let copies = 0
+  const lost = await run({ reviews: scanRefuted, ci: sonarRed, args: { autoPush: true, markSonar: true, maxCycles: 1 },
+    garble: (l, a) => l.startsWith('sonar#1') && ++copies <= 2 ? null : a })
+  assert.deepEqual(lost.calls.filter(c => c.label.startsWith('sonar#')).map(receiptOf),
+    [['sonar#1', first[1]], ['sonar#1.retry', first[1]], ['sonar#1', first[1]]])
+  assert.deepEqual(lost.result.history[0].sonar.map(x => x.outcome), ['marked'])
+  assert.ok(lost.logs.some(l => /re-arming to read the SonarCloud check again/.test(l)), lost.logs.join('\n'))
+  // The same request in the next cycle is read afresh: a waiting issue is not replayed as waiting.
+  let cycle = 0
+  const later = await run({
+    reviewsPerCycle: () => ++cycle === 1 ? { ...scanRefuted, bots: 'pending' } : { findings: [], replies: [], bots: 'reviewed' },
+    args: { autoPush: true, markSonar: true, maxCycles: 2 },
+    sonar: (items, l) => ({ results: items.map(x => ({ commentId: x.commentId, issue: `K${x.commentId}`,
+      ...l.startsWith('sonar#1') ? { outcome: 'waiting', detail: 'not analysed' } : { outcome: 'marked', detail: 'false positive' } })) }),
+  })
+  const runs = later.calls.filter(c => c.label.startsWith('sonar#')).map(receiptOf)
+  assert.deepEqual(runs.map(([l]) => l), ['sonar#1', 'sonar#2'], later.labels.join(', '))
+  assert.equal(runs[0][1], first[1], 'the path is the request\'s')
+  assert.match(runs[1][1], /\/sonar-2-[0-9a-f]{8}\.json$/)
+  assert.equal(runs[1][1].slice(-14), runs[0][1].slice(-14), 'the same request')
+  assert.deepEqual(later.result.history.map(h => h.sonar.map(x => x.outcome)), [['waiting'], ['marked']])
 })
 
 test('a mark re-arms only for SonarCloud\'s own check, not an Actions job named for the scanner', async () => {
