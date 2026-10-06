@@ -36,10 +36,13 @@ python3 $R --pr <N> --manifest <file.json> --receipt <path>   # also --reuse, --
 Every entry carries the body's digest (FNV-1a, 32-bit, over code points); the
 script refuses an entry whose body does not match it, so a body copied wrong
 never reaches the PR. A workflow computes the digests itself; by hand, use
-`--digest`. The original's digest is `scripts/comment_digest.py`'s, the one
-pr-babysit harvests with: what CodeRabbit rewrites at its comment's end does
-not change it. An inspection from before that rule has another digest: inspect
-again.
+`--digest`. A reply's digest, in a receipt, an inspection or a `--reuse` or
+`--edit` entry, is always its text's, the quote line left out, so a posting
+receipt's `digest` settles that reply under `--reuse`. The original's digest
+is `scripts/comment_digest.py`'s, the one pr-babysit harvests with: what
+CodeRabbit rewrites at its comment's end does not change it. An inspection or
+a saved receipt from before these rules may carry an older digest: inspect
+again, with a fresh receipt path.
 
 The last stdout line is `{"receipts": [...], "seal": ...}`, one receipt per manifest entry (the seal is pr-babysit's check that a relayed copy is exact):
 `kind` (`review`, `issue` or `review-body`; `none` when all three were searched

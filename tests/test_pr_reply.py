@@ -543,12 +543,13 @@ class SealTest(ReplyCase):
 class ReconcileTest(ReplyCase):
     """--inspect and --reuse: settle on a reply of ours already there, never posting."""
 
+    QUOTE20 = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\n'
+
     def reworded(self):
-        """Comment 20 and our quoting answer 901 in other words than any manifest now holds."""
+        """Comment 20 and our quoting answer 901 in other words than any manifest now holds; returns its text."""
         self.gh.issue_comment(20, 'three points')
-        body = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\nall three answered'
-        self.gh.issue_comment(901, body, ME)
-        return body
+        self.gh.issue_comment(901, self.QUOTE20 + 'all three answered', ME)
+        return 'all three answered'
 
     def test_inspect_reads_our_reply_and_both_digests(self):
         body = self.reworded()
@@ -565,8 +566,8 @@ class ReconcileTest(ReplyCase):
     def test_a_bare_comment_inspects_our_newest_reply_to_it(self):
         body = self.reworded()
         self.gh.issue_comment(905, 'someone else quoting', 'bot')
-        later = f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\nanswered by hand'
-        self.gh.issue_comment(906, later, ME)
+        later = 'answered by hand'
+        self.gh.issue_comment(906, self.QUOTE20 + later, ME)
         self.gh.review_comment(10, 'one point')
         self.gh.review_comment(55, 'first answer', ME, thread='T10', parent=10)
         self.gh.review_comment(57, 'newer answer', ME, thread='T10', parent=10)
@@ -613,11 +614,12 @@ class ReconcileTest(ReplyCase):
         good = {'commentId': 20, 'replyId': 901, 'bodyDigest': reply.fnv1a(body), 'originalDigest': reply.comment_digest.sha12('three points')}
         for change, expected in [
             (lambda: self.gh.issue[20].update(body='four points'), 'comment 20 was edited since the inspection'),
-            (lambda: self.gh.issue[901].update(body=body + ' and more'), 'reply 901 was edited since the inspection'),
+            (lambda: self.gh.issue[901].update(body=self.QUOTE20 + body + ' and more'), 'reply 901 was edited since the inspection'),
+            (lambda: self.gh.issue[901].update(body=self.QUOTE20.replace('-20', '-21') + body), 'mismatch on quote'),
             (lambda: self.gh.issue[901]['user'].update(login='bot'), 'mismatch on author'),
         ]:
             self.setUp()
-            body = self.reworded()
+            self.reworded()
             change()
             rc, receipts = self.reuse(good)
             self.assertEqual((rc, receipts[0]['verified']), (1, False))
@@ -651,9 +653,8 @@ class ReconcileTest(ReplyCase):
 
     def test_reuse_reads_a_review_body_afresh_too(self):
         self.gh.add_review(30, 'outside the diff: x')
-        quoted = f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\nnot so'
-        self.gh.issue_comment(901, quoted, ME)
-        rc, receipts = self.reuse({'commentId': 30, 'replyId': 901, 'bodyDigest': reply.fnv1a(quoted),
+        self.gh.issue_comment(901, f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\nnot so', ME)
+        rc, receipts = self.reuse({'commentId': 30, 'replyId': 901, 'bodyDigest': reply.fnv1a('not so'),
                                    'originalDigest': reply.comment_digest.sha12('outside the diff: x')})
         self.assertEqual((rc, receipts[0]['kind'], receipts[0]['verified']), (0, 'review-body', True))
 
@@ -679,14 +680,14 @@ class ReconcileTest(ReplyCase):
         rc, receipts = self.edit({'commentId': 20, 'replyId': 901, 'body': 'the draft', 'bodyDigest': reply.fnv1a(body),
                                   'originalDigest': reply.comment_digest.sha12('three points')})
         self.assertEqual((rc, receipts[0]['verified'], receipts[0]['resolved']), (0, True, None))
-        self.assertEqual(self.gh.mutations[-1], ('edit', 901, f'> https://github.com/{REPO}/pull/{PR}#issuecomment-20\n\nthe draft'))
+        self.assertEqual(self.gh.mutations[-1], ('edit', 901, self.QUOTE20 + 'the draft'))
 
     def test_edit_refuses_anything_changed_since_the_inspection(self):
         body = self.reworded()
         good = {'commentId': 20, 'replyId': 901, 'body': 'the draft', 'bodyDigest': reply.fnv1a(body), 'originalDigest': reply.comment_digest.sha12('three points')}
         for change, expected in [
             (lambda: self.gh.issue[20].update(body='four points'), 'comment 20 was edited since the inspection'),
-            (lambda: self.gh.issue[901].update(body=body + ' and more'), 'reply 901 was edited since the inspection'),
+            (lambda: self.gh.issue[901].update(body=self.QUOTE20 + body + ' and more'), 'reply 901 was edited since the inspection'),
             (lambda: self.gh.issue[901]['user'].update(login='bot'), 'mismatch on author'),
         ]:
             self.setUp()
@@ -726,6 +727,35 @@ class ReconcileTest(ReplyCase):
                                   'originalDigest': reply.comment_digest.sha12('two points')})
         self.assertEqual((rc, receipts[0]['posted'], receipts[0]['verified'], receipts[0]['resolved']), (1, True, False, None))
         self.assertFalse(self.gh.threads['T10']['resolved'])
+
+    def test_a_posting_or_edit_receipt_digest_settles_its_reply(self):
+        """#56: a quoted reply's receipt digest is its text's, the one --inspect and --reuse read back."""
+        self.gh.review_comment(10, 'two points')
+        self.gh.issue_comment(20, 'three points')
+        self.gh.add_review(30, 'outside the diff: x')
+        texts = {10: 'not so', 20: '> a quote of our own\n\nnot so', 30: 'not so either'}
+        rc, posted = self.run_script([{'commentId': c, 'body': t} for c, t in texts.items()])
+        self.assertEqual(rc, 0, posted)
+        rc, out = self.main('--inspect', *(f'{r["commentId"]}:{r["replyId"]}' for r in posted))
+        self.assertEqual([(i['body'], i['bodyDigest']) for i in out['inspected']], [(t, reply.fnv1a(t)) for t in texts.values()])
+        pairs = [{'commentId': r['commentId'], 'replyId': r['replyId'], 'bodyDigest': r['digest'],
+                  'originalDigest': i['originalDigest']} for r, i in zip(posted, out['inspected'])]
+        rc, receipts = self.reuse(*pairs)
+        self.assertEqual((rc, [(r['verified'], r['digest']) for r in receipts]), (0, [(True, r['digest']) for r in posted]))
+        rc, edited = self.edit(*({**p, 'body': 'reworded'} for p in pairs))
+        self.assertEqual(rc, 0, edited)
+        rc, receipts = self.reuse(*({**p, 'bodyDigest': r['digest']} for p, r in zip(pairs, edited)))
+        self.assertEqual((rc, [r['verified'] for r in receipts]), (0, [True] * 3))
+
+    def test_a_quoted_replys_whole_body_digest_from_before_56_needs_a_new_inspection(self):
+        text = self.reworded()
+        pair = {'commentId': 20, 'replyId': 901, 'originalDigest': reply.comment_digest.sha12('three points')}
+        rc, receipts = self.reuse({**pair, 'bodyDigest': reply.fnv1a(self.QUOTE20 + text)})
+        self.assertEqual((rc, receipts[0]['error']), (1, 'reply 901 was edited since the inspection'))
+        rc, out = self.main('--inspect', '20:901')
+        rc, receipts = self.reuse({**pair, 'bodyDigest': out['inspected'][0]['bodyDigest']})
+        self.assertEqual((rc, receipts[0]['verified']), (0, True))
+        self.assertEqual(self.gh.mutations, [])
 
     def test_bad_pairs_and_reuse_files_are_usage_errors(self):
         with self.assertRaises(SystemExit) as e:

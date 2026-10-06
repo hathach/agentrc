@@ -16,7 +16,8 @@ GitHub files every reply, and is read back: it must match the body, sit in that
 thread after the comment it answers, and carry our login and the PR, before the
 thread is resolved; the other two
 have no thread: the reply is an issue comment whose body is the original's URL
-as a quote line plus the text. A reply of ours with the identical body already
+as a quote line plus the text. Every reply digest here is the text's, the
+quote line left out. A reply of ours with the identical body already
 there is reused, never posted twice. A caller that lost its state would answer
 a comment again in new words, so any other reply of ours to it (an inline
 reply in its thread, or a comment of ours quoting it) is not posted over and
@@ -42,7 +43,7 @@ error is left out of the line: a model relaying it drops a trailing null.
 
 --inspect reads, never writes: for each pair, whether REPLY is ours answering
 COMMENT on this PR (a bare COMMENT names our newest reply to it, an error when
-there is none), its exact body with the body's digest, and the original's
+there is none), its exact text with the text's digest, and the original's
 digest as pr-babysit's harvest.py computes it (comment_digest.py), and the original's
 text. stdout ends with {"inspected": [{"commentId", "replyId", "kind", "body",
 "bodyDigest", "original", "originalDigest", "error"}], "seal"}; body is null when
@@ -54,7 +55,7 @@ pair was read and is ours, 1 otherwise.
 digests an inspection returned. Each pair is read again, and only a reply still
 ours, still that body, on a comment still that body, counts as verified; its
 review thread is then resolved. Receipts as above, sent and posted false, digest
-being the reply body's as read now.
+being the reply text's as read now.
 
 --edit puts the intended body on a reply of ours that went out with another: FILE is
 {"edits": [{"commentId", "replyId", "body", "digest", "bodyDigest", "originalDigest"}]},
@@ -291,6 +292,11 @@ def reply_body(kind, original, body):
     return body if kind == 'review' else issue_body(original, body)
 
 
+def reply_text(kind, original, body):
+    """A reply's text: its body less the quote line reply_body added, which read_pair has checked is there."""
+    return body[len(reply_body(kind, original, '')):]
+
+
 def is_fix_note(body):
     """pr-babysit's note for a landed fix, a different answer from a refutation of the same comment."""
     return body.partition('\n\n')[2].startswith('Fixed in ')
@@ -331,27 +337,28 @@ def inspect(poster, comment_id, reply_id):
         if why:
             out['error'] = why
         else:
-            out['body'], out['bodyDigest'] = c['body'], fnv1a(c['body'])
+            out['body'] = reply_text(kind, original, c['body'])
+            out['bodyDigest'] = fnv1a(out['body'])
     except ApiError as e:
         out['error'] = str(e)
     return out
 
 
 def read_again(poster, item, rc, done=None):
-    """(original, reply, why) as they stand now, rc's kind set once known; why names
-    what makes the pair not ours or changed since the inspection, None when neither.
-    A reply already carrying `done` (an edit that landed; quoted as issue_body quotes it) has not changed."""
+    """(original, reply text, why) as they stand now, rc's kind set once known, the text
+    None when the pair is not ours; why names what makes the pair not ours or changed
+    since the inspection, None when neither. A reply already carrying `done` (an edit that landed) has not changed."""
     kind, _ = poster.kind_of(item['commentId'])
     rc['kind'] = kind
     # Afresh for each entry: settling an earlier one may have moved this one.
     original = poster.read_original(kind, item['commentId']) if kind != 'none' else None
     c, why = read_pair(poster, kind, original, item['commentId'], item['replyId'])
+    text = None if why else reply_text(kind, original, c.get('body', ''))
     if not why and original_digest(original) != item['originalDigest']:
         why = f'comment {item["commentId"]} was edited since the inspection'
-    if not why and fnv1a(c.get('body', '')) != item['bodyDigest'] and (
-            done is None or c.get('body') != reply_body(kind, original, done)):
+    if not why and fnv1a(text) != item['bodyDigest'] and text != done:
         why = f'reply {item["replyId"]} was edited since the inspection'
-    return original, c, why
+    return original, text, why
 
 
 def receipt(comment_id, reply_id, digest):
@@ -363,9 +370,9 @@ def receipt(comment_id, reply_id, digest):
 def reuse(poster, item):
     rc = receipt(item['commentId'], item['replyId'], item['bodyDigest'])
     try:
-        _, c, why = read_again(poster, item, rc)
-        if c is not None:
-            rc['digest'] = fnv1a(c.get('body', ''))
+        _, text, why = read_again(poster, item, rc)
+        if text is not None:
+            rc['digest'] = fnv1a(text)
         if why:
             rc['error'] = why
             return rc
@@ -388,14 +395,14 @@ def edit(poster, item):
         rc['error'] = 'edit body does not match its digest'
         return rc
     try:
-        original, c, why = read_again(poster, item, rc, item['body'])
+        original, text, why = read_again(poster, item, rc, item['body'])
         if why:
             rc['error'] = why
             return rc
         kind = rc['kind']
         body = reply_body(kind, original, item['body'])
         # A rerun after a lost receipt finds its own edit there and does not make another.
-        if c.get('body') != body:
+        if text != item['body']:
             rc['sent'] = True
             poster.edit(kind, item['replyId'], body)
             rc['posted'] = True

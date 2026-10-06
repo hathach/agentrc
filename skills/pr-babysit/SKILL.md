@@ -76,7 +76,8 @@ The workflow's own contract (`workflows/pr-babysit.js`).
   topic's issue; the caller defers a held one by id.
 - `replySettlements`: `[{ commentId, commentDigest, replyId, bodyDigest, headSha }]`:
   the caller's verified reply on a comment the result handed off, judged to
-  answer it whole at `headSha`. Under `autoPush`, a cycle that harvests
+  answer it whole at `headSha`, `bodyDigest` as `reply.py`'s receipt or
+  inspection gives it. Under `autoPush`, a cycle that harvests
   reviews settles it when `headSha` is the expected HEAD after any adoption,
   no point of the comment is held, and `reply.py --reuse` returns a settling
   receipt: both digests read back and, in a review thread, the thread
