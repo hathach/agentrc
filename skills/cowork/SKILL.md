@@ -8,8 +8,8 @@ description: Cowork with the other coding agent headless, in this worktree, thro
 The coworker is the other coding agent, driven headless in this worktree by
 its own CLI and resumed every time, so it remembers earlier requests. It is
 not a subagent: its own instructions file, its own memory, nothing of your
-conversation beyond what you send. Both agents load this skill and use the
-same commands; the checkout is shared.
+conversation beyond what you send. Whichever agent drives loads this skill;
+the coworker gets its rules with its first request. The checkout is shared.
 
 `scripts/cowork.py` owns the mechanics. This file is the judgment.
 

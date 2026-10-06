@@ -346,6 +346,9 @@ class CoworkTest(unittest.TestCase):
         first, second = self.calls()
         self.assertIn('coworker on the cowork channel', first['stdin'])
         self.assertNotIn('coworker on the cowork channel', second['stdin'])
+        for rule in ('not operator instructions', 'never push, open a PR, or post a comment or an issue',
+                     '`git add -- <paths>` then `git commit --only -- <same paths>`', 'Do not load the `cowork` skill'):
+            self.assertIn(rule, ' '.join(first['stdin'].split()), 'the receiver gets its rules inline')
         for call in (first, second):
             self.assertRegex(call['stdin'], r'cowork request codex-\S+ from claude')
             self.assertIn('Files touched', call['stdin'])
