@@ -33,7 +33,8 @@ send died or detached, waiting for release with --wait and refusing a running
 request otherwise; reset removes everything of a lane, its worktree included
 once its branch is merged. Exit codes: 1 failed, 3 unknown
 or delivered request, a lane busy, not ready or of the wrong kind, or reset
-refused, 4 missing "Files touched" line or a changed tree during --no-edit.
+refused, 4 missing "Files touched" line, or a --no-edit turn that changed
+the tree or could not be checked (an unreadable tree runs no turn at all).
 """
 
 import argparse
@@ -176,8 +177,8 @@ def drop_lane(root, box):
         return
     branch = claim(tree, box)
     if git(root, 'merge-base', '--is-ancestor', branch, 'HEAD', check=False).returncode:
-        die(f'lane {lane} has commits on {branch} that HEAD lacks; merge or cherry-pick them first, '
-            f'or delete the branch', BUSY)
+        die(f'lane {lane} has commits on {branch} that HEAD lacks; merge the lane branch into this checkout, '
+            f'or integrate it by hand and retire the worktree (git worktree remove, then git branch -D)', BUSY)
     git(root, 'worktree', 'remove', str(tree))
     git(root, 'branch', '-q', '-d', branch)
     print(f'{side}/{lane}: worktree {tree} removed, branch {branch} deleted')
@@ -418,7 +419,12 @@ def run(side, box, host, request, no_edit, lock_fd):
         env = {k: v for k, v in os.environ.items()  # the coworker is nobody's driver
                if not k.startswith('HERDR_') and k not in ('CLAUDECODE', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID')}
         env['COWORK_TURN'] = request  # tells the simplify gate to stay out
-        before = tree_state(root) if no_edit else None
+        try:
+            before = tree_state(root) if no_edit else None
+        except SnapshotError as failure:  # the turn could not be checked, so it does not run
+            print(failure, file=sys.stderr)
+            status = 'unverified'
+            return
         with tempfile.TemporaryFile() as stdin, stream.open('ab') as out:
             stdin.write(prompt.encode())
             stdin.seek(0)
@@ -460,9 +466,14 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
             reply.write_text(result.get('result') or '', encoding='utf-8')
             if new_session:
                 update_side(box, session=new_session)
-    if status == '0' and before is not None and tree_state(root) != before:
-        print('the tree changed during a --no-edit turn; check git status', file=sys.stderr)
-        status = 'edited'
+    if status == '0' and before is not None:
+        try:
+            if tree_state(root) != before:
+                print('the tree changed during a --no-edit turn; check git status', file=sys.stderr)
+                status = 'edited'
+        except SnapshotError as failure:
+            print(failure, file=sys.stderr)
+            status = 'unverified'
     if side == 'codex' and status not in ('0', 'edited', 'killed'):  # a turn that produced a reply, or was cut
         # Codex reports an in-turn failure only as a JSONL event, with nothing on stderr
         for event in events(stream):
@@ -473,21 +484,38 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
     return status
 
 
+class SnapshotError(Exception):
+    """tree_state could not read the tree: a --no-edit turn stays unverified, never passes."""
+
+
 def tree_state(root):
     """HEAD, the index entries with their stages, and the worktree as git
     would stage it: what a coworker told not to edit must leave all three
-    alone. `ls-files -s` rather than `write-tree`, which refuses conflicts."""
-    def git(*args, **env):
-        return subprocess.run(['git', *args], cwd=root, capture_output=True, text=True,
-                              env={**os.environ, **env}).stdout
+    alone. `ls-files -s` rather than `write-tree`, which refuses conflicts.
+    An unborn HEAD and a missing index are states; any other failure raises."""
+    def git(*args, ok=(0,), quiet=False, **env):
+        done = subprocess.run(['git', *args], cwd=root, capture_output=True, text=True, env={**os.environ, **env})
+        if done.returncode not in ok or quiet and done.stderr:
+            raise SnapshotError(f'could not verify the tree: git {" ".join(args)}: '
+                                f'{done.stderr.strip() or f"exit {done.returncode}"}')
+        return done.stdout
     with tempfile.TemporaryDirectory() as scratch:
         index = os.path.join(scratch, 'index')  # a copy of the real one: tracked and staged files are never ignored
-        with contextlib.suppress(OSError):
-            shutil.copy(git('rev-parse', '--git-path', 'index').strip(), index)
+        try:
+            shutil.copy(os.path.join(root, git('rev-parse', '--git-path', 'index').strip()), index)
+        except FileNotFoundError:
+            pass  # nothing staged yet
+        except OSError as failure:
+            raise SnapshotError(f'could not verify the tree: copying the index: {failure}') from failure
         git('add', '-A', GIT_INDEX_FILE=index)
         git('add', '-A', '--renormalize', GIT_INDEX_FILE=index)  # rehash every tracked file: equal size and mtime prove nothing
         worktree = git('ls-files', '-s', GIT_INDEX_FILE=index)
-    return git('rev-parse', 'HEAD') + git('ls-files', '-s') + worktree
+    head = git('rev-parse', '-q', '--verify', 'HEAD', ok=(0, 1))
+    if not head:  # unborn only when HEAD names a branch that git lists nowhere, without complaint; a broken ref is neither
+        branch = git('symbolic-ref', '-q', 'HEAD').strip()
+        if git('for-each-ref', branch, quiet=True):
+            raise SnapshotError(f'could not verify the tree: {branch} exists but does not resolve')
+    return head + git('ls-files', '-s') + worktree
 
 
 def events(stream):
@@ -508,6 +536,9 @@ def verdict(box, request):
     status = exit_file.read_text().strip()
     if status == 'edited':
         return 'the tree changed during a --no-edit turn; check git status', MALFORMED
+    if status == 'unverified':
+        err = box / f'{request}.err'
+        return (text_of(err)[-2000:].strip() if err.exists() else '') or 'could not verify the tree', MALFORMED
     if status == '0':
         if FOOTER.search(text_of(box / f'{request}.reply')):
             return 'replied', 0
@@ -533,8 +564,10 @@ def deliver(box, request):
         else:
             if code == MALFORMED:
                 print(f'cowork request {request}: {what}', file=sys.stderr)
-            text = text_of(box / f'{request}.reply')
-        print(text, end='' if text.endswith('\n') else '\n', flush=True)
+            reply = box / f'{request}.reply'  # absent when an unverifiable turn never ran
+            text = text_of(reply) if reply.exists() else ''
+        if text:
+            print(text, end='' if text.endswith('\n') else '\n', flush=True)
         remove(box, request)
     return code
 

@@ -417,6 +417,45 @@ class CoworkTest(unittest.TestCase):
                 self.assertEqual(code, cowork.MALFORMED)
                 self.assertIn('tree changed', err)
 
+    def test_a_tree_it_cannot_snapshot_before_the_turn_runs_nothing(self):
+        code, _, _, _ = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, 0, 'an unborn HEAD and no index yet are a snapshot, not a failure')
+        self.commit('a.txt', 'a')
+        (self.root / '.git' / 'index').write_bytes(b'garbage')
+        ran = len(self.calls())
+        code, request, reply, err = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, cowork.MALFORMED)
+        self.assertIn('could not verify the tree', err)
+        self.assertIn('index', err.split('could not verify the tree', 1)[1], "git's own diagnostic is shown")
+        self.assertEqual(reply, '')
+        self.assertEqual(len(self.calls()), ran, 'the coworker never ran')
+        self.assertEqual(self.leftovers(request), [])
+
+    def test_a_broken_head_is_not_taken_for_an_unborn_one(self):
+        self.commit('a.txt', 'a')
+        (self.root / '.git' / 'refs' / 'heads' / 'main').write_text('garbage\n')
+        ran = len(self.calls())
+        code, _, reply, err = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, cowork.MALFORMED)
+        self.assertIn('could not verify the tree', err)
+        self.assertEqual((reply, len(self.calls())), ('', ran))
+
+    def test_a_tree_it_cannot_snapshot_after_the_turn_keeps_the_reply(self):
+        self.commit('a.txt', 'a')
+        self.codex_does("open('.git/index', 'wb').write(b'garbage')")
+        code, request, reply, err = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, cowork.MALFORMED)
+        self.assertIn('could not verify the tree', err)
+        self.assertIn('index', err.split('could not verify the tree', 1)[1])
+        self.assertEqual(reply, 'codex reply\nFiles touched: none\n')
+        self.assertEqual(self.leftovers(request), [])
+
+    def test_an_index_it_cannot_copy_is_a_snapshot_failure(self):
+        self.commit('a.txt', 'a')
+        with mock.patch.object(cowork.shutil, 'copy', side_effect=PermissionError('denied')):
+            with self.assertRaises(cowork.SnapshotError):
+                cowork.tree_state(self.root)
+
     def test_the_coworker_runs_at_the_root_without_the_drivers_pane_identity(self):
         sub = self.root / 'sub'
         sub.mkdir()
@@ -978,6 +1017,18 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('lane names are', err)
         self.send('--lane', 'review', '--read-only', '--task', 'again')  # a reset lane can be created anew, of either kind
         self.assertEqual(self.calls()[-1]['cwd'], str(self.root))
+
+    def test_reset_refuses_a_cherry_picked_lane_and_does_not_advise_cherry_picking(self):
+        self.commit('a.txt', 'a')
+        self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
+                        "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
+        self.send('--lane', 'impl', '--task', 'x')
+        self.commit('b.txt', 'b')
+        sh(self.root, 'git', 'cherry-pick', 'cowork/main/codex-impl')
+        code, _, err = self.run_cli('reset', 'codex', 'impl')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('merge the lane branch into this checkout, or integrate it by hand and retire the worktree', err)
+        self.assertNotIn('cherry-pick', err)
 
     def test_a_worktree_lane_survives_a_rewritten_host_history(self):
         self.commit('a.txt', 'a')

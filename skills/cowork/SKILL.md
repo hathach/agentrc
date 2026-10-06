@@ -60,8 +60,8 @@ Codex; `--to` overrides. `--no-edit` puts Claude in plan mode; Codex is asked
 and then checked, since its read-only sandbox would also forbid the temp
 files a test suite needs. Exit codes: 1 the turn failed, 3 unknown or
 delivered request, the lane busy, not ready or of the wrong kind, or reset
-refused, 4 the reply lacks its "Files touched" line or the tree changed under
-`--no-edit`.
+refused, 4 the reply lacks its "Files touched" line, or under `--no-edit` the
+tree changed or could not be checked, the latter with git's diagnostic.
 
 ## Lanes
 
