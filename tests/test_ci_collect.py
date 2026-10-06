@@ -485,6 +485,29 @@ class FailuresTest(unittest.TestCase):
             self.assertEqual(collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(99)]), 1)
         self.assertIn('stale snapshot', json.loads(out.getvalue())['error'])
 
+    def test_a_job_cancelled_before_any_step_ran_reads_no_log_and_no_base(self):
+        never = self.run_job(5, 1, None, name='hil (${{ matrix.display }})', conclusion='cancelled', steps=[], runner_id=None)
+        self.checks.append({'name': never['name'], 'workflow': 'Build', 'bucket': 'cancel', 'link': JOB.format(5)})
+        for runner in (None, 0):
+            self.jobs['5'] = {**never, 'runner_id': runner}
+            self.calls.clear()
+            with mock.patch.object(collect, 'actions_log', side_effect=AssertionError('a log was read')):
+                c = self.entries(JOB.format(5))[0]
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(5)])
+            self.assertEqual({k: c[k] for k in ('cancelledBeforeStart', 'log', 'base', 'cells', 'files', 'diagnostics', 'error')},
+                             {'cancelledBeforeStart': True, 'log': None, 'base': None, 'cells': [], 'files': [], 'diagnostics': [], 'error': None})
+            self.assertEqual((c['firstError'], c['signature']), (collect.NEVER_STARTED, collect.NEVER_STARTED))
+            self.assertEqual(unsealed(out.getvalue())['bases'], [{'link': JOB.format(5), 'base': None}], 'the same token failures printed')
+            self.assertFalse([call for call in self.calls if call[:2] == ['run', 'list']], 'no base run is looked up')
+        self.logs['5'] = log(*STEP)
+        for over in ({'steps': [{'name': 'Set up job'}]}, {'steps': ...}, {'runner_id': 12}, {'runner_id': ...}, {'conclusion': 'failure'}):
+            self.jobs['5'] = {k: v for k, v in {**never, **over}.items() if v is not ...}
+            c = self.entries(JOB.format(5))[0]
+            self.assertNotIn('cancelledBeforeStart', c, over)
+            self.assertTrue(c['log'], over)
+
     def test_bases_refuses_a_job_of_another_head_and_a_head_that_moved(self):
         def bases():
             out = io.StringIO()

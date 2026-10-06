@@ -43,7 +43,10 @@ executed it, and `executedBefore`, whether an earlier attempt executed the same
 job (null when that cannot be told), and the newest run on the PR's base commit
 in which the same job ran, else the newest such run on the base branch (the
 detail file's baseSha tells which), with its conclusion and the diagnostic lines both
-share, and `cells`. Cells are an adapter for tinyusb's test/hil/hil_test.py:
+share, and `cells`. A job cancelled before any step ran (no steps, no
+runner) has no log: its entry has `cancelledBeforeStart`, `log` and `base`
+null, no cells, and NEVER_STARTED as firstError and signature.
+Cells are an adapter for tinyusb's test/hil/hil_test.py:
 each terminal failure row (`Failed:` or `Flash Failed:`) of its result table,
 `[<time> ]<board>  <test>  ...  <outcome>`, as {cell "<board> <test>",
 signature ("<cell>: " and the outcome up to the two spaces before the board's
@@ -131,6 +134,7 @@ HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HI
 HIL_FAILED = ('Failed:', 'Flash Failed:')
 LINE = 500
 SONARCLOUD = 'https://sonarcloud.io'
+NEVER_STARTED = 'GitHub Actions job cancelled before any step ran'
 COMPARATOR = {'GT': '>', 'LT': '<'}
 CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
 
@@ -538,16 +542,23 @@ def base_run(repo, base_ref, base_sha, workflow, name, cache):
     return None
 
 
+def never_started(record):
+    """A job cancelled before a runner took it, such as a duplicate run concurrency cancelled: GitHub keeps no log for it."""
+    return record.get('conclusion') == 'cancelled' and record.get('steps') == [] and record.get('runner_id', -1) in (None, 0)
+
+
 def actions(repo, head, base_ref, base_sha, job, folder, cache, record=None):
     record = record or gh('api', f'repos/{repo}/actions/jobs/{job}')
     if record.get('head_sha') != head:
         raise Failed(f'job {job} ran on {record.get("head_sha")}, not the head {head}')
+    entry = {'name': record['name'], 'workflow': record.get('workflow_name', ''), 'runId': record.get('run_id'),
+             'runAttempt': record.get('run_attempt')}
+    if never_started(record):
+        return {**entry, 'log': None, 'cancelledBeforeStart': True, **evidence([], NEVER_STARTED), 'base': None, 'cells': []}
     full = actions_log(repo, job)
     section, exit_line = failed_steps(full)
     failed = failed_rows(full)
-    entry = {'name': record['name'], 'workflow': record.get('workflow_name', ''), 'runId': record.get('run_id'),
-             'runAttempt': record.get('run_attempt'), 'log': save(folder, f'actions-{job}.log', full),
-             **evidence(section, exit_line, {row[2] for row in failed.values()})}
+    entry.update(log=save(folder, f'actions-{job}.log', full), **evidence(section, exit_line, {row[2] for row in failed.values()}))
     base = base_run(repo, base_ref, base_sha, entry['workflow'], record['name'], cache)
     base_rows = None
     if base and (base['conclusion'] == 'failure' or (failed and base['conclusion'] == 'success')):
@@ -748,7 +759,8 @@ def bases(repo, pr, head, links):
             record = failing[link].get('record') or gh('api', f'repos/{repo}/actions/jobs/{ident}')
             if record.get('head_sha') != head:
                 raise Failed(f'job {ident} ran on {record.get("head_sha")}, not the head {head}')
-            base = base_run(repo, now['baseRef'], now['baseSha'], record.get('workflow_name', ''), record['name'], cache)
+            if not never_started(record):
+                base = base_run(repo, now['baseRef'], now['baseSha'], record.get('workflow_name', ''), record['name'], cache)
         out.append({'link': link, 'base': base_token(base)})
     after = pull(repo, pr)['headRefOid']
     if after != head:
