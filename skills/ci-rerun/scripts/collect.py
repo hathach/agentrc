@@ -40,8 +40,9 @@ Actions job, but only tails for the others: the last 150 lines of each failed
 CircleCI step and Read the Docs' notes with 40-line tails of failed commands.
 For an Actions job the entry also holds `runAttempt`, the attempt that
 executed it, and `executedBefore`, whether an earlier attempt executed the same
-job (null when that cannot be told), and the newest run on the base branch in
-which the same job ran, with its conclusion and the diagnostic lines both
+job (null when that cannot be told), and the newest run on the PR's base commit
+in which the same job ran, else the newest such run on the base branch (the
+detail file's baseSha tells which), with its conclusion and the diagnostic lines both
 share, and `cells`. Cells are an adapter for tinyusb's test/hil/hil_test.py:
 each terminal failure row (`Failed:` or `Flash Failed:`) of its result table,
 `[<time> ]<board>  <test>  ...  <outcome>`, as {cell "<board> <test>",
@@ -273,7 +274,7 @@ def inventory(repo, pr, head, wait):
     after = pull(repo, pr)
     if after['headRefOid'] != head:
         raise Failed(f'PR #{pr} head moved to {after["headRefOid"]} while collecting')
-    return {'head': head, 'baseRef': before['baseRefName'], 'status': summary(checks, after.get('mergeable'))[0],
+    return {'head': head, 'baseRef': before['baseRefName'], 'baseSha': before['baseRefOid'], 'status': summary(checks, after.get('mergeable'))[0],
             'mergeable': after['mergeable'], 'counts': counts, 'checks': listed}
 
 
@@ -518,23 +519,26 @@ def actions_log(repo, job):
     return clean(gh('api', f'repos/{repo}/actions/jobs/{job}/logs', '--allow-escape-sequences', raw=True))
 
 
-def base_run(repo, base_ref, workflow, name, cache):
-    """The newest completed run on the base branch in which a job of this name ran."""
-    runs = cache.setdefault('runs', {})
-    if workflow not in runs:
-        runs[workflow] = [run for run in gh('run', 'list', '--repo', repo, '--branch', base_ref, '--workflow', workflow,
-                                             '--limit', '20', '--json', 'databaseId,headSha,status')
-                           if run['status'] == 'completed']
-    for run in runs[workflow]:
-        if 'jobs' not in run:
-            run['jobs'] = gh('run', 'view', str(run['databaseId']), '--repo', repo, '--json', 'jobs')['jobs']
-        job = next((j for j in run['jobs'] if j['name'] == name and j.get('conclusion') not in (None, '', 'skipped', 'cancelled')), None)
-        if job:
-            return {'sha': run['headSha'], 'runId': run['databaseId'], 'jobId': job['databaseId'], 'conclusion': job['conclusion']}
+def base_run(repo, base_ref, base_sha, workflow, name, cache):
+    """The newest completed run on the base commit in which a job of this name ran, else the newest on the base branch."""
+    runs, jobs = cache.setdefault('runs', {}), cache.setdefault('jobs', {})
+    # GitHub's branch listing has served runs a month stale (#52); the commit listing names the exact base.
+    for key, filt in (((workflow, base_sha), ('--commit', base_sha)), ((workflow, base_ref), ('--branch', base_ref))):
+        if key not in runs:
+            runs[key] = [run for run in gh('run', 'list', '--repo', repo, *filt, '--workflow', workflow,
+                                           '--limit', '20', '--json', 'databaseId,headSha,headBranch,status')
+                         if run['status'] == 'completed' and run['headBranch'] == base_ref
+                         and (filt[0] == '--branch' or run['headSha'] == base_sha)]
+        for run in runs[key]:
+            if run['databaseId'] not in jobs:
+                jobs[run['databaseId']] = gh('run', 'view', str(run['databaseId']), '--repo', repo, '--json', 'jobs')['jobs']
+            job = next((j for j in jobs[run['databaseId']] if j['name'] == name and j.get('conclusion') not in (None, '', 'skipped', 'cancelled')), None)
+            if job:
+                return {'sha': run['headSha'], 'runId': run['databaseId'], 'jobId': job['databaseId'], 'conclusion': job['conclusion']}
     return None
 
 
-def actions(repo, head, base_ref, job, folder, cache, record=None):
+def actions(repo, head, base_ref, base_sha, job, folder, cache, record=None):
     record = record or gh('api', f'repos/{repo}/actions/jobs/{job}')
     if record.get('head_sha') != head:
         raise Failed(f'job {job} ran on {record.get("head_sha")}, not the head {head}')
@@ -544,7 +548,7 @@ def actions(repo, head, base_ref, job, folder, cache, record=None):
     entry = {'name': record['name'], 'workflow': record.get('workflow_name', ''), 'runId': record.get('run_id'),
              'runAttempt': record.get('run_attempt'), 'log': save(folder, f'actions-{job}.log', full),
              **evidence(section, exit_line, {row[2] for row in failed.values()})}
-    base = base_run(repo, base_ref, entry['workflow'], record['name'], cache)
+    base = base_run(repo, base_ref, base_sha, entry['workflow'], record['name'], cache)
     base_rows = None
     if base and (base['conclusion'] == 'failure' or (failed and base['conclusion'] == 'success')):
         base_full = actions_log(repo, base['jobId'])
@@ -697,7 +701,7 @@ def failures(repo, pr, head, links, gates=()):
         try:
             if kind == 'actions':
                 entry['executedBefore'] = check['executedBefore']
-                entry.update(actions(repo, head, now['baseRef'], ident, folder, cache, check.get('record')))
+                entry.update(actions(repo, head, now['baseRef'], now['baseSha'], ident, folder, cache, check.get('record')))
             elif kind == 'readthedocs':
                 entry.update(readthedocs(link, folder, cache))
             elif kind == 'circleci':
@@ -709,7 +713,7 @@ def failures(repo, pr, head, links, gates=()):
         checks.append(entry)
     unread = prior_verdicts(repo, pr, head, checks)
     read = [gate(link, pr) for link in gates]
-    out = {'head': head, 'baseRef': now['baseRef'], **({'priorErrors': unread} if unread else {})}
+    out = {'head': head, 'baseRef': now['baseRef'], 'baseSha': now['baseSha'], **({'priorErrors': unread} if unread else {})}
     if any(c['error'] is None for c in checks):
         out['changed'], why = changed_paths(repo, pr)
         if why:
@@ -744,7 +748,7 @@ def bases(repo, pr, head, links):
             record = failing[link].get('record') or gh('api', f'repos/{repo}/actions/jobs/{ident}')
             if record.get('head_sha') != head:
                 raise Failed(f'job {ident} ran on {record.get("head_sha")}, not the head {head}')
-            base = base_run(repo, now['baseRef'], record.get('workflow_name', ''), record['name'], cache)
+            base = base_run(repo, now['baseRef'], now['baseSha'], record.get('workflow_name', ''), record['name'], cache)
         out.append({'link': link, 'base': base_token(base)})
     after = pull(repo, pr)['headRefOid']
     if after != head:

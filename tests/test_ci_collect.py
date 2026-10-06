@@ -223,9 +223,10 @@ class FailuresTest(unittest.TestCase):
         self.attempts = {}   # attempt number -> the jobs of run 7 at that attempt, on one page
         self.paged = {}      # attempt number -> its pages as gh --slurp prints them, when not one
         self.logs = {'3': log(*STEP), '40': log(*STEP[:9], 'Total failed: 1', *STEP[11:])}
-        self.base_runs = [{'databaseId': 71, 'headSha': 'd' * 40, 'status': 'in_progress'},
-                          {'databaseId': 72, 'headSha': 'e' * 40, 'status': 'completed'},
-                          {'databaseId': 70, 'headSha': BASE, 'status': 'completed'}]
+        self.base_runs = [{'databaseId': 71, 'headSha': 'd' * 40, 'headBranch': 'master', 'status': 'in_progress'},
+                          {'databaseId': 72, 'headSha': 'e' * 40, 'headBranch': 'master', 'status': 'completed'},
+                          {'databaseId': 70, 'headSha': BASE, 'headBranch': 'master', 'status': 'completed'}]
+        self.commit_runs = []   # what `gh run list --commit BASE` answers; None fails it
         self.run_jobs = {'72': [{'name': 'hil (x.json)', 'conclusion': 'skipped', 'databaseId': 41}],
                          '70': [{'name': 'hil (x.json)', 'conclusion': 'failure', 'databaseId': 40}]}
         self.changed = ['src/host/msc.c', 'test/hil/tiny usb.json']
@@ -246,6 +247,8 @@ class FailuresTest(unittest.TestCase):
                 if self.changed is None:
                     return mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 500')
                 return ok([[{'filename': f, 'patch': '@@'} for f in self.changed]])
+            if argv[1:3] == ['run', 'list'] and '--commit' in argv:
+                return ok(self.commit_runs) if self.commit_runs is not None else mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 502')
             if argv[1:3] == ['run', 'list']:
                 return ok(self.base_runs)
             if argv[1:3] == ['run', 'view']:
@@ -317,6 +320,32 @@ class FailuresTest(unittest.TestCase):
     def test_the_base_run_is_the_newest_completed_one_in_which_the_job_ran(self):
         self.main(JOB.format(3))
         self.assertEqual([c[2] for c in self.calls if c[:2] == ['run', 'view']], ['72', '70'])
+
+    def test_the_run_on_the_base_commit_wins_over_a_stale_branch_listing(self):
+        # #52: the branch listing served a month-old run while the base commit had its own.
+        self.base_runs = [{'databaseId': 60, 'headSha': 'f' * 40, 'headBranch': 'master', 'status': 'completed'}]
+        self.commit_runs = [{'databaseId': 75, 'headSha': BASE, 'headBranch': 'master', 'status': 'in_progress'},
+                            {'databaseId': 70, 'headSha': BASE, 'headBranch': 'master', 'status': 'completed'}]
+        self.run_jobs['60'] = [{'name': 'hil (x.json)', 'conclusion': 'failure', 'databaseId': 61}]
+        rc, r = self.main(JOB.format(3))
+        detail = json.loads(Path(r['detail']).read_text())
+        self.assertEqual((detail['baseSha'], detail['checks'][0]['base']['runId']), (BASE, 70))
+        self.assertFalse([c for c in self.calls if c[:2] == ['run', 'list'] and '--branch' in c], 'no fallback')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(3)])
+        self.assertEqual(unsealed(out.getvalue())['bases'], r['bases'], 'bases picks the same run')
+
+    def test_a_base_commit_run_without_the_job_or_off_the_base_branch_falls_back_to_the_branch(self):
+        self.commit_runs = [{'databaseId': 73, 'headSha': BASE, 'headBranch': 'feature', 'status': 'completed'},
+                            {'databaseId': 72, 'headSha': BASE, 'headBranch': 'master', 'status': 'completed'}]
+        self.assertEqual(self.entries(JOB.format(3))[0]['base']['runId'], 70)
+        self.assertEqual([c[2] for c in self.calls if c[:2] == ['run', 'view']], ['72', '70'], 'another branch\'s run is never read, a run listed twice is read once')
+
+    def test_a_failed_base_commit_listing_is_an_error_not_a_fallback(self):
+        self.commit_runs = None
+        self.assertIn('HTTP 502', self.entries(JOB.format(3))[0]['error'])
+        self.assertFalse([c for c in self.calls if c[:2] == ['run', 'list'] and '--branch' in c])
 
     def test_a_base_run_that_passed_carries_no_lines(self):
         self.run_jobs['70'][0]['conclusion'] = 'success'
@@ -640,7 +669,7 @@ class FailuresTest(unittest.TestCase):
         self.run_jobs['70'].append({'name': 'build (x)', 'conclusion': 'success', 'databaseId': 42})
         self.logs['42'] = log('pico  host/msc  ...  OK in 1.0s')
         self.entries(JOB.format(3), JOB.format(4))
-        self.assertEqual(sum(c[:2] == ['run', 'list'] for c in self.calls), 1)
+        self.assertEqual(sum(c[:2] == ['run', 'list'] for c in self.calls), 2, 'one per listing, commit then branch')
         self.assertEqual([c[2] for c in self.calls if c[:2] == ['run', 'view']], ['72', '70'], 'each run is read once')
 
     def test_a_log_that_is_not_utf8_is_still_read(self):
@@ -734,7 +763,7 @@ class FailuresTest(unittest.TestCase):
 
     def test_gates_alone_write_an_empty_detail_file_read_no_changed_paths_and_check_the_head_again(self):
         r, _ = self.gates({'status': 'ERROR', 'conditions': []})
-        self.assertEqual(json.loads(Path(r['detail']).read_text()), {'head': HEAD, 'baseRef': 'master', 'checks': []})
+        self.assertEqual(json.loads(Path(r['detail']).read_text()), {'head': HEAD, 'baseRef': 'master', 'baseSha': BASE, 'checks': []})
         self.assertFalse([c for c in self.calls if c[:2] == ['api', '--paginate'] and '/pulls/' in c[3]], 'no changed paths')
         self.assertEqual(sum(c[:2] == ['pr', 'view'] for c in self.calls), 3, 'inventory reads the head twice, the gates once more')
 
