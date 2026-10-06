@@ -18,7 +18,7 @@ the coworker gets its rules with its first request. The checkout is shared.
 ```bash
 S=<skill dir>/scripts/cowork.py
 
-python3 $S send (--task "..." | --task -) [--lane L] [--read-only] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach]
+python3 $S send (--task "..." | --task -) [--lane L] [--read-only | --worktree] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach]
 python3 $S kill <id>             # the running request, with all it spawned
 python3 $S read [--wait] <id>    # a detached or dead sender's reply; --wait blocks until ready
 python3 $S status                # lanes and undelivered requests
@@ -71,23 +71,24 @@ Three kinds:
 
 - `main` works in this checkout, sees your uncommitted work and edits your
   tree.
-- A lane created with `--read-only` on its first send works in this checkout
-  too, and every send to it is `--no-edit`, so several reviewers can read
-  your uncommitted work at once without any of them touching it.
-- Any other lane works in its own worktree, `.worktrees/cowork-<side>-<lane>`
-  on branch `cowork/<host branch>/<side>-<lane>`, created on its first send.
-  Before every send the script brings that tree to your HEAD: the lane's own
-  commits, those since the last sync, are rebased on top, even after you
-  amended or folded the host history under it; a dirty tree or a rebase
-  conflict refuses the send with exit 3 and names the files. It sees commits
-  only: commit first to share uncommitted work. The request header tells the
-  coworker its worktree, branch and base commit. Its commits come back the
-  way any branch's do: you merge or cherry-pick the lane branch.
+- Any other lane works in this checkout too, read-only: every send to it is
+  `--no-edit`, so several reviewers can read your uncommitted work at once
+  without any of them touching it. `--read-only` asserts that kind, refused
+  on `main` or a worktree lane.
+- A lane whose first send says `--worktree` works in its own worktree,
+  `.worktrees/cowork-<side>-<lane>` on branch `cowork/<host branch>/<side>-<lane>`,
+  created at your HEAD and never moved by the script; a dirty tree refuses
+  the send with exit 3 and names the files. Use it where the coworker must
+  not see your uncommitted work, as in `co-test`, or for a parallel edit.
+  To hand it newer commits, merge them in its tree yourself. The request
+  header tells the coworker its worktree, branch and starting commit. Its
+  commits come back the way any branch's do: you merge the lane branch.
 
-`reset <side> <lane>` forgets the lane; for a worktree lane it also removes
-the tree and deletes the branch, and refuses while the tree is dirty or the
-branch has commits your HEAD lacks. `reset <side> all` does every lane.
-Lane names are `[a-z0-9-]`. `status` shows each lane with its kind.
+A lane keeps its kind until `reset <side> <lane>` forgets it; for a
+worktree lane that also removes the tree and deletes the branch, and is
+refused while the tree is dirty or the branch has commits your HEAD lacks.
+`reset <side> all` does every lane. Lane names are `[a-z0-9-]`. `status`
+shows each lane with its kind.
 
 A Codex lane runs on a tier, chosen by role:
 
@@ -106,12 +107,11 @@ A Codex lane runs on a tier, chosen by role:
 A new lane starts on `default`, and a send without `--tier` keeps the lane's
 tier. A flip reaches every `default` lane on its next send; the model
 change likely forfeits an active lane's prompt cache on that turn, so flip
-between tasks. Either `--model` or `--effort` pins a lane outside the
-tiers, keeping the other value; a lane from before tiers stays
-pinned until a send names one. A Claude coworker has no tiers: it takes
-`--model` and `--effort`, else `opus` at `high`, and keeps them. `reset`
-forgets all of it; `status` shows each lane's pair and its tier or `pinned`,
-and the request header tells the coworker its pair.
+between tasks. A Codex lane runs on tiers only: one pinned to a model
+before is refused until a send names its `--tier`. A Claude coworker has no
+tiers: it takes `--model` and `--effort`, else `opus` at `high`, and keeps
+them. `reset` forgets all of it; `status` shows each lane's pair and its
+tier or `pinned`, and the request header tells the coworker its pair.
 
 Routine step reviews share one read-only `step` lane per task, first briefed
 with the agreed plan and its invariants; a step that sets an interface,
@@ -138,9 +138,9 @@ finding, say whether you reproduced it or only read the code.
   alone. `--no-edit` for a question or a review.
 - **Whether the result holds.** Re-read every file the reply lists under
   "Files touched" before you build on it. A claim of done is a claim.
-- **Which lane.** `main` for the ordinary edit; `plan` or a read-only lane
-  for a question, plan or review, one per parallel reviewer; a worktree lane
-  per parallel edit, one topic each.
+- **Which lane.** `main` for the ordinary edit; a named lane, read-only,
+  for a question, plan or review, one per parallel reviewer; a `--worktree`
+  lane per parallel or isolated edit, one topic each.
 - **When to reset.** When the coworker's context is spent or the topic
   changes entirely; `status` shows the lanes and undelivered requests.
   Every delivery prints a `cowork usage <side>/<lane>:` line to stderr: a

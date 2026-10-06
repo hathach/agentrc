@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run coworker turns in a detached process, resuming one session per lane, one turn at a time per lane.
 
-  cowork.py send [--to codex|claude] [--lane L] [--read-only] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach] (--task TEXT | --task -)
+  cowork.py send [--to codex|claude] [--lane L] [--read-only | --worktree] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach] (--task TEXT | --task -)
   cowork.py default [astra|sol]
   cowork.py kill <id>
   cowork.py read [--wait] <id>
@@ -12,13 +12,12 @@ A lane is one resumed session of a side, with files under
 <git dir>/cowork/<side>/<lane>/: `session` holds the session id, the model
 and the effort in use, and a Codex lane's tier (TIERS, PRESETS; see
 settle_pair). reset forgets them. Three kinds of lane: `main` works in
-this checkout; a lane created with --read-only works in this checkout too
-and every send to it is --no-edit; any other lane works in its own worktree
-.worktrees/cowork-<side>-<lane> on branch cowork/<host branch>/<side>-<lane>,
-created on its first send and brought to this checkout's HEAD before every
-send: its own commits, those after the `base` it was last synced to, are
-rebased onto HEAD; refused when dirty or conflicting. Its kind is the
-`read-only` marker file or the absence of one.
+this checkout; any other lane works in this checkout too and every send to
+it is --no-edit, unless its first send said --worktree: then it works in its
+own worktree .worktrees/cowork-<side>-<lane> on branch
+cowork/<host branch>/<side>-<lane>, created at this checkout's HEAD, the
+lane's `base`, and never moved by cowork; a send to it is refused while the
+tree is dirty. Its kind is the `read-only` marker file or the `base` file.
 A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
@@ -66,7 +65,7 @@ BOOTSTRAP = (  # the receiver's whole contract, so it need not read the driver's
     'Do not load the `cowork` skill: it is for the driving side, and these are its rules for you.\n\n')
 HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at {effort} effort. Scope: {scope}.\n'
           '{where}End your reply with a line "Files touched: <paths>" or "Files touched: none".\n---\n')
-WHERE = 'Your checkout is the worktree {root} on branch {branch}, based on {base} of the host checkout; commit there.\n'
+WHERE = 'Your checkout is the worktree {root} on branch {branch}, created at {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # names both CLIs accept
 DEFAULTS = {'claude': ('opus', 'high')}  # a new Claude lane's model and effort
@@ -114,7 +113,7 @@ def boxes(gitdir):
 def kind(box):
     if box.name == 'main':
         return 'main'
-    return 'read-only' if (box / 'read-only').exists() else 'worktree'
+    return 'read-only' if (box / 'read-only').exists() else 'worktree'  # start() writes one marker or the other first
 
 
 def lane_root(root, box):
@@ -141,13 +140,11 @@ def claim(tree, box):
 
 
 def sync_lane(root, box):
-    """The lane's worktree at the host's HEAD with the lane's own commits,
-    those since the base it was last synced to, rebased on top; created on
-    first use. Refused while dirty or when the rebase conflicts. The base
-    rather than ancestry, so a host history rewritten under the lane still
-    syncs. Under admission."""
+    """The lane's worktree, created at the host's HEAD on first use, or
+    recreated on its branch when the tree is gone; refused while dirty. The
+    lane's commits stay where the coworker made them: integrating them is the
+    host's. Under admission."""
     tree, lane = lane_root(root, box), box.name
-    head = git(root, 'rev-parse', 'HEAD').stdout.strip()
     if not tree.exists():
         git(root, 'worktree', 'prune')
         host = git(root, 'symbolic-ref', '--short', 'HEAD', check=False)
@@ -157,18 +154,11 @@ def sync_lane(root, box):
         known = git(root, 'rev-parse', '-q', '--verify', f'refs/heads/{branch}', check=False).returncode == 0
         if known and not (box / 'base').exists():  # a branch left by an earlier lane: which of its commits are its own?
             die(f'branch {branch} exists but lane {lane} has no record of its base; delete or rename the branch', BUSY)
-        git(root, 'worktree', 'add', '-q', *([] if known else ['-b', branch]), str(tree), branch if known else 'HEAD')
+        head = git(root, 'rev-parse', 'HEAD').stdout.strip()  # one commit, both made from and recorded
+        git(root, 'worktree', 'add', '-q', *([] if known else ['-b', branch]), str(tree), branch if known else head)
         if not known:
             (box / 'base').write_text(head + '\n')
     claim(tree, box)
-    base = (box / 'base').read_text().strip()
-    if git(tree, 'rev-parse', 'HEAD').stdout.strip() == base:
-        git(tree, 'reset', '-q', '--hard', head)
-    elif git(tree, 'rebase', '-q', '--onto', head, base, check=False).returncode:
-        files = git(tree, 'diff', '--name-only', '--diff-filter=U').stdout
-        git(tree, 'rebase', '--abort', check=False)
-        die(f'lane {lane} does not rebase onto {head[:12]}; integrate or reset it first, conflicts in:\n{files}', BUSY)
-    (box / 'base').write_text(head + '\n')
 
 
 def drop_lane(root, box):
@@ -325,15 +315,22 @@ def update_side(box, **fields):
 
 def settle_pair(box, side, model, effort, tier):
     """Save the model and effort a request runs on. Under admission with the
-    start; the runner reads them back, so a later flip cannot change it.
-    --model/--effort pin a pair over the one in effect; else a Codex lane
-    runs on the named or saved tier, resolved now, so a flipped default
-    reaches it; a pinned lane keeps its pair; a new Codex lane starts on
-    `default`, a new Claude lane on DEFAULTS."""
+    start; the runner reads them back, so a later flip cannot change it. A
+    Codex lane runs on the named or saved tier, resolved now, so a flipped
+    default reaches it; a new one starts on `default`, and one pinned before
+    pins were dropped is refused until a tier is named. A Claude lane keeps
+    its --model and --effort, starting at DEFAULTS."""
     saved = lane_fields(box)
-    tier = '' if side == 'claude' else tier or saved['tier'] or ('' if saved['model'] else 'default')
-    base = tier_pair(tier) if tier else (saved['model'], saved['effort']) if saved['model'] else DEFAULTS['claude']
-    write_side(box, model=model or base[0], effort=effort or base[1], tier='' if model or effort else tier)
+    if side == 'claude':
+        write_side(box, model=model or saved['model'] or DEFAULTS['claude'][0],
+                   effort=effort or saved['effort'] or DEFAULTS['claude'][1], tier='')
+        return
+    tier = tier or saved['tier'] or ('' if saved['model'] else 'default')
+    if not tier:
+        die(f'codex/{box.name} is pinned to {saved["model"]} at {saved["effort"]} effort; '
+            f'name its tier with --tier {"|".join(("default", *TIERS))}', BUSY)
+    model, effort = tier_pair(tier)
+    write_side(box, model=model, effort=effort, tier=tier)
 
 
 def session_of(box):
@@ -414,7 +411,7 @@ def run(side, box, host, request, no_edit, lock_fd):
         where = ''
         if kind(box) == 'worktree':
             where = WHERE.format(root=root, branch=git(root, 'symbolic-ref', '--short', 'HEAD').stdout.strip(),
-                                 base=git(host, 'rev-parse', '--short=12', 'HEAD').stdout.strip())
+                                 base=(box / 'base').read_text().strip()[:12])
         task = box / f'{request}.task'
         prompt = compose(session, side, request, task.read_text(), no_edit, root, model, effort, box.name, where)
         task.unlink()
@@ -621,24 +618,29 @@ def find(gitdir, request):
     return box
 
 
-def start(box, root, side, task, no_edit, read_only, model, effort, tier):
+def start(box, root, side, task, no_edit, read_only, worktree, model, effort, tier):
     """Record the request and start its runner, which holds the request lock
     from birth; the caller keeps nothing open. Refused while one is in flight,
-    and for a lane not ready: --read-only on a worktree lane, a worktree that
-    is dirty or does not rebase."""
+    and for a lane of another kind than the flags assert, or a dirty worktree.
+    A new named lane is read-only unless --worktree makes it a worktree lane."""
     lane = box.name
     with admission(box):
         busy = running(box)
         if busy:
             die(f'{side}/{lane} is busy with {busy}; wait for it, or kill it', BUSY)
         if lane == 'main':
-            if read_only:
-                die('main is this checkout and writable; --read-only creates a named lane', BUSY)
+            if read_only or worktree:
+                die('main is this checkout and writable; --read-only and --worktree are for named lanes', BUSY)
         else:
-            if read_only and (box / 'session').exists() and kind(box) != 'read-only':
-                die(f'{side}/{lane} is a worktree lane; --read-only creates a lane, it cannot convert one', BUSY)
-            if read_only:
-                (box / 'read-only').touch()
+            if not (box / 'read-only').exists() and not (box / 'base').exists():
+                if (box / 'session').exists():
+                    die(f'{side}/{lane} has a session but no record of its kind; reset it', BUSY)
+                if not worktree:
+                    (box / 'read-only').touch()
+            if read_only and kind(box) != 'read-only':
+                die(f'{side}/{lane} is a worktree lane; --read-only cannot convert one', BUSY)
+            if worktree and kind(box) != 'worktree':
+                die(f'{side}/{lane} is a read-only lane; --worktree cannot convert one', BUSY)
             if kind(box) == 'read-only':
                 no_edit = True
             else:
@@ -693,14 +695,17 @@ def main(argv=None):
     send = sub.add_parser('send', help='one turn of the coworker; prints the request id, then the reply unless --detach')
     send.add_argument('--to', choices=SIDES, help='which coworker; defaults to codex when run from Claude Code')
     send.add_argument('--lane', default='main', help='which session of that coworker (default: main, this checkout); '
-                                                    'any other lane works in its own worktree unless created --read-only')
-    send.add_argument('--read-only', action='store_true',
-                      help='on a lane\'s first send: it works in this checkout and every send to it is --no-edit')
+                                                    'any other lane is read-only in this checkout unless created --worktree')
+    kinds = send.add_mutually_exclusive_group()
+    kinds.add_argument('--read-only', action='store_true',
+                       help='assert a read-only lane: this checkout, every send --no-edit; what a new named lane is anyway')
+    kinds.add_argument('--worktree', action='store_true',
+                       help='on a new lane\'s first send: its own worktree and branch, created at HEAD')
     send.add_argument('--task', required=True, help='literal text, or - for stdin')
     send.add_argument('--no-edit', action='store_true', help='a question or review: the coworker must not edit')
     send.add_argument('--tier', choices=('default', *TIERS), help='a Codex lane\'s tier from now on; a new lane starts on default')
-    send.add_argument('--model', help=f'pin the coworker\'s model from now on; a new Claude lane defaults to {DEFAULTS["claude"][0]}')
-    send.add_argument('--effort', choices=EFFORTS, help='pin its reasoning effort from now on')
+    send.add_argument('--model', help=f'a Claude lane\'s model from now on, default {DEFAULTS["claude"][0]}')
+    send.add_argument('--effort', choices=EFFORTS, help='a Claude lane\'s effort from now on')
     send.add_argument('--detach', action='store_true', help='print the request id and return; collect the reply with read --wait')
     sub.add_parser('kill', help='stop a running request and everything its coworker spawned').add_argument('request')
     read = sub.add_parser('read', help='print the reply of a request whose send detached or died, and remove it')
@@ -739,6 +744,8 @@ def main(argv=None):
         side = coworker(a.to)
         if a.tier and side == 'claude':
             parser.error('--tier is for Codex lanes; a Claude lane takes --model/--effort')
+        if (a.model or a.effort) and side == 'codex':
+            parser.error('--model/--effort are for Claude lanes; a Codex lane takes --tier')
         if side == 'codex':
             preset()  # a bad preference file is refused before the lane is touched
         if not LANE.match(a.lane):
@@ -748,7 +755,7 @@ def main(argv=None):
         task = sys.stdin.read() if a.task == '-' else a.task
         if not task.strip():
             die('the task resolved to nothing')
-        request = start(box, root, side, task, a.no_edit, a.read_only, a.model, a.effort, a.tier)
+        request = start(box, root, side, task, a.no_edit, a.read_only, a.worktree, a.model, a.effort, a.tier)
         print(request, flush=True)
         if a.detach:
             return 0

@@ -236,26 +236,23 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(argv[argv.index('-m') + 1], 'gpt-6.1-sol')
         self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=high')
         self.assertIn('answered by gpt-6.1-sol at high effort', self.calls()[0]['stdin'])
-        self.send('--effort', 'max', '--task', 'max')
-        argv = self.calls()[1]['argv']
-        self.assertEqual(argv[argv.index('-c') + 1], 'model_reasoning_effort=max')
+        code, _, _, err = self.send('--effort', 'max', '--task', 'max')
+        self.assertEqual(code, 2)
+        self.assertIn('--model/--effort are for Claude lanes', err)
         self.send('--task', 'from codex', **CODEX)
-        argv = self.calls()[2]['argv']
+        argv = self.calls()[1]['argv']
         self.assertEqual(argv[argv.index('--model') + 1], 'opus')
         self.assertEqual(argv[argv.index('--effort') + 1], 'high')
 
-    def test_model_and_effort_flags_persist_until_replaced_or_reset(self):
-        for argv in (('--model', 'gpt-5.6-terra', '--effort', 'high', '--task', 'a'), ('--task', 'b'),
-                     ('--effort', 'low', '--task', 'c'), ('--model', 'gpt-5.6-luna', '--task', 'd'), ('--task', 'e')):
-            self.assertEqual(self.send(*argv)[0], 0)
-        self.run_cli('reset', 'codex', 'main')
-        self.send('--task', 'f')
-        seen = [(c['argv'][c['argv'].index('-m') + 1], c['argv'][c['argv'].index('-c') + 1]) for c in self.calls()]
-        self.assertEqual(seen, [('gpt-5.6-terra', 'model_reasoning_effort=high'), ('gpt-5.6-terra', 'model_reasoning_effort=high'),
-                                ('gpt-5.6-terra', 'model_reasoning_effort=low'), ('gpt-5.6-luna', 'model_reasoning_effort=low'),
-                                ('gpt-5.6-luna', 'model_reasoning_effort=low'), ('gpt-6.1-sol', 'model_reasoning_effort=high')])
-        _, out, _ = self.run_cli('status')
-        self.assertIn('codex/main: session thread-42, gpt-6.1-sol at high effort', out)
+    def test_a_claude_lanes_model_and_effort_persist_until_replaced_or_reset(self):
+        for argv in (('--model', 'sonnet', '--effort', 'medium', '--task', 'a'), ('--task', 'b'),
+                     ('--effort', 'low', '--task', 'c'), ('--model', 'haiku', '--task', 'd'), ('--task', 'e')):
+            self.assertEqual(self.send(*argv, **CODEX)[0], 0)
+        self.run_cli('reset', 'claude', 'main')
+        self.send('--task', 'f', **CODEX)
+        seen = [(c['argv'][c['argv'].index('--model') + 1], c['argv'][c['argv'].index('--effort') + 1]) for c in self.calls()]
+        self.assertEqual(seen, [('sonnet', 'medium'), ('sonnet', 'medium'), ('sonnet', 'low'), ('haiku', 'low'),
+                                ('haiku', 'low'), ('opus', 'high')])
 
     def test_a_field_update_keeps_the_bound_thread(self):
         self.assertEqual(self.send('--task', 'one')[0], 0)
@@ -267,15 +264,11 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(self.calls()[-1]['argv'][:3], ['exec', 'resume', 'thread-42'])
 
     def test_a_flag_writes_back_only_its_own_field(self):
-        self.send('--model', 'gpt-5.6-luna', '--effort', 'medium', '--task', 'a')
-        cowork.settle_pair(self.box(), 'codex', None, 'high', None)
-        self.assertEqual((cowork.lane_fields(self.box())['model'], cowork.lane_fields(self.box())['effort']), ('gpt-5.6-luna', 'high'))
-        self.assertFalse(list(self.box().glob('session.*.tmp')), 'the session file is replaced, never truncated')
-        self.run_cli('reset', 'codex', 'main')
-        self.send('--tier', 'expert', '--task', 'b')
-        cowork.settle_pair(self.box(), 'codex', 'gpt-5.6-terra', None, None)  # on a tier: the effort comes from its pair
-        self.assertEqual(cowork.lane_fields(self.box()), {'session': 'thread-42', 'model': 'gpt-5.6-terra',
-                                                          'effort': 'xhigh', 'tier': ''})
+        self.send('--model', 'haiku', '--effort', 'medium', '--task', 'a', **CODEX)
+        box = self.box(side='claude')
+        cowork.settle_pair(box, 'claude', None, 'high', None)
+        self.assertEqual((cowork.lane_fields(box)['model'], cowork.lane_fields(box)['effort']), ('haiku', 'high'))
+        self.assertFalse(list(box.glob('session.*.tmp')), 'the session file is replaced, never truncated')
 
     # --- tiers and the Codex default -------------------------------------------
 
@@ -301,14 +294,18 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual([self.pair(c) for c in self.calls()], [('gpt-6-astra', 'high'), ('gpt-6-astra', 'high'),
                                                                  ('gpt-6-astra', 'xhigh'), ('gpt-6.1-sol', 'high')])
 
-    def test_a_lane_from_before_tiers_keeps_its_pair_until_a_tier_is_named(self):
+    def test_a_pinned_codex_lane_is_refused_until_a_tier_is_named(self):
         self.box().mkdir(parents=True)
         (self.box() / 'session').write_text('thread-42\ngpt-6-astra\nhigh\n')
-        self.send('--task', 'a')
         _, out, _ = self.run_cli('status')
         self.assertIn('codex/main: session thread-42, gpt-6-astra at high effort, pinned', out)
+        code, _, _, err = self.send('--task', 'a')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('codex/main is pinned to gpt-6-astra at high effort; name its tier with --tier default|review|expert', err)
+        self.assertEqual(self.calls(), [])
         self.send('--tier', 'default', '--task', 'b')
-        self.assertEqual([self.pair(c) for c in self.calls()], [('gpt-6-astra', 'high'), ('gpt-6.1-sol', 'high')])
+        self.assertEqual([self.pair(c) for c in self.calls()], [('gpt-6.1-sol', 'high')])
+        self.assertEqual(self.calls()[0]['argv'][:3], ['exec', 'resume', 'thread-42'], 'the session carries over')
 
     def test_a_tier_with_a_pin_or_on_a_claude_lane_is_refused(self):
         code, _, _, err = self.send('--tier', 'review', '--model', 'gpt-6-astra', '--task', 'q')
@@ -965,19 +962,19 @@ class CoworkTest(unittest.TestCase):
     def test_a_worktree_lane_works_in_its_own_tree_and_resumes(self):
         base = self.commit('a.txt', 'a')
         tree = self.root / '.worktrees' / 'cowork-codex-impl'
-        code, request, _, err = self.send('--lane', 'impl', '--task', 'x')
+        code, request, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x')
         self.assertEqual(code, 0, err)
         self.assertTrue(request.startswith('codex-impl-'))
         self.assertEqual(self.calls()[0]['cwd'], str(tree))
         prompt = self.calls()[0]['stdin']
         self.assertIn(f'on lane impl,', prompt)
-        self.assertIn(f'Your checkout is the worktree {tree} on branch cowork/main/codex-impl, based on {base[:12]} '
+        self.assertIn(f'Your checkout is the worktree {tree} on branch cowork/main/codex-impl, created at {base[:12]} '
                       'of the host checkout; commit there.', prompt)
         self.assertEqual(self.head(tree), base)
         code, out, _ = self.run_cli('status')
         self.assertIn(f'codex/impl: session thread-42, gpt-6.1-sol at high effort, tier default, in {tree}', out)
         self.assertNotIn('codex/main', out)
-        self.send('--lane', 'impl', '--task', 'y')
+        self.send('--lane', 'impl', '--worktree', '--task', 'y')
         self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
         self.assertEqual(self.head(tree), base)
 
@@ -995,13 +992,33 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.MALFORMED)
         self.assertIn('tree changed during a --no-edit turn', err)
         (self.root / 'edited.txt').unlink()
-        self.send('--lane', 'impl', '--task', 'z')
+        self.send('--lane', 'impl', '--worktree', '--task', 'z')
         code, _, _, err = self.send('--lane', 'impl', '--read-only', '--task', 'w')
         self.assertEqual(code, cowork.BUSY)
-        self.assertIn('codex/impl is a worktree lane; --read-only creates a lane', err)
-        code, _, _, err = self.send('--read-only', '--task', 'v')
+        self.assertIn('codex/impl is a worktree lane; --read-only cannot convert one', err)
+        code, _, _, err = self.send('--lane', 'review', '--worktree', '--task', 'u')
         self.assertEqual(code, cowork.BUSY)
-        self.assertIn('main is this checkout and writable', err)
+        self.assertIn('codex/review is a read-only lane; --worktree cannot convert one', err)
+        for flag in ('--read-only', '--worktree'):
+            code, _, _, err = self.send(flag, '--task', 'v')
+            self.assertEqual(code, cowork.BUSY)
+            self.assertIn('main is this checkout and writable', err)
+        self.assertEqual(self.send('--lane', 'x', '--read-only', '--worktree', '--task', 't')[0], 2, 'one kind or the other')
+
+    def test_a_new_named_lane_is_read_only_unless_its_first_send_says_worktree(self):
+        self.commit('a.txt', 'a')
+        code, _, _, err = self.send('--lane', 'plan', '--task', 'x')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls()[-1]['cwd'], str(self.root))
+        self.assertIn('Scope: do not edit anything', self.calls()[-1]['stdin'])
+        self.assertIn('codex/plan: session thread-42, gpt-6.1-sol at high effort, tier default, read-only', self.run_cli('status')[1])
+        self.assertFalse((self.root / '.worktrees').exists())
+        box = self.box(lane='old')  # a worktree lane from before the default changed: no marker, a base
+        box.mkdir(parents=True)
+        self.send('--lane', 'old', '--worktree', '--task', 'y')
+        (box / 'session').unlink()
+        self.send('--lane', 'old', '--task', 'z')
+        self.assertEqual(self.calls()[-1]['cwd'], str(self.root / '.worktrees' / 'cowork-codex-old'), 'it keeps its kind')
 
     def test_lanes_run_concurrently_with_one_request_in_flight_each(self):
         self.commit('a.txt', 'a')
@@ -1015,28 +1032,48 @@ class CoworkTest(unittest.TestCase):
         self.gate.touch()
         proc.wait(timeout=30)
 
-    def test_a_worktree_lane_follows_the_host_head_and_rebases_its_own_commits(self):
+    def test_a_lane_with_a_session_but_no_kind_is_refused_not_converted(self):
         self.commit('a.txt', 'a')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        (self.box(lane='impl') / 'base').unlink()
+        ran = len(self.calls())
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'y')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('codex/impl has a session but no record of its kind', err)
+        self.assertEqual(len(self.calls()), ran)
+        self.assertFalse((self.box(lane='impl') / 'read-only').exists())
+
+    def test_the_recorded_base_is_the_commit_the_worktree_was_made_from(self):
+        base = self.commit('a.txt', 'a')
+        real = cowork.git
+        def git(cwd, *args, check=True):
+            done = real(cwd, *args, check=check)
+            if args[:2] == ('worktree', 'add'):  # the host moves on between creating the tree and recording its base
+                self.commit('b.txt', 'b')
+            return done
+        with mock.patch.object(cowork, 'git', git):
+            self.assertEqual(self.send('--lane', 'impl', '--worktree', '--task', 'x')[0], 0)
         tree = self.root / '.worktrees' / 'cowork-codex-impl'
-        self.send('--lane', 'impl', '--task', 'x')
-        moved = self.commit('b.txt', 'b')
+        self.assertEqual(self.head(tree), base)
+        self.assertEqual((self.box(lane='impl') / 'base').read_text().strip(), base)
+        self.assertIn(f'created at {base[:12]} of the host checkout', self.calls()[-1]['stdin'])
+
+    def test_a_worktree_lane_stays_at_its_base_and_keeps_its_commits(self):
+        base = self.commit('a.txt', 'a')
+        tree = self.root / '.worktrees' / 'cowork-codex-impl'
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        self.commit('b.txt', 'b')
         self.send('--lane', 'impl', '--task', 'y')
-        self.assertEqual(self.head(tree), moved, 'a lane without commits of its own is moved to HEAD')
+        self.assertEqual(self.head(tree), base, 'host commits do not move the lane')
+        self.assertIn(f'created at {base[:12]} of the host checkout', self.calls()[-1]['stdin'])
         self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
                         "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
         self.send('--lane', 'impl', '--task', 'commit something')
         self.codex_does('')
-        moved = self.commit('c.txt', 'c')
-        self.send('--lane', 'impl', '--task', 'z')
-        self.assertEqual(sh(tree, 'git', 'rev-list', '--count', f'{moved}..HEAD').strip(), '1', 'rebased on the new HEAD')
-        self.assertEqual(sh(tree, 'git', 'log', '-1', '--format=%s').strip(), 'lane')
-        self.commit('lane.txt', 'host version')
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'conflict')
-        self.assertEqual(code, cowork.BUSY)
-        self.assertIn('does not rebase onto', err)
-        self.assertIn('lane.txt', err)
-        self.assertEqual(sh(tree, 'git', 'status', '--porcelain'), '', 'the rebase was aborted')
-        self.assertFalse(self.calls()[-1]['stdin'].endswith('conflict'))
+        sh(self.root, 'git', 'commit', '-q', '--amend', '-m', 'b, amended')
+        code, _, _, err = self.send('--lane', 'impl', '--task', 'z')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sh(tree, 'git', 'log', '--format=%s').split(), ['lane', 'a.txt'], 'a rewritten host is not its concern')
         (tree / 'scratch.txt').write_text('left behind')
         code, _, _, err = self.send('--lane', 'impl', '--task', 'dirty')
         self.assertEqual(code, cowork.BUSY)
@@ -1048,7 +1085,7 @@ class CoworkTest(unittest.TestCase):
         tree = self.root / '.worktrees' / 'cowork-codex-impl'
         self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
                         "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
-        self.send('--lane', 'impl', '--task', 'x')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
         code, _, err = self.run_cli('reset', 'codex', 'impl')
         self.assertEqual(code, cowork.BUSY)
         self.assertIn('commits on cowork/main/codex-impl that HEAD lacks', err)
@@ -1080,7 +1117,7 @@ class CoworkTest(unittest.TestCase):
         self.commit('a.txt', 'a')
         self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
                         "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
-        self.send('--lane', 'impl', '--task', 'x')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
         self.commit('b.txt', 'b')
         sh(self.root, 'git', 'cherry-pick', 'cowork/main/codex-impl')
         code, _, err = self.run_cli('reset', 'codex', 'impl')
@@ -1088,45 +1125,31 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('merge the lane branch into this checkout, or integrate it by hand and retire the worktree', err)
         self.assertNotIn('cherry-pick', err)
 
-    def test_a_worktree_lane_survives_a_rewritten_host_history(self):
-        self.commit('a.txt', 'a')
-        tree = self.root / '.worktrees' / 'cowork-codex-impl'
-        self.send('--lane', 'impl', '--task', 'x')
-        sh(self.root, 'git', 'commit', '-q', '--amend', '-m', 'a, amended')
-        amended = self.head(self.root)
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'y')
-        self.assertEqual(code, 0, err)
-        self.assertEqual(self.head(tree), amended, 'no commits of its own since the last base: moved, not rebased')
-        self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
-                        "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
-        self.send('--lane', 'impl', '--task', 'commit')
-        self.codex_does('')
-        sh(self.root, 'git', 'commit', '-q', '--amend', '-m', 'a, amended twice')
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'z')
-        self.assertEqual(code, 0, err)
-        self.assertEqual(sh(tree, 'git', 'log', '--format=%s').split(), ['lane', 'a,', 'amended', 'twice'])
-
     def test_a_removed_tree_comes_back_with_the_lanes_own_commits(self):
         self.commit('a.txt', 'a')
         tree = self.root / '.worktrees' / 'cowork-codex-impl'
         self.codex_does("import subprocess; open('lane.txt', 'w').write('lane'); "
                         "subprocess.run(['git', 'add', 'lane.txt']); subprocess.run(['git', 'commit', '-q', '-m', 'lane'])")
-        self.send('--lane', 'impl', '--task', 'commit')
+        self.send('--lane', 'impl', '--worktree', '--task', 'commit')
         self.codex_does('')
         sh(self.root, 'git', 'worktree', 'remove', str(tree))
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'again')
+        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'again')
         self.assertEqual(code, 0, err)
         self.assertEqual(sh(tree, 'git', 'log', '-1', '--format=%s').strip(), 'lane', 'its own commit is not the base')
         (self.box(lane='impl') / 'base').unlink()
         sh(self.root, 'git', 'worktree', 'remove', str(tree))
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'no base')
+        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'no base')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('has a session but no record of its kind', err)
+        (self.box(lane='impl') / 'session').unlink()  # a branch some earlier lane left: which of its commits are its own?
+        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'no base')
         self.assertEqual(code, cowork.BUSY)
         self.assertIn('has no record of its base', err)
 
     def test_reset_refuses_a_tree_that_is_not_on_the_lanes_branch(self):
         self.commit('a.txt', 'a')
         tree = self.root / '.worktrees' / 'cowork-codex-impl'
-        self.send('--lane', 'impl', '--task', 'x')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
         sh(tree, 'git', 'checkout', '-q', '-b', 'unrelated')
         code, _, err = self.run_cli('reset', 'codex', 'impl')
         self.assertEqual(code, cowork.BUSY)
@@ -1142,13 +1165,13 @@ class CoworkTest(unittest.TestCase):
         self.assertFalse((box / 'read-only').exists())
         self.commit('a.txt', 'a')
         self.send('--lane', 'review', '--task', 'x')
-        self.assertEqual(self.calls()[0]['cwd'], str(self.root / '.worktrees' / 'cowork-codex-review'))
+        self.assertEqual(self.calls()[0]['cwd'], str(self.root), 'made anew, read-only by default')
 
     def test_a_stray_directory_is_not_taken_for_the_lanes_worktree(self):
         self.commit('a.txt', 'a')
         tree = self.root / '.worktrees' / 'cowork-codex-impl'
         tree.mkdir(parents=True)
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'x')
+        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x')
         self.assertEqual(code, cowork.BUSY)
         self.assertIn(f"{tree} is not lane impl's worktree", err)
         self.assertEqual(self.calls(), [])
@@ -1160,7 +1183,7 @@ class CoworkTest(unittest.TestCase):
             self.assertEqual(code, cowork.FAILED, bad)
             self.assertIn('lane names are [a-z0-9-]', err)
         sh(self.root, 'git', 'checkout', '-q', '--detach')
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'x')
+        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x')
         self.assertEqual(code, cowork.BUSY)
         self.assertIn('detached', err)
         self.assertEqual(self.calls(), [])
