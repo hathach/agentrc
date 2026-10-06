@@ -122,15 +122,14 @@ lane cannot see uncommitted host changes.
 
 Never open the session interactively while a request is running.
 
-## Show the exchange
+## Report
 
-For every `send`, paste the task sent and reply received verbatim in your
-own messages, each in its own code block, before summarizing or acting on
-the reply. This includes non-review requests and replies delivered by
-`read`. Tool output does not count: the harness folds it away, and the
-human reads unattended sessions back from your messages.
-
-For each finding, say whether you reproduced it or only read the code.
+Report a reply by its outcome, the disagreement left and what was not
+verified, naming the lane and request id: the full turn stays in the CLI's
+own store (`grep -rl <id> ~/.codex/sessions ~/.claude/projects`). Report
+transport failures and their diagnostics; request artifacts are removed on
+delivery, and those diagnostics need not appear in the CLI session. For each
+finding, say whether you reproduced it or only read the code.
 
 ## What you decide
 
@@ -143,7 +142,7 @@ For each finding, say whether you reproduced it or only read the code.
   for a question, plan or review, one per parallel reviewer; a worktree lane
   per parallel edit, one topic each.
 - **When to reset.** When the coworker's context is spent or the topic
-  changes entirely; `status` shows the lanes and past requests.
+  changes entirely; `status` shows the lanes and undelivered requests.
 
 ## Rules for both sides
 
@@ -163,18 +162,19 @@ For each finding, say whether you reproduced it or only read the code.
 - **Not a batch transport.** Schema'd, unattended verification uses a saved
   workflow's `agent()` call on a review role (`code-verifier`,
   `finding-verifier`) for completion and failure boundaries; request a Codex
-  second opinion here.
+  second opinion here, from a saved workflow too, through the `coworker`
+  agent, when the workflow's own agent judges the reply.
 - **The simplify gate stays out** of a coworker turn (`COWORK_TURN` in its
   environment). Edits you commissioned are challenged at your own Stop and
   are yours to defend, not to reject as a peer's.
 
 ## Review rounds
 
-For any reply you act on, including a review, proposal or answer, apply
-what verifies, then send a follow-up with `--no-edit`: say what you applied
-and what you rejected and why, and ask again. A lookup with nothing to apply
-needs no follow-up. Stop when the coworker reports nothing left and you
-agree, or when a round turns into re-litigating documented behaviour. Do not
-automate that loop: a reply establishes neither agreement nor correctness,
-which is why the script has no `converge` subcommand and should not grow
-one.
+For a review, an exchange the user's instructions run under these rounds,
+or a finding still unresolved: apply what verifies, then send a follow-up
+with `--no-edit` saying what you applied and what you rejected and why, and
+ask again. An ordinary answer or proposal you act on needs no follow-up.
+Stop when the coworker reports nothing left and you agree, or when a round
+turns into re-litigating documented behaviour; a reply alone establishes
+neither agreement nor correctness. When implementation depends on an agreed
+plan, a revision needs another review before implementation.
