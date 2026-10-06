@@ -42,15 +42,18 @@ if os.environ.get('FAKE_EXIT', '0') != '0':
     sys.stderr.buffer.write(os.environ.get('FAKE_STDERR', '').encode('latin-1'))
     sys.exit(int(os.environ['FAKE_EXIT']))
 open(args[args.index('-o') + 1], 'w').write(os.environ.get('FAKE_REPLY', 'codex reply\\nFiles touched: none\\n'))
+if os.environ.get('FAKE_USAGE'):
+    print(json.dumps({'type': 'turn.completed', 'usage': json.loads(os.environ['FAKE_USAGE'])}))
 '''
 FAKE_CLAUDE = FAKE_PREAMBLE + '''if os.environ.get('FAKE_EXIT', '0') != '0':
     sys.exit(int(os.environ['FAKE_EXIT']))
-print(json.dumps({'type': 'assistant', 'text': 'thinking'}))
+print(os.environ.get('FAKE_ASSISTANT', json.dumps({'type': 'assistant', 'text': 'thinking'})))
 print(os.environ.get('FAKE_RESULT', json.dumps({'type': 'result', 'result': 'claude reply\\nFiles touched: a.c'})))
 '''
 
 
 THREAD = '01a08a2e-cbbb-7de2-8b6f-b2e769c5b9d8'
+NO_USAGE = 'cowork usage codex/main: unavailable\n'  # what a delivery prints to stderr when the fake reports none
 CODEX = {'CLAUDECODE': '', 'CODEX_THREAD_ID': THREAD}  # a send driven by a Codex session
 
 
@@ -484,6 +487,58 @@ class CoworkTest(unittest.TestCase):
 
     # --- outcomes -----------------------------------------------------------------
 
+    def test_codex_usage_is_the_sessions_running_total_labelled_as_such(self):
+        total = {'input_tokens': 77537, 'cached_input_tokens': 51328, 'output_tokens': 91, 'reasoning_output_tokens': 0}
+        code, _, _, err = self.send('--task', 'x', FAKE_USAGE=json.dumps(total))
+        self.assertEqual(code, 0)
+        self.assertIn('cowork usage codex/main: session input 77,537 (cached 51,328), output 91\n', err)
+        self.assertNotIn('context', err, 'the codex stream has no per-call figure')
+
+    def test_missing_or_failed_usage_is_unavailable_and_changes_nothing_else(self):
+        for env, want in (({}, 0), ({'FAKE_USAGE': '"garbage"'}, 0), ({'FAKE_USAGE': '{}'}, 0),
+                          ({'FAKE_USAGE': '{"input_tokens": 5, "output_tokens": 1}'}, 0),
+                          ({'FAKE_USAGE': '{"input_tokens": "5", "cached_input_tokens": 0, "output_tokens": 1}'}, 0),
+                          ({'FAKE_USAGE': '{"input_tokens": true, "cached_input_tokens": 0, "output_tokens": 1}'}, 0),
+                          ({'FAKE_USAGE': '{"input_tokens": -3, "cached_input_tokens": 0, "output_tokens": 1}'}, 0),
+                          ({'FAKE_EXIT': '2'}, cowork.FAILED),
+                          ({'FAKE_REPLY': 'no footer\n'}, cowork.MALFORMED)):
+            with self.subTest(env):
+                code, request, _, err = self.send('--task', 'x', **env)
+                self.assertEqual(code, want)
+                self.assertIn('cowork usage codex/main: unavailable\n', err)
+                self.assertNotIn('input 0', err)
+                self.assertEqual(self.leftovers(request), [])
+
+    def test_claude_usage_is_per_request_with_the_last_calls_context(self):
+        call = {'input_tokens': 8, 'cache_read_input_tokens': 27935, 'cache_creation_input_tokens': 182, 'output_tokens': 2}
+        result = {'type': 'result', 'result': 'ok\nFiles touched: none',
+                  'usage': {'input_tokens': 18, 'cache_read_input_tokens': 42079, 'cache_creation_input_tokens': 13973,
+                            'output_tokens': 158}}
+        code, _, _, err = self.send('--to', 'claude', '--task', 'q', **CODEX, FAKE_RESULT=json.dumps(result),
+                                    FAKE_ASSISTANT=json.dumps({'type': 'assistant', 'message': {'usage': call}}))
+        self.assertEqual(code, 0)
+        self.assertIn('cowork usage claude/main: input 56,070 (cached 42,079), output 158; context 28,125 (last call)\n', err)
+        for bad in (None, {}, {'output_tokens': 3}, {'input_tokens': 1, 'output_tokens': 1, 'cache_read_input_tokens': 'x'},
+                    {'input_tokens': True, 'output_tokens': 1}, {'input_tokens': 1, 'output_tokens': -1}):
+            with self.subTest(bad):
+                code, _, _, err = self.send('--to', 'claude', '--task', 'q', **CODEX,
+                                            FAKE_RESULT=json.dumps({**result, 'usage': bad}))
+                self.assertEqual(code, 0)
+                self.assertIn('cowork usage claude/main: unavailable\n', err)
+
+    def test_an_unreadable_usage_record_still_delivers_the_reply(self):
+        real = cowork.text_of
+        def text_of(path):
+            if path.suffix == '.usage':
+                raise PermissionError('denied')
+            return real(path)
+        with mock.patch.object(cowork, 'text_of', text_of):
+            code, request, reply, err = self.send('--task', 'x', FAKE_USAGE=json.dumps(
+                {'input_tokens': 1, 'cached_input_tokens': 0, 'output_tokens': 1}))
+        self.assertEqual((code, reply), (0, 'codex reply\nFiles touched: none\n'))
+        self.assertIn('cowork usage codex/main: unavailable\n', err)
+        self.assertEqual(self.leftovers(request), [])
+
     def test_a_failing_codex_turn_reports_its_jsonl_error_and_stderr(self):
         code, request, reply, _ = self.send('--task', 'x', FAKE_EXIT='2', FAKE_STDERR='bad \xff bytes')
         self.assertEqual(code, 1)
@@ -784,7 +839,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('delivered already', err)
 
     def test_read_reports_a_reaped_send_exactly_as_send_would_have(self):
-        for env, want in (({}, (0, 'codex reply\nFiles touched: none\n', '')),
+        for env, want in (({}, (0, 'codex reply\nFiles touched: none\n', NO_USAGE)),
                           ({'FAKE_REPLY': 'missing footer\n'}, (cowork.MALFORMED, 'missing footer\n', 'no "Files touched" line')),
                           ({'FAKE_EXIT': '2'}, (cowork.FAILED, 'exited 2', ''))):
             with self.subTest(env=env):
@@ -813,7 +868,7 @@ class CoworkTest(unittest.TestCase):
         reader = self.read_wait(request)
         self.gate.touch()
         out, err = reader.communicate(timeout=10)
-        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
         self.assertEqual(self.leftovers(request), [])
 
     def test_send_detach_exits_and_closes_its_output_while_the_runner_works(self):
@@ -830,7 +885,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIsNone(cowork.session_of(self.box()))
         self.gate.touch()
         out, err = reader.communicate(timeout=10)
-        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
         self.assertEqual(cowork.session_of(self.box()), 'thread-42')
         self.assertEqual(self.leftovers(request), [])
 
@@ -844,7 +899,7 @@ class CoworkTest(unittest.TestCase):
             reader = self.read_wait('codex-x')
             self.assertTrue((box / 'codex-x.reply').exists())
         out, err = reader.communicate(timeout=10)
-        self.assertEqual((reader.returncode, out, err), (0, 'done\nFiles touched: none\n', ''))
+        self.assertEqual((reader.returncode, out, err), (0, 'done\nFiles touched: none\n', NO_USAGE))
 
     def test_read_wait_leaves_status_and_kill_responsive(self):
         request = self.reaped('--task', 'x')
@@ -858,7 +913,7 @@ class CoworkTest(unittest.TestCase):
         out, err = reader.communicate(timeout=10)
         self.assertEqual(reader.returncode, cowork.FAILED)
         self.assertIn('was killed', out)
-        self.assertEqual(err, '')
+        self.assertEqual(err, NO_USAGE)
 
     def test_read_wait_competing_consumers_deliver_once(self):
         request = self.reaped('--task', 'x')
@@ -869,7 +924,7 @@ class CoworkTest(unittest.TestCase):
             out, err = reader.communicate(timeout=10)
             results.append((reader.returncode, out, err))
         results.sort()
-        self.assertEqual(results[0], (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual(results[0], (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
         self.assertEqual(results[1][:2], (cowork.BUSY, ''))
         self.assertIn('delivered already', results[1][2])
         self.assertEqual(self.leftovers(request), [])
@@ -883,7 +938,7 @@ class CoworkTest(unittest.TestCase):
         replacement = self.read_wait(request)
         self.gate.touch()
         out, err = replacement.communicate(timeout=10)
-        self.assertEqual((replacement.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', ''))
+        self.assertEqual((replacement.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
         self.assertEqual(self.leftovers(request), [])
 
     def test_the_jsonl_exists_the_instant_the_id_is_printed(self):

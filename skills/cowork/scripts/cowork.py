@@ -27,7 +27,7 @@ inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
 (the verdict, first writer wins). One request per lane is in flight: a send
 while one is refused.
 
-send waits for the reply, prints it and removes the request, or with --detach
+send waits for the reply, prints it, its usage line on stderr, and removes the request, or with --detach
 prints only the id and leaves the reply to read; read delivers a reply whose
 send died or detached, waiting for release with --wait and refusing a running
 request otherwise; reset removes everything of a lane, its worktree included
@@ -448,7 +448,12 @@ def run(side, box, host, request, no_edit, lock_fd):
 
 def conclude(side, box, status, reply, stream, new_session, before, root):
     """What the finished CLI left behind: bind a new session, validate the
-    reply, check a --no-edit tree, surface Codex's in-stream error."""
+    reply, check a --no-edit tree, surface Codex's in-stream error, record
+    the turn's usage."""
+    with contextlib.suppress(Exception):  # usage is a report, never a reason to lose the verdict
+        line = usage(side, stream)
+        if line:
+            reply.with_suffix('.usage').write_text(line)
     if side == 'codex':
         if not session_of(box):
             thread = next((e['thread_id'] for e in events(stream) if 'thread_id' in e), None)
@@ -486,6 +491,35 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
 
 class SnapshotError(Exception):
     """tree_state could not read the tree: a --no-edit turn stays unverified, never passes."""
+
+
+def usage(side, stream):
+    """The turn's token usage as one line, or None unless the stream reports
+    every counter. Codex reports running totals for the session; Claude
+    reports the request and, per call, the context it sent."""
+    def count(v):
+        return type(v) is int and v >= 0  # a bool is an int to isinstance
+    def counts(u, *keys, optional=()):
+        if not isinstance(u, dict) or not all(count(u.get(k)) for k in keys) \
+                or not all(count(u.get(k, 0)) for k in optional):
+            return None
+        return {k: u.get(k, 0) for k in keys + optional}
+    if side == 'codex':
+        done = next((e for e in events(stream) if e.get('type') == 'turn.completed'), None)
+        total = counts(done and done.get('usage'), 'input_tokens', 'cached_input_tokens', 'output_tokens')
+        return total and (f'session input {total["input_tokens"]:,} (cached {total["cached_input_tokens"]:,}), '
+                          f'output {total["output_tokens"]:,}')
+    cache = ('cache_read_input_tokens', 'cache_creation_input_tokens')
+    def sent(u):
+        return u['input_tokens'] + u['cache_read_input_tokens'] + u['cache_creation_input_tokens']
+    result = next((e for e in events(stream) if e.get('type') == 'result'), None)
+    used = counts(result and result.get('usage'), 'input_tokens', 'output_tokens', optional=cache)
+    if not used:
+        return None
+    last = next((counts(e['message']['usage'], 'input_tokens', optional=cache) for e in events(stream)
+                 if e.get('type') == 'assistant' and isinstance(e.get('message'), dict) and 'usage' in e['message']), None)
+    return (f'input {sent(used):,} (cached {used["cache_read_input_tokens"]:,}), output {used["output_tokens"]:,}'
+            + (f'; context {sent(last):,} (last call)' if last else ''))
 
 
 def tree_state(root):
@@ -558,6 +592,11 @@ def deliver(box, request):
         if held(lock):
             die(f'{request} is {state(box, request)}; read it once it settles', BUSY)
         what, code = verdict(box, request)
+        try:
+            used = text_of(box / f'{request}.usage')
+        except OSError:  # none recorded, or unreadable: a report, never a reason to lose the reply
+            used = 'unavailable'
+        print(f'cowork usage {box.parent.name}/{box.name}: {used}', file=sys.stderr)
         if code == FAILED:
             err = box / f'{request}.err'  # absent if send died before starting the runner
             text = f'cowork request {request} {what}\n{text_of(err)[-2000:] if err.exists() else ""}'

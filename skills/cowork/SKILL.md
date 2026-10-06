@@ -29,7 +29,7 @@ python3 $S reset codex|claude <lane>|all   # forget the lane and its requests; a
 `send` prints the request id, then blocks until the reply is in and prints
 it; `--detach` returns after the id. In an ordinary Claude session, run
 `send --detach` in the foreground and arm Monitor, at its maximum
-`timeout_ms`, on `python3 $S read --wait <id>` from the same checkout as the
+`timeout_ms`, on `python3 $S read --wait <id> 2>&1` from the same checkout as the
 request's only reader: Claude Code may reap a background shell under memory
 pressure, while Monitor is exempt. When Monitor expires or its reader dies,
 arm it again and report whatever the reader returns. Exit 3 with "no request"
@@ -143,6 +143,9 @@ finding, say whether you reproduced it or only read the code.
   per parallel edit, one topic each.
 - **When to reset.** When the coworker's context is spent or the topic
   changes entirely; `status` shows the lanes and undelivered requests.
+  Every delivery prints a `cowork usage <side>/<lane>:` line to stderr: a
+  Codex lane's running session totals, a Claude lane's request tokens and
+  its last call's `context`, or `unavailable`.
 
 ## Rules for both sides
 
