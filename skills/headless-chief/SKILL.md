@@ -16,20 +16,26 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
   --permission-mode bypassPermissions
 ```
 
-1. **Before launching**: a task that publishes to a PR carries its grant
-   verbatim, per the README's headless recipe.
+1. **Before launching**: take the target from the assignment, formed as the
+   Report rule in `agents/chief.md` forms it (`owner/repo#N` and the task),
+   asking only when it is ambiguous, and name `--out` after it. A task that publishes to a PR carries
+   its grant verbatim, per the README's headless recipe.
 2. **Launch** in the foreground: it checks the arguments, starts the
    launcher in its own session, prints its pid and returns. A chief
    runs as long as it needs; a background command would end it at the tool's
    time limit. A refused argument exits 2 at once. The
    `launcher: exit` line in `progress.log` is the end of the run;
    `kill <launcher pid>` stops it early.
-3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`. Each line is
+3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`, its
+   description, on every arm, the target, such as `chief hathach/tinyusb#3988
+   babysit`. Each line is
    `<seq> <HH:MM:SS> <text>`: `launcher:` lines (started, session, a parse
    warning, exit), chief's `chief: <event> · ...` lines, and `note:` lines,
    a progress note, joined onto one line, that the model returned as a `thinking` block
    instead of text; a note can carry an event whose status line never came. An `attention`
-   line is chief asking for something; relay it. Monitor expires after 30
+   line is chief asking for something; relay it. Every line you relay,
+   delivered by Monitor or read later, names the target, so parallel chiefs
+   stay apart. Monitor expires after 30
    minutes: re-arm with `tail -n +<last seq received + 1> -F`, a few lines
    earlier when unsure.
 4. **On exit**, stop the Monitor and read the lines it had not delivered;
@@ -40,7 +46,8 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    `cost.md`, and puts its brief form, the Launches and Usage tables, into the
    report before chief's first `##` section. The exit line ends with the total,
    or with `cost none` and why.
-   In the message that reports the exit, unasked, relay verbatim the Launches
+   Open the message that reports the exit, with or without `report.md`, with
+   the target, and, unasked, relay verbatim the Launches
    table with its State line and chief's `Worth a look:` line, the Usage table
    and chief's decisions for the user; a row that dwarfs the work it did is worth
    a word.
