@@ -33,7 +33,8 @@ request otherwise; reset removes everything of a lane, its worktree included
 once its branch is merged. Exit codes: 1 failed, 3 unknown
 or delivered request, a lane busy, not ready or of the wrong kind, or reset
 refused, 4 missing "Files touched" line, or a --no-edit turn that changed
-the tree or could not be checked (an unreadable tree runs no turn at all).
+the tree or after which it could not be checked; a tree unreadable before
+the turn runs none and fails.
 """
 
 import argparse
@@ -111,9 +112,12 @@ def boxes(gitdir):
 
 
 def kind(box):
+    """main, read-only (its marker), worktree (its base), or None: not yet made."""
     if box.name == 'main':
         return 'main'
-    return 'read-only' if (box / 'read-only').exists() else 'worktree'  # start() writes one marker or the other first
+    if (box / 'read-only').exists():
+        return 'read-only'
+    return 'worktree' if (box / 'base').exists() else None
 
 
 def lane_root(root, box):
@@ -159,6 +163,8 @@ def sync_lane(root, box):
         if not known:
             (box / 'base').write_text(head + '\n')
     claim(tree, box)
+    if not (box / 'base').exists():  # a tree made but never recorded: its kind is unknown, never the host's
+        die(f'lane {lane}\'s worktree {tree} has no record of its base; reset the lane before retrying', BUSY)
 
 
 def drop_lane(root, box):
@@ -419,12 +425,7 @@ def run(side, box, host, request, no_edit, lock_fd):
         env = {k: v for k, v in os.environ.items()  # the coworker is nobody's driver
                if not k.startswith('HERDR_') and k not in ('CLAUDECODE', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID')}
         env['COWORK_TURN'] = request  # tells the simplify gate to stay out
-        try:
-            before = tree_state(root) if no_edit else None
-        except SnapshotError as failure:  # the turn could not be checked, so it does not run
-            print(failure, file=sys.stderr)
-            status = 'unverified'
-            return
+        before = tree_state(root) if no_edit else None  # unreadable: an error, and no turn
         with tempfile.TemporaryFile() as stdin, stream.open('ab') as out:
             stdin.write(prompt.encode())
             stdin.seek(0)
@@ -448,12 +449,7 @@ def run(side, box, host, request, no_edit, lock_fd):
 
 def conclude(side, box, status, reply, stream, new_session, before, root):
     """What the finished CLI left behind: bind a new session, validate the
-    reply, check a --no-edit tree, surface Codex's in-stream error, record
-    the turn's usage."""
-    with contextlib.suppress(Exception):  # usage is a report, never a reason to lose the verdict
-        line = usage(side, stream)
-        if line:
-            reply.with_suffix('.usage').write_text(line)
+    reply, check a --no-edit tree, surface Codex's in-stream error."""
     if side == 'codex':
         if not session_of(box):
             thread = next((e['thread_id'] for e in events(stream) if 'thread_id' in e), None)
@@ -494,31 +490,25 @@ class SnapshotError(Exception):
 
 
 def usage(side, stream):
-    """The turn's token usage as one line, or None unless the stream reports
-    every counter. Codex reports running totals for the session; Claude
-    reports the request and, per call, the context it sent."""
-    def count(v):
-        return type(v) is int and v >= 0  # a bool is an int to isinstance
-    def counts(u, *keys, optional=()):
-        if not isinstance(u, dict) or not all(count(u.get(k)) for k in keys) \
-                or not all(count(u.get(k, 0)) for k in optional):
-            return None
-        return {k: u.get(k, 0) for k in keys + optional}
+    """The turn's token usage as one line; raises unless the stream reports
+    every counter as a count. Codex reports running totals for the session;
+    Claude reports the request and, per call, the context it sent."""
+    def num(u, key, default=None):
+        value = u.get(key, default)
+        if type(value) is not int or value < 0:  # a bool is an int to isinstance
+            raise ValueError(f'{key}: {value!r}')
+        return value
+    found = [e for e in events(stream) if e.get('type') in ('turn.completed', 'result', 'assistant')]
     if side == 'codex':
-        done = next((e for e in events(stream) if e.get('type') == 'turn.completed'), None)
-        total = counts(done and done.get('usage'), 'input_tokens', 'cached_input_tokens', 'output_tokens')
-        return total and (f'session input {total["input_tokens"]:,} (cached {total["cached_input_tokens"]:,}), '
-                          f'output {total["output_tokens"]:,}')
-    cache = ('cache_read_input_tokens', 'cache_creation_input_tokens')
+        total = next(e for e in found if e['type'] == 'turn.completed')['usage']
+        return (f'session input {num(total, "input_tokens"):,} (cached {num(total, "cached_input_tokens"):,}), '
+                f'output {num(total, "output_tokens"):,}')
     def sent(u):
-        return u['input_tokens'] + u['cache_read_input_tokens'] + u['cache_creation_input_tokens']
-    result = next((e for e in events(stream) if e.get('type') == 'result'), None)
-    used = counts(result and result.get('usage'), 'input_tokens', 'output_tokens', optional=cache)
-    if not used:
-        return None
-    last = next((counts(e['message']['usage'], 'input_tokens', optional=cache) for e in events(stream)
-                 if e.get('type') == 'assistant' and isinstance(e.get('message'), dict) and 'usage' in e['message']), None)
-    return (f'input {sent(used):,} (cached {used["cache_read_input_tokens"]:,}), output {used["output_tokens"]:,}'
+        return num(u, 'input_tokens') + num(u, 'cache_read_input_tokens', 0) + num(u, 'cache_creation_input_tokens', 0)
+    used = next(e for e in found if e['type'] == 'result')['usage']
+    last = next((e['message']['usage'] for e in found
+                 if e['type'] == 'assistant' and isinstance(e.get('message'), dict) and 'usage' in e['message']), None)
+    return (f'input {sent(used):,} (cached {num(used, "cache_read_input_tokens", 0):,}), output {num(used, "output_tokens"):,}'
             + (f'; context {sent(last):,} (last call)' if last else ''))
 
 
@@ -526,10 +516,11 @@ def tree_state(root):
     """HEAD, the index entries with their stages, and the worktree as git
     would stage it: what a coworker told not to edit must leave all three
     alone. `ls-files -s` rather than `write-tree`, which refuses conflicts.
-    An unborn HEAD and a missing index are states; any other failure raises."""
-    def git(*args, ok=(0,), quiet=False, **env):
+    An unborn or detached HEAD and a missing index are states; any other
+    failure raises."""
+    def git(*args, ok=(0,), **env):
         done = subprocess.run(['git', *args], cwd=root, capture_output=True, text=True, env={**os.environ, **env})
-        if done.returncode not in ok or quiet and done.stderr:
+        if done.returncode not in ok:
             raise SnapshotError(f'could not verify the tree: git {" ".join(args)}: '
                                 f'{done.stderr.strip() or f"exit {done.returncode}"}')
         return done.stdout
@@ -544,11 +535,8 @@ def tree_state(root):
         git('add', '-A', GIT_INDEX_FILE=index)
         git('add', '-A', '--renormalize', GIT_INDEX_FILE=index)  # rehash every tracked file: equal size and mtime prove nothing
         worktree = git('ls-files', '-s', GIT_INDEX_FILE=index)
-    head = git('rev-parse', '-q', '--verify', 'HEAD', ok=(0, 1))
-    if not head:  # unborn only when HEAD names a branch that git lists nowhere, without complaint; a broken ref is neither
-        branch = git('symbolic-ref', '-q', 'HEAD').strip()
-        if git('for-each-ref', branch, quiet=True):
-            raise SnapshotError(f'could not verify the tree: {branch} exists but does not resolve')
+    # the branch HEAD names (none when detached) and its commit (none when unborn); a broken ref fails the first
+    head = git('symbolic-ref', '-q', 'HEAD', ok=(0, 1)) + git('rev-parse', '-q', '--verify', 'HEAD', ok=(0, 1))
     return head + git('ls-files', '-s') + worktree
 
 
@@ -571,14 +559,19 @@ def verdict(box, request):
     if status == 'edited':
         return 'the tree changed during a --no-edit turn; check git status', MALFORMED
     if status == 'unverified':
-        err = box / f'{request}.err'
-        return (text_of(err)[-2000:].strip() if err.exists() else '') or 'could not verify the tree', MALFORMED
+        return err_tail(box, request).strip() or 'could not verify the tree', MALFORMED
     if status == '0':
         if FOOTER.search(text_of(box / f'{request}.reply')):
             return 'replied', 0
         return 'the reply has no "Files touched" line; re-read the tree yourself', MALFORMED
     return {'error': 'failed', 'killed': 'was killed',
             'died': 'died without recording a verdict'}.get(status, f'exited {status}'), FAILED
+
+
+def err_tail(box, request):
+    """The end of the runner's stderr; absent if send died before starting the runner."""
+    err = box / f'{request}.err'
+    return text_of(err)[-2000:] if err.exists() else ''
 
 
 def deliver(box, request):
@@ -593,13 +586,12 @@ def deliver(box, request):
             die(f'{request} is {state(box, request)}; read it once it settles', BUSY)
         what, code = verdict(box, request)
         try:
-            used = text_of(box / f'{request}.usage')
-        except OSError:  # none recorded, or unreadable: a report, never a reason to lose the reply
+            used = usage(box.parent.name, box / f'{request}.jsonl')
+        except Exception:  # a report, never a reason to lose the reply
             used = 'unavailable'
         print(f'cowork usage {box.parent.name}/{box.name}: {used}', file=sys.stderr)
         if code == FAILED:
-            err = box / f'{request}.err'  # absent if send died before starting the runner
-            text = f'cowork request {request} {what}\n{text_of(err)[-2000:] if err.exists() else ""}'
+            text = f'cowork request {request} {what}\n{err_tail(box, request)}'
         else:
             if code == MALFORMED:
                 print(f'cowork request {request}: {what}', file=sys.stderr)
@@ -632,16 +624,16 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
             if read_only or worktree:
                 die('main is this checkout and writable; --read-only and --worktree are for named lanes', BUSY)
         else:
-            if not (box / 'read-only').exists() and not (box / 'base').exists():
+            lane_kind = kind(box)
+            if lane_kind is None:
                 if (box / 'session').exists():
                     die(f'{side}/{lane} has a session but no record of its kind; reset it', BUSY)
-                if not worktree:
-                    (box / 'read-only').touch()
-            if read_only and kind(box) != 'read-only':
-                die(f'{side}/{lane} is a worktree lane; --read-only cannot convert one', BUSY)
-            if worktree and kind(box) != 'worktree':
-                die(f'{side}/{lane} is a read-only lane; --worktree cannot convert one', BUSY)
-            if kind(box) == 'read-only':
+                lane_kind = 'worktree' if worktree else 'read-only'
+                if lane_kind == 'read-only':
+                    (box / 'read-only').touch()  # a worktree lane's base is written once its tree exists
+            if (read_only or worktree) and lane_kind != ('read-only' if read_only else 'worktree'):
+                die(f'{side}/{lane} is a {lane_kind} lane; it keeps its kind until reset', BUSY)
+            if lane_kind == 'read-only':
                 no_edit = True
             else:
                 sync_lane(root, box)
@@ -675,7 +667,7 @@ def reset(root, gitdir, side, lane):
         busy = running(box)
         if busy:
             die(f'{side}/{lane} is busy with {busy}; not resetting under it', BUSY)
-        if kind(box) == 'worktree':
+        if kind(box) in ('worktree', None):  # a kindless lane may still have a tree
             drop_lane(root, box)
         gone = requests(box)
         for request in gone:
@@ -722,8 +714,6 @@ def main(argv=None):
     for name in ('side', 'lane', 'request', 'no_edit', 'lock_fd'):
         runner.add_argument(name)
     a = parser.parse_args(argv)
-    if a.cmd == 'send' and a.tier and (a.model or a.effort):
-        parser.error('--tier names a pair; --model/--effort pin one: give one or the other')
 
     if a.cmd == 'default':
         path = preset_file()
@@ -791,7 +781,8 @@ def main(argv=None):
                     shown += 1
                     fields = lane_fields(box)
                     model, tier = fields['model'], fields['tier']
-                    where = {'main': '', 'read-only': ', read-only', 'worktree': f', in {lane_root(root, box)}'}[kind(box)]
+                    where = {'main': '', 'read-only': ', read-only', 'worktree': f', in {lane_root(root, box)}',
+                             None: ', kind unknown'}[kind(box)]
                     pair = f', {model} at {fields["effort"]} effort' if model else ''
                     if side == 'codex' and model:
                         pair += f', tier {tier}' if tier else ', pinned'

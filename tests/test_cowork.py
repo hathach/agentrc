@@ -310,7 +310,7 @@ class CoworkTest(unittest.TestCase):
     def test_a_tier_with_a_pin_or_on_a_claude_lane_is_refused(self):
         code, _, _, err = self.send('--tier', 'review', '--model', 'gpt-6-astra', '--task', 'q')
         self.assertEqual(code, 2)
-        self.assertIn('--tier names a pair', err)
+        self.assertIn('--model/--effort are for Claude lanes', err)
         code, _, _, err = self.send('--tier', 'review', '--task', 'q', **CODEX)
         self.assertEqual(code, 2)
         self.assertIn('--tier is for Codex lanes', err)
@@ -426,11 +426,10 @@ class CoworkTest(unittest.TestCase):
         self.commit('a.txt', 'a')
         (self.root / '.git' / 'index').write_bytes(b'garbage')
         ran = len(self.calls())
-        code, request, reply, err = self.send('--no-edit', '--task', 'review')
-        self.assertEqual(code, cowork.MALFORMED)
-        self.assertIn('could not verify the tree', err)
-        self.assertIn('index', err.split('could not verify the tree', 1)[1], "git's own diagnostic is shown")
-        self.assertEqual(reply, '')
+        code, request, reply, _ = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, cowork.FAILED, 'the turn never ran')
+        self.assertIn('could not verify the tree', reply)
+        self.assertIn('index', reply.split('could not verify the tree', 1)[1], "git's own diagnostic is shown")
         self.assertEqual(len(self.calls()), ran, 'the coworker never ran')
         self.assertEqual(self.leftovers(request), [])
 
@@ -438,10 +437,20 @@ class CoworkTest(unittest.TestCase):
         self.commit('a.txt', 'a')
         (self.root / '.git' / 'refs' / 'heads' / 'main').write_text('garbage\n')
         ran = len(self.calls())
-        code, _, reply, err = self.send('--no-edit', '--task', 'review')
-        self.assertEqual(code, cowork.MALFORMED)
-        self.assertIn('could not verify the tree', err)
-        self.assertEqual((reply, len(self.calls())), ('', ran))
+        code, _, reply, _ = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, cowork.FAILED)
+        self.assertIn('could not verify the tree', reply)
+        self.assertEqual(len(self.calls()), ran)
+
+    def test_a_detached_head_is_a_snapshot_and_a_branch_switch_is_an_edit(self):
+        self.commit('a.txt', 'a')
+        sh(self.root, 'git', 'checkout', '-q', '--detach')
+        self.assertEqual(self.send('--no-edit', '--task', 'review')[0], 0)
+        sh(self.root, 'git', 'checkout', '-q', 'main')
+        self.codex_does("import subprocess; subprocess.run(['git', 'checkout', '-q', '-b', 'elsewhere'])")
+        code, _, _, err = self.send('--no-edit', '--task', 'review')
+        self.assertEqual(code, cowork.MALFORMED, 'same commit, same index, another branch')
+        self.assertIn('tree changed during a --no-edit turn', err)
 
     def test_a_tree_it_cannot_snapshot_after_the_turn_keeps_the_reply(self):
         self.commit('a.txt', 'a')
@@ -526,15 +535,9 @@ class CoworkTest(unittest.TestCase):
                 self.assertEqual(code, 0)
                 self.assertIn('cowork usage claude/main: unavailable\n', err)
 
-    def test_an_unreadable_usage_record_still_delivers_the_reply(self):
-        real = cowork.text_of
-        def text_of(path):
-            if path.suffix == '.usage':
-                raise PermissionError('denied')
-            return real(path)
-        with mock.patch.object(cowork, 'text_of', text_of):
-            code, request, reply, err = self.send('--task', 'x', FAKE_USAGE=json.dumps(
-                {'input_tokens': 1, 'cached_input_tokens': 0, 'output_tokens': 1}))
+    def test_a_usage_report_that_raises_still_delivers_the_reply(self):
+        with mock.patch.object(cowork, 'usage', side_effect=PermissionError('denied')):
+            code, request, reply, err = self.send('--task', 'x')
         self.assertEqual((code, reply), (0, 'codex reply\nFiles touched: none\n'))
         self.assertIn('cowork usage codex/main: unavailable\n', err)
         self.assertEqual(self.leftovers(request), [])
@@ -995,10 +998,10 @@ class CoworkTest(unittest.TestCase):
         self.send('--lane', 'impl', '--worktree', '--task', 'z')
         code, _, _, err = self.send('--lane', 'impl', '--read-only', '--task', 'w')
         self.assertEqual(code, cowork.BUSY)
-        self.assertIn('codex/impl is a worktree lane; --read-only cannot convert one', err)
+        self.assertIn('codex/impl is a worktree lane; it keeps its kind until reset', err)
         code, _, _, err = self.send('--lane', 'review', '--worktree', '--task', 'u')
         self.assertEqual(code, cowork.BUSY)
-        self.assertIn('codex/review is a read-only lane; --worktree cannot convert one', err)
+        self.assertIn('codex/review is a read-only lane; it keeps its kind until reset', err)
         for flag in ('--read-only', '--worktree'):
             code, _, _, err = self.send(flag, '--task', 'v')
             self.assertEqual(code, cowork.BUSY)
@@ -1042,6 +1045,23 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('codex/impl has a session but no record of its kind', err)
         self.assertEqual(len(self.calls()), ran)
         self.assertFalse((self.box(lane='impl') / 'read-only').exists())
+        self.assertIn('codex/impl: session thread-42, gpt-6.1-sol at high effort, tier default, kind unknown',
+                      self.run_cli('status')[1])
+        (self.root / '.worktrees' / 'cowork-codex-impl' / 'scratch.txt').write_text('left behind')
+        code, _, err = self.run_cli('reset', 'codex', 'impl')
+        self.assertEqual(code, cowork.BUSY, "a kindless lane's tree is still guarded")
+        self.assertIn('uncommitted changes', err)
+
+    def test_a_tree_left_without_its_base_is_refused_not_run_in_the_host(self):
+        self.commit('a.txt', 'a')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        for name in ('base', 'session'):  # as if interrupted between making the tree and recording its base
+            (self.box(lane='impl') / name).unlink()
+        ran = len(self.calls())
+        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'y')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('has no record of its base', err)
+        self.assertEqual(len(self.calls()), ran)
 
     def test_the_recorded_base_is_the_commit_the_worktree_was_made_from(self):
         base = self.commit('a.txt', 'a')

@@ -77,9 +77,9 @@ its history.
 - **Whether the result holds.** Re-read every file the reply lists under
   "Files touched" before you build on it. A claim of done is a claim.
 - **When to reset.** When the topic changes, or the coworker's context is
-  spent: each delivery's `cowork usage` line on stderr shows a Claude lane's
-  last-call context; a Codex lane's line gives its session totals, not its
-  context.
+  spent. Each delivery's `cowork usage` line on stderr gives a Claude lane's
+  request tokens and last-call context, a Codex lane's session totals (not
+  its context), or `unavailable`.
 
 ## Report
 

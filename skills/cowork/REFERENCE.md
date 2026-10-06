@@ -3,20 +3,12 @@
 Details `SKILL.md` leaves out. `scripts/cowork.py --help` and its docstring
 are the source of truth.
 
-## Commands
+## Flags SKILL.md leaves out
 
-```bash
-python3 $S send (--task "..." | --task -) [--to codex|claude] [--lane L] [--read-only | --worktree] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach]
-python3 $S kill <id>
-python3 $S read [--wait] <id>
-python3 $S status
-python3 $S default [astra|sol]
-python3 $S reset codex|claude <lane>|all
-```
-
-The coworker defaults to the other CLI: Codex from Claude Code, Claude from
-Codex; `--to` overrides. `--tier` is for Codex lanes, `--model`/`--effort`
-for Claude lanes; either on the wrong side is refused.
+`--to codex|claude` picks the coworker, by default the other CLI: Codex from
+Claude Code, Claude from Codex. `--read-only` asserts a read-only lane.
+`--model M` and `--effort E` set a Claude lane's pair; `--tier` is for Codex
+lanes. Either on the wrong side is refused.
 
 ## Delivery
 
@@ -29,26 +21,23 @@ one print it again. Plain `read <id>` refuses a request still running;
 3 with "no request" means the request is absent here: delivered already,
 never sent, or removed by `reset`, which also drops undelivered requests
 with the lane's session. The coworker's own store keeps the whole session,
-prompts included: `~/.codex/sessions` and `~/.claude/projects`, where
-`codex resume` / `claude --resume` find it and the request id greps it.
-
-The usage line: a Codex lane's running session totals (`session input N
-(cached C), output O`), a Claude lane's request tokens and its last call's
-`context`, or `unavailable` when the stream reported no complete counters.
+prompts included, where `codex resume` / `claude --resume` find it.
 
 ## Exit codes
 
-1 the turn failed; 3 unknown or delivered request, the lane busy, a lane of
-another kind than the flags assert, a pinned or kindless lane, a dirty
-worktree lane, or reset refused; 4 the reply lacks its "Files touched" line,
-or under `--no-edit` the tree changed or could not be checked, the latter
-with git's diagnostic and, when it failed before the turn, no turn run.
+1 the turn failed, or never ran because the tree could not be checked
+before it; 3 unknown or delivered request, the lane busy, a lane of another
+kind than the flags assert, a pinned or kindless lane, a dirty worktree
+lane, or reset refused; 4 the reply lacks its "Files touched" line, or under
+`--no-edit` the tree changed or could not be checked after the turn, with
+git's diagnostic.
 
 ## `--no-edit`
 
-Claude runs in plan mode. Codex is asked, then checked: HEAD, the index and
-the worktree as git would stage it, before and after the turn, since its
-read-only sandbox would also forbid the temp files a test suite needs. The
+Claude runs in plan mode; Codex is asked, since its read-only sandbox would
+also forbid the temp files a test suite needs. Both are then checked: the
+branch HEAD names, its commit, the index and the worktree as git would stage
+it, before and after the turn. The
 check sees what git sees, not effects outside the checkout, and an edit you
 make during a read-only review changes the snapshot too.
 
@@ -76,7 +65,7 @@ its kind is refused until `reset`. Lane names are `[a-z0-9-]`, up to 40.
 this host only. A new Codex lane
 starts on `default`; a send without `--tier` keeps the lane's tier, resolved
 at each send, so a flip reaches every `default` lane on its next send while
-a request already running keeps its pair. A Codex lane pinned to a model
-before pins were dropped shows as `pinned` in `status` and is refused until
-a send names its `--tier`. A Claude lane keeps its `--model` and `--effort`,
+a request already running keeps its pair. A Codex lane saved with a model but
+no tier shows as `pinned` in `status` and is refused until a send names its
+`--tier`. A Claude lane keeps its `--model` and `--effort`,
 else `opus` at `high`. The request header tells the coworker its pair.
