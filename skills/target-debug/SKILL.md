@@ -312,6 +312,9 @@ the wire itself: `usb-sniffer` skill (hardware tap, PID-level).
   the ring buffer; if it vanishes under GDB too, PC-sampling only.
 - **UART logging blocks in the write path** (worst perturbation, including
   inside the ISR); RTT is much cheaper but not free; verbose logging multiplies both.
+- **`pkill -f PATTERN` matches its own caller**: the pattern is in your
+  shell's (or ssh's) command line, so it kills the command running it.
+  Bracket one character (`pkill -f '[J]LinkGDBServer'`) or kill by PID.
 - Flash/GDB only with the board lock held; a hold refused because CI is
   mid-test on that board means wait, and force only under an explicitly
   scoped forced-lock recovery (Delegated sessions' Lock).
