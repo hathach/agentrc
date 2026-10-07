@@ -361,8 +361,10 @@ class CoworkTest(unittest.TestCase):
             self.assertEqual(call['env']['COWORK_TURN'], call['stdin'].split('cowork request ')[1].split()[0],
                              'COWORK_TURN names the request so the gate stays out')
         self.assertIn('---\nfirst task\n---\n', first['stdin'])
-        for call in (first, second):  # last, so a task asking for its output only does not drop the footer
-            self.assertTrue(call['stdin'].endswith('"Files touched: none", even when the task asks for nothing else.\n'))
+        # last, so a task asking for its output only does not drop the footer
+        self.assertTrue(first['stdin'].endswith('"Files touched: none", even when the task asks for nothing else.\n'))
+        self.assertTrue(second['stdin'].endswith('\n---\nIf you changed any file, end your reply with a line '
+                                                 '"Files touched: <paths>".\n'), 'a read-only turn owes no "none"')
         self.assertIn('Scope: edit and commit', first['stdin'])
         self.assertIn('Scope: do not edit anything', second['stdin'])
 
@@ -642,6 +644,49 @@ class CoworkTest(unittest.TestCase):
         code, _, err = self.run_cli('read', 'codex-nope')
         self.assertEqual(code, cowork.BUSY)
         self.assertNotIn('cowork result', err)
+
+    def test_the_trailer_follows_the_requests_effective_scope(self):
+        self.commit('a.txt', 'a')
+        for argv in (('--no-edit',), ('--lane', 'plan'), ('--lane', 'impl', '--worktree'), ()):
+            with self.subTest(argv):
+                self.send(*argv, '--task', 'x')
+                read_only = argv in (('--no-edit',), ('--lane', 'plan'))
+                self.assertEqual('If you changed any file' in self.calls()[-1]['stdin'], read_only)
+
+    def test_a_read_only_reply_needs_no_footer_but_reported_paths_reach_the_receipt(self):
+        for argv, reply, used in ((('--no-edit',), 'looks fine\n', 'usage unavailable'),
+                                  (('--lane', 'plan'), 'looks fine\n', 'usage unavailable'),
+                                  (('--no-edit',), 'x\nFiles touched: none\n', 'usage unavailable'),
+                                  (('--no-edit',), 'notes\nFiles touched: /tmp/notes.md\n',
+                                   'paths reported: /tmp/notes.md; usage unavailable')):
+            with self.subTest(argv=argv, reply=reply):
+                code, request, out, err = self.send(*argv, '--task', 'x', FAKE_REPLY=reply)
+                lane = 'codex/' + (argv[1] if argv[0] == '--lane' else 'main')
+                self.assertEqual((code, out, err), (0, reply, receipt(request, used=used, lane=lane)))
+                self.assertEqual(self.leftovers(request), [])
+
+    def test_the_footer_rule_follows_scope_on_every_side_and_kind(self):
+        self.commit('a.txt', 'a')
+        bare = json.dumps({'type': 'result', 'result': 'done'})
+        for argv, env, code in ((('--to', 'claude', '--no-edit'), {**CODEX, 'FAKE_RESULT': bare}, 0),
+                                (('--to', 'claude'), {**CODEX, 'FAKE_RESULT': bare}, cowork.MALFORMED),
+                                (('--lane', 'impl', '--worktree', '--no-edit'), {'FAKE_REPLY': 'done\n'}, 0)):
+            with self.subTest(argv):
+                self.assertEqual(self.send(*argv, '--task', 'x', **env)[0], code)
+        box = self.box()  # a request from before the marker existed is a writer's
+        box.mkdir(parents=True, exist_ok=True)
+        (box / 'codex-x.exit').write_text('0\n')
+        (box / 'codex-x.reply').write_text('done\n')
+        (box / 'codex-x.lock').touch()
+        code, _, err = self.run_cli('read', 'codex-x')
+        self.assertEqual((code, err.splitlines()[-1] + '\n'), (cowork.MALFORMED, receipt('codex-x', 'no-footer', cowork.MALFORMED)))
+
+    def test_an_empty_reply_is_flagged_whatever_the_scope(self):
+        for argv in (('--no-edit',), ()):
+            with self.subTest(argv):
+                code, request, out, err = self.send(*argv, '--task', 'x', FAKE_REPLY='\n')
+                self.assertEqual(code, cowork.MALFORMED)
+                self.assertTrue(err.endswith(receipt(request, 'empty-reply', cowork.MALFORMED)), err)
 
     def test_a_missing_cli_is_reported_not_raised(self):
         (self.bin / 'codex').unlink()

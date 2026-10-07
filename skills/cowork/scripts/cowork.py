@@ -22,9 +22,9 @@ A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
 teardown, so liveness does not depend on pid reuse; the CLI pid is written
-inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
-(the verdict, first writer wins). One request per lane is in flight: a send
-while one is refused.
+inside), .no-edit for a read-only request, .jsonl (CLI stdout), .err
+(stderr), and at settle .reply and .exit (the verdict, first writer wins).
+One request per lane is in flight: a send while one is refused.
 
 send waits for the reply, prints it, then on stderr any diagnostic and a
 last `cowork result <id>` line with the outcome, exit code and usage, and
@@ -32,10 +32,11 @@ removes the request, or with --detach prints only the id and leaves the reply
 to read; read delivers a reply whose send died or detached, waiting for
 release with --wait and refusing a running request otherwise; reset removes
 everything of a lane, its worktree included once its branch is merged. Exit
-codes: 1 failed, 3 unknown or delivered request, a lane busy, not ready or of the wrong kind, or reset
-refused, 4 missing "Files touched" line, or a --no-edit turn that changed
-the tree or after which it could not be checked; a tree unreadable before
-the turn runs none and fails.
+codes: 1 failed, 3 unknown or delivered request, a lane busy, not ready or
+of the wrong kind, or reset refused, 4 an empty reply, a writer's reply
+without its "Files touched" line, or a --no-edit turn that changed the tree
+or after which it could not be checked; a tree unreadable before the turn
+runs none and fails.
 """
 
 import argparse
@@ -56,7 +57,7 @@ from pathlib import Path
 
 SIDES = ('codex', 'claude')
 FAILED, BUSY, MALFORMED = 1, 3, 4
-FOOTER = re.compile(r'^Files touched: \S', re.M)
+FOOTER = re.compile(r'^Files touched: (\S.*)$', re.M)
 LANE = re.compile(r'^(?!all$)[a-z0-9-]{1,40}$')
 BOOTSTRAP = (  # the receiver's whole contract, so it need not read the driver's skill
     'You are the {side} coworker on the cowork channel of the checkout at {root}: a headless,\n'
@@ -66,8 +67,10 @@ BOOTSTRAP = (  # the receiver's whole contract, so it need not read the driver's
     '`git commit --only -- <same paths>`, never a bare `git commit`, `git add -A` or `commit -a`.\n'
     'Do not load the `cowork` skill: it is for the driving side, and these are its rules for you.\n\n')
 HEADER = 'cowork request {id} from {me} on lane {lane}, answered by {model} at {effort} effort. Scope: {scope}.\n{where}---\n'
-TRAILER = ('\n---\nEnd your reply with a line "Files touched: <paths>" or "Files touched: none", '
-           'even when the task asks for nothing else.\n')  # after the task, so the task cannot override it
+TRAILER = {  # by --no-edit; after the task, so the task cannot override it
+    False: ('\n---\nEnd your reply with a line "Files touched: <paths>" or "Files touched: none", '
+            'even when the task asks for nothing else.\n'),
+    True: '\n---\nIf you changed any file, end your reply with a line "Files touched: <paths>".\n'}
 WHERE = 'Your checkout is the worktree {root} on branch {branch}, created at {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # names both CLIs accept
@@ -348,7 +351,7 @@ def session_of(box):
 def compose(session, side, request, task, no_edit, root, model, effort, lane, where):
     sender = 'claude' if side == 'codex' else 'codex'
     header = HEADER.format(id=request, me=sender, lane=lane, scope=SCOPE[no_edit], model=model, effort=effort, where=where)
-    return ('' if session else BOOTSTRAP.format(side=side, root=root)) + header + task.rstrip('\n') + TRAILER
+    return ('' if session else BOOTSTRAP.format(side=side, root=root)) + header + task.rstrip('\n') + TRAILER[no_edit]
 
 
 def command(side, session, reply_file, no_edit, model, effort):
@@ -553,7 +556,7 @@ def events(stream):
 
 def verdict(box, request):
     """(outcome, what to say about it, exit code) of a request whose runner
-    has let go. A runner killed outright left no verdict: record one, so the
+    has let go; for a reply, what to say is an advisory for the receipt. A runner killed outright left no verdict: record one, so the
     request is delivered like any other."""
     exit_file = box / f'{request}.exit'
     publish(exit_file, 'died\n')
@@ -563,7 +566,14 @@ def verdict(box, request):
     if status == 'unverified':
         return 'unverified', err_tail(box, request).strip() or 'could not verify the tree', MALFORMED
     if status == '0':
-        if FOOTER.search(text_of(box / f'{request}.reply')):
+        reply = text_of(box / f'{request}.reply')
+        footers = FOOTER.findall(reply)
+        if not reply.strip():
+            return 'empty-reply', 'the reply is empty', MALFORMED
+        if (box / f'{request}.no-edit').exists():  # checked by its tree; reported paths may lie outside it
+            paths = footers[-1].strip() if footers else 'none'
+            return 'replied', '' if paths == 'none' else f'paths reported: {paths}', 0
+        if footers:
             return 'replied', '', 0
         return 'no-footer', 'the reply has no "Files touched" line; re-read the tree yourself', MALFORMED
     if status in ('killed', 'died'):
@@ -602,7 +612,8 @@ def deliver(box, request):
             print(text, end='' if text.endswith('\n') else '\n', flush=True)
         if code == MALFORMED:
             print(f'cowork request {request}: {what}', file=sys.stderr)
-        print(f'cowork result {request} {box.parent.name}/{box.name}: {outcome}, exit {code}; {used}',
+        advisory = f'; {what}' if code == 0 and what else ''
+        print(f'cowork result {request} {box.parent.name}/{box.name}: {outcome}, exit {code}{advisory}; {used}',
               file=sys.stderr, flush=True)
         remove(box, request)
     return code
@@ -645,6 +656,8 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
         settle_pair(box, side, model, effort, tier)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task)
+        if no_edit:
+            (box / f'{request}.no-edit').touch()  # for verdict(), which owes a read-only reply no footer
         (box / f'{request}.jsonl').touch()
         with (box / f'{request}.lock').open('w') as lock, (box / f'{request}.err').open('ab') as err:
             fcntl.flock(lock, fcntl.LOCK_EX)
