@@ -28,7 +28,9 @@ python3 $S default [astra|sol]   # the Codex default tier's preset on this host
 In Claude Code, run `send --detach` in the foreground and arm Monitor, at
 its maximum `timeout_ms`, on `python3 $S read --wait <id> 2>&1` as the
 request's only reader: Monitor survives the memory pressure that may reap a
-background shell. Re-arm it, from the same checkout, when it expires or its
+background shell. A delivery ends with one receipt line, `cowork result <id>
+<side>/<lane>: <outcome>, exit <N>; <usage>`: the reader is done when it
+names your id, so no exit-status wrapper is needed. Re-arm it, from the same checkout, when it expires or its
 reader dies, and report what it returns; an exit 3 "no request" means the
 request is absent here, so look in earlier Monitor events, else report its
 delivery as unknown. Fan out with one send
@@ -53,8 +55,10 @@ you are answering (`COWORK_TURN`) or another caller's.
   To hand it newer commits, merge them in its tree yourself; merge its
   branch to take its commits.
 
-A lane keeps its kind and session until `reset`. Never open a lane's
-session interactively while a request runs.
+Name a lane after its task, `review-<topic>`, `plan-<topic>`: a new topic
+gets a new lane rather than an old one whose stale context every call
+resends. A lane keeps its kind and session until `reset`. Never open a lane's session interactively while a request
+runs.
 
 Codex lanes run on tiers: `review` for planning, `co-ask`, `co-plan`,
 `co-debug` and `co-review` exchanges, non-routine and completion reviews;
@@ -63,11 +67,11 @@ Codex lanes run on tiers: `review` for planning, `co-ask`, `co-plan`,
 `co-test` rounds before their completion review, and lookups. `default`
 follows the host preset: flip it to `sol` when the weekly Codex quota is
 tight, between tasks, since a model change likely forfeits an active lane's
-prompt cache on that turn. Routine step reviews share one read-only `step` lane per task, briefed
-with the agreed plan and its invariants; a step that sets an interface,
-invariant, concurrency or hardware behaviour goes to a `review` lane, and
-the completion co-review moves the `step` lane with `--tier review`, keeping
-its history.
+prompt cache on that turn. Routine step reviews share one read-only
+`step-<task>` lane, briefed with the agreed plan and its invariants; a step
+that sets an interface, invariant, concurrency or hardware behaviour goes to
+a lane on `--tier review`, and the completion co-review moves the step lane
+to `--tier review`, keeping its history.
 
 ## What you decide
 
@@ -75,11 +79,14 @@ its history.
   has none of your conversation; say which files it owns and what to leave
   alone. `--no-edit` for a question or a review.
 - **Whether the result holds.** Re-read every file the reply lists under
-  "Files touched" before you build on it. A claim of done is a claim.
-- **When to reset.** When the topic changes, or the coworker's context is
-  spent. Each delivery's `cowork usage` line on stderr gives a Claude lane's
-  request tokens and last-call context, a Codex lane's session totals (not
-  its context), or `unavailable`.
+  "Files touched" before you build on it. A claim of done is a claim. A
+  read-only reply owes that line only when it changed something, and the
+  receipt repeats the paths it names: the tree check cannot see outside the
+  checkout.
+- **When to reset.** When the lane's context is spent: the receipt's usage
+  gives the request's tokens and, where the CLI recorded it, its last call's
+  input context; for a Codex turn not found in its rollout, the session
+  totals (`session input`, no context); else `usage unavailable`.
 
 ## Report
 

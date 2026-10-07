@@ -14,9 +14,16 @@ lanes. Either on the wrong side is refused.
 
 `send` prints the request id, then blocks until the reply is in and prints
 it; `--detach` returns after the id. Delivery by `send` or `read` prints the
-reply on stdout and a `cowork usage <side>/<lane>:` line on stderr, then
-removes the request's files, so a reader killed between the two lets a later
-one print it again. Plain `read <id>` refuses a request still running;
+reply, or a failed turn's diagnostic, on stdout; then on stderr any other
+diagnostic and last the receipt, `cowork result <id> <side>/<lane>:
+<outcome>, exit <N>[; paths reported: <paths>]; <usage>`; then removes the
+request's files, so a reader killed or cut off before that lets a later one
+print it all again. Outcomes: `replied` (0); `no-footer`, `empty-reply`,
+`tree-changed`, `unverified` (4); `failed`, `killed`, `died` (1). A refusal
+(exit 3) prints no receipt. A Codex turn's usage comes from its rollout
+under `$CODEX_HOME/sessions` (`~/.codex/sessions` when unset), the turn
+matched by its request header, else from the stream's session totals,
+labelled `session input`; `usage unavailable` when neither reads. Plain `read <id>` refuses a request still running;
 `read --wait` blocks until its runner and everything it spawned let go. Exit
 3 with "no request" means the request is absent here: delivered already,
 never sent, or removed by `reset`, which also drops undelivered requests
@@ -28,9 +35,13 @@ prompts included, where `codex resume` / `claude --resume` find it.
 1 the turn failed, or never ran because the tree could not be checked
 before it; 3 unknown or delivered request, the lane busy, a lane of another
 kind than the flags assert, a pinned or kindless lane, a dirty worktree
-lane, or reset refused; 4 the reply lacks its "Files touched" line, or under
-`--no-edit` the tree changed or could not be checked after the turn, with
-git's diagnostic.
+lane, or reset refused; 4 an empty reply, a writer's reply without its
+"Files touched" line, or under `--no-edit` the tree changed or could not be
+checked after the turn, with git's diagnostic. A `--no-edit` request, or
+one to a read-only lane, owes the line only when it changed a file; the
+paths it names reach the receipt as an advisory and leave the verdict alone.
+A request left from before that rule has no scope marker and still owes
+it.
 
 ## `--no-edit`
 
