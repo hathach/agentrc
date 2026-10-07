@@ -494,17 +494,66 @@ class SnapshotError(Exception):
     """tree_state could not read the tree: a --no-edit turn stays unverified, never passes."""
 
 
-def usage(side, stream):
-    """The turn's token usage as one line; raises unless the stream reports
-    every counter as a count. Codex reports running totals for the session;
-    Claude reports the request and, per call, the context it sent."""
-    def num(u, key, default=None):
-        value = u.get(key, default)
-        if type(value) is not int or value < 0:  # a bool is an int to isinstance
-            raise ValueError(f'{key}: {value!r}')
-        return value
-    found = [e for e in events(stream) if e.get('type') in ('turn.completed', 'result', 'assistant')]
+def num(u, key, default=None):
+    value = u.get(key, default)
+    if type(value) is not int or value < 0:  # a bool is an int to isinstance
+        raise ValueError(f'{key}: {value!r}')
+    return value
+
+
+def rollout_turn(thread, request):
+    """The last usage record Codex wrote to its rollout for this request's
+    turn, or None unless that turn is found exactly once and completed. The
+    request counts only in an envelope header, so neither a later task quoting
+    it nor a compaction's copy of history matches again."""
+    home = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex')
+    files = list(home.glob(f'sessions/*/*/*/rollout-*-{thread}.jsonl'))
+    if len(files) != 1:
+        return None
+    meta, turn, matches, record, complete = None, None, [], None, False
+    with files[0].open(encoding='utf-8') as rollout:
+        for line in rollout:
+            if not any(word in line for word in ('"session_meta"', '"task_started"', '"task_complete"',
+                                                 '"token_usage_record"', request)):
+                continue  # most of a long rollout is tool output
+            event = json.loads(line)
+            what, payload = event.get('type'), event.get('payload') or {}
+            mine = matches and payload.get('turn_id') == matches[0]
+            if what == 'session_meta':
+                meta = payload.get('id')
+            elif what == 'event_msg' and payload.get('type') == 'task_started':
+                turn = payload.get('turn_id')
+            elif what == 'event_msg' and payload.get('type') == 'task_complete':
+                complete = complete or mine
+            elif what == 'token_usage_record' and mine and payload.get('thread_id') == thread:
+                record = payload
+            elif what == 'response_item' and payload.get('type') == 'message' and payload.get('role') == 'user':
+                text = ''.join(part.get('text', '') for part in payload.get('content') or [] if isinstance(part, dict))
+                head, delimiter, _ = text.partition('\n---\n')
+                if delimiter and any(line.startswith(f'cowork request {request} from ') for line in head.splitlines()):
+                    tagged = (payload.get('internal_chat_message_metadata_passthrough') or {}).get('turn_id', turn)
+                    matches.append(turn if tagged == turn else None)
+    if meta != thread or len(matches) != 1 or matches[0] is None or not complete:
+        return None
+    return record
+
+
+def usage(side, stream, request):
+    """The turn's token usage as one line; raises unless every counter is a
+    count. Codex: the turn's own figures from its rollout, else the running
+    totals for the session its stream reports. Claude: the request and, per
+    call, the context it sent."""
+    found = [e for e in events(stream) if e.get('type') in ('thread.started', 'turn.completed', 'result', 'assistant')]
     if side == 'codex':
+        thread = next((e.get('thread_id') for e in found if e['type'] == 'thread.started'), None)
+        try:
+            record = rollout_turn(thread, request) if thread else None
+            if record:
+                turn, last = record['turn_token_usage'], record['usage']
+                return (f'input {num(turn, "input_tokens"):,} (cached {num(turn, "cached_input_tokens"):,}), '
+                        f'output {num(turn, "output_tokens"):,}; input context {num(last, "input_tokens"):,} (last call)')
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            pass  # a rollout written by another Codex version, or cut short: the stream's totals still hold
         total = next(e for e in found if e['type'] == 'turn.completed')['usage']
         return (f'session input {num(total, "input_tokens"):,} (cached {num(total, "cached_input_tokens"):,}), '
                 f'output {num(total, "output_tokens"):,}')
@@ -600,7 +649,7 @@ def deliver(box, request):
             die(f'{request} is {state(box, request)}; read it once it settles', BUSY)
         outcome, what, code = verdict(box, request)
         try:
-            used = usage(box.parent.name, box / f'{request}.jsonl')
+            used = usage(box.parent.name, box / f'{request}.jsonl', request)
         except Exception:  # a report, never a reason to lose the reply
             used = 'usage unavailable'
         if code == FAILED:

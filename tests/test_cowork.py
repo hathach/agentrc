@@ -29,8 +29,8 @@ import cowork  # noqa: E402
 # keep a turn busy exactly as long as its assertions need.
 FAKE_PREAMBLE = '''#!/usr/bin/env python3
 import json, os, sys, time
-args = sys.argv[1:]
-open(os.environ['FAKE_LOG'], 'a').write(json.dumps({'argv': args, 'stdin': sys.stdin.read(), 'cwd': os.getcwd(),
+args, prompt = sys.argv[1:], sys.stdin.read()
+open(os.environ['FAKE_LOG'], 'a').write(json.dumps({'argv': args, 'stdin': prompt, 'cwd': os.getcwd(),
     'env': {k: v for k, v in os.environ.items() if k.startswith(('COWORK', 'HERDR', 'CLAUDECODE'))}}) + '\\n')
 while os.environ.get('FAKE_GATE') and not os.path.exists(os.environ['FAKE_GATE']):
     time.sleep(0.02)
@@ -44,6 +44,23 @@ if os.environ.get('FAKE_EXIT', '0') != '0':
 open(args[args.index('-o') + 1], 'w').write(os.environ.get('FAKE_REPLY', 'codex reply\\nFiles touched: none\\n'))
 if os.environ.get('FAKE_USAGE'):
     print(json.dumps({'type': 'turn.completed', 'usage': json.loads(os.environ['FAKE_USAGE'])}))
+if os.environ.get('FAKE_ROLLOUT'):  # what Codex records of the turn: turn n's two calls send 1000n and 1500n
+    path = os.path.join(os.environ['CODEX_HOME'], 'sessions', '2026', '10', '07', 'rollout-2026-10-07T00-00-00-thread-42.jsonl')
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    n = 1 + (open(path).read().count('"task_started"') if os.path.exists(path) else 0)
+    turn, lines = f'turn-{n}', [] if n > 1 else [{'type': 'session_meta', 'payload': {'id': 'thread-42'}}]
+    lines += [{'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': turn}},
+              {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [
+                  {'type': 'input_text', 'text': prompt}],
+                  'internal_chat_message_metadata_passthrough': {'turn_id': turn}}}]
+    for call, (sent, cached) in enumerate(((1000 * n, 0), (1500 * n, 1000 * n))):
+        lines.append({'type': 'token_usage_record', 'payload': {'thread_id': 'thread-42', 'turn_id': turn,
+            'usage': {'input_tokens': sent, 'cached_input_tokens': cached, 'output_tokens': 10},
+            'turn_token_usage': {'input_tokens': 1000 * n + sent * call, 'cached_input_tokens': cached,
+                                 'output_tokens': 10 + 10 * call}}})
+    if os.environ['FAKE_ROLLOUT'] != 'incomplete':
+        lines.append({'type': 'event_msg', 'payload': {'type': 'task_complete', 'turn_id': turn}})
+    open(path, 'a').write(''.join(json.dumps(line) + '\\n' for line in lines))
 '''
 FAKE_CLAUDE = FAKE_PREAMBLE + '''if os.environ.get('FAKE_EXIT', '0') != '0':
     sys.exit(int(os.environ['FAKE_EXIT']))
@@ -95,7 +112,7 @@ class CoworkTest(unittest.TestCase):
         clean = {k: v for k, v in os.environ.items() if not k.startswith(('FAKE_', 'HERDR_', 'COWORK', 'CODEX_', 'CLAUDE_'))}
         self.env = mock.patch.dict('os.environ', {
             **clean, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1',
-            'XDG_CONFIG_HOME': str(base / 'config'),
+            'XDG_CONFIG_HOME': str(base / 'config'), 'CODEX_HOME': str(base / 'codex'),
             'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
             'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}, clear=True)
         self.env.start()
@@ -515,6 +532,67 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err, receipt(request, used='session input 77,537 (cached 51,328), output 91'))
         self.assertNotIn('context', err, 'the codex stream has no per-call figure')
+
+    def rollout(self):
+        return next(Path(os.environ['CODEX_HOME']).glob('sessions/*/*/*/rollout-*-thread-42.jsonl'))
+
+    def turn_usage(self, n):
+        return f'input {2500 * n:,} (cached {1000 * n:,}), output 20; input context {1500 * n:,} (last call)'
+
+    def test_codex_usage_is_the_turns_own_from_its_rollout(self):
+        total = json.dumps({'input_tokens': 9, 'cached_input_tokens': 0, 'output_tokens': 1})
+        for n in (1, 2):  # the second turn reports its own figures, not the session's
+            code, request, _, err = self.send('--task', 'x', FAKE_ROLLOUT='1', FAKE_USAGE=total)
+            self.assertEqual((code, err), (0, receipt(request, used=self.turn_usage(n))))
+
+    def detached_and_settled(self, *argv, **env):
+        with mock.patch.dict('os.environ', env):
+            code, out, _ = self.run_cli('send', '--detach', *argv)
+        request = out.strip()
+        until(lambda: not cowork.held(self.box() / f'{request}.lock'))
+        return request
+
+    def test_codex_usage_counts_only_a_header_match_through_compaction(self):
+        first = self.detached_and_settled('--task', 'x', FAKE_ROLLOUT='1')
+        header = f'cowork request {first} from claude on lane main'
+        self.detached_and_settled('--task', f'what did "{header}" ask?', FAKE_ROLLOUT='1')
+        with self.rollout().open('a') as rollout:
+            rollout.write(json.dumps({'type': 'compacted', 'payload': {'replacement_history': [
+                {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': header + '\n---\nx'}]}]}}) + '\n')
+        code, _, err = self.run_cli('read', first)
+        self.assertEqual((code, err), (0, receipt(first, used=self.turn_usage(1))))
+
+    def test_codex_usage_falls_back_to_the_session_unless_the_turn_is_certain(self):
+        total = json.dumps({'input_tokens': 9, 'cached_input_tokens': 0, 'output_tokens': 1})
+        fallback = 'session input 9 (cached 0), output 1'
+        def rewrite(old, new, count=1):
+            text = self.rollout().read_text()
+            self.assertIn(old, text)
+            self.rollout().write_text(text.replace(old, new, count))
+        def quoted(request):  # the id in a message without an envelope
+            events = [json.loads(line) for line in self.rollout().read_text().splitlines()]
+            for event in events:
+                if event['payload'].get('role') == 'user':
+                    event['payload']['content'][0]['text'] = f'explain cowork request {request} from claude'
+            self.rollout().write_text(''.join(json.dumps(event) + '\n' for event in events))
+        for spoil in (None,  # no rollout at all
+                      lambda _: rewrite('"type": "session_meta", "payload": {"id": "thread-42"}', '"type": "session_meta", "payload": {"id": "other"}'),
+                      lambda _: rewrite('"internal_chat_message_metadata_passthrough": {"turn_id": "turn-1"}',
+                                        '"internal_chat_message_metadata_passthrough": {"turn_id": "turn-9"}'),
+                      lambda _: rewrite('"thread_id": "thread-42", "turn_id": "turn-1"', '"thread_id": "thread-7", "turn_id": "turn-1"', 2),
+                      lambda _: rewrite('"usage": {"input_tokens": 1500,', '"usage": {"input_tokens": true,'),
+                      lambda _: self.rollout().write_text(self.rollout().read_text() * 2),  # the header twice
+                      quoted,
+                      'incomplete'):
+            with self.subTest(spoil):
+                with contextlib.suppress(StopIteration):
+                    self.rollout().unlink()
+                rollout = 'incomplete' if spoil == 'incomplete' else ('' if spoil is None else '1')
+                request = self.detached_and_settled('--task', 'x', FAKE_ROLLOUT=rollout, FAKE_USAGE=total)
+                if callable(spoil):
+                    spoil(request)
+                code, _, err = self.run_cli('read', request)
+                self.assertEqual((code, err), (0, receipt(request, used=fallback)))
 
     def test_missing_or_failed_usage_is_unavailable_and_changes_nothing_else(self):
         for env, want in (({}, 0), ({'FAKE_USAGE': '"garbage"'}, 0), ({'FAKE_USAGE': '{}'}, 0),
