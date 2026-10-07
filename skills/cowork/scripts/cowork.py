@@ -4,8 +4,8 @@
   cowork.py send [--to codex|claude] [--lane L] [--read-only | --worktree] [--no-edit] [--tier T | [--model M] [--effort E]] [--detach] (--task TEXT | --task -)
   cowork.py default [astra|sol]
   cowork.py kill <id>
-  cowork.py read [--wait] <id>
-  cowork.py status
+  cowork.py read [--wait] [--out FILE] <id>
+  cowork.py status [--all]
   cowork.py reset <side> <lane>|all
 
 A lane is one resumed session of a side, with files under
@@ -30,7 +30,10 @@ send waits for the reply, prints it, then on stderr any diagnostic and a
 last `cowork result <id>` line with the outcome, exit code and usage, and
 removes the request, or with --detach prints only the id and leaves the reply
 to read; read delivers a reply whose send died or detached, waiting for
-release with --wait and refusing a running request otherwise; reset removes
+release with --wait and refusing a running request otherwise, and with --out
+writing what it would print to that file in one step, printing only a short
+receipt that names it; status lists the lanes holding a request and counts
+the idle ones, --all lists every lane; reset removes
 everything of a lane, its worktree included once its branch is merged. Exit
 codes: 1 failed, 3 unknown or delivered request, a lane busy, not ready or
 of the wrong kind, or reset refused, 4 an empty reply, a writer's reply
@@ -290,10 +293,14 @@ def lane_fields(box):
 
 
 def replace_text(path, text):
-    """Write `path` in one step, so a reader never sees it truncated."""
+    """Write `path` in one step, so a reader never sees it truncated; a
+    failure leaves no temp file behind."""
     tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(text, encoding='utf-8')
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def write_side(box, **fields):
@@ -650,10 +657,12 @@ def err_tail(box, request):
     return text_of(err)[-2000:] if err.exists() else ''
 
 
-def deliver(box, request):
+def deliver(box, request, out=None):
     """Print a settled request's reply, or its failure, on stdout, then its
     diagnostics and one receipt line on stderr, then remove its files: the
-    coworker's session store keeps the turn. Under admission, so two readers
+    coworker's session store keeps the turn. With `out`, write all of that to
+    the file instead and print only a short receipt naming it; a file that
+    cannot be written falls back to printing. Under admission, so two readers
     cannot both claim it, and only once both streams have taken the text."""
     with admission(box):
         lock = box / f'{request}.lock'
@@ -668,17 +677,26 @@ def deliver(box, request):
         else:
             reply = box / f'{request}.reply'  # absent when an unverifiable turn never ran
             text = text_of(reply) if reply.exists() else ''
-        if text:
-            print(text, end='' if text.endswith('\n') else '\n', flush=True)
-        if code == MALFORMED:
-            print(f'cowork request {request}: {what}', file=sys.stderr, flush=True)
-        try:  # after the reply, so a slow rollout never holds it back
+        if text and not text.endswith('\n'):
+            text += '\n'
+        notes = f'cowork request {request}: {what}\n' if code == MALFORMED else ''
+        if out is None:
+            print(text, end='', flush=True)  # before usage, so a slow rollout never holds it back
+        try:
             used = usage(box, request)
         except Exception:  # a report, never a reason to lose the reply
             used = 'usage unavailable'
+        result = f'cowork result {request} {box.parent.name}/{box.name}: {outcome}, exit {code}'
         advisory = f'; {what}' if code == 0 and what else ''
-        print(f'cowork result {request} {box.parent.name}/{box.name}: {outcome}, exit {code}{advisory}; {used}',
-              file=sys.stderr, flush=True)
+        receipt = f'{result}{advisory}; {used}\n'
+        if out is not None:
+            try:
+                replace_text(out, text + notes + receipt)
+                notes, receipt = '', f'{result}; written to {out}\n'
+            except (OSError, ValueError) as failure:
+                print(text, end='', flush=True)
+                notes += f'cowork request {request}: could not write {out} ({failure}); the reply is on stdout\n'
+        print(notes + receipt, end='', file=sys.stderr, flush=True)
         remove(box, request)
     return code
 
@@ -783,7 +801,10 @@ def main(argv=None):
     read = sub.add_parser('read', help='print the reply of a request whose send detached or died, and remove it')
     read.add_argument('request')
     read.add_argument('--wait', action='store_true', help='wait until the runner and its descendants release the request')
-    sub.add_parser('status', help='lanes and undelivered requests in this worktree')
+    read.add_argument('--out', type=Path, metavar='FILE',
+                      help='write the reply, diagnostics and receipt to FILE in one step; print only a short receipt naming it')
+    status = sub.add_parser('status', help='busy lanes and undelivered requests in this worktree, and a count of idle lanes')
+    status.add_argument('--all', action='store_true', help='every lane, idle ones included')
     default = sub.add_parser('default', help='show, or set, the Codex default tier\'s preset for this user on this host')
     default.add_argument('preset', nargs='?', choices=tuple(PRESETS))
     reset_ = sub.add_parser('reset', help='forget a lane\'s session and its requests, remove its worktree once merged; '
@@ -836,7 +857,7 @@ def main(argv=None):
         box = find(gitdir, a.request)
         if a.wait:
             held(box / f'{a.request}.lock', wait=True)
-        return deliver(box, a.request)
+        return deliver(box, a.request, a.out and a.out.absolute())
 
     if a.cmd == 'kill':
         box = find(gitdir, a.request)
@@ -851,13 +872,18 @@ def main(argv=None):
         return 0
 
     if a.cmd == 'status':
+        idle = 0
         for side in SIDES:
             shown = 0
             for lane in lanes(gitdir, side):
                 box = box_of(gitdir, side, lane)
                 with admission(box):  # a delivery in progress would remove files under state()
-                    if not (box / 'session').exists() and not requests(box):
+                    pending = requests(box)
+                    if not (box / 'session').exists() and not pending:
                         continue  # reset, and nothing since
+                    if not (pending or a.all):
+                        idle += 1
+                        continue
                     shown += 1
                     fields = lane_fields(box)
                     model, tier = fields['model'], fields['tier']
@@ -867,10 +893,12 @@ def main(argv=None):
                     if side == 'codex' and model:
                         pair += f', tier {tier}' if tier else ', pinned'
                     print(f'{side}/{lane}: session {fields["session"] or "none"}{pair}{where}')
-                    for request in requests(box):
+                    for request in pending:
                         print(f'  {request}  {state(box, request)}')
-            if not shown:
+            if not shown and a.all:
                 print(f'{side}: no lane')
+        if not a.all:
+            print(f'{idle} idle lane{"" if idle == 1 else "s"}' + (', listed by status --all' if idle else ''))
         return 0
 
     if a.cmd == 'reset':

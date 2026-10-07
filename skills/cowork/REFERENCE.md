@@ -24,11 +24,22 @@ print it all again. Outcomes: `replied` (0); `no-footer`, `empty-reply`,
 under `$CODEX_HOME/sessions` (`~/.codex/sessions` when unset), the turn
 matched by its request header, else from the stream's session totals,
 labelled `session input`; `usage unavailable` when neither reads. Plain `read <id>` refuses a request still running;
-`read --wait` blocks until its runner and everything it spawned let go. Exit
+`read --wait` blocks until its runner and everything it spawned let go.
+`read --out FILE` writes what the delivery would print, reply, diagnostics
+and receipt, to FILE in one step (a temp file beside it, renamed over it;
+the caller removes it), then prints on stderr only `cowork result <id>
+<side>/<lane>: <outcome>, exit <N>; written to <FILE>`, with FILE made
+absolute, and exits as without it. A FILE that cannot be written gets the
+plain delivery, a `could not write` line before its receipt. A refusal
+writes nothing. Exit
 3 with "no request" means the request is absent here: delivered already,
 never sent, or removed by `reset`, which also drops undelivered requests
 with the lane's session. The coworker's own store keeps the whole session,
 prompts included, where `codex resume` / `claude --resume` find it.
+
+`status` lists each lane holding a request, running or undelivered, with
+its requests and their state, then one line counting the idle lanes;
+`status --all` lists every lane with a session instead.
 
 ## Exit codes
 
@@ -77,6 +88,6 @@ this host only. A new Codex lane
 starts on `default`; a send without `--tier` keeps the lane's tier, resolved
 at each send, so a flip reaches every `default` lane on its next send while
 a request already running keeps its pair. A Codex lane saved with a model but
-no tier shows as `pinned` in `status` and is refused until a send names its
+no tier shows as `pinned` in `status --all` and is refused until a send names its
 `--tier`. A Claude lane keeps its `--model` and `--effort`,
 else `opus` at `high`. The request header tells the coworker its pair.

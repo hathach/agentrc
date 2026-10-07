@@ -305,7 +305,7 @@ class CoworkTest(unittest.TestCase):
     def test_a_flipped_default_reaches_a_default_lane_on_its_next_send(self):
         self.send('--task', 'a')
         self.assertEqual(self.run_cli('default', 'astra')[0], 0)
-        _, out, _ = self.run_cli('status')
+        _, out, _ = self.run_cli('status', '--all')
         self.assertIn('codex/main: session thread-42, gpt-6.1-sol at high effort, tier default', out)
         self.send('--task', 'b')
         self.assertEqual(self.pair(self.calls()[1]), ('gpt-6-astra', 'high'))
@@ -323,7 +323,7 @@ class CoworkTest(unittest.TestCase):
     def test_a_pinned_codex_lane_is_refused_until_a_tier_is_named(self):
         self.box().mkdir(parents=True)
         (self.box() / 'session').write_text('thread-42\ngpt-6-astra\nhigh\n')
-        _, out, _ = self.run_cli('status')
+        _, out, _ = self.run_cli('status', '--all')
         self.assertIn('codex/main: session thread-42, gpt-6-astra at high effort, pinned', out)
         code, _, _, err = self.send('--task', 'a')
         self.assertEqual(code, cowork.BUSY)
@@ -1082,6 +1082,72 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('was killed', out)
         self.assertEqual(err, receipt(request, 'killed', cowork.FAILED))
 
+    def test_read_wait_out_writes_the_delivery_and_prints_only_a_short_receipt(self):
+        out_file = Path(self.tmp.name) / 'reply.txt'
+        request = self.reaped('--task', 'x')
+        reader = subprocess.Popen([sys.executable, str(SCRIPT), 'read', '--wait', '--out', str(out_file), request],
+                                  cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.background.append(reader)
+        self.gate.touch()
+        out, err = reader.communicate(timeout=10)
+        self.assertEqual((reader.returncode, out, err),
+                         (0, '', f'cowork result {request} codex/main: replied, exit 0; written to {out_file}\n'))
+        self.assertEqual(out_file.read_text(), 'codex reply\nFiles touched: none\n' + receipt(request))
+        self.assertEqual(self.leftovers(request), [])
+        self.assertEqual(sorted(p.name for p in out_file.parent.glob('reply.txt*')), ['reply.txt'], 'no temp file left')
+
+    def test_read_out_keeps_exit_codes_diagnostics_and_full_receipts_in_the_file(self):
+        out_file = Path(self.tmp.name) / 'reply.txt'
+        for env, code, outcome, said in (({'FAKE_REPLY': 'did it\n'}, cowork.MALFORMED, 'no-footer', 'no "Files touched" line'),
+                                         ({'FAKE_EXIT': '2'}, cowork.FAILED, 'failed', 'exited 2')):
+            with self.subTest(outcome):
+                request = self.reaped('--task', 'x', **env)
+                self.settled(request)
+                got, out, err = self.run_cli('read', '--out', str(out_file), request)
+                self.assertEqual((got, out, err), (code, '', f'cowork result {request} codex/main: {outcome}, exit {code}; '
+                                                              f'written to {out_file}\n'))
+                written = out_file.read_text()
+                self.assertIn(said, written)
+                self.assertTrue(written.endswith(receipt(request, outcome, code)), written)
+                self.gate.unlink()
+
+    def test_read_out_that_cannot_be_written_prints_the_reply_and_says_why(self):
+        request = self.reaped('--task', 'x')
+        self.settled(request)
+        missing = Path(self.tmp.name) / 'no-such-dir' / 'reply.txt'
+        code, out, err = self.run_cli('read', '--out', str(missing), request)
+        self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'), 'the reply is not lost')
+        note, last = err.splitlines(keepends=True)
+        self.assertIn(f'could not write {missing}', note)
+        self.assertEqual(last, receipt(request))
+        self.assertFalse(missing.parent.exists())
+        self.assertEqual(self.leftovers(request), [])
+
+    def test_read_out_of_an_unknown_request_is_refused_and_writes_nothing(self):
+        out_file = Path(self.tmp.name) / 'reply.txt'
+        code, out, err = self.run_cli('read', '--wait', '--out', str(out_file), 'codex-nope')
+        self.assertEqual((code, out), (cowork.BUSY, ''))
+        self.assertIn('no request codex-nope', err)
+        self.assertFalse(out_file.exists())
+
+    def test_status_lists_lanes_holding_a_request_and_counts_idle_ones(self):
+        self.commit('a.txt', 'a')
+        self.send('--lane', 'review-a', '--task', 'x')
+        self.send('--lane', 'review-b', '--task', 'x')
+        undelivered = self.reaped('--task', 'x')
+        self.settled(undelivered)
+        _, out, _ = self.run_cli('status')
+        self.assertEqual(out, f'codex/main: session thread-42, gpt-6.1-sol at high effort, tier default\n'
+                              f'  {undelivered}  replied\n2 idle lanes, listed by status --all\n')
+        _, out, _ = self.run_cli('status', '--all')
+        self.assertIn('codex/review-a: session thread-42', out)
+        self.assertIn('codex/review-b: session thread-42', out)
+        self.assertIn(f'  {undelivered}  replied', out)
+        self.assertIn('claude: no lane', out)
+        self.assertNotIn('idle', out)
+        self.run_cli('read', undelivered)
+        self.assertEqual(self.run_cli('status')[1], '3 idle lanes, listed by status --all\n')
+
     def test_read_wait_competing_consumers_deliver_once(self):
         request = self.reaped('--task', 'x')
         readers = [self.read_wait(request), self.read_wait(request)]
@@ -1138,7 +1204,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn(f'Your checkout is the worktree {tree} on branch cowork/main/codex-impl, created at {base[:12]} '
                       'of the host checkout; commit there.', prompt)
         self.assertEqual(self.head(tree), base)
-        code, out, _ = self.run_cli('status')
+        code, out, _ = self.run_cli('status', '--all')
         self.assertIn(f'codex/impl: session thread-42, gpt-6.1-sol at high effort, tier default, in {tree}', out)
         self.assertNotIn('codex/main', out)
         self.send('--lane', 'impl', '--worktree', '--task', 'y')
@@ -1152,7 +1218,7 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(self.calls()[0]['cwd'], str(self.root))
         self.assertIn('Scope: do not edit anything', self.calls()[0]['stdin'])
         self.assertFalse((self.root / '.worktrees').exists())
-        code, out, _ = self.run_cli('status')
+        code, out, _ = self.run_cli('status', '--all')
         self.assertIn('codex/review: session thread-42, gpt-6.1-sol at high effort, tier default, read-only', out)
         self.codex_does("open('edited.txt', 'w').write('!')")
         code, _, _, err = self.send('--lane', 'review', '--task', 'y')  # no --no-edit: the lane implies it
@@ -1178,7 +1244,7 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.calls()[-1]['cwd'], str(self.root))
         self.assertIn('Scope: do not edit anything', self.calls()[-1]['stdin'])
-        self.assertIn('codex/plan: session thread-42, gpt-6.1-sol at high effort, tier default, read-only', self.run_cli('status')[1])
+        self.assertIn('codex/plan: session thread-42, gpt-6.1-sol at high effort, tier default, read-only', self.run_cli('status', '--all')[1])
         self.assertFalse((self.root / '.worktrees').exists())
         box = self.box(lane='old')  # a worktree lane from before the default changed: no marker, a base
         box.mkdir(parents=True)
@@ -1210,7 +1276,7 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(len(self.calls()), ran)
         self.assertFalse((self.box(lane='impl') / 'read-only').exists())
         self.assertIn('codex/impl: session thread-42, gpt-6.1-sol at high effort, tier default, kind unknown',
-                      self.run_cli('status')[1])
+                      self.run_cli('status', '--all')[1])
         (self.root / '.worktrees' / 'cowork-codex-impl' / 'scratch.txt').write_text('left behind')
         code, _, err = self.run_cli('reset', 'codex', 'impl')
         self.assertEqual(code, cowork.BUSY, "a kindless lane's tree is still guarded")
@@ -1282,13 +1348,14 @@ class CoworkTest(unittest.TestCase):
         self.assertFalse(tree.exists())
         self.assertEqual(sorted(p.name for p in self.box(lane='impl').iterdir()), ['lock'], 'the admission lock stays')
         self.assertNotIn('cowork/main/codex-impl', sh(self.root, 'git', 'branch'))
-        self.assertNotIn('codex/impl', self.run_cli('status')[1])
+        self.assertNotIn('codex/impl', self.run_cli('status', '--all')[1])
         self.codex_does('')
         self.send('--lane', 'review', '--read-only', '--task', 'x')
         self.send('--task', 'x')
         code, out, _ = self.run_cli('reset', 'codex', 'all')
         self.assertEqual(out.count('session forgotten'), 2)
-        self.assertEqual(self.run_cli('status')[1], 'codex: no lane\nclaude: no lane\n')
+        self.assertEqual(self.run_cli('status', '--all')[1], 'codex: no lane\nclaude: no lane\n')
+        self.assertEqual(self.run_cli('status')[1], '0 idle lanes\n')
         code, out, _ = self.run_cli('reset', 'codex', 'nope')
         self.assertEqual((code, out.strip()), (0, 'codex/nope: no session'))
         code, _, err = self.run_cli('reset', 'codex', '../..')

@@ -18,22 +18,24 @@ the judgment.
 S=<skill dir>/scripts/cowork.py
 
 python3 $S send (--task "..." | --task -) [--lane L] [--worktree] [--no-edit] [--tier review|expert|default] [--detach]
-python3 $S read [--wait] <id>    # the reply of a detached or dead sender
+python3 $S read [--wait] [--out FILE] <id>  # the reply of a detached or dead sender
 python3 $S kill <id>             # the running request, with all it spawned
-python3 $S status                # lanes and undelivered requests
+python3 $S status [--all]        # busy lanes, undelivered requests; --all every lane
 python3 $S reset codex|claude <lane>|all
 python3 $S default [astra|sol]   # the Codex default tier's preset on this host
 ```
 
 In Claude Code, run `send --detach` in the foreground and arm Monitor, at
-its maximum `timeout_ms`, on `python3 $S read --wait <id> 2>&1` as the
-request's only reader: Monitor survives the memory pressure that may reap a
-background shell. A delivery ends with a `cowork result <id>` receipt on
-stderr, giving the outcome, exit code and usage (`REFERENCE.md`): the reader
-is done when it names your id, so no exit-status wrapper is needed. Re-arm it, from the same checkout, when it expires or its
-reader dies, and report what it returns; an exit 3 "no request" means the
-request is absent here, so look in earlier Monitor events, else report its
-delivery as unknown. Fan out with one send
+its maximum `timeout_ms`, on `python3 $S read --wait --out <scratch file> <id> 2>&1`
+as the request's only reader: Monitor survives the memory pressure that may
+reap a background shell but truncates long events, so the reply and full
+receipt go to the file and the event is one `cowork result <id>` line with
+the outcome, exit code and file (`REFERENCE.md`); if the file cannot be
+written, the event says why and carries the reply. The reader is done when
+that line names your id: read the file once, then delete it. Re-arm it, from
+the same checkout, when it expires or its reader dies, and report what it
+returns; an exit 3 "no request" means the request is absent here, so look in
+the file and earlier Monitor events, else report its delivery as unknown. Fan out with one send
 and one Monitor per lane. In Codex, run `send` in the foreground. Sessions without Bash, such as `chief`,
 go through the `coworker` agent, on read-only lanes only.
 
