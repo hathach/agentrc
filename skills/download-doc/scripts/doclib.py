@@ -549,23 +549,32 @@ class Library:
                        "spurious lock error. Let it finish first.")
         return out
 
-    def index(self) -> dict:
+    def books(self) -> list:
+        """Every book with the fields index() and a refresh read; one bulk read."""
+        return json.loads(self._run("list", "--for-machine", "-f",
+                                    "id,title,authors,identifiers,comments") or "[]")
+
+    @staticmethod
+    def entry(book: dict) -> dict:
+        """{'id', 'title', 'rev', 'author'} of one book from books()."""
+        m = re.search(r"Rev\.?\s*([0-9A-Za-z.]+)\s*$", book.get("title", ""))
+        return {"id": book["id"], "title": book.get("title", ""),
+                "rev": m.group(1) if m else rev_from_comments(book.get("comments")),
+                "author": book.get("authors", "")}
+
+    def index(self, books: list | None = None) -> dict:
         """{'st:DS12930': {'id': 42, 'title': ..., 'rev': '3.1', 'author': ...}} for every
-        book that carries a vendor identifier. One bulk read beats per-doc `calibredb search`."""
-        books = json.loads(self._run("list", "--for-machine", "-f",
-                                     "id,title,authors,identifiers,comments") or "[]")
+        book that carries a vendor identifier, of `books` or else a fresh books(). One
+        bulk read beats per-doc `calibredb search`."""
         idx = {}
-        for b in books:
+        for b in self.books() if books is None else books:
             ids = b.get("identifiers") or {}
             if not isinstance(ids, dict):
                 continue
             for scheme, code in ids.items():
                 if scheme in ("isbn", "mobi-asin", "uri", "doi"):
                     continue
-                m = re.search(r"Rev\.?\s*([0-9A-Za-z.]+)\s*$", b.get("title", ""))
-                rev = m.group(1) if m else rev_from_comments(b.get("comments"))
-                idx[f"{scheme}:{code}"] = {"id": b["id"], "title": b.get("title", ""),
-                                           "rev": rev, "author": b.get("authors", "")}
+                idx[f"{scheme}:{code}"] = self.entry(b)
         return idx
 
     def legacy_index(self, author: str) -> dict:
@@ -594,17 +603,52 @@ class Library:
                       "--field", f"publisher:{doc.author}", str(book_id), check=False)
         return book_id
 
-    def remove(self, book_id: int, backup_dir: Path) -> None:
-        """Back the PDF up before removing. Calibre's remove is immediate and there is
-        no undo; a superseded revision is still the only copy of that revision."""
-        backup_dir.mkdir(parents=True, exist_ok=True)
-        for line in self._run("list", "--for-machine", "-f", "formats",
-                              "-s", f"id:{book_id}", check=False).splitlines():
-            for path in re.findall(r'"(/[^"]+\.\w+)"', line):
-                src = Path(path)
-                if src.exists():
-                    shutil.copy2(src, backup_dir / src.name)
-        self._run("remove", str(book_id))
+    def remove(self, book_id: int, backup_dir: Path) -> list:
+        """Back the book's files up, then remove it; -> the backup paths. Calibre's
+        remove is immediate and there is no undo; a superseded revision is still the
+        only copy of that revision, so no PDF copied means nothing removed."""
+        try:
+            listed = json.loads(self._run("list", "--for-machine", "-f", "formats",
+                                          "-s", f"id:{book_id}") or "[]")
+            formats = [Path(f) for f in listed[0]["formats"]] if len(listed) == 1 else []
+        except (RuntimeError, ValueError, LookupError, TypeError) as e:
+            raise BackupError(f"book #{book_id}: its files could not be listed ({e})") from e
+        if not any(f.suffix.lower() == ".pdf" and f.is_file() for f in formats):
+            raise BackupError(f"book #{book_id}: no PDF on disk to back up "
+                              f"(formats: {', '.join(map(str, formats)) or 'none'})")
+        copies = []
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            for src in formats:
+                if src.is_file():
+                    copies.append(Path(shutil.copy2(src, unused(backup_dir, f"{src.stem}.book{book_id}", src.suffix))))
+        except OSError as e:
+            raise BackupError(f"book #{book_id}: backing its files up failed ({e})") from e
+        if not any(c.suffix.lower() == ".pdf" for c in copies):
+            raise BackupError(f"book #{book_id}: its PDF vanished before it was copied")
+        try:
+            self._run("remove", str(book_id))
+        except RuntimeError as e:
+            raise RemoveError(f"book #{book_id}: calibredb remove failed ({e}); "
+                              f"backed up to {', '.join(map(str, copies))}") from e
+        return copies
+
+
+class BackupError(RuntimeError):
+    """The book's files could not be backed up, so it was not removed."""
+
+
+class RemoveError(RuntimeError):
+    """The book was backed up but calibredb remove failed: whether it is gone is unknown."""
+
+
+def unused(directory: Path, stem: str, suffix: str) -> Path:
+    """`directory/stem+suffix`, or with a counter before the suffix when that is taken:
+    an earlier backup is never overwritten."""
+    path, n = directory / f"{stem}{suffix}", 1
+    while path.exists():
+        path, n = directory / f"{stem}.{n}{suffix}", n + 1
+    return path
 
 
 # ---------------------------------------------------------------- planning

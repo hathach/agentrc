@@ -75,10 +75,14 @@ python3 <skill dir>/scripts/sync.py add --vendor gigadevice \
 
 The dry run still downloads and checks the file, then prints the identifier, author,
 title, tags and comments it would file. It refuses (exit 1) an identifier already in
-the library — `add` never replaces; refreshing is `sync.py <vendor>`'s — a second
+the library — `add` never replaces — a second
 spelling of the vendor's scheme or author, a title already filed by hand, a download
 that is not a PDF, and an ID pages 1-2 do not confirm (unless `--id-not-printed`). Exit 2 is a
 usage error, a blocker, or a library it could not read. `--apply` imports; reindex after.
+
+A newer revision of a book an adapter does not refresh goes through `sync.py refresh`,
+with `add`'s arguments and a required `--revision`; the given metadata replaces the
+book's, and a failed backup of the old one removes nothing (`sync.py refresh --help`).
 
 ## Conventions
 

@@ -14,7 +14,8 @@ it. Pass --apply once the plan looks right.
   sync.py ti  --parts ina3221,tca9548a
 
 `sync.py add` imports one document by hand under the same conventions, for a vendor
-with no adapter or a document an adapter does not list (`sync.py add --help`).
+with no adapter or a document an adapter does not list (`sync.py add --help`);
+`sync.py refresh` replaces such a book with a newer revision (`sync.py refresh --help`).
 """
 from __future__ import annotations
 
@@ -112,12 +113,23 @@ def library_conflict(doc, idx: dict, legacy: dict) -> str | None:
     have = {k.lower(): v for k, v in idx.items()}.get(doc.ident.lower())
     if have:
         refresh = (f"`sync.py {doc.vendor}` refreshes it when the vendor publishes a newer "
-                   f"revision" if doc.vendor in VENDORS else
-                   "no adapter covers this vendor, so it has no refresh path yet "
-                   "(references/maintaining.md, 'Adding a vendor')")
+                   f"revision, or `sync.py refresh` with the newer one" if doc.vendor in VENDORS
+                   else "`sync.py refresh` with its newer revision replaces it")
         return (f"{doc.ident} is already book #{have['id']} {have['title']!r} "
                 f"(Rev {have['rev'] or 'unknown'}); add never replaces a book — {refresh}")
-    # A second spelling of either name splits one vendor's books in two.
+    why = spelling_conflict(doc, idx)
+    if why:
+        return why
+    p = doclib.plan([doc], idx, legacy)
+    if p["legacy"]:
+        _, book = p["legacy"][0]
+        return (f"probably already filed by hand as #{book['id']} {book['title']!r} — "
+                f"compare the two before adding a second copy")
+    return None
+
+
+def spelling_conflict(doc, idx: dict) -> str | None:
+    """A second spelling of either name splits one vendor's books in two."""
     for ident, book in idx.items():
         scheme = ident.split(":", 1)[0]
         if scheme == doc.vendor and book["author"] != doc.author:
@@ -126,11 +138,6 @@ def library_conflict(doc, idx: dict, legacy: dict) -> str | None:
         if book["author"] == doc.author and scheme != doc.vendor:
             return (f"author {doc.author!r} already files its books as {scheme}: "
                     f"(#{book['id']}), not {doc.vendor}:")
-    p = doclib.plan([doc], idx, legacy)
-    if p["legacy"]:
-        _, book = p["legacy"][0]
-        return (f"probably already filed by hand as #{book['id']} {book['title']!r} — "
-                f"compare the two before adding a second copy")
     return None
 
 
@@ -148,16 +155,10 @@ def blocked(lib, apply: bool) -> bool:
     return bool(blockers) and apply
 
 
-def add_main(argv: list) -> int:
-    """Import one document under the conventions an adapter's import follows.
-
-    Dry run by default; it still downloads and checks the file, so every refusal
-    shows up before --apply. Exit 0 planned or imported, 1 refused, 2 a usage
-    error, a blocker, or a library that could not be read.
-    """
-    ap = argparse.ArgumentParser(
-        prog="sync.py add", description=add_main.__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+def doc_parser(prog: str, description: str) -> argparse.ArgumentParser:
+    """The arguments add and refresh share: one document and where its PDF comes from."""
+    ap = argparse.ArgumentParser(prog=prog, description=description,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--vendor", required=True,
                     help="identifier scheme, lowercase: an adapter's name "
                          f"({', '.join(sorted(VENDORS))}) or a new one (nordic)")
@@ -176,14 +177,15 @@ def add_main(argv: list) -> int:
     src.add_argument("--url", help="download the PDF from this URL")
     src.add_argument("--pdf", type=Path, help="import this local PDF (a browser download)")
     ap.add_argument("--source", help="with --pdf, required: the URL it came from")
-    ap.add_argument("--revision",
-                    help="as the document prints it; without one the book can never "
-                         "be checked for a newer revision")
     ap.add_argument("--family", help="comma list of family tags: nRF52,...")
     ap.add_argument("--desc", default="", help="description line for comments")
-    ap.add_argument("--apply", action="store_true", help="actually import")
-    a = ap.parse_args(argv)
+    ap.add_argument("--apply", action="store_true", help="actually write to the library")
+    return ap
 
+
+def parse_doc(ap: argparse.ArgumentParser, argv: list) -> tuple:
+    """-> (args, Doc, adapter module or None), or a usage error."""
+    a = ap.parse_args(argv)
     if not re.fullmatch(r"[a-z][a-z0-9-]*", a.vendor):
         ap.error(f"--vendor {a.vendor!r}: a lowercase identifier scheme like st, nxp, nordic")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", a.doc_id):
@@ -204,17 +206,67 @@ def add_main(argv: list) -> int:
         ap.error(f"--author is required: {a.vendor!r} has no adapter to name the vendor")
     else:
         author = a.author
-
     doc = doclib.Doc(vendor=a.vendor, doc_id=a.doc_id, doc_type=a.type, version=a.revision,
                      title=a.title, url=a.url or a.source, author=author,
                      family=a.family.split(",") if a.family else [], desc=a.desc,
                      verify_id=not a.id_not_printed)
+    return a, doc, mod
+
+
+def acquire(a, doc, mod, tmp: Path) -> tuple:
+    """Download or copy the PDF into tmp and confirm it -> (pdf, identity verdict) or
+    (None, why refused). A --pdf is copied first: it may sit in the very book folder a
+    refresh removes."""
+    if a.url:
+        pdf, why = fetch(doc, mod, tmp)
+    else:
+        copy = Path(shutil.copy2(a.pdf, tmp / a.pdf.name))
+        if doclib.classify_payload(head(copy)) != "pdf":
+            return None, f"{a.pdf} is not a PDF"
+        pdf, why = verified(copy, doc, mod)
+    if pdf is None:
+        return None, why
+    # A hand-typed ID is filed only once the document confirms it, or the caller
+    # declared there is nothing printed to confirm it against.
+    if why != ("skipped" if a.id_not_printed else "ok"):
+        unconfirmed = {"absent": f"{doc.doc_id} is not printed on pages 1-2",
+                       "inconclusive": f"pages 1-2 do not confirm {doc.doc_id} (no "
+                                       f"readable text, or no '<ID> Rev' marking)"}
+        return None, (f"{unconfirmed.get(why, f'identity check returned {why!r}')} — "
+                      f"use the number the document prints, or pass --id-not-printed")
+    return pdf, why
+
+
+def show(heading: str, doc, pdf: Path, why: str) -> None:
+    print(f"\n{heading}\n"
+          f"  author      {doc.author}\n"
+          f"  title       {doc.calibre_title()}\n"
+          f"  tags        {', '.join(doc.tags())}\n"
+          f"  file        {pdf.stat().st_size} bytes, identity {why}\n"
+          f"  comments    " + doc.comments().strip().replace("\n", "\n              "))
+
+
+REINDEX = "reindex so read-doc finds it: python3 ~/.claude/skills/read-doc/scripts/locate.py build --all"
+SUPERSEDED = Path.home() / ".local" / "share" / "download-doc" / "superseded"
+
+
+def add_main(argv: list) -> int:
+    """Import one document under the conventions an adapter's import follows.
+
+    Dry run by default; it still downloads and checks the file, so every refusal
+    shows up before --apply. Exit 0 planned or imported, 1 refused, 2 a usage
+    error, a blocker, or a library that could not be read.
+    """
+    ap = doc_parser("sync.py add", add_main.__doc__)
+    ap.add_argument("--revision", help="as the document prints it; without one the book "
+                                       "can never be checked for a newer revision")
+    a, doc, mod = parse_doc(ap, argv)
 
     lib = doclib.Library()
     if blocked(lib, a.apply):
         return 2
     try:
-        idx, legacy = lib.index(), lib.legacy_index(author)
+        idx, legacy = lib.index(), lib.legacy_index(doc.author)
     except RuntimeError as e:
         if a.apply:
             print(f"BLOCKED: cannot read the library: {e}", file=sys.stderr)
@@ -229,32 +281,11 @@ def add_main(argv: list) -> int:
 
     tmp = Path(tempfile.mkdtemp(prefix="download-doc-"))
     try:
-        if a.url:
-            pdf, why = fetch(doc, mod, tmp)
-        elif doclib.classify_payload(head(a.pdf)) != "pdf":
-            pdf, why = None, f"{a.pdf} is not a PDF"
-        else:
-            pdf, why = verified(a.pdf, doc, mod)
+        pdf, why = acquire(a, doc, mod, tmp)
         if pdf is None:
             print(f"REFUSED: {why}", file=sys.stderr)
             return 1
-        # A hand-typed ID is filed only once the document confirms it, or the caller
-        # declared there is nothing printed to confirm it against.
-        if why != ("skipped" if a.id_not_printed else "ok"):
-            unconfirmed = {"absent": f"{doc.doc_id} is not printed on pages 1-2",
-                           "inconclusive": f"pages 1-2 do not confirm {doc.doc_id} (no "
-                                           f"readable text, or no '<ID> Rev' marking)"}
-            print(f"REFUSED: {unconfirmed.get(why, f'identity check returned {why!r}')} — "
-                  f"use the number the document prints, or pass --id-not-printed",
-                  file=sys.stderr)
-            return 1
-
-        print(f"\nADD {doc.ident}\n"
-              f"  author      {doc.author}\n"
-              f"  title       {doc.calibre_title()}\n"
-              f"  tags        {', '.join(doc.tags())}\n"
-              f"  file        {pdf.stat().st_size} bytes, identity {why}\n"
-              f"  comments    " + doc.comments().strip().replace("\n", "\n              "))
+        show(f"ADD {doc.ident}", doc, pdf, why)
         if not a.revision:
             print("  note: no --revision — recorded as unknown, so this book can never be "
                   "checked for a newer revision", file=sys.stderr)
@@ -278,14 +309,130 @@ def add_main(argv: list) -> int:
                if lib.last_add_status == "duplicate" else "calibredb add reported no book id")
         print(f"REFUSED: {why}", file=sys.stderr)
         return 1
-    print(f"\nIMPORTED #{book_id} {doc.ident}\n"
-          f"reindex so read-doc finds it: python3 ~/.claude/skills/read-doc/scripts/locate.py build --all")
+    print(f"\nIMPORTED #{book_id} {doc.ident}\n{REINDEX}")
+    return 0
+
+
+def refresh_target(lib, doc) -> tuple:
+    """-> (the one book carrying doc's identifier, None) or (None, why refused). Counted
+    from the book list itself: index() keeps one book per identifier."""
+    books = lib.books()
+    found = [(b, ident) for b in books if (ident := stored_ident(b, doc.ident))]
+    if not found:
+        return None, f"{doc.ident} is not in the library — use `sync.py add`"
+    if len(found) > 1:
+        return None, (f"{doc.ident} is on {len(found)} books "
+                      f"({', '.join('#' + str(b['id']) for b, _ in found)}); keep one by hand first")
+    why = spelling_conflict(doc, lib.index(books))
+    if why:
+        return None, why
+    book, ident = found[0]
+    return {**lib.entry(book), "ident": ident}, None
+
+
+def stored_ident(book: dict, ident: str) -> str | None:
+    """How `book` spells `ident`, matched case-insensitively, or None."""
+    return next((f"{s}:{c}" for s, c in (book.get("identifiers") or {}).items()
+                 if f"{s}:{c}".lower() == ident.lower()), None)
+
+
+def replace(lib, old_id: int, doc, pdf: Path) -> tuple:
+    """Back book old_id up, remove it and add doc in its place -> (new id, backup paths,
+    None), or (None, backup paths, why it stopped, naming the stage). A failed backup
+    removes nothing."""
+    try:
+        copies = lib.remove(old_id, SUPERSEDED)
+    except doclib.BackupError as e:
+        return None, [], f"backup failed, book #{old_id} left in place: {e}"
+    except doclib.RemoveError as e:
+        return None, [], f"removal failed, nothing added: {e}"
+    try:
+        new_id = lib.add(doc, pdf)
+        why = None if new_id else lib.last_add_status
+    except RuntimeError as e:
+        new_id, why = None, str(e) or type(e).__name__
+    if new_id:
+        return new_id, copies, None
+    return None, copies, (f"book #{old_id} was removed but the new copy was not added ({why}); "
+                          f"its files are in {', '.join(map(str, copies))}")
+
+
+def refresh_main(argv: list) -> int:
+    """Replace the book carrying a document's identifier with a newer revision of it,
+    under the conventions add files it with: for a vendor with no adapter, or a
+    document its adapter does not list. The supplied metadata replaces the book's,
+    so give --family and --desc again if it should keep them.
+
+    The --revision is compared before anything is downloaded: newer (or a book whose
+    revision cannot be read) goes ahead, the same one is nothing to do, and one that
+    cannot be compared is refused. --apply backs the old PDF up to
+    ~/.local/share/download-doc/superseded, then removes the book and adds the new
+    one; a failed backup removes nothing. Exit 0 planned, refreshed or already
+    current, 1 refused or failed, 2 a usage error, a blocker, or a library that
+    could not be read.
+    """
+    ap = doc_parser("sync.py refresh", refresh_main.__doc__)
+    ap.add_argument("--revision", required=True, help="the newer revision, as the document prints it")
+    a, doc, mod = parse_doc(ap, argv)
+
+    lib = doclib.Library()
+    if blocked(lib, a.apply):
+        return 2
+    try:
+        have, why = refresh_target(lib, doc)
+    except RuntimeError as e:
+        print(f"BLOCKED: cannot read the library: {e}", file=sys.stderr)
+        return 2
+    if why:
+        print(f"REFUSED: {why}", file=sys.stderr)
+        return 1
+    verdict, detail = doclib.compare_rev(doc.version, have["rev"])
+    if verdict == "current":
+        print(f"{doc.ident} is book #{have['id']} at Rev {have['rev']}: nothing to refresh")
+        return 0
+    if verdict != "newer":
+        print(f"REFUSED: cannot tell Rev {doc.version} is newer than book #{have['id']}'s: "
+              f"{detail}", file=sys.stderr)
+        return 1
+
+    tmp = Path(tempfile.mkdtemp(prefix="download-doc-"))
+    try:
+        pdf, why = acquire(a, doc, mod, tmp)
+        if pdf is None:
+            print(f"REFUSED: {why}", file=sys.stderr)
+            return 1
+        show(f"REFRESH #{have['id']} {doc.ident} ({detail})\n  was         {have['title']}",
+             doc, pdf, why)
+        if have["ident"] != doc.ident:
+            print(f"  note: the library spells it {have['ident']}; the new book takes "
+                  f"{doc.ident}, as --id gives it", file=sys.stderr)
+        if not a.apply:
+            print(f"\ndry run — nothing changed. --apply backs #{have['id']}'s files up to "
+                  f"{SUPERSEDED}, removes it and adds the above", file=sys.stderr)
+            return 0
+        again, why = refresh_target(lib, doc)
+        if not why and (again["id"], again["rev"]) != (have["id"], have["rev"]):
+            why = f"now Rev {again['rev']} as #{again['id']}"
+        if why:
+            print(f"REFUSED: book #{have['id']} changed since the plan ({why}); run it again",
+                  file=sys.stderr)
+            return 1
+        book_id, copies, failure = replace(lib, have["id"], doc, pdf)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if failure:
+        print(f"FAILED: {failure}", file=sys.stderr)
+        return 1
+    print(f"\nREFRESHED #{have['id']} -> #{book_id} {doc.ident}\n"
+          f"backed up: {', '.join(map(str, copies))}\n{REINDEX}")
     return 0
 
 
 def main() -> int:
     if sys.argv[1:2] == ["add"]:
         return add_main(sys.argv[2:])
+    if sys.argv[1:2] == ["refresh"]:
+        return refresh_main(sys.argv[2:])
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("vendor", choices=sorted(VENDORS))
@@ -458,8 +605,7 @@ def main() -> int:
         return 0
 
     tmp = Path(tempfile.mkdtemp(prefix="download-doc-"))
-    backup = Path.home() / ".local" / "share" / "download-doc" / "superseded"
-    added = replaced = failed = 0
+    added = replaced = failed = unsafe = 0
     skipped: list = []
 
     for doc in fetchable:
@@ -482,8 +628,11 @@ def main() -> int:
             skipped.append((doc.doc_id, f"{why}; local copy left alone"))
             failed += 1
             continue
-        lib.remove(have["id"], backup)      # backs the old PDF up first
-        if lib.add(doc, pdf):
+        _, _, failure = replace(lib, have["id"], doc, pdf)
+        if failure:
+            skipped.append((doc.doc_id, failure))
+            unsafe += 1
+        else:
             replaced += 1
 
     print("\n" + "=" * 68)
@@ -514,7 +663,7 @@ def main() -> int:
             print(f"        - {doc_id[:40]:<40} {why[:46]}")
     print("=" * 68)
     if replaced:
-        print(f"superseded PDFs backed up to {backup}")
+        print(f"superseded PDFs backed up to {SUPERSEDED}")
     for doc_id, why in skipped:
         print(f"  SKIPPED {doc_id:<22} {why}")
     print("\ncoverage — catalogue must equal the sum of what happened to it:")
@@ -531,7 +680,8 @@ def main() -> int:
         print(f"\n{len(needs_human)} documents need a signed-in browser; "
               f"see references/nxp.md for the flow (and get the user's OK before "
               f"accepting any licence on their behalf).")
-    return 0
+    # A failed download leaves the library as it was; a failed replacement may not.
+    return 1 if unsafe else 0
 
 
 if __name__ == "__main__":

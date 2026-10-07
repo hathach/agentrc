@@ -378,33 +378,63 @@ def pdf_with(text):
     return out.encode('latin-1')
 
 
+def patch_library(test):
+    """Route Library's calibredb calls to test.library, looked up per call so a test may
+    swap it, with nothing blocking and no content server."""
+    saved = (doclib.Library._run, doclib.Library.blockers, doclib.Library.__dict__['_server_creds'])
+
+    def restore():
+        doclib.Library._run, doclib.Library.blockers, doclib.Library._server_creds = saved
+    test.addCleanup(restore)
+    doclib.Library._run = lambda lib, *a, **k: test.library.run(*a, **k)
+    doclib.Library.blockers = lambda lib: []
+    doclib.Library._server_creds = staticmethod(lambda: None)
+
+
 class FakeCalibre:
-    """calibredb over an in-memory book list, taking the argv Library passes it."""
+    """calibredb over an in-memory book list, taking the argv Library passes it.
+    `fail` maps a command to the error it raises; `added` keeps each added file's bytes."""
 
     def __init__(self, *books):
         self.books = [dict(b) for b in books]
         self.writes = []
+        self.fail = {}
+        self.added = []
+        self.next_id = max((b['id'] for b in books), default=0) + 1
 
     def run(self, *args, check=True, tries=4):
+        if args[0] in self.fail:
+            raise RuntimeError(self.fail[args[0]])
         if args[0] == 'list':
             books = self.books
             if '--search' in args:
                 author = args[args.index('--search') + 1].split('"')[1]
                 books = [b for b in books if b['authors'] == author]
+            if '-s' in args:
+                book_id = int(args[args.index('-s') + 1].split(':')[1])
+                books = [{'id': b['id'], 'formats': b.get('formats', [])} for b in books if b['id'] == book_id]
             return json.dumps(books)
         self.writes.append(args[0])
         if args[0] == 'add':
             opt = dict(zip(args[1:-1:2], args[2:-1:2]))
             scheme, code = opt['-I'].split(':', 1)
-            self.books.append({'id': len(self.books) + 1, 'title': opt['-t'], 'authors': opt['-a'],
+            self.added.append(Path(args[-1]).read_bytes())
+            book_id, self.next_id = self.next_id, self.next_id + 1
+            self.books.append({'id': book_id, 'title': opt['-t'], 'authors': opt['-a'],
                                'tags': opt['-T'].split(','), 'identifiers': {scheme: code},
                                'comments': ''})
-            return f'Added book ids: {len(self.books)}'
+            return f'Added book ids: {book_id}'
         if args[0] == 'set_metadata':
-            book = self.books[int(args[-1]) - 1]
+            book = next(b for b in self.books if b['id'] == int(args[-1]))
             for spec in args[2:-1:2]:
                 name, value = spec.split(':', 1)
                 book[name] = value
+            return ''
+        if args[0] == 'remove':
+            book = next(b for b in self.books if b['id'] == int(args[1]))
+            for path in book.get('formats', []):
+                Path(path).unlink(missing_ok=True)
+            self.books.remove(book)
             return ''
         raise AssertionError(f'unexpected calibredb {args}')
 
@@ -419,16 +449,9 @@ class AddOne(unittest.TestCase):
         self.library = FakeCalibre()
         self.served = pdf_with('nRF52820 Product Specification PS1234 v1.4')
         self.fetched = []
-        saved = (doclib.Library._run, doclib.Library.blockers, doclib.Library.__dict__['_server_creds'],
-                 doclib.http_get)
-
-        def restore():
-            (doclib.Library._run, doclib.Library.blockers, doclib.Library._server_creds,
-             doclib.http_get) = saved
-        self.addCleanup(restore)
-        doclib.Library._run = lambda lib, *a, **k: self.library.run(*a, **k)
-        doclib.Library.blockers = lambda lib: []
-        doclib.Library._server_creds = staticmethod(lambda: None)
+        patch_library(self)
+        saved = doclib.http_get
+        self.addCleanup(lambda: setattr(doclib, 'http_get', saved))
         doclib.http_get = self.http_get
 
     def http_get(self, url, *a, **k):
@@ -472,7 +495,7 @@ class AddOne(unittest.TestCase):
         code, _, err = self.add('--apply')
         self.assertEqual(code, 1)
         self.assertIn('already book #7', err)
-        self.assertIn('no refresh path', err)
+        self.assertIn('`sync.py refresh` with its newer revision replaces it', err)
         self.assertEqual((self.fetched, self.library.writes), ([], []))
 
     def test_a_second_spelling_of_the_vendor_is_refused(self):
@@ -532,6 +555,331 @@ class AddOne(unittest.TestCase):
 def setattr_all(saved):
     vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp = saved
 
+
+
+class RemoveBacksUp(unittest.TestCase):
+    """Library.remove() removes a book only once its PDF is backed up."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.backup = self.root / 'superseded'
+        patch_library(self)
+        self.lib = doclib.Library.__new__(doclib.Library)
+
+    def book(self, *names):
+        paths = []
+        for name in names:
+            path = self.root / 'lib' / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_bytes(b'%PDF old')
+            paths.append(str(path))
+        self.library = FakeCalibre({'id': 3, 'title': 't', 'authors': 'a', 'formats': paths})
+        return paths
+
+    def test_the_files_are_copied_then_the_book_removed(self):
+        pdf, epub = self.book('m.pdf', 'm.epub')
+        copies = self.lib.remove(3, self.backup)
+        self.assertEqual(copies, [self.backup / 'm.book3.pdf', self.backup / 'm.book3.epub'])
+        self.assertEqual([c.read_bytes() for c in copies], [b'%PDF old'] * 2)
+        self.assertEqual((self.library.books, self.library.writes), ([], ['remove']))
+
+    def test_an_earlier_backup_of_the_same_name_is_kept(self):
+        self.backup.mkdir()
+        (self.backup / 'm.book3.pdf').write_bytes(b'earlier')
+        self.book('m.pdf')
+        self.assertEqual(self.lib.remove(3, self.backup), [self.backup / 'm.book3.1.pdf'])
+        self.assertEqual((self.backup / 'm.book3.pdf').read_bytes(), b'earlier')
+
+    def test_no_pdf_to_back_up_removes_nothing(self):
+        for names, missing in ((('m.epub',), False), (('m.pdf',), True), ((), False)):
+            with self.subTest(names=names, missing=missing):
+                paths = self.book(*names)
+                if missing:
+                    Path(paths[0]).unlink()
+                with self.assertRaisesRegex(doclib.BackupError, 'no PDF on disk'):
+                    self.lib.remove(3, self.backup)
+                self.assertEqual(self.library.writes, [])
+
+    def test_a_listing_or_copy_failure_removes_nothing(self):
+        self.book('m.pdf')
+        self.library.fail['list'] = 'database locked'
+        with self.assertRaisesRegex(doclib.BackupError, 'could not be listed'):
+            self.lib.remove(3, self.backup)
+        del self.library.fail['list']
+        self.backup.write_bytes(b'')  # a file where the directory should be
+        with self.assertRaisesRegex(doclib.BackupError, 'backing its files up failed'):
+            self.lib.remove(3, self.backup)
+        self.assertEqual(self.library.writes, [])
+
+    def test_a_pdf_that_vanishes_before_its_copy_removes_nothing(self):
+        pdf, = self.book('m.pdf')
+        checks = []
+        real = Path.is_file
+
+        def is_file(path):
+            if str(path) == pdf:
+                checks.append(path)
+                return len(checks) == 1  # there for the check, gone by the copy
+            return real(path)
+        saved = Path.is_file
+        self.addCleanup(lambda: setattr(Path, 'is_file', saved))
+        Path.is_file = is_file
+        with self.assertRaisesRegex(doclib.BackupError, 'vanished before it was copied'):
+            self.lib.remove(3, self.backup)
+        self.assertEqual(self.library.writes, [])
+
+    def test_a_failed_remove_names_the_backup(self):
+        self.book('m.pdf')
+        self.library.fail['remove'] = 'permission denied'
+        with self.assertRaisesRegex(doclib.RemoveError, 'backed up to .*m.book3.pdf'):
+            self.lib.remove(3, self.backup)
+
+
+@unittest.skipUnless(shutil.which('pdftotext'), 'identity checks read the PDF with pdftotext')
+class RefreshOne(unittest.TestCase):
+    """`sync.py refresh` replaces the one book carrying an identifier with a newer revision."""
+
+    URL = 'https://example.com/ps.pdf'
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.old_pdf = self.root / 'lib' / 'ps.pdf'
+        self.old_pdf.parent.mkdir()
+        self.old_pdf.write_bytes(b'%PDF old')
+        self.library = FakeCalibre(self.filed())
+        self.served = pdf_with('nRF52820 Product Specification PS1234 v1.5')
+        self.fetched = []
+        patch_library(self)
+        saved = doclib.http_get, sync.SUPERSEDED
+
+        def restore():
+            doclib.http_get, sync.SUPERSEDED = saved
+        self.addCleanup(restore)
+        doclib.http_get = self.http_get
+        sync.SUPERSEDED = self.root / 'superseded'
+
+    def filed(self, book_id=7, rev='1.4', code='PS1234'):
+        return {'id': book_id, 'title': f'PS1234 nRF52820 Product Specification — Datasheet Rev {rev}',
+                'authors': 'Nordic Semiconductor', 'identifiers': {'nordic': code},
+                'comments': f'Revision: {rev}', 'formats': [str(self.old_pdf)]}
+
+    def http_get(self, url, *a, **k):
+        self.fetched.append(url)
+        return self.served
+
+    def refresh(self, *args, revision='1.5', source=('--url', URL)):
+        argv = ['--vendor', 'nordic', '--author', 'Nordic Semiconductor', '--id', 'PS1234',
+                '--type', 'datasheet', '--title', 'nRF52820 Product Specification',
+                *source, '--revision', revision, '--family', 'nRF52', *args]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sync.refresh_main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_dry_run_plans_the_replacement_and_changes_nothing(self):
+        code, out, err = self.refresh()
+        self.assertEqual(code, 0, err)
+        for line in ('REFRESH #7 nordic:PS1234 (1.4 -> 1.5)',
+                     'was         PS1234 nRF52820 Product Specification — Datasheet Rev 1.4',
+                     'title       PS1234 nRF52820 Product Specification — Datasheet Rev 1.5', 'identity ok'):
+            self.assertIn(line, out)
+        self.assertIn('dry run', err)
+        self.assertEqual((self.fetched, self.library.writes), ([self.URL], []))
+
+    def test_apply_backs_up_removes_and_adds(self):
+        code, out, err = self.refresh('--apply')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.library.writes, ['remove', 'add', 'set_metadata'])
+        self.assertEqual([b['id'] for b in self.library.books], [8])
+        self.assertEqual(self.library.books[0]['title'], 'PS1234 nRF52820 Product Specification — Datasheet Rev 1.5')
+        self.assertEqual((sync.SUPERSEDED / 'ps.book7.pdf').read_bytes(), b'%PDF old')
+        self.assertIn('REFRESHED #7 -> #8 nordic:PS1234', out)
+
+    def test_a_local_pdf_inside_the_removed_book_is_still_added(self):
+        self.old_pdf.write_bytes(self.served)
+        code, _, err = self.refresh('--apply', source=('--pdf', str(self.old_pdf), '--source', self.URL))
+        self.assertEqual(code, 0, err)
+        self.assertFalse(self.old_pdf.exists())
+        self.assertEqual(self.library.added, [self.served])
+
+    def test_the_same_revision_is_nothing_to_do_and_downloads_nothing(self):
+        code, out, _ = self.refresh('--apply', revision='1.4')
+        self.assertEqual(code, 0)
+        self.assertIn('nothing to refresh', out)
+        self.assertEqual((self.fetched, self.library.writes), ([], []))
+
+    def test_an_unreadable_local_revision_is_refreshed(self):
+        self.library = FakeCalibre({**self.filed(), 'title': 'PS1234 nRF52820', 'comments': ''})
+        code, out, err = self.refresh()
+        self.assertEqual(code, 0, err)
+        self.assertIn('local revision None unreadable', out)
+
+    def test_an_older_revision_is_nothing_to_do_and_an_incomparable_one_is_refused(self):
+        for revision, expected, said in (('1.3', 0, 'nothing to refresh'),
+                                         ('2026-01-05', 1, 'cannot tell Rev 2026-01-05 is newer')):
+            with self.subTest(revision):
+                code, out, err = self.refresh('--apply', revision=revision)
+                self.assertEqual(code, expected)
+                self.assertIn(said, out + err)
+        self.assertEqual((self.fetched, self.library.writes), ([], []))
+
+    def test_no_book_or_several_books_are_refused(self):
+        for books, said in (((), 'not in the library — use `sync.py add`'),
+                            ((self.filed(), self.filed(9)), 'is on 2 books (#7, #9)')):
+            with self.subTest(said):
+                self.library = FakeCalibre(*books)
+                code, _, err = self.refresh('--apply')
+                self.assertEqual(code, 1)
+                self.assertIn(said, err)
+                self.assertEqual((self.fetched, self.library.writes), ([], []))
+
+    def test_a_second_spelling_of_the_author_is_refused(self):
+        self.library = FakeCalibre({**self.filed(), 'authors': 'Nordic'})
+        code, _, err = self.refresh('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn("filed under author 'Nordic'", err)
+
+    def test_two_spellings_of_the_identifier_on_one_book_are_one_book(self):
+        self.library = FakeCalibre({**self.filed(), 'identifiers': {'nordic': 'PS1234', 'Nordic': 'ps1234'}})
+        code, _, err = self.refresh()
+        self.assertEqual(code, 1)
+        self.assertNotIn('is on 2 books', err)
+        self.assertIn('already files its books as Nordic:', err)  # the second scheme spelling
+
+    def test_a_case_only_difference_in_the_identifier_is_noted(self):
+        self.library = FakeCalibre(self.filed(code='ps1234'))
+        code, _, err = self.refresh()
+        self.assertEqual(code, 0, err)
+        self.assertIn('the library spells it nordic:ps1234', err)
+
+    def test_the_wrong_document_is_refused_and_nothing_written(self):
+        self.served = pdf_with('nRF52833 Product Specification PS9999 v1.5')
+        code, _, err = self.refresh('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('PS1234 is not printed on pages 1-2', err)
+        self.assertEqual(self.library.writes, [])
+
+    def test_a_blocker_or_an_unreadable_library_stops_it(self):
+        doclib.Library.blockers = lambda lib: ['The Calibre GUI is open']
+        self.assertEqual(self.refresh('--apply')[0], 2)
+        doclib.Library.blockers = lambda lib: []
+        self.library.fail['list'] = 'database locked'
+        code, _, err = self.refresh()
+        self.assertEqual(code, 2)
+        self.assertIn('cannot read the library', err)
+
+    def test_a_book_changed_since_the_plan_is_left_alone(self):
+        saved = sync.acquire
+
+        def acquire(*a):
+            self.library.books[0]['comments'] = 'Revision: 1.5'
+            self.library.books[0]['title'] = 'PS1234 nRF52820 Product Specification — Datasheet Rev 1.5'
+            return saved(*a)
+        sync.acquire = acquire
+        self.addCleanup(lambda: setattr(sync, 'acquire', saved))
+        code, _, err = self.refresh('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('changed since the plan', err)
+        self.assertEqual(self.library.writes, [])
+
+    def test_a_failed_backup_leaves_the_book_in_place(self):
+        self.old_pdf.unlink()
+        code, _, err = self.refresh('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('backup failed, book #7 left in place: book #7: no PDF on disk', err)
+        self.assertEqual(self.library.writes, [])
+
+    def test_a_failed_removal_adds_nothing(self):
+        self.library.fail['remove'] = 'permission denied'
+        code, _, err = self.refresh('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('removal failed, nothing added', err)
+        self.assertIn('calibredb remove failed (permission denied); backed up to', err)
+        self.assertNotIn('add', self.library.writes)
+
+    def test_a_failed_add_after_the_removal_names_the_backup(self):
+        for error, said in (('disk full', '(disk full)'), ('', '(RuntimeError)')):
+            with self.subTest(error=error):
+                self.old_pdf.write_bytes(b'%PDF old')
+                self.library = FakeCalibre(self.filed())
+                self.library.fail['add'] = error
+                code, _, err = self.refresh('--apply')
+                self.assertEqual(code, 1)
+                self.assertIn(f'book #7 was removed but the new copy was not added {said}', err)
+                self.assertRegex(err, r'its files are in \S*ps\.book7(\.1)?\.pdf')
+
+    def test_a_standard_identifier_beside_the_vendor_one_is_no_second_spelling(self):
+        self.library = FakeCalibre({**self.filed(), 'identifiers': {'nordic': 'PS1234', 'isbn': '9780000000000'}})
+        code, _, err = self.refresh()
+        self.assertEqual(code, 0, err)
+
+    def test_an_add_that_files_nothing_names_the_backup(self):
+        saved = doclib.Library.add
+        self.addCleanup(lambda: setattr(doclib.Library, 'add', saved))
+
+        def add(lib, doc, pdf):
+            lib.last_add_status = 'failed'
+        doclib.Library.add = add
+        code, _, err = self.refresh('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('was removed but the new copy was not added', err)
+        self.assertIn('ps.book7.pdf', err)
+
+
+class VendorReplace(unittest.TestCase):
+    """`sync.py <vendor> --apply` reports a replacement that fails by stage and exits 1."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        doc = doclib.Doc(vendor='ti', doc_id='SBOS548', doc_type='datasheet', version='C',
+                         title='INA3221', url='https://ti.com/x.pdf', author=vendor_ti.AUTHOR)
+        self.library = FakeCalibre({'id': 4, 'title': 'SBOS548 INA3221 Rev B', 'authors': vendor_ti.AUTHOR,
+                                    'identifiers': {'ti': 'SBOS548'}, 'comments': 'Revision: B',
+                                    'formats': [str(self.root / 'old.pdf')]})
+        new = self.root / 'new.pdf'
+        new.write_bytes(b'%PDF new')
+        patch_library(self)
+        saved = (sync.enumerate_vendor, sync.fetch, sync.SUPERSEDED, sys.argv)
+
+        def restore():
+            sync.enumerate_vendor, sync.fetch, sync.SUPERSEDED, sys.argv = saved
+        self.addCleanup(restore)
+        sync.enumerate_vendor = lambda vendor, args: [doc]
+        sync.fetch = lambda d, mod, tmp: (new, 'ok')
+        sync.SUPERSEDED = self.root / 'superseded'
+        sys.argv = ['sync.py', 'ti', '--parts', 'ina3221', '--apply']
+
+    def run_sync(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = sync.main()
+        return code, out.getvalue()
+
+    def test_a_failed_backup_skips_the_replacement(self):
+        code, out = self.run_sync()
+        self.assertEqual(code, 1)
+        self.assertIn('backup failed, book #4 left in place', out)
+        self.assertEqual(self.library.writes, [])
+
+    def test_a_failed_add_after_the_removal_names_the_backup(self):
+        (self.root / 'old.pdf').write_bytes(b'%PDF old')
+        self.library.fail['add'] = 'disk full'
+        code, out = self.run_sync()
+        self.assertEqual(code, 1)
+        self.assertIn('book #4 was removed but the new copy was not added (disk full)', out)
+        self.assertIn('old.book4.pdf', out)
+
+    def test_a_replacement_that_succeeds_exits_zero(self):
+        (self.root / 'old.pdf').write_bytes(b'%PDF old')
+        code, out = self.run_sync()
+        self.assertEqual(code, 0)
+        self.assertIn('1 replaced', out)
 
 if __name__ == '__main__':
     unittest.main()
