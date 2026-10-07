@@ -6,12 +6,17 @@
 
 rerun: each job's workflow, deduplicated, is re-run from its failed jobs with
 the circleci CLI (`circleci workflow rerun <uuid> --from-failed`, token from
-~/.circleci/cli.yml); stdout ends with one JSON line
-{"reruns": [{"workflow", "jobs", "newWorkflow"}], "errors": [...]}. Exit 0 when
-every workflow was re-run, 1 otherwise, 2 on a usage error.
+~/.circleci/cli.yml), unless its status is still running, failing or on_hold:
+the API refuses that re-run, so the workflow is listed under "running" and left
+for the caller to retry. stdout ends with one JSON line
+{"reruns": [{"workflow", "jobs", "newWorkflow"}], "running": [{"workflow",
+"jobs", "status"}], "errors": [...]}. Exit 0 when every workflow was re-run, 3
+when none failed but some are still running, 1 when any errored, 2 on a usage
+error.
 log: prints the last N lines (default 150) of every failed step of the job.
 
-The job lookup is the public v1.1 endpoint, no token needed.
+The job lookup is the public v1.1 endpoint and the workflow status the public
+v2 one, no token needed.
 """
 
 import argparse
@@ -22,6 +27,9 @@ import sys
 import urllib.request
 
 UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+# The v2 Workflow.status enum, split by whether the workflow has finished.
+UNFINISHED = ('running', 'failing', 'on_hold')
+FINISHED = ('success', 'not_run', 'failed', 'error', 'canceled', 'unauthorized')
 
 
 class Failed(Exception):
@@ -47,6 +55,13 @@ def workflow_of(repo, number):
     return wid
 
 
+def workflow_status(wid):
+    status = fetch(f'https://circleci.com/api/v2/workflow/{wid}').get('status')
+    if status not in UNFINISHED + FINISHED:
+        raise Failed(f'workflow {wid}: unknown status {status!r}')
+    return status
+
+
 def rerun(repo, numbers):
     by_workflow, errors = {}, []
     for n in numbers:
@@ -54,8 +69,16 @@ def rerun(repo, numbers):
             by_workflow.setdefault(workflow_of(repo, n), []).append(n)
         except Failed as e:
             errors.append(str(e))
-    reruns = []
+    reruns, running = [], []
     for wid, jobs in by_workflow.items():
+        try:
+            status = workflow_status(wid)
+        except Failed as e:
+            errors.append(f'{e} (jobs {", ".join(map(str, jobs))})')
+            continue
+        if status in UNFINISHED:
+            running.append({'workflow': wid, 'jobs': jobs, 'status': status})
+            continue
         done = subprocess.run(['circleci', 'workflow', 'rerun', wid, '--from-failed', '--json'],
                               capture_output=True, text=True)
         try:
@@ -67,8 +90,8 @@ def rerun(repo, numbers):
                           f'{(done.stderr or done.stdout).strip() or f"exit {done.returncode}"}')
             continue
         reruns.append({'workflow': wid, 'jobs': jobs, 'newWorkflow': new})
-    print(json.dumps({'reruns': reruns, 'errors': errors}))
-    return 0 if not errors else 1
+    print(json.dumps({'reruns': reruns, 'running': running, 'errors': errors}))
+    return 1 if errors else 3 if running else 0
 
 
 def failed_steps(repo, number, lines):

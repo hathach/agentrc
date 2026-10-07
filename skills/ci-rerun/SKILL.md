@@ -15,11 +15,15 @@ python3 $C log 391824                 # the failed steps' last 150 lines, to cla
 python3 $C rerun 391824 391728 ...    # each job's workflow, once, from its failed jobs
 ```
 
-`rerun` prints one JSON line, `{"reruns": [{"workflow", "jobs", "newWorkflow"}], "errors": [...]}`,
+`rerun` prints one JSON line, `{"reruns": [{"workflow", "jobs", "newWorkflow"}], "running": [{"workflow", "jobs", "status"}], "errors": [...]}`,
 and exits 1 when any workflow could not be re-run. Several failed jobs of one
-workflow are one re-run; the new workflow id is what a watcher records. The
+workflow are one re-run; the new workflow id is what a watcher records. A
+workflow still `running`, `failing` or `on_hold` cannot be re-run yet: the
+script reads its status first, lists it under `running` without re-running
+it, and exits 3 when that is all that stopped it; re-run it later, there is no
+need to check its status yourself. A status it cannot read is an error. The
 re-run goes through the installed `circleci` CLI and its token in
-`~/.circleci/cli.yml`; the job and log lookups are public.
+`~/.circleci/cli.yml`; the job, workflow status and log lookups are public.
 
 # Read the Docs from a GitHub check
 

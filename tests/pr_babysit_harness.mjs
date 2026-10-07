@@ -292,7 +292,7 @@ async function run(opts = {}) {
       const failures = structuredClone(ci.realFailures)
         .map(rf => ({ workflow: 'ci', job: rf.check, cell: null, signature: rf.firstError, runId: 1, complete: true, ...rf }))
       const failed = failedChecks(ci)
-      const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun }
+      const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun, deferred: [] }
       return conforms(options.schema, opts.judge ? opts.judge(judged) : judged, label)
     }
     if (label.startsWith('reviews#')) {
@@ -1798,6 +1798,39 @@ test('a partial judgment needs a complete enumeration of distinct failures, and 
   assert.deepEqual(rerun.result.rollup.ciChecks, { judged: 1, partial: 0, reused: 0, unchanged: 0 }, 'a re-run is a judgment, not a merge')
 })
 
+test('a check deferred while its CircleCI workflow runs is judged afresh: no re-run spent, no verdict kept', async () => {
+  const defer = (j) => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })), deferred: j.checks.map(c => c.link) })
+  let n = 0
+  const { calls, logs, labels, result } = await run({
+    args: { autoPush: true, maxCycles: 3 }, reviews: WAITING, ci: redWith(RIG).ci,
+    judge: (j) => ++n === 1 ? defer(j) : { ...j, checks: j.checks.map(c => ({ ...c, failures: [] })), infraRerun: ['wf-2'] },
+  })
+  const deferred = calls.find(c => c.label === 'ci:judge#1').schema.properties.deferred
+  assert.deepEqual(deferred.items.enum, [job(1)])
+  assert.throws(() => conforms(deferred, [job(2)], 'd'), /not in/)
+  assert.ok(logs.some(l => /cycle 1: CI judge deferred hil \/ pico — its CircleCI workflow is still running/.test(l)), logs.join('\n'))
+  assert.equal(logs.some(l => /cycle 1: CI judge re-ran/.test(l)), false, 'a deferral is no re-run')
+  assert.deepEqual([result.history[0].ci.status, result.history[0].ci.infraRerun, result.history[0].ci.realFailures], ['running', [], []])
+  assert.equal(labels.includes('ci:collect#1.w'), false, 'no verdict stored for it')
+  const second = judgePrompt(calls, 2)
+  assert.deepEqual(askedOf(second).map(c => c.link), [job(1)], 'the same failed link is judged again')
+  assert.doesNotMatch(second, /re-run/, 'its re-run is still unspent')
+  assert.equal(logs.some(l => /a second time/.test(l)), false)
+  assert.equal(labels.includes('ci:judge#3'), false, 'then settling on its one re-run')
+  assert.deepEqual(result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
+  assert.equal(result.rollup.reran, 1)
+  assert.equal(result.rollup.ciChecks.judged, 1, 'a deferral is not counted judged')
+  // a stored check with an unclassified failure, deferred when judged in part, is not left as judged by its old base job
+  const store = new Map()
+  const st = (await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })).result.state
+  const later = await run({ store, base: 'b2', args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, judge: defer })
+  assert.ok(askedOf(judgePrompt(later.calls, 2))[0].judgeOnly)
+  assert.equal(later.result.history.at(-1).ci.status, 'running')
+  assert.deepEqual([later.result.state.ciCache.entries, later.result.state.ciCache.reruns], [[], []])
+  const next = await run({ store, args: { ...YIELD, state: later.result.state }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
+  assert.equal(askedOf(judgePrompt(next.calls, 3))[0].judgeOnly, undefined, 'judged whole again')
+})
+
 test('an accepted failure resumed from the cache still passes', async () => {
   const store = new Map()
   const first = await run({ ...redWith(PVS), store, args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING })
@@ -2027,7 +2060,7 @@ test('the CI contract names the three verdicts and nothing else', async () => {
   assert.equal(judge.agentType, 'pr-ci-watcher')
   const item = judge.schema.properties.checks.items.properties.failures.items
   assert.deepEqual(item.required, ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'])
-  assert.deepEqual(judge.schema.required, ['checks', 'infraRerun'])
+  assert.deepEqual(judge.schema.required, ['checks', 'infraRerun', 'deferred'])
   assert.deepEqual(item.properties.verdict.enum, ['real', 'rig-side', 'unclassified'])
   assert.deepEqual(item.properties.runId.type, ['integer', 'null'], 'a check whose link names no run has no run id')
   assert.equal(item.additionalProperties, false)

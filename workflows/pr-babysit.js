@@ -333,7 +333,7 @@ const REMEMBERED = withSeal({
 })
 const JUDGED = {
   type: 'object', additionalProperties: false,
-  required: ['checks', 'infraRerun'],
+  required: ['checks', 'infraRerun', 'deferred'],
   properties: {
     checks: {
       type: 'array',
@@ -343,6 +343,8 @@ const JUDGED = {
       },
     },
     infraRerun: { type: 'array', items: { type: 'string' } },
+    // Links of infra checks whose CircleCI workflow was still running, so not re-run yet.
+    deferred: { type: 'array', uniqueItems: true, items: { type: 'string' } },
   },
 }
 // One verdict per id: { verdicts: [{ <id>, <field>, reason }] }.
@@ -358,6 +360,11 @@ const exactly = (schema, key, idField, ids) => {
   const id = list.items.properties[idField]
   return { ...schema, properties: { ...schema.properties, [key]: { ...list, minItems: ids.length, maxItems: ids.length,
     items: { ...list.items, properties: { ...list.items.properties, [idField]: ids.length ? { ...id, enum: ids } : id } } } } }
+}
+// The judge's schema for these check links: one entry each, deferring only among them.
+const judgedFor = (links) => {
+  const s = exactly(JUDGED, 'checks', 'link', links)
+  return { ...s, properties: { ...s.properties, deferred: { ...s.properties.deferred, items: { type: 'string', enum: links } } } }
 }
 
 const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown']
@@ -1714,7 +1721,7 @@ const ciLaneRun = async (cycle, lanes) => {
     (known.length ? `\nAlready re-run on this head: ${JSON.stringify(known)}.` : '') +
     (possible.length ? `\nPossibly re-run by a judge that was lost on this head: ${JSON.stringify(possible)}.` : '') +
     (ciNotes ? `\nWhat the caller established about this PR's CI already, to weigh with your own evidence: ${ciNotes}` : ''),
-    { label: `ci:judge#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: exactly(JUDGED, 'checks', 'link', links) },
+    { label: `ci:judge#${cycle}`, phase: 'Triage', agentType: 'pr-ci-watcher', schema: judgedFor(links) },
   ).catch(quiet(`cycle ${cycle}: CI judge`))
   const answered = judged ? judged.checks.map(j => j.link) : []
   if (!judged || !sameLinks(answered, links)) {
@@ -1723,7 +1730,15 @@ const ciLaneRun = async (cycle, lanes) => {
     for (const c of judging) noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: false })
     return null
   }
-  const reran = judging.filter(c => judged.checks.find(j => j.link === c.link).failures.length === 0)
+  // A deferred check's CircleCI workflow was still running: neither re-run nor placed, it keeps no verdict and its re-run, and is judged afresh.
+  const deferred = judging.filter(c => judged.deferred.includes(c.link))
+  for (const c of deferred) ciVerdicts.delete(c.link)
+  if (deferred.length) {
+    report.status = 'running'
+    log(`cycle ${cycle}: CI judge deferred ${deferred.map(c => c.name).join(', ')} — its CircleCI workflow is still running, so not re-run yet; judged again next cycle`)
+  }
+  const placing = judging.filter(c => !deferred.includes(c))
+  const reran = placing.filter(c => judged.checks.find(j => j.link === c.link).failures.length === 0)
   for (const c of reran) {
     if (reruns.some(r => r.workflow === c.workflow && r.check === c.name)) log(`cycle ${cycle}: CI judge re-ran ${c.workflow} / ${c.name} a second time`)
     noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true })
@@ -1736,7 +1751,7 @@ const ciLaneRun = async (cycle, lanes) => {
   const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
   const unsettled = []
   const patches = new Map()
-  for (const c of partial.filter(c => judging.includes(c) && !reran.includes(c))) {
+  for (const c of partial.filter(c => placing.includes(c) && !reran.includes(c))) {
     const got = new Map(failuresOf.get(c.link).map(f => [failureKey(f), f]))
     const distinct = got.size === failuresOf.get(c.link).length
     if (distinct && sameLinks([...got.keys()], unplaced(c).map(failureKey)) && [...got.values()].every(f => f.complete)) {
@@ -1749,9 +1764,9 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   for (const c of unsettled) ciVerdicts.delete(c.link)
   ciChecks.partial += patches.size
-  ciChecks.judged += judging.length - patches.size - unsettled.length
+  ciChecks.judged += placing.length - patches.size - unsettled.length
   for (const [link, e] of ciVerdicts) if (e.head !== inv.head) ciVerdicts.delete(link)
-  const fresh = judging.filter(c => c.attempt && !reran.includes(c) && !unsettled.includes(c))
+  const fresh = placing.filter(c => c.attempt && !reran.includes(c) && !unsettled.includes(c))
     .map(c => ({ link: c.link, bucket: c.bucket, failures: JSON.parse(JSON.stringify(failuresOf.get(c.link))) }))
   for (const v of fresh) {
     const base = ev.bases.find(b => b.link === v.link)?.base ?? null
@@ -1766,7 +1781,7 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   if (unsettled.length) return null
   report.infraRerun = judged.infraRerun
-  report.realFailures.push(...judging.flatMap(c => keyed(c, failuresOf.get(c.link))))
+  report.realFailures.push(...placing.flatMap(c => keyed(c, failuresOf.get(c.link))))
   return report
 }
 

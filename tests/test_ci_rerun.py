@@ -23,6 +23,7 @@ ci, rtd = load('circleci'), load('rtd')
 
 W1, W2, NEW = '3a705162-e09b-4ef8-9488-d034f9818421', '7a72feba-da90-4613-bd4e-7b6b4b674475', 'd2814134-464c-4966-9dff-c403909287d9'
 BASE = 'https://circleci.com/api/v1.1/project/github/o/r/'
+WORKFLOW = 'https://circleci.com/api/v2/workflow/'
 
 
 class CircleciTest(unittest.TestCase):
@@ -31,8 +32,14 @@ class CircleciTest(unittest.TestCase):
         self.outputs = {}   # output_url -> messages
         self.cli = []       # argv of each circleci call
         self.cli_result = lambda wid: (0, json.dumps({'workflow_id': NEW}), '')
+        self.status = {}    # workflow id -> v2 status, 'failed' when absent
 
         def fetch(url):
+            if url.startswith(WORKFLOW):
+                status = self.status.get(url[len(WORKFLOW):], 'failed')
+                if isinstance(status, Exception):
+                    raise status
+                return {'id': url[len(WORKFLOW):], 'status': status}
             if url.startswith(BASE):
                 n = url[len(BASE):]
                 if n in self.jobs:
@@ -65,7 +72,7 @@ class CircleciTest(unittest.TestCase):
         rc, out, _ = self.main('rerun', '1', '2', '3')
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out.strip().splitlines()[-1]), {'reruns': [
-            {'workflow': W1, 'jobs': [1, 2], 'newWorkflow': NEW}, {'workflow': W2, 'jobs': [3], 'newWorkflow': NEW}], 'errors': []})
+            {'workflow': W1, 'jobs': [1, 2], 'newWorkflow': NEW}, {'workflow': W2, 'jobs': [3], 'newWorkflow': NEW}], 'running': [], 'errors': []})
         self.assertEqual(self.cli, [['circleci', 'workflow', 'rerun', W1, '--from-failed', '--json'],
                                     ['circleci', 'workflow', 'rerun', W2, '--from-failed', '--json']])
 
@@ -93,6 +100,33 @@ class CircleciTest(unittest.TestCase):
         rc, out, _ = self.main('rerun', '1')
         self.assertEqual(rc, 1)
         self.assertIn('rerun failed', json.loads(out)['errors'][0])
+
+    def test_a_running_workflow_is_reported_not_rerun(self):
+        self.job(1, W1); self.job(2, W1); self.job(3, W2)
+        self.status[W1] = 'failing'
+        rc, out, _ = self.main('rerun', '1', '2', '3')
+        self.assertEqual(rc, 3)
+        self.assertEqual(json.loads(out), {'reruns': [{'workflow': W2, 'jobs': [3], 'newWorkflow': NEW}],
+                                           'running': [{'workflow': W1, 'jobs': [1, 2], 'status': 'failing'}], 'errors': []})
+        self.assertEqual([argv[3] for argv in self.cli], [W2])
+
+    def test_an_error_outranks_a_running_workflow(self):
+        self.job(1, W1)
+        self.status[W1] = 'on_hold'
+        rc, out, _ = self.main('rerun', '1', '2')
+        r = json.loads(out)
+        self.assertEqual((rc, self.cli, r['running'][0]['status'], len(r['errors'])), (1, [], 'on_hold', 1))
+
+    def test_a_status_that_cannot_be_read_is_an_error_not_running(self):
+        self.job(1, W1); self.job(2, W2)
+        self.status[W1] = ci.Failed(f'{WORKFLOW}{W1}: HTTP Error 503')
+        self.status[W2] = None
+        rc, out, _ = self.main('rerun', '1', '2')
+        r = json.loads(out)
+        self.assertEqual((rc, self.cli, r['reruns'], r['running']), (1, [], [], []))
+        self.assertIn('503', r['errors'][0])
+        self.assertIn('jobs 1', r['errors'][0])
+        self.assertIn('unknown status None', r['errors'][1])
 
     def test_log_prints_the_failed_steps_tail(self):
         self.job(9, W1, [{'name': 'Checkout code', 'actions': [{'status': 'success', 'output_url': 'u0'}]},
