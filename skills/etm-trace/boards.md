@@ -193,3 +193,48 @@ Board caveats (beyond the table):
   board pending). No Ethernet while tracing.
 - **SEGGER ref boards**: run their own demo (ladder step 3 flags); `--isr`
   degrades gracefully without a live SysTick.
+
+## Adding a new board
+
+Bring-up ladder — each step gates the next:
+
+1. **Docs before hardware** (`read-doc` skill first, then vendor site): board
+   manual, schematics, MCU reference manual. Establish the trace clock
+   source and max — chip side and probe side (J-Trace PRO Cortex-M tops out
+   at a 150 MHz trace clock) — the pins carrying TRACE_CLK/D0-D3 (read the board's
+   debug-connector table — boards often route trace on alternate pins), and
+   required rework (jumpers, solder bridges, 0 Ω resistors to add/remove).
+   Hunt shared-net hazards: PHYs or other active drivers on trace nets,
+   boot straps, connector stubs.
+2. **Confirm with the user before any hardware change**: present the rework
+   findings as **[ACTION]** items and wait — the user solders/jumpers, you
+   verify afterward.
+3. **Vendor example before your firmware**: fetch SEGGER's trace example for the
+   same/similar MCU
+   (<https://www.segger.com/products/debug-probes/j-trace/technology/tested-devices/>)
+   and run it with `--probe jtrace --device <MCU> --target-if .. --tif-speed ..
+   --trace-width .. --elf <demo ELF> --jlink-script <demo .pex>`, plus
+   `--cortex-m-default-hooks` when the demo is a plain Cortex-M image (no
+   reference project supplies hooks; not for one a ROM bootloader must start). Streaming proves the physical path — and only that: demo
+   firmware often runs reset-default clocks (the RA6M5 one traces at a few
+   MHz), so its success says nothing about your target's trace rate. The
+   example may target a different board (the LPC4357 one is tested on a
+   Keil MCB4300), so silence isn't final proof — but its J-Link
+   script/config is often borrowable.
+4. **Firmware support**: a trace init behind a build switch — mux trace pins AFTER the final
+   core-clock switch, enable the trace clock, enable any funnel between ETM
+   and TPIU; commit a reference Ozone project beside the board, and — only when
+   J-Link's built-in support for the device does not already cover them (RP2350's
+   does: never replace it) — a `.JLinkScript` declaring off-ROM-table
+   CSTF/TMC/TPIU (addresses from the vendor demo's script); validate with `--jdebug <that project>`.
+5. **Still silent or corrupt?** In order: chip-side register audit (pinmux,
+   TPIU, ETM, DEMCR — and EVERY funnel in the path; an unprogrammed funnel
+   reads register-perfect and eats the stream), physically re-seat both
+   connector ends, then SEGGER's procedure (UM08001): find a stable
+   `--trace-timing` at `--trace-width 1`, step up to 2, then 4 (sampling
+   default is +2 ns) — then search the
+   MCU vendor's application notes and community forums for the chip's trace
+   recipe: more than one board's fix lived only in a forum thread.
+6. **Board note**: add the table row (core clock, TRACECLK pin + max,
+   width, timing, physical setup, TODO for anything left unvalidated) plus
+   a caveat bullet — both in this file.

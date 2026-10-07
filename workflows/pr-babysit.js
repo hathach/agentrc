@@ -1,11 +1,11 @@
 export const meta = {
   name: 'pr-babysit',
   description: 'Drive a PR to green: validate bot review findings, fix, verify, push and reply, overlapped with a CI watch-and-judge lane',
-  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ~/.claude/skills/pr-babysit/SKILL.md.',
+  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ~/.claude/skills/pr-babysit/ARGUMENTS.md.',
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
-// args: see skills/pr-babysit/SKILL.md, Arguments.
+// args: see skills/pr-babysit/ARGUMENTS.md.
 if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }

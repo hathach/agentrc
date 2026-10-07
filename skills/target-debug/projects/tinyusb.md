@@ -215,6 +215,11 @@ carried over, as pointers to the technique rather than to the fix:
   from the ELF when `CFG_TUD/TUH_ENABLED` are 0), the bootloader, or external
   JTAG. espressif_p4_function_ev has separate pins and keeps both. carried over.
 - The ELF comes from the example's own `idf.py` build directory. carried over.
+- On ci.lan, ESP-IDF's `export.sh` does not put the RISC-V GDB on PATH; the
+  executable is
+  `/home/hathach/.espressif/tools/riscv32-esp-elf-gdb/17.1_20260402/riscv32-esp-elf-gdb/bin/riscv32-esp-elf-gdb`.
+  Re-resolve the version directory after an ESP-IDF tool update. verified
+  2026-09-18 ci.lan.
 
 ## On the wire and in usbmon
 
