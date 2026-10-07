@@ -70,7 +70,8 @@ def matches(record, args, timestamp):
     query = record["query"]
     if args.term:
         term = args.term.casefold()
-        values = query["keywords"] if record["op"] == "search" else [query["term"]]
+        values = (query["keywords"] if record["op"] == "search"
+                  else [] if record["op"] == "page" else [query["term"]])
         if not any(term in value.casefold() for value in values):
             return False
     return args.since is None or timestamp.date() >= args.since
@@ -90,6 +91,10 @@ def summary(record):
                                          separators=(",", ":"))
         top = [] if result is None else [book(bid, title) for bid, _, title in result["books"][:3]]
         rendered += " books=" + ("; ".join(top) if top else "-")
+    elif record["op"] == "page":
+        title = result.get("title") if result else None
+        first, last = query["pages"]
+        rendered = f"pages={first}" + (f"-{last}" if last != first else "") + f" of {book(query['book'], title)}"
     else:
         title = result.get("title") if result else None
         rendered = (f"term={json.dumps(query['term'], ensure_ascii=False)}"
@@ -124,6 +129,10 @@ def repeat_command(record):
         if query["kind"] is not None:
             command.extend(("--kind", query["kind"]))
         command.extend(("--limit", str(query["limit"]), "--", *query["keywords"]))
+    elif record["op"] == "page":
+        first, last = query["pages"]
+        command = ["python3", os.path.join(directory, "locate.py"), "page", "--book", str(query["book"]),
+                   "--pages", f"{first}-{last}", "--max-chars", str(query["max_chars"])]
     else:
         command = ["python3", os.path.join(directory, "locate.py"), "find",
                    "--book", str(query["book"]), "--term=" + query["term"],

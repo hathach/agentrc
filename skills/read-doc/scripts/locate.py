@@ -4,18 +4,22 @@
 Usage: locate.py build (--all | --book ID) [--jobs N] [--skip-tag TAG]
        locate.py find --book ID --term TERM [--context N] [--limit N]
                       [--offset N] [--max-chars N]
+       locate.py page --book ID --pages A[-B] [--max-chars N]
 
 `build` extracts each PDF to text once, into <library>/.read-doc/<id>.txt: a
 JSON manifest on the first line, then the pages, one form feed between them.
 It re-extracts only what changed, so a run over an unchanged library costs a
 stat per book. `find` searches that text and prints the physical PDF pages to
-read, which is the point: read those pages, not the whole document.
+read, which is the point: read those pages, not the whole document. `page`
+prints the indexed text of those pages; it locates evidence, while tables,
+figures, bitfields and access types are checked on the PDF page itself.
 
 The index lives inside the library so it travels with the library's own sync.
 It is derived data and can be deleted at any time.
 
-Exit 0 result or build done, 1 nothing matched, 2 bad usage,
-3 library/file/index unavailable or the build did not finish.
+Exit 0 result or build done, 1 nothing matched (`page`: a page out of range
+or with no text), 2 bad usage, 3 library/file/index unavailable or the build
+did not finish.
 """
 import argparse
 import concurrent.futures
@@ -38,6 +42,7 @@ EXTRACTOR = ["pdftotext", "-layout"]
 VERSION = 2
 JOBS, MAX_JOBS = 4, 32
 CONTEXT, LIMIT, MAX_CHARS, MIN_CHARS = 2, 5, 4000, 80
+PAGE_CHARS = 10000  # a dense -layout manual page runs 4.5-5 KB; a cut page costs another round trip
 # Not technical documentation. Matched as whole tags, never a substring of one.
 # Only the bulk build honours this; `find` on such a book still indexes it,
 # since skipping is a build cost, not a policy about what may be read.
@@ -289,6 +294,37 @@ def find(pages, term, context, limit, offset, max_chars):
     return len(merged), blocks, matched
 
 
+def render_page(pno, page):
+    """One page headed by its number, its -layout margin dropped and its blank runs folded."""
+    lines = [l.rstrip() for l in page.split("\n")]
+    margin = min((len(l) - len(l.lstrip()) for l in lines if l), default=0)
+    body, blank = [], False
+    for l in lines:
+        if l:
+            body.append("  " + l[margin:])
+        elif body and not blank:
+            body.append("")
+        blank = not l
+    while body and not body[-1]:
+        body.pop()
+    return "\n".join([f"p{pno}"] + body)
+
+
+def page_text(pages, first, last, max_chars):
+    """(blocks, first page not shown or None). Same cap rule as find: the first
+    page is always emitted, truncated if it alone exceeds max_chars."""
+    blocks, used = [], 0
+    for pno in range(first, last + 1):
+        text = render_page(pno, pages[pno - 1])
+        if used + len(text) > max_chars:
+            if blocks:
+                return blocks, pno
+            text = text[:max_chars - len(TRUNCATED)] + TRUNCATED
+        blocks.append(text)
+        used += len(text)
+    return blocks, None
+
+
 def wanted(db, skip_tags):
     """(PDF rows the bulk build should index, how many its tags skipped)."""
     skip = {re.sub(r"[-_\s]+", " ", norm(t)).strip() for t in skip_tags}
@@ -368,27 +404,36 @@ def build(args):
     return 3 if counts["unavailable"] or counts["failed"] else 0
 
 
+def check_max_chars(n):
+    if n < MIN_CHARS:
+        raise ValueError(f"--max-chars must be at least {MIN_CHARS}, got {n};"
+                         " a smaller cap cannot hold a page number and a line")
+
+
+def indexed(bid):
+    """(manifest, pages, title, the result fields every lookup records)."""
+    meta, pages = ensure(bid)
+    with contextlib.closing(open_db()) as db:
+        row = db.execute("SELECT title FROM books WHERE id = ?", (bid,)).fetchone()
+    title = row[0] if row else None  # a label only: a row gone since ensure() costs the title, not the lookup
+    if not meta:
+        raise Unavailable(f"{bid}: the index file is unreadable; delete it and retry")
+    return meta, pages, {"title": title,
+                         "source": {k: meta[k] for k in ("path", "size", "mtime_ns", "pages")}}
+
+
 def find_cmd(args):
     """Exit code; the lookup history's result is left in args.result."""
     if args.limit < 1:
         raise ValueError(f"--limit must be at least 1, got {args.limit}")
-    if args.max_chars < MIN_CHARS:
-        raise ValueError(f"--max-chars must be at least {MIN_CHARS}, got {args.max_chars};"
-                         " a smaller cap cannot hold a page number and a line")
+    check_max_chars(args.max_chars)
     if args.context < 0 or args.offset < 0:
         raise ValueError("--context and --offset cannot be negative")
     if not args.term.strip():
         raise ValueError("--term cannot be blank")
-    meta, pages = ensure(args.book)
-    with contextlib.closing(open_db()) as db:
-        row = db.execute("SELECT title FROM books WHERE id = ?", (args.book,)).fetchone()
-    title = row[0] if row else None  # a label only: a row gone since ensure() costs the title, not the lookup
-    if not meta:
-        raise Unavailable(f"{args.book}: the index file is unreadable; delete it and retry")
+    meta, pages, recorded = indexed(args.book)
     total, blocks, matched = find(pages, args.term, args.context, args.limit, args.offset, args.max_chars)
-    args.result = {"title": title,
-                   "source": {k: meta[k] for k in ("path", "size", "mtime_ns", "pages")},
-                   "total_hits": total, "hits": matched}
+    args.result = {**recorded, "total_hits": total, "hits": matched}
     if not total:
         print(f"{args.book}: {args.term!r} is not in the extracted text of any page "
               f"({meta['pages']} pages searched); a figure or scan holds none")
@@ -402,6 +447,49 @@ def find_cmd(args):
     if seen < total:
         print(f"({total - seen} more; --offset {seen})")
     return 0
+
+
+def page_range(value):
+    """[A, B] from "A" or "A-B", physical PDF pages as `find` prints them."""
+    m = re.fullmatch(r"(\d+)(?:-(\d+))?", value.strip())
+    first, last = (int(m.group(1)), int(m.group(2) or m.group(1))) if m else (0, 0)
+    if not m or not 1 <= first <= last:
+        raise argparse.ArgumentTypeError(f"must be A or A-B with 1 <= A <= B, got {value!r}")
+    return [first, last]
+
+
+def page_cmd(args):
+    """Exit code; the lookup history's result is left in args.result."""
+    check_max_chars(args.max_chars)
+    first, last = args.pages
+    asked = f"pages {first}-{last}" if last > first else f"page {first}"
+    meta, pages, recorded = indexed(args.book)
+    args.result = {**recorded, "shown": [], "empty": []}
+    if last > meta["pages"]:
+        print(f"{args.book}: has {meta['pages']} pages; {asked} is out of range")
+        return 1
+    blocks, rest = page_text(pages, first, last, args.max_chars)
+    shown = list(range(first, rest or last + 1))
+    empty = [p for p in shown if not pages[p - 1].strip()]
+    args.result.update(shown=shown, empty=empty)
+    print(f"{args.book}: {asked} of {meta['pages']}, extracted text of {meta['path']}")
+    for b in blocks:
+        print(b)
+    if blocks[0].endswith(TRUNCATED):
+        print(f"(p{first} cut at --max-chars {args.max_chars})")
+    if rest:
+        print(f"(not shown; --pages {rest}" + (f"-{last})" if last > rest else ")"))
+    if empty:
+        print("(no extracted text on p" + ", p".join(map(str, empty))
+              + ": a figure, scan or blank page)")
+    span = f"{first}-{shown[-1]}" if shown[-1] > first else str(first)
+    print("Tables, figures, register bitfields and access types are not reliable here: check them"
+          f" on the PDF page itself (Read {os.path.join(LIB, meta['path'])} with pages={span}).")
+    return 1 if empty else 0
+
+
+LOGGED = {"find": ("book", "term", "context", "limit", "offset", "max_chars"),
+          "page": ("book", "pages", "max_chars")}
 
 
 def parser():
@@ -425,6 +513,12 @@ def parser():
     f.add_argument("--offset", type=int, default=0, help="skip this many excerpts")
     f.add_argument("--max-chars", type=int, default=MAX_CHARS, help=f"output cap (>= {MIN_CHARS})")
     f.set_defaults(run=find_cmd)
+
+    g = sub.add_parser("page", help="print the indexed text of pages of one book")
+    g.add_argument("--book", type=int, required=True)
+    g.add_argument("--pages", type=page_range, required=True, help="A or A-B, physical PDF pages")
+    g.add_argument("--max-chars", type=int, default=PAGE_CHARS, help=f"output cap (>= {MIN_CHARS})")
+    g.set_defaults(run=page_cmd)
     return p
 
 
@@ -441,9 +535,8 @@ def main(argv):
         code, error = 3, f"{type(e).__name__}: {e}"
     if error:
         print(error, file=sys.stderr)
-    if args.command == "find":
-        log_lookup(LIB, "find", {k: getattr(args, k) for k in
-                                 ("book", "term", "context", "limit", "offset", "max_chars")},
+    if args.command in LOGGED:
+        log_lookup(LIB, args.command, {k: getattr(args, k) for k in LOGGED[args.command]},
                    started, code, error, args.result if code in (0, 1) else None)
     return code
 

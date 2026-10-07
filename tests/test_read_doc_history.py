@@ -168,6 +168,28 @@ class History(unittest.TestCase):
                 self.assertEqual(replay.returncode, code, replay.stderr)
                 self.assertEqual(replay.stdout, original.stdout)
 
+    def test_a_logged_page_lists_and_replays(self):
+        library = Path(self.tmp.name) / "library"
+        library.mkdir()
+        fake_library(str(library),
+                     [(1, "RM0001 reference manual", ["reference-manual"], True)]).close()
+        pdf = library / "Vendor" / "RM0001 reference manual (1)" / "RM0001 reference manual.pdf"
+        pdf.write_bytes(FIXTURE.read_bytes())
+        env = dict(self.env, CALIBRE_LIBRARY=str(library))
+        env.pop("READ_DOC_HISTORY", None)
+        invoke_main = ("import sys; sys.path.insert(0, sys.argv[1]); import locate; "
+                       "raise SystemExit(locate.main(sys.argv[2:]))")
+        original = subprocess.run([sys.executable, "-c", invoke_main, str(SCRIPTS), "page", "--book", "1",
+                                   "--pages", "1"], capture_output=True, text=True, env=env)
+        self.assertEqual(original.returncode, 0, original.stderr)
+        record = json.loads(self.path.read_text().splitlines()[-1])
+        listed = self.run_history("list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn(f"page {record['id']} pages=1 of RM0001 reference manual (1)", listed.stdout)
+        command = self.run_history("show", record["id"]).stdout.rstrip().rsplit("\n\n", 1)[1]
+        replay = subprocess.run(["sh", "-c", command], capture_output=True, text=True, env=env)
+        self.assertEqual(replay.stdout, original.stdout)
+
     def test_bad_json_and_unknown_versions_are_reported_and_skipped(self):
         missing = copy.deepcopy(SEARCH)
         del missing["result"]

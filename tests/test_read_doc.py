@@ -177,6 +177,32 @@ class Find(unittest.TestCase):
         self.assertNotIn('b', blocks[0])
 
 
+class PageText(unittest.TestCase):
+    PAGES = ['      Bits  Description\n\n\n\n      31    EP0_INT_STALL  RW   \n\n',
+             '   ',
+             'third page ' + 'x' * 200]
+
+    def test_each_page_is_headed_by_its_physical_number_with_the_layout_margin_dropped(self):
+        blocks, rest = locate.page_text(self.PAGES, 1, 3, 4000)
+        self.assertEqual(blocks[0], 'p1\n  Bits  Description\n\n  31    EP0_INT_STALL  RW',
+                         'relative columns kept, a blank run folded to one line')
+        self.assertEqual(blocks[1], 'p2', 'a page with no text keeps its number')
+        self.assertTrue(blocks[2].startswith('p3\n  third page'))
+        self.assertIsNone(rest)
+
+    def test_the_cap_stops_before_a_page_that_does_not_fit_and_names_it(self):
+        blocks, rest = locate.page_text(self.PAGES, 1, 3, 100)
+        self.assertEqual([b.split('\n')[0] for b in blocks], ['p1', 'p2'])
+        self.assertEqual(rest, 3)
+
+    def test_a_first_page_over_the_cap_is_truncated_but_still_emitted(self):
+        blocks, rest = locate.page_text(self.PAGES, 3, 3, locate.MIN_CHARS)
+        self.assertLessEqual(len(blocks[0]), locate.MIN_CHARS)
+        self.assertTrue(blocks[0].startswith('p3') and blocks[0].endswith(locate.TRUNCATED), blocks[0])
+        self.assertIsNone(rest)
+        self.assertEqual(locate.page_text(self.PAGES, 3, 3, 4000)[0][0].count('x'), 200)
+
+
 class Manifest(unittest.TestCase):
     BODY = 'one\ftwo\f'
     META = {'id': 7, 'path': 'Vendor/x.pdf', 'size': 10, 'mtime_ns': 99, 'pages': 2,
@@ -647,7 +673,10 @@ class Usage(unittest.TestCase):
                              ('search.py', ['--limit', 'ten', 'stm32']),
                              ('locate.py', ['find', '--book', '1']),
                              ('locate.py', ['find', '--term', 'x']),
-                             ('locate.py', ['build', '--book', 'abc'])):
+                             ('locate.py', ['build', '--book', 'abc']),
+                             ('locate.py', ['page', '--book', '1']),
+                             *(('locate.py', ['page', '--book', '1', '--pages', bad])
+                               for bad in ('0', '3-2', '1-', 'a', '1,2'))):
             code, out = self.run_script(script, *args)
             self.assertEqual(code, 2, f'{script} {args}: {out}')
 
@@ -666,6 +695,8 @@ class Usage(unittest.TestCase):
         produce it."""
         self.unavailable('/nonexistent/calibre-library', 'search.py', 'stm32')
         self.unavailable('/nonexistent/calibre-library', 'locate.py', 'build', '--all')
+        self.unavailable('/nonexistent/calibre-library', 'locate.py', 'find', '--book', '1', '--term', 'x')
+        self.unavailable('/nonexistent/calibre-library', 'locate.py', 'page', '--book', '1', '--pages', '1')
 
     def test_a_corrupt_database_is_unavailable_not_a_miss(self):
         """A present but unreadable metadata.db reaches sqlite, which the
@@ -829,6 +860,66 @@ class History(unittest.TestCase):
         for p in procs:
             self.assertEqual(p.wait(), 0)
         self.assertEqual(len(self.records()), 240)
+
+
+class PageCommand(unittest.TestCase):
+    """`page` over the three-page fixture, whose page 2 has no text layer."""
+    setUp, call, records = History.setUp, History.call, History.records
+    AUTHORITY = 'Tables, figures, register bitfields and access types are not reliable here'
+
+    def page(self, *args):
+        return self.call(locate.main, 'page', '--book', '1', *args)
+
+    def test_it_prints_the_pages_text_then_points_at_the_pdf_page_for_the_authority(self):
+        code, out, err = self.page('--pages', '1')
+        lines = out.splitlines()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(lines[1:3], ['p1', '  USB: SIE_CTRL Register'])
+        pdf = self.lib / 'Vendor/RM0001 reference manual (1)/RM0001 reference manual.pdf'
+        self.assertTrue(lines[-1].startswith(self.AUTHORITY), lines[-1])
+        self.assertIn(f'{pdf} with pages=1)', lines[-1])
+        rec, = self.records()
+        self.assertEqual((rec['op'], rec['exit'], rec['query']),
+                         ('page', 0, {'book': 1, 'pages': [1, 1], 'max_chars': locate.PAGE_CHARS}))
+        self.assertEqual((rec['result']['shown'], rec['result']['empty'], rec['result']['title']),
+                         ([1], [], 'RM0001 reference manual'))
+        self.assertTrue(err.endswith(f"lookup {rec['id']} logged\n"), err)
+        os.environ['READ_DOC_HISTORY'] = '0'
+        self.assertEqual(self.page('--pages', '1')[:2], (code, out))
+        self.assertEqual(len(self.records()), 1, 'the history off records nothing')
+
+    def test_a_page_with_no_text_exits_one_and_still_names_the_pdf_pages(self):
+        code, out, _ = self.page('--pages', '2-3')
+        self.assertEqual(code, 1)
+        self.assertIn('\np2\np3\n  controls for EP0 come from SIE_CTRL.', out)
+        self.assertIn('no extracted text on p2', out)
+        self.assertIn('with pages=2-3)', out.splitlines()[-1])
+        self.assertEqual(self.records()[0]['result']['empty'], [2])
+
+    def test_a_page_out_of_range_exits_one_and_prints_no_text(self):
+        code, out, _ = self.page('--pages', '3-4')
+        self.assertEqual(code, 1)
+        self.assertEqual(out, '1: has 3 pages; pages 3-4 is out of range\n')
+        self.assertEqual(self.records()[0]['result']['shown'], [])
+
+    def test_the_cap_names_the_pages_left_to_read(self):
+        code, out, _ = self.page('--pages', '1-3', '--max-chars', '80')
+        self.assertEqual(code, 1, 'page 2 is shown, and empty')
+        self.assertIn('(not shown; --pages 3)', out)
+        self.assertNotIn('p3', out.split('(not shown')[0])
+        self.assertIn('with pages=1-2)', out)
+        self.assertEqual(self.page('--pages', '1', '--max-chars', '79')[0], 2)
+
+    def test_an_unknown_book_or_an_unindexed_one_it_cannot_index_is_unavailable(self):
+        self.assertEqual(self.page('--pages', '1')[0], 0)
+        os.remove(locate.text_path(1))
+        with unittest.mock.patch.object(locate.os, 'access', return_value=False):
+            code, out, err = self.page('--pages', '1')
+        self.assertEqual((code, out), (3, ''))
+        self.assertIn('run `build`', err)
+        self.assertEqual(self.call(locate.main, 'page', '--book', '9', '--pages', '1')[0], 3)
+        self.assertEqual([r['result'] for r in self.records()[1:]], [None, None])
+
 
 if __name__ == '__main__':
     unittest.main()
