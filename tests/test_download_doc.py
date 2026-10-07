@@ -5,6 +5,7 @@ import io
 import json
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -190,6 +191,76 @@ class RetitlePlan(unittest.TestCase):
         sys.argv = ['retitle.py', '--apply']
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(retitle.main(), 2)
+
+
+class GuiDetection(unittest.TestCase):
+    """Only the Calibre GUI holds the library; its workers and other tools do not."""
+
+    GUI = [['/usr/bin/python3.13', '/usr/bin/calibre']]
+    WORKER = [['/usr/bin/python3.13', '/usr/bin/calibre-parallel', '--pipe-worker', 'from calibre.utils.ipc.pool ...']]
+
+    def running(self, *cmdlines):
+        saved = doclib.Library.__dict__['_cmdlines']
+        self.addCleanup(lambda: setattr(doclib.Library, '_cmdlines', saved))
+        doclib.Library._cmdlines = staticmethod(lambda: iter(cmdlines))
+
+    def test_the_gui_is_its_launcher_however_it_was_started(self):
+        for argv in (['/usr/bin/python3.13', '/usr/bin/calibre'], ['/usr/bin/python3.14', '/usr/bin/calibre', '--detach'],
+                     ['/usr/bin/python3', '/usr/local/bin/calibre'], ['/opt/calibre/calibre']):
+            with self.subTest(argv):
+                self.running(argv)
+                self.assertTrue(doclib.Library._gui_running())
+
+    def test_workers_tools_and_mentions_are_not_the_gui(self):
+        for argv in (*self.WORKER, ['/opt/calibre/calibre-parallel'], ['/usr/bin/python3.13', '/usr/bin/calibre-server'],
+                     ['/usr/bin/python3.13', '/usr/bin/calibredb', 'list'], ['/bin/bash', '-c', '/usr/bin/calibre'],
+                     ['/usr/bin/python3', '-c', 'import os; os.system("/usr/bin/calibre")'], ['/usr/bin/python3.13']):
+            with self.subTest(argv):
+                self.running(argv)
+                self.assertFalse(doclib.Library._gui_running())
+
+    def test_blockers_name_the_gui_only_when_it_is_open(self):
+        lib = doclib.Library.__new__(doclib.Library)
+        lib.server = None
+        self.running(*self.WORKER)
+        self.assertEqual(lib.blockers(), [])
+        self.running(*self.GUI, *self.WORKER)
+        self.assertEqual(len(lib.blockers()), 1)
+        self.assertIn('GUI is open', lib.blockers()[0])
+        self.running(['/usr/bin/FreeFileSync_x86_64', '/home/u/calibre-library.ffs_batch'])
+        self.assertIn('FreeFileSync', lib.blockers()[0])
+
+    def lock_then(self, results, server=None):
+        """A Library whose calibredb answers each call from `results` (a lock error or output)."""
+        calls = []
+
+        def run(argv, capture_output, text):
+            calls.append(argv)
+            out = results.pop(0)
+            return subprocess.CompletedProcess(argv, 1 if out == 'lock' else 0, out, 'Another calibre program is running' if out == 'lock' else '')
+        saved = (doclib.subprocess.run, doclib.time.sleep)
+        self.addCleanup(lambda: (setattr(doclib.subprocess, 'run', saved[0]), setattr(doclib.time, 'sleep', saved[1])))
+        doclib.subprocess.run = run
+        doclib.time.sleep = lambda s: None
+        lib = doclib.Library.__new__(doclib.Library)
+        lib.path, lib.server = Path('/lib'), server
+        return lib, calls
+
+    def test_a_lock_with_only_a_worker_running_is_retried(self):
+        self.running(*self.WORKER)
+        lib, calls = self.lock_then(['lock', 'ok'])
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(lib._run('list'), 'ok')
+        self.assertEqual(len(calls), 2)
+
+    def test_a_lock_with_the_gui_open_is_not_retried(self):
+        self.running(*self.GUI)
+        lib, calls = self.lock_then(['lock'])
+        with self.assertRaisesRegex(RuntimeError, 'GUI is open'):
+            lib._run('list')
+        lib, calls = self.lock_then(['lock', 'via server'], server=('http://localhost:8080/#lib', 'u', 'pw'))
+        self.assertEqual(lib._run('list'), 'via server')
+        self.assertEqual(calls[1][2], 'http://localhost:8080/#lib')
 
 
 class MicrochipNumber(unittest.TestCase):

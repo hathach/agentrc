@@ -444,7 +444,7 @@ class Library:
             if self._LOCK_MSG in err.lower():
                 # Two different causes, and only one of them clears by waiting. Retrying
                 # a GUI lock just burns 30 seconds and then reports the wrong problem.
-                if self._running("/usr/bin/calibre") or self._running("python3.13", "/usr/bin/calibre"):
+                if self._gui_running():
                     if self.server:
                         # Write through the running GUI's own content server rather than
                         # wait for a lock that cannot clear while the GUI is open.
@@ -491,16 +491,8 @@ class Library:
         return ""
 
     @staticmethod
-    def _running(argv0_suffix: str, needle: str = "") -> bool:
-        """Is a process running whose *executable* is argv0_suffix?
-
-        Deliberately not `pgrep -f`: that matches any command line containing the
-        string, including the shell that invoked us. A shell running
-        `grep ... calibre-library.ffs_batch` makes pgrep report the mirror as running,
-        and a `pkill -f` with the same pattern kills the caller — which happened three
-        times while building this. Matching argv[0] cannot hit a wrapper, because a
-        shell's argv[0] is the shell.
-        """
+    def _cmdlines():
+        """Every other process's argv, as strings; one that exits mid-walk is skipped."""
         me = os.getpid()
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit() or int(entry.name) == me:
@@ -509,11 +501,34 @@ class Library:
                 argv = (entry / "cmdline").read_bytes().split(b"\0")
             except OSError:
                 continue
-            if not argv or not argv[0]:
-                continue
-            exe = argv[0].decode("utf-8", "replace")
-            rest = b" ".join(argv[1:]).decode("utf-8", "replace")
-            if exe.endswith(argv0_suffix) and (not needle or needle in rest or needle in exe):
+            if argv and argv[0]:
+                yield [a.decode("utf-8", "replace") for a in argv]
+
+    @classmethod
+    def _running(cls, argv0_suffix: str, needle: str) -> bool:
+        """Is a process running whose *executable* is argv0_suffix, with needle in its arguments?
+
+        Deliberately not `pgrep -f`: that matches any command line containing the
+        string, including the shell that invoked us. A shell running
+        `grep ... calibre-library.ffs_batch` makes pgrep report the mirror as running,
+        and a `pkill -f` with the same pattern kills the caller — which happened three
+        times while building this. Matching argv[0] cannot hit a wrapper, because a
+        shell's argv[0] is the shell.
+        """
+        return any(argv[0].endswith(argv0_suffix) and needle in " ".join(argv[1:])
+                   for argv in cls._cmdlines())
+
+    @classmethod
+    def _gui_running(cls) -> bool:
+        """Is the Calibre GUI open? Its program is named exactly `calibre`, run directly
+        (/opt/calibre/calibre) or by a Python interpreter (/usr/bin/python3.13
+        /usr/bin/calibre). A substring would also match its calibre-parallel workers,
+        which a content server spawns and which outlive a closing GUI."""
+        for argv in cls._cmdlines():
+            program = os.path.basename(argv[0])
+            if re.fullmatch(r"python3(\.\d+)?", program) and len(argv) > 1:
+                program = os.path.basename(argv[1])
+            if program == "calibre":
                 return True
         return False
 
@@ -521,7 +536,7 @@ class Library:
         """Reasons an import would be unsafe right now. Report these and let the
         user clear them — killing someone's GUI or sync job is not ours to do."""
         out = []
-        gui = self._running("/usr/bin/calibre") or self._running("python3.13", "/usr/bin/calibre")
+        gui = self._gui_running()
         if gui and not self.server:
             out.append("The Calibre GUI is open and holds the library's write lock — "
                        "close it before importing.")
