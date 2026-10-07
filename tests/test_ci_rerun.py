@@ -110,6 +110,12 @@ class CircleciTest(unittest.TestCase):
                                            'running': [{'workflow': W1, 'jobs': [1, 2], 'status': 'failing'}], 'errors': []})
         self.assertEqual([argv[3] for argv in self.cli], [W2])
 
+    def test_a_queued_workflow_is_not_finished(self):
+        self.job(1, W1)
+        self.status[W1] = 'queued'
+        rc, out, _ = self.main('rerun', '1')
+        self.assertEqual((rc, self.cli, json.loads(out)['running']), (3, [], [{'workflow': W1, 'jobs': [1], 'status': 'queued'}]))
+
     def test_an_error_outranks_a_running_workflow(self):
         self.job(1, W1)
         self.status[W1] = 'on_hold'

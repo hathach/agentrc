@@ -153,11 +153,13 @@ const auditScope = quotedAfter(/commits\.py head --parent [0-9a-f]{40}/)
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
 // The failing checks collect.py lists for a CI fixture: a failure with no
 // workflow is a SonarCloud-style check whose link names no run (its own `link`
-// when the fixture gives one); every other one is an Actions job.
+// when the fixture gives one); every other one is an Actions job, or a CircleCI
+// job when the fixture gives a circleci.com `link`.
 const failedChecks = (ci) => (ci.realFailures || []).map((rf, i) => {
   if (rf.workflow === '') return { name: rf.check, workflow: '', bucket: ci.bucket ?? 'fail', link: rf.link ?? `https://sonarcloud.io/dashboard?id=o_r&pullRequest=${i + 1}`, attempt: null, aliases: [] }
   const link = rf.link ?? `https://github.com/o/r/actions/runs/1/job/${i + 1}`
-  return { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link, attempt: `actions:${link.split('/').at(-1)}`, aliases: rf.aliases ?? [] }
+  const kind = link.startsWith('https://circleci.com/') ? 'circleci' : 'actions'
+  return { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link, attempt: `${kind}:${link.split('/').at(-1)}`, aliases: rf.aliases ?? [] }
 })
 // push.py's receipt: what the pinned push URL holds after the push, and the PR
 // head when the workflow asked for it.
@@ -170,13 +172,14 @@ const printed = (receipts) => receipts.map(r => Object.fromEntries(Object.entrie
 const lsTreeOf = (paths) => paths.map(f => `100644 blob ${blobOf(f)}\t${f}`)
 
 // Drive the workflow against stub agents. Every cycle gets the same `reviews`
-// and `ci` answer; `fix`/`push` patch (or null out) those replies.
+// answer, and the same `ci` unless it is a function of the call's label;
+// `fix`/`push` patch (or null out) those replies.
 async function run(opts = {}) {
   const logs = []
   const calls = opts.trace ?? [] // shared so a case that expects a throw can still see what ran
   const napPoints = [] // logs.length when a backoff started, to prove ordering
   const reviews = opts.reviews ?? { findings: [], replies: [], bots: 'reviewed' }
-  const ci = opts.ci ?? GREEN
+  const ciOf = (label) => typeof opts.ci === 'function' ? opts.ci(label) : opts.ci ?? GREEN
   const store = opts.store ?? new Map()
   const patch = (base, over) => over === null ? null : { ...structuredClone(base), ...over }
   // The stub checkout's HEAD: the PR head until this run pushes, then the SHA it
@@ -236,6 +239,7 @@ async function run(opts = {}) {
       return patch({ ...RECHECK, head }, over)
     }
     if (label.startsWith('ci:collect#')) {
+      const ci = ciOf(label)
       // A fixture names the report the CI lane should compose; collect.py's
       // answers follow from it (failedChecks); a running fixture also counts one pending check.
       const failed = failedChecks(ci)
@@ -287,12 +291,13 @@ async function run(opts = {}) {
       return answer === null ? null : conforms(options.schema, answer, label)
     }
     if (label.startsWith('ci:judge#')) {
+      const ci = ciOf(label)
       // The rest of each failure is the plain case: one run, every failure of a job listed.
       const links = askedOf(prompt).map(x => x.link)
       const failures = structuredClone(ci.realFailures)
-        .map(rf => ({ workflow: 'ci', job: rf.check, cell: null, signature: rf.firstError, runId: 1, complete: true, ...rf }))
+        .map(({ link, aliases, ...rf }) => ({ workflow: 'ci', job: rf.check, cell: null, signature: rf.firstError, runId: 1, complete: true, ...rf }))
       const failed = failedChecks(ci)
-      const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun, deferred: [] }
+      const judged = { checks: links.map(link => ({ link, failures: [failures[failed.findIndex(c => c.link === link)]] })), infraRerun: ci.infraRerun }
       return conforms(options.schema, opts.judge ? opts.judge(judged) : judged, label)
     }
     if (label.startsWith('reviews#')) {
@@ -1798,37 +1803,18 @@ test('a partial judgment needs a complete enumeration of distinct failures, and 
   assert.deepEqual(rerun.result.rollup.ciChecks, { judged: 1, partial: 0, reused: 0, unchanged: 0 }, 'a re-run is a judgment, not a merge')
 })
 
-test('a check deferred while its CircleCI workflow runs is judged afresh: no re-run spent, no verdict kept', async () => {
-  const defer = (j) => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })), deferred: j.checks.map(c => c.link) })
-  let n = 0
-  const { calls, logs, labels, result } = await run({
-    args: { autoPush: true, maxCycles: 3 }, reviews: WAITING, ci: redWith(RIG).ci,
-    judge: (j) => ++n === 1 ? defer(j) : { ...j, checks: j.checks.map(c => ({ ...c, failures: [] })), infraRerun: ['wf-2'] },
-  })
-  const deferred = calls.find(c => c.label === 'ci:judge#1').schema.properties.deferred
-  assert.deepEqual(deferred.items.enum, [job(1)])
-  assert.throws(() => conforms(deferred, [job(2)], 'd'), /not in/)
-  assert.ok(logs.some(l => /cycle 1: CI judge deferred hil \/ pico — its CircleCI workflow is still running/.test(l)), logs.join('\n'))
-  assert.equal(logs.some(l => /cycle 1: CI judge re-ran/.test(l)), false, 'a deferral is no re-run')
-  assert.deepEqual([result.history[0].ci.status, result.history[0].ci.infraRerun, result.history[0].ci.realFailures], ['running', [], []])
-  assert.equal(labels.includes('ci:collect#1.w'), false, 'no verdict stored for it')
-  const second = judgePrompt(calls, 2)
-  assert.deepEqual(askedOf(second).map(c => c.link), [job(1)], 'the same failed link is judged again')
-  assert.doesNotMatch(second, /re-run/, 'its re-run is still unspent')
-  assert.equal(logs.some(l => /a second time/.test(l)), false)
-  assert.equal(labels.includes('ci:judge#3'), false, 'then settling on its one re-run')
-  assert.deepEqual(result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
-  assert.equal(result.rollup.reran, 1)
-  assert.equal(result.rollup.ciChecks.judged, 1, 'a deferral is not counted judged')
-  // a stored check with an unclassified failure, deferred when judged in part, is not left as judged by its old base job
-  const store = new Map()
-  const st = (await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })).result.state
-  const later = await run({ store, base: 'b2', args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, judge: defer })
-  assert.ok(askedOf(judgePrompt(later.calls, 2))[0].judgeOnly)
-  assert.equal(later.result.history.at(-1).ci.status, 'running')
-  assert.deepEqual([later.result.state.ciCache.entries, later.result.state.ciCache.reruns], [[], []])
-  const next = await run({ store, args: { ...YIELD, state: later.result.state }, reviews: WAITING, ci: redWith(RIG).ci, judge: judgeWith(MIXED) })
-  assert.equal(askedOf(judgePrompt(next.calls, 3))[0].judgeOnly, undefined, 'judged whole again')
+test('a failed CircleCI job held pending while its workflow runs is judged once, after the workflow finishes', async () => {
+  const circle = { ...RIG, link: 'https://circleci.com/gh/o/r/413502' }
+  // collect.py lists the job as pending until its workflow is terminal, then as failed.
+  const ci = (label) => /#1\b/.test(label) ? { status: 'running', pending: 1, infraRerun: [], realFailures: [] } : redWith(circle).ci
+  const { labels, calls, result } = await run({ args: { autoPush: true, maxCycles: 3 }, reviews: WAITING, ci })
+  assert.equal(labels.includes('ci:judge#1'), false, 'nothing to judge while it is pending')
+  assert.equal(labels.includes('ci:collect#1.w'), false)
+  assert.deepEqual(labels.filter(l => l.startsWith('ci:judge#')), ['ci:judge#2'], 'judged once')
+  assert.deepEqual(askedOf(judgePrompt(calls, 2)).map(c => c.link), [circle.link])
+  assert.doesNotMatch(judgePrompt(calls, 2), /re-run/, 'no re-run spent while it was pending')
+  assert.equal(result.history[0].ci.status, 'running')
+  assert.deepEqual(result.state.ciCache.reruns, [])
 })
 
 test('an accepted failure resumed from the cache still passes', async () => {
@@ -2115,7 +2101,7 @@ test('the CI contract names the three verdicts and nothing else', async () => {
   assert.equal(judge.agentType, 'pr-ci-watcher')
   const item = judge.schema.properties.checks.items.properties.failures.items
   assert.deepEqual(item.required, ['check', 'workflow', 'job', 'cell', 'signature', 'runId', 'complete', 'firstError', 'files', 'verdict'])
-  assert.deepEqual(judge.schema.required, ['checks', 'infraRerun', 'deferred'])
+  assert.deepEqual(judge.schema.required, ['checks', 'infraRerun'])
   assert.deepEqual(item.properties.verdict.enum, ['real', 'rig-side', 'unclassified'])
   assert.deepEqual(item.properties.runId.type, ['integer', 'null'], 'a check whose link names no run has no run id')
   assert.equal(item.additionalProperties, false)

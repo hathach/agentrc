@@ -18,7 +18,7 @@ python3 $C rerun 391824 391728 ...    # each job's workflow, once, from its fail
 `rerun` prints one JSON line, `{"reruns": [{"workflow", "jobs", "newWorkflow"}], "running": [{"workflow", "jobs", "status"}], "errors": [...]}`,
 and exits 1 when any workflow could not be re-run. Several failed jobs of one
 workflow are one re-run; the new workflow id is what a watcher records. A
-workflow still `running`, `failing` or `on_hold` cannot be re-run yet: the
+workflow still `running`, `failing`, `on_hold` or `queued` cannot be re-run yet: the
 script reads its status first, lists it under `running` without re-running
 it, and exits 3 when that is all that stopped it; re-run it later, there is no
 need to check its status yourself. A status it cannot read is an error. The
@@ -47,7 +47,8 @@ the script exits 2.
 
 `scripts/collect.py` is `pr-babysit`'s CI lane without a model: `inventory`
 waits a bounded time and lists a head's failed and cancelled checks with a
-count of pending ones, calling a PR that conflicts with its base
+count of pending ones (a failed CircleCI job counts as pending until its
+workflow finishes and can be re-run), calling a PR that conflicts with its base
 `conflicting`, and `failures` saves each failing check's log and
 diagnostics, with the base branch's run of the same job, for the
 `pr-ci-watcher` judge; `remember` and `recall` keep the judge's verdicts beside

@@ -60,7 +60,7 @@ class AgentFiles(unittest.TestCase):
         """pr-babysit fixes only verdict 'real', stops honestly on 'unclassified', and needs one entry per check."""
         body = (AGENTS / 'pr-ci-watcher.md').read_text()
         example = self.contract_example('pr-ci-watcher.md')
-        self.assertEqual(sorted(example), ['checks', 'deferred', 'infraRerun'])
+        self.assertEqual(sorted(example), ['checks', 'infraRerun'])
         self.assertEqual(sorted(example['checks'][0]), ['failures', 'link'])
         failure = example['checks'][0]['failures'][0]
         self.assertEqual(sorted(failure), ['cell', 'check', 'complete', 'files', 'firstError', 'job', 'runId', 'signature', 'verdict', 'workflow'])

@@ -14,7 +14,11 @@ conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
 may not have run, so no check result stands for the PR), else running (a check
 pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
 failed or was cancelled) or green; `mergeable` is GitHub's, read last;
-`pending` counts the pending checks. `checks` lists
+`pending` counts the pending checks. A failed or cancelled CircleCI job whose
+workflow has not finished (running, failing, on_hold, queued: CircleCI refuses
+to re-run it yet) counts as pending, read from CircleCI's public job and
+workflow API on every poll; a status it cannot read is an error. This also
+delays judging a real failure in it until its workflow finishes. `checks` lists
 the failed and cancelled ones, each {name, workflow, bucket, link, attempt, aliases}:
 `attempt` is the per-run id in a link that has one (an Actions job, a Read the
 Docs build, a CircleCI job; each re-run mints a new one), and null for a link
@@ -256,13 +260,32 @@ def summary(checks, mergeable):
     return ('red' if counts.get('fail') or counts.get('cancel') else 'green'), counts
 
 
+def unfinished_held(repo, checks, workflows):
+    """The checks, a failed CircleCI job of an unfinished workflow as pending; `workflows` caches job -> workflow."""
+    jobs = {}
+    for c in checks:
+        kind, _, n = (attempt(c['link']) or '').partition(':')
+        if c['bucket'] in ('fail', 'cancel') and kind == 'circleci':
+            jobs[c['link']] = n
+    try:
+        for n in jobs.values():
+            if n not in workflows:
+                workflows[n] = circleci.workflow_of(repo, int(n))
+        status = {w: circleci.workflow_status(w) for w in {workflows[n] for n in jobs.values()}}
+    except circleci.Failed as e:
+        raise Failed(f'CircleCI: {e}')
+    held = {link for link, n in jobs.items() if status[workflows[n]] in circleci.UNFINISHED}
+    return [{**c, 'bucket': 'pending'} if c['link'] in held else c for c in checks]
+
+
 def inventory(repo, pr, head, wait):
     view = before = pull(repo, pr)
     if before['headRefOid'] != head:
         raise Failed(f'PR #{pr} head is {before["headRefOid"]}, not {head}')
     start = time.monotonic()
+    workflows = {}
     while True:
-        checks = listing(repo, pr)
+        checks = unfinished_held(repo, listing(repo, pr), workflows)
         status, counts = summary(checks, view.get('mergeable'))
         waited = int(time.monotonic() - start)
         if status != 'running' or waited + POLL > wait:

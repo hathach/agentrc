@@ -6,7 +6,7 @@
 
 rerun: each job's workflow, deduplicated, is re-run from its failed jobs with
 the circleci CLI (`circleci workflow rerun <uuid> --from-failed`, token from
-~/.circleci/cli.yml), unless its status is still running, failing or on_hold:
+~/.circleci/cli.yml), unless its status is still running, failing, on_hold or queued:
 the API refuses that re-run, so the workflow is listed under "running" and left
 for the caller to retry. stdout ends with one JSON line
 {"reruns": [{"workflow", "jobs", "newWorkflow"}], "running": [{"workflow",
@@ -28,7 +28,7 @@ import urllib.request
 
 UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 # The v2 Workflow.status enum, split by whether the workflow has finished.
-UNFINISHED = ('running', 'failing', 'on_hold')
+UNFINISHED = ('running', 'failing', 'on_hold', 'queued')
 FINISHED = ('success', 'not_run', 'failed', 'error', 'canceled', 'unauthorized')
 
 

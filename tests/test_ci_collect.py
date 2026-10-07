@@ -59,8 +59,23 @@ class InventoryTest(unittest.TestCase):
                 return mock.Mock(returncode=answer[0], stdout=b'', stderr=answer[1].encode())
             return mock.Mock(returncode=0, stdout=json.dumps(answer).encode())
         sleep = lambda s: self.clock.__setitem__(0, self.clock[0] + s)
+        # CircleCI's public API: job number -> workflow id (wf-<n> unless set), workflow -> statuses per read.
+        self.workflow_of, self.statuses = {}, {}
+
+        def workflow_of(repo, number):
+            self.calls.append(['circleci', 'job', number])
+            return self.workflow_of.get(number, f'wf-{number}')
+
+        def workflow_status(wid):
+            self.calls.append(['circleci', 'workflow', wid])
+            seq = self.statuses.get(wid, ['failed'])
+            got = seq.pop(0) if len(seq) > 1 else seq[0]
+            if isinstance(got, Exception):
+                raise got
+            return got
         for obj, name, fake in ((collect.subprocess, 'run', run), (collect.time, 'sleep', sleep),
-                                (collect.time, 'monotonic', lambda: self.clock[0])):
+                                (collect.time, 'monotonic', lambda: self.clock[0]),
+                                (collect.circleci, 'workflow_of', workflow_of), (collect.circleci, 'workflow_status', workflow_status)):
             patcher = mock.patch.object(obj, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -95,6 +110,47 @@ class InventoryTest(unittest.TestCase):
                           self.check('bot', 'fail', 'https://greptile.com/'), self.check('rabbit', 'fail', '')]]
         self.assertEqual([c['attempt'] for c in self.main()[1]['checks']],
                          ['actions:3', 'readthedocs:9', 'circleci:413502', None, None, None])
+
+    def test_a_failed_circleci_job_is_pending_until_its_workflow_finishes(self):
+        self.heads = [HEAD]
+        for status in collect.circleci.UNFINISHED:
+            self.statuses = {'wf-1': [status]}
+            self.listings = [[self.check('cci', 'fail', CIRCLE.format(1)), self.check('hil', 'pass', JOB.format(3))]]
+            rc, r = self.main()
+            self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []), status)
+        self.statuses = {'wf-1': ['failed']}
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['pending'], [c['link'] for c in r['checks']]), ('red', 0, [CIRCLE.format(1)]))
+
+    def test_an_unfinished_workflow_holds_only_its_own_jobs(self):
+        self.heads = [HEAD]
+        self.workflow_of = {1: 'wf-a', 2: 'wf-a', 3: 'wf-b'}
+        self.statuses = {'wf-a': ['failing'], 'wf-b': ['failed']}
+        self.listings = [[self.check('c1', 'fail', CIRCLE.format(1)), self.check('c2', 'cancel', CIRCLE.format(2)),
+                          self.check('c3', 'fail', CIRCLE.format(3)), self.check('hil', 'fail', JOB.format(4)),
+                          self.check('docs', 'fail', RTD.format(9))]]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['pending']), ('running', 2))
+        self.assertEqual([c['name'] for c in r['checks']], ['c3', 'hil', 'docs'], 'other workflows and providers still listed')
+        self.assertEqual(sorted(c[2] for c in self.calls if c[:2] == ['circleci', 'workflow']), ['wf-a', 'wf-b'], 'one status read per workflow')
+
+    def test_waits_for_the_workflow_reading_its_status_every_poll(self):
+        self.heads = [HEAD]
+        self.statuses = {'wf-1': ['running', 'failing', 'failed']}
+        self.listings = [[self.check('cci', 'fail', CIRCLE.format(1))]]
+        rc, r = self.main('--wait-seconds', '600')
+        self.assertEqual((r['status'], self.clock[0], [c['link'] for c in r['checks']]), ('red', 60, [CIRCLE.format(1)]))
+        self.assertEqual(self.calls.count(['circleci', 'workflow', 'wf-1']), 3, 'status read every poll')
+        self.assertEqual(self.calls.count(['circleci', 'job', 1]), 1, 'a job\'s workflow looked up once per call')
+
+    def test_a_circleci_status_it_cannot_read_is_an_error(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('cci', 'fail', CIRCLE.format(1))]]
+        self.statuses = {'wf-1': [collect.circleci.Failed('workflow wf-1: unknown status None')]}
+        rc, r = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('CircleCI: workflow wf-1: unknown status None', r['error'])
+        self.assertNotIn('status', r)
 
     def test_green_when_everything_passed_or_skipped(self):
         self.heads = [HEAD]
