@@ -26,12 +26,13 @@ inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
 (the verdict, first writer wins). One request per lane is in flight: a send
 while one is refused.
 
-send waits for the reply, prints it, its usage line on stderr, and removes the request, or with --detach
-prints only the id and leaves the reply to read; read delivers a reply whose
-send died or detached, waiting for release with --wait and refusing a running
-request otherwise; reset removes everything of a lane, its worktree included
-once its branch is merged. Exit codes: 1 failed, 3 unknown
-or delivered request, a lane busy, not ready or of the wrong kind, or reset
+send waits for the reply, prints it, then on stderr any diagnostic and a
+last `cowork result <id>` line with the outcome, exit code and usage, and
+removes the request, or with --detach prints only the id and leaves the reply
+to read; read delivers a reply whose send died or detached, waiting for
+release with --wait and refusing a running request otherwise; reset removes
+everything of a lane, its worktree included once its branch is merged. Exit
+codes: 1 failed, 3 unknown or delivered request, a lane busy, not ready or of the wrong kind, or reset
 refused, 4 missing "Files touched" line, or a --no-edit turn that changed
 the tree or after which it could not be checked; a tree unreadable before
 the turn runs none and fails.
@@ -551,22 +552,23 @@ def events(stream):
 
 
 def verdict(box, request):
-    """(what happened, exit code) of a request whose runner has let go. A
-    runner killed outright left no verdict: record one, so the request is
-    delivered like any other."""
+    """(outcome, what to say about it, exit code) of a request whose runner
+    has let go. A runner killed outright left no verdict: record one, so the
+    request is delivered like any other."""
     exit_file = box / f'{request}.exit'
     publish(exit_file, 'died\n')
     status = exit_file.read_text().strip()
     if status == 'edited':
-        return 'the tree changed during a --no-edit turn; check git status', MALFORMED
+        return 'tree-changed', 'the tree changed during a --no-edit turn; check git status', MALFORMED
     if status == 'unverified':
-        return err_tail(box, request).strip() or 'could not verify the tree', MALFORMED
+        return 'unverified', err_tail(box, request).strip() or 'could not verify the tree', MALFORMED
     if status == '0':
         if FOOTER.search(text_of(box / f'{request}.reply')):
-            return 'replied', 0
-        return 'the reply has no "Files touched" line; re-read the tree yourself', MALFORMED
-    return {'error': 'failed', 'killed': 'was killed',
-            'died': 'died without recording a verdict'}.get(status, f'exited {status}'), FAILED
+            return 'replied', '', 0
+        return 'no-footer', 'the reply has no "Files touched" line; re-read the tree yourself', MALFORMED
+    if status in ('killed', 'died'):
+        return status, {'killed': 'was killed', 'died': 'died without recording a verdict'}[status], FAILED
+    return 'failed', 'failed' if status == 'error' else f'exited {status}', FAILED
 
 
 def err_tail(box, request):
@@ -576,30 +578,32 @@ def err_tail(box, request):
 
 
 def deliver(box, request):
-    """Print a settled request's outcome, then remove its files: the
+    """Print a settled request's reply, or its failure, on stdout, then its
+    diagnostics and one receipt line on stderr, then remove its files: the
     coworker's session store keeps the turn. Under admission, so two readers
-    cannot both claim it, and only once stdout has taken the text."""
+    cannot both claim it, and only once both streams have taken the text."""
     with admission(box):
         lock = box / f'{request}.lock'
         if not lock.exists():
             die(f'no request {request} in this worktree: delivered already, or never sent', BUSY)
         if held(lock):
             die(f'{request} is {state(box, request)}; read it once it settles', BUSY)
-        what, code = verdict(box, request)
+        outcome, what, code = verdict(box, request)
         try:
             used = usage(box.parent.name, box / f'{request}.jsonl')
         except Exception:  # a report, never a reason to lose the reply
-            used = 'unavailable'
-        print(f'cowork usage {box.parent.name}/{box.name}: {used}', file=sys.stderr)
+            used = 'usage unavailable'
         if code == FAILED:
             text = f'cowork request {request} {what}\n{err_tail(box, request)}'
         else:
-            if code == MALFORMED:
-                print(f'cowork request {request}: {what}', file=sys.stderr)
             reply = box / f'{request}.reply'  # absent when an unverifiable turn never ran
             text = text_of(reply) if reply.exists() else ''
         if text:
             print(text, end='' if text.endswith('\n') else '\n', flush=True)
+        if code == MALFORMED:
+            print(f'cowork request {request}: {what}', file=sys.stderr)
+        print(f'cowork result {request} {box.parent.name}/{box.name}: {outcome}, exit {code}; {used}',
+              file=sys.stderr, flush=True)
         remove(box, request)
     return code
 

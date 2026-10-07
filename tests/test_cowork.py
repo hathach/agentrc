@@ -53,12 +53,16 @@ print(os.environ.get('FAKE_RESULT', json.dumps({'type': 'result', 'result': 'cla
 
 
 THREAD = '01a08a2e-cbbb-7de2-8b6f-b2e769c5b9d8'
-NO_USAGE = 'cowork usage codex/main: unavailable\n'  # what a delivery prints to stderr when the fake reports none
 CODEX = {'CLAUDECODE': '', 'CODEX_THREAD_ID': THREAD}  # a send driven by a Codex session
 
 
 def sh(cwd, *args):
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def receipt(request, outcome='replied', code=0, used='usage unavailable', lane='codex/main'):
+    """The last line a delivery prints to stderr; the fake reports no usage unless told to."""
+    return f'cowork result {request} {lane}: {outcome}, exit {code}; {used}\n'
 
 
 def task_of(prompt):
@@ -505,9 +509,9 @@ class CoworkTest(unittest.TestCase):
 
     def test_codex_usage_is_the_sessions_running_total_labelled_as_such(self):
         total = {'input_tokens': 77537, 'cached_input_tokens': 51328, 'output_tokens': 91, 'reasoning_output_tokens': 0}
-        code, _, _, err = self.send('--task', 'x', FAKE_USAGE=json.dumps(total))
+        code, request, _, err = self.send('--task', 'x', FAKE_USAGE=json.dumps(total))
         self.assertEqual(code, 0)
-        self.assertIn('cowork usage codex/main: session input 77,537 (cached 51,328), output 91\n', err)
+        self.assertEqual(err, receipt(request, used='session input 77,537 (cached 51,328), output 91'))
         self.assertNotIn('context', err, 'the codex stream has no per-call figure')
 
     def test_missing_or_failed_usage_is_unavailable_and_changes_nothing_else(self):
@@ -521,7 +525,7 @@ class CoworkTest(unittest.TestCase):
             with self.subTest(env):
                 code, request, _, err = self.send('--task', 'x', **env)
                 self.assertEqual(code, want)
-                self.assertIn('cowork usage codex/main: unavailable\n', err)
+                self.assertTrue(err.endswith(f'exit {want}; usage unavailable\n'), err)
                 self.assertNotIn('input 0', err)
                 self.assertEqual(self.leftovers(request), [])
 
@@ -530,23 +534,23 @@ class CoworkTest(unittest.TestCase):
         result = {'type': 'result', 'result': 'ok\nFiles touched: none',
                   'usage': {'input_tokens': 18, 'cache_read_input_tokens': 42079, 'cache_creation_input_tokens': 13973,
                             'output_tokens': 158}}
-        code, _, _, err = self.send('--to', 'claude', '--task', 'q', **CODEX, FAKE_RESULT=json.dumps(result),
-                                    FAKE_ASSISTANT=json.dumps({'type': 'assistant', 'message': {'usage': call}}))
+        code, request, _, err = self.send('--to', 'claude', '--task', 'q', **CODEX, FAKE_RESULT=json.dumps(result),
+                                          FAKE_ASSISTANT=json.dumps({'type': 'assistant', 'message': {'usage': call}}))
         self.assertEqual(code, 0)
-        self.assertIn('cowork usage claude/main: input 56,070 (cached 42,079), output 158; context 28,125 (last call)\n', err)
+        self.assertEqual(err, receipt(request, lane='claude/main',
+                                      used='input 56,070 (cached 42,079), output 158; context 28,125 (last call)'))
         for bad in (None, {}, {'output_tokens': 3}, {'input_tokens': 1, 'output_tokens': 1, 'cache_read_input_tokens': 'x'},
                     {'input_tokens': True, 'output_tokens': 1}, {'input_tokens': 1, 'output_tokens': -1}):
             with self.subTest(bad):
-                code, _, _, err = self.send('--to', 'claude', '--task', 'q', **CODEX,
-                                            FAKE_RESULT=json.dumps({**result, 'usage': bad}))
+                code, request, _, err = self.send('--to', 'claude', '--task', 'q', **CODEX,
+                                                  FAKE_RESULT=json.dumps({**result, 'usage': bad}))
                 self.assertEqual(code, 0)
-                self.assertIn('cowork usage claude/main: unavailable\n', err)
+                self.assertEqual(err, receipt(request, lane='claude/main'))
 
     def test_a_usage_report_that_raises_still_delivers_the_reply(self):
         with mock.patch.object(cowork, 'usage', side_effect=PermissionError('denied')):
             code, request, reply, err = self.send('--task', 'x')
-        self.assertEqual((code, reply), (0, 'codex reply\nFiles touched: none\n'))
-        self.assertIn('cowork usage codex/main: unavailable\n', err)
+        self.assertEqual((code, reply, err), (0, 'codex reply\nFiles touched: none\n', receipt(request)))
         self.assertEqual(self.leftovers(request), [])
 
     def test_a_failing_codex_turn_reports_its_jsonl_error_and_stderr(self):
@@ -578,6 +582,66 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.MALFORMED)
         self.assertEqual(reply, 'did it\n', 'the reply is still shown')
         self.assertIn('no "Files touched" line', err)
+
+    def test_every_delivery_ends_with_one_receipt_after_its_diagnostics(self):
+        for argv, env, outcome, code, diagnostic in (
+                ((), {}, 'replied', 0, None),
+                ((), {'FAKE_REPLY': 'did it\n'}, 'no-footer', cowork.MALFORMED, 'no "Files touched" line'),
+                (('--no-edit',), {'FAKE_REPLY': 'x\nFiles touched: none\n'}, 'replied', 0, None),
+                ((), {'FAKE_EXIT': '2'}, 'failed', cowork.FAILED, None)):
+            with self.subTest(outcome=outcome, env=env):
+                code_, request, _, err = self.send(*argv, '--task', 'x', **env)
+                self.assertEqual(code_, code)
+                lines = err.splitlines(keepends=True)
+                self.assertEqual(lines[-1], receipt(request, outcome, code))
+                if diagnostic:
+                    self.assertIn(diagnostic, ''.join(lines[:-1]), 'the diagnostic stays its own line')
+                self.assertEqual(self.leftovers(request), [])
+
+    def test_the_receipt_names_a_changed_or_unverified_tree(self):
+        self.codex_does("open('new.c', 'w').write('x')")
+        code, request, _, err = self.send('--no-edit', '--task', 'x')
+        self.assertTrue(err.endswith(receipt(request, 'tree-changed', cowork.MALFORMED)), err)
+        self.assertIn('the tree changed', err)
+        (self.root / 'new.c').unlink()
+        self.codex_does("import shutil; shutil.rmtree('.git/objects')")
+        code, request, _, err = self.send('--no-edit', '--task', 'x')
+        self.assertEqual(code, cowork.MALFORMED)
+        self.assertTrue(err.endswith(receipt(request, 'unverified', cowork.MALFORMED)), err)
+        self.assertIn('could not verify the tree', err, "git's diagnostic is kept apart from the receipt")
+
+    def test_a_dead_runner_gets_a_died_receipt(self):
+        self.box().mkdir(parents=True)
+        (self.box() / 'codex-x.lock').touch()
+        code, _, err = self.run_cli('read', 'codex-x')
+        self.assertEqual((code, err), (cowork.FAILED, receipt('codex-x', 'died', cowork.FAILED)))
+
+    def test_the_receipt_comes_after_the_reply_on_a_merged_stream(self):
+        request = self.reaped('--task', 'x')
+        self.settled(request)
+        done = subprocess.run([sys.executable, str(SCRIPT), 'read', request], cwd=self.root,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+        self.assertEqual(done.stdout, 'codex reply\nFiles touched: none\n' + receipt(request))
+
+    def test_a_delivery_whose_output_fails_leaves_the_request_to_read_again(self):
+        class Broken(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError(32, 'Broken pipe')
+        for stream in ('stdout', 'stderr'):
+            with self.subTest(stream):
+                request = self.reaped('--task', 'x')
+                self.settled(request)
+                with mock.patch(f'sys.{stream}', Broken()), self.assertRaises(BrokenPipeError):
+                    cowork.main(['read', request])
+                self.assertIn('.reply', self.leftovers(request))
+                code, out, err = self.run_cli('read', request)
+                self.assertEqual((code, out, err), (0, 'codex reply\nFiles touched: none\n', receipt(request)))
+                self.gate.unlink()
+
+    def test_refusals_print_no_receipt(self):
+        code, _, err = self.run_cli('read', 'codex-nope')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertNotIn('cowork result', err)
 
     def test_a_missing_cli_is_reported_not_raised(self):
         (self.bin / 'codex').unlink()
@@ -849,9 +913,9 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('delivered already', err)
 
     def test_read_reports_a_reaped_send_exactly_as_send_would_have(self):
-        for env, want in (({}, (0, 'codex reply\nFiles touched: none\n', NO_USAGE)),
+        for env, want in (({}, (0, 'codex reply\nFiles touched: none\n', 'replied, exit 0')),
                           ({'FAKE_REPLY': 'missing footer\n'}, (cowork.MALFORMED, 'missing footer\n', 'no "Files touched" line')),
-                          ({'FAKE_EXIT': '2'}, (cowork.FAILED, 'exited 2', ''))):
+                          ({'FAKE_EXIT': '2'}, (cowork.FAILED, 'exited 2', 'failed, exit 1'))):
             with self.subTest(env=env):
                 request = self.reaped('--task', 'x', **env)
                 self.settled(request)
@@ -878,7 +942,7 @@ class CoworkTest(unittest.TestCase):
         reader = self.read_wait(request)
         self.gate.touch()
         out, err = reader.communicate(timeout=10)
-        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
+        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', receipt(request)))
         self.assertEqual(self.leftovers(request), [])
 
     def test_send_detach_exits_and_closes_its_output_while_the_runner_works(self):
@@ -895,7 +959,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIsNone(cowork.session_of(self.box()))
         self.gate.touch()
         out, err = reader.communicate(timeout=10)
-        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
+        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', receipt(request)))
         self.assertEqual(cowork.session_of(self.box()), 'thread-42')
         self.assertEqual(self.leftovers(request), [])
 
@@ -909,7 +973,7 @@ class CoworkTest(unittest.TestCase):
             reader = self.read_wait('codex-x')
             self.assertTrue((box / 'codex-x.reply').exists())
         out, err = reader.communicate(timeout=10)
-        self.assertEqual((reader.returncode, out, err), (0, 'done\nFiles touched: none\n', NO_USAGE))
+        self.assertEqual((reader.returncode, out, err), (0, 'done\nFiles touched: none\n', receipt('codex-x')))
 
     def test_read_wait_leaves_status_and_kill_responsive(self):
         request = self.reaped('--task', 'x')
@@ -923,7 +987,7 @@ class CoworkTest(unittest.TestCase):
         out, err = reader.communicate(timeout=10)
         self.assertEqual(reader.returncode, cowork.FAILED)
         self.assertIn('was killed', out)
-        self.assertEqual(err, NO_USAGE)
+        self.assertEqual(err, receipt(request, 'killed', cowork.FAILED))
 
     def test_read_wait_competing_consumers_deliver_once(self):
         request = self.reaped('--task', 'x')
@@ -934,7 +998,7 @@ class CoworkTest(unittest.TestCase):
             out, err = reader.communicate(timeout=10)
             results.append((reader.returncode, out, err))
         results.sort()
-        self.assertEqual(results[0], (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
+        self.assertEqual(results[0], (0, 'codex reply\nFiles touched: none\n', receipt(request)))
         self.assertEqual(results[1][:2], (cowork.BUSY, ''))
         self.assertIn('delivered already', results[1][2])
         self.assertEqual(self.leftovers(request), [])
@@ -948,7 +1012,7 @@ class CoworkTest(unittest.TestCase):
         replacement = self.read_wait(request)
         self.gate.touch()
         out, err = replacement.communicate(timeout=10)
-        self.assertEqual((replacement.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', NO_USAGE))
+        self.assertEqual((replacement.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', receipt(request)))
         self.assertEqual(self.leftovers(request), [])
 
     def test_the_jsonl_exists_the_instant_the_id_is_printed(self):
