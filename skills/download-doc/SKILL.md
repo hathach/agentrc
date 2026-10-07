@@ -7,69 +7,19 @@ description: List, download and import vendor hardware docs (datasheets, referen
 
 Fetch vendor documentation into the Calibre library, and keep it current.
 `CALIBRE_LIBRARY` overrides the library location for every script here, the same
-variable `read-doc` honours; imports and replacements then target that library.
-
-The library at `~/Documents/calibre-library` is the house archive of hardware docs.
-It is also the first place to look before searching the web for a
-manual — so its value depends on being both complete and *not stale*.
-
-## The pipeline
-
-```
-vendor adapter          shared core
-enumerate()  ──▶  diff vs Calibre identifiers  ──▶  download  ──▶  import / replace  ──▶  report
-                  (st:DS12930, nxp:MCXA344...)                     (backup first)
-```
-
-Everything vendor-specific lives in an adapter; everything else is shared. Adding a
-vendor should mean writing one adapter, not another pipeline.
+variable `read-doc` honours. The library is the first place to look before searching
+the web for a manual, so its value depends on being complete and *not stale*.
 
 | File | Role |
 |---|---|
-| `scripts/sync.py` | CLI. Enumerate → plan → (with `--apply`) import. Dry-run by default. |
-| `scripts/doclib.py` | Transport, revision comparison, Calibre I/O, planning. Vendor-neutral. |
-| `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py`'s `VENDORS` is the list (`sync.py --help` prints it), each module's docstring its scope |
-| `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry-run by default. |
-| `references/st.md`, `references/nxp.md` | Per-vendor endpoints, quirks, and the gated-download flow |
+| `scripts/sync.py` | CLI: sync a vendor (enumerate → plan → `--apply` imports/replaces), or `add` one document. Dry run by default. |
+| `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py --help` lists them, each docstring gives its scope |
+| `scripts/doclib.py` | Shared core: transport, revisions, Calibre I/O, planning |
+| `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry run by default. |
+| `references/st.md`, `references/nxp.md` | Per-vendor endpoints, quirks, the NXP gated-download flow |
+| `references/maintaining.md` | Why the conventions, the failure modes, adding a vendor |
 
-Books added by hand before this skill existed carry no identifier, so an
-identifier-only diff would import a second copy of each. Adapters declare `aliases`
-(the title shapes their vendor's files were historically filed under) and those land
-in a **legacy** bucket: reported, never touched. They can't be revision-compared — the
-old title records no revision — so the only automatic action would be replacing a
-book the user filed themselves, on a guess.
-
-## What a bare run fetches
-
-Two defaults apply unless the request names otherwise. Both are announced on every
-run, because a filtered run and an unfiltered one must not look alike:
-
-- **Technical documents only** — datasheet, errata, reference/user/programming manual,
-  user guide, application note. Product briefs, presentations, packaging and
-  certification paperwork are the bulk of a vendor catalogue and noise in a reference
-  library. `--all-types` widens it; naming `--types` replaces it outright.
-- **Parts with a USB controller** — where the vendor's data supports deciding that.
-  `--all-devices` widens it; naming `--family`/`--chips`/`--device` replaces it.
-
-The USB scope is per-adapter and honest about what it cannot know:
-
-| Vendor | Scope | Why |
-|---|---|---|
-| Espressif | S2, S3, S31, P4 | datasheet-verified USB OTG; USB-Serial/JTAG-only parts (C3/C6/H2) excluded on purpose |
-| Raspberry Pi | everything | every RP2040/RP2350 part has a USB controller |
-| ST | **no filter** | not derivable — see below |
-| NXP | **no filter** | taxonomy classifies by product line, not peripheral |
-
-⚠️ Don't be tempted to mine ST's datasheet blurbs for "USB". It looks like it works —
-it finds USB in 10 of 24 series — and it is wrong: STM32G4, L5, U5 and WB all have USB
-and all score zero, because those descriptions are truncated marketing text. That
-heuristic silently drops whole series. When capability can't be derived, the adapter
-says so in the run output rather than applying a filter that quietly under-reports.
-
-Derive USB-capable part lists from current datasheets (`pdftotext -f 1 -l 6 … | grep -i otg`)
-rather than model recall, which can omit newer parts.
-
-## Before you touch the library
+## Sync a vendor
 
 Run the plan first and *read it*:
 
@@ -77,214 +27,89 @@ Run the plan first and *read it*:
 python3 <skill dir>/scripts/sync.py st --family STM32H7 --types datasheet,errata
 ```
 
-This prints, per document, the resolved doc ID and the `old -> new` revision pair,
-and changes nothing. Check those pairs before going further. The one serious failure
-mode in this whole workflow is resolving the **wrong document ID** — and a wrong ID
-doesn't error, it produces a confident, plausible, entirely wrong plan. (A regex bug
-that turned `RM0433` into `RM433` once reported "6 outdated" when the truth was 31.)
-The listing is how you catch it.
-
-Then apply:
+It prints, per document, the resolved doc ID and the `old -> new` revision pair, and
+changes nothing. Check those pairs: the one serious failure mode is resolving the
+**wrong document ID**, which doesn't error — it produces a confident, plausible,
+entirely wrong plan. Then apply and reindex so `read-doc` finds the new pages:
 
 ```bash
 python3 <skill dir>/scripts/sync.py st --family STM32H7 --types datasheet,errata --apply
 python3 <skill dir>/scripts/sync.py nxp --types errata --device "i.MX RT" --apply
-```
-
-After an `--apply` run, reindex so `read-doc` can find pages in the revisions it
-replaced. The command reconciles the whole library but extracts only the PDFs
-that are missing or whose source changed:
-
-```bash
 python3 ~/.claude/skills/read-doc/scripts/locate.py build --all
 ```
 
-`--apply` refuses to run while something else holds the library:
+A bare run fetches **technical documents only** (datasheet, errata, reference/user/
+programming manual, user guide, application note; `--all-types` widens, `--types`
+replaces) for **parts with a USB controller** where the adapter can decide that
+(`--all-devices` widens, `--family`/`--chips`/`--device`/`--parts` replace). Both are
+announced on every run.
 
-- **The Calibre GUI holds an exclusive write lock.** Ask the user to close it; don't
-  kill it. With a content-server user configured in the gitignored `secret.yml`
-  beside this file (`calibre:` block with `server_url`, `username`, `password`;
-  `Library._server_creds` documents the shape) imports go through the running
-  GUI's server instead, and the lock is not a blocker.
-- **A FreeFileSync `calibre-library.ffs_batch` mirror.** Importing mid-sync races a
-  17 GB mirror to omv and produces spurious "another calibre program is running"
-  errors. Let it finish. (That batch is the scheduled FreeFileSync mirror of the
-  library to omv.)
+Plan lines: `NEW`, `OUTDATED old -> new`, `GATED` (needs a person, below), `LEGACY`
+(filed by hand before identifiers existed; reported, never touched), `UNCHECKABLE`
+(revision cannot be compared). The coverage block must add up per type — catalogue
+equals the sum of the buckets — and names unparseable revisions; `--strict` makes them
+a non-zero exit. "0 found" usually means the vendor is throttling: wait and re-run,
+cached progress is kept.
 
-## Conventions that must not drift
+## Add one document
 
-The books already imported follow these, and dedup depends on matching them
-exactly:
+For a vendor with no adapter, or a document an adapter does not list, `add` is the
+import path — not curl, a hand-built `Doc`, or `doclib.Library` calls:
 
-- `authors` — the vendor: `STMicroelectronics`, `NXP Semiconductors`
-- `title` — `<DOCID> <description> Rev <n>`, e.g. `ES0392 STM32H7 device errata Rev 15` (`retitle.py` fixes id-last ones)
-- `identifiers` — `st:<DOCID>` / `nxp:<DOCID>`, **set at import time**
-- `tags` — kind (`datasheet`, `errata`, `reference-manual`, `user-manual`,
-  `programming-manual`, `application-note`) + vendor + family (`STM32H7`, `i.MX RT`, `LPC`)
-- `comments` — description, Document ID, Revision, Source URL. The `Revision:` line is
-  read back by `Library.index()` when the title carries no `Rev n` — titles only hold
-  numeric revisions, so a letter or date revision lives here and nowhere else.
-
-Identifiers are the single source of truth for "do we already have this?". Don't add
-an import log alongside them — two sources of truth drift, and one `calibredb list
---for-machine` at startup gives you the same answer in one query, survives log loss,
-and sees books added by any other route. Cache it in memory for the run, not on disk.
-
-`calibredb add` has no `--comments`, so import is add-then-`set_metadata`. If the
-second call fails you get a book with the right identifier and no comments — which an
-identifier-only check will call "done" forever. When auditing, treat *has identifier
-but empty comments* as needing repair rather than as complete.
-
-## Things that will bite you
-
-**Validate the payload; never trust the exit status.** Both vendors serve HTML error
-and login pages with a 200, so success has to mean "the JSON parsed" or "the file
-starts with `%PDF`". `doclib.http_get` takes a validator, tries wget then curl, and
-raises only when no client returned something that passes. Keep it that way rather
-than picking a favourite client — which one works has been observed to differ between
-processes on the same host at the same minute.
-
-Two artifacts masquerade as bot-blocking; both cost hours if you take them at face
-value:
-
-- **curl globs `{ }`.** NXP's API takes its query as a brace-wrapped path segment.
-  Without `-g`, curl strips the braces and requests a malformed URL, which returns
-  406 — or 404 with a 745-byte "Page not available" body that looks exactly like an
-  Akamai block. It isn't. `curl -g` returns a clean 200.
-- **`%{size_download}` counts wire bytes.** With `--compressed`, a 29,896-byte JSON
-  body reports 3,878. That reads as truncation. Compare *file* sizes, not counters.
-
-**Vendors throttle for real, though.** A burst of index fetches and st.com stops
-answering — dropped connections, no error page, so it presents as a network fault, and
-it can take out every client in the process at once. Indexes are cached under
-`~/.cache/download-doc/` and paced apart for this reason. An empty result usually
-means "backed off", not "wrong URL": wait and re-run, and cached progress is kept.
-
-**Report revision-comparison outcomes explicitly.** `compare_rev()` returns
-`newer | current | incomparable | unparseable` with a detail string. Use it for
-reports so "up to date" remains distinguishable from "cannot be checked";
-`rev_newer()` is the boolean wrapper for callers that do not need that distinction.
-
-**So is a revision the vendor re-schemed.** If the local book records `1.1` and the
-vendor now reports `30 January 2024` — or `2` becomes `B` after a rewrite — both parse
-fine, but they cannot be ordered against each other, and `rev_newer` refuses forever.
-That refusal is correct and invisible: it reads as "already current". Those pairs get
-their own `UNCHECKABLE` line and an `incomparable` column in the coverage arithmetic,
-so a convention change surfaces the first time it appears.
-
-**An unparseable revision is a silent, permanent stall.** A document whose revision
-can't be parsed enumerates, matches and imports perfectly — and can then never be
-compared, so it reports "0 outdated" forever, which looks exactly like "everything is
-current". Espressif's `v1.8` did this. The coverage block therefore names them:
-
-```
-  errata      catalogue    4 = 2 current + 2 legacy
-              (2 revision(s) unparseable — cannot be checked for updates: AN123='DRAFT', ...)
+```bash
+python3 <skill dir>/scripts/sync.py add --vendor gigadevice \
+    --author "GigaDevice Semiconductor" --id GD32F303xB-datasheet --id-not-printed \
+    --type datasheet --title "GD32F303xB Arm Cortex-M4 32-bit MCU" --revision 1.1 \
+    --family GD32F303 --url "https://download.gigadevice.com/Datasheet/GD32F303xB%20Datasheet_Rev1.1.pdf"
 ```
 
-so the next unhandled format announces itself the first time it appears rather than
-after someone notices a vendor has never once published an update. `--strict` turns
-that into a non-zero exit for automation.
+- `--vendor`: the lowercase identifier scheme. An adapter's name fixes the author; a
+  new vendor needs `--author`, the company name, spelled the same every time.
+- `--id`: the vendor's stable document number, never including the revision. When the
+  document prints none, use `<part>-<kind>` (or the filename stem) with
+  `--id-not-printed`.
+- `--type`: one of the shared kinds (`--help` lists them); `--title` is the description
+  without ID or revision; `--family` adds tags.
+- `--url URL`, or `--pdf FILE --source URL` for a file downloaded in a browser — the
+  route for vendors that block scripted clients (Nordic answers 403).
 
-**Revisions are not version numbers.** ST's are clean (`12.0`), but NXP's `RevisionNo`
-is free text and roughly a third of errata put a date in it (`10DEC2013`,
-`30 January 2024`, even `11 Sep 019`). `doclib.parse_rev` returns a *kind* —
-`num` / `date` / `alpha` / `unknown` — and comparison refuses to order across kinds.
-Separated dates are detected **before** the numeric branch, because `30.01.2024`
-matches `\d+(\.\d+)*` and parses as version `(30, 1, 2024)` — which orders *older*
-than `(1, 1, 2024)` and so silently refuses every real update across a month or year
-boundary. DD/MM vs MM/DD is resolved only when a field exceeds 12 or both agree;
-a genuinely ambiguous `01.02.2024` stays unknown rather than guessing. A date is
-neither newer nor older than `2.0`; it's unknowable. Under-replacing shows up in the
-report and is recoverable; over-replacing deletes a good local PDF on the strength of
-a parse artifact. Keep that asymmetry.
+The dry run still downloads and checks the file, then prints the identifier, author,
+title, tags and comments it would file. It refuses (exit 1) an identifier already in
+the library — `add` never replaces; refreshing is `sync.py <vendor>`'s — a second
+spelling of the vendor's scheme or author, a title already filed by hand, a download
+that is not a PDF, and an ID pages 1-2 do not confirm (unless `--id-not-printed`). Exit 2 is a
+usage error, a blocker, or a library it could not read. `--apply` imports; reindex after.
 
-**Check the file is the document you asked for.** Vendors do serve the wrong one —
-NXP returned `SAC57D5x_1N87P` for a request for `SAC57D54H_1N87P`. A wrong PDF filed
-under the right identifier is worse than a missing book, because it looks correct
-forever. `verify_identity` reads page 1 and compares, and it **must** use the
-Rev-adjacent pattern: on ST's ES0392 errata sheet the first ID-shaped token on page 1
-is `RM0433`, the reference manual it cites, so a bare match would reject 124 valid
-errata sheets. A mismatch blocks the import; an unfindable code only warns.
+## Conventions
 
-**Reconcile coverage per type, and print it.** `catalogue == new + current + legacy +
-outdated + gated`, per document type, every run. This is the one check that catches a
-silent drop — and unlike
-an exception, a silent drop reports as a confident success. It's also what lets you
-*prove* a fix cost nothing rather than argue about it: `124 = 91 + 33 + 0`.
+Dedup depends on matching these exactly; `maintaining.md` gives the reasons.
 
-**A download isn't always a PDF.** `fetch_document` classifies before importing: NXP
-`DRM*` bundles arrive as a zip holding `<CODE>.pdf` plus HW/SW packages (extract the
-PDF, discard the rest); some codes resolve to an online HTML doc site with no file at
-all; and a few open only through a session-signed `cache.nxp.com` URL that is
-unobtainable headlessly. Each needs a different answer, and none of them is a retry.
+- `authors` — the vendor's company name: `STMicroelectronics`, `NXP Semiconductors`
+- `title` — `<DOCID> <description> Rev <n>`, e.g. `ES0392 STM32H7 device errata Rev 15`;
+  an unprinted ID trails in parentheses (`retitle.py` fixes id-last ones)
+- `identifiers` — `<vendor>:<DOCID>`, set at import time; the only record of "do we
+  have this?" — no import log beside it
+- `tags` — kind (`datasheet`, `errata`, `reference-manual`, …) + vendor + family
+- `comments` — description, Document ID, Revision, Source URL
 
-**The GUI keeps a sqlite lock after content-server imports.** With the Calibre GUI
-open, `sync.py --apply` writes through its content server fine — but afterwards the
-idle GUI held `metadata.db` locked for well over five minutes (2026-09-01), so anything
-that reads the database directly (`retitle.py`, `sqlite3`) fails with "database is
-locked". `calibredb` through the server still works; route reads that way or wait.
+## Safety rules
 
-**Microchip has no revision field; a file is pinned or rolling.** `…-DS00001692D.pdf`
-pins Rev D and never changes; `…-DS00001692.pdf` is the rolling latest (it served Rev E
-while the D file still existed, so when both are listed the pinned one is dropped). A
-rolling file's version is the sitemap `<lastmod>` date, harvested into the cache as
-`url<TAB>lastmod` — a date compares against a date, and it moves when the file does.
-Consequence: books imported before lastmod was recorded carry `Revision: unknown`, and
-the core's "local unreadable → refresh" rule marks every one of them OUTDATED on the
-next run. That is one deliberate re-download (or a backfill of `Revision:` with the
-date each book was added), not a bug — but it is ~100 documents, so read the plan first.
+- `--apply` refuses while something holds the library. **The Calibre GUI's write lock**:
+  ask the user to close it, never kill it — or configure a content-server user in the
+  gitignored `secret.yml` beside this file (`calibre:` block; `Library._server_creds`
+  documents it). **A FreeFileSync `calibre-library.ffs_batch` mirror** to omv: let it
+  finish.
+- Replacing a book backs its PDF up to `~/.local/share/download-doc/superseded/`
+  first; never `calibredb remove` by hand.
+- Gated documents (login, per-document EULA, NXP moderated request, `*-NDA`) are
+  reported per document with the reason. **Never accept a licence or submit a request
+  form without the user's explicit say-so**; `references/nxp.md` has the flow.
+- Never dedupe NXP mask-set errata on title similarity; the code is the identity.
 
-**Back up before replacing.** `calibredb remove` is immediate with no undo, and a
-superseded revision is still the only copy of *that* revision. `Library.remove()`
-copies the PDF to `~/.local/share/download-doc/superseded/` first.
+## When to open references/maintaining.md
 
-**Sweep the download directory case-insensitively and extension-agnostically.**
-Browser-mediated downloads don't match the doc code: casing differs
-(`MKMxxZxxACxx5RM.pdf` for code `MKMXXZXXACXX5RM`), Chrome appends ` (1)`, and some
-docs arrive as a `.zip` with the PDF inside. A strict match "misses" files that
-downloaded fine and re-fetches them every retry. `doclib.sweep_download_dir` handles
-this and lives in the core because any browser-mediated vendor hits it.
-
-**Never dedupe NXP mask-set errata on title or mask similarity.** `KINETIS_K_0N50M`
-and `KINETIS_V_0N50M` look like revisions of each other and are different products
-(MK22FN vs MKV31F). Dedupe on the document code only. If two really do look
-redundant, confirm with `pdftotext` against the "applies to mask X for these
-products" list inside the PDF before removing either.
-
-## Documents that need a human
-
-Roughly half of NXP's Arm-MCU catalogue — and nearly every reference manual — is
-gated. Those are reported, not silently dropped:
-
-- **Login-gated** (`webapp/Download?colCode=`) — needs a signed-in browser;
-  `references/nxp.md` has the flow.
-- **Per-document EULA** (`sps/download/license.jsp`) — a licence agreement.
-  **Get the user's explicit say-so before accepting one on their behalf.** Accepting
-  a licence is a legal act performed in their name; it is not yours to click.
-- **Moderated request** (`mod_download.jsp?appType=moderated`) — not a EULA at all,
-  but a form asking for the user's NXP salesperson and email, sent for approval.
-  Never submit it automatically.
-- **`*-NDA` codes** — unobtainable without an NDA. A few codes in NXP's own index
-  are simply dead 404s.
-
-Report what was skipped and *why*, per document. Across a 1,500-document import the
-interesting output was not the successes — it was the ~70 that needed a person. A run
-that says only "done" hides precisely the part the user has to act on.
-
-## Adding a vendor
-
-Write `scripts/vendor_<name>.py` exposing:
-
-```python
-enumerate_docs(...) -> list[doclib.Doc]   # Doc(vendor, doc_id, doc_type, version,
-                                          #     title, url, author, family, desc)
-```
-
-Normalize `doc_type` to the shared tag vocabulary above so the library stays
-searchable across vendors, and put the vendor's quirks in `references/<name>.md`
-rather than in the core. Then add it to `VENDORS` in `sync.py`. If you find yourself
-special-casing a vendor inside `doclib.py`, the abstraction is leaking.
-
-Run `python3 <skill dir>/scripts/doclib.py` for the self-test (revision parsing and doc-ID regexes,
-with the real-world values as fixtures) after touching the core.
+Before writing or changing an adapter or `doclib.py`; and when a run misbehaves — 404,
+406 or empty answers that look like blocking, a revision that never updates or reads
+`UNCHECKABLE`, an identity mismatch, a download that is not a PDF, "database is
+locked" after imports, every Microchip book turning OUTDATED, or a question about the
+LEGACY bucket or USB scope.

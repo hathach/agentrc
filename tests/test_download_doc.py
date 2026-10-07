@@ -2,6 +2,8 @@
 reported as legacy, never imported a second time."""
 import contextlib
 import io
+import json
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -11,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'download-doc' / 'scripts'))
 import doclib  # noqa: E402
 import retitle  # noqa: E402
+import sync  # noqa: E402
 import titles  # noqa: E402
 import vendor_arm  # noqa: E402
 import vendor_microchip  # noqa: E402
@@ -282,6 +285,177 @@ class ArmCatalogue(unittest.TestCase):
         self.serve(lambda code: [])
         with self.assertRaisesRegex(SystemExit, 'ddi0419 has no PDF'):
             vendor_arm.enumerate_docs()
+
+
+def pdf_with(text):
+    """A one-page PDF whose page text pdftotext reads back as `text`."""
+    objs = ['<</Type/Catalog/Pages 2 0 R>>', '<</Type/Pages/Kids[3 0 R]/Count 1>>',
+            '<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]/Resources<</Font<</F1 4 0 R>>>>'
+            '/Contents 5 0 R>>',
+            '<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>']
+    stream = f'BT /F1 12 Tf 72 720 Td ({text}) Tj ET'
+    objs.append(f'<</Length {len(stream)}>>\nstream\n{stream}\nendstream')
+    out = '%PDF-1.4\n%' + 'x' * 1100 + '\n'    # past the size floor a download must clear
+    offsets = []
+    for n, obj in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f'{n} 0 obj\n{obj}\nendobj\n'
+    xref = len(out)
+    out += f'xref\n0 {len(objs) + 1}\n0000000000 65535 f \n'
+    out += ''.join(f'{o:010d} 00000 n \n' for o in offsets)
+    out += f'trailer\n<</Size {len(objs) + 1}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n'
+    return out.encode('latin-1')
+
+
+class FakeCalibre:
+    """calibredb over an in-memory book list, taking the argv Library passes it."""
+
+    def __init__(self, *books):
+        self.books = [dict(b) for b in books]
+        self.writes = []
+
+    def run(self, *args, check=True, tries=4):
+        if args[0] == 'list':
+            books = self.books
+            if '--search' in args:
+                author = args[args.index('--search') + 1].split('"')[1]
+                books = [b for b in books if b['authors'] == author]
+            return json.dumps(books)
+        self.writes.append(args[0])
+        if args[0] == 'add':
+            opt = dict(zip(args[1:-1:2], args[2:-1:2]))
+            scheme, code = opt['-I'].split(':', 1)
+            self.books.append({'id': len(self.books) + 1, 'title': opt['-t'], 'authors': opt['-a'],
+                               'tags': opt['-T'].split(','), 'identifiers': {scheme: code},
+                               'comments': ''})
+            return f'Added book ids: {len(self.books)}'
+        if args[0] == 'set_metadata':
+            book = self.books[int(args[-1]) - 1]
+            for spec in args[2:-1:2]:
+                name, value = spec.split(':', 1)
+                book[name] = value
+            return ''
+        raise AssertionError(f'unexpected calibredb {args}')
+
+
+@unittest.skipUnless(shutil.which('pdftotext'), 'identity checks read the PDF with pdftotext')
+class AddOne(unittest.TestCase):
+    """`sync.py add` files one document the way an adapter's import would, or refuses."""
+
+    URL = 'https://example.com/ps.pdf'
+
+    def setUp(self):
+        self.library = FakeCalibre()
+        self.served = pdf_with('nRF52820 Product Specification PS1234 v1.4')
+        self.fetched = []
+        saved = (doclib.Library._run, doclib.Library.blockers, doclib.Library.__dict__['_server_creds'],
+                 doclib.http_get)
+
+        def restore():
+            (doclib.Library._run, doclib.Library.blockers, doclib.Library._server_creds,
+             doclib.http_get) = saved
+        self.addCleanup(restore)
+        doclib.Library._run = lambda lib, *a, **k: self.library.run(*a, **k)
+        doclib.Library.blockers = lambda lib: []
+        doclib.Library._server_creds = staticmethod(lambda: None)
+        doclib.http_get = self.http_get
+
+    def http_get(self, url, *a, **k):
+        self.fetched.append(url)
+        return self.served
+
+    def add(self, *args, doc_id='PS1234', source=('--url', URL)):
+        argv = ['--vendor', 'nordic', '--author', 'Nordic Semiconductor', '--id', doc_id,
+                '--type', 'datasheet', '--title', 'nRF52820 Product Specification',
+                *source, '--revision', '1.4', '--family', 'nRF52', *args]
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sync.add_main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_dry_run_prints_the_plan_and_changes_nothing(self):
+        code, out, err = self.add()
+        self.assertEqual(code, 0, err)
+        for line in ('ADD nordic:PS1234', 'author      Nordic Semiconductor',
+                     'title       PS1234 nRF52820 Product Specification — Datasheet Rev 1.4',
+                     'tags        datasheet, nordic, nRF52', 'identity ok',
+                     'Document ID: PS1234', 'Revision: 1.4', f'Source: {self.URL}'):
+            self.assertIn(line, out)
+        self.assertIn('dry run', err)
+        self.assertEqual((self.fetched, self.library.writes), ([self.URL], []))
+
+    def test_apply_imports_under_the_conventions(self):
+        code, out, err = self.add('--apply')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.library.books, [{
+            'id': 1, 'title': 'PS1234 nRF52820 Product Specification — Datasheet Rev 1.4',
+            'authors': 'Nordic Semiconductor', 'tags': ['datasheet', 'nordic', 'nRF52'],
+            'identifiers': {'nordic': 'PS1234'}, 'publisher': 'Nordic Semiconductor',
+            'comments': f'\n\nDocument ID: PS1234\nRevision: 1.4\nSource: {self.URL}'}])
+        self.assertIn('IMPORTED #1 nordic:PS1234', out)
+        self.assertIn('locate.py build --all', out)
+
+    def test_an_identifier_already_filed_is_refused_before_any_download(self):
+        self.library = FakeCalibre({'id': 7, 'title': 'PS1234 old', 'authors': 'Nordic Semiconductor',
+                                    'identifiers': {'nordic': 'ps1234'}, 'comments': 'Revision: 1.3'})
+        code, _, err = self.add('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('already book #7', err)
+        self.assertIn('no refresh path', err)
+        self.assertEqual((self.fetched, self.library.writes), ([], []))
+
+    def test_a_second_spelling_of_the_vendor_is_refused(self):
+        self.library = FakeCalibre({'id': 3, 'title': 'other', 'authors': 'Nordic Semiconductor',
+                                    'identifiers': {'nordicsemi': 'X'}, 'comments': ''})
+        code, _, err = self.add('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('already files its books as nordicsemi:', err)
+
+    def test_a_download_that_is_not_a_pdf_is_refused(self):
+        self.served = b'<!doctype html><html>sign in</html>' + b' ' * 1024
+        code, _, err = self.add('--apply')
+        self.assertEqual(code, 1)
+        self.assertIn('login page', err)
+        self.assertEqual(self.library.writes, [])
+
+    def test_a_local_file_that_is_not_a_pdf_is_refused(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        page = Path(tmp.name) / 'ps.pdf'
+        page.write_bytes(b'<html>sign in</html>')
+        code, _, err = self.add('--apply', source=('--pdf', str(page), '--source', self.URL))
+        self.assertEqual(code, 1)
+        self.assertIn('is not a PDF', err)
+        self.assertEqual(self.library.writes, [])
+
+    def test_the_wrong_document_is_refused(self):
+        self.served = pdf_with('DS9999 Rev 2 nRF52820 Product Specification')
+        code, _, err = self.add('--apply', doc_id='DS1234')
+        self.assertEqual(code, 1)
+        self.assertIn('served DS9999, not DS1234', err)
+        self.assertEqual(self.library.writes, [])
+
+    def test_an_id_the_document_does_not_print_is_refused_unless_declared(self):
+        code, _, err = self.add('--apply', doc_id='nRF52820-datasheet')
+        self.assertEqual((code, self.library.writes), (1, []))
+        self.assertIn('--id-not-printed', err)
+        code, out, err = self.add('--id-not-printed', doc_id='nRF52820-datasheet')
+        self.assertEqual(code, 0, err)
+        self.assertIn('title       nRF52820 Product Specification — Datasheet (nRF52820-datasheet) Rev 1.4', out)
+        self.assertIn('identity skipped', out)
+
+    def test_a_document_that_neither_confirms_nor_contradicts_the_id_is_refused(self):
+        self.served = pdf_with('Some unrelated application note without a number')
+        code, _, err = self.add('--apply', doc_id='DS1234')
+        self.assertEqual((code, self.library.writes), (1, []))
+        self.assertIn('do not confirm DS1234', err)
+        self.assertIn('--id-not-printed', err)
+
+    def test_a_vendor_without_an_adapter_needs_an_author(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            sync.add_main(['--vendor', 'nordic', '--id', 'PS1234', '--type', 'datasheet',
+                           '--title', 't', '--url', self.URL])
+        self.assertIn('--author is required', err.getvalue())
 
 
 def setattr_all(saved):

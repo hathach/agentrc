@@ -12,10 +12,15 @@ it. Pass --apply once the plan looks right.
   sync.py st  --family STM32H7 --types datasheet,errata --apply
   sync.py nxp --types errata --device "i.MX RT"
   sync.py ti  --parts ina3221,tca9548a
+
+`sync.py add` imports one document by hand under the same conventions, for a vendor
+with no adapter or a document an adapter does not list (`sync.py add --help`).
 """
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -68,7 +73,219 @@ def enumerate_vendor(name: str, args) -> list:
     return mod.enumerate_docs(**common)
 
 
+def verified(pdf: Path, doc, mod) -> tuple:
+    """Confirm the file is the document asked for -> (pdf, identity verdict) or (None, why)."""
+    verdict, found = doclib.verify_identity(pdf, doc)
+    if verdict == "mismatch":
+        # The vendor served a different document. Filing it under this identifier
+        # would be worse than missing it: it looks right forever after.
+        return None, f"served {found}, not {doc.doc_id} — not imported"
+    if verdict == "absent":
+        print(f"  note: {doc.doc_id} not found on page 1 — identity unverified",
+              file=sys.stderr)
+    # What an adapter can only learn from the file itself (Microchip prints the
+    # letter revision in the page footer) is kept as description.
+    if hasattr(mod, "describe_pdf"):
+        extra = mod.describe_pdf(pdf)
+        if extra:
+            doc.desc = f"{doc.desc}\n{extra}".strip()
+    return pdf, verdict
+
+
+def fetch(doc, mod, tmp: Path) -> tuple:
+    """Download, then verify -> (pdf, identity verdict) or (None, why)."""
+    got, why = doclib.fetch_document(doc.url, tmp / f"{doc.doc_id}.pdf", doc.doc_id)
+    if got is None and mod is vendor_nxp:
+        got, why = doclib.fetch_document(vendor_nxp.direct_url(doc),
+                                         tmp / f"{doc.doc_id}.pdf", doc.doc_id)
+    if got is None:
+        return None, why
+    return verified(got, doc, mod)
+
+
+# The shared tag vocabulary: the kinds the adapters normalize to.
+KINDS = sorted(doclib.TECHNICAL_TYPES | {"technical-note", "data-brief"})
+
+
+def library_conflict(doc, idx: dict, legacy: dict) -> str | None:
+    """Why this document must not be added to the library, or None."""
+    have = {k.lower(): v for k, v in idx.items()}.get(doc.ident.lower())
+    if have:
+        refresh = (f"`sync.py {doc.vendor}` refreshes it when the vendor publishes a newer "
+                   f"revision" if doc.vendor in VENDORS else
+                   "no adapter covers this vendor, so it has no refresh path yet "
+                   "(references/maintaining.md, 'Adding a vendor')")
+        return (f"{doc.ident} is already book #{have['id']} {have['title']!r} "
+                f"(Rev {have['rev'] or 'unknown'}); add never replaces a book — {refresh}")
+    # A second spelling of either name splits one vendor's books in two.
+    for ident, book in idx.items():
+        scheme = ident.split(":", 1)[0]
+        if scheme == doc.vendor and book["author"] != doc.author:
+            return (f"{scheme}: books are filed under author {book['author']!r} "
+                    f"(#{book['id']}), not {doc.author!r}")
+        if book["author"] == doc.author and scheme != doc.vendor:
+            return (f"author {doc.author!r} already files its books as {scheme}: "
+                    f"(#{book['id']}), not {doc.vendor}:")
+    p = doclib.plan([doc], idx, legacy)
+    if p["legacy"]:
+        _, book = p["legacy"][0]
+        return (f"probably already filed by hand as #{book['id']} {book['title']!r} — "
+                f"compare the two before adding a second copy")
+    return None
+
+
+def head(path: Path) -> bytes:
+    """The bytes classify_payload reads, without loading a whole manual."""
+    with path.open("rb") as f:
+        return f.read(2048)
+
+
+def blocked(lib, apply: bool) -> bool:
+    """Whether the library's blockers stop this run: each is BLOCKED under --apply, a note otherwise."""
+    blockers = lib.blockers()
+    for b in blockers:
+        print(f"{'BLOCKED' if apply else 'note'}: {b}", file=sys.stderr)
+    return bool(blockers) and apply
+
+
+def add_main(argv: list) -> int:
+    """Import one document under the conventions an adapter's import follows.
+
+    Dry run by default; it still downloads and checks the file, so every refusal
+    shows up before --apply. Exit 0 planned or imported, 1 refused, 2 a usage
+    error, a blocker, or a library that could not be read.
+    """
+    ap = argparse.ArgumentParser(
+        prog="sync.py add", description=add_main.__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--vendor", required=True,
+                    help="identifier scheme, lowercase: an adapter's name "
+                         f"({', '.join(sorted(VENDORS))}) or a new one (nordic)")
+    ap.add_argument("--author",
+                    help="the vendor's company name as Calibre files it (Nordic "
+                         "Semiconductor); required for a vendor without an adapter")
+    ap.add_argument("--id", required=True, dest="doc_id",
+                    help="the vendor's stable document number, without the revision")
+    ap.add_argument("--id-not-printed", action="store_true",
+                    help="the ID is a filename stem or a name you derived (part-kind), not "
+                         "printed in the document: no identity check, and the title carries "
+                         "it in parentheses, as adapters file such IDs")
+    ap.add_argument("--type", required=True, choices=KINDS)
+    ap.add_argument("--title", required=True, help="description, without the ID or revision")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--url", help="download the PDF from this URL")
+    src.add_argument("--pdf", type=Path, help="import this local PDF (a browser download)")
+    ap.add_argument("--source", help="with --pdf, required: the URL it came from")
+    ap.add_argument("--revision",
+                    help="as the document prints it; without one the book can never "
+                         "be checked for a newer revision")
+    ap.add_argument("--family", help="comma list of family tags: nRF52,...")
+    ap.add_argument("--desc", default="", help="description line for comments")
+    ap.add_argument("--apply", action="store_true", help="actually import")
+    a = ap.parse_args(argv)
+
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", a.vendor):
+        ap.error(f"--vendor {a.vendor!r}: a lowercase identifier scheme like st, nxp, nordic")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", a.doc_id):
+        ap.error(f"--id {a.doc_id!r}: letters, digits, '.', '_' and '-' only")
+    if a.pdf is not None:
+        if not a.source:
+            ap.error("--pdf needs --source: the URL the file came from")
+        if not a.pdf.is_file():
+            ap.error(f"--pdf {a.pdf}: no such file")
+    elif a.source:
+        ap.error("--source goes with --pdf; --url is already the source")
+    mod = VENDORS.get(a.vendor)
+    if mod is not None:
+        if a.author and a.author != mod.AUTHOR:
+            ap.error(f"{a.vendor}: books are filed under author {mod.AUTHOR!r}; drop --author")
+        author = mod.AUTHOR
+    elif not a.author:
+        ap.error(f"--author is required: {a.vendor!r} has no adapter to name the vendor")
+    else:
+        author = a.author
+
+    doc = doclib.Doc(vendor=a.vendor, doc_id=a.doc_id, doc_type=a.type, version=a.revision,
+                     title=a.title, url=a.url or a.source, author=author,
+                     family=a.family.split(",") if a.family else [], desc=a.desc,
+                     verify_id=not a.id_not_printed)
+
+    lib = doclib.Library()
+    if blocked(lib, a.apply):
+        return 2
+    try:
+        idx, legacy = lib.index(), lib.legacy_index(author)
+    except RuntimeError as e:
+        if a.apply:
+            print(f"BLOCKED: cannot read the library: {e}", file=sys.stderr)
+            return 2
+        idx = None
+        print(f"note: cannot read the library, duplicate checks not run: {e}", file=sys.stderr)
+    if idx is not None:
+        why = library_conflict(doc, idx, legacy)
+        if why:
+            print(f"REFUSED: {why}", file=sys.stderr)
+            return 1
+
+    tmp = Path(tempfile.mkdtemp(prefix="download-doc-"))
+    try:
+        if a.url:
+            pdf, why = fetch(doc, mod, tmp)
+        elif doclib.classify_payload(head(a.pdf)) != "pdf":
+            pdf, why = None, f"{a.pdf} is not a PDF"
+        else:
+            pdf, why = verified(a.pdf, doc, mod)
+        if pdf is None:
+            print(f"REFUSED: {why}", file=sys.stderr)
+            return 1
+        # A hand-typed ID is filed only once the document confirms it, or the caller
+        # declared there is nothing printed to confirm it against.
+        if why != ("skipped" if a.id_not_printed else "ok"):
+            unconfirmed = {"absent": f"{doc.doc_id} is not printed on pages 1-2",
+                           "inconclusive": f"pages 1-2 do not confirm {doc.doc_id} (no "
+                                           f"readable text, or no '<ID> Rev' marking)"}
+            print(f"REFUSED: {unconfirmed.get(why, f'identity check returned {why!r}')} — "
+                  f"use the number the document prints, or pass --id-not-printed",
+                  file=sys.stderr)
+            return 1
+
+        print(f"\nADD {doc.ident}\n"
+              f"  author      {doc.author}\n"
+              f"  title       {doc.calibre_title()}\n"
+              f"  tags        {', '.join(doc.tags())}\n"
+              f"  file        {pdf.stat().st_size} bytes, identity {why}\n"
+              f"  comments    " + doc.comments().strip().replace("\n", "\n              "))
+        if not a.revision:
+            print("  note: no --revision — recorded as unknown, so this book can never be "
+                  "checked for a newer revision", file=sys.stderr)
+        elif doclib.parse_rev(a.revision)[0] == "unknown":
+            print(f"  note: revision {a.revision!r} is unparseable — this book can never be "
+                  f"checked for a newer revision", file=sys.stderr)
+
+        if not a.apply:
+            if idx is None:
+                print("\ndry run — library not checked for duplicates; nothing changed",
+                      file=sys.stderr)
+                return 2
+            print("\ndry run — nothing changed. Check the identifier, author and title "
+                  "above, then re-run with --apply", file=sys.stderr)
+            return 0
+        book_id = lib.add(doc, pdf)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    if book_id is None:
+        why = ("a book with this title and author already exists"
+               if lib.last_add_status == "duplicate" else "calibredb add reported no book id")
+        print(f"REFUSED: {why}", file=sys.stderr)
+        return 1
+    print(f"\nIMPORTED #{book_id} {doc.ident}\n"
+          f"reindex so read-doc finds it: python3 ~/.claude/skills/read-doc/scripts/locate.py build --all")
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["add"]:
+        return add_main(sys.argv[2:])
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("vendor", choices=sorted(VENDORS))
@@ -94,13 +311,8 @@ def main() -> int:
         ap.error("--parts is TI only")
 
     lib = doclib.Library()
-    blockers = lib.blockers()
-    if blockers and args.apply:
-        for b in blockers:
-            print(f"BLOCKED: {b}", file=sys.stderr)
+    if blocked(lib, args.apply):
         return 2
-    for b in blockers:
-        print(f"note: {b}", file=sys.stderr)
 
     # Defaults, applied only where the user has not said otherwise. Naming --types or a
     # device scope explicitly turns the corresponding default off entirely.
@@ -250,32 +462,8 @@ def main() -> int:
     added = replaced = failed = 0
     skipped: list = []
 
-    def fetch(doc):
-        """Fetch, then confirm the file is the document we asked for."""
-        got, why = doclib.fetch_document(doc.url, tmp / f"{doc.doc_id}.pdf", doc.doc_id)
-        if got is None and args.vendor == "nxp":
-            got, why = doclib.fetch_document(vendor_nxp.direct_url(doc),
-                                             tmp / f"{doc.doc_id}.pdf", doc.doc_id)
-        if got is None:
-            return None, why
-        verdict, found = doclib.verify_identity(got, doc)
-        if verdict == "mismatch":
-            # The vendor served a different document. Filing it under this identifier
-            # would be worse than missing it: it looks right forever after.
-            return None, f"served {found}, not {doc.doc_id} — not imported"
-        if verdict == "absent":
-            print(f"  note: {doc.doc_id} not found on page 1 — importing unverified",
-                  file=sys.stderr)
-        # What an adapter can only learn from the file itself (Microchip prints the
-        # letter revision in the page footer) is kept as description.
-        if hasattr(mod, "describe_pdf"):
-            extra = mod.describe_pdf(got)
-            if extra:
-                doc.desc = f"{doc.desc}\n{extra}".strip()
-        return got, None
-
     for doc in fetchable:
-        pdf, why = fetch(doc)
+        pdf, why = fetch(doc, mod, tmp)
         if pdf is None:
             skipped.append((doc.doc_id, why))
             failed += 1
@@ -289,7 +477,7 @@ def main() -> int:
             failed += 1
 
     for doc, have in p["outdated"]:
-        pdf, why = fetch(doc)
+        pdf, why = fetch(doc, mod, tmp)
         if pdf is None:
             skipped.append((doc.doc_id, f"{why}; local copy left alone"))
             failed += 1

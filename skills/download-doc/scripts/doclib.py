@@ -535,10 +535,10 @@ class Library:
         return out
 
     def index(self) -> dict:
-        """{'st:DS12930': {'id': 42, 'title': ..., 'rev': '3.1'}} for every book that
-        carries a vendor identifier. One bulk read beats per-doc `calibredb search`."""
+        """{'st:DS12930': {'id': 42, 'title': ..., 'rev': '3.1', 'author': ...}} for every
+        book that carries a vendor identifier. One bulk read beats per-doc `calibredb search`."""
         books = json.loads(self._run("list", "--for-machine", "-f",
-                                     "id,title,identifiers,comments") or "[]")
+                                     "id,title,authors,identifiers,comments") or "[]")
         idx = {}
         for b in books:
             ids = b.get("identifiers") or {}
@@ -550,7 +550,7 @@ class Library:
                 m = re.search(r"Rev\.?\s*([0-9A-Za-z.]+)\s*$", b.get("title", ""))
                 rev = m.group(1) if m else rev_from_comments(b.get("comments"))
                 idx[f"{scheme}:{code}"] = {"id": b["id"], "title": b.get("title", ""),
-                                           "rev": rev}
+                                           "rev": rev, "author": b.get("authors", "")}
         return idx
 
     def legacy_index(self, author: str) -> dict:
