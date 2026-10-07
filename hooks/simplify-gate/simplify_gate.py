@@ -20,17 +20,25 @@ neither wrote nor commissioned. Batches stay queued until a review covers them, 
 round limit, a failed run, or a Stop while a review is still running are
 reviewed in a later turn. At Stop the queued patch goes to `codex exec`, one
 review at a time and at most two rounds per user turn; Codex never edits.
-State lives under $XDG_CACHE_HOME/agentrc/simplify-gate/<checkout+session>.
+State lives under $XDG_CACHE_HOME/agentrc/simplify-gate/<checkout+session>,
+cached blobs hard-linked to one copy in its `.blobs` store; `gate.py prune`
+expires what settled sessions no longer need.
 """
 
+import contextlib
 import difflib
 import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
+import tempfile
+import time
+from collections import Counter, defaultdict
 from pathlib import Path
 
 MODEL = 'gpt-6.1-sol'  # codex exec -m
@@ -42,6 +50,9 @@ PROMPT_LIMIT = 1048576  # characters `codex exec` accepts on stdin
 CODEX_TIMEOUT = 300  # seconds per attempt; two attempts fit in the Stop hook's 650 s
 EFFORTS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh')
 DEFAULTS = {'model': MODEL, 'effort': EFFORT}
+STORE = '.blobs'  # the shared blob store, beside session directories named by a hex digest
+TEMP = '.tmp-'  # prefix of a blob file still being written
+PRUNE_DAYS, REPORT_DAYS = 30, 90
 SCRIPT = Path(__file__).resolve()
 SCHEMA = {
     'type': 'object', 'additionalProperties': False, 'required': ['findings'],
@@ -73,7 +84,7 @@ def blob_id(tree, blobs, name, content, mode):
     filters = [] if mode == '120000' else ['--path', name]
     sha = subprocess.check_output(['git', '-C', str(tree), 'hash-object', '-w', '--stdin', *filters],
                                   input=content, stderr=subprocess.PIPE).decode().strip()
-    keep_blob(tree, blobs, [mode, sha])
+    keep_blob(tree, blobs, [mode, sha], content)
     return sha
 
 
@@ -85,12 +96,62 @@ def head(tree):
         return os.fsdecode(git(tree, 'hash-object', '-t', 'tree', '/dev/null')).strip()
 
 
-def keep_blob(root, blobs, entry):
+def keep_blob(root, blobs, entry, content=None):
     """Copy a blob out of the object store. Snapshot objects, dropped index
     entries and a baseline commit can all be unreachable, and a gc would prune
-    them before the review renders the change."""
+    them before the review renders the change. The session's copy is a hard
+    link into the user-wide store, so sessions of one checkout share it.
+    `content`, bytes the caller just hashed, spares a cat-file when no filter
+    changed them."""
     if entry and entry[0] != '160000' and not (blobs / entry[1]).exists():
-        (blobs / entry[1]).write_bytes(git(root, 'cat-file', 'blob', entry[1]))
+        target = blobs / entry[1]
+        try:
+            os.link(blobs.parent.parent / STORE / entry[1], target, follow_symlinks=False)
+        except OSError:  # not stored yet, pruned, another device or the link limit
+            pass
+        else:
+            # Checked through the link, so it is the inode now kept; a damaged
+            # store copy is left for prune to report.
+            if stat.S_ISREG(target.lstat().st_mode) and intact(target):
+                return
+            target.unlink()
+        if content is None or git_blob_id(content, len(entry[1])) != entry[1]:
+            content = git(root, 'cat-file', 'blob', entry[1])
+        publish(blobs.parent.parent / STORE / entry[1], target, content)
+
+
+def git_blob_id(content, length):
+    """The id git gives `content` as a blob, in the hash an id of `length` hex digits uses."""
+    hashed = (hashlib.sha1 if length == 40 else hashlib.sha256)(b'blob %d\0' % len(content))
+    hashed.update(content)
+    return hashed.hexdigest()
+
+
+def intact(path):
+    return git_blob_id(path.read_bytes(), len(path.name)) == path.name
+
+
+def publish(shared, target, content):
+    """Write `content`, verified against its id, to `target`, then offer the
+    same inode to the store; a store copy already there is never replaced.
+    The session's link exists before the store name does, so a concurrent
+    prune never finds the new store copy with no other link."""
+    if git_blob_id(content, len(shared.name)) != shared.name:
+        raise ValueError(f'blob {shared.name}: content does not match its id')
+    shared.parent.mkdir(mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=shared.parent, prefix=TEMP)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(content)
+        try:
+            os.link(temporary, target)
+        except OSError:  # another device, or the link limit: a private copy
+            os.replace(shutil.copyfile(temporary, target.with_name(TEMP + target.name)), target)
+            return
+        with contextlib.suppress(FileExistsError):  # a concurrent writer's copy stands
+            os.link(temporary, shared)
+    finally:
+        os.unlink(temporary)
 
 
 def worktrees(root):
@@ -496,6 +557,261 @@ def handle(root, directory, payload):
         job['lock'].close()
 
 
+# --- retention ----------------------------------------------------------------
+
+SESSION_FILES = {'state.json', 'lock', 'review.lock', 'blobs'}
+BLOB_NAME = re.compile(r'[0-9a-f]{40}|[0-9a-f]{64}')
+
+
+def cache_dir():
+    return Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'agentrc/simplify-gate'
+
+
+def referenced(state):
+    """Blob ids a later event may read from the session's store: both sides of
+    every queued batch (the review renders them) and every cursor entry (the
+    old side of the next delta)."""
+    entries = [entry for batch in state['batches'] for pair in batch.values() for entry in pair]
+    if state['cursor'] is not None:
+        entries += state['cursor']['files'].values()
+    return {entry[1] for entry in entries if entry}
+
+
+def settled(state):
+    """Nothing left for a review or for Claude: no queued batch, no standing
+    finding, no error."""
+    return not (state['batches'] or state['findings'] or state['errors'])
+
+
+def load_state(directory):
+    """The session's state, or None when it is missing, unreadable or of another shape."""
+    try:
+        state = json.loads((directory / 'state.json').read_text())
+        if isinstance(state, dict) and set(state) == set(new_state()):
+            referenced(state)
+            return state
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError):
+        pass
+    return None
+
+
+def is_link(path):
+    return stat.S_ISLNK(path.lstat().st_mode)
+
+
+def symlink_in(directory):
+    """The first symlink among a session's files and blobs, or None. Prune
+    never follows or changes anything in a session holding one."""
+    paths = list(directory.iterdir())
+    blobs = directory / 'blobs'
+    if blobs in paths and stat.S_ISDIR(blobs.lstat().st_mode):
+        paths += blobs.iterdir()
+    return next((path for path in paths if is_link(path)), None)
+
+
+@contextlib.contextmanager
+def held(path, create):
+    """`path` flocked without waiting; BlockingIOError when a hook holds it.
+    A missing lock file is created only when `create`, else it is not held."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | (os.O_CREAT if create else 0), 0o644)
+    except FileNotFoundError:
+        yield
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+class Pruner:
+    """One pass over the cache. Link counts are tracked as the plan leaves
+    them, so a dry run reports the bytes `apply` would free. Nothing is
+    followed through a symlink: one in the store or a session is reported and
+    its owner left alone."""
+
+    def __init__(self, cache, apply):
+        self.cache, self.apply = cache, apply
+        self.links, self.freed, self.files = {}, Counter(), Counter()
+        self.report = defaultdict(list)
+        self.checked = {}  # inode -> whether its content matches its blob id
+        self.store = {}  # blob id -> inode of its store copy, as the plan leaves the store
+        store = cache / STORE
+        try:
+            self.store_usable = stat.S_ISDIR(store.lstat().st_mode)
+        except FileNotFoundError:
+            self.store_usable, store = True, None
+        if not self.store_usable:
+            self.note('symlinked or not a directory (left untouched)', cache / STORE)
+        elif store:
+            for path in store.iterdir():
+                st = path.lstat()
+                if stat.S_ISLNK(st.st_mode):
+                    self.note('symlinked or not a directory (left untouched)', path)
+                elif BLOB_NAME.fullmatch(path.name) and stat.S_ISREG(st.st_mode):
+                    self.store[path.name] = self.inode(st)
+
+    def note(self, heading, item):
+        if str(item) not in self.report[heading]:
+            self.report[heading].append(str(item))
+
+    def inode(self, st):
+        key = (st.st_dev, st.st_ino)
+        self.links.setdefault(key, st.st_nlink)
+        return key
+
+    def intact(self, path, key):
+        """Whether inode `key`, read at `path`, holds the blob its name says;
+        hashed once per pass."""
+        if key not in self.checked:
+            st = path.lstat()
+            self.checked[key] = (st.st_dev, st.st_ino) == key and stat.S_ISREG(st.st_mode) and intact(path)
+        return self.checked[key]
+
+    def forget(self, st, category):
+        """Count one link of `st` gone; its bytes are freed with the last link."""
+        key = self.inode(st)
+        self.links[key] -= 1
+        self.files[category] += 1
+        if not self.links[key]:
+            self.freed[category] += st.st_size
+
+    def drop(self, path, category, st):
+        if self.apply:
+            path.unlink()
+        self.forget(st, category)
+
+    def relink(self, path, st):
+        """Make a session blob a link to the store copy once both are checked
+        against the blob id; the first good copy becomes the store's."""
+        sha, key = path.name, self.inode(st)
+        shared = self.cache / STORE / sha
+        if not self.store_usable or self.store.get(sha) == key:
+            return
+        if not self.intact(path, key):
+            self.note('corrupt blobs (left in place)', path)
+            return
+        if sha not in self.store:
+            try:
+                if self.apply:
+                    shared.parent.mkdir(mode=0o700, exist_ok=True)
+                    os.link(path, shared, follow_symlinks=False)
+                self.links[key] += 1
+                self.store[sha] = key
+                return
+            except FileExistsError:  # a hook stored it since the pass began
+                self.store[sha] = self.inode(shared.lstat())
+        store_key = self.store[sha]
+        if not self.intact(shared, store_key):
+            self.note('corrupt blobs (left in place)', shared)
+            return
+        if self.apply:
+            temporary = path.with_name(TEMP + sha)
+            temporary.unlink(missing_ok=True)
+            os.link(shared, temporary, follow_symlinks=False)
+            if self.inode(temporary.lstat()) != store_key:
+                temporary.unlink()
+                raise OSError(f'{shared} changed during the pass')
+            os.replace(temporary, path)
+        self.links[store_key] += 1
+        self.forget(st, 'relinked duplicates')
+
+    def session(self, directory, now, days, report_days):
+        # Checked before locking, so nothing is created in a session left alone.
+        if symlink_in(directory) or load_state(directory) is None:
+            self.unusable(directory)
+            return
+        try:
+            with held(directory / 'lock', self.apply), held(directory / 'review.lock', False):
+                # A Stop takes review.lock only under the state lock, so a missing one stays free.
+                state = load_state(directory)
+                if symlink_in(directory) or state is None:
+                    self.unusable(directory)
+                    return
+                self.locked_session(directory, state, now, days, report_days)
+        except BlockingIOError:
+            self.note('busy (skipped)', directory)
+        except OSError as error:
+            self.note('failed', f'{directory}: {error}')
+
+    def unusable(self, directory):
+        link = symlink_in(directory)
+        if link:
+            self.note('symlinked or not a directory (left untouched)', link)
+        else:
+            self.note('unrecognized (left untouched)', directory)
+
+    def locked_session(self, directory, state, now, days, report_days):
+        entries = [(path, path.lstat()) for path in directory.iterdir()]
+        files = [(path, st) for path, st in entries if path.name not in SESSION_FILES and stat.S_ISREG(st.st_mode)]
+        idle = now - max([directory.lstat().st_mtime] + [st.st_mtime for _, st in entries])
+        blobs = [(path, path.lstat()) for path in (directory / 'blobs').iterdir()] \
+            if any(path.name == 'blobs' and stat.S_ISDIR(st.st_mode) for path, st in entries) else []
+        if settled(state) and idle > days * 86400:
+            for path, st in files:
+                self.drop(path, 'diagnostics', st)
+            keep = referenced(state)
+            for path, st in blobs:
+                if path.name not in keep and stat.S_ISREG(st.st_mode):
+                    self.drop(path, 'unreferenced blobs', st)
+            blobs = [(p, st) for p, st in blobs if p.name in keep]
+        elif not settled(state) and idle > report_days * 86400:
+            self.report[f'unresolved, inactive over {report_days} days (kept)'].append(
+                f'{directory}: {idle / 86400:.0f} days; {len(state["batches"])} batch(es), '
+                f'{len(state["findings"])} finding(s), {len(state["errors"])} error(s)')
+        for path, st in blobs:
+            if stat.S_ISREG(st.st_mode) and BLOB_NAME.fullmatch(path.name):
+                self.relink(path, st)
+
+    def sweep(self, now):
+        """Drop store copies no session links any more, and stale partial writes."""
+        if not self.store_usable or not (self.cache / STORE).exists():
+            return
+        for path in (self.cache / STORE).iterdir():
+            st = path.lstat()
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if path.name.startswith(TEMP):
+                if now - st.st_mtime > 86400:
+                    self.drop(path, 'unused store blobs', st)
+            elif self.links.get(key := self.inode(st)) == 1 and self.checked.get(key) is not False \
+                    and (not self.apply or path.lstat().st_nlink == 1):
+                self.drop(path, 'unused store blobs', st)
+
+
+def size(count):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if count < 1024 or unit == 'GB':
+            return f'{count:.1f} {unit}' if unit != 'B' else f'{count} B'
+        count /= 1024
+
+
+def prune(cache, apply=False, days=PRUNE_DAYS, report_days=REPORT_DAYS, now=None):
+    """Free what settled sessions no longer need; report, never delete, the rest.
+    Never removes a session directory, its state, its lock files or a blob its
+    state references. Returns the report text."""
+    now = time.time() if now is None else now
+    pruner = Pruner(cache, apply)
+    sessions = sorted(p for p in cache.iterdir() if p.name != STORE) if cache.is_dir() else []
+    for directory in sessions:
+        if stat.S_ISDIR(directory.lstat().st_mode):
+            pruner.session(directory, now, days, report_days)
+        else:
+            pruner.note('symlinked or not a directory (left untouched)', directory)
+    pruner.sweep(now)
+    verb = 'freed' if apply else 'would free (dry run; --apply to act)'
+    lines = [f'simplify-gate prune: {cache}, {len(sessions)} session(s); settled sessions idle over {days} days expire',
+             f'{verb}:']
+    for category in ('diagnostics', 'unreferenced blobs', 'relinked duplicates', 'unused store blobs'):
+        lines.append(f'  {category:20} {size(pruner.freed[category]):>10}  ({pruner.files[category]} file(s))')
+    lines.append(f'  {"total":20} {size(sum(pruner.freed.values())):>10}')
+    for heading, items in pruner.report.items():
+        lines.append(f'{heading}: {len(items)}')
+        lines.extend('  ' + item for item in items)
+    return '\n'.join(lines)
+
+
 def chief_session(transcript_path):
     """True when the transcript's header records the chief agent; unreadable means no."""
     try:
@@ -528,8 +844,7 @@ def main():
             return
     except subprocess.CalledProcessError:
         return  # not a checkout of anything
-    cache = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'agentrc/simplify-gate'
-    reply = handle(root, cache / digest([str(root), payload['session_id']]), payload)
+    reply = handle(root, cache_dir() / digest([str(root), payload['session_id']]), payload)
     if reply:
         print(json.dumps(reply))
 

@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -623,6 +624,281 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.s.stop(), {})
 
 
+DAY = 86400
+
+
+class PruneTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.cache = self.base / 'cache'
+        self.store = self.cache / gate.STORE
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def blob(self, text):
+        content = text.encode()
+        return gate.git_blob_id(content, 40), content
+
+    def session(self, name, age_days=0, blobs=(), cursor=(), files=(), **state):
+        """A session as an earlier gate left it: plain blob copies, `cursor`
+        referencing the given blob ids, everything last touched `age_days` ago."""
+        directory = self.cache / name
+        (directory / 'blobs').mkdir(parents=True)
+        for sha, content in blobs:
+            (directory / 'blobs' / sha).write_bytes(content)
+        entries = {f'f{i}': ['100644', sha] for i, sha in enumerate(cursor)}
+        (directory / 'state.json').write_text(json.dumps({
+            **gate.new_state(), 'cursor': {'files': entries, 'trees': ['']}, **state}))
+        (directory / 'lock').touch()
+        for name in files:
+            (directory / name).write_text('log\n')
+        self.age(directory, age_days)
+        return directory
+
+    def age(self, directory, days):
+        when = time.time() - days * DAY
+        for path in [*directory.iterdir(), directory]:
+            os.utime(path, (when, when))
+
+    def prune(self, *args, **kw):
+        return gate.prune(self.cache, *args, **kw)
+
+    def test_new_writes_share_one_store_copy(self):
+        root = make_repo(self.base / 'repo')
+        (root / 'big.txt').write_text('untracked\n' * 1000)
+        sha = self.blob('untracked\n' * 1000)[0]
+        for name in ('s1', 's2'):
+            Session(root, self.cache / name).prompt()
+        shared = self.store / sha
+        self.assertTrue(shared.exists())
+        self.assertTrue((self.cache / 's1' / 'blobs' / sha).samefile(self.cache / 's2' / 'blobs' / sha))
+        self.assertEqual(shared.stat().st_nlink, 3)
+        self.assertEqual([p.name for p in self.store.iterdir()], [sha], 'no partial write is left behind')
+        self.assertIn(gate.STORE, os.listdir(self.cache))
+        shared.unlink()  # pruned between two events: the next session stores it again
+        Session(root, self.cache / 's3').prompt()
+        self.assertTrue((self.cache / 's3' / 'blobs' / sha).samefile(shared))
+        with self.assertRaises(ValueError):
+            gate.publish(self.store / ('0' * 40), self.base / 'target', b'not that blob')
+
+    def test_bytes_just_hashed_are_stored_without_a_cat_file_unless_a_filter_changed_them(self):
+        root = make_repo(self.base / 'repo')
+        sha, content = self.blob('stored as hashed\n')
+        blobs = self.cache / 's1' / 'blobs'
+        blobs.mkdir(parents=True)
+        with mock.patch.object(gate, 'git', wraps=gate.git) as git:
+            gate.keep_blob(root, blobs, ['100644', sha], content)
+        self.assertEqual(git.call_count, 0)
+        self.assertEqual((blobs / sha).read_bytes(), content)
+        stored = subprocess.run(['git', 'hash-object', '-w', '--stdin'], cwd=root, input=b'as git keeps it\n',
+                                check=True, capture_output=True).stdout.decode().strip()
+        other = self.cache / 's2' / 'blobs'
+        other.mkdir(parents=True)
+        with mock.patch.object(gate, 'git', wraps=gate.git) as git:
+            gate.keep_blob(root, other, ['100644', stored], b'AS THE WORKTREE HAS IT\n')
+        git.assert_called_once_with(root, 'cat-file', 'blob', stored)
+        self.assertEqual((other / stored).read_bytes(), b'as git keeps it\n')
+
+    def test_a_damaged_store_copy_is_not_handed_to_a_new_session(self):
+        root = make_repo(self.base / 'repo')
+        (root / 'big.txt').write_text('untracked\n')
+        sha = self.blob('untracked\n')[0]
+        self.store.mkdir(parents=True)
+        (self.store / sha).write_bytes(b'damaged\n')
+        s = Session(root, self.cache / 's1')
+        s.prompt()
+        self.assertEqual((s.directory / 'blobs' / sha).read_text(), 'untracked\n')
+        self.assertEqual((self.store / sha).read_bytes(), b'damaged\n', 'left for prune to report')
+
+    def test_a_concurrent_prune_cannot_take_a_store_copy_being_published(self):
+        root = make_repo(self.base / 'repo')
+        (root / 'big.txt').write_text('untracked\n')
+        sha = self.blob('untracked\n')[0]
+        real_link, pruning = os.link, []
+        def link_after_a_prune(*args, **kw):
+            # A prune pass lands before every link the hook makes, in each window publication has.
+            if not pruning:
+                pruning.append(1)
+                self.prune(apply=True)
+                pruning.clear()
+            return real_link(*args, **kw)
+        s = Session(root, self.cache / 's1')
+        with mock.patch.object(gate.os, 'link', link_after_a_prune):
+            s.prompt()
+            Session(root, self.cache / 's2').prompt()
+        for name in ('s1', 's2'):
+            self.assertEqual((self.cache / name / 'blobs' / sha).read_text(), 'untracked\n')
+        self.assertTrue((self.cache / 's2' / 'blobs' / sha).samefile(self.store / sha))
+
+    def test_a_corrupt_store_copy_is_never_linked_over_a_good_one(self):
+        sha, content = self.blob('good')
+        a = self.session('a', blobs=[(sha, content)], cursor=[sha])
+        self.store.mkdir()
+        (self.store / sha).write_bytes(b'bad')
+        report = self.prune(apply=True)
+        self.assertIn(f'corrupt blobs (left in place): 1\n  {self.store / sha}', report)
+        self.assertEqual((a / 'blobs' / sha).read_bytes(), content)
+        self.assertEqual((a / 'blobs' / sha).stat().st_nlink, 1)
+        self.assertEqual((self.store / sha).read_bytes(), b'bad')
+
+    def test_symlinks_are_reported_never_followed(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        victim = outside / ('1' * 40)
+        victim.write_text('unrelated\n')
+        (outside / 'log').write_text('unrelated log\n')
+        sha, content = self.blob('kept')
+        linked_blobs = self.session('linked-blobs', age_days=40)
+        shutil.rmtree(linked_blobs / 'blobs')
+        (linked_blobs / 'blobs').symlink_to(outside)
+        linked_log = self.session('linked-log', age_days=40, files=['codex-1-0.log'])
+        (linked_log / 'codex-2-0.log').symlink_to(outside / 'log')
+        linked_blob = self.session('linked-blob', age_days=40, blobs=[(sha, content)])
+        (linked_blob / 'blobs' / ('2' * 40)).symlink_to(victim)
+        real = self.session('real', age_days=40, files=['codex-1-0.log'])
+        (self.cache / 'linked-session').symlink_to(real)
+        for directory in (linked_blobs, linked_log, linked_blob):
+            self.age(directory, 40)
+        report = self.prune(apply=True)
+        self.assertIn('symlinked or not a directory (left untouched): 4', report)
+        self.assertEqual(victim.read_text(), 'unrelated\n')
+        self.assertEqual((outside / 'log').read_text(), 'unrelated log\n')
+        self.assertTrue((linked_log / 'codex-1-0.log').exists(), 'a session holding a symlink is left whole')
+        self.assertTrue((linked_blob / 'blobs' / sha).exists())
+        self.assertTrue((self.cache / 'linked-session').is_symlink())
+        self.assertFalse((real / 'codex-1-0.log').exists(), 'the real session is pruned once, by its own name')
+
+    def test_a_symlinked_store_is_reported_and_left_alone(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        sha, content = self.blob('shared')
+        (outside / sha).write_bytes(b'not the blob')
+        (outside / ('3' * 40)).write_text('unrelated\n')
+        self.cache.mkdir()
+        self.store.symlink_to(outside)
+        a = self.session('a', blobs=[(sha, content)], cursor=[sha])
+        report = self.prune(apply=True)
+        self.assertIn(f'symlinked or not a directory (left untouched): 1\n  {self.store}', report)
+        self.assertEqual(sorted(os.listdir(outside)), sorted([sha, '3' * 40]))
+        self.assertEqual((a / 'blobs' / sha).read_bytes(), content)
+        self.store.unlink()
+        self.store.mkdir()
+        (self.store / ('4' * 40)).symlink_to(outside / ('3' * 40))
+        report = self.prune(apply=True)
+        self.assertIn(str(self.store / ('4' * 40)), report)
+        self.assertTrue((self.store / ('4' * 40)).is_symlink())
+        self.assertTrue((outside / ('3' * 40)).exists())
+
+    def test_relinking_duplicates_frees_their_bytes_and_keeps_content(self):
+        sha, content = self.blob('x' * 5000)
+        a = self.session('a', blobs=[(sha, content)], cursor=[sha])
+        b = self.session('b', blobs=[(sha, content)], cursor=[sha], batches=[{'p': [None, ['100644', sha]]}])
+        report = self.prune()
+        self.assertIn('would free', report)
+        self.assertRegex(report, r'relinked duplicates +4\.9 KB  \(1 file')
+        self.assertFalse(self.store.exists(), 'a dry run changes nothing')
+        self.assertEqual((a / 'blobs' / sha).stat().st_nlink, 1)
+        report = self.prune(apply=True)
+        self.assertRegex(report, r'relinked duplicates +4\.9 KB')
+        for directory in (a, b):
+            self.assertTrue((directory / 'blobs' / sha).samefile(self.store / sha))
+            self.assertEqual((directory / 'blobs' / sha).read_bytes(), content)
+        self.assertEqual((self.store / sha).stat().st_nlink, 3)
+        self.assertRegex(self.prune(apply=True), r'total +0 B', 'a second pass has nothing left')
+
+    def test_a_corrupt_copy_is_reported_not_linked(self):
+        sha, _ = self.blob('real')
+        a = self.session('a', blobs=[(sha, b'tampered')], cursor=[sha])
+        report = self.prune(apply=True)
+        self.assertIn(f'corrupt blobs (left in place): 1\n  {a / "blobs" / sha}', report)
+        self.assertEqual((a / 'blobs' / sha).read_bytes(), b'tampered')
+        self.assertFalse((self.store / sha).exists())
+
+    def test_settled_idle_diagnostics_and_unreferenced_blobs_expire_only_with_apply(self):
+        kept, dropped = self.blob('kept'), self.blob('dropped')
+        logs = ('codex-1-0.log', 'result-1-0.json', 'schema.json')
+        old = self.session('old', age_days=40, blobs=[kept, dropped], cursor=[kept[0]], files=logs)
+        (old / 'review.lock').touch()
+        self.age(old, 40)
+        recent = self.session('recent', age_days=5, blobs=[self.blob('recent')], files=logs)
+        report = self.prune()
+        self.assertRegex(report, r'diagnostics +12 B  \(3 file')
+        self.assertRegex(report, r'unreferenced blobs +7 B  \(1 file')
+        self.assertTrue(all((old / name).exists() for name in logs))
+        self.prune(apply=True)
+        self.assertEqual(sorted(os.listdir(old)), ['blobs', 'lock', 'review.lock', 'state.json'])
+        self.assertEqual(os.listdir(old / 'blobs'), [kept[0]])
+        self.assertTrue((self.store / kept[0]).samefile(old / 'blobs' / kept[0]))
+        self.assertTrue(all((recent / name).exists() for name in logs), 'a recent session keeps its logs')
+        self.assertEqual(len(os.listdir(recent / 'blobs')), 1, 'and its blobs')
+
+    def test_a_busy_session_is_skipped(self):
+        sha, content = self.blob('busy')
+        for lock in ('lock', 'review.lock'):
+            directory = self.session(lock, age_days=40, blobs=[(sha, content)], files=['codex-1-0.log'])
+            with open(directory / lock, 'a') as held:
+                fcntl.flock(held, fcntl.LOCK_EX)
+                report = self.prune(apply=True)
+            self.assertIn(f'busy (skipped): 1\n  {directory}', report)
+            self.assertTrue((directory / 'codex-1-0.log').exists())
+            self.assertEqual((directory / 'blobs' / sha).stat().st_nlink, 1)
+            shutil.rmtree(directory)
+
+    def test_an_unresolved_idle_session_is_reported_and_kept(self):
+        sha, content = self.blob('queued')
+        directory = self.session('stuck', age_days=100, blobs=[(sha, content)], files=['codex-1-0.log'],
+                                 batches=[{'p': [None, ['100644', sha]]}], errors=['codex failed twice'])
+        report = self.prune(apply=True)
+        self.assertIn(f'unresolved, inactive over 90 days (kept): 1\n  {directory}: 100 days; 1 batch(es)', report)
+        self.assertTrue((directory / 'codex-1-0.log').exists())
+        self.assertTrue((directory / 'blobs' / sha).exists())
+        self.assertNotIn('unresolved', self.prune(report_days=200))
+
+    def test_unrecognized_sessions_are_left_untouched(self):
+        sha, content = self.blob('odd')
+        garbled = self.session('garbled', age_days=40, blobs=[(sha, content)], files=['codex-1-0.log'])
+        (garbled / 'state.json').write_text('not json')
+        older = self.session('older', age_days=40, blobs=[(sha, content)], files=['codex-1-0.log'])
+        (older / 'state.json').write_text(json.dumps({'pending': {}}))
+        missing = self.session('missing', age_days=40, blobs=[(sha, content)])
+        (missing / 'state.json').unlink()
+        before = {d: sorted(os.listdir(d)) for d in (garbled, older, missing)}
+        report = self.prune(apply=True)
+        self.assertIn('unrecognized (left untouched): 3', report)
+        for directory, names in before.items():
+            self.assertEqual(sorted(os.listdir(directory)), names)
+            self.assertEqual((directory / 'blobs' / sha).stat().st_nlink, 1)
+        self.assertFalse(self.store.exists())
+
+    def test_a_store_copy_goes_only_with_its_last_link(self):
+        linked, orphan = self.blob('linked'), self.blob('orphan')
+        directory = self.session('s', blobs=[linked], cursor=[linked[0]])
+        self.store.mkdir()
+        os.link(directory / 'blobs' / linked[0], self.store / linked[0])
+        (self.store / orphan[0]).write_bytes(orphan[1])
+        (self.store / (gate.TEMP + 'stale')).write_bytes(b'partial')
+        os.utime(self.store / (gate.TEMP + 'stale'), (0, 0))
+        report = self.prune()
+        self.assertRegex(report, r'unused store blobs +13 B  \(2 file')
+        self.assertTrue((self.store / orphan[0]).exists())
+        self.prune(apply=True)
+        self.assertEqual(os.listdir(self.store), [linked[0]])
+        self.assertTrue((self.store / linked[0]).samefile(directory / 'blobs' / linked[0]))
+
+    def test_a_dry_run_counts_a_store_copy_freed_by_expired_blobs(self):
+        sha, content = self.blob('only old')
+        directory = self.session('s', age_days=40, blobs=[(sha, content)])
+        self.store.mkdir()
+        os.link(directory / 'blobs' / sha, self.store / sha)
+        report = self.prune()
+        self.assertRegex(report, r'unreferenced blobs +0 B  \(1 file')
+        self.assertRegex(report, r'unused store blobs +8 B  \(1 file')
+        self.prune(apply=True)
+        self.assertEqual(os.listdir(self.store), [])
+
+
 class ActivationTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -743,6 +1019,16 @@ class SkillTest(unittest.TestCase):
         run = self.gate('status')
         self.assertNotEqual(run.returncode, 0)
         self.assertIn('effort must be one of', run.stderr)
+        self.assertNotEqual(self.gate('status', '--apply').returncode, 0)
+
+    def test_prune_runs_on_the_users_cache_outside_any_checkout(self):
+        env = {**os.environ, 'XDG_CACHE_HOME': str(self.base / 'cache')}
+        run = subprocess.run([sys.executable, str(GATE), 'prune', '--days', '7'], cwd=self.base,
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertIn(f'simplify-gate prune: {self.base / "cache" / "agentrc" / "simplify-gate"}', run.stdout)
+        self.assertIn('idle over 7 days', run.stdout)
+        self.assertIn('would free', run.stdout)
 
 
 if __name__ == '__main__':
