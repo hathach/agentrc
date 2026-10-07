@@ -25,7 +25,8 @@ _spec.loader.exec_module(pc_sample)
 
 # Answers each mem32 with "J-Link><addr> = <value>" (the real Commander echoes its
 # prompt on the same line). FAKE_PCSR: comma-separated PCSR values in order, the
-# last one repeated; FAKE_DHCSR: the two DHCSR values; FAKE_MODE=truncate stops
+# last one repeated; FAKE_DHCSR: the two DHCSR values; FAKE_DEMCR: the DEMCR
+# answer lines, comma-separated (default one, TRCENA set); FAKE_MODE=truncate stops
 # after half the reads, FAKE_MODE=hang never exits.
 FAKE_JLINK = '''#!/usr/bin/env python3
 import os, sys, time
@@ -46,6 +47,9 @@ for line in lines:
     elif line.startswith('mem32 E000EDF0'):
         v = dhcsr[min(n_dh, len(dhcsr) - 1)]; n_dh += 1
         print(f'J-Link>E000EDF0 = {v}')
+    elif line.startswith('mem32 E000EDFC'):
+        for v in os.environ.get('FAKE_DEMCR', '01000000').split(','):
+            print(f'J-Link>E000EDFC = {v}')
     elif line.startswith('Sleep'):
         print('J-Link>Sleep(' + line.split()[1] + ')')
     elif line == 'qc':
@@ -86,14 +90,14 @@ LINK = ('--interface', 'swd', '--speed', '4000')
 
 class ParseTest(unittest.TestCase):
     def test_prompt_prefixed_and_bare_lines_both_parse(self):
-        text = ('J-Link>E000EDF0 = 00010001\nE000101C = 08001234\n'
+        text = ('J-Link>E000EDFC = 01000000\nJ-Link>E000EDF0 = 00010001\nE000101C = 08001234\n'
                 'J-Link>E000101C = FFFFFFFF\nJ-Link>Sleep(5)\nJ-Link>E000EDF0 = 02030003\n')
         self.assertEqual(pc_sample.parse_reads(text),
-                         ([0x08001234, 0xFFFFFFFF], [0x00010001, 0x02030003]))
+                         ([0x08001234, 0xFFFFFFFF], [0x00010001, 0x02030003], [0x01000000]))
 
-    def test_script_reads_dhcsr_around_the_samples(self):
+    def test_script_reads_demcr_then_dhcsr_around_the_samples(self):
         s = pc_sample.jlink_script(2, 5).splitlines()
-        self.assertEqual(s, ['mem32 E000EDF0, 1', 'mem32 E000101C, 1', 'Sleep 5',
+        self.assertEqual(s, ['mem32 E000EDFC, 1', 'mem32 E000EDF0, 1', 'mem32 E000101C, 1', 'Sleep 5',
                              'mem32 E000101C, 1', 'Sleep 5', 'mem32 E000EDF0, 1', 'qc'])
         self.assertNotIn('Sleep 0', pc_sample.jlink_script(1, 0))
 
@@ -169,6 +173,30 @@ class CliTest(unittest.TestCase):
     def test_interval_emits_sleeps(self):
         r = self.run_cli('--samples', '2', '--interval-ms', '7', FAKE_SYMS='0x20000100=loop@main.c:1')
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_trace_disabled_refuses_the_histogram(self):
+        raw = self.elf.parent / 'raw.txt'
+        r = self.run_cli('--samples', '3', '--raw', str(raw), FAKE_DEMCR='000F0001', FAKE_PCSR='08001000,08002000',
+                         FAKE_SYM_MODE='fail')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x000f0001): DWT_PCSR samples are not valid '
+                      'while trace is disabled', r.stderr)
+        self.assertNotIn('addr2line', r.stderr)
+        self.assertEqual(r.stdout, '')
+        self.assertFalse(raw.exists())
+
+    def test_other_demcr_bits_do_not_matter(self):
+        r = self.run_cli('--samples', '1', FAKE_DEMCR='010F07F1', FAKE_SYMS='0x20000100=loop@main.c:1')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('1 usable of 1 samples', r.stdout)
+
+    def test_a_demcr_read_missing_twice_or_malformed_is_no_capture(self):
+        raw = self.elf.parent / 'raw.txt'
+        for demcr, n in (('', 0), ('zz', 0), ('0100000', 0), ('01000000,01000000', 2)):
+            r = self.run_cli('--samples', '2', '--raw', str(raw), FAKE_DEMCR=demcr, FAKE_SYM_MODE='fail')
+            self.assertEqual(r.returncode, 1, demcr)
+            self.assertIn(f'incomplete capture: 2/2 samples, 2/2 DHCSR reads, {n}/1 DEMCR reads', r.stderr, demcr)
+            self.assertFalse(raw.exists(), demcr)
 
     def test_incomplete_capture_is_an_explicit_failure(self):
         r = self.run_cli('--samples', '10', FAKE_MODE='truncate')

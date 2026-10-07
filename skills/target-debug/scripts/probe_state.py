@@ -47,14 +47,12 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pc_sample import (DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL, _MEM32_RE,  # noqa: E402
-                       hil_flasher, hil_jlink_device)
+from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL,  # noqa: E402
+                       _MEM32_RE, hil_flasher, hil_jlink_device)
 
 CPUID = 0xE000ED00
-DEMCR = 0xE000EDFC
 # CPUID.ARCHITECTURE [19:16]: 0xC ARMv6-M / Armv8-M Baseline, 0xF ARMv7-M / Armv8-M Mainline
 M_PROFILE_ARCH = {0xC: 'armv6-m or armv8-m baseline', 0xF: 'armv7-m or armv8-m mainline'}
-DEMCR_TRCENA = 1 << 24  # DWTENA on ARMv6-M; DWT reads are UNKNOWN while it is 0
 _JLINK_PC_RE = re.compile(r'\bPC = ([0-9A-Fa-f]{8})')
 _OCD_READ_RE = re.compile(r'^R (\w+) (0x[0-9a-fA-F]+)$', re.M)
 # Paths reach OpenOCD's Tcl and JLinkExe's comma-separated arguments unquoted

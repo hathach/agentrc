@@ -15,7 +15,13 @@ python3 <skill dir>/scripts/pc_sample.py --probe <uid> --device <JLINK_DEVICE> -
 #   or: --hil-config <file> --board <name> --interface swd --speed 4000 --elf <flashed.elf>
 #   --samples N (300), --interval-ms M, --raw FILE; DHCSR is read before and after,
 #   sentinel and no-PCSR samples are counted apart; exit 1 unless every sample came back
+#   DEMCR.TRCENA 0 is exit 1, no histogram
 ```
+
+TRCENA is 0 after a power-on reset, and an ARMv6-M core reset clears it too;
+`DWT_PCSR` is then UNKNOWN (ARMv6-M/v7-M) or 0xFFFFFFFF (Armv8-M). Set it from a
+debugger session before sampling (read DEMCR, `w4 E000EDFC` with bit 24 added);
+the script itself never writes.
 
 The histogram's top entries are the spin site; a flat histogram = core is
 servicing normally — and an idle loop has a hot spot of its own: learn it from a

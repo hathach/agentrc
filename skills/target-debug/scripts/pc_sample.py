@@ -8,10 +8,12 @@ histogram the PCs by function (the target-debug skill's PC-sampling technique).
 PC_SAMPLE_JLINK_EXE names J-Link Commander when it is not `JLinkExe` (`JLink.exe` on
 Windows) on PATH.
 
-Reads DHCSR before and after the samples so a 0xFFFFFFFF sample (core halted or
-in WFI) can be read against the core's state. A capture is complete only when
-every requested sample and both DHCSR reads came back: JLinkExe exits 0 after a
-failed command, so the output is the evidence, not the exit code.
+Reads DEMCR first and refuses the histogram while DEMCR.TRCENA (DWTENA on
+ARMv6-M) is 0 (techniques.md, PC-sampling). Reads DHCSR before and after
+the samples so a 0xFFFFFFFF sample (core halted or in WFI) can be read against
+the core's state. A capture is complete only when every requested sample, the
+DEMCR read and both DHCSR reads came back: JLinkExe exits 0 after a failed
+command, so the output is the evidence, not the exit code.
 """
 import argparse
 import collections
@@ -26,6 +28,8 @@ import sys
 
 DWT_PCSR = 0xE000101C
 DHCSR = 0xE000EDF0
+DEMCR = 0xE000EDFC
+DEMCR_TRCENA = 1 << 24  # DWTENA on ARMv6-M; DWT reads are invalid while it is 0
 SENTINEL = 0xFFFFFFFF
 # "E000101C = 20000ABC" — JLinkExe may prefix the line with its "J-Link>" prompt
 _MEM32_RE = re.compile(r'([0-9A-Fa-f]{8}) = ([0-9A-Fa-f]{8})')
@@ -36,7 +40,7 @@ class ToolError(RuntimeError):
 
 
 def jlink_script(samples, interval_ms):
-    lines = [f'mem32 {DHCSR:X}, 1']
+    lines = [f'mem32 {DEMCR:X}, 1', f'mem32 {DHCSR:X}, 1']
     for _ in range(samples):
         lines.append(f'mem32 {DWT_PCSR:X}, 1')
         if interval_ms:
@@ -46,16 +50,14 @@ def jlink_script(samples, interval_ms):
 
 
 def parse_reads(text):
-    """(pcs, dhcsr) from JLinkExe output: every DWT_PCSR value in order and every
-    DHCSR value in order."""
-    pcs, dhcsr = [], []
+    """(pcs, dhcsr, demcr) from JLinkExe output: every DWT_PCSR, DHCSR and DEMCR
+    value, each in order."""
+    reads = {DWT_PCSR: [], DHCSR: [], DEMCR: []}
     for m in _MEM32_RE.finditer(text):
-        addr, val = int(m.group(1), 16), int(m.group(2), 16)
-        if addr == DWT_PCSR:
-            pcs.append(val)
-        elif addr == DHCSR:
-            dhcsr.append(val)
-    return pcs, dhcsr
+        addr = int(m.group(1), 16)
+        if addr in reads:
+            reads[addr].append(int(m.group(2), 16))
+    return reads[DWT_PCSR], reads[DHCSR], reads[DEMCR]
 
 
 def sample(probe, device, interface, speed, samples, interval_ms, timeout):
@@ -74,11 +76,14 @@ def sample(probe, device, interface, speed, samples, interval_ms, timeout):
         # reads printed before the failure can look like a complete capture
         tail = '\n'.join((r.stdout + r.stderr).strip().splitlines()[-6:])
         raise ToolError(f'{name} exited {r.returncode}; last output:\n{tail}')
-    pcs, dhcsr = parse_reads(r.stdout)
-    if len(pcs) != samples or len(dhcsr) != 2:
+    pcs, dhcsr, demcr = parse_reads(r.stdout)
+    if len(pcs) != samples or len(dhcsr) != 2 or len(demcr) != 1:
         tail = '\n'.join((r.stdout + r.stderr).strip().splitlines()[-6:])
-        raise ToolError(f'incomplete capture: {len(pcs)}/{samples} samples, {len(dhcsr)}/2 DHCSR reads '
-                        f'(exit {r.returncode}); last output:\n{tail}')
+        raise ToolError(f'incomplete capture: {len(pcs)}/{samples} samples, {len(dhcsr)}/2 DHCSR reads, '
+                        f'{len(demcr)}/1 DEMCR reads (exit {r.returncode}); last output:\n{tail}')
+    if not demcr[0] & DEMCR_TRCENA:
+        raise ToolError(f'DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{demcr[0]:08x}): DWT_PCSR samples are '
+                        f'not valid while trace is disabled; enable trace from a debugger session first')
     return pcs, dhcsr
 
 
