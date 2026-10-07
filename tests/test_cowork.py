@@ -546,9 +546,7 @@ class CoworkTest(unittest.TestCase):
             self.assertEqual((code, err), (0, receipt(request, used=self.turn_usage(n))))
 
     def detached_and_settled(self, *argv, **env):
-        with mock.patch.dict('os.environ', env):
-            code, out, _ = self.run_cli('send', '--detach', *argv)
-        request = out.strip()
+        request = self.send('--detach', *argv, **env)[1]
         until(lambda: not cowork.held(self.box() / f'{request}.lock'))
         return request
 
@@ -657,26 +655,12 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('without a usable result', reply)
 
-    def test_a_reply_without_the_files_line_is_flagged(self):
-        code, _, reply, err = self.send('--task', 'x', FAKE_REPLY='did it\n')
-        self.assertEqual(code, cowork.MALFORMED)
-        self.assertEqual(reply, 'did it\n', 'the reply is still shown')
-        self.assertIn('no "Files touched" line', err)
-
-    def test_every_delivery_ends_with_one_receipt_after_its_diagnostics(self):
-        for argv, env, outcome, code, diagnostic in (
-                ((), {}, 'replied', 0, None),
-                ((), {'FAKE_REPLY': 'did it\n'}, 'no-footer', cowork.MALFORMED, 'no "Files touched" line'),
-                (('--no-edit',), {'FAKE_REPLY': 'x\nFiles touched: none\n'}, 'replied', 0, None),
-                ((), {'FAKE_EXIT': '2'}, 'failed', cowork.FAILED, None)):
-            with self.subTest(outcome=outcome, env=env):
-                code_, request, _, err = self.send(*argv, '--task', 'x', **env)
-                self.assertEqual(code_, code)
-                lines = err.splitlines(keepends=True)
-                self.assertEqual(lines[-1], receipt(request, outcome, code))
-                if diagnostic:
-                    self.assertIn(diagnostic, ''.join(lines[:-1]), 'the diagnostic stays its own line')
-                self.assertEqual(self.leftovers(request), [])
+    def test_a_reply_without_the_files_line_is_flagged_before_its_receipt(self):
+        code, request, reply, err = self.send('--task', 'x', FAKE_REPLY='did it\n')
+        self.assertEqual((code, reply), (cowork.MALFORMED, 'did it\n'), 'the reply is still shown')
+        diagnostic, last = err.splitlines(keepends=True)
+        self.assertIn('no "Files touched" line', diagnostic)
+        self.assertEqual(last, receipt(request, 'no-footer', cowork.MALFORMED))
 
     def test_the_receipt_names_a_changed_or_unverified_tree(self):
         self.codex_does("open('new.c', 'w').write('x')")
@@ -689,12 +673,6 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.MALFORMED)
         self.assertTrue(err.endswith(receipt(request, 'unverified', cowork.MALFORMED)), err)
         self.assertIn('could not verify the tree', err, "git's diagnostic is kept apart from the receipt")
-
-    def test_a_dead_runner_gets_a_died_receipt(self):
-        self.box().mkdir(parents=True)
-        (self.box() / 'codex-x.lock').touch()
-        code, _, err = self.run_cli('read', 'codex-x')
-        self.assertEqual((code, err), (cowork.FAILED, receipt('codex-x', 'died', cowork.FAILED)))
 
     def test_the_receipt_comes_after_the_reply_on_a_merged_stream(self):
         request = self.reaped('--task', 'x')
@@ -718,53 +696,45 @@ class CoworkTest(unittest.TestCase):
                 self.assertEqual((code, out, err), (0, 'codex reply\nFiles touched: none\n', receipt(request)))
                 self.gate.unlink()
 
-    def test_refusals_print_no_receipt(self):
-        code, _, err = self.run_cli('read', 'codex-nope')
-        self.assertEqual(code, cowork.BUSY)
-        self.assertNotIn('cowork result', err)
-
-    def test_the_trailer_follows_the_requests_effective_scope(self):
+    def test_the_scope_sets_the_trailer_and_the_footer_rule(self):
         self.commit('a.txt', 'a')
-        for argv in (('--no-edit',), ('--lane', 'plan'), ('--lane', 'impl', '--worktree'), ()):
-            with self.subTest(argv):
-                self.send(*argv, '--task', 'x')
-                read_only = argv in (('--no-edit',), ('--lane', 'plan'))
-                self.assertEqual('If you changed any file' in self.calls()[-1]['stdin'], read_only)
-
-    def test_a_read_only_reply_needs_no_footer_but_reported_paths_reach_the_receipt(self):
-        for argv, reply, used in ((('--no-edit',), 'looks fine\n', 'usage unavailable'),
-                                  (('--lane', 'plan'), 'looks fine\n', 'usage unavailable'),
-                                  (('--no-edit',), 'x\nFiles touched: none\n', 'usage unavailable'),
-                                  (('--no-edit',), 'notes\nFiles touched: /tmp/notes.md\n',
-                                   'paths reported: /tmp/notes.md; usage unavailable')):
-            with self.subTest(argv=argv, reply=reply):
-                code, request, out, err = self.send(*argv, '--task', 'x', FAKE_REPLY=reply)
-                lane = 'codex/' + (argv[1] if argv[0] == '--lane' else 'main')
-                self.assertEqual((code, out, err), (0, reply, receipt(request, used=used, lane=lane)))
+        bare = {**CODEX, 'FAKE_RESULT': json.dumps({'type': 'result', 'result': 'done'})}
+        for argv, env, outcome, advisory in (
+                (('--no-edit',), {'FAKE_REPLY': 'looks fine\n'}, 'replied', ''),
+                (('--lane', 'plan'), {'FAKE_REPLY': 'looks fine\n'}, 'replied', ''),
+                (('--lane', 'impl', '--worktree', '--no-edit'), {'FAKE_REPLY': 'done\n'}, 'replied', ''),
+                (('--lane', 'impl'), {'FAKE_REPLY': 'done\n'}, 'no-footer', ''),
+                (('--no-edit',), {'FAKE_REPLY': 'x\nFiles touched: none\n'}, 'replied', ''),
+                (('--no-edit',), {'FAKE_REPLY': 'x\nFiles touched: /tmp/notes.md\n'}, 'replied', 'paths reported: /tmp/notes.md; '),
+                ((), {'FAKE_REPLY': 'x\nFiles touched: a.c\n'}, 'replied', 'paths reported: a.c; '),
+                (('--to', 'claude', '--no-edit'), bare, 'replied', ''),
+                (('--to', 'claude'), bare, 'no-footer', ''),
+                (('--no-edit',), {'FAKE_REPLY': '\n'}, 'empty-reply', ''),
+                ((), {'FAKE_REPLY': '\n'}, 'empty-reply', '')):
+            with self.subTest(argv=argv, env=env):
+                code, request, _, err = self.send(*argv, '--task', 'x', **env)
+                where = ('claude' if 'claude' in argv else 'codex') + '/' + (argv[1] if argv[:1] == ('--lane',) else 'main')
+                self.assertEqual(code, cowork.OUTCOMES[outcome])
+                self.assertTrue(err.endswith(receipt(request, outcome, code, advisory + 'usage unavailable', where)), err)
+                read_only = '--no-edit' in argv or 'plan' in argv
+                self.assertEqual(self.calls()[-1]['stdin'].endswith(cowork.TRAILER[True]), read_only)
                 self.assertEqual(self.leftovers(request), [])
 
-    def test_the_footer_rule_follows_scope_on_every_side_and_kind(self):
-        self.commit('a.txt', 'a')
-        bare = json.dumps({'type': 'result', 'result': 'done'})
-        for argv, env, code in ((('--to', 'claude', '--no-edit'), {**CODEX, 'FAKE_RESULT': bare}, 0),
-                                (('--to', 'claude'), {**CODEX, 'FAKE_RESULT': bare}, cowork.MALFORMED),
-                                (('--lane', 'impl', '--worktree', '--no-edit'), {'FAKE_REPLY': 'done\n'}, 0)):
-            with self.subTest(argv):
-                self.assertEqual(self.send(*argv, '--task', 'x', **env)[0], code)
-        box = self.box()  # a request from before the marker existed is a writer's
-        box.mkdir(parents=True, exist_ok=True)
-        (box / 'codex-x.exit').write_text('0\n')
-        (box / 'codex-x.reply').write_text('done\n')
-        (box / 'codex-x.lock').touch()
-        code, _, err = self.run_cli('read', 'codex-x')
-        self.assertEqual((code, err.splitlines()[-1] + '\n'), (cowork.MALFORMED, receipt('codex-x', 'no-footer', cowork.MALFORMED)))
-
-    def test_an_empty_reply_is_flagged_whatever_the_scope(self):
-        for argv in (('--no-edit',), ()):
-            with self.subTest(argv):
-                code, request, out, err = self.send(*argv, '--task', 'x', FAKE_REPLY='\n')
-                self.assertEqual(code, cowork.MALFORMED)
-                self.assertTrue(err.endswith(receipt(request, 'empty-reply', cowork.MALFORMED)), err)
+    def test_an_outcome_from_a_runner_on_older_code_keeps_its_writer_rule(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        for status, reply, outcome in (('0', 'done\nFiles touched: none\n', 'replied'), ('0', 'done\n', 'no-footer'),
+                                       ('0', '', 'empty-reply'), ('edited', 'x\n', 'tree-changed'),
+                                       ('error', None, 'failed'), ('2', None, 'failed')):
+            with self.subTest(status=status, reply=reply):
+                (box / 'codex-x.exit').write_text(status + '\n')
+                if reply is not None:
+                    (box / 'codex-x.reply').write_text(reply)
+                (box / 'codex-x.lock').touch()
+                code, out, err = self.run_cli('read', 'codex-x')
+                self.assertTrue(err.endswith(receipt('codex-x', outcome, cowork.OUTCOMES[outcome])), err)
+                if status == '2':
+                    self.assertIn('codex-x exited 2', out)
 
     def test_a_missing_cli_is_reported_not_raised(self):
         (self.bin / 'codex').unlink()
@@ -923,7 +893,7 @@ class CoworkTest(unittest.TestCase):
         (self.box() / f'{request}.lock').write_text(f'{os.getpid()}\n')  # a reused pid: ours
         with mock.patch.object(cowork, 'kill_tree') as kill:
             code, out, _ = self.run_cli('kill', request)
-        self.assertEqual(out.strip(), f'{request}: 0')
+        self.assertEqual(out.strip(), f'{request}: replied')
         kill.assert_not_called()
 
     def test_a_kill_that_wins_during_conclude_is_the_verdict(self):
@@ -979,11 +949,11 @@ class CoworkTest(unittest.TestCase):
         proc.kill()
         proc.wait()
         self.settled(request)
-        self.assertEqual((self.box() / f'{request}.exit').read_text(), '0\n')
+        self.assertEqual((self.box() / f'{request}.exit').read_text(), 'replied\n')
         self.assertEqual((self.box() / f'{request}.reply').read_text(), 'codex reply\nFiles touched: none\n')
         self.assertEqual(cowork.session_of(self.box()), 'thread-42', 'the thread was still bound')
         _, out, _ = self.run_cli('status')
-        self.assertIn(f'{request}  0', out, 'undelivered, so still listed')
+        self.assertIn(f'{request}  replied', out, 'undelivered, so still listed')
         code, out, _ = self.run_cli('read', request)
         self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'))
         self.assertEqual(self.leftovers(request), [])
@@ -1052,8 +1022,8 @@ class CoworkTest(unittest.TestCase):
         self.box().mkdir(parents=True)
         (self.box() / 'codex-x.task').write_text('p')
         (self.box() / 'codex-x.lock').touch()  # the runner never wrote a verdict; nobody holds the lock
-        code, out, _ = self.run_cli('read', 'codex-x')
-        self.assertEqual(code, cowork.FAILED)
+        code, out, err = self.run_cli('read', 'codex-x')
+        self.assertEqual((code, err), (cowork.FAILED, receipt('codex-x', 'died', cowork.FAILED)))
         self.assertIn('codex-x died without recording a verdict', out)
         self.assertEqual(self.leftovers('codex-x'), [])
 
@@ -1405,6 +1375,9 @@ class CoworkTest(unittest.TestCase):
     def test_unknown_request(self):
         code, _, _ = self.run_cli('kill', 'codex-nope')
         self.assertEqual(code, cowork.BUSY)
+        code, _, err = self.run_cli('read', 'codex-nope')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertNotIn('cowork result', err, 'a refusal is no delivery')
 
 
 class Frontmatter(unittest.TestCase):

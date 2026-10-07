@@ -28,9 +28,9 @@ python3 $S default [astra|sol]   # the Codex default tier's preset on this host
 In Claude Code, run `send --detach` in the foreground and arm Monitor, at
 its maximum `timeout_ms`, on `python3 $S read --wait <id> 2>&1` as the
 request's only reader: Monitor survives the memory pressure that may reap a
-background shell. A delivery ends with one receipt line, `cowork result <id>
-<side>/<lane>: <outcome>, exit <N>; <usage>`: the reader is done when it
-names your id, so no exit-status wrapper is needed. Re-arm it, from the same checkout, when it expires or its
+background shell. A delivery ends with a `cowork result <id>` receipt on
+stderr, giving the outcome, exit code and usage (`REFERENCE.md`): the reader
+is done when it names your id, so no exit-status wrapper is needed. Re-arm it, from the same checkout, when it expires or its
 reader dies, and report what it returns; an exit 3 "no request" means the
 request is absent here, so look in earlier Monitor events, else report its
 delivery as unknown. Fan out with one send
@@ -83,10 +83,8 @@ to `--tier review`, keeping its history.
   read-only reply owes that line only when it changed something, and the
   receipt repeats the paths it names: the tree check cannot see outside the
   checkout.
-- **When to reset.** When the lane's context is spent: the receipt's usage
-  gives the request's tokens and, where the CLI recorded it, its last call's
-  input context; for a Codex turn not found in its rollout, the session
-  totals (`session input`, no context); else `usage unavailable`.
+- **When to reset.** When the lane's context is spent: the receipt shows
+  its last call's input context wherever the CLI recorded one.
 
 ## Report
 

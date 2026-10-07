@@ -22,8 +22,8 @@ A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
 teardown, so liveness does not depend on pid reuse; the CLI pid is written
-inside), .no-edit for a read-only request, .jsonl (CLI stdout), .err
-(stderr), and at settle .reply and .exit (the verdict, first writer wins).
+inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
+(the outcome, first writer wins).
 One request per lane is in flight: a send while one is refused.
 
 send waits for the reply, prints it, then on stderr any diagnostic and a
@@ -57,6 +57,8 @@ from pathlib import Path
 
 SIDES = ('codex', 'claude')
 FAILED, BUSY, MALFORMED = 1, 3, 4
+OUTCOMES = {'replied': 0, 'no-footer': MALFORMED, 'empty-reply': MALFORMED, 'tree-changed': MALFORMED,
+            'unverified': MALFORMED, 'failed': FAILED, 'killed': FAILED, 'died': FAILED}  # a request's exit code
 FOOTER = re.compile(r'^Files touched: (\S.*)$', re.M)
 LANE = re.compile(r'^(?!all$)[a-z0-9-]{1,40}$')
 BOOTSTRAP = (  # the receiver's whole contract, so it need not read the driver's skill
@@ -411,7 +413,7 @@ def run(side, box, host, request, no_edit, lock_fd):
     """One coworker turn, in the detached runner, whose stderr is <id>.err.
     Publishes the verdict unless `kill` got there first, then lets go."""
     exit_file, reply, stream = (box / f'{request}.{ext}' for ext in ('exit', 'reply', 'jsonl'))
-    status, child, before = 'error', None, None
+    status, child, before = 'failed', None, None
     root = tree_of(box, host)
     try:
         if exit_file.exists():  # killed before it started
@@ -453,8 +455,10 @@ def run(side, box, host, request, no_edit, lock_fd):
 
 
 def conclude(side, box, status, reply, stream, new_session, before, root):
-    """What the finished CLI left behind: bind a new session, validate the
-    reply, check a --no-edit tree, surface Codex's in-stream error."""
+    """The outcome (OUTCOMES) of what the finished CLI left behind: bind a new
+    session, validate the reply, check a --no-edit tree (`before`, the
+    snapshot taken when the request is --no-edit), surface Codex's in-stream
+    error."""
     if side == 'codex':
         if not session_of(box):
             thread = next((e['thread_id'] for e in events(stream) if 'thread_id' in e), None)
@@ -462,12 +466,12 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
                 update_side(box, session=thread)  # a thread that exists resumes, even after a failed turn
         if status == '0' and not reply.exists():
             print('codex exited 0 without writing its last message', file=sys.stderr)
-            status = 'error'
+            status = 'failed'
     elif status == '0':
         result = next((e for e in events(stream) if e.get('type') == 'result'), None)
         if result is None or result.get('is_error'):
             print(f'claude ended without a usable result: {result}', file=sys.stderr)
-            status = 'error'
+            status = 'failed'
         else:
             reply.write_text(result.get('result') or '', encoding='utf-8')
             if new_session:
@@ -476,11 +480,16 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
         try:
             if tree_state(root) != before:
                 print('the tree changed during a --no-edit turn; check git status', file=sys.stderr)
-                status = 'edited'
+                status = 'tree-changed'
         except SnapshotError as failure:
             print(failure, file=sys.stderr)
             status = 'unverified'
-    if side == 'codex' and status not in ('0', 'edited', 'killed'):  # a turn that produced a reply, or was cut
+    if status == '0':
+        return classify(text_of(reply), before is not None)
+    if status not in OUTCOMES:
+        print(f'{side} exited {status}', file=sys.stderr)
+        status = 'failed'
+    if side == 'codex' and status == 'failed':
         # Codex reports an in-turn failure only as a JSONL event, with nothing on stderr
         for event in events(stream):
             if event.get('type') in ('error', 'turn.failed'):
@@ -490,15 +499,17 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
     return status
 
 
+def classify(reply, no_edit):
+    """A finished turn's outcome from its reply: a writer owes its "Files
+    touched" line; a read-only turn, checked by its tree, only when it changed
+    something."""
+    if not reply.strip():
+        return 'empty-reply'
+    return 'replied' if no_edit or FOOTER.search(reply) else 'no-footer'
+
+
 class SnapshotError(Exception):
     """tree_state could not read the tree: a --no-edit turn stays unverified, never passes."""
-
-
-def num(u, key, default=None):
-    value = u.get(key, default)
-    if type(value) is not int or value < 0:  # a bool is an int to isinstance
-        raise ValueError(f'{key}: {value!r}')
-    return value
 
 
 def rollout_turn(thread, request):
@@ -538,25 +549,29 @@ def rollout_turn(thread, request):
     return record
 
 
-def usage(side, stream, request):
+def usage(box, request):
     """The turn's token usage as one line; raises unless every counter is a
     count. Codex: the turn's own figures from its rollout, else the running
     totals for the session its stream reports. Claude: the request and, per
     call, the context it sent."""
-    found = [e for e in events(stream) if e.get('type') in ('thread.started', 'turn.completed', 'result', 'assistant')]
-    if side == 'codex':
-        thread = next((e.get('thread_id') for e in found if e['type'] == 'thread.started'), None)
+    def num(u, key, default=None):
+        value = u.get(key, default)
+        if type(value) is not int or value < 0:  # a bool is an int to isinstance
+            raise ValueError(f'{key}: {value!r}')
+        return value
+    def spent(prefix, u, cached='cached_input_tokens'):
+        return f'{prefix}{num(u, "input_tokens"):,} (cached {num(u, cached):,}), output {num(u, "output_tokens"):,}'
+    found = [e for e in events(box / f'{request}.jsonl') if e.get('type') in ('turn.completed', 'result', 'assistant')]
+    if box.parent.name == 'codex':
+        thread = session_of(box)  # bound by the runner; reset would have removed the request with it
         try:
-            record = rollout_turn(thread, request) if thread else None
+            record = thread and rollout_turn(thread, request)
             if record:
-                turn, last = record['turn_token_usage'], record['usage']
-                return (f'input {num(turn, "input_tokens"):,} (cached {num(turn, "cached_input_tokens"):,}), '
-                        f'output {num(turn, "output_tokens"):,}; input context {num(last, "input_tokens"):,} (last call)')
+                return (spent('input ', record['turn_token_usage'])
+                        + f'; input context {num(record["usage"], "input_tokens"):,} (last call)')
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             pass  # a rollout written by another Codex version, or cut short: the stream's totals still hold
-        total = next(e for e in found if e['type'] == 'turn.completed')['usage']
-        return (f'session input {num(total, "input_tokens"):,} (cached {num(total, "cached_input_tokens"):,}), '
-                f'output {num(total, "output_tokens"):,}')
+        return spent('session input ', next(e for e in found if e['type'] == 'turn.completed')['usage'])
     def sent(u):
         return num(u, 'input_tokens') + num(u, 'cache_read_input_tokens', 0) + num(u, 'cache_creation_input_tokens', 0)
     used = next(e for e in found if e['type'] == 'result')['usage']
@@ -604,30 +619,29 @@ def events(stream):
 
 
 def verdict(box, request):
-    """(outcome, what to say about it, exit code) of a request whose runner
-    has let go; for a reply, what to say is an advisory for the receipt. A runner killed outright left no verdict: record one, so the
-    request is delivered like any other."""
-    exit_file = box / f'{request}.exit'
+    """(outcome, what to say about it) of a request whose runner has let go:
+    a diagnostic, or for a reply the paths its footer reports. A runner killed
+    outright left no verdict: record one, so the request is delivered like
+    any other."""
+    exit_file, reply = box / f'{request}.exit', box / f'{request}.reply'
     publish(exit_file, 'died\n')
-    status = exit_file.read_text().strip()
-    if status == 'edited':
-        return 'tree-changed', 'the tree changed during a --no-edit turn; check git status', MALFORMED
-    if status == 'unverified':
-        return 'unverified', err_tail(box, request).strip() or 'could not verify the tree', MALFORMED
-    if status == '0':
-        reply = text_of(box / f'{request}.reply')
-        footers = FOOTER.findall(reply)
-        if not reply.strip():
-            return 'empty-reply', 'the reply is empty', MALFORMED
-        if (box / f'{request}.no-edit').exists():  # checked by its tree; reported paths may lie outside it
-            paths = footers[-1].strip() if footers else 'none'
-            return 'replied', '' if paths == 'none' else f'paths reported: {paths}', 0
-        if footers:
-            return 'replied', '', 0
-        return 'no-footer', 'the reply has no "Files touched" line; re-read the tree yourself', MALFORMED
-    if status in ('killed', 'died'):
-        return status, {'killed': 'was killed', 'died': 'died without recording a verdict'}[status], FAILED
-    return 'failed', 'failed' if status == 'error' else f'exited {status}', FAILED
+    outcome = exit_file.read_text().strip()
+    text = text_of(reply) if reply.exists() else ''  # absent when the turn failed, or never ran
+    if outcome not in OUTCOMES:  # a runner on older code: its writer rule, which owed every reply a footer
+        legacy = {'0': classify(text, False), 'edited': 'tree-changed', 'error': 'failed'}.get(outcome)
+        if legacy is None:
+            return 'failed', f'exited {outcome}'
+        outcome = legacy
+    if outcome == 'replied':
+        footers = FOOTER.findall(text)
+        paths = footers[-1].strip() if footers else ''
+        return outcome, '' if paths in ('', 'none') else f'paths reported: {paths}'
+    if outcome == 'unverified':
+        return outcome, err_tail(box, request).strip() or 'could not verify the tree'
+    return outcome, {'no-footer': 'the reply has no "Files touched" line; re-read the tree yourself',
+                     'empty-reply': 'the reply is empty',
+                     'tree-changed': 'the tree changed during a --no-edit turn; check git status',
+                     'killed': 'was killed', 'died': 'died without recording a verdict'}.get(outcome, 'failed')
 
 
 def err_tail(box, request):
@@ -647,11 +661,8 @@ def deliver(box, request):
             die(f'no request {request} in this worktree: delivered already, or never sent', BUSY)
         if held(lock):
             die(f'{request} is {state(box, request)}; read it once it settles', BUSY)
-        outcome, what, code = verdict(box, request)
-        try:
-            used = usage(box.parent.name, box / f'{request}.jsonl', request)
-        except Exception:  # a report, never a reason to lose the reply
-            used = 'usage unavailable'
+        outcome, what = verdict(box, request)
+        code = OUTCOMES[outcome]
         if code == FAILED:
             text = f'cowork request {request} {what}\n{err_tail(box, request)}'
         else:
@@ -660,7 +671,11 @@ def deliver(box, request):
         if text:
             print(text, end='' if text.endswith('\n') else '\n', flush=True)
         if code == MALFORMED:
-            print(f'cowork request {request}: {what}', file=sys.stderr)
+            print(f'cowork request {request}: {what}', file=sys.stderr, flush=True)
+        try:  # after the reply, so a slow rollout never holds it back
+            used = usage(box, request)
+        except Exception:  # a report, never a reason to lose the reply
+            used = 'usage unavailable'
         advisory = f'; {what}' if code == 0 and what else ''
         print(f'cowork result {request} {box.parent.name}/{box.name}: {outcome}, exit {code}{advisory}; {used}',
               file=sys.stderr, flush=True)
@@ -705,8 +720,6 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
         settle_pair(box, side, model, effort, tier)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task)
-        if no_edit:
-            (box / f'{request}.no-edit').touch()  # for verdict(), which owes a read-only reply no footer
         (box / f'{request}.jsonl').touch()
         with (box / f'{request}.lock').open('w') as lock, (box / f'{request}.err').open('ab') as err:
             fcntl.flock(lock, fcntl.LOCK_EX)

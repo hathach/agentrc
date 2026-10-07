@@ -38,10 +38,10 @@ kind than the flags assert, a pinned or kindless lane, a dirty worktree
 lane, or reset refused; 4 an empty reply, a writer's reply without its
 "Files touched" line, or under `--no-edit` the tree changed or could not be
 checked after the turn, with git's diagnostic. A `--no-edit` request, or
-one to a read-only lane, owes the line only when it changed a file; the
-paths it names reach the receipt as an advisory and leave the verdict alone.
-A request left from before that rule has no scope marker and still owes
-it.
+one to a read-only lane, owes the line only when it changed a file. Paths
+a successful reply's line names, other than none, reach the receipt as `paths
+reported:`, what the coworker says it touched; they leave the verdict
+alone.
 
 ## `--no-edit`
 
