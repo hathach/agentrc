@@ -30,9 +30,10 @@ its maximum `timeout_ms`, on `python3 $S read --wait --out <scratch file> <id> 2
 as the request's only reader: Monitor survives the memory pressure that may
 reap a background shell but truncates long events, so the reply and full
 receipt go to the file and the event is one `cowork result <id>` line with
-the outcome, exit code and file (`REFERENCE.md`); if the file cannot be
-written, the event says why and carries the reply. The reader is done when
-that line names your id: read the file once, then delete it. Re-arm it, from
+the outcome, exit code and file (`REFERENCE.md`); a file that cannot be
+written is refused with exit 3, the request kept: re-arm with a writable
+one. The reader is done when that line names your id and the file: read the
+file once, then delete it. Re-arm it, from
 the same checkout, when it expires or its reader dies, and report what it
 returns; an exit 3 "no request" means the request is absent here, so look in
 the file and earlier Monitor events, else report its delivery as unknown. Fan out with one send

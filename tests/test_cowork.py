@@ -1111,16 +1111,19 @@ class CoworkTest(unittest.TestCase):
                 self.assertTrue(written.endswith(receipt(request, outcome, code)), written)
                 self.gate.unlink()
 
-    def test_read_out_that_cannot_be_written_prints_the_reply_and_says_why(self):
+    def test_read_out_that_cannot_be_written_is_refused_and_keeps_the_request(self):
         request = self.reaped('--task', 'x')
         self.settled(request)
         missing = Path(self.tmp.name) / 'no-such-dir' / 'reply.txt'
         code, out, err = self.run_cli('read', '--out', str(missing), request)
-        self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'), 'the reply is not lost')
-        note, last = err.splitlines(keepends=True)
-        self.assertIn(f'could not write {missing}', note)
-        self.assertEqual(last, receipt(request))
+        self.assertEqual((code, out), (cowork.BUSY, ''))
+        self.assertIn(f'could not write {missing}', err)
+        self.assertNotIn('cowork result', err)
         self.assertFalse(missing.parent.exists())
+        out_file = Path(self.tmp.name) / 'reply.txt'
+        code, out, err = self.run_cli('read', '--out', str(out_file), request)
+        self.assertEqual((code, out, err), (0, '', f'cowork result {request} codex/main: replied, exit 0; written to {out_file}\n'))
+        self.assertEqual(out_file.read_text(), 'codex reply\nFiles touched: none\n' + receipt(request))
         self.assertEqual(self.leftovers(request), [])
 
     def test_read_out_of_an_unknown_request_is_refused_and_writes_nothing(self):

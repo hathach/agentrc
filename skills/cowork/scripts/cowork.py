@@ -662,7 +662,8 @@ def deliver(box, request, out=None):
     diagnostics and one receipt line on stderr, then remove its files: the
     coworker's session store keeps the turn. With `out`, write all of that to
     the file instead and print only a short receipt naming it; a file that
-    cannot be written falls back to printing. Under admission, so two readers
+    cannot be written is refused and keeps the request for a reader with a
+    writable one, since a long reply printed instead may be cut. Under admission, so two readers
     cannot both claim it, and only once both streams have taken the text."""
     with admission(box):
         lock = box / f'{request}.lock'
@@ -694,8 +695,8 @@ def deliver(box, request, out=None):
                 replace_text(out, text + notes + receipt)
                 notes, receipt = '', f'{result}; written to {out}\n'
             except (OSError, ValueError) as failure:
-                print(text, end='', flush=True)
-                notes += f'cowork request {request}: could not write {out} ({failure}); the reply is on stdout\n'
+                die(f'cowork request {request}: could not write {out} ({failure}); the request is kept: '
+                    f'read it again with a writable --out', BUSY)
         print(notes + receipt, end='', file=sys.stderr, flush=True)
         remove(box, request)
     return code

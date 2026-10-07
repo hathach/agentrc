@@ -29,9 +29,9 @@ labelled `session input`; `usage unavailable` when neither reads. Plain `read <i
 and receipt, to FILE in one step (a temp file beside it, renamed over it;
 the caller removes it), then prints on stderr only `cowork result <id>
 <side>/<lane>: <outcome>, exit <N>; written to <FILE>`, with FILE made
-absolute, and exits as without it. A FILE that cannot be written gets the
-plain delivery, a `could not write` line before its receipt. A refusal
-writes nothing. Exit
+absolute, and exits as without it. A FILE that cannot be written is a
+refusal: a `could not write` line, exit 3, and the request kept for a read
+with a writable FILE. A refusal writes nothing. Exit
 3 with "no request" means the request is absent here: delivered already,
 never sent, or removed by `reset`, which also drops undelivered requests
 with the lane's session. The coworker's own store keeps the whole session,
@@ -44,7 +44,8 @@ its requests and their state, then one line counting the idle lanes;
 ## Exit codes
 
 1 the turn failed, or never ran because the tree could not be checked
-before it; 3 unknown or delivered request, the lane busy, a lane of another
+before it; 3 unknown or delivered request, a `--out` FILE that cannot be
+written, the lane busy, a lane of another
 kind than the flags assert, a pinned or kindless lane, a dirty worktree
 lane, or reset refused; 4 an empty reply, a writer's reply without its
 "Files touched" line, or under `--no-edit` the tree changed or could not be
