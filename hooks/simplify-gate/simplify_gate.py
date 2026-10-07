@@ -298,7 +298,10 @@ def review(root, directory, job):
                 run = subprocess.run(
                     ['codex', 'exec', '-C', str(root), '--sandbox', 'read-only',
                      '-c', 'approval_policy="never"', '-c', f'model_reasoning_effort="{options["effort"]}"',
-                     '-m', options['model'], '--output-schema', str(directory / 'schema.json'),
+                     '-m', options['model'],
+                     # Memories, plugins and the skills index are ~8k tokens a challenger never uses; AGENTS.md stays.
+                     '--disable', 'memories', '--disable', 'plugins', '-c', 'skills.include_instructions=false',
+                     '--output-schema', str(directory / 'schema.json'),
                      '-o', str(output), '--json', '-'],
                     input=prompt, text=True, stdout=log, stderr=subprocess.STDOUT, timeout=CODEX_TIMEOUT)
             if run.returncode:

@@ -576,6 +576,9 @@ class GateTest(unittest.TestCase):
         cmd = self.s.calls[0]
         self.assertEqual(cmd[cmd.index('-m') + 1], gate.MODEL)
         self.assertIn(f'model_reasoning_effort="{gate.EFFORT}"', cmd)
+        # The challenger runs without memories, plugins or the skills index; AGENTS.md is not switched off.
+        self.assertEqual(cmd[cmd.index('--disable'):cmd.index('--output-schema')],
+                         ['--disable', 'memories', '--disable', 'plugins', '-c', 'skills.include_instructions=false'])
         (self.root / '.git' / 'simplify-gate').write_text('# repo override\nmodel = spark\neffort=low\n')
         self.write('a.txt', 'a3\n')
         self.review()
