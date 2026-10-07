@@ -64,8 +64,9 @@ BOOTSTRAP = (  # the receiver's whole contract, so it need not read the driver's
     'or post a comment or an issue. Commit only your own paths: `git add -- <paths>` then\n'
     '`git commit --only -- <same paths>`, never a bare `git commit`, `git add -A` or `commit -a`.\n'
     'Do not load the `cowork` skill: it is for the driving side, and these are its rules for you.\n\n')
-HEADER = ('cowork request {id} from {me} on lane {lane}, answered by {model} at {effort} effort. Scope: {scope}.\n'
-          '{where}End your reply with a line "Files touched: <paths>" or "Files touched: none".\n---\n')
+HEADER = 'cowork request {id} from {me} on lane {lane}, answered by {model} at {effort} effort. Scope: {scope}.\n{where}---\n'
+TRAILER = ('\n---\nEnd your reply with a line "Files touched: <paths>" or "Files touched: none", '
+           'even when the task asks for nothing else.\n')  # after the task, so the task cannot override it
 WHERE = 'Your checkout is the worktree {root} on branch {branch}, created at {base} of the host checkout; commit there.\n'
 SCOPE = {True: 'do not edit anything', False: 'edit and commit by explicit path as the task needs'}
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')  # names both CLIs accept
@@ -346,7 +347,7 @@ def session_of(box):
 def compose(session, side, request, task, no_edit, root, model, effort, lane, where):
     sender = 'claude' if side == 'codex' else 'codex'
     header = HEADER.format(id=request, me=sender, lane=lane, scope=SCOPE[no_edit], model=model, effort=effort, where=where)
-    return ('' if session else BOOTSTRAP.format(side=side, root=root)) + header + task
+    return ('' if session else BOOTSTRAP.format(side=side, root=root)) + header + task.rstrip('\n') + TRAILER
 
 
 def command(side, session, reply_file, no_edit, model, effort):

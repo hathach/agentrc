@@ -61,6 +61,11 @@ def sh(cwd, *args):
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
 
 
+def task_of(prompt):
+    """The task as the coworker received it, between the header and the trailer."""
+    return prompt.split('---\n', 1)[1].rsplit('\n---\n', 1)[0]
+
+
 def until(condition, timeout=10):
     deadline = time.monotonic() + timeout
     while not condition():
@@ -351,7 +356,9 @@ class CoworkTest(unittest.TestCase):
             self.assertIn('Files touched', call['stdin'])
             self.assertEqual(call['env']['COWORK_TURN'], call['stdin'].split('cowork request ')[1].split()[0],
                              'COWORK_TURN names the request so the gate stays out')
-        self.assertTrue(first['stdin'].endswith('---\nfirst task'))
+        self.assertIn('---\nfirst task\n---\n', first['stdin'])
+        for call in (first, second):  # last, so a task asking for its output only does not drop the footer
+            self.assertTrue(call['stdin'].endswith('"Files touched: none", even when the task asks for nothing else.\n'))
         self.assertIn('Scope: edit and commit', first['stdin'])
         self.assertIn('Scope: do not edit anything', second['stdin'])
 
@@ -482,10 +489,10 @@ class CoworkTest(unittest.TestCase):
         task.write_text('from file')
         code, _, _, _ = self.send('--task', '-', stdin='from stdin')
         self.assertEqual(code, 0)
-        self.assertTrue(self.calls()[0]['stdin'].endswith('from stdin'))
+        self.assertEqual(task_of(self.calls()[0]['stdin']), 'from stdin')
         code, _, _, _ = self.send('--task', 'task.md')
         self.assertEqual(code, 0, 'a literal is a literal, even one that names a file')
-        self.assertTrue(self.calls()[1]['stdin'].endswith('task.md'))
+        self.assertEqual(task_of(self.calls()[1]['stdin']), 'task.md')
 
     def test_an_empty_task_never_reaches_the_coworker(self):
         for argv in (('--task', ''), ('--task', '-')):
@@ -603,7 +610,7 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('Files touched: none', first.stdout.read())
         code, _, _, _ = self.send('--task', 'two')
         self.assertEqual(code, 0)
-        tasks = [c['stdin'].rsplit('\n', 1)[-1] for c in self.calls()]
+        tasks = [task_of(c['stdin']) for c in self.calls()]
         self.assertEqual(tasks, ['one', 'two'])
         self.assertNotIn('resume', self.calls()[0]['argv'])
         self.assertEqual(self.calls()[1]['argv'][:3], ['exec', 'resume', 'thread-42'])
