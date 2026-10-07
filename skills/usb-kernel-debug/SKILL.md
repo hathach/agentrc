@@ -20,7 +20,7 @@ debugging (GDB on the MCU) for those.
 
 `usbmon` records host-side **URBs** — control / bulk / interrupt / isochronous transfers, descriptors, class requests, STALLs, short packets — i.e. exactly what the host exchanged with a device.
 
-Requires `usbmon` loaded and `/dev/usbmon*` readable by your user (`wireshark` group); the script says so when `tshark` cannot open the interface — a fresh group membership needs a new login or `sg wireshark -c '...'`. Reading a finished `.pcapng` needs no group.
+Requires `usbmon` loaded and `/dev/usbmon*` readable by your user (`wireshark` group); the script says so when `tshark` cannot open the interface — a fresh group membership needs a new login or `sg wireshark -c '...'`. Never `sudo` it: the script refuses root, whose `dumpcap` drops its capabilities and then cannot write an outfile under a mode-0700 home. Reading a finished `.pcapng` needs no group.
 
 ```bash
 S=<skill dir>/scripts

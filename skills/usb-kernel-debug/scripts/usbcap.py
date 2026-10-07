@@ -12,7 +12,7 @@ matches listed; pass the bus instead. An existing outfile is refused, never
 overwritten. A capture with no URB in it fails and keeps the file: the bus
 was idle, or the selector named the wrong one. Linux only (usbmon). Assumes
 usbmon is loaded and /dev/usbmon* is readable by the wireshark group (see
-SKILL.md), so tshark captures without sudo.
+SKILL.md), so tshark captures without sudo; running as root is refused.
 """
 import argparse
 import os
@@ -63,6 +63,12 @@ def main():
     args = parser.parse_args()
     if not sys.platform.startswith('linux'):
         sys.exit(f'usbcap.py is Linux-only (usbmon); this is {sys.platform}')
+    if os.geteuid() == 0:
+        # Wireshark 4.4 dumpcap.c: relinquish_privs_except_capture(), then relinquish_all_capabilities()
+        sys.exit('usbcap.py refuses to run as root: dumpcap drops all root capabilities before writing, so it '
+                 'cannot reach the outfile through a directory only its owner may enter (a mode-0700 home) and '
+                 'fails with "Permission denied". Run it without sudo, as a user in the wireshark group '
+                 "(SKILL.md; after a fresh group add: sg wireshark -c '...')")
     if args.seconds <= 0:
         sys.exit('seconds must be positive')
     if args.snaplen is not None and args.snaplen <= 0:

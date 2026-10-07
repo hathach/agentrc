@@ -66,6 +66,23 @@ DATA = Path(__file__).resolve().parent / 'data' / 'usb_kernel_debug'   # real us
 
 
 @unittest.skipIf(os.name == 'nt', 'usbmon capture requires Linux')
+class RootTest(unittest.TestCase):
+    def test_root_is_refused_with_the_cause_before_anything_is_reserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'cap.pcapng'
+            r = subprocess.run([sys.executable, '-c', 'import os, sys, runpy; os.geteuid = lambda: 0; '
+                                f'sys.argv = ["usbcap.py", "1", "3", {str(out)!r}]; runpy.run_path({str(SCRIPT)!r}, run_name="__main__")'],
+                               capture_output=True, text=True, env={**os.environ, 'PATH': tmp})
+            self.assertEqual(r.returncode, 1)
+            self.assertIn('refuses to run as root', r.stderr)
+            self.assertIn('dumpcap drops all root capabilities', r.stderr)
+            self.assertIn('wireshark group', r.stderr)
+            self.assertNotIn('not on PATH', r.stderr, 'refused before the tool check')
+            self.assertFalse(out.exists())
+
+
+@unittest.skipIf(os.name == 'nt', 'usbmon capture requires Linux')
+@unittest.skipIf(IS_ROOT, 'usbcap.py refuses root')
 @unittest.skipUnless(shutil.which('capinfos'), "needs Wireshark's capinfos")
 class CliTest(unittest.TestCase):
     """lsusb and the capturing tshark are stubs on PATH; tshark records its arguments and
