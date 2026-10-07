@@ -1,6 +1,6 @@
 ---
 name: download-doc
-description: Enumerate, download, and import vendor hardware documentation — datasheets, reference manuals, errata, programming/user manuals, application notes — into the Calibre library at ~/Documents/calibre-library, and refresh local copies when the vendor has published a newer revision. Use this whenever the user wants a datasheet or reference manual for a chip, asks to update/check/audit their documentation library, mentions ST/STM32 or NXP/i.MX/LPC/Kinetis/MCX documents, or wants to bulk-fetch a vendor's docs — even if they never say "Calibre".
+description: Enumerate, download, and import vendor hardware documentation — datasheets, reference manuals, errata, programming/user manuals, application notes — into the Calibre library at ~/Documents/calibre-library, and refresh local copies when the vendor has published a newer revision. Use this whenever the user wants a datasheet or reference manual for a chip, asks to update/check/audit their documentation library, mentions a vendor's documents (ST, NXP, Microchip, TI, Renesas, Espressif, Raspberry Pi, Arm and others), or wants to bulk-fetch a vendor's docs — even if they never say "Calibre".
 ---
 
 # download-doc
@@ -9,8 +9,8 @@ Fetch vendor documentation into the Calibre library, and keep it current.
 `CALIBRE_LIBRARY` overrides the library location for every script here, the same
 variable `read-doc` honours; imports and replacements then target that library.
 
-The library at `~/Documents/calibre-library` is the house archive of hardware docs
-(~3,000 books). It is also the first place to look before searching the web for a
+The library at `~/Documents/calibre-library` is the house archive of hardware docs.
+It is also the first place to look before searching the web for a
 manual — so its value depends on being both complete and *not stale*.
 
 ## The pipeline
@@ -28,11 +28,7 @@ vendor should mean writing one adapter, not another pipeline.
 |---|---|
 | `scripts/sync.py` | CLI. Enumerate → plan → (with `--apply`) import. Dry-run by default. |
 | `scripts/doclib.py` | Transport, revision comparison, Calibre I/O, planning. Vendor-neutral. |
-| `scripts/vendor_st.py` | STMicroelectronics adapter |
-| `scripts/vendor_nxp.py` | NXP adapter |
-| `scripts/vendor_espressif.py` | Espressif adapter |
-| `scripts/vendor_rpi.py` | Raspberry Pi adapter (RP2040/RP2350, Pico boards) — probes a name list, no index exists |
-| `scripts/vendor_arm.py` | Arm adapter (architecture and debug-interface specs) — a name list resolved through Arm's documentation service |
+| `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py`'s `VENDORS` is the list (`sync.py --help` prints it), each module's docstring its scope |
 | `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry-run by default. |
 | `references/st.md`, `references/nxp.md` | Per-vendor endpoints, quirks, and the gated-download flow |
 
@@ -117,7 +113,7 @@ python3 ~/.claude/skills/read-doc/scripts/locate.py build --all
 
 ## Conventions that must not drift
 
-The ~1,800 already-imported books follow these, and dedup depends on matching them
+The books already imported follow these, and dedup depends on matching them
 exactly:
 
 - `authors` — the vendor: `STMicroelectronics`, `NXP Semiconductors`
