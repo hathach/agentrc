@@ -187,7 +187,7 @@ if (args.stateRef != null) {
       `Run exactly: python3 ${STATE_SCRIPT} '${ref.outputFile}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
-      { label: `state:load#${++call}`, model: 'sonnet', effort: 'low', schema: ENVELOPE },
+      { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
     ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
     let added = false
     replies.forEach((env, g) => { added = take(env, groups[g]) || added })
@@ -584,8 +584,9 @@ const withNulls = (s, v) => {
   return out
 }
 // A copy that fails its script's seal is no answer; an error line carries no seal.
-const relayAgent = async (prompt, opts) => {
-  const v = await agent(prompt, { ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
+// The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
+const relayAgent = async (prompt, { fileTool, ...opts }) => {
+  const v = await agent(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
   if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
     log(`${opts.label}: the relayed copy does not match its seal`)
     return null
@@ -1308,7 +1309,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < <that file>; rm -f <that file>\`. ` +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
-    { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT },
+    { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
   )
   // A dead committer or relay error leaves no receipt: the read-back settles it, else committed stays null.
   const lost = made ? made.error : 'commit agent died'

@@ -2503,8 +2503,8 @@ test('the pending-bot backoff is taken after the cycle summary', async () => {
 test('reviews go to the validator role directly, and no lane leaves the roles', async () => {
   // The `workflow` binding throws, so a run that reaches its verdict is itself
   // the proof that nothing nested a workflow; these are the only roles it may
-  // dispatch to (the mechanical lanes carry a model, not an agentType).
-  const ROLES = ['pr-ci-watcher', 'pr-review-validator', 'finding-verifier', 'code-writer']
+  // dispatch to (the script relays go to the Bash-only relay type).
+  const ROLES = ['pr-ci-watcher', 'pr-review-validator', 'finding-verifier', 'code-writer', 'relay']
   const wide = await run({
     reviews: {
       findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })],
@@ -2525,6 +2525,11 @@ test('reviews go to the validator role directly, and no lane leaves the roles', 
     if (c.agentType !== undefined) assert.ok(ROLES.includes(c.agentType), `${c.label} dispatched to ${c.agentType}`)
   }
   assert.ok(calls.some(c => c.label.startsWith('fix:')) && calls.some(c => c.label.startsWith('scope:')))
+  // A script relay needs only Bash, so it carries no skill index; commit# writes its message with a file tool.
+  const RELAYS = /^(preflight|ci:collect#|replies#|resolve#|build#|recheck#|hooks#|audit#|push#)/
+  for (const c of calls.filter(c => RELAYS.test(c.label))) assert.equal(c.agentType, 'relay', c.label)
+  assert.ok(calls.some(c => c.label.startsWith('build#')) && calls.some(c => c.label.startsWith('push#')))
+  for (const c of calls.filter(c => c.label.startsWith('commit#'))) assert.equal(c.agentType, undefined, c.label)
   // Dispatch only proves what the exercised branches did: a dormant workflow()
   // call would never be reached here, and runCycle would absorb the stub's throw
   // as 'cycle-threw' if it were. So refuse the spelling too, over the whole source.
@@ -5856,6 +5861,8 @@ test('stateRef loads the saved state as checksummed chunks, exactly', async () =
   const loaded = await loadWith(state, stateRef)
   assert.deepEqual(loaded.labels.slice(0, 2), ['state:load#1', 'preflight'])
   assert.match(loaded.calls[0].prompt, /state_transfer\.py '\/tmp\/tasks\/w1\.output'\n/)
+  assert.equal(loaded.calls[0].agentType, 'relay')
+  assert.equal(loaded.calls[0].model, 'sonnet', 'the caller still picks the relay\'s model')
   assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded state carries the budget')
   assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
 })
