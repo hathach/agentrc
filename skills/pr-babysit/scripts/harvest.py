@@ -21,7 +21,12 @@ review|issue|review-body, commentId, source, author, body verbatim, digest
 (pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
 CodeRabbit rewrites at its end), aliases (the digests a body's earlier forms
 may have been recorded under; left out when there are none), path, line,
-commitId, createdAt, updatedAt, inReplyTo, url). Exit 2 with {"error": ...} when gh cannot answer the PR, the
+commitId, createdAt, updatedAt, inReplyTo, url). One body is left out: a CodeRabbit
+issue comment that opens with its walkthrough marker (CR_WALKTHROUGH), the
+auto-generated summary no finding comes from, has body null, bodyOmitted
+"coderabbit-walkthrough" and bodyLength; its digest and aliases are still the
+real body's and identify it, and `gh api repos/<repo>/issues/comments/<commentId>`
+(or its url) fetches it. Exit 2 with {"error": ...} when gh cannot answer the PR, the
 head, or a comment endpoint.
 """
 
@@ -47,6 +52,7 @@ AUTHOR = {'code-scanning': 'github-advanced-security'}
 HEAD_ACTIVITIES = {'opened', 'synchronize', 'reopened', 'ready_for_review'}
 CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
+CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 GREPTILE_PAUSED = 'Greptile has paused reviews on this repository'
 GREPTILE_ERROR = 'Greptile encountered an error while reviewing this PR'
 GREPTILE_STATUS = '<!-- greptile-status -->'
@@ -292,7 +298,9 @@ def pr_types(repo, path, sha):
 def entry(kind, c, src, body, created, updated, path=None, line=None, commit=None, reply_to=None):
     author = c['user']['login']
     first, *also = comment_digest.digests(body, author)
-    return {'kind': kind, 'commentId': c['id'], 'source': src, 'author': author, 'body': body or '',
+    walkthrough = kind == 'issue' and src == 'coderabbit' and (body or '').lstrip().startswith(CR_WALKTHROUGH)
+    shown = {'body': None, 'bodyOmitted': 'coderabbit-walkthrough', 'bodyLength': len(body)} if walkthrough else {'body': body or ''}
+    return {'kind': kind, 'commentId': c['id'], 'source': src, 'author': author, **shown,
             'digest': first, **({'aliases': also} if also else {}),
             'path': path, 'line': line, 'commitId': commit, 'createdAt': created, 'updatedAt': updated, 'inReplyTo': reply_to, 'url': c['html_url']}
 

@@ -105,6 +105,24 @@ class SettleRules(unittest.TestCase):
                 self.assertEqual(got['digest'], hashlib.sha256((body or '').encode()).hexdigest()[:12])
                 self.assertNotIn('aliases', got)
 
+    def test_only_coderabbits_walkthrough_issue_comment_loses_its_body(self):
+        rabbit = 'coderabbitai[bot]'
+        walk = harvest.CR_WALKTHROUGH + '\n<!-- walkthrough_start -->\n## Walkthrough\nsequence diagrams\n<!-- walkthrough_end -->'
+        got = harvest.entry('issue', {'id': 5, 'user': {'login': rabbit}, 'html_url': 'u/5'}, 'coderabbit', walk, 't', 't')
+        self.assertEqual((got['body'], got['bodyOmitted'], got['bodyLength']), (None, 'coderabbit-walkthrough', len(walk)))
+        self.assertEqual([got['digest'], *got.get('aliases', [])], harvest.comment_digest.digests(walk, rabbit), 'the real body\'s digest')
+        self.assertEqual((got['commentId'], got['url'], got['kind'], got['source']), (5, 'u/5', 'issue', 'coderabbit'))
+        prompt = '\n<details><summary>🤖 Prompt for AI Agents</summary>\nIn @a.c around line 3, fix it.\n</details>'
+        kept = [('review-body', rabbit, 'coderabbit', harvest.CR_WALKTHROUGH + '\n<summary>🧹 Nitpick comments (1)</summary>' + prompt),
+                ('review', rabbit, 'coderabbit', harvest.CR_WALKTHROUGH + '\n_⚠️ Potential issue_' + prompt),
+                ('issue', rabbit, 'coderabbit', harvest.CR_RATE + '\n> ## Review limit reached'),
+                ('issue', 'greptile-apps[bot]', 'greptile', harvest.CR_WALKTHROUGH + '\n<!-- greptile_summary -->')]
+        for kind, login, src, body in kept:
+            got = harvest.entry(kind, {'id': 6, 'user': {'login': login}, 'html_url': 'u/6'}, src, body, 't', 't')
+            self.assertEqual(got['body'], body, (kind, src))
+            self.assertNotIn('bodyOmitted', got)
+
+
 class FailClosed(unittest.TestCase):
     """What a first review found failing open: each case must end unknown or with the older, provable state."""
 
@@ -269,6 +287,16 @@ class EndToEnd(unittest.TestCase):
                          'only the named reviewers, and no empty review body')
         self.assertEqual(got['comments'][0]['digest'], harvest.digest('fix this'))
         self.assertEqual(got['comments'][0]['body'], 'fix this')
+
+    def test_the_walkthrough_is_harvested_without_its_body(self):
+        answers = self.answers([HEAD])
+        walk = harvest.CR_WALKTHROUGH + '\n## Walkthrough'
+        answers['api --paginate --slurp repos/o/r/issues/7/comments?per_page=100'][0][0].append(comment('coderabbitai[bot]', walk, id_=22))
+        code, got = self.harvest(answers)
+        self.assertEqual(code, 0, got)
+        by_id = {c['commentId']: c for c in got['comments']}
+        self.assertEqual((by_id[22]['body'], by_id[22]['bodyOmitted'], by_id[22]['digest']), (None, 'coderabbit-walkthrough', harvest.digest(walk)))
+        self.assertEqual(by_id[20]['body'], 'walkthrough', 'a CodeRabbit issue comment without the marker stays verbatim')
 
     def test_copilot_is_harvested_when_named_but_never_settled(self):
         answers = self.answers([HEAD])
