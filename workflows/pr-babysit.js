@@ -119,7 +119,7 @@ const ciLane = lane !== 'reviews'
 const markSonar = args.markSonar === true
 if (markSonar && args.autoPush !== true) throw new Error('markSonar publishes to SonarCloud: it needs autoPush')
 const reviewLane = lane !== 'ci'
-const STATE_VERSION = 3
+const STATE_VERSION = 4
 // A state crosses its caller, so it is sealed: canonical key order, any change fails the digest.
 const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
   : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
@@ -214,22 +214,24 @@ const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected
 let restored = null
 if (args.state !== undefined && args.state !== null) {
   const st = typeof args.state === 'string' ? JSON.parse(args.state) : args.state
-  const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
+  // Version 3 differs only in acceptedFailures as [{ key }]; it is sealed as saved, then migrated.
+  const shaped = st && [3, STATE_VERSION].includes(st.version) && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
     Number.isInteger(st.maxCycles) && st.maxCycles >= 1 &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
     typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
-    [st.deferrals, st.acceptedFailures, st.decisions, st.holds].every(Array.isArray) && (st.build === null || typeof st.build === 'string') &&
+    [st.deferrals, st.acceptedFailures, st.decisions, st.holds].every(Array.isArray) &&
+    st.acceptedFailures.every(a => typeof (st.version === 3 ? a && a.key : a) === 'string') && (st.build === null || typeof st.build === 'string') &&
     (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
-  if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
+  if (!shaped) throw new Error(`state is not a pr-babysit state of version 3 or ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
     throw new Error(`state was made by a run with different arguments: ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
   }
   if (st.build !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(st.build)} → ${JSON.stringify(buildCmd)}`)
-  restored = st
+  restored = st.version === 3 ? { ...st, version: STATE_VERSION, acceptedFailures: st.acceptedFailures.map(a => a.key) } : st
 }
 const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 10)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
@@ -677,7 +679,7 @@ const reanswer = new Set((restored && restored.reanswer) || [])
 const debt = new Map(restored
   ? restored.debt.map(([id, { seenSinceEdit, ...d }]) => [id, { ...d, dismissals: new Set(d.dismissals), notes: new Set(d.notes), ...(seenSinceEdit ? { edited: true } : {}) }])
   : [])
-for (const { key } of restored ? restored.acceptedFailures : []) {
+for (const key of restored ? restored.acceptedFailures : []) {
   if (!acceptedArg.some(x => x.key === key)) log(`accepted failure not renewed by this launch, no longer accepted: key ${key}`)
 }
 // findingId -> last settled verdict, never evicted: a finding can come back reworded or moved.
@@ -718,7 +720,7 @@ const stateOut = () => {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
-    acceptedFailures: acceptedArg.map(a => ({ key: a.key })),
+    acceptedFailures: acceptedArg.map(a => a.key),
     decisions: [...decisions],
     holds: [...holds],
     ...(reanswer.size ? { reanswer: [...reanswer] } : {}),

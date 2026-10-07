@@ -94,7 +94,7 @@ const adoptionState = ({
   maxCycles = 4, cyclesUsed = 1, reviewers = ['coderabbit'], autoRun = reviewers,
   protected: protectedPattern = null, pin = STATE_PIN, ...over
 } = {}) => seal({
-  version: 3, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
+  version: 4, pin: structuredClone(pin), expectedHead: HEAD, reviewClock: null, pending: null,
   config: {
     pr: 3888, reviewers, autoRun, checkoutDir: '.', ciWait: 30,
     protected: protectedPattern === null ? null : new RegExp(protectedPattern).source, generated: null,
@@ -2042,8 +2042,63 @@ test('a state missing a field the writer always saves is refused', async () => {
   const { digest, ...st } = (await run({ args: YIELD })).result.state
   for (const key of ['deferrals', 'acceptedFailures', 'decisions', 'holds', 'ciCache', 'build']) {
     const { [key]: _, ...partial } = st
-    await assert.rejects(run({ args: { ...YIELD, state: seal(partial) } }), /state is not a pr-babysit state of version 3/, key)
+    await assert.rejects(run({ args: { ...YIELD, state: seal(partial) } }), /state is not a pr-babysit state of version 3 or 4/, key)
   }
+})
+
+// A state as a version-3 launch saved it: acceptedFailures as [{ key }], sealed in that form.
+const asV3 = ({ digest, ...st }) => seal({ ...st, version: 3, acceptedFailures: st.acceptedFailures.map(key => ({ key })) })
+// Load a state and save it again with no cycle run: its spent budget stops the launch before preflight.
+const reload = async (state, args = {}) => {
+  const r = await run({ args: { ...YIELD, ...args, maxCycles: undefined, state } })
+  assert.equal(r.result.reason, 'budget-exhausted')
+  assert.deepEqual(r.labels, [])
+  return r.result.state
+}
+
+test('a saved state survives a load and save unchanged, and a version-3 one migrates to the same state', async () => {
+  const twice = async (opts, later = opts) => {
+    const first = await run({ ...opts, args: { ...YIELD, ...opts.args } })
+    const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
+    return run({ preflight: at, ...later, args: { ...YIELD, ...later.args, state: first.result.state } })
+  }
+  const reversed = { findings: [invalidFinding({ changeReason: 'the fix landed differently' })], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' }
+  const cases = {
+    'repeated dismissals': await twice({ reviews: owing, challenge: upheld }),
+    'a changed verdict': await twice({ reviews: oneValid }, { reviews: reversed }),
+    'a writer rejection': await twice({ reviews: oneValid, fix: rejecting('1#1') }),
+    'accepted failures': await run({ ...redWith(PVS), args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING }),
+  }
+  const { state: dismissed } = cases['repeated dismissals'].result
+  assert.deepEqual(dismissed.debt, [[5, { dismissals: ['5#1'], notes: [], digest: 'd5' }]], 'the dismissal is owed across both launches')
+  assert.equal(cases['a changed verdict'].result.state.decisions[0][1].verdict, 'invalid', 'the reversal is the settled verdict')
+  assert.ok(cases['a writer rejection'].result.state.decisions[0][1].rejection, 'the rejection is recorded')
+  assert.ok(cases['a writer rejection'].result.state.holds.some(([id]) => id === '1#1'), 'and held')
+  assert.deepEqual(cases['accepted failures'].result.state.acceptedFailures, [PVS_KEY])
+  for (const [name, { result }] of Object.entries(cases)) {
+    const spent = seal({ ...result.state, maxCycles: result.state.cyclesUsed })
+    // An acceptance holds only while each launch renews it.
+    const renewed = name === 'accepted failures' ? { acceptedFailures: [byKey()] } : {}
+    assert.deepEqual(await reload(spent, renewed), spent, `${name}: a load and save changes nothing`)
+    assert.deepEqual(await reload(asV3(spent), renewed), spent, `${name}: the version-3 copy loads as the same state`)
+  }
+  const v3 = asV3(cases['accepted failures'].result.state)
+  await assert.rejects(run({ args: { ...YIELD, state: { ...v3, acceptedFailures: [{ key: '0'.repeat(16) }] } } }), /state digest mismatch/, 'a version-3 state is checked as saved')
+})
+
+test('a version-3 state resumes a launch, by state and by stateRef, and its accepted keys are still read', async () => {
+  const first = await run({ ...redWith(PVS), args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING })
+  const v3 = asV3(first.result.state)
+  const resumed = await run({ ...redWith(PVS), args: { ...YIELD, state: v3 }, reviews: WAITING })
+  assert.equal(resumed.result.state.version, 4)
+  assert.equal(resumed.result.state.cyclesUsed, 2)
+  assert.ok(resumed.logs.includes(`accepted failure not renewed by this launch, no longer accepted: key ${PVS_KEY}`), resumed.logs.join('\n'))
+  const loaded = await run({ ...redWith(PVS), args: { ...YIELD, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: v3.digest } }, load: v3, reviews: WAITING })
+  assert.equal(loaded.labels[0], 'state:load#1')
+  assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded version-3 state carries the budget')
+  const forged = seal({ ...v3, acceptedFailures: [PVS_KEY] })
+  await assert.rejects(run({ args: { ...YIELD, state: forged } }), /not a pr-babysit state of version 3 or 4/, 'a version-3 state with version-4 keys')
+  await assert.rejects(run({ args: { ...YIELD, state: seal({ ...first.result.state, acceptedFailures: [{ key: PVS_KEY }] }) } }), /not a pr-babysit state/)
 })
 
 test('ciNotes reach the judge prompt verbatim, and only when given', async () => {
@@ -2116,7 +2171,7 @@ test('an accepted failure is named by its key, and a wrong key accepts nothing',
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.equal(result.acceptedFailures[0].key, PVS_KEY)
   assert.equal(result.observation.ci.realFailures[0].key, PVS_KEY, 'the observed report carries the key a caller accepts it by')
-  assert.deepEqual(result.state.acceptedFailures, [{ key: PVS_KEY }], 'the state keeps the key alone')
+  assert.deepEqual(result.state.acceptedFailures, [PVS_KEY], 'the state keeps the key alone')
   const wrong = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey({ key: '0'.repeat(16) })] } })
   assert.notEqual(wrong.result.pass, true)
   assert.ok(wrong.logs.some(l => /accepted failure 0{16} matches no failure on this head/.test(l)), wrong.logs.join('\n'))
@@ -2143,7 +2198,7 @@ test('a run red only from accepted failures passes, listing them, and is never c
   assert.ok(logs.some(l => /CI red only from 1 accepted failure\(s\)/.test(l)))
   assert.ok(!logs.some(l => /PR is green/.test(l)))
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
-  assert.deepEqual(result.state.acceptedFailures, [{ key: PVS_KEY }], 'the state keeps the key alone')
+  assert.deepEqual(result.state.acceptedFailures, [PVS_KEY], 'the state keeps the key alone')
 })
 
 test('a green run is called green and lists no accepted failures', async () => {
@@ -5808,7 +5863,7 @@ test('a returned state is sealed, compact and leads with its digest', async () =
   const { state } = first.result
   assert.equal(Object.keys(first.result)[0], 'stateDigest', 'the digest survives a truncated result')
   assert.equal(first.result.stateDigest, state.digest)
-  assert.equal(state.version, 3)
+  assert.equal(state.version, 4)
   assert.equal('history' in state, false)
   assert.equal(state.last.cycle, 1)
   assert.deepEqual(Object.keys(state.last).filter(k => !['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed'].includes(k)), [],
@@ -5825,7 +5880,7 @@ test('a changed or old-format state is refused before anything runs', async () =
   await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...state, cyclesUsed: 0 } } }), /state digest mismatch/)
   await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: JSON.stringify(state).replace('"cyclesUsed":1', '"cyclesUsed":0') } }), /state digest mismatch/)
   const { last, digest, ...rest } = state
-  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...rest, version: 2, history: [last] } } }), /not a pr-babysit state of version 3/)
+  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...rest, version: 2, history: [last] } } }), /not a pr-babysit state of version 3 or 4/)
   assert.deepEqual(trace, [], 'no agent ran')
 })
 
