@@ -84,10 +84,11 @@ const VERIFY = {
 const STEPS = { type: 'array', items: { type: 'object', additionalProperties: false, required: ['id', 'change', 'paths', 'check'],
   properties: { id: { type: 'string' }, change: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } }, check: { type: 'string' } } } }
 const PLAN = {
-  type: 'object', additionalProperties: false, required: ['status', 'steps', 'scope', 'remaining', 'blocker'],
+  type: 'object', additionalProperties: false, required: ['status', 'steps', 'scope', 'remaining', 'validation', 'blocker'],
   properties: {
     status: { enum: ['agreed', 'unresolved', 'needs-user', 'hardware-triage', 'scope-extension'] }, steps: STEPS,
-    scope: { type: 'array', items: { type: 'string' } }, remaining: { type: 'array', items: { type: 'string' } }, blocker: { type: ['string', 'null'] },
+    scope: { type: 'array', items: { type: 'string' } }, remaining: { type: 'array', items: { type: 'string' } },
+    validation: { type: 'array', items: { type: 'string' } }, blocker: { type: ['string', 'null'] },
   },
 }
 const DECISIONS = { type: 'array', items: { type: 'object', additionalProperties: false, required: ['proposal', 'from', 'disposition', 'reason', 'evidence'],
@@ -231,8 +232,10 @@ const brief =
   'scope = every path the steps touch. status: agreed when the plan is ready to implement; needs-user, with blocker, when it needs a ' +
   "human decision; hardware-triage, with blocker, when a supported fix needs hardware behaviour observed on a board first; " +
   "scope-extension, with blocker, when the change needs work outside the target's task; unresolved when you cannot settle it. " +
-  'remaining: open questions. Answer format: in text, a line `PLAN: draft` once, then status, scope, steps (id, change, paths, check), ' +
-  'remaining and blocker; with an output schema, the same fields in it.'
+  'remaining: unresolved planning questions; validation: checks required after implementation and before claiming completion ' +
+  '(a HIL run, a hardware validator). Evidence needed to choose or justify the fix belongs in remaining or hardware-triage, never ' +
+  'in validation. Answer format: in text, a line `PLAN: draft` once, then status, scope, steps (id, change, paths, check), ' +
+  'remaining, validation and blocker; with an output schema, the same fields in it.'
 const [claudeDraft, codexDraft] = await parallel([
   () => planner('plan:claude', brief, PLAN),
   () => ask('plan:codex', brief, ['PLAN: draft']),
@@ -301,7 +304,7 @@ const contract = contractOf(planScope)
 if (!batch) {
   return finish({
     pass: false, reason: 'co-plan-agreed', target, triage, contract, coplan,
-    next: `the plan is agreed on lane ${lane} (${coplan.exchanges.map(e => e.requestId).filter(Boolean).join(', ')}); implement coplan.plan's steps with a step review on that lane after each, then your completion review, or run under chief with batch: true on a fresh plan lane`,
+    next: `the plan is agreed on lane ${lane} (${coplan.exchanges.map(e => e.requestId).filter(Boolean).join(', ')}); implement coplan.plan's steps with a step review on that lane after each, then your completion review; perform every coplan.plan.validation check through the applicable repository workflow or role, in the required completion sequence, and report its result; or run under chief with batch: true on a fresh plan lane`,
   })
 }
 
@@ -360,7 +363,7 @@ const [check, checkLabel] = v && v.args ? [`Workflow /${v.name} ${JSON.stringify
     : [`${verify} alone, no validation workflow being named by the repository's instructions`, `${verify} alone`]
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
-  : `confirm the implement notes carry hook evidence; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence), its Codex co-review on the plan lane ${lane} with --tier review, with ${check} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and names the co-plan's outcome, remaining disagreement and request ids, and, unless your report already tables the session's spend (chief does), ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl> --full <a new temporary file>\`'s output verbatim; then the human opens the PR`
+  : `confirm the implement notes carry hook evidence; perform every coplan.plan.validation check through the applicable repository workflow or role, in the required completion sequence, and report its result; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence), its Codex co-review on the plan lane ${lane} with --tier review, with ${check} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and names the co-plan's outcome, remaining disagreement and request ids, and, unless your report already tables the session's spend (chief does), ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl> --full <a new temporary file>\`'s output verbatim; then the human opens the PR`
 return finish({
   pass: !reason, reason, target, issue: triage.issue, kind: triage.kind, disposition: triage.disposition,
   triage, contract, coplan, implement: dev, commits: verified.commits, verify: verified, validate: triage.validate, next,
