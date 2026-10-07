@@ -18,7 +18,9 @@ its comment (a refutedPosts reply answers stale findings as well as invalid ones
 cyclesUsed and maxCycles. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch
 included, the latter with the caller's response; `notes` what is absent but harmless.
+`logs` leaves out lines another field carries whole and folds repeated ones into one.
 """
+import argparse
 import json
 import re
 import sys
@@ -29,7 +31,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from facts import Parser, Unusable, git, report  # noqa: E402
 
 CONDENSED = ('history', 'observation', 'state')
-NOT_FIXING = re.compile(r'^cycle \d+: rig-side CI failure \(not fixing\)')
+NOT_FIXING = re.compile(r'^cycle \d+: [\w -]+ CI failure \(not fixing\): ')
+# Whole in result.handoffs (commentId, replyId, the error in `why`) and result.settlements, when the record is there.
+HANDED = (re.compile(r'^cycle \d+: reply \d+ to comment (?P<c>\d+) exists with the wrong content \(.*\) — handed to the caller, not another reply$', re.S),
+          re.compile(r'^cycle \d+: no reply posted to comment (?P<c>\d+) \(.*\) — handed to the caller, who checks the thread for an earlier attempt$', re.S))
+SETTLED = re.compile(r"^cycle \d+: comment (?P<c>\d+) settled on the caller's reply (?P<r>\d+)$")
+COLLAPSED = (re.compile(r'^(?P<pre>cycle \d+: accepted failure )(?P<value>\S+)(?P<post> matches no failure on this head)$'),
+             re.compile(r'^(?P<pre>accepted failure not renewed by this launch, no longer accepted: key )(?P<value>\S+)(?P<post>)$'))
+SUMMARY = re.compile(r'^cycle \d+ summary — ')
 IDE_DRIFT = re.compile(r'(?:.*/)?\.idea/')
 CUT = 300
 ADOPTION_REFUSED = 'the adoption was refused: investigate and report it, never answer it with a reset or a fabricated state'
@@ -131,13 +140,47 @@ def ci_summary(ci, keys=False):
                           for f in failures if not settled(f)]}
 
 
-def logs(lines):
-    """Every log line cut to CUT, except that rig-side "not fixing" lines are counted: ci lists those failures."""
-    lines = lines or []
-    kept = [l if len(l) <= CUT else f'{l[:CUT]}… ({len(l)} chars; whole line in the output\'s logs)'
-            for l in lines if not NOT_FIXING.match(l)]
-    dropped = len(lines) - len(kept)
-    return kept + ([f'({dropped} rig-side "not fixing" lines, one per failure listed under ci)'] if dropped else [])
+def carried(line, result):
+    """Whether the result holds the handoff or settlement record this log line reports."""
+    result = result or {}
+    m = next(filter(None, (p.match(line) for p in HANDED)), None)
+    if m:
+        return any(str(h.get('commentId')) == m['c'] for h in result.get('handoffs') or [])
+    m = SETTLED.match(line)
+    return bool(m) and any(str(st.get('commentId')) == m['c'] and str(st.get('replyId')) == m['r'] and st.get('outcome') == 'settled'
+                           for st in result.get('settlements') or [])
+
+
+def logs(lines, result=None):
+    """Every log line cut to CUT, except: "not fixing" CI lines are counted, as ci lists those failures; a line whose record
+    the result carries is dropped;
+    a cycle summary keeps its header line, its table carried by observation; and the lines of one COLLAPSED pattern become one."""
+    kept, counted, groups = [], 0, {}
+    for l in lines or []:
+        m = next(filter(None, (p.match(l) for p in COLLAPSED)), None)
+        if NOT_FIXING.match(l):
+            counted += 1
+        elif carried(l, result):
+            pass
+        elif m:
+            key = (m['pre'], m['post'])
+            if key not in groups:
+                groups[key] = []
+                kept.append(key)
+            groups[key].append(m['value'])
+        else:
+            head, _, table = l.partition('\n') if SUMMARY.match(l) else (l, '', '')
+            l = f'{head} … ({table.count(chr(10)) + 1} more lines in the output\'s logs)' if table else l
+            kept.append(l if len(l) <= CUT else f'{l[:CUT]}… ({len(l)} chars; whole line in the output\'s logs)')
+    kept = [k if isinstance(k, str) else collapsed(*k, groups[k]) for k in kept]
+    return kept + ([f'({counted} "not fixing" CI failure lines, one per failure listed under ci)'] if counted else [])
+
+
+def collapsed(pre, post, values):
+    """One line for a pattern's lines: its distinct values in first-seen order, and how many lines there were."""
+    if len(values) == 1:
+        return f'{pre}{values[0]}{post}'
+    return f'{pre}{{{", ".join(dict.fromkeys(values))}}}{post} ({len(values)} lines)'
 
 
 def ide_drift(line):
@@ -160,7 +203,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         blockers.append('the output file is empty: the launch threw before returning a result (its error is in the Workflow tool result)')
     else:
         summary['launch'] = {'agents': output.get('agentCount'), 'tokens': output.get('totalTokens'), 'secs': elapsed(output.get('workflowProgress'))}
-        summary['logs'] = logs(output.get('logs'))
+        summary['logs'] = logs(output.get('logs'), output.get('result'))
         if not isinstance(result, dict):
             blockers.append('the output carries no result object')
     if isinstance(result, dict):
@@ -218,7 +261,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
 
 
 def collect(argv):
-    p = Parser(prog='launch_result.py', add_help=False)
+    p = Parser(prog='launch_result.py', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--output', required=True)
     p.add_argument('--state-ref')
     p.add_argument('--checkout')

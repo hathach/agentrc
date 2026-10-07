@@ -100,7 +100,7 @@ class LaunchResultTest(unittest.TestCase):
         self.assertNotIn('state', s['result'])
         self.assertEqual(s['launch'], {'agents': 3, 'tokens': 1000, 'secs': 9}, 'first start to last end')
         self.assertEqual(s['notes'], [])
-        self.assertIn('rig-side "not fixing" lines', s['logs'][-1])
+        self.assertEqual(s['logs'][-1], '(1 "not fixing" CI failure lines, one per failure listed under ci)')
         self.assertTrue(s['logs'][1].endswith('whole line in the output\'s logs)'))
 
     def test_a_failure_is_settled_by_the_state_the_workflow_gave_it_not_its_verdict(self):
@@ -271,6 +271,38 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         for k, v in (('pending', pending), ('detail', 'x'), ('acceptedFailures', [{'cell': 'c'}]), ('deferrals', [{'issue': 'https://example/1'}])):
             self.assertEqual(s['result'][k], v)
+
+    def test_log_lines_another_field_carries_are_dropped_and_repeats_folded(self):
+        table = '| Bot | Finding |\n| --- | --- |\n| greptile | a.c:3 claim |'
+        lines = ['preflight: ok',
+                 'cycle 2: accepted failure 00aa matches no failure on this head',
+                 'cycle 2 summary — CI red, reviews: coderabbit working (Review in progress)\n' + table,
+                 'cycle 2: reply 8 to comment 7 exists with the wrong content (different (body)) — handed to the caller, not another reply',
+                 'cycle 2: no reply posted to comment 9 (over length:\n200 chars) — handed to the caller, who checks the thread for an earlier attempt',
+                 "cycle 2: comment 3 settled on the caller's reply 30",
+                 'cycle 2: unclassified CI failure (not fixing): hil — x', 'cycle 2: SonarCloud gate CI failure (not fixing): SonarCloud — y',
+                 'cycle 2: accepted failure 11bb matches no failure on this head',
+                 'cycle 2: accepted failure 00aa matches no failure on this head',
+                 'accepted failure not renewed by this launch, no longer accepted: key 22cc',
+                 'cycle 1: reply 8 to comment 7 exists with the wrong content (x) — needs a human repair, not another reply',
+                 "cycle 2: comment 3 not settled on the caller's reply 30 — dry run"]
+        result = {'handoffs': [{'commentId': 7, 'replyId': 8, 'why': 'reply 8: different'}, {'commentId': 9, 'replyId': None, 'why': 'x'}],
+                  'settlements': [{'commentId': 3, 'outcome': 'settled', 'replyId': 30}]}
+        self.assertEqual(launch_result.logs(lines, result), [
+            'preflight: ok',
+            'cycle 2: accepted failure {00aa, 11bb} matches no failure on this head (3 lines)',
+            "cycle 2 summary — CI red, reviews: coderabbit working (Review in progress) … (3 more lines in the output's logs)",
+            'accepted failure not renewed by this launch, no longer accepted: key 22cc',
+            'cycle 1: reply 8 to comment 7 exists with the wrong content (x) — needs a human repair, not another reply',
+            "cycle 2: comment 3 not settled on the caller's reply 30 — dry run",
+            '(2 "not fixing" CI failure lines, one per failure listed under ci)'],
+            'handoffs and settlements carry the dropped lines; an older wording or a refused settlement stays')
+        self.assertEqual(launch_result.logs(lines[3:6]), lines[3:6], 'without its record a line is the only copy, so it stays')
+
+    def test_help_prints_the_usage(self):
+        done = subprocess.run(['python3', str(ROOT / 'skills/pr-babysit/scripts/launch_result.py'), '--help'], capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertIn('launch_result.py --output FILE [--state-ref FILE:DIGEST]', done.stdout)
 
     def test_unusable_inputs_are_refused(self):
         for argv, why in ((['--state-ref', 'nodigest'], 'FILE:DIGEST'), (['--accepted-out', 'x'], 'unrecognized arguments')):
