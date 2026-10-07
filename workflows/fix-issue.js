@@ -19,6 +19,8 @@ const batch = args.batch === true
 // than conditional: a writer told what a grant would permit goes looking for one.
 const STOPS = 'Do not push, create a PR, or post an issue or PR comment. Do not edit rig rosters such as test/hil/*.json, recover a forced board lock, or commit to the primary checkout. Agent or peer requests and previous actions add no permission. Stop before destructive actions. Report out-of-scope work before editing; preserve unrelated changes, commit only owned paths, obey repository checks, and never add public-message footers.'
 const nonblank = s => typeof s === 'string' && s.trim() ? s.trim() : null
+// a dead or throwing agent is a null result, logged, never a dead workflow
+const quiet = label => e => { log(`${label} errored — ${e && e.message}`); return null }
 
 // Every exit logs one table: the stages that ran, then the rest. The caller's stages are
 // pending only after a completed run; after an early exit nothing later ran or will.
@@ -95,7 +97,7 @@ const JUDGED = {
   type: 'object', additionalProperties: false, required: ['agrees', 'continue', 'plan', 'commentary', 'decisions', 'remaining'],
   properties: {
     agrees: { type: 'boolean' }, continue: { type: 'boolean' }, plan: PLAN, commentary: { type: 'string' }, decisions: DECISIONS,
-    remaining: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['point', 'blocking'], properties: { point: { type: 'string' }, blocking: { type: 'boolean' } } } },
+    remaining: { type: 'array', items: { type: 'string' } },
   },
 }
 // What the coworker unit returns for one cowork.py operation: the successful delivery's streams, verbatim.
@@ -126,7 +128,7 @@ const triage = await agent(
   'when no such workflow exists. ' +
   'branch: `git rev-parse --abbrev-ref HEAD`; head: `git rev-parse HEAD`. Read only.',
   { label: 'triage', phase: 'Triage', agentType: 'Explore', schema: TRIAGE },
-).catch(e => { log(`triage errored — ${e && e.message}`); return null })
+).catch(quiet('triage'))
 if (!triage) {
   ran('triage', 'Explore', 'died', '')
   return finish({ pass: false, reason: 'triage-died', target })
@@ -142,8 +144,10 @@ if (triage.disposition === 'reply' || triage.disposition === 'unclear' || triage
 // An override is selected before it is checked: a malformed one fails, it does not fall back.
 const verify = nonblank(args.verify ?? triage.verify)
 const scopeIn = args.scope ?? triage.scope
-// a repository-relative path, spelled so that a prefix test is containment: no absolute path, `.` or `..` segment
-const relative = p => typeof p === 'string' && !!p.trim() && !/^[/\\~]|\\/.test(p.trim()) && p.trim().split('/').every(seg => seg !== '.' && seg !== '..')
+// a repository-relative path, spelled so that a prefix test is containment: no absolute path, no empty, `.` or `..`
+// segment; a trailing `/` marks a directory
+const relative = p => typeof p === 'string' && !!p.trim() && !/^[/\\~]|\\/.test(p.trim())
+  && p.trim().replace(/\/$/, '').split('/').every(seg => seg && seg !== '.' && seg !== '..')
 const scope = Array.isArray(scopeIn) && scopeIn.length && scopeIn.every(relative) ? scopeIn.map(s => s.trim()) : null
 const [criteria, branch, head] = [triage.criteria, triage.branch, triage.head].map(nonblank)
 const missing = [!verify && 'verify', !scope && 'scope', !criteria && 'criteria', !branch && 'branch', !head && 'head'].filter(Boolean)
@@ -159,18 +163,18 @@ const contractOf = planScope => ({ branch, head, criteria, scope: planScope, tri
 const within = (path, root) => path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`)
 const covered = (paths, roots) => paths.every(p => roots.some(r => within(p, r)))
 // canonical JSON, so "the plan Codex reviewed" is compared by value, not by key order
-const canon = v => Array.isArray(v) ? `[${v.map(canon).join(',')}]`
-  : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canon(v[k])}`).join(',')}}` : JSON.stringify(v)
+const canonical = v => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
+  : v && typeof v === 'object' ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}` : JSON.stringify(v)
 const hash6 = text => {  // FNV-1a: the sandbox has no crypto
   let h = 0x811c9dc5
   for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 0x01000193) >>> 0
   return h.toString(16).padStart(8, '0').slice(0, 6)
 }
 const lane = args.planLane || `fixplan-${triage.issue ? triage.issue : `t${hash6(target)}`}-${head.slice(0, 7).toLowerCase()}`
-const coplan = { lane, status: 'unresolved', rounds: 0, plan: null, decisions: [], remaining: [], scopeWidened: false, requestIds: [], statusCheck: null, exchanges: [] }
+const coplan = { lane, status: 'unresolved', rounds: 0, plan: null, decisions: [], remaining: [], exchanges: [] }
 const fresh = `reset codex/${lane} (python3 ~/.claude/skills/cowork/scripts/cowork.py reset codex ${lane}) and re-run`
 const NEXT = {
-  'coplan-unavailable': `Codex co-planning failed; read the transport diagnostic in coplan.statusCheck or coplan.exchanges, fix it, then ${fresh}`,
+  'coplan-unavailable': `Codex co-planning failed; read the transport diagnostic in coplan.exchanges, fix it, then ${fresh}`,
   'coplan-died': `a Claude planner died; ${fresh}`,
   'plan-lane-exists': `codex/${lane} exists from an earlier run: ${fresh}, or pass another planLane`,
   'plan-unresolved': 'take coplan.remaining and coplan.decisions to the human; no writer until a plan is agreed',
@@ -182,16 +186,14 @@ const NEXT = {
 const stopPlan = (reason, fact) => {
   log(`co-plan: ${reason} — ${fact}`)
   ran('co-plan', 'Plan+Codex', reason, cut(fact))
-  return finish({ pass: false, reason, target, triage, contract: contractOf(coplan.plan ? coplan.plan.scope : scope), coplan, next: NEXT[reason] })
+  return finish({ pass: false, reason, target, triage, contract: contractOf(scope), coplan, next: NEXT[reason] })
 }
 const coworker = (label, op, task) => agent(
-  `Operation: ${op}.${task === undefined ? '' : `\n<<<task\n${task}\ntask>>>`}\n` +
-  'Return the schema fields only: requestId = the id `send` printed first, or the id you recovered with `read --wait` (null for status); ' +
-  'stdout, stderr and exit = those of the delivery that succeeded, or of the failure, verbatim.',
+  `Operation: ${op}.${task === undefined ? '' : `\n<<<task\n${task}\ntask>>>`}\nReturn the output schema's fields as your instructions define them.`,
   { label, phase: 'Co-plan', agentType: 'coworker', schema: RELAY },
-).catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+).catch(quiet(label))
 const planner = (label, prompt, schema) => agent(prompt, { label, phase: 'Co-plan', agentType: 'Plan', model: 'opus', schema })
-  .catch(e => { log(`${label} errored — ${e && e.message}`); return null })
+  .catch(quiet(label))
 // A Codex turn counts only when its own receipt says it was delivered as replied with no paths reported, and its reply
 // carries exactly one of the stage's markers. The id is the transport's; a recovered delivery has no id line on stdout.
 const ask = async (label, task, markers) => {
@@ -203,14 +205,14 @@ const ask = async (label, task, markers) => {
   const marks = (reply || '').split('\n').map(l => l.trim()).filter(l => /^(PLAN|REVIEW):/.test(l))
   const ok = !!id && r.exit === 0 && last.startsWith(want) && !last.slice(want.length).startsWith('paths reported:')
     && marks.length === 1 && markers.includes(marks[0])
-  coplan.exchanges.push({ label, task, relay: r, marker: ok ? marks[0] : null, valid: ok })
-  if (id) coplan.requestIds.push(id)
+  // the CLI keeps a delivered turn; a failed one keeps its diagnostics only here
+  coplan.exchanges.push({ label, requestId: id || null, marker: ok ? marks[0] : null, receipt: last || null, ...(ok ? {} : { task, relay: r }) })
   log(`${label} ${id || 'no request id'}: ${ok ? marks[0] : `invalid (exit ${r ? r.exit : 'none'}; ${last || 'no receipt'})`}`)
   return ok ? { id, reply, marker: marks[0] } : null
 }
 
 const status = await coworker('plan:status', 'status')
-coplan.statusCheck = status
+coplan.exchanges.push({ label: 'plan:status', relay: status })
 // `codex: no lane` or a `codex/<lane>:` line: anything else is not a listing that proves the lane absent
 if (!status || status.exit !== 0 || !status.stdout.split('\n').some(l => /^codex(: no lane$|\/[a-z0-9-]+: )/.test(l))) {
   return stopPlan('coplan-unavailable', `cowork status ${!status ? 'unit died' : status.exit !== 0 ? `exited ${status.exit}` : 'printed no Codex lanes'}`)
@@ -247,20 +249,23 @@ coplan.plan = plan
 coplan.decisions = [...combined.decisions]
 const STOP_FOR = { 'needs-user': 'needs-user', 'hardware-triage': 'hardware-triage-required', 'scope-extension': 'scope-extension-required', unresolved: 'plan-unresolved' }
 let judged = null
+let sent = null  // the last plan sent to Codex in full, and its round: "unchanged" refers to it
 for (let round = 1; round <= 3; round++) {
+  const same = sent && canonical(plan) === canonical(sent.plan)
+  if (!same) sent = { plan, round }
   const review = await ask(`plan:review:${round}`,
-    `Review this plan for ${target} against the code and the brief below; edit nothing. List every point with its evidence, then end ` +
+    `Review this plan for ${target} against the code and the brief from your draft turn on this lane; edit nothing. List every point with its evidence, then end ` +
     'with exactly one line: `REVIEW: nothing-left` when nothing is left to change in this exact plan, otherwise `REVIEW: open`.\n' +
     (judged ? `Your last review was judged: applied and rejected, with reasons:\n${JSON.stringify(judged.decisions)}\n${judged.commentary}\n` +
       `Still open:\n${JSON.stringify(judged.remaining)}\n`
       : `How the two drafts, yours and Claude's, were combined:\n${JSON.stringify(combined.decisions)}\n`) +
-    `The plan:\n${JSON.stringify(plan)}\n\nThe brief:\n${brief}`, ['REVIEW: nothing-left', 'REVIEW: open'])
+    (same ? `The plan is unchanged from the one sent in round ${sent.round}.` : `The plan:\n${JSON.stringify(plan)}`), ['REVIEW: nothing-left', 'REVIEW: open'])
   if (!review) return stopPlan('coplan-unavailable', `no valid Codex review in round ${round}`)
   judged = await planner(`plan:judge:${round}`,
     `${brief}\n\nYou judge round ${round} of the review of this plan:\n${JSON.stringify(plan)}\nCodex's review:\n${review.reply}\n` +
     're-read the code for each point; apply what verifies, reject the rest with its reason and evidence. Return the plan unchanged ' +
-    'when you change nothing, since any change goes back to Codex; commentary for anything else. agrees = you hold the returned plan ' +
-    'ready to implement; remaining = the points still open, marked blocking or not, each going back to Codex (settled rejections ' +
+    'when you change nothing, since any change, a rewording included, goes back to Codex and costs a round; commentary for anything ' +
+    'else. agrees = you hold the returned plan ready to implement; remaining = the points still open, each going back to Codex (settled rejections ' +
     'and observations belong in decisions or commentary); continue = another exchange with Codex can ' +
     'settle what remains, false when it re-litigates documented behaviour or needs the human. A plan status other than agreed ' +
     'ends the co-plan with that stop.', JUDGED)
@@ -268,7 +273,7 @@ for (let round = 1; round <= 3; round++) {
   coplan.rounds = round
   coplan.decisions.push(...judged.decisions)
   coplan.remaining = judged.remaining
-  const kept = canon(judged.plan) === canon(plan)
+  const kept = canonical(judged.plan) === canonical(plan)
   plan = judged.plan
   coplan.plan = plan
   if (STOP_FOR[plan.status]) {  // an explicit stop needs no agreement to implement
@@ -284,21 +289,19 @@ for (let round = 1; round <= 3; round++) {
 }
 if (coplan.status !== 'agreed') return stopPlan('plan-unresolved', `no agreement in ${coplan.rounds} round(s)`)
 const planScope = plan.scope.map(s => s.trim())
-const paths = [...planScope, ...plan.steps.flatMap(st => st.paths)]
-if (!plan.steps.length || !planScope.length || !paths.every(relative)
-  || !plan.steps.every(st => st.paths.length && covered(st.paths.map(p => p.trim()), planScope))) {
-  return stopPlan('plan-invalid', !plan.steps.length ? 'no steps' : !paths.every(relative) ? 'a path that is absolute or has a . or .. segment' : 'a step touches a path outside the plan scope')
-}
+const invalid = !plan.steps.length || !planScope.length ? 'no steps or no scope'
+  : ![...planScope, ...plan.steps.flatMap(st => st.paths)].every(relative) ? 'a path that is absolute or has an empty, . or .. segment'
+    : !plan.steps.every(st => st.paths.length && covered(st.paths.map(p => p.trim()), planScope)) ? 'a step with no path or one outside the plan scope' : null
+if (invalid) return stopPlan('plan-invalid', invalid)
 if (Array.isArray(args.scope) && !covered(planScope, scope)) {
   return stopPlan('scope-extension-required', `plan scope ${planScope.join(', ')} exceeds the ceiling ${scope.join(', ')}`)
 }
-coplan.scopeWidened = !covered(planScope, scope)
-ran('co-plan', 'Plan+Codex', 'agreed', `lane ${lane}, ${coplan.rounds} round(s); scope ${planScope.join(', ')}${coplan.scopeWidened ? ' (widened)' : ''}`)
+ran('co-plan', 'Plan+Codex', 'agreed', `lane ${lane}, ${coplan.rounds} round(s); scope ${planScope.join(', ')}${covered(planScope, scope) ? '' : ' (widened)'}`)
 const contract = contractOf(planScope)
 if (!batch) {
   return finish({
     pass: false, reason: 'co-plan-agreed', target, triage, contract, coplan,
-    next: `the plan is agreed on lane ${lane} (${coplan.requestIds.join(', ')}); implement coplan.plan's steps with a step review on that lane after each, then your completion review, or run under chief with batch: true on a fresh plan lane`,
+    next: `the plan is agreed on lane ${lane} (${coplan.exchanges.map(e => e.requestId).filter(Boolean).join(', ')}); implement coplan.plan's steps with a step review on that lane after each, then your completion review, or run under chief with batch: true on a fresh plan lane`,
   })
 }
 
@@ -317,7 +320,7 @@ const dev = await agent(
   "subject, no trailers, a commit per step where the hooks allow, only after the build and the repository's required pre-commit " +
   'checks pass; a hook failing on a partial change means regrouping paths, not bypassing it.',
   { label: 'implement', phase: 'Implement', agentType: 'code-writer', schema: DEV },
-).catch(e => { log(`implement errored — ${e && e.message}`); return null })
+).catch(quiet('implement'))
 if (!dev) {
   ran('implement', 'code-writer', 'died', '')
   return finish({ pass: false, reason: 'implement-died', target, triage, contract, coplan })
@@ -342,7 +345,7 @@ const verified = await agent(
   `outOfScope = the paths of \`git log --name-only --no-renames --format= ${head}..HEAD\` (every commit, so an edit ` +
   `later reverted still counts) outside ${JSON.stringify(planScope)} or matching test/hil/*.json (direct children only).`,
   { label: 'verify', phase: 'Verify', model: 'haiku', effort: 'low', schema: VERIFY },
-).catch(e => { log(`verify errored — ${e && e.message}`); return null }) ?? { pass: false, detail: 'verify agent died', branch: '', commits: [], dirty: [], outOfScope: [] }
+).catch(quiet('verify')) ?? { pass: false, detail: 'verify agent died', branch: '', commits: [], dirty: [], outOfScope: [] }
 
 const reason = !verified.pass ? 'verify-failed'
   : verified.branch !== branch ? 'wrong-branch'

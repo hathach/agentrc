@@ -194,7 +194,7 @@ test('an existing lane, an unreadable status or a dead status unit stops before 
     assert.deepEqual(labels, ['triage', 'plan:status'])
     assert.equal(result.pass, false)
     assert.ok(result.next, 'every planning stop says what to do next')
-    if (status && status.stderr) assert.equal(result.coplan.statusCheck.stderr, 'not a git repository', 'the raw relay is kept')
+    if (status && status.stderr) assert.equal(result.coplan.exchanges[0].relay.stderr, 'not a git repository', 'the raw relay is kept')
   }
   assert.equal((await run({ 'plan:status': { stdout: 'codex: no lane\nclaude: no lane\n' } })).result.pass, true, 'no Codex lane at all')
   assert.match((await run({ 'plan:status': { stdout: `codex/${LANE}: session y\n` } })).result.next, new RegExp(`reset codex ${LANE}`))
@@ -222,7 +222,8 @@ test('a Codex reply counts only with a receipt for its own id, lane and success,
     assert.equal(result.reason, 'coplan-unavailable', why)
     assert.match(result.next, /transport diagnostic/, why)
     assert.deepEqual(labels, ['triage', 'plan:status', 'plan:claude', 'plan:codex'], `${why}: no combine or judge without a valid draft`)
-    assert.ok(result.coplan.exchanges.some(e => e.label === 'plan:codex'), `${why}: raw fields kept`)
+    const sent = result.coplan.exchanges.find(e => e.label === 'plan:codex')
+    assert.ok(sent && sent.task && 'relay' in sent && sent.marker === null, `${why}: a failed exchange keeps its task and raw relay`)
   }
   for (const [over, why] of [
     [{}, 'a footerless reply'],
@@ -257,8 +258,8 @@ test('a review round agrees only on nothing-left for the exact plan the judge ke
     [{ 'plan:review:1': open(1), 'plan:review:2': open(2), 'plan:review:3': open(3) }, 'Codex open at the cap'],
     [{ 'plan:judge:1': { agrees: false }, 'plan:judge:2': { agrees: false }, 'plan:judge:3': { agrees: false } }, 'the judge never agrees'],
     [{ 'plan:review:1': open(1), 'plan:review:2': open(2), 'plan:judge:3': { plan: revised } }, 'a judge revision at the last round'],
-    [{ 'plan:judge:1': { remaining: [{ point: 'acceptance coverage', blocking: true }] }, 'plan:judge:2': { remaining: [{ point: 'acceptance coverage', blocking: true }] },
-      'plan:judge:3': { remaining: [{ point: 'acceptance coverage', blocking: true }] } }, 'a blocking point the judge keeps open'],
+    [{ 'plan:judge:1': { remaining: ['acceptance coverage'] }, 'plan:judge:2': { remaining: ['acceptance coverage'] },
+      'plan:judge:3': { remaining: ['acceptance coverage'] } }, 'a point the judge keeps open'],
     [{ 'plan:combine': { plan: { ...PLAN, remaining: ['which lock'] } }, 'plan:judge:1': { plan: { ...PLAN, remaining: ['which lock'] } },
       'plan:judge:2': { plan: { ...PLAN, remaining: ['which lock'] } }, 'plan:judge:3': { plan: { ...PLAN, remaining: ['which lock'] } } }, 'an open question in the plan'],
     [{ 'plan:judge:1': { plan: revised }, 'plan:judge:2': { plan: { ...revised, scope: [...revised.scope, 'src/tusb_option.h'] } }, 'plan:judge:3': { plan: PLAN } }, 'every round revised'],
@@ -273,9 +274,9 @@ test('a review round agrees only on nothing-left for the exact plan the judge ke
   const early = await run({ 'plan:review:1': open(1), 'plan:judge:1': { agrees: false, continue: false } })
   assert.equal(early.result.reason, 'plan-unresolved', 'the judge may end the exchange early')
   assert.ok(!early.labels.includes('plan:review:2'))
-  const minor = await run({ 'plan:judge:1': { remaining: [{ point: 'naming', blocking: false }] } })
+  const minor = await run({ 'plan:judge:1': { remaining: ['naming'] } })
   assert.equal(minor.result.pass, true, minor.result.reason)
-  assert.deepEqual(minor.labels.slice(PLANNED.length, -2), ['plan:review:2', 'plan:judge:2'], 'even a nonblocking point goes back to Codex')
+  assert.deepEqual(minor.labels.slice(PLANNED.length, -2), ['plan:review:2', 'plan:judge:2'], 'even a minor point goes back to Codex')
   assert.match(minor.calls.find(c => c.label === 'plan:review:2').prompt, /Still open:\n.*naming/)
   assert.deepEqual(minor.result.coplan.remaining, [])
   const hw = { ...PLAN, status: 'hardware-triage', blocker: 'reproduce the SQCLR stall first' }
@@ -284,6 +285,14 @@ test('a review round agrees only on nothing-left for the exact plan the judge ke
   assert.equal(hardware.result.coplan.status, 'hardware-triage')
   assert.match(hardware.result.next, /hw-debugger/)
   assert.ok(!hardware.labels.includes('plan:review:2'))
+  // A -> B -> unchanged B: round 2 sends B in full, round 3 refers to round 2, never to round 1
+  const shorthand = await run({ 'plan:review:1': open(1), 'plan:judge:1': { plan: revised }, 'plan:review:2': open(2), 'plan:judge:2': { plan: revised }, 'plan:judge:3': { plan: revised } })
+  const prompts = [1, 2, 3].map(n => shorthand.calls.find(c => c.label === `plan:review:${n}`).prompt)
+  assert.match(prompts[0], /The plan:\n/)
+  assert.match(prompts[1], /Add the CMake target/)
+  assert.match(prompts[2], /unchanged from the one sent in round 2/)
+  assert.ok(prompts.every(t => !t.includes('Treat the target')), 'the lane already has the brief from its draft turn')
+  assert.equal(shorthand.result.pass, true, shorthand.result.reason)
   const invalid = await run({ 'plan:review:1': relay(`codex-${LANE}-r1`, 'REVIEW: maybe\n') })
   assert.equal(invalid.result.reason, 'coplan-unavailable', 'an unknown review marker')
   assert.ok(!invalid.labels.includes('plan:judge:1'))
@@ -313,6 +322,8 @@ test('the agreed plan\'s own status, emptiness or reach stops before any writer'
     [{ scope: ['src/../../outside/'], steps: [{ id: 's1', change: 'x', paths: ['src/../../outside/file.c'], check: '' }] }, 'plan-invalid', { target: '28', batch: true, scope: ['src/'] }],
     [{ steps: [{ id: 's1', change: 'x', paths: ['/etc/passwd'], check: '' }] }, 'plan-invalid'],
     [{ scope: ['./src/osal/'], steps: [{ id: 's1', change: 'x', paths: ['./src/osal/a.c'], check: '' }] }, 'plan-invalid'],
+    [{ scope: ['src//osal/'], steps: [{ id: 's1', change: 'x', paths: ['src//osal/a.c'], check: '' }] }, 'plan-invalid'],
+    [{ steps: [{ id: 's1', change: 'x', paths: [], check: '' }] }, 'plan-invalid'],
   ]) {
     const { result, labels } = await run({ 'plan:judge:1': { plan: { ...PLAN, ...plan } }, 'plan:combine': { plan: { ...PLAN, ...plan } }, ...(args ? { args } : {}) })
     assert.equal(result.reason, reason, JSON.stringify(plan))
@@ -326,7 +337,7 @@ test('the agreed plan\'s own status, emptiness or reach stops before any writer'
   }
   const widened = await run({ 'plan:combine': { plan: { ...PLAN, scope: [...PLAN.scope, 'src/common/'] } }, 'plan:judge:1': { plan: { ...PLAN, scope: [...PLAN.scope, 'src/common/'] } } })
   assert.equal(widened.result.pass, true, 'widening within the target\'s task is the plan\'s to make')
-  assert.equal(widened.result.coplan.scopeWidened, true)
+  assert.ok(widened.logs.some(l => l.includes('(widened)')), 'the co-plan row says the scope widened')
   assert.match(widened.calls.find(c => c.label === 'verify').prompt, /src\/common\//, 'verify checks the plan\'s scope')
 })
 
@@ -343,14 +354,16 @@ test('without batch the run stops once the plan is agreed', async () => {
 test('the coplan result keeps every exchange with its request id, one log line each', async () => {
   const { result, logs } = await run()
   const { coplan } = result
-  assert.deepEqual(coplan.exchanges.map(e => e.label), ['plan:codex', 'plan:review:1'])
-  assert.deepEqual(coplan.requestIds, coplan.exchanges.map(e => e.relay.requestId))
-  assert.ok(coplan.exchanges.every(e => e.task && e.valid && e.relay.stdout && e.relay.stderr.startsWith('cowork result ')), 'the raw relay is kept')
-  assert.deepEqual(coplan.exchanges.map(e => e.marker), ['PLAN: draft', 'REVIEW: nothing-left'])
+  assert.deepEqual(coplan.exchanges.map(e => e.label), ['plan:status', 'plan:codex', 'plan:review:1'])
+  assert.deepEqual(coplan.exchanges[0].relay, STATUS, 'the status listing is kept whole')
+  const delivered = coplan.exchanges.slice(1)
+  assert.deepEqual(delivered.map(e => e.marker), ['PLAN: draft', 'REVIEW: nothing-left'])
+  assert.ok(delivered.every(e => e.receipt.startsWith(`cowork result ${e.requestId} `) && !('task' in e) && !('relay' in e)),
+    'a delivered turn is kept by the CLI, so the result names it by id and receipt')
   assert.equal(coplan.rounds, 1)
   assert.deepEqual(coplan.decisions, COMBINED.decisions)
   assert.deepEqual(coplan.remaining, [])
-  for (const e of coplan.exchanges) assert.ok(logs.some(l => l.includes(e.relay.requestId) && l.includes(e.label)), e.label)
+  for (const e of delivered) assert.ok(logs.some(l => l.includes(e.requestId) && l.includes(e.label)), e.label)
 })
 
 // --- implement and verify -------------------------------------------------------
