@@ -1,6 +1,7 @@
 ---
 name: simplify-gate
 description: Show, switch on or switch off agentrc's simplify gate (the Codex YAGNI challenge that runs when a Claude Code session stops) for the current repository and all of its worktrees. `status` prints the state with the effective model and effort, `on` takes `--model`/`--effort` overrides, bare `/simplify-gate` or `help` prints the usage.
+disable-model-invocation: true
 ---
 
 # simplify-gate
