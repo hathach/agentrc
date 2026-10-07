@@ -1,6 +1,6 @@
 ---
 name: usb-sniffer
-description: Use when you need wire-level USB evidence that host-side capture cannot give: a device that never enumerates, usbmon showing only Submits, NAK storms, STALL, babble, bus-reset or enumeration timing, or a link with no Linux host (an MCU host, a gadget peer). LS/FS/HS packets into pcapng with the ataradov usb-sniffer.
+description: "Use when you need wire-level USB evidence that host-side capture cannot give: a device that never enumerates, usbmon showing only Submits, NAK storms, STALL, babble, bus-reset or enumeration timing, or a link with no Linux host (an MCU host, a gadget peer). LS/FS/HS packets into pcapng with the ataradov usb-sniffer."
 ---
 
 # usb-sniffer — wire-level capture with the ataradov hardware analyzer

@@ -217,5 +217,15 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('one status line, its first line', body)
 
 
+class SkillFiles(unittest.TestCase):
+    def test_every_skill_frontmatter_parses_and_names_its_directory(self):
+        """Claude Code reads frontmatter as YAML: a parse error silently drops its fields."""
+        for skill in sorted(p.parent for p in SKILLS.glob('*/SKILL.md')):
+            with self.subTest(skill.name):
+                meta = yaml.safe_load(skill.joinpath('SKILL.md').read_text().split('---')[1])
+                self.assertEqual(meta['name'], skill.name)
+                self.assertIsInstance(meta['description'], str)
+
+
 if __name__ == '__main__':
     unittest.main()

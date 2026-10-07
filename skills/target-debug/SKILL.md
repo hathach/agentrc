@@ -1,6 +1,6 @@
 ---
 name: target-debug
-description: Use when firmware misbehaves on real hardware and the firmware's own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Target-side evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO.
+description: "Use when firmware misbehaves on real hardware and the firmware's own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Target-side evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO."
 ---
 
 # target-debug — target-side capture & debugging over a debug probe
