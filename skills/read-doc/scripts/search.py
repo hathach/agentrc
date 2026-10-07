@@ -19,6 +19,7 @@ Each lookup, here and in locate.py find, is appended to HISTORY and named on
 stderr by its id; history.py lists and shows them. READ_DOC_HISTORY=0 skips it.
 """
 import argparse
+import collections
 import contextlib
 import fcntl
 import glob
@@ -127,6 +128,11 @@ def norm(s):
 def tag_list(tags):
     """Calibre joins tags with ', '; normalize each for whole-tag comparison."""
     return [re.sub(r"[-_\s]+", " ", norm(t)).strip() for t in (tags or "").split(", ") if t.strip()]
+
+
+def kind_summary(counts):
+    """'2 datasheet, 1 errata': each kind's count, in KINDS order."""
+    return ", ".join(f"{n} {k}" for k, n in sorted(counts.items(), key=lambda c: KINDS.index(c[0])))
 
 
 def kind_of(title, tags):
@@ -248,7 +254,7 @@ def run(args):
     with contextlib.closing(sqlite3.connect("file:" + urllib.parse.quote(DB) + "?mode=ro",
                                             uri=True)) as db:
         rows = db.execute(QUERY).fetchall()
-    hits = []
+    hits, other_kinds = [], collections.Counter()
     for bid, title, path, authors, tags, series, publisher, comments, files in rows:
         entries = [e.split("/", 1) for e in (files or "").split("\n") if e]
         hay = norm(" ".join(x for x in (title, authors, tags, series, publisher, comments) if x)
@@ -259,22 +265,21 @@ def run(args):
             continue
         kind = kind_of(title, tags)
         if args.kind and kind != args.kind:
+            other_kinds[kind] += 1
             continue
         in_title = sum(contains(norm(title), k) for k in keywords)
         family = any(k not in hay for k in matched)
         hits.append((KINDS.index(kind), -found, -in_title, title, kind, bid, tags, path, entries, family))
 
     if not hits:
-        print("no match")
+        # A part's base document is not always the kind asked for (NXP files many as user manuals).
+        print(f"no {args.kind}; without --kind: {kind_summary(other_kinds)}" if other_kinds else "no match")
         return 1, {"db_mtime_ns": db_mtime_ns, "total": 0, "kinds": {}, "books": []}
 
     hits.sort(key=lambda h: h[:4])  # tags/path are not comparable across rows
-    counts = {}
-    for h in hits:
-        counts[h[4]] = counts.get(h[4], 0) + 1
+    counts = dict(collections.Counter(h[4] for h in hits))
     shown = hits if args.limit == 0 else hits[:args.limit]
-    print(f"{len(hits)} book(s): " + ", ".join(f"{n} {k}" for k, n in
-                                               sorted(counts.items(), key=lambda c: KINDS.index(c[0]))))
+    print(f"{len(hits)} book(s): {kind_summary(counts)}")
     if len(shown) < len(hits):
         print(f"showing {len(shown)}; --limit N for more, --kind K to filter, or add a keyword")
     for _, _, _, title, kind, bid, tags, path, entries, family in shown:
@@ -294,7 +299,7 @@ def run(args):
 def main(argv):
     """Exit 3 covers the whole run, not just the query: --path walks the
     library tree, and a half-synced one must not read as "nothing matched"."""
-    args = parser().parse_args(argv)
+    args = parser().parse_intermixed_args(argv)
     started, error, result = time.monotonic(), None, None
     try:
         code, result = run(args)

@@ -64,7 +64,7 @@ is answered from, ahead of the errata and application notes:
 ```bash
 python3 <skill dir>/scripts/search.py errata RT1064            # AND (default)
 python3 <skill dir>/scripts/search.py RT1060 RT1064 --any
-python3 <skill dir>/scripts/search.py --kind reference-manual stm32h7
+python3 <skill dir>/scripts/search.py --kind reference-manual stm32h7  # none of that kind: names the kinds found
 ```
 
 Both scripts use one exit-code contract: 0 a result, 1 searched and found

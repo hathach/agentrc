@@ -517,6 +517,14 @@ class Search(unittest.TestCase):
         self.assertEqual(self.ids(out), ['3'])
         self.assertEqual(self.run_search('stm32h7', 'stm32f4')[0], 1, 'AND finds neither')
         self.assertEqual(self.run_search('stm32h7', 'stm32f4', '--any')[0], 0)
+        self.assertEqual(self.run_search('stm32h7', '--any', 'stm32f4')[0], 0, 'an option between keywords')
+
+    def test_a_kind_that_filters_out_every_match_names_the_kinds_that_matched(self):
+        # LPC parts file their base document as a user manual, not a reference manual.
+        code, out = self.run_search('--kind', 'reference-manual', 'lpc17xx')
+        self.assertEqual(code, 1)
+        self.assertEqual(out.strip(), 'no reference-manual; without --kind: 1 user-manual')
+        self.assertEqual(self.run_search('--kind', 'errata', 'nonesuch')[1].strip(), 'no match')
 
     def test_a_member_part_number_finds_the_document_filed_under_its_family(self):
         # Microchip files the USB2514B datasheet as USB251xB; an exact-part
