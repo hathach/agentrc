@@ -26,6 +26,35 @@ itself. Native probes (ST-Link/CMSIS-DAP) are
 not covered by the script yet: repeat `mdw 0xE000101C` over OpenOCD's telnet
 :4444 by hand.
 
+## Probe state — DHCSR anchor, PCSR samples, image read-back
+
+One JSON object of what the probe sees on a Cortex-M board, with the board lock
+already held (the script takes none): CPUID, DHCSR before and after, DEMCR, N
+`DWT_PCSR` samples, and with `--verify` the image's address ranges read back and
+compared on the host:
+
+```bash
+python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [--interface swd --speed 4000] \
+  [--samples N] [--interval-ms M] [--allow-halt] [--verify <flashed.elf> | --verify <fw.bin> --base <flash addr>]
+#   exit 0 observed, 1 verify mismatch, 2 usage, 3 probe/tool failed or core not M-profile
+```
+
+- It writes nothing to the target and halts only with `--allow-halt`, when no
+  sample was usable from a running core. `--verify` reads memory back (J-Link
+  `savebin`, OpenOCD `dump_image`) rather than run `verify_image`, whose
+  checksum path writes its CRC loader into the target's work area first
+  (`armv7m_checksum_memory`), even on a running core.
+- `pcsr.status`: `sampled`; `no-address` (only 0xFFFFFFFF or 0: halted, address
+  unavailable, or non-invasive debug not permitted); `not-implemented` (all 0:
+  RAZ, a core built without PCSR); `dwt-disabled` (DEMCR bit 24 clear: the
+  values are UNKNOWN, Armv8-M returns 0xFFFFFFFF). M0/M0+ have PCSR only when
+  the DWT is configured in (RP2040's is).
+- Every DHCSR read clears S_RESET_ST, the tool's own connect included: the
+  `dhcsrBefore` bit covers only this session's connect, `dhcsrAfter` the
+  sampling window.
+- A read-back of RP2040 flash while the core sits in `get_bootsel_button`
+  returns zeroes: check the project note before calling a mismatch real there.
+
 ## RAM ring-buffer trace
 
 The zero-print instrument: a small event ring in the

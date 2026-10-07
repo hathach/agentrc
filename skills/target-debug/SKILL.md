@@ -51,7 +51,8 @@ directly (`--hil-config <file> --board <name>`; a flag given as well must agree)
 
 A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and
 `--speed` stay explicit; on the OpenOCD route they live inside `--cfg` and the two
-flags are refused. `pc_sample.py` takes J-Link entries only. `etm_capture.py` does not read it — a J-Trace is one probe moved
+flags are refused. `pc_sample.py` takes J-Link entries only; `probe_state.py` reads only
+the HIL config and takes `jlink` and `openocd` entries. `etm_capture.py` does not read it — a J-Trace is one probe moved
 between boards, named with `--probe`.
 
 ## Delegated sessions
@@ -188,6 +189,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
 
 - PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py`, reading the
   histogram, native probes by hand.
+- Probe-state snapshot (DHCSR anchor, PCSR samples, image read-back for
+  Cleanup's verification): `techniques.md`, "Probe state" — `probe_state.py`.
 - SWO exception trace, hardware PC-sampling, DWT data trace: `swo-dwt.md`.
 - Vector catch and the fault registers: `fault-autopsy.md`.
 - RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code,

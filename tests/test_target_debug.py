@@ -2,8 +2,14 @@
 a fake JLinkExe on PATH (prompt-prefixed output like the real tool) are
 histogrammed by function through a fake symbolizer; an incomplete capture, a
 missing or broken tool, and a symbolizer answering the wrong number of lines
-are explicit failures, never a partial result passed off as a profile."""
+are explicit failures, never a partial result passed off as a profile.
+
+probe_state.py through fake JLinkExe and openocd: the plumbing only; its hardware
+behaviour is verified on a rig board."""
 import importlib.util
+import hashlib
+import json
+import struct
 import os
 import stat
 import subprocess
@@ -245,6 +251,365 @@ class CliTest(unittest.TestCase):
         r = subprocess.run([sys.executable, str(SCRIPT), '--help'], capture_output=True, text=True, timeout=30, cwd='/')
         self.assertEqual(r.returncode, 0)
         self.assertIn('--interval-ms', r.stdout)
+
+
+
+PROBE_STATE = SCRIPT.parent / 'probe_state.py'
+_spec = importlib.util.spec_from_file_location('probe_state', PROBE_STATE)
+probe_state = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(probe_state)
+
+# Shared by both fakes: FAKE_<REG> answers each read of that register, a comma list
+# consumed in order with the last value repeated; FAKE_MEM/FAKE_MEM_BASE is the flash
+# the read-back sees; FAKE_LOG records argv and the script; FAKE_MODE=truncate stops
+# answering after the CPUID read, =fail exits 1; FAKE_HALT_DHCSR answers DHCSR in a
+# J-Link halt-read session; FAKE_REPLACE names a file the read-back overwrites.
+FAKE_COMMON = """
+import json, os, sys
+regs = {k: os.environ.get('FAKE_' + k, d).split(',') for k, d in
+        (('CPUID', '410fc241'), ('DHCSR', '01010001'), ('DEMCR', '01000000'), ('PCSR', '08001000'), ('PC', '08004444'))}
+seen = {}
+def value(reg):
+    n = seen.get(reg, 0); seen[reg] = n + 1
+    vals = regs[reg]
+    return int(vals[min(n, len(vals) - 1)], 16)
+def dump(path, addr, size):
+    mem = open(os.environ['FAKE_MEM'], 'rb').read() if os.environ.get('FAKE_MEM') else b''
+    off = addr - int(os.environ.get('FAKE_MEM_BASE', '0'), 16)
+    open(path, 'wb').write(mem[off:off + size])
+    if os.environ.get('FAKE_REPLACE'):
+        open(os.environ['FAKE_REPLACE'], 'wb').write(b'replaced while the probe read back')
+mode = os.environ.get('FAKE_MODE', '')
+"""
+
+FAKE_JLINK_STATE = '#!/usr/bin/env python3' + FAKE_COMMON + """
+import re
+script = sys.stdin.read()
+open(os.environ['FAKE_LOG'], 'w').write(json.dumps({'argv': sys.argv[1:], 'script': script}))
+if '\\nh\\n' in script and os.environ.get('FAKE_HALT_DHCSR'):
+    regs['DHCSR'] = os.environ['FAKE_HALT_DHCSR'].split(',')
+names = {'E000ED00': 'CPUID', 'E000EDF0': 'DHCSR', 'E000EDFC': 'DEMCR', 'E000101C': 'PCSR'}
+print('SEGGER J-Link Commander V9.78 (Compiled fake)')
+for line in script.splitlines():
+    m = re.match(r'mem32 ([0-9A-F]{8}), 1', line)
+    if m:
+        print(f'J-Link>{m.group(1)} = {value(names[m.group(1)]):08X}')
+        if mode == 'truncate':
+            break
+    m = re.match(r'savebin (\\S+), 0x([0-9A-F]+), 0x([0-9A-F]+)', line)
+    if m:
+        dump(m.group(1), int(m.group(2), 16), int(m.group(3), 16))
+    if line == 'h':
+        print(f'PC = {value("PC"):08X}, CycleCnt = 00000000')
+sys.exit(1 if mode == 'fail' else 0)
+"""
+
+FAKE_OPENOCD_STATE = '#!/usr/bin/env python3' + FAKE_COMMON + """
+import re
+script = sys.argv[-1]
+open(os.environ['FAKE_LOG'], 'w').write(json.dumps({'argv': sys.argv[1:], 'script': script}))
+for line in script.splitlines():
+    m = re.match(r'\\s*(?:rd |echo \\[format "R )(\\w+) ', line)
+    if m:
+        print(f'R {m.group(1)} 0x{value(m.group(1)):08x}', file=sys.stderr)
+        if mode == 'truncate':
+            break
+    m = re.match(r'dump_image \\{(\\S+)\\} 0x([0-9a-f]+) 0x([0-9a-f]+)', line)
+    if m:
+        dump(m.group(1), int(m.group(2), 16), int(m.group(3), 16))
+if mode == 'tclerror':
+    print('ERROR read_memory: failed to read memory', file=sys.stderr)
+sys.exit(1 if mode == 'fail' else 0)
+"""
+
+STATE_BOARDS = [
+    {'name': 'k64f', 'flasher': {'name': 'jlink', 'uid': '000621000000', 'args': '-device MK64FN1M0xxx12'}},
+    {'name': 'max32', 'flasher': {'name': 'openocd', 'uid': 'E6614C311B597D32', 'vid_pid': '0x2e8a 0x000c',
+                                  'args': '-f interface/cmsis-dap.cfg -f target/max32665.cfg'}},
+    {'name': 'h743', 'flasher': {'name': 'stlink', 'uid': '004C00343137510F39383538'}},
+    {'name': 'p4', 'flasher': {'name': 'esptool', 'uid': '4ea4f48f', 'args': '-b 1500000'}},
+    {'name': 'no_uid', 'flasher': {'name': 'jlink', 'args': '-device X'}},
+    {'name': 'no_dev', 'flasher': {'name': 'jlink', 'uid': '1'}},
+    {'name': 'no_cfg', 'flasher': {'name': 'openocd', 'uid': '1'}},
+    {'name': 'bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c', 'args': '-f x.cfg'}},
+    {'name': 'twin', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'}},
+    {'name': 'twin', 'flasher': {'name': 'jlink', 'uid': '2', 'args': '-device X'}},
+]
+
+
+def elf32(segments):
+    """A minimal little-endian ELF32 with one PT_LOAD per (paddr, bytes, filesz-or-None)."""
+    phoff, phentsize = 52, 32
+    data_off = phoff + phentsize * len(segments)
+    header = bytearray(b'\x7fELF\x01\x01\x01' + bytes(9))
+    header += struct.pack('<HHIIIIIHHHHHH', 2, 40, 1, 0, phoff, 0, 0, 52, phentsize, len(segments), 0, 0, 0)
+    phdrs, blobs = b'', b''
+    for paddr, blob in segments:
+        phdrs += struct.pack('<8I', 1, data_off + len(blobs), paddr | 0x1000_0000, paddr, len(blob), len(blob), 5, 4)
+        blobs += blob
+    return bytes(header) + phdrs + blobs
+
+
+class ProbeStateUnitTest(unittest.TestCase):
+    def test_dhcsr_bits(self):
+        self.assertEqual(probe_state.dhcsr_state(0x03030003),
+                         {'raw': '0x03030003', 'halted': True, 'sleeping': False, 'lockup': False,
+                          'retiredSinceLastRead': True, 'resetSinceLastRead': True})
+        self.assertTrue(probe_state.dhcsr_state(1 << 18)['sleeping'])
+        self.assertTrue(probe_state.dhcsr_state(1 << 19)['lockup'])
+
+    def test_cpuid_architecture(self):
+        self.assertEqual(probe_state.cpuid_state(0x410CC601)['architecture'], 'armv6-m or armv8-m baseline')
+        self.assertEqual(probe_state.cpuid_state(0x410FC241)['partno'], '0xc24')
+        self.assertTrue(probe_state.cpuid_state(0x00000000)['architecture'].startswith('not M-profile'))
+
+    def test_pcsr_classes(self):
+        on = probe_state.DEMCR_TRCENA
+        self.assertEqual(probe_state.pcsr_summary([0x0800_1000] * 3, 0)['status'], 'dwt-disabled')
+        self.assertEqual(probe_state.pcsr_summary([0, 0], on)['status'], 'not-implemented')
+        self.assertEqual(probe_state.pcsr_summary([0xFFFFFFFF, 0], on)['status'], 'no-address')
+        s = probe_state.pcsr_summary([0x10, 0x10, 0xFFFFFFFF, 0, 0x20], on)
+        self.assertEqual((s['status'], s['usable'], s['sentinel'], s['zero']), ('sampled', 3, 1, 1))
+        self.assertEqual(list(s['pcs'].items()), [('0x00000010', 2), ('0x00000020', 1)])
+
+    def test_image_segments(self):
+        with tempfile.TemporaryDirectory() as d:
+            elf = Path(d) / 'fw.elf'
+            elf.write_bytes(elf32([(0x0800_0000, b'abcd'), (0x0800_0100, b'')]))
+            segs, digest = probe_state.image_segments(str(elf), None)
+            self.assertEqual(segs, [(0x0800_0000, b'abcd')])
+            self.assertEqual(digest, hashlib.sha256(elf.read_bytes()).hexdigest())
+            with self.assertRaisesRegex(ValueError, 'ELF carries its own load addresses'):
+                probe_state.image_segments(str(elf), 0x0800_0000)
+            raw = Path(d) / 'fw.bin'
+            raw.write_bytes(b'xyz')
+            self.assertEqual(probe_state.image_segments(str(raw), 0x100)[0], [(0x100, b'xyz')])
+            with self.assertRaisesRegex(ValueError, 'give --base'):
+                probe_state.image_segments(str(raw), None)
+
+    def test_a_malformed_elf_is_refused_not_compared_in_part(self):
+        good = elf32([(0x0800_0000, b'abcd')])
+        cases = [(good[:-2], 'segment 0 at 0x08000000 ends past the end of the file'),
+                 (good[:60], 'program header table ends past the end of the file'),
+                 (good[:40], 'shorter than an ELF32 header'),
+                 (good[:42] + struct.pack('<H', 16) + good[44:], 'entries of 16 bytes')]
+        with tempfile.TemporaryDirectory() as d:
+            elf = Path(d) / 'fw.elf'
+            for data, want in cases:
+                elf.write_bytes(data)
+                with self.assertRaisesRegex(ValueError, want):
+                    probe_state.image_segments(str(elf), None)
+
+
+try:
+    import tkinter
+    _TCL = tkinter.Tcl
+except ImportError:
+    _TCL = None
+
+# OpenOCD's commands as Tcl stubs: calls are logged, echo collects output.
+OPENOCD_TCL_STUBS = '''
+set calls {}; set out {}
+proc init {} {}; proc shutdown {} {lappend ::calls shutdown}
+proc echo {s} {lappend ::out $s}
+proc read_memory {a w n} {return 0x01010001}
+proc target {cmd} {return tgt}
+proc tgt {cmd} {return $::state}
+proc halt {} {lappend ::calls halt}
+proc resume {} {lappend ::calls resume}
+proc get_reg {r} {
+  if {$::pcfail} {error "failed to read pc"}
+  return [dict create pc 0x0800abcd]
+}
+'''
+
+
+@unittest.skipIf(_TCL is None, 'needs a Tcl interpreter (tkinter)')
+class ProbeStateHaltReadTclTest(unittest.TestCase):
+    def run_tcl(self, state, pcfail):
+        tcl = _TCL()
+        tcl.eval(OPENOCD_TCL_STUBS)
+        tcl.eval(f'set state {state}; set pcfail {int(pcfail)}')
+        tcl.eval(probe_state.OpenOCD.script(probe_state.OpenOCD.HALT_READ))
+        return tcl.splitlist(tcl.eval('set calls')), list(tcl.splitlist(tcl.eval('set out')))
+
+    def test_a_failed_pc_read_still_resumes_the_core_it_halted(self):
+        calls, out = self.run_tcl('running', pcfail=True)
+        self.assertEqual(calls, ('halt', 'resume', 'shutdown'))
+        self.assertEqual(out[-2], 'R DHCSR 0x01010001')
+        self.assertTrue(out[-1].startswith('ERROR halt/pc read: failed to read pc; found running, '
+                                           'DHCSR after 0x01010001'), out[-1])
+        self.assertFalse(any(o.startswith('R PC') for o in out))
+
+    def test_success_and_a_halted_core(self):
+        calls, out = self.run_tcl('running', pcfail=False)
+        self.assertEqual(calls, ('halt', 'resume', 'shutdown'))
+        self.assertEqual(out, ['R DHCSR 0x01010001', 'R PC 0x0800abcd', 'R DHCSR 0x01010001'])
+        calls, out = self.run_tcl('halted', pcfail=True)
+        self.assertEqual(calls, ('shutdown',))
+        self.assertIn('found halted', out[-1])
+
+
+@unittest.skipIf(os.name == 'nt', 'JLinkExe and openocd stubs require POSIX executable semantics')
+class ProbeStateCliTest(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.d = Path(self._dir.name)
+        for name, body in (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE)):
+            f = self.d / name
+            f.write_text(body)
+            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        self.config = self.d / 'hil.json'
+        self.config.write_text(json.dumps({'boards': STATE_BOARDS}))
+        self.log = self.d / 'log.json'
+        self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log)}
+
+    def run_cli(self, board, *args, **env):
+        r = subprocess.run([sys.executable, str(PROBE_STATE), '--hil-config', str(self.config), '--board', board,
+                            *args], capture_output=True, text=True, timeout=30, env={**self.env, **env}, cwd='/')
+        out = json.loads(r.stdout) if r.stdout.strip() else None
+        return r.returncode, out, r.stderr
+
+    def logged(self):
+        return json.loads(self.log.read_text())
+
+    def test_jlink_observation(self):
+        rc, out, err = self.run_cli('k64f', *LINK, '--samples', '4', '--interval-ms', '3',
+                                    FAKE_PCSR='08001000,08001000,FFFFFFFF,08002000',
+                                    FAKE_DHCSR='01010001,03010001')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((out['backend'], out['probe'], out['device']), ('jlink', '000621000000', 'MK64FN1M0xxx12'))
+        self.assertEqual(out['cpuid']['architecture'], 'armv7-m or armv8-m mainline')
+        self.assertFalse(out['dhcsrBefore']['halted'])
+        self.assertTrue(out['dhcsrAfter']['resetSinceLastRead'])
+        self.assertEqual(out['pcsr'], {'samples': 4, 'status': 'sampled', 'usable': 3, 'sentinel': 1, 'zero': 0,
+                                       'pcs': {'0x08001000': 2, '0x08002000': 1}})
+        self.assertNotIn('verify', out)
+        log = self.logged()
+        self.assertEqual(log['argv'][:4], ['-device', 'MK64FN1M0xxx12', '-SelectEmuBySN', '000621000000'])
+        self.assertIn('-if swd -speed 4000', ' '.join(log['argv']))
+        self.assertEqual(log['script'].count('Sleep 3'), 4)
+        self.assertNotRegex(log['script'], r'(?m)^(h|g|r|w\w*|savebin.*)$')   # no halt, no write
+
+    def test_jlink_verify_match_and_mismatch(self):
+        mem = self.d / 'flash.bin'
+        mem.write_bytes(bytes(range(256)) * 4)
+        elf = self.d / 'fw.elf'
+        elf.write_bytes(elf32([(0x0000_0010, bytes(range(16, 48))), (0x0000_0100, bytes(range(16)))]))
+        rc, out, err = self.run_cli('k64f', *LINK, '--verify', str(elf), FAKE_MEM=str(mem), FAKE_MEM_BASE='0')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['verify']['result'], 'match')
+        self.assertEqual([s['address'] for s in out['verify']['segments']], ['0x00000010', '0x00000100'])
+        self.assertIn('savebin ', self.logged()['script'])
+        self.assertEqual(out['verify']['dhcsrAfter']['raw'], '0x01010001')
+        elf.write_bytes(elf32([(0x0000_0010, bytes(range(16, 40)) + b'XX' + bytes(range(42, 48)))]))
+        rc, out, err = self.run_cli('k64f', *LINK, '--verify', str(elf), FAKE_MEM=str(mem), FAKE_MEM_BASE='0')
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(out['verify']['result'], 'mismatch')
+        self.assertEqual(out['verify']['segments'][0]['firstDiff'], '0x00000028')
+
+    def test_digest_is_of_the_bytes_compared(self):
+        mem = self.d / 'flash.bin'
+        mem.write_bytes(b'firmware')
+        raw = self.d / 'fw.bin'
+        raw.write_bytes(b'firmware')
+        want = hashlib.sha256(b'firmware').hexdigest()
+        rc, out, err = self.run_cli('k64f', *LINK, '--verify', str(raw), '--base', '0x0', FAKE_MEM=str(mem),
+                                    FAKE_REPLACE=str(raw))
+        self.assertEqual(rc, 0, err)
+        self.assertNotEqual(raw.read_bytes(), b'firmware')    # the fake did replace it mid-run
+        self.assertEqual(out['verify']['sha256'], want)
+
+    def test_a_truncated_elf_never_reaches_the_probe(self):
+        elf = self.d / 'fw.elf'
+        elf.write_bytes(elf32([(0x0, b'abcd')])[:-2])
+        rc, out, err = self.run_cli('k64f', *LINK, '--verify', str(elf))
+        self.assertEqual(rc, 2)
+        self.assertIn('ends past the end of the file', err)
+        self.assertFalse(self.log.exists())
+
+    def test_openocd_observation_and_raw_verify(self):
+        mem = self.d / 'flash.bin'
+        mem.write_bytes(b'\x00' * 16 + b'firmware')
+        raw = self.d / 'fw.bin'
+        raw.write_bytes(b'firmware')
+        rc, out, err = self.run_cli('max32', '--samples', '2', '--verify', str(raw), '--base', '0x10000010',
+                                    FAKE_PCSR='0', FAKE_MEM=str(mem), FAKE_MEM_BASE='10000000')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((out['backend'], out['cfg']), ('openocd', '-f interface/cmsis-dap.cfg -f target/max32665.cfg'))
+        self.assertEqual(out['pcsr'], {'samples': 2, 'status': 'not-implemented'})
+        self.assertEqual(out['verify']['result'], 'match')
+        self.assertFalse(out['resetDetected'])
+        argv = self.logged()['argv']
+        self.assertIn('adapter serial E6614C311B597D32', argv)
+        self.assertIn('adapter usb vid_pid 0x2e8a 0x000c', argv)
+        self.assertEqual(argv[argv.index('-f'):argv.index('-f') + 4],
+                         ['-f', 'interface/cmsis-dap.cfg', '-f', 'target/max32665.cfg'])
+        self.assertNotRegex(self.logged()['script'], r'\b(halt|resume|reset|write_memory|mww|program)\b')
+
+    def test_dwt_disabled_samples_are_not_reported_as_pcs(self):
+        rc, out, err = self.run_cli('max32', FAKE_DEMCR='00000000', FAKE_PCSR='FFFFFFFF')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['pcsr']['status'], 'dwt-disabled')
+        self.assertFalse(out['demcr']['dwtEnabled'])
+
+    def test_halt_read_only_when_allowed_and_needed(self):
+        rc, out, err = self.run_cli('max32', FAKE_PCSR='0')
+        self.assertNotIn('haltRead', out)
+        rc, out, err = self.run_cli('max32', '--allow-halt', FAKE_PCSR='08001000')
+        self.assertEqual(out['haltRead'], {'performed': False, 'reason': 'PCSR sampled'})
+        rc, out, err = self.run_cli('max32', '--allow-halt', FAKE_PCSR='0', FAKE_DHCSR='01030003')
+        self.assertEqual(out['haltRead'], {'performed': False, 'reason': 'core halted'})
+        rc, out, err = self.run_cli('max32', '--allow-halt', FAKE_PCSR='0', FAKE_PC='0800abcd')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((out['haltRead']['pc'], out['haltRead']['resumed']), ('0x0800abcd', True))
+        self.assertIn('if {$was eq "running"} {resume}', self.logged()['script'])
+        rc, out, err = self.run_cli('k64f', *LINK, '--allow-halt', FAKE_PCSR='FFFFFFFF', FAKE_PC='0000abc0')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['haltRead']['pc'], '0x0000abc0')
+        self.assertEqual(self.logged()['script'].splitlines()[1:3], ['h', 'g'])
+        rc, out, err = self.run_cli('k64f', *LINK, '--allow-halt', FAKE_PCSR='FFFFFFFF',
+                                    FAKE_HALT_DHCSR='01010001,01030003')
+        self.assertEqual(rc, 3)
+        self.assertIn('left a core it found running halted', out['error'])
+
+    def test_a_core_that_is_not_m_profile_is_not_interpreted(self):
+        rc, out, err = self.run_cli('max32', FAKE_CPUID='00000000')
+        self.assertEqual(rc, 3)
+        self.assertIn('M-profile', out['error'])
+        self.assertNotIn('dhcsrBefore', out)
+
+    def test_tool_failures_exit_3(self):
+        for board, args in (('k64f', LINK), ('max32', ())):
+            for mode, want in (('truncate', 'incomplete capture'), ('fail', 'exited 1')):
+                rc, out, err = self.run_cli(board, *args, FAKE_MODE=mode)
+                self.assertEqual(rc, 3, (board, mode))
+                self.assertIn(want, out['error'], (board, mode))
+        rc, out, err = self.run_cli('max32', FAKE_MODE='tclerror')
+        self.assertEqual(rc, 3)
+        self.assertIn('read_memory: failed', out['error'])
+        rc, out, err = self.run_cli('k64f', *LINK, PATH='/nonexistent')
+        self.assertEqual(rc, 3)
+        self.assertIn('JLinkExe not found', out['error'])
+
+    def test_refusals_launch_nothing(self):
+        bin_ = self.d / 'fw.bin'
+        bin_.write_bytes(b'x')
+        cases = [('p4', (), 'no debug-probe route'), ('h743', (), 'stlink'), ('no_uid', LINK, 'no flasher.uid'),
+                 ('no_dev', LINK, "-device NAME"), ('no_cfg', (), 'needs flasher.args'),
+                 ('bad_ids', (), '0xVVVV 0xPPPP'), ('twin', LINK, '2 entries'), ('absent', LINK, '0 entries'),
+                 ('k64f', (), 'needs --interface and --speed'), ('k64f', ('--interface', 'swd', '--speed', 'fast'),
+                                                                  '--speed must be kHz'),
+                 ('max32', ('--speed', '4000'), 'J-Link only'), ('max32', ('--base', '0x0'), 'goes with --verify'),
+                 ('max32', ('--verify', str(bin_)), 'give --base'),
+                 ('max32', ('--verify', str(bin_), '--base', 'flash'), 'not an address'),
+                 ('max32', ('--samples', '0'), '--samples'), ('max32', ('--timeout', 'nan'), '--timeout')]
+        for board, args, want in cases:
+            rc, out, err = self.run_cli(board, *args)
+            self.assertEqual(rc, 2, (board, args, err))
+            self.assertIn(want, err, (board, args))
+            self.assertFalse(self.log.exists(), (board, args))
 
 
 if __name__ == '__main__':
