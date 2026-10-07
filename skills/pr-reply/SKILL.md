@@ -26,6 +26,8 @@ python3 $R --pr <N> --manifest <file.json>
 # file.json: {"replies": [{"commentId": 4013179956, "body": "...", "digest": "<8 hex>"}]}
 python3 $R --digest "$body"      # the digest of a body, for a manifest written by hand
 python3 $R --pr <N> --inspect <commentId>:<replyId> ...   # read our replies, post nothing
+python3 $R --pr <N> --inspect <commentId>   # our newest reply; its `original` and `originalDigest` too,
+                                           # also on exit 1 "no reply of ours": how to read the comment itself
 python3 $R --pr <N> --reuse <file.json>
 # file.json: {"reuses": [{"commentId": ..., "replyId": ..., "bodyDigest": "...", "originalDigest": "..."}]}
 python3 $R --pr <N> --edit <file.json>
