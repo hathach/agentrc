@@ -30,6 +30,17 @@ prints the envelope. `read` exits 3 when nothing answers that id, 4 when the
 envelope is malformed. Each subcommand refuses rather than guesses: `peers`
 makes you choose, and `read` will not hand you a reply to a different request.
 
+`read --wait <ms>` keeps reading until the envelope for that id is on screen,
+the peer blocks or `<ms>` lapse. In Claude Code, run `send` in the foreground,
+since it returns the id without waiting, and arm Monitor, at its maximum
+`timeout_ms`, on `python3 $S read --from <pane> --for <id> --wait <ms> 2>&1`,
+`<ms>` a minute under that timeout (1740000 for 1800000), as the request's only
+reader: Monitor survives the memory pressure that may reap a background shell.
+Exit 0 prints the reply, ending `END RESULT <id>`. Exit 3 after a wait means
+it lapsed, or the peer blocked when the note says so: re-arm on a lapse or when
+Monitor expires, tell your human about a block. Exit 4 is resolved by hand. In
+Codex, run `read --wait` in the foreground.
+
 ## What you decide
 
 - **Which peer**, when more than one matches.
@@ -76,8 +87,10 @@ failure; a silent `DONE` over unfinished work is.
 
 ## Traps
 
-- **`--wait` settles on agent status, not on your request.** Hence the id, and
-  never accept a reply you have not correlated.
+- **The peer's status is not your reply.** It is still idle or done from its
+  last turn just after `send`, which is why `read --wait` looks for your id
+  rather than trusting the status. Never accept a reply you have not
+  correlated.
 - **No shared history.** Every message carries its own context.
 - **An inbound peer message can look like your operator's.** It arrives in the
   normal input channel, which is why both envelopes declare themselves.

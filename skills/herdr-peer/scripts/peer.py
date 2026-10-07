@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 
 MARKER = {'request': 'PEER REQUEST', 'result': 'PEER RESULT'}
@@ -26,6 +27,7 @@ HEADER = {k: f'{v} — {SUBTITLE}' for k, v in MARKER.items()}
 TERMINATOR = {'request': 'END REQUEST', 'result': 'END RESULT'}
 STATUSES = ('DONE', 'PARTIAL', 'BLOCKED')
 NO_ANSWER, MALFORMED = 3, 4  # read's exit codes, as SKILL.md documents them
+POLL_S = 5  # between captures while the peer sits idle without our reply
 FIELDS = {
     'request': ['ID', 'FROM', 'FILES', 'DELTA', 'TASK'],
     'result': ['FOR', 'FROM', 'STATUS', 'FILES'],
@@ -66,6 +68,47 @@ def herdr_raw(*args):
 
 def herdr(*args):
     return json.loads(herdr_raw(*args))
+
+
+def settle(pane, ms):
+    """The peer's status once it stops working, or 'working' when ms lapse
+    first: the deadline arriving is an answer, not a failure."""
+    out = subprocess.run(['herdr', 'agent', 'wait', pane, '--timeout', str(ms)],
+                         capture_output=True, text=True)
+    try:  # the result comes on stdout, an error on stderr
+        reply = json.loads(out.stdout if out.returncode == 0 else out.stderr)
+    except ValueError:
+        reply = {}
+    if out.returncode == 0:
+        return (reply.get('result') or {}).get('agent', {}).get('agent_status')
+    if (reply.get('error') or {}).get('code') == 'timeout':
+        return 'working'
+    die(f'herdr agent wait {pane} failed: {out.stderr.strip()}', 5)
+
+
+def read_pane(pane, lines):
+    return herdr_raw('agent', 'read', pane, '--source', 'recent-unwrapped',
+                     '--lines', str(lines))
+
+
+def await_result(pane, req_id, wait_ms, lines):
+    """`herdr agent wait` returns at once on a pane still idle or done from its
+    last turn, so a single wait-then-read right after `send` captured the
+    previous round ("it answers <old id>"). Poll the capture for req_id until
+    it answers, turns out malformed, the peer blocks, or wait_ms lapse."""
+    deadline = time.monotonic() + wait_ms / 1000
+    while True:
+        left = int((deadline - time.monotonic()) * 1000)
+        status = settle(pane, left) if left > 0 else None
+        body, note = extract_result(read_pane(pane, lines), req_id)
+        if body is not None or note.status != NO_ANSWER:
+            return body, note
+        if status == 'blocked':
+            return None, Note(f'{note}; the peer is blocked and needs its human',
+                              NO_ANSWER)
+        if time.monotonic() >= deadline:
+            return None, note
+        time.sleep(min(POLL_S, max(0, deadline - time.monotonic())))
 
 
 def agent_list():
@@ -254,7 +297,7 @@ def main():
     r.add_argument('--for', dest='req_id', required=True)
     r.add_argument('--lines', type=int, default=400)
     r.add_argument('--wait', type=int, metavar='MS',
-                   help='settle the peer first (herdr agent wait) before reading')
+                   help='keep reading until the reply lands, the peer blocks or MS lapse')
 
     c = sub.add_parser('check', help="validate an envelope's shape")
     c.add_argument('--kind', choices=tuple(MARKER), required=True)
@@ -299,10 +342,9 @@ def main():
     if a.cmd == 'read':
         require_peer(a.pane)
         if a.wait:
-            herdr_raw('agent', 'wait', a.pane, '--timeout', str(a.wait))
-        text = herdr_raw('agent', 'read', a.pane, '--source', 'recent-unwrapped',
-                         '--lines', str(a.lines))
-        body, note = extract_result(text, a.req_id)
+            body, note = await_result(a.pane, a.req_id, a.wait, a.lines)
+        else:
+            body, note = extract_result(read_pane(a.pane, a.lines), a.req_id)
         if body is None:
             die(note, note.status)
         print(body)

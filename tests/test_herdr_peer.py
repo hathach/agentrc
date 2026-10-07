@@ -197,6 +197,68 @@ class IdentityTest(unittest.TestCase):
             peer.own_identity()
 
 
+class AwaitTest(unittest.TestCase):
+    """read --wait against a fake clock: each sleep advances it, and settle
+    returns the peer status the scenario scripts."""
+
+    def run_await(self, captures, statuses, wait_ms=60000):
+        now = [0.0]
+        captures, statuses = iter(captures), iter(statuses)
+
+        def sleep(s):
+            now[0] += s
+
+        with mock.patch.object(peer, 'settle', side_effect=lambda p, ms: next(statuses)), \
+             mock.patch.object(peer, 'read_pane', side_effect=lambda p, n: next(captures)), \
+             mock.patch.object(peer.time, 'monotonic', side_effect=lambda: now[0]), \
+             mock.patch.object(peer.time, 'sleep', side_effect=sleep) as slept:
+            return peer.await_result('w1:p2', 'w1:p1-7', wait_ms, 400), slept
+
+    def test_a_stale_round_on_an_idle_pane_is_waited_past(self):
+        # the exit-3 case: send returns before the peer leaves its last turn's
+        # done state, so the first capture holds only the previous answer
+        (body, note), slept = self.run_await(
+            [RESULT.format(id='w1:p1-6'), RESULT.format(id='w1:p1-7')],
+            ['done', 'done'])
+        self.assertIsNone(note)
+        self.assertTrue(body.endswith('END RESULT w1:p1-7'))
+        self.assertEqual(slept.call_count, 1)
+
+    def test_a_lapsed_wait_reports_no_answer(self):
+        (body, note), _ = self.run_await(
+            [RESULT.format(id='w1:p1-6')] * 3, ['done', 'done', 'working'],
+            wait_ms=2 * peer.POLL_S * 1000)
+        self.assertIsNone(body)
+        self.assertEqual(note.status, peer.NO_ANSWER)
+        self.assertIn('w1:p1-7', note)
+
+    def test_a_blocked_peer_ends_the_wait(self):
+        (body, note), slept = self.run_await([RESULT.format(id='w1:p1-6')], ['blocked'])
+        self.assertIsNone(body)
+        self.assertEqual(note.status, peer.NO_ANSWER)
+        self.assertIn('blocked', note)
+        slept.assert_not_called()
+
+    def test_a_malformed_answer_ends_the_wait(self):
+        bad = RESULT.format(id='w1:p1-7').replace('END RESULT w1:p1-7', 'END RESULT x')
+        (body, note), _ = self.run_await([bad], ['done'])
+        self.assertEqual(note.status, peer.MALFORMED)
+
+    def test_settle_treats_a_timeout_as_still_working(self):
+        # herdr 0.9.1 prints the error JSON on stderr, exit 1
+        lapsed = mock.Mock(returncode=1, stdout='', stderr=(
+            '{"error":{"code":"timeout","message":"timed out waiting for agent status"}}'))
+        with mock.patch.object(peer.subprocess, 'run', return_value=lapsed):
+            self.assertEqual(peer.settle('w1:p2', 1000), 'working')
+
+    def test_settle_fails_loudly_on_any_other_error(self):
+        gone = mock.Mock(returncode=1, stdout='', stderr='{"error":{"code":"not_found"}}')
+        with mock.patch.object(peer.subprocess, 'run', return_value=gone), \
+             self.assertRaises(SystemExit) as raised:
+            peer.settle('w1:p2', 1000)
+        self.assertEqual(raised.exception.code, 5)
+
+
 class Frontmatter(unittest.TestCase):
     """A bare `word: ` inside an unquoted description is a YAML mapping, not
     prose, and the whole block stops parsing. Cheap to write, silent to hit."""
