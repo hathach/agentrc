@@ -1,6 +1,6 @@
 ---
 name: usb-kernel-debug
-description: Use when the Linux end of a USB link must explain itself — enumeration failures, "device descriptor read error", control STALLs, missing or short transfers, ISO dropouts, port-reset storms, xHCI errors. usbmon URB capture into pcapng on a Linux host, kernel dynamic debug on a host or a gadget peer.
+description: Use when the Linux end of a USB link must explain itself — enumeration failures, "device descriptor read error", control STALLs, missing or short transfers, ISO dropouts, port-reset storms, xHCI errors. usbmon URB capture to pcapng, kernel dynamic debug on host or gadget.
 ---
 
 # usb-kernel-debug — what the Linux side of the link saw

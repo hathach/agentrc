@@ -1,6 +1,6 @@
 ---
 name: headless-chief
-description: Launch a headless `chief` (`claude -p --agent chief`) and follow it from the calling session - its `chief:` status lines arrive as a numbered progress log while it runs, its final report as a file when it exits. Use when handing a task worktree, such as a PR to babysit, to a headless chief.
+description: Launch a headless `chief` (`claude -p --agent chief`) and follow its status lines and final report from the calling session. Use when handing a task worktree, such as a PR to babysit, to a headless chief.
 ---
 
 # Headless chief

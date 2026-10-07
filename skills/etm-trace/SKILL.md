@@ -1,6 +1,6 @@
 ---
 name: etm-trace
-description: Use when logs, GDB or PC-sampling cannot answer and you need instruction-level execution data from real hardware through a SEGGER J-Trace and Ozone — instruction-count hot-function profiling, ISR timing, on-target code coverage, or what ran right before a fault or hang. Headless ETM capture and analysis; "No trace clock present".
+description: Use when logs, GDB or PC-sampling cannot answer and you need instruction-level execution data from a SEGGER J-Trace and Ozone — hot functions by instruction count, ISR timing, on-target code coverage, what ran right before a fault or hang. ETM trace; "No trace clock present".
 ---
 
 # etm-trace — unattended ETM instruction trace via J-Trace + Ozone

@@ -1,6 +1,6 @@
 ---
 name: download-doc
-description: Enumerate, download, and import vendor hardware documentation — datasheets, reference manuals, errata, programming/user manuals, application notes — into the Calibre library at ~/Documents/calibre-library, and refresh local copies when the vendor has published a newer revision. Use this whenever the user wants a datasheet or reference manual for a chip, asks to update/check/audit their documentation library, mentions a vendor's documents (ST, NXP, Microchip, TI, Renesas, Espressif, Raspberry Pi, Arm and others), or wants to bulk-fetch a vendor's docs — even if they never say "Calibre".
+description: List, download and import vendor hardware docs (datasheets, reference manuals, errata, user manuals, app notes) into the Calibre library, and refresh copies the vendor has revised. Use whenever the user wants a chip's datasheet or reference manual, asks to update/check/audit their documentation library, or wants a vendor's docs (ST, NXP, Microchip, TI, Renesas, Espressif, Raspberry Pi, Arm...) fetched in bulk, even without saying "Calibre".
 ---
 
 # download-doc

@@ -1,6 +1,6 @@
 ---
 name: herdr-peer
-description: Cowork with the coding-agent session in the neighbouring Herdr pane, in either direction between Claude and Codex, sharing one checkout. Hand a bounded task to the peer and take the result back, ask it a question or for a review, or tell it what you are doing while you both work in parallel. The peer edits and commits locally; push, PRs and comments stay with the human. Interactive only; schema'd, unattended verification is a saved workflow's job. Requires HERDR_ENV=1.
+description: Cowork with the Claude or Codex session in the neighbouring Herdr pane, sharing one checkout - hand it a bounded task, a question or a review, or tell it what you are doing while you both work. Push, PRs and comments stay with the human. Interactive; needs HERDR_ENV=1.
 ---
 
 # Coworking with the peer session in the neighbouring Herdr pane

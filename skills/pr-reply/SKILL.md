@@ -1,6 +1,6 @@
 ---
 name: pr-reply
-description: Post replies to PR review comments from a manifest and prove they landed. Use when a workflow or agent must answer bot or human review comments on a pull request; the script posts each body once, reads it back, and resolves the thread only when the read-back matches.
+description: Post replies to PR review comments from a manifest, read each back, and resolve its thread only on a match. Use when a workflow or agent must answer bot or human review comments on a pull request.
 ---
 
 # Replying to PR review comments

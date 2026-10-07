@@ -1,6 +1,6 @@
 ---
 name: esp-target-debug
-description: Use when debugging firmware on Espressif ESP32-S3 or ESP32-P4 boards through the chip's built-in USB-Serial-JTAG — attach, backtrace, breakpoints, FreeRTOS task lists, console — or when openocd says "could not find or open device", the 303a:1001 port vanishes, or the S3 debug port turns into the firmware's own USB device.
+description: Use when debugging firmware on Espressif ESP32-S3/P4 boards over the built-in USB-Serial-JTAG (attach, backtrace, breakpoints, FreeRTOS tasks, console), or openocd says "could not find or open device", the 303a:1001 port vanishes, or the S3 debug port becomes the firmware's USB device.
 ---
 
 # esp-target-debug — Espressif built-in USB-JTAG backend

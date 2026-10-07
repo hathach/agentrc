@@ -1,6 +1,6 @@
 ---
 name: pr-review
-description: Review a pull request, mostly another contributor's - pin its head, ask which test-rig boards to validate on, run the pr-review workflow (code-audit over the change, earlier findings and pushback rechecked, open threads judged, a fixed verdict rule), keep the result in a per-PR ledger, and publish it as a pending GitHub review the human finishes, or submit it under auto-post; a later launch reviews only the new push. Use for "review PR N", a re-review after a contributor pushes, or replies to our review comments.
+description: Review a pull request, mostly another contributor's - run the pr-review workflow on its pinned head with chosen rig boards, keep a per-PR ledger, publish a pending GitHub review (or submit under auto-post); later launches review only the new push. Use for "review PR N", a re-review after a contributor pushes, or replies to our review comments.
 ---
 
 # pr-review

@@ -1,6 +1,6 @@
 ---
 name: read-pcb
-description: Use when a board-wiring question should be answered from the board's schematic rather than memory or a pinout image — which MCU pin or GPIO drives a signal, what sits on a net, what a connector, jumper or switch connects, a part's value, MPN or package, or what a given revision says — for the user's boards in hathach/pcb (KiCad) and any other board repo READ_PCB_SOURCES lists (EAGLE or KiCad), or a design directory the user names; including while writing or debugging firmware for that board.
+description: Use when a board-wiring question should be answered from the schematic, not memory or a pinout image — which MCU pin or GPIO drives a signal, what sits on a net, what a connector, jumper or switch connects, a part's value, MPN or package, per revision — for boards in hathach/pcb, READ_PCB_SOURCES repos or a design directory the user names (KiCad/EAGLE), including while writing firmware for it.
 ---
 
 # Read PCB

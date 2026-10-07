@@ -1,6 +1,6 @@
 ---
 name: followup-issue
-description: Open one follow-up issue, or add one comment of new evidence to an open issue that covers the topic, and prove it landed. Use when chief, under a push grant that covers follow-up issues, must file deferred work in the PR's repository or a defect of agentrc's own tooling in hathach/agentrc; the script refuses an unallowed repository, attribution, a missing label and a title collision, and never posts twice.
+description: Open one follow-up issue, or comment new evidence on the open issue covering the topic, and prove it landed. Use when chief, under a push grant covering them, files deferred work in the PR's repository or an agentrc tooling defect in hathach/agentrc.
 ---
 
 # Filing a follow-up issue

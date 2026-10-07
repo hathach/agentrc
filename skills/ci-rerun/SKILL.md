@@ -1,6 +1,6 @@
 ---
 name: ci-rerun
-description: Re-run failed CircleCI jobs or Read the Docs builds, or read why they failed, from the job number or build URL a GitHub check carries. Use when a PR's CircleCI or Read the Docs check failed for an infrastructure reason (a lost clone, a dropped SSH handshake, a runner timeout, a failed checkout) and should run again.
+description: Re-run failed CircleCI jobs or Read the Docs builds, or read why they failed, from a GitHub check's job number or build URL, when a PR check failed for an infrastructure reason (lost clone, dropped SSH handshake, runner timeout, failed checkout).
 ---
 
 # CircleCI from a GitHub check

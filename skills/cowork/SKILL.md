@@ -1,6 +1,6 @@
 ---
 name: cowork
-description: Cowork with the other coding agent headless, in this worktree, through its own CLI - Claude drives `codex exec`, Codex drives `claude -p` - with resumed sessions, lanes, so context carries across requests. Hand it a bounded task, ask a question or a review, one request in flight per lane and lanes in parallel. The coworker edits and commits locally; push, PRs and comments stay with the human.
+description: Cowork with the other coding agent headless through its CLI (Claude drives `codex exec`, Codex drives `claude -p`) in resumed sessions (lanes) that keep context; hand it a bounded task, a question or a review. Push, PRs and comments stay with the human.
 ---
 
 # Coworking with the other agent's CLI

@@ -1,6 +1,6 @@
 ---
 name: pr-babysit
-description: Fact collectors the pr-babysit workflow runs in a PR checkout, the push it publishes with, and its caller's reader of a finished launch. Use when a pr-babysit prompt names one of these scripts, to reproduce by hand what the workflow saw, or to read a launch's result; the workflow, not the script, decides whether to publish.
+description: Fact-collector scripts of the pr-babysit workflow, its publishing push, and the reader of a finished launch. Use when a pr-babysit prompt names one, to reproduce by hand what the workflow saw, or to read a launch's result.
 ---
 
 # pr-babysit's scripts

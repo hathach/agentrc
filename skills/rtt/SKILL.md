@@ -1,6 +1,6 @@
 ---
 name: rtt
-description: Use when console, printf or log I/O must go over a debug probe on real hardware — no UART wired, no probe VCOM, "RTT Control Block not found", an RTT server that will not start or drops output, JLinkRTTLogger or openocd rtt misbehaving, or the RTT ring needs reading post-mortem.
+description: Use when console, printf or log I/O must go over a debug probe on real hardware — no UART wired, no probe VCOM, "RTT Control Block not found", an RTT server that won't start or drops output, JLinkRTTLogger or openocd rtt misbehaving, or reading the RTT ring post-mortem.
 ---
 
 # rtt — SEGGER RTT transport and console

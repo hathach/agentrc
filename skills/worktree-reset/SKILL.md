@@ -1,6 +1,6 @@
 ---
 name: worktree-reset
-description: Reset a git worktree slot for its next task after its branch's work merged - fresh numbered branch at the default branch, cowork lanes reset, ignored files and chief state kept. Use when the user asks to reset, clean up or recycle a worktree for another session.
+description: Reset a git worktree slot for its next task once its branch merged (fresh numbered branch at the default branch, ignored files and chief state kept). Use when the user asks to reset, clean up or recycle a worktree.
 ---
 
 # Resetting a worktree
