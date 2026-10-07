@@ -52,9 +52,11 @@ directory, credentials, the rig). That summary goes into the board question.
 Candidates come from the project's HIL contract: run its PR-scoped selector from
 the launcher's checkout, never the review worktree's copy, which is the
 contributor's code and may predate the tool, over prepare's `changedFile`, one
-changed path a line (tinyusb: `tools/ci_select.py --diff-file <changedFile>`
-over the rig config, reading `full` before `args`; a null `changedFile`, a path
-with a line break, offers the full matrix). `hardwareRelevant` is true
+changed path a line (tinyusb: `tools/change_impact.py --diff-file <changedFile>`,
+or `tools/ci_select.py` in a checkout without `change_impact.py`, chosen by that
+file's absence alone, never after a failed run; over the rig config, reading
+`full` before `args`; a null `changedFile`, a path with a line break, offers the
+full matrix). `hardwareRelevant` is true
 when it names boards or answers `full`, whatever board choice follows. With no
 HIL contract, offer only a local board or none.
 
