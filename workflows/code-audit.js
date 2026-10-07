@@ -38,6 +38,14 @@ const scopeOf = dir => args.diff
 // The one scale, defined in finding-verifier.md's Severity section.
 const LEVELS = ['critical', 'high', 'medium', 'low', 'nit']
 const CONFIDENCE = ['high', 'medium', 'low']
+// Optional: the read-doc sources a scanner consulted (Calibre book id, PDF pages, logged lookup ids).
+const DOCS = {
+  type: 'array',
+  items: {
+    type: 'object', additionalProperties: false, required: ['book', 'pages'],
+    properties: { book: { type: 'integer' }, pages: { type: 'string' }, lookups: { type: 'array', items: { type: 'string' } } },
+  },
+}
 const FINDINGS = {
   type: 'object', additionalProperties: false,
   required: ['scope', 'dimension', 'findings'],
@@ -51,6 +59,7 @@ const FINDINGS = {
         properties: {
           file: { type: 'string' }, line: { type: 'integer' }, snippet: { type: 'string' },
           why: { type: 'string' }, severity: { enum: LEVELS }, confidence: { enum: CONFIDENCE },
+          docs: DOCS,
         },
       },
     },

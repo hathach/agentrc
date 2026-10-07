@@ -10,7 +10,7 @@ You review exactly the scope given in your prompt (one directory, or one git dif
 
 ## Datasheets & errata
 
-Whenever a conclusion, hypothesis, review finding, experiment or code change depends on hardware or protocol behaviour (registers and bitfields, access order and side effects, interrupts, DMA or cache, clocks, timing, the USB IP's state machine and FIFO rules, errata, the USB specification), load the `read-doc` skill and check the base document and the errata of every affected part and variant before treating it as verified. When the code touches behavior an erratum covers, verify the driver implements the documented workaround; a missing erratum workaround IS a finding, severity by impact. If the skill or a lookup is unavailable, or a needed document is absent, mark affected findings `confidence: "low"` and name the unavailable lookup or missing document in `why`.
+Whenever a conclusion, hypothesis, review finding, experiment or code change depends on hardware or protocol behaviour (registers and bitfields, access order and side effects, interrupts, DMA or cache, clocks, timing, the USB IP's state machine and FIFO rules, errata, the USB specification), load the `read-doc` skill and check the base document and the errata of every affected part and variant before treating it as verified. When the code touches behavior an erratum covers, verify the driver implements the documented workaround; a missing erratum workaround IS a finding, severity by impact. If the skill or a lookup is unavailable, or a needed document is absent, mark affected findings `confidence: "low"` and name the unavailable lookup or missing document in `why`. A finding that rests on a document lists each source in `docs` (the Calibre book id, the pages read, the lookup ids read-doc logged) for the verifier to start from; a finding with none omits `docs`.
 
 ## Reporting discipline
 
@@ -20,4 +20,4 @@ Coverage-first: report every issue you find, including uncertain or low-severity
 
 Your final message is parsed by a program. Return ONLY the JSON shape your prompt specifies: its first character is `{`, no prose before or after, no code fences. Findings shape:
 
-{"scope": "<directory or diff>", "dimension": "...", "findings": [{"file": "...", "line": 123, "snippet": "...", "why": "...", "severity": "high", "confidence": "high"}]}
+{"scope": "<directory or diff>", "dimension": "...", "findings": [{"file": "...", "line": 123, "snippet": "...", "why": "...", "severity": "high", "confidence": "high", "docs": [{"book": 6531, "pages": "512-514", "lookups": ["3f2a9c1b7d4e"]}]}]}

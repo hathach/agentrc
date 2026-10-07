@@ -231,3 +231,24 @@ test('the scan schema takes only the one scale', async () => {
   assert.deepEqual(item.severity.enum, ['critical', 'high', 'medium', 'low', 'nit'])
   assert.deepEqual(item.confidence.enum, ['high', 'medium', 'low'])
 })
+
+test('a finding\'s read-doc sources reach its verifier inside the finding', async () => {
+  const docs = [{ book: 6531, pages: '512-514', lookups: ['3f2a9c1b7d4e'] }]
+  const scans = { 'src/portable/x|correctness': [{ ...finding(1, 'cited'), docs }, finding(2, 'uncited')] }
+  const { result, calls } = await run(ONE, { scans, verdicts: { cited: true, uncited: true } })
+  const [cited, uncited] = calls.filter(c => c.label.startsWith('verify:'))
+  assert.deepEqual(JSON.parse(/^Finding: (.+)$/m.exec(cited.prompt)[1]), { ...finding(1, 'cited'), docs })
+  assert.equal(uncited.prompt,
+    `Adversarially verify ONE review finding about src/portable/x.\nDimension: correctness\nFinding: ${JSON.stringify(finding(2, 'uncited'))}\n` +
+    'Read the cited code and enough surrounding context to judge. Try to REFUTE it; real=true only if it survives your best attempt. ' +
+    'If real, set severity, impact, severityReason and confidence by the Severity section of your role; the finding\'s own severity is the scanner\'s guess. If refuted, set them null.')
+  assert.deepEqual(result.confirmed[0].findings.map(f => f.docs), [docs, undefined])
+})
+
+test('docs is an optional field of the scan schema', async () => {
+  const { calls } = await run(ONE, { scans: { 'src/portable/x|correctness': [] } })
+  const item = calls[0].schema.properties.findings.items
+  assert.ok(!item.required.includes('docs'))
+  assert.deepEqual(item.properties.docs.items.required, ['book', 'pages'])
+  assert.deepEqual(Object.keys(item.properties.docs.items.properties), ['book', 'pages', 'lookups'])
+})
