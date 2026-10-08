@@ -59,7 +59,11 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   `expectedHead` (a caller's repair, or a push made outside the workflow):
   the chain is audited, published under `autoPush`, and the run continues
   from it; per launch. A merge from the PR's base branch is one link, its
-  paths those it leaves unlike both parents. A PR that conflicts with its base
+  paths those it leaves unlike both parents; it is from the base when the
+  branch's live tip or the base GitHub recorded holds its second parent. That
+  record is stale until the head is pushed, so a merge newer than it needs the
+  live tip in the checkout (fetch the base branch), or the audit stops with
+  `fetch it`. A PR that conflicts with its base
   stops `pr-conflicting`; the merge that resolves it rejoins by `adoptHead`.
 - `rebasedHead`: full SHA of the PR head after a history rewrite (rebase,
   force-push) the user authorized: with the checkout at it and no unpublished

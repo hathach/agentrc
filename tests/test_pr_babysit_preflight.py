@@ -17,8 +17,10 @@ preflight = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(preflight)
 
 ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
-VIEW = {'headRefName': 'fix', 'headRefOid': 'f' * 40, 'baseRefOid': 'b' * 40, 'headRepositoryOwner': {'id': 'x', 'login': 'someone'},
+VIEW = {'headRefName': 'fix', 'headRefOid': 'f' * 40, 'baseRefOid': 'b' * 40, 'baseRefName': 'master',
+        'headRepositoryOwner': {'id': 'x', 'login': 'someone'},
         'headRepository': {'id': 'y', 'name': 'tinyusb'}, 'url': 'https://github.com/hathach/tinyusb/pull/7'}
+REF = {'ref': 'refs/heads/master', 'object': {'type': 'commit', 'sha': 'c' * 40}}
 
 
 class PreflightTest(unittest.TestCase):
@@ -44,13 +46,21 @@ class PreflightTest(unittest.TestCase):
     def git(self, *argv, check=True):
         return subprocess.run(['git', *argv], check=check, capture_output=True, text=True).stdout
 
-    def fake_gh(self, answer, code=0):
+    def fake_gh(self, answer, code=0, ref=json.dumps(REF), ref_code=0):
+        """`gh pr ...` answers answer, `gh api ...` ref; each call's argv is appended to gh.log."""
         (self.root / 'answer').write_text(answer)
+        (self.root / 'ref').write_text(ref)
         bin_dir = self.root / 'bin'
         bin_dir.mkdir(exist_ok=True)
-        (bin_dir / 'gh').write_text(f'#!/bin/sh\ncat {self.root / "answer"}\nexit {code}\n')
+        (bin_dir / 'gh').write_text(f'#!/bin/sh\necho "$@" >> {self.root / "gh.log"}\n'
+                                    f'if [ "$1" = api ]; then cat {self.root / "ref"}; exit {ref_code}; fi\n'
+                                    f'cat {self.root / "answer"}\nexit {code}\n')
         (bin_dir / 'gh').chmod(0o755)
         self.enterContext(mock.patch.dict(os.environ, {'PATH': f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}))
+
+    def gh_calls(self):
+        log = self.root / 'gh.log'
+        return log.read_text().splitlines() if log.exists() else []
 
     def pin(self, *argv):
         out = io.StringIO()
@@ -72,10 +82,31 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual((Path(receipts).parent, list(Path(receipts).iterdir())), (self.root / 'pr-babysit-receipts', []), 'a new empty directory')
         self.assertNotEqual(self.pin()[1]['receipts'], receipts, 'one per launch')
         self.assertEqual(out, {
-            'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prRepo': 'someone/tinyusb',
+            'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prBaseBranch': 'master', 'prBaseTip': 'c' * 40,
+            'prRepo': 'someone/tinyusb',
             'prUrl': VIEW['url'], 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
             'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o'],
             'pr': 7, 'badPushUrl': ''})
+        self.assertEqual(self.gh_calls()[-1], 'api repos/{owner}/{repo}/git/ref/heads/master', 'the base repository gh resolves for the PR')
+
+    def test_the_base_branch_is_requested_quoted(self):
+        name = 'rel/v1#x{branch}'
+        self.fake_gh(json.dumps({**VIEW, 'baseRefName': name}), ref=json.dumps({**REF, 'ref': f'refs/heads/{name}'}))
+        code, out = self.pin()
+        self.assertEqual((code, out['prBaseBranch'], out['prBaseTip']), (0, name, 'c' * 40))
+        self.assertEqual(self.gh_calls()[-1], 'api repos/{owner}/{repo}/git/ref/heads/rel/v1%23x%7Bbranch%7D')
+
+    def test_a_base_tip_gh_cannot_vouch_for_is_an_error(self):
+        for ref, code, want in (('', 1, 'gh api'), ('not json', 0, 'unexpected answer'),
+                                (json.dumps({**REF, 'ref': 'refs/heads/main'}), 0, 'unexpected answer'),
+                                (json.dumps([REF]), 0, 'unexpected answer'),
+                                (json.dumps({**REF, 'object': {'type': 'tag', 'sha': 'c' * 40}}), 0, 'unexpected answer'),
+                                (json.dumps({**REF, 'object': {'type': 'commit', 'sha': 'c' * 7}}), 0, 'unexpected answer'),
+                                (json.dumps({**REF, 'object': {'type': 'commit', 'sha': 'c' * 40 + '\n'}}), 0, 'unexpected answer')):
+            self.fake_gh(json.dumps(VIEW), ref=ref, ref_code=code)
+            status, out = self.pin()
+            self.assertEqual(status, 2, ref)
+            self.assertIn(want, out['error'], ref)
 
     def test_a_push_url_outside_the_pr_head_repository_is_named(self):
         good = 'git@github.com:someone/tinyusb.git'
@@ -159,7 +190,7 @@ class PreflightTest(unittest.TestCase):
         (self.repo / 'staged.c').write_text('x')
         self.git('add', 'staged.c')
         code, out = self.pin('--recheck')
-        self.assertEqual(code, 0)
+        self.assertEqual((code, self.gh_calls()), (0, []))
         self.assertEqual(out, {'branch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
                                'head': self.git('rev-parse', 'HEAD').strip(), 'staged': ['staged.c'],
                                'status': ['A  staged.c', '?? a name.c']})

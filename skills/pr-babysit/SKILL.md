@@ -19,7 +19,7 @@ python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabb
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
 python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
-python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head>  # audit from..to for adoption, full SHAs
+python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--pr N]
 python3 $S/sonar.py --pr N --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>'  # build the checkout as it stands

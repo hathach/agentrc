@@ -477,9 +477,10 @@ const SONAR = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['from', 'to', 'published', 'base', 'commits', 'paths', 'unpublished', 'refusal'],
+  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'refusal'],
   properties: {
     error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' }, base: { type: 'string' },
+    tip: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
     unpublished: { type: 'array', items: { type: 'string' } },
     refusal: { type: 'string' },
@@ -2302,11 +2303,12 @@ const runCycle = async (cycle, entry) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
+  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prBaseBranch', 'prBaseTip', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
   properties: {
     error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
-    prHead: { type: 'string' }, prBase: { type: 'string' }, prRepo: { type: 'string' }, prUrl: { type: 'string' },
+    prHead: { type: 'string' }, prBase: { type: 'string' }, prBaseBranch: { type: 'string' }, prBaseTip: { type: 'string' },
+    prRepo: { type: 'string' }, prUrl: { type: 'string' },
     remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
@@ -2376,6 +2378,7 @@ if (adoptHead !== null) {
   const X = restored.expectedHead
   const prHead = pinned.prHead.trim()
   const base = pinned.prBase.trim()
+  const tip = pinned.prBaseTip.trim()
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
     return finish(stop(cyclesUsed, 'adopt-head-mismatch', { head: pinned.head.trim(), expected: adoptHead }))
@@ -2388,8 +2391,9 @@ if (adoptHead !== null) {
     return finish(stop(cyclesUsed, 'adopt-pending', { pending: p }))
   }
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
+  if (tip !== base) log(`preflight: ${pinned.prBaseBranch} is at ${tip.slice(0, 7)}, not the base ${base.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`)
   const audit = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )
@@ -2400,8 +2404,8 @@ if (adoptHead !== null) {
   const guarded = protectedRe && audit ? [...new Set(audit.unpublished.map(canon).filter(f => f && protectedRe.test(f)))] : []
   const why = !audit ? 'the audit agent died'
     : audit.error ? `the chain could not be read back: ${audit.error}`
-    : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead || audit.base !== base
-      ? `the audit read ${audit.from}..${audit.to} published at ${audit.published} on base ${audit.base}, not ${X}..${adoptHead} published at ${prHead} on base ${base}`
+    : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead || audit.base !== base || audit.tip !== tip
+      ? `the audit read ${audit.from}..${audit.to} published at ${audit.published} on base ${audit.base} tip ${audit.tip}, not ${X}..${adoptHead} published at ${prHead} on base ${base} tip ${tip}`
     : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
     : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}`

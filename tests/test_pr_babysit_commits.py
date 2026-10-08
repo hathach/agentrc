@@ -115,10 +115,10 @@ class CommitsTest(unittest.TestCase):
         self.write('c\nd.c', 'c\n')
         self.write('b.c', 'bb\n')
         two = self.commit('two', 'c\nd.c', 'b.c')
-        code, out = self.run_script('chain', self.base, two, '--published', self.base, '--base', self.base)
+        code, out = self.run_script('chain', self.base, two, '--published', self.base, '--base', self.base, '--tip', self.base)
         self.assertEqual(code, 0)
         self.assertEqual({k: v for k, v in out.items() if k != 'seal'}, {
-            'from': self.base, 'to': two, 'published': self.base, 'base': self.base, 'commits': [one, two], 'refusal': '',
+            'from': self.base, 'to': two, 'published': self.base, 'base': self.base, 'tip': self.base, 'commits': [one, two], 'refusal': '',
             'paths': ['b.c', 'c\nd.c'], 'unpublished': ['b.c', 'c\nd.c']}, 'each path once, a name holding a newline whole')
 
     def test_unpublished_holds_only_what_the_commits_after_the_published_head_touch(self):
@@ -129,7 +129,7 @@ class CommitsTest(unittest.TestCase):
         self.write('b.c', 'bb\n')
         three = self.commit('three', 'b.c')
         for published, want in ((self.base, ['b.c', 'c.c']), (one, ['c.c', 'b.c']), (two, ['b.c']), (three, []), ('f' * 40, ['b.c', 'c.c'])):
-            code, out = self.run_script('chain', self.base, three, '--published', published, '--base', self.base)
+            code, out = self.run_script('chain', self.base, three, '--published', published, '--base', self.base, '--tip', self.base)
             self.assertEqual(code, 0)
             self.assertEqual(out['unpublished'], want, f'{published[:7]}: a published path edited again later is unpublished again; a foreign head publishes nothing')
 
@@ -139,7 +139,9 @@ class CommitsTest(unittest.TestCase):
         return out['refusal']
 
     def chain_refusal(self, start, end, base=None):
-        return self.refusal('chain', start, end, '--published', start, '--base', base or self.base)
+        """The refusal with one base: the tip given as the base itself."""
+        base = base or self.base
+        return self.refusal('chain', start, end, '--published', start, '--base', base, '--tip', base)
 
     def test_a_chain_that_cannot_be_adopted_is_refused(self):
         self.write('b.c', 'b\n')
@@ -175,8 +177,8 @@ class CommitsTest(unittest.TestCase):
             resolve()
         return one, tip, self.commit(message)
 
-    def chain_of(self, end, published, base):
-        code, out = self.run_script('chain', self.base, end, '--published', published, '--base', base)
+    def chain_of(self, end, published, base, tip=None):
+        code, out = self.run_script('chain', self.base, end, '--published', published, '--base', base, '--tip', base if tip is None else tip)
         self.assertEqual(code, 0, out)
         return out
 
@@ -192,7 +194,29 @@ class CommitsTest(unittest.TestCase):
         later = self.commit('base moved on', 'n.c')
         self.assertEqual(self.chain_of(two, one, later)['refusal'], '', 'a base that moved on still holds the merged commit')
         self.assertEqual(self.chain_of(merge, tip, tip)['unpublished'], ['b.c'], 'a PR head on the merged side is no chain commit, so it publishes nothing')
-        self.assertEqual(self.refusal('chain', merge, two, '--published', merge, '--base', 'e' * 40), '', 'a chain without a merge never reads the base')
+        self.assertEqual(self.refusal('chain', merge, two, '--published', merge, '--base', 'e' * 40, '--tip', 'e' * 40), '',
+                         'a chain without a merge never reads the base')
+
+    def test_a_merge_of_the_live_base_tip_is_a_link_while_the_recorded_base_is_stale(self):
+        one, tip, merge = self.base_merge()
+        self.assertIn("not on the PR's base", self.chain_of(merge, one, self.base)['refusal'], 'the recorded base alone predates the merged tip')
+        self.assertEqual(self.chain_of(merge, one, self.base, tip)['refusal'], '')
+        self.git('checkout', '-q', 'main')
+        self.write('n.c', 'n\n')
+        later = self.commit('base moved on', 'n.c')
+        self.assertEqual(self.chain_of(merge, one, self.base, later)['refusal'], '', 'a live tip that moved on still holds the merged commit')
+        self.assertEqual(self.chain_of(merge, one, tip, 'e' * 40)['refusal'], '', 'a recorded base holding the merge needs no tip in the checkout')
+        code, out = self.run_script('chain', self.base, merge, '--published', one, '--base', self.base, '--tip', 'e' * 40)
+        self.assertEqual(code, 2)
+        self.assertEqual(out['error'], f"the PR's base {'e' * 40} is not in the checkout: fetch it")
+        self.git('checkout', '-q', '-b', 'side', tip)
+        self.write('s.c', 's\n')
+        side = self.commit('side', 's.c')
+        self.git('checkout', '-q', '--detach', one)
+        self.git('merge', '-q', '--no-ff', '--no-edit', side)
+        foreign = self.git('rev-parse', 'HEAD').strip()
+        self.assertIn(f"{foreign[:7]} merges {side[:7]}, which is not on the PR's base {self.base[:7]} or {tip[:7]}",
+                      self.chain_of(foreign, one, self.base, tip)['refusal'])
 
     def test_a_merge_owns_each_path_whose_entry_differs_from_both_parents(self):
         self.write('l.c', ''.join(f'{n}\n' for n in range(1, 8)))
@@ -237,14 +261,14 @@ class CommitsTest(unittest.TestCase):
 
     def test_a_merge_link_needs_the_base_in_the_checkout_and_reports_git_failing(self):
         one, tip, merge = self.base_merge()
-        code, out = self.run_script('chain', self.base, merge, '--published', one, '--base', 'e' * 40)
+        code, out = self.run_script('chain', self.base, merge, '--published', one, '--base', 'e' * 40, '--tip', 'e' * 40)
         self.assertEqual(code, 2)
         self.assertEqual(out['error'], f"the PR's base {'e' * 40} is not in the checkout: fetch it")
         cwd = os.getcwd()
         os.chdir(self.repo)
         try:
             with self.assertRaisesRegex(commits.Unusable, 'merge-base --is-ancestor 1{40} .*: fatal: Not a valid commit name 1{40}'):
-                commits.on_base('1' * 40, tip)
+                commits.on_base('1' * 40, [tip])
         finally:
             os.chdir(cwd)
 
@@ -356,12 +380,17 @@ class CommitsTest(unittest.TestCase):
 
     def test_errors(self):
         chain = ['chain', self.base, self.base, '--published', self.base]
-        for argv, want in ((['chain', 'HEAD~1', 'HEAD', '--published', 'HEAD~1', '--base', self.base], 'not a full SHA'),
-                           ([*chain[:4], 'not-a-sha', '--base', self.base], 'not a full SHA'), (['chain', self.base], 'usage'), (['chain', self.base, self.base], 'usage'),
-                           (chain, 'usage'), ([*chain, '--base', 'HEAD'], 'not a full SHA'),
+        tip = ['--tip', self.base]
+        for argv, want in ((['chain', 'HEAD~1', 'HEAD', '--published', 'HEAD~1', '--base', self.base, *tip], 'not a full SHA'),
+                           ([*chain[:4], 'not-a-sha', '--base', self.base, *tip], 'not a full SHA'), (['chain', self.base], 'usage'), (['chain', self.base, self.base], 'usage'),
+                           (chain, 'usage'), ([*chain, '--base', 'HEAD', *tip], 'not a full SHA'),
+                           ([*chain, '--base', self.base], 'usage'),
+                           ([*chain, '--base', self.base, '--tip', 'HEAD'], 'not a full SHA'), ([*chain, '--base', self.base, '--tip'], 'usage'),
+                           ([*chain, '--base', self.base, '--tip', ''], 'not a full SHA'),
+                           ([*chain, '--base', self.base, '--frob', self.base], 'usage'),
                            (['head'], 'usage'), (['head', 'a.c'], 'usage'), (['head', '--parent', 'HEAD', 'a.c'], 'not a full SHA'),
                            (['frob'], 'usage'), (['commit'], 'usage'),
-                           (['chain', self.base, 'f' * 40, '--published', self.base, '--base', self.base], 'git rev-list')):
+                           (['chain', self.base, 'f' * 40, '--published', self.base, '--base', self.base, *tip], 'git rev-list')):
             code, out = self.run_script(*argv)
             self.assertEqual(code, 2, argv)
             self.assertIn(want, out['error'], argv)

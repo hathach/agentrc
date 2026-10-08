@@ -71,10 +71,12 @@ const HEAD = '0f1e2d3c4b5a69788796a5b4c3d2e1f0deadbee5'
 // Somebody else's commit: a plausible HEAD that is not one this run made.
 const FOREIGN = 'c0ffee11223344556677889900aabbccddeeff01'
 const BASE = 'ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e'
+// The base branch's live tip, moved since the BASE GitHub recorded at the PR's last push.
+const TIP = '7e57e57e57e57e57e57e57e57e57e57e57e57e57'
 // What the preflight pins, and what the pre-publish recheck must still find.
 const PIN = {
   branch: 'claude/foo', prBranch: 'claude/foo',
-  prHead: HEAD, prBase: BASE, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
+  prHead: HEAD, prBase: BASE, prBaseBranch: 'master', prBaseTip: TIP, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
   pr: 3888, badPushUrl: '', receipts: '/tmp/pr-babysit-receipts-x',
@@ -219,9 +221,9 @@ async function run(opts = {}) {
       const answer = typeof opts.adoptAudit === 'function' ? await opts.adoptAudit(label)
         : opts.adoptAudit === undefined ? fallback : opts.adoptAudit
       if (answer instanceof Error) throw answer
-      // commits.py echoes the --published and --base it was given, unless a case says otherwise.
-      const [, published, base] = String(prompt).match(/ --published ([0-9a-f]{40}) --base ([0-9a-f]{40})`/)
-      return answer === null ? null : conforms(options.schema, { published, base, ...structuredClone(answer) }, label)
+      // commits.py echoes the --published, --base and --tip it was given, unless a case says otherwise.
+      const [, published, base, tip] = String(prompt).match(/ --published ([0-9a-f]{40}) --base ([0-9a-f]{40}) --tip ([0-9a-f]{40})`/)
+      return answer === null ? null : conforms(options.schema, { published, base, tip, ...structuredClone(answer) }, label)
     }
     if (label === 'adopt:push' || label === 'adopt:push.retry') {
       // push.py's receipt: by default the push landed on every pinned URL and the PR.
@@ -695,7 +697,7 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -4896,6 +4898,17 @@ test('a state from a run with other arguments, or of another shape, is refused',
 
 // adopting an audited local chain without resetting the carried ledger
 
+test('a chain merging the base branch\'s live tip is adopted and pushed while GitHub\'s recorded base is stale (#60)', async () => {
+  const state = adoptionState()
+  const { result, labels, calls, logs } = await run({
+    args: adoptionArgs(state, { autoPush: true }), preflight: { head: ADOPT, prHead: HEAD },
+  })
+  assert.ok(calls.find(c => c.label === 'adopt:audit').prompt.includes(`--base ${BASE} --tip ${TIP}\``))
+  assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'])
+  assert.equal(result.history[1].adoption.publication, 'pushed')
+  assert.ok(logs.includes(`preflight: master is at ${TIP.slice(0, 7)}, not the base ${BASE.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`), logs.join('\n'))
+})
+
 test('adoption publishes before cycle watchers and reviews the adopted head', async () => {
   const state = adoptionState()
   const { result, labels, calls } = await run({
@@ -4918,8 +4931,8 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.equal(JSON.stringify(result.state).includes('adoptHead'), false, 'the launch argument is not persisted')
   const audit = calls.find(c => c.label === 'adopt:audit')
   assert.equal(audit.phase, 'Triage')
-  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'commits', 'paths', 'unpublished', 'refusal'])
-  assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE}\``), audit.prompt)
+  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'refusal'])
+  assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
   assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --pr 3888\``), push.prompt)
@@ -4985,10 +4998,11 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
   for (const [audit, detail] of [
     [chainAudit([ADOPT], undefined, { refusal: 'commit message carries attribution: Generated by Codex' }),
       'commit message carries attribution: Generated by Codex'],
-    [chainAudit([ADOPT], undefined, { from: ADOPT_MID }), `the audit read ${ADOPT_MID}..${ADOPT} published at ${HEAD} on base ${BASE}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE}`],
-    [chainAudit([ADOPT_MID]), `the audit read ${HEAD}..${ADOPT_MID} published at ${HEAD} on base ${BASE}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE}`],
+    [chainAudit([ADOPT], undefined, { from: ADOPT_MID }), `the audit read ${ADOPT_MID}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
+    [chainAudit([ADOPT_MID]), `the audit read ${HEAD}..${ADOPT_MID} published at ${HEAD} on base ${BASE} tip ${TIP}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
     // A merge vouched for by another base than the PR's is no merge from its base.
-    [chainAudit([ADOPT], undefined, { base: FOREIGN }), `the audit read ${HEAD}..${ADOPT} published at ${HEAD} on base ${FOREIGN}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE}`],
+    [chainAudit([ADOPT], undefined, { base: FOREIGN }), `the audit read ${HEAD}..${ADOPT} published at ${HEAD} on base ${FOREIGN} tip ${TIP}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
+    [chainAudit([ADOPT], undefined, { tip: FOREIGN }), `the audit read ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${FOREIGN}, not ${HEAD}..${ADOPT} published at ${HEAD} on base ${BASE} tip ${TIP}`],
   ]) {
     const state = adoptionState()
     const { result, labels } = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit })
@@ -5003,7 +5017,7 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
 test('a chain the audit script cannot read back is refused with its error', async () => {
   const { result, labels } = await run({
     args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
-    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', commits: [], paths: [], unpublished: [], refusal: '' },
+    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], refusal: '' },
   })
   assert.equal(result.reason, 'adopt-audit-failed')
   assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
@@ -5179,7 +5193,7 @@ test('a protected path the PR already carries is adopted; one this run would pub
   })
   assert.notEqual(published.result.reason, 'adopt-audit-failed', published.result.detail)
   assert.equal(published.result.history[1].adoption.publication, 'already-published')
-  assert.ok(published.calls.find(c => c.label === 'adopt:audit').prompt.includes(`--published ${ADOPT} --base ${BASE}\``))
+  assert.ok(published.calls.find(c => c.label === 'adopt:audit').prompt.includes(`--published ${ADOPT} --base ${BASE} --tip ${TIP}\``))
   const suffix = await run({
     args: adoptionArgs(state), preflight: { head: ADOPT, prHead: ADOPT_MID },
     adoptAudit: chainAudit([ADOPT_MID, ADOPT], roster, { unpublished: ['test/hil/tinyusb.json'] }),

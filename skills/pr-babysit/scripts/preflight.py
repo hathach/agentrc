@@ -5,8 +5,12 @@
   preflight.py --recheck
 
 Reports what every later step must still be true of: branch (`git rev-parse
---abbrev-ref HEAD`), prBranch, prHead, prBase (the base branch's head), prRepo
-(owner/name) and prUrl from one `gh pr view N`, verbatim even when they disagree with git; remote, the remote
+--abbrev-ref HEAD`), prBranch, prHead, prBase (the base head GitHub last
+recorded for the PR, stale once the base moves until the head is pushed),
+prBaseBranch, prRepo (owner/name) and prUrl from one `gh pr view N`, verbatim
+even when they disagree with git; prBaseTip, the base branch's live tip in the
+base repository (`gh api repos/{owner}/{repo}/git/ref/heads/<prBaseBranch>`,
+resolved as `gh pr view` resolves N); remote, the remote
 the branch tracks, "" when it tracks none; upstreamBranch, the branch it
 tracks there, "" when none; pushUrls (`git remote get-url
 --push --all <remote>`, which a pushurl can point away from the fetch URL);
@@ -35,10 +39,11 @@ import json
 import re
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Parser, Unusable, git, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, git, report, run  # noqa: E402
 
 
 HOST = 'github.com'
@@ -98,17 +103,32 @@ def receipts_dir():
     return tempfile.mkdtemp(dir=parent)
 
 
+def base_tip(name):
+    """The live head of the base repository's branch name."""
+    try:
+        # quote: a `{` would read as a gh placeholder, `#` or `%` as URL syntax.
+        path = 'repos/{owner}/{repo}/git/ref/heads/' + urllib.parse.quote(name, safe='/')
+        ref = json.loads(run('gh', 'api', path)[1])
+        if ref['ref'] != f'refs/heads/{name}' or ref['object']['type'] != 'commit' or not FULL_SHA.fullmatch(ref['object']['sha']):
+            raise ValueError(ref)
+        return ref['object']['sha']
+    except (ValueError, KeyError, TypeError) as e:
+        raise Unusable(f'gh api git/ref/heads/{name}: unexpected answer ({e!r})')
+
+
 def pin(pr):
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
-    fields = 'headRefName,headRefOid,baseRefOid,headRepositoryOwner,headRepository,url'
+    fields = 'headRefName,headRefOid,baseRefOid,baseRefName,headRepositoryOwner,headRepository,url'
     try:
         view = json.loads(run('gh', 'pr', 'view', str(pr), '--json', fields)[1])
         pr_facts = {'prBranch': view['headRefName'], 'prHead': view['headRefOid'], 'prBase': view['baseRefOid'],
+                    'prBaseBranch': view['baseRefName'],
                     'prRepo': f"{view['headRepositoryOwner']['login']}/{view['headRepository']['name']}",
                     'prUrl': view['url']}
     except (ValueError, KeyError, TypeError) as e:
         # A deleted head fork comes back as a null headRepository.
         raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')
+    pr_facts['prBaseTip'] = base_tip(pr_facts['prBaseBranch'])
     remote, urls = push_urls(branch)
     expected = f"{HOST}/{pr_facts['prRepo'].lower()}"
     return {'branch': branch, **pr_facts, 'remote': remote, 'upstreamBranch': upstream_branch(branch, remote),
