@@ -8,6 +8,7 @@
 #   C      Codex week, from the codex app-server (account/rateLimits/read)
 #   ↻      reset time, local, short form (HH:MM today, else "MonDD HH:MM");
 #          one after the Claude weekly %s, one after the Codex %
+#   #N     open PRs this session linked, newest first: ✓ green, ⏳ pending, ✗ blocked, ? unknown
 #
 # Usage is fetched in the BACKGROUND and cached, so rendering never blocks on
 # the network. Colors: green <50%, yellow <80%, red >=80%.
@@ -47,12 +48,16 @@ if isinstance(p,(int,float)):
     print("\033[97mc\033[0m"+c+str(round(p))+"%\033[0m")
 else:
     print("")
+print(d.get("session_id") or "")
+print(d.get("transcript_path") or "")
 ' 2>/dev/null)
 cwd=$(printf '%s' "$fields" | sed -n '1p')
 model=$(printf '%s' "$fields" | sed -n '2p' | sed -E 's/ *\([^)]*\)$//')
 effort=$(printf '%s' "$fields" | sed -n '3p')
 wk_reset=$(printf '%s' "$fields" | sed -n '4p')
 ctx=$(printf '%s' "$fields" | sed -n '5p')
+sid=$(printf '%s' "$fields" | sed -n '6p')
+transcript=$(printf '%s' "$fields" | sed -n '7p')
 [ -n "$cwd" ] || cwd=$PWD
 
 # ---- org from oauthAccount: config-dir-local first, then home-dir default ----
@@ -154,6 +159,12 @@ print("\033[97mC"+r+col+str(round(p))+"%"+r+sr)
 ' "$cx_cache" 2>/dev/null)
 fi
 
+# ---- PRs this session linked: the helper prints from its cache and refreshes it detached ----
+# (its own per-session cache, backoff and rate-limit wait, so not the mkdir/find scheme above)
+pr_helper="$HOME/.claude/statusline-prs.py"
+prs=""
+[ -f "$pr_helper" ] && [ -n "$sid" ] && prs=$(python3 "$pr_helper" render "$CFG/statusline-prs" "$sid" "$transcript" 2>/dev/null)
+
 # usage percentages (line 1) + weekly reset time, short form (line 2)
 usage=""; reset_at=""; credits=""
 if [ -f "$cache" ]; then
@@ -238,4 +249,5 @@ printf " %s" "$usage"
 [ -n "$credits" ] && printf " %s" "$credits"
 # "/" separates the Claude group (s/w/F) from the Codex one
 [ -n "$codex_usage" ] && printf "${host}/${reset} %s" "$codex_usage"
+[ -n "$prs" ] && printf "${host}/${reset} %s" "$prs"
 exit 0   # never let a false final test leak a non-zero exit (hides the whole statusline)

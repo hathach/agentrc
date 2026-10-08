@@ -67,8 +67,9 @@ def links(kind, name):
         return [(REPO / 'hooks' / name, dirs(kind)[0] / name)]
     if kind == 'workflow':
         return [(REPO / 'workflows' / f'{name}.js', dirs(kind)[0] / f'{name}.js')]
-    if kind == 'statusline':  # statusline.sh runs its Codex fetcher from $HOME/.claude
-        return [(REPO / 'statusline' / f, Path.home() / '.claude' / f) for f in ('statusline.sh', 'statusline-codex-usage.py')]
+    if kind == 'statusline':  # statusline.sh runs its helpers from $HOME/.claude
+        return [(REPO / 'statusline' / f, Path.home() / '.claude' / f)
+                for f in ('statusline.sh', 'statusline-codex-usage.py', 'statusline-prs.py')]
     return [(REPO / 'instructions' / 'user.md', Path.home() / '.claude' / 'CLAUDE.md'),
             (Path('../.claude/CLAUDE.md'), Path.home() / '.codex' / 'AGENTS.md')]
 

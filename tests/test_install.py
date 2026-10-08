@@ -167,11 +167,11 @@ class InstallTest(unittest.TestCase):
         self.assertEqual((self.claude / 'settings.json').read_text(), '{"model": "x"}', 'a no-op keeps the file byte for byte')
         self.assertFalse((self.claude / 'settings.json.before-agentrc').exists())
 
-    def test_statusline_links_both_files_and_sets_the_setting_once(self):
+    def test_statusline_links_its_files_and_sets_the_setting_once(self):
         self.claude.mkdir()
         (self.claude / 'settings.json').write_text(json.dumps({'model': 'x', 'hooks': {}}))
         self.ok('install', '--statusline')
-        for name in ('statusline.sh', 'statusline-codex-usage.py'):
+        for name in ('statusline.sh', 'statusline-codex-usage.py', 'statusline-prs.py'):
             self.assertEqual(os.readlink(self.claude / name), str(ROOT / 'statusline' / name))
         self.assertEqual(self.settings(), {'model': 'x', 'hooks': {}, 'statusLine': {
             'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'}}, 'hooks untouched')

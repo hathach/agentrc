@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Status-line segment for the PRs a Claude Code session is linked to, e.g. `#4066✓ #4164⏳`.
+
+Claude Code links a session to one PR at a time (its own `gh pr create`, `gh pr view`) and records
+each link as a `pr-link` transcript entry; this session's PRs are every PR it ever linked.
+
+  render <cache_dir> <session_id> <transcript>   print the segment from the session's cache only,
+                                                 and start a detached refresh when one is due
+  refresh <cache_dir> <session_id> <transcript>  rescan the transcript, then poll GitHub once,
+                                                 in one GraphQL request, for every PR not merged
+
+Cache `<cache_dir>/<session_id>.json`: {"prs": ["owner/name#N", ...] in first-link order,
+"status": {pr: {state, isDraft, reviewDecision, rollup, fetched_at}}, "attempt_at", "retry_after"}. A failed poll keeps the last-good status with its own fetched_at.
+"""
+import datetime
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+SESSION_ID = re.compile(r'[A-Za-z0-9-]+')
+REPO = re.compile(r'[\w.-]+/[\w.-]+')
+PR_ID = re.compile(REPO.pattern + r'#[1-9][0-9]*')
+SHOWN = 5
+STALE_S = 300
+TERMINAL = ('MERGED', 'CLOSED')
+REFRESH_S = 120
+BACKOFF_S = 300
+LOW_POINTS = 200  # the gh budget is shared with chief and pr-babysit: yield it when low
+GH_TIMEOUT_S = 20
+WORKER_S = 60
+FIELDS = 'state isDraft reviewDecision commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
+RED, YELLOW, GREEN, DIM, RESET = '\033[91m', '\033[93m', '\033[92m', '\033[90m', '\033[0m'
+
+
+def link_id(entry, session_id):
+    """`owner/name#N` of a valid github.com pr-link entry of this session, else None."""
+    if not isinstance(entry, dict) or entry.get('type') != 'pr-link' or entry.get('sessionId') != session_id:
+        return None
+    repo, number, url = entry.get('prRepository'), entry.get('prNumber'), entry.get('prUrl')
+    if not (isinstance(repo, str) and REPO.fullmatch(repo) and type(number) is int and number > 0
+            and isinstance(url, str) and re.fullmatch(rf'https://github\.com/{re.escape(repo)}/pull/{number}/?', url)):
+        return None
+    return f'{repo}#{number}'
+
+
+def scan(transcript, session_id):
+    """This session's linked PRs in first-link order; re-stamps of the same link never reorder."""
+    prs = {}
+    with open(transcript, 'rb') as f:
+        for line in f:
+            if b'pr-link' not in line:
+                continue
+            try:
+                pr = link_id(json.loads(line), session_id)
+            except ValueError:
+                continue  # a torn last line parses on the next scan
+            if pr:
+                prs.setdefault(pr)
+    return list(prs)
+
+
+def load(path):
+    try:
+        cache = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {}
+    return cache if isinstance(cache, dict) else {}
+
+
+def num(value):
+    return value if isinstance(value, (int, float)) else 0
+
+
+def cached_prs(cache):
+    prs = cache.get('prs')
+    return [pr for pr in prs if isinstance(pr, str) and PR_ID.fullmatch(pr)] if isinstance(prs, list) else []
+
+
+def cached_status(cache, prs):
+    status = cache.get('status')
+    status = status if isinstance(status, dict) else {}
+    return {pr: status[pr] for pr in prs if isinstance(status.get(pr), dict)}
+
+
+def due(cache, now):
+    return now - num(cache.get('attempt_at')) >= REFRESH_S and now >= num(cache.get('retry_after'))
+
+
+def glyph(status):
+    """One mark per PR: a blocker wins over pending, and green needs a passing check rollup."""
+    rollup, review = status.get('rollup'), status.get('reviewDecision')
+    if rollup in ('FAILURE', 'ERROR') or review == 'CHANGES_REQUESTED':
+        return RED + '✗'
+    if rollup in ('PENDING', 'EXPECTED') or review == 'REVIEW_REQUIRED' or status.get('isDraft'):
+        return YELLOW + '⏳'
+    if rollup == 'SUCCESS':
+        return GREEN + '✓'
+    return DIM + '?'
+
+
+def render(cache, now):
+    """Newest-linked first; only PRs GitHub confirmed merged or closed are hidden."""
+    prs = cached_prs(cache)
+    status = cached_status(cache, prs)
+    live = [pr for pr in reversed(prs) if status.get(pr, {}).get('state') not in TERMINAL]
+    shown = live[:SHOWN]
+    qualify = len({pr.split('#')[0] for pr in shown}) > 1
+    parts = []
+    for pr in shown:
+        s = status.get(pr, {})
+        fetched = s.get('fetched_at')
+        stale = f'{DIM}~{RESET}' if isinstance(fetched, (int, float)) and now - fetched > STALE_S else ''
+        label = pr.split('/', 1)[1] if qualify else '#' + pr.split('#')[1]
+        parts.append(f'{stale}{label}{glyph(s)}{RESET}')
+    if len(live) > SHOWN:
+        parts.append(f'{DIM}+{len(live) - SHOWN}{RESET}')
+    return ' '.join(parts)
+
+
+def publish(path, cache):
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    tmp.write_text(json.dumps(cache))
+    os.replace(tmp, path)
+
+
+def query(prs):
+    """One GraphQL document for every PR: aliased repository fields holding aliased pullRequest fields."""
+    repos = {}
+    for pr in prs:
+        repo, number = pr.split('#')
+        repos.setdefault(repo, []).append(int(number))
+    fields = []
+    for i, (repo, numbers) in enumerate(repos.items()):
+        owner, name = repo.split('/')
+        pulls = ' '.join(f'p{n}: pullRequest(number: {n}) {{ {FIELDS} }}' for n in numbers)
+        fields.append(f'r{i}: repository(owner: "{owner}", name: "{name}") {{ {pulls} }}')
+    return 'query { rateLimit { remaining resetAt } ' + ' '.join(fields) + ' }', list(repos.items())
+
+
+def pr_status(node, now):
+    try:
+        state, draft, review, commits = node['state'], node['isDraft'], node['reviewDecision'], node['commits']['nodes']
+        checks = commits[0]['commit']['statusCheckRollup'] if commits else None
+        rollup = None if checks is None else checks['state']
+    except (KeyError, TypeError, IndexError):
+        raise ValueError('unexpected pull request shape')
+    if (state not in ('OPEN',) + TERMINAL or type(draft) is not bool or not isinstance(commits, list)
+            or not isinstance(review, (str, type(None))) or not isinstance(rollup, (str, type(None)))):
+        raise ValueError('unexpected pull request fields')
+    return {'state': state, 'isDraft': draft, 'reviewDecision': review, 'rollup': rollup, 'fetched_at': now}
+
+
+def fetch(prs, now):
+    """({pr: status} for every PR GitHub returned, epoch to wait for when points run low or None).
+    Any error or unexpected shape raises ValueError, so nothing partial replaces the last-good status."""
+    doc, repos = query(prs)
+    done = subprocess.run(['gh', 'api', 'graphql', '-f', f'query={doc}'], capture_output=True, text=True,
+                          timeout=GH_TIMEOUT_S)
+    answer = json.loads(done.stdout)
+    if done.returncode or not isinstance(answer, dict) or answer.get('errors') or not isinstance(answer.get('data'), dict):
+        raise ValueError(f'gh api graphql failed: {done.stderr.strip()[:200]}')
+    data, status = answer['data'], {}
+    for i, (repo, numbers) in enumerate(repos):
+        fields = data.get(f'r{i}')
+        if not isinstance(fields, dict) or any(f'p{n}' not in fields for n in numbers):
+            raise ValueError(f'incomplete answer for {repo}')
+        for n in numbers:
+            if fields[f'p{n}'] is not None:  # null is unverified, never terminal
+                status[f'{repo}#{n}'] = pr_status(fields[f'p{n}'], now)
+    rate = data.get('rateLimit')
+    try:
+        remaining, reset = rate['remaining'], datetime.datetime.fromisoformat(rate['resetAt'].replace('Z', '+00:00'))
+    except (KeyError, TypeError, AttributeError):
+        raise ValueError('no rateLimit')
+    if type(remaining) is not int:
+        raise ValueError('no rateLimit')
+    return status, reset.timestamp() if remaining < LOW_POINTS else None
+
+
+def refresh(cache_dir, session_id, transcript):
+    """Under the session's flock (the kernel drops it with the worker): recheck, mark the attempt, poll."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f'{session_id}.json'
+    with open(cache_dir / f'{session_id}.lock', 'a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return
+        cache, now = load(path), time.time()
+        if not due(cache, now):
+            return
+        cache['attempt_at'] = now
+        publish(path, cache)
+        try:
+            cache['prs'] = scan(transcript, session_id)
+        except OSError:
+            pass  # no transcript: keep the known membership
+        prs = cached_prs(cache)
+        status = cached_status(cache, prs)
+        polled = [pr for pr in prs if status.get(pr, {}).get('state') != 'MERGED']  # closed ones may reopen
+        if polled:
+            try:
+                fresh, wait = fetch(polled, now)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                cache['retry_after'] = now + BACKOFF_S  # due() let us in, so no later wait is overwritten
+            else:
+                status.update(fresh)
+                if wait:
+                    cache['retry_after'] = wait
+        cache['status'] = status
+        publish(path, cache)
+
+
+def spawn_refresh(cache_dir, session_id, transcript):
+    try:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), 'refresh', str(cache_dir), session_id, transcript],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+def main(argv):
+    if len(argv) == 5 and argv[1] in ('render', 'refresh') and SESSION_ID.fullmatch(argv[3]):
+        cache_dir, session_id, transcript = Path(argv[2]), argv[3], argv[4]
+        if argv[1] == 'refresh':
+            if fcntl:  # no flock (Windows): never refresh
+                signal.alarm(WORKER_S)  # bounds the scan and parsing too, not just gh
+                refresh(cache_dir, session_id, transcript)
+            return 0
+        cache, now = load(cache_dir / f'{session_id}.json'), time.time()
+        print(render(cache, now))
+        if fcntl and due(cache, now) and (os.path.isfile(transcript) or cached_prs(cache)):
+            spawn_refresh(cache_dir, session_id, transcript)
+        return 0
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

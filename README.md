@@ -11,7 +11,7 @@ skills/        skills for both agents
 agents/        <name>.md for both agents, plus <name>.toml for Codex
 hooks/         Claude Code hooks, one folder each with a hooks.json
 workflows/     saved workflows (Claude only)
-statusline/    the Claude Code status line and its Codex usage fetcher
+statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
 tests/         unit tests for skill scripts, hooks and the installer
 ```
 
@@ -34,7 +34,7 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 - `--workflow`: into `~/.claude/workflows`.
 - `--claude-md`: `instructions/user.md` as `~/.claude/CLAUDE.md`, and
   `~/.codex/AGENTS.md` to it.
-- `--statusline`: both `statusline/` files into `~/.claude`, and `statusLine`
+- `--statusline`: the `statusline/` files into `~/.claude`, and `statusLine`
   in `~/.claude/settings.json`; `install` refuses if another one is set. The
   command names `$HOME/.claude`, so another `CLAUDE_CONFIG_DIR` can reuse it.
 
