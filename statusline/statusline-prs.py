@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Status-line segment for the PRs a Claude Code session is linked to, e.g. `#4066✓ #4164⏳`.
+"""Status-line segment for the PRs a Claude Code session is linked to, e.g. `#4066✓ #4164●`.
 
 Claude Code links a session to one PR at a time (its own `gh pr create`, `gh pr view`) and records
 each link as a `pr-link` transcript entry; this session's PRs are every PR it ever linked.
@@ -46,8 +46,8 @@ WORKER_S = 60
 KEEP_S = 7 * 86400
 SWEPT = re.compile(SESSION_ID.pattern + r'\.(json|lock|json\.[0-9]+\.tmp)')
 FIELDS = 'state commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
-RED, YELLOW, GREEN, DIM, RESET = '\033[91m', '\033[93m', '\033[92m', '\033[90m', '\033[0m'
-ORANGE = '\033[38;5;208m'  # xterm DarkOrange, as statusline.sh's credits
+RED, ORANGE, GREEN, DIM, RESET = '\033[91m', '\033[38;5;208m', '\033[92m', '\033[90m', '\033[0m'
+BADGE = '\033[38;2;255;193;7m'  # Claude Code's PR badge colour (dark theme `warning`)
 
 
 def link_id(entry, session_id):
@@ -112,7 +112,7 @@ def glyph(status):
     if rollup in ('FAILURE', 'ERROR'):
         return RED + '✗'
     if rollup in ('PENDING', 'EXPECTED'):
-        return YELLOW + '⏳'
+        return ORANGE + '●'
     return DIM + '?'
 
 
@@ -133,7 +133,7 @@ def render(cache):
         repo, number = pr.split('#')
         label = pr.split('/', 1)[1] if qualify else '#' + number
         url = f'https://github.com/{repo}/pull/{number}'
-        parts.append(f'{ORANGE}{link(url, label)}{glyph(status.get(pr, {}))}{RESET}')
+        parts.append(f'{BADGE}{link(url, label)}{glyph(status.get(pr, {}))}{RESET}')
     if len(live) > SHOWN:
         parts.append(f'{DIM}+{len(live) - SHOWN}{RESET}')
     return ' '.join(parts)

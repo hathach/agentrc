@@ -137,7 +137,7 @@ class PrRenderTest(unittest.TestCase):
 
     def test_the_mark_is_the_check_rollup_alone(self):
         cases = {'✗': [dict(rollup='FAILURE'), dict(rollup='ERROR')],
-                 '⏳': [dict(rollup='PENDING'), dict(rollup='EXPECTED')],
+                 '●': [dict(rollup='PENDING'), dict(rollup='EXPECTED')],
                  '✓': [dict(), dict(reviewDecision='CHANGES_REQUESTED'), dict(isDraft=True)],
                  '?': [dict(rollup=None), dict(rollup='SOMETHING_NEW')]}
         for mark, variants in cases.items():
@@ -152,8 +152,14 @@ class PrRenderTest(unittest.TestCase):
 
     def test_each_label_links_to_its_pull_request(self):
         out = prs.render({'prs': ['o/a#1', 'p/b#2'], 'status': {}})
-        self.assertIn('\x1b[38;5;208m\x1b]8;;https://github.com/p/b/pull/2\ab#2\x1b]8;;\a', out)
+        self.assertIn('\x1b[38;2;255;193;7m\x1b]8;;https://github.com/p/b/pull/2\ab#2\x1b]8;;\a', out)
         self.assertIn('\x1b]8;;https://github.com/o/a/pull/1\aa#1\x1b]8;;\a', out)
+
+    def test_marks_are_coloured_by_check_state(self):
+        for rollup, expected in (('SUCCESS', '\x1b[92m✓'), ('FAILURE', '\x1b[91m✗'), ('PENDING', '\x1b[38;5;208m●'),
+                                 (None, '\x1b[90m?')):
+            with self.subTest(rollup=rollup):
+                self.assertIn(expected, prs.render({'prs': ['o/r#1'], 'status': {'o/r#1': self.status(rollup=rollup)}}))
 
     def test_older_open_pr_behind_many_terminal_ones_still_shows(self):
         ids = ['o/r#1'] + [f'o/r#{n}' for n in range(2, 30)]
