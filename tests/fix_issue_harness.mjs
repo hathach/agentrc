@@ -165,7 +165,7 @@ test('both planners get one byte-identical brief, neither sees the other, Codex 
   assert.doesNotMatch(claude.prompt, /osal_cmsis_rtos2/, 'no draft leaks into the brief')
   const status = calls.find(c => c.label === 'plan:status')
   assert.equal(status.agentType, 'coworker')
-  assert.match(status.prompt, /\bstatus\b/)
+  assert.match(status.prompt, /Operation: status --all\./, 'idle lanes are listed only with --all')
   assert.equal(result.coplan.lane, LANE)
 })
 

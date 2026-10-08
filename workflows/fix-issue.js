@@ -213,7 +213,7 @@ const ask = async (label, task, markers) => {
   return ok ? { id, reply, marker: marks[0] } : null
 }
 
-const status = await coworker('plan:status', 'status')
+const status = await coworker('plan:status', 'status --all')
 coplan.exchanges.push({ label: 'plan:status', relay: status })
 // `codex: no lane` or a `codex/<lane>:` line: anything else is not a listing that proves the lane absent
 if (!status || status.exit !== 0 || !status.stdout.split('\n').some(l => /^codex(: no lane$|\/[a-z0-9-]+: )/.test(l))) {

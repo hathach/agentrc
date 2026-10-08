@@ -26,7 +26,7 @@ python3 ~/.claude/skills/cowork/scripts/cowork.py send --lane <lane> --read-only
 
 ## Other commands
 
-`status`, `read <id>`, `read --wait <id>`, `kill <id>`, `reset codex <lane>|all`: run exactly the one the prompt names. `read <id>` recovers a request whose sender died without delivering; `status` shows it.
+`status [--all]`, `read <id>`, `read --wait <id>`, `kill <id>`, `reset codex <lane>|all`: run exactly the one the prompt names. `read <id>` recovers a request whose sender died without delivering; `status` shows it.
 
 ## Output
 
