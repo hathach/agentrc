@@ -2412,6 +2412,10 @@ if (adoptHead !== null) {
     : null
   if (why) {
     log(`preflight: adoption refused — ${why}`)
+    // commits.py's missing-base error: the base moved again after the merge, so a fetch and the same adoption recover it
+    if (audit && /^the PR's base [0-9a-f]{40} is not in the checkout: fetch it$/.test(audit.error || '')) {
+      return finish(stop(cyclesUsed, 'adopt-base-missing', { detail: why }))
+    }
     return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: why }))
   }
   if (prHead !== X && !shas.includes(prHead)) {

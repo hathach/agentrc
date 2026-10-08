@@ -42,6 +42,9 @@ SUMMARY = re.compile(r'^cycle \d+ summary — ')
 IDE_DRIFT = re.compile(r'(?:.*/)?\.idea/')
 CUT = 300
 ADOPTION_REFUSED = 'the adoption was refused: investigate and report it, never answer it with a reset or a fabricated state'
+BASE_FETCH = ('; this one lacks the base: fetch the base branch from the PR\'s base repository (not assuming the push remote, '
+              'changing no credentials), then retry the same adoption with the same stateRef and adoptHead; '
+              'a base that moved again can need another retry')
 # budget-exhausted-unverified is no longer produced; kept so an older launch's output still reads.
 REFUSED = {
     'budget-exhausted-unverified': 'the launch stopped before loading its state, whose copy showed the cycle budget spent; '
@@ -50,6 +53,7 @@ REFUSED = {
     'state-mismatch': "the PR or its remote differs from the state's pin (compare the result's pin with expected): report it; "
                       "starting over is the user's decision, never a reset or a fresh launch",
     'adopt-head-mismatch': ADOPTION_REFUSED, 'adopt-pending': ADOPTION_REFUSED, 'adopt-audit-failed': ADOPTION_REFUSED,
+    'adopt-base-missing': ADOPTION_REFUSED + BASE_FETCH,
     'rebase-refused': 'the re-pin was refused: check out the rebasedHead or resolve the pending candidate, else report it; '
                       'never reset the state',
     'stale-head': "HEAD moved off the state's head since the last launch: commits on top of it rejoin by adoptHead; "

@@ -145,6 +145,7 @@ class LaunchResultTest(unittest.TestCase):
                              ('adopt-head-mismatch', 'never answer it with a reset or a fabricated state'),
                              ('adopt-pending', 'never answer it with a reset or a fabricated state'),
                              ('adopt-audit-failed', 'never answer it with a reset or a fabricated state'),
+                             ('adopt-base-missing', 'retry the same adoption with the same stateRef and adoptHead'),
                              ('rebase-refused', 'the re-pin was refused'),
                              ('stale-head', "only on the user's word"),
                              ('wrong-head', 'check out the PR head'),

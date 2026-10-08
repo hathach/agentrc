@@ -72,6 +72,7 @@ def on_base(sha, bases):
         return True
     missing = [b for b in bases if b not in present]
     if missing:
+        # pr-babysit.js matches this text to stop as adopt-base-missing
         raise Unusable(f"the PR's base {missing[0]} is not in the checkout: fetch it")
     return False
 

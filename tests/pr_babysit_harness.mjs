@@ -5014,6 +5014,23 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
   }
 })
 
+test('a merge whose base the checkout lacks stops as adopt-base-missing; other audit errors and refusals do not', async () => {
+  const missing = `the PR's base ${TIP} is not in the checkout: fetch it`
+  const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], refusal: '' })
+  for (const [audit, reason] of [
+    [errored(missing), 'adopt-base-missing'],
+    [errored('git rev-list: fatal: bad revision'), 'adopt-audit-failed'],
+    [errored(`${missing} (twice)`), 'adopt-audit-failed'],
+    [chainAudit([ADOPT], undefined, { refusal: `commit message carries attribution: Co-Authored-By: ${missing}` }), 'adopt-audit-failed'],
+  ]) {
+    const state = adoptionState()
+    const { result, labels } = await run({ args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit })
+    assert.equal(result.reason, reason, JSON.stringify(audit))
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'])
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+  }
+})
+
 test('a chain the audit script cannot read back is refused with its error', async () => {
   const { result, labels } = await run({
     args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
