@@ -10,7 +10,13 @@ each link as a `pr-link` transcript entry; this session's PRs are every PR it ev
                                                  in one GraphQL request, for every PR not merged
 
 Cache `<cache_dir>/<session_id>.json`: {"prs": ["owner/name#N", ...] in first-link order,
-"status": {pr: {state, isDraft, reviewDecision, rollup, fetched_at}}, "attempt_at", "retry_after"}. A failed poll keeps the last-good status with its own fetched_at.
+"status": {pr: {state, isDraft, reviewDecision, rollup, fetched_at}}, "attempt_at", "retry_after"}.
+A failed poll keeps the last-good status with its own fetched_at.
+
+One flock on `<cache_dir>/.lock` covers each whole refresh, for every session; a refresh that finds
+it held leaves without writing, so a later render retries (best effort, no fairness). The
+sweep removes caches, temp files a killed worker left and the per-session `.lock` files of the
+earlier scheme once idle for KEEP_S; a resumed session rebuilds its cache from the transcript.
 """
 import datetime
 import json
@@ -38,6 +44,8 @@ BACKOFF_S = 300
 LOW_POINTS = 200  # the gh budget is shared with chief and pr-babysit: yield it when low
 GH_TIMEOUT_S = 20
 WORKER_S = 60
+KEEP_S = 7 * 86400
+SWEPT = re.compile(SESSION_ID.pattern + r'\.(json|lock|json\.[0-9]+\.tmp)')
 FIELDS = 'state isDraft reviewDecision commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
 RED, YELLOW, GREEN, DIM, RESET = '\033[91m', '\033[93m', '\033[92m', '\033[90m', '\033[0m'
 
@@ -188,10 +196,11 @@ def fetch(prs, now):
 
 
 def refresh(cache_dir, session_id, transcript):
-    """Under the session's flock (the kernel drops it with the worker): recheck, mark the attempt, poll."""
+    """Under the directory's flock (the kernel drops it with the worker): recheck, mark the attempt, poll.
+    The lock stays held to the last publish; attempt_at is wall-clock, so it cannot exclude a worker."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / f'{session_id}.json'
-    with open(cache_dir / f'{session_id}.lock', 'a') as lock:
+    with open(cache_dir / '.lock', 'a') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -201,6 +210,10 @@ def refresh(cache_dir, session_id, transcript):
             return
         cache['attempt_at'] = now
         publish(path, cache)
+        try:
+            sweep(cache_dir, now)
+        except OSError:
+            pass  # best effort
         try:
             cache['prs'] = scan(transcript, session_id)
         except OSError:
@@ -219,6 +232,17 @@ def refresh(cache_dir, session_id, transcript):
                     cache['retry_after'] = wait
         cache['status'] = status
         publish(path, cache)
+
+
+def sweep(cache_dir, now):
+    """Remove this helper's files idle for KEEP_S; a directory fails to unlink, a symlink loses only itself."""
+    with os.scandir(cache_dir) as entries:
+        for entry in entries:
+            try:
+                if SWEPT.fullmatch(entry.name) and now - entry.stat(follow_symlinks=False).st_mtime >= KEEP_S:
+                    os.unlink(entry.path)
+            except OSError:
+                pass
 
 
 def spawn_refresh(cache_dir, session_id, transcript):

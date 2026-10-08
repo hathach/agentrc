@@ -95,8 +95,10 @@ class RenderTest(unittest.TestCase):
                 self.assertTrue((home / 'entered').exists(), 'the detached worker reached gh after render returned')
             finally:
                 (home / 'go').touch()
-                with open(home / 'statusline-prs' / f'{SID}.lock', 'a') as held:
-                    prs.fcntl.flock(held, prs.fcntl.LOCK_EX)  # it finishes before the directory goes
+                cache = home / 'statusline-prs' / f'{SID}.json'
+                deadline = time.monotonic() + 10
+                while 'retry_after' not in prs.load(cache) and time.monotonic() < deadline:
+                    time.sleep(0.05)  # the worker publishes its failed poll before the directory goes
 
 
 class PrScanTest(unittest.TestCase):
@@ -346,10 +348,50 @@ class PrRefreshTest(unittest.TestCase):
         self.assertEqual(len(self.calls()), 3, 'an all-merged session makes no gh call')
         self.assertNotIn('retry_after', self.cache())
 
+    def test_a_refresh_sweeps_only_this_helpers_idle_files(self):
+        self.answer(self.all())
+        self.cache_dir.mkdir()
+        old, fresh = time.time() - prs.KEEP_S - 60, time.time() - 600
+        files = {'idle-1.json': old, 'live-2.json': fresh, 'idle-1.json.4242.tmp': old, 'live-2.json.4243.tmp': fresh,
+                 'idle-5.lock': old, 'live-6.lock': fresh, 'notes.txt': old, '.lock': old}
+        for name, mtime in files.items():
+            (self.cache_dir / name).write_text('x')
+            os.utime(self.cache_dir / name, (mtime, mtime))
+        (self.cache_dir / 'dir-3.json').mkdir()
+        os.utime(self.cache_dir / 'dir-3.json', (old, old))
+        os.symlink(self.dir / 'answer', self.cache_dir / 'link-4.json')
+        os.utime(self.cache_dir / 'link-4.json', (old, old), follow_symlinks=False)
+        self.refresh()
+        self.assertEqual(sorted(os.listdir(self.cache_dir)),
+                         ['.lock', f'{SID}.json', 'dir-3.json', 'live-2.json', 'live-2.json.4243.tmp', 'live-6.lock',
+                          'notes.txt'])
+        self.assertTrue((self.dir / 'answer').exists(), 'a swept symlink leaves its target')
+
+    def test_an_unreadable_cache_dir_leaves_the_refresh_result_in_place(self):
+        self.answer(self.all())
+        with mock.patch.object(prs.os, 'scandir', side_effect=PermissionError):
+            self.refresh()
+        self.assertIn('o/r#1', self.cache()['status'])
+
+    def test_a_clock_jump_cannot_admit_a_second_worker_mid_refresh(self):
+        self.answer(self.all())
+        poll = prs.fetch
+
+        def jump_then_poll(polled, now):
+            self.write_links(link(4, 'o/r'))
+            with mock.patch.object(prs.time, 'time', return_value=now + prs.REFRESH_S + 1):
+                self.refresh()  # would publish the new link if the lock let it in
+            return poll(polled, now)
+
+        with mock.patch.object(prs, 'fetch', side_effect=jump_then_poll):
+            self.refresh()
+        self.assertEqual(self.cache()['prs'], ['o/r#1', 'o/r#2', 'o/s#3'])
+        self.assertEqual(len(self.calls()), 1)
+
     def test_a_held_lock_makes_a_second_refresher_leave_without_writing(self):
         self.answer(self.all())
         self.cache_dir.mkdir()
-        with open(self.cache_dir / f'{SID}.lock', 'a') as held:
+        with open(self.cache_dir / '.lock', 'a') as held:
             prs.fcntl.flock(held, prs.fcntl.LOCK_EX)
             self.refresh()
         self.assertFalse((self.cache_dir / f'{SID}.json').exists())
