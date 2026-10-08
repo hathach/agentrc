@@ -8,7 +8,7 @@
 #   C      Codex week, from the codex app-server (account/rateLimits/read)
 #   ↻      reset time, local, short form (HH:MM today, else "MonDD HH:MM");
 #          one after the Claude weekly %s, one after the Codex %
-#   #N     open PRs this session linked, newest first: ✓ green, ⏳ pending, ✗ blocked, ? unknown
+#   #N     open PRs this session linked, newest first, by check state: ✓ passed, ⏳ running, ✗ failed, ? unknown
 #
 # Usage is fetched in the BACKGROUND and cached, so rendering never blocks on
 # the network. Colors: green <50%, yellow <80%, red >=80%.

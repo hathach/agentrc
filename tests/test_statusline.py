@@ -78,8 +78,7 @@ class RenderTest(unittest.TestCase):
             (home / 'statusline-prs').mkdir()
             (home / 'statusline-prs' / f'{SID}.json').write_text(json.dumps({
                 'prs': ['o/r#7'], 'attempt_at': 0,
-                'status': {'o/r#7': {'state': 'OPEN', 'isDraft': False, 'reviewDecision': None,
-                                     'rollup': 'SUCCESS'}}}))
+                'status': {'o/r#7': {'state': 'OPEN', 'rollup': 'SUCCESS'}}}))
             payload = {'workspace': {'current_dir': str(home)}, 'session_id': SID, 'transcript_path': str(transcript)}
             try:
                 # a render that waited for the held gh would outlast this timeout (GH_TIMEOUT_S is longer)
@@ -129,20 +128,18 @@ class PrRenderTest(unittest.TestCase):
         return plain(prs.render({'prs': ids, 'status': status or {}}))
 
     def status(self, **fields):
-        return {'state': 'OPEN', 'isDraft': False, 'reviewDecision': None, 'rollup': 'SUCCESS', **fields}
+        return {'state': 'OPEN', 'rollup': 'SUCCESS', **fields}
 
     def test_newest_link_first_terminal_hidden_unknown_shown(self):
         ids = ['o/r#1', 'o/r#2', 'o/r#3']
         status = {'o/r#1': self.status(), 'o/r#2': self.status(state='MERGED')}
         self.assertEqual(self.render(ids, status), '#3? #1✓')
 
-    def test_one_mark_per_pr_by_precedence(self):
-        cases = {'✗': [dict(rollup='FAILURE'), dict(rollup='ERROR'), dict(reviewDecision='CHANGES_REQUESTED'),
-                       dict(rollup='PENDING', reviewDecision='CHANGES_REQUESTED')],
-                 '⏳': [dict(rollup='PENDING'), dict(rollup='EXPECTED'), dict(reviewDecision='REVIEW_REQUIRED'),
-                       dict(isDraft=True), dict(isDraft=True, rollup=None)],
-                 '✓': [dict(), dict(reviewDecision='APPROVED')],
-                 '?': [dict(rollup=None)]}
+    def test_the_mark_is_the_check_rollup_alone(self):
+        cases = {'✗': [dict(rollup='FAILURE'), dict(rollup='ERROR')],
+                 '⏳': [dict(rollup='PENDING'), dict(rollup='EXPECTED')],
+                 '✓': [dict(), dict(reviewDecision='CHANGES_REQUESTED'), dict(isDraft=True)],
+                 '?': [dict(rollup=None), dict(rollup='SOMETHING_NEW')]}
         for mark, variants in cases.items():
             for fields in variants:
                 with self.subTest(mark=mark, fields=fields):
@@ -185,9 +182,9 @@ exit "${STUB_RC:-0}"
 """
 
 
-def pull(state='OPEN', rollup='SUCCESS', draft=False, review=None):
+def pull(state='OPEN', rollup='SUCCESS'):
     nodes = [{'commit': {'statusCheckRollup': rollup and {'state': rollup}}}]
-    return {'state': state, 'isDraft': draft, 'reviewDecision': review, 'commits': {'nodes': nodes}}
+    return {'state': state, 'commits': {'nodes': nodes}}
 
 
 class PrRefreshTest(unittest.TestCase):

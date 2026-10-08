@@ -10,7 +10,7 @@ each link as a `pr-link` transcript entry; this session's PRs are every PR it ev
                                                  in one GraphQL request, for every PR not merged
 
 Cache `<cache_dir>/<session_id>.json`: {"prs": ["owner/name#N", ...] in first-link order,
-"status": {pr: {state, isDraft, reviewDecision, rollup}}, "attempt_at", "retry_after"}.
+"status": {pr: {state, rollup}}, "attempt_at", "retry_after"}.
 A failed poll keeps the last-good status.
 
 One flock on `<cache_dir>/.lock` covers each whole refresh, for every session; a refresh that finds
@@ -45,7 +45,7 @@ GH_TIMEOUT_S = 20
 WORKER_S = 60
 KEEP_S = 7 * 86400
 SWEPT = re.compile(SESSION_ID.pattern + r'\.(json|lock|json\.[0-9]+\.tmp)')
-FIELDS = 'state isDraft reviewDecision commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
+FIELDS = 'state commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
 RED, YELLOW, GREEN, DIM, RESET = '\033[91m', '\033[93m', '\033[92m', '\033[90m', '\033[0m'
 ORANGE = '\033[38;5;208m'  # xterm DarkOrange, as statusline.sh's credits
 
@@ -105,14 +105,14 @@ def due(cache, now):
 
 
 def glyph(status):
-    """One mark per PR: a blocker wins over pending, and green needs a passing check rollup."""
-    rollup, review = status.get('rollup'), status.get('reviewDecision')
-    if rollup in ('FAILURE', 'ERROR') or review == 'CHANGES_REQUESTED':
-        return RED + '✗'
-    if rollup in ('PENDING', 'EXPECTED') or review == 'REVIEW_REQUIRED' or status.get('isDraft'):
-        return YELLOW + '⏳'
+    """The PR's check rollup: passed, failed, running, or unknown (none yet, or never fetched)."""
+    rollup = status.get('rollup')
     if rollup == 'SUCCESS':
         return GREEN + '✓'
+    if rollup in ('FAILURE', 'ERROR'):
+        return RED + '✗'
+    if rollup in ('PENDING', 'EXPECTED'):
+        return YELLOW + '⏳'
     return DIM + '?'
 
 
@@ -161,15 +161,14 @@ def query(prs):
 
 def pr_status(node):
     try:
-        state, draft, review, commits = node['state'], node['isDraft'], node['reviewDecision'], node['commits']['nodes']
+        state, commits = node['state'], node['commits']['nodes']
         checks = commits[0]['commit']['statusCheckRollup'] if commits else None
         rollup = None if checks is None else checks['state']
     except (KeyError, TypeError, IndexError):
         raise ValueError('unexpected pull request shape')
-    if (state not in ('OPEN',) + TERMINAL or type(draft) is not bool or not isinstance(commits, list)
-            or not isinstance(review, (str, type(None))) or not isinstance(rollup, (str, type(None)))):
+    if state not in ('OPEN',) + TERMINAL or not isinstance(commits, list) or not isinstance(rollup, (str, type(None))):
         raise ValueError('unexpected pull request fields')
-    return {'state': state, 'isDraft': draft, 'reviewDecision': review, 'rollup': rollup}
+    return {'state': state, 'rollup': rollup}
 
 
 def fetch(prs):
