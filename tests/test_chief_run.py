@@ -74,7 +74,9 @@ class ChiefRun(unittest.TestCase):
         self.task.write_text('Babysit PR 1.\n')
         self.out = self.root / 'run'
         # HOME holds the transcripts run_cost.py reads: none, unless a test writes them
-        self.env = {**os.environ, 'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'FAKE_DIR': str(self.fake),
+        # with no CLAUDE_CONFIG_DIR, the user scope is HOME/.claude
+        self.env = {**{k: v for k, v in os.environ.items() if k != 'CLAUDE_CONFIG_DIR'},
+                    'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'FAKE_DIR': str(self.fake),
                     'CLAUDECODE': '1', 'HERDR_PANE_ID': 'p1', 'HERDR_ENV': '1', 'HOME': str(self.root)}
 
     def stream(self, *events):
@@ -385,6 +387,120 @@ class ChiefRun(unittest.TestCase):
         self.stream(init(), result())
         r = self.run_it(worktree=elsewhere)
         self.assertEqual(r.returncode, 0, f'another worktree is not blocked: {r.stderr}')
+
+    def installed(self, kind, name, content, root=None, scope=None):
+        """An agentrc entry linked into the user scope as install.py links it."""
+        src = (root or self.root / 'agentrc') / kind / name
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text(content)
+        link = (scope or self.root / '.claude') / kind / name
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(src)
+        return src
+
+    def project(self, kind, name, content):
+        path = self.worktree / '.claude' / kind / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+        return path
+
+    def assert_refused(self, r, named=(), not_named=()):
+        self.assertEqual(r.returncode, 2, r.stderr)
+        for want in named:
+            self.assertIn(want, r.stderr)
+        for unwanted in not_named:
+            self.assertNotIn(unwanted, r.stderr)
+        self.assertFalse(self.out.exists())
+        self.assertFalse((self.fake / 'argv.json').exists(), 'claude must not start')
+
+    def test_a_stale_tracked_workflow_is_refused_before_launch(self):
+        self.stream(init(), result())
+        self.installed('workflows', 'pr-babysit.js', 'new')
+        stale = self.project('workflows', 'pr-babysit.js', 'old')
+        self.assert_refused(self.run_it(), ['.claude/workflows/pr-babysit.js', 'merge the default branch', str(self.root / '.claude')])
+        r = self.run_it(detached=True)
+        self.assertEqual((r.returncode, r.stdout), (2, ''))
+        self.assert_refused(r)
+        stale.unlink()
+        self.assertEqual(self.run_it().returncode, 0)
+
+    def test_stale_roles_are_refused_chief_included(self):
+        self.stream(init(), result())
+        for name in ('code-writer.md', 'chief.md'):
+            self.installed('agents', name, 'new')
+            self.project('agents', name, 'old')
+        self.assert_refused(self.run_it(), ['.claude/agents/code-writer.md', '.claude/agents/chief.md'])
+
+    def test_a_copy_that_shadows_nothing_installed_is_let_through(self):
+        self.stream(init(), result())
+        self.installed('workflows', 'pr-babysit.js', 'same')
+        self.project('workflows', 'pr-babysit.js', 'same')
+        mine = self.root / '.claude' / 'agents' / 'mine.md'   # the user's own role, which a project may override
+        mine.parent.mkdir(parents=True)
+        mine.write_text('user')
+        self.project('agents', 'mine.md', 'project')
+        self.project('agents', 'hw-debugger.md', 'not installed')
+        self.installed('agents', 'code-writer.md', 'new').unlink()   # a dangling link
+        self.project('agents', 'code-writer.md', 'old')
+        r = self.run_it()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_a_peer_installed_from_another_checkout_counts(self):
+        self.stream(init(), result())
+        self.installed('workflows', 'pr-babysit.js', 'new', root=self.root / 'other-agentrc')
+        copy = self.project('workflows', 'pr-babysit.js', 'old')
+        self.assert_refused(self.run_it(), ['.claude/workflows/pr-babysit.js'])
+        copy.write_text('new')
+        self.assertEqual(self.run_it().returncode, 0)
+
+    def test_the_user_scope_follows_claude_config_dir(self):
+        self.stream(init(), result())
+        cfg = self.root / 'cfg'
+        self.installed('workflows', 'pr-babysit.js', 'old')
+        self.installed('workflows', 'pr-babysit.js', 'new', root=self.root / 'agentrc-new', scope=cfg)
+        copy = self.project('workflows', 'pr-babysit.js', 'new')
+        self.assertEqual(self.run_it(CLAUDE_CONFIG_DIR=str(cfg)).returncode, 0)
+        shutil.rmtree(self.out)
+        (self.fake / 'argv.json').unlink()
+        self.assert_refused(self.run_it(), ['.claude/workflows/pr-babysit.js'])
+        copy.write_text('old')
+        self.assert_refused(self.run_it(CLAUDE_CONFIG_DIR=str(cfg)), [str(cfg)])
+
+    def test_symlinked_project_entries_are_followed(self):
+        self.stream(init(), result())
+        self.installed('workflows', 'pr-babysit.js', 'new')
+        self.installed('agents', 'code-writer.md', 'new')
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'pr-babysit.js').write_text('old')
+        (outside / 'code-writer.md').write_text('old')
+        (self.worktree / '.claude' / 'agents').mkdir(parents=True)
+        (self.worktree / '.claude' / 'workflows').symlink_to(outside)
+        (self.worktree / '.claude' / 'agents' / 'code-writer.md').symlink_to(outside / 'code-writer.md')
+        self.assert_refused(self.run_it(), ['.claude/workflows/pr-babysit.js', '.claude/agents/code-writer.md'])
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root reads any directory')
+    def test_an_unreadable_project_or_installed_directory_is_refused_without_merge_advice(self):
+        self.stream(init(), result())
+        self.installed('agents', 'code-writer.md', 'new')
+        project = self.project('agents', 'code-writer.md', 'old').parent
+        for unreadable in (project, self.root / '.claude' / 'agents'):
+            with self.subTest(unreadable=unreadable):
+                unreadable.chmod(0)
+                try:
+                    self.assert_refused(self.run_it(), ['cannot inspect', str(unreadable)], ['merge the default branch'])
+                finally:
+                    unreadable.chmod(0o755)
+
+    def test_a_catalogue_it_cannot_read_is_an_error_not_an_empty_one(self):
+        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
+        chief_run = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(chief_run)
+        agentrc = self.root / 'agentrc-partial'
+        (agentrc / 'agents').mkdir(parents=True)
+        with mock.patch.object(chief_run, 'AGENTRC', agentrc), self.assertRaises(FileNotFoundError) as caught:
+            chief_run.shadows(self.worktree)
+        self.assertEqual(Path(caught.exception.filename), agentrc / 'workflows')
 
 
 if __name__ == '__main__':

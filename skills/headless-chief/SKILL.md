@@ -23,7 +23,10 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
 2. **Launch** in the foreground: it checks the arguments, starts the
    launcher in its own session, prints its pid and returns. A chief
    runs as long as it needs; a background command would end it at the tool's
-   time limit. A refused argument exits 2 at once. The
+   time limit. A refused argument exits 2 at once. So does a worktree whose
+   `.claude/workflows` or `.claude/agents` entries differ from the same-named
+   agentrc copies installed in the user scope (`$CLAUDE_CONFIG_DIR`, else
+   `~/.claude`), which they would shadow; the message names the fix. The
    `launcher: exit` line in `progress.log` is the end of the run;
    `kill <launcher pid>` stops it early.
 3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`, its
@@ -58,7 +61,7 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    |---|---|
    | 0 | chief ended with a report |
    | 1 | no final result, an error result, or one without text |
-   | 2 | bad arguments, `--out` already exists, or a chief already runs in the worktree |
+   | 2 | bad arguments, `--out` already exists, a chief already runs in the worktree, or its `.claude` shadows agentrc's installed copies or cannot be read |
    | 127 | `claude` could not start |
    | other | claude's own status; 128 + N when killed by signal N |
 

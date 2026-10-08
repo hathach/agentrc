@@ -17,6 +17,7 @@ command timeout ends the run; --foreground runs it in place. Exit codes and usag
 in SKILL.md.
 """
 import argparse
+import filecmp
 import json
 import os
 import re
@@ -31,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_cost  # noqa: E402
 
 MARKER = 'chief: '
+AGENTRC = Path(__file__).resolve().parents[3]   # the agentrc checkout this launcher runs from
+KINDS = {'workflows': '.js', 'agents': '.md'}
 
 
 def fail(msg):
@@ -66,6 +69,30 @@ def running_chiefs(worktree):
         except OSError:
             continue   # gone, or not ours to read
     return pids
+
+
+def user_scope():
+    return Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+
+
+def shadows(worktree):
+    """The worktree's `.claude/workflows` and `.claude/agents` entries that differ from the same-named
+    agentrc ones installed in the user scope; an entry it cannot read raises OSError. Project scope wins
+    for `Workflow({name})` and for role lookup, so a branch's stale copy would run in place of the
+    installed one (#59)."""
+    stale, scope = [], user_scope()
+    for kind, suffix in KINDS.items():
+        with os.scandir(AGENTRC / kind) as entries:
+            names = {e.name for e in entries if e.name.endswith(suffix)}
+        d = worktree / '.claude' / kind
+        if not d.is_dir():
+            continue
+        with os.scandir(d) as entries:
+            candidates = sorted(e.name for e in entries if e.name in names)
+        # an absent or dangling peer is no installed copy to shadow
+        stale += [f'.claude/{kind}/{name}' for name in candidates
+                  if (scope / kind / name).is_file() and not filecmp.cmp(d / name, scope / kind / name, shallow=False)]
+    return stale
 
 
 def child_env():
@@ -139,6 +166,13 @@ def main(argv=None):
         fail(f'{a.task_file} is not a file')
     if pids := running_chiefs(a.worktree):
         fail(f'a chief already runs in {a.worktree} (pid {", ".join(map(str, pids))})')
+    try:
+        stale = shadows(a.worktree)
+    except OSError as e:
+        fail(f'cannot inspect {a.worktree}/.claude: {e}')
+    if stale:
+        fail(f'{a.worktree} carries {", ".join(stale)}, which would shadow the agentrc copies installed in {user_scope()}: '
+             'merge the default branch into the task branch (remove an untracked copy), then relaunch with a new --out')
     try:
         task = a.task_file.open('rb')
     except OSError as e:
