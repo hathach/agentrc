@@ -10,8 +10,8 @@ each link as a `pr-link` transcript entry; this session's PRs are every PR it ev
                                                  in one GraphQL request, for every PR not merged
 
 Cache `<cache_dir>/<session_id>.json`: {"prs": ["owner/name#N", ...] in first-link order,
-"status": {pr: {state, isDraft, reviewDecision, rollup, fetched_at}}, "attempt_at", "retry_after"}.
-A failed poll keeps the last-good status with its own fetched_at.
+"status": {pr: {state, isDraft, reviewDecision, rollup}}, "attempt_at", "retry_after"}.
+A failed poll keeps the last-good status.
 
 One flock on `<cache_dir>/.lock` covers each whole refresh, for every session; a refresh that finds
 it held leaves without writing, so a later render retries (best effort, no fairness). The
@@ -37,7 +37,6 @@ SESSION_ID = re.compile(r'[A-Za-z0-9-]+')
 REPO = re.compile(r'[\w.-]+/[\w.-]+')
 PR_ID = re.compile(REPO.pattern + r'#[1-9][0-9]*')
 SHOWN = 5
-STALE_S = 300
 TERMINAL = ('MERGED', 'CLOSED')
 REFRESH_S = 120
 BACKOFF_S = 300
@@ -48,6 +47,7 @@ KEEP_S = 7 * 86400
 SWEPT = re.compile(SESSION_ID.pattern + r'\.(json|lock|json\.[0-9]+\.tmp)')
 FIELDS = 'state isDraft reviewDecision commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'
 RED, YELLOW, GREEN, DIM, RESET = '\033[91m', '\033[93m', '\033[92m', '\033[90m', '\033[0m'
+ORANGE = '\033[38;5;208m'  # xterm DarkOrange, as statusline.sh's credits
 
 
 def link_id(entry, session_id):
@@ -116,7 +116,12 @@ def glyph(status):
     return DIM + '?'
 
 
-def render(cache, now):
+def link(url, text):
+    """OSC 8 hyperlink, BEL-terminated as Claude Code writes its own."""
+    return f'\033]8;;{url}\a{text}\033]8;;\a'
+
+
+def render(cache):
     """Newest-linked first; only PRs GitHub confirmed merged or closed are hidden."""
     prs = cached_prs(cache)
     status = cached_status(cache, prs)
@@ -125,11 +130,10 @@ def render(cache, now):
     qualify = len({pr.split('#')[0] for pr in shown}) > 1
     parts = []
     for pr in shown:
-        s = status.get(pr, {})
-        fetched = s.get('fetched_at')
-        stale = f'{DIM}~{RESET}' if isinstance(fetched, (int, float)) and now - fetched > STALE_S else ''
-        label = pr.split('/', 1)[1] if qualify else '#' + pr.split('#')[1]
-        parts.append(f'{stale}{label}{glyph(s)}{RESET}')
+        repo, number = pr.split('#')
+        label = pr.split('/', 1)[1] if qualify else '#' + number
+        url = f'https://github.com/{repo}/pull/{number}'
+        parts.append(f'{ORANGE}{link(url, label)}{glyph(status.get(pr, {}))}{RESET}')
     if len(live) > SHOWN:
         parts.append(f'{DIM}+{len(live) - SHOWN}{RESET}')
     return ' '.join(parts)
@@ -155,7 +159,7 @@ def query(prs):
     return 'query { rateLimit { remaining resetAt } ' + ' '.join(fields) + ' }', list(repos.items())
 
 
-def pr_status(node, now):
+def pr_status(node):
     try:
         state, draft, review, commits = node['state'], node['isDraft'], node['reviewDecision'], node['commits']['nodes']
         checks = commits[0]['commit']['statusCheckRollup'] if commits else None
@@ -165,10 +169,10 @@ def pr_status(node, now):
     if (state not in ('OPEN',) + TERMINAL or type(draft) is not bool or not isinstance(commits, list)
             or not isinstance(review, (str, type(None))) or not isinstance(rollup, (str, type(None)))):
         raise ValueError('unexpected pull request fields')
-    return {'state': state, 'isDraft': draft, 'reviewDecision': review, 'rollup': rollup, 'fetched_at': now}
+    return {'state': state, 'isDraft': draft, 'reviewDecision': review, 'rollup': rollup}
 
 
-def fetch(prs, now):
+def fetch(prs):
     """({pr: status} for every PR GitHub returned, epoch to wait for when points run low or None).
     Any error or unexpected shape raises ValueError, so nothing partial replaces the last-good status."""
     doc, repos = query(prs)
@@ -184,7 +188,7 @@ def fetch(prs, now):
             raise ValueError(f'incomplete answer for {repo}')
         for n in numbers:
             if fields[f'p{n}'] is not None:  # null is unverified, never terminal
-                status[f'{repo}#{n}'] = pr_status(fields[f'p{n}'], now)
+                status[f'{repo}#{n}'] = pr_status(fields[f'p{n}'])
     rate = data.get('rateLimit')
     try:
         remaining, reset = rate['remaining'], datetime.datetime.fromisoformat(rate['resetAt'].replace('Z', '+00:00'))
@@ -223,7 +227,7 @@ def refresh(cache_dir, session_id, transcript):
         polled = [pr for pr in prs if status.get(pr, {}).get('state') != 'MERGED']  # closed ones may reopen
         if polled:
             try:
-                fresh, wait = fetch(polled, now)
+                fresh, wait = fetch(polled)
             except (OSError, ValueError, subprocess.SubprocessError):
                 cache['retry_after'] = now + BACKOFF_S  # due() let us in, so no later wait is overwritten
             else:
@@ -263,7 +267,7 @@ def main(argv):
                 refresh(cache_dir, session_id, transcript)
             return 0
         cache, now = load(cache_dir / f'{session_id}.json'), time.time()
-        print(render(cache, now))
+        print(render(cache))
         if fcntl and due(cache, now) and (os.path.isfile(transcript) or cached_prs(cache)):
             spawn_refresh(cache_dir, session_id, transcript)
         return 0

@@ -18,7 +18,7 @@ spec = importlib.util.spec_from_file_location('statusline_prs', ROOT / 'statusli
 prs = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(prs)
 SID = '38bd3fd0-775b-4cdb-bc1f-32d8a7eb775a'
-ANSI = re.compile(r'\x1b\[[0-9;]*m')
+ANSI = re.compile(r'\x1b\[[0-9;]*m|\x1b\]8;;[^\a]*\a')
 
 
 def link(number, repo='hathach/tinyusb', sid=SID):
@@ -79,7 +79,7 @@ class RenderTest(unittest.TestCase):
             (home / 'statusline-prs' / f'{SID}.json').write_text(json.dumps({
                 'prs': ['o/r#7'], 'attempt_at': 0,
                 'status': {'o/r#7': {'state': 'OPEN', 'isDraft': False, 'reviewDecision': None,
-                                     'rollup': 'SUCCESS', 'fetched_at': time.time()}}}))
+                                     'rollup': 'SUCCESS'}}}))
             payload = {'workspace': {'current_dir': str(home)}, 'session_id': SID, 'transcript_path': str(transcript)}
             try:
                 # a render that waited for the held gh would outlast this timeout (GH_TIMEOUT_S is longer)
@@ -125,14 +125,11 @@ class PrScanTest(unittest.TestCase):
 
 
 class PrRenderTest(unittest.TestCase):
-    NOW = 1_000_000
-
     def render(self, ids, status=None):
-        return plain(prs.render({'prs': ids, 'status': status or {}}, self.NOW))
+        return plain(prs.render({'prs': ids, 'status': status or {}}))
 
     def status(self, **fields):
-        return {'state': 'OPEN', 'isDraft': False, 'reviewDecision': None, 'rollup': 'SUCCESS',
-                'fetched_at': self.NOW - 10, **fields}
+        return {'state': 'OPEN', 'isDraft': False, 'reviewDecision': None, 'rollup': 'SUCCESS', **fields}
 
     def test_newest_link_first_terminal_hidden_unknown_shown(self):
         ids = ['o/r#1', 'o/r#2', 'o/r#3']
@@ -151,11 +148,15 @@ class PrRenderTest(unittest.TestCase):
                 with self.subTest(mark=mark, fields=fields):
                     self.assertEqual(self.render(['o/r#9'], {'o/r#9': self.status(**fields)}), '#9' + mark)
 
-    def test_overflow_repo_qualifier_and_stale_mark(self):
+    def test_overflow_and_repo_qualifier(self):
         ids = [f'o/r#{n}' for n in range(1, 8)]
         self.assertEqual(self.render(ids), '#7? #6? #5? #4? #3? +2')
         self.assertEqual(self.render(['o/a#1', 'o/b#2']), 'b#2? a#1?')
-        self.assertEqual(self.render(['o/r#1'], {'o/r#1': self.status(fetched_at=self.NOW - 301)}), '~#1✓')
+
+    def test_each_label_links_to_its_pull_request(self):
+        out = prs.render({'prs': ['o/a#1', 'p/b#2'], 'status': {}})
+        self.assertIn('\x1b[38;5;208m\x1b]8;;https://github.com/p/b/pull/2\ab#2\x1b]8;;\a', out)
+        self.assertIn('\x1b]8;;https://github.com/o/a/pull/1\aa#1\x1b]8;;\a', out)
 
     def test_older_open_pr_behind_many_terminal_ones_still_shows(self):
         ids = ['o/r#1'] + [f'o/r#{n}' for n in range(2, 30)]
@@ -173,7 +174,7 @@ class PrRenderTest(unittest.TestCase):
             done = subprocess.run([sys.executable, str(ROOT / 'statusline-prs.py'), 'render', d, 'bad-ids', '/none'],
                                   capture_output=True, text=True)
             self.assertEqual((done.returncode, plain(done.stdout).strip()), (0, '#1?'), done.stderr)
-            self.assertEqual(prs.render({'prs': 'x', 'status': []}, self.NOW), '')
+            self.assertEqual(prs.render({'prs': 'x', 'status': []}), '')
 
 
 STUB_GH = """#!/bin/sh
@@ -246,7 +247,7 @@ class PrRefreshTest(unittest.TestCase):
         self.assertEqual(cache['prs'], ['o/r#1', 'o/r#2', 'o/s#3'])
         self.assertEqual(sorted(cache['status']), ['o/r#1', 'o/r#2'])
         self.assertNotIn('retry_after', cache)
-        self.assertEqual(plain(prs.render(cache, time.time())), 's#3? r#1✓')
+        self.assertEqual(plain(prs.render(cache)), 's#3? r#1✓')
         self.refresh()
         self.assertEqual(len(self.calls()), 1, 'a fresh attempt is not repeated')
 
@@ -266,7 +267,7 @@ class PrRefreshTest(unittest.TestCase):
         before = time.time()
         self.refresh()
         cache = self.cache()
-        self.assertEqual(cache['status'], good, 'last-good kept with its fetched_at')
+        self.assertEqual(cache['status'], good, 'last-good kept')
         self.assertGreaterEqual(cache['retry_after'], before + prs.BACKOFF_S)
         self.age()
         self.refresh()
@@ -377,11 +378,11 @@ class PrRefreshTest(unittest.TestCase):
         self.answer(self.all())
         poll = prs.fetch
 
-        def jump_then_poll(polled, now):
+        def jump_then_poll(polled):
             self.write_links(link(4, 'o/r'))
-            with mock.patch.object(prs.time, 'time', return_value=now + prs.REFRESH_S + 1):
+            with mock.patch.object(prs.time, 'time', return_value=time.time() + prs.REFRESH_S + 1):
                 self.refresh()  # would publish the new link if the lock let it in
-            return poll(polled, now)
+            return poll(polled)
 
         with mock.patch.object(prs, 'fetch', side_effect=jump_then_poll):
             self.refresh()
