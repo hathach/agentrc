@@ -378,6 +378,11 @@ class CommitsTest(unittest.TestCase):
         self.assertIn('blank', out['detail'])
         self.assertEqual(self.git('status', '--porcelain'), ' M a.c\n', 'nothing was staged')
 
+    def test_a_full_sha_is_exactly_forty_lowercase_hex(self):
+        self.assertTrue(commits.FULL_SHA.match('a' * 40))
+        for bad in ('a' * 40 + '\n', 'a' * 40 + ' ', 'a' * 39, 'a' * 41, 'A' * 40, '\n' + 'a' * 40):
+            self.assertIsNone(commits.FULL_SHA.match(bad), repr(bad))
+
     def test_errors(self):
         chain = ['chain', self.base, self.base, '--published', self.base]
         tip = ['--tip', self.base]
@@ -387,6 +392,7 @@ class CommitsTest(unittest.TestCase):
                            ([*chain, '--base', self.base], 'usage'),
                            ([*chain, '--base', self.base, '--tip', 'HEAD'], 'not a full SHA'), ([*chain, '--base', self.base, '--tip'], 'usage'),
                            ([*chain, '--base', self.base, '--tip', ''], 'not a full SHA'),
+                           ([*chain, '--base', self.base, '--tip', self.base + '\n'], 'not a full SHA'),
                            ([*chain, '--base', self.base, '--frob', self.base], 'usage'),
                            (['head'], 'usage'), (['head', 'a.c'], 'usage'), (['head', '--parent', 'HEAD', 'a.c'], 'not a full SHA'),
                            (['frob'], 'usage'), (['commit'], 'usage'),

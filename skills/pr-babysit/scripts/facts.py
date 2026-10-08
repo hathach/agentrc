@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 
-FULL_SHA = re.compile(r'^[0-9a-f]{40}$')
+FULL_SHA = re.compile(r'\A[0-9a-f]{40}\Z')  # \Z: $ would let a trailing newline through
 # The human is the sole author: no line may credit an agent, model, tool or session, nor link a Claude or ChatGPT session anywhere.
 # ASCII on purpose: \b ends at a non-ASCII letter, and Unicode case folds (ſession) are not recognized spellings.
 ATTRIBUTION = tuple(re.compile(p, re.I | re.ASCII) for p in (
