@@ -236,6 +236,28 @@ test('a Codex reply counts only with a receipt for its own id, lane and success,
   }
 })
 
+test('a checkout that changed during a no-edit Codex turn stops as checkout-busy, not as a transport fault', async () => {
+  const changed = id => ({ stdout: `${id}\nPLAN: draft\n`, stderr: `cowork request ${id}: the tree changed during a --no-edit turn; check git status\n${receipt(id, 'tree-changed', 4)}`, exit: 4 })
+  for (const label of ['plan:codex', 'plan:review:1']) {
+    const id = `codex-${LANE}-busy`
+    const { result } = await run({ [label]: { requestId: id, ...changed(id) } })
+    assert.equal(result.reason, 'checkout-busy', label)
+    assert.match(result.next, /checkout changed during a read-only Codex exchange; inspect the changes and identify their source/, label)
+    assert.match(result.next, new RegExp(`reset codex ${LANE}`), label)
+    assert.match(result.coplan.exchanges.find(e => e.label === label).relay.stderr, /tree changed during a --no-edit turn/, `${label}: the diagnostic is kept`)
+  }
+  const id = `codex-${LANE}-busy`
+  for (const [over, why] of [
+    [{ requestId: id, ...changed('codex-other-9') }, 'a receipt for another request'],
+    [{ requestId: id, ...changed(id), stderr: receipt(id, 'tree-changed', 4, 'other-lane') }, 'a receipt for another lane'],
+    [{ requestId: id, ...changed(id), stderr: receipt(id, 'tree-changed', 4) + 'trailing noise\n' }, 'a receipt that is not last'],
+    [{ requestId: id, ...changed(id), exit: 0 }, 'a relay exit that disagrees'],
+  ]) {
+    const { result } = await run({ 'plan:codex': over })
+    assert.equal(result.reason, 'coplan-unavailable', why)
+  }
+})
+
 test('a review round agrees only on nothing-left for the exact plan the judge keeps', async () => {
   const open = n => relay(`codex-${LANE}-r${n}`, 'Step s2 misses the CMake target.\nStep s1 lacks a check.\nREVIEW: open\n')
   const revised = { ...PLAN, steps: [...PLAN.steps, { id: 's3', change: 'Add the CMake target', paths: ['examples/device/cdc_msc_cmsis_rtos2/CMakeLists.txt'], check: 'cmake --help' }] }

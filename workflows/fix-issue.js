@@ -1,7 +1,7 @@
 export const meta = {
   name: 'fix-issue',
   description: 'Triage one target (issue number, GitHub URL, file path or text) against this checkout, co-plan it with Codex, implement the agreed plan with code-writer committing on the current branch, run the build the repository names, and report what stays with the human: the validation workflow, review rounds, the PR',
-  whenToUse: 'From the task worktree on its branch, for "fix issue N". Never pushes or comments; a question, an unclear target, an unagreed plan or a change to the target\'s own acceptance criteria stops with a report for the human instead of code. The writer runs only with batch: true, which chief passes because its own completion sequence replaces per-step review; otherwise the run stops once the plan is agreed.',
+  whenToUse: 'From the task worktree on its branch, for "fix issue N". Never pushes or comments; a question, an unclear target, an unagreed plan or a change to the target\'s own acceptance criteria stops with a report for the human instead of code. The writer runs only with batch: true, which chief passes because its own completion sequence replaces per-step review; otherwise the run stops once the plan is agreed. One run per worktree, and nothing else edits it while the run plans.',
   phases: [{ title: 'Triage' }, { title: 'Co-plan' }, { title: 'Implement' }, { title: 'Verify' }, { title: 'Report' }],
 }
 
@@ -177,6 +177,7 @@ const coplan = { lane, status: 'unresolved', rounds: 0, plan: null, decisions: [
 const fresh = `reset codex/${lane} (python3 ~/.claude/skills/cowork/scripts/cowork.py reset codex ${lane}) and re-run`
 const NEXT = {
   'coplan-unavailable': `Codex co-planning failed; read the transport diagnostic in coplan.exchanges, fix it, then ${fresh}`,
+  'checkout-busy': `the checkout changed during a read-only Codex exchange; inspect the changes and identify their source, then rerun with exclusive ownership of the checkout: ${fresh}`,
   'coplan-died': `a Claude planner died; ${fresh}`,
   'plan-lane-exists': `codex/${lane} exists from an earlier run: ${fresh}, or pass another planLane`,
   'plan-unresolved': 'take coplan.remaining and coplan.decisions to the human; no writer until a plan is agreed',
@@ -198,12 +199,19 @@ const planner = (label, prompt, schema) => agent(prompt, { label, phase: 'Co-pla
   .catch(quiet(label))
 // A Codex turn counts only when its own receipt says it was delivered as replied with no paths reported, and its reply
 // carries exactly one of the stage's markers. The id is the transport's; a recovered delivery has no id line on stdout.
+const receiptOf = id => `cowork result ${id} codex/${lane}: `
+// a no-edit turn that saw the checkout change is no transport fault to fix
+const unavailable = fact => {
+  const e = coplan.exchanges[coplan.exchanges.length - 1]
+  const busy = !!e && !!e.requestId && e.relay?.exit === 4 && !!e.receipt?.startsWith(`${receiptOf(e.requestId)}tree-changed, exit 4; `)
+  return stopPlan(busy ? 'checkout-busy' : 'coplan-unavailable', fact)
+}
 const ask = async (label, task, markers) => {
   const r = await coworker(label, `send --lane ${lane} --tier review`, task)
   const id = r && nonblank(r.requestId)
   const reply = !r ? null : id && r.stdout.startsWith(`${id}\n`) ? r.stdout.slice(id.length + 1) : r.stdout
   const last = r ? r.stderr.trimEnd().split('\n').pop() : ''
-  const want = `cowork result ${id} codex/${lane}: replied, exit 0; `
+  const want = `${receiptOf(id)}replied, exit 0; `
   const marks = (reply || '').split('\n').map(l => l.trim()).filter(l => /^(PLAN|REVIEW):/.test(l))
   const ok = !!id && r.exit === 0 && last.startsWith(want) && !last.slice(want.length).startsWith('paths reported:')
     && marks.length === 1 && markers.includes(marks[0])
@@ -244,7 +252,7 @@ const [claudeDraft, codexDraft] = await parallel([
   () => ask('plan:codex', brief, ['PLAN: draft']),
 ])
 if (!claudeDraft) return stopPlan('coplan-died', 'the Claude draft died')
-if (!codexDraft) return stopPlan('coplan-unavailable', 'no valid Codex draft')
+if (!codexDraft) return unavailable('no valid Codex draft')
 const combined = await planner('plan:combine',
   `${brief}\n\nTwo independent drafts of this plan follow. Combine them into one plan: re-read the code for every point where ` +
   'they differ, keep what verifies, and record each proposal with where it came from, its disposition, the reason and the evidence.\n' +
@@ -266,7 +274,7 @@ for (let round = 1; round <= 3; round++) {
       `Still open:\n${JSON.stringify(judged.remaining)}\n`
       : `How the two drafts, yours and Claude's, were combined:\n${JSON.stringify(combined.decisions)}\n`) +
     (same ? `The plan is unchanged from the one sent in round ${sent.round}.` : `The plan:\n${JSON.stringify(plan)}`), ['REVIEW: nothing-left', 'REVIEW: open'])
-  if (!review) return stopPlan('coplan-unavailable', `no valid Codex review in round ${round}`)
+  if (!review) return unavailable(`no valid Codex review in round ${round}`)
   judged = await planner(`plan:judge:${round}`,
     `${brief}\n\nYou judge round ${round} of the review of this plan:\n${JSON.stringify(plan)}\nCodex's review:\n${review.reply}\n` +
     're-read the code for each point; apply what verifies, reject the rest with its reason and evidence. Return the plan unchanged ' +
