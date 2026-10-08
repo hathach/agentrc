@@ -164,6 +164,13 @@ Headless, launch it through the [`headless-chief`](skills/headless-chief/SKILL.m
 skill, which runs `claude -p --agent chief` and gives the caller chief's status
 lines while it runs and its report when it exits.
 
+A branch whose `.claude/workflows` or `.claude/agents` entries differ from the
+same-named agentrc ones installed would run them in their place, since project
+scope wins; merge the default branch first. The launcher refuses such a
+worktree, and the `headless-chief` hook (`--skill` registers it) denies every
+`Workflow` and `Agent` call in it, interactive sessions included; the chief
+prompt itself loads before any tool call and is not covered.
+
 For headless PR publishing, follow `agents/chief.md`'s Authorization exception:
 the human's request to launch chief to babysit a PR, or their yes to the
 offer, is the grant, with no further question. Include that message verbatim

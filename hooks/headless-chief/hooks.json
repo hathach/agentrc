@@ -1,0 +1,3 @@
+{
+  "PreToolUse": [{"matcher": "Workflow|Agent", "hooks": [{"type": "command", "command": "shadow_guard.py", "timeout": 10}]}]
+}

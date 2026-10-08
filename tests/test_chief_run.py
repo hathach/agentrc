@@ -493,13 +493,13 @@ class ChiefRun(unittest.TestCase):
                     unreadable.chmod(0o755)
 
     def test_a_catalogue_it_cannot_read_is_an_error_not_an_empty_one(self):
-        spec = importlib.util.spec_from_file_location('chief_run', SCRIPT)
-        chief_run = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(chief_run)
+        spec = importlib.util.spec_from_file_location('shadows', SCRIPT.with_name('shadows.py'))
+        shadows = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shadows)
         agentrc = self.root / 'agentrc-partial'
         (agentrc / 'agents').mkdir(parents=True)
-        with mock.patch.object(chief_run, 'AGENTRC', agentrc), self.assertRaises(FileNotFoundError) as caught:
-            chief_run.shadows(self.worktree)
+        with mock.patch.object(shadows, 'AGENTRC', agentrc), self.assertRaises(FileNotFoundError) as caught:
+            shadows.shadows(self.worktree)
         self.assertEqual(Path(caught.exception.filename), agentrc / 'workflows')
 
 

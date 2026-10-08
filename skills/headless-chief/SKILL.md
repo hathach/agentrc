@@ -27,7 +27,9 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    `.claude/workflows` or `.claude/agents` entries differ from the same-named
    agentrc copies installed in the user scope (`$CLAUDE_CONFIG_DIR`, else
    `~/.claude`), which they would shadow; the message names the fix. The
-   `launcher: exit` line in `progress.log` is the end of the run;
+   skill's hook denies `Workflow` and `Agent` calls in such a worktree for
+   interactive sessions too. The `launcher: exit` line in `progress.log` is
+   the end of the run;
    `kill <launcher pid>` stops it early.
 3. **Watch** with Monitor on `tail -n +1 -F <dir>/progress.log`, its
    description, on every arm, the target, such as `chief hathach/tinyusb#3988

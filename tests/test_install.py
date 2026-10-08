@@ -11,6 +11,7 @@ SCRIPT = ROOT / 'install.py'
 USER_MD = ROOT / 'instructions' / 'user.md'
 SKILLS = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
 SKILL = SKILLS[0]
+SKILL_HOOKS = [s for s in SKILLS if (ROOT / 'hooks' / s / 'hooks.json').exists()]
 
 
 class InstallTest(unittest.TestCase):
@@ -53,7 +54,7 @@ class InstallTest(unittest.TestCase):
         for d in (self.claude / 'skills', self.codex / 'skills'):
             self.assertTrue(os.path.samefile(d / SKILL, ROOT / 'skills' / SKILL))
             self.assertEqual(sorted(p.name for p in d.iterdir()), SKILLS)
-        self.assertEqual(out.count('->'), 2 * len(SKILLS) + 1, 'and the one hook')
+        self.assertEqual(out.count('->'), 2 * len(SKILLS) + len(SKILL_HOOKS), "and each skill's hook")
         self.assertFalse((self.claude / 'CLAUDE.md').exists())
         self.assertFalse((self.claude / 'agents').exists())
         self.assertEqual(self.ok('install', '--skill'), '', 'a rerun is silent')
@@ -87,10 +88,12 @@ class InstallTest(unittest.TestCase):
         (self.claude / 'settings.json').write_text(json.dumps(before))
         self.ok('install', '--skill')
         launcher = str(self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate')
+        guard = str(self.claude / 'hooks' / 'headless-chief' / 'shadow_guard.py')
         data = self.settings()
         self.assertEqual(data['model'], 'x')
         self.assertEqual(self.commands(data), {'SessionStart': ['other'], 'Stop': ['other-stop', launcher],
-                                               'UserPromptSubmit': [launcher]})
+                                               'UserPromptSubmit': [launcher], 'PreToolUse': [guard]})
+        self.assertEqual(data['hooks']['PreToolUse'][-1]['matcher'], 'Workflow|Agent')
         stop = data['hooks']['Stop'][-1]['hooks'][0]
         self.assertEqual(stop['timeout'], 650)
         self.assertNotIn('matcher', data['hooks']['Stop'][-1])
