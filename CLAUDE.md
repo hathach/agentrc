@@ -10,3 +10,5 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
   separately so each uses the unchanged channel. If the required channel is
   unavailable, report review and simplification as pending rather than
   substituting the skill under edit.
+- Verify every change with `python -X utf8 -m unittest discover -s tests`,
+  which also runs the workflow harnesses under node.
