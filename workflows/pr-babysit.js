@@ -281,7 +281,7 @@ const INVENTORY = withSeal({
   type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'checks'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
-    pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
+    pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK }, brief: { type: ['boolean', 'null'] },
   },
 })
 const GATE = {
@@ -1591,13 +1591,22 @@ const ciLaneRun = async (cycle, lanes) => {
   let left = ciWait * 60
   for (let k = 1; ; k++) {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
-    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}`, INVENTORY)
+    // A slice that is still running prints no checks: nothing a relay copies again on the next one.
+    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice} --brief`, INVENTORY)
     if (!inv || inv.error) {
       log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
       return null
     }
     left -= slice
     if (inv.status !== 'running' || left < 30 || lanes.reviewPublishing || lanes.ended) break
+  }
+  // Leaving the wait still running, the whole inventory is read once, as it stands now.
+  if (inv.brief) {
+    inv = await collect(`ci:collect#${cycle}.full`, 'inventory --wait-seconds 0', INVENTORY)
+    if (!inv || inv.error) {
+      log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
+      return null
+    }
   }
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
   const shown = inv.mergeable === 'CONFLICTING' ? 'conflicting'

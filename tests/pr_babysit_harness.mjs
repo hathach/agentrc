@@ -278,7 +278,9 @@ async function run(opts = {}) {
         answer = {
           head: ci.headSha ?? head, status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
+          ...(/ --brief /.test(text) && ci.status === 'running' ? { checks: [], brief: true } : {}),
         }
+        if (opts.inventory) answer = opts.inventory(answer, label)
       } else {
         if (opts.evidence) await opts.evidence(calls)
         // A --gate's answer is its fixture's gate, by default one complete failure per fixture.
@@ -1377,10 +1379,13 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
 
 test('the CI lane waits out its budget in slices, 30 minutes by default', async () => {
   const running = { status: 'running', infraRerun: [], realFailures: [] }
-  const slices = (calls) => calls.filter(c => c.label.startsWith('ci:collect#1.'))
-    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+) --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
+  const slices = (calls) => calls.filter(c => /^ci:collect#1\.\d+$/.test(c.label))
+    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+) --brief --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
   const { calls } = await run({ ci: running, args: { maxCycles: 1 } })
   assert.equal(slices(calls).reduce((a, b) => a + b), 30 * 60)
+  const full = calls.filter(c => c.label === 'ci:collect#1.full')
+  assert.equal(full.length, 1, 'leaving the wait still running reads the whole inventory once')
+  assert.match(full[0].prompt, /collect\.py inventory --wait-seconds 0 --repo /)
   assert.equal(slices(calls)[0], 180, 'short while the review lane may still push')
   assert.equal(calls.find(c => c.label === 'ci:collect#1.1').model, 'haiku')
   const long = await run({ ci: running, args: { ciWait: 90, maxCycles: 1 } })
@@ -1388,7 +1393,25 @@ test('the CI lane waits out its budget in slices, 30 minutes by default', async 
   const ciOnly = await run({ ci: running, args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 1 } })
   assert.equal(slices(ciOnly.calls)[0], 540, 'no review lane to wait for')
   const green = await run()
-  assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge')
+  assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge, nor a full read')
+})
+
+test('a CI wait left still running is classified from its full read, not the brief slices', async () => {
+  const running = { status: 'running', infraRerun: [], realFailures: [] }
+  const ciCalls = (calls) => calls.filter(c => c.label.startsWith('ci:'))
+  // The full read shows CI settled green after the last slice: the cycle goes on from that, with no judge.
+  const settled = await run({ ci: running, args: { maxCycles: 1 },
+    inventory: (a, label) => label.startsWith('ci:collect#1.full') ? { ...a, status: 'green', pending: 0 } : a })
+  assert.equal(ciCalls(settled.calls).filter(c => c.label === 'ci:collect#1.full').length, 1)
+  assert.equal(settled.logs.some(l => /CI inventory is inconsistent|CI inventory failed/.test(l)), false, settled.logs.join('\n'))
+  // Another head on the full read is never read as this head's CI.
+  const moved = await run({ ci: running, args: { maxCycles: 1 },
+    inventory: (a, label) => label.startsWith('ci:collect#1.full') ? { ...a, head: 'f'.repeat(40) } : a })
+  assert.ok(moved.logs.some(l => /CI inventory is inconsistent — head fffffff for /.test(l)), moved.logs.join('\n'))
+  // A full read that dies, retry included, is a failed inventory, not the last brief slice.
+  const failed = await run({ ci: running, args: { maxCycles: 1 }, throwOn: (l) => l.startsWith('ci:collect#1.full') })
+  assert.deepEqual(ciCalls(failed.calls).map(c => c.label).slice(-2), ['ci:collect#1.full', 'ci:collect#1.full.retry'])
+  assert.ok(failed.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), failed.logs.join('\n'))
 })
 
 test('a path whose name has a leading or trailing space is rejected, not trimmed', async () => {

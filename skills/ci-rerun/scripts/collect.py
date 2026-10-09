@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Collect a PR's CI state for a watcher, so no model spends turns waiting or listing.
 
-  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S]
+  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief]
   collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
 prints one JSON object {head, status, mergeable, pending, checks}, plus `error` when set
+and, with --brief while the status is still running, `brief: true` and no checks listed (a
+waiting relay copies nothing it will read again)
 (a relaying agent can drop a trailing null, so no line carries a null error); every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. `status` is
 conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
@@ -333,10 +335,11 @@ def sealed(facts):
 INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for failures and bases
 
 
-def printed(inv):
-    """What the caller reads: the failing checks by name, the pending ones by count."""
-    return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
-            'checks': [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
+def printed(inv, brief=False):
+    """What the caller reads: the failing checks by name, the pending ones by count; brief, a running state without its checks."""
+    out = {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
+           'checks': [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
+    return {**out, 'checks': [], 'brief': True} if brief and inv['status'] == 'running' else out
 
 
 def evidence_dir(repo, pr, head):
@@ -798,6 +801,7 @@ def main(argv=None):
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True, help='the head SHA the caller expects')
     p.add_argument('--wait-seconds', type=int, default=0)
+    p.add_argument('--brief', action='store_true', help='inventory: while still running, print the state without its checks')
     p.add_argument('--check', action='append', default=[], metavar='LINK')
     p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
     p.add_argument('--offset', type=int, help='recall: where the page to print starts, of the lone --check')
@@ -806,6 +810,8 @@ def main(argv=None):
         p.error('--offset is for recall with exactly one --check')
     if a.gate and a.command != 'failures':
         p.error('--gate is for failures')
+    if a.brief and a.command != 'inventory':
+        p.error('--brief is for inventory')
     if (a.command in ('failures', 'bases', 'recall')) != bool(a.check or a.gate):
         p.error('--check is for failures, bases and recall, which need at least one (failures: a --check or a --gate)')
     if len({*a.check, *a.gate}) != len(a.check) + len(a.gate):
@@ -814,7 +820,7 @@ def main(argv=None):
         p.error('--head must be a full 40-hex SHA')
     try:
         if a.command == 'inventory':
-            out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)))
+            out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)), a.brief)
         elif a.command == 'failures':
             out = failures(a.repo, a.pr, a.head, a.check, a.gate)
         elif a.command == 'bases':
