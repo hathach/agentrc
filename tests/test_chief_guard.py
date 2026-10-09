@@ -68,12 +68,20 @@ class ChiefGuard(unittest.TestCase):
         for c in ('GIT_DIR=x git push', 'env -u X git push', 'timeout 60 git push', 'nice -n 5 git push',
                   'git status && git push', 'git log | head; git commit -m x', 'true || git push', '(cd /tmp && git push)',
                   'echo "$(git push)"', 'echo `git push`', "bash -c 'git push'", 'sh -c "git log && git push"',
-                  'if git push; then echo y; fi', 'xargs -n1 git push', '/usr/bin/git push', "eval 'git push'"):
+                  'if git push; then echo y; fi', 'xargs -n1 git push', '/usr/bin/git push', "eval 'git push'",
+                  'command -- git push', 'exec -a x git push', 'git status # look\ngit push origin HEAD',
+                  "# don't edit\nprintf x > src/a.c", "# it's fine\ngit status && git push origin HEAD",
+                  "printf '%s\\n' https://github.com/o/r/issues/1#c2 > src/a.c", 'echo a#b; git push'):
             self.assert_denied(c)
 
     def test_quoted_words_are_data(self):
         self.assert_allowed("git log --grep='git push' --oneline")
         self.assert_allowed('echo "git commit"')
+        self.assert_allowed("rg '>' src/a.c")
+        self.assert_allowed('command -v git python3 node')
+        self.assert_allowed('command -p -v git python3 node')
+        self.assert_allowed("cat > /tmp/r.md <<'EOF'\n# it's a title\nEOF")
+        self.assert_allowed('grep -c "a;b|c" src/a.c && echo \\> done')
 
     def test_heredoc_body_is_data_but_its_line_counts(self):
         self.assert_allowed("cat > /tmp/brief.md <<'EOF'\ngit push\ngh pr merge 1\nEOF")
@@ -100,8 +108,8 @@ class ChiefGuard(unittest.TestCase):
 
     def test_writes_inside_the_worktree_are_denied(self):
         for c in (f'echo x > {self.project}/a', f'rm {self.project}/src/a.c', f'mv /tmp/a {self.project}/src/',
-                  f'cp /tmp/a {self.project}/src/b.c', f"sed -i 's/a/b/' {self.project}/src/a.c", f'printf x | tee {self.project}/src/a.c',
-                  f'git diff --output={self.project}/p.patch'):
+                  f'cp /tmp/a {self.project}/src/b.c', f'printf x | tee {self.project}/src/a.c',
+                  f'git diff --output={self.project}/p.patch', f'chmod --reference=/bin/sh {self.project}/src/a.c'):
             self.assert_denied(c, 'literal absolute path')
         self.assert_denied(None, 'literal absolute path', tool='Write', file_path=str(self.project / 'src' / 'new.c'))
 
@@ -110,28 +118,25 @@ class ChiefGuard(unittest.TestCase):
         for c in ('echo x > src/a.c', 'cd /tmp && printf done > chief-report.md', 'out=/tmp/r.md; printf done > "$out"',
                   'printf done > "$(git rev-parse --show-toplevel)/r.md"', 'mkdir -p "$(git rev-parse --git-path chief)"',
                   'touch new.c', 'git diff --output=chief-report.patch', 'cp -t . /tmp/brief.md', 'rsync -t /tmp/brief.md .',
-                  "cd hooks && sed -i 's/old/new/' chief_guard.py", 'chmod 600 src/a.c'):
+                  'chmod 600 src/a.c', 'echo x > ~/chief-note.md', 'echo x > "$HOME/chief-note.md"'):
             self.assert_denied(c, 'literal absolute path')
 
     def test_writes_outside_the_worktree_pass(self):
         for c in ('echo x > /tmp/out.md', 'git log > /tmp/log 2>&1', 'git status 2>/dev/null', 'cp src/a.c /tmp/a.c',
                   'mkdir -p /tmp/chief-run', 'rm -f /tmp/x', "sed 's/a/b/' src/a.c", 'cat src/a.c >&2',
-                  'echo x > ~/chief-note.md', 'echo x > "$HOME/chief-note.md"', 'echo "$(date)" > /tmp/stamp',
+                  'echo "$(date)" > /tmp/stamp', "echo 'a > b' > /tmp/x.md",
                   'chmod 600 /tmp/chief-report.md', 'cp -t /tmp src/a.c', 'rsync -t src/a.c /tmp/chief-a.c',
-                  'git -C /tmp diff --output=/tmp/p.patch', "sed -i -e 's/a/b/' /tmp/x.md", "perl -pi -e 's/a/b/' /tmp/x.md"):
+                  'git -C /tmp diff --output=/tmp/p.patch', 'chmod --reference=/bin/sh /tmp/chief-report.md'):
             self.assert_allowed(c)
         self.assert_allowed(None, tool='Write', file_path='/tmp/report.md')
 
-    def test_in_place_edits_name_every_file_operand(self):
-        self.assert_denied(f"sed -i -e 's/a/b/' /tmp/x.md {self.project}/src/a.c", 'literal absolute path')
-        self.assert_denied(f"perl -pi -e 's/a/b/' {self.project}/src/a.c", 'literal absolute path')
-        self.assert_denied("sed -i.bak 's/a/b/' src/a.c", 'literal absolute path')
-        self.assert_denied(f'sed -i -f/tmp/edit.sed {self.project}/README.md', 'literal absolute path')
-        self.assert_denied(f'sed -i -f /tmp/edit.sed {self.project}/README.md', 'literal absolute path')
-        self.assert_allowed("sed -Ei 's/a/b/' /tmp/chief-report.md")
-        self.assert_allowed('sed -i -f /tmp/edit.sed /tmp/chief-report.md')
+    def test_in_place_edits_are_denied(self):
+        # chief writes its artifacts whole with Write; a worktree edit goes to a writer
+        for c in ("sed -i 's/a/b/' /tmp/x.md", "sed -Ei 's/a/b/' /tmp/x.md", "sed --in-place=.bak 's/a/b/' /tmp/x.md",
+                  "perl -pi -e 's/a/b/' /tmp/x.md", "cd hooks && sed -i 's/old/new/' chief_guard.py"):
+            self.assert_denied(c, 'in place')
 
-    def test_a_reassigned_home_or_tmpdir_is_not_expanded(self):
+    def test_home_and_tmpdir_are_not_expanded(self):
         for c in (f'TMPDIR={self.project}; printf done > "$TMPDIR/r.md"', f'HOME={self.project} && printf done > "$HOME/r.md"',
                   f'export HOME={self.project}; printf done > ~/r.md', f"bash -c 'TMPDIR={self.project}; printf x > $TMPDIR/r'"):
             self.assert_denied(c, 'literal absolute path')

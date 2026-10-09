@@ -186,6 +186,37 @@ class LaunchResultTest(unittest.TestCase):
                          [('refutedPosts', 41, ['invalid', 'stale']), ('fixNotePosts', 7, ['valid'])],
                          'a refutation of a stale finding says so; the join is on commentId, not the findingId prefix')
 
+    def test_a_multi_cycle_launch_keeps_every_cycle_s_receipts(self):
+        data = output()
+        obs = data['result']['observation']
+        early = {'refutedPosts': {'pass': True, 'detail': '', 'receipts': [{'commentId': 501, 'kind': 'review', 'posted': True}]}}
+        obs['launchActions'] = [{'cycle': 1, **early}, {'cycle': 2, **obs['actions']}]
+        _, s = self.run_it(data)
+        self.assertEqual([(r['batch'], r['commentId']) for r in s['receipts']['replies']], [('refutedPosts', 501), ('fixNotePosts', 7)])
+        self.assertEqual([p['lane'] for p in s['receipts']['pushes']], ['reviewPush'])
+
+    def test_each_receipt_keeps_its_own_cycle_s_verdicts(self):
+        data = output()
+        obs = data['result']['observation']
+        early = {'findings': [{'commentId': 501, 'verdict': 'invalid'}],
+                 'refutedPosts': {'pass': True, 'detail': '', 'receipts': [{'commentId': 501, 'posted': True}]}}
+        obs['launchActions'] = [{'cycle': 1, **early}, {'cycle': 2, **obs['actions'], 'findings': []}]
+        _, s = self.run_it(data)
+        self.assertEqual(s['receipts']['replies'][0]['findingVerdicts'], ['invalid'])
+
+    def test_a_retried_reply_batch_supersedes_the_failed_one(self):
+        data = output()
+        obs = data['result']['observation']
+        failed = {'refutedPosts': {'pass': False, 'detail': 'unsettled: 1', 'receipts': [{'commentId': 1, 'posted': False}]}}
+        retried = {'refutedPosts': {'pass': True, 'detail': '', 'receipts': [{'commentId': 1, 'posted': True, 'replyId': 501}]}}
+        obs['launchActions'] = [{'cycle': 1, **failed}, {'cycle': 2, **retried}]
+        _, s = self.run_it(data)
+        self.assertFalse([b for b in s['blockers'] if 'reply batch' in b], s['blockers'])
+        self.assertEqual([r['posted'] for r in s['receipts']['replies']], [False, True])
+        obs['launchActions'].reverse()
+        _, s = self.run_it(data)
+        self.assertTrue([b for b in s['blockers'] if 'refutedPosts' in b], s['blockers'])
+
     def test_what_chief_must_settle_is_a_blocker(self):
         data = output()
         obs = data['result']['observation']

@@ -6,10 +6,10 @@ writer of the worktree or a publisher by mistake.
 Only chief's own calls are checked: the payload names agent_type `chief` and carries no agent_id,
 which every subagent call does (measured on 2.1.295). A guard against mistakes, not isolation: a
 script chief runs may still write or publish, and the grants in agents/chief.md stay the authority.
-A write target passes only as a literal absolute path outside the worktree (`~`, `$HOME` and
-`$TMPDIR` expand), so no shell state needs tracking; chief's own directory, `git rev-parse
---git-path chief`, passes even inside a primary checkout. Exit 2 denies; a command it cannot parse
-is denied too, since Claude Code lets an erroring hook pass.
+A write target passes only as a literal absolute path outside the worktree, so no shell state
+needs tracking; chief's own directory, `git rev-parse --git-path chief`, passes even inside a
+primary checkout. Exit 2 denies; a command it cannot parse is denied too, since Claude Code lets
+an erroring hook pass.
 """
 import json
 import sys
@@ -55,10 +55,11 @@ GH_READ = {
 GH_WITH_VALUE = {'-R', '--repo', '-H', '--header', '-q', '--jq', '-t', '--template', '--hostname', '-p', '--preview'}
 # workflow-only publishers: Sonar marking rides markSonar, the PR push rides autoPush
 WORKFLOW_ONLY = {'push.py', 'sonar.py'}
-WRAPPERS = {'command', 'builtin', 'exec', 'nohup', 'time', 'stdbuf'}
-WRAPPERS_WITH_VALUE = {
-    'nice': {'-n'}, 'timeout': {'-s', '--signal', '-k', '--kill-after'}, 'sudo': {'-u', '-g'},
-    'env': {'-u', '--unset', '-C', '--chdir'},
+# command prefixes that run the next word: name -> its options that take a value
+WRAPPERS = {
+    'command': set(), 'builtin': set(), 'nohup': set(), 'exec': {'-a'}, 'time': {'-f', '-o'},
+    'stdbuf': {'-i', '-o', '-e'}, 'nice': {'-n'}, 'timeout': {'-s', '--signal', '-k', '--kill-after'},
+    'sudo': {'-u', '-g'}, 'env': {'-u', '--unset', '-C', '--chdir'},
     'xargs': {'-n', '-L', '-P', '-s', '-I', '-d', '-E', '-a', '--max-args', '--max-lines', '--max-procs',
               '--max-chars', '--delimiter', '--eof', '--arg-file'},
 }
@@ -72,9 +73,12 @@ SEPARATORS = {';', '&&', '||', '|', '&', '(', ')', '|&', ';;'}
 REDIRECTS = {'>', '>>', '&>', '&>>', '>|', '>&'}
 STREAMS = REDIRECTS | {'<', '<<', '<<<'}
 OPERATORS = sorted(SEPARATORS | STREAMS, key=len, reverse=True)
+PUNCTUATION = ';&|<>()'
+# a quoted or escaped operator character stays a word character: these stand in for it until a path is judged
+QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(PUNCTUATION)}
+UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
 HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
-EXPANDED = re.compile(r'\$(?:\{(HOME|TMPDIR)\}|(HOME|TMPDIR)\b)')
 UNKNOWN = '\0'
 
 
@@ -82,28 +86,15 @@ class Denied(Exception):
     pass
 
 
-class Tree:
-    """The task worktree, read once on the first write target to judge."""
-
-    def __init__(self, payload):
-        self.payload, self.root = payload, None
-
-    def holds(self, path):
-        if self.root is None:
-            root, (chief,) = project(self.payload, 'chief')
-            self.root, self.chief = root.resolve(), chief and chief.resolve()
-        p = Path(path).resolve()
-        return p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
-
-
 def substitutions(text, quotes=True):
-    """(text with each command substitution outside single quotes replaced by an unresolved word, their bodies).
-    quotes=False reads an unquoted heredoc body, where single quotes are plain characters."""
+    """(text with each command substitution outside single quotes replaced by an unresolved word and each
+    quoted or escaped operator character by its stand-in and each comment dropped, the substitutions' bodies).
+    quotes=False reads an unquoted heredoc body, where quotes are plain characters."""
     out, bodies, i, single, double = [], [], 0, False, False
     while i < len(text):
         c = text[i]
         if c == '\\' and not single:
-            out.append(text[i:i + 2])
+            out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
             i += 2
             continue
         if quotes and c == "'" and not double:
@@ -126,6 +117,12 @@ def substitutions(text, quotes=True):
             out.append(UNKNOWN)
             i = j + 1
             continue
+        elif quotes and not (single or double) and c == '#' and (not out or out[-1][-1:] in ' \t\n;&|()'):
+            i = text.find('\n', i)  # a comment, to its newline: its quotes and substitutions are text
+            i = len(text) if i < 0 else i
+            continue
+        elif (single or double) and c in QUOTED:
+            c = QUOTED[c]
         out.append(c)
         i += 1
     return ''.join(out), bodies
@@ -133,7 +130,7 @@ def substitutions(text, quotes=True):
 
 def operators(token):
     """shlex joins adjacent punctuation, `);` or `)&&`, into one token: split it into shell operators."""
-    if not token or not set(token) <= set(';&|<>()'):
+    if not token or not set(token) <= set(PUNCTUATION):
         return [token]
     out = []
     while token:
@@ -143,14 +140,27 @@ def operators(token):
     return out
 
 
-class Check:
-    def __init__(self, tree):
-        self.tree, self.fixed = tree, {'HOME', 'TMPDIR'}
+class Guard:
+    def __init__(self, payload):
+        self.payload, self.root = payload, None
+
+    def inside(self, path):
+        """Is this absolute path in the worktree, chief's own directory apart; the worktree is read once, on first use."""
+        if self.root is None:
+            root, chief = project(self.payload)
+            self.root, self.chief = root.resolve(), chief and chief.resolve()
+        p = Path(path).resolve()
+        return p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
+
+    def writes(self, path, why):
+        path = path.translate(UNQUOTED)
+        if path == '/dev/null':
+            return
+        if UNKNOWN in path or '$' in path or not os.path.isabs(path) or self.inside(path):
+            raise Denied(f'{why} would write {path}: chief writes only its artifacts, named by a literal absolute path '
+                         'outside the task worktree; a worktree change goes to a writer')
 
     def command(self, command, depth=0):
-        if depth == 0:
-            # a variable the command itself assigns no longer names the hook's value
-            self.fixed -= set(re.findall(r'\b(HOME|TMPDIR)=', command))
         if depth > 3:
             raise Denied('commands nested this deep are not checked; run them as plain words, or dispatch them to a unit')
         bodies = []
@@ -162,8 +172,9 @@ class Check:
         text, subs = substitutions(HEREDOC.sub(heredoc, command))
         for body in bodies + subs:
             self.command(body, depth + 1)
-        lex = shlex.shlex(text.replace('\n', ' ; '), posix=True, punctuation_chars=';&|<>()')
+        lex = shlex.shlex(text.replace('\n', ' ; '), posix=True, punctuation_chars=PUNCTUATION)
         lex.whitespace_split = True
+        lex.commenters = ''  # substitutions() dropped the comments; a # inside a word is data
         try:
             tokens = list(lex)
         except ValueError as e:
@@ -177,18 +188,6 @@ class Check:
             else:
                 seg.append(t)
 
-    def writes(self, path, why):
-        if path == '/dev/null':
-            return
-        def value(m):
-            name = m.group(1) or m.group(2)
-            return os.environ.get(name, UNKNOWN) if name in self.fixed else UNKNOWN
-        p = EXPANDED.sub(value, path)
-        p = os.path.expanduser(p) if 'HOME' in self.fixed else p
-        if UNKNOWN in p or '$' in p or not os.path.isabs(p) or self.tree.holds(p):
-            raise Denied(f'{why} would write {path}: chief writes only its artifacts, named by a literal absolute path '
-                         'outside the task worktree (~, $HOME and $TMPDIR expand); a worktree change goes to a writer')
-
     def segment(self, words, depth):
         for k, w in enumerate(words[:-1]):
             if w in REDIRECTS and not (w == '>&' and words[k + 1].isdigit()):
@@ -200,15 +199,17 @@ class Check:
         if cmd in SHELLS:
             for k, a in enumerate(args):
                 if re.fullmatch(r'-[a-zA-Z]*c[a-zA-Z]*', a):
-                    return self.command(args[k + 1] if k + 1 < len(args) else '', depth + 1)
+                    return self.command((args[k + 1] if k + 1 < len(args) else '').translate(UNQUOTED), depth + 1)
         if cmd == 'eval':
-            return self.command(' '.join(args), depth + 1)
+            return self.command(' '.join(args).translate(UNQUOTED), depth + 1)
         if cmd == 'git':
             self.git(args)
         elif cmd == 'gh':
             gh(args)
         elif cmd in WORKFLOW_ONLY or (cmd.startswith('python') and any(os.path.basename(a) in WORKFLOW_ONLY for a in args)):
             raise Denied('this publisher runs only inside its workflow (autoPush, markSonar)')
+        elif cmd in ('sed', 'perl') and any(re.match(r'-[a-zA-Z]*i|--in-place', a) for a in args):
+            raise Denied(f'`{cmd}` in place edits a file; chief writes its artifacts whole with Write, and a worktree change goes to a writer')
         for path in written(cmd, args):
             self.writes(path, f'`{cmd}`')
 
@@ -246,19 +247,32 @@ class Check:
 
 
 def unwrap(words):
+    """The command a word list runs, past assignments, keywords and wrappers with their options."""
     while words:
         w = words[0]
-        if ASSIGNMENT.match(w) or w in KEYWORDS or w in WRAPPERS:
+        if ASSIGNMENT.match(w) or w in KEYWORDS:
             words = words[1:]
-        elif w in WRAPPERS_WITH_VALUE:
+        elif w == 'command' and any(re.fullmatch(r'-[pvV]*[vV][pvV]*', o) for o in options(words[1:])):
+            return []  # looks the names up, runs none
+        elif w in WRAPPERS:
             words = words[1:]
             while words and (words[0].startswith('-') or (w == 'env' and '=' in words[0])):
-                words = words[2:] if words[0] in WRAPPERS_WITH_VALUE[w] else words[1:]
+                words = words[2:] if words[0] in WRAPPERS[w] else words[1:]
             if w == 'timeout' and words:
                 words = words[1:]  # the duration
         else:
             break
     return words
+
+
+def options(words):
+    """The leading options of a word list, up to the first operand or `--`."""
+    out = []
+    for w in words:
+        if w == '--' or not w.startswith('-'):
+            break
+        out.append(w)
+    return out
 
 
 def gh(args):
@@ -299,26 +313,6 @@ def gh(args):
 
 def written(cmd, args):
     """The paths a file-writing command names as its targets."""
-    if cmd in ('sed', 'perl') and any(re.match(r'-[a-zA-Z]*i|--in-place', a) for a in args):
-        # every operand but the script: a script option's value (sed -e/-f, perl -e/-E, attached or next), else the first operand
-        script_flags = 'ef' if cmd == 'sed' else 'eE'
-        files, script, k = [], False, 0
-        while k < len(args):
-            a, k = args[k], k + 1
-            if a in ('--expression', '--file'):
-                script, k = True, k + 1
-            elif a.startswith(('--expression=', '--file=')):
-                script = True
-            elif len(a) > 1 and a.startswith('-') and not a.startswith('--'):
-                for j, c in enumerate(a[1:], 1):
-                    if c in script_flags:
-                        script, k = True, k + (j == len(a) - 1)
-                        break
-                    if c == 'i':
-                        break  # the rest of the group is a backup suffix
-            elif not a.startswith('-'):
-                files.append(a)
-        return files if script else files[1:]
     names = [a for a in args if not a.startswith('-')]
     if cmd in WRITERS_LAST:
         # -t/--target-directory names the destination where the command has it (rsync's -t keeps times)
@@ -328,18 +322,19 @@ def written(cmd, args):
             [a[2:] for a in args if a.startswith('-t') and len(a) > 2 and not a.startswith('--')]
         return target or names[-1:]
     if cmd in WRITERS_AFTER_FIRST:
-        return names[1:]
+        # --reference takes the place of the mode or owner: every operand is a target
+        return names if any(a.startswith('--reference') for a in args) else names[1:]
     return names if cmd in WRITERS_ALL else []
 
 
 def main(payload):
-    check = Check(Tree(payload))
+    guard = Guard(payload)
     data = payload.get('tool_input') or {}
     try:
         if payload.get('tool_name') == 'Write':
-            check.writes(data.get('file_path', ''), 'this Write')
+            guard.writes(data.get('file_path', ''), 'this Write')
         elif payload.get('tool_name') == 'Bash':
-            check.command(data.get('command', ''))
+            guard.command(data.get('command', ''))
     except Denied as e:
         print(f'chief guard: {e}', file=sys.stderr)
         return 2

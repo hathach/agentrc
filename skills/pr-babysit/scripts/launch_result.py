@@ -101,26 +101,32 @@ def finding_verdicts(findings, comment_id):
     return sorted({f.get('verdict') for f in findings if f.get('commentId') == comment_id})
 
 
-def receipts(actions, findings):
-    """Pushes, replies and the adoption the last cycle recorded, verbatim, and what about them blocks.
+def receipts(cycles, findings):
+    """Pushes, replies and the adoption every cycle of the launch recorded, verbatim, and what about them blocks.
 
     A reply batch's `pass` is the workflow's own verdict that every comment it
     owed is settled, its detail naming any that is not; the receipts are evidence.
+    A later batch of the same kind supersedes an earlier one's verdict, since it
+    retries what that one left unsettled. Each receipt carries the verdicts its
+    own cycle harvested, the last harvest where a cycle recorded none.
     """
-    pushes, replies, blocking = [], [], []
-    for lane in ('reviewPush', 'ciPush'):
-        p = actions.get(lane)
-        if p:
-            pushes.append({'lane': lane, **p})
-            if p.get('pass') is not True or p.get('committed') is None:
-                blocking.append(f'uncertain publication: {lane}: {cut(p.get("detail", ""))}')
-    for kind in ('refutedPosts', 'fixNotePosts', 'deferralPosts'):
-        posts = actions.get(kind)
-        if posts:
-            replies += [{'batch': kind, 'findingVerdicts': finding_verdicts(findings, r.get('commentId')), **r} for r in posts.get('receipts') or []]
-            if posts.get('pass') is not True:
-                blocking.append(f'reply batch did not pass: {kind}: {cut(posts.get("detail", ""))}')
-    adoption = actions.get('adoption')
+    pushes, replies, blocking, adoption, batches = [], [], [], None, {}
+    for actions in cycles:
+        harvest = actions.get('findings', findings)
+        for lane in ('reviewPush', 'ciPush'):
+            p = actions.get(lane)
+            if p:
+                pushes.append({'lane': lane, **p})
+                if p.get('pass') is not True or p.get('committed') is None:
+                    blocking.append(f'uncertain publication: {lane}: {cut(p.get("detail", ""))}')
+        for kind in ('refutedPosts', 'fixNotePosts', 'deferralPosts'):
+            posts = actions.get(kind)
+            if posts:
+                replies += [{'batch': kind, 'findingVerdicts': finding_verdicts(harvest, r.get('commentId')), **r} for r in posts.get('receipts') or []]
+                batches[kind] = posts
+        adoption = actions.get('adoption') or adoption
+    blocking += [f'reply batch did not pass: {kind}: {cut(posts.get("detail", ""))}'
+                 for kind, posts in batches.items() if posts.get('pass') is not True]
     if adoption and adoption.get('publication') not in ('pushed', 'already-published', None):
         blocking.append(f'uncertain publication: adoption {adoption.get("from", "")[:8]}..{adoption.get("to", "")[:8]}: {adoption.get("publication")}')
     return {'pushes': pushes, 'replies': replies, 'adoption': adoption}, blocking
@@ -230,7 +236,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
                          for f in reviews.get('findings') or []],
             'ci': ci and ci_summary(ci, keys),
         }
-        summary['receipts'], blocking = receipts(actions, reviews.get('findings') or [])
+        # A launch that ran several cycles lists each cycle's actions; an older output has the last one only.
+        summary['receipts'], blocking = receipts(obs.get('launchActions') or [actions], reviews.get('findings') or [])
         blockers += blocking
         if actions.get('error'):
             blockers.append(f'action error: {cut(actions["error"])}')

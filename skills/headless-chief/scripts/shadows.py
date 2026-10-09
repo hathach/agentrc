@@ -12,18 +12,18 @@ AGENTRC = Path(__file__).resolve().parents[3]   # the agentrc checkout this modu
 KINDS = {'workflows': '.js', 'agents': '.md'}
 
 
-def project(payload, *git_paths):
-    """The hook session's project top level and each named `git rev-parse --git-path`, absolute;
-    outside a repository, the start directory and None for each."""
+def project(payload):
+    """The hook session's project top level and its chief directory (`git rev-parse --git-path chief`),
+    absolute; outside a repository, the start directory and None."""
     # the session's project, not a directory a Bash cd moved the payload's cwd to; its GIT_* would name another repository
     start = os.environ.get('CLAUDE_PROJECT_DIR') or payload.get('cwd') or '.'
     env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-    asked = ['--path-format=absolute', *(a for p in git_paths for a in ('--git-path', p))] if git_paths else []
-    got = subprocess.run(['git', '-C', start, 'rev-parse', '--show-toplevel', *asked], capture_output=True, text=True, env=env)
+    got = subprocess.run(['git', '-C', start, 'rev-parse', '--show-toplevel', '--path-format=absolute', '--git-path', 'chief'],
+                         capture_output=True, text=True, env=env)
     if got.returncode:
-        return Path(start), [None] * len(git_paths)
-    lines = got.stdout.splitlines()
-    return Path(lines[0]), [Path(p) for p in lines[1:]]
+        return Path(start), None
+    top, chief = got.stdout.splitlines()
+    return Path(top), Path(chief)
 
 
 def user_scope():

@@ -7,11 +7,11 @@
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
-prints one JSON object {head, status, mergeable, pending, checks}, plus `error` when set;
-with --brief, a status still running lists no checks (a waiting relay copies nothing it
-will read again)
+prints one JSON object {head, status, mergeable, pending, checks}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error); every
-line but an error one also carries `seal`, pr-babysit's facts.py seal. `status` is
+line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
+status still running lists no checks (a waiting relay copies nothing it will read
+again). `status` is
 conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
 may not have run, so no check result stands for the PR), else running (a check
 pending, no checks registered yet, or mergeable UNKNOWN), else red (a check

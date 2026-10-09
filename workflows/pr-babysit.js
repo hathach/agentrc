@@ -763,6 +763,12 @@ const launchRollup = () => {
     ciChecks: { ...ciChecks }, reran: reran.size, pushed, replies,
   }
 }
+const actionsOf = (e) => ({
+  reviewFixes: e.reviewFixes || null, ciFixes: e.ciFixes || null,
+  reviewPush: e.reviewPush || e.reviewPushFailed || null, ciPush: e.ciPush || e.ciPushFailed || null,
+  refutedPosts: e.refutedPosts || null, fixNotePosts: e.fixNotePosts || null, deferralPosts: e.deferralPosts || null, error: e.error || null,
+  adoption: e.adoption || null,
+})
 // status: complete, paused (a cycle ran, another may follow) or blocked.
 const finish = (verdict, status) => {
   const last = history[history.length - 1] || null
@@ -770,12 +776,12 @@ const finish = (verdict, status) => {
     reviewedHead: last ? last.head : expectedHead, lane: last ? last.lane || lane : lane,
     reviews: last ? last.reviews || null : null,
     ci: last && last.ci ? { ...last.ci, realFailures: (last.ci.realFailures || []).map(rf => ({ ...rf, state: ciState(rf) })) } : null,
-    actions: last ? {
-      reviewFixes: last.reviewFixes || null, ciFixes: last.ciFixes || null,
-      reviewPush: last.reviewPush || last.reviewPushFailed || null, ciPush: last.ciPush || last.ciPushFailed || null,
-      refutedPosts: last.refutedPosts || null, fixNotePosts: last.fixNotePosts || null, deferralPosts: last.deferralPosts || null, error: last.error || null,
-      adoption: last.adoption || null,
-    } : null,
+    actions: last ? actionsOf(last) : null,
+    // Every cycle this launch ran publishes its own receipts; a multi-cycle launch keeps the earlier ones here.
+    launchActions: history.slice(launchFrom).map(e => ({
+      cycle: e.cycle, ...actionsOf(e),
+      findings: ((e.reviews && e.reviews.findings) || []).map(f => ({ commentId: f.commentId, verdict: f.verdict })),
+    })),
   }
   const state = stateOut()
   const handoffs = handoffList()
@@ -1387,6 +1393,9 @@ const pushExact = async (sha, label, prToo = false) => {
 }
 
 let napMs = 0
+// Set where a cycle continues only to wait (CI, bots, owed replies, a SonarCloud re-read); any other continuation pauses yieldOnChange.
+let waited = false
+const rearm = () => { waited = true; return null }
 
 // A digest recorded before CodeRabbit rewrote its comment's end is one of the comment's aliases now (comment_digest.py): the same body.
 const repin = (cycle, findings) => {
@@ -1596,19 +1605,20 @@ const ciLaneRun = async (cycle, lanes) => {
   }
   // collect.py polls every 30 s, so a shorter slice would only list.
   let inv = null
-  let brief = false
+  let last = false
   let left = ciWait * 60
   for (let k = 1; ; k++) {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
     // A --brief slice still running prints no checks, so a relay copies nothing it reads again; the budget's last slice is whole.
-    brief = left - slice >= 30
-    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${brief ? ' --brief' : ''}`, INVENTORY)
+    last = left - slice < 30
+    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}`, INVENTORY)
     if (inventoryFailed(inv)) return null
     left -= slice
-    if (inv.status !== 'running' || left < 30 || lanes.reviewPublishing || lanes.ended) break
+    if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended) break
   }
-  // Leaving the wait early on a brief slice still running, the whole inventory is read once, as it stands now.
-  if (brief && inv.status === 'running') {
+  // Leaving the wait early on a brief slice still running, the whole inventory is read once, as it stands now;
+  // not when the review lane is publishing, which supersedes this CI run anyway.
+  if (!last && inv.status === 'running' && !lanes.reviewPublishing) {
     inv = await collect(`ci:collect#${cycle}.full`, 'inventory --wait-seconds 0', INVENTORY)
     if (inventoryFailed(inv)) return null
   }
@@ -2199,8 +2209,7 @@ const runCycle = async (cycle, entry) => {
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
     if (marked > 0 && c.realFailures.some(sonarGate)) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
-      waited = true
-      return null
+      return rearm()
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
     // One acceptance covers one exact failure, and only when the watcher listed every failure of its job.
@@ -2259,8 +2268,7 @@ const runCycle = async (cycle, entry) => {
         if (cycle < maxCycles && !owedNow.every(handedOff)) {
           log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'} but ${owedNow.length} comment(s) still owed an answer — re-arming`)
           napMs = 60000 * cycle
-          waited = true
-          return null
+          return rearm()
         }
         return unresolvedVerdict(cycle, owedNow)
       }
@@ -2294,8 +2302,7 @@ const runCycle = async (cycle, entry) => {
     }
     if (c.status === 'running' || c.infraRerun.length > 0) {
       log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)
-      waited = true
-      return null
+      return rearm()
     }
     if (!reviewsSettled) {
       // Back off, or the budget burns on re-harvests of an unchanged PR.
@@ -2306,8 +2313,7 @@ const runCycle = async (cycle, entry) => {
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }
-      waited = true
-      return null
+      return rearm()
     }
     log(`cycle ${cycle}: nothing actionable`)
     return stop(cycle, 'unactionable')
@@ -2477,8 +2483,6 @@ const adopt = async (entry) => {
 }
 
 const yielded = (cycle) => finish(stop(cycle, 'yielded', { outstanding: outstanding() }), 'paused')
-// Set where a cycle continues only to wait (CI, bots, owed replies, a SonarCloud re-read); any other continuation pauses yieldOnChange.
-let waited = false
 // yieldOnChange returns after a cycle the caller must see: a push, changed handoffs or corrections, or no usable observation.
 const changeOf = (entry, before) => entry.reviewPush || entry.ciPush ? 'a repair was pushed'
   : JSON.stringify(handoffList()) !== before.handoffs ? 'the handoffs changed'

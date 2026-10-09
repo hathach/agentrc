@@ -6437,3 +6437,16 @@ test('yieldOnChange pauses when the handoffs change, and refuses yieldAfterCycle
   await assert.rejects(run({ args: { ...ON, yieldAfterCycle: true } }), /two ways to pause/)
   await assert.rejects(run({ args: { ...ON, lane: 'ci' } }), /needs yieldAfterCycle/)
 })
+
+test('a launch that runs several cycles returns every cycle\'s publication receipts', async () => {
+  // Cycle 1 answers a refuted finding while CI runs; cycle 2 finds CI green and ends the launch.
+  const cycleOf = (label) => Number(label.match(/#(\d+)/)[1])
+  const refuted = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' }
+  const { result, logs } = await run({ args: { autoPush: true, maxCycles: 4, yieldOnChange: true }, reviews: refuted,
+    ci: (label) => cycleOf(label) < 2 ? RUNNING : GREEN })
+  assert.ok(result.history.length >= 2, logs.join('\n'))
+  const posted = result.observation.launchActions.filter(a => a.refutedPosts).map(a => a.cycle)
+  assert.ok(posted.includes(1), `cycle 1's reply receipt is kept: ${JSON.stringify(result.observation.launchActions)}`)
+  assert.deepEqual(result.observation.launchActions[0].findings.map(f => f.verdict), ['invalid'])
+  assert.deepEqual(result.observation.launchActions.map(a => a.cycle), result.history.map(e => e.cycle))
+})
