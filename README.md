@@ -179,7 +179,11 @@ offer, is the grant, with no further question. Include that message verbatim
 (with the offer it answered when it is a yes, and any later restriction), the
 PR resolved from it (repository, PR URL, head repository and branch, expected
 HEAD, worktree) and the task scope, and, when a pr-babysit launch continues an
-earlier chief's run, that run's last reported `stateRef`; ask only when the PR,
+earlier chief's run, that run's last reported `stateRef`. The task scope names
+the review scope: the whole PR, or takeover-only (earlier PR commits are context,
+the takeover HEAD is the task base) for a task limited to the repairs it
+commissions; an offer to launch names that choice when the human has not, and an
+unspecified review scope defaults to the whole PR; ask only when the PR,
 repository or worktree is ambiguous. A relaunch for the same PR task copies
 the grant verbatim from the earlier launch task, without asking again, until
 the task is done, the PR changes, or the human narrows or withdraws it; a
