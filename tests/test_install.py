@@ -88,12 +88,12 @@ class InstallTest(unittest.TestCase):
         (self.claude / 'settings.json').write_text(json.dumps(before))
         self.ok('install', '--skill')
         launcher = str(self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate')
-        guard = str(self.claude / 'hooks' / 'headless-chief' / 'shadow_guard.py')
+        guards = [str(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
         data = self.settings()
         self.assertEqual(data['model'], 'x')
         self.assertEqual(self.commands(data), {'SessionStart': ['other'], 'Stop': ['other-stop', launcher],
-                                               'UserPromptSubmit': [launcher], 'PreToolUse': [guard]})
-        self.assertEqual(data['hooks']['PreToolUse'][-1]['matcher'], 'Workflow|Agent')
+                                               'UserPromptSubmit': [launcher], 'PreToolUse': guards})
+        self.assertEqual([g['matcher'] for g in data['hooks']['PreToolUse']], ['Workflow|Agent', 'Bash|Write'])
         stop = data['hooks']['Stop'][-1]['hooks'][0]
         self.assertEqual(stop['timeout'], 650)
         self.assertNotIn('matcher', data['hooks']['Stop'][-1])

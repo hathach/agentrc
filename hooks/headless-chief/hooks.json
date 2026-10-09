@@ -1,3 +1,6 @@
 {
-  "PreToolUse": [{"matcher": "Workflow|Agent", "hooks": [{"type": "command", "command": "shadow_guard.py", "timeout": 10}]}]
+  "PreToolUse": [
+    {"matcher": "Workflow|Agent", "hooks": [{"type": "command", "command": "shadow_guard.py", "timeout": 10}]},
+    {"matcher": "Bash|Write", "hooks": [{"type": "command", "command": "chief_guard.py", "timeout": 10}]}
+  ]
 }

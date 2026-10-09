@@ -143,9 +143,11 @@ mv $d/settings.json.new $d/settings.json
 
 ## Chief session
 
-`agents/chief.md` is a dispatch-only main session with no file or shell tools:
-every read, edit, build and review goes to the repository's agents, skills and
-workflows. Its direct Codex exchanges go through `agents/coworker.md`, the
+`agents/chief.md` is the orchestrating main session: it reads and runs short
+chores itself, and every worktree edit, long build or investigation and review goes
+to the repository's agents, skills and workflows. `hooks/headless-chief/chief_guard.py`
+denies chief's own direct `git`/`gh` writes, workflow-only publishers and writes
+into its worktree, a guard against mistakes, not isolation. Its direct Codex exchanges go through `agents/coworker.md`, the
 `cowork.py` transport. `workflows/code-audit.js` is its saved review: one `code-verifier`
 per directory x dimension, then `finding-verifier` on every finding (on Sonnet for a
 scanner-labelled nit)
