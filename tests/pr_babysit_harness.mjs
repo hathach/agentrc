@@ -17,6 +17,7 @@ const body = readFileSync(new URL('../workflows/pr-babysit.js', import.meta.url)
 const ABSENT = ['URL', 'URLSearchParams', 'TextEncoder', 'TextDecoder', 'Buffer', 'process', 'fetch', 'structuredClone']
 
 const GREEN = { status: 'green', infraRerun: [], realFailures: [] }
+const RUNNING = { status: 'running', infraRerun: [], realFailures: [] }
 const finding = (over = {}) => {
   const f = {
     source: 'coderabbit', commentId: 1, file: 'src/a.c', line: 1,
@@ -278,9 +279,8 @@ async function run(opts = {}) {
         answer = {
           head: ci.headSha ?? head, status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
-          ...(/ --brief /.test(text) && ci.status === 'running' ? { checks: [], brief: true } : {}),
+          ...(/ --brief /.test(text) && ci.status === 'running' ? { checks: [] } : {}),
         }
-        if (opts.inventory) answer = opts.inventory(answer, label)
       } else {
         if (opts.evidence) await opts.evidence(calls)
         // A --gate's answer is its fixture's gate, by default one complete failure per fixture.
@@ -1378,39 +1378,38 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
 })
 
 test('the CI lane waits out its budget in slices, 30 minutes by default', async () => {
-  const running = { status: 'running', infraRerun: [], realFailures: [] }
-  const slices = (calls) => calls.filter(c => /^ci:collect#1\.\d+$/.test(c.label))
-    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+) --brief --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
-  const { calls } = await run({ ci: running, args: { maxCycles: 1 } })
+  const sliceCalls = (calls) => calls.filter(c => /^ci:collect#1\.\d+$/.test(c.label))
+  const slices = (calls) => sliceCalls(calls)
+    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+)(?: --brief)? --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
+  const { calls } = await run({ ci: RUNNING, args: { maxCycles: 1 } })
   assert.equal(slices(calls).reduce((a, b) => a + b), 30 * 60)
-  const full = calls.filter(c => c.label === 'ci:collect#1.full')
-  assert.equal(full.length, 1, 'leaving the wait still running reads the whole inventory once')
-  assert.match(full[0].prompt, /collect\.py inventory --wait-seconds 0 --repo /)
+  const briefs = sliceCalls(calls).map(c => / --brief /.test(c.prompt))
+  assert.deepEqual([briefs.slice(0, -1).every(Boolean), briefs.at(-1)], [true, false], 'brief while waiting, whole on the budget\'s last slice')
+  assert.equal(calls.some(c => c.label === 'ci:collect#1.full'), false, 'the last slice already read the whole inventory')
   assert.equal(slices(calls)[0], 180, 'short while the review lane may still push')
   assert.equal(calls.find(c => c.label === 'ci:collect#1.1').model, 'haiku')
-  const long = await run({ ci: running, args: { ciWait: 90, maxCycles: 1 } })
+  const long = await run({ ci: RUNNING, args: { ciWait: 90, maxCycles: 1 } })
   assert.equal(slices(long.calls).reduce((a, b) => a + b), 90 * 60)
-  const ciOnly = await run({ ci: running, args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 1 } })
+  const ciOnly = await run({ ci: RUNNING, args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 1 } })
   assert.equal(slices(ciOnly.calls)[0], 540, 'no review lane to wait for')
   const green = await run()
   assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge, nor a full read')
 })
 
-test('a CI wait left still running is classified from its full read, not the brief slices', async () => {
-  const running = { status: 'running', infraRerun: [], realFailures: [] }
-  const ciCalls = (calls) => calls.filter(c => c.label.startsWith('ci:'))
-  // The full read shows CI settled green after the last slice: the cycle goes on from that, with no judge.
-  const settled = await run({ ci: running, args: { maxCycles: 1 },
-    inventory: (a, label) => label.startsWith('ci:collect#1.full') ? { ...a, status: 'green', pending: 0 } : a })
-  assert.equal(ciCalls(settled.calls).filter(c => c.label === 'ci:collect#1.full').length, 1)
-  assert.equal(settled.logs.some(l => /CI inventory is inconsistent|CI inventory failed/.test(l)), false, settled.logs.join('\n'))
+test('a CI wait left early on a brief slice is classified from its full read', async () => {
+  // A review lane that stops ends the cycle, and the CI wait with it, after its first (brief) slice.
+  const stops = (l) => l.startsWith('reviews#')
+  const full = (l) => l.startsWith('ci:collect#1.full')
+  const ciLabels = (calls) => calls.filter(c => c.label.startsWith('ci:')).map(c => c.label)
+  const settled = await run({ throwOn: stops, ci: (l) => full(l) ? GREEN : RUNNING, args: { maxCycles: 1 } })
+  assert.deepEqual(ciLabels(settled.calls), ['ci:collect#1.1', 'ci:collect#1.full'], settled.logs.join('\n'))
+  assert.equal(settled.result.history[0].ci.status, 'green', 'the full read, not the brief slice, is the CI observed')
   // Another head on the full read is never read as this head's CI.
-  const moved = await run({ ci: running, args: { maxCycles: 1 },
-    inventory: (a, label) => label.startsWith('ci:collect#1.full') ? { ...a, head: 'f'.repeat(40) } : a })
+  const moved = await run({ throwOn: stops, ci: (l) => full(l) ? { ...RUNNING, headSha: 'f'.repeat(40) } : RUNNING, args: { maxCycles: 1 } })
   assert.ok(moved.logs.some(l => /CI inventory is inconsistent — head fffffff for /.test(l)), moved.logs.join('\n'))
-  // A full read that dies, retry included, is a failed inventory, not the last brief slice.
-  const failed = await run({ ci: running, args: { maxCycles: 1 }, throwOn: (l) => l.startsWith('ci:collect#1.full') })
-  assert.deepEqual(ciCalls(failed.calls).map(c => c.label).slice(-2), ['ci:collect#1.full', 'ci:collect#1.full.retry'])
+  // A full read that dies, retry included, is a failed inventory, not the brief slice.
+  const failed = await run({ throwOn: (l) => stops(l) || full(l), ci: RUNNING, args: { maxCycles: 1 } })
+  assert.deepEqual(ciLabels(failed.calls).slice(-2), ['ci:collect#1.full', 'ci:collect#1.full.retry'])
   assert.ok(failed.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), failed.logs.join('\n'))
 })
 
@@ -6401,11 +6400,10 @@ test('gate evidence missing or doubled for a requested link re-arms', async () =
 })
 
 test('yieldOnChange keeps a launch going through cycles that only waited, and pauses after one the caller must see', async () => {
-  const running = { status: 'running', infraRerun: [], realFailures: [] }
   const cycleOf = (label) => Number(label.match(/#(\d+)/)[1])
   const ON = { autoPush: true, maxCycles: 4, yieldOnChange: true }
   // CI settles only in cycle 3: one launch, no pause.
-  const waited = await run({ args: ON, ci: (label) => cycleOf(label) < 3 ? running : GREEN })
+  const waited = await run({ args: ON, ci: (label) => cycleOf(label) < 3 ? RUNNING : GREEN })
   assert.equal(waited.result.history.length, 3, waited.logs.join('\n'))
   assert.equal(waited.result.pass, true)
   assert.equal(waited.logs.some(l => /pausing for the caller/.test(l)), false)
@@ -6432,8 +6430,7 @@ test('yieldOnChange pauses when the handoffs change, and refuses yieldAfterCycle
   // A cycle that stops keeps its stop; one that would go on waiting for CI pauses for the new handoff.
   const stopped = await run({ args: { ...ON, state: first.result.state }, preflight: at, reviews: edited })
   assert.equal(stopped.result.reason, 'deferred-replies-unresolved')
-  const running = { status: 'running', infraRerun: [], realFailures: [] }
-  const second = await run({ args: { ...ON, state: first.result.state }, preflight: at, reviews: edited, ci: running })
+  const second = await run({ args: { ...ON, state: first.result.state }, preflight: at, reviews: edited, ci: RUNNING })
   assert.deepEqual([second.result.status, second.result.reason], ['paused', 'yielded'], second.logs.join('\n'))
   assert.deepEqual(second.result.handoffs.map(h => h.commentId), [1])
   assert.ok(second.logs.some(l => /pausing for the caller — the handoffs changed/.test(l)), second.logs.join('\n'))

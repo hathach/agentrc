@@ -7,9 +7,9 @@
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
-prints one JSON object {head, status, mergeable, pending, checks}, plus `error` when set
-and, with --brief while the status is still running, `brief: true` and no checks listed (a
-waiting relay copies nothing it will read again)
+prints one JSON object {head, status, mergeable, pending, checks}, plus `error` when set;
+with --brief, a status still running lists no checks (a waiting relay copies nothing it
+will read again)
 (a relaying agent can drop a trailing null, so no line carries a null error); every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. `status` is
 conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
@@ -336,10 +336,11 @@ INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for fa
 
 
 def printed(inv, brief=False):
-    """What the caller reads: the failing checks by name, the pending ones by count; brief, a running state without its checks."""
-    out = {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
-           'checks': [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]}
-    return {**out, 'checks': [], 'brief': True} if brief and inv['status'] == 'running' else out
+    """What the caller reads: the failing checks by name, the pending ones by count; brief, none while still running."""
+    listed = [] if brief and inv['status'] == 'running' else \
+        [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]
+    return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
+            'checks': listed}
 
 
 def evidence_dir(repo, pr, head):

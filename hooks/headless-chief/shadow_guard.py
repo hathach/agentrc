@@ -9,25 +9,15 @@ loads before any tool call and is not covered. Exit 2 denies; Claude Code lets a
 errors proceed, so an entry it cannot read denies too.
 """
 import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'skills' / 'headless-chief' / 'scripts'))
-from shadows import refusal  # noqa: E402
-
-
-def project(payload):
-    # the session's project, not a directory a Bash cd moved the payload's cwd to; its GIT_* would name another repository
-    start = os.environ.get('CLAUDE_PROJECT_DIR') or payload.get('cwd') or '.'
-    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-    top = subprocess.run(['git', '-C', start, 'rev-parse', '--show-toplevel'], capture_output=True, text=True, env=env)
-    return Path(top.stdout.strip() if top.returncode == 0 else start)
+from shadows import project, refusal  # noqa: E402
 
 
 def main():
-    why = refusal(project(json.load(sys.stdin)), 'restart the session')
+    why = refusal(project(json.load(sys.stdin))[0], 'restart the session')
     if why:
         print(why, file=sys.stderr)
         return 2

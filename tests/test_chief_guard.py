@@ -77,8 +77,8 @@ class ChiefGuard(unittest.TestCase):
 
     def test_heredoc_body_is_data_but_its_line_counts(self):
         self.assert_allowed("cat > /tmp/brief.md <<'EOF'\ngit push\ngh pr merge 1\nEOF")
-        self.assert_denied("cat > src/x.md <<'EOF'\nhello\nEOF", 'inside the task worktree')
-        self.assert_denied("cat <<EOF | tee src/x\nhi\nEOF", 'inside the task worktree')
+        self.assert_denied("cat > src/x.md <<'EOF'\nhello\nEOF", 'literal absolute path')
+        self.assert_denied("cat <<EOF | tee src/x\nhi\nEOF", 'literal absolute path')
 
     def test_gh_reads_pass(self):
         for c in ('gh pr view 12 --json state', 'gh pr checks 12', 'gh -R o/r pr list', 'gh issue view 3',
@@ -99,32 +99,48 @@ class ChiefGuard(unittest.TestCase):
         self.assert_allowed('python3 ~/.claude/skills/pr-babysit/scripts/launch_result.py --output /tmp/o')
 
     def test_writes_inside_the_worktree_are_denied(self):
-        for c in ('echo x > src/a.c', 'echo x >> ./notes.md', f'echo x > {self.project}/a', 'rm src/a.c', 'rm -rf /tmp/x src',
-                  'mv src/a.c /tmp/', 'touch new.c', 'cp /tmp/a src/b.c', "sed -i 's/a/b/' src/a.c", 'mkdir build',
-                  'printf x | tee src/a.c'):
-            self.assert_denied(c, 'inside the task worktree')
+        for c in (f'echo x > {self.project}/a', f'rm {self.project}/src/a.c', f'mv /tmp/a {self.project}/src/',
+                  f'cp /tmp/a {self.project}/src/b.c', f"sed -i 's/a/b/' {self.project}/src/a.c", f'printf x | tee {self.project}/src/a.c',
+                  f'git diff --output={self.project}/p.patch'):
+            self.assert_denied(c, 'literal absolute path')
+        self.assert_denied(None, 'literal absolute path', tool='Write', file_path=str(self.project / 'src' / 'new.c'))
+
+    def test_a_write_target_must_be_a_literal_absolute_path(self):
+        # no shell state is tracked: after any cd, a relative or variable target could be the worktree
+        for c in ('echo x > src/a.c', 'cd /tmp && printf done > chief-report.md', 'out=/tmp/r.md; printf done > "$out"',
+                  'printf done > "$(git rev-parse --show-toplevel)/r.md"', 'mkdir -p "$(git rev-parse --git-path chief)"',
+                  'touch new.c', 'git diff --output=chief-report.patch', 'cp -t . /tmp/brief.md', 'rsync -t /tmp/brief.md .',
+                  "cd hooks && sed -i 's/old/new/' chief_guard.py", 'chmod 600 src/a.c'):
+            self.assert_denied(c, 'literal absolute path')
 
     def test_writes_outside_the_worktree_pass(self):
         for c in ('echo x > /tmp/out.md', 'git log > /tmp/log 2>&1', 'git status 2>/dev/null', 'cp src/a.c /tmp/a.c',
-                  'mkdir -p /tmp/chief-run', 'rm -f /tmp/x', "sed 's/a/b/' src/a.c", 'cat src/a.c >&2'):
+                  'mkdir -p /tmp/chief-run', 'rm -f /tmp/x', "sed 's/a/b/' src/a.c", 'cat src/a.c >&2',
+                  'echo x > ~/chief-note.md', 'echo x > "$HOME/chief-note.md"', 'echo "$(date)" > /tmp/stamp',
+                  'chmod 600 /tmp/chief-report.md', 'cp -t /tmp src/a.c', 'rsync -t src/a.c /tmp/chief-a.c',
+                  'git -C /tmp diff --output=/tmp/p.patch', "sed -i -e 's/a/b/' /tmp/x.md", "perl -pi -e 's/a/b/' /tmp/x.md"):
             self.assert_allowed(c)
+        self.assert_allowed(None, tool='Write', file_path='/tmp/report.md')
+
+    def test_in_place_edits_name_every_file_operand(self):
+        self.assert_denied(f"sed -i -e 's/a/b/' /tmp/x.md {self.project}/src/a.c", 'literal absolute path')
+        self.assert_denied(f"perl -pi -e 's/a/b/' {self.project}/src/a.c", 'literal absolute path')
+        self.assert_denied("sed -i.bak 's/a/b/' src/a.c", 'literal absolute path')
+        self.assert_denied(f'sed -i -f/tmp/edit.sed {self.project}/README.md', 'literal absolute path')
+        self.assert_denied(f'sed -i -f /tmp/edit.sed {self.project}/README.md', 'literal absolute path')
+        self.assert_allowed("sed -Ei 's/a/b/' /tmp/chief-report.md")
+        self.assert_allowed('sed -i -f /tmp/edit.sed /tmp/chief-report.md')
+
+    def test_a_reassigned_home_or_tmpdir_is_not_expanded(self):
+        for c in (f'TMPDIR={self.project}; printf done > "$TMPDIR/r.md"', f'HOME={self.project} && printf done > "$HOME/r.md"',
+                  f'export HOME={self.project}; printf done > ~/r.md', f"bash -c 'TMPDIR={self.project}; printf x > $TMPDIR/r'"):
+            self.assert_denied(c, 'literal absolute path')
 
     def test_chief_directory_inside_a_primary_checkout_is_writable(self):
-        self.assert_allowed('mkdir -p .git/chief && git log > .git/chief/u1-commit-check.txt')
-        self.assertEqual(self.hook(tool='Write', file_path=str(self.project / '.git' / 'chief' / 'brief.md')).returncode, 0)
-        self.assert_denied('echo x > .git/config', 'inside the task worktree')
-
-    def test_write_tool_only_outside_the_worktree(self):
-        self.assertEqual(self.hook(tool='Write', file_path='/tmp/report.md').returncode, 0)
-        r = self.hook(tool='Write', file_path=str(self.project / 'src' / 'new.c'))
-        self.assertEqual(r.returncode, 2)
-        self.assertIn('outside the task worktree', r.stderr)
-
-    def test_a_directory_change_moves_where_relative_paths_land(self):
-        self.assert_denied(f'cd /tmp && cd {self.project} && printf done > chief-report.md', 'inside the task worktree')
-        self.assert_allowed('cd /tmp && printf done > chief-report.md')
-        self.assert_denied('cd "$SOMEWHERE" && printf done > r.md', 'inside the task worktree')
-        self.assert_allowed('cd "$SOMEWHERE" && printf done > /tmp/r.md')
+        chief = self.project / '.git' / 'chief'
+        self.assert_allowed(f'mkdir -p {chief} && git log > {chief}/u1-commit-check.txt')
+        self.assert_allowed(None, tool='Write', file_path=str(chief / 'brief.md'))
+        self.assert_denied(f'echo x > {self.project}/.git/config', 'literal absolute path')
 
     def test_combined_shell_flags_and_xargs_values(self):
         self.assert_denied("bash -lc 'git push origin HEAD'", 'changes the repository')
@@ -140,49 +156,13 @@ class ChiefGuard(unittest.TestCase):
         self.assert_denied("cat > /tmp/r.md <<EOF\n'`git push`'\nEOF", 'changes the repository')
         self.assert_allowed("cat > /tmp/r.md <<'EOF'\n$(git push origin HEAD)\nEOF")
 
-    def test_git_output_options_are_writes(self):
-        self.assert_denied('git diff --output=chief-report.patch', 'inside the task worktree')
-        self.assert_denied('git log -p --output chief.patch', 'inside the task worktree')
-        self.assert_allowed('git diff --output=/tmp/chief-report.patch')
-
-    def test_simple_variables_and_modes_resolve(self):
-        self.assert_allowed('out=/tmp/chief-report.md; printf done > "$out"')
-        self.assert_allowed('out=/tmp/chief; mkdir -p "${out}/u1"')
-        self.assert_allowed('chmod 600 /tmp/chief-report.md')
-        self.assert_denied('chmod 600 src/a.c', 'inside the task worktree')
-        self.assert_denied('printf done > "$unset_var"', 'inside the task worktree')
-
     def test_single_quoted_substitutions_are_data(self):
         self.assert_allowed("printf '%s\\n' '$(git push)' > /tmp/chief-report.md")
         self.assert_allowed("grep -n '`git push`' /tmp/notes.md")
 
-    def test_subshells_and_child_shells_keep_their_own_directory(self):
-        for c in ('(cd /tmp && pwd); printf done > chief-report.md', "bash -c 'cd /tmp'; printf done > chief-report.md",
-                  'echo "$(cd /tmp && pwd)"; printf done > chief-report.md'):
-            self.assert_denied(c, 'inside the task worktree')
-        self.assert_allowed('(cd /tmp && printf done > chief-report.md)')
-
-    def test_substitution_output_is_an_unresolved_path(self):
-        self.assert_denied('printf done > "$(git rev-parse --show-toplevel)/chief-report.md"', 'inside the task worktree')
-        self.assert_denied('mkdir -p "$(git rev-parse --git-path chief)"', 'inside the task worktree')
-        self.assert_allowed('echo "$(date)" > /tmp/stamp')
-
-    def test_git_output_follows_git_dash_c(self):
-        self.assert_denied(f'cd /tmp && git -C {self.project} diff --output=chief-report.patch', 'inside the task worktree')
-        self.assert_allowed(f'git -C /tmp diff --output=chief-report.patch')
+    def test_git_reads_keep_their_own_short_options(self):
         self.assert_allowed('git ls-files -o --exclude-standard')
         self.assert_allowed('git grep -o chief -- src')
-
-    def test_an_explicit_copy_destination_counts(self):
-        self.assert_denied('cp -t . /tmp/brief.md', 'inside the task worktree')
-        self.assert_denied('cp --target-directory=src /tmp/brief.md', 'inside the task worktree')
-        self.assert_allowed('cp -t /tmp src/a.c')
-        self.assert_denied('rsync -t /tmp/brief.md .', 'inside the task worktree')
-        self.assert_allowed('rsync -t src/a.c /tmp/chief-a.c')
-
-    def test_cd_option_terminator(self):
-        self.assert_denied(f'cd /tmp && cd -- {self.project} && printf done > r.md', 'inside the task worktree')
-        self.assert_allowed('cd -- /tmp && printf done > chief-report.md')
 
     def test_an_unparsable_command_is_denied(self):
         self.assert_denied('echo "unterminated', 'cannot parse')

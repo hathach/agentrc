@@ -283,7 +283,7 @@ const INVENTORY = withSeal({
   type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'checks'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
-    pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK }, brief: { type: ['boolean', 'null'] },
+    pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
   },
 })
 const GATE = {
@@ -1589,27 +1589,28 @@ const ciLaneRun = async (cycle, lanes) => {
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
   const sameLinks = (got, want) => got.length === want.length && want.every(l => got.includes(l))
+  const inventoryFailed = (inv) => {
+    if (inv && !inv.error) return false
+    log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
+    return true
+  }
   // collect.py polls every 30 s, so a shorter slice would only list.
   let inv = null
+  let brief = false
   let left = ciWait * 60
   for (let k = 1; ; k++) {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
-    // A slice that is still running prints no checks: nothing a relay copies again on the next one.
-    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice} --brief`, INVENTORY)
-    if (!inv || inv.error) {
-      log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
-      return null
-    }
+    // A --brief slice still running prints no checks, so a relay copies nothing it reads again; the budget's last slice is whole.
+    brief = left - slice >= 30
+    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${brief ? ' --brief' : ''}`, INVENTORY)
+    if (inventoryFailed(inv)) return null
     left -= slice
     if (inv.status !== 'running' || left < 30 || lanes.reviewPublishing || lanes.ended) break
   }
-  // Leaving the wait still running, the whole inventory is read once, as it stands now.
-  if (inv.brief) {
+  // Leaving the wait early on a brief slice still running, the whole inventory is read once, as it stands now.
+  if (brief && inv.status === 'running') {
     inv = await collect(`ci:collect#${cycle}.full`, 'inventory --wait-seconds 0', INVENTORY)
-    if (!inv || inv.error) {
-      log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
-      return null
-    }
+    if (inventoryFailed(inv)) return null
   }
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
   const shown = inv.mergeable === 'CONFLICTING' ? 'conflicting'
@@ -2198,7 +2199,7 @@ const runCycle = async (cycle, entry) => {
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
     if (marked > 0 && c.realFailures.some(sonarGate)) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
-      waitedOn = 'sonar'
+      waited = true
       return null
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
@@ -2258,7 +2259,7 @@ const runCycle = async (cycle, entry) => {
         if (cycle < maxCycles && !owedNow.every(handedOff)) {
           log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'} but ${owedNow.length} comment(s) still owed an answer — re-arming`)
           napMs = 60000 * cycle
-          waitedOn = 'replies'
+          waited = true
           return null
         }
         return unresolvedVerdict(cycle, owedNow)
@@ -2293,7 +2294,7 @@ const runCycle = async (cycle, entry) => {
     }
     if (c.status === 'running' || c.infraRerun.length > 0) {
       log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)
-      waitedOn = 'ci'
+      waited = true
       return null
     }
     if (!reviewsSettled) {
@@ -2305,7 +2306,7 @@ const runCycle = async (cycle, entry) => {
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }
-      waitedOn = 'bots'
+      waited = true
       return null
     }
     log(`cycle ${cycle}: nothing actionable`)
@@ -2475,18 +2476,19 @@ const adopt = async (entry) => {
   return null
 }
 
-// What the last cycle that continued only waited on (CI, bots, replies, sonar), else null.
-let waitedOn = null
+const yielded = (cycle) => finish(stop(cycle, 'yielded', { outstanding: outstanding() }), 'paused')
+// Set where a cycle continues only to wait (CI, bots, owed replies, a SonarCloud re-read); any other continuation pauses yieldOnChange.
+let waited = false
 // yieldOnChange returns after a cycle the caller must see: a push, changed handoffs or corrections, or no usable observation.
 const changeOf = (entry, before) => entry.reviewPush || entry.ciPush ? 'a repair was pushed'
   : JSON.stringify(handoffList()) !== before.handoffs ? 'the handoffs changed'
   : corrections.length !== before.corrections ? 'a correction was recorded'
-  : !waitedOn ? 'the cycle ended without a usable observation' : null
+  : !waited ? 'the cycle ended without a usable observation' : null
 const firstCycle = cyclesUsed + 1
 const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
 for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
-  waitedOn = null
+  waited = false
   const before = yieldOnChange ? { handoffs: JSON.stringify(handoffList()), corrections: corrections.length } : null
   const entry = { cycle, head: expectedHead, ...(rebased && cycle === firstCycle ? { rebased } : {}) }
   retired.clear()
@@ -2508,12 +2510,10 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   const change = yieldOnChange && cycle < maxCycles ? changeOf(entry, before) : null
   if (change) {
     log(`cycle ${cycle}: pausing for the caller — ${change}`)
-    return finish(stop(cycle, 'yielded', { outstanding: outstanding() }), 'paused')
+    return yielded(cycle)
   }
 }
-if (yieldAfterCycle && cyclesUsed < maxCycles) {
-  return finish(stop(cyclesUsed, 'yielded', { outstanding: outstanding() }), 'paused')
-}
+if (yieldAfterCycle && cyclesUsed < maxCycles) return yielded(cyclesUsed)
 // Reply debt outranks a silent bot; a last cycle that pushed says nothing about the new head.
 const last = history[history.length - 1]
 const stillPending = last.bots && last.head === expectedHead ? last.bots.bots.filter(b => !b.done) : []

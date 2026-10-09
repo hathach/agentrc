@@ -174,10 +174,11 @@ class InventoryTest(unittest.TestCase):
         self.heads = [HEAD]
         self.listings = [[self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
-        self.assertEqual((rc, r['status'], r['pending'], r['checks'], r['brief']), (0, 'running', 1, [], True))
+        self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []))
+        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'status'], 'the same members as a whole line')
         self.listings = [[self.check('hil', 'pass', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
-        self.assertEqual((r['status'], [c['link'] for c in r['checks']], 'brief' in r), ('red', [JOB.format(4)], False), 'settled: the whole inventory')
+        self.assertEqual((r['status'], [c['link'] for c in r['checks']]), ('red', [JOB.format(4)]), 'settled: the whole inventory')
 
     def test_no_wait_budget_reports_what_stands(self):
         self.heads = [HEAD]
