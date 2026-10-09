@@ -1,7 +1,7 @@
 export const meta = {
   name: 'pr-babysit',
   description: 'Drive a PR to green: validate bot review findings, fix, verify, push and reply, overlapped with a CI watch-and-judge lane',
-  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ~/.claude/skills/pr-babysit/ARGUMENTS.md.',
+  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true, or yieldOnChange: true to pause only after a cycle that needs it, and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ~/.claude/skills/pr-babysit/ARGUMENTS.md.',
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, lane?, state?, stateRef?, adoptHead?, rebasedHead? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, rebasedHead? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -112,9 +112,11 @@ const generatedRe = pathRe('generated')
 const buildCmd = typeof args.build === 'string' && args.build.trim() ? args.build.trim() : null
 
 const yieldAfterCycle = args.yieldAfterCycle === true
+const yieldOnChange = args.yieldOnChange === true
 const lane = args.lane === undefined ? 'both' : args.lane
 if (!['both', 'ci', 'reviews'].includes(lane)) throw new Error("lane must be 'both', 'ci' or 'reviews'")
 if (lane !== 'both' && !yieldAfterCycle) throw new Error(`lane '${lane}' runs one lane for one cycle: it needs yieldAfterCycle`)
+if (yieldOnChange && yieldAfterCycle) throw new Error('yieldOnChange and yieldAfterCycle are two ways to pause: pass one')
 const ciLane = lane !== 'reviews'
 const markSonar = args.markSonar === true
 if (markSonar && args.autoPush !== true) throw new Error('markSonar publishes to SonarCloud: it needs autoPush')
@@ -776,12 +778,7 @@ const finish = (verdict, status) => {
     } : null,
   }
   const state = stateOut()
-  // Comments the caller answers; a replySettlements entry then settles each.
-  const handoffs = [...new Set([...debt.keys(), ...reanswer])].filter(handedOff).map(commentId => {
-    const d = debt.get(commentId) || {}
-    return { commentId, ...(d.digest !== undefined ? { commentDigest: d.digest } : {}), why: handoffWhy(commentId),
-      ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.repair && d.repair.replyId ? { replyId: d.repair.replyId } : {}), ...(d.repair && d.repair.draft ? { draft: d.repair.draft } : {}) }
-  })
+  const handoffs = handoffList()
   if (!settlementsTried) for (const s of settlementsArg) settlements.push({ commentId: s.commentId, outcome: 'not processed', why: 'no review harvest in this launch' })
   const sonarUnmarked = !markSonar ? [] : [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, how: (a.sonarOf || a).how, last: sonarLast.get(commentId) || (sonarDown ? { outcome: 'not asked', detail: sonarDown } : null) }))
@@ -791,6 +788,12 @@ const finish = (verdict, status) => {
     rollup: launchRollup(), ...rest, ...(corrections.length ? { corrections } : {}), ...(handoffs.length ? { handoffs } : {}), ...(settlements.length ? { settlements } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
   }
 }
+// Comments the caller answers; a replySettlements entry then settles each.
+const handoffList = () => [...new Set([...debt.keys(), ...reanswer])].filter(handedOff).map(commentId => {
+  const d = debt.get(commentId) || {}
+  return { commentId, ...(d.digest !== undefined ? { commentDigest: d.digest } : {}), why: handoffWhy(commentId),
+    ...(d.attempt ? { attempt: d.attempt } : {}), ...(d.repair && d.repair.replyId ? { replyId: d.repair.replyId } : {}), ...(d.repair && d.repair.draft ? { draft: d.repair.draft } : {}) }
+})
 // Why the caller answers it now, or null: the workflow posts nothing more on it until the caller's reply settles it.
 const handoffWhy = (commentId) => {
   const d = debt.get(commentId)
@@ -2195,6 +2198,7 @@ const runCycle = async (cycle, entry) => {
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
     if (marked > 0 && c.realFailures.some(sonarGate)) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
+      waitedOn = 'sonar'
       return null
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
@@ -2254,6 +2258,7 @@ const runCycle = async (cycle, entry) => {
         if (cycle < maxCycles && !owedNow.every(handedOff)) {
           log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'} but ${owedNow.length} comment(s) still owed an answer — re-arming`)
           napMs = 60000 * cycle
+          waitedOn = 'replies'
           return null
         }
         return unresolvedVerdict(cycle, owedNow)
@@ -2288,6 +2293,7 @@ const runCycle = async (cycle, entry) => {
     }
     if (c.status === 'running' || c.infraRerun.length > 0) {
       log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)
+      waitedOn = 'ci'
       return null
     }
     if (!reviewsSettled) {
@@ -2299,6 +2305,7 @@ const runCycle = async (cycle, entry) => {
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }
+      waitedOn = 'bots'
       return null
     }
     log(`cycle ${cycle}: nothing actionable`)
@@ -2468,10 +2475,19 @@ const adopt = async (entry) => {
   return null
 }
 
+// What the last cycle that continued only waited on (CI, bots, replies, sonar), else null.
+let waitedOn = null
+// yieldOnChange returns after a cycle the caller must see: a push, changed handoffs or corrections, or no usable observation.
+const changeOf = (entry, before) => entry.reviewPush || entry.ciPush ? 'a repair was pushed'
+  : JSON.stringify(handoffList()) !== before.handoffs ? 'the handoffs changed'
+  : corrections.length !== before.corrections ? 'a correction was recorded'
+  : !waitedOn ? 'the cycle ended without a usable observation' : null
 const firstCycle = cyclesUsed + 1
 const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
 for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
+  waitedOn = null
+  const before = yieldOnChange ? { handoffs: JSON.stringify(handoffList()), corrections: corrections.length } : null
   const entry = { cycle, head: expectedHead, ...(rebased && cycle === firstCycle ? { rebased } : {}) }
   retired.clear()
   history.push(entry)
@@ -2489,6 +2505,11 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
     cyclesUsed = cycle
   }
   if (verdict) return finish(verdict)
+  const change = yieldOnChange && cycle < maxCycles ? changeOf(entry, before) : null
+  if (change) {
+    log(`cycle ${cycle}: pausing for the caller — ${change}`)
+    return finish(stop(cycle, 'yielded', { outstanding: outstanding() }), 'paused')
+  }
 }
 if (yieldAfterCycle && cyclesUsed < maxCycles) {
   return finish(stop(cyclesUsed, 'yielded', { outstanding: outstanding() }), 'paused')

@@ -51,6 +51,12 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   its SonarCloud marking under `markSonar`, unless our earlier answer still
   owes one. Per launch.
 - `yieldAfterCycle`: run one cycle and return the state for the next launch.
+- `yieldOnChange`: run cycles up to `maxCycles` with both lanes, pausing (status
+  `paused`, reason `yielded`) only after a cycle that pushed a repair, changed
+  the handoffs, recorded a correction, or ended with no usable observation; a
+  cycle that only waited (CI settling, bots pending, owed replies, a SonarCloud
+  re-read) goes on in the same launch. A stop and the last cycle end the launch
+  as without it. Not with `yieldAfterCycle` or a single lane.
 - `lane`: `both` (default), `ci` or `reviews`; a single lane needs
   `yieldAfterCycle` and never declares the PR done.
 - `state` or `stateRef: { outputFile, digest }`: a previous launch's state, or

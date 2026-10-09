@@ -6399,3 +6399,44 @@ test('gate evidence missing or doubled for a requested link re-arms', async () =
     assert.equal(labels.some(l => l.startsWith('ci:judge')), false)
   }
 })
+
+test('yieldOnChange keeps a launch going through cycles that only waited, and pauses after one the caller must see', async () => {
+  const running = { status: 'running', infraRerun: [], realFailures: [] }
+  const cycleOf = (label) => Number(label.match(/#(\d+)/)[1])
+  const ON = { autoPush: true, maxCycles: 4, yieldOnChange: true }
+  // CI settles only in cycle 3: one launch, no pause.
+  const waited = await run({ args: ON, ci: (label) => cycleOf(label) < 3 ? running : GREEN })
+  assert.equal(waited.result.history.length, 3, waited.logs.join('\n'))
+  assert.equal(waited.result.pass, true)
+  assert.equal(waited.logs.some(l => /pausing for the caller/.test(l)), false)
+  // A pushed repair pauses with its receipt, before another cycle or nap.
+  const fixed = await run({ args: ON, reviews: oneValid })
+  assert.deepEqual([fixed.result.status, fixed.result.reason, fixed.result.history.length], ['paused', 'yielded', 1])
+  assert.ok(fixed.result.observation.actions.reviewPush, 'the repair receipt reaches the caller')
+  assert.ok(fixed.logs.some(l => /cycle 1: pausing for the caller — a repair was pushed/.test(l)), fixed.logs.join('\n'))
+  // The last cycle ends the launch as without the flag: no pause that implies another cycle remains.
+  const last = await run({ args: { ...ON, maxCycles: 1 }, reviews: oneValid })
+  assert.notEqual(last.result.reason, 'yielded')
+  // A CI lane with no usable report goes back to the caller rather than retrying inside the launch.
+  const blind = await run({ args: ON, throwOn: (l) => l.startsWith('ci:collect#1.') })
+  assert.deepEqual([blind.result.status, blind.result.history.length], ['paused', 1])
+  assert.ok(blind.logs.some(l => /pausing for the caller — the cycle ended without a usable observation/.test(l)), blind.logs.join('\n'))
+})
+
+test('yieldOnChange pauses when the handoffs change, and refuses yieldAfterCycle or a single lane', async () => {
+  const edited = { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' }
+  const ON = { autoPush: true, maxCycles: 4, yieldOnChange: true }
+  const first = await run({ args: ON, reviews: oneValid })
+  assert.equal(first.result.reason, 'yielded')
+  const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
+  // A cycle that stops keeps its stop; one that would go on waiting for CI pauses for the new handoff.
+  const stopped = await run({ args: { ...ON, state: first.result.state }, preflight: at, reviews: edited })
+  assert.equal(stopped.result.reason, 'deferred-replies-unresolved')
+  const running = { status: 'running', infraRerun: [], realFailures: [] }
+  const second = await run({ args: { ...ON, state: first.result.state }, preflight: at, reviews: edited, ci: running })
+  assert.deepEqual([second.result.status, second.result.reason], ['paused', 'yielded'], second.logs.join('\n'))
+  assert.deepEqual(second.result.handoffs.map(h => h.commentId), [1])
+  assert.ok(second.logs.some(l => /pausing for the caller — the handoffs changed/.test(l)), second.logs.join('\n'))
+  await assert.rejects(run({ args: { ...ON, yieldAfterCycle: true } }), /two ways to pause/)
+  await assert.rejects(run({ args: { ...ON, lane: 'ci' } }), /needs yieldAfterCycle/)
+})
