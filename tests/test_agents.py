@@ -187,7 +187,7 @@ class AgentFiles(unittest.TestCase):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())
         self.assertIn('a controller-level rung only on its dead-controller signature', chief)
         self.assertIn('Rungs that reboot the host or its VM need the user in a headless session.', chief)
-        self.assertIn('follows only a reported verified recovery with the marker cleared', chief)
+        self.assertIn('follows only a reported verified recovery that cleared that state', chief)
 
     def test_chief_launches_pr_babysit_with_the_arguments_the_workflow_parses(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())

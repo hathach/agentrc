@@ -69,10 +69,12 @@ tooling summary when there is one. Nothing is preselected; ask again when the
 answers contradict each other (selected boards plus none, "use selected" with
 none selected). For a local board, ask which entry of the project's local rig
 config to use (tinyusb: `test/hil/local.json`, its `boards` or `boards-skip`),
-or for a new one's name, board uid, flasher and tests, and a flashable example
-to run on it. The launcher only collects the entry; chief applies it. A launch
-that cannot ask (headless, a schedule) takes the choice from its task, `none`
-included, never a default.
+or for a new one, the fields the HIL contract lists for a new entry (tinyusb:
+name, board uid, flasher and tests, and a flashable example to run on it), when
+the contract allows adding one at review time. The launcher only collects the
+entry; chief applies it.
+A launch that cannot ask (headless, a schedule) takes the choice from its task,
+`none` included, never a default.
 
 ## 3. Ask how to publish
 
@@ -105,11 +107,14 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
 1. `prepare.py --check` in the worktree; a moved head stops the run.
 2. Hardware, when boards were chosen: chief's Hardware rules, its pre-hardware
    facts unit reading the tooling diff first, one `hil-operator` run through
-   the HIL contract on those boards. A local board's entry is added or enabled
-   in the worktree's rig config, uncommitted, by the hardware unit, and
-   restored before step 3. Each row it passes on is built from the
-   report that run wrote: `{board, verdict: pass|fail|not-run, regression:
-   verified|none|unknown, testedHead, report}`; a failing board is rerun on
+   the HIL contract on those boards. Unless the HIL contract rules it out, a
+   local board's entry is added or enabled in the worktree's rig config,
+   uncommitted, by the hardware unit, and restored before step 3. Each row it
+   passes on is built from the report that run wrote, by the HIL contract's
+   review mapping where it has one: `{board, verdict: pass|fail|not-run,
+   regression: verified|none|unknown, testedHead, report}`. A board the mapping
+   calls a blocker, which takes precedence over every other mapping, stops the
+   run before step 3. A failing board is rerun on
    `mergeBase` only when the same firmware, test and rig make that comparison
    meaningful, otherwise its regression is `unknown`.
 3. The `pr-review` workflow with `{pr, repo, head, mergeBase, scopeBase, mode,
