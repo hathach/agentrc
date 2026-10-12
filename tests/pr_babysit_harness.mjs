@@ -196,6 +196,7 @@ async function run(opts = {}) {
   let commits = 0 // so each stub commit gets its own SHA, as a real one would
   let staged = [] // what the committer put in it, read back by the audit agent
   let validatorCalls = 0
+  let observed = null // the last validator observedAt, a trigger's default finishing time
   let brokenWriter = false // a writer reported a failed build since the last candidate build
   const receiptFiles = new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
   const sonarMarked = new Set() // comments whose SonarCloud issue a sonar.py run marked
@@ -319,6 +320,7 @@ async function run(opts = {}) {
         : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
           : r.bots
       const observedAt = at((opts.clockOffset ?? 0) + (validatorCalls++) * (opts.minutesPerCycle ?? 1))
+      observed = observedAt
       return {
         headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', ...r,
         bots: bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha })),
@@ -471,6 +473,12 @@ async function run(opts = {}) {
       const line = conforms(options.schema, answer.error ? answer : sealLine(answer), label)
       if (path && !answer.error) receiptFiles.set(path, line)
       return line
+    }
+    if (label.startsWith('crtrigger#')) {
+      // coderabbit_trigger.py's line: the box ticked unless opts.crTrigger(label) answers otherwise, finished when the
+      // validator last observed unless it says when; null is a dead relay.
+      const answer = typeof opts.crTrigger === 'function' ? opts.crTrigger(label) : 'crTrigger' in opts ? opts.crTrigger : { outcome: 'ticked', detail: 'comment 5' }
+      return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
     }
     if (label.startsWith('build:resolve#')) {
       // The repository's build for the batch, resolved when the caller named none.
@@ -5929,6 +5937,103 @@ test('a push in a yielding launch leaves the old clock; the resume starts a new 
   })
   assert.equal(b.result.reason, 'yielded', `${b.result.reason}: twenty minutes on the old head do not count`)
   assert.deepEqual(b.result.state.reviewClock, { sha: shaFor(1), eventAt: null, since: at(20) })
+})
+
+const MANUAL = 'Review skipped: manual review required for this OSS repository'
+const skippedCr = (reason = MANUAL) => bot('coderabbit', { state: 'settled', kind: 'skipped', sha: null, evidence: ['status CodeRabbit'], reason })
+const triggers = (labels) => labels.filter(l => l.startsWith('crtrigger#'))
+
+test('coderabbitTrigger ticks the Trigger review box on a manual-review skip, then waits for the review', async () => {
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 },
+    reviewsPerCycle: () => quiet([++n === 1 ? skippedCr() : bot('coderabbit')]),
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.equal(result.cycles, 2)
+  assert.deepEqual(triggers(labels), ['crtrigger#1'])
+  const call = calls.find(c => c.label === 'crtrigger#1')
+  assert.ok(call.prompt.includes(`coderabbit_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
+  assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
+  assert.ok(logs.includes('cycle 1: crtrigger#1: ticked (comment 5)'), logs.join('\n'))
+  assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 10m to cap)`)
+  assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), triggeredAt: at(0) })
+})
+
+test('a head is triggered once, across cycles and a resumed state, and settles skipped after the cap', async () => {
+  const capped = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, reviews: quiet([skippedCr()]) })
+  assert.equal(capped.result.pass, true, capped.result.reason)
+  assert.equal(capped.result.cycles, 3)
+  assert.deepEqual(triggers(capped.labels), ['crtrigger#1'])
+  assert.equal(headLine(capped.logs)[2], `cycle 3 summary — CI green, reviews: coderabbit settled (skipped: ${MANUAL}; no review 10m after its trigger)`)
+  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true }, crTrigger: { outcome: 'already', detail: 'comment 5' }, reviews: quiet([skippedCr()]) })
+  assert.equal(a.result.reason, 'yielded')
+  assert.equal(a.result.state.reviewClock.triggeredAt, at(0))
+  const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true, state: a.result.state }, clockOffset: 3, reviews: quiet([skippedCr()]) })
+  assert.equal(b.result.reason, 'yielded', 'three minutes since the trigger: still waiting')
+  assert.deepEqual(triggers(b.labels), [])
+  await assert.rejects(run({ args: { maxCycles: 3, state: { ...a.result.state, reviewClock: { ...a.result.state.reviewClock, triggeredAt: 'never' } } } }), /not a pr-babysit state/)
+  // The cap runs from when the script finished, not from the harvest before it.
+  const late = await run({ args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 5, crTrigger: { outcome: 'ticked', detail: 'comment 5', at: at(4) }, reviews: quiet([skippedCr()]) })
+  assert.equal(late.result.pass, true, late.result.reason)
+  assert.equal(late.result.cycles, 4)
+  assert.equal(late.result.state.reviewClock.triggeredAt, at(4))
+  assert.equal(headLine(late.logs)[2], `cycle 3 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 4m to cap)`)
+})
+
+test('a recheck that finds no skip waits for the next harvest, which settles it', async () => {
+  const notSkipped = { outcome: 'notSkipped', detail: "CodeRabbit status is pending 'Review in progress'" }
+  let n = 0
+  const reviewed = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, crTrigger: notSkipped, reviewsPerCycle: () => quiet([++n === 1 ? skippedCr() : bot('coderabbit')]) })
+  assert.equal(reviewed.result.pass, true, reviewed.result.reason)
+  assert.equal(reviewed.result.cycles, 2)
+  assert.ok(reviewed.logs.includes("cycle 1: crtrigger#1: notSkipped (CodeRabbit status is pending 'Review in progress')"), reviewed.logs.join('\n'))
+  assert.equal(headLine(reviewed.logs)[0], `cycle 1 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 10m to cap)`)
+  const capped = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, crTrigger: notSkipped, reviews: quiet([skippedCr()]) })
+  assert.equal(capped.result.pass, true, capped.result.reason)
+  assert.equal(capped.result.cycles, 3)
+  assert.deepEqual(triggers(capped.labels), ['crtrigger#1'])
+})
+
+test('a CodeRabbit queued after its trigger waits out the cap from the trigger, not from an older head event', async () => {
+  const queued = absent('coderabbit', { state: 'queued', reason: 'review requested' })
+  let n = 0
+  const perCycle = () => ({ ...quiet([++n === 1 ? skippedCr() : queued]), headEventAt: at(-20) })
+  const early = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, reviewsPerCycle: perCycle })
+  assert.equal(early.result.reason, 'reviews-pending')
+  assert.equal(headLine(early.logs)[1], 'cycle 2 summary — CI green, reviews: coderabbit queued (review requested, 9m to cap)')
+  n = 0
+  const late = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, minutesPerCycle: 5, reviewsPerCycle: perCycle })
+  assert.equal(late.result.pass, true, late.result.reason)
+  assert.equal(headLine(late.logs)[2], 'cycle 3 summary — CI green, reviews: coderabbit queued, wait expired after 10m: head unreviewed (review requested)')
+})
+
+test('no trigger without coderabbitTrigger or for another skip, and the switch needs autoPush and coderabbit auto-running', async () => {
+  for (const [args, reason] of [[{}, MANUAL], [{ coderabbitTrigger: true }, 'Review skipped: draft pull request']]) {
+    const { result, labels } = await run({ args, reviews: quiet([skippedCr(reason)]) })
+    assert.equal(result.pass, true, result.reason)
+    assert.deepEqual(triggers(labels), [])
+  }
+  await assert.rejects(run({ args: { autoPush: false, coderabbitTrigger: true } }), /coderabbitTrigger ticks CodeRabbit's Trigger review box: it needs autoPush/)
+  await assert.rejects(run({ args: { coderabbitTrigger: 'yes' } }), /coderabbitTrigger must be a boolean/)
+  await assert.rejects(run({ args: { reviewers: ['greptile'], coderabbitTrigger: true } }), /coderabbitTrigger needs coderabbit in autoRun/)
+})
+
+test('a failed or lost trigger leaves CodeRabbit settled, logged and not asked again', async () => {
+  const cases = [
+    [{ outcome: 'failed', detail: '0 CodeRabbit comments hold one Trigger review box, not 1' }, 'failed (0 CodeRabbit comments hold one Trigger review box, not 1)'],
+    [{ error: 'gh: HTTP 502', outcome: '', detail: '', at: '' }, 'failed (gh: HTTP 502)'],
+    [null, 'failed (no answer)'],
+  ]
+  for (const [crTrigger, line] of cases) {
+    const { result, logs, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, crTrigger, reviews: quiet([skippedCr()]) })
+    assert.equal(result.pass, true, result.reason)
+    assert.equal(result.cycles, 1)
+    assert.deepEqual(triggers(labels), crTrigger === null ? ['crtrigger#1', 'crtrigger#1.retry'] : ['crtrigger#1'])
+    assert.ok(logs.includes(`cycle 1: crtrigger#1: ${line}`), logs.join('\n'))
+    assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit settled (skipped: ${MANUAL})`)
+    assert.equal(result.state.reviewClock.triggeredAt, null, 'tried and not waiting')
+  }
 })
 
 test('a returned state is sealed, compact and leads with its digest', async () => {

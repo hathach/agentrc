@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -126,6 +126,10 @@ if (yieldOnChange && yieldAfterCycle) throw new Error('yieldOnChange and yieldAf
 const ciLane = lane !== 'reviews'
 const markSonar = args.markSonar === true
 if (markSonar && args.autoPush !== true) throw new Error('markSonar publishes to SonarCloud: it needs autoPush')
+const coderabbitTrigger = args.coderabbitTrigger ?? false
+if (typeof coderabbitTrigger !== 'boolean') throw new Error('coderabbitTrigger must be a boolean')
+if (coderabbitTrigger && args.autoPush !== true) throw new Error("coderabbitTrigger ticks CodeRabbit's Trigger review box: it needs autoPush")
+if (coderabbitTrigger && !autoRun.includes('coderabbit')) throw new Error(`coderabbitTrigger needs coderabbit in autoRun ${JSON.stringify(autoRun)}`)
 const reviewLane = lane !== 'ci'
 const STATE_VERSION = 4
 // A state crosses its caller, so it is sealed: canonical key order, any change fails the digest.
@@ -232,7 +236,8 @@ if (args.state !== undefined && args.state !== null) {
     (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
-      Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt)))))
+      Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
+      (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt)))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version 3 or ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
@@ -485,6 +490,12 @@ const SONAR = withSeal({
     },
   },
 })
+// outcome is checked in code: an error line's relay fills it with ''.
+const CRTRIGGER = withSeal({
+  type: 'object', additionalProperties: false,
+  required: ['outcome', 'detail', 'at'],
+  properties: { error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' } },
+})
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'refusal'],
@@ -558,13 +569,14 @@ const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
 const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
 const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
 const SONAR_SCRIPT = '~/.claude/skills/pr-babysit/scripts/sonar.py'
+const CRTRIGGER_SCRIPT = '~/.claude/skills/pr-babysit/scripts/coderabbit_trigger.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build.py'
 const SCOPE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/scope_check.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
-const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
@@ -711,6 +723,7 @@ const sonarLast = new Map()
 let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
 // When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
+// triggeredAt: absent until this head's one CodeRabbit trigger, then when the script finished, or null when it failed.
 let reviewClock = restored ? restored.reviewClock : null
 // A landed but unpushed commit is the caller's to decide, never the next baseline.
 const pendingOf = () => {
@@ -893,8 +906,13 @@ const settleBots = (r) => {
     })),
   }
 }
-const botCell = (b, waitedMin) => {
+const botCell = (b, headWaitedMin) => {
   if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
+  const waitedMin = b.triggeredMin ?? headWaitedMin
+  if (b.state === 'settled' && b.triggeredMin !== undefined) {
+    return b.done ? `settled (${b.kind}: ${b.reason}; no review ${waitedMin}m after its trigger)`
+      : `review triggered (${b.reason}, ${Math.max(0, REVIEW_CAP_MIN - waitedMin)}m to cap)`
+  }
   if (b.state === 'settled') return `settled (${b.kind}: ${b.reason})`
   if (b.state === 'queued' || b.state === 'absent') {
     return b.done ? `${b.state}, wait expired after ${waitedMin}m: head unreviewed (${b.reason})`
@@ -1578,6 +1596,32 @@ const settleSonar = async (cycle, entry) => {
   return entry.sonar.filter(x => x.outcome === 'marked').length
 }
 
+// A repository below CodeRabbit's open-source threshold gets a manual-review skip on every push until its Trigger review box is ticked.
+const MANUAL_SKIP = /^review skipped: manual review required/i
+const triggerCodeRabbit = async (cycle, r, bots) => {
+  const cr = bots.bots.find(b => b.bot === 'coderabbit')
+  if (!coderabbitTrigger || !cr) return
+  const manual = cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
+  // Once per head, whatever the outcome: a failed tick is not retried into a storm.
+  if (manual && reviewClock.triggeredAt === undefined) {
+    const label = `crtrigger#${cycle}`
+    const t = await relayOnce(
+      `${IN_CHECKOUT}Tick CodeRabbit's Trigger review box on PR #${args.pr}: run \`python3 ${CRTRIGGER_SCRIPT} --pr ${args.pr} --head ${r.headSha}\` ` +
+      relayed(CRTRIGGER) + ' Change nothing on GitHub yourself.',
+      { label, phase: 'Push', model: 'haiku', effort: 'low', schema: CRTRIGGER })
+    const known = !!t && !t.error && ['ticked', 'already', 'notSkipped', 'failed'].includes(t.outcome)
+    const outcome = known ? t.outcome : 'failed'
+    const detail = known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`
+    // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
+    reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
+    log(`cycle ${cycle}: ${label}: ${outcome}${detail ? ` (${detail})` : ''}`)
+  }
+  // Waits like a queued bot, its cap counted from the trigger; working and reviewed go by settleBots alone.
+  if (typeof reviewClock.triggeredAt !== 'string' || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
+  cr.triggeredMin = Math.floor((Date.parse(r.observedAt) - Date.parse(reviewClock.triggeredAt)) / 60000)
+  cr.done = cr.triggeredMin >= REVIEW_CAP_MIN
+}
+
 // The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none. Returns the ids settled.
 const settlements = []
 let settlementsTried = false
@@ -1894,6 +1938,7 @@ const runCycle = async (cycle, entry) => {
     entry.bots = r === nobody
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)
+    if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots)
     const reviewsSettled = !!entry.bots && entry.bots.bots.every(b => b.done)
     const pendingBots = entry.bots ? entry.bots.bots.filter(b => !b.done) : []
 
@@ -2567,5 +2612,5 @@ const stillPending = last.bots && last.head === expectedHead ? last.bots.bots.fi
 return finish(outstanding().length > 0
   ? unresolvedVerdict(maxCycles, outstanding(), args.autoPush !== true)
   : stillPending.length > 0
-    ? stop(maxCycles, 'reviews-pending', { head: expectedHead, pending: stillPending.map(({ done, ...b }) => b) })
+    ? stop(maxCycles, 'reviews-pending', { head: expectedHead, pending: stillPending.map(({ done, triggeredMin, ...b }) => b) })
     : stop(maxCycles, 'maxCycles reached'))
