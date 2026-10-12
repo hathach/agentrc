@@ -99,11 +99,8 @@ adds only what it may edit and when it stops.
   revision, configuration and hash, recorded as `cleanup.pristine`; cleanup
   restores that identity, and later commits do not move it. When the
   project's HIL contract defines a cleanup state instead of a restoration
-  firmware, record that state there; cleanup then runs the contract's cleanup,
-  its write counts as a restoration flash, and its verification is the
-  run-state observation. Tracked paths a
-  build may rewrite are in the prompt's temporary scope, or reported before
-  building.
+  firmware, record that state there. Tracked paths a build may rewrite are in
+  the prompt's temporary scope, or reported before building.
 - **Instrumentation.** Only the listed paths, from a clean checkout,
   uncommitted, each diff saved as a patch in the artifact directory. From a
   previous unit's dirty state (a recovery prompt): inspect the recorded patch
@@ -130,21 +127,24 @@ adds only what it may edit and when it stops.
   the experiment plus cleanup; never cut a restoration short for the deadline,
   report the overrun.
 - **Cleanup, before releasing the lock.** Stop owned capture and debug clients
-  before opening the restoration flasher, dispose of the source as your role
-  says, establish the pinned restoration image on the board (retain the
-  programmed image when verification with the backend's procedure establishes
-  that it matches the pinned artifact and nothing since changed its contents
-  or made them uncertain, citing that verification; otherwise program the
-  pinned artifact and verify its programmed contents, the artifact hash
-  recorded apart from that result), remove owned breakpoints and watchpoints,
-  restore the firmware's expected run state and record an observation that
-  establishes it (a verified flash alone does not; for a USB device, the
-  expected function, such as an application exchange; a claim that needs
-  re-enumeration records the enumeration events, and a device number alone
-  establishes neither, since the host may reuse it across a reset), close the
-  flasher, restore host settings, release the lock. `restorationFlashes`
-  counts actual programming attempts. Run state not established is a failed
-  cleanup. Do only the cleanup your own actions or the explicitly assigned
+  before opening the restoration flasher or running the contract's cleanup,
+  dispose of the source as your role says, establish the pinned restoration
+  image on the board (retain the programmed image when verification with the
+  backend's procedure establishes that it matches the pinned artifact and
+  nothing since changed its contents or made them uncertain, citing that
+  verification; otherwise program the pinned artifact and verify its
+  programmed contents, the artifact hash recorded apart from that result) or,
+  when `cleanup.pristine` records the HIL contract's cleanup state, run the
+  contract's cleanup instead, verified only by the run-state observation
+  below; remove owned breakpoints and watchpoints, restore the firmware's
+  expected run state and record an observation that establishes it (a
+  verified flash alone does not; for a USB device, the expected function,
+  such as an application exchange; a claim that needs re-enumeration records
+  the enumeration events, and a device number alone establishes neither,
+  since the host may reuse it across a reset), close any flasher you opened,
+  restore host settings, release the lock. `restorationFlashes` counts actual
+  programming attempts, a contract cleanup's write included. Run state not
+  established is a failed cleanup. Do only the cleanup your own actions or the explicitly assigned
   recovery state call for, establishing ownership before restoring a
   predecessor's state. Blocked before touching hardware with no recovery state
   assigned, the untouched actions are `n-a`, nothing is flashed and another
