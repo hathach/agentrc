@@ -252,6 +252,7 @@ identity (`git remote get-url origin`), not by a directory name:
 | Repository | Notes |
 |---|---|
 | `hathach/tinyusb` | `projects/tinyusb.md` |
+| `adafruit/tinyuf2` | `projects/tinyuf2.md` |
 
 Every entry there says how it is known (verified when, on which revision and
 board, how — or only carried over). Check a symbol exists in the checkout in
