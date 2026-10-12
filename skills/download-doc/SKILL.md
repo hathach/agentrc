@@ -12,7 +12,7 @@ the web for a manual, so its value depends on being complete and *not stale*.
 
 | File | Role |
 |---|---|
-| `scripts/sync.py` | CLI: sync a vendor (enumerate → plan → `--apply` imports/replaces), or `add` one document. Dry run by default. |
+| `scripts/sync.py` | CLI: sync a vendor (enumerate → plan → `--apply` imports/replaces), or `add`, `refresh` or `remove` one document. Dry run by default. |
 | `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py --help` lists them, each docstring gives its scope |
 | `scripts/doclib.py` | Shared core: transport, revisions, Calibre I/O, planning |
 | `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry run by default. |
@@ -82,7 +82,10 @@ usage error, a blocker, or a library it could not read. `--apply` imports; reind
 
 A newer revision of a book an adapter does not refresh goes through `sync.py refresh`,
 with `add`'s arguments and a required `--revision`; the given metadata replaces the
-book's, and a failed backup of the old one removes nothing (`sync.py refresh --help`).
+book's (`sync.py refresh --help`).
+
+An old copy `refresh` cannot reach, such as a book filed by hand with no identifier,
+goes through `sync.py remove <book id>`: dry run first, then `--apply`.
 
 ## Conventions
 
@@ -103,8 +106,8 @@ Dedup depends on matching these exactly; `maintaining.md` gives the reasons.
   gitignored `secret.yml` beside this file (`calibre:` block; `Library._server_creds`
   documents it). **A FreeFileSync `calibre-library.ffs_batch` mirror** to omv: let it
   finish.
-- Replacing a book backs its PDF up to `~/.local/share/download-doc/superseded/`
-  first; never `calibredb remove` by hand.
+- Replacing or removing a book keeps no copy of the old one; remove through
+  `refresh` or `sync.py remove`, never `calibredb remove` by hand.
 - Gated documents (login, per-document EULA, NXP moderated request, `*-NDA`) are
   reported per document with the reason. **Never accept a licence or submit a request
   form without the user's explicit say-so**; `references/nxp.md` has the flow.

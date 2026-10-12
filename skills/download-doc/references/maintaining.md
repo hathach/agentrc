@@ -9,7 +9,7 @@ vendor. `SKILL.md` is the run guide.
 ```
 vendor adapter          shared core
 enumerate()  ──▶  diff vs Calibre identifiers  ──▶  download  ──▶  import / replace  ──▶  report
-                  (st:DS12930, nxp:MCXA344...)                     (backup first)
+                  (st:DS12930, nxp:MCXA344...)
 ```
 
 Everything vendor-specific lives in an adapter; everything else is shared. Adding a
@@ -182,10 +182,6 @@ Consequence: books imported before lastmod was recorded carry `Revision: unknown
 the core's "local unreadable → refresh" rule marks every one of them OUTDATED on the
 next run. That is one deliberate re-download (or a backfill of `Revision:` with the
 date each book was added), not a bug — but it is ~100 documents, so read the plan first.
-
-**Back up before replacing.** `calibredb remove` is immediate with no undo, and a
-superseded revision is still the only copy of *that* revision. `Library.remove()`
-copies the PDF to `~/.local/share/download-doc/superseded/` first.
 
 **Sweep the download directory case-insensitively and extension-agnostically.**
 Browser-mediated downloads don't match the doc code: casing differs

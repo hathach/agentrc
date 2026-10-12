@@ -603,52 +603,16 @@ class Library:
                       "--field", f"publisher:{doc.author}", str(book_id), check=False)
         return book_id
 
-    def remove(self, book_id: int, backup_dir: Path) -> list:
-        """Back the book's files up, then remove it; -> the backup paths. Calibre's
-        remove is immediate and there is no undo; a superseded revision is still the
-        only copy of that revision, so no PDF copied means nothing removed."""
-        try:
-            listed = json.loads(self._run("list", "--for-machine", "-f", "formats",
-                                          "-s", f"id:{book_id}") or "[]")
-            formats = [Path(f) for f in listed[0]["formats"]] if len(listed) == 1 else []
-        except (RuntimeError, ValueError, LookupError, TypeError) as e:
-            raise BackupError(f"book #{book_id}: its files could not be listed ({e})") from e
-        if not any(f.suffix.lower() == ".pdf" and f.is_file() for f in formats):
-            raise BackupError(f"book #{book_id}: no PDF on disk to back up "
-                              f"(formats: {', '.join(map(str, formats)) or 'none'})")
-        copies = []
-        try:
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            for src in formats:
-                if src.is_file():
-                    copies.append(Path(shutil.copy2(src, unused(backup_dir, f"{src.stem}.book{book_id}", src.suffix))))
-        except OSError as e:
-            raise BackupError(f"book #{book_id}: backing its files up failed ({e})") from e
-        if not any(c.suffix.lower() == ".pdf" for c in copies):
-            raise BackupError(f"book #{book_id}: its PDF vanished before it was copied")
+    def remove(self, book_id: int) -> None:
+        """calibredb remove is immediate, with no undo and no copy kept."""
         try:
             self._run("remove", str(book_id))
         except RuntimeError as e:
-            raise RemoveError(f"book #{book_id}: calibredb remove failed ({e}); "
-                              f"backed up to {', '.join(map(str, copies))}") from e
-        return copies
-
-
-class BackupError(RuntimeError):
-    """The book's files could not be backed up, so it was not removed."""
+            raise RemoveError(f"book #{book_id}: calibredb remove failed ({e})") from e
 
 
 class RemoveError(RuntimeError):
-    """The book was backed up but calibredb remove failed: whether it is gone is unknown."""
-
-
-def unused(directory: Path, stem: str, suffix: str) -> Path:
-    """`directory/stem+suffix`, or with a counter before the suffix when that is taken:
-    an earlier backup is never overwritten."""
-    path, n = directory / f"{stem}{suffix}", 1
-    while path.exists():
-        path, n = directory / f"{stem}.{n}{suffix}", n + 1
-    return path
+    """calibredb remove failed: whether the book is gone is unknown."""
 
 
 # ---------------------------------------------------------------- planning

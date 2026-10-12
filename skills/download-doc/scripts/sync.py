@@ -15,7 +15,8 @@ it. Pass --apply once the plan looks right.
 
 `sync.py add` imports one document by hand under the same conventions, for a vendor
 with no adapter or a document an adapter does not list (`sync.py add --help`);
-`sync.py refresh` replaces such a book with a newer revision (`sync.py refresh --help`).
+`sync.py refresh` replaces such a book with a newer revision (`sync.py refresh --help`);
+`sync.py remove` removes one book by its Calibre id (`sync.py remove --help`).
 """
 from __future__ import annotations
 
@@ -247,7 +248,6 @@ def show(heading: str, doc, pdf: Path, why: str) -> None:
 
 
 REINDEX = "reindex so read-doc finds it: python3 ~/.claude/skills/read-doc/scripts/locate.py build --all"
-SUPERSEDED = Path.home() / ".local" / "share" / "download-doc" / "superseded"
 
 
 def add_main(argv: list) -> int:
@@ -337,24 +337,20 @@ def stored_ident(book: dict, ident: str) -> str | None:
 
 
 def replace(lib, old_id: int, doc, pdf: Path) -> tuple:
-    """Back book old_id up, remove it and add doc in its place -> (new id, backup paths,
-    None), or (None, backup paths, why it stopped, naming the stage). A failed backup
-    removes nothing."""
+    """Remove book old_id and add doc in its place -> (new id, None), or (None, why it
+    stopped, naming the stage)."""
     try:
-        copies = lib.remove(old_id, SUPERSEDED)
-    except doclib.BackupError as e:
-        return None, [], f"backup failed, book #{old_id} left in place: {e}"
+        lib.remove(old_id)
     except doclib.RemoveError as e:
-        return None, [], f"removal failed, nothing added: {e}"
+        return None, f"removal failed, nothing added: {e}"
     try:
         new_id = lib.add(doc, pdf)
         why = None if new_id else lib.last_add_status
     except RuntimeError as e:
         new_id, why = None, str(e) or type(e).__name__
     if new_id:
-        return new_id, copies, None
-    return None, copies, (f"book #{old_id} was removed but the new copy was not added ({why}); "
-                          f"its files are in {', '.join(map(str, copies))}")
+        return new_id, None
+    return None, f"book #{old_id} was removed but the new copy was not added ({why})"
 
 
 def refresh_main(argv: list) -> int:
@@ -365,11 +361,9 @@ def refresh_main(argv: list) -> int:
 
     The --revision is compared before anything is downloaded: newer (or a book whose
     revision cannot be read) goes ahead, the same one is nothing to do, and one that
-    cannot be compared is refused. --apply backs the old PDF up to
-    ~/.local/share/download-doc/superseded, then removes the book and adds the new
-    one; a failed backup removes nothing. Exit 0 planned, refreshed or already
-    current, 1 refused or failed, 2 a usage error, a blocker, or a library that
-    could not be read.
+    cannot be compared is refused. --apply removes the old book, keeping no copy,
+    and adds the new one. Exit 0 planned, refreshed or already current, 1 refused or
+    failed, 2 a usage error, a blocker, or a library that could not be read.
     """
     ap = doc_parser("sync.py refresh", refresh_main.__doc__)
     ap.add_argument("--revision", required=True, help="the newer revision, as the document prints it")
@@ -407,8 +401,8 @@ def refresh_main(argv: list) -> int:
             print(f"  note: the library spells it {have['ident']}; the new book takes "
                   f"{doc.ident}, as --id gives it", file=sys.stderr)
         if not a.apply:
-            print(f"\ndry run — nothing changed. --apply backs #{have['id']}'s files up to "
-                  f"{SUPERSEDED}, removes it and adds the above", file=sys.stderr)
+            print(f"\ndry run — nothing changed. --apply removes #{have['id']}, keeping no "
+                  f"copy, and adds the above", file=sys.stderr)
             return 0
         again, why = refresh_target(lib, doc)
         if not why and (again["id"], again["rev"]) != (have["id"], have["rev"]):
@@ -417,14 +411,50 @@ def refresh_main(argv: list) -> int:
             print(f"REFUSED: book #{have['id']} changed since the plan ({why}); run it again",
                   file=sys.stderr)
             return 1
-        book_id, copies, failure = replace(lib, have["id"], doc, pdf)
+        book_id, failure = replace(lib, have["id"], doc, pdf)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if failure:
         print(f"FAILED: {failure}", file=sys.stderr)
         return 1
-    print(f"\nREFRESHED #{have['id']} -> #{book_id} {doc.ident}\n"
-          f"backed up: {', '.join(map(str, copies))}\n{REINDEX}")
+    print(f"\nREFRESHED #{have['id']} -> #{book_id} {doc.ident}\n{REINDEX}")
+    return 0
+
+
+def remove_main(argv: list) -> int:
+    """Remove one book by its Calibre id, keeping no copy: an old copy refresh cannot
+    reach, such as a book filed by hand with no identifier. Dry run by default. Exit 0
+    planned or removed, 1 no such book or the removal failed, 2 a usage error, a
+    blocker, or a library that could not be read.
+    """
+    ap = argparse.ArgumentParser(prog="sync.py remove", description=remove_main.__doc__)
+    ap.add_argument("book_id", type=int, help="the book's Calibre id")
+    ap.add_argument("--apply", action="store_true", help="actually remove it")
+    a = ap.parse_args(argv)
+
+    lib = doclib.Library()
+    if blocked(lib, a.apply):
+        return 2
+    try:
+        book = next((b for b in lib.books() if b["id"] == a.book_id), None)
+    except RuntimeError as e:
+        print(f"BLOCKED: cannot read the library: {e}", file=sys.stderr)
+        return 2
+    if book is None:
+        print(f"REFUSED: no book #{a.book_id}", file=sys.stderr)
+        return 1
+    idents = ", ".join(f"{k}:{v}" for k, v in (book.get("identifiers") or {}).items()) or "none"
+    print(f"REMOVE #{a.book_id} {book.get('title', '')}\n  author      {book.get('authors', '')}\n"
+          f"  identifiers {idents}")
+    if not a.apply:
+        print("\ndry run — nothing changed. --apply removes it, keeping no copy", file=sys.stderr)
+        return 0
+    try:
+        lib.remove(a.book_id)
+    except doclib.RemoveError as e:
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 1
+    print(f"\nREMOVED #{a.book_id}\n{REINDEX}")
     return 0
 
 
@@ -433,6 +463,8 @@ def main() -> int:
         return add_main(sys.argv[2:])
     if sys.argv[1:2] == ["refresh"]:
         return refresh_main(sys.argv[2:])
+    if sys.argv[1:2] == ["remove"]:
+        return remove_main(sys.argv[2:])
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("vendor", choices=sorted(VENDORS))
@@ -628,7 +660,7 @@ def main() -> int:
             skipped.append((doc.doc_id, f"{why}; local copy left alone"))
             failed += 1
             continue
-        _, _, failure = replace(lib, have["id"], doc, pdf)
+        _, failure = replace(lib, have["id"], doc, pdf)
         if failure:
             skipped.append((doc.doc_id, failure))
             unsafe += 1
@@ -662,8 +694,6 @@ def main() -> int:
         for doc_id, why in skipped[:8]:
             print(f"        - {doc_id[:40]:<40} {why[:46]}")
     print("=" * 68)
-    if replaced:
-        print(f"superseded PDFs backed up to {SUPERSEDED}")
     for doc_id, why in skipped:
         print(f"  SKIPPED {doc_id:<22} {why}")
     print("\ncoverage — catalogue must equal the sum of what happened to it:")
