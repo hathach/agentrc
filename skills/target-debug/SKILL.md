@@ -97,7 +97,11 @@ adds only what it may edit and when it stops.
   leaving firmware staged for HIL untouched. Before the first hardware change,
   save the restoration artifact apart from later build outputs and pin it: its
   revision, configuration and hash, recorded as `cleanup.pristine`; cleanup
-  restores that identity, and later commits do not move it. Tracked paths a
+  restores that identity, and later commits do not move it. When the
+  project's HIL contract defines a cleanup state instead of a restoration
+  firmware, record that state there; cleanup then runs the contract's cleanup,
+  its write counts as a restoration flash, and its verification is the
+  run-state observation. Tracked paths a
   build may rewrite are in the prompt's temporary scope, or reported before
   building.
 - **Instrumentation.** Only the listed paths, from a clean checkout,
@@ -221,10 +225,10 @@ Each technique's recipe, read when you reach for it (files beside this one):
   mid-test on that board means wait, and force only under an explicitly
   scoped forced-lock recovery (Delegated sessions' Lock).
 - **Instrumentation is temporary**: before `release`, restore the pinned
-  restoration firmware as Delegated sessions' Cleanup says (the next CI run
-  must not inherit a debug build) and revert the instrumentation diff. Handing
-  the diff over with the diagnosis preserves the evidence; it does not count
-  as cleanup.
+  restoration firmware or cleanup state as Delegated sessions' Cleanup says
+  (the next CI run must not inherit a debug build) and revert the
+  instrumentation diff. Handing the diff over with the diagnosis preserves the
+  evidence; it does not count as cleanup.
 - **A register snapshot without a validity anchor lies**: J-Link tool sessions
   can reset or briefly halt the DUT as a side effect, and a snapshot of a
   freshly-reset chip (e.g. NVIC ISER = 0) reads like a smoking gun. Read DHCSR
