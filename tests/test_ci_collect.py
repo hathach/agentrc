@@ -537,6 +537,16 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(sig(jlink, esptool), 'report pass: Failed: survivors JLinkExe, esptool')
         self.assertEqual(sig(jlink, esptool), sig({**jlink, 'pid': 90, 'start': 456}, {**esptool, 'pid': 91, 'start': None}))
 
+    def test_a_cleanup_survivors_signature_names_their_commands_not_their_pids(self):
+        def sig(pid, start):
+            survivors = [{'pid': pid, 'start': start, 'cmd': ['/opt/SEGGER/JLinkExe', '-USB', '1']}]
+            cleanup = {'pass': False, 'state': 'unknown', 'survivors': survivors,
+                       'detail': f'StepFail: children {[pid]} survived SIGKILL; no flash may overlap them'}
+            report = {'pass': False, 'caveat': '', 'results': [{'board': 'a', 'pass': False, 'steps': [], 'cleanup': cleanup}]}
+            return collect.cell_signature('a cleanup', collect.report_rows(7, report)['a cleanup'][0])
+        self.assertEqual(sig(9, 123), 'a cleanup: Failed: survivors JLinkExe')
+        self.assertEqual(sig(9, 123), sig(90, 456))
+
     def test_report_level_cells_are_passed_against_a_base_report_and_not_run_without_one(self):
         self.logs['3'] = self.uf2_log('{"pass": false, "caveat": "", "error": "roster rejected", "results": []}')
         self.logs['40'] = self.uf2_log('pass.json')
@@ -553,7 +563,8 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(collect.uf2_report([fail, ok])[0], 2)
         self.assertIsNone(collect.uf2_report(['{"results": []}', 'plain']))
         self.assertIsNone(collect.uf2_report(['{"pass": true, "results": []}']), 'hil_test.py always prints a caveat')
-        for bad in ('[null]', '[{"steps": {}}]', '[{"steps": [1]}]', '[{"cleanup": "x"}]', '[], "survivors": [1]'):
+        for bad in ('[null]', '[{"steps": {}}]', '[{"steps": [1]}]', '[{"cleanup": "x"}]', '[], "survivors": [1]',
+                    '[{"cleanup": {"survivors": [1]}}]'):
             self.assertEqual(collect.uf2_report([fail, f'{{"pass": true, "caveat": "", "results": {bad}}}']),
                              (1, json.loads(fail)), bad)
 

@@ -63,8 +63,8 @@ a JSON report as its last stdout line: the log's last report gives a
 "<board> <step>" or "<board> cleanup" cell per failure, "<board> locked" signed
 by the lock alone, "<board> run" for a board failed otherwise, "report
 error"/"report caveat", and "report pass" when the report's pass is not true but
-no other cell failed (survivors alone, signed by their commands' names; pid and
-start follow the signature). A report's report-level cells it did not fail read
+no other cell failed (survivors alone). Survivors, a cleanup's or the report's, are
+signed by their commands' names; pid and start follow the signature. A report's report-level cells it did not fail read
 OK, so they are passed against a base report; its cell rows are rebuilt in the
 table's shape and stand in for the report line, whose number is their lineNo. onBase compares
 the base run's row for the cell: same-failure, other-failure, passed, other (a skip), not-run, or
@@ -540,7 +540,15 @@ def uf2_shaped(report):
     def dicts(x, missing_ok=True):
         return (missing_ok and x is None) or (isinstance(x, list) and all(isinstance(i, dict) for i in x))
     return (dicts(report.get('results'), missing_ok=False) and dicts(report.get('survivors'))
-            and all(dicts(r.get('steps')) and isinstance(r.get('cleanup'), (dict, type(None))) for r in report['results']))
+            and all(dicts(r.get('steps')) and isinstance(r.get('cleanup'), (dict, type(None)))
+                    and dicts((r.get('cleanup') or {}).get('survivors')) for r in report['results']))
+
+
+def survived(survivors, detail):
+    """A survivors failure's detail: their commands' names, then the two spaces cell_signature cuts at,
+    so the pids and starts that change run to run stay out of the signature."""
+    names = ', '.join(Path(str((s.get('cmd') or ['?'])[0])).name for s in survivors)
+    return f'survivors {names}  {detail}'
 
 
 def report_rows(n, report):
@@ -553,7 +561,10 @@ def report_rows(n, report):
             own = [(s.get('step'), s.get('pass') is True, s.get('detail') or '') for s in r.get('steps') or []]
             cleanup = r.get('cleanup')
             if cleanup:
-                own.append(('cleanup', cleanup.get('pass') is True, cleanup.get('detail') or cleanup.get('state') or ''))
+                detail = cleanup.get('detail') or cleanup.get('state') or ''
+                if cleanup.get('survivors'):
+                    detail = survived(cleanup['survivors'], detail)
+                own.append(('cleanup', cleanup.get('pass') is True, detail))
             # install and restore (invalidate on origin/master) rows carry no run verdict
             if 'ran' in r and r.get('pass') is not True and all(ok for _, ok, _ in own):
                 own.append(('run', False, r.get('detail') or ''))
@@ -561,10 +572,8 @@ def report_rows(n, report):
     # report-level cells read OK when not failed, so a base report places them as passed
     found += [(f'report {key}', not report.get(key), report.get(key)) for key in ('error', 'caveat')]
     survivors = report.get('survivors')
-    # pid and start change run to run, so they follow the two spaces cell_signature cuts at
-    names = ', '.join(Path(str((s.get('cmd') or ['?'])[0])).name for s in survivors or [])
     found.append(('report pass', report.get('pass') is True or not all(ok for _, ok, _ in found),  # e.g. survivors alone
-                  f'survivors {names}  {json.dumps(survivors)}' if survivors else 'pass is not true'))
+                  survived(survivors, json.dumps(survivors)) if survivors else 'pass is not true'))
     rows = {}
     for cell, ok, detail in found:
         outcome = 'OK' if ok else f'Failed: {detail}'
