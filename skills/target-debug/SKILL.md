@@ -69,8 +69,9 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
   against the HIL config entry it names, before acting. Resolve the board's family and debug backend from the project's
   metadata before choosing probe tools, never from the board name or its flashing backend.
 - **Lock.** Ordinary hardware sessions hold the project's board lock for the whole hardware phase; a refused hold waits
-  within the lock-wait budget, then returns `blocked` with the holder. Forced-lock recovery is a separate, explicitly
-  scoped operation naming the holder, affected resources and recovery procedure; a refusal alone never adds that scope,
+  within the lock-wait budget, then returns `blocked` with the holder; a cleanup holder (`role: cleanup-holder`) is never
+  waited on and returns `blocked` at once as a recovery blocker. Forced-lock recovery is a separate, explicitly scoped
+  operation naming the holder, affected resources and recovery procedure; a refusal alone never adds that scope,
   and it never includes stopping the CI runner. A reproducer that takes the lock itself (the HIL contract's Reservation
   names them) never runs under your hold, and its guard is bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
   reproduction while its firmware, configuration, reproducer and relevant rig inputs match; otherwise resolve equivalent
