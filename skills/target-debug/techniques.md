@@ -58,8 +58,10 @@ python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [-
 - Every DHCSR read clears S_RESET_ST, the tool's own connect included: the
   `dhcsrBefore` bit covers only this session's connect, `dhcsrAfter` the
   sampling window.
-- A read-back of RP2040 flash while the core sits in `get_bootsel_button`
-  returns zeroes: check the project note before calling a mismatch real there.
+- Before calling an RP2040 flash read-back mismatch real: `families.md`,
+  "RP2040 flash verification".
+- A single opcode read (`mdh <addr> 1`) at an address where two builds differ
+  supports a narrow identity claim between them, not a verified image.
 
 ## RAM ring-buffer trace
 

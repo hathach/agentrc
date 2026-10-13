@@ -68,9 +68,9 @@ riscv32-esp-elf-gdb -batch -ex 'target extended-remote :3333' \
 - `set ESP_RTOS FreeRTOS` must precede the board cfg: with it, `info threads`
   lists every task with name/state/CPU (verified: usbd Running @CPU0, IDLE1
   @CPU1, ...); without it, one bare "Remote target".
-- `export.sh` may leave the RISC-V GDB off PATH: a rig host's verified path is
-  in the project's notes (`target-debug`'s `projects/`); read it when
-  `riscv32-esp-elf-gdb` is not found.
+- `export.sh` may leave the RISC-V GDB off PATH: look under
+  `~/.espressif/tools/riscv32-esp-elf-gdb/<version>/riscv32-esp-elf-gdb/bin/`
+  (verified on ci.lan 2026-09-18, version `17.1_20260402`).
 - The ELF: the firmware's own build output (an `idf.py` build directory) —
   symbolized app backtraces verified.
 - **P4 attach resets the target** in the measured rig configuration: openocd

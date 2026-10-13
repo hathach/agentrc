@@ -30,7 +30,7 @@ in its own session, or wrap it in `catch` and run the restoring commands
 unconditionally before `shutdown error`.
 
 On RP2040, reach a flash-resident halt before any flash read or
-`verify_image`: the tinyusb project note "RP2040 flash verification" has the
+`verify_image`: `families.md`, "RP2040 flash verification", has the
 precondition and the failure it prevents.
 
 RP2040 needs the roster's explicit `adapter speed` (5000 on the measured
@@ -108,4 +108,20 @@ p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparat
 While halted the device answers **nothing**: host control transfers time out
 in ~5 s and the OS may reset/re-enumerate — after `continue`, the bus traffic
 shows recovery, not the original bug. Prefer one halt for a post-mortem dump
-over stepping through live USB traffic.
+over stepping through live USB traffic. When the probe shares that host, the
+stalled enumeration can block it too: halting pico2_etm_trace stalled the
+host's enumeration for ~30 s (`device not accepting address`, error -62) and
+JLinkExe blocked at "Connecting to J-Link" meanwhile. verified 2026-09-18.
+
+## J-Link Commander sessions
+
+- In a hand-written JLinkExe command file, `-ExitOnError 0` still exits at a
+  failed `verifybin` and leaves the core halted: resume it from a new session.
+  verified 2026-10-12 mimxrt1060_evk.
+- `JLinkExe` can crash in `libjlinkarm` at the probe connect, before the
+  target connect (SIGSEGV; once a glibc double-free abort); the cause is
+  unknown. verified 2026-10-12 htpc, mimxrt1060_evk: 2 of 94 sessions of
+  TinyUF2's HIL runner.
+- Keep the probe off the hub of a device that hangs mid-write: the xHCI keeps
+  retrying its enumeration, and a J-Link there stalled for ~80 s. verified
+  2026-10-12 lpcxpresso55s69 (that the hub is the cause is a hypothesis).

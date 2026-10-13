@@ -131,11 +131,11 @@ Board caveats (beyond the table):
   not proof of a currently clean 150 MHz link; lower the core clock if a
   retry still dies mid-stream.
   **Other rates need a hand-built clock** (the compile definitions: the project's
-  notes). Measured: 180000 = 90 MHz TRACECLK, loaded eye
+  build contract). Measured: 180000 = 90 MHz TRACECLK, loaded eye
   +4000..+5000 ps (3/3); 240000 = **the J-Trace PRO V2 ceiling** (120 MHz
   TRACECLK, TD +3500) — **⚠ 240 MHz was measured with the core regulator
   raised to 1.15 V, which nothing does automatically any more: raise it
-  yourself (definitions in the project's notes), or the chip runs
+  yourself (definitions in the project's build contract), or the chip runs
   60% over its 150 MHz rating at stock 1.10 V.** >=125 MHz
   TRACECLK is a hard probe wall at every sample delay/width (the V2 AT its
   documented limit: Arm spec 100 MHz in-spec, SEGGER's tuned-V2 best is

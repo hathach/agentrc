@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Verify the image programmed on an RP2040 against an ELF, over OpenOCD, and
-leave core 0 running (the target-debug skill's RP2040 flash verification).
+leave core 0 running (target-debug's families.md, "RP2040 flash verification").
 
   rp2040_verify.py --probe <serial> --interface-cfg interface/cmsis-dap.cfg --speed 5000 \
                    --elf <flashed.elf> --symbol tud_task_ext

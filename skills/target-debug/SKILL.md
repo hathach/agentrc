@@ -202,8 +202,11 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - SystemView: the project's `sysview` skill.
 - Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands, the
   drain model; the channel itself is the `rtt` skill's.
+- Chip and family constraints (flash reads, reset domains, probe misreads):
+  `families.md`.
 - dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch
-  sessions, the hardware breakpoint budget, watchpoints, FreeRTOS threads.
+  sessions, the hardware breakpoint budget, watchpoints, FreeRTOS threads,
+  J-Link Commander quirks.
 - USB enumeration or transfer bugs: capture both sides at once by default —
   `techniques.md`, "USB: dual-side capture".
 - Manuals (J-Link UM08001, OpenOCD, GDB): `techniques.md`, "Manuals".
@@ -213,7 +216,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - **Halting/resetting via the probe does NOT disconnect the device**: a DWC2
   soft-connect pullup stays up through core halt *and* reset, so the host's
   stuck URBs stay stuck and a wedged DUT stays wedged — recover the Linux
-  host side (the rig's own procedure; its HIL contract names it).
+  host side (the rig's own procedure; its HIL contract names it). carried
+  over.
 - **A bug that vanishes under logging is a timing bug**, not fixed: switch to
   the ring buffer; if it vanishes under GDB too, PC-sampling only.
 - **UART logging blocks in the write path** (worst perturbation, including
@@ -239,7 +243,7 @@ Each technique's recipe, read when you reach for it (files beside this one):
   /tmp/fw.bin`, then `verifybin /tmp/fw.bin,<flash-base>` (J-Link, verified)
   or `verify_image` (OpenOCD); on mismatch reflash before debugging further.
   Some targets need a particular halt state before flash reads (RP2040: a
-  flash-resident halt); check the project note first.
+  flash-resident halt); `families.md` has them.
 - **A marginal link can fake a deterministic firmware bug** — down to failing
   the same test at the same iteration twice. "USB disconnect" in dmesg on a
   freshly re-cabled port (high devnum = churn) means the plug, not the code:
@@ -249,9 +253,12 @@ Each technique's recipe, read when you reach for it (files beside this one):
 
 ## Project notes
 
-Symbols, symptom tables and gotchas of the projects these skills have been used
-on, one file each, for all six skills. Match the project by its repository
-identity (`git remote get-url origin`), not by a directory name:
+What is specific to the projects these skills have been used on, one file
+each, for all six skills: their symbols, typical issues and the behaviour of
+their code, releases and CI firmware; a project's build, rig and battery
+procedure stays in its own contracts. Read it with `families.md`'s section for
+the board's chip. Match the project by its repository identity
+(`git remote get-url origin`), not by a directory name:
 
 | Repository | Notes |
 |---|---|
@@ -261,7 +268,10 @@ identity (`git remote get-url origin`), not by a directory name:
 Every entry there says how it is known (verified when, on which revision and
 board, how — or only carried over). Check a symbol exists in the checkout in
 front of you before relying on it. When a session establishes something
-reusable about a project — reproduced, or read in its source — add it with
-the same evidence, or correct the entry it contradicts; leave out the session's
-chronology and dead ends. A project with no file: work from its source, and
+reusable — reproduced, or read in a source — add it with the same evidence,
+or correct the entry it contradicts, where it holds: only for this project,
+its file here; for any firmware on the chip, `families.md` (Espressif:
+`esp-target-debug`); for a probe or tool, the technique file (RTT and trace
+per-board caveats: `rtt/boards.md`, `etm-trace/boards.md`). Leave out the
+session's chronology and dead ends. A project with no file: work from its source, and
 start one when there is something worth keeping.

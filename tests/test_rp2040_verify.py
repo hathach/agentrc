@@ -1,6 +1,6 @@
 """Tests for the target-debug skill's rp2040_verify.py through a fake OpenOCD and
 nm on PATH. They prove the plumbing only: the batch's hardware behaviour is
-verified on a board, recorded in the tinyusb project note."""
+verified on a board, recorded in target-debug's families.md."""
 import importlib.util
 import json
 import os
