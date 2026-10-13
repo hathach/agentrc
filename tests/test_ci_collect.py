@@ -552,6 +552,10 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(collect.uf2_report([fail, '{"pass": true}', '{not json']), (1, json.loads(fail)))
         self.assertEqual(collect.uf2_report([fail, ok])[0], 2)
         self.assertIsNone(collect.uf2_report(['{"results": []}', 'plain']))
+        self.assertIsNone(collect.uf2_report(['{"pass": true, "results": []}']), 'hil_test.py always prints a caveat')
+        for bad in ('[null]', '[{"steps": {}}]', '[{"steps": [1]}]', '[{"cleanup": "x"}]', '[], "survivors": [1]'):
+            self.assertEqual(collect.uf2_report([fail, f'{{"pass": true, "caveat": "", "results": {bad}}}']),
+                             (1, json.loads(fail)), bad)
 
     def test_changed_paths_are_read_for_any_readable_check_and_their_failure_is_named(self):
         rc, r = self.main('https://greptile.com/')

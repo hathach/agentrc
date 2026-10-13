@@ -530,9 +530,17 @@ def uf2_report(lines):
                 report = json.loads(lines[n - 1])
             except ValueError:
                 continue
-            if isinstance(report, dict) and 'pass' in report and isinstance(report.get('results'), list):
+            if isinstance(report, dict) and {'pass', 'caveat'} <= report.keys() and uf2_shaped(report):
                 return n, report
     return None
+
+
+def uf2_shaped(report):
+    """Whether report_rows can read the report: its results, steps and survivors dicts, a cleanup a dict."""
+    def dicts(x, missing_ok=True):
+        return (missing_ok and x is None) or (isinstance(x, list) and all(isinstance(i, dict) for i in x))
+    return (dicts(report.get('results'), missing_ok=False) and dicts(report.get('survivors'))
+            and all(dicts(r.get('steps')) and isinstance(r.get('cleanup'), (dict, type(None))) for r in report['results']))
 
 
 def report_rows(n, report):
