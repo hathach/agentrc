@@ -68,14 +68,15 @@ def _curl(url: str, timeout: int, accept: str) -> bytes:
 def last_modified(url: str) -> str | None:
     """Last-Modified of a URL via HEAD: a revision substitute for vendors that
     publish none, and proof that the file exists."""
-    p = subprocess.run(["curl", "-sgIL", "--compressed", "-m", "25", "-A", UA, url],
+    # -w reads the final response only; with -L every redirect hop prints its own headers.
+    p = subprocess.run(["curl", "-sgIL", "--compressed", "-o", "/dev/null", "-m", "25", "-A", UA,
+                        "-w", "%{http_code} %header{last-modified}", url],
                        capture_output=True, text=True)
-    m = re.search(r"^last-modified:\s*(.+)$", p.stdout or "", re.I | re.M)
-    if m:
-        return m.group(1).strip()
+    status, _, date = p.stdout.partition(" ")
+    if not p.returncode and status.startswith("2") and date:
+        return date
     # Without this a refused HEAD reads only as an unparseable revision in the plan.
-    status = re.findall(r"^HTTP/\S+ (\d{3})", p.stdout or "", re.M)
-    why = f"curl exit {p.returncode}" if p.returncode or not status else f"HTTP {status[-1]}"
+    why = f"curl exit {p.returncode}" if p.returncode else f"HTTP {status}"
     print(f"  note: no Last-Modified from {url} ({why})", file=sys.stderr)
     return None
 

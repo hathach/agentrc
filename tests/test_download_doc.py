@@ -273,14 +273,16 @@ class LastModified(unittest.TestCase):
 
     def test_the_head_request_carries_an_accept_encoding_the_cdn_requires(self):
         def run(argv, **kw):
-            out = 'HTTP/2 200\r\nlast-modified: Wed, 28 Oct 2020 20:09:52 GMT\r\n' if '--compressed' in argv else 'HTTP/2 403\r\n'
+            out = '200 Wed, 28 Oct 2020 20:09:52 GMT' if '--compressed' in argv else '403 '
             return subprocess.CompletedProcess(argv, 0, out, '')
         self.assertEqual(self.head(run), ('Wed, 28 Oct 2020 20:09:52 GMT', ''))
 
     def test_a_missing_last_modified_names_the_final_status(self):
-        for out, code, why in (('HTTP/2 301\r\nlocation: /y.pdf\r\n\r\nHTTP/2 403\r\n', 0, 'HTTP 403'),
-                               ('', 28, 'curl exit 28'),
-                               ('HTTP/2 301\r\nlocation: /y.pdf\r\n', 6, 'curl exit 6')):
+        for out, code, why in (('403 ', 0, 'HTTP 403'),
+                               ('200 ', 0, 'HTTP 200'),
+                               ('404 Mon, 01 Jan 2024 00:00:00 GMT', 0, 'HTTP 404'),
+                               ('000 ', 28, 'curl exit 28'),
+                               ('301 ', 6, 'curl exit 6')):
             with self.subTest(why):
                 version, err = self.head(lambda argv, **kw: subprocess.CompletedProcess(argv, code, out, ''))
                 self.assertIsNone(version)
