@@ -40,7 +40,7 @@ each other on a shared board. `<lock>` is the contract's lock name for the
 board, which may differ from its roster name. The helper that takes it, and its
 holder record (pid, reason), are the contract's Reservation.
 
-- Never kill a holder, never stop a CI runner, never release a hold you did not
+- Never stop a CI runner. Never kill a holder or release a hold you did not
   take, except through the contract's Recovery procedure under a dispatch that
   names that board.
 - Never pre-hold a board for a tool that locks itself: it refuses your hold as a
