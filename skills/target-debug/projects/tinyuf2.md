@@ -56,27 +56,24 @@ in front of you.**
 
 ## espressif
 
-843fef8 below is TinyUF2's unmerged `hil-esp32s3` branch; its bootloader
-source is master 9d4b382's.
-
 - The bootloader enumerates as 239a:00a5 on the devkitc (`USB_PID` in its
   `board.h`, shared with the S2 saola wrover, a TODO there), its USB serial the
-  chip's factory MAC in hex. verified 2026-10-13 843fef8
+  chip's factory MAC in hex. verified 2026-10-13 2b558bd
   espressif_esp32s3_devkitc_1: sysfs and `lsusb`.
 - An app enters TinyUF2 with reset hint 0x11F2 (`ports/espressif/README.md`);
   the second-stage bootloader (`bootloader_components/main/bootloader_start.c`,
   `APP_REQUEST_UF2_RESET_HINT`) honours it only after a software reset
   (`RESET_REASON_CORE_SW`/`CPU0_SW`) from a non-factory boot, then clears it.
-  verified 2026-10-13 843fef8 espressif_esp32s3_devkitc_1: the battery's
+  verified 2026-10-13 2b558bd espressif_esp32s3_devkitc_1: the battery's
   reenter and 10 DFU_DETACH cycles of its app.
 - While TinyUF2 or the tested app owns the native port, USB-Serial-JTAG
   (303a:1001) is absent; logs and reset go over the UART bridge
   (`esp-target-debug`, "The PHY map").
-  verified 2026-10-13 843fef8 espressif_esp32s3_devkitc_1: sysfs during the
+  verified 2026-10-13 2b558bd espressif_esp32s3_devkitc_1: sysfs during the
   battery.
 - **dmesg shows "reset full-speed USB device ... device firmware changed" and
   "device offline error, dev sda" at the end of a UF2 copy**: TinyUF2 restarts
-  while usb-storage still talks to it. verified 2026-10-13 843fef8
+  while usb-storage still talks to it. verified 2026-10-13 2b558bd
   espressif_esp32s3_devkitc_1: on successful copies only, never on
   DFU_DETACH, in a 10-cycle run; they do not by themselves show a copy
   succeeded.
