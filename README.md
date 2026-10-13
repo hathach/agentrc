@@ -85,6 +85,7 @@ through its `Build contract:` and `HIL contract:` lines:
 
 | Skill | Use it to | Start with |
 |---|---|---|
+| [`hil`](skills/hil/SKILL.md) | run a project's HIL tests and judge their results: contract sections, board locks, verdicts, retries | the project's `HIL contract:` page |
 | [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
 | [`esp-target-debug`](skills/esp-target-debug/SKILL.md) | the same on ESP32-S3/P4 built-in USB-Serial-JTAG (other gdb, openocd fork) | read its PHY map first |
 | [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |

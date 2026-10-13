@@ -84,8 +84,8 @@ adds only what it may edit and when it stops.
   explicitly scoped operation naming the holder, affected resources and
   recovery procedure; a refusal alone never adds that scope, and it never
   includes stopping the CI runner. A reproducer that takes the lock itself
-  (tinyusb's `hil_test.py`) never runs under your hold, and its guard is
-  bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
+  (the HIL contract's Reservation names them) never runs under your hold, and
+  its guard is bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
   reproduction while its firmware, configuration, reproducer and relevant rig
   inputs match; otherwise resolve equivalent manual steps through the HIL
   contract, and if there are none return `blocked` naming the exact HIL
