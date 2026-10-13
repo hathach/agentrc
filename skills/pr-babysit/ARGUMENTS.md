@@ -7,7 +7,7 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
-- `maxCycles`: cycle ceiling, default 10; a resumed launch defaults to its state's.
+- `maxCycles`: cycle ceiling, default 16; a resumed launch defaults to its state's.
 - `autoPush` (default false, a dry run: fixes left uncommitted, nothing posted)
   and `markSonar` (needs `autoPush` and `SONAR_TOKEN`: marks the SonarCloud
   issue behind a refuted code-scanning comment, or a fixed one SonarCloud still

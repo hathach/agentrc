@@ -246,7 +246,7 @@ if (args.state !== undefined && args.state !== null) {
   if (st.build !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(st.build)} → ${JSON.stringify(buildCmd)}`)
   restored = st.version === 3 ? { ...st, version: STATE_VERSION, acceptedFailures: st.acceptedFailures.map(a => a.key) } : st
 }
-const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 10)
+const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 16)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
 let cyclesUsed = restored ? restored.cyclesUsed : 0
 const adoptHead = args.adoptHead === undefined || args.adoptHead === null ? null : args.adoptHead
