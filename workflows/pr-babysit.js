@@ -474,7 +474,7 @@ const PUSH = withSeal({
       items: { type: 'object', additionalProperties: false, required: ['url', 'head'],
         properties: { url: { type: 'string' }, head: { type: ['string', 'null'] } } },
     },
-    prHead: { type: ['string', 'null'] },
+    prState: { type: ['string', 'null'] }, prHead: { type: ['string', 'null'] },
   },
 })
 const SONAR = withSeal({
@@ -850,6 +850,8 @@ const dismissalKey = (f) => f.findingId
 const acceptedOnly = (c) => c.status === 'red' && c.realFailures.length > 0 && c.realFailures.every(rf => rf.accepted) && c.infraRerun.length === 0
 
 const stop = (cycles, reason, extra) => ({ pass: false, cycles, history, reason, ...extra })
+// A PR no longer open ends the launch whatever else is pending: there is nothing left to babysit.
+const prEnded = (cycles, state) => state === 'merged' ? stop(cycles, 'pr-merged') : state === 'closed' ? stop(cycles, 'pr-closed') : stop(cycles, 'pr-state-unread')
 const unverifiedStop = (cycles, unverifiable) => unverifiable ? stop(cycles, 'build-unverifiable', { detail: unverifiable }) : stop(cycles, 'fix-verification-failed')
 // dryRun: the debt was never postable.
 const unresolvedVerdict = (cycles, outstanding, dryRun = false) =>
@@ -1423,7 +1425,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
 const pushExact = async (sha, label, prToo = false) => {
   const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
     `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
-    `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
+    `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')} --open-pr ${args.pr}${prToo ? ` --pr ${args.pr}` : ''}\` ` +
     relayed(PUSH)
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
   // A retry finds a push that landed; it cannot prove one did not.
@@ -1432,6 +1434,11 @@ const pushExact = async (sha, label, prToo = false) => {
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
   if (r.error) return unknown(r.error)
+  // push.py pushed nothing to a PR it did not read OPEN; the caller stops on a merged or closed one. A retry cannot prove the first attempt did not land.
+  if (r.prState !== 'OPEN') {
+    const ended = r.prState === 'MERGED' || r.prState === 'CLOSED' ? { prState: r.prState.toLowerCase() } : {}
+    return { pass: false, detail: r.detail, ...ended, ...(first ? {} : { published: 'unknown' }) }
+  }
   if (r.heads.map(h => h.url).join('\n') !== pinned.pushUrls.join('\n')) return unknown(`the receipt names ${r.heads.map(h => h.url).join(', ') || 'no destination'}`)
   const heads = r.heads.map(h => h.head === null ? null : h.head.trim())
   const prHead = !prToo ? sha : typeof r.prHead === 'string' ? r.prHead.trim() : null
@@ -1445,6 +1452,22 @@ const pushExact = async (sha, label, prToo = false) => {
     : prHead === null ? `PR #${args.pr} head unreadable after the push`
     : prHead !== sha ? `PR #${args.pr} heads ${prHead.slice(0, 7)} after the push, not ${sha.slice(0, 7)}`
     : 'the push landed on some push URLs and not others')
+}
+
+const PR_STATE = { type: 'object', required: ['state'], properties: { error: { type: ['string', 'null'] }, state: { type: 'string' } } }
+const readPrState = async (tag) => {
+  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`gh pr view ${args.pr} --json state\` ` + relayed(PR_STATE),
+    { label: `prstate#${tag}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PR_STATE })
+  if (!r || r.error || !['OPEN', 'MERGED', 'CLOSED'].includes(r.state)) log(`prstate#${tag}: PR #${args.pr} state unread — ${!r ? 'the relay died' : r.error || JSON.stringify(r.state)}`)
+  return r && !r.error ? r.state : null
+}
+// Before each GitHub write but a push (push.py reads it itself), the state is read afresh: only a verified OPEN goes on.
+const prGate = async (lanes, tag) => {
+  if (!lanes.prState) {
+    const state = await readPrState(tag)
+    if (state !== 'OPEN') lanes.prState = state === 'MERGED' || state === 'CLOSED' ? state.toLowerCase() : 'unread'
+  }
+  return lanes.prState
 }
 
 let napMs = 0
@@ -1573,10 +1596,12 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
 }
 
 // SonarCloud keeps its gate red until an issue is resolved: mark the issue behind each answered code-scanning comment false positive.
-const settleSonar = async (cycle, entry) => {
+// ended: the caller's PR-state check, read before writing; the caller stops on it.
+const settleSonar = async (cycle, entry, ended) => {
   const items = [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, commentDigest: (a.sonarOf || a).digest, how: (a.sonarOf || a).how, note: a.sonar, digest: fnv1a(a.sonar) }))
   if (!markSonar || sonarDown || entry.sonar || items.length === 0) return 0
+  if (await ended('sonar')) return 0
   const label = `sonar#${cycle}`
   // One receipt per request and cycle: a retry, or the CI lane after both copies were lost, replays the run that marked (#55).
   const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
@@ -1598,12 +1623,13 @@ const settleSonar = async (cycle, entry) => {
 
 // A repository below CodeRabbit's open-source threshold gets a manual-review skip on every push until its Trigger review box is ticked.
 const MANUAL_SKIP = /^review skipped: manual review required/i
-const triggerCodeRabbit = async (cycle, r, bots) => {
+const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitTrigger || !cr) return
   const manual = cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
   // Once per head, whatever the outcome: a failed tick is not retried into a storm.
   if (manual && reviewClock.triggeredAt === undefined) {
+    if (await ended('crtrigger')) return
     const label = `crtrigger#${cycle}`
     const t = await relayOnce(
       `${IN_CHECKOUT}Tick CodeRabbit's Trigger review box on PR #${args.pr}: run \`python3 ${CRTRIGGER_SCRIPT} --pr ${args.pr} --head ${r.headSha}\` ` +
@@ -1625,7 +1651,7 @@ const triggerCodeRabbit = async (cycle, r, bots) => {
 // The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none. Returns the ids settled.
 const settlements = []
 let settlementsTried = false
-const settleCaller = async (cycle, digestOf, held) => {
+const settleCaller = async (cycle, digestOf, held, ended) => {
   const refuse = (s, why) => {
     settlements.push({ commentId: s.commentId, outcome: 'refused', why })
     log(`cycle ${cycle}: comment ${s.commentId} not settled on the caller's reply ${s.replyId} — ${why}`)
@@ -1641,7 +1667,7 @@ const settleCaller = async (cycle, digestOf, held) => {
     return !why
   })
   settlementsTried = true
-  if (!ready.length) return []
+  if (!ready.length || await ended('reuse')) return []
   const out = await runReplyScript(`reuse#${cycle}`, 'reuse', `Settle these comments on PR #${args.pr} on the replies already there`,
     'The script posts nothing; do not post, edit or delete anything yourself. ',
     `Reuses: ${JSON.stringify({ reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })}`)
@@ -1690,6 +1716,11 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
     return true
   }
+  const endLanes = (inv) => {
+    lanes.prState = inv.status
+    log(`cycle ${cycle}: PR #${args.pr} is ${inv.status} — ending both lanes`)
+    return { headSha: inv.head, status: inv.status, infraRerun: [], realFailures: [] }
+  }
   // collect.py polls every 30 s, so a shorter slice would only list.
   let inv = null
   let last = false
@@ -1709,6 +1740,7 @@ const ciLaneRun = async (cycle, lanes) => {
     inv = await collect(`ci:collect#${cycle}.full`, 'inventory --wait-seconds 0', INVENTORY)
     if (inventoryFailed(inv)) return null
   }
+  if (['merged', 'closed'].includes(inv.status)) return endLanes(inv)
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
   const shown = inv.mergeable === 'CONFLICTING' ? 'conflicting'
     : inv.pending > 0 || inv.mergeable === 'UNKNOWN' ? 'running' : failing.length ? 'red' : null
@@ -1792,9 +1824,9 @@ const ciLaneRun = async (cycle, lanes) => {
   if (judging.length === 0 && gated.length === 0) return report
   // A review lane that ended without publishing leaves CI as it was: its concluded failures are still judged (#41).
   const superseded = () => {
-    if (!lanes.reviewPublishing) return false
-    log(`cycle ${cycle}: ${judging.length + gated.length} failing CI check(s) left unjudged — the review lane attempted to publish`)
-    return true
+    const why = lanes.prState ? `PR #${args.pr} is ${lanes.prState}` : lanes.reviewPublishing ? 'the review lane attempted to publish' : null
+    if (why) log(`cycle ${cycle}: ${judging.length + gated.length} failing CI check(s) left unjudged — ${why}`)
+    return !!why
   }
   if (superseded()) return report
   const links = judging.map(c => c.link)
@@ -1815,6 +1847,8 @@ const ciLaneRun = async (cycle, lanes) => {
   report.realFailures.push(...gated.flatMap(c => keyed(c, ev.gates.find(g => g.link === c.link).failures
     .map(f => ({ check: c.name, workflow: '', job: c.name, cell: null, runId: null, files: [], verdict: 'real', ...f })))))
   if (judging.length === 0) return report
+  // The judge may re-run checks: the PR must read OPEN, and no review push may have landed during that read.
+  if (await prGate(lanes, `${cycle}-judge`) || superseded()) return report
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} at head ${report.headSha} per your procedure. ` +
     `The collector's evidence for them is in ${ev.detail}. The checks, each needing exactly one entry in your reply: ` +
@@ -1887,7 +1921,9 @@ const ciLaneRun = async (cycle, lanes) => {
 // Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
   let ciPromise = null
-  const lanes = { reviewDone: !reviewLane, reviewPublishing: false, ended: false }
+  // prState: 'merged' or 'closed' once read so, 'unread' when a read before a write failed; the review lane then stops at its next step.
+  const lanes = { reviewDone: !reviewLane, reviewPublishing: false, ended: false, prState: null }
+  const ended = (what) => prGate(lanes, `${cycle}-${what}`)
   // Settle the CI lane in finally so no CI agent outlives the workflow.
   try {
     entry.lane = lane
@@ -1920,6 +1956,7 @@ const runCycle = async (cycle, entry) => {
       : await agent(reviewPrompt, {
         label: `reviews#${cycle}`, phase: 'Triage', agentType: 'pr-review-validator', schema: REVIEWS,
       }).catch(quiet(`cycle ${cycle}: review validator`))
+    if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (!r) {
       entry.error = 'pr-review-validator died'
       return stop(cycle, 'review-validator-died')
@@ -1938,7 +1975,8 @@ const runCycle = async (cycle, entry) => {
     entry.bots = r === nobody
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)
-    if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots)
+    if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended)
+    if (lanes.prState) return prEnded(cycle, lanes.prState)
     const reviewsSettled = !!entry.bots && entry.bots.bots.every(b => b.done)
     const pendingBots = entry.bots ? entry.bots.bots.filter(b => !b.done) : []
 
@@ -1990,6 +2028,7 @@ const runCycle = async (cycle, entry) => {
     // A dismissal about to be posted closes the thread, and a reversal is about to be fixed: both get a second opinion.
     const challenged = r.findings.filter(f => f.verdict !== 'valid' || reversal(f))
     if (challenged.length > 0) {
+      if (lanes.prState) return prEnded(cycle, lanes.prState)
       const submitted = challenged.map((f, id) => {
         const p = prior.get(f)
         return {
@@ -2074,6 +2113,7 @@ const runCycle = async (cycle, entry) => {
     const deferredIds = new Set([...deferrals.keys(), ...deferralsArg.map(d => d.findingId)])
     const loose = r.findings.filter(f => f.verdict === 'valid' && !f.hold && !deferredIds.has(f.findingId))
     if (topics.length && loose.length) {
+      if (lanes.prState) return prEnded(cycle, lanes.prState)
       const pairs = loose.flatMap(f => topics.map((t, n) => ({ id: `${f.findingId}@${n}`, f, t, issueUrl: t.issueUrl })))
       const covers = await issueCovers(`topic#${cycle}`, pairs)
       for (const f of loose) {
@@ -2179,7 +2219,8 @@ const runCycle = async (cycle, entry) => {
       const d = debt.get(id)
       return !d || [...(dismissalsToo ? d.dismissals : []), ...d.notes].every(k => harvested.has(k))
     }
-    if (!settlementsTried && settlementsArg.length && r !== nobody) (await settleCaller(cycle, digestOf, held)).forEach(id => ledger.delete(id))
+    if (!settlementsTried && settlementsArg.length && r !== nobody) (await settleCaller(cycle, digestOf, held, ended)).forEach(id => ledger.delete(id))
+    if (lanes.prState) return prEnded(cycle, lanes.prState)
     r.findings = r.findings.filter(f => !answeredByHand(f))
 
     // One body per comment: reply.py resolves the thread and pay() retires every dismissal, so sibling drafts merge.
@@ -2206,13 +2247,16 @@ const runCycle = async (cycle, entry) => {
     if (withheld.size) log(`cycle ${cycle}: drafted reply/replies withheld — ${[...withheld].map(([why, n]) => `${why}: ${n}`).join(', ')}`)
     if (freshReplies.length > 0 && args.autoPush === true) {
       // Keep the receipt first: a cycle that dies after posting must still say what went out.
+      if (await ended('replies')) return prEnded(cycle, lanes.prState)
       entry.refutedPosts = await publishReplies(`replies#${cycle}`, freshReplies, 'refutation', cycle, digestOf)
-      entry.sonarMarked = await settleSonar(cycle, entry)
+      entry.sonarMarked = await settleSonar(cycle, entry, ended)
+      if (lanes.prState) return prEnded(cycle, lanes.prState)
     }
     const deferralReplies = [...ledger.keys()]
       .filter(id => owed(id) === 'deferral' && debt.has(id) && debt.get(id).notes.size > 0 && !handedOff(id) && !owesDismissal(id) && showsAll(id, false))
       .map(id => ({ commentId: id, body: deferredOn(id).map(deferralLine).join('\n') }))
     if (deferralReplies.length > 0 && args.autoPush === true) {
+      if (await ended('defer')) return prEnded(cycle, lanes.prState)
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
@@ -2223,6 +2267,7 @@ const runCycle = async (cycle, entry) => {
         text: `${f.file}:${f.line} [${f.source}] ${f.claim} — hint: ${f.fixHint}`,
         claim: `${f.file}:${f.line} ${f.claim}`,
       })))
+      if (lanes.prState) return prEnded(cycle, lanes.prState)
       const { ok, fixes, owned, brief, unverifiable, rejected } = await fixAndVerify(work, `${cycle}-review`, true)
       entry.reviewFixes = fixes
       // A rejected finding is held, its evidence on its decision, until the next harvest judges it again; a second rejection is the caller's.
@@ -2249,11 +2294,16 @@ const runCycle = async (cycle, entry) => {
         log(`cycle ${cycle}: review-lane fixes left uncommitted for the caller's review — not pushing unverified changes`)
         return unverifiedStop(cycle, unverifiable)
       }
+      if (lanes.prState) {
+        log(`cycle ${cycle}: review-lane fixes left uncommitted — PR #${args.pr} is ${lanes.prState}`)
+        return prEnded(cycle, lanes.prState)
+      }
       if (owned.length > 0) {
         // Any push attempt may have restarted CI, a refused or unknown one included.
         const push = await commitAndPush(cycle, 'review', owned, brief, () => { lanes.reviewPublishing = true })
         if (!push.pass) {
           entry.reviewPushFailed = push
+          if (push.prState) return prEnded(cycle, push.prState)
           log(`cycle ${cycle}: review-lane push failed (${push.detail}) — stopping`)
           return stop(cycle, 'push-failed')
         }
@@ -2270,6 +2320,7 @@ const runCycle = async (cycle, entry) => {
         }
         for (const x of answerable.values()) x.body = withDeferred(x.commentId, x.body)
         if (answerable.size > 0) {
+          if (await ended('resolve')) return prEnded(cycle, lanes.prState)
           entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
         }
       }
@@ -2285,6 +2336,7 @@ const runCycle = async (cycle, entry) => {
       log(`cycle ${cycle}: CI lane gave no report — re-arming`)
       return null
     }
+    if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (lanes.reviewPublishing) {
       log(`cycle ${cycle}: review-lane push superseded the CI run — re-arming`)
       return null
@@ -2294,7 +2346,8 @@ const runCycle = async (cycle, entry) => {
       return stop(cycle, 'pr-conflicting', { outstanding: outstanding() })
     }
     // A mark may clear the SonarCloud gate this run failed on: read CI again rather than fix it.
-    const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry)
+    const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry, ended)
+    if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (marked > 0 && c.realFailures.some(sonarGate)) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
       return rearm()
@@ -2334,6 +2387,7 @@ const runCycle = async (cycle, entry) => {
       const ciPush = await commitAndPush(cycle, 'ci', owned, brief)
       if (!ciPush.pass) {
         entry.ciPushFailed = ciPush
+        if (ciPush.prState) return prEnded(cycle, ciPush.prState)
         log(`cycle ${cycle}: CI-lane push failed (${ciPush.detail}) — stopping`)
         return stop(cycle, 'push-failed')
       }
@@ -2414,12 +2468,12 @@ const runCycle = async (cycle, entry) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prBaseBranch', 'prBaseTip', 'prRepo', 'prUrl', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
+  required: ['branch', 'prBranch', 'prHead', 'prBase', 'prBaseBranch', 'prBaseTip', 'prRepo', 'prUrl', 'prState', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
   properties: {
     error: { type: 'string' },
     branch: { type: 'string' }, prBranch: { type: 'string' },
     prHead: { type: 'string' }, prBase: { type: 'string' }, prBaseBranch: { type: 'string' }, prBaseTip: { type: 'string' },
-    prRepo: { type: 'string' }, prUrl: { type: 'string' },
+    prRepo: { type: 'string' }, prUrl: { type: 'string' }, prState: { type: 'string' },
     remote: { type: 'string' }, upstreamBranch: { type: 'string' }, pushUrls: { type: 'array', items: { type: 'string' } },
     head: { type: 'string' },
     dirty: { type: 'array', items: { type: 'string' } },
@@ -2444,6 +2498,10 @@ if (pinned.error) {
 if (pinned.pr !== args.pr) {
   log(`preflight: the pin is of PR #${pinned.pr}, not #${args.pr}`)
   return finish(stop(cyclesUsed, 'preflight-failed', { detail: `the pin is of PR #${pinned.pr}` }))
+}
+if (pinned.prState !== 'OPEN') {
+  log(`preflight: PR #${args.pr} is ${pinned.prState.toLowerCase()} — nothing to babysit`)
+  return finish(prEnded(cyclesUsed, pinned.prState.toLowerCase()))
 }
 const dirty = withoutIdeDrift(pinned.dirty)
 if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
@@ -2556,10 +2614,12 @@ const adopt = async (entry) => {
     if (!push || push.published === 'unknown') {
       const detail = push ? push.detail : 'the push agent died'
       Object.assign(entry.adoption, { publication: 'unknown', detail })
+      if (push && push.prState) return prEnded(entry.cycle, push.prState)
       return stop(entry.cycle, 'adopt-push-unknown', { detail })
     }
     if (!push.pass) {
       Object.assign(entry.adoption, { publication: 'failed', detail: push.detail || 'push refused' })
+      if (push.prState) return prEnded(entry.cycle, push.prState)
       return stop(entry.cycle, 'adopt-push-failed', { detail: entry.adoption.detail })
     }
     Object.assign(entry.adoption, { publication: 'pushed', detail: push.detail })

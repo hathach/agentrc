@@ -18,6 +18,8 @@ its comment (a refutedPosts reply answers stale findings as well as invalid ones
 cyclesUsed and maxCycles. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch
 included, the latter with the caller's response; `notes` what is absent but harmless.
+A launch that stopped on a merged or closed PR is terminal: a note says so, and a
+spent budget is no blocker.
 `logs` leaves out lines another field carries whole and folds repeated ones into one.
 """
 import argparse
@@ -65,7 +67,9 @@ REFUSED = {
     'pr-conflicting': 'the PR conflicts with its base, so passing checks establish nothing: resolve the conflict in a merge from the base, '
                       "then relaunch with adoptHead naming that merge; rebasedHead is only for a rewrite on the user's word",
     'stale-workflow': "this session's cached workflow definition calls a script the install lacks: relaunch from a fresh session, never by hand",
+    'pr-state-unread': 'the PR state could not be read before a GitHub write, so nothing was written: relaunch once `gh pr view` answers',
 }
+ENDED = {'pr-merged': 'the PR is merged; nothing to continue', 'pr-closed': 'the PR is closed; nothing to continue'}
 
 
 def load_output(path):
@@ -222,10 +226,12 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             summary['stateRef'] = {'outputFile': output_path, 'digest': result['stateDigest']}
             used, most = result['state'].get('cyclesUsed'), result['state'].get('maxCycles')
             summary['budget'] = {'cyclesUsed': used, 'maxCycles': most}
-            if result.get('pass') is not True and isinstance(used, int) and isinstance(most, int) and used >= most:
+            if result.get('pass') is not True and result.get('reason') not in ENDED and isinstance(used, int) and isinstance(most, int) and used >= most:
                 blockers.append(f'cycle budget spent: {used} of {most}; a relaunch needs a larger maxCycles, the user\'s decision')
         if result.get('reason') in REFUSED:
             blockers.append(REFUSED[result['reason']])
+        if result.get('reason') in ENDED:
+            notes.append(ENDED[result['reason']])
         obs = result.get('observation') or {}
         reviews, ci, actions = obs.get('reviews') or {}, obs.get('ci'), obs.get('actions') or {}
         summary['observation'] = {

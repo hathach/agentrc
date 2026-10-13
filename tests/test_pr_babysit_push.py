@@ -48,10 +48,12 @@ class PushTest(unittest.TestCase):
         out = subprocess.run(['git', 'ls-remote', bare, 'refs/heads/fix'], capture_output=True, text=True).stdout
         return out.split('\t')[0] if out else ''
 
-    def publish(self, *urls, sha=None, pr=None):
+    def publish(self, *urls, sha=None, pr=None, open_pr=None):
         argv = ['--remote', 'origin', '--branch', 'fix', '--sha', sha or self.sha]
         for u in urls:
             argv += ['--push-url', u]
+        if open_pr is not None:
+            argv += ['--open-pr', str(open_pr)]
         if pr is not None:
             argv += ['--pr', str(pr)]
         out = io.StringIO()
@@ -129,6 +131,29 @@ class PushTest(unittest.TestCase):
         code, out = self.publish(self.a, pr=7)
         self.assertIsNone(out['prHead'])
         self.assertEqual(count.read_text().strip(), str(push.PR_TRIES))
+
+    def test_a_pr_no_longer_open_is_not_pushed_to(self):
+        for state in ('MERGED', 'CLOSED'):
+            self.fake_gh(f'echo "$@" >> {self.root / "gh.log"}; echo {state}')
+            code, out = self.publish(self.a, open_pr=7)
+            self.assertEqual((code, out['pushed'], out['heads'], out['prState']), (0, False, [], state))
+            self.assertEqual(out['detail'], f'PR #7 is {state.lower()}: nothing pushed')
+            self.assertEqual(self.remote_head(self.a), '')
+        self.assertIn('pr view 7 --json state -q .state', (self.root / 'gh.log').read_text())
+
+    def test_an_open_pr_is_pushed_to(self):
+        self.fake_gh('echo OPEN')
+        code, out = self.publish(self.a, open_pr=7)
+        self.assertEqual((code, out['pushed'], out['prState']), (0, True, 'OPEN'))
+        self.assertEqual(self.remote_head(self.a), self.sha)
+
+    def test_an_unreadable_pr_state_is_not_pushed_to(self):
+        for script in ('exit 1', 'echo'):
+            self.fake_gh(script)
+            code, out = self.publish(self.a, open_pr=7)
+            self.assertEqual((code, out['pushed'], out['heads'], out['prState']), (0, False, [], None))
+            self.assertEqual(out['detail'], 'PR #7 state is unreadable: nothing pushed')
+            self.assertEqual(self.remote_head(self.a), '')
 
 
 if __name__ == '__main__':

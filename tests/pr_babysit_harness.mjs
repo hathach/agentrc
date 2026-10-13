@@ -79,7 +79,7 @@ const TIP = '7e57e57e57e57e57e57e57e57e57e57e57e57e57'
 // What the preflight pins, and what the pre-publish recheck must still find.
 const PIN = {
   branch: 'claude/foo', prBranch: 'claude/foo',
-  prHead: HEAD, prBase: BASE, prBaseBranch: 'master', prBaseTip: TIP, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888',
+  prHead: HEAD, prBase: BASE, prBaseBranch: 'master', prBaseTip: TIP, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888', prState: 'OPEN',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
   pr: 3888, badPushUrl: '', receipts: '/tmp/pr-babysit-receipts-x',
@@ -166,10 +166,10 @@ const failedChecks = (ci) => (ci.realFailures || []).map((rf, i) => {
   const kind = link.startsWith('https://circleci.com/') ? 'circleci' : 'actions'
   return { name: rf.check, workflow: 'ci', bucket: ci.bucket ?? 'fail', link, attempt: `${kind}:${link.split('/').at(-1)}`, aliases: rf.aliases ?? [] }
 })
-// push.py's receipt: what the pinned push URL holds after the push, and the PR
-// head when the workflow asked for it.
+// push.py's receipt: what the pinned push URL holds after the push, the PR's
+// state it read first (--open-pr), and the PR head when the workflow asked for it.
 const receiptOf = (head, prHead, detail, pushed = true) => ({
-  pushed, detail, heads: PIN.pushUrls.map(url => ({ url, head })), ...(prHead === undefined ? {} : { prHead }),
+  pushed, detail, heads: PIN.pushUrls.map(url => ({ url, head })), prState: 'OPEN', ...(prHead === undefined ? {} : { prHead }),
 })
 const hookQuoted = quotedAfter(/hooks\.py/)
 // reply.py's printed receipts leave out a null resolved or error.
@@ -239,6 +239,11 @@ async function run(opts = {}) {
       const push = conforms(options.schema, structuredClone(answer), label)
       if (push.pushed) prHead = to
       return push
+    }
+    if (label.startsWith('prstate#')) {
+      // gh pr view --json state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
+      const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
+      return state === null ? null : conforms(options.schema, { state }, label)
     }
     if (label.startsWith('recheck#')) {
       const over = typeof opts.recheck === 'function' ? opts.recheck(label) : opts.recheck
@@ -713,7 +718,7 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -1391,7 +1396,7 @@ test('the publisher stages exactly the owned paths, never a protected one', asyn
   const push = calls.find(c => c.label === 'push#1-review')
   // The exact refspec is the point: pushing the branch would publish whatever
   // HEAD became after the audit, not the commit that was audited.
-  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git'\``), push.prompt)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888\``), push.prompt)
   assert.match(push.prompt, /Committing, amending and forcing nothing/)
   // The stage cannot commit and already knows the SHA, so it is asked for neither.
   assert.deepEqual(push.schema.required, ['pushed', 'detail', 'heads'])
@@ -2184,6 +2189,148 @@ const redWith = (...failures) => ({ ci: { status: 'red', infraRerun: [], realFai
 const PVS_KEY = '1f1a4bfe929a72bb'
 assert.equal(keyOf(PVS), PVS_KEY)
 const byKey = (over = {}) => ({ key: PVS_KEY, reason: 'PVS license renewal pending', scope: 'until the license is renewed', ...over })
+
+test('a PR merged or closed before the launch stops at preflight, its state kept', async () => {
+  for (const [prState, reason, args] of [['MERGED', 'pr-merged', { yieldOnChange: true, maxCycles: 4 }], ['CLOSED', 'pr-closed', { lane: 'reviews', yieldAfterCycle: true }]]) {
+    const state = adoptionState()
+    const { result, labels, logs } = await run({
+      reviews: oneValid, args: { autoPush: true, ...adoptionArgs(state, { adoptHead: undefined, yieldAfterCycle: undefined, ...args }) },
+      preflight: { prState, dirty: [' M src/a.c'] },
+    })
+    assert.equal(result.reason, reason, prState)
+    assert.equal(result.pass, false)
+    assert.deepEqual(labels, ['preflight'], `${prState}: nothing waited for, harvested or judged`)
+    assert.equal(result.state.cyclesUsed, state.cyclesUsed)
+    assert.deepEqual(result.state.last, state.last)
+    assert.ok(logs.some(l => l === `preflight: PR #3888 is ${prState.toLowerCase()} — nothing to babysit`), logs.join('\n'))
+  }
+})
+
+test('a PR merged or closed mid-launch ends both lanes at the CI lane\'s next read (#70)', async () => {
+  const ended = (status) => ({ ...GREEN, status, mergeable: 'UNKNOWN', headSha: FOREIGN })
+  for (const status of ['merged', 'closed']) {
+    // Cycle 1 waits on a bot; the PR is merged during cycle 2's CI wait, whatever head it ended on.
+    const { result, labels, logs } = await run({
+      reviews: { findings: [], replies: [], bots: 'pending' },
+      ci: (label) => label.startsWith('ci:collect#1.') ? GREEN : label === 'ci:collect#2.1' ? RUNNING : ended(status),
+      args: { maxCycles: 6, yieldOnChange: true },
+    })
+    assert.equal(result.reason, `pr-${status}`, logs.join('\n'))
+    assert.equal(result.cycles, 2)
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1', 'ci:collect#2.1', 'ci:collect#2.2'], 'no further wait, re-read or judge')
+    assert.equal(result.state.cyclesUsed, 2)
+    assert.ok(logs.some(l => l === `cycle 2: PR #3888 is ${status} — ending both lanes`), logs.join('\n'))
+  }
+  // A review-lane fix in flight is left unpublished.
+  const fixing = await run({ reviews: oneValid, ci: ended('merged'), args: { autoPush: true, maxCycles: 3 } })
+  assert.equal(fixing.result.reason, 'pr-merged')
+  assert.equal(fixing.labels.some(l => /^(commit|push|replies|resolve)#/.test(l)), false, fixing.labels.join(', '))
+  // A refutation is not posted once the CI lane has read the merge.
+  const refuting = await run({
+    reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not a bug' }], bots: 'reviewed' },
+    ci: ended('merged'), args: { autoPush: true, maxCycles: 3 },
+  })
+  assert.equal(refuting.result.reason, 'pr-merged')
+  assert.equal(refuting.labels.some(l => l.startsWith('replies#')), false, refuting.labels.join(', '))
+  // The CI lane alone stops the same way.
+  const ciOnly = await run({ ci: ended('closed'), args: { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 } })
+  assert.equal(ciOnly.result.reason, 'pr-closed')
+  assert.deepEqual(ciOnly.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'])
+})
+
+test('fix notes are not posted once the CI lane reads the merge during the push', async () => {
+  // The merge lands after the commit's audit, while the push is under way.
+  const trace = []
+  const { result, labels } = await run({
+    trace, reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
+    ci: () => trace.some(c => c.label.startsWith('audit#')) ? { ...GREEN, status: 'merged', mergeable: 'UNKNOWN' } : RUNNING,
+  })
+  assert.equal(result.reason, 'pr-merged')
+  assert.ok(result.history[0].reviewPush.pass, 'the push receipt is kept')
+  assert.equal(labels.some(l => l.startsWith('resolve#')), false, labels.join(', '))
+})
+
+test('a GitHub write reads the PR state first, and goes on only for a verified OPEN', async () => {
+  const refuting = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not a bug' }], bots: 'reviewed' }
+  const writes = (labels) => labels.filter(l => /^(prstate|replies)#/.test(l))
+  for (const [name, args] of [['both lanes', { autoPush: true, maxCycles: 3 }], ['reviews lane alone', { autoPush: true, lane: 'reviews', yieldAfterCycle: true }]]) {
+    for (const [state, reason] of [['MERGED', 'pr-merged'], ['CLOSED', 'pr-closed'], [null, 'pr-state-unread'], ['', 'pr-state-unread']]) {
+      const { result, labels } = await run({ reviews: refuting, prState: state, args })
+      assert.equal(result.reason, reason, `${name}, ${state}`)
+      // A dead relay gets its one retry.
+      assert.deepEqual(writes(labels), state === null ? ['prstate#1-replies', 'prstate#1-replies.retry'] : ['prstate#1-replies'], `${name}, ${state}: nothing posted`)
+    }
+    const open = await run({ reviews: refuting, args })
+    assert.deepEqual(writes(open.labels), ['prstate#1-replies', 'replies#1'], name)
+  }
+  // The CI lane still waiting is no stand-in for the read: its merged result may not have arrived.
+  const watched = await run({ reviews: refuting, ci: RUNNING, args: { autoPush: true, maxCycles: 1 } })
+  assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
+  const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
+  assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
+})
+
+test('the CI judge, which may re-run checks, is dispatched only for a PR read OPEN just before', async () => {
+  const args = { lane: 'ci', yieldAfterCycle: true, maxCycles: 3 }
+  const judge = (labels) => labels.filter(l => /^(prstate#|ci:judge#)/.test(l))
+  const merged = await run({ ...redWith(PVS), prState: 'MERGED', args })
+  assert.equal(merged.result.reason, 'pr-merged')
+  assert.deepEqual(judge(merged.labels), ['prstate#1-judge'])
+  const open = await run({ ...redWith(PVS), args })
+  assert.deepEqual(judge(open.labels).slice(0, 2), ['prstate#1-judge', 'ci:judge#1'])
+})
+
+test('the CodeRabbit trigger and a caller settlement read the PR state first', async () => {
+  const cr = await run({
+    args: { coderabbitTrigger: true, autoPush: true, lane: 'reviews', yieldAfterCycle: true },
+    reviews: quiet([skippedCr()]), prState: 'MERGED',
+  })
+  assert.equal(cr.result.reason, 'pr-merged')
+  assert.deepEqual(cr.labels.filter(l => /^(prstate|crtrigger)#/.test(l)), ['prstate#1-crtrigger'])
+  const { edited, at, state, settlement } = await reanswered()
+  const settle = await run({ reviews: edited, preflight: at, prState: 'CLOSED', args: { ...YIELD, state, replySettlements: [settlement] } })
+  assert.equal(settle.result.reason, 'pr-closed')
+  assert.deepEqual(settle.labels.filter(l => /^(prstate|reuse)#/.test(l)), ['prstate#3-reuse'])
+})
+
+test('a push refused on an unreadable PR state stops push-failed, nothing published', async () => {
+  const { result } = await run({
+    reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
+    push: { pushed: false, detail: 'PR #3888 state is unreadable: nothing pushed', heads: [], prState: null },
+  })
+  assert.equal(result.reason, 'push-failed')
+  assert.equal(result.state.pending.stage, 'push-failed')
+})
+
+test('a retry that finds the PR merged after a lost receipt stops pr-merged, publication unknown', async () => {
+  const refusal = { pushed: false, detail: 'PR #3888 is merged: nothing pushed', heads: [], prState: 'MERGED' }
+  const review = await run({
+    reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
+    push: refusal, garble: (l, a) => l === 'push#1-review' ? null : a,
+  })
+  assert.equal(review.result.reason, 'pr-merged')
+  assert.equal(review.result.history[0].reviewPushFailed.published, 'unknown')
+  assert.equal(review.result.state.pending.stage, 'publication-unknown')
+  const state = adoptionState()
+  const adopt = await run({
+    args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
+    adoptPush: (label) => label === 'adopt:push' ? null : refusal,
+  })
+  assert.equal(adopt.result.reason, 'pr-merged')
+  assert.equal(adopt.result.history.at(-1).adoption.publication, 'unknown')
+  assert.equal(adopt.result.state.pending.stage, 'adopt-push-unknown')
+})
+
+test('a push refused because the PR is no longer open stops the launch, its commit kept as the candidate', async () => {
+  const { result, calls } = await run({
+    reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
+    push: { pushed: false, detail: 'PR #3888 is merged: nothing pushed', heads: [], prState: 'MERGED' },
+  })
+  assert.equal(result.reason, 'pr-merged')
+  assert.equal(result.history[0].reviewPushFailed.prState, 'merged')
+  assert.equal(result.state.pending.stage, 'push-failed')
+  assert.match(calls.find(c => c.label === 'push#1-review').prompt, / --open-pr 3888`/)
+})
 
 test('a PR conflicting with its base stops, judging nothing, whatever its checks say (#51)', async () => {
   for (const [name, over] of [
@@ -4999,7 +5146,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
-  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --pr 3888\``), push.prompt)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --pr 3888\``), push.prompt)
 })
 
 test('a lost adoption push receipt gets one fresh agent, which reads the push back', async () => {

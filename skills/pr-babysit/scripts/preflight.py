@@ -7,7 +7,8 @@
 Reports what every later step must still be true of: branch (`git rev-parse
 --abbrev-ref HEAD`), prBranch, prHead, prBase (the base head GitHub last
 recorded for the PR, stale once the base moves until the head is pushed),
-prBaseBranch, prRepo (owner/name) and prUrl from one `gh pr view N`, verbatim
+prBaseBranch, prRepo (owner/name), prUrl and prState (OPEN, MERGED or CLOSED,
+any other an error) from one `gh pr view N`, verbatim
 even when they disagree with git; prBaseTip, the base branch's live tip in the
 base repository (`gh api repos/{owner}/{repo}/git/ref/heads/<prBaseBranch>`,
 resolved as `gh pr view` resolves N); remote, the remote
@@ -118,13 +119,15 @@ def base_tip(name):
 
 def pin(pr):
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
-    fields = 'headRefName,headRefOid,baseRefOid,baseRefName,headRepositoryOwner,headRepository,url'
+    fields = 'headRefName,headRefOid,baseRefOid,baseRefName,headRepositoryOwner,headRepository,url,state'
     try:
         view = json.loads(run('gh', 'pr', 'view', str(pr), '--json', fields)[1])
         pr_facts = {'prBranch': view['headRefName'], 'prHead': view['headRefOid'], 'prBase': view['baseRefOid'],
                     'prBaseBranch': view['baseRefName'],
                     'prRepo': f"{view['headRepositoryOwner']['login']}/{view['headRepository']['name']}",
-                    'prUrl': view['url']}
+                    'prUrl': view['url'], 'prState': view['state']}
+        if pr_facts['prState'] not in ('OPEN', 'MERGED', 'CLOSED'):
+            raise ValueError(f"state {pr_facts['prState']!r}")
     except (ValueError, KeyError, TypeError) as e:
         # A deleted head fork comes back as a null headRepository.
         raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')

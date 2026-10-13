@@ -19,7 +19,7 @@ spec.loader.exec_module(preflight)
 ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
 VIEW = {'headRefName': 'fix', 'headRefOid': 'f' * 40, 'baseRefOid': 'b' * 40, 'baseRefName': 'master',
         'headRepositoryOwner': {'id': 'x', 'login': 'someone'},
-        'headRepository': {'id': 'y', 'name': 'tinyusb'}, 'url': 'https://github.com/hathach/tinyusb/pull/7'}
+        'headRepository': {'id': 'y', 'name': 'tinyusb'}, 'url': 'https://github.com/hathach/tinyusb/pull/7', 'state': 'OPEN'}
 REF = {'ref': 'refs/heads/master', 'object': {'type': 'commit', 'sha': 'c' * 40}}
 
 
@@ -84,7 +84,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(out, {
             'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prBaseBranch': 'master', 'prBaseTip': 'c' * 40,
             'prRepo': 'someone/tinyusb',
-            'prUrl': VIEW['url'], 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
+            'prUrl': VIEW['url'], 'prState': 'OPEN', 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
             'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o'],
             'pr': 7, 'badPushUrl': ''})
         self.assertEqual(self.gh_calls()[-1], 'api repos/{owner}/{repo}/git/ref/heads/master', 'the base repository gh resolves for the PR')
@@ -177,11 +177,18 @@ class PreflightTest(unittest.TestCase):
 
     def test_gh_failures_and_odd_answers_are_errors(self):
         for answer, code, want in (('', 1, 'gh pr view'), ('not json', 0, 'unexpected answer'),
-                                   (json.dumps({**VIEW, 'headRepository': None}), 0, 'unexpected answer')):
+                                   (json.dumps({**VIEW, 'headRepository': None}), 0, 'unexpected answer'),
+                                   (json.dumps({**VIEW, 'state': 'DRAFT'}), 0, "state 'DRAFT'")):
             self.fake_gh(answer, code)
             status, out = self.pin()
             self.assertEqual(status, 2, answer)
             self.assertIn(want, out['error'], answer)
+
+    def test_a_pr_no_longer_open_is_pinned_with_its_state(self):
+        for state in ('MERGED', 'CLOSED'):
+            self.fake_gh(json.dumps({**VIEW, 'state': state}))
+            code, out = self.pin()
+            self.assertEqual((code, out['prState']), (0, state))
 
     def test_recheck_reads_the_local_facts_without_gh(self):
         self.git('remote', 'set-url', '--push', 'origin', 'git@github.com:someone/tinyusb.git')

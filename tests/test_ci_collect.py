@@ -40,6 +40,7 @@ class InventoryTest(unittest.TestCase):
     def setUp(self):
         self.heads = []      # headRefOid per `gh pr view`, last one repeats
         self.mergeable = ['MERGEABLE']   # mergeable per `gh pr view`, last one repeats
+        self.states = ['OPEN']   # state per `gh pr view`, last one repeats
         self.listings = []   # `gh pr checks` answers in order: a list of checks, or (rc, stderr)
         self.calls = []
         self.clock = [0]
@@ -49,8 +50,9 @@ class InventoryTest(unittest.TestCase):
             if argv[1:3] == ['pr', 'view']:
                 head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
                 mergeable = self.mergeable.pop(0) if len(self.mergeable) > 1 else self.mergeable[0]
+                state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
                 return mock.Mock(returncode=0, stdout=json.dumps(
-                    {'headRefOid': head, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': mergeable}).encode())
+                    {'headRefOid': head, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': mergeable, 'state': state}).encode())
             if argv[1] == 'api':   # a failing Actions job's record: a first attempt, its own execution
                 job = int(argv[2].split('/jobs/')[1])
                 return mock.Mock(returncode=0, stdout=json.dumps({'id': job, 'run_id': 7, 'run_attempt': 1, 'head_sha': HEAD}).encode())
@@ -168,7 +170,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('hil', 'pending', JOB.format(3))]]
         rc, r = self.main('--wait-seconds', '70')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []), 'pending checks are counted, not listed')
-        self.assertEqual((self.calls.count(['pr', 'checks']), self.calls.count(['pr', 'view'])), (3, 2), 'a settled mergeable is read before and after only')
+        self.assertEqual((self.calls.count(['pr', 'checks']), self.calls.count(['pr', 'view'])), (3, 4), 'the PR is read before, on every poll and after')
 
     def test_brief_lists_no_checks_only_while_running(self):
         self.heads = [HEAD]
@@ -219,6 +221,38 @@ class InventoryTest(unittest.TestCase):
         self.mergeable = ['MERGEABLE', 'CONFLICTING']
         rc, r = self.main()
         self.assertEqual((r['status'], r['mergeable']), ('conflicting', 'CONFLICTING'), 'the last read decides')
+
+    def test_a_pr_no_longer_open_is_reported_at_once_whatever_its_head(self):
+        self.heads = [OTHER]
+        self.mergeable = ['UNKNOWN']
+        self.listings = [[self.check('hil', 'pending', JOB.format(3))]]
+        for state in ('MERGED', 'CLOSED'):
+            self.states, self.clock[0] = [state], 0
+            self.calls.clear()
+            rc, r = self.main('--wait-seconds', '600', '--brief')
+            self.assertEqual((rc, r['status'], r['head'], r['pending'], r['checks'], self.clock[0]), (0, state.lower(), OTHER, 0, [], 0), state)
+            self.assertEqual(self.calls, [['pr', 'view']], 'nothing listed, nothing waited for')
+
+    def test_a_merge_during_the_wait_ends_it(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('hil', 'pending', JOB.format(3))]]
+        for mergeable in ('UNKNOWN', 'MERGEABLE'):
+            self.mergeable, self.states, self.clock[0] = [mergeable], ['OPEN', 'OPEN', 'MERGED'], 0
+            rc, r = self.main('--wait-seconds', '600')
+            self.assertEqual((rc, r['status'], r['checks'], self.clock[0]), (0, 'merged', [], 60), f'read again on every poll, {mergeable}')
+        self.clock[0] = 0
+        self.states = ['OPEN', 'OPEN', 'OPEN', 'MERGED']
+        rc, r = self.main('--wait-seconds', '70')
+        self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'merged', 0, []), 'the read after the wait decides')
+
+    def test_an_unexpected_state_is_an_error(self):
+        self.heads = [HEAD]
+        self.listings = [[]]
+        for value in (None, 'DRAFT'):
+            self.states = [value]
+            rc, r = self.main()
+            self.assertEqual(rc, 1)
+            self.assertIn(f'state is {value!r}', r['error'])
 
     def test_an_unexpected_mergeable_is_an_error(self):
         self.heads = [HEAD]
@@ -302,7 +336,7 @@ class FailuresTest(unittest.TestCase):
             self.calls.append(argv[1:])
             ok = lambda out: mock.Mock(returncode=0, stdout=out if isinstance(out, bytes) else (out if isinstance(out, str) else json.dumps(out)).encode(), stderr=b'')
             if argv[1:3] == ['pr', 'view']:
-                return ok({'headRefOid': HEAD, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': 'MERGEABLE'})
+                return ok({'headRefOid': HEAD, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': 'MERGEABLE', 'state': 'OPEN'})
             if argv[1:3] == ['pr', 'checks']:
                 return ok(self.checks)
             if argv[1:3] == ['api', '--paginate'] and '/attempts/' in argv[4]:
@@ -481,7 +515,7 @@ class FailuresTest(unittest.TestCase):
         real = collect.subprocess.run
         def moving(argv, **kw):
             if argv[1:3] == ['pr', 'view']:
-                return mock.Mock(returncode=0, stdout=json.dumps({'headRefOid': next(views), 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': 'MERGEABLE'}).encode(), stderr=b'')
+                return mock.Mock(returncode=0, stdout=json.dumps({'headRefOid': next(views), 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': 'MERGEABLE', 'state': 'OPEN'}).encode(), stderr=b'')
             return real(argv, **kw)
         with mock.patch.object(collect.subprocess, 'run', moving), redirect_stdout(io.StringIO()) as out:
             rc = collect.main(['failures', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(3)])

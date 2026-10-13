@@ -151,13 +151,24 @@ class LaunchResultTest(unittest.TestCase):
                              ('wrong-head', 'check out the PR head'),
                              ('deferral-refused', 'it needs a new decision'),
                              ('pr-conflicting', 'relaunch with adoptHead naming that merge'),
-                             ('stale-workflow', 'relaunch from a fresh session')):
+                             ('stale-workflow', 'relaunch from a fresh session'),
+                             ('pr-state-unread', 'relaunch once `gh pr view` answers')):
             with self.subTest(reason):
                 refused = {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
                            'result': {'pass': False, 'status': 'blocked', 'reason': reason}}
                 rc, s = self.run_it(refused, '--state-ref', '/t/w1.output:4841042f')
                 self.assertEqual(len(s['blockers']), 1, s['blockers'])
                 self.assertIn(says, s['blockers'][0])
+
+    def test_a_merged_or_closed_pr_is_terminal_with_no_relaunch_blocker(self):
+        for reason, says in (('pr-merged', 'the PR is merged; nothing to continue'), ('pr-closed', 'the PR is closed; nothing to continue')):
+            with self.subTest(reason):
+                ended = {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
+                         'result': {'stateDigest': '0123abcd', 'pass': False, 'status': 'blocked', 'reason': reason, 'cycles': 4,
+                                    'state': {'expectedHead': HEAD, 'cyclesUsed': 4, 'maxCycles': 4}}}
+                rc, s = self.run_it(ended)
+                self.assertEqual((rc, s['blockers']), (0, []), 'a spent budget does not block a launch with nothing to continue')
+                self.assertIn(says, s['notes'])
 
     def test_every_stop_reason_of_the_workflow_is_refused_or_handled_elsewhere(self):
         handled_elsewhere = {  # blocked by receipts, budget, heads or CI fields, or left to chief's judgment
@@ -171,7 +182,8 @@ class LaunchResultTest(unittest.TestCase):
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
         historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced
         self.assertFalse(handled_elsewhere & set(launch_result.REFUSED))
-        self.assertEqual(reasons, handled_elsewhere | (set(launch_result.REFUSED) - historical),
+        self.assertFalse(set(launch_result.ENDED) & (handled_elsewhere | set(launch_result.REFUSED)))
+        self.assertEqual(reasons, handled_elsewhere | (set(launch_result.REFUSED) - historical) | set(launch_result.ENDED),
                          'a stop reason was added or renamed: give it a REFUSED response or name it here')
 
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):

@@ -11,7 +11,9 @@ prints one JSON object {head, status, mergeable, pending, checks}, plus `error` 
 (a relaying agent can drop a trailing null, so no line carries a null error); every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
-again). `status` is
+again). The PR is read again on every poll. `status` is
+merged or closed (the PR is no longer open: printed at once, waiting for and
+listing nothing, its head whatever the PR's last one was), else
 conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
 may not have run, so no check result stands for the PR), else running (a check
 pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
@@ -167,7 +169,16 @@ def gh(*args, raw=False):
 
 
 def pull(repo, pr):
-    return gh('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid,baseRefName,baseRefOid,mergeable')
+    view = gh('pr', 'view', str(pr), '--repo', repo, '--json', 'headRefOid,baseRefName,baseRefOid,mergeable,state')
+    if view.get('state') not in ('OPEN', 'MERGED', 'CLOSED'):
+        raise Failed(f'the PR\'s state is {view.get("state")!r}')
+    return view
+
+
+def ended(view):
+    """A merged or closed PR's inventory, nothing waited for or listed: a merged PR's mergeable stays UNKNOWN, running for good."""
+    return {'head': view['headRefOid'], 'baseRef': view['baseRefName'], 'baseSha': view['baseRefOid'], 'status': view['state'].lower(),
+            'mergeable': view['mergeable'], 'counts': {}, 'checks': []}
 
 
 def listing(repo, pr):
@@ -282,6 +293,8 @@ def unfinished_held(repo, checks, workflows):
 
 def inventory(repo, pr, head, wait):
     view = before = pull(repo, pr)
+    if before['state'] != 'OPEN':
+        return ended(before)
     if before['headRefOid'] != head:
         raise Failed(f'PR #{pr} head is {before["headRefOid"]}, not {head}')
     start = time.monotonic()
@@ -293,14 +306,18 @@ def inventory(repo, pr, head, wait):
         if status != 'running' or waited + POLL > wait:
             break
         time.sleep(POLL)
-        if view.get('mergeable') == 'UNKNOWN':
-            view = pull(repo, pr)
+        # Every poll, so a merge while checks run ends the wait within one.
+        view = pull(repo, pr)
+        if view['state'] != 'OPEN':
+            return ended(view)
     listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
     cache = {}
     listed = [resolved(repo, head, c, cache) if c['bucket'] in ('fail', 'cancel') and (c['attempt'] or '').startswith('actions:') else c
               for c in listed]
     # The listing reads the PR's last commit: a push during it would describe another head.
     after = pull(repo, pr)
+    if after['state'] != 'OPEN':
+        return ended(after)
     if after['headRefOid'] != head:
         raise Failed(f'PR #{pr} head moved to {after["headRefOid"]} while collecting')
     return {'head': head, 'baseRef': before['baseRefName'], 'baseSha': before['baseRefOid'], 'status': summary(checks, after.get('mergeable'))[0],
