@@ -92,3 +92,20 @@ and tools it names, not for the whole family.
   write followed by `r` left the reset failing. verified 2026-10-12
   lpcxpresso55s69 (TinyUF2 0.35.0); which prerequisite the bench hit is not
   established.
+
+## DWC2 (Synopsys USB 2.0 OTG core)
+
+- From core version 2.94a, `DCTL.SftDiscon` resets to 1 (disconnect) and a
+  core soft reset (`GRSTCTL.CSftRst`) keeps it; before 2.94a it reset to 0. On
+  such a core a hard reset of the controller presents a disconnect until
+  firmware clears the bit. Whether a probe's reset reaches that hard reset is
+  the chip's wiring. HS OTG Databook 4.20a (book 2045) p19, p356, p549-550.
+
+## STM32F4
+
+- `OTG_FS_DCTL` resets to 0 (SDIS clear), but `OTG_FS_GCCFG.PWRDWN` resets to
+  0, transceiver powered down (RM0090 rev 22 p1277-1278, p1291), so a system
+  reset drops the device until firmware sets PWRDWN. A J-Link `r; g` gave
+  "USB disconnect" and re-enumeration 325 ms later, while a bare halt stayed
+  connected. verified 2026-08-16 stm32f407disco (tinyusb's
+  `usb-kernel-recover`; firmware revision not recorded).

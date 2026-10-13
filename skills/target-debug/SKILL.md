@@ -213,11 +213,12 @@ Each technique's recipe, read when you reach for it (files beside this one):
 
 ## Warnings
 
-- **Halting/resetting via the probe does NOT disconnect the device**: a DWC2
-  soft-connect pullup stays up through core halt *and* reset, so the host's
-  stuck URBs stay stuck and a wedged DUT stays wedged — recover the Linux
-  host side (the rig's own procedure; its HIL contract names it). carried
-  over.
+- **Halting via the probe does NOT disconnect the device**: a halt resets no
+  peripheral, so the USB controller keeps its pull-up, the host's stuck URBs
+  stay stuck and a wedged DUT stays wedged — recover the Linux host side (the
+  rig's own procedure; its HIL contract names it). A probe reset disconnects
+  only when the reset it issues reaches the USB controller or its PHY: check
+  the part (`families.md`: DWC2, STM32F4).
 - **A bug that vanishes under logging is a timing bug**, not fixed: switch to
   the ring buffer; if it vanishes under GDB too, PC-sampling only.
 - **UART logging blocks in the write path** (worst perturbation, including
