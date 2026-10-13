@@ -34,13 +34,15 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 # JSON parsed" or "the file starts with %PDF" — never "the status was 0".
 #
 # Which client succeeds is not stable, so we try more than one and let validation
-# decide. Two failure modes look like blocking but aren't, and both cost real time
+# decide. Three failure modes look like blocking but aren't, and all cost real time
 # to diagnose:
 #
 #   * curl globs `{ }`. NXP's API takes its query as a brace-wrapped path segment,
 #     and without -g curl silently strips the braces and requests a malformed URL —
 #     which comes back 406, or 404 with a 745-byte "Page not available" page. That
 #     reads exactly like bot-blocking and is not.
+#   * silabs.com answers 403 to a request with no Accept-Encoding, HEAD included,
+#     so every curl call carries --compressed (wget sends one by default).
 #   * `%{size_download}` counts *wire* bytes. With --compressed a 29,896-byte JSON
 #     body reports 3,878, which reads like a truncated or blocked response.
 #
@@ -66,10 +68,16 @@ def _curl(url: str, timeout: int, accept: str) -> bytes:
 def last_modified(url: str) -> str | None:
     """Last-Modified of a URL via HEAD: a revision substitute for vendors that
     publish none, and proof that the file exists."""
-    p = subprocess.run(["curl", "-sgIL", "-m", "25", "-A", UA, url],
+    p = subprocess.run(["curl", "-sgIL", "--compressed", "-m", "25", "-A", UA, url],
                        capture_output=True, text=True)
     m = re.search(r"^last-modified:\s*(.+)$", p.stdout or "", re.I | re.M)
-    return m.group(1).strip() if m else None
+    if m:
+        return m.group(1).strip()
+    # Without this a refused HEAD reads only as an unparseable revision in the plan.
+    status = re.findall(r"^HTTP/\S+ (\d{3})", p.stdout or "", re.M)
+    why = f"HTTP {status[-1]}" if status else f"curl exit {p.returncode}"
+    print(f"  note: no Last-Modified from {url} ({why})", file=sys.stderr)
+    return None
 
 
 def http_get(url: str, timeout: int = 60, accept: str = "application/json",

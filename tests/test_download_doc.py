@@ -263,6 +263,29 @@ class GuiDetection(unittest.TestCase):
         self.assertEqual(calls[1][2], 'http://localhost:8080/#lib')
 
 
+class LastModified(unittest.TestCase):
+    def head(self, run):
+        saved = doclib.subprocess.run
+        self.addCleanup(setattr, doclib.subprocess, 'run', saved)
+        doclib.subprocess.run = run
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            return doclib.last_modified('https://example.com/x.pdf'), err.getvalue()
+
+    def test_the_head_request_carries_an_accept_encoding_the_cdn_requires(self):
+        def run(argv, **kw):
+            out = 'HTTP/2 200\r\nlast-modified: Wed, 28 Oct 2020 20:09:52 GMT\r\n' if '--compressed' in argv else 'HTTP/2 403\r\n'
+            return subprocess.CompletedProcess(argv, 0, out, '')
+        self.assertEqual(self.head(run), ('Wed, 28 Oct 2020 20:09:52 GMT', ''))
+
+    def test_a_missing_last_modified_names_the_final_status(self):
+        for out, code, why in (('HTTP/2 301\r\nlocation: /y.pdf\r\n\r\nHTTP/2 403\r\n', 0, 'HTTP 403'),
+                               ('', 28, 'curl exit 28')):
+            with self.subTest(why):
+                version, err = self.head(lambda argv, **kw: subprocess.CompletedProcess(argv, code, out, ''))
+                self.assertIsNone(version)
+                self.assertIn(f'no Last-Modified from https://example.com/x.pdf ({why})', err)
+
+
 class MicrochipNumber(unittest.TestCase):
     """The title leads with the number the filename carries; the identifier keeps the stem."""
 
