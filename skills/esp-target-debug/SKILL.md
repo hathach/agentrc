@@ -37,13 +37,17 @@ UART side is also the remote reset: `esptool.py --after hard_reset read_mac`.
 ### S3 (DevKitM) notes
 
 - Debugging windows: firmware that never starts the OTG controller (verified:
-  attach/halt/symbol resolution), bootloader/ROM (always stable), or external
-  JTAG (TODO).
+  attach/halt/symbol resolution), the ROM or ESP-IDF's second-stage bootloader
+  (always stable), or external JTAG (TODO).
 - **Keep-alive quirk (verified)**: with app firmware running and nothing
   attached, USB-SJ drops ~4 s after boot (device-side disconnect, then
   half-dead `-71` setup failures until reset). Attach a client inside the
   window — once it survives the window it stays up. Recover via the UART
   reset above.
+- With [0x0, 0x1000) erased (the bootloader's first sector), the ROM loops
+  printing "invalid header: 0xffffffff" on the UART bridge, and
+  USB-Serial-JTAG (303a:1001) enumerates on the native port. verified
+  2026-10-13 espressif_esp32s3_devkitc_1: an esptool erase of that range.
 - PHY mux reference: `RTC_CNTL_RTC_USB_CONF_REG` (0x60008120) bits
   `SW_HW_USB_PHY_SEL`/`SW_USB_PHY_SEL` (TRM 10.56); 0 = eFuse/hardware
   control (default). `esptool.py read_mem/write_mem` peeks and pokes
