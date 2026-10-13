@@ -176,12 +176,13 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   outcome and any disagreement that remains for me.
 
 # Pull requests
-- Right after opening a new PR on my request, launch a headless `chief` in
-  its worktree to babysit it through `pr-babysit` with `autoPush: true` and
-  `markSonar: true`, without asking, unless I declined babysitting. After
-  pushing to an existing PR that no chief is babysitting, ask me whether to
-  launch one, unless I already asked for one or declined; an unfinished chief
-  task on it that still holds my grant continues under the headless recipe
+- Right after opening a new non-draft PR on my request, launch a headless
+  `chief` in its worktree to babysit it through `pr-babysit` with
+  `autoPush: true` and `markSonar: true`, without asking, unless I declined
+  babysitting. After pushing to an existing non-draft PR or marking a draft
+  ready for review, if no chief is babysitting it, ask me whether to launch
+  one, unless I already asked for one or declined; an unfinished chief task
+  on it that still holds my grant continues under the headless recipe
   without asking.
   My request to open the PR, my request to launch chief to babysit a PR, or
   my yes to that offer, is the grant unless I narrow it: launch without a

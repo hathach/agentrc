@@ -148,8 +148,8 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('a new chief invocation, including a restart or resumed recovery, requires a fresh exchange', review)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
         rules = ' '.join((AGENTS.parent / 'instructions' / 'user.md').read_text().split())
-        for phrase in ('Right after opening a new PR on my request, launch a headless `chief` in its worktree to babysit it',
-                       'After pushing to an existing PR that no chief is babysitting, ask me whether to launch one',
+        for phrase in ('Right after opening a new non-draft PR on my request, launch a headless `chief` in its worktree to babysit it',
+                       'After pushing to an existing non-draft PR or marking a draft ready for review, if no chief is babysitting it, ask me whether to launch one',
                        'My request to open the PR, my request to launch chief to babysit a PR, or my yes to that offer, is the grant unless I narrow it'):
             self.assertIn(phrase, rules)
         self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
