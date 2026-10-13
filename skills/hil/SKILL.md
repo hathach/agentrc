@@ -46,7 +46,9 @@ holder record (pid, reason), are the contract's Reservation.
 - Never pre-hold a board for a tool that locks itself: it refuses your hold as a
   conflict.
 - Report a refused hold with its holder and reason; wait only within the task's
-  lock-wait budget.
+  lock-wait budget. A holder record marked as a cleanup holder
+  (`role: cleanup-holder`) never frees on its own: it is a recovery blocker for
+  every project, never waited on.
 - Bypassing a lock (`HIL_NO_BOARD_LOCK=1`, or the contract's equivalent) needs
   task scope naming that board; a refusal alone never adds it.
 - A rig-wide operation (hub power, root-port cycle, controller rebind) holds
@@ -55,8 +57,8 @@ holder record (pid, reason), are the contract's Reservation.
 
 Manual work on a rig board outside the contract's runner (`hw-validator`,
 `hw-debugger`, probe tools used directly) follows `target-debug`'s Delegated
-sessions for its hold and cleanup; the contract supplies the helper and the
-cleanup state.
+sessions for its hold and cleanup; the contract supplies the helper, and the
+cleanup state when it defines one instead of a restoration firmware.
 
 ## Running
 
@@ -102,7 +104,8 @@ A run-level caveat (aborted, nothing selected) gates every row.
   succeeded, no board is locked, wedged or held, the caveat is empty, and the
   contract does not name that result final; Results says whether the operator
   or its caller retries. Keep every attempt's report; a clean retry never
-  erases an earlier run-level failure.
+  erases an earlier run-level failure. An eligible retry that fails then passes
+  reads as a pass marked flaky, quoting both reports.
 - `locked` is an admission refusal, not a test failure: admit again once the
   holder releases, within the budget, or report the board not covered, naming
   the holder.
