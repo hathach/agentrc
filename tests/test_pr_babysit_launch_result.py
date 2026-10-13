@@ -181,19 +181,34 @@ class LaunchResultTest(unittest.TestCase):
 
     def test_every_stop_reason_of_the_workflow_is_refused_or_handled_elsewhere(self):
         handled_elsewhere = {  # blocked by receipts, budget, heads or CI fields, or left to chief's judgment
-            'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable', 'ci-red-rig-side',
-            'ci-red-sonar-gate', 'ci-red-unclassified', 'cycle-threw', 'maxCycles reached', 'deferred-replies-unresolved', 'dirty-start',
-            'duplicate-finding-ids', 'fix-verification-failed', 'preflight-died', 'preflight-failed', 'push-failed',
+            'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable',
+            'cycle-threw', 'maxCycles reached', 'deferred-replies-unresolved', 'dirty-start',
+            'duplicate-finding-ids', 'fix-verification-failed', 'held-awaiting-caller', 'preflight-died', 'preflight-failed', 'push-failed',
             'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending',
-            'unactionable', 'wrong-branch', 'wrong-remote', 'yielded'}
+            'wrong-branch', 'wrong-remote', 'yielded'}
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
         historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced
-        self.assertFalse(handled_elsewhere & set(launch_result.REFUSED))
-        self.assertFalse(set(launch_result.ENDED) & (handled_elsewhere | set(launch_result.REFUSED)))
-        self.assertEqual(reasons, handled_elsewhere | (set(launch_result.REFUSED) - historical) | set(launch_result.ENDED),
+        sets = (handled_elsewhere, set(launch_result.REFUSED), set(launch_result.ENDED), set(launch_result.STALLED))
+        self.assertEqual(sum(map(len, sets)), len(set().union(*sets)), 'each reason is handled one way')
+        self.assertEqual(reasons, set().union(*sets) - historical,
                          'a stop reason was added or renamed: give it a REFUSED response or name it here')
+
+    def test_a_stop_another_launch_would_repeat_says_what_must_change(self):
+        def stopped(reason, **extra):
+            return {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
+                    'result': {'stateDigest': '0123abcd', 'pass': False, 'status': 'blocked', 'reason': reason, 'cycles': 2,
+                               'state': {'expectedHead': HEAD, 'cyclesUsed': 2, 'maxCycles': 16}, **extra}}
+        for reason, says in launch_result.STALLED.items():
+            with self.subTest(reason):
+                self.assertEqual(self.run_it(stopped(reason))[1]['blockers'], [says])
+        held = [{'findingId': '7#1', 'commentId': 7, 'reason': 'out of scope per https://x/1 (y): defer it by findingId, or drop the topic'}]
+        self.assertEqual(self.run_it(stopped('held-awaiting-caller', held=held))[1]['blockers'],
+                         ['finding 7#1 on comment 7 is held for the caller, and another launch cannot lift it: '
+                          'out of scope per https://x/1 (y): defer it by findingId, or drop the topic'])
+        for reason in ('yielded', 'pr-merged'):
+            self.assertEqual(self.run_it(stopped(reason))[1]['blockers'], [], reason)
 
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):
         data = output()

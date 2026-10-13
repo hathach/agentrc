@@ -183,6 +183,7 @@ async function run(opts = {}) {
   const logs = []
   const calls = opts.trace ?? [] // shared so a case that expects a throw can still see what ran
   const napPoints = [] // logs.length when a backoff started, to prove ordering
+  const napMs = [] // each backoff's requested delay
   const reviews = opts.reviews ?? { findings: [], replies: [], bots: 'reviewed' }
   const ciOf = (label) => typeof opts.ci === 'function' ? opts.ci(label) : opts.ci ?? GREEN
   const store = opts.store ?? new Map()
@@ -287,6 +288,8 @@ async function run(opts = {}) {
         answer = {
           head: ci.headSha ?? head, status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
+          // Every read sees CI move unless a fixture fixes what it waits on.
+          registered: ci.registered ?? Math.max(1, failed.length), waiting: ci.status === 'running' ? ci.waiting ?? label : '',
           ...(/ --brief /.test(text) && ci.status === 'running' ? { checks: [] } : {}),
         }
       } else {
@@ -527,7 +530,7 @@ async function run(opts = {}) {
   // nap()'s real delay is minutes; fire it immediately and record where in the
   // log stream it happened.
   const realTimeout = globalThis.setTimeout
-  globalThis.setTimeout = (fn) => { napPoints.push(logs.length); realTimeout(fn, 0); return 0 }
+  globalThis.setTimeout = (fn, ms) => { napPoints.push(logs.length); napMs.push(ms); realTimeout(fn, 0); return 0 }
   try {
     const fn = new AsyncFunction(
       'args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget',
@@ -547,7 +550,7 @@ async function run(opts = {}) {
         return copy && conforms(options.schema, copy, options.label)
       }, pipeline, parallel, () => {}, (m) => logs.push(String(m)), workflow, null,
       ...ABSENT.map(() => undefined))
-    return { result, logs, labels: calls.map(c => c.label), calls, napPoints }
+    return { result, logs, labels: calls.map(c => c.label), calls, napPoints, napMs }
   } finally {
     globalThis.setTimeout = realTimeout
   }
@@ -1440,6 +1443,59 @@ test('the CI lane waits out its budget in slices, 30 minutes by default', async 
   assert.equal(slices(ciOnly.calls)[0], 540, 'no review lane to wait for')
   const green = await run()
   assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge, nor a full read')
+})
+
+test('CI that saw nothing move through two whole waits on one head stops ci-stuck, across a resume too', async () => {
+  const stuck = { ...RUNNING, pending: 2, waiting: 'same' }
+  const { result, logs } = await run({ ci: stuck, args: { maxCycles: 4 } })
+  assert.equal(result.reason, 'ci-stuck')
+  assert.equal(result.cycles, 2)
+  assert.deepEqual([result.head, result.pending], [HEAD, 2])
+  assert.ok(logs.some(l => l.includes('still running with the same 2 pending check(s) after two whole waits')), logs.join('\n'))
+  const moving = await run({ ci: RUNNING, args: { maxCycles: 3 } })
+  assert.equal(moving.result.reason, 'maxCycles reached', 'a wait that saw CI move re-arms')
+  // A wait cut short by the review lane is no whole wait.
+  const cut = await run({ ci: stuck, throwOn: (l) => l.startsWith('reviews#'), args: { maxCycles: 3 } })
+  assert.notEqual(cut.result.reason, 'ci-stuck')
+  // Chained single-cycle launches carry the last whole wait in the state.
+  const first = await run({ ci: stuck, args: YIELD })
+  assert.deepEqual(first.result.state.last.ciWaited, { head: HEAD, registered: 1, pending: 2, waiting: 'same' })
+  const second = await run({ ci: stuck, args: { ...YIELD, state: first.result.state } })
+  assert.equal(second.result.reason, 'ci-stuck')
+  const other = await run({ ci: { ...stuck, waiting: 'other' }, args: { ...YIELD, state: first.result.state } })
+  assert.equal(other.result.reason, 'yielded')
+  // The sealed state is canonical JSON: its key order is no part of what the wait saw.
+  const { head, registered, pending, waiting } = first.result.state.last.ciWaited
+  const reordered = seal({ ...first.result.state, last: { ...first.result.state.last, ciWaited: { waiting, pending, registered, head } } })
+  assert.equal((await run({ ci: stuck, args: { ...YIELD, state: reordered } })).result.reason, 'ci-stuck')
+  // A CI-only launch stops on it too.
+  const CI_ONLY = { ...YIELD, lane: 'ci' }
+  const ciFirst = await run({ ci: stuck, args: CI_ONLY })
+  assert.equal((await run({ ci: stuck, args: { ...CI_ONLY, state: ciFirst.result.state } })).result.reason, 'ci-stuck')
+  // A slice its relay retried ran without its wait: no whole wait, on either kind of head.
+  const retried = (l) => /^ci:collect#\d+\.1$/.test(l)
+  const short = await run({ ci: stuck, throwOn: retried, args: { maxCycles: 3, ciWait: 1 } })
+  assert.equal(short.result.reason, 'maxCycles reached')
+  const none = { ...RUNNING, pending: 0, registered: 0, waiting: 'none' }
+  const shortNone = await run({ ci: none, throwOn: retried, args: { maxCycles: 1, ciWait: 1 } })
+  assert.notEqual(shortNone.result.pass, true)
+})
+
+test('a head with no check registered after a whole wait is read at once on later cycles, until checks appear', async () => {
+  const none = { ...RUNNING, pending: 0, registered: 0, waiting: 'none' }
+  const green = await run({ ci: none })
+  assert.equal(green.result.pass, true, 'nothing to wait for once the whole wait found no check')
+  assert.ok(green.logs.some(l => l.includes('no CI check registered on 0f1e2d3 after a whole 30-minute wait')), green.logs.join('\n'))
+  const waits = (calls, cycle) => calls.filter(c => c.label.startsWith(`ci:collect#${cycle}.`))
+    .map(c => Number(c.prompt.match(/inventory --wait-seconds (\d+)/)[1]))
+  const { calls, result } = await run({ ci: (l) => /^ci:collect#[123]\./.test(l) ? none : RUNNING, reviews: WAITING, args: { maxCycles: 5 } })
+  assert.equal(waits(calls, 1).reduce((a, b) => a + b), 30 * 60)
+  assert.deepEqual([waits(calls, 2), waits(calls, 3), waits(calls, 4)], [[0], [0], [0]], 'read at once, cycle after cycle')
+  assert.equal(waits(calls, 5).reduce((a, b) => a + b), 30 * 60, 'checks registered since: waited out again')
+  assert.deepEqual(result.history.map(e => e.ci.status), ['green', 'green', 'green', 'running', 'running'])
+  // Mergeability unknown is no proof that nothing will register.
+  const unknown = await run({ ci: { ...none, mergeable: 'UNKNOWN' }, args: { maxCycles: 1 } })
+  assert.notEqual(unknown.result.pass, true)
 })
 
 test('a CI wait left early on a brief slice is classified from its full read', async () => {
@@ -2768,6 +2824,15 @@ test('the pending-bot backoff is taken after the cycle summary', async () => {
   assert.ok(napPoints[0] > firstSummaryAt, 'cycle 1 reported before the wait, not after it')
 })
 
+test('the backoff grows a minute per cycle and stops growing at ten, a resumed launch included', async () => {
+  const pending = { findings: [], replies: [], bots: 'pending' }
+  assert.deepEqual((await run({ args: { maxCycles: 3 }, reviews: pending })).napMs, [60000, 120000])
+  const state = adoptionState({ cyclesUsed: 11, maxCycles: 13 })
+  const { result, napMs } = await run({ args: adoptionArgs(state, { adoptHead: undefined, yieldAfterCycle: undefined }), reviews: pending })
+  assert.equal(result.reason, 'reviews-pending')
+  assert.deepEqual(napMs, [600000], 'cycle 12 naps ten minutes, not twelve')
+})
+
 test('reviews go to the validator role directly, and no lane leaves the roles', async () => {
   // The `workflow` binding throws, so a run that reaches its verdict is itself
   // the proof that nothing nested a workflow; these are the only roles it may
@@ -3911,6 +3976,26 @@ test('an out-of-scope topic holds a finding its issue covers before the first ha
   assert.equal(deferred.result.pass, true, JSON.stringify(deferred.result.reason))
 })
 
+test('a green PR whose owed findings are all held for the caller stops at once; a hold another cycle may lift re-arms', async () => {
+  const topic = { issueUrl: ISSUE, reason: 'hub port stuck at HIL start' }
+  const covered = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 3, deferrals: [topic] }, topic: () => true })
+  assert.equal(covered.result.reason, 'held-awaiting-caller')
+  assert.equal(covered.result.cycles, 1)
+  assert.deepEqual(covered.labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], 'one harvest, not one per cycle')
+  assert.deepEqual(covered.result.held, [{ findingId: '1#1', commentId: 1, reason: covered.result.state.holds[0][1].reason }])
+  const unsure = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 3, deferrals: [topic] }, topic: () => null })
+  assert.equal(unsure.result.reason, 'deferred-replies-unresolved', 'an unread topic is judged again')
+  assert.equal(unsure.result.cycles, 3)
+  // One comment, a caller hold and a first writer rejection: the rejection is judged again next cycle.
+  const mixed = await run({
+    reviews: { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' }, fix: rejecting('1#2'),
+    topic: (id) => id.startsWith('1#1@'), args: { autoPush: true, maxCycles: 2, deferrals: [topic] },
+  })
+  assert.equal(mixed.result.state.holds.find(([id]) => id === '1#1')[1].caller, true)
+  assert.equal(mixed.result.state.holds.find(([id]) => id === '1#2')[1].caller, undefined)
+  assert.ok(mixed.labels.includes('reviews#2'), 'the rejected sibling keeps the comment progressing')
+})
+
 test('a deferral whose reason alone breaks the reply limit is refused before anything runs', async () => {
   await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'w '.repeat(55).trim() })] } }),
     /deferral reason too long for its reply \(60 words, a line 300 characters with the issue URL\): 1#1/)
@@ -4055,7 +4140,8 @@ test('a hold survives a harvest that omits the finding, within a launch and acro
     args: { maxCycles: 5, yieldAfterCycle: true },
   })
   let cycle = 0
-  const within = await run({ reviewsPerCycle: () => ++cycle === 1 ? flipped : empty, args: { maxCycles: 5, state: first.result.state } })
+  // An unproven challenger verdict leaves the hold for another cycle; an unsettled one would stop for the caller.
+  const within = await run({ reviewsPerCycle: () => ++cycle === 1 ? flipped : empty, challenge: { verdicts: [{ id: 0, verdict: 'unknown', reason: '' }] }, args: { maxCycles: 5, state: first.result.state } })
   assert.notEqual(within.result.pass, true, 'omitting the held finding settles nothing')
   assert.deepEqual(within.result.state.holds.map(([id]) => id), ['1#1'])
   assert.match(within.calls.filter(c => c.label.startsWith('reviews#')).at(-1).prompt, /so they can be reconciled: \[\{"commentId":1,"findingIds":\["1#1"\]\}\]/)
@@ -4092,7 +4178,7 @@ test('a held finding stays held against its earlier decision when a later harves
   })
   const related = finding({ findingId: '5#1', commentId: 5, file: 'src/b.c', related: '1#1' })
   const held = await run({ reviews: { findings: [related], replies: [], bots: 'reviewed' }, args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
-  assert.deepEqual(held.result.state.holds, [['5#1', { commentId: 5, reason: 'contradicts the earlier invalid verdict on 1#1: the challenger could not settle it: cannot tell', against: '1#1' }]])
+  assert.deepEqual(held.result.state.holds, [['5#1', { commentId: 5, reason: 'contradicts the earlier invalid verdict on 1#1: the challenger could not settle it: cannot tell', against: '1#1', caller: true }]])
   const dropped = await run({ reviews: { findings: [{ ...related, related: null }], replies: [], bots: 'reviewed' }, args: { maxCycles: 3, state: held.result.state } })
   assert.equal(dropped.labels.some(l => l.startsWith('fix:')), false)
   assert.ok(!dropped.logs.some(l => /5#1 reconciled/.test(l)))
@@ -4129,8 +4215,10 @@ test('a hold on an answered comment is named in every exit that lists what is ow
   assert.deepEqual(yielded.result.state.debt, [], 'comment 1 is answered, so it accrues no debt')
   assert.deepEqual(yielded.result.outstanding, [1])
   const spent = await run({ reviews: flipped, args: { maxCycles: 5, state: yielded.result.state } })
-  assert.equal(spent.result.reason, 'deferred-replies-unresolved')
+  assert.equal(spent.result.reason, 'held-awaiting-caller', 'the challenger cannot settle it, so another cycle cannot either')
+  assert.equal(spent.result.cycles, 3, 'stopped at its first cycle, not the ceiling')
   assert.deepEqual(spent.result.outstanding, [1])
+  assert.deepEqual(spent.result.held.map(h => [h.findingId, h.commentId]), [['1#1', 1]])
 })
 
 test('a finding related to another comment keeps its own debt, and settling one does not settle the other', async () => {

@@ -291,10 +291,11 @@ const COLLECT_CHECK = {
   },
 }
 const INVENTORY = withSeal({
-  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'checks'],
+  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'waiting', 'checks'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
-    pending: { type: 'integer' }, checks: { type: 'array', items: COLLECT_CHECK },
+    pending: { type: 'integer' }, registered: { type: 'integer' }, waiting: { type: 'string' },
+    checks: { type: 'array', items: COLLECT_CHECK },
   },
 })
 const GATE = {
@@ -695,7 +696,7 @@ const noteRerun = (r) => {
 const ciVerdicts = new Map()
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e })
 const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
-const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed']
+const CARRIED = ['cycle', 'head', 'lane', 'adoption', 'reviewPushFailed', 'ciPushFailed', 'ciWaited']
 // commentId -> { how, digest, sonar?, sonarOf? }: the answer and the body digest it addressed; an edit owes again. sonar: a code-scanning answer until its
 // SonarCloud issue settles; sonarOf: the { how, digest } of our earlier answer it belongs to, when the caller's reply settled the comment since.
 const answeredWith = new Map(restored ? restored.answeredWith : [])
@@ -842,6 +843,18 @@ const handoffWhy = (commentId) => {
     : null
 }
 const handedOff = (commentId) => !!handoffWhy(commentId)
+// An edited comment's carried ids may name other points now: none is named to the validator.
+const owedIds = (commentId) => {
+  const d = debt.get(commentId)
+  if (d && d.edited) return []
+  const held = [...holds].filter(([, h]) => h.commentId === commentId).map(([findingId]) => findingId)
+  return [...new Set([...(d ? [...d.dismissals, ...d.notes] : []), ...held])]
+}
+// Every finding still owed on the comment is held for the caller's decision.
+const callerHeld = (commentId) => {
+  const ids = owedIds(commentId)
+  return ids.length > 0 && ids.every(k => (holds.get(k) || {}).caller)
+}
 const owesDismissal = (commentId) => {
   const d = debt.get(commentId)
   return !!d && d.dismissals.size > 0
@@ -1472,9 +1485,13 @@ const prGate = async (lanes, tag) => {
 }
 
 let napMs = 0
+// The cycle number carries across launches; capped so a resumed launch does not nap a quarter hour per cycle.
+const backoff = (cycle) => 60000 * Math.min(cycle, 10)
 // Set where a cycle continues only to wait (CI, bots, owed replies, a SonarCloud re-read); any other continuation pauses yieldOnChange.
 let waited = false
 const rearm = () => { waited = true; return null }
+// The cycle before this one, the state's last included: history holds this cycle's entry already.
+const ciWaitedBefore = () => history.length > 1 ? history[history.length - 2].ciWaited : null
 
 // A digest recorded before CodeRabbit rewrote its comment's end is one of the comment's aliases now (comment_digest.py): the same body.
 const repin = (cycle, findings) => {
@@ -1694,7 +1711,7 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
 }
 
 // collect.py waits and lists without a model; the judge reads only the failing checks' evidence. Waits stay short while the review lane may still push.
-const ciLaneRun = async (cycle, lanes) => {
+const ciLaneRun = async (cycle, lanes, entry) => {
   const repo = ((pin && pin.prUrl) || '').match(/github\.com\/([^/]+\/[^/]+)\/pull\//)?.[1]
   if (!repo) {
     log(`cycle ${cycle}: CI not collected — no PR repository in ${JSON.stringify(pin && pin.prUrl)}`)
@@ -1706,9 +1723,15 @@ const ciLaneRun = async (cycle, lanes) => {
       `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${expectedHead}${payload ? ' < <that file>' : ''}\` ` +
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
       (payload ? `\n${JSON.stringify(payload)}` : '')
-    return relayOnce(prompt(command), { label, phase: 'Triage', model: 'haiku', effort: 'low', schema },
-      prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')))
+    const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }
+    return relayRun(prompt(command), opts).then(got => {
+      if (got) return got
+      shortened = shortened || /--wait-seconds [1-9]/.test(command)
+      return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts)
+    })
   }
+  // A slice retried without its wait leaves the budget short of a whole wait.
+  let shortened = false
   const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
   const sameLinks = (got, want) => got.length === want.length && want.every(l => got.includes(l))
@@ -1722,10 +1745,13 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: PR #${args.pr} is ${inv.status} — ending both lanes`)
     return { headSha: inv.head, status: inv.status, infraRerun: [], realFailures: [] }
   }
+  // A head on which a whole wait found no check registered is read again at once, not waited out every cycle.
+  const prior = ciWaitedBefore()
+  const unregistered = !!prior && prior.head === expectedHead && prior.registered === 0
   // collect.py polls every 30 s, so a shorter slice would only list.
   let inv = null
   let last = false
-  let left = ciWait * 60
+  let left = unregistered ? 0 : ciWait * 60
   for (let k = 1; ; k++) {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
     // A --brief slice still running prints no checks, so a relay copies nothing it reads again; the budget's last slice is whole.
@@ -1749,6 +1775,14 @@ const ciLaneRun = async (cycle, lanes) => {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
     return null
   }
+  // ciWaited: a whole wait that ended still running, what ci-stuck compares cycle to cycle; the read at once is no wait.
+  const exhausted = last && !unregistered && !shortened && inv.status === 'running'
+  if (inv.status === 'running' && inv.registered === 0 && inv.mergeable === 'MERGEABLE' && (unregistered || exhausted)) {
+    entry.ciWaited = { head: inv.head, registered: 0 }
+    log(`cycle ${cycle}: no CI check registered on ${inv.head.slice(0, 7)} after a whole ${ciWait}-minute wait — nothing to wait for`)
+    return { headSha: inv.head, status: 'green', infraRerun: [], realFailures: [] }
+  }
+  if (exhausted) entry.ciWaited = { head: inv.head, registered: inv.registered, pending: inv.pending, waiting: inv.waiting }
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
   const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
@@ -1935,16 +1969,9 @@ const runLanes = async (cycle, entry, lanes) => {
   try {
     entry.lane = lane
     if (ciLane) {
-      ciPromise = ciLaneRun(cycle, lanes).catch(quiet(`cycle ${cycle}: CI lane`))
+      ciPromise = ciLaneRun(cycle, lanes, entry).catch(quiet(`cycle ${cycle}: CI lane`))
     }
 
-    // An edited comment's carried ids may name other points now: none is named to the validator.
-    const owedIds = (commentId) => {
-      const d = debt.get(commentId)
-      if (d && d.edited) return []
-      const held = [...holds].filter(([, h]) => h.commentId === commentId).map(([findingId]) => findingId)
-      return [...new Set([...(d ? [...d.dismissals, ...d.notes] : []), ...held])]
-    }
     const owedLastCycle = outstanding().map(commentId => ({ commentId, findingIds: owedIds(commentId) }))
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
@@ -2022,13 +2049,15 @@ const runLanes = async (cycle, entry, lanes) => {
     // A reversal is settled by a challenger shown both verdicts; valid to stale is a fix landing.
     const turned = (was, now) => (was !== 'valid' && now === 'valid') || (was === 'valid' && now === 'invalid')
     const reversal = (f) => { const p = prior.get(f); return p && turned(p.verdict, f.verdict) ? p : null }
-    const holdOn = (f, why) => {
+    // byCaller: another cycle cannot lift it, only the caller's decision can.
+    const holdOn = (f, why, byCaller = false) => {
       const p = reversal(f)
       if (p) f.against = p.ref
       f.hold = p ? `contradicts the earlier ${p.verdict} verdict on ${p.ref}: ${why}` : why
+      f.holdByCaller = byCaller
     }
     const recordHold = (f) => {
-      holds.set(f.findingId, { commentId: f.commentId, reason: f.hold, against: f.against || (holds.get(f.findingId) || {}).against || null })
+      holds.set(f.findingId, { commentId: f.commentId, reason: f.hold, against: f.against || (holds.get(f.findingId) || {}).against || null, ...(f.holdByCaller ? { caller: true } : {}) })
       log(`cycle ${cycle}: ${f.findingId} held — ${f.hold}`)
     }
 
@@ -2080,7 +2109,7 @@ const runLanes = async (cycle, entry, lanes) => {
         const unsettled = !v.reason.trim() ? 'the challenger gave no evidence'
           : v.verdict === 'unknown' ? `the challenger could not settle it: ${v.reason}`
           : v.verdict === 'justified' && f.verdict === 'valid' ? `the challenger upheld the earlier dismissal: ${v.reason}` : null
-        if (unsettled) { holdOn(f, unsettled); continue }
+        if (unsettled) { holdOn(f, unsettled, !!v.reason.trim()); continue }
         const overturns = v.verdict === 'valid' && f.verdict !== 'valid'
         if (overturns || reversal(f)) f.challengeReason = v.reason
         if (!overturns) continue
@@ -2127,7 +2156,7 @@ const runLanes = async (cycle, entry, lanes) => {
         const mine = pairs.filter(p => p.f === f).map(p => ({ ...p, v: covers.get(p.id) }))
         const covered = mine.find(p => p.v && p.v.covers === true)
         const unsure = mine.find(p => !p.v || p.v.covers !== false)
-        if (covered) holdOn(f, `out of scope per ${covered.t.issueUrl} (${covered.t.reason}): defer it by findingId, or drop the topic`)
+        if (covered) holdOn(f, `out of scope per ${covered.t.issueUrl} (${covered.t.reason}): defer it by findingId, or drop the topic`, true)
         else if (unsure) holdOn(f, `not yet judged outside the out-of-scope topic ${unsure.t.issueUrl}${unsure.v ? `: ${unsure.v.reason}` : ''}`)
       }
     }
@@ -2401,6 +2430,11 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.ciPush = ciPush
       return null
     }
+    const now = entry.ciWaited, before = ciWaitedBefore()
+    if (c.status === 'running' && now && now.registered > 0 && before && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === before[k])) {
+      log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s) after two whole waits — observe them before relaunching`)
+      return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending })
+    }
     if (!reviewLane) {
       log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
       return null
@@ -2413,11 +2447,17 @@ const runLanes = async (cycle, entry, lanes) => {
           log('autoPush not set: replies left unposted (dry run)')
           return { pass: false, cycles: cycle, history, dryRun: true }
         }
-        // Another cycle cannot answer a comment handed to the caller: stop rather than burn the budget waiting.
-        if (cycle < maxCycles && !owedNow.every(handedOff)) {
+        // Another cycle cannot answer a comment handed to the caller, or one held for the caller's decision: stop rather than burn the budget waiting.
+        const progressing = owedNow.filter(id => !handedOff(id) && !callerHeld(id))
+        if (cycle < maxCycles && progressing.length) {
           log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'} but ${owedNow.length} comment(s) still owed an answer — re-arming`)
-          napMs = 60000 * cycle
+          napMs = backoff(cycle)
           return rearm()
+        }
+        if (!progressing.length && !owedNow.every(handedOff)) {
+          const held = [...holds].filter(([, h]) => h.caller && owedNow.includes(h.commentId)).map(([findingId, h]) => ({ findingId, commentId: h.commentId, reason: h.reason }))
+          log(`cycle ${cycle}: ${held.length} finding(s) held for the caller's decision — stopping`)
+          return stop(cycle, 'held-awaiting-caller', { outstanding: owedNow, held })
         }
         return unresolvedVerdict(cycle, owedNow)
       }
@@ -2458,7 +2498,7 @@ const runLanes = async (cycle, entry, lanes) => {
       const who = pendingBots.map(b => `${b.bot} ${botCell(b, entry.bots.waitedMin)}`).join('; ')
       if (cycle < maxCycles) {
         log(`cycle ${cycle}: auto-review still pending (${who}) — re-arming after a wait`)
-        napMs = 60000 * cycle
+        napMs = backoff(cycle)
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }

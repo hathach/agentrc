@@ -101,10 +101,24 @@ class InventoryTest(unittest.TestCase):
                           self.check('lint', 'cancel', 'https://example.com/x')]]
         rc, r = self.main()
         self.assertEqual((rc, r['status'], r['pending']), (0, 'red', 0))
-        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'status'], 'only what the workflow reads, and no null error')
+        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
         self.assertEqual([c['aliases'] for c in r['checks']], [[], [], []], 'printed empty, so a relay has nothing to add (#50)')
+
+    def test_registered_counts_every_check_and_waiting_fingerprints_the_pending_ones(self):
+        self.heads = [HEAD]
+        def read(*checks):
+            self.listings = [list(checks)]
+            return self.main()[1]
+        a, b, done = self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'pending', JOB.format(4)), self.check('x', 'pass', JOB.format(1))
+        r = read(a, b, done)
+        self.assertEqual((r['status'], r['registered']), ('running', 3))
+        self.assertEqual(read(b, a, done)['waiting'], r['waiting'], 'order does not matter')
+        self.assertEqual(read(a, b)['waiting'], r['waiting'], 'only pending checks count')
+        self.assertNotEqual(read(a, self.check('lint', 'pending', JOB.format(5)), done)['waiting'], r['waiting'], 'a new attempt is movement')
+        self.assertNotEqual(read(a)['waiting'], r['waiting'])
+        self.assertEqual((read(done)['waiting'], read(done)['registered']), ('', 1), 'nothing to fingerprint once settled')
 
     def test_attempt_only_from_a_link_that_names_one_run(self):
         self.heads = [HEAD]
@@ -179,7 +193,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []))
-        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'status'], 'the same members as a whole line')
+        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'the same members as a whole line')
         self.listings = [[self.check('hil', 'pass', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((r['status'], [c['link'] for c in r['checks']]), ('red', [JOB.format(4)]), 'settled: the whole inventory')

@@ -7,7 +7,7 @@
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
-prints one JSON object {head, status, mergeable, pending, checks}, plus `error` when set
+prints one JSON object {head, status, mergeable, pending, registered, waiting, checks}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error); every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
@@ -18,7 +18,9 @@ conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
 may not have run, so no check result stands for the PR), else running (a check
 pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
 failed or was cancelled) or green; `mergeable` is GitHub's, read last;
-`pending` counts the pending checks. A failed or cancelled CircleCI job whose
+`pending` counts the pending checks, `registered` every check. `waiting`, '' unless
+running, fingerprints the pending checks (name, link, attempt) and mergeable: two
+reads with the same one saw nothing move. A failed or cancelled CircleCI job whose
 workflow has not finished (running, failing, on_hold, queued: CircleCI refuses
 to re-run it yet) counts as pending, read from CircleCI's public job and
 workflow API on every poll; a status it cannot read is an error. This also
@@ -361,11 +363,15 @@ INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for fa
 
 
 def printed(inv, brief=False):
-    """What the caller reads: the failing checks by name, the pending ones by count; brief, none while still running."""
+    """What the caller reads: the failing checks by name, the pending ones by count; brief, none while still running.
+    registered counts every check; waiting, '' unless running, fingerprints the pending checks and mergeable, so a
+    caller can tell a wait that saw nothing move from one that did."""
     listed = [] if brief and inv['status'] == 'running' else \
         [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]
+    pending = sorted([c['name'], c.get('link') or '', c.get('attempt') or ''] for c in inv['checks'] if c['bucket'] == 'pending')
     return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
-            'checks': listed}
+            'registered': sum(inv['counts'].values()),
+            'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed}
 
 
 def evidence_dir(repo, pr, head):

@@ -17,7 +17,8 @@ its comment (a refutedPosts reply answers stale findings as well as invalid ones
 `budget` is the returned state's
 cyclesUsed and maxCycles. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch
-included, the latter with the caller's response; `notes` what is absent but harmless.
+included, the latter with the caller's response, and a stop another launch on the same state would repeat,
+with what must change first; `notes` what is absent but harmless.
 A launch that stopped on a merged or closed PR is terminal: a note says so, and a
 spent budget is no blocker.
 `logs` leaves out lines another field carries whole and folds repeated ones into one.
@@ -70,6 +71,16 @@ REFUSED = {
     'pr-state-unread': 'the PR state could not be read before a GitHub write, so that write did not run: relaunch once `gh pr view` answers',
 }
 ENDED = {'pr-merged': 'the PR is merged; nothing to continue', 'pr-closed': 'the PR is closed; nothing to continue'}
+# Stops another launch on the same state repeats: what must change first (chief's rule against relaunching on an unchanged blocker).
+STALLED = {
+    'ci-red-rig-side': 'CI is red only from rig-side failures: relaunch once they are repaired and re-run, or the user accepts them',
+    'ci-red-sonar-gate': "the SonarCloud gate fails: relaunch only when markSonar has an answered issue to mark or the gate changed; "
+                         "otherwise it is the user's to resolve or accept",
+    'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
+    'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head: observe them once (a hung job, a missing runner) '
+                'before relaunching',
+    'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
+}
 
 
 def load_output(path):
@@ -232,6 +243,11 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             blockers.append(REFUSED[result['reason']])
         if result.get('reason') in ENDED:
             notes.append(ENDED[result['reason']])
+        if result.get('reason') in STALLED:
+            blockers.append(STALLED[result['reason']])
+        if result.get('reason') == 'held-awaiting-caller':
+            blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
+                         f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]
         obs = result.get('observation') or {}
         reviews, ci, actions = obs.get('reviews') or {}, obs.get('ci'), obs.get('actions') or {}
         summary['observation'] = {
