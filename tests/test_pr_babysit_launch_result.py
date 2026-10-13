@@ -160,6 +160,15 @@ class LaunchResultTest(unittest.TestCase):
                 self.assertEqual(len(s['blockers']), 1, s['blockers'])
                 self.assertIn(says, s['blockers'][0])
 
+    def test_an_unread_pr_state_after_a_lost_receipt_keeps_the_publication_uncertain(self):
+        data = output()
+        data['result'].update(status='blocked', reason='pr-state-unread')
+        data['result']['observation']['actions']['adoption'] = {'from': HEAD, 'to': NEXT, 'publication': 'unknown'}
+        _, s = self.run_it(data)
+        self.assertIn('uncertain publication: adoption aaaaaaaa..bbbbbbbb: unknown', s['blockers'])
+        self.assertTrue(any('relaunch once `gh pr view` answers' in b for b in s['blockers']), s['blockers'])
+        self.assertFalse([b for b in s['blockers'] if 'nothing was written' in b], s['blockers'])
+
     def test_a_merged_or_closed_pr_is_terminal_with_no_relaunch_blocker(self):
         for reason, says in (('pr-merged', 'the PR is merged; nothing to continue'), ('pr-closed', 'the PR is closed; nothing to continue')):
             with self.subTest(reason):

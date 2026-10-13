@@ -67,7 +67,7 @@ REFUSED = {
     'pr-conflicting': 'the PR conflicts with its base, so passing checks establish nothing: resolve the conflict in a merge from the base, '
                       "then relaunch with adoptHead naming that merge; rebasedHead is only for a rewrite on the user's word",
     'stale-workflow': "this session's cached workflow definition calls a script the install lacks: relaunch from a fresh session, never by hand",
-    'pr-state-unread': 'the PR state could not be read before a GitHub write, so nothing was written: relaunch once `gh pr view` answers',
+    'pr-state-unread': 'the PR state could not be read before a GitHub write, so that write did not run: relaunch once `gh pr view` answers',
 }
 ENDED = {'pr-merged': 'the PR is merged; nothing to continue', 'pr-closed': 'the PR is closed; nothing to continue'}
 
