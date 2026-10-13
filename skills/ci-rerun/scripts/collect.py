@@ -58,8 +58,13 @@ each terminal failure row (`Failed:` or `Flash Failed:`) of its result table,
 signature ("<cell>: " and the outcome up to the two spaces before the board's
 captured output, without workspace paths and durations), lineNo, line, files,
 onBase, baseLineNo, baseLine, prior}; line and baseLine are 500-character
-previews of rows the saved logs hold whole. onBase compares the base run's row
-for the cell: same-failure, other-failure, passed, other (a skip), not-run, or
+previews of rows the saved logs hold whole. TinyUF2's hil_test.py prints instead
+a JSON report as its last stdout line: the log's last report gives a
+"<board> <step>" or "<board> cleanup" cell per failure, "<board> locked" signed
+by the lock alone, "<board> run" for a board failed otherwise, and "report
+error"/"report caveat"; its cell rows are rebuilt in the table's shape and
+stand in for the report line, whose number is their lineNo. onBase compares
+the base run's row for the cell: same-failure, other-failure, passed, other (a skip), not-run, or
 null without a comparable base run. A signature is the error's first segment,
 so two different errors can share one: same-failure and prior are leads. prior
 lists the verdicts stored for the same workflow, check, cell and signature in the
@@ -68,7 +73,7 @@ one when ambiguous, and is absent when none match; this head's own store counts
 only for runs a re-run replaced, not for the checks read now. The detail file's
 `priorErrors` names each head whose store could not be read and was left out. A cell row is left out of
 `diagnostics` and `shared`, on both sides; `firstError` still reads it. A failed
-step that ran hil_test.py but printed no parsed row gets `cellsError` instead.
+step that ran hil_test.py but printed no parsed failure row or report gets `cellsError` instead.
 When any check was read, the detail file lists the PR's `changed`
 paths (null with `changedError` when they could not be read or may be
 incomplete), and the PR head is read again after them. A --check that is no longer a failing check of the head is a stale
@@ -503,6 +508,9 @@ def evidence(lines, exit_line, omit=()):
 
 def hil_rows(lines):
     """{cell: (outcome, line number, line)}, the last row per cell: a retried cell's final result."""
+    report = uf2_report(lines)
+    if report:
+        return report_rows(*report)
     rows = {}
     for n, line in enumerate(lines, 1):
         m = HIL_ROW.match(line)
@@ -511,14 +519,56 @@ def hil_rows(lines):
     return rows
 
 
+def uf2_report(lines):
+    """(line number, report) of the last TinyUF2 hil_test.py report in the log, else None."""
+    for n in range(len(lines), 0, -1):
+        if lines[n - 1].startswith('{'):
+            try:
+                report = json.loads(lines[n - 1])
+            except ValueError:
+                continue
+            if isinstance(report, dict) and 'pass' in report and isinstance(report.get('results'), list):
+                return n, report
+    return None
+
+
+def report_rows(n, report):
+    """hil_rows' {cell: (outcome, n, row)} for a TinyUF2 report, each row rebuilt in the table's shape."""
+    found = []
+    for r in report['results']:
+        if r.get('locked'):
+            own = [('locked', False, 'board locked')]
+        else:
+            own = [(s.get('step'), s.get('pass') is True, s.get('detail') or '') for s in r.get('steps') or []]
+            cleanup = r.get('cleanup')
+            if cleanup:
+                own.append(('cleanup', cleanup.get('pass') is True, cleanup.get('detail') or cleanup.get('state') or ''))
+            if r.get('pass') is not True and all(ok for _, ok, _ in own):
+                own.append(('run', False, r.get('detail') or ''))
+        found += [(f'{r.get("board")} {name}', ok, detail) for name, ok, detail in own]
+    found += [(f'report {key}', False, report[key]) for key in ('error', 'caveat') if report.get(key)]
+    rows = {}
+    for cell, ok, detail in found:
+        outcome = 'OK' if ok else f'Failed: {detail}'
+        rows[cell] = (outcome, n, f'{cell.replace(" ", "  ", 1)}  ...  {outcome}')
+    return rows
+
+
+def with_rows(section, lines, rows):
+    """The section with a report line replaced by its failed cells' rows, which then stand for it as a table's rows do."""
+    report = {lines[n - 1] for _, n, row in rows.values() if lines[n - 1] != row}
+    failed = [row for outcome, _, row in rows.values() if outcome.startswith(HIL_FAILED)]
+    return [x for line in section for x in (failed if line in report else [line])]
+
+
 def cell_signature(cell, outcome):
     # The runner prints `Failed: <error>`, then two spaces before the board's captured
     # output, a `COMMAND FAILED:` tail or the duration: only the error is the same run to run.
     return f'{cell}: {signature(outcome.split("  ")[0])}'
 
 
-def failed_rows(lines):
-    return {cell: row for cell, row in hil_rows(lines).items() if row[0].startswith(HIL_FAILED)}
+def failed_rows(rows):
+    return {cell: row for cell, row in rows.items() if row[0].startswith(HIL_FAILED)}
 
 
 def on_base(cell, sig, theirs):
@@ -584,8 +634,10 @@ def actions(repo, head, base_ref, base_sha, job, folder, cache, record=None):
         return {**entry, 'log': None, 'cancelledBeforeStart': True, **evidence([], NEVER_STARTED), 'base': None, 'cells': []}
     full = actions_log(repo, job)
     section, exit_line = failed_steps(full)
-    failed = failed_rows(full)
-    entry.update(log=save(folder, f'actions-{job}.log', full), **evidence(section, exit_line, {row[2] for row in failed.values()}))
+    rows = hil_rows(full)
+    failed = failed_rows(rows)
+    entry.update(log=save(folder, f'actions-{job}.log', full),
+                 **evidence(with_rows(section, full, rows), exit_line, {row[2] for row in failed.values()}))
     base = base_run(repo, base_ref, base_sha, entry['workflow'], record['name'], cache)
     base_rows = None
     if base and (base['conclusion'] == 'failure' or (failed and base['conclusion'] == 'success')):
@@ -593,13 +645,14 @@ def actions(repo, head, base_ref, base_sha, job, folder, cache, record=None):
         base_rows = hil_rows(base_full)
         base = {**base, 'log': save(folder, f'base-actions-{base["jobId"]}.log', base_full)}
         if base['conclusion'] == 'failure':
-            theirs = [line for line in diagnostics(failed_steps(base_full)[0]) if line not in {row[2] for row in base_rows.values()}]
+            theirs = [line for line in diagnostics(with_rows(failed_steps(base_full)[0], base_full, base_rows))
+                      if line not in {row[2] for row in base_rows.values()}]
             ours = {signature(line) for line in entry['diagnostics']}
             base.update(shared=[line for line in theirs if signature(line) in ours][:KEEP], diagnostics=theirs[:KEEP])
     entry['base'] = base
     entry['cells'] = cells(failed, base_rows)
-    if not failed and any('hil_test.py' in line for line in section):
-        entry['cellsError'] = 'a failed hil_test.py step printed no result row this reads; read its log'
+    if not failed and not uf2_report(full) and any('hil_test.py' in line for line in section):
+        entry['cellsError'] = 'a failed hil_test.py step printed no result row or report this reads; read its log'
     return entry
 
 
