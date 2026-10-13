@@ -547,7 +547,7 @@ def uf2_shaped(report):
 def survived(survivors, detail):
     """A survivors failure's detail: their commands' names, then the two spaces cell_signature cuts at,
     so the pids and starts that change run to run stay out of the signature."""
-    names = ', '.join(Path(str((s.get('cmd') or ['?'])[0])).name for s in survivors)
+    names = ', '.join(Path(str(c[0])).name if isinstance(c := s.get('cmd'), list) and c else '?' for s in survivors)
     return f'survivors {names}  {detail}'
 
 

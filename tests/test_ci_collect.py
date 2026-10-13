@@ -536,6 +536,7 @@ class FailuresTest(unittest.TestCase):
         esptool = {'pid': 10, 'start': 124, 'cmd': ['/usr/bin/esptool', '--port', '/dev/ttyACM0']}
         self.assertEqual(sig(jlink, esptool), 'report pass: Failed: survivors JLinkExe, esptool')
         self.assertEqual(sig(jlink, esptool), sig({**jlink, 'pid': 90, 'start': 456}, {**esptool, 'pid': 91, 'start': None}))
+        self.assertEqual(sig({'cmd': 1}, {'cmd': 'JLinkExe -USB'}, {'cmd': []}, {}), 'report pass: Failed: survivors ?, ?, ?, ?')
 
     def test_a_cleanup_survivors_signature_names_their_commands_not_their_pids(self):
         def sig(pid, start):
