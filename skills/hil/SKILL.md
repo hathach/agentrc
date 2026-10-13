@@ -41,8 +41,9 @@ board, which may differ from its roster name. The helper that takes it, and its
 holder record (pid, reason), are the contract's Reservation.
 
 - Never stop a CI runner. Never kill a holder or release a hold you did not
-  take, except through the contract's Recovery procedure under a dispatch that
-  names that board.
+  take, except through the contract's Recovery procedure under a separate
+  recovery dispatch explicitly naming that board, its holder and the kill or
+  release; a refused hold alone never adds that scope.
 - Never pre-hold a board for a tool that locks itself: it refuses your hold as a
   conflict.
 - Report a refused hold with its holder and reason; wait only within the task's
