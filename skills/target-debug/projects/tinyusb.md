@@ -118,9 +118,9 @@ fad6bd546.
 - On rp2040/rp2350 the stock examples spend almost all their time in
   `get_bootsel_button` (the BOOTSEL button read runs from RAM with flash access
   off, and `board_button_read` is called every main-loop pass): a histogram
-  dominated by it is the idle loop, not a spin, and on RP2040 no place to stop
-  for a flash read (`families.md`, "RP2040 flash verification": use
-  `--symbol tud_task_ext`). verified 2026-09-18 fad6bd546 pico2_etm_trace:
+  dominated by it is the idle loop, not a spin. On RP2040 `get_bootsel_button`
+  is also no place to stop for a flash read (`families.md`, "RP2040 flash
+  verification": use `--symbol tud_task_ext`). verified 2026-09-18 fad6bd546 pico2_etm_trace:
   98.7 % of 300 PC samples, 97.8 % of traced instructions.
 - The trace init is `trace_etm_init()` in the family BSP, compiled in by the ETM
   build variant; trace starts there, not at reset. symbol checked in fad6bd546
