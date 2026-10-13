@@ -24,10 +24,11 @@ in front of you.**
   into ITCM on every boot, and it runs at 0x0000xxxx. Current source links the
   boot image to OCRAM (`_fcfb_origin` 0x20208000). verified 2026-10-12
   mimxrt1060_evk: IVT parse of the release BIN, PC samples.
-- The USB serial is the OCOTP CFG0..CFG3 words (0x401F4410..0x401F4440) as
-  little-endian bytes in hex (`board_usb_get_serial`), so it can be predicted
-  from a `mem32` before TinyUF2 runs. verified 2026-10-12 0.35.0
-  mimxrt1060_evk: the predicted serial enumerated.
+- The bootloader enumerates as 239a:0083
+  (`ports/mimxrt10xx/boards/imxrt1060_evk/board.h`). Its USB serial is the
+  OCOTP CFG0..CFG3 words (0x401F4410..0x401F4440) as little-endian bytes in
+  hex (`board_usb_get_serial`), so it can be predicted from a `mem32` before
+  TinyUF2 runs. verified 2026-10-12 0.35.0 mimxrt1060_evk: both as predicted.
 - Double-tap register: `SNVS->LPGPR[3]` = 0x400D410C, magic 0xF01669EF
   (`DBL_TAP_MAGIC`). Writing it over J-Link with the core halted, then
   SYSRESETREQ, enters DFU, and the bootloader leaves it 0. verified 2026-10-12

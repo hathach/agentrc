@@ -52,13 +52,13 @@ espressif_p4_function_ev: all three probe-side flashes followed those functions.
 
 Reading the host side (usbmon's limits, URB status codes) is `usb-kernel-debug`'s;
 these are the tinyusb names its symptoms point to, hypotheses with the check
-that discriminates, not verdicts. carried over; callback names checked in
-fad6bd546.
+that discriminates, not verdicts. carried over; callback names and the
+`usbd.c` EP0 stall paths checked in fad6bd546.
 
 | Host-side symptom | Target-side check |
 |---|---|
 | Enumeration stalls | The request after the last good control transfer (often CONFIG, a string, or the first class request) is what `tud_descriptor_*` / the control callback mishandled. |
-| Control STALL (`-32`) | A `tud_*_control_xfer_cb` returning `false`. |
+| Control STALL (`-32`) | A `tud_*_control_xfer_cb` returning `false`, or `usbd.c` rejecting the SETUP first: an unsupported standard request or recipient, an interface or endpoint no driver owns, a `tud_descriptor_*_cb` returning NULL. Follow the full SETUP through `process_setup_received` to where it returns `false`. |
 | Bulk / interrupt: no completions | `_usbd_dev.ep_status` and the port's transfer bookkeeping (dwc2: `xfer_status`). |
 | CDC read (`dd`/cat) hangs, IN endpoint idle | With DTR never seen, `tud_cdc_connected()` is false and the app stops sourcing TX; typical right after a bulk **write** phase. Confirm with `_cdcd_itf[0].line_state` bit 0. |
 | Wrong descriptors | `bLength` / `wTotalLength` against `tud_descriptor_configuration_cb`. |
