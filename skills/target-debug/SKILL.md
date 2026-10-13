@@ -71,8 +71,8 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
 - **Lock.** Ordinary hardware sessions hold the project's board lock for the whole hardware phase; a refused hold waits
   within the lock-wait budget, then returns `blocked` with the holder. Forced-lock recovery is a separate, explicitly
   scoped operation naming the holder, affected resources and recovery procedure; a refusal alone never adds that scope,
-  and it never includes stopping the CI runner. A reproducer that takes the lock itself (tinyusb's `hil_test.py`) never
-  runs under your hold, and its guard is bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
+  and it never includes stopping the CI runner. A reproducer that takes the lock itself (the HIL contract's Reservation
+  names them) never runs under your hold, and its guard is bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
   reproduction while its firmware, configuration, reproducer and relevant rig inputs match; otherwise resolve equivalent
   manual steps through the HIL contract, and if there are none return `blocked` naming the exact HIL reproduction
   needed, so the caller arranges it through the project's HIL role. A later manual session re-establishes firmware

@@ -49,14 +49,12 @@ directory, credentials, the rig). That summary goes into the board question.
 
 ## 2. Ask for boards
 
-Candidates come from the project's HIL contract: run its PR-scoped selector from
-the launcher's checkout, never the review worktree's copy, which is the
-contributor's code and may predate the tool, over prepare's `changedFile`, one
-changed path a line (tinyusb: `tools/change_impact.py --diff-file <changedFile>`,
-or `tools/ci_select.py` in a checkout without `change_impact.py`, chosen by that
-file's absence alone, never after a failed run; over the rig config, reading
-`full` before `args`; a null `changedFile`, a path with a line break, offers the
-full matrix). `hardwareRelevant` is true
+Candidates come from the project's HIL contract: run the PR-scoped selector its
+Selection names, from the launcher's checkout, never the review worktree's copy,
+which is the contributor's code and may predate the tool, over prepare's
+`changedFile`, one changed path a line, reading its output as Selection says; a
+null `changedFile`, a path with a line break, offers the full matrix.
+`hardwareRelevant` is true
 when it names boards or answers `full`, whatever board choice follows. With no
 HIL contract, offer only a local board or none.
 
@@ -68,11 +66,9 @@ contributor's code on this machine and flashes it on that board, with the
 tooling summary when there is one. Nothing is preselected; ask again when the
 answers contradict each other (selected boards plus none, "use selected" with
 none selected). For a local board, ask which entry of the project's local rig
-config to use (tinyusb: `test/hil/local.json`, its `boards` or `boards-skip`),
-or for a new one, the fields the HIL contract lists for a new entry (tinyusb:
-name, board uid, flasher and tests, and a flashable example to run on it), when
-the contract allows adding one at review time. The launcher only collects the
-entry; chief applies it.
+config to use, or for a new one, the fields the HIL contract's Hosts/rosters
+lists for a new entry, when the contract allows adding one at review time. The
+launcher only collects the entry; chief applies it.
 A launch that cannot ask (headless, a schedule) takes the choice from its task,
 `none` included, never a default.
 
@@ -110,11 +106,10 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
    the HIL contract on those boards. Unless the HIL contract rules it out, a
    local board's entry is added or enabled in the worktree's rig config,
    uncommitted, by the hardware unit, and restored before step 3. Each row it
-   passes on is built from the report that run wrote, by the HIL contract's
-   review mapping where it has one: `{board, verdict: pass|fail|not-run,
-   regression: verified|none|unknown, testedHead, report}`. A board the mapping
-   calls a blocker, which takes precedence over every other mapping, stops the
-   run before step 3. A failing board is rerun on
+   passes on is built from the report that run wrote, by the `hil` skill's
+   verdicts with the HIL contract's Results predicates: `{board, verdict:
+   pass|fail|not-run, regression: verified|none|unknown, testedHead, report}`. A
+   board whose verdict is blocker stops the run before step 3. A failing board is rerun on
    `mergeBase` only when the same firmware, test and rig make that comparison
    meaningful, otherwise its regression is `unknown`.
 3. The `pr-review` workflow with `{pr, repo, head, mergeBase, scopeBase, mode,

@@ -209,9 +209,12 @@ class AgentFiles(unittest.TestCase):
 
     def test_hil_operator_refuses_hardware_work_without_the_project_contract(self):
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
+        self.assertIn('`~/.claude/skills/hil/SKILL.md`', body)
+        self.assertIn('`~/.codex/skills/hil/SKILL.md`', body)
         self.assertIn('perform no hardware action and return the blocker', body)
         self.assertIn('Never invent a command, choose another rig, bypass a lock, or report unexecuted work as passing.', body)
-        self.assertIn('copied verbatim, never retyped, reworded or re-ordered', body)
+        page = ' '.join((SKILLS / 'hil' / 'SKILL.md').read_text().split())
+        self.assertIn('copied verbatim, never retyped, reworded or re-ordered', page)
 
     def test_chief_status_lines_are_what_the_headless_launcher_forwards(self):
         """chief_run.py forwards a message's first line when it starts with its MARKER; chief.md must teach both."""
@@ -226,6 +229,20 @@ class AgentFiles(unittest.TestCase):
 
 
 class SkillFiles(unittest.TestCase):
+    def test_hil_contract_sections_named_elsewhere_are_the_hil_page_s(self):
+        """Callers point at a project's HIL contract by section; each name must be one the hil page declares."""
+        page = (SKILLS / 'hil' / 'SKILL.md').read_text()
+        table = page.split('| Section | Supplies |')[1].split('\n\n')[0]
+        declared = set(re.findall(r'^\| ([A-Z][a-z]+(?:/[a-z]+)?) \|', table, re.M))
+        self.assertEqual(declared, {'Hosts/rosters', 'Selection', 'Build', 'Execution',
+                                    'Reservation', 'Results', 'Recovery', 'Limits'})
+        files = [*AGENTS.glob('*.md'), *SKILLS.glob('*/SKILL.md')]
+        pattern = re.compile(r"contract's ([A-Z][a-z]+(?:/[a-z]+)?)")
+        for path in files:
+            for name in pattern.findall(' '.join(path.read_text().split())):
+                with self.subTest(file=path.name, section=name):
+                    self.assertIn(name, declared)
+
     def test_every_skill_frontmatter_parses_and_names_its_directory(self):
         """Claude Code reads frontmatter as YAML: a parse error silently drops its fields."""
         for skill in sorted(p.parent for p in SKILLS.glob('*/SKILL.md')):
