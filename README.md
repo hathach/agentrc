@@ -174,11 +174,12 @@ worktree, and the `headless-chief` hook (`--skill` registers it) denies every
 prompt itself loads before any tool call and is not covered.
 
 For headless PR publishing, follow `agents/chief.md`'s Authorization exception:
-the human's request to launch chief to babysit a PR, or their yes to the
-offer, is the grant, with no further question. Include that message verbatim
-(with the offer it answered when it is a yes, and any later restriction), the
-PR resolved from it (repository, PR URL, head repository and branch, expected
-HEAD, worktree) and the task scope, and, when a pr-babysit launch continues an
+the human's request to launch chief to babysit a PR, their yes to the offer, or
+their request to open a new PR under the user-wide rule, is the grant, with no
+further question. Include that message verbatim (with the offer it answered
+when it is a yes, and any later restriction), the PR resolved from it
+(repository, PR URL, head repository and branch, expected HEAD, worktree) and
+the task scope, and, when a pr-babysit launch continues an
 earlier chief's run, that run's last reported `stateRef`. The task scope names
 the review scope: the whole PR, or takeover-only (earlier PR commits are context,
 the takeover HEAD is the task base) for a task limited to the repairs it

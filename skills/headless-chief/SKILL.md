@@ -67,7 +67,8 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    | 127 | `claude` could not start |
    | other | claude's own status; 128 + N when killed by signal N |
 
-Leave the worktree to chief until it exits. A signal to the launcher is passed
+Leave the worktree to chief until it exits; remaining in-scope work goes into
+its task. A signal to the launcher is passed
 on to chief; the launcher still writes the exit line. A relaunch needs a new
 `--out`; its grant follows the README's headless recipe.
 

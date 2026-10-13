@@ -128,7 +128,8 @@ class AgentFiles(unittest.TestCase):
                        'no issues withholds the follow-up issue rule', 'no Sonar marking sets `markSonar: false`'):
             self.assertIn(phrase, default)
         exception = body.split('Exception for a headless PR launch:')[1].split('Follow-up issue rule:')[0]
-        for phrase in ("or their yes to that session's offer to launch one, grants this chief invocation what the interactive default grants on that PR, narrowed the same way",
+        for phrase in ("their yes to that session's offer to launch one, or their request that it open the PR under the user-wide rule in your own instructions",
+                       '(a copy of that rule in the launch task does not count), grants this chief invocation what the interactive default grants on that PR, narrowed the same way',
                        'The launch task carries that message verbatim', 'Those fields bind the grant to that one PR and widen nothing',
                        'a mismatch stops publishing', 'Accept it during this chief invocation under the provenance rule above',
                        'a relaunch task may carry the same message copied verbatim from an earlier launch task for this PR',
@@ -147,7 +148,10 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('a new chief invocation, including a restart or resumed recovery, requires a fresh exchange', review)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
         rules = ' '.join((AGENTS.parent / 'instructions' / 'user.md').read_text().split())
-        self.assertIn('My request to launch chief to babysit a PR, or my yes to that offer, is the grant unless I narrow it', rules)
+        for phrase in ('Right after opening a new PR on my request, launch a headless `chief` in its worktree to babysit it',
+                       'After pushing to an existing PR that no chief is babysitting, ask me whether to launch one',
+                       'My request to open the PR, my request to launch chief to babysit a PR, or my yes to that offer, is the grant unless I narrow it'):
+            self.assertIn(phrase, rules)
         self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '

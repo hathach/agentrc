@@ -176,13 +176,17 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   outcome and any disagreement that remains for me.
 
 # Pull requests
-- Right after opening a PR, or pushing to one that no chief is babysitting,
-  ask me whether to launch a headless `chief` in its worktree to babysit it
-  through `pr-babysit` with `autoPush: true` and `markSonar: true`, unless I
-  already asked for one.
-  My request to launch chief to babysit a PR, or my yes to that offer, is the
-  grant unless I narrow it: launch without a further question, following
-  `~/code/agentrc/README.md`'s headless PR publishing recipe.
+- Right after opening a new PR on my request, launch a headless `chief` in
+  its worktree to babysit it through `pr-babysit` with `autoPush: true` and
+  `markSonar: true`, without asking, unless I declined babysitting. After
+  pushing to an existing PR that no chief is babysitting, ask me whether to
+  launch one, unless I already asked for one or declined; an unfinished chief
+  task on it that still holds my grant continues under the headless recipe
+  without asking.
+  My request to open the PR, my request to launch chief to babysit a PR, or
+  my yes to that offer, is the grant unless I narrow it: launch without a
+  further question, following `~/code/agentrc/README.md`'s headless PR
+  publishing recipe.
 - "Launch chief", headless, always means the `headless-chief` skill, never a
   bare `claude -p --agent chief`, even where a repo recipe names one.
 - Standing grant: on a PR I asked `pr-review` to review, its `post.py` may
