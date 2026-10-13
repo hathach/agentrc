@@ -31,9 +31,9 @@ and tools it names, not for the whole family.
   CDC echo still worked and dmesg logged no new enumeration. An earlier run of
   the script's first version did coincide with one disconnect and
   re-enumeration (14:46:42), and the next session logged "external reset
-  detected" (cause not established), and OpenOCD's default SMP pair failed
-  `resume` with "core1 not halted", leaving core 0 halted: hence the script
-  fails on a detected reset and sets `USE_CORE 0`.
+  detected"; cause not established, so the script now fails on a detected
+  reset. OpenOCD's default SMP pair failed `resume` with "core1 not halted"
+  and left core 0 halted; the script sets `USE_CORE 0`.
 - Observed 2026-09-18 bdb6b90fc raspberry_pi_pico (htpc, CMSIS-DAP): a bare
   `halt` that stopped in `get_bootsel_button`, then `verify_image` (all
   zeroes), then `reset` left the board failing enumeration ("device not
