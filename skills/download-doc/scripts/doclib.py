@@ -75,7 +75,7 @@ def last_modified(url: str) -> str | None:
         return m.group(1).strip()
     # Without this a refused HEAD reads only as an unparseable revision in the plan.
     status = re.findall(r"^HTTP/\S+ (\d{3})", p.stdout or "", re.M)
-    why = f"HTTP {status[-1]}" if status else f"curl exit {p.returncode}"
+    why = f"curl exit {p.returncode}" if p.returncode or not status else f"HTTP {status[-1]}"
     print(f"  note: no Last-Modified from {url} ({why})", file=sys.stderr)
     return None
 

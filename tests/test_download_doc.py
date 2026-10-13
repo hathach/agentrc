@@ -279,7 +279,8 @@ class LastModified(unittest.TestCase):
 
     def test_a_missing_last_modified_names_the_final_status(self):
         for out, code, why in (('HTTP/2 301\r\nlocation: /y.pdf\r\n\r\nHTTP/2 403\r\n', 0, 'HTTP 403'),
-                               ('', 28, 'curl exit 28')):
+                               ('', 28, 'curl exit 28'),
+                               ('HTTP/2 301\r\nlocation: /y.pdf\r\n', 6, 'curl exit 6')):
             with self.subTest(why):
                 version, err = self.head(lambda argv, **kw: subprocess.CompletedProcess(argv, code, out, ''))
                 self.assertIsNone(version)
