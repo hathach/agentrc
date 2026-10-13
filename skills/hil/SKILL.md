@@ -50,7 +50,8 @@ holder record (pid, reason), are the contract's Reservation.
   (`role: cleanup-holder`) never frees on its own: it is a recovery blocker for
   every project, never waited on.
 - Bypassing a lock (`HIL_NO_BOARD_LOCK=1`, or the contract's equivalent) needs
-  task scope naming that board; a refusal alone never adds it.
+  task scope explicitly naming forcing that board; a refusal alone never adds
+  it.
 - A rig-wide operation (hub power, root-port cycle, controller rebind) holds
   every board on the host first, across every project's roster there. A
   partial hold is worse than none: it reads as protection.
