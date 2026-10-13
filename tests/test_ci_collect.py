@@ -515,19 +515,37 @@ class FailuresTest(unittest.TestCase):
         invalidate = {'pass': True, 'caveat': '', 'survivors': [],
                       'results': [{'board': 'a', 'cleanup': {'pass': True, 'state': 'bootloader invalidated',
                                                              'evidence': {'zeroPage': '0x0', 'verified': True}}}]}
-        self.assertEqual(collect.report_rows(7, install), {})
-        for report in (restore, invalidate):
-            self.assertEqual([row[0] for row in collect.report_rows(7, report).values()], ['OK'])
+        for report in (install, restore, invalidate):
+            self.assertEqual({row[0] for row in collect.report_rows(7, report).values()}, {'OK'})
 
     def test_failed_tinyuf2_manual_reports_have_a_failed_cell(self):
         survivor = [{'pid': 9, 'start': 123, 'cmd': ['JLinkExe', '-nogui', '1']}]
         install = {'pass': False, 'caveat': '', 'survivors': survivor,
                    'results': [{'board': 'a', 'installed': {'path': 'tinyuf2.bin', 'sha256': '00'}}]}
         refused = {'pass': False, 'caveat': '', 'results': [], 'error': 'a J-Link install takes --firmware and --sha256'}
-        self.assertEqual({cell: row[0] for cell, row in collect.report_rows(7, install).items()},
-                         {'report pass': f'Failed: survivors {json.dumps(survivor)}'})
-        self.assertEqual({cell: row[0] for cell, row in collect.report_rows(7, refused).items()},
-                         {'report error': 'Failed: a J-Link install takes --firmware and --sha256'})
+        failed = lambda report: {cell: row[0] for cell, row in collect.failed_rows(collect.report_rows(7, report)).items()}
+        self.assertEqual(failed(install), {'report pass': f'Failed: survivors JLinkExe  {json.dumps(survivor)}'})
+        self.assertEqual(failed(refused), {'report error': 'Failed: a J-Link install takes --firmware and --sha256'})
+        self.assertEqual(failed({'pass': False, 'caveat': '', 'results': []}), {'report pass': 'Failed: pass is not true'})
+
+    def test_a_survivors_signature_names_their_commands_not_their_pids(self):
+        def sig(*survivors):
+            outcome = collect.report_rows(7, {'pass': False, 'caveat': '', 'results': [], 'survivors': list(survivors)})['report pass'][0]
+            return collect.cell_signature('report pass', outcome)
+        jlink = {'pid': 9, 'start': 123, 'cmd': ['JLinkExe', '-USB', '1']}
+        esptool = {'pid': 10, 'start': 124, 'cmd': ['/usr/bin/esptool', '--port', '/dev/ttyACM0']}
+        self.assertEqual(sig(jlink, esptool), 'report pass: Failed: survivors JLinkExe, esptool')
+        self.assertEqual(sig(jlink, esptool), sig({**jlink, 'pid': 90, 'start': 456}, {**esptool, 'pid': 91, 'start': None}))
+
+    def test_report_level_cells_are_passed_against_a_base_report_and_not_run_without_one(self):
+        self.logs['3'] = self.uf2_log('{"pass": false, "caveat": "", "error": "roster rejected", "results": []}')
+        self.logs['40'] = self.uf2_log('pass.json')
+        self.assertEqual([(x['cell'], x['onBase'], x['baseLineNo']) for x in self.entries(JOB.format(3))[0]['cells']],
+                         [('report error', 'passed', 8)])
+        self.logs['3'] = self.uf2_log('{"pass": false, "caveat": "", "results": [], "survivors": [{"pid": 9, "start": 1, "cmd": ["JLinkExe"]}]}')
+        self.assertEqual([(x['cell'], x['onBase']) for x in self.entries(JOB.format(3))[0]['cells']], [('report pass', 'passed')])
+        self.logs['40'] = log(*STEP[:9], 'Total failed: 1', *STEP[11:])
+        self.assertEqual([x['onBase'] for x in self.entries(JOB.format(3))[0]['cells']], ['not-run'], 'a tinyusb base has no report')
 
     def test_the_last_tinyuf2_report_counts_and_other_json_is_not_one(self):
         fail, ok = (UF2 / 'fail.json').read_text().strip(), (UF2 / 'pass.json').read_text().strip()

@@ -61,9 +61,12 @@ onBase, baseLineNo, baseLine, prior}; line and baseLine are 500-character
 previews of rows the saved logs hold whole. TinyUF2's hil_test.py prints instead
 a JSON report as its last stdout line: the log's last report gives a
 "<board> <step>" or "<board> cleanup" cell per failure, "<board> locked" signed
-by the lock alone, "<board> run" for a board failed otherwise, and "report
-error"/"report caveat"; its cell rows are rebuilt in the table's shape and
-stand in for the report line, whose number is their lineNo. onBase compares
+by the lock alone, "<board> run" for a board failed otherwise, "report
+error"/"report caveat", and "report pass" when the report's pass is not true but
+no other cell failed (survivors alone, signed by their commands' names; pid and
+start follow the signature). A report's report-level cells it did not fail read
+OK, so they are passed against a base report; its cell rows are rebuilt in the
+table's shape and stand in for the report line, whose number is their lineNo. onBase compares
 the base run's row for the cell: same-failure, other-failure, passed, other (a skip), not-run, or
 null without a comparable base run. A signature is the error's first segment,
 so two different errors can share one: same-failure and prior are leads. prior
@@ -547,10 +550,13 @@ def report_rows(n, report):
             if 'ran' in r and r.get('pass') is not True and all(ok for _, ok, _ in own):
                 own.append(('run', False, r.get('detail') or ''))
         found += [(f'{r.get("board")} {name}', ok, detail) for name, ok, detail in own]
-    found += [(f'report {key}', False, report[key]) for key in ('error', 'caveat') if report.get(key)]
-    if report.get('pass') is not True and all(ok for _, ok, _ in found):  # e.g. survivors alone fail a manual operation
-        survivors = report.get('survivors')
-        found.append(('report pass', False, f'survivors {json.dumps(survivors)}' if survivors else 'pass is not true'))
+    # report-level cells read OK when not failed, so a base report places them as passed
+    found += [(f'report {key}', not report.get(key), report.get(key)) for key in ('error', 'caveat')]
+    survivors = report.get('survivors')
+    # pid and start change run to run, so they follow the two spaces cell_signature cuts at
+    names = ', '.join(Path(str((s.get('cmd') or ['?'])[0])).name for s in survivors or [])
+    found.append(('report pass', report.get('pass') is True or not all(ok for _, ok, _ in found),  # e.g. survivors alone
+                  f'survivors {names}  {json.dumps(survivors)}' if survivors else 'pass is not true'))
     rows = {}
     for cell, ok, detail in found:
         outcome = 'OK' if ok else f'Failed: {detail}'
