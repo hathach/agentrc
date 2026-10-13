@@ -543,10 +543,14 @@ def report_rows(n, report):
             cleanup = r.get('cleanup')
             if cleanup:
                 own.append(('cleanup', cleanup.get('pass') is True, cleanup.get('detail') or cleanup.get('state') or ''))
-            if 'ran' in r and r.get('pass') is not True and all(ok for _, ok, _ in own):  # install/invalidate rows carry no run verdict
+            # install and restore (invalidate on origin/master) rows carry no run verdict
+            if 'ran' in r and r.get('pass') is not True and all(ok for _, ok, _ in own):
                 own.append(('run', False, r.get('detail') or ''))
         found += [(f'{r.get("board")} {name}', ok, detail) for name, ok, detail in own]
     found += [(f'report {key}', False, report[key]) for key in ('error', 'caveat') if report.get(key)]
+    if report.get('pass') is not True and all(ok for _, ok, _ in found):  # e.g. survivors alone fail a manual operation
+        survivors = report.get('survivors')
+        found.append(('report pass', False, f'survivors {json.dumps(survivors)}' if survivors else 'pass is not true'))
     rows = {}
     for cell, ok, detail in found:
         outcome = 'OK' if ok else f'Failed: {detail}'

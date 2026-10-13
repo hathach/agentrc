@@ -506,11 +506,28 @@ class FailuresTest(unittest.TestCase):
                                   'report error': 'Failed: roster rejected',
                                   'report caveat': 'Failed: run ended without a report; board state unknown'})
 
-    def test_passing_tinyuf2_install_and_invalidate_reports_have_no_failed_cells(self):
-        install = {'pass': True, 'caveat': '', 'results': [{'board': 'a', 'installed': {'path': 'tinyuf2.bin', 'sha256': '00'}}]}
-        invalidate = {'pass': True, 'caveat': '', 'results': [{'board': 'a', 'firmware': {}, 'cleanup': {'pass': True, 'state': 'bootloader restored'}}]}
+    def test_passing_tinyuf2_install_restore_and_invalidate_reports_have_no_failed_cells(self):
+        firmware = json.loads((UF2 / 'pass.json').read_text())['results'][0]['firmware']
+        install = {'pass': True, 'caveat': '', 'survivors': [],
+                   'results': [{'board': 'a', 'installed': {'path': 'tinyuf2.bin', 'sha256': '00'}}]}
+        restore = {'pass': True, 'caveat': '', 'survivors': [],
+                   'results': [{'board': 'a', 'firmware': firmware, 'cleanup': {'pass': True, 'state': 'blinky copied', 'evidence': {}}}]}
+        invalidate = {'pass': True, 'caveat': '', 'survivors': [],
+                      'results': [{'board': 'a', 'cleanup': {'pass': True, 'state': 'bootloader invalidated',
+                                                             'evidence': {'zeroPage': '0x0', 'verified': True}}}]}
         self.assertEqual(collect.report_rows(7, install), {})
-        self.assertEqual([row[0] for row in collect.report_rows(7, invalidate).values()], ['OK'])
+        for report in (restore, invalidate):
+            self.assertEqual([row[0] for row in collect.report_rows(7, report).values()], ['OK'])
+
+    def test_failed_tinyuf2_manual_reports_have_a_failed_cell(self):
+        survivor = [{'pid': 9, 'start': 123, 'cmd': ['JLinkExe', '-nogui', '1']}]
+        install = {'pass': False, 'caveat': '', 'survivors': survivor,
+                   'results': [{'board': 'a', 'installed': {'path': 'tinyuf2.bin', 'sha256': '00'}}]}
+        refused = {'pass': False, 'caveat': '', 'results': [], 'error': 'a J-Link install takes --firmware and --sha256'}
+        self.assertEqual({cell: row[0] for cell, row in collect.report_rows(7, install).items()},
+                         {'report pass': f'Failed: survivors {json.dumps(survivor)}'})
+        self.assertEqual({cell: row[0] for cell, row in collect.report_rows(7, refused).items()},
+                         {'report error': 'Failed: a J-Link install takes --firmware and --sha256'})
 
     def test_the_last_tinyuf2_report_counts_and_other_json_is_not_one(self):
         fail, ok = (UF2 / 'fail.json').read_text().strip(), (UF2 / 'pass.json').read_text().strip()
