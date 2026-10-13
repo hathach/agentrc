@@ -15,6 +15,7 @@ missing. Each script's docstring says what it reports.
 S=~/.claude/skills/pr-babysit/scripts
 python3 $S/preflight.py --pr N [--needs P]   # the checkout and the PR it must stay; P a script the workflow calls
 python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
+python3 $S/preflight.py --state N            # before a GitHub write: is the PR still OPEN?
 python3 $S/harvest.py --pr N --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
 python3 $S/hooks.py 'src/a.c' 'docs/b.rst'   # from the checkout's top level
 python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
@@ -31,7 +32,7 @@ python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkou
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch and lists the `blockers` to settle before continuing.
-A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first and goes on only for an OPEN PR, `push.py` included; an unreadable state stops `pr-state-unread`.
+A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 `commits.py commit` stages and commits exactly its paths; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back

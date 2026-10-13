@@ -190,6 +190,29 @@ class PreflightTest(unittest.TestCase):
             code, out = self.pin()
             self.assertEqual((code, out['prState']), (0, state))
 
+    def test_a_pr_no_longer_open_whose_head_fork_is_gone_is_pinned_with_its_state(self):
+        for state in ('MERGED', 'CLOSED'):
+            for gone in ({'headRepository': None}, {'headRepository': None, 'headRepositoryOwner': None}):
+                self.fake_gh(json.dumps({**VIEW, 'state': state, **gone}))
+                code, out = self.pin()
+                self.assertEqual((code, out['prState'], out['prRepo']), (0, state, ''), gone)
+        self.fake_gh(json.dumps({**VIEW, 'headRepositoryOwner': None}))
+        self.assertEqual(self.pin()[0], 2, 'an open PR is not pinned without its head repository')
+
+    def test_state_reads_the_pr_state_alone(self):
+        for state in ('OPEN', 'MERGED', 'CLOSED'):
+            self.fake_gh(json.dumps({'state': state}))
+            self.assertEqual(self.pin('--state', '7'), (0, {'state': state}))
+        self.assertEqual(self.gh_calls()[-1], 'pr view 7 --json state')
+        for answer, code, want in (('', 1, 'gh pr view'), ('not json', 0, 'unexpected answer'), ('{}', 0, 'unexpected answer'),
+                                   (json.dumps({'state': 'DRAFT'}), 0, "state 'DRAFT'")):
+            self.fake_gh(answer, code)
+            status, out = self.pin('--state', '7')
+            self.assertEqual(status, 2, answer)
+            self.assertIn(want, out['error'], answer)
+        status, out = self.pin('--state', '7', '--needs', 'x')
+        self.assertEqual((status, out['error']), (2, 'usage: --needs is for --pr'))
+
     def test_recheck_reads_the_local_facts_without_gh(self):
         self.git('remote', 'set-url', '--push', 'origin', 'git@github.com:someone/tinyusb.git')
         self.fake_gh('', 1)

@@ -151,7 +151,7 @@ class PushTest(unittest.TestCase):
         for script in ('exit 1', 'echo'):
             self.fake_gh(script)
             code, out = self.publish(self.a, open_pr=7)
-            self.assertEqual((code, out['pushed'], out['heads'], out['prState']), (0, False, [], None))
+            self.assertEqual((code, out['pushed'], out['heads'], out['prState']), (0, False, [], 'UNREAD'))
             self.assertEqual(out['detail'], 'PR #7 state is unreadable: nothing pushed')
             self.assertEqual(self.remote_head(self.a), '')
 

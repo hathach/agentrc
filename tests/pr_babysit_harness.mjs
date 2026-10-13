@@ -241,7 +241,7 @@ async function run(opts = {}) {
       return push
     }
     if (label.startsWith('prstate#')) {
-      // gh pr view --json state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
+      // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
       const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
       return state === null ? null : conforms(options.schema, { state }, label)
     }
@@ -1399,7 +1399,7 @@ test('the publisher stages exactly the owned paths, never a protected one', asyn
   assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888\``), push.prompt)
   assert.match(push.prompt, /Committing, amending and forcing nothing/)
   // The stage cannot commit and already knows the SHA, so it is asked for neither.
-  assert.deepEqual(push.schema.required, ['pushed', 'detail', 'heads'])
+  assert.deepEqual(push.schema.required, ['pushed', 'detail', 'heads', 'prState'])
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
 })
 
@@ -2268,6 +2268,12 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
   assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
   const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
   assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
+  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `python3 ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888` /)
+  // A copy that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
+  const miscopied = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
+  assert.equal(miscopied.result.reason, 'pr-state-unread')
+  assert.deepEqual(writes(miscopied.labels), ['prstate#1-replies', 'prstate#1-replies.retry'])
+  assert.ok(miscopied.logs.includes('prstate#1-replies: the relayed copy does not match its seal'), miscopied.logs.join('\n'))
 })
 
 test('the CI judge, which may re-run checks, is dispatched only for a PR read OPEN just before', async () => {
@@ -2293,12 +2299,13 @@ test('the CodeRabbit trigger and a caller settlement read the PR state first', a
   assert.deepEqual(settle.labels.filter(l => /^(prstate|reuse)#/.test(l)), ['prstate#3-reuse'])
 })
 
-test('a push refused on an unreadable PR state stops push-failed, nothing published', async () => {
+test('a push refused on an unreadable PR state stops pr-state-unread, nothing published', async () => {
   const { result } = await run({
     reviews: oneValid, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 3 },
-    push: { pushed: false, detail: 'PR #3888 state is unreadable: nothing pushed', heads: [], prState: null },
+    push: { pushed: false, detail: 'PR #3888 state is unreadable: nothing pushed', heads: [], prState: 'UNREAD' },
   })
-  assert.equal(result.reason, 'push-failed')
+  assert.equal(result.reason, 'pr-state-unread')
+  assert.equal(result.history[0].reviewPushFailed.prState, 'unread')
   assert.equal(result.state.pending.stage, 'push-failed')
 })
 
@@ -5492,7 +5499,7 @@ test('a successful adoption push with no confirming read-back is unknown', async
     ['unreadable URL', receiptOf(null, ADOPT, 'pushed'), 'no read-back from git@github.com:hathach/tinyusb.git'],
     ['unreadable PR', receiptOf(ADOPT, null, 'pushed'), 'PR #3888 head unreadable after the push'],
     ['contradictory PR', receiptOf(ADOPT, FOREIGN, 'pushed'), `PR #3888 heads ${FOREIGN.slice(0, 7)} after the push, not ${ADOPT.slice(0, 7)}`],
-    ['script error', { error: 'no JSON line', pushed: false, detail: '', heads: [] }, 'no JSON line'],
+    ['script error', { error: 'no JSON line', pushed: false, detail: '', heads: [], prState: '' }, 'no JSON line'],
     ['other destination', { ...receiptOf(ADOPT, ADOPT, 'pushed'), heads: [{ url: 'git@evil.example:x.git', head: ADOPT }] }, 'the receipt names git@evil.example:x.git'],
   ]) {
     const state = adoptionState()

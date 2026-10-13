@@ -6,7 +6,7 @@
 Refuses unless R's push URLs (`git remote get-url --push --all R`) are exactly
 the U given, in order: those are the destinations the caller vetted. With
 --open-pr, it reads PR N's state first and, unless it reads OPEN, pushes
-nothing: pushed false, heads empty and prState MERGED, CLOSED or null when
+nothing: pushed false, heads empty and prState MERGED, CLOSED or UNREAD when
 unreadable. Then runs
 `git push R S:refs/heads/B`, no flags, and reads refs/heads/B back from every
 U with `git ls-remote`, never through R, whose fetch URL may differ. With
@@ -14,7 +14,7 @@ U with `git ls-remote`, never through R, whose fetch URL may differ. With
 since GitHub takes a moment to see a push.
 
 stdout ends with one JSON line {pushed, detail, heads: [{url, head}],
-prState?, prHead?, seal} (seal: facts.sealed): pushed is git push's exit status, detail git's refusal line or else
+prState? (--open-pr), prHead? (--pr), seal} (seal: facts.sealed): pushed is git push's exit status, detail git's refusal line or else
 its last stderr line, head the SHA the branch holds at that URL, "" when the
 branch is absent there, null when it could not be read; prHead is null when
 unreadable. A failed read is never a sign that nothing was pushed. Exit 0 with
@@ -55,7 +55,7 @@ def pr_head(pr, sha):
 
 def pr_state(pr):
     code, out, _ = attempt('gh', 'pr', 'view', str(pr), '--json', 'state', '-q', '.state')
-    return None if code else out.strip() or None
+    return 'UNREAD' if code else out.strip() or 'UNREAD'
 
 
 def publish(argv):
@@ -76,7 +76,7 @@ def publish(argv):
         raise Unusable(f"{a.remote} now pushes to {', '.join(out.splitlines()) or '(nowhere)'}, not {', '.join(a.urls)}")
     state = pr_state(a.open_pr) if a.open_pr is not None else None
     if a.open_pr is not None and state != 'OPEN':
-        why = f'is {state.lower()}' if state else 'state is unreadable'
+        why = 'state is unreadable' if state == 'UNREAD' else f'is {state.lower()}'
         return {'pushed': False, 'detail': f'PR #{a.open_pr} {why}: nothing pushed', 'heads': [], 'prState': state}
     code, _, err = attempt('git', 'push', a.remote, f'{a.sha}:refs/heads/{a.branch}')
     said = [line for line in err.splitlines() if line.strip() and not line.startswith('hint:')]

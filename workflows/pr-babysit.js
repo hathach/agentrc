@@ -465,7 +465,8 @@ const BUILD_RUN = withSeal({
 })
 const PUSH = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['pushed', 'detail', 'heads'],
+  // prState: pushExact always passes --open-pr.
+  required: ['pushed', 'detail', 'heads', 'prState'],
   properties: {
     error: { type: 'string' },
     pushed: { type: 'boolean' }, detail: { type: 'string' },
@@ -474,7 +475,7 @@ const PUSH = withSeal({
       items: { type: 'object', additionalProperties: false, required: ['url', 'head'],
         properties: { url: { type: 'string' }, head: { type: ['string', 'null'] } } },
     },
-    prState: { type: ['string', 'null'] }, prHead: { type: ['string', 'null'] },
+    prState: { type: 'string' }, prHead: { type: ['string', 'null'] },
   },
 })
 const SONAR = withSeal({
@@ -1434,10 +1435,10 @@ const pushExact = async (sha, label, prToo = false) => {
   if (!r) return null
   const unknown = (detail) => ({ pass: false, detail, published: 'unknown' })
   if (r.error) return unknown(r.error)
-  // push.py pushed nothing to a PR it did not read OPEN; the caller stops on a merged or closed one. A retry cannot prove the first attempt did not land.
+  // push.py pushed nothing to a PR it did not read OPEN; the caller stops on it. A retry cannot prove the first attempt did not land.
   if (r.prState !== 'OPEN') {
-    const ended = r.prState === 'MERGED' || r.prState === 'CLOSED' ? { prState: r.prState.toLowerCase() } : {}
-    return { pass: false, detail: r.detail, ...ended, ...(first ? {} : { published: 'unknown' }) }
+    const prState = r.prState === 'MERGED' || r.prState === 'CLOSED' ? r.prState.toLowerCase() : 'unread'
+    return { pass: false, detail: r.detail, prState, ...(first ? {} : { published: 'unknown' }) }
   }
   if (r.heads.map(h => h.url).join('\n') !== pinned.pushUrls.join('\n')) return unknown(`the receipt names ${r.heads.map(h => h.url).join(', ') || 'no destination'}`)
   const heads = r.heads.map(h => h.head === null ? null : h.head.trim())
@@ -1454,9 +1455,9 @@ const pushExact = async (sha, label, prToo = false) => {
     : 'the push landed on some push URLs and not others')
 }
 
-const PR_STATE = { type: 'object', required: ['state'], properties: { error: { type: ['string', 'null'] }, state: { type: 'string' } } }
+const PR_STATE = withSeal({ type: 'object', additionalProperties: false, required: ['state'], properties: { error: { type: 'string' }, state: { type: 'string' } } })
 const readPrState = async (tag) => {
-  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`gh pr view ${args.pr} --json state\` ` + relayed(PR_STATE),
+  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --state ${args.pr}\` ` + relayed(PR_STATE),
     { label: `prstate#${tag}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PR_STATE })
   if (!r || r.error || !['OPEN', 'MERGED', 'CLOSED'].includes(r.state)) log(`prstate#${tag}: PR #${args.pr} state unread — ${!r ? 'the relay died' : r.error || JSON.stringify(r.state)}`)
   return r && !r.error ? r.state : null
