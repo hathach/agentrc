@@ -51,7 +51,9 @@ and tools it names, not for the whole family.
 
 - Silicon: DIGPROG (0x400D8260) reads 0x006C0000 on RT1060_A, which the
   reference manual calls "silicon revision 1.0"; registers do not tell A from
-  B, the marking does. verified 2026-10-12 mimxrt1060_evk, RM rev 4 p2551.
+  B, the marking does (6A on the measured board). verified 2026-10-12
+  mimxrt1060_evk (MIMXRT1060-EVK, not -EVKB; schematic SCH-31357 rev A2 from
+  its label, the library has rev A3, book 1673), RM rev 4 p2551.
 - Every J-Link reset while the app vector is invalid prints "Could not find
   valid reset vector." then "Target halted on flash header read."; the reset
   worked. verified 2026-10-12 mimxrt1060_evk (TinyUF2 0.35.0), in two J-Link
