@@ -506,6 +506,12 @@ class FailuresTest(unittest.TestCase):
                                   'report error': 'Failed: roster rejected',
                                   'report caveat': 'Failed: run ended without a report; board state unknown'})
 
+    def test_passing_tinyuf2_install_and_invalidate_reports_have_no_failed_cells(self):
+        install = {'pass': True, 'caveat': '', 'results': [{'board': 'a', 'installed': {'path': 'tinyuf2.bin', 'sha256': '00'}}]}
+        invalidate = {'pass': True, 'caveat': '', 'results': [{'board': 'a', 'firmware': {}, 'cleanup': {'pass': True, 'state': 'bootloader restored'}}]}
+        self.assertEqual(collect.report_rows(7, install), {})
+        self.assertEqual([row[0] for row in collect.report_rows(7, invalidate).values()], ['OK'])
+
     def test_the_last_tinyuf2_report_counts_and_other_json_is_not_one(self):
         fail, ok = (UF2 / 'fail.json').read_text().strip(), (UF2 / 'pass.json').read_text().strip()
         self.assertEqual(collect.uf2_report([fail, '{"pass": true}', '{not json']), (1, json.loads(fail)))

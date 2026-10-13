@@ -543,7 +543,7 @@ def report_rows(n, report):
             cleanup = r.get('cleanup')
             if cleanup:
                 own.append(('cleanup', cleanup.get('pass') is True, cleanup.get('detail') or cleanup.get('state') or ''))
-            if r.get('pass') is not True and all(ok for _, ok, _ in own):
+            if 'ran' in r and r.get('pass') is not True and all(ok for _, ok, _ in own):  # install/invalidate rows carry no run verdict
                 own.append(('run', False, r.get('detail') or ''))
         found += [(f'{r.get("board")} {name}', ok, detail) for name, ok, detail in own]
     found += [(f'report {key}', False, report[key]) for key in ('error', 'caveat') if report.get(key)]
