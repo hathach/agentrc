@@ -2511,6 +2511,13 @@ test('a dead review validator still settles the CI lane', async () => {
   assert.equal(summaries(logs).length, 1)
 })
 
+test('a CI lane that reads the merge after the review validator died stops pr-merged', async () => {
+  const { result, logs } = await run({ reviews: new Error('validator exploded'), ci: { ...GREEN, status: 'merged', mergeable: 'UNKNOWN' } })
+  assert.ok(logs.indexOf('cycle 1: PR #3888 is merged — ending both lanes') > logs.findIndex(l => l.startsWith('cycle 1: review validator')), logs.join('\n'))
+  assert.equal(result.reason, 'pr-merged', logs.join('\n'))
+  assert.equal(result.history[0].error, 'pr-review-validator died', 'the validator death stays on record')
+})
+
 test('a failed push stops the loop after a summary', async () => {
   const { result, logs } = await run({ reviews: oneValid, push: null })
   assert.equal(result.reason, 'push-failed')

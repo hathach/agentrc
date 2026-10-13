@@ -190,6 +190,13 @@ class PreflightTest(unittest.TestCase):
             code, out = self.pin()
             self.assertEqual((code, out['prState']), (0, state))
 
+    def test_a_pr_no_longer_open_pins_without_its_base_tip(self):
+        for state in ('MERGED', 'CLOSED'):
+            self.fake_gh(json.dumps({**VIEW, 'state': state}), ref='', ref_code=1)
+            code, out = self.pin()
+            self.assertEqual((code, out['prState'], out['prBaseTip']), (0, state, ''))
+            self.assertFalse(any(c.startswith('api ') for c in self.gh_calls()), 'a deleted base branch cannot fail the pin')
+
     def test_a_pr_no_longer_open_whose_head_fork_is_gone_is_pinned_with_its_state(self):
         for state in ('MERGED', 'CLOSED'):
             for gone in ({'headRepository': None}, {'headRepository': None, 'headRepositoryOwner': None}):

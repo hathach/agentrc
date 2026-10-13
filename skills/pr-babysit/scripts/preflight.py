@@ -13,7 +13,8 @@ repository is gone), prUrl and prState (OPEN, MERGED or CLOSED, any other an
 error) from one `gh pr view N`, verbatim
 even when they disagree with git; prBaseTip, the base branch's live tip in the
 base repository (`gh api repos/{owner}/{repo}/git/ref/heads/<prBaseBranch>`,
-resolved as `gh pr view` resolves N); remote, the remote
+resolved as `gh pr view` resolves N; "" for a PR no longer open, whose base
+branch may be gone); remote, the remote
 the branch tracks, "" when it tracks none; upstreamBranch, the branch it
 tracks there, "" when none; pushUrls (`git remote get-url
 --push --all <remote>`, which a pushurl can point away from the fetch URL);
@@ -146,7 +147,7 @@ def pin(pr):
                     'prUrl': view['url'], 'prState': view['state']}
     except (KeyError, TypeError) as e:
         raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')
-    pr_facts['prBaseTip'] = base_tip(pr_facts['prBaseBranch'])
+    pr_facts['prBaseTip'] = base_tip(pr_facts['prBaseBranch']) if view['state'] == 'OPEN' else ''
     remote, urls = push_urls(branch)
     expected = f"{HOST}/{pr_facts['prRepo'].lower()}"
     return {'branch': branch, **pr_facts, 'remote': remote, 'upstreamBranch': upstream_branch(branch, remote),

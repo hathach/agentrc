@@ -1921,9 +1921,15 @@ const ciLaneRun = async (cycle, lanes) => {
 
 // Returns null to re-arm, or the final result.
 const runCycle = async (cycle, entry) => {
-  let ciPromise = null
   // prState: 'merged' or 'closed' once read so, 'unread' when a read before a write failed; the review lane then stops at its next step.
   const lanes = { reviewDone: !reviewLane, reviewPublishing: false, ended: false, prState: null }
+  const verdict = await runLanes(cycle, entry, lanes)
+  // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
+  return lanes.prState === 'merged' || lanes.prState === 'closed' ? prEnded(cycle, lanes.prState) : verdict
+}
+
+const runLanes = async (cycle, entry, lanes) => {
+  let ciPromise = null
   const ended = (what) => prGate(lanes, `${cycle}-${what}`)
   // Settle the CI lane in finally so no CI agent outlives the workflow.
   try {
