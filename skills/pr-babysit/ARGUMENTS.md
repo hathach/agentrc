@@ -7,6 +7,7 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
+  Every reviewer is reported with its state; only these are waited on.
 - `maxCycles`: cycle ceiling, default 16; a resumed launch defaults to its state's.
 - `autoPush` (default false, a dry run: fixes left uncommitted, nothing posted)
   and `markSonar` (needs `autoPush` and `SONAR_TOKEN`: marks the SonarCloud
@@ -16,7 +17,10 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   `CLAUDE.md` when CodeRabbit skips every push for a manual review (a
   repository below its open-source threshold). Once per head, ticks
   the "Trigger review" box of CodeRabbit's summary comment when the head was
-  skipped that way, then waits for the review up to the silent-bot cap. Needs
+  skipped that way, then waits for the review up to the silent-bot cap. Once
+  per head too, when CodeRabbit is rate-limited with a reset time under an
+  hour away, naps until the reset and comments `@coderabbitai review` (a limit
+  notice has no box), then waits the same way. Needs
   `autoPush` and `coderabbit` in `autoRun`; never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
   paths are ignored; any other pre-existing edit refuses the start.

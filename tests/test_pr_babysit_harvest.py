@@ -194,6 +194,82 @@ class FailClosed(unittest.TestCase):
         self.assertEqual(harvest.coderabbit(HEAD, [at_once], [], [tie], EVENT)['state'], 'unknown', 'one timestamp orders nothing')
         self.assertEqual(harvest.coderabbit(HEAD, [at_once], [], [comment(bot, harvest.CR_PAUSED, at='2026-09-25T09:00:00Z')], EVENT)['state'], 'unknown')
 
+    def test_a_rate_limit_status_dates_the_notice_it_edits(self):
+        """#82: CodeRabbit edited its walkthrough into a rate-limit notice a second after its "Review rate limited" status."""
+        bot = 'coderabbitai[bot]'
+        body = harvest.CR_WALKTHROUGH + '\n' + harvest.CR_RATE + '\n> ## Review limit reached\n> **Next included review available in 51 minutes.**'
+        notice = comment(bot, body, at='2026-09-25T08:54:33Z', updated='2026-09-25T09:04:19Z', id_=3)
+        limited = status('success', 'Review rate limited', '2026-09-25T09:04:18Z')
+        r = harvest.coderabbit(HEAD, [limited], [], [notice], EVENT)
+        self.assertEqual((r['state'], r['kind'], r['sha'], r['retryAt']), ('settled', 'limited', HEAD, '2026-09-25T09:55:19Z'))
+        self.assertIn('comment 3', r['evidence'])
+        tie = comment(bot, body, at='2026-09-25T08:54:33Z', updated='2026-09-25T09:04:18Z', id_=3)
+        self.assertEqual(harvest.coderabbit(HEAD, [limited], [], [tie], EVENT)['retryAt'], '2026-09-25T09:55:18Z', 'a notice at the status\'s second agrees with it')
+        alone = harvest.coderabbit(HEAD, [limited], [], [], EVENT)
+        self.assertEqual((alone['kind'], alone['retryAt']), ('limited', None), 'the status alone: limited, no reset time')
+        self.assertIn('no reset time read', alone['reason'])
+        older = comment(bot, body, at='2026-09-25T08:00:00Z', updated='2026-09-25T08:10:00Z', id_=4)
+        self.assertEqual(harvest.coderabbit(HEAD, [limited], [], [older], EVENT)['retryAt'], None, 'a notice before the status is not its notice')
+        self.assertEqual(harvest.coderabbit(HEAD, [], [], [notice], EVENT)['state'], 'unknown', 'without the status the edit still cannot be dated')
+        later = status('success', 'Review completed', '2026-09-25T10:00:00Z')
+        self.assertEqual(harvest.coderabbit(HEAD, [limited, later], [], [notice], EVENT)['state'], 'reviewed', 'a newer review supersedes the limit')
+        run_ = {'id': 11, 'name': 'CodeRabbit', 'status': 'in_progress', 'conclusion': None, 'started_at': '2026-09-25T09:30:00Z'}
+        self.assertEqual(harvest.coderabbit(HEAD, [limited], [run_], [notice], EVENT)['state'], 'working', 'a newer run supersedes it too')
+        pause = comment(bot, harvest.CR_PAUSED, at='2026-09-25T09:10:00Z', id_=5)
+        self.assertEqual(harvest.coderabbit(HEAD, [limited], [], [notice, pause], EVENT)['kind'], 'paused')
+        soon = comment(bot, body.replace('51 minutes', '1 minute'), at='2026-09-25T08:54:33Z', updated='2026-09-25T09:04:19Z', id_=6)
+        for issue in ([notice, soon], [soon, notice]):
+            r = harvest.coderabbit(HEAD, [limited], [], issue, EVENT)
+            self.assertEqual((r['kind'], r['retryAt']), ('limited', None), 'tied notices with different countdowns give no reset time')
+            self.assertIn('read differently', r['reason'])
+        posted = [comment(bot, harvest.CR_RATE + f'\n> **Next included review available in {n}.**', at='2026-09-25T09:30:00Z', id_=i)
+                  for i, n in ((7, '1 minute'), (8, '51 minutes'))]
+        for issue in (posted, posted[::-1]):
+            r = harvest.coderabbit(HEAD, [], [], issue, EVENT)
+            self.assertEqual((r['kind'], r['retryAt']), ('limited', None), 'so do tied unedited ones')
+
+    def test_a_rate_limit_countdown_reads_or_is_none(self):
+        def at(countdown, updated='2026-09-25T09:00:00Z'):
+            return harvest.retry_at({'body': f'> **Next included review available in {countdown}.**', 'updated_at': updated})
+        self.assertEqual(at('51 minutes'), '2026-09-25T09:51:00Z')
+        self.assertEqual(at('1 minute'), '2026-09-25T09:01:00Z')
+        self.assertEqual(at('1 hour and 3 minutes'), '2026-09-25T10:03:00Z')
+        self.assertEqual(at('2 hours, 5 minutes and 30 seconds'), '2026-09-25T11:05:30Z')
+        self.assertEqual(at('0 minutes'), '2026-09-25T09:00:00Z')
+        for bad in ('a few minutes', '51 minutes or so', '5 minutes and 3 minutes', '3 days', ''):
+            self.assertIsNone(at(bad), bad)
+        self.assertIsNone(harvest.retry_at({'body': 'Review limit reached', 'updated_at': '2026-09-25T09:00:00Z'}))
+        self.assertIsNone(harvest.retry_at(None))
+        plain = comment('coderabbitai[bot]', harvest.CR_RATE + '\n> **Next included review available in 10 minutes.**', at='2026-09-25T09:30:00Z')
+        r = harvest.coderabbit(HEAD, [], [], [plain], EVENT)
+        self.assertEqual((r['kind'], r['retryAt']), ('limited', '2026-09-25T09:40:00Z'), 'an unedited notice counts from its posting')
+
+    def test_copilot_reads_its_newest_submitted_review_on_the_head(self):
+        cop = 'copilot-pull-request-reviewer[bot]'
+        def v(body, commit=HEAD, at='2026-09-25T09:00:00Z', state='COMMENTED', id_=1):
+            return review(cop, commit, body, at, id_) | {'state': state}
+        overview = '<!-- ccr-overview-v2 -->\n### Approval recommended'
+        excluded = harvest.COPILOT_NO_FILES + ' Check if the **Files changed** are included in default exclusions.'
+        cases = [
+            ([v(harvest.COPILOT_QUOTA)], ('settled', 'limited', HEAD)),
+            ([v(excluded)], ('settled', 'skipped', HEAD)),
+            ([v(overview)], ('reviewed', None, HEAD)),
+            ([v('## Pull request overview\nx')], ('reviewed', None, HEAD)),
+            ([v('Copilot was unable to review this pull request because it is on fire.')], ('unknown', None, None)),
+            ([v('Something new')], ('unknown', None, None)),
+            ([v(overview, commit=OLD)], ('absent', None, None)),
+            ([v(overview, state='PENDING')], ('absent', None, None)),
+            ([v(overview, state='DISMISSED')], ('absent', None, None)),
+            ([review('coderabbitai[bot]', HEAD, overview)], ('absent', None, None)),
+            ([], ('absent', None, None)),
+            ([v(overview, at='2026-09-25T09:00:00Z', id_=1), v(harvest.COPILOT_QUOTA, at='2026-09-25T10:00:00Z', id_=2)], ('settled', 'limited', HEAD)),
+            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA, id_=2)], ('unknown', None, None)),
+            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA, at=None, id_=2)], ('unknown', None, None)),
+        ]
+        for reviews, want in cases:
+            r = harvest.copilot(HEAD, reviews)
+            self.assertEqual((r['state'], r['kind'], r['sha']), want, reviews)
+
     def test_unfamiliar_artifacts_are_unknown(self):
         self.assertEqual(harvest.coderabbit(HEAD, [status('success', 'Something new')], [], [], EVENT)['state'], 'unknown')
         undated = greptile_run('completed', 'success', at=None)
@@ -282,7 +358,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(code, 0, got)
         self.assertEqual((got['headSha'], got['headEventAt']), (HEAD, '2026-09-25T08:00:00Z'), 'the labeled run and the other branch date nothing')
         self.assertIn('run 2', got['headEventEvidence'])
-        self.assertEqual([b['state'] for b in got['bots']], ['reviewed'])
+        self.assertEqual([(b['bot'], b['state']) for b in got['bots']], [('coderabbit', 'reviewed'), ('copilot', 'absent')], 'one record per reviewer')
         self.assertEqual([(c['kind'], c['commentId']) for c in got['comments']], [('review', 40), ('issue', 20), ('review-body', 30)],
                          'only the named reviewers, and no empty review body')
         self.assertEqual(got['comments'][0]['digest'], harvest.digest('fix this'))
@@ -298,16 +374,41 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual((by_id[22]['body'], by_id[22]['bodyOmitted'], by_id[22]['digest']), (None, 'coderabbit-walkthrough', harvest.digest(walk)))
         self.assertEqual(by_id[20]['body'], 'walkthrough', 'a CodeRabbit issue comment without the marker stays verbatim')
 
-    def test_copilot_is_harvested_when_named_but_never_settled(self):
+    def test_copilot_is_harvested_and_read_from_its_review(self):
         answers = self.answers([HEAD])
-        answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].append(review('copilot-pull-request-reviewer[bot]', HEAD, '## Pull request overview', id_=32))
+        answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].append(
+            review('copilot-pull-request-reviewer[bot]', HEAD, '## Pull request overview', id_=32) | {'state': 'COMMENTED'})
         answers['api --paginate --slurp repos/o/r/pulls/7/comments?per_page=100'][0][0].append(
             {'id': 41, 'user': user('Copilot'), 'body': 'nit', 'path': 'a.c', 'line': 5, 'commit_id': HEAD, 'created_at': EVENT, 'updated_at': EVENT,
              'in_reply_to_id': None, 'html_url': 'u/41'})
         code, got = self.harvest(answers)
         self.assertEqual(code, 0, got)
         self.assertEqual([(c['kind'], c['commentId']) for c in got['comments'] if c['source'] == 'copilot'], [('review', 41), ('review-body', 32)])
-        self.assertEqual([b['bot'] for b in got['bots']], ['coderabbit'])
+        self.assertEqual([(b['bot'], b['state'], b['evidence']) for b in got['bots']],
+                         [('coderabbit', 'reviewed', got['bots'][0]['evidence']), ('copilot', 'reviewed', [f'review 32 on {HEAD[:8]}'])])
+
+    def test_a_copilot_refusal_has_no_body_and_reads_settled(self):
+        answers = self.answers([HEAD])
+        answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].append(
+            review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA, id_=33) | {'state': 'COMMENTED'})
+        code, got = self.harvest(answers)
+        self.assertEqual(code, 0, got)
+        mine = [c for c in got['comments'] if c['source'] == 'copilot']
+        self.assertEqual([(c['commentId'], c['body'], c['bodyOmitted'], c['digest']) for c in mine],
+                         [(33, None, 'copilot-refusal', harvest.digest(harvest.COPILOT_QUOTA))])
+        self.assertEqual([(b['state'], b['kind'], b['evidence']) for b in got['bots'] if b['bot'] == 'copilot'],
+                         [('settled', 'limited', [f'review 33 on {HEAD[:8]}'])])
+
+    def test_each_comment_endpoint_is_read_once(self):
+        answers = self.answers([HEAD])
+        quota = review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA, id_=33) | {'state': 'COMMENTED'}
+        # A second read would get the second page set, with no Copilot review in it.
+        answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'] = [[[quota]], [[]]]
+        answers['api --paginate --slurp repos/o/r/issues/7/comments?per_page=100'].append([[]])
+        code, got = self.harvest(answers)
+        self.assertEqual(code, 0, got)
+        self.assertEqual([b['kind'] for b in got['bots'] if b['bot'] == 'copilot'], ['limited'])
+        self.assertEqual(sorted(c['commentId'] for c in got['comments']), [20, 33, 40])
 
     def test_a_moving_head_is_read_again_then_refused(self):
         code, got = self.harvest(self.answers([OLD, HEAD]))
@@ -327,8 +428,10 @@ class EndToEnd(unittest.TestCase):
         answers = self.answers([HEAD])
         for k in [k for k in answers if '/actions/runs' in k or '/timeline' in k or '/contents/' in k or '/statuses' in k or '/check-runs' in k]:
             del answers[k]
-        code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit')
-        self.assertEqual((code, got['headEventAt'], got['bots']), (0, None, []), got)
+        code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit,code-scanning')
+        self.assertEqual((code, got['headEventAt'], [(b['bot'], b['state']) for b in got['bots']]),
+                         (0, None, [('coderabbit', 'harvested'), ('code-scanning', 'harvested')]), got)
+        self.assertIn('3 comment(s) harvested', got['bots'][0]['reason'])
         self.assertIn('no reviewer auto-runs', got['headEventEvidence'])
         self.assertEqual(len(got['comments']), 3, 'the comments are still harvested')
 

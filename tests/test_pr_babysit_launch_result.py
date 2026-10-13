@@ -210,6 +210,19 @@ class LaunchResultTest(unittest.TestCase):
         for reason in ('yielded', 'pr-merged'):
             self.assertEqual(self.run_it(stopped(reason))[1]['blockers'], [], reason)
 
+    def test_every_reviewer_keeps_its_state_kind_and_evidence(self):
+        # #85: a Copilot quota notice left no finding, so its record is the only trace.
+        data = output()
+        data['result']['observation']['reviews']['bots'] = [
+            {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'Review rate limited',
+             'evidence': ['comment 5'], 'retryAt': '2026-10-13T10:55:19Z'},
+            {'bot': 'copilot', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'the requesting user reached the Copilot quota',
+             'evidence': ['review 3313 on aaaaaaaa'], 'retryAt': None}]
+        bots = self.run_it(data)[1]['observation']['bots']
+        self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD[:8], 'reason': 'Review rate limited',
+                                   'evidence': ['comment 5'], 'retryAt': '2026-10-13T10:55:19Z'})
+        self.assertEqual((bots[1]['bot'], bots[1]['kind'], bots[1]['evidence']), ('copilot', 'limited', ['review 3313 on aaaaaaaa']))
+
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):
         data = output()
         obs = data['result']['observation']

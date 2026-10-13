@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Where each auto-running review bot stands on a PR's head, and every comment its reviewers left.
+"""Where each requested review bot stands on a PR's head, and every comment its reviewers left.
 
   harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile
 
---auto-run names only bots it settles: copilot and code-scanning are harvested, never settled.
+--auto-run names the bots settled from their artifacts, only coderabbit and greptile. Copilot is read
+from its newest submitted review on the head; any other reviewer is `harvested`, its state not read.
 
 Run from the PR checkout. It settles first and harvests second: the bots'
 artifacts are read, then the three comment endpoints, then the head again; a
@@ -15,26 +16,28 @@ never `absent`.
 
 stdout ends with one JSON line: headSha, observedAt, headEventAt (null when no
 run or timeline event dates the head, or no bot auto-runs), headEventEvidence, bots (one record per
---auto-run name: bot, state, kind, sha, evidence, reason), and comments (every
+--reviewers name: bot, state, kind, sha, evidence, reason, retryAt: when a rate-limited
+bot's notice says its next review is available, else null), and comments (every
 inline comment, issue comment and review body by a --reviewers author: kind
 review|issue|review-body, commentId, source, author, body verbatim, digest
 (pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
 CodeRabbit rewrites at its end), aliases (the digests a body's earlier forms
 may have been recorded under; left out when there are none), path, line,
-commitId, createdAt, updatedAt, inReplyTo, url). One body is left out: a CodeRabbit
-issue comment that opens with its walkthrough marker (CR_WALKTHROUGH), the
-auto-generated summary no finding comes from, has body null, bodyOmitted
-"coderabbit-walkthrough" and bodyLength; its digest and aliases are still the
-real body's and identify it, and `gh api repos/<repo>/issues/comments/<commentId>`
-(or its url) fetches it. Exit 2 with {"error": ...} when gh cannot answer the PR, the
+commitId, createdAt, updatedAt, inReplyTo, url). Two bodies no finding comes from are left
+out, with body null, bodyOmitted and bodyLength: a CodeRabbit issue comment that opens
+with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
+"coderabbit-walkthrough"; and a Copilot review body saying it could not review,
+"copilot-refusal". Their digest and aliases are still the real body's and identify them,
+and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
 head, or a comment endpoint.
 """
 
 import base64
 import functools
 import json
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import yaml
@@ -53,6 +56,13 @@ HEAD_ACTIVITIES = {'opened', 'synchronize', 'reopened', 'ready_for_review'}
 CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
+CR_RATE_STATUS = 'review rate limited'
+CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
+COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
+COPILOT_QUOTA = 'Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.'
+COPILOT_NO_FILES = "Copilot wasn't able to review any files in this pull request."
+COPILOT_OVERVIEW = ('<!-- ccr-overview', '## Pull request overview')
+REVIEW_SUBMITTED = ('COMMENTED', 'APPROVED', 'CHANGES_REQUESTED')
 GREPTILE_PAUSED = 'Greptile has paused reviews on this repository'
 GREPTILE_ERROR = 'Greptile encountered an error while reviewing this PR'
 GREPTILE_STATUS = '<!-- greptile-status -->'
@@ -87,8 +97,21 @@ def stamp(t):
     return datetime.fromisoformat(t.replace('Z', '+00:00')) if t else None
 
 
-def record(bot, state, reason, evidence=(), sha=None, kind=None):
-    return {'bot': bot, 'state': state, 'kind': kind, 'sha': sha, 'evidence': list(evidence), 'reason': reason}
+def record(bot, state, reason, evidence=(), sha=None, kind=None, retry_at=None):
+    return {'bot': bot, 'state': state, 'kind': kind, 'sha': sha, 'evidence': list(evidence), 'reason': reason, 'retryAt': retry_at}
+
+
+def retry_at(notice):
+    """When a CodeRabbit rate-limit notice says the next review is available, counted from its last edit; None when its countdown does not read."""
+    m = CR_COUNTDOWN.search((notice or {}).get('body') or '')
+    if not m:
+        return None
+    terms = COUNTDOWN_TERM.findall(m.group(1))
+    units = [unit for _, unit in terms]
+    if not terms or len(set(units)) != len(units) or COUNTDOWN_TERM.sub('', m.group(1)).replace('and', '').replace(',', '').strip():
+        return None
+    wait = timedelta(**{f'{unit}s': int(n) for n, unit in terms})
+    return (stamp(notice['updated_at']) + wait).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def newest(items, key):
@@ -148,11 +171,16 @@ def coderabbit(head, statuses, checks, issue, event_at):
     if why:
         return record('coderabbit', 'unknown', f'pause comments: {why}', ev)
     rate = [c for c in stickies if CR_RATE in (c.get('body') or '')]
-    tied = next((c for c in [pause, *rate] if c and latest_at is not None and stamp(c['updated_at']) == latest_at), None)
+    # CodeRabbit's own rate-limit status on the head dates the notice it edits alongside it.
+    by_status = bool(s) and s['state'] == 'success' and (s.get('description') or '').lower().startswith(CR_RATE_STATUS) and (run_at is None or run_at < s_at)
+    tied = next((c for c in [pause, *([] if by_status else rate)] if c and latest_at is not None and stamp(c['updated_at']) == latest_at), None)
     if tied:
         return record('coderabbit', 'unknown', 'a notice and a status or run on the head share one timestamp', [*ev, f"comment {tied['id']}"])
     if pause and (latest_at is None or stamp(pause['updated_at']) > latest_at):
         return record('coderabbit', 'settled', 'reviews paused on this PR', [*ev, f"pause in comment {pause['id']}"], None, 'paused')
+    if by_status:
+        notice, why = newest_reading([c for c in rate if stamp(c['updated_at']) >= s_at], 'updated_at', retry_at)
+        return limited_record(s.get('description'), notice, why, ev, head)
     # A notice last touched before a status or run on the head is superseded, and an edited
     # one last touched before the head event is about an older push; any other edit hides when it was posted.
     rate = [c for c in rate if latest_at is None or stamp(c['updated_at']) > latest_at]
@@ -161,9 +189,10 @@ def coderabbit(head, statuses, checks, issue, event_at):
         return record('coderabbit', 'unknown', 'a rate-limit notice in an edited comment cannot be dated', [*ev, f"comment {edited['id']}"])
     if rate and event_at is None:
         return record('coderabbit', 'unknown', 'a rate-limit notice, and the head event time is unknown', [*ev, f"comment {rate[0]['id']}"])
-    limited = newest([c for c in rate if c['created_at'] == c['updated_at'] and applies(c['created_at'], event_at)], 'created_at')
-    if limited:
-        return record('coderabbit', 'settled', 'rate-limited after the head event', [*ev, f"comment {limited['id']}"], None, 'limited')
+    fresh = [c for c in rate if c['created_at'] == c['updated_at'] and applies(c['created_at'], event_at)]
+    if fresh:
+        limited, why = newest_reading(fresh, 'created_at', retry_at)
+        return limited_record('rate-limited after the head event', limited or fresh[0], why, ev, None)
     if s and run_ and s_at == run_at:
         a, b = coderabbit_status(s, ev, head), coderabbit_run(run_, ev, head)
         if (a['state'], a['kind']) != (b['state'], b['kind']):
@@ -175,6 +204,14 @@ def coderabbit(head, statuses, checks, issue, event_at):
     return record('coderabbit', 'absent', 'no status and no check run on the head')
 
 
+def limited_record(reason, notice, why, ev, sha):
+    """CodeRabbit settled as rate-limited, with the notice's reset time; `why` says why the notices give none."""
+    at = None if why else retry_at(notice)
+    if not at:
+        reason += f"; no reset time read{f' ({why})' if why else ''}"
+    return record('coderabbit', 'settled', reason, [*ev, *([f"comment {notice['id']}"] if notice else [])], sha, 'limited', at)
+
+
 def coderabbit_status(s, ev, head):
     desc, state = s.get('description') or '', s['state']
     if state == 'pending':
@@ -184,6 +221,8 @@ def coderabbit_status(s, ev, head):
             return record('coderabbit', 'settled', desc, ev, head, 'skipped')
         if desc.lower().startswith('review completed'):
             return record('coderabbit', 'reviewed', desc, ev, head)
+        if desc.lower().startswith(CR_RATE_STATUS):
+            return record('coderabbit', 'settled', desc, ev, head, 'limited')
         return record('coderabbit', 'unknown', f'a success status this does not read: {desc!r}', ev)
     if state in ('failure', 'error'):
         return record('coderabbit', 'settled', desc or state, ev, head, 'failed')
@@ -248,6 +287,29 @@ def greptile(head, checks, issue, reviews, event_at):
     return record('greptile', 'unknown', f"check run {r['status']}/{r.get('conclusion')} with a summary this does not read", ev)
 
 
+def copilot_reading(body):
+    """(state, kind, reason) for a Copilot review body."""
+    body = (body or '').strip()
+    if body == COPILOT_QUOTA:
+        return 'settled', 'limited', 'the requesting user reached the Copilot quota'
+    if body.startswith(COPILOT_NO_FILES):
+        return 'settled', 'skipped', 'no file in the PR is one Copilot reviews'
+    if body.startswith(COPILOT_OVERVIEW):
+        return 'reviewed', None, 'review on the head'
+    return 'unknown', None, 'a Copilot review body this does not read'
+
+
+def copilot(head, reviews):
+    mine = [v for v in reviews if 'copilot' in (v['user']['login'] or '').lower() and v.get('commit_id') == head and v.get('state') in REVIEW_SUBMITTED]
+    if not mine:
+        return record('copilot', 'absent', 'no Copilot review on the head')
+    v, why = newest_reading(mine, 'submitted_at', lambda v: copilot_reading(v.get('body')))
+    if why:
+        return record('copilot', 'unknown', f'reviews: {why}')
+    state, kind, reason = copilot_reading(v.get('body'))
+    return record('copilot', state, reason, [f"review {v['id']} on {head[:8]}"], head if state != 'unknown' else None, kind)
+
+
 def head_event(repo, n, view, head):
     """(the latest head event's time, its evidence), (None, why) when nothing dates it."""
     branch, head_repo = view['headRefName'], view['headRepository']['nameWithOwner']
@@ -299,24 +361,27 @@ def entry(kind, c, src, body, created, updated, path=None, line=None, commit=Non
     author = c['user']['login']
     first, *also = comment_digest.digests(body, author)
     walkthrough = kind == 'issue' and src == 'coderabbit' and (body or '').lstrip().startswith(CR_WALKTHROUGH)
-    shown = {'body': None, 'bodyOmitted': 'coderabbit-walkthrough', 'bodyLength': len(body)} if walkthrough else {'body': body or ''}
+    refusal = kind == 'review-body' and src == 'copilot' and copilot_reading(body)[0] == 'settled'
+    omitted = 'coderabbit-walkthrough' if walkthrough else 'copilot-refusal' if refusal else None
+    shown = {'body': None, 'bodyOmitted': omitted, 'bodyLength': len(body)} if omitted else {'body': body or ''}
     return {'kind': kind, 'commentId': c['id'], 'source': src, 'author': author, **shown,
             'digest': first, **({'aliases': also} if also else {}),
             'path': path, 'line': line, 'commitId': commit, 'createdAt': created, 'updatedAt': updated, 'inReplyTo': reply_to, 'url': c['html_url']}
 
 
-def comments(repo, n, reviewers):
+def comments(repo, n, reviewers, issue=None, reviews=None):
+    """Every comment by a reviewer; `issue` and `reviews` are those endpoints already read, None when they were not."""
     got = []
     for c in pages(f'repos/{repo}/pulls/{n}/comments'):
         src = source_of(c['user']['login'], reviewers)
         if src:
             got.append(entry('review', c, src, c.get('body'), c['created_at'], c['updated_at'], c.get('path'),
                              c.get('line') or c.get('original_line'), c.get('commit_id'), c.get('in_reply_to_id')))
-    for c in pages(f'repos/{repo}/issues/{n}/comments'):
+    for c in issue if issue is not None else pages(f'repos/{repo}/issues/{n}/comments'):
         src = source_of(c['user']['login'], reviewers)
         if src:
             got.append(entry('issue', c, src, c.get('body'), c['created_at'], c['updated_at']))
-    for r in pages(f'repos/{repo}/pulls/{n}/reviews'):
+    for r in reviews if reviews is not None else pages(f'repos/{repo}/pulls/{n}/reviews'):
         src = source_of(r['user']['login'], reviewers)
         if src and (r.get('body') or '').strip():
             got.append(entry('review-body', r, src, r['body'], r.get('submitted_at'), r.get('submitted_at'), commit=r.get('commit_id')))
@@ -331,15 +396,20 @@ def observe(repo, n, reviewers, auto):
     event_at, event_why = head_event(repo, n, view, head) if auto else (None, 'no reviewer auto-runs, so no head event is read')
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
     checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
-    issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else []
-    reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if 'greptile' in auto else []
+    issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
+    reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if 'greptile' in auto or 'copilot' in reviewers else None
+    harvested = comments(repo, n, reviewers, issue, reviews)
     bots = []
-    for bot in auto:
-        if bot == 'coderabbit':
+    for bot in reviewers:
+        if bot == 'coderabbit' and bot in auto:
             bots.append(coderabbit(head, statuses, checks, issue, event_at))
-        elif bot == 'greptile':
+        elif bot == 'greptile' and bot in auto:
             bots.append(greptile(head, checks, issue, reviews, event_at))
-    harvested = comments(repo, n, reviewers)
+        elif bot == 'copilot':
+            bots.append(copilot(head, reviews))
+        else:
+            n_ = sum(c['source'] == bot for c in harvested)
+            bots.append(record(bot, 'harvested', f'{n_} comment(s) harvested; it does not auto-run here, so its state is not read'))
     return {'headSha': head, 'observedAt': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
             'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested}
 

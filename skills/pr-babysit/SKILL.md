@@ -23,7 +23,7 @@ python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD,
 python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N]
 python3 $S/sonar.py --pr N --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
-python3 $S/coderabbit_trigger.py --pr N --head <sha>  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review
+python3 $S/coderabbit_trigger.py --pr N --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
 python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 $S/state_transfer.py <saved output> [--chunks I,J]  # a stateRef's state as checksummed base64 chunks
@@ -37,7 +37,7 @@ A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight o
 `commits.py commit` stages and commits exactly its paths; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, `sonar.py` comments on and resolves SonarCloud issues, and `coderabbit_trigger.py` edits
-CodeRabbit's summary comment to tick its Trigger review box. Run any of them by hand only with the user's authorization to publish there.
+CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment. Run any of them by hand only with the user's authorization to publish there.
 
 ## Arguments
 

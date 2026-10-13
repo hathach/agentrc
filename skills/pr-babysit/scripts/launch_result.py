@@ -80,6 +80,8 @@ STALLED = {
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head: observe them once (a hung job, a missing runner) '
                 'before relaunching',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
+    'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
+                     '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',
 }
 
 
@@ -252,7 +254,9 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         reviews, ci, actions = obs.get('reviews') or {}, obs.get('ci'), obs.get('actions') or {}
         summary['observation'] = {
             'lane': obs.get('lane'), 'reviewedHead': obs.get('reviewedHead'),
-            'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'sha': (b.get('sha') or '')[:8] or None} for b in reviews.get('bots') or []],
+            'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'kind': b.get('kind'), 'sha': (b.get('sha') or '')[:8] or None,
+                      'reason': cut(b.get('reason') or ''), 'evidence': [cut(e) for e in b.get('evidence') or []], 'retryAt': b.get('retryAt')}
+                     for b in reviews.get('bots') or []],
             'findings': [{'id': f.get('findingId'), 'digest': f.get('commentDigest'), 'source': f.get('source'), 'verdict': f.get('verdict'),
                           'at': f'{f.get("file")}:{f.get("line")}', **({'held': cut(f['hold'])} if f.get('hold') else {})}
                          for f in reviews.get('findings') or []],

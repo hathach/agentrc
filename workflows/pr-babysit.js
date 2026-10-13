@@ -28,7 +28,7 @@ if (args.maxCycles != null && (!Number.isInteger(args.maxCycles) || args.maxCycl
 // harvest.py knows only these bots: an unknown name would review nothing.
 const KNOWN_REVIEWERS = ['copilot', 'coderabbit', 'greptile', 'code-scanning']
 const DEFAULT_REVIEWERS = ['coderabbit', 'greptile', 'code-scanning']
-// Code-scanning and Copilot are harvested, never waited on: neither has a verdict to wait for.
+// Code-scanning and Copilot are harvested and reported, never waited on: neither has a verdict to wait for.
 const HARVEST_ONLY = ['copilot', 'code-scanning']
 const reviewersArg = args.reviewers ?? DEFAULT_REVIEWERS
 if (!Array.isArray(reviewersArg)) {
@@ -237,7 +237,11 @@ if (args.state !== undefined && args.state !== null) {
     (st.last === null || (st.last && typeof st.last === 'object')) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
-      (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt)))))
+      (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
+      (st.reviewClock.request === undefined || (st.reviewClock.request && Number.isFinite(Date.parse(st.reviewClock.request.retryAt)) &&
+        (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
+      (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
+        Object.values(st.reviewClock.unknown).every(u => u && typeof u.reading === 'string' && Number.isFinite(Date.parse(u.since)))))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version 3 or ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
@@ -376,7 +380,7 @@ const exactly = (schema, key, idField, ids) => {
     items: { ...list.items, properties: { ...list.items.properties, [idField]: ids.length ? { ...id, enum: ids } : id } } } } }
 }
 
-const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown']
+const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested']
 const SETTLED_KINDS = ['skipped', 'limited', 'paused', 'failed']
 const REVIEWS = {
   type: 'object', additionalProperties: false,
@@ -388,12 +392,13 @@ const REVIEWS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['bot', 'state', 'kind', 'sha', 'evidence', 'reason'],
+        required: ['bot', 'state', 'kind', 'sha', 'evidence', 'reason', 'retryAt'],
         properties: {
           bot: { type: 'string' }, state: { type: 'string', enum: BOT_STATES },
           kind: { type: ['string', 'null'], enum: [...SETTLED_KINDS, null] },
           sha: { type: ['string', 'null'] },
           evidence: { type: 'array', items: { type: 'string' } }, reason: { type: 'string' },
+          retryAt: { type: ['string', 'null'] },
         },
       },
     },
@@ -496,7 +501,10 @@ const SONAR = withSeal({
 const CRTRIGGER = withSeal({
   type: 'object', additionalProperties: false,
   required: ['outcome', 'detail', 'at'],
-  properties: { error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' } },
+  properties: {
+    error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
+    retryAt: { type: ['string', 'null'] },
+  },
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
@@ -885,7 +893,7 @@ const reviewsWhy = (r) => {
   }
   const seen = new Set()
   for (const b of r.bots) {
-    if (!autoRun.includes(b.bot)) return `record for ${b.bot}, which does not auto-run here`
+    if (!reviewers.includes(b.bot)) return `record for ${b.bot}, which is not a reviewer here`
     if (seen.has(b.bot)) return `two records for ${b.bot}`
     seen.add(b.bot)
     if (b.sha !== null && b.sha !== expectedHead) return `${b.bot} record names ${FULL_SHA.test(b.sha) ? b.sha.slice(0, 7) : JSON.stringify(b.sha)}, not the head`
@@ -893,8 +901,10 @@ const reviewsWhy = (r) => {
     if ((b.state === 'settled') !== (b.kind !== null)) return `${b.bot} is ${b.state} with kind ${JSON.stringify(b.kind)}`
     if ((b.state === 'reviewed' || b.state === 'settled') && !b.evidence.some(e => e.trim())) return `${b.bot} ${b.state} with no evidence`
     if (b.state !== 'reviewed' && !b.reason.trim()) return `${b.bot} ${b.state} with no reason`
+    if (b.state === 'harvested' && (autoRun.includes(b.bot) || b.bot === 'copilot')) return `${b.bot} is harvested, a state only a reviewer whose state is not read takes`
+    if (b.retryAt !== null && !(b.kind === 'limited' && Number.isFinite(Date.parse(b.retryAt)))) return `${b.bot} has retryAt ${JSON.stringify(b.retryAt)} on a ${b.state}/${b.kind} record`
   }
-  const missing = autoRun.filter(bot => !seen.has(bot))
+  const missing = reviewers.filter(bot => !seen.has(bot))
   if (missing.length) return `no record for ${missing.join(', ')}`
   // A comment's findings carry its one digest; any other cannot say which body was judged.
   const bodyOf = new Map()
@@ -905,7 +915,8 @@ const reviewsWhy = (r) => {
   }
   return null
 }
-// reviewed and settled are done; queued and absent once the cap passed; working and unknown wait uncapped.
+// A reviewer that does not auto-run is reported, never waited on. Of the rest, reviewed and settled are done;
+// queued and absent once the cap passed; working and unknown wait uncapped, an unknown timed by how long its reading stood unchanged.
 const settleBots = (r) => {
   if (!reviewClock || reviewClock.sha !== r.headSha) reviewClock = { sha: r.headSha, eventAt: r.headEventAt, since: r.observedAt }
   else if (r.headEventAt !== null && (reviewClock.eventAt === null || Date.parse(r.headEventAt) > Date.parse(reviewClock.eventAt))) {
@@ -913,18 +924,25 @@ const settleBots = (r) => {
   }
   const start = reviewClock.eventAt ?? reviewClock.since
   const waitedMin = Math.floor((Date.parse(r.observedAt) - Date.parse(start)) / 60000)
-  return {
-    waitedMin, since: start, clock: reviewClock.eventAt ? 'head event' : 'first observation',
-    bots: r.bots.map(b => ({
-      ...b,
-      done: b.state === 'reviewed' || b.state === 'settled' ||
-        ((b.state === 'queued' || b.state === 'absent') && waitedMin >= REVIEW_CAP_MIN),
-    })),
-  }
+  const unknown = {}
+  const bots = r.bots.map(b => {
+    const done = !autoRun.includes(b.bot) || b.state === 'reviewed' || b.state === 'settled' ||
+      ((b.state === 'queued' || b.state === 'absent') && waitedMin >= REVIEW_CAP_MIN)
+    if (done || b.state !== 'unknown') return { ...b, done }
+    const reading = JSON.stringify([b.reason, b.evidence])
+    const seen = reviewClock.unknown && reviewClock.unknown[b.bot]
+    unknown[b.bot] = seen && seen.reading === reading ? seen : { reading, since: r.observedAt }
+    return { ...b, done, unknownMin: Math.floor((Date.parse(r.observedAt) - Date.parse(unknown[b.bot].since)) / 60000) }
+  })
+  if (Object.keys(unknown).length) reviewClock.unknown = unknown
+  else delete reviewClock.unknown
+  return { waitedMin, since: start, clock: reviewClock.eventAt ? 'head event' : 'first observation', bots }
 }
 const botCell = (b, headWaitedMin) => {
   if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
+  if (!autoRun.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
   const waitedMin = b.triggeredMin ?? headWaitedMin
+  if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again after ${b.retryAt})`
   if (b.state === 'settled' && b.triggeredMin !== undefined) {
     return b.done ? `settled (${b.kind}: ${b.reason}; no review ${waitedMin}m after its trigger)`
       : `review triggered (${b.reason}, ${Math.max(0, REVIEW_CAP_MIN - waitedMin)}m to cap)`
@@ -936,6 +954,7 @@ const botCell = (b, headWaitedMin) => {
   }
   return `${b.state} (${b.reason})`
 }
+const botOut = ({ done, triggeredMin, retryWaitMs, unknownMin, ...b }) => b
 const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
   : rs.bots.map(b => `${b.bot} ${botCell(b, rs.waitedMin)}`).join(' · ')
 
@@ -1648,22 +1667,62 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   // Once per head, whatever the outcome: a failed tick is not retried into a storm.
   if (manual && reviewClock.triggeredAt === undefined) {
     if (await ended('crtrigger')) return
-    const label = `crtrigger#${cycle}`
-    const t = await relayOnce(
-      `${IN_CHECKOUT}Tick CodeRabbit's Trigger review box on PR #${args.pr}: run \`python3 ${CRTRIGGER_SCRIPT} --pr ${args.pr} --head ${r.headSha}\` ` +
-      relayed(CRTRIGGER) + ' Change nothing on GitHub yourself.',
-      { label, phase: 'Push', model: 'haiku', effort: 'low', schema: CRTRIGGER })
-    const known = !!t && !t.error && ['ticked', 'already', 'notSkipped', 'failed'].includes(t.outcome)
-    const outcome = known ? t.outcome : 'failed'
-    const detail = known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`
+    const { t, outcome } = await relayCodeRabbit(cycle, 'crtrigger', `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
+      ['ticked', 'already', 'notSkipped', 'failed'])
     // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
-    log(`cycle ${cycle}: ${label}: ${outcome}${detail ? ` (${detail})` : ''}`)
   }
-  // Waits like a queued bot, its cap counted from the trigger; working and reviewed go by settleBots alone.
-  if (typeof reviewClock.triggeredAt !== 'string' || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
-  cr.triggeredMin = Math.floor((Date.parse(r.observedAt) - Date.parse(reviewClock.triggeredAt)) / 60000)
+  if (cr.state === 'settled' && cr.kind === 'limited') return requestCodeRabbit(cycle, r, cr, ended)
+  // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone.
+  const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
+  if (!asks.length || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
+  waitAfter(cr, asks.reduce((a, b) => Date.parse(a) >= Date.parse(b) ? a : b), r.observedAt)
+}
+// One coderabbit_trigger.py run through a relay: its line, and the outcome, `failed` for a line it cannot read.
+const relayCodeRabbit = async (cycle, kind, task, flag, outcomes) => {
+  const label = `${kind}#${cycle}`
+  const t = await relayOnce(
+    `${IN_CHECKOUT}${task}: run \`python3 ${CRTRIGGER_SCRIPT} --pr ${args.pr} --head ${expectedHead}${flag}\` ` +
+    relayed(CRTRIGGER) + ' Change nothing on GitHub yourself.',
+    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: CRTRIGGER })
+  const known = !!t && !t.error && outcomes.includes(t.outcome)
+  const outcome = known ? t.outcome : 'failed'
+  const detail = known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`
+  log(`cycle ${cycle}: ${label}: ${outcome}${detail ? ` (${detail})` : ''}`)
+  return { t: known ? t : null, outcome }
+}
+const waitAfter = (cr, askedAt, observedAt) => {
+  cr.triggeredMin = Math.floor((Date.parse(observedAt) - Date.parse(askedAt)) / 60000)
   cr.done = cr.triggeredMin >= REVIEW_CAP_MIN
+}
+// A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again.
+const RETRY_WAIT_MAX_MS = 60 * 60000
+const retryLater = (cr, cycle, ms) => {
+  const wait = ms + 60000
+  if (wait > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
+  cr.done = false
+  cr.retryWaitMs = wait
+}
+const requestCodeRabbit = async (cycle, r, cr, ended) => {
+  const asked = reviewClock.request
+  if (asked) {
+    // The limit asked past still showing waits for the answer; a later reset is CodeRabbit refusing again.
+    if (asked.at !== null && Date.parse(asked.retryAt) === Date.parse(cr.retryAt)) waitAfter(cr, asked.at, r.observedAt)
+    return
+  }
+  if (cr.retryAt === null) return
+  const dueMs = Date.parse(cr.retryAt) - Date.parse(r.observedAt)
+  if (dueMs > 0) return retryLater(cr, cycle, dueMs)
+  if (await ended('crrequest')) return
+  const { t, outcome } = await relayCodeRabbit(cycle, 'crrequest', `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
+    ['requested', 'already', 'notDue', 'notLimited', 'failed'])
+  const atOk = !!t && Number.isFinite(Date.parse(t.at))
+  const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
+  if (outcome === 'notDue' && reset && atOk) return retryLater(cr, cycle, Math.max(0, Date.parse(reset) - Date.parse(t.at)))
+  // notLimited waits too: what changed since the harvest is for the next harvest to read.
+  const asking = ['requested', 'already', 'notLimited'].includes(outcome) && atOk
+  reviewClock.request = { at: asking ? t.at : null, retryAt: reset ?? cr.retryAt }
+  if (asking) waitAfter(cr, t.at, r.observedAt)
 }
 
 // The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none. Returns the ids settled.
@@ -1975,8 +2034,8 @@ const runLanes = async (cycle, entry, lanes) => {
     const owedLastCycle = outstanding().map(commentId => ({ commentId, findingIds: owedIds(commentId) }))
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
-      `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others; ` +
-      `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push: report one record for each and no other` : 'none of them auto-run: report no bot records'}. ${IN_CHECKOUT}` +
+      `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others: report one bot record for each; ` +
+      `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push` : 'none of them auto-run'}. ${IN_CHECKOUT}` +
       `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${autoRun.length ? ` --auto-run ${autoRun.join(',')}` : ''}\`. ` +
       `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
@@ -2496,9 +2555,14 @@ const runLanes = async (cycle, entry, lanes) => {
     if (!reviewsSettled) {
       // Back off, or the budget burns on re-harvests of an unchanged PR.
       const who = pendingBots.map(b => `${b.bot} ${botCell(b, entry.bots.waitedMin)}`).join('; ')
+      // Another harvest reads an unknown the same way: what the harvest could not read needs a person.
+      if (pendingBots.every(b => b.unknownMin >= REVIEW_CAP_MIN)) {
+        log(`cycle ${cycle}: auto-review unreadable, unchanged for ${REVIEW_CAP_MIN}m or more (${who}) — stopping`)
+        return stop(cycle, 'reviews-stuck', { head: expectedHead, bots: pendingBots.map(botOut) })
+      }
       if (cycle < maxCycles) {
         log(`cycle ${cycle}: auto-review still pending (${who}) — re-arming after a wait`)
-        napMs = backoff(cycle)
+        napMs = Math.max(backoff(cycle), ...pendingBots.map(b => b.retryWaitMs ?? 0))
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }
@@ -2719,5 +2783,5 @@ const stillPending = last.bots && last.head === expectedHead ? last.bots.bots.fi
 return finish(outstanding().length > 0
   ? unresolvedVerdict(maxCycles, outstanding(), args.autoPush !== true)
   : stillPending.length > 0
-    ? stop(maxCycles, 'reviews-pending', { head: expectedHead, pending: stillPending.map(({ done, triggeredMin, ...b }) => b) })
+    ? stop(maxCycles, 'reviews-pending', { head: expectedHead, pending: stillPending.map(botOut) })
     : stop(maxCycles, 'maxCycles reached'))
