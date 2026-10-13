@@ -496,9 +496,9 @@ class FailuresTest(unittest.TestCase):
         c = self.entries(JOB.format(3))[0]
         self.assertEqual((c['cells'], c['cellsError']), ([], 'a failed hil_test.py step printed no result row or report this reads; read its log'))
 
-    def uf2_log(self, report):
-        line = (UF2 / report).read_text().strip() if report.endswith('.json') else report
-        return log(*STEP[:7], line, *STEP[11:])
+    def uf2_log(self, *reports):
+        lines = [(UF2 / r).read_text().strip() if r.endswith('.json') else r for r in reports]
+        return log(*STEP[:7], *lines, *STEP[11:])
 
     def test_a_tinyuf2_report_gives_a_cell_per_failed_step_placed_against_the_base_report(self):
         self.logs['3'], self.logs['40'] = self.uf2_log('fail.json'), self.uf2_log('pass.json')
@@ -540,6 +540,18 @@ class FailuresTest(unittest.TestCase):
                                   'report error': 'Failed: roster rejected',
                                   'report caveat': 'Failed: run ended without a report; board state unknown'})
 
+    def test_a_boards_locked_and_run_cells_are_placed_against_a_base_run(self):
+        locked = '{"pass": false, "caveat": "", "results": [{"board": "%s", "ran": false, "pass": false, "locked": true, "detail": "board locked"}]}' % S3
+        refused = '{"pass": false, "caveat": "", "error": "no", "results": [{"board": "%s", "ran": false, "pass": false, "locked": false, "detail": "no"}]}' % S3
+        self.logs['40'] = self.uf2_log('pass.json')
+        for head, cell in ((locked, f'{S3} locked'), (refused, f'{S3} run')):
+            self.logs['3'] = self.uf2_log(head)
+            self.assertEqual([(x['cell'], x['onBase']) for x in self.entries(JOB.format(3))[0]['cells'] if x['cell'] == cell],
+                             [(cell, 'passed')], 'a passing base board ran under its lock')
+        self.logs['3'], self.logs['40'] = self.uf2_log(locked), self.uf2_log(refused)
+        self.assertEqual([(x['cell'], x['onBase']) for x in self.entries(JOB.format(3))[0]['cells']],
+                         [(f'{S3} locked', 'not-run')], 'an admission refusal never reached the lock')
+
     def test_passing_tinyuf2_install_restore_and_invalidate_reports_have_no_failed_cells(self):
         firmware = json.loads((UF2 / 'pass.json').read_text())['results'][0]['firmware']
         install = {'pass': True, 'caveat': '', 'survivors': [],
@@ -558,7 +570,10 @@ class FailuresTest(unittest.TestCase):
                    'results': [{'board': 'a', 'installed': {'path': 'tinyuf2.bin', 'sha256': '00'}}]}
         refused = {'pass': False, 'caveat': '', 'results': [], 'error': 'a J-Link install takes --firmware and --sha256'}
         failed = lambda report: {cell: row[0] for cell, row in collect.failed_rows(collect.report_rows(7, report)).items()}
-        self.assertEqual(failed(install), {'report pass': f'Failed: survivors JLinkExe  {json.dumps(survivor)}'})
+        self.assertEqual(failed(install), {'report pass': 'Failed: survivors JLinkExe'})
+        restore = {'pass': False, 'caveat': '', 'survivors': survivor, 'error': 'restore left children that survived SIGKILL', 'results': []}
+        self.assertEqual(failed(restore), {'report error': 'Failed: restore left children that survived SIGKILL',
+                                           'report pass': 'Failed: survivors JLinkExe'}, 'the survivors are named beside the error')
         self.assertEqual(failed(refused), {'report error': 'Failed: a J-Link install takes --firmware and --sha256'})
         self.assertEqual(failed({'pass': False, 'caveat': '', 'results': []}), {'report pass': 'Failed: pass is not true'})
 
@@ -572,15 +587,91 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(sig(jlink, esptool), sig({**jlink, 'pid': 90, 'start': 456}, {**esptool, 'pid': 91, 'start': None}))
         self.assertEqual(sig({'cmd': 1}, {'cmd': 'JLinkExe -USB'}, {'cmd': []}, {}), 'report pass: Failed: survivors ?, ?, ?, ?')
 
-    def test_a_cleanup_survivors_signature_names_their_commands_not_their_pids(self):
-        def sig(pid, start):
+    def test_a_survivor_is_named_by_its_container_its_helper_script_or_its_command(self):
+        name = lambda cmd: collect.survivor_name({'pid': 9, 'start': 1, 'cmd': cmd})
+        self.assertEqual(collect.survivor_name({'container': 'hil-flash-1'}), 'hil-flash-1')
+        session, dfu = name(['/usr/bin/python3', '-B', '/w/esp_session.py']), name(['/usr/bin/python3.11', '-B', 'usb_dfu.py'])
+        self.assertEqual((session, dfu), ('esp_session.py', 'usb_dfu.py'), 'hil_test.py spawns its helpers as [sys.executable, -B, script]')
+        self.assertEqual(name(['/opt/SEGGER/JLinkExe', '-USB', '1']), 'JLinkExe')
+        self.assertEqual(name(['/usr/bin/python3', '-m', 'esptool']), 'python3', 'only the producer\'s helper shape names its script')
+        for cmd in ([None], [1], [''], ['.'], [{'x': 'a/y'}], [], 'JLinkExe', None,
+                    ['python3', '-B', None], ['python3', '-B', ''], ['python3', '-B', '.'], ['python3', '-B']):
+            self.assertEqual(name(cmd), '?', cmd)
+        self.assertEqual(collect.survivor_name({'container': 5}), '?')
+        spaced = lambda tool: collect.cell_signature('report pass', collect.report_rows(7, {'pass': False, 'caveat': '', 'results': [],
+            'survivors': [{'cmd': ['/x/my  prog']}, {'cmd': [tool]}]})['report pass'][0])
+        self.assertEqual(spaced('JLinkExe'), 'report pass: Failed: survivors my prog, JLinkExe')
+        self.assertNotEqual(spaced('JLinkExe'), spaced('esptool'), 'a name\'s spaces never cut the signature short')
+
+    def test_a_cleanup_survivors_signature_keeps_the_error_and_names_their_commands_not_their_pids(self):
+        def sig(pid, start, detail='StepFail: children survived SIGKILL; no flash may overlap them'):
             survivors = [{'pid': pid, 'start': start, 'cmd': ['/opt/SEGGER/JLinkExe', '-USB', '1']}]
-            cleanup = {'pass': False, 'state': 'unknown', 'survivors': survivors,
-                       'detail': f'StepFail: children {[pid]} survived SIGKILL; no flash may overlap them'}
+            cleanup = {'pass': False, 'state': 'unknown', 'survivors': survivors, 'detail': detail}
             report = {'pass': False, 'caveat': '', 'results': [{'board': 'a', 'pass': False, 'steps': [], 'cleanup': cleanup}]}
             return collect.cell_signature('a cleanup', collect.report_rows(7, report)['a cleanup'][0])
-        self.assertEqual(sig(9, 123), 'a cleanup: Failed: survivors JLinkExe')
+        self.assertEqual(sig(9, 123), 'a cleanup: Failed: StepFail: children survived SIGKILL; no flash may overlap them; survivors JLinkExe')
         self.assertEqual(sig(9, 123), sig(90, 456))
+        self.assertNotEqual(sig(9, 123, 'Interrupted: interrupted by SIGTERM'), sig(9, 123, 'StepFail: JLinkExe timed out after 60s'),
+                            'clean_up appends survivors after any error')
+        cleanup = {'pass': False, 'state': 'unknown', 'survivors': [], 'detail': 'StepFail: readback differs'}
+        report = {'pass': False, 'caveat': '', 'results': [{'board': 'a', 'pass': False, 'steps': [], 'cleanup': cleanup}]}
+        self.assertEqual(collect.report_rows(7, report)['a cleanup'][0], 'Failed: StepFail: readback differs')
+
+    def test_a_report_pass_cell_is_placed_against_the_base_reports_survivors(self):
+        def report(cmd, **extra):
+            return json.dumps({'pass': False, 'caveat': '', 'results': [], 'survivors': [{'pid': 9, 'start': 1, 'cmd': cmd}], **extra})
+        session = ['/usr/bin/python3', '-B', 'esp_session.py']
+        self.logs['3'] = self.uf2_log(report(session))
+        self.logs['40'] = self.uf2_log(report(session, error='restore left children that survived SIGKILL'))
+        self.assertEqual([(x['cell'], x['onBase']) for x in self.entries(JOB.format(3))[0]['cells']], [('report pass', 'same-failure')],
+                         'the base failed on the same survivors, beside its error')
+        self.logs['40'] = self.uf2_log(report(['/usr/bin/python3', '-B', 'usb_dfu.py'], error='restore left children that survived SIGKILL'))
+        self.assertEqual([x['onBase'] for x in self.entries(JOB.format(3))[0]['cells']], ['other-failure'])
+
+    def test_a_cleanup_survivor_is_placed_against_the_base_by_its_error_and_name_not_its_pid(self):
+        passed = json.loads((UF2 / 'pass.json').read_text())['results'][0]
+        def report(error, pid):
+            cleanup = {'pass': False, 'state': 'unknown', 'detail': error, 'evidence': {}, 'heldAfter': True,
+                       'survivors': [{'pid': pid, 'start': pid * 10, 'cmd': ['/opt/SEGGER/JLinkExe', '-USB', '1']}]}
+            return json.dumps({'pass': False, 'caveat': '', 'results': [{**passed, 'pass': False, 'cleanup': cleanup}]})
+        sigterm = 'Interrupted: interrupted by SIGTERM'
+        self.logs['3'], self.logs['40'] = self.uf2_log(report(sigterm, 9)), self.uf2_log(report(sigterm, 90))
+        c = self.entries(JOB.format(3))[0]
+        self.assertEqual([(x['cell'], x['signature'], x['onBase']) for x in c['cells']],
+                         [(f'{S3} cleanup', f'{S3} cleanup: Failed: {sigterm}; survivors JLinkExe', 'same-failure')])
+        self.logs['40'] = self.uf2_log(report('StepFail: JLinkExe timed out after 60s', 9))
+        self.assertEqual([x['onBase'] for x in self.entries(JOB.format(3))[0]['cells']], ['other-failure'], 'the error still signs')
+
+    def test_a_jobs_signature_is_the_same_when_only_survivor_pids_change(self):
+        def entry(pid, start):
+            self.logs['3'] = self.uf2_log(json.dumps({'pass': False, 'caveat': '', 'results': [],
+                                                      'survivors': [{'pid': pid, 'start': start, 'cmd': ['JLinkExe', '-USB', '1']}]}))
+            return self.entries(JOB.format(3))[0]
+        first, second = entry(9, 123), entry(90, 456)
+        self.assertEqual((first['firstError'], first['signature']), (second['firstError'], second['signature']))
+        self.assertEqual(first['firstError'], 'report  pass  ...  Failed: survivors JLinkExe')
+
+    def test_a_malformed_survivor_command_is_named_not_a_traceback(self):
+        self.logs['3'] = self.uf2_log('{"pass": false, "caveat": "", "results": [], "survivors": [{"cmd": 5}, {"cmd": {"a": 1}}, {"cmd": [null]}]}')
+        c = self.entries(JOB.format(3))[0]
+        self.assertEqual((c['error'], [x['signature'] for x in c['cells']]), (None, ['report pass: Failed: survivors ?, ?, ?']))
+
+    def test_a_log_holding_several_tinyuf2_reports_reads_no_cells(self):
+        self.logs['3'] = self.uf2_log('fail.json', 'pass.json')
+        c = self.entries(JOB.format(3))[0]
+        self.assertEqual((c['cells'], c['cellsError']), ([], 'the log holds 2 TinyUF2 reports (lines 8, 9): cells read none; read its log'),
+                         'never the last report alone, nor table rows')
+        self.assertEqual(c['error'], None)
+
+    def test_a_base_log_holding_several_tinyuf2_reports_places_no_cell(self):
+        self.logs['3'] = self.uf2_log('fail.json')
+        for conclusion in ('failure', 'success'):
+            self.run_jobs['70'][0]['conclusion'] = conclusion
+            self.logs['40'] = self.uf2_log('fail.json', 'pass.json')
+            c = self.entries(JOB.format(3))[0]
+            self.assertEqual((c['error'], [x['onBase'] for x in c['cells']]), (None, [None]), conclusion)
+            self.assertEqual(c['base']['cellsError'], 'the log holds 2 TinyUF2 reports (lines 8, 9): cells read none; read its log')
+            self.assertNotIn('cellsError', c)
 
     def test_report_level_cells_are_passed_against_a_base_report_and_not_run_without_one(self):
         self.logs['3'] = self.uf2_log('{"pass": false, "caveat": "", "error": "roster rejected", "results": []}')
@@ -592,16 +683,16 @@ class FailuresTest(unittest.TestCase):
         self.logs['40'] = log(*STEP[:9], 'Total failed: 1', *STEP[11:])
         self.assertEqual([x['onBase'] for x in self.entries(JOB.format(3))[0]['cells']], ['not-run'], 'a tinyusb base has no report')
 
-    def test_the_last_tinyuf2_report_counts_and_other_json_is_not_one(self):
+    def test_every_tinyuf2_report_is_found_and_other_json_is_not_one(self):
         fail, ok = (UF2 / 'fail.json').read_text().strip(), (UF2 / 'pass.json').read_text().strip()
-        self.assertEqual(collect.uf2_report([fail, '{"pass": true}', '{not json']), (1, json.loads(fail)))
-        self.assertEqual(collect.uf2_report([fail, ok])[0], 2)
-        self.assertIsNone(collect.uf2_report(['{"results": []}', 'plain']))
-        self.assertIsNone(collect.uf2_report(['{"pass": true, "results": []}']), 'hil_test.py always prints a caveat')
+        self.assertEqual(collect.uf2_reports([fail, '{"pass": true}', '{not json']), [(1, json.loads(fail))])
+        self.assertEqual([n for n, _ in collect.uf2_reports([fail, 'plain', ok])], [1, 3])
+        self.assertEqual(collect.uf2_reports(['{"results": []}', 'plain']), [])
+        self.assertEqual(collect.uf2_reports(['{"pass": true, "results": []}']), [], 'hil_test.py always prints a caveat')
         for bad in ('[null]', '[{"steps": {}}]', '[{"steps": [1]}]', '[{"cleanup": "x"}]', '[], "survivors": [1]',
                     '[{"cleanup": {"survivors": [1]}}]'):
-            self.assertEqual(collect.uf2_report([fail, f'{{"pass": true, "caveat": "", "results": {bad}}}']),
-                             (1, json.loads(fail)), bad)
+            self.assertEqual(collect.uf2_reports([fail, f'{{"pass": true, "caveat": "", "results": {bad}}}']),
+                             [(1, json.loads(fail))], bad)
 
     def test_changed_paths_are_read_for_any_readable_check_and_their_failure_is_named(self):
         rc, r = self.main('https://greptile.com/')
