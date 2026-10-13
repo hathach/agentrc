@@ -258,7 +258,7 @@ What is specific to the projects these skills have been used on, one file
 each, for all six skills: their symbols, typical issues and the behaviour of
 their code, releases and CI firmware; a project's build, rig and battery
 procedure stays in its own contracts. Read it with `families.md`'s section for
-the board's chip. Match the project by its repository identity
+the board's chip, when it has one. Match the project by its repository identity
 (`git remote get-url origin`), not by a directory name:
 
 | Repository | Notes |
