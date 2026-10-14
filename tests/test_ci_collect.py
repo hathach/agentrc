@@ -101,7 +101,7 @@ class InventoryTest(unittest.TestCase):
                           self.check('lint', 'cancel', 'https://example.com/x')]]
         rc, r = self.main()
         self.assertEqual((rc, r['status'], r['pending']), (0, 'red', 0))
-        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'only what the workflow reads, and no null error')
+        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
         self.assertEqual([c['aliases'] for c in r['checks']], [[], [], []], 'printed empty, so a relay has nothing to add (#50)')
@@ -193,7 +193,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []))
-        self.assertEqual(sorted(r), ['checks', 'head', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'the same members as a whole line')
+        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'pending', 'registered', 'status', 'waiting'], 'the same members as a whole line')
         self.listings = [[self.check('hil', 'pass', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((r['status'], [c['link'] for c in r['checks']]), ('red', [JOB.format(4)]), 'settled: the whole inventory')
@@ -307,6 +307,69 @@ class InventoryTest(unittest.TestCase):
         with mock.patch.object(collect.subprocess, 'run', wraps=collect.subprocess.run) as spy:
             self.main()
         self.assertTrue(all(['--repo', 'o/r'] == c.args[0][4:6] for c in spy.call_args_list))
+
+    def test_an_ignored_check_is_left_out_by_its_exact_name_in_any_bucket(self):
+        self.heads = [HEAD]
+        real = self.check('hil', 'pass', JOB.format(1))
+        for bucket in ('pending', 'fail', 'cancel', 'pass'):
+            self.listings = [[self.check('CodeRabbit', bucket, ''), real]]
+            rc, r = self.main('--ignore-check', 'CodeRabbit')
+            self.assertEqual((rc, r['status'], r['registered'], r['pending'], r['checks'], r['ignored']),
+                             (0, 'green', 1, 0, [], ['CodeRabbit']), bucket)
+        for name in ('CodeRabbit Review', 'coderabbit', 'SonarCloud Code Analysis'):
+            self.listings = [[self.check(name, 'fail', ''), real]]
+            rc, r = self.main('--ignore-check', 'CodeRabbit')
+            self.assertEqual((r['status'], [c['name'] for c in r['checks']], r['ignored']), ('red', [name], []), name)
+
+    def test_only_ignored_checks_read_as_none_registered(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('CodeRabbit', 'pass', '')]]
+        rc, r = self.main('--ignore-check', 'CodeRabbit', '--brief')
+        self.assertEqual((rc, r['status'], r['registered'], r['pending'], r['ignored']), (0, 'running', 0, 0, ['CodeRabbit']))
+        self.listings = [(1, "no checks reported on the 'x' branch")]
+        none = self.main('--ignore-check', 'CodeRabbit')[1]
+        self.assertEqual((none['status'], none['registered'], none['ignored']), ('running', 0, []), 'truly empty: nothing ignored')
+        self.assertEqual(none['waiting'], r['waiting'], 'an ignored check is no movement')
+
+    def test_an_ignored_check_does_not_move_the_waiting_fingerprint(self):
+        self.heads = [HEAD]
+        hil = self.check('hil', 'pending', JOB.format(3))
+        self.listings = [[self.check('CodeRabbit', 'pending', ''), hil]]
+        before = self.main('--ignore-check', 'CodeRabbit')[1]
+        self.listings = [[self.check('CodeRabbit', 'pass', ''), hil]]
+        after = self.main('--ignore-check', 'CodeRabbit')[1]
+        self.assertEqual((after['waiting'], after['pending'], after['registered']), (before['waiting'], 1, 1))
+
+    def test_only_ignored_checks_keep_the_pr_guards(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('CodeRabbit', 'pending', '')]]
+        for mergeable, status in (('UNKNOWN', 'running'), ('CONFLICTING', 'conflicting')):
+            self.mergeable = [mergeable]
+            rc, r = self.main('--ignore-check', 'CodeRabbit')
+            self.assertEqual((rc, r['status'], r['mergeable'], r['ignored']), (0, status, mergeable, ['CodeRabbit']))
+        self.mergeable = ['MERGEABLE']
+        self.heads = [HEAD, OTHER]
+        rc, r = self.main('--ignore-check', 'CodeRabbit')
+        self.assertEqual(rc, 1)
+        self.assertIn(f'head moved to {OTHER}', r['error'])
+        self.heads, self.states = [HEAD], ['MERGED']
+        rc, r = self.main('--ignore-check', 'CodeRabbit')
+        self.assertEqual((rc, r['status'], r['ignored']), (0, 'merged', []))
+
+    def test_a_real_check_registered_during_the_wait_decides(self):
+        self.heads = [HEAD]
+        rabbit = self.check('CodeRabbit', 'pending', '')
+        self.listings = [[rabbit], [rabbit, self.check('hil', 'pending', JOB.format(3))], [rabbit, self.check('hil', 'fail', JOB.format(3))]]
+        rc, r = self.main('--ignore-check', 'CodeRabbit', '--wait-seconds', '600')
+        self.assertEqual((r['status'], r['registered'], [c['name'] for c in r['checks']], r['ignored'], self.clock[0]),
+                         ('red', 1, ['hil'], ['CodeRabbit'], 60))
+
+    def test_ignore_check_is_for_inventory_with_distinct_names(self):
+        for argv in (['failures', '--check', JOB.format(1), '--ignore-check', 'CodeRabbit'],
+                     ['inventory', '--ignore-check', ''], ['inventory', '--ignore-check', 'CodeRabbit', '--ignore-check', 'CodeRabbit']):
+            with self.assertRaises(SystemExit) as e, redirect_stdout(io.StringIO()), mock.patch('sys.stderr', io.StringIO()):
+                collect.main([*argv, '--repo', 'o/r', '--pr', '5', '--head', HEAD])
+            self.assertEqual(e.exception.code, 2, argv)
 
     def test_a_short_head_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as e, redirect_stdout(io.StringIO()), mock.patch('sys.stderr', io.StringIO()):

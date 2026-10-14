@@ -49,7 +49,9 @@ the script exits 2.
 waits a bounded time and lists a head's failed and cancelled checks with a
 count of pending ones (a failed CircleCI job counts as pending until its
 workflow finishes and can be re-run), calling a PR that conflicts with its base
-`conflicting`, or at once `merged`/`closed` for a PR no longer open, and
+`conflicting`, or at once `merged`/`closed` for a PR no longer open, leaving
+out any `--ignore-check NAME` (a review bot's status the caller waits on
+elsewhere), and
 `failures` saves each failing check's log and diagnostics, with the base
 branch's run of the same job, for the
 `pr-ci-watcher` judge; `remember` and `recall` keep the judge's verdicts beside

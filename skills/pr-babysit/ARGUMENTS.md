@@ -36,7 +36,12 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   environment setup it needs; default the repository's build contract, its
   setup and the tools it requires resolved with it, a missing one stopping
   `build-unverifiable` rather than failing the batch; per launch.
-- `ciWait`: minutes to wait on pending checks, default 30.
+- `ciWait`: minutes to wait on pending checks, default 30. CodeRabbit's own
+  check is left out when coderabbit is in `autoRun` and the review lane runs:
+  the review lane waits on it. A head with no other check registered settles
+  green at the CI wait's next slice boundary after the review lane's pass
+  (normally within 3 minutes, a later slice up to 9), not after the whole
+  wait; that pass is a grace period for checks that register late, not proof.
 - `ciNotes`: what the caller established about this PR's CI, handed to the
   judge verbatim; it never revises a placed verdict stored on the head, while
   a stored unclassified failure is judged again once the notes change.

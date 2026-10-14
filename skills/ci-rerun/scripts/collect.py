@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Collect a PR's CI state for a watcher, so no model spends turns waiting or listing.
 
-  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief]
+  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief] [--ignore-check NAME...]
   collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
-prints one JSON object {head, status, mergeable, pending, registered, waiting, checks}, plus `error` when set
+prints one JSON object {head, status, mergeable, pending, registered, ignored, waiting, checks}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error); every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
-again). The PR is read again on every poll. `status` is
+again). The PR is read again on every poll. A check named exactly an
+--ignore-check NAME (a review bot's status the caller tracks elsewhere) is left
+out of everything below, so a listing of only those is one with no check
+registered; `ignored` names those present, sorted, [] when none. `status` is
 merged or closed (the PR is no longer open: printed at once, waiting for and
 listing nothing, its head whatever the PR's last one was), else
 conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
@@ -194,7 +197,7 @@ def pull(repo, pr):
 def ended(view):
     """A merged or closed PR's inventory, nothing waited for or listed: a merged PR's mergeable stays UNKNOWN, running for good."""
     return {'head': view['headRefOid'], 'baseRef': view['baseRefName'], 'baseSha': view['baseRefOid'], 'status': view['state'].lower(),
-            'mergeable': view['mergeable'], 'counts': {}, 'checks': []}
+            'mergeable': view['mergeable'], 'counts': {}, 'ignored': [], 'checks': []}
 
 
 def listing(repo, pr):
@@ -307,7 +310,7 @@ def unfinished_held(repo, checks, workflows):
     return [{**c, 'bucket': 'pending'} if c['link'] in held else c for c in checks]
 
 
-def inventory(repo, pr, head, wait):
+def inventory(repo, pr, head, wait, ignore=()):
     view = before = pull(repo, pr)
     if before['state'] != 'OPEN':
         return ended(before)
@@ -316,7 +319,9 @@ def inventory(repo, pr, head, wait):
     start = time.monotonic()
     workflows = {}
     while True:
-        checks = unfinished_held(repo, listing(repo, pr), workflows)
+        everything = listing(repo, pr)
+        ignored = sorted({c['name'] for c in everything if c['name'] in ignore})
+        checks = unfinished_held(repo, [c for c in everything if c['name'] not in ignore], workflows)
         status, counts = summary(checks, view.get('mergeable'))
         waited = int(time.monotonic() - start)
         if status != 'running' or waited + POLL > wait:
@@ -337,7 +342,7 @@ def inventory(repo, pr, head, wait):
     if after['headRefOid'] != head:
         raise Failed(f'PR #{pr} head moved to {after["headRefOid"]} while collecting')
     return {'head': head, 'baseRef': before['baseRefName'], 'baseSha': before['baseRefOid'], 'status': summary(checks, after.get('mergeable'))[0],
-            'mergeable': after['mergeable'], 'counts': counts, 'checks': listed}
+            'mergeable': after['mergeable'], 'counts': counts, 'ignored': ignored, 'checks': listed}
 
 
 def fnv1a(text):
@@ -376,7 +381,7 @@ def printed(inv, brief=False):
         [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]
     pending = sorted([c['name'], c.get('link') or '', c.get('attempt') or ''] for c in inv['checks'] if c['bucket'] == 'pending')
     return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
-            'registered': sum(inv['counts'].values()),
+            'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
             'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed}
 
 
@@ -941,6 +946,7 @@ def main(argv=None):
     p.add_argument('--check', action='append', default=[], metavar='LINK')
     p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
     p.add_argument('--offset', type=int, help='recall: where the page to print starts, of the lone --check')
+    p.add_argument('--ignore-check', action='append', default=[], metavar='NAME', help='inventory: leave out the checks of this exact name')
     a = p.parse_args(argv)
     if a.offset is not None and (a.command != 'recall' or len(a.check) != 1):
         p.error('--offset is for recall with exactly one --check')
@@ -948,6 +954,10 @@ def main(argv=None):
         p.error('--gate is for failures')
     if a.brief and a.command != 'inventory':
         p.error('--brief is for inventory')
+    if a.ignore_check and a.command != 'inventory':
+        p.error('--ignore-check is for inventory')
+    if '' in a.ignore_check or len(set(a.ignore_check)) != len(a.ignore_check):
+        p.error('an --ignore-check name is empty or given more than once')
     if (a.command in ('failures', 'bases', 'recall')) != bool(a.check or a.gate):
         p.error('--check is for failures, bases and recall, which need at least one (failures: a --check or a --gate)')
     if len({*a.check, *a.gate}) != len(a.check) + len(a.gate):
@@ -956,7 +966,7 @@ def main(argv=None):
         p.error('--head must be a full 40-hex SHA')
     try:
         if a.command == 'inventory':
-            out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds)), a.brief)
+            out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds), set(a.ignore_check)), a.brief)
         elif a.command == 'failures':
             out = failures(a.repo, a.pr, a.head, a.check, a.gate)
         elif a.command == 'bases':

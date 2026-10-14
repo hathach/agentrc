@@ -131,6 +131,8 @@ if (typeof coderabbitTrigger !== 'boolean') throw new Error('coderabbitTrigger m
 if (coderabbitTrigger && args.autoPush !== true) throw new Error("coderabbitTrigger ticks CodeRabbit's Trigger review box: it needs autoPush")
 if (coderabbitTrigger && !autoRun.includes('coderabbit')) throw new Error(`coderabbitTrigger needs coderabbit in autoRun ${JSON.stringify(autoRun)}`)
 const reviewLane = lane !== 'ci'
+// CodeRabbit's own check, by its exact name: the review lane waits on it, so CI leaves it out (#80). Never SonarCloud or code scanning, which are CI.
+const ciIgnored = reviewLane && autoRun.includes('coderabbit') ? ['CodeRabbit'] : []
 const STATE_VERSION = 4
 // A state crosses its caller, so it is sealed: canonical key order, any change fails the digest.
 const canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`
@@ -295,10 +297,10 @@ const COLLECT_CHECK = {
   },
 }
 const INVENTORY = withSeal({
-  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'waiting', 'checks'],
+  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
-    pending: { type: 'integer' }, registered: { type: 'integer' }, waiting: { type: 'string' },
+    pending: { type: 'integer' }, registered: { type: 'integer' }, ignored: { type: 'array', items: { type: 'string' } }, waiting: { type: 'string' },
     checks: { type: 'array', items: COLLECT_CHECK },
   },
 })
@@ -1807,6 +1809,11 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   // A head on which a whole wait found no check registered is read again at once, not waited out every cycle.
   const prior = ciWaitedBefore()
   const unregistered = !!prior && prior.head === expectedHead && prior.registered === 0
+  const ignoring = ciIgnored.map(name => ` --ignore-check ${shq(name)}`).join('')
+  // Only the review lane's checks registered, and its pass is done: they are its to wait on. The pass is a grace
+  // period for checks that register late, not proof none will.
+  const noneRegistered = (inv) => inv.status === 'running' && inv.registered === 0 && inv.mergeable === 'MERGEABLE'
+  const reviewOnly = (inv) => lanes.reviewDone && inv.ignored.length > 0 && noneRegistered(inv)
   // collect.py polls every 30 s, so a shorter slice would only list.
   let inv = null
   let last = false
@@ -1815,15 +1822,15 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
     // A --brief slice still running prints no checks, so a relay copies nothing it reads again; the budget's last slice is whole.
     last = left - slice < 30
-    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}`, INVENTORY)
+    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}${ignoring}`, INVENTORY)
     if (inventoryFailed(inv)) return null
     left -= slice
-    if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended) break
+    if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended || reviewOnly(inv)) break
   }
   // Leaving the wait early on a brief slice still running, the whole inventory is read once, as it stands now;
   // not when the review lane is publishing, which supersedes this CI run anyway.
-  if (!last && inv.status === 'running' && !lanes.reviewPublishing) {
-    inv = await collect(`ci:collect#${cycle}.full`, 'inventory --wait-seconds 0', INVENTORY)
+  if (!last && inv.status === 'running' && !lanes.reviewPublishing && !reviewOnly(inv)) {
+    inv = await collect(`ci:collect#${cycle}.full`, `inventory --wait-seconds 0${ignoring}`, INVENTORY)
     if (inventoryFailed(inv)) return null
   }
   if (['merged', 'closed'].includes(inv.status)) return endLanes(inv)
@@ -1834,9 +1841,13 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
     return null
   }
+  if (reviewOnly(inv)) {
+    log(`cycle ${cycle}: only ${inv.ignored.join(', ')} registered on ${inv.head.slice(0, 7)}, which the review lane waits on — nothing for CI to wait for`)
+    return { headSha: inv.head, status: 'green', infraRerun: [], realFailures: [] }
+  }
   // ciWaited: a whole wait that ended still running, what ci-stuck compares cycle to cycle; the read at once is no wait.
   const exhausted = last && !unregistered && !shortened && inv.status === 'running'
-  if (inv.status === 'running' && inv.registered === 0 && inv.mergeable === 'MERGEABLE' && (unregistered || exhausted)) {
+  if (noneRegistered(inv) && (unregistered || exhausted)) {
     entry.ciWaited = { head: inv.head, registered: 0 }
     log(`cycle ${cycle}: no CI check registered on ${inv.head.slice(0, 7)} after a whole ${ciWait}-minute wait — nothing to wait for`)
     return { headSha: inv.head, status: 'green', infraRerun: [], realFailures: [] }

@@ -290,6 +290,7 @@ async function run(opts = {}) {
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
           // Every read sees CI move unless a fixture fixes what it waits on.
           registered: ci.registered ?? Math.max(1, failed.length), waiting: ci.status === 'running' ? ci.waiting ?? label : '',
+          ignored: / --ignore-check /.test(text) ? ci.ignored ?? [] : [],
           ...(/ --brief /.test(text) && ci.status === 'running' ? { checks: [] } : {}),
         }
       } else {
@@ -1444,7 +1445,7 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
 test('the CI lane waits out its budget in slices, 30 minutes by default', async () => {
   const sliceCalls = (calls) => calls.filter(c => /^ci:collect#1\.\d+$/.test(c.label))
   const slices = (calls) => sliceCalls(calls)
-    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+)(?: --brief)? --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
+    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+)(?: --brief)?(?: --ignore-check '[^']*')* --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
   const { calls } = await run({ ci: RUNNING, args: { maxCycles: 1 } })
   assert.equal(slices(calls).reduce((a, b) => a + b), 30 * 60)
   const briefs = sliceCalls(calls).map(c => / --brief /.test(c.prompt))
@@ -1458,6 +1459,39 @@ test('the CI lane waits out its budget in slices, 30 minutes by default', async 
   assert.equal(slices(ciOnly.calls)[0], 540, 'no review lane to wait for')
   const green = await run()
   assert.deepEqual(green.labels.filter(l => l.startsWith('ci:')), ['ci:collect#1.1'], 'a settled inventory needs no judge, nor a full read')
+})
+
+// Each inventory read's wait in seconds, of one cycle.
+const inventoryWaits = (calls, cycle) => calls.filter(c => c.label.startsWith(`ci:collect#${cycle}.`) && / inventory /.test(c.prompt))
+  .map(c => Number(c.prompt.match(/inventory --wait-seconds (\d+)/)[1]))
+
+test("a review bot's own check is left to the review lane, and CI settles once the review pass is done (#80)", async () => {
+  const onlyBot = { ...RUNNING, pending: 0, registered: 0, waiting: 'none', ignored: ['CodeRabbit'] }
+  const reads = (calls) => calls.filter(c => c.label.startsWith('ci:collect#') && / inventory /.test(c.prompt))
+  const waited = (calls) => inventoryWaits(calls, 1).reduce((a, b) => a + b, 0)
+  const settled = await run({ ci: onlyBot, reviews: WAITING, args: { maxCycles: 2 } })
+  assert.ok(reads(settled.calls).length && reads(settled.calls).every(c => / --ignore-check 'CodeRabbit' /.test(c.prompt)), 'every read')
+  assert.ok(settled.logs.some(l => l.includes('only CodeRabbit registered on 0f1e2d3, which the review lane waits on')), settled.logs.join('\n'))
+  assert.ok(waited(settled.calls) < 30 * 60, 'no whole wait')
+  assert.equal(settled.calls.some(c => c.label === 'ci:collect#1.full'), false, 'its brief read stands')
+  assert.deepEqual(settled.result.history.map(e => [e.ci.status, e.ciWaited]), [['green', undefined], ['green', undefined]], 'reviews still pending')
+  // A review pass that never finished leaves the whole-wait rule.
+  const cut = await run({ ci: onlyBot, throwOn: (l) => l.startsWith('reviews#'), args: { maxCycles: 1 } })
+  assert.equal(cut.logs.some(l => l.includes('which the review lane waits on')), false, cut.logs.join('\n'))
+  assert.ok(cut.calls.some(c => c.label === 'ci:collect#1.full') && reads(cut.calls).every(c => / --ignore-check 'CodeRabbit'/.test(c.prompt)), 'the full read too')
+  const retried = await run({ ci: onlyBot, reviews: WAITING, throwOn: (l) => l === 'ci:collect#1.1', args: { maxCycles: 1 } })
+  assert.match(retried.calls.find(c => c.label === 'ci:collect#1.1.retry').prompt, /inventory --wait-seconds 0 --brief --ignore-check 'CodeRabbit' /)
+  // A real check registered beside it is waited out, and only real checks count toward ci-stuck.
+  const real = await run({ ci: { ...RUNNING, ignored: ['CodeRabbit'] }, reviews: WAITING, args: { maxCycles: 1 } })
+  assert.equal(waited(real.calls), 30 * 60)
+  const stuck = await run({ ci: { ...RUNNING, pending: 2, waiting: 'same', ignored: ['CodeRabbit'] }, args: { maxCycles: 4 } })
+  assert.equal(stuck.result.reason, 'ci-stuck')
+  // Only when the review lane waits on CodeRabbit.
+  for (const args of [{ lane: 'ci', yieldAfterCycle: true }, { reviewers: [] }, { reviewers: ['greptile'] },
+    { reviewers: ['coderabbit', 'greptile'], autoRun: ['greptile'] }]) {
+    const { calls } = await run({ ci: onlyBot, args: { ...args, maxCycles: 1 } })
+    assert.ok(reads(calls).length && reads(calls).every(c => !/--ignore-check/.test(c.prompt)), JSON.stringify(args))
+  }
 })
 
 test('CI that saw nothing move through two whole waits on one head stops ci-stuck, across a resume too', async () => {
@@ -1501,12 +1535,10 @@ test('a head with no check registered after a whole wait is read at once on late
   const green = await run({ ci: none })
   assert.equal(green.result.pass, true, 'nothing to wait for once the whole wait found no check')
   assert.ok(green.logs.some(l => l.includes('no CI check registered on 0f1e2d3 after a whole 30-minute wait')), green.logs.join('\n'))
-  const waits = (calls, cycle) => calls.filter(c => c.label.startsWith(`ci:collect#${cycle}.`))
-    .map(c => Number(c.prompt.match(/inventory --wait-seconds (\d+)/)[1]))
   const { calls, result } = await run({ ci: (l) => /^ci:collect#[123]\./.test(l) ? none : RUNNING, reviews: WAITING, args: { maxCycles: 5 } })
-  assert.equal(waits(calls, 1).reduce((a, b) => a + b), 30 * 60)
-  assert.deepEqual([waits(calls, 2), waits(calls, 3), waits(calls, 4)], [[0], [0], [0]], 'read at once, cycle after cycle')
-  assert.equal(waits(calls, 5).reduce((a, b) => a + b), 30 * 60, 'checks registered since: waited out again')
+  assert.equal(inventoryWaits(calls, 1).reduce((a, b) => a + b), 30 * 60)
+  assert.deepEqual([inventoryWaits(calls, 2), inventoryWaits(calls, 3), inventoryWaits(calls, 4)], [[0], [0], [0]], 'read at once, cycle after cycle')
+  assert.equal(inventoryWaits(calls, 5).reduce((a, b) => a + b), 30 * 60, 'checks registered since: waited out again')
   assert.deepEqual(result.history.map(e => e.ci.status), ['green', 'green', 'green', 'running', 'running'])
   // Mergeability unknown is no proof that nothing will register.
   const unknown = await run({ ci: { ...none, mergeable: 'UNKNOWN' }, args: { maxCycles: 1 } })
