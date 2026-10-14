@@ -13,4 +13,6 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
 - Verify every change with `python -X utf8 -m unittest discover -s tests`,
   which also runs the workflow harnesses under node.
 - `pr-babysit` args for this repo:
-  `{"pr": <num>, "reviewers": ["coderabbit", "copilot"], "coderabbitTrigger": true}`.
+  `{"pr": <num>, "reviewers": ["coderabbit", "copilot", "greptile"], "autoRun": ["coderabbit"], "coderabbitTrigger": true}`;
+  Greptile auto-reviews on `open` events (`.greptile/config.json`); request
+  another review with `@greptileai`.
