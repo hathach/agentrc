@@ -75,7 +75,14 @@ def git(*args, cwd=None, gitdir=None, input=None):
 
 
 def head_oid(gitdir):
-    return run(['git', '--git-dir', str(gitdir), 'rev-parse', '-q', '--verify', 'HEAD']).stdout.strip()
+    """HEAD's object id, or None on a branch not yet born; Keep when HEAD cannot be read."""
+    done = run(['git', '--git-dir', str(gitdir), 'rev-parse', '-q', '--verify', 'HEAD'])
+    if not done.returncode and done.stdout.strip():
+        return done.stdout.strip()
+    branch = run(['git', '--git-dir', str(gitdir), 'symbolic-ref', '-q', 'HEAD'])
+    if done.returncode == 1 and not branch.returncode and not refs(gitdir, branch.stdout.strip()):
+        return None
+    raise Keep(f'HEAD unreadable in {gitdir} (exit {done.returncode}: {done.stderr.strip()})')
 
 
 def refs(gitdir, *patterns):
@@ -91,6 +98,13 @@ def unkept(entries, gitdir, *, against=('--branches', '--tags', '--remotes')):
     off = set(git('rev-list', '--stdin', '--not', *against, gitdir=gitdir,
                   input=''.join(f'{oid}\n' for oid in commits)).split()) if commits else set()
     return [e for e in entries if e[1] != 'commit' or e[0] in off]
+
+
+def walk(top):
+    """os.walk that keeps the child on a directory it cannot list."""
+    def fail(err):
+        raise Keep(f'cannot list {err.filename}: {err.strerror}')
+    return os.walk(top, onerror=fail)
 
 
 def is_within(path, roots):
@@ -171,7 +185,7 @@ def nested_repo(child, allowed):
     or None. The whole tree: a repository initialized inside a tracked directory shows in no status or
     ignored listing."""
     allowed = {os.path.realpath(p) for p in [child, *allowed]}
-    for top, dirs, files in os.walk(child):
+    for top, dirs, files in walk(child):
         bare = 'HEAD' in files and 'objects' in dirs and 'refs' in dirs
         if ('.git' in dirs or '.git' in files or bare) and os.path.realpath(top) not in allowed:
             return top
@@ -182,16 +196,16 @@ def nested_repo(child, allowed):
 
 def doomed_stores(child, gitdir, sub_gitdirs):
     """Git dirs the removal deletes: submodule git dirs inside the child or its git dir, and every
-    module repository stored under the child's git dir (deinitialized ones included)."""
+    repository stored anywhere under the child's git dir (deinitialized submodules included)."""
     stores = {os.path.realpath(d) for d in sub_gitdirs if is_within(d, [child, gitdir])}
-    for top, dirs, files in os.walk(gitdir / 'modules'):
+    for top, dirs, files in walk(gitdir):
         if 'HEAD' in files and 'objects' in dirs:
             stores.add(os.path.realpath(top))
-            dirs[:] = ['modules'] if 'modules' in dirs else []
+            dirs.remove('objects')
     return sorted(stores)
 
 
-def check_store(store, child, gitdir, common):
+def check_store(store, child, gitdir, common, doomed):
     if git('for-each-ref', 'refs/stash', gitdir=store).strip():
         raise Keep(f'a stash in submodule repository {store}')
     # a linked worktree's HEAD and refs/worktree are its own and checked nowhere, even when inside the child
@@ -199,12 +213,16 @@ def check_store(store, child, gitdir, common):
         if 'worktree' in wt and (i or not is_within(wt['worktree'], [child, gitdir])):
             raise Keep(f'submodule repository {store} has a worktree at {wt["worktree"]}')
     own = [r for r in refs(store) if not r[2].startswith('refs/remotes/')]
-    own += [(head_oid(store), 'commit', 'HEAD')] if head_oid(store) else []
+    head = head_oid(store)
+    own += [(head, 'commit', 'HEAD')] if head else []
     pending = unkept(own, store, against=('--remotes',))
     if not pending:
         return
     modules = Path(os.path.realpath(gitdir / 'modules'))
     survivor = common / 'modules' / Path(store).relative_to(modules) if is_within(store, [modules]) else None
+    # a copy that resolves into what the removal deletes would vouch for itself
+    if survivor and is_within(survivor, [child, gitdir, *doomed]):
+        survivor = None
     kept = {}
     if survivor and (survivor / 'objects').is_dir() and not (survivor / 'objects' / 'info' / 'alternates').exists():
         kept = {name: oid for oid, _, name in refs(survivor)}
@@ -226,15 +244,17 @@ def check(child):
     sub_gitdirs = [check_repo(repo) for repo in [child, *subs]][1:]
     held = refs(gitdir, *PRIVATE_REFS)
     if run(['git', '-C', str(child), 'symbolic-ref', '-q', 'HEAD']).returncode:
-        held.append((head_oid(gitdir), 'commit', 'HEAD'))
+        head = head_oid(gitdir)
+        held += [(head, 'commit', 'HEAD')] if head else []
     for _, _, name in unkept(held, gitdir):
         raise Keep('detached HEAD on a commit no branch, tag or remote holds' if name == 'HEAD'
                    else f'private ref {name} holds an object no shared ref holds')
     nested = nested_repo(child, subs)
     if nested:
         raise Keep(f'nested repository or worktree at {nested}')
-    for store in doomed_stores(child, gitdir, sub_gitdirs):
-        check_store(store, child, gitdir, common)
+    doomed = doomed_stores(child, gitdir, sub_gitdirs)
+    for store in doomed:
+        check_store(store, child, gitdir, common, doomed)
     # plain removal refuses a populated submodule or any modules/ store, deinitialized ones included
     return common, bool(subs) or (gitdir / 'modules').exists()
 

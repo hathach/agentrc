@@ -105,6 +105,29 @@ class WorktreeChildren(unittest.TestCase):
             self.git('fetch', '-q', '--no-tags', str(sub), f'{oid}:{primary_ref}', cwd=self.main / 'lib' / 'sub')
         return sub
 
+    def relocated_sub_store(self, child):
+        """Moves the child's submodule store to `custom-store` in its git dir and stashes a change there."""
+        sub = child / 'lib' / 'sub'
+        gitdir = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip())
+        old = Path(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip())
+        store = gitdir / 'custom-store'
+        old.rename(store)
+        (sub / '.git').write_text(f'gitdir: {store}\n')
+        self.git('config', '--file', str(store / 'config'), 'core.worktree', str(sub), cwd=child)
+        (sub / 'a.txt').write_text('stashed')
+        self.git('stash', '-q', cwd=sub)
+        return store
+
+    def git_wrapper(self, case):
+        """PATH for a `git` that runs the shell `case` arm on its arguments first."""
+        bin_dir = self.t / 'bin'
+        bin_dir.mkdir(exist_ok=True)
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!/bin/sh\ncase " $* " in {case};; esac\n'
+                           f'exec {shutil.which("git", path=self.env["PATH"])} "$@"\n')
+        wrapper.chmod(0o755)
+        return {'PATH': f'{bin_dir}{os.pathsep}{self.env["PATH"]}'}
+
     def drop_parent(self):
         self.git('worktree', 'remove', '--force', str(self.parent), cwd=self.main)
 
@@ -284,16 +307,15 @@ class WorktreeChildren(unittest.TestCase):
 
     def test_a_submodule_store_elsewhere_in_the_git_dir_is_checked(self):
         child = self.child()
-        sub = child / 'lib' / 'sub'
-        gitdir = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip())
-        old = Path(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip())
-        store = gitdir / 'custom-store'
-        old.rename(store)
-        (sub / '.git').write_text(f'gitdir: {store}\n')
-        self.git('config', '--file', str(store / 'config'), 'core.worktree', str(sub), cwd=child)
-        (sub / 'a.txt').write_text('stashed')
-        self.git('stash', '-q', cwd=sub)
+        self.relocated_sub_store(child)
         self.assert_kept(child, 'a stash in submodule repository')
+
+    def test_a_deinitialized_submodule_store_elsewhere_in_the_git_dir_is_checked(self):
+        child = self.child()
+        store = self.relocated_sub_store(child)
+        self.git('submodule', 'deinit', '-q', 'lib/sub', cwd=child)
+        self.assertEqual(list((child / 'lib' / 'sub').iterdir()), [])
+        self.assert_kept(child, f'a stash in submodule repository {store}')
 
     def test_a_nested_repository_under_a_submodules_ignored_path_keeps_the_child(self):
         child = self.child()
@@ -335,6 +357,54 @@ class WorktreeChildren(unittest.TestCase):
             'rev-parse', '--absolute-git-dir', cwd=sub).strip()) / 'objects') + '\n')
         self.assert_kept(child, 'is on no remote')
 
+    def test_a_primary_copy_linked_into_the_doomed_store_is_no_fallback(self):
+        child = self.child()
+        sub = self.unpublished_sub_tag(child)
+        copy = self.main / '.git' / 'modules' / 'lib' / 'sub'
+        copy.rename(copy.with_name('sub.orig'))
+        copy.symlink_to(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip())
+        self.assert_kept(child, 'refs/tags/saved in submodule repository')
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root lists any directory')
+    def test_a_directory_the_checks_cannot_list_keeps_the_child(self):
+        for case in ('child', 'git dir'):
+            with self.subTest(case):
+                self.tearDown()
+                self.setUp()
+                child = self.child()
+                if case == 'child':
+                    locked = child / 'build' / 'locked'
+                    self.git('init', '-q', str(locked / 'inner'), cwd=child)
+                else:
+                    sub = child / 'lib' / 'sub'
+                    (sub / 'a.txt').write_text('stashed')
+                    self.git('stash', '-q', cwd=sub)
+                    self.git('submodule', 'deinit', '-q', 'lib/sub', cwd=child)
+                    locked = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip()) / 'modules' / 'lib'
+                locked.chmod(0o300)
+                try:
+                    self.assert_kept(child, f'cannot list {locked}')
+                finally:
+                    locked.chmod(0o700)
+
+    def test_an_unreadable_head_keeps_the_child(self):
+        for case in ('child', 'submodule'):
+            with self.subTest(case):
+                self.tearDown()
+                self.setUp()
+                child = self.child()
+                repo = child if case == 'child' else child / 'lib' / 'sub'
+                self.git('checkout', '-q', '--detach', cwd=repo)
+                self.commit(repo, 'lost', 'only here')
+                if case == 'submodule':
+                    self.git('submodule', 'deinit', '-q', '-f', 'lib/sub', cwd=child)
+                self.drop_parent()
+                done = self.run_script('cleanup', str(self.parent),
+                                       env=self.git_wrapper('*" rev-parse -q --verify HEAD "*) exit 128'))
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertTrue(child.is_dir())
+                self.assertIn(f'kept {child}: HEAD unreadable', done.stdout)
+
     def test_a_submodule_worktree_outside_the_child_keeps_it(self):
         child = self.child()
         self.git('worktree', 'add', '-q', '--detach', str(self.t / 'outside'), cwd=child / 'lib' / 'sub')
@@ -358,14 +428,9 @@ class WorktreeChildren(unittest.TestCase):
         self.git('init', '-q', '-b', 'master', str(other), cwd=self.t)
         self.commit(other, '.gitignore', 'build/\n')
         child = self.child('foreign', repo=other)
-        bin_dir = self.t / 'bin'
-        bin_dir.mkdir()
-        wrapper = bin_dir / 'git'
-        wrapper.write_text(f'#!/bin/sh\ncase " $* " in *" worktree remove "*) echo late > "{child}/late.txt";; esac\n'
-                           f'exec {shutil.which("git", path=self.env["PATH"])} "$@"\n')
-        wrapper.chmod(0o755)
         self.drop_parent()
-        done = self.run_script('cleanup', str(self.parent), env={'PATH': f'{bin_dir}{os.pathsep}{self.env["PATH"]}'})
+        done = self.run_script('cleanup', str(self.parent),
+                               env=self.git_wrapper(f'*" worktree remove "*) echo late > "{child}/late.txt"'))
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertEqual((child / 'late.txt').read_text(), 'late\n')
         self.assertIn(f'kept {child}: `git worktree remove` failed', done.stdout)
