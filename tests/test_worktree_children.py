@@ -30,6 +30,7 @@ if sys.argv[1:3] == ['worktree', 'list']:
 
 # runs the script with DirEntry.is_dir failing on `inner`, as a stat can on a filesystem without d_type
 UNCLASSIFIABLE = r'''import os, runpy, sys
+from contextlib import contextmanager
 scandir = os.scandir
 class Entry:
     def __init__(self, entry):
@@ -40,18 +41,11 @@ class Entry:
         if self.entry.name == 'inner':
             raise OSError(5, 'Input/output error', self.entry.path)
         return self.entry.is_dir(follow_symlinks=follow_symlinks)
-class Listing:
-    def __init__(self, it):
-        self.it = it
-    def __enter__(self):
-        return self
-    def __exit__(self, *exc):
-        self.it.close()
-    def __iter__(self):
-        return self
-    def __next__(self):
-        return Entry(next(self.it))
-os.scandir = lambda path='.': Listing(scandir(path))
+@contextmanager
+def failing_scandir(path='.'):
+    with scandir(path) as listing:
+        yield (Entry(entry) for entry in listing)
+os.scandir = failing_scandir
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name='__main__')
 '''
