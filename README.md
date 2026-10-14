@@ -12,17 +12,18 @@ agents/        <name>.md for both agents, plus <name>.toml for Codex
 hooks/         Claude Code hooks, one folder each with a hooks.json
 workflows/     saved workflows (Claude only)
 statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
+plugins/       herdr plugins, one folder each with a herdr-plugin.toml
 tests/         unit tests for skill scripts, hooks and the installer
 ```
 
 ## Install
 
-Every entry is a symlink, so edits are live. Each flag takes every entry of
-its kind; nothing is installed by default.
+Every entry is a symlink or, for herdr plugins, a herdr link, so edits are
+live. Each flag takes every entry of its kind; nothing is installed by default.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
-~/code/agentrc/install.py install --skill --agent --workflow --claude-md --statusline
+~/code/agentrc/install.py install --skill --agent --workflow --claude-md --statusline --herdr-plugin
 ~/code/agentrc/install.py remove --skill
 ```
 
@@ -37,6 +38,14 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 - `--statusline`: the `statusline/` files into `~/.claude`, and `statusLine`
   in `~/.claude/settings.json`; `install` refuses if another one is set. The
   command names `$HOME/.claude`, so another `CLAUDE_CONFIG_DIR` can reuse it.
+- `--herdr-plugin`: each `plugins/*` folder through `herdr plugin link --enabled`.
+  `install` refuses if herdr holds the id from elsewhere; `remove` unlinks only
+  plugins linked from this checkout, which needs a running herdr server. herdr
+  steps run first, so a refusal of herdr's (such as `min_herdr_version`) changes
+  nothing.
+  `worktree-children` removes a herdr worktree's `<name>--*` sibling worktrees
+  when herdr removes it, keeping and reporting any that hold work (its
+  docstring lists the checks); `worktree_children.py cleanup <parent>` retries.
 
 The target directories stay real, so local entries sit beside the links.
 `install` refuses before touching anything if a target is a file or a
@@ -161,6 +170,9 @@ worktree:
 ~/code/agentrc/install.py install --agent --workflow --skill
 git worktree add .worktrees/<branch> -b <branch> <base> && cd .worktrees/<branch> && claude --agent chief
 ```
+
+From a herdr worktree the task worktree is its sibling `<checkout>--<branch>`
+instead (`instructions/user.md`, herdr worktrees).
 
 Headless, launch it through the [`headless-chief`](skills/headless-chief/SKILL.md)
 skill, which runs `claude -p --agent chief` and gives the caller chief's status

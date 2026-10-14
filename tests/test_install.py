@@ -9,6 +9,29 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.py'
 USER_MD = ROOT / 'instructions' / 'user.md'
+PLUGIN = ROOT / 'plugins' / 'worktree-children'
+PLUGIN_ID = 'agentrc.worktree-children'
+HERDR_STUB = f'''#!{sys.executable}
+import json, os, sys
+state = json.load(open(os.environ['STUB_STATE']))
+open(os.environ['STUB_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\\n')
+args = sys.argv[1:]
+if args == ['plugin', 'list', '--json']:
+    print(json.dumps({{'id': 'cli:plugin', 'result': {{'plugins': state['plugins']}}}}))
+elif args[:2] == ['plugin', 'link']:
+    if state['too_old']:
+        sys.exit('plugin requires Herdr 0.9.1 or newer')
+    state['plugins'] = [p for p in state['plugins'] if p['plugin_id'] != state['link_id']]
+    state['plugins'].append({{'plugin_id': state['link_id'], 'plugin_root': args[2], 'enabled': True,
+                             'source': {{'kind': 'local'}}}})
+elif args[:2] == ['plugin', 'unlink']:
+    if not state['running']:
+        sys.exit('herdr server is not running')
+    state['plugins'] = [p for p in state['plugins'] if p['plugin_id'] != args[2]]
+else:
+    sys.exit('unexpected ' + repr(args))
+json.dump(state, open(os.environ['STUB_STATE'], 'w'))
+'''
 SKILLS = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
 SKILL = SKILLS[0]
 SKILL_HOOKS = [s for s in SKILLS if (ROOT / 'hooks' / s / 'hooks.json').exists()]
@@ -249,6 +272,94 @@ class InstallTest(unittest.TestCase):
         self.ok('remove', '--claude-md')
         self.assertFalse((self.claude / 'CLAUDE.md').is_symlink())
         self.assertFalse((self.codex / 'AGENTS.md').is_symlink(), 'the relative Codex link is judged before Claude\'s goes')
+
+
+@unittest.skipIf(os.name == 'nt', 'the herdr stub is a shebang script')
+class HerdrPluginTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        self.state, self.log, stub = self.home / 'state.json', self.home / 'calls', self.home / 'herdr'
+        stub.write_text(HERDR_STUB)
+        stub.chmod(0o755)
+        self.env = {**os.environ, 'HOME': str(self.home), 'HERDR_BIN_PATH': str(stub),
+                    'STUB_STATE': str(self.state), 'STUB_LOG': str(self.log)}
+        self.arrange()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def arrange(self, too_old=False, running=True, plugins=()):
+        self.state.write_text(json.dumps({'too_old': too_old, 'running': running, 'plugins': list(plugins),
+                                          'link_id': PLUGIN_ID}))
+        self.log.write_text('')
+
+    def mine(self, enabled=True):
+        return {'plugin_id': PLUGIN_ID, 'plugin_root': str(PLUGIN), 'enabled': enabled, 'source': {'kind': 'local'}}
+
+    def run_cli(self, *argv):
+        return subprocess.run([sys.executable, str(SCRIPT), *argv, '--herdr-plugin'], capture_output=True,
+                              text=True, env=self.env)
+
+    def changes(self):
+        return [c for c in self.log.read_text().splitlines() if c.split()[:2] in (['plugin', 'link'], ['plugin', 'unlink'])]
+
+    def plugins(self):
+        return json.loads(self.state.read_text())['plugins']
+
+    def test_install_links_enabled_once_and_relinks_a_disabled_one(self):
+        done = self.run_cli('install')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.changes(), [f'plugin link {PLUGIN} --enabled'])
+        self.assertIn(f'herdr plugin {PLUGIN_ID} ->', done.stdout)
+        self.log.write_text('')
+        done = self.run_cli('install')
+        self.assertEqual((done.returncode, done.stdout, self.changes()), (0, '', []), 'a rerun is silent')
+        self.arrange(running=False, plugins=[self.mine(enabled=False)])
+        self.assertEqual(self.run_cli('install').returncode, 0)
+        self.assertEqual(self.plugins(), [self.mine()], 'link replaced the disabled entry, no server needed')
+
+    def test_install_refuses_before_any_change(self):
+        foreign = {**self.mine(), 'plugin_root': '/elsewhere', 'source': {'kind': 'github'}}
+        cases = {
+            'the id held from elsewhere': (dict(plugins=[foreign]), 'unlink it first'),
+            'the id linked from another checkout': (dict(plugins=[{**self.mine(), 'plugin_root': '/other'}]),
+                                                    'unlink it first'),
+            'herdr refusing the link': (dict(too_old=True), 'requires Herdr 0.9.1'),
+        }
+        for case, (state, message) in cases.items():
+            with self.subTest(case):
+                self.arrange(**state)
+                done = self.run_cli('install', '--claude-md')
+                self.assertEqual(done.returncode, 1)
+                self.assertIn(message, done.stderr)
+                self.assertEqual(self.plugins(), state.get('plugins', []))
+                self.assertFalse((self.home / '.claude').exists(), 'no link was made either')
+        self.env['HERDR_BIN_PATH'] = ''
+        self.env['PATH'] = ''
+        done = self.run_cli('install')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('herdr is not on PATH', done.stderr)
+
+    def test_remove_unlinks_only_our_link_before_any_other_change(self):
+        self.arrange(plugins=[self.mine()])
+        subprocess.run([sys.executable, str(SCRIPT), 'install', '--claude-md'], env=self.env, check=True,
+                       capture_output=True)
+        self.arrange(running=False, plugins=[self.mine()])
+        done = self.run_cli('remove', '--claude-md')
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('server is not running', done.stderr)
+        self.assertTrue((self.home / '.claude' / 'CLAUDE.md').is_symlink(), 'refused before unlinking')
+        self.arrange(plugins=[self.mine()])
+        done = self.run_cli('remove')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.changes(), [f'plugin unlink {PLUGIN_ID}'])
+        self.assertEqual(self.plugins(), [])
+        self.arrange(plugins=[{**self.mine(), 'plugin_root': '/other'}])
+        done = self.run_cli('remove')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('left alone', done.stdout)
+        self.assertEqual(self.changes(), [])
 
 
 if __name__ == '__main__':

@@ -1,0 +1,9 @@
+id = "agentrc.worktree-children"
+name = "Worktree children"
+version = "0.1.0"
+min_herdr_version = "0.9.1"
+description = "Remove a herdr worktree's <name>--* sibling worktrees with it, keeping any that hold work"
+
+[[events]]
+on = "worktree.removed"
+command = ["python3", "worktree_children.py", "event"]

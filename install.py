@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Link parts of this checkout into ~/.claude and ~/.codex, by explicit choice.
 
-    install.py install --skill --agent --workflow --claude-md --statusline
+    install.py install --skill --agent --workflow --claude-md --statusline --herdr-plugin
     install.py remove --skill
 
 Skills link into ~/.claude/skills and ~/.codex/skills; agents into
@@ -11,8 +11,10 @@ merged into ~/.claude/settings.json; workflows into ~/.claude/workflows
 (Claude only);
 --claude-md links instructions/user.md as ~/.claude/CLAUDE.md and
 ~/.codex/AGENTS.md; --statusline links the statusline/ files into ~/.claude
-and sets statusLine in its settings.json. Each flag takes every entry of its
-kind; nothing is selected by default. Everything is a symlink, so edits are
+and sets statusLine in its settings.json; --herdr-plugin links each plugins/*
+herdr plugin into herdr with `herdr plugin link <dir> --enabled` (herdr keeps
+the registration, so edits are live too). Each flag takes every entry of its
+kind; nothing is selected by default. Everything else is a symlink, so edits are
 live and a rerun after a change is a no-op.
 
 Refuses before touching anything when a destination holds something that is
@@ -20,15 +22,20 @@ not a link, or a directory to link into is a file or a dangling link. `remove`
 unlinks the named entries whatever they point to but never deletes a real
 file or directory; --claude-md and --statusline links are removed only when
 they link into this checkout, and statusLine only when it is the one install
-writes.
+writes. A herdr plugin is linked unless herdr holds its id from elsewhere,
+and unlinked only when linked from this checkout; herdr steps run before any
+link, so herdr's own refusals (min_herdr_version, unlink without a running
+server) change nothing.
 """
 import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
@@ -235,6 +242,55 @@ def write_settings(before, after):
     print(f'updated {path}')
 
 
+# --- herdr plugins ------------------------------------------------------------
+
+def herdr_plugins():
+    """(id, directory) of every plugins/* herdr plugin."""
+    return [(tomllib.loads(toml.read_text())['id'], toml.parent)
+            for toml in sorted((REPO / 'plugins').glob('*/herdr-plugin.toml'))]
+
+
+def herdr(*args):
+    exe = os.environ.get('HERDR_BIN_PATH') or shutil.which('herdr')
+    if not exe:
+        refuse('herdr is not on PATH; install it or leave out --herdr-plugin')
+    return subprocess.run([exe, *args], capture_output=True, text=True)
+
+
+def plan_herdr(install):
+    """[(herdr argv, message)] to link or unlink our plugins. herdr's own refusals (an older herdr
+    than min_herdr_version, unlink without a running server) come from run_herdr, which runs before
+    any other change."""
+    listed = herdr('plugin', 'list', '--json')
+    try:
+        plugins = {p['plugin_id']: p for p in json.loads(listed.stdout)['result']['plugins']}
+    except (ValueError, KeyError, TypeError):
+        refuse(f'`herdr plugin list --json` gave no plugin list: {(listed.stderr or listed.stdout).strip()}')
+    steps = []
+    for pid, d in herdr_plugins():
+        cur = plugins.get(pid)
+        mine = bool(cur) and cur.get('source', {}).get('kind') == 'local' and \
+            canonical(os.path.realpath(cur.get('plugin_root', ''))) == canonical(os.path.realpath(d))
+        if install:
+            if cur and not mine:
+                refuse(f'herdr already has plugin {pid} from {cur.get("plugin_root")}; unlink it first')
+            if not (cur and cur.get('enabled')):  # link replaces a disabled entry of the same id
+                steps.append((['plugin', 'link', str(d), '--enabled'], f'herdr plugin {pid} -> {d}'))
+        elif mine:
+            steps.append((['plugin', 'unlink', pid], f'unlinked herdr plugin {pid}'))
+        elif cur:
+            print(f'herdr plugin {pid} is not linked from this checkout, left alone')
+    return steps
+
+
+def run_herdr(steps):
+    for argv, message in steps:
+        done = herdr(*argv)
+        if done.returncode:
+            refuse(f'`herdr {" ".join(argv)}` failed: {(done.stderr or done.stdout).strip()}')
+        print(message)
+
+
 # --- command line -------------------------------------------------------------
 
 def selection(parser, args):
@@ -244,7 +300,7 @@ def selection(parser, args):
         chosen.append(('claude-md', None))
     if args.statusline:
         chosen.append(('statusline', None))
-    if not chosen:
+    if not chosen and not args.herdr_plugin:
         parser.error('nothing selected')
     return chosen
 
@@ -256,9 +312,11 @@ def main(argv=None):
         parser.add_argument(f'--{kind}', action='store_true', help=f'every {kind}')
     parser.add_argument('--claude-md', action='store_true', help='instructions/user.md as ~/.claude/CLAUDE.md, also ~/.codex/AGENTS.md')
     parser.add_argument('--statusline', action='store_true', help='the Claude Code status line')
+    parser.add_argument('--herdr-plugin', action='store_true', help='every plugins/* herdr plugin, through herdr')
     args = parser.parse_args(argv)
     chosen = selection(parser, args)
     pairs = [(kind, pair) for kind, name in chosen for pair in links(kind, name)]
+    herdr_steps = plan_herdr(args.action == 'install') if args.herdr_plugin else []
     hooks = [name for kind, name in chosen if kind == 'hook']
     planned = None
     if hooks or args.statusline:
@@ -268,6 +326,7 @@ def main(argv=None):
             refuse(f'{settings()} cannot be edited ({err!r}); fix it first')
 
     if args.action == 'remove':
+        run_herdr(herdr_steps)
         foreign = [dst for kind, (_, dst) in pairs if kind in ('claude-md', 'statusline') and not ours(dst)]
         for kind, (_, dst) in pairs:  # ownership settled before any unlink: the Codex link is relative
             if dst in foreign:
@@ -279,6 +338,7 @@ def main(argv=None):
         return
 
     preflight([pair for _, pair in pairs])
+    run_herdr(herdr_steps)
     for _, (src, dst) in pairs:
         link(src, dst)
     for kind in {kind for kind, _ in chosen if kind in KINDS}:
