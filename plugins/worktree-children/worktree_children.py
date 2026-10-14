@@ -6,11 +6,12 @@
 
 Children of `<dir>/<name>` are the entries `<dir>/<name>--*` (grandchildren `<name>--a--b`
 too) with a `.git` file that are linked git worktrees of any repository: the `<name>--` prefix is reserved for
-them by the user rule. Nothing runs while `<dir>/<name>` exists again: a late event or a retry
-must not sweep the children of a replacement parent.
+them by the user rule. Nothing runs while `<dir>/<name>` exists again, checked before each removal
+too: a late event or a retry must not sweep the children of a replacement parent.
 
-A child is removed (`git worktree remove --force`, needed because submodules make git refuse
-otherwise) only when every check below passes; otherwise it is kept and its reasons reported:
+A child is removed only when every check below passes; otherwise it is kept and its reasons reported.
+`git worktree remove` re-checks cleanliness at removal; `--force`, which skips that, is used only
+for a child with submodules (git refuses those otherwise), so a write racing its checks is lost.
 - herdr confirms it is not open as its own workspace (`herdr worktree list --cwd <child>`);
   herdr unreachable or an unexpected answer keeps it;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes;
@@ -19,10 +20,11 @@ otherwise) only when every check below passes; otherwise it is kept and its reas
   merge, cherry-pick, revert, rebase or bisect is in progress;
 - its private refs (refs/worktree, refs/bisect, refs/rewritten) are reachable from the
   repository's branches, tags or remotes;
-- no repository or worktree is nested anywhere below it (ignored directories included) other
-  than its submodules;
+- no repository (bare ones included) or worktree is nested anywhere below it (ignored
+  directories included) other than its submodules;
 - every repository whose storage the removal deletes (submodule git dirs inside the child or
-  inside its git dir, initialized or not) has no stash, no worktree outside that boundary, and
+  inside its git dir, initialized or not) has no stash, no linked worktree (even one inside the
+  child or pruned), its main worktree inside that boundary, and
   each of its refs and HEAD either a commit reachable from its own remote-tracking refs or
   present under the same name and object id in the primary checkout's copy of that submodule
   (`<common git dir>/modules/<name>`, used only when it borrows no objects through alternates);
@@ -42,6 +44,9 @@ import time
 from pathlib import Path
 
 PRIVATE_REFS = ('refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
+GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+                'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE')
+ENV = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION}  # so `git -C <child>` means the child
 OPERATIONS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'BISECT_LOG')
 HERDR = os.environ.get('HERDR_BIN_PATH') or 'herdr'
 STATE = os.environ.get('HERDR_PLUGIN_STATE_DIR')
@@ -55,7 +60,7 @@ class Keep(Exception):
 def run(args, cwd=None, input=None):
     """A finished command; one that cannot start reads as exit 127, so its check keeps the child."""
     try:
-        return subprocess.run(args, cwd=cwd, input=input, capture_output=True, text=True)
+        return subprocess.run(args, cwd=cwd, input=input, capture_output=True, text=True, env=ENV)
     except OSError as e:
         return subprocess.CompletedProcess(args, 127, '', str(e))
 
@@ -162,11 +167,13 @@ def submodules(child):
 
 
 def nested_repo(child, allowed):
-    """A .git file or directory below child other than at child and its submodules, or None. The whole
-    tree: a repository initialized inside a tracked directory shows in no status or ignored listing."""
+    """A .git file or directory or a bare repository below child other than at child and its submodules,
+    or None. The whole tree: a repository initialized inside a tracked directory shows in no status or
+    ignored listing."""
     allowed = {os.path.realpath(p) for p in [child, *allowed]}
     for top, dirs, files in os.walk(child):
-        if ('.git' in dirs or '.git' in files) and os.path.realpath(top) not in allowed:
+        bare = 'HEAD' in files and 'objects' in dirs and 'refs' in dirs
+        if ('.git' in dirs or '.git' in files or bare) and os.path.realpath(top) not in allowed:
             return top
         if '.git' in dirs:
             dirs.remove('.git')
@@ -187,8 +194,9 @@ def doomed_stores(child, gitdir, sub_gitdirs):
 def check_store(store, child, gitdir, common):
     if git('for-each-ref', 'refs/stash', gitdir=store).strip():
         raise Keep(f'a stash in submodule repository {store}')
-    for wt in worktree_entries(store):
-        if 'worktree' in wt and not is_within(wt['worktree'], [child, gitdir]):
+    # a linked worktree's HEAD and refs/worktree are its own and checked nowhere, even when inside the child
+    for i, wt in enumerate(worktree_entries(store)):
+        if 'worktree' in wt and (i or not is_within(wt['worktree'], [child, gitdir])):
             raise Keep(f'submodule repository {store} has a worktree at {wt["worktree"]}')
     own = [r for r in refs(store) if not r[2].startswith('refs/remotes/')]
     own += [(head_oid(store), 'commit', 'HEAD')] if head_oid(store) else []
@@ -209,7 +217,7 @@ def check_store(store, child, gitdir, common):
 
 def check(child):
     """Raise Keep when removing child could lose anything but ignored files and reflog-only commits;
-    returns the common git dir to remove it with."""
+    returns the common git dir to remove it with and whether that needs --force."""
     gitdir, common = linked_worktree(child)
     check_herdr(child)
     if (gitdir / 'locked').exists():
@@ -227,11 +235,12 @@ def check(child):
         raise Keep(f'nested repository or worktree at {nested}')
     for store in doomed_stores(child, gitdir, sub_gitdirs):
         check_store(store, child, gitdir, common)
-    return common
+    # plain removal refuses a populated submodule or any modules/ store, deinitialized ones included
+    return common, bool(subs) or (gitdir / 'modules').exists()
 
 
-def remove(child, common):
-    done = run(['git', '--git-dir', str(common), 'worktree', 'remove', '--force', str(child)])
+def remove(child, common, force):
+    done = run(['git', '--git-dir', str(common), 'worktree', 'remove', *['--force'] * force, str(child)])
     if done.returncode:
         raise Keep(f'`git worktree remove` failed, possibly part way: {done.stderr.strip()}')
 
@@ -263,7 +272,11 @@ def cleanup(parent):
     kept = []
     for child in children(parent):
         try:
-            remove(child, check(child))
+            removal = check(child)
+            if parent.exists():
+                log(f'{parent} exists again: not touching {child} or the children after it')
+                return 2
+            remove(child, *removal)
             log(f'removed {child}')
         except Keep as why:
             kept.append((child, str(why)))

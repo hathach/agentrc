@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,8 @@ mode = open(os.environ['STUB_MODE']).read().strip()
 if sys.argv[1:3] == ['worktree', 'list']:
     if mode == 'down':
         sys.exit('herdr server unreachable')
+    if mode == 'recreate':
+        os.makedirs(os.environ['STUB_PARENT'], exist_ok=True)
     path = sys.argv[sys.argv.index('--cwd') + 1]
     entry = {'path': path, 'is_linked_worktree': True}
     if mode == 'open':
@@ -37,7 +40,8 @@ class WorktreeChildren(unittest.TestCase):
                     'GIT_CONFIG_NOSYSTEM': '1', 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
                     'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t', 'GIT_CONFIG_COUNT': '1',
                     'GIT_CONFIG_KEY_0': 'protocol.file.allow', 'GIT_CONFIG_VALUE_0': 'always'}
-        for k in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE'):
+        for k in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+                  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE'):
             self.env.pop(k, None)
         stub = self.t / 'herdr'
         stub.write_text(STUB)
@@ -45,7 +49,7 @@ class WorktreeChildren(unittest.TestCase):
         self.calls, self.mode = self.t / 'calls', self.t / 'mode'
         self.mode.write_text('closed')
         self.env.update(HERDR_BIN_PATH=str(stub), STUB_LOG=str(self.calls), STUB_MODE=str(self.mode),
-                        HERDR_PLUGIN_STATE_DIR=str(self.t / 'state'))
+                        HERDR_PLUGIN_STATE_DIR=str(self.t / 'state'), STUB_PARENT=str(self.t / 'wt' / 'parent'))
         # an upstream for the submodule, and the main repository with it
         self.git('init', '-q', '--bare', str(self.t / 'sub.git'), cwd=self.t)
         self.git('clone', '-q', str(self.t / 'sub.git'), str(self.t / 'subwork'), cwd=self.t)
@@ -182,6 +186,17 @@ class WorktreeChildren(unittest.TestCase):
         self.git('checkout', '-q', '--detach', 'origin/master', cwd=sub)
         self.assertNotIn(oid, self.git('rev-parse', 'topic', cwd=sub))
         self.assert_removed(child)
+
+    def test_stray_git_location_variables_do_not_redirect_the_checks(self):
+        clean, dirty = self.child(), self.child('dirty')
+        (dirty / 'notes.txt').write_text('wip')
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), env={
+            'GIT_DIR': str(self.main / '.git'), 'GIT_WORK_TREE': str(self.main),
+            'GIT_INDEX_FILE': str(self.main / '.git' / 'index'), 'GIT_COMMON_DIR': str(self.main / '.git')})
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertFalse(clean.exists(), done.stdout)
+        self.assertIn(f'kept {dirty}: uncommitted or untracked changes', done.stdout)
 
     def test_an_unrelated_prunable_worktree_is_not_pruned(self):
         stale = self.wt / 'stale'
@@ -325,6 +340,36 @@ class WorktreeChildren(unittest.TestCase):
         self.git('worktree', 'add', '-q', '--detach', str(self.t / 'outside'), cwd=child / 'lib' / 'sub')
         self.assert_kept(child, 'has a worktree at')
 
+    def test_a_bare_repository_in_an_ignored_directory_keeps_the_child(self):
+        child = self.child()
+        self.git('init', '-q', '--bare', str(child / 'build' / 'store.git'), cwd=child)
+        self.assert_kept(child, f'nested repository or worktree at {child / "build" / "store.git"}')
+
+    def test_a_deleted_submodule_worktree_inside_the_child_on_a_unique_commit_keeps_it(self):
+        child = self.child()
+        subwt = child / 'build' / 'subwt'
+        self.git('worktree', 'add', '-q', '--detach', str(subwt), cwd=child / 'lib' / 'sub')
+        self.commit(subwt, 'c.txt', 'only in this worktree')
+        shutil.rmtree(subwt)
+        self.assert_kept(child, 'has a worktree at')
+
+    def test_a_file_written_after_the_checks_keeps_a_child_without_submodules(self):
+        other = self.t / 'other'
+        self.git('init', '-q', '-b', 'master', str(other), cwd=self.t)
+        self.commit(other, '.gitignore', 'build/\n')
+        child = self.child('foreign', repo=other)
+        bin_dir = self.t / 'bin'
+        bin_dir.mkdir()
+        wrapper = bin_dir / 'git'
+        wrapper.write_text(f'#!/bin/sh\ncase " $* " in *" worktree remove "*) echo late > "{child}/late.txt";; esac\n'
+                           f'exec {shutil.which("git", path=self.env["PATH"])} "$@"\n')
+        wrapper.chmod(0o755)
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), env={'PATH': f'{bin_dir}{os.pathsep}{self.env["PATH"]}'})
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertEqual((child / 'late.txt').read_text(), 'late\n')
+        self.assertIn(f'kept {child}: `git worktree remove` failed', done.stdout)
+
     def test_a_long_report_keeps_the_retry_command_in_the_notification(self):
         kids = [self.child(f'k{i}') for i in range(3)]
         for kid in kids:
@@ -346,6 +391,16 @@ class WorktreeChildren(unittest.TestCase):
         done = self.run_script('cleanup', str(self.parent))
         self.assertEqual(done.returncode, 2)
         self.assertTrue(child.is_dir())
+
+    def test_a_parent_recreated_during_the_checks_stops_the_sweep(self):
+        kids = [self.child(), self.child('second')]
+        self.mode.write_text('recreate')
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertTrue(self.parent.is_dir())
+        for kid in kids:
+            self.assertTrue(kid.is_dir(), done.stdout)
+            self.assertNotIn(f'removed {kid}', done.stdout)
 
     def test_the_event_reads_herdrs_envelope_and_bad_events_are_usage_errors(self):
         child = self.child()
