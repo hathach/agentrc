@@ -101,10 +101,28 @@ def unkept(entries, gitdir, *, against=('--branches', '--tags', '--remotes')):
 
 
 def walk(top):
-    """os.walk that keeps the child on a directory it cannot list."""
-    def fail(err):
-        raise Keep(f'cannot list {err.filename}: {err.strerror}')
-    return os.walk(top, onerror=fail)
+    """Top-down os.walk (symlinks listed, not entered) that keeps the child on an entry it cannot list or
+    classify: os.walk files an entry whose stat fails (d_type unknown) as a non-directory and skips it."""
+    stack = [top]
+    while stack:
+        top = stack.pop()
+        dirs, files, real = [], [], set()
+        try:
+            with os.scandir(top) as listing:
+                for entry in listing:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            real.add(entry.name)
+                        elif not (entry.is_symlink() and os.path.isdir(entry.path)):
+                            files.append(entry.name)
+                            continue
+                    except OSError as err:
+                        raise Keep(f'cannot classify {entry.path}: {err.strerror}')
+                    dirs.append(entry.name)
+        except OSError as err:
+            raise Keep(f'cannot list {err.filename}: {err.strerror}')
+        yield top, dirs, files
+        stack += [os.path.join(top, d) for d in dirs if d in real]
 
 
 def is_within(path, roots):
@@ -201,7 +219,7 @@ def doomed_stores(child, gitdir, sub_gitdirs):
     for top, dirs, files in walk(gitdir):
         if 'HEAD' in files and 'objects' in dirs:
             stores.add(os.path.realpath(top))
-            dirs.remove('objects')
+            dirs[:] = [d for d in dirs if d not in ('objects', 'refs', 'logs')]  # a ref may be named objects/*
     return sorted(stores)
 
 
@@ -220,8 +238,9 @@ def check_store(store, child, gitdir, common, doomed):
         return
     modules = Path(os.path.realpath(gitdir / 'modules'))
     survivor = common / 'modules' / Path(store).relative_to(modules) if is_within(store, [modules]) else None
-    # a copy that resolves into what the removal deletes would vouch for itself
-    if survivor and is_within(survivor, [child, gitdir, *doomed]):
+    # a copy that resolves, or keeps its objects or refs, in what the removal deletes would vouch for itself
+    if survivor and any(is_within(p, [child, gitdir, *doomed]) for p in (survivor, survivor / 'objects',
+                                                                          survivor / 'refs')):
         survivor = None
     kept = {}
     if survivor and (survivor / 'objects').is_dir() and not (survivor / 'objects' / 'info' / 'alternates').exists():

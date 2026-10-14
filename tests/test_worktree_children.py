@@ -28,6 +28,34 @@ if sys.argv[1:3] == ['worktree', 'list']:
     sys.exit(1 if mode == 'failed' else 0)
 '''
 
+# runs the script with DirEntry.is_dir failing on `inner`, as a stat can on a filesystem without d_type
+UNCLASSIFIABLE = r'''import os, runpy, sys
+scandir = os.scandir
+class Entry:
+    def __init__(self, entry):
+        self.entry = entry
+    def __getattr__(self, name):
+        return getattr(self.entry, name)
+    def is_dir(self, follow_symlinks=True):
+        if self.entry.name == 'inner':
+            raise OSError(5, 'Input/output error', self.entry.path)
+        return self.entry.is_dir(follow_symlinks=follow_symlinks)
+class Listing:
+    def __init__(self, it):
+        self.it = it
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        self.it.close()
+    def __iter__(self):
+        return self
+    def __next__(self):
+        return Entry(next(self.it))
+os.scandir = lambda path='.': Listing(scandir(path))
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+
 
 @unittest.skipIf(os.name == 'nt', 'POSIX paths and a shell submodule foreach')
 class WorktreeChildren(unittest.TestCase):
@@ -210,6 +238,12 @@ class WorktreeChildren(unittest.TestCase):
         self.assertNotIn(oid, self.git('rev-parse', 'topic', cwd=sub))
         self.assert_removed(child)
 
+    def test_a_submodule_remote_branch_named_like_a_store_does_not_keep_the_child(self):
+        child = self.child()
+        self.git('push', '-q', 'origin', 'HEAD:refs/heads/objects/x', cwd=self.t / 'subwork')
+        self.git('fetch', '-q', 'origin', cwd=child / 'lib' / 'sub')
+        self.assert_removed(child)
+
     def test_stray_git_location_variables_do_not_redirect_the_checks(self):
         clean, dirty = self.child(), self.child('dirty')
         (dirty / 'notes.txt').write_text('wip')
@@ -365,6 +399,18 @@ class WorktreeChildren(unittest.TestCase):
         copy.symlink_to(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip())
         self.assert_kept(child, 'refs/tags/saved in submodule repository')
 
+    def test_a_primary_copy_whose_objects_or_refs_link_into_the_doomed_store_is_no_fallback(self):
+        for part in ('objects', 'refs'):
+            with self.subTest(part):
+                self.tearDown()
+                self.setUp()
+                child = self.child()
+                sub = self.unpublished_sub_tag(child, 'refs/tags/saved')
+                copy = self.main / '.git' / 'modules' / 'lib' / 'sub' / part
+                shutil.rmtree(copy)
+                copy.symlink_to(Path(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip()) / part)
+                self.assert_kept(child, 'refs/tags/saved in submodule repository')
+
     @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root lists any directory')
     def test_a_directory_the_checks_cannot_list_keeps_the_child(self):
         for case in ('child', 'git dir'):
@@ -386,6 +432,16 @@ class WorktreeChildren(unittest.TestCase):
                     self.assert_kept(child, f'cannot list {locked}')
                 finally:
                     locked.chmod(0o700)
+
+    def test_an_entry_the_checks_cannot_classify_keeps_the_child(self):
+        child = self.child()
+        self.git('init', '-q', str(child / 'build' / 'inner' / 'nested'), cwd=child)
+        self.drop_parent()
+        done = subprocess.run([sys.executable, '-c', UNCLASSIFIABLE, str(SCRIPT), 'cleanup', str(self.parent)],
+                              env=self.env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertTrue(child.is_dir())
+        self.assertIn(f'kept {child}: cannot classify {child / "build" / "inner"}', done.stdout)
 
     def test_an_unreadable_head_keeps_the_child(self):
         for case in ('child', 'submodule'):
