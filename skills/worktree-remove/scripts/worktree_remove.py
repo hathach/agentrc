@@ -13,10 +13,8 @@ Refused (exit 3), nothing changed:
 - PATH is a primary checkout or no linked worktree, or herdr lists it open in no workspace
   (`herdr worktree open --path <PATH>` first); herdr unreachable;
 - herdr has the plugin unlinked, disabled, or linked from another checkout than this script's;
-- PATH fails the plugin's content check: uncommitted, untracked or flagged changes (submodules
-  included), an operation in progress, a lock, a nested repository, unsafe submodule storage, a
-  detached HEAD on a commit nothing else holds, a running headless chief (so a chief cannot
-  remove its own worktree), or a cowork lane holding a request;
+- PATH fails the plugin's content check, the one each sibling gets (its docstring lists them);
+  a running headless chief among them means a chief cannot remove its own worktree;
 - this script, the plugin, the report directory or the plugin's log lies inside PATH or a
   sibling to be removed;
 - a git or GitHub lookup the gate needs fails or comes back incomplete.
@@ -46,7 +44,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import re
 import sys
 import time
 from pathlib import Path
@@ -56,7 +53,11 @@ PLUGIN_ID = 'agentrc.worktree-children'
 STATE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state')
 REPORTS = STATE / 'agentrc' / 'worktree-remove'
 PLUGIN_LOG = STATE / 'herdr' / 'plugins' / PLUGIN_ID / 'log'
-GITHUB = re.compile(r'github\.com[:/]')
+THREADS = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    reviewThreads(first: 100, after: $endCursor) {
+      nodes { isResolved comments(first: 1) { nodes { url } } }
+      pageInfo { hasNextPage endCursor } } } } }'''
 
 
 class Refused(Exception):
@@ -89,14 +90,13 @@ def herdr(*args):
 def workspace(root):
     """The id of the herdr workspace that has root open as a linked worktree."""
     try:
-        mine = [w for w in herdr('worktree', 'list', '--cwd', str(root))['worktrees']
-                if os.path.realpath(w['path']) == str(root)]
-    except (KeyError, TypeError):
-        raise Refused('herdr answered `worktree list` without its worktrees')
-    if len(mine) != 1 or not mine[0].get('is_linked_worktree') or not mine[0].get('open_workspace_id'):
+        entry = wc.herdr_entry(root)
+    except wc.Keep as why:
+        raise Refused(f'herdr and {root}: {why}')
+    if not entry.get('is_linked_worktree') or not entry.get('open_workspace_id'):
         raise Refused(f'herdr has {root} open as no linked worktree workspace; open it with '
                       f'`herdr worktree open --path {root}` and rerun')
-    return mine[0]['open_workspace_id']
+    return entry['open_workspace_id']
 
 
 def check_plugin():
@@ -111,11 +111,12 @@ def check_plugin():
                       'so its verdicts may differ from these')
 
 
-def lookup(fn, *args, **kwargs):
-    try:
-        return fn(*args, **kwargs)
-    except wc.Keep as why:
-        raise Refused(str(why))
+def unresolved_threads(repo, number):
+    owner, name = repo.split('/')
+    return wc.gh_lines('api', 'graphql', '--paginate', '-f', f'query={THREADS}', '-F', f'owner={owner}',
+                       '-F', f'name={name}', '-F', f'number={number}', '--jq',
+                       '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)'
+                       ' | .comments.nodes[0].url')
 
 
 def gate(common, branch, tip):
@@ -125,20 +126,21 @@ def gate(common, branch, tip):
         remote = wc.branch_remote(common, branch)
     except wc.Keep:
         return []
-    default = lookup(wc.refresh, common, remote)
-    pushed = not lookup(wc.git, 'rev-list', tip, '--not', f'--remotes={remote}', gitdir=common).strip()
-    merged = not wc.run(['git', '--git-dir', common, 'merge-base', '--is-ancestor', tip,
-                         f'refs/remotes/{remote}/{default}']).returncode
-    url = lookup(wc.git, 'remote', 'get-url', remote, gitdir=common).strip()
-    if not GITHUB.search(url):
-        return [f'{branch}: commits on {remote} that {default} lacks'] if pushed and not merged else []
-    repo = lookup(wc.github_repo, common, remote)
-    prs = lookup(wc.pulls, repo, branch)
-    items = [f'{branch}: open PR #{pr["number"]}' for pr in prs if pr['state'] == 'OPEN']
-    last = max((pr for pr in prs if pr['merged_at']), key=lambda pr: pr['merged_at'], default=None)
-    if last:
-        items += [f'{branch}: unresolved review thread {url}'
-                  for url in lookup(wc.unresolved_threads, repo, last['number'])]
+    try:
+        default = wc.refresh(common, remote)
+        pushed = not wc.git('rev-list', tip, '--not', f'--remotes={remote}', gitdir=common).strip()
+        merged = not wc.run(['git', '--git-dir', common, 'merge-base', '--is-ancestor', tip,
+                             f'refs/remotes/{remote}/{default}']).returncode
+        repo = wc.github_repo(common, remote)
+        if not repo:
+            return [f'{branch}: commits on {remote} that {default} lacks'] if pushed and not merged else []
+        prs = wc.pulls(repo, branch)
+        items = [f'{branch}: open PR #{pr["number"]}' for pr in prs if pr['state'] == 'OPEN']
+        last = max((pr for pr in prs if pr['merged_at']), key=lambda pr: pr['merged_at'], default=None)
+        if last:
+            items += [f'{branch}: unresolved review thread {url}' for url in unresolved_threads(repo, last['number'])]
+    except wc.Keep as why:
+        raise Refused(str(why))
     if pushed and not merged and not any(pr['head'] == tip for pr in prs):
         items.append(f'{branch}: commits on {remote} that {default} lacks, and no PR has them as its head')
     return items
@@ -168,19 +170,17 @@ def plan(path, pending):
     siblings = []
     for child in wc.children(root):
         try:
-            removal, why = wc.check(child), None
+            wc.check(child)
+            why = None
         except (wc.Keep, OSError) as err:
-            removal, why = None, str(err)
-        done = wc.run(['git', '-C', str(child), 'rev-parse', '--path-format=absolute', '--git-common-dir'])
-        siblings.append(dict(path=child, removal=removal, why=why, head=wc.head_branch(child),
-                             common=None if done.returncode else os.path.realpath(done.stdout.strip())))
-    leaving = [root] + [s['path'] for s in siblings if s['removal']]
+            why = str(err)
+        siblings.append(dict(path=child, why=why, head=wc.head_branch(child), common=wc.common_dir(child / '.git')))
+    leaving = [root] + [s['path'] for s in siblings if s['why'] is None]
     for needed in (Path(__file__).resolve(), PLUGIN_DIR, REPORTS, PLUGIN_LOG):
         if wc.is_within(needed, leaving):
             raise Refused(f'{needed} lies inside a worktree this removes')
 
-    checkouts = [dict(path=root, removal=(common, force), why=None, head=wc.head_branch(root),
-                   common=os.path.realpath(common))] + siblings
+    checkouts = [dict(path=root, why=None, head=wc.head_branch(root), common=os.path.realpath(common))] + siblings
     items = list(pending)
     for s in checkouts:
         s['branch'] = None
@@ -189,7 +189,7 @@ def plan(path, pending):
         if not s['head'] or not s['common']:
             continue
         name, tip = s['head']
-        if s['removal']:
+        if s['why'] is None:
             try:
                 s['branch'] = f'branch {name} goes: {wc.branch_proof(s["common"], name, tip, leaving)}'
             except wc.Keep as why:
@@ -211,9 +211,9 @@ def report(p, heading):
              f'has the result: {PLUGIN_LOG}', '', f'Command: `{" ".join(command(p))}`', '', '## Inventory', '']
     for s in p['checkouts']:
         fate = ('removed by herdr' if s['path'] == p['root'] else
-                'removed by the plugin' if s['removal'] else f'stays: {s["why"]}')
+                'removed by the plugin' if s['why'] is None else f'stays: {s["why"]}')
         lines.append(f'- {s["path"]}: {fate}' + (f'; {s["branch"]}' if s['branch'] else ''))
-    lines += ['', '## Symlinks leaving the removed trees (their targets stay)', '']
+    lines += ['', '## Symlinks leaving the removed trees', '']
     lines += [f'- {link} -> {target}' for link, target in p['links']] or ['- none']
     lines += ['', f'## Pending (token {p["token"]})', '']
     lines += [f'- {item}' for item in p['items']] or ['- none']

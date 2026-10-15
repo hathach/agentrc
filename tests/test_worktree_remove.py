@@ -169,7 +169,7 @@ class Remove(unittest.TestCase):
             self.assertRefused(f'{state / "log"} lies inside a worktree this removes')
 
     def test_a_failed_github_lookup_is_refused(self):
-        with mock.patch.object(wr, 'GITHUB', re.compile('')):
+        with mock.patch.object(wr.wc, 'GITHUB', re.compile('')):
             self.assertRefused('network unreachable')
 
     # --- pending ----------------------------------------------------------------------
@@ -218,10 +218,9 @@ class Remove(unittest.TestCase):
         moved = self.sibling('moved')
         self.commit(moved, 'm.txt', 'm')
         sh(moved, 'push', '-q', 'origin', 'moved')
-        with mock.patch.object(wr, 'GITHUB', re.compile('')), \
-                mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'o/r'), \
+        with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'o/r'), \
                 mock.patch.object(wr.wc, 'pulls', lambda repo, branch: prs[branch]), \
-                mock.patch.object(wr.wc, 'unresolved_threads', lambda repo, n: threads[n]):
+                mock.patch.object(wr, 'unresolved_threads', lambda repo, n: threads[n]):
             rc, out = self.run_remove()
         self.assertEqual(rc, 4, out)
         self.assertIn('parent: unresolved review thread https://github.com/o/r/pull/5#discussion_r1', out)

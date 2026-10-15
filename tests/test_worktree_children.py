@@ -96,7 +96,7 @@ class WorktreeChildren(unittest.TestCase):
         self.git('clone', '-q', str(self.t / 'sub.git'), str(self.t / 'subwork'), cwd=self.t)
         self.commit(self.t / 'subwork', 'a.txt', 'sub')
         self.git('push', '-q', 'origin', 'HEAD:refs/heads/master', cwd=self.t / 'subwork')
-        self.main = self.repo('main')
+        self.main = self.repo('main', github=True)
         self.commit(self.main, 'README', 'main')
         self.git('submodule', 'add', '-q', str(self.t / 'sub.git'), 'lib/sub', cwd=self.main)
         self.git('commit', '-qm', 'sub', cwd=self.main)
@@ -123,12 +123,14 @@ class WorktreeChildren(unittest.TestCase):
         self.git('commit', '-qm', name, cwd=repo)
         return self.git('rev-parse', 'HEAD', cwd=repo).strip()
 
-    def repo(self, name):
-        """A repository at t/<name> on master, pushed to its bare origin t/<name>.git."""
+    def repo(self, name, github=False):
+        """A repository at t/<name> on master, pushed to its bare origin t/<name>.git, or with github
+        t/github.com/<name>.git, a path the plugin takes for a GitHub remote."""
         path = self.t / name
-        self.git('init', '-q', '--bare', '-b', 'master', str(self.t / f'{name}.git'), cwd=self.t)
+        origin = self.t / ('github.com' if github else '') / f'{name}.git'
+        self.git('init', '-q', '--bare', '-b', 'master', str(origin), cwd=self.t)
         self.git('init', '-q', '-b', 'master', str(path), cwd=self.t)
-        self.git('remote', 'add', 'origin', str(self.t / f'{name}.git'), cwd=path)
+        self.git('remote', 'add', 'origin', str(origin), cwd=path)
         self.commit(path, '.gitignore', 'build/\n')
         self.git('push', '-q', 'origin', 'master', cwd=path)
         return path
@@ -330,8 +332,8 @@ class WorktreeChildren(unittest.TestCase):
         self.assert_kept(child, 'MERGE_HEAD in progress')
 
     def test_an_open_or_unconfirmed_herdr_workspace_keeps_the_child(self):
-        for mode, reason in (('open', 'open in herdr workspace w9'), ('down', 'herdr could not confirm'),
-                             ('failed', 'herdr could not confirm'), ('null', 'herdr could not confirm')):
+        for mode, reason in (('open', 'open in herdr workspace w9'), ('down', 'herdr could not list it'),
+                             ('failed', 'herdr could not list it'), ('null', 'herdr could not list it')):
             with self.subTest(mode):
                 self.tearDown()
                 self.setUp()
@@ -346,7 +348,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         for kid in kids:
             self.assertTrue(kid.is_dir())
-            self.assertIn(f'kept {kid}: herdr could not confirm', done.stdout)
+            self.assertIn(f'kept {kid}: herdr could not list it', done.stdout)
 
     def test_a_private_ref_on_a_unique_commit_keeps_the_child(self):
         child = self.child()
@@ -614,6 +616,16 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertFalse(self.branch_exists('child'))
 
+    def test_a_never_pushed_branch_of_a_remote_off_github_stays_without_asking_gh(self):
+        other = self.repo('other')
+        child = self.child('foreign', repo=other, push=False)
+        self.commit(child, 'local.txt', 'local')
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('kept branch foreign', done.stdout)
+        self.assertIn('commits on no origin branch and no PR head', done.stdout)
+        self.assertEqual([c for c in map(json.loads, self.calls.read_text().splitlines()) if c[:1] == ['gh']], [])
+
     def test_a_pr_head_branch_goes_and_a_wrong_head_or_failed_lookup_keeps_it(self):
         child, tip = self.squashed('feat')
         done = self.cleanup()
@@ -659,7 +671,7 @@ class WorktreeChildren(unittest.TestCase):
         self.git('config', 'branch.local.remote', '.', cwd=self.main)
         self.git('branch', 'dev', 'master', cwd=self.main)
         self.git('push', '-q', 'origin', 'dev', cwd=self.main)
-        self.git('symbolic-ref', 'HEAD', 'refs/heads/dev', cwd=self.t / 'main.git')
+        self.git('symbolic-ref', 'HEAD', 'refs/heads/dev', cwd=self.t / 'github.com' / 'main.git')
         self.drop_parent()
         common = str(self.main / '.git')
         cases = {'busy': (self.oid('busy'), 'checked out at'), 'moved': (old, 'is at'),
