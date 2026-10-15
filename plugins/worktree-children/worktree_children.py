@@ -2,7 +2,7 @@
 """Remove the sibling child worktrees of a herdr worktree once herdr has removed it.
 
     worktree_children.py event               # herdr's worktree.removed hook (HERDR_PLUGIN_EVENT_JSON)
-    worktree_children.py cleanup <parent>    # the same for a parent path, by hand (a retry)
+    worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
 
 Children of `<dir>/<name>` are the entries `<dir>/<name>--*` (grandchildren `<name>--a--b`
 too) with a `.git` file that are linked git worktrees of any repository: the `<name>--` prefix is reserved for
@@ -14,6 +14,8 @@ A child is removed only when every check below passes; otherwise it is kept and 
 for a child with submodules (git refuses those otherwise), so a write racing its checks is lost.
 - herdr confirms it is not open as its own workspace (`herdr worktree list --cwd <child>`);
   herdr unreachable or an unexpected answer keeps it;
+- no headless chief runs in it and none of its cowork lanes holds a request (running or
+  undelivered); the skills' own code decides, and code that cannot load keeps it;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes;
 - in the child and in every initialized submodule, recursively: `git status` shows no tracked
   or untracked change, no index entry is flagged assume-unchanged or skip-worktree, and no
@@ -30,15 +32,32 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   (`<common git dir>/modules/<name>`, used only when self-contained: no alternates, no commondir,
   no symlink);
   an annotated tag therefore needs that copy. Remote-tracking refs are trusted as fetched.
-Deleted by policy: ignored files and commits only a reflog still names. The child's branch is
-never deleted. No `git worktree prune` runs: it would touch unrelated worktrees.
+Deleted by policy: ignored files and commits only a reflog still names. No `git worktree prune`
+runs: it would touch unrelated worktrees. herdr removes the parent before this runs, with its
+own checks only: the worktree-remove skill's pending-work gate is skipped by a removal from
+herdr's menu.
 
-Each action is printed and appended to $HERDR_PLUGIN_STATE_DIR/log; kept or failed children
-also raise one herdr notification naming the retry command. Exit 0 every child removed (or
-none found), 1 a child kept or a removal failed, 2 bad input or a parent that exists again.
+Branches: the parent's (the event's branch in its `repo_key` repository) and each removed
+child's are deleted when nothing but the branch name is lost, otherwise kept with a reason:
+- not symbolic, at the object id recorded before the removal, checked out in no worktree,
+  and not the default branch its remote advertises;
+- its remote (`branch.<name>.remote`, else origin) is a configured remote;
+- after fetching that remote's branches into its remote-tracking refs (pruned, tags untouched),
+  they reach the tip; or else a GitHub PR of any state has that branch and exactly that tip as
+  its head, and the remote's `refs/pull/<N>/head` is that tip (squash and rebase merges);
+- any failed or incomplete lookup keeps it.
+The ref is deleted against its recorded id (`update-ref -d`), then its `branch.<name>` config.
+
+Each action is printed and appended to $HERDR_PLUGIN_STATE_DIR/log, each branch's retry
+arguments before its checkout is removed; anything kept or failed also raises one herdr
+notification naming the retry command. Exit 0 every child and branch removed (or none found),
+1 something kept or a removal failed, 2 bad input or a parent that exists again.
 """
+import functools
 import json
 import os
+import re
+import shlex
 import subprocess
 import sys
 import time
@@ -52,6 +71,17 @@ OPERATIONS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', '
 HERDR = os.environ.get('HERDR_BIN_PATH') or 'herdr'
 STATE = os.environ.get('HERDR_PLUGIN_STATE_DIR')
 LOG = Path(STATE) / 'log' if STATE else None
+SKILLS = Path(__file__).resolve().parents[2] / 'skills'
+SEARCH = '''query($q: String!, $endCursor: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
+    issueCount
+    nodes { ... on PullRequest { number state headRefName headRefOid mergedAt } }
+    pageInfo { hasNextPage endCursor } } }'''
+THREADS = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    reviewThreads(first: 100, after: $endCursor) {
+      nodes { isResolved comments(first: 1) { nodes { url } } }
+      pageInfo { hasNextPage endCursor } } } } }'''
 
 
 class Keep(Exception):
@@ -272,11 +302,30 @@ def check_store(store, child, gitdir, common, doomed):
                    f'{survivor or "a surviving copy"} under that name')
 
 
-def check(child):
-    """Raise Keep when removing child could lose anything but ignored files and reflog-only commits;
-    returns the common git dir to remove it with and whether that needs --force."""
+def check_agents(path, gitdir):
+    """Keep a checkout a headless chief or a cowork lane still works in."""
+    sys.path[:0] = [str(SKILLS / 'headless-chief' / 'scripts'), str(SKILLS / 'cowork' / 'scripts')]
+    try:
+        import chief_run
+        import cowork
+    except Exception as err:  # whatever stops them loading, the child stays
+        raise Keep(f'cannot check for running agents: {err!r}')
+    finally:
+        del sys.path[:2]
+    chiefs = chief_run.running_chiefs(Path(path))
+    if chiefs:
+        raise Keep(f'a headless chief runs in it: pid {", ".join(map(str, chiefs))}')
+    for box in cowork.boxes(gitdir):
+        if cowork.requests(box):
+            raise Keep(f'cowork lane {box.parent.name}/{box.name} holds a running or undelivered request')
+
+
+def content_check(child):
+    """Raise Keep when removing the linked worktree child could lose anything but ignored files and
+    reflog-only commits, or would cut off a running agent; returns the common git dir to remove it
+    with and whether that needs --force."""
     gitdir, common = linked_worktree(child)
-    check_herdr(child)
+    check_agents(child, gitdir)
     if (gitdir / 'locked').exists():
         raise Keep('locked')
     subs = submodules(child)
@@ -298,6 +347,130 @@ def check(child):
     return common, bool(subs) or (gitdir / 'modules').exists()
 
 
+def check(child):
+    """content_check for a child herdr has not open as a workspace of its own."""
+    check_herdr(child)
+    return content_check(child)
+
+
+def head_branch(path):
+    """(branch name, tip) of the checkout at path, or None when HEAD is detached or unborn."""
+    branch = run(['git', '-C', str(path), 'symbolic-ref', '-q', 'HEAD'])
+    tip = run(['git', '-C', str(path), 'rev-parse', '-q', '--verify', 'HEAD'])
+    if branch.returncode or tip.returncode or not branch.stdout.startswith('refs/heads/'):
+        return None
+    return branch.stdout.strip().removeprefix('refs/heads/'), tip.stdout.strip()
+
+
+def gh_lines(*args):
+    """gh's output, one item per line; any error keeps, never reads as empty."""
+    done = run(['gh', *args])
+    if done.returncode:
+        raise Keep(f'`gh {args[0]} {args[1]}` failed: {(done.stdout + done.stderr).strip()[:300]}')
+    return [line for line in done.stdout.splitlines() if line]
+
+
+def github_repo(common, remote):
+    """owner/name of the GitHub repository remote points to; Keep for any other remote."""
+    url = git('remote', 'get-url', remote, gitdir=common).strip()
+    repo = gh_lines('repo', 'view', url, '--json', 'nameWithOwner', '-q', '.nameWithOwner')
+    if len(repo) != 1 or repo[0].count('/') != 1:
+        raise Keep(f'gh names no repository for {url}: {repo}')
+    return repo[0]
+
+
+def pulls(repo, branch):
+    """Every PR of repo whose head branch is exactly branch, deleted branches included, as
+    {number, head (oid), state, merged_at}: `head:` search matches by prefix and stops at 1000
+    results, so a short answer keeps, as does a malformed one."""
+    lines = gh_lines('api', 'graphql', '--paginate', '-f', f'query={SEARCH}',
+                     '-f', f'q=repo:{repo} is:pr head:{branch}', '--jq', '.data.search')
+    try:
+        pages = [json.loads(line) for line in lines]
+        nodes = [n for page in pages for n in page['nodes']]
+        if not pages or len(nodes) != pages[0]['issueCount']:
+            raise Keep(f'PR search for head:{branch} returned {len(nodes)} of '
+                       f'{pages[0]["issueCount"] if pages else "an unknown number"}')
+        return [dict(number=int(n['number']), head=str(n['headRefOid']), state=str(n['state']),
+                     merged_at=n['mergedAt']) for n in nodes if n['headRefName'] == branch]
+    except (ValueError, KeyError, TypeError) as err:
+        raise Keep(f'PR search for head:{branch} gave a malformed answer: {err!r}')
+
+
+def unresolved_threads(repo, number):
+    owner, name = repo.split('/')
+    return gh_lines('api', 'graphql', '--paginate', '-f', f'query={THREADS}', '-F', f'owner={owner}',
+                    '-F', f'name={name}', '-F', f'number={number}', '--jq',
+                    '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved | not)'
+                    ' | .comments.nodes[0].url')
+
+
+def branch_remote(common, branch):
+    """The configured remote branch pushes to: its upstream's, else origin; Keep for `.` or none."""
+    done = run(['git', '--git-dir', str(common), 'config', f'branch.{branch}.remote'])
+    remote = done.stdout.strip() if not done.returncode else 'origin'
+    if remote not in git('remote', gitdir=common).split():
+        raise Keep(f'{remote} is not a configured remote')
+    return remote
+
+
+@functools.lru_cache(maxsize=None)
+def refresh(common, remote):
+    """The branch remote advertises as its default, after fetching its branches into its
+    remote-tracking refs and nothing else: the empty --refmap drops the configured mappings,
+    which would also update the refs they name, and tags are neither fetched nor pruned."""
+    m = re.search(r'^ref: refs/heads/(\S+)\tHEAD$', git('ls-remote', '--symref', remote, 'HEAD', gitdir=common), re.M)
+    if not m:
+        raise Keep(f'{remote} advertises no default branch')
+    git('fetch', '--quiet', '--no-tags', '--no-prune-tags', '--prune', '--refmap=', remote,
+        f'+refs/heads/*:refs/remotes/{remote}/*', gitdir=common)
+    return m.group(1)
+
+
+def owners(common, branch):
+    return [wt['worktree'] for wt in worktree_entries(common) if wt.get('branch') == f'refs/heads/{branch}']
+
+
+def branch_proof(common, branch, tip, leaving=()):
+    """How branch at tip survives its deletion ('on origin', 'head of PR #N'); Keep when it might not.
+    A worktree in leaving, about to be removed, does not count as checking it out."""
+    common = str(common)
+    ref = f'refs/heads/{branch}'
+    if not run(['git', '--git-dir', common, 'symbolic-ref', '-q', ref]).returncode:
+        raise Keep(f'{ref} is a symbolic ref')
+    now = run(['git', '--git-dir', common, 'rev-parse', '-q', '--verify', ref]).stdout.strip()
+    if now != tip:
+        raise Keep(f'{ref} is at {now or "nothing"}, not {tip}')
+    held = [w for w in owners(common, branch) if not is_within(w, leaving)]
+    if held:
+        raise Keep(f'checked out at {held[0]}')
+    remote = branch_remote(common, branch)
+    if refresh(common, remote) == branch:
+        raise Keep(f'the default branch of {remote}')
+    if not git('rev-list', tip, '--not', f'--remotes={remote}', gitdir=common).strip():
+        return f'on {remote}'
+    try:
+        repo = github_repo(common, remote)
+        heads = [pr['number'] for pr in pulls(repo, branch) if pr['head'] == tip]
+    except Keep as why:
+        raise Keep(f'commits on no {remote} branch, and no PR head: {why}')
+    for number in heads:
+        if git('ls-remote', remote, f'refs/pull/{number}/head', gitdir=common).split()[:1] == [tip]:
+            return f'head of PR #{number}'
+    raise Keep(f'commits on no {remote} branch and no PR head')
+
+
+def delete_branch(common, branch, tip):
+    """Delete branch at tip once branch_proof holds; Keep otherwise."""
+    proof = branch_proof(common, branch, tip)
+    held = owners(common, branch)  # again: a checkout can race the network lookups
+    if held:
+        raise Keep(f'checked out at {held[0]}')
+    git('update-ref', '--no-deref', '-d', f'refs/heads/{branch}', tip, gitdir=common)
+    run(['git', '--git-dir', str(common), 'config', '--remove-section', f'branch.{branch}'])
+    return proof
+
+
 def remove(child, common, force):
     done = run(['git', '--git-dir', str(common), 'worktree', 'remove', *['--force'] * force, str(child)])
     if done.returncode:
@@ -312,52 +485,105 @@ def log(line):
             f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
 
 
-def notify(parent, kept):
+def retry(parent, branches):
+    return shlex.join([str(Path(__file__).resolve()), 'cleanup', str(parent),
+                       *[a for b in branches for a in ('--branch', *map(str, b))]])
+
+
+def notify(parent, kept, branches):
     tail = f' Retry: {Path(__file__).resolve()} cleanup {parent}'
+    tail += ' with the --branch arguments the log names' if branches else ''
     tail += f' Full report: {LOG}' if LOG else ''
-    reasons = '; '.join(f'{p.name}: {why}' for p, why in kept)
+    reasons = '; '.join(f'{name}: {why}' for name, why in kept + [(f'branch {b[1]}', why) for b, why in branches])
     room = 999 - len(tail)  # a toast, not the report: 1000 characters, the '.' included
     if len(reasons) > room:
         reasons = reasons[:max(0, room - 3)] + '...'
-    run([HERDR, 'notification', 'show', f'Kept {len(kept)} child worktree(s) of {Path(parent).name}',
+    run([HERDR, 'notification', 'show',
+         f'Kept {len(kept)} child worktree(s) and {len(branches)} branch(es) of {Path(parent).name}',
          '--body', reasons + '.' + tail, '--sound', 'request'])
 
 
-def cleanup(parent):
+def cleanup(parent, branches=(), kept_branches=()):
+    """Remove parent's clean children, then delete the given branches and each removed child's;
+    a branch is (common git dir, name, tip), kept_branches pairs one with why it stays."""
     parent = Path(parent)
     if parent.exists():
         log(f'{parent} exists: not touching its children')
         return 2
-    kept = []
+    kept, kept_branches = [], list(kept_branches)
+
+    def settle(branch):
+        try:
+            log(f'deleted branch {branch[1]} in {branch[0]}: {delete_branch(*branch)}')
+        except (Keep, OSError) as why:
+            kept_branches.append((branch, str(why)))
+            log(f'kept branch {branch[1]} in {branch[0]}: {why}')
+
+    for branch, why in kept_branches:
+        log(f'kept branch {branch[1]}: {why}')
+    if branches:
+        log(f'branches to settle: {retry(parent, branches)}')
+    for branch in branches:
+        settle(branch)
     for child in children(parent):
         try:
             removal = check(child)
+            head = head_branch(child)
+            branch = head and (str(removal[0]), *head)
+            if branch:
+                log(f'removing {child}; its branch is retried by: {retry(parent, [branch])}')
             if parent.exists():
                 log(f'{parent} exists again: not touching {child} or the children after it')
                 return 2
             remove(child, *removal)
             log(f'removed {child}')
         except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
-            kept.append((child, str(why)))
+            kept.append((child.name, str(why)))
             log(f'kept {child}: {why}')
-    if kept:
-        notify(parent, kept)
-    return 1 if kept else 0
+            continue
+        if branch:
+            settle(branch)
+    unsettled = [b for b, _ in kept_branches if b[0]]
+    if unsettled:
+        log(f'retry: {retry(parent, unsettled)}')
+    if kept or kept_branches:
+        notify(parent, kept, kept_branches)
+    return 1 if kept or kept_branches else 0
+
+
+def event_branch(data):
+    """The removed parent's branch as (common git dir, name, tip); Keep when the event names a
+    branch it gives no repository holding; None when it names no branch."""
+    branch = (data['worktree'].get('branch') or '').strip()
+    if not branch:
+        return None
+    space = (data.get('workspace') or {}).get('worktree') or {}
+    common = space.get('repo_key') or (space.get('repo_root') and common_dir(Path(space['repo_root']) / '.git'))
+    if not common:
+        raise Keep('the event names no repository')
+    return common, branch, git('rev-parse', '--verify', f'refs/heads/{branch}', gitdir=common).strip()
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ['cleanup'] and len(argv) == 2:
-        return cleanup(os.path.abspath(argv[1]))
+    if argv[:1] == ['cleanup'] and len(argv) >= 2:
+        rest = argv[2:]
+        if len(rest) % 4 == 0 and all(f == '--branch' for f in rest[::4]):
+            return cleanup(os.path.abspath(argv[1]), [tuple(rest[i + 1:i + 4]) for i in range(0, len(rest), 4)])
     if argv == ['event']:
         try:
-            path = json.loads(os.environ['HERDR_PLUGIN_EVENT_JSON'])['data']['worktree']['path']
+            data = json.loads(os.environ['HERDR_PLUGIN_EVENT_JSON'])['data']
+            path = data['worktree']['path']
             if not os.path.isabs(path):
                 raise ValueError(f'{path!r} is not absolute')
         except (KeyError, ValueError, TypeError) as err:
             print(f'worktree.removed event without an absolute data.worktree.path: {err!r}', file=sys.stderr)
             return 2
-        return cleanup(path)
+        try:
+            branch = event_branch(data)
+        except Keep as why:  # the parent's branch stays; its children are still cleaned up
+            return cleanup(path, kept_branches=[((None, data['worktree']['branch'], None), str(why))])
+        return cleanup(path, [branch] if branch else [])
     print(__doc__.split('\n\n')[1], file=sys.stderr)
     return 2
 

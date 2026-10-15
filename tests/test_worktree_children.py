@@ -28,6 +28,20 @@ if sys.argv[1:3] == ['worktree', 'list']:
     sys.exit(1 if mode == 'failed' else 0)
 '''
 
+# gh: `repo view` names t/repo; `api graphql` prints the search page in $STUB_PRS, else fails
+GH = r'''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ['STUB_LOG'], 'a') as f:
+    f.write(json.dumps(['gh'] + sys.argv[1:]) + '\n')
+prs = os.environ.get('STUB_PRS')
+if not prs:
+    sys.exit('gh: network unreachable')
+if sys.argv[1:3] == ['repo', 'view']:
+    print('t/repo')
+else:
+    print(open(prs).read())
+'''
+
 # runs the script with DirEntry.is_dir failing on `inner`, as a stat can on a filesystem without d_type
 UNCLASSIFIABLE = r'''import os, runpy, sys
 from contextlib import contextmanager
@@ -72,17 +86,21 @@ class WorktreeChildren(unittest.TestCase):
         self.mode.write_text('closed')
         self.env.update(HERDR_BIN_PATH=str(stub), STUB_LOG=str(self.calls), STUB_MODE=str(self.mode),
                         HERDR_PLUGIN_STATE_DIR=str(self.t / 'state'), STUB_PARENT=str(self.t / 'wt' / 'parent'))
+        gh_dir = self.t / 'gh-bin'
+        gh_dir.mkdir()
+        (gh_dir / 'gh').write_text(GH)
+        (gh_dir / 'gh').chmod(0o755)
+        self.env['PATH'] = f'{gh_dir}{os.pathsep}{self.env["PATH"]}'
         # an upstream for the submodule, and the main repository with it
         self.git('init', '-q', '--bare', str(self.t / 'sub.git'), cwd=self.t)
         self.git('clone', '-q', str(self.t / 'sub.git'), str(self.t / 'subwork'), cwd=self.t)
         self.commit(self.t / 'subwork', 'a.txt', 'sub')
         self.git('push', '-q', 'origin', 'HEAD:refs/heads/master', cwd=self.t / 'subwork')
-        self.main = self.t / 'main'
-        self.git('init', '-q', '-b', 'master', str(self.main), cwd=self.t)
-        self.commit(self.main, '.gitignore', 'build/\n')
+        self.main = self.repo('main')
         self.commit(self.main, 'README', 'main')
         self.git('submodule', 'add', '-q', str(self.t / 'sub.git'), 'lib/sub', cwd=self.main)
         self.git('commit', '-qm', 'sub', cwd=self.main)
+        self.git('push', '-q', 'origin', 'master', cwd=self.main)
         self.wt = self.t / 'wt'
         self.wt.mkdir()
         self.parent = self.wt / 'parent'
@@ -94,9 +112,9 @@ class WorktreeChildren(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def git(self, *args, cwd):
+    def git(self, *args, cwd, ok=()):
         done = subprocess.run(['git', *args], cwd=cwd, env=self.env, capture_output=True, text=True)
-        self.assertEqual(done.returncode, 0, f'git {args}: {done.stderr}')
+        self.assertIn(done.returncode, (0, *ok), f'git {args}: {done.stderr}')
         return done.stdout
 
     def commit(self, repo, name, text):
@@ -105,9 +123,22 @@ class WorktreeChildren(unittest.TestCase):
         self.git('commit', '-qm', name, cwd=repo)
         return self.git('rev-parse', 'HEAD', cwd=repo).strip()
 
-    def child(self, name='child', repo=None, init=True):
+    def repo(self, name):
+        """A repository at t/<name> on master, pushed to its bare origin t/<name>.git."""
+        path = self.t / name
+        self.git('init', '-q', '--bare', '-b', 'master', str(self.t / f'{name}.git'), cwd=self.t)
+        self.git('init', '-q', '-b', 'master', str(path), cwd=self.t)
+        self.git('remote', 'add', 'origin', str(self.t / f'{name}.git'), cwd=path)
+        self.commit(path, '.gitignore', 'build/\n')
+        self.git('push', '-q', 'origin', 'master', cwd=path)
+        return path
+
+    def child(self, name='child', repo=None, init=True, push=True):
+        """A clean child on branch name, pushed to origin unless push is false."""
         path = self.wt / f'parent--{name}'
         self.git('worktree', 'add', '-q', str(path), '-b', name, cwd=repo or self.main)
+        if push:
+            self.git('push', '-q', 'origin', name, cwd=path)
         if init and (path / '.gitmodules').exists():
             self.git('submodule', 'update', '-q', '--init', cwd=path)
         (path / 'build').mkdir()
@@ -190,19 +221,20 @@ class WorktreeChildren(unittest.TestCase):
 
     # --- removed ------------------------------------------------------------------
 
-    def test_a_clean_child_goes_with_its_ignored_files_and_keeps_its_branch_and_shared_targets(self):
+    def test_a_clean_child_goes_with_its_ignored_files_and_pushed_branch_and_keeps_shared_targets(self):
         child = self.child()
-        self.assert_removed(child)
-        self.assertIn('child', self.git('branch', '--list', 'child', cwd=self.main))
+        self.git('config', 'branch.child.description', 'notes', cwd=self.main)
+        done = self.assert_removed(child)
+        self.assertEqual(self.git('branch', '--list', 'child', cwd=self.main), '')
+        self.assertEqual(self.git('config', '--get-regexp', '^branch\\.child\\.', cwd=self.main, ok=(1,)), '')
+        self.assertIn('deleted branch child', done.stdout)
         self.assertEqual((self.sentinel / 'keep').read_text(), 'shared target')
         self.assertNotIn(str(child), self.git('worktree', 'list', cwd=self.main))
         self.assertEqual(self.notifications(), [])
         self.assertIn(f'removed {child}', (self.t / 'state' / 'log').read_text())
 
     def test_grandchildren_and_children_of_other_repositories_go_too_and_other_entries_stay(self):
-        other = self.t / 'other'
-        self.git('init', '-q', '-b', 'master', str(other), cwd=self.t)
-        self.commit(other, '.gitignore', 'build/\n')
+        other = self.repo('other')
         kids = [self.child(), self.child('child--grand'), self.child('foreign', repo=other)]
         plain = self.wt / 'parent--plain'
         plain.mkdir()
@@ -517,9 +549,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assert_kept(child, 'has a worktree at')
 
     def test_a_file_written_after_the_checks_keeps_a_child_without_submodules(self):
-        other = self.t / 'other'
-        self.git('init', '-q', '-b', 'master', str(other), cwd=self.t)
-        self.commit(other, '.gitignore', 'build/\n')
+        other = self.repo('other')
         child = self.child('foreign', repo=other)
         self.drop_parent()
         done = self.run_script('cleanup', str(self.parent),
@@ -541,6 +571,212 @@ class WorktreeChildren(unittest.TestCase):
         self.assertIn(f'cleanup {self.parent}', body)
         self.assertIn(str(self.t / 'state' / 'log'), body)
         self.assertLessEqual(len(body), 1000)
+
+    # --- branches ----------------------------------------------------------------------
+
+    def oid(self, ref, repo=None):
+        return self.git('rev-parse', ref, cwd=repo or self.main).strip()
+
+    def branch_exists(self, name, repo=None):
+        return bool(self.git('branch', '--list', name, cwd=repo or self.main).strip())
+
+    def pr_search(self, *prs):
+        """Makes the gh stub answer the PR search with prs, (number, head branch, head oid) each."""
+        page = {'issueCount': len(prs), 'pageInfo': {'hasNextPage': False, 'endCursor': None},
+                'nodes': [{'number': n, 'state': 'MERGED', 'headRefName': b, 'headRefOid': o, 'mergedAt': 'x'}
+                          for n, b, o in prs]}
+        (self.t / 'prs').write_text(json.dumps(page))
+        return {'STUB_PRS': str(self.t / 'prs')}
+
+    def squashed(self, name):
+        """A removable child whose branch has a commit origin holds only as PR 7's head."""
+        child = self.child(name, push=False)
+        tip = self.commit(child, 'feature.txt', 'feature')
+        self.git('push', '-q', 'origin', f'{tip}:refs/pull/7/head', cwd=child)
+        return child, tip
+
+    def test_a_never_pushed_branch_stays_and_a_retry_deletes_it_once_pushed(self):
+        child = self.child(push=False)
+        tip = self.commit(child, 'local.txt', 'local')
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertFalse(child.exists())
+        self.assertTrue(self.branch_exists('child'))
+        self.assertIn('kept branch child', done.stdout)
+        [note] = self.notifications()
+        self.assertIn('branch child: commits on no origin branch', note[note.index('--body') + 1])
+        log = (self.t / 'state' / 'log').read_text()
+        retry = f'cleanup {self.parent} --branch {self.main / ".git"} child {tip}'
+        self.assertIn(f'its branch is retried by: {SCRIPT} {retry}', log)
+        self.assertLess(log.index('its branch is retried by'), log.index(f'removed {child}'))
+        self.git('push', '-q', 'origin', 'child', cwd=self.main)
+        done = self.run_script(*retry.split())
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse(self.branch_exists('child'))
+
+    def test_a_pr_head_branch_goes_and_a_wrong_head_or_failed_lookup_keeps_it(self):
+        child, tip = self.squashed('feat')
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('kept branch feat', done.stdout)
+        self.assertIn('network unreachable', done.stdout)
+        retry = ['cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'feat', tip]
+        done = self.run_script(*retry, env=self.pr_search((7, 'feat', self.oid('master'))))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertTrue(self.branch_exists('feat'))
+        done = self.run_script(*retry, env=self.pr_search((7, 'feat-other', tip)))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        done = self.run_script(*retry, env=self.pr_search((8, 'feat', tip)))  # PR 8's head ref is not on origin
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        done = self.run_script(*retry, env=self.pr_search((8, 'feat', tip), (7, 'feat', tip)))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('deleted branch feat', done.stdout)
+        self.assertIn('head of PR #7', done.stdout)
+        self.assertFalse(self.branch_exists('feat'))
+
+    def test_a_truncated_pr_search_keeps_the_branch(self):
+        child, tip = self.squashed('feat')
+        env = self.pr_search((7, 'feat', tip))
+        page = json.loads((self.t / 'prs').read_text())
+        page['issueCount'] = 2
+        (self.t / 'prs').write_text(json.dumps(page))
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), env=env)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('returned 1 of 2', done.stdout)
+        self.assertTrue(self.branch_exists('feat'))
+
+    def test_a_branch_checked_out_moved_symbolic_default_or_on_a_local_remote_stays(self):
+        self.git('worktree', 'add', '-q', str(self.t / 'elsewhere'), '-b', 'busy', cwd=self.main)
+        self.git('push', '-q', 'origin', 'busy', cwd=self.main)
+        self.git('branch', 'moved', cwd=self.main)
+        self.git('push', '-q', 'origin', 'moved', cwd=self.main)
+        old = self.oid('moved')
+        self.commit(self.t / 'elsewhere', 'x.txt', 'x')
+        self.git('branch', '-f', 'moved', 'busy', cwd=self.main)
+        self.git('symbolic-ref', 'refs/heads/alias', 'refs/heads/moved', cwd=self.main)
+        self.git('branch', 'local', cwd=self.main)
+        self.git('config', 'branch.local.remote', '.', cwd=self.main)
+        self.git('branch', 'dev', 'master', cwd=self.main)
+        self.git('push', '-q', 'origin', 'dev', cwd=self.main)
+        self.git('symbolic-ref', 'HEAD', 'refs/heads/dev', cwd=self.t / 'main.git')
+        self.drop_parent()
+        common = str(self.main / '.git')
+        cases = {'busy': (self.oid('busy'), 'checked out at'), 'moved': (old, 'is at'),
+                 'alias': (self.oid('alias'), 'symbolic ref'), 'local': (self.oid('local'), '. is not a configured'),
+                 'dev': (self.oid('dev'), 'default branch of origin')}
+        for name, (tip, why) in cases.items():
+            done = self.run_script('cleanup', str(self.parent), '--branch', common, name, tip)
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertIn(why, done.stdout, name)
+            self.assertTrue(self.branch_exists(name), name)
+
+    def test_the_fetch_leaves_local_tags_alone_whatever_the_prune_config(self):
+        child = self.child()
+        self.git('tag', 'local-only', cwd=self.main)
+        self.git('push', '-q', 'origin', 'master:refs/heads/gone', cwd=self.main)
+        self.git('fetch', '-q', 'origin', cwd=self.main)
+        self.git('push', '-q', 'origin', ':refs/heads/gone', cwd=self.main)
+        self.git('config', 'fetch.pruneTags', 'true', cwd=self.main)
+        self.git('config', 'remote.origin.pruneTags', 'true', cwd=self.main)
+        self.git('config', 'remote.origin.tagOpt', '--tags', cwd=self.main)
+        self.assert_removed(child)
+        self.assertEqual(self.git('tag', '--list', 'local-only', cwd=self.main).strip(), 'local-only')
+        self.assertEqual(self.git('branch', '-r', '--list', 'origin/gone', cwd=self.main), '', 'pruned branch')
+
+    def test_the_fetch_updates_no_ref_a_configured_mapping_names(self):
+        child = self.child()
+        self.git('branch', 'notes', 'master', cwd=self.main)
+        self.git('push', '-q', 'origin', 'notes', cwd=self.main)
+        self.git('tag', 'v1', 'master', cwd=self.main)
+        self.git('push', '-q', 'origin', 'v1', cwd=self.main)
+        local = self.commit(self.main, 'mine.txt', 'mine')
+        self.git('reset', '-q', '--hard', 'HEAD~1', cwd=self.main)
+        self.git('update-ref', 'refs/heads/notes', local, cwd=self.main)
+        self.git('tag', '-f', 'v1', local, cwd=self.main)
+        for spec in ('+refs/heads/notes:refs/heads/notes', '+refs/tags/*:refs/tags/*'):
+            self.git('config', '--add', 'remote.origin.fetch', spec, cwd=self.main)
+        self.assert_removed(child)
+        self.assertEqual(self.oid('notes'), local)
+        self.assertEqual(self.oid('v1'), local)
+
+    def test_a_malformed_pr_search_keeps_the_branch_and_the_sweep_goes_on(self):
+        kids = [self.child('a', push=False), self.child('b', push=False)]
+        for kid in kids:
+            self.commit(kid, f'{kid.name}.txt', 'local')
+        (self.t / 'prs').write_text(json.dumps({'nodes': None, 'issueCount': 0}))
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), env={'STUB_PRS': str(self.t / 'prs')})
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        for kid in kids:
+            self.assertFalse(kid.exists())
+        self.assertEqual(done.stdout.count('malformed answer'), 2)
+        [retry] = [l.split(' cleanup ', 1)[1].split() for l in done.stdout.splitlines() if l.startswith('retry: ')]
+        node = {'headRefName': 'a', 'headRefOid': self.oid('a'), 'state': 'OPEN', 'mergedAt': None, 'number': 1}
+        for missing in ('number', 'headRefOid'):
+            answer = {'nodes': [{k: v for k, v in node.items() if k != missing}], 'issueCount': 1}
+            (self.t / 'prs').write_text(json.dumps(answer))
+            self.calls.unlink()
+            done = self.run_script('cleanup', *retry, env={'STUB_PRS': str(self.t / 'prs')})
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertIn('kept branch a in', done.stdout)
+            self.assertIn('malformed answer', done.stdout)
+            self.assertIn('kept branch b in', done.stdout)
+            [note] = self.notifications()
+            self.assertIn('2 branch(es)', note[note.index('show') + 1])
+        self.assertTrue(self.branch_exists('a') and self.branch_exists('b'))
+
+    def test_the_event_settles_the_parents_branch_from_its_workspace_snapshot(self):
+        self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
+        child = self.child()
+        self.drop_parent()
+        event = {'event': 'worktree.removed', 'data': {
+            'type': 'worktree_removed', 'workspace_id': 'w1', 'forced': False,
+            'workspace': {'workspace_id': 'w1', 'worktree': {
+                'repo_key': str(self.main / '.git'), 'repo_name': 'main', 'repo_root': str(self.main),
+                'checkout_path': str(self.parent), 'is_linked_worktree': True}},
+            'worktree': {'path': str(self.parent), 'branch': 'parent', 'is_bare': False, 'is_detached': False,
+                         'is_prunable': False, 'is_linked_worktree': True, 'label': 'parent'}}}
+        done = self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': json.dumps(event)})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse(self.branch_exists('parent'))
+        self.assertFalse(child.exists())
+        self.assertFalse(self.branch_exists('child'))
+        self.git('branch', 'parent', 'master', cwd=self.main)
+        del event['data']['workspace']
+        done = self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': json.dumps(event)})
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('kept branch parent: the event names no repository', done.stdout)
+        self.assertTrue(self.branch_exists('parent'))
+
+    # --- agents ----------------------------------------------------------------------
+
+    def test_a_running_chief_keeps_the_child(self):
+        child = self.child()
+        chief = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', '--agent', 'chief'], cwd=child)
+        self.addCleanup(chief.wait)
+        self.addCleanup(chief.kill)
+        self.assert_kept(child, f'a headless chief runs in it: pid {chief.pid}')
+
+    def test_a_cowork_lane_with_a_request_keeps_the_child(self):
+        child = self.child()
+        box = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip()) / 'cowork' / 'codex' / 'review'
+        box.mkdir(parents=True)
+        (box / 'codex-review-1.lock').write_text('')
+        self.assert_kept(child, 'cowork lane codex/review holds a running or undelivered request')
+
+    def test_a_childs_store_inside_another_child_keeps_the_holder(self):
+        holder, user = self.child('a'), self.child('b')
+        sub = user / 'lib' / 'sub'
+        old = Path(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip())
+        store = holder / 'build' / 'store'
+        old.rename(store)
+        (sub / '.git').write_text(f'gitdir: {store}\n')
+        self.git('config', '--file', str(store / 'config'), 'core.worktree', str(sub), cwd=user)
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {holder}: nested repository or worktree at {store}', done.stdout)
+        self.assertTrue((store / 'HEAD').is_file())
 
     # --- refusals and input ----------------------------------------------------------
 
@@ -572,7 +808,8 @@ class WorktreeChildren(unittest.TestCase):
                          'a repeated event finds nothing to do')
         for bad in ('{}', 'not json', json.dumps({'data': {'worktree': {'path': 'relative'}}})):
             self.assertEqual(self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': bad}).returncode, 2, bad)
-        self.assertEqual(self.run_script().returncode, 2)
+        for argv in ([], ['cleanup', str(self.parent), '--branch', 'a', 'b'], ['cleanup', str(self.parent), 'x']):
+            self.assertEqual(self.run_script(*argv).returncode, 2, argv)
 
 
 if __name__ == '__main__':
