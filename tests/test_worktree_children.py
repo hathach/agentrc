@@ -113,7 +113,12 @@ class WorktreeChildren(unittest.TestCase):
         (path / 'build').mkdir()
         (path / 'build' / 'out.bin').write_text('ignored build output')
         (path / 'build' / 'deps').symlink_to(self.sentinel)
+        (path / 'build' / 'stale').symlink_to(self.t / 'gone')  # a dangling link never keeps a child
         return path
+
+    def hand_made_store(self, at):
+        """A bare repository at `at`: no remote-tracking refs, so its branch is on no remote."""
+        self.git('clone', '-q', '--bare', str(self.t / 'sub.git'), str(at), cwd=self.t)
 
     def unpublished_sub_tag(self, child, primary_ref=None):
         """Tag `saved` on a submodule commit only the child has, the checkout back on the published one;
@@ -393,17 +398,30 @@ class WorktreeChildren(unittest.TestCase):
         copy.symlink_to(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip())
         self.assert_kept(child, 'refs/tags/saved in submodule repository')
 
-    def test_a_primary_copy_whose_objects_or_refs_link_into_the_doomed_store_is_no_fallback(self):
-        for part in ('objects', 'refs'):
+    def test_a_primary_copy_that_is_not_self_contained_is_no_fallback(self):
+        for part in ('objects', 'refs', 'objects/pack', 'fanout', 'outside', 'commondir'):
             with self.subTest(part):
                 self.tearDown()
                 self.setUp()
                 child = self.child()
                 sub = self.unpublished_sub_tag(child, 'refs/tags/saved')
-                copy = self.main / '.git' / 'modules' / 'lib' / 'sub' / part
-                shutil.rmtree(copy)
-                copy.symlink_to(Path(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip()) / part)
+                copy = self.main / '.git' / 'modules' / 'lib' / 'sub'
+                doomed = Path(self.git('rev-parse', '--absolute-git-dir', cwd=sub).strip())
+                if part == 'commondir':
+                    (copy / 'commondir').write_text(f'{doomed}\n')
+                else:
+                    name = {'fanout': next(f'objects/{d.name}' for d in (copy / 'objects').iterdir()
+                                           if len(d.name) == 2), 'outside': 'objects/pack'}.get(part, part)
+                    # moved, not copied: every object stays readable through the link
+                    target = (self.t if part == 'outside' else doomed) / f'moved-{name.replace("/", "-")}'
+                    (copy / name).rename(target)
+                    (copy / name).symlink_to(target)
                 self.assert_kept(child, 'refs/tags/saved in submodule repository')
+
+    def test_a_looping_symlink_keeps_the_child(self):
+        child = self.child()
+        (child / 'build' / 'loop').symlink_to(child / 'build' / 'loop')
+        self.assert_kept(child, f'cannot classify {child / "build" / "loop"}')
 
     @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root lists any directory')
     def test_a_directory_the_checks_cannot_list_keeps_the_child(self):
@@ -436,6 +454,31 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertTrue(child.is_dir())
         self.assertIn(f'kept {child}: cannot classify {child / "build" / "inner"}', done.stdout)
+
+    @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root stats any path')
+    def test_a_store_whose_objects_link_where_the_checks_cannot_stat_keeps_the_child(self):
+        child = self.child()
+        store = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip()) / 'modules' / 'extra'
+        self.hand_made_store(store)
+        locked = self.t / 'locked'
+        locked.mkdir()
+        (store / 'objects').rename(locked / 'objects')
+        (store / 'objects').symlink_to(locked / 'objects')
+        locked.chmod(0)
+        try:
+            self.assert_kept(child, f'cannot classify {store / "objects"}')
+        finally:
+            locked.chmod(0o700)
+
+    def test_a_repository_placed_in_a_stores_refs_or_logs_keeps_the_child(self):
+        for part in ('refs', 'logs'):
+            with self.subTest(part):
+                self.tearDown()
+                self.setUp()
+                child = self.child()
+                store = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child / 'lib' / 'sub').strip())
+                self.hand_made_store(store / part / 'hidden')
+                self.assert_kept(child, f'in submodule repository {store / part / "hidden"} is on no remote')
 
     def test_an_unreadable_head_keeps_the_child(self):
         for case in ('child', 'submodule'):

@@ -27,7 +27,8 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   child or pruned), its main worktree inside that boundary, and
   each of its refs and HEAD either a commit reachable from its own remote-tracking refs or
   present under the same name and object id in the primary checkout's copy of that submodule
-  (`<common git dir>/modules/<name>`, used only when it borrows no objects through alternates);
+  (`<common git dir>/modules/<name>`, used only when self-contained: no alternates, no commondir,
+  no symlink);
   an annotated tag therefore needs that copy. Remote-tracking refs are trusted as fetched.
 Deleted by policy: ignored files and commits only a reflog still names. The child's branch is
 never deleted. No `git worktree prune` runs: it would touch unrelated worktrees.
@@ -100,20 +101,39 @@ def unkept(entries, gitdir, *, against=('--branches', '--tags', '--remotes')):
     return [e for e in entries if e[1] != 'commit' or e[0] in off]
 
 
+def is_store(dirs, files):
+    """git's own test for a repository (setup.c is_git_directory): HEAD, objects/ and refs/."""
+    return 'HEAD' in files and 'objects' in dirs and 'refs' in dirs
+
+
+def has_symlink(top):
+    """Whether top is or holds a symlink."""
+    return os.path.islink(top) or any(links for _, _, _, links in walk(top))
+
+
+def common_dir(gitdir):
+    """The common git dir git resolves for gitdir, or None when git cannot read it."""
+    done = run(['git', '--git-dir', str(gitdir), 'rev-parse', '--path-format=absolute', '--git-common-dir'])
+    return None if done.returncode else os.path.realpath(done.stdout.strip())
+
+
 def walk(top):
-    """Top-down os.walk (symlinks listed, not entered) that keeps the child on an entry it cannot list or
-    classify: os.walk files an entry whose stat fails (d_type unknown) as a non-directory and skips it."""
+    """Top-down os.walk (symlinks listed, not entered) that also yields each directory's symlink names,
+    and keeps the child on an entry it cannot list or classify, a symlink whose target cannot be read
+    included: os.walk and os.path.isdir file an entry whose stat fails as a non-directory."""
     stack = [top]
     while stack:
         top = stack.pop()
-        dirs, files, real = [], [], set()
+        dirs, files, links, real = [], [], [], set()
         try:
             with os.scandir(top) as listing:
                 for entry in listing:
                     try:
+                        if entry.is_symlink():
+                            links.append(entry.name)
                         if entry.is_dir(follow_symlinks=False):
                             real.add(entry.name)
-                        elif not (entry.is_symlink() and os.path.isdir(entry.path)):
+                        elif not entry.is_dir():  # a dangling link is a file; a looping one raises
                             files.append(entry.name)
                             continue
                     except OSError as err:
@@ -121,7 +141,7 @@ def walk(top):
                     dirs.append(entry.name)
         except OSError as err:
             raise Keep(f'cannot list {err.filename}: {err.strerror}')
-        yield top, dirs, files
+        yield top, dirs, files, links
         stack += [os.path.join(top, d) for d in dirs if d in real]
 
 
@@ -203,9 +223,8 @@ def nested_repo(child, allowed):
     or None. The whole tree: a repository initialized inside a tracked directory shows in no status or
     ignored listing."""
     allowed = {os.path.realpath(p) for p in [child, *allowed]}
-    for top, dirs, files in walk(child):
-        bare = 'HEAD' in files and 'objects' in dirs and 'refs' in dirs
-        if ('.git' in dirs or '.git' in files or bare) and os.path.realpath(top) not in allowed:
+    for top, dirs, files, _ in walk(child):
+        if ('.git' in dirs or '.git' in files or is_store(dirs, files)) and os.path.realpath(top) not in allowed:
             return top
         if '.git' in dirs:
             dirs.remove('.git')
@@ -216,10 +235,9 @@ def doomed_stores(child, gitdir, sub_gitdirs):
     """Git dirs the removal deletes: submodule git dirs inside the child or its git dir, and every
     repository stored anywhere under the child's git dir (deinitialized submodules included)."""
     stores = {os.path.realpath(d) for d in sub_gitdirs if is_within(d, [child, gitdir])}
-    for top, dirs, files in walk(gitdir):
-        if 'HEAD' in files and 'objects' in dirs:
-            stores.add(os.path.realpath(top))
-            dirs[:] = [d for d in dirs if d not in ('objects', 'refs', 'logs')]  # a ref may be named objects/*
+    # the whole tree, so a repository placed in a store's refs/ or logs/ is found; remote branches named
+    # both objects/* and refs/* make refs/remotes/<remote> pass as a store, which then keeps the child
+    stores.update(os.path.realpath(top) for top, dirs, files, _ in walk(gitdir) if is_store(dirs, files))
     return sorted(stores)
 
 
@@ -238,12 +256,14 @@ def check_store(store, child, gitdir, common, doomed):
         return
     modules = Path(os.path.realpath(gitdir / 'modules'))
     survivor = common / 'modules' / Path(store).relative_to(modules) if is_within(store, [modules]) else None
-    # a copy that resolves, or keeps its objects or refs, in what the removal deletes would vouch for itself
-    if survivor and any(is_within(p, [child, gitdir, *doomed]) for p in (survivor, survivor / 'objects',
-                                                                          survivor / 'refs')):
+    # the copy vouches only when self-contained: alternates, a commondir or a symlink, none of which git
+    # puts in a module store, could make it borrow from what the removal deletes
+    if survivor and (is_within(survivor, [child, gitdir, *doomed]) or not (survivor / 'objects').is_dir()
+                     or (survivor / 'objects' / 'info' / 'alternates').exists()
+                     or common_dir(survivor) != os.path.realpath(survivor) or has_symlink(survivor)):
         survivor = None
     kept = {}
-    if survivor and (survivor / 'objects').is_dir() and not (survivor / 'objects' / 'info' / 'alternates').exists():
+    if survivor:
         kept = {name: oid for oid, _, name in refs(survivor)}
         kept['HEAD'] = head_oid(survivor)
     lost = [name for oid, _, name in pending if kept.get(name) != oid]
@@ -317,7 +337,7 @@ def cleanup(parent):
                 return 2
             remove(child, *removal)
             log(f'removed {child}')
-        except Keep as why:
+        except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
             kept.append((child, str(why)))
             log(f'kept {child}: {why}')
     if kept:
