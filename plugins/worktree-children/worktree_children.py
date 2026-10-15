@@ -559,7 +559,11 @@ def cleanup(parent, branches=(), kept_branches=()):
         if branch:
             branches.append(branch)
     for branch in branches:  # only now: a detached child checked above may hang on one of them
-        settle(branch)
+        if stopped:  # the parent's replacement may not have checked its branch out yet
+            kept_branches.append((branch[1], f'{parent} exists again'))
+            unsettled.append(branch)
+        else:
+            settle(branch)
     if unsettled:
         log(f'retry: {retry(parent, unsettled)}')
     if kept or kept_branches:

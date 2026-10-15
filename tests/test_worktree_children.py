@@ -842,13 +842,18 @@ class WorktreeChildren(unittest.TestCase):
 
     def test_a_parent_recreated_during_the_checks_stops_the_sweep(self):
         kids = [self.child(), self.child('second')]
+        self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
+        tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
         self.mode.write_text('recreate')
-        done = self.cleanup()
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertTrue(self.parent.is_dir())
         for kid in kids:
             self.assertTrue(kid.is_dir(), done.stdout)
             self.assertNotIn(f'removed {kid}', done.stdout)
+        self.assertTrue(self.branch_exists('parent'), done.stdout)
+        self.assertIn(f'retry: {SCRIPT} cleanup {self.parent} --branch', done.stdout)
 
     def test_the_event_reads_herdrs_envelope_and_bad_events_are_usage_errors(self):
         child = self.child()
