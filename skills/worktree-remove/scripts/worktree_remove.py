@@ -20,11 +20,11 @@ Refused (exit 3), nothing changed:
 - a git or GitHub lookup the gate needs fails or comes back incomplete.
 
 Pending (exit 4 unless --proceed names the token the list printed), for PATH's branch and each
-sibling's, each against its own repository (a fork's PRs to its parent included): an open PR; an
-unresolved review thread on its latest merged PR; commits on its remote that the remote's default
-branch lacks, with no PR at that tip; each sibling and each branch the plugin will keep, with the
-reason (a never-pushed commit, say); each --pending item. The token digests the list, so a list
-that changed since the human saw it stops again.
+sibling's, each against its own repository (its PRs from that repository's branch of that name, a
+fork's to its parent included): an open PR; an unresolved review thread on its latest merged PR;
+commits on its remote that the remote's default branch lacks, with no PR at that tip; each sibling
+and each branch the plugin will keep, with the reason (a never-pushed commit, say); each --pending
+item. The token digests the list, so a list that changed since the human saw it stops again.
 
 Then PATH's content check runs again, the report goes to
 ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the inventory,
@@ -144,11 +144,12 @@ def gate(common, branch, tip):
         repo = wc.github_repo(common, remote)
         if not repo:
             return [f'{branch}: commits on {remote} that {default} lacks'] if pushed and not merged else []
-        prs = [dict(pr, repo=repo, ref=f'#{pr["number"]}') for pr in wc.pulls(repo, branch)]
+        owner = repo.split('/')[0]  # the search spans forks; a same-named branch of another is not ours
+        prs = [dict(pr, repo=repo, ref=f'#{pr["number"]}') for pr in wc.pulls(repo, branch, owner=owner)]
         parent = fork_parent(repo)
         if parent:  # a fork's PRs to its parent live in the parent
             prs += [dict(pr, repo=parent, ref=f'{parent}#{pr["number"]}')
-                    for pr in wc.pulls(parent, branch, owner=repo.split('/')[0])]
+                    for pr in wc.pulls(parent, branch, owner=owner)]
         items = [f'{branch}: open PR {pr["ref"]}' for pr in prs if pr['state'] == 'OPEN']
         last = max((pr for pr in prs if pr['merged_at']), key=lambda pr: pr['merged_at'], default=None)
         if last:

@@ -219,7 +219,7 @@ class Remove(unittest.TestCase):
         self.commit(moved, 'm.txt', 'm')
         sh(moved, 'push', '-q', 'origin', 'moved')
         with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'o/r'), \
-                mock.patch.object(wr.wc, 'pulls', lambda repo, branch: prs[branch]), \
+                mock.patch.object(wr.wc, 'pulls', lambda repo, branch, owner=None: prs[branch]), \
                 mock.patch.object(wr, 'fork_parent', lambda repo: None), \
                 mock.patch.object(wr, 'unresolved_threads', lambda repo, n: threads[n]):
             rc, out = self.run_remove()
@@ -262,6 +262,31 @@ class Remove(unittest.TestCase):
         with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'me/r'), \
                 mock.patch.object(wr.wc, 'gh_lines', gh):
             self.assertRefused('PR search of up/r for head:parent')
+
+    def test_same_named_branches_from_other_owners_are_not_gated_on(self):
+        nodes = [dict(number=9, state='MERGED', headRefName='parent', headRefOid='x', mergedAt='2026-03-01',
+                      headRepositoryOwner={'login': 'stranger'}),
+                 dict(number=8, state='OPEN', headRefName='parent', headRefOid='y', mergedAt=None,
+                      headRepositoryOwner={'login': 'stranger'}),
+                 dict(number=7, state='MERGED', headRefName='parent', headRefOid='z', mergedAt='2026-01-01',
+                      headRepositoryOwner={'login': 'o'})]
+
+        def gh(*args):
+            if args[:2] == ('repo', 'view'):
+                return [json.dumps({'isFork': False, 'parent': None})]
+            query = ' '.join(args)
+            if 'reviewThreads' in query:
+                number = re.search(r'number=(\d+)', query).group(1)
+                return [f'https://github.com/o/r/pull/{number}#discussion_r1']
+            return [json.dumps({'issueCount': len(nodes), 'nodes': nodes})]
+
+        with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'o/r'), \
+                mock.patch.object(wr.wc, 'gh_lines', gh):
+            rc, out = self.run_remove()
+        self.assertEqual(rc, 4, out)
+        self.assertIn('parent: unresolved review thread https://github.com/o/r/pull/7#discussion_r1', out)
+        self.assertNotIn('pull/9', out)
+        self.assertNotIn('open PR', out)
 
     # --- run --------------------------------------------------------------------------
 
