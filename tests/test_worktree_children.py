@@ -853,6 +853,7 @@ class WorktreeChildren(unittest.TestCase):
             self.assertTrue(kid.is_dir(), done.stdout)
             self.assertNotIn(f'removed {kid}', done.stdout)
         self.assertTrue(self.branch_exists('parent'), done.stdout)
+        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
         self.assertIn(f'retry: {SCRIPT} cleanup {self.parent} --branch', done.stdout)
 
     def test_a_parent_recreated_during_a_failing_check_keeps_the_queued_branches(self):
@@ -866,6 +867,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertTrue(kid.is_dir(), done.stdout)
         self.assertTrue(self.branch_exists('parent'), done.stdout)
+        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
         self.assertIn(f'retry: {SCRIPT} cleanup {self.parent} --branch', done.stdout)
 
     def test_the_event_reads_herdrs_envelope_and_bad_events_are_usage_errors(self):
