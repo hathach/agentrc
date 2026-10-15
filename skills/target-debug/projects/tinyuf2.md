@@ -66,9 +66,9 @@ in front of you.**
   (`RESET_REASON_CORE_SW`/`CPU0_SW`) from a non-factory boot, then clears it.
   verified 2026-10-13 2b558bd espressif_esp32s3_devkitc_1: the battery's
   reenter and 10 DFU_DETACH cycles of its app.
-- While TinyUF2 or the tested app owns the native port, USB-Serial-JTAG
+- While TinyUF2 or the tested app owns the native port on the S3, USB-Serial-JTAG
   (303a:1001) is absent; logs and reset go over the UART bridge
-  (`esp-target-debug`, "The PHY map").
+  (`espressif.md`, "The USB ports per chip").
   verified 2026-10-13 2b558bd espressif_esp32s3_devkitc_1: sysfs during the
   battery.
 - **dmesg shows "reset full-speed USB device ... device firmware changed" and

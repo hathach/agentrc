@@ -96,8 +96,7 @@ through its `Build contract:` and `HIL contract:` lines:
 
 | Skill | Use it to | Start with |
 |---|---|---|
-| [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
-| [`esp-target-debug`](skills/esp-target-debug/SKILL.md) | the same on ESP32-S3/P4 built-in USB-Serial-JTAG (other gdb, openocd fork) | read its PHY map first |
+| [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO; Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
 | [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |
 | [`etm-trace`](skills/etm-trace/SKILL.md) | instruction-level trace through a J-Trace and Ozone: hot functions, coverage, history before a fault | `etm_capture.py --jdebug <ref.jdebug> --elf <elf> --probe jtrace --duration-ms 10000 --out <dir>`, then `etm_profile.py <dir> --elf <elf>` |
 | [`usb-kernel-debug`](skills/usb-kernel-debug/SKILL.md) | capture Linux host URBs (usbmon); kernel dynamic debug on a host or gadget | `usbcap.py <vid:pid> 10`; `sudo usb_dyndbg.sh on\|off usbcore xhci_hcd` |

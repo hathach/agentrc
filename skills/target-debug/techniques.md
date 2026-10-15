@@ -4,7 +4,10 @@ Part of the `target-debug` skill: the recipes its technique ladder points to.
 Read a section when the ladder sends you to that technique; SKILL.md's
 Delegated sessions, Rig discipline and Warnings bind here unchanged.
 
-## PC-sampling — where the core spins, without halting
+## PC-sampling — where the core spins, without halting (Cortex-M DWT_PCSR)
+
+Xtensa and RISC-V have no sampling register; `espressif.md`'s halt-based
+substitute is more intrusive than a RAM ring and untested as a histogram.
 
 `DWT_PCSR` (0xE000101C) returns the current PC on every read, target running
 (Cortex-M3+; optional on M0+, reads 0 if absent; 0xFFFFFFFF = core halted or
@@ -66,7 +69,9 @@ python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [-
 ## RAM ring-buffer trace
 
 The zero-print instrument: a small event ring in the
-driver under suspicion, dumped over GDB after the failure. Single-writer (ISR) — no locking:
+driver under suspicion, dumped over GDB after the failure. One non-reentrant
+writer on one core (the ISR) — no locking; on a dual-core chip (ESP32-S3, P4,
+S31) a second core writing the same ring needs its own ring:
 
 ```c
 typedef struct { uint16_t ev; uint16_t a; uint32_t b; } dbg_ev_t;
@@ -83,9 +88,10 @@ static inline void DBG_EV(uint16_t ev, uint16_t a, uint32_t b) {
 After building, `nm` the ELF for `dbg_ring`/`dbg_wr` — if they're missing the
 compiler deleted your instrument and the run will "reproduce" with an empty ring.
 
-Order is the index; if durations matter add a `uint32_t t = DWT->CYCCNT` field
-(enable once: `CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; DWT->CTRL |= 1;`
-RISC-V: read `mcycle`). Let the failure happen, halt, then:
+Order is the index; if durations matter add a `uint32_t t` field from the
+core's cycle counter (Cortex-M: `DWT->CYCCNT`, enable once with
+`CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk; DWT->CTRL |= 1;`; RISC-V:
+`mcycle`; Xtensa: `CCOUNT`). Let the failure happen, halt, then:
 
 ```gdb
 p dbg_wr                          # total events; oldest slot = dbg_wr & (DBG_N-1) once wrapped
@@ -104,9 +110,22 @@ gotchas live there):
 ```bash
 # RTT (J-Link probe; flash + reset first — the console owns the probe):
 python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> --interface swd --speed auto --seconds 20 > /tmp/rtt.log
-# UART (board's debug serial, if wired):
-stty -F /dev/ttyACM<N> 115200 raw && timeout 20s cat /dev/ttyACM<N> | tee /tmp/uart.log
+# UART (board's debug serial, if wired; name it by /dev/serial/by-id or by-path):
+stty -F /dev/serial/by-id/<port> 115200 raw && timeout 20s cat /dev/serial/by-id/<port> | tee /tmp/uart.log
 ```
+
+A separate `stty` can race another client's terminal setup, and the
+settings are shared: configure raw mode after opening the reader's own fd
+(pyserial, or `tty.setraw(fd, termios.TCSANOW)`; the default `TCSAFLUSH`
+waits for a concurrent writer's output to drain and discards unread input)
+and coordinate later changes between clients (a capture stopped at 4095
+bytes, a reader blocked behind the CDC writer: 2026-10-16, P4 and S31).
+
+A UART write path costs what its driver does: a polled driver blocks only
+while the TX FIFO is full, an interrupt-driven ring blocks only when the
+ring is full, and a console that drops when the host does not drain waits
+as long as its driver says before dropping, then loses lines. Espressif
+consoles (UART0, USB-Serial-JTAG CDC): `espressif.md` "Console".
 
 OpenOCD RTT (native probes: ST-Link/CMSIS-DAP): rtt skill §OpenOCD — exact
 CB address from `nm`, attach-only. OpenOCD polls — bursty logs can drop
@@ -148,8 +167,11 @@ the wire itself: `usb-sniffer` skill (hardware tap, PID-level).
 
 - J-Link (UM08001): <https://kb.segger.com/UM08001_J-Link_/_J-Trace_User_Guide> — flash breakpoints, RTT, SWO, monitor mode, Commander.
 - OpenOCD: <https://openocd.org/doc/html/index.html> — `rtt`, `bp`/`wp`, `cortex_m vector_catch`/`maskisr`, `itm`/`tpiu`.
+- openocd-esp32 (Espressif's fork): <https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/jtag-debugging/>
+  and the fork's `share/openocd/scripts/target/esp_common.cfg`.
 - "Debugging with GDB" (§5.1 = break/watch/dprintf): Tenth Edition (GDB 18)
   via the `read-doc` skill, or
   `curl -sL -o /tmp/gdb.pdf https://sourceware.org/gdb/current/onlinedocs/gdb.pdf`
-  (the HTML mirror blocks fetchers). Installed `arm-none-eabi-gdb`
+  (the HTML mirror blocks fetchers). The matching toolchain's installed gdb
+  (`arm-none-eabi-gdb`, `riscv32-esp-elf-gdb`, `xtensa-esp32s3-elf-gdb`)
   `help <cmd>` is authoritative here.

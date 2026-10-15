@@ -1,12 +1,13 @@
 ---
 name: target-debug
-description: "Use when firmware misbehaves on real hardware and its own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO."
+description: "Use when firmware misbehaves on real hardware and its own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO. Also for Espressif chips over the built-in USB-Serial-JTAG (303a:1001) or pad JTAG with openocd-esp32, when openocd says \"could not find or open device\", or the debug port becomes the firmware's USB device."
 ---
 
 # target-debug — target-side capture & debugging over a debug probe
 
-The **target** is the MCU running the code under test. The methods here work
-for any firmware on a debug probe; the worked cases are USB stacks (device
+The **target** is the MCU running the code under test. The discipline here
+holds for any firmware on a debug probe, and each technique names the
+architecture it exists on; the worked cases are USB stacks (device
 role, host role, or both), where the link peer is not always a Linux PC: an MCU
 host may face another board or a Linux gadget (e.g. a Raspberry Pi).
 
@@ -16,11 +17,14 @@ host may face another board or a Linux gadget (e.g. a Raspberry Pi).
 |----------------------|------------------------------------------------------------------|---------------------------------------------------------|
 | **`target-debug`**   | **what the target did** (driver state, faults, where the core spins) | a debug probe on the target                        |
 | `rtt`                | the target's log/console stream, and a post-mortem ring dump     | a probe, firmware that logs over SEGGER RTT             |
-| `esp-target-debug`   | the same methods on Espressif's built-in USB-JTAG                | an ESP32-S3/P4 — read it FIRST there: other gdb, other openocd |
 | `etm-trace`          | exactly which instructions ran (profile, coverage, history)      | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule |
 | `usb-sniffer`        | what crossed the wire (PIDs, handshakes, resets)                 | the hardware tap cabled in; role-agnostic               |
 | a project's `sysview` | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | the project ships the skill; a J-Link/J-Trace for live capture, or an OpenOCD probe for raw RTT capture |
 | `usb-kernel-debug`   | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
+
+**Espressif targets** (ESP32-S2/S3/P4/S31 and the C series): read
+`espressif.md` first; it names the tools, the JTAG route per chip and the
+console.
 
 ## What the project supplies
 
@@ -44,7 +48,7 @@ directly (`--hil-config <file> --board <name>`; a flag given as well must agree)
 
 | `flasher` field | Means | Becomes |
 |---|---|---|
-| `name` | how the rig flashes: `jlink`, `openocd`, `stlink` are probe routes; `esptool`, `lm4flash` are refused: they name no debug probe | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
+| `name` | how the rig flashes: `jlink`, `openocd`, `stlink` are probe routes; `esptool`, `lm4flash` are refused: they name no debug probe (Espressif debug transport and selector: `espressif.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
 | `uid` | the probe's serial | `--probe` |
 | `args` | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments | `--device`, or `--cfg` whole |
 | `vid_pid` | the probe model's USB IDs, openocd only | `--vid-pid` |
@@ -117,12 +121,19 @@ adds only what it may edit and when it stops.
   or outcome differ. An early decisive observation may settle the claim;
   otherwise a shortened capture is partial evidence and cannot establish a
   pass that needs the full exposure. Anchor every state reading with the
-  backend's validity check (Cortex-M: DHCSR) and record whether attaching
-  halted or reset the target; a post-reset snapshot is never the failure
-  state.
+  backend's validity check (Cortex-M: DHCSR; Espressif: a console banner
+  baseline taken at port open, before the attach, `espressif.md` Anchors)
+  and record whether
+  attaching halted or reset the target; a post-reset snapshot is never the
+  failure state.
 - **Host.** Leave the host as found: never clear kernel logs (`dmesg -C`) or
   other shared history, and restore every setting you change (dynamic debug,
-  module parameters).
+  module parameters). Anchor kernel-log reads on raw kernel timestamps
+  (`dmesg --time-format raw`) and take a contemporaneous clock mapping
+  when correlating with wall time: line counts fail once the ring wraps,
+  and both `-T` and ISO stamps need that mapping checked (`-T` was ~30 s
+  off on htpc, 2026-10-16). A host with `dmesg_restrict` refuses an
+  unprivileged `dmesg -w` ("Operation not permitted"): read it with sudo.
 - **Budget.** Stop starting experiments when the remaining time cannot cover
   the experiment plus cleanup; never cut a restoration short for the deadline,
   report the overrun.
@@ -165,7 +176,8 @@ its CI runner. Rigs and
 benches run many identical probes:
 
 - Select the probe by serial: J-Link `-SelectEmuBySN <uid>`, its GDB server
-  `-select usb=<uid>`, OpenOCD `-c 'adapter serial <uid>'`.
+  `-select usb=<uid>`, OpenOCD `-c 'adapter serial <uid>'`; a probe without
+  one by `adapter usb location` (`espressif.md`, ESP32-S2).
 - Run on the host that owns the probe.
 - One probe serves one client: quit JLinkExe before starting JLinkGDBServer on
   the same probe.
@@ -178,14 +190,14 @@ that IS a finding (timing-sensitive): move down in intrusiveness, not up.
 
 | Technique                          | Intrusiveness                  | Reach for it when                                       |
 |------------------------------------|--------------------------------|---------------------------------------------------------|
-| PC-sampling                        | none — no halt, no code change | core wedged/spinning somewhere unknown                  |
-| SWO exception trace / hw PC-sample | none — needs SWO pin wired     | ISR ordering/timing with zero code change               |
-| DWT data trace                     | none — needs SWO pin wired     | stream one address's accesses: value + accessor PC      |
-| Vector catch                       | none until a fault fires       | crash-shaped wedges — autopsy AT the faulting pc        |
+| PC-sampling                        | no deliberate halt or firmware instrumentation (Cortex-M with DWT implemented; Espressif: none, `espressif.md`) | core wedged/spinning somewhere unknown |
+| SWO exception trace / hw PC-sample | none — Cortex-M (ARMv7-M+), SWO pin wired | ISR ordering/timing with zero code change               |
+| DWT data trace                     | none — Cortex-M (ARMv7-M+), SWO pin wired | stream one address's accesses: value + accessor PC      |
+| Vector catch                       | none until a fault fires (Cortex-M; RISC-V/Xtensa: a breakpoint in the trap handler) | crash-shaped wedges — autopsy AT the faulting pc |
 | RAM ring-buffer                    | ~tens of cycles per event      | ISR ordering/timing bugs                                |
 | SystemView (project's `sysview`)   | recorder in the firmware, per event | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
 | Log lines (RTT)                    | µs per line                    | logic bugs that survive logging (J-Link or OpenOCD rtt) |
-| Log lines (UART)                   | ms per line — blocking write   | same, when no debug-probe RTT path                      |
+| Log lines (UART)                   | up to ms per line when the write path polls a full FIFO | same, when no debug-probe RTT path |
 | dprintf / conditional breakpoint   | halt+resume per hit (~ms)      | low-rate probes post-wedge; never ISR-rate events       |
 | GDB halt / breakpoints             | stops USB service entirely     | post-mortem state autopsy once wedged                   |
 
@@ -203,7 +215,7 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands, the
   drain model; the channel itself is the `rtt` skill's.
 - Chip and family constraints (flash reads, reset domains, probe misreads):
-  `families.md`.
+  `families.md`; Espressif chips: `espressif.md`.
 - dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch
   sessions, the hardware breakpoint budget, watchpoints, FreeRTOS threads,
   J-Link Commander quirks.
@@ -219,10 +231,14 @@ Each technique's recipe, read when you reach for it (files beside this one):
   rig's own procedure; its HIL contract names it). A probe reset disconnects
   only when the reset it issues reaches the USB controller or its PHY: check
   the part (`families.md`: DWC2, STM32F4).
-- **A bug that vanishes under logging is a timing bug**, not fixed: switch to
-  the ring buffer; if it vanishes under GDB too, PC-sampling only.
-- **UART logging blocks in the write path** (worst perturbation, including
-  inside the ISR); RTT is much cheaper but not free; verbose logging multiplies both.
+- **A bug that vanishes under logging is not fixed**: treat it as
+  timing-sensitive until the ring buffer reproduces it, and if it vanishes
+  under GDB too, move down to PC-sampling; the added code's own effect on
+  stack, layout and ordering is the alternative to rule out.
+- **A logging write path that polls a full FIFO blocks** (worst perturbation,
+  including inside the ISR; which driver does what: `techniques.md` "Log
+  capture", `espressif.md` "Console"); RTT is much cheaper but not free;
+  verbose logging multiplies both.
 - **`pkill -f PATTERN` matches its own caller**: the pattern is in your
   shell's (or ssh's) command line, so it kills the command running it.
   Bracket one character (`pkill -f '[J]LinkGDBServer'`) or kill by PID.
@@ -234,28 +250,40 @@ Each technique's recipe, read when you reach for it (files beside this one):
   (the next CI run must not inherit a debug build) and revert the
   instrumentation diff. Handing the diff over with the diagnosis preserves the
   evidence; it does not count as cleanup.
-- **A register snapshot without a validity anchor lies**: J-Link tool sessions
+- **A register snapshot without a validity anchor lies**: debug tool sessions
   can reset or briefly halt the DUT as a side effect, and a snapshot of a
-  freshly-reset chip (e.g. NVIC ISER = 0) reads like a smoking gun. Read DHCSR
-  (0xE000EDF0: bit 17 S_HALT, bit 25 S_RESET_ST) with every snapshot, and
-  cross-check against something the device demonstrably still does.
+  freshly-reset chip (e.g. NVIC ISER = 0) reads like a smoking gun. Cortex-M:
+  read DHCSR (0xE000EDF0: bit 17 S_HALT, bit 25 S_RESET_ST) with every
+  snapshot; Espressif: `espressif.md` Anchors, since the USB device number
+  survives a core reset there. Cross-check against something the device
+  demonstrably still does.
 - **"Flash OK" can lie** (silent no-op — old firmware keeps running). When
   behavior contradicts the flashed code: `objcopy -O binary fw.elf
   /tmp/fw.bin`, then `verifybin /tmp/fw.bin,<flash-base>` (J-Link, verified)
   or `verify_image` (OpenOCD); on mismatch reflash before debugging further.
-  Some targets need a particular halt state before flash reads (RP2040: a
-  flash-resident halt); `families.md` has them.
+  Espressif: `esptool verify-flash` with the image and offset from the
+  build's `flasher_args.json` (`espressif.md`), never the objcopy output, since
+  the flashed image is esptool's `elf2image` output. Some targets need a
+  particular halt state before flash reads (RP2040: a flash-resident halt);
+  `families.md` has them.
 - **A marginal link can fake a deterministic firmware bug** — down to failing
   the same test at the same iteration twice. "USB disconnect" in dmesg on a
-  freshly re-cabled port (high devnum = churn) means the plug, not the code:
-  first sustained bulk traffic is when a bad contact drops. Before declaring a
-  regression, re-run the OLD build on the SAME link state — and if a bisect
-  exonerates every hunk, believe it: re-test the exact failing binary.
+  freshly re-cabled port (high devnum = churn) points at the plug before the
+  code: first sustained bulk traffic is when a bad contact drops. Before
+  declaring a regression, re-run the OLD build on the SAME link state — and
+  if a bisect exonerates every hunk, believe it: re-test the exact failing
+  binary.
+- **`dd` creates a regular file when its output device node has vanished**
+  (an 8 KiB file at /dev/sdb after the device dropped, 2026-10-16): verify
+  the DUT identity and `test -b` before each raw write, add `conv=nocreat`
+  so a disappearance before the open fails instead, and discard every
+  result obtained from a replacement regular file. Bare ` sdX:` kernel
+  lines after raw writes are partition-rescan output, not errors.
 
 ## Project notes
 
 What is specific to the projects these skills have been used on, one file
-each, for all six skills: their symbols, typical issues and the behaviour of
+each, for these skills: their symbols, typical issues and the behaviour of
 their code, releases and CI firmware; a project's build, rig and battery
 procedure stays in its own contracts. Read it with `families.md`'s section for
 the board's chip, when it has one. Match the project by its repository identity
@@ -271,8 +299,8 @@ board, how — or only carried over). Check a symbol exists in the checkout in
 front of you before relying on it. When a session establishes something
 reusable — reproduced, or read in a source — add it with the same evidence,
 or correct the entry it contradicts, where it holds: only for this project,
-its file here; for any firmware on the chip, `families.md` (Espressif:
-`esp-target-debug`); for a probe or tool, the technique file (RTT and trace
+its file here; for any firmware on the chip, `families.md` (Espressif chips:
+`espressif.md`); for a probe or tool, the technique file (RTT and trace
 per-board caveats: `rtt/boards.md`, `etm-trace/boards.md`). Leave out the
 session's chronology and dead ends. A project with no file: work from its source, and
 start one when there is something worth keeping.

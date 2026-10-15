@@ -76,7 +76,9 @@ always pass them (`--probe` / `adapter serial`).
 ## Excluded (recorded so absence is never read as "works")
 
 - `espressif_s3_devkitm`, `espressif_p4_function_ev` — no SEGGER RTT path in
-  TinyUSB builds (console is the chip's USB-Serial-JTAG; see `esp-target-debug`).
+  the tested TinyUSB builds; their console is UART0 on the CP2102N bridge,
+  with the USB-Serial-JTAG CDC as secondary where the chip keeps it
+  (`target-debug`'s `espressif.md`, "Console").
 - `ek_tm4c123gxl` — flashed by `lm4flash`; no debug-probe path configured on
   the rig.
 - `nanoch32v203`, `ch32v103r_r1_1v0`, `ch32v307v_r1_1v0`, `ch582m_evt` — in

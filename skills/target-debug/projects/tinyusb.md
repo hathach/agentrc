@@ -1,7 +1,7 @@
 # TinyUSB (`hathach/tinyusb`) — debugging notes
 
-What is specific to this project when using `target-debug`, `rtt`, `etm-trace`,
-`esp-target-debug`, `usb-sniffer` or `usb-kernel-debug` on it: names to inspect,
+What is specific to this project when using `target-debug` (its `espressif.md`
+included), `rtt`, `etm-trace`, `usb-sniffer` or `usb-kernel-debug` on it: names to inspect,
 what a symptom usually means, which example proves what. For building a debug
 variant, taking a rig board or handling a failed `usbtest` case, follow the
 project's own `CLAUDE.md` (`Build contract:`, `HIL contract:`,
@@ -148,15 +148,17 @@ that discriminates, not verdicts. carried over; callback names and the
 
 - Resolve the board's family from `hw/bsp/*/boards/<board>` before selecting the
   debug backend; `ls -d hw/bsp/*/boards/<board>` must identify one board
-  directory. For an Espressif board, read `esp-target-debug` first; `target-debug`
+  directory. For an Espressif board, read `espressif.md` first; SKILL.md
   still supplies the methodology. carried over from TinyUSB's `target-debugger`
   agent.
-- The HIL config's `esptool` uids are the CP2102N **flasher** serials (the UART
-  bridge), never the USB-Serial-JTAG device: do not pass them to openocd, whose
-  `adapter serial` is the chip MAC with colons. carried over.
+- The HIL config's `esptool` uid is whatever port the rig flashes through:
+  the CP2102N **flasher** serial on the S3 and P4 rig boards, never the
+  USB-Serial-JTAG device there; openocd's `adapter serial` is the chip MAC
+  with colons, read from the device. carried over (S3/P4 rig boards).
 - Break in app code for symbolized frames: `tbreak tud_task_ext`; a good backtrace
-  reads `tud_task_ext` ← `usb_device_task` ← `vPortTaskWrapper`. verified
-  2026-09-16 espressif_p4_function_ev (ci.lan); symbols checked in fad6bd546.
+  reads `tud_task_ext` ← `tud_task` ← `usb_device_task` ← `vPortTaskWrapper`. verified
+  2026-09-16 espressif_p4_function_ev (ci.lan) and 2026-10-15
+  espressif_p4_function_ev v1.0 (htpc, ea1d867ce); symbols checked in fad6bd546.
 - On espressif_s3_devkitm, tinyusb's non-USB debug window
-  (`esp-target-debug`, "S3 (DevKitM) notes") is `board_test`: `usb_new_phy` is
+  (`espressif.md`, "ESP32-S3") is `board_test`: `usb_new_phy` is
   absent from its ELF when `CFG_TUD/TUH_ENABLED` are 0. carried over.

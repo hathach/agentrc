@@ -1,7 +1,9 @@
-# SWO and DWT data trace — hardware-timed, zero code change
+# SWO and DWT data trace — hardware-timed, zero code change (Cortex-M)
 
 Part of the `target-debug` skill (its technique ladder says when to reach for these).
-Needs the SWO pin (TRACESWO) wired to the probe.
+Cortex-M only: ARMv7-M and later for DWT trace and SWO, with the ARMv6-M
+limits as written below; absent on Xtensa and RISC-V (Espressif's analog is
+apptrace, `espressif.md`). Needs the SWO pin (TRACESWO) wired to the probe.
 
 ## SWO — hardware-timed trace on one pin (J-Link; verified on F407)
 
@@ -20,7 +22,8 @@ SWORead                      # hex: 0x17+4B LE = PC sample, 0x0E+2B = IRQ enter/
 ```
 
 Verified: 680 KB in 3 s (flash-range PC samples + SysTick enter/exit).
-SWORead stuck at 0 = SWO pin not wired (many boards route only SWDIO/SWCLK).
+SWORead stuck at 0: check wiring (many boards route only SWDIO/SWCLK), the
+trace configuration, the clocks and the capture setup before concluding.
 Restore DWT_CTRL when done.
 
 ## DWT data trace — stream one variable's accesses (value + PC), zero code

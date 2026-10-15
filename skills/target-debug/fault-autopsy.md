@@ -1,6 +1,8 @@
-# Vector catch and fault autopsy — catch the crash, not the wedge
+# Vector catch and fault autopsy — catch the crash, not the wedge (Cortex-M)
 
-Part of the `target-debug` skill.
+Part of the `target-debug` skill. Cortex-M registers throughout; the RISC-V
+analog is the last line, and on Espressif chips the panic handler is the
+breakpoint target (`espressif.md`).
 
 A wedge that is really a fault (HardFault loop, lockup) autopsies best AT
 the faulting instruction. Two hardware-proven gotchas: **FPB/DWT comparators

@@ -16,7 +16,8 @@ everything here is zero-wiring: no UART, no VCOM.
 
 Scope: byte transport and console. Timing/profiling → `etm-trace`;
 debugging decision flows → `target-debug`;
-Espressif consoles → `esp-target-debug` (USB-Serial-JTAG, no SEGGER RTT).
+Espressif consoles → `target-debug`'s `espressif.md` (UART0 or the
+USB-Serial-JTAG CDC; no SEGGER RTT in the measured builds).
 
 ## Quick start — console on a J-Link probe
 

@@ -93,8 +93,17 @@ and tools it names, not for the whole family.
   lpcxpresso55s69 (TinyUF2 0.35.0); which prerequisite the bench hit is not
   established.
 
+## Espressif (ESP32-S2, S3, P4, S31)
+
+- `espressif.md` beside SKILL.md: tools, the USB ports per chip, attach rules,
+  resets, console, and the per-chip measurements.
+
 ## DWC2 (Synopsys USB 2.0 OTG core)
 
+- A read of `GRXSTSP` (offset 0x20) pops the RxFIFO status entry; `GRXSTSR`
+  (0x1C) reads the same entry without popping it. Debugger memory dumps over
+  the register block must skip 0x20 or the device loses a packet status. HS
+  OTG Databook 4.20a (book 2045) §7.1.9 p387, §7.1.8 p382.
 - From core version 2.94a, `DCTL.SftDiscon` resets to 1 (disconnect) and a
   core soft reset (`GRSTCTL.CSftRst`) keeps it; before 2.94a it reset to 0. On
   such a core a hard reset of the controller presents a disconnect until
