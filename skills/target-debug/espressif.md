@@ -192,15 +192,14 @@ what the Arduino 1200-baud touch and openocd's `reset` produced, console
 `rst:0x3 (RTC_SW_SYS_RST)`) and the watchdogs' core resets are all core
 resets. What survives them: `RTC_CNTL_RTC_OPTION1_REG` (0x6000812C, bit 0
 `FORCE_DOWNLOAD_BOOT`, R/W, p628), the download-mode strap override (p536),
-pad hold. On the RISC-V chips (P4, S31) the debug module's active flag was
-measured to survive core resets (Attach); on S3 that is unverified.
-Consequences measured 2026-10-15 (Metro S3, Arduino sketch): after a 1200-baud touch the ROM
-re-entered download mode on every core reset, openocd's included, until EN
-was pressed; esptool's "hard reset" over that USJ port left the chip in
-download mode with the same USB device number, which cannot tell a core
-reset from no reset. In the 2026-10-15 P4 session the esptool reset over
-the USJ returned to the app unless another process held the port; after a
-debug session it can instead enter the Breakpoint boot loop (Attach).
+and pad hold. Consequences measured 2026-10-15 (Metro S3, Arduino sketch):
+after a 1200-baud touch the ROM re-entered download mode on every core
+reset, openocd's included, until EN was pressed; esptool's "hard reset" over
+that USJ port left the chip in download mode with the same USB device
+number, which cannot tell a core reset from no reset. In the 2026-10-15 P4
+session the esptool reset over the USJ returned to the app unless another
+process held the port; after a debug session it can instead enter the
+Breakpoint boot loop (Attach).
 
 ## Console
 

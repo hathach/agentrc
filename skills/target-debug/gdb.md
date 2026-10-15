@@ -120,11 +120,11 @@ p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparat
   those routes). It populates only after a run→stop cycle — plain attach
   shows one 0xDEAD placeholder. openocd-esp32 enables FreeRTOS by default
   (`set ESP_RTOS` before the board cfg overrides it); what it showed per
-  target is in `espressif.md`. Semihosting as
-  a log channel is never the answer (traps + halts per call — RTT instead;
-  IDF's own semihosting calls under a debugger: `espressif.md`). **Monitor-mode
-  debugging** (J-Link, M3+) keeps chosen IRQs serviced at a breakpoint —
-  needs SEGGER's JLINK_MONITOR files + `SetMonModeDebug=1`; not set up here:
+  target is in `espressif.md`. Semihosting as a log channel is never the
+  answer (traps + halts per call — RTT instead; IDF's own semihosting calls
+  under a debugger: `espressif.md`). **Monitor-mode debugging** (J-Link,
+  M3+) keeps chosen IRQs serviced at a breakpoint — needs SEGGER's
+  JLINK_MONITOR files + `SetMonModeDebug=1`; not set up here:
   <https://kb.segger.com/Monitor_Mode_Debugging> (untested).
 
 While halted the device answers **nothing**: host control transfers time out
