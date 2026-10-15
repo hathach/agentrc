@@ -387,6 +387,41 @@ class WorktreeChildren(unittest.TestCase):
         self.git('reset', '-q', '--hard', 'HEAD~1', cwd=child)
         self.assert_kept(child, 'private ref refs/worktree/saved')
 
+    def reviewr_refs(self, child, base_pick=None):
+        """herdr-reviewr's pane state: turn-base on a snapshot tree, base-pick on a blob, or on the
+        object id base_pick, written by hand since update-ref refuses a missing object."""
+        self.git('update-ref', 'refs/worktree/reviewr/turn-base', self.git('write-tree', cwd=child).strip(), cwd=child)
+        if base_pick:
+            gitdir = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip())
+            (gitdir / 'refs' / 'worktree' / 'reviewr' / 'base-pick').write_text(f'{base_pick}\n')
+            return
+        (self.t / 'pick').write_text('master')
+        blob = self.git('hash-object', '-w', str(self.t / 'pick'), cwd=child).strip()
+        self.git('update-ref', 'refs/worktree/reviewr/base-pick', blob, cwd=child)
+
+    def test_reviewr_pane_state_does_not_keep_the_child(self):
+        child = self.child()
+        self.reviewr_refs(child)
+        self.assert_removed(child)
+
+    def test_a_reviewr_ref_on_a_missing_object_does_not_keep_the_child(self):
+        child = self.child()
+        self.reviewr_refs(child, base_pick='1' * 40)
+        self.assert_removed(child)
+
+    def test_another_ref_under_reviewr_keeps_the_child(self):
+        child = self.child()
+        self.git('update-ref', 'refs/worktree/reviewr/other', self.git('write-tree', cwd=child).strip(), cwd=child)
+        self.assert_kept(child, 'private ref refs/worktree/reviewr/other')
+
+    def test_reviewr_pane_state_beside_unique_work_keeps_the_child(self):
+        child = self.child()
+        self.reviewr_refs(child)
+        oid = self.commit(child, 'saved', 'saved work')
+        self.git('update-ref', 'refs/worktree/saved', oid, cwd=child)
+        self.git('reset', '-q', '--hard', 'HEAD~1', cwd=child)
+        self.assert_kept(child, 'private ref refs/worktree/saved')
+
     def test_a_nested_repository_in_an_ignored_directory_keeps_the_child(self):
         child = self.child()
         self.git('init', '-q', str(child / 'build' / 'inner'), cwd=child)

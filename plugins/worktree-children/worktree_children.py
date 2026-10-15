@@ -22,7 +22,8 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   or untracked change, no index entry is flagged assume-unchanged or skip-worktree, and no
   merge, cherry-pick, revert, rebase or bisect is in progress;
 - its private refs (refs/worktree, refs/bisect, refs/rewritten) are reachable from the
-  repository's branches, tags or remotes, fetched the same way;
+  repository's branches, tags or remotes, fetched the same way; herdr-reviewr's view state,
+  refs/worktree/reviewr/turn-base and base-pick, is not checked;
 - no repository (bare ones included) or worktree is nested anywhere below it (ignored
   directories included) other than its submodules;
 - every repository whose storage the removal deletes (submodule git dirs inside the child or
@@ -66,6 +67,8 @@ import time
 from pathlib import Path
 
 PRIVATE_REFS = ('refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
+# herdr-reviewr's pane state (last-turn snapshot tree, base pick blob), rewritten every turn, never work
+REVIEWR_REFS = ('refs/worktree/reviewr/turn-base', 'refs/worktree/reviewr/base-pick')
 GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
                 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE')
 ENV = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION}  # so `git -C <child>` means the child
@@ -334,7 +337,10 @@ def content_check(child):
         raise Keep('locked')
     subs = submodules(child)
     sub_gitdirs = [check_repo(repo) for repo in [child, *subs]][1:]
-    held = refs(gitdir, *PRIVATE_REFS)
+    # by name first: reading the type of a reviewr ref whose object is gone would fail
+    names = [n for n in git('for-each-ref', '--format=%(refname)', *PRIVATE_REFS, gitdir=gitdir).split()
+             if n not in REVIEWR_REFS]
+    held = refs(gitdir, *names) if names else []
     if run(['git', '-C', str(child), 'symbolic-ref', '-q', 'HEAD']).returncode:
         head = head_oid(gitdir)
         held += [(head, 'commit', 'HEAD')] if head else []
