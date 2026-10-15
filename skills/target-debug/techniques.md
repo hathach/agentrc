@@ -111,15 +111,23 @@ gotchas live there):
 # RTT (J-Link probe; flash + reset first — the console owns the probe):
 python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> --interface swd --speed auto --seconds 20 > /tmp/rtt.log
 # UART (board's debug serial, if wired; name it by /dev/serial/by-id or by-path):
-stty -F /dev/serial/by-id/<port> 115200 raw && timeout 20s cat /dev/serial/by-id/<port> | tee /tmp/uart.log
+timeout 20s python3 -c '
+import os, sys, termios, tty
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
+tty.setraw(fd, termios.TCSANOW)
+a = termios.tcgetattr(fd); a[4] = a[5] = termios.B115200
+termios.tcsetattr(fd, termios.TCSANOW, a)
+while chunk := os.read(fd, 4096):
+    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
+' /dev/serial/by-id/<port> | tee /tmp/uart.log
 ```
 
 A separate `stty` can race another client's terminal setup, and the
-settings are shared: configure raw mode after opening the reader's own fd
-(pyserial, or `tty.setraw(fd, termios.TCSANOW)`; the default `TCSAFLUSH`
-waits for a concurrent writer's output to drain and discards unread input)
-and coordinate later changes between clients (a capture stopped at 4095
-bytes, a reader blocked behind the CDC writer: 2026-10-16, P4 and S31).
+settings are shared: the reader configures its own fd with `TCSANOW` (the
+default `TCSAFLUSH` waits for a concurrent writer's output to drain and
+discards unread input); coordinate later changes between clients (a capture
+stopped at 4095 bytes, a reader blocked behind the CDC writer: 2026-10-16,
+P4 and S31).
 
 A UART write path costs what its driver does: a polled driver blocks only
 while the TX FIFO is full, an interrupt-driven ring blocks only when the
