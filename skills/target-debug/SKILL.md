@@ -132,9 +132,9 @@ adds only what it may edit and when it stops.
   (`dmesg --time-format raw`) and take the clock mapping from a kernel
   event you caused at a known wall time: line counts fail once the ring
   wraps, `-T` and ISO stamps need that mapping checked, and `/proc/uptime`
-  is not it (both were ~30 s off on htpc, 2026-10-16). A host with
-  `dmesg_restrict` refuses an
-  unprivileged `dmesg -w` ("Operation not permitted"): read it with sudo.
+  is not it (`-T` and `/proc/uptime` were both ~30 s off on htpc,
+  2026-10-16). A host with `dmesg_restrict` refuses an unprivileged
+  `dmesg -w` ("Operation not permitted"): read it with sudo.
 - **Budget.** Stop starting experiments when the remaining time cannot cover
   the experiment plus cleanup; never cut a restoration short for the deadline,
   report the overrun.

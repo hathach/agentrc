@@ -331,8 +331,8 @@ with the tool version; budgets; recovery; what is unverified.
 - Firmware can take the pads back: the scan chain reads all zeroes while an
   app that drives GPIO39-42 runs and is fine in ROM. measured 2026-10-15
   Metro S3 with an Arduino sketch (its variant maps TX/RX/SCK/MOSI to
-  IO40/41/39/42); a tinyusb host build with the MAX3421 shield does the
-  same (`projects/tinyusb.md`).
+  IO40/41/39/42). A tinyusb build with `CFG_TUH_MAX3421` drives SCK/MOSI
+  on GPIO39/42 (`projects/tinyusb.md`), so expect the same; not measured.
 - Boards measured: Metro ESP32-S3 rev B (`DIS_USB_JTAG` burned 2026-10-15,
   Cortex 2x5 header X2 = pad JTAG, ESP-Prog cable pin-compatible, X2 pin 10 =
   EN; IO39/42 shared with the ICSP header and the microSD socket, IO40/41 are
@@ -415,14 +415,14 @@ with the tool version; budgets; recovery; what is unverified.
 - RISC-V dual HP core + LP core, USJ on its own FS PHY (GPIO33/34), HS OTG
   on pins 44/45: both enumerate together. `board/esp32s31-builtin.cfg`
   (Tcl targets `esp32s31.hp.cpu0` and `.cpu1`), `riscv32-esp-elf-gdb`.
-  Attach with `set ESP_RTOS none` halted both HP cores
-  and the device kept answering in a telnet-only session (halt, `mdw`,
-  `dump_image`, resume); no console capture ran, so reset-anchor coverage
-  was limited (2026-10-14). With `ESP_RTOS FreeRTOS` on tinyusb
-  cdc_msc_freertos ea1d867ce (end-of-stack watchpoint on) it behaved like
-  the P4 (Attach, above): one attach of two panicked at examination and
-  stayed halted there, the other examined both cores without reset and
-  `thbreak tud_task_ext` hit in `usbd` with 9 tasks listed at connect; USB
+  Attach with `set ESP_RTOS none` halted both HP cores and the device kept
+  answering in a telnet-only session (halt, `mdw`, `dump_image`, resume);
+  no console capture ran, so reset-anchor coverage was limited
+  (2026-10-14). With `ESP_RTOS FreeRTOS` on tinyusb cdc_msc_freertos
+  ea1d867ce (end-of-stack watchpoint on) it behaved like the P4 (Attach,
+  above): one attach of two panicked at examination and stayed halted
+  there, the other examined both cores without reset and `thbreak
+  tud_task_ext` hit in `usbd` with 9 tasks listed at connect; USB
   service degraded under the semihosting halts before the explicit 1 s
   halt, `detach` left both cores halted, and the post-`shutdown` esptool
   reset boot-looped until `init; shutdown`. On cdc_msc_throughput and on
@@ -432,11 +432,11 @@ with the tool version; budgets; recovery; what is unverified.
   latency only (no kernel message); on cdc_msc_throughput the explicit 1 s
   halt found both cores in `esp_cpu_wait_for_intr`. openocd reports `Found
   4 triggers`; all three builds inserted four hardware breakpoints with the
-  fifth refused (Attach's count rule). measured
-  2026-10-16 htpc, `espressif_s31_function_core`, openocd 20260703; run
-  records in `projects/tinyusb.md`. Flashing and console went
-  over the USJ CDC (bootloader 0x2000); the measured board's CP2102N bridge
-  (user guide book 4899 p9) had an unusable receive path (2026-10-14). After a
+  fifth refused (Attach's count rule). measured 2026-10-16 htpc,
+  `espressif_s31_function_core`, openocd 20260703; run records in
+  `projects/tinyusb.md`. Flashing and console went over the USJ CDC
+  (bootloader 0x2000); the measured board's CP2102N bridge (user guide
+  book 4899 p9) had an unusable receive path (2026-10-14). After a
   1200-baud touch (`FORCE_DOWNLOAD_BOOT`) a USJ RTS reset left the chip in
   download mode; the exit that worked was an esptool session on the ROM's
   OTG CDC (`303a:0020`) ending in a watchdog reset (2026-10-15, tinyuf2

@@ -174,7 +174,8 @@ that discriminates, not verdicts. carried over; callback names and the
   at ea1d867ce; cdc_msc_throughput does not): on RISC-V under openocd each
   context switch is then a semihosting halt, with the attach, service and
   cleanup effects in `espressif.md` Attach. To build without it, set the
-  option in the build dir's `sdkconfig` and run `idf.py build`: the
+  option in the build dir's `sdkconfig` and run
+  `idf.py -C examples/device/<example> -B <build dir> build`: the
   example's CMakeLists appends its `sdkconfig.defaults` after
   `-DSDKCONFIG_DEFAULTS`, so an override file there loses.
 - Fresh-executor runs of the documented recipe, 2026-10-16 (hw-validator
@@ -203,7 +204,8 @@ that discriminates, not verdicts. carried over; callback names and the
     the Breakpoint boot loop and `init; shutdown` ended it (`espressif.md`
     Attach). Flash verified intact at the end.
   - P4 and S31, cdc_msc_freertos rebuilt with the end-of-stack watchpoint
-    off (above; build dirs `cmake-build-<board>/device/cdc_msc_freertos-nowp`):
+    off (above; build dirs
+    `cmake-build/cmake-build-<board>/device/cdc_msc_freertos-nowp`):
     every sub-claim verified on both (`espressif.md` Attach). P4: 384/384
     echoes and 713 MSC ops through the debug window, the only gaps (1.09 s,
     1.00 s) at the halt and the hit; S31: 985/985 echoes across baseline
