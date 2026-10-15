@@ -28,10 +28,11 @@ firmware and tools it names.
 
 ## What runs, and the debugger of choice
 
-- An ESP-IDF application is a FreeRTOS app: `set ESP_RTOS FreeRTOS` before
-  the board cfg enables task enumeration (`info threads` with name, state and
-  core; what each target showed is in its variant section). The ROM and the
-  second-stage bootloader are bare: `set ESP_RTOS none`.
+- An ESP-IDF application is a FreeRTOS app, and FreeRTOS task enumeration is
+  openocd-esp32's default (`target/esp_common.cfg:26`; `set ESP_RTOS FreeRTOS`
+  before the board cfg only makes it explicit): `info threads` with name,
+  state and core; what each target showed is in its variant section. The ROM
+  and the second-stage bootloader are bare: `set ESP_RTOS none`.
 - The debugger of choice is JTAG with openocd-esp32, through the chip's
   built-in USB-Serial-JTAG (USJ) where the firmware leaves it usable, else
   through the JTAG pads with an FT2232-class probe (ESP-Prog) or the
@@ -55,7 +56,7 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 #   an FTDI without an EEPROM serial, the pair with the selector between them:
 #   -f interface/ftdi/<board>.cfg -c 'adapter usb location <bus>-<port[.port...]>' -f target/<chip>.cfg
 <arch>-gdb -ex 'target extended-remote :3333' <elf>
-(gdb) monitor halt / info threads / thbreak tud_task_ext / continue / bt
+(gdb) monitor halt / info threads / thbreak <app symbol> / continue / bt
 (gdb) delete / monitor resume / detach / quit
 # then, on telnet :4444: shutdown
 ```
@@ -131,7 +132,7 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   /dev/serial/by-id/<port> verify-flash <offset> <bin>`, offsets from the
   build's `flasher_args.json`; without such a port (Metro S3), report
   verification pending, or restore and verify the pinned image under
-  Cleanup.
+  `SKILL.md`'s Delegated sessions, Cleanup.
 - **Count breakpoints from the target's own evidence**: openocd prints
   `Found N triggers` per RISC-V core (P4: 3), and the usable count can be
   smaller: the 2026-10-16 P4 run (cdc_msc_freertos ea1d867ce, openocd
@@ -149,9 +150,9 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   In these runs the refusal read as a failed flash-breakpoint fallback, not
   as "no free triggers" (when it surfaces: `gdb.md`). Xtensa prints
   no count: it is `xtopt ibreaknum` in `target/xtensa-core-<chip>.cfg` (S2:
-  2), and the refusal of the third `hbreak` reads the same as on the P4
-  (2026-10-16, Kaluga, cdc_msc_freertos ea1d867ce). Nothing carries across
-  chips.
+  2; watchpoints are `xtopt dbreaknum` in the same file, untested), and the
+  refusal of the third `hbreak` reads the same as on the P4 (2026-10-16,
+  Kaluga, cdc_msc_freertos ea1d867ce). Nothing carries across chips.
 - **Anchors**: a reset during the session shows as a new ROM banner
   (`rst:0x..`) in the console capture started before the attach. The USB
   device number proves nothing: the USJ kept its device number through a
@@ -178,8 +179,8 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   tasks at connect (2026-10-16). Enumeration and attribution are checked
   per target.
 - ROM-frame backtraces (`0x4004xxxx` on S3, `0x4fc0xxxx` on P4, all `??`)
-  mean the core is in ROM: break in app code (`thbreak tud_task_ext`) for
-  symbolized frames.
+  mean the core is in ROM: break in app code (`thbreak <app symbol>`; TinyUSB's
+  is in `projects/tinyusb.md`) for symbolized frames.
 
 ## Resets: core vs chip
 
@@ -191,8 +192,9 @@ what the Arduino 1200-baud touch and openocd's `reset` produced, console
 `rst:0x3 (RTC_SW_SYS_RST)`) and the watchdogs' core resets are all core
 resets. What survives them: `RTC_CNTL_RTC_OPTION1_REG` (0x6000812C, bit 0
 `FORCE_DOWNLOAD_BOOT`, R/W, p628), the download-mode strap override (p536),
-pad hold, and the JTAG debug module's active state. Consequences measured
-2026-10-15 (Metro S3, Arduino sketch): after a 1200-baud touch the ROM
+pad hold. On the RISC-V chips (P4, S31) the debug module's active flag was
+measured to survive core resets (Attach); on S3 that is unverified.
+Consequences measured 2026-10-15 (Metro S3, Arduino sketch): after a 1200-baud touch the ROM
 re-entered download mode on every core reset, openocd's included, until EN
 was pressed; esptool's "hard reset" over that USJ port left the chip in
 download mode with the same USB device number, which cannot tell a core

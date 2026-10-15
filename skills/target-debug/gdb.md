@@ -118,8 +118,9 @@ p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparat
   upstream OpenOCD `-rtos FreeRTOS` on the target in its config → `info
   threads` lists every task with state/prio/frame (verified: 6 tasks, on
   those routes). It populates only after a run→stop cycle — plain attach
-  shows one 0xDEAD placeholder. openocd-esp32 takes `set ESP_RTOS FreeRTOS`
-  before the board cfg; what it showed per target is in `espressif.md`. Semihosting as
+  shows one 0xDEAD placeholder. openocd-esp32 enables FreeRTOS by default
+  (`set ESP_RTOS` before the board cfg overrides it); what it showed per
+  target is in `espressif.md`. Semihosting as
   a log channel is never the answer (traps + halts per call — RTT instead;
   IDF's own semihosting calls under a debugger: `espressif.md`). **Monitor-mode
   debugging** (J-Link, M3+) keeps chosen IRQs serviced at a breakpoint —
