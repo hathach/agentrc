@@ -558,6 +558,7 @@ def cleanup(parent, branches=(), kept_branches=()):
             continue
         if branch:
             branches.append(branch)
+    stopped = stopped or parent.exists()  # it may have returned during a check that kept its child
     for branch in branches:  # only now: a detached child checked above may hang on one of them
         if stopped:  # the parent's replacement may not have checked its branch out yet
             kept_branches.append((branch[1], f'{parent} exists again'))
