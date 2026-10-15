@@ -258,6 +258,7 @@ class Remove(unittest.TestCase):
         self.assertIn('parent: unresolved review thread https://github.com/up/r/pull/7#discussion_r1', out)
         self.assertNotIn('open PR', out)
         search['up/r'].append(dict(number=4))  # a malformed or short answer refuses, as any failed lookup
+        wr.wc.pulls.cache_clear()
         with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'me/r'), \
                 mock.patch.object(wr.wc, 'gh_lines', gh):
             self.assertRefused('PR search of up/r for head:parent')

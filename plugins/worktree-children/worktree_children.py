@@ -76,7 +76,7 @@ SKILLS = Path(__file__).resolve().parents[2] / 'skills'
 SEARCH = '''query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
     issueCount
-    nodes { ... on PullRequest { number state headRefName headRefOid mergedAt } }
+    nodes { ... on PullRequest { number state headRefName headRefOid mergedAt headRepositoryOwner { login } } }
     pageInfo { hasNextPage endCursor } } }'''
 GITHUB = re.compile(r'github\.com[:/]')
 
@@ -387,22 +387,25 @@ def github_repo(common, remote):
 
 
 @functools.lru_cache(maxsize=None)
-def pulls(repo, branch):
+def pulls(repo, branch, owner=None):
     """Every PR of repo whose head branch is exactly branch, deleted branches included, as
-    {number, head (oid), state, merged_at}: `head:` search matches by prefix and stops at 1000
-    results, so a short answer keeps, as does a malformed one."""
+    {number, head (oid), state, merged_at}; with owner, only those from owner's repository (a
+    fork's). `head:` search matches by prefix, across forks, and stops at 1000 results, so a short
+    answer keeps, as does a malformed one."""
     lines = gh_lines('api', 'graphql', '--paginate', '-f', f'query={SEARCH}',
                      '-f', f'q=repo:{repo} is:pr head:{branch}', '--jq', '.data.search')
     try:
         pages = [json.loads(line) for line in lines]
         nodes = [n for page in pages for n in page['nodes']]
         if not pages or len(nodes) != pages[0]['issueCount']:
-            raise Keep(f'PR search for head:{branch} returned {len(nodes)} of '
+            raise Keep(f'PR search of {repo} for head:{branch} returned {len(nodes)} of '
                        f'{pages[0]["issueCount"] if pages else "an unknown number"}')
         return [dict(number=int(n['number']), head=str(n['headRefOid']), state=str(n['state']),
-                     merged_at=n['mergedAt']) for n in nodes if n['headRefName'] == branch]
-    except (ValueError, KeyError, TypeError) as err:
-        raise Keep(f'PR search for head:{branch} gave a malformed answer: {err!r}')
+                     merged_at=n['mergedAt']) for n in nodes
+                if n['headRefName'] == branch
+                and (owner is None or (n['headRepositoryOwner'] or {}).get('login') == owner)]
+    except (ValueError, KeyError, TypeError, AttributeError) as err:
+        raise Keep(f'PR search of {repo} for head:{branch} gave a malformed answer: {err!r}')
 
 
 

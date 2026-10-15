@@ -58,11 +58,6 @@ THREADS = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: S
     reviewThreads(first: 100, after: $endCursor) {
       nodes { isResolved comments(first: 1) { nodes { url } } }
       pageInfo { hasNextPage endCursor } } } } }'''
-FORK_PRS = '''query($q: String!, $endCursor: String) {
-  search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
-    issueCount
-    nodes { ... on PullRequest { number state headRefName headRefOid mergedAt headRepositoryOwner { login } } }
-    pageInfo { hasNextPage endCursor } } }'''
 
 
 class Refused(Exception):
@@ -134,24 +129,6 @@ def fork_parent(repo):
         raise wc.Keep(f'gh names no parent for {repo}: {lines}')
 
 
-def parent_pulls(parent, owner, branch):
-    """wc.pulls for the PRs of parent from branch of owner's fork: the search matches head branches
-    of every fork by prefix, so the owner and exact name filter it; a short answer keeps."""
-    lines = wc.gh_lines('api', 'graphql', '--paginate', '-f', f'query={FORK_PRS}',
-                        '-f', f'q=repo:{parent} is:pr head:{branch}', '--jq', '.data.search')
-    try:
-        pages = [json.loads(line) for line in lines]
-        nodes = [n for page in pages for n in page['nodes']]
-        if not pages or len(nodes) != pages[0]['issueCount']:
-            raise wc.Keep(f'PR search of {parent} for head:{branch} returned {len(nodes)} of '
-                          f'{pages[0]["issueCount"] if pages else "an unknown number"}')
-        return [dict(number=int(n['number']), head=str(n['headRefOid']), state=str(n['state']),
-                     merged_at=n['mergedAt']) for n in nodes
-                if n['headRefName'] == branch and (n['headRepositoryOwner'] or {}).get('login') == owner]
-    except (ValueError, KeyError, TypeError, AttributeError) as err:
-        raise wc.Keep(f'PR search of {parent} for head:{branch} gave a malformed answer: {err!r}')
-
-
 def gate(common, branch, tip):
     """The pending items of branch: its PRs' state on GitHub, or commits on its remote that no
     default branch has. A branch with no remote has nothing there; its keep says why."""
@@ -171,7 +148,7 @@ def gate(common, branch, tip):
         parent = fork_parent(repo)
         if parent:  # a fork's PRs to its parent live in the parent
             prs += [dict(pr, repo=parent, ref=f'{parent}#{pr["number"]}')
-                    for pr in parent_pulls(parent, repo.split('/')[0], branch)]
+                    for pr in wc.pulls(parent, branch, owner=repo.split('/')[0])]
         items = [f'{branch}: open PR {pr["ref"]}' for pr in prs if pr['state'] == 'OPEN']
         last = max((pr for pr in prs if pr['merged_at']), key=lambda pr: pr['merged_at'], default=None)
         if last:
