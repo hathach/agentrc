@@ -243,7 +243,9 @@ class WorktreeChildren(unittest.TestCase):
         plain.mkdir()
         unrelated = self.wt / 'parentx'
         self.git('worktree', 'add', '-q', str(unrelated), '-b', 'parentx', cwd=self.main)
+        (other / '.gitignore').write_text('local change\n')
         self.assert_removed(*kids)
+        self.assertEqual((other / '.gitignore').read_text(), 'local change\n')
         self.assertTrue(plain.is_dir())
         self.assertTrue(unrelated.is_dir())
 
