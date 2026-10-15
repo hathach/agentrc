@@ -77,3 +77,20 @@ in front of you.**
   espressif_esp32s3_devkitc_1: on successful copies only, never on
   DFU_DETACH, in a 10-cycle run; they do not by themselves show a copy
   succeeded.
+- The four entries above are S3 measurements.
+- P4 (`espressif_p4_function_ev`, 8e75969 #532): 239a:00a5 as well (the
+  shared-PID TODO in `board.h`), UF2 board id `ESP32P4-FunctionEV-v1.4`,
+  volume `P4FEVBOOT`, button GPIO35. A software restart on the P4 left the
+  OTG HS device attached, so the host kept a device that no longer answered
+  and a UF2 copy's `mcopy` hung ~60 s on SCSI resets; 0ed85c1 (2026-10-14)
+  detaches OTG HS before the restart. verified 2026-10-14 htpc: 10/10 UF2
+  copies and 5/5 DFU_DETACH cycles clean after the fix.
+- S31 (`espressif_esp32s31_func_core`, ba97530 #554, 2026-10-15): 239a:00a5
+  shared too, board id `ESP32S31-FCB1-v1.0`, button GPIO61, NeoPixel GPIO60.
+  The USB serial is the 6-byte factory MAC via `esp_read_mac(ESP_MAC_EFUSE_FACTORY)`
+  (`esp_efuse_mac_get_default` returns the 8-byte EUI-64 on 802.15.4-capable
+  targets). The P4 detach-before-restart path covers the S31. The
+  second-stage bootloader drives the NeoPixel through dedicated GPIO channel
+  0 with `NEOPIXEL_T0H_NS=250` (`bootloader_start.c:322-329`).
+  source-checked at ba97530, 2026-10-16; none of it exercised on hardware
+  in this skill's sessions.

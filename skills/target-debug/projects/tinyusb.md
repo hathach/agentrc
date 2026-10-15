@@ -148,17 +148,110 @@ that discriminates, not verdicts. carried over; callback names and the
 
 - Resolve the board's family from `hw/bsp/*/boards/<board>` before selecting the
   debug backend; `ls -d hw/bsp/*/boards/<board>` must identify one board
-  directory. For an Espressif board, read `espressif.md` first; SKILL.md
-  still supplies the methodology. carried over from TinyUSB's `target-debugger`
-  agent.
+  directory. carried over from TinyUSB's `target-debugger` agent.
+- Boards: `espressif_kaluga_1` (S2), `espressif_s3_devkitc` / `espressif_s3_devkitm`
+  (S3), `espressif_p4_function_ev` (P4; `-DMA` variant), `espressif_s31_function_core`
+  (S31, BSP 4536bb27b #4228; slave and DMA variants by flags); build and
+  flash through the project's contracts. The Metro ESP32-S3 has no BSP: the
+  `espressif_s3_devkitc` build runs on it (LED and button pins differ).
+  verified 2026-10-15 htpc, ea1d867ce.
 - The HIL config's `esptool` uid is whatever port the rig flashes through:
   the CP2102N **flasher** serial on the S3 and P4 rig boards, never the
   USB-Serial-JTAG device there; openocd's `adapter serial` is the chip MAC
-  with colons, read from the device. carried over (S3/P4 rig boards).
-- Break in app code for symbolized frames: `tbreak tud_task_ext`; a good backtrace
+  with colons, read from the device. carried over (S3/P4 rig boards). On the
+  S31 the flasher port is the USB-Serial-JTAG CDC itself, so its uid is the
+  chip MAC with colons, the same string openocd takes. verified 2026-10-14
+  htpc espressif_s31_function_core.
+- Break in app code for symbolized frames: `thbreak tud_task_ext`; a good backtrace
   reads `tud_task_ext` ← `tud_task` ← `usb_device_task` ← `vPortTaskWrapper`. verified
   2026-09-16 espressif_p4_function_ev (ci.lan) and 2026-10-15
   espressif_p4_function_ev v1.0 (htpc, ea1d867ce); symbols checked in fad6bd546.
+- tinyusb's FreeRTOS examples set `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y`
+  in `sdkconfig.defaults` (cdc_msc_freertos, board_test,
+  hid_composite_freertos, audio_test_freertos, audio_4_channel_mic_freertos
+  at ea1d867ce; cdc_msc_throughput does not): on RISC-V under openocd each
+  context switch is then a semihosting halt, with the attach, service and
+  cleanup effects in `espressif.md` Attach.
+- Fresh-executor runs of the documented recipe, 2026-10-16 (hw-validator
+  from an isolated config, openocd 20260703, tinyusb ea1d867ce; the chip
+  behaviour they measured is in `espressif.md`'s Attach and variant
+  sections):
+  - P4 Function-EV v1.0, cdc_msc_freertos: no-debugger baseline 794 MSC
+    8 KiB ops at 12.8 ms and 300/300 CDC echoes in 30 s. Attached, 8 KiB
+    ops took ~10 s; one run lost CDC and MSC service around the attach and
+    recovered through a kernel port power cycle, another's CDC probe timed
+    out five seconds after the attach with no sustained traffic. Recovery
+    needed `init; shutdown` or `reset run` from openocd. No final
+    whole-flash verification ran.
+  - P4, cdc_msc_throughput: attach, 2 s halt, `thbreak tud_task_ext` (5
+    tasks at connect) and the recipe end all left the HS device enumerated;
+    the stress run (MSC reads and writes `bs=1M count=16`, ~1.9 s each,
+    plus CDC both ways) completed MSC 80/80 and kept host-to-device CDC
+    through a 1.1 s halt and one breakpoint hit with zero kernel messages;
+    device-to-host CDC had stalled before the attach, so debugger effects
+    on that direction stay unverified.
+  - S31 CoreBoard (OTG HS device on hub port 5-3.2), cdc_msc_freertos:
+    baseline 312/312 echoes, 259 MSC ops, max 23 ms. Under the 100 ms CDC
+    echo loop and the 8 KiB RAM-disk loop the first MSC ops after attach
+    took 11-12 s and CDC writes timed out before the explicit 1 s halt; the
+    device stayed unavailable after `shutdown`, the esptool reset started
+    the Breakpoint boot loop and `init; shutdown` ended it (`espressif.md`
+    Attach). Flash verified intact at the end.
+  - S31, cdc_msc_throughput: attach, halt and resume, breakpoint and
+    backtrace, budget refusal and post-shutdown service all passed; 74 MSC
+    operations (16 MiB reads ~1.7-2.0 s, writes ~1.0-1.1 s) and 530 CDC
+    writes completed, CDC RX 722.6 MB over 128 s with a single 1.017 s gap
+    at the halt, no new kernel message (run 2; run 1's RX capture was
+    invalid, `techniques.md` "Log capture").
+  - Metro ESP32-S3 rev B over pad JTAG (ESP-Prog, `espressif_s3_devkitc`
+    build of cdc_msc_freertos): examine, 1 s halt, `thbreak tud_task_ext`
+    hit in `usbd` (8 tasks) and the recipe end all kept the device
+    enumerated with no kernel error; under a CDC loop at about 6.6
+    records/s and the 8 KiB RAM-disk loop, 807 records sent and 801 echoes
+    counted with no malformed echo or I/O error, 442 reads plus 442 writes
+    without failures or read mismatches. `usbd` reaches `tud_task_ext`
+    within ~0.9 s with no host traffic.
+  - Kaluga S2 (FT2232HL by `adapter usb location`), cdc_msc_freertos:
+    attach, 1 s halt, `thbreak tud_task_ext` (tasks usbd/IDLE/blinky/cdc/io)
+    and the recipe end all kept the device enumerated with no kernel error;
+    under the 8 KiB RAM-disk loop and a CDC echo loop every ~100 ms the
+    only extended gap was the halt itself (1.105 s); 1,338 echoes and 557
+    dd operations completed cleanly; its end-of-stack watchpoint does not
+    show in openocd `wp`. cdc_msc_throughput kept the device enumerated
+    with zero kernel messages during 120 s of stress (at full speed one
+    16 MiB MSC op takes 42-45 s, CDC RX ~254 kB/s steady, the 1 s halt a
+    1.2 s gap).
+- cdc_msc_throughput: its CDC interface is
+  `usb-TinyUSB_Throughput_<serial>-if00`, and its CDC filler is NUL bytes
+  without a newline: a canonical-mode tty delivers nothing of it to `cat`,
+  read the port raw.
+- Two cdc_msc_throughput observations outside the short-halt criterion, not
+  yet diagnosed (P4 Function-EV v1.0, ea1d867ce, 2026-10-16): (1) a
+  breakpoint-budget batch error left the target halted ~36 s under MSC
+  traffic, the host reset the device meanwhile, and the resume ended in
+  "Store access fault" at `tu_unaligned_write32(mem=0x0)` from
+  `tu_hwfifo_read(hwfifo=0x50001000, dest=0x0, len=31)` ←
+  `handle_rxflvl_irq` (dcd_dwc2.c, RX_DATA with `xfer->buffer == NULL` and
+  no FIFO); the host could not enumerate it until a chip reset. (2)
+  Device-to-host CDC stopped 26 s into combined CDC RX, CDC TX and MSC load
+  before any debugger attached, MSC still serving, cleared only by a chip
+  reset; a later busy/claimed endpoint snapshot (`ep_status[2] = {0x5,
+  0x5}`, EP 0x82 armed with 0x400 bytes) was taken with no reader open and
+  is not diagnostic by itself.
+- Halting inside `tud_mount_cb` on the Kaluga S2 wedged the host's
+  SET_CONFIGURATION (`espressif.md`, "ESP32-S2"). `tud_task_ext` also runs
+  the enumeration events, so confirm the host shows the device configured
+  before arming a breakpoint there. verified 2026-10-15 espressif_kaluga_1,
+  cdc_msc_freertos ea1d867ce.
+- #4229 (S31 slave-mode bulk IN truncation): the slave-mode ISR TX FIFO
+  write and the TX FIFO flush ran unlocked against the task on the other
+  core; fixed in ec7be1ed1 (#4234, 2026-10-15) with `usbd_spin_lock` around
+  both. The autopsy used openocd telnet `halt`/`mdw`/`dump_image`/`resume`
+  over the USJ; instrumentation symbols move between builds (`riscv32-esp-elf-nm`
+  the flashed ELF before `mdw`). verified 2026-10-14 htpc.
+- `src/portable/synopsys/dwc2/dwc2_info.py` records the S31 DWC2 values
+  read live in 50d481aca (2026-10-14); chip details: `espressif.md`,
+  "ESP32-S31".
 - On espressif_s3_devkitm, tinyusb's non-USB debug window
   (`espressif.md`, "ESP32-S3") is `board_test`: `usb_new_phy` is
   absent from its ELF when `CFG_TUD/TUH_ENABLED` are 0. carried over.
