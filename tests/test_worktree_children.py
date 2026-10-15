@@ -836,9 +836,12 @@ class WorktreeChildren(unittest.TestCase):
 
     def test_nothing_runs_while_the_parent_path_exists(self):
         child = self.child()
-        done = self.run_script('cleanup', str(self.parent))
+        tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
+        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
         self.assertEqual(done.returncode, 2)
         self.assertTrue(child.is_dir())
+        self.assertTrue(self.branch_exists('parent'))
+        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists', done.stdout)
 
     def test_a_parent_recreated_during_the_checks_stops_the_sweep(self):
         kids = [self.child(), self.child('second')]

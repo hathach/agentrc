@@ -521,21 +521,14 @@ def cleanup(parent, branches=(), kept_branches=()):
     """Remove parent's clean children, then delete the given branches and each removed child's;
     a branch is (common git dir, name, tip); kept_branches pairs a branch name with why it stays."""
     parent = Path(parent)
-    if parent.exists():
-        log(f'{parent} exists: not touching its children')
-        return 2
-    kept, kept_branches, unsettled = [], list(kept_branches), []
-
-    def settle(branch):
-        try:
-            log(f'deleted branch {branch[1]} in {branch[0]}: {delete_branch(*branch)}')
-        except (Keep, OSError) as why:
-            kept_branches.append((branch[1], str(why)))
-            unsettled.append(branch)
-            log(f'kept branch {branch[1]} in {branch[0]}: {why}')
-
     for name, why in kept_branches:
         log(f'kept branch {name}: {why}')
+    if parent.exists():
+        log(f'{parent} exists: not touching its children')
+        for branch in branches:
+            log(f'kept branch {branch[1]} in {branch[0]}: {parent} exists')
+        return 2
+    kept, kept_branches, unsettled = [], list(kept_branches), []
     if branches:
         log(f'branches to settle: {retry(parent, branches)}')
     branches, stopped = list(branches), False
@@ -560,12 +553,14 @@ def cleanup(parent, branches=(), kept_branches=()):
             branches.append(branch)
     stopped = stopped or parent.exists()  # it may have returned during a check that kept its child
     for branch in branches:  # only now: a detached child checked above may hang on one of them
-        if stopped:  # the parent's replacement may not have checked its branch out yet
-            kept_branches.append((branch[1], f'{parent} exists again'))
+        try:
+            if stopped:  # the parent's replacement may not have checked its branch out yet
+                raise Keep(f'{parent} exists again')
+            log(f'deleted branch {branch[1]} in {branch[0]}: {delete_branch(*branch)}')
+        except (Keep, OSError) as why:
+            kept_branches.append((branch[1], str(why)))
             unsettled.append(branch)
-            log(f'kept branch {branch[1]} in {branch[0]}: {parent} exists again')
-        else:
-            settle(branch)
+            log(f'kept branch {branch[1]} in {branch[0]}: {why}')
     if unsettled:
         log(f'retry: {retry(parent, unsettled)}')
     if kept or kept_branches:
