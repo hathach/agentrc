@@ -325,6 +325,35 @@ class WorktreeChildren(unittest.TestCase):
         self.commit(child, 'lost', 'only here')
         self.assert_kept(child, 'detached HEAD')
 
+    def detached_on_remote_branch(self, name, remote_branch):
+        """A child detached on a commit only origin's remote_branch, and its remote-tracking ref, hold."""
+        child = self.child(name, push=False)
+        self.commit(child, f'{name}.txt', 'pushed elsewhere')
+        self.git('push', '-q', 'origin', f'HEAD:refs/heads/{remote_branch}', cwd=child)
+        self.git('checkout', '-q', '--detach', cwd=child)
+        self.git('branch', '-q', '-D', name, cwd=self.main)
+        return child
+
+    def test_a_detached_head_held_only_by_a_stale_remote_tracking_ref_keeps_the_child(self):
+        stale = self.detached_on_remote_branch('a', 'obsolete')
+        self.git('update-ref', '-d', 'refs/heads/obsolete', cwd=self.t / 'github.com' / 'main.git')
+        later = self.child('b')  # settled after every check; its fetch prunes origin/obsolete
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertTrue(stale.is_dir())
+        self.assertIn('detached HEAD', done.stdout)
+        self.assertFalse(later.exists())
+
+    def test_a_detached_head_held_only_by_a_remote_branch_goes_once_a_fetch_confirms_it(self):
+        child = self.detached_on_remote_branch('a', 'elsewhere')
+        origin = self.git('remote', 'get-url', 'origin', cwd=self.main).strip()
+        self.git('remote', 'set-url', 'origin', str(self.t / 'missing.git'), cwd=self.main)
+        self.assert_kept(child, 'ls-remote')
+        self.git('remote', 'set-url', 'origin', origin, cwd=self.main)
+        done = self.run_script('cleanup', str(self.parent))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse(child.exists())
+
     def test_an_operation_in_progress_keeps_the_child(self):
         child = self.child()
         gitdir = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip())

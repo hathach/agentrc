@@ -16,12 +16,13 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   herdr unreachable or an unexpected answer keeps it;
 - no headless chief runs in it and none of its cowork lanes holds a request (running or
   undelivered); the skills' own code decides, and code that cannot load keeps it;
-- not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes;
+- not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
+  the remotes' only after fetching each configured remote as branches are (below), first;
 - in the child and in every initialized submodule, recursively: `git status` shows no tracked
   or untracked change, no index entry is flagged assume-unchanged or skip-worktree, and no
   merge, cherry-pick, revert, rebase or bisect is in progress;
 - its private refs (refs/worktree, refs/bisect, refs/rewritten) are reachable from the
-  repository's branches, tags or remotes;
+  repository's branches, tags or remotes, fetched the same way;
 - no repository (bare ones included) or worktree is nested anywhere below it (ignored
   directories included) other than its submodules;
 - every repository whose storage the removal deletes (submodule git dirs inside the child or
@@ -337,6 +338,10 @@ def content_check(child):
     if run(['git', '-C', str(child), 'symbolic-ref', '-q', 'HEAD']).returncode:
         head = head_oid(gitdir)
         held += [(head, 'commit', 'HEAD')] if head else []
+    held = unkept(held, gitdir, against=('--branches', '--tags'))
+    if held:  # the branch settling's pruning fetch must not drop a remote-tracking ref after it vouched
+        for remote in git('remote', gitdir=common).split():
+            refresh(common, remote)
     for _, _, name in unkept(held, gitdir):
         raise Keep('detached HEAD on a commit no branch, tag or remote holds' if name == 'HEAD'
                    else f'private ref {name} holds an object no shared ref holds')
@@ -418,11 +423,16 @@ def branch_remote(common, branch):
     return remote
 
 
-@functools.lru_cache(maxsize=None)
 def refresh(common, remote):
     """The branch remote advertises as its default, after fetching its branches into its
     remote-tracking refs and nothing else: the empty --refmap drops the configured mappings,
-    which would also update the refs they name, and tags are neither fetched nor pruned."""
+    which would also update the refs they name, and tags are neither fetched nor pruned.
+    Once per repository and remote: the checks rely on the refs that fetch left."""
+    return fetched(os.path.realpath(common), remote)
+
+
+@functools.lru_cache(maxsize=None)
+def fetched(common, remote):
     m = re.search(r'^ref: refs/heads/(\S+)\tHEAD$', git('ls-remote', '--symref', remote, 'HEAD', gitdir=common), re.M)
     if not m:
         raise Keep(f'{remote} advertises no default branch')
