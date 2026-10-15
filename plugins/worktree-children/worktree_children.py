@@ -525,8 +525,7 @@ def cleanup(parent, branches=(), kept_branches=()):
         log(f'kept branch {name}: {why}')
     if branches:
         log(f'branches to settle: {retry(parent, branches)}')
-    for branch in branches:
-        settle(branch)
+    branches, stopped = list(branches), False
     for child in children(parent):
         try:
             removal = check(child)
@@ -536,7 +535,8 @@ def cleanup(parent, branches=(), kept_branches=()):
                 log(f'removing {child}; its branch is retried by: {retry(parent, [branch])}')
             if parent.exists():
                 log(f'{parent} exists again: not touching {child} or the children after it')
-                return 2
+                stopped = True
+                break
             remove(child, *removal)
             log(f'removed {child}')
         except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
@@ -544,12 +544,14 @@ def cleanup(parent, branches=(), kept_branches=()):
             log(f'kept {child}: {why}')
             continue
         if branch:
-            settle(branch)
+            branches.append(branch)
+    for branch in branches:  # only now: a detached child checked above may hang on one of them
+        settle(branch)
     if unsettled:
         log(f'retry: {retry(parent, unsettled)}')
     if kept or kept_branches:
         notify(parent, kept, kept_branches, unsettled)
-    return 1 if kept or kept_branches else 0
+    return 2 if stopped else 1 if kept or kept_branches else 0
 
 
 def event_branch(data):

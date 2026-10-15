@@ -646,6 +646,19 @@ class WorktreeChildren(unittest.TestCase):
         self.assertIn('head of PR #7', done.stdout)
         self.assertFalse(self.branch_exists('feat'))
 
+    def test_a_detached_sibling_held_only_by_the_parents_pr_head_branch_goes_before_the_branch(self):
+        tip = self.commit(self.parent, 'feature.txt', 'feature')
+        self.git('push', '-q', 'origin', f'{tip}:refs/pull/7/head', cwd=self.parent)
+        child = self.child('side')
+        self.git('checkout', '-q', '--detach', tip, cwd=child)
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip,
+                               env=self.pr_search((7, 'parent', tip)))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse(child.exists())
+        self.assertIn('head of PR #7', done.stdout)
+        self.assertFalse(self.branch_exists('parent'))
+
     def test_a_truncated_pr_search_keeps_the_branch(self):
         child, tip = self.squashed('feat')
         env = self.pr_search((7, 'feat', tip))

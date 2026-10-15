@@ -220,6 +220,7 @@ class Remove(unittest.TestCase):
         sh(moved, 'push', '-q', 'origin', 'moved')
         with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'o/r'), \
                 mock.patch.object(wr.wc, 'pulls', lambda repo, branch: prs[branch]), \
+                mock.patch.object(wr, 'fork_parent', lambda repo: None), \
                 mock.patch.object(wr, 'unresolved_threads', lambda repo, n: threads[n]):
             rc, out = self.run_remove()
         self.assertEqual(rc, 4, out)
@@ -229,6 +230,37 @@ class Remove(unittest.TestCase):
         self.assertIn('lone: commits on origin that master lacks, and no PR has them as its head', out)
         self.assertIn('moved: commits on origin that master lacks, and no PR has them', out)
         self.assertNotIn('open: commits', out)
+
+    def test_a_fork_branch_is_gated_on_its_prs_in_the_parent_repository(self):
+        sh(self.parent, 'push', '-q', 'origin', 'parent:master')  # merged upstream, then the fork synced
+        search = {'me/r': [], 'up/r': [
+            dict(number=7, state='MERGED', headRefName='parent', headRefOid='x', mergedAt='2026-01-01',
+                 headRepositoryOwner={'login': 'me'}),
+            dict(number=6, state='OPEN', headRefName='parent', headRefOid='y', mergedAt=None,
+                 headRepositoryOwner={'login': 'someone'}),
+            dict(number=5, state='OPEN', headRefName='parent-2', headRefOid='z', mergedAt=None,
+                 headRepositoryOwner={'login': 'me'})]}
+
+        def gh(*args):
+            if args[:2] == ('repo', 'view'):
+                fork = args[2] == 'me/r'
+                return [json.dumps({'isFork': fork, 'parent': {'name': 'r', 'owner': {'login': 'up'}} if fork else None})]
+            query = ' '.join(args)
+            if 'reviewThreads' in query:
+                return ['https://github.com/up/r/pull/7#discussion_r1'] if 'owner=up' in query and 'number=7' in query else []
+            nodes = search[re.search(r'q=repo:(\S+)', query).group(1)]
+            return [json.dumps({'issueCount': len(nodes), 'nodes': nodes})]
+
+        with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'me/r'), \
+                mock.patch.object(wr.wc, 'gh_lines', gh):
+            rc, out = self.run_remove()
+        self.assertEqual(rc, 4, out)
+        self.assertIn('parent: unresolved review thread https://github.com/up/r/pull/7#discussion_r1', out)
+        self.assertNotIn('open PR', out)
+        search['up/r'].append(dict(number=4))  # a malformed or short answer refuses, as any failed lookup
+        with mock.patch.object(wr.wc, 'github_repo', lambda common, remote: 'me/r'), \
+                mock.patch.object(wr.wc, 'gh_lines', gh):
+            self.assertRefused('PR search of up/r for head:parent')
 
     # --- run --------------------------------------------------------------------------
 

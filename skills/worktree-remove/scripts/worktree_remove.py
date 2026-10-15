@@ -20,11 +20,11 @@ Refused (exit 3), nothing changed:
 - a git or GitHub lookup the gate needs fails or comes back incomplete.
 
 Pending (exit 4 unless --proceed names the token the list printed), for PATH's branch and each
-sibling's, each against its own repository: an open PR; an unresolved review thread on its latest
-merged PR; commits on its remote that the remote's default branch lacks, with no PR at that tip; each
-sibling and each branch the plugin will keep, with the reason (a never-pushed commit, say);
-each --pending item. The token digests the list, so a list that changed since the human saw it
-stops again.
+sibling's, each against its own repository (a fork's PRs to its parent included): an open PR; an
+unresolved review thread on its latest merged PR; commits on its remote that the remote's default
+branch lacks, with no PR at that tip; each sibling and each branch the plugin will keep, with the
+reason (a never-pushed commit, say); each --pending item. The token digests the list, so a list
+that changed since the human saw it stops again.
 
 Then PATH's content check runs again, the report goes to
 ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the inventory,
@@ -58,6 +58,11 @@ THREADS = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: S
     reviewThreads(first: 100, after: $endCursor) {
       nodes { isResolved comments(first: 1) { nodes { url } } }
       pageInfo { hasNextPage endCursor } } } } }'''
+FORK_PRS = '''query($q: String!, $endCursor: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
+    issueCount
+    nodes { ... on PullRequest { number state headRefName headRefOid mergedAt headRepositoryOwner { login } } }
+    pageInfo { hasNextPage endCursor } } }'''
 
 
 class Refused(Exception):
@@ -119,6 +124,34 @@ def unresolved_threads(repo, number):
                        ' | .comments.nodes[0].url')
 
 
+def fork_parent(repo):
+    """owner/name of the repository repo is a fork of, None for no fork; Keep when gh cannot tell."""
+    lines = wc.gh_lines('repo', 'view', repo, '--json', 'isFork,parent')
+    try:
+        view = json.loads(''.join(lines))
+        return f'{view["parent"]["owner"]["login"]}/{view["parent"]["name"]}' if view['isFork'] else None
+    except (ValueError, KeyError, TypeError):
+        raise wc.Keep(f'gh names no parent for {repo}: {lines}')
+
+
+def parent_pulls(parent, owner, branch):
+    """wc.pulls for the PRs of parent from branch of owner's fork: the search matches head branches
+    of every fork by prefix, so the owner and exact name filter it; a short answer keeps."""
+    lines = wc.gh_lines('api', 'graphql', '--paginate', '-f', f'query={FORK_PRS}',
+                        '-f', f'q=repo:{parent} is:pr head:{branch}', '--jq', '.data.search')
+    try:
+        pages = [json.loads(line) for line in lines]
+        nodes = [n for page in pages for n in page['nodes']]
+        if not pages or len(nodes) != pages[0]['issueCount']:
+            raise wc.Keep(f'PR search of {parent} for head:{branch} returned {len(nodes)} of '
+                          f'{pages[0]["issueCount"] if pages else "an unknown number"}')
+        return [dict(number=int(n['number']), head=str(n['headRefOid']), state=str(n['state']),
+                     merged_at=n['mergedAt']) for n in nodes
+                if n['headRefName'] == branch and (n['headRepositoryOwner'] or {}).get('login') == owner]
+    except (ValueError, KeyError, TypeError, AttributeError) as err:
+        raise wc.Keep(f'PR search of {parent} for head:{branch} gave a malformed answer: {err!r}')
+
+
 def gate(common, branch, tip):
     """The pending items of branch: its PRs' state on GitHub, or commits on its remote that no
     default branch has. A branch with no remote has nothing there; its keep says why."""
@@ -134,11 +167,16 @@ def gate(common, branch, tip):
         repo = wc.github_repo(common, remote)
         if not repo:
             return [f'{branch}: commits on {remote} that {default} lacks'] if pushed and not merged else []
-        prs = wc.pulls(repo, branch)
-        items = [f'{branch}: open PR #{pr["number"]}' for pr in prs if pr['state'] == 'OPEN']
+        prs = [dict(pr, repo=repo, ref=f'#{pr["number"]}') for pr in wc.pulls(repo, branch)]
+        parent = fork_parent(repo)
+        if parent:  # a fork's PRs to its parent live in the parent
+            prs += [dict(pr, repo=parent, ref=f'{parent}#{pr["number"]}')
+                    for pr in parent_pulls(parent, repo.split('/')[0], branch)]
+        items = [f'{branch}: open PR {pr["ref"]}' for pr in prs if pr['state'] == 'OPEN']
         last = max((pr for pr in prs if pr['merged_at']), key=lambda pr: pr['merged_at'], default=None)
         if last:
-            items += [f'{branch}: unresolved review thread {url}' for url in unresolved_threads(repo, last['number'])]
+            items += [f'{branch}: unresolved review thread {url}'
+                      for url in unresolved_threads(last['repo'], last['number'])]
     except wc.Keep as why:
         raise Refused(str(why))
     if pushed and not merged and not any(pr['head'] == tip for pr in prs):
