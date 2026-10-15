@@ -153,7 +153,9 @@ that discriminates, not verdicts. carried over; callback names and the
   (S3), `espressif_p4_function_ev` (P4; `-DMA` variant), `espressif_s31_function_core`
   (S31, BSP 4536bb27b #4228; slave and DMA variants by flags); build and
   flash through the project's contracts. The Metro ESP32-S3 has no BSP: the
-  `espressif_s3_devkitc` build runs on it (LED and button pins differ).
+  `espressif_s3_devkitc` build runs on it (LED and button pins differ). That
+  BSP puts the MAX3421 host shield's SCK and MOSI on GPIO39/42, the JTAG
+  pads (host builds with `CFG_TUH_MAX3421` only, `family.c`).
   verified 2026-10-15 htpc, ea1d867ce.
 - The HIL config's `esptool` uid is whatever port the rig flashes through:
   the CP2102N **flasher** serial on the S3 and P4 rig boards, never the
@@ -171,7 +173,10 @@ that discriminates, not verdicts. carried over; callback names and the
   hid_composite_freertos, audio_test_freertos, audio_4_channel_mic_freertos
   at ea1d867ce; cdc_msc_throughput does not): on RISC-V under openocd each
   context switch is then a semihosting halt, with the attach, service and
-  cleanup effects in `espressif.md` Attach.
+  cleanup effects in `espressif.md` Attach. To build without it, set the
+  option in the build dir's `sdkconfig` and run `idf.py build`: the
+  example's CMakeLists appends its `sdkconfig.defaults` after
+  `-DSDKCONFIG_DEFAULTS`, so an override file there loses.
 - Fresh-executor runs of the documented recipe, 2026-10-16 (hw-validator
   from an isolated config, openocd 20260703, tinyusb ea1d867ce; the chip
   behaviour they measured is in `espressif.md`'s Attach and variant
@@ -197,6 +202,13 @@ that discriminates, not verdicts. carried over; callback names and the
     device stayed unavailable after `shutdown`, the esptool reset started
     the Breakpoint boot loop and `init; shutdown` ended it (`espressif.md`
     Attach). Flash verified intact at the end.
+  - P4 and S31, cdc_msc_freertos rebuilt with the end-of-stack watchpoint
+    off (above; build dirs `cmake-build-<board>/device/cdc_msc_freertos-nowp`):
+    every sub-claim verified on both (`espressif.md` Attach). P4: 384/384
+    echoes and 713 MSC ops through the debug window, the only gaps (1.09 s,
+    1.00 s) at the halt and the hit; S31: 985/985 echoes across baseline
+    and debug window, no kernel line; both kept MSC and CDC after
+    `shutdown`.
   - S31, cdc_msc_throughput: attach, halt and resume, breakpoint and
     backtrace, budget refusal and post-shutdown service all passed; 74 MSC
     operations (16 MiB reads ~1.7-2.0 s, writes ~1.0-1.1 s) and 530 CDC

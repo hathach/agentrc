@@ -88,11 +88,12 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   calls it on every context switch when `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y`
   (`components/freertos/FreeRTOS-Kernel/portable/riscv/port.c:703`; on in
   the measured tinyusb cdc_msc_freertos and tinyuf2 P4 builds, off in
-  tinyusb cdc_msc_throughput: check the build's sdkconfig). The debug
-  module's active flag survives core resets, so after a killed openocd the
-  next `ebreak` has no handler: "Guru Meditation Error: Core 0 panic'ed
-  (Breakpoint)" and a reboot loop until an openocd `init; shutdown` session
-  releases it or the chip is reset by EN or power. With openocd attached the
+  tinyusb cdc_msc_throughput: check the build's sdkconfig). After a killed
+  openocd the next `ebreak` has no handler: "Guru Meditation Error: Core 0
+  panic'ed (Breakpoint)" and a reboot loop until an openocd `init; shutdown`
+  session releases it or the chip is reset by EN or power, consistent with
+  the debug module's active flag surviving core resets (inferred from the
+  boot loops, not read from the hardware). With openocd attached the
   same call is one `debug_reason=00000001` halt per context switch in its
   log (2630 in a six minute P4 session, 1247 on the S31): those lines at
   task rate do not by themselves establish a fault, but the firmware's USB
@@ -102,9 +103,17 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   (Breakpoint)", `rst:0xc`), the S31 parked in the panic handler with no
   new banner (backtrace `vTaskSwitchContext` → `vPortSetStackWatchpoint` →
   `esp_cpu_set_watchpoint(wp_num=3)` → `esp_panic_handler`). A PMP Store
-  access fault was also seen on the P4 and its contribution is unresolved;
-  whether the halts alone cause the service loss is open until a matched
-  build with the stack watchpoint disabled is measured.
+  access fault was also seen on the P4 and its contribution is unresolved.
+  The same example rebuilt with `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=n`
+  (same boards, tools and recipe, 2026-10-16) verified every sub-claim on
+  both chips: no reset at the one examination per board, one
+  `debug_reason=00000001` line in the whole log (the breakpoint hit), USB
+  service kept through the attach, a 1 s halt and the hit under MSC and CDC
+  traffic with no kernel message, and a clean `shutdown` with the device
+  still answering (budget: the count rule below). With the option off
+  neither run reproduced the service loss or the attach panic, whose
+  backtrace runs through `vPortSetStackWatchpoint`; one clean attach per
+  board does not bound the panic rate by itself.
   measured 2026-10-15/16 espressif_p4_function_ev v1.0 and
   espressif_s31_function_core, tinyusb cdc_msc_freertos ea1d867ce, openocd
   20260703; run records in `projects/tinyusb.md`.
@@ -140,13 +149,14 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   (gdb "Cannot insert hardware breakpoint ...: Remote failure reply: 0E",
   openocd "No flash at address ... Failed to get flash bank (-4)", nothing
   written since flash support was off); the same chip took three with
-  cdc_msc_throughput, whose sdkconfig has no end-of-stack watchpoint, so
-  that watchpoint holding one trigger is suspected (openocd also logged
-  "could not remove watchpoint #0"), not read from the hardware; the S31
-  inserted four hardware breakpoints with the same watchpoint configuration
-  enabled (2026-10-16; `wp` listed a watchpoint only after their deletion
-  and resume, concurrent allocation unchecked), so the P4 shortfall stays
-  unexplained.
+  cdc_msc_throughput, whose sdkconfig has no end-of-stack watchpoint, and
+  three with cdc_msc_freertos rebuilt with that option off (2026-10-16): on
+  the P4 the stack watchpoint held one trigger (inferred from the matched
+  builds, not read from the hardware; openocd also logged "could not remove
+  watchpoint #0"). The S31 inserted four with the watchpoint on and off
+  (with it on, `wp` listed the watchpoint only after their deletion and
+  resume; concurrent allocation unchecked), so why it shows no shortfall is
+  open.
   In these runs the refusal read as a failed flash-breakpoint fallback, not
   as "no free triggers" (when it surfaces: `gdb.md`). Xtensa prints
   no count: it is `xtopt ibreaknum` in `target/xtensa-core-<chip>.cfg` (S2:
@@ -177,7 +187,11 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   after continuing into app code and halting, and thread attribution at a
   breakpoint was wrong on some hits; on 20260703 the P4 and S31 runs listed
   tasks at connect (2026-10-16). Enumeration and attribution are checked
-  per target.
+  per target. Two openocds on one host clash on the default ports
+  3333/4444/6666: the second dies binding its Tcl port, and a client pointed
+  at the defaults drives the other board; give each session `gdb port`,
+  `telnet port` and `tcl port` before `-f` and check `ss -ltnp` first (P4
+  and S31 in parallel, 2026-10-16).
 - ROM-frame backtraces (`0x4004xxxx` on S3, `0x4fc0xxxx` on P4, all `??`)
   mean the core is in ROM: break in app code (`thbreak <app symbol>`; TinyUSB's
   is in `projects/tinyusb.md`) for symbolized frames.
@@ -317,7 +331,8 @@ with the tool version; budgets; recovery; what is unverified.
 - Firmware can take the pads back: the scan chain reads all zeroes while an
   app that drives GPIO39-42 runs and is fine in ROM. measured 2026-10-15
   Metro S3 with an Arduino sketch (its variant maps TX/RX/SCK/MOSI to
-  IO40/41/39/42).
+  IO40/41/39/42); a tinyusb host build with the MAX3421 shield does the
+  same (`projects/tinyusb.md`).
 - Boards measured: Metro ESP32-S3 rev B (`DIS_USB_JTAG` burned 2026-10-15,
   Cortex 2x5 header X2 = pad JTAG, ESP-Prog cable pin-compatible, X2 pin 10 =
   EN; IO39/42 shared with the ICSP header and the microSD socket, IO40/41 are
@@ -363,13 +378,15 @@ with the tool version; budgets; recovery; what is unverified.
   watchpoint: no semihosting halts, three hardware breakpoints, a ~1 s halt
   plus one breakpoint hit under MSC and host-to-device CDC traffic with no
   kernel message; device-to-host CDC had stalled before the attach,
-  `projects/tinyusb.md`). gdb connect resets through the memory-protection
+  `projects/tinyusb.md`) and with cdc_msc_freertos rebuilt with the
+  watchpoint off (Attach). gdb connect resets through the memory-protection
   path unless `ESP_FLASH_SIZE 0` precedes the board file (Attach, above);
   that reset knocked the HS OTG device off the bus (descriptor reads -110,
   then silence) until a reset over the USJ brought it back. With the
   ordering right: `thbreak tud_task_ext` hit in the `usbd` task, backtrace
   `tud_task_ext` ← `tud_task` ← `usb_device_task` ← `vPortTaskWrapper`, eight
-  tasks listed, CDC echo after `shutdown` (not reproduced on 2026-10-16).
+  tasks listed, CDC echo after `shutdown` (not reproduced on 2026-10-16
+  with the stock build, reproduced with the watchpoint off).
   measured 2026-10-15/16 htpc, Function-EV v1.4 chip v1.0
   (`espressif_p4_function_ev`), tinyusb ea1d867ce, openocd 20260703. On 20251215 (ci.lan, chip
   v0.1, 2026-09-16) the same connect reset, and a second breakpoint armed
@@ -396,8 +413,9 @@ with the tool version; budgets; recovery; what is unverified.
 ### ESP32-S31
 
 - RISC-V dual HP core + LP core, USJ on its own FS PHY (GPIO33/34), HS OTG
-  on pins 44/45: both enumerate together. `board/esp32s31-builtin.cfg`,
-  `riscv32-esp-elf-gdb`. Attach with `set ESP_RTOS none` halted both HP cores
+  on pins 44/45: both enumerate together. `board/esp32s31-builtin.cfg`
+  (Tcl targets `esp32s31.hp.cpu0` and `.cpu1`), `riscv32-esp-elf-gdb`.
+  Attach with `set ESP_RTOS none` halted both HP cores
   and the device kept answering in a telnet-only session (halt, `mdw`,
   `dump_image`, resume); no console capture ran, so reset-anchor coverage
   was limited (2026-10-14). With `ESP_RTOS FreeRTOS` on tinyusb
@@ -407,15 +425,14 @@ with the tool version; budgets; recovery; what is unverified.
   `thbreak tud_task_ext` hit in `usbd` with 9 tasks listed at connect; USB
   service degraded under the semihosting halts before the explicit 1 s
   halt, `detach` left both cores halted, and the post-`shutdown` esptool
-  reset boot-looped until `init; shutdown`. On cdc_msc_throughput
-  (watchpoint off) server initialization
-  left both cores running without reset, the explicit 1 s halt found both
-  in `esp_cpu_wait_for_intr`, gdb connect caused no reset either, 6 tasks
-  were listed at connect, and under HS MSC and CDC traffic the halt and one
-  hit cost latency only (no kernel message). openocd reports `Found 4
-  triggers`; both builds inserted four hardware breakpoints with the fifth
-  refused (with the stack watchpoint on, `wp` listed one only after their
-  deletion and resume; concurrent allocation unchecked). measured
+  reset boot-looped until `init; shutdown`. On cdc_msc_throughput and on
+  cdc_msc_freertos rebuilt with the watchpoint off, server initialization
+  left both cores running without reset, gdb connect caused no reset
+  either, and under HS MSC and CDC traffic the halt and one hit cost
+  latency only (no kernel message); on cdc_msc_throughput the explicit 1 s
+  halt found both cores in `esp_cpu_wait_for_intr`. openocd reports `Found
+  4 triggers`; all three builds inserted four hardware breakpoints with the
+  fifth refused (Attach's count rule). measured
   2026-10-16 htpc, `espressif_s31_function_core`, openocd 20260703; run
   records in `projects/tinyusb.md`. Flashing and console went
   over the USJ CDC (bootloader 0x2000); the measured board's CP2102N bridge

@@ -129,10 +129,11 @@ adds only what it may edit and when it stops.
 - **Host.** Leave the host as found: never clear kernel logs (`dmesg -C`) or
   other shared history, and restore every setting you change (dynamic debug,
   module parameters). Anchor kernel-log reads on raw kernel timestamps
-  (`dmesg --time-format raw`) and take a contemporaneous clock mapping
-  when correlating with wall time: line counts fail once the ring wraps,
-  and both `-T` and ISO stamps need that mapping checked (`-T` was ~30 s
-  off on htpc, 2026-10-16). A host with `dmesg_restrict` refuses an
+  (`dmesg --time-format raw`) and take the clock mapping from a kernel
+  event you caused at a known wall time: line counts fail once the ring
+  wraps, `-T` and ISO stamps need that mapping checked, and `/proc/uptime`
+  is not it (both were ~30 s off on htpc, 2026-10-16). A host with
+  `dmesg_restrict` refuses an
   unprivileged `dmesg -w` ("Operation not permitted"): read it with sudo.
 - **Budget.** Stop starting experiments when the remaining time cannot cover
   the experiment plus cleanup; never cut a restoration short for the deadline,
