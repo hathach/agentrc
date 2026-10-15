@@ -842,6 +842,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertTrue(child.is_dir())
         self.assertTrue(self.branch_exists('parent'))
         self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists', done.stdout)
+        self.assertIn(f'retry: {SCRIPT} cleanup {self.parent} --branch {self.main / ".git"} parent {tip}', done.stdout)
 
     def test_a_parent_recreated_during_the_checks_stops_the_sweep(self):
         kids = [self.child(), self.child('second')]

@@ -527,6 +527,8 @@ def cleanup(parent, branches=(), kept_branches=()):
         log(f'{parent} exists: not touching its children')
         for branch in branches:
             log(f'kept branch {branch[1]} in {branch[0]}: {parent} exists')
+        if branches:
+            log(f'retry: {retry(parent, branches)}')
         return 2
     kept, kept_branches, unsettled = [], list(kept_branches), []
     if branches:
