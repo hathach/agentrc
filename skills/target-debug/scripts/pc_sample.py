@@ -7,10 +7,10 @@ function (the target-debug skill's PC-sampling technique).
   pc_sample.py --hil-config <file> --board <name> [--interface swd --speed 4000] \
                --elf <flashed.elf> [--samples N] [--halt-samples N --halt-timeout-ms M]
 
-A J-Link is driven here through J-Link Commander (PC_SAMPLE_JLINK_EXE names it when it is
-not `JLinkExe`, `JLink.exe` on Windows, on PATH). A HIL board flashed over openocd is
-sampled through probe_state.py's OpenOCD session (the file next to this one; its
-PROBE_STATE_OPENOCD names openocd), which also reports the other cores' DHCSR.
+Both routes sample through probe_state.py's sessions (the file next to this one): J-Link
+Commander, which checks the probe serial, and OpenOCD for a HIL board flashed over openocd,
+which also reports the other cores' DHCSR. PROBE_STATE_JLINK_EXE and PROBE_STATE_OPENOCD
+name the tools when they are not on PATH.
 
 --halt-samples N is probe_state.py's halting fallback (its --allow-halt, whose docstring
 gives the rules: OpenOCD only, single core, recovery) run N times: when the samples gave no
@@ -18,12 +18,12 @@ usable PC from a core both DHCSR reads found running, a second session halts it 
 (each halt waits up to --halt-timeout-ms), reads PC and resumes, stopping at the first halt
 or resume that fails. Those PCs are counted apart from the observed ones.
 
-Reads DEMCR first and refuses the histogram while DEMCR.TRCENA (DWTENA on
-ARMv6-M) is 0 (techniques.md, PC-sampling). Reads DHCSR before and after
-the samples so a 0xFFFFFFFF sample (core halted or in WFI) can be read against
-the core's state. A capture is complete only when every requested sample, the
-DEMCR read and both DHCSR reads came back: JLinkExe exits 0 after a failed
-command, so the output is the evidence, not the exit code.
+Reads CPUID, DHCSR, DEMCR, the samples, then DHCSR again; refuses a core that does not
+identify as M-profile, and the histogram while DEMCR.TRCENA (DWTENA on ARMv6-M) is 0
+(techniques.md, PC-sampling). The DHCSR reads let a 0xFFFFFFFF sample (core halted or in
+WFI) be read against the core's state. A capture is complete only when every read came back
+in order: JLinkExe exits 0 after a failed command, so the output is the evidence, not the
+exit code.
 """
 import argparse
 import collections
@@ -41,61 +41,11 @@ DHCSR = 0xE000EDF0
 DEMCR = 0xE000EDFC
 DEMCR_TRCENA = 1 << 24  # DWTENA on ARMv6-M; DWT reads are invalid while it is 0
 SENTINEL = 0xFFFFFFFF
-# "E000101C = 20000ABC" — JLinkExe may prefix the line with its "J-Link>" prompt
-_MEM32_RE = re.compile(r'([0-9A-Fa-f]{8}) = ([0-9A-Fa-f]{8})')
 SPEED_RE = re.compile(r'[1-9][0-9]*|auto|adaptive')
 
 
 class ToolError(RuntimeError):
     pass
-
-
-def jlink_script(samples, interval_ms):
-    lines = [f'mem32 {DEMCR:X}, 1', f'mem32 {DHCSR:X}, 1']
-    for _ in range(samples):
-        lines.append(f'mem32 {DWT_PCSR:X}, 1')
-        if interval_ms:
-            lines.append(f'Sleep {interval_ms}')
-    lines += [f'mem32 {DHCSR:X}, 1', 'qc']
-    return '\n'.join(lines) + '\n'
-
-
-def parse_reads(text):
-    """(pcs, dhcsr, demcr) from JLinkExe output: every DWT_PCSR, DHCSR and DEMCR
-    value, each in order."""
-    reads = {DWT_PCSR: [], DHCSR: [], DEMCR: []}
-    for m in _MEM32_RE.finditer(text):
-        addr = int(m.group(1), 16)
-        if addr in reads:
-            reads[addr].append(int(m.group(2), 16))
-    return reads[DWT_PCSR], reads[DHCSR], reads[DEMCR]
-
-
-def sample(probe, device, interface, speed, samples, interval_ms, timeout):
-    name = os.environ.get('PC_SAMPLE_JLINK_EXE') or ('JLink.exe' if os.name == 'nt' else 'JLinkExe')
-    exe = shutil.which(name)
-    if not exe:
-        raise ToolError(f'{name} not found - install J-Link Commander or set PC_SAMPLE_JLINK_EXE')
-    cmd = [exe, '-device', device, '-SelectEmuBySN', probe, '-if', interface, '-speed', speed,
-           '-autoconnect', '1', '-nogui', '1']
-    try:
-        r = subprocess.run(cmd, input=jlink_script(samples, interval_ms), capture_output=True,
-                           text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        raise ToolError(f'{name} did not finish within {timeout:.0f} s') from e
-    if r.returncode != 0:
-        # reads printed before the failure can look like a complete capture
-        tail = '\n'.join((r.stdout + r.stderr).strip().splitlines()[-6:])
-        raise ToolError(f'{name} exited {r.returncode}; last output:\n{tail}')
-    pcs, dhcsr, demcr = parse_reads(r.stdout)
-    if len(pcs) != samples or len(dhcsr) != 2 or len(demcr) != 1:
-        tail = '\n'.join((r.stdout + r.stderr).strip().splitlines()[-6:])
-        raise ToolError(f'incomplete capture: {len(pcs)}/{samples} samples, {len(dhcsr)}/2 DHCSR reads, '
-                        f'{len(demcr)}/1 DEMCR reads (exit {r.returncode}); last output:\n{tail}')
-    if not demcr[0] & DEMCR_TRCENA:
-        raise ToolError(f'DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{demcr[0]:08x}): DWT_PCSR samples are '
-                        f'not valid while trace is disabled; enable trace from a debugger session first')
-    return pcs, dhcsr
 
 
 def probe_state_module():
@@ -105,11 +55,11 @@ def probe_state_module():
     try:
         import probe_state
     except ImportError as e:
-        raise ToolError(f'an openocd board needs probe_state.py next to this script: {e}')
+        raise ToolError(f'pc_sample.py needs probe_state.py next to it: {e}')
     return probe_state
 
 
-def sample_openocd(backend, samples, interval_ms, timeout):
+def sample(backend, samples, interval_ms, timeout):
     """(pcs, [dhcsr before, after], {other core: (before, after)}) through probe_state's session."""
     ps = probe_state_module()
     cap = ps.Capture(samples, interval_ms, False, [])
@@ -118,7 +68,7 @@ def sample_openocd(backend, samples, interval_ms, timeout):
     if not vals['demcr'] & DEMCR_TRCENA:
         raise ToolError(f"DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{vals['demcr']:08x}): DWT_PCSR samples "
                         f'are not valid while trace is disabled; enable trace from a debugger session first')
-    return vals['pcs'], [vals['dhcsr0'], vals['dhcsr1']], backend.others
+    return vals['pcs'], [vals['dhcsr0'], vals['dhcsr1']], getattr(backend, 'others', {})
 
 
 def symbolize(addr2line, elf, pcs, timeout):
@@ -286,6 +236,12 @@ def main(argv=None):
             p.error('a J-Link needs --interface and --speed')
         if not SPEED_RE.fullmatch(a.speed):
             p.error(f'--speed must be kHz, "auto" or "adaptive", got {a.speed!r}')
+        if os.environ.get('PC_SAMPLE_JLINK_EXE'):
+            p.error('PC_SAMPLE_JLINK_EXE is no longer read: name J-Link Commander with PROBE_STATE_JLINK_EXE')
+        try:
+            backend = probe_state_module().JLink(a.probe, a.device, a.interface, a.speed)
+        except ToolError as e:
+            p.error(str(e))
     if a.samples <= 0 or a.interval_ms < 0 or a.top <= 0:
         p.error('--samples and --top must be positive, --interval-ms non-negative')
     if a.raw and os.path.lexists(a.raw):
@@ -297,12 +253,9 @@ def main(argv=None):
     timeout = a.timeout if a.timeout is not None else a.samples * (a.interval_ms + 50) / 1000 + 20
     halt_timeout = a.timeout if a.timeout is not None else \
         a.halt_samples * (a.halt_timeout_ms + a.interval_ms + 100) / 1000 + 20
-    others, halted_pcs, halted_dhcsr, fallback_error = {}, [], [], None
+    halted_pcs, halted_dhcsr, fallback_error = [], [], None
     try:
-        if backend is None:
-            pcs, dhcsr = sample(a.probe, a.device, a.interface, a.speed, a.samples, a.interval_ms, timeout)
-        else:
-            pcs, dhcsr, others = sample_openocd(backend, a.samples, a.interval_ms, timeout)
+        pcs, dhcsr, others = sample(backend, a.samples, a.interval_ms, timeout)
         if a.raw:
             with open(a.raw, 'w') as f:
                 f.writelines(f'{pc:08x}\n' for pc in pcs)

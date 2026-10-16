@@ -29,46 +29,6 @@ _spec = importlib.util.spec_from_file_location('pc_sample', SCRIPT)
 pc_sample = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pc_sample)
 
-# Answers each mem32 with "J-Link><addr> = <value>" (the real Commander echoes its
-# prompt on the same line). FAKE_PCSR: comma-separated PCSR values in order, the
-# last one repeated; FAKE_DHCSR: the two DHCSR values; FAKE_DEMCR: the DEMCR
-# answer lines, comma-separated (default one, TRCENA set); FAKE_MODE=truncate stops
-# after half the reads, FAKE_MODE=hang never exits.
-FAKE_JLINK = '''#!/usr/bin/env python3
-import os, sys, time
-pcsr = os.environ.get('FAKE_PCSR', '20000100').split(',')
-dhcsr = os.environ.get('FAKE_DHCSR', '00010001,00010001').split(',')
-mode = os.environ.get('FAKE_MODE', '')
-if mode == 'hang':
-    time.sleep(60)
-print('SEGGER J-Link Commander V9.66 (Compiled fake)')
-n_pc = n_dh = 0
-lines = sys.stdin.read().splitlines()
-total = sum(1 for l in lines if l.startswith('mem32'))
-done = 0
-for line in lines:
-    if line.startswith('mem32 E000101C'):
-        v = pcsr[min(n_pc, len(pcsr) - 1)]; n_pc += 1
-        print(f'J-Link>E000101C = {v}')
-    elif line.startswith('mem32 E000EDF0'):
-        v = dhcsr[min(n_dh, len(dhcsr) - 1)]; n_dh += 1
-        print(f'J-Link>E000EDF0 = {v}')
-    elif line.startswith('mem32 E000EDFC'):
-        for v in os.environ.get('FAKE_DEMCR', '01000000').split(','):
-            print(f'J-Link>E000EDFC = {v}')
-    elif line.startswith('Sleep'):
-        print('J-Link>Sleep(' + line.split()[1] + ')')
-    elif line == 'qc':
-        break
-    done += 1
-    if mode == 'truncate' and done > total // 2:
-        print('Could not read memory.')
-        sys.exit(0)
-if mode == 'dies_after_reads':
-    print('USB communication error: probe disconnected')
-    sys.exit(1)
-'''
-
 # addr2line -f: two lines per address, function then file:line. FAKE_SYMS maps
 # "pc=func@loc"; unknown PCs answer ??. FAKE_SYM_MODE=short drops the last line,
 # =fail exits 1, =hang sleeps.
@@ -94,33 +54,21 @@ print('\\n'.join(out))
 LINK = ('--interface', 'swd', '--speed', '4000')
 
 
-class ParseTest(unittest.TestCase):
-    def test_prompt_prefixed_and_bare_lines_both_parse(self):
-        text = ('J-Link>E000EDFC = 01000000\nJ-Link>E000EDF0 = 00010001\nE000101C = 08001234\n'
-                'J-Link>E000101C = FFFFFFFF\nJ-Link>Sleep(5)\nJ-Link>E000EDF0 = 02030003\n')
-        self.assertEqual(pc_sample.parse_reads(text),
-                         ([0x08001234, 0xFFFFFFFF], [0x00010001, 0x02030003], [0x01000000]))
-
-    def test_script_reads_demcr_then_dhcsr_around_the_samples(self):
-        s = pc_sample.jlink_script(2, 5).splitlines()
-        self.assertEqual(s, ['mem32 E000EDFC, 1', 'mem32 E000EDF0, 1', 'mem32 E000101C, 1', 'Sleep 5',
-                             'mem32 E000101C, 1', 'Sleep 5', 'mem32 E000EDF0, 1', 'qc'])
-        self.assertNotIn('Sleep 0', pc_sample.jlink_script(1, 0))
-
-
 @unittest.skipIf(os.name == 'nt', 'J-Link and addr2line stubs require POSIX executable semantics')
 class CliTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         d = Path(self._dir.name)
-        for name, body in (('JLinkExe', FAKE_JLINK), ('fake-addr2line', FAKE_ADDR2LINE)):
+        for name, body in (('JLinkExe', FAKE_JLINK_STATE), ('fake-addr2line', FAKE_ADDR2LINE)):
             f = d / name
             f.write_text(body)
             f.chmod(f.stat().st_mode | stat.S_IEXEC)
         self.elf = d / 'fw.elf'
         self.elf.write_bytes(b'\x7fELF')
-        self.env = {**os.environ, 'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}'}
+        self.log = d / 'log.json'
+        self.env = {**os.environ, 'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
+                    'FAKE_PCSR': '20000100'}
 
     def run_cli(self, *args, **env):
         e = {**self.env, **env}
@@ -149,6 +97,9 @@ class CliTest(unittest.TestCase):
         lines = r.stdout.splitlines()
         self.assertTrue(lines[1].startswith('     2  50.0%  spin_here'), lines[1])
         self.assertIn('0x08001000  main.c:42', lines[2])
+        script = json.loads(self.log.read_text())['script'].splitlines()
+        self.assertEqual(script[:3] + script[-2:], ['mem32 E000ED00, 1', 'mem32 E000EDF0, 1', 'mem32 E000EDFC, 1',
+                                                    'mem32 E000EDF0, 1', 'qc'])
 
     def test_histogram_aggregates_pcs_by_function(self):
         # four sites in busy() outrank two samples at one idle() site
@@ -179,6 +130,7 @@ class CliTest(unittest.TestCase):
     def test_interval_emits_sleeps(self):
         r = self.run_cli('--samples', '2', '--interval-ms', '7', FAKE_SYMS='0x20000100=loop@main.c:1')
         self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(self.log.read_text())['script'].count('Sleep 7'), 2)
 
     def test_trace_disabled_refuses_the_histogram(self):
         raw = self.elf.parent / 'raw.txt'
@@ -196,40 +148,40 @@ class CliTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('1 usable of 1 samples', r.stdout)
 
-    def test_a_demcr_read_missing_twice_or_malformed_is_no_capture(self):
-        raw = self.elf.parent / 'raw.txt'
-        for demcr, n in (('', 0), ('zz', 0), ('0100000', 0), ('01000000,01000000', 2)):
-            r = self.run_cli('--samples', '2', '--raw', str(raw), FAKE_DEMCR=demcr, FAKE_SYM_MODE='fail')
-            self.assertEqual(r.returncode, 1, demcr)
-            self.assertIn(f'incomplete capture: 2/2 samples, 2/2 DHCSR reads, {n}/1 DEMCR reads', r.stderr, demcr)
-            self.assertFalse(raw.exists(), demcr)
-
     def test_incomplete_capture_is_an_explicit_failure(self):
-        r = self.run_cli('--samples', '10', FAKE_MODE='truncate')
+        raw = self.elf.parent / 'raw.txt'
+        r = self.run_cli('--samples', '10', '--raw', str(raw), FAKE_MODE='truncate')
         self.assertEqual(r.returncode, 1)
-        self.assertRegex(r.stderr, r'incomplete capture: \d+/10 samples, 1/2 DHCSR reads')
-        self.assertIn('Could not read memory', r.stderr)
+        self.assertIn('incomplete capture: 1/14 reads', r.stderr)
+        self.assertFalse(raw.exists())
 
     def test_a_commander_that_fails_after_answering_is_no_capture(self):
-        r = self.run_cli('--samples', '3', FAKE_MODE='dies_after_reads', FAKE_SYMS='0x20000100=loop@main.c:1')
+        r = self.run_cli('--samples', '3', FAKE_MODE='fail', FAKE_SYMS='0x20000100=loop@main.c:1')
         self.assertEqual(r.returncode, 1)
         self.assertIn('JLinkExe exited 1', r.stderr)
-        self.assertIn('USB communication error', r.stderr)
         self.assertNotIn('usable of', r.stdout)
+
+    def test_another_probe_or_core_is_refused(self):
+        r = self.run_cli('--samples', '1', FAKE_SN='123')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('connected to J-Link S/N 123, not the requested 000', r.stderr)
+        r = self.run_cli('--samples', '1', FAKE_CPUID='00000000')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('does not identify as an M-profile core', r.stderr)
 
     def test_blank_selectors_never_reach_the_commander(self):
         for flag in ('--probe', '--device'):
             r = subprocess.run([sys.executable, str(SCRIPT), '--probe', '000', '--device', 'FAKE', *LINK,
                                 '--elf', str(self.elf), f'{flag}=  '], capture_output=True, text=True,
-                               timeout=30, env={**self.env, 'FAKE_MODE': 'hang'})
+                               timeout=30, env={**self.env, 'FAKE_JLINK_SLEEP': '60'})
             self.assertEqual(r.returncode, 2, flag)
             self.assertIn('must not be empty', r.stderr)
 
     def test_missing_or_hanging_jlink(self):
         r = self.run_cli(PATH='/nonexistent')
-        self.assertEqual(r.returncode, 1)
-        self.assertIn('JLinkExe not found - install J-Link Commander or set PC_SAMPLE_JLINK_EXE', r.stderr)
-        r = self.run_cli('--samples', '1', '--timeout', '1', FAKE_MODE='hang')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('JLinkExe not found - install it or set PROBE_STATE_JLINK_EXE', r.stderr)
+        r = self.run_cli('--samples', '1', '--timeout', '1', FAKE_JLINK_SLEEP='60')
         self.assertEqual(r.returncode, 1)
         self.assertIn('JLinkExe did not finish within 1 s', r.stderr)
 
@@ -261,9 +213,15 @@ class CliTest(unittest.TestCase):
         other.chmod(0o755)
         r = subprocess.run([*base, '--interface', 'jtag', '--speed', 'adaptive', '--samples', '1'],
                            capture_output=True, text=True, timeout=30,
-                           env={**self.env, 'PC_SAMPLE_JLINK_EXE': str(other)})
-        self.assertIn('incomplete capture: 0/1 samples', r.stderr)      # the override ran, and said nothing
+                           env={**self.env, 'PROBE_STATE_JLINK_EXE': str(other)})
+        self.assertIn('incomplete capture: 0/5 reads', r.stderr)      # the override ran, and said nothing
         self.assertIn('-if jtag -speed adaptive', argv.read_text())
+        argv.unlink()
+        r = subprocess.run([*base, *LINK], capture_output=True, text=True, timeout=30,
+                           env={**self.env, 'PC_SAMPLE_JLINK_EXE': str(other)})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('PC_SAMPLE_JLINK_EXE is no longer read', r.stderr)
+        self.assertFalse(argv.exists())
 
     def test_raw_never_overwrites(self):
         raw = Path(self._dir.name) / 'pcs.txt'
@@ -825,7 +783,7 @@ class FakeToolsCase(unittest.TestCase):
 
 @unittest.skipIf(os.name == 'nt', 'openocd and addr2line stubs require POSIX executable semantics')
 class PcSampleOpenOCDTest(FakeToolsCase):
-    tools = (('openocd', FAKE_OPENOCD_STATE), ('JLinkExe', FAKE_JLINK), ('fake-addr2line', FAKE_ADDR2LINE))
+    tools = (('openocd', FAKE_OPENOCD_STATE), ('JLinkExe', FAKE_JLINK_STATE), ('fake-addr2line', FAKE_ADDR2LINE))
 
     def setUp(self):
         super().setUp()

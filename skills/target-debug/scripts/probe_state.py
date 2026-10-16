@@ -94,7 +94,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL, SPEED_RE,  # noqa: E402
-                       ToolError, _MEM32_RE, hil_flasher, hil_jlink_device)
+                       ToolError, hil_flasher, hil_jlink_device)
 
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
@@ -107,6 +107,8 @@ M_PROFILE_ARCH = {0xC: 'armv6-m or armv8-m baseline', 0xF: 'armv7-m or armv8-m m
 ORDINARY_MEMORY = ((0x00000000, 0x1FFFFFFF, 'Code'), (0x20000000, 0x3FFFFFFF, 'SRAM'), (0x60000000, 0x9FFFFFFF, 'RAM'))
 RP2040_XIP_REGION = (0x10000000, 0x1FFFFFFF)  # RP2040 datasheet 2.2.2, Table 15
 MAX_READ = 64 * 1024
+# "E000101C = 20000ABC" — JLinkExe may prefix the line with its "J-Link>" prompt
+_MEM32_RE = re.compile(r'([0-9A-Fa-f]{8}) = ([0-9A-Fa-f]{8})')
 _JLINK_SN_RE = re.compile(r'\bS/N: *(\d+)')
 _JLINK_VTREF_RE = re.compile(r'\bVTref=([0-9.]+)V')
 _OCD_READ_RE = re.compile(r'^R (\w+) (0x[0-9a-fA-F]+)$', re.M)

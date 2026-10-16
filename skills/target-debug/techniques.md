@@ -13,9 +13,9 @@ which):
 python3 <skill dir>/scripts/pc_sample.py --probe <uid> --device <JLINK_DEVICE> --interface swd --speed 4000 --elf <flashed.elf>
 #   or: --hil-config <file> --board <name> --interface swd --speed 4000 --elf <flashed.elf>
 #   or, an openocd board: --hil-config <file> --board <name> --elf <flashed.elf> [--halt-samples N]
-#   --samples N (300), --interval-ms M, --raw FILE; DHCSR is read before and after,
-#   sentinel and no-PCSR samples are counted apart; exit 1 unless every sample came back
-#   DEMCR.TRCENA 0 is exit 1, no histogram
+#   --samples N (300), --interval-ms M, --raw FILE; CPUID, DHCSR and DEMCR are read first and DHCSR
+#   after (probe_state.py's sessions), sentinel and no-PCSR samples are counted apart; exit 1 unless
+#   every read came back; a core not M-profile or DEMCR.TRCENA 0 is exit 1, no histogram
 ```
 
 TRCENA is 0 after a power-on reset, and an ARMv6-M core reset clears it too; `DWT_PCSR` is then UNKNOWN (ARMv6-M/v7-M)
