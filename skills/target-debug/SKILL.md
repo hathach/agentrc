@@ -165,8 +165,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - Vector catch and the fault registers: `fault-autopsy.md`.
 - RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code, the `nm` check, the GDB dump.
 - SystemView: the project's `sysview` skill.
-- Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands, the drain model; the channel itself is the
-  `rtt` skill's.
+- Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands (`console_capture.py` for a UART), the drain
+  model; the channel itself is the `rtt` skill's.
 - Chip and family constraints (flash reads, reset domains, probe misreads): `families.md`; Espressif chips:
   `espressif.md`.
 - dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch sessions, the halted autopsy

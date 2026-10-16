@@ -87,6 +87,16 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 (gdb) continue
 ```
 
+`esp_session.py` runs the read-only part as one bounded session and ends it the way Leave says even when gdb dies
+(`--help`; runs in `projects/tinyusb.md`):
+
+```bash
+python3 <skill dir>/scripts/esp_session.py inspect --out <new dir> --board-cfg board/<chip>-builtin.cfg \
+  --adapter-serial <MAC> --rtos FreeRTOS --gdb <arch gdb> --elf <flashed.elf> --anchor <console capture> [--expr ...]
+#   budget: --at <location> ... instead of --expr; recover: the route only (init; shutdown);
+#   a server left running after exit 3: leave --receipt <out>/receipt.json
+```
+
 - Server initialization examines the cores and leaves them running (S2, S3, P4, S31 measured 2026-10-16); a telnet
   `halt` or the gdb connect halts them. Keep the three apart in a record: examination, gdb connect and a deliberate halt
   each change state differently.
@@ -111,7 +121,8 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 ### Breakpoint budgets
 
 Count from the target's own evidence; nothing carries across chips. The probe procedure (`always-inserted`, where the
-refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s.
+refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s; `esp_session.py budget --at <location> ...` runs it
+with the cleanup outside gdb (builds without the end-of-stack watchpoint, 2026-10-16: P4 exactly 3, S31 exactly 4).
 
 - RISC-V: openocd prints `Found N triggers` per core (P4: 3, which TRM 6567 §2.11.3.2 p161 says, and once "four"; S31:
   4), breakpoints and watchpoints share them, and firmware can hold one (the end-of-stack watchpoint held one of the
@@ -157,16 +168,18 @@ refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s.
 
 In this order, since an esptool reset before the first step started the boot loop (P4 and S31, 2026-10-16):
 
-1. A fresh openocd `init; shutdown`, after a killed openocd and after a `shutdown` that logged "could not remove
-   watchpoint" errors. `shutdown` is meant to clear the debug module (`esp_common.cfg:340-343` writes DM control 0 as a
-   pre-shutdown command), yet on both the P4 and the S31 such a shutdown was followed, at the next esptool reset, by the
-   Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not established.
-2. Verify the build image through a non-writing route before reprogramming:
-   `esptool --chip <c> --port /dev/serial/by-id/<port> verify-flash <offset> <bin>`, image and offset from the build's
-   `flasher_args.json`, never an objcopy of the ELF (verified 2026-10-15 P4, S2); without such a port (Metro S3), report
-   verification pending, or restore and verify the pinned image under `SKILL.md`'s Delegated sessions, Cleanup. With
-   flash support off the known writer, the flash-breakpoint fallback, is absent; that does not stand in for the
-   verification Cleanup requires.
+1. A fresh openocd `init; shutdown` (`esp_session.py recover`), after a killed openocd and after a `shutdown` that
+   logged "could not remove watchpoint" errors. `shutdown` is meant to clear the debug module (`esp_common.cfg:340-343`
+   writes DM control 0 as a pre-shutdown command), yet on both the P4 and the S31 such a shutdown was followed, at the
+   next esptool reset, by the Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not
+   established.
+2. Verify the build image through a non-writing route before reprogramming: `esp_verify.py --manifest
+   <build>/flasher_args.json --chip <c> --port /dev/serial/by-id/<port> --before <reset> --after <reset>` (`--help`),
+   never an objcopy of the ELF. A failed connect, a wrong `--chip` included, leaves a chip that `--before` reset in the
+   ROM loader, since esptool skips `--after` then (the report's `chipState`; the P4 came back on a reset from the USJ's
+   lines, 2026-10-16). Without such a port (Metro S3), report verification pending, or restore and verify the
+   pinned image under `SKILL.md`'s Delegated sessions, Cleanup. With flash support off the known writer, the
+   flash-breakpoint fallback, is absent; that does not stand in for the verification Cleanup requires.
 3. Reset or reflash as the cleanup requires ("Resets").
 
 ### The end-of-stack watchpoint (RISC-V)
@@ -228,14 +241,16 @@ back as reset cause 1, power-on (Metro, 2026-10-16).
   `CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG` (boot log and `ESP_LOG*` also on the USJ CDC). Name ports by
   `/dev/serial/by-id` or `by-path`, never `ttyACM<N>`/`ttyUSB<N>`, which drift within one boot. The capture recipe is
   `techniques.md` "Log capture".
-- Opening the USJ CDC, a CP2102N or an ESP-Prog channel B wired to EN with DTR/RTS asserted can reset the chip: set the
-  control lines before opening, as the capture tool allows, and still expect one: a pyserial open of the USJ CDC with
-  `dtr=rts=False` set before `open()` reset the P4 and the S31 (`rst:0x17 CHIP_USB_UART_RESET`, 2026-10-16). Open it
-  before the baseline (Attach, "Before attaching").
+- Opening the USJ CDC, a CP2102N or an ESP-Prog channel B wired to EN can reset the chip, since Linux raises DTR and RTS
+  at every open: measure it (`console_capture.py --mark 'rst:0x[0-9a-f]+'`, `techniques.md` "Log capture") rather than
+  assume either way, and open before the baseline (Attach, "Before attaching"). A pyserial open of the USJ CDC with
+  `dtr=rts=False` set before `open()` reset the P4 and the S31 (`rst:0x17 CHIP_USB_UART_RESET`); `console_capture.py`
+  opens reset neither, nor the Metro S3 through ESP-Prog channel B (2026-10-16).
 - openocd on the USJ's JTAG interface and a console on its CDC coexist: every 2026-10-16 P4 and S31 attach ran with the
   console open.
 - The USJ CDC is a console only while the USJ exists (on the measured S3 boards it disappears when the firmware starts
-  USB, "ESP32-S3"), and when a reset makes the USJ re-enumerate, the capture misses the beginning of the boot log.
+  USB, "ESP32-S3"), and when a reset makes the USJ re-enumerate, the capture misses the beginning of the boot log. A
+  USJ-driven reset of the P4 (DTR low with RTS high) did not: the open capture kept the whole ROM banner (2026-10-16).
 
 ### Console perturbation
 
@@ -324,8 +339,8 @@ under Attach and in `projects/tinyusb.md`.
   `ESP_EN` on PROG pin 1 also gates the probe's own JTAG buffers through an inverter, with its pull-up R7 drawn NC
   (guide p14: R7 in Fig. 7, the inverter and buffers in Fig. 8): wire PROG pin 1 to the board's EN. On that FT2232
   channel B UART (`if01`) RTS asserted with DTR deasserted pulls EN low (measured; matches the guide's Fig. 7 table,
-  p14), and opening the port reset the chip once even with `dtr=rts=False` set before and after the open. PROG pin 5
-  `ESP_RXD` listens to the target's TXD (measured 2026-10-16: pin 3 captured nothing).
+  p14); a pyserial open reset the chip once even with `dtr=rts=False` set before and after the open ("Console" for the
+  opens that did not). PROG pin 5 `ESP_RXD` listens to the target's TXD (measured 2026-10-16: pin 3 captured nothing).
 - Metro attach (cdc_msc_freertos and cdc_msc_throughput on OTG, 2026-10-16): the recipe passed under traffic with no DUT
   USB reset, disconnect or error logged (`projects/tinyusb.md`). The exception: after the `program_esp` session that
   reprogrammed the app (ended with `reset exit`), every attach read the scan chain as all ones, through a USB

@@ -119,23 +119,19 @@ per the **rtt** skill (servers per probe, transport matrix, control-block gotcha
 ```bash
 # RTT (J-Link probe; flash + reset first — the console owns the probe):
 python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> --interface swd --speed auto --seconds 20 > /tmp/rtt.log
-# UART (board's debug serial, if wired; name it by /dev/serial/by-id or by-path; opening a port can reset an
-#   Espressif chip through DTR/RTS: espressif.md "Console"):
-timeout 20s python3 -c '
-import os, sys, termios, tty
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
-tty.setraw(fd, termios.TCSANOW)
-a = termios.tcgetattr(fd); a[4] = a[5] = termios.B115200
-termios.tcsetattr(fd, termios.TCSANOW, a)
-while chunk := os.read(fd, 4096):
-    sys.stdout.buffer.write(chunk); sys.stdout.buffer.flush()
-' /dev/serial/by-id/<port> | tee /tmp/uart.log
 ```
 
-A separate `stty` can race another client's terminal setup, and the settings are shared: the reader configures its own
-fd with `TCSANOW` (the default `TCSAFLUSH` waits for a concurrent writer's output to drain and discards unread input);
-coordinate later changes between clients (a capture stopped at 4095 bytes, a reader blocked behind the CDC writer:
-2026-10-16, P4 and S31).
+A UART console (the board's debug serial, if wired) goes through `console_capture.py` (`--help`):
+
+```bash
+python3 <skill dir>/scripts/console_capture.py --port /dev/serial/by-id/<port> --baud 115200 --seconds 20 \
+  --lines low --out <new file> [--mark '<reset banner regex>']
+```
+
+Opening a port raises DTR and RTS, which can reset an Espressif chip (`espressif.md`, "Console"): `--mark` reports
+where a reset banner shows up, so a reset at the open is measured rather than assumed. Clients share the port's
+settings and its input: a second reader takes bytes from the first, and changes to the settings need coordinating (a
+capture stopped at 4095 bytes, a reader blocked behind the CDC writer: 2026-10-16, P4 and S31).
 
 A UART write path costs what its driver does: a polled driver blocks only while the TX FIFO is full, an interrupt-driven
 ring blocks only when the ring is full, and a console that drops when the host does not drain waits as long as its
