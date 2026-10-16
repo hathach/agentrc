@@ -18,7 +18,7 @@ comparison_size records that padding. Images are snapshotted before invoking
 the tool. Encrypted images and unsupported flashing options are refused.
 esptool registers the --after reset only once it has connected, uploaded the stub and set the
 baud (__init__.py:552 connects, :623 stub, :639 baud, the teardown at :660-680 resets): a
-failure before then, a wrong chip included, leaves a chip in the ROM loader, whether --before
+failure before then, a wrong chip included, can leave the chip in the ROM loader, whether --before
 or the caller put it there, and a printed reset can still fail. A failed run says so
 (`chipState`) unless --before and --after are both no-reset. With --before no-reset, DTR stays
 asserted from the open and a UART bridge's hard reset writes only RTS, so a two-transistor

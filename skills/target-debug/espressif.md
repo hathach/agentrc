@@ -176,11 +176,11 @@ In this order, since an esptool reset before the first step started the boot loo
 2. Verify the build image through a non-writing route before reprogramming: `esp_verify.py --manifest
    <build>/flasher_args.json --chip <c> --port /dev/serial/by-id/<port> --before <reset> --after <reset>` (`--help`),
    never an objcopy of the ELF. A failure before esptool's command runs (the connect, a wrong `--chip`, the stub upload)
-   leaves a chip in the ROM loader, since esptool skips `--after` then (the report's `chipState`; the P4 came back on a
-   reset from the USJ's lines, 2026-10-16). Without such a port, use a forced download boot where the board has one
+   can leave the chip in the ROM loader, since esptool skips `--after` then (the report's `chipState`; the P4 came back
+   on a reset from the USJ's lines, 2026-10-16). Without such a port, use a forced download boot where the board has one
    (the Metro S3: "ESP32-S3"), else report verification pending, or restore and verify the pinned image under
-   `SKILL.md`'s Delegated sessions, Cleanup. With flash support off the known writer, the
-   flash-breakpoint fallback, is absent; that does not stand in for the verification Cleanup requires.
+   `SKILL.md`'s Delegated sessions, Cleanup. With flash support off the known writer, the flash-breakpoint fallback, is
+   absent; that does not stand in for the verification Cleanup requires.
 3. Reset or reflash as the cleanup requires ("Resets").
 
 ### The end-of-stack watchpoint (RISC-V)
@@ -200,9 +200,9 @@ v1.0) and espressif_s31_function_core with tinyusb cdc_msc_freertos ea1d867ce (w
   inserted four either way, with concurrent allocation unchecked, so why it shows no shortfall is open.
 - Through `esp_session.py` (S31, 2026-10-16) two attaches of two panicked at the examination: cpu0 halted in the
   semihosting call of `esp_cpu_set_breakpoint` (`cpu.c:91`) after the panic handler's "Setting breakpoint at <pc> and
-  returning". The session ended with both cores running, and the next attach, 8 s later, found both halted: the panic
-  handler's breakpoint fired after the server left. Its budget, exactly 4, was taken in that state, so it does not
-  measure coexistence with the watchpoint.
+  returning". The session ended with both cores running, and the next attach, 8 s later, found both halted (when and why
+  they halted is not established; the panic handler's breakpoint is the likely cause). Its budget, exactly 4, was taken
+  in that state, so it does not measure coexistence with the watchpoint.
 - After `shutdown`, the next esptool reset started the Breakpoint boot loop ("After an abnormal end").
 
 The same example rebuilt with the option off, same boards, tools and recipe, passed every criterion of the recipe
@@ -339,12 +339,12 @@ under Attach and in `projects/tinyusb.md`.
 - Metro ESP32-S3 rev B (`DIS_USB_JTAG` burned 2026-10-15; from its rev B schematic through `read-pcb`): Cortex 2x5
   header X2 = pad JTAG, ESP-Prog cable pin-compatible, X2 pin 10 = EN; IO39/42 shared with the ICSP header and the
   microSD socket, IO40/41 are the D1/D0 header pins; UART0 only on header JP2, pin 1 TXD0, no USB-UART bridge. Under an
-  OTG app esptool has no port to this board: images go over JTAG (`program_esp`, "Verify OK" on 2026-10-16). Its UART0
-  reaches ESP-Prog channel B with EN but not IO0 (`--before default-reset` boots the app: "Wrong boot mode detected
-  (0x8)"), so verification goes through a forced download boot: over JTAG, halt, set `FORCE_DOWNLOAD_BOOT` ("Reset
-  domains") and `reset run`; then `esp_verify.py --before no-reset --after hard-reset` on channel B matched every image
-  (esptool 5.5.0). Its hard reset clears the bit but pulses RTS with DTR still asserted from the open, so EN stays high
-  and the chip stays in the loader: pulse EN afterwards (RTS asserted, DTR deasserted).
+  OTG app esptool has no onboard port to this board: images go over JTAG (`program_esp`, "Verify OK" on 2026-10-16). An
+  external UART on JP2, here ESP-Prog channel B, has EN but not IO0 (`--before default-reset` boots the app: "Wrong boot
+  mode detected (0x8)"), so verification goes through a forced download boot: over JTAG, halt, set `FORCE_DOWNLOAD_BOOT`
+  ("Reset domains") and `reset run`; then `esp_verify.py --before no-reset --after hard-reset` on channel B matched
+  every image (esptool 5.5.0). Its hard reset clears the bit but pulses RTS with DTR still asserted from the open, so EN
+  stays high and the chip stays in the loader: pulse EN afterwards (RTS asserted, DTR deasserted).
 - ESP-Prog on the Metro: `board/esp32s3-ftdi.cfg`, `adapter serial <FTDI EEPROM serial>`, JTAG PWR SEL and PROG PWR SEL
   on 3.3 V. Its JTAG header carries no reset (pin 10 NC, so X2 pin 10 EN stays unconnected; guide book 6576 p10), and
   `ESP_EN` on PROG pin 1 also gates the probe's own JTAG buffers through an inverter, with its pull-up R7 drawn NC
