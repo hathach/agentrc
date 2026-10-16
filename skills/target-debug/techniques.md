@@ -52,14 +52,10 @@ python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [-
 - The script issues no configuration write; the connect does (PC-sampling above: the tools set TRCENA, OpenOCD also
   DHCSR.C_DEBUGEN), so `demcr` is the tool's value, not the firmware's. Each J-Link session also halts the core as it
   closes and restarts it (PC-sampling above), so a core it finds halted is running afterwards. Otherwise it halts only
-  in the halting fallback, `--allow-halt` (and `pc_sample.py --halt-samples`), when no sample was usable from a core
-  found running: OpenOCD boards only (J-Link Commander cannot branch, so it could not leave a core it finds halted
-  untouched), single core only (an SMP halt stops every core; refused from the first session's core listing), a core
-  halted by the time the halt session starts left alone, and a session that dies past its guards followed by one that
-  polls the core and resumes it (`--help`). OpenOCD's halt and resume errors are unreliable in both directions, so each
-  core is judged by its DHCSR. Reads use J-Link `savebin` and OpenOCD
-  `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area first
-  (`armv7m_checksum_memory`), even on a running core.
+  in the halting fallback, `--allow-halt` (also `pc_sample.py --halt-samples`), when no sample was usable from a core
+  found running: single-core OpenOCD boards only, with recovery (rules in `--help`). Reads use J-Link `savebin` and
+  OpenOCD `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area
+  first (`armv7m_checksum_memory`), even on a running core.
 - `--budget`, `--read` and `--save` follow the rules in `--help` (which registers, which symbols, which address
   ranges). `reads.snapshot` is `false` on purpose: a running core changes memory between reads, and DHCSR before and
   after only says whether it ran. A save proves nothing about what restores the board, and a region read on a running

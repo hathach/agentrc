@@ -12,10 +12,8 @@ Commander, which checks the probe serial, and OpenOCD for a HIL board flashed ov
 which also reports the other cores' DHCSR. PROBE_STATE_JLINK_EXE and PROBE_STATE_OPENOCD
 name the tools when they are not on PATH.
 
---halt-samples N is probe_state.py's halting fallback (its --allow-halt, whose docstring
-gives the rules: OpenOCD only, single core, recovery) run N times: when the samples gave no
-usable PC from a core both DHCSR reads found running, a second session halts it N times
-(each halt waits up to --halt-timeout-ms), reads PC and resumes, stopping at the first halt
+--halt-samples N runs probe_state.py's halting fallback (its --allow-halt; the rules are in
+its docstring) with N halts, each waiting up to --halt-timeout-ms, stopping at the first halt
 or resume that fails. Those PCs are counted apart from the observed ones.
 
 Reads CPUID, DHCSR, DEMCR, the samples, then DHCSR again; refuses a core that does not
@@ -41,6 +39,7 @@ DHCSR = 0xE000EDF0
 DEMCR = 0xE000EDFC
 DEMCR_TRCENA = 1 << 24  # DWTENA on ARMv6-M; DWT reads are invalid while it is 0
 SENTINEL = 0xFFFFFFFF
+HALT_WAIT_MS = 500    # each halt of the halting fallback
 SPEED_RE = re.compile(r'[1-9][0-9]*|auto|adaptive')
 
 
@@ -68,7 +67,7 @@ def sample(backend, samples, interval_ms, timeout):
     if not vals['demcr'] & DEMCR_TRCENA:
         raise ToolError(f"DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{vals['demcr']:08x}): DWT_PCSR samples "
                         f'are not valid while trace is disabled; enable trace from a debugger session first')
-    return vals['pcs'], [vals['dhcsr0'], vals['dhcsr1']], getattr(backend, 'others', {})
+    return vals['pcs'], [vals['dhcsr0'], vals['dhcsr1']], backend.others
 
 
 def symbolize(addr2line, elf, pcs, timeout):
@@ -199,7 +198,8 @@ def main(argv=None):
     p.add_argument('--speed', help='J-Link: interface speed in kHz, or "auto"/"adaptive"; no default')
     p.add_argument('--halt-samples', type=int, default=0,
                    help='openocd boards: halt reads when the samples gave no usable PC from a running core')
-    p.add_argument('--halt-timeout-ms', type=int, default=500, help='wait for each halt (default 500)')
+    p.add_argument('--halt-timeout-ms', type=int, default=HALT_WAIT_MS,
+                   help=f'wait for each halt (default {HALT_WAIT_MS})')
     p.add_argument('--timeout', type=float, help='bound on each tool run in seconds '
                    '(default: samples x (interval + 50 ms) + 20 s)')
     p.add_argument('--top', type=int, default=15, help='histogram rows (default 15)')
@@ -251,8 +251,6 @@ def main(argv=None):
     if not os.path.isfile(a.elf):
         p.error(f'ELF not found: {a.elf}')
     timeout = a.timeout if a.timeout is not None else a.samples * (a.interval_ms + 50) / 1000 + 20
-    halt_timeout = a.timeout if a.timeout is not None else \
-        a.halt_samples * (a.halt_timeout_ms + a.interval_ms + 100) / 1000 + 20
     halted_pcs, halted_dhcsr, fallback_error = [], [], None
     try:
         pcs, dhcsr, others = sample(backend, a.samples, a.interval_ms, timeout)
@@ -263,7 +261,7 @@ def main(argv=None):
         if a.halt_samples and found_running and not any(pc not in (0, SENTINEL) for pc in pcs):
             try:
                 halted_pcs, *halted_dhcsr = backend.halt_reads(a.halt_samples, a.halt_timeout_ms, a.interval_ms,
-                                                               halt_timeout)
+                                                               a.timeout)
             except ToolError as e:
                 fallback_error = str(e)
         wanted = {pc for pc in pcs + halted_pcs if pc not in (0, SENTINEL)}

@@ -338,7 +338,7 @@ if gdb_port:
 script = sys.argv[-1]
 log(script)
 print('Info : CMSIS-DAP: Serial# = E6614C311B597D32', file=sys.stderr)
-if 'not touched:' in script:    # pc_sample's recovery
+if 'not touched:' in script:    # OpenOCD.recover
     print(f'R DHCSR 0x{value("DHCSR"):08x}', file=sys.stderr)
     open(os.environ['FAKE_STATE'], 'w').write('01010001')
     print(f'R DHCSR 0x{value("DHCSR"):08x}', file=sys.stderr)
@@ -858,23 +858,27 @@ class PcSampleOpenOCDTest(FakeToolsCase):
             self.assertEqual(state.read_text(), end)
             self.log.unlink()
 
+    @staticmethod
+    def single_core(batch):
+        """An observed single-core OpenOCD backend whose sessions are batch(body, timeout)."""
+        backend = object.__new__(probe_state.OpenOCD)
+        backend.current, backend.others, backend.batch = 'max32665.cpu', {}, batch
+        return backend
+
     def halt_with_signal(self, raises):
         """halt_reads over a session that takes SIGTERM; raises: the failure it then ends with."""
-        class Backend(probe_state.OpenOCD):
-            def __init__(self):
-                self.current, self.others = 'max32665.cpu', {}
-
-            def batch(self, body, timeout):
-                os.kill(os.getpid(), signal.SIGTERM)
-                if raises:
-                    raise raises
-                return 'R DHCSR 0x01010001\nGUARDED\nH 0x08001000\nR DHCSR 0x01010001\n', \
-                    [('DHCSR', 0x01010001), ('DHCSR', 0x01010001)]
+        def batch(body, timeout):
+            os.kill(os.getpid(), signal.SIGTERM)
+            if raises:
+                raise raises
+            return 'R DHCSR 0x01010001\nGUARDED\nH 0x08001000\nR DHCSR 0x01010001\n', \
+                [('DHCSR', 0x01010001), ('DHCSR', 0x01010001)]
 
         previous = signal.getsignal(signal.SIGTERM)
-        with mock.patch.object(Backend, 'recover', return_value='; recovered') as recover:
+        backend = self.single_core(batch)
+        with mock.patch.object(backend, 'recover', return_value='; recovered') as recover:
             with self.assertRaises(probe_state.ToolError) as cm:
-                Backend().halt_reads(1, 500, 10, 30)
+                backend.halt_reads(1, 500, 10, 30)
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
         return str(cm.exception), recover.call_count
 
@@ -884,18 +888,20 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertEqual(self.halt_with_signal(failure), ('halting fallback: interrupted by signal 15; recovered', 1))
 
     def test_incomplete_output_past_the_guards_is_recovered(self):
-        class Backend(probe_state.OpenOCD):
-            def __init__(self):
-                self.current, self.others = 'max32665.cpu', {}
-
-            def batch(self, body, timeout):
-                return 'R DHCSR 0x01010001\nGUARDED\n', [('DHCSR', 0x01010001)]
-
-        with mock.patch.object(Backend, 'recover', return_value='; recovered') as recover:
+        backend = self.single_core(lambda body, timeout: ('R DHCSR 0x01010001\nGUARDED\n', [('DHCSR', 0x01010001)]))
+        with mock.patch.object(backend, 'recover', return_value='; recovered') as recover:
             with self.assertRaisesRegex(probe_state.ToolError,
                                         r'(?s)^halting fallback: 0/2 halt reads;.*; recovered$'):
-                Backend().halt_reads(2, 500, 0, 30)
+                backend.halt_reads(2, 500, 0, 30)
         self.assertEqual(recover.call_count, 1)
+
+    def test_the_halt_session_is_bounded_by_its_own_work_unless_given(self):
+        seen = []
+        backend = self.single_core(lambda body, timeout: seen.append(timeout) or (
+            'H 0x08001000\n' * 4, [('DHCSR', 0x01010001), ('DHCSR', 0x01010001)]))
+        backend.halt_reads(4, 500, 10, None)
+        backend.halt_reads(4, 500, 10, 3)
+        self.assertEqual(seen, [4 * 0.61 + 20, 3])
 
     def test_a_signal_after_the_fallback_finished_needs_no_recovery(self):
         self.assertEqual(self.halt_with_signal(None), ('halting fallback: interrupted by signal 15', 0))
@@ -965,7 +971,7 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertIn('--probe and --device are J-Link flags', r.stderr)
         r = self.run_cli('k64f', *LINK, '--halt-samples', '2')
         self.assertEqual(r.returncode, 2)
-        self.assertIn('the halting fallback is OpenOCD-only', r.stderr)
+        self.assertIn('--halt-samples is for openocd boards: J-Link Commander cannot branch', r.stderr)
         r = self.run_cli('k64f')
         self.assertEqual(r.returncode, 2)
         self.assertIn('a J-Link needs --interface and --speed', r.stderr)
@@ -1094,7 +1100,7 @@ class ProbeStateCliTest(FakeToolsCase):
     def test_the_halting_fallback_is_refused_for_jlink_and_multi_core(self):
         rc, out, err = self.run_cli('k64f', *LINK, '--allow-halt', FAKE_PCSR='FFFFFFFF')
         self.assertEqual(rc, 2)
-        self.assertIn('the halting fallback is OpenOCD-only', err)
+        self.assertIn('--allow-halt is for openocd boards: J-Link Commander cannot branch', err)
         self.assertFalse(self.log.exists())
         rc, out, err = self.run_cli('max32', '--allow-halt', FAKE_PCSR='FFFFFFFF', FAKE_CURRENT='rp2040.core0',
                                     FAKE_CORES='rp2040.core1=01010001')

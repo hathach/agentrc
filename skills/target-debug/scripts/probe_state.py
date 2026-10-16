@@ -30,7 +30,7 @@ pre-connect state of those bits is not observable. DWT_PCSR is read without halt
 J-Link session halts the core as it closes and restarts it (DFSR.HALTED is set after each
 session, V9.78), so a core found halted is running afterwards.
 
---allow-halt is the halting fallback, shared with pc_sample.py --halt-samples: with no
+--allow-halt is the halting fallback, also pc_sample.py --halt-samples: with no
 usable sample from a core both DHCSR reads found running, a second session halts it, reads
 PC and resumes. It is OpenOCD-only: J-Link Commander cannot branch, so it could not leave a
 core it finds halted untouched, and the flag is refused for a J-Link board. A multi-core
@@ -93,8 +93,8 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL, SPEED_RE,  # noqa: E402
-                       ToolError, hil_flasher, hil_jlink_device)
+from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HALT_WAIT_MS, HIL_PROBE_ROUTES, SENTINEL,  # noqa: E402
+                       SPEED_RE, ToolError, hil_flasher, hil_jlink_device)
 
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
@@ -124,9 +124,7 @@ STT_OBJECT, STT_FUNC = 1, 2
 SHN_UNDEF, SHN_ABS, SHN_COMMON = 0, 0xFFF1, 0xFFF2
 SHT_PROGBITS, SHT_NOBITS = 1, 8
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
-HALT_WAIT_MS = 500    # --allow-halt's wait for its one halt, pc_sample's --halt-timeout-ms default
-NO_JLINK_HALT = ('the halting fallback is OpenOCD-only: J-Link Commander cannot branch, so it could not leave '
-                 'a core it finds halted untouched')
+NO_JLINK_HALT = 'J-Link Commander cannot branch, so it could not leave a core it finds halted untouched'
 
 
 def dhcsr_state(v):
@@ -331,12 +329,12 @@ def compare(expected, actual):
 
 
 class HaltRefused(ToolError):
-    """The halting fallback halted nothing: reason 'halted' (the core was halted when its session started,
-    dhcsr the value read) or 'multicore'."""
+    """The halting fallback found the core halted when its session started (dhcsr, the value read) and
+    touched nothing."""
 
-    def __init__(self, msg, reason, dhcsr=None):
+    def __init__(self, msg, dhcsr):
         super().__init__(msg)
-        self.reason, self.dhcsr = reason, dhcsr
+        self.dhcsr = dhcsr
 
 
 def tool(env, posix, windows=None):
@@ -461,6 +459,7 @@ class Capture:
 
 
 class JLink:
+    others = {}    # Commander attaches to one core
     REG = {'CPUID': CPUID, 'DHCSR': DHCSR, 'DEMCR': DEMCR, 'FPCTRL': FP_CTRL, 'DWTCTRL': DWT_CTRL, 'PCSR': DWT_PCSR}
 
     def __init__(self, probe, device, interface, speed):
@@ -631,13 +630,15 @@ class OpenOCD:
         now = f"{'halted' if last else 'running'} (DHCSR 0x{dhcsr[1]:08x})"
         return f'; the core was left halted, resumed: now {now}' if first else f'; the core is {now}'
 
-    def halt_reads(self, n, halt_timeout_ms, interval_ms, timeout):
-        """(pcs, DHCSR before, DHCSR after) from n halt reads after an observe(). Raises HaltRefused when it
-        halted nothing, else ToolError, after a recovery session when the loop may have started."""
+    def halt_reads(self, n, halt_timeout_ms, interval_ms, timeout=None):
+        """(pcs, DHCSR before, DHCSR after) from n halt reads after an observe(). Raises HaltRefused for a core
+        found halted, else ToolError, after a recovery session when the loop may have started."""
         if self.others:
             names = ' '.join([self.current, *self.others])
-            raise HaltRefused(f'halting fallback refused: {len(self.others) + 1} cores ({names}); an SMP halt '
-                              f'stops every core', 'multicore')
+            raise ToolError(f'halting fallback refused: {len(self.others) + 1} cores ({names}); an SMP halt stops '
+                            f'every core')
+        if timeout is None:
+            timeout = n * (halt_timeout_ms + interval_ms + 100) / 1000 + 20
         signals, stopping = [], True
 
         def on_signal(signum, _frame):
@@ -662,10 +663,9 @@ class OpenOCD:
             if failure is None and not signals:
                 return pcs, dhcsr[0], dhcsr[1]
             refused = re.search(r'^ERROR refused (halted|multicore): ', text, re.M)
-            if refused and not signals:
-                first = re.search(r'^R DHCSR (0x[0-9a-fA-F]+)$', text, re.M)
-                raise HaltRefused(f'halting fallback: {failure}', refused.group(1),
-                                  first and int(first.group(1), 16)) from failure
+            first = next((int(v, 16) for name, v in _OCD_READ_RE.findall(text) if name == 'DHCSR'), None)
+            if refused and refused.group(1) == 'halted' and first is not None and not signals:
+                raise HaltRefused(f'halting fallback: {failure}', first) from failure
             what = f'interrupted by signal {signals[0]}' if signals else str(failure)
             if failure is None:
                 after = ''    # the loop finished, resume included, before the signal could stop it
@@ -908,10 +908,8 @@ def main(argv=None):
             result['haltRead'] = {'performed': False, 'reason': 'PCSR sampled' if running else 'core halted'}
         else:
             try:
-                (pc,), before, after = backend.halt_reads(1, HALT_WAIT_MS, 0, timeout)
+                (pc,), before, after = backend.halt_reads(1, HALT_WAIT_MS, 0, a.timeout)
             except HaltRefused as e:
-                if e.reason != 'halted':
-                    return fail(str(e))
                 result['haltRead'] = {'performed': False, 'reason': 'core halted at the halt session',
                                       'dhcsr': dhcsr_state(e.dhcsr)}
             except ToolError as e:
