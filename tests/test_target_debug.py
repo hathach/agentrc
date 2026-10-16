@@ -289,14 +289,23 @@ _spec.loader.exec_module(probe_state)
 
 # Shared by both fakes: FAKE_<REG> answers each read of that register, a comma list
 # consumed in order with the last value repeated; FAKE_MEM/FAKE_MEM_BASE is the flash
-# the read-back sees; FAKE_LOG records argv and the script; FAKE_MODE=truncate stops
-# answering after the CPUID read, =fail exits 1; FAKE_HALT_DHCSR answers DHCSR in a
-# J-Link halt-read session; FAKE_REPLACE names a file the read-back overwrites.
+# the read-back sees; FAKE_LOG records argv and the script, one JSON line per session;
+# FAKE_MODE=truncate stops answering after the CPUID read, =fail exits 1, =short dumps
+# one byte less than asked; FAKE_HALT_DHCSR answers DHCSR in a J-Link halt-read
+# session; FAKE_REPLACE names a file the read-back overwrites; FAKE_SN is the serial
+# the J-Link fake reports (default: the one selected); FAKE_CORES / FAKE_CORES_AFTER are
+# the OpenOCD fake's other cores as `name=DHCSR,...` (default none), FAKE_CURRENT its
+# current target.
 FAKE_COMMON = """
 import json, os, sys
 regs = {k: os.environ.get('FAKE_' + k, d).split(',') for k, d in
-        (('CPUID', '410fc241'), ('DHCSR', '01010001'), ('DEMCR', '01000000'), ('PCSR', '08001000'), ('PC', '08004444'))}
+        (('CPUID', '410fc241'), ('DHCSR', '01010001'), ('DEMCR', '01000000'), ('PCSR', '08001000'), ('PC', '08004444'),
+         ('FPCTRL', '00000260'), ('DWTCTRL', '40000000'))}
+def log(script):
+    with open(os.environ['FAKE_LOG'], 'a') as f:
+        f.write(json.dumps({'argv': sys.argv[1:], 'script': script}) + '\\n')
 seen = {}
+mode = os.environ.get('FAKE_MODE', '')
 def value(reg):
     n = seen.get(reg, 0); seen[reg] = n + 1
     vals = regs[reg]
@@ -304,20 +313,25 @@ def value(reg):
 def dump(path, addr, size):
     mem = open(os.environ['FAKE_MEM'], 'rb').read() if os.environ.get('FAKE_MEM') else b''
     off = addr - int(os.environ.get('FAKE_MEM_BASE', '0'), 16)
+    if mode == 'short':
+        size -= 1
     open(path, 'wb').write(mem[off:off + size])
     if os.environ.get('FAKE_REPLACE'):
         open(os.environ['FAKE_REPLACE'], 'wb').write(b'replaced while the probe read back')
-mode = os.environ.get('FAKE_MODE', '')
 """
 
 FAKE_JLINK_STATE = '#!/usr/bin/env python3' + FAKE_COMMON + """
 import re
 script = sys.stdin.read()
-open(os.environ['FAKE_LOG'], 'w').write(json.dumps({'argv': sys.argv[1:], 'script': script}))
+log(script)
 if '\\nh\\n' in script and os.environ.get('FAKE_HALT_DHCSR'):
     regs['DHCSR'] = os.environ['FAKE_HALT_DHCSR'].split(',')
-names = {'E000ED00': 'CPUID', 'E000EDF0': 'DHCSR', 'E000EDFC': 'DEMCR', 'E000101C': 'PCSR'}
+names = {'E000ED00': 'CPUID', 'E000EDF0': 'DHCSR', 'E000EDFC': 'DEMCR', 'E000101C': 'PCSR', 'E0002000': 'FPCTRL',
+         'E0001000': 'DWTCTRL'}
 print('SEGGER J-Link Commander V9.78 (Compiled fake)')
+sn = os.environ.get('FAKE_SN', sys.argv[sys.argv.index('-SelectEmuBySN') + 1].lstrip('0'))
+print(f'S/N: {sn}')
+print('VTref=3.300V')
 for line in script.splitlines():
     m = re.match(r'mem32 ([0-9A-F]{8}), 1', line)
     if m:
@@ -335,8 +349,18 @@ sys.exit(1 if mode == 'fail' else 0)
 FAKE_OPENOCD_STATE = '#!/usr/bin/env python3' + FAKE_COMMON + """
 import re
 script = sys.argv[-1]
-open(os.environ['FAKE_LOG'], 'w').write(json.dumps({'argv': sys.argv[1:], 'script': script}))
+log(script)
+print('Info : CMSIS-DAP: Serial# = E6614C311B597D32', file=sys.stderr)
+others = {'B': os.environ.get('FAKE_CORES', '')}
+others['A'] = os.environ.get('FAKE_CORES_AFTER', others['B'])
 for line in script.splitlines():
+    if line == 'echo "C [target current]"':
+        print('C ' + os.environ.get('FAKE_CURRENT', 'max32665.cpu'), file=sys.stderr)
+    m = re.search(r'format "T([BA]) ', line)
+    if m:
+        for kv in filter(None, others[m.group(1)].split(',')):
+            name, v = kv.split('=')
+            print(f'T{m.group(1)} {name} 0x{int(v, 16):08x}', file=sys.stderr)
     m = re.match(r'\\s*(?:rd |echo \\[format "R )(\\w+) ', line)
     if m:
         print(f'R {m.group(1)} 0x{value(m.group(1)):08x}', file=sys.stderr)
@@ -362,20 +386,60 @@ STATE_BOARDS = [
     {'name': 'bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c', 'args': '-f x.cfg'}},
     {'name': 'twin', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'}},
     {'name': 'twin', 'flasher': {'name': 'jlink', 'uid': '2', 'args': '-device X'}},
+    {'name': 'pico', 'flasher': {'name': 'openocd', 'uid': 'E6614103E72C1D2F',
+                                 'args': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg'}},
 ]
 
 
-def elf32(segments):
-    """A minimal little-endian ELF32 with one PT_LOAD per (paddr, bytes, filesz-or-None)."""
+def elf32(segments, symbols=(), e_type=2):
+    """A minimal little-endian ELF32 with one PT_LOAD per (paddr, bytes) and, when symbols are
+    given, sections .text (1), .rodata (2), .bss (3), then .symtab, .strtab, .shstrtab, the
+    symbols as (name, value, size, type, shndx)."""
     phoff, phentsize = 52, 32
     data_off = phoff + phentsize * len(segments)
-    header = bytearray(b'\x7fELF\x01\x01\x01' + bytes(9))
-    header += struct.pack('<HHIIIIIHHHHHH', 2, 40, 1, 0, phoff, 0, 0, 52, phentsize, len(segments), 0, 0, 0)
     phdrs, blobs = b'', b''
     for paddr, blob in segments:
         phdrs += struct.pack('<8I', 1, data_off + len(blobs), paddr | 0x1000_0000, paddr, len(blob), len(blob), 5, 4)
         blobs += blob
-    return bytes(header) + phdrs + blobs
+    shoff, shnum, shstrndx, tail = 0, 0, 0, b''
+    if symbols:
+        strtab, symtab = b'\0', bytes(16)
+        for name, value, size, kind, shndx in symbols:
+            symtab += struct.pack('<IIIBBH', len(strtab), value, size, kind, 0, shndx)
+            strtab += name.encode() + b'\0'
+        names = [b'.text', b'.rodata', b'.bss', b'.symtab', b'.strtab', b'.shstrtab']
+        shstrtab, name_off = b'\0', []
+        for n in names:
+            name_off.append(len(shstrtab))
+            shstrtab += n + b'\0'
+        off_sym = data_off + len(blobs)
+        off_str, off_shstr = off_sym + len(symtab), off_sym + len(symtab) + len(strtab)
+        shoff = off_shstr + len(shstrtab)
+        shdr = lambda i, kind, flags, off, size, link, entsize: struct.pack(  # noqa: E731
+            '<10I', name_off[i], kind, flags, 0, off, size, link, 0, 1, entsize)
+        alloc, execinstr = 0x2, 0x4
+        tail = (symtab + strtab + shstrtab + bytes(40)
+                + shdr(0, 1, alloc | execinstr, 0, 0, 0, 0) + shdr(1, 1, alloc, 0, 0, 0, 0)
+                + shdr(2, 8, alloc | 0x1, 0, 0, 0, 0)
+                + shdr(3, 2, 0, off_sym, len(symtab), 5, 16) + shdr(4, 3, 0, off_str, len(strtab), 0, 0)
+                + shdr(5, 3, 0, off_shstr, len(shstrtab), 0, 0))
+        shnum, shstrndx = 7, 6
+    header = bytearray(b'\x7fELF\x01\x01\x01' + bytes(9))
+    header += struct.pack('<HHIIIIIHHHHHH', e_type, 40, 1, 0, phoff, shoff, 0, 52, phentsize, len(segments), 40, shnum,
+                          shstrndx)
+    return bytes(header) + phdrs + blobs + tail
+
+
+OBJ, FUNC, TEXT, RODATA, BSS = 1, 2, 1, 2, 3   # symbol types and the section indexes elf32() lays out
+SYMS = [('g_count', 0x2000_0010, 4, OBJ, BSS), ('g_flag', 0x2000_0014, 1, OBJ, BSS),
+        ('g_wide', 0x2000_0018, 8, OBJ, BSS), ('g_odd', 0x2000_0020, 3, OBJ, BSS),
+        ('table', 0x0800_0100, 16, OBJ, RODATA), ('main', 0x0800_0200, 40, FUNC, TEXT),
+        ('code_obj', 0x0800_0300, 4, OBJ, TEXT), ('same_twice', 0x2000_0060, 4, OBJ, BSS),
+        ('same_twice', 0x2000_0060, 4, FUNC, TEXT),
+        ('dup', 0x2000_0030, 4, OBJ, BSS), ('dup', 0x2000_0040, 4, OBJ, BSS),
+        ('empty', 0x2000_0050, 0, OBJ, BSS), ('extern_only', 0, 0, 0, 0),
+        ('reg', 0x4002_0000, 4, OBJ, BSS), ('ABSVAL', 0x1234, 4, OBJ, 0xFFF1),
+        ('flash_var', 0x1000_0100, 4, OBJ, RODATA)]
 
 
 class ProbeStateUnitTest(unittest.TestCase):
@@ -428,6 +492,54 @@ class ProbeStateUnitTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, want):
                     probe_state.image_segments(str(elf), None)
 
+    def test_budget_fields(self):
+        on = probe_state.DEMCR_TRCENA
+        b = probe_state.budget_state(0x0000_1261, 0x4000_0000, on)
+        self.assertEqual((b['fpCtrl']['numCode'], b['fpCtrl']['enabled'], b['dwtCtrl']['numComp']), (22, True, 4))
+        self.assertEqual(probe_state.budget_state(0x40, 0x2000_0000, 0)['dwtCtrl'], {'status': 'dwt-disabled'})
+        self.assertEqual(probe_state.budget_state(0x40, 0, on)['fpCtrl']['numCode'], 4)
+
+    def test_symbol_reads_resolve_offline_and_refuse_the_rest(self):
+        with tempfile.TemporaryDirectory() as d:
+            elf = Path(d) / 'fw.elf'
+            elf.write_bytes(elf32([(0x0800_0000, b'abcd')], SYMS))
+            self.assertEqual(probe_state.resolve_reads(str(elf), ['g_count', 'table'], False),
+                             [('g_count', 0x2000_0010, 4), ('table', 0x0800_0100, 16)])
+            self.assertEqual(probe_state.resolve_reads(str(elf), ['flash_var'], False), [('flash_var', 0x1000_0100, 4)])
+            for name, want in (('nothere', 'no symbol'), ('main', 'a function'), ('dup', 'ambiguous'),
+                               ('same_twice', 'ambiguous'), ('empty', 'zero size'), ('extern_only', 'undefined'),
+                               ('reg', 'not within Code'), ('ABSVAL', 'absolute'), ('code_obj', 'data section')):
+                with self.assertRaisesRegex(ValueError, want, msg=name):
+                    probe_state.resolve_reads(str(elf), [name], False)
+            with self.assertRaisesRegex(ValueError, 'RP2040 XIP region'):
+                probe_state.resolve_reads(str(elf), ['flash_var'], True)
+            probe_state.check_region('x', 0x1400_001C, 4, False)    # architectural Code: allowed off RP2040
+            stripped = Path(d) / 'stripped.elf'
+            stripped.write_bytes(elf32([(0x0800_0000, b'abcd')]))
+            with self.assertRaisesRegex(ValueError, 'section header'):
+                probe_state.resolve_reads(str(stripped), ['g_count'], False)
+            relocatable = Path(d) / 'obj.o'
+            relocatable.write_bytes(elf32([], SYMS, e_type=1))
+            with self.assertRaisesRegex(ValueError, 'not a linked executable'):
+                probe_state.resolve_reads(str(relocatable), ['g_count'], False)
+
+    def test_region_rules(self):
+        probe_state.check_region('x', 0x0800_0000, 0x10000, False)
+        probe_state.check_region('x', 0x6000_0000, 16, False)
+        for addr, size, rp, want in ((0x4000_0000, 4, False, 'not within'), (0xE000_EDF0, 4, False, 'not within'),
+                                     (0x1FFF_FFFE, 4, False, 'not within'), (0x1000_0000, 4, True, 'RP2040'),
+                                     (0x1300_0000, 4, True, 'RP2040'), (0x1400_001C, 4, True, 'RP2040 XIP'),
+                                     (0x1800_0000, 4, True, 'RP2040 XIP'), (0x2000_0000, 0, False, 'positive'),
+                                     (0xFFFF_FFFE, 4, False, 'outside')):
+            with self.assertRaisesRegex(ValueError, want, msg=hex(addr)):
+                probe_state.check_region('x', addr, size, rp)
+
+    def test_read_decoding(self):
+        self.assertEqual(probe_state.decode_read('a', 0x2000_0000, b'\x34\x12')['hex'], '0x1234')
+        self.assertEqual(probe_state.decode_read('a', 0x2000_0000, b'\x01\x00\x00\x00\x00\x00\x00\x00')['value'], 1)
+        odd = probe_state.decode_read('a', 0x2000_0000, b'abc')
+        self.assertEqual((odd['bytes'], 'value' in odd), ('616263', False))
+
 
 try:
     import tkinter
@@ -440,9 +552,10 @@ OPENOCD_TCL_STUBS = '''
 set calls {}; set out {}
 proc init {} {}; proc shutdown {} {lappend ::calls shutdown}
 proc echo {s} {lappend ::out $s}
-proc read_memory {a w n} {return 0x01010001}
-proc target {cmd} {return tgt}
-proc tgt {cmd} {return $::state}
+proc read_memory {a w n} {return $::dhcsr}
+proc target {cmd} {if {$cmd eq "names"} {return $::targets}; return tgt}
+proc tgt {args} {return $::dhcsr}
+proc tgt2 {args} {return $::dhcsr2}
 proc halt {} {lappend ::calls halt}
 proc resume {} {lappend ::calls resume}
 proc get_reg {r} {
@@ -454,10 +567,12 @@ proc get_reg {r} {
 
 @unittest.skipIf(_TCL is None, 'needs a Tcl interpreter (tkinter)')
 class ProbeStateHaltReadTclTest(unittest.TestCase):
-    def run_tcl(self, state, pcfail):
+    def run_tcl(self, state, pcfail, other=None):
         tcl = _TCL()
         tcl.eval(OPENOCD_TCL_STUBS)
-        tcl.eval(f'set state {state}; set pcfail {int(pcfail)}')
+        dhcsr = {'running': '0x01010001', 'halted': '0x01030003'}
+        tcl.eval(f'set dhcsr {dhcsr[state]}; set pcfail {int(pcfail)}; set targets {{tgt{" tgt2" if other else ""}}}; '
+                 f'set dhcsr2 {dhcsr[other or "running"]}')
         tcl.eval(probe_state.OpenOCD.script(probe_state.OpenOCD.HALT_READ))
         return tcl.splitlist(tcl.eval('set calls')), list(tcl.splitlist(tcl.eval('set out')))
 
@@ -475,7 +590,22 @@ class ProbeStateHaltReadTclTest(unittest.TestCase):
         self.assertEqual(out, ['R DHCSR 0x01010001', 'R PC 0x0800abcd', 'R DHCSR 0x01010001'])
         calls, out = self.run_tcl('halted', pcfail=True)
         self.assertEqual(calls, ('shutdown',))
+        self.assertEqual(out[0], 'R DHCSR 0x01030003')
         self.assertIn('found halted', out[-1])
+
+    def test_a_multi_core_target_refuses_the_halt(self):
+        for other in ('halted', 'running'):
+            calls, out = self.run_tcl('running', pcfail=False, other=other)
+            self.assertEqual(calls, ('shutdown',))
+            self.assertIn('refused: 2 cores (tgt tgt2)', out[-1])
+
+    def test_an_empty_resume_error_is_named(self):
+        tcl = _TCL()
+        tcl.eval(OPENOCD_TCL_STUBS)
+        tcl.eval('set dhcsr 0x01010001; set pcfail 0; set targets {tgt}; set dhcsr2 0; proc resume {} {error ""}')
+        tcl.eval(probe_state.OpenOCD.script(probe_state.OpenOCD.HALT_READ))
+        out = list(tcl.splitlist(tcl.eval('set out')))
+        self.assertIn('resume: failed without a message; found running', out[-1])
 
 
 @unittest.skipIf(os.name == 'nt', 'JLinkExe and openocd stubs require POSIX executable semantics')
@@ -499,8 +629,11 @@ class ProbeStateCliTest(unittest.TestCase):
         out = json.loads(r.stdout) if r.stdout.strip() else None
         return r.returncode, out, r.stderr
 
-    def logged(self):
-        return json.loads(self.log.read_text())
+    def logged(self, session=-1):
+        return self.sessions()[session]
+
+    def sessions(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def test_jlink_observation(self):
         rc, out, err = self.run_cli('k64f', *LINK, '--samples', '4', '--interval-ms', '3',
@@ -530,7 +663,8 @@ class ProbeStateCliTest(unittest.TestCase):
         self.assertEqual(out['verify']['result'], 'match')
         self.assertEqual([s['address'] for s in out['verify']['segments']], ['0x00000010', '0x00000100'])
         self.assertIn('savebin ', self.logged()['script'])
-        self.assertEqual(out['verify']['dhcsrAfter']['raw'], '0x01010001')
+        self.assertEqual(out['dhcsrAfterReads']['raw'], '0x01010001')
+        self.assertEqual(out['connection'], {'serial': '621000000', 'vtref': 3.3})
         elf.write_bytes(elf32([(0x0000_0010, bytes(range(16, 40)) + b'XX' + bytes(range(42, 48)))]))
         rc, out, err = self.run_cli('k64f', *LINK, '--verify', str(elf), FAKE_MEM=str(mem), FAKE_MEM_BASE='0')
         self.assertEqual(rc, 1, err)
@@ -602,6 +736,108 @@ class ProbeStateCliTest(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn('left a core it found running halted', out['error'])
 
+
+    def test_budget_registers(self):
+        rc, out, err = self.run_cli('k64f', *LINK, '--budget', FAKE_FPCTRL='00001261', FAKE_DWTCTRL='40000000')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((out['budget']['fpCtrl']['numCode'], out['budget']['dwtCtrl']['numComp']), (22, 4))
+        rc, out, err = self.run_cli('max32', '--budget', FAKE_DEMCR='00000000', FAKE_FPCTRL='00000040')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['budget'], {'fpCtrl': {'raw': '0x00000040', 'numCode': 4, 'enabled': False},
+                                         'dwtCtrl': {'status': 'dwt-disabled'}})
+        rc, out, err = self.run_cli('max32')
+        self.assertNotIn('budget', out)
+        self.assertNotIn('E0002000', self.logged()['script'].lower().replace('0x', ''))
+
+    def test_symbol_reads_over_both_backends(self):
+        mem = self.d / 'ram.bin'
+        mem.write_bytes(bytes(range(256)))
+        elf = self.d / 'fw.elf'
+        elf.write_bytes(elf32([(0x0800_0000, b'abcd')], SYMS))
+        for board, args in (('k64f', LINK), ('max32', ())):
+            rc, out, err = self.run_cli(board, *args, '--elf', str(elf), '--read', 'g_count', '--read', 'g_odd',
+                                        FAKE_MEM=str(mem), FAKE_MEM_BASE='20000000')
+            self.assertEqual(rc, 0, (board, err))
+            values = out['reads']['values']
+            self.assertEqual((values[0]['symbol'], values[0]['hex'], values[0]['value']),
+                             ('g_count', '0x13121110', 0x13121110))
+            self.assertEqual((values[1]['bytes'], 'value' in values[1]), ('202122', False))
+            self.assertFalse(out['reads']['snapshot'])
+            self.assertIn('dhcsrAfterReads', out)
+        rc, out, err = self.run_cli('k64f', *LINK, '--elf', str(elf), '--read', 'g_count', FAKE_MEM=str(mem),
+                                    FAKE_MEM_BASE='20000000', FAKE_MODE='short')
+        self.assertEqual(rc, 3)
+        self.assertIn('read back 3 of 4 bytes', out['error'])
+
+    def test_save_is_exclusive_exact_and_kept_when_short(self):
+        mem = self.d / 'flash.bin'
+        mem.write_bytes(bytes(range(256)) * 4)
+        target = self.d / 'pristine.bin'
+        rc, out, err = self.run_cli('k64f', *LINK, '--save', '0x10', '32', str(target), FAKE_MEM=str(mem))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(target.read_bytes(), bytes(range(16, 48)))
+        self.assertEqual(out['saves'], [{'file': str(target), 'address': '0x00000010', 'size': 32, 'bytes': 32,
+                                         'complete': True, 'sha256': hashlib.sha256(bytes(range(16, 48))).hexdigest()}])
+        rc, out, err = self.run_cli('k64f', *LINK, '--save', '0x10', '32', str(target), FAKE_MEM=str(mem))
+        self.assertEqual(rc, 2)
+        self.assertIn('never overwrites', err)
+        self.assertEqual(len(self.sessions()), 1)
+        short = self.d / 'short.bin'
+        rc, out, err = self.run_cli('max32', '--save', '0x20', '16', str(short), FAKE_MEM=str(mem),
+                                    FAKE_MEM_BASE='0', FAKE_MODE='short')
+        self.assertEqual(rc, 3)
+        self.assertIn('incomplete', out['error'])
+        self.assertEqual((out['saves'][0]['complete'], out['saves'][0]['bytes'], len(short.read_bytes())),
+                         (False, 15, 15))
+        failed = self.d / 'failed.bin'
+        rc, out, err = self.run_cli('max32', '--save', '0x20', '16', str(failed), FAKE_MODE='fail')
+        self.assertEqual(rc, 3)
+        self.assertEqual(out['saves'][0]['complete'], False)
+        self.assertTrue(failed.exists())
+
+    def test_connection_identity_and_core_states(self):
+        rc, out, err = self.run_cli('k64f', *LINK, FAKE_SN='123')
+        self.assertEqual(rc, 3)
+        self.assertIn('S/N 123, not the requested 000621000000', out['error'])
+        rc, out, err = self.run_cli('max32', FAKE_CURRENT='rp2040.core0', FAKE_CORES='rp2040.core1=00040001',
+                                    FAKE_CORES_AFTER='rp2040.core1=00030003', FAKE_DHCSR='01000001')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['connection'], {'serial': 'E6614C311B597D32'})
+        running = {'raw': '0x01000001', 'halted': False, 'sleeping': False}
+        self.assertEqual(out['cores'], {
+            'rp2040.core0': {'current': True, 'before': running, 'after': running},
+            'rp2040.core1': {'current': False, 'before': {'raw': '0x00040001', 'halted': False, 'sleeping': True},
+                             'after': {'raw': '0x00030003', 'halted': True, 'sleeping': False}}})
+        script = self.logged()['script'].splitlines()
+        first_dhcsr = next(i for i, ln in enumerate(script) if ln.startswith('rd DHCSR'))
+        self.assertLess(first_dhcsr, next(i for i, ln in enumerate(script) if 'format "TB' in ln))
+        (self.d / 'ram.bin').write_bytes(bytes(16))
+        rc, out, err = self.run_cli('max32', '--save', '0x20000000', '4', str(self.d / 'end.bin'),
+                                    FAKE_MEM=str(self.d / 'ram.bin'), FAKE_MEM_BASE='20000000',
+                                    FAKE_DHCSR='01000001,01000001,00030003')
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(out['cores']['max32665.cpu']['after']['halted'])    # the reading at the capture's end
+        rc, out, err = self.run_cli('max32', FAKE_CORES='a=1', FAKE_CORES_AFTER='b=1')
+        self.assertEqual(rc, 3)
+        self.assertIn('incomplete core listing', out['error'])
+
+    def test_rp2040_flash_reads_are_refused_before_the_probe(self):
+        elf = self.d / 'fw.elf'
+        elf.write_bytes(elf32([(0x1000_0000, b'abcd')], SYMS))
+        for args in (('--save', '0x10000000', '16', str(self.d / 'x.bin')),
+                     ('--save', '0x1400001c', '4', str(self.d / 'x.bin')), ('--elf', str(elf), '--read', 'flash_var')):
+            rc, out, err = self.run_cli('pico', *args)
+            self.assertEqual(rc, 2, args)
+            self.assertIn('RP2040 XIP region', err)
+        self.assertFalse(self.log.exists())
+        self.assertFalse((self.d / 'x.bin').exists())
+        mem = self.d / 'ram.bin'
+        mem.write_bytes(bytes(64))
+        rc, out, err = self.run_cli('pico', '--elf', str(elf), '--read', 'g_count', FAKE_MEM=str(mem),
+                                    FAKE_MEM_BASE='20000000')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['reads']['values'][0]['value'], 0)
+
     def test_a_core_that_is_not_m_profile_is_not_interpreted(self):
         rc, out, err = self.run_cli('max32', FAKE_CPUID='00000000')
         self.assertEqual(rc, 3)
@@ -631,8 +867,12 @@ class ProbeStateCliTest(unittest.TestCase):
                                                                   '--speed must be kHz'),
                  ('max32', ('--speed', '4000'), 'J-Link only'), ('max32', ('--base', '0x0'), 'goes with --verify'),
                  ('max32', ('--verify', str(bin_)), 'give --base'),
-                 ('max32', ('--verify', str(bin_), '--base', 'flash'), 'not an address'),
-                 ('max32', ('--samples', '0'), '--samples'), ('max32', ('--timeout', 'nan'), '--timeout')]
+                 ('max32', ('--verify', str(bin_), '--base', 'flash'), 'not a number'),
+                 ('max32', ('--samples', '0'), '--samples'), ('max32', ('--timeout', 'nan'), '--timeout'),
+                 ('max32', ('--read', 'x'), '--read needs --elf'), ('max32', ('--elf', str(bin_)), '--elf without'),
+                 ('max32', ('--save', '0x40000000', '4', str(self.d / 'p.bin')), 'not within'),
+                 ('max32', ('--save', '0x20000000', '4', str(self.d / 'bad name.bin')), 'characters'),
+                 ('max32', ('--save', '0x20000000', 'four', str(self.d / 'q.bin')), 'not a number')]
         for board, args, want in cases:
             rc, out, err = self.run_cli(board, *args)
             self.assertEqual(rc, 2, (board, args, err))

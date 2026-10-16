@@ -18,8 +18,11 @@ python3 <skill dir>/scripts/pc_sample.py --probe <uid> --device <JLINK_DEVICE> -
 ```
 
 TRCENA is 0 after a power-on reset, and an ARMv6-M core reset clears it too; `DWT_PCSR` is then UNKNOWN (ARMv6-M/v7-M)
-or 0xFFFFFFFF (Armv8-M). Set it from a debugger session before sampling (read DEMCR, `w4 E000EDFC` with bit 24 added);
-the script itself never writes.
+or 0xFFFFFFFF (Armv8-M). The probe tools set it at connect: J-Link Commander V9.78 (verified 2026-10-16 stm32f407disco:
+cleared by hand, held clear for 2 s with the core running, set again at the next connect) and OpenOCD, whose cortex_m
+examine replaces DEMCR with TRCENA plus its own vector-catch bits (`cortex_m.c` in 0.12.0+dev-g0ce743125). Through them
+it reads set; a tool that leaves it clear needs it set from a debugger session (read DEMCR, `w4 E000EDFC` with bit 24
+added). The script itself never writes.
 
 The histogram's top entries are the spin site; a flat histogram = core is servicing normally — and an idle loop has a
 hot spot of its own: learn it from a healthy run before reading a wedged one. A core halted from a JLinkExe session is
@@ -31,18 +34,44 @@ histogram, without symbols; `--samples` sets the count.
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 
 One JSON object of what the probe sees on a Cortex-M board, with the board lock already held (the script takes none):
-CPUID, DHCSR before and after, DEMCR, N `DWT_PCSR` samples, and with `--verify` the image's address ranges read back and
-compared on the host:
+CPUID, DHCSR before and after, DEMCR, N `DWT_PCSR` samples, and on request the breakpoint budget, static variables read
+through the ELF, raw regions saved to files, and the image's address ranges read back and compared on the host:
 
 ```bash
 python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [--interface swd --speed 4000] \
-  [--samples N] [--interval-ms M] [--allow-halt] [--verify <flashed.elf> | --verify <fw.bin> --base <flash addr>]
-#   exit 0 observed, 1 verify mismatch, 2 usage, 3 probe/tool failed or core not M-profile
+  [--samples N] [--interval-ms M] [--allow-halt] [--budget] \
+  [--verify <flashed.elf> | --verify <fw.bin> --base <flash addr>] \
+  [--elf <flashed.elf> --read <symbol> ...] [--save <addr> <len> <new file> ...]
+#   exit 0 observed, 1 verify mismatch, 2 usage, 3 probe/tool failed, capture or save incomplete, wrong probe
+#   connected, core not M-profile, or a halt read left the core halted
 ```
 
-- It writes nothing to the target and halts only with `--allow-halt`, when no sample was usable from a running core.
-  `--verify` reads memory back (J-Link `savebin`, OpenOCD `dump_image`) rather than run `verify_image`, whose checksum
-  path writes its CRC loader into the target's work area first (`armv7m_checksum_memory`), even on a running core.
+- The script issues no configuration write; the connect does (PC-sampling above: the tools set TRCENA, OpenOCD also
+  DHCSR.C_DEBUGEN), so `demcr` is the tool's value, not the firmware's. It halts only with `--allow-halt`, when no
+  sample was usable from a running core; over OpenOCD it refuses that on a multi-core target, where the SMP halt stops
+  every core and the resume fails for a core OpenOCD never polled, leaving it halted (OpenOCD 0.12.0+dev-g0ce743125,
+  `cortex_m_restore_smp`; RP2040 core1, verified 2026-10-16), and OpenOCD's resume error is unreliable there in both
+  directions, so judge each core by its DHCSR. Reads use J-Link `savebin` and OpenOCD `dump_image`, never
+  `verify_image`, whose checksum path writes its CRC loader into the target's work area first
+  (`armv7m_checksum_memory`), even on a running core.
+- `--budget`: `fpCtrl.numCode` is the hardware breakpoint count (FP_CTRL bits [7:4] and [14:12]; ARMv6-M's BP_CTRL
+  reserves the high bits), `dwtCtrl.numComp` the watchpoint comparators, reported only while TRCENA is set since the DWT
+  registers read UNKNOWN otherwise (ARMv7-M ARM C1-839, ARMv6-M ARM C1-339).
+- `--read <symbol>` with `--elf` (a linked executable): the symbol table places it offline; exactly one definition, a
+  sized data object in a section the image loads as data, inside Code, SRAM or RAM (peripheral and system space refused:
+  a read there can have side effects), widths 1, 2, 4 and 8 decoded, every read keeps its bytes. `reads.snapshot` is
+  `false` on purpose: a running core changes memory between reads, and DHCSR before and after only says whether it ran.
+- `--save <addr> <len> <new file>`: a raw region copy with its hash, refusing an existing file; an incomplete copy is
+  kept and reported `complete: false`. It proves nothing about what restores the board, and a region read on a running
+  core is not coherent. The address rule is architectural: a vendor device mapped inside Code, SRAM or RAM is yours to
+  avoid. On RP2040 the whole XIP region (0x10000000-0x1FFFFFFF: flash and its aliases, the XIP controller, SSI; RP2040
+  datasheet §2.2.2) is refused for `--read` and `--save`, since the controller registers have read side effects (XIP
+  `STREAM_FIFO`); flash verification there is `rp2040_verify.py`'s.
+- `connection` is the probe the tool actually connected to (J-Link serial and VTref, CMSIS-DAP serial, ST-Link target
+  voltage); a J-Link whose serial is not the requested one ends the run. `otherProbeClients` lists probe tools in the
+  process list as a possible conflict, not as proof that the probe is free, and never replaces the lock. OpenOCD boards
+  report each core's DHCSR before and after as `cores`, judged from the register since OpenOCD's own state stays
+  `unknown` until it polls; reading another core's DHCSR clears its sticky bits.
 - `pcsr.status`: `sampled`; `no-address` (only 0xFFFFFFFF or 0: halted, address unavailable, or non-invasive debug not
   permitted); `not-implemented` (all 0: RAZ, a core built without PCSR); `dwt-disabled` (DEMCR bit 24 clear: the values
   are UNKNOWN, Armv8-M returns 0xFFFFFFFF). On ARMv6-M (M0, M0+, M1) PCSR is implementation defined (ARMv6-M ARM book

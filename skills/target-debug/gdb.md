@@ -59,11 +59,12 @@ break <the USB ISR>                         # works, but see warning below
 ```
 
 **Hardware budget — read it off the chip** (Cortex-M FPB/DWT, verified: F407/M4 = 6 bp + 4 wp, rp2040/M0+ = 4 + 2; M7
-typically 8/4; Espressif: `espressif.md`, Attach, "Breakpoint budgets"):
+typically 8/4; Espressif: `espressif.md`, Attach, "Breakpoint budgets"): `probe_state.py --budget` reads both without
+halting (`techniques.md`, "Probe state"); from an open gdb session:
 
 ```gdb
 p ((*(unsigned*)0xE0002000)>>4) & 0xF   # FPB NUM_CODE = hw breakpoints (M7 adds bits[14:12])
-p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparators
+p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparators (UNKNOWN while DEMCR.TRCENA is 0)
 ```
 
 - `hbreak`/`thbreak` force a hardware breakpoint (software breaks in flash need flash-breakpoint support — J-Link has
@@ -111,6 +112,7 @@ blocked at "Connecting to J-Link" meanwhile. verified 2026-09-18.
   halted: resume it from a new session. verified 2026-10-12 mimxrt1060_evk.
 - `JLinkExe` can crash in `libjlinkarm` at the probe connect, before the target connect (SIGSEGV; once a glibc
   double-free abort); the cause is unknown. verified 2026-10-12 htpc, mimxrt1060_evk: 2 of 94 sessions of TinyUF2's HIL
-  runner.
+  runner; 2026-10-16 ci.lan, stm32f407disco's J-Link OB, V9.78: a double-free abort then a SIGSEGV on consecutive
+  sessions, the next ones clean. A script driving it reports the crash and retries nothing; rerun the session.
 - Keep the probe off the hub of a device that hangs mid-write: the xHCI keeps retrying its enumeration, and a J-Link
   there stalled for ~80 s. verified 2026-10-12 lpcxpresso55s69 (that the hub is the cause is a hypothesis).

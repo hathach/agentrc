@@ -159,8 +159,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
 
 - PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py`, reading the histogram; native probes through
   `probe_state.py`.
-- Probe-state snapshot (DHCSR anchor, PCSR samples, image read-back for Cleanup's verification): `techniques.md`, "Probe
-  state" — `probe_state.py`.
+- Probe-state snapshot (DHCSR anchor, PCSR samples, breakpoint budget, symbol reads, region saves, image read-back for
+  Cleanup's verification): `techniques.md`, "Probe state" — `probe_state.py`.
 - SWO exception trace, hardware PC-sampling, DWT data trace: `swo-dwt.md`.
 - Vector catch and the fault registers: `fault-autopsy.md`.
 - RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code, the `nm` check, the GDB dump.
