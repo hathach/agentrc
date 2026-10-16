@@ -25,7 +25,8 @@ The histogram's top entries are the spin site; a flat histogram = core is servic
 hot spot of its own: learn it from a healthy run before reading a wedged one. A core halted from a JLinkExe session is
 running again once that session exits (Commander restores the run state it found; seen 2026-09-18 on RP2350), so the
 sentinel means the target halted or slept by itself. Native probes (ST-Link/CMSIS-DAP) are not covered by the script
-yet: repeat `mdw 0xE000101C` over OpenOCD's telnet :4444 by hand.
+yet: `probe_state.py` (next section) samples PCSR over OpenOCD from the board's HIL entry and reports the raw PC
+histogram, without symbols; `--samples` sets the count.
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 
