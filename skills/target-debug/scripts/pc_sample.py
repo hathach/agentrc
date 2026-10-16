@@ -47,6 +47,7 @@ DEMCR_TRCENA = 1 << 24  # DWTENA on ARMv6-M; DWT reads are invalid while it is 0
 SENTINEL = 0xFFFFFFFF
 # "E000101C = 20000ABC" — JLinkExe may prefix the line with its "J-Link>" prompt
 _MEM32_RE = re.compile(r'([0-9A-Fa-f]{8}) = ([0-9A-Fa-f]{8})')
+SPEED_RE = re.compile(r'[1-9][0-9]*|auto|adaptive')
 
 
 class ToolError(RuntimeError):
@@ -102,6 +103,8 @@ def sample(probe, device, interface, speed, samples, interval_ms, timeout):
 
 
 def probe_state_module():
+    # run as a script, this module is __main__: register it so probe_state's import shares ToolError
+    sys.modules.setdefault('pc_sample', sys.modules[__name__])
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     try:
         import probe_state
@@ -114,12 +117,8 @@ def sample_openocd(backend, samples, interval_ms, timeout):
     """(pcs, [dhcsr before, after], {other core: (before, after)}) through probe_state's session."""
     ps = probe_state_module()
     cap = ps.Capture(samples, interval_ms, False, [])
-    try:
-        vals = cap.unpack(backend.observe(cap, timeout))
-    except ps.ToolError as e:
-        raise ToolError(str(e)) from e
-    if vals['cpuid'] >> 16 & 0xF not in ps.M_PROFILE_ARCH:
-        raise ToolError(f"the target does not identify as an M-profile core (CPUID 0x{vals['cpuid']:08x})")
+    vals = cap.unpack(backend.observe(cap, timeout))
+    ps.check_m_profile(vals['cpuid'])
     if not vals['demcr'] & DEMCR_TRCENA:
         raise ToolError(f"DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{vals['demcr']:08x}): DWT_PCSR samples "
                         f'are not valid while trace is disabled; enable trace from a debugger session first')
@@ -162,10 +161,9 @@ RECOVER_TCL = (f'if {{[llength [target names]] > 1}} {{error "not touched: [llen
 
 
 def recover(backend, timeout):
-    ps = probe_state_module()
     try:
         _, reads = backend.batch(RECOVER_TCL, timeout)
-    except ps.ToolError as e:
+    except ToolError as e:
         return f'; the recovery session failed too ({e}): check the core with probe_state.py'
     dhcsr = [v for name, v in reads if name == 'DHCSR']
     if len(dhcsr) != 2:
@@ -181,7 +179,7 @@ def halt_samples(backend, n, halt_timeout_ms, interval_ms, timeout):
     ps = probe_state_module()
     try:
         text, reads = backend.batch(halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
-    except ps.ToolError as e:
+    except ToolError as e:
         # recover only a core this session showed running on a single-core target before halting it;
         # openocd flushes each echo at once (log_puts in log.c), so GUARDED is out before the first halt
         if re.search(r'^GUARDED$', getattr(e, 'text', ''), re.M):
@@ -342,17 +340,13 @@ def main(argv=None):
             if flasher['name'] == 'openocd':
                 if a.probe or a.device:
                     raise ValueError('--probe and --device are J-Link flags; an openocd board takes its HIL entry')
-                ps = probe_state_module()
-                try:
-                    _, _, backend = ps.resolve(a, p)
-                except ps.ToolError as e:
-                    raise ValueError(str(e))
+                _, _, backend = probe_state_module().resolve(a, p)
             elif flasher['name'] != 'jlink':
                 raise ValueError(f"--board {a.board} is flashed over {flasher['name']!r}; pc_sample.py "
                                  f"samples over a J-Link or openocd only")
             else:
                 hil_merge(a, a.board, probe=flasher.get('uid'), device=hil_jlink_device(a.board, flasher))
-        except ValueError as e:
+        except (ValueError, ToolError) as e:
             p.error(str(e))
     if a.halt_samples < 0 or a.halt_timeout_ms <= 0:
         p.error('--halt-samples must be non-negative, --halt-timeout-ms positive')
@@ -365,7 +359,7 @@ def main(argv=None):
             p.error('--probe and --device must not be empty')
         if not (a.interface and a.speed):
             p.error('a J-Link needs --interface and --speed')
-        if not re.fullmatch(r'[1-9][0-9]*|auto|adaptive', a.speed):
+        if not SPEED_RE.fullmatch(a.speed):
             p.error(f'--speed must be kHz, "auto" or "adaptive", got {a.speed!r}')
     if a.samples <= 0 or a.interval_ms < 0 or a.top <= 0:
         p.error('--samples and --top must be positive, --interval-ms non-negative')

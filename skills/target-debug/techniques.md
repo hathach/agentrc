@@ -31,10 +31,8 @@ slept by itself, but a J-Link session does not leave that state alone: it halts 
 unless told `exec SetRestartOnClose = 0` (V9.78, verified 2026-10-16 stm32f407disco: DFSR.HALTED set after every plain
 session; a core found halted ran at the next session; with the setting, a running core stayed halted). An openocd HIL
 board (CMSIS-DAP) is sampled through `probe_state.py`'s OpenOCD session, which also reports the other cores' DHCSR.
-`--halt-samples N` is the explicit fallback for a core with no usable PCSR: only when the samples gave none from a
-running core, only on a single-core target, each halt resumed and checked by DHCSR, stopping at the first failure, and a
-session that dies mid-loop followed by one that resumes the core; those PCs are reported apart, as halt reads. ST-Link
-entries carry no OpenOCD configuration and are not covered.
+`--halt-samples N` is the explicit halting fallback for a single-core openocd board with no usable PCSR, its PCs
+reported apart as halt reads (`--help`). ST-Link entries carry no OpenOCD configuration and are not covered.
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 
@@ -60,19 +58,12 @@ python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [-
   is unreliable there in both directions, so judge each core by its DHCSR. Reads use J-Link `savebin` and OpenOCD
   `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area first
   (`armv7m_checksum_memory`), even on a running core.
-- `--budget`: `fpCtrl.numCode` is the hardware breakpoint count (FP_CTRL bits [7:4] and [14:12]; ARMv6-M's BP_CTRL
-  reserves the high bits), `dwtCtrl.numComp` the watchpoint comparators, reported only while TRCENA is set since the DWT
-  registers read UNKNOWN otherwise (ARMv7-M ARM C1-839, ARMv6-M ARM C1-339).
-- `--read <symbol>` with `--elf` (a linked executable): the symbol table places it offline; exactly one definition, a
-  sized data object in a section the image loads as data, inside Code, SRAM or RAM (peripheral and system space refused:
-  a read there can have side effects), widths 1, 2, 4 and 8 decoded, every read keeps its bytes. `reads.snapshot` is
-  `false` on purpose: a running core changes memory between reads, and DHCSR before and after only says whether it ran.
-- `--save <addr> <len> <new file>`: a raw region copy with its hash, refusing an existing file; an incomplete copy is
-  kept and reported `complete: false`. It proves nothing about what restores the board, and a region read on a running
+- `--budget`, `--read` and `--save` follow the rules in `--help` (which registers, which symbols, which address
+  ranges). `reads.snapshot` is `false` on purpose: a running core changes memory between reads, and DHCSR before and
+  after only says whether it ran. A save proves nothing about what restores the board, and a region read on a running
   core is not coherent. The address rule is architectural: a vendor device mapped inside Code, SRAM or RAM is yours to
-  avoid. On RP2040 the whole XIP region (0x10000000-0x1FFFFFFF: flash and its aliases, the XIP controller, SSI; RP2040
-  datasheet §2.2.2) is refused for `--read` and `--save`, since the controller registers have read side effects (XIP
-  `STREAM_FIFO`); flash verification there is `rp2040_verify.py`'s.
+  avoid. RP2040's XIP region is refused (its controller registers have read side effects); flash verification there is
+  `rp2040_verify.py`'s.
 - `connection` is the probe the tool actually connected to (J-Link serial and VTref, CMSIS-DAP serial, ST-Link target
   voltage); a J-Link whose serial is not the requested one ends the run. `otherProbeClients` lists probe tools in the
   process list as a possible conflict, not as proof that the probe is free, and never replaces the lock. OpenOCD boards

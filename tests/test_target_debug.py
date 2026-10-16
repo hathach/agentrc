@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from unittest import mock
 from pathlib import Path
 
@@ -600,6 +601,17 @@ class ProbeStateUnitTest(unittest.TestCase):
         self.assertTrue(probe_state.dhcsr_state(1 << 18)['sleeping'])
         self.assertTrue(probe_state.dhcsr_state(1 << 19)['lockup'])
 
+    def test_openocd_gdb_server_command(self):
+        with unittest.mock.patch.dict(os.environ, {'PROBE_STATE_OPENOCD': sys.executable}):
+            ocd = probe_state.OpenOCD('SN1', '-f target/x.cfg -c "gdb_port disabled"', None)
+        self.assertEqual(ocd.cmd, [sys.executable, '-c', 'tcl_port disabled', '-c', 'gdb_port disabled', '-c',
+                                   'telnet_port disabled', '-c', 'adapter serial SN1', '-f', 'target/x.cfg', '-c',
+                                   'gdb_port disabled'])
+        cmd = ocd.command(gdb_port=3333)
+        self.assertNotIn('gdb_port disabled', cmd)
+        self.assertEqual(cmd.count('gdb port 3333'), 2)
+        self.assertEqual(cmd[4:7], ['gdb port 3333', '-c', 'gdb memory_map disable'])
+
     def test_cpuid_architecture(self):
         self.assertEqual(probe_state.cpuid_state(0x410CC601)['architecture'], 'armv6-m or armv8-m baseline')
         self.assertEqual(probe_state.cpuid_state(0x410FC241)['partno'], '0xc24')
@@ -806,23 +818,35 @@ class PcSampleHaltTclTest(unittest.TestCase):
         self.assertIn('refused: 2 cores (tgt tgt2)', err)
 
 
-@unittest.skipIf(os.name == 'nt', 'openocd and addr2line stubs require POSIX executable semantics')
-class PcSampleOpenOCDTest(unittest.TestCase):
+class FakeToolsCase(unittest.TestCase):
+    """A temp dir of fake tools first on PATH, the state HIL config and a FAKE_LOG of their sessions."""
+    tools = ()
+
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         self.d = Path(self._dir.name)
-        for name, body in (('openocd', FAKE_OPENOCD_STATE), ('JLinkExe', FAKE_JLINK),
-                           ('fake-addr2line', FAKE_ADDR2LINE)):
+        for name, body in self.tools:
             f = self.d / name
             f.write_text(body)
             f.chmod(f.stat().st_mode | stat.S_IEXEC)
         self.config = self.d / 'hil.json'
         self.config.write_text(json.dumps({'boards': STATE_BOARDS}))
-        self.elf = self.d / 'fw.elf'
-        self.elf.write_bytes(b'\x7fELF')
         self.log = self.d / 'log.json'
         self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log)}
+
+    def sessions(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+
+@unittest.skipIf(os.name == 'nt', 'openocd and addr2line stubs require POSIX executable semantics')
+class PcSampleOpenOCDTest(FakeToolsCase):
+    tools = (('openocd', FAKE_OPENOCD_STATE), ('JLinkExe', FAKE_JLINK), ('fake-addr2line', FAKE_ADDR2LINE))
+
+    def setUp(self):
+        super().setUp()
+        self.elf = self.d / 'fw.elf'
+        self.elf.write_bytes(b'\x7fELF')
 
     def run_cli(self, board, *args, **env):
         return subprocess.run([sys.executable, str(SCRIPT), '--hil-config', str(self.config), '--board', board,
@@ -830,7 +854,7 @@ class PcSampleOpenOCDTest(unittest.TestCase):
                               capture_output=True, text=True, timeout=30, env={**self.env, **env}, cwd='/')
 
     def scripts(self):
-        return [json.loads(line)['script'] for line in self.log.read_text().splitlines()]
+        return [s['script'] for s in self.sessions()]
 
     def test_an_openocd_board_samples_through_probe_state(self):
         r = self.run_cli('max32', '--samples', '3', '--halt-samples', '4', FAKE_PCSR='08001000,08001000,08002000',
@@ -855,14 +879,14 @@ class PcSampleOpenOCDTest(unittest.TestCase):
         self.assertIn('halting fallback: openocd: resume 0 failed', r.stderr)
 
     def test_a_stalled_fallback_is_killed_then_recovered(self):
-        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', '--timeout', '3', FAKE_PCSR='FFFFFFFF',
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', '--timeout', '2', FAKE_PCSR='FFFFFFFF',
                          FAKE_HALT_STALL='1', FAKE_STATE=str(self.d / 'state'))
         self.assertEqual(r.returncode, 1)
-        self.assertIn('did not finish within 3 s', r.stderr)
+        self.assertIn('did not finish within 2 s', r.stderr)
         self.assertIn('the core was left halted, resumed: now running (DHCSR 0x01010001)', r.stderr)
         self.assertEqual((self.d / 'state').read_text(), '01010001')
         self.log.unlink()
-        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', '--timeout', '3', FAKE_PCSR='FFFFFFFF',
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', '--timeout', '2', FAKE_PCSR='FFFFFFFF',
                          FAKE_HALT_STALL='early')
         self.assertEqual(r.returncode, 1)
         self.assertIn('stopped before its guards passed, so it halted nothing', r.stderr)
@@ -896,22 +920,14 @@ class PcSampleOpenOCDTest(unittest.TestCase):
         r = self.run_cli('k64f')
         self.assertEqual(r.returncode, 2)
         self.assertIn('a J-Link needs --interface and --speed', r.stderr)
+        r = self.run_cli('max32', PROBE_STATE_OPENOCD='no-such-openocd')
+        self.assertEqual(r.returncode, 2)    # probe_state's ToolError is pc_sample's when run as a script
+        self.assertIn('no-such-openocd not found', r.stderr)
 
 
 @unittest.skipIf(os.name == 'nt', 'JLinkExe and openocd stubs require POSIX executable semantics')
-class ProbeStateCliTest(unittest.TestCase):
-    def setUp(self):
-        self._dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._dir.cleanup)
-        self.d = Path(self._dir.name)
-        for name, body in (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE)):
-            f = self.d / name
-            f.write_text(body)
-            f.chmod(f.stat().st_mode | stat.S_IEXEC)
-        self.config = self.d / 'hil.json'
-        self.config.write_text(json.dumps({'boards': STATE_BOARDS}))
-        self.log = self.d / 'log.json'
-        self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log)}
+class ProbeStateCliTest(FakeToolsCase):
+    tools = (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE))
 
     def run_cli(self, board, *args, **env):
         r = subprocess.run([sys.executable, str(PROBE_STATE), '--hil-config', str(self.config), '--board', board,
@@ -921,9 +937,6 @@ class ProbeStateCliTest(unittest.TestCase):
 
     def logged(self, session=-1):
         return self.sessions()[session]
-
-    def sessions(self):
-        return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def test_jlink_observation(self):
         rc, out, err = self.run_cli('k64f', *LINK, '--samples', '4', '--interval-ms', '3',
@@ -1175,32 +1188,21 @@ AUTOPSY = SCRIPT.parent / 'autopsy.py'
 
 
 @unittest.skipIf(os.name == 'nt', 'gdb, server and probe stubs require POSIX executable semantics')
-class AutopsyCliTest(unittest.TestCase):
+class AutopsyCliTest(FakeToolsCase):
+    tools = (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE), ('arm-none-eabi-gdb', FAKE_GDB),
+             ('JLinkGDBServer', FAKE_JLINK_GDBSERVER))
+
     def setUp(self):
-        self._dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self._dir.cleanup)
-        self.d = Path(self._dir.name)
-        for name, body in (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE),
-                           ('arm-none-eabi-gdb', FAKE_GDB), ('JLinkGDBServer', FAKE_JLINK_GDBSERVER)):
-            f = self.d / name
-            f.write_text(body)
-            f.chmod(f.stat().st_mode | stat.S_IEXEC)
-        self.config = self.d / 'hil.json'
-        self.config.write_text(json.dumps({'boards': STATE_BOARDS}))
+        super().setUp()
         self.elf = self.d / 'fw.elf'
         self.elf.write_bytes(elf32([(0x0800_0000, b'abcd')], SYMS))
-        self.log = self.d / 'log.json'
-        self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
-                    'FAKE_STATE': str(self.d / 'state'), 'FAKE_STOP': str(self.d / 'stop')}
+        self.env.update(FAKE_STATE=str(self.d / 'state'), FAKE_STOP=str(self.d / 'stop'))
 
     def run_cli(self, board, *args, out='out', **env):
         r = subprocess.run([sys.executable, str(AUTOPSY), '--hil-config', str(self.config), '--board', board,
                             '--elf', str(self.elf), '--out', str(self.d / out), *args],
                            capture_output=True, text=True, timeout=60, env={**self.env, **env}, cwd='/')
         return r.returncode, json.loads(r.stdout) if r.stdout.strip() else None, r.stderr
-
-    def sessions(self):
-        return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def gdb_commands(self):
         argv = next(s['argv'] for s in self.sessions() if s['script'] == 'gdb')
@@ -1311,9 +1313,9 @@ class AutopsyCliTest(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn('gdb session incomplete (exit 1, no DHCSR, PC, ICSR, backtrace)', out['error'])
         self.assertIn('after', out)
-        rc, out, err = self.run_cli('k64f', *LINK, '--timeout', '2', out='out2', FAKE_GDB_HANG='1')
+        rc, out, err = self.run_cli('k64f', *LINK, '--timeout', '1', out='out2', FAKE_GDB_HANG='1')
         self.assertEqual(rc, 3)
-        self.assertIn('did not finish within 2 s', out['error'])
+        self.assertIn('did not finish within 1 s', out['error'])
         rc, out, err = self.run_cli('k64f', *LINK, '--dump', '0x20000000', '16', str(self.d / 'd.bin'), out='out3',
                                     FAKE_GDB_SHORT='1')
         self.assertEqual(rc, 1)
@@ -1321,15 +1323,15 @@ class AutopsyCliTest(unittest.TestCase):
         rc, out, err = self.run_cli('k64f', *LINK, out='out4', FAKE_DHCSR='01030003', FAKE_GDB_EXIT='42')
         self.assertEqual(rc, 3)
         self.assertIn('gdb session incomplete (exit 42, no PC, ICSR, backtrace)', out['error'])
-        rc, out, err = self.run_cli('max32', '--timeout', '2', out='out5', FAKE_GDB_HANG_ATTACHED='1')
+        rc, out, err = self.run_cli('max32', '--timeout', '1', out='out5', FAKE_GDB_HANG_ATTACHED='1')
         self.assertEqual(rc, 3)
-        self.assertIn('did not finish within 2 s', out['error'])
+        self.assertIn('did not finish within 1 s', out['error'])
         self.assertTrue(out['restored'])
         self.assertFalse(out['after']['cores']['max32665.cpu']['halted'])
 
     def test_a_core_found_halted_that_ran_is_reported(self):
         # gdb dies before it can ask the J-Link server not to restart the core at close
-        rc, out, err = self.run_cli('k64f', *LINK, '--timeout', '2', FAKE_DHCSR='01030003',
+        rc, out, err = self.run_cli('k64f', *LINK, '--timeout', '1', FAKE_DHCSR='01030003',
                                     FAKE_GDB_HANG_ATTACHED='1')
         self.assertEqual(rc, 3)
         self.assertIn('core found halted, ran after the attach (afterServer)', out['error'])
@@ -1432,7 +1434,7 @@ class AutopsyCliTest(unittest.TestCase):
         (self.d / 'taken').mkdir()
         cases = [(('--dump', '0x40000000', '4', str(self.d / 'p.bin')), 'not within'),
                  (('--dump', '0x20000000', '4', str(self.d / 'exists.bin')), 'never overwrites'),
-                 (('--dump', '0x20000000', '4', str(self.d / 'out' / 'server.log')), 'a transcript of --out'),
+                 (('--dump', '0x20000000', '4', str(self.d / 'out' / 'server.log')), 'a file this script writes'),
                  (('--expr', ''), 'one non-empty line'), (('--timeout', '0'), '--timeout')]
         for args, want in cases:
             rc, out, err = self.run_cli('k64f', *LINK, *args)

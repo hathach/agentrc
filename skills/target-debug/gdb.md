@@ -50,13 +50,18 @@ chip (`espressif.md`, Attach, Anchors). Symbolize with the ELF that is actually 
 wedged; do not rebuild while the wedge is still on the board. The names to put in these slots are the project's
 (`projects/<name>.md` when the skill keeps notes for it, else read the stack and the port driver first):
 
-On a Cortex-M rig board, `autopsy.py` runs this as one bounded session: DHCSR of each core before the attach, PC, its
-symbol, a backtrace, ICSR, your read-only expressions and dumps while halted, the resume when every core was running,
-and the end state from a separate probe session, restored and observed once more when a core found running was left
-halted. gdb runs with writes, calls and breakpoint insertion off; a core found halted is never resumed, a multi-core
-target found with mixed states is refused (the attach halts every core), and a run that cannot say what it left (a
-failed J-Link anchor with no state read) says so. `--out` keeps gdb's values (`gdb.log`), its errors (`gdb.err`) and
-the server's log:
+```gdb
+p/x <device stack's endpoint state table>   # busy/stalled/claimed per endpoint
+p <host stack's per-device state>           # addr, enum/config
+p/x <port's private state>                  # per-port names — read the port driver first
+x/8wx <USB peripheral base>                 # raw regs: only ranges the manual documents as side-effect-free
+                                            #   (DWC2: a read of GRXSTSP 0x20 pops the RxFIFO; families.md)
+watch  <port's transfer bookkeeping field>  # HW watchpoint (Cortex-M: ~4; Espressif: espressif.md)
+break <the USB ISR>                         # works, but see warning below
+```
+
+On a Cortex-M rig board, `autopsy.py` runs the read-only part of this as one bounded session and checks that each core
+is left as found (`--help`); `--out` keeps gdb's values (`gdb.log`), its errors (`gdb.err`) and the server's log:
 
 ```bash
 python3 <skill dir>/scripts/autopsy.py --hil-config <file> --board <name> [--interface swd --speed 4000] \
@@ -71,21 +76,12 @@ started with `-singlerun` exits at the detach, and its close restarts the core u
 `monitor exec SetRestartOnClose = 0` came first (the J-Link close behaviour in `techniques.md`, PC-sampling). An SMP
 `monitor resume` restored both RP2040 cores only after `monitor foreach t [target names] {$t arp_poll}`; without it
 core1 stayed halted and openocd's next poll halted core0 again (verified 2026-10-16 raspberry_pi_pico). An openocd
-server did not stop on SIGINT there; SIGTERM stopped it. By hand:
+server did not stop on SIGINT there; SIGTERM stopped it.
 
-```gdb
-p/x <device stack's endpoint state table>   # busy/stalled/claimed per endpoint
-p <host stack's per-device state>           # addr, enum/config
-p/x <port's private state>                  # per-port names — read the port driver first
-x/8wx <USB peripheral base>                 # raw regs: only ranges the manual documents as side-effect-free
-                                            #   (DWC2: a read of GRXSTSP 0x20 pops the RxFIFO; families.md)
-watch  <port's transfer bookkeeping field>  # HW watchpoint (Cortex-M: ~4; Espressif: espressif.md)
-break <the USB ISR>                         # works, but see warning below
-```
-
-**Hardware budget — read it off the chip** (Cortex-M FPB/DWT, verified: F407/M4 = 6 bp + 4 wp, rp2040/M0+ = 4 + 2; M7
-typically 8/4; Espressif: `espressif.md`, Attach, "Breakpoint budgets"): `probe_state.py --budget` reads both without
-halting (`techniques.md`, "Probe state"); from an open gdb session:
+**Hardware budget — read it off the chip** (Cortex-M FPB/DWT, verified with `--budget` 2026-10-16: F407/M4 = 6 bp + 4
+wp, F723 and RT1064/M7 = 8 + 4, rp2040/M0+ and F072/M0 = 4 + 2; Espressif: `espressif.md`, Attach, "Breakpoint
+budgets"): `probe_state.py --budget` reads both without halting (`techniques.md`, "Probe state"); from an open gdb
+session:
 
 ```gdb
 p ((*(unsigned*)0xE0002000)>>4) & 0xF   # FPB NUM_CODE = hw breakpoints (M7 adds bits[14:12])

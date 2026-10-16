@@ -85,8 +85,8 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL,  # noqa: E402
-                       _MEM32_RE, hil_flasher, hil_jlink_device)
+from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL, SPEED_RE,  # noqa: E402
+                       ToolError, _MEM32_RE, hil_flasher, hil_jlink_device)
 
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
@@ -115,10 +115,6 @@ STT_OBJECT, STT_FUNC = 1, 2
 SHN_UNDEF, SHN_ABS, SHN_COMMON = 0, 0xFFF1, 0xFFF2
 SHT_PROGBITS, SHT_NOBITS = 1, 8
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
-
-
-class ToolError(RuntimeError):
-    pass
 
 
 def dhcsr_state(v):
@@ -377,9 +373,7 @@ class Capture:
         self.samples, self.interval_ms, self.budget, self.dumps = samples, interval_ms, budget, dumps
 
     def want(self):
-        w = ['CPUID', 'DHCSR', 'DEMCR'] + (['FPCTRL', 'DWTCTRL'] if self.budget else [])
-        w += ['PCSR'] * self.samples + ['DHCSR']
-        return w + (['DHCSR'] if self.dumps else [])
+        return [n for kind, n in self.steps() if kind == 'read']
 
     def steps(self):
         """('read', NAME) | ('sleep', ms) | ('dump', (path, addr, size))."""
@@ -415,9 +409,6 @@ class JLink:
         self.cmd = [tool('PROBE_STATE_JLINK_EXE', 'JLinkExe', 'JLink.exe'), '-device', device,
                     '-SelectEmuBySN', probe, '-if', interface, '-speed', speed, '-autoconnect', '1', '-nogui', '1']
         self.connection = {}
-        # The DLL halts the core when the session closes and restarts it only while this is set (V9.78,
-        # stm32f407disco: DFSR.HALTED set after every session); False keeps a core halted after the session.
-        self.restart_on_close = True
 
     def _identify(self, text):
         sn, vt = _JLINK_SN_RE.search(text), _JLINK_VTREF_RE.search(text)
@@ -428,10 +419,12 @@ class JLink:
         if vt:
             self.connection['vtref'] = float(vt.group(1))
 
-    def observe(self, cap, timeout):
+    def observe(self, cap, timeout, keep_halted=False):
+        """The DLL halts the core when the session closes and restarts it unless keep_halted (V9.78,
+        stm32f407disco: DFSR.HALTED set after every session)."""
         forms = {'read': lambda n: f'mem32 {self.REG[n]:X}, 1', 'sleep': lambda ms: f'Sleep {ms}',
                  'dump': lambda d: f'savebin {d[0]}, 0x{d[1]:08X}, 0x{d[2]:X}'}
-        lines = [] if self.restart_on_close else ['exec SetRestartOnClose = 0']
+        lines = ['exec SetRestartOnClose = 0'] if keep_halted else []
         lines += [forms[kind](arg) for kind, arg in cap.steps()]
         text = run(self.cmd, timeout, '\n'.join(lines + ['qc']) + '\n')
         self._identify(text)
@@ -463,13 +456,21 @@ class OpenOCD:
     REG = JLink.REG
 
     def __init__(self, probe, cfg, vid_pid):
-        self.cmd = [tool('PROBE_STATE_OPENOCD', 'openocd'), '-c', 'tcl_port disabled', '-c', 'gdb_port disabled',
-                    '-c', 'telnet_port disabled']
-        if vid_pid:
-            self.cmd += ['-c', f'adapter usb vid_pid {vid_pid}']
-        self.cmd += ['-c', f'adapter serial {probe}', *shlex.split(cfg)]
+        self.exe, self.probe, self.cfg, self.vid_pid = tool('PROBE_STATE_OPENOCD', 'openocd'), probe, cfg, vid_pid
+        self.cmd = self.command()
         self.connection = {}
-        self.current, self.others = None, {}
+        self.current, self.others, self.reset_detected = None, {}, False
+
+    def command(self, gdb_port=None):
+        # Without the memory map gdb connect probes no flash: the RP2040 probe runs ROM code that
+        # exits XIP and never re-enters it, and the resumed core faulted (rp2xxx.c in 0ce743125).
+        gdb = ['gdb_port disabled'] if gdb_port is None else [f'gdb port {gdb_port}', '-c', 'gdb memory_map disable']
+        cmd = [self.exe, '-c', 'tcl_port disabled', '-c', *gdb, '-c', 'telnet_port disabled']
+        if self.vid_pid:
+            cmd += ['-c', f'adapter usb vid_pid {self.vid_pid}']
+        # a board's own args may disable the gdb port too
+        return cmd + ['-c', f'adapter serial {self.probe}',
+                      *[x for arg in shlex.split(self.cfg) for x in (gdb if arg == 'gdb_port disabled' else [arg])]]
 
     # OpenOCD's curstate stays "unknown" until a poll, so the other cores are judged by their own DHCSR;
     # the current core's state is dhcsrBefore/dhcsrAfter, read first so its sticky bits stay this session's
@@ -519,7 +520,8 @@ class OpenOCD:
             self.connection['targetVoltage'] = float(volt.group(1))
         return text, [(n, int(v, 16)) for n, v in _OCD_READ_RE.findall(text)]
 
-    def observe(self, cap, timeout):
+    def observe(self, cap, timeout, keep_halted=False):
+        """keep_halted is J-Link's: an openocd exit never changes the run state."""
         forms = {'read': lambda n: f'rd {n} 0x{self.REG[n]:08x}',
                  'sleep': lambda ms: f'sleep {ms}',
                  'dump': lambda d: f'dump_image {{{d[0]}}} 0x{d[1]:08x} 0x{d[2]:x}'}
@@ -564,7 +566,7 @@ def resolve(a, p):
                 raise ValueError(f"--board {a.board}: a jlink entry needs flasher.args '-device NAME'")
             if not (a.interface and a.speed):
                 raise ValueError('a J-Link board needs --interface and --speed (its HIL entry has neither)')
-            if not re.fullmatch(r'[1-9][0-9]*|auto|adaptive', a.speed):
+            if not SPEED_RE.fullmatch(a.speed):
                 raise ValueError(f'--speed must be kHz, "auto" or "adaptive", got {a.speed!r}')
             backend = JLink(flasher['uid'], device, a.interface, a.speed)
             return route, {'probe': flasher['uid'], 'device': device}, backend
@@ -592,12 +594,46 @@ def parse_int(p, flag, text):
         p.error(f'{flag} {text!r} is not a number')
 
 
-def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_board_args(p):
     p.add_argument('--hil-config', required=True, metavar='FILE', help="the project's HIL config json")
     p.add_argument('--board', required=True, metavar='NAME', help='board name in --hil-config')
     p.add_argument('--interface', choices=['swd', 'jtag'], help='J-Link boards: target interface, no default')
     p.add_argument('--speed', help='J-Link boards: interface speed in kHz, "auto" or "adaptive"; no default')
+
+
+def is_rp2040(ident):
+    return 'rp2040' in (ident.get('device') or ident.get('cfg')).lower()
+
+
+def parse_regions(p, flag, triples, rp2040, reserved=()):
+    """[(absolute path, addr, size)] from ADDR LEN FILE triples, or p.error(); whether a file
+    exists is the caller's check."""
+    regions = []
+    for addr_s, len_s, path in triples:
+        addr, size = parse_int(p, flag, addr_s), parse_int(p, flag, len_s)
+        path = os.path.abspath(path)
+        try:
+            check_region(f'{flag} {path}', addr, size, rp2040)
+        except ValueError as e:
+            p.error(str(e))
+        if not SAFE_PATH.fullmatch(path):
+            p.error(f'{flag} {path}: the path has characters the probe tools would misread '
+                    f'(letters, digits, _ . / + - only)')
+        if path in [r[0] for r in regions] or path in reserved:
+            p.error(f'{flag} {path}: named twice, or a file this script writes itself')
+        regions.append((path, addr, size))
+    return regions
+
+
+def check_m_profile(cpuid):
+    if cpuid >> 16 & 0xF not in M_PROFILE_ARCH:
+        raise ToolError(f'the target does not identify as an M-profile core (CPUID 0x{cpuid:08x}): '
+                        f'DHCSR and DWT reads are not interpreted')
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_board_args(p)
     p.add_argument('--samples', type=int, default=16, help='DWT_PCSR reads (default 16)')
     p.add_argument('--interval-ms', type=int, default=0, help='pause between reads, ms (default 0)')
     p.add_argument('--allow-halt', action='store_true',
@@ -636,27 +672,16 @@ def main(argv=None):
     except ToolError as e:
         print(json.dumps({'board': a.board, 'error': str(e)}))
         return 3
-    rp2040 = 'rp2040' in (ident.get('device') or ident.get('cfg')).lower()
-    reads, saves = [], []
+    rp2040 = is_rp2040(ident)
+    reads = []
     try:
         if a.read:
             reads = resolve_reads(a.elf, a.read, rp2040)
-        seen = set()
-        for addr_s, len_s, path in a.save:
-            addr, size = parse_int(p, '--save', addr_s), parse_int(p, '--save', len_s)
-            check_region(f'--save {path}', addr, size, rp2040)
-            path = os.path.abspath(path)
-            if not SAFE_PATH.fullmatch(path):
-                raise ValueError(f'--save {path}: the path has characters the probe tools would misread '
-                                 f'(letters, digits, _ . / + - only)')
-            if path in seen:
-                raise ValueError(f'--save {path}: named twice')
-            seen.add(path)
-            saves.append((path, addr, size))
     except OSError as e:
         p.error(f'--elf {a.elf}: {e}')
     except ValueError as e:
         p.error(str(e))
+    saves = parse_regions(p, '--save', a.save, rp2040)
     created = []
     for path, _, _ in saves:
         try:
@@ -701,8 +726,10 @@ def main(argv=None):
     if backend.connection:
         result['connection'] = backend.connection
     result['cpuid'] = cpuid_state(vals['cpuid'])
-    if vals['cpuid'] >> 16 & 0xF not in M_PROFILE_ARCH:
-        return fail('the target does not identify as an M-profile core: DHCSR and DWT reads are not interpreted')
+    try:
+        check_m_profile(vals['cpuid'])
+    except ToolError as e:
+        return fail(str(e))
     demcr = vals['demcr']
     result.update(dhcsrBefore=dhcsr_state(vals['dhcsr0']), demcr={'raw': f'0x{demcr:08x}',
                                                                   'dwtEnabled': bool(demcr & DEMCR_TRCENA)})

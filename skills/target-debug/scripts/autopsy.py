@@ -57,7 +57,6 @@ failed, the run was interrupted, or the end state is not the one found (a core l
 halted, or one found halted now running).
 """
 import argparse
-import hashlib
 import json
 import math
 import os
@@ -71,7 +70,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_state  # noqa: E402
-from probe_state import Capture, JLink, OpenOCD, ToolError, core_state, cpuid_state  # noqa: E402
+from probe_state import Capture, OpenOCD, ToolError, core_state, cpuid_state  # noqa: E402
 
 ICSR = 0xE000ED04
 BACKTRACE_FRAMES = 16
@@ -80,9 +79,11 @@ OBSERVER = ['set may-write-memory off', 'set may-write-registers off', 'set may-
             'set may-insert-breakpoints off', 'set pagination off', 'set confirm off', 'set width 0']
 NO_RESTART = 'exec SetRestartOnClose = 0'
 # Every core polled before any resume: an SMP resume fails for a core OpenOCD has not polled
-# (verified 2026-10-16 raspberry_pi_pico); it also restores the others, so later ones may fail.
-# `resume` acts on the current target: a target instance has no resume command (target.c).
-OCD_RESTORE = ('foreach t [target names] {$t arp_poll}\n'
+# (verified 2026-10-16 raspberry_pi_pico), and the next poll then halted both.
+POLL_ALL = 'foreach t [target names] {$t arp_poll}'
+# A resume also restores the others, so later ones may fail. `resume` acts on the current
+# target: a target instance has no resume command (target.c).
+OCD_RESTORE = (f'{POLL_ALL}\n'
                'foreach t [target names] {if {[$t curstate] eq "halted"} {targets $t; catch {resume}}}')
 _MARK_RE = re.compile(r'^AUTOPSY (\S+) (.*)$', re.M)
 
@@ -105,12 +106,9 @@ def free_ports(n):
 def anchor(backend, timeout, keep_halted):
     """{'cpuid', 'cores': {name: core_state}} from one probe_state observation. keep_halted leaves a
     J-Link core halted after the session, whatever it found; an openocd exit never changes the run state."""
-    if isinstance(backend, JLink):
-        backend.restart_on_close = not keep_halted
     cap = Capture(1, 0, False, [])
-    vals = cap.unpack(backend.observe(cap, timeout))
-    if vals['cpuid'] >> 16 & 0xF not in probe_state.M_PROFILE_ARCH:
-        raise ToolError(f"the target does not identify as an M-profile core (CPUID 0x{vals['cpuid']:08x})")
+    vals = cap.unpack(backend.observe(cap, timeout, keep_halted))
+    probe_state.check_m_profile(vals['cpuid'])
     if isinstance(backend, OpenOCD):
         cores = {backend.current: core_state(vals['dhcsr1'])}
         cores.update({n: core_state(a) for n, (_, a) in backend.others.items()})
@@ -124,12 +122,7 @@ def server_command(route, ident, backend, a, ports, exe):
         return [exe, '-select', f"usb={ident['probe']}", '-device', ident['device'], '-if', a.interface,
                 '-speed', a.speed, '-port', str(ports[0]), '-swoport', str(ports[1]),
                 '-telnetport', str(ports[2]), '-nogui', '-singlerun']
-    cmd = []
-    for arg in backend.cmd:
-        # Without the memory map gdb connect probes no flash: the RP2040 probe runs ROM code that
-        # exits XIP and never re-enters it, and the resumed core faulted (rp2xxx.c in 0ce743125).
-        cmd += [f'gdb port {ports[0]}', '-c', 'gdb memory_map disable'] if arg == 'gdb_port disabled' else [arg]
-    return cmd
+    return backend.command(gdb_port=ports[0])
 
 
 def gdb_commands(route, port, exprs, dumps, resume, multicore):
@@ -151,8 +144,7 @@ def gdb_commands(route, port, exprs, dumps, resume, multicore):
     if route == 'jlink' and resume:
         cmds += ['monitor go']
     elif resume:
-        # An SMP resume fails for a core this session never polled, and the next poll then halted both.
-        cmds += ['monitor foreach t [target names] {$t arp_poll}'] if multicore else []
+        cmds += [f'monitor {POLL_ALL}'] if multicore else []
         cmds += ['monitor resume']
     return cmds + ['detach']
 
@@ -185,16 +177,6 @@ def stop(proc, grace):
             return
         except subprocess.TimeoutExpired:
             continue
-
-
-def dump_record(path, addr, size):
-    rec = {'file': path, 'address': f'0x{addr:08x}', 'size': size}
-    try:
-        with open(path, 'rb') as f:
-            data = f.read()
-    except OSError as e:
-        return {**rec, 'complete': False, 'error': str(e)}
-    return {**rec, 'bytes': len(data), 'complete': len(data) == size, 'sha256': hashlib.sha256(data).hexdigest()}
 
 
 def start_anchor_recovery(route, backend, err):
@@ -244,10 +226,7 @@ def end_state_error(before, after, resumed):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--hil-config', required=True, metavar='FILE', help="the project's HIL config json")
-    p.add_argument('--board', required=True, metavar='NAME', help='board name in --hil-config')
-    p.add_argument('--interface', choices=['swd', 'jtag'], help='J-Link boards: target interface, no default')
-    p.add_argument('--speed', help='J-Link boards: interface speed in kHz, "auto" or "adaptive"; no default')
+    probe_state.add_board_args(p)
     p.add_argument('--elf', required=True, metavar='FILE', help='the ELF flashed on the board, for symbols')
     p.add_argument('--out', required=True, metavar='DIR', help='new directory for the gdb and server transcripts')
     p.add_argument('--expr', metavar='EXPR', action='append', default=[],
@@ -268,21 +247,11 @@ def main(argv=None):
     except OSError as e:
         p.error(f'--elf {a.elf}: {e}')
     route, ident, backend = probe_state.resolve(a, p)
-    rp2040 = 'rp2040' in (ident.get('device') or ident.get('cfg')).lower()
-    dumps = []
-    for addr_s, len_s, path in a.dump:
-        addr, size = probe_state.parse_int(p, '--dump', addr_s), probe_state.parse_int(p, '--dump', len_s)
-        path = os.path.abspath(path)
-        try:
-            probe_state.check_region(f'--dump {path}', addr, size, rp2040)
-        except ValueError as e:
-            p.error(str(e))
-        if not probe_state.SAFE_PATH.fullmatch(path):
-            p.error(f'--dump {path}: letters, digits, _ . / + - only (the path reaches a gdb command line)')
-        transcripts = [os.path.join(os.path.abspath(a.out), n) for n in ('gdb.log', 'gdb.err', 'server.log')]
-        if os.path.lexists(path) or path in [d[0] for d in dumps] + transcripts:
-            p.error(f'--dump {path}: exists, named twice or a transcript of --out; a dump never overwrites')
-        dumps.append((path, addr, size))
+    transcripts = [os.path.join(os.path.abspath(a.out), n) for n in ('gdb.log', 'gdb.err', 'server.log')]
+    dumps = probe_state.parse_regions(p, '--dump', a.dump, probe_state.is_rp2040(ident), transcripts)
+    for path, _, _ in dumps:
+        if os.path.lexists(path):
+            p.error(f'--dump {path}: exists; a dump never overwrites')
     try:
         gdb = probe_state.tool('AUTOPSY_GDB', 'arm-none-eabi-gdb', 'arm-none-eabi-gdb.exe')
         server_exe = (probe_state.tool('AUTOPSY_JLINK_GDBSERVER', 'JLinkGDBServer', 'JLinkGDBServerCL.exe')
@@ -346,7 +315,7 @@ def main(argv=None):
     finally:
         armed[0] = False
         stop(gdb_proc, 0)
-        stop(server, 3)
+        stop(server, 3 if route == 'jlink' else 0)   # JLinkGDBServer -singlerun exits by itself; openocd never
     # the cleanup policy comes from the anchor alone, whatever point a signal interrupted
     resume = not any(c['halted'] for c in before['cores'].values())
     multicore = len(before['cores']) > 1
@@ -382,7 +351,7 @@ def main(argv=None):
     if gdb_stderr:
         result['gdbStderr'] = gdb_stderr
     if dumps:
-        result['dumps'] = [dump_record(*d) for d in dumps]
+        result['dumps'] = [probe_state.save_record(*d) for d in dumps]
         exprs_failed |= not all(d['complete'] for d in result['dumps'])
     missing = [k for k, f in (('DHCSR', 'attachDhcsr'), ('PC', 'pc'), ('ICSR', 'icsr'), ('backtrace', 'backtrace'))
                if not result.get(f)]
