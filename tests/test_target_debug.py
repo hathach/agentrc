@@ -935,8 +935,6 @@ class PcSampleOpenOCDTest(FakeToolsCase):
 
     def test_a_signal_as_the_fallback_fails_still_recovers(self):
         # the signal lands while the failed session's ToolError is propagating: its output still decides
-        sys.path.insert(0, str(SCRIPT.parent))
-        import pc_sample
         failure = pc_sample.ToolError('openocd: halt timed out')
         failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
 
@@ -953,6 +951,34 @@ class PcSampleOpenOCDTest(FakeToolsCase):
                 pc_sample.halt_samples(Backend(), 3, 500, 10, 30)
         recover.assert_called_once()
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_run_feeds_stdin_within_the_timeout(self):
+        start = time.monotonic()
+        with self.assertRaisesRegex(probe_state.ToolError, 'did not finish within'):
+            probe_state.run([sys.executable, '-c', 'import time; time.sleep(30)'], 0.3, 'x' * (1 << 20))
+        self.assertLess(time.monotonic() - start, 10)
+
+    def test_a_signal_during_run_cleanup_still_stops_the_tool_and_keeps_its_output(self):
+        class Stop(Exception):
+            pass
+
+        def on_signal(*_):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)    # raise once, like the scripts' handlers
+            raise Stop()
+        previous = signal.signal(signal.SIGTERM, on_signal)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        real_kill, procs = subprocess.Popen.kill, []
+
+        def kill(proc):
+            procs.append(proc)
+            os.kill(os.getpid(), signal.SIGTERM)    # lands during the timeout's cleanup, before the kill
+            real_kill(proc)
+        with mock.patch.object(subprocess.Popen, 'kill', kill):
+            with self.assertRaises(Stop) as cm:
+                probe_state.run([sys.executable, '-c', 'import time; print("GUARDED", flush=True); time.sleep(30)'],
+                                1)
+        self.assertIn('GUARDED', cm.exception.text)
+        self.assertIsNotNone(procs[-1].poll())
 
     def test_a_core_that_is_not_m_profile_is_refused(self):
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF', FAKE_CPUID='00000000')
