@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# lsusbt — `lsusb -t` topology annotated with vendor/product name strings.
+#
+# `lsusb -t` prints the bus/port tree but never the human-readable device names.
+# This walks the tree and appends the name (looked up in plain `lsusb` output)
+# and, when the device reports one, its serial number in [brackets] — once per
+# device, on its first line only (a root hub, or the "If 0" interface), so
+# multi-interface devices aren't repeated.
+#
+# It also maps each serial back to the TinyUSB HIL board it belongs to, using the
+# uids recorded in a boards JSON (default: $HOME/code/tinyusb/test/hil/tinyusb.json).
+# A serial matching a board's `uid` is that board acting as a USB device; one
+# matching a `flasher.uid` is that board's flasher/debugger. Matches append
+# `<board> device` or `<board> flasher`.
+#
+# By default only the lines that resolved to a board are printed, plus root hubs and
+# hubs so the surviving lines keep their bus/port context; -v prints the whole tree.
+#
+# Usage: lsusbt [-j|--json FILE] [-v|--verbose] [lsusb -t args...]
+#   -j, --json FILE   boards JSON to resolve serials against (default above)
+#   -v, --verbose     print every line, including devices with no board match
+#   Any other args are passed through to `lsusb -t`. Note -v is consumed here and no
+#   longer reaches lsusb; run `lsusb -t -v` directly if you want its sysfs paths.
+set -u
+
+JSON="${HOME}/code/tinyusb/test/hil/tinyusb.json"
+verbose=0
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -j|--json)    JSON="${2:?--json needs a file}"; shift 2 ;;
+    --json=*)     JSON="${1#*=}"; shift ;;
+    -v|--verbose) verbose=1; shift ;;
+    *)            args+=("$1"); shift ;;
+  esac
+done
+
+# Colorize only when writing to a terminal (disabled when piped or NO_COLOR is set).
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\e[0m'; C_SPEED=$'\e[33m'; C_SER=$'\e[35m'
+  C_HUB=$'\e[90m'; C_FLASH=$'\e[36m'; C_DEV=$'\e[1;32m'
+else
+  C_RESET=; C_SPEED=; C_SER=; C_HUB=; C_FLASH=; C_DEV=
+fi
+
+# Canonical form for serial comparison: drop separators, upper-case, strip leading
+# zeros. This reconciles the ways the same uid shows up differently — J-Link pads to
+# 12 digits in its USB serial ("000681295394") but the JSON may store it unpadded
+# ("681295394"); ESP MACs render with colons ("84:F7:03:C0:84:E4") vs plain hex.
+norm() {
+  local s=${1//[^0-9A-Za-z]/}
+  s=${s^^}
+  while [[ $s == 0* && ${#s} -gt 1 ]]; do s=${s#0}; done
+  printf '%s' "$s"
+}
+
+# Drop the "If 0, Class=..., Driver=..., " noise, and render the trailing speed as
+# ": [12M]". Applied at print time only — parsing above needs the untouched line.
+strip() {
+  printf '%s' "$1" | sed -E "
+    s/If [0-9]+, //
+    s/Class=[^,]*, //
+    s/Driver=[^,]*, //
+    s/, ([0-9]+M)\$/: ${C_SPEED}[\1]${C_RESET}/
+  "
+}
+
+# Build norm(uid) -> "<board> device|flasher" from the boards JSON.
+declare -A LABEL
+if [ -f "$JSON" ] && command -v jq >/dev/null 2>&1; then
+  while IFS=$'\t' read -r uid label; do
+    [ -n "$uid" ] && LABEL["$(norm "$uid")"]=$label
+  done < <(jq -r '
+    .boards[] | .name as $n |
+    (if .uid         then [.uid,         $n + " device"]  | @tsv else empty end),
+    (if .flasher.uid then [.flasher.uid, $n + " flasher"] | @tsv else empty end)
+  ' "$JSON" 2>/dev/null)
+fi
+
+# Build a bus:dev -> serial map from sysfs (the `serial` file only exists when the
+# device actually reports a serial number). Numbers here are unpadded ("1", "11").
+declare -A SERIAL
+for d in "${LSUSBT_SYSFS:-/sys/bus/usb/devices}"/*/; do  # tests point it at a fake tree
+  [ -f "$d/serial" ] || continue
+  read -r b < "$d/busnum" 2>/dev/null || continue
+  read -r n < "$d/devnum" 2>/dev/null || continue
+  read -r SERIAL["$b:$n"] < "$d/serial" 2>/dev/null
+done
+
+# One plain `lsusb` for every name: `lsusb -s` per device rescans the bus each time,
+# 20 s for a 60-device rig. Keys are unpadded like SERIAL's.
+declare -A NAME
+re_name='^Bus ([0-9]+) Device ([0-9]+): ID [0-9a-fA-F]{4}:[0-9a-fA-F]{4} ?(.*)$'
+while IFS= read -r l; do
+  [[ $l =~ $re_name ]] && NAME["$((10#${BASH_REMATCH[1]})):$((10#${BASH_REMATCH[2]}))"]=${BASH_REMATCH[3]}
+done < <(lsusb 2>/dev/null)
+
+re_bus='Bus ([0-9]+)'; re_dev='Dev ([0-9]+)'; re_itf='If ([0-9]+)'
+
+bus=""
+lsusb -t "${args[@]}" | while IFS= read -r line; do
+  [[ $line == /:* && $line =~ $re_bus ]] && bus=${BASH_REMATCH[1]}
+  dev=""; itf=""   # itf stays empty on root/hub lines
+  [[ $line =~ $re_dev ]] && dev=${BASH_REMATCH[1]}
+  [[ $line =~ $re_itf ]] && itf=${BASH_REMATCH[1]}
+  if [ -n "$dev" ] && { [ -z "$itf" ] || [ "$itf" = "0" ]; }; then
+    # lsusb -t pads bus/dev ("001", "011"); the maps' keys are unpadded, so strip zeros.
+    # Skip the serial for root hubs (their "serial" is just the host PCI address).
+    key="$((10#$bus)):$((10#$dev))"
+    name=${NAME[$key]:-}
+    serial=${SERIAL[$key]:-}
+    case "$line" in *Class=root_hub*) serial="" ;; esac
+    board=""
+    [ -n "$serial" ] && board=${LABEL["$(norm "$serial")"]:-}
+    # Hubs/root hubs are structural: keep them even when filtering, so the surviving
+    # board lines still sit under their bus and hub.
+    hub=0
+    case "$line" in *Class=root_hub*|*Class=Hub*) hub=1 ;; esac
+    if [ -n "$board" ]; then
+      case "$board" in *' device') bcol=$C_DEV ;; *) bcol=$C_FLASH ;; esac
+      printf '%s %s %s[%s]%s %s%s%s\n' "$(strip "$line")" "${name:-?}" \
+        "$C_SER" "$serial" "$C_RESET" "$bcol" "$board" "$C_RESET"
+    elif [ "$verbose" = 1 ] || [ "$hub" = 1 ]; then
+      if [ -n "$serial" ]; then
+        printf '%s %s %s[%s]%s\n' "$(strip "$line")" "${name:-?}" "$C_SER" "$serial" "$C_RESET"
+      else
+        printf '%s %s%s%s\n' "$(strip "$line")" "$C_HUB" "${name:-?}" "$C_RESET"
+      fi
+    fi
+  elif [ "$verbose" = 1 ]; then
+    printf '%s\n' "$(strip "$line")"
+  fi
+done

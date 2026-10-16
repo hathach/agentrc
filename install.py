@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Link parts of this checkout into ~/.claude and ~/.codex, by explicit choice.
+"""Link parts of this checkout into ~/.claude, ~/.codex and ~/.local/bin, by explicit choice.
 
-    install.py install --skill --agent --workflow --claude-md --statusline --herdr-plugin
+    install.py install --skill --agent --workflow --bin --claude-md --statusline --herdr-plugin
     install.py remove --skill
 
 Skills link into ~/.claude/skills and ~/.codex/skills; agents into
 ~/.claude/agents (the .md) and ~/.codex/agents (the .md and its .toml);
 a skill's hooks of the same name into ~/.claude/hooks, with their hooks.json
 merged into ~/.claude/settings.json; workflows into ~/.claude/workflows
-(Claude only);
+(Claude only); bin/ commands into ~/.local/bin;
 --claude-md links instructions/user.md as ~/.claude/CLAUDE.md and
 ~/.codex/AGENTS.md; --statusline links the statusline/ files into ~/.claude
 and sets statusLine in its settings.json; --herdr-plugin links each plugins/*
@@ -39,8 +39,8 @@ import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
-KINDS = ('skill', 'agent', 'hook', 'workflow')
-FLAGS = ('skill', 'agent', 'workflow')  # hooks come with the skill of the same name
+KINDS = ('skill', 'agent', 'hook', 'workflow', 'bin')
+FLAGS = ('skill', 'agent', 'workflow', 'bin')  # hooks come with the skill of the same name
 STATUSLINE = {'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'}
 
 
@@ -51,6 +51,8 @@ def available(kind):
         return sorted(p.stem for p in (REPO / 'agents').glob('*.md'))
     if kind == 'workflow':
         return sorted(p.stem for p in (REPO / 'workflows').glob('*.js'))
+    if kind == 'bin':
+        return sorted(p.name for p in (REPO / 'bin').iterdir() if p.is_file() and os.access(p, os.X_OK))
     return sorted(p.name for p in (REPO / 'hooks').iterdir() if (p / 'hooks.json').exists())
 
 
@@ -58,7 +60,8 @@ def dirs(kind):
     """Where entries of a kind are linked to."""
     claude, codex = Path.home() / '.claude', Path.home() / '.codex'
     return {'skill': [claude / 'skills', codex / 'skills'], 'agent': [claude / 'agents', codex / 'agents'],
-            'hook': [claude / 'hooks'], 'workflow': [claude / 'workflows']}[kind]
+            'hook': [claude / 'hooks'], 'workflow': [claude / 'workflows'],
+            'bin': [Path.home() / '.local' / 'bin']}[kind]
 
 
 def links(kind, name):
@@ -74,6 +77,8 @@ def links(kind, name):
         return [(REPO / 'hooks' / name, dirs(kind)[0] / name)]
     if kind == 'workflow':
         return [(REPO / 'workflows' / f'{name}.js', dirs(kind)[0] / f'{name}.js')]
+    if kind == 'bin':
+        return [(REPO / 'bin' / name, dirs(kind)[0] / name)]
     if kind == 'statusline':  # statusline.sh runs its helpers from $HOME/.claude
         return [(REPO / 'statusline' / f, Path.home() / '.claude' / f)
                 for f in ('statusline.sh', 'statusline-codex-usage.py', 'statusline-prs.py')]
@@ -111,11 +116,14 @@ def refuse(reason):
 
 def preflight(pairs):
     """Every destination must be absent, a symlink or an empty directory; every
-    directory linked into must be a real directory or absent."""
+    directory linked into, and each missing one's ancestors, must be a real
+    directory or absent."""
     for _, dst in pairs:
-        parent = dst.parent
-        if (parent.exists() or parent.is_symlink()) and not parent.is_dir():
-            refuse(f'{parent} is not a directory; move it aside first')
+        for parent in dst.parents:
+            if parent.is_dir():
+                break
+            if parent.exists() or parent.is_symlink():
+                refuse(f'{parent} is not a directory; move it aside first')
         if dst.is_symlink() or not dst.exists():
             continue
         if dst.is_dir() and not any(dst.iterdir()):
@@ -156,7 +164,7 @@ def unlink(dst):
 
 def prune(kind):
     """Drop our links whose source left the repo; leave every other link alone."""
-    source = REPO / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks', 'workflow': 'workflows'}[kind]
+    source = REPO / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks', 'workflow': 'workflows', 'bin': 'bin'}[kind]
     for parent in dirs(kind):
         for path in parent.iterdir() if parent.is_dir() else ():
             if not path.is_symlink() or path.exists():

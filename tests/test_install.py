@@ -83,7 +83,7 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(self.ok('install', '--skill'), '', 'a rerun is silent')
 
     def test_each_flag_covers_its_kind_and_a_skill_brings_its_hook(self):
-        self.ok('install', '--skill', '--agent', '--workflow', '--claude-md')
+        self.ok('install', '--skill', '--agent', '--workflow', '--bin', '--claude-md')
         self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), SKILLS)
         self.assertTrue(os.path.samefile(self.claude / 'agents' / 'pvs-studio.md', ROOT / 'agents' / 'pvs-studio.md'))
         self.assertEqual(sorted(p.name for p in (self.codex / 'agents').iterdir()),
@@ -92,6 +92,7 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(os.path.samefile(self.claude / 'workflows' / 'fix-issue.js', ROOT / 'workflows' / 'fix-issue.js'))
         self.assertTrue(os.path.samefile(self.claude / 'workflows' / 'code-audit.js', ROOT / 'workflows' / 'code-audit.js'))
         self.assertFalse((self.codex / 'workflows').exists(), 'workflows are Claude only')
+        self.assertTrue(os.path.samefile(self.home / '.local' / 'bin' / 'lsusbt', ROOT / 'bin' / 'lsusbt'))
         self.assertTrue(os.path.samefile(self.claude / 'CLAUDE.md', USER_MD))
         self.assertTrue(os.path.samefile(self.codex / 'AGENTS.md', USER_MD))
         self.assertEqual((self.codex / 'AGENTS.md').read_text(), USER_MD.read_text())
@@ -226,6 +227,8 @@ class InstallTest(unittest.TestCase):
             'a dangling link dir': lambda: (self.claude.mkdir(), os.symlink('/nonexistent', self.claude / 'hooks')),
             'a real CLAUDE.md': lambda: (self.claude.mkdir(), (self.claude / 'CLAUDE.md').write_text('mine')),
             'a real status line script': lambda: (self.claude.mkdir(), (self.claude / 'statusline.sh').write_text('mine')),
+            'a file above a link dir': lambda: (self.home / '.local').write_text('x'),
+            'a dangling link above a link dir': lambda: os.symlink('/nonexistent', self.home / '.local'),
         }
         for case, arrange in cases.items():
             with self.subTest(case):
@@ -233,7 +236,7 @@ class InstallTest(unittest.TestCase):
                 self.setUp()
                 arrange()
                 before = sorted(str(p) for p in self.home.rglob('*'))
-                done = self.run_cli('install', '--skill', '--agent', '--workflow', '--claude-md', '--statusline')
+                done = self.run_cli('install', '--skill', '--agent', '--workflow', '--bin', '--claude-md', '--statusline')
                 self.assertEqual(done.returncode, 1, case)
                 self.assertIn('move it aside first', done.stderr)
                 self.assertEqual(sorted(str(p) for p in self.home.rglob('*')), before, 'nothing changed')
@@ -241,13 +244,14 @@ class InstallTest(unittest.TestCase):
     # --- remove -----------------------------------------------------------------
 
     def test_remove_unlinks_whatever_the_link_points_to_but_never_content(self):
-        self.ok('install', '--skill', '--agent', '--workflow')
+        self.ok('install', '--skill', '--agent', '--workflow', '--bin')
         os.remove(self.codex / 'skills' / SKILL)
         os.symlink('/somewhere/else', self.codex / 'skills' / SKILL)
         (self.claude / 'agents' / 'pvs-studio.md').unlink()
         (self.claude / 'agents' / 'pvs-studio.md').write_text('my own copy')
-        out = self.ok('remove', '--skill', '--agent', '--workflow')
+        out = self.ok('remove', '--skill', '--agent', '--workflow', '--bin')
         self.assertFalse((self.claude / 'skills' / SKILL).exists())
+        self.assertFalse((self.home / '.local' / 'bin' / 'lsusbt').is_symlink())
         self.assertFalse((self.claude / 'workflows' / 'fix-issue.js').exists())
         self.assertFalse((self.codex / 'skills' / SKILL).is_symlink(), 'a foreign link is removed too')
         self.assertEqual((self.claude / 'agents' / 'pvs-studio.md').read_text(), 'my own copy')

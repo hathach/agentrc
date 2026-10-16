@@ -3,7 +3,7 @@
 Personal agent config shared by Claude Code and Codex, versioned in git.
 
 ```
-install.py     symlinks chosen parts of this checkout into ~/.claude and ~/.codex
+install.py     symlinks chosen parts of this checkout into ~/.claude, ~/.codex and ~/.local/bin
 instructions/  user.md, the user-wide instructions
 CLAUDE.md      instructions for work in this repository
 AGENTS.md      -> CLAUDE.md, for Codex
@@ -11,6 +11,7 @@ skills/        skills for both agents
 agents/        <name>.md for both agents, plus <name>.toml for Codex
 hooks/         Claude Code hooks, one folder each with a hooks.json
 workflows/     saved workflows (Claude only)
+bin/           commands for the human, such as lsusbt
 statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
 plugins/       herdr plugins, one folder each with a herdr-plugin.toml
 tests/         unit tests for skill scripts, hooks and the installer
@@ -23,7 +24,7 @@ live. Each flag takes every entry of its kind; nothing is installed by default.
 
 ```sh
 git clone git@github.com:hathach/agentrc.git ~/code/agentrc
-~/code/agentrc/install.py install --skill --agent --workflow --claude-md --statusline --herdr-plugin
+~/code/agentrc/install.py install --skill --agent --workflow --bin --claude-md --statusline --herdr-plugin
 ~/code/agentrc/install.py remove --skill
 ```
 
@@ -33,6 +34,9 @@ git clone git@github.com:hathach/agentrc.git ~/code/agentrc
 - `--agent`: the `.md` into `~/.claude/agents` and `~/.codex/agents`, the
   `.toml`, if any, into `~/.codex/agents`.
 - `--workflow`: into `~/.claude/workflows`.
+- `--bin`: each `bin/` command into `~/.local/bin`, which must be on `PATH`.
+  `lsusbt` is `lsusb -t` with device names, serials and the HIL board each
+  serial belongs to; its header lists the options.
 - `--claude-md`: `instructions/user.md` as `~/.claude/CLAUDE.md`, and
   `~/.codex/AGENTS.md` to it.
 - `--statusline`: the `statusline/` files into `~/.claude`, and `statusLine`
