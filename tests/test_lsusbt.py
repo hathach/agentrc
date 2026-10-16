@@ -101,6 +101,10 @@ class LsusbtTest(unittest.TestCase):
         (self.bin / 'lsusb').write_text('#!/bin/bash\n[ "$1" = -t ] && exit 3\nexit 0\n')
         self.assertEqual(self.invoke().returncode, 3)
 
+    def test_lsusb_name_lookup_failure_fails(self):
+        (self.bin / 'lsusb').write_text('#!/bin/bash\n[ "$1" = -t ] && exit 0\nexit 2\n')
+        self.assert_fails(self.invoke(), 'cannot read device names')
+
 
 if __name__ == '__main__':
     unittest.main()
