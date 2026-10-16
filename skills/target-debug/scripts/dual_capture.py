@@ -80,10 +80,10 @@ def children(pid):
     return kids
 
 
-def track(seen, roots):
-    """Add every process now below roots, or below one seen earlier, to seen, keyed by pid with its
-    start time so a reused pid is never taken for it."""
-    todo = [*roots, *seen]
+def track(seen, tops):
+    """Add every process now below tops, or below one seen earlier and still the same process, to
+    seen, keyed by pid with its start time so a reused pid is never taken for it."""
+    todo = [*tops, *(pid for pid, start in seen.items() if (stat(pid) or (None, None))[1] == start)]
     while todo:
         for k in children(todo.pop()):
             if k not in seen:
@@ -134,6 +134,11 @@ def left(seen):
     return out
 
 
+def roots(side):
+    """The leader, while Popen has not reaped it and its pid cannot have been reused."""
+    return [side['proc'].pid] if side['proc'].poll() is None else []
+
+
 def lingering(side):
     return side['proc'].poll() is None or bool(left(side['seen']))
 
@@ -167,11 +172,12 @@ def main(argv=None):
     except OSError as e:
         p.error(f'--out {a.out}: {e}')
 
-    signals = []
+    signals, armed = [], True
 
     def on_signal(signum, _frame):
         signals.append(signum)
-        raise Interrupted()
+        if armed:
+            raise Interrupted()
 
     t0, started, running, strays = None, [], [], {}
     if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
@@ -182,58 +188,65 @@ def main(argv=None):
             signal.signal(sig, on_signal)
         for side in sides:
             out, err = open(side['stdout'], 'wb'), open(side['stderr'], 'wb')
+            armed = False    # a signal now is acted on once the side is fully recorded
             try:
+                side['seen'] = {}
                 side['proc'] = subprocess.Popen(side['argv'], stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                                                 cwd=a.out, start_new_session=True)
+                side['spawned'] = time.monotonic()
+                t0 = side['spawned'] if t0 is None else t0
             except OSError as e:
                 side['startError'] = str(e)
                 break
             finally:
                 out.close()
                 err.close()
-            side.update(spawned=time.monotonic(), seen={})
-            t0 = side['spawned'] if t0 is None else t0
+                armed = True
+            if signals:
+                raise Interrupted()
         started = [s for s in sides if 'proc' in s]
         if len(started) == 2:
             deadline = t0 + a.timeout
             while any(s['proc'].poll() is None for s in started) and time.monotonic() < deadline:
                 for s in started:
-                    track(s['seen'], [s['proc'].pid])
+                    track(s['seen'], roots(s))
                     note_exit(s)
                 adopt(sides, strays)
                 time.sleep(0.05)
     except Interrupted:
         pass
     finally:
+        armed = False
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, signal.SIG_IGN)
         started = [s for s in sides if 'proc' in s]
         for s in started:
-            track(s['seen'], [s['proc'].pid])
+            track(s['seen'], roots(s))
             note_exit(s)
         adopt(sides, strays)
         running = [s for s in started if lingering(s)]
         signal_pids(left(strays), signal.SIGTERM)
         for s in running:
             # SIGTERM to the leader's group only: a live tool stops what it started in its own order
-            # (rtt.py's server sits in a session of its own); what outlives its leader gets it directly
-            try:
-                os.killpg(s['proc'].pid, signal.SIGTERM)
-            except OSError:
-                pass
-            if s['proc'].poll() is not None:
+            # (rtt.py's server sits in a session of its own); what outlived its leader gets it directly
+            if s['proc'].poll() is None:
+                try:
+                    os.killpg(s['proc'].pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            else:
                 signal_pids(left(s['seen']), signal.SIGTERM)
         end = time.monotonic() + a.grace
         while time.monotonic() < end and (any(lingering(s) for s in running) or left(strays)):
             for s in running:
-                track(s['seen'], [s['proc'].pid])
+                track(s['seen'], roots(s))
                 note_exit(s)
             adopt(sides, strays)
             time.sleep(0.05)
         for s in running:
             if lingering(s):
                 s['killed'] = True
-                track(s['seen'], [s['proc'].pid])
+                track(s['seen'], roots(s))
                 signal_pids([-s['proc'].pid, *left(s['seen'])], signal.SIGKILL)
             try:
                 s['proc'].wait(5)

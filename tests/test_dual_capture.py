@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'dual_capture.py'
@@ -169,6 +170,36 @@ class DualCaptureTest(unittest.TestCase):
         self.assertLess(host['exitedAt'], 1.5)
         self.assertGreater(target['exitedAt'], 2.2)
         self.assertEqual(out['bothRunning']['to'], host['exitedAt'])
+
+    def test_a_signal_while_a_side_starts_still_stops_it(self):
+        # SIGTERM lands inside Popen, after the fork: the side must be recorded and stopped, not leaked
+        pidfile = self.d / 'started.pid'
+        driver = (f'import os, signal, subprocess, sys\nsys.path.insert(0, {str(SCRIPT.parent)!r})\n'
+                  'import dual_capture\nreal = subprocess.Popen\n'
+                  'def popen(*a, **k):\n'
+                  '    p = real(*a, **k)\n'
+                  f'    open({str(pidfile)!r}, "w").write(str(p.pid))\n'
+                  '    os.kill(os.getpid(), signal.SIGTERM)\n'
+                  '    return p\n'
+                  'dual_capture.subprocess.Popen = popen\nsys.exit(dual_capture.main(sys.argv[1:]))')
+        proc = subprocess.run([sys.executable, '-c', driver, '--a', self.side('host', 'import time; time.sleep(60)'),
+                               '--b', self.side('target', 'pass'), '--timeout', '30', '--grace', '1',
+                               '--out', str(self.out)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(out['interrupted'], [15])
+        self.assertTrue(out['sides'][0]['stopped'])
+        self.assertTrue(wait_until(lambda: not alive(int(pidfile.read_text()))))
+
+    def test_a_reused_pid_is_not_walked(self):
+        table = {101: ('S', 'new'), 202: ('S', 's202')}
+        kids = {101: {202}}
+        with mock.patch.object(dual_capture, 'stat', table.get), \
+                mock.patch.object(dual_capture, 'children', lambda pid: kids.get(pid, set())):
+            seen = {101: 'old'}
+            dual_capture.track(seen, [])
+            self.assertEqual(seen, {101: 'old'})
+            self.assertEqual(dual_capture.left(seen), [])
 
     def test_refusals(self):
         good = self.side('host', 'pass')
