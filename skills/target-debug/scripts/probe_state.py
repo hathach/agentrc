@@ -86,7 +86,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL, SPEED_RE,  # noqa: E402
-                       Interrupted, ToolError, _MEM32_RE, hil_flasher, hil_jlink_device)
+                       ToolError, _MEM32_RE, hil_flasher, hil_jlink_device)
 
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
@@ -326,6 +326,18 @@ def tool(env, posix, windows=None):
     return exe
 
 
+_running = []    # the tool run() waits on, for a signal handler that stops it rather than raising
+
+
+def stop_running():
+    """Kill the tool run() is waiting on; run() then fails with its output (safe in a signal handler)."""
+    for proc in list(_running):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def run(cmd, timeout, stdin=None):
     """The tool's stdout and stderr as one text. Its output goes to a file, so a session that times out
     or is interrupted (any exception, a signal handler's included) still carries what it printed, as
@@ -333,6 +345,7 @@ def run(cmd, timeout, stdin=None):
     with tempfile.TemporaryFile() as out:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
                                 stdout=out, stderr=subprocess.STDOUT)
+        _running.append(proc)
         caught = None
         try:
             proc.communicate(None if stdin is None else stdin.encode(), timeout=timeout)
@@ -352,6 +365,7 @@ def run(cmd, timeout, stdin=None):
                 break
             except BaseException as e:
                 caught = e
+        _running.remove(proc)
     if isinstance(caught, subprocess.TimeoutExpired):
         err = ToolError(f'{os.path.basename(cmd[0])} did not finish within {timeout:.0f} s')
         err.text = text

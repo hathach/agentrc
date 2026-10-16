@@ -70,7 +70,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_state  # noqa: E402
-from probe_state import Capture, Interrupted, OpenOCD, ToolError, core_state, cpuid_state  # noqa: E402
+from probe_state import Capture, OpenOCD, ToolError, core_state, cpuid_state  # noqa: E402
 
 ICSR = 0xE000ED04
 BACKTRACE_FRAMES = 16
@@ -86,6 +86,10 @@ POLL_ALL = 'foreach t [target names] {$t arp_poll}'
 OCD_RESTORE = (f'{POLL_ALL}\n'
                'foreach t [target names] {if {[$t curstate] eq "halted"} {targets $t; catch {resume}}}')
 _MARK_RE = re.compile(r'^AUTOPSY (\S+) (.*)$', re.M)
+
+
+class Interrupted(Exception):
+    pass
 
 
 def free_ports(n):

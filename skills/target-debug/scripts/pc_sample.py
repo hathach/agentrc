@@ -56,10 +56,6 @@ class ToolError(RuntimeError):
     pass
 
 
-class Interrupted(Exception):
-    pass
-
-
 def jlink_script(samples, interval_ms):
     lines = [f'mem32 {DEMCR:X}, 1', f'mem32 {DHCSR:X}, 1']
     for _ in range(samples):
@@ -183,36 +179,36 @@ def halt_samples(backend, n, halt_timeout_ms, interval_ms, timeout):
     """(pcs, [dhcsr before, after]) from halt reads; raises ToolError on a refusal or failure,
     after a recovery session when the loop may have started."""
     ps = probe_state_module()
-    armed = True
+    signals, stopping = [], True
 
     def on_signal(signum, _frame):
-        nonlocal armed
-        if armed:
-            armed = False
-            raise Interrupted(f'interrupted by signal {signum}')
+        # nothing is raised here: the halting session is killed and fails with its output, which
+        # decides the recovery; a signal during the recovery is only recorded
+        signals.append(signum)
+        if stopping:
+            ps.stop_running()
 
     previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
+        failure = None
         try:
             text, reads = backend.batch(halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
-        finally:
-            armed = False    # from here on a signal is ignored, so it cannot cut the recovery below short
-    except (ToolError, Interrupted) as e:
-        # recover only a core this session showed running on a single-core target before halting it;
-        # openocd flushes each echo at once (log_puts in log.c), so GUARDED is out before the first halt.
-        # A signal that landed as the session failed carries its output on the failure it interrupted.
-        text = getattr(e, 'text', None)
-        if text is None and e.__context__ is not None:
-            text = getattr(e.__context__, 'text', None)
-        if text is not None and re.search(r'^GUARDED$', text, re.M):
-            after = recover(backend, 30)
-        elif str(e).startswith('openocd: refused:'):
-            after = ''
-        elif text is None:
-            after = '; what the session did is unknown: check the core with probe_state.py'
-        else:
-            after = '; it stopped before its guards passed, so it halted nothing: check the core with probe_state.py'
-        raise ToolError(f'halting fallback: {e}{after}') from e
+        except ToolError as e:
+            failure, text = e, getattr(e, 'text', '')
+        stopping = False
+        if failure is not None or signals:
+            what = f'interrupted by signal {signals[0]}' if signals else str(failure)
+            # recover only a core this session showed running on a single-core target before halting it;
+            # openocd flushes each echo at once (log_puts in log.c), so GUARDED is out before the first halt
+            if failure is None:
+                after = ''    # the loop finished, resume included, before the signal could stop it
+            elif re.search(r'^GUARDED$', text, re.M):
+                after = recover(backend, 30)
+            elif str(failure).startswith('openocd: refused:'):
+                after = ''
+            else:
+                after = '; it stopped before its guards passed, so it halted nothing: check the core with probe_state.py'
+            raise ToolError(f'halting fallback: {what}{after}') from failure
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)

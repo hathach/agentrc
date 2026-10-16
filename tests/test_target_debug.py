@@ -933,24 +933,29 @@ class PcSampleOpenOCDTest(FakeToolsCase):
             self.assertEqual(state.read_text(), end)
             self.log.unlink()
 
-    def test_a_signal_as_the_fallback_fails_still_recovers(self):
-        # the signal lands while the failed session's ToolError is propagating: its output still decides
-        failure = pc_sample.ToolError('openocd: halt timed out')
-        failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
-
+    def halt_with_signal(self, raises):
+        """halt_samples over a backend whose session takes SIGTERM; raises: the failure it then ends with."""
         class Backend:
             def batch(self, body, timeout):
-                try:
-                    raise failure
-                finally:
-                    os.kill(os.getpid(), signal.SIGTERM)
+                os.kill(os.getpid(), signal.SIGTERM)
+                if raises:
+                    raise raises
+                return 'R DHCSR 0x01010001\nGUARDED\nH 0x08001000\nR DHCSR 0x01010001\n', []
 
         previous = signal.getsignal(signal.SIGTERM)
         with mock.patch.object(pc_sample, 'recover', return_value='; recovered') as recover:
-            with self.assertRaisesRegex(pc_sample.ToolError, 'interrupted by signal 15; recovered'):
-                pc_sample.halt_samples(Backend(), 3, 500, 10, 30)
-        recover.assert_called_once()
+            with self.assertRaises(pc_sample.ToolError) as cm:
+                pc_sample.halt_samples(Backend(), 1, 500, 10, 30)
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        return str(cm.exception), recover.call_count
+
+    def test_a_signal_that_stopped_the_fallback_past_its_guards_recovers(self):
+        failure = pc_sample.ToolError('openocd exited -9')
+        failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
+        self.assertEqual(self.halt_with_signal(failure), ('halting fallback: interrupted by signal 15; recovered', 1))
+
+    def test_a_signal_after_the_fallback_finished_needs_no_recovery(self):
+        self.assertEqual(self.halt_with_signal(None), ('halting fallback: interrupted by signal 15', 0))
 
     def test_run_feeds_stdin_within_the_timeout(self):
         start = time.monotonic()
