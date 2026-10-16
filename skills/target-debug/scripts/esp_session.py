@@ -516,7 +516,7 @@ def main(argv=None):
         try:
             yield
         finally:
-            armed = True
+            armed = not signals    # one pending stays disarmed, as on_signal leaves it, so cleanup is not cut short
         if signals:
             raise Interrupted(f'interrupted by signal {signals[0]}')
 

@@ -442,8 +442,16 @@ class EspSessionTest(unittest.TestCase):
                   '        super().__init__(args, *a, **k)\n'
                   '        if (which == "server" and "-l" in args) or (which == "gdb" and os.path.basename(args[0]) == "fake-gdb"):\n'
                   '            os.kill(os.getpid(), signal.SIGTERM)\n'
+                  'if which == "gdb-twice":\n'
+                  '    which, base = "gdb", esp_session.Interrupted.__str__\n'
+                  '    def again(self):\n'
+                  '        if not getattr(again, "sent", False):\n'
+                  '            again.sent = True\n'
+                  '            os.kill(os.getpid(), signal.SIGTERM)    # a second signal while the first is handled\n'
+                  '        return base(self)\n'
+                  '    esp_session.Interrupted.__str__ = again\n'
                   'esp_session.subprocess.Popen = Popen\nsys.exit(esp_session.main(sys.argv[1:]))')
-        for which in ('server', 'gdb'):
+        for which in ('server', 'gdb', 'gdb-twice'):
             with self.subTest(which=which):
                 out_dir = self.d / f'out-{which}'
                 argv = self.session('inspect', '--timeout', '30')
@@ -453,7 +461,7 @@ class EspSessionTest(unittest.TestCase):
                 self.assertEqual(rc, 3, err)
                 self.assertIn('interrupted by signal 15', out['error'])
                 receipt_file = out_dir / 'receipt.json'
-                if which == 'gdb':
+                if which.startswith('gdb'):
                     self.assertIn('gdbExit', out)
                     self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
                     self.assertTrue(json.loads(receipt_file.read_text())['closed'])
