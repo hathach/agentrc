@@ -25,8 +25,9 @@ conflict: a second reader takes bytes from this one.
 
 Output: the bytes in --out, one JSON line per chunk ({"t": s after the open, "offset", "len"})
 in <out>.times, and a JSON summary on stdout. The capture ends at --seconds, at a signal, or
-when the device goes away (a reset that re-enumerates a USB console); a device that went away
-has no settings left to restore (`terminalRestored: null`).
+when the device goes away or hangs up (a reset that re-enumerates a USB console); its settings
+then often cannot be restored, which fails the run like any other restore failure (a hung-up
+USB-serial port keeps its termios: the USB-serial core does not reset them at hangup).
 
 Exit: 0 captured (an empty capture included); 2 bad usage; 3 the port could not be opened or
 configured, a read failed, or its settings could not be restored.
@@ -200,11 +201,8 @@ def main(argv=None):
                     termios.tcsetattr(fd, termios.TCSANOW, saved)
                     result['terminalRestored'] = True
                 except termios.error as e:
-                    if ended == 'device gone':
-                        result['terminalRestored'] = None
-                    else:
-                        result['terminalRestored'] = False
-                        errors.append(f'restoring the port settings: {e}')
+                    result['terminalRestored'] = False
+                    errors.append(f'restoring the port settings: {e}')
             os.close(fd)
         out.close()
         times.close()

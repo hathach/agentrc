@@ -102,9 +102,10 @@ class ConsoleCaptureTest(unittest.TestCase):
         os.close(self.master)
         out, err = proc.communicate(timeout=30)
         out = json.loads(out)
-        self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(proc.returncode, 3, err)    # a hung-up port's settings could not be put back
         self.assertEqual(out['ended'], 'device gone')
-        self.assertIsNone(out['terminalRestored'])
+        self.assertFalse(out['terminalRestored'])
+        self.assertIn('restoring the port settings', out['error'])
         self.assertEqual(self.out.read_bytes(), b'boot\n')
 
     def test_a_signal_ends_the_capture_and_restores(self):
