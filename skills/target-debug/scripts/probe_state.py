@@ -26,10 +26,12 @@ The script issues no configuration write, but connecting has side effects: OpenO
 cortex_m examine sets DHCSR.C_DEBUGEN when clear and replaces DEMCR with TRCENA plus its
 own vector-catch bits (cortex_m.c in 0.12.0+dev-g0ce743125), and J-Link Commander V9.78
 sets TRCENA at connect. Through them the DEMCR read is the tool's value and the
-pre-connect state of those bits is not observable. DWT_PCSR is read without halting; with
---allow-halt and no usable sample from a core that was running, a second session
-halts, reads PC and resumes; over OpenOCD that is refused on a multi-core target, whose
-SMP halt stops every core and whose resume fails for a core OpenOCD never polled.
+pre-connect state of those bits is not observable. DWT_PCSR is read without halting, but a
+J-Link session halts the core as it closes and restarts it (DFSR.HALTED is set after each
+session, V9.78), so a core found halted is running afterwards. With --allow-halt and no
+usable sample from a core that was running, a second session halts, reads PC and resumes;
+over OpenOCD that is refused on a multi-core target, whose SMP halt stops every core and
+whose resume fails for a core OpenOCD never polled.
 
 --budget reads FP_CTRL (BP_CTRL on ARMv6-M) and DWT_CTRL: NUM_CODE is the hardware
 breakpoint count, NUMCOMP the watchpoint comparator count. NUMCOMP is reported only
@@ -408,6 +410,9 @@ class JLink:
         self.cmd = [tool('PROBE_STATE_JLINK_EXE', 'JLinkExe', 'JLink.exe'), '-device', device,
                     '-SelectEmuBySN', probe, '-if', interface, '-speed', speed, '-autoconnect', '1', '-nogui', '1']
         self.connection = {}
+        # The DLL halts the core when the session closes and restarts it only while this is set (V9.78,
+        # stm32f407disco: DFSR.HALTED set after every session); False keeps a core halted after the session.
+        self.restart_on_close = True
 
     def _identify(self, text):
         sn, vt = _JLINK_SN_RE.search(text), _JLINK_VTREF_RE.search(text)
@@ -421,13 +426,20 @@ class JLink:
     def observe(self, cap, timeout):
         forms = {'read': lambda n: f'mem32 {self.REG[n]:X}, 1', 'sleep': lambda ms: f'Sleep {ms}',
                  'dump': lambda d: f'savebin {d[0]}, 0x{d[1]:08X}, 0x{d[2]:X}'}
-        lines = [forms[kind](arg) for kind, arg in cap.steps()]
+        lines = [] if self.restart_on_close else ['exec SetRestartOnClose = 0']
+        lines += [forms[kind](arg) for kind, arg in cap.steps()]
         text = run(self.cmd, timeout, '\n'.join(lines + ['qc']) + '\n')
         self._identify(text)
         want = [self.REG[n] for n in cap.want()]
         reads = [(int(a, 16), int(v, 16)) for a, v in _MEM32_RE.findall(text)]
         if [a for a, _ in reads] != want:
-            raise ToolError(f'incomplete capture: {len(reads)}/{len(want)} reads; last output:\n{tail(text)}')
+            err = ToolError(f'incomplete capture: {len(reads)}/{len(want)} reads; last output:\n{tail(text)}')
+            err.partial = []    # the values read in the requested order, up to the first gap
+            for (addr, v), w in zip(reads, want):
+                if addr != w:
+                    break
+                err.partial.append(v)
+            raise err
         return [v for _, v in reads]
 
     def halt_read(self, timeout):

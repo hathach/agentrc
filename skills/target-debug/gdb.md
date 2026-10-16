@@ -37,7 +37,9 @@ failed to allocate its bounce buffer and left the core halted.
 Connect with the matching toolchain's GDB (`arm-none-eabi-gdb <flashed.elf>` for ARM), then `target remote :2331` for
 J-Link or `target remote :3333` for OpenOCD (`target extended-remote` keeps the server across a detach, used in
 `espressif.md`). For an autopsy, use `monitor halt`; for a fresh start only, use `monitor reset halt`, `load`, then
-`continue`.
+`continue`. On RP2040, start openocd with `-c 'gdb memory_map disable'` for anything but flashing: building gdb's memory
+map probes the flash through ROM calls that leave XIP off (`rp2xxx.c` in 0.12.0+dev-g0ce743125), and the core resumed
+after that faulted into lockup (verified 2026-10-16 raspberry_pi_pico).
 
 Script JLinkGDBServer sessions with `-singlerun` — the server exits with the connection, and back-to-back relaunches
 race the probe handle and hang. Symbols need the firmware's DWARF: check the project's release configuration keeps it.
@@ -47,6 +49,29 @@ reset destroys the evidence). On Espressif chips take the console baseline first
 chip (`espressif.md`, Attach, Anchors). Symbolize with the ELF that is actually flashed — the one from the build that
 wedged; do not rebuild while the wedge is still on the board. The names to put in these slots are the project's
 (`projects/<name>.md` when the skill keeps notes for it, else read the stack and the port driver first):
+
+On a Cortex-M rig board, `autopsy.py` runs this as one bounded session: DHCSR of each core before the attach, PC, its
+symbol, a backtrace, ICSR, your read-only expressions and dumps while halted, the resume when every core was running,
+and the end state from a separate probe session, restored and observed once more when a core found running was left
+halted. gdb runs with writes, calls and breakpoint insertion off; a core found halted is never resumed, a multi-core
+target found with mixed states is refused (the attach halts every core), and a run that cannot say what it left (a
+failed J-Link anchor with no state read) says so. `--out` keeps gdb's values (`gdb.log`), its errors (`gdb.err`) and
+the server's log:
+
+```bash
+python3 <skill dir>/scripts/autopsy.py --hil-config <file> --board <name> [--interface swd --speed 4000] \
+  --elf <flashed.elf> --out <new dir> [--expr '<state table>' ...] [--dump <addr> <len> <new file> ...]
+#   exit 0 done and the end state as found, 1 an expression or dump failed, 2 usage, 3 probe, server or gdb
+#   session failure, interrupted, or a core not left as found
+```
+
+Both servers halt at attach (openocd's `gdb-attach` default is `halt 1000`) and neither resumes at detach; openocd's
+gdb connect also removes every breakpoint and watchpoint (`gdb_server.c` in 0.12.0+dev-g0ce743125). A JLinkGDBServer
+started with `-singlerun` exits at the detach, and its close restarts the core unless
+`monitor exec SetRestartOnClose = 0` came first (the J-Link close behaviour in `techniques.md`, PC-sampling). An SMP
+`monitor resume` restored both RP2040 cores only after `monitor foreach t [target names] {$t arp_poll}`; without it
+core1 stayed halted and openocd's next poll halted core0 again (verified 2026-10-16 raspberry_pi_pico). An openocd
+server did not stop on SIGINT there; SIGTERM stopped it. By hand:
 
 ```gdb
 p/x <device stack's endpoint state table>   # busy/stalled/claimed per endpoint
@@ -101,10 +126,12 @@ p (*(unsigned*)0xE0001000)>>28          # DWT_CTRL NUMCOMP = watchpoint comparat
   files + `SetMonModeDebug=1`; not set up here: <https://kb.segger.com/Monitor_Mode_Debugging> (untested).
 
 While halted the device answers **nothing**: host control transfers time out in ~5 s and the OS may reset/re-enumerate —
-after `continue`, the bus traffic shows recovery, not the original bug. Prefer one halt for a post-mortem dump over
-stepping through live USB traffic. When the probe shares that host, the stalled enumeration can block it too: halting
-pico2_etm_trace stalled the host's enumeration for ~30 s (`device not accepting address`, error -62) and JLinkExe
-blocked at "Connecting to J-Link" meanwhile. verified 2026-09-18.
+after `continue`, the bus traffic shows recovery, not the original bug. A bus-powered board may not stay halted at all:
+Linux's hub driver, failing to enumerate it, logged `attempt power cycle` and power-cycled the port, which rebooted the
+board about 35 s after the halt (verified 2026-10-16 raspberry_pi_pico on ci.lan; DHCSR then read running). Prefer one
+halt for a post-mortem dump over stepping through live USB traffic. When the probe shares that host, the stalled
+enumeration can block it too: halting pico2_etm_trace stalled the host's enumeration for ~30 s (`device not accepting
+address`, error -62) and JLinkExe blocked at "Connecting to J-Link" meanwhile. verified 2026-09-18.
 
 ## J-Link Commander sessions
 

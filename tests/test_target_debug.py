@@ -6,16 +6,21 @@ are explicit failures, never a partial result passed off as a profile.
 
 probe_state.py through fake JLinkExe and openocd: the plumbing only; its hardware
 behaviour is verified on a rig board."""
+import contextlib
 import importlib.util
+import io
 import hashlib
 import json
 import struct
 import os
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'pc_sample.py'
@@ -307,6 +312,9 @@ def log(script):
 seen = {}
 mode = os.environ.get('FAKE_MODE', '')
 def value(reg):
+    state = os.environ.get('FAKE_STATE')
+    if reg == 'DHCSR' and state and os.path.exists(state):
+        return int(open(state).read(), 16)
     n = seen.get(reg, 0); seen[reg] = n + 1
     vals = regs[reg]
     return int(vals[min(n, len(vals) - 1)], 16)
@@ -332,10 +340,20 @@ print('SEGGER J-Link Commander V9.78 (Compiled fake)')
 sn = os.environ.get('FAKE_SN', sys.argv[sys.argv.index('-SelectEmuBySN') + 1].lstrip('0'))
 print(f'S/N: {sn}')
 print('VTref=3.300V')
+if os.environ.get('FAKE_JLINK_SLEEP'):
+    import time; time.sleep(float(os.environ['FAKE_JLINK_SLEEP']))
+once = os.environ.get('FAKE_READS_MAX_ONCE')
+cut = os.environ.get('FAKE_STATE', '/nonexistent') + '.cut'
+reads_max = int(once) if once and not os.path.exists(cut) else None
+if reads_max is not None:
+    open(cut, 'w').write('')
 for line in script.splitlines():
     m = re.match(r'mem32 ([0-9A-F]{8}), 1', line)
     if m:
+        if reads_max is not None and reads_max == 0:
+            break
         print(f'J-Link>{m.group(1)} = {value(names[m.group(1)]):08X}')
+        reads_max = None if reads_max is None else reads_max - 1
         if mode == 'truncate':
             break
     m = re.match(r'savebin (\\S+), 0x([0-9A-F]+), 0x([0-9A-F]+)', line)
@@ -343,11 +361,22 @@ for line in script.splitlines():
         dump(m.group(1), int(m.group(2), 16), int(m.group(3), 16))
     if line == 'h':
         print(f'PC = {value("PC"):08X}, CycleCnt = 00000000')
+if os.environ.get('FAKE_STATE'):    # the DLL halts at close, then restarts unless told not to
+    open(os.environ['FAKE_STATE'], 'w').write('00030003' if 'exec SetRestartOnClose = 0' in script else '01010001')
 sys.exit(1 if mode == 'fail' else 0)
 """
 
 FAKE_OPENOCD_STATE = '#!/usr/bin/env python3' + FAKE_COMMON + """
-import re
+import re, time
+gdb_port = next((a.split()[-1] for a in sys.argv if a.startswith('gdb port ')), None)
+if gdb_port:
+    log('server')
+    print(f'Info : Listening on port {gdb_port} for gdb connections', file=sys.stderr, flush=True)
+    while not os.environ.get('FAKE_SERVER_STAY') and not os.path.exists(os.environ.get('FAKE_STOP', '/nonexistent')):
+        time.sleep(0.05)
+    while os.environ.get('FAKE_SERVER_STAY'):
+        time.sleep(0.05)
+    sys.exit(0)
 script = sys.argv[-1]
 log(script)
 print('Info : CMSIS-DAP: Serial# = E6614C311B597D32', file=sys.stderr)
@@ -369,9 +398,111 @@ for line in script.splitlines():
     m = re.match(r'dump_image \\{(\\S+)\\} 0x([0-9a-f]+) 0x([0-9a-f]+)', line)
     if m:
         dump(m.group(1), int(m.group(2), 16), int(m.group(3), 16))
+if 'arp_poll' in script:
+    if os.environ.get('FAKE_RESTORE_FAIL'):
+        print('ERROR resume failed', file=sys.stderr)
+    else:
+        open(os.environ['FAKE_STATE'], 'w').write('01000001')
 if mode == 'tclerror':
     print('ERROR read_memory: failed to read memory', file=sys.stderr)
 sys.exit(1 if mode == 'fail' else 0)
+"""
+
+
+# gdb: echoes the AUTOPSY markers the way gdb would, attach writes FAKE_STATE halted and
+# monitor go/resume running (what the end anchor then reads), output EXPR answers from
+# FAKE_EXPRS "expr=value;..." or with gdb's refusal for an assignment, dump writes the
+# bytes (one short with FAKE_GDB_SHORT), detach touches FAKE_STOP for the server. Errors go
+# to stderr and the exit status is the last command's, as gdb -batch does; a FAKE_EXPRS value
+# starting with ! is an error. `monitor exec SetRestartOnClose = 0` leaves FAKE_STATE.norestart
+# for the J-Link server fake. FAKE_GDB_ATTACH_FAIL fails the attach, FAKE_GDB_NORESUME ignores
+# the resume, FAKE_GDB_HANG never exits, FAKE_GDB_HANG_ATTACHED hangs after the attach and
+# FAKE_GDB_EXIT exits with that status after the DHCSR marker.
+FAKE_GDB = """#!/usr/bin/env python3
+import json, os, re, sys, time
+args = sys.argv[1:]
+cmds = [args[i + 1] for i, a in enumerate(args) if a == '-ex']
+with open(os.environ['FAKE_LOG'], 'a') as f:
+    f.write(json.dumps({'argv': args, 'script': 'gdb'}) + '\\n')
+if os.environ.get('FAKE_GDB_HANG'):
+    time.sleep(60)
+exprs = dict(kv.split('=', 1) for kv in os.environ.get('FAKE_EXPRS', '').split(';') if kv)
+attached = False
+ok = True
+def state(v):
+    open(os.environ['FAKE_STATE'], 'w').write(v)
+def error(msg):
+    global ok
+    sys.stdout.flush(); print(msg, file=sys.stderr, flush=True); ok = False
+for c in cmds:
+    ok = True
+    if c.startswith('target remote'):
+        if os.environ.get('FAKE_GDB_ATTACH_FAIL'):
+            error(':3333: Connection timed out.'); continue
+        attached = True; state('00030003')
+        if os.environ.get('FAKE_GDB_HANG_ATTACHED'):
+            time.sleep(60)
+    elif c.startswith('set '):
+        pass
+    elif c.startswith('echo '):
+        sys.stdout.write(c[5:].replace('\\\\n', '\\n'))
+    elif not attached:
+        error('The program has no registers now.')
+    elif c.startswith('printf "AUTOPSY DHCSR'):
+        print('AUTOPSY DHCSR 0x00030003', flush=True)
+        if os.environ.get('FAKE_GDB_EXIT'):
+            sys.exit(int(os.environ['FAKE_GDB_EXIT']))
+    elif c.startswith('printf "AUTOPSY PC'):
+        print('AUTOPSY PC 0x08001436')
+    elif c.startswith('printf "AUTOPSY ICSR'):
+        print('AUTOPSY ICSR 0x00000000')
+    elif c == 'info symbol $pc':
+        print('tud_task_ext + 6 in section .text')
+    elif c.startswith('bt '):
+        print('#0  0x08001436 in tud_task_ext ()'); print('#1  0x080002e0 in main ()')
+    elif c == 'info threads':
+        print('* 1    Thread 1 "rp2040.core0" 0x08001436 in tud_task_ext ()')
+    elif c.startswith('output '):
+        e = c[7:]
+        v = exprs.get(e, '!No symbol "%s" in current context.' % e)
+        if re.search(r'[^=!<>]=[^=]', e):
+            error('Writing to memory is not allowed (addr 0x20000004, len 4)')
+        elif v.startswith('!'):
+            error(v[1:])
+        else:
+            sys.stdout.write(v)
+    elif c.startswith('dump binary memory '):
+        path, a, b = c.split()[3:6]
+        n = int(b, 16) - int(a, 16) - (1 if os.environ.get('FAKE_GDB_SHORT') else 0)
+        open(path, 'wb').write(bytes(range(256)) * (n // 256) + bytes(range(n % 256)))
+    elif c in ('monitor go', 'monitor resume') and not os.environ.get('FAKE_GDB_NORESUME'):
+        state('01010001')
+    elif c == 'monitor exec SetRestartOnClose = 0':
+        open(os.environ['FAKE_STATE'] + '.norestart', 'w').write('')
+    elif c == 'detach':
+        print('[Inferior 1 (Remote target) detached]')
+        open(os.environ['FAKE_STOP'], 'w').write('')
+    sys.stdout.flush()
+sys.exit(0 if ok else 1)
+"""
+
+# JLinkGDBServer: its close halts the core and restarts it, unless gdb sent the setting or
+# FAKE_SERVER_NORESTART stands for a restart that did not happen.
+FAKE_JLINK_GDBSERVER = """#!/usr/bin/env python3
+import json, os, signal, sys, time
+with open(os.environ['FAKE_LOG'], 'a') as f:
+    f.write(json.dumps({'argv': sys.argv[1:], 'script': 'server'}) + '\\n')
+def close(*_):
+    st = os.environ['FAKE_STATE']
+    keep = os.path.exists(st + '.norestart') or os.environ.get('FAKE_SERVER_NORESTART')
+    open(st, 'w').write('00030003' if keep else '01010001')
+    sys.exit(0)
+signal.signal(signal.SIGTERM, close)
+time.sleep(float(os.environ.get('FAKE_SERVER_DELAY', '0')))
+print('Waiting for GDB connection...', flush=True)
+while not os.path.exists(os.environ['FAKE_STOP']):
+    time.sleep(0.05)
+close()
 """
 
 STATE_BOARDS = [
@@ -652,6 +783,7 @@ class ProbeStateCliTest(unittest.TestCase):
         self.assertIn('-if swd -speed 4000', ' '.join(log['argv']))
         self.assertEqual(log['script'].count('Sleep 3'), 4)
         self.assertNotRegex(log['script'], r'(?m)^(h|g|r|w\w*|savebin.*)$')   # no halt, no write
+        self.assertNotIn('SetRestartOnClose', log['script'])
 
     def test_jlink_verify_match_and_mismatch(self):
         mem = self.d / 'flash.bin'
@@ -878,6 +1010,282 @@ class ProbeStateCliTest(unittest.TestCase):
             self.assertEqual(rc, 2, (board, args, err))
             self.assertIn(want, err, (board, args))
             self.assertFalse(self.log.exists(), (board, args))
+
+
+AUTOPSY = SCRIPT.parent / 'autopsy.py'
+
+
+@unittest.skipIf(os.name == 'nt', 'gdb, server and probe stubs require POSIX executable semantics')
+class AutopsyCliTest(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.d = Path(self._dir.name)
+        for name, body in (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE),
+                           ('arm-none-eabi-gdb', FAKE_GDB), ('JLinkGDBServer', FAKE_JLINK_GDBSERVER)):
+            f = self.d / name
+            f.write_text(body)
+            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        self.config = self.d / 'hil.json'
+        self.config.write_text(json.dumps({'boards': STATE_BOARDS}))
+        self.elf = self.d / 'fw.elf'
+        self.elf.write_bytes(elf32([(0x0800_0000, b'abcd')], SYMS))
+        self.log = self.d / 'log.json'
+        self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
+                    'FAKE_STATE': str(self.d / 'state'), 'FAKE_STOP': str(self.d / 'stop')}
+
+    def run_cli(self, board, *args, out='out', **env):
+        r = subprocess.run([sys.executable, str(AUTOPSY), '--hil-config', str(self.config), '--board', board,
+                            '--elf', str(self.elf), '--out', str(self.d / out), *args],
+                           capture_output=True, text=True, timeout=60, env={**self.env, **env}, cwd='/')
+        return r.returncode, json.loads(r.stdout) if r.stdout.strip() else None, r.stderr
+
+    def sessions(self):
+        return [json.loads(line) for line in self.log.read_text().splitlines()]
+
+    def gdb_commands(self):
+        argv = next(s['argv'] for s in self.sessions() if s['script'] == 'gdb')
+        return [argv[i + 1] for i, a in enumerate(argv) if a == '-ex']
+
+    def test_jlink_autopsy_reads_resumes_and_checks_the_end_state(self):
+        dump = self.d / 'ram.bin'
+        rc, out, err = self.run_cli('k64f', *LINK, '--expr', 'blink_interval_ms', '--expr', 'blink_interval_ms = 5',
+                                    '--dump', '0x20000000', '300', str(dump), FAKE_EXPRS='blink_interval_ms=1000')
+        self.assertEqual(rc, 1, err)    # the assignment was refused
+        self.assertEqual((out['attachDhcsr'], out['pc'], out['icsr']), ('0x00030003', '0x08001436', '0x00000000'))
+        self.assertEqual(out['symbol'], 'tud_task_ext + 6 in section .text')
+        self.assertEqual(out['backtrace'][0], '#0  0x08001436 in tud_task_ext ()')
+        self.assertEqual(out['exprs'][0], {'expr': 'blink_interval_ms', 'output': '1000'})
+        self.assertIn('no value', out['exprs'][1]['error'])
+        self.assertIn('Writing to memory is not allowed (addr 0x20000004, len 4)', out['gdbStderr'])
+        self.assertEqual(out['dumps'][0]['bytes'], 300)
+        self.assertTrue(out['dumps'][0]['complete'])
+        self.assertTrue(out['resumed'])
+        self.assertFalse(out['before']['cores']['core']['halted'])
+        self.assertFalse(out['after']['cores']['core']['halted'])
+        cmds = self.gdb_commands()
+        self.assertEqual(cmds[:4], ['set may-write-memory off', 'set may-write-registers off',
+                                    'set may-call-functions off', 'set may-insert-breakpoints off'])
+        self.assertEqual(cmds[-2:], ['monitor go', 'detach'])
+        last_read = max(i for i, c in enumerate(cmds) if c.startswith(('output', 'dump')))
+        self.assertLess(last_read, cmds.index('monitor go'))
+        server = next(s['argv'] for s in self.sessions() if s['script'] == 'server')
+        self.assertEqual(server[:4], ['-select', 'usb=000621000000', '-device', 'MK64FN1M0xxx12'])
+        self.assertIn('-singlerun', server)
+        self.assertTrue((self.d / 'out' / 'gdb.log').exists())
+        anchors = [s['script'] for s in self.sessions() if s['argv'][0] == '-device']
+        self.assertEqual([a.startswith('exec SetRestartOnClose = 0\n') for a in anchors], [True, False])
+
+    def test_a_core_found_halted_is_not_resumed(self):
+        rc, out, err = self.run_cli('k64f', *LINK, FAKE_DHCSR='01030003')
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(out['resumed'])
+        cmds = self.gdb_commands()
+        attach = next(i for i, c in enumerate(cmds) if c.startswith('target remote :'))
+        self.assertEqual(cmds[attach + 1], 'monitor exec SetRestartOnClose = 0')
+        self.assertNotIn('monitor go', cmds)
+        self.assertTrue(out['after']['cores']['core']['halted'])
+        anchors = [s['script'] for s in self.sessions() if s['argv'][0] == '-device']
+        self.assertEqual([a.startswith('exec SetRestartOnClose = 0\n') for a in anchors], [True, True])
+
+    def test_a_core_left_halted_is_restored_and_observed_again(self):
+        # J-Link: the end anchor that saw it halted restarted it at close; a third session confirms
+        rc, out, err = self.run_cli('k64f', *LINK, FAKE_GDB_NORESUME='1', FAKE_SERVER_NORESTART='1')
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(out['restored'])
+        self.assertTrue(out['afterServer']['cores']['core']['halted'])
+        self.assertFalse(out['after']['cores']['core']['halted'])
+        self.assertEqual(sum(s['argv'][0] == '-device' for s in self.sessions()), 3)
+        # openocd: a restoring batch polls and resumes each halted core
+        rc, out, err = self.run_cli('max32', out='out2', FAKE_GDB_NORESUME='1')
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(out['restored'])
+        self.assertIn('arp_poll', self.sessions()[-2]['argv'][-1])
+        rc, out, err = self.run_cli('max32', out='out3', FAKE_GDB_NORESUME='1', FAKE_RESTORE_FAIL='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('restoring session: openocd: resume failed', out['error'])
+        self.assertIn('max32665.cpu found running, now halted', out['error'])
+        self.assertIn('resume a halted core', out['error'])
+
+    def test_a_failed_start_anchor_restarts_only_a_core_found_running(self):
+        rc, out, err = self.run_cli('k64f', *LINK, FAKE_READS_MAX_ONCE='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('run state before it is unknown', out['error'])
+        self.assertEqual(len(self.sessions()), 1)
+        self.assertEqual((self.d / 'state').read_text(), '00030003')
+        (self.d / 'state.cut').unlink()
+        (self.d / 'state').unlink()
+        rc, out, err = self.run_cli('k64f', *LINK, out='out2', FAKE_READS_MAX_ONCE='2')
+        self.assertEqual(rc, 3)
+        self.assertIn('found running and a second session restarted it', out['error'])
+        self.assertEqual((self.d / 'state').read_text(), '01010001')
+        (self.d / 'state.cut').unlink()
+        (self.d / 'state').unlink()
+        rc, out, err = self.run_cli('k64f', *LINK, out='out3', FAKE_READS_MAX_ONCE='2', FAKE_DHCSR='01030003')
+        self.assertEqual(rc, 3)
+        self.assertIn('found halted and stays halted', out['error'])
+        self.assertEqual((self.d / 'state').read_text(), '00030003')
+        self.assertFalse(any(s['script'] in ('gdb', 'server') for s in self.sessions()))
+
+    def test_openocd_server_and_multi_core_states(self):
+        rc, out, err = self.run_cli('max32', FAKE_CURRENT='rp2040.core0', FAKE_CORES='rp2040.core1=00040001')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.gdb_commands()[-3:], ['monitor foreach t [target names] {$t arp_poll}',
+                                                    'monitor resume', 'detach'])
+        self.assertIn('info threads', self.gdb_commands())
+        self.assertIn('gdb port', ' '.join(out['server']))
+        self.assertNotIn('gdb_port disabled', out['server'])
+        self.assertIn('gdb memory_map disable', out['server'])
+        self.assertEqual(set(out['before']['cores']), {'rp2040.core0', 'rp2040.core1'})
+        rc, out, err = self.run_cli('max32', out='out2', FAKE_CURRENT='rp2040.core0',
+                                    FAKE_CORES='rp2040.core1=00030003')
+        self.assertEqual(rc, 3)
+        self.assertIn('mixed core states', out['error'])
+        self.assertFalse(any(s['script'] in ('gdb', 'server') for s in self.sessions()[-1:]))
+
+    def test_a_server_that_stays_is_stopped_with_sigterm(self):
+        rc, out, err = self.run_cli('max32', FAKE_SERVER_STAY='1')
+        self.assertEqual(rc, 0, err)
+
+    def test_failures_exit_3_and_still_check_the_end(self):
+        rc, out, err = self.run_cli('k64f', *LINK, FAKE_GDB_ATTACH_FAIL='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('gdb session incomplete (exit 1, no DHCSR, PC, ICSR, backtrace)', out['error'])
+        self.assertIn('after', out)
+        rc, out, err = self.run_cli('k64f', *LINK, '--timeout', '2', out='out2', FAKE_GDB_HANG='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('did not finish within 2 s', out['error'])
+        rc, out, err = self.run_cli('k64f', *LINK, '--dump', '0x20000000', '16', str(self.d / 'd.bin'), out='out3',
+                                    FAKE_GDB_SHORT='1')
+        self.assertEqual(rc, 1)
+        self.assertFalse(out['dumps'][0]['complete'])
+        rc, out, err = self.run_cli('k64f', *LINK, out='out4', FAKE_DHCSR='01030003', FAKE_GDB_EXIT='42')
+        self.assertEqual(rc, 3)
+        self.assertIn('gdb session incomplete (exit 42, no PC, ICSR, backtrace)', out['error'])
+        rc, out, err = self.run_cli('max32', '--timeout', '2', out='out5', FAKE_GDB_HANG_ATTACHED='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('did not finish within 2 s', out['error'])
+        self.assertTrue(out['restored'])
+        self.assertFalse(out['after']['cores']['max32665.cpu']['halted'])
+
+    def test_a_core_found_halted_that_ran_is_reported(self):
+        # gdb dies before it can ask the J-Link server not to restart the core at close
+        rc, out, err = self.run_cli('k64f', *LINK, '--timeout', '2', FAKE_DHCSR='01030003',
+                                    FAKE_GDB_HANG_ATTACHED='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('core found halted, ran after the attach (afterServer)', out['error'])
+        self.assertFalse(out['afterServer']['cores']['core']['halted'])
+        self.assertTrue(out['after']['cores']['core']['halted'])
+        self.assertNotIn('restored', out)
+
+    def test_an_expression_error_is_reported_from_stderr(self):
+        rc, out, err = self.run_cli('k64f', *LINK, '--expr', '1/0', '--expr', 'x',
+                                    FAKE_EXPRS='1/0=!Division by zero;x=3')
+        self.assertEqual(rc, 1, err)
+        self.assertIn('error', out['exprs'][0])
+        self.assertEqual(out['exprs'][1], {'expr': 'x', 'output': '3'})
+        self.assertEqual(out['gdbStderr'], ['Division by zero'])
+
+    def interrupt(self, board, until, *args, **env):
+        proc = subprocess.Popen([sys.executable, str(AUTOPSY), '--hil-config', str(self.config), '--board', board,
+                                 '--elf', str(self.elf), '--out', str(self.d / 'out'), *args],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd='/',
+                                env={**self.env, **env})
+        deadline = time.monotonic() + 20
+        while not (self.log.exists() and until(self.sessions())) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        proc.send_signal(signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=60)
+        return proc.returncode, json.loads(stdout), stderr
+
+    def test_a_signal_after_the_anchor_still_reaches_the_end_anchor(self):
+        rc, out, err = self.interrupt('k64f', lambda ss: any(s['script'] == 'server' for s in ss), *LINK,
+                                      FAKE_SERVER_DELAY='5')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('interrupted by signal 15', out['error'])
+        self.assertFalse(out['after']['cores']['core']['halted'])
+        self.assertEqual((self.d / 'state').read_text(), '01010001')
+
+    def test_a_signal_during_the_anchor_reports_an_unknown_state(self):
+        rc, out, err = self.interrupt('k64f', lambda ss: True, *LINK, FAKE_JLINK_SLEEP='5')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('pre-attach anchor: interrupted by signal 15', out['error'])
+        self.assertIn('run state before it is unknown', out['error'])
+
+    def test_a_signal_right_after_the_anchor_keeps_the_found_state_policy(self):
+        spec = importlib.util.spec_from_file_location('autopsy_inproc', AUTOPSY)
+        autopsy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(autopsy)
+        real = autopsy.anchor
+
+        class Trap(dict):    # the first look at the anchor's cores is where the signal lands
+            fired = False
+
+            def items(self):
+                if not Trap.fired:
+                    Trap.fired = True
+                    raise autopsy.Interrupted('interrupted by signal 15')
+                return super().items()
+
+        def anchor(*args, **kw):
+            got = real(*args, **kw)
+            if not Trap.fired:
+                got['cores'] = Trap(got['cores'])
+            return got
+
+        argv = ['--hil-config', str(self.config), '--board', 'k64f', '--elf', str(self.elf), '--out',
+                str(self.d / 'out'), *LINK]
+        stdout = io.StringIO()
+        for sig in (signal.SIGTERM, signal.SIGINT):    # main() installs its own handlers
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(autopsy, 'anchor', anchor), \
+                contextlib.redirect_stdout(stdout):
+            rc = autopsy.main(argv)
+        out = json.loads(stdout.getvalue())
+        self.assertEqual(rc, 3)
+        self.assertIn('interrupted by signal 15', out['error'])
+        self.assertNotIn('ran after the attach', out['error'])
+        self.assertFalse(out['after']['cores']['core']['halted'])
+        self.assertEqual((self.d / 'state').read_text(), '01010001')
+
+    def test_signals_still_run_cleanup_and_the_end_anchor(self):
+        proc = subprocess.Popen([sys.executable, str(AUTOPSY), '--hil-config', str(self.config), '--board', 'max32',
+                                 '--elf', str(self.elf), '--out', str(self.d / 'out')],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd='/',
+                                env={**self.env, 'FAKE_GDB_HANG_ATTACHED': '1'})
+        deadline = time.monotonic() + 20
+        while not (self.log.exists() and 'gdb' in self.log.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        proc.send_signal(signal.SIGTERM)
+        time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=60)
+        out = json.loads(stdout)
+        self.assertEqual(proc.returncode, 3, stderr)
+        self.assertIn('interrupted by signal 15, 15', out['error'])
+        self.assertTrue(out['restored'])
+        self.assertFalse(out['after']['cores']['max32665.cpu']['halted'])
+
+    def test_refusals_launch_nothing(self):
+        (self.d / 'exists.bin').write_bytes(b'')
+        (self.d / 'taken').mkdir()
+        cases = [(('--dump', '0x40000000', '4', str(self.d / 'p.bin')), 'not within'),
+                 (('--dump', '0x20000000', '4', str(self.d / 'exists.bin')), 'never overwrites'),
+                 (('--dump', '0x20000000', '4', str(self.d / 'out' / 'server.log')), 'a transcript of --out'),
+                 (('--expr', ''), 'one non-empty line'), (('--timeout', '0'), '--timeout')]
+        for args, want in cases:
+            rc, out, err = self.run_cli('k64f', *LINK, *args)
+            self.assertEqual(rc, 2, (args, err))
+            self.assertIn(want, err)
+        rc, out, err = self.run_cli('k64f', *LINK, out='taken')
+        self.assertEqual(rc, 2)
+        self.assertIn('give a new directory', err)
+        rc, out, err = self.run_cli('pico', '--dump', '0x14000000', '4', str(self.d / 'x.bin'))
+        self.assertEqual(rc, 2)
+        self.assertIn('RP2040 XIP region', err)
+        self.assertFalse(self.log.exists())
 
 
 if __name__ == '__main__':

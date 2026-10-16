@@ -25,11 +25,12 @@ it reads set; a tool that leaves it clear needs it set from a debugger session (
 added). The script itself never writes.
 
 The histogram's top entries are the spin site; a flat histogram = core is servicing normally — and an idle loop has a
-hot spot of its own: learn it from a healthy run before reading a wedged one. A core halted from a JLinkExe session is
-running again once that session exits (Commander restores the run state it found; seen 2026-09-18 on RP2350), so the
-sentinel means the target halted or slept by itself. Native probes (ST-Link/CMSIS-DAP) are not covered by the script
-yet: `probe_state.py` (next section) samples PCSR over OpenOCD from the board's HIL entry and reports the raw PC
-histogram, without symbols; `--samples` sets the count.
+hot spot of its own: learn it from a healthy run before reading a wedged one. The sentinel means the target halted or
+slept by itself, but a J-Link session does not leave that state alone: it halts the core when it closes and restarts it
+unless told `exec SetRestartOnClose = 0` (V9.78, verified 2026-10-16 stm32f407disco: DFSR.HALTED set after every plain
+session; a core found halted ran at the next session; with the setting, a running core stayed halted). Native probes
+(ST-Link/CMSIS-DAP) are not covered by the script yet: `probe_state.py` (next section) samples PCSR over OpenOCD from
+the board's HIL entry and reports the raw PC histogram, without symbols; `--samples` sets the count.
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 
@@ -47,12 +48,13 @@ python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [-
 ```
 
 - The script issues no configuration write; the connect does (PC-sampling above: the tools set TRCENA, OpenOCD also
-  DHCSR.C_DEBUGEN), so `demcr` is the tool's value, not the firmware's. It halts only with `--allow-halt`, when no
-  sample was usable from a running core; over OpenOCD it refuses that on a multi-core target, where the SMP halt stops
-  every core and the resume fails for a core OpenOCD never polled, leaving it halted (OpenOCD 0.12.0+dev-g0ce743125,
-  `cortex_m_restore_smp`; RP2040 core1, verified 2026-10-16), and OpenOCD's resume error is unreliable there in both
-  directions, so judge each core by its DHCSR. Reads use J-Link `savebin` and OpenOCD `dump_image`, never
-  `verify_image`, whose checksum path writes its CRC loader into the target's work area first
+  DHCSR.C_DEBUGEN), so `demcr` is the tool's value, not the firmware's. Each J-Link session also halts the core as it
+  closes and restarts it (PC-sampling above), so a core it finds halted is running afterwards. Otherwise it halts only
+  with `--allow-halt`, when no sample was usable from a running core; over OpenOCD it refuses that on a multi-core
+  target, where the SMP halt stops every core and the resume fails for a core OpenOCD never polled, leaving it halted
+  (OpenOCD 0.12.0+dev-g0ce743125, `cortex_m_restore_smp`; RP2040 core1, verified 2026-10-16), and OpenOCD's resume error
+  is unreliable there in both directions, so judge each core by its DHCSR. Reads use J-Link `savebin` and OpenOCD
+  `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area first
   (`armv7m_checksum_memory`), even on a running core.
 - `--budget`: `fpCtrl.numCode` is the hardware breakpoint count (FP_CTRL bits [7:4] and [14:12]; ARMv6-M's BP_CTRL
   reserves the high bits), `dwtCtrl.numComp` the watchpoint comparators, reported only while TRCENA is set since the DWT
