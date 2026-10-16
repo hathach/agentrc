@@ -909,12 +909,19 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertIn('stopped before its guards passed, so it halted nothing', r.stderr)
         self.assertEqual(len(self.scripts()), 2)    # no recovery session
 
-    def test_an_interrupted_fallback_is_recovered(self):
-        # stall '1': interrupted with the core halted mid-loop; 'early': before the loop halted anything
-        for stall, now in (('1', 'the core was left halted, resumed: now running'), ('early', 'the core is running')):
+    def test_an_interrupted_fallback_is_recovered_only_past_its_guards(self):
+        # stall '1': interrupted mid-loop with the core halted by it; 'early': before its guards printed, with a
+        # core that halted by itself meanwhile, which no recovery may resume
+        for stall, now, sessions, end in (('1', 'the core was left halted, resumed: now running', 3, '01010001'),
+                                          ('early', 'stopped before its guards passed, so it halted nothing', 2,
+                                           '00030003')):
             state = self.d / f'state-{stall}'
+
+            def halted_by_itself():
+                state.write_text('00030003')
+                return True
             until = ((lambda: state.exists() and state.read_text() == '00030003') if stall == '1' else
-                     (lambda: self.log.exists() and len(self.scripts()) == 2))
+                     (lambda: self.log.exists() and len(self.scripts()) == 2 and halted_by_itself()))
             rc, _, stderr = self.signal_when(
                 [str(SCRIPT), '--hil-config', str(self.config), '--board', 'max32', '--elf', str(self.elf),
                  '--addr2line', 'fake-addr2line', '--samples', '2', '--halt-samples', '3'], until,
@@ -922,9 +929,30 @@ class PcSampleOpenOCDTest(FakeToolsCase):
             self.assertEqual(rc, 1, stderr)
             self.assertIn('halting fallback: interrupted by signal 2', stderr)
             self.assertIn(now, stderr)
-            self.assertEqual(len(self.scripts()), 3)    # the recovery session ran
-            self.assertEqual(state.read_text(), '01010001')
+            self.assertEqual(len(self.scripts()), sessions)
+            self.assertEqual(state.read_text(), end)
             self.log.unlink()
+
+    def test_a_signal_as_the_fallback_fails_still_recovers(self):
+        # the signal lands while the failed session's ToolError is propagating: its output still decides
+        sys.path.insert(0, str(SCRIPT.parent))
+        import pc_sample
+        failure = pc_sample.ToolError('openocd: halt timed out')
+        failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
+
+        class Backend:
+            def batch(self, body, timeout):
+                try:
+                    raise failure
+                finally:
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+        previous = signal.getsignal(signal.SIGTERM)
+        with mock.patch.object(pc_sample, 'recover', return_value='; recovered') as recover:
+            with self.assertRaisesRegex(pc_sample.ToolError, 'interrupted by signal 15; recovered'):
+                pc_sample.halt_samples(Backend(), 3, 500, 10, 30)
+        recover.assert_called_once()
+        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
 
     def test_a_core_that_is_not_m_profile_is_refused(self):
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF', FAKE_CPUID='00000000')

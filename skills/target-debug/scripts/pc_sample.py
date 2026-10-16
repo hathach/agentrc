@@ -17,8 +17,8 @@ when the samples gave none from a core found running, a second session re-reads 
 on a single-core target that is running, halts it N times (each halt waits up to
 --halt-timeout-ms), reads PC and resumes, stopping at the first halt or resume that fails
 and leaving the core resumed when it can (a session that fails, times out or is stopped by
-SIGINT or SIGTERM mid-loop is followed by one that resumes a core it left halted; signals
-during that one are ignored). Those PCs are counted apart from the observed
+SIGINT or SIGTERM after its guards passed is followed by one that resumes a core it left
+halted; signals during that one are ignored). Those PCs are counted apart from the observed
 ones. A multi-core target is refused: an SMP halt stops every core and OpenOCD cannot
 resume a core it has not polled. J-Link Commander cannot stop on a failed resume, so the
 J-Link route has no fallback.
@@ -193,17 +193,23 @@ def halt_samples(backend, n, halt_timeout_ms, interval_ms, timeout):
 
     previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
-        text, reads = backend.batch(halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
-        armed = False
+        try:
+            text, reads = backend.batch(halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
+        finally:
+            armed = False    # from here on a signal is ignored, so it cannot cut the recovery below short
     except (ToolError, Interrupted) as e:
-        armed = False
         # recover only a core this session showed running on a single-core target before halting it;
         # openocd flushes each echo at once (log_puts in log.c), so GUARDED is out before the first halt.
-        # A session killed by a signal may have passed its guards unseen, so it is recovered too.
-        if isinstance(e, Interrupted) or re.search(r'^GUARDED$', getattr(e, 'text', ''), re.M):
+        # A signal that landed as the session failed carries its output on the failure it interrupted.
+        text = getattr(e, 'text', None)
+        if text is None and e.__context__ is not None:
+            text = getattr(e.__context__, 'text', None)
+        if text is not None and re.search(r'^GUARDED$', text, re.M):
             after = recover(backend, 30)
         elif str(e).startswith('openocd: refused:'):
             after = ''
+        elif text is None:
+            after = '; what the session did is unknown: check the core with probe_state.py'
         else:
             after = '; it stopped before its guards passed, so it halted nothing: check the core with probe_state.py'
         raise ToolError(f'halting fallback: {e}{after}') from e

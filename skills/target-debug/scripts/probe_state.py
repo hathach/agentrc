@@ -327,16 +327,35 @@ def tool(env, posix, windows=None):
 
 
 def run(cmd, timeout, stdin=None):
-    try:
-        r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        err = ToolError(f'{os.path.basename(cmd[0])} did not finish within {timeout:.0f} s')
-        err.text = ''.join(x.decode(errors='replace') if isinstance(x, bytes) else x or ''
-                           for x in (e.stdout, e.stderr))
-        raise err from e
-    text = r.stdout + r.stderr
-    if r.returncode != 0:
-        err = ToolError(f'{os.path.basename(cmd[0])} exited {r.returncode}; last output:\n{tail(text)}')
+    """The tool's stdout and stderr as one text. Its output goes to a file, so a session that times out
+    or is interrupted (any exception, a signal handler's included) still carries what it printed, as
+    the exception's .text; the tool is killed then."""
+    with tempfile.TemporaryFile() as out:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+                                stdout=out, stderr=subprocess.STDOUT)
+        try:
+            if stdin is not None:
+                try:
+                    proc.stdin.write(stdin.encode())
+                    proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            rc = proc.wait(timeout)
+        except BaseException as e:
+            proc.kill()
+            proc.wait()
+            out.seek(0)
+            text = out.read().decode(errors='replace')
+            if isinstance(e, subprocess.TimeoutExpired):
+                err = ToolError(f'{os.path.basename(cmd[0])} did not finish within {timeout:.0f} s')
+                err.text = text
+                raise err from e
+            e.text = text
+            raise
+        out.seek(0)
+        text = out.read().decode(errors='replace')
+    if rc != 0:
+        err = ToolError(f'{os.path.basename(cmd[0])} exited {rc}; last output:\n{tail(text)}')
         err.text = text
         raise err
     return text
