@@ -179,7 +179,8 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   `console_capture.py` opens with `--lines low` or `leave` reset none of the P4, the S31 and the Metro (no banner in
   6 s, USB numbers kept); a USJ-driven reset of the P4 (DTR low, RTS high) kept the whole ROM banner in the capture.
   Later the same day: `esp_verify.py` matched the Metro's cdc_msc_throughput over ESP-Prog channel B after a forced
-  download boot (`espressif.md`, "ESP32-S3"); with the end-of-stack watchpoint build (cdc_msc_freertos, option on) the
+  download boot (`espressif.md`, "ESP32-S3"; esptool 5.2.0's stub upload failed there with "Serial data stream
+  stopped", 5.5.0 passed); with the end-of-stack watchpoint build (cdc_msc_freertos, option on) the
   Metro's budget stayed exactly 2 and the S31's attach panicked ("The end-of-stack watchpoint"); both boards were put
   back on their option-off images and verified.
 - cdc_msc_throughput: its CDC interface is `usb-TinyUSB_Throughput_<serial>-if00`, and its CDC filler is NUL bytes

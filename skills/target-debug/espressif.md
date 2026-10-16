@@ -14,7 +14,7 @@ board, firmware and tools it names.
 | ESP32-S2  | Xtensa LX7, 1    | `xtensa-esp32s2-elf-gdb` | pads only; Kaluga: its FT2232HL, `-f interface/ftdi/esp32s2_kaluga_v1.cfg -c 'adapter usb location <loc>' -f target/esp32s2.cfg` | 2 instruction + 2 data; the third `hbreak` refused; data breakpoints untested | pads | Kaluga: UART by `by-path` for flash and console | 0x1000 |
 | ESP32-S3  | Xtensa LX7, 2    | `xtensa-esp32s3-elf-gdb` | USJ `board/esp32s3-builtin.cfg` only until the app starts OTG; pads `board/esp32s3-ftdi.cfg` once the eFuses route them | 2 + 2; the third refused (Metro, with and without the end-of-stack watchpoint); data breakpoints untested | no over the USJ on the measured internal-PHY boards, yes over pads | DevKitC-1: CP2102N (UART0, EN, boot strap); Metro: images over JTAG, UART0 on a header only | 0x0 |
 | ESP32-P4  | RISC-V HP 2 + LP | `riscv32-esp-elf-gdb`    | USJ `board/esp32p4-builtin.cfg -c 'adapter serial <MAC>'` | 3 triggers per HP core, breakpoints and watchpoints shared; firmware may hold one; watchpoint insertion untested | yes, USJ and HS OTG on their own PHYs | Function-EV: USJ CDC or the CP2102N on J20 for flash and reset; the 2026-10-16 runs captured the console on the USJ CDC | 0x2000 |
-| ESP32-S31 | RISC-V HP 2 + LP | `riscv32-esp-elf-gdb`    | USJ `board/esp32s31-builtin.cfg -c 'adapter serial <MAC>'` | 4 triggers per HP core, all four inserted, also with the end-of-stack watchpoint build, whose attach panicked ("The end-of-stack watchpoint") | yes | CoreBoard: USJ CDC for flash, reset and console (its CP2102N receive path was unusable, 2026-10-14) | 0x2000 |
+| ESP32-S31 | RISC-V HP 2 + LP | `riscv32-esp-elf-gdb`    | USJ `board/esp32s31-builtin.cfg -c 'adapter serial <MAC>'` | 4 triggers per HP core, all four inserted; coexistence with a firmware watchpoint unmeasured, its attach panicking ("The end-of-stack watchpoint") | yes | CoreBoard: USJ CDC for flash, reset and console (its CP2102N receive path was unusable, 2026-10-14) | 0x2000 |
 
 Pins, PHYs and their citations: "The USB ports per chip". The bootloader offset is the ROM's
 (`ESP_ROM_BOOTLOADER_OFFSET_FLASH` in IDF's `components/esp_rom/<chip>/esp_rom_caps.h`). Board wiring, recovery and what
@@ -209,12 +209,11 @@ The same example rebuilt with the option off, same boards, tools and recipe, pas
 (`projects/tinyusb.md`, the run records): no reset at the one examination per board, one `debug_reason=00000001` line in
 the whole log (the breakpoint hit), USB service kept through the attach, a 1 s halt and the hit under MSC and CDC
 traffic with no kernel message, and a clean `shutdown` with the device still answering. One clean attach per board does
-not bound the panic rate. The S2 and S3 runs with the option on showed neither the attach panics nor the service loss
-(the Metro's `esp_session.py budget` with it on: exactly 2, three sessions with the cores running before and after,
-2026-10-16): on Xtensa the watchpoint is a register write (`cpu.c:146`), which openocd's `wp` does not list since it
-shows the watchpoints openocd set. To build an IDF app without it: `idf.py reconfigure` creates the project's
-`sdkconfig` (IDF 6.1 `project.cmake:104`; a project may set `SDKCONFIG` elsewhere, `projects/`); set the option to `n`
-there, then `idf.py build` (a project's `sdkconfig.defaults` only seeds that file).
+not bound the panic rate. The S2 and S3 runs with the option on showed neither the attach panics nor the service loss:
+on Xtensa the watchpoint is a register write (`cpu.c:146`), which openocd's `wp` does not list since it shows the
+watchpoints openocd set. To build an IDF app without it: `idf.py reconfigure` creates the project's `sdkconfig` (IDF 6.1
+`project.cmake:104`; a project may set `SDKCONFIG` elsewhere, `projects/`); set the option to `n` there, then `idf.py
+build` (a project's `sdkconfig.defaults` only seeds that file).
 
 ## Resets
 
@@ -342,13 +341,10 @@ under Attach and in `projects/tinyusb.md`.
   microSD socket, IO40/41 are the D1/D0 header pins; UART0 only on header JP2, pin 1 TXD0, no USB-UART bridge. Under an
   OTG app esptool has no port to this board: images go over JTAG (`program_esp`, "Verify OK" on 2026-10-16). Its UART0
   reaches ESP-Prog channel B with EN but not IO0 (`--before default-reset` boots the app: "Wrong boot mode detected
-  (0x8)"), so verification goes through a forced download boot: over JTAG, halt, set `RTC_CNTL_FORCE_DOWNLOAD_BOOT`
-  (`RTC_CNTL_RTC_OPTION1_REG` 0x6000812C bit 0, ESP32-S3 TRM book 4890 p628, the 0x6000_8000 base p408; honoured on a
-  CPU reset unless an eFuse disables it, p536) and `reset run`; then `esp_verify.py --before no-reset --after
-  hard-reset` on channel B matched every image (esptool 5.5.0, 2026-10-16; 5.2.0's stub upload failed there with
-  "Serial data stream stopped"). Its hard reset clears the bit but pulses RTS with DTR still asserted from the open, so
-  EN stays high and the chip stays in the loader: pulse EN afterwards (RTS asserted, DTR deasserted; a chip reset
-  clears the bit, p526).
+  (0x8)"), so verification goes through a forced download boot: over JTAG, halt, set `FORCE_DOWNLOAD_BOOT` ("Reset
+  domains") and `reset run`; then `esp_verify.py --before no-reset --after hard-reset` on channel B matched every image
+  (esptool 5.5.0). Its hard reset clears the bit but pulses RTS with DTR still asserted from the open, so EN stays high
+  and the chip stays in the loader: pulse EN afterwards (RTS asserted, DTR deasserted).
 - ESP-Prog on the Metro: `board/esp32s3-ftdi.cfg`, `adapter serial <FTDI EEPROM serial>`, JTAG PWR SEL and PROG PWR SEL
   on 3.3 V. Its JTAG header carries no reset (pin 10 NC, so X2 pin 10 EN stays unconnected; guide book 6576 p10), and
   `ESP_EN` on PROG pin 1 also gates the probe's own JTAG buffers through an inverter, with its pull-up R7 drawn NC

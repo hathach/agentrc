@@ -58,7 +58,6 @@ if mode in ('mismatch', 'mismatch_failure'):
     print('ERROR: A fatal error occurred: ' + reason, file=sys.stderr)
     sys.exit(2)
 if mode == 'late_failure':
-    print('Hard resetting via RTS pin...')
     print('ERROR: A fatal error occurred: Lost connection during reset.', file=sys.stderr)
     sys.exit(2)
 '''
@@ -161,15 +160,13 @@ class VerifyTest(unittest.TestCase):
                 self.assertEqual(code, 2, result)
                 self.assertIn('ROM loader', result['chipState'])
 
-    def test_a_failure_before_the_command_leaves_the_chip_state_unknown(self):
+    def test_a_failed_run_leaves_the_chip_state_unknown(self):
         # the caller put the chip in the ROM loader and asked --after to reset it; the stub upload failed first
         code, result = self.run_cli('--after', 'hard-reset', FAKE_MODE='stub_failure')
         self.assertEqual(code, 3, result)
         self.assertIn('ROM loader', result['chipState'])
-        code, result = self.run_cli('--after', 'hard-reset', FAKE_MODE='late_failure')
-        self.assertEqual(code, 3, result)
-        self.assertNotIn('chipState', result)    # the reset ran
         code, result = self.run_cli(FAKE_MODE='stub_failure')
+        self.assertEqual(code, 3, result)
         self.assertNotIn('chipState', result)    # no-reset both ways: the caller keeps the chip where it was
 
     def test_a_refusal_before_the_tool_says_nothing_of_the_chip(self):
