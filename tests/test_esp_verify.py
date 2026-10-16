@@ -27,6 +27,10 @@ if mode == 'wrong_chip':
     print('ERROR: A fatal error occurred: This chip is ESP32-S3, not ESP32-P4. '
           'Wrong chip argument?', file=sys.stderr)
     sys.exit(2)
+if mode == 'hang':
+    print('Connected to ESP32-P4 on /dev/serial/by-id/fake:', flush=True)
+    import time
+    time.sleep(30)
 if mode == 'stub_failure':
     print('Connected to ESP32-P4 on /dev/serial/by-id/fake:')
     print('Uploading stub flasher...')
@@ -169,6 +173,14 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(code, 3, result)
         self.assertNotIn('chipState', result)    # no-reset both ways: the caller keeps the chip where it was
 
+    def test_a_hung_esptool_is_killed_at_the_timeout(self):
+        code, result = self.run_cli('--after', 'hard-reset', '--timeout', '1', FAKE_MODE='hang')
+        self.assertEqual(code, 3, result)
+        self.assertIn('did not finish within 1 s', result['error'])
+        self.assertIsNone(result['tool_exit'])
+        self.assertIn('Connected to', result['stdout'])
+        self.assertIn('ROM loader', result['chipState'])
+
     def test_a_refusal_before_the_tool_says_nothing_of_the_chip(self):
         self.files['0x2004'] = 'app space [1].bin'
         self.write_manifest()
@@ -265,6 +277,7 @@ class VerifyTest(unittest.TestCase):
     def test_reset_choices_and_chip_are_explicit(self):
         self.assert_refused('--before', 'default_reset')
         self.assert_refused('--chip', 'auto')
+        self.assert_refused('--timeout', '0')
         proc = subprocess.run([sys.executable, str(SCRIPT)], capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(json.loads(proc.stdout)['status'], 'refused')

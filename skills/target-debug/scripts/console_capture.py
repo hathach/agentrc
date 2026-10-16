@@ -12,7 +12,7 @@ discards unread input), and puts the port's original settings back at the end; a
 fails fails the run.
 
 --lines is the control-line policy, with no default: `leave` keeps DTR and RTS as the open set
-them, `low` clears both right after the open. Neither keeps them low through the open: Linux
+them, `low` clears both once the port is configured. Neither keeps them low through the open: Linux
 raises DTR and RTS when a serial port opens, and on Espressif boards a line change can reset
 the chip (espressif.md, Console). A port without modem control lines (a pty) refuses `low`.
 Closing the port drops both lines again when the restored settings carry HUPCL.
@@ -157,16 +157,17 @@ def main(argv=None):
         fd = os.open(a.port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
         t_open = time.monotonic()
         result['openedAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='milliseconds')
-        if a.lines == 'low':
-            try:
-                fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack('i', termios.TIOCM_DTR | termios.TIOCM_RTS))
-            except OSError as e:
-                raise OSError(e.errno, f'cannot clear DTR/RTS on this port ({e.strerror}); --lines low refused')
         saved = termios.tcgetattr(fd)
         tty.setraw(fd, termios.TCSANOW)
         attrs = termios.tcgetattr(fd)
         attrs[4] = attrs[5] = speed
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        if a.lines == 'low':
+            # after the baud: leaving B0 raises the lines again (ftdi_sio.c, cdc-acm.c set_termios)
+            try:
+                fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack('i', termios.TIOCM_DTR | termios.TIOCM_RTS))
+            except OSError as e:
+                raise OSError(e.errno, f'cannot clear DTR/RTS on this port ({e.strerror}); --lines low refused')
         result['lines'] = {'policy': a.lines, 'afterSetup': modem_lines(fd)}
         deadline = t_open + a.seconds
         while (left := deadline - time.monotonic()) > 0:

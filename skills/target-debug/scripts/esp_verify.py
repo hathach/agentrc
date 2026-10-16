@@ -2,11 +2,12 @@
 """Verify every image in an ESP-IDF flasher_args.json, without programming flash.
 
   esp_verify.py --manifest <build>/flasher_args.json --chip esp32p4 \
-      --port /dev/serial/by-id/<port> --before default-reset --after hard-reset
+      --port /dev/serial/by-id/<port> --before default-reset --after hard-reset [--timeout S]
 
 ESP_VERIFY_ESPTOOL is a command line (e.g. '/path/to/python -m esptool'); otherwise
 use esptool on PATH. The command/output contract is esptool 5.5.0 from ESP-IDF 6.1.
-Reset policies are required, never taken from the manifest. No retry is made.
+Reset policies are required, never taken from the manifest. No retry is made. esptool is
+killed after --timeout seconds (default 300), a tool failure that leaves the chip state unknown.
 Port ownership is the caller's board lock, not checked here: esptool's pyserial
 exclusive=True uses advisory flock on POSIX and cannot exclude other readers
 (esptool/loader.py:453-465; serial/serialposix.py:382-389). Stop console readers.
@@ -172,7 +173,10 @@ def main(argv=None):
         parser.add_argument('--port', required=True)
         parser.add_argument('--before', required=True, choices=BEFORE)
         parser.add_argument('--after', required=True, choices=AFTER)
+        parser.add_argument('--timeout', type=float, default=300.0, help='seconds before esptool is killed')
         args = parser.parse_args(argv)
+        if not 0 < args.timeout < float('inf'):
+            raise ValueError('--timeout must be a finite positive number of seconds')
         if not re.fullmatch(r'esp(?:32[a-z0-9]*|8266)', args.chip):
             raise ValueError('--chip must name an explicit ESP chip, not auto')
         if not PORT.fullmatch(args.port) or args.port.rsplit('/', 1)[-1] in ('.', '..'):
@@ -208,7 +212,14 @@ def main(argv=None):
                 command += [hex(image['offset']), sources[image['offset']]]
             result['command'] = command
             env = {**os.environ, 'ESPTOOL_OPEN_PORT_ATTEMPTS': '1', 'NO_COLOR': '1'}
-            proc = subprocess.run(command, capture_output=True, text=True, errors='replace', env=env)
+            try:
+                proc = subprocess.run(command, capture_output=True, text=True, errors='replace', env=env,
+                                      timeout=args.timeout)
+            except subprocess.TimeoutExpired as exc:
+                # its output can come back as bytes after a timeout even with text=True
+                text = lambda b: b.decode(errors='replace') if isinstance(b, bytes) else (b or '')
+                result.update(tool_exit=None, stdout=text(exc.stdout), stderr=text(exc.stderr))
+                raise ValueError(f'esptool did not finish within {args.timeout:g} s and was killed') from exc
             result.update(tool_exit=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
             output = proc.stdout + '\n' + proc.stderr
             # loader.py:984-995: unknown chip warning or explicit chip disagreement is a refusal.
