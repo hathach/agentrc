@@ -5,303 +5,231 @@ description: "Use when firmware misbehaves on real hardware and its own state mu
 
 # target-debug — target-side capture & debugging over a debug probe
 
-The **target** is the MCU running the code under test. The discipline here
-holds for any firmware on a debug probe, and each technique names the
-architecture it exists on; the worked cases are USB stacks (device
-role, host role, or both), where the link peer is not always a Linux PC: an MCU
-host may face another board or a Linux gadget (e.g. a Raspberry Pi).
+The **target** is the MCU running the code under test. The discipline here holds for any firmware on a debug probe, and
+each technique names the architecture it exists on; the worked cases are USB stacks (device role, host role, or both),
+where the link peer is not always a Linux PC: an MCU host may face another board or a Linux gadget (e.g. a Raspberry
+Pi).
 
 ## Which skill answers what
 
-| Skill                | Answers                                                          | Needs                                                   |
-|----------------------|------------------------------------------------------------------|---------------------------------------------------------|
-| **`target-debug`**   | **what the target did** (driver state, faults, where the core spins) | a debug probe on the target                        |
-| `rtt`                | the target's log/console stream, and a post-mortem ring dump     | a probe, firmware that logs over SEGGER RTT             |
-| `etm-trace`          | exactly which instructions ran (profile, coverage, history)      | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule |
-| `usb-sniffer`        | what crossed the wire (PIDs, handshakes, resets)                 | the hardware tap cabled in; role-agnostic               |
+| Skill                 | Answers                                                                                                                      | Needs                                                                                                   |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| **`target-debug`**    | **what the target did** (driver state, faults, where the core spins)                                                         | a debug probe on the target                                                                             |
+| `rtt`                 | the target's log/console stream, and a post-mortem ring dump                                                                 | a probe, firmware that logs over SEGGER RTT                                                             |
+| `etm-trace`           | exactly which instructions ran (profile, coverage, history)                                                                  | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule                            |
+| `usb-sniffer`         | what crossed the wire (PIDs, handshakes, resets)                                                                             | the hardware tap cabled in; role-agnostic                                                               |
 | a project's `sysview` | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | the project ships the skill; a J-Link/J-Trace for live capture, or an OpenOCD probe for raw RTT capture |
-| `usb-kernel-debug`   | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
+| `usb-kernel-debug`    | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug)                                           | Linux on either end: PC host or gadget peer                                                             |
 
-**Espressif targets** (ESP32-S2/S3/P4/S31 and the C series): read
-`espressif.md` first; it names the tools, the JTAG route per chip and the
-console.
+**Espressif targets** (ESP32-S2/S3/P4/S31 and the C series): read `espressif.md` first; it names the tools, the JTAG
+route per chip and the console.
 
 ## What the project supplies
 
-These skills know probes, not projects. Three things come from the project, and
-none of them is ever guessed:
+These skills know probes, not projects. Three things come from the project, and none of them is ever guessed:
 
-- **How to build a debug variant** (logging over RTT, trace init, where the ELF
-  lands, the J-Link device name or OpenOCD config of a board): the project's
-  `Build contract:` line in its `CLAUDE.md` names the skill or document that
-  says. No contract: use the ELF and device/config the caller gave, and ask for
-  what is missing.
-- **How to take a rig board**: the project's `HIL contract:` line names its rig
-  skill, which owns lock and release and says which HIL config json describes
-  the host you are on. No contract: follow the procedure the caller gave; on a
+- **How to build a debug variant** (logging over RTT, trace init, where the ELF lands, the J-Link device name or OpenOCD
+  config of a board): the project's `Build contract:` line in its `CLAUDE.md` names the skill or document that says. No
+  contract: use the ELF and device/config the caller gave, and ask for what is missing.
+- **How to take a rig board**: the project's `HIL contract:` line names its rig skill, which owns lock and release and
+  says which HIL config json describes the host you are on. No contract: follow the procedure the caller gave; on a
   shared rig with none, ask before touching a board.
-- **What its symbols and symptoms mean**: kept here, in `projects/`, for the
-  projects this skill has been used on — see "Project notes" at the end.
+- **What its symbols and symptoms mean**: kept here, in `projects/`, for the projects this skill has been used on — see
+  "Project notes" at the end.
 
-A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it
-directly (`--hil-config <file> --board <name>`; a flag given as well must agree):
+A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it directly
+(`--hil-config <file> --board <name>`; a flag given as well must agree):
 
-| `flasher` field | Means | Becomes |
-|---|---|---|
-| `name` | how the rig flashes: `jlink`, `openocd`, `stlink` are probe routes; `esptool`, `lm4flash` are refused: they name no debug probe (Espressif debug transport and selector: `espressif.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
-| `uid` | the probe's serial | `--probe` |
-| `args` | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments | `--device`, or `--cfg` whole |
-| `vid_pid` | the probe model's USB IDs, openocd only | `--vid-pid` |
+| `flasher` field | Means                                                                                                                                                                                    | Becomes                                                             |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `name`          | how the rig flashes: `jlink`, `openocd`, `stlink` are probe routes; `esptool`, `lm4flash` are refused: they name no debug probe (Espressif debug transport and selector: `espressif.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
+| `uid`           | the probe's serial                                                                                                                                                                       | `--probe`                                                           |
+| `args`          | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments                                                                                                                        | `--device`, or `--cfg` whole                                        |
+| `vid_pid`       | the probe model's USB IDs, openocd only                                                                                                                                                  | `--vid-pid`                                                         |
 
-A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and
-`--speed` stay explicit; on the OpenOCD route they live inside `--cfg` and the two
-flags are refused. `pc_sample.py` takes J-Link entries only; `probe_state.py` reads only
-the HIL config and takes `jlink` and `openocd` entries. `etm_capture.py` does not read it — a J-Trace is one probe moved
-between boards, named with `--probe`.
+A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and `--speed` stay explicit; on
+the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` takes J-Link entries only;
+`probe_state.py` reads only the HIL config and takes `jlink` and `openocd` entries. `etm_capture.py` does not read it —
+a J-Trace is one probe moved between boards, named with `--probe`.
 
 ## Delegated sessions
 
-When an agent dispatches this work (chief's `hw-validator` and `hw-debugger`
-units), the prompt is the scope and these rules bind the unit; its role file
-adds only what it may edit and when it stops.
+When an agent dispatches this work (chief's `hw-validator` and `hw-debugger` units), the prompt is the scope and these
+rules bind the unit; its role file adds only what it may edit and when it stops.
 
-- **Scope.** Stay within the prompt's board, operations and source paths;
-  resolve the build and access through the project's contracts or the ELF,
-  device/config and procedure it supplies. The dispatch supplies hardware task
-  scope; no human grant or verbatim exchange is needed for its hardware
-  operations. Missing technical inputs or scope return `blocked` with what the
-  caller must supply. Use `needs-user` for human-only action or a permission
-  still required for publishing, destructive actions on data or third-party
-  access, instead of waiting for an answer. Establish the physical setup a
-  technique needs before using it. If wiring cannot be established from
-  current evidence or the supplied setup information, name the missing setup
-  and proposed experiment in `next`: for ETM, follow `etm-trace`'s per-board
-  wiring rule.
-- **Identity.** Verify worktree, branch and HEAD, then board, probe serial and
-  host against the prompt, or the probe against the HIL config entry it names,
-  before acting. Resolve the board's family and debug backend from the
-  project's metadata before choosing probe tools, never from the board name or
-  its flashing backend.
-- **Lock.** Ordinary hardware sessions hold the project's board lock for the
-  whole hardware phase; a refused hold waits within the lock-wait budget, then
-  returns `blocked` with the holder. Forced-lock recovery is a separate,
-  explicitly scoped operation naming the holder, affected resources and
-  recovery procedure; a refusal alone never adds that scope, and it never
-  includes stopping the CI runner. A reproducer that takes the lock itself
-  (tinyusb's `hil_test.py`) never runs under your hold, and its guard is
-  bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
-  reproduction while its firmware, configuration, reproducer and relevant rig
-  inputs match; otherwise resolve equivalent manual steps through the HIL
-  contract, and if there are none return `blocked` naming the exact HIL
-  reproduction needed, so the caller arranges it through the project's HIL
-  role. A later manual session re-establishes firmware identity and state and
-  never treats a snapshot taken after that handoff as the earlier failure
-  state without evidence.
-- **Builds.** Through the build contract into a private build directory,
-  leaving firmware staged for HIL untouched. Before the first hardware change,
-  save the restoration artifact apart from later build outputs and pin it: its
-  revision, configuration and hash, recorded as `cleanup.pristine`; cleanup
-  restores that identity, and later commits do not move it. When the
-  project's HIL contract defines a cleanup state instead of a restoration
-  firmware, record that state there. Tracked paths a build may rewrite are in
-  the prompt's temporary scope, or reported before building.
-- **Instrumentation.** Only the listed paths, from a clean checkout,
-  uncommitted, each diff saved as a patch in the artifact directory. From a
-  previous unit's dirty state (a recovery prompt): inspect the recorded patch
-  and current changes first, restore only what is attributable to it, report
-  ambiguous ownership untouched.
-- **Observation.** The prompt's observation window is the ceiling on one
-  reproducer attempt; the criterion states the required operations or minimum
-  exposure, and a completed deterministic operation ends the attempt. Every
-  reproducer invocation, including smoke checks, cleanup checks that invoke it
-  and failed or truncated captures, is accounted for in `runs` and counts
-  toward the repetition ceiling; a state read or run-state observation that
-  does not invoke the reproducer costs time, not a repetition. A `runs` row
-  aggregates identical attempts and splits where purpose, firmware, conditions
-  or outcome differ. An early decisive observation may settle the claim;
-  otherwise a shortened capture is partial evidence and cannot establish a
-  pass that needs the full exposure. Anchor every state reading with the
-  backend's validity check (Cortex-M: DHCSR; Espressif: a console banner
-  baseline taken at port open, before the attach, `espressif.md` Anchors)
-  and record whether
-  attaching halted or reset the target; a post-reset snapshot is never the
-  failure state.
-- **Host.** Leave the host as found: never clear kernel logs (`dmesg -C`) or
-  other shared history, and restore every setting you change (dynamic debug,
-  module parameters). Anchor kernel-log reads on raw kernel timestamps
-  (`dmesg --time-format raw`) and take the clock mapping from a kernel
-  event you caused at a known wall time: line counts fail once the ring
-  wraps, `-T` and ISO stamps need that mapping checked, and `/proc/uptime`
-  is not it (`-T` and `/proc/uptime` were both ~30 s off on htpc,
-  2026-10-16). A host with `dmesg_restrict` refuses an unprivileged
+- **Scope.** Stay within the prompt's board, operations and source paths; resolve the build and access through the
+  project's contracts or the ELF, device/config and procedure it supplies. The dispatch supplies hardware task scope; no
+  human grant or verbatim exchange is needed for its hardware operations. Missing technical inputs or scope return
+  `blocked` with what the caller must supply. Use `needs-user` for human-only action or a permission still required for
+  publishing, destructive actions on data or third-party access, instead of waiting for an answer. Establish the
+  physical setup a technique needs before using it. If wiring cannot be established from current evidence or the
+  supplied setup information, name the missing setup and proposed experiment in `next`: for ETM, follow `etm-trace`'s
+  per-board wiring rule.
+- **Identity.** Verify worktree, branch and HEAD, then board, probe serial and host against the prompt, or the probe
+  against the HIL config entry it names, before acting. Resolve the board's family and debug backend from the project's
+  metadata before choosing probe tools, never from the board name or its flashing backend.
+- **Lock.** Ordinary hardware sessions hold the project's board lock for the whole hardware phase; a refused hold waits
+  within the lock-wait budget, then returns `blocked` with the holder. Forced-lock recovery is a separate, explicitly
+  scoped operation naming the holder, affected resources and recovery procedure; a refusal alone never adds that scope,
+  and it never includes stopping the CI runner. A reproducer that takes the lock itself (tinyusb's `hil_test.py`) never
+  runs under your hold, and its guard is bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
+  reproduction while its firmware, configuration, reproducer and relevant rig inputs match; otherwise resolve equivalent
+  manual steps through the HIL contract, and if there are none return `blocked` naming the exact HIL reproduction
+  needed, so the caller arranges it through the project's HIL role. A later manual session re-establishes firmware
+  identity and state and never treats a snapshot taken after that handoff as the earlier failure state without evidence.
+- **Builds.** Through the build contract into a private build directory, leaving firmware staged for HIL untouched.
+  Before the first hardware change, save the restoration artifact apart from later build outputs and pin it: its
+  revision, configuration and hash, recorded as `cleanup.pristine`; cleanup restores that identity, and later commits do
+  not move it. When the project's HIL contract defines a cleanup state instead of a restoration firmware, record that
+  state there. Tracked paths a build may rewrite are in the prompt's temporary scope, or reported before building.
+- **Instrumentation.** Only the listed paths, from a clean checkout, uncommitted, each diff saved as a patch in the
+  artifact directory. From a previous unit's dirty state (a recovery prompt): inspect the recorded patch and current
+  changes first, restore only what is attributable to it, report ambiguous ownership untouched.
+- **Observation.** The prompt's observation window is the ceiling on one reproducer attempt; the criterion states the
+  required operations or minimum exposure, and a completed deterministic operation ends the attempt. Every reproducer
+  invocation, including smoke checks, cleanup checks that invoke it and failed or truncated captures, is accounted for
+  in `runs` and counts toward the repetition ceiling; a state read or run-state observation that does not invoke the
+  reproducer costs time, not a repetition. A `runs` row aggregates identical attempts and splits where purpose,
+  firmware, conditions or outcome differ. An early decisive observation may settle the claim; otherwise a shortened
+  capture is partial evidence and cannot establish a pass that needs the full exposure. Anchor every state reading with
+  the backend's validity check (Cortex-M: DHCSR; Espressif: a console banner baseline taken at port open, before the
+  attach, `espressif.md`, Attach, Anchors) and record whether attaching halted or reset the target; a post-reset
+  snapshot is never the failure state.
+- **Host.** Leave the host as found: never clear kernel logs (`dmesg -C`) or other shared history, and restore every
+  setting you change (dynamic debug, module parameters). Anchor kernel-log reads on raw kernel timestamps
+  (`dmesg --time-format raw`) and take the clock mapping from a kernel event you caused at a known wall time: line
+  counts fail once the ring wraps, `-T` and ISO stamps need that mapping checked, and `/proc/uptime` is not it (`-T` and
+  `/proc/uptime` were both ~30 s off on htpc, 2026-10-16). A host with `dmesg_restrict` refuses an unprivileged
   `dmesg -w` ("Operation not permitted"): read it with sudo.
-- **Budget.** Stop starting experiments when the remaining time cannot cover
-  the experiment plus cleanup; never cut a restoration short for the deadline,
-  report the overrun.
-- **Cleanup, before releasing the lock.** Stop owned capture and debug clients
-  before opening the restoration flasher or running the contract's cleanup,
-  dispose of the source as your role says, establish the pinned restoration
-  image on the board (retain the programmed image when verification with the
-  backend's procedure establishes that it matches the pinned artifact and
-  nothing since changed its contents or made them uncertain, citing that
-  verification; otherwise program the pinned artifact and verify its
-  programmed contents, the artifact hash recorded apart from that result) or,
-  when `cleanup.pristine` records the HIL contract's cleanup state, run the
-  contract's cleanup instead, verified only by the run-state observation
-  below; remove owned breakpoints and watchpoints, restore the firmware's
-  expected run state and record an observation that establishes it (a
-  verified flash alone does not; for a USB device, the expected function,
-  such as an application exchange; a claim that needs re-enumeration records
-  the enumeration events, and a device number alone establishes neither,
-  since the host may reuse it across a reset), close any flasher you opened,
-  restore host settings, release the lock. `restorationFlashes` counts actual
-  programming attempts, a contract cleanup's write included. Run state not
-  established is a failed cleanup. Do only the cleanup your own actions or the explicitly assigned
-  recovery state call for, establishing ownership before restoring a
-  predecessor's state. Blocked before touching hardware with no recovery state
-  assigned, the untouched actions are `n-a`, nothing is flashed and another
-  holder's lock stays. If restoration cannot complete, keep the lock where you
-  can, report the exact remaining source, firmware, process and lock state,
-  and do not call the board ready.
-- **Return.** The tested firmware identity, decisive observations, artifact
-  locations, cleanup state and budget used; sampling done by hand on a native
-  probe comes back with its command, and the limits name only what was
-  actually unavailable.
+- **Budget.** Stop starting experiments when the remaining time cannot cover the experiment plus cleanup; never cut a
+  restoration short for the deadline, report the overrun.
+- **Cleanup, before releasing the lock.** Stop owned capture and debug clients before opening the restoration flasher or
+  running the contract's cleanup, dispose of the source as your role says, establish the pinned restoration image on the
+  board (retain the programmed image when verification with the backend's procedure establishes that it matches the
+  pinned artifact and nothing since changed its contents or made them uncertain, citing that verification; otherwise
+  program the pinned artifact and verify its programmed contents, the artifact hash recorded apart from that result) or,
+  when `cleanup.pristine` records the HIL contract's cleanup state, run the contract's cleanup instead, verified only by
+  the run-state observation below; remove owned breakpoints and watchpoints (Espressif: `espressif.md` Attach's leaving
+  rules, `delete`, `monitor resume` before `detach`, `shutdown`), restore the firmware's expected run state and record
+  an observation that establishes it (a verified flash alone does not; for a USB device, the expected function, such as
+  an application exchange; a claim that needs re-enumeration records the enumeration events, and a device number alone
+  establishes neither, since the host may reuse it across a reset), close any flasher you opened, restore host settings,
+  release the lock. `restorationFlashes` counts actual programming attempts, a contract cleanup's write included. Run
+  state not established is a failed cleanup. Do only the cleanup your own actions or the explicitly assigned recovery
+  state call for, establishing ownership before restoring a predecessor's state. Blocked before touching hardware with
+  no recovery state assigned, the untouched actions are `n-a`, nothing is flashed and another holder's lock stays. If
+  restoration cannot complete, keep the lock where you can, report the exact remaining source, firmware, process and
+  lock state, and do not call the board ready.
+- **Return.** The tested firmware identity, decisive observations, artifact locations, cleanup state and budget used;
+  sampling done by hand on a native probe comes back with its command, and the limits name only what was actually
+  unavailable.
 
 ## Rig discipline — lock first, always
 
-On a shared rig, an ordinary session holds the project's board lock for the
-WHOLE manual session (instrument, build, flash, capture, GDB), forcing it only
-under a scoped forced-lock recovery (Delegated sessions' Lock), and never stops
-its CI runner. Rigs and
-benches run many identical probes:
+On a shared rig, an ordinary session holds the project's board lock for the WHOLE manual session (instrument, build,
+flash, capture, GDB), forcing it only under a scoped forced-lock recovery (Delegated sessions' Lock), and never stops
+its CI runner. Rigs and benches run many identical probes:
 
-- Select the probe by serial: J-Link `-SelectEmuBySN <uid>`, its GDB server
-  `-select usb=<uid>`, OpenOCD `-c 'adapter serial <uid>'`; a probe without
-  one by `adapter usb location` (`espressif.md`, ESP32-S2).
+- Select the probe by serial: J-Link `-SelectEmuBySN <uid>`, its GDB server `-select usb=<uid>`, OpenOCD
+  `-c 'adapter serial <uid>'`; a probe without one by `adapter usb location` (`espressif.md`, Attach).
 - Run on the host that owns the probe.
-- One probe serves one client: quit JLinkExe before starting JLinkGDBServer on
-  the same probe.
+- One probe serves one client: quit JLinkExe before starting JLinkGDBServer on the same probe.
 
 ## Pick the least intrusive technique that can answer the question
 
-Observation can mask the bug: one can change behavior under logging *and* under
-the debugger. If the bug disappears when instrumented,
-that IS a finding (timing-sensitive): move down in intrusiveness, not up.
+Observation can mask the bug: one can change behavior under logging *and* under the debugger. If the bug disappears when
+instrumented, that IS a finding (timing-sensitive): move down in intrusiveness, not up.
 
-| Technique                          | Intrusiveness                  | Reach for it when                                       |
-|------------------------------------|--------------------------------|---------------------------------------------------------|
-| PC-sampling                        | no deliberate halt or firmware instrumentation (Cortex-M with DWT implemented; Espressif: none, `espressif.md`) | core wedged/spinning somewhere unknown |
-| SWO exception trace / hw PC-sample | none — Cortex-M (ARMv7-M+), SWO pin wired | ISR ordering/timing with zero code change               |
-| DWT data trace                     | none — Cortex-M (ARMv7-M+), SWO pin wired | stream one address's accesses: value + accessor PC      |
-| Vector catch                       | none until a fault fires (Cortex-M; RISC-V/Xtensa: a breakpoint in the trap handler) | crash-shaped wedges — autopsy AT the faulting pc |
-| RAM ring-buffer                    | ~tens of cycles per event      | ISR ordering/timing bugs                                |
-| SystemView (project's `sysview`)   | recorder in the firmware, per event | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
-| Log lines (RTT)                    | µs per line                    | logic bugs that survive logging (J-Link or OpenOCD rtt) |
-| Log lines (UART)                   | up to ms per line when the write path polls a full FIFO | same, when no debug-probe RTT path |
-| dprintf / conditional breakpoint   | halt+resume per hit (~ms)      | low-rate probes post-wedge; never ISR-rate events       |
-| GDB halt / breakpoints             | stops USB service entirely     | post-mortem state autopsy once wedged                   |
+The Core column says where a technique exists; a row that names a core family does not exist elsewhere, and
+`espressif.md`'s "Technique mapping" gives the Xtensa and RISC-V substitutes.
+
+| Technique                          | Core                                                                                         | Intrusiveness                                           | Reach for it when                                                                                              |
+| ---------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| PC-sampling (DWT_PCSR polled)      | Cortex-M3 and later; ARMv6-M (M0, M0+, M1) only where PCSR is implemented (`techniques.md`)  | no deliberate halt, no firmware change                  | core wedged/spinning somewhere unknown                                                                         |
+| SWO exception trace / hw PC-sample | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                              | none                                                    | ISR ordering/timing with zero code change                                                                      |
+| DWT data trace                     | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                              | none                                                    | stream one address's accesses: value + accessor PC                                                             |
+| Vector catch                       | Cortex-M (ARMv6-M: HardFault and reset only)                                                 | none until a fault fires                                | crash-shaped wedges — autopsy AT the faulting pc                                                               |
+| RAM ring-buffer                    | any; one ring per writing core                                                               | ~tens of cycles per event                               | ISR ordering/timing bugs                                                                                       |
+| SystemView (project's `sysview`)   | any the project's `sysview` supports                                                         | recorder in the firmware, per event                     | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
+| Log lines (RTT)                    | any with a probe RTT path (J-Link, OpenOCD); none in the measured TinyUSB Espressif builds   | µs per line                                             | logic bugs that survive logging                                                                                |
+| Log lines (UART)                   | any                                                                                          | up to ms per line when the write path polls a full FIFO | same, when no debug-probe RTT path                                                                             |
+| dprintf / conditional breakpoint   | any                                                                                          | halt+resume per hit (~ms)                               | low-rate probes post-wedge; never ISR-rate events                                                              |
+| GDB halt / breakpoints             | any; the hardware budget is per chip (`gdb.md`; `espressif.md`, Attach, "Count breakpoints") | stops USB service entirely                              | post-mortem state autopsy once wedged                                                                          |
 
 Each technique's recipe, read when you reach for it (files beside this one):
 
-- PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py`, reading the
-  histogram, native probes by hand.
-- Probe-state snapshot (DHCSR anchor, PCSR samples, image read-back for
-  Cleanup's verification): `techniques.md`, "Probe state" — `probe_state.py`.
+- PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py`, reading the histogram, native probes by hand.
+- Probe-state snapshot (DHCSR anchor, PCSR samples, image read-back for Cleanup's verification): `techniques.md`, "Probe
+  state" — `probe_state.py`.
 - SWO exception trace, hardware PC-sampling, DWT data trace: `swo-dwt.md`.
 - Vector catch and the fault registers: `fault-autopsy.md`.
-- RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code,
-  the `nm` check, the GDB dump.
+- RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code, the `nm` check, the GDB dump.
 - SystemView: the project's `sysview` skill.
-- Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands, the
-  drain model; the channel itself is the `rtt` skill's.
-- Chip and family constraints (flash reads, reset domains, probe misreads):
-  `families.md`; Espressif chips: `espressif.md`.
-- dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch
-  sessions, the hardware breakpoint budget, watchpoints, FreeRTOS threads,
-  J-Link Commander quirks.
-- USB enumeration or transfer bugs: capture both sides at once by default —
-  `techniques.md`, "USB: dual-side capture".
+- Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands, the drain model; the channel itself is the
+  `rtt` skill's.
+- Chip and family constraints (flash reads, reset domains, probe misreads): `families.md`; Espressif chips:
+  `espressif.md`.
+- dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch sessions, the hardware breakpoint budget,
+  watchpoints, FreeRTOS threads, J-Link Commander quirks.
+- USB enumeration or transfer bugs: capture both sides at once by default — `techniques.md`, "USB: dual-side capture".
 - Manuals (J-Link UM08001, OpenOCD, GDB): `techniques.md`, "Manuals".
 
 ## Warnings
 
-- **Halting via the probe does NOT disconnect the device**: a halt resets no
-  peripheral, so the USB controller keeps its pull-up, the host's stuck URBs
-  stay stuck and a wedged DUT stays wedged — recover the Linux host side (the
-  rig's own procedure; its HIL contract names it). A probe reset disconnects
-  only when the reset it issues reaches the USB controller or its PHY: check
-  the part (`families.md`: DWC2, STM32F4).
-- **A bug that vanishes under logging is not fixed**: treat it as
-  timing-sensitive until the ring buffer reproduces it, and if it vanishes
-  under GDB too, move down to PC-sampling; the added code's own effect on
-  stack, layout and ordering is the alternative to rule out.
-- **A logging write path that polls a full FIFO blocks** (worst perturbation,
-  including inside the ISR; which driver does what: `techniques.md` "Log
-  capture", `espressif.md` "Console"); RTT is much cheaper but not free;
-  verbose logging multiplies both.
-- **`pkill -f PATTERN` matches its own caller**: the pattern is in your
-  shell's (or ssh's) command line, so it kills the command running it.
-  Bracket one character (`pkill -f '[J]LinkGDBServer'`) or kill by PID.
-- Flash/GDB only with the board lock held; a hold refused because CI is
-  mid-test on that board means wait, and force only under an explicitly
-  scoped forced-lock recovery (Delegated sessions' Lock).
-- **Instrumentation is temporary**: before `release`, restore the pinned
-  restoration firmware or cleanup state as Delegated sessions' Cleanup says
-  (the next CI run must not inherit a debug build) and revert the
-  instrumentation diff. Handing the diff over with the diagnosis preserves the
-  evidence; it does not count as cleanup.
-- **A register snapshot without a validity anchor lies**: debug tool sessions
-  can reset or briefly halt the DUT as a side effect, and a snapshot of a
-  freshly-reset chip (e.g. NVIC ISER = 0) reads like a smoking gun. Cortex-M:
-  read DHCSR (0xE000EDF0: bit 17 S_HALT, bit 25 S_RESET_ST) with every
-  snapshot; Espressif: `espressif.md` Anchors, since the USB device number
-  survives a core reset there. Cross-check against something the device
-  demonstrably still does.
-- **"Flash OK" can lie** (silent no-op — old firmware keeps running). When
-  behavior contradicts the flashed code: `objcopy -O binary fw.elf
-  /tmp/fw.bin`, then `verifybin /tmp/fw.bin,<flash-base>` (J-Link, verified)
-  or `verify_image` (OpenOCD); on mismatch reflash before debugging further.
-  Espressif: `esptool verify-flash` with the image and offset from the
-  build's `flasher_args.json` (`espressif.md`), never the objcopy output, since
-  the flashed image is esptool's `elf2image` output. Some targets need a
-  particular halt state before flash reads (RP2040: a flash-resident halt);
+- **Halting via the probe does NOT disconnect the device**: a halt resets no peripheral, so the USB controller keeps its
+  pull-up, the host's stuck URBs stay stuck and a wedged DUT stays wedged — recover the Linux host side (the rig's own
+  procedure; its HIL contract names it). A probe reset disconnects only when the reset it issues reaches the USB
+  controller or its PHY: check the part (`families.md`: DWC2, STM32F4).
+- **A bug that vanishes under logging is not fixed**: treat it as timing-sensitive until the ring buffer reproduces it,
+  and if it vanishes under GDB too, move down to PC-sampling; the added code's own effect on stack, layout and ordering
+  is the alternative to rule out.
+- **A logging write path that polls a full FIFO blocks** (worst perturbation, including inside the ISR; which driver
+  does what: `techniques.md` "Log capture", `espressif.md` "Console"); RTT is much cheaper but not free; verbose logging
+  multiplies both.
+- **`pkill -f PATTERN` matches its own caller**: the pattern is in your shell's (or ssh's) command line, so it kills the
+  command running it. Bracket one character (`pkill -f '[J]LinkGDBServer'`) or kill by PID; an openocd-esp32 server is
+  ended with `shutdown`, never killed (`espressif.md`, Attach).
+- Flash/GDB only with the board lock held; a hold refused because CI is mid-test on that board means wait, and force
+  only under an explicitly scoped forced-lock recovery (Delegated sessions' Lock).
+- **Instrumentation is temporary**: before `release`, restore the pinned restoration firmware or cleanup state as
+  Delegated sessions' Cleanup says (the next CI run must not inherit a debug build) and revert the instrumentation diff.
+  Handing the diff over with the diagnosis preserves the evidence; it does not count as cleanup.
+- **A register snapshot without a validity anchor lies**: debug tool sessions can reset or briefly halt the DUT as a
+  side effect, and a snapshot of a freshly-reset chip (e.g. NVIC ISER = 0) reads like a smoking gun. Cortex-M: read
+  DHCSR (0xE000EDF0: bit 17 S_HALT, bit 25 S_RESET_ST) with every snapshot; Espressif: `espressif.md`, Attach, Anchors,
+  since the USB device number survives a core reset there. Cross-check against something the device demonstrably still
+  does.
+- **"Flash OK" can lie** (silent no-op — old firmware keeps running). When behavior contradicts the flashed code:
+  `objcopy -O binary fw.elf /tmp/fw.bin`, then `verifybin /tmp/fw.bin,<flash-base>` (J-Link, verified) or `verify_image`
+  (OpenOCD); on mismatch reflash before debugging further. Espressif: `esptool verify-flash` with the image and offset
+  from the build's `flasher_args.json` (`espressif.md`), never the objcopy output, since the flashed image is esptool's
+  `elf2image` output. Some targets need a particular halt state before flash reads (RP2040: a flash-resident halt);
   `families.md` has them.
-- **A marginal link can fake a deterministic firmware bug** — down to failing
-  the same test at the same iteration twice. "USB disconnect" in dmesg on a
-  freshly re-cabled port (high devnum = churn) points at the plug before the
-  code: first sustained bulk traffic is when a bad contact drops. Before
-  declaring a regression, re-run the OLD build on the SAME link state — and
-  if a bisect exonerates every hunk, believe it: re-test the exact failing
-  binary.
-- **`dd` creates a regular file when its output device node has vanished**
-  (an 8 KiB file at /dev/sdb after the device dropped, 2026-10-16): verify
-  the DUT identity and `test -b` before each raw write, add `conv=nocreat`
-  so a disappearance before the open fails instead, and discard every
-  result obtained from a replacement regular file. Bare ` sdX:` kernel
-  lines after raw writes are partition-rescan output, not errors.
+- **A marginal link can fake a deterministic firmware bug** — down to failing the same test at the same iteration twice.
+  "USB disconnect" in dmesg on a freshly re-cabled port (high devnum = churn) points at the plug before the code: first
+  sustained bulk traffic is when a bad contact drops. Before declaring a regression, re-run the OLD build on the SAME
+  link state — and if a bisect exonerates every hunk, believe it: re-test the exact failing binary.
+- **`dd` creates a regular file when its output device node has vanished** (an 8 KiB file at /dev/sdb after the device
+  dropped, 2026-10-16): verify the DUT identity and `test -b` before each raw write, add `conv=nocreat` so a
+  disappearance before the open fails instead, and discard every result obtained from a replacement regular file. Bare
+  ` sdX:` kernel lines after raw writes are partition-rescan output, not errors.
 
 ## Project notes
 
-What is specific to the projects these skills have been used on, one file
-each, for these skills: their symbols, typical issues and the behaviour of
-their code, releases and CI firmware; a project's build, rig and battery
-procedure stays in its own contracts. Read it with `families.md`'s section for
-the board's chip, when it has one. Match the project by its repository identity
-(`git remote get-url origin`), not by a directory name:
+What is specific to the projects these skills have been used on, one file each, for these skills: their symbols, typical
+issues and the behaviour of their code, releases and CI firmware; a project's build, rig and battery procedure stays in
+its own contracts. Read it with `families.md`'s section for the board's chip, when it has one. Match the project by its
+repository identity (`git remote get-url origin`), not by a directory name:
 
-| Repository | Notes |
-|---|---|
-| `hathach/tinyusb` | `projects/tinyusb.md` |
+| Repository         | Notes                 |
+| ------------------ | --------------------- |
+| `hathach/tinyusb`  | `projects/tinyusb.md` |
 | `adafruit/tinyuf2` | `projects/tinyuf2.md` |
 
-Every entry there says how it is known (verified when, on which revision and
-board, how — or only carried over). Check a symbol exists in the checkout in
-front of you before relying on it. When a session establishes something
-reusable — reproduced, or read in a source — add it with the same evidence,
-or correct the entry it contradicts, where it holds: only for this project,
-its file here; for any firmware on the chip, `families.md` (Espressif chips:
-`espressif.md`); for a probe or tool, the technique file (RTT and trace
-per-board caveats: `rtt/boards.md`, `etm-trace/boards.md`). Leave out the
-session's chronology and dead ends. A project with no file: work from its source, and
-start one when there is something worth keeping.
+Every entry there says how it is known (verified when, on which revision and board, how — or only carried over). Check a
+symbol exists in the checkout in front of you before relying on it. When a session establishes something reusable —
+reproduced, or read in a source — add it with the same evidence, or correct the entry it contradicts, where it holds:
+only for this project, its file here; for any firmware on the chip, `families.md` (Espressif chips: `espressif.md`); for
+a probe or tool, the technique file (RTT and trace per-board caveats: `rtt/boards.md`, `etm-trace/boards.md`). Leave out
+the session's chronology and dead ends. A project with no file: work from its source, and start one when there is
+something worth keeping.
