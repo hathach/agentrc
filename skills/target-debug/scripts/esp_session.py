@@ -338,9 +338,9 @@ def parse_inspect(result, blocks, exprs, gdb_err):
 
 def parse_budget(result, blocks, locations):
     """Each location in order: inserted, refused (the budget is the count inserted before it), or
-    unresolved (gdb found no such location and asked the hardware nothing). Anything else, a
-    location not reached or gdb failing another way (no connection, no hardware breakpoint support),
-    ends the count and is returned as the location the hardware was not asked about."""
+    unresolved (gdb found no such location and asked the hardware nothing). gdb failing another way
+    (no connection, no hardware breakpoint support) anywhere, or a location not reached before the
+    first refusal, leaves no budget and is returned as the location the hardware was not asked about."""
     rows, budget, inserted, unasked = [], None, 0, None
     for i, loc in enumerate(locations):
         out = blocks.get(f'AT{i}')
@@ -355,14 +355,16 @@ def parse_budget(result, blocks, locations):
         else:
             row = {'at': loc, 'result': 'failed', 'output': lines}
         rows.append(row)
-        if budget is None and unasked is None:
+        if unasked is None and (row['result'] == 'failed' or row['result'] == 'not reached' and budget is None):
+            unasked = loc
+        elif budget is None and unasked is None:
             if row['result'] == 'inserted':
                 inserted += 1
             elif row['result'] == 'refused':
                 budget = {'exactly': inserted}
-            elif row['result'] in ('not reached', 'failed'):
-                unasked = loc
-    if budget is None and unasked is None:
+    if unasked is not None:
+        budget = None
+    elif budget is None:
         budget = {'atLeast': inserted}
     result['locations'], result['budget'] = rows, budget
     return any(r['result'] != 'inserted' for r in rows), unasked

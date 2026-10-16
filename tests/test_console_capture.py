@@ -83,6 +83,19 @@ class ConsoleCaptureTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(out['marks'], [])
 
+    def test_a_capture_that_cannot_be_read_back_keeps_its_summary(self):
+        self.feed(b'rst:0x1\n', delay=0.2)
+        proc = self.start('--seconds', '1', '--lines', 'leave', '--mark', 'rst')
+        deadline = time.monotonic() + 10
+        while not self.out.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.out.rename(self.d / 'moved.bin')
+        out, err = proc.communicate(timeout=30)
+        out = json.loads(out)
+        self.assertEqual(proc.returncode, 3, err)
+        self.assertIn('reading', out['error'])
+        self.assertEqual(out['bytes'], 8)
+
     def test_a_port_that_is_not_a_terminal_fails_with_json(self):
         plain = self.d / 'plain'
         plain.write_bytes(b'')

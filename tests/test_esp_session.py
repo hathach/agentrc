@@ -133,7 +133,7 @@ for c in exs:
         else:
             sys.stderr.write(f'No symbol "{e}" in current context.\n')
     elif c.startswith('hbreak '):
-        if os.environ.get('FAKE_NO_HW_BREAK'):
+        if os.environ.get('FAKE_NO_HW_BREAK') or c[7:] == os.environ.get('FAKE_FAIL_AT'):
             print('No hardware breakpoint support in the target.')
             continue
         if c[7:] in os.environ.get('FAKE_UNRESOLVED', '').split(','):
@@ -287,6 +287,13 @@ class EspSessionTest(unittest.TestCase):
         self.assertIsNone(out['budget'])
         self.assertEqual(out['locations'][0]['result'], 'failed')
         self.assertIn('did not ask the hardware', out['error'])
+
+    def test_a_gdb_failure_after_a_refusal_still_fails(self):
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'main', '--at', 'cdc_task', '--at', 'broken'),
+                                    FAKE_BUDGET='1', FAKE_FAIL_AT='broken')
+        self.assertEqual(rc, 3, err)
+        self.assertIsNone(out['budget'])
+        self.assertEqual([r['result'] for r in out['locations']], ['inserted', 'refused', 'failed'])
 
     def test_a_tcl_port_with_another_session_is_never_driven(self):
         rc, out, err = self.run_cli(self.session('inspect'), FAKE_OTHER_TOKEN='intruder')

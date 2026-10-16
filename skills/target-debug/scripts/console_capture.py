@@ -212,8 +212,11 @@ def main(argv=None):
                   firstByteAt=chunks[0]['t'] if chunks else None,
                   baseline='the open' if chunks else 'none: nothing was received')
     if patterns:
-        with open(a.out, 'rb') as f:
-            result['marks'] = marks(f.read(), chunks, patterns)
+        try:
+            with open(a.out, 'rb') as f:
+                result['marks'] = marks(f.read(), chunks, patterns)
+        except OSError as e:
+            errors.append(f'reading {a.out} back for --mark: {e}')
     if errors:
         result['error'] = '; '.join(errors)
     print(json.dumps(result))
