@@ -228,14 +228,17 @@ back as reset cause 1, power-on (Metro, 2026-10-16).
   `CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG` (boot log and `ESP_LOG*` also on the USJ CDC). Name ports by
   `/dev/serial/by-id` or `by-path`, never `ttyACM<N>`/`ttyUSB<N>`, which drift within one boot. The capture recipe is
   `techniques.md` "Log capture".
-- Opening the USJ CDC, a CP2102N or an ESP-Prog channel B wired to EN with DTR/RTS asserted can reset the chip: set the
-  control lines before opening, as the capture tool allows, and still expect one: a pyserial open of the USJ CDC with
-  `dtr=rts=False` set before `open()` reset the P4 and the S31 (`rst:0x17 CHIP_USB_UART_RESET`, 2026-10-16). Open it
-  before the baseline (Attach, "Before attaching").
+- Opening the USJ CDC, a CP2102N or an ESP-Prog channel B wired to EN can reset the chip, since Linux raises DTR and RTS
+  at every open: measure it (`console_capture.py --mark 'rst:0x[0-9a-f]+'`, `techniques.md` "Log capture") rather than
+  assume either way, and open before the baseline (Attach, "Before attaching"). A pyserial open of the USJ CDC with
+  `dtr=rts=False` set before `open()` reset the P4 and the S31 (`rst:0x17 CHIP_USB_UART_RESET`); `console_capture.py`
+  opens, with `--lines low` or `leave`, reset neither, nor the Metro S3 through ESP-Prog channel B (no banner in 6 s,
+  app devices kept their USB device numbers; all 2026-10-16).
 - openocd on the USJ's JTAG interface and a console on its CDC coexist: every 2026-10-16 P4 and S31 attach ran with the
   console open.
 - The USJ CDC is a console only while the USJ exists (on the measured S3 boards it disappears when the firmware starts
-  USB, "ESP32-S3"), and when a reset makes the USJ re-enumerate, the capture misses the beginning of the boot log.
+  USB, "ESP32-S3"), and when a reset makes the USJ re-enumerate, the capture misses the beginning of the boot log. A
+  USJ-driven reset of the P4 (DTR low with RTS high) did not: the open capture kept the whole ROM banner (2026-10-16).
 
 ### Console perturbation
 
@@ -324,8 +327,8 @@ under Attach and in `projects/tinyusb.md`.
   `ESP_EN` on PROG pin 1 also gates the probe's own JTAG buffers through an inverter, with its pull-up R7 drawn NC
   (guide p14: R7 in Fig. 7, the inverter and buffers in Fig. 8): wire PROG pin 1 to the board's EN. On that FT2232
   channel B UART (`if01`) RTS asserted with DTR deasserted pulls EN low (measured; matches the guide's Fig. 7 table,
-  p14), and opening the port reset the chip once even with `dtr=rts=False` set before and after the open. PROG pin 5
-  `ESP_RXD` listens to the target's TXD (measured 2026-10-16: pin 3 captured nothing).
+  p14); a pyserial open reset the chip once even with `dtr=rts=False` set before and after the open ("Console" for the
+  opens that did not). PROG pin 5 `ESP_RXD` listens to the target's TXD (measured 2026-10-16: pin 3 captured nothing).
 - Metro attach (cdc_msc_freertos and cdc_msc_throughput on OTG, 2026-10-16): the recipe passed under traffic with no DUT
   USB reset, disconnect or error logged (`projects/tinyusb.md`). The exception: after the `program_esp` session that
   reprogrammed the app (ended with `reset exit`), every attach read the scan chain as all ones, through a USB
