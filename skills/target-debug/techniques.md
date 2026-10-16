@@ -94,14 +94,11 @@ per the **rtt** skill (servers per probe, transport matrix, control-block gotcha
 python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> --interface swd --speed auto --seconds 20 > /tmp/rtt.log
 ```
 
-A UART console (the board's debug serial, if wired) goes through `console_capture.py`: the port by `/dev/serial/by-id`
-or `by-path`, an explicit baud and control-line policy, the bytes kept as received with a time per chunk, the open
-recorded as the baseline and the port's settings restored (`--help`):
+A UART console (the board's debug serial, if wired) goes through `console_capture.py` (`--help`):
 
 ```bash
 python3 <skill dir>/scripts/console_capture.py --port /dev/serial/by-id/<port> --baud 115200 --seconds 20 \
   --lines low --out <new file> [--mark '<reset banner regex>']
-#   exit 0 captured (empty included: an empty capture anchors nothing), 2 usage, 3 open/configure/read/restore failed
 ```
 
 Opening a port raises DTR and RTS, which can reset an Espressif chip (`espressif.md`, "Console"): `--mark` reports

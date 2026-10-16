@@ -30,14 +30,16 @@ and may-insert-breakpoints off), resumes and detaches. budget: gdb sets `breakpo
 always-inserted on` and inserts one `hbreak` per --at location in order, so each insertion is
 tried at once; the budget is the count inserted before the first refusal, or a lower bound when
 none was refused. A location gdb cannot place (no such symbol) is reported unresolved and asks
-the hardware nothing. The firmware can hold triggers of its own (espressif.md, "Breakpoint
+the hardware nothing; any other gdb failure at a location (no connection, no hardware breakpoint
+support) ends the count and fails the run. The firmware can hold triggers of its own (espressif.md, "Breakpoint
 budgets").
 
 Whatever gdb does, the session ends from this script over the Tcl port: every breakpoint and
 watchpoint removed, each halted core resumed, each core's state read, then `shutdown`, never a
-kill (a killed openocd leaves RISC-V chips in the Breakpoint boot loop: espressif.md, Leave). The
-Tcl port must first answer the session token this script gave its openocd (`set ESPS_SESSION`),
-so a server that took the port meanwhile is never driven. A shutdown that fails leaves the
+kill (a killed openocd leaves RISC-V chips in the Breakpoint boot loop: espressif.md, Leave). Each
+Tcl connection must first answer the session token this script gave its openocd (`set
+ESPS_SESSION`), and the commands follow on that connection, so a server that took the port
+meanwhile is never driven. A shutdown that fails leaves the
 server running and its receipt open: `leave --receipt` ends that server only, after checking the
 process (argv and start time) and the token. Removal errors, from the end or in openocd's log,
 fail the run with the `recover` hint. `recover` is the separately chosen `init; shutdown` session
@@ -52,8 +54,9 @@ Output: one JSON object on stdout; <out> keeps openocd.log, gdb.log (values), gd
 and monitor output; budget writes both into gdb.log to keep their order) and receipt.json.
 
 Exit: 0 done and every core running at the end; 1 done, but an expression failed or a budget
-location was refused (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed, the run was
-interrupted, a core was left halted, or the shutdown failed.
+location was refused (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a budget location
+gdb could not ask about included), the run was interrupted, a core was left halted, removal is
+unchecked or failed, or the shutdown failed.
 """
 import argparse
 import json
@@ -85,6 +88,7 @@ class Interrupted(Exception):
 
 
 def free_ports(n):
+    # kept identical with rtt.py's; the session token covers a port taken between this and openocd's bind
     socks = [socket.socket() for _ in range(n)]
     try:
         for s in socks:
@@ -119,41 +123,53 @@ def server_command(exe, a, ports, log, token=None):
     else:
         cmd = [exe, '-c', 'gdb port disabled', '-c', 'telnet port disabled', '-c', 'tcl port disabled']
     cmd += ['-c', 'set ESP_FLASH_SIZE 0']
-    if getattr(a, 'rtos', None):
+    if a.rtos:
         cmd += ['-c', f'set ESP_RTOS {a.rtos}']
     return cmd + route_args(a) + ['-l', log]
 
 
 class Tcl:
-    def __init__(self, port, token, timeout=10):
-        self.port, self.token, self.timeout = port, token, timeout
+    """The port picked here could have been taken by another server meanwhile: a connection must answer
+    this session's token before anything else is sent, and every later command goes down that same
+    connection. A connection that fails is dropped; the next command opens and checks a new one."""
 
-    def __call__(self, cmd):
-        with socket.create_connection(('127.0.0.1', self.port), timeout=self.timeout) as s:
-            s.sendall(cmd.encode() + TCL_END)
+    def __init__(self, port, token, timeout=10):
+        self.port, self.token, self.timeout, self.sock = port, token, timeout, None
+
+    def _ask(self, cmd):
+        try:
+            self.sock.sendall(cmd.encode() + TCL_END)
             buf = b''
             while not buf.endswith(TCL_END):
-                chunk = s.recv(4096)
+                chunk = self.sock.recv(4096)
                 if not chunk:
                     raise ToolError(f'Tcl port {self.port} closed before answering {cmd!r}')
                 buf += chunk
+        except BaseException:
+            self.close()
+            raise
         return buf[:-1].decode(errors='replace')
 
-    def check(self):
-        """The port picked here could have been taken by another server meanwhile: it must answer this
-        session's token before anything is read or sent."""
-        got = self('if {[info exists ESPS_SESSION]} {set ESPS_SESSION}')
-        if got != self.token:
-            raise ToolError(f'Tcl port {self.port} answers for another server (session {got!r}): nothing sent')
+    def __call__(self, cmd):
+        if self.sock is None:
+            self.sock = socket.create_connection(('127.0.0.1', self.port), timeout=self.timeout)
+            got = self._ask('if {[info exists ESPS_SESSION]} {set ESPS_SESSION}')
+            if got != self.token:
+                self.close()
+                raise ToolError(f'Tcl port {self.port} answers for another server (session {got!r}): nothing sent')
+        return self._ask(cmd)
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
 
     def states(self):
-        self.check()
         out = self('set r {}; foreach t [target names] {append r "$t [$t curstate]\n"}; set r')
         return dict(line.rsplit(' ', 1) for line in out.splitlines() if line.strip())
 
     def end(self):
         """Remove every breakpoint and watchpoint, resume each halted core, read the states, shut down."""
-        self.check()
         rec = {'removed': self('set e {}; foreach t [target names] {targets $t; if {[catch {rbp all} m]} '
                                '{lappend e "$t rbp: $m"}; if {[catch {rwp all} m]} {lappend e "$t rwp: $m"}}; set e')}
         before = self.states()
@@ -165,22 +181,35 @@ class Tcl:
             self('shutdown')
         except (OSError, ToolError):
             pass    # the server closes the connection as it shuts down
+        self.close()
         return rec
 
 
-def removal_errors(log, end=None):
-    """openocd's own removal errors, and the rbp/rwp errors the end collected."""
-    try:
-        with open(log, errors='replace') as f:
-            bad = [ln for ln in f.read().splitlines() if re.search(r'could not remove (break|watch)point', ln, re.I)]
-    except OSError:
-        bad = []
-    if end and end.get('removed', '').strip():
-        bad.append(end['removed'].strip())
-    return bad
+def read(path):
+    with open(path, errors='replace') as f:
+        return f.read()
 
 
 RECOVER_HINT = 'run `recover` before an esptool reset (espressif.md, "After an abnormal end")'
+
+
+def end_errors(result, log):
+    """The verdict on an ended session: cores left not running, and removal errors from the end's
+    rbp/rwp or openocd's log; a log that cannot be read is no evidence of a clean removal."""
+    errors, end = [], result.get('end') or {}
+    halted = [t for t, s in end.get('cores', {}).items() if s != 'running']
+    if halted:
+        errors.append(f"left not running: {', '.join(halted)}")
+    try:
+        bad = [ln for ln in read(log).splitlines() if re.search(r'could not remove (break|watch)point', ln, re.I)]
+    except OSError as e:
+        bad = [f'openocd log unreadable, removal unchecked: {e}']
+    if end.get('removed', '').strip():
+        bad.append(end['removed'].strip())
+    if bad:
+        result['removeErrors'] = bad
+        errors.append(f'breakpoint/watchpoint removal errors: {RECOVER_HINT}')
+    return errors
 
 
 def start_time(pid):
@@ -193,9 +222,8 @@ def start_time(pid):
 
 def wait_for(proc, path, pattern, deadline):
     while time.monotonic() < deadline:
-        with open(path, errors='replace') as f:
-            if re.search(pattern, f.read(), re.M):
-                return
+        if re.search(pattern, read(path), re.M):
+            return
         if proc is not None and proc.poll() is not None:
             raise ToolError(f'openocd exited {proc.returncode}; see {path}')
         time.sleep(0.1)
@@ -214,18 +242,21 @@ def wait_exit(pid, proc, seconds):
     return False
 
 
+def block(name, cmd, newline=''):
+    return [f'echo ESPS {name}-BEGIN \\n', cmd, f'echo {newline}ESPS {name}-END \\n']
+
+
 def gdb_commands(mode, port, exprs, locations):
     cmds = OBSERVER + (['set may-insert-breakpoints off'] if mode == 'inspect' else
                        ['set breakpoint always-inserted on'])
     cmds += [f'target extended-remote :{port}']
     if mode == 'inspect':
-        cmds += ['echo ESPS THREADS-BEGIN \\n', 'info threads', 'echo ESPS THREADS-END \\n',
-                 'echo ESPS BT-BEGIN \\n', 'bt 16', 'echo ESPS BT-END \\n']
+        cmds += block('THREADS', 'info threads') + block('BT', 'bt 16')
         for i, e in enumerate(exprs):
-            cmds += [f'echo ESPS EXPR{i}-BEGIN \\n', f'output {e}', f'echo \\nESPS EXPR{i}-END \\n']
+            cmds += block(f'EXPR{i}', f'output {e}', newline='\\n')
     else:
         for i, loc in enumerate(locations):
-            cmds += [f'echo ESPS AT{i}-BEGIN \\n', f'hbreak {loc}', f'echo ESPS AT{i}-END \\n']
+            cmds += block(f'AT{i}', f'hbreak {loc}')
         cmds += ['delete']
     return cmds + ['monitor resume', 'detach']
 
@@ -276,7 +307,7 @@ def leave(receipt_path):
                            f'process): nothing sent')
         return result, 2
     try:
-        result.update(Tcl(rec['ports'][2], rec['token']).end())
+        result['end'] = Tcl(rec['ports'][2], rec['token']).end()
     except (OSError, ToolError) as e:
         result['error'] = f'Tcl port {rec["ports"][2]}: {e}'
         return result, 3
@@ -284,18 +315,57 @@ def leave(receipt_path):
         result['error'] = 'openocd still runs after shutdown'
         return result, 3
     write_receipt(receipt_path, {**rec, 'closed': True})
-    errors = []
-    halted = [t for t, s in result['cores'].items() if s != 'running']
-    if halted:
-        errors.append(f"left not running: {', '.join(halted)}")
-    bad = removal_errors(rec.get('log', ''), result)
-    if bad:
-        result['removeErrors'] = bad
-        errors.append(f'breakpoint/watchpoint removal errors: {RECOVER_HINT}')
+    errors = end_errors(result, rec.get('log', ''))
     if errors:
         result['error'] = '; '.join(errors)
         return result, 3
     return result, 0
+
+
+def parse_inspect(result, blocks, exprs, gdb_err):
+    result['threads'] = blocks.get('THREADS', '').splitlines() or None
+    result['backtrace'] = blocks.get('BT', '').splitlines() or None
+    result['exprs'] = []
+    for i, e in enumerate(exprs):
+        out = blocks.get(f'EXPR{i}')
+        result['exprs'].append({'expr': e, 'output': out.strip('\n')} if out and out.strip() else
+                               {'expr': e, 'error': 'not reached' if out is None else 'no value; its error is in gdbStderr'})
+    err_lines = [ln for ln in read(gdb_err).splitlines() if ln.strip()] if os.path.exists(gdb_err) else []
+    if err_lines:
+        result['gdbStderr'] = err_lines
+    return any('error' in r for r in result['exprs'])
+
+
+def parse_budget(result, blocks, locations):
+    """Each location in order: inserted, refused (the budget is the count inserted before it), or
+    unresolved (gdb found no such location and asked the hardware nothing). Anything else, a
+    location not reached or gdb failing another way (no connection, no hardware breakpoint support),
+    ends the count and is returned as the location the hardware was not asked about."""
+    rows, budget, inserted, unasked = [], None, 0, None
+    for i, loc in enumerate(locations):
+        out = blocks.get(f'AT{i}')
+        lines = out.strip().splitlines() if out else []
+        if out is None:
+            row = {'at': loc, 'result': 'not reached'}
+        elif re.search(r'^Hardware assisted breakpoint \d+ at', out, re.M):
+            refused = re.search(r'Cannot insert|Could not insert|Remote failure', out)
+            row = {'at': loc, 'result': 'refused', 'output': lines} if refused else {'at': loc, 'result': 'inserted'}
+        elif re.search(r'not defined|No symbol|No source file named|No line \d+|malformed linespec', out):
+            row = {'at': loc, 'result': 'unresolved', 'output': lines}
+        else:
+            row = {'at': loc, 'result': 'failed', 'output': lines}
+        rows.append(row)
+        if budget is None and unasked is None:
+            if row['result'] == 'inserted':
+                inserted += 1
+            elif row['result'] == 'refused':
+                budget = {'exactly': inserted}
+            elif row['result'] in ('not reached', 'failed'):
+                unasked = loc
+    if budget is None and unasked is None:
+        budget = {'atLeast': inserted}
+    result['locations'], result['budget'] = rows, budget
+    return any(r['result'] != 'inserted' for r in rows), unasked
 
 
 def main(argv=None):
@@ -395,13 +465,12 @@ def main(argv=None):
             print(json.dumps(result))
             return 3
         result['exit'] = proc.returncode
-        with open(log, errors='replace') as f:
-            result['examination'] = [m.group(0) for m in _EXAMINE_RE.finditer(f.read())]
         errors = [f'openocd exited {proc.returncode}; see {log}'] if proc.returncode else []
-        bad = removal_errors(log)
-        if bad:
-            result['removeErrors'] = bad
-            errors.append('breakpoint/watchpoint removal errors in the recover session itself')
+        try:
+            result['examination'] = [m.group(0) for m in _EXAMINE_RE.finditer(read(log))]
+        except OSError as e:
+            errors.append(f'openocd log unreadable: {e}')
+        errors += end_errors(result, log)
         if errors:
             result['error'] = '; '.join(errors)
         print(json.dumps(result))
@@ -413,12 +482,13 @@ def main(argv=None):
     result.update(server=cmd, ports=ports, receipt=receipt,
                   anchor={'file': a.anchor, 'sizeAtStart': size_of(a.anchor)} if a.anchor else
                   {'none': a.no_anchor})
-    signals, armed = [], [True]
+    signals, armed = [], True
 
     def on_signal(signum, _frame):
+        nonlocal armed
         signals.append(signum)
-        if armed[0]:
-            armed[0] = False
+        if armed:
+            armed = False
             raise Interrupted(f'interrupted by signal {signum}')
 
     server = gdb_proc = None
@@ -435,8 +505,7 @@ def main(argv=None):
                        'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
         write_receipt(receipt, receipt_rec)
         wait_for(server, log, rf'Listening on port {ports[0]} for gdb connections', time.monotonic() + 30)
-        with open(log, errors='replace') as f:
-            text = f.read()
+        text = read(log)
         result['examination'] = {'log': [m.group(0) for m in _EXAMINE_RE.finditer(text)], 'cores': tcl.states()}
         mark = len(text)
         argv = [gdb, '-nx', '-batch', a.elf]
@@ -449,12 +518,11 @@ def main(argv=None):
                 gdb_proc.wait(a.timeout)
             except subprocess.TimeoutExpired:
                 errors.append(f'gdb did not finish within {a.timeout:.0f} s; see {gdb_log}')
-        with open(log, errors='replace') as f:
-            result['connect'] = [m.group(0) for m in _CONNECT_RE.finditer(f.read()[mark:])]
+        result['connect'] = [m.group(0) for m in _CONNECT_RE.finditer(read(log)[mark:])]
     except (ToolError, OSError, Interrupted) as e:
         errors.append(str(e))
     finally:
-        armed[0] = False
+        armed = False
         stop(gdb_proc)
     try:
         if server is not None and server.poll() is None:
@@ -469,71 +537,25 @@ def main(argv=None):
     except (OSError, ToolError) as e:
         errors.append(f'ending the session over the Tcl port: {e}; the server is left running: '
                       f'esp_session.py leave --receipt {receipt}')
-    gdb_text = open(gdb_log, errors='replace').read() if os.path.exists(gdb_log) else ''
+    gdb_text = read(gdb_log) if os.path.exists(gdb_log) else ''
     blocks = dict(_MARK_RE.findall(gdb_text))
-    failed = False
     if a.mode == 'inspect':
-        result['threads'] = blocks.get('THREADS', '').splitlines() or None
-        result['backtrace'] = blocks.get('BT', '').splitlines() or None
-        result['exprs'] = []
-        for i, e in enumerate(a.expr):
-            out = blocks.get(f'EXPR{i}')
-            row = {'expr': e, 'output': out.strip('\n')} if out and out.strip() else \
-                  {'expr': e, 'error': 'not reached' if out is None else 'no value; its error is in gdbStderr'}
-            result['exprs'].append(row)
-            failed |= 'error' in row
-        err_lines = [ln for ln in open(gdb_err, errors='replace').read().splitlines() if ln.strip()] \
-            if os.path.exists(gdb_err) else []
-        if err_lines:
-            result['gdbStderr'] = err_lines
+        failed = parse_inspect(result, blocks, a.expr, gdb_err)
         if result['backtrace'] is None and not errors:
             errors.append(f'gdb session incomplete (no backtrace); see {gdb_log} and {gdb_err}')
     else:
-        rows, budget, inserted = [], None, 0
-        for i, loc in enumerate(a.at):
-            out = blocks.get(f'AT{i}')
-            if out is None:
-                rows.append({'at': loc, 'result': 'not reached'})
-            elif not re.search(r'^Hardware assisted breakpoint \d+ at', out, re.M):
-                # gdb could not place it (no such symbol, a bad expression): no hardware was asked
-                rows.append({'at': loc, 'result': 'unresolved', 'output': out.strip().splitlines()})
-            elif re.search(r'Cannot insert|Could not insert|Remote failure', out):
-                rows.append({'at': loc, 'result': 'refused', 'output': out.strip().splitlines()})
-            else:
-                rows.append({'at': loc, 'result': 'inserted'})
-        for r in rows:
-            if r['result'] == 'inserted':
-                inserted += 1
-            elif r['result'] == 'refused':
-                budget = {'exactly': inserted}
-                break
-            elif r['result'] == 'not reached':
-                break
-        else:
-            budget = {'atLeast': inserted}
-        result['locations'], result['budget'] = rows, budget
-        failed = any(r['result'] != 'inserted' for r in rows)
-        if budget is None and not errors:
-            errors.append(f'gdb session incomplete (a location was not reached); see {gdb_log}')
+        failed, unasked = parse_budget(result, blocks, a.at)
+        if unasked and not errors:
+            errors.append(f'gdb did not ask the hardware for {unasked!r}; see {gdb_log}')
     if a.anchor:
         result['anchor']['sizeAtEnd'] = size_of(a.anchor)
-    if 'end' in result:
-        halted = [t for t, s in result['end']['cores'].items() if s != 'running']
-        if halted:
-            errors.append(f"left not running: {', '.join(halted)}")
-    bad = removal_errors(log, result.get('end'))
-    if bad:
-        result['removeErrors'] = bad
-        errors.append(f'breakpoint/watchpoint removal errors: {RECOVER_HINT}')
+    errors += end_errors(result, log)
     if signals:
         errors.append(f"interrupted by signal {', '.join(map(str, signals))}")
     if errors:
         result['error'] = '; '.join(dict.fromkeys(errors))
-        print(json.dumps(result))
-        return 3
     print(json.dumps(result))
-    return 1 if failed else 0
-
+    return 3 if errors else (1 if failed else 0)
 
 if __name__ == '__main__':
     sys.exit(main())

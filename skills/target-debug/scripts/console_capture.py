@@ -33,9 +33,11 @@ Exit: 0 captured (an empty capture included); 2 bad usage; 3 the port could not 
 configured, a read failed, or its settings could not be restored.
 """
 import argparse
+import bisect
 import datetime
 import errno
 import fcntl
+import itertools
 import json
 import math
 import os
@@ -97,8 +99,8 @@ def marks(data, chunks, patterns):
     starts = [c['offset'] for c in chunks]
     out = []
     for pat in patterns:
-        for m in list(pat.finditer(text))[:MAX_MARKS]:
-            i = max(0, next((k for k, s in enumerate(starts) if s > m.start()), len(starts)) - 1)
+        for m in itertools.islice(pat.finditer(text), MAX_MARKS):
+            i = max(0, bisect.bisect_right(starts, m.start()) - 1)
             out.append({'pattern': pat.pattern, 'offset': m.start(), 't': chunks[i]['t'], 'text': m.group(0)})
     return out
 
@@ -150,7 +152,7 @@ def main(argv=None):
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, on_signal)
     fd, saved, errors = None, None, []
-    chunks, data, ended = [], bytearray(), 'time'
+    chunks, size, ended = [], 0, 'time'
     try:
         fd = os.open(a.port, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
         t_open = time.monotonic()
@@ -182,12 +184,12 @@ def main(argv=None):
             if not chunk:
                 ended = 'device gone'
                 break
-            rec = {'t': round(time.monotonic() - t_open, 4), 'offset': len(data), 'len': len(chunk)}
+            rec = {'t': round(time.monotonic() - t_open, 4), 'offset': size, 'len': len(chunk)}
             out.write(chunk)
             out.flush()
             times.write((json.dumps(rec) + '\n').encode())
             chunks.append(rec)
-            data += chunk
+            size += len(chunk)
     except Stop as e:
         ended = str(e)
     except (OSError, termios.error) as e:
@@ -206,17 +208,16 @@ def main(argv=None):
             os.close(fd)
         out.close()
         times.close()
-    result.update(ended=ended, bytes=len(data), chunks=len(chunks),
+    result.update(ended=ended, bytes=size, chunks=len(chunks),
                   firstByteAt=chunks[0]['t'] if chunks else None,
                   baseline='the open' if chunks else 'none: nothing was received')
     if patterns:
-        result['marks'] = marks(bytes(data), chunks, patterns)
+        with open(a.out, 'rb') as f:
+            result['marks'] = marks(f.read(), chunks, patterns)
     if errors:
         result['error'] = '; '.join(errors)
-        print(json.dumps(result))
-        return 3
     print(json.dumps(result))
-    return 0
+    return 3 if errors else 0
 
 
 if __name__ == '__main__':

@@ -47,15 +47,28 @@ say(f'Info : Listening on port {gdb_port} for gdb connections')
 if os.environ.get('FAKE_REMOVE_ERROR'):
     say('Error: [chip.cpu0] could not remove watchpoint')
 ignore_shutdown = os.environ.get('FAKE_IGNORE_SHUTDOWN')
-while True:
-    conn, _ = srv.accept()
+def commands(conn):
     buf = b''
-    while not buf.endswith(b'\x1a'):
+    while True:
         chunk = conn.recv(4096)
         if not chunk:
-            break
+            return
         buf += chunk
-    cmd = buf[:-1].decode()
+        while b'\x1a' in buf:
+            cmd, buf = buf.split(b'\x1a', 1)
+            yield cmd.decode()
+nconn = 0
+def serve():
+    global nconn
+    conn, _ = srv.accept()
+    nconn += 1
+    for cmd in commands(conn):
+        with open(os.environ['FAKE_LOG'], 'a') as f:
+            f.write(json.dumps({'tool': 'tcl', 'conn': nconn, 'cmd': cmd}) + '\n')
+        if not answer(conn, cmd):
+            return
+    conn.close()
+def answer(conn, cmd):
     with open(state_path) as f:
         st = json.load(f)
     reply = ''
@@ -71,14 +84,16 @@ while True:
     elif cmd == 'shutdown':
         if ignore_shutdown and not os.path.exists(ignore_shutdown):
             open(ignore_shutdown, 'w').close()
-            conn.sendall(b'\x1a'); conn.close(); continue
+            conn.sendall(b'\x1a'); conn.close(); return False
         say('shutdown command invoked')
         conn.close()
         sys.exit(0)
     with open(state_path, 'w') as f:
         json.dump(st, f)
     conn.sendall(reply.encode() + b'\x1a')
-    conn.close()
+    return True
+while True:
+    serve()
 '''
 
 # gdb stand-in: the -ex commands in order; the connect halts every core and appends openocd's connect lines.
@@ -118,6 +133,9 @@ for c in exs:
         else:
             sys.stderr.write(f'No symbol "{e}" in current context.\n')
     elif c.startswith('hbreak '):
+        if os.environ.get('FAKE_NO_HW_BREAK'):
+            print('No hardware breakpoint support in the target.')
+            continue
         if c[7:] in os.environ.get('FAKE_UNRESOLVED', '').split(','):
             print(f'Function "{c[7:]}" not defined.')
             continue
@@ -152,7 +170,7 @@ class EspSessionTest(unittest.TestCase):
         self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
                     'FAKE_STATE': str(self.d / 'state.json'), 'FAKE_OCD_LOG': str(self.out / 'openocd.log')}
 
-    def session(self, mode, *args, **env):
+    def session(self, mode, *args):
         return [sys.executable, str(SCRIPT), mode, '--out', str(self.out), *BOARD, '--rtos', 'FreeRTOS',
                 '--gdb', 'fake-gdb', '--elf', str(self.elf), '--anchor', str(self.anchor), *args]
 
@@ -236,6 +254,40 @@ class EspSessionTest(unittest.TestCase):
         self.assertIn('run `recover`', out['error'])
         self.assertEqual(out['removeErrors'], ['{chip.cpu0 rbp: failed}'])
 
+    def test_each_tcl_connection_answers_the_token_before_any_command(self):
+        rc, out, err = self.run_cli(self.session('inspect'))
+        self.assertEqual(rc, 0, err)
+        conns = {}
+        for line in self.log.read_text().splitlines():
+            c = json.loads(line)
+            if c['tool'] == 'tcl':
+                conns.setdefault(c['conn'], []).append(c['cmd'])
+        self.assertEqual(len(conns), 1, conns)
+        cmds = conns[1]
+        self.assertIn('ESPS_SESSION', cmds[0])
+        self.assertFalse(any('ESPS_SESSION' in c for c in cmds[1:]))
+        self.assertEqual(cmds[-1], 'shutdown')
+
+    def test_an_unreadable_log_leaves_removal_unchecked(self):
+        flag = self.d / 'shutdown-ignored'
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_IGNORE_SHUTDOWN=str(flag))
+        self.assertEqual(rc, 3, err)
+        receipt = self.out / 'receipt.json'
+        rec = json.loads(receipt.read_text())
+        receipt.write_text(json.dumps({**rec, 'log': str(self.d / 'gone.log')}))
+        rc, out, err = self.run_cli([sys.executable, str(SCRIPT), 'leave', '--receipt', str(receipt)],
+                                    FAKE_IGNORE_SHUTDOWN=str(flag))
+        self.assertEqual(rc, 3, (out, err))
+        self.assertIn('removal unchecked', out['removeErrors'][0])
+
+    def test_a_gdb_failure_at_a_location_is_no_budget(self):
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'main', '--at', 'tud_task'),
+                                    FAKE_NO_HW_BREAK='1')
+        self.assertEqual(rc, 3, err)
+        self.assertIsNone(out['budget'])
+        self.assertEqual(out['locations'][0]['result'], 'failed')
+        self.assertIn('did not ask the hardware', out['error'])
+
     def test_a_tcl_port_with_another_session_is_never_driven(self):
         rc, out, err = self.run_cli(self.session('inspect'), FAKE_OTHER_TOKEN='intruder')
         self.assertEqual(rc, 3)
@@ -287,7 +339,7 @@ class EspSessionTest(unittest.TestCase):
         leave = [sys.executable, str(SCRIPT), 'leave', '--receipt', str(receipt)]
         rc, out, err = self.run_cli(leave, FAKE_IGNORE_SHUTDOWN=str(flag))
         self.assertEqual(rc, 0, (out, err))
-        self.assertEqual(out['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+        self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
         self.assertTrue(json.loads(receipt.read_text())['closed'])
         rc, out, err = self.run_cli(leave)
         self.assertEqual(rc, 2)

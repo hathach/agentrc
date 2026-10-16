@@ -1,6 +1,5 @@
 """Manifest and esptool 5.5.0 output plumbing; no hardware is accessed."""
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,9 +11,6 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills/target-debug/scripts/esp_verify.py'
-_spec = importlib.util.spec_from_file_location('esp_verify', SCRIPT)
-esp_verify = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(esp_verify)
 
 # The headers/verdicts are from esptool 5.5.0 cmds.py:2671-2700; fatal exit is 2.
 FAKE_ESPTOOL = '''#!/usr/bin/env python3

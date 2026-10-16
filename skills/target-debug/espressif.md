@@ -87,21 +87,15 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 (gdb) continue
 ```
 
-`esp_session.py` runs the read-only part as one bounded session and ends it the way Leave says even when gdb dies: the
-configuration in this order on free ports, examination, gdb connect and the end recorded apart, every core's state read
-at the end over the Tcl port (`--help`):
+`esp_session.py` runs the read-only part as one bounded session and ends it the way Leave says even when gdb dies
+(`--help`; runs in `projects/tinyusb.md`):
 
 ```bash
 python3 <skill dir>/scripts/esp_session.py inspect --out <new dir> --board-cfg board/<chip>-builtin.cfg \
   --adapter-serial <MAC> --rtos FreeRTOS --gdb <arch gdb> --elf <flashed.elf> --anchor <console capture> [--expr ...]
-#   budget: --at <location> ... instead of --expr; recover: the route only (init; shutdown)
-#   exit 0 done and every core running, 1 an expression failed or a location was refused, 2 usage,
-#   3 openocd/gdb/Tcl failure, interrupted, a core left halted, or the shutdown failed (then: leave --receipt)
+#   budget: --at <location> ... instead of --expr; recover: the route only (init; shutdown);
+#   a server left running after exit 3: leave --receipt <out>/receipt.json
 ```
-
-On 2026-10-16 (openocd 20260703, htpc) `inspect` ran on the P4, the S31, the Kaluga S2 (by USB location) and the Metro
-S3 (ESP-Prog serial) with every core running at the end, an empty console capture and the app devices' USB device
-numbers unchanged; with gdb hung after the connect and killed at `--timeout`, the Tcl side resumed both P4 cores.
 
 - Server initialization examines the cores and leaves them running (S2, S3, P4, S31 measured 2026-10-16); a telnet
   `halt` or the gdb connect halts them. Keep the three apart in a record: examination, gdb connect and a deliberate halt
@@ -128,8 +122,7 @@ numbers unchanged; with gdb hung after the connect and killed at `--timeout`, th
 
 Count from the target's own evidence; nothing carries across chips. The probe procedure (`always-inserted`, where the
 refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s; `esp_session.py budget --at <location> ...` runs it
-with the cleanup outside gdb (2026-10-16, builds without the end-of-stack watchpoint: P4 exactly 3, S31 exactly 4, the
-next one refused).
+with the cleanup outside gdb (builds without the end-of-stack watchpoint, 2026-10-16: P4 exactly 3, S31 exactly 4).
 
 - RISC-V: openocd prints `Found N triggers` per core (P4: 3, which TRM 6567 §2.11.3.2 p161 says, and once "four"; S31:
   4), breakpoints and watchpoints share them, and firmware can hold one (the end-of-stack watchpoint held one of the
@@ -181,12 +174,10 @@ In this order, since an esptool reset before the first step started the boot loo
    next esptool reset, by the Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not
    established.
 2. Verify the build image through a non-writing route before reprogramming: `esp_verify.py --manifest
-   <build>/flasher_args.json --chip <c> --port /dev/serial/by-id/<port> --before <reset> --after <reset>` runs esptool's
-   `verify-flash` over every image the manifest lists, with its flash settings, and reports those ranges only
-   (`--help`); never an objcopy of the ELF. On 2026-10-16 it matched the flashed builds on the P4, the S31 (USJ) and the
-   Kaluga S2 (UART) and named the bootloader and app mismatches against other builds; a wrong `--chip` was refused, and
-   that refusal left the P4 in the ROM loader (esptool skips `--after` when it cannot connect; the report says so) until
-   a reset from the USJ's lines. Without such a port (Metro S3), report verification pending, or restore and verify the
+   <build>/flasher_args.json --chip <c> --port /dev/serial/by-id/<port> --before <reset> --after <reset>` (`--help`),
+   never an objcopy of the ELF. A failed connect, a wrong `--chip` included, leaves a chip that `--before` reset in the
+   ROM loader, since esptool skips `--after` then (the report's `chipState`; the P4 came back on a reset from the USJ's
+   lines, 2026-10-16). Without such a port (Metro S3), report verification pending, or restore and verify the
    pinned image under `SKILL.md`'s Delegated sessions, Cleanup. With flash support off the known writer, the
    flash-breakpoint fallback, is absent; that does not stand in for the verification Cleanup requires.
 3. Reset or reflash as the cleanup requires ("Resets").
@@ -254,8 +245,7 @@ back as reset cause 1, power-on (Metro, 2026-10-16).
   at every open: measure it (`console_capture.py --mark 'rst:0x[0-9a-f]+'`, `techniques.md` "Log capture") rather than
   assume either way, and open before the baseline (Attach, "Before attaching"). A pyserial open of the USJ CDC with
   `dtr=rts=False` set before `open()` reset the P4 and the S31 (`rst:0x17 CHIP_USB_UART_RESET`); `console_capture.py`
-  opens, with `--lines low` or `leave`, reset neither, nor the Metro S3 through ESP-Prog channel B (no banner in 6 s,
-  app devices kept their USB device numbers; all 2026-10-16).
+  opens reset neither, nor the Metro S3 through ESP-Prog channel B (2026-10-16).
 - openocd on the USJ's JTAG interface and a console on its CDC coexist: every 2026-10-16 P4 and S31 attach ran with the
   console open.
 - The USJ CDC is a console only while the USJ exists (on the measured S3 boards it disappears when the firmware starts

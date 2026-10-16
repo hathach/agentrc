@@ -171,6 +171,13 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   non-panicking stock attach listed nine tasks. An earlier stock-build attach on the P4 (2026-10-15, before these runs)
   had been clean: no reset, `thbreak tud_task_ext` hit in `usbd` with a symbolized backtrace, eight tasks listed, CDC
   echo after `shutdown`.
+- target-debug script runs, 2026-10-16 (htpc, openocd 20260703, esptool 5.5.0, the builds above): `esp_session.py
+  inspect` on the P4, the S31, the Kaluga S2 (by USB location) and the Metro S3 (ESP-Prog serial) ended with every core
+  running, an empty console capture and the app devices' USB numbers unchanged; with gdb hung after the connect and
+  killed at `--timeout`, the Tcl side resumed both P4 cores. `esp_verify.py` matched the flashed builds on the P4, the
+  S31 (USJ) and the Kaluga S2 (UART) and named the bootloader and app mismatches against other builds.
+  `console_capture.py` opens with `--lines low` or `leave` reset none of the P4, the S31 and the Metro (no banner in
+  6 s, USB numbers kept); a USJ-driven reset of the P4 (DTR low, RTS high) kept the whole ROM banner in the capture.
 - cdc_msc_throughput: its CDC interface is `usb-TinyUSB_Throughput_<serial>-if00`, and its CDC filler is NUL bytes
   without a newline: a canonical-mode tty delivers nothing of it to `cat` and mimics a device-to-host stall; set raw
   mode on the reader's own fd (`techniques.md` "Log capture").
