@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import signal
@@ -9,14 +10,21 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'dual_capture.py'
+_spec = importlib.util.spec_from_file_location('dual_capture', SCRIPT)
+dual_capture = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(dual_capture)
 
 
 def alive(pid):
-    try:
-        with open(f'/proc/{pid}/stat') as f:
-            return f.read().rsplit(')', 1)[1].split()[0] != 'Z'
-    except OSError:
-        return False
+    st = dual_capture.stat(pid)
+    return bool(st) and st[0] != 'Z'
+
+
+def wait_until(cond, seconds=5):
+    deadline = time.monotonic() + seconds
+    while not cond() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return cond()
 
 
 @unittest.skipIf(not sys.platform.startswith('linux'), 'reads /proc')
@@ -52,7 +60,6 @@ class DualCaptureTest(unittest.TestCase):
         self.assertEqual([host['returncode'], target['returncode']], [0, 0])
         self.assertGreater(out['bothRunning']['seconds'], 0.1)
         self.assertLessEqual(out['bothRunning']['to'], host['exitedAt'])
-        self.assertTrue(out['readiness'].startswith('not observed'))
 
     def test_the_bound_stops_a_side_and_an_escaped_descendant(self):
         pidfile = self.d / 'grandchild.pid'
@@ -63,11 +70,10 @@ class DualCaptureTest(unittest.TestCase):
                                     '--timeout', '1.5', '--grace', '1')
         self.assertEqual(rc, 1, err)
         host = out['sides'][0]
-        self.assertTrue(host['stoppedAtBound'])
+        self.assertTrue(host['stopped'])
         self.assertEqual((self.out / 'host.out').read_text(), 'partial\n')
-        time.sleep(0.3)
-        self.assertFalse(alive(int(pidfile.read_text())))
-        self.assertFalse(out['sides'][1]['stoppedAtBound'])
+        self.assertTrue(wait_until(lambda: not alive(int(pidfile.read_text()))))
+        self.assertFalse(out['sides'][1]['stopped'])
 
     def test_a_side_that_cannot_start_stops_the_other(self):
         bad = self.d / 'bad.json'
@@ -76,7 +82,7 @@ class DualCaptureTest(unittest.TestCase):
                                     '--timeout', '20', '--grace', '1')
         self.assertEqual(rc, 3, err)
         self.assertIn('startError', out['sides'][1])
-        self.assertTrue(out['sides'][0]['stoppedAtBound'])
+        self.assertTrue(out['sides'][0]['stopped'])
 
     def test_a_failing_side_fails_the_run(self):
         rc, out, err = self.run_cli(self.side('host', 'raise SystemExit(4)'), self.side('target', 'pass'),
@@ -93,7 +99,76 @@ class DualCaptureTest(unittest.TestCase):
         out = json.loads(out)
         self.assertEqual(proc.returncode, 1, err)
         self.assertEqual(out['interrupted'], [15])
-        self.assertTrue(all(s['stoppedAtBound'] for s in out['sides']))
+        self.assertTrue(all(s['stopped'] for s in out['sides']))
+
+    def test_what_outlives_its_tool_is_stopped_and_fails_the_run(self):
+        # seen by its side while the tool still ran, or orphaned before that and reparented here
+        for linger, owner in (('0.5', 'side'), ('0', 'orphans')):
+            with self.subTest(owner):
+                pidfile = self.d / f'orphan-{owner}.pid'
+                code = ('import subprocess, time; '
+                        f'p = subprocess.Popen(["setsid", "sleep", "60"]); open({str(pidfile)!r}, "w").write(str(p.pid)); '
+                        f'time.sleep({linger})')
+                self.out = self.d / f'out-{owner}'
+                rc, out, err = self.run_cli(self.side('host', code), self.side('target', 'pass'),
+                                            '--timeout', '10', '--grace', '1')
+                pid = int(pidfile.read_text())
+                self.assertEqual(rc, 1, err)
+                if owner == 'side':
+                    self.assertTrue(out['sides'][0]['stopped'])
+                    self.assertNotIn('descendantsLeft', out['sides'][0])
+                else:
+                    self.assertEqual(out['orphans'], {'pids': [pid], 'left': []})
+                self.assertTrue(wait_until(lambda: not alive(pid)))
+
+    def test_a_child_started_by_a_thread_is_tracked(self):
+        pidfile = self.d / 'thread-child.pid'
+        code = ('import subprocess, threading, time\n'
+                'def run():\n'
+                f'    p = subprocess.Popen(["sleep", "60"], start_new_session=True); open({str(pidfile)!r}, "w").write(str(p.pid))\n'
+                'threading.Thread(target=run).start(); time.sleep(60)')
+        rc, out, err = self.run_cli(self.side('host', code), self.side('target', 'pass'),
+                                    '--timeout', '1', '--grace', '1')
+        self.assertEqual(rc, 1, err)
+        self.assertNotIn('descendantsLeft', out['sides'][0])
+        self.assertTrue(wait_until(lambda: not alive(int(pidfile.read_text()))))
+
+    def test_a_live_tool_stops_its_own_children_and_they_get_the_grace(self):
+        # the leader, like rtt.py, ends its own-session child in its own way on SIGTERM; the child takes
+        # 0.5 s to finish, past the leader's exit, and must not be signalled by this script meanwhile
+        log = self.d / 'child.log'
+        child = (f'import signal, sys, time\nlog = open({str(log)!r}, "a", buffering=1)\n'
+                 'def term(*_): log.write("TERM\\n")\n'
+                 'def stop(*_): time.sleep(0.5); log.write("flushed\\n"); sys.exit(0)\n'
+                 'signal.signal(signal.SIGTERM, term); signal.signal(signal.SIGINT, stop)\n'
+                 'log.write("up\\n")\n'
+                 'while True: time.sleep(1)')
+        leader = ('import signal, subprocess, sys, time\n'
+                  f'p = subprocess.Popen([sys.executable, "-c", {child!r}], start_new_session=True)\n'
+                  'def term(*_): p.send_signal(signal.SIGINT); sys.exit(0)\n'
+                  'signal.signal(signal.SIGTERM, term)\n'
+                  'while True: time.sleep(1)')
+        proc = self.start(self.side('host', leader), self.side('target', 'import time; time.sleep(60)'),
+                          '--timeout', '1.5', '--grace', '3')
+        out, err = proc.communicate(timeout=30)
+        out = json.loads(out)
+        self.assertEqual(log.read_text(), 'up\nflushed\n', err)
+        host = out['sides'][0]
+        self.assertFalse(host['killed'])
+        self.assertNotIn('descendantsLeft', host)
+
+    def test_each_exit_time_is_its_own(self):
+        rc, out, err = self.run_cli(self.side('host', 'import time; time.sleep(60)'),
+                                    self.side('target', 'import signal, time; signal.signal(signal.SIGTERM, '
+                                                        'signal.SIG_IGN); time.sleep(60)'),
+                                    '--timeout', '1', '--grace', '1.5')
+        self.assertEqual(rc, 1, err)
+        host, target = out['sides']
+        self.assertFalse(host['killed'])
+        self.assertTrue(target['killed'])
+        self.assertLess(host['exitedAt'], 1.5)
+        self.assertGreater(target['exitedAt'], 2.2)
+        self.assertEqual(out['bothRunning']['to'], host['exitedAt'])
 
     def test_refusals(self):
         good = self.side('host', 'pass')

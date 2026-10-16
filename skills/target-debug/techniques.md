@@ -128,16 +128,14 @@ answers "what ran right before this hang".
 
 Capture both ends at once: usbmon plus a target channel when a Linux PC is the host; an MCU host has no usbmon on either
 end, so target channel plus the wire (`usb-sniffer`), plus `usb-kernel-debug` on a Linux gadget peer. `dual_capture.py`
-starts both under one bound, keeps whatever each wrote (a side still running at the bound is stopped, its process group
-and descendants included), and reports when each ran and the window both existed; that is not when both were capturing,
-which each tool's own output shows (`--help`). Each side is an argv file, a JSON list:
+runs both under one backstop bound and reports when each ran (`--help`); each tool keeps its own duration. Each side is
+an argv file, a JSON list:
 
 ```bash
 echo '["python3", "<usb-kernel-debug skill dir>/scripts/usbcap.py", "<bus>", "30", "host.pcapng"]' > host.json
 echo '["python3", "<rtt skill dir>/scripts/rtt.py", "--backend", "jlink", "--probe", "<sn>", "--device", "<dev>",
       "--interface", "swd", "--speed", "auto", "--seconds", "30"]' > target.json
 python3 <skill dir>/scripts/dual_capture.py --a host=host.json --b target=target.json --timeout 40 --out <new dir>
-#   exit 0 both exited 0 within the bound, 1 a side failed or was stopped, 2 usage, 3 a side could not start
 ```
 
 Trigger the failing test once both sides show they are capturing in their own output (usbcap prints its start line).
