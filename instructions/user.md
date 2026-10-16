@@ -88,6 +88,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
 - Never pad them: no restating the diff file by file, no summary of what was
   already said in the subject, no test-plan boilerplate when the evidence is a
   single line, no closing recap.
+- Markdown files: wrap prose you write or edit at 120 columns, and align table
+  columns, separator included, up to the first column whose widest cell exceeds
+  that width; from there leave cells unpadded and the separator `---`. Keep a
+  file's or repo's own convention; never re-wrap or re-pad text you did not
+  change.
 
 # Authorship
 - Never add AI-agent attribution or session trailers to git commit messages —
