@@ -128,8 +128,8 @@ numbers unchanged; with gdb hung after the connect and killed at `--timeout`, th
 
 Count from the target's own evidence; nothing carries across chips. The probe procedure (`always-inserted`, where the
 refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s; `esp_session.py budget --at <location> ...` runs it
-with the cleanup outside gdb (P4, a build without the end-of-stack watchpoint: exactly 3, the fourth refused,
-2026-10-16).
+with the cleanup outside gdb (2026-10-16, builds without the end-of-stack watchpoint: P4 exactly 3, S31 exactly 4, the
+next one refused).
 
 - RISC-V: openocd prints `Found N triggers` per core (P4: 3, which TRM 6567 §2.11.3.2 p161 says, and once "four"; S31:
   4), breakpoints and watchpoints share them, and firmware can hold one (the end-of-stack watchpoint held one of the

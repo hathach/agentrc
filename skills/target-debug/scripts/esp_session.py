@@ -6,7 +6,7 @@
                  (--anchor <console capture file> | --no-anchor <reason>) [--expr EXPR ...] [--timeout S]
   esp_session.py budget  --out <new dir> <route> --rtos FreeRTOS|none --gdb <arch gdb> --elf <flashed.elf> \
                  (--anchor <file> | --no-anchor <reason>) --at <location> [--at ...] [--timeout S]
-  esp_session.py recover --out <new dir> <route>
+  esp_session.py recover --out <new dir> <route> [--timeout S]
   esp_session.py leave   --receipt <dir>/receipt.json
 
   <route>: --board-cfg board/<chip>-builtin.cfg --adapter-serial <MAC-with-colons>
@@ -29,15 +29,20 @@ backtrace and the caller's expressions (may-write-memory, may-write-registers, m
 and may-insert-breakpoints off), resumes and detaches. budget: gdb sets `breakpoint
 always-inserted on` and inserts one `hbreak` per --at location in order, so each insertion is
 tried at once; the budget is the count inserted before the first refusal, or a lower bound when
-none was refused. The firmware can hold triggers of its own (espressif.md, "Breakpoint budgets").
+none was refused. A location gdb cannot place (no such symbol) is reported unresolved and asks
+the hardware nothing. The firmware can hold triggers of its own (espressif.md, "Breakpoint
+budgets").
 
 Whatever gdb does, the session ends from this script over the Tcl port: every breakpoint and
 watchpoint removed, each halted core resumed, each core's state read, then `shutdown`, never a
-kill (a killed openocd leaves RISC-V chips in the Breakpoint boot loop: espressif.md, Leave). A
-shutdown that fails leaves the server running and its receipt open: `leave --receipt` ends that
-server only, after checking the process is the one this script started. `recover` is the
-separately chosen `init; shutdown` session (espressif.md, "After an abnormal end"). Nothing
-here resets, reflashes or kills on its own.
+kill (a killed openocd leaves RISC-V chips in the Breakpoint boot loop: espressif.md, Leave). The
+Tcl port must first answer the session token this script gave its openocd (`set ESPS_SESSION`),
+so a server that took the port meanwhile is never driven. A shutdown that fails leaves the
+server running and its receipt open: `leave --receipt` ends that server only, after checking the
+process (argv and start time) and the token. Removal errors, from the end or in openocd's log,
+fail the run with the `recover` hint. `recover` is the separately chosen `init; shutdown` session
+(espressif.md, "After an abnormal end"), bounded by --timeout and never killed. Nothing here
+resets, reflashes or kills on its own.
 
 --anchor names the console capture already running (console_capture.py's --out file): its
 size is recorded at the start and the end, so the bytes printed during the session can be read
@@ -55,7 +60,7 @@ import json
 import math
 import os
 import re
-import shlex
+import secrets
 import shutil
 import signal
 import socket
@@ -106,10 +111,11 @@ def route_args(a):
     return r + (['-c', f'adapter speed {a.adapter_speed}'] if a.adapter_speed else [])
 
 
-def server_command(exe, a, ports, log):
+def server_command(exe, a, ports, log, token=None):
     """The one place the configuration order is decided."""
     if ports:
-        cmd = [exe, '-c', f'gdb port {ports[0]}', '-c', f'telnet port {ports[1]}', '-c', f'tcl port {ports[2]}']
+        cmd = [exe, '-c', f'gdb port {ports[0]}', '-c', f'telnet port {ports[1]}', '-c', f'tcl port {ports[2]}',
+               '-c', f'set ESPS_SESSION {token}']
     else:
         cmd = [exe, '-c', 'gdb port disabled', '-c', 'telnet port disabled', '-c', 'tcl port disabled']
     cmd += ['-c', 'set ESP_FLASH_SIZE 0']
@@ -119,8 +125,8 @@ def server_command(exe, a, ports, log):
 
 
 class Tcl:
-    def __init__(self, port, timeout=10):
-        self.port, self.timeout = port, timeout
+    def __init__(self, port, token, timeout=10):
+        self.port, self.token, self.timeout = port, token, timeout
 
     def __call__(self, cmd):
         with socket.create_connection(('127.0.0.1', self.port), timeout=self.timeout) as s:
@@ -133,12 +139,21 @@ class Tcl:
                 buf += chunk
         return buf[:-1].decode(errors='replace')
 
+    def check(self):
+        """The port picked here could have been taken by another server meanwhile: it must answer this
+        session's token before anything is read or sent."""
+        got = self('if {[info exists ESPS_SESSION]} {set ESPS_SESSION}')
+        if got != self.token:
+            raise ToolError(f'Tcl port {self.port} answers for another server (session {got!r}): nothing sent')
+
     def states(self):
+        self.check()
         out = self('set r {}; foreach t [target names] {append r "$t [$t curstate]\n"}; set r')
         return dict(line.rsplit(' ', 1) for line in out.splitlines() if line.strip())
 
     def end(self):
         """Remove every breakpoint and watchpoint, resume each halted core, read the states, shut down."""
+        self.check()
         rec = {'removed': self('set e {}; foreach t [target names] {targets $t; if {[catch {rbp all} m]} '
                                '{lappend e "$t rbp: $m"}; if {[catch {rwp all} m]} {lappend e "$t rwp: $m"}}; set e')}
         before = self.states()
@@ -151,6 +166,29 @@ class Tcl:
         except (OSError, ToolError):
             pass    # the server closes the connection as it shuts down
         return rec
+
+
+def removal_errors(log, end=None):
+    """openocd's own removal errors, and the rbp/rwp errors the end collected."""
+    try:
+        with open(log, errors='replace') as f:
+            bad = [ln for ln in f.read().splitlines() if re.search(r'could not remove (break|watch)point', ln, re.I)]
+    except OSError:
+        bad = []
+    if end and end.get('removed', '').strip():
+        bad.append(end['removed'].strip())
+    return bad
+
+
+RECOVER_HINT = 'run `recover` before an esptool reset (espressif.md, "After an abnormal end")'
+
+
+def start_time(pid):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            return f.read().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
 
 
 def wait_for(proc, path, pattern, deadline):
@@ -233,12 +271,12 @@ def leave(receipt_path):
         return result, 2
     running = cmdline(rec['pid'])
     # a script stand-in runs under its interpreter, which /proc lists first
-    if running is None or running[-len(rec['argv']):] != rec['argv']:
+    if running is None or running[-len(rec['argv']):] != rec['argv'] or start_time(rec['pid']) != rec.get('startTime'):
         result['error'] = (f"process {rec['pid']} is not the openocd this receipt names (gone, or another "
                            f'process): nothing sent')
         return result, 2
     try:
-        result.update(Tcl(rec['ports'][2]).end())
+        result.update(Tcl(rec['ports'][2], rec['token']).end())
     except (OSError, ToolError) as e:
         result['error'] = f'Tcl port {rec["ports"][2]}: {e}'
         return result, 3
@@ -246,9 +284,16 @@ def leave(receipt_path):
         result['error'] = 'openocd still runs after shutdown'
         return result, 3
     write_receipt(receipt_path, {**rec, 'closed': True})
+    errors = []
     halted = [t for t, s in result['cores'].items() if s != 'running']
     if halted:
-        result['error'] = f"left not running: {', '.join(halted)}"
+        errors.append(f"left not running: {', '.join(halted)}")
+    bad = removal_errors(rec.get('log', ''), result)
+    if bad:
+        result['removeErrors'] = bad
+        errors.append(f'breakpoint/watchpoint removal errors: {RECOVER_HINT}')
+    if errors:
+        result['error'] = '; '.join(errors)
         return result, 3
     return result, 0
 
@@ -271,7 +316,8 @@ def main(argv=None):
     p.add_argument('--no-anchor', metavar='REASON', help='why there is no console capture')
     p.add_argument('--expr', action='append', default=[], metavar='EXPR', help='inspect: read-only gdb expression')
     p.add_argument('--at', action='append', default=[], metavar='LOCATION', help='budget: hbreak location, in order')
-    p.add_argument('--timeout', type=float, default=60, help='bound on the gdb session in seconds (default 60)')
+    p.add_argument('--timeout', type=float, default=60,
+                   help='bound on the gdb session, or on recover, in seconds (default 60)')
     a = p.parse_args(argv)
     if a.mode == 'leave':
         if not a.receipt or a.out:
@@ -297,6 +343,8 @@ def main(argv=None):
     for v in (a.board_cfg, a.interface_cfg, a.target_cfg, a.adapter_serial, a.usb_location):
         if v and not re.fullmatch(r'[A-Za-z0-9_./:+-]+', v):
             p.error(f'{v!r}: letters, digits and _ . / : + - only (it reaches an openocd command)')
+    if not (math.isfinite(a.timeout) and a.timeout > 0):
+        p.error('--timeout must be a finite positive number of seconds')
     session = a.mode in ('inspect', 'budget')
     if session:
         if not (a.rtos and a.gdb and a.elf):
@@ -307,8 +355,6 @@ def main(argv=None):
             p.error(f'--anchor {a.anchor}: no such file (start console_capture.py first)')
         if not os.path.isfile(a.elf):
             p.error(f'--elf {a.elf}: no such file')
-        if not (math.isfinite(a.timeout) and a.timeout > 0):
-            p.error('--timeout must be a finite positive number of seconds')
         for e in a.expr + a.at:
             if not e.strip() or '\n' in e:
                 p.error(f'{e!r}: one non-empty line')
@@ -338,22 +384,31 @@ def main(argv=None):
     if a.mode == 'recover':
         cmd = server_command(exe, a, None, log) + ['-c', 'init', '-c', 'shutdown']
         result['server'] = cmd
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                                start_new_session=True)
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            proc.wait(a.timeout)
         except subprocess.TimeoutExpired:
-            result['error'] = 'init; shutdown did not finish within 60 s (openocd left to its own exit)'
+            # never killed: a killed openocd is what recover exists to clean up after
+            result.update(pid=proc.pid, error=f'init; shutdown still runs after {a.timeout:.0f} s (pid {proc.pid}, '
+                                              f'not killed); see {log}')
             print(json.dumps(result))
             return 3
-        result['exit'] = r.returncode
+        result['exit'] = proc.returncode
         with open(log, errors='replace') as f:
             result['examination'] = [m.group(0) for m in _EXAMINE_RE.finditer(f.read())]
-        if r.returncode:
-            result['error'] = f'openocd exited {r.returncode}; see {log}'
+        errors = [f'openocd exited {proc.returncode}; see {log}'] if proc.returncode else []
+        bad = removal_errors(log)
+        if bad:
+            result['removeErrors'] = bad
+            errors.append('breakpoint/watchpoint removal errors in the recover session itself')
+        if errors:
+            result['error'] = '; '.join(errors)
         print(json.dumps(result))
-        return 3 if r.returncode else 0
-    ports = free_ports(3)
-    tcl = Tcl(ports[2])
-    cmd = server_command(exe, a, ports, log)
+        return 3 if errors else 0
+    ports, token = free_ports(3), secrets.token_hex(8)
+    tcl = Tcl(ports[2], token)
+    cmd = server_command(exe, a, ports, log, token)
     receipt = os.path.join(a.out, 'receipt.json')
     result.update(server=cmd, ports=ports, receipt=receipt,
                   anchor={'file': a.anchor, 'sizeAtStart': size_of(a.anchor)} if a.anchor else
@@ -375,8 +430,10 @@ def main(argv=None):
         open(log, 'w').close()
         server = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   stdin=subprocess.DEVNULL, start_new_session=True)
-        write_receipt(receipt, {'pid': server.pid, 'argv': cmd, 'ports': ports, 'closed': False,
-                                'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z')})
+        receipt_rec = {'pid': server.pid, 'startTime': start_time(server.pid), 'argv': cmd, 'ports': ports,
+                       'token': token, 'log': os.path.abspath(log), 'closed': False,
+                       'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+        write_receipt(receipt, receipt_rec)
         wait_for(server, log, rf'Listening on port {ports[0]} for gdb connections', time.monotonic() + 30)
         with open(log, errors='replace') as f:
             text = f.read()
@@ -403,12 +460,12 @@ def main(argv=None):
         if server is not None and server.poll() is None:
             result['end'] = tcl.end()
             if wait_exit(server.pid, server, 10):
-                write_receipt(receipt, {'pid': server.pid, 'argv': cmd, 'ports': ports, 'closed': True})
+                write_receipt(receipt, {**receipt_rec, 'closed': True})
             else:
                 errors.append(f'openocd still runs after shutdown; end it with: esp_session.py leave --receipt {receipt}')
         elif server is not None:
             errors.append(f'openocd exited {server.returncode} during the session; see {log}')
-            write_receipt(receipt, {'pid': server.pid, 'argv': cmd, 'ports': ports, 'closed': True})
+            write_receipt(receipt, {**receipt_rec, 'closed': True})
     except (OSError, ToolError) as e:
         errors.append(f'ending the session over the Tcl port: {e}; the server is left running: '
                       f'esp_session.py leave --receipt {receipt}')
@@ -432,37 +489,42 @@ def main(argv=None):
         if result['backtrace'] is None and not errors:
             errors.append(f'gdb session incomplete (no backtrace); see {gdb_log} and {gdb_err}')
     else:
-        rows, budget = [], None
+        rows, budget, inserted = [], None, 0
         for i, loc in enumerate(a.at):
             out = blocks.get(f'AT{i}')
             if out is None:
                 rows.append({'at': loc, 'result': 'not reached'})
-            elif re.search(r'^Hardware assisted breakpoint \d+ at', out, re.M) and \
-                    not re.search(r'Cannot insert|Could not insert|Remote failure', out):
-                rows.append({'at': loc, 'result': 'inserted'})
-            else:
+            elif not re.search(r'^Hardware assisted breakpoint \d+ at', out, re.M):
+                # gdb could not place it (no such symbol, a bad expression): no hardware was asked
+                rows.append({'at': loc, 'result': 'unresolved', 'output': out.strip().splitlines()})
+            elif re.search(r'Cannot insert|Could not insert|Remote failure', out):
                 rows.append({'at': loc, 'result': 'refused', 'output': out.strip().splitlines()})
-        refused = next((i for i, r in enumerate(rows) if r['result'] != 'inserted'), None)
-        if refused is None:
-            budget = {'atLeast': len(rows)}
-        elif rows[refused]['result'] == 'refused':
-            budget = {'exactly': refused}
+            else:
+                rows.append({'at': loc, 'result': 'inserted'})
+        for r in rows:
+            if r['result'] == 'inserted':
+                inserted += 1
+            elif r['result'] == 'refused':
+                budget = {'exactly': inserted}
+                break
+            elif r['result'] == 'not reached':
+                break
+        else:
+            budget = {'atLeast': inserted}
         result['locations'], result['budget'] = rows, budget
-        failed = refused is not None
+        failed = any(r['result'] != 'inserted' for r in rows)
         if budget is None and not errors:
-            errors.append(f'gdb session incomplete (location {refused} not reached); see {gdb_log}')
+            errors.append(f'gdb session incomplete (a location was not reached); see {gdb_log}')
     if a.anchor:
         result['anchor']['sizeAtEnd'] = size_of(a.anchor)
     if 'end' in result:
         halted = [t for t, s in result['end']['cores'].items() if s != 'running']
         if halted:
             errors.append(f"left not running: {', '.join(halted)}")
-    with open(log, errors='replace') as f:
-        bad = [ln for ln in f.read().splitlines() if re.search(r'could not remove (break|watch)point', ln, re.I)]
+    bad = removal_errors(log, result.get('end'))
     if bad:
         result['removeErrors'] = bad
-        errors.append('openocd logged breakpoint/watchpoint removal errors: run `recover` before an esptool reset '
-                      '(espressif.md, "After an abnormal end")')
+        errors.append(f'breakpoint/watchpoint removal errors: {RECOVER_HINT}')
     if signals:
         errors.append(f"interrupted by signal {', '.join(map(str, signals))}")
     if errors:

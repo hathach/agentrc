@@ -30,8 +30,12 @@ def say(line):
 for c in cores:
     say(f'Info : [{c}] Examination succeed')
 if cs[-2:] == ['init', 'shutdown']:
+    if os.environ.get('FAKE_RECOVER_HANG'):
+        import time; time.sleep(30)
     say('shutdown command invoked')
     sys.exit(int(os.environ.get('FAKE_RECOVER_RC', '0')))
+token = next((c.split()[2] for c in cs if c.startswith('set ESPS_SESSION ')), None)
+token = os.environ.get('FAKE_OTHER_TOKEN', token)
 gdb_port = next(int(c.split()[2]) for c in cs if c.startswith('gdb port '))
 tcl_port = next(int(c.split()[2]) for c in cs if c.startswith('tcl port '))
 state_path = os.environ['FAKE_STATE']
@@ -55,7 +59,9 @@ while True:
     with open(state_path) as f:
         st = json.load(f)
     reply = ''
-    if 'curstate' in cmd:
+    if 'ESPS_SESSION' in cmd:
+        reply = token or ''
+    elif 'curstate' in cmd:
         reply = ''.join(f'{c} {s}\n' for c, s in st.items())
     elif 'rbp all' in cmd:
         reply = os.environ.get('FAKE_RBP_REPLY', '')
@@ -112,6 +118,9 @@ for c in exs:
         else:
             sys.stderr.write(f'No symbol "{e}" in current context.\n')
     elif c.startswith('hbreak '):
+        if c[7:] in os.environ.get('FAKE_UNRESOLVED', '').split(','):
+            print(f'Function "{c[7:]}" not defined.')
+            continue
         n += 1
         print(f'Hardware assisted breakpoint {n} at 0x{n:x}: file main.c, line {n}.')
         if n > budget:
@@ -209,6 +218,41 @@ class EspSessionTest(unittest.TestCase):
         rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'b'), FAKE_BUDGET='4')
         self.assertEqual(rc, 0, err)
         self.assertEqual(out['budget'], {'atLeast': 2})
+
+    def test_an_unresolved_location_is_no_refusal(self):
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'nosuch', '--at', 'b', '--at', 'c'),
+                                    FAKE_BUDGET='1', FAKE_UNRESOLVED='nosuch')
+        self.assertEqual(rc, 1, err)
+        self.assertEqual([r['result'] for r in out['locations']], ['unresolved', 'inserted', 'refused'])
+        self.assertEqual(out['budget'], {'exactly': 1})
+        self.out.rename(self.d / 'out1')
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'nosuch'), FAKE_UNRESOLVED='nosuch')
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(out['budget'], {'atLeast': 0})
+
+    def test_removal_errors_at_the_end_fail_the_run(self):
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_RBP_REPLY='{chip.cpu0 rbp: failed}')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('run `recover`', out['error'])
+        self.assertEqual(out['removeErrors'], ['{chip.cpu0 rbp: failed}'])
+
+    def test_a_tcl_port_with_another_session_is_never_driven(self):
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_OTHER_TOKEN='intruder')
+        self.assertEqual(rc, 3)
+        self.assertIn('answers for another server', out['error'])
+        self.assertNotIn('end', out)
+        receipt = json.loads((self.out / 'receipt.json').read_text())
+        self.assertFalse(receipt['closed'])
+        os.kill(receipt['pid'], signal.SIGKILL)    # the fake server, which nothing here may stop
+
+    def test_recover_is_bounded_and_never_kills(self):
+        argv = [sys.executable, str(SCRIPT), 'recover', '--out', str(self.out), *BOARD, '--timeout', '1']
+        rc, out, err = self.run_cli(argv, FAKE_RECOVER_HANG='1')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('not killed', out['error'])
+        time.sleep(0.2)
+        self.assertTrue(os.path.exists(f"/proc/{out['pid']}"))
+        os.kill(out['pid'], signal.SIGKILL)
 
     def test_the_tcl_side_resumes_what_gdb_left_halted(self):
         rc, out, err = self.run_cli(self.session('inspect'), FAKE_GDB_NO_RESUME='1')
