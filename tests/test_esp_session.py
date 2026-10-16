@@ -1,0 +1,298 @@
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'esp_session.py'
+
+# openocd-esp32 stand-in: --version banner; init/shutdown sessions; a server that logs its examination and
+# listening lines and answers the Tcl commands esp_session sends, with core states in FAKE_STATE.
+FAKE_OPENOCD = r'''#!/usr/bin/env python3
+import json, os, re, socket, sys
+argv = sys.argv[1:]
+if argv == ['--version']:
+    sys.stderr.write(os.environ.get('FAKE_BANNER', 'Open On-Chip Debugger v0.12.0-esp32-20260703 (2026-07-03-13:49)') + '\n')
+    sys.exit(0)
+cs = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
+log = argv[argv.index('-l') + 1]
+cores = os.environ.get('FAKE_CORES', 'chip.cpu0,chip.cpu1').split(',')
+with open(os.environ['FAKE_LOG'], 'a') as f:
+    f.write(json.dumps({'tool': 'openocd', 'argv': argv}) + '\n')
+def say(line):
+    with open(log, 'a') as f:
+        f.write(line + '\n')
+for c in cores:
+    say(f'Info : [{c}] Examination succeed')
+if cs[-2:] == ['init', 'shutdown']:
+    say('shutdown command invoked')
+    sys.exit(int(os.environ.get('FAKE_RECOVER_RC', '0')))
+gdb_port = next(int(c.split()[2]) for c in cs if c.startswith('gdb port '))
+tcl_port = next(int(c.split()[2]) for c in cs if c.startswith('tcl port '))
+state_path = os.environ['FAKE_STATE']
+with open(state_path, 'w') as f:
+    json.dump({c: 'running' for c in cores}, f)
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(('127.0.0.1', tcl_port)); srv.listen(4)
+say(f'Info : Listening on port {gdb_port} for gdb connections')
+if os.environ.get('FAKE_REMOVE_ERROR'):
+    say('Error: [chip.cpu0] could not remove watchpoint')
+ignore_shutdown = os.environ.get('FAKE_IGNORE_SHUTDOWN')
+while True:
+    conn, _ = srv.accept()
+    buf = b''
+    while not buf.endswith(b'\x1a'):
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    cmd = buf[:-1].decode()
+    with open(state_path) as f:
+        st = json.load(f)
+    reply = ''
+    if 'curstate' in cmd:
+        reply = ''.join(f'{c} {s}\n' for c, s in st.items())
+    elif 'rbp all' in cmd:
+        reply = os.environ.get('FAKE_RBP_REPLY', '')
+    elif m := re.match(r'targets (\S+); catch \{resume\}', cmd):
+        if not os.environ.get('FAKE_RESUME_FAIL'):
+            st = {c: 'running' for c in st}
+    elif cmd == 'shutdown':
+        if ignore_shutdown and not os.path.exists(ignore_shutdown):
+            open(ignore_shutdown, 'w').close()
+            conn.sendall(b'\x1a'); conn.close(); continue
+        say('shutdown command invoked')
+        conn.close()
+        sys.exit(0)
+    with open(state_path, 'w') as f:
+        json.dump(st, f)
+    conn.sendall(reply.encode() + b'\x1a')
+    conn.close()
+'''
+
+# gdb stand-in: the -ex commands in order; the connect halts every core and appends openocd's connect lines.
+FAKE_GDB = r'''#!/usr/bin/env python3
+import json, os, re, sys, time
+argv = sys.argv[1:]
+with open(os.environ['FAKE_LOG'], 'a') as f:
+    f.write(json.dumps({'tool': 'gdb', 'argv': argv}) + '\n')
+exs = [argv[i + 1] for i, a in enumerate(argv) if a == '-ex']
+state_path = os.environ['FAKE_STATE']
+exprs = json.loads(os.environ.get('FAKE_EXPRS', '{}'))
+budget = int(os.environ.get('FAKE_BUDGET', '99'))
+def setall(s):
+    with open(state_path) as f:
+        st = json.load(f)
+    with open(state_path, 'w') as f:
+        json.dump({c: s for c in st}, f)
+n = 0
+for c in exs:
+    if c.startswith('target extended-remote'):
+        setall('halted')
+        log = os.environ['FAKE_OCD_LOG']
+        with open(log, 'a') as f:
+            f.write("Info : accepting 'gdb' connection on tcp/1\nInfo : [chip.cpu0] Target halted, PC=0x1\n")
+        if os.environ.get('FAKE_GDB_HANG'):
+            time.sleep(60)
+    elif c.startswith('echo '):
+        sys.stdout.write(c[5:].replace('\\n', '\n'))
+    elif c == 'info threads':
+        print('* 1    Thread 1 "IDLE0" (Name: IDLE0, State: Running @CPU0) 0x1 in idle ()')
+    elif c.startswith('bt '):
+        print('#0  0x1 in idle ()')
+    elif c.startswith('output '):
+        e = c[7:]
+        if e in exprs:
+            sys.stdout.write(exprs[e])
+        else:
+            sys.stderr.write(f'No symbol "{e}" in current context.\n')
+    elif c.startswith('hbreak '):
+        n += 1
+        print(f'Hardware assisted breakpoint {n} at 0x{n:x}: file main.c, line {n}.')
+        if n > budget:
+            print(f'Warning:\nCannot insert hardware breakpoint {n}:Remote failure reply: 0E.')
+    elif c == 'monitor resume' and not os.environ.get('FAKE_GDB_NO_RESUME'):
+        setall('running')
+    sys.stdout.flush()
+'''
+
+BOARD = ['--board-cfg', 'board/esp32p4-builtin.cfg', '--adapter-serial', '30:ED:A0:E0:C9:02']
+
+
+@unittest.skipIf(os.name == 'nt', 'openocd and gdb stubs require POSIX executable semantics')
+class EspSessionTest(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.d = Path(self._dir.name)
+        for name, body in (('openocd', FAKE_OPENOCD), ('fake-gdb', FAKE_GDB)):
+            f = self.d / name
+            f.write_text(body)
+            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        self.elf = self.d / 'fw.elf'
+        self.elf.write_bytes(b'\x7fELF')
+        self.anchor = self.d / 'console.bin'
+        self.anchor.write_bytes(b'boot\n')
+        self.log = self.d / 'log.json'
+        self.out = self.d / 'out'
+        self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
+                    'FAKE_STATE': str(self.d / 'state.json'), 'FAKE_OCD_LOG': str(self.out / 'openocd.log')}
+
+    def session(self, mode, *args, **env):
+        return [sys.executable, str(SCRIPT), mode, '--out', str(self.out), *BOARD, '--rtos', 'FreeRTOS',
+                '--gdb', 'fake-gdb', '--elf', str(self.elf), '--anchor', str(self.anchor), *args]
+
+    def run_cli(self, argv, **env):
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env={**self.env, **env})
+        return r.returncode, json.loads(r.stdout) if r.stdout.strip() else None, r.stderr
+
+    def calls(self, tool):
+        return [json.loads(line)['argv'] for line in self.log.read_text().splitlines()
+                if json.loads(line)['tool'] == tool]
+
+    def test_inspect_records_examination_connect_and_end(self):
+        rc, out, err = self.run_cli(self.session('inspect', '--expr', 'x', '--expr', 'nope'),
+                                    FAKE_EXPRS=json.dumps({'x': '42'}))
+        self.assertEqual(rc, 1, err)    # 'nope' has no value
+        self.assertEqual(out['examination']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+        self.assertIn('Info : [chip.cpu0] Examination succeed', out['examination']['log'])
+        self.assertTrue(any('Target halted' in ln for ln in out['connect']))
+        self.assertEqual(out['exprs'], [{'expr': 'x', 'output': '42'},
+                                        {'expr': 'nope', 'error': 'no value; its error is in gdbStderr'}])
+        self.assertEqual(out['gdbStderr'], ['No symbol "nope" in current context.'])
+        self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+        self.assertEqual(out['anchor'], {'file': str(self.anchor), 'sizeAtStart': 5, 'sizeAtEnd': 5})
+        self.assertTrue(json.loads((self.out / 'receipt.json').read_text())['closed'])
+        gdb = self.calls('gdb')[0]
+        exs = [gdb[i + 1] for i, a in enumerate(gdb) if a == '-ex']
+        for setting in ('set may-write-memory off', 'set may-call-functions off', 'set may-insert-breakpoints off'):
+            self.assertLess(exs.index(setting), exs.index(next(e for e in exs if e.startswith('target'))))
+        self.assertEqual(exs[-2:], ['monitor resume', 'detach'])
+
+    def test_configuration_order(self):
+        self.run_cli(self.session('inspect'))
+        argv = self.calls('openocd')[0]
+        first_f = argv.index('-f')
+        for c in ('set ESP_FLASH_SIZE 0', 'set ESP_RTOS FreeRTOS'):
+            self.assertLess(argv.index(c), first_f)
+        self.assertLess(max(i for i, a in enumerate(argv) if a.startswith(('gdb port', 'tcl port'))), first_f)
+        self.assertEqual(argv[first_f:first_f + 4], ['-f', 'board/esp32p4-builtin.cfg', '-c',
+                                                     'adapter serial 30:ED:A0:E0:C9:02'])
+        self.log.unlink()
+        argv = [sys.executable, str(SCRIPT), 'recover', '--out', str(self.d / 'rec'), '--interface-cfg',
+                'interface/ftdi/x.cfg', '--usb-location', '5-1.7', '--target-cfg', 'target/esp32s2.cfg',
+                '--adapter-speed', '5000']
+        rc, out, err = self.run_cli(argv)
+        self.assertEqual(rc, 0, err)
+        argv = self.calls('openocd')[0]
+        i = argv.index('-f')
+        self.assertEqual(argv[i:i + 7], ['-f', 'interface/ftdi/x.cfg', '-c', 'adapter usb location 5-1.7', '-f',
+                                         'target/esp32s2.cfg', '-c'])
+        self.assertIn('gdb port disabled', argv)
+        self.assertEqual(argv[-4:], ['-c', 'init', '-c', 'shutdown'])
+
+    def test_budget_counts_until_the_first_refusal(self):
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'b', '--at', 'c'), FAKE_BUDGET='2')
+        self.assertEqual(rc, 1, err)
+        self.assertEqual([r['result'] for r in out['locations']], ['inserted', 'inserted', 'refused'])
+        self.assertEqual(out['budget'], {'exactly': 2})
+        self.assertEqual(out['end']['cores']['chip.cpu1'], 'running')
+        exs = self.calls('gdb')[0]
+        self.assertIn('set breakpoint always-inserted on', exs)
+        self.assertEqual(exs[-6:], ['-ex', 'delete', '-ex', 'monitor resume', '-ex', 'detach'])
+        self.out.rename(self.d / 'out1')
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'b'), FAKE_BUDGET='4')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['budget'], {'atLeast': 2})
+
+    def test_the_tcl_side_resumes_what_gdb_left_halted(self):
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_GDB_NO_RESUME='1')
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out['end']['beforeResume'], {'chip.cpu0': 'halted', 'chip.cpu1': 'halted'})
+        self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+
+    def test_a_hung_gdb_is_killed_and_the_session_still_ends(self):
+        rc, out, err = self.run_cli(self.session('inspect', '--timeout', '1'), FAKE_GDB_HANG='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('gdb did not finish within 1 s', out['error'])
+        self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+        self.assertTrue(json.loads((self.out / 'receipt.json').read_text())['closed'])
+
+    def test_a_core_left_halted_fails(self):
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_GDB_NO_RESUME='1', FAKE_RESUME_FAIL='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('left not running: chip.cpu0, chip.cpu1', out['error'])
+
+    def test_removal_errors_point_at_recover(self):
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_REMOVE_ERROR='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('run `recover`', out['error'])
+
+    def test_a_server_that_stays_is_left_to_leave(self):
+        flag = self.d / 'ignored-once'
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_IGNORE_SHUTDOWN=str(flag))
+        self.assertEqual(rc, 3)
+        self.assertIn('leave --receipt', out['error'])
+        receipt = self.out / 'receipt.json'
+        self.assertFalse(json.loads(receipt.read_text())['closed'])
+        leave = [sys.executable, str(SCRIPT), 'leave', '--receipt', str(receipt)]
+        rc, out, err = self.run_cli(leave, FAKE_IGNORE_SHUTDOWN=str(flag))
+        self.assertEqual(rc, 0, (out, err))
+        self.assertEqual(out['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+        self.assertTrue(json.loads(receipt.read_text())['closed'])
+        rc, out, err = self.run_cli(leave)
+        self.assertEqual(rc, 2)
+        self.assertIn('closed', out['error'])
+
+    def test_leave_refuses_a_process_that_is_not_its_server(self):
+        receipt = self.d / 'receipt.json'
+        receipt.write_text(json.dumps({'pid': os.getpid(), 'argv': ['openocd', '-c', 'x'], 'ports': [1, 2, 3],
+                                       'closed': False}))
+        rc, out, err = self.run_cli([sys.executable, str(SCRIPT), 'leave', '--receipt', str(receipt)])
+        self.assertEqual(rc, 2)
+        self.assertIn('nothing sent', out['error'])
+
+    def test_a_signal_still_ends_the_session(self):
+        proc = subprocess.Popen(self.session('inspect', '--timeout', '30'), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, env={**self.env, 'FAKE_GDB_HANG': '1'})
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not (self.out / 'openocd.log').exists():
+            time.sleep(0.05)
+        while time.monotonic() < deadline and 'accepting' not in (self.out / 'openocd.log').read_text():
+            time.sleep(0.05)
+        proc.send_signal(signal.SIGTERM)
+        stdout, _ = proc.communicate(timeout=60)
+        out = json.loads(stdout)
+        self.assertEqual(proc.returncode, 3)
+        self.assertIn('interrupted by signal 15', out['error'])
+        self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+
+    def test_refusals_start_nothing(self):
+        cases = [(self.session('inspect')[:-2] + ['--no-anchor', 'x', '--anchor', str(self.anchor)], 'or --no-anchor'),
+                 (self.session('inspect')[:-2], 'or --no-anchor'),
+                 (self.session('inspect', '--usb-location', '5-1'), 'exactly one selector'),
+                 (self.session('budget'), 'budget takes --at'),
+                 (self.session('inspect', '--at', 'x'), '--at is for budget'),
+                 ([sys.executable, str(SCRIPT), 'recover', '--out', str(self.out), *BOARD, '--rtos', 'none'],
+                  'recover takes the route only'),
+                 ([sys.executable, str(SCRIPT), 'recover', '--out', str(self.out), '--board-cfg', 'b.cfg',
+                   '--usb-location', '5-1'], 'goes with --interface-cfg'),
+                 ([sys.executable, str(SCRIPT), 'recover', '--out', str(self.out), '--board-cfg', 'b.cfg; x',
+                   '--adapter-serial', 's'], 'letters, digits')]
+        for argv, want in cases:
+            rc, out, err = self.run_cli(argv)
+            self.assertEqual(rc, 2, (argv, err))
+            self.assertIn(want, err)
+        rc, out, err = self.run_cli(self.session('inspect'), FAKE_BANNER='Open On-Chip Debugger 0.12.0')
+        self.assertEqual(rc, 3)
+        self.assertIn('not openocd-esp32', out['error'])
+        self.assertFalse(self.log.exists() and self.calls('gdb'))
+
+
+if __name__ == '__main__':
+    unittest.main()

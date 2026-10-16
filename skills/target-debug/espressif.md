@@ -87,6 +87,22 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 (gdb) continue
 ```
 
+`esp_session.py` runs the read-only part as one bounded session and ends it the way Leave says even when gdb dies: the
+configuration in this order on free ports, examination, gdb connect and the end recorded apart, every core's state read
+at the end over the Tcl port (`--help`):
+
+```bash
+python3 <skill dir>/scripts/esp_session.py inspect --out <new dir> --board-cfg board/<chip>-builtin.cfg \
+  --adapter-serial <MAC> --rtos FreeRTOS --gdb <arch gdb> --elf <flashed.elf> --anchor <console capture> [--expr ...]
+#   budget: --at <location> ... instead of --expr; recover: the route only (init; shutdown)
+#   exit 0 done and every core running, 1 an expression failed or a location was refused, 2 usage,
+#   3 openocd/gdb/Tcl failure, interrupted, a core left halted, or the shutdown failed (then: leave --receipt)
+```
+
+On 2026-10-16 (openocd 20260703, htpc) `inspect` ran on the P4, the S31, the Kaluga S2 (by USB location) and the Metro
+S3 (ESP-Prog serial) with every core running at the end, an empty console capture and the app devices' USB device
+numbers unchanged; with gdb hung after the connect and killed at `--timeout`, the Tcl side resumed both P4 cores.
+
 - Server initialization examines the cores and leaves them running (S2, S3, P4, S31 measured 2026-10-16); a telnet
   `halt` or the gdb connect halts them. Keep the three apart in a record: examination, gdb connect and a deliberate halt
   each change state differently.
@@ -111,7 +127,9 @@ openocd -c 'set ESP_FLASH_SIZE 0' -c 'set ESP_RTOS FreeRTOS' \
 ### Breakpoint budgets
 
 Count from the target's own evidence; nothing carries across chips. The probe procedure (`always-inserted`, where the
-refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s.
+refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s; `esp_session.py budget --at <location> ...` runs it
+with the cleanup outside gdb (P4, a build without the end-of-stack watchpoint: exactly 3, the fourth refused,
+2026-10-16).
 
 - RISC-V: openocd prints `Found N triggers` per core (P4: 3, which TRM 6567 §2.11.3.2 p161 says, and once "four"; S31:
   4), breakpoints and watchpoints share them, and firmware can hold one (the end-of-stack watchpoint held one of the
@@ -157,10 +175,11 @@ refusal shows, what a `-batch` abort leaves behind) is `gdb.md`'s.
 
 In this order, since an esptool reset before the first step started the boot loop (P4 and S31, 2026-10-16):
 
-1. A fresh openocd `init; shutdown`, after a killed openocd and after a `shutdown` that logged "could not remove
-   watchpoint" errors. `shutdown` is meant to clear the debug module (`esp_common.cfg:340-343` writes DM control 0 as a
-   pre-shutdown command), yet on both the P4 and the S31 such a shutdown was followed, at the next esptool reset, by the
-   Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not established.
+1. A fresh openocd `init; shutdown` (`esp_session.py recover`), after a killed openocd and after a `shutdown` that
+   logged "could not remove watchpoint" errors. `shutdown` is meant to clear the debug module (`esp_common.cfg:340-343`
+   writes DM control 0 as a pre-shutdown command), yet on both the P4 and the S31 such a shutdown was followed, at the
+   next esptool reset, by the Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not
+   established.
 2. Verify the build image through a non-writing route before reprogramming:
    `esptool --chip <c> --port /dev/serial/by-id/<port> verify-flash <offset> <bin>`, image and offset from the build's
    `flasher_args.json`, never an objcopy of the ELF (verified 2026-10-15 P4, S2); without such a port (Metro S3), report
