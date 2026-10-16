@@ -65,7 +65,7 @@ def load_side(p, flag, spec, out):
     if any('\0' in x for x in argv):
         p.error(f'{flag} {path}: an argument holds a NUL character, which no command line can carry')
     return {'name': name, 'argv': argv, 'stdout': os.path.join(out, name + '.out'),
-            'stderr': os.path.join(out, name + '.err')}
+            'stderr': os.path.join(out, name + '.err'), 'seen': {}}
 
 
 def children(pid):
@@ -98,7 +98,9 @@ def track(seen, tops):
 
 def adopt(sides, strays):
     """This process is the subreaper: a descendant orphaned before a side saw it reparents here.
-    It belongs to one of the sides, which one is unknown; reap the orphans that already exited."""
+    It belongs to one of the sides, which one is unknown; reap the orphans that already exited.
+    Returns the strays added by this call."""
+    before = dict(strays)
     leaders = {s['proc'].pid for s in sides if 'proc' in s}
     for k in children(os.getpid()) - leaders:
         st = stat(k)
@@ -107,9 +109,10 @@ def adopt(sides, strays):
                 os.waitpid(k, os.WNOHANG)
             except OSError:
                 pass
-        elif st and strays.get(k) != st[1] and not any(s['seen'].get(k) == st[1] for s in sides if 'proc' in s):
+        elif st and strays.get(k) != st[1] and not any(s['seen'].get(k) == st[1] for s in sides):
             strays[k] = st[1]
     track(strays, [])
+    return {k: v for k, v in strays.items() if before.get(k) != v}
 
 
 def stat(pid):
@@ -190,26 +193,20 @@ def main(argv=None):
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, on_signal)
         for side in sides:
-            out = err = None
             armed = False    # a signal now is acted on once the side is fully recorded
             try:
-                side['seen'] = {}
-                out = open(side['stdout'], 'wb')
-                err = open(side['stderr'], 'wb')
-                for s in sides:
-                    if 'proc' in s:
-                        note_exit(s)    # before the next spawn: a side already gone then never overlapped it
-                side['proc'] = subprocess.Popen(side['argv'], stdout=out, stderr=err, stdin=subprocess.DEVNULL,
-                                                cwd=a.out, start_new_session=True)
-                side['spawned'] = time.monotonic()
-                t0 = side['spawned'] if t0 is None else t0
+                with open(side['stdout'], 'wb') as out, open(side['stderr'], 'wb') as err:
+                    for s in sides:
+                        if 'proc' in s:
+                            note_exit(s)    # before the next spawn: a side already gone then never overlapped it
+                    side['proc'] = subprocess.Popen(side['argv'], stdout=out, stderr=err, stdin=subprocess.DEVNULL,
+                                                    cwd=a.out, start_new_session=True)
+                    side['spawned'] = time.monotonic()
+                    t0 = side['spawned'] if t0 is None else t0
             except OSError as e:
                 side['startError'] = str(e)
                 break
             finally:
-                for f in (out, err):
-                    if f:
-                        f.close()
                 armed = True
             if signals:
                 raise Interrupted()
@@ -235,17 +232,10 @@ def main(argv=None):
         adopt(sides, strays)
         running = [s for s in started if lingering(s)]
         signal_pids(left(strays), signal.SIGTERM)
-        termed = dict(strays)
         for s in running:
             # SIGTERM to the leader's group only: a live tool stops what it started in its own order
             # (rtt.py's server sits in a session of its own); what outlived its leader gets it directly
-            if s['proc'].poll() is None:
-                try:
-                    os.killpg(s['proc'].pid, signal.SIGTERM)
-                except OSError:
-                    pass
-            else:
-                signal_pids(left(s['seen']), signal.SIGTERM)
+            signal_pids([-pid for pid in roots(s)] or left(s['seen']), signal.SIGTERM)
         end = time.monotonic() + a.grace
         while True:
             for s in running:
@@ -253,10 +243,7 @@ def main(argv=None):
                 note_exit(s)
             # before adopt: a process seen gone has already reparented its orphans here
             busy = any(lingering(s) for s in running)
-            adopt(sides, strays)
-            fresh = {k: v for k, v in strays.items() if termed.get(k) != v}
-            signal_pids(left(fresh), signal.SIGTERM)
-            termed.update(fresh)
+            signal_pids(left(adopt(sides, strays)), signal.SIGTERM)
             if not (busy or left(strays)) or time.monotonic() >= end:
                 break
             time.sleep(0.05)

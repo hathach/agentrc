@@ -171,8 +171,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
   `espressif.md`.
 - dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch sessions, the halted autopsy
   (`autopsy.py`), the hardware breakpoint budget, watchpoints, FreeRTOS threads, J-Link Commander quirks.
-- USB enumeration or transfer bugs: capture both sides at once by default — `techniques.md`, "USB: dual-side capture" —
-  `dual_capture.py`.
+- USB enumeration or transfer bugs: capture both sides at once by default — `techniques.md`, "USB: dual-side capture"
+  (`dual_capture.py`).
 - Manuals (J-Link UM08001, OpenOCD, GDB): `techniques.md`, "Manuals".
 
 ## Warnings

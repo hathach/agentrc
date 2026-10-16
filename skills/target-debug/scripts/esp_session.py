@@ -27,14 +27,14 @@ inspect: the server examines the cores (recorded from its log, then each core's 
 Tcl port), gdb connects (which halts them; recorded from the log), reads `info threads`, a
 backtrace and the caller's expressions (may-write-memory, may-write-registers, may-call-functions
 and may-insert-breakpoints off), resumes and detaches. budget: gdb sets `breakpoint
-always-inserted on` and inserts one `hbreak` per --at location in order, so each insertion is
-tried at once; the budget is the count of distinct addresses inserted before the first refusal,
-or a lower bound when none was refused. A location gdb cannot place (no such symbol) is reported
-unresolved, and one at an address an earlier location already holds is reported duplicate (gdb
-inserts one breakpoint per address); neither asks the hardware for a slot. --at values must
-differ. A location gdb resolves to several addresses takes a slot each and leaves no budget, as
-does any other gdb failure at a location (no connection, no hardware breakpoint support): both
-fail the run. The firmware can hold triggers of its own (espressif.md, "Breakpoint budgets").
+always-inserted on` and inserts one `hbreak` per --at location in order, so each insertion is tried
+at once; the budget is the count of distinct addresses inserted before the first refusal, or a lower
+bound when none was refused. A location gdb cannot place (no such symbol) is reported unresolved,
+and one at an address an earlier location already holds is reported duplicate (gdb inserts one
+breakpoint per address); neither asks the hardware for a slot. A location gdb resolves to several
+addresses takes a slot each and leaves no budget, as does any other gdb failure at a location (no
+connection, no hardware breakpoint support): both fail the run. The firmware can hold triggers of
+its own (espressif.md, "Breakpoint budgets").
 
 Whatever gdb does, the session ends from this script over the Tcl port: every breakpoint and
 watchpoint removed, each halted core resumed, each core's state read, then `shutdown`, never a
@@ -56,9 +56,9 @@ Output: one JSON object on stdout; <out> keeps openocd.log, gdb.log (values), gd
 and monitor output; budget writes both into gdb.log to keep their order) and receipt.json.
 
 Exit: 0 done and every core running at the end; 1 done, but an expression failed or a budget
-location was refused (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a budget location
-gdb could not ask about or resolved to several addresses included; gdb exiting non-zero, which in
--batch means its last command, detach, failed, or by a signal leaves no budget), the run was interrupted, a core was left halted, removal is
+location was refused (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a budget
+location gdb could not ask about or resolved to several addresses included; gdb exiting non-zero
+or by a signal leaves no budget), the run was interrupted, a core was left halted, removal is
 unchecked or failed, or the shutdown failed.
 """
 import argparse
@@ -365,11 +365,13 @@ def parse_budget(result, blocks, locations):
         else:
             row = {'at': loc, 'result': 'failed', 'output': lines}
         rows.append(row)
-        if problem is None and (row['result'] == 'failed' or row['result'] == 'not reached' and budget is None):
+        if problem is not None:
+            continue
+        if row['result'] == 'failed' or row['result'] == 'not reached' and budget is None:
             problem = f'gdb did not ask the hardware for {loc!r}'
-        elif problem is None and row['result'] == 'several addresses' and budget is None:
+        elif row['result'] == 'several addresses' and budget is None:
             problem = f'{loc!r} resolved to several addresses, a slot each: give one address per --at'
-        elif budget is None and problem is None:
+        elif budget is None:
             if row['result'] == 'inserted':
                 inserted += 1
             elif row['result'] == 'refused':
@@ -442,8 +444,6 @@ def main(argv=None):
         for e in a.expr + a.at:
             if not e.strip() or '\n' in e:
                 p.error(f'{e!r}: one non-empty line')
-        if len(set(a.at)) != len(a.at):
-            p.error('--at repeated: a location holds one breakpoint slot however often it is given')
         if a.mode == 'budget' and (not a.at or a.expr):
             p.error('budget takes --at locations and no --expr')
         if a.mode == 'inspect' and a.at:

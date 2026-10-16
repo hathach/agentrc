@@ -432,7 +432,6 @@ class EspSessionTest(unittest.TestCase):
                  (self.session('inspect')[:-2], 'or --no-anchor'),
                  (self.session('inspect', '--usb-location', '5-1'), 'exactly one selector'),
                  (self.session('budget'), 'budget takes --at'),
-                 (self.session('budget', '--at', 'main', '--at', 'main'), '--at repeated'),
                  (self.session('inspect', '--at', 'x'), '--at is for budget'),
                  ([sys.executable, str(SCRIPT), 'recover', '--out', str(self.out), *BOARD, '--rtos', 'none'],
                   'recover takes the route only'),

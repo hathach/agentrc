@@ -187,10 +187,10 @@ class DualCaptureTest(unittest.TestCase):
         self.assertTrue(out['sides'][0]['stopped'])
         self.assertTrue(wait_until(lambda: not alive(int(pidfile.read_text()))))
 
-    def driver(self, popen_body, *args):
-        """Run main() in a child with subprocess.Popen replaced by popen(*a, **k) from popen_body."""
+    def driver(self, prelude, *args):
+        """Run main() in a child with subprocess.Popen replaced by the popen that prelude defines."""
         driver = (f'import os, signal, subprocess, sys, time\nsys.path.insert(0, {str(SCRIPT.parent)!r})\n'
-                  'import dual_capture\nreal = subprocess.Popen\ncalls = []\n' + popen_body +
+                  'import dual_capture\nreal = subprocess.Popen\n' + prelude +
                   'dual_capture.subprocess.Popen = popen\nsys.exit(dual_capture.main(sys.argv[1:]))')
         return subprocess.run([sys.executable, '-c', driver, *args, '--out', str(self.out)],
                               capture_output=True, text=True, timeout=60)
@@ -241,7 +241,8 @@ class DualCaptureTest(unittest.TestCase):
         self.assertEqual([(pid, sig) for pid, sig in sent if pid < 0], [])
 
     def test_a_side_that_exits_before_the_other_starts_does_not_overlap(self):
-        popen = ('def popen(*a, **k):\n'
+        popen = ('calls = []\n'
+                 'def popen(*a, **k):\n'
                  '    if calls: time.sleep(0.2)\n'
                  '    p = real(*a, **k)\n'
                  '    calls.append(p)\n'
