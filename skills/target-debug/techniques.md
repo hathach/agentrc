@@ -12,6 +12,7 @@ which):
 ```bash
 python3 <skill dir>/scripts/pc_sample.py --probe <uid> --device <JLINK_DEVICE> --interface swd --speed 4000 --elf <flashed.elf>
 #   or: --hil-config <file> --board <name> --interface swd --speed 4000 --elf <flashed.elf>
+#   or, an openocd board: --hil-config <file> --board <name> --elf <flashed.elf> [--halt-samples N]
 #   --samples N (300), --interval-ms M, --raw FILE; DHCSR is read before and after,
 #   sentinel and no-PCSR samples are counted apart; exit 1 unless every sample came back
 #   DEMCR.TRCENA 0 is exit 1, no histogram
@@ -28,9 +29,12 @@ The histogram's top entries are the spin site; a flat histogram = core is servic
 hot spot of its own: learn it from a healthy run before reading a wedged one. The sentinel means the target halted or
 slept by itself, but a J-Link session does not leave that state alone: it halts the core when it closes and restarts it
 unless told `exec SetRestartOnClose = 0` (V9.78, verified 2026-10-16 stm32f407disco: DFSR.HALTED set after every plain
-session; a core found halted ran at the next session; with the setting, a running core stayed halted). Native probes
-(ST-Link/CMSIS-DAP) are not covered by the script yet: `probe_state.py` (next section) samples PCSR over OpenOCD from
-the board's HIL entry and reports the raw PC histogram, without symbols; `--samples` sets the count.
+session; a core found halted ran at the next session; with the setting, a running core stayed halted). An openocd HIL
+board (CMSIS-DAP) is sampled through `probe_state.py`'s OpenOCD session, which also reports the other cores' DHCSR.
+`--halt-samples N` is the explicit fallback for a core with no usable PCSR: only when the samples gave none from a
+running core, only on a single-core target, each halt resumed and checked by DHCSR, stopping at the first failure, and a
+session that dies mid-loop followed by one that resumes the core; those PCs are reported apart, as halt reads. ST-Link
+entries carry no OpenOCD configuration and are not covered.
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
 

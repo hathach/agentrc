@@ -334,10 +334,15 @@ def run(cmd, timeout, stdin=None):
     try:
         r = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        raise ToolError(f'{os.path.basename(cmd[0])} did not finish within {timeout:.0f} s') from e
+        err = ToolError(f'{os.path.basename(cmd[0])} did not finish within {timeout:.0f} s')
+        err.text = ''.join(x.decode(errors='replace') if isinstance(x, bytes) else x or ''
+                           for x in (e.stdout, e.stderr))
+        raise err from e
     text = r.stdout + r.stderr
     if r.returncode != 0:
-        raise ToolError(f'{os.path.basename(cmd[0])} exited {r.returncode}; last output:\n{tail(text)}')
+        err = ToolError(f'{os.path.basename(cmd[0])} exited {r.returncode}; last output:\n{tail(text)}')
+        err.text = text
+        raise err
     return text
 
 
@@ -504,7 +509,9 @@ class OpenOCD:
         text = run(self.cmd + ['-c', self.script(body)], timeout)
         err = re.search(r'^ERROR (.*)$', text, re.M)
         if err:
-            raise ToolError(f'openocd: {err.group(1)}')
+            failure = ToolError(f'openocd: {err.group(1)}')
+            failure.text = text    # what the session printed, for callers that act on how far it got
+            raise failure
         serial, volt = _OCD_SERIAL_RE.search(text), _OCD_VOLTAGE_RE.search(text)
         if serial:
             self.connection['serial'] = serial.group(1)

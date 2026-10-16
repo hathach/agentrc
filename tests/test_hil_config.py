@@ -235,8 +235,9 @@ class Cli(Config):
                                 ('absent', '0 entries of that name')):
                 self.refused(name, ['--board', board, *extra], want)
         self.refused('rtt', ['--board', 'stlink_args', '--addr', '20000000', '--cfg', '-f x.cfg'], "st-flash's, not")
-        self.refused('pc_sample', ['--board', 'max32', '--elf', str(self.elf), *self.LINK], 'samples over a J-Link only')
-        self.refused('pc_sample', ['--board', 'h743', '--elf', str(self.elf), *self.LINK], 'samples over a J-Link only')
+        self.refused('pc_sample', ['--board', 'max32', '--elf', str(self.elf), *self.LINK], 'J-Link only')
+        self.refused('pc_sample', ['--board', 'h743', '--elf', str(self.elf), *self.LINK],
+                     'samples over a J-Link or openocd only')
 
     def test_the_two_flags_go_together(self):
         for name, extra in (('rtt', ('--backend', 'jlink')), ('pc_sample', ('--elf', str(self.elf), *self.LINK))):

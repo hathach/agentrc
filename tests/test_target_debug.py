@@ -380,6 +380,11 @@ if gdb_port:
 script = sys.argv[-1]
 log(script)
 print('Info : CMSIS-DAP: Serial# = E6614C311B597D32', file=sys.stderr)
+if 'not touched:' in script:    # pc_sample's recovery
+    print(f'R DHCSR 0x{value("DHCSR"):08x}', file=sys.stderr)
+    open(os.environ['FAKE_STATE'], 'w').write('01010001')
+    print(f'R DHCSR 0x{value("DHCSR"):08x}', file=sys.stderr)
+    sys.exit(0)
 others = {'B': os.environ.get('FAKE_CORES', '')}
 others['A'] = os.environ.get('FAKE_CORES_AFTER', others['B'])
 for line in script.splitlines():
@@ -398,6 +403,20 @@ for line in script.splitlines():
     m = re.match(r'dump_image \\{(\\S+)\\} 0x([0-9a-f]+) 0x([0-9a-f]+)', line)
     if m:
         dump(m.group(1), int(m.group(2), 16), int(m.group(3), 16))
+m = re.search(r'for \\{set i 0\\} \\{\\$i < (\\d+)\\}', script)
+if m and 'get_reg pc' in script:    # the line loop above printed both R DHCSR lines
+    if os.environ.get('FAKE_HALT_STALL'):
+        if os.environ['FAKE_HALT_STALL'] != 'early':
+            print('GUARDED', file=sys.stderr, flush=True)
+            open(os.environ['FAKE_STATE'], 'w').write('00030003')
+        time.sleep(60)
+    if os.environ.get('FAKE_HALT_FAIL'):
+        print('ERROR resume 0 failed: the core is left halted (DHCSR 0x00030003)', file=sys.stderr)
+        sys.exit(0)
+    pcs = os.environ.get('FAKE_HALT_PCS', '08004444').split(',')
+    for i in range(int(m.group(1))):
+        print(f'H 0x{int(pcs[i % len(pcs)], 16):08x}', file=sys.stderr)
+    sys.exit(0)
 if 'arp_poll' in script:
     if os.environ.get('FAKE_RESTORE_FAIL'):
         print('ERROR resume failed', file=sys.stderr)
@@ -737,6 +756,146 @@ class ProbeStateHaltReadTclTest(unittest.TestCase):
         tcl.eval(probe_state.OpenOCD.script(probe_state.OpenOCD.HALT_READ))
         out = list(tcl.splitlist(tcl.eval('set out')))
         self.assertIn('resume: failed without a message; found running', out[-1])
+
+
+HALT_TCL_STUBS = '''
+set calls {}; set out {}; set state running; set n 0
+proc echo {s} {lappend ::out $s}
+proc target {cmd} {return $::targets}
+proc read_memory {a w n} {expr {$::state eq "running" ? 0x01010001 : 0x01030003}}
+proc halt {ms} {lappend ::calls "halt $ms"; if {$::haltfail == $::n} {error ""}; set ::state halted}
+proc resume {} {lappend ::calls resume; if {$::resumefail != $::n} {set ::state running}; incr ::n}
+proc get_reg {r} {return [dict create pc [format 0x%08x [expr {0x08001000 + $::n}]]]}
+proc sleep {ms} {lappend ::calls "sleep $ms"}
+'''
+
+
+@unittest.skipIf(_TCL is None, 'needs a Tcl interpreter (tkinter)')
+class PcSampleHaltTclTest(unittest.TestCase):
+    def run_tcl(self, n=3, state='running', targets='tgt', haltfail=-1, resumefail=-1, interval=0):
+        tcl = _TCL()
+        tcl.eval(HALT_TCL_STUBS)
+        tcl.eval(f'set state {state}; set targets {{{targets}}}; set haltfail {haltfail}; set resumefail {resumefail}')
+        rc = tcl.eval(f'catch {{{pc_sample.halt_tcl(n, 250, interval)}}} err')
+        err = tcl.eval('set err') if rc == '1' else None
+        return list(tcl.splitlist(tcl.eval('set calls'))), list(tcl.splitlist(tcl.eval('set out'))), err
+
+    def test_each_halt_is_resumed_and_checked(self):
+        calls, out, err = self.run_tcl(interval=5)
+        self.assertIsNone(err)
+        self.assertEqual(calls, ['halt 250', 'resume', 'sleep 5'] * 3)
+        self.assertEqual(out, ['R DHCSR 0x01010001', 'GUARDED', 'H 0x08001000', 'H 0x08001001', 'H 0x08001002',
+                               'R DHCSR 0x01010001'])
+
+    def test_a_failed_halt_still_resumes_and_stops(self):
+        calls, out, err = self.run_tcl(haltfail=1)
+        self.assertEqual(calls, ['halt 250', 'resume', 'halt 250', 'resume'])
+        self.assertEqual(err, 'halt 1: failed without a message; DHCSR after a resume 0x01010001')
+
+    def test_a_failed_resume_stops_the_loop(self):
+        calls, out, err = self.run_tcl(resumefail=0)
+        self.assertEqual(calls, ['halt 250', 'resume'])
+        self.assertEqual(err, 'resume 0 failed: the core is left halted (DHCSR 0x01030003)')
+
+    def test_a_halted_or_multi_core_target_is_refused_untouched(self):
+        calls, out, err = self.run_tcl(state='halted')
+        self.assertEqual(calls, [])
+        self.assertIn('refused: the core is halted now', err)
+        calls, out, err = self.run_tcl(targets='tgt tgt2')
+        self.assertEqual(calls, [])
+        self.assertIn('refused: 2 cores (tgt tgt2)', err)
+
+
+@unittest.skipIf(os.name == 'nt', 'openocd and addr2line stubs require POSIX executable semantics')
+class PcSampleOpenOCDTest(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.d = Path(self._dir.name)
+        for name, body in (('openocd', FAKE_OPENOCD_STATE), ('JLinkExe', FAKE_JLINK),
+                           ('fake-addr2line', FAKE_ADDR2LINE)):
+            f = self.d / name
+            f.write_text(body)
+            f.chmod(f.stat().st_mode | stat.S_IEXEC)
+        self.config = self.d / 'hil.json'
+        self.config.write_text(json.dumps({'boards': STATE_BOARDS}))
+        self.elf = self.d / 'fw.elf'
+        self.elf.write_bytes(b'\x7fELF')
+        self.log = self.d / 'log.json'
+        self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log)}
+
+    def run_cli(self, board, *args, **env):
+        return subprocess.run([sys.executable, str(SCRIPT), '--hil-config', str(self.config), '--board', board,
+                               '--elf', str(self.elf), '--addr2line', 'fake-addr2line', *args],
+                              capture_output=True, text=True, timeout=30, env={**self.env, **env}, cwd='/')
+
+    def scripts(self):
+        return [json.loads(line)['script'] for line in self.log.read_text().splitlines()]
+
+    def test_an_openocd_board_samples_through_probe_state(self):
+        r = self.run_cli('max32', '--samples', '3', '--halt-samples', '4', FAKE_PCSR='08001000,08001000,08002000',
+                         FAKE_CORES='max32665.cpu1=00040001', FAKE_SYMS='0x08001000=spin@main.c:4')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('3 usable of 3 samples', r.stdout)
+        self.assertIn('spin', r.stdout)
+        self.assertIn('max32665.cpu1 DHCSR before 0x00040001, after 0x00040001', r.stdout)
+        self.assertEqual(len(self.scripts()), 1)    # usable samples: no halting fallback
+        self.assertEqual(self.scripts()[0].count('rd PCSR'), 3)
+
+    def test_the_halting_fallback_is_labelled_apart(self):
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF',
+                         FAKE_HALT_PCS='08003000,08003000,08004000')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('0 usable of 2 samples', r.stdout)
+        self.assertIn('--- halted samples', r.stdout)
+        self.assertIn('3 usable of 3 halt reads', r.stdout)
+        self.assertIn('halt 500', self.scripts()[1])
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF', FAKE_HALT_FAIL='1')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('halting fallback: openocd: resume 0 failed', r.stderr)
+
+    def test_a_stalled_fallback_is_killed_then_recovered(self):
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', '--timeout', '3', FAKE_PCSR='FFFFFFFF',
+                         FAKE_HALT_STALL='1', FAKE_STATE=str(self.d / 'state'))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('did not finish within 3 s', r.stderr)
+        self.assertIn('the core was left halted, resumed: now running (DHCSR 0x01010001)', r.stderr)
+        self.assertEqual((self.d / 'state').read_text(), '01010001')
+        self.log.unlink()
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', '--timeout', '3', FAKE_PCSR='FFFFFFFF',
+                         FAKE_HALT_STALL='early')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('stopped before its guards passed, so it halted nothing', r.stderr)
+        self.assertEqual(len(self.scripts()), 2)    # no recovery session
+
+    def test_a_core_that_is_not_m_profile_is_refused(self):
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF', FAKE_CPUID='00000000')
+        self.assertEqual(r.returncode, 1)
+        self.assertIn('does not identify as an M-profile core', r.stderr)
+        self.assertEqual(len(self.scripts()), 1)
+
+    def test_no_fallback_without_the_flag_or_for_a_halted_core(self):
+        r = self.run_cli('max32', '--samples', '2', FAKE_PCSR='FFFFFFFF')
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(len(self.scripts()), 1)
+        self.log.unlink()
+        r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF', FAKE_DHCSR='01030003')
+        self.assertEqual(r.returncode, 1)
+        self.assertEqual(len(self.scripts()), 1)
+
+    def test_route_flags_are_checked(self):
+        r = self.run_cli('max32', *LINK)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('J-Link only', r.stderr)
+        r = self.run_cli('max32', '--probe', '1')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('--probe and --device are J-Link flags', r.stderr)
+        r = self.run_cli('k64f', *LINK, '--halt-samples', '2')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('cannot stop on a failed resume', r.stderr)
+        r = self.run_cli('k64f')
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('a J-Link needs --interface and --speed', r.stderr)
 
 
 @unittest.skipIf(os.name == 'nt', 'JLinkExe and openocd stubs require POSIX executable semantics')

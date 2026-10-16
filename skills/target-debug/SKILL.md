@@ -48,8 +48,8 @@ A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it 
 | `vid_pid`       | the probe model's USB IDs, openocd only | `--vid-pid` |
 
 A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and `--speed` stay explicit; on
-the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` takes J-Link entries only;
-`probe_state.py` reads only the HIL config and takes `jlink` and `openocd` entries. `etm_capture.py` does not read it —
+the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` and `probe_state.py` take
+`jlink` and `openocd` entries; `probe_state.py` reads only the HIL config. `etm_capture.py` does not read it —
 a J-Trace is one probe moved between boards, named with `--probe`.
 
 ## Delegated sessions
@@ -157,8 +157,8 @@ The Core column says where a technique exists; a row that names a core family do
 
 Each technique's recipe, read when you reach for it (files beside this one):
 
-- PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py`, reading the histogram; native probes through
-  `probe_state.py`.
+- PC-sampling: `techniques.md`, "PC-sampling" — `pc_sample.py` over J-Link or OpenOCD, reading the histogram, the
+  explicit halting fallback for a core without a usable PCSR.
 - Probe-state snapshot (DHCSR anchor, PCSR samples, breakpoint budget, symbol reads, region saves, image read-back for
   Cleanup's verification): `techniques.md`, "Probe state" — `probe_state.py`.
 - SWO exception trace, hardware PC-sampling, DWT data trace: `swo-dwt.md`.
