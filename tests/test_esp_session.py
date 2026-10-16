@@ -433,6 +433,39 @@ class EspSessionTest(unittest.TestCase):
         self.assertIn('interrupted by signal 15', out['error'])
         self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
 
+    def test_a_signal_while_a_tool_starts_still_ends_the_session(self):
+        # SIGTERM lands inside Popen, after the fork: the process must be recorded, stopped and the session ended
+        driver = (f'import os, signal, subprocess, sys\nsys.path.insert(0, {str(SCRIPT.parent)!r})\n'
+                  'import esp_session\nreal = subprocess.Popen\nwhich = sys.argv.pop(1)\n'
+                  'class Popen(real):\n'
+                  '    def __init__(self, args, *a, **k):\n'
+                  '        super().__init__(args, *a, **k)\n'
+                  '        if (which == "server" and "-l" in args) or (which == "gdb" and os.path.basename(args[0]) == "fake-gdb"):\n'
+                  '            os.kill(os.getpid(), signal.SIGTERM)\n'
+                  'esp_session.subprocess.Popen = Popen\nsys.exit(esp_session.main(sys.argv[1:]))')
+        for which in ('server', 'gdb'):
+            with self.subTest(which=which):
+                out_dir = self.d / f'out-{which}'
+                argv = self.session('inspect', '--timeout', '30')
+                argv[argv.index(str(self.out))] = str(out_dir)
+                rc, out, err = self.run_cli([sys.executable, '-c', driver, which, *argv[2:]],
+                                            FAKE_OCD_LOG=str(out_dir / 'openocd.log'))
+                self.assertEqual(rc, 3, err)
+                self.assertIn('interrupted by signal 15', out['error'])
+                receipt_file = out_dir / 'receipt.json'
+                if which == 'gdb':
+                    self.assertIn('gdbExit', out)
+                    self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
+                    self.assertTrue(json.loads(receipt_file.read_text())['closed'])
+                    continue
+                # the server, not yet listening, is recorded and left to leave --receipt rather than lost
+                self.assertIn(f'leave --receipt {receipt_file}', out['error'])
+                self.assertFalse(json.loads(receipt_file.read_text())['closed'])
+                rc, out, err = self.run_cli([sys.executable, str(SCRIPT), 'leave', '--receipt', str(receipt_file)],
+                                            FAKE_OCD_LOG=str(out_dir / 'openocd.log'))
+                self.assertEqual(rc, 0, err)
+                self.assertTrue(json.loads(receipt_file.read_text())['closed'])
+
     def test_refusals_start_nothing(self):
         cases = [(self.session('inspect')[:-2] + ['--no-anchor', 'x', '--anchor', str(self.anchor)], 'or --no-anchor'),
                  (self.session('inspect')[:-2], 'or --no-anchor'),
