@@ -16,10 +16,12 @@ SHA256 hashes describe the original files. Comparison uses esptool's header
 patching with the manifest flash settings and 0xff padding to four bytes;
 comparison_size records that padding. Images are snapshotted before invoking
 the tool. Encrypted images and unsupported flashing options are refused.
-esptool runs the --after reset only once it has connected (__init__.py:552 connects, the
-teardown at :660-680 resets): when the connection fails, a wrong chip included, a chip that
---before put in the ROM loader stays there, and the report says so (`chipState`). Seen on the
-ESP32-P4 Function-EV, 2026-10-16: its app returned only after a reset from the USJ's lines.
+esptool registers the --after reset only once it has connected, uploaded the stub and set the
+baud (__init__.py:552 connects, :623 stub, :639 baud, the teardown at :660-680 resets): a
+failure before then, a wrong chip included, leaves a chip in the ROM loader, whether --before
+or the caller put it there. A failed run whose output shows no reset says so (`chipState`).
+Seen 2026-10-16 on the ESP32-P4 Function-EV (a failed connect; its app returned only after a
+reset from the USJ's lines) and the Metro ESP32-S3 (the stub upload failed after the connect).
 Exit: 0 all images match; 1 mismatch; 2 usage/refusal; 3 tool failure or incomplete
 per-image evidence.
 """
@@ -54,6 +56,8 @@ HEADER = re.compile(r"Verifying (0x[0-9a-f]+) \(([0-9]+)\) bytes at "
 VERDICTS = {'Verification successful (digest matched).': 'match',
             'Verification failed (digest mismatch).': 'mismatch'}
 MISMATCH_ERROR = 'ERROR: A fatal error occurred: Verification failed.'
+# loader.py:2184,2188, cmds.py:2834, targets/esp32s3.py:338 (and its siblings): the line each reset prints.
+RESET_PRINTED = ('Custom reset sequence executed', 'Hard resetting', 'Soft resetting')
 
 
 class JsonParser(argparse.ArgumentParser):
@@ -226,9 +230,12 @@ def main(argv=None):
     except (ValueError, OSError) as exc:
         result.update(status='failed', error=str(exc))
         code = 3
-    if code in (2, 3) and 'tool_exit' in result and not args.before.startswith('no-reset'):
-        result['chipState'] = ('unknown, possibly left in the ROM loader by --before: esptool skips --after when '
-                               'it fails to connect; reset the chip to return to the app')
+    reset_printed = any(m in result.get('stdout', '') for m in RESET_PRINTED)
+    stays = args.before.startswith('no-reset') and args.after.startswith('no-reset')
+    if code in (2, 3) and 'tool_exit' in result and not (reset_printed or stays):
+        result['chipState'] = ('unknown, possibly in the ROM loader: esptool printed no reset, and it skips --after '
+                               'when it fails before the command runs (connect, stub upload, baud); reset the chip '
+                               'to return to the app')
     print(json.dumps(result))
     return code
 

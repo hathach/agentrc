@@ -27,6 +27,12 @@ if mode == 'wrong_chip':
     print('ERROR: A fatal error occurred: This chip is ESP32-S3, not ESP32-P4. '
           'Wrong chip argument?', file=sys.stderr)
     sys.exit(2)
+if mode == 'stub_failure':
+    print('Connected to ESP32-P4 on /dev/serial/by-id/fake:')
+    print('Uploading stub flasher...')
+    print('ERROR: A fatal error occurred: Serial data stream stopped: Possible serial noise or corruption.',
+          file=sys.stderr)
+    sys.exit(2)
 if mode == 'unknown_chip':
     print("WARNING: This chip doesn't appear to be an ESP32-P4 (read chip ID 999). "
           "Probably it is unsupported by this version of esptool. Will attempt to continue anyway.", file=sys.stderr)
@@ -52,6 +58,7 @@ if mode in ('mismatch', 'mismatch_failure'):
     print('ERROR: A fatal error occurred: ' + reason, file=sys.stderr)
     sys.exit(2)
 if mode == 'late_failure':
+    print('Hard resetting via RTS pin...')
     print('ERROR: A fatal error occurred: Lost connection during reset.', file=sys.stderr)
     sys.exit(2)
 '''
@@ -153,6 +160,17 @@ class VerifyTest(unittest.TestCase):
                 code, result = self.run_cli('--before', 'default-reset', FAKE_MODE=mode)
                 self.assertEqual(code, 2, result)
                 self.assertIn('ROM loader', result['chipState'])
+
+    def test_a_failure_before_the_command_leaves_the_chip_state_unknown(self):
+        # the caller put the chip in the ROM loader and asked --after to reset it; the stub upload failed first
+        code, result = self.run_cli('--after', 'hard-reset', FAKE_MODE='stub_failure')
+        self.assertEqual(code, 3, result)
+        self.assertIn('ROM loader', result['chipState'])
+        code, result = self.run_cli('--after', 'hard-reset', FAKE_MODE='late_failure')
+        self.assertEqual(code, 3, result)
+        self.assertNotIn('chipState', result)    # the reset ran
+        code, result = self.run_cli(FAKE_MODE='stub_failure')
+        self.assertNotIn('chipState', result)    # no-reset both ways: the caller keeps the chip where it was
 
     def test_a_refusal_before_the_tool_says_nothing_of_the_chip(self):
         self.files['0x2004'] = 'app space [1].bin'
