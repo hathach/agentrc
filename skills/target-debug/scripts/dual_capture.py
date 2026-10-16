@@ -5,10 +5,11 @@ each ran (the target-debug skill's USB dual-side capture).
   dual_capture.py --a <name>=<argv.json> --b <name>=<argv.json> --timeout S --out <new dir>
 
 Each argv file is a JSON list of strings, the command exactly as it should run (no shell); for a
-host-side usbmon capture and a target channel, e.g. ["python3", "<usb-kernel-debug>/scripts/usbcap.py",
-"5", "30", "host.pcapng"] and an rtt.py or serial console command. Each side starts in its own
-process group with its stdout and stderr in <out>/<name>.out and <name>.err, and its working
-directory in <out>, so relative output paths land there.
+host-side usbmon capture and a target channel, e.g. ["python3", "-u",
+"<usb-kernel-debug>/scripts/usbcap.py", "5", "30", "host.pcapng"] and an rtt.py or serial console
+command. A Python side needs -u, or a line it prints reaches its file only when it exits. Each side
+starts in its own process group with its stdout and stderr in <out>/<name>.out and <name>.err, and
+its working directory in <out>, so relative output paths land there.
 
 Both sides are started, then waited for until both exit or --timeout passes. --timeout is a
 backstop: give each tool its own duration and a --timeout beyond the longer one. A side still
@@ -21,9 +22,10 @@ This script is the subreaper of both sides, so a descendant orphaned before it w
 reparents here: it is stopped the same way and reported under orphans, its side unknown.
 
 The report gives each side's spawn and exit times (seconds after the first spawn) and the window
-in which both processes existed. That is when both ran, not when both were capturing: a tool's
-readiness (usbmon attached, an RTT block found, a port opened) is its own output's to show, and
-this script claims none.
+in which both processes existed. An exit time is when this script saw the exit, within one 50 ms
+poll, so it and the window's end are upper bounds. The window is when both ran, not when both were
+capturing: a tool's readiness (usbmon attached, an RTT block found, a port opened) is its own
+output's to show, and this script claims none.
 
 Exit: 0 both sides exited 0 within the bound and left nothing running; 1 a side exited non-zero
 or had to be stopped, or the run was interrupted (each side reported); 2 bad usage; 3 a side
@@ -60,6 +62,8 @@ def load_side(p, flag, spec, out):
         p.error(f'{flag} {path}: {e}')
     if not (isinstance(argv, list) and argv and all(isinstance(x, str) for x in argv)):
         p.error(f'{flag} {path}: a JSON list of strings, the command and its arguments')
+    if any('\0' in x for x in argv):
+        p.error(f'{flag} {path}: an argument holds a NUL character, which no command line can carry')
     return {'name': name, 'argv': argv, 'stdout': os.path.join(out, name + '.out'),
             'stderr': os.path.join(out, name + '.err')}
 
@@ -86,11 +90,10 @@ def track(seen, tops):
     todo = [*tops, *(pid for pid, start in seen.items() if (stat(pid) or (None, None))[1] == start)]
     while todo:
         for k in children(todo.pop()):
-            if k not in seen:
-                st = stat(k)
-                if st:
-                    seen[k] = st[1]
-                    todo.append(k)
+            st = stat(k)
+            if st and seen.get(k) != st[1]:
+                seen[k] = st[1]
+                todo.append(k)
 
 
 def adopt(sides, strays):
@@ -104,7 +107,7 @@ def adopt(sides, strays):
                 os.waitpid(k, os.WNOHANG)
             except OSError:
                 pass
-        elif st and k not in strays and not any(k in s['seen'] for s in sides if 'proc' in s):
+        elif st and strays.get(k) != st[1] and not any(s['seen'].get(k) == st[1] for s in sides if 'proc' in s):
             strays[k] = st[1]
     track(strays, [])
 
@@ -187,10 +190,15 @@ def main(argv=None):
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, on_signal)
         for side in sides:
-            out, err = open(side['stdout'], 'wb'), open(side['stderr'], 'wb')
+            out = err = None
             armed = False    # a signal now is acted on once the side is fully recorded
             try:
                 side['seen'] = {}
+                out = open(side['stdout'], 'wb')
+                err = open(side['stderr'], 'wb')
+                for s in sides:
+                    if 'proc' in s:
+                        note_exit(s)    # before the next spawn: a side already gone then never overlapped it
                 side['proc'] = subprocess.Popen(side['argv'], stdout=out, stderr=err, stdin=subprocess.DEVNULL,
                                                 cwd=a.out, start_new_session=True)
                 side['spawned'] = time.monotonic()
@@ -199,8 +207,9 @@ def main(argv=None):
                 side['startError'] = str(e)
                 break
             finally:
-                out.close()
-                err.close()
+                for f in (out, err):
+                    if f:
+                        f.close()
                 armed = True
             if signals:
                 raise Interrupted()
@@ -226,6 +235,7 @@ def main(argv=None):
         adopt(sides, strays)
         running = [s for s in started if lingering(s)]
         signal_pids(left(strays), signal.SIGTERM)
+        termed = dict(strays)
         for s in running:
             # SIGTERM to the leader's group only: a live tool stops what it started in its own order
             # (rtt.py's server sits in a session of its own); what outlived its leader gets it directly
@@ -237,17 +247,25 @@ def main(argv=None):
             else:
                 signal_pids(left(s['seen']), signal.SIGTERM)
         end = time.monotonic() + a.grace
-        while time.monotonic() < end and (any(lingering(s) for s in running) or left(strays)):
+        while True:
             for s in running:
                 track(s['seen'], roots(s))
                 note_exit(s)
+            # before adopt: a process seen gone has already reparented its orphans here
+            busy = any(lingering(s) for s in running)
             adopt(sides, strays)
+            fresh = {k: v for k, v in strays.items() if termed.get(k) != v}
+            signal_pids(left(fresh), signal.SIGTERM)
+            termed.update(fresh)
+            if not (busy or left(strays)) or time.monotonic() >= end:
+                break
             time.sleep(0.05)
         for s in running:
             if lingering(s):
                 s['killed'] = True
                 track(s['seen'], roots(s))
-                signal_pids([-s['proc'].pid, *left(s['seen'])], signal.SIGKILL)
+                # the group only while its unreaped leader holds the pgid; what it leaves is in seen or strays
+                signal_pids([*(-pid for pid in roots(s)), *left(s['seen'])], signal.SIGKILL)
             try:
                 s['proc'].wait(5)
             except subprocess.TimeoutExpired:

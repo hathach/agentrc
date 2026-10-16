@@ -132,13 +132,14 @@ runs both under one backstop bound and reports when each ran (`--help`); each to
 an argv file, a JSON list:
 
 ```bash
-echo '["python3", "<usb-kernel-debug skill dir>/scripts/usbcap.py", "<bus>", "30", "host.pcapng"]' > host.json
+echo '["python3", "-u", "<usb-kernel-debug skill dir>/scripts/usbcap.py", "<bus>", "30", "host.pcapng"]' > host.json
 echo '["python3", "<rtt skill dir>/scripts/rtt.py", "--backend", "jlink", "--probe", "<sn>", "--device", "<dev>",
       "--interface", "swd", "--speed", "auto", "--seconds", "30"]' > target.json
 python3 <skill dir>/scripts/dual_capture.py --a host=host.json --b target=target.json --timeout 40 --out <new dir>
 ```
 
-Trigger the failing test once both sides show they are capturing in their own output (usbcap prints its start line).
+Trigger the failing test once both sides show they are capturing in their own output (usbcap prints its start line;
+a Python side needs `-u` for that line to reach its file before it exits).
 usbcap takes the board's bus; a VID: selector spanning buses is refused.
 
 RTT lines and ring events carry no wall-clock: correlate on unambiguous anchors — bus reset, SET_ADDRESS, the first

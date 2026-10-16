@@ -191,6 +191,102 @@ class DualCaptureTest(unittest.TestCase):
         self.assertTrue(out['sides'][0]['stopped'])
         self.assertTrue(wait_until(lambda: not alive(int(pidfile.read_text()))))
 
+    def driver(self, popen_body, *args):
+        """Run main() in a child with subprocess.Popen replaced by popen(*a, **k) from popen_body."""
+        driver = (f'import os, signal, subprocess, sys, time\nsys.path.insert(0, {str(SCRIPT.parent)!r})\n'
+                  'import dual_capture\nreal = subprocess.Popen\ncalls = []\n' + popen_body +
+                  'dual_capture.subprocess.Popen = popen\nsys.exit(dual_capture.main(sys.argv[1:]))')
+        return subprocess.run([sys.executable, '-c', driver, *args, '--out', str(self.out)],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_an_orphan_first_seen_in_the_grace_gets_sigterm(self):
+        # the tool forks in its SIGTERM handler and exits at once: the child reparents here unseen
+        log = self.d / 'orphan.log'
+        leader = ('import os, signal, sys, time\n'
+                  'def term(*_):\n'
+                  '    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n'
+                  '    if os.fork():\n'
+                  '        os._exit(0)\n'
+                  f'    log = open({str(log)!r}, "a", buffering=1)\n'
+                  '    def bye(*_): log.write("TERM\\n"); os._exit(0)\n'
+                  '    signal.signal(signal.SIGTERM, bye)\n'
+                  '    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})\n'
+                  '    while True: time.sleep(1)\n'
+                  'signal.signal(signal.SIGTERM, term)\n'
+                  'while True: time.sleep(1)')
+        rc, out, err = self.run_cli(self.side('host', leader), self.side('target', 'pass'),
+                                    '--timeout', '1', '--grace', '3')
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(log.read_text(), 'TERM\n', out)
+        self.assertEqual(out['orphans']['left'], [])
+
+    def test_no_group_sigkill_once_the_leader_is_reaped(self):
+        # the leader exits leaving a group member that ignores SIGTERM; its pgid is no longer ours to signal
+        kills = self.d / 'kills'
+        pidfile = self.d / 'member.pid'
+        member = 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'
+        host = ('import subprocess, sys, time; '
+                f'p = subprocess.Popen([sys.executable, "-c", {member!r}]); '
+                f'open({str(pidfile)!r}, "w").write(str(p.pid)); time.sleep(0.5)')
+        popen = ('real_kill = os.kill\n'
+                 'def kill(pid, sig):\n'
+                 f'    open({str(kills)!r}, "a").write(f"{{pid}} {{sig}}\\n")\n'
+                 '    real_kill(pid, sig)\n'
+                 'dual_capture.os.kill = kill\n'
+                 'popen = real\n')
+        proc = self.driver(popen, '--a', self.side('host', host), '--b', self.side('target', 'pass'),
+                           '--timeout', '10', '--grace', '0.5')
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertTrue(out['sides'][0]['killed'])
+        self.assertTrue(wait_until(lambda: not alive(int(pidfile.read_text()))))
+        sent = [tuple(map(int, line.split())) for line in kills.read_text().split('\n') if line]
+        self.assertIn(int(signal.SIGKILL), [sig for _, sig in sent])
+        self.assertEqual([(pid, sig) for pid, sig in sent if pid < 0], [])
+
+    def test_a_side_that_exits_before_the_other_starts_does_not_overlap(self):
+        popen = ('def popen(*a, **k):\n'
+                 '    if calls: time.sleep(0.2)\n'
+                 '    p = real(*a, **k)\n'
+                 '    calls.append(p)\n'
+                 '    if len(calls) == 1: p.wait()\n'
+                 '    return p\n')
+        proc = self.driver(popen, '--a', self.side('host', 'pass'), '--b', self.side('target', 'pass'),
+                           '--timeout', '10')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        host, target = out['sides']
+        self.assertLess(host['exitedAt'], target['spawnedAt'])
+        self.assertEqual(out['bothRunning']['seconds'], 0)
+
+    def test_an_output_file_that_cannot_open_is_a_start_error(self):
+        # <name>.out is longer than a file name may be
+        argv = self.d / 'long.json'
+        argv.write_text(json.dumps(['true']))
+        rc, out, err = self.run_cli(self.side('host', 'import time; time.sleep(30)'), f'{"b" * 252}={argv}',
+                                    '--timeout', '20', '--grace', '1')
+        self.assertEqual(rc, 3, err)
+        self.assertIn('startError', out['sides'][1])
+        self.assertTrue(out['sides'][0]['stopped'])
+
+    def test_a_reused_pid_below_a_live_process_is_tracked_again(self):
+        table = {1: ('S', 's1'), 101: ('S', 'new'), 202: ('S', 's202')}
+        kids = {1: {101}, 101: {202}}
+        with mock.patch.object(dual_capture, 'stat', table.get), \
+                mock.patch.object(dual_capture, 'children', lambda pid: kids.get(pid, set())):
+            seen = {101: 'old'}
+            dual_capture.track(seen, [1])
+            self.assertEqual(seen, {101: 'new', 202: 's202'})
+
+    def test_an_orphan_on_a_reused_pid_is_adopted(self):
+        table = {101: ('S', 'new'), 102: ('S', 'new2')}
+        side = {'proc': mock.Mock(pid=999), 'seen': {102: 'old2'}}
+        with mock.patch.object(dual_capture, 'stat', table.get), \
+                mock.patch.object(dual_capture, 'children', lambda pid: {101, 102} if pid == os.getpid() else set()):
+            strays = {101: 'old'}
+            dual_capture.adopt([side], strays)
+            self.assertEqual(strays, {101: 'new', 102: 'new2'})
+
     def test_a_reused_pid_is_not_walked(self):
         table = {101: ('S', 'new'), 202: ('S', 's202')}
         kids = {101: {202}}
@@ -205,7 +301,10 @@ class DualCaptureTest(unittest.TestCase):
         good = self.side('host', 'pass')
         notlist = self.d / 'n.json'
         notlist.write_text('"echo hi"')
+        nul = self.d / 'nul.json'
+        nul.write_text(json.dumps(['echo', 'a\0b']))
         for args, want in (((good, good, '--timeout', '1'), 'different names'),
+                           ((good, f'x={nul}', '--timeout', '1'), 'NUL'),
                            ((good, f'x={notlist}', '--timeout', '1'), 'JSON list of strings'),
                            ((good, 'nameonly', '--timeout', '1'), '<name>=<argv.json>'),
                            ((good, f'a/b={notlist}', '--timeout', '1'),
