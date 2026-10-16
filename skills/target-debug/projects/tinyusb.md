@@ -40,13 +40,13 @@ Reading the host side (usbmon's limits, URB status codes) is `usb-kernel-debug`'
 symptoms point to, hypotheses with the check that discriminates, not verdicts. carried over; callback names and the
 `usbd.c` EP0 stall paths checked in fad6bd546.
 
-| Host-side symptom                           | Target-side check                                                                                                                                                                                                                                                                                      |
-| ------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Enumeration stalls                          | The request after the last good control transfer (often CONFIG, a string, or the first class request) is what `tud_descriptor_*` / the control callback mishandled.                                                                                                                                    |
+| Host-side symptom                           | Target-side check |
+| ------------------------------------------- | --- |
+| Enumeration stalls                          | The request after the last good control transfer (often CONFIG, a string, or the first class request) is what `tud_descriptor_*` / the control callback mishandled. |
 | Control STALL (`-32`)                       | A `tud_*_control_xfer_cb` returning `false`, or `usbd.c` rejecting the SETUP first: an unsupported standard request or recipient, an interface or endpoint no driver owns, a `tud_descriptor_*_cb` returning NULL. Follow the full SETUP through `process_setup_received` to where it returns `false`. |
-| Bulk / interrupt: no completions            | `_usbd_dev.ep_status` and the port's transfer bookkeeping (dwc2: `xfer_status`).                                                                                                                                                                                                                       |
-| CDC read (`dd`/cat) hangs, IN endpoint idle | With DTR never seen, `tud_cdc_connected()` is false and the app stops sourcing TX; typical right after a bulk **write** phase. Confirm with `_cdcd_itf[0].line_state` bit 0.                                                                                                                           |
-| Wrong descriptors                           | `bLength` / `wTotalLength` against `tud_descriptor_configuration_cb`.                                                                                                                                                                                                                                  |
+| Bulk / interrupt: no completions            | `_usbd_dev.ep_status` and the port's transfer bookkeeping (dwc2: `xfer_status`). |
+| CDC read (`dd`/cat) hangs, IN endpoint idle | With DTR never seen, `tud_cdc_connected()` is false and the app stops sourcing TX; typical right after a bulk **write** phase. Confirm with `_cdcd_itf[0].line_state` bit 0. |
+| Wrong descriptors                           | `bLength` / `wTotalLength` against `tud_descriptor_configuration_cb`. |
 
 - Example devices enumerate as `cafe:40xx`; the low PID bits encode the classes, so `cafe:` on a rig matches several
   boards — select by bus or by full PID. verified 2026-09-18: two `cafe:4007` devices on one bus, `usbcap.py cafe:4007`
@@ -118,7 +118,12 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   and flash through the project's contracts. The Metro ESP32-S3 has no BSP: the `espressif_s3_devkitc` build runs on it
   (LED and button pins differ). That BSP puts the MAX3421 host shield's SCK and MOSI on GPIO39/42, the JTAG pads (host
   builds with `CFG_TUH_MAX3421` only, `family.c`); the `adafruit_feather_esp32s3` BSP puts them on 36/35. verified
-  2026-10-15 htpc, ea1d867ce.
+  2026-10-15 htpc, ea1d867ce. `espressif_s3_devkitc` and tinyuf2's `espressif_esp32s3_devkitc_1` are one board in two
+  rosters whose holds do not exclude each other: hold it under both names in the shared lock store, and stop if both
+  holds cannot be acquired. P4 units with chip v0.1 and v1.0 both exist on the benches: build for the detected revision;
+  the rig roster's "`--force` for v0.1" note predates esptool 5.2.0.
+- The espressif BSP installs no UART driver, so UART0 log writes take the polled VFS path (`espressif.md`, "Console
+  perturbation").
 - The HIL config's `esptool` uid is whatever port the rig flashes through: the CP2102N **flasher** serial on the S3 and
   P4 rig boards, never the USB-Serial-JTAG device there; openocd's `adapter serial` is the chip MAC with colons, read
   from the device. carried over (S3/P4 rig boards). On the S31 the flasher port is the USB-Serial-JTAG CDC itself, so
@@ -141,22 +146,31 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   debug window holding the halt and the hit, and an after-window. The chip behaviour behind each verdict is in
   `espressif.md` (Attach, "The end-of-stack watchpoint", the variant sections):
 
-  | Board, example                                                                   | Recipe                                                                                             | Under load                                                                                                                                                                                                                                                                          |
-  | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-  | P4 Function-EV v1.0, cdc_msc_freertos stock                                      | refuted (below)                                                                                    | 8 KiB MSC ops 12.8 ms before the attach, ~10 s after; one run lost CDC and MSC around the attach, another's CDC probe timed out 5 s after it with no sustained traffic                                                                                                              |
-  | P4, cdc_msc_freertos, watchpoint off                                             | all verified                                                                                       | no echo or MSC op lost; the only gaps (1.09 s, 1.00 s) at the halt and the hit; service kept after `shutdown`                                                                                                                                                                       |
-  | P4, cdc_msc_throughput                                                           | all verified (5 tasks at connect, 2 s halt)                                                        | 80/80 MSC ops of 16 MiB with CDC both ways; host-to-device CDC kept through a 1.1 s halt and one hit, zero kernel messages; device-to-host CDC had stalled before the attach (below), so that direction is unverified                                                               |
-  | S31 CoreBoard, cdc_msc_freertos stock                                            | refuted (below)                                                                                    | under a 100 ms CDC echo loop and the 8 KiB RAM-disk loop, the first MSC ops after the attach took 11-12 s and CDC writes timed out before the 1 s halt                                                                                                                              |
-  | S31, cdc_msc_freertos, watchpoint off                                            | all verified                                                                                       | no echo lost across baseline and window (985/985), no kernel line; service kept after `shutdown`                                                                                                                                                                                    |
-  | S31, cdc_msc_throughput                                                          | all verified (6 tasks at connect)                                                                  | 16 MiB MSC ops and 1 MiB CDC writes all completed; one 1.017 s CDC RX gap at the halt; no new kernel message                                                                                                                                                                        |
-  | Metro ESP32-S3 rev B, pad JTAG, `espressif_s3_devkitc` build of cdc_msc_freertos | all verified (8 tasks); idle, `usbd` reaches `tud_task_ext` within ~0.9 s                          | CDC echo loop and the 8 KiB RAM-disk loop: no malformed echo, I/O error, read mismatch or kernel error                                                                                                                                                                              |
+  | Board, example                                                                   | Recipe                                                                                             | Under load |
+  | -------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- | --- |
+  | P4 Function-EV v1.4 (chip v1.0), cdc_msc_freertos stock                          | refuted (below)                                                                                    | 8 KiB MSC ops 12.8 ms before the attach, ~10 s after; one run lost CDC and MSC around the attach, another's CDC probe timed out 5 s after it with no sustained traffic |
+  | P4, cdc_msc_freertos, watchpoint off                                             | all verified (8 tasks, the CDC echo after `shutdown` reproduced)                                   | no echo or MSC op lost; the only gaps (1.09 s, 1.00 s) at the halt and the hit; service kept after `shutdown` |
+  | P4, cdc_msc_throughput                                                           | all verified (5 tasks at connect, 3 hardware breakpoints, 2 s halt)                                | 80/80 MSC ops of 16 MiB with CDC both ways; host-to-device CDC kept through a 1.1 s halt and one hit, zero kernel messages; device-to-host CDC had stalled before the attach (below), so that direction is unverified |
+  | S31 CoreBoard, cdc_msc_freertos stock                                            | refuted (below)                                                                                    | under a 100 ms CDC echo loop and the 8 KiB RAM-disk loop, the first MSC ops after the attach took 11-12 s and CDC writes timed out before the 1 s halt |
+  | S31, cdc_msc_freertos, watchpoint off                                            | all verified (9 tasks)                                                                             | no echo lost across baseline and window (985/985), no kernel line; service kept after `shutdown` |
+  | S31, cdc_msc_throughput                                                          | all verified (6 tasks at connect)                                                                  | 16 MiB MSC ops and 1 MiB CDC writes all completed; one 1.017 s CDC RX gap at the halt; no new kernel message |
+  | Metro ESP32-S3 rev B, pad JTAG, `espressif_s3_devkitc` build of cdc_msc_freertos | all verified (8 tasks); idle, `usbd` reaches `tud_task_ext` within ~0.9 s                          | CDC echo loop and the 8 KiB RAM-disk loop: no malformed echo, I/O error, read mismatch or kernel error |
   | Metro, cdc_msc_throughput                                                        | all verified (5 threads at the hit)                                                                | 125 s window: one 1.029 s CDC RX gap at the halt, 50 CDC writes of 1 MiB and 3 direct MSC ops of 16 MiB all completed, zero kernel messages; the writes (~127 s) and the MSC ops (138 s) each ran longer than the window, and the full-speed link carried all three streams at once |
-  | Kaluga S2 (FT2232HL by `adapter usb location`), cdc_msc_freertos                 | all verified (tasks usbd/IDLE/blinky/cdc/io); its end-of-stack watchpoint absent from openocd `wp` | 8 KiB RAM-disk loop and a CDC echo every ~100 ms: no echo or dd op lost, the only extended gap the halt (1.105 s)                                                                                                                                                                   |
-  | Kaluga, cdc_msc_throughput                                                       | all verified                                                                                       | 120 s with the device enumerated throughout, zero kernel messages: one 16 MiB MSC op takes 42-45 s at full speed, the 1 s halt a 1.2 s CDC RX gap                                                                                                                                   |
+  | Kaluga S2 (FT2232HL by `adapter usb location`), cdc_msc_freertos                 | all verified (tasks usbd/IDLE/blinky/cdc/io); its end-of-stack watchpoint absent from openocd `wp` | 8 KiB RAM-disk loop and a CDC echo every ~100 ms: no echo or dd op lost, the only extended gap the halt (1.105 s) |
+  | Kaluga, cdc_msc_throughput                                                       | all verified                                                                                       | 120 s with the device enumerated throughout, zero kernel messages: one 16 MiB MSC op takes 42-45 s at full speed, the 1 s halt a 1.2 s CDC RX gap |
 
   The two refuted rows: the P4 recovered through a kernel port power cycle in one run and needed `init; shutdown` or
   `reset run` from openocd in both, with no final whole-flash verification; the S31 stayed unavailable after `shutdown`
-  and its esptool reset started the Breakpoint boot loop until `init; shutdown`, flash verified intact.
+  and its esptool reset started the Breakpoint boot loop until `init; shutdown`, flash verified intact. Behind them:
+  2630 `debug_reason=00000001` halts in a six-minute P4 session and 1247 on the S31; the P4 reset with "panic'ed
+  (Breakpoint)", `rst:0xc`, on one attach in three and once logged a PMP Store access fault (contribution unresolved);
+  the S31 parked in the panic handler on one attach in two (backtrace `vTaskSwitchContext` → `vPortSetStackWatchpoint` →
+  `esp_cpu_set_watchpoint(wp_num=3)` → `esp_panic_handler`); the matched P4 builds inserted two hardware breakpoints
+  with the option on and three without, and openocd logged "could not remove watchpoint #0" at shutdown; the S31
+  inserted four either way, and `wp` listed the firmware watchpoint only after their deletion and resume; its
+  non-panicking stock attach listed nine tasks. An earlier stock-build attach on the P4 (2026-10-15, before these runs)
+  had been clean: no reset, `thbreak tud_task_ext` hit in `usbd` with a symbolized backtrace, eight tasks listed, CDC
+  echo after `shutdown`.
 - cdc_msc_throughput: its CDC interface is `usb-TinyUSB_Throughput_<serial>-if00`, and its CDC filler is NUL bytes
   without a newline: a canonical-mode tty delivers nothing of it to `cat` and mimics a device-to-host stall; set raw
   mode on the reader's own fd (`techniques.md` "Log capture").
@@ -168,14 +182,18 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   stopped 26 s into combined CDC RX, CDC TX and MSC load before any debugger attached, MSC still serving, cleared only
   by a chip reset; a later busy/claimed endpoint snapshot (`ep_status[2] = {0x5, 0x5}`, EP 0x82 armed with 0x400 bytes)
   was taken with no reader open and is not diagnostic by itself.
-- Halting inside `tud_mount_cb` on the Kaluga S2 wedged the host's SET_CONFIGURATION (`espressif.md`, "ESP32-S2").
-  `tud_task_ext` also runs the enumeration events, so confirm the host shows the device configured before arming a
-  breakpoint there. verified 2026-10-15 espressif_kaluga_1, cdc_msc_freertos ea1d867ce.
+- Halting inside `tud_mount_cb` on the Kaluga S2 wedged the host's enumeration: SET_CONFIGURATION at -110, a
+  re-authorize at -32, only a chip reset recovered (`espressif.md`, "ESP32-S2"). `tud_task_ext` also runs the
+  enumeration events, so confirm the host shows the device configured before arming a breakpoint there. verified
+  2026-10-15 espressif_kaluga_1, cdc_msc_freertos ea1d867ce.
 - #4229 (S31 slave-mode bulk IN truncation): the slave-mode ISR TX FIFO write and the TX FIFO flush ran unlocked against
   the task on the other core; fixed in ec7be1ed1 (#4234, 2026-10-15) with `usbd_spin_lock` around both. The autopsy used
   openocd telnet `halt`/`mdw`/`dump_image`/`resume` over the USJ; instrumentation symbols move between builds
   (`riscv32-esp-elf-nm` the flashed ELF before `mdw`). verified 2026-10-14 htpc.
-- `src/portable/synopsys/dwc2/dwc2_info.py` records the S31 DWC2 values read live in 50d481aca (2026-10-14); chip
-  details: `espressif.md`, "ESP32-S31".
-- On espressif_s3_devkitm, tinyusb's non-USB debug window (`espressif.md`, "ESP32-S3") is `board_test`: `usb_new_phy` is
-  absent from its ELF when `CFG_TUD/TUH_ENABLED` are 0. carried over.
+- `src/portable/synopsys/dwc2/dwc2_info.py` records the S31 DWC2 values read live in 50d481aca (2026-10-14): base
+  0x20300000, GSNPSID 0x4F54430A (4.30a); chip details: `espressif.md`, "ESP32-S31".
+- On espressif_s3_devkitm, tinyusb's window before any app starts OTG (`espressif.md`, "ESP32-S3") is `board_test`:
+  `usb_new_phy` is absent from its ELF when `CFG_TUD/TUH_ENABLED` are 0; attach, halt and symbol resolution worked in
+  it. carried over. In that window the USJ dropped ~4 s after boot with nothing attached and stayed up once a client
+  survived it (tinyusb 5066ac7b3, 2026-07-24; original transcript unavailable); a DevKitC running tinyuf2 blinky kept
+  its USJ up for minutes unattended (2026-10-13), a differing observation on another board and build.

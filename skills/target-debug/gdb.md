@@ -59,7 +59,7 @@ break <the USB ISR>                         # works, but see warning below
 ```
 
 **Hardware budget — read it off the chip** (Cortex-M FPB/DWT, verified: F407/M4 = 6 bp + 4 wp, rp2040/M0+ = 4 + 2; M7
-typically 8/4; Espressif: `espressif.md`, Attach, "Count breakpoints"):
+typically 8/4; Espressif: `espressif.md`, Attach, "Breakpoint budgets"):
 
 ```gdb
 p ((*(unsigned*)0xE0002000)>>4) & 0xF   # FPB NUM_CODE = hw breakpoints (M7 adds bits[14:12])

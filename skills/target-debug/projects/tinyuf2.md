@@ -57,7 +57,11 @@ it in the checkout in front of you.**
   of a UF2 copy**: TinyUF2 restarts while usb-storage still talks to it. verified 2026-10-13 2b558bd
   espressif_esp32s3_devkitc_1: on successful copies only, never on DFU_DETACH, in a 10-cycle run; they do not by
   themselves show a copy succeeded.
-- The four entries above are S3 measurements.
+- The four entries above are S3 measurements. `espressif_esp32s3_devkitc_1` is tinyusb's `espressif_s3_devkitc`, one
+  board in two rosters whose holds do not exclude each other: hold it under both names in the shared lock store, and
+  stop if both holds cannot be acquired. `ports/espressif/sdkconfig.defaults` and the blinky, dfu_runtime,
+  erase_firmware and update_tinyuf2 apps set `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y` (fd60fc5): on a RISC-V port
+  under openocd that is the halt storm `espressif.md` describes ("The end-of-stack watchpoint").
 - P4 (`espressif_p4_function_ev`, 8e75969 #532): 239a:00a5 as well (the shared-PID TODO in `board.h`), UF2 board id
   `ESP32P4-FunctionEV-v1.4`, volume `P4FEVBOOT`, button GPIO35. A software restart on the P4 left the OTG HS device
   attached, so the host kept a device that no longer answered and a UF2 copy's `mcopy` hung ~60 s on SCSI resets;

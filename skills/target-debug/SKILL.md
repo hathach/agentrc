@@ -12,14 +12,14 @@ Pi).
 
 ## Which skill answers what
 
-| Skill                 | Answers                                                                                                                      | Needs                                                                                                   |
-| --------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **`target-debug`**    | **what the target did** (driver state, faults, where the core spins)                                                         | a debug probe on the target                                                                             |
-| `rtt`                 | the target's log/console stream, and a post-mortem ring dump                                                                 | a probe, firmware that logs over SEGGER RTT                                                             |
-| `etm-trace`           | exactly which instructions ran (profile, coverage, history)                                                                  | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule                            |
-| `usb-sniffer`         | what crossed the wire (PIDs, handshakes, resets)                                                                             | the hardware tap cabled in; role-agnostic                                                               |
+| Skill                 | Answers | Needs |
+| --------------------- | --- | --- |
+| **`target-debug`**    | **what the target did** (driver state, faults, where the core spins) | a debug probe on the target |
+| `rtt`                 | the target's log/console stream, and a post-mortem ring dump | a probe, firmware that logs over SEGGER RTT |
+| `etm-trace`           | exactly which instructions ran (profile, coverage, history) | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule |
+| `usb-sniffer`         | what crossed the wire (PIDs, handshakes, resets) | the hardware tap cabled in; role-agnostic |
 | a project's `sysview` | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | the project ships the skill; a J-Link/J-Trace for live capture, or an OpenOCD probe for raw RTT capture |
-| `usb-kernel-debug`    | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug)                                           | Linux on either end: PC host or gadget peer                                                             |
+| `usb-kernel-debug`    | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
 
 **Espressif targets** (ESP32-S2/S3/P4/S31 and the C series): read `espressif.md` first; it names the tools, the JTAG
 route per chip and the console.
@@ -40,12 +40,12 @@ These skills know probes, not projects. Three things come from the project, and 
 A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it directly
 (`--hil-config <file> --board <name>`; a flag given as well must agree):
 
-| `flasher` field | Means                                                                                                                                                                                    | Becomes                                                             |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `flasher` field | Means | Becomes |
+| --------------- | --- | --- |
 | `name`          | how the rig flashes: `jlink`, `openocd`, `stlink` are probe routes; `esptool`, `lm4flash` are refused: they name no debug probe (Espressif debug transport and selector: `espressif.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
-| `uid`           | the probe's serial                                                                                                                                                                       | `--probe`                                                           |
-| `args`          | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments                                                                                                                        | `--device`, or `--cfg` whole                                        |
-| `vid_pid`       | the probe model's USB IDs, openocd only                                                                                                                                                  | `--vid-pid`                                                         |
+| `uid`           | the probe's serial | `--probe` |
+| `args`          | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments | `--device`, or `--cfg` whole |
+| `vid_pid`       | the probe model's USB IDs, openocd only | `--vid-pid` |
 
 A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and `--speed` stay explicit; on
 the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` takes J-Link entries only;
@@ -109,10 +109,10 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
   pinned artifact and nothing since changed its contents or made them uncertain, citing that verification; otherwise
   program the pinned artifact and verify its programmed contents, the artifact hash recorded apart from that result) or,
   when `cleanup.pristine` records the HIL contract's cleanup state, run the contract's cleanup instead, verified only by
-  the run-state observation below; remove owned breakpoints and watchpoints (Espressif: `espressif.md` Attach's leaving
-  rules, `delete`, `monitor resume` before `detach`, `shutdown`), restore the firmware's expected run state and record
-  an observation that establishes it (a verified flash alone does not; for a USB device, the expected function, such as
-  an application exchange; a claim that needs re-enumeration records the enumeration events, and a device number alone
+  the run-state observation below; remove owned breakpoints and watchpoints (Espressif: `espressif.md` Attach, "Leave":
+  `delete`, `monitor resume` before `detach`, `shutdown`), restore the firmware's expected run state and record an
+  observation that establishes it (a verified flash alone does not; for a USB device, the expected function, such as an
+  application exchange; a claim that needs re-enumeration records the enumeration events, and a device number alone
   establishes neither, since the host may reuse it across a reset), close any flasher you opened, restore host settings,
   release the lock. `restorationFlashes` counts actual programming attempts, a contract cleanup's write included. Run
   state not established is a failed cleanup. Do only the cleanup your own actions or the explicitly assigned recovery
@@ -143,18 +143,18 @@ instrumented, that IS a finding (timing-sensitive): move down in intrusiveness, 
 The Core column says where a technique exists; a row that names a core family does not exist elsewhere, and
 `espressif.md`'s "Technique mapping" gives the Xtensa and RISC-V substitutes.
 
-| Technique                          | Core                                                                                         | Intrusiveness                                           | Reach for it when                                                                                              |
-| ---------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| PC-sampling (DWT_PCSR polled)      | Cortex-M3 and later; ARMv6-M (M0, M0+, M1) only where PCSR is implemented (`techniques.md`)  | no deliberate halt, no firmware change                  | core wedged/spinning somewhere unknown                                                                         |
-| SWO exception trace / hw PC-sample | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                              | none                                                    | ISR ordering/timing with zero code change                                                                      |
-| DWT data trace                     | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                              | none                                                    | stream one address's accesses: value + accessor PC                                                             |
-| Vector catch                       | Cortex-M (ARMv6-M: HardFault and reset only)                                                 | none until a fault fires                                | crash-shaped wedges — autopsy AT the faulting pc                                                               |
-| RAM ring-buffer                    | any; one ring per writing core                                                               | ~tens of cycles per event                               | ISR ordering/timing bugs                                                                                       |
-| SystemView (project's `sysview`)   | any the project's `sysview` supports                                                         | recorder in the firmware, per event                     | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
-| Log lines (RTT)                    | any with a probe RTT path (J-Link, OpenOCD); none in the measured TinyUSB Espressif builds   | µs per line                                             | logic bugs that survive logging                                                                                |
-| Log lines (UART)                   | any                                                                                          | up to ms per line when the write path polls a full FIFO | same, when no debug-probe RTT path                                                                             |
-| dprintf / conditional breakpoint   | any                                                                                          | halt+resume per hit (~ms)                               | low-rate probes post-wedge; never ISR-rate events                                                              |
-| GDB halt / breakpoints             | any; the hardware budget is per chip (`gdb.md`; `espressif.md`, Attach, "Count breakpoints") | stops USB service entirely                              | post-mortem state autopsy once wedged                                                                          |
+| Technique                          | Core                                                                                          | Intrusiveness                                           | Reach for it when                                                                                              |
+| ---------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| PC-sampling (DWT_PCSR polled)      | Cortex-M3 and later; ARMv6-M (M0, M0+, M1) only where PCSR is implemented (`techniques.md`)   | no deliberate halt, no firmware change                  | core wedged/spinning somewhere unknown                                                                         |
+| SWO exception trace / hw PC-sample | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                               | none                                                    | ISR ordering/timing with zero code change                                                                      |
+| DWT data trace                     | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                               | none                                                    | stream one address's accesses: value + accessor PC                                                             |
+| Vector catch                       | Cortex-M (ARMv6-M: HardFault and reset only)                                                  | none until a fault fires                                | crash-shaped wedges — autopsy AT the faulting pc                                                               |
+| RAM ring-buffer                    | any; one ring per writing core                                                                | ~tens of cycles per event                               | ISR ordering/timing bugs                                                                                       |
+| SystemView (project's `sysview`)   | any the project's `sysview` supports                                                          | recorder in the firmware, per event                     | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
+| Log lines (RTT)                    | any with a probe RTT path (J-Link, OpenOCD); none in the measured TinyUSB Espressif builds    | µs per line                                             | logic bugs that survive logging                                                                                |
+| Log lines (UART)                   | any                                                                                           | up to ms per line when the write path polls a full FIFO | same, when no debug-probe RTT path                                                                             |
+| dprintf / conditional breakpoint   | any                                                                                           | halt+resume per hit (~ms)                               | low-rate probes post-wedge; never ISR-rate events                                                              |
+| GDB halt / breakpoints             | any; the hardware budget is per chip (`gdb.md`; `espressif.md`, Attach, "Breakpoint budgets") | stops USB service entirely                              | post-mortem state autopsy once wedged                                                                          |
 
 Each technique's recipe, read when you reach for it (files beside this one):
 
