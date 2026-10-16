@@ -163,7 +163,7 @@ def main(argv=None):
         attrs[4] = attrs[5] = speed
         termios.tcsetattr(fd, termios.TCSANOW, attrs)
         if a.lines == 'low':
-            # after the baud: leaving B0 raises the lines again (ftdi_sio.c, cdc-acm.c set_termios)
+            # after the baud: leaving B0 re-raises DTR, and RTS on ftdi (ftdi_sio.c, cdc-acm.c set_termios)
             try:
                 fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack('i', termios.TIOCM_DTR | termios.TIOCM_RTS))
             except OSError as e:

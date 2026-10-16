@@ -216,9 +216,9 @@ def main(argv=None):
                 proc = subprocess.run(command, capture_output=True, text=True, errors='replace', env=env,
                                       timeout=args.timeout)
             except subprocess.TimeoutExpired as exc:
-                # its output can come back as bytes after a timeout even with text=True
-                text = lambda b: b.decode(errors='replace') if isinstance(b, bytes) else (b or '')
-                result.update(tool_exit=None, stdout=text(exc.stdout), stderr=text(exc.stderr))
+                # on POSIX a timeout's output is the raw bytes, text=True notwithstanding
+                result.update(tool_exit=None, stdout=(exc.stdout or b'').decode(errors='replace'),
+                              stderr=(exc.stderr or b'').decode(errors='replace'))
                 raise ValueError(f'esptool did not finish within {args.timeout:g} s and was killed') from exc
             result.update(tool_exit=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
             output = proc.stdout + '\n' + proc.stderr
