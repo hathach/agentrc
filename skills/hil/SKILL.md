@@ -53,9 +53,14 @@ holder record (pid, reason), are the contract's Reservation.
 - Bypassing a lock (`HIL_NO_BOARD_LOCK=1`, or the contract's equivalent) needs
   task scope explicitly naming forcing that board; a refusal alone never adds
   it.
-- A rig-wide operation (hub power, root-port cycle, controller rebind) holds
-  every board on the host first, across every project's roster there. A
-  partial hold is worse than none: it reads as protection.
+- A rig-wide operation, one that can reset or renumber a board you do not
+  hold (a hub's power, a root-port cycle, a controller rebind), holds every
+  board on the host first, across every project's roster there; a contract's
+  Hosts/rosters names the other projects' rosters on a host it shares. A
+  partial hold is worse than none: it reads as protection. A contract whose
+  runner cycles one hub port under the board's own lock records that in its
+  Limits as a limitation of this rule, with what else the cycle is known to
+  reach; it is no exemption.
 
 Manual work on a rig board outside the contract's runner (`hw-validator`,
 `hw-debugger`, probe tools used directly) follows `target-debug`'s Delegated
@@ -64,10 +69,10 @@ cleanup state when it defines one instead of a restoration firmware.
 
 ## Running
 
-- One run or manual session per board; batch, wait and judge completion as
-  Execution says, never cancelling before the run's own guard or spending a
-  call only to pass time. A runner that printed its report and still holds a
-  board is a blocker requiring recovery, never a process to cancel.
+- At most one run or manual session on a board at a time; batch, wait and judge
+  completion as Execution says, never cancelling before the run's own guard or
+  spending a call only to pass time. A runner that printed its report and still
+  holds a board is a blocker requiring recovery, never a process to cancel.
 - Read only the report this run wrote; an older report in the checkout is not
   this run's.
 
@@ -98,16 +103,17 @@ Each requested board gets one:
 - **not-run**: the validation was not exercised (locked, refused, unbuilt, not
   on this rig).
 
-A run-level caveat (aborted, nothing selected) gates every row.
+A run-level caveat (aborted, nothing selected) denies every row a pass: aborted
+makes every requested board a blocker; nothing selected leaves each board
+not-run, except a row that already holds a blocker, which stands.
 
 ## Caller rules
 
-- Retry a failed test once, only when it ran and failed, its required cleanup
-  succeeded, no board is locked, wedged or held, the caveat is empty, and the
-  contract does not name that result final; Results says whether the operator
-  or its caller retries. Keep every attempt's report; a clean retry never
-  erases an earlier run-level failure. An eligible retry that fails then passes
-  reads as a pass marked flaky, quoting both reports.
+- Retry a fail once, only on a run with no blocker or locked board and an empty
+  caveat, unless the contract names that result final; Results says whether the
+  operator or its caller retries. Keep every attempt's report; a clean retry
+  never erases an earlier run-level failure. An eligible retry that fails then
+  passes reads as a pass marked flaky, quoting both reports.
 - `locked` is an admission refusal, not a test failure: admit again once the
   holder releases, within the budget, or report the board not covered, naming
   the holder.
