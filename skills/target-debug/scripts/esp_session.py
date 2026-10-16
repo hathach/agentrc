@@ -28,11 +28,13 @@ Tcl port), gdb connects (which halts them; recorded from the log), reads `info t
 backtrace and the caller's expressions (may-write-memory, may-write-registers, may-call-functions
 and may-insert-breakpoints off), resumes and detaches. budget: gdb sets `breakpoint
 always-inserted on` and inserts one `hbreak` per --at location in order, so each insertion is
-tried at once; the budget is the count inserted before the first refusal, or a lower bound when
-none was refused. A location gdb cannot place (no such symbol) is reported unresolved and asks
-the hardware nothing; any other gdb failure at a location (no connection, no hardware breakpoint
-support) ends the count and fails the run. The firmware can hold triggers of its own (espressif.md, "Breakpoint
-budgets").
+tried at once; the budget is the count of distinct addresses inserted before the first refusal,
+or a lower bound when none was refused. A location gdb cannot place (no such symbol) is reported
+unresolved, and one at an address an earlier location already holds is reported duplicate (gdb
+inserts one breakpoint per address); neither asks the hardware for a slot. --at values must
+differ. A location gdb resolves to several addresses takes a slot each and leaves no budget, as
+does any other gdb failure at a location (no connection, no hardware breakpoint support): both
+fail the run. The firmware can hold triggers of its own (espressif.md, "Breakpoint budgets").
 
 Whatever gdb does, the session ends from this script over the Tcl port: every breakpoint and
 watchpoint removed, each halted core resumed, each core's state read, then `shutdown`, never a
@@ -55,7 +57,8 @@ and monitor output; budget writes both into gdb.log to keep their order) and rec
 
 Exit: 0 done and every core running at the end; 1 done, but an expression failed or a budget
 location was refused (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a budget location
-gdb could not ask about included), the run was interrupted, a core was left halted, removal is
+gdb could not ask about or resolved to several addresses included; gdb exiting non-zero, which in
+-batch means its last command, detach, failed, or by a signal leaves no budget), the run was interrupted, a core was left halted, removal is
 unchecked or failed, or the shutdown failed.
 """
 import argparse
@@ -337,37 +340,46 @@ def parse_inspect(result, blocks, exprs, gdb_err):
 
 
 def parse_budget(result, blocks, locations):
-    """Each location in order: inserted, refused (the budget is the count inserted before it), or
-    unresolved (gdb found no such location and asked the hardware nothing). gdb failing another way
-    (no connection, no hardware breakpoint support) anywhere, or a location not reached before the
-    first refusal, leaves no budget and is returned as the location the hardware was not asked about."""
-    rows, budget, inserted, unasked = [], None, 0, None
+    """Each location in order: inserted, refused (the budget is the count inserted before it),
+    unresolved (gdb found no such location and asked the hardware nothing), or duplicate (an address
+    already held: gdb inserts one breakpoint per address, and -batch prints no "also set at" note).
+    gdb failing another way (no connection, no hardware breakpoint support) anywhere, or a location
+    not reached or resolved to several addresses before the first refusal, leaves no budget and is
+    returned as the problem."""
+    rows, budget, inserted, problem, held = [], None, 0, None, set()
     for i, loc in enumerate(locations):
         out = blocks.get(f'AT{i}')
         lines = out.strip().splitlines() if out else []
+        placed = re.search(r'^Hardware assisted breakpoint \d+ at (0x[0-9a-fA-F]+)', out or '', re.M)
         if out is None:
             row = {'at': loc, 'result': 'not reached'}
-        elif re.search(r'^Hardware assisted breakpoint \d+ at', out, re.M):
-            refused = re.search(r'Cannot insert|Could not insert|Remote failure', out)
-            row = {'at': loc, 'result': 'refused', 'output': lines} if refused else {'at': loc, 'result': 'inserted'}
+        elif placed and re.search(r'\(\d+ locations\)', out):
+            row = {'at': loc, 'result': 'several addresses', 'output': lines}
+        elif placed and re.search(r'Cannot insert|Could not insert|Remote failure', out):
+            row = {'at': loc, 'result': 'refused', 'output': lines}
+        elif placed:
+            row = {'at': loc, 'result': 'duplicate' if placed[1] in held else 'inserted', 'address': placed[1]}
+            held.add(placed[1])
         elif re.search(r'not defined|No symbol|No source file named|No line \d+|malformed linespec', out):
             row = {'at': loc, 'result': 'unresolved', 'output': lines}
         else:
             row = {'at': loc, 'result': 'failed', 'output': lines}
         rows.append(row)
-        if unasked is None and (row['result'] == 'failed' or row['result'] == 'not reached' and budget is None):
-            unasked = loc
-        elif budget is None and unasked is None:
+        if problem is None and (row['result'] == 'failed' or row['result'] == 'not reached' and budget is None):
+            problem = f'gdb did not ask the hardware for {loc!r}'
+        elif problem is None and row['result'] == 'several addresses' and budget is None:
+            problem = f'{loc!r} resolved to several addresses, a slot each: give one address per --at'
+        elif budget is None and problem is None:
             if row['result'] == 'inserted':
                 inserted += 1
             elif row['result'] == 'refused':
                 budget = {'exactly': inserted}
-    if unasked is not None:
+    if problem is not None:
         budget = None
     elif budget is None:
         budget = {'atLeast': inserted}
     result['locations'], result['budget'] = rows, budget
-    return any(r['result'] != 'inserted' for r in rows), unasked
+    return any(r['result'] != 'inserted' for r in rows), problem
 
 
 def main(argv=None):
@@ -430,6 +442,8 @@ def main(argv=None):
         for e in a.expr + a.at:
             if not e.strip() or '\n' in e:
                 p.error(f'{e!r}: one non-empty line')
+        if len(set(a.at)) != len(a.at):
+            p.error('--at repeated: a location holds one breakpoint slot however often it is given')
         if a.mode == 'budget' and (not a.at or a.expr):
             p.error('budget takes --at locations and no --expr')
         if a.mode == 'inspect' and a.at:
@@ -520,12 +534,20 @@ def main(argv=None):
                 gdb_proc.wait(a.timeout)
             except subprocess.TimeoutExpired:
                 errors.append(f'gdb did not finish within {a.timeout:.0f} s; see {gdb_log}')
+            else:
+                # -batch exits non-zero only when its last command (detach) failed
+                if gdb_proc.returncode < 0:
+                    errors.append(f'gdb was killed by signal {-gdb_proc.returncode}; see {gdb_log}')
+                elif gdb_proc.returncode:
+                    errors.append(f'gdb exited {gdb_proc.returncode} (detach failed); see {gdb_log}')
         result['connect'] = [m.group(0) for m in _CONNECT_RE.finditer(read(log)[mark:])]
     except (ToolError, OSError, Interrupted) as e:
         errors.append(str(e))
     finally:
         armed = False
         stop(gdb_proc)
+    if gdb_proc is not None:
+        result['gdbExit'] = gdb_proc.returncode
     try:
         if server is not None and server.poll() is None:
             result['end'] = tcl.end()
@@ -546,9 +568,11 @@ def main(argv=None):
         if result['backtrace'] is None and not errors:
             errors.append(f'gdb session incomplete (no backtrace); see {gdb_log} and {gdb_err}')
     else:
-        failed, unasked = parse_budget(result, blocks, a.at)
-        if unasked and not errors:
-            errors.append(f'gdb did not ask the hardware for {unasked!r}; see {gdb_log}')
+        failed, problem = parse_budget(result, blocks, a.at)
+        if result.get('gdbExit') != 0:
+            result['budget'] = None    # a gdb that timed out, was interrupted or failed its detach
+        if problem and not errors:
+            errors.append(f'{problem}; see {gdb_log}')
     if a.anchor:
         result['anchor']['sizeAtEnd'] = size_of(a.anchor)
     errors += end_errors(result, log)

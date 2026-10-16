@@ -30,7 +30,7 @@ then often cannot be restored, which fails the run like any other restore failur
 USB-serial port keeps its termios: the USB-serial core does not reset them at hangup).
 
 Exit: 0 captured (an empty capture included); 2 bad usage; 3 the port could not be opened or
-configured, a read failed, or its settings could not be restored.
+configured, a read failed, its settings could not be restored, or an output file failed to close.
 """
 import argparse
 import bisect
@@ -188,6 +188,7 @@ def main(argv=None):
             out.write(chunk)
             out.flush()
             times.write((json.dumps(rec) + '\n').encode())
+            times.flush()
             chunks.append(rec)
             size += len(chunk)
     except Stop as e:
@@ -206,8 +207,11 @@ def main(argv=None):
                     result['terminalRestored'] = False
                     errors.append(f'restoring the port settings: {e}')
             os.close(fd)
-        out.close()
-        times.close()
+        for f in (out, times):
+            try:
+                f.close()
+            except OSError as e:
+                errors.append(f'closing {f.name}: {e}')
     result.update(ended=ended, bytes=size, chunks=len(chunks),
                   firstByteAt=chunks[0]['t'] if chunks else None,
                   baseline='the open' if chunks else 'none: nothing was received')

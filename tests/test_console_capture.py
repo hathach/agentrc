@@ -96,6 +96,49 @@ class ConsoleCaptureTest(unittest.TestCase):
         self.assertIn('reading', out['error'])
         self.assertEqual(out['bytes'], 8)
 
+    def test_each_chunk_time_is_written_as_it_arrives(self):
+        self.feed(b'boot\n', delay=0.2)
+        proc = self.start('--seconds', '10', '--lines', 'leave')
+        self.addCleanup(proc.communicate, timeout=30)
+        self.addCleanup(proc.send_signal, signal.SIGTERM)
+        times = Path(str(self.out) + '.times')
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (times.exists() and times.read_bytes()):
+            time.sleep(0.02)
+        self.assertIsNone(proc.poll())
+        self.assertEqual([json.loads(line)['len'] for line in times.read_text().splitlines()], [5])
+
+    def test_a_failed_close_keeps_the_summary(self):
+        # the .times file stands in for a full disk: its close fails
+        run = f'''
+import errno, importlib.util, sys
+spec = importlib.util.spec_from_file_location('console_capture', {str(SCRIPT)!r})
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+class Full:
+    def __init__(self, f):
+        self.f, self.name = f, f.name
+    def write(self, b):
+        return self.f.write(b)
+    def flush(self):
+        self.f.flush()
+    def close(self):
+        self.f.close()
+        raise OSError(errno.ENOSPC, 'No space left on device')
+def fake_open(path, mode='r', *args, **kw):
+    f = open(path, mode, *args, **kw)
+    return Full(f) if mode == 'xb' and path.endswith('.times') else f
+m.open = fake_open
+sys.exit(m.main(sys.argv[1:]))
+'''
+        r = subprocess.run([sys.executable, '-c', run, '--port', self.port, '--baud', '115200', '--out', str(self.out),
+                            '--seconds', '0.3', '--lines', 'leave'], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertIn('closing', out['error'])
+        self.assertIn('No space left', out['error'])
+        self.assertTrue(out['terminalRestored'])
+
     def test_a_port_that_is_not_a_terminal_fails_with_json(self):
         plain = self.d / 'plain'
         plain.write_bytes(b'')

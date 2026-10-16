@@ -106,6 +106,14 @@ exs = [argv[i + 1] for i, a in enumerate(argv) if a == '-ex']
 state_path = os.environ['FAKE_STATE']
 exprs = json.loads(os.environ.get('FAKE_EXPRS', '{}'))
 budget = int(os.environ.get('FAKE_BUDGET', '99'))
+addresses = json.loads(os.environ.get('FAKE_ADDRESSES', '{}'))
+held = set()
+def die():
+    code = int(os.environ['FAKE_GDB_DIE'])
+    sys.stdout.flush()
+    if code < 0:
+        os.kill(os.getpid(), -code)
+    sys.exit(code)
 def setall(s):
     with open(state_path) as f:
         st = json.load(f)
@@ -140,12 +148,22 @@ for c in exs:
             print(f'Function "{c[7:]}" not defined.')
             continue
         n += 1
-        print(f'Hardware assisted breakpoint {n} at 0x{n:x}: file main.c, line {n}.')
-        if n > budget:
+        addr = addresses.get(c[7:], f'0x{n:x}')
+        if c[7:] in os.environ.get('FAKE_MULTI', '').split(','):
+            held |= {addr, addr + '+'}
+            print(f'Hardware assisted breakpoint {n} at {addr}: main.c:{n}. (2 locations)')
+        else:
+            held.add(addr)
+            print(f'Hardware assisted breakpoint {n} at {addr}: file main.c, line {n}.')
+        if len(held) > budget:
             print(f'Warning:\nCannot insert hardware breakpoint {n}:Remote failure reply: 0E.')
     elif c == 'monitor resume' and not os.environ.get('FAKE_GDB_NO_RESUME'):
         setall('running')
     sys.stdout.flush()
+    if c.startswith(os.environ.get('FAKE_GDB_DIE_AFTER') or '\0'):
+        die()
+if os.environ.get('FAKE_GDB_DIE_AFTER') == 'end':
+    die()
 '''
 
 BOARD = ['--board-cfg', 'board/esp32p4-builtin.cfg', '--adapter-serial', '30:ED:A0:E0:C9:02']
@@ -247,6 +265,40 @@ class EspSessionTest(unittest.TestCase):
         rc, out, err = self.run_cli(self.session('budget', '--at', 'nosuch'), FAKE_UNRESOLVED='nosuch')
         self.assertEqual(rc, 1, err)
         self.assertEqual(out['budget'], {'atLeast': 0})
+
+    def test_a_shared_address_takes_one_slot(self):
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'alias_of_a', '--at', 'c', '--at', 'd'),
+                                    FAKE_BUDGET='2', FAKE_ADDRESSES=json.dumps({'a': '0x40', 'alias_of_a': '0x40'}))
+        self.assertEqual(rc, 1, err)
+        self.assertEqual([r['result'] for r in out['locations']], ['inserted', 'duplicate', 'inserted', 'refused'])
+        self.assertEqual(out['locations'][1]['address'], '0x40')
+        self.assertEqual(out['budget'], {'exactly': 2})
+
+    def test_a_location_with_several_addresses_is_no_budget(self):
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'inlined'), FAKE_MULTI='inlined')
+        self.assertEqual(rc, 3, err)
+        self.assertIsNone(out['budget'])
+        self.assertEqual(out['locations'][1]['result'], 'several addresses')
+        self.assertIn('several addresses', out['error'])
+
+    def test_a_gdb_that_fails_its_detach_or_dies_is_no_result(self):
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'b'),
+                                    FAKE_GDB_DIE_AFTER='end', FAKE_GDB_DIE='1')
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(out['gdbExit'], 1)
+        self.assertIsNone(out['budget'])
+        self.assertIn('gdb exited 1', out['error'])
+        self.out.rename(self.d / 'out1')
+        rc, out, err = self.run_cli(self.session('inspect', '--expr', 'x'), FAKE_EXPRS=json.dumps({'x': '42'}),
+                                    FAKE_GDB_DIE_AFTER='end', FAKE_GDB_DIE=str(-signal.SIGSEGV))
+        self.assertEqual(rc, 3, err)
+        self.assertIn(f'killed by signal {signal.SIGSEGV}', out['error'])
+        self.out.rename(self.d / 'out2')
+        rc, out, err = self.run_cli(self.session('inspect', '--expr', 'x'), FAKE_EXPRS=json.dumps({'x': '42'}),
+                                    FAKE_GDB_DIE_AFTER='echo ESPS BT-END', FAKE_GDB_DIE=str(-signal.SIGKILL))
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(out['exprs'], [{'expr': 'x', 'error': 'not reached'}])
+        self.assertEqual(out['end']['cores'], {'chip.cpu0': 'running', 'chip.cpu1': 'running'})
 
     def test_removal_errors_at_the_end_fail_the_run(self):
         rc, out, err = self.run_cli(self.session('inspect'), FAKE_RBP_REPLY='{chip.cpu0 rbp: failed}')
@@ -380,6 +432,7 @@ class EspSessionTest(unittest.TestCase):
                  (self.session('inspect')[:-2], 'or --no-anchor'),
                  (self.session('inspect', '--usb-location', '5-1'), 'exactly one selector'),
                  (self.session('budget'), 'budget takes --at'),
+                 (self.session('budget', '--at', 'main', '--at', 'main'), '--at repeated'),
                  (self.session('inspect', '--at', 'x'), '--at is for budget'),
                  ([sys.executable, str(SCRIPT), 'recover', '--out', str(self.out), *BOARD, '--rtos', 'none'],
                   'recover takes the route only'),
