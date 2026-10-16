@@ -62,6 +62,7 @@ non-zero or by a signal leaves no budget), the run was interrupted, a core was l
 is unchecked or failed, or the shutdown failed.
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -507,6 +508,18 @@ def main(argv=None):
             armed = False
             raise Interrupted(f'interrupted by signal {signum}')
 
+    @contextlib.contextmanager
+    def held():
+        """A signal inside is acted on once the block has recorded what it started."""
+        nonlocal armed
+        armed = False
+        try:
+            yield
+        finally:
+            armed = True
+        if signals:
+            raise Interrupted(f'interrupted by signal {signals[0]}')
+
     server = gdb_proc = None
     gdb_log, gdb_err = os.path.join(a.out, 'gdb.log'), os.path.join(a.out, 'gdb.err')
     errors = []
@@ -514,18 +527,13 @@ def main(argv=None):
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, on_signal)
         open(log, 'w').close()
-        armed = False    # a signal now is acted on once the server and its receipt are recorded
-        try:
+        with held():
             server = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                       stdin=subprocess.DEVNULL, start_new_session=True)
             receipt_rec = {'pid': server.pid, 'startTime': start_time(server.pid), 'argv': cmd, 'ports': ports,
                            'token': token, 'log': os.path.abspath(log), 'closed': False,
                            'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
             write_receipt(receipt, receipt_rec)
-        finally:
-            armed = True
-        if signals:
-            raise Interrupted(f'interrupted by signal {signals[0]}')
         wait_for(server, log, rf'Listening on port {ports[0]} for gdb connections', time.monotonic() + 30)
         text = read(log)
         result['examination'] = {'log': [m.group(0) for m in _EXAMINE_RE.finditer(text)], 'cores': tcl.states()}
@@ -534,14 +542,9 @@ def main(argv=None):
         for c in gdb_commands(a.mode, ports[0], a.expr, a.at):
             argv += ['-ex', c]
         with open(gdb_log, 'w') as out, open(gdb_err, 'w') as err:
-            armed = False    # likewise for gdb, so that stop() reaches it
-            try:
+            with held():
                 gdb_proc = subprocess.Popen(argv, stdout=out, stderr=out if a.mode == 'budget' else err,
                                             stdin=subprocess.DEVNULL)
-            finally:
-                armed = True
-            if signals:
-                raise Interrupted(f'interrupted by signal {signals[0]}')
             try:
                 gdb_proc.wait(a.timeout)
             except subprocess.TimeoutExpired:
