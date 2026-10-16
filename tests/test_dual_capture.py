@@ -174,17 +174,13 @@ class DualCaptureTest(unittest.TestCase):
     def test_a_signal_while_a_side_starts_still_stops_it(self):
         # SIGTERM lands inside Popen, after the fork: the side must be recorded and stopped, not leaked
         pidfile = self.d / 'started.pid'
-        driver = (f'import os, signal, subprocess, sys\nsys.path.insert(0, {str(SCRIPT.parent)!r})\n'
-                  'import dual_capture\nreal = subprocess.Popen\n'
-                  'def popen(*a, **k):\n'
-                  '    p = real(*a, **k)\n'
-                  f'    open({str(pidfile)!r}, "w").write(str(p.pid))\n'
-                  '    os.kill(os.getpid(), signal.SIGTERM)\n'
-                  '    return p\n'
-                  'dual_capture.subprocess.Popen = popen\nsys.exit(dual_capture.main(sys.argv[1:]))')
-        proc = subprocess.run([sys.executable, '-c', driver, '--a', self.side('host', 'import time; time.sleep(60)'),
-                               '--b', self.side('target', 'pass'), '--timeout', '30', '--grace', '1',
-                               '--out', str(self.out)], capture_output=True, text=True, timeout=60)
+        popen = ('def popen(*a, **k):\n'
+                 '    p = real(*a, **k)\n'
+                 f'    open({str(pidfile)!r}, "w").write(str(p.pid))\n'
+                 '    os.kill(os.getpid(), signal.SIGTERM)\n'
+                 '    return p\n')
+        proc = self.driver(popen, '--a', self.side('host', 'import time; time.sleep(60)'),
+                           '--b', self.side('target', 'pass'), '--timeout', '30', '--grace', '1')
         self.assertEqual(proc.returncode, 1, proc.stderr)
         out = json.loads(proc.stdout)
         self.assertEqual(out['interrupted'], [15])
