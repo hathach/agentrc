@@ -31,7 +31,7 @@ slept by itself, but a J-Link session does not leave that state alone: it halts 
 unless told `exec SetRestartOnClose = 0` (V9.78, verified 2026-10-16 stm32f407disco: DFSR.HALTED set after every plain
 session; a core found halted ran at the next session; with the setting, a running core stayed halted). An openocd HIL
 board (CMSIS-DAP) is sampled through `probe_state.py`'s OpenOCD session, which also reports the other cores' DHCSR.
-`--halt-samples N` is the explicit halting fallback for a single-core openocd board with no usable PCSR, its PCs
+`--halt-samples N` runs `probe_state.py`'s halting fallback (below) N times for a core with no usable PCSR, its PCs
 reported apart as halt reads (`--help`). ST-Link entries carry no OpenOCD configuration and are not covered.
 
 ## Probe state — DHCSR anchor, PCSR samples, image read-back
@@ -46,16 +46,18 @@ python3 <skill dir>/scripts/probe_state.py --hil-config <file> --board <name> [-
   [--verify <flashed.elf> | --verify <fw.bin> --base <flash addr>] \
   [--elf <flashed.elf> --read <symbol> ...] [--save <addr> <len> <new file> ...]
 #   exit 0 observed, 1 verify mismatch, 2 usage, 3 probe/tool failed, capture or save incomplete, wrong probe
-#   connected, core not M-profile, or a halt read left the core halted
+#   connected, core not M-profile, or the halting fallback failed or met a multi-core target
 ```
 
 - The script issues no configuration write; the connect does (PC-sampling above: the tools set TRCENA, OpenOCD also
   DHCSR.C_DEBUGEN), so `demcr` is the tool's value, not the firmware's. Each J-Link session also halts the core as it
   closes and restarts it (PC-sampling above), so a core it finds halted is running afterwards. Otherwise it halts only
-  with `--allow-halt`, when no sample was usable from a running core; over OpenOCD it refuses that on a multi-core
-  target, where the SMP halt stops every core and the resume fails for a core OpenOCD never polled, leaving it halted
-  (OpenOCD 0.12.0+dev-g0ce743125, `cortex_m_restore_smp`; RP2040 core1, verified 2026-10-16), and OpenOCD's resume error
-  is unreliable there in both directions, so judge each core by its DHCSR. Reads use J-Link `savebin` and OpenOCD
+  in the halting fallback, `--allow-halt` (and `pc_sample.py --halt-samples`), when no sample was usable from a core
+  found running: OpenOCD boards only (J-Link Commander cannot branch, so it could not leave a core it finds halted
+  untouched), single core only (an SMP halt stops every core; refused from the first session's core listing), a core
+  halted by the time the halt session starts left alone, and a session that dies past its guards followed by one that
+  polls the core and resumes it (`--help`). OpenOCD's halt and resume errors are unreliable in both directions, so each
+  core is judged by its DHCSR. Reads use J-Link `savebin` and OpenOCD
   `dump_image`, never `verify_image`, whose checksum path writes its CRC loader into the target's work area first
   (`armv7m_checksum_memory`), even on a running core.
 - `--budget`, `--read` and `--save` follow the rules in `--help` (which registers, which symbols, which address

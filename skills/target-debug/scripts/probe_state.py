@@ -28,10 +28,16 @@ own vector-catch bits (cortex_m.c in 0.12.0+dev-g0ce743125), and J-Link Commande
 sets TRCENA at connect. Through them the DEMCR read is the tool's value and the
 pre-connect state of those bits is not observable. DWT_PCSR is read without halting, but a
 J-Link session halts the core as it closes and restarts it (DFSR.HALTED is set after each
-session, V9.78), so a core found halted is running afterwards. With --allow-halt and no
-usable sample from a core that was running, a second session halts, reads PC and resumes;
-over OpenOCD that is refused on a multi-core target, whose SMP halt stops every core and
-whose resume fails for a core OpenOCD never polled.
+session, V9.78), so a core found halted is running afterwards.
+
+--allow-halt is the halting fallback, shared with pc_sample.py --halt-samples: with no
+usable sample from a core both DHCSR reads found running, a second session halts it, reads
+PC and resumes. It is OpenOCD-only: J-Link Commander cannot branch, so it could not leave a
+core it finds halted untouched, and the flag is refused for a J-Link board. A multi-core
+target is refused before that session, since an SMP halt stops every core. A core found
+halted when that session starts is reported and not touched. A session that fails, times
+out or is stopped by SIGINT or SIGTERM after its guards passed is followed by one that
+polls the core and resumes it when it was left halted.
 
 --budget reads FP_CTRL (BP_CTRL on ARMv6-M) and DWT_CTRL: NUM_CODE is the hardware
 breakpoint count, NUMCOMP the watchpoint comparator count. NUMCOMP is reported only
@@ -67,7 +73,8 @@ PROBE_STATE_JLINK_EXE and PROBE_STATE_OPENOCD name the tools when they are not
 
 Exit: 0 observed; 1 --verify found a difference; 2 bad usage; 3 the probe or tool
 failed, the capture or a save was incomplete, the connected probe is not the one
-asked for, the core is not M-profile, or a halt read left the core halted.
+asked for, the core is not M-profile, or the halting fallback failed or was refused for
+a multi-core target.
 """
 import argparse
 import collections
@@ -78,6 +85,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -99,7 +107,6 @@ M_PROFILE_ARCH = {0xC: 'armv6-m or armv8-m baseline', 0xF: 'armv7-m or armv8-m m
 ORDINARY_MEMORY = ((0x00000000, 0x1FFFFFFF, 'Code'), (0x20000000, 0x3FFFFFFF, 'SRAM'), (0x60000000, 0x9FFFFFFF, 'RAM'))
 RP2040_XIP_REGION = (0x10000000, 0x1FFFFFFF)  # RP2040 datasheet 2.2.2, Table 15
 MAX_READ = 64 * 1024
-_JLINK_PC_RE = re.compile(r'\bPC = ([0-9A-Fa-f]{8})')
 _JLINK_SN_RE = re.compile(r'\bS/N: *(\d+)')
 _JLINK_VTREF_RE = re.compile(r'\bVTref=([0-9.]+)V')
 _OCD_READ_RE = re.compile(r'^R (\w+) (0x[0-9a-fA-F]+)$', re.M)
@@ -115,6 +122,9 @@ STT_OBJECT, STT_FUNC = 1, 2
 SHN_UNDEF, SHN_ABS, SHN_COMMON = 0, 0xFFF1, 0xFFF2
 SHT_PROGBITS, SHT_NOBITS = 1, 8
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
+HALT_WAIT_MS = 500    # --allow-halt's wait for its one halt, pc_sample's --halt-timeout-ms default
+NO_JLINK_HALT = ('the halting fallback is OpenOCD-only: J-Link Commander cannot branch, so it could not leave '
+                 'a core it finds halted untouched')
 
 
 def dhcsr_state(v):
@@ -318,6 +328,15 @@ def compare(expected, actual):
     return next((i for i in range(n) if expected[i] != actual[i]), n)
 
 
+class HaltRefused(ToolError):
+    """The halting fallback halted nothing: reason 'halted' (the core was halted when its session started,
+    dhcsr the value read) or 'multicore'."""
+
+    def __init__(self, msg, reason, dhcsr=None):
+        super().__init__(msg)
+        self.reason, self.dhcsr = reason, dhcsr
+
+
 def tool(env, posix, windows=None):
     name = os.environ.get(env) or (windows if os.name == 'nt' and windows else posix)
     exe = shutil.which(name)
@@ -489,17 +508,6 @@ class JLink:
             out.append(int(v, 16))
         return out
 
-    def halt_read(self, timeout):
-        """Halt, read PC, resume. Commander has no conditionals, so `g` also resumes a
-        core that halted by itself since the first session: dhcsrBefore says so."""
-        text = run(self.cmd, timeout, f'mem32 {DHCSR:X}, 1\nh\ng\nmem32 {DHCSR:X}, 1\nqc\n')
-        self._identify(text)
-        reads = [int(v, 16) for a, v in _MEM32_RE.findall(text) if int(a, 16) == DHCSR]
-        pc = _JLINK_PC_RE.search(text)
-        if len(reads) != 2 or not pc:
-            raise ToolError(f'incomplete halt read; last output:\n{tail(text)}')
-        return reads[0], int(pc.group(1), 16), reads[1], True
-
 
 class OpenOCD:
     REG = JLink.REG
@@ -528,32 +536,12 @@ class OpenOCD:
         return ('foreach t [target names] {if {$t ne [target current]} '
                 f'{{echo [format "T{tag} %s 0x%08x" $t [$t read_memory 0x{DHCSR:08x} 32 1]]}}}}')
 
-    @staticmethod
-    def script(body):
-        return ('init\nproc rd {name addr} {echo [format "R %s 0x%08x" $name [read_memory $addr 32 1]]}\n'
-                f'if {{[catch {{\n{body}\n}} err]}} {{echo "ERROR [string map {{"\\n" " | "}} $err]"}}\nshutdown')
+    RD = 'proc rd {name addr} {set v [read_memory $addr 32 1]; echo [format "R %s 0x%08x" $name $v]; return $v}'
 
-    # A failed halt or PC read still resumes a core found running, then reads DHCSR, before the
-    # error reaches the outer catch. A multi-core target is refused: an SMP halt stops every core
-    # and the resume cannot restore one OpenOCD never polled halted, leaving it stopped
-    # (cortex_m_smp_halt_all, cortex_m_restore_smp in 0.12.0+dev-g0ce743125; RP2040 core1, 2026-10-16).
-    HALT_READ = (f'set d [read_memory 0x{DHCSR:08x} 32 1]\necho [format "R DHCSR 0x%08x" $d]\n'
-                 'if {[llength [target names]] > 1} {\n'
-                 '  error "refused: [llength [target names]] cores ([target names]); an SMP halt stops them all '
-                 'and OpenOCD cannot resume a core it has not polled"\n'
-                 '}\n'
-                 'set was [expr {$d & 0x20000 ? "halted" : "running"}]\n'
-                 'set rc [catch {\n'
-                 '  if {$was eq "running"} {halt}\n'
-                 '  echo [format "R PC 0x%08x" [dict get [get_reg pc] pc]]\n'
-                 '} perr]\n'
-                 'set rrc [catch {if {$was eq "running"} {resume}} rerr]\n'
-                 f'set after [read_memory 0x{DHCSR:08x} 32 1]\n'
-                 'echo [format "R DHCSR 0x%08x" $after]\n'
-                 'set msg {}\n'
-                 'if {$rc} {append msg "halt/pc read: [expr {$perr eq {} ? {failed without a message} : $perr}]; "}\n'
-                 'if {$rrc} {append msg "resume: [expr {$rerr eq {} ? {failed without a message} : $rerr}]; "}\n'
-                 'if {$msg ne {}} {error [format "%sfound %s, DHCSR after 0x%08x" $msg $was $after]}')
+    @classmethod
+    def script(cls, body):
+        return (f'init\n{cls.RD}\n'
+                f'if {{[catch {{\n{body}\n}} err]}} {{echo "ERROR [string map {{"\\n" " | "}} $err]"}}\nshutdown')
 
     def batch(self, body, timeout):
         text = run(self.cmd + ['-c', self.script(body)], timeout)
@@ -590,13 +578,106 @@ class OpenOCD:
         self.reset_detected = 'external reset detected' in text
         return [v for _, v in reads]
 
-    def halt_read(self, timeout):
-        """Halt and resume only a core OpenOCD finds running; a halted one is read as is."""
-        text, reads = self.batch(self.HALT_READ, timeout)
-        if [n for n, _ in reads] != ['DHCSR', 'PC', 'DHCSR']:
-            raise ToolError(f'incomplete halt read; last output:\n{tail(text)}')
-        before, pc, after = (v for _, v in reads)
-        return before, pc, after, not dhcsr_state(before)['halted']
+    @staticmethod
+    def halt_tcl(n, halt_timeout_ms, interval_ms):
+        """Halt, read PC, resume, n times on a single running core; judged by DHCSR, since OpenOCD's
+        halt and resume errors are not reliable either way on these targets. GUARDED is printed once
+        the guards passed, before the first halt: openocd flushes each echo at once (log_puts in log.c)."""
+        pause = f'  sleep {interval_ms}\n' if interval_ms else ''
+        return (f'set d [rd DHCSR 0x{DHCSR:08x}]\n'
+                'if {[llength [target names]] > 1} {\n'
+                '  error "refused multicore: [llength [target names]] cores ([target names]); an SMP halt stops '
+                'every core"\n'
+                '}\n'
+                'if {$d & 0x20000} {error [format "refused halted: the core is halted now (DHCSR 0x%08x)" $d]}\n'
+                'echo GUARDED\n'
+                f'for {{set i 0}} {{$i < {n}}} {{incr i}} {{\n'
+                f'  if {{[catch {{halt {halt_timeout_ms}; echo [format "H 0x%08x" [dict get [get_reg pc] pc]]}} e]}} '
+                '{\n'
+                '    catch {resume}\n'
+                f'    set a [read_memory 0x{DHCSR:08x} 32 1]\n'
+                '    error [format "halt %d: %s; DHCSR after a resume 0x%08x" $i '
+                '[expr {$e eq {} ? {failed without a message} : $e}] $a]\n'
+                '  }\n'
+                '  catch {resume}\n'
+                f'  set a [read_memory 0x{DHCSR:08x} 32 1]\n'
+                '  if {$a & 0x20000} {\n'
+                '    error [format "resume %d failed: the core is left halted (DHCSR 0x%08x)" $i $a]\n'
+                '  }\n'
+                f'{pause}'
+                '}\n'
+                f'rd DHCSR 0x{DHCSR:08x}')
+
+    # After a halting session that failed or was killed past its guards: resume a single core left halted
+    # (it was running when that session began), and report what the core is doing. A new session must
+    # poll before `resume`, which refuses a target whose state is not yet known to be halted.
+    RECOVER_TCL = ('if {[llength [target names]] > 1} {error "not touched: [llength [target names]] cores"}\n'
+                   f'set d [rd DHCSR 0x{DHCSR:08x}]\n'
+                   'if {$d & 0x20000} {[target current] arp_poll; catch {resume}}\n'
+                   f'rd DHCSR 0x{DHCSR:08x}')
+
+    def recover(self, timeout):
+        """The recovery outcome, as the tail of a failure message."""
+        try:
+            _, reads = self.batch(self.RECOVER_TCL, timeout)
+        except ToolError as e:
+            return f'; the recovery session failed too ({e}): check the core with probe_state.py'
+        dhcsr = [v for name, v in reads if name == 'DHCSR']
+        if len(dhcsr) != 2:
+            return '; the recovery session read no DHCSR: check the core with probe_state.py'
+        first, last = (v & (1 << 17) for v in dhcsr)
+        now = f"{'halted' if last else 'running'} (DHCSR 0x{dhcsr[1]:08x})"
+        return f'; the core was left halted, resumed: now {now}' if first else f'; the core is {now}'
+
+    def halt_reads(self, n, halt_timeout_ms, interval_ms, timeout):
+        """(pcs, DHCSR before, DHCSR after) from n halt reads after an observe(). Raises HaltRefused when it
+        halted nothing, else ToolError, after a recovery session when the loop may have started."""
+        if self.others:
+            names = ' '.join([self.current, *self.others])
+            raise HaltRefused(f'halting fallback refused: {len(self.others) + 1} cores ({names}); an SMP halt '
+                              f'stops every core', 'multicore')
+        signals, stopping = [], True
+
+        def on_signal(signum, _frame):
+            # nothing is raised here: the halting session is killed and fails with its output, which
+            # decides the recovery; a signal during the recovery is only recorded
+            signals.append(signum)
+            if stopping:
+                stop_running()
+
+        previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            failure, text = None, ''
+            try:
+                text, reads = self.batch(self.halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
+                pcs = [int(v, 16) for v in re.findall(r'^H 0x([0-9a-f]{8})$', text, re.M)]
+                dhcsr = [v for name, v in reads if name == 'DHCSR']
+                if len(pcs) != n or len(dhcsr) != 2:
+                    raise ToolError(f'{len(pcs)}/{n} halt reads; last output:\n{tail(text)}')
+            except ToolError as e:
+                failure, text = e, getattr(e, 'text', text)
+            stopping = False
+            if failure is None and not signals:
+                return pcs, dhcsr[0], dhcsr[1]
+            refused = re.search(r'^ERROR refused (halted|multicore): ', text, re.M)
+            if refused and not signals:
+                first = re.search(r'^R DHCSR (0x[0-9a-fA-F]+)$', text, re.M)
+                raise HaltRefused(f'halting fallback: {failure}', refused.group(1),
+                                  first and int(first.group(1), 16)) from failure
+            what = f'interrupted by signal {signals[0]}' if signals else str(failure)
+            if failure is None:
+                after = ''    # the loop finished, resume included, before the signal could stop it
+            elif re.search(r'^GUARDED$', text, re.M):
+                after = self.recover(30)
+            elif refused:
+                after = ''
+            else:
+                after = ('; it stopped before its guards passed, so it halted nothing: check the core with '
+                         'probe_state.py')
+            raise ToolError(f'halting fallback: {what}{after}') from failure
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
 
 
 def resolve(a, p):
@@ -721,6 +802,8 @@ def main(argv=None):
     except ToolError as e:
         print(json.dumps({'board': a.board, 'error': str(e)}))
         return 3
+    if a.allow_halt and route == 'jlink':
+        p.error(f'--allow-halt is for openocd boards: {NO_JLINK_HALT}')
     rp2040 = is_rp2040(ident)
     reads = []
     try:
@@ -823,13 +906,17 @@ def main(argv=None):
             result['haltRead'] = {'performed': False, 'reason': 'PCSR sampled' if running else 'core halted'}
         else:
             try:
-                before, pc, after, resumed = backend.halt_read(timeout)
+                (pc,), before, after = backend.halt_reads(1, HALT_WAIT_MS, 0, timeout)
+            except HaltRefused as e:
+                if e.reason != 'halted':
+                    return fail(str(e))
+                result['haltRead'] = {'performed': False, 'reason': 'core halted at the halt session',
+                                      'dhcsr': dhcsr_state(e.dhcsr)}
             except ToolError as e:
                 return fail(str(e))
-            result['haltRead'] = {'performed': True, 'pc': f'0x{pc:08x}', 'resumed': resumed,
-                                  'dhcsrBefore': dhcsr_state(before), 'dhcsrAfter': dhcsr_state(after)}
-            if dhcsr_state(after)['halted'] and not dhcsr_state(before)['halted']:
-                return fail('the halt read left a core it found running halted')
+            else:
+                result['haltRead'] = {'performed': True, 'pc': f'0x{pc:08x}', 'dhcsrBefore': dhcsr_state(before),
+                                      'dhcsrAfter': dhcsr_state(after)}
     print(json.dumps(result))
     return rc
 

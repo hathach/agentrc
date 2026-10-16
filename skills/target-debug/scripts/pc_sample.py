@@ -12,16 +12,11 @@ not `JLinkExe`, `JLink.exe` on Windows, on PATH). A HIL board flashed over openo
 sampled through probe_state.py's OpenOCD session (the file next to this one; its
 PROBE_STATE_OPENOCD names openocd), which also reports the other cores' DHCSR.
 
---halt-samples N (openocd boards only) is the fallback for a core without a usable PCSR:
-when the samples gave none from a core found running, a second session re-reads DHCSR and,
-on a single-core target that is running, halts it N times (each halt waits up to
---halt-timeout-ms), reads PC and resumes, stopping at the first halt or resume that fails
-and leaving the core resumed when it can (a session that fails, times out or is stopped by
-SIGINT or SIGTERM after its guards passed is followed by one that resumes a core it left
-halted; signals during that one are ignored). Those PCs are counted apart from the observed
-ones. A multi-core target is refused: an SMP halt stops every core and OpenOCD cannot
-resume a core it has not polled. J-Link Commander cannot stop on a failed resume, so the
-J-Link route has no fallback.
+--halt-samples N is probe_state.py's halting fallback (its --allow-halt, whose docstring
+gives the rules: OpenOCD only, single core, recovery) run N times: when the samples gave no
+usable PC from a core both DHCSR reads found running, a second session halts it N times
+(each halt waits up to --halt-timeout-ms), reads PC and resumes, stopping at the first halt
+or resume that fails. Those PCs are counted apart from the observed ones.
 
 Reads DEMCR first and refuses the histogram while DEMCR.TRCENA (DWTENA on
 ARMv6-M) is 0 (techniques.md, PC-sampling). Reads DHCSR before and after
@@ -38,7 +33,6 @@ import os
 import re
 import shlex
 import shutil
-import signal
 import subprocess
 import sys
 
@@ -125,98 +119,6 @@ def sample_openocd(backend, samples, interval_ms, timeout):
         raise ToolError(f"DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{vals['demcr']:08x}): DWT_PCSR samples "
                         f'are not valid while trace is disabled; enable trace from a debugger session first')
     return vals['pcs'], [vals['dhcsr0'], vals['dhcsr1']], backend.others
-
-
-def halt_tcl(n, halt_timeout_ms, interval_ms):
-    """Halt, read PC, resume, n times on a single running core; judged by DHCSR, since
-    OpenOCD's halt and resume errors are not reliable either way on these targets."""
-    pause = f'  sleep {interval_ms}\n' if interval_ms else ''
-    return (f'set d [read_memory 0x{DHCSR:08x} 32 1]\necho [format "R DHCSR 0x%08x" $d]\n'
-            'if {[llength [target names]] > 1} {\n'
-            '  error "refused: [llength [target names]] cores ([target names]); an SMP halt stops them all '
-            'and OpenOCD cannot resume a core it has not polled"\n'
-            '}\n'
-            'if {$d & 0x20000} {error [format "refused: the core is halted now (DHCSR 0x%08x)" $d]}\n'
-            'echo GUARDED\n'
-            f'for {{set i 0}} {{$i < {n}}} {{incr i}} {{\n'
-            f'  if {{[catch {{halt {halt_timeout_ms}; echo [format "H 0x%08x" [dict get [get_reg pc] pc]]}} e]}} {{\n'
-            '    catch {resume}\n'
-            f'    set a [read_memory 0x{DHCSR:08x} 32 1]\n'
-            '    error [format "halt %d: %s; DHCSR after a resume 0x%08x" $i '
-            '[expr {$e eq {} ? {failed without a message} : $e}] $a]\n'
-            '  }\n'
-            '  catch {resume}\n'
-            f'  set a [read_memory 0x{DHCSR:08x} 32 1]\n'
-            '  if {$a & 0x20000} {error [format "resume %d failed: the core is left halted (DHCSR 0x%08x)" $i $a]}\n'
-            f'{pause}'
-            '}\n'
-            f'echo [format "R DHCSR 0x%08x" [read_memory 0x{DHCSR:08x} 32 1]]')
-
-
-# After a halting session that failed or was killed mid-loop: resume a single core left halted
-# (it was running when that session began), and report what the core is doing. A new session
-# must poll before `resume`, which refuses a target whose state is not yet known to be halted.
-RECOVER_TCL = (f'if {{[llength [target names]] > 1}} {{error "not touched: [llength [target names]] cores"}}\n'
-               f'set d [read_memory 0x{DHCSR:08x} 32 1]\necho [format "R DHCSR 0x%08x" $d]\n'
-               'if {$d & 0x20000} {[target current] arp_poll; catch {resume}}\n'
-               f'echo [format "R DHCSR 0x%08x" [read_memory 0x{DHCSR:08x} 32 1]]')
-
-
-def recover(backend, timeout):
-    try:
-        _, reads = backend.batch(RECOVER_TCL, timeout)
-    except ToolError as e:
-        return f'; the recovery session failed too ({e}): check the core with probe_state.py'
-    dhcsr = [v for name, v in reads if name == 'DHCSR']
-    if len(dhcsr) != 2:
-        return '; the recovery session read no DHCSR: check the core with probe_state.py'
-    first, last = (v & (1 << 17) for v in dhcsr)
-    now = f"{'halted' if last else 'running'} (DHCSR 0x{dhcsr[1]:08x})"
-    return f'; the core was left halted, resumed: now {now}' if first else f'; the core is {now}'
-
-
-def halt_samples(backend, n, halt_timeout_ms, interval_ms, timeout):
-    """(pcs, [dhcsr before, after]) from halt reads; raises ToolError on a refusal or failure,
-    after a recovery session when the loop may have started."""
-    ps = probe_state_module()
-    signals, stopping = [], True
-
-    def on_signal(signum, _frame):
-        # nothing is raised here: the halting session is killed and fails with its output, which
-        # decides the recovery; a signal during the recovery is only recorded
-        signals.append(signum)
-        if stopping:
-            ps.stop_running()
-
-    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
-    try:
-        failure = None
-        try:
-            text, reads = backend.batch(halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
-        except ToolError as e:
-            failure, text = e, getattr(e, 'text', '')
-        stopping = False
-        if failure is not None or signals:
-            what = f'interrupted by signal {signals[0]}' if signals else str(failure)
-            # recover only a core this session showed running on a single-core target before halting it;
-            # openocd flushes each echo at once (log_puts in log.c), so GUARDED is out before the first halt
-            if failure is None:
-                after = ''    # the loop finished, resume included, before the signal could stop it
-            elif re.search(r'^GUARDED$', text, re.M):
-                after = recover(backend, 30)
-            elif str(failure).startswith('openocd: refused:'):
-                after = ''
-            else:
-                after = '; it stopped before its guards passed, so it halted nothing: check the core with probe_state.py'
-            raise ToolError(f'halting fallback: {what}{after}') from failure
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-    pcs = [int(v, 16) for v in re.findall(r'^H 0x([0-9a-f]{8})$', text, re.M)]
-    dhcsr = [v for name, v in reads if name == 'DHCSR']
-    if len(pcs) != n or len(dhcsr) != 2:
-        raise ToolError(f'halting fallback: {len(pcs)}/{n} halt reads; last output:\n{ps.tail(text)}')
-    return pcs, dhcsr
 
 
 def symbolize(addr2line, elf, pcs, timeout):
@@ -374,7 +276,7 @@ def main(argv=None):
     if a.halt_samples < 0 or a.halt_timeout_ms <= 0:
         p.error('--halt-samples must be non-negative, --halt-timeout-ms positive')
     if a.halt_samples and backend is None:
-        p.error('--halt-samples is for openocd boards: J-Link Commander cannot stop on a failed resume')
+        p.error(f'--halt-samples is for openocd boards: {probe_state_module().NO_JLINK_HALT}')
     if backend is None:
         if not (a.probe and a.device):
             p.error('need --probe and --device (or --hil-config with --board)')
@@ -404,11 +306,11 @@ def main(argv=None):
         if a.raw:
             with open(a.raw, 'w') as f:
                 f.writelines(f'{pc:08x}\n' for pc in pcs)
-        found_running = not dhcsr[0] & (1 << 17)
+        found_running = not (dhcsr[0] | dhcsr[1]) & (1 << 17)
         if a.halt_samples and found_running and not any(pc not in (0, SENTINEL) for pc in pcs):
             try:
-                halted_pcs, halted_dhcsr = halt_samples(backend, a.halt_samples, a.halt_timeout_ms,
-                                                        a.interval_ms, halt_timeout)
+                halted_pcs, *halted_dhcsr = backend.halt_reads(a.halt_samples, a.halt_timeout_ms, a.interval_ms,
+                                                               halt_timeout)
             except ToolError as e:
                 fallback_error = str(e)
         wanted = {pc for pc in pcs + halted_pcs if pc not in (0, SENTINEL)}
