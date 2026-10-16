@@ -56,10 +56,10 @@ Output: one JSON object on stdout; <out> keeps openocd.log, gdb.log (values), gd
 and monitor output; budget writes both into gdb.log to keep their order) and receipt.json.
 
 Exit: 0 done and every core running at the end; 1 done, but an expression failed or a budget
-location was refused (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a budget
-location gdb could not ask about or resolved to several addresses included; gdb exiting non-zero
-or by a signal leaves no budget), the run was interrupted, a core was left halted, removal is
-unchecked or failed, or the shutdown failed.
+location was refused or unresolved (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a
+budget location gdb could not ask about or resolved to several addresses included; gdb exiting
+non-zero or by a signal leaves no budget), the run was interrupted, a core was left halted, removal
+is unchecked or failed, or the shutdown failed.
 """
 import argparse
 import json
@@ -381,7 +381,7 @@ def parse_budget(result, blocks, locations):
     elif budget is None:
         budget = {'atLeast': inserted}
     result['locations'], result['budget'] = rows, budget
-    return any(r['result'] != 'inserted' for r in rows), problem
+    return any(r['result'] not in ('inserted', 'duplicate') for r in rows), problem
 
 
 def main(argv=None):

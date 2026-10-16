@@ -273,6 +273,12 @@ class EspSessionTest(unittest.TestCase):
         self.assertEqual([r['result'] for r in out['locations']], ['inserted', 'duplicate', 'inserted', 'refused'])
         self.assertEqual(out['locations'][1]['address'], '0x40')
         self.assertEqual(out['budget'], {'exactly': 2})
+        self.out.rename(self.d / 'out1')
+        rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'a'), FAKE_BUDGET='4',
+                                    FAKE_ADDRESSES=json.dumps({'a': '0x40'}))
+        self.assertEqual(rc, 0, err)
+        self.assertEqual([r['result'] for r in out['locations']], ['inserted', 'duplicate'])
+        self.assertEqual(out['budget'], {'atLeast': 1})
 
     def test_a_location_with_several_addresses_is_no_budget(self):
         rc, out, err = self.run_cli(self.session('budget', '--at', 'a', '--at', 'inlined'), FAKE_MULTI='inlined')
