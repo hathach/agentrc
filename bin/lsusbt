@@ -89,7 +89,8 @@ fi
 # Build a bus:dev -> serial map from sysfs (the `serial` file only exists when the
 # device actually reports a serial number). Numbers here are unpadded ("1", "11").
 declare -A SERIAL
-for d in "${LSUSBT_SYSFS:-/sys/bus/usb/devices}"/*/; do  # tests point it at a fake tree
+sysfs=${LSUSBT_SYSFS:-/sys/bus/usb/devices}  # tests point it at a fake tree
+for d in "$sysfs"/*/; do
   [ -f "$d/serial" ] || continue
   read -r b < "$d/busnum" 2>/dev/null || continue
   read -r n < "$d/devnum" 2>/dev/null || continue
@@ -99,7 +100,10 @@ done
 # One plain `lsusb` for every name: `lsusb -s` per device rescans the bus each time,
 # 20 s for a 60-device rig. Keys are unpadded like SERIAL's.
 declare -A NAME
-names=$(lsusb) || { echo "lsusbt: cannot read device names from lsusb" >&2; exit 1; }
+# lsusb exits 1 both on failure and when it finds no device; an empty sysfs is the latter.
+if ! names=$(lsusb) && compgen -G "$sysfs/*" >/dev/null; then
+  echo "lsusbt: cannot read device names from lsusb" >&2; exit 1
+fi
 re_name='^Bus ([0-9]+) Device ([0-9]+): ID [0-9a-fA-F]{4}:[0-9a-fA-F]{4} ?(.*)$'
 while IFS= read -r l; do
   [[ $l =~ $re_name ]] && NAME["$((10#${BASH_REMATCH[1]})):$((10#${BASH_REMATCH[2]}))"]=${BASH_REMATCH[3]}

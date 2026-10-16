@@ -105,6 +105,12 @@ class LsusbtTest(unittest.TestCase):
         (self.bin / 'lsusb').write_text('#!/bin/bash\n[ "$1" = -t ] && exit 0\nexit 2\n')
         self.assert_fails(self.invoke(), 'cannot read device names')
 
+    def test_a_host_without_usb_devices_prints_an_empty_tree(self):
+        shutil.rmtree(self.sysfs)
+        self.sysfs.mkdir()
+        (self.bin / 'lsusb').write_text('#!/bin/bash\n[ "$1" = -t ] && exit 0\nexit 1\n')
+        self.assertEqual(self.run_lsusbt(), [], 'lsusb finds no device and exits 1')
+
 
 if __name__ == '__main__':
     unittest.main()
