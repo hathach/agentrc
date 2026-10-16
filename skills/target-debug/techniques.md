@@ -150,16 +150,20 @@ answers "what ran right before this hang".
 ## USB: dual-side capture — the default for enumeration/transfer bugs
 
 Capture both ends at once: usbmon plus a target channel when a Linux PC is the host; an MCU host has no usbmon on either
-end, so target channel plus the wire (`usb-sniffer`), plus `usb-kernel-debug` on a Linux gadget peer. Start both
-channels, then trigger the failing test (Linux-PC-host shown; MCU host: swap usbmon for `usb-sniffer`, +
-`usb-kernel-debug` on a Linux gadget peer):
+end, so target channel plus the wire (`usb-sniffer`), plus `usb-kernel-debug` on a Linux gadget peer. `dual_capture.py`
+runs both under one backstop bound and reports when each ran (`--help`); each tool keeps its own duration. Each side is
+an argv file, a JSON list:
 
 ```bash
-<usb-kernel-debug skill dir>/scripts/usbcap.py <bus> 30 /tmp/host.pcapng & cap=$!   # host URBs; the board's bus — a VID: selector spanning buses is refused
-python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <dev> --interface swd --speed auto --seconds 30 > /tmp/target.rtt & rtt=$!  # target (rtt skill; or ring dump after)
-wait $cap; rc_cap=$?; wait $rtt; rc_rtt=$?   # `wait $cap && wait $rtt` would skip the rtt wait when cap failed
-[ $rc_cap -eq 0 ] && [ $rc_rtt -eq 0 ]       # a bare `wait` returns 0 even when one side failed
+echo '["python3", "-u", "<usb-kernel-debug skill dir>/scripts/usbcap.py", "<bus>", "30", "host.pcapng"]' > host.json
+echo '["python3", "<rtt skill dir>/scripts/rtt.py", "--backend", "jlink", "--probe", "<sn>", "--device", "<dev>",
+      "--interface", "swd", "--speed", "auto", "--seconds", "30"]' > target.json
+python3 <skill dir>/scripts/dual_capture.py --a host=host.json --b target=target.json --timeout 40 --out <new dir>
 ```
+
+Trigger the failing test once both sides show they are capturing in their own output (usbcap prints its start line;
+a Python side needs `-u` for that line to reach its file before it exits).
+usbcap takes the board's bus; a VID: selector spanning buses is refused.
 
 RTT lines and ring events carry no wall-clock: correlate on unambiguous anchors — bus reset, SET_ADDRESS, the first
 transfer on the failing EP — then lay device events between anchors in host-URB order. Logging the SOF/frame number on
