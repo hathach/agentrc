@@ -16,8 +16,9 @@ PROBE_STATE_OPENOCD names openocd), which also reports the other cores' DHCSR.
 when the samples gave none from a core found running, a second session re-reads DHCSR and,
 on a single-core target that is running, halts it N times (each halt waits up to
 --halt-timeout-ms), reads PC and resumes, stopping at the first halt or resume that fails
-and leaving the core resumed when it can (a session that fails or times out mid-loop is
-followed by one that resumes a core it left halted). Those PCs are counted apart from the observed
+and leaving the core resumed when it can (a session that fails, times out or is stopped by
+SIGINT or SIGTERM mid-loop is followed by one that resumes a core it left halted; signals
+during that one are ignored). Those PCs are counted apart from the observed
 ones. A multi-core target is refused: an SMP halt stops every core and OpenOCD cannot
 resume a core it has not polled. J-Link Commander cannot stop on a failed resume, so the
 J-Link route has no fallback.
@@ -37,6 +38,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -51,6 +53,10 @@ SPEED_RE = re.compile(r'[1-9][0-9]*|auto|adaptive')
 
 
 class ToolError(RuntimeError):
+    pass
+
+
+class Interrupted(Exception):
     pass
 
 
@@ -177,18 +183,33 @@ def halt_samples(backend, n, halt_timeout_ms, interval_ms, timeout):
     """(pcs, [dhcsr before, after]) from halt reads; raises ToolError on a refusal or failure,
     after a recovery session when the loop may have started."""
     ps = probe_state_module()
+    armed = True
+
+    def on_signal(signum, _frame):
+        nonlocal armed
+        if armed:
+            armed = False
+            raise Interrupted(f'interrupted by signal {signum}')
+
+    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
     try:
         text, reads = backend.batch(halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
-    except ToolError as e:
+        armed = False
+    except (ToolError, Interrupted) as e:
+        armed = False
         # recover only a core this session showed running on a single-core target before halting it;
-        # openocd flushes each echo at once (log_puts in log.c), so GUARDED is out before the first halt
-        if re.search(r'^GUARDED$', getattr(e, 'text', ''), re.M):
+        # openocd flushes each echo at once (log_puts in log.c), so GUARDED is out before the first halt.
+        # A session killed by a signal may have passed its guards unseen, so it is recovered too.
+        if isinstance(e, Interrupted) or re.search(r'^GUARDED$', getattr(e, 'text', ''), re.M):
             after = recover(backend, 30)
         elif str(e).startswith('openocd: refused:'):
             after = ''
         else:
             after = '; it stopped before its guards passed, so it halted nothing: check the core with probe_state.py'
         raise ToolError(f'halting fallback: {e}{after}') from e
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     pcs = [int(v, 16) for v in re.findall(r'^H 0x([0-9a-f]{8})$', text, re.M)]
     dhcsr = [v for name, v in reads if name == 'DHCSR']
     if len(pcs) != n or len(dhcsr) != 2:

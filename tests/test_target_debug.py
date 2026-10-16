@@ -346,7 +346,8 @@ if os.environ.get('FAKE_JLINK_SLEEP'):
 once = os.environ.get('FAKE_READS_MAX_ONCE')
 cut = os.environ.get('FAKE_STATE', '/nonexistent') + '.cut'
 reads_max = int(once) if once and not os.path.exists(cut) else None
-if reads_max is not None:
+cut_now = reads_max is not None    # FAKE_CUT_EXIT: this cut-short session exits with that status
+if cut_now:
     open(cut, 'w').write('')
 for line in script.splitlines():
     m = re.match(r'mem32 ([0-9A-F]{8}), 1', line)
@@ -364,6 +365,8 @@ for line in script.splitlines():
         print(f'PC = {value("PC"):08X}, CycleCnt = 00000000')
 if os.environ.get('FAKE_STATE'):    # the DLL halts at close, then restarts unless told not to
     open(os.environ['FAKE_STATE'], 'w').write('00030003' if 'exec SetRestartOnClose = 0' in script else '01010001')
+if cut_now and os.environ.get('FAKE_CUT_EXIT'):
+    sys.exit(int(os.environ['FAKE_CUT_EXIT']))
 sys.exit(1 if mode == 'fail' else 0)
 """
 
@@ -838,6 +841,20 @@ class FakeToolsCase(unittest.TestCase):
     def sessions(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
+    def signal_when(self, argv, until, env, signals=(signal.SIGTERM,)):
+        """Start argv, wait until until() holds, send each signal in turn; (returncode, stdout, stderr)."""
+        proc = subprocess.Popen([sys.executable, *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                cwd='/', env={**self.env, **env})
+        deadline = time.monotonic() + 20
+        while not until() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        for sig in signals:
+            proc.send_signal(sig)
+            time.sleep(0.05)
+        stdout, stderr = proc.communicate(timeout=60)
+        return proc.returncode, stdout, stderr
+
 
 @unittest.skipIf(os.name == 'nt', 'openocd and addr2line stubs require POSIX executable semantics')
 class PcSampleOpenOCDTest(FakeToolsCase):
@@ -891,6 +908,23 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn('stopped before its guards passed, so it halted nothing', r.stderr)
         self.assertEqual(len(self.scripts()), 2)    # no recovery session
+
+    def test_an_interrupted_fallback_is_recovered(self):
+        # stall '1': interrupted with the core halted mid-loop; 'early': before the loop halted anything
+        for stall, now in (('1', 'the core was left halted, resumed: now running'), ('early', 'the core is running')):
+            state = self.d / f'state-{stall}'
+            until = ((lambda: state.exists() and state.read_text() == '00030003') if stall == '1' else
+                     (lambda: self.log.exists() and len(self.scripts()) == 2))
+            rc, _, stderr = self.signal_when(
+                [str(SCRIPT), '--hil-config', str(self.config), '--board', 'max32', '--elf', str(self.elf),
+                 '--addr2line', 'fake-addr2line', '--samples', '2', '--halt-samples', '3'], until,
+                {'FAKE_PCSR': 'FFFFFFFF', 'FAKE_HALT_STALL': stall, 'FAKE_STATE': str(state)}, (signal.SIGINT,))
+            self.assertEqual(rc, 1, stderr)
+            self.assertIn('halting fallback: interrupted by signal 2', stderr)
+            self.assertIn(now, stderr)
+            self.assertEqual(len(self.scripts()), 3)    # the recovery session ran
+            self.assertEqual(state.read_text(), '01010001')
+            self.log.unlink()
 
     def test_a_core_that_is_not_m_profile_is_refused(self):
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF', FAKE_CPUID='00000000')
@@ -1288,6 +1322,14 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertEqual((self.d / 'state').read_text(), '00030003')
         self.assertFalse(any(s['script'] in ('gdb', 'server') for s in self.sessions()))
 
+    def test_a_start_anchor_that_exits_nonzero_still_restarts_a_core_found_running(self):
+        rc, out, err = self.run_cli('k64f', *LINK, FAKE_READS_MAX_ONCE='2', FAKE_CUT_EXIT='1')
+        self.assertEqual(rc, 3)
+        self.assertIn('exited 1', out['error'])
+        self.assertIn('found running and a second session restarted it', out['error'])
+        self.assertEqual((self.d / 'state').read_text(), '01010001')
+        self.assertEqual(len(self.sessions()), 2)
+
     def test_openocd_server_and_multi_core_states(self):
         rc, out, err = self.run_cli('max32', FAKE_CURRENT='rp2040.core0', FAKE_CORES='rp2040.core1=00040001')
         self.assertEqual(rc, 0, err)
@@ -1347,18 +1389,11 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertEqual(out['exprs'][1], {'expr': 'x', 'output': '3'})
         self.assertEqual(out['gdbStderr'], ['Division by zero'])
 
-    def interrupt(self, board, until, *args, **env):
-        proc = subprocess.Popen([sys.executable, str(AUTOPSY), '--hil-config', str(self.config), '--board', board,
-                                 '--elf', str(self.elf), '--out', str(self.d / 'out'), *args],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd='/',
-                                env={**self.env, **env})
-        deadline = time.monotonic() + 20
-        while not (self.log.exists() and until(self.sessions())) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        time.sleep(0.3)
-        proc.send_signal(signal.SIGTERM)
-        stdout, stderr = proc.communicate(timeout=60)
-        return proc.returncode, json.loads(stdout), stderr
+    def interrupt(self, board, until, *args, signals=(signal.SIGTERM,), **env):
+        rc, stdout, stderr = self.signal_when(
+            [str(AUTOPSY), '--hil-config', str(self.config), '--board', board, '--elf', str(self.elf),
+             '--out', str(self.d / 'out'), *args], lambda: self.log.exists() and until(self.sessions()), env, signals)
+        return rc, json.loads(stdout), stderr
 
     def test_a_signal_after_the_anchor_still_reaches_the_end_anchor(self):
         rc, out, err = self.interrupt('k64f', lambda ss: any(s['script'] == 'server' for s in ss), *LINK,
@@ -1411,20 +1446,9 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertEqual((self.d / 'state').read_text(), '01010001')
 
     def test_signals_still_run_cleanup_and_the_end_anchor(self):
-        proc = subprocess.Popen([sys.executable, str(AUTOPSY), '--hil-config', str(self.config), '--board', 'max32',
-                                 '--elf', str(self.elf), '--out', str(self.d / 'out')],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd='/',
-                                env={**self.env, 'FAKE_GDB_HANG_ATTACHED': '1'})
-        deadline = time.monotonic() + 20
-        while not (self.log.exists() and 'gdb' in self.log.read_text()) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        time.sleep(0.3)
-        proc.send_signal(signal.SIGTERM)
-        time.sleep(0.05)
-        proc.send_signal(signal.SIGTERM)
-        stdout, stderr = proc.communicate(timeout=60)
-        out = json.loads(stdout)
-        self.assertEqual(proc.returncode, 3, stderr)
+        rc, out, stderr = self.interrupt('max32', lambda ss: any(s['script'] == 'gdb' for s in ss),
+                                         signals=(signal.SIGTERM, signal.SIGTERM), FAKE_GDB_HANG_ATTACHED='1')
+        self.assertEqual(rc, 3, stderr)
         self.assertIn('interrupted by signal 15, 15', out['error'])
         self.assertTrue(out['restored'])
         self.assertFalse(out['after']['cores']['max32665.cpu']['halted'])

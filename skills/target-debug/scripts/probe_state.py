@@ -86,7 +86,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HIL_PROBE_ROUTES, SENTINEL, SPEED_RE,  # noqa: E402
-                       ToolError, _MEM32_RE, hil_flasher, hil_jlink_device)
+                       Interrupted, ToolError, _MEM32_RE, hil_flasher, hil_jlink_device)
 
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
@@ -426,19 +426,30 @@ class JLink:
                  'dump': lambda d: f'savebin {d[0]}, 0x{d[1]:08X}, 0x{d[2]:X}'}
         lines = ['exec SetRestartOnClose = 0'] if keep_halted else []
         lines += [forms[kind](arg) for kind, arg in cap.steps()]
-        text = run(self.cmd, timeout, '\n'.join(lines + ['qc']) + '\n')
-        self._identify(text)
         want = [self.REG[n] for n in cap.want()]
+        try:
+            text = run(self.cmd, timeout, '\n'.join(lines + ['qc']) + '\n')
+        except ToolError as err:
+            self._identify(err.text)    # another probe's reads say nothing about this core
+            err.partial = self._in_order(err.text, want)
+            raise
+        self._identify(text)
         reads = [(int(a, 16), int(v, 16)) for a, v in _MEM32_RE.findall(text)]
         if [a for a, _ in reads] != want:
             err = ToolError(f'incomplete capture: {len(reads)}/{len(want)} reads; last output:\n{tail(text)}')
-            err.partial = []    # the values read in the requested order, up to the first gap
-            for (addr, v), w in zip(reads, want):
-                if addr != w:
-                    break
-                err.partial.append(v)
+            err.partial = self._in_order(text, want)
             raise err
         return [v for _, v in reads]
+
+    @staticmethod
+    def _in_order(text, want):
+        """The values read in the requested order, up to the first gap."""
+        out = []
+        for (addr, v), w in zip(_MEM32_RE.findall(text), want):
+            if int(addr, 16) != w:
+                break
+            out.append(int(v, 16))
+        return out
 
     def halt_read(self, timeout):
         """Halt, read PC, resume. Commander has no conditionals, so `g` also resumes a
