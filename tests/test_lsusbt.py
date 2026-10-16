@@ -51,11 +51,18 @@ class LsusbtTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def invoke(self, *args, path=None):
+        env = {**os.environ, 'PATH': path or f'{self.bin}:{os.environ["PATH"]}', 'LSUSBT_SYSFS': str(self.sysfs)}
+        return subprocess.run([str(SCRIPT), '-j', str(self.json), *args], capture_output=True, text=True, env=env)
+
     def run_lsusbt(self, *args):
-        env = {**os.environ, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'LSUSBT_SYSFS': str(self.sysfs)}
-        done = subprocess.run([str(SCRIPT), '-j', str(self.json), *args], capture_output=True, text=True, env=env)
+        done = self.invoke(*args)
         self.assertEqual(done.returncode, 0, done.stderr)
         return done.stdout.splitlines()
+
+    def assert_fails(self, done, message):
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn(message, done.stderr)
 
     def test_default_keeps_board_lines_under_their_hubs(self):
         self.assertEqual(self.run_lsusbt(), [
@@ -76,6 +83,23 @@ class LsusbtTest(unittest.TestCase):
     def test_other_args_reach_lsusb_t_and_verbose_does_not(self):
         self.run_lsusbt('-v', '-x')
         self.assertIn('-t -x', self.log.read_text().splitlines())
+
+    def test_missing_json_fails(self):
+        self.json.unlink()
+        self.assert_fails(self.invoke(), 'no such boards JSON')
+
+    def test_malformed_json_fails(self):
+        self.json.write_text('{"boards": [')
+        self.assert_fails(self.invoke(), 'cannot parse boards')
+
+    def test_missing_jq_fails(self):
+        for tool in ('bash', 'sed'):
+            (self.bin / tool).symlink_to(shutil.which(tool))
+        self.assert_fails(self.invoke(path=str(self.bin)), 'jq is needed')
+
+    def test_lsusb_t_failure_propagates(self):
+        (self.bin / 'lsusb').write_text('#!/bin/bash\n[ "$1" = -t ] && exit 3\nexit 0\n')
+        self.assertEqual(self.invoke().returncode, 3)
 
 
 if __name__ == '__main__':

@@ -21,15 +21,16 @@
 #   -v, --verbose     print every line, including devices with no board match
 #   Any other args are passed through to `lsusb -t`. Note -v is consumed here and no
 #   longer reaches lsusb; run `lsusb -t -v` directly if you want its sysfs paths.
-set -u
+set -uo pipefail
 
 JSON="${HOME}/code/tinyusb/test/hil/tinyusb.json"
+json_given=0
 verbose=0
 args=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    -j|--json)    JSON="${2:?--json needs a file}"; shift 2 ;;
-    --json=*)     JSON="${1#*=}"; shift ;;
+    -j|--json)    JSON="${2:?--json needs a file}"; json_given=1; shift 2 ;;
+    --json=*)     JSON="${1#*=}"; json_given=1; shift ;;
     -v|--verbose) verbose=1; shift ;;
     *)            args+=("$1"); shift ;;
   esac
@@ -66,15 +67,23 @@ strip() {
 }
 
 # Build norm(uid) -> "<board> device|flasher" from the boards JSON.
+# A JSON that exists but cannot be read is an error: without its labels the default
+# filtered view shows only hubs, which reads as "no boards connected".
 declare -A LABEL
-if [ -f "$JSON" ] && command -v jq >/dev/null 2>&1; then
-  while IFS=$'\t' read -r uid label; do
-    [ -n "$uid" ] && LABEL["$(norm "$uid")"]=$label
-  done < <(jq -r '
+if [ -f "$JSON" ]; then
+  command -v jq >/dev/null 2>&1 || { echo "lsusbt: jq is needed to read $JSON" >&2; exit 1; }
+  labels=$(jq -r '
     .boards[] | .name as $n |
     (if .uid         then [.uid,         $n + " device"]  | @tsv else empty end),
     (if .flasher.uid then [.flasher.uid, $n + " flasher"] | @tsv else empty end)
-  ' "$JSON" 2>/dev/null)
+  ' "$JSON") || { echo "lsusbt: cannot parse boards from $JSON" >&2; exit 1; }
+  while IFS=$'\t' read -r uid label; do
+    [ -n "$uid" ] && LABEL["$(norm "$uid")"]=$label
+  done <<< "$labels"
+elif [ "$json_given" = 1 ]; then
+  echo "lsusbt: no such boards JSON: $JSON" >&2; exit 1
+elif [ "$verbose" = 0 ]; then
+  echo "lsusbt: no boards JSON at $JSON, so no board labels; -v prints the whole tree" >&2
 fi
 
 # Build a bus:dev -> serial map from sysfs (the `serial` file only exists when the
