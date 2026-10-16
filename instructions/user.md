@@ -29,7 +29,9 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   alone does not establish correctness.
 
 # Infrastructure
-- ci.lan, a VM on the pve.lan Proxmox host, is the main HIL (hardware-in-the-loop) rig for testing tinyusb and other projects
+- ci.lan, a VM on the pve.lan Proxmox host, is the main HIL (hardware-in-the-loop) rig for testing tinyusb and other
+  projects. "The HIL farm" means the boards on that rig, used under the project's lock and runner rules. Boards on
+  this dev PC are attached temporarily for the work at hand; nothing stays here, unlike the farm.
 - SSH from this PC: ci.lan and pve.lan
 
 # Environment
