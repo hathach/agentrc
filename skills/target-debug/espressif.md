@@ -180,12 +180,15 @@ In this order, since an esptool reset before the first step started the boot loo
    writes DM control 0 as a pre-shutdown command), yet on both the P4 and the S31 such a shutdown was followed, at the
    next esptool reset, by the Breakpoint reboot loop until `init; shutdown` ended it; the residual state was not
    established.
-2. Verify the build image through a non-writing route before reprogramming:
-   `esptool --chip <c> --port /dev/serial/by-id/<port> verify-flash <offset> <bin>`, image and offset from the build's
-   `flasher_args.json`, never an objcopy of the ELF (verified 2026-10-15 P4, S2); without such a port (Metro S3), report
-   verification pending, or restore and verify the pinned image under `SKILL.md`'s Delegated sessions, Cleanup. With
-   flash support off the known writer, the flash-breakpoint fallback, is absent; that does not stand in for the
-   verification Cleanup requires.
+2. Verify the build image through a non-writing route before reprogramming: `esp_verify.py --manifest
+   <build>/flasher_args.json --chip <c> --port /dev/serial/by-id/<port> --before <reset> --after <reset>` runs esptool's
+   `verify-flash` over every image the manifest lists, with its flash settings, and reports those ranges only
+   (`--help`); never an objcopy of the ELF. On 2026-10-16 it matched the flashed builds on the P4, the S31 (USJ) and the
+   Kaluga S2 (UART) and named the bootloader and app mismatches against other builds; a wrong `--chip` was refused, and
+   that refusal left the P4 in the ROM loader (esptool skips `--after` when it cannot connect; the report says so) until
+   a reset from the USJ's lines. Without such a port (Metro S3), report verification pending, or restore and verify the
+   pinned image under `SKILL.md`'s Delegated sessions, Cleanup. With flash support off the known writer, the
+   flash-breakpoint fallback, is absent; that does not stand in for the verification Cleanup requires.
 3. Reset or reflash as the cleanup requires ("Resets").
 
 ### The end-of-stack watchpoint (RISC-V)
