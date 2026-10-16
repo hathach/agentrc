@@ -225,6 +225,10 @@ that discriminates, not verdicts. carried over; callback names and the
     counted with no malformed echo or I/O error, 442 reads plus 442 writes
     without failures or read mismatches. `usbd` reaches `tud_task_ext`
     within ~0.9 s with no host traffic.
+  - Metro, cdc_msc_throughput: every sub-claim verified, budget refusal
+    included; 5 threads at the hit; in a 125 s stress run CDC RX ~404 kB/s
+    with a single 1.029 s gap at the halt, 50 CDC writes of 1 MiB and 3
+    MSC ops of 16 MiB all completed, zero kernel messages.
   - Kaluga S2 (FT2232HL by `adapter usb location`), cdc_msc_freertos:
     attach, 1 s halt, `thbreak tud_task_ext` (tasks usbd/IDLE/blinky/cdc/io)
     and the recipe end all kept the device enumerated with no kernel error;
@@ -237,8 +241,9 @@ that discriminates, not verdicts. carried over; callback names and the
     1.2 s gap).
 - cdc_msc_throughput: its CDC interface is
   `usb-TinyUSB_Throughput_<serial>-if00`, and its CDC filler is NUL bytes
-  without a newline: a canonical-mode tty delivers nothing of it to `cat`,
-  read the port raw.
+  without a newline: a canonical-mode tty delivers nothing of it to `cat`
+  and mimics a device-to-host stall; set raw mode on the reader's own fd
+  (`techniques.md` "Log capture").
 - Two cdc_msc_throughput observations outside the short-halt criterion, not
   yet diagnosed (P4 Function-EV v1.0, ea1d867ce, 2026-10-16): (1) a
   breakpoint-budget batch error left the target halted ~36 s under MSC

@@ -77,11 +77,13 @@ v0.12.0-esp32-20260703, ESP-IDF v6.1 builds):
   2026-10-16 P4 run saw a panic and reset on one of three attaches (below).
   With flash support off there are no flash breakpoints and no `program`
   from openocd: flash with esptool where the board exposes a flashing port.
-  A board without one (Metro S3 under an OTG app, no EN/IO0 wiring)
-  programs over JTAG in a separate session with flash support on,
-  `program_esp <bin> <offset> verify`, `reset exit` on the last call; that
-  command reprograms on a hash mismatch (`esp_common.cfg:657-663`), so it
-  is not a verification route.
+  A board without one (Metro S3 under an OTG app: no USJ, and no IO0 or
+  ESP_TXD-to-RXD0 wiring) programs over JTAG in a separate session with
+  flash support on, `program_esp <bin> <offset> verify`, `reset exit` on
+  the last call; that command reprograms on a hash mismatch
+  (`esp_common.cfg:657-663`), so it is not a verification route, and after
+  one such session the Metro's scan chain read all ones until a chip reset
+  by EN ("ESP32-S3").
 - **Leave openocd with `shutdown`, never a kill.** On RISC-V chips IDF's
   `esp_cpu_set_watchpoint` (`components/esp_hw_support/cpu.c:153`) issues a
   semihosting `ebreak` while `esp_cpu_dbgr_is_attached()` is true, and FreeRTOS
@@ -340,14 +342,26 @@ with the tool version; budgets; recovery; what is unverified.
   BSP, the `espressif_s3_devkitc` build runs). ESP-Prog: `board/esp32s3-ftdi.cfg`,
   `adapter serial <FTDI EEPROM serial>`, JTAG PWR SEL and PROG PWR SEL on
   3.3 V, PROG header pin 5 `ESP_RXD` listens to the target's TXD (measured
-  2026-10-16: pin 3 captured nothing). With cdc_msc_freertos on OTG, attach
-  examines both cores and leaves them running; halt, resume, a `thbreak
-  tud_task_ext` hit and a 1 s halt under CDC and MSC traffic kept the
-  device enumerated with no DUT USB reset, disconnect or error logged
-  (2026-10-16, `projects/tinyusb.md`). The "Reset cause" lines appeared at
-  the first halt, not at examination. With the USJ gone under the OTG app
-  and no EN/IO0 wiring, esptool has no port to this board: images go over
-  JTAG (`program_esp`, Attach), "Verify OK" on 2026-10-16.
+  2026-10-16: pin 3 captured nothing), PROG pin 1 `ESP_EN` wired to the
+  board's EN: RTS asserted with DTR deasserted on the same FT2232 channel
+  B UART (`if01`) pulls EN low (measured; the guide does not document the
+  mapping), and opening that console port reset the chip once in the
+  measured run even with `dtr=rts=False` set before and after the open
+  (Console). The ESP-Prog JTAG header carries no reset (its pin 10 is NC,
+  so X2 pin 10 EN stays unconnected; guide book 6576 p10). With
+  cdc_msc_freertos and cdc_msc_throughput on OTG, attach examines both
+  cores and leaves them running; halt, resume, a `thbreak tud_task_ext`
+  hit and a 1 s halt under CDC and MSC traffic kept the device enumerated
+  with no DUT USB reset, disconnect or error logged (2026-10-16,
+  `projects/tinyusb.md`). After the `program_esp` session that
+  reprogrammed the app (ended with `reset exit`), every attach read the
+  scan chain as all ones, through a USB re-authorize of the probe, until
+  EN was wired and pulsed (no attach between the wiring and the pulse);
+  the same `reset exit` earlier that night, with flash content matching,
+  had left the chain readable, so the trigger is not established. After
+  the pulse both cores could be examined with the same app running
+  (2026-10-16). esptool has no port to this board (Attach): images go over
+  JTAG (`program_esp`), "Verify OK" on 2026-10-16.
 - DevKitM (`espressif_s3_devkitm`, tinyusb rig): attach/halt/symbol
   resolution in the no-OTG window of `board_test`; USJ dropped ~4 s after boot
   with nothing attached and stayed up once a client survived that window;
