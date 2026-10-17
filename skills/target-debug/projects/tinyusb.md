@@ -18,9 +18,8 @@ followed those functions.
 pyOCD runs only through `test/hil/pyocd/run_pyocd.py` under pyOCD's own interpreter (`_pyocd_argv`), for `flash` and for
 `gdbserver` alike: it limits discovery to the roster's VID/PID, which keeps other probe models closed but not another
 probe of the same model, and loads `user_script.py`, whose LPC55 reset catch resets the chip through the debug mailbox
-before pyOCD's reset-halt (its comment gives the cause). lpcxpresso55s28 is flashed that way and carries a roster
-`debugger` entry for the probe scripts (SKILL.md, HIL config). verified 2026-10-17 3c6524eb9 lpcxpresso55s28: `flash`
-and `gdbserver` through the launcher, every probe script through the `debugger`.
+before pyOCD's reset-halt (its comment gives the cause). verified 2026-10-17 3c6524eb9 lpcxpresso55s28: `flash` and
+`gdbserver` through the launcher.
 
 ## Stack state and entry points
 

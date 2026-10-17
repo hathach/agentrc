@@ -63,10 +63,10 @@ family.
 
 ## LPC55
 
-- **Debug over OpenOCD, flash over pyOCD.** Upstream OpenOCD has neither an LPC55 target config nor an LPC55 flash
-  driver (master source of 2026-10-16; the farm's 0.12.0+dev-02620-g0ce743125 binary lists the lpc2000, lpc288x and
-  lpcspifi drivers only), so OpenOCD gets the target inline and cannot `program` or `load`: flash with pyOCD
-  (`-t lpc55s28`). The inline single-core target on an LPC55S28, after `-f interface/cmsis-dap.cfg`:
+- **With a CMSIS-DAP probe, debug over OpenOCD and flash over pyOCD.** Upstream OpenOCD has neither an LPC55 target
+  config nor an LPC55 flash driver (master source of 2026-10-16; the farm's 0.12.0+dev-02620-g0ce743125 binary lists the
+  lpc2000, lpc288x and lpcspifi drivers only), so OpenOCD gets the target inline and cannot `program` or `load`: flash
+  with pyOCD (`-t lpc55s28`). The inline single-core target on an LPC55S28, after `-f interface/cmsis-dap.cfg`:
 
   ```
   -c "transport select swd" -c "adapter speed 1000"
@@ -75,7 +75,12 @@ family.
   ```
 
   verified 2026-10-17 lpcxpresso55s28 (LPC-Link2, CMSIS-DAP FW 1.10): CPUID 0x410fd213, PCSR samples, 8 breakpoints
-  and 4 watchpoint comparators, image read-back, halt and resume, RTT, gdb attach.
+  and 4 watchpoint comparators, image read-back, halt and resume, RTT, gdb attach. `rtt.py --backend openocd --cfg`
+  takes it whole; `pc_sample.py` and `probe_state.py` take an OpenOCD target only from a HIL config entry whose flasher
+  is `openocd` (a `pyocd` flasher is refused), so give them a config that names it.
+- `pyocd gdbserver` can `load` where OpenOCD cannot: on an LPC55S28 halted inside the running application its flash
+  algorithm returned in a HardFault (IPSR 3); after `monitor reset halt` it programmed the image and `compare-sections`
+  matched. verified 2026-10-17 lpcxpresso55s28.
 - The DPIDR read 0x6ba02477, an Arm (designer 0x23B) DPv2 debug port (ADIv5 IHI0031 B2.2.5); UM11126 rev 2.1 and the
   LPC55S2x datasheet give no value. The debug subsystem is an SWJ-DP with a CPU0 AP, a CPU1 AP (LPC55S6x only) and the
   DM-AP of the debug mailbox (UM11126 rev 2.1 §51.5.1, PDF p1120); CPU0 answered at AP 0. verified 2026-10-17

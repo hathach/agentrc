@@ -48,37 +48,16 @@ BOARDS = [
     {'name': 'bad_cfg', 'flasher': {'name': 'openocd', 'uid': '1', 'args': '-f "unterminated'}},
     {'name': 'bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c', 'args': '-f x.cfg'}},
     {'name': 'stlink_args', 'flasher': {'name': 'stlink', 'uid': '3', 'args': '--connect-under-reset'}},
-    {'name': 'lpc55', 'flasher': {'name': 'pyocd', 'uid': 'FLASHUID', 'vid_pid': '0x0d28 0x0204', 'args': '-t lpc55s28'},
-     'debugger': {'name': 'openocd', 'uid': 'GSA0CQEQ', 'vid_pid': '0x1fc9 0x0090',
-                  'args': '-f interface/cmsis-dap.cfg -c "transport select swd"'}},
-    {'name': 'dbg_no_uid', 'flasher': {'name': 'pyocd', 'uid': 'FLASHUID', 'vid_pid': '0x0d28 0x0204', 'args': '-t lpc55s28'},
-     'debugger': {'name': 'openocd', 'args': '-f interface/cmsis-dap.cfg -f target/lpc55.cfg'}},
-    {'name': 'pyocd_only', 'flasher': {'name': 'pyocd', 'uid': 'GSA0CQEQ', 'args': '-t lpc55s28'}},
-    {'name': 'dbg_null', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'}, 'debugger': None},
-    {'name': 'dbg_pyocd', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'},
-     'debugger': {'name': 'pyocd', 'uid': '1'}},
-    {'name': 'dbg_blank', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'},
-     'debugger': {'name': 'jlink', 'uid': ' ', 'args': '-device X'}},
-    {'name': 'dbg_jtag', 'flasher': {'name': 'pyocd', 'uid': '1'},
-     'debugger': {'name': 'jlink', 'uid': '1', 'args': '-device X -if jtag'}},
 ]
 
-# (board, what the resolver says) - a string is the refusal, a tuple the (key, entry) it returns
-BY_NAME = {b['name']: b for b in BOARDS if b['name'] != 'twin'}
+# (board, what the resolver says) - a string is the refusal, a dict the flasher it returns
 RESOLVE_CASES = [
-    ('k64f', ('flasher', BOARDS[0]['flasher'])),
-    ('max32', ('flasher', BOARDS[1]['flasher'])),
-    ('h743', ('flasher', BOARDS[2]['flasher'])),
-    ('bare', ('flasher', {'name': 'jlink'})),
-    ('lpc55', ('debugger', BY_NAME['lpc55']['debugger'])),
-    ('dbg_no_uid', ('debugger', BY_NAME['dbg_no_uid']['debugger'])),
-    ('p4', "flasher 'esptool' is no debug-probe route"),
-    ('tm4c', "flasher 'lm4flash'"),
-    ('pyocd_only', "flasher 'pyocd' is no debug-probe route (known: jlink, openocd, stlink); give the board a "
-                   "debugger entry"),
-    ('dbg_null', 'no debugger.name'),
-    ('dbg_pyocd', "debugger 'pyocd' is no debug-probe route (known: jlink, openocd, stlink); name the probe"),
-    ('dbg_blank', 'debugger.uid in'),
+    ('k64f', BOARDS[0]['flasher']),
+    ('max32', BOARDS[1]['flasher']),
+    ('h743', BOARDS[2]['flasher']),
+    ('bare', {'name': 'jlink'}),
+    ('p4', "flashed over 'esptool', which is no debug-probe route"),
+    ('tm4c', "flashed over 'lm4flash'"),
     ('blank_uid', "flasher.uid in"),
     ('int_uid', "flasher.uid in"),
     ('no_kind', 'no flasher.name'),
@@ -101,7 +80,7 @@ class Config(unittest.TestCase):
 
 class Resolver(Config):
     def test_both_scripts_carry_the_same_resolver(self):
-        for func in ('hil_probe_entry', 'hil_jlink_device', 'hil_merge'):
+        for func in ('hil_flasher', 'hil_jlink_device', 'hil_merge'):
             self.assertEqual(inspect.getsource(getattr(MODULES['rtt'], func)),
                              inspect.getsource(getattr(MODULES['pc_sample'], func)), func)
         self.assertEqual(MODULES['rtt'].HIL_PROBE_ROUTES, MODULES['pc_sample'].HIL_PROBE_ROUTES)
@@ -110,11 +89,11 @@ class Resolver(Config):
         for name, mod in MODULES.items():
             for board, want in RESOLVE_CASES:
                 with self.subTest(script=name, board=board):
-                    if isinstance(want, tuple):
-                        self.assertEqual(mod.hil_probe_entry(self.config, board), want)
+                    if isinstance(want, dict):
+                        self.assertEqual(mod.hil_flasher(self.config, board), want)
                     else:
                         with self.assertRaises(ValueError) as cm:
-                            mod.hil_probe_entry(self.config, board)
+                            mod.hil_flasher(self.config, board)
                         self.assertIn(want, str(cm.exception))
 
     def test_a_file_of_the_wrong_shape_is_refused(self):
@@ -123,39 +102,36 @@ class Resolver(Config):
                 with self.subTest(script=name, text=text):
                     self.config.write_text(text)
                     with self.assertRaises(ValueError) as cm:
-                        mod.hil_probe_entry(self.config, 'k64f')
+                        mod.hil_flasher(self.config, 'k64f')
                     self.assertIn(want, str(cm.exception))
             with self.assertRaises(ValueError) as cm:
-                mod.hil_probe_entry(self.tmp / 'absent.json', 'k64f')
+                mod.hil_flasher(self.tmp / 'absent.json', 'k64f')
             self.assertIn('absent.json', str(cm.exception))
 
     def test_a_jlink_entry_carries_a_device_and_nothing_else(self):
         for name, mod in MODULES.items():
-            self.assertEqual(mod.hil_jlink_device('k64f', 'flasher', BY_NAME['k64f']['flasher']), 'MK64FN1M0xxx12')
-            self.assertIsNone(mod.hil_jlink_device('bare', 'flasher', BY_NAME['bare']['flasher']))
-            for board, want in (('jtag', "flasher.args must be exactly '-device NAME'"),
-                                ('quote', 'No closing quotation')):
+            flasher = {b['name']: b.get('flasher') for b in BOARDS if b['name'] != 'twin'}
+            self.assertEqual(mod.hil_jlink_device('k64f', flasher['k64f']), 'MK64FN1M0xxx12')
+            self.assertIsNone(mod.hil_jlink_device('bare', flasher['bare']))
+            for board, want in (('jtag', "must be exactly '-device NAME'"), ('quote', 'No closing quotation')):
                 with self.assertRaises(ValueError) as cm:
-                    mod.hil_jlink_device(board, 'flasher', BY_NAME[board]['flasher'])
+                    mod.hil_jlink_device(board, flasher[board])
                 self.assertIn(want, str(cm.exception), name)
-            with self.assertRaises(ValueError) as cm:
-                mod.hil_jlink_device('dbg_jtag', 'debugger', BY_NAME['dbg_jtag']['debugger'])
-            self.assertIn("debugger.args must be exactly '-device NAME'", str(cm.exception), name)
 
     @unittest.skipUnless(TINYUSB_CONFIG.is_file(), 'no tinyusb checkout beside this one')
     def test_every_board_of_the_real_tinyusb_config_resolves_or_is_refused_cleanly(self):
         routes = {}
         for board in json.loads(TINYUSB_CONFIG.read_text())['boards']:
             try:
-                kind = MODULES['rtt'].hil_probe_entry(TINYUSB_CONFIG, board['name'])[1]['name']
+                kind = MODULES['rtt'].hil_flasher(TINYUSB_CONFIG, board['name'])['name']
             except ValueError as e:
                 kind = 'refused'
                 self.assertIn('no debug-probe route', str(e))
             routes.setdefault(kind, []).append(board['name'])
         self.assertIn('jlink', routes)
         for name in routes['jlink']:
-            key, entry = MODULES['rtt'].hil_probe_entry(TINYUSB_CONFIG, name)
-            self.assertTrue(MODULES['rtt'].hil_jlink_device(name, key, entry), name)
+            flasher = MODULES['rtt'].hil_flasher(TINYUSB_CONFIG, name)
+            self.assertTrue(MODULES['rtt'].hil_jlink_device(name, flasher), name)
 
 
 @unittest.skipIf(os.name == 'nt', 'probe CLI stubs require POSIX executable semantics')
@@ -214,30 +190,6 @@ class Cli(Config):
                         '--cfg', '-f interface/stlink.cfg -f target/stm32h7x.cfg')
         self.assertIn('adapter serial 00AA00BB00CC00DD00EE00FF -f interface/stlink.cfg', self.command())
 
-    def test_a_debugger_entry_is_the_probe_route_and_the_flasher_is_not_read(self):
-        self.run_script('rtt', '--board', 'lpc55', '--addr', '20000000', '--seconds', '1')
-        self.assertIn('adapter usb vid_pid 0x1fc9 0x0090', self.command())
-        self.assertIn('adapter serial GSA0CQEQ -f interface/cmsis-dap.cfg -c transport select swd', self.command())
-        for flasher_only in ('lpc55s28', 'FLASHUID', '0x0d28'):
-            self.assertNotIn(flasher_only, self.command())
-        self.launched.unlink()
-        self.run_script('pc_sample', '--board', 'lpc55', '--elf', str(self.elf), '--samples', '1')
-        (argv,) = self.argvs()
-        self.assertEqual(argv[0], str(self.bin / 'openocd'))
-        self.assertIn('adapter serial GSA0CQEQ', argv)
-        self.assertIn('adapter usb vid_pid 0x1fc9 0x0090', argv)
-        for flasher_only in ('lpc55s28', 'FLASHUID', '0x0d28'):
-            self.assertNotIn(flasher_only, ' '.join(argv))
-
-    def test_a_debugger_without_a_uid_takes_the_probe_from_flags_not_the_flasher(self):
-        self.refused('rtt', ['--board', 'dbg_no_uid', '--addr', '20000000'], 'needs --probe and/or --vid-pid')
-        self.run_script('rtt', '--board', 'dbg_no_uid', '--probe', '77', '--addr', '20000000', '--seconds', '1')
-        self.assertIn('adapter serial 77 -f interface/cmsis-dap.cfg -f target/lpc55.cfg', self.command())
-        self.assertNotIn('FLASHUID', self.command())
-        self.assertNotIn('0x0d28', self.command())
-        self.launched.unlink()
-        self.refused('pc_sample', ['--board', 'dbg_no_uid', '--elf', str(self.elf)], 'no debugger.uid')
-
     def test_flags_fill_what_the_file_leaves_out_and_must_agree_with_what_it_has(self):
         self.run_script('rtt', '--board', 'bare', '--probe', '77', '--device', 'Y', *self.LINK, '--seconds', '1')
         self.assertIn('-USB 77', self.command())
@@ -277,10 +229,7 @@ class Cli(Config):
 
     def test_what_cannot_be_a_probe_route_is_refused_by_both(self):
         for name, extra in (('rtt', ('--seconds', '1')), ('pc_sample', ('--elf', str(self.elf), *self.LINK))):
-            for board, want in (('p4', "flasher 'esptool'"), ('tm4c', "flasher 'lm4flash'"),
-                                ('pyocd_only', 'give the board a debugger entry'), ('dbg_null', 'no debugger.name'),
-                                ('dbg_pyocd', "debugger 'pyocd' is no debug-probe route"),
-                                ('dbg_blank', 'debugger.uid in'),
+            for board, want in (('p4', "flashed over 'esptool'"), ('tm4c', "flashed over 'lm4flash'"),
                                 ('jtag', "must be exactly '-device NAME'"), ('quote', 'No closing quotation'),
                                 ('blank_uid', 'must be a non-empty string'), ('blank_dev', "must be exactly '-device NAME'"), ('twin', '2 entries of that name'),
                                 ('absent', '0 entries of that name')):

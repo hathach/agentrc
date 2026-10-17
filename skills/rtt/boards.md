@@ -35,7 +35,7 @@ is decode-validated: a channel-1 SystemView capture on stm32h743nucleo
 | feather_nrf52840_express | ci   | J-Link                 | J-Link  | yes  | yes   | `nrf52840_xxaa`       |
 | metro_m4_express         | ci   | J-Link                 | J-Link  | yes  | yes   | `ATSAMD51J19`         |
 | lpcxpresso11u37          | ci   | J-Link                 | J-Link  | yes  | yes   | `LPC11U37/401`        |
-| lpcxpresso55s28          | ci   | LPC-Link2 (CMSIS-DAP)  | OpenOCD | yes  | —     | inline (`debugger`)   |
+| lpcxpresso55s28 (2026-08-25) | ci | J-Link               | J-Link  | yes  | yes   | `LPC55S28`            |
 | ra4m1_ek                 | ci   | J-Link                 | J-Link  | yes  | yes   | `R7FA4M1AB`           |
 | stm32f072disco           | ci   | J-Link                 | J-Link  | yes  | yes   | `stm32f072rb`         |
 | stm32f407disco           | ci   | J-Link                 | J-Link  | yes  | yes   | `stm32f407vg`         |
@@ -72,10 +72,6 @@ always pass them (`--probe` / `adapter serial`).
 - **ST-Link rows**: flashed by `STM32_Programmer_CLI`; RTT capture is a
   separate openocd session (`interface/stlink.cfg` + the target cfg above),
   attach without reset.
-- **lpcxpresso55s28**: re-validated 2026-10-17 after its LPC-Link2 moved to CMSIS-DAP firmware; `--hil-config` reads its
-  `debugger` entry (`target-debug`'s `projects/tinyusb.md`). It read a LOG=2 `cdc_msc` log, its boot and enumeration and
-  then the host's live MSC polling; Write untested because `cdc_msc` does not poll the console. The 2026-08-25 sweep had
-  read and written it over the J-Link firmware (`LPC55S28`).
 
 ## Excluded (recorded so absence is never read as "works")
 

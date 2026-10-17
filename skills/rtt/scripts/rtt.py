@@ -715,13 +715,11 @@ def dump_ring(probe: str, device: str, addr: int, out_path: str, channel: int = 
 HIL_PROBE_ROUTES = {'jlink': 'jlink', 'openocd': 'openocd', 'stlink': 'openocd'}
 
 
-def hil_probe_entry(path, board):
-    """(key, entry): the probe entry of one board in a project's HIL config json ({"boards":
-    [{"name", "flasher": {"name", "uid", "args", "vid_pid"}, "debugger": {...}}]}), its
-    `debugger` when it has that key (a board flashed by a tool that is no probe route, such as
-    pyocd), else its `flasher`. Checked but not completed: only the entry's name must be there,
-    what else is missing is the caller's to supply. Raises ValueError. Kept identical in rtt.py
-    and pc_sample.py, which are copied around alone."""
+def hil_flasher(path, board):
+    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name",
+    "flasher": {"name", "uid", "args", "vid_pid"}}]}), checked but not completed: only
+    flasher.name must be there, what else is missing is the caller's to supply. Raises
+    ValueError. Kept identical in rtt.py and pc_sample.py, which are copied around alone."""
     try:
         with open(path) as f:
             config = json.load(f)
@@ -734,33 +732,31 @@ def hil_probe_entry(path, board):
     if len(found) != 1:
         names = ', '.join(sorted(str(b.get('name')) for b in boards))
         raise ValueError(f'--board {board}: {len(found)} entries of that name in {path} (it has: {names})')
-    key = 'debugger' if 'debugger' in found[0] else 'flasher'
-    entry = found[0].get(key)
-    if not isinstance(entry, dict) or not isinstance(entry.get('name'), str):
-        raise ValueError(f'--board {board}: no {key}.name in {path}')
-    if entry['name'] not in HIL_PROBE_ROUTES:
-        fix = 'give the board a debugger entry or ' if key == 'flasher' else ''
-        raise ValueError(f"--board {board}: {key} {entry['name']!r} is no debug-probe route "
-                         f"(known: {', '.join(HIL_PROBE_ROUTES)}); {fix}name the probe with explicit flags")
-    for field in ('uid', 'args', 'vid_pid'):
-        if field in entry and (not isinstance(entry[field], str) or not entry[field].strip()):
-            raise ValueError(f'--board {board}: {key}.{field} in {path} must be a non-empty string, '
-                             f'got {entry[field]!r}')
-    return key, entry
+    flasher = found[0].get('flasher')
+    if not isinstance(flasher, dict) or not isinstance(flasher.get('name'), str):
+        raise ValueError(f'--board {board}: no flasher.name in {path}')
+    if flasher['name'] not in HIL_PROBE_ROUTES:
+        raise ValueError(f"--board {board} is flashed over {flasher['name']!r}, which is no debug-probe route "
+                         f"(known: {', '.join(HIL_PROBE_ROUTES)}); name the probe with explicit flags")
+    for key in ('uid', 'args', 'vid_pid'):
+        if key in flasher and (not isinstance(flasher[key], str) or not flasher[key].strip()):
+            raise ValueError(f'--board {board}: flasher.{key} in {path} must be a non-empty string, '
+                             f'got {flasher[key]!r}')
+    return flasher
 
 
-def hil_jlink_device(board, key, entry):
+def hil_jlink_device(board, flasher):
     """The J-Link device of a jlink entry, whose args may be exactly `-device NAME`: any
     other flag there would be one this script silently drops."""
-    if 'args' not in entry:
+    if 'args' not in flasher:
         return None
     try:
-        words = shlex.split(entry['args'])
+        words = shlex.split(flasher['args'])
     except ValueError as e:
-        raise ValueError(f"--board {board}: {key}.args {entry['args']!r}: {e}")
+        raise ValueError(f"--board {board}: flasher.args {flasher['args']!r}: {e}")
     if len(words) != 2 or words[0] != '-device' or not words[1].strip():
-        raise ValueError(f"--board {board}: {key}.args must be exactly '-device NAME', got "
-                         f"{entry['args']!r}; pass the probe flags explicitly instead")
+        raise ValueError(f"--board {board}: flasher.args must be exactly '-device NAME', got "
+                         f"{flasher['args']!r}; pass the probe flags explicitly instead")
     return words[1]
 
 
@@ -844,15 +840,15 @@ def main() -> int:
         ap.error('--hil-config and --board go together')
     if args.hil_config:
         try:
-            key, entry = hil_probe_entry(args.hil_config, args.board)
-            route = HIL_PROBE_ROUTES[entry['name']]
-            if entry['name'] == 'stlink' and 'args' in entry:
-                raise ValueError(f"--board {args.board}: a stlink {key}'s args are st-flash's, not "
+            flasher = hil_flasher(args.hil_config, args.board)
+            route = HIL_PROBE_ROUTES[flasher['name']]
+            if flasher['name'] == 'stlink' and 'args' in flasher:
+                raise ValueError(f"--board {args.board}: a stlink entry's args are st-flash's, not "
                                  f"openocd's; pass --cfg, and the probe flags, explicitly")
-            hil_merge(args, args.board, backend=route, probe=entry.get('uid'),
-                      vid_pid=entry.get('vid_pid') if route == 'openocd' else None,
-                      device=hil_jlink_device(args.board, key, entry) if route == 'jlink' else None,
-                      cfg=entry.get('args') if entry['name'] == 'openocd' else None)
+            hil_merge(args, args.board, backend=route, probe=flasher.get('uid'),
+                      vid_pid=flasher.get('vid_pid') if route == 'openocd' else None,
+                      device=hil_jlink_device(args.board, flasher) if route == 'jlink' else None,
+                      cfg=flasher.get('args') if flasher['name'] == 'openocd' else None)
         except ValueError as e:
             ap.error(str(e))
     if not args.backend:

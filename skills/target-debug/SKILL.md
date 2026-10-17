@@ -37,16 +37,15 @@ These skills know probes, not projects. Three things come from the project, and 
 - **What its symbols and symptoms mean**: kept here, in `projects/`, for the projects this skill has been used on — see
   "Project notes" at the end.
 
-A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it directly (`--hil-config <file> --board
-<name>`; a flag given as well must agree). The entry read is the board's `debugger` when it has one, else its `flasher`;
-the two are never merged, so a `debugger` carries its own `uid`, `vid_pid` and `args`:
+A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it directly
+(`--hil-config <file> --board <name>`; a flag given as well must agree):
 
-| field     | Means | Becomes |
-| --------- | --- | --- |
-| `name`    | `jlink`, `openocd`, `stlink` are probe routes; a flasher `esptool`, `lm4flash` or `pyocd` without a `debugger` is refused: the scripts drive none of them (Espressif debug transport and selector: `espressif.md`; LPC55 flashed by pyOCD: `families.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
-| `uid`     | the probe's serial | `--probe` |
-| `args`    | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments | `--device`, or `--cfg` whole |
-| `vid_pid` | the probe model's USB IDs, openocd only | `--vid-pid` |
+| `flasher` field | Means | Becomes |
+| --------------- | --- | --- |
+| `name`          | how the rig flashes: `jlink`, `openocd`, `stlink` are probe routes; `esptool`, `lm4flash`, `pyocd` are refused: the scripts drive none of them (Espressif debug transport and selector: `espressif.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
+| `uid`           | the probe's serial | `--probe` |
+| `args`          | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments | `--device`, or `--cfg` whole |
+| `vid_pid`       | the probe model's USB IDs, openocd only | `--vid-pid` |
 
 A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and `--speed` stay explicit; on
 the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` and `probe_state.py` take
