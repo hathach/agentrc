@@ -38,12 +38,9 @@ One kernel flock per board, `/tmp/tinyusb-hil-locks/<lock>.lock`, shared by
 every project and CI runner on a host, so tools of different projects exclude
 each other on a shared board. `<lock>` is the contract's lock name for the
 board, which may differ from its roster name. The helper that takes it, and its
-holder record (pid, reason), are the contract's Reservation: a wrapper of this
-skill's `scripts/hil_lock.py` for the project's roster and lock names, and the
-only entry point; the contract says which agentrc commit it loads, and from
-where. A runner that watches the bus (is the board enumerated, which process
-holds its usbfs node) loads this skill's `scripts/usb_observe.py` the same way,
-one module instance per process; it observes only, never resets or locks.
+holder record, are the contract's Reservation: a wrapper of this skill's
+`scripts/hil_lock.py` for the project's roster and lock names, and the only
+entry point; the contract says which agentrc commit it loads, and from where.
 
 - Never stop a CI runner. Killing a holder or releasing a hold you did not take
   happens only through the contract's Recovery procedure, under a separate
@@ -79,6 +76,9 @@ helper and any cleanup state.
   holds a board is a blocker requiring recovery, never a process to cancel.
 - Read only the report this run wrote; an older report in the checkout is not
   this run's.
+- A runner that watches the bus (is the board enumerated, which process holds
+  its usbfs node) loads this skill's `scripts/usb_observe.py` the way it loads
+  the lock helper, one module instance per process; it observes only.
 
 ## Reporting
 

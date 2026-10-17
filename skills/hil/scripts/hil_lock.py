@@ -26,6 +26,10 @@ class LockUnavailable(RuntimeError):
     run unlocked. The OSError is the __cause__."""
 
 
+class BoardLocked(RuntimeError):
+    """Another session holds the board; the message names its holder."""
+
+
 def lock_path(board: str) -> str:
     return os.path.join(BOARD_LOCK_DIR, f'{board}.lock')
 
@@ -84,14 +88,13 @@ def holder_text(info) -> str:
 
 def take_board_lock(board: str, reason: str):
     """Take the board's flock and record ourselves as its holder; returns the open handle
-    (keep it referenced; closing releases it). Raises RuntimeError('board locked: ...') when
-    another session holds the board, and LockUnavailable when the lock cannot be taken or
-    recorded (fail-closed)."""
+    (keep it referenced; closing releases it). Raises BoardLocked when another session holds
+    the board, and LockUnavailable when the lock cannot be taken or recorded (fail-closed)."""
     try:
         os.makedirs(BOARD_LOCK_DIR, exist_ok=True)
         fh = flock_nb(board)
     except BlockingIOError:
-        raise RuntimeError(f'board locked: {holder_text(read_record(board))}') from None
+        raise BoardLocked(f'board locked: {holder_text(read_record(board))}') from None
     except OSError as e:
         raise LockUnavailable(f'board lock unavailable: {e}') from e
     # announce ourselves so the other side's conflict message is truthful

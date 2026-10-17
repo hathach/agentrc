@@ -259,7 +259,7 @@ class FailsClosed(LockDir):
 class Contention(LockDir):
     def test_another_process_holds_it(self):
         self.holder(self.record(reason='hil_test.py'))
-        with self.assertRaisesRegex(RuntimeError, r'^board locked: .*hil_test\.py') as cm:
+        with self.assertRaisesRegex(hil_lock.BoardLocked, r'^board locked: .*hil_test\.py') as cm:
             self.acquire()
         self.assertNotIsInstance(cm.exception, hil_lock.LockUnavailable)
 
