@@ -502,9 +502,11 @@ STATE_BOARDS = [
     {'name': 'twin', 'flasher': {'name': 'jlink', 'uid': '2', 'args': '-device X'}},
     {'name': 'pico', 'flasher': {'name': 'openocd', 'uid': 'E6614103E72C1D2F',
                                  'args': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg'}},
-    {'name': 'lpc55', 'flasher': {'name': 'pyocd', 'uid': 'GSA0CQEQ', 'vid_pid': '0x1fc9 0x0090', 'args': '-t lpc55s28'},
+    {'name': 'lpc55', 'flasher': {'name': 'pyocd', 'uid': 'FLASHUID', 'vid_pid': '0x0d28 0x0204', 'args': '-t lpc55s28'},
      'debugger': {'name': 'openocd', 'uid': 'GSA0CQEQ', 'vid_pid': '0x1fc9 0x0090',
                   'args': '-f interface/cmsis-dap.cfg -f target/lpc55.cfg'}},
+    {'name': 'dbg_no_uid', 'flasher': {'name': 'pyocd', 'uid': 'FLASHUID', 'vid_pid': '0x0d28 0x0204', 'args': '-t lpc55s28'},
+     'debugger': {'name': 'openocd', 'args': '-f interface/cmsis-dap.cfg -f target/lpc55.cfg'}},
     {'name': 'pyocd_only', 'flasher': {'name': 'pyocd', 'uid': 'GSA0CQEQ', 'args': '-t lpc55s28'}},
     {'name': 'dbg_null', 'flasher': {'name': 'openocd', 'uid': '1', 'args': '-f x.cfg'}, 'debugger': None},
     {'name': 'dbg_no_cfg', 'flasher': {'name': 'pyocd', 'uid': '1'}, 'debugger': {'name': 'openocd', 'uid': '1'}},
@@ -1083,7 +1085,8 @@ class ProbeStateCliTest(FakeToolsCase):
         argv = self.logged()['argv']
         self.assertIn('adapter serial GSA0CQEQ', argv)
         self.assertIn('adapter usb vid_pid 0x1fc9 0x0090', argv)
-        self.assertNotIn('lpc55s28', ' '.join(argv))
+        for flasher_only in ('lpc55s28', 'FLASHUID', '0x0d28'):
+            self.assertNotIn(flasher_only, ' '.join(argv))
 
     def test_dwt_disabled_samples_are_not_reported_as_pcs(self):
         rc, out, err = self.run_cli('max32', FAKE_DEMCR='00000000', FAKE_PCSR='FFFFFFFF')
@@ -1259,6 +1262,7 @@ class ProbeStateCliTest(FakeToolsCase):
                  ('bad_ids', (), '0xVVVV 0xPPPP'), ('twin', LINK, '2 entries'), ('absent', LINK, '0 entries'),
                  ('pyocd_only', (), 'give the board a debugger entry'), ('dbg_null', (), 'no debugger.name'),
                  ('dbg_no_cfg', (), 'needs debugger.args'), ('lpc55', LINK, 'debugger.args'),
+                 ('dbg_no_uid', (), 'no debugger.uid'),
                  ('k64f', (), 'needs --interface and --speed'), ('k64f', ('--interface', 'swd', '--speed', 'fast'),
                                                                   '--speed must be kHz'),
                  ('max32', ('--speed', '4000'), 'J-Link only'), ('max32', ('--base', '0x0'), 'goes with --verify'),

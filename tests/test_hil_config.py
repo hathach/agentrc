@@ -48,9 +48,11 @@ BOARDS = [
     {'name': 'bad_cfg', 'flasher': {'name': 'openocd', 'uid': '1', 'args': '-f "unterminated'}},
     {'name': 'bad_ids', 'flasher': {'name': 'openocd', 'uid': '1', 'vid_pid': '2e8a:000c', 'args': '-f x.cfg'}},
     {'name': 'stlink_args', 'flasher': {'name': 'stlink', 'uid': '3', 'args': '--connect-under-reset'}},
-    {'name': 'lpc55', 'flasher': {'name': 'pyocd', 'uid': 'GSA0CQEQ', 'vid_pid': '0x1fc9 0x0090', 'args': '-t lpc55s28'},
+    {'name': 'lpc55', 'flasher': {'name': 'pyocd', 'uid': 'FLASHUID', 'vid_pid': '0x0d28 0x0204', 'args': '-t lpc55s28'},
      'debugger': {'name': 'openocd', 'uid': 'GSA0CQEQ', 'vid_pid': '0x1fc9 0x0090',
                   'args': '-f interface/cmsis-dap.cfg -c "transport select swd"'}},
+    {'name': 'dbg_no_uid', 'flasher': {'name': 'pyocd', 'uid': 'FLASHUID', 'vid_pid': '0x0d28 0x0204', 'args': '-t lpc55s28'},
+     'debugger': {'name': 'openocd', 'args': '-f interface/cmsis-dap.cfg -f target/lpc55.cfg'}},
     {'name': 'pyocd_only', 'flasher': {'name': 'pyocd', 'uid': 'GSA0CQEQ', 'args': '-t lpc55s28'}},
     {'name': 'dbg_null', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'}, 'debugger': None},
     {'name': 'dbg_pyocd', 'flasher': {'name': 'jlink', 'uid': '1', 'args': '-device X'},
@@ -69,6 +71,7 @@ RESOLVE_CASES = [
     ('h743', ('flasher', BOARDS[2]['flasher'])),
     ('bare', ('flasher', {'name': 'jlink'})),
     ('lpc55', ('debugger', BY_NAME['lpc55']['debugger'])),
+    ('dbg_no_uid', ('debugger', BY_NAME['dbg_no_uid']['debugger'])),
     ('p4', "flasher 'esptool' is no debug-probe route"),
     ('tm4c', "flasher 'lm4flash'"),
     ('pyocd_only', "flasher 'pyocd' is no debug-probe route (known: jlink, openocd, stlink); give the board a "
@@ -215,13 +218,25 @@ class Cli(Config):
         self.run_script('rtt', '--board', 'lpc55', '--addr', '20000000', '--seconds', '1')
         self.assertIn('adapter usb vid_pid 0x1fc9 0x0090', self.command())
         self.assertIn('adapter serial GSA0CQEQ -f interface/cmsis-dap.cfg -c transport select swd', self.command())
-        self.assertNotIn('lpc55s28', self.command())
+        for flasher_only in ('lpc55s28', 'FLASHUID', '0x0d28'):
+            self.assertNotIn(flasher_only, self.command())
         self.launched.unlink()
         self.run_script('pc_sample', '--board', 'lpc55', '--elf', str(self.elf), '--samples', '1')
         (argv,) = self.argvs()
         self.assertEqual(argv[0], str(self.bin / 'openocd'))
         self.assertIn('adapter serial GSA0CQEQ', argv)
         self.assertIn('adapter usb vid_pid 0x1fc9 0x0090', argv)
+        for flasher_only in ('lpc55s28', 'FLASHUID', '0x0d28'):
+            self.assertNotIn(flasher_only, ' '.join(argv))
+
+    def test_a_debugger_without_a_uid_takes_the_probe_from_flags_not_the_flasher(self):
+        self.refused('rtt', ['--board', 'dbg_no_uid', '--addr', '20000000'], 'needs --probe and/or --vid-pid')
+        self.run_script('rtt', '--board', 'dbg_no_uid', '--probe', '77', '--addr', '20000000', '--seconds', '1')
+        self.assertIn('adapter serial 77 -f interface/cmsis-dap.cfg -f target/lpc55.cfg', self.command())
+        self.assertNotIn('FLASHUID', self.command())
+        self.assertNotIn('0x0d28', self.command())
+        self.launched.unlink()
+        self.refused('pc_sample', ['--board', 'dbg_no_uid', '--elf', str(self.elf)], 'no debugger.uid')
 
     def test_flags_fill_what_the_file_leaves_out_and_must_agree_with_what_it_has(self):
         self.run_script('rtt', '--board', 'bare', '--probe', '77', '--device', 'Y', *self.LINK, '--seconds', '1')
