@@ -22,7 +22,8 @@ A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
 teardown, so liveness does not depend on pid reuse; the CLI pid is written
-inside), .jsonl (CLI stdout), .err (stderr), and at settle .reply and .exit
+inside; on Windows an open write handle stands for the flock), .jsonl
+(CLI stdout), .err (stderr), and at settle .reply and .exit
 (the outcome, first writer wins).
 One request per lane is in flight: a send while one is refused.
 
@@ -45,7 +46,7 @@ runs none and fails.
 import argparse
 import contextlib
 import datetime
-import fcntl
+import errno
 import json
 import os
 import re
@@ -57,6 +58,14 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows: the nt_* backend below
+    fcntl = None
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
 
 SIDES = ('codex', 'claude')
 FAILED, BUSY, MALFORMED = 1, 3, 4
@@ -84,6 +93,7 @@ TIERS = {'review': ('gpt-6-astra', 'high'), 'expert': ('gpt-6-astra', 'xhigh')} 
 PRESETS = {'astra': ('gpt-6-astra', 'high'), 'sol': ('gpt-6.1-sol', 'high')}
 PRESET = 'sol'  # the Codex default while no preference file names one
 FIELDS = ('session', 'model', 'effort', 'tier')
+GIT_ENCODING = 'utf-8' if os.name == 'nt' else None  # git speaks UTF-8 there, not the ANSI code page; else the locale's
 
 
 def die(message, code=FAILED):
@@ -94,7 +104,7 @@ def die(message, code=FAILED):
 def git_dir():
     try:
         out = subprocess.run(['git', 'rev-parse', '--show-toplevel', '--git-dir'],
-                             check=True, capture_output=True, text=True).stdout.split('\n')
+                             check=True, capture_output=True, text=True, encoding=GIT_ENCODING).stdout.split('\n')
     except subprocess.CalledProcessError:
         die('not inside a git checkout')
     root, gitdir = Path(out[0]), Path(out[1])
@@ -102,7 +112,7 @@ def git_dir():
 
 
 def git(cwd, *args, check=True):
-    done = subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True)
+    done = subprocess.run(['git', *args], cwd=cwd, capture_output=True, text=True, encoding=GIT_ENCODING)
     if check and done.returncode:
         die(f'git {args[0]} in {cwd}: {done.stderr.strip()}')
     return done
@@ -144,7 +154,7 @@ def claim(tree, box):
     before any git command that would move or delete it. Returns the branch."""
     top = git(tree, 'rev-parse', '--show-toplevel', check=False).stdout.strip()
     branch = git(tree, 'symbolic-ref', '--short', 'HEAD', check=False).stdout.strip()
-    if top != str(tree) or not (branch.startswith('cowork/') and branch.endswith(f'/{box.parent.name}-{box.name}')):
+    if Path(top) != tree or not (branch.startswith('cowork/') and branch.endswith(f'/{box.parent.name}-{box.name}')):
         die(f'{tree} is not lane {box.name}\'s worktree (toplevel {top or "none"}, branch {branch or "none"}); '
             f'move it aside', BUSY)
     dirty = git(tree, 'status', '--porcelain').stdout
@@ -228,10 +238,148 @@ def publish(path, text):
     return True
 
 
+if fcntl is None:  # Windows: open handles, msvcrt locks and a job object stand in for flock, /proc and signals
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    for _name, _restype, _argtypes in (
+            ('CreateFileW', wintypes.HANDLE, (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                              wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)),
+            ('OpenProcess', wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
+            ('GetExitCodeProcess', wintypes.BOOL, (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))),
+            ('GetProcessTimes', wintypes.BOOL, (wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4)),
+            ('CreateJobObjectW', wintypes.HANDLE, (wintypes.LPVOID, wintypes.LPCWSTR)),
+            ('AssignProcessToJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.HANDLE)),
+            ('TerminateJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.UINT)),
+            ('SetInformationJobObject', wintypes.BOOL,
+             (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)),
+            ('CloseHandle', wintypes.BOOL, (wintypes.HANDLE,))):
+        getattr(kernel32, _name).restype, getattr(kernel32, _name).argtypes = _restype, _argtypes
+    GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_DELETE, OPEN_EXISTING = 0x80000000, 1, 4, 3
+    INVALID_HANDLE_VALUE, ERROR_SHARING_VIOLATION = wintypes.HANDLE(-1).value, 32
+    PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK = 9, 0x800
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):  # BREAKAWAY_OK is an extended limit
+        _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64), ('PerJobUserTimeLimit', ctypes.c_int64),
+                    ('LimitFlags', wintypes.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t),
+                    ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', wintypes.DWORD),
+                    ('Affinity', ctypes.c_size_t), ('PriorityClass', wintypes.DWORD),
+                    ('SchedulingClass', wintypes.DWORD), ('IoInfo', ctypes.c_uint64 * 6),
+                    ('ProcessMemoryLimit', ctypes.c_size_t), ('JobMemoryLimit', ctypes.c_size_t),
+                    ('PeakProcessMemoryUsed', ctypes.c_size_t), ('PeakJobMemoryUsed', ctypes.c_size_t)]
+
+
+@contextlib.contextmanager
+def nt_lock(file):
+    """flock(LOCK_EX) on Windows: a msvcrt lock on byte 0, polled, since LK_LOCK gives up after ~10 s."""
+    os.lseek(file.fileno(), 0, os.SEEK_SET)
+    while True:
+        try:
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+            break
+        except OSError as failure:
+            if failure.errno not in (errno.EACCES, errno.EDEADLOCK):  # held by another; anything else is an error
+                raise
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        os.lseek(file.fileno(), 0, os.SEEK_SET)
+        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def nt_written(path):
+    """True while any handle with write access to `path` is open, in any
+    process: an open for reading that shares only reading then fails. Probes
+    and readers never fail it, and it shares deletion, so a probe never blocks
+    a delivery's unlink."""
+    handle = kernel32.CreateFileW(str(path), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, None,
+                                  OPEN_EXISTING, 0, None)
+    if handle == INVALID_HANDLE_VALUE:
+        return ctypes.get_last_error() == ERROR_SHARING_VIOLATION
+    kernel32.CloseHandle(handle)
+    return False
+
+
+def nt_born(pid):
+    """When a live process was created, in ns since the epoch; None once it is gone."""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        code, times = wintypes.DWORD(), [wintypes.FILETIME() for _ in range(4)]
+        if not (kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value == STILL_ACTIVE
+                and kernel32.GetProcessTimes(handle, *map(ctypes.byref, times))):
+            return None
+        return ((times[0].dwHighDateTime << 32 | times[0].dwLowDateTime) - 116444736000000000) * 100
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def nt_popen(argv, handle, creationflags=0, **kwargs):
+    """Popen that hands the child `handle` and its standard handles, nothing
+    else, with no console window."""
+    os.set_handle_inheritable(handle, True)
+    return subprocess.Popen(argv, close_fds=True, startupinfo=subprocess.STARTUPINFO(lpAttributeList={
+        'handle_list': [handle]}), creationflags=subprocess.CREATE_NO_WINDOW | creationflags, **kwargs)
+
+
+def nt_detach(argv, cwd, handle, stderr):
+    """Start the runner, or the middle process that starts it, outside the
+    caller's console, process group and, where the job allows, its job."""
+    group = subprocess.CREATE_NEW_PROCESS_GROUP
+    kwargs = dict(cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr)
+    try:
+        return nt_popen(argv, handle, group | subprocess.CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+    except PermissionError:  # a job that forbids breakaway
+        stderr.flush()
+        os.write(stderr.fileno(), b'cowork: the caller\'s job refused breakaway; the runner dies with that job\n')
+        return nt_popen(argv, handle, group, **kwargs)
+
+
+def nt_cli(argv):
+    """argv with its program found on PATH alone, an .exe before a .cmd or
+    .bat: shutil.which and CreateProcess would try the checkout first, where
+    a contributor's claude.cmd may sit. A batch file runs through cmd.exe,
+    which reparses what list2cmdline quoted (BatBadBut): refused when any
+    argument, the checkout path included, has a character it would expand."""
+    exts = ('.exe', '.cmd', '.bat')
+    program = next((p for d in os.environ.get('PATH', '').split(os.pathsep) if d
+                    for p in (os.path.join(d, argv[0] + e) for e in exts) if os.path.isfile(p)), None)
+    if program is None:
+        raise FileNotFoundError(f'{argv[0]} is not on PATH as {", ".join(argv[0] + e for e in exts)}')
+    if program.lower().endswith(('.cmd', '.bat')) and any(set(arg) & set('%^&|<>!"') for arg in (program, *argv[1:])):
+        raise OSError(f'{program} is a batch file, and cmd.exe would reinterpret one of %^&|<>!" in its arguments '
+                      f'(the checkout path among them); install the native {argv[0]}.exe or move the checkout')
+    return [program, *argv[1:]]
+
+
+def nt_job(child):
+    """A job holding the CLI's tree, so one call kills it all; None if the
+    child cannot join one. The CLI starts before it joins, so what it spawns
+    in that instant stays outside. A tool may still leave by asking for
+    breakaway, as on POSIX one may leave the process group with setsid."""
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION(LimitFlags=JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+    if not kernel32.SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits),
+                                            ctypes.sizeof(limits)):
+        print(f'cowork: the CLI\'s job refused breakaway for its tools (error {ctypes.get_last_error()})',
+              file=sys.stderr)
+    if not kernel32.AssignProcessToJobObject(job, int(child._handle)):
+        kernel32.CloseHandle(job)
+        return None
+    return job
+
+
 @contextlib.contextmanager
 def admission(box):
     """Only one process reads or changes a side's requests at a time."""
-    with (box / 'lock').open('w') as lock:
+    with (box / 'lock').open('w' if fcntl else 'a') as lock:
+        if fcntl is None:
+            with nt_lock(lock):
+                yield
+            return
         fcntl.flock(lock, fcntl.LOCK_EX)
         yield
 
@@ -239,6 +387,12 @@ def admission(box):
 def held(lock_file, wait=False):
     """True while a runner, its CLI or anything they spawned still holds this
     request's lock exclusively; with `wait`, block until they let go."""
+    if fcntl is None:  # they hold it open for writing; polled
+        while nt_written(lock_file):
+            if not wait:
+                return True
+            time.sleep(0.2)
+        return False
     try:
         with lock_file.open('r') as handle:
             fcntl.flock(handle, fcntl.LOCK_SH | (0 if wait else fcntl.LOCK_NB))
@@ -252,6 +406,14 @@ def held(lock_file, wait=False):
 def holds(pid, lock_file):
     """True if that process has the request lock open: the CLI we started,
     not a later process that got its pid."""
+    if fcntl is None:  # no /proc: one created after the lock and before the runner wrote its pid there
+        # Strict on purpose: it needs local NTFS's sub-ms times, and a coarser filesystem may refuse a real
+        # orphan rather than let any slack take a reused pid for ours.
+        try:
+            stat, born = lock_file.stat(), nt_born(pid)
+        except OSError:
+            return False
+        return born is not None and getattr(stat, 'st_birthtime_ns', stat.st_ctime_ns) <= born <= stat.st_mtime_ns
     try:
         return any(os.readlink(fd) == str(lock_file) for fd in Path(f'/proc/{pid}/fd').iterdir())
     except OSError:
@@ -275,8 +437,30 @@ def state(box, request):
 
 
 def remove(box, request):
+    """Remove a request's files; on Windows, all that can go even when one is
+    still open elsewhere (then raised), so no half of it reads as a request."""
+    stuck = None
     for leftover in box.glob(f'{request}.*'):
-        leftover.unlink()
+        try:
+            retry(leftover.unlink)
+        except PermissionError as failure:
+            if os.name != 'nt':
+                raise
+            stuck = stuck or failure
+    if stuck:
+        raise stuck
+
+
+def retry(step):
+    """On Windows, a file another process has open cannot be removed or
+    replaced: retry for a second, then raise. Elsewhere, once."""
+    for attempt in reversed(range(50 if os.name == 'nt' else 1)):
+        try:
+            return step()
+        except PermissionError:
+            if not attempt:
+                raise
+            time.sleep(0.02)
 
 
 def running(box):
@@ -297,8 +481,8 @@ def replace_text(path, text):
     failure leaves no temp file behind."""
     tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
     try:
-        tmp.write_text(text, encoding='utf-8')
-        os.replace(tmp, path)
+        tmp.write_bytes(text.encode('utf-8'))  # untranslated: the same bytes on every OS
+        retry(lambda: os.replace(tmp, path))
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -392,12 +576,23 @@ def children_of():
     return table
 
 
-def kill_tree(pid):
+def kill_tree(pid, job=None):
     """SIGKILL a process and everything under it. Codex runs its shell tool
     in its own session, so the process group is not enough. Freeze each
     process as it is found and rescan until the frozen tree grows no more,
     so nothing spawned mid-walk escapes. A process we may not signal (sudo's
-    child) is skipped; its parent still dies."""
+    child) is skipped; its parent still dies. On Windows taskkill follows
+    parent links from one snapshot, without freezing, so it misses what is
+    spawned meanwhile and what outlived its parent; the runner's job object,
+    where there is one (not for `kill`), then takes the rest of the tree at
+    once, all but a tool that asked to break away, which taskkill took while
+    its parent lived."""
+    if fcntl is None:
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+        if job:
+            kernel32.TerminateJobObject(job, 1)
+        return
     frozen = set()
     while True:
         table, stack, grown = children_of(), [pid], False
@@ -420,7 +615,7 @@ def run(side, box, host, request, no_edit, lock_fd):
     """One coworker turn, in the detached runner, whose stderr is <id>.err.
     Publishes the verdict unless `kill` got there first, then lets go."""
     exit_file, reply, stream = (box / f'{request}.{ext}' for ext in ('exit', 'reply', 'jsonl'))
-    status, child, before = 'failed', None, None
+    status, child, before, job = 'failed', None, None, None
     root = tree_of(box, host)
     try:
         if exit_file.exists():  # killed before it started
@@ -433,7 +628,8 @@ def run(side, box, host, request, no_edit, lock_fd):
             where = WHERE.format(root=root, branch=git(root, 'symbolic-ref', '--short', 'HEAD').stdout.strip(),
                                  base=(box / 'base').read_text().strip()[:12])
         task = box / f'{request}.task'
-        prompt = compose(session, side, request, task.read_text(), no_edit, root, model, effort, box.name, where)
+        prompt = compose(session, side, request, task.read_text(encoding='utf-8'), no_edit, root, model, effort,
+                         box.name, where)
         task.unlink()
         argv, new_session = command(side, session, reply, no_edit, model, effort)
         env = {k: v for k, v in os.environ.items()  # the coworker is nobody's driver
@@ -443,17 +639,28 @@ def run(side, box, host, request, no_edit, lock_fd):
         with tempfile.TemporaryFile() as stdin, stream.open('ab') as out:
             stdin.write(prompt.encode())
             stdin.seek(0)
-            child = subprocess.Popen(argv, cwd=root, stdin=stdin, stdout=out, env=env,
-                                     start_new_session=True, pass_fds=(lock_fd,))
-        os.pwrite(lock_fd, f'{child.pid}\n'.encode(), 0)  # for `kill`, should this runner die first
+            if fcntl is None:
+                child = nt_popen(nt_cli(argv), msvcrt.get_osfhandle(lock_fd), cwd=root, stdin=stdin, stdout=out,
+                                 env=env)
+                job = nt_job(child)
+            else:
+                child = subprocess.Popen(argv, cwd=root, stdin=stdin, stdout=out, env=env,
+                                         start_new_session=True, pass_fds=(lock_fd,))
+        if fcntl is None:  # no os.pwrite
+            os.lseek(lock_fd, 0, os.SEEK_SET)
+            os.write(lock_fd, f'{child.pid}\n'.encode())
+        else:
+            os.pwrite(lock_fd, f'{child.pid}\n'.encode(), 0)  # for `kill`, should this runner die first
         while child.poll() is None and not exit_file.exists():
             time.sleep(0.2)
         status = 'killed' if exit_file.exists() else str(child.returncode)
     except BaseException as failure:  # a missing CLI, anything: leave no orphan
         print(repr(failure), file=sys.stderr)
     finally:
-        if child is not None and child.poll() is None:
-            kill_tree(child.pid)
+        # On Windows, a killed CLI's job also holds what the taskkill of `kill` may have missed, even when
+        # the CLI itself had already exited: POSIX leaves that CLI's grandchildren alone.
+        if child is not None and (child.poll() is None or job and exit_file.exists()):
+            kill_tree(child.pid, job)
             child.wait()
         if child is not None:
             status = conclude(side, box, status, reply, stream, new_session, before, root)
@@ -480,7 +687,7 @@ def conclude(side, box, status, reply, stream, new_session, before, root):
             print(f'claude ended without a usable result: {result}', file=sys.stderr)
             status = 'failed'
         else:
-            reply.write_text(result.get('result') or '', encoding='utf-8')
+            reply.write_bytes((result.get('result') or '').encode('utf-8'))  # as Codex writes its own, untranslated
             if new_session:
                 update_side(box, session=new_session)
     if status == '0' and before is not None:
@@ -595,7 +802,8 @@ def tree_state(root):
     An unborn or detached HEAD and a missing index are states; any other
     failure raises."""
     def git(*args, ok=(0,), **env):
-        done = subprocess.run(['git', *args], cwd=root, capture_output=True, text=True, env={**os.environ, **env})
+        done = subprocess.run(['git', *args], cwd=root, capture_output=True, text=True, encoding=GIT_ENCODING,
+                              errors='replace' if GIT_ENCODING else None, env={**os.environ, **env})
         if done.returncode not in ok:
             raise SnapshotError(f'could not verify the tree: git {" ".join(args)}: '
                                 f'{done.stderr.strip() or f"exit {done.returncode}"}')
@@ -698,7 +906,13 @@ def deliver(box, request, out=None):
                 die(f'cowork request {request}: could not write {out} ({failure}); the request is kept: '
                     f'read it again with a writable --out', BUSY)
         print(notes + receipt, end='', file=sys.stderr, flush=True)
-        remove(box, request)
+        try:
+            remove(box, request)
+        except PermissionError as failure:  # on Windows, a file still open: delivered all the same
+            if os.name != 'nt':
+                raise
+            print(f'cowork request {request}: delivered, but {failure.filename} is still open in another process; '
+                  f'remove what is left of the request once it lets go', file=sys.stderr, flush=True)
     return code
 
 
@@ -738,9 +952,16 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
                 sync_lane(root, box)
         settle_pair(box, side, model, effort, tier)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
-        (box / f'{request}.task').write_text(task)
+        (box / f'{request}.task').write_text(task, encoding='utf-8')
         (box / f'{request}.jsonl').touch()
         with (box / f'{request}.lock').open('w') as lock, (box / f'{request}.err').open('ab') as err:
+            if fcntl is None:
+                # The open handle is the lock. A middle process starts the runner and exits, so the
+                # runner is no descendant of `send` that a harness's tree kill could reach.
+                handle = msvcrt.get_osfhandle(lock.fileno())
+                nt_detach([sys.executable, __file__, '_detach', side, lane, request, str(int(no_edit)), str(handle)],
+                          root, handle, err).wait()
+                return request
             fcntl.flock(lock, fcntl.LOCK_EX)
             argv = [sys.executable, __file__, '_run', side, lane, request, str(int(no_edit)), str(lock.fileno())]
             # Double fork: the runner's parent exits at once, so it hangs off init, in its own
@@ -812,10 +1033,19 @@ def main(argv=None):
                                           'the next send starts anew')
     reset_.add_argument('side', choices=SIDES)
     reset_.add_argument('lane', help='a lane name, or all')
-    runner = sub.add_parser('_run', help=argparse.SUPPRESS)  # the detached child of `send`
-    for name in ('side', 'lane', 'request', 'no_edit', 'lock_fd'):
-        runner.add_argument(name)
+    # the detached child of `send`; on Windows, also the middle process that starts it
+    for cmd in ('_run',) + (() if fcntl else ('_detach',)):
+        runner = sub.add_parser(cmd, help=argparse.SUPPRESS)
+        for name in ('side', 'lane', 'request', 'no_edit', 'lock_fd'):
+            runner.add_argument(name)
     a = parser.parse_args(argv)
+    if sys.platform in ('cygwin', 'msys'):  # its POSIX locks and signals would not reach the native CLIs
+        die('cowork: on Windows, run it with a native Windows CPython (python.org or MinGW), not a Cygwin or MSYS one')
+
+    if a.cmd == '_detach':  # the lock "fd" is a handle on Windows
+        nt_detach([sys.executable, __file__, '_run', a.side, a.lane, a.request, a.no_edit, a.lock_fd], os.getcwd(),
+                  int(a.lock_fd), sys.stderr)
+        return 0
 
     if a.cmd == 'default':
         path = preset_file()
@@ -829,7 +1059,8 @@ def main(argv=None):
 
     root, gitdir = git_dir()
     if a.cmd == '_run':
-        run(a.side, box_of(gitdir, a.side, a.lane), root, a.request, a.no_edit == '1', int(a.lock_fd))
+        lock_fd = int(a.lock_fd) if fcntl else msvcrt.open_osfhandle(int(a.lock_fd), os.O_RDWR)
+        run(a.side, box_of(gitdir, a.side, a.lane), root, a.request, a.no_edit == '1', lock_fd)
         return 0
 
     if a.cmd == 'send':
@@ -844,7 +1075,12 @@ def main(argv=None):
             die(f'lane names are [a-z0-9-], up to 40, and not "all": {a.lane!r}')
         box = box_of(gitdir, side, a.lane)
         box.mkdir(parents=True, exist_ok=True)
-        task = sys.stdin.read() if a.task == '-' else a.task
+        try:
+            task = sys.stdin.read() if a.task == '-' else a.task
+        except UnicodeDecodeError:
+            if os.name != 'nt':
+                raise
+            die('--task - must be UTF-8')  # stdin is read as UTF-8 there, not in the ANSI code page
         if not task.strip():
             die('the task resolved to nothing')
         request = start(box, root, side, task, a.no_edit, a.read_only, a.worktree, a.model, a.effort, a.tier)
@@ -911,4 +1147,8 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':  # piped stdio would use the ANSI code page; tasks, replies and diagnostics are UTF-8
+        for stream, errors in ((sys.stdin, 'strict'), (sys.stdout, 'strict'), (sys.stderr, 'backslashreplace')):
+            if stream:
+                stream.reconfigure(encoding='utf-8', errors=errors)
     sys.exit(main())

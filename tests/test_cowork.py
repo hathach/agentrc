@@ -1,22 +1,27 @@
 import contextlib
-import os
-import unittest
-
-if os.name == 'nt':
-    raise unittest.SkipTest('cowork requires POSIX file locking and process semantics')
-
-import fcntl
+import errno
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import unittest
 from pathlib import Path
 from unittest import mock
 
-import yaml
+try:
+    import fcntl
+except ImportError:  # Windows: an open write handle is the request lock
+    fcntl = None
+    import msvcrt
+try:
+    import yaml
+except ImportError:  # MSYS2's python3 ships none
+    yaml = None
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'skills' / 'cowork' / 'scripts' / 'cowork.py'
@@ -29,7 +34,7 @@ import cowork  # noqa: E402
 # keep a turn busy exactly as long as its assertions need.
 FAKE_PREAMBLE = '''#!/usr/bin/env python3
 import json, os, sys, time
-args, prompt = sys.argv[1:], sys.stdin.read()
+args, prompt = sys.argv[1:], sys.stdin.buffer.read().decode('utf-8')
 open(os.environ['FAKE_LOG'], 'a').write(json.dumps({'argv': args, 'stdin': prompt, 'cwd': os.getcwd(),
     'env': {k: v for k, v in os.environ.items() if k.startswith(('COWORK', 'HERDR', 'CLAUDECODE'))}}) + '\\n')
 while os.environ.get('FAKE_GATE') and not os.path.exists(os.environ['FAKE_GATE']):
@@ -41,7 +46,8 @@ if os.environ.get('FAKE_EXIT', '0') != '0':
     print(json.dumps({'type': 'turn.failed', 'error': {'message': 'usage limit reached'}}))
     sys.stderr.buffer.write(os.environ.get('FAKE_STDERR', '').encode('latin-1'))
     sys.exit(int(os.environ['FAKE_EXIT']))
-open(args[args.index('-o') + 1], 'w').write(os.environ.get('FAKE_REPLY', 'codex reply\\nFiles touched: none\\n'))
+open(args[args.index('-o') + 1], 'w', encoding='utf-8', newline='').write(
+    os.environ.get('FAKE_REPLY', 'codex reply\\nFiles touched: none\\n'))
 if os.environ.get('FAKE_USAGE'):
     print(json.dumps({'type': 'turn.completed', 'usage': json.loads(os.environ['FAKE_USAGE'])}))
 if os.environ.get('FAKE_ROLLOUT'):  # what Codex records of the turn: turn n's two calls send 1000n and 1500n
@@ -95,6 +101,66 @@ def until(condition, timeout=10):
         time.sleep(0.02)
 
 
+SLEEP = [sys.executable, '-c', 'import time; time.sleep(30)']
+KILLED = 1 if os.name == 'nt' else -9  # what taskkill /F leaves for an exit code
+
+
+@contextlib.contextmanager
+def holding(path, mode='w'):
+    """A request lock held as a runner holds it: flocked, or on Windows open for writing."""
+    with open(path, mode) as lock:
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        yield lock
+
+
+@contextlib.contextmanager
+def reading(path):
+    """Another reader of the request lock: a shared flock, or on Windows a probe as held() opens it."""
+    if fcntl:
+        with open(path) as reader:
+            fcntl.flock(reader, fcntl.LOCK_SH)
+            yield
+        return
+    handle = cowork.kernel32.CreateFileW(str(path), cowork.GENERIC_READ, cowork.FILE_SHARE_READ | cowork.FILE_SHARE_DELETE,
+                                         None, cowork.OPEN_EXISTING, 0, None)
+    assert handle != cowork.INVALID_HANDLE_VALUE
+    try:
+        yield
+    finally:
+        cowork.kernel32.CloseHandle(handle)
+
+
+def spawn_holding(lock, argv):
+    """A process that inherits the request lock, as the runner's CLI does."""
+    if fcntl is None:
+        return cowork.nt_popen(argv, msvcrt.get_osfhandle(lock.fileno()))
+    return subprocess.Popen(argv, pass_fds=(lock.fileno(),))
+
+
+def gone(pid):
+    if os.name == 'nt':
+        return cowork.nt_born(pid) is None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    return False
+
+
+def launcher(bin_dir, name, script):
+    """<bin_dir>/<name>.exe running `script` with this Python: CreateProcess
+    runs only an .exe by name, and a missing stand-in must never fall through
+    to the real CLI on PATH."""
+    from pip._vendor.distlib.scripts import ScriptMaker
+    source = bin_dir.parent / 'launch' / f'{name}.py'
+    source.parent.mkdir(exist_ok=True)
+    source.write_text(f'#!python\nimport runpy\nrunpy.run_path({str(script)!r}, run_name="__main__")\n')
+    maker = ScriptMaker(str(source.parent), str(bin_dir))
+    maker.executable, maker.variants = sys.executable, {''}
+    maker.make(source.name)
+
+
 class CoworkTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -104,17 +170,23 @@ class CoworkTest(unittest.TestCase):
         sh(self.root, 'git', 'init', '-q', '-b', 'main')
         self.bin = base / 'bin'
         self.bin.mkdir()
+        self.stubs = base / 'stubs' if os.name == 'nt' else self.bin  # what the fake CLIs run
+        self.stubs.mkdir(exist_ok=True)
         for name, body in (('codex', FAKE_CODEX), ('claude', FAKE_CLAUDE)):
-            (self.bin / name).write_text(body)
-            (self.bin / name).chmod(0o755)
+            self.fake(name, body)
+            if os.name == 'nt':
+                launcher(self.bin, name, self.stubs / name)
         self.log = base / 'calls.jsonl'
         self.gate = base / 'gate'
         clean = {k: v for k, v in os.environ.items() if not k.startswith(('FAKE_', 'HERDR_', 'COWORK', 'CODEX_', 'CLAUDE_'))}
         self.env = mock.patch.dict('os.environ', {
-            **clean, 'PATH': f'{self.bin}:{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1',
+            **clean, 'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1',
+            'HOME': str(base / 'home'), 'USERPROFILE': str(base / 'home'),
             'XDG_CONFIG_HOME': str(base / 'config'), 'CODEX_HOME': str(base / 'codex'),
             'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
-            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}, clear=True)
+            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+            # Git for Windows enables fsmonitor system-wide: its daemon would outlive each repo, holding the dir
+            'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.fsmonitor', 'GIT_CONFIG_VALUE_0': 'false'}, clear=True)
         self.env.start()
         self.cwd = os.getcwd()
         os.chdir(self.root)
@@ -131,21 +203,41 @@ class CoworkTest(unittest.TestCase):
                     pipe.close()
         for box in Path(self.tmp.name).glob('repo/.git/cowork/*/*'):  # runners hang off init, not off us
             for request in cowork.requests(box):
-                subprocess.run(['pkill', '-9', '-f', f'cowork.py _run \\S+ \\S+ {request} '], stderr=subprocess.DEVNULL)
-                pid = cowork.cli_pid(box / f'{request}.lock')
-                if pid and cowork.holds(int(pid), box / f'{request}.lock'):
-                    os.kill(int(pid), 9)
+                lock = box / f'{request}.lock'
+                if os.name != 'nt':
+                    subprocess.run(['pkill', '-9', '-f', f'cowork.py _run \\S+ \\S+ {request} '], stderr=subprocess.DEVNULL)
+                pid = cowork.cli_pid(lock)
+                if pid and cowork.holds(int(pid), lock):
+                    if os.name == 'nt':
+                        cowork.kill_tree(int(pid))
+                    else:
+                        os.kill(int(pid), 9)
+                if os.name == 'nt':  # the runner goes with its CLI
+                    with contextlib.suppress(AssertionError):
+                        until(lambda: not cowork.held(lock))
         os.chdir(self.cwd)
         self.env.stop()
-        self.tmp.cleanup()
+        for attempt in reversed(range(50 if os.name == 'nt' else 1)):  # a process letting go may still be exiting
+            try:
+                self.tmp.cleanup()
+                break
+            except OSError:
+                if not attempt:
+                    raise
+                time.sleep(0.1)
 
     def calls(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
 
+    def fake(self, name, body):
+        """What the fake `name` CLI runs: the executable itself, or on Windows the script its launcher runs."""
+        (self.stubs / name).write_text(body, encoding='utf-8')
+        (self.stubs / name).chmod(0o755)
+
     def codex_does(self, snippet):
         """A fake codex that runs `snippet` (Python) before replying."""
-        (self.bin / 'codex').write_text(FAKE_CODEX.replace("while os.environ.get('FAKE_GATE')",
-                                                           f"{snippet}\nwhile os.environ.get('FAKE_GATE')", 1))
+        self.fake('codex', FAKE_CODEX.replace("while os.environ.get('FAKE_GATE')",
+                                              f"{snippet}\nwhile os.environ.get('FAKE_GATE')", 1))
 
     def run_cli(self, *argv, stdin=''):
         out, err = io.StringIO(), io.StringIO()
@@ -191,10 +283,22 @@ class CoworkTest(unittest.TestCase):
         until(lambda: not cowork.held(self.box() / f'{request}.lock'))
 
     def read_wait(self, request):
-        proc = subprocess.Popen([sys.executable, str(SCRIPT), 'read', '--wait', request], cwd=self.root,
+        argv = [str(SCRIPT)]
+        if os.name == 'nt':  # it polls without holding the lock open: a sentinel marks that it waits
+            polling = Path(self.tmp.name) / f'polling-{len(self.background)}'
+            argv = ['-c', f'import pathlib, sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import cowork\n'
+                          f'held = cowork.held\n'
+                          f'def waiting(lock, wait=False):\n'
+                          f'    wait and pathlib.Path({str(polling)!r}).touch()\n'
+                          f'    return held(lock, wait)\n'
+                          f'cowork.held = waiting\nsys.exit(cowork.main(sys.argv[1:]))']
+        proc = subprocess.Popen([sys.executable, *argv, 'read', '--wait', request], cwd=self.root,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.background.append(proc)
-        until(lambda: proc.poll() is not None or cowork.holds(proc.pid, self.box() / f'{request}.lock'))
+        if os.name == 'nt':
+            until(lambda: proc.poll() is not None or polling.exists())
+        else:
+            until(lambda: proc.poll() is not None or cowork.holds(proc.pid, self.box() / f'{request}.lock'))
         self.assertIsNone(proc.poll())
         return proc
 
@@ -517,6 +621,15 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, 0, 'a literal is a literal, even one that names a file')
         self.assertEqual(task_of(self.calls()[1]['stdin']), 'task.md')
 
+    def test_a_non_ascii_task_and_reply_cross_the_real_stdio_as_utf8(self):
+        task, reply = 'check ✔ • café — 中', 'done ✔ — café\nFiles touched: none\n'
+        env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
+        done = subprocess.run([sys.executable, str(SCRIPT), 'send', '--task', '-'], cwd=self.root, input=task.encode(),
+                              capture_output=True, timeout=30, env={**env, 'PYTHONUTF8': '0', 'FAKE_REPLY': reply})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.decode().replace('\r\n', '\n').partition('\n')[2], reply)
+        self.assertEqual(task_of(self.calls()[0]['stdin']), task)
+
     def test_an_empty_task_never_reaches_the_coworker(self):
         for argv in (('--task', ''), ('--task', '-')):
             code, _, _, err = self.send(*argv)
@@ -640,7 +753,7 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(self.leftovers(request), [], 'delivered, so nothing stays')
 
     def test_codex_exiting_clean_without_a_reply_is_a_failure(self):
-        (self.bin / 'codex').write_text(FAKE_CODEX.replace("open(args[args.index('-o') + 1], 'w')", "open(os.devnull, 'w')"))
+        self.fake('codex', FAKE_CODEX.replace("open(args[args.index('-o') + 1], 'w'", "open(os.devnull, 'w'"))
         code, _, reply, _ = self.send('--task', 'x')
         self.assertEqual(code, 1)
         self.assertIn('without writing its last message', reply)
@@ -668,7 +781,7 @@ class CoworkTest(unittest.TestCase):
         self.assertTrue(err.endswith(receipt(request, 'tree-changed', cowork.MALFORMED)), err)
         self.assertIn('the tree changed', err)
         (self.root / 'new.c').unlink()
-        self.codex_does("import shutil; shutil.rmtree('.git/objects')")
+        self.codex_does("import shutil, stat; shutil.rmtree('.git/objects', onerror=lambda f, p, _: (os.chmod(p, stat.S_IWRITE), f(p)))")
         code, request, _, err = self.send('--no-edit', '--task', 'x')
         self.assertEqual(code, cowork.MALFORMED)
         self.assertTrue(err.endswith(receipt(request, 'unverified', cowork.MALFORMED)), err)
@@ -729,7 +842,7 @@ class CoworkTest(unittest.TestCase):
             with self.subTest(status=status, reply=reply):
                 (box / 'codex-x.exit').write_text(status + '\n')
                 if reply is not None:
-                    (box / 'codex-x.reply').write_text(reply)
+                    (box / 'codex-x.reply').write_bytes(reply.encode())
                 (box / 'codex-x.lock').touch()
                 code, out, err = self.run_cli('read', 'codex-x')
                 self.assertTrue(err.endswith(receipt('codex-x', outcome, cowork.OUTCOMES[outcome])), err)
@@ -737,11 +850,173 @@ class CoworkTest(unittest.TestCase):
                     self.assertIn('codex-x exited 2', out)
 
     def test_a_missing_cli_is_reported_not_raised(self):
-        (self.bin / 'codex').unlink()
-        code, _, reply, _ = self.send('--task', 'x', PATH=f'{self.bin}:{os.path.dirname(shutil.which("git"))}')
+        (self.bin / ('codex.exe' if os.name == 'nt' else 'codex')).unlink()
+        code, _, reply, _ = self.send('--task', 'x', PATH=f'{self.bin}{os.pathsep}{os.path.dirname(shutil.which("git"))}')
         self.assertEqual(code, 1)
         self.assertIn('failed', reply)
-        self.assertIn('No such file', reply)
+        self.assertIn('codex is not on PATH as codex.exe, codex.cmd, codex.bat' if os.name == 'nt' else 'No such file',
+                      reply)
+
+    @unittest.skipIf(os.name != 'nt', 'CreateProcess and shutil.which search the current directory on Windows only')
+    def test_the_cli_is_found_on_path_alone_never_in_the_checkout(self):
+        (self.root / 'codex.cmd').write_text('@echo hijacked> hijacked\r\n')  # a contributor's checkout
+        env = {k: v for k, v in os.environ.items() if k.lower() != 'nodefaultcurrentdirectoryinexepath'}
+        with mock.patch.dict('os.environ', env, clear=True):
+            code, _, reply, _ = self.send('--task', 'x')
+        self.assertEqual((code, reply), (0, 'codex reply\nFiles touched: none\n'))
+        self.assertFalse((self.root / 'hijacked').exists())
+        self.assertEqual(len(self.calls()), 1)
+        first, second = Path(self.tmp.name) / 'first', Path(self.tmp.name) / 'second'
+        for where, names in ((first, ('codex.cmd',)), (second, ('codex.exe', 'codex.cmd'))):
+            where.mkdir()
+            for name in names:
+                (where / name).touch()
+        for path, found in (((first, second), first / 'codex.cmd'), ((second, first), second / 'codex.exe')):
+            with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': os.pathsep.join(map(str, path))}):
+                self.assertEqual(cowork.nt_cli(['codex', 'exec']), [str(found), 'exec'], 'PATH order, then .exe first')
+
+    @unittest.skipIf(os.name != 'nt', 'cmd.exe runs batch files on Windows only')
+    def test_a_batch_file_cli_runs_but_never_with_an_argument_cmd_would_reparse(self):
+        (self.bin / 'claude.exe').unlink()  # an npm install: claude.cmd only
+        (self.bin / 'claude.cmd').write_text(f'@"{sys.executable}" "{self.stubs / "claude"}" %*\r\n')
+        code, _, reply, _ = self.send('--to', 'claude', '--task', 'q')
+        self.assertEqual((code, reply), (0, 'claude reply\nFiles touched: a.c\n'))
+        code, _, reply, _ = self.send('--to', 'claude', '--model', 'x&echo.>injected', '--task', 'q')
+        self.assertEqual(code, 1)
+        self.assertIn('is a batch file, and cmd.exe would reinterpret', reply)
+        self.assertFalse((self.root / 'injected').exists())
+        self.assertEqual(len(self.calls()), 1, 'refused before it ran')
+
+    @unittest.skipIf(os.name != 'nt', 'job objects are Windows')
+    def test_a_refused_breakaway_is_noted_in_the_requests_err(self):
+        err = Path(self.tmp.name) / 'x.err'
+        with mock.patch.object(cowork, 'nt_popen', side_effect=[PermissionError(5, 'Access is denied'), 'runner']), \
+                err.open('ab') as stream:
+            self.assertEqual(cowork.nt_detach(['x'], '.', 0, stream), 'runner')
+        self.assertIn(b'refused breakaway', err.read_bytes())
+
+    @unittest.skipIf(os.name != 'nt', 'job objects are Windows')
+    def test_a_tool_may_ask_to_break_away_from_the_clis_job(self):
+        # the CLI itself, not a launcher: the fakes' launcher lets them break away from its own job
+        gate = Path(self.tmp.name) / 'joined'
+        away = (f"import os, subprocess, sys, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.02)\n"
+                "try:\n    subprocess.run([sys.executable, '-c', ''], creationflags=subprocess.CREATE_BREAKAWAY_FROM_JOB, "
+                "check=True); print('left')\nexcept OSError as e:\n    print(repr(e))")
+        cli = subprocess.Popen([sys.executable, '-c', away], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            job = cowork.nt_job(cli)
+        gate.touch()
+        out, _ = cli.communicate(timeout=10)
+        cowork.kernel32.CloseHandle(job)
+        self.assertEqual((out.strip(), err.getvalue()), ('left', ''))
+
+    @unittest.skipIf(os.name != 'nt', 'the job object is the Windows backend')
+    def test_kill_takes_a_daemon_whose_parent_already_exited(self):
+        daemon = ("import subprocess, sys; open('daemon.pid', 'w').write(str(subprocess.Popen("
+                  f"{SLEEP!r}, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP).pid))")
+        self.codex_does(f'import subprocess; subprocess.run([sys.executable, "-c", {daemon!r}])')
+        proc, request = self.send_gated('--task', 'x')
+        until(lambda: (self.root / 'daemon.pid').exists() and (self.root / 'daemon.pid').read_text())
+        pid = int((self.root / 'daemon.pid').read_text())
+        try:
+            self.run_cli('kill', request)
+            proc.wait(timeout=10)
+            until(lambda: gone(pid), timeout=5)  # taskkill finds no parent link to it: only the job holds it
+        finally:
+            subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True)
+
+    @unittest.skipIf(os.name != 'nt', 'msvcrt locks are Windows')
+    def test_admission_retries_only_a_lock_held_by_another(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        for failure, raised in ((OSError(errno.EACCES, 'held'), False), (OSError(errno.EBADF, 'bad'), True)):
+            with self.subTest(failure=failure), mock.patch.object(cowork.msvcrt, 'locking',
+                                                                  side_effect=[failure, None, None]):
+                with contextlib.ExitStack() as stack:
+                    if raised:
+                        stack.enter_context(self.assertRaises(OSError))
+                    stack.enter_context(cowork.admission(box))
+
+    @unittest.skipIf(os.name != 'nt', 'an open file blocks its removal on Windows only')
+    def test_a_request_file_still_open_elsewhere_neither_loses_the_reply_nor_raises(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        for let_go in (0.3, None):
+            with self.subTest(let_go=let_go):
+                for ext, body in (('exit', b'0\n'), ('reply', b'done\nFiles touched: none\n'), ('lock', b''),
+                                  ('err', b''), ('jsonl', b'')):
+                    (box / f'codex-x.{ext}').write_bytes(body)
+                holder = (box / 'codex-x.jsonl').open()  # what a grandchild inherited as its stdout
+                timer = let_go and threading.Timer(let_go, holder.close)
+                try:
+                    if timer:
+                        timer.start()
+                    code, out, err = self.run_cli('read', 'codex-x')
+                    left = self.leftovers('codex-x')
+                finally:
+                    if timer:
+                        timer.join()
+                    holder.close()
+                self.assertEqual((code, out), (0, 'done\nFiles touched: none\n'))
+                self.assertNotIn('Traceback', err)
+                if timer:
+                    self.assertEqual((left, err), ([], receipt('codex-x')))
+                else:
+                    self.assertEqual(left, ['.jsonl'], 'all else is gone, the lock with it')
+                    self.assertIn('delivered, but', err)
+                    (box / 'codex-x.jsonl').unlink()
+
+    @unittest.skipIf(os.name != 'nt', 'os.replace onto an open file fails on Windows only')
+    def test_setting_the_default_waits_out_a_reader_of_the_preference_file(self):
+        self.assertEqual(self.run_cli('default', 'astra')[0], 0)
+        holder = cowork.preset_file().open()
+        timer = threading.Timer(0.3, holder.close)
+        timer.start()
+        try:
+            code, _, err = self.run_cli('default', 'sol')
+        finally:
+            timer.join()
+            holder.close()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(cowork.preset_file().read_bytes(), b'sol\n')
+
+    @unittest.skipIf(os.name != 'nt', 'stdin is read as UTF-8 on Windows; elsewhere in the locale encoding')
+    def test_a_task_on_stdin_that_is_not_utf8_is_a_usage_error(self):
+        done = subprocess.run([sys.executable, str(SCRIPT), 'send', '--task', '-'], cwd=self.root,
+                              input=b'caf\xe9\n', capture_output=True, timeout=30)
+        self.assertEqual(done.returncode, 1)
+        self.assertEqual(done.stderr.decode().strip(), '--task - must be UTF-8')
+        self.assertEqual(self.calls(), [])
+
+    def test_a_cygwin_or_msys_python_is_refused(self):
+        for platform in ('cygwin', 'msys'):
+            with self.subTest(platform), mock.patch.object(sys, 'platform', platform):
+                code, out, err = self.run_cli('default')
+                self.assertEqual((code, out), (1, ''))
+                self.assertIn('native Windows CPython', err)
+
+    def test_the_windows_middle_process_is_no_command_elsewhere(self):
+        with mock.patch.object(cowork, 'fcntl', object()), mock.patch.object(cowork, 'nt_detach') as detach:
+            code, _, err = self.run_cli('_detach', 'codex', 'main', 'codex-x', '0', '5')
+        self.assertEqual(code, 2, err)
+        detach.assert_not_called()
+
+    def test_git_output_is_utf8_on_windows_and_the_locale_encoding_elsewhere(self):
+        real, seen = subprocess.run, []
+
+        def recording(*args, **kwargs):
+            if args[0][0] == 'git':
+                seen.append(kwargs)
+            return real(*args, **kwargs)
+        with mock.patch.object(cowork.subprocess, 'run', recording):
+            cowork.git_dir()
+            cowork.git(self.root, 'status')
+            cowork.tree_state(self.root)
+        self.assertGreater(len(seen), 3)
+        for kwargs in seen:  # as text=True alone decodes outside Windows: strictly, in the locale's encoding
+            self.assertTrue(kwargs.get('text'))
+            self.assertEqual(kwargs.get('encoding'), 'utf-8' if os.name == 'nt' else None)
+            self.assertIn(kwargs.get('errors'), (None, 'replace') if os.name == 'nt' else (None,))
 
     def test_publish_is_all_or_nothing_and_the_first_verdict_wins(self):
         target = self.root / 'x.exit'
@@ -818,24 +1093,33 @@ class CoworkTest(unittest.TestCase):
         box.mkdir(parents=True)
         (box / 'codex-x.task').write_text('p')
         cowork.publish(box / 'codex-x.exit', 'killed\n')
-        with (box / 'codex-x.lock').open('w') as lock, contextlib.redirect_stderr(io.StringIO()):
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with holding(box / 'codex-x.lock') as lock, contextlib.redirect_stderr(io.StringIO()):
             cowork.write_side(box, model='gpt-6-astra', effort='medium')
             cowork.run('codex', box, self.root, 'codex-x', False, lock.fileno())
         self.assertEqual(self.calls(), [])
         self.assertTrue((box / 'codex-x.task').exists(), 'unread')
 
     def test_kill_takes_tools_that_left_the_process_group(self):
-        self.codex_does("import subprocess; open('tool.pid', 'w').write(str(subprocess.Popen(['sleep', '60'], start_new_session=True).pid))")
+        away = ('creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP' if os.name == 'nt'
+                else 'start_new_session=True')
+        self.codex_does(f"import subprocess; open('tool.pid', 'w').write(str(subprocess.Popen({SLEEP!r}, {away}).pid))")
         proc, request = self.send_gated('--task', 'x')
-        until(lambda: (self.root / 'tool.pid').exists())
+        until(lambda: (self.root / 'tool.pid').exists() and (self.root / 'tool.pid').read_text())
         self.run_cli('kill', request)
         proc.wait(timeout=10)
-        with self.assertRaises(ProcessLookupError, msg='a tool in its own session died with the tree'):
-            os.kill(int((self.root / 'tool.pid').read_text()), 0)
+        tool = int((self.root / 'tool.pid').read_text())
+        if os.name == 'nt':  # TerminateProcess returns before the process is gone
+            until(lambda: gone(tool), timeout=5)
+        self.assertTrue(gone(tool), 'a tool in its own session died with the tree')
 
     def test_kill_freezes_the_tree_so_nothing_spawned_meanwhile_escapes(self):
-        self.codex_does('import subprocess; subprocess.Popen(["sh", "-c", "while :; do setsid sh -c \\"sleep 1; touch late\\" & sleep 0.05; done"])')
+        if os.name == 'nt':  # no sh or setsid: detached Pythons, which the runner's job still holds
+            late = ("import subprocess, sys, time\nwhile True:\n    subprocess.Popen([sys.executable, '-c', "
+                    "'import pathlib, time; time.sleep(1); pathlib.Path(\"late\").touch()'], "
+                    "creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)\n    time.sleep(0.05)")
+            self.codex_does(f'import subprocess; subprocess.Popen([sys.executable, "-c", {late!r}])')
+        else:
+            self.codex_does('import subprocess; subprocess.Popen(["sh", "-c", "while :; do setsid sh -c \\"sleep 1; touch late\\" & sleep 0.05; done"])')
         proc, request = self.send_gated('--task', 'x')
         self.started(request)
         self.run_cli('kill', request)
@@ -849,8 +1133,7 @@ class CoworkTest(unittest.TestCase):
         box.mkdir(parents=True)
         (box / 'codex-x.task').write_text('p')
         (box / 'codex-x.exit').write_text('killed\n')
-        with (box / 'codex-x.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # a kill was published; the teardown is not done
+        with holding(box / 'codex-x.lock'):  # a kill was published; the teardown is not done
             self.assertEqual(cowork.running(box), 'codex-x')
             code, _, _ = self.run_cli('read', 'codex-x')
             self.assertEqual(code, cowork.BUSY, 'a verdict does not make teardown complete')
@@ -862,9 +1145,8 @@ class CoworkTest(unittest.TestCase):
         box = self.box()
         box.mkdir(parents=True)
         (box / 'codex-x.task').write_text('p')
-        stranger = subprocess.Popen(['sleep', '30'])  # a reused pid: a process that never had the lock
-        with (box / 'codex-x.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # a runner still holds it, but its CLI is gone
+        stranger = subprocess.Popen(SLEEP)  # a reused pid: a process that never had the lock
+        with holding(box / 'codex-x.lock') as lock:  # a runner still holds it, but its CLI is gone
             lock.write(f'{stranger.pid}\n')
             lock.flush()
             with mock.patch.object(cowork, 'kill_tree') as kill:
@@ -874,18 +1156,35 @@ class CoworkTest(unittest.TestCase):
         stranger.kill()
         stranger.wait()
         (box / 'codex-y.task').write_text('p')
-        with (box / 'codex-y.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            orphan = subprocess.Popen(['sleep', '30'], pass_fds=(lock.fileno(),))
+        with holding(box / 'codex-y.lock') as lock:
+            orphan = spawn_holding(lock, SLEEP)
             lock.write(f'{orphan.pid}\n')
         try:
             self.assertTrue(cowork.holds(orphan.pid, box / 'codex-y.lock'))
             code, out, _ = self.run_cli('kill', 'codex-y')
-            self.assertEqual(orphan.wait(timeout=5), -9, 'the pid that holds the lock is ours to kill')
+            self.assertEqual(orphan.wait(timeout=5), KILLED, 'the pid that holds the lock is ours to kill')
         finally:
             if orphan.poll() is None:
                 orphan.kill()
                 orphan.wait()
+
+    @unittest.skipIf(os.name != 'nt', 'the Windows backend dates the pid; /proc shows the open lock')
+    def test_a_pid_reused_after_the_runner_wrote_it_is_not_ours(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        lock = box / 'codex-x.lock'
+        with holding(lock) as held:
+            stranger = subprocess.Popen(SLEEP)
+            try:
+                held.write(f'{stranger.pid}\n')
+                held.flush()
+                self.assertTrue(cowork.holds(stranger.pid, lock), 'born between the lock and the pid write')
+                born = cowork.nt_born(stranger.pid)
+                os.utime(lock, ns=(born - 1, born - 1))  # the pid was written before it was born
+                self.assertFalse(cowork.holds(stranger.pid, lock))
+            finally:
+                stranger.kill()
+                stranger.wait()
 
     def test_kill_on_a_finished_request_signals_nothing(self):
         request = self.reaped('--task', 'done')
@@ -902,8 +1201,7 @@ class CoworkTest(unittest.TestCase):
         (box / 'codex-x.task').write_text('p')
         (box / 'codex-x.jsonl').touch()
         (box / 'codex-x.err').touch()
-        with (box / 'codex-x.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        with holding(box / 'codex-x.lock') as lock:
 
             def kill_meanwhile(*args, **kwargs):
                 cowork.publish(box / 'codex-x.exit', 'killed\n')
@@ -919,18 +1217,30 @@ class CoworkTest(unittest.TestCase):
         box.mkdir(parents=True)
         (box / 'codex-x.lock').write_text('4242\n')  # the runner is exiting
         (box / 'codex-x.exit').write_text('0\n')
-        (box / 'codex-x.reply').write_text('done\nFiles touched: none\n')
+        (box / 'codex-x.reply').write_bytes(b'done\nFiles touched: none\n')  # as a runner writes it
         (box / 'codex-x.err').touch()
-        with (box / 'codex-x.lock').open('r+') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # something the CLI spawned still has the runner's lock
+        with holding(box / 'codex-x.lock', 'r+'):  # something the CLI spawned still has the runner's lock
             self.assertTrue(cowork.held(box / 'codex-x.lock'), 'a verdict line is not release')
             code, _, _ = self.run_cli('read', 'codex-x')
             self.assertEqual(code, cowork.BUSY)
-        with (box / 'codex-x.lock').open() as reader:
-            fcntl.flock(reader, fcntl.LOCK_SH)
+        with reading(box / 'codex-x.lock'):
             self.assertFalse(cowork.held(box / 'codex-x.lock'))
             code, out, _ = self.run_cli('read', 'codex-x')
             self.assertEqual((code, out), (0, 'done\nFiles touched: none\n'))
+
+    def test_a_grandchild_holding_the_lock_keeps_the_request_live_after_the_cli_exits(self):
+        release = Path(self.tmp.name) / 'release'
+        wait = f'import os, time\nwhile not os.path.exists({str(release)!r}): time.sleep(0.02)'
+        self.codex_does(f'import subprocess; subprocess.Popen([sys.executable, "-c", {wait!r}], close_fds=False)')
+        request = self.send('--detach', '--task', 'x')[1]
+        lock = self.box() / f'{request}.lock'
+        until(lambda: (self.box() / f'{request}.exit').exists())  # the CLI and its runner are done
+        self.assertTrue(cowork.held(lock), 'what the CLI spawned still holds it')
+        self.assertEqual(self.run_cli('read', request)[0], cowork.BUSY)
+        release.touch()
+        until(lambda: not cowork.held(lock))
+        code, out, _ = self.run_cli('read', request)
+        self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'))
 
     def test_kill_of_a_delivered_request_leaves_no_orphan_verdict(self):
         _, request, _, _ = self.send('--task', 'done')
@@ -943,9 +1253,12 @@ class CoworkTest(unittest.TestCase):
     def test_a_killed_send_loses_nothing(self):
         proc, request = self.send_gated('--task', 'x')
         self.started(request)
-        runner = int(subprocess.run(['pgrep', '-f', f'_run codex main {request}'], capture_output=True, text=True).stdout.split()[0])
-        with open(f'/proc/{runner}/stat') as stat:
-            self.assertNotEqual(int(stat.read().rsplit(')', 1)[1].split()[1]), proc.pid, 'the runner is not a child of send')
+        if os.name == 'nt':  # what a harness does: send and its descendants; the runner is none of them
+            subprocess.run(['taskkill', '/F', '/T', '/PID', str(proc.pid)], capture_output=True, check=True)
+        else:
+            runner = int(subprocess.run(['pgrep', '-f', f'_run codex main {request}'], capture_output=True, text=True).stdout.split()[0])
+            with open(f'/proc/{runner}/stat') as stat:
+                self.assertNotEqual(int(stat.read().rsplit(')', 1)[1].split()[1]), proc.pid, 'the runner is not a child of send')
         proc.kill()
         proc.wait()
         self.settled(request)
@@ -962,9 +1275,8 @@ class CoworkTest(unittest.TestCase):
         box = self.box()
         box.mkdir(parents=True)
         (box / 'codex-x.task').write_text('p')
-        with (box / 'codex-x.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            orphan = subprocess.Popen(['sleep', '30'], pass_fds=(lock.fileno(),))
+        with holding(box / 'codex-x.lock') as lock:
+            orphan = spawn_holding(lock, SLEEP)
             lock.write(f'{orphan.pid}\n')
         try:
             _, out, _ = self.run_cli('status')
@@ -973,7 +1285,7 @@ class CoworkTest(unittest.TestCase):
             self.assertEqual(code, cowork.BUSY)
             code, out, _ = self.run_cli('kill', 'codex-x')
             self.assertEqual(out.strip(), 'codex-x: killed')
-            self.assertEqual(orphan.wait(timeout=5), -9, 'killed, not waited for')
+            self.assertEqual(orphan.wait(timeout=5), KILLED, 'killed, not waited for')
         finally:
             if orphan.poll() is None:
                 orphan.kill()
@@ -1060,9 +1372,8 @@ class CoworkTest(unittest.TestCase):
         box = self.box()
         box.mkdir(parents=True)
         (box / 'codex-x.exit').write_text('0\n')
-        (box / 'codex-x.reply').write_text('done\nFiles touched: none\n')
-        with (box / 'codex-x.lock').open('w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+        (box / 'codex-x.reply').write_bytes(b'done\nFiles touched: none\n')
+        with holding(box / 'codex-x.lock'):
             reader = self.read_wait('codex-x')
             self.assertTrue((box / 'codex-x.reply').exists())
         out, err = reader.communicate(timeout=10)
@@ -1092,7 +1403,8 @@ class CoworkTest(unittest.TestCase):
         out, err = reader.communicate(timeout=10)
         self.assertEqual((reader.returncode, out, err),
                          (0, '', f'cowork result {request} codex/main: replied, exit 0; written to {out_file}\n'))
-        self.assertEqual(out_file.read_text(), 'codex reply\nFiles touched: none\n' + receipt(request))
+        self.assertEqual(out_file.read_bytes().decode(), 'codex reply\nFiles touched: none\n' + receipt(request),
+                         'the same bytes on every OS')
         self.assertEqual(self.leftovers(request), [])
         self.assertEqual(sorted(p.name for p in out_file.parent.glob('reply.txt*')), ['reply.txt'], 'no temp file left')
 
@@ -1451,8 +1763,9 @@ class CoworkTest(unittest.TestCase):
 
 
 class Frontmatter(unittest.TestCase):
+    @unittest.skipIf(yaml is None, 'needs PyYAML')
     def test_declares_name_and_description(self):
-        fm = yaml.safe_load(SKILL.read_text().split('---')[1])
+        fm = yaml.safe_load(SKILL.read_text(encoding='utf-8').split('---')[1])
         self.assertEqual(fm['name'], 'cowork')
         self.assertTrue(fm['description'].strip())
 
