@@ -15,12 +15,12 @@ For firmware built away from the probe host, take the rig's exact manual flash r
 verified 2026-09-18 e595e7950 raspberry_pi_pico, frdm_k64f, espressif_p4_function_ev: all three probe-side flashes
 followed those functions.
 
-pyOCD runs only through `test/hil/pyocd/run_pyocd.py` under pyOCD's own interpreter (`_pyocd_argv`), for `flash` and
-for `gdbserver` alike: it limits discovery to the roster's VID/PID, which keeps other probe models closed but not
-another probe of the same model, and loads `user_script.py`, whose LPC55 reset catch resets the chip through the debug
-mailbox before pyOCD's reset-halt (its comment gives the cause). lpcxpresso55s28 is flashed that way and debugged
-through its roster `debugger` entry, an inline OpenOCD target (`families.md`, "LPC55"). verified 2026-10-17
-3c6524eb9 lpcxpresso55s28: `flash` and `gdbserver` through the launcher, every probe script through the `debugger`.
+pyOCD runs only through `test/hil/pyocd/run_pyocd.py` under pyOCD's own interpreter (`_pyocd_argv`), for `flash` and for
+`gdbserver` alike: it limits discovery to the roster's VID/PID, which keeps other probe models closed but not another
+probe of the same model, and loads `user_script.py`, whose LPC55 reset catch resets the chip through the debug mailbox
+before pyOCD's reset-halt (its comment gives the cause). lpcxpresso55s28 is flashed that way and carries a roster
+`debugger` entry for the probe scripts (SKILL.md, HIL config). verified 2026-10-17 3c6524eb9 lpcxpresso55s28: `flash`
+and `gdbserver` through the launcher, every probe script through the `debugger`.
 
 ## Stack state and entry points
 

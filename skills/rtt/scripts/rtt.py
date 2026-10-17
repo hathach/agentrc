@@ -735,7 +735,7 @@ def hil_probe_entry(path, board):
         names = ', '.join(sorted(str(b.get('name')) for b in boards))
         raise ValueError(f'--board {board}: {len(found)} entries of that name in {path} (it has: {names})')
     key = 'debugger' if 'debugger' in found[0] else 'flasher'
-    entry = found[0][key] if key in found[0] else None
+    entry = found[0].get(key)
     if not isinstance(entry, dict) or not isinstance(entry.get('name'), str):
         raise ValueError(f'--board {board}: no {key}.name in {path}')
     if entry['name'] not in HIL_PROBE_ROUTES:

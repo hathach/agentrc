@@ -39,13 +39,11 @@ These skills know probes, not projects. Three things come from the project, and 
 
 A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it directly (`--hil-config <file> --board
 <name>`; a flag given as well must agree). The entry read is the board's `debugger` when it has one, else its `flasher`;
-the two are never merged, so a `debugger` carries its own `uid`, `vid_pid` and `args`. A board flashed by a tool that
-drives no probe the scripts know, such as pyOCD, is debugged through its `debugger` entry (LPC55: `families.md`,
-"LPC55"):
+the two are never merged, so a `debugger` carries its own `uid`, `vid_pid` and `args`:
 
 | field     | Means | Becomes |
 | --------- | --- | --- |
-| `name`    | `jlink`, `openocd`, `stlink` are probe routes; a flasher `esptool`, `lm4flash` or `pyocd` without a `debugger` is refused: the scripts drive none of them (Espressif debug transport and selector: `espressif.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
+| `name`    | `jlink`, `openocd`, `stlink` are probe routes; a flasher `esptool`, `lm4flash` or `pyocd` without a `debugger` is refused: the scripts drive none of them (Espressif debug transport and selector: `espressif.md`; LPC55 flashed by pyOCD: `families.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
 | `uid`     | the probe's serial | `--probe` |
 | `args`    | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments | `--device`, or `--cfg` whole |
 | `vid_pid` | the probe model's USB IDs, openocd only | `--vid-pid` |
