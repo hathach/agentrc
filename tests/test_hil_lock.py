@@ -3,12 +3,17 @@ shares, so its boundary is frozen: the lock dir and file names, a hold that neve
 loser's record, the flock as the only authority, the holder record's fields (foreign ones kept),
 cleanup holders as recovery blockers, protected holders never signalled, and fail-closed
 acquisition. Every lock lives in a temp dir under a name no rig uses."""
+import os
+import unittest
+
+if os.name == 'nt':
+    raise unittest.SkipTest('hil_lock requires POSIX flock and fork')
+
 import ast
 import fcntl
 import importlib.util
 import io
 import json
-import os
 import resource
 import signal
 import stat
@@ -16,7 +21,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import unittest
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
