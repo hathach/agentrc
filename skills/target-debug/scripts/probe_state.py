@@ -11,9 +11,10 @@ Probe observations only: it never says whether the application works.
                  [--save ADDR LEN FILE ...]
 
 The board's HIL config entry (the target-debug SKILL.md's HIL config table) gives the
-backend and probe: flasher `jlink` (args exactly `-device NAME`; --interface and
---speed are the caller's) or `openocd` (args are its -f/-c arguments; vid_pid pins
-discovery). Any other flasher, a missing serial or an ambiguous board is refused.
+backend and probe, from its `debugger` when it has one, else its `flasher`: `jlink` (args
+exactly `-device NAME`; --interface and --speed are the caller's) or `openocd` (args are
+its -f/-c arguments; vid_pid pins discovery). Any other entry, a missing serial or an
+ambiguous board is refused.
 
 The caller holds the project's board lock for the whole run (target-debug, Delegated
 sessions); this script takes no lock and cannot check that one is held. The
@@ -94,7 +95,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HALT_WAIT_MS, HIL_PROBE_ROUTES, SENTINEL,  # noqa: E402
-                       SPEED_RE, ToolError, hil_flasher, hil_jlink_device)
+                       SPEED_RE, ToolError, hil_jlink_device, hil_probe_entry)
 
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
@@ -685,35 +686,35 @@ class OpenOCD:
 def resolve(a, p):
     """(route, identity, backend) for the board, or p.error()."""
     try:
-        flasher = hil_flasher(a.hil_config, a.board)
-        if 'uid' not in flasher:
-            raise ValueError(f'--board {a.board}: no flasher.uid (probe serial) in {a.hil_config}')
-        route = HIL_PROBE_ROUTES[flasher['name']]
-        if flasher['name'] == 'stlink':
-            raise ValueError(f'--board {a.board} is flashed over stlink, whose entry carries no OpenOCD '
+        key, entry = hil_probe_entry(a.hil_config, a.board)
+        if 'uid' not in entry:
+            raise ValueError(f'--board {a.board}: no {key}.uid (probe serial) in {a.hil_config}')
+        route = HIL_PROBE_ROUTES[entry['name']]
+        if entry['name'] == 'stlink':
+            raise ValueError(f'--board {a.board}: {key} stlink, whose entry carries no OpenOCD '
                              f'configuration; probe_state.py takes jlink and openocd entries')
         if route == 'jlink':
-            device = hil_jlink_device(a.board, flasher)
+            device = hil_jlink_device(a.board, key, entry)
             if device is None:
-                raise ValueError(f"--board {a.board}: a jlink entry needs flasher.args '-device NAME'")
+                raise ValueError(f"--board {a.board}: a jlink entry needs {key}.args '-device NAME'")
             if not (a.interface and a.speed):
                 raise ValueError('a J-Link board needs --interface and --speed (its HIL entry has neither)')
             if not SPEED_RE.fullmatch(a.speed):
                 raise ValueError(f'--speed must be kHz, "auto" or "adaptive", got {a.speed!r}')
-            backend = JLink(flasher['uid'], device, a.interface, a.speed)
-            return route, {'probe': flasher['uid'], 'device': device}, backend
+            backend = JLink(entry['uid'], device, a.interface, a.speed)
+            return route, {'probe': entry['uid'], 'device': device}, backend
         if a.interface or a.speed:
-            raise ValueError('--interface and --speed are J-Link only; an OpenOCD board takes them from flasher.args')
-        if 'args' not in flasher:
-            raise ValueError(f'--board {a.board}: an openocd entry needs flasher.args (its -f/-c arguments)')
-        vid_pid = flasher.get('vid_pid')
+            raise ValueError(f'--interface and --speed are J-Link only; an OpenOCD board takes them from {key}.args')
+        if 'args' not in entry:
+            raise ValueError(f'--board {a.board}: an openocd entry needs {key}.args (its -f/-c arguments)')
+        vid_pid = entry.get('vid_pid')
         if vid_pid is not None and not re.fullmatch(r'0x[0-9a-fA-F]{1,4} 0x[0-9a-fA-F]{1,4}', vid_pid.strip()):
-            raise ValueError(f'--board {a.board}: flasher.vid_pid must be "0xVVVV 0xPPPP", got {vid_pid!r}')
+            raise ValueError(f'--board {a.board}: {key}.vid_pid must be "0xVVVV 0xPPPP", got {vid_pid!r}')
         try:
-            shlex.split(flasher['args'])
+            shlex.split(entry['args'])
         except ValueError as e:
-            raise ValueError(f"--board {a.board}: flasher.args {flasher['args']!r}: {e}")
-        return route, {'probe': flasher['uid'], 'cfg': flasher['args']}, OpenOCD(flasher['uid'], flasher['args'],
+            raise ValueError(f"--board {a.board}: {key}.args {entry['args']!r}: {e}")
+        return route, {'probe': entry['uid'], 'cfg': entry['args']}, OpenOCD(entry['uid'], entry['args'],
                                                          vid_pid and vid_pid.strip())
     except ValueError as e:
         p.error(str(e))
