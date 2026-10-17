@@ -63,6 +63,23 @@ family.
 
 ## LPC55
 
+- **Debug over OpenOCD, flash over pyOCD.** Upstream OpenOCD has neither an LPC55 target config nor an LPC55 flash
+  driver (master source of 2026-10-16; the farm's 0.12.0+dev-02620-g0ce743125 binary lists the lpc2000, lpc288x and
+  lpcspifi drivers only), so OpenOCD gets the target inline and cannot `program` or `load`: flash with pyOCD
+  (`-t lpc55s28`). The inline single-core target on an LPC55S28, after `-f interface/cmsis-dap.cfg`:
+
+  ```
+  -c "transport select swd" -c "adapter speed 1000"
+  -c "swd newdap lpc55s28 cpu -expected-id 0x6ba02477" -c "dap create lpc55s28.dap -chain-position lpc55s28.cpu"
+  -c "target create lpc55s28.cpu cortex_m -dap lpc55s28.dap -ap-num 0"
+  ```
+
+  verified 2026-10-17 lpcxpresso55s28 (LPC-Link2, CMSIS-DAP FW 1.10): CPUID 0x410fd213, PCSR samples, 8 breakpoints
+  and 4 watchpoint comparators, image read-back, halt and resume, RTT, gdb attach.
+- The DPIDR read 0x6ba02477, an Arm (designer 0x23B) DPv2 debug port (ADIv5 IHI0031 B2.2.5); UM11126 rev 2.1 and the
+  LPC55S2x datasheet give no value. The debug subsystem is an SWJ-DP with a CPU0 AP, a CPU1 AP (LPC55S6x only) and the
+  DM-AP of the debug mailbox (UM11126 rev 2.1 §51.5.1, PDF p1120); CPU0 answered at AP 0. verified 2026-10-17
+  lpcxpresso55s28. A dual-core LPC55S69 needs its own target for CPU1.
 - Rev 0A silicon read `SYSCON->DIEID` 0x000426B0 (REV_ID 0) and ROM 2.2. verified 2026-10-12 lpcxpresso55s69.
 - The RTC that holds GPREG is not usable right after a reset-halt: its register clock (AHBCLKCTRL0 bit 23) resets off,
   and after power-up CTRL.SWRESET holds every RTC register at reset (UM11126 rev 2.1 p54, p570). There a J-Link `mem32`

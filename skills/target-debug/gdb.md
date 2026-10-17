@@ -41,6 +41,16 @@ J-Link or `target remote :3333` for OpenOCD (`target extended-remote` keeps the 
 map probes the flash through ROM calls that leave XIP off (`rp2xxx.c` in 0.12.0+dev-g0ce743125), and the core resumed
 after that faulted into lockup (verified 2026-10-16 raspberry_pi_pico).
 
+LPC55 has no OpenOCD flash driver (`families.md`, "LPC55"): flash with pyOCD first, then attach OpenOCD with the board's
+inline target and skip `load`. `pyocd gdbserver -t <target>` (0.45.1; port 3333 unless `-p`) can `load`: on an LPC55S28
+halted inside the running application, `load` failed with the flash algorithm returning in a HardFault (IPSR 3), and
+after `monitor reset halt` it programmed the image and `compare-sections` matched (verified 2026-10-17 lpcxpresso55s28).
+The gdbserver halts the core when its pyOCD session opens, before gdb connects (`connect_mode` default `halt`), and
+resumes a halted core when the last gdb client detaches, `--persist` included (`notify_client_detached` in
+`gdbserver/gdbserver.py`), and again when the session ends (`resume_on_disconnect`, default true): a core halted on
+purpose does not stay halted across a detach. On a shared rig run pyOCD only through the project's discovery filter
+(TinyUSB: `projects/tinyusb.md`): unfiltered, it opens every CMSIS-DAP-class USB device to read its interface string.
+
 Script JLinkGDBServer sessions with `-singlerun` — the server exits with the connection, and back-to-back relaunches
 race the probe handle and hang. Symbols need the firmware's DWARF: check the project's release configuration keeps it.
 

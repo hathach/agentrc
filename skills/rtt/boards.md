@@ -35,7 +35,8 @@ is decode-validated: a channel-1 SystemView capture on stm32h743nucleo
 | feather_nrf52840_express | ci   | J-Link                 | J-Link  | yes  | yes   | `nrf52840_xxaa`       |
 | metro_m4_express         | ci   | J-Link                 | J-Link  | yes  | yes   | `ATSAMD51J19`         |
 | lpcxpresso11u37          | ci   | J-Link                 | J-Link  | yes  | yes   | `LPC11U37/401`        |
-| lpcxpresso55s28          | ci   | J-Link                 | J-Link  | yes  | yes   | `LPC55S28`            |
+| lpcxpresso55s28 (2026-08-25, J-Link firmware) | ci | J-Link | J-Link | yes | yes | `LPC55S28` |
+| lpcxpresso55s28 (2026-10-17) | ci | LPC-Link2 CMSIS-DAP | OpenOCD | yes | — | inline, the roster's `debugger` |
 | ra4m1_ek                 | ci   | J-Link                 | J-Link  | yes  | yes   | `R7FA4M1AB`           |
 | stm32f072disco           | ci   | J-Link                 | J-Link  | yes  | yes   | `stm32f072rb`         |
 | stm32f407disco           | ci   | J-Link                 | J-Link  | yes  | yes   | `stm32f407vg`         |
@@ -72,6 +73,10 @@ always pass them (`--probe` / `adapter serial`).
 - **ST-Link rows**: flashed by `STM32_Programmer_CLI`; RTT capture is a
   separate openocd session (`interface/stlink.cfg` + the target cfg above),
   attach without reset.
+- **lpcxpresso55s28**: its LPC-Link2 now runs CMSIS-DAP firmware and the rig flashes it with pyOCD, which `rtt.py` does
+  not drive; `--hil-config` takes the board's `debugger` entry, an inline OpenOCD target (`target-debug`'s
+  `families.md`, "LPC55"). The 2026-10-17 row read a LOG=2 `cdc_msc` log, its boot and enumeration and then the host's
+  live MSC polling; Write untested there because `cdc_msc` does not poll the console.
 
 ## Excluded (recorded so absence is never read as "works")
 
