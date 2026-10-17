@@ -38,7 +38,10 @@ One kernel flock per board, `/tmp/tinyusb-hil-locks/<lock>.lock`, shared by
 every project and CI runner on a host, so tools of different projects exclude
 each other on a shared board. `<lock>` is the contract's lock name for the
 board, which may differ from its roster name. The helper that takes it, and its
-holder record (pid, reason), are the contract's Reservation.
+holder record (pid, reason), are the contract's Reservation: a wrapper of this
+skill's `scripts/hil_lock.py` for the project's roster and lock names, and the
+only entry point; the contract says which agentrc commit it loads, and from
+where.
 
 - Never stop a CI runner. Killing a holder or releasing a hold you did not take
   happens only through the contract's Recovery procedure, under a separate
