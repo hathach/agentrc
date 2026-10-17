@@ -151,6 +151,26 @@ class BoundedRead(unittest.TestCase):
         self.assertEqual(uo.read_sysfs(self.fifo, timeout=1), 'CAFE01',
                          'a board that came back on the same busport stayed blacklisted')
 
+    def test_a_lock_released_without_re_enumeration_clears_the_memo(self):
+        """The device lock can be released with the kernfs node unchanged, so the inode
+        all-clear never fires: only the stranded reader returning can say it is readable."""
+        self.assertIsNone(uo.read_sysfs(self.fifo, timeout=0.05))
+        with open(self.fifo, 'w') as f:            # releases the stranded reader
+            f.write('CAFE01\n')
+        deadline = time.monotonic() + 5
+        while uo.path_stranded(self.fifo) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(uo.path_stranded(self.fifo), 'a finished reader left its path stranded')
+
+        def answer():
+            with open(self.fifo, 'w') as f:
+                f.write('CAFE02\n')
+
+        threading.Thread(target=answer, daemon=True).start()
+        self.assertEqual(uo.read_sysfs(self.fifo, timeout=1), 'CAFE02',
+                         'a board whose lock was released stayed hidden on the same inode')
+        self.assertEqual(uo._strand_hits[self.fifo], 1)
+
     def test_a_stranded_path_is_never_read_twice(self):
         """Each expiry strands a thread and an fd for the life of the process, and callers
         poll. Re-reading would leak one pair per poll."""
