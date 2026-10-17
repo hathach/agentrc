@@ -130,7 +130,7 @@ def usb_scan(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> l
       every peer that shares its VID -- so the bound is what stops one wedged DUT from
       stalling every caller (see read_sysfs).
 
-    A device whose serial cannot be read (missing or wedged) is not returned.
+    A device whose serial is missing or unreadable is not returned.
     """
     out = []
     for d in glob.glob(os.path.join(SYS_USB_DEVICES, '*-*')):
@@ -215,9 +215,10 @@ def usb_node_serial(node: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
     up after `timeout` and strand a reader. The node's devt names both records without
     touching the device: usbcore's MKDEV(189, (busnum-1)*128 + devnum-1).
 
-    The udev value is usb_id's ID_SERIAL_SHORT, not the raw sysfs `serial`: whitespace runs
-    and unsafe characters become '_', and a serial with bytes above 0x7f, control characters
-    or ',' gets none. Such a serial may differ from usb_scan's; plain alphanumerics match.
+    The udev value is usb_id's ID_SERIAL_SHORT, not the raw sysfs `serial`: whitespace and
+    unsafe characters become '_', so it can differ from usb_scan's. A serial with bytes above
+    0x7f, control characters or ',' gets none and takes the sysfs read, which equals usb_scan's
+    but can time out on a wedged device.
     """
     bus, _, dev = node.removeprefix('/dev/bus/usb/').partition('/')
     if not (bus.isdigit() and dev.isdigit()):
