@@ -30,7 +30,7 @@ fetched as the contract says; a build alone is never hardware evidence.
 
 A requested operation the contract does not cover is not performed: return the
 blocker. Never compose a lock, flash or run command the contract does not give,
-and never pick a rig or host other than its host selection gives.
+and never pick a rig or host other than its Hosts/rosters gives.
 
 ## Board locks
 
@@ -40,32 +40,31 @@ each other on a shared board. `<lock>` is the contract's lock name for the
 board, which may differ from its roster name. The helper that takes it, and its
 holder record (pid, reason), are the contract's Reservation.
 
-- Never stop a CI runner. Never kill a holder or release a hold you did not
-  take, except through the contract's Recovery procedure under a separate
+- Never stop a CI runner. Killing a holder or releasing a hold you did not take
+  happens only through the contract's Recovery procedure, under a separate
   recovery dispatch explicitly naming that board, its holder and the kill or
-  release; a refused hold alone never adds that scope.
+  release; bypassing a lock (`HIL_NO_BOARD_LOCK=1`, or the contract's
+  equivalent) only under task scope explicitly naming forcing that board. A
+  refused hold alone adds neither.
 - Never pre-hold a board for a tool that locks itself: it refuses your hold as a
   conflict.
 - Report a refused hold with its holder and reason; wait only within the task's
   lock-wait budget. A holder record marked as a cleanup holder
   (`role: cleanup-holder`) never frees on its own: it is a recovery blocker for
   every project, never waited on.
-- Bypassing a lock (`HIL_NO_BOARD_LOCK=1`, or the contract's equivalent) needs
-  task scope explicitly naming forcing that board; a refusal alone never adds
-  it.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
   Hosts/rosters names the other projects' rosters on a host it shares. A
-  partial hold is worse than none: it reads as protection. A contract whose
-  runner cycles one hub port under the board's own lock records that in its
-  Limits as a limitation of this rule, with what else the cycle is known to
-  reach; it is no exemption.
+  partial hold is worse than none: it reads as protection. A runner that
+  cycles one hub port under the board's own lock is a limitation of this rule,
+  not an exemption, recorded in the contract's Limits with what else the cycle
+  is known to reach.
 
 Manual work on a rig board outside the contract's runner (`hw-validator`,
 `hw-debugger`, probe tools used directly) follows `target-debug`'s Delegated
-sessions for its hold and cleanup; the contract supplies the helper, and the
-cleanup state when it defines one instead of a restoration firmware.
+sessions for its hold and cleanup; the contract's Reservation supplies the
+helper and any cleanup state.
 
 ## Running
 
@@ -100,12 +99,12 @@ Each requested board gets one:
 - **pass**: the requested validation ran and passed, and any cleanup the
   contract requires succeeded.
 - **fail**: the validation ran and established a failure.
-- **not-run**: the validation was not exercised (locked, refused, unbuilt, not
-  on this rig).
+- **not-run**: the validation was not exercised (locked, build refused, unbuilt,
+  not on this rig).
 
-A run-level caveat (aborted, nothing selected) denies every row a pass: aborted
-makes every requested board a blocker; nothing selected leaves each board
-not-run, except a row that already holds a blocker, which stands.
+A run-level caveat denies every row a pass: aborted makes every requested board
+a blocker; nothing selected leaves each board not-run unless it already holds a
+blocker.
 
 ## Caller rules
 
@@ -117,5 +116,5 @@ not-run, except a row that already holds a blocker, which stands.
 - `locked` is an admission refusal, not a test failure: admit again once the
   holder releases, within the budget, or report the board not covered, naming
   the holder.
-- A blocker is never retried. Recovery is a separate dispatch for one board,
-  carrying what the contract's Recovery lists.
+- Recovery is a separate dispatch for one board, carrying what the contract's
+  Recovery lists.

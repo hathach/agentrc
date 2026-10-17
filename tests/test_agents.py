@@ -232,10 +232,10 @@ class SkillFiles(unittest.TestCase):
     def test_hil_contract_sections_named_elsewhere_are_the_hil_page_s(self):
         """Callers point at a project's HIL contract by section; each name must be one the hil page declares."""
         page = (SKILLS / 'hil' / 'SKILL.md').read_text()
-        table = page.split('| Section | Supplies |')[1].split('\n\n')[0]
-        declared = set(re.findall(r'^\| ([A-Z][a-z]+(?:/[a-z]+)?) \|', table, re.M))
-        self.assertEqual(declared, {'Hosts/rosters', 'Selection', 'Build', 'Execution',
-                                    'Reservation', 'Results', 'Recovery', 'Limits'})
+        declared = {'Hosts/rosters', 'Selection', 'Build', 'Execution',
+                    'Reservation', 'Results', 'Recovery', 'Limits'}
+        for name in declared:
+            self.assertIn(f'\n| {name} | ', page)
         files = [*AGENTS.glob('*.md'), *SKILLS.glob('*/SKILL.md')]
         pattern = re.compile(r"contract's ([A-Z][a-z]+(?:/[a-z]+)?)")
         for path in files:

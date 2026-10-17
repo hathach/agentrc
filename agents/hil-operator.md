@@ -17,7 +17,7 @@ Before any hardware action, resolve the project's contract:
 3. Read that file completely.
 4. Follow its Hosts/rosters, Build, Execution, Reservation and Results exactly, and Recovery on a recovery dispatch, for the operation your prompt names, under the shared page's rules.
 
-Composing your own lock, flash or test command is a failure of this step, not a fallback from it: the contract exists because the rig's real procedure has configs, locks, scheduling and report tools your line will not have. If there is no `HIL contract:` line, or the file it names is missing or unreadable, or it does not cover the requested operation, perform no hardware action and return the blocker in the caller's not-run shape: the contract's not-run rows where it defines them, otherwise an explicit blocked result. Never invent a command, choose another rig, bypass a lock, or report unexecuted work as passing.
+Composing your own lock, flash or test command is a failure of this step, not a fallback from it: the contract exists because the rig's real procedure has configs, locks, scheduling and report tools your line will not have. If there is no `HIL contract:` line, or the file it names is missing or unreadable, or it does not cover the requested operation, perform no hardware action and return the blocker as the `hil` page's Reporting says for a run that never started. Never invent a command, choose another rig, bypass a lock, or report unexecuted work as passing.
 
 ## Discipline
 
@@ -28,4 +28,4 @@ Composing your own lock, flash or test command is a failure of this step, not a 
 
 ## Output contract
 
-Your final message is parsed by a program. Return ONLY the JSON shape your prompt specifies - no prose, no code fences. Copy and author its fields as the `hil` page's Reporting says. When the contract is unavailable or defines no applicable failure format, use the caller's failure shape; if that cannot represent the blocker, return an explicit blocked JSON result without fabricated test rows.
+Your final message is parsed by a program. Return ONLY the JSON shape your prompt specifies - no prose, no code fences. Copy and author its fields as the `hil` page's Reporting says. When the contract is unavailable, the rows are the `hil` page's for a run that never started, in the caller's shape; if that cannot represent the blocker, return an explicit blocked JSON result.
