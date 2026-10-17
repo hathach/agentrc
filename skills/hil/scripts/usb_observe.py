@@ -83,7 +83,6 @@ def read_sysfs(path: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
     except OSError:
         ino = None
     out: dict = {}
-    memo: dict = {}           # 'ino' the give-up memoised, 'done' once the reader returns
 
     def _read():
         try:
@@ -91,13 +90,6 @@ def read_sysfs(path: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
                 out['v'] = f.read().strip()
         except (OSError, ValueError):
             pass
-        # a stranded reader returning means the device lock was released; without a
-        # re-enumeration the inode is unchanged, so only this clears the memo. Compare
-        # first: a newer strand on a new inode is not ours to clear.
-        with _strand_lock:
-            memo['done'] = True
-            if 'ino' in memo and _stranded.get(path) == memo['ino']:
-                del _stranded[path]
 
     t = threading.Thread(target=_read, daemon=True)
     t.start()
@@ -116,11 +108,9 @@ def read_sysfs(path: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
                 pass
         if ino is not None:
             with _strand_lock:
-                if memo.get('done'):              # returned since the join: not stranded
-                    return out.get('v')
                 if path not in _stranded:         # count the PATH once, not each reader
                     _strand_hits[path] = _strand_hits.get(path, 0) + 1
-                _stranded[path] = memo['ino'] = ino
+                _stranded[path] = ino
         return None
     return out.get('v')
 
