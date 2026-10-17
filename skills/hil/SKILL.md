@@ -41,7 +41,9 @@ board, which may differ from its roster name. The helper that takes it, and its
 holder record (pid, reason), are the contract's Reservation: a wrapper of this
 skill's `scripts/hil_lock.py` for the project's roster and lock names, and the
 only entry point; the contract says which agentrc commit it loads, and from
-where.
+where. A runner that watches the bus (is the board enumerated, which process
+holds its usbfs node) loads this skill's `scripts/usb_observe.py` the same way,
+one module instance per process; it observes only, never resets or locks.
 
 - Never stop a CI runner. Killing a holder or releasing a hold you did not take
   happens only through the contract's Recovery procedure, under a separate
