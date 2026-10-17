@@ -50,13 +50,24 @@ def status_paths(records):
     return paths
 
 
+def index_mode(f):
+    """The mode git add gives f with core.fileMode false, Windows' default (true there is unsupported): a tracked
+    file keeps its index mode, a new one is 644. A symlink (120000) checked out as a file stays 644, as os.access
+    reports it on POSIX, so it never matches ls-tree's 000 and its commit is refused."""
+    for entry in git('--literal-pathspecs', 'ls-files', '-s', '-z', '--', f).split('\0'):
+        meta, _, path = entry.partition('\t')
+        if path == f and meta.startswith('100'):
+            return meta[3:6]
+    return '644'
+
+
 def snapshot(paths, records):
     lines = []
     for f in sorted(set(paths) | set(status_paths(records))):
         if not os.path.lexists(f):
             lines.append(f'absent - {f}')
         elif not os.path.isdir(f):
-            mode = '755' if os.access(f, os.X_OK) else '644'
+            mode = index_mode(f) if os.name == 'nt' else '755' if os.access(f, os.X_OK) else '644'
             lines.append(f"{mode} {git('hash-object', '--', f).strip()} {f}")
     return lines
 
@@ -96,7 +107,7 @@ def run_hooks(paths):
     for _ in range(2):
         try:
             done = subprocess.run(['pre-commit', 'run', '--color', 'never', '--files', *paths],
-                                  capture_output=True, text=True, errors='replace')
+                                  capture_output=True, encoding='utf-8', errors='replace')
         except FileNotFoundError:
             raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
         ids += [h for h in modified_by(done.stdout, done.returncode) if h not in ids]

@@ -166,6 +166,8 @@ def main(argv=None):
                    help='seconds from SIGTERM to SIGKILL, longer than either tool\'s own shutdown (default 15)')
     p.add_argument('--out', required=True, metavar='DIR', help='new directory for both sides\' output')
     a = p.parse_args(argv)
+    if sys.platform != 'linux':
+        p.error(f'Linux-only (/proc, prctl subreaper); this is {sys.platform}')
     if not (math.isfinite(a.timeout) and a.timeout > 0 and math.isfinite(a.grace) and a.grace >= 0):
         p.error('--timeout must be positive and --grace non-negative, both finite')
     sides = [load_side(p, f, s, a.out) for f, s in (('--a', a.a), ('--b', a.b))]

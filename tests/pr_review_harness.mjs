@@ -89,6 +89,43 @@ test('args that would change the verdict silently are refused before any agent',
   for (const a of bad) await assert.rejects(run(a), /args|must/, JSON.stringify(a))
 })
 
+test('a Windows factsDir and checkout top are read with slashes; a POSIX path stays exactly as given', async () => {
+  const file = `C:/Users/me/ledger/7/threads-${H}.json`
+  for (const factsDir of ['C:\\Users\\me\\ledger\\7', 'C:/Users/me/ledger/7']) {
+    const { result, calls, audits } = await run({ ...BASE, factsDir }, { threads: { file, count: 0 }, check: { ...pinned(BASE), top: 'E:/w' } })
+    assert.equal(result.verdict.event, 'APPROVE', factsDir)
+    assert.ok(calls.find(c => c.label === 'threads').prompt.includes(`--out '${file}'`), factsDir)
+    assert.equal(audits[0].root, 'E:/w')
+  }
+  for (const factsDir of ['/tmp/a\\b', 'C:rel', 'C:/x/../y', 'C:\\x\\..\\y', 'C:/x\'y']) {
+    await assert.rejects(run({ ...BASE, factsDir }), /factsDir must be an absolute path/, factsDir)
+  }
+})
+
+// The real code-audit body, its scanner reporting `findings` for every unit and its verifier confirming each.
+const AUDIT = readFileSync(new URL('../workflows/code-audit.js', import.meta.url), 'utf8').replace(/^export const meta = /m, 'const meta = ')
+const codeAudit = (a, findings) => {
+  const agent = async (prompt, o) => o.label.startsWith('scan:') ? { findings }
+    : { real: true, reason: 'holds', severity: 'high', impact: IMP, severityReason: 'graded', confidence: 'high' }
+  const pipeline = (items, ...stages) => Promise.all(items.map(async (item, i) => {
+    let v = item
+    for (const s of stages) v = await s(v, item, i)
+    return v
+  }))
+  const parallel = thunks => Promise.all(thunks.map(t => Promise.resolve().then(t).catch(() => null)))
+  return new AsyncFunction('args', 'agent', 'pipeline', 'parallel', 'phase', 'log', 'workflow', 'budget', ...ABSENT, AUDIT)(
+    a, agent, pipeline, parallel, () => {}, () => {}, null, null, ...ABSENT.map(() => undefined))
+}
+
+test('a backslashed checkout top reaches code-audit as check gave it, and code-audit places a finding under it', async () => {
+  const top = 'E:\\w\\top'
+  const scanned = { file: 'e:\\W\\Top\\src\\core\\a.c', line: 10, snippet: 'x', why: 'buffer overrun', severity: 'high', confidence: 'high', hardware: false }
+  const { result, audits } = await run(BASE, { check: { ...pinned(BASE), top }, audit: a => codeAudit(a, [scanned]) })
+  assert.equal(audits[0].root, top)
+  assert.ok(result.draft.comments.length, JSON.stringify(result.verdict))
+  assert.deepEqual([...new Set(result.draft.comments.map(c => c.path))], ['src/core/a.c'])
+})
+
 test('a failed, moved-head or unidentified check stops before any review work', async () => {
   const { repo, pr, ...unnamed } = pinned(BASE)
   for (const check of [null, { error: 'head moved: expected b' }, { ok: true, head: OLD, ci: { state: 'green' } }, unnamed, { ...pinned(BASE), repo: 'o/other' }, { ...pinned(BASE), pr: 8 }]) {

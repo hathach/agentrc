@@ -21,6 +21,7 @@ with no adapter or a document an adapter does not list (`sync.py add --help`);
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import sys
@@ -715,4 +716,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # vendor titles carry ® and ™
     sys.exit(main())

@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -64,7 +65,8 @@ class Extract(unittest.TestCase):
         printed = io.StringIO()
         with redirect_stdout(printed):
             extract.main([str(self.root / 'projects'), '--out', str(out)])
-        return [json.loads(l) for l in out.read_text().splitlines()], printed.getvalue()
+        self.assertNotIn(b'\r', out.read_bytes(), 'one LF-terminated line a case on every OS')
+        return [json.loads(l) for l in out.read_text(encoding='utf-8').splitlines()], printed.getvalue()
 
     def test_a_case_is_the_prompt_and_model_its_transcript_recorded(self):
         nit = {**FINDING, 'severity': 'nit'}
@@ -91,6 +93,35 @@ class Extract(unittest.TestCase):
         cases, printed = self.run_it()
         self.assertEqual([(c['path'], c['worktree']) for c in cases], [('src/class/x.c', top), ('src/x.c', None)])
         self.assertIn('1 verdict(s), absolute path outside the session worktree', printed)
+
+    def test_a_windows_finding_path_names_its_worktree_as_spelled(self):
+        top = 'E:\\mcu\\tinyusb\\.worktrees\\pr-review-12'
+        inside = {**FINDING, 'file': 'e:\\mcu\\tinyusb\\.worktrees\\pr-review-12\\src\\class\\x.c'}
+        self.journal('E--mcu-tinyusb--worktrees-pr-review-12', [
+            ('verify:d0x0:0', REAL, prompt(finding=inside, directory='src/class'), OPUS),
+            ('verify:d0x0:1', REAL, prompt(finding={**FINDING, 'file': 'D:/elsewhere/x.c'}, directory='src/class'), OPUS),
+        ], check={'head': HEAD, 'top': top})
+        cases, printed = self.run_it()
+        self.assertEqual([(c['repo'], c['pr'], c['path'], c['worktree']) for c in cases],
+                         [('hathach/tinyusb', 12, 'src/class/x.c', 'e:\\mcu\\tinyusb\\.worktrees\\pr-review-12')])
+        self.assertIn('1 verdict(s), absolute path outside the session worktree', printed)
+
+    def test_every_backslash_is_a_separator_and_a_unc_rooted_or_drive_relative_path_is_absolute(self):
+        top = 'E:\\mcu\\tinyusb\\.worktrees\\pr-review-12'
+        at = lambda file, why='w': prompt(finding={**FINDING, 'file': file, 'why': why}, directory='src/class')
+        self.journal('E--mcu-tinyusb--worktrees-pr-review-12', [
+            ('verify:d0x0:0', REAL, at('src\\class\\x.c'), OPUS),
+            ('verify:d0x0:1', REAL, at('\\\\srv\\share\\x.c'), OPUS),
+            ('verify:d0x0:2', REAL, at('\\x.c'), OPUS),
+            ('verify:d0x0:3', REAL, at('C:x.c'), OPUS),
+        ], check={'head': HEAD, 'top': top})
+        unc = '\\\\srv\\share\\tinyusb\\.worktrees\\pr-review-13'
+        self.journal('--srv-share-tinyusb--worktrees-pr-review-13', [
+            ('verify:d0x0:0', REAL, at(unc + '\\src\\y.c', 'unc'), OPUS),
+        ], check={'head': HEAD, 'top': unc})
+        cases, printed = self.run_it()
+        self.assertEqual(sorted((c['pr'], c['path'], c['worktree']) for c in cases), [(12, 'src/class/x.c', None), (13, 'src/y.c', unc)])
+        self.assertIn('3 verdict(s), absolute path outside the session worktree', printed)
 
     def test_the_worktree_is_the_prefix_the_project_directory_encodes(self):
         top = '/home/u/src/tinyusb/.worktrees/pr-review-12'
@@ -160,7 +191,7 @@ class Extract(unittest.TestCase):
         self.assertIn('1 verdict(s), no transcript', printed.getvalue())
 
     def test_the_prompt_patterns_follow_code_audit(self):
-        src = (ROOT / 'workflows' / 'code-audit.js').read_text()
+        src = (ROOT / 'workflows' / 'code-audit.js').read_text(encoding='utf-8')
         self.assertIn('`Adversarially verify ONE review finding about ${p.dir}.\\nDimension: ${p.dim}\\nFinding: ${JSON.stringify(f)}\\n`', src)
         self.assertIn(' The checkout is at ${args.diff.head}. Judge only what \\`git diff ${args.diff.base} ${args.diff.head}', src)
 
@@ -191,7 +222,7 @@ class Sample(unittest.TestCase):
         self.assertEqual(sample.counts(cl, tagged(cl))['duplicate'], 2)
 
     def test_the_grading_rule_follows_code_audit(self):
-        src = (ROOT / 'workflows' / 'code-audit.js').read_text()
+        src = (ROOT / 'workflows' / 'code-audit.js').read_text(encoding='utf-8')
         for const, want in (('LEVELS', sample.LEVELS), ('CONFIDENCE', sample.CONFIDENCE)):
             got = re.search(rf"^const {const} = \[([^\]]*)\]", src, re.M).group(1)
             self.assertEqual(tuple(re.findall(r"'(\w+)'", got)), want, const)
@@ -212,7 +243,8 @@ class Sample(unittest.TestCase):
             src.write_text('\n'.join(map(json.dumps, cases)) + '\n')
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as err:
                 rc = sample.main(['--cases', str(src), '--out', str(out), '--seed', '7', '--total', str(total)])
-            return rc, err.getvalue(), [json.loads(l) for l in out.read_text().splitlines()]
+            self.assertNotIn(b'\r', out.read_bytes(), 'one LF-terminated line a case on every OS')
+            return rc, err.getvalue(), [json.loads(l) for l in out.read_text(encoding='utf-8').splitlines()]
 
     def test_every_pr_is_sampled_and_the_total_is_filled(self):
         cs = [case(i, (i % 4) // 2 * 5 + 100 * (i // 4), real=i % 2 == 0 or i < 4, pr=i // 20, why='errata' if i % 8 == 0 else 'w',
@@ -315,7 +347,7 @@ import json, os, re, sys
 if '--version' in sys.argv:
     print('0.0.0 (fake)')
     sys.exit(0)
-prompt = sys.stdin.read()
+prompt = sys.stdin.buffer.read().decode('utf-8')
 schema = json.loads(sys.argv[sys.argv.index('--json-schema') + 1])
 with open(os.environ['FAKE_LOG'], 'a') as log:
     log.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': prompt}) + '\n')
@@ -352,12 +384,18 @@ class Replay(unittest.TestCase):
         self.root = Path(td.name)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         self.env.update({'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
-                         'FAKE_LOG': str(self.root / 'fake.log'), 'HOME': str(self.root / 'home')})
+                         'FAKE_LOG': str(self.root / 'fake.log'), 'HOME': str(self.root / 'home'),
+                         'USERPROFILE': str(self.root / 'home')})
         (self.root / 'home').mkdir()
         bin_dir = self.root / 'bin'
         bin_dir.mkdir()
         (bin_dir / 'claude').write_text(FAKE_CLAUDE)
         (bin_dir / 'claude').chmod(0o755)
+        # Launched by the interpreter, so it runs where a shebang does not; a `claude` looked up on PATH is
+        # this one, or on Windows a blocker that cannot start, never the real CLI.
+        self.env['REPLAY_CLAUDE'] = json.dumps([sys.executable, str(bin_dir / 'claude')])
+        if os.name == 'nt':
+            (bin_dir / 'claude.exe').write_bytes(b'')
         self.env['PATH'] = f"{bin_dir}{os.pathsep}{self.env['PATH']}"
         self.repo = self.root / 'clone'
         (self.repo / 'src').mkdir(parents=True)
@@ -393,23 +431,23 @@ class Replay(unittest.TestCase):
         out = out or str(self.root / mode)
         done = subprocess.run(['node', str(ROOT / 'bench' / 'finding-verify' / 'replay.mjs'), '--corpus', str(corpus), '--mode', mode,
                                '--out', out, '--worktrees', str(self.root / 'wt'), '--checkout', f'o/r={self.repo}', *extra],
-                              env=self.env, capture_output=True, text=True, cwd=self.root)
+                              env=self.env, capture_output=True, encoding='utf-8', errors='replace', cwd=self.root)
         self.assertEqual(done.returncode == 0, ok, done.stderr + done.stdout)
         return Path(self.root, out), done.stderr
 
     def test_both_modes_run_code_audit_and_record_every_dispatch(self):
         corpus = self.corpus()
         single, batch = self.replay('single', corpus)[0], self.replay('batch', corpus)[0]
-        calls = {m: [json.loads(l) for l in (self.root / m / 'calls.jsonl').read_text().splitlines()] for m in ('single', 'batch')}
+        calls = {m: [json.loads(l) for l in (self.root / m / 'calls.jsonl').read_text(encoding='utf-8').splitlines()] for m in ('single', 'batch')}
         self.assertEqual(sorted(c['label'] for c in calls['single']), ['verify:d0x0:0', 'verify:d0x0:1', 'verify:d0x0:2'])
         self.assertEqual(sorted((c['label'], tuple(c['caseIds'])) for c in calls['batch']),
                          [('verify:b0', ('c0', 'c1')), ('verify:d0x0:1', ('c2',))], 'the hardware case stays alone')
         self.assertTrue(all(c['prompt'] and c['schema'] for c in calls['batch']), 'each dispatch keeps what it was sent')
-        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text().splitlines()]
+        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text(encoding='utf-8').splitlines()]
         self.assertTrue(all(Path(x['cwd']).resolve() == (self.root / 'wt' / f'o-r-{self.head[:12]}').resolve() for x in logged))
         self.assertTrue(all(x['argv'][:7] == ['-p', '--agent', 'finding-verifier', '--model', 'opus', '--effort', 'high'] for x in logged))
         self.assertFalse(any('agreed' in x['prompt'] or '"label"' in x['prompt'] for x in logged), 'no truth reaches a verifier')
-        records = {m: {v['id']: v for v in map(json.loads, (self.root / m / 'verdicts.jsonl').read_text().splitlines())} for m in calls}
+        records = {m: {v['id']: v for v in map(json.loads, (self.root / m / 'verdicts.jsonl').read_text(encoding='utf-8').splitlines())} for m in calls}
         self.assertEqual({i: r['kind'] for i, r in records['single'].items()}, {'c0': 'confirmed', 'c1': 'refuted', 'c2': 'confirmed'})
         self.assertEqual({i: r['kind'] for i, r in records['batch'].items()}, {i: r['kind'] for i, r in records['single'].items()})
         self.assertEqual(records['batch']['c0']['from'], 'verify:b0')
@@ -459,13 +497,13 @@ class Replay(unittest.TestCase):
         unnamed = (batch[0], [{**c, 'models': []} for c in batch[1]], batch[2])
         self.assertEqual(score.report(score.load(corpus), single, unnamed, corpus_digest=self.digest(corpus))['environment'],
                          'a dispatch names no model that answered it')
-        relabelled = [json.loads(l) for l in corpus.read_text().splitlines()]
+        relabelled = [json.loads(l) for l in corpus.read_text(encoding='utf-8').splitlines()]
         relabelled[1]['truth']['label'] = 'true'
         r = score.report(relabelled, single, batch, corpus_digest=hashlib.sha256(json.dumps(relabelled).encode()).hexdigest())
         self.assertEqual((r['gate']['environment'], r['environment']), (False, 'the corpus scored is not the one replayed'))
 
     def test_heads_replay_concurrently_each_in_its_own_worktree_and_units_by_their_label(self):
-        rows = [json.loads(l) for l in self.corpus().read_text().splitlines()]
+        rows = [json.loads(l) for l in self.corpus().read_text(encoding='utf-8').splitlines()]
         (self.repo / 'src' / 'x.c').write_text('int x;\nint y;\nint z;\n')
         self.sh('git', 'commit', '-qam', 'second head')
         head2 = self.sh('git', 'rev-parse', 'HEAD').strip()
@@ -474,17 +512,17 @@ class Replay(unittest.TestCase):
         corpus = self.root / 'two-heads.jsonl'
         corpus.write_text(''.join(json.dumps(r) + '\n' for r in rows + later))
         out, _ = self.replay('single', corpus, '--jobs', '2')
-        records = {v['id']: v for v in map(json.loads, (out / 'verdicts.jsonl').read_text().splitlines())}
+        records = {v['id']: v for v in map(json.loads, (out / 'verdicts.jsonl').read_text(encoding='utf-8').splitlines())}
         self.assertEqual({i: r['kind'] for i, r in records.items()},
                          {'c0': 'confirmed', 'c1': 'refuted', 'c2': 'confirmed', 'd0': 'confirmed', 'd1': 'refuted'})
-        calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text().splitlines()]
+        calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text(encoding='utf-8').splitlines()]
         self.assertEqual(sorted((c['head'][:12], c['label'], tuple(c['caseIds'])) for c in calls if c['head'] == head2),
                          [(head2[:12], 'verify:d0x0:0', ('d0',)), (head2[:12], 'verify:d0x1:0', ('d1',))], 'scan:d0x1 is the second dimension')
-        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text().splitlines()]
+        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text(encoding='utf-8').splitlines()]
         self.assertEqual({Path(x['cwd']).name for x in logged}, {f'o-r-{self.head[:12]}', f'o-r-{head2[:12]}'})
 
     def test_a_failing_head_stops_the_other_heads_dispatches_and_keeps_their_calls(self):
-        rows = [json.loads(l) for l in self.corpus().read_text().splitlines()]
+        rows = [json.loads(l) for l in self.corpus().read_text(encoding='utf-8').splitlines()]
         (self.repo / 'src' / 'x.c').write_text('int x;\nint y;\nint z;\n')
         self.sh('git', 'commit', '-qam', 'second head')
         head2 = self.sh('git', 'rev-parse', 'HEAD').strip()
@@ -496,21 +534,30 @@ class Replay(unittest.TestCase):
         out, err = self.replay('single', corpus, ok=False)
         self.assertLess(time.monotonic() - started, 20, 'the slow verifier was terminated, not awaited')
         self.assertIn(f'changed while {head2} was replayed', err)
-        calls = {c['label'] + '@' + c['head'][:12]: c for c in map(json.loads, (out / 'calls.jsonl').read_text().splitlines())}
+        calls = {c['label'] + '@' + c['head'][:12]: c for c in map(json.loads, (out / 'calls.jsonl').read_text(encoding='utf-8').splitlines())}
         killed = calls[f'verify:d0x0:0@{self.head[:12]}']
         self.assertEqual((killed['caseIds'], killed['structured']), (['s0'], None), 'the terminated call is still recorded')
         self.assertNotIn(f'verify:d0x0:0.retry@{self.head[:12]}', calls, 'no dispatch starts after the failure')
         self.assertFalse((out / 'verdicts.jsonl').exists())
 
     def test_a_reply_off_its_schema_counts_as_none(self):
-        rows = [json.loads(l) for l in self.corpus().read_text().splitlines()]
+        rows = [json.loads(l) for l in self.corpus().read_text(encoding='utf-8').splitlines()]
         corpus = self.root / 'garbled.jsonl'
         corpus.write_text(json.dumps({**rows[0], 'finding': {**rows[0]['finding'], 'why': 'garble me'}}) + '\n')
         out, _ = self.replay('single', corpus)
-        [record] = map(json.loads, (out / 'verdicts.jsonl').read_text().splitlines())
+        [record] = map(json.loads, (out / 'verdicts.jsonl').read_text(encoding='utf-8').splitlines())
         self.assertEqual((record['kind'], record['attempts']), ('unverified', ['verify:d0x0:0', 'verify:d0x0:0.retry']))
-        calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text().splitlines()]
+        calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text(encoding='utf-8').splitlines()]
         self.assertTrue(all(c['structured'] is None and c['error'].startswith('success: {') for c in calls))
+
+    def test_the_skills_digest_names_a_file_with_slashes(self):
+        skill = self.root / 'home' / '.claude' / 'skills' / 'x'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_bytes(b'hi\n')
+        out, _ = self.replay('single', self.corpus())
+        env = json.loads((out / 'env.json').read_text(encoding='utf-8'))
+        line = '\0'.join(('x/SKILL.md', '3', hashlib.sha256(b'hi\n').hexdigest())) + '\n'
+        self.assertEqual(env['before']['skills'], hashlib.sha256(line.encode()).hexdigest())
 
     def test_nothing_is_spent_on_a_run_that_cannot_be_scored(self):
         corpus = self.corpus()
@@ -519,7 +566,7 @@ class Replay(unittest.TestCase):
         (self.root / 'taken').mkdir()
         _, err = self.replay('single', corpus, out='taken', ok=False)
         self.assertIn('exists', err)
-        rows = [json.loads(l) for l in corpus.read_text().splitlines()]
+        rows = [json.loads(l) for l in corpus.read_text(encoding='utf-8').splitlines()]
         twin = self.root / 'twin.jsonl'
         twin.write_text(''.join(json.dumps(r) + '\n' for r in rows + [{**rows[0], 'id': 'c9'}]))
         _, err = self.replay('single', twin, ok=False)
@@ -528,6 +575,12 @@ class Replay(unittest.TestCase):
         gone.write_text(''.join(json.dumps({**r, 'base': 'f' * 40}) + '\n' for r in rows))
         _, err = self.replay('single', gone, ok=False)
         self.assertIn(f"o/r {'f' * 40}: not in", err)
+        stand_in = self.env['REPLAY_CLAUDE']
+        for bad in ('', 'claude', '[]', '[""]'):
+            self.env['REPLAY_CLAUDE'] = bad
+            _, err = self.replay('single', corpus, ok=False)
+            self.assertIn('REPLAY_CLAUDE must be a JSON array of nonempty strings', err, repr(bad))
+        self.env['REPLAY_CLAUDE'] = stand_in
         self.assertFalse((self.root / 'fake.log').exists(), 'no verifier was started')
         self.replay('single', Path('corpus.jsonl'), '--worktrees', 'wt2', out='relative')
         self.assertTrue((self.root / 'relative' / 'verdicts.jsonl').exists(), 'relative paths resolve against the caller')

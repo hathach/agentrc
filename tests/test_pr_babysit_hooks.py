@@ -121,6 +121,36 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(snap['b.txt'], ['absent', '-'])
         self.assertEqual(snap['c.txt'][0], '644')
 
+    def test_an_executable_is_snapshotted_with_the_mode_git_commits(self):
+        self.configure()
+        if os.name == 'nt':
+            self.git('update-index', '--chmod=+x', 'a.txt')  # Windows keeps the exec bit in the index alone
+        else:
+            os.chmod(self.repo / 'a.txt', 0o755)
+        (self.repo / 'a.txt').write_text('edited\n')
+        (self.repo / 'new.txt').write_text('new\n')
+        code, out = self.run_script('a.txt', 'new.txt')
+        self.assertEqual(code, 0)
+        snap = self.snap(out['snapshotAfter'])
+        self.git('add', '--', 'a.txt', 'new.txt')
+        staged = {line.split('\t')[1]: line.split()[0][3:] for line in self.git('ls-files', '-s', '--', 'a.txt', 'new.txt').splitlines()}
+        self.assertEqual({f: snap[f][0] for f in staged}, {'a.txt': '755', 'new.txt': '644'})
+        self.assertEqual({f: snap[f][0] for f in staged}, staged, 'what git add commits')
+
+    def test_a_symlink_checked_out_as_a_file_never_snapshots_as_the_mode_it_commits(self):
+        self.configure()
+        self.git('config', 'core.symlinks', 'false')  # Windows' default: the link is a file holding its target
+        (self.repo / 'link').write_text('a.txt')
+        self.git('update-index', '--add', '--cacheinfo', f"120000,{self.git('hash-object', '-w', 'link').strip()},link")
+        self.git('commit', '-qm', 'link')
+        (self.repo / 'link').write_text('b.txt')
+        code, out = self.run_script('link')
+        self.assertEqual(code, 0)
+        self.git('add', '--', 'link')
+        self.assertTrue(self.git('ls-files', '-s', '--', 'link').startswith('120000 '), 'git add keeps the symlink')
+        self.assertEqual(self.snap(out['snapshotAfter'])['link'][0], '644', "never ls-tree's 000: the workflow refuses its commit")
+
+    @unittest.skipIf(os.name == 'nt', 'Windows file names are Unicode: none is not UTF-8')
     def test_a_status_that_is_not_utf8_is_an_error(self):
         self.configure()
         (self.repo / b'bad\xff.c'.decode('utf-8', 'surrogateescape')).write_text('stray\n')
@@ -136,10 +166,16 @@ class HooksTest(unittest.TestCase):
 
     def test_a_config_without_pre_commit_is_an_error(self):
         self.configure('ok')
-        bin_dir = self.repo.parent / 'bin'
-        bin_dir.mkdir()
-        (bin_dir / 'git').symlink_to(shutil.which('git'))
-        code, out = self.run_script('a.txt', env={**self.env, 'PATH': str(bin_dir)})
+        if os.name == 'nt':
+            # Windows runs no symlinked git, and Git for Windows' launcher needs its own install around it.
+            path = os.path.dirname(shutil.which('git'))
+            if shutil.which('pre-commit', path=path):
+                self.skipTest(f'pre-commit sits beside git in {path}')
+        else:
+            path = self.repo.parent / 'bin'
+            path.mkdir()
+            (path / 'git').symlink_to(shutil.which('git'))
+        code, out = self.run_script('a.txt', env={**self.env, 'PATH': str(path)})
         self.assertEqual(code, 2)
         self.assertIn('pre-commit is not installed', out['error'])
 

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -18,6 +19,19 @@ spec.loader.exec_module(push)
 ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
 
 
+def run_gh_as(stub):
+    """Patch subprocess.run so `gh ...` runs stub under this Python, never a gh found on PATH; anything but git fails."""
+    real = subprocess.run
+
+    def run(argv, *a, **kw):
+        if argv[0] == 'gh':
+            argv = [sys.executable, str(stub), *argv[1:]]
+        elif argv[0] not in ('git', sys.executable):
+            raise AssertionError(f'{argv[0]} must not run in this test: only git, and gh as the stub')
+        return real(argv, *a, **kw)
+    return mock.patch.object(subprocess, 'run', run)
+
+
 class PushTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -25,6 +39,7 @@ class PushTest(unittest.TestCase):
         self.root = Path(tmp.name)
         self.enterContext(mock.patch.dict(os.environ, ENV))
         self.enterContext(mock.patch.object(push, 'PR_WAIT', 0))
+        self.enterContext(run_gh_as(self.root / 'gh.py'))
         self.a, self.b = str(self.root / 'a.git'), str(self.root / 'b.git')
         for bare in (self.a, self.b):
             subprocess.run(['git', 'init', '-q', '--bare', bare], check=True)
@@ -111,30 +126,31 @@ class PushTest(unittest.TestCase):
             self.assertIn(want, json.loads(out.getvalue())['error'])
 
     def fake_gh(self, script):
-        bin_dir = self.root / 'bin'
-        bin_dir.mkdir(exist_ok=True)
-        (bin_dir / 'gh').write_text(f'#!/bin/sh\n{script}\n')
-        (bin_dir / 'gh').chmod(0o755)
-        self.enterContext(mock.patch.dict(os.environ, {'PATH': f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}))
+        """gh as the Python script; count() reads and bumps a call counter."""
+        (self.root / 'gh.py').write_text('import sys\nfrom pathlib import Path\n'
+                                         f'def count(f=Path({str(self.root / "count")!r})):\n'
+                                         '    n = int(f.read_text()) if f.exists() else 0\n'
+                                         '    f.write_text(str(n + 1))\n'
+                                         '    return n\n'
+                                         f'{script}\n')
 
     def test_the_pr_head_is_retried_until_github_sees_the_push(self):
         count = self.root / 'count'
-        self.fake_gh(f'n=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}; '
-                     f'[ "$n" -ge 2 ] && echo {self.sha} || echo {"0" * 40}')
+        self.fake_gh(f'print({self.sha!r} if count() >= 2 else {"0" * 40!r})')
         code, out = self.publish(self.a, pr=7)
         self.assertEqual(out['prHead'], self.sha)
         self.assertEqual(count.read_text().strip(), '3')
 
     def test_an_unreadable_pr_head_is_null_after_every_try(self):
         count = self.root / 'count'
-        self.fake_gh(f'n=$(cat {count} 2>/dev/null || echo 0); echo $((n+1)) > {count}; exit 1')
+        self.fake_gh('count(); sys.exit(1)')
         code, out = self.publish(self.a, pr=7)
         self.assertIsNone(out['prHead'])
         self.assertEqual(count.read_text().strip(), str(push.PR_TRIES))
 
     def test_a_pr_no_longer_open_is_not_pushed_to(self):
         for state in ('MERGED', 'CLOSED'):
-            self.fake_gh(f'echo "$@" >> {self.root / "gh.log"}; echo {state}')
+            self.fake_gh(f'open({str(self.root / "gh.log")!r}, "a").write(" ".join(sys.argv[1:]) + "\\n"); print({state!r})')
             code, out = self.publish(self.a, open_pr=7)
             self.assertEqual((code, out['pushed'], out['heads'], out['prState']), (0, False, [], state))
             self.assertEqual(out['detail'], f'PR #7 is {state.lower()}: nothing pushed')
@@ -142,13 +158,13 @@ class PushTest(unittest.TestCase):
         self.assertIn('pr view 7 --json state -q .state', (self.root / 'gh.log').read_text())
 
     def test_an_open_pr_is_pushed_to(self):
-        self.fake_gh('echo OPEN')
+        self.fake_gh("print('OPEN')")
         code, out = self.publish(self.a, open_pr=7)
         self.assertEqual((code, out['pushed'], out['prState']), (0, True, 'OPEN'))
         self.assertEqual(self.remote_head(self.a), self.sha)
 
     def test_an_unreadable_pr_state_is_not_pushed_to(self):
-        for script in ('exit 1', 'echo'):
+        for script in ('sys.exit(1)', 'print()'):
             self.fake_gh(script)
             code, out = self.publish(self.a, open_pr=7)
             self.assertEqual((code, out['pushed'], out['heads'], out['prState']), (0, False, [], 'UNREAD'))

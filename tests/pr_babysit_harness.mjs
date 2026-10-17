@@ -4,6 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test as nodeTest } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor
 // The body runs as the runtime runs it; `meta` is exposed so its value, not its spelling, is checked.
@@ -134,7 +135,7 @@ const conforms = (schema, value, at) => {
 }
 
 // state_transfer.py's envelope for a saved output holding `state`, all chunks or `chunks` ("1,3").
-const STATE_TRANSFER = new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url).pathname
+const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
 const transferOf = (state, chunks) => {
   const dir = mkdtempSync(join(tmpdir(), 'pr-babysit-state-'))
   try {
@@ -882,7 +883,7 @@ test('a relayed copy that does not match its seal gets one fresh agent; a second
 test("facts.py's seal is the one the workflow checks, on text JSON escapes", async () => {
   const odd = 'claude/naïve-✓ "q" \\ \t\u0001 \ud800 é'
   const line = { ...PIN, branch: odd, prBranch: odd, error: null }
-  const done = spawnSync('python3', ['-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(json.dumps(sealed(json.loads(sys.stdin.read()))))',
+  const done = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(json.dumps(sealed(json.loads(sys.stdin.read()))))',
     join(STATE_TRANSFER, '..')], { input: JSON.stringify(line), encoding: 'utf8' })
   assert.equal(done.status, 0, done.stderr)
   const printed = JSON.parse(done.stdout)
@@ -890,7 +891,7 @@ test("facts.py's seal is the one the workflow checks, on text JSON escapes", asy
   assert.equal(kept.labels.includes('preflight.retry'), false, 'the seal matched: no retry')
   assert.equal(kept.result.pass, true)
   // Keys JavaScript and a code-point sort order differently.
-  const keyed = spawnSync('python3', ['-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(sealed(json.loads(sys.stdin.read()))["seal"])',
+  const keyed = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from facts import sealed; print(sealed(json.loads(sys.stdin.read()))["seal"])',
     join(STATE_TRANSFER, '..')], { input: JSON.stringify({ '\u{1F600}': 1, '\ue000': 2, '\ud800': 3, a: null }), encoding: 'utf8' })
   assert.equal(keyed.stdout.trim(), sealLine({ '\u{1F600}': 1, '\ue000': 2, '\ud800': 3 }).seal, keyed.stderr)
   const copied = await run({ preflight: printed, garble: (l, a) => l === 'preflight' ? { ...a, branch: a.branch.replace('é', 'e'), prBranch: a.prBranch.replace('é', 'e') } : a })
@@ -1042,7 +1043,10 @@ test('the committer gets the claims without their hints, and the message on stdi
   const commit = calls.find(c => c.label === 'commit#1-review').prompt
   assert.doesNotMatch(commit, /hint:|rewrite it all/)
   assert.match(commit, /The fixes: \["src\/a\.c:\d+ /)
-  assert.match(commit, /commits\.py commit 'src\/a\.c' < <that file>; rm -f <that file>`/)
+  assert.match(commit, /commits\.py commit 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
+  const quoted = calls.filter(c => c.prompt.includes("'<that file>'"))
+  assert.ok(quoted.some(c => c.label.startsWith('reply')) || quoted.length > 1, 'more than the commit quotes its file')
+  for (const c of quoted) assert.match(c.prompt, /a new temporary file[^:]*, a name without quotes/, c.label)
 })
 
 test('an unresolved build contract, or a build that did not run, blocks the batch as unverifiable, a failed build as unverified', async () => {
@@ -5588,7 +5592,8 @@ test('a protected path the PR already carries is adopted; one this run would pub
 })
 
 test('an uncanonicalizable adopted path fails the audit', async () => {
-  for (const path of ['../outside.c', '/tmp/absolute.c', ' src/leading.c', 'src/trailing.c ']) {
+  for (const path of ['../outside.c', '/tmp/absolute.c', 'C:/tmp/absolute.c', 'C:\\tmp\\absolute.c', 'C:tmp\\drive-relative.c',
+    '\\\\host\\share\\unc.c', ' src/leading.c', 'src/trailing.c ']) {
     const state = adoptionState()
     const { result } = await run({
       args: adoptionArgs(state), preflight: { head: ADOPT, prHead: HEAD },
@@ -6554,6 +6559,13 @@ test('stateRef loads the saved state as checksummed chunks, exactly', async () =
   assert.equal(loaded.calls[0].model, 'sonnet', 'the caller still picks the relay\'s model')
   assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded state carries the budget')
   assert.equal(loaded.result.state.decisions[0][1].reason, REASON, 'free text arrives byte for byte')
+  const windows = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\me\\tasks\\w1.output' })
+  assert.match(windows.calls[0].prompt, /state_transfer\.py 'C:\/Users\/me\/tasks\/w1\.output'\n/, 'a Windows path, spelled with slashes')
+  assert.equal(windows.result.state.cyclesUsed, 2)
+  // launch_result.py's path on a host whose user name has a blank: single-quoted, it stays one word.
+  const spaced = await loadWith(state, { ...stateRef, outputFile: 'C:\\Users\\John Smith\\tasks\\w1.output' })
+  assert.match(spaced.calls[0].prompt, /state_transfer\.py 'C:\/Users\/John Smith\/tasks\/w1\.output'\n/)
+  assert.equal(spaced.result.state.cyclesUsed, 2)
 })
 
 test('a state whose cycles are spent loads, then stops before preflight', async () => {
@@ -6705,7 +6717,9 @@ test('stateRef is refused when malformed or given with state', async () => {
   await assert.rejects(run({ args: { stateRef: { outputFile: '/x', digest: stateDigest }, state } }), /state or stateRef, not both/)
   await assert.rejects(run({ args: { stateRef: { outputFile: 'rel/x', digest: stateDigest } } }), /stateRef must be/)
   await assert.rejects(run({ args: { stateRef: { outputFile: '/x', digest: 'nothex!!' } } }), /stateRef must be/)
-  for (const outputFile of ['/tmp/$(printf injected).output', '/tmp/`id`.output', "/tmp/a'b.output", '/tmp/a b.output', '/tmp/../etc/x']) {
+  for (const outputFile of ['/tmp/$(printf injected).output', '/tmp/`id`.output', "/tmp/a'b.output", '/tmp/a"b.output', '/tmp/../etc/x',
+    "C:\\a'b.output", 'C:\\tmp\\..\\x', 'C:rel\\x', 'CD:/x',
+    '\\\\host\\share\\w.output', '//host/share/w.output', '//./pipe/x', '\\\\.\\pipe\\x', '\\\\?\\C:\\x', 'C://host/x']) {
     await assert.rejects(run({ args: { stateRef: { outputFile, digest: stateDigest } } }), /stateRef must be/, outputFile)
   }
 })

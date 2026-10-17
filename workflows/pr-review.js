@@ -49,7 +49,10 @@ if ((args.mode === 'incremental') === (args.scopeBase === args.mergeBase)) fail(
 const discussion = args.mode === 'discussion'
 const plainPath = (p) => typeof p === 'string' && /^[A-Za-z0-9._/@+ -]+$/.test(p) && !p.includes('..')
 if (!Array.isArray(args.groups) || !args.groups.length || !args.groups.every(plainPath)) fail('groups must be a nonempty array of repository paths')
-if (!plainPath(args.factsDir) || !args.factsDir.startsWith('/')) fail('factsDir must be an absolute path')
+// A Windows drive path reads with slashes; any other path stays exactly as given.
+const slashed = (p) => typeof p === 'string' && /^[A-Za-z]:[\\/]/.test(p) ? p.replace(/\\/g, '/') : p
+const factsDir = slashed(args.factsDir)
+if (!(typeof factsDir === 'string' && /^(\/|[A-Za-z]:\/)[A-Za-z0-9._/@+ -]*$/.test(factsDir) && !factsDir.includes('..'))) fail('factsDir must be an absolute path (on Windows its drive form, C:/...)')
 for (const k of ['hardwareRelevant', 'autoPost']) if (typeof args[k] !== 'boolean') fail(`${k} must be true or false`)
 const VERDICTS = ['pass', 'fail', 'not-run']
 const REGRESSION = ['verified', 'none', 'unknown']
@@ -100,7 +103,7 @@ if (off.length) return blocked('scope-mismatch', `args differ from prepare's pin
 const ci = check.ci
 
 phase('Context')
-const threadsFile = `${args.factsDir}/threads-${head}.json`
+const threadsFile = `${factsDir}/threads-${head}.json`
 const threadsOut = await relay('threads', 'Context', `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`,
   { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } })
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')

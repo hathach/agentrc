@@ -140,7 +140,8 @@ def chain_refusal(start, end, bases, found):
 
 def make(paths):
     try:
-        message = sys.stdin.read()
+        # -sig: a leading BOM would hide an attribution first line from attribution_in
+        message = sys.stdin.buffer.read().decode('utf-8-sig')
     except UnicodeDecodeError:
         raise Unusable('the message on stdin is not UTF-8')
     if not message.strip():

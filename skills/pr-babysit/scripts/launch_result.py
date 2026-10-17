@@ -311,7 +311,7 @@ def collect(argv):
         if not sep or not file or not re.fullmatch(r'[0-9a-f]{8}', digest):
             raise Unusable(f'--state-ref must be FILE:DIGEST with an 8-hex digest, not {a.state_ref!r}')
         ref = {'outputFile': file, 'digest': digest}
-    return summarize(load_output(a.output), str(Path(a.output).resolve()), ref, checkout(a.checkout) if a.checkout else None, a.keys)
+    return summarize(load_output(a.output), Path(a.output).resolve().as_posix(), ref, checkout(a.checkout) if a.checkout else None, a.keys)
 
 
 if __name__ == '__main__':

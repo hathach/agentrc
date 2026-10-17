@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,7 +26,7 @@ BOARDS = {'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4'},
                      {'name': 'stm32h7', 'uid': '1234', 'flasher': {'uid': '681295394'}}]}
 
 
-@unittest.skipIf(os.name == 'nt', 'reads Linux sysfs')
+@unittest.skipUnless(sys.platform.startswith('linux'), 'reads Linux sysfs')
 @unittest.skipUnless(shutil.which('jq'), 'needs jq')
 class LsusbtTest(unittest.TestCase):
     """lsusb is a stub on PATH that records its arguments; sysfs is a fake tree."""
@@ -110,6 +111,14 @@ class LsusbtTest(unittest.TestCase):
         self.sysfs.mkdir()
         (self.bin / 'lsusb').write_text('#!/bin/bash\n[ "$1" = -t ] && exit 0\nexit 1\n')
         self.assertEqual(self.run_lsusbt(), [], 'lsusb finds no device and exits 1')
+
+
+@unittest.skipIf(sys.platform.startswith('linux'), 'the refusal is for other systems')
+@unittest.skipUnless(shutil.which('bash'), 'needs bash')
+class LsusbtElsewhereTest(unittest.TestCase):
+    def test_it_refuses_in_one_line(self):
+        done = subprocess.run([shutil.which('bash'), str(SCRIPT)], capture_output=True, text=True)
+        self.assertEqual((done.returncode, done.stdout, done.stderr), (1, '', 'lsusbt: Linux-only (sysfs, lsusb -t)\n'))
 
 
 if __name__ == '__main__':

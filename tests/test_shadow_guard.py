@@ -1,4 +1,5 @@
 """Tests for hooks/headless-chief/shadow_guard.py, run as Claude Code runs it: hook JSON on stdin."""
+import importlib.util
 import json
 import os
 import subprocess
@@ -6,11 +7,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'shadow_guard.py'
 
 
-@unittest.skipIf(os.name == 'nt', 'the hook ships for POSIX sessions')
 class ShadowGuard(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
@@ -21,7 +22,7 @@ class ShadowGuard(unittest.TestCase):
         # GIT_* from a calling hook would point git at another repository
         self.env = {k: v for k, v in os.environ.items()
                     if k not in ('CLAUDE_CONFIG_DIR', 'CLAUDE_PROJECT_DIR') and not k.startswith('GIT_')}
-        self.env['HOME'] = str(self.root)
+        self.env['HOME'] = self.env['USERPROFILE'] = str(self.root)   # Path.home() reads USERPROFILE on Windows
         subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
 
     def installed(self, kind, name, content):
@@ -38,10 +39,10 @@ class ShadowGuard(unittest.TestCase):
         path.write_text(content)
         return path
 
-    def hook(self, tool='Workflow', cwd=None, **env):
+    def hook(self, tool='Workflow', cwd=None, raw=None, run_in=None, **env):
         event = {'hook_event_name': 'PreToolUse', 'tool_name': tool, 'cwd': str(cwd or self.project)}
-        return subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(event), env={**self.env, **env},
-                              capture_output=True, text=True, timeout=30)
+        return subprocess.run([sys.executable, str(SCRIPT)], input=raw or json.dumps(event, ensure_ascii=False),
+                              env={**self.env, **env}, cwd=run_in, capture_output=True, encoding='utf-8', timeout=30)
 
     def assert_denied(self, r, *named):
         self.assertEqual(r.returncode, 2, r.stderr)
@@ -80,6 +81,15 @@ class ShadowGuard(unittest.TestCase):
         self.assert_denied(self.hook(cwd=self.root, CLAUDE_PROJECT_DIR=str(self.project)), '.claude/workflows/pr-babysit.js')
         self.assertEqual(self.hook(cwd=self.root).returncode, 0, 'without CLAUDE_PROJECT_DIR the cwd decides')
 
+    def test_a_non_ascii_project_is_read_as_utf_8(self):
+        # hook JSON is UTF-8; read in a locale's encoding (GBK) the cwd named no directory and nothing was denied
+        self.project = self.root / 'wt-ü✓'
+        subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
+        self.installed('workflows', 'pr-babysit.js', 'new')
+        self.local('workflows', 'pr-babysit.js', 'old')
+        self.assert_denied(self.hook(), '.claude/workflows/pr-babysit.js')
+
+    @unittest.skipIf(os.name == 'nt', 'chmod(0) does not make a Windows directory unreadable')
     @unittest.skipIf(hasattr(os, 'geteuid') and os.geteuid() == 0, 'root reads any directory')
     def test_an_unreadable_directory_denies_without_merge_advice(self):
         self.installed('agents', 'code-writer.md', 'new')
@@ -89,6 +99,54 @@ class ShadowGuard(unittest.TestCase):
         r = self.hook()
         self.assert_denied(r, 'cannot inspect')
         self.assertNotIn('merge the default branch', r.stderr)
+
+    def test_any_error_denies(self):
+        # Claude Code lets a hook that exits 1 pass
+        for raw in ('not json', json.dumps({'tool_name': 'Workflow', 'cwd': 5}), json.dumps([])):
+            with self.subTest(raw=raw):
+                r = self.hook(raw=raw)
+                self.assert_denied(r, 'shadow guard: the check failed')
+                self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
+
+    @unittest.skipUnless(os.name == 'nt', 'NTFS names match without case')
+    def test_a_stale_entry_named_in_another_case_still_shadows(self):
+        self.installed('agents', 'code-writer.md', 'new')
+        self.local('agents', 'Code-Writer.MD', 'old')
+        self.assert_denied(self.hook(), '.claude/agents/Code-Writer.MD')
+
+    @unittest.skipUnless(os.name == 'nt', 'CreateProcess tries the working directory before PATH')
+    def test_a_git_in_the_project_is_not_the_one_run(self):
+        # Claude Code runs the hook in the project, a contributor's checkout: its git.exe must not run
+        from pip._vendor.distlib.scripts import ScriptMaker
+        fake = self.root / 'fake'
+        fake.mkdir()
+        (fake / 'git').write_text(f'#!/usr/bin/env python3\nimport pathlib, sys\npathlib.Path({str(self.root / "ran")!r}).touch()\nsys.exit(1)\n')
+        maker = ScriptMaker(str(fake), str(self.project))
+        maker.executable = sys.executable
+        maker.make('git')
+        self.assertTrue((self.project / 'git.exe').is_file())
+        self.env = {k: v for k, v in self.env.items() if k.lower() != 'nodefaultcurrentdirectoryinexepath'}   # Claude Code sets it
+        self.installed('workflows', 'pr-babysit.js', 'new')
+        self.local('workflows', 'pr-babysit.js', 'old')
+        self.assert_denied(self.hook(run_in=self.project), '.claude/workflows/pr-babysit.js')
+        self.assertFalse((self.root / 'ran').exists(), "the project's git.exe ran")
+
+    @unittest.skipUnless(os.name == 'nt', 'shadows.on_path walks PATH on Windows only')
+    def test_a_relative_path_entry_is_no_place_to_find_a_program(self):
+        # a relative entry resolves against the hook's working directory, the project
+        spec = importlib.util.spec_from_file_location('shadows', SCRIPT.parents[2] / 'skills' / 'headless-chief' / 'scripts' / 'shadows.py')
+        shadows = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shadows)
+        (self.project / 'bin').mkdir()
+        for exe in (self.project / 'git.exe', self.project / 'bin' / 'git.exe'):
+            exe.write_bytes(b'')
+        cwd = os.getcwd()
+        os.chdir(self.project)
+        self.addCleanup(os.chdir, cwd)
+        with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['.', 'bin', '\\bin', ''])}):
+            self.assertIsNone(shadows.on_path('git', ('.exe',)))
+        with mock.patch.dict(os.environ, {'PATH': str(self.project / 'bin')}):
+            self.assertEqual(Path(shadows.on_path('git', ('.exe',))), self.project / 'bin' / 'git.exe')
 
 
 if __name__ == '__main__':

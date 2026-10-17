@@ -42,6 +42,7 @@ over runs, the rows under FOLD dollars folded into one, its total split by model
 import argparse
 import functools
 import json
+import os
 import re
 import sys
 from collections import Counter, defaultdict
@@ -140,7 +141,7 @@ def seconds(t0, t1):
 
 def meta_of(meta_path):
     try:
-        return json.loads(meta_path.read_text())
+        return json.loads(meta_path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return {}
 
@@ -318,7 +319,7 @@ def timeline(session, walls):
 def record_of(session, run):
     """A run's record beside the transcripts, or {}."""
     try:
-        r = json.loads((session / 'workflows' / f'{run}.json').read_text())
+        r = json.loads((session / 'workflows' / f'{run}.json').read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return {}
     return r if isinstance(r, dict) else {}
@@ -476,7 +477,7 @@ def report(session, full_path=None):
     full = table(rows) + '\n\n' + breakout(rows, session) + '\n\n' + timeline(session, walls) + '\n\n' + '\n'.join(notes)
     if full_path is None:
         return None, full, total_cell(rows)
-    full_path.write_text(full + '\n', encoding='utf-8')
+    full_path.write_text(full + '\n', encoding='utf-8', newline='\n')
     brief = (f'## Launches\n\n{launches(session, rows, walls)}\n\n## Usage by stage and agent\n\n{usage(rows)}\n\n'
              + ''.join(n + '\n' for n in notes[1:]) + f'Per launch × stage × model and the time breakdown: {full_path}')
     return brief, full, total_cell(rows)
@@ -504,4 +505,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':
+        sys.stdout.reconfigure(encoding='utf-8')   # labels are claude's UTF-8 text, whatever the locale
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

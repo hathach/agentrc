@@ -4,13 +4,27 @@ import signal
 import subprocess
 import sys
 import tempfile
-import termios
 import threading
 import time
 import unittest
 from pathlib import Path
 
+try:
+    import termios
+except ImportError:  # Windows
+    termios = None
+
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'console_capture.py'
+
+
+@unittest.skipUnless(os.name == 'nt', 'the refusal is for Windows')
+class WindowsRefusalTest(unittest.TestCase):
+    def test_it_refuses_before_touching_a_port(self):
+        r = subprocess.run([sys.executable, str(SCRIPT), '--port', 'COM3', '--baud', '115200', '--seconds', '1',
+                            '--lines', 'leave', '--out', 'never-written'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('POSIX-only (termios)', r.stderr)
+        self.assertFalse(os.path.exists('never-written'))
 
 
 @unittest.skipIf(os.name == 'nt', 'ptys are POSIX')

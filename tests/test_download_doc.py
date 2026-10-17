@@ -3,12 +3,14 @@ reported as legacy, never imported a second time."""
 import contextlib
 import io
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'skills' / 'download-doc' / 'scripts'))
@@ -176,6 +178,18 @@ class RetitlePlan(unittest.TestCase):
                                 (8, 'LPC43xx leaflet (UM10503)', 'UM10503 LPC43xx leaflet')])
         self.assertEqual(absent, [2, 3, 4, 5, 7])
 
+    def test_a_dry_run_prints_titles_outside_the_console_encoding(self):
+        # Most ST titles carry ®, which a GBK or ASCII pipe cannot encode.
+        self.book(1, 'LPC43xx® manual (UM10503)')
+        self.book(2, 'LPC43xx guide (UM10503)', folder=False)
+        env = {k: v for k, v in os.environ.items() if k not in ('PYTHONIOENCODING', 'PYTHONUTF8')}
+        done = subprocess.run([sys.executable, str(Path(retitle.__file__)), '--no-pdf'], capture_output=True,
+                              env=dict(env, CALIBRE_LIBRARY=str(self.lib)))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = done.stdout.decode('utf-8')
+        self.assertIn('+  UM10503 LPC43xx® manual', out)
+        self.assertIn('⚠️  1 renames withheld', out)
+
     def test_apply_refuses_while_something_holds_the_library(self):
         class Held:
             def blockers(self):
@@ -195,6 +209,40 @@ class RetitlePlan(unittest.TestCase):
 
 class GuiDetection(unittest.TestCase):
     """Only the Calibre GUI holds the library; its workers and other tools do not."""
+
+    def test_the_process_list_is_read_on_this_os(self):
+        # It once walked /proc on Windows too, and every sync.py command died in blockers().
+        # Only its shape: a PID-namespaced container may show no other process.
+        listed = list(doclib.Library._cmdlines())
+        self.assertIsInstance(listed, list)
+        self.assertTrue(all(argv and isinstance(argv[0], str) for argv in listed), listed[:3])
+
+    @unittest.skipUnless(os.name == 'nt', 'tasklist is how Windows lists its processes')
+    def test_a_process_list_tasklist_cannot_give_is_a_blocker_not_no_gui(self):
+        def missing(argv, **kw):
+            raise FileNotFoundError(2, 'The system cannot find the file specified', 'tasklist')
+        runs = {'no tasklist': missing,
+                'exit 1': lambda argv, **kw: subprocess.CompletedProcess(argv, 1, '', 'ERROR: Access denied.'),
+                'ERROR line': lambda argv, **kw: subprocess.CompletedProcess(argv, 0, 'ERROR: Invalid query\r\n', '')}
+        lib = doclib.Library.__new__(doclib.Library)
+        lib.server = ('http://localhost:8080', 'u', 'pw')  # even when an open GUI would not block
+        for name, run in runs.items():
+            with self.subTest(name), unittest.mock.patch.object(doclib.subprocess, 'run', run):
+                blockers = lib.blockers()
+                self.assertEqual(len(blockers), 1, blockers)
+                self.assertIn('cannot list processes to check for the Calibre GUI', blockers[0])
+                with self.assertRaisesRegex(RuntimeError, 'cannot list processes'):
+                    doclib.Library._gui_running()
+
+    @unittest.skipUnless(os.name == 'nt', 'tasklist is how Windows lists its processes')
+    def test_on_windows_the_gui_is_calibre_exe_alone(self):
+        rows = {'calibre.exe': True, 'CALIBRE.EXE': True, 'calibre-parallel.exe': False,
+                'calibredb.exe': False, 'calibre-server.exe': False}
+        for image, gui in rows.items():
+            out = f'"System","4","Services","0","144 K"\r\n"{image}","4242","Console","1","90,000 K"\r\n'
+            with self.subTest(image), unittest.mock.patch.object(
+                    doclib.subprocess, 'run', lambda argv, **kw: subprocess.CompletedProcess(argv, 0, out, '')):
+                self.assertEqual(doclib.Library._gui_running(), gui)
 
     GUI = [['/usr/bin/python3.13', '/usr/bin/calibre']]
     WORKER = [['/usr/bin/python3.13', '/usr/bin/calibre-parallel', '--pipe-worker', 'from calibre.utils.ipc.pool ...']]
@@ -276,6 +324,24 @@ class LastModified(unittest.TestCase):
             out = '200 Wed, 28 Oct 2020 20:09:52 GMT' if '--compressed' in argv else '403 '
             return subprocess.CompletedProcess(argv, 0, out, '')
         self.assertEqual(self.head(run), ('Wed, 28 Oct 2020 20:09:52 GMT', ''))
+
+    def test_the_body_is_discarded_to_this_os_null_device(self):
+        # curl cannot write "/dev/null" on Windows: exit 23, and no revision ever.
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(argv[argv.index('-o') + 1])
+            return subprocess.CompletedProcess(argv, 0, '200 Wed, 28 Oct 2020 20:09:52 GMT', '')
+        self.head(run)
+        self.assertEqual(seen, [os.devnull])
+
+    def test_a_missing_wget_falls_through_to_curl(self):
+        def run(argv, **kw):
+            if argv[0] == 'wget':
+                raise FileNotFoundError(2, 'No such file', 'wget')
+            return subprocess.CompletedProcess(argv, 0, b'{"ok": 1}', b'')
+        with unittest.mock.patch.object(doclib.subprocess, 'run', run):
+            self.assertEqual(doclib.get_json('https://example.com/x.json'), {'ok': 1})
 
     def test_a_missing_last_modified_names_the_final_status(self):
         for out, code, why in (('403 ', 0, 'HTTP 403'),
@@ -460,6 +526,26 @@ class FakeCalibre:
             self.books.remove(book)
             return ''
         raise AssertionError(f'unexpected calibredb {args}')
+
+
+@unittest.skipUnless(shutil.which('pdftotext'), 'page 1 is read with pdftotext')
+class PageOneText(unittest.TestCase):
+    """Page 1 reads back as UTF-8 whichever pdftotext is on PATH: Git for Windows'
+    xpdf writes Latin-1 unless asked, and one undecodable byte lost the whole page."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.pdf = Path(tmp.name) / 'es.pdf'
+        # StandardEncoding: 0xD0 is an em dash, 0xA8 a currency sign, 0xE8 Ł, whose UTF-8
+        # 0xC5 0x81 a cp1252 locale cannot decode either
+        self.pdf.write_bytes(pdf_with('ES0182 Rev 3 \xd0 STM32\xa8 \xe8 errata'))
+
+    def test_page1_text_keeps_the_page_and_its_non_ascii_text(self):
+        self.assertIn('ES0182 Rev 3 — STM32¤ Ł errata', doclib.page1_text(self.pdf))
+
+    def test_retitle_reads_the_number_off_such_a_page(self):
+        self.assertEqual(retitle.from_pdf(self.pdf), ('ES0182', 'both', None))
 
 
 @unittest.skipUnless(shutil.which('pdftotext'), 'identity checks read the PDF with pdftotext')

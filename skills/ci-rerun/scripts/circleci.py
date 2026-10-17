@@ -21,6 +21,7 @@ v2 one, no token needed.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -80,7 +81,7 @@ def rerun(repo, numbers):
             running.append({'workflow': wid, 'jobs': jobs, 'status': status})
             continue
         done = subprocess.run(['circleci', 'workflow', 'rerun', wid, '--from-failed', '--json'],
-                              capture_output=True, text=True)
+                              capture_output=True, encoding='utf-8', errors='replace')
         try:
             new = json.loads(done.stdout)['workflow_id'] if done.returncode == 0 else None
         except (ValueError, KeyError, TypeError):
@@ -119,7 +120,7 @@ def main(argv=None):
     repo = a.repo
     if not repo:
         done = subprocess.run(['gh', 'repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'],
-                              capture_output=True, text=True)
+                              capture_output=True, encoding='utf-8', errors='replace')
         if done.returncode != 0:
             print(f'circleci.py: {done.stderr.strip()}', file=sys.stderr)
             return 2
@@ -134,4 +135,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':  # what it prints carries remote text, which a Windows console code page cannot always encode
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

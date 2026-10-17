@@ -46,12 +46,25 @@ class Failed(Exception):
     pass
 
 
+def bash():
+    """'bash'; on Windows bash.exe from PATH alone: not the cwd, a checkout's bash.bat, nor System32's WSL launcher."""
+    if os.name != 'nt':
+        return 'bash'
+    wsl = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'bash.exe'))
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        path = os.path.join(d, 'bash.exe')
+        if os.path.isabs(d) and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
+            return path
+    raise Failed('RTD_TOKEN is not in the environment and no bash.exe is on PATH for a login shell (System32 holds only WSL)')
+
+
 def token():
     value = os.environ.get('RTD_TOKEN')
     if not value:
+        login = bash()
         try:
-            value = subprocess.run(['bash', '-lc', 'printf %s "$RTD_TOKEN"'],
-                                   capture_output=True, text=True, timeout=10).stdout.strip()
+            value = subprocess.run([login, '-lc', 'printf %s "$RTD_TOKEN"'],
+                                   capture_output=True, encoding='utf-8', errors='replace', timeout=10).stdout.strip()
         except (OSError, subprocess.SubprocessError) as e:
             raise Failed(f'RTD_TOKEN is not in the environment and the login shell failed: {e}')
     if not value:
@@ -152,4 +165,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':  # what it prints carries remote text, which a Windows console code page cannot always encode
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

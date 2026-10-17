@@ -61,7 +61,7 @@ class LaunchResultTest(unittest.TestCase):
         if data is None:
             path.unlink(missing_ok=True)
         else:
-            path.write_text(data if isinstance(data, str) else json.dumps(data))
+            path.write_text(data if isinstance(data, str) else json.dumps(data), encoding='utf-8')
         out = io.StringIO()
         with redirect_stdout(out):
             rc = launch_result.report(launch_result.collect, ['--output', str(path), *argv])
@@ -79,7 +79,8 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(s['result']['status'], 'paused')
         self.assertEqual(s['result']['rollup']['pushed'], [NEXT[:8]])
-        self.assertEqual(s['stateRef'], {'outputFile': str((self.dir / 'w.output').resolve()), 'digest': '0123abcd'})
+        self.assertEqual(s['stateRef'], {'outputFile': (self.dir / 'w.output').resolve().as_posix(), 'digest': '0123abcd'},
+                         'with slashes: the workflow puts it in a shell command')
         self.assertEqual(s['blockers'], [], 'a push past the reviewed head is not a disagreement')
         self.assertEqual(s['observation']['findings'], [{'id': '7#1', 'digest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid', 'at': 'a.c:3'}])
         ci = s['observation']['ci']
@@ -186,7 +187,7 @@ class LaunchResultTest(unittest.TestCase):
             'duplicate-finding-ids', 'fix-verification-failed', 'held-awaiting-caller', 'preflight-died', 'preflight-failed', 'push-failed',
             'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending',
             'wrong-branch', 'wrong-remote', 'yielded'}
-        source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
+        source = (ROOT / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
         historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced

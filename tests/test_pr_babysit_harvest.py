@@ -4,7 +4,8 @@ import hashlib
 import importlib.util
 import io
 import json
-import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -285,16 +286,27 @@ class FailClosed(unittest.TestCase):
             self.assertEqual(harvest.head_event('o/r', 7, view, HEAD)[0], '2026-09-25T09:00:00Z', 'GitHub leaves a reopen\'s commit_id null')
 
 
+def run_gh_as(stub):
+    """Patch subprocess.run so `gh ...` runs stub under this Python, never a gh found on PATH; anything but git fails."""
+    real = subprocess.run
+
+    def run(argv, *a, **kw):
+        if argv[0] == 'gh':
+            argv = [sys.executable, str(stub), *argv[1:]]
+        elif argv[0] not in ('git', sys.executable):
+            raise AssertionError(f'{argv[0]} must not run in this test: only git, and gh as the stub')
+        return real(argv, *a, **kw)
+    return mock.patch.object(subprocess, 'run', run)
+
+
 class FakeGh:
-    """A gh on PATH answering from a {joined argv: [answers...]} map; each call pops the first answer that remains."""
+    """A gh answering from a {joined argv: [answers...]} map; each call pops the first answer that remains."""
 
     def __init__(self, root, answers):
         self.file = root / 'answers.json'
         self.file.write_text(json.dumps(answers))
-        bin_dir = root / 'bin'
-        bin_dir.mkdir(exist_ok=True)
-        (bin_dir / 'gh').write_text(f'''#!/usr/bin/env python3
-import json, sys
+        self.stub = root / 'gh.py'
+        self.stub.write_text(f'''import json, sys
 f = {str(self.file)!r}
 answers = json.load(open(f))
 key = ' '.join(sys.argv[1:])
@@ -305,12 +317,20 @@ out = got.pop(0) if len(got) > 1 else got[0]
 json.dump(answers, open(f, 'w'))
 print(json.dumps(out))
 ''')
-        (bin_dir / 'gh').chmod(0o755)
-        self.path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
 
 
 def workflow(on):
     return {'content': base64.b64encode(on.encode()).decode()}
+
+
+class WithoutPyYaml(unittest.TestCase):
+    def test_only_reading_a_workflow_needs_pyyaml(self):
+        """sonar.py and coderabbit_trigger.py import this file for its gh helpers, under a python3 that may lack PyYAML."""
+        with mock.patch.dict(sys.modules, {'yaml': None}):
+            bare = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(bare)
+            with self.assertRaisesRegex(bare.Unusable, 'PyYAML is not installed'):
+                bare.pr_types('o/r', '.github/workflows/build.yml', HEAD)
 
 
 class EndToEnd(unittest.TestCase):
@@ -349,7 +369,7 @@ class EndToEnd(unittest.TestCase):
     def harvest(self, answers, *argv):
         gh = FakeGh(self.root, answers)
         out = io.StringIO()
-        with mock.patch.dict(os.environ, {'PATH': gh.path}), redirect_stdout(out):
+        with run_gh_as(gh.stub), redirect_stdout(out):
             code = harvest.report(harvest.collect, list(argv) or ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit'])
         return code, json.loads(out.getvalue().splitlines()[-1])
 

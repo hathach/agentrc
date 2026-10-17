@@ -50,10 +50,12 @@ def run(*argv, ok=(0,)):
 def attempt(*argv, input=None):
     """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, errors='replace', input=input)
+        # bytes in: a text-mode stdin on Windows writes each \n as \r\n
+        done = subprocess.run(argv, capture_output=True, input=None if input is None else input.encode('utf-8', 'replace'))
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')
-    return done.returncode, done.stdout, done.stderr
+    text = lambda b: b.decode('utf-8', 'replace').replace('\r\n', '\n').replace('\r', '\n')  # as text mode reads it
+    return done.returncode, text(done.stdout), text(done.stderr)
 
 
 def fnv1a(text):

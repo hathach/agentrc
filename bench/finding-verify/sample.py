@@ -85,7 +85,7 @@ def main(argv=None):
     ap.add_argument('--span', type=int, default=15)
     ap.add_argument('--size', type=int, default=4)
     a = ap.parse_args(argv)
-    cases = [json.loads(l) for l in a.cases.read_text().splitlines()]
+    cases = [json.loads(l) for l in a.cases.read_text(encoding='utf-8').splitlines()]
     tag = {c['id']: tags(c) for c in cases}
     pool = clusters(cases, tag, a.span, a.size)
     random.Random(a.seed).shuffle(pool)
@@ -125,7 +125,7 @@ def main(argv=None):
         if room(cl):
             take(cl)
     sample = [{**c, 'cluster': i, 'tags': sorted(tag[c['id']])} for i, cl in enumerate(picked) for c in cl]
-    with a.out.open('w') as f:
+    with a.out.open('w', encoding='utf-8', newline='\n') as f:
         for c in sample:
             f.write(json.dumps(c) + '\n')
     print(f'{len(sample)}/{a.total} cases in {len(picked)} clusters, seed {a.seed}: ' +

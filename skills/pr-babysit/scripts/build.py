@@ -28,6 +28,7 @@ to leave behind.
 
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -65,6 +66,18 @@ def snapshot(paths):
     return h.hexdigest()
 
 
+def bash():
+    """'bash'; on Windows bash.exe from PATH alone: not the cwd, the PR's checkout, nor System32's WSL launcher."""
+    if os.name != 'nt':
+        return 'bash'
+    wsl = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'bash.exe'))
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        path = os.path.join(d, 'bash.exe')
+        if os.path.isabs(d) and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
+            return path
+    raise Unusable('no bash.exe on PATH (System32 holds only the WSL launcher)')
+
+
 def collect(argv):
     p = Parser(prog='build.py')
     p.add_argument('--path', action='append', required=True)
@@ -72,6 +85,10 @@ def collect(argv):
     p.add_argument('--setup')
     p.add_argument('--require', action='append', default=[])
     a = p.parse_args(argv)
+    sh = bash()
+    # <BUILD> goes into the command unquoted: a temp dir with a blank or shell syntax in it would split or run
+    if os.name == 'nt' and re.search(r'[\s\'"$`;&|<>()*?[\]{}!#]', Path(tempfile.gettempdir()).as_posix()):
+        raise Unusable(f'the temp dir {tempfile.gettempdir()} holds a blank or shell syntax: point TMP and TEMP at a plain path')
     top = checkout_top()
 
     LOGS.mkdir(exist_ok=True)
@@ -79,7 +96,7 @@ def collect(argv):
     os.close(fd)
     fd, stage_file = tempfile.mkstemp(prefix='stage-', dir=LOGS)
     os.close(fd)
-    build = tempfile.mkdtemp(prefix='pr-babysit-build-')
+    build = Path(tempfile.mkdtemp(prefix='pr-babysit-build-')).as_posix()  # C:/... survives an unquoted <BUILD>
 
     def cleanup():
         shutil.rmtree(build, ignore_errors=True)
@@ -93,7 +110,7 @@ def collect(argv):
         with open(log, 'ab') as out:
             out.write(''.join(f'$ {line}\n' for line in shell.splitlines()).encode())
             out.flush()
-            build_exit = subprocess.run(['bash', '-c', shell], cwd=top, stdout=out, stderr=subprocess.STDOUT,
+            build_exit = subprocess.run([sh, '-c', shell], cwd=top, stdout=out, stderr=subprocess.STDOUT,
                                         env={**os.environ, 'PR_BABYSIT_STAGE': stage_file}).returncode
         stage = Path(stage_file).read_text().strip()
         if stage not in STAGES:
@@ -104,7 +121,7 @@ def collect(argv):
         raise Unusable(f'{e}; cleanup left {retained}' if retained else str(e))
     return {'revision': revision, 'snapshot': snap, 'snapshotAfter': after, 'command': command,
             'setup': a.setup or '', 'requires': a.require, 'stage': stage,
-            'buildDir': build, 'exit': build_exit, 'log': log, 'retained': cleanup()}
+            'buildDir': build, 'exit': build_exit, 'log': Path(log).as_posix(), 'retained': cleanup()}
 
 
 if __name__ == '__main__':

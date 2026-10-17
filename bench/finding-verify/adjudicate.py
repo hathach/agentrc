@@ -13,6 +13,7 @@ adjudicator's name, the names distinct.
 import argparse
 import collections
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -44,7 +45,7 @@ Return only a JSON array, one object per finding, in this order:
 
 
 def load(path):
-    return [json.loads(l) for l in Path(path).read_text().splitlines() if l.strip()]
+    return [json.loads(l) for l in Path(path).read_text(encoding='utf-8').splitlines() if l.strip()]
 
 
 def span(text):
@@ -81,7 +82,7 @@ def answers(spec, ids):
         raise SystemExit(f'{spec!r}: expected NAME=file[,file...]')
     got = {}
     for path in files.split(','):
-        for a in json.loads(Path(path).read_text()):
+        for a in json.loads(Path(path).read_text(encoding='utf-8')):
             checks = ((a.get('id') in ids, 'unknown id'), (a.get('id') not in got, 'answered twice'),
                       (a.get('label') in LABELS, f'label not one of {LABELS}'), (a.get('needs') in NEEDS, f'needs not one of {NEEDS}'),
                       (isinstance(a.get('evidence'), str) and a['evidence'].strip(), 'no evidence'))
@@ -142,7 +143,7 @@ def main(argv=None):
         sys.stdout.write(brief(sample, a.clusters, checkouts))
         return 0
     corpus = merge(sample, a.a, a.b, a.lead)
-    with a.out.open('w') as f:
+    with a.out.open('w', encoding='utf-8', newline='\n') as f:
         for c in corpus:
             f.write(json.dumps(c) + '\n')
     by = collections.Counter(c['truth']['status'] for c in corpus)
@@ -151,4 +152,6 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':  # the brief quotes findings and code
+        sys.stdout.reconfigure(encoding='utf-8')
     sys.exit(main())

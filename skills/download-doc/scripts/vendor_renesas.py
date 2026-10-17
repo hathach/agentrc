@@ -83,7 +83,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
     # twice, counted twice in the plan, and the second copy was refused by calibredb as
     # a duplicate title — which the importer then reported as ~700 failures. Dedupe by
     # document id, English first.
-    rows = sorted(json.loads(CACHE.read_text()),
+    rows = sorted(json.loads(CACHE.read_text(encoding="utf-8")),
                   key=lambda r: 0 if "/en/" in r["url"] else 1)
     for row in rows:
         kind = TYPE_MAP.get(row["type"])

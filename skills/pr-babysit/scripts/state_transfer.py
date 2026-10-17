@@ -33,7 +33,7 @@ MAX = 64 * 1024
 
 def load(path):
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             saved = json.load(f)
     except OSError as e:
         raise Unusable(f'cannot read {path}: {e.strerror}')

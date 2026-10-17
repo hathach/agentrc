@@ -16,6 +16,9 @@ spec.loader.exec_module(commits)
 
 ENV = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
        'GIT_COMMITTER_EMAIL': 't@t'}
+# Names git quotes outside -z; NTFS forbids " and a newline, so Windows takes non-ASCII ones git quotes too.
+QUOTED = 'src/quote"name.c' if os.name != 'nt' else 'src/naïve name.c'
+NEWLINE = 'c\nd.c' if os.name != 'nt' else 'cé d.c'
 
 
 class CommitsTest(unittest.TestCase):
@@ -29,11 +32,11 @@ class CommitsTest(unittest.TestCase):
 
     def git(self, *argv):
         return subprocess.run(['git', *argv], cwd=self.repo, env=ENV, check=True,
-                              capture_output=True, text=True).stdout
+                              capture_output=True, encoding='utf-8').stdout
 
     def write(self, path, text):
         (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (self.repo / path).write_text(text)
+        (self.repo / path).write_text(text, encoding='utf-8')
 
     def commit(self, message, *paths):
         self.git('add', '-A', '--', *paths)
@@ -47,11 +50,11 @@ class CommitsTest(unittest.TestCase):
 
     def run_script(self, *argv, cwd=None, stdin=''):
         done = subprocess.run([sys.executable, str(SCRIPT), *argv], cwd=cwd or self.repo, env=ENV,
-                              capture_output=True, text=True, input=stdin)
+                              capture_output=True, encoding='utf-8', input=stdin)
         return done.returncode, json.loads(done.stdout.splitlines()[-1])
 
     def test_head_reads_the_commit_and_the_scope_unquoted(self):
-        odd = ['src/space name.c', 'src/quote"name.c', '-x.c']
+        odd = ['src/space name.c', QUOTED, '-x.c']
         for p in odd:
             self.write(p, 'x\n')
         self.write('a.c', 'changed\n')
@@ -62,8 +65,8 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual((out['sha'], out['parent'], out['scope'], out['refusal']), (sha, self.base, odd, ''),
                          'a change outside the scope is not left behind')
         self.assertEqual(len(out['entries']), 3)
-        blob = self.git('rev-parse', f'{sha}:src/quote"name.c').strip()
-        self.assertIn(f'100644 blob {blob}\tsrc/quote"name.c', out['entries'])
+        blob = self.git('rev-parse', f'{sha}:{QUOTED}').strip()
+        self.assertIn(f'100644 blob {blob}\t{QUOTED}', out['entries'])
         rest = {k: v for k, v in out.items() if k != 'seal'}
         self.assertEqual(out['seal'], sys.modules['facts'].sealed(rest)['seal'], 'the line is sealed over what it says')
 
@@ -112,14 +115,14 @@ class CommitsTest(unittest.TestCase):
     def test_chain_lists_each_commit_oldest_first(self):
         self.write('b.c', 'b\n')
         one = self.commit('one', 'b.c')
-        self.write('c\nd.c', 'c\n')
+        self.write(NEWLINE, 'c\n')
         self.write('b.c', 'bb\n')
-        two = self.commit('two', 'c\nd.c', 'b.c')
+        two = self.commit('two', NEWLINE, 'b.c')
         code, out = self.run_script('chain', self.base, two, '--published', self.base, '--base', self.base, '--tip', self.base)
         self.assertEqual(code, 0)
         self.assertEqual({k: v for k, v in out.items() if k != 'seal'}, {
             'from': self.base, 'to': two, 'published': self.base, 'base': self.base, 'tip': self.base, 'commits': [one, two], 'refusal': '',
-            'paths': ['b.c', 'c\nd.c'], 'unpublished': ['b.c', 'c\nd.c']}, 'each path once, a name holding a newline whole')
+            'paths': ['b.c', NEWLINE], 'unpublished': ['b.c', NEWLINE]}, 'each path once, a name holding a newline whole')
 
     def test_unpublished_holds_only_what_the_commits_after_the_published_head_touch(self):
         self.write('b.c', 'b\n')
@@ -231,6 +234,8 @@ class CommitsTest(unittest.TestCase):
                 ('a new mode', {'resolve': lambda: (self.repo / 'a.c').chmod(0o755)}, ['a.c']),
                 ('a deletion of a file both parents hold', {'resolve': lambda: self.git('rm', '-q', 'a.c')}, ['a.c'])):
             with self.subTest(name):
+                if os.name == 'nt' and name == 'a new mode':
+                    self.skipTest('chmod sets no exec bit on Windows')
                 self.git('checkout', '-q', '--detach', self.base)
                 for branch in ('main', 'pr'):
                     subprocess.run(['git', 'branch', '-q', '-D', branch], cwd=self.repo, env=ENV, capture_output=True)
@@ -328,6 +333,7 @@ class CommitsTest(unittest.TestCase):
             sha = self.commit(message, 'b.c')
             self.assertEqual(self.chain_refusal(self.base, sha), '', message)
 
+    @unittest.skipIf(os.name == 'nt', 'Windows file names are Unicode: none is not UTF-8')
     def test_a_name_that_is_not_utf8_is_an_error_not_a_lookalike(self):
         self.write('bad\ufffd.c', 'owned\n')
         (self.repo / b'bad\xff.c'.decode('utf-8', 'surrogateescape')).write_text('stray\n')
@@ -346,6 +352,30 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(self.git('log', '-1', '--format=%B'), 'Fix the thing\n\nWhy.\n\n')
         self.assertIn('A  other.c', self.git('status', '--porcelain'), 'what was staged beside it stays staged, uncommitted')
 
+    def test_commit_takes_a_utf8_message_on_stdin_verbatim(self):
+        # Windows once decoded it in the console code page and committed mojibake.
+        message = 'Fix the naïve check — ✓ 修复\n\nWhy: “quoted”.\n'
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin=message)
+        self.assertEqual((code, out['committed']), (0, True), out)
+        self.assertEqual(self.git('log', '-1', '--format=%B'), message + '\n')
+
+    def test_attempt_reads_utf8_output_whatever_the_locale(self):
+        code, out, err = sys.modules['facts'].attempt(sys.executable, '-c', "import sys; sys.stdout.buffer.write('é ✓ 修复'.encode())")
+        self.assertEqual((code, out, err), (0, 'é ✓ 修复', ''))
+
+    def test_attempt_sends_its_input_byte_for_byte_and_reads_newlines_as_text_mode_does(self):
+        echo = "import sys; sys.stdout.buffer.write(repr(sys.stdin.buffer.read()).encode() + b'\\r\\n' + 'é'.encode())"
+        code, out, _ = sys.modules['facts'].attempt(sys.executable, '-c', echo, input='a\nb ✓\n')
+        self.assertEqual((code, out), (0, repr('a\nb ✓\n'.encode()) + '\né'), 'Windows text-mode stdin once wrote \\r\\n')
+
+    def test_a_leading_bom_does_not_hide_an_attribution_subject(self):
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='﻿Co-Authored-By: Claude <x@y>\n\nFix\n')
+        self.assertEqual((code, out['committed']), (0, True), out)
+        self.assertEqual(self.git('log', '-1', '--format=%B'), 'Co-Authored-By: Claude <x@y>\n\nFix\n\n', 'the BOM is not committed')
+        self.assertIn('carries attribution', self.refusal('head', '--parent', self.base, 'a.c'))
+
     def test_commit_refused_by_a_hook_is_not_committed(self):
         self.hook('echo "trailing whitespace fixed in a.c" >&2\nexit 1')
         self.write('a.c', 'changed\n')
@@ -354,6 +384,7 @@ class CommitsTest(unittest.TestCase):
         self.assertIn('trailing whitespace', out['detail'])
         self.assertEqual(self.git('rev-parse', 'HEAD').strip(), self.base)
 
+    @unittest.skipIf(os.name == 'nt', 'NTFS forbids : and * in a file name')
     def test_commit_reads_a_path_named_like_pathspec_magic_literally(self):
         self.write(':(top)*', 'odd\n')
         self.write('a.c', 'changed\n')

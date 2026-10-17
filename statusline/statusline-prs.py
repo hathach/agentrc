@@ -18,6 +18,7 @@ it held leaves without writing, so a later render retries (best effort, no fairn
 sweep removes caches, temp files a killed worker left and the per-session `.lock` files of the
 earlier scheme once idle for KEEP_S; a resumed session rebuilds its cache from the transcript.
 """
+import contextlib
 import datetime
 import json
 import os
@@ -25,13 +26,15 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 try:
     import fcntl
-except ImportError:
+except ImportError:  # Windows
     fcntl = None
+    import msvcrt
 
 SESSION_ID = re.compile(r'[A-Za-z0-9-]+')
 REPO = re.compile(r'[\w.-]+/[\w.-]+')
@@ -142,7 +145,17 @@ def render(cache):
 def publish(path, cache):
     tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
     tmp.write_text(json.dumps(cache))
-    os.replace(tmp, path)
+    if os.name != 'nt':
+        os.replace(tmp, path)
+        return
+    # Windows refuses the replace while a render reads the cache: retry, then leave it to the next publish
+    for _ in range(50):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            time.sleep(0.02)
+    tmp.unlink(missing_ok=True)
 
 
 def query(prs):
@@ -175,8 +188,9 @@ def fetch(prs):
     """({pr: status} for every PR GitHub returned, epoch to wait for when points run low or None).
     Any error or unexpected shape raises ValueError, so nothing partial replaces the last-good status."""
     doc, repos = query(prs)
-    done = subprocess.run(['gh', 'api', 'graphql', '-f', f'query={doc}'], capture_output=True, text=True,
-                          timeout=GH_TIMEOUT_S)
+    done = subprocess.run(['gh', 'api', 'graphql', '-f', f'query={doc}'], capture_output=True, encoding='utf-8',
+                          errors='replace', timeout=GH_TIMEOUT_S,
+                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))  # the worker has no console
     answer = json.loads(done.stdout)
     if done.returncode or not isinstance(answer, dict) or answer.get('errors') or not isinstance(answer.get('data'), dict):
         raise ValueError(f'gh api graphql failed: {done.stderr.strip()[:200]}')
@@ -203,9 +217,15 @@ def refresh(cache_dir, session_id, transcript):
     The lock stays held to the last publish; attempt_at is wall-clock, so it cannot exclude a worker."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_dir / f'{session_id}.json'
-    with open(cache_dir / '.lock', 'a') as lock:
+    with open(cache_dir / '.lock', 'a') as lock, contextlib.ExitStack() as held:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fcntl:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:  # msvcrt locks are mandatory and per handle: lock a byte past the (empty) content
+                os.lseek(lock.fileno(), 1 << 30, os.SEEK_SET)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                # unlocked before the close, which frees it only "after a delay"; nothing moves the position
+                held.callback(msvcrt.locking, lock.fileno(), msvcrt.LK_UNLCK, 1)
         except OSError:
             return
         cache, now = load(path), time.time()
@@ -249,10 +269,11 @@ def sweep(cache_dir, now):
 
 
 def spawn_refresh(cache_dir, session_id, transcript):
+    detach = {'start_new_session': True} if os.name != 'nt' else \
+        {'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
     try:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), 'refresh', str(cache_dir), session_id, transcript],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True)
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **detach)
     except OSError:
         pass
 
@@ -261,13 +282,17 @@ def main(argv):
     if len(argv) == 5 and argv[1] in ('render', 'refresh') and SESSION_ID.fullmatch(argv[3]):
         cache_dir, session_id, transcript = Path(argv[2]), argv[3], argv[4]
         if argv[1] == 'refresh':
-            if fcntl:  # no flock (Windows): never refresh
+            if hasattr(signal, 'alarm'):
                 signal.alarm(WORKER_S)  # bounds the scan and parsing too, not just gh
-                refresh(cache_dir, session_id, transcript)
+            else:  # Windows: no SIGALRM
+                timer = threading.Timer(WORKER_S, os._exit, (1,))
+                timer.daemon = True
+                timer.start()
+            refresh(cache_dir, session_id, transcript)
             return 0
         cache, now = load(cache_dir / f'{session_id}.json'), time.time()
         print(render(cache))
-        if fcntl and due(cache, now) and (os.path.isfile(transcript) or cached_prs(cache)):
+        if due(cache, now) and (os.path.isfile(transcript) or cached_prs(cache)):
             spawn_refresh(cache_dir, session_id, transcript)
         return 0
     print(__doc__, file=sys.stderr)
@@ -275,4 +300,6 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':
+        sys.stdout.reconfigure(encoding='utf-8')  # the glyphs; Windows stdout defaults to its ANSI code page
     sys.exit(main(sys.argv))

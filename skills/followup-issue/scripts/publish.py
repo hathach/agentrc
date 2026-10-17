@@ -49,7 +49,8 @@ class Refused(Exception):
 
 
 def gh(args, stdin=None):
-    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, text=True)
+    # replace: a stray byte must reach the error and read-back paths, not raise past them
+    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, encoding='utf-8', errors='replace')
     return r.returncode, r.stdout, r.stderr
 
 

@@ -1,10 +1,14 @@
+import importlib.util
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.py'
@@ -33,8 +37,18 @@ else:
 json.dump(state, open(os.environ['STUB_STATE'], 'w'))
 '''
 SKILLS = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
+spec = importlib.util.spec_from_file_location('install', SCRIPT)
+install = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(install)
 SKILL = SKILLS[0]
 SKILL_HOOKS = [s for s in SKILLS if (ROOT / 'hooks' / s / 'hooks.json').exists()]
+
+
+def guard_command(script):
+    """The settings command of a Python hook: under the installing interpreter on Windows, where bash may find no
+    python3 and a hook that cannot start lets the call through."""
+    command = shlex.quote(script.as_posix())
+    return f'{shlex.quote(Path(sys.executable).as_posix())} {command}' if os.name == 'nt' else command
 
 
 class InstallTest(unittest.TestCase):
@@ -95,7 +109,7 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(os.path.samefile(self.home / '.local' / 'bin' / 'lsusbt', ROOT / 'bin' / 'lsusbt'))
         self.assertTrue(os.path.samefile(self.claude / 'CLAUDE.md', USER_MD))
         self.assertTrue(os.path.samefile(self.codex / 'AGENTS.md', USER_MD))
-        self.assertEqual((self.codex / 'AGENTS.md').read_text(), USER_MD.read_text())
+        self.assertEqual((self.codex / 'AGENTS.md').read_text(encoding='utf-8'), USER_MD.read_text(encoding='utf-8'))
         self.assertEqual(self.ok('install', '--claude-md'), '', 'relative Codex link is idempotent outside HOME')
 
     def test_a_link_to_the_old_root_file_moves_to_the_user_file(self):
@@ -111,8 +125,8 @@ class InstallTest(unittest.TestCase):
             'Stop': [{'hooks': [{'type': 'command', 'command': 'other-stop'}]}]}}
         (self.claude / 'settings.json').write_text(json.dumps(before))
         self.ok('install', '--skill')
-        launcher = str(self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate')
-        guards = [str(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
+        launcher = (self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate').as_posix()  # bash runs it, also on Windows
+        guards = [guard_command(self.claude / 'hooks' / 'headless-chief' / g) for g in ('shadow_guard.py', 'chief_guard.py')]
         data = self.settings()
         self.assertEqual(data['model'], 'x')
         self.assertEqual(self.commands(data), {'SessionStart': ['other'], 'Stop': ['other-stop', launcher],
@@ -141,9 +155,80 @@ class InstallTest(unittest.TestCase):
                               env={**os.environ, 'HOME': str(home), 'USERPROFILE': str(home)})
         self.assertEqual(done.returncode, 0, done.stderr)
         data = json.loads((home / '.claude' / 'settings.json').read_text())
-        launcher = str(home / '.claude' / 'hooks' / 'simplify-gate' / 'simplify-gate')
-        want = subprocess.list2cmdline([launcher]) if os.name == 'nt' else f"'{launcher}'"
-        self.assertEqual(data['hooks']['Stop'][0]['hooks'][0]['command'], want)
+        launcher = (home / '.claude' / 'hooks' / 'simplify-gate' / 'simplify-gate').as_posix()
+        command = data['hooks']['Stop'][0]['hooks'][0]['command']
+        self.assertEqual(command, f"'{launcher}'")
+        if os.name == 'nt':  # Claude Code runs it through bash: a backslash path would lose its separators
+            done = subprocess.run([shutil.which('bash'), '-c', f'printf %s {command}'], capture_output=True, text=True)
+            self.assertEqual(done.stdout, launcher)
+
+    def test_settings_are_utf8(self):
+        self.claude.mkdir()
+        before = {'model': 'Zoë ✔ ő'}  # outside the Windows ANSI code pages
+        (self.claude / 'settings.json').write_bytes(json.dumps(before, ensure_ascii=False).encode())
+        env = {**os.environ, 'HOME': str(self.home), 'USERPROFILE': str(self.home)}
+        env.pop('PYTHONUTF8', None)
+        done = subprocess.run([sys.executable, str(SCRIPT), 'install', '--skill'], capture_output=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads((self.claude / 'settings.json').read_bytes())['model'], before['model'])
+        self.assertEqual(json.loads((self.claude / 'settings.json.before-agentrc').read_bytes()), before)
+
+    def test_a_reinstall_replaces_the_entries_an_earlier_version_wrote(self):
+        self.claude.mkdir()
+        launcher = str(self.claude / 'hooks' / 'simplify-gate' / 'simplify-gate')
+        old = [f"'{launcher}'", subprocess.list2cmdline([launcher])]  # backslashes on Windows
+        (self.claude / 'settings.json').write_text(json.dumps({'hooks': {'Stop': [
+            {'hooks': [{'type': 'command', 'command': command}]} for command in old]}}))
+        self.ok('install', '--skill')
+        self.assertEqual(self.commands(self.settings())['Stop'], [Path(launcher).as_posix()])
+
+    def test_a_home_with_quotes_or_spaces_keeps_one_entry_per_hook(self):
+        for name in ("O'Brien", "O'Brien Doe", 'John Doe'):
+            with self.subTest(name):
+                home = self.home / name
+                claude = home / '.claude'
+                claude.mkdir(parents=True)
+                launcher = claude / 'hooks' / 'simplify-gate' / 'simplify-gate'
+                guard = claude / 'hooks' / 'headless-chief' / 'chief_guard.py'
+                # forms earlier versions wrote: bash quoting of the native path, and list2cmdline on Windows
+                old = [shlex.quote(str(launcher))] + ([subprocess.list2cmdline([str(launcher)])] if os.name == 'nt' else [])
+                old_guard = [shlex.quote(str(guard))] + ([subprocess.list2cmdline([str(guard)])] if os.name == 'nt' else [])
+                (claude / 'settings.json').write_text(json.dumps({'hooks': {
+                    'Stop': [{'hooks': [{'type': 'command', 'command': c}]} for c in old],
+                    'PreToolUse': [{'hooks': [{'type': 'command', 'command': c}]} for c in old_guard]}}))
+                env = {**os.environ, 'HOME': str(home), 'USERPROFILE': str(home)}
+                for _ in range(2):
+                    done = subprocess.run([sys.executable, str(SCRIPT), 'install', '--skill'], capture_output=True,
+                                          text=True, env=env)
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    data = json.loads((claude / 'settings.json').read_text())
+                    self.assertEqual(self.commands(data)['Stop'], [shlex.quote(launcher.as_posix())])
+                    self.assertEqual(self.commands(data)['PreToolUse'].count(guard_command(guard)), 1)
+                    self.assertEqual(len(self.commands(data)['PreToolUse']), 2, 'each guard once')
+                done = subprocess.run([sys.executable, str(SCRIPT), 'remove', '--skill'], capture_output=True,
+                                      text=True, env=env)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertNotIn('hooks', json.loads((claude / 'settings.json').read_text()))
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX runs a Python hook by its shebang')
+    def test_a_python_hook_names_this_interpreter_for_bash_on_windows(self):
+        self.ok('install', '--skill')
+        guard = self.claude / 'hooks' / 'headless-chief' / 'chief_guard.py'
+        command = self.commands(self.settings())['PreToolUse'][1]
+        self.assertEqual(command, guard_command(guard))
+        done = subprocess.run([shutil.which('bash'), '-c', f"printf '%s\n' {command}"], capture_output=True, text=True)
+        self.assertEqual(done.stdout.splitlines(), [Path(sys.executable).as_posix(), guard.as_posix()])
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX needs no privilege to link')
+    def test_no_symlink_privilege_refuses_before_touching_anything(self):
+        def no_privilege(*args, **kwargs):
+            raise OSError(None, 'A required privilege is not held by the client', None, 1314)
+
+        with mock.patch.dict(os.environ, {'HOME': str(self.home), 'USERPROFILE': str(self.home)}),                 mock.patch.object(install.os, 'symlink', no_privilege), mock.patch('sys.stderr') as err,                 self.assertRaises(SystemExit) as done:
+            install.main(['install', '--skill', '--claude-md'])
+        self.assertEqual(done.exception.code, 1)
+        self.assertIn('Developer Mode', ''.join(c.args[0] for c in err.write.call_args_list))
+        self.assertEqual(os.listdir(self.home), [], 'nothing created')
 
     def test_a_dead_link_of_ours_is_pruned_and_foreign_links_and_content_stay(self):
         (self.claude / 'skills').mkdir(parents=True)
@@ -196,7 +281,9 @@ class InstallTest(unittest.TestCase):
         (self.claude / 'settings.json').write_text(json.dumps({'model': 'x', 'hooks': {}}))
         self.ok('install', '--statusline')
         for name in ('statusline.sh', 'statusline-codex-usage.py', 'statusline-prs.py'):
-            self.assertEqual(os.readlink(self.claude / name), str(ROOT / 'statusline' / name))
+            # Windows reads an absolute link target back with its \\?\ prefix and \ separators
+            self.assertEqual(os.path.normcase(os.readlink(self.claude / name).removeprefix('\\\\?\\')),
+                             os.path.normcase(ROOT / 'statusline' / name))
         self.assertEqual(self.settings(), {'model': 'x', 'hooks': {}, 'statusLine': {
             'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'}}, 'hooks untouched')
         self.assertEqual(self.ok('install', '--statusline'), '', 'a rerun is silent')
@@ -276,6 +363,17 @@ class InstallTest(unittest.TestCase):
         self.ok('remove', '--claude-md')
         self.assertFalse((self.claude / 'CLAUDE.md').is_symlink())
         self.assertFalse((self.codex / 'AGENTS.md').is_symlink(), 'the relative Codex link is judged before Claude\'s goes')
+
+
+class HerdrOnWindowsTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'herdr refuses only on Windows')
+    def test_herdr_plugins_are_refused_before_any_change(self):
+        with tempfile.TemporaryDirectory() as home:
+            done = subprocess.run([sys.executable, str(SCRIPT), 'install', '--claude-md', '--herdr-plugin'],
+                                  capture_output=True, text=True, env={**os.environ, 'HOME': home, 'USERPROFILE': home})
+            self.assertEqual(done.returncode, 1)
+            self.assertIn('Linux and macOS only', done.stderr)
+            self.assertEqual(os.listdir(home), [])
 
 
 @unittest.skipIf(os.name == 'nt', 'the herdr stub is a shebang script')

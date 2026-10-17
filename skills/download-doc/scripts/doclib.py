@@ -10,6 +10,7 @@ this file, the abstraction is leaking and the fix probably belongs in the adapte
 """
 from __future__ import annotations
 
+import csv
 import json
 import os
 import re
@@ -52,9 +53,12 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 # So: retry with the other client, then back off — and don't hard-code a winner.
 
 def _wget(url: str, timeout: int, accept: str) -> bytes:
-    p = subprocess.run(["wget", "-q", "-O", "-", "-T", str(timeout), "-t", "2",
-                        f"--user-agent={UA}", f"--header=Accept: {accept}", url],
-                       capture_output=True)
+    try:
+        p = subprocess.run(["wget", "-q", "-O", "-", "-T", str(timeout), "-t", "2",
+                            f"--user-agent={UA}", f"--header=Accept: {accept}", url],
+                           capture_output=True)
+    except FileNotFoundError:  # no wget, as on stock Windows: curl alone
+        return b""
     return p.stdout if p.returncode == 0 else b""
 
 
@@ -69,7 +73,7 @@ def last_modified(url: str) -> str | None:
     """Last-Modified of a URL via HEAD: a revision substitute for vendors that
     publish none, and proof that the file exists."""
     # -w reads the final response only; with -L every redirect hop prints its own headers.
-    p = subprocess.run(["curl", "-sgIL", "--compressed", "-o", "/dev/null", "-m", "25", "-A", UA,
+    p = subprocess.run(["curl", "-sgIL", "--compressed", "-o", os.devnull, "-m", "25", "-A", UA,
                         "-w", "%{http_code} %header{last-modified}", url],
                        capture_output=True, text=True)
     status, _, date = p.stdout.partition(" ")
@@ -430,7 +434,7 @@ class Library:
             f = Path(__file__).resolve().parent.parent / "secret.yml"
             if not f.exists():
                 return None
-        blk = re.search(r"^calibre:\s*$(.*?)(?=^\S|\Z)", f.read_text(), re.M | re.S)
+        blk = re.search(r"^calibre:\s*$(.*?)(?=^\S|\Z)", f.read_text(encoding="utf-8"), re.M | re.S)
         if not blk:
             return None
         g = dict(re.findall(r"^\s+(\w+):\s*(\S+)\s*$", blk.group(1), re.M))
@@ -465,10 +469,12 @@ class Library:
                         # it a 0600 file on tmpfs (never touches disk) and delete it
                         # immediately. Its other option, `<stdin>`, routes through
                         # getpass() and needs a TTY we do not have here.
-                        rt = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+                        rt = Path(os.environ.get("XDG_RUNTIME_DIR",
+                                                 tempfile.gettempdir() if os.name == "nt" else "/tmp"))
                         fd, tmp_pw = tempfile.mkstemp(dir=str(rt), prefix=".calpw-")
                         try:
-                            os.fchmod(fd, 0o600)
+                            if hasattr(os, "fchmod"):  # mkstemp already made it 0600; Windows has no modes
+                                os.fchmod(fd, 0o600)
                             with os.fdopen(fd, "w") as fh:
                                 fh.write(pw)
                             p2 = subprocess.run(
@@ -501,8 +507,24 @@ class Library:
 
     @staticmethod
     def _cmdlines():
-        """Every other process's argv, as strings; one that exits mid-walk is skipped."""
+        """Every other process's argv, as strings; one that exits mid-walk is skipped.
+        On Windows only each program's image name: tasklist shows no arguments. A list
+        it cannot give is a RuntimeError, never an empty one that reads as "no GUI"."""
         me = os.getpid()
+        if os.name == "nt":
+            try:
+                p = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True,
+                                   encoding="utf-8", errors="replace")
+            except OSError as e:
+                raise RuntimeError(f"cannot list processes to check for the Calibre GUI: {e}") from e
+            if p.returncode != 0 or re.search(r"^ERROR:", p.stdout or "", re.M):
+                why = (p.stderr or p.stdout or "").strip()[:160]
+                raise RuntimeError("cannot list processes to check for the Calibre GUI: "
+                                   f"tasklist exit {p.returncode}: {why}")
+            for row in csv.reader((p.stdout or "").splitlines()):
+                if len(row) > 1 and row[1].isdigit() and int(row[1]) != me:
+                    yield [row[0]]
+            return
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit() or int(entry.name) == me:
                 continue
@@ -535,6 +557,8 @@ class Library:
         which a content server spawns and which outlive a closing GUI."""
         for argv in cls._cmdlines():
             program = os.path.basename(argv[0])
+            if os.name == "nt":
+                program = re.sub(r"\.exe$", "", program.lower())  # calibre.exe; not calibre-parallel.exe
             if re.fullmatch(r"python3(\.\d+)?", program) and len(argv) > 1:
                 program = os.path.basename(argv[1])
             if program == "calibre":
@@ -545,13 +569,20 @@ class Library:
         """Reasons an import would be unsafe right now. Report these and let the
         user clear them — killing someone's GUI or sync job is not ours to do."""
         out = []
-        gui = self._gui_running()
+        try:
+            gui = self._gui_running()
+        except RuntimeError as e:  # Windows: tasklist failed, so an open GUI cannot be ruled out
+            return [str(e)]
         if gui and not self.server:
             out.append("The Calibre GUI is open and holds the library's write lock — "
                        "close it before importing.")
         # With content-server credentials configured, an open GUI is not a blocker:
         # _run writes through its server instead of competing for the lock. Reporting
         # it anyway made sync.py refuse imports that would have succeeded.
+        # Linux only: it needs the program's arguments to find the calibre-library batch.
+        # On Windows _cmdlines() has image names alone (FreeFileSync_x64.exe,
+        # RealTimeSync.exe), and blocking on the name would let a resident RealTimeSync
+        # refuse every import, so there the mirror goes unseen: SKILL.md says to pause it.
         if self._running("FreeFileSync_x86_64", "calibre-library"):
             out.append("A FreeFileSync calibre-library mirror is running — importing "
                        "now races the sync to omv, and calibredb may report a "
@@ -629,8 +660,9 @@ class RemoveError(RuntimeError):
 def page1_text(path: Path, pages: int = 2) -> str:
     if not shutil.which("pdftotext"):
         return ""
-    p = subprocess.run(["pdftotext", "-f", "1", "-l", str(pages), str(path), "-"],
-                       capture_output=True, text=True)
+    # -enc UTF-8: Git for Windows' xpdf pdftotext writes Latin-1 by default.
+    p = subprocess.run(["pdftotext", "-enc", "UTF-8", "-f", "1", "-l", str(pages), str(path), "-"],
+                       capture_output=True, encoding="utf-8", errors="replace")
     return re.sub(r"\s+", " ", p.stdout or "")
 
 
@@ -769,7 +801,7 @@ class UsbIndex:
 
     def __init__(self, path: Path | None = None):
         self.path = path or (Path.home() / ".cache" / "download-doc" / "usb-capability.json")
-        self.data = json.loads(self.path.read_text()) if self.path.exists() else {}
+        self.data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
     def get(self, vendor: str, family: str):
         return self.data.get(f"{vendor}:{family}")
@@ -778,7 +810,7 @@ class UsbIndex:
         self.data[f"{vendor}:{family}"] = {"usb": usb, "source": source,
                                            "evidence": evidence[:120]}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True))
+        self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True), encoding="utf-8")
 
     def hint_from_index(self, docs: list) -> None:
         """Accept positive mentions in the vendor's own descriptions. Never record a

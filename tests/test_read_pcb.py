@@ -1,9 +1,12 @@
 """Tests for the read-pcb skill's pcb.py: EAGLE and KiCad schematics load into
 one model, every pin keeps its own identity, and a source that cannot give a
 complete, unambiguous answer is refused with a named reason."""
+import errno
 import io
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -11,9 +14,6 @@ import unittest
 import unittest.mock
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
-
-if os.name == 'nt':
-    raise unittest.SkipTest('read-pcb requires POSIX file locking')
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'skills' / 'read-pcb' / 'scripts'))
@@ -26,12 +26,15 @@ needs_kicad = unittest.skipUnless(shutil.which('kicad-cli'),
                                   'kicad-cli is not installed; the real export path is unverified here')
 VBUS_NET = ['VBUS', '  R1  1 (A)  10k  t:R', '  R2  1 (A)  10k  t:R']
 
-# A stand-in kicad-cli: FAKE_KICAD=fail exits 1; =edit writes a netlist, then
-# rewrites the schematic at its old size and mtime.
-FAKE_KICAD = f"""#!{sys.executable}
-import os, sys
+# A stand-in kicad-cli: FAKE_KICAD=fail exits 1; =utf8 too, saying so in UTF-8
+# whatever the locale; =edit writes a netlist, then rewrites the schematic at its
+# old size and mtime.
+FAKE_KICAD = """import os, sys
 if os.environ['FAKE_KICAD'] == 'fail':
     sys.exit('Failed to load schematic')
+if os.environ['FAKE_KICAD'] == 'utf8':
+    sys.stderr.buffer.write('library \\u2126 \\u2014 not found\\n'.encode('utf-8'))
+    sys.exit(1)
 with open(sys.argv[sys.argv.index('-o') + 1], 'w') as fh:
     fh.write('<export/>')
 sch = sys.argv[-1]
@@ -53,6 +56,14 @@ def setUpModule():
         os.environ.pop(k, None)
 
 
+def rmtree(path):
+    """shutil.rmtree that also removes git's read-only objects, which Windows refuses to delete."""
+    def writable(func, p, _):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    shutil.rmtree(path, **({'onexc': writable} if sys.version_info >= (3, 12) else {'onerror': writable}))
+
+
 def run(*args):
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
@@ -63,7 +74,7 @@ def run(*args):
 class Tmp(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp)
+        self.addCleanup(rmtree, self.tmp)
 
     def write(self, name, data):
         path = self.tmp / name
@@ -124,9 +135,17 @@ class Eagle(Tmp):
         _, out, _ = run('net', EAGLE, 'B1')
         self.assertIn('  R3  1  0R  t:R_0603  [DNP in variant lite]', out)
 
+    def test_a_value_outside_the_console_encoding_prints_rather_than_failing(self):
+        path = self.eagle_variant('value="10k"', 'value="10kΩ µ"')
+        env = {k: v for k, v in os.environ.items() if k not in ('PYTHONIOENCODING', 'PYTHONUTF8')}
+        done = subprocess.run([sys.executable, str(ROOT / 'skills/read-pcb/scripts/pcb.py'), 'parts', str(path), 'R1'],
+                              capture_output=True, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('R1  10kΩ µ  t:R_0603', done.stdout.decode('utf-8'))
+
     def test_every_answer_opens_with_its_source(self):
         _, out, _ = run('nets', EAGLE)
-        self.assertRegex(out.splitlines()[0], rf'^source: {EAGLE} .*\[eagle\]$')
+        self.assertRegex(out.splitlines()[0], rf'^source: {re.escape(str(EAGLE))} .*\[eagle\]$')
 
     def test_a_missing_net_or_part_exits_one_and_suggests_names_that_contain_it(self):
         code, out, _ = run('net', EAGLE, 'SI')
@@ -264,12 +283,19 @@ def kicad_files(prefix=''):
 
 
 class KicadSheets(Tmp, Refusals):
+    @contextmanager
     def fake_kicad(self, mode):
-        """kicad-cli on PATH is FAKE_KICAD in that mode; git stays real."""
-        cli = self.write('bin/kicad-cli', FAKE_KICAD)
-        cli.chmod(0o755)
-        return unittest.mock.patch.dict(os.environ, {'FAKE_KICAD': mode,
-                                                     'PATH': f'{cli.parent}{os.pathsep}{os.environ["PATH"]}'})
+        """kicad-cli is FAKE_KICAD in that mode, run by this interpreter, so no real
+        kicad-cli is ever reached and Windows needs no executable stub; git stays real."""
+        cli = str(self.write('bin/kicad-cli.py', FAKE_KICAD))
+        which, real_run = shutil.which, subprocess.run
+
+        def run(cmd, *a, **kw):
+            return real_run([sys.executable, *cmd] if cmd[0] == cli else cmd, *a, **kw)
+        with unittest.mock.patch.dict(os.environ, {'FAKE_KICAD': mode}), \
+                unittest.mock.patch.object(pcb.shutil, 'which', lambda n: cli if n == 'kicad-cli' else which(n)), \
+                unittest.mock.patch.object(pcb.subprocess, 'run', run):
+            yield
 
     def test_a_sub_sheet_is_refused_and_names_its_root(self):
         self.assertRefused('sub-sheet of the project whose root sheet has uuid r-uuid',
@@ -293,7 +319,7 @@ class KicadSheets(Tmp, Refusals):
         self.write('board/sheets/a.kicad_sch', CHILD_SHEET.format(child='../shared/b.kicad_sch'))
         self.write('board/shared/b.kicad_sch', SUB_SHEET)
         self.write('board/main.kicad_pro', '{}')
-        names = sorted(os.path.relpath(p, self.tmp) for p in pcb.kicad_inputs(str(root)))
+        names = sorted(Path(os.path.relpath(p, self.tmp)).as_posix() for p in pcb.kicad_inputs(str(root)))
         self.assertEqual(names, ['board/main.kicad_pro', 'board/main.kicad_sch',
                                  'board/shared/b.kicad_sch', 'board/sheets/a.kicad_sch'])
 
@@ -314,6 +340,11 @@ class KicadSheets(Tmp, Refusals):
             self.assertRefused('changed while KiCad exported it', 'nets', root)
         self.assertIn('"v"', root.read_text())
         self.assertEqual((root.stat().st_size, root.stat().st_mtime_ns), (stat.st_size, stat.st_mtime_ns))
+
+    def test_a_kicad_cli_message_outside_the_locale_encoding_is_still_its_message(self):
+        with self.fake_kicad('utf8'):
+            self.assertRefused('kicad-cli failed (1): library Ω — not found',
+                               'nets', self.write('main.kicad_sch', MIN_ROOT))
 
     def test_a_kicad_cli_failure_is_refused_with_its_message(self):
         with self.fake_kicad('fail'):
@@ -382,7 +413,7 @@ class KicadExportVariants(Tmp):
                  '(reference "R3") (unit 1))')
         board = self.copy(root=lambda t: t.replace('(sheet_instances', second + '(sheet_instances'),
                           child=lambda t: t.replace('(reference "R2") (unit 1))', '(reference "R2") (unit 1))' + extra))
-        self.assertEqual(sorted(os.path.relpath(p, self.tmp) for p in pcb.kicad_inputs(str(board))),
+        self.assertEqual(sorted(Path(os.path.relpath(p, self.tmp)).as_posix() for p in pcb.kicad_inputs(str(board))),
                          ['board.kicad_sch', 'sheets/power.kicad_sch'])
         code, out, err = run('net', board, 'VBUS')
         self.assertEqual(code, 0, err)
@@ -403,7 +434,7 @@ class Repos(Tmp):
     def setUp(self):
         super().setUp()
         env = {'XDG_CACHE_HOME': str(self.tmp / 'cache'),
-               'READ_PCB_REMOTE_BASE': f'file://{self.tmp}/remotes/', 'READ_PCB_CLONES': '',
+               'READ_PCB_REMOTE_BASE': (self.tmp / 'remotes').as_uri() + '/', 'READ_PCB_CLONES': '',
                'READ_PCB_SOURCES': os.pathsep.join(('acme/boards', 'hathach/pcb'))}
         patcher = unittest.mock.patch.dict(os.environ, env)
         patcher.start()
@@ -453,7 +484,8 @@ class Clones(Repos, Refusals):
 
     def test_a_tilde_entry_is_expanded(self):
         path = self.repo('home/pcb', {}, 'git@github.com:hathach/pcb.git')
-        with unittest.mock.patch.dict(os.environ, {'HOME': str(self.tmp / 'home')}):
+        with unittest.mock.patch.dict(os.environ, {'HOME': str(self.tmp / 'home'),
+                                                   'USERPROFILE': str(self.tmp / 'home')}):
             self.clones('~/pcb')
             self.assertEqual(pcb.clones(), {'hathach/pcb': str(path)})
 
@@ -546,6 +578,20 @@ class LocalClone(Repos):
                      'acme/boards:boards/../../outside.sch'):
             self.assertRefused('must stay inside acme/boards', 'nets', spec, code=2)
 
+    def test_a_native_separator_path_out_of_a_clone_is_outside_it(self):
+        self.assertTrue(pcb.escapes(os.path.join('..', 'loose', 'x.sch')))
+        self.assertFalse(pcb.escapes(os.path.join('..board', 'x.sch')))
+        self.assertEqual(pcb.relative(str(self.clone / 'boards' / 'Hub Rev B.sch'), str(self.clone)),
+                         'boards/Hub Rev B.sch', 'git and the source name both want /')
+        self.assertRefused('must stay inside acme/boards', 'nets',
+                           'acme/boards:' + os.path.join('..', 'outside.sch'), code=2)
+
+    @unittest.skipUnless(os.name == 'nt', 'only Windows has paths with no relative path between them')
+    def test_a_file_on_another_drive_is_outside_every_clone(self):
+        self.assertEqual(pcb.relative('Q:\\boards\\x.sch', 'C:\\clone'), '..')
+        self.assertTrue(pcb.escapes('Q:/x.sch'))
+        self.assertEqual(pcb.worktree_state('C:\\clone', 'HEAD', 'Q:\\x.sch', b''), 'outside the repository')
+
     def test_a_name_starting_with_two_dots_is_inside_the_repository(self):
         self.write('boards clone/..board.sch', EAGLE.read_bytes())
         git(self.clone, 'add', '..board.sch')
@@ -556,17 +602,21 @@ class LocalClone(Repos):
 
     def test_a_path_through_a_symlink_is_resolved_to_the_clone(self):
         link = self.tmp / 'link'
-        link.symlink_to(self.clone)
+        try:
+            link.symlink_to(self.clone, target_is_directory=True)
+        except OSError as e:  # Windows without Developer Mode
+            self.skipTest(f'cannot create a symlink: {e}')
         self.assertIn(f'source: {self.name} @', self.header(str(link / 'boards' / 'Hub Rev B.sch')))
         self.assertIn('working tree clean', self.header(str(link / 'boards' / 'Hub Rev B.sch')))
         code, out, err = run('find', '--in', link / 'boards', 'rev b')
-        self.assertEqual((code, out.splitlines()), (0, [f'{self.clone}/boards/Hub Rev B.sch  [eagle]']), err)
+        self.assertEqual((code, out.splitlines()), (0, [f'{self.clone / "boards" / "Hub Rev B.sch"}  [eagle]']), err)
 
     def test_a_deleted_file_is_skipped_and_the_rest_still_listed(self):
         (self.clone / 'boards' / 'Hub Rev A.sch').unlink()
         code, out, _ = run('find', 'hub')
         self.assertEqual((code, out.splitlines()), (0, ['acme/boards:boards/Hub Rev B.sch  [eagle]']))
-        self.assertEqual(run('find', '--in', self.clone)[1].splitlines(), [f'{self.clone}/boards/Hub Rev B.sch  [eagle]'])
+        self.assertEqual(run('find', '--in', self.clone)[1].splitlines(),
+                         [f'{self.clone / "boards" / "Hub Rev B.sch"}  [eagle]'])
 
     def test_an_unreadable_candidate_is_reported_and_the_rest_still_listed(self):
         path = self.clone / 'boards' / 'Hub Rev A.sch'
@@ -614,7 +664,7 @@ class LocalClone(Repos):
         self.remote('hathach/pcb', {'a/x.sch': EAGLE.read_bytes()})
         part = self.tmp / 'partial'
         git(self.tmp, 'clone', '-q', '--filter=blob:none', '--no-checkout',
-            f'file://{self.tmp}/remotes/hathach/pcb.git', str(part))
+            (self.tmp / 'remotes' / 'hathach' / 'pcb.git').as_uri(), str(part))
         git(part, 'reset', '-q')
         git(part, 'remote', 'set-url', 'origin', 'https://github.com/hathach/pcb')
         self.write('partial/a/x.sch', EAGLE.read_bytes())
@@ -635,6 +685,7 @@ class LocalClone(Repos):
 
 
 class FindIn(Repos):
+    @unittest.skipIf(os.name == 'nt', 'board.sch and Board.sch are one file on a case-insensitive filesystem')
     def test_names_that_sort_alike_come_out_in_one_order(self):
         top = self.repo('ties', {n: EAGLE.read_bytes() for n in ('board.sch', 'Board.sch', 'board1.sch', 'board01.sch')})
         outs = {subprocess.run([sys.executable, str(ROOT / 'skills/read-pcb/scripts/pcb.py'), 'find', '--in', str(top)],
@@ -648,14 +699,14 @@ class FindIn(Repos):
         self.write('top/board/new.sch', EAGLE.read_bytes())
         code, out, _ = run('find', '--in', top / 'board')
         self.assertEqual(code, 0)
-        self.assertEqual(out.splitlines(), [f'{top}/board/a.sch  [eagle]',
-                                            f'{top}/board/new.sch  [eagle] [untracked]'])
+        self.assertEqual(out.splitlines(), [f'{top / "board" / "a.sch"}  [eagle]',
+                                            f'{top / "board" / "new.sch"}  [eagle] [untracked]'])
 
     def test_a_plain_directory_is_walked(self):
         self.write('plain/x/board.sch', EAGLE.read_bytes())
         self.write('plain/x/sub.kicad_sch', SUB_SHEET)
         out = run('find', '--in', self.tmp / 'plain', 'board')[1]
-        self.assertEqual(out.splitlines(), [f'{self.tmp}/plain/x/board.sch  [eagle]'])
+        self.assertEqual(out.splitlines(), [f'{self.tmp / "plain" / "x" / "board.sch"}  [eagle]'])
 
     def test_an_unreadable_directory_refuses_the_search_with_or_without_git(self):
         self.repo('git', {'visible.sch': EAGLE.read_bytes()})
@@ -677,14 +728,40 @@ class FindIn(Repos):
             path = self.write(f'odd{i}/odd.kicad_sch', text)
             self.write(f'odd{i}/ok.sch', EAGLE.read_bytes())
             code, out, err = run('find', '--in', path.parent)
-            self.assertEqual((code, out.splitlines()), (0, [f'{path.parent}/odd.kicad_sch  [{tag}]',
-                                                            f'{path.parent}/ok.sch  [eagle]']), err)
+            self.assertEqual((code, out.splitlines()), (0, [f'{path.parent / "odd.kicad_sch"}  [{tag}]',
+                                                            f'{path.parent / "ok.sch"}  [eagle]']), err)
             self.assertRefused('malformed KiCad schematic', 'nets', path)
 
     def test_find_without_keyword_or_path_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as e, redirect_stderr(io.StringIO()):
             pcb.main(['find'])
         self.assertEqual(e.exception.code, 2)
+
+
+@unittest.skipUnless(os.name == 'nt', 'msvcrt locks; flock is freed when the cache lock file closes')
+class WindowsLock(unittest.TestCase):
+    def test_the_lock_is_freed_when_the_block_ends_not_after_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'repo.lock')
+            with open(path, 'w') as held, open(path, 'w') as other:
+                with pcb.exclusive(held):
+                    pass
+                os.lseek(other.fileno(), 1 << 30, os.SEEK_SET)
+                pcb.msvcrt.locking(other.fileno(), pcb.msvcrt.LK_NBLCK, 1)  # raises if still held
+                pcb.msvcrt.locking(other.fileno(), pcb.msvcrt.LK_UNLCK, 1)
+
+    def test_a_lock_error_other_than_contention_is_raised_not_retried(self):
+        calls = []
+
+        def locking(fd, mode, n):
+            calls.append(mode)
+            if len(calls) > 1:
+                raise AssertionError('retried a lock that cannot succeed')
+            raise OSError(errno.EBADF, 'Bad file descriptor')
+        with tempfile.TemporaryFile() as fh, unittest.mock.patch.object(pcb.msvcrt, 'locking', locking):
+            with self.assertRaises(OSError) as e, pcb.exclusive(fh):
+                pass
+        self.assertEqual(e.exception.errno, errno.EBADF)
 
 
 class Cache(Repos, Refusals):
@@ -746,7 +823,7 @@ class Cache(Repos, Refusals):
 
     def test_a_reachable_source_answers_while_the_other_fails(self):
         self.push(self.pcb, {'e/board.sch': EAGLE.read_bytes()})
-        shutil.rmtree(self.tmp / 'remotes' / 'acme')
+        rmtree(self.tmp / 'remotes' / 'acme')
         code, out, _ = run('find', 'kicad_sch')
         self.assertEqual(code, 3)
         self.assertEqual(out.splitlines()[0], 'hathach/pcb:k/board.kicad_sch  [kicad]')
@@ -762,7 +839,7 @@ class Cache(Repos, Refusals):
         cache = pcb.Cache('hathach/pcb')
         into = self.tmp / 'into'
         cache.materialize('b/main.kicad_sch', str(into))
-        self.assertEqual(sorted(str(p.relative_to(into)) for p in into.rglob('*') if p.is_file()),
+        self.assertEqual(sorted(p.relative_to(into).as_posix() for p in into.rglob('*') if p.is_file()),
                          ['b/main.kicad_pro', 'b/main.kicad_sch', 'b/sheets/a.kicad_sch', 'shared/c.kicad_sch'])
         with self.refused('outside the repository'):
             cache.materialize('x/main.kicad_sch', str(self.tmp / 'into2'))

@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'scope_check.py'
+STAR = [] if os.name == 'nt' else ['src/*.c']  # NTFS forbids * in a file name
 
 
 class ScopeCheckTest(unittest.TestCase):
@@ -19,7 +20,7 @@ class ScopeCheckTest(unittest.TestCase):
         # a test running git in a temp repo must not inherit a caller's GIT_* (pre-commit sets some)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         self.env.update({'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'})
-        files = {'src/a.c': 'int a;\n', 'src/keep me.c': '', 'src/*.c': '', 'test/unit/test_a.c': '', '.gitignore': '*.generated.c\nbuild/\n!build/again.c\n',
+        files = {'src/a.c': 'int a;\n', 'src/keep me.c': '', **dict.fromkeys(STAR, ''), 'test/unit/test_a.c': '', '.gitignore': '*.generated.c\nbuild/\n!build/again.c\n',
                  'build/keep.c': ''}
         for path, text in files.items():
             (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
@@ -41,17 +42,18 @@ class ScopeCheckTest(unittest.TestCase):
         return done.returncode, json.loads(done.stdout.splitlines()[-1])
 
     def test_tracked_files_and_files_to_create_are_accepted(self):
-        code, out = self.check('src/a.c', 'src/keep me.c', 'src/*.c', 'test/unit/test_b.c', 'test/device/test_hid.c')
+        code, out = self.check('src/a.c', 'src/keep me.c', *STAR, 'test/unit/test_b.c', 'test/device/test_hid.c')
         self.assertEqual(code, 0)
         self.assertEqual(out['accepted'], [{'path': 'src/a.c', 'kind': 'existing'}, {'path': 'src/keep me.c', 'kind': 'existing'},
-                                           {'path': 'src/*.c', 'kind': 'existing'}, {'path': 'test/unit/test_b.c', 'kind': 'new'},
+                                           *({'path': p, 'kind': 'existing'} for p in STAR), {'path': 'test/unit/test_b.c', 'kind': 'new'},
                                            {'path': 'test/device/test_hid.c', 'kind': 'new'}])
         self.assertEqual(out['refused'], [])
         self.assertIn('seal', out)
 
     def test_a_pathspec_pattern_names_only_itself(self):
         _, out = self.check('src/[a].c', 'src/:(glob)*.c')
-        self.assertEqual([r['path'] for r in out['accepted']], ['src/[a].c', 'src/:(glob)*.c'])
+        magic = ['src/:(glob)*.c'] if os.name != 'nt' else []  # a : is no plain path on Windows
+        self.assertEqual([r['path'] for r in out['accepted']], ['src/[a].c', *magic])
         self.assertEqual({r['kind'] for r in out['accepted']}, {'new'}, 'neither matched src/a.c as a pattern')
 
     def test_what_a_writer_must_not_be_given_is_refused_with_its_reason(self):
@@ -75,6 +77,27 @@ class ScopeCheckTest(unittest.TestCase):
             ('build/new.c', 'ignored'),
             ('build/again.c', 'ignored'),
         ])
+
+    @unittest.skipUnless(os.name == 'nt', 'a backslash or a colon is a plain file name character on POSIX')
+    def test_a_windows_spelling_is_refused(self):
+        top = (self.repo / 'src' / 'new.c').as_posix()
+        paths = [top, top.replace('/', '\\'), 'src\\new.c', 'src/a.c:stream', 'C:src/new.c', 'src/:(glob)*.c']
+        _, out = self.check(*paths)
+        self.assertEqual(out['accepted'], [])
+        self.assertEqual([(r['path'], r['why']) for r in out['refused']], [(p, 'not a plain repository-relative path') for p in paths])
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX checks a symlink out as one, refused as reached through a symbolic link')
+    def test_a_symlink_checked_out_as_a_file_is_refused(self):
+        self.git('config', 'core.symlinks', 'false')
+        (self.repo / 'src' / 'link.c').write_text('a.c')
+        blob = subprocess.run(['git', 'hash-object', '-w', 'src/link.c'], cwd=self.repo, env=self.env, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        self.git('update-index', '--add', '--cacheinfo', f'120000,{blob},src/link.c')
+        self.git('commit', '-qm', 'link')
+        code, out = self.check('src/link.c', 'src/a.c')
+        self.assertEqual(code, 0)
+        self.assertEqual(out['accepted'], [{'path': 'src/a.c', 'kind': 'existing'}])
+        self.assertEqual(out['refused'], [{'path': 'src/link.c', 'why': 'not a regular file in the index'}])
 
     def test_it_runs_only_from_the_checkout_top(self):
         code, out = self.check('a.c', cwd=self.repo / 'src')

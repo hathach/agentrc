@@ -21,7 +21,7 @@ stderr by its id; history.py lists and shows them. READ_DOC_HISTORY=0 skips it.
 import argparse
 import collections
 import contextlib
-import fcntl
+import errno
 import glob
 import json
 import os
@@ -33,6 +33,12 @@ import time
 import unicodedata
 import urllib.parse
 import uuid
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 LIB = os.path.realpath(os.path.expanduser(os.environ.get("CALIBRE_LIBRARY") or "~/Documents/calibre-library"))
 DB = os.path.join(LIB, "metadata.db")
@@ -199,6 +205,41 @@ def resolve(bid, path, fmt, name):
     return None
 
 
+# Windows locks are mandatory: lock a byte far past the records, so readers are never refused.
+LOCK_BYTE = 1 << 30
+
+
+def lock(fd):
+    """Hold an exclusive lock on fd until unlock() or close."""
+    if fcntl:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return
+    os.lseek(fd, LOCK_BYTE, os.SEEK_SET)
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EDEADLOCK):
+                raise
+            time.sleep(0.05)  # LK_LOCK gives up after ~10 s
+
+
+def unlock(fd):
+    """Windows frees a closed handle's lock only after a delay; POSIX frees it at close."""
+    if not fcntl:
+        with contextlib.suppress(OSError):  # the record is written; closing frees it anyway
+            os.lseek(fd, LOCK_BYTE, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+def last_byte(fd, end):
+    if hasattr(os, "pread"):
+        return os.pread(fd, 1, end - 1)
+    os.lseek(fd, end - 1, os.SEEK_SET)  # O_APPEND writes still go to the end
+    return os.read(fd, 1)
+
+
 def log_lookup(library, op, query, started, code, error, result):
     """Append one lookup record to HISTORY. Failing to is a warning: the lookup
     already answered, and its exit code stays the lookup's."""
@@ -214,15 +255,18 @@ def log_lookup(library, op, query, started, code, error, result):
     line = (json.dumps(record) + "\n").encode()
     try:
         os.makedirs(os.path.dirname(HISTORY), mode=0o700, exist_ok=True)
-        fd = os.open(HISTORY, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
+        fd = os.open(HISTORY, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            end = os.lseek(fd, 0, os.SEEK_END)
-            if end and os.pread(fd, 1, end - 1) != b"\n":
-                line = b"\n" + line  # a writer killed mid-line must not swallow this record
-            view = memoryview(line)
-            while view:
-                view = view[os.write(fd, view):]
+            lock(fd)
+            try:
+                end = os.lseek(fd, 0, os.SEEK_END)
+                if end and last_byte(fd, end) != b"\n":
+                    line = b"\n" + line  # a writer killed mid-line must not swallow this record
+                view = memoryview(line)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                unlock(fd)
         finally:
             os.close(fd)
     except OSError as e:
@@ -315,6 +359,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # titles carry ® and the like
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:

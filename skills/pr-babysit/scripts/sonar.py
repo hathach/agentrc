@@ -151,7 +151,7 @@ def settle(token, item, pr, head, heads):
 
 def items_of(path):
     try:
-        m = json.loads(Path(path).read_text())
+        m = json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError, ValueError) as e:
         raise Unusable(f'manifest {path}: {e}')
     items = m.get('items') if isinstance(m, dict) else None
@@ -172,7 +172,7 @@ def items_of(path):
 def saved_results(path, request):
     """The results saved at path for request, None when path is absent; Unusable for anything else there."""
     try:
-        saved = json.loads(Path(path).read_text())
+        saved = json.loads(Path(path).read_text(encoding='utf-8'))
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as e:
@@ -189,7 +189,7 @@ def saved_results(path, request):
 
 def save(path, request, results):
     try:
-        Path(path + '.tmp').write_text(json.dumps({'request': request, 'line': sealed({'results': results})}))
+        Path(path + '.tmp').write_text(json.dumps({'request': request, 'line': sealed({'results': results})}), encoding='utf-8')
         os.replace(path + '.tmp', path)
     except OSError as e:
         print(f'sonar.py: receipt not saved: {e}', file=sys.stderr)

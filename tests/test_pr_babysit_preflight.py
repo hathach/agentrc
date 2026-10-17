@@ -23,6 +23,19 @@ VIEW = {'headRefName': 'fix', 'headRefOid': 'f' * 40, 'baseRefOid': 'b' * 40, 'b
 REF = {'ref': 'refs/heads/master', 'object': {'type': 'commit', 'sha': 'c' * 40}}
 
 
+def run_gh_as(stub):
+    """Patch subprocess.run so `gh ...` runs stub under this Python, never a gh found on PATH; anything but git fails."""
+    real = subprocess.run
+
+    def run(argv, *a, **kw):
+        if argv[0] == 'gh':
+            argv = [sys.executable, str(stub), *argv[1:]]
+        elif argv[0] not in ('git', sys.executable):
+            raise AssertionError(f'{argv[0]} must not run in this test: only git, and gh as the stub')
+        return real(argv, *a, **kw)
+    return mock.patch.object(subprocess, 'run', run)
+
+
 class PreflightTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -41,6 +54,7 @@ class PreflightTest(unittest.TestCase):
         self.git('commit', '-q', '--allow-empty', '-m', 'one')
         self.git('push', '-q', '-u', 'origin', 'fix')
         self.fake_gh(json.dumps(VIEW))
+        self.enterContext(run_gh_as(self.root / 'gh.py'))
         self.enterContext(mock.patch.object(tempfile, 'tempdir', str(self.root)))
 
     def git(self, *argv, check=True):
@@ -50,13 +64,11 @@ class PreflightTest(unittest.TestCase):
         """`gh pr ...` answers answer, `gh api ...` ref; each call's argv is appended to gh.log."""
         (self.root / 'answer').write_text(answer)
         (self.root / 'ref').write_text(ref)
-        bin_dir = self.root / 'bin'
-        bin_dir.mkdir(exist_ok=True)
-        (bin_dir / 'gh').write_text(f'#!/bin/sh\necho "$@" >> {self.root / "gh.log"}\n'
-                                    f'if [ "$1" = api ]; then cat {self.root / "ref"}; exit {ref_code}; fi\n'
-                                    f'cat {self.root / "answer"}\nexit {code}\n')
-        (bin_dir / 'gh').chmod(0o755)
-        self.enterContext(mock.patch.dict(os.environ, {'PATH': f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}))
+        (self.root / 'gh.py').write_text('import sys\n'
+                                         f'open({str(self.root / "gh.log")!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
+                                         f'api = sys.argv[1:2] == ["api"]\n'
+                                         f'sys.stdout.write(open({str(self.root / "ref")!r} if api else {str(self.root / "answer")!r}).read())\n'
+                                         f'sys.exit({ref_code} if api else {code})\n')
 
     def gh_calls(self):
         log = self.root / 'gh.log'
@@ -79,6 +91,7 @@ class PreflightTest(unittest.TestCase):
         code, out = self.pin()
         self.assertEqual(code, 0)
         receipts = out.pop('receipts')
+        self.assertNotIn('\\', receipts, 'a Windows dir is spelled C:/...')
         self.assertEqual((Path(receipts).parent, list(Path(receipts).iterdir())), (self.root / 'pr-babysit-receipts', []), 'a new empty directory')
         self.assertNotEqual(self.pin()[1]['receipts'], receipts, 'one per launch')
         self.assertEqual(out, {

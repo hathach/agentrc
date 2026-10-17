@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -375,6 +376,11 @@ class InventoryTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as e, redirect_stdout(io.StringIO()), mock.patch('sys.stderr', io.StringIO()):
             collect.main(['inventory', '--repo', 'o/r', '--pr', '5', '--head', 'abc'])
         self.assertEqual(e.exception.code, 2)
+
+
+def stdin_of(data):
+    """A stdin holding data, text sent as UTF-8."""
+    return io.TextIOWrapper(io.BytesIO(data if isinstance(data, bytes) else data.encode('utf-8')), encoding='utf-8')
 
 
 def log(*lines):
@@ -799,12 +805,19 @@ class FailuresTest(unittest.TestCase):
         self.assertIn('moved', out.getvalue())
         self.assertNotEqual(rc, 0)
 
+    def test_a_log_is_saved_as_utf8(self):
+        self.logs['3'] = log(*STEP, 'naïve ✓ 😀')
+        c = self.entries(JOB.format(3))[0]
+        self.assertNotIn('\\', c['log'], 'a path the judge may paste into a shell')
+        self.assertIn('naïve ✓ 😀', Path(c['log']).read_text(encoding='utf-8'))
+        self.assertNotIn(b'\r', Path(c['log']).read_bytes(), 'lines end in \\n on Windows too')
+
     def test_the_detail_lists_the_prs_changed_paths(self):
         rc, r = self.main(JOB.format(3))
         self.assertEqual(json.loads(Path(r['detail']).read_text())['changed'], ['src/host/msc.c', 'test/hil/tiny usb.json'], 'a path with a space stays one path')
 
     def remember_on(self, head, failures, link=JOB.format(3)):
-        with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps([{'link': link, 'bucket': 'fail', 'failures': failures}]))):
+        with mock.patch.object(sys, 'stdin', stdin_of(json.dumps([{'link': link, 'bucket': 'fail', 'failures': failures}]))):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(collect.main(['remember', '--repo', 'o/r', '--pr', '5', '--head', head]), 0)
 
@@ -1212,7 +1225,7 @@ class VerdictsTest(unittest.TestCase):
 
     def main(self, command, *argv, stdin=''):
         out = io.StringIO()
-        with redirect_stdout(out), mock.patch('sys.stdin', io.StringIO(stdin)):
+        with redirect_stdout(out), mock.patch('sys.stdin', stdin_of(stdin)):
             rc = collect.main([command, '--repo', 'o/r', '--pr', '5', '--head', HEAD, *argv])
         self.printed = out.getvalue()
         return rc, unsealed(self.printed)
@@ -1221,7 +1234,8 @@ class VerdictsTest(unittest.TestCase):
         return {**self.ENTRY, 'link': link.format(n), 'failures': [{**self.ENTRY['failures'][0], 'firstError': 'x' * size}]}
 
     def test_recall_returns_what_was_remembered_unchanged_and_skips_unknown_links(self):
-        self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY])), (0, {'head': HEAD}))
+        # Raw UTF-8 on stdin, stored as UTF-8 whatever the locale: 😀 is in no Windows code page.
+        self.assertEqual(self.main('remember', stdin=json.dumps([self.ENTRY], ensure_ascii=False)), (0, {'head': HEAD}))
         rc, r = self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))
         self.assertEqual((rc, r['verdicts']), (0, [self.ENTRY]))
 
@@ -1346,11 +1360,21 @@ class VerdictsTest(unittest.TestCase):
             for held in r['left']:
                 self.assertEqual(self.joined(held), next(e for e in entries if e['link'] == held['link']), 'each fits one page')
     def test_remember_refuses_what_is_not_a_list_of_verdicts(self):
-        for text in ('not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}]),
+        # strict UTF-8: no BOM, no encoded surrogate (which once crashed the write, leaving its temp file)
+        for text in (b'["\xff"]', b'\xef\xbb\xbf[]', b'[{"link": "\xed\xa0\x80", "bucket": "fail", "failures": []}]', 'not json', json.dumps({'link': 'x'}), json.dumps([{'link': 'x', 'bucket': 'fail'}]),
                      json.dumps([{'link': 'x', 'bucket': 'fail', 'patch': [7]}]), json.dumps([{'link': 'x', 'bucket': 'fail', 'failures': [], 'patch': []}])):
             rc, r = self.main('remember', stdin=text)
             self.assertEqual(rc, 1, text)
             self.assertIn('verdicts on stdin', r['error'])
+        self.assertFalse(collect.evidence_dir('o/r', 5, HEAD).exists() and any(collect.evidence_dir('o/r', 5, HEAD).iterdir()), 'nothing written')
+
+    def test_remember_waits_out_a_reader_holding_the_verdicts_open(self):
+        self.main('remember', stdin=json.dumps([self.ENTRY]))
+        held = open(collect.evidence_dir('o/r', 5, HEAD) / 'verdicts.json', 'rb')  # Windows: os.replace onto it fails
+        self.addCleanup(held.close)
+        threading.Timer(0.2, held.close).start()
+        self.assertEqual(self.main('remember', stdin=json.dumps([{**self.ENTRY, 'link': JOB.format(4)}]))[0], 0)
+        self.assertEqual(len(self.main('recall', '--check', JOB.format(3), '--check', JOB.format(4))[1]['verdicts']), 2)
 
 
 if __name__ == '__main__':

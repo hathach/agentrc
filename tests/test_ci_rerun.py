@@ -3,6 +3,10 @@ import importlib.util
 import io
 import http.server
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
@@ -175,7 +179,8 @@ class RtdTest(unittest.TestCase):
             if url.endswith('/notifications/'):
                 return {'results': [{'message': m} for m in self.notes.get(build, [])]}
             return self.builds[build]
-        for patcher in (mock.patch.object(rtd, 'call', call), mock.patch.dict(rtd.os.environ, {'RTD_TOKEN': 'k'})):
+        for patcher in (mock.patch.object(rtd, 'call', call), mock.patch.dict(rtd.os.environ, {'RTD_TOKEN': 'k'}),
+                        mock.patch.object(rtd, 'bash', lambda: 'bash')):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -274,12 +279,59 @@ class RtdTest(unittest.TestCase):
         self.assertEqual((rc, self.keys), (2, set()))
         self.assertIn('not a single token', err)
 
+    def test_the_login_shell_is_the_bash_on_path(self):
+        """Windows resolves a bare 'bash' to System32's WSL launcher before PATH."""
+        del rtd.os.environ['RTD_TOKEN']
+        run = mock.Mock(return_value=mock.Mock(stdout='tok'))
+        with mock.patch.object(rtd.subprocess, 'run', run), mock.patch.object(rtd, 'bash', lambda: '/opt/bash'):
+            self.main('log', URL.format(1))
+        self.assertEqual((run.call_args.args[0][:2], self.keys), (['/opt/bash', '-lc'], {'tok'}))
+
+    def test_no_bash_for_the_login_shell_is_a_setup_error_before_any_call(self):
+        del rtd.os.environ['RTD_TOKEN']
+        run = mock.Mock()
+        with mock.patch.object(rtd.subprocess, 'run', run), \
+                mock.patch.object(rtd, 'bash', mock.Mock(side_effect=rtd.Failed('no bash.exe is on PATH'))):
+            rc, _, err = self.main('log', URL.format(1))
+        self.assertEqual((rc, self.keys, run.called), (2, set(), False))
+        self.assertIn('no bash.exe is on PATH', err)
+
+    def test_a_refusal_prints_utf8_whatever_the_console(self):
+        # PATH an empty dir: no gh or bash to reach; and none of Python's own UTF-8 switches, so the script's is what is tested
+        with tempfile.TemporaryDirectory() as bare:
+            env = {**{k: v for k, v in os.environ.items() if k.upper() not in ('PATH', 'PYTHONUTF8', 'PYTHONIOENCODING')},
+                   'PATH': bare, 'RTD_TOKEN': 'k'}
+            done = subprocess.run([sys.executable, str(SCRIPTS / 'rtd.py'), 'log', 'https://example.org/修复/🙂'],
+                                  capture_output=True, env=env)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('修复/🙂: not a build URL', done.stderr.decode('utf-8'))
+
     def test_a_login_shell_that_hangs_is_a_setup_error(self):
         del rtd.os.environ['RTD_TOKEN']
         with mock.patch.object(rtd.subprocess, 'run', side_effect=rtd.subprocess.TimeoutExpired('bash', 10)):
             rc, _, err = self.main('log', URL.format(1))
         self.assertEqual(rc, 2)
         self.assertIn('login shell failed', err)
+
+
+@unittest.skipUnless(os.name == 'nt', 'POSIX runs bash by name, as execvp finds it')
+class RtdBashTest(unittest.TestCase):
+    def test_bash_comes_from_path_alone_never_system32s_wsl_launcher_or_the_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, real, cwd = Path(tmp) / 'Windows', Path(tmp) / 'Git' / 'bin', Path(tmp) / 'checkout'
+            for exe in (root / 'System32' / 'bash.exe', real / 'bash.exe', cwd / 'bash.exe', cwd / 'bash.bat'):
+                exe.parent.mkdir(parents=True, exist_ok=True)
+                exe.write_bytes(b'')
+            was = os.getcwd()
+            os.chdir(cwd)
+            try:
+                on_path = lambda *dirs: {'SystemRoot': str(root), 'PATH': os.pathsep.join(map(str, dirs))}
+                with mock.patch.dict(os.environ, on_path(root / 'System32', '.', real)):
+                    self.assertEqual(Path(rtd.bash()), real / 'bash.exe')
+                with mock.patch.dict(os.environ, on_path(root / 'System32', '.', '')), self.assertRaisesRegex(rtd.Failed, 'no bash.exe is on PATH'):
+                    rtd.bash()
+            finally:
+                os.chdir(was)
 
 
 class RtdRedirectTest(unittest.TestCase):

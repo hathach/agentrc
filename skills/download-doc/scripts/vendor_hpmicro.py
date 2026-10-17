@@ -64,7 +64,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
         return []
     want = {f.upper() for f in families} if families else None
     docs = []
-    for rel in CACHE.read_text().split():
+    for rel in CACHE.read_text(encoding="utf-8").split():
         name = rel.rsplit("/", 1)[-1]
         kind = _kind(name)
         if kind is None or (types and kind not in types):

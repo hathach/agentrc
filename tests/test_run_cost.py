@@ -124,6 +124,18 @@ class RunCostTest(unittest.TestCase):
         self.assertTrue(parts['wf_aaa'][0].endswith(' (partial)'), 'its Haiku rows have no dollars')
         self.assertEqual(models['haiku-4-5'], ['-', '-'])
 
+    def test_non_ascii_meta_and_records_are_read_as_utf_8(self):
+        # claude writes them in UTF-8; a locale default (GBK on a Chinese Windows) dropped the label and the name
+        run = self.session / 'subagents' / 'workflows' / 'wf_aaa'
+        (run / 'agent-a3.meta.json').write_text(json.dumps({'description': 'fix:src/ü→✓.c'}, ensure_ascii=False), encoding='utf-8')
+        (self.session / 'workflows').mkdir(parents=True)
+        (self.session / 'workflows' / 'wf_aaa.json').write_text(json.dumps({'workflowName': 'pr-babysit — ✓'}, ensure_ascii=False),
+                                                                encoding='utf-8')
+        write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': OPUS})])
+        out = self.main('--session-id', SID)[1]
+        self.assertIn(('wf_aaa', 'fix', 'opus-5-5'), self.rows(out))
+        self.assertIn('wf_aaa (pr-babysit — ✓)', self.breakout(out, 1))
+
     def test_a_model_the_rates_misprice_or_do_not_know_still_sums_to_its_recorded_dollars(self):
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-haiku-4-5': HAIKU, 'claude-opus-5-5': 4.00})])
         out = self.main('--session-id', SID)[1]

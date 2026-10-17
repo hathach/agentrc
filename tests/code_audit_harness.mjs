@@ -286,6 +286,44 @@ test('a scanner path under root reaches the verifier relative; one outside it, o
   assert.ok(logs.some(l => /3 with an unusable path/.test(l)), logs.join('\n'))
 })
 
+test('a Windows root and scanner path compare with slashes and an upper-case drive', async () => {
+  const at = (file, why) => ({ ...finding(7, why), file })
+  const scans = { 'src/portable/x|correctness': [
+    at('E:\\w\\top\\src\\a.c', 'backslashed'), at('e:/w/top/src/b.c', 'lower drive'), at('E:/w/top-other/a.c', 'prefix collision'),
+    at('D:/elsewhere/a.c', 'outside'),
+  ] }
+  const verdicts = { backslashed: true, 'lower drive': true }
+  const { result } = await run({ ...ONE, root: 'e:\\w\\top\\' }, { scans, verdicts })
+  assert.deepEqual(result.confirmed[0].findings.map(f => f.file), ['src/a.c', 'src/b.c'])
+  assert.deepEqual(result.unverified[0].findings.map(f => [f.file, f.pathError]), [
+    ['D:/elsewhere/a.c', 'absolute path outside the checkout E:/w/top'],
+    ['E:/w/top-other/a.c', 'absolute path outside the checkout E:/w/top'],
+  ])
+  const bare = await run(ONE, { scans: { 'src/portable/x|correctness': [at('C:/w/a.c', 'abs')] } })
+  assert.equal(bare.result.unverified[0].findings[0].pathError, 'absolute path outside the checkout (no root given)')
+  await assert.rejects(run({ ...ONE, root: 'C:w' }), /args\.root must be an absolute path/)
+})
+
+test('every backslash is a separator, a UNC, root- or drive-relative path is absolute, and a drive root matches in any case', async () => {
+  const at = (file, why) => ({ ...finding(7, why), file })
+  const scans = { 'src/portable/x|correctness': [
+    at('src\\..\\..\\x.c', 'escapes'), at('\\\\srv\\share\\x.c', 'unc'), at('\\x.c', 'root-relative'), at('C:x.c', 'drive-relative'),
+    at('src\\c.c', 'relative'), at('.\\src\\d.c', 'dotted'), at('e:\\W\\TOP\\src\\e.c', 'other case'),
+  ] }
+  const verdicts = { relative: true, dotted: true, 'other case': true }
+  const { result, calls } = await run({ ...ONE, root: 'E:/w/top' }, { scans, verdicts })
+  const verified = calls.filter(c => c.label.startsWith('verify:')).map(c => JSON.parse(/^Finding: (.+)$/m.exec(c.prompt)[1]).file)
+  assert.deepEqual(verified, ['src/c.c', 'src/d.c', 'src/e.c'])
+  assert.deepEqual(result.unverified[0].findings.map(f => [f.why, f.pathError]).sort(), [
+    ['drive-relative', 'absolute path outside the checkout E:/w/top'],
+    ['escapes', 'path escapes the checkout'],
+    ['root-relative', 'absolute path outside the checkout E:/w/top'],
+    ['unc', 'absolute path outside the checkout E:/w/top'],
+  ])
+  const posix = await run({ ...ONE, root: '/w/top' }, { scans: { 'src/portable/x|correctness': [at('/W/TOP/src/a.c', 'abs')] } })
+  assert.equal(posix.result.unverified[0].findings[0].pathError, 'absolute path outside the checkout /w/top', 'a POSIX root keeps its case')
+})
+
 test('without root an absolute scanner path is unverified, and root must be absolute', async () => {
   const scans = { 'src/portable/x|correctness': [{ ...finding(7, 'abs'), file: '/w/top/src/a.c' }] }
   const { result, calls } = await run(ONE, { scans })

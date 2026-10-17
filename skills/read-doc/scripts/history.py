@@ -194,6 +194,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # recorded titles and terms are not ASCII
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:

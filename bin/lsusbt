@@ -21,6 +21,7 @@
 #   -v, --verbose     print every line, including devices with no board match
 #   Any other args are passed through to `lsusb -t`. Note -v is consumed here and no
 #   longer reaches lsusb; run `lsusb -t -v` directly if you want its sysfs paths.
+[[ $OSTYPE == linux* ]] || { echo 'lsusbt: Linux-only (sysfs, lsusb -t)' >&2; exit 1; }
 set -uo pipefail
 
 JSON="${HOME}/code/tinyusb/test/hil/tinyusb.json"

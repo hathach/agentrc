@@ -17,15 +17,17 @@
 // verdict it rests on) and env.json (digests of what the verifiers ran under, before and after; score.py
 // refuses a pair whose environments differ). Heads replay concurrently under the one --jobs limit. A worktree
 // found changed after its head is replayed fails the run: no dispatch starts after a failure, running ones are
-// terminated, and every head settles, its calls recorded, before the run exits.
+// terminated, and every head settles, its calls recorded, before the run exits. REPLAY_CLAUDE, a JSON array, is
+// the command run in place of `claude` (the tests' stand-in).
 import { spawn, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync, appendFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, relative, resolve } from 'node:path'
+import { join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
 
-const HERE = new URL('.', import.meta.url).pathname
+const HERE = fileURLToPath(new URL('.', import.meta.url))
 const AGENTRC = resolve(HERE, '..', '..')
 const WORKFLOW = join(AGENTRC, 'workflows', 'code-audit.js')
 const HARDWARE = /datasheet|errat|reference manual|user manual|\bregister|W1C|write-1-to-clear|silicon|read-doc|\b(?:UM|RM|AN|DS)\d{4,}/i
@@ -50,6 +52,11 @@ const jobs = Number(opt.jobs)
 if (!Number.isInteger(jobs) || jobs < 1) fail(`--jobs must be a positive integer, not ${opt.jobs}`)
 const only = opt.only ? new Set(opt.only.split(',')) : null
 if (existsSync(out)) fail(`${out} exists: a run writes a new directory, so no two experiments share one`)
+let CLAUDE = ['claude']
+if (process.env.REPLAY_CLAUDE !== undefined) {  // set but empty is a mistake, not a request for the real claude
+  try { CLAUDE = JSON.parse(process.env.REPLAY_CLAUDE) } catch { CLAUDE = null }
+  if (!Array.isArray(CLAUDE) || !CLAUDE.length || !CLAUDE.every(a => typeof a === 'string' && a)) fail('REPLAY_CLAUDE must be a JSON array of nonempty strings')
+}
 
 const corpusText = readFileSync(corpusFile, 'utf8')
 const cases = corpusText.split('\n').filter(Boolean).map(JSON.parse).filter(c => !only || only.has(c.id))
@@ -96,6 +103,7 @@ for (const [key, dir] of trees) if (!clean(dir, JSON.parse(key)[1])) fail(`${dir
 
 const sha256 = (data) => createHash('sha256').update(data).digest('hex')
 const fileDigest = (p) => existsSync(p) ? sha256(readFileSync(realpathSync(p))) : null
+// Names are `/`-separated on every host, so env.json compares across them.
 const treeDigest = (root) => {
   if (!existsSync(root)) return null
   const h = createHash('sha256')
@@ -105,16 +113,16 @@ const treeDigest = (root) => {
       const p = join(dir, name)
       const st = statSync(p)
       if (st.isDirectory()) walk(p)
-      else h.update(`${relative(root, p)}\0${st.size}\0${st.size < 1 << 20 ? sha256(readFileSync(p)) : ''}\n`)
+      else h.update(`${relative(root, p).split(sep).join('/')}\0${st.size}\0${st.size < 1 << 20 ? sha256(readFileSync(p)) : ''}\n`)
     }
   }
   walk(realpathSync(root))
   return h.digest('hex')
 }
 const env = () => ({
-  workflow: fileDigest(WORKFLOW), replay: fileDigest(new URL(import.meta.url).pathname), corpus: sha256(corpusText),
+  workflow: fileDigest(WORKFLOW), replay: fileDigest(fileURLToPath(import.meta.url)), corpus: sha256(corpusText),
   cases: cases.map(c => c.id).sort(),
-  claude: execFileSync('claude', ['--version'], { encoding: 'utf8' }).trim(),
+  claude: execFileSync(CLAUDE[0], [...CLAUDE.slice(1), '--version'], { encoding: 'utf8' }).trim(),
   userInstructions: fileDigest(join(homedir(), '.claude', 'CLAUDE.md')),
   role: fileDigest(join(homedir(), '.claude', 'agents', 'finding-verifier.md')),
   settings: fileDigest(join(homedir(), '.claude', 'settings.json')),
@@ -138,7 +146,7 @@ const claude = async (cwd, prompt, schema, model, effort) => {
   try {
     if (aborted) throw new Error(`not dispatched: ${aborted.message}`)
     return await new Promise((done) => {
-      const p = spawn('claude', ['-p', '--agent', 'finding-verifier', '--model', model, '--effort', effort, '--output-format', 'json',
+      const p = spawn(CLAUDE[0], [...CLAUDE.slice(1), '-p', '--agent', 'finding-verifier', '--model', model, '--effort', effort, '--output-format', 'json',
         '--json-schema', JSON.stringify(schema), '--permission-mode', 'bypassPermissions', '--max-budget-usd', '10'], { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
       children.add(p)
       let stdout = '', stderr = ''

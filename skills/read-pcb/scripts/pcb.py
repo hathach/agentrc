@@ -25,8 +25,9 @@ Exit 0 result, 1 nothing matched, 2 bad usage or a sheet that is not a root,
 3 source unavailable, unsupported or malformed, or an incomplete find.
 """
 import argparse
+import contextlib
 import datetime
-import fcntl
+import errno
 import os
 import posixpath
 import re
@@ -34,10 +35,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter
 from dataclasses import dataclass, field
 from functools import partial
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 
 class Refusal(Exception):
@@ -300,7 +308,7 @@ def export_netlist(path):
     with tempfile.TemporaryDirectory() as tmp:
         out = os.path.join(tmp, "netlist.xml")
         run = subprocess.run([cli, "sch", "export", "netlist", "--format", "kicadxml", "-o", out, path],
-                             capture_output=True, text=True)
+                             capture_output=True, encoding="utf-8", errors="replace")
         if run.returncode != 0 or not os.path.exists(out):
             raise Refusal(3, f"{path}: kicad-cli failed ({run.returncode}): {(run.stderr or run.stdout).strip()}")
         with open(out, "rb") as fh:
@@ -394,7 +402,16 @@ def why(run):
 
 def escapes(rel):
     """True when a normalized relative path leaves the directory it is relative to."""
-    return rel == ".." or rel.startswith("../") or rel.startswith("/")
+    rel = rel.replace(os.sep, "/")  # Windows relpath gives ..\x, and C:/x is absolute
+    return rel == ".." or rel.startswith("../") or rel.startswith("/") or bool(os.path.splitdrive(rel)[0])
+
+
+def relative(path, start):
+    """path relative to start, '/'-separated as git names it; ".." when on another drive."""
+    try:
+        return os.path.relpath(path, start).replace(os.sep, "/")
+    except ValueError:  # Windows: no relative path between drives
+        return ".."
 
 
 def sources():
@@ -414,7 +431,7 @@ def source_named(name):
 
 def toplevel(path):
     run = git(path if os.path.isdir(path) else os.path.dirname(path), "rev-parse", "--show-toplevel")
-    return out(run) if run.returncode == 0 else None
+    return os.path.normpath(out(run)) if run.returncode == 0 else None  # Windows git prints C:/...
 
 
 def clones():
@@ -451,7 +468,7 @@ def head_sha(top):
 
 def worktree_state(top, sha, path, data):
     """How the bytes read compare with commit sha, the one baseline of a header."""
-    rel = os.path.relpath(path, top)
+    rel = relative(path, top)
     if escapes(rel):
         return "outside the repository"
     entry = git(top, "ls-tree", "-z", sha, "--", rel)
@@ -486,8 +503,8 @@ class Cache:
                                 "read-pcb", repo)
         os.makedirs(os.path.dirname(self.dir), exist_ok=True)
         with open(self.dir + ".lock", "w") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)  # one clone or fetch at a time; FETCH_HEAD is shared
-            self._sync()
+            with exclusive(lock):  # one clone or fetch at a time; FETCH_HEAD is shared
+                self._sync()
 
     def _sync(self):
         if not os.path.isdir(os.path.join(self.dir, ".git")):
@@ -539,6 +556,30 @@ class Cache:
         return f"@ {self.sha[:12]} | cache {self.dir}, origin HEAD fetched {self.fetched}"
 
 
+@contextlib.contextmanager
+def exclusive(fh):
+    """Hold an exclusive lock on fh for the block."""
+    if fcntl:
+        fcntl.flock(fh, fcntl.LOCK_EX)  # freed when fh closes
+        yield
+        return
+    fd = fh.fileno()
+    os.lseek(fd, 1 << 30, os.SEEK_SET)  # Windows locks are mandatory: a byte past any content
+    while True:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            break
+        except OSError as e:
+            if e.errno not in (errno.EACCES, errno.EDEADLOCK):
+                raise
+            time.sleep(0.05)  # LK_LOCK gives up after ~10 s
+    try:
+        yield
+    finally:
+        os.lseek(fd, 1 << 30, os.SEEK_SET)  # Windows frees a closed handle's lock only after a delay
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
 def tag(data):
     """find's format tag; None hides a KiCad sub-sheet."""
     fmt = classify(data)
@@ -577,21 +618,22 @@ def dir_candidates(where):
         raise Refusal(2, f"--in {where}: not a directory")
     top = toplevel(base)
     if top:
-        return git_candidates(top, base, base + os.sep)
+        return git_candidates(top, base, base + os.sep, os.sep)
     rows = []
     for d, _, fs in os.walk(base, onerror=unreadable):
         for f in fs:
             p = os.path.join(d, f)
-            rows.append((p, os.path.relpath(p, base), "", partial(read_file, p, head=True)))
+            rows.append((p, relative(p, base), "", partial(read_file, p, head=True)))
     return rows
 
 
-def git_candidates(top, base, prefix):
+def git_candidates(top, base, prefix, sep="/"):
     """find's rows for the files git lists under base, matched and named relative to base."""
     rows = []
-    for f, st in local_listing(top, os.path.relpath(base, top)).items():
-        rel = os.path.relpath(os.path.join(top, f), base)
-        rows.append((prefix + rel, rel, st, partial(read_file, os.path.join(base, rel), head=True)))
+    for f, st in local_listing(top, relative(base, top)).items():
+        rel = relative(os.path.join(top, f), base)
+        rows.append((prefix + rel.replace("/", sep), rel, st,
+                     partial(read_file, os.path.join(base, rel), head=True)))
     return rows
 
 
@@ -643,12 +685,12 @@ def open_source(spec, tmp):
     if repo is None:
         path = os.path.realpath(os.path.expanduser(spec))
         for r, top in local.items():
-            rel = os.path.relpath(path, top)
+            rel = relative(path, top)
             if not escapes(rel):
                 return Source(path, f"{r}:{rel}", top, f"local clone {top}")
         top = toplevel(path)
         return Source(path, path, top, top or "")
-    rel = posixpath.normpath(m.group(2))
+    rel = posixpath.normpath(m.group(2).replace(os.sep, "/"))
     if escapes(rel):
         raise Refusal(2, f"{spec}: the path after the colon must stay inside {repo}; "
                          "name a file elsewhere by its filesystem path")
@@ -667,7 +709,7 @@ def describe(src, inputs, fmt):
     sha, trouble = head_sha(src.top)
     states = {f: trouble or worktree_state(src.top, sha, f, data) for f, data in inputs.items()}
     state = states.pop(src.path)
-    others = [f"{os.path.relpath(f, src.top)} {st}" for f, st in states.items() if st != "clean"]
+    others = [f"{relative(f, src.top)} {st}" for f, st in states.items() if st != "clean"]
     return (f"source: {src.name} @ {sha[:12] if sha else '(no HEAD)'} | {src.place}, working tree {state}"
             + (f"; inputs {', '.join(others)}" if others else "") + f" [{fmt}]")
 
@@ -815,6 +857,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # part values and net names are not ASCII
     try:
         sys.exit(main(sys.argv[1:]))
     except BrokenPipeError:

@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -16,6 +18,10 @@ reply = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reply)
 
 REPO, PR, ME = 'o/r', 7, 'hathach'
+# A gh stand-in that echoes stdin and appends UTF-8 text: a real process, so the pipe decoding is the script's own.
+ECHO = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + ' ✓ 修复'.encode())"
+STRAY = "import sys; sys.stdout.buffer.write(b'ok \\xff'); sys.stderr.buffer.write(b'err \\xfe'); sys.exit(1)"
+GH = reply.gh  # the real one: ReplyCase patches it
 
 
 class FakeGitHub:
@@ -134,8 +140,8 @@ class ReplyCase(unittest.TestCase):
 
     def json_file(self, obj):
         fd, path = tempfile.mkstemp(suffix='.json', dir=self.tmp)
-        with os.fdopen(fd, 'w') as f:
-            json.dump(obj, f)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(obj, f, ensure_ascii=False)  # raw UTF-8, as a model's file tool writes it
         return path
 
     def main(self, *args):
@@ -779,6 +785,33 @@ RABBIT = reply.comment_digest.CODERABBIT
 FOOTER = reply.comment_digest.FOOTER
 
 
+class EncodingTest(ReplyCase):
+    def test_a_manifest_body_is_read_as_utf8(self):
+        body = 'Fixed — naïve ✓ 修复 🙂'
+        path = self.json_file({'replies': [{'commentId': 1, 'body': body, 'digest': reply.fnv1a(body)}]})
+        self.assertEqual(reply.load_entries(path, 'replies', 'manifest', reply.check_reply)[0]['body'], body)
+
+    def test_gh_output_is_read_as_utf8(self):
+        real = subprocess.run
+        with mock.patch.object(reply.subprocess, 'run', lambda argv, **kw: real([sys.executable, '-c', ECHO], **kw)):
+            self.assertEqual(GH(['api'], '{"body": "é"}'), (0, '{"body": "é"} ✓ 修复', ''))
+
+    def test_a_byte_gh_prints_that_is_not_utf8_is_replaced_not_raised(self):
+        real = subprocess.run
+        with mock.patch.object(reply.subprocess, 'run', lambda argv, **kw: real([sys.executable, '-c', STRAY], **kw)):
+            self.assertEqual(GH(['api']), (1, 'ok �', 'err �'))
+
+    def test_a_refusal_prints_utf8_whatever_the_console(self):
+        path = self.json_file({'replies': [{'commentId': 1, 'body': '修复 🙂'}]})
+        # PATH an empty dir: no gh to reach; and none of Python's own UTF-8 switches, so the script's is what is tested
+        bare = os.path.join(self.tmp, 'bin')
+        os.mkdir(bare)
+        env = {**{k: v for k, v in os.environ.items() if k.upper() not in ('PATH', 'PYTHONUTF8', 'PYTHONIOENCODING')}, 'PATH': bare}
+        done = subprocess.run([sys.executable, str(SCRIPT), '--pr', str(PR), '--repo', REPO, '--manifest', path], capture_output=True, env=env)
+        self.assertEqual(done.returncode, 2)
+        self.assertIn('修复 🙂', done.stderr.decode('utf-8'))
+
+
 class CommentDigestTest(unittest.TestCase):
     """What CodeRabbit rewrites at the end of its own comment leaves the digest alone; nothing else does."""
 
@@ -791,7 +824,7 @@ class CommentDigestTest(unittest.TestCase):
         return self.cd.digests(body, author)[1:]
 
     def live(self, cid):
-        return json.loads((DATA / f'{cid}.json').read_text())
+        return json.loads((DATA / f'{cid}.json').read_text(encoding='utf-8'))
 
     def test_live_comments_keep_the_digest_recorded_before_their_rewrite(self):
         # tinyusb#4055 and #3862: pr-babysit recorded these before CodeRabbit added a status, or flipped its footer to reply.

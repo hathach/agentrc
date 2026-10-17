@@ -107,7 +107,7 @@ def recheck():
 def receipts_dir():
     parent = Path(tempfile.gettempdir()) / 'pr-babysit-receipts'
     parent.mkdir(exist_ok=True)
-    return tempfile.mkdtemp(dir=parent)
+    return Path(tempfile.mkdtemp(dir=parent)).as_posix()  # relayed by a model and pasted into commands: no backslashes
 
 
 def base_tip(name):

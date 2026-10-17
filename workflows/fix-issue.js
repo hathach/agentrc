@@ -146,9 +146,9 @@ if (triage.disposition === 'reply' || triage.disposition === 'unclear' || triage
 // An override is selected before it is checked: a malformed one fails, it does not fall back.
 const verify = nonblank(args.verify ?? triage.verify)
 const scopeIn = args.scope ?? triage.scope
-// a repository-relative path, spelled so that a prefix test is containment: no absolute path, no empty, `.` or `..`
-// segment; a trailing `/` marks a directory
-const relative = p => typeof p === 'string' && !!p.trim() && !/^[/\\~]|\\/.test(p.trim())
+// a repository-relative path, spelled so that a prefix test is containment: no absolute path (a Windows drive path,
+// with or without a slash, included), no empty, `.` or `..` segment; a trailing `/` marks a directory
+const relative = p => typeof p === 'string' && !!p.trim() && !/^[/\\~]|^[A-Za-z]:|\\/.test(p.trim())
   && p.trim().replace(/\/$/, '').split('/').every(seg => seg && seg !== '.' && seg !== '..')
 const scope = Array.isArray(scopeIn) && scopeIn.length && scopeIn.every(relative) ? scopeIn.map(s => s.trim()) : null
 const [criteria, branch, head] = [triage.criteria, triage.branch, triage.head].map(nonblank)

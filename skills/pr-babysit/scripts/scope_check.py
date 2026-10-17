@@ -41,7 +41,9 @@ def ignored(path):
 def classify(top, path):
     """(kind, None) or (None, why)."""
     parts = path.split('/')
-    if not path or path.startswith('/') or any(p in ('', '.', '..') for p in parts):
+    # on Windows a drive (C:), a backslash or an NTFS stream (a.c:x) would name a file outside the plain path
+    if (not path or path.startswith('/') or any(p in ('', '.', '..') for p in parts)
+            or (os.name == 'nt' and any(c in path for c in '\\:'))):
         return None, 'not a plain repository-relative path'
     full = os.path.join(top, path)
     # a path through a symbolic link is one git will not stage, wherever the link points
@@ -50,7 +52,13 @@ def classify(top, path):
     if os.path.lexists(full):
         if not os.path.isfile(full):
             return None, 'not a regular file'
-        return ('existing', None) if tracked(path) == [path] else (None, 'exists but is not tracked')
+        if tracked(path) != [path]:
+            return None, 'exists but is not tracked'
+        # without core.symlinks (Windows) a symlink is checked out as a file holding its target: editing it retargets it
+        if os.name == 'nt' and any(e.split(' ')[0] not in ('100644', '100755')
+                                   for e in git('--literal-pathspecs', 'ls-files', '-s', '-z', '--', path).split('\0') if e):
+            return None, 'not a regular file in the index'
+        return 'existing', None
     ancestor = next(i for i in range(len(parts) - 1, -1, -1) if os.path.lexists(os.path.join(top, *parts[:i])))
     base = '/'.join(parts[:ancestor])
     if not os.path.isdir(os.path.join(top, base)):

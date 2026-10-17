@@ -14,6 +14,8 @@
 # the network. Colors: green <50%, yellow <80%, red >=80%.
 
 input=$(cat)
+# Windows Python reads files and writes stdout in its ANSI code page; the JSON and the glyphs are UTF-8
+export PYTHONUTF8=1
 
 # ---- config dir (holds .credentials.json + caches). Falls back sensibly. ----
 CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
@@ -59,6 +61,8 @@ ctx=$(printf '%s' "$fields" | sed -n '5p')
 sid=$(printf '%s' "$fields" | sed -n '6p')
 transcript=$(printf '%s' "$fields" | sed -n '7p')
 [ -n "$cwd" ] || cwd=$PWD
+# Git Bash/MSYS2: Claude Code passes a Windows path, $HOME is /c/Users/...
+command -v cygpath >/dev/null 2>&1 && cwd=$(cygpath -u "$cwd")
 
 # ---- org from oauthAccount: config-dir-local first, then home-dir default ----
 # (each config dir is a different account; do NOT cross-fall-back into the other)
@@ -90,7 +94,7 @@ if [ -n "$creds" ]; then
     # atomic lock; clear a stale lock (>1 min) left by a killed refresh
     [ -d "$lock" ] && [ -n "$(find "$lock" -mmin +1 2>/dev/null)" ] && rmdir "$lock" 2>/dev/null
     if mkdir "$lock" 2>/dev/null; then
-      ( tok=$(python3 -c "import json;print(json.load(open('$creds'))['claudeAiOauth']['accessToken'])" 2>/dev/null)
+      ( tok=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["claudeAiOauth"]["accessToken"])' "$creds" 2>/dev/null)
         if [ -n "$tok" ]; then
           curl -sS --max-time 8 \
             -H "Authorization: Bearer $tok" \
@@ -235,7 +239,8 @@ fi
 # ---- render ----
 # user@host muted (recedes); path cyan (distinct); info bright white; usage keeps its colors
 host='\033[90m'; path='\033[36m'; info='\033[97m'; reset='\033[0m'
-printf "${host}%s:${reset}${path}%s${reset}" "$(hostname -s)" "$dir"
+hn=$(hostname -s 2>/dev/null) || hn=${HOSTNAME%%.*}   # Git Bash's hostname has no -s
+printf "${host}%s:${reset}${path}%s${reset}" "$hn" "$dir"
 [ -n "$org" ] && printf " ${info}%s${reset}" "$org"
 [ -n "$model" ] && printf " ${info}%s${reset}" "$model"
 [ -n "$effort" ] && printf " ${path}%s${reset}" "$effort"

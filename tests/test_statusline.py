@@ -2,9 +2,11 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -34,6 +36,31 @@ def window(used, mins):
     return {'usedPercent': used, 'windowDurationMins': mins, 'resetsAt': 1}
 
 
+def make_stub(bin_dir, name, source):
+    """`name` on `bin_dir`, running the Python `source`: a shebang script, or on Windows, which
+    cannot exec one, a launcher exe, so no real `name` further down PATH ever runs instead."""
+    script = bin_dir / name
+    if os.name != 'nt':
+        script.write_text(f'#!{sys.executable}\n{source}')
+        script.chmod(0o755)
+        return
+    try:
+        from pip._vendor.distlib.scripts import ScriptMaker
+    except ImportError:
+        raise unittest.SkipTest('no distlib to build a stub launcher') from None
+    source_dir = bin_dir.parent / f'{name}-source'
+    source_dir.mkdir()
+    (source_dir / name).write_text(f'#!python\n{source}')
+    maker = ScriptMaker(str(source_dir), str(bin_dir))
+    maker.executable = sys.executable
+    maker.make(name)
+    if not (bin_dir / f'{name}.exe').is_file():
+        raise AssertionError(f'no {name}.exe stub')
+
+
+BASH = shutil.which('bash') or 'bash'  # a bare 'bash' finds WSL's launcher in System32 first on Windows
+
+
 class CodexWeeklyTest(unittest.TestCase):
     def test_the_codex_bucket_wins_and_either_slot_may_hold_the_week(self):
         result = {'rateLimitsByLimitId': {
@@ -49,14 +76,54 @@ class CodexWeeklyTest(unittest.TestCase):
         self.assertIsNone(codex_usage.weekly({'rateLimits': {'primary': window(7, 300)}}))
 
 
+CODEX_STUB = """import json, subprocess, sys, time
+sys.stdin.readline()
+print(json.dumps({'id': 2, 'result': {'rateLimits': {'primary': {'usedPercent': 7, 'windowDurationMins': 10080}}}}),
+      flush=True)
+time.sleep(2)
+open(sys.argv[1], 'w').close()
+"""
+
+
+@unittest.skipUnless(os.name == 'nt', 'POSIX runs codex by name and kills it alone, as before')
+class CodexProcessTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        (self.dir / 'bin').mkdir()
+        (self.dir / 'stub.py').write_text(CODEX_STUB)
+        self.late = self.dir / 'late'
+
+    def test_codex_is_found_on_path_alone(self):
+        (self.dir / 'codex.exe').write_text('never run')
+        cwd = os.getcwd()
+        os.chdir(self.dir)
+        try:
+            with mock.patch.dict(os.environ, {'PATH': os.pathsep.join(['', str(self.dir / 'bin')])}), \
+                    mock.patch.object(codex_usage.subprocess, 'Popen') as popen:
+                self.assertIsNone(codex_usage.read_rate_limits())
+        finally:
+            os.chdir(cwd)
+        popen.assert_not_called()
+
+    def test_codex_dies_with_its_children(self):
+        (self.dir / 'bin' / 'codex.cmd').write_text(f'@"{sys.executable}" "{self.dir / "stub.py"}" "{self.late}"\n')
+        with mock.patch.dict(os.environ, {'PATH': str(self.dir / 'bin')}):
+            result = codex_usage.read_rate_limits()
+        self.assertEqual(codex_usage.weekly(result)['usedPercent'], 7)
+        time.sleep(2.5)
+        self.assertFalse(self.late.exists(), 'node under codex.cmd outlived the read')
+
+
 class RenderTest(unittest.TestCase):
     def test_renders_from_input_alone_and_exits_zero(self):
         with tempfile.TemporaryDirectory() as home:
             payload = {'workspace': {'current_dir': f'{home}/code'}, 'model': {'display_name': 'Opus (1M context)'},
                        'effort': {'level': 'high'}, 'context_window': {'used_percentage': 12}}
-            done = subprocess.run(['bash', str(ROOT / 'statusline.sh')], input=json.dumps(payload),
-                                  capture_output=True, text=True,
-                                  env={**os.environ, 'HOME': home, 'CLAUDE_CONFIG_DIR': home})
+            done = subprocess.run([BASH, str(ROOT / 'statusline.sh')], input=json.dumps(payload),
+                                  capture_output=True, encoding='utf-8',
+                                  env={**os.environ, 'HOME': home, 'USERPROFILE': home, 'CLAUDE_CONFIG_DIR': home})
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('~/code', done.stdout)
         self.assertIn('Opus', done.stdout)
@@ -70,9 +137,7 @@ class RenderTest(unittest.TestCase):
             (home / '.claude').mkdir()
             os.symlink(ROOT / 'statusline-prs.py', home / '.claude' / 'statusline-prs.py')
             (home / 'bin').mkdir()
-            (home / 'bin' / 'gh').write_text(  # holds the worker in gh until the test releases it
-                '#!/bin/sh\ntouch "$HOME/entered"\nwhile [ ! -e "$HOME/go" ]; do sleep 0.05; done\n')
-            (home / 'bin' / 'gh').chmod(0o755)
+            make_stub(home / 'bin', 'gh', HELD_GH)  # holds the worker in gh until the test releases it
             transcript = home / 't.jsonl'
             transcript.write_text(json.dumps(link(7, 'o/r')) + '\n')
             (home / 'statusline-prs').mkdir()
@@ -82,10 +147,11 @@ class RenderTest(unittest.TestCase):
             payload = {'workspace': {'current_dir': str(home)}, 'session_id': SID, 'transcript_path': str(transcript)}
             try:
                 # a render that waited for the held gh would outlast this timeout (GH_TIMEOUT_S is longer)
-                done = subprocess.run(['bash', str(ROOT / 'statusline.sh')], input=json.dumps(payload),
-                                      capture_output=True, text=True, timeout=prs.GH_TIMEOUT_S / 2,
-                                      env={**os.environ, 'HOME': str(home), 'CLAUDE_CONFIG_DIR': str(home),
-                                           'PATH': f"{home / 'bin'}:{os.environ['PATH']}"})
+                done = subprocess.run([BASH, str(ROOT / 'statusline.sh')], input=json.dumps(payload),
+                                      capture_output=True, encoding='utf-8', timeout=prs.GH_TIMEOUT_S / 2,
+                                      env={**os.environ, 'HOME': str(home), 'USERPROFILE': str(home),
+                                           'CLAUDE_CONFIG_DIR': str(home), 'STUB_DIR': str(home),
+                                           'PATH': f"{home / 'bin'}{os.pathsep}{os.environ['PATH']}"})
                 self.assertEqual(done.returncode, 0, done.stderr)
                 self.assertIn('#7✓', plain(done.stdout))
                 deadline = time.monotonic() + 10
@@ -180,11 +246,21 @@ class PrRenderTest(unittest.TestCase):
             self.assertEqual(prs.render({'prs': 'x', 'status': []}), '')
 
 
-STUB_GH = """#!/bin/sh
-echo "$@" >> "$STUB_DIR/calls"
-[ -n "$STUB_SLEEP" ] && sleep "$STUB_SLEEP"
-cat "$STUB_DIR/answer"
-exit "${STUB_RC:-0}"
+HELD_GH = """import os, time
+home = os.environ['STUB_DIR']
+open(os.path.join(home, 'entered'), 'w').close()
+while not os.path.exists(os.path.join(home, 'go')):
+    time.sleep(0.05)
+"""
+STUB_GH = """import os, sys, time
+d = os.environ['STUB_DIR']
+with open(os.path.join(d, 'calls'), 'a') as calls:
+    calls.write(' '.join(sys.argv[1:]) + '\\n')
+if os.environ.get('STUB_SLEEP'):
+    time.sleep(float(os.environ['STUB_SLEEP']))
+with open(os.path.join(d, 'answer')) as answer:
+    sys.stdout.write(answer.read())
+sys.exit(int(os.environ.get('STUB_RC') or 0))
 """
 
 
@@ -199,10 +275,8 @@ class PrRefreshTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         (self.dir / 'bin').mkdir()
-        gh = self.dir / 'bin' / 'gh'
-        gh.write_text(STUB_GH)
-        gh.chmod(0o755)
-        env = mock.patch.dict(os.environ, {'PATH': f"{self.dir / 'bin'}:{os.environ['PATH']}",
+        make_stub(self.dir / 'bin', 'gh', STUB_GH)
+        env = mock.patch.dict(os.environ, {'PATH': f"{self.dir / 'bin'}{os.pathsep}{os.environ['PATH']}",
                                            'STUB_DIR': str(self.dir)})
         env.start()
         self.addCleanup(env.stop)
@@ -363,8 +437,9 @@ class PrRefreshTest(unittest.TestCase):
             os.utime(self.cache_dir / name, (mtime, mtime))
         (self.cache_dir / 'dir-3.json').mkdir()
         os.utime(self.cache_dir / 'dir-3.json', (old, old))
-        os.symlink(self.dir / 'answer', self.cache_dir / 'link-4.json')
-        os.utime(self.cache_dir / 'link-4.json', (old, old), follow_symlinks=False)
+        if os.name != 'nt':  # Windows cannot set a symlink's own times
+            os.symlink(self.dir / 'answer', self.cache_dir / 'link-4.json')
+            os.utime(self.cache_dir / 'link-4.json', (old, old), follow_symlinks=False)
         self.refresh()
         self.assertEqual(sorted(os.listdir(self.cache_dir)),
                          ['.lock', f'{SID}.json', 'dir-3.json', 'live-2.json', 'live-2.json.4243.tmp', 'live-6.lock',
@@ -392,11 +467,55 @@ class PrRefreshTest(unittest.TestCase):
         self.assertEqual(self.cache()['prs'], ['o/r#1', 'o/r#2', 'o/s#3'])
         self.assertEqual(len(self.calls()), 1)
 
+    def test_a_publish_waits_out_a_reader_of_the_cache(self):
+        self.answer(self.all())
+        self.refresh()
+        reader = open(self.cache_dir / f'{SID}.json', 'rb')  # as a render reads it
+        self.addCleanup(reader.close)
+        threading.Timer(0.3, reader.close).start()
+        prs.publish(self.cache_dir / f'{SID}.json', {'prs': ['o/r#9']})
+        self.assertEqual(self.cache(), {'prs': ['o/r#9']})
+
+    @unittest.skipUnless(os.name == 'nt', 'POSIX replaces a file that is open')
+    def test_a_cache_held_open_throughout_leaves_the_refresh_whole(self):
+        self.answer(self.all())
+        self.refresh()
+        self.age()
+        with open(self.cache_dir / f'{SID}.json', 'rb'):
+            self.refresh()  # neither publish lands, and the worker still polls once
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(sorted(os.listdir(self.cache_dir)), ['.lock', f'{SID}.json'], 'no temp file left')
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks are Windows only')
+    def test_the_refresh_lock_is_released_before_its_handle_closes(self):
+        self.answer(self.all())
+        with mock.patch.object(prs.msvcrt, 'locking', wraps=prs.msvcrt.locking) as locking:
+            self.refresh()
+        self.assertEqual([c.args[1] for c in locking.call_args_list], [prs.msvcrt.LK_NBLCK, prs.msvcrt.LK_UNLCK])
+
+    def test_a_hung_refresh_worker_exits_by_its_deadline(self):
+        hang = ('import importlib.util, sys, time\n'
+                'spec = importlib.util.spec_from_file_location("prs", sys.argv[1])\n'
+                'prs = importlib.util.module_from_spec(spec)\n'
+                'spec.loader.exec_module(prs)\n'
+                'prs.WORKER_S = 1\n'
+                'prs.refresh = lambda *args: time.sleep(60)\n'
+                'sys.exit(prs.main(["statusline-prs.py", "refresh", sys.argv[2], sys.argv[3], "none"]))\n')
+        start = time.monotonic()
+        done = subprocess.run([sys.executable, '-c', hang, str(ROOT / 'statusline-prs.py'), str(self.cache_dir), SID],
+                              capture_output=True, timeout=30)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertNotEqual(done.returncode, 0, 'killed by the watchdog, not finished')
+
     def test_a_held_lock_makes_a_second_refresher_leave_without_writing(self):
         self.answer(self.all())
         self.cache_dir.mkdir()
         with open(self.cache_dir / '.lock', 'a') as held:
-            prs.fcntl.flock(held, prs.fcntl.LOCK_EX)
+            if prs.fcntl:
+                prs.fcntl.flock(held, prs.fcntl.LOCK_EX)
+            else:  # as refresh() locks on Windows, through another handle
+                os.lseek(held.fileno(), 1 << 30, os.SEEK_SET)
+                prs.msvcrt.locking(held.fileno(), prs.msvcrt.LK_NBLCK, 1)
             self.refresh()
         self.assertFalse((self.cache_dir / f'{SID}.json').exists())
         self.assertEqual(self.calls(), [])

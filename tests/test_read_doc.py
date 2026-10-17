@@ -2,6 +2,7 @@
 ranks the authoritative document kinds first, the page index stays paired with
 the PDF it came from, page numbers are the physical ones a reader opens, and
 every refusal is explicit rather than a silent default."""
+import errno
 import io
 import json
 import os
@@ -10,13 +11,11 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
-
-if os.name == 'nt':
-    raise unittest.SkipTest('read-doc requires POSIX file locking')
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'skills' / 'read-doc' / 'scripts'
@@ -48,7 +47,7 @@ def fake_library(tmp, books):
     db = sqlite3.connect(os.path.join(tmp, 'metadata.db'))
     db.executescript(SCHEMA)
     for bid, title, tags, has_pdf in books:
-        path = f'Vendor/{title} ({bid})'
+        path = f"Vendor/{title.replace(':', '_')} ({bid})"  # as Calibre names it; NTFS refuses ':'
         db.execute('INSERT INTO books (id, title, path) VALUES (?,?,?)', (bid, title, path))
         if has_pdf:
             os.makedirs(os.path.join(tmp, path), exist_ok=True)
@@ -59,6 +58,22 @@ def fake_library(tmp, books):
             db.execute('INSERT INTO books_tags_link (book, tag) VALUES (?,?)', (bid, tid))
     db.commit()
     return db
+
+
+def minimal_pdf(title):
+    """A one-page PDF with no text, its Info title set."""
+    objs = [b'<< /Type /Catalog /Pages 2 0 R >>', b'<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+            b'<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+            b'<< /Title <FEFF' + title.encode('utf-16-be').hex().encode() + b'> >>']
+    out, offsets = bytearray(b'%PDF-1.4\n'), []
+    for n, obj in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += b'%d 0 obj\n%s\nendobj\n' % (n, obj)
+    xref = len(out)
+    out += b'xref\n0 %d\n0000000000 65535 f \n' % (len(objs) + 1)
+    out += b''.join(b'%010d 00000 n \n' % off for off in offsets)
+    out += b'trailer\n<< /Size %d /Root 1 0 R /Info 4 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(objs) + 1, xref)
+    return bytes(out)
 
 
 class Pages(unittest.TestCase):
@@ -331,7 +346,7 @@ class Extract(unittest.TestCase):
         every later lookup into a false claim that the term is absent."""
         self.addCleanup(setattr, locate, 'EXTRACTOR', locate.EXTRACTOR)
         # three blank pages, the shape pdftotext gives for a scan
-        locate.EXTRACTOR = ['sh', '-c', 'printf "\\f\\f\\f" > "$2"', '_']
+        locate.EXTRACTOR = [sys.executable, '-c', 'import sys; open(sys.argv[-1], "w").write("\\f\\f\\f")']
         with self.assertRaises(locate.Unavailable) as e:
             locate.extract(4, str(self.src))
         self.assertIn('text layer', str(e.exception))
@@ -339,7 +354,7 @@ class Extract(unittest.TestCase):
 
     def test_a_pdftotext_failure_is_unavailable_and_leaves_nothing_behind(self):
         self.addCleanup(setattr, locate, 'EXTRACTOR', locate.EXTRACTOR)
-        locate.EXTRACTOR = ['false']  # pdfinfo still succeeds, so only pdftotext fails
+        locate.EXTRACTOR = [sys.executable, '-c', 'raise SystemExit(1)']  # pdfinfo still succeeds
         with self.assertRaises(locate.Unavailable) as e:
             locate.extract(4, str(self.src))
         self.assertIn('pdftotext exit 1', str(e.exception))
@@ -365,6 +380,91 @@ class Extract(unittest.TestCase):
             locate.extract(4, str(self.src))
         self.assertIn('pdfinfo says 99', str(e.exception))
         self.assertEqual(os.listdir(locate.INDEX), [], 'the temporary file is cleaned up')
+
+    def test_the_manifest_path_is_slash_separated_and_a_backslash_one_stays_current(self):
+        # The index syncs with the library; Windows once wrote backslashes, and
+        # every other OS must not re-extract the whole library over them.
+        (self.lib / 'Vendor').mkdir()
+        src = self.lib / 'Vendor' / 'doc.pdf'
+        os.replace(self.src, src)
+        self.assertEqual(locate.extract(4, str(src))['path'], 'Vendor/doc.pdf')
+        index = Path(locate.text_path(4))
+        head, body = index.read_bytes().split(b'\n', 1)
+        self.assertNotIn(b'\r', body, 'the index is written with bare newlines')
+        index.write_bytes(head.replace(b'Vendor/doc.pdf', b'Vendor\\\\doc.pdf') + b'\n' + body)
+        self.assertIn('Vendor\\doc.pdf', json.loads(index.read_text(encoding='utf-8').split('\n')[0])['path'])
+        self.assertTrue(locate.is_current(locate.read_header(4), 4, str(src)))
+        self.assertEqual(locate.read_index(4)[0]['path'], 'Vendor/doc.pdf', 'and reads back as one')
+
+    def test_pdfinfo_output_that_is_not_in_the_locale_encoding_still_counts_pages(self):
+        # pdfinfo prints the title in UTF-8; decoded as GBK it once came back as None.
+        # Ł and ‘ are UTF-8 bytes 0x81 and 0x98, which cp1252 and cp1251 leave undefined.
+        pdf = self.lib / 'titled.pdf'
+        pdf.write_bytes(minimal_pdf('USB — RM® Ł ‘x’'))
+        self.assertEqual(locate.page_count(str(pdf)), 1)
+
+    def test_pdftotext_is_asked_for_utf8_and_the_manifest_keeps_its_identity(self):
+        # xpdf's pdftotext (Git for Windows ships one) writes Latin-1 unless asked: an
+        # index of U+FFFD that is_current() would then accept on every machine.
+        seen, real = [], subprocess.run
+
+        def run(argv, **kw):
+            seen.append(list(argv))
+            return real(argv, **kw)
+        with unittest.mock.patch.object(locate.subprocess, 'run', run):
+            meta = locate.extract(4, str(self.src))
+        cmd = seen[-1]
+        self.assertEqual(cmd[cmd.index('-enc') + 1], 'UTF-8', cmd)
+        self.assertEqual(meta['extractor'], ['pdftotext', '-layout'])
+        self.assertTrue(locate.is_current(locate.read_header(4), 4, str(self.src)))
+
+    def test_an_index_a_reader_holds_open_is_still_replaced(self):
+        # Windows refuses to replace a file another handle has open, as a `find` may.
+        locate.extract(4, str(self.src))
+        reader = open(locate.text_path(4), 'rb')
+        self.addCleanup(reader.close)
+        threading.Timer(0.2, reader.close).start()
+        self.assertEqual(locate.extract(4, str(self.src))['pages'], 3)
+        self.assertEqual(os.listdir(locate.INDEX), ['4.txt'])
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows runs a program from the current directory before PATH')
+    def test_pdfinfo_is_the_one_on_path_and_pdftotext_its_sibling(self):
+        here, poppler = self.lib / 'here', self.lib / 'poppler'
+        for d in (here, poppler):
+            d.mkdir()
+            for name in ('pdfinfo.exe', 'pdftotext.exe'):
+                (d / name).write_bytes(b'')
+        seen = []
+
+        def run(argv, **kw):
+            seen.append(argv[0])
+            return subprocess.CompletedProcess(argv, 0, 'Pages:          1\n', '')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(here)
+        with unittest.mock.patch.dict(os.environ, {'PATH': str(poppler)}), \
+                unittest.mock.patch.object(locate.subprocess, 'run', run):
+            self.assertEqual(locate.page_count(str(self.src)), 1)
+            cmd = locate.extractor()
+        self.assertEqual(seen, [str(poppler / 'pdfinfo.exe')])
+        self.assertEqual(Path(cmd[0]), poppler / 'pdftotext.exe')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows looks pdfinfo up on PATH itself')
+    def test_no_pdfinfo_on_path_is_unavailable(self):
+        with unittest.mock.patch.dict(os.environ, {'PATH': str(self.lib)}):
+            with self.assertRaisesRegex(locate.Unavailable, 'pdfinfo is not on PATH'):
+                locate.page_count(str(self.src))
+
+    @unittest.skipUnless(os.name == 'nt', 'only Git for Windows puts an xpdf pdftotext on PATH')
+    def test_pdftotext_runs_from_the_directory_pdfinfo_comes_from(self):
+        xpdf, poppler = self.lib / 'xpdf', self.lib / 'poppler'
+        for d, names in ((xpdf, ('pdftotext.exe',)), (poppler, ('pdfinfo.exe', 'pdftotext.exe'))):
+            d.mkdir()
+            for name in names:
+                (d / name).write_bytes(b'')
+        with unittest.mock.patch.dict(os.environ, {'PATH': f'{xpdf}{os.pathsep}{poppler}'}):
+            cmd = locate.extractor()
+        self.assertEqual(Path(cmd[0]).parent, poppler)
+        self.assertEqual(cmd[1:], [*locate.EXTRACTOR[1:], '-enc', 'UTF-8'])
 
     def test_a_file_pdfinfo_cannot_read_is_unavailable_not_silently_unverified(self):
         bad = self.lib / 'bad.pdf'
@@ -427,6 +527,15 @@ class Prune(unittest.TestCase):
         (self.index / '3.dir').mkdir()
         self.assertEqual(locate.prune(self.db), 0)
         self.assertEqual(sorted(os.listdir(self.index)), sorted([*keep, '3.dir']))
+
+    def test_a_stale_index_a_reader_holds_open_is_still_removed(self):
+        # Windows refuses to remove a file another handle has open.
+        (self.index / '3.txt').write_text('x')
+        reader = open(self.index / '3.txt', 'rb')
+        self.addCleanup(reader.close)
+        threading.Timer(0.2, reader.close).start()
+        self.assertEqual(locate.prune(self.db), 1)
+        self.assertEqual(os.listdir(self.index), [])
 
 
 class BuildEndToEnd(unittest.TestCase):
@@ -708,6 +817,29 @@ class Usage(unittest.TestCase):
         self.unavailable(tmp.name, 'search.py', 'stm32')
         self.unavailable(tmp.name, 'locate.py', 'find', '--book', '1', '--term', 'x')
 
+    def test_a_title_outside_the_console_encoding_prints_rather_than_failing_as_usage(self):
+        # Most ST titles carry ®, which a GBK or ASCII pipe cannot encode.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        # Ω and → are outside cp1252 as well.
+        fake_library(tmp.name, [(1, 'RM0090 STM32F4® reference manual — USB Ω→', [], False)]).close()
+        env = {k: v for k, v in os.environ.items() if k not in ('PYTHONIOENCODING', 'PYTHONUTF8')}
+        done = subprocess.run([sys.executable, str(SCRIPTS / 'search.py'), 'stm32f4'], capture_output=True,
+                              env=dict(env, CALIBRE_LIBRARY=tmp.name, READ_DOC_HISTORY='0'))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('STM32F4® reference manual — USB Ω→', done.stdout.decode('utf-8'))
+
+    @unittest.skipIf(os.name == 'nt', 'Windows prints UTF-8 whatever the console encoding')
+    def test_posix_output_keeps_the_encoding_and_handler_python_chose(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        fake_library(tmp.name, [(1, 'RM0090 STM32F4® reference manual', [], False)]).close()
+        done = subprocess.run([sys.executable, str(SCRIPTS / 'search.py'), 'stm32f4'], capture_output=True,
+                              env=dict(os.environ, CALIBRE_LIBRARY=tmp.name, READ_DOC_HISTORY='0',
+                                       PYTHONIOENCODING='ascii:backslashreplace'))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(b'STM32F4\\xae reference manual', done.stdout)
+
     def test_search_with_no_keyword_prints_usage(self):
         code, out = self.run_script('search.py')
         self.assertEqual(code, 2)
@@ -821,6 +953,7 @@ class History(unittest.TestCase):
         self.assertEqual(both['session'], {'claude': 'claude-1', 'codex': 'codex-1'})
         self.assertEqual(none['session'], {'claude': None, 'codex': None})
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX mode bits')
     def test_the_history_is_private_to_its_user(self):
         self.call(search.main, 'rm0001')
         self.assertEqual(os.stat(search.HISTORY).st_mode & 0o777, 0o600)
@@ -843,6 +976,39 @@ class History(unittest.TestCase):
         lines = Path(search.HISTORY).read_text().splitlines()
         self.assertEqual(lines[0], '{"v": 1, "id": "cut')
         self.assertEqual(json.loads(lines[1])['op'], 'search')
+
+    def test_records_end_in_a_bare_newline(self):
+        self.call(search.main, 'rm0001')
+        self.call(search.main, 'rm0001')
+        data = Path(search.HISTORY).read_bytes()
+        self.assertNotIn(b'\r', data, 'text mode on Windows wrote CRLF records')
+        self.assertEqual(data.count(b'\n'), 2)
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks')
+    def test_a_lock_error_other_than_contention_is_the_history_warning_not_a_retry(self):
+        calls = []
+
+        def locking(fd, mode, n):
+            calls.append(mode)
+            if len(calls) > 1:
+                raise AssertionError('retried a lock that cannot succeed')
+            raise OSError(errno.EBADF, 'Bad file descriptor')
+        with unittest.mock.patch.object(search.msvcrt, 'locking', locking):
+            code, _, err = self.call(search.main, 'rm0001')
+        self.assertEqual(code, 0)
+        self.assertIn('lookup history not written', err)
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks; flock is freed at close')
+    def test_the_lock_is_released_before_the_handle_closes(self):
+        modes, real = [], search.msvcrt.locking
+
+        def locking(fd, mode, n):
+            modes.append(mode)
+            return real(fd, mode, n)
+        with unittest.mock.patch.object(search.msvcrt, 'locking', locking):
+            self.call(search.main, 'rm0001')
+        self.assertEqual(modes, [search.msvcrt.LK_NBLCK, search.msvcrt.LK_UNLCK])
+        self.assertEqual(len(self.records()), 1)
 
     def test_a_short_write_is_completed(self):
         real = os.write

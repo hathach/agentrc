@@ -64,13 +64,13 @@ def _grid(grid_id: str, refresh: bool = False) -> list:
     CACHE.mkdir(parents=True, exist_ok=True)
     f = CACHE / f"{grid_id}.json"
     if f.exists() and not refresh:
-        return json.loads(f.read_text()).get("rows", [])
+        return json.loads(f.read_text(encoding="utf-8")).get("rows", [])
     try:
         data = http_get(GRID.format(grid_id), timeout=25)
     except RuntimeError:
         if f.exists():
             print(f"  {grid_id}: fetch failed, using cached copy", file=sys.stderr)
-            return json.loads(f.read_text()).get("rows", [])
+            return json.loads(f.read_text(encoding="utf-8")).get("rows", [])
         print(f"  {grid_id}: fetch failed and nothing cached — ST is likely throttling; "
               f"wait a few minutes and re-run (progress is cached)", file=sys.stderr)
         return []

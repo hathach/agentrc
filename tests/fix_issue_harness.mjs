@@ -369,6 +369,8 @@ test('the agreed plan\'s own status, emptiness or reach stops before any writer'
     [{ scope: ['src/', 'examples/', 'hw/'] }, 'scope-extension-required', { target: '28', batch: true, scope: ['src/', 'examples/'] }],
     [{ scope: ['src/../../outside/'], steps: [{ id: 's1', change: 'x', paths: ['src/../../outside/file.c'], check: '' }] }, 'plan-invalid', { target: '28', batch: true, scope: ['src/'] }],
     [{ steps: [{ id: 's1', change: 'x', paths: ['/etc/passwd'], check: '' }] }, 'plan-invalid'],
+    [{ steps: [{ id: 's1', change: 'x', paths: ['C:/Windows/x.c'], check: '' }] }, 'plan-invalid'],
+    [{ scope: [...PLAN.scope, 'C:foo/'], steps: [{ id: 's1', change: 'x', paths: ['C:foo/a.c'], check: '' }] }, 'plan-invalid'],
     [{ scope: ['./src/osal/'], steps: [{ id: 's1', change: 'x', paths: ['./src/osal/a.c'], check: '' }] }, 'plan-invalid'],
     [{ scope: ['src//osal/'], steps: [{ id: 's1', change: 'x', paths: ['src//osal/a.c'], check: '' }] }, 'plan-invalid'],
     [{ steps: [{ id: 's1', change: 'x', paths: [], check: '' }] }, 'plan-invalid'],
@@ -379,7 +381,7 @@ test('the agreed plan\'s own status, emptiness or reach stops before any writer'
     assert.equal(result.pass, false)
     assert.ok(result.next, reason)
   }
-  for (const scope of [['../x/'], ['/abs/'], ['src/./osal/']]) {
+  for (const scope of [['../x/'], ['/abs/'], ['C:/abs/'], ['c:\\abs\\'], ['C:foo/'], ['C:'], ['src/./osal/']]) {
     const bad = await run({ args: { target: '28', batch: true, scope } })
     assert.deepEqual(bad.result.missing, ['scope'], `${scope}: a caller scope that escapes is no scope`)
   }

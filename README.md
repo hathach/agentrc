@@ -62,6 +62,40 @@ are pruned.
 Project repos such as tinyusb call these skills by bare name and expect this
 install.
 
+### Windows
+
+Claude Code on Windows runs the Bash tool, hooks and the status line through
+Git Bash (or MSYS2), and the scripts run on native Windows from there. They read
+and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
+`PATH` needs:
+
+- a `python3` that is a native CPython 3.12+ (python.org's install manager or
+  MSYS2's mingw build), not the WindowsApps alias and not MSYS2's
+  `/usr/bin/python3`, for the workflows' script calls and the simplify gate's
+  wrapper; PyYAML in it for `pr-babysit`'s `harvest.py`, which `pr-review` also
+  imports, and for the tests. `install.py` registers a Python hook as
+  `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot
+  start lets the tool call through; rerun it after replacing that Python, and
+  name the interpreter the same way in the credit guard's recipe below.
+- `bash`, `cygpath` and `git` from Git for Windows or MSYS2: from Python a bare
+  `bash` is System32's WSL launcher, so scripts look it up on `PATH`.
+  `chief_guard.py` maps `/tmp`-style paths through `cygpath` and denies them
+  without it; it also denies `cmd`, PowerShell and `wsl` outright.
+- poppler's `pdfinfo` and `pdftotext` for `read-doc` (MSYS2
+  `mingw-w64-x86_64-poppler`); `pdftotext` is taken from beside `pdfinfo`, so
+  Git's xpdf earlier on `PATH` does not matter.
+
+Claude Code sets `NoDefaultCurrentDirectoryInExePath`; set it too when running
+the scripts from another shell, or Windows runs a `git.exe` or `gh.exe` from the
+current directory, a PR checkout for many of them.
+
+`install.py` creates symlinks, which needs Developer Mode or an elevated shell.
+Linux only: `--herdr-plugin` (herdr runs on Linux and macOS), `lsusbt`,
+`usb-kernel-debug`, `hil`'s rig-host scripts, and the capture scripts of
+`usb-sniffer`, `etm-trace` and `target-debug` (`dual_capture.py`,
+`console_capture.py`). Tests skip the cases that need POSIX exec, `/proc` or file
+names NTFS refuses.
+
 ## Skills
 
 Agent collaboration and PRs:
@@ -218,3 +252,6 @@ python -X utf8 -m unittest discover -s tests
 ```
 
 Needs PyYAML; the pre-commit hook runs the same command (`pre-commit install`).
+Where Git for Windows has `core.fsmonitor=true` (an installer option), each
+temporary test repository leaves a `git fsmonitor--daemon` behind; run the suite
+with `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false`.

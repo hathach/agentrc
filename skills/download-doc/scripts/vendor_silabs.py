@@ -49,7 +49,7 @@ def _families_from_bsp() -> set:
         text = f.name
         if f.is_file():
             try:
-                text += " " + f.read_text(errors="ignore")
+                text += " " + f.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 pass
         for m in _PART.findall(text):

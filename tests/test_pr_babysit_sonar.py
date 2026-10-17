@@ -72,7 +72,7 @@ class SonarTest(unittest.TestCase):
     def run_mark(self, fake, items, head=HEAD, manifest=None, receipt=None):
         self.manifest.write_text(json.dumps(manifest or {'items': [
             {'commentId': c, 'commentDigest': self.digest(c), 'how': how, 'note': note, 'digest': sonar.fnv1a(note)}
-            for c, how, note in items]}))
+            for c, how, note in items]}, ensure_ascii=False), encoding='utf-8')
         out, self.stderr = io.StringIO(), io.StringIO()
         argv = ['--pr', '7', '--head', head, '--manifest', str(self.manifest)] + (['--receipt', str(receipt)] if receipt else [])
         with mock.patch.object(sonar, 'sonar', fake), redirect_stdout(out), redirect_stderr(self.stderr):
@@ -95,6 +95,14 @@ class SonarTest(unittest.TestCase):
         self.assertEqual(fake.issues['K1']['comments'], [{'markdown': 'Not injectable: a list argv.'}])
         self.assertEqual(fake.issues['K1']['resolution'], 'FALSE-POSITIVE')
         self.assertIn('seal', line)
+
+    def test_a_manifest_is_read_as_utf8(self):
+        self.comments[1] = scanning('K1')
+        note = 'Not injectable — a list argv, naïve ✓ 修复.'
+        fake = FakeSonar({'K1': 'OPEN'})
+        code, line = self.run_mark(fake, [(1, 'refutation', note)])
+        self.assertEqual((code, self.outcomes(line)), (0, {1: ('marked', 'K1')}))
+        self.assertEqual(fake.issues['K1']['comments'], [{'markdown': note}])
 
     def test_a_refutation_is_marked_whatever_head_sonarcloud_analysed(self):
         self.comments[1] = scanning('K1')

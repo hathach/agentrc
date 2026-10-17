@@ -135,7 +135,7 @@ def worktree(top, pr, head):
             git('worktree', 'add', '--quiet', str(path), branch)
         else:
             git('worktree', 'add', '--quiet', '-b', branch, str(path), head)
-        return str(path), branch
+        return path.as_posix(), branch
     dirty = run('git', '-C', str(path), 'status', '--porcelain')[1].strip()
     if dirty:
         raise Unusable(f'{path} has uncommitted changes, left by an earlier run: {dirty.splitlines()[0]} ...; restore them first')
@@ -143,7 +143,7 @@ def worktree(top, pr, head):
     if tip not in pinned:
         raise Unusable(f'{path} is at {tip}, not a head this script pinned; resolve by hand')
     run('git', '-C', str(path), 'checkout', '--quiet', '-B', branch, head)
-    return str(path), branch
+    return path.as_posix(), branch
 
 
 def mode_of(led, head, merge_base, full):
@@ -187,12 +187,13 @@ def prepare(a):
     facts = facts_path(repo, a.pr, head)
     facts.parent.mkdir(parents=True, exist_ok=True)
     pins = {'head': head, 'mergeBase': merge_base, 'scopeBase': scope_base, 'mode': mode, 'groups': groups}
-    facts.write_text(json.dumps({**pins, 'changed': pr_paths, 'scope': scope, 'checks': checks}, indent=1) + '\n')
+    facts.write_text(json.dumps({**pins, 'changed': pr_paths, 'scope': scope, 'checks': checks}, indent=1) + '\n', encoding='utf-8')
     # The selector reads one path a line: a path that line splitting breaks cannot go in the file.
     listing = ''.join(f'{p}\n' for p in pr_paths)
     changed_file = facts.with_name(f'changed-{head}.txt') if listing.splitlines() == pr_paths else None
     if changed_file:
-        changed_file.write_text(listing)
+        # Bytes: text mode would end each line with CRLF on Windows.
+        changed_file.write_bytes(listing.encode('utf-8'))
     head_repo = f"{(info.get('headRepositoryOwner') or {}).get('login')}/{(info.get('headRepository') or {}).get('name')}"
     return {
         'repo': repo, 'pr': a.pr, 'url': info['url'], 'title': info['title'],
@@ -202,7 +203,7 @@ def prepare(a):
         'mode': mode, 'scopeBase': scope_base, 'priorHead': prior,
         'changed': len(pr_paths), 'scoped': len(scope), 'groups': groups, 'overCap': over,
         'tooling': [p for p in pr_paths if TOOLING.search(p)], 'ci': ci,
-        'ledger': str(path), 'facts': str(facts), 'synced': synced, 'changedFile': changed_file and str(changed_file),
+        'ledger': path.as_posix(), 'facts': facts.as_posix(), 'synced': synced, 'changedFile': changed_file and changed_file.as_posix(),
     }
 
 
@@ -221,10 +222,10 @@ def check(a):
     load(ledger_path(repo, a.pr), repo, a.pr)
     facts = facts_path(repo, a.pr, local)
     try:
-        pinned = json.loads(facts.read_text())
+        pinned = json.loads(facts.read_text(encoding='utf-8'))
     except (OSError, ValueError):
         raise Unusable(f'no prepare facts for {local} at {facts}: run prepare first')
-    return {'ok': True, 'head': local, 'top': os.path.realpath(top), 'repo': repo, 'pr': a.pr, 'ci': ci_summary(repo, a.pr)[0],
+    return {'ok': True, 'head': local, 'top': Path(os.path.realpath(top)).as_posix(), 'repo': repo, 'pr': a.pr, 'ci': ci_summary(repo, a.pr)[0],
             'pins': {k: pinned[k] for k in ('mergeBase', 'scopeBase', 'mode', 'groups')}}
 
 

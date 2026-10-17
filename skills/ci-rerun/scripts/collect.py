@@ -393,16 +393,27 @@ def evidence_dir(repo, pr, head):
 
 def stored_verdicts(folder):
     try:
-        return json.loads((folder / 'verdicts.json').read_text())
+        return json.loads((folder / 'verdicts.json').read_text(encoding='utf-8'))
     except FileNotFoundError:
         return {}
     except ValueError as e:
         raise Failed(f'verdicts.json: {e}')
 
 
-def remember(repo, pr, head, text):
+def replace(src, dst):
+    """os.replace; on Windows retried while a reader still holds dst open, which fails it there."""
+    for _ in range(50 if os.name == 'nt' else 0):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            time.sleep(0.02)
+    os.replace(src, dst)
+
+
+def remember(repo, pr, head, data):
     try:
-        entries = json.loads(text)
+        # strict UTF-8 first: json.loads(bytes) would take a BOM, UTF-16/32 and encoded surrogates
+        entries = json.loads(data.decode('utf-8'))
     except ValueError as e:
         raise Failed(f'verdicts on stdin: {e}')
     if not (isinstance(entries, list) and all(isinstance(e, dict) and sorted(e) in (['bucket', 'failures', 'link'], ['bucket', 'link', 'patch']) and
@@ -415,8 +426,8 @@ def remember(repo, pr, head, text):
     for e in entries:
         stored[e['link']] = patched(stored.get(e['link']), e) if 'patch' in e else e
     tmp = folder / f'verdicts.json.{time.time_ns()}'
-    tmp.write_text(json.dumps(stored, ensure_ascii=False))
-    tmp.replace(folder / 'verdicts.json')
+    tmp.write_text(json.dumps(stored, ensure_ascii=False), encoding='utf-8')
+    replace(tmp, folder / 'verdicts.json')
     return {'head': head}
 
 
@@ -675,8 +686,8 @@ def cells(failed, base_rows):
 
 def save(folder, name, lines):
     path = folder / name
-    path.write_text('\n'.join(lines) + '\n')
-    return str(path)
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8', newline='\n')  # \n on Windows too: a judge reads it by line
+    return path.as_posix()
 
 
 def actions_log(repo, job):
@@ -902,8 +913,8 @@ def failures(repo, pr, head, links, gates=()):
         if after != head:
             raise Failed(f'PR #{pr} head moved to {after} while collecting')
     detail = folder / f'failures-{time.time_ns()}.json'
-    detail.write_text(json.dumps({**out, 'checks': checks}, indent=1))
-    return {'head': head, 'detail': str(detail), 'gates': read,
+    detail.write_text(json.dumps({**out, 'checks': checks}, indent=1), encoding='utf-8')
+    return {'head': head, 'detail': detail.as_posix(), 'gates': read,
             'bases': [{'link': c['link'], 'base': base_token(c.get('base'))} for c in checks]}
 
 
@@ -972,7 +983,7 @@ def main(argv=None):
         elif a.command == 'bases':
             out = bases(a.repo, a.pr, a.head, a.check)
         elif a.command == 'remember':
-            out = remember(a.repo, a.pr, a.head, sys.stdin.read())
+            out = remember(a.repo, a.pr, a.head, sys.stdin.buffer.read())
         else:
             out = recall(a.repo, a.pr, a.head, a.check, a.offset)
         out, rc = sealed(out), 0

@@ -1,4 +1,5 @@
 """Tests for pr-review's scripts: real git in temporary repositories, a fake GitHub behind gh."""
+import errno
 import importlib.util
 import json
 import os
@@ -7,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -198,7 +200,7 @@ class Case(unittest.TestCase):
         self.remote.parent.mkdir()
         sh(self.tmp, 'git', 'init', '--quiet', '--bare', '-b', 'main', str(self.remote))
         self.work = self.tmp / 'work'
-        sh(self.tmp, 'git', 'clone', '--quiet', str(self.remote), str(self.work))
+        sh(self.tmp, 'git', 'clone', '--quiet', self.remote.as_posix(), str(self.work))
         for k, v in (('user.name', 't'), ('user.email', 't@t'), ('commit.gpgsign', 'false')):
             sh(self.work, 'git', 'config', k, v)
         self.env = mock.patch.dict(os.environ, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'commit.gpgsign', 'GIT_CONFIG_VALUE_0': 'false'})
@@ -207,7 +209,7 @@ class Case(unittest.TestCase):
         sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
         self.base = sh(self.work, 'git', 'rev-parse', 'HEAD')
         self.clone = self.tmp / 'clone'
-        sh(self.tmp, 'git', 'clone', '--quiet', str(self.remote), str(self.clone))
+        sh(self.tmp, 'git', 'clone', '--quiet', self.remote.as_posix(), str(self.clone))
         self.gh = FakeGitHub()
         self.cwd = os.getcwd()
         os.chdir(self.clone)
@@ -365,7 +367,7 @@ class Prepare(Case):
         os.chdir(p['worktree'])
         ok = self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])
         self.assertEqual(ok['pins'], {'mergeBase': p['mergeBase'], 'scopeBase': p['scopeBase'], 'mode': 'full', 'groups': p['groups']})
-        self.assertEqual(ok['top'], os.path.realpath(p['worktree']))
+        self.assertEqual(ok['top'], Path(os.path.realpath(p['worktree'])).as_posix())
         self.assertEqual((ok['repo'], ok['pr']), (REPO, PR))
         with self.assertRaisesRegex(facts.Unusable, 'a full SHA'):
             self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head + '\n'])
@@ -378,6 +380,14 @@ class Prepare(Case):
         with self.assertRaisesRegex(facts.Unusable, 'head moved'):
             self.call(prepare, ['--check', '--pr', str(PR), '--repo', REPO, '--expected-head', head])
 
+    def test_a_non_ascii_path_is_one_utf8_line_of_the_changed_file(self):
+        self.commit('src/\u00e9t\u00e9.c', 'int a;\n', 'odd')
+        self.push_pr()
+        p = self.prepare()
+        self.assertNotIn('\\', p['worktree'] + p['ledger'] + p['facts'] + p['changedFile'])
+        self.assertEqual(Path(p['changedFile']).read_bytes(), 'src/\u00e9t\u00e9.c\n'.encode('utf-8'))
+
+    @unittest.skipIf(os.name == 'nt', 'NTFS refuses a newline in a filename')
     def test_a_filename_with_a_newline_is_one_changed_path(self):
         self.commit('src/a\nb.c', 'int a;\n', 'odd')
         self.push_pr()
@@ -386,6 +396,7 @@ class Prepare(Case):
         self.assertIsNone(p['changedFile'], 'the selector file cannot hold that path')
         self.assertEqual(p['groups'], ['src'])
 
+    @unittest.skipIf(os.name == 'nt', 'NTFS refuses a carriage return in a filename')
     def test_a_filename_with_a_carriage_return_gets_no_changed_file(self):
         self.commit('src/a\rb.c', 'int a;\n', 'odd')
         self.push_pr()
@@ -491,11 +502,13 @@ class Ledger(Case):
         self.assertEqual(self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO])['open'], [])
         self.assertEqual(self.prepare()['mode'], 'full', 'a declined head is not a reviewed head')
 
-    def test_an_absolute_comment_path_is_refused(self):
+    def test_an_absolute_or_backslashed_comment_path_is_refused(self):
         r = self.result_for(self.p)
-        r['draft']['comments'][0]['path'] = '/abs/src/core/a.c'
-        with self.assertRaisesRegex(facts.Unusable, 'absolute path'):
-            self.save(r)
+        for path in ('/abs/src/core/a.c', 'C:/abs/src/core/a.c', 'C:\\abs\\src\\core\\a.c', '\\\\srv\\share\\src\\core\\a.c',
+                     '\\src\\core\\a.c', 'C:src/core/a.c', 'src\\core\\a.c'):
+            r['draft']['comments'][0]['path'] = path
+            with self.assertRaisesRegex(facts.Unusable, 'absolute path or a backslash', msg=path):
+                self.save(r)
 
     def test_carried_findings_keep_their_id(self):
         self.save(self.result_for(self.p))
@@ -1504,6 +1517,72 @@ class ResolveDue(unittest.TestCase):
         self.assertEqual(self.due(('withdrawn', {})), ({}, []), 'no reply of ours: never resolved bare')
 
 
+class Lock(unittest.TestCase):
+    def setUp(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.path = tmp / 'pr-review' / '7.json'
+
+    def test_a_second_process_waits_for_the_holder_to_leave_the_block(self):
+        holder = subprocess.Popen(
+            [sys.executable, '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import ledger; from pathlib import Path\n'
+             'with ledger.locked(Path(sys.argv[2])):\n print("held", flush=True); sys.stdin.readline()\n'
+             'print("released", flush=True); sys.stdin.read()',
+             str(SCRIPTS), str(self.path)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.stdin.close)
+        self.addCleanup(holder.stdout.close)
+        self.assertEqual(holder.stdout.readline().strip(), 'held')
+        got, again = threading.Event(), threading.Event()
+
+        def take():
+            with ledger.locked(self.path):
+                got.set()
+            with ledger.locked(self.path):
+                again.set()
+        t = threading.Thread(target=take, daemon=True)
+        t.start()
+        self.assertFalse(got.wait(0.5), 'the lock was taken while another process held it')
+        holder.stdin.write('\n')
+        holder.stdin.flush()
+        self.assertEqual(holder.stdout.readline().strip(), 'released')
+        self.assertTrue(got.wait(10), 'the lock was not taken once its holder left the block')
+        self.assertTrue(again.wait(10), 'the lock was not taken again in the process that released it')
+        self.assertIsNone(holder.poll(), 'the holder is still alive: leaving the block released it, not exiting')
+        t.join()
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locking')
+    def test_a_locking_error_that_is_not_contention_is_raised(self):
+        raised = []
+
+        def take():
+            try:
+                with ledger.locked(self.path):
+                    pass
+            except OSError as e:
+                raised.append(e.errno)
+        with mock.patch.object(ledger.msvcrt, 'locking', side_effect=OSError(errno.EBADF, 'bad file descriptor')):
+            t = threading.Thread(target=take, daemon=True)
+            t.start()
+            t.join(5)
+        self.assertEqual(raised, [errno.EBADF], 'retried as if the lock were held')
+
+
+class Store(unittest.TestCase):
+    def test_a_reader_holding_the_ledger_open_only_delays_the_write(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = tmp / '7.json'
+        path.write_text('{}\n', encoding='utf-8')
+        reader = open(path, encoding='utf-8')
+        self.addCleanup(reader.close)
+        later = threading.Timer(0.2, reader.close)
+        later.start()
+        self.addCleanup(later.join)
+        ledger.store(path, {'v': 1})
+        self.assertEqual(json.loads(path.read_text(encoding='utf-8')), {'v': 1})
+
+
 class Result(unittest.TestCase):
     def test_counts_never_bodies(self):
         with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as f:
@@ -1558,12 +1637,12 @@ class Severity(unittest.TestCase):
                          [('P0 critical', 1), ('P1 high', 2), ('P2 medium', 1), ('P4 nit', 1)])
 
     def test_every_copy_of_the_scale_is_the_one_in_finding_verifier(self):
-        role = (ROOT / 'agents' / 'finding-verifier.md').read_text()
+        role = (ROOT / 'agents' / 'finding-verifier.md').read_text(encoding='utf-8')
         self.assertEqual(tuple(re.findall(r'^\| `(\w+)` \|', role, re.M)), ledger.LEVELS)
         facts_ = re.findall(r'^- `(\w+)`: ', role.split('## Severity')[1], re.M)
         self.assertEqual(facts_, ['consequence', 'path', 'variants', 'recovery'])
         for wf in ('code-audit.js', 'pr-review.js'):
-            src = (ROOT / 'workflows' / wf).read_text()
+            src = (ROOT / 'workflows' / wf).read_text(encoding='utf-8')
             for const, want in (('LEVELS', ledger.LEVELS), ('CONFIDENCE', ledger.CONFIDENCE)):
                 got = re.search(rf"^const {const} = \[([^\]]*)\]", src, re.M).group(1)
                 self.assertEqual(tuple(re.findall(r"'(\w+)'", got)), want, f'{wf} {const}')
@@ -1574,7 +1653,7 @@ class Severity(unittest.TestCase):
 class Workflow(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_stub_harness_passes(self):
-        done = subprocess.run(['node', str(ROOT / 'tests' / 'pr_review_harness.mjs')], capture_output=True, text=True)
+        done = subprocess.run(['node', str(ROOT / 'tests' / 'pr_review_harness.mjs')], capture_output=True, encoding='utf-8', errors='replace')
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
 

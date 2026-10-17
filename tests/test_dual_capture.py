@@ -28,6 +28,20 @@ def wait_until(cond, seconds=5):
     return cond()
 
 
+@unittest.skipIf(sys.platform.startswith('linux'), 'the refusal is for other hosts')
+class OffLinuxTest(unittest.TestCase):
+    def test_it_refuses_before_creating_out(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / 'out'
+            side = Path(d) / 'a.json'
+            side.write_text(json.dumps([sys.executable, '-c', 'pass']))
+            r = subprocess.run([sys.executable, str(SCRIPT), '--a', f'a={side}', '--b', f'b={side}', '--timeout', '5',
+                                '--out', str(out)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn('Linux-only', r.stderr)
+            self.assertFalse(out.exists())
+
+
 @unittest.skipIf(not sys.platform.startswith('linux'), 'reads /proc')
 class DualCaptureTest(unittest.TestCase):
     def setUp(self):

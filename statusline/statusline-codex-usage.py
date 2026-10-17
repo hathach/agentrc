@@ -4,16 +4,28 @@
 Codex 0.154 exposes rate limits only through the app-server JSON-RPC
 (`account/rateLimits/read`); there is no `codex usage` subcommand.
 """
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 WEEK_MINS = 10080
 WEEK_MIN, WEEK_MAX = 9576, 10584   # codex TUI treats +/-5% of a week as weekly
 
 
+def on_path(name, exts):
+    """Windows: `name` from PATH alone, not the cwd, which CreateProcess searches first."""
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        for e in exts:
+            p = os.path.join(d, name + e)
+            if d and os.path.isfile(p):
+                return p
+
+
 def read_rate_limits(timeout=25):
-    p = subprocess.Popen(["codex", "-c", "analytics.enabled=false", "app-server"], stdin=subprocess.PIPE,
-                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         text=True, bufsize=1)
+    exe = "codex" if os.name != "nt" else on_path("codex", (".exe", ".cmd", ".bat"))
+    if not exe:
+        return None
+    p = subprocess.Popen([exe, "-c", "analytics.enabled=false", "app-server"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         encoding="utf-8", errors="replace", bufsize=1)
     try:
         def send(o):
             p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
@@ -35,7 +47,12 @@ def read_rate_limits(timeout=25):
                 return m.get("result")
         return None
     finally:
-        p.kill()
+        if os.name != "nt":
+            p.kill()
+        else:  # npm's codex.cmd runs cmd.exe, then node: kill the tree
+            taskkill = os.path.join(os.environ.get("SystemRoot", "C:/Windows"), "System32", "taskkill.exe")
+            subprocess.run([taskkill, "/T", "/F", "/PID", str(p.pid)], capture_output=True)
+            p.wait()
 
 
 def weekly(result):

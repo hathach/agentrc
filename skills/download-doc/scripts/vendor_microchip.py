@@ -93,7 +93,7 @@ def describe_pdf(path: Path) -> str | None:
 
 def _entries():
     """(url, lastmod) per cache line; a harvest that predates lastmod holds bare URLs."""
-    for line in CACHE.read_text().splitlines():
+    for line in CACHE.read_text(encoding="utf-8").splitlines():
         url, _, mod = line.strip().partition("\t")
         if url:
             yield url, (mod.strip() or None)

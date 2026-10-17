@@ -124,7 +124,8 @@ def sealed(facts):
 
 
 def gh(args, stdin=None):
-    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, text=True)
+    # replace: a stray byte must reach the error and read-back paths, not raise past them
+    r = subprocess.run(['gh', *args], input=stdin, capture_output=True, encoding='utf-8', errors='replace')
     return r.returncode, r.stdout, r.stderr
 
 
@@ -450,7 +451,7 @@ def handle(poster, item):
 
 def load_entries(path, key, what, check):
     """The non-empty `key` list of the JSON file at path, each entry passing check, one per commentId."""
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         m = json.load(f)
     entries = m.get(key) if isinstance(m, dict) else None
     if not isinstance(entries, list) or not entries:
@@ -495,7 +496,7 @@ def pair(text):
 def saved_receipt(path, request):
     """The (line, code) saved at path for request, None when path is absent; ValueError for anything else there."""
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             saved = json.load(f)
     except FileNotFoundError:
         return None
@@ -565,7 +566,7 @@ def main(argv=None):
     code = 0 if all(r['verified'] is True and (r['kind'] != 'review' or r['resolved']) for r in receipts) else 1
     if a.receipt:
         try:
-            with open(a.receipt + '.tmp', 'w') as f:
+            with open(a.receipt + '.tmp', 'w', encoding='utf-8') as f:
                 json.dump({'request': request, 'line': line, 'code': code}, f)
             os.replace(a.receipt + '.tmp', a.receipt)
         except OSError as e:
@@ -576,4 +577,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
+    if os.name == 'nt':  # what it prints carries remote text, which a Windows console code page cannot always encode
+        sys.stdout.reconfigure(encoding='utf-8')
+        sys.stderr.reconfigure(encoding='utf-8', errors='backslashreplace')
     sys.exit(main())

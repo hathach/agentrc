@@ -40,8 +40,6 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import yaml
-
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, Unusable, report, run  # noqa: E402
 
@@ -338,6 +336,10 @@ def dates_head(repo, run_, branch, head_repo):
 @functools.cache
 def pr_types(repo, path, sha):
     """The pull_request activity types a workflow revision runs on, or None when they cannot be read."""
+    try:
+        import yaml  # here, so sonar.py and coderabbit_trigger.py, which import this file, run without PyYAML
+    except ImportError:
+        raise Unusable('PyYAML is not installed')
     try:
         meta = gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         doc = yaml.safe_load(base64.b64decode(meta['content']).decode())

@@ -45,7 +45,7 @@ class StateTransferTest(unittest.TestCase):
 
     def saved(self, content, name='w.output'):
         path = self.dir / name
-        path.write_text(content if isinstance(content, str) else json.dumps(content, indent=2))
+        path.write_text(content if isinstance(content, str) else json.dumps(content, indent=2, ensure_ascii=False), encoding='utf-8')
         return str(path)
 
     def run_script(self, *argv):
@@ -107,7 +107,7 @@ class StateTransferTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
     def test_the_sum_matches_the_workflows_fnv1a(self):
-        source = (ROOT / 'workflows' / 'pr-babysit.js').read_text()
+        source = (ROOT / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
         fn = re.search(r'^function fnv1a \(text\) \{.*?^\}', source, re.S | re.M).group(0)
         samples = ['', 'eyJhIjoxfQ==', 'A' * 684, '+/=0123456789abcdefXYZ']
         out = subprocess.run(['node', '-e', f'{fn}\nconsole.log(JSON.stringify({json.dumps(samples)}.map(fnv1a)))'],

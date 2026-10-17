@@ -54,7 +54,7 @@ def _parts_from_bsp() -> dict:
             if not f.is_file() or f.suffix.lower() not in (".c", ".h", ".mk", ".cmake", ".txt", ".ld", ""):
                 continue
             try:
-                for m in rx.findall(f.read_text(errors="ignore")):
+                for m in rx.findall(f.read_text(encoding="utf-8", errors="ignore")):
                     out[m.lower()] = fam
             except OSError:
                 continue

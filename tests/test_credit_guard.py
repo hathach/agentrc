@@ -1,5 +1,5 @@
 """Tests for hooks/credit-guard/credit_guard.py with the usage fetch stubbed."""
-import fcntl
+import errno
 import importlib.util
 import json
 import os
@@ -173,12 +173,35 @@ class Guard(unittest.TestCase):
 
     def test_a_busy_lock_blocks_before_the_hook_timeout(self):
         self.state.mkdir()
-        with (self.state / 'usage.lock').open('w') as held, mock.patch.object(cg, 'LOCK_WAIT', 0.2):
-            fcntl.flock(held, fcntl.LOCK_EX)
+        with mock.patch.object(cg, 'LOCK_WAIT', 0.2), cg.locked(self.state):  # held through its own handle
             out = cg.handle(ev('PreToolUse'), T0)
         self.assertBlocks(out)
         self.assertIn('lock busy', out['stopReason'])
         self.assertEqual(self.calls, 0)
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks are Windows only')
+    def test_a_lock_failure_other_than_contention_is_not_waited_out(self):
+        self.state.mkdir()
+        failure = OSError(errno.EBADF, 'bad file descriptor')
+        with mock.patch.object(cg.msvcrt, 'locking', side_effect=failure), self.assertRaises(OSError) as raised,                 cg.locked(self.state):
+            pass
+        self.assertEqual(raised.exception.errno, errno.EBADF, 'not a TimeoutError after LOCK_WAIT')
+
+    @unittest.skipUnless(os.name == 'nt', 'msvcrt locks are Windows only')
+    def test_the_lock_is_released_before_its_handle_closes(self):
+        self.state.mkdir()
+        with mock.patch.object(cg.msvcrt, 'locking', wraps=cg.msvcrt.locking) as locking:
+            with cg.locked(self.state):
+                pass
+        self.assertEqual([c.args[1] for c in locking.call_args_list], [cg.msvcrt.LK_NBLCK, cg.msvcrt.LK_UNLCK])
+        with cg.locked(self.state):  # and at once free for the next hook
+            pass
+
+    def test_the_readings_log_stamps_a_full_time_one_line_per_reading(self):
+        self.open_session(usage(session=10))
+        raw = (self.state / 'readings.log').read_bytes()
+        self.assertNotIn(b'\r', raw)
+        self.assertRegex(json.loads(raw)['time'], r'^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$')
 
     def test_an_unfinished_or_missing_check_leaves_the_session_armed(self):
         self.replies.append(OSError('offline'))
@@ -211,6 +234,15 @@ class Guard(unittest.TestCase):
         self.assertBlocks(run(json.dumps(ev('PreToolUse'))))
         self.assertBlocks(run(json.dumps(ev('UserPromptSubmit'))), 'UserPromptSubmit')
         self.assertIs(run('not json')['continue'], False)
+
+    def test_the_script_reads_its_event_as_utf8(self):
+        env = {**os.environ, 'CLAUDE_CONFIG_DIR': self.tmp.name}
+        env.pop('PYTHONUTF8', None)
+        self.open_session(usage(enabled=False))  # guard off: a correctly read prompt gets no reply
+        event = {**ev('UserPromptSubmit'), 'prompt': 'café ✔ ő'}
+        r = subprocess.run([sys.executable, str(SCRIPT)], input=json.dumps(event, ensure_ascii=False).encode(),
+                           capture_output=True, env=env, timeout=30)
+        self.assertEqual((r.returncode, r.stdout), (0, b''), r.stderr)
 
 
 if __name__ == '__main__':

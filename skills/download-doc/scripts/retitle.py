@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
+import os
 import pathlib
 import re
 import sqlite3
@@ -53,8 +55,8 @@ def from_pdf(pdf: pathlib.Path) -> tuple:
     """-> (doc_id, 'lead'|'adj'|'both', disagreement) reading only page 1."""
     try:
         txt = re.sub(r"\s+", " ", subprocess.run(
-            ["pdftotext", "-f", "1", "-l", "1", str(pdf), "-"],
-            capture_output=True, text=True, timeout=25).stdout or "")
+            ["pdftotext", "-enc", "UTF-8", "-f", "1", "-l", "1", str(pdf), "-"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=25).stdout or "")
     except Exception:
         return (None, None, None)
     lead, adj = ANY.match(txt.lstrip()), ADJ.search(txt)
@@ -79,13 +81,17 @@ def reprefixed(title: str) -> str:
 
 
 def build_plan(use_pdf: bool) -> tuple:
-    con = sqlite3.connect(f"file:{LIB / 'metadata.db'}?mode=ro", uri=True)
+    # Read up front and closed: Windows cannot delete or replace a database still open.
+    with contextlib.closing(sqlite3.connect(f"file:{LIB / 'metadata.db'}?mode=ro", uri=True)) as con:
+        identifiers = con.execute("select book, type, val from identifiers").fetchall()
+        data = con.execute(
+            "select b.id, b.path, d.name, d.format from books b join data d on d.book=b.id").fetchall()
+        books = con.execute("select id, title, path from books").fetchall()
     ids = collections.defaultdict(dict)
-    for book, typ, val in con.execute("select book, type, val from identifiers"):
+    for book, typ, val in identifiers:
         ids[book][typ] = val
     files = collections.defaultdict(list)
-    for book, path, name, fmt in con.execute(
-            "select b.id, b.path, d.name, d.format from books b join data d on d.book=b.id"):
+    for book, path, name, fmt in data:
         files[book].append(LIB / path / f"{name}.{fmt.lower()}")
 
     plan, stats, conflicts, absent = [], collections.Counter(), [], []
@@ -100,7 +106,7 @@ def build_plan(use_pdf: bool) -> tuple:
             return
         plan.append((book, title, new))
 
-    for book, title, folder in con.execute("select id, title, path from books"):
+    for book, title, folder in books:
         title = (title or "").strip()
         if LEAD.match(title):
             stats["already prefixed"] += 1
@@ -164,7 +170,7 @@ def main() -> int:
 
     roll = pathlib.Path.home() / ".local/share/download-doc" / f"retitle-{time.strftime('%Y%m%d-%H%M%S')}.tsv"
     roll.parent.mkdir(parents=True, exist_ok=True)
-    roll.write_text("".join(f"{b}\t{o}\t{n}\n" for b, o, n in plan))
+    roll.write_text("".join(f"{b}\t{o}\t{n}\n" for b, o, n in plan), encoding="utf-8")
     print(f"  rollback: {roll}")
 
     ok, fail = 0, 0
@@ -182,4 +188,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if os.name == "nt":
+        for stream in (sys.stdout, sys.stderr):
+            stream.reconfigure(encoding="utf-8", errors="replace")  # titles, and the warning signs
     sys.exit(main())

@@ -3,14 +3,12 @@ import copy
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-
-if os.name == 'nt':
-    raise unittest.SkipTest('read-doc requires POSIX file locking')
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,7 +64,15 @@ class History(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / HISTORY
-        self.env = dict(os.environ, XDG_STATE_HOME=self.tmp.name)
+        # The scripts' output is UTF-8 wherever it is read: a find prints an em dash.
+        self.env = dict(os.environ, XDG_STATE_HOME=self.tmp.name, PYTHONIOENCODING="utf-8")
+        if os.name == "nt":
+            # The replay names python3, which here may be another interpreter (MSYS's
+            # prints '/' paths); the comparison is of the replay, not of interpreters.
+            shim = Path(self.tmp.name) / "bin"
+            shim.mkdir()
+            (shim / "python3").write_text(f'#!/bin/sh\nexec "{Path(sys.executable).as_posix()}" "$@"\n')
+            self.env["PATH"] = str(shim) + os.pathsep + self.env["PATH"]
 
     def write(self, *records):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +81,7 @@ class History(unittest.TestCase):
 
     def run_history(self, *args):
         return subprocess.run([sys.executable, str(SCRIPTS / "history.py"), *args],
-                              capture_output=True, text=True, env=self.env)
+                              capture_output=True, encoding="utf-8", env=self.env)
 
     def test_list_sorts_and_filters_by_both_session_ids_term_and_date(self):
         older = copy.deepcopy(SEARCH)
@@ -139,6 +145,7 @@ class History(unittest.TestCase):
                 self.assertEqual(words[1:], expected)
                 self.assertTrue(Path(words[2]).is_absolute())
 
+    @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
     def test_show_command_repeats_a_real_logged_find(self):
         library = Path(self.tmp.name) / "library"
         library.mkdir()
@@ -156,18 +163,19 @@ class History(unittest.TestCase):
                 original = subprocess.run(
                     [sys.executable, "-c", invoke_main, str(SCRIPTS), "find", "--book", "1",
                      "--term=" + term, "--context", "0", "--limit", "2"],
-                    capture_output=True, text=True, env=env)
+                    capture_output=True, encoding="utf-8", env=env)
                 self.assertEqual(original.returncode, code, original.stderr)
                 record = json.loads(self.path.read_text().splitlines()[-1])
 
                 shown = self.run_history("show", record["id"])
                 self.assertEqual(shown.returncode, 0, shown.stderr)
                 command = shown.stdout.rstrip().rsplit("\n\n", 1)[1]
-                replay = subprocess.run(["sh", "-c", command], capture_output=True, text=True,
+                replay = subprocess.run(["sh", "-c", command], capture_output=True, encoding="utf-8",
                                         env=env)
                 self.assertEqual(replay.returncode, code, replay.stderr)
                 self.assertEqual(replay.stdout, original.stdout)
 
+    @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
     def test_a_logged_page_lists_and_replays(self):
         library = Path(self.tmp.name) / "library"
         library.mkdir()
@@ -180,14 +188,14 @@ class History(unittest.TestCase):
         invoke_main = ("import sys; sys.path.insert(0, sys.argv[1]); import locate; "
                        "raise SystemExit(locate.main(sys.argv[2:]))")
         original = subprocess.run([sys.executable, "-c", invoke_main, str(SCRIPTS), "page", "--book", "1",
-                                   "--pages", "1"], capture_output=True, text=True, env=env)
+                                   "--pages", "1"], capture_output=True, encoding="utf-8", env=env)
         self.assertEqual(original.returncode, 0, original.stderr)
         record = json.loads(self.path.read_text().splitlines()[-1])
         listed = self.run_history("list")
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertIn(f"page {record['id']} pages=1 of RM0001 reference manual (1)", listed.stdout)
         command = self.run_history("show", record["id"]).stdout.rstrip().rsplit("\n\n", 1)[1]
-        replay = subprocess.run(["sh", "-c", command], capture_output=True, text=True, env=env)
+        replay = subprocess.run(["sh", "-c", command], capture_output=True, encoding="utf-8", env=env)
         self.assertEqual(replay.stdout, original.stdout)
 
     def test_bad_json_and_unknown_versions_are_reported_and_skipped(self):

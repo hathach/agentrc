@@ -30,15 +30,22 @@ const isSha = v => typeof v === 'string' && SHA.test(v)
 if (args.diff != null && !(isSha(args.diff.base) && isSha(args.diff.head))) {
   throw new Error('args.diff must be { base, head }, two full 40-hex SHAs')
 }
-if (args.root != null && !(typeof args.root === 'string' && /^\/./.test(args.root))) throw new Error('args.root must be an absolute path')
+// Every `\` is a separator, on POSIX too (this runtime cannot tell the host): a Windows path, which a scanner may
+// report with either slash and drive case, compares in one form, and `\x`, `\\srv\share` or `C:x` is absolute.
+const DRIVE = /^[A-Za-z]:/
+const slashed = p => p.replace(/\\/g, '/').replace(/^[a-z](?=:)/, c => c.toUpperCase())
+if (args.root != null && !(typeof args.root === 'string' && /^(?:\/.|[A-Za-z]:[\\/])/.test(args.root))) throw new Error('args.root must be an absolute path')
 if (args.batch != null && typeof args.batch !== 'boolean') throw new Error('args.batch must be a boolean')
-const root = args.root == null ? null : args.root.replace(/\/+$/, '')
+const root = args.root == null ? null : slashed(args.root).replace(/\/+$/, '')
+// A drive path's case is not its identity: the checkout's real path and a scanner's spelling may differ in it.
+const under = p => root && (DRIVE.test(root) ? p.slice(0, root.length + 1).toLowerCase() === `${root}/`.toLowerCase() : p.startsWith(`${root}/`))
 // A verifier reads the path it is given, and a finding's consumers need it repository-relative. Strings only:
 // root is the checkout's real path, and a scanner reports the path it read.
 const placed = (f) => {
-  const file = root && f.file.startsWith(`${root}/`) ? f.file.slice(root.length + 1) : f.file.replace(/^(?:\.\/)+/, '')
+  const ff = slashed(f.file)
+  const file = under(ff) ? ff.slice(root.length + 1) : ff.replace(/^(?:\.\/)+/, '')
   const pathError = !file ? 'no file'
-    : file.startsWith('/') ? `absolute path outside the checkout${root ? ` ${root}` : ' (no root given)'}`
+    : file.startsWith('/') || DRIVE.test(file) ? `absolute path outside the checkout${root ? ` ${root}` : ' (no root given)'}`
     : file.split('/').includes('..') ? 'path escapes the checkout' : null
   return pathError ? { ...f, pathError } : { ...f, file }
 }
