@@ -188,6 +188,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('`~/.codex/skills/hil/SKILL.md`', skill)
         for stale in ('forced-lock recovery', 'never force'):
             self.assertNotIn(stale, skill)
+        self.assertIn('a CI runner is never stopped', skill)
         for role in ('hw-debugger.md', 'hw-validator.md'):
             self.assertIn('a permission still required under the shared Scope rule', (AGENTS / role).read_text())
 
