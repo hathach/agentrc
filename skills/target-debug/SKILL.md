@@ -68,13 +68,13 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
 - **Identity.** Verify worktree, branch and HEAD, then board, probe serial and host against the prompt, or the probe
   against the HIL config entry it names, before acting. Resolve the board's family and debug backend from the project's
   metadata before choosing probe tools, never from the board name or its flashing backend.
-- **Lock.** Ordinary hardware sessions hold the project's board lock for the whole hardware phase; a refused hold waits
-  within the lock-wait budget, then returns `blocked` with the holder; a cleanup holder (`role: cleanup-holder`) is never
-  waited on and returns `blocked` at once as a recovery blocker. Forced-lock recovery is a separate, explicitly scoped
-  operation naming the holder, affected resources and recovery procedure; a refusal alone never adds that scope,
-  and it never includes stopping the CI runner. A reproducer that takes the lock itself (the HIL contract's Reservation
-  names them) never runs under your hold, and its guard is bypassed only under that scoped forced-lock recovery. Reuse a supplied HIL
-  reproduction while its firmware, configuration, reproducer and relevant rig inputs match; otherwise resolve equivalent
+- **Lock.** Hold the board through its HIL contract's Reservation for the whole hardware phase. A refused hold waits
+  within the lock-wait budget, then returns `blocked` with the holder; a cleanup holder (`role: cleanup-holder`) returns
+  `blocked` at once. Never kill a holder, release a hold not yours or bypass a lock unless the prompt carries the scope
+  the shared `hil` page's Board locks names for that board and operation, read by path (`~/.claude/skills/hil/SKILL.md`;
+  under Codex `~/.codex/skills/hil/SKILL.md`), never through a skill lookup a project's own skill could shadow; a
+  refusal alone never adds it, and a CI runner is never stopped. Reuse a supplied HIL reproduction while its firmware,
+  configuration, reproducer and relevant rig inputs match; otherwise resolve equivalent
   manual steps through the HIL contract, and if there are none return `blocked` naming the exact HIL reproduction
   needed, so the caller arranges it through the project's HIL role. A later manual session re-establishes firmware
   identity and state and never treats a snapshot taken after that handoff as the earlier failure state without evidence.
@@ -127,8 +127,7 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
 ## Rig discipline — lock first, always
 
 The board lock rules are Delegated sessions' Lock, for a manual session too: held for the WHOLE session (instrument,
-build, flash, capture, GDB), forced only under a scoped forced-lock recovery, the CI runner never stopped. Rigs and
-benches run many identical probes:
+build, flash, capture, GDB). Rigs and benches run many identical probes:
 
 - Select the probe by serial: J-Link `-SelectEmuBySN <uid>`, its GDB server `-select usb=<uid>`, OpenOCD
   `-c 'adapter serial <uid>'`; a probe without one by `adapter usb location` (`espressif.md`, Attach).
@@ -190,7 +189,7 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - **`pkill -f PATTERN` matches its own caller**: the pattern is in your shell's (or ssh's) command line, so it kills the
   command running it. Bracket one character (`pkill -f '[J]LinkGDBServer'`) or kill by PID; an openocd-esp32 server is
   ended with `shutdown`, never killed (`espressif.md`, Attach).
-- Flash/GDB only with the board lock held (Delegated sessions' Lock: a refused hold means wait, never force).
+- Flash/GDB only with the board lock held (Delegated sessions' Lock).
 - **Instrumentation is temporary**: before `release`, restore the pinned restoration firmware or cleanup state as
   Delegated sessions' Cleanup says (the next CI run must not inherit a debug build) and revert the instrumentation diff.
   Handing the diff over with the diagnosis preserves the evidence; it does not count as cleanup.

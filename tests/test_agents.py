@@ -182,8 +182,12 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('Changing the issue\'s acceptance criterion or accepting a red CI remains the human\'s decision', chief)
         skill = ' '.join((SKILLS / 'target-debug' / 'SKILL.md').read_text().split())
         self.assertIn('no human grant or verbatim exchange is needed for its hardware operations', skill)
-        self.assertIn('Forced-lock recovery is a separate, explicitly scoped operation', skill)
-        self.assertIn('it never includes stopping the CI runner', skill)
+        # lock authority is the shared hil page's, read by path; target-debug keeps no copy of its rules
+        self.assertIn("the shared `hil` page's Board locks names for that board and operation, read by path", skill)
+        self.assertIn('`~/.claude/skills/hil/SKILL.md`', skill)
+        self.assertIn('`~/.codex/skills/hil/SKILL.md`', skill)
+        for stale in ('forced-lock recovery', 'never force'):
+            self.assertNotIn(stale, skill)
         for role in ('hw-debugger.md', 'hw-validator.md'):
             self.assertIn('a permission still required under the shared Scope rule', (AGENTS / role).read_text())
 
