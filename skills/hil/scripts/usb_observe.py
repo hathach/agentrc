@@ -16,30 +16,79 @@ UDEV_DATA = '/run/udev/data'
 
 SYSFS_READ_GRACE = 2.0        # default bound on one attribute read; see read_sysfs
 
-# path -> the kernfs inode the node had when its bounded read gave up. Keyed by INODE, not
-# by path alone: a busport does not change when a board returns to the same physical port,
-# so a path-only blacklist outlives the wedge -- a tool reflashes the board, polls that
-# busport for the new inode, and the scan it polls through would never look at the device
-# again. A re-enumeration destroys the kernfs node and makes
-# a new one, so a CHANGED inode is the all-clear. os.stat is safe on a wedged device: it
-# does not call ->show(), so it cannot block on the lock the reader is stuck behind.
+# Both memos are keyed by the attribute's realpath: usb_scan reads `serial` through
+# /sys/bus/usb/devices/<busport> and usb_node_serial through /sys/dev/char/189:N, and keyed by
+# spelling one wedged device would strand once per spelling.
+#
+# key -> the reader given up on. Keyed by INODE too, not by path alone: a busport does not
+# change when a board returns to the same physical port, so a path-only blacklist outlives
+# the wedge -- a tool reflashes the board, polls that busport for the new inode, and the scan
+# it polls through would never look at the device again. A re-enumeration destroys the
+# kernfs node and makes a new one, so a CHANGED inode is the all-clear; so is the stranded
+# reader finishing (a USBDEVFS_RESET that keeps the usb_device, a D-state holder that exits).
+# os.stat is safe on a wedged device: it does not call ->show(), so it cannot block on the
+# lock the reader is stuck behind.
 _stranded: dict = {}
-_strand_hits: dict = {}       # path -> how many times it has stranded, ever
+_inflight: dict = {}          # key -> the reader still within its grace; concurrent callers share it
+_live: dict = {}              # key -> readers started and not yet returned
+_spelling: dict = {}          # a non-canonical path -> its key, while that key has a reader or a strand
 _strand_lock = threading.Lock()
 
-# Each strand costs a thread AND an fd for the life of the process -- on sysfs the open()
+# Each reader costs a thread AND an fd until the read returns -- on sysfs the open()
 # SUCCEEDS and only the read blocks. A device that FLAPS while still wedged re-enumerates,
-# clears the inode memo, and strands again; after this many it stays memoised whatever its
-# inode says, so one sick board cannot leak without bound.
+# clears the inode memo, and strands again; with this many readers outstanding no new one
+# starts whatever its inode says, so one sick board cannot leak without bound.
 _PATH_STRAND_MAX = 4
+
+
+class _Reader:
+    """One bounded read of one attribute node. `done` is set under _strand_lock, so a
+    caller that gives up and a reader that finishes cannot both win."""
+    __slots__ = ('ino', 'value', 'done')
+
+    def __init__(self, ino):
+        self.ino = ino
+        self.value = None
+        self.done = threading.Event()
+
+
+def _key(path: str) -> str:
+    return os.path.realpath(path)
 
 
 def path_stranded(path: str) -> bool:
     """Whether THIS attribute is currently memoised as unreadable: lets a caller tell a
     device whose `serial` is held under the device lock from one that genuinely left the bus.
     """
+    key = _key(path)
     with _strand_lock:
-        return path in _stranded
+        if not os.path.lexists(path):
+            # an alias that vanished while its reader is stuck no longer resolves to the key
+            key = _spelling.get(path, key)
+        # a capped key reads as unreadable even while its readers are still in their grace
+        return key in _stranded or _live.get(key, 0) >= _PATH_STRAND_MAX
+
+
+def _read(key: str, r: _Reader, path: str) -> None:
+    try:
+        with open(path) as f:
+            value = f.read().strip()
+    except (OSError, ValueError):
+        value = None
+    with _strand_lock:
+        r.value = value
+        r.done.set()
+        # only its own entries: a newer reader of a re-enumerated node owns the key now
+        if _inflight.get(key) is r:
+            del _inflight[key]
+        if _stranded.get(key) is r:
+            del _stranded[key]
+        _live[key] -= 1
+        if not _live[key]:
+            del _live[key]
+            if key not in _stranded:
+                for spelling in [s for s, k in _spelling.items() if k == key]:
+                    del _spelling[spelling]
 
 
 def read_sysfs(path: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
@@ -60,59 +109,55 @@ def read_sysfs(path: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
     per-attribute blindness. The memo is keyed by inode so the cost stays on the device
     that is actually wedged; path_stranded() tells a caller which device that was.
     """
-    with _strand_lock:
-        was = _stranded.get(path)
-        stuck_for_good = _strand_hits.get(path, 0) >= _PATH_STRAND_MAX
-    if was is not None:
-        try:
-            if os.stat(path).st_ino == was:
-                return None                   # same kernfs node, still wedged
-        except OSError:
-            pass                              # gone: let the read below report it
-        if stuck_for_good:
-            return None       # flapped too many times; see _PATH_STRAND_MAX
-        with _strand_lock:
-            _stranded.pop(path, None)         # a different inode is the all-clear
-
+    key = _key(path)
     # BEFORE the read, not after: a node that re-enumerates DURING the grace would
     # otherwise have its brand-new HEALTHY inode recorded as the wedged one, and only a
-    # second re-enumeration could ever clear it. If it cannot be stat'd there is no key to
-    # memoise against, so the path is simply re-read next time -- the open fails fast.
+    # second re-enumeration could ever clear it.
     try:
         ino = os.stat(path).st_ino
     except OSError:
         ino = None
-    out: dict = {}
-
-    def _read():
+    with _strand_lock:
+        if path != key:
+            _spelling[path] = key
+        stuck = _stranded.get(key)
+        if stuck is not None and ino == stuck.ino:
+            return None                       # same kernfs node, still wedged
+        r = _inflight.get(key)
+        # share the reader in its grace unless both inodes are known and differ: a reader
+        # whose stat failed may be on this very node
+        mine = r is None or (ino is not None and r.ino is not None and r.ino != ino)
+        if mine and _live.get(key, 0) >= _PATH_STRAND_MAX:
+            return None                       # flapped too many times; the strand stays shown
+        if stuck is not None:
+            del _stranded[key]                # a different inode is the all-clear
+        if mine:
+            r = _Reader(ino)
+            _inflight[key] = r
+            _live[key] = _live.get(key, 0) + 1
+    if mine:
+        threading.Thread(target=_read, args=(key, r, path), daemon=True).start()
+    if r.done.wait(timeout):
+        return r.value
+    if r.ino is None:
+        # the pre-read stat lost a race the open then won -- the node was replaced
+        # between them. Re-stat now: the reader is blocked on whatever node exists,
+        # so this is the key it is stuck on. Without a key nothing is memoised and
+        # every later poll starts another thread and fd for this path.
         try:
-            with open(path) as f:
-                out['v'] = f.read().strip()
-        except (OSError, ValueError):
-            pass
-
-    t = threading.Thread(target=_read, daemon=True)
-    t.start()
-    t.join(timeout)
-    # `out` FIRST: a reader can deposit its value and still be alive for a moment
-    # afterwards, and counting that as a strand blacklists a healthy attribute forever
-    if t.is_alive() and 'v' not in out:
-        if ino is None:
-            # the pre-read stat lost a race the open then won -- the node was replaced
-            # between them. Re-stat now: the reader is blocked on whatever node exists,
-            # so this is the key it is stuck on. Without a key nothing is memoised and
-            # every later poll starts another permanent thread and fd for this path.
-            try:
-                ino = os.stat(path).st_ino
-            except OSError:
-                pass
-        if ino is not None:
-            with _strand_lock:
-                if path not in _stranded:         # count the PATH once, not each reader
-                    _strand_hits[path] = _strand_hits.get(path, 0) + 1
-                _stranded[path] = ino
-        return None
-    return out.get('v')
+            ino = os.stat(path).st_ino
+        except OSError:
+            ino = None
+    with _strand_lock:
+        if r.done.is_set():
+            return r.value                    # finished between the wait and the lock
+        if r.ino is None:
+            r.ino = ino
+        if _inflight.get(key) is r:
+            del _inflight[key]
+            if r.ino is not None:
+                _stranded[key] = r
+    return None
 
 
 def usb_scan(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> list:

@@ -11,6 +11,7 @@ if os.name == 'nt':
 
 import importlib.util
 import inspect
+import sys
 import threading
 import time
 from pathlib import Path
@@ -43,9 +44,9 @@ class BoundedRead(unittest.TestCase):
     find the one it wants, so one wedged DUT would stall every caller rather than one."""
 
     def setUp(self):
-        for name in ('_stranded', '_strand_hits'):
-            self.addCleanup(setattr, uo, name, dict(getattr(uo, name)))
-            getattr(uo, name).clear()
+        # a fresh module per test: a reader still blocked from an earlier test keeps that
+        # test's memo, so it can never update this one's
+        patch(self, sys.modules[__name__], 'uo', load())
         self.td = TemporaryDirectory()
         self.addCleanup(self.td.cleanup)
         self.fifo = os.path.join(self.td.name, 'serial')
@@ -86,7 +87,7 @@ class BoundedRead(unittest.TestCase):
         [t.start() for t in ts]
         [t.join() for t in ts]
         self.assertEqual(len(uo._stranded), 1)
-        self.assertEqual(uo._strand_hits[self.fifo], 1, 'four readers of one path spent four credits')
+        self.assertEqual(uo._live[self.fifo], 1, 'four readers of one path spent four credits')
 
     def test_a_flapping_wedged_device_cannot_leak_without_bound(self):
         """The inode all-clear re-arms on every re-enumeration, so a device that flaps
@@ -95,7 +96,8 @@ class BoundedRead(unittest.TestCase):
             uo.read_sysfs(self.fifo, timeout=0.05)
             os.unlink(self.fifo)
             os.mkfifo(self.fifo)                      # back on the same path, still wedged
-        self.assertEqual(uo._strand_hits[self.fifo], uo._PATH_STRAND_MAX,
+        self.assertTrue(uo.path_stranded(self.fifo), 'a refused admission hid the strand')
+        self.assertEqual(uo._live[self.fifo], uo._PATH_STRAND_MAX,
                          'a flapping device kept stranding past its per-path cap')
 
     def test_a_value_that_arrived_at_the_deadline_is_not_a_strand(self):
@@ -159,6 +161,150 @@ class BoundedRead(unittest.TestCase):
         for _ in range(5):
             self.assertIsNone(uo.read_sysfs(self.fifo, timeout=0.3))
         self.assertLess(time.monotonic() - t0, 0.3, 'repeat reads of a known-stranded path paid the grace again')
+
+    def _finish(self, fd):
+        """Let the reader blocked on this FIFO complete, and wait until it has."""
+        os.write(fd, b'BACK01\n')
+        os.close(fd)
+        deadline = time.monotonic() + 5
+        while uo._stranded and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+    def _strand(self, path):
+        """Strand a reader on the FIFO at `path`; returns a write end that can finish it."""
+        self.assertIsNone(uo.read_sysfs(path, timeout=0.05))
+        return os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK)  # succeeds: a reader waits
+
+    def test_a_stranded_reader_that_finishes_clears_the_memo(self):
+        """A holder that finishes without re-enumerating keeps the kernfs node (a
+        USBDEVFS_RESET whose usb_reset_device keeps the usb_device, a D-state holder that
+        exits): only the reader finishing can tell, else a healthy board stays hidden for
+        the life of the process."""
+        self._finish(self._strand(self.fifo))
+        self.assertFalse(uo.path_stranded(self.fifo), 'a finished reader stayed memoised')
+        writer = threading.Thread(target=lambda: Path(self.fifo).write_text('AGAIN\n'), daemon=True)
+        writer.start()
+        self.assertEqual(uo.read_sysfs(self.fifo, timeout=2), 'AGAIN',
+                         'the same inode was not read again after its reader finished')
+
+    def test_an_older_reader_finishing_leaves_a_newer_strand(self):
+        old = self._strand(self.fifo)
+        os.unlink(self.fifo)                      # re-enumerated, and wedged again
+        os.mkfifo(self.fifo)
+        self.assertIsNone(uo.read_sysfs(self.fifo, timeout=0.05))
+        os.write(old, b'OLD\n')
+        os.close(old)
+        time.sleep(0.2)
+        self.assertTrue(uo.path_stranded(self.fifo), "the old node's reader cleared the new node's strand")
+
+    def test_every_spelling_of_one_attribute_shares_one_memo(self):
+        """usb_scan reads /sys/bus/usb/devices/<busport>/serial and usb_node_serial reads
+        /sys/dev/char/189:N/serial: both are symlinks to the same attribute, and a memo
+        keyed by spelling strands one wedge twice, with a second grace and thread."""
+        alias_dir = Path(self.td.name) / 'char'
+        alias_dir.symlink_to(self.td.name)
+        alias = str(alias_dir / 'serial')
+        self.assertIsNone(uo.read_sysfs(alias, timeout=0.05))
+        self.assertTrue(uo.path_stranded(self.fifo))
+        t0 = time.monotonic()
+        self.assertIsNone(uo.read_sysfs(self.fifo, timeout=0.3))
+        self.assertLess(time.monotonic() - t0, 0.3, 'the second spelling paid the grace again')
+        self.assertEqual(sum(uo._live.values()), 1)
+
+    def test_a_vanished_alias_still_answers_and_clears(self):
+        """usbtest asks path_stranded by the spelling it read, to tell a held serial from a
+        disconnect: the alias vanishing while its reader is stuck must not change the answer."""
+        alias_dir = Path(self.td.name) / 'char'
+        alias_dir.symlink_to(self.td.name)
+        alias = str(alias_dir / 'serial')
+        fd = self._strand(alias)
+        alias_dir.unlink()
+        self.assertTrue(uo.path_stranded(alias), 'the vanished spelling lost its strand')
+        self._finish(fd)
+        self.assertFalse(uo.path_stranded(self.fifo))
+        self.assertFalse(uo.path_stranded(alias))
+        self.assertEqual(uo._spelling, {})
+
+    def test_an_alias_first_seen_on_a_memo_hit_keeps_answering(self):
+        alias_dir = Path(self.td.name) / 'char'
+        alias_dir.symlink_to(self.td.name)
+        alias = str(alias_dir / 'serial')
+        fd = self._strand(self.fifo)
+        self.assertIsNone(uo.read_sysfs(alias))
+        alias_dir.unlink()
+        self.assertTrue(uo.path_stranded(alias))
+        self._finish(fd)
+        self.assertEqual(uo._spelling, {})
+
+    def test_aliases_are_forgotten_once_every_generation_returns(self):
+        alias_dir = Path(self.td.name) / 'char'
+        alias_dir.symlink_to(self.td.name)
+        old = self._strand(str(alias_dir / 'serial'))
+        os.unlink(self.fifo)
+        os.mkfifo(self.fifo)
+        new = self._strand(self.fifo)
+        os.write(old, b'OLD\n')
+        os.close(old)
+        self._finish(new)
+        deadline = time.monotonic() + 5
+        while uo._live and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual((uo._live, uo._spelling), ({}, {}))
+
+    def test_a_failed_pre_stat_shares_the_reader_in_its_grace(self):
+        real_stat = uo.os.stat
+        failed = []
+
+        def flaky(path, *a, **kw):
+            if not failed:
+                failed.append(path)
+                raise OSError('vanished between stat and open')
+            return real_stat(path, *a, **kw)
+
+        patch(self, uo.os, 'stat', flaky)
+        first = threading.Thread(target=lambda: uo.read_sysfs(self.fifo, timeout=0.3))
+        first.start()
+        while not uo._inflight:
+            time.sleep(0.005)
+        uo.read_sysfs(self.fifo, timeout=0.05)
+        first.join()
+        self.assertEqual(uo._live[self.fifo], 1, 'a failed pre-stat started a second reader on one node')
+
+    def test_generations_inside_their_grace_stay_within_the_cap(self):
+        """Re-enumerations faster than the grace start a reader per node before any strand
+        is published: the cap must count readers outstanding, not strands published."""
+        ts = []
+        for _ in range(uo._PATH_STRAND_MAX + 3):
+            ts.append(threading.Thread(target=lambda: uo.read_sysfs(self.fifo, timeout=0.5)))
+            ts[-1].start()
+            time.sleep(0.02)
+            os.unlink(self.fifo)
+            os.mkfifo(self.fifo)
+            if len(ts) > uo._PATH_STRAND_MAX:
+                self.assertTrue(uo.path_stranded(self.fifo), 'a refused admission inside the grace read as gone')
+        [t.join() for t in ts]
+        self.assertEqual(uo._live[self.fifo], uo._PATH_STRAND_MAX)
+
+    def test_concurrent_callers_share_one_reader(self):
+        """Each caller starting its own reader on one wedged node leaks a thread and an
+        fd per caller."""
+        started = []
+
+        class Counting(threading.Thread):
+            def start(self):
+                started.append(self)
+                super().start()
+
+        patch(self, uo.threading, 'Thread', Counting)
+        barrier = threading.Barrier(4)
+
+        def call():
+            barrier.wait()
+            uo.read_sysfs(self.fifo, timeout=0.3)
+        ts = [threading.Thread(target=call) for _ in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len([t for t in started if t not in ts]), 1, 'concurrent callers each started a reader')
 
     def test_a_healthy_attribute_is_not_blacklisted(self):
         good = os.path.join(self.td.name, 'idVendor')
