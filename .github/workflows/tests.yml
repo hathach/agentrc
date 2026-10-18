@@ -1,0 +1,44 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - run: python -m pip install pyyaml pre-commit
+      # an environment of its own: MSYS2's poppler brings a Python that would shadow this one on PATH
+      - if: runner.os == 'Windows'
+        run: |
+          & "$env:CONDA\Scripts\conda.exe" create -y -q -p "$env:RUNNER_TEMP\poppler" -c conda-forge poppler
+          "$env:RUNNER_TEMP\poppler\Library\bin" >> $env:GITHUB_PATH
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq poppler-utils
+      - name: optional tools found
+        run: python -c "import shutil; [print(t, shutil.which(t)) for t in 'python node git bash jq awk pdfinfo pdftotext tshark editcap capinfos openocd kicad-cli xvfb-run pre-commit'.split()]"
+      - run: python -X utf8 -m unittest discover -s tests -v

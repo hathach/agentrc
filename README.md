@@ -1,6 +1,8 @@
 # agentrc
 
-Personal agent config shared by Claude Code and Codex, versioned in git.
+Personal agent config shared by Claude Code and Codex, versioned in git. It runs
+on Linux and Windows, both tested in CI; [Windows](#windows) lists its setup and
+the Linux-only parts. macOS is not supported.
 
 ```
 install.py     symlinks chosen parts of this checkout into ~/.claude, ~/.codex and ~/.local/bin
