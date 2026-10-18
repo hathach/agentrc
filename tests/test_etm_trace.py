@@ -286,9 +286,9 @@ class CaptureCli(unittest.TestCase):
     DEVICE = ('--device', 'X', '--target-if', 'SWD', '--tif-speed', '4 MHz', '--trace-width', '4',
               '--cortex-m-default-hooks')
 
-    def run_cli(self, *args, probe=('--probe', '1')):
+    def run_cli(self, *args, probe=('--probe', '1'), env=None):
         return subprocess.run([sys.executable, str(SCRIPTS / 'etm_capture.py'), *probe, *args],
-                              capture_output=True, text=True, timeout=30, cwd='/')
+                              capture_output=True, text=True, timeout=30, cwd='/', env=env)
 
     def test_the_probe_is_never_assumed(self):
         with tempfile.NamedTemporaryFile(suffix='.elf') as elf:
@@ -359,11 +359,13 @@ class CaptureCli(unittest.TestCase):
         with tempfile.NamedTemporaryFile(suffix='.elf') as elf, tempfile.TemporaryDirectory() as d:
             stale = Path(d) / 'code_profile.txt'
             stale.write_text('Code Profile Report from an older run')
-            r = self.run_cli(*self.DEVICE, '--elf', elf.name, '--out', d)
+            # this refusal comes after the Ozone lookup, which only checks the file exists
+            env = {**os.environ, 'ETM_OZONE': sys.executable}
+            r = self.run_cli(*self.DEVICE, '--elf', elf.name, '--out', d, env=env)
             self.assertEqual(r.returncode, 1)
             self.assertIn('not an empty directory', r.stderr)
             self.assertEqual(os.listdir(d), ['code_profile.txt'])   # nothing written beside it
-            r = self.run_cli(*self.DEVICE, '--elf', elf.name, '--out', str(stale))
+            r = self.run_cli(*self.DEVICE, '--elf', elf.name, '--out', str(stale), env=env)
             self.assertIn('not an empty directory', r.stderr)
 
     def test_help_runs_from_anywhere(self):
