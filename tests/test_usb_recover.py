@@ -5,6 +5,7 @@ foreign owner blocks unshield while a dead one does not. Never run as root: the 
 (USB_RECOVER_SYSFS/USB_RECOVER_STATE) are ignored under root and the partial-acquisition
 case chmods a root-owned procfs file expecting EPERM."""
 import os
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -109,7 +110,6 @@ class Shield(Tree):
         real = Path('/sys/bus/usb/devices/usb1')
         if not (real / 'serial').exists():
             self.skipTest('no real root hub to borrow')
-        import shutil
         shutil.rmtree(self.dev / 'usb13')
         os.symlink(real, self.dev / 'usb13')
         real_modes = {a: mode(real / a) for a in ATTRS if (real / a).exists()}
@@ -196,7 +196,6 @@ class Shield(Tree):
         real = Path('/sys/bus/usb/devices/usb1')
         if not (real / 'serial').exists():
             self.skipTest('no real root hub to borrow')
-        import shutil
         shutil.rmtree(self.dev / 'usb13')
         os.symlink(real, self.dev / 'usb13')            # acquisition fails at the root hub (EPERM)...
         env = {'USB_RECOVER_TEST_FAIL_CHMOD': str(self.dev / '13-1/bMaxPower')}   # ...and one rollback chmod fails
@@ -242,7 +241,7 @@ case "$UHUBCTL_MODE" in
   *) exit 0 ;;
 esac
 '''
-SLEEP = '#!/bin/sh\nexec /usr/bin/sleep 0.05\n'
+SLEEP = f'#!/bin/sh\nexec {shutil.which("sleep")} 0.05\n'   # resolved before the stub shadows it on PATH
 UDEVADM = '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$UDEVADM_ARGV"\n[ -n "$UDEVADM_PATH" ] || exit 1\necho "$UDEVADM_PATH"\n'
 
 
