@@ -5,12 +5,16 @@ foreign owner blocks unshield while a dead one does not. Never run as root: the 
 (USB_RECOVER_SYSFS/USB_RECOVER_STATE) are ignored under root and the partial-acquisition
 case chmods a root-owned procfs file expecting EPERM."""
 import os
+import unittest
+
+if os.name == 'nt':
+    raise unittest.SkipTest('usb_recover.sh drives Linux sysfs')
+
 import shutil
 import signal
 import subprocess
 import tempfile
 import time
-import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'usb-kernel-recover' / 'scripts' / 'usb_recover.sh'
