@@ -515,6 +515,58 @@ class Run(Fixture):
         self.assertEqual(p.wait(), 1)
         self.assertEqual(self.held(), set())
 
+    def test_a_hangup_does_not_end_a_cleanup_hold(self):
+        p = self.run_run(action='fail')
+        token = token_of(p.blocker())
+        p.send_signal(signal.SIGHUP)                    # the terminal or SSH session that launched it went away
+        time.sleep(0.3)
+        self.assert_cleanup_holder(p, token)
+        self.assertFalse(self.flock_free('raspberry_pi_pico2'))
+        rc, out = main('release', '--token', token)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(), 1)
+        self.assertEqual(self.held(), set())
+
+    def test_a_hangup_during_the_command_is_ignored_and_before_it_releases(self):
+        p = self.run_run(action='hang')
+        self.wait_for(lambda: self.argv_out.exists(), 'the command to start')
+        time.sleep(0.2)
+        p.send_signal(signal.SIGHUP)
+        time.sleep(0.3)
+        self.assertIsNone(p.poll())                     # the mutation runs on
+        p.send_signal(signal.SIGTERM)
+        line = p.blocker()
+        self.assertIn('SIGHUP ignored during command', line)
+        self.assertIn('SIGTERM forwarded', line)
+        p.kill()                                        # frees the locks for the second run
+        self.argv_out.unlink()
+
+        def before(m):
+            real, calls = m.check, []
+
+            def check(*a, **k):
+                calls.append(1)
+                if len(calls) == 2:
+                    os.kill(os.getpid(), signal.SIGHUP)     # under the hold, before the command
+                return real(*a, **k)
+            m.check = check
+        q = self.run_run(patch=before)
+        self.assertEqual(q.wait(), 130)
+        self.assertFalse(self.argv_out.exists())
+        self.assertEqual(self.held(), set())
+
+    def test_a_command_that_cannot_start_releases_the_locks_and_refuses(self):
+        def patch(m):
+            def popen(*a, **k):
+                raise FileNotFoundError(2, 'No such file or directory', 'sudo')
+            m.subprocess.Popen = popen
+        p = self.run_run(patch=patch)
+        out = p.output()
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn('refused: cannot start sudo: ', out)
+        self.assertEqual(self.held(), set())
+        self.assertTrue(all(self.flock_free(l) for l in self.records()))
+
     def test_a_cleanup_record_that_cannot_be_written_still_holds(self):
         def patch(m):
             real = m.Reservation.record

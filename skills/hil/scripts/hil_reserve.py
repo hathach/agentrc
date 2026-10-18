@@ -44,9 +44,12 @@ established: it verifies the token, the holder's pid and start time, the role an
 set on every record, then signals through a pidfd. Exit 0 released, 1 blocker (run) or
 refused (release), 2 usage.
 
-Signals: SIGINT/SIGTERM before the command release the untouched reservation and exit 130;
-during the command they are forwarded to its process group; afterwards they are noted and
-ignored. SIGUSR1 is ignored until the cleanup-holder state.
+Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
+exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP
+(a lost terminal or SSH session, not a request to abort) is noted and ignored so the mutation
+completes; afterwards all three are noted and ignored, so a hangup never ends a cleanup hold.
+A command that cannot be started at all releases the reservation and refuses. SIGUSR1 is
+ignored until the cleanup-holder state.
 """
 import argparse
 import ctypes
@@ -85,6 +88,7 @@ RESTORE_POLL = 0.5         # between restoration looks; a node back later than t
 # the one command `run` builds; a test points this at a stub through the module, never the CLI
 RECOVER_SCRIPT = os.path.normpath(os.path.join(HERE, '..', '..', 'usb-kernel-recover', 'scripts', 'usb_recover.sh'))
 PR_SET_CHILD_SUBREAPER = 36
+HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _ABSENT = object()
 
 
@@ -294,7 +298,7 @@ class Reservation:
 
     def install_signals(self):
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)     # meaningful only as a cleanup holder
-        for s in (signal.SIGINT, signal.SIGTERM):
+        for s in HANDLED_SIGNALS:
             signal.signal(s, self._on_signal)
 
     def _on_signal(self, signum, _):
@@ -302,7 +306,7 @@ class Reservation:
         if self.phase == 'pre':          # nothing mutated yet: give the locks back and stop
             self.release()
             os._exit(130)
-        if self.phase == 'command':
+        if self.phase == 'command' and signum != signal.SIGHUP:
             try:
                 os.killpg(self.pgid, signum)
                 self.noted.append(f'{name} forwarded')
@@ -342,12 +346,17 @@ class Reservation:
         self.handles = []
 
     def run(self, argv):
-        """argv in its own process group; returns its exit code."""
+        """argv in its own process group; returns its exit code. A command that cannot be
+        started mutated nothing: the reservation is released and Refused raised."""
         # a signal that lands while the child is being spawned waits until its group is known
-        held = {signal.SIGINT, signal.SIGTERM}
+        held = set(HANDLED_SIGNALS)
         signal.pthread_sigmask(signal.SIG_BLOCK, held)
         try:
-            proc = subprocess.Popen(argv, process_group=0)
+            try:
+                proc = subprocess.Popen(argv, process_group=0)
+            except OSError as e:
+                self.release()
+                raise Refused(f'cannot start {argv[0]}: {e}')
             self.pgid = proc.pid
             self.phase = 'command'
         finally:
