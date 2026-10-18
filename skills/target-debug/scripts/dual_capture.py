@@ -264,6 +264,9 @@ def main(argv=None):
         signal_pids(left(strays), signal.SIGKILL)
         time.sleep(0.1 if strays else 0)
         adopt(sides, strays)
+        until = time.monotonic() + 1    # SIGKILL lands asynchronously: report only what outlives it
+        while (left(strays) or any(left(s['seen']) for s in sides)) and time.monotonic() < until:
+            time.sleep(0.02)
     rows = []
     for s in sides:
         row = {k: s[k] for k in ('name', 'argv', 'stdout', 'stderr')}
