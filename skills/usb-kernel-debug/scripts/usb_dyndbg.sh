@@ -30,12 +30,13 @@ allowed() { local m; for m in $ALLOW; do [ "$m" = "$1" ] && return 0; done; retu
 # Control lines are: file:line [module]function =flags "format"; `p` in flags
 # is the print flag, `=_` means none set.
 sites() {  # sites <module|-> [all] : lines of the allowlisted module(s), with p set unless "all"
-  awk -v module="$1" -v every="${2:-}" -v allow=" $ALLOW " '
+  # gawk skips an unreadable operand with exit 0; cat fails, and pipefail carries it
+  cat -- "$CTL" | awk -v module="$1" -v every="${2:-}" -v allow=" $ALLOW " '
     {
       m = $2; sub(/\].*/, "", m); sub(/^\[/, "", m)
       if (module != "-" ? m != module : index(allow, " " m " ") == 0) next
       if (every == "all" || $3 ~ /^=[a-z_]*p/) print
-    }' "$CTL"
+    }'
 }
 count() {  # count <module> [all] : how many such sites; fails when the control file cannot be read
   local out
