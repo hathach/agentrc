@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Host-wide reservation for a root-port operation on a HIL host (`hil` skill, Board locks):
+"""Host-wide reservation for a root- or hub-port operation on a HIL host (`hil` skill, Board locks):
 every board lock of every supplied roster, taken by one process around the one supported
 mutation, after a coverage check of the subtree the operation reaches.
 
-  hil_reserve.py check <busport> --roster FILE [SELECTOR] ...
-  hil_reserve.py run root-cycle <busport> --roster FILE [SELECTOR] ... --reason TEXT
+  hil_reserve.py check <busport> [--scope root|hub] --roster FILE [SELECTOR] ...
+  hil_reserve.py run root-cycle|hub-cycle <busport> --roster FILE [SELECTOR] ... --reason TEXT
   hil_reserve.py release --token TOKEN
 
 A roster is a project's HIL roster JSON (`boards` and `boards-skip`; a parked board is still
@@ -17,7 +17,8 @@ contract's Hosts/rosters is the roster list: the check refuses what the rosters 
 explain, it never infers an inventory.
 
 check (read-only, exit 0 covered / 1 refused / 2 usage): walks the device directories under
-the busport's root port twice within one budget. A node's identity is its sysfs `serial`,
+the busport's root port (`--scope hub`: its parent hub, which hub-cycle uses) twice within
+one budget. A node's identity is its sysfs `serial`,
 or, when that read does not answer (a wedged device serves it under the lock the wedge
 holds), udev's record of it (`ID_SERIAL_SHORT`, written when the device was added and read
 without touching it). A node is covered when its class is readable and its identity matches
@@ -25,8 +26,9 @@ a roster identity, or when it is a hub (bDeviceClass 09) whose children are all 
 empty hub, an unreadable class, a node without an identity, an unmatched identity, a tree
 that differs between the walks, or a walk over budget refuses, naming each.
 
-run: check, take every lock (all-or-nothing), check again, run
-`sudo -n <usb-kernel-recover>/scripts/usb_recover.sh root-cycle <busport> <serial>` with
+run: check (hub-cycle: under the parent hub, and the target must not be a hub), take every
+lock (all-or-nothing), check again, run
+`sudo -n <usb-kernel-recover>/scripts/usb_recover.sh <verb> <busport> <serial>` with
 the target's sysfs serial, or its udev one when sysfs did not answer (the script then warns
 and proceeds, as its own guard says), then validate: the command exited 0, no descendant
 survives (this process is a child subreaper, so orphans reparent to it), and the subtree is
@@ -36,15 +38,15 @@ covered. That restoration check repeats twice a second until it holds or one bud
 passed since the command ended, every read bounded by that same deadline, since siblings
 re-enumerate one after another after the target. Only a restored subtree releases the
 locks, and only restoration gaps may clear by waiting: a non-zero exit, a survivor or a
-signal stays a blocker. Any other outcome
-turns the records into `role: cleanup-holder` records and keeps this process alive holding
-the locks, as the shared rule requires; the blocker line prints the reservation token, and
-`release --token` (hil_lock.release_token, the same as `hil_lock.py release --token`) is the
-contract recovery procedure's release step once restoration is established: it verifies the
-token, the holder's pid and start time, the role and the lock set on every record, then
-signals through a pidfd. The records are marked protected, so a reservation killed outright
-leaves recovery blockers that only a recovery takeover (`hil_lock.py hold --take-over`)
-clears. Exit 0 released, 1 blocker (run) or refused (release), 2 usage.
+signal stays a blocker, except that an exit 3 (the script refused before its first
+mutation) with an unchanged subtree, no survivor and no noted signal releases and refuses.
+Any other outcome turns the records into `role: cleanup-holder` records and keeps this
+process alive holding the locks, as the shared rule requires; the blocker line prints the
+reservation token, and `release --token` (hil_lock.release_token, the same as
+`hil_lock.py release --token`) is the contract recovery procedure's release step once
+restoration is established. The records are marked protected, so a reservation killed
+outright leaves recovery blockers that only a recovery takeover (`hil_lock.py hold
+--take-over`) clears. Exit 0 released, 1 blocker (run) or refused (release), 2 usage.
 
 Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
 exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP
@@ -84,6 +86,9 @@ UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into 
 BUSPORT_RE = re.compile(r'^[0-9]+-[0-9]+(\.[0-9]+)*$')
 IDENTITY_KEYS = ('uid', 'uart_uid', 'serial')
 HUB_CLASS = '09'
+VERB_SCOPE = {'root-cycle': 'root', 'hub-cycle': 'hub'}
+SCOPE_NAME = {'root': 'root port', 'hub': 'hub'}
+REFUSED_UNWRITTEN = 3     # usb_recover.sh, either verb: refused before its first mutation
 DEFAULT_BUDGET = 60.0
 PROGRESS_EVERY = 60.0
 RESTORE_POLL = 0.5         # between restoration looks; a node back later than this before the deadline is missed
@@ -176,12 +181,22 @@ def _bounded(path, deadline):
     return uo.read_sysfs(path, min(uo.SYSFS_READ_GRACE, left))
 
 
-def walk(busport, identities, deadline, cached=True):
-    """The subtree under the busport's root port: {name: {serial, udev, identity, cls, ino,
+def top(busport, scope):
+    """What an operation on the busport can reach: its root port for `root`, its parent hub
+    (the hub and everything under it) for `hub`."""
+    if scope == 'root':
+        return busport.split('.')[0]
+    if '.' not in busport:
+        raise Refused(f'{busport} is on a root port: no hub above it to scope to')
+    return busport.rsplit('.', 1)[0]
+
+
+def walk(busport, identities, deadline, cached=True, scope='root'):
+    """The subtree `top(busport, scope)` heads: {name: {serial, udev, identity, cls, ino,
     covered, why}}. `serial` is the sysfs read; `udev` its record, consulted only when sysfs
     did not answer and `cached` allows it (admission, never restoration). Raises Refused on
     a budget overrun; the target itself must be present."""
-    root = busport.split('.')[0]
+    root = top(busport, scope)
     nodes = {}
     for d in sorted(glob.glob(os.path.join(uo.SYS_USB_DEVICES, f'{root}*'))):
         name = os.path.basename(d)
@@ -239,16 +254,16 @@ def gaps(nodes):
     return [f'{name}: {n["why"]}' for name, n in sorted(nodes.items()) if not n['covered']]
 
 
-def check(busport, rosters, budget):
+def check(busport, rosters, budget, scope='root'):
     """Two walks within one budget; returns the nodes or raises Refused naming every gap."""
     deadline = time.monotonic() + budget
-    first = walk(busport, rosters['identities'], deadline)
-    second = walk(busport, rosters['identities'], deadline)
+    first = walk(busport, rosters['identities'], deadline, scope=scope)
+    second = walk(busport, rosters['identities'], deadline, scope=scope)
     if snapshot(first) != snapshot(second):
         raise Refused('the subtree changed during the check')
     bad = gaps(second)
     if bad:
-        raise Refused('uncovered under root port %s:\n  ' % busport.split('.')[0] + '\n  '.join(bad))
+        raise Refused(f'uncovered under {SCOPE_NAME[scope]} {top(busport, scope)}:\n  ' + '\n  '.join(bad))
     return second
 
 
@@ -260,12 +275,6 @@ def describe(rosters, nodes):
 
 
 # --- processes -----------------------------------------------------------------------------
-def proc_start(pid):
-    """The process start time (clock ticks since boot), or None when it is gone."""
-    st = uo._proc_stat(pid)
-    return st[2] if st else None
-
-
 def survivors(pgid):
     """Live descendants after the command was reaped: our remaining children (orphans
     reparent to a subreaper) plus anything still in the command's process group."""
@@ -292,8 +301,11 @@ class Reservation:
     def __init__(self, locks, reason):
         self.locks, self.reason = locks, reason
         self.token = secrets.token_hex(8)
+        try:
+            self._own = {'tool': 'hil_reserve', **hil_lock.holder_fields(self.token, locks)}
+        except (OSError, ValueError) as e:
+            raise Refused(f'holder record fields: {e}')
         self.handles = []
-        self.start = proc_start(os.getpid())
         self.phase = 'pre'          # pre -> command -> post -> cleanup
         self.pgid = None
         self.noted = []
@@ -321,7 +333,7 @@ class Reservation:
 
     def fields(self, role=None, detail=''):
         """This reservation's own record fields, beyond the shared pid/reason/since."""
-        rec = {'tool': 'hil_reserve', 'token': self.token, 'start': self.start, 'locks': self.locks}
+        rec = dict(self._own)
         if role:
             rec.update(role=role, detail=detail)
         return rec
@@ -340,9 +352,8 @@ class Reservation:
 
     def release(self):
         for fh in self.handles:
-            hil_lock.clear_record(fh)
             try:
-                fh.close()
+                hil_lock.release_board_lock(fh)
             except OSError:
                 pass
         self.handles = []
@@ -401,12 +412,12 @@ class Reservation:
             signal.pause()
 
 
-def restoration_gaps(before, busport, rosters, deadline):
+def restoration_gaps(before, busport, rosters, deadline, scope='root'):
     """What keeps the subtree from counting as back: coverage from a fresh sysfs-only walk,
     every pre-operation node present with a readable serial matching its identity, and
     nothing new."""
     try:
-        after = walk(busport, rosters['identities'], deadline, cached=False)
+        after = walk(busport, rosters['identities'], deadline, cached=False, scope=scope)
     except OverBudget:
         raise
     except Refused as e:                  # the target itself absent, or a node uninspectable: a gap, looked at again
@@ -428,23 +439,26 @@ def restoration_gaps(before, busport, rosters, deadline):
 
 
 def cmd_run(args):
+    scope = VERB_SCOPE[args.verb]
     rosters = load_rosters(args.roster)
-    nodes = check(args.busport, rosters, args.budget)
+    nodes = check(args.busport, rosters, args.budget, scope)
     if nodes[args.busport]['identity'] is None:
         raise Refused(f'{args.busport} has no serial, in sysfs or recorded by udev, to bind the command to')
+    if args.verb == 'hub-cycle' and nodes[args.busport]['cls'] == HUB_CLASS:
+        raise Refused(f'{args.busport} is a hub: hub-cycle cycles a leaf only')
     _subreaper()
     res = Reservation(rosters['locks'], args.reason)
     res.install_signals()
     res.acquire()
     try:
-        again = check(args.busport, rosters, args.budget)
+        again = check(args.busport, rosters, args.budget, scope)
         if snapshot(again) != snapshot(nodes):
             raise Refused('the subtree changed between the check and the hold')
     except Refused:
         res.release()
         raise
     target = again[args.busport]      # the latest look: a raw sysfs serial over the udev form the script would refuse
-    argv = ['sudo', '-n', RECOVER_SCRIPT, 'root-cycle', args.busport, target['serial'] or target['udev']]
+    argv = ['sudo', '-n', RECOVER_SCRIPT, args.verb, args.busport, target['serial'] or target['udev']]
     print('hil_reserve: holding ' + ' '.join(res.locks) + '\nhil_reserve: ' + ' '.join(argv), flush=True)
     rc = res.run(argv)
     deadline = time.monotonic() + args.budget      # one deadline for everything that follows the command
@@ -454,14 +468,23 @@ def cmd_run(args):
     left = survivors(res.pgid)
     if left:
         problems.append(f'surviving pids {left}')
+    if rc == REFUSED_UNWRITTEN and not left:
+        # the script refused before its first write: proven only if the subtree is unchanged
+        try:
+            unchanged = snapshot(check(args.busport, rosters, args.budget, scope)) == snapshot(nodes)
+        except Refused:
+            unchanged = False
+        if unchanged and not res.noted:
+            res.release()
+            raise Refused(f'{args.verb} refused before writing anything (its message above); locks released')
     try:
-        gaps_left = restoration_gaps(nodes, args.busport, rosters, deadline)
+        gaps_left = restoration_gaps(nodes, args.busport, rosters, deadline, scope)
     except OverBudget as e:
         gaps_left = [str(e)]
     while gaps_left and (left := deadline - time.monotonic()) > 0:
         time.sleep(min(RESTORE_POLL, left))
         try:
-            gaps_left = restoration_gaps(nodes, args.busport, rosters, deadline)
+            gaps_left = restoration_gaps(nodes, args.busport, rosters, deadline, scope)
         except OverBudget:
             break                                   # mid-look: the last complete look stands
     if gaps_left:
@@ -471,7 +494,8 @@ def cmd_run(args):
     if problems:
         res.hold_as_cleanup_holder(problems)   # never returns
     res.release()
-    print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under root port {args.busport.split(".")[0]}')
+    print(f'hil_reserve: released {len(res.locks)} lock(s); {len(nodes)} node(s) back under '
+          f'{SCOPE_NAME[scope]} {top(args.busport, scope)}')
     return 0
 
 
@@ -495,9 +519,11 @@ def main(argv=None):
 
     p_check = sub.add_parser('check')
     p_check.add_argument('busport')
+    p_check.add_argument('--scope', choices=sorted(SCOPE_NAME), default='root',
+                         help='what the coverage walk spans: the root port (default) or the parent hub')
     add_roster_args(p_check)
     p_run = sub.add_parser('run')
-    p_run.add_argument('verb', choices=['root-cycle'])
+    p_run.add_argument('verb', choices=sorted(VERB_SCOPE))
     p_run.add_argument('busport')
     p_run.add_argument('--reason', required=True)
     add_roster_args(p_run)
@@ -517,7 +543,7 @@ def main(argv=None):
         args.roster = specs
         if args.cmd == 'check':
             rosters = load_rosters(specs)
-            print(describe(rosters, check(args.busport, rosters, args.budget)))
+            print(describe(rosters, check(args.busport, rosters, args.budget, args.scope)))
             return 0
         return cmd_run(args)
     except Refused as e:

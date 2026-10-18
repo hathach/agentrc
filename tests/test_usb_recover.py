@@ -54,10 +54,12 @@ class Tree(unittest.TestCase):
             (d / a).write_text(f'{name} {a}\n')
             os.chmod(d / a, MODE.get(a, 0o444))
 
-    def run_script(self, *args, ok=True, env=None):
+    def run_script(self, *args, ok=True, env=None, code=None):
         env = {**os.environ, 'USB_RECOVER_SYSFS': str(self.sys), 'USB_RECOVER_STATE': str(self.state), **(env or {})}
         r = subprocess.run(['bash', str(SCRIPT), *args], env=env, capture_output=True, text=True)
-        if ok:
+        if code is not None:
+            self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+        elif ok:
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         else:
             self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -286,11 +288,8 @@ SLEEP = f'#!/bin/sh\nexec {shutil.which("sleep")} 0.05\n'   # resolved before th
 UDEVADM = '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$UDEVADM_ARGV"\n[ -n "$UDEVADM_PATH" ] || exit 1\necho "$UDEVADM_PATH"\n'
 
 
-@unittest.skipIf(os.geteuid() == 0, 'the fake-tree seams are ignored under root')
-class Verbs(Tree):
-    """authorized, pci-rebind, pci-bind, root-cycle and resolve against the fake tree, with
-    uhubctl and udevadm stubs on PATH: argument checks, the exact calls, and the success
-    criterion (root-cycle succeeds only when the target directory's inode changed)."""
+class VerbTree(Tree):
+    """The fake tree with uhubctl, udevadm and sleep stubs on PATH."""
 
     def setUp(self):
         super().setUp()
@@ -329,8 +328,8 @@ class Verbs(Tree):
             for f in ('bind', 'unbind'):
                 (pci / 'drivers' / drv / f).write_text('')
 
-    def verb(self, *args, ok=True, **env):
-        return self.run_script(*args, ok=ok, env={**self.stub_env, **env})
+    def verb(self, *args, ok=True, code=None, **env):
+        return self.run_script(*args, ok=ok, env={**self.stub_env, **env}, code=code)
 
     def fifo(self, path):
         """Replace the attribute with a FIFO held open here, so every write to it is kept in order."""
@@ -345,6 +344,13 @@ class Verbs(Tree):
             return os.read(fd, 4096).decode()
         except BlockingIOError:
             return ''
+
+
+@unittest.skipIf(os.geteuid() == 0, 'the fake-tree seams are ignored under root')
+class Verbs(VerbTree):
+    """authorized, pci-rebind, pci-bind, root-cycle and resolve against the fake tree, with
+    uhubctl and udevadm stubs on PATH: argument checks, the exact calls, and the success
+    criterion (root-cycle succeeds only when the target directory's inode changed)."""
 
     def test_authorized_writes_zero_then_one(self):
         auth = self.fifo(self.dev / '13-1.6' / 'authorized')
@@ -405,7 +411,7 @@ class Verbs(Tree):
                       self.verb('pci-bind', '0000:06:00.0', ok=False))
 
     def test_root_cycle_refuses_a_serial_mismatch_before_touching_uhubctl(self):
-        out = self.verb('root-cycle', '13-1.6', 'OTHER-SN', ok=False)
+        out = self.verb('root-cycle', '13-1.6', 'OTHER-SN', code=3)
         self.assertIn("has serial 'PROBE-SN', expected 'OTHER-SN'", out)
         self.assertFalse(self.argv.exists())
 
@@ -416,15 +422,17 @@ class Verbs(Tree):
         self.assertIn('target 13-1.6 is 2e8a:000c serial=PROBE-SN', out)
         out = self.verb('root-cycle', '13-1.6', UHUBCTL_MODE='reenumerate')  # a new directory: a new inode
         self.assertIn('root-cycled 13 port 1: 13-1.6 re-enumerated (devnum 7', out)
-        self.assertIn('uhubctl failed to cycle bus 13 port 1', self.verb('root-cycle', '13-1.6', UHUBCTL_MODE='fail', ok=False))
-        self.assertIn('did not re-enumerate', self.verb('root-cycle', '13-1.6', UHUBCTL_MODE='vanish', ok=False))
+        self.assertIn('uhubctl failed to cycle bus 13 port 1', self.verb('root-cycle', '13-1.6', UHUBCTL_MODE='fail', code=1))
+        self.assertIn('did not re-enumerate', self.verb('root-cycle', '13-1.6', UHUBCTL_MODE='vanish', code=1))
 
     def test_root_cycle_without_a_serial_prints_the_identity_and_a_missing_serial_is_not_a_timeout(self):
         (self.dev / '13-1.6' / 'serial').unlink()
-        out = self.verb('root-cycle', '13-1.6', 'PROBE-SN', ok=False)
+        out = self.verb('root-cycle', '13-1.6', 'PROBE-SN', code=3)
         self.assertIn("has serial '', expected 'PROBE-SN'", out)       # absent reads as '', never as '?'
         self.assertFalse(self.argv.exists())
-        self.assertIn('no such usb device: 13-9', self.verb('root-cycle', '13-9', ok=False))
+        self.assertIn('no such usb device: 13-9', self.verb('root-cycle', '13-9', code=3))
+        self.assertIn('bad usb path', self.verb('root-cycle', '../x', code=3))
+        self.assertFalse(self.argv.exists())
 
     def test_resolve_walks_up_to_the_usb_device(self):
         for a in ('busnum', 'devnum', 'authorized'):
@@ -467,6 +475,147 @@ class Verbs(Tree):
         out = self.run_script('shield-status', ok=False, env={'USB_RECOVER_STATE': str(parent / 'state')})
         self.assertIn('cannot inspect', out)
         self.assertNotIn('no shields', out)
+
+
+UHUBCTL_CALLED = '#!/bin/sh\necho "$@" >> "$UHUBCTL_CALLS"\n'   # hub-cycle must never reach it
+# the poll's sleep re-enumerates the target once the port came back on (disable reads 0);
+# OFF_HANG stretches the off delay (`sleep 2`) so a test can interrupt it
+REENUM_SLEEP = f'''#!/bin/sh
+[ -n "$OFF_HANG" ] && [ "$1" = 2 ] && exec {shutil.which("sleep")} 30
+if [ -n "$REENUM" ] && [ "$(wc -l < "$WRITES" 2>/dev/null)" = 2 ] && [ ! -e "$REENUM.done" ]; then
+  old=$(readlink "$USB_RECOVER_SYSFS/bus/usb/devices/$TARGET"); mv "$old" "$old.gone" && cp -r "$old.gone" "$old"
+  touch "$REENUM.done"
+fi
+exec {shutil.which("sleep")} 0.05
+'''
+# `sh -c WRITE sh FILE VALUE`: hangs the write of $HANG_VALUE, and logs every write
+SH = f'''#!/bin/sh
+[ "$1" = -c ] && [ -n "$WRITES" ] && echo "$5" >> "$WRITES"
+[ "$1" = -c ] && [ -n "$HANG_VALUE" ] && [ "$5" = "$HANG_VALUE" ] && exec {shutil.which("sleep")} 1000
+exec {shutil.which("sh")} "$@"
+'''
+
+
+@unittest.skipIf(os.geteuid() == 0, 'the fake-tree seams are ignored under root')
+class HubCycle(VerbTree):
+    """hub-cycle writes the hub port's `disable` 1 then 0 for a leaf, never calls uhubctl,
+    refuses everything else before any write (exit 3), restores power after a failed or
+    interrupted cycle, and succeeds only when the target re-enumerated."""
+
+    def setUp(self):
+        super().setUp()
+        (self.dev / '13-1' / 'bDeviceClass').write_text('09\n')
+        (self.targets / '13-1.6.gen1' / 'bDeviceClass').write_text('00\n')
+        port = self.dev / '13-1' / '13-1:1.0' / '13-1-port6'
+        port.mkdir(parents=True)
+        self.disable = port / 'disable'
+        self.disable.write_text('0\n')
+        self.write_log = Path(self.td.name) / 'writes'
+        self.uhubctl_calls = Path(self.td.name) / 'uhubctl-calls'
+        for name, text in (('uhubctl', UHUBCTL_CALLED), ('sleep', REENUM_SLEEP), ('sh', SH)):
+            (self.stubs / name).write_text(text)
+            (self.stubs / name).chmod(0o755)
+        self.stub_env.update(UHUBCTL_CALLS=str(self.uhubctl_calls), DISABLE=str(self.disable),
+                             WRITES=str(self.write_log), USB_RECOVER_PORT_WRITE_TIMEOUT='1')
+
+    def cycle(self, *args, ok=True, code=None, **env):
+        e = {**os.environ, 'USB_RECOVER_SYSFS': str(self.sys), 'USB_RECOVER_STATE': str(self.state),
+             **self.stub_env, **env}
+        r = subprocess.run(['bash', str(SCRIPT), 'hub-cycle', *args], env=e, capture_output=True, text=True)
+        if code is not None:
+            self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+        elif ok:
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        return r.stdout + r.stderr
+
+    def written(self):
+        return self.write_log.read_text().split() if self.write_log.exists() else []
+
+    def test_a_leaf_is_cycled_off_then_on_and_must_re_enumerate(self):
+        out = self.cycle('13-1.6', 'PROBE-SN', REENUM=str(Path(self.td.name) / 'reenum'))
+        self.assertIn('hub-cycled 13-1 port 6: 13-1.6 re-enumerated', out)
+        self.assertEqual(self.written(), ['1', '0'])
+        self.assertEqual(self.disable.read_text().strip(), '0')
+        out = self.cycle('13-1.6', code=1)                       # no re-enumeration: a failure
+        self.assertIn('did not re-enumerate after cycling 13-1 port 6', out)
+        self.assertFalse(self.uhubctl_calls.exists())
+
+    def test_everything_else_is_refused_before_any_write(self):
+        cases = [(('13-1',), 'on a root port'),
+                 (('13-1.6', 'OTHER-SN'), "expected 'OTHER-SN'"),
+                 (('13-1.9',), 'no such usb device')]
+        serial = self.targets / '13-1.6.gen1' / 'serial'
+        serial.unlink()
+        self.assertIn('has no readable serial', self.cycle('13-1.6', code=3))
+        serial.write_text('PROBE-SN\n')
+        (self.targets / '13-1.6.gen1' / 'bDeviceClass').unlink()
+        self.assertIn("cannot read 13-1.6's class", self.cycle('13-1.6', code=3))
+        (self.targets / '13-1.6.gen1' / 'bDeviceClass').write_text('00\n')
+        for args, says in cases:
+            with self.subTest(says=says):
+                self.assertIn(says, self.cycle(*args, code=3))
+                self.assertEqual(self.written(), [])
+        (self.targets / '13-1.6.gen1' / 'bDeviceClass').write_text('09\n')
+        self.assertIn('is a hub; only a leaf', self.cycle('13-1.6', code=3))
+        (self.targets / '13-1.6.gen1' / 'bDeviceClass').write_text('00\n')
+        (self.dev / '13-1' / 'bDeviceClass').write_text('00\n')
+        self.assertIn('13-1 is not a hub', self.cycle('13-1.6', code=3))
+        (self.dev / '13-1' / 'bDeviceClass').write_text('09\n')
+        self.disable.unlink()
+        self.assertIn('no port control file', self.cycle('13-1.6', code=3))
+        self.assertEqual(self.written(), [])
+        self.assertFalse(self.uhubctl_calls.exists())
+
+    def test_a_wedged_leaf_is_left_to_root_cycle(self):
+        serial = self.targets / '13-1.6.gen1' / 'serial'
+        serial.unlink()
+        os.mkfifo(serial)                                         # a read that never answers
+        self.assertIn('did not answer (wedged)', self.cycle('13-1.6', code=3))
+        self.assertEqual(self.written(), [])
+        self.assertFalse(self.uhubctl_calls.exists())
+
+    def test_a_hung_off_write_still_powers_the_port_back_on(self):
+        out = self.cycle('13-1.6', code=1, HANG_VALUE='1')
+        self.assertIn('failed (off 1, on 0); power-on restored', out)
+        self.assertEqual(self.written(), ['1', '0'])
+
+    def test_a_failed_on_write_is_reported_not_restored(self):
+        out = self.cycle('13-1.6', code=1, HANG_VALUE='0')
+        self.assertIn('power-on NOT restored', out)
+
+    def test_a_group_signal_during_the_off_delay_still_powers_the_port_back_on(self):
+        """hil_reserve forwards SIGTERM to the command's process group, sleep included."""
+        e = {**os.environ, 'USB_RECOVER_SYSFS': str(self.sys), 'USB_RECOVER_STATE': str(self.state),
+             **self.stub_env, 'OFF_HANG': '1'}
+        p = subprocess.Popen(['bash', str(SCRIPT), 'hub-cycle', '13-1.6'], env=e, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        for _ in range(500):
+            if self.written() == ['1']:
+                break
+            time.sleep(0.01)
+        time.sleep(0.2)                                           # into the off delay
+        os.killpg(p.pid, signal.SIGTERM)
+        out, _ = p.communicate(timeout=10)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn('interrupted); power-on restored', out)
+        self.assertEqual(self.written(), ['1', '0'])
+        self.assertEqual(self.disable.read_text().strip(), '0')
+
+    def test_an_interrupted_cycle_powers_the_port_back_on_and_fails(self):
+        e = {**os.environ, 'USB_RECOVER_SYSFS': str(self.sys), 'USB_RECOVER_STATE': str(self.state),
+             **self.stub_env, 'HANG_VALUE': '1'}
+        p = subprocess.Popen(['bash', str(SCRIPT), 'hub-cycle', '13-1.6'], env=e, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+        for _ in range(200):
+            if self.written():
+                break
+            time.sleep(0.01)
+        p.send_signal(signal.SIGTERM)
+        out, _ = p.communicate(timeout=10)
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn('interrupted); power-on restored', out)
+        self.assertEqual(self.written(), ['1', '0'])
+
 
 if __name__ == '__main__':
     unittest.main()

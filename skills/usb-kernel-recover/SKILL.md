@@ -161,6 +161,22 @@ say this host cuts power, treat it as a forced re-enumeration, never a power cyc
 device whose firmware is wedged can ride it out. Success is the sysfs inode changing,
 not uhubctl's exit code.
 
+**Not a rung — a healthy leaf's port power-off/on: `hub-cycle`.** For a device that
+still answers, `hil_reserve.py run hub-cycle <busport>` holds every roster board, checks
+coverage under the parent hub, and has this script write the hub port's `disable` file
+1, then 0 after 2 s: a targeted kernel request to power that port off and on, under the
+hub's lock. Whether VBUS physically drops is the hub's: a ganged hub cuts the gang only
+when this was the last port in it needing power, and restoring one port powers the gang
+(USB 2.0 §11.11); a hub without switches drops the port only logically; a USB 3 hub's
+companion port may keep VBUS up (USB 3.2 Table 10-2). Success therefore proves
+re-enumeration, not a power cycle or a firmware restart; physical power guarantees
+belong to the contract's Limits. Because the write takes the hub's lock, the script
+refuses a target whose serial read does not answer (the wedge signature): a wedged
+device belongs to the rungs above. It also refuses a hub and a root port, all before
+any write (exit 3, as `root-cycle` does for its guards before uhubctl runs; `hil_reserve`
+then releases if the subtree is unchanged); any failure from the first write on is a
+blocker.
+
 **Rung 3 — terminal case: a driver ioctl that OWNS the lock.** No software cure:
 the task is uninterruptible and SIGKILL is queued, not delivered. Reboot with
 **sysrq**, never `reboot(2)` — a graceful reboot runs `device_shutdown()`, which

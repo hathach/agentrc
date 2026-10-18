@@ -76,11 +76,12 @@ nothing in it through a link.
   board on the host first, across every project's roster there; a contract's
   Hosts/rosters names the other projects' rosters on a host it shares. A
   partial hold is worse than none: it reads as protection. For a root-port
-  cycle that hold is this skill's `scripts/hil_reserve.py run`, given every
-  roster on the host: it refuses when a device under the root port is not
-  explained by those rosters, holds every board of every roster in one
-  process around the one command it builds (`usb-kernel-recover`'s
-  `root-cycle`), and keeps the locks as a cleanup holder until the contract's
+  or hub-port cycle that hold is this skill's `scripts/hil_reserve.py run`,
+  given every roster on the host: it refuses when a device under the root
+  port, or under the hub for a hub-port cycle, is not explained by those
+  rosters, holds every board of every roster in one process around the one
+  command it builds (`usb-kernel-recover`'s `root-cycle` or `hub-cycle`),
+  and keeps the locks as a cleanup holder until the contract's
   recovery procedure releases them by token when anything but a clean,
   fully re-enumerated outcome follows. A controller operation has no
   inspected reservation yet; a contract refuses it. A runner that

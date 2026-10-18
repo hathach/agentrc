@@ -9,7 +9,14 @@
 #                          # it; [serial] is verified against the device and refused on mismatch,
 #                          # skipping the leaf hubs (which fake ganged switching and do not
 #                          # actually cut power). Bounces every sibling under that root port.
-#                          # The D-state escape: no device lock, so it cannot convoy.
+#                          # Its power-off takes no device lock, but uhubctl's status pass
+#                          # opens the port's children first (agentrc#149).
+#                          # Exit 3: refused before uhubctl ran.
+#   hub-cycle <busport> [serial]  # e.g. 5-3.2 -> ask the kernel to power the hub port feeding that
+#                          # LEAF off and on (its `disable` file: 1, 2 s, 0) under the hub's lock.
+#                          # Whether VBUS drops is the hub's: success proves re-enumeration, not a
+#                          # power cycle. Its serial must answer: a wedged leaf would block the
+#                          # write. Exit 3: refused before anything was written.
 #   pci-rebind <pciaddr>   # e.g. 0000:05:00.0 -> unbind+bind the whole xHCI
 #                          # controller. For a DEAD CONTROLLER, not a wedged
 #                          # device: it renumbers every bus it owns.
@@ -39,6 +46,7 @@ if [ "$(id -u)" -ne 0 ]; then
   SYSFS=${USB_RECOVER_SYSFS:-/sys}
   SHIELD_STATE=${USB_RECOVER_STATE:-/run/tinyusb-hil/shield}
   FAIL_CHMOD=${USB_RECOVER_TEST_FAIL_CHMOD:-}
+  PORT_WRITE_TIMEOUT=${USB_RECOVER_PORT_WRITE_TIMEOUT:-}
 fi
 
 USBPATH_RE='^[0-9]+-[0-9]+(\.[0-9]+)*$'
@@ -46,6 +54,7 @@ PCI_RE='^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9]$'
 DRIVER_RE='^[A-Za-z0-9_-]+$'
 
 die() { echo "usb_recover: $*" >&2; exit 1; }
+refuse() { echo "usb_recover: $*" >&2; exit 3; }   # nothing was written
 
 lock_read() {
   # Read an attribute served under the device lock (serial, product) with a 2s bound.
@@ -105,6 +114,39 @@ require_usb_controller() {
 }
 
 sysfs_gen() { stat -c %i "$SYSFS/bus/usb/devices/$1/" 2>/dev/null || echo none; }
+
+await_reenum() {  # await_reenum TARGET GEN: print its new generation; non-zero after ten 1 s looks without one
+  local now
+  for _ in $(seq 1 10); do
+    sleep 1
+    now=$(sysfs_gen "$1")
+    if [ "$now" != none ] && [ "$now" != "$2" ]; then echo "$now"; return 0; fi
+  done
+  return 1
+}
+
+PORT_WRITE_TIMEOUT=${PORT_WRITE_TIMEOUT:-15}   # s for one `disable` write and its read-back
+PORT_OFF_SECS=2
+port_write() {
+  # port_write FILE VALUE: write it and read it back in a child bounded by PORT_WRITE_TIMEOUT:
+  # both take the hub's lock. 0 done, 1 failed, 2 the child outlived SIGKILL (D state) and was
+  # left running -- it may still write, so no other write may follow it. The read-back is the
+  # shell's own `read`, so the timeout's SIGKILL reaches every process doing the work.
+  local child n=0
+  sh -c 'echo "$2" > "$1" && read -r v < "$1" && [ "$v" = "$2" ]' sh "$1" "$2" &
+  child=$!
+  while kill -0 "$child" 2>/dev/null; do
+    if [ $n -ge $((PORT_WRITE_TIMEOUT * 5)) ]; then
+      kill -9 "$child" 2>/dev/null
+      sleep 1
+      kill -0 "$child" 2>/dev/null && { survivor=$child; return 2; }
+      wait "$child" 2>/dev/null
+      return 1
+    fi
+    sleep 0.2; n=$((n + 1))
+  done
+  wait "$child" || return 1
+}
 usage() { sed -n '/^# Usage/,/^set -euo pipefail/p' "$0" | grep -E '^#   (sudo|[a-z])' >&2; exit 2; }
 
 # ---- shield -----------------------------------------------------------------------------
@@ -428,15 +470,15 @@ case "$action" in
     # writes the wedged device's sysfs or takes its lock, so it cannot join a D-state convoy.
     # uhubctl exits 0 even when it does nothing ("No compatible devices detected" still returns
     # 0), so its status proves nothing -- the sysfs_gen check below is the only real verdict.
-    [[ "$target" =~ $USBPATH_RE ]] || die "bad usb path: $target"
+    [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
     UHUBCTL=$(command -v uhubctl || echo /sbin/uhubctl)
-    [ -x "$UHUBCTL" ] || die "uhubctl not installed"
+    [ -x "$UHUBCTL" ] || refuse "uhubctl not installed"
     # Existence alone only proves *something* occupies that path -- bus numbers renumber every
     # boot, so a stale busport can name a different device entirely and we would cut power to its
     # whole subtree (every fixture under that root port). Callers that know what they expect pass the
     # serial as a third argument and we refuse on mismatch; otherwise print the identity so a
     # wrong target is at least visible.
-    [ -e "$SYSFS/bus/usb/devices/$target" ] || die "no such usb device: $target"
+    [ -e "$SYSFS/bus/usb/devices/$target" ] || refuse "no such usb device: $target"
     idf="$SYSFS/bus/usb/devices/$target"
     serial=$(lock_read "$idf/serial")
     expect=${3:-}
@@ -448,7 +490,7 @@ case "$action" in
       echo "root-cycle: WARNING $target's serial did not answer (it is wedged), so '$expect'" \
            "could NOT be confirmed; proceeding, but verify the busport if siblings drop" >&2
     elif [ -n "$expect" ] && [ "$expect" != "$serial" ]; then
-      die "root-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"
+      refuse "root-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"
     fi
     # idVendor/idProduct are usb_descriptor_attr_le16: served WITHOUT the device lock, so
     # a plain cat is safe on a wedged device. serial/product are usb_string_attr and are not.
@@ -467,15 +509,66 @@ case "$action" in
     # power-off control transfer straight to the root hub with no child-disconnect in front.
     "$UHUBCTL" -S -l "$bus" -p "$rootport" -a cycle -d 5 \
       || die "uhubctl failed to cycle bus $bus port $rootport"
-    for _ in $(seq 1 10); do
-      sleep 1
-      now=$(sysfs_gen "$target")
-      if [ "$now" != none ] && [ "$now" != "$gen" ]; then
-        echo "root-cycled $bus port $rootport: $target re-enumerated"\
-             "(devnum $(cat "$SYSFS/bus/usb/devices/$target/devnum" 2>/dev/null || echo ?), gen $gen -> $now)"; exit 0
-      fi
-    done
+    if now=$(await_reenum "$target" "$gen"); then
+      echo "root-cycled $bus port $rootport: $target re-enumerated"\
+           "(devnum $(cat "$SYSFS/bus/usb/devices/$target/devnum" 2>/dev/null || echo ?), gen $gen -> $now)"; exit 0
+    fi
     die "root-cycle: $target did not re-enumerate after cycling bus $bus port $rootport (sysfs generation still $gen: no disconnect happened)"
+    ;;
+  hub-cycle)
+    # A targeted kernel port power-off/on request (`disable` 1, 2 s, 0) under the hub's lock.
+    # Whether VBUS physically drops is the hub's: a ganged hub cuts the gang only when this was
+    # the last port in it needing power, and restoring one port powers the gang (USB 2.0 11.11);
+    # a hub without switches drops the port only logically; a USB 3 hub's companion port may keep
+    # VBUS up (USB 3.2 Table 10-2). So success proves re-enumeration, not a power cycle or a
+    # firmware restart; physical power guarantees belong to the rig contract's Limits.
+    # `disable` rather than a raw hub request: disable_store runs under the hub's lock, after any
+    # enumeration in progress, where a raw hub request that met an enumeration killed an AMD
+    # 500-series xHCI (tinyuf2 bench history, 2026-10-14); that choice is made against that
+    # incident, not verified under it. The price is root-cycle's hazard: disable_store
+    # disconnects the child under the hub's lock first, so a wedged target would block it --
+    # hence the serial that must answer, and a wedged leaf is left to root-cycle, whose libusb
+    # request has no child-disconnect in front.
+    [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
+    [[ "$target" == *.* ]] || refuse "hub-cycle: $target is on a root port; that is root-cycle's"
+    hub=${target%.*}; port=${target##*.}
+    idf="$SYSFS/bus/usb/devices/$target"; hubd="$SYSFS/bus/usb/devices/$hub"
+    [ -e "$idf" ] || refuse "no such usb device: $target"
+    # bDeviceClass is a lock-free descriptor attribute, safe on a wedged device
+    cls=$(cat "$hubd/bDeviceClass" 2>/dev/null) || refuse "hub-cycle: cannot read $hub's class"
+    [ "$cls" = 09 ] || refuse "hub-cycle: $hub is not a hub"
+    cls=$(cat "$idf/bDeviceClass" 2>/dev/null) || refuse "hub-cycle: cannot read $target's class"
+    [ "$cls" != 09 ] || refuse "hub-cycle: $target is a hub; only a leaf is cycled"
+    disable="$hubd/$hub:1.0/$hub-port$port/disable"
+    [ -f "$disable" ] || refuse "hub-cycle: no port control file $disable"
+    serial=$(lock_read "$idf/serial")
+    [ "$serial" != '?' ] || refuse "hub-cycle: $target's serial did not answer (wedged): the port write would block on its lock; use root-cycle"
+    [ -n "$serial" ] || refuse "hub-cycle: $target has no readable serial to prove it answers"
+    expect=${3:-}
+    [ -z "$expect" ] || [ "$expect" = "$serial" ] || refuse "hub-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"
+    gen=$(sysfs_gen "$target")
+    echo "hub-cycle: target $target serial=$serial; writing 1, then 0 after ${PORT_OFF_SECS} s, to $disable"
+    # from the first off write on, any failure or interruption still tries to power the port
+    # back on, unless a writer survived (it could still write after the restore)
+    interrupted='' survivor='' off=0 on=0
+    trap 'interrupted=yes' INT TERM HUP
+    port_write "$disable" 1 || off=$?
+    # `|| :`: a signal to the process group kills the sleep too, and set -e must not skip the restore
+    if [ $off -eq 0 ] && [ -z "$interrupted" ]; then sleep "$PORT_OFF_SECS" || :; fi
+    if [ -n "$survivor" ]; then
+      restored="not attempted: writer pid $survivor survived"
+    else
+      port_write "$disable" 0 || on=$?
+      [ $on -eq 0 ] && restored=restored || restored="NOT restored (write ${on})"
+    fi
+    trap - INT TERM HUP
+    if [ $off -ne 0 ] || [ $on -ne 0 ] || [ -n "$interrupted" ]; then
+      die "hub-cycle: cycle of $hub port $port failed (off ${off}, on ${on}${interrupted:+, interrupted}); power-on ${restored}"
+    fi
+    if now=$(await_reenum "$target" "$gen"); then
+      echo "hub-cycled $hub port $port: $target re-enumerated (gen $gen -> $now)"; exit 0
+    fi
+    die "hub-cycle: $target did not re-enumerate after cycling $hub port $port (sysfs generation still $gen)"
     ;;
   *)
     usage
