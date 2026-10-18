@@ -39,10 +39,12 @@ locks, and only restoration gaps may clear by waiting: a non-zero exit, a surviv
 signal stays a blocker. Any other outcome
 turns the records into `role: cleanup-holder` records and keeps this process alive holding
 the locks, as the shared rule requires; the blocker line prints the reservation token, and
-`release --token` is the contract recovery procedure's release step once restoration is
-established: it verifies the token, the holder's pid and start time, the role and the lock
-set on every record, then signals through a pidfd. Exit 0 released, 1 blocker (run) or
-refused (release), 2 usage.
+`release --token` (hil_lock.release_token, the same as `hil_lock.py release --token`) is the
+contract recovery procedure's release step once restoration is established: it verifies the
+token, the holder's pid and start time, the role and the lock set on every record, then
+signals through a pidfd. The records are marked protected, so a reservation killed outright
+leaves recovery blockers that only a recovery takeover (`hil_lock.py hold --take-over`)
+clears. Exit 0 released, 1 blocker (run) or refused (release), 2 usage.
 
 Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservation and
 exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP
@@ -331,7 +333,7 @@ class Reservation:
     def acquire(self):
         try:
             for lock in self.locks:
-                self.handles.append(hil_lock.take_board_lock(lock, self.reason, **self.fields()))
+                self.handles.append(hil_lock.take_board_lock(lock, self.reason, protected=True, **self.fields()))
         except (hil_lock.BoardLocked, hil_lock.LockUnavailable) as e:
             self.release()
             raise Refused(f'{lock}: {e}')
@@ -474,44 +476,12 @@ def cmd_run(args):
 
 
 def cmd_release(args):
-    found = {}
-    for lock in hil_lock.lock_names():
-        rec = hil_lock.read_record(lock)
-        if isinstance(rec, dict) and rec.get('token') == args.token:
-            found[lock] = rec
-    if not found:
-        raise Refused(f'no holder record carries token {args.token}')
-    first = next(iter(found.values()))
-    pid, start, lockset = first.get('pid'), first.get('start'), sorted(first.get('locks') or [])
-    for lock, rec in found.items():
-        if rec.get('pid') != pid or rec.get('start') != start or sorted(rec.get('locks') or []) != lockset:
-            raise Refused(f'token {args.token}: the record on {lock} disagrees with the others')
-        if not hil_lock.is_cleanup_holder(rec):
-            raise Refused(f'holder pid {pid} is not a cleanup holder on {lock}: still mutating or already clean')
-    if not isinstance(pid, int) or lockset != sorted(found):
-        raise Refused(f'token {args.token}: record lock set {lockset} != files carrying it {sorted(found)}')
-    if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
-        raise Refused('identity-bound signalling (pidfd) is unavailable on this platform')
     try:
-        pidfd = os.pidfd_open(pid)
-    except OSError as e:
-        raise Refused(f'holder pid {pid} cannot be opened: {e}')
-    try:
-        live = proc_start(pid)
-        if live is None or live != start:
-            raise Refused(f'pid {pid} is not the recorded holder (start {live} != {start})')
-        try:
-            signal.pidfd_send_signal(pidfd, signal.SIGUSR1)
-        except OSError as e:
-            raise Refused(f'holder pid {pid} could not be signalled: {e}')
-    finally:
-        os.close(pidfd)
-    for _ in range(50):
-        if all(hil_lock.read_record(lock) is None for lock in found):
-            print(f'hil_reserve: released {len(found)} lock(s) of holder {pid} (token {args.token})')
-            return 0
-        time.sleep(0.1)
-    raise Refused(f'holder {pid} signalled but its records remain')
+        pid, boards = hil_lock.release_token(args.token)
+    except hil_lock.ReleaseRefused as e:
+        raise Refused(str(e))
+    print(f'hil_reserve: released {len(boards)} lock(s) of holder {pid} (token {args.token})')
+    return 0
 
 
 def main(argv=None):

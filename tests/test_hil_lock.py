@@ -380,11 +380,11 @@ class DetachedHolder(LockDir):
         other = BOARD + '-2'
         real, calls = hil_lock.write_record, []
 
-        def write_record(fh, reason):
+        def write_record(fh, reason, **extra):
             calls.append(fh)
             if len(calls) == 2:                 # the first record is written, the second fails
                 raise OSError('disk full')
-            real(fh, reason)
+            real(fh, reason, **extra)
         self.patch(hil_lock, 'write_record', write_record)     # inherited by the forked holder
         with quiet() as (_, err):
             self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 1)
@@ -412,11 +412,419 @@ class DetachedHolder(LockDir):
             pass
 
 
+class SafeFiles(LockDir):
+    """The shared dir is writable by others: nothing in it is opened through a link, a FIFO or
+    a second name, and nothing is repaired; the target of a planted link stays untouched."""
+
+    def plant(self, kind):
+        target = Path(self.dir, 'victim')
+        target.write_text('precious\n')
+        path = hil_lock.lock_path(BOARD)
+        if kind == 'symlink':
+            os.symlink(target, path)
+        elif kind == 'hardlink':
+            os.link(target, path)
+        elif kind == 'fifo':
+            os.mkfifo(path)
+        else:
+            os.mkdir(path)
+        return target
+
+    def test_take_hold_and_release_refuse_an_unsafe_lock_file(self):
+        for kind in ('symlink', 'hardlink', 'fifo', 'dir'):
+            with self.subTest(kind=kind):
+                target = self.plant(kind)
+                with self.assertRaisesRegex(hil_lock.LockUnavailable, 'board lock unavailable'):
+                    self.acquire()
+                with quiet() as (_, err):
+                    self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 1)
+                    self.assertEqual(hil_lock.cmd_release([BOARD, BOARD + '-2']), 1)
+                self.assertEqual(target.read_text(), 'precious\n')
+                self.assertEqual(hil_lock.record_state(BOARD)[0], 'unreadable')
+                path = hil_lock.lock_path(BOARD)
+                os.rmdir(path) if kind == 'dir' else os.unlink(path)
+                target.unlink()
+
+    def test_a_symlinked_lock_dir_or_an_invalid_name_is_refused(self):
+        real = Path(self.dir, 'real')
+        real.mkdir()
+        link = Path(self.dir, 'link')
+        link.symlink_to(real)
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', str(link))
+        with self.assertRaises(hil_lock.LockUnavailable):
+            self.acquire()
+        self.assertEqual(os.listdir(real), [])
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', str(real))
+        for bad in ('../escape', 'a/b', '', '.hidden'):
+            with self.subTest(name=bad), self.assertRaisesRegex(hil_lock.LockUnavailable, 'invalid board lock name'):
+                hil_lock.take_board_lock(bad, 'selftest')
+
+    def test_a_dir_another_user_owns_needs_the_sticky_bit(self):
+        self.patch(hil_lock.os, 'geteuid', lambda: os.getuid() + 1)    # the dir is now "someone else's"
+        os.chmod(self.dir, 0o777)
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'not sticky'):
+            self.acquire()
+        os.chmod(self.dir, 0o1777)
+        self.assertIsNotNone(self.acquire())
+
+    def test_modes_ignore_the_umask_and_leave_widening_to_the_host(self):
+        sub = os.path.join(self.dir, 'locks')
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', sub)
+        old = os.umask(0o077)
+        self.addCleanup(os.umask, old)
+        self.acquire()
+        self.assertEqual(stat.S_IMODE(os.stat(sub).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(hil_lock.lock_path(BOARD)).st_mode), 0o666)
+
+    def test_a_create_refused_by_the_dir_names_the_host_step(self):
+        os.chmod(self.dir, 0o555)
+        self.addCleanup(os.chmod, self.dir, 0o755)
+        if os.access(self.dir, os.W_OK):
+            self.skipTest('running as root: the dir is writable anyway')
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'install -d -m 1777'):
+            self.acquire()
+
+
+class Records(LockDir):
+    def test_absent_empty_unreadable_and_non_object_records_are_told_apart(self):
+        self.assertEqual(hil_lock.record_state(BOARD), ('absent', None))
+        path = Path(hil_lock.lock_path(BOARD))
+        for data, state in (('', 'empty'), ('{bad', 'unreadable'), ('["x"]', 'unreadable'),
+                            ('7', 'unreadable'), ('{"pid": 1}', 'record')):
+            path.write_text(data)
+            self.assertEqual(hil_lock.record_state(BOARD)[0], state, data)
+
+    def test_release_reports_a_non_object_record_and_goes_on(self):
+        later = BOARD + '-2'
+        Path(hil_lock.lock_path(later)).write_text(json.dumps({'pid': 999999999, 'reason': 'gone'}))
+        self.holder(b'["x"]')
+        with quiet() as (_, err):
+            rc = hil_lock.cmd_release([BOARD, later])
+        self.assertEqual(rc, 1)
+        self.assertIn('record is unreadable', err.getvalue())
+        self.assertIsNone(hil_lock.read_record(later), 'the board after the bad record was not processed')
+
+
+class SignalsOnlyProvenHolds(LockDir):
+    """release SIGTERMs only this CLI's own hold holder, proven by its start time and by an
+    open file description of its that holds the flock; everything else is named, never signalled."""
+
+    def setUp(self):
+        super().setUp()
+        self.signals = []
+        real = signal.pidfd_send_signal
+        self.patch(hil_lock.signal, 'pidfd_send_signal', lambda fd, sig: (self.signals.append(sig), real(fd, sig)))
+
+    def bystander(self):
+        """A live process that has the lock file open without holding its flock."""
+        p = subprocess.Popen([sys.executable, '-c', 'import sys; f = open(sys.argv[1]); print("ready", flush=True); sys.stdin.read()',
+                              hil_lock.lock_path(BOARD)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(p.wait)
+        self.addCleanup(p.stdin.close)
+        self.addCleanup(p.stdout.close)
+        self.assertEqual(p.stdout.readline().strip(), 'ready')
+        return p
+
+    def test_a_record_naming_a_bystander_is_never_signalled(self):
+        Path(hil_lock.lock_path(BOARD)).touch()
+        by = self.bystander()
+        rec = {'pid': by.pid, 'reason': 'selftest', 'holder': hil_lock.HOLD_KIND, 'start': hil_lock.proc_start(by.pid)}
+        self.holder(json.dumps(rec).encode())
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+        self.assertIn('does not hold the flock', err.getvalue())
+        self.assertEqual(self.signals, [])
+        self.assertIsNone(by.poll())
+
+    def test_a_reused_pid_or_a_foreign_taker_is_never_signalled(self):
+        for fields, says in (({'holder': hil_lock.HOLD_KIND, 'start': '1'}, 'not the process that wrote'),
+                             ({}, 'not a hil_lock.py hold')):
+            with self.subTest(says=says):
+                p = self.holder(self.record(reason='selftest', **fields))
+                with quiet() as (_, err):
+                    self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+                self.assertIn(says, err.getvalue())
+                self.assertEqual(self.signals, [])
+                p.stdin.close()
+                p.wait()
+
+    def test_a_malformed_mark_never_cancels_legacy_protection(self):
+        p = self.holder(self.record(reason='hil_test.py', protected='no', holder=hil_lock.HOLD_KIND))
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+        self.assertIn('wait for it to finish', err.getvalue())
+        self.assertIsNone(p.poll())
+
+    def test_a_proven_hold_is_signalled_through_a_pidfd_and_waited_for(self):
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
+        pid = hil_lock.read_record(BOARD)['pid']
+        self.addCleanup(DetachedHolder.kill_quietly, pid)
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
+        self.assertEqual(self.signals, [signal.SIGTERM])
+        self.assertIsNone(hil_lock.read_record(BOARD))
+
+
+class RecoveryBlockers(LockDir):
+    """A record that needs recovery survives a free flock: no project takes the board and an
+    ordinary release keeps it, until a recovery takeover ends it."""
+
+    def dead_record(self, **fields):
+        dead = subprocess.Popen([sys.executable, '-c', ''])
+        dead.wait()
+        Path(hil_lock.lock_path(BOARD)).write_text(json.dumps({'pid': dead.pid, 'reason': 'selftest', **fields}))
+
+    def test_a_dead_protected_run_or_cleanup_holder_blocks_every_taker(self):
+        for fields in ({'protected': True}, {'role': 'cleanup-holder'}):
+            with self.subTest(fields=fields):
+                self.dead_record(**fields)
+                with self.assertRaisesRegex(hil_lock.RecoveryBlocked, hil_lock.RECOVERY_BLOCKER):
+                    self.acquire()
+                with quiet() as (_, err):
+                    self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 1)
+                    self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+                self.assertIn('kept', err.getvalue())
+                self.assertEqual(hil_lock.read_record(BOARD).get('reason'), 'selftest')
+                with quiet() as (out, _):
+                    hil_lock.cmd_status()
+                self.assertIn('stale', out.getvalue())
+
+    def test_an_unmarked_legacy_runner_record_is_taken_as_before(self):
+        """tinyusb's runner admits after a killed run; a tinyuf2 record left by a helper older
+        than the mark looks the same and is taken too (documented in the hil skill)."""
+        self.dead_record(reason='hil_test.py')
+        self.assertIsNotNone(self.acquire())
+
+    def test_a_protected_taker_ends_with_release_board_lock(self):
+        fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True)
+        self.assertIs(hil_lock.read_record(BOARD)['protected'], True)
+        hil_lock.release_board_lock(fh)
+        self.assertIsNotNone(self.acquire())
+
+
+class Takeover(LockDir):
+    """A recovery takeover journals each board's predecessor before replacing its record, takes
+    the predecessor's whole lock set or nothing, and ends only by token release of a live taker."""
+
+    OTHER = BOARD + '-2'
+
+    def blocked(self, locks=None):
+        for b in locks or [BOARD]:
+            Path(hil_lock.lock_path(b)).write_text(json.dumps(
+                {'pid': 999999999, 'reason': 'selftest run', 'protected': True, 'locks': locks or [BOARD]}))
+
+    def journal(self, b):
+        return hil_lock.journal_state(b)
+
+    def test_takes_the_whole_set_journals_and_ends_by_token(self):
+        self.blocked([BOARD, self.OTHER])
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_hold([], 'selftest recovery', take_over_board=BOARD), 0)
+        token = out.getvalue().split('token ')[1].split(')')[0]
+        rec = hil_lock.read_record(self.OTHER)
+        self.addCleanup(DetachedHolder.kill_quietly, rec['pid'])
+        self.assertEqual((rec['role'], rec['token'], rec['locks']), ('cleanup-holder', token, [BOARD, self.OTHER]))
+        self.assertIn('selftest run', self.journal(self.OTHER)['predecessor'])
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)     # a cleanup holder: never signalled
+            self.assertEqual(hil_lock.cmd_hold([BOARD], 'x'), 1)
+        self.assertEqual(hil_lock.cmd_release_token(token), 0)
+        for b in (BOARD, self.OTHER):
+            self.assertIsNone(hil_lock.read_record(b))
+            self.assertIsNone(self.journal(b))
+        self.assertIsNotNone(self.acquire())
+
+    def test_a_held_member_of_the_set_modifies_nothing(self):
+        self.blocked([BOARD, self.OTHER])
+        before = Path(hil_lock.lock_path(BOARD)).read_bytes()
+        with open(hil_lock.lock_path(self.OTHER), 'r+') as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(hil_lock.BoardLocked):
+                hil_lock.take_over(BOARD, 'selftest recovery')
+        self.assertEqual(hil_lock.journal_names(), [])
+        self.assertEqual(Path(hil_lock.lock_path(BOARD)).read_bytes(), before)
+
+    def test_a_failed_journal_or_record_write_leaves_every_board_blocked(self):
+        for name in ('_write_journal', 'write_record'):
+            with self.subTest(fails=name):
+                self.blocked([BOARD, self.OTHER])
+                real, calls = getattr(hil_lock, name), []
+
+                def fail_second(*a, real=real, calls=calls, **k):
+                    calls.append(1)
+                    if len(calls) == 2:
+                        raise OSError('disk full')
+                    return real(*a, **k)
+                with mock.patch.object(hil_lock, name, fail_second):
+                    with self.assertRaisesRegex(hil_lock.LockUnavailable, 'takeover .* failed'):
+                        hil_lock.take_over(BOARD, 'selftest recovery')
+                with self.assertRaises(hil_lock.RecoveryBlocked):
+                    self.acquire()
+                for b in (BOARD, self.OTHER):
+                    os.unlink(hil_lock.lock_path(b))
+                for b in hil_lock.journal_names():
+                    os.unlink(os.path.join(self.dir, b + hil_lock.JOURNAL))
+
+    def test_a_killed_taker_stays_blocked_until_a_second_takeover_recovers(self):
+        self.blocked()
+        pid = os.fork()
+        if pid == 0:                         # dies between its journal and a complete record
+            def die(fh, *a, **k):
+                fh.truncate(0)
+                fh.write('{"pid": ')
+                fh.flush()
+                os._exit(9)
+            hil_lock.write_record = die
+            try:
+                hil_lock.take_over(BOARD, 'selftest recovery')
+            finally:
+                os._exit(1)
+        self.assertEqual(os.waitpid(pid, 0)[1] >> 8, 9)
+        first = self.journal(BOARD)
+        self.assertEqual(first['pid'], pid)
+        self.assertEqual(hil_lock.record_state(BOARD)[0], 'unreadable')
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            self.acquire()
+        with quiet():
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+            self.assertEqual(hil_lock.cmd_release_token(first['token']), 1)
+        self.assertIsNotNone(self.journal(BOARD))
+        token, handles = hil_lock.take_over(BOARD, 'selftest recovery again')
+        self.assertEqual(self.journal(BOARD)['prior']['token'], first['token'])
+        hil_lock.end_takeover(handles)
+        self.assertEqual(hil_lock.journal_names(), [])
+        self.assertIsNotNone(self.acquire())
+
+    def test_token_release_of_a_dead_taker_is_refused(self):
+        self.blocked()
+        token, handles = hil_lock.take_over(BOARD, 'selftest recovery')
+        for fh in handles.values():
+            fh.close()                       # the taker is gone; its records name this test's pid
+        rec = hil_lock.read_record(BOARD)
+        rec['pid'] = 999999999
+        Path(hil_lock.lock_path(BOARD)).write_text(json.dumps(rec))
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'is gone; its boards need a recovery takeover'):
+            hil_lock.release_token(token)
+
+
+class TakeoverEdges(LockDir):
+    OTHER = Takeover.OTHER
+    blocked = Takeover.blocked
+
+    def test_a_lock_set_that_grows_while_it_is_taken_modifies_nothing(self):
+        self.blocked()
+        real = hil_lock.flock_nb
+
+        def grow(b):
+            fh = real(b)
+            rec = json.loads(Path(hil_lock.lock_path(BOARD)).read_text())
+            rec['locks'] = [BOARD, self.OTHER]
+            Path(hil_lock.lock_path(BOARD)).write_text(json.dumps(rec))
+            return fh
+        self.patch(hil_lock, 'flock_nb', grow)
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'lock set changed'):
+            hil_lock.take_over(BOARD, 'selftest recovery')
+        self.assertEqual(hil_lock.journal_names(), [])
+
+    def test_an_unreadable_journal_refuses_the_takeover(self):
+        self.blocked()
+        Path(self.dir, BOARD + hil_lock.JOURNAL).write_text('{"locks": [')
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'cannot be read'):
+            hil_lock.take_over(BOARD, 'selftest recovery')
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            self.acquire()
+
+    def test_token_release_proves_the_holder_holds_every_flock(self):
+        Path(hil_lock.lock_path(BOARD)).touch()
+        by = SignalsOnlyProvenHolds.bystander(self)
+        rec = {'pid': by.pid, 'start': hil_lock.proc_start(by.pid), 'token': 'tok', 'locks': [BOARD],
+               'role': 'cleanup-holder', 'reason': 'selftest'}
+        self.holder(json.dumps(rec).encode())
+        signals = []
+        self.patch(hil_lock.signal, 'pidfd_send_signal', lambda fd, sig: signals.append(sig))
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'does not hold the flocks'):
+            hil_lock.release_token('tok')
+        self.assertEqual(signals, [])
+
+
+class UnreadableRecords(LockDir):
+    def test_a_free_board_with_an_unreadable_record_is_kept_and_the_next_one_processed(self):
+        later = BOARD + '-2'
+        Path(hil_lock.lock_path(BOARD)).write_bytes(b'\xff\xfe{"pid"')
+        Path(hil_lock.lock_path(later)).write_text(json.dumps({'pid': 999999999, 'reason': 'gone'}))
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD, later]), 1)
+        self.assertIn('unreadable record', err.getvalue())
+        self.assertEqual(Path(hil_lock.lock_path(BOARD)).read_bytes(), b'\xff\xfe{"pid"')
+        self.assertIsNone(hil_lock.read_record(later))
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            self.acquire()
+        with quiet() as (out, _):
+            hil_lock.cmd_status()
+        self.assertIn(f'{BOARD}: unreadable record', out.getvalue())
+
+    def test_a_holder_that_leaves_an_unreadable_record_fails_the_release(self):
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
+        pid = hil_lock.read_record(BOARD)['pid']
+        self.addCleanup(DetachedHolder.kill_quietly, pid)
+
+        def garble(fd, sig):                       # stands in for a holder whose cleanup went wrong
+            Path(hil_lock.lock_path(BOARD)).write_bytes(b'\xff')
+        self.patch(hil_lock.signal, 'pidfd_send_signal', garble)
+        self.patch(hil_lock, 'RELEASE_WAIT', 0.1)
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+        self.assertIn('still locked', err.getvalue())
+
+    def test_a_record_left_unreadable_is_not_a_completed_release(self):
+        self.patch(hil_lock.time, 'sleep', lambda s: None)
+        Path(hil_lock.lock_path(BOARD)).write_bytes(b'\xff')
+        self.assertEqual(hil_lock._wait_cleared([BOARD], time.monotonic()), [BOARD])
+
+
+class HolderFields(LockDir):
+    def test_a_token_holder_without_its_start_or_with_a_bad_set_is_refused(self):
+        self.assertEqual(set(hil_lock.holder_fields('t', [BOARD])), {'token', 'start', 'locks'})
+        for locks in ([], [BOARD, BOARD], ['a/b']):
+            with self.subTest(locks=locks), self.assertRaises((ValueError, OSError)):
+                hil_lock.holder_fields('t', locks)
+        self.patch(hil_lock, 'proc_start', lambda pid: None)
+        with self.assertRaisesRegex(OSError, 'start time unreadable'):
+            hil_lock.holder_fields('t', [BOARD])
+
+
+class Cheap(LockDir):
+    def test_release_waits_only_after_a_signal_and_status_reads_each_record_once(self):
+        slept = []
+        self.patch(hil_lock.time, 'sleep', slept.append)
+        Path(hil_lock.lock_path(BOARD)).write_text(json.dumps({'pid': 999999999, 'reason': 'gone'}))
+        with quiet():
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
+        self.assertEqual(slept, [])
+        self.holder(self.record(reason='selftest'))
+        reads = []
+        real = hil_lock._read_file
+        self.patch(hil_lock, '_read_file', lambda b, suffix: (reads.append((b, suffix)), real(b, suffix))[1])
+        with quiet() as (out, _):
+            hil_lock.cmd_status()
+        self.assertEqual(reads.count((BOARD, '.lock')), 1)
+        self.assertIn('selftest', out.getvalue())
+
+
 class Cli(unittest.TestCase):
     def test_hold_takes_named_boards_only(self):
         r = subprocess.run([sys.executable, str(SCRIPT), 'hold', '--all', '--reason', 'x'],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 2, r.stderr)
+
+    def test_a_token_release_takes_no_boards_and_a_takeover_one_board(self):
+        for argv in (['release', '--token', 't', 'b'], ['release', '--token', 't', '--all'],
+                     ['hold', 'b', '--take-over', 'c', '--reason', 'x'], ['hold', '--reason', 'x']):
+            with self.subTest(argv=argv):
+                r = subprocess.run([sys.executable, str(SCRIPT), *argv], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stderr)
 
 
 if __name__ == '__main__':

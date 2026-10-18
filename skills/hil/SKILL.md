@@ -41,6 +41,10 @@ board, which may differ from its roster name. The helper that takes it, and its
 holder record, are the contract's Reservation: a wrapper of this skill's
 `scripts/hil_lock.py` for the project's roster and lock names, and the only
 entry point; the contract says which agentrc commit it loads, and from where.
+The helper creates the dir writable by its owner only; a host whose projects
+run as different OS users widens it once (`sudo install -d -m 1777
+/tmp/tinyusb-hil-locks`), after every project there runs a helper that opens
+nothing in it through a link.
 
 - Never stop a CI runner. Killing a holder or releasing a hold you did not take
   happens only through the contract's Recovery procedure, under a separate
@@ -51,9 +55,22 @@ entry point; the contract says which agentrc commit it loads, and from where.
 - Never pre-hold a board for a tool that locks itself: it refuses your hold as a
   conflict.
 - Report a refused hold with its holder and reason; wait only within the task's
-  lock-wait budget. A holder record marked as a cleanup holder
-  (`role: cleanup-holder`) never frees on its own: it is a recovery blocker for
-  every project, never waited on.
+  lock-wait budget. A recovery blocker never frees on its own and is never
+  waited on, for every project: a cleanup holder (`role: cleanup-holder`), live
+  or dead; a record marked `protected: true` left on a free flock, its run
+  having died before its cleanup; or a takeover journal (`<lock>.takeover`).
+  The contract's Recovery ends it, under a recovery dispatch naming the board:
+  `hil_lock.py hold --take-over <lock>` holds the blocker's whole lock set as a
+  cleanup holder, journalling each record it replaces, and once the recovery
+  succeeded `hil_lock.py release --token <token>` ends that live holder. A
+  dead holder is never released by token; it is taken over.
+- A taker whose interrupted run needs recovery takes with `protected=True` and
+  ends with `release_board_lock`. `release` never signals a protected record,
+  a cleanup holder or a legacy runner reason (`hil_test.py`, `pool_check`), and
+  signals only `hil_lock.py hold`'s own holder, proven by its start time and
+  its flock. A record from a helper older than the mark carries none and is
+  taken like any other: protection across projects holds once every project
+  on the host runs this helper.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's

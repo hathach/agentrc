@@ -210,6 +210,12 @@ class Fixture(unittest.TestCase):
     def held(self):
         return {k for k, v in self.records().items() if v}
 
+    def recovered(self):
+        """A killed reservation leaves protected records: recovery blockers until a takeover
+        ends them. Stands in for that recovery between two runs."""
+        for fn in os.listdir(self.locks):
+            (self.locks / fn).write_text('')
+
     def flock_free(self, lock):
         with open(self.locks / f'{lock}.lock', 'r+') as f:
             try:
@@ -538,8 +544,12 @@ class Run(Fixture):
         line = p.blocker()
         self.assertIn('SIGHUP ignored during command', line)
         self.assertIn('SIGTERM forwarded', line)
-        p.kill()                                        # frees the locks for the second run
+        p.kill()                                        # frees the flocks, leaves recovery blockers
         self.argv_out.unlink()
+        refused = self.run_run()
+        self.assertIn('recovery blocker', refused.output())
+        self.assertNotEqual(refused.returncode, 0)
+        self.recovered()
 
         def before(m):
             real, calls = m.check, []
@@ -634,6 +644,7 @@ class Run(Fixture):
         self.assertEqual(self.argv_out.read_text().split(), ['root-cycle', '3-1.1', 'E6633861A3978538'])
         self.assertIn('3-1.1 (serial E6633861A3978538 (udev)) not back: serial unreadable', line)
         p.kill()
+        self.recovered()
         q = self.run_run(action='cure')                      # re-enumerated: sysfs answers again
         out = q.output()
         self.assertEqual(q.returncode, 0, out)
@@ -672,7 +683,8 @@ class Run(Fixture):
     def test_an_unreadable_class_or_a_new_node_after_the_command_is_a_blocker(self):
         p = self.run_run(action='unreadable-class')
         self.assertIn('3-1: class unreadable', p.blocker())
-        p.kill()                                        # frees the locks for the second run
+        p.kill()
+        self.recovered()
         self.dev('3-1', cls='09')
         q = self.run_run(action='new-node', busport='3-1.2')
         self.assertIn('3-1.9: new node (serial new)', q.blocker())
@@ -690,6 +702,7 @@ class Run(Fixture):
                 self.assertIsNone(p.poll())      # still a cleanup holder: the survivor leaving frees nothing
                 self.assertEqual(self.records()['raspberry_pi_pico2']['role'], 'cleanup-holder')
                 p.kill()
+                self.recovered()
 
     def test_sigterm_during_the_command_is_forwarded_and_ends_as_a_blocker(self):
         p = self.run_run(action='hang')
@@ -824,7 +837,7 @@ class Run(Fixture):
         hr.signal.pidfd_send_signal = send
         self.addCleanup(setattr, hr.signal, 'pidfd_send_signal', real)
         rc, out = main('release', '--token', tok)
-        self.assertEqual((rc, f'holder pid {p.pid} could not be signalled' in out), (1, True), out)
+        self.assertEqual((rc, f'delivery failed: holder pid {p.pid}' in out), (1, True), out)
 
     def test_release_refuses_without_pidfd_support(self):
         p = self.run_run(action='fail')
@@ -844,7 +857,8 @@ class Run(Fixture):
         tok = p.token()
         p.kill()
         rc, out = main('release', '--token', tok)      # the kernel dropped the flocks; the records are stale
-        self.assertEqual((rc, f'holder pid {p.pid} cannot be opened' in out), (1, True), out)
+        self.assertEqual((rc, f'holder pid {p.pid} of token {tok} is gone' in out), (1, True), out)
+        self.assertIn('recovery takeover', out)
 
 
 if __name__ == '__main__':
