@@ -97,10 +97,24 @@ profile path such as `C:\Users\First Last` gives; point `TMP` and `TEMP` at a
 plain path such as `C:\tmp` there.
 
 `install.py` creates symlinks, which needs Developer Mode or an elevated shell.
-Linux only: `--herdr-plugin` (herdr runs on Linux and macOS), `lsusbt`,
-`usb-kernel-debug`, `hil`'s rig-host scripts, and the capture scripts of
-`usb-sniffer`, `etm-trace` and `target-debug` (`dual_capture.py`). Tests skip the
-cases that need POSIX exec, `/proc` or file names NTFS refuses.
+Not on Windows yet; [#148](https://github.com/hathach/agentrc/issues/148) has
+the skipped tests and notes for a port:
+
+- `hil`'s rig-host scripts (`hil_lock.py`, `hil_reserve.py`, `usb_observe.py`)
+  and `usb-kernel-recover`'s `usb_recover.sh`: POSIX `flock` and `fork`,
+  `/proc` and sysfs.
+- `lsusbt`: sysfs.
+- `usb-kernel-debug`: kernel dynamic debug and usbmon, which have no Windows
+  counterpart to port to.
+- the capture scripts of `usb-sniffer` (`sniff.py`), `etm-trace`
+  (`etm_capture.py`) and `target-debug` (`dual_capture.py`): usbfs, `/proc`
+  and POSIX process control.
+- `install.py --herdr-plugin` refuses on Windows; `worktree-remove` has no
+  Windows test.
+
+The hardware-debug scripts run on Windows but are unverified on a board there
+(#130), and their tests skip the cases that drive POSIX stub executables or
+ptys. Other skips are for `/proc`, permission bits or file names NTFS refuses.
 
 ## Skills
 
