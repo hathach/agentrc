@@ -58,7 +58,15 @@ entry point; the contract says which agentrc commit it loads, and from where.
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
   Hosts/rosters names the other projects' rosters on a host it shares. A
-  partial hold is worse than none: it reads as protection. A runner that
+  partial hold is worse than none: it reads as protection. For a root-port
+  cycle that hold is this skill's `scripts/hil_reserve.py run`, given every
+  roster on the host: it refuses when a device under the root port is not
+  explained by those rosters, holds every board of every roster in one
+  process around the one command it builds (`usb-kernel-recover`'s
+  `root-cycle`), and keeps the locks as a cleanup holder until the contract's
+  recovery procedure releases them by token when anything but a clean,
+  fully re-enumerated outcome follows. A controller operation has no
+  inspected reservation yet; a contract refuses it. A runner that
   cycles one hub port under the board's own lock is a limitation of this rule,
   not an exemption, recorded in the contract's Limits with what else the cycle
   is known to reach.

@@ -161,7 +161,8 @@ def usb_scan(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> l
 
 
 def _proc_stat(pid) -> tuple | None:
-    """(comm, state, starttime) from /proc/<pid>/stat, or None when the process is gone."""
+    """(comm, state, starttime, ppid, pgrp) from /proc/<pid>/stat, or None when the process
+    is gone."""
     try:
         with open(f'{PROC_ROOT}/{pid}/stat') as f:
             text = f.read()
@@ -172,7 +173,8 @@ def _proc_stat(pid) -> tuple | None:
     fields = tail.split()
     if not sep or len(fields) < 20:
         return None
-    return head.partition('(')[2], fields[0], fields[19]   # fields 2, 3 and 22 of proc(5)
+    # fields 2, 3, 22, 4 and 5 of proc(5)
+    return head.partition('(')[2], fields[0], fields[19], fields[1], fields[2]
 
 
 def dstate_holders(comm: str) -> list:
@@ -206,6 +208,22 @@ def proc_holds(holder: dict) -> bool:
     return bool(st) and st[2] == holder['start'] and st[1] not in ('Z', 'X')
 
 
+def udev_serial(bus: int, dev: int) -> str | None:
+    """usb_id's ID_SERIAL_SHORT for the device at busnum/devnum, as udev recorded it when the
+    device was added, read without touching the device; None when udev has none. usb_id
+    drops a serial with a byte outside 0x20-0x7f or a ',', collapses whitespace runs into
+    one '_' and turns characters outside [A-Za-z0-9#+-.:=@_] into '_'. The devt names the
+    record: usbcore's MKDEV(189, (busnum-1)*128 + devnum-1)."""
+    try:
+        with open(os.path.join(UDEV_DATA, f'c189:{(bus - 1) * 128 + dev - 1}')) as f:
+            for line in f:
+                if line.startswith('E:ID_SERIAL_SHORT='):
+                    return line.split('=', 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
 def usb_node_serial(node: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
     """The serial of the device behind usbfs node /dev/bus/usb/BBB/DDD, as udev recorded it
     when the device was added, else the bounded sysfs read. None when unidentified.
@@ -223,12 +241,8 @@ def usb_node_serial(node: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
     bus, _, dev = node.removeprefix('/dev/bus/usb/').partition('/')
     if not (bus.isdigit() and dev.isdigit()):
         return None
+    serial = udev_serial(int(bus), int(dev))
+    if serial is not None:
+        return serial
     devt = f'189:{(int(bus) - 1) * 128 + int(dev) - 1}'
-    try:
-        with open(os.path.join(UDEV_DATA, f'c{devt}')) as f:
-            for line in f:
-                if line.startswith('E:ID_SERIAL_SHORT='):
-                    return line.split('=', 1)[1].strip()
-    except OSError:
-        pass
     return read_sysfs(os.path.join(SYS_DEV_CHAR, devt, 'serial'), timeout)

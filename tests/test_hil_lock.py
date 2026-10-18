@@ -358,6 +358,47 @@ class DetachedHolder(LockDir):
             _sleep(0.02)
         self.assertTrue(self.flock_is_free())
 
+    def test_a_repeated_name_holds_once(self):
+        with quiet() as (out, _):
+            self.assertEqual(hil_lock.cmd_hold([BOARD, BOARD], 'selftest hold'), 0)
+        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.assertEqual(out.getvalue().strip(), f'held: {BOARD}')
+        self.assertTrue(hil_lock.is_locked(BOARD))
+
+    def test_a_lost_race_leaves_no_owned_record_and_the_rivals_intact(self):
+        rival = self.holder(self.record(reason='rival'))
+        other = BOARD + '-2'
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_hold([other, BOARD], 'selftest hold'), 1)
+        self.assertIn(f'{BOARD} locked: ', err.getvalue())
+        self.assertIn('"rival"', err.getvalue())
+        self.wait_cleared([other])
+        self.assertIsNone(hil_lock.read_record(other))     # our own record, cleared by the losing holder
+        self.assertEqual(hil_lock.read_record(BOARD)['pid'], rival.pid)
+
+    def test_a_record_write_that_fails_in_the_holder_leaves_no_owned_record(self):
+        other = BOARD + '-2'
+        real, calls = hil_lock.write_record, []
+
+        def write_record(fh, reason):
+            calls.append(fh)
+            if len(calls) == 2:                 # the first record is written, the second fails
+                raise OSError('disk full')
+            real(fh, reason)
+        self.patch(hil_lock, 'write_record', write_record)     # inherited by the forked holder
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 1)
+        self.assertIn('holder failed to acquire locks', err.getvalue())
+        self.wait_cleared([BOARD, other])
+        self.assertIsNone(hil_lock.read_record(BOARD))
+        self.assertIsNone(hil_lock.read_record(other))
+        deadline = time.monotonic() + 10
+        while not self.flock_is_free() and time.monotonic() < deadline:
+            _sleep(0.02)
+        self.assertTrue(self.flock_is_free())
+        with open(hil_lock.lock_path(other), 'r+') as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)       # free too
+
     def wait_cleared(self, boards):
         deadline = time.monotonic() + 10
         while any(hil_lock.read_record(b) for b in boards) and time.monotonic() < deadline:

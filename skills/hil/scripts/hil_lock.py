@@ -30,6 +30,13 @@ class BoardLocked(RuntimeError):
     """Another session holds the board; the message names its holder."""
 
 
+def lock_names() -> list:
+    """The boards with a lock file, held or not."""
+    if not os.path.isdir(BOARD_LOCK_DIR):
+        return []
+    return sorted(fn[:-5] for fn in os.listdir(BOARD_LOCK_DIR) if fn.endswith('.lock'))
+
+
 def lock_path(board: str) -> str:
     return os.path.join(BOARD_LOCK_DIR, f'{board}.lock')
 
@@ -48,13 +55,14 @@ def flock_nb(board: str):
     return fh
 
 
-def write_record(fh, reason: str) -> None:
+def write_record(fh, reason: str, **extra) -> None:
     """Holder record; the flock itself is already held. Raises OSError on a write failure: a
-    hold whose record is missing is invisible to status/release, so every caller refuses it."""
+    hold whose record is missing is invisible to status/release, so every caller refuses it.
+    `extra` adds a tool's own fields (hil_reserve: token, start, locks, role)."""
     fh.truncate(0)
     fh.seek(0)
     json.dump({'pid': os.getpid(), 'reason': reason,
-               'since': time.strftime('%Y-%m-%dT%H:%M:%S%z')}, fh)
+               'since': time.strftime('%Y-%m-%dT%H:%M:%S%z'), **extra}, fh)
     fh.flush()
 
 
@@ -86,7 +94,7 @@ def holder_text(info) -> str:
     return f'{text} ({RECOVERY_BLOCKER})' if info.get('role') == CLEANUP_ROLE else text
 
 
-def take_board_lock(board: str, reason: str):
+def take_board_lock(board: str, reason: str, **extra):
     """Take the board's flock and record ourselves as its holder; returns the open handle
     (keep it referenced; closing releases it). Raises BoardLocked when another session holds
     the board, and LockUnavailable when the lock cannot be taken or recorded (fail-closed)."""
@@ -99,7 +107,7 @@ def take_board_lock(board: str, reason: str):
         raise LockUnavailable(f'board lock unavailable: {e}') from e
     # announce ourselves so the other side's conflict message is truthful
     try:
-        write_record(fh, reason)
+        write_record(fh, reason, **extra)
     except OSError as e:
         clear_record(fh)
         try:
@@ -138,6 +146,7 @@ def is_locked(board: str) -> bool:
 
 
 def cmd_hold(boards, reason):
+    boards = list(dict.fromkeys(boards))   # a repeated name would conflict with its own flock
     os.makedirs(BOARD_LOCK_DIR, exist_ok=True)
     # No pre-check: the holder's own LOCK_NB flock is the only authority, since a recorded
     # pid may be stale or recycled. The holder signals success through this pipe because a
@@ -177,19 +186,22 @@ def cmd_hold(boards, reason):
         os.dup2(devnull, std_fd)
     if devnull > 2:
         os.close(devnull)
+    handles = []
     try:
-        handles = []
         for b in boards:
-            fh = flock_nb(b)
-            write_record(fh, reason)
-            handles.append(fh)
+            handles.append(flock_nb(b))   # tracked before its record, so a failed write is cleared too
+            write_record(handles[-1], reason)
+        os.write(w_fd, b'1')
     except OSError:
+        # lost a race, or a record or the readiness pipe failed: clear every record we wrote
+        # (the flocks go with the exit) so no stale owned record outlives this holder
+        for h in handles:
+            clear_record(h)
         try:
             os.write(w_fd, b'0')
         except OSError:
             pass
-        os._exit(1)  # lost a race; parent reports the failure
-    os.write(w_fd, b'1')
+        os._exit(1)  # parent reports the failure
     os.close(w_fd)
 
     def _bow_out(*_):
@@ -256,14 +268,8 @@ def cmd_release(boards):
 
 
 def cmd_status():
-    if not os.path.isdir(BOARD_LOCK_DIR):
-        print('no locks')
-        return 0
     any_locked = False
-    for fn in sorted(os.listdir(BOARD_LOCK_DIR)):
-        if not fn.endswith('.lock'):
-            continue
-        b = fn[:-5]
+    for b in lock_names():
         if is_locked(b):
             any_locked = True
             print(f'{b}: {holder_text(read_record(b))}')
@@ -305,8 +311,7 @@ def main():
         sys.exit(cmd_hold(a.boards, a.reason))
     if a.cmd == 'release':
         if a.all:
-            boards = ([fn[:-5] for fn in os.listdir(BOARD_LOCK_DIR) if fn.endswith('.lock')]
-                      if os.path.isdir(BOARD_LOCK_DIR) else [])
+            boards = lock_names()
         else:
             boards = a.boards
         if not boards:

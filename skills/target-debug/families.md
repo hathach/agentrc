@@ -89,4 +89,4 @@ family.
 - `OTG_FS_DCTL` resets to 0 (SDIS clear), but `OTG_FS_GCCFG.PWRDWN` resets to 0, transceiver powered down (RM0090 rev 22
   p1277-1278, p1291), so a system reset drops the device until firmware sets PWRDWN. A J-Link `r; g` gave "USB
   disconnect" and re-enumeration 325 ms later, while a bare halt stayed connected. verified 2026-08-16 stm32f407disco
-  (tinyusb's `usb-kernel-recover`; firmware revision not recorded).
+  (`usb-kernel-recover`, rung 1; firmware revision not recorded).
