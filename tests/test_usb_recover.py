@@ -214,6 +214,43 @@ class Shield(Tree):
         self.assertEqual(mode(self.dev / '13-1/bMaxPower'), 0o444)
         self.assertFalse((self.state / '13-1.6').exists())
 
+    def counted(self, *args, ok=True):
+        """run_script with python3 behind a counter: (output, interpreter starts)."""
+        bindir = Path(self.td.name) / 'bin'
+        log = Path(self.td.name) / 'py.log'
+        if not bindir.exists():
+            bindir.mkdir()
+            real = shutil.which('python3')
+            (bindir / 'python3').write_text(f'#!/bin/sh\necho x >> {log}\nexec {real} "$@"\n')
+            os.chmod(bindir / 'python3', 0o755)
+        log.write_text('')
+        out = self.run_script(*args, ok=ok, env={'PATH': f'{bindir}:{os.environ["PATH"]}'})
+        return out, len(log.read_text().split())
+
+    def test_each_verb_starts_one_interpreter_for_every_attribute(self):
+        """One python3 per attribute was 52 starts to shield one leaf and 25 to unshield it."""
+        self.assertEqual(self.counted('shield', '13-1.6', str(self.owner.pid))[1], 1)
+        self.assertEqual(self.counted('shield', '13-1.7', str(self.owner.pid), ok=False)[1], 0)   # overlap: refused in bash
+        saved = Path(self.td.name) / 'saved'
+        (self.state / '13-1.6').rename(saved)           # out of the way of the overlap check
+        self.counted('shield', '13-1.7', str(self.owner.pid))
+        saved.rename(self.state / '13-1.6')
+        out, n = self.counted('shield-status')
+        self.assertEqual(n, 1, 'two records, one interpreter')
+        self.assertIn('13-1.6: owner pid', out)
+        self.assertIn('13-1.7: owner pid', out)
+        self.assertEqual(self.counted('unshield', '13-1.6', str(self.owner.pid))[1], 1)
+
+    def test_a_failed_shield_rolls_back_in_the_same_interpreter(self):
+        real = Path('/sys/bus/usb/devices/usb1')
+        if not (real / 'serial').exists():
+            self.skipTest('no real root hub to borrow')
+        shutil.rmtree(self.dev / 'usb13')
+        os.symlink(real, self.dev / 'usb13')            # acquisition fails at the root hub (EPERM)
+        out, n = self.counted('shield', '13-1.6', str(self.owner.pid), ok=False)
+        self.assertIn('rolled back', out)
+        self.assertEqual(n, 1)
+
     def test_the_other_actions_still_dispatch(self):
         out = self.run_script('resolve', '/dev/null', ok=False)
         self.assertIn('could not find parent USB device', out)
