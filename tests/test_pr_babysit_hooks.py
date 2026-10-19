@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -32,6 +33,9 @@ SCRIPTS = {
     # Rewrites a tracked file outside the paths it was given, as a doc generator does.
     'gen': 'echo generated > b.txt\n',
     'echo': 'printf -- "- hook id: fake\\n- files were modified by this hook\\n"; exit 1\n',
+    'counted': 'echo run >> "$HOOK_LOG"; exit 1\n',
+    # Outlasts a short deadline; its pid shows whether the timeout took it down.
+    'slow': 'echo $$ > "$HOOK_PID"; sleep 30\n',
 }
 
 
@@ -100,10 +104,41 @@ class HooksTest(unittest.TestCase):
         self.assertNotIn('b.txt', before)
         self.assertEqual(after['b.txt'][1], self.git('hash-object', 'b.txt').strip())
 
-    def test_a_failing_hook_fails_both_runs(self):
-        self.configure('broken')
-        code, out = self.run_script('a.txt')
+    def test_a_failing_hook_that_modified_nothing_runs_once(self):
+        # A second run repairs only what a hook rewrote (#140): the same failure again costs a whole slow pass.
+        self.configure('counted')
+        log = Path(self.repo.parent) / 'runs.log'
+        code, out = self.run_script('a.txt', env={**self.env, 'HOOK_LOG': str(log)})
         self.assertEqual((code, out['ran'], out['passed'], out['modifiedBy']), (0, True, False, []))
+        self.assertEqual(log.read_text().splitlines(), ['run'])
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX process groups; Windows takes the tree with taskkill')
+    def test_hooks_past_the_deadline_are_killed_and_reported(self):
+        self.configure('slow')
+        pid = Path(self.repo.parent) / 'hook.pid'
+        code, out = self.run_script('--deadline-seconds', '2', 'a.txt', env={**self.env, 'HOOK_PID': str(pid)})
+        self.assertEqual(code, 2)
+        self.assertRegex(out['error'], r'pre-commit did not finish within 2 s')
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pid.read_text()), 0)
+
+    @unittest.skipUnless(shutil.which('setsid') and os.name != 'nt', 'needs setsid')
+    def test_a_process_that_escapes_the_kill_does_not_hold_the_result(self):
+        # pre-commit keeps a hook's output on its own pipes; a pre-commit whose child starts another session
+        # and keeps ours outlives the group kill.
+        self.configure('ok')
+        bin_dir = Path(self.repo.parent) / 'bin'
+        bin_dir.mkdir()
+        (bin_dir / 'pre-commit').write_text('#!/bin/sh\nsetsid sleep 30 &\necho $! > "$HOOK_PID"\nsleep 30\n')
+        (bin_dir / 'pre-commit').chmod(0o755)
+        pid = Path(self.repo.parent) / 'hook.pid'
+        started = time.monotonic()
+        env = {**self.env, 'HOOK_PID': str(pid), 'PATH': f"{bin_dir}{os.pathsep}{self.env['PATH']}"}
+        code, out = self.run_script('--deadline-seconds', '2', 'a.txt', env=env)
+        self.addCleanup(lambda: subprocess.run(['kill', '-9', pid.read_text().strip()], capture_output=True))
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(code, 2)
+        self.assertRegex(out['error'], r'did not finish within 2 s .*may still be running')
 
     def test_markers_a_hook_prints_are_not_read_as_pre_commits(self):
         self.configure('echo')

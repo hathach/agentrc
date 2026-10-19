@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Run the repository's pre-commit hooks on the given paths and report what they did.
 
-  hooks.py PATH...
+  hooks.py [--deadline-seconds N] PATH...
 
 Run from the checkout's top level. Prints the tree status and a snapshot of
 PATH plus every path the status names, runs `pre-commit run --files PATH...`
-when .pre-commit-config.yaml exists (once more if it exits non-zero), then the
-status and snapshot again. Status lines are `git status --porcelain -z`
+when .pre-commit-config.yaml exists (once more if it failed after a hook
+modified files), then the status and snapshot again. Both runs together get N
+seconds (default 540, inside the 600 a relay's Bash call allows); past that
+the pre-commit process tree is killed and the result is an error. Status lines are `git status --porcelain -z`
 records; snapshot lines are `<644|755> <blob> <path>` or `absent - <path>`.
 
 stdout ends with one JSON line {ran, passed, modifiedBy, before, after,
@@ -19,14 +21,17 @@ collected or pre-commit's output contradicts its exit status.
 
 import os
 import re
+import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Unusable, checkout_top, git, report  # noqa: E402
 
 CONFIG = '.pre-commit-config.yaml'
+DEADLINE = 540
 HOOK_ID = '- hook id: '
 MODIFIED = '- files were modified by this hook'
 # pre-commit pads a hook's name with dots to its result, then prints the
@@ -100,29 +105,65 @@ def modified_by(output, exit_code):
     return ids
 
 
-def run_hooks(paths):
+def kill_tree(proc):
+    if os.name == 'nt':
+        # by full path: a bare name would find a taskkill.exe in the checkout first
+        taskkill = os.path.join(os.environ.get('SystemRoot') or 'C:\\Windows', 'System32', 'taskkill.exe')
+        subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True)
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)
+
+
+def pre_commit(paths, deadline, start, attempt):
+    """(exit code, stdout) of one run, its whole process tree killed once `deadline` seconds from `start` pass."""
+    group = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
+    try:
+        proc = subprocess.Popen(['pre-commit', 'run', '--color', 'never', '--files', *paths], stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, encoding='utf-8', errors='replace', **group)
+    except FileNotFoundError:
+        raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
+    try:
+        out, _ = proc.communicate(timeout=max(deadline - (time.monotonic() - start), 0))
+    except subprocess.TimeoutExpired:
+        kill_tree(proc)
+        late = f'pre-commit did not finish within {deadline} s (run {attempt})'
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A descendant in another session outlived the kill and still holds the output pipe.
+            raise Unusable(f'{late}; a process it started survived the kill and may still be running')
+        raise Unusable(f'{late}; its process group was killed, though a process that left it may survive')
+    return proc.returncode, out
+
+
+def run_hooks(paths, deadline=DEADLINE):
     if not os.path.exists(CONFIG):
         return False, True, []
     ids = []
-    for _ in range(2):
-        try:
-            done = subprocess.run(['pre-commit', 'run', '--color', 'never', '--files', *paths],
-                                  capture_output=True, encoding='utf-8', errors='replace')
-        except FileNotFoundError:
-            raise Unusable(f'{CONFIG} exists but pre-commit is not installed')
-        ids += [h for h in modified_by(done.stdout, done.returncode) if h not in ids]
-        if not done.returncode:
+    start = time.monotonic()
+    for attempt in (1, 2):
+        code, out = pre_commit(paths, deadline, start, attempt)
+        modified = modified_by(out, code)
+        ids += [h for h in modified if h not in ids]
+        # A rerun repairs what a hook rewrote; the same failure again only spends another pass (#140).
+        if not code or not modified:
             break
-    return True, not done.returncode, ids
+    return True, not code, ids
 
 
-def collect(paths):
+def collect(argv):
+    deadline = DEADLINE
+    if argv[:1] == ['--deadline-seconds']:
+        if len(argv) < 2 or not argv[1].isdigit() or int(argv[1]) < 1:
+            raise Unusable('usage: hooks.py [--deadline-seconds N] PATH...')
+        deadline, argv = int(argv[1]), argv[2:]
+    paths = argv
     if not paths:
-        raise Unusable('usage: hooks.py PATH...')
+        raise Unusable('usage: hooks.py [--deadline-seconds N] PATH...')
     checkout_top()
     before = status()
     snapshot_before = snapshot(paths, before)
-    ran, passed, ids = run_hooks(paths)
+    ran, passed, ids = run_hooks(paths, deadline)
     after = status()
     return {'ran': ran, 'passed': passed, 'modifiedBy': ids, 'before': before, 'after': after,
             'snapshotBefore': snapshot_before, 'snapshotAfter': snapshot(paths, after)}

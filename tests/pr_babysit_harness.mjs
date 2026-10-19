@@ -3811,6 +3811,13 @@ test('receipts beside an error are not trusted: an error line carries no seal to
   assert.deepEqual(reused.result.settlements, [{ commentId: 1, outcome: 'refused', why: 'reply.py: HTTP 403' }])
 })
 
+test('the hook and commit relays wait out a slow pre-commit, up to the Bash maximum (#140)', async () => {
+  const { calls } = await run({ reviews: oneValid, args: { autoPush: true, maxCycles: 1 } })
+  for (const label of ['hooks#1-review', 'commit#1-review']) {
+    assert.match(calls.find(c => c.label === label).prompt, /in the foreground with a Bash timeout of 600000 ms/, label)
+  }
+})
+
 // Comment 2 was answered by a reply (502) whose body reply.py will not post over.
 const HELD = { replyId: 502, error: 'reply 502 of ours is already on this comment in other words; the caller reconciles it' }
 const heldForRepair = (over = {}) => ({
