@@ -10,6 +10,16 @@ runs it through `run` (default hil_process.run_cmd, the instance loaded here as
 `timeout` explicitly. A flash or reset returns an Operation: the last run's CompletedProcess
 fields plus every attempt on its own. rc 0 means the tool said it succeeded, not that the
 target runs the image; rc 124 means it was killed on the bound.
+
+Each attempt is one kind: `exited` (the runner returned), `timed_out` (rc 124 returned, or
+subprocess.TimeoutExpired raised, its partial output kept), `interrupted` (a BaseException
+that is not an Exception, such as KeyboardInterrupt, or any exception with a true
+`interrupted` attribute) or `error` (any other exception, such as a launch failure). A
+runner's result or exception may carry `cleanup` ('done', 'pending' or 'unknown') and
+`receipt` (whatever identifies a session still outstanding). Without `cleanup`, the default
+runner's contract applies: hil_process.run_cmd reaps boundedly and abandons a survivor, so
+only an exit other than rc 124 is 'done'; rc 124 and every exception are 'unknown'. An
+unrecognised value reads as 'unknown'.
 """
 
 from __future__ import annotations
@@ -48,34 +58,63 @@ def _runner(run):
     return hil_process.run_cmd if run is None else run
 
 
+CLEANUP = ('done', 'unknown', 'pending')   # least to most outstanding
+
+
 class Attempt(NamedTuple):
-    """One run of a tool: the command, its command file's contents if it has one, and the
-    runner's result, None when the run raised."""
+    """One run of a tool (module docstring): the command, its command file's contents if it
+    has one, the runner's result (returncode None and any partial output when it raised),
+    the exception it raised, its cleanup status and outstanding-session receipt."""
     cmd: str | list
     script: str | None
-    result: subprocess.CompletedProcess | None
+    result: subprocess.CompletedProcess
+    error: BaseException | None
+    cleanup: str
+    receipt: object
 
     @property
-    def interrupted(self) -> bool:
-        return self.result is None
+    def kind(self) -> str:
+        e = self.error
+        if isinstance(e, subprocess.TimeoutExpired) or e is None and self.result.returncode == 124:
+            return 'timed_out'
+        if e is None:
+            return 'exited'
+        return 'interrupted' if not isinstance(e, Exception) or getattr(e, 'interrupted', False) else 'error'
 
     @property
     def timed_out(self) -> bool:
-        # 124 is hil_process.run_cmd's mark for a run it killed on the bound
-        return self.result is not None and self.result.returncode == 124
+        return self.kind == 'timed_out'
+
+    @property
+    def interrupted(self) -> bool:
+        return self.kind == 'interrupted'
+
+    @property
+    def errored(self) -> bool:
+        return self.kind == 'error'
+
+
+def _record(cmd, script, result, error) -> Attempt:
+    source = result if error is None else error
+    default = 'done' if error is None and result.returncode != 124 else 'unknown'
+    cleanup = getattr(source, 'cleanup', None) or default
+    return Attempt(cmd, script, result, error, cleanup if cleanup in CLEANUP else 'unknown',
+                   getattr(source, 'receipt', None))
 
 
 class Operation(subprocess.CompletedProcess):
     """The last attempt's CompletedProcess fields, so a caller reading returncode and stdout
     keeps working, plus `attempts`: every run in order with its own output, never
-    concatenated. Every attempt but the last was retried. An interrupted run's exception
-    carries the operation so far as `.operation`."""
+    concatenated. Every attempt but the last was retried. A runner's exception carries the
+    operation so far as `.operation`. `cleanup` is the worst attempt's ('pending' over
+    'unknown' over 'done'), `receipts` every outstanding session's receipt in order."""
 
     def __init__(self, attempts: list):
-        last = attempts[-1]
-        r = subprocess.CompletedProcess(last.cmd, None) if last.interrupted else last.result
+        r = attempts[-1].result
         super().__init__(r.args, r.returncode, r.stdout, r.stderr)
         self.attempts = tuple(attempts)
+        self.cleanup = max((a.cleanup for a in attempts), key=CLEANUP.index)
+        self.receipts = tuple(a.receipt for a in attempts if a.receipt is not None)
 
     @property
     def retried(self) -> tuple:
@@ -86,10 +125,11 @@ def _attempt(attempts: list, run, cmd, script=None, **kw) -> subprocess.Complete
     try:
         ret = run(cmd, **kw)
     except BaseException as e:
-        attempts.append(Attempt(cmd, script, None))
+        partial = subprocess.CompletedProcess(cmd, None, getattr(e, 'stdout', None), getattr(e, 'stderr', None))
+        attempts.append(_record(cmd, script, partial, e))
         e.operation = Operation(attempts)
         raise
-    attempts.append(Attempt(cmd, script, ret))
+    attempts.append(_record(cmd, script, ret, None))
     return ret
 
 

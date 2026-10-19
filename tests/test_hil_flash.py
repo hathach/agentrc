@@ -405,21 +405,88 @@ class Record(unittest.TestCase):
                 self.assertEqual((a.cmd, a.script, a.result.returncode, a.result.stdout), (op.args, None, 3, 'out|'))
                 self.assertEqual(op.retried, ())
 
-    def test_a_timed_out_attempt_is_marked(self):
+    def test_a_returned_rc_124_is_timed_out_and_its_cleanup_unknown(self):
         op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=self.runner([(124, 'partial')]))
-        self.assertTrue(op.attempts[0].timed_out)
-        self.assertEqual(op.stdout, 'partial|')
+        a, = op.attempts
+        self.assertEqual((a.kind, a.timed_out, a.interrupted, a.errored, a.error), ('timed_out', True, False, False, None))
+        self.assertEqual((op.stdout, op.cleanup, a.cleanup, op.receipts), ('partial|', 'unknown', 'unknown', ()))
 
-    def test_an_interrupted_run_carries_the_operation_so_far(self):
-        for exc in (KeyboardInterrupt(), RuntimeError('spawn')):
-            with self.subTest(exc=type(exc).__name__), tempfile.TemporaryDirectory() as d, contextlib.chdir(d), \
-                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(type(exc)) as cm:
-                hf.reset_jlink(JLINK, timeout=30, crash_retries=2, run=self.runner([(139, 'S/N: 1'), exc]))
-            op = cm.exception.operation
-            self.assertEqual([a.interrupted for a in op.attempts], [False, True])
-            self.assertEqual(op.attempts[0].result.stdout, 'S/N: 1|halt\nr\ngo\nexit\n')
-            self.assertEqual((op.returncode, op.stdout), (None, None))
-            self.assertEqual(op.attempts[1].script, 'halt\nr\ngo\nexit\n')
+    def test_a_normal_exit_is_done_whatever_its_rc(self):
+        for rc in (0, 1, 139):
+            op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=self.runner([(rc, 'x')]))
+            self.assertEqual((op.attempts[0].kind, op.cleanup), ('exited', 'done'))
+
+    def raised(self, exc, before=()):
+        """The operation a reset_jlink with 2 crash retries carries out on its exception."""
+        with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(type(exc)) as cm:
+            hf.reset_jlink(JLINK, timeout=30, crash_retries=2, run=self.runner([*before, exc]))
+        self.assertIs(cm.exception, exc)
+        return cm.exception.operation
+
+    def test_a_raised_run_is_classified_and_carries_the_operation_so_far(self):
+        class Interrupted(Exception):
+            interrupted = True
+        timeout = subprocess.TimeoutExpired('JLinkExe', 30, output=b'partial', stderr=b'err')
+        for exc, kind in ((timeout, 'timed_out'), (KeyboardInterrupt(), 'interrupted'), (SystemExit(1), 'interrupted'),
+                          (Interrupted(), 'interrupted'), (FileNotFoundError('JLinkExe'), 'error'),
+                          (OSError('E2BIG'), 'error'), (RuntimeError('boom'), 'error')):
+            with self.subTest(exc=type(exc).__name__):
+                op = self.raised(exc, before=[(139, 'S/N: 1')])
+                first, last = op.attempts
+                self.assertEqual((first.kind, first.result.stdout), ('exited', 'S/N: 1|halt\nr\ngo\nexit\n'))
+                self.assertEqual((last.kind, last.error, last.script, last.result.returncode),
+                                 (kind, exc, 'halt\nr\ngo\nexit\n', None))
+                self.assertEqual([last.timed_out, last.interrupted, last.errored],
+                                 [kind == 'timed_out', kind == 'interrupted', kind == 'error'])
+                self.assertEqual((op.returncode, op.cleanup), (None, 'unknown'))
+                self.assertEqual((op.stdout, op.stderr), (b'partial', b'err') if exc is timeout else (None, None))
+
+    def test_a_runner_supplies_cleanup_and_receipt(self):
+        class Pending(subprocess.CompletedProcess):
+            cleanup, receipt = 'pending', {'pid': 41, 'start': 7}
+
+        def run(cmd, **kw):
+            return Pending(cmd, 0, 'out', None)
+        op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=run)
+        self.assertEqual((op.attempts[0].cleanup, op.attempts[0].receipt), ('pending', {'pid': 41, 'start': 7}))
+        self.assertEqual((op.cleanup, op.receipts), ('pending', ({'pid': 41, 'start': 7},)))
+        exc = KeyboardInterrupt()
+        exc.cleanup, exc.receipt = 'pending', 'holder-9'
+        op = self.raised(exc)
+        self.assertEqual((op.attempts[0].cleanup, op.cleanup, op.receipts), ('pending', 'pending', ('holder-9',)))
+        for value, want in (('done', 'done'), ('bogus', 'unknown'), (None, 'done')):
+            Pending.cleanup = value
+            self.assertEqual(hf.reset_stlink({'uid': 'S1'}, timeout=7, run=run).cleanup, want, value)
+
+    def test_the_operation_cleanup_is_the_worst_attempts(self):
+        def answers(*items):
+            it = iter(items)
+
+            def run(cmd, **kw):
+                rc, cleanup, receipt = next(it)
+                r = subprocess.CompletedProcess(cmd, rc, '', None)
+                r.cleanup, r.receipt = cleanup, receipt
+                return r
+            return run
+        with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()):
+            op = hf.reset_jlink(JLINK, timeout=30, crash_retries=2,
+                                run=answers((139, 'pending', 'r1'), (139, 'unknown', None), (0, 'done', None)))
+        self.assertEqual(([a.cleanup for a in op.attempts], op.cleanup, op.receipts),
+                         (['pending', 'unknown', 'done'], 'pending', ('r1',)))
+
+    def test_the_default_runner_reports_done_or_unknown(self):
+        """hil_process.run_cmd for real: a normal exit is done, the timeout kill unknown."""
+        with tempfile.TemporaryDirectory() as d:
+            tool = Path(d) / 'lm4flash'
+            tool.write_text('#!/bin/sh\ncase "$*" in *slow*) sleep 30;; esac\necho ran\n')
+            tool.chmod(0o755)
+            with mock.patch.dict(os.environ, {'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}'}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                done = hf.flash_lm4flash({'uid': 'S1', 'args': ''}, 'fw.bin', timeout=10)
+                killed = hf.flash_lm4flash({'uid': 'S1', 'args': ''}, 'slow.bin', timeout=0.5)
+        self.assertEqual((done.returncode, done.attempts[0].kind, done.cleanup), (0, 'exited', 'done'))
+        self.assertEqual((killed.returncode, killed.attempts[0].kind, killed.cleanup), (124, 'timed_out', 'unknown'))
 
 
 class Sessions(unittest.TestCase):
