@@ -732,6 +732,12 @@ def _release_one(b, victims) -> int:
         fh.close()
 
 
+def _boards_of(pid, start) -> list:
+    """Every board whose record names the holder `pid` started at `start`."""
+    recs = {b: read_record(b) for b in lock_names()}
+    return [b for b, r in recs.items() if isinstance(r, dict) and (r.get('pid'), r.get('start')) == (pid, start)]
+
+
 def cmd_release(boards):
     rc = 0
     victims = {}
@@ -739,11 +745,13 @@ def cmd_release(boards):
         rc |= _release_one(b, victims)
     signalled = []
     for (pid, start), held in sorted(victims.items()):
+        # SIGTERM ends the holder on every board it holds: wait for all of its records
+        owned = sorted({b for b, _ in held} | set(_boards_of(pid, start)))
         try:
             _pidfd_signal(pid, start, signal.SIGTERM,
                           lambda: all(read_record(b) == info for b, info in held))
             print(f'released holder pid {pid}')
-            signalled += [b for b, _ in held]
+            signalled += owned
         except ReleaseRefused as e:
             print(f'ERROR: {e}', file=sys.stderr)
             rc = 1
