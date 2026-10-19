@@ -125,8 +125,19 @@ class Launcher(unittest.TestCase):
         # pyocd resolves them from the project dir it chdirs into, not the launcher's cwd
         self.assertEqual(out['argv'][:4], ['flash', '--pack', 'packs/lpc55.pack', 'fw.elf'])
 
-    def test_a_missing_project_dir_argument_is_refused(self):
-        for args in (('0x1fc9', '0x0090', 'flash'), ('--project-dir',)):
+    def test_a_project_dir_holding_a_pyocd_config_is_refused(self):
+        # discovery's bare Session loads one from there despite --no-config
+        for name in ('pyocd.yaml', 'pyocd.yml', '.pyocd.yaml', '.pyocd.yml'):
+            with self.subTest(name=name):
+                (self.project / name).write_text('')
+                r = self.run_launcher('--project-dir', str(self.project), '0x1fc9', '0x0090', 'flash', 'fw.elf')
+                (self.project / name).unlink()
+                self.assertEqual((r.returncode, r.stdout), (2, ''))
+                self.assertIn(name, r.stderr)
+
+    def test_a_missing_project_dir_is_refused(self):
+        for args in (('0x1fc9', '0x0090', 'flash'), ('--project-dir',),
+                     ('--project-dir', str(self.root / 'absent'), '0x1fc9', '0x0090', 'flash')):
             r = self.run_launcher(*args)
             self.assertEqual((r.returncode, r.stdout), (2, ''), args)
 

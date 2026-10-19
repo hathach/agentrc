@@ -18,6 +18,9 @@ import os
 import sys
 from pathlib import Path
 
+# pyocd's project config names; discovery would load one from the project dir (main below)
+PYOCD_CONFIGS = ('pyocd.yaml', 'pyocd.yml', '.pyocd.yaml', '.pyocd.yml')
+
 
 def _fail(msg: str):
     print(f'run_pyocd.py: {msg}', file=sys.stderr)
@@ -41,6 +44,13 @@ def main(argv: list) -> int:
         _fail(f'want "--project-dir DIR" first, got {argv[:2]}')
     project_dir = Path(argv[1]).resolve()
     argv = argv[2:]
+    if not project_dir.is_dir():
+        _fail(f'project dir {project_dir} is not a directory')
+    # CMSIS-DAP discovery builds a bare Session (pyocd 0.45.1 dap_access_cmsis_dap.py:81) that
+    # ignores --no-config and loads pyocd.yaml from the project dir, else the cwd
+    present = [name for name in PYOCD_CONFIGS if (project_dir / name).exists()]
+    if present:
+        _fail(f'project dir {project_dir} holds {present}, which discovery would load')
     try:
         vid, pid = (int(v, 16) for v in argv[:2])
     except ValueError:
