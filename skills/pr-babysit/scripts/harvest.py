@@ -216,11 +216,14 @@ def coderabbit(head, statuses, checks, issue, event_at):
 
 def limited_record(reason, notice, why, ev, sha):
     """CodeRabbit settled as rate-limited, with the notice's reset time, or an hour after the notice when it gives no
-    countdown (#138); `why` says why the notices give none."""
+    countdown (#138), none when its countdown does not read; `why` says why the notices give none."""
     at = None if why else retry_at(notice)
     if not at and notice and not why:
-        at = after(notice, ESTIMATED_RESET)
-        reason += '; no countdown read, reset estimated an hour after the notice'
+        if CR_COUNTDOWN.search(notice.get('body') or ''):
+            reason += '; its countdown did not read, no reset time'
+        else:
+            at = after(notice, ESTIMATED_RESET)
+            reason += '; no countdown read, reset estimated an hour after the notice'
     elif not at:
         reason += f"; no reset time read{f' ({why})' if why else ''}"
     return record('coderabbit', 'settled', reason, [*ev, *([f"comment {notice['id']}"] if notice else [])], sha, 'limited', at)

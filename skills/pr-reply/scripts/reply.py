@@ -38,8 +38,10 @@ reply may exist), posted that GitHub answered it, verified is true on a
 matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
-reply, resolved; 1 otherwise; 2 on a usage or manifest error, or a GitHub failure
-before any reply, with {"error": ...} as the last stdout line. A null resolved or
+reply, resolved; 1 otherwise, a failed comment lookup (an inaccessible --repo or a
+rate limit included) being a receipt's error; 2 on a usage or manifest error, or
+when finding the repo (gh repo view) or our login (gh api user) fails, with
+{"error": ...} as the last stdout line. A null resolved or
 error is left out of the line: a model relaying it drops a trailing null. An
 entry whose error names a GitHub rate limit ends the batch: every later entry
 gets a receipt that nothing was tried, with no further GitHub call.

@@ -258,6 +258,9 @@ class FailClosed(unittest.TestCase):
         self.assertIn('reset estimated an hour after the notice', first['reason'])
         posted = comment(bot, harvest.CR_RATE + '\n> ## Review limit reached', at='2026-09-25T09:30:00Z')
         self.assertEqual(harvest.coderabbit(HEAD, [], [], [posted], EVENT)['retryAt'], '2026-09-25T10:30:00Z', 'an unedited one alike')
+        unread = harvest.coderabbit(HEAD, [limited], [], [notice('2026-09-25T12:08:34Z', body.replace('40 minutes', '3 days'))], EVENT)
+        self.assertEqual((unread['kind'], unread['retryAt']), ('limited', None), 'a countdown that does not read is not estimated')
+        self.assertIn('its countdown did not read', unread['reason'])
 
     def test_a_rate_limit_countdown_reads_or_is_none(self):
         def at(countdown, updated='2026-09-25T09:00:00Z'):
