@@ -1404,6 +1404,23 @@ class CoworkTest(unittest.TestCase):
                 orphan.kill()
                 orphan.wait()
 
+    @unittest.skipIf(fcntl is None, '/proc lists the open lock')
+    def test_a_descriptor_closed_while_listed_does_not_hide_the_lock(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        lock_file = box / 'codex-x.lock'
+        with holding(lock_file) as lock:
+            orphan = spawn_holding(lock, SLEEP)
+        self.addCleanup(lambda: (orphan.kill(), orphan.wait()))
+        real = os.readlink
+
+        def closed_since_listed(fd):  # a CLI opens and closes files all the time
+            if real(fd) != str(lock_file):
+                raise FileNotFoundError(fd)
+            return real(fd)
+        with mock.patch.object(cowork.os, 'readlink', closed_since_listed):
+            self.assertTrue(cowork.holds(orphan.pid, lock_file))
+
     @unittest.skipIf(os.name != 'nt', 'the Windows backend records the pid\'s creation time; /proc shows the open lock')
     def test_a_pid_reused_after_the_runner_wrote_it_is_not_ours(self):
         box = self.box()

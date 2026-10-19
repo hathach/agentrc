@@ -482,8 +482,13 @@ def holds(pid, lock_file):
     if fcntl is None:  # no /proc: the one created when the runner recorded beside its pid
         with holder(pid, lock_file) as process:
             return process is not None
+    def target(fd):
+        try:
+            return os.readlink(fd)
+        except OSError:  # closed since listed: a CLI opens and closes files all the time
+            return None
     try:
-        return any(os.readlink(fd) == str(lock_file) for fd in Path(f'/proc/{pid}/fd').iterdir())
+        return any(target(fd) == str(lock_file) for fd in Path(f'/proc/{pid}/fd').iterdir())
     except OSError:
         return False
 
