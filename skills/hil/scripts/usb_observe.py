@@ -6,6 +6,7 @@ a lock.
 """
 import glob
 import os
+import re
 import threading
 
 # Roots of the scan and the stray-holder lookup; module globals so unit tests can point them at a tree
@@ -15,6 +16,9 @@ SYS_DEV_CHAR = '/sys/dev/char'
 UDEV_DATA = '/run/udev/data'
 
 SYSFS_READ_GRACE = 2.0        # default bound on one attribute read; see read_sysfs
+
+# a device's bus-port as sysfs names it (5-3.4); `$` still lets .match() accept one trailing newline
+BUSPORT_RE = re.compile(r'^[0-9]+-[0-9]+(\.[0-9]+)*$')
 
 # Both memos are keyed by the attribute's realpath: usb_scan reads `serial` through
 # /sys/bus/usb/devices/<busport> and usb_node_serial through /sys/dev/char/189:N, and keyed by

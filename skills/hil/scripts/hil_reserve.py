@@ -83,7 +83,6 @@ uo = _load('usb_observe')
 
 LOCK_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs
-BUSPORT_RE = re.compile(r'^[0-9]+-[0-9]+(\.[0-9]+)*$')
 IDENTITY_KEYS = ('uid', 'uart_uid', 'serial')
 HUB_CLASS = '09'
 VERB_SCOPE = {'root-cycle': 'root', 'hub-cycle': 'hub'}
@@ -533,7 +532,7 @@ def main(argv=None):
     try:
         if args.cmd == 'release':
             return cmd_release(args)
-        if not BUSPORT_RE.match(args.busport):
+        if not uo.BUSPORT_RE.match(args.busport):
             ap.error(f'bad busport: {args.busport}')
         specs = []
         for r in args.roster:

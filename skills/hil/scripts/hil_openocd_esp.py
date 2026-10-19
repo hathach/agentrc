@@ -90,7 +90,6 @@ CLEANUP_TIMEOUT = 30                 # seconds for the reviewed end: reset run, 
 _UID_RE = re.compile(r'[A-Za-z0-9_.:+-]+')
 _PATH_RE = re.compile(r'/[A-Za-z0-9_./+-]*')    # a path that reaches a Tcl command unquoted
 _CHIP = r'esp32[a-z0-9]*'
-_BUSPORT_RE = re.compile(r'[0-9]+-[0-9]+(\.[0-9]+)*')
 
 
 def admit(flasher: dict) -> tuple:
@@ -209,7 +208,7 @@ def usj_location(serial: str) -> str:
     if _usj_walk(serial) != first:
         raise RuntimeError(f'USJ serial {serial}: moved or re-enumerated during resolution ({first[0][0]})')
     busport = first[0][0]
-    if not _BUSPORT_RE.fullmatch(busport) or len(busport) > USB_LOCATION_MAX:
+    if not usb_observe.BUSPORT_RE.fullmatch(busport) or len(busport) > USB_LOCATION_MAX:
         raise RuntimeError(f'USJ serial {serial}: bus-port {busport!r} is not a location openocd can match')
     return busport
 
