@@ -294,6 +294,8 @@ async function run(opts = {}) {
           registered: ci.registered ?? Math.max(1, failed.length), waiting: ci.status === 'running' ? ci.waiting ?? label : '',
           ignored: / --ignore-check /.test(text) ? ci.ignored ?? [] : [],
           ...(/ --brief /.test(text) && ci.status === 'running' ? { checks: [] } : {}),
+          // opts.clock: collect.py's observedAt per call, by default one fixed time.
+          observedAt: typeof opts.clock === 'function' ? opts.clock(label) : at(0),
         }
       } else {
         if (opts.evidence) await opts.evidence(calls)
@@ -2033,6 +2035,46 @@ test('a re-run carries across a launch: its old run is still settling', async ()
   const again = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1'])
   assert.equal(again.result.history.at(-1).ci.status, 'running')
+})
+
+// #123: a red whose re-run has not registered came back at once, and the re-arm spent a cycle every few seconds.
+const rerunAll = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
+const minuteOf = (minutes) => (label) => at(minutes[Number(label.match(/^ci:collect#(\d+)/)[1]) - 1])
+
+test('a re-run not yet registered waits before the next cycle, and is judged once it registers (#123)', async () => {
+  const ci = (label) => redWith({ ...RIG, link: job(/^ci:(collect|judge)#[3-9]/.test(label) ? 4 : 1) }).ci
+  let judged = 0
+  const { labels, logs, napMs, result } = await run({ ci, reviews: WAITING, judge: j => judged++ ? j : rerunAll(j), args: { maxCycles: 3 } })
+  assert.deepEqual(ciLabels(labels).filter(l => l.startsWith('ci:judge')), ['ci:judge#1', 'ci:judge#3'])
+  assert.ok(logs.some(l => /cycle 1: CI still settling .* re-arming after a wait/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /cycle 2: CI still settling .* re-arming after a wait/.test(l)))
+  assert.ok(napMs.includes(60000) && napMs.includes(120000), JSON.stringify(napMs))
+  assert.notEqual(result.reason, 'ci-stuck')
+})
+
+test('a re-run that never registers stops ci-stuck after ciWait minutes, naming its check (#123)', async () => {
+  const opts = { ci: redWith(RIG).ci, reviews: WAITING, judge: rerunAll }
+  const { result, logs } = await run({ ...opts, clock: minuteOf([0, 10, 30]), args: { maxCycles: 5 } })
+  assert.equal(result.reason, 'ci-stuck')
+  assert.deepEqual(result.unregistered, ['ci / hil / pico'])
+  assert.equal(result.cycles, 3)
+  assert.ok(logs.some(l => /the re-run of ci \/ hil \/ pico has not registered within 30 minutes/.test(l)))
+  const early = await run({ ...opts, clock: minuteOf([0, 10, 29]), args: { maxCycles: 3 } })
+  assert.notEqual(early.result.reason, 'ci-stuck', 'within ciWait it is still settling')
+})
+
+test('a re-run\'s deadline carries across launches; one from a state without its time starts at the resume (#123)', async () => {
+  const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll })
+  const { state } = first.result
+  assert.deepEqual(state.ciCache.reruns.map(r => r.at), [at(0)])
+  const resumed = (st, minutes) => run({ args: { ...YIELD, state: st }, reviews: WAITING, ci: redWith(RIG).ci, clock: () => at(minutes) })
+  assert.notEqual((await resumed(state, 29)).result.reason, 'ci-stuck')
+  assert.equal((await resumed(state, 30)).result.reason, 'ci-stuck', 'the resume does not restart the deadline')
+  const old = seal({ ...state, ciCache: { ...state.ciCache, reruns: state.ciCache.reruns.map(({ at: _, ...r }) => r) } })
+  const timed = await resumed(old, 100)
+  assert.notEqual(timed.result.reason, 'ci-stuck')
+  assert.deepEqual(timed.result.state.ciCache.reruns.map(r => r.at), [at(100)], 'timed from the first read after the resume, once')
+  assert.equal((await resumed(timed.result.state, 130)).result.reason, 'ci-stuck')
 })
 
 test('a re-run recorded under a copy\'s link still settles the execution it copied', async () => {

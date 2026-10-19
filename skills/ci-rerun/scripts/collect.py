@@ -7,7 +7,7 @@
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
-prints one JSON object {head, status, mergeable, pending, registered, ignored, waiting, checks}, plus `error` when set
+prints one JSON object {head, status, mergeable, pending, registered, ignored, waiting, checks, observedAt}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error); every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
@@ -23,7 +23,8 @@ pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
 failed or was cancelled) or green; `mergeable` is GitHub's, read last;
 `pending` counts the pending checks, `registered` every check. `waiting`, '' unless
 running, fingerprints the pending checks (name, link, attempt) and mergeable: two
-reads with the same one saw nothing move. A failed or cancelled CircleCI job whose
+reads with the same one saw nothing move. `observedAt` is the UTC time of the
+print, `YYYY-MM-DDTHH:MM:SSZ`, the caller's clock. A failed or cancelled CircleCI job whose
 workflow has not finished (running, failing, on_hold, queued: CircleCI refuses
 to re-run it yet) counts as pending, read from CircleCI's public job and
 workflow API on every poll; a status it cannot read is an error. This also
@@ -382,7 +383,8 @@ def printed(inv, brief=False):
     pending = sorted([c['name'], c.get('link') or '', c.get('attempt') or ''] for c in inv['checks'] if c['bucket'] == 'pending')
     return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
             'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
-            'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed}
+            'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed,
+            'observedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
 
 
 def evidence_dir(repo, pr, head):

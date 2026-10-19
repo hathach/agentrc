@@ -77,8 +77,8 @@ STALLED = {
     'ci-red-sonar-gate': "the SonarCloud gate fails: relaunch only when markSonar has an answered issue to mark or the gate changed; "
                          "otherwise it is the user's to resolve or accept",
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
-    'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head: observe them once (a hung job, a missing runner) '
-                'before relaunching',
+    'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
+                'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
                      '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',

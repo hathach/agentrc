@@ -255,7 +255,8 @@ if (args.stateRef != null) {
 }
 // CI knowledge per head, so a relaunch neither re-reads nor re-judges: re-runs (sure false for a lost judge) and each run link's verdict digest; verdicts live in collect.py's store. placedWith = `<ciNotes digest>:<base job>` an unclassified verdict was judged with.
 const ciCacheShaped = (c) => c && typeof c === 'object' &&
-  Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean') &&
+  Array.isArray(c.reruns) && c.reruns.every(r => r && ['head', 'link', 'workflow', 'check'].every(k => typeof r[k] === 'string') && typeof r.sure === 'boolean' &&
+    (r.at === undefined || Number.isFinite(Date.parse(r.at)))) &&
   Array.isArray(c.entries) && c.entries.every(e => e && ['head', 'link', 'bucket', 'digest'].every(k => typeof e[k] === 'string') &&
     (e.placedWith === undefined || typeof e.placedWith === 'string'))
 const config = { pr: args.pr, reviewers, autoRun, checkoutDir, ciWait, protected: protectedRe ? protectedRe.source : null, generated: generatedRe ? generatedRe.source : null }
@@ -331,11 +332,11 @@ const COLLECT_CHECK = {
   },
 }
 const INVENTORY = withSeal({
-  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks'],
+  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'observedAt'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
     pending: { type: 'integer' }, registered: { type: 'integer' }, ignored: { type: 'array', items: { type: 'string' } }, waiting: { type: 'string' },
-    checks: { type: 'array', items: COLLECT_CHECK },
+    checks: { type: 'array', items: COLLECT_CHECK }, observedAt: { type: 'string' },
   },
 })
 const GATE = {
@@ -737,7 +738,7 @@ const deferralLine = (f) => {
 const history = restored && restored.last ? [restored.last] : []
 const launchFrom = history.length
 // A check keeps its old link until its re-run registers; one is never re-run twice on a head.
-const ciReruns = restored ? restored.ciCache.reruns : []
+const ciReruns = restored ? restored.ciCache.reruns.map(r => ({ ...r })) : []
 const noteRerun = (r) => {
   const i = ciReruns.findIndex(x => x.head === r.head && x.link === r.link)
   if (i < 0) ciReruns.push(r)
@@ -1892,8 +1893,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
   const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
+  // A re-run is timed from when it was asked; one carried from a state without that time, from this launch's first read (#123).
+  for (const r of ciReruns) if (r.at === undefined) r.at = inv.observedAt
   const reruns = ciReruns.filter(r => r.head === inv.head)
-  const settling = failing.filter(c => reruns.some(r => r.sure && [c.link, ...c.aliases].includes(r.link)))
+  const rerunOf = (c) => reruns.find(r => r.sure && [c.link, ...c.aliases].includes(r.link))
+  const settling = failing.filter(rerunOf)
+  const overdue = settling.filter(c => Date.parse(inv.observedAt) - Date.parse(rerunOf(c).at) >= ciWait * 60000)
   // A run's conclusion can change under the same link, so the bucket must match too.
   const reusable = (c) => !settling.includes(c) && !gated.includes(c) && c.attempt && ciVerdicts.has(c.link) &&
     ciVerdicts.get(c.link).head === inv.head && ciVerdicts.get(c.link).bucket === c.bucket
@@ -1959,6 +1964,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   ciChecks.unchanged += unchanged.length
   const report = {
     headSha: inv.head, status: settling.length ? 'running' : inv.status, infraRerun: [],
+    // A re-run not yet registered reads as a red the inventory returns at once: the re-arm waits instead (#123).
+    ...(settling.length && inv.status !== 'running' ? { settling: true } : {}),
+    ...(overdue.length ? { unregistered: overdue.map(c => `${c.workflow} / ${c.name}`) } : {}),
     realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)))),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
@@ -2009,17 +2017,20 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (!judged || !sameLinks(answered, links)) {
     if (judged) log(`cycle ${cycle}: CI judge answered ${JSON.stringify(answered)} for ${JSON.stringify(links)} — re-arming`)
     // It may have re-run any of them: none is re-run again on this head.
-    for (const c of judging) noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: false })
+    for (const c of judging) noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: false, at: inv.observedAt })
     return null
   }
   const reran = judging.filter(c => judged.checks.find(j => j.link === c.link).failures.length === 0)
   for (const c of reran) {
     if (reruns.some(r => r.workflow === c.workflow && r.check === c.name)) log(`cycle ${cycle}: CI judge re-ran ${c.workflow} / ${c.name} a second time`)
-    noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true })
+    noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true, at: inv.observedAt })
     ciVerdicts.delete(c.link)
   }
   // An empty answer is a re-run by the contract.
-  if (reran.length) report.status = 'running'
+  if (reran.length) {
+    report.status = 'running'
+    if (inv.status !== 'running') report.settling = true
+  }
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
   // A partly judged check is answered by its judgeOnly failures or by all of them; anything else is judged whole next time.
   const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
@@ -2561,6 +2572,10 @@ const runLanes = async (cycle, entry, lanes) => {
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s) after two whole waits — observe them before relaunching`)
       return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending })
     }
+    if (c.unregistered) {
+      log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: the re-run of ${c.unregistered.join(', ')} has not registered within ${ciWait} minutes — observe it before relaunching`)
+      return stop(cycle, 'ci-stuck', { head: expectedHead, unregistered: c.unregistered })
+    }
     if (!reviewLane) {
       log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
       return null
@@ -2616,7 +2631,8 @@ const runLanes = async (cycle, entry, lanes) => {
       }
     }
     if (c.status === 'running' || c.infraRerun.length > 0) {
-      log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming`)
+      if (c.settling) napMs = backoff(cycle)
+      log(`cycle ${cycle}: CI still settling (${c.infraRerun.length} infra re-run(s)) — re-arming${c.settling ? ' after a wait' : ''}`)
       return rearm()
     }
     if (!reviewsSettled) {
