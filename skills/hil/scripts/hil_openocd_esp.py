@@ -630,3 +630,12 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     op.segments = tuple(records)
     op.session['security'] = security
     return op
+
+
+def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
+    """Reset and run the chip through a managed session: init within `timeout` seconds, then the
+    reviewed end, `reset run` and a confirmed shutdown within CLEANUP_TIMEOUT. init examines the
+    cores, which panics a running app built with the end-of-stack watchpoint; the reset run
+    that follows reboots it, and an init that failed leaves the session pending instead.
+    Returns hil_flash's Operation, as flash_openocd_esp without `segments`."""
+    return _run(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)

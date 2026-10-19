@@ -836,6 +836,35 @@ class Programming(SessionCase):
         self.assertEnded(op)
 
 
+class Reset(SessionCase):
+    def reset(self, **kw):
+        return self.run_op(lambda timeout: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=timeout,
+                                                                 openocd=str(self.exe)), **kw)
+
+    def test_init_then_reset_run_and_a_confirmed_shutdown(self):
+        op = self.reset()
+        self.assertEqual(self.tcl(), ['token?', 'init', 'reset run', 'shutdown'])
+        self.assertEqual(op.returncode, 0)
+        self.assertFalse(hasattr(op, 'segments'))
+        self.assertEnded(op)
+
+    def test_an_init_failure_is_never_followed_by_a_reset(self):
+        op = self.reset(script={'init': 'err:esp_usb_jtag: could not find or open device!'})
+        self.assertEqual(self.tcl(), ['token?', 'init'])
+        self.assertPending(op)
+
+    def test_an_init_outstanding_at_the_timeout_is_pending(self):
+        op = self.reset(timeout=2, script={'init': 'hang'})
+        self.assertEqual((op.returncode, self.tcl()), (124, ['token?', 'init']))
+        self.assertPending(op)
+
+    def test_a_failed_reset_run_is_pending(self):
+        op = self.reset(script={'reset run': 'err:Target not examined yet'})
+        self.assertEqual(self.tcl(), ['token?', 'init', 'reset run'])
+        self.assertEqual(op.returncode, 1)
+        self.assertPending(op)
+
+
 class Segments(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()

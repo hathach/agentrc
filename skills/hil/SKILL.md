@@ -147,6 +147,26 @@ recovery stay the contract's. Linux only.
   AIRCR SYSRESETREQ through such a session, a reset distinct from the probe's
   (`reset_jlink`, `reset_stlink`). Their results are raw: judging the
   transcript, retrying and recovering stay the caller's.
+- `openocd_esp` is `scripts/hil_openocd_esp.py`'s (`flash_openocd_esp`,
+  `reset_openocd_esp`): an Espressif chip's built-in USB-Serial/JTAG through
+  openocd-esp32 v0.12.0-esp32-20260703 only. `uid` is the USJ serial; `args`
+  is `-f board/<chip>-builtin.cfg` or `-f interface/esp_usb_jtag.cfg -f
+  target/<chip>.cfg` and nothing else. The USJ's bus-port is resolved by
+  serial, exactly one match, and pinned before init; it is never convoy-safe.
+  A flash takes the caller's ordered segments (sector-aligned offset, raw
+  binary file, size), programs each with verify, stops at the first failure
+  and reads every segment back byte for byte. It also requires `security`, the
+  caller's evidence read from the chip before programming (for tinyuf2, with
+  esptool over the same USJ's serial port):
+  `{"flashEncryption": "off", "secureBoot": "off", "source": <where it was
+  read>}`. Without it, or with either feature not `off`, the flash is refused
+  before anything starts; the provider never infers or defaults the chip's
+  security state, and records the evidence in the operation. Each operation is one session that is never
+  killed: after a command that returned, `reset run` and a confirmed shutdown
+  end it; an init failure, a command outstanding at the timeout or interrupt,
+  or a failed reset or shutdown leaves cleanup `pending` with the session's
+  receipt, for the caller's cleanup holder, and no retry, restore or test may
+  overlap it.
 - rc 0 means the tool reported success, not that the target runs the image;
   the project's own checks decide that. rc 124 means the runner killed the
   tool's process group on the timeout and reaped it for a bounded grace: a
