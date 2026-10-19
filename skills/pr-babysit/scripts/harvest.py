@@ -111,7 +111,11 @@ def retry_at(notice):
     units = [unit for _, unit in terms]
     if not terms or len(set(units)) != len(units) or COUNTDOWN_TERM.sub('', m.group(1)).replace('and', '').replace(',', '').strip():
         return None
-    wait = timedelta(**{f'{unit}s': int(n) for n, unit in terms})
+    return after(notice, timedelta(**{f'{unit}s': int(n) for n, unit in terms}))
+
+
+def after(notice, wait):
+    """The notice's last edit plus wait, as an ISO 8601 UTC string."""
     return (stamp(notice['updated_at']) + wait).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
@@ -215,7 +219,7 @@ def limited_record(reason, notice, why, ev, sha):
     countdown (#138); `why` says why the notices give none."""
     at = None if why else retry_at(notice)
     if not at and notice and not why:
-        at = (stamp(notice['updated_at']) + ESTIMATED_RESET).strftime('%Y-%m-%dT%H:%M:%SZ')
+        at = after(notice, ESTIMATED_RESET)
         reason += '; no countdown read, reset estimated an hour after the notice'
     elif not at:
         reason += f"; no reset time read{f' ({why})' if why else ''}"

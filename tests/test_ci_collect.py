@@ -29,6 +29,20 @@ S3 = 'espressif_esp32s3_devkitc_1'
 
 
 
+class RateLimitParity(unittest.TestCase):
+    def test_collect_reads_a_rate_limit_as_facts_does(self):
+        cases = [('HTTP 403: API rate limit exceeded for user ID 1.', {'core': {'remaining': 0, 'reset': 1790000060}}),
+                 ('HTTP 403: You have exceeded a secondary rate limit.', {'core': {'remaining': 4000, 'reset': 1790000060}}),
+                 ('HTTP 429: Too Many Requests', {'graphql': {'remaining': 0, 'reset': 1790000000}}),
+                 ('HTTP 403: API rate limit exceeded', None), ('HTTP 502: Bad Gateway', {})]
+        for stderr, resources in cases:
+            with self.subTest(stderr):
+                out = b'not json' if resources is None else json.dumps({'resources': resources}).encode()
+                answer = lambda argv, **kw: mock.Mock(returncode=0, stdout=out)
+                with mock.patch('subprocess.run', answer), mock.patch('time.time', return_value=1789990000):
+                    self.assertEqual(collect.rate_limit(stderr), FACTS.rate_limit(stderr))
+
+
 def unsealed(text):
     """The printed line without its seal, which must be facts.py's over the rest; an error line has none."""
     line = json.loads(text)

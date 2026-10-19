@@ -198,9 +198,9 @@ if (args.stateRef != null) {
   let got = new Map()
   let idle = 0
   let call = 0
-  // Asks each chunk has failed: every second re-ask goes padded (#147), so a deterministic mis-copy reads other text.
+  // Asks each chunk has failed: a re-ask after an odd count goes padded (#147), so a deterministic mis-copy reads other text.
   const failed = new Map()
-  const padded = (i) => (failed.get(i) || 0) % 2 === 0 && failed.has(i)
+  const padded = (i) => (failed.get(i) || 0) % 2 === 1
   const reset = (reason) => { why = reason; length = 0; got = new Map() }
   const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
     env.digest === ref.digest && Array.isArray(env.chunks)
@@ -225,7 +225,7 @@ if (args.stateRef != null) {
   const indices = () => [...Array(Math.ceil(length / SIZE)).keys()]
   const missingOf = () => indices().filter(i => !got.has(i))
   // Idle rounds end the load only once every missing chunk was asked padded too.
-  const untried = () => length > 0 && missingOf().some(i => (failed.get(i) || 0) < 3)
+  const untried = () => length > 0 && missingOf().some(i => (failed.get(i) || 0) < 2)
   for (let round = 1; args.state == null && (idle < 2 || untried()) && round <= ROUNDS; round++) {
     const missing = length ? missingOf() : null
     const groups = missing ? [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
@@ -666,6 +666,9 @@ const withNulls = (s, v) => {
   }
   return out
 }
+// The first refusal for a GitHub rate limit this cycle: facts.py's rateLimit plus its error (#90).
+let githubLimit = null
+const noteLimit = (limit) => { githubLimit = githubLimit || limit }
 // A copy that fails its script's seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, ...opts }) => {
@@ -674,6 +677,7 @@ const relayAgent = async (prompt, { fileTool, ...opts }) => {
     log(`${opts.label}: the relayed copy does not match its seal`)
     return null
   }
+  if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit })
   return v
 }
 // A dead or unsealed relay gets one fresh Sonnet agent (Haiku mis-copies a long line); only for a script safe to run twice.
@@ -1492,6 +1496,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     return { pass: false, committed: true, detail: `commit failed audit: ${why}`, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
   }
 
+  if (githubLimit) return { pass: false, committed: true, detail: 'not pushed: GitHub refused a call for a rate limit this cycle', sha }
   beforePush()
   const push = await pushExact(sha, `push#${cycle}-${what}`)
   if (!push) return { pass: false, committed: true, detail: 'push agent died after the commit landed', sha, published: 'unknown' }
@@ -1543,18 +1548,16 @@ const readPrState = async (tag) => {
   return r && !r.error ? r.state : null
 }
 // Before each GitHub write but a push (push.py reads it itself), the state is read afresh: only a verified OPEN goes on.
+// A GitHub rate limit seen this cycle, before the read or during it, stops the write too; runCycle reports it (#90).
 const prGate = async (lanes, tag) => {
-  if (!lanes.prState) {
+  if (!lanes.prState && !githubLimit) {
     const state = await readPrState(tag)
     if (state !== 'OPEN') lanes.prState = state === 'MERGED' || state === 'CLOSED' ? state.toLowerCase() : 'unread'
   }
-  return lanes.prState
+  return lanes.prState || (githubLimit ? 'rate-limited' : null)
 }
 
 let napMs = 0
-// The first refusal for a GitHub rate limit this cycle: facts.py's rateLimit plus its error (#90).
-let githubLimit = null
-const noteLimit = (limit) => { githubLimit = githubLimit || limit }
 // The cycle number carries across launches; capped so a resumed launch does not nap a quarter hour per cycle.
 const backoff = (cycle) => 60000 * Math.min(cycle, 10)
 // Set where a cycle continues only to wait (CI, bots, owed replies, a SonarCloud re-read); any other continuation pauses yieldOnChange.
@@ -1846,16 +1849,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   }
   // A slice retried without its wait leaves the budget short of a whole wait.
   let shortened = false
-  const faultOf = (x, head) => {
-    if (x && x.rateLimit) noteLimit({ error: x.error || '', ...x.rateLimit })
-    return !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
-  }
+  const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
   const sameLinks = (got, want) => got.length === want.length && want.every(l => got.includes(l))
   const inventoryFailed = (inv) => {
-    const fault = faultOf(inv, inv ? inv.head : '')
-    if (!fault) return false
-    log(`cycle ${cycle}: CI inventory failed — ${fault}`)
+    if (inv && !inv.error) return false
+    log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
     return true
   }
   const endLanes = (inv) => {
@@ -1882,8 +1881,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}${ignoring}`, INVENTORY)
     if (inventoryFailed(inv)) return null
     left -= slice
-    if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended || reviewOnly(inv)) break
+    if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended || reviewOnly(inv) || githubLimit) break
   }
+  if (githubLimit) return ['merged', 'closed'].includes(inv.status) ? endLanes(inv) : null
   // Leaving the wait early on a brief slice still running, the whole inventory is read once, as it stands now;
   // not when the review lane is publishing, which supersedes this CI run anyway.
   if (!last && inv.status === 'running' && !lanes.reviewPublishing && !reviewOnly(inv)) {
@@ -2001,10 +2001,11 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const links = judging.map(c => c.link)
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
+  if (githubLimit) return null
   const ev = await collect(`ci:collect#${cycle}.f`, `failures ${[...links.map(l => `--check ${shq(l)}`), ...gated.map(c => `--gate ${shq(c.link)}`)].join(' ')}`, EVIDENCE)
-  const evFault = faultOf(ev, inv.head)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
   if (superseded()) return report
+  const evFault = faultOf(ev, inv.head)
   if (evFault) {
     log(`cycle ${cycle}: CI evidence not collected — ${evFault}`)
     return null
@@ -2798,9 +2799,12 @@ if (adoptHead !== null) {
   // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49),
   // unless only a base merge changes it and the caller named it in adoptProtected (#97).
   const mergeOnly = audit && !audit.error ? audit.mergeOnly.map(canon) : []
-  const exempt = new Set(mergeOnly.filter(f => adoptProtected.includes(f)))
-  const touchedProtected = protectedRe && audit ? [...new Set(audit.unpublished.map(canon).filter(f => f && protectedRe.test(f)))] : []
-  const guarded = touchedProtected.filter(f => !exempt.has(f))
+  const guarded = [], waived = []
+  if (protectedRe && audit && !audit.error) {
+    for (const f of new Set(audit.unpublished.map(canon))) {
+      if (f && protectedRe.test(f)) (mergeOnly.includes(f) && adoptProtected.includes(f) ? waived : guarded).push(f)
+    }
+  }
   const why = !audit ? 'the audit agent died'
     : audit.error ? `the chain could not be read back: ${audit.error}`
     : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead || audit.base !== base || audit.tip !== tip
@@ -2818,7 +2822,6 @@ if (adoptHead !== null) {
     }
     return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: why }))
   }
-  const waived = touchedProtected.filter(f => exempt.has(f))
   if (waived.length) log(`preflight: adopting a base merge's change to protected path(s) ${waived.join(', ')}, named in adoptProtected`)
   if (prHead !== X && !shas.includes(prHead)) {
     log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor a commit of the chain to ${adoptHead.slice(0, 7)}`)

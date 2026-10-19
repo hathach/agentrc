@@ -175,8 +175,13 @@ class Failed(Exception):
         self.limit = limit
 
 
+def utc(seconds):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(seconds))
+
+
 def rate_limit(stderr):
-    """pr-babysit facts.py's rateLimit for a gh failure GitHub refused for a rate limit, else None."""
+    """rateLimit for a gh failure GitHub refused for a rate limit, else None: a copy of pr-babysit facts.py's, which
+    test_ci_collect holds equal."""
     if not re.search(r'rate limit|HTTP 429', stderr, re.I):
         return None
     try:
@@ -184,7 +189,6 @@ def rate_limit(stderr):
         spent = [r['reset'] for r in resources.values() if r.get('remaining') == 0 and isinstance(r.get('reset'), int)]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         spent = []
-    utc = lambda t: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
     return {'observedAt': utc(time.time()), 'resetAt': utc(max(spent)) if spent else None,
             'secondary': not spent or 'secondary' in stderr.lower()}
 
@@ -402,7 +406,7 @@ def printed(inv, brief=False):
     return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
             'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
             'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed,
-            'observedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+            'observedAt': utc(time.time())}
 
 
 def evidence_dir(repo, pr, head):

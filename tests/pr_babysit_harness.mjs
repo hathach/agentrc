@@ -322,6 +322,8 @@ async function run(opts = {}) {
     }
     if (label.startsWith('reviews#')) {
       if (reviews instanceof Error) throw reviews
+      // opts.reviewsWait(calls): hold the validator's answer, as afterReviewLane holds the CI evidence.
+      if (opts.reviewsWait) await opts.reviewsWait(calls)
       const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
       // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
       if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
@@ -1825,6 +1827,8 @@ const WAITING = { findings: [], replies: [], bots: 'pending' }
 const YIELD = { autoPush: true, maxCycles: 3, yieldAfterCycle: true }
 const ciLabels = (labels) => labels.filter(l => l.startsWith('ci:'))
 const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
+// A judge that re-ran every check it was given: an empty failure list is a re-run by the contract.
+const rerunAll = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
 
 test('a same-head relaunch recalls the judged verdicts from the store: no judge', async () => {
   const store = new Map()
@@ -2024,14 +2028,12 @@ test('a check keeps one re-run record per head, and a known re-run replaces a po
   const lost = await run({ throwOn: 'ci:judge#', args: { autoPush: true, maxCycles: 3 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.equal(lost.labels.filter(l => l.startsWith('ci:judge#')).length, 3)
   assert.deepEqual(lost.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', false]])
-  const rerun = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
-  const known = await run({ throwOn: 'ci:judge#1', judge: rerun, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
+  const known = await run({ throwOn: 'ci:judge#1', judge: rerunAll, args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(known.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
 })
 
 test('a re-run carries across a launch: its old run is still settling', async () => {
-  const rerun = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
-  const first = await run({ args: YIELD, reviews: WAITING, ci: { status: 'red', infraRerun: ['7'], realFailures: [RIG] }, judge: rerun })
+  const first = await run({ args: YIELD, reviews: WAITING, ci: { status: 'red', infraRerun: ['7'], realFailures: [RIG] }, judge: rerunAll })
   assert.deepEqual(first.result.state.ciCache.reruns.map(r => [r.check, r.sure]), [['hil / pico', true]])
   const again = await run({ args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1'])
@@ -2039,7 +2041,6 @@ test('a re-run carries across a launch: its old run is still settling', async ()
 })
 
 // #123: a red whose re-run has not registered came back at once, and the re-arm spent a cycle every few seconds.
-const rerunAll = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
 const minuteOf = (minutes) => (label) => at(minutes[Number(label.match(/^ci:collect#(\d+)/)[1]) - 1])
 
 test('a re-run not yet registered waits before the next cycle, and is judged once it registers (#123)', async () => {
@@ -2104,10 +2105,13 @@ test('a CI read GitHub refused for a rate limit stops the cycle too, with its re
   assert.ok(logs.some(l => l.includes(`relaunch after ${at(60)}`)))
 })
 
-test('a cycle that pushed a repair is charged though the other lane met a rate limit; the uncharged cycle number runs again (#90)', async () => {
-  const { result } = await run({ reviews: oneValid, garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
+test('a repair committed in a rate-limited cycle is held unpushed and charged; the uncharged cycle number runs again (#90)', async () => {
+  const { result, labels } = await run({ reviews: oneValid, garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
   assert.equal(result.reason, 'github-rate-limited')
-  assert.ok(result.history[0].reviewPush, 'the review lane pushed')
+  assert.deepEqual([result.history[0].reviewPushFailed.committed, result.history[0].reviewPushFailed.detail],
+    [true, 'not pushed: GitHub refused a call for a rate limit this cycle'])
+  assert.equal(labels.some(l => l.startsWith('push#')), false)
+  assert.equal(result.state.pending.stage, 'push-failed', 'the landed commit stays the caller\'s to decide')
   assert.equal(result.state.cyclesUsed, 1)
   const first = await run({ reviews: WAITING, args: YIELD })
   const quiet = await run({ reviews: LIMITED_REVIEWS, args: { ...YIELD, state: first.result.state } })
@@ -2125,7 +2129,7 @@ test('reply.py refused for a rate limit stops the launch too; a cycle that re-ra
   const midBatch = await run({ reviews: oneValid, lost: () => RATE, args: { autoPush: true, maxCycles: 4 } })
   assert.equal(midBatch.result.reason, 'github-rate-limited', 'a receipt\'s error names it too')
   assert.equal(midBatch.result.rateLimit.error, `reply.py: ${RATE}`)
-  const reran = await run({ reviews: LIMITED_REVIEWS, ci: redWith(RIG).ci, judge: rerunAll, args: { maxCycles: 4 } })
+  const reran = await run({ reviews: LIMITED_REVIEWS, reviewsWait: afterReviewLane('ci:judge#1'), ci: redWith(RIG).ci, judge: rerunAll, args: { maxCycles: 4 } })
   assert.equal(reran.result.reason, 'github-rate-limited')
   assert.deepEqual(reran.result.state.ciCache.reruns.map(r => r.sure), [true])
   assert.equal(reran.result.state.cyclesUsed, 1, 'a re-run without a receipt is still one')
@@ -2140,6 +2144,21 @@ test('CI evidence refused for a rate limit stops the launch even when a review p
   assert.equal(labels.includes('ci:judge#1'), false, 'superseded evidence is still not judged')
   assert.equal(result.reason, 'github-rate-limited')
   assert.deepEqual(result.rateLimit, { error: RATE, ...LIMIT })
+})
+
+test('once one lane met a rate limit, the other makes no further GitHub call this cycle (#90)', async () => {
+  const waiting = await run({ reviews: LIMITED_REVIEWS, ci: { status: 'running', infraRerun: [], realFailures: [] }, args: { maxCycles: 4 } })
+  assert.equal(waiting.result.reason, 'github-rate-limited')
+  assert.deepEqual(ciLabels(waiting.labels), ['ci:collect#1.1'], 'no further slice and no full read')
+  for (const status of ['merged', 'closed']) {
+    const ended = await run({ reviews: LIMITED_REVIEWS, ci: { ...GREEN, status, mergeable: 'UNKNOWN' }, args: { maxCycles: 4 } })
+    assert.equal(ended.result.reason, `pr-${status}`, 'an ended PR still outranks the limit')
+  }
+  const refuting = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+  const posting = await run({ reviews: refuting, reviewsWait: afterReviewLane('ci:collect#1.1'), garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(posting.result.reason, 'github-rate-limited')
+  assert.equal(posting.labels.some(l => /^(prstate|replies)#/.test(l)), false, 'the write gate stops before reading the PR state')
+  assert.equal(posting.result.state.cyclesUsed, 0)
 })
 
 test('another harvest error keeps today\'s path: every reviewer unknown, re-armed (#90)', async () => {
@@ -6904,7 +6923,7 @@ test('a mis-copied, missing or duplicated chunk is asked for again alone', async
   ]
   for (const [change, again] of cases) {
     const got = await loadWith(state, stateRef, once(change))
-    assert.deepEqual(asks(got.calls), ['all', again])
+    assert.deepEqual(asks(got.calls), ['all', `${again}+pad`], 'a re-ask goes padded')
     assert.equal(got.labels[2], 'preflight')
     assert.deepEqual(got.result.state.decisions, state.decisions)
   }
@@ -6912,11 +6931,11 @@ test('a mis-copied, missing or duplicated chunk is asked for again alone', async
   const extra = await loadWith(state, stateRef, (env, label) => label === 'state:load#1'
     ? { ...env, chunks: [...env.chunks.slice(1), { i: 999, data: 'AAAA', sum: fnv1a('AAAA') }] }
     : { ...env, chunks: [...env.chunks, { ...transferOf(state).chunks[last] }] })
-  assert.deepEqual(asks(extra.calls), ['all', '0'])
+  assert.deepEqual(asks(extra.calls), ['all', '0+pad'])
   assert.equal(extra.labels[2], 'preflight')
 })
 
-test('a chunk mis-copied the same way twice is asked again padded, so its text differs (#147)', async () => {
+test('a mis-copied chunk is asked again padded, so its text differs, then plain (#147)', async () => {
   const { state, stateRef } = await savedForLoad()
   // The relays keep the source's sum and alter the data, as wf_70c961b3-aea's did, on every unpadded copy of chunk 1.
   const stubborn = (env) => {
@@ -6924,14 +6943,14 @@ test('a chunk mis-copied the same way twice is asked again padded, so its text d
     return env
   }
   const got = await loadWith(state, stateRef, stubborn)
-  assert.deepEqual(asks(got.calls), ['all', '1', '1+pad'])
-  assert.equal(got.labels[3], 'preflight')
+  assert.deepEqual(asks(got.calls), ['all', '1+pad'])
+  assert.equal(got.labels[2], 'preflight')
   assert.deepEqual(got.result.state.decisions, state.decisions)
   // Two rounds without progress end the load; an answer whose pad is not the one asked for is no answer.
   const both = await loadWith(state, stateRef, (env) => { for (const c of env.chunks) if (c.i === 1) c.data = flip(c.data); return env })
-  assert.deepEqual(asks(both.calls), ['all', '1', '1+pad'])
+  assert.deepEqual(asks(both.calls), ['all', '1+pad', '1'])
   assert.equal(both.result.reason, 'state-transfer-failed')
-  const unpadded = await loadWith(state, stateRef, (env, label) => label === 'state:load#3' ? { ...env, pad: false } : stubborn(env))
+  const unpadded = await loadWith(state, stateRef, (env, label) => label === 'state:load#2' ? { ...env, pad: false } : stubborn(env))
   assert.equal(unpadded.result.reason, 'state-transfer-failed')
   // Every plain copy failing makes two idle rounds before any padded ask: the load runs on until each chunk had one.
   const all = await loadWith(state, stateRef, (env) => { if (!env.pad) for (const c of env.chunks) c.data = flip(c.data); return env })
@@ -6944,7 +6963,7 @@ test('changed metadata, or a chunk changed with its sum, asks for the whole stat
   // A length off by one looks consistent alone: the last chunk seems short, so it is
   // asked for again, and the true length in that reply then drops everything.
   const offByOne = await loadWith(state, stateRef, once(env => ({ ...env, length: env.length + 1 })))
-  assert.deepEqual(asks(offByOne.calls), ['all', String(transferOf(state).chunks.length - 1), 'all'])
+  assert.deepEqual(asks(offByOne.calls), ['all', `${transferOf(state).chunks.length - 1}+pad`, 'all'])
   assert.equal(offByOne.labels[3], 'preflight')
   for (const change of [
     env => ({ ...env, length: 256 * 1024 + 1 }),
@@ -6959,7 +6978,7 @@ test('changed metadata, or a chunk changed with its sum, asks for the whole stat
   // A partial reply whose length differs from the retained chunks' drops them too.
   const partial = await loadWith(state, stateRef, (env, label) =>
     label === 'state:load#1' ? { ...env, chunks: env.chunks.slice(1) } : label === 'state:load#2' ? { ...env, length: env.length - 1 } : env)
-  assert.deepEqual(asks(partial.calls), ['all', '0', 'all'])
+  assert.deepEqual(asks(partial.calls), ['all', '0+pad', 'all'])
   assert.equal(partial.labels[3], 'preflight')
 })
 
@@ -6983,11 +7002,11 @@ test('a large state arrives in two rounds, four chunks per call, and a mangled b
     if (label === 'state:load#2') { delete e.chunks[2].sum; e.chunks[3].data = flip(e.chunks[3].data) }
     return e
   })
-  assert.deepEqual(asks(live.calls), ['all', '3,4,5,6', '7,8', '5,6'], 'every missing chunk is asked for at once, four to a call')
-  assert.equal(live.labels[4], 'preflight')
+  assert.deepEqual(asks(live.calls), ['all', '4,5,6,7', '8', '3+pad', '6,7+pad'], 'every missing chunk is asked for at once, four to a call, re-asks padded')
+  assert.equal(live.labels[5], 'preflight')
   // A reply with mis-copied metadata costs its own chunks, not its siblings'.
   const sibling = await loadWith(state, stateRef, (env, label) => label === 'state:load#2' ? { ...env, digest: '00000000' } : env)
-  assert.deepEqual(asks(sibling.calls), ['all', '4,5,6,7', '8', '4,5,6,7'])
+  assert.deepEqual(asks(sibling.calls), ['all', '4,5,6,7', '8', '4,5,6,7+pad'])
   assert.equal(sibling.labels[4], 'preflight')
   // A short copied length sizes a short budget; the true length, once accepted, grows it.
   const short = await loadWith(state, stateRef, (env, label) => {
@@ -6997,7 +7016,7 @@ test('a large state arrives in two rounds, four chunks per call, and a mangled b
     if (label === 'state:load#5') for (const c of e.chunks) if (c.i !== 8) c.data = flip(c.data)
     return e
   })
-  assert.deepEqual(asks(short.calls), ['all', '3', 'all', '4,5,6,7', '8', '4,5,6'])
+  assert.deepEqual(asks(short.calls), ['all', '3+pad', 'all', '4,5,6,7', '8', '4,5,6+pad'])
   assert.equal(short.labels[6], 'preflight')
   // Progress undone by every other reply stops at the round budget.
   const seesaw = await loadWith(state, stateRef, (env, label) =>

@@ -107,14 +107,13 @@ const threadsFile = `${factsDir}/threads-${head}.json`
 const THREADS = { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } }
 const threadsCmd = `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`
 // A relay that throws is no answer, as one that returns nothing.
-const dies = () => null
-let threadsOut = await relay('threads', 'Context', threadsCmd, THREADS).catch(dies)
+let threadsOut = await relay('threads', 'Context', threadsCmd, THREADS).catch(() => null)
 // A copy that is not the script's line (one wrapped as a string, #150) is asked once more, on a fresh label: a resume
 // replays a label's cached answer. The script's own error is its answer.
 if (!threadsOut || (!threadsOut.error && threadsOut.file !== threadsFile)) {
   threadsOut = await agent(`${IN}Run exactly: ${threadsCmd}\nIts last stdout line is one JSON object {"file": ..., "count": ...}: return that object ` +
     `itself as your answer, its members as members, not the line as a string; file is ${threadsFile}.`,
-  { label: 'threads:retry', phase: 'Context', model: 'sonnet', effort: 'low', schema: THREADS }).catch(dies)
+  { label: 'threads:retry', phase: 'Context', model: 'sonnet', effort: 'low', schema: THREADS }).catch(() => null)
 }
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')
 const DISPUTES = { type: 'object', additionalProperties: false, properties: { error: { type: 'string' }, disputes: { type: 'array', items: { type: 'object', required: ['findingId', 'key', 'replies'],
@@ -262,7 +261,7 @@ const groupingOk = (x) => {
     x.groups.every(g => g.findings.length + g.claims.length > 1 && g.findings.every(i => Number.isInteger(i) && pool[i]) &&
       g.claims.every(id => Object.hasOwn(claimOf, id)) && oneFile(g))
 }
-const askGroups = (label, prompt) => agent(prompt, { label, phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS }).catch(dies)
+const askGroups = (label, prompt) => agent(prompt, { label, phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS }).catch(() => null)
 let grouped = asked.size ? await askGroups('group', groupPrompt) : { groups: [] }
 // One unusable answer (#150) gets one more judgment, on a fresh label, before its findings stay ungrouped.
 if (!groupingOk(grouped)) {

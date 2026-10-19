@@ -121,9 +121,10 @@ def chain(start, end, published, base, tip):
     found = [commit(sha) for sha in git('rev-list', '--reverse', '--first-parent', f'{full(start)}..{full(end)}').split()]
     shas = [c['sha'] for c in found]
     after = shas.index(published) + 1 if published in shas else 0
+    unpublished = touched(found[after:])
     ordinary = set(touched(c for c in found[after:] if len(c['parents']) == 1))
     return {'from': start, 'to': end, 'published': published, 'base': base, 'tip': tip, 'commits': shas, 'paths': touched(found),
-            'unpublished': touched(found[after:]), 'mergeOnly': [p for p in touched(found[after:]) if p not in ordinary],
+            'unpublished': unpublished, 'mergeOnly': [p for p in unpublished if p not in ordinary],
             'refusal': chain_refusal(start, end, bases, found)}
 
 
