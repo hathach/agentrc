@@ -235,6 +235,15 @@ class JLink(unittest.TestCase):
         self.assertEqual(beside, [Path(path).name])
         self.assertEqual(os.listdir(d), [])
 
+    def test_flash_and_reset_take_a_workdir_for_their_command_file(self):
+        self.in_dir()
+        work, seen = tempfile.mkdtemp(dir=os.environ.get('TMPDIR')), []
+        self.addCleanup(os.rmdir, work)
+        hf.flash_jlink(JLINK, '/fw/a.hex', timeout=7, run=self.reading_run(seen), workdir=work)
+        hf.reset_jlink(JLINK, timeout=7, run=self.reading_run(seen), workdir=work)
+        self.assertEqual([Path(p).parent for p, _, _ in seen], [Path(work).resolve()] * 2)
+        self.assertEqual(os.listdir(work), [])
+
     def test_reset_writes_its_script_every_time_and_removes_it(self):
         d, seen = self.in_dir(), []
         for _ in range(2):
@@ -307,8 +316,8 @@ class JLink(unittest.TestCase):
             now, starts = [0.0], []
 
             @contextlib.contextmanager
-            def slow_command_file(script):
-                with real_command_file(script) as made:
+            def slow_command_file(script, **kw):
+                with real_command_file(script, **kw) as made:
                     now[0] += prep
                     yield made
 

@@ -163,12 +163,12 @@ def _command_file(script: list, *, prefix='hil_jlink_', suffix='.jlink', workdir
         Path(path).unlink(missing_ok=True)
 
 
-def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run) -> Operation:
+def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run, workdir=None) -> Operation:
     # crash_retries reruns share one deadline, taken once the command file is written, and
     # never start over a session the runner reports pending or names by a receipt. A rerun is
     # no proof the target was untouched.
     run, attempts = _runner(run), []
-    with _command_file(script) as (path, text):
+    with _command_file(script, workdir=workdir) as (path, text):
         cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
                f'-NoGui 1 -ExitOnError 1 -CommandFile {shlex.quote(path)}')
         deadline = time.monotonic() + timeout
@@ -184,16 +184,16 @@ def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run)
 
 
 def flash_jlink(flasher: dict, firmware: str, *, timeout,
-                crash_retries: int = 0, run=None) -> Operation:
+                crash_retries: int = 0, run=None, workdir=None) -> Operation:
     # loadfile resets and halts the target itself by default (J-Link Commander, LoadFile)
     script = ['halt', f'loadfile {firmware}', 'r', 'go', 'exit']
-    return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
+    return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run, workdir=workdir)
 
 
 def reset_jlink(flasher: dict, *, timeout,
-                crash_retries: int = 0, run=None) -> Operation:
+                crash_retries: int = 0, run=None, workdir=None) -> Operation:
     script = ['halt', 'r', 'go', 'exit']
-    return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
+    return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run, workdir=workdir)
 
 
 def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, autoconnect: bool, device: str,

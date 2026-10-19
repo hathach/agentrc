@@ -141,6 +141,8 @@ recovery stay the contract's. Linux only.
   (`pending`, then `unknown`, then `done`) and `receipts` lists every
   receipt. A J-Link crash is not rerun after an attempt reported `pending`
   or a receipt.
+- `flash_jlink` and `reset_jlink` write their command file in `workdir`, the
+  current directory by default.
 - `run_jlink_commands` and `run_stlink_commands` run one probe session of the
   caller's commands with the caller's connection profile, from a unique
   command file in `workdir`; `sysresetreq_jlink` and `sysresetreq_stlink` write
