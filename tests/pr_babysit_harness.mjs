@@ -2079,6 +2079,17 @@ test('a re-run\'s deadline starts after the judge returns, not at the inventory 
   assert.equal(lost.result.cycles, 5, 'an unread time is taken from the next read, at minute 15')
 })
 
+test('a PR the read after a re-run finds merged or closed ends both lanes, its re-run kept (#123)', async () => {
+  for (const status of ['merged', 'closed']) {
+    const ci = (label) => label === 'ci:collect#1.t' ? { ...GREEN, status, mergeable: 'UNKNOWN' } : redWith(RIG).ci
+    const { result, labels, logs } = await run({ ci, reviews: WAITING, judge: rerunAll, args: { maxCycles: 3 } })
+    assert.equal(result.reason, `pr-${status}`, logs.join('\n'))
+    assert.equal(result.cycles, 1)
+    assert.equal(ciLabels(labels).at(-1), 'ci:collect#1.t', 'no further wait, read or judge')
+    assert.equal(result.state.ciCache.reruns.length, 1, 'the re-run is recorded')
+  }
+})
+
 test('a re-run\'s deadline carries across launches; one from a state without its time starts at the resume (#123)', async () => {
   const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll })
   const { state } = first.result

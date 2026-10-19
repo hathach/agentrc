@@ -2057,6 +2057,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     report.status = 'running'
     if (inv.status !== 'running') report.settling = true
   }
+  if (stamp && !stamp.error && ['merged', 'closed'].includes(stamp.status)) return endLanes(stamp)
   if (reran.length && judged.infraRerun.length === 0) log(`cycle ${cycle}: CI judge re-ran ${reran.length} check(s) without a receipt`)
   // A partly judged check is answered by its judgeOnly failures or by all of them; anything else is judged whole next time.
   const failuresOf = new Map(judged.checks.map(j => [j.link, j.failures]))
