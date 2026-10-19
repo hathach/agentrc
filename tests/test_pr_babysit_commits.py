@@ -122,7 +122,7 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual({k: v for k, v in out.items() if k != 'seal'}, {
             'from': self.base, 'to': two, 'published': self.base, 'base': self.base, 'tip': self.base, 'commits': [one, two], 'refusal': '',
-            'paths': ['b.c', NEWLINE], 'unpublished': ['b.c', NEWLINE]}, 'each path once, a name holding a newline whole')
+            'paths': ['b.c', NEWLINE], 'unpublished': ['b.c', NEWLINE], 'mergeOnly': []}, 'each path once, a name holding a newline whole')
 
     def test_unpublished_holds_only_what_the_commits_after_the_published_head_touch(self):
         self.write('b.c', 'b\n')
@@ -241,6 +241,18 @@ class CommitsTest(unittest.TestCase):
                     subprocess.run(['git', 'branch', '-q', '-D', branch], cwd=self.repo, env=ENV, capture_output=True)
                 one, tip, merge = self.base_merge(**case)
                 self.assertEqual(self.chain_of(merge, one, tip)['unpublished'], owned)
+
+    def test_merge_only_holds_the_unpublished_paths_no_ordinary_link_touches(self):
+        one, tip, merge = self.base_merge(base_files={'a.c': 'base\n'}, pr_files={'a.c': 'pr\n', 'b.c': 'b\n'},
+                                          resolve=lambda: self.write('a.c', 'base\npr\n'))
+        self.assertEqual(self.chain_of(merge, one, tip)['mergeOnly'], ['a.c'], 'a conflict resolved in the merge')
+        self.assertEqual(self.chain_of(merge, self.base, tip)['mergeOnly'], [], 'the unpublished PR commit before it touches a.c too')
+        self.assertEqual(self.chain_of(merge, merge, tip)['mergeOnly'], [], 'a published merge publishes nothing')
+        self.write('a.c', 'base\npr\nmore\n')
+        two = self.commit('edit after the merge', 'a.c')
+        out = self.chain_of(two, one, tip)
+        self.assertEqual((out['unpublished'], out['mergeOnly']), (['a.c'], []), 'an ordinary link touching the same path')
+        self.assertEqual(self.chain_of(two, merge, tip)['mergeOnly'], [])
 
     def test_a_merge_that_changes_no_path_is_still_a_link(self):
         self.git('checkout', '-q', '-b', 'main')

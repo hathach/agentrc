@@ -94,7 +94,7 @@ const STATE_PIN = {
   remote: PIN.remote, pushUrls: PIN.pushUrls,
 }
 const chainAudit = (commits = [ADOPT], paths = ['src/adopted.c'], over = {}) => ({
-  from: HEAD, to: commits[commits.length - 1], commits, paths, unpublished: paths, refusal: '', ...over,
+  from: HEAD, to: commits[commits.length - 1], commits, paths, unpublished: paths, mergeOnly: [], refusal: '', ...over,
 })
 const adoptionState = ({
   maxCycles = 4, cyclesUsed = 1, reviewers = ['coderabbit'], autoRun = reviewers,
@@ -5429,7 +5429,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.equal(JSON.stringify(result.state).includes('adoptHead'), false, 'the launch argument is not persisted')
   const audit = calls.find(c => c.label === 'adopt:audit')
   assert.equal(audit.phase, 'Triage')
-  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'refusal'])
+  assert.deepEqual(audit.schema.required, ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'refusal'])
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
@@ -5514,7 +5514,7 @@ test('the audit script\'s refusal, or an audit of another range, is refused', as
 
 test('a merge whose base the checkout lacks stops as adopt-base-missing; other audit errors and refusals do not', async () => {
   const missing = `the PR's base ${TIP} is not in the checkout: fetch it`
-  const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], refusal: '' })
+  const errored = error => ({ error, from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], refusal: '' })
   for (const [audit, reason] of [
     [errored(missing), 'adopt-base-missing'],
     [errored('git rev-list: fatal: bad revision'), 'adopt-audit-failed'],
@@ -5532,7 +5532,7 @@ test('a merge whose base the checkout lacks stops as adopt-base-missing; other a
 test('a chain the audit script cannot read back is refused with its error', async () => {
   const { result, labels } = await run({
     args: adoptionArgs(adoptionState()), preflight: { head: ADOPT, prHead: HEAD },
-    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], refusal: '' },
+    adoptAudit: { error: 'git rev-list: fatal: bad revision', from: '', to: '', published: '', base: '', tip: '', commits: [], paths: [], unpublished: [], mergeOnly: [], refusal: '' },
   })
   assert.equal(result.reason, 'adopt-audit-failed')
   assert.equal(result.detail, 'the chain could not be read back: git rev-list: fatal: bad revision')
@@ -5723,6 +5723,49 @@ test('a protected path the PR already carries is adopted; one this run would pub
   assert.equal(elsewhere.result.reason, 'adopt-audit-failed', 'a receipt drawn at another publication boundary is no audit')
   assert.match(elsewhere.result.detail, /published at 1{40} on base .*, not .* published at 0f1e2d3c/)
   assert.equal(elsewhere.labels.includes('adopt:push'), false)
+})
+
+test('adoptProtected admits a protected path only a base merge changes, and only the paths it names (#97)', async () => {
+  const roster = ['test/hil/local.json', 'test/hil/other.json']
+  const state = adoptionState({ protected: '^test/hil/' })
+  const audit = (over) => chainAudit([ADOPT], roster, { mergeOnly: roster, ...over })
+  const HINT = '; only a base merge changes them, which adoptProtected may permit'
+  const merged = await run({
+    args: adoptionArgs(state, { autoPush: true, adoptProtected: roster }), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit(),
+  })
+  assert.notEqual(merged.result.reason, 'adopt-audit-failed', merged.result.detail)
+  assert.equal(merged.result.history[1].adoption.publication, 'pushed')
+  assert.ok(merged.logs.some(l => l.includes('protected path(s) test/hil/local.json, test/hil/other.json, named in adoptProtected')))
+  for (const [name, over, args, refused] of [
+    ['an unnamed path', {}, { adoptProtected: ['test/hil/local.json'] }, `test/hil/other.json${HINT}`],
+    ['an ordinary link touching the path too', { mergeOnly: ['test/hil/other.json'] }, { adoptProtected: roster }, 'test/hil/local.json'],
+    ['no adoptProtected', {}, {}, `test/hil/local.json, test/hil/other.json${HINT}`],
+    ['one of two by an ordinary link', { mergeOnly: ['test/hil/other.json'] }, {}, 'test/hil/local.json, test/hil/other.json'],
+  ]) {
+    const { result, labels } = await run({ args: adoptionArgs(state, { autoPush: true, ...args }), preflight: { head: ADOPT, prHead: HEAD }, adoptAudit: audit(over) })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.equal(result.detail, `protected path(s) in the chain: ${refused}`, name)
+    assert.equal(labels.includes('adopt:push'), false, name)
+  }
+})
+
+test('adoptProtected is refused unless it names distinct plain paths beside an adoptHead (#97)', async () => {
+  const state = adoptionState({ protected: '^test/hil/' })
+  for (const [adoptProtected, adoptHead, message] of [
+    ['test/hil/local.json', ADOPT, /must be an array of plain repository-relative paths/],
+    [['./test/hil/local.json'], ADOPT, /must be an array of plain repository-relative paths/],
+    [['../local.json'], ADOPT, /must be an array of plain repository-relative paths/],
+    [[''], ADOPT, /must be an array of plain repository-relative paths/],
+    [['test/hil/local.json', 'test/hil/local.json'], ADOPT, /names a path twice/],
+    [['test/hil/local.json'], undefined, /goes with the adoptHead/],
+  ]) {
+    await assert.rejects(run({ args: adoptionArgs(state, { adoptProtected, adoptHead }), preflight: { head: ADOPT, prHead: HEAD } }), message,
+      JSON.stringify(adoptProtected))
+  }
+  const trace = []
+  await assert.rejects(run({ trace, args: { stateRef: { outputFile: '/tmp/w.output', digest: '0123abcd' }, adoptHead: ADOPT, adoptProtected: ['../x'] } }),
+    /plain repository-relative paths/)
+  assert.deepEqual(trace, [], 'refused before the state loader starts an agent')
 })
 
 test('an uncanonicalizable adopted path fails the audit', async () => {

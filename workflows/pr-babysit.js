@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -147,6 +147,28 @@ const bare = (v) => Array.isArray(v) ? v.map(bare)
 const sealMatches = ({ seal, error, ...facts }) => seal === fnv1a(canonical(bare(facts)))
 const groupsOf = (list, n) => [...Array(Math.ceil(list.length / n)).keys()].map(k => list.slice(k * n, (k + 1) * n))
 const withSeal = (schema) => ({ ...schema, required: [...schema.required, 'seal'], properties: { ...schema.properties, seal: { type: 'string' } } })
+// '' for a path that escapes the repo or whose spelling names another file.
+const canon = (p) => {
+  const s = String(p).replace(/\\/g, '/')
+  if (s !== s.trim()) return ''
+  // On any host (the runtime cannot tell which): a drive, C:x included (relative to that drive's cwd), or UNC (\\ is //).
+  if (s.startsWith('/') || /^[A-Za-z]:/.test(s)) return ''
+  const out = []
+  for (const seg of s.split('/')) {
+    if (!seg || seg === '.') continue
+    if (seg === '..') { if (out.pop() === undefined) return '' } else out.push(seg)
+  }
+  return out.join('/')
+}
+
+// The caller's word that a base merge in the adopted chain may change these protected paths (#97).
+const adoptProtected = args.adoptProtected ?? []
+if (!Array.isArray(adoptProtected) || adoptProtected.some(f => typeof f !== 'string' || !f || canon(f) !== f)) {
+  throw new Error('adoptProtected must be an array of plain repository-relative paths')
+}
+if (new Set(adoptProtected).size !== adoptProtected.length) throw new Error('adoptProtected names a path twice')
+if (adoptProtected.length && args.adoptHead == null) throw new Error('adoptProtected goes with the adoptHead it was given for')
+
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
 if (args.stateRef != null) {
@@ -522,12 +544,12 @@ const CRTRIGGER = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'refusal'],
+  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'refusal'],
   properties: {
     error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' }, base: { type: 'string' },
     tip: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
-    unpublished: { type: 'array', items: { type: 'string' } },
+    unpublished: { type: 'array', items: { type: 'string' } }, mergeOnly: { type: 'array', items: { type: 'string' } },
     refusal: { type: 'string' },
   },
 })
@@ -981,20 +1003,6 @@ const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
   : rs.bots.map(b => `${b.bot} ${botCell(b, rs.waitedMin)}`).join(' · ')
 
 const nap = (ms) => new Promise(res => setTimeout(res, ms))
-
-// '' for a path that escapes the repo or whose spelling names another file.
-const canon = (p) => {
-  const s = String(p).replace(/\\/g, '/')
-  if (s !== s.trim()) return ''
-  // On any host (the runtime cannot tell which): a drive, C:x included (relative to that drive's cwd), or UNC (\\ is //).
-  if (s.startsWith('/') || /^[A-Za-z]:/.test(s)) return ''
-  const out = []
-  for (const seg of s.split('/')) {
-    if (!seg || seg === '.') continue
-    if (seg === '..') { if (out.pop() === undefined) return '' } else out.push(seg)
-  }
-  return out.join('/')
-}
 
 // A relay that trims a leading blank fails its seal.
 const STATUS_LINE = /^([ MADRCUT?!])([ MADRCUT?!]) (.+)$/
@@ -2739,15 +2747,20 @@ if (adoptHead !== null) {
   const shas = audit ? audit.commits : []
   const paths = audit ? audit.paths : []
   const badPath = paths.find(f => !canon(f))
-  // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49).
-  const guarded = protectedRe && audit ? [...new Set(audit.unpublished.map(canon).filter(f => f && protectedRe.test(f)))] : []
+  // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49),
+  // unless only a base merge changes it and the caller named it in adoptProtected (#97).
+  const mergeOnly = audit && !audit.error ? audit.mergeOnly.map(canon) : []
+  const exempt = new Set(mergeOnly.filter(f => adoptProtected.includes(f)))
+  const touchedProtected = protectedRe && audit ? [...new Set(audit.unpublished.map(canon).filter(f => f && protectedRe.test(f)))] : []
+  const guarded = touchedProtected.filter(f => !exempt.has(f))
   const why = !audit ? 'the audit agent died'
     : audit.error ? `the chain could not be read back: ${audit.error}`
     : audit.from !== X || audit.to !== adoptHead || audit.published !== prHead || audit.base !== base || audit.tip !== tip
       ? `the audit read ${audit.from}..${audit.to} published at ${audit.published} on base ${audit.base} tip ${audit.tip}, not ${X}..${adoptHead} published at ${prHead} on base ${base} tip ${tip}`
     : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
-    : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}`
+    : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}` +
+      (guarded.every(f => mergeOnly.includes(f)) ? '; only a base merge changes them, which adoptProtected may permit' : '')
     : null
   if (why) {
     log(`preflight: adoption refused — ${why}`)
@@ -2757,6 +2770,8 @@ if (adoptHead !== null) {
     }
     return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: why }))
   }
+  const waived = touchedProtected.filter(f => exempt.has(f))
+  if (waived.length) log(`preflight: adopting a base merge's change to protected path(s) ${waived.join(', ')}, named in adoptProtected`)
   if (prHead !== X && !shas.includes(prHead)) {
     log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor a commit of the chain to ${adoptHead.slice(0, 7)}`)
     return finish(stop(cyclesUsed, 'wrong-head', { head: prHead, expected: [X, adoptHead] }))

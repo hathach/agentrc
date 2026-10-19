@@ -89,6 +89,11 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   live tip in the checkout (fetch the base branch), or the audit stops with
   `fetch it`. A PR that conflicts with its base
   stops `pr-conflicting`; the merge that resolves it rejoins by `adoptHead`.
+- `adoptProtected`: exact repository-relative paths matching `protected` that a
+  base merge in the `adoptHead` chain may change, such as a conflict resolved
+  in a protected roster; only with `adoptHead`, per launch. A path an
+  unpublished ordinary commit of the chain also touches stays refused, and
+  writers and hooks stay bound by `protected`.
 - `rebasedHead`: full SHA of the PR head after a history rewrite (rebase,
   force-push) the user authorized: with the checkout at it and no unpublished
   candidate, the state is re-pinned to it unaudited, keeping cycles used,
