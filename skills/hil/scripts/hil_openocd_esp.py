@@ -71,6 +71,7 @@ def _load(name, path):
 
 
 usb_observe = _load('usb_observe', os.path.join(HERE, 'usb_observe.py'))
+hil_process = _load('hil_process', os.path.join(HERE, 'hil_process.py'))
 hil_flash = _load('hil_flash', os.path.join(HERE, 'hil_flash.py'))
 # Tcl token check, receipts and process identity; a consumer staging this skill stages it too
 ESP_SESSION = os.path.join(HERE, '..', '..', 'target-debug', 'scripts', 'esp_session.py')
@@ -329,7 +330,7 @@ class Session:
         cwd = os.path.join(self.out, 'cwd')
         os.mkdir(cwd)
         with open(os.path.join(self.out, 'openocd.out'), 'w') as out:
-            hold = hil_flash.hil_process._InterruptHold()
+            hold = hil_process.InterruptHold()
             try:
                 self.lock_fd = _lock(self.receipt)
                 if self.lock_fd is None:
@@ -473,7 +474,7 @@ class Session:
 def _finish(s, error=None, **info):
     """s.operation(error) with SIGINT/SIGTERM held until it is built, so an interrupt arriving
     meanwhile still carries the operation and its receipt."""
-    hold = hil_flash.hil_process._InterruptHold()
+    hold = hil_process.InterruptHold()
     op = None
     try:
         op = s.operation(error, **info)
@@ -763,7 +764,7 @@ def end_session(receipt: str, *, timeout: float = END_TIMEOUT) -> tuple:
     deadline = time.monotonic() + timeout
     os.stat(receipt)
     while True:
-        hold, lock = hil_flash.hil_process._InterruptHold(), None
+        hold, lock = hil_process.InterruptHold(), None
         try:
             lock = _lock(receipt)
             if lock is not None:

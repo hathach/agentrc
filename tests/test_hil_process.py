@@ -267,23 +267,31 @@ class RunCmdCleanupShape(unittest.TestCase):
     masked the caller's exception: a shape an AST can pin.
     """
 
-    def _run_cmd_ast(self):
+    def _ast(self, name='run_cmd'):
         src = Path(hp.__file__).read_text()
         return next(n for n in ast.walk(ast.parse(src))
-                    if isinstance(n, ast.FunctionDef) and n.name == 'run_cmd')
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    _run_cmd_ast = _ast
+
+    @staticmethod
+    def _calls(tree):
+        return [getattr(c.func, 'attr', getattr(c.func, 'id', '')) for c in ast.walk(tree) if isinstance(c, ast.Call)]
 
     def test_no_cleanup_try_has_an_else(self):
-        for n in ast.walk(self._run_cmd_ast()):
-            if isinstance(n, ast.Try) and n.orelse:
-                self.fail(f'try/else at line {n.lineno}: an else here runs when the kill SUCCEEDED')
+        for name in ('run_cmd', '_kill_group'):
+            for n in ast.walk(self._ast(name)):
+                if isinstance(n, ast.Try) and n.orelse:
+                    self.fail(f'{name}: try/else at line {n.lineno}: an else here runs when the kill SUCCEEDED')
 
     def test_both_cleanup_paths_kill_the_group(self):
-        killers = [getattr(c.func, 'attr', '') for c in ast.walk(self._run_cmd_ast())
-                   if isinstance(c, ast.Call) and getattr(c.func, 'attr', '') in ('killpg', 'kill')]
-        self.assertEqual(killers.count('killpg'), 2,
-                         'both the timeout and the BaseException path must killpg')
-        self.assertEqual(killers.count('kill'), 0,
+        killers = self._calls(self._run_cmd_ast())
+        self.assertEqual(killers.count('_kill_group'), 2,
+                         'both the timeout and the BaseException path must kill the group')
+        self.assertEqual(killers.count('kill') + killers.count('killpg'), 0,
                          'p.kill() reaches only the direct child')
+        group = self._calls(self._ast('_kill_group'))
+        self.assertEqual((group.count('killpg'), group.count('kill')), (1, 0))
 
     def test_the_interrupt_path_reraises(self):
         base = [h for n in ast.walk(self._run_cmd_ast()) if isinstance(n, ast.Try) for h in n.handlers

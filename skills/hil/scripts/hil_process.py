@@ -77,6 +77,16 @@ def _print_banner(title: str, out: Any, err: Any) -> None:
         print(_banner_body(out, err))
 
 
+def _kill_group(p: subprocess.Popen) -> None:
+    """SIGKILL the child's process group. Never raises: ProcessLookupError is a group already
+    gone, PermissionError an all-root group refusing the kill, and either escaping would skip
+    the caller's bounded reap, pipe close and rc-124 return."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def _close_pipes(p: subprocess.Popen) -> None:
     """Close OUR ends of an abandoned child's pipes. Never raises."""
     for pipe in (p.stdout, p.stderr, p.stdin):
@@ -87,7 +97,7 @@ def _close_pipes(p: subprocess.Popen) -> None:
             pass
 
 
-class _InterruptHold:
+class InterruptHold:
     """Defer SIGINT/SIGTERM's Python handlers across Popen and into the caller's cleanup
     `try`, where release() delivers whatever arrived. Popen forks before that `try` is
     entered, and a handler that raised in between unwound with the child alive (tinyusb #4022).
@@ -151,7 +161,7 @@ def run_alongside(argv: list, work, timeout: int, *,
     its own pipe; communicate() drains both, so the split cannot deadlock.
     `work` runs even if the child dies immediately -- the caller's own asserts decide.
     """
-    hold = _InterruptHold()
+    hold = InterruptHold()
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              start_new_session=True)
@@ -198,10 +208,7 @@ def run_alongside(argv: list, work, timeout: int, *,
         # never wait. Not keyed on returncode: communicate() reaps the leader on
         # KeyboardInterrupt, its group living on. The pgid stays ours while any member lives.
         if not reaped:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except OSError:
-                pass
+            _kill_group(p)
             _close_pipes(p)
         raise
 
@@ -245,7 +252,7 @@ def run_cmd(cmd: str | list, cwd: str | None = None, *, timeout: float,
     # called from threads
     popen_kwargs['start_new_session'] = True
 
-    hold = _InterruptHold()
+    hold = InterruptHold()
     try:
         p = subprocess.Popen(cmd, **popen_kwargs)
     except BaseException:
@@ -256,13 +263,7 @@ def run_cmd(cmd: str | list, cwd: str | None = None, *, timeout: float,
         out, err = p.communicate(timeout=timeout)
         r = subprocess.CompletedProcess(args=cmd, returncode=p.returncode, stdout=out, stderr=err)
     except subprocess.TimeoutExpired as ex:
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except OSError:
-            # ProcessLookupError: already gone. PermissionError: an all-root group refuses
-            # the group kill -- letting either escape would skip the bounded reap, the pipe
-            # close and the rc-124 return this handler exists for.
-            pass
+        _kill_group(p)
         try:
             out, err = p.communicate(timeout=reap_grace)
         except subprocess.TimeoutExpired:
@@ -298,10 +299,7 @@ def run_cmd(cmd: str | list, cwd: str | None = None, *, timeout: float,
         # its OWN group, so it never got the terminal's SIGINT -- without this, Ctrl-C
         # leaves the flasher or testusb holding the probe and its usbfs node. Kill and
         # close, never wait: this path must not add a hang of its own.
-        try:
-            os.killpg(p.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        _kill_group(p)
         _close_pipes(p)
         raise
 
