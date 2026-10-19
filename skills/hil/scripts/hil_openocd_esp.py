@@ -43,7 +43,6 @@ session from its receipt:
 from __future__ import annotations
 
 import argparse
-import contextlib
 import fcntl
 import glob
 import hashlib
@@ -260,51 +259,12 @@ def _lock(receipt):
         raise
 
 
-def write_receipt(path, rec):
-    """Replace the receipt atomically: a reader sees the old record or the new one, never part."""
-    fd, tmp = tempfile.mkstemp(prefix='.receipt.', dir=os.path.dirname(path))
+def _shutdown(tcl):
     try:
-        with os.fdopen(fd, 'w') as f:
-            json.dump(rec, f, indent=1)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
-
-
-class _Tcl(esp_session.Tcl):
-    """esp_session's token-checked Tcl with one absolute `deadline` across the connect, the token
-    check and the command's answer; its own _ask bounds every send and recv by what is left."""
-    deadline = None
-
-    def _left(self, cmd):
-        left = self.deadline - time.monotonic()
-        if left <= 0:
-            raise TimeoutError(f'Tcl port {self.port}: no answer to {cmd!r} by the deadline')
-        return left
-
-    def __call__(self, cmd):
-        self.timeout = self._left(cmd)     # bounds the connect
-        return super().__call__(cmd)
-
-    def _ask(self, cmd):
-        try:
-            self.sock.settimeout(self._left(cmd))
-            self.sock.sendall(cmd.encode() + esp_session.TCL_END)
-            buf = b''
-            while not buf.endswith(esp_session.TCL_END):
-                self.sock.settimeout(self._left(cmd))
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    raise esp_session.ToolError(f'Tcl port {self.port} closed before answering {cmd!r}')
-                buf += chunk
-        except BaseException:
-            self.close()
-            raise
-        return buf[:-1].decode(errors='replace')
+        tcl('shutdown')
+    except (OSError, esp_session.ToolError):
+        pass        # it answers and closes the connection as it shuts down (tcl_server.c:235-240)
+    tcl.close()
 
 
 class Session:
@@ -315,9 +275,9 @@ class Session:
         self.argv, self.out = argv, out
         self.log, self.receipt = os.path.join(out, 'openocd.log'), os.path.join(out, 'receipt.json')
         self.lock_fd = None
-        self.tcl = _Tcl(tcl_port, token)
+        self.tcl = esp_session.Tcl(tcl_port, token)
         self.proc = self.rec = self.exit = self.failure = None
-        self.receipt_written = self.closed = self.init_sent = self.timed_out = False
+        self.receipt_written = self.closed = self.timed_out = False
         self.steps, self.deadline, self.seq = [], None, 0
 
     def start(self, deadline):
@@ -340,7 +300,7 @@ class Session:
                             'argv': self.argv, 'ports': [None, None, self.tcl.port], 'token': self.tcl.token,
                             'log': self.log, 'closed': False, 'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                             'tool': 'hil_openocd_esp', 'init': None, 'submitted': 0}
-                write_receipt(self.receipt, self.rec)
+                esp_session.write_receipt(self.receipt, self.rec)
                 self.receipt_written = True
             except BaseException:
                 if self.proc is None:
@@ -363,11 +323,9 @@ class Session:
         except esp_session.ToolError as e:
             raise _Stop(str(e), timed_out=self.proc.poll() is None) from None
 
-    def _log_size(self):
-        try:
-            return os.path.getsize(self.log)
-        except OSError:
-            return 0
+    @property
+    def init_sent(self):
+        return self.rec is not None and self.rec['init'] is not None
 
     def _log_since(self, mark):
         try:
@@ -382,28 +340,26 @@ class Session:
         if self.deadline <= time.monotonic():
             raise _Stop(f'timed out before {cmd!r}', end=True, timed_out=True)
         if cmd == 'init':
-            self.init_sent = True
             self.rec['init'] = 'sent'
         self.seq += 1
         self.rec['submitted'] = self.seq
-        write_receipt(self.receipt, self.rec)
-        mark, step = self._log_size(), {'cmd': cmd, 'outcome': 'outstanding'}
+        esp_session.write_receipt(self.receipt, self.rec)
+        mark, step = esp_session.size_of(self.log) or 0, {'cmd': cmd, 'outcome': 'outstanding'}
         self.steps.append(step)
         self.tcl.deadline = self.deadline
         try:
             answer = self.tcl(_wrap(cmd, self.seq))
         except TimeoutError:
-            step['log'] = self._log_since(mark)
             raise _Stop(f'{cmd!r} still outstanding after the timeout', timed_out=True) from None
         except (OSError, esp_session.ToolError) as e:
-            step['log'] = self._log_since(mark)
             raise _Stop(f'{cmd!r}: {e}') from None
-        step['log'] = self._log_since(mark)
+        finally:
+            step['log'] = self._log_since(mark)
         ok = answer.startswith('HIL-OK')
         step['outcome'] = 'ok' if ok else 'error'
         if cmd == 'init':
             self.rec['init'] = 'ok' if ok else 'failed'
-            write_receipt(self.receipt, self.rec)
+            esp_session.write_receipt(self.receipt, self.rec)
         step['answer'] = answer.removeprefix('HIL-OK' if ok else 'HIL-ERR').removeprefix(' ')
         # a failed init answers empty; its reason is only in the log
         errors = '; '.join(ln for ln in step['log'] if ln.startswith('Error'))
@@ -422,12 +378,8 @@ class Session:
         if not ok:
             raise _Stop(f"'reset run' failed: {answer}")
         self.steps.append({'cmd': 'shutdown', 'outcome': 'sent'})
-        try:
-            self.tcl.deadline = self.deadline
-            self.tcl('shutdown')
-        except (OSError, esp_session.ToolError):
-            pass        # it answers and closes the connection as it shuts down (tcl_server.c:235-240)
-        self.tcl.close()
+        self.tcl.deadline = self.deadline
+        _shutdown(self.tcl)
         if not esp_session.wait_exit(self.proc.pid, self.proc, max(self.deadline - time.monotonic(), 0)):
             raise _Stop('openocd still runs after shutdown')
         if self.proc.returncode:
@@ -445,7 +397,8 @@ class Session:
         if not self.closed and self.proc is not None:
             self.exit, self.closed = self.proc.returncode, True
             if self.receipt_written:
-                write_receipt(self.receipt, {**self.rec, 'closed': True, 'cleanup': cleanup, 'exit': self.exit})
+                esp_session.write_receipt(self.receipt, {**self.rec, 'closed': True, 'cleanup': cleanup,
+                                                         'exit': self.exit})
         return cleanup
 
     def operation(self, error=None, **extra):
@@ -496,10 +449,11 @@ def _workdir(workdir) -> str:
     return path
 
 
-def _run(flasher: dict, work, *, workdir, timeout, openocd=None):
+def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
     """Admit, resolve and start a session in a new directory under `workdir`, init it, run
-    `work(session)` within `timeout` seconds, then end it as the module docstring says.
-    Refusals raise before anything starts; an exception after the start carries `.operation`."""
+    `work(session)` within `timeout` seconds, then end it as the module docstring says; `record`
+    joins the operation's `session`. Refusals raise before anything starts; an exception after
+    the start carries `.operation`."""
     chip, cfgs = admit(flasher)
     workdir = _workdir(workdir)
     tool = find_openocd(openocd)
@@ -509,7 +463,8 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None):
     port, token = esp_session.free_ports(1)[0], secrets.token_hex(8)
     s = Session(server_argv(tool, cfgs, location, flasher['uid'], tcl_port=port, token=token,
                             log=os.path.join(out, 'openocd.log')), out, port, token)
-    info = {'openocd': tool['banner'], 'scripts': tool['scripts'], 'location': location, 'serial': flasher['uid']}
+    info = {'openocd': tool['banner'], 'scripts': tool['scripts'], 'location': location, 'serial': flasher['uid'],
+            **(record or {})}
     try:
         s.start(time.monotonic() + timeout)
         s.wait_ready()
@@ -689,22 +644,22 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
             s.check(f"flash read_bank 0 {{{path}}} 0x{rec['offset']:x} {length}")
             with open(path, 'rb') as f:
                 got = f.read()
-            diff = next((j for j, (a, b) in enumerate(zip(got, data)) if a != b), None)
-            if diff is None and len(got) != length:
-                diff = min(len(got), rec['size'])
+            diff = None
+            if got[:rec['size']] != data:
+                diff = next((j for j, (a, b) in enumerate(zip(got, data)) if a != b), min(len(got), rec['size']))
+            elif len(got) != length:
+                diff = rec['size']
             rec['readBack'].update(match=diff is None, firstMismatch=diff)
             if diff is not None:
                 raise _Stop(f"read-back of {rec['file']} at 0x{rec['offset']:x} differs at +0x{diff:x}", end=True)
 
     try:
-        op = _run(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd)
+        op = _run(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd, record={'security': security})
     except BaseException as e:
         if hasattr(e, 'operation'):
             e.operation.segments = tuple(records)
-            e.operation.session['security'] = security
         raise
     op.segments = tuple(records)
-    op.session['security'] = security
     return op
 
 
@@ -723,13 +678,6 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
 END_TIMEOUT = 60
 _RECEIPT_KEYS = ('pid', 'startTime', 'argv', 'ports', 'token', 'closed', 'init', 'submitted')
 NEEDS_RECOVERY = 'the board stays held and needs a separately reviewed recovery'
-
-
-def _same_process(rec) -> bool:
-    # a script stand-in runs under its interpreter, which /proc lists first
-    running = esp_session.cmdline(rec['pid'])
-    return (running is not None and running[-len(rec['argv']):] == rec['argv']
-            and esp_session.start_time(rec['pid']) == rec['startTime'])
 
 
 def _exited(pidfd, deadline) -> bool:
@@ -798,7 +746,7 @@ def _end_owned(receipt, deadline) -> tuple:
             return 0, result
         return stop('refused', f"closed with cleanup {rec.get('cleanup')!r}, without the reviewed end: "
                                f'{NEEDS_RECOVERY}')
-    if not _same_process(rec):
+    if not esp_session.same_process(rec):
         return stop('refused', f"process {rec['pid']} is not the openocd this receipt names (gone or another "
                                f'process): nothing sent; {NEEDS_RECOVERY}')
     pidfd = tcl = None
@@ -813,32 +761,27 @@ def _end_owned(receipt, deadline) -> tuple:
         except OSError as e:
             return stop('refused', f'pidfd_open: {e}, so the exit could not be confirmed: nothing sent; '
                                    f'{NEEDS_RECOVERY}')
-        if not _same_process(rec):        # the pidfd now names the identified process
+        if not esp_session.same_process(rec):        # the pidfd now names the identified process
             return stop('refused', f"process {rec['pid']} changed while it was identified: nothing sent")
         if rec['init'] != 'ok':
             return stop('refused', f"init {rec['init'] or 'never sent'}: the ordinary end (reset run, shutdown) is "
                                    f'refused after a failed or unproven init; {NEEDS_RECOVERY}')
-        tcl = _Tcl(rec['ports'][2], rec['token'])
-        tcl.deadline = deadline
+        tcl = esp_session.Tcl(rec['ports'][2], rec['token'], deadline=deadline)
         done = tcl(DONE_QUERY)
         result['done'] = done
         if done != str(rec['submitted']):
             return stop('refused', f"command #{rec['submitted']} is not known to have run (the server has run "
                                    f"#{done or 'none'}): nothing sent; rerun later")
         rec['submitted'] += 1
-        write_receipt(receipt, rec)
+        esp_session.write_receipt(receipt, rec)
         answer = tcl(_wrap('reset run', rec['submitted']))
         result['resetRun'] = answer
         if not answer.startswith('HIL-OK'):
             return stop('failed', f"'reset run' failed: {answer}; {NEEDS_RECOVERY}")
-        try:
-            tcl('shutdown')
-        except (OSError, esp_session.ToolError):
-            pass        # it answers and closes the connection as it shuts down (tcl_server.c:235-240)
-        tcl.close()
+        _shutdown(tcl)
         if not _exited(pidfd, deadline):
             return stop('failed', 'openocd exit not confirmed after shutdown (still running?); rerun end')
-        write_receipt(receipt, {**rec, 'closed': True, 'cleanup': 'done',
+        esp_session.write_receipt(receipt, {**rec, 'closed': True, 'cleanup': 'done',
                                 'end': {'resetRun': answer, 'at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}})
         result['outcome'] = 'ended'
         return 0, result

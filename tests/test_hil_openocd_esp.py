@@ -137,7 +137,7 @@ def model(cmd):
     if m := re.fullmatch(r'flash read_bank 0 \{(\S+)\} (0x[0-9a-f]+) (\d+)', cmd):
         off, n = int(m[2], 16), int(m[3])
         with open(m[1], 'wb') as f:
-            f.write(image()[off:off + n])
+            f.write(image()[off:off + n + int(os.environ.get('FAKE_READ_DELTA', '0'))])
         return 'HIL-OK '
     say(f'Info : {cmd} done')
     return 'HIL-OK '
@@ -805,6 +805,19 @@ class Programming(SessionCase):
         self.assertEqual(op.returncode, 1)
         self.assertEnded(op)
 
+    def test_a_short_read_back_fails_where_it_ends(self):
+        op = self.flash_op(env={'FAKE_READ_DELTA': '-1'})
+        self.assertEqual(op.segments[0]['readBack'], {**op.segments[0]['readBack'], 'match': False,
+                                                      'firstMismatch': 4999})
+        self.assertEqual(op.returncode, 1)
+
+    def test_a_read_back_of_the_wrong_length_fails_even_when_the_payload_matches(self):
+        op = self.flash_op(env={'FAKE_READ_DELTA': '1'})
+        self.assertEqual(op.segments[0]['readBack'], {**op.segments[0]['readBack'], 'match': False,
+                                                      'firstMismatch': 5000})
+        self.assertIn('differs at +0x1388', op.session['failure'])
+        self.assertEqual(op.returncode, 1)
+
     def test_the_first_failed_segment_stops_programming(self):
         op = self.flash_op(script={'program_esp#2': 'err:** Verify Failed **'})
         self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list',
@@ -998,10 +1011,10 @@ class End(SessionCase):
     def test_another_process_or_a_foreign_server_is_sent_nothing(self):
         path = self.pending({'work': 'slow:2.5'})
         rec, n = self.receipt(path), len(self.tcl())
-        oe.write_receipt(path, {**rec, 'startTime': '1'})
+        oe.esp_session.write_receipt(path, {**rec, 'startTime': '1'})
         rc, result = self.end(path)
         self.assertIn('not the openocd this receipt names', result['error'])
-        oe.write_receipt(path, {**rec, 'token': 'someone-else'})
+        oe.esp_session.write_receipt(path, {**rec, 'token': 'someone-else'})
         rc, result = self.end(path)
         self.assertIn('another server', result['error'])
         self.assertEqual(self.after(n), ['token?'])
