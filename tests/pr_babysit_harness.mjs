@@ -319,9 +319,9 @@ async function run(opts = {}) {
     }
     if (label.startsWith('reviews#')) {
       if (reviews instanceof Error) throw reviews
-      const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle() : reviews)
-      // A finding that relates to no earlier verdict, unless a case says it does.
-      if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, ...f }))
+      const r = structuredClone(opts.reviewsPerCycle ? opts.reviewsPerCycle(prompt) : reviews)
+      // A finding that relates to no earlier verdict and names no repair of ours, unless a case says it does.
+      if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
       // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
       // state; explicit records are filled the same way, one field at a time.
       // The auto-running bots are the ones the workflow's prompt names.
@@ -3603,6 +3603,71 @@ test('a stale reply after a failed fix note is a repair, not a second answer', a
   assert.deepEqual(result.outstanding, [1])
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'the stale reply went out over a possible fix note')
   assert.deepEqual(debtOf(result, 1).repair, { replyId: null, error: 'no reply posted: offered fixNote is stale (now owes a refutation)' })
+})
+
+// The fix note of cycle 1 dies with its batch; from cycle 2 the validator judges each finding stale, fixedBy(sha, prompt) naming the commit.
+const renoteRun = (fixedBy, { first = structuredClone(oneValid), later = (f) => [f] } = {}) => {
+  let cycle = 0
+  const named = []
+  return run({
+    args: { autoPush: true, maxCycles: 4 },
+    dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
+    reviewsPerCycle: (prompt) => {
+      cycle++
+      if (cycle === 1) return first
+      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
+      named.push(sha && JSON.parse(sha))
+      const findings = first.findings.flatMap(f => later(finding({ ...f, verdict: 'stale', fixedBy: fixedBy(sha && JSON.parse(sha)[0].sha) }), cycle))
+      return { findings, replies: [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
+    },
+  }).then(out => ({ ...out, named }))
+}
+
+test('a fix note whose batch died is posted as offered once the validator names our repair as the fix (#115)', async () => {
+  const { result, calls, named } = await renoteRun((sha) => sha)
+  const [offered, again] = manifestOf(calls, 'resolve#1').concat(manifestOf(calls, 'resolve#2'))
+  assert.match(named[0][0].sha, /^[0-9a-f]{40}$/)
+  assert.deepEqual(named[0], [{ commentId: 1, sha: named[0][0].sha }])
+  assert.equal(again.body, offered.body, 'the offered body, byte for byte')
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'no "already fixed" reply')
+  assert.equal(result.state.debt.some(([id]) => id === 1), false)
+  assert.equal(result.handoffs, undefined)
+})
+
+test('a stale verdict naming another fix, or missing a finding the note covered, keeps the note handed off (#115)', async () => {
+  const two = { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' }
+  for (const [name, out] of [
+    ['another commit', await renoteRun(() => 'f'.repeat(40))],
+    ['no commit', await renoteRun(() => null)],
+    ['a sibling judged otherwise', await renoteRun((sha) => sha, { first: two, later: (f) => [f.line === 2 ? { ...f, verdict: 'invalid', fixedBy: null } : f] })],
+  ]) {
+    assert.equal(out.calls.some(c => c.label === 'resolve#2'), false, name)
+    assert.match(debtOf(out.result, 1).repair.error, /offered fixNote is stale/, name)
+  }
+  // A harvest missing a covered finding answers nothing on the comment yet.
+  const partial = await renoteRun((sha) => sha, { first: two, later: (f) => f.line === 2 ? [] : [f] })
+  assert.equal(partial.calls.some(c => /^(resolve|replies)#[234]$/.test(c.label)), false)
+  assert.deepEqual(partial.result.outstanding, [1])
+})
+
+test('a partial harvest before the note qualifies leaves no dismissal behind once it does (#115)', async () => {
+  const two = { findings: [finding(), finding({ line: 2 })], replies: [], bots: 'reviewed' }
+  const { result, calls } = await renoteRun((sha) => sha, { first: two, later: (f, cycle) => cycle === 2 && f.line === 2 ? [] : [f] })
+  assert.equal(manifestOf(calls, 'resolve#3')[0].body, manifestOf(calls, 'resolve#1')[0].body)
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'no second answer for a dismissal left behind')
+  assert.equal(result.state.debt.some(([id]) => id === 1), false, 'the covered findings owe no dismissal')
+  assert.equal(result.pass, true)
+})
+
+test('a rebase drops a pending fix note\'s repair: the rewritten commit cannot be named again (#115)', async () => {
+  const attempt = { body: `Fixed in ${HEAD}.\n\n- src/a.c:1`, how: 'fixNote', digest: 'd1', repair: { sha: HEAD, findings: ['1#1'] } }
+  const state = adoptionState({ debt: [[1, { dismissals: [], notes: ['1#1'], digest: 'd1', attempt }]] })
+  const { result, calls } = await run({ args: rebaseArgs(state), preflight: { head: FOREIGN, prHead: FOREIGN },
+    reviews: { findings: [finding({ verdict: 'stale', fixedBy: HEAD })], replies: [], bots: 'reviewed' } })
+  assert.equal(calls.find(c => c.label.startsWith('reviews#')).prompt.includes('not yet posted'), false)
+  assert.equal(calls.some(c => c.label.startsWith('resolve#')), false)
+  assert.equal(debtOf(result, 1).attempt.repair, undefined)
+  assert.equal(debtOf(result, 1).attempt.body, attempt.body, 'the offered body stays')
 })
 
 test('an answered comment is not replied to again for a stale re-report', async () => {

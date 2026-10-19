@@ -412,9 +412,9 @@ const REVIEWS = {
       type: 'array',
       items: {
         type: 'object', additionalProperties: false,
-        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'fixFiles', 'related', 'changeReason'],
+        required: ['source', 'findingId', 'commentDigest', 'commentId', 'file', 'line', 'claim', 'verdict', 'reason', 'fixHint', 'fixFiles', 'related', 'changeReason', 'fixedBy'],
         properties: {
-          related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] },
+          related: { type: ['string', 'null'] }, changeReason: { type: ['string', 'null'] }, fixedBy: { type: ['string', 'null'] },
           source: { type: 'string' }, findingId: { type: 'string' },
           commentDigest: { type: 'string' }, commentAliases: { type: 'array', items: { type: 'string' } }, commentId: { type: 'integer' },
           file: { type: 'string' }, line: { type: 'integer' }, claim: { type: 'string' },
@@ -863,6 +863,8 @@ const handoffWhy = (commentId) => {
     : null
 }
 const handedOff = (commentId) => !!handoffWhy(commentId)
+// [commentId, debt] whose fix note, offered for a repair of ours, no receipt has shown posted.
+const unpostedNotes = () => [...debt].filter(([, d]) => d.attempt && d.attempt.how === 'fixNote' && d.attempt.repair)
 // An edited comment's carried ids may name other points now: none is named to the validator.
 const owedIds = (commentId) => {
   const d = debt.get(commentId)
@@ -1580,7 +1582,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   // The first offered body is kept as the attempt until paid: no receipt proves an earlier POST never landed, and reply.py reuses only an identical body.
   const replies = []
   const sonarNotes = new Map()
-  for (const { commentId, body, scanning } of drafts) {
+  for (const { commentId, body, scanning, repair: made } of drafts) {
     const d = debt.get(commentId)
     const a = d && d.attempt
     if (a && (a.how !== how || a.digest !== digestOf.get(commentId))) {
@@ -1593,7 +1595,9 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     }
     if (a && a.body !== body) log(`cycle ${cycle}: comment ${commentId} keeps the body already offered, not this cycle's redraft`)
     const out = a ? a.body : body
-    if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId) }
+    // A fix note's repair stays the one it was first offered for.
+    const madeBy = a ? a.repair : made
+    if (d) d.attempt = { body: out, how, digest: digestOf.get(commentId), ...(madeBy ? { repair: madeBy } : {}) }
     replies.push({ commentId, body: out, digest: fnv1a(out) })
     if (scanning) sonarNotes.set(commentId, out)
   }
@@ -2066,7 +2070,10 @@ const runLanes = async (cycle, entry, lanes) => {
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
           `those listed by findingId among them, so they can be reconciled: ${JSON.stringify(owedLastCycle)}. ` : '') +
       (decisions.size > 0
-        ? `Earlier verdicts on this PR (set related and changeReason against them per your procedure): ${JSON.stringify([...decisions].map(([findingId, d]) => ({ findingId, ...d })))}. ` : '')
+        ? `Earlier verdicts on this PR (set related and changeReason against them per your procedure): ${JSON.stringify([...decisions].map(([findingId, d]) => ({ findingId, ...d })))}. ` : '') +
+      (unpostedNotes().length > 0
+        ? 'Our fix notes on these comments are not yet posted; for a stale finding on one, set fixedBy to its sha when that commit\'s change is what fixed the finding: ' +
+          `${JSON.stringify(unpostedNotes().map(([commentId, d]) => ({ commentId, sha: d.attempt.repair.sha })))}. ` : '')
     const nobody = { findings: [], replies: [], bots: [] }
     const r = !reviewLane || reviewers.length === 0
       ? nobody
@@ -2294,9 +2301,16 @@ const runLanes = async (cycle, entry, lanes) => {
     //   deferral: deferred points only; deferred points ride in a mixed comment's reply
     const ledger = new Map()
     const digestOf = new Map()
+    // A fix note whose post died is owed again, as offered, once a fresh judgment names its repair as what made every finding it covered stale (#115).
+    const ownFixed = new Set(unpostedNotes().filter(([id, { attempt: a }]) => {
+      const now = r.findings.filter(f => f.commentId === id)
+      return now.length > 0 &&
+        now.every(f => f.verdict === 'stale' && !f.hold && f.fixedBy === a.repair.sha && f.commentDigest === a.digest && a.repair.findings.includes(f.findingId)) &&
+        a.repair.findings.every(k => now.some(f => f.findingId === k))
+    }).map(([id]) => id))
     for (const f of r.findings) {
       const e = ledger.get(f.commentId) || { valid: 0, refuted: 0, deferred: 0 }
-      if (!f.hold) e[f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : 'refuted']++
+      if (!f.hold) e[f.deferral ? 'deferred' : f.verdict === 'valid' || ownFixed.has(f.commentId) ? 'valid' : 'refuted']++
       ledger.set(f.commentId, e)
       digestOf.set(f.commentId, f.commentDigest)
     }
@@ -2322,7 +2336,9 @@ const runLanes = async (cycle, entry, lanes) => {
       const open = () => (d = debtEntry(f.commentId))
       if (d && d.edited) continue
       if (f.verdict !== 'valid') {
-        if (!answered) { const e = open(); e.dismissals.add(dismissalKey(f)); e.digest = f.commentDigest }
+        // A finding our named repair fixed owes no refutation, whatever an earlier partial harvest recorded.
+        if (ownFixed.has(f.commentId)) { if (d) d.dismissals.delete(dismissalKey(f)) }
+        else if (!answered) { const e = open(); e.dismissals.add(dismissalKey(f)); e.digest = f.commentDigest }
         continue
       }
       // Retiring a dismissal is always allowed, even on an answered comment.
@@ -2379,6 +2395,8 @@ const runLanes = async (cycle, entry, lanes) => {
       entry.deferralPosts = await publishReplies(`defer#${cycle}`, deferralReplies, 'deferral', cycle, digestOf)
     }
 
+    // One fix note per comment: this cycle's pushed repairs, and offered bodies (#115) whose repair a fresh judgment named.
+    const answerable = new Map()
     const validFindings = r.findings.filter(x => x.verdict === 'valid' && !x.deferral && !x.hold)
     if (validFindings.length > 0) {
       const work = groupWork(validFindings.map(f => ({
@@ -2427,22 +2445,28 @@ const runLanes = async (cycle, entry, lanes) => {
           return stop(cycle, 'push-failed')
         }
         entry.reviewPush = push
-        // One fix note per comment, built here: the read-back proves only a text the workflow chose.
-        const answerable = new Map()
+        // Built here: the read-back proves only a text the workflow chose.
         const heldNow = heldComments()
         for (const f of validFindings) {
           if (owed(f.commentId) !== 'fixNote' || heldNow.has(f.commentId) || handedOff(f.commentId) || !showsAll(f.commentId, false)) continue
           const line = `- ${f.file}:${f.line}`
           const prev = answerable.get(f.commentId)
-          if (prev) prev.body += `\n${line}`
-          else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId) })
+          if (prev) { prev.body += `\n${line}`; prev.repair.findings.push(f.findingId) }
+          else answerable.set(f.commentId, { commentId: f.commentId, body: `Fixed in ${push.sha}.\n\n${line}`, scanning: scanning.has(f.commentId), repair: { sha: push.sha, findings: [f.findingId] } })
         }
         for (const x of answerable.values()) x.body = withDeferred(x.commentId, x.body)
-        if (answerable.size > 0) {
-          if (await ended('resolve')) return prEnded(cycle, lanes.prState)
-          entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
+      }
+    }
+    if (args.autoPush === true) {
+      for (const id of ownFixed) {
+        if (!answerable.has(id) && owed(id) === 'fixNote' && !handedOff(id) && showsAll(id, false)) {
+          answerable.set(id, { commentId: id, body: debt.get(id).attempt.body, scanning: scanning.has(id) })
         }
       }
+    }
+    if (answerable.size > 0) {
+      if (await ended('resolve')) return prEnded(cycle, lanes.prState)
+      entry.fixNotePosts = await publishReplies(`resolve#${cycle}`, [...answerable.values()], 'fixNote', cycle, digestOf)
     }
 
     lanes.reviewDone = true
@@ -2734,6 +2758,8 @@ if (adoptHead !== null) {
 }
 const rebased = rebasedHead !== null ? { from: restored.expectedHead, to: rebasedHead } : null
 if (rebased) log(`preflight: re-pinned ${rebased.from.slice(0, 7)} -> ${rebased.to.slice(0, 7)}, the PR history the caller rewrote, unaudited; cycles, answers, decisions, holds and deferrals kept`)
+// A rewrite renamed our repair commits: a pending fix note keeps its body but can no longer be posted on a judgment naming one.
+if (rebased) for (const d of debt.values()) if (d.attempt) delete d.attempt.repair
 expectedHead = adoption ? adoption.from : pinned.prHead.trim()
 pin = currentPin
 log(`preflight: ${pinned.prRepo} ${pinned.branch}@${pinned.head.slice(0, 7)} tracking ${pinned.remote}, clean`)
