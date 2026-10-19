@@ -110,14 +110,15 @@ JLINK_CRASH_RCS = {128 + signal.SIGSEGV, -signal.SIGSEGV, 128 + signal.SIGABRT, 
 
 
 @contextlib.contextmanager
-def _command_file(script: list):
-    # A unique file per invocation in the current directory: a stale or concurrent file is
-    # never the one run, and none outlives the invocation.
-    fd, path = tempfile.mkstemp(prefix='hil_jlink_', suffix='.jlink', dir=os.getcwd())
+def _command_file(script: list, *, prefix='hil_jlink_', suffix='.jlink', workdir=None):
+    # A unique file per invocation in `workdir` (default the current directory): a stale or
+    # concurrent file is never the one run, and none outlives the invocation. Yields (path, text).
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=workdir or os.getcwd())
+    text = ''.join(f'{s}\n' for s in script)
     try:
         with os.fdopen(fd, 'w') as f:
-            f.writelines(f'{s}\n' for s in script)
-        yield path
+            f.write(text)
+        yield path, text
     finally:
         Path(path).unlink(missing_ok=True)
 
@@ -125,8 +126,8 @@ def _command_file(script: list):
 def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run) -> Operation:
     # crash_retries reruns share one deadline, taken once the command file is written.
     # A rerun is no proof the target was untouched.
-    run, attempts, text = _runner(run), [], ''.join(f'{s}\n' for s in script)
-    with _command_file(script) as path:
+    run, attempts = _runner(run), []
+    with _command_file(script) as (path, text):
         cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
                f'-NoGui 1 -ExitOnError 1 -CommandFile {shlex.quote(path)}')
         deadline = time.monotonic() + timeout
@@ -153,6 +154,33 @@ def reset_jlink(flasher: dict, *, timeout,
     return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
 
 
+def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, autoconnect: bool, device: str,
+                       timeout, run=None, workdir=None) -> Operation:
+    """One JLinkExe session running `commands`, then `exit`, from a command file in `workdir`,
+    with the caller's connection profile: `device` replaces the flasher's `args` (a session
+    may connect as the core), `autoconnect` False leaves the flag out. The raw result only:
+    judging the transcript, retrying and recovering stay the caller's."""
+    script = [*commands, 'exit']
+    with _command_file(script, workdir=workdir) as (path, text):
+        argv = ['JLinkExe', '-USB', flasher['uid'], '-device', device, '-if', interface, '-speed', str(speed),
+                *(['-autoconnect', '1'] if autoconnect else []), '-NoGui', '1', '-ExitOnError', '1',
+                '-CommandFile', path]
+        return _once(run, argv, script=text, timeout=timeout)
+
+
+# Cortex-M SCB AIRCR and the SYSRESETREQ write tinyuf2's runner issues to it
+SCB_AIRCR, AIRCR_SYSRESETREQ = 0xE000ED0C, 0x05FA0004
+
+
+def sysresetreq_jlink(flasher: dict, *, interface: str, speed, autoconnect: bool, device: str,
+                      timeout, run=None, workdir=None) -> Operation:
+    """SYSRESETREQ through a J-Link session, not the probe's reset (reset_jlink). The reset may
+    drop the connection mid-write, so the caller judges the write's issue, not the exit."""
+    return run_jlink_commands(flasher, [f'w4 {SCB_AIRCR:08X} {AIRCR_SYSRESETREQ:08X}'], interface=interface,
+                              speed=speed, autoconnect=autoconnect, device=device, timeout=timeout, run=run,
+                              workdir=workdir)
+
+
 # -------------------------------------------------------------
 # ST-Link
 # -------------------------------------------------------------
@@ -168,6 +196,23 @@ def flash_stlink(flasher: dict, firmware: str, *, timeout, run=None) -> Operatio
 
 def reset_stlink(flasher: dict, *, timeout, run=None) -> Operation:
     return _once(run, f'STM32_Programmer_CLI --connect port=swd sn={flasher["uid"]} --rst --go', timeout=timeout)
+
+
+def run_stlink_commands(flasher: dict, commands: list, *, connect_mode: str, timeout, run=None,
+                        workdir=None) -> Operation:
+    """One STM32_Programmer_CLI script session: an SWD connect to the flasher's ST-LINK in
+    `connect_mode`, then `commands`, from a script file in `workdir`. The raw result only:
+    judging the transcript, retrying and recovering stay the caller's."""
+    script = [f'-c port=SWD sn={flasher["uid"]} mode={connect_mode}', *commands]
+    with _command_file(script, prefix='hil_stlink_', suffix='.prg', workdir=workdir) as (path, text):
+        return _once(run, ['STM32_Programmer_CLI', '-script', path], script=text, timeout=timeout)
+
+
+def sysresetreq_stlink(flasher: dict, *, connect_mode: str, timeout, run=None, workdir=None) -> Operation:
+    """SYSRESETREQ through an ST-LINK session, not the probe's reset (reset_stlink); `-nv`
+    skips the read-back the reset would fail. The caller judges the write's report."""
+    return run_stlink_commands(flasher, [f'-w32 0x{SCB_AIRCR:08X} 0x{AIRCR_SYSRESETREQ:08X} -nv'],
+                               connect_mode=connect_mode, timeout=timeout, run=run, workdir=workdir)
 
 
 # -------------------------------------------------------------

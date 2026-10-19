@@ -127,6 +127,12 @@ recovery stay the contract's. Linux only.
   its own, never concatenated; `retried` is every attempt but the last. An
   exception from the runner carries the operation so far as `.operation`. Only
   a J-Link crash is rerun, and only when the caller passes `crash_retries`.
+- `run_jlink_commands` and `run_stlink_commands` run one probe session of the
+  caller's commands with the caller's connection profile, from a unique
+  command file in `workdir`; `sysresetreq_jlink` and `sysresetreq_stlink` write
+  AIRCR SYSRESETREQ through such a session, a reset distinct from the probe's
+  (`reset_jlink`, `reset_stlink`). Their results are raw: judging the
+  transcript, retrying and recovering stay the caller's.
 - rc 0 means the tool reported success, not that the target runs the image;
   the project's own checks decide that. rc 124 means the runner killed the
   tool's process group on the timeout and reaped it for a bounded grace: a

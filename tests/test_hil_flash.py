@@ -307,9 +307,9 @@ class JLink(unittest.TestCase):
 
             @contextlib.contextmanager
             def slow_command_file(script):
-                with real_command_file(script) as path:
+                with real_command_file(script) as made:
                     now[0] += prep
-                    yield path
+                    yield made
 
             def run(cmd, timeout):
                 starts.append((now[0], timeout))
@@ -420,6 +420,100 @@ class Record(unittest.TestCase):
             self.assertEqual(op.attempts[0].result.stdout, 'S/N: 1|halt\nr\ngo\nexit\n')
             self.assertEqual((op.returncode, op.stdout), (None, None))
             self.assertEqual(op.attempts[1].script, 'halt\nr\ngo\nexit\n')
+
+
+class Sessions(unittest.TestCase):
+    """run_jlink_commands/run_stlink_commands and the SYSRESETREQ operations built on them:
+    the caller's connection profile, a unique command file in `workdir`, one raw attempt."""
+    UF2 = {'name': 'jlink', 'uid': '000725000000', 'args': '-device MIMXRT1011DAE5A'}
+    PROFILE = {'interface': 'SWD', 'speed': '4000', 'autoconnect': True, 'device': 'MIMXRT1011DAE5A'}
+
+    def session(self, fn, *args, rc=0, workdir=None, **kw):
+        """(operation, argv, command file path, its text, files beside it) of one call."""
+        seen = []
+
+        def run(argv, **k):
+            path = argv[-1]
+            seen.append((argv, k, path, Path(path).read_text(), sorted(os.listdir(Path(path).parent))))
+            return subprocess.CompletedProcess(argv, rc, 'transcript', None)
+        op = fn(*args, run=run, workdir=workdir, **kw)
+        (argv, k, path, text, beside), = seen
+        self.assertEqual(k, {'timeout': kw['timeout']})
+        self.assertFalse(Path(path).exists())
+        self.assertEqual(beside, [Path(path).name])
+        self.assertEqual((op.args, op.returncode, op.stdout), (argv, rc, 'transcript'))
+        self.assertEqual(len(op.attempts), 1)
+        self.assertEqual(op.attempts[0].script, text)
+        return op, argv, path, text
+
+    def test_jlink_session_argv_and_script(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        _, argv, path, text = self.session(hf.run_jlink_commands, self.UF2, ['h', 'mem32 E000ED08 1', 'g'],
+                                           workdir=d, timeout=120, **self.PROFILE)
+        self.assertEqual(Path(path).parent, Path(d))
+        self.assertRegex(Path(path).name, r'^hil_jlink_\w+\.jlink$')
+        self.assertEqual(argv, ['JLinkExe', '-USB', '000725000000', '-device', 'MIMXRT1011DAE5A', '-if', 'SWD',
+                                '-speed', '4000', '-autoconnect', '1', '-NoGui', '1', '-ExitOnError', '1',
+                                '-CommandFile', path])
+        self.assertEqual(text, 'h\nmem32 E000ED08 1\ng\nexit\n')
+
+    def test_jlink_session_profile_is_the_callers(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        _, argv, _, _ = self.session(hf.run_jlink_commands, self.UF2, ['h'], workdir=d, timeout=5,
+                                     interface='JTAG', speed=1000, autoconnect=False, device='Cortex-M4')
+        self.assertEqual(argv[3:9], ['-device', 'Cortex-M4', '-if', 'JTAG', '-speed', '1000'])
+        self.assertEqual(argv[9:13], ['-NoGui', '1', '-ExitOnError', '1'])
+        with self.assertRaises(TypeError):
+            hf.run_jlink_commands(self.UF2, ['h'], timeout=5, interface='SWD', speed=4000, autoconnect=True)
+
+    def test_stlink_session_argv_and_script(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        _, argv, path, text = self.session(hf.run_stlink_commands, {'name': 'stlink', 'uid': '0035'},
+                                           ['-halt', '-r32 0xE000ED08 1'], connect_mode='HOTPLUG', workdir=d,
+                                           timeout=120)
+        self.assertRegex(Path(path).name, r'^hil_stlink_\w+\.prg$')
+        self.assertEqual(argv, ['STM32_Programmer_CLI', '-script', path])
+        self.assertEqual(text, '-c port=SWD sn=0035 mode=HOTPLUG\n-halt\n-r32 0xE000ED08 1\n')
+
+    def test_the_workdir_defaults_to_the_cwd(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        with contextlib.chdir(d):
+            _, _, path, _ = self.session(hf.run_stlink_commands, {'uid': 'S'}, ['-halt'], connect_mode='UR',
+                                         timeout=5)
+        self.assertEqual(Path(path).parent, Path(d).resolve())
+
+    def test_a_failed_or_crashed_session_is_one_raw_attempt(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        for rc in (1, 124, -11, 139):
+            op, _, _, _ = self.session(hf.run_jlink_commands, self.UF2, ['h'], rc=rc, workdir=d, timeout=5,
+                                       **self.PROFILE)
+            self.assertEqual((op.returncode, op.retried, op.attempts[0].timed_out), (rc, (), rc == 124))
+
+    def test_an_interrupted_session_removes_its_file(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+
+        def run(argv, **k):
+            raise KeyboardInterrupt
+        for fn, kw in ((hf.run_jlink_commands, self.PROFILE), (hf.run_stlink_commands, {'connect_mode': 'HOTPLUG'})):
+            with self.assertRaises(KeyboardInterrupt) as cm:
+                fn(self.UF2, ['h'], timeout=5, run=run, workdir=d, **kw)
+            self.assertTrue(cm.exception.operation.attempts[0].interrupted)
+        self.assertEqual(os.listdir(d), [])
+
+    def test_sysresetreq_is_tinyuf2s_sequence_byte_for_byte(self):
+        """tinyuf2 hil_test.py at 7ab18b5: Battery.sysreset() runs Probe.run(['w4 E000ED0C 05FA0004'],
+        judge=False) with its session profile; StlinkBattery.sysreset() runs StlinkProbe.run(
+        ['-w32 0xE000ED0C 0x05FA0004 -nv']) after its HOTPLUG connect line."""
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        _, argv, path, text = self.session(hf.sysresetreq_jlink, self.UF2, workdir=d, timeout=120, **self.PROFILE)
+        self.assertEqual(argv, ['JLinkExe', '-USB', '000725000000', '-device', 'MIMXRT1011DAE5A', '-if', 'SWD',
+                                '-speed', '4000', '-autoconnect', '1', '-NoGui', '1', '-ExitOnError', '1',
+                                '-CommandFile', path])
+        self.assertEqual(text.encode(), b'w4 E000ED0C 05FA0004\nexit\n')
+        _, argv, path, text = self.session(hf.sysresetreq_stlink, {'name': 'stlink', 'uid': '0035'},
+                                           connect_mode='HOTPLUG', workdir=d, timeout=120)
+        self.assertEqual(argv, ['STM32_Programmer_CLI', '-script', path])
+        self.assertEqual(text.encode(), b'-c port=SWD sn=0035 mode=HOTPLUG\n-w32 0xE000ED0C 0x05FA0004 -nv\n')
 
 
 class StlinkLm4flashEsptool(unittest.TestCase):
