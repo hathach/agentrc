@@ -47,6 +47,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = []   # `gh pr checks` answers in order: a list of checks, or (rc, stderr)
         self.calls = []
         self.clock = [0]
+        self.resources = {}   # `gh api rate_limit`'s resources
 
         def run(argv, **kw):
             self.calls.append(argv[1:3])
@@ -56,6 +57,8 @@ class InventoryTest(unittest.TestCase):
                 state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
                 return mock.Mock(returncode=0, stdout=json.dumps(
                     {'headRefOid': head, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': mergeable, 'state': state}).encode())
+            if argv[1:3] == ['api', 'rate_limit']:
+                return mock.Mock(returncode=0, stdout=json.dumps({'resources': self.resources}).encode())
             if argv[1] == 'api':   # a failing Actions job's record: a first attempt, its own execution
                 job = int(argv[2].split('/jobs/')[1])
                 return mock.Mock(returncode=0, stdout=json.dumps({'id': job, 'run_id': 7, 'run_attempt': 1, 'head_sha': HEAD}).encode())
@@ -288,6 +291,19 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn('HTTP 502', r['error'])
         self.assertNotIn('status', r)
+        self.assertNotIn('rateLimit', r)
+
+    def test_a_rate_limit_is_reported_with_its_reset(self):
+        self.heads = [HEAD]
+        self.listings = [(1, 'GraphQL: API rate limit exceeded for user ID 249515.')]
+        self.resources = {'core': {'remaining': 4000, 'reset': 1790009999}, 'graphql': {'remaining': 0, 'reset': 1790000060}}
+        rc, r = self.main()
+        self.assertEqual((rc, r['rateLimit']['resetAt'], r['rateLimit']['secondary']), (1, '2026-09-21T14:14:20Z', False))
+        self.assertIn('API rate limit exceeded', r['error'])
+        self.resources = {'core': {'remaining': 4000, 'reset': 1790009999}}
+        self.listings = [(1, 'HTTP 403: You have exceeded a secondary rate limit.')]
+        rc, r = self.main()
+        self.assertEqual((r['rateLimit']['resetAt'], r['rateLimit']['secondary']), (None, True))
 
     def test_a_head_other_than_expected_is_refused_before_listing(self):
         self.heads = [OTHER]
@@ -429,7 +445,12 @@ class FailuresTest(unittest.TestCase):
                 n = int(argv[4].split('/attempts/')[1].split('/')[0])
                 jobs = self.attempts.get(n, [])
                 return ok(self.paged.get(n) or [{'total_count': len(jobs), 'jobs': jobs}])
+            limited = mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 403: API rate limit exceeded for user ID 1.')
+            if argv[1:3] == ['api', 'rate_limit']:
+                return ok({'resources': {'core': {'remaining': 0, 'reset': 1790000060}}})
             if argv[1:3] == ['api', '--paginate']:
+                if self.changed == 'limited':
+                    return limited
                 if self.changed is None:
                     return mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 500')
                 return ok([[{'filename': f, 'patch': '@@'} for f in self.changed]])
@@ -441,6 +462,8 @@ class FailuresTest(unittest.TestCase):
                 return ok({'jobs': self.run_jobs[argv[3]]})
             path = argv[2]
             job = path.split('/jobs/')[1].split('/')[0]
+            if path.endswith('/logs') and self.logs[job] == 'limited':
+                return limited
             return ok(self.logs[job]) if path.endswith('/logs') else ok(self.jobs[job])
         for obj, name, fake in ((collect.subprocess, 'run', run), (collect.tempfile, 'gettempdir', lambda: self.tmp.name),
                                 (collect.rtd, 'token', lambda: 'k'),
@@ -777,6 +800,15 @@ class FailuresTest(unittest.TestCase):
                     '[{"cleanup": {"survivors": [1]}}]'):
             self.assertEqual(collect.uf2_reports([fail, f'{{"pass": true, "caveat": "", "results": {bad}}}']),
                              [(1, json.loads(fail))], bad)
+
+    def test_a_rate_limit_reading_a_check_or_the_changed_paths_fails_the_whole_call(self):
+        for name, setup in (('a job log', lambda: self.logs.__setitem__('3', 'limited')), ('the changed paths', lambda: setattr(self, 'changed', 'limited'))):
+            with self.subTest(name):
+                self.setUp()
+                setup()
+                rc, r = self.main(JOB.format(3))
+                self.assertEqual((rc, r['rateLimit']['resetAt'], r['rateLimit']['secondary']), (1, '2026-09-21T14:14:20Z', False))
+                self.assertIn('API rate limit exceeded', r['error'])
 
     def test_changed_paths_are_read_for_any_readable_check_and_their_failure_is_named(self):
         rc, r = self.main('https://greptile.com/')

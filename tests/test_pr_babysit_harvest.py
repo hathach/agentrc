@@ -315,6 +315,8 @@ if not got:
     sys.stderr.write('no answer for ' + key); sys.exit(1)
 out = got.pop(0) if len(got) > 1 else got[0]
 json.dump(answers, open(f, 'w'))
+if isinstance(out, dict) and 'stderr' in out and len(out) == 1:
+    sys.stderr.write(out['stderr']); sys.exit(1)
 print(json.dumps(out))
 ''')
 
@@ -370,7 +372,7 @@ class EndToEnd(unittest.TestCase):
         gh = FakeGh(self.root, answers)
         out = io.StringIO()
         with run_gh_as(gh.stub), redirect_stdout(out):
-            code = harvest.report(harvest.collect, list(argv) or ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit'])
+            code = harvest.report(harvest.collect, list(argv) or ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit'], limits=True)
         return code, json.loads(out.getvalue().splitlines()[-1])
 
     def test_one_read(self):
@@ -436,6 +438,26 @@ class EndToEnd(unittest.TestCase):
         code, got = self.harvest(self.answers([OLD, HEAD, 'c' * 40]))
         self.assertEqual(code, 2)
         self.assertIn('head moved', got['error'])
+
+    def test_a_rate_limit_is_reported_with_its_reset(self):
+        limited = {'stderr': 'HTTP 403: API rate limit exceeded for user ID 249515.'}
+        for name, resources, want in (
+                ('primary', {'core': {'remaining': 0, 'reset': 1790000000}, 'graphql': {'remaining': 0, 'reset': 1790000060},
+                             'search': {'remaining': 30, 'reset': 1790009999}}, ('2026-09-21T14:14:20Z', False)),
+                ('secondary', {'core': {'remaining': 5000, 'reset': 1790000000}}, (None, True))):
+            with self.subTest(name):
+                answers = self.answers([HEAD])
+                answers['pr view 7 --json headRefOid,headRefName,headRepository'] = [limited]
+                answers['api rate_limit'] = [{'resources': resources}]
+                code, got = self.harvest(answers)
+                self.assertEqual(code, 2)
+                self.assertIn('API rate limit exceeded', got['error'])
+                self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), want)
+                self.assertRegex(got['rateLimit']['observedAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
+        answers = self.answers([HEAD])
+        answers['pr view 7 --json headRefOid,headRefName,headRepository'] = [{'stderr': 'HTTP 404: Not Found'}]
+        code, got = self.harvest(answers)
+        self.assertEqual((code, 'rateLimit' in got), (2, False), 'another failure keeps its plain error line')
 
     def test_a_malformed_answer_is_an_error(self):
         answers = self.answers([HEAD])

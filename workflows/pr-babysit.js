@@ -331,12 +331,17 @@ const COLLECT_CHECK = {
     aliases: { type: 'array', items: { type: 'string' } },
   },
 }
+// A gh call GitHub refused for a rate limit (facts.py): resetAt null for a secondary limit, which names no reset.
+const RATE_LIMIT = {
+  type: ['object', 'null'], additionalProperties: false, required: ['observedAt', 'resetAt', 'secondary'],
+  properties: { observedAt: { type: 'string' }, resetAt: { type: ['string', 'null'] }, secondary: { type: 'boolean' } },
+}
 const INVENTORY = withSeal({
   type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'observedAt'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
     pending: { type: 'integer' }, registered: { type: 'integer' }, ignored: { type: 'array', items: { type: 'string' } }, waiting: { type: 'string' },
-    checks: { type: 'array', items: COLLECT_CHECK }, observedAt: { type: 'string' },
+    checks: { type: 'array', items: COLLECT_CHECK }, observedAt: { type: 'string' }, rateLimit: RATE_LIMIT,
   },
 })
 const GATE = {
@@ -356,6 +361,7 @@ const GATE = {
 const EVIDENCE = withSeal({
   type: 'object', required: ['head', 'detail', 'gates', 'bases'],
   properties: {
+    rateLimit: RATE_LIMIT,
     error: { type: ['string', 'null'] }, head: { type: 'string' }, detail: { type: 'string' }, gates: { type: 'array', items: GATE },
     bases: {
       type: 'array',
@@ -462,6 +468,8 @@ const REVIEWS = {
         properties: { commentId: { type: 'integer' }, body: { type: 'string' } },
       },
     },
+    // harvest.py's error line when GitHub refused it for a rate limit, with that error.
+    rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
   },
 }
 // code-writer's output contract verbatim: a schema missing a key the role returns rejects a conformant reply.
@@ -688,7 +696,12 @@ const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\'. ' +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
-)
+).then(out => {
+  // reply.py names a rate limit only in error text: the line's, or a sealed receipt's when it struck mid-batch.
+  const said = !out ? undefined : (out.error ? [out.error] : out.receipts.map(r => r.error)).find(e => e && /rate limit|HTTP 429/i.test(e))
+  if (said) noteLimit({ error: `reply.py: ${said}`, observedAt: null, resetAt: null, secondary: /secondary/i.test(said) })
+  return out
+})
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -1539,6 +1552,9 @@ const prGate = async (lanes, tag) => {
 }
 
 let napMs = 0
+// The first refusal for a GitHub rate limit this cycle: facts.py's rateLimit plus its error (#90).
+let githubLimit = null
+const noteLimit = (limit) => { githubLimit = githubLimit || limit }
 // The cycle number carries across launches; capped so a resumed launch does not nap a quarter hour per cycle.
 const backoff = (cycle) => 60000 * Math.min(cycle, 10)
 // Set where a cycle continues only to wait (CI, bots, owed replies, a SonarCloud re-read); any other continuation pauses yieldOnChange.
@@ -1830,12 +1846,16 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   }
   // A slice retried without its wait leaves the budget short of a whole wait.
   let shortened = false
-  const faultOf = (x, head) => !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
+  const faultOf = (x, head) => {
+    if (x && x.rateLimit) noteLimit({ error: x.error || '', ...x.rateLimit })
+    return !x ? 'the collector died' : x.error || (x.head !== head ? `it is for ${x.head.slice(0, 7)}` : null)
+  }
   const verdictDigest = ({ link, bucket, failures }) => fnv1a(canonical({ link, bucket, failures }))
   const sameLinks = (got, want) => got.length === want.length && want.every(l => got.includes(l))
   const inventoryFailed = (inv) => {
-    if (inv && !inv.error) return false
-    log(`cycle ${cycle}: CI inventory failed — ${inv ? inv.error : 'the collector died'}`)
+    const fault = faultOf(inv, inv ? inv.head : '')
+    if (!fault) return false
+    log(`cycle ${cycle}: CI inventory failed — ${fault}`)
     return true
   }
   const endLanes = (inv) => {
@@ -1982,9 +2002,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   const known = reruns.filter(r => r.sure).map(r => `${r.workflow} / ${r.check}`)
   const possible = reruns.filter(r => !r.sure).map(r => `${r.workflow} / ${r.check}`)
   const ev = await collect(`ci:collect#${cycle}.f`, `failures ${[...links.map(l => `--check ${shq(l)}`), ...gated.map(c => `--gate ${shq(c.link)}`)].join(' ')}`, EVIDENCE)
+  const evFault = faultOf(ev, inv.head)
   // A push while the evidence was read restarted CI: judging it could re-run a superseded run.
   if (superseded()) return report
-  const evFault = faultOf(ev, inv.head)
   if (evFault) {
     log(`cycle ${cycle}: CI evidence not collected — ${evFault}`)
     return null
@@ -2028,6 +2048,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   }
   // An empty answer is a re-run by the contract.
   if (reran.length) {
+    entry.ciReran = reran.length
     report.status = 'running'
     if (inv.status !== 'running') report.settling = true
   }
@@ -2076,7 +2097,14 @@ const runCycle = async (cycle, entry) => {
   const lanes = { reviewDone: !reviewLane, reviewPublishing: false, ended: false, prState: null }
   const verdict = await runLanes(cycle, entry, lanes)
   // The CI lane settles last, so it can read the merge after the review lane stopped for another reason.
-  return lanes.prState === 'merged' || lanes.prState === 'closed' ? prEnded(cycle, lanes.prState) : verdict
+  if (lanes.prState === 'merged' || lanes.prState === 'closed') return prEnded(cycle, lanes.prState)
+  // Another cycle would meet the same refusal: the caller relaunches once it clears (#90).
+  if (githubLimit) {
+    const { error, resetAt, secondary } = githubLimit
+    log(`cycle ${cycle}: GitHub refused a call for a ${secondary ? 'secondary ' : ''}rate limit (${error}) — stopping; relaunch ${resetAt ? `after ${resetAt}` : 'once it clears'}`)
+    return stop(cycle, 'github-rate-limited', { rateLimit: githubLimit })
+  }
+  return verdict
 }
 
 const runLanes = async (cycle, entry, lanes) => {
@@ -2114,6 +2142,10 @@ const runLanes = async (cycle, entry, lanes) => {
     if (!r) {
       entry.error = 'pr-review-validator died'
       return stop(cycle, 'review-validator-died')
+    }
+    if (r.rateLimit) {
+      noteLimit(r.rateLimit)
+      return null
     }
     if (reviewLane && reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
     entry.reviews = reviewLane ? r : null
@@ -2833,6 +2865,8 @@ const adopt = async (entry) => {
   return null
 }
 
+const worked = (e) => Object.entries(actionsOf(e)).some(([k, v]) => k !== 'error' && (Array.isArray(v) ? v.length > 0 : !!v)) ||
+  !!(e.sonar && e.sonar.length) || !!e.ciReran
 const yielded = (cycle) => finish(stop(cycle, 'yielded', { outstanding: outstanding() }), 'paused')
 // yieldOnChange returns after a cycle the caller must see: a push, changed handoffs or corrections, or no usable observation.
 const changeOf = (entry, before) => entry.reviewPush || entry.ciPush ? 'a repair was pushed'
@@ -2844,6 +2878,7 @@ const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
 for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
   waited = false
+  githubLimit = null
   const before = yieldOnChange ? { handoffs: JSON.stringify(handoffList()), corrections: corrections.length } : null
   const entry = { cycle, head: expectedHead, ...(rebased && cycle === firstCycle ? { rebased } : {}) }
   retired.clear()
@@ -2861,6 +2896,8 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
     log(entry.summary)
     cyclesUsed = cycle
   }
+  // A cycle that only met the rate limit observed nothing: it is not charged.
+  if (verdict && verdict.reason === 'github-rate-limited' && !worked(entry)) cyclesUsed = cycle - 1
   if (verdict) return finish(verdict)
   const change = yieldOnChange && cycle < maxCycles ? changeOf(entry, before) : null
   if (change) {

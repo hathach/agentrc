@@ -1,10 +1,17 @@
-"""What pr-babysit's scripts share: the {"error"} line contract and strict reads."""
+"""What pr-babysit's scripts share: the {"error"} line contract and strict reads.
+
+A gh call GitHub refused for a rate limit raises RateLimited; a script whose
+caller reads it (report(limits=True)) also prints rateLimit {observedAt, resetAt,
+secondary} on that error line: resetAt the latest reset of a resource `gh api
+rate_limit` (which spends no quota) shows exhausted, null when it shows none, and
+secondary when none is exhausted or gh names a secondary limit."""
 
 import argparse
 import json
 import os
 import re
 import subprocess
+import time
 
 FULL_SHA = re.compile(r'\A[0-9a-f]{40}\Z')  # \Z: $ would let a trailing newline through
 # The human is the sole author: no line may credit an agent, model, tool or session, nor link a Claude or ChatGPT session anywhere.
@@ -27,6 +34,32 @@ class Unusable(Exception):
     pass
 
 
+class RateLimited(Unusable):
+    def __init__(self, message, limit):
+        super().__init__(message)
+        self.limit = limit
+
+
+RATE_LIMITED = re.compile(r'rate limit|HTTP 429', re.I)
+
+
+def utc(seconds):
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(seconds))
+
+
+def rate_limit(stderr):
+    """rateLimit for a gh failure GitHub refused for a rate limit, else None."""
+    if not RATE_LIMITED.search(stderr):
+        return None
+    try:
+        resources = json.loads(subprocess.run(['gh', 'api', 'rate_limit'], capture_output=True).stdout)['resources']
+        spent = [r['reset'] for r in resources.values() if r.get('remaining') == 0 and isinstance(r.get('reset'), int)]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        spent = []
+    return {'observedAt': utc(time.time()), 'resetAt': utc(max(spent)) if spent else None,
+            'secondary': not spent or 'secondary' in stderr.lower()}
+
+
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         raise Unusable(f'usage: {message}')
@@ -39,7 +72,10 @@ def run(*argv, ok=(0,)):
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')
     if done.returncode not in ok:
-        raise Unusable(f"{' '.join(argv)}: {done.stderr.decode(errors='replace').strip()}")
+        err = done.stderr.decode(errors='replace').strip()
+        message = f"{' '.join(argv)}: {err}"
+        limit = rate_limit(err) if argv[0] == 'gh' else None
+        raise RateLimited(message, limit) if limit else Unusable(message)
     try:
         return done.returncode, done.stdout.decode()
     except UnicodeDecodeError:
@@ -94,12 +130,12 @@ def checkout_top():
     return top
 
 
-def report(collect, argv, seal=False):
+def report(collect, argv, seal=False, limits=False):
     """Print collect(argv) as the last stdout line, sealed when asked, and return 0, or {"error"} and 2."""
     try:
         facts = collect(argv)
     except Unusable as e:
-        print(json.dumps({'error': str(e)}))
+        print(json.dumps({'error': str(e), **({'rateLimit': e.limit} if limits and isinstance(e, RateLimited) else {})}))
         return 2
     print(json.dumps(sealed(facts) if seal else facts))
     return 0

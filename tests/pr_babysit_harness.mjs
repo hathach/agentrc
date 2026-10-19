@@ -392,7 +392,8 @@ async function run(opts = {}) {
         : opts.reviewBody && opts.reviewBody(commentId)
           ? { commentId, kind: 'review-body', replyId: 500 + commentId, digest, sent: true, posted: true, verified: true, resolved: null, error: null }
         : opts.lost && opts.lost(commentId)
-          ? { commentId, kind: 'review', replyId: null, digest, sent: true, posted: false, verified: false, resolved: null, error: 'connection reset' }
+          // lost: true, or the error text the posting failed with
+          ? { commentId, kind: 'review', replyId: null, digest, sent: true, posted: false, verified: false, resolved: null, error: typeof opts.lost(commentId) === 'string' ? opts.lost(commentId) : 'connection reset' }
           : opts.wrongBody && opts.wrongBody(commentId)
             ? { commentId, kind: 'review', replyId: 500 + commentId, digest, sent: true, posted: true, verified: false, resolved: null, error: 'read-back mismatch on body' }
           : opts.alreadyThere && opts.alreadyThere(commentId)
@@ -2075,6 +2076,77 @@ test('a re-run\'s deadline carries across launches; one from a state without its
   assert.notEqual(timed.result.reason, 'ci-stuck')
   assert.deepEqual(timed.result.state.ciCache.reruns.map(r => r.at), [at(100)], 'timed from the first read after the resume, once')
   assert.equal((await resumed(timed.result.state, 130)).result.reason, 'ci-stuck')
+})
+
+// #90: every harvest of a launch hit a secondary limit, and each failed cycle was charged.
+const LIMIT = { observedAt: at(5), resetAt: null, secondary: true }
+const LIMITED_REVIEWS = { headSha: '', headEventEvidence: 'rate limited', bots: [], botsWhole: true, findings: [], replies: [],
+  rateLimit: { error: 'gh api: HTTP 403: You have exceeded a secondary rate limit.', ...LIMIT } }
+const limitedInventory = (label, line) => label.startsWith('ci:collect#') && line && 'status' in line
+  ? { ...line, error: 'gh pr checks: GraphQL: API rate limit exceeded', rateLimit: { ...LIMIT, resetAt: at(60), secondary: false }, seal: '' } : line
+
+test('a harvest GitHub refused for a rate limit stops the launch at once, the cycle not charged (#90)', async () => {
+  for (const args of [{ maxCycles: 4 }, { ...YIELD }, { autoPush: true, maxCycles: 4, yieldOnChange: true }]) {
+    const { result, labels, logs } = await run({ reviews: LIMITED_REVIEWS, args })
+    assert.equal(result.reason, 'github-rate-limited', JSON.stringify(args))
+    assert.deepEqual(result.rateLimit, LIMITED_REVIEWS.rateLimit)
+    assert.equal(result.state.cyclesUsed, 0, 'nothing observed: the cycle is not charged')
+    assert.equal(labels.filter(l => l.startsWith('reviews#')).length, 1)
+    assert.ok(logs.some(l => /GitHub refused a call for a secondary rate limit .* relaunch once it clears/.test(l)))
+  }
+})
+
+test('a CI read GitHub refused for a rate limit stops the cycle too, with its reset (#90)', async () => {
+  const { result, logs } = await run({ reviews: WAITING, garble: limitedInventory, args: { maxCycles: 4 } })
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.deepEqual(result.rateLimit, { error: 'gh pr checks: GraphQL: API rate limit exceeded', ...LIMIT, resetAt: at(60), secondary: false })
+  assert.equal(result.state.cyclesUsed, 0)
+  assert.ok(logs.some(l => l.includes(`relaunch after ${at(60)}`)))
+})
+
+test('a cycle that pushed a repair is charged though the other lane met a rate limit; the uncharged cycle number runs again (#90)', async () => {
+  const { result } = await run({ reviews: oneValid, garble: limitedInventory, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.ok(result.history[0].reviewPush, 'the review lane pushed')
+  assert.equal(result.state.cyclesUsed, 1)
+  const first = await run({ reviews: WAITING, args: YIELD })
+  const quiet = await run({ reviews: LIMITED_REVIEWS, args: { ...YIELD, state: first.result.state } })
+  assert.deepEqual([quiet.result.reason, quiet.result.state.cyclesUsed], ['github-rate-limited', 1])
+  const next = await run({ reviews: WAITING, args: { ...YIELD, state: quiet.result.state } })
+  assert.equal(next.result.state.cyclesUsed, 2, 'the uncharged cycle number runs again')
+  assert.ok(next.labels.includes('reviews#2'))
+})
+
+test('reply.py refused for a rate limit stops the launch too; a cycle that re-ran a check is charged (#90)', async () => {
+  const replied = await run({ reviews: oneValid, replyError: (label) => label.startsWith('resolve#') && RATE, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(replied.result.reason, 'github-rate-limited')
+  assert.deepEqual(replied.result.rateLimit, { error: `reply.py: ${RATE}`, observedAt: null, resetAt: null, secondary: false })
+  assert.equal(replied.result.state.cyclesUsed, 1, 'it pushed a repair')
+  const midBatch = await run({ reviews: oneValid, lost: () => RATE, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(midBatch.result.reason, 'github-rate-limited', 'a receipt\'s error names it too')
+  assert.equal(midBatch.result.rateLimit.error, `reply.py: ${RATE}`)
+  const reran = await run({ reviews: LIMITED_REVIEWS, ci: redWith(RIG).ci, judge: rerunAll, args: { maxCycles: 4 } })
+  assert.equal(reran.result.reason, 'github-rate-limited')
+  assert.deepEqual(reran.result.state.ciCache.reruns.map(r => r.sure), [true])
+  assert.equal(reran.result.state.cyclesUsed, 1, 'a re-run without a receipt is still one')
+})
+
+test('CI evidence refused for a rate limit stops the launch even when a review push superseded it (#90)', async () => {
+  const limitedEvidence = (label, line) => label === 'ci:collect#1.f' && line ? { ...line, error: RATE, rateLimit: LIMIT, seal: '' } : line
+  const { result, labels } = await run({
+    reviews: oneValid, args: { autoPush: true, maxCycles: 4 }, garble: limitedEvidence,
+    ci: { status: 'red', infraRerun: [], realFailures: [UNPLACED] }, evidence: afterReviewLane('push#'),
+  })
+  assert.equal(labels.includes('ci:judge#1'), false, 'superseded evidence is still not judged')
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.deepEqual(result.rateLimit, { error: RATE, ...LIMIT })
+})
+
+test('another harvest error keeps today\'s path: every reviewer unknown, re-armed (#90)', async () => {
+  const unknown = { findings: [], replies: [], bots: [bot('coderabbit', { state: 'unknown', sha: null, evidence: [], reason: 'gh: HTTP 502' })] }
+  const { result } = await run({ reviews: unknown, args: { maxCycles: 2 } })
+  assert.notEqual(result.reason, 'github-rate-limited')
+  assert.equal(result.state.cyclesUsed, 2)
 })
 
 test('a re-run recorded under a copy\'s link still settles the execution it copied', async () => {

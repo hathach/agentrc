@@ -29,7 +29,7 @@ with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
 "coderabbit-walkthrough"; and a Copilot review body saying it could not review,
 "copilot-refusal". Their digest and aliases are still the real body's and identify them,
 and its url shows it (`gh api repos/<repo>/issues/comments/<commentId>` for the walkthrough). Exit 2 with {"error": ...} when gh cannot answer the PR, the
-head, or a comment endpoint.
+head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh for a rate limit.
 """
 
 import base64
@@ -440,4 +440,4 @@ def collect(argv):
 
 
 if __name__ == '__main__':
-    sys.exit(report(collect, sys.argv[1:]))
+    sys.exit(report(collect, sys.argv[1:], limits=True))

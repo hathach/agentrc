@@ -8,7 +8,9 @@
 
 inventory: waits up to S seconds (default 0) while the status is running, then
 prints one JSON object {head, status, mergeable, pending, registered, ignored, waiting, checks, observedAt}, plus `error` when set
-(a relaying agent can drop a trailing null, so no line carries a null error); every
+(a relaying agent can drop a trailing null, so no line carries a null error), and
+`rateLimit` {observedAt, resetAt, secondary} beside an error from a gh call GitHub
+refused for a rate limit, as pr-babysit's facts.py reports it; every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
 again). The PR is read again on every poll. A check named exactly an
@@ -168,7 +170,23 @@ CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
 
 
 class Failed(Exception):
-    pass
+    def __init__(self, message, limit=None):
+        super().__init__(message)
+        self.limit = limit
+
+
+def rate_limit(stderr):
+    """pr-babysit facts.py's rateLimit for a gh failure GitHub refused for a rate limit, else None."""
+    if not re.search(r'rate limit|HTTP 429', stderr, re.I):
+        return None
+    try:
+        resources = json.loads(subprocess.run(['gh', 'api', 'rate_limit'], capture_output=True).stdout)['resources']
+        spent = [r['reset'] for r in resources.values() if r.get('remaining') == 0 and isinstance(r.get('reset'), int)]
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        spent = []
+    utc = lambda t: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+    return {'observedAt': utc(time.time()), 'resetAt': utc(max(spent)) if spent else None,
+            'secondary': not spent or 'secondary' in stderr.lower()}
 
 
 def gh(*args, raw=False):
@@ -178,7 +196,7 @@ def gh(*args, raw=False):
         raise Failed(f'gh: {e}')
     if done.returncode != 0:
         err = done.stderr.decode(errors='replace').strip()
-        raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}')
+        raise Failed(f'gh {args[0]} {args[1]}: {err or f"exit {done.returncode}"}', rate_limit(err))
     # A job log is whatever the job printed; anything parsed stays strict.
     if raw:
         return done.stdout.decode(errors='replace')
@@ -870,6 +888,8 @@ def changed_paths(repo, pr):
     try:
         names = [f['filename'] for page in gh('api', '--paginate', '--slurp', f'repos/{repo}/pulls/{pr}/files?per_page=100') for f in page]
     except (Failed, KeyError, TypeError) as e:
+        if getattr(e, 'limit', None):
+            raise
         return None, f'the PR files could not be read: {e}'
     if len(names) >= 3000:
         return None, f'GitHub listed {len(names)} files, its cap: the list may be incomplete'
@@ -900,6 +920,8 @@ def failures(repo, pr, head, links, gates=()):
             else:
                 entry['error'] = 'no reader for this check: its link names no run'
         except (Failed, rtd.Failed, circleci.Failed) as e:
+            if getattr(e, 'limit', None):
+                raise
             entry['error'] = str(e)
         checks.append(entry)
     unread = prior_verdicts(repo, pr, head, checks)
@@ -990,7 +1012,7 @@ def main(argv=None):
             out = recall(a.repo, a.pr, a.head, a.check, a.offset)
         out, rc = sealed(out), 0
     except Failed as e:
-        out, rc = {'head': a.head, 'error': str(e)}, 1
+        out, rc = {'head': a.head, 'error': str(e), **({'rateLimit': e.limit} if e.limit else {})}, 1
     print(json.dumps(out))
     return rc
 
