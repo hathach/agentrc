@@ -3830,9 +3830,8 @@ test('a deferred sibling the offered note states does not keep it from being pos
 test('a deferred sibling whose point the offered note does not state keeps it handed off (#115)', async () => {
   // The resumed launch defers the sibling with another reason, so its point is not the one the dead note carried.
   let cycle = 0
-  const opts = (reason, state) => ({
-    args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, deferrals: [deferral({ findingId: '1#2', reason })], ...(state ? { state } : {}) },
-    ...(state ? { preflight: { head: state.expectedHead, prHead: state.expectedHead } } : {}),
+  const opts = (reason) => ({
+    args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, deferrals: [deferral({ findingId: '1#2', reason })] },
     dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
     reviewsPerCycle: (prompt) => {
       cycle++
@@ -3842,7 +3841,7 @@ test('a deferred sibling whose point the offered note does not state keeps it ha
     },
   })
   const first = await run(opts('broken on master too; own PR'))
-  const { result, calls } = await run(opts('needs its own PR', first.result.state))
+  const { result, calls } = await resumeAt(first.result.state, opts('needs its own PR'))
   assert.equal(calls.some(c => c.label.startsWith('resolve#')), false, 'the offered note went out without the point now owed')
   assert.match(debtOf(result, 1).repair.error, /offered fixNote is stale/)
 })
