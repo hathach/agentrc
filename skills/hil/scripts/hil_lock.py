@@ -399,10 +399,36 @@ def _pidfd_signal(pid, start, sig, still_valid) -> None:
         os.close(pidfd)
 
 
-def _wait_cleared(boards, deadline) -> list:
-    """The boards whose record or journal is still there at the deadline."""
+def _exited(pid, start) -> bool:
+    """Whether `pid` started at `start` has only zombie threads: do_exit() drops a task's files
+    before exit_notify() makes it one (kernel/exit.c v6.12 :934, :959), and its fd dir is then
+    EACCES. A zombie creates no thread, so an unchanged task set around the scan has no live one."""
+    def state(t):
+        with open(f'/proc/{pid}/task/{t}/stat') as f:
+            return f.read().rpartition(')')[2].split()[0]
+    try:
+        tasks = sorted(os.listdir(f'/proc/{pid}/task'))
+        return (bool(tasks) and all(state(t) in ('Z', 'X') for t in tasks)
+                and sorted(os.listdir(f'/proc/{pid}/task')) == tasks and proc_start(pid) == start)
+    except (OSError, IndexError):
+        return False
+
+
+def _keeps_flock(pid, start, board) -> bool:
+    """Whether the holder `pid` started at `start` still holds `board`'s flock: it clears its
+    records before it exits and the kernel drops its flocks only then."""
+    try:
+        return proc_start(pid) == start and _holds_flock(pid, lock_path(board))
+    except OSError:
+        return not _exited(pid, start)     # otherwise unproven either way: rechecked until the deadline
+
+
+def _wait_cleared(boards, pid, start, deadline) -> list:
+    """The boards whose record or journal is still there at the deadline, or whose flock the
+    holder `pid` started at `start` still holds."""
     while True:
-        left = [b for b in boards if record_state(b)[0] not in ('absent', 'empty') or journal_state(b) is not None]
+        left = [b for b in boards if record_state(b)[0] not in ('absent', 'empty') or journal_state(b) is not None
+                or _keeps_flock(pid, start, b)]
         if not left or time.monotonic() >= deadline:
             return left
         time.sleep(0.05)
@@ -411,7 +437,7 @@ def _wait_cleared(boards, deadline) -> list:
 def release_token(token: str):
     """End the token's holder: its token, pid, start, role and lock set agree on every board
     that carries the token, it is alive as recorded, and SIGUSR1 reaches it through a pidfd;
-    returns (pid, boards) once its records are gone. A dead holder is refused: its boards
+    returns (pid, boards) once its records and flocks are gone. A dead holder is refused: its boards
     need a recovery takeover."""
     found = {}
     for b in lock_names():
@@ -450,9 +476,9 @@ def release_token(token: str):
     if not proven:
         raise ReleaseRefused(f'not signalled: holder pid {pid} does not hold the flocks its records name')
     _pidfd_signal(pid, start, signal.SIGUSR1, still_valid)
-    left = _wait_cleared(sorted(found), time.monotonic() + RELEASE_WAIT)
+    left = _wait_cleared(sorted(found), pid, start, time.monotonic() + RELEASE_WAIT)
     if left:
-        raise ReleaseRefused(f'signalled, but holder pid {pid} left its records on {", ".join(left)}')
+        raise ReleaseRefused(f'signalled, but holder pid {pid} left its records or flocks on {", ".join(left)}')
     return pid, sorted(found)
 
 
@@ -809,14 +835,6 @@ def _wait_released(owned, named, deadline) -> list:
     deadline: by that holder's record, alive or not, or its flock, by an unreadable record, or,
     on a board in `named`, by any live holder. A board only _boards_of added is cleared once
     another holder has it."""
-    def holds_flock(b):
-        # the holder clears its records before it exits and the kernel drops its flocks
-        pid, start = owned[b]
-        try:
-            return proc_start(pid) == start and _holds_flock(pid, lock_path(b))
-        except OSError:
-            return True        # unproven either way: rechecked until the deadline
-
     def taken(b):
         state, rec = record_state(b)
         if state == 'unreadable':
@@ -824,7 +842,7 @@ def _wait_released(owned, named, deadline) -> list:
         if state == 'record' and ((rec.get('pid'), rec.get('start')) == owned[b]
                                   or (b in named and _alive(rec))):
             return True
-        return holds_flock(b)
+        return _keeps_flock(*owned[b], b)
     while True:
         still = sorted(b for b in owned if taken(b))
         if not still or time.monotonic() >= deadline:

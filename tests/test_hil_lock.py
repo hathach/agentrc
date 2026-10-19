@@ -1109,7 +1109,51 @@ class UnreadableRecords(LockDir):
     def test_a_record_left_unreadable_is_not_a_completed_release(self):
         self.patch(hil_lock.time, 'sleep', lambda s: None)
         Path(hil_lock.lock_path(BOARD)).write_bytes(b'\xff')
-        self.assertEqual(hil_lock._wait_cleared([BOARD], time.monotonic()), [BOARD])
+        self.assertEqual(hil_lock._wait_cleared([BOARD], 999999999, None, time.monotonic()), [BOARD])
+
+    def test_a_holder_still_on_its_flock_is_not_a_completed_release(self):
+        self.patch(hil_lock.time, 'sleep', lambda s: None)
+        fh = hil_lock.flock_nb(BOARD)               # records cleared, flock not yet dropped
+        me = (os.getpid(), hil_lock.proc_start(os.getpid()))
+        self.assertEqual(hil_lock._wait_cleared([BOARD], *me, time.monotonic()), [BOARD])
+        fh.close()
+        self.assertEqual(hil_lock._wait_cleared([BOARD], *me, time.monotonic()), [])
+
+    def test_an_exited_holder_not_yet_reaped_has_dropped_its_flock(self):
+        self.patch(hil_lock.time, 'sleep', lambda s: None)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                fh = hil_lock.flock_nb(BOARD)      # kept open: only the kernel's exit drops it
+                os._exit(0 if fh else 1)
+            finally:
+                os._exit(1)
+        self.addCleanup(os.waitpid, pid, 0)
+        start = hil_lock.proc_start(pid)
+        deadline = time.monotonic() + 5
+        while not hil_lock._exited(pid, start) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(hil_lock._wait_cleared([BOARD], pid, start, time.monotonic()), [])
+
+    def test_a_thread_set_that_changes_during_the_scan_is_not_an_exit(self):
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        self.addCleanup(os.waitpid, pid, 0)
+        start = hil_lock.proc_start(pid)
+        deadline = time.monotonic() + 5
+        while not hil_lock._exited(pid, start) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        real, scans = os.listdir, []
+
+        def listdir(path):                      # a worker appears between the two scans
+            got = real(path)
+            if path == f'/proc/{pid}/task':
+                scans.append(1)
+                return got + ['999999999'] if len(scans) > 1 else got
+            return got
+        self.patch(hil_lock.os, 'listdir', listdir)
+        self.assertFalse(hil_lock._exited(pid, start))
 
 
 class HolderFields(LockDir):
