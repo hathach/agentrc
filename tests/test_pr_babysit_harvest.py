@@ -489,6 +489,18 @@ class EndToEnd(unittest.TestCase):
         code, got = self.harvest(answers)
         self.assertEqual((code, 'rateLimit' in got), (2, False), 'another failure keeps its plain error line')
 
+    def test_a_rate_limit_on_a_workflow_read_is_reported(self):
+        """#90: an unreadable workflow dates nothing, but a rate limit on its read stops the harvest."""
+        answers = self.answers([HEAD])
+        answers[f'api repos/o/r/contents/.github/workflows/label.yml?ref={HEAD}'] = [{'stderr': 'HTTP 403: You have exceeded a secondary rate limit.'}]
+        answers['api rate_limit'] = [{'resources': {'core': {'remaining': 5000}}}]
+        for later in ('statuses', 'check-runs'):
+            del answers[f'api --paginate --slurp repos/o/r/commits/{HEAD}/{later}?per_page=100']
+        code, got = self.harvest(answers)
+        self.assertEqual(code, 2, got)
+        self.assertIn('secondary rate limit', got['error'])
+        self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), (None, True))
+
     def test_a_malformed_answer_is_an_error(self):
         answers = self.answers([HEAD])
         answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'] = [[[{'id': 30, 'user': None}]]]

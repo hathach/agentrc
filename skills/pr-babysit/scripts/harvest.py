@@ -42,7 +42,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, report, run  # noqa: E402
 
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
@@ -359,6 +359,8 @@ def pr_types(repo, path, sha):
     try:
         meta = gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
+    except RateLimited:
+        raise
     except (Unusable, KeyError, ValueError, yaml.YAMLError):
         return None
     on = doc.get('on', doc.get(True)) if isinstance(doc, dict) else None  # YAML 1.1 reads a bare `on` as True
