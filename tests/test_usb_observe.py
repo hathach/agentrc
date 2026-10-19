@@ -87,7 +87,7 @@ class BoundedRead(unittest.TestCase):
         [t.start() for t in ts]
         [t.join() for t in ts]
         self.assertEqual(len(uo._stranded), 1)
-        self.assertEqual(uo._live[self.fifo], 1, 'four readers of one path spent four credits')
+        self.assertEqual(uo._live[uo._key(self.fifo)], 1, 'four readers of one path spent four credits')
 
     def test_a_flapping_wedged_device_cannot_leak_without_bound(self):
         """The inode all-clear re-arms on every re-enumeration, so a device that flaps
@@ -97,7 +97,7 @@ class BoundedRead(unittest.TestCase):
             os.unlink(self.fifo)
             os.mkfifo(self.fifo)                      # back on the same path, still wedged
         self.assertTrue(uo.path_stranded(self.fifo), 'a refused admission hid the strand')
-        self.assertEqual(uo._live[self.fifo], uo._PATH_STRAND_MAX,
+        self.assertEqual(uo._live[uo._key(self.fifo)], uo._PATH_STRAND_MAX,
                          'a flapping device kept stranding past its per-path cap')
 
     def test_a_value_that_arrived_at_the_deadline_is_not_a_strand(self):
@@ -114,7 +114,7 @@ class BoundedRead(unittest.TestCase):
 
         patch(self, uo.threading, 'Thread', Lingering)
         self.assertEqual(uo.read_sysfs(str(good), timeout=0.05), 'cafe')
-        self.assertNotIn(str(good), uo._stranded)
+        self.assertNotIn(uo._key(str(good)), uo._stranded)
 
     def test_path_stranded_answers_per_device(self):
         other = Path(self.td.name) / 'peer'
@@ -139,7 +139,7 @@ class BoundedRead(unittest.TestCase):
 
         patch(self, uo.os, 'stat', flaky)
         self.assertIsNone(uo.read_sysfs(self.fifo, timeout=0.05))
-        self.assertIn(self.fifo, uo._stranded, 'a lost stat race leaks a fresh reader on every later poll')
+        self.assertIn(uo._key(self.fifo), uo._stranded, 'a lost stat race leaks a fresh reader on every later poll')
 
     def test_a_recovered_device_is_seen_again_on_the_same_busport(self):
         """THE reflash flow: a board is flashed, then the caller polls the scan for the NEW
@@ -268,7 +268,7 @@ class BoundedRead(unittest.TestCase):
             time.sleep(0.005)
         uo.read_sysfs(self.fifo, timeout=0.05)
         first.join()
-        self.assertEqual(uo._live[self.fifo], 1, 'a failed pre-stat started a second reader on one node')
+        self.assertEqual(uo._live[uo._key(self.fifo)], 1, 'a failed pre-stat started a second reader on one node')
 
     def test_generations_inside_their_grace_stay_within_the_cap(self):
         """Re-enumerations faster than the grace start a reader per node before any strand
@@ -283,7 +283,7 @@ class BoundedRead(unittest.TestCase):
             if len(ts) > uo._PATH_STRAND_MAX:
                 self.assertTrue(uo.path_stranded(self.fifo), 'a refused admission inside the grace read as gone')
         [t.join() for t in ts]
-        self.assertEqual(uo._live[self.fifo], uo._PATH_STRAND_MAX)
+        self.assertEqual(uo._live[uo._key(self.fifo)], uo._PATH_STRAND_MAX)
 
     def test_concurrent_callers_share_one_reader(self):
         """Each caller starting its own reader on one wedged node leaks a thread and an
