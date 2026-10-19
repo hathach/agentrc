@@ -109,6 +109,25 @@ helper and any cleanup state.
   its usbfs node) loads this skill's `scripts/usb_observe.py` the way it loads
   the lock helper, one module instance per process; it observes only.
 
+## Flashers
+
+A runner that flashes or resets through this skill's `scripts/hil_flash.py`
+gets the backend's command and its execution only; board, image, retries and
+recovery stay the contract's. Linux only.
+
+- A flasher is a dict: `name` (`jlink`, `stlink`, `openocd`, `lm4flash`,
+  `esptool`, `pyocd`), `uid` (the probe's serial), `args` (passed to the tool
+  verbatim), and optionally `vid_pid` (openocd's `0xVVVV 0xPPPP` pairs; pyocd
+  requires exactly one) and `verify`. Every call takes an explicit `timeout`;
+  `run=` injects the caller's runner, by default `scripts/hil_process.py`'s
+  `run_cmd`.
+- rc 0 means the tool reported success, not that the target runs the image;
+  the project's own checks decide that. rc 124 means the runner killed the
+  tool's process group on the timeout and reaped it for a bounded grace: a
+  survivor is abandoned, so 124 proves neither that every descendant died nor
+  that the board is in a known state. A J-Link crash rerun is no proof the
+  target was untouched either.
+
 ## Reporting
 
 Interactively, show the run's result in its native form (its table verbatim, or
