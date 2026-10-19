@@ -139,7 +139,8 @@ recovery stay the contract's. Linux only.
   survivor of its bounded reap and a tool's exit does not prove its
   descendants exited. The operation's `cleanup` is its worst attempt's
   (`pending`, then `unknown`, then `done`) and `receipts` lists every
-  receipt. A J-Link crash is not rerun after an attempt reported `pending`.
+  receipt. A J-Link crash is not rerun after an attempt reported `pending`
+  or a receipt.
 - `run_jlink_commands` and `run_stlink_commands` run one probe session of the
   caller's commands with the caller's connection profile, from a unique
   command file in `workdir`; `sysresetreq_jlink` and `sysresetreq_stlink` write

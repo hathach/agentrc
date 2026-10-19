@@ -476,9 +476,8 @@ class Record(unittest.TestCase):
     def test_the_operation_cleanup_is_the_worst_attempts(self):
         with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()):
             op = hf.reset_jlink(JLINK, timeout=30, crash_retries=2,
-                                run=self.answers((139, 'done', None), (139, 'unknown', 'r2'), (0, 'done', None)))
-        self.assertEqual(([a.cleanup for a in op.attempts], op.cleanup, op.receipts),
-                         (['done', 'unknown', 'done'], 'unknown', ('r2',)))
+                                run=self.answers((139, 'done', None), (139, 'unknown', None), (0, 'done', None)))
+        self.assertEqual(([a.cleanup for a in op.attempts], op.cleanup), (['done', 'unknown', 'done'], 'unknown'))
 
     def test_no_crash_rerun_over_a_pending_session(self):
         with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()) as out:
@@ -487,6 +486,13 @@ class Record(unittest.TestCase):
         self.assertEqual(([(a.result.returncode, a.cleanup) for a in op.attempts], op.cleanup, op.receipts),
                          ([(139, 'pending')], 'pending', ('r1',)))
         self.assertNotIn('rerunning', out.getvalue())
+
+    def test_no_crash_rerun_over_a_session_named_by_a_receipt(self):
+        for cleanup in ('unknown', 'done', ABSENT):
+            with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()):
+                op = hf.reset_jlink(JLINK, timeout=30, crash_retries=2,
+                                    run=self.answers((139, cleanup, 'r1'), (0, 'done', None)))
+            self.assertEqual(([a.result.returncode for a in op.attempts], op.receipts), ([139], ('r1',)), cleanup)
 
     def test_an_unknown_cleanup_still_reruns_a_crash(self):
         """The default runner reports nothing, so every attempt is unknown: tinyusb's reruns stand."""

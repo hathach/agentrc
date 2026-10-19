@@ -165,8 +165,8 @@ def _command_file(script: list, *, prefix='hil_jlink_', suffix='.jlink', workdir
 
 def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run) -> Operation:
     # crash_retries reruns share one deadline, taken once the command file is written, and
-    # never start over a session the runner reports pending. A rerun is no proof the target
-    # was untouched.
+    # never start over a session the runner reports pending or names by a receipt. A rerun is
+    # no proof the target was untouched.
     run, attempts = _runner(run), []
     with _command_file(script) as (path, text):
         cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
@@ -175,7 +175,8 @@ def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run)
         ret = _attempt(attempts, run, cmd, text, timeout=timeout)
         for _ in range(crash_retries):
             left = deadline - time.monotonic()
-            if ret.returncode not in JLINK_CRASH_RCS or left <= 0 or attempts[-1].cleanup == 'pending':
+            if ret.returncode not in JLINK_CRASH_RCS or left <= 0 \
+                    or attempts[-1].cleanup == 'pending' or attempts[-1].receipt is not None:
                 break
             print(f'JLinkExe -USB {flasher["uid"]} crashed (rc {ret.returncode}), rerunning', flush=True)
             ret = _attempt(attempts, run, cmd, text, timeout=left)
