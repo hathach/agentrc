@@ -3894,7 +3894,7 @@ test('a deferred finding is not fixed, is answered with its issue on the caller\
   const { result, calls, labels, logs } = await run({ reviews: oneValid, args: { deferrals: [deferral()] } })
   assert.equal(labels.some(l => /^(fix:|issue#)/.test(l)), false, 'no writer for a deferred finding, and no second read of its issue')
   const [posted] = manifestOf(calls, 'defer#1')
-  assert.equal(posted.body, `- src/a.c:1: Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
+  assert.equal(posted.body, `- src/a.c:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.deferrals, [{ findingId: '1#1', issueUrl: ISSUE }])
   assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', issueUrl: ISSUE, reason: 'broken on master too; own PR' }]])
@@ -3906,7 +3906,7 @@ test("a finding the PR owner decided not to fix is deferred with no issue: not f
   const owner = deferral({ issueUrl: undefined, reason: 'the unpinned install is intentional' })
   const { result, calls, labels } = await run({ reviews: oneValid, args: { deferrals: [owner] } })
   assert.equal(labels.some(l => /^(fix:|issue#)/.test(l)), false, 'no writer, and no issue to read')
-  assert.equal(manifestOf(calls, 'defer#1')[0].body, "- src/a.c:1: Left as is, by the PR owner's decision: the unpinned install is intentional.")
+  assert.equal(manifestOf(calls, 'defer#1')[0].body, "- src/a.c:1:\n  Left as is, by the PR owner's decision: the unpinned install is intentional.")
   assert.equal(result.pass, true, JSON.stringify(result.reason))
   assert.deepEqual(result.deferrals, [{ findingId: '1#1', ownerDecision: 'the unpinned install is intentional' }])
   assert.deepEqual(result.state.deferrals, [['1#1', { digest: 'd1', reason: 'the unpinned install is intentional' }]])
@@ -3916,7 +3916,7 @@ test("a finding the PR owner decided not to fix is deferred with no issue: not f
   // On a mixed comment it rides in the fix note.
   const mixed = { findings: [finding({ findingId: '1#1', claim: 'pin it' }), finding({ findingId: '1#2', line: 2, claim: 'in scope' })], replies: [], bots: 'reviewed' }
   const withFix = await run({ reviews: mixed, args: { deferrals: [owner] } })
-  assert.match(manifestOf(withFix.calls, 'resolve#1')[0].body, /\n\n- src\/a\.c:1: Left as is, by the PR owner's decision: the unpinned install is intentional\.$/)
+  assert.match(manifestOf(withFix.calls, 'resolve#1')[0].body, /\n\n- src\/a\.c:1:\n  Left as is, by the PR owner's decision: the unpinned install is intentional\.$/)
 })
 
 test('a deferral reply that is not verified leaves the comment owed', async () => {
@@ -4060,14 +4060,44 @@ test('a deferral whose reason alone breaks the reply limit is refused before any
   assert.ok(calls.length > 0, 'a reason within the limit runs')
 })
 
-test('a deferral point quotes no claim, and is refused only when its location takes it over the limit', async () => {
+test('a deferral point quotes no claim, and the launch measures the point the cycle posts (#142)', async () => {
   const wordyClaim = { findings: [finding({ claim: 'w '.repeat(80) + 'x'.repeat(300) })], replies: [], bots: 'reviewed' }
   const posted = await run({ reviews: wordyClaim, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
-  assert.equal(manifestOf(posted.calls, 'defer#1')[0].body, `- src/a.c:1: Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
-  const { result, calls } = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(50).trim() })], maxCycles: 2 } })
-  assert.equal(result.reason, 'deferral-refused')
-  assert.match(result.detail, /^1#1: its reply point would exceed 60 words or a line 300 characters; pass a shorter reason$/)
-  assert.equal(calls.some(c => c.label.startsWith('defer#')), false, 'nothing is posted')
+  assert.equal(manifestOf(posted.calls, 'defer#1')[0].body, `- src/a.c:1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`)
+  // The place is one word on its own line: 7 + 50 + 3 answer words and the place make 61.
+  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(50).trim() })], maxCycles: 2 } }),
+    /deferral reason too long for its reply .*: 1#1$/)
+  const atWords = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: 'r '.repeat(49).trim() })], autoPush: true, maxCycles: 2 } })
+  assert.equal(manifestOf(atWords.calls, 'defer#1').length, 1, '60 words are posted')
+  // The answer line is measured as posted, with its two-space indent.
+  const fill = (n) => 'x'.repeat(n - `  Real, and out of this PR's scope: . Tracked in ${ISSUE}.`.length)
+  await assert.rejects(run({ reviews: oneValid, args: { deferrals: [deferral({ reason: fill(301) })] } }), /: 1#1$/)
+  const atChars = await run({ reviews: oneValid, args: { deferrals: [deferral({ reason: fill(300) })], autoPush: true, maxCycles: 2 } })
+  const line = manifestOf(atChars.calls, 'defer#1')[0].body.split('\n')[1]
+  assert.equal(line.length, 300)
+})
+
+test('a deferral attempt offered in the one-line form is posted as offered, not reformatted (#142)', async () => {
+  const LONG = { deferrals: [deferral()], autoPush: true, maxCycles: 4, yieldAfterCycle: true }
+  const first = await run({ reviews: oneValid, dropDoneIds: (label) => label.startsWith('defer#'), args: LONG })
+  const state = structuredClone(first.result.state)
+  const attempt = debtOf({ state }, 1).attempt
+  assert.match(attempt.body, /^- src\/a\.c:1:\n {2}Real/)
+  const old = `- src/a.c:1: ${attempt.body.split('\n  ')[1]}`
+  attempt.body = old
+  const { digest, ...rest } = state
+  state.digest = fnv1a(canonical(rest))
+  const again = await resumeAt(state, { reviews: oneValid, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(manifestOf(again.calls, 'defer#2')[0].body, old)
+  assert.equal(again.result.state.debt.some(([id]) => id === 1), false, 'the old attempt settles the comment')
+})
+
+test('a deferral place that is not one word, or too long for its line, is named by its finding id (#142)', async () => {
+  for (const file of ['src/my file.c', `src/${'d/'.repeat(150)}a.c`]) {
+    const reviews = { findings: [finding({ file })], replies: [], bots: 'reviewed' }
+    const { calls } = await run({ reviews, args: { deferrals: [deferral()], autoPush: true, maxCycles: 2 } })
+    assert.equal(manifestOf(calls, 'defer#1')[0].body, `- 1#1:\n  Real, and out of this PR's scope: broken on master too; own PR. Tracked in ${ISSUE}.`, file)
+  }
 })
 
 test('a deferral applied once holds on a resumed launch without being passed again, until the comment is edited', async () => {
@@ -4093,7 +4123,7 @@ test('a deferred point rides in the one reply its mixed comment gets', async () 
   assert.equal(withFix.calls.filter(c => c.label.startsWith('fix:')).length, 1)
   assert.doesNotMatch(withFix.calls.find(c => c.label.startsWith('fix:')).prompt, /deferred point/)
   const [note] = manifestOf(withFix.calls, 'resolve#1')
-  assert.match(note.body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:2\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
+  assert.match(note.body, /^Fixed in [0-9a-f]{40}\.\n\n- src\/a\.c:2\n\n- src\/a\.c:1:\n  Real, and out of this PR's scope/)
   assert.equal(withFix.labels.some(l => l.startsWith('defer#')), false, 'one reply per comment')
   const refutedPoint = invalidFinding({ findingId: '1#2', line: 2, claim: 'wrong' })
   const withRefutation = await run({
@@ -4101,7 +4131,7 @@ test('a deferred point rides in the one reply its mixed comment gets', async () 
     args: { deferrals: [deferral()] },
   })
   const [reply] = manifestOf(withRefutation.calls, 'replies#1')
-  assert.match(reply.body, /^not so\n\n- src\/a\.c:1: Real, and out of this PR's scope/)
+  assert.match(reply.body, /^not so\n\n- src\/a\.c:1:\n  Real, and out of this PR's scope/)
   assert.equal(withRefutation.labels.some(l => l.startsWith('defer#')), false)
 })
 

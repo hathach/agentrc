@@ -86,7 +86,9 @@ const deferralAnswer = (d) => d.issueUrl ? `Real, and out of this PR's scope: ${
 const REPLY_WORDS = 60, REPLY_LINE_CHARS = 300 // words per point; about 3 rendered lines
 const overLength = (body) => body.split(/\n\s*\n|\n(?=[-*+] )/).some(p => p.split(/\s+/).filter(w => w && !/^[-*+]$/.test(w)).length > REPLY_WORDS) ||
   body.split('\n').some(l => l.length > REPLY_LINE_CHARS)
-const longReasons = deferralsArg.filter(d => overLength(deferralAnswer(d))).map(d => d.findingId)
+// The place is one word on its own line, the answer an indented line under it: what a launch measures is what a cycle posts.
+const deferralPoint = (place, d) => `- ${place}:\n  ${deferralAnswer(d)}`
+const longReasons = deferralsArg.filter(d => overLength(deferralPoint('X', d))).map(d => d.findingId)
 if (longReasons.length) throw new Error(`deferral reason too long for its reply (${REPLY_WORDS} words, a line ${REPLY_LINE_CHARS} characters with the issue URL): ${longReasons.join(', ')}`)
 const FULL_SHA = /^[0-9a-f]{40}$/
 // The caller's verified replies on comments this run handed it, each judged to answer the whole comment at headSha.
@@ -693,7 +695,11 @@ const RECEIPTS = withSeal({
 
 const COVERS = verdictList('findingId', 'string', 'covers', { type: ['boolean', 'null'] })
 
-const deferralLine = (f) => `- ${f.file}:${f.line}: ${deferralAnswer(f.deferral)}`
+// A place a launch cannot measure as one short word is named by its finding id.
+const deferralLine = (f) => {
+  const place = `${f.file}:${f.line}`
+  return deferralPoint(/\s/.test(place) || `- ${place}:`.length > REPLY_LINE_CHARS ? f.findingId : place, f.deferral)
+}
 
 // Across launches only the last cycle's publication outcome is read (pendingOf).
 const history = restored && restored.last ? [restored.last] : []
