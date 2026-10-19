@@ -145,6 +145,27 @@ class RunCmdModes(unittest.TestCase):
         self.assertEqual(hp.cmd_stdout_text(b'a\xffb'), 'ab')
 
 
+class Stuck:
+    """A child that never finishes: every communicate() times out, its bound kept in `waits`."""
+    pid = 999999999
+    stdout = stderr = stdin = None
+    waits = None
+
+    def __init__(self, *a, **k):
+        pass
+
+    def communicate(self, timeout):
+        self.waits.append(timeout)
+        raise subprocess.TimeoutExpired('x', timeout, output=b'partial')
+
+
+class RootOwned(Stuck):
+    """An all-root group's child: p.kill() is refused as killpg is."""
+
+    def kill(self):
+        raise PermissionError(1, 'Operation not permitted')
+
+
 class ExplicitBounds(unittest.TestCase):
     """The provider holds no bound or switch of its own: every caller states its timeout."""
 
@@ -160,25 +181,27 @@ class ExplicitBounds(unittest.TestCase):
 
     def test_reap_grace_bounds_the_post_kill_reap(self):
         waits = []
-
-        class Stuck:
-            pid = 999999999
-            stdout = stderr = stdin = None
-
-            def __init__(self, *a, **k):
-                pass
-
-            def communicate(self, timeout):
-                waits.append(timeout)
-                raise subprocess.TimeoutExpired('x', timeout, output=b'partial')
-
         for fn in (lambda: hp.run_cmd('x', timeout=3, reap_grace=0.5),
                    lambda: hp.run_alongside(['x'], lambda: None, 3, reap_grace=0.5)):
             waits.clear()
             with mock.patch.object(hp.subprocess, 'Popen', Stuck), redirect_stdout(io.StringIO()), \
-                    mock.patch.object(hp.os, 'killpg'):
+                    mock.patch.object(Stuck, 'waits', waits), mock.patch.object(hp.os, 'killpg'):
                 r = fn()
             self.assertEqual((r.returncode, waits), (124, [3, 0.5]))
+
+    def test_a_refused_kill_still_reaps_and_returns_124(self):
+        """An all-root group refuses killpg AND p.kill(); a raise there skipped the bounded
+        reap and masked work()'s own error."""
+        waits = []
+
+        def boom():
+            raise AssertionError('the write failed')
+        with mock.patch.object(hp.subprocess, 'Popen', RootOwned), mock.patch.object(RootOwned, 'waits', waits), \
+                mock.patch.object(hp.os, 'killpg', side_effect=PermissionError(1, 'Operation not permitted')):
+            r = hp.run_alongside(['x'], lambda: None, 3, reap_grace=0.5)
+            self.assertEqual((r.returncode, waits), (124, [3, 0.5]))
+            with self.assertRaisesRegex(AssertionError, 'the write failed'):
+                hp.run_alongside(['x'], boom, 3, reap_grace=0.5)
 
     def test_the_stdlib_closure(self):
         # a project loads this on a bare CI runner: stdlib only, at module level

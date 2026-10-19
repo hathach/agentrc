@@ -178,10 +178,7 @@ def run_alongside(argv: list, work, timeout: int, *,
             reaped = True
             return subprocess.CompletedProcess(argv, p.returncode, out, err)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(p.pid, signal.SIGKILL)
-            except OSError:
-                p.kill()
+            _kill_group(p)
             try:
                 out, err = p.communicate(timeout=reap_grace)
             except subprocess.TimeoutExpired:
