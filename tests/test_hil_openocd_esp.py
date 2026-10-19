@@ -14,6 +14,7 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -61,7 +62,8 @@ def event(**kw):
         f.write(json.dumps(kw) + '\n')
 for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
     signal.signal(sig, lambda n, _f: event(signal=n))
-event(pid=os.getpid(), argv=argv)
+event(pid=os.getpid(), argv=argv,
+      fds=[os.readlink(f'/proc/self/fd/{fd}') for fd in os.listdir('/proc/self/fd') if os.path.exists(f'/proc/self/fd/{fd}')])
 cs = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
 search = [argv[i + 1] for i, a in enumerate(argv) if a == '-s']
 def find(name):
@@ -95,7 +97,9 @@ if os.environ.get('FAKE_NO_LISTEN'):
     time.sleep(120)
 say(f'Info : Listening on port {port} for tcl connections')
 sent = {}
-WRAPPED = re.compile(r'^if \{\[catch \{(.*)\} hil_m\]\} \{set hil_m "HIL-ERR \$hil_m"\} else \{set hil_m "HIL-OK \$hil_m"\}$', re.S)
+WRAPPED = re.compile(r'^set hil_r \[catch \{(.*)\} hil_m\]; set hil_done (\d+); if \{\$hil_r\} \{set hil_m "HIL-ERR \$hil_m"\} else \{set hil_m "HIL-OK \$hil_m"\}$', re.S)
+DONE_QUERY = 'if {[info exists hil_done]} {set hil_done} else {list}'
+done, held = 0, []
 FLASH, BANK = os.environ.get('FAKE_FLASH'), int(os.environ.get('FAKE_BANK_SIZE', '0'), 0)
 def image():
     with open(FLASH, 'rb') as f:
@@ -147,13 +151,24 @@ def run(cmd):
         time.sleep(120)
     if action == 'die':
         os._exit(3)
+    if action == 'defer':
+        return None
     kind, _, text = action.partition(':')
+    if kind == 'slow':
+        time.sleep(float(text))
+        return model(cmd)
     if kind == 'err':
         say(f'Error: {text}')
         return f'HIL-ERR {text}'
     say(f'Info : {cmd} done')
     return f'HIL-OK {text}'
+def reply(conn, text):
+    try:
+        conn.sendall(text.encode() + b'\x1a')
+    except OSError:
+        pass                        # the client gave up; the command has run all the same
 def serve(conn):
+    global done
     buf = b''
     while True:
         chunk = conn.recv(65536)
@@ -165,11 +180,15 @@ def serve(conn):
             cmd = raw.decode()
             if 'ESPS_SESSION' in cmd:
                 event(tcl='token?')
-                conn.sendall(token.encode() + b'\x1a')
+                reply(conn, token)
+                continue
+            if cmd == DONE_QUERY:
+                event(tcl='done?')
+                reply(conn, str(done) if done else '')
                 continue
             if cmd == 'shutdown':
                 event(tcl='shutdown')
-                conn.sendall(b'\x1a')
+                reply(conn, '')
                 if os.environ.get('FAKE_IGNORE_SHUTDOWN'):
                     continue
                 conn.close()
@@ -177,7 +196,13 @@ def serve(conn):
                 sys.exit(int(os.environ.get('FAKE_SHUTDOWN_RC', '0')))
             m = WRAPPED.match(cmd)
             event(tcl=m[1] if m else cmd)
-            conn.sendall((run(m[1]) if m else 'unwrapped').encode() + b'\x1a')
+            answer = run(m[1]) if m else 'unwrapped'
+            if answer is None:
+                held.append(conn)   # its frame stays unread while the next connection is served
+                return
+            if m:
+                done = int(m[2])
+            reply(conn, answer)
 while True:
     conn, _ = srv.accept()
     serve(conn)
@@ -692,6 +717,7 @@ class TclDeadline(unittest.TestCase):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         s = oe.Session([], td.name, srv.getsockname()[1], 'tok')
+        s.rec = {'init': None, 'submitted': 0}
         s.deadline = time.monotonic() + 0.4
         with self.assertRaises(oe._Stop) as cm:
             s.ask('x')
@@ -863,6 +889,250 @@ class Reset(SessionCase):
         self.assertEqual(self.tcl(), ['token?', 'init', 'reset run'])
         self.assertEqual(op.returncode, 1)
         self.assertPending(op)
+
+
+class End(SessionCase):
+    """`end` from a pending session's receipt, against the fake server the session left running."""
+
+    def pending(self, script, **kw):
+        op = self.session(lambda s: s.check('work'), timeout=kw.pop('timeout', 1.5), script=script, **kw)
+        self.assertEqual(op.attempts[0].cleanup, 'pending')
+        return op.session['receipt']
+
+    def receipt(self, path):
+        return json.loads(Path(path).read_text())
+
+    def end(self, path, timeout=10):
+        return oe.end_session(path, timeout=timeout)
+
+    def after(self, n):
+        return self.tcl()[n:]
+
+    def assertKept(self, path, rc):
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.receipt(path)['closed'])
+        pid = self.receipt(path)['pid']
+        self.assertTrue(self.alive(pid))
+        self.assertEqual(self.signals(), [])
+
+    def test_the_receipt_records_init_and_every_command_submitted(self):
+        op = self.session(lambda s: s.check('a'))
+        rec = self.receipt(op.session['receipt'])
+        self.assertEqual((rec['tool'], rec['init'], rec['submitted'], rec['cleanup']), ('hil_openocd_esp', 'ok', 3, 'done'))
+        self.assertEqual(sorted(p.name for p in Path(op.session['dir']).glob('.receipt.*')), [])
+
+    def test_a_command_that_finished_after_the_timeout_is_ended_then_idempotent(self):
+        path = self.pending({'work': 'slow:2.5'})
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome'], result['done']), (0, 'ended', '2'))
+        self.assertEqual(self.after(n), ['token?', 'done?', 'reset run', 'shutdown'])
+        rec = self.receipt(path)
+        self.assertEqual((rec['closed'], rec['cleanup'], rec['submitted']), (True, 'done', 3))
+        self.assertTrue(rec['end']['resetRun'].startswith('HIL-OK'))
+        self.assertFalse(self.alive(rec['pid']))
+        self.assertEqual(self.signals(), [])
+        self.assertEqual(self.end(path)[0], 0)
+        self.assertEqual(self.end(path)[1]['outcome'], 'alreadyEnded')
+
+    def test_an_interrupt_as_the_lock_is_taken_does_not_keep_it(self):
+        path = self.pending({'work': 'slow:2.5'})
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        real = oe._lock
+
+        def lock_then_interrupt(receipt):
+            fd = real(receipt)
+            signal.raise_signal(signal.SIGINT)      # lands between the flock and the closing try
+            return fd
+        with mock.patch.object(oe, '_lock', lock_then_interrupt), self.assertRaises(KeyboardInterrupt):
+            self.end(path)
+        rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome']), (0, 'ended'))
+
+    def test_a_command_still_executing_is_never_overtaken(self):
+        path = self.pending({'work': 'hang'})
+        n = len(self.tcl())
+        rc, result = self.end(path, timeout=1.5)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(self.after(n), [])
+        self.assertKept(path, rc)
+
+    def test_a_frame_left_unread_on_the_old_connection_is_never_overtaken(self):
+        path = self.pending({'work': 'defer'})
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual((result['outcome'], result['done']), ('refused', '1'))
+        self.assertIn('#2 is not known to have run', result['error'])
+        self.assertEqual(self.after(n), ['token?', 'done?'])
+        self.assertKept(path, rc)
+
+    def test_after_a_failed_or_unproven_init_the_ordinary_end_is_refused(self):
+        for script, state in (({'init': 'err:no device'}, 'failed'), ({'init': 'hang'}, 'sent')):
+            with self.subTest(state=state):
+                op = self.session(timeout=1.5, script=script)
+                path = op.session['receipt']
+                self.assertEqual(self.receipt(path)['init'], state)
+                n = len(self.tcl())
+                rc, result = self.end(path, timeout=2)
+                self.assertEqual(result['outcome'], 'refused')
+                self.assertIn('separately reviewed recovery', result['error'])
+                self.assertEqual(self.after(n), [])
+                self.assertKept(path, rc)
+                self.reap()
+
+    def test_a_failed_reset_run_is_never_followed_by_shutdown(self):
+        path = self.pending({'work': 'slow:2.5', 'reset run': 'err:Target not examined yet'})
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(self.after(n), ['token?', 'done?', 'reset run'])
+        self.assertKept(path, rc)
+
+    def test_a_server_still_running_after_shutdown_keeps_the_receipt(self):
+        path = self.pending({'work': 'slow:2.5'}, FAKE_IGNORE_SHUTDOWN='1')
+        rc, result = self.end(path, timeout=4)
+        self.assertIn('exit not confirmed after shutdown', result['error'])
+        self.assertKept(path, rc)
+
+    def test_another_process_or_a_foreign_server_is_sent_nothing(self):
+        path = self.pending({'work': 'slow:2.5'})
+        rec, n = self.receipt(path), len(self.tcl())
+        oe.write_receipt(path, {**rec, 'startTime': '1'})
+        rc, result = self.end(path)
+        self.assertIn('not the openocd this receipt names', result['error'])
+        oe.write_receipt(path, {**rec, 'token': 'someone-else'})
+        rc, result = self.end(path)
+        self.assertIn('another server', result['error'])
+        self.assertEqual(self.after(n), ['token?'])
+        self.assertKept(path, rc)
+
+    def test_a_server_that_is_gone_is_refused(self):
+        path = self.pending({'work': 'slow:2.5'})
+        pid = self.receipt(path)['pid']
+        os.kill(pid, signal.SIGKILL)       # a stand-in; gone as a crashed openocd would be
+        for _ in range(50):
+            if not self.alive(pid):
+                break
+            time.sleep(0.1)
+        rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome']), (1, 'refused'))
+        self.assertFalse(self.receipt(path)['closed'])
+
+    def test_a_receipt_closed_without_the_reviewed_end_is_refused(self):
+        op = self.session(lambda s: s.check('x'), script={'x': 'die'})
+        rc, result = self.end(op.session['receipt'])
+        self.assertEqual((rc, result['outcome']), (1, 'refused'))
+        self.assertIn("cleanup 'unknown'", result['error'])
+
+    def test_an_interrupt_propagates_and_keeps_the_receipt(self):
+        path = self.pending({'work': 'hang'})
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with self.assertRaises(KeyboardInterrupt):
+            self.end(path, timeout=30)
+        self.assertKept(path, 1)
+
+    def test_a_live_session_owns_its_receipt_until_it_finalizes(self):
+        # end must not read `submitted`, query and act while the session can still send a command
+        started, go, ops = threading.Event(), threading.Event(), []
+
+        def work(s):
+            s.check('a')
+            started.set()
+            go.wait(20)
+            s.check('b')
+        t = threading.Thread(target=lambda: ops.append(self.session(work, timeout=30)))
+        t.start()
+        self.addCleanup(t.join, 30)
+        self.addCleanup(go.set)
+        self.assertTrue(started.wait(20))
+        path = next(self.work.glob('*/receipt.json'))
+        n = len(self.tcl())
+        rc, result = self.end(str(path), timeout=1)
+        self.assertEqual((rc, result['outcome']), (1, 'refused'))
+        self.assertIn('still the owner', result['error'])
+        self.assertEqual(self.after(n), [])
+        go.set()
+        t.join(30)
+        self.assertEqual(ops[0].returncode, 0)
+
+    def test_an_end_waiting_on_a_session_that_finishes_ends_nothing(self):
+        started, go, results = threading.Event(), threading.Event(), []
+
+        def work(s):
+            started.set()
+            go.wait(20)
+        t = threading.Thread(target=lambda: self.session(work, timeout=30))
+        t.start()
+        self.addCleanup(t.join, 30)
+        self.addCleanup(go.set)
+        self.assertTrue(started.wait(20))
+        path = str(next(self.work.glob('*/receipt.json')))
+        e = threading.Thread(target=lambda: results.append(self.end(path, timeout=20)))
+        e.start()
+        time.sleep(0.5)
+        go.set()
+        t.join(30)
+        e.join(30)
+        rc, result = results[0]
+        self.assertEqual((rc, result['outcome']), (0, 'alreadyEnded'))
+        self.assertEqual(self.tcl().count('reset run'), 1)
+
+    def test_two_concurrent_ends_end_the_session_once(self):
+        path = self.pending({'work': 'slow:2.5'})
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(self.end(path, timeout=20))) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(sorted((rc, r['outcome']) for rc, r in results), [(0, 'alreadyEnded'), (0, 'ended')])
+        self.assertEqual(self.tcl().count('reset run'), 1)
+        self.assertEqual(self.tcl().count('shutdown'), 1)
+
+    def test_the_server_never_inherits_the_receipt_lock(self):
+        op = self.session()
+        fds, = [e['fds'] for e in self.events() if 'fds' in e]
+        self.assertNotIn(op.session['receipt'] + '.lock', fds)
+
+    def test_without_a_pidfd_end_is_refused(self):
+        path = self.pending({'work': 'slow:2.5'})
+        n = len(self.tcl())
+        for patch in (mock.patch.object(oe.os, 'pidfd_open', None),
+                      mock.patch.object(oe.os, 'pidfd_open', side_effect=OSError(38, 'Function not implemented'))):
+            with self.subTest(patch=patch), patch:
+                rc, result = self.end(path)
+                self.assertEqual(result['outcome'], 'refused')
+                self.assertIn('pidfd', result['error'])
+        self.assertEqual(self.after(n), [])
+        self.assertKept(path, rc)
+
+    def test_an_uncertain_exit_is_not_an_exit(self):
+        path = self.pending({'work': 'slow:2.5'}, FAKE_IGNORE_SHUTDOWN='1')
+
+        class Poller:
+            def register(self, fd, events):
+                self.fd = fd
+
+            def poll(self, ms):
+                return [(self.fd, oe.select.POLLNVAL)]
+        with mock.patch.object(oe.select, 'poll', Poller):
+            rc, result = self.end(path)
+        self.assertIn('exit not confirmed', result['error'])
+        self.assertKept(path, rc)
+
+    def test_the_command_line(self):
+        path = self.pending({'work': 'slow:2.5'})
+        cli = [sys.executable, str(SCRIPTS / 'hil_openocd_esp.py'), 'end', '--receipt', path, '--timeout', '10']
+        r = subprocess.run(cli, capture_output=True, text=True, timeout=60)
+        self.assertEqual((r.returncode, json.loads(r.stdout)['outcome']), (0, 'ended'), r.stderr)
+        r = subprocess.run(cli[:-4] + ['--receipt', str(self.work / 'none.json')], capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(r.returncode, 2)
 
 
 class Segments(unittest.TestCase):

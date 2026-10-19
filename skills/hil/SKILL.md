@@ -161,12 +161,26 @@ recovery stay the contract's. Linux only.
   `{"flashEncryption": "off", "secureBoot": "off", "source": <where it was
   read>}`. Without it, or with either feature not `off`, the flash is refused
   before anything starts; the provider never infers or defaults the chip's
-  security state, and records the evidence in the operation. Each operation is one session that is never
-  killed: after a command that returned, `reset run` and a confirmed shutdown
-  end it; an init failure, a command outstanding at the timeout or interrupt,
-  or a failed reset or shutdown leaves cleanup `pending` with the session's
-  receipt, for the caller's cleanup holder, and no retry, restore or test may
-  overlap it.
+  security state, and records the evidence in the operation. Each operation is
+  one session that is never killed: after a command that returned, `reset run`
+  and a confirmed shutdown end it; an init failure, a command outstanding at
+  the timeout or interrupt, or a failed reset or shutdown leaves cleanup
+  `pending` with the session's receipt, for the caller's cleanup holder, and no
+  retry, restore or test may overlap it.
+- `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
+  a pending session, all within one deadline and without ever signalling it:
+  it takes the receipt's lock (`<receipt>.lock`, which a session holds until
+  it finalizes; still held at the deadline, by the session or another `end`:
+  refused), rereads the receipt, checks its process (argv, start time) through
+  a pidfd (refused where there is none) and its Tcl token, refuses after a
+  failed or unproven init (that board needs a separately reviewed recovery),
+  proves on the server that the last command sent has run, then
+  requires `reset run` to succeed before `shutdown` and confirms the process
+  exited. Exit 0 closes the receipt with the results and keeps it, and a rerun
+  on it exits 0 again; anything else (refusal, failure, timeout, interrupt)
+  exits 1 with the receipt open and the board held (2: bad usage or an
+  unreadable receipt). Releasing the board's cleanup holder (`hil_lock.py
+  release --token TOKEN`) after exit 0 stays the caller's step.
 - rc 0 means the tool reported success, not that the target runs the image;
   the project's own checks decide that. rc 124 means the runner killed the
   tool's process group on the timeout and reaped it for a bounded grace: a

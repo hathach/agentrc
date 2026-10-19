@@ -29,19 +29,34 @@ names the server left running, for the caller's cleanup holder. A server that ex
 own leaves cleanup `unknown` (`done` when it exited before init was asked, so no adapter was
 opened). There is no bare init/shutdown: examining a running app built with the end-of-stack
 watchpoint panics it, and only the reset run brings it back.
+
+The session holds an exclusive flock on <dir>/receipt.json.lock, a file never replaced, from
+before the spawn until its operation is built; the openocd child never inherits it. The
+receipt is replaced atomically and also records `init` (sent, ok, failed) and `submitted`,
+the sequence number of the last command sent, persisted before it is sent; every command sets
+the server's Tcl global `hil_done` to its number once it has run. `end` (below) ends a pending
+session from its receipt:
+
+  hil_openocd_esp.py end --receipt <dir>/receipt.json [--timeout S]
 """
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import fcntl
 import glob
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import shlex
 import secrets
+import select
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -219,9 +234,45 @@ class _Stop(Exception):
         self.end, self.timed_out = end, timed_out
 
 
-def _wrap(cmd):
-    # the Tcl server answers with a command's result but not its status (tcl_server.c:233-249)
-    return f'if {{[catch {{{cmd}}} hil_m]}} {{set hil_m "HIL-ERR $hil_m"}} else {{set hil_m "HIL-OK $hil_m"}}'
+def _wrap(cmd, seq):
+    # the Tcl server answers with a command's result but not its status (tcl_server.c:233-249);
+    # hil_done records, on the server, that command number `seq` has run
+    return (f'set hil_r [catch {{{cmd}}} hil_m]; set hil_done {seq}; '
+            f'if {{$hil_r}} {{set hil_m "HIL-ERR $hil_m"}} else {{set hil_m "HIL-OK $hil_m"}}')
+
+
+DONE_QUERY = 'if {[info exists hil_done]} {set hil_done} else {list}'
+
+
+def _lock(receipt):
+    """An fd holding the exclusive flock on the receipt's companion lock file, or None while
+    another owner holds it. The fd is not inheritable (PEP 446), so no child keeps the lock;
+    callers hold interrupts from this call into the `try` that closes it."""
+    fd = os.open(receipt + '.lock', os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def write_receipt(path, rec):
+    """Replace the receipt atomically: a reader sees the old record or the new one, never part."""
+    fd, tmp = tempfile.mkstemp(prefix='.receipt.', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(rec, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 class _Tcl(esp_session.Tcl):
@@ -263,10 +314,11 @@ class Session:
     def __init__(self, argv, out, tcl_port, token):
         self.argv, self.out = argv, out
         self.log, self.receipt = os.path.join(out, 'openocd.log'), os.path.join(out, 'receipt.json')
+        self.lock_fd = None
         self.tcl = _Tcl(tcl_port, token)
         self.proc = self.rec = self.exit = self.failure = None
         self.receipt_written = self.closed = self.init_sent = self.timed_out = False
-        self.steps, self.deadline = [], None
+        self.steps, self.deadline, self.seq = [], None, 0
 
     def start(self, deadline):
         self.deadline = deadline
@@ -279,15 +331,29 @@ class Session:
         with open(os.path.join(self.out, 'openocd.out'), 'w') as out:
             hold = hil_flash.hil_process._InterruptHold()
             try:
+                self.lock_fd = _lock(self.receipt)
+                if self.lock_fd is None:
+                    raise RuntimeError(f'{self.receipt}.lock is held by another owner')
                 self.proc = subprocess.Popen(self.argv, stdin=subprocess.DEVNULL, stdout=out, cwd=cwd,
                                              stderr=subprocess.STDOUT, start_new_session=True)
                 self.rec = {'pid': self.proc.pid, 'startTime': esp_session.start_time(self.proc.pid),
                             'argv': self.argv, 'ports': [None, None, self.tcl.port], 'token': self.tcl.token,
-                            'log': self.log, 'closed': False, 'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
-                esp_session.write_receipt(self.receipt, self.rec)
+                            'log': self.log, 'closed': False, 'startedAt': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                            'tool': 'hil_openocd_esp', 'init': None, 'submitted': 0}
+                write_receipt(self.receipt, self.rec)
                 self.receipt_written = True
+            except BaseException:
+                if self.proc is None:
+                    self.release()
+                raise
             finally:
                 hold.release()     # a signal deferred across the spawn is acted on here, once registered
+
+    def release(self):
+        """Give up the receipt: from here `end` may own it."""
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
 
     def wait_ready(self):
         # server.c:313 prints this at server_init, before the server loop answers
@@ -317,11 +383,15 @@ class Session:
             raise _Stop(f'timed out before {cmd!r}', end=True, timed_out=True)
         if cmd == 'init':
             self.init_sent = True
+            self.rec['init'] = 'sent'
+        self.seq += 1
+        self.rec['submitted'] = self.seq
+        write_receipt(self.receipt, self.rec)
         mark, step = self._log_size(), {'cmd': cmd, 'outcome': 'outstanding'}
         self.steps.append(step)
         self.tcl.deadline = self.deadline
         try:
-            answer = self.tcl(_wrap(cmd))
+            answer = self.tcl(_wrap(cmd, self.seq))
         except TimeoutError:
             step['log'] = self._log_since(mark)
             raise _Stop(f'{cmd!r} still outstanding after the timeout', timed_out=True) from None
@@ -331,6 +401,9 @@ class Session:
         step['log'] = self._log_since(mark)
         ok = answer.startswith('HIL-OK')
         step['outcome'] = 'ok' if ok else 'error'
+        if cmd == 'init':
+            self.rec['init'] = 'ok' if ok else 'failed'
+            write_receipt(self.receipt, self.rec)
         step['answer'] = answer.removeprefix('HIL-OK' if ok else 'HIL-ERR').removeprefix(' ')
         # a failed init answers empty; its reason is only in the log
         errors = '; '.join(ln for ln in step['log'] if ln.startswith('Error'))
@@ -367,12 +440,13 @@ class Session:
     def cleanup(self) -> str:
         if self.proc is not None and self.proc.poll() is None:
             return 'pending'
+        orderly = bool(self.steps) and self.steps[-1]['cmd'] == 'shutdown'
+        cleanup = 'done' if orderly or not self.init_sent else 'unknown'
         if not self.closed and self.proc is not None:
             self.exit, self.closed = self.proc.returncode, True
             if self.receipt_written:
-                esp_session.write_receipt(self.receipt, {**self.rec, 'closed': True})
-        orderly = bool(self.steps) and self.steps[-1]['cmd'] == 'shutdown'
-        return 'done' if orderly or not self.init_sent else 'unknown'
+                write_receipt(self.receipt, {**self.rec, 'closed': True, 'cleanup': cleanup, 'exit': self.exit})
+        return cleanup
 
     def operation(self, error=None, **extra):
         """hil_flash's Operation of one attempt, the session: argv, the commands sent as its
@@ -404,6 +478,7 @@ def _finish(s, error=None, **info):
     try:
         op = s.operation(error, **info)
     finally:
+        s.release()
         try:
             hold.release()
         except BaseException as late:
@@ -453,6 +528,7 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None):
         s.fail(stop)
     except BaseException as e:
         if s.proc is None:
+            s.release()
             raise
         for step in s.steps:
             if step['outcome'] == 'outstanding':
@@ -639,3 +715,163 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
     that follows reboots it, and an init that failed leaves the session pending instead.
     Returns hil_flash's Operation, as flash_openocd_esp without `segments`."""
     return _run(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
+
+
+# -------------------------------------------------------------
+# Ending a pending session
+# -------------------------------------------------------------
+END_TIMEOUT = 60
+_RECEIPT_KEYS = ('pid', 'startTime', 'argv', 'ports', 'token', 'closed', 'init', 'submitted')
+NEEDS_RECOVERY = 'the board stays held and needs a separately reviewed recovery'
+
+
+def _same_process(rec) -> bool:
+    # a script stand-in runs under its interpreter, which /proc lists first
+    running = esp_session.cmdline(rec['pid'])
+    return (running is not None and running[-len(rec['argv']):] == rec['argv']
+            and esp_session.start_time(rec['pid']) == rec['startTime'])
+
+
+def _exited(pidfd, deadline) -> bool:
+    """Whether the identified process exited by the deadline: only its pidfd turning readable
+    (POLLIN at exit, pidfd_open(2)) counts; any other poll result is no evidence."""
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN)
+    return any(ev & select.POLLIN for _, ev in poller.poll(max(deadline - time.monotonic(), 0) * 1000))
+
+
+def end_session(receipt: str, *, timeout: float = END_TIMEOUT) -> tuple:
+    """(rc, result) of ending the pending session a receipt names, all within one deadline of
+    `timeout` seconds; never a signal. rc 0: ended now, or the receipt is already closed after
+    the reviewed end; the receipt is then closed with the results, kept. rc 1: refused or failed,
+    the receipt kept open and the board held. Steps, each refusing on doubt:
+
+    - the receipt's lock is taken within the deadline, so its session has finalized and no
+      other `end` runs; held throughout, and the receipt is read only once it is taken;
+    - the process is the receipt's (argv and start time), held by a pidfd from then on; without
+      a pidfd its exit could not be confirmed, so the end is refused;
+    - init is `ok`: after a failed or unproven init the ordinary end is refused, NEEDS_RECOVERY;
+    - over the token-checked Tcl port, the server's `hil_done` equals the receipt's
+      `submitted`: the last command sent has run. An answer alone is no proof: the server reads
+      a connection 256 bytes at a time (tcl_server.c:172-176) and services connections in turn
+      (server.c:572-590), so an older command still unread on a dropped connection could run
+      after a new connection's, and one still running holds the server, so the query times out;
+    - `reset run` succeeds, then `shutdown`, and the identified process exits.
+
+    Raises OSError or ValueError for an unreadable or malformed receipt; an interrupt propagates
+    with the receipt kept."""
+    deadline = time.monotonic() + timeout
+    os.stat(receipt)
+    while True:
+        hold, lock = hil_flash.hil_process._InterruptHold(), None
+        try:
+            lock = _lock(receipt)
+            if lock is not None:
+                held, hold = hold, None
+                held.release()             # an interrupt that arrived meanwhile raises inside this try
+                return _end_owned(receipt, deadline)
+        finally:
+            if hold is not None:
+                hold.release()
+            if lock is not None:
+                os.close(lock)
+        if time.monotonic() >= deadline:
+            return 1, {'mode': 'end', 'receipt': receipt, 'outcome': 'refused',
+                       'error': 'the session still holds the receipt lock: it is still the owner; nothing sent'}
+        time.sleep(0.05)
+
+
+def _end_owned(receipt, deadline) -> tuple:
+    with open(receipt) as f:
+        rec = json.load(f)
+    if not isinstance(rec, dict) or rec.get('tool') != 'hil_openocd_esp' or any(k not in rec for k in _RECEIPT_KEYS):
+        raise ValueError('not a hil_openocd_esp session receipt')
+    result = {'mode': 'end', 'receipt': receipt, 'pid': rec['pid']}
+
+    def stop(outcome, why):
+        result.update(outcome=outcome, error=why)
+        return 1, result
+
+    if rec['closed']:
+        if rec.get('cleanup') == 'done':
+            result['outcome'] = 'alreadyEnded'
+            return 0, result
+        return stop('refused', f"closed with cleanup {rec.get('cleanup')!r}, without the reviewed end: "
+                               f'{NEEDS_RECOVERY}')
+    if not _same_process(rec):
+        return stop('refused', f"process {rec['pid']} is not the openocd this receipt names (gone or another "
+                               f'process): nothing sent; {NEEDS_RECOVERY}')
+    pidfd = tcl = None
+    try:
+        pidfd_open = getattr(os, 'pidfd_open', None)
+        if pidfd_open is None:
+            return stop('refused', f'no pidfd here, so the exit could not be confirmed: nothing sent; {NEEDS_RECOVERY}')
+        try:
+            pidfd = pidfd_open(rec['pid'])
+        except ProcessLookupError:
+            return stop('refused', f"process {rec['pid']} exited: nothing sent; {NEEDS_RECOVERY}")
+        except OSError as e:
+            return stop('refused', f'pidfd_open: {e}, so the exit could not be confirmed: nothing sent; '
+                                   f'{NEEDS_RECOVERY}')
+        if not _same_process(rec):        # the pidfd now names the identified process
+            return stop('refused', f"process {rec['pid']} changed while it was identified: nothing sent")
+        if rec['init'] != 'ok':
+            return stop('refused', f"init {rec['init'] or 'never sent'}: the ordinary end (reset run, shutdown) is "
+                                   f'refused after a failed or unproven init; {NEEDS_RECOVERY}')
+        tcl = _Tcl(rec['ports'][2], rec['token'])
+        tcl.deadline = deadline
+        done = tcl(DONE_QUERY)
+        result['done'] = done
+        if done != str(rec['submitted']):
+            return stop('refused', f"command #{rec['submitted']} is not known to have run (the server has run "
+                                   f"#{done or 'none'}): nothing sent; rerun later")
+        rec['submitted'] += 1
+        write_receipt(receipt, rec)
+        answer = tcl(_wrap('reset run', rec['submitted']))
+        result['resetRun'] = answer
+        if not answer.startswith('HIL-OK'):
+            return stop('failed', f"'reset run' failed: {answer}; {NEEDS_RECOVERY}")
+        try:
+            tcl('shutdown')
+        except (OSError, esp_session.ToolError):
+            pass        # it answers and closes the connection as it shuts down (tcl_server.c:235-240)
+        tcl.close()
+        if not _exited(pidfd, deadline):
+            return stop('failed', 'openocd exit not confirmed after shutdown (still running?); rerun end')
+        write_receipt(receipt, {**rec, 'closed': True, 'cleanup': 'done',
+                                'end': {'resetRun': answer, 'at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}})
+        result['outcome'] = 'ended'
+        return 0, result
+    except (OSError, esp_session.ToolError) as e:     # TimeoutError included
+        return stop('failed', f'{e}; the receipt is kept')
+    finally:
+        if tcl is not None:
+            tcl.close()
+        if pidfd is not None:
+            os.close(pidfd)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description='End a pending openocd_esp session from its receipt '
+                                            '(end_session); one JSON object on stdout.')
+    sub = p.add_subparsers(dest='mode', required=True)
+    e = sub.add_parser('end', help='reset run and shut down the session a receipt names')
+    e.add_argument('--receipt', required=True, metavar='FILE')
+    e.add_argument('--timeout', type=float, default=END_TIMEOUT, metavar='S',
+                   help=f'one bound on the whole end, in seconds (default {END_TIMEOUT})')
+    a = p.parse_args(argv)
+    if not (0 < a.timeout < float('inf')):
+        p.error('--timeout must be a finite positive number of seconds')
+    try:
+        rc, result = end_session(a.receipt, timeout=a.timeout)
+    except (OSError, ValueError) as err:
+        p.error(f'--receipt {a.receipt}: {err}')
+    except KeyboardInterrupt:
+        rc, result = 1, {'mode': 'end', 'receipt': a.receipt, 'outcome': 'failed',
+                         'error': 'interrupted; the receipt is kept'}
+    print(json.dumps(result))
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main())
