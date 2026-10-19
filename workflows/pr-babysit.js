@@ -1540,9 +1540,10 @@ const debtEntry = (commentId, digest) => {
   if (!debt.has(commentId)) debt.set(commentId, { dismissals: new Set(), notes: new Set(), ...(digest !== undefined ? { digest } : {}) })
   return debt.get(commentId)
 }
-// A rejudge stands beside any repair or edit until the caller's reply settles the comment.
+// A rejudge stands beside any repair or edit until the caller's reply settles the comment; a repair naming our reply is an answer of ours too.
 for (const x of rejudgeArg) {
-  if (!answeredWith.has(x.commentId) && !reanswer.has(x.commentId)) throw new Error(`rejudge: comment ${x.commentId} has no answer of ours in the state`)
+  const ours = answeredWith.has(x.commentId) || reanswer.has(x.commentId) || !!debt.get(x.commentId)?.repair?.replyId
+  if (!ours) throw new Error(`rejudge: comment ${x.commentId} has no answer of ours in the state`)
   debtEntry(x.commentId).rejudge = { reason: x.reason.trim() }
 }
 // A refutation or an answer by hand settles the comment; a fix note settles only its notes.

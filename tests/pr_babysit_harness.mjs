@@ -7154,3 +7154,32 @@ test('a rejudge names answered comments, each once, with a reason', async () => 
     await assert.rejects(run({ reviews: oneValid, preflight: at, args: { ...YIELD, state: first.result.state, rejudge } }), /rejudge must be/, JSON.stringify(rejudge))
   }
 })
+
+test('a rejudge reaches a comment whose reply of ours is only in a handoff (#114)', async () => {
+  const first = await run(heldForRepair({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true } }))
+  assert.deepEqual(debtOf(first.result, 2).repair, HELD)
+  const reason = 'reply 502 cites a commit the rebase dropped'
+  const quiet = { findings: [], replies: [], bots: 'reviewed' }
+  const asked = await resumeAt(first.result.state, { reviews: quiet, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, rejudge: [{ commentId: 2, reason }] } })
+  const handoff = asked.result.handoffs.find(h => h.commentId === 2)
+  assert.deepEqual([handoff.replyId, handoff.rejudge], [502, { reason }])
+  assert.deepEqual(debtOf(asked.result, 2).repair, HELD, 'the handoff stays; rejudge authorizes no edit or second reply')
+  assert.equal(asked.calls.some(c => c.label.startsWith('replies#')), false)
+  const later = await resumeAt(asked.result.state, { reviews: quiet, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true } })
+  assert.deepEqual(later.result.handoffs.find(h => h.commentId === 2).rejudge, { reason })
+  const settlement = { commentId: 2, commentDigest: 'd2', replyId: 502, bodyDigest: fnv1a('reworded'), headSha: first.result.state.expectedHead }
+  const settled = await resumeAt(later.result.state, { reviews: quiet, args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, replySettlements: [settlement] } })
+  assert.equal(settled.result.handoffs, undefined)
+  assert.equal(settled.result.state.debt.some(([id]) => id === 2), false)
+})
+
+test('a rejudge still refuses a repair that names no reply of ours', async () => {
+  const first = await run(heldForRepair({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true } }))
+  const state = structuredClone(first.result.state)
+  debtOf({ state }, 2).repair = { replyId: null, error: 'no reply posted: over length' }
+  const { digest, ...rest } = state
+  state.digest = fnv1a(canonical(rest))
+  await assert.rejects(resumeAt(state, { reviews: { findings: [], replies: [], bots: 'reviewed' },
+    args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, rejudge: [{ commentId: 2, reason: 'x' }] } }),
+  /rejudge: comment 2 has no answer of ours in the state/)
+})
