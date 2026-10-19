@@ -347,6 +347,39 @@ test('a dead or malformed answer on muted findings posts them all and leaves cov
   assert.doesNotMatch(lead.result.draft.body, /w pr7-f2/, 'its own comment states the muted member')
 })
 
+test('a threads receipt that is not the script\'s line is asked again once on a fresh label, else the launch blocks (#150)', async () => {
+  const file = `${BASE.factsDir}/threads-${H}.json`
+  const wrapped = { file: JSON.stringify({ file, count: 3 }) }
+  const once = await run(BASE, { threads: (prompt, label) => label === 'threads' ? wrapped : { file, count: 3 } })
+  assert.notEqual(once.result.status, 'blocked')
+  assert.deepEqual(once.labels.filter(l => l.startsWith('threads')), ['threads', 'threads:retry'])
+  assert.equal(once.calls.find(c => c.label === 'threads:retry').options.model, 'sonnet')
+  const twice = await run(BASE, { threads: wrapped })
+  assert.deepEqual([twice.result.status, twice.result.reason], ['blocked', 'threads-failed'])
+  // The script's own error is its answer: nothing to copy better.
+  const failed = await run(BASE, { threads: { file: '', error: 'gh: HTTP 502' } })
+  assert.deepEqual([failed.result.reason, failed.labels.includes('threads:retry')], ['threads-failed', false])
+  const thrown = (label) => { throw new Error(`${label} exploded`) }
+  const died = await run(BASE, { threads: (prompt, label) => label === 'threads' ? thrown(label) : { file, count: 3 } })
+  assert.notEqual(died.result.status, 'blocked', 'a relay that throws gets the retry too')
+  const dead = await run(BASE, { threads: (prompt, label) => thrown(label) })
+  assert.deepEqual([dead.result.reason, dead.result.detail], ['threads-failed', 'the threads relay died'])
+})
+
+test('an invalid or dead grouping is judged again once, told why, before its findings stay ungrouped (#150)', async () => {
+  const two = audited(finding('a'), finding('b'), { ...finding('c'), file: 'src/core/b.c' })
+  const good = { groups: [{ findings: [0, 1], claims: [] }] }
+  const thrown = new Error('group exploded')
+  for (const bad of [{ groups: [{ findings: [0, 0], claims: [] }] }, null, thrown]) {
+    const { result, calls } = await run(BASE, { audit: two, group: (prompt, label) => { if (label !== 'group') return good; if (bad === thrown) throw bad; return bad } })
+    assert.deepEqual(result.coverage.unjudged, [], JSON.stringify(bad))
+    assert.equal(result.draft.comments.length, 2, 'one comment for the grouped pair')
+    assert.match(calls.find(c => c.label === 'group:retry').prompt, /answer was not usable/)
+  }
+  const both = await run(BASE, { audit: two, group: () => { throw thrown } })
+  assert.deepEqual([both.result.coverage.unjudged, both.result.draft.comments.length], [[{ kind: 'group' }], 3])
+})
+
 test('a grouping that names an item twice, nothing, one member or two files is distrusted whole; a dead one is unjudged', async () => {
   const two = audited(finding('a'), finding('b'), { ...finding('c'), file: 'src/core/b.c' })
   for (const groups of [[{ findings: [0, 1], claims: [] }, { findings: [1, 0], claims: [] }], [{ findings: [0, 5], claims: [] }],

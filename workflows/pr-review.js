@@ -104,8 +104,18 @@ const ci = check.ci
 
 phase('Context')
 const threadsFile = `${factsDir}/threads-${head}.json`
-const threadsOut = await relay('threads', 'Context', `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`,
-  { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } })
+const THREADS = { type: 'object', properties: { file: { type: 'string' }, count: { type: 'integer' }, error: { type: 'string' } } }
+const threadsCmd = `python3 ${S}/threads.py --pr ${pr} --repo ${repo} --out '${threadsFile}'`
+// A relay that throws is no answer, as one that returns nothing.
+const dies = () => null
+let threadsOut = await relay('threads', 'Context', threadsCmd, THREADS).catch(dies)
+// A copy that is not the script's line (one wrapped as a string, #150) is asked once more, on a fresh label: a resume
+// replays a label's cached answer. The script's own error is its answer.
+if (!threadsOut || (!threadsOut.error && threadsOut.file !== threadsFile)) {
+  threadsOut = await agent(`${IN}Run exactly: ${threadsCmd}\nIts last stdout line is one JSON object {"file": ..., "count": ...}: return that object ` +
+    `itself as your answer, its members as members, not the line as a string; file is ${threadsFile}.`,
+  { label: 'threads:retry', phase: 'Context', model: 'sonnet', effort: 'low', schema: THREADS }).catch(dies)
+}
 if (!threadsOut || threadsOut.error || threadsOut.file !== threadsFile) return blocked('threads-failed', threadsOut ? threadsOut.error || 'wrong file' : 'the threads relay died')
 const DISPUTES = { type: 'object', additionalProperties: false, properties: { error: { type: 'string' }, disputes: { type: 'array', items: { type: 'object', required: ['findingId', 'key', 'replies'],
   properties: { findingId: { type: 'string' }, key: { type: 'string' }, rootCommentId: { type: 'integer' }, outdated: { type: 'boolean' },
@@ -237,20 +247,29 @@ const whyOf = (f) => f.why || earlier[f.id].why
 const onFile = new Map()
 for (const x of [...pool, ...confirmedClaims.filter(c => c.path)]) onFile.set(x.file || x.path, [...(onFile.get(x.file || x.path) || []), x])
 const asked = new Set(discussion ? [] : [...onFile].filter(([, xs]) => xs.length > 1).map(([p]) => p))
-const grouped = asked.size ? await agent(
+const groupPrompt = (
   'Group the review findings and thread claims below that describe the SAME defect in the same code: one group per defect, at least two members, only groups you are sure of. ' +
   'An item belongs to a group only if its whole substance is that defect: a finding or claim that also raises another problem stays out. Items about different variants belong together only when the path and the fix are the same.\n' +
   `Findings: ${JSON.stringify(pool.map((f, i) => ({ finding: i, file: f.file, line: f.line, dimension: f.dimension, why: whyOf(f) })).filter(f => asked.has(f.file)))}\n` +
-  `Claims: ${JSON.stringify(confirmedClaims.filter(c => asked.has(c.path)).map(c => ({ claim: c.claimId, path: c.path, line: c.line, text: c.claim })))}`,
-  { label: 'group', phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS },
-) : { groups: [] }
+  `Claims: ${JSON.stringify(confirmedClaims.filter(c => asked.has(c.path)).map(c => ({ claim: c.claimId, path: c.path, line: c.line, text: c.claim })))}`)
 // An item named twice, an index or id that names nothing, a group of one, one across files or on a file not asked
 // about is a grouping to distrust whole.
-const members = grouped ? grouped.groups.flatMap(g => [...g.findings.map(i => `f${i}`), ...g.claims.map(id => `c${id}`)]) : []
 const oneFile = (g) => { const at = new Set([...g.findings.map(i => pool[i].file), ...g.claims.map(id => claimOf[id].path)]); return at.size === 1 && asked.has([...at][0]) }
-const groupsOk = grouped && new Set(members).size === members.length &&
-  grouped.groups.every(g => g.findings.length + g.claims.length > 1 && g.findings.every(i => Number.isInteger(i) && pool[i]) &&
-    g.claims.every(id => Object.hasOwn(claimOf, id)) && oneFile(g))
+const groupingOk = (x) => {
+  if (!x || !Array.isArray(x.groups) || !x.groups.every(g => g && Array.isArray(g.findings) && Array.isArray(g.claims))) return false
+  const members = x.groups.flatMap(g => [...g.findings.map(i => `f${i}`), ...g.claims.map(id => `c${id}`)])
+  return new Set(members).size === members.length &&
+    x.groups.every(g => g.findings.length + g.claims.length > 1 && g.findings.every(i => Number.isInteger(i) && pool[i]) &&
+      g.claims.every(id => Object.hasOwn(claimOf, id)) && oneFile(g))
+}
+const askGroups = (label, prompt) => agent(prompt, { label, phase: 'Judge', model: 'sonnet', effort: 'medium', schema: GROUPS }).catch(dies)
+let grouped = asked.size ? await askGroups('group', groupPrompt) : { groups: [] }
+// One unusable answer (#150) gets one more judgment, on a fresh label, before its findings stay ungrouped.
+if (!groupingOk(grouped)) {
+  grouped = await askGroups('group:retry', `${groupPrompt}\nAn earlier answer was not usable: each item at most once, only ` +
+    'the finding indexes and claim ids listed, at least two members a group, and every member of a group on one file.')
+}
+const groupsOk = groupingOk(grouped)
 if (!groupsOk) unjudged.push({ kind: 'group' })
 const groups = groupsOk ? grouped.groups : []
 // A lead thread claim graded below our lead finding: the body names our stronger grade.
