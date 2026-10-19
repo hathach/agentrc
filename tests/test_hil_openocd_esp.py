@@ -498,6 +498,8 @@ class SessionCase(unittest.TestCase):
     def reap(self):
         receipts = [json.loads(r.read_text())['pid'] for r in self.work.glob('*/receipt.json')]
         for pid in {*self.pids(), *receipts}:
+            if str(self.exe) not in (oe.esp_session.cmdline(pid) or []):    # gone, or a reused pid
+                continue
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
