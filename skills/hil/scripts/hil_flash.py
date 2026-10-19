@@ -311,7 +311,9 @@ def flash_esptool(flasher: dict, *, chip: str, port: str, flash_args: str, cwd: 
                   run=None) -> subprocess.CompletedProcess:
     """`chip` is the build's IDF_TARGET, `flash_args` its flash_args file on one line, `cwd`
     the build directory the file's relative paths name, `port` the probe's serial device."""
-    command = (f'esptool --chip {chip} -p {port} {flasher["args"]} '
+    # esptool 5.2.0 emits cursor CSI codes off a TTY when TERM is xterm-like (logger.py); NO_COLOR
+    # turns them off, output only
+    command = (f'NO_COLOR=1 esptool --chip {chip} -p {port} {flasher["args"]} '
                f'--before=default_reset --after=hard_reset write_flash {flash_args}')
     return _runner(run)(command, cwd=cwd, timeout=timeout)
 

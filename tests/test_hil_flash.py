@@ -6,8 +6,8 @@ plus a pyOCD entry, and requires exactly what tinyusb's module produced
 output and the result handed back. Only the pyOCD launcher path and its --project-dir
 argument are normalised, plus deliberate deltas since, each applied explicitly: J-Link
 command files are unique per invocation, reused by its crash reruns and removed after it
-(jlink_command_file_delta), and the J-Link flash script has no reset before `loadfile`
-(jlink_flash_script_delta). Equality there does not establish timing, signals or pyOCD's
+(jlink_command_file_delta), the J-Link flash script has no reset before `loadfile`
+(jlink_flash_script_delta), and esptool runs with NO_COLOR=1 (esptool_no_color_delta). Equality there does not establish timing, signals or pyOCD's
 project-directory behaviour; test_hil_process and test_hil_pyocd do."""
 import os
 import unittest
@@ -110,8 +110,19 @@ def jlink_flash_script_delta(case, observed):
     return {**observed, 'calls': calls}
 
 
+def esptool_no_color_delta(case, observed):
+    """esptool's command gains a NO_COLOR=1 prefix: output only, its arguments unchanged."""
+    if case['flasher']['name'].lower() != 'esptool' or case['op'] == 'rescue':
+        return observed
+    calls = []
+    for call in observed['calls']:
+        assert call['cmd'].startswith('esptool '), call['cmd']
+        calls.append({**call, 'cmd': f"NO_COLOR=1 {call['cmd']}"})
+    return {**observed, 'calls': calls}
+
+
 def deltas(case, observed):
-    return jlink_flash_script_delta(case, jlink_command_file_delta(case, observed))
+    return esptool_no_color_delta(case, jlink_flash_script_delta(case, jlink_command_file_delta(case, observed)))
 
 
 class Golden(unittest.TestCase):
@@ -350,10 +361,26 @@ class StlinkLm4flashEsptool(unittest.TestCase):
     def test_esptool_runs_in_the_build_dir_and_never_resets_alone(self):
         _, calls, _, _ = capture(hf.flash_esptool, {'name': 'esptool', 'uid': 'U', 'args': '-b 1500000'},
                                  chip='esp32s3', port='/dev/ttyACM0', flash_args='0x0 a.bin', cwd='/b', timeout=7)
-        self.assertEqual(calls, [('esptool --chip esp32s3 -p /dev/ttyACM0 -b 1500000 --before=default_reset '
+        self.assertEqual(calls, [('NO_COLOR=1 esptool --chip esp32s3 -p /dev/ttyACM0 -b 1500000 --before=default_reset '
                                   '--after=hard_reset write_flash 0x0 a.bin', {'cwd': '/b', 'timeout': 7})])
         self.assertFalse(hasattr(hf, 'reset_esptool'))
         self.assertFalse(hasattr(hf, 'reset_lm4flash'))
+
+    def test_esptool_runs_with_no_color_in_its_environment(self):
+        """Through the provider runner's shell, with a colour-capable TERM: a fake esptool on PATH."""
+        with tempfile.TemporaryDirectory() as d:
+            tool = Path(d) / 'esptool'
+            tool.write_text('#!/bin/sh\necho "NO_COLOR=$NO_COLOR TERM=$TERM args: $*"\n')
+            tool.chmod(0o755)
+            env = {'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}', 'TERM': 'xterm-256color'}
+            with mock.patch.dict(os.environ, env), mock.patch.dict(os.environ):
+                os.environ.pop('NO_COLOR', None)
+                r = hf.flash_esptool({'name': 'esptool', 'uid': 'U', 'args': '-b 1500000'}, chip='esp32s3',
+                                     port='/dev/null', flash_args='0x0 a.bin', cwd=d, timeout=10)
+                self.assertNotIn('NO_COLOR', os.environ)
+        self.assertEqual((r.returncode, r.stdout),
+                         (0, 'NO_COLOR=1 TERM=xterm-256color args: --chip esp32s3 -p /dev/null -b 1500000 '
+                             '--before=default_reset --after=hard_reset write_flash 0x0 a.bin\n'))
 
     def test_timeout_is_explicit_everywhere(self):
         for fn, args in ((hf.flash_stlink, ({}, 'fw')), (hf.reset_stlink, ({},)), (hf.flash_openocd, ({}, 'fw')),
