@@ -18,17 +18,20 @@ v0.12.0-esp32-20260703.
 
 Session: one openocd server per operation, started with `noinit` in its own session (the
 terminal's SIGINT never reaches it) and driven over a Tcl port that must first answer this
-session's token (target-debug's esp_session.py Tcl). Its pid, start time, argv, port, token
-and log are written to <dir>/receipt.json, in esp_session.py's receipt format, before an
-interrupt can be acted on. It is never signalled or killed. The reviewed end is `reset run`,
-then `shutdown` and its exit confirmed within CLEANUP_TIMEOUT; it follows success and a
-command that failed and returned. An init that failed, a command still outstanding (timed
-out, interrupted, its connection lost or answered by a foreign server) or a reset run that
-failed gets no reset and no shutdown: the operation's cleanup is `pending` and its receipt
-names the server left running, for the caller's cleanup holder. A server that exited on its
-own leaves cleanup `unknown` (`done` when it exited before init was asked, so no adapter was
-opened). There is no bare init/shutdown: examining a running app built with the end-of-stack
-watchpoint panics it, and only the reset run brings it back.
+session's token (target-debug's esp_session.py Tcl). A command fails when it answers an error
+or when its own log lines show a target event hook that failed (`Execution of event <name>
+failed:`, such as reset-assert-post during a reset): target_handle_event logs the hook's
+error and does not propagate it (target.c), so the command still answers success. Its pid,
+start time, argv, port, token and log are written to <dir>/receipt.json, in esp_session.py's
+receipt format, before an interrupt can be acted on. It is never signalled or killed. The
+reviewed end is `reset run`, then `shutdown` and its exit confirmed within CLEANUP_TIMEOUT;
+it follows success and a command that failed and returned. An init that failed, a command
+still outstanding (timed out, interrupted, its connection lost or answered by a foreign
+server) or a reset run that failed gets no reset and no shutdown: the operation's cleanup is
+`pending` and its receipt names the server left running, for the caller's cleanup holder. A
+server that exited on its own leaves cleanup `unknown` (`done` when it exited before init was
+asked, so no adapter was opened). There is no bare init/shutdown: examining a running app
+built with the end-of-stack watchpoint panics it, and only the reset run brings it back.
 
 The session holds an exclusive flock on <dir>/receipt.json.lock, a file never replaced, from
 before the spawn until its operation is built; the openocd child never inherits it. The
@@ -76,8 +79,10 @@ hil_flash = _load('hil_flash', os.path.join(HERE, 'hil_flash.py'))
 ESP_SESSION = os.path.join(HERE, '..', '..', 'target-debug', 'scripts', 'esp_session.py')
 esp_session = _load('esp_session', ESP_SESSION)
 
-# The build whose program_esp, flash read_bank, esp_usb_jtag and shutdown paths were read; another
-# build is refused until its source is checked again.
+# The build whose program_esp, flash write_image/read_bank, esp_usb_jtag and shutdown paths were
+# read; another build is refused until its source is checked again. The pin also covers the `esp`
+# subcommands the writes use (compression, encrypt_binary, flash_stub_clock_boost,
+# verify_bank_hash): C commands of this build, which `info commands` does not list.
 VERIFIED_OPENOCD = 'v0.12.0-esp32-20260703'
 OPENOCD_ENV = 'HIL_OPENOCD_ESP'
 USJ_VID_PID = ('303a', '1001')       # interface/esp_usb_jtag.cfg's `adapter usb vid_pid`
@@ -158,8 +163,8 @@ def find_openocd(openocd: str | None = None) -> dict:
             common = f.read()
     except OSError as e:
         raise RuntimeError(f'{exe}: no openocd-esp32 scripts beside it ({e})') from None
-    if 'proc program_esp ' not in common:
-        raise RuntimeError(f'{scripts}/target/esp_common.cfg defines no program_esp')
+    if 'proc check_image_revision ' not in common:
+        raise RuntimeError(f'{scripts}/target/esp_common.cfg defines no check_image_revision')
     return {'exe': exe, 'banner': banner, 'scripts': scripts}
 
 
@@ -260,6 +265,26 @@ def _wrap(cmd, seq):
 
 DONE_QUERY = 'if {[info exists hil_done]} {set hil_done} else {list}'
 
+# target_handle_event's LOG_TARGET_ERROR "[%s] Execution of event %s failed:" (pinned build)
+_EVENT_FAILED_RE = re.compile(r'Error: \[(\S+)\] Execution of event (\S+) failed:')
+
+
+def _event_failures(lines) -> list:
+    return [f'event {m[2]} failed on {m[1]}' for ln in lines if (m := _EVENT_FAILED_RE.fullmatch(ln))]
+
+
+def _log_since(log, mark) -> tuple:
+    """(lines, events) of the log from byte `mark`; never raises. `events` names each failed
+    event hook, or a log that could not be read, which leaves one not ruled out: either fails
+    the command."""
+    try:
+        with open(log, 'rb') as f:
+            f.seek(mark)
+            lines = f.read().decode(errors='replace').splitlines()
+    except OSError as e:
+        return [], [f'its log could not be read, so a failed event hook is not ruled out ({e})']
+    return lines, _event_failures(lines)
+
 
 def _lock(receipt):
     """An fd holding the exclusive flock on the receipt's companion lock file, or None while
@@ -345,16 +370,9 @@ class Session:
     def init_sent(self):
         return self.rec is not None and self.rec['init'] is not None
 
-    def _log_since(self, mark):
-        try:
-            with open(self.log, 'rb') as f:
-                f.seek(mark)
-                return f.read().decode(errors='replace').splitlines()
-        except OSError:
-            return []
-
     def ask(self, cmd) -> tuple:
-        """(ok, answer) of one command; _Stop when it is left outstanding or was never sent."""
+        """(ok, answer) of one command, failed on an error answer, an event failure in its log lines
+        or a log it could not read (`events`); _Stop when it is left outstanding or was never sent."""
         if self.deadline <= time.monotonic():
             raise _Stop(f'timed out before {cmd!r}', end=True, timed_out=True)
         if cmd == 'init':
@@ -372,16 +390,23 @@ class Session:
         except (OSError, esp_session.ToolError) as e:
             raise _Stop(f'{cmd!r}: {e}') from None
         finally:
-            step['log'] = self._log_since(mark)
-        ok = answer.startswith('HIL-OK')
+            step['log'], events = _log_since(self.log, mark)    # never raises over an interrupt
+        answered_ok = answer.startswith('HIL-OK')
+        step['answer'] = answer.removeprefix('HIL-OK' if answered_ok else 'HIL-ERR').removeprefix(' ')
+        ok = answered_ok and not events
         step['outcome'] = 'ok' if ok else 'error'
+        if events:
+            step['events'] = events
+            reason = '; '.join(events)
+        elif ok or step['answer']:
+            reason = step['answer']
+        else:
+            # a failed init answers empty; its reason is only in the log
+            reason = '; '.join(ln for ln in step['log'] if ln.startswith('Error'))
         if cmd == 'init':
             self.rec['init'] = 'ok' if ok else 'failed'
             esp_session.write_receipt(self.receipt, self.rec)
-        step['answer'] = answer.removeprefix('HIL-OK' if ok else 'HIL-ERR').removeprefix(' ')
-        # a failed init answers empty; its reason is only in the log
-        errors = '; '.join(ln for ln in step['log'] if ln.startswith('Error'))
-        return ok, step['answer'] if ok or step['answer'] else errors
+        return ok, reason
 
     def check(self, cmd) -> str:
         """The answer of a command that must succeed; its failure ends the work, then the reviewed end."""
@@ -534,10 +559,11 @@ _HEX = frozenset(b'0123456789abcdefABCDEF')
 
 
 def _loaded_as(head: bytes) -> str | None:
-    """What openocd would load a file starting with `head` as, if not a raw binary: program_esp
-    hands the file to `flash write_image erase` without a type (esp_common.cfg:642-663), which
-    autodetects ELF, Intel HEX and S-record (image.c:42-89, image_open :956-960) and places their
-    records at their own addresses rather than at the segment's offset."""
+    """What openocd would load a file starting with `head` as, if not a raw binary: the write
+    hands the file to `flash write_image erase` without a type, as program_esp does
+    (esp_common.cfg:642-663), which autodetects ELF, Intel HEX and S-record (image.c:42-89,
+    image_open :956-960) and places their records at their own addresses rather than at the
+    segment's offset."""
     if len(head) < 9:
         return None                      # image.c:57-62: under 9 bytes is always binary
     if head[:4] == b'\x7fELF':
@@ -557,8 +583,8 @@ def admit_segments(segments) -> list:
     range but pads only its end with data (core.c:516-552, 883-900), so bytes before an
     unaligned offset would be erased. Erase extents may not overlap. A length need not be a
     multiple of 4: verify_bank_hash skips the last length % 4 bytes (esp_flash.c:1726-1730),
-    so the read-back covers them. `encrypted` may only be false: program_esp is run without
-    `encrypt` and writes plaintext; any other key is an option this backend does not apply."""
+    so the read-back covers them. `encrypted` may only be false: the writes run with `esp
+    encrypt_binary no` and write plaintext; any other key is an option this backend does not apply."""
     if not isinstance(segments, (list, tuple)) or not segments:
         raise ValueError('no segments')
     admitted, extents = [], []
@@ -566,7 +592,7 @@ def admit_segments(segments) -> list:
         if not isinstance(seg, dict) or not {'offset', 'file', 'size'} <= set(seg) <= _SEGMENT_KEYS:
             raise ValueError(f'segment {seg!r}: want {{offset, file, size}} and nothing but `encrypted` false')
         if seg.get('encrypted', False) not in (False, 'false'):
-            raise ValueError(f'segment {seg!r}: encrypted writes are refused (program_esp writes plaintext here)')
+            raise ValueError(f'segment {seg!r}: encrypted writes are refused (the writes are plaintext here)')
         offset, size = seg['offset'], seg['size']
         if not _int(offset) or offset < 0 or offset % SECTOR:
             raise ValueError(f'segment {seg!r}: the offset must be a multiple of 0x{SECTOR:x}')
@@ -617,8 +643,8 @@ _BANK_RE = re.compile(r'name\s+\{([^}]*)\}\s+driver\s+(\S+)\s+base\s+(0x[0-9a-fA
 
 
 def _bank0(listing: str) -> dict:
-    # `flash list` (tcl.c:1454-1475); bank 0 is the whole flash, which program_esp's verify_bank_hash 0
-    # and read_bank 0 use (esp_common.cfg configure_esp_flash_bank)
+    # `flash list` (tcl.c:1454-1475); bank 0 is the whole flash, which verify_bank_hash 0 and
+    # read_bank 0 use (esp_common.cfg configure_esp_flash_bank)
     m = _BANK_RE.search(listing)
     if not m or not m[1].endswith('.flash') or int(m[3], 16) != 0 or not int(m[4], 16) \
             or int(m[4], 16) % SECTOR:
@@ -626,29 +652,79 @@ def _bank0(listing: str) -> dict:
     return {'name': m[1], 'driver': m[2], 'size': int(m[4], 16)}
 
 
+RESET_INIT_ATTEMPTS = 3
+_TARGET_RE = re.compile(r'[A-Za-z0-9_.]+')     # a target name reaches Tcl unquoted
+
+
+def _reset_init(s):
+    """A `reset init` with no failed event hook, within RESET_INIT_ATTEMPTS; nothing is written yet."""
+    for _ in range(RESET_INIT_ATTEMPTS):
+        ok, answer = s.ask('reset init')
+        if ok:
+            return
+    raise _Stop(f"'reset init' failed {RESET_INIT_ATTEMPTS} times, last: {answer}", end=True)
+
+
+def _write_setup(s) -> dict:
+    """program_esp's setup after its reset (esp_common.cfg:621-652) with this backend's options:
+    no work-area backup, no compression, plaintext, flash clock boost on. Returns each target's
+    saved -work-area-backup."""
+    names = s.check('target names').split()
+    if not names or not all(_TARGET_RE.fullmatch(n) for n in names):
+        raise _Stop(f'target names {names!r}: want names of letters, digits, _ and .', end=True)
+    saved = {}
+    for tgt in names:
+        saved[tgt] = s.check(f'{tgt} cget -work-area-backup')
+        if saved[tgt] not in ('0', '1'):
+            raise _Stop(f'{tgt} -work-area-backup is {saved[tgt]!r}, not 0 or 1', end=True)
+        s.check(f'{tgt} configure -work-area-backup 0')
+    for cmd in ('esp compression off', 'esp encrypt_binary no', 'esp flash_stub_clock_boost on'):
+        s.check(cmd)
+    return saved
+
+
+def _program(s, rec):
+    """program_esp's checks, write and verify of one segment (esp_common.cfg:577-579, 663-669):
+    `check_image_revision`, `flash write_image erase`, `esp verify_bank_hash`, on the session's
+    copy and with no reset. `program` is attached once a command has returned and holds the last
+    answer and the log of every command that returned; `ok` and `verified` turn true only once
+    the verify passed."""
+    copy, offset = rec['copy'], f"0x{rec['offset']:x}"
+    program = {'ok': False, 'answer': '', 'log': [], 'verified': False}
+    for name, cmd in (('check_image_revision', f'check_image_revision {{{copy}}} 0'),
+                      ('flash write_image erase', f'flash write_image erase {{{copy}}} {offset}'),
+                      ('esp verify_bank_hash', f'esp verify_bank_hash 0 {{{copy}}} {offset}')):
+        ok, program['answer'] = s.ask(cmd)
+        program['log'] += s.steps[-1]['log']
+        rec['program'] = program
+        if not ok:
+            raise _Stop(f"programming {rec['file']} at {offset} failed at {name!r}: {program['answer']}", end=True)
+    program['ok'] = program['verified'] = True
+
+
 def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, openocd=None):
-    """Program `segments` in order, each by `program_esp <file> <offset> verify no_skip_loaded`
-    (esp_common.cfg:531-705; never its `exit`, whose program_error runs `shutdown error`,
-    startup.tcl:12-19), stopping at the first failure; then read every segment back with
-    `flash read_bank` and compare it byte for byte with the bytes admitted. One managed session
-    (module docstring) within `timeout` seconds, files in a new directory under `workdir`.
+    """Program `segments` in order, each verified, stopping at the first failure, then read every
+    segment back with `flash read_bank` and compare it byte for byte with the bytes admitted. One
+    managed session (module docstring) within `timeout` seconds, files in a new directory under
+    `workdir`. The chip must not sit in its ROM loader (the `hil` skill's Flashers).
 
     `security` is the caller's evidence that flash encryption and secure boot are off
     (admit_security), required and recorded as `session['security']`.
 
-    Before the first write it runs `reset init` and `flash probe 0` and refuses a segment whose
-    erased sectors leave bank 0. Returns hil_flash's Operation, with `segments`: per segment its
-    offset, file, size, erased range, sha256, `copy` (the session's copy of the admitted bytes,
-    the file programmed), `program` (the call's answer and log, `verified`
-    when it printed "** Verify OK **") and `readBack` (file, length, match, firstMismatch).
-    Refusals raise ValueError or RuntimeError before anything starts."""
+    Nothing is written without a `reset init` whose event hooks all passed, within
+    RESET_INIT_ATTEMPTS (_reset_init), nor a segment whose erased sectors leave bank 0; no reset
+    runs between that reset and the last write (_write_setup, _program). Returns hil_flash's
+    Operation, with `segments`: per segment its offset, file, size, erased range, sha256, `copy`
+    (the session's copy of the admitted bytes, the file programmed), `program` once attempted
+    (_program) and `readBack` (file, length, match, firstMismatch). Refusals raise ValueError
+    or RuntimeError before anything starts."""
     _refuse_ci()
     security = admit_security(security)
     admitted = admit_segments(segments)
     records = [rec for rec, _ in admitted]
 
     def work(s):
-        # program_esp reopens its file: program a private copy, so an input replaced after
+        # each write step reopens its file: program a private copy, so an input replaced after
         # admission cannot write past the checked erase range
         try:
             for i, (rec, data) in enumerate(admitted):
@@ -657,21 +733,19 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
                     f.write(data)
         except OSError as e:
             raise _Stop(f'copying the admitted segments: {e}', end=True) from None
-        s.check('reset init')
+        _reset_init(s)
         s.check('flash probe 0')
         bank = _bank0(s.check('flash list'))
         for rec in records:
             if rec['erase'][1] > bank['size']:
                 raise _Stop(f"segment {rec['file']} at 0x{rec['offset']:x} leaves bank {bank['name']} "
                             f"(0x{bank['size']:x} bytes)", end=True)
+        saved = _write_setup(s)
         for rec in records:
-            ok, answer = s.ask(f"program_esp {{{rec['copy']}}} 0x{rec['offset']:x} verify no_skip_loaded")
-            log = s.steps[-1]['log']
-            rec['program'] = {'ok': ok, 'answer': answer, 'log': log,
-                              'verified': ok and '** Verify OK **' in log}
-            if not rec['program']['verified']:
-                raise _Stop(f"programming {rec['file']} at 0x{rec['offset']:x} failed: {answer or 'no Verify OK'}",
-                            end=True)
+            _program(s, rec)
+        # each target its own value: configure_esp_workarea_backups's `incr $index` never advances
+        for tgt, value in saved.items():
+            s.check(f'{tgt} configure -work-area-backup {value}')
         for i, (rec, data) in enumerate(admitted):
             # esp_algo_flash_read refuses an unaligned offset (esp_flash.c:986-989); the length is
             # rounded up to 4 and only the segment's own bytes compared
@@ -704,7 +778,8 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
     """Reset and run the chip through a managed session: init within `timeout` seconds, then the
     reviewed end, `reset run` and a confirmed shutdown within CLEANUP_TIMEOUT. init examines the
     cores, which panics a running app built with the end-of-stack watchpoint; the reset run
-    that follows reboots it, and an init that failed leaves the session pending instead.
+    that follows reboots it. An init or a reset run that failed, a failed event hook included,
+    leaves the session pending instead.
     Returns hil_flash's Operation, as flash_openocd_esp without `segments`."""
     _refuse_ci()
     return _run(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
@@ -714,7 +789,7 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
 # Ending a pending session
 # -------------------------------------------------------------
 END_TIMEOUT = 60
-_RECEIPT_KEYS = ('pid', 'startTime', 'argv', 'ports', 'token', 'closed', 'init', 'submitted')
+_RECEIPT_KEYS = ('pid', 'startTime', 'argv', 'ports', 'token', 'log', 'closed', 'init', 'submitted')
 NEEDS_RECOVERY = 'the board stays held and needs a separately reviewed recovery'
 
 
@@ -805,10 +880,14 @@ def _end_owned(receipt, deadline) -> tuple:
                                    f"#{done or 'none'}): nothing sent; rerun later")
         rec['submitted'] += 1
         esp_session.write_receipt(receipt, rec)
+        mark = esp_session.size_of(rec['log']) or 0
         answer = tcl(_wrap('reset run', rec['submitted']))
         result['resetRun'] = answer
-        if not answer.startswith('HIL-OK'):
-            return stop('failed', f"'reset run' failed: {answer}; {NEEDS_RECOVERY}")
+        _, events = _log_since(rec['log'], mark)
+        if events:
+            result['events'] = events
+        if not answer.startswith('HIL-OK') or events:
+            return stop('failed', f"'reset run' failed: {'; '.join(events) or answer}; {NEEDS_RECOVERY}")
         _shutdown(tcl)
         if not _exited(pidfd, deadline):
             return stop('failed', 'openocd exit not confirmed after shutdown (still running?); rerun end')

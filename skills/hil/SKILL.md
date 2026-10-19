@@ -151,10 +151,17 @@ recovery stay the contract's. Linux only.
   transcript, retrying and recovering stay the caller's.
 - `openocd_esp` is `scripts/hil_openocd_esp.py`'s (`flash_openocd_esp`,
   `reset_openocd_esp`): an Espressif chip's built-in USB-Serial/JTAG through
-  openocd-esp32 v0.12.0-esp32-20260703 only. `uid` is the USJ serial; `args`
+  openocd-esp32 v0.12.0-esp32-20260703 only, found by `HIL_OPENOCD_ESP`, else
+  `openocd` on PATH. `uid` is the USJ serial; `args`
   is `-f board/<chip>-builtin.cfg` or `-f interface/esp_usb_jtag.cfg -f
   target/<chip>.cfg` and nothing else. The USJ's bus-port is resolved by
   serial, exactly one match, and pinned before init; it is never convoy-safe.
+  The caller hard-resets the chip out of its ROM loader first: one left there
+  (esptool `--after no-reset`) faults the flash stub after `reset init`. A
+  command whose log shows a failed target event hook (`Execution of event
+  <name> failed:`), or cannot be read, fails although openocd answers success:
+  a flash writes nothing after three such `reset init`s, and such a `reset run`
+  leaves the session pending.
   A flash takes the caller's ordered segments (sector-aligned offset, raw
   binary file, size), programs each with verify, stops at the first failure
   and reads every segment back byte for byte. It also requires `security`, the

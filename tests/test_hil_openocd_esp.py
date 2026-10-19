@@ -45,13 +45,16 @@ BANNER = f'Open On-Chip Debugger {oe.VERIFIED_OPENOCD} (2026-07-03-13:49)'
 # openocd-esp32 stand-in: the banner, then a server that logs its listening line and answers the
 # token query and the wrapped Tcl commands. FAKE_SCRIPT maps a command, its first word, or
 # `<first word>#<n>` for the n-th such command, to "ok:<answer>", "err:<message>", "hang" (never
-# answers), "die" (exits without answering) or "gate:<file>" (logs a `gated` event, then runs the
-# command once <file> exists). Otherwise program_esp, flash list and flash
-# read_bank work on FAKE_FLASH, a FAKE_BANK_SIZE image: program_esp erases whole sectors, writes,
-# and verifies only the 4-byte-aligned prefix as verify_bank_hash does; FAKE_CORRUPT=tail corrupts
-# an unaligned segment's last byte, =after_verify its first byte after the verify. FAKE_EVENTS gets
-# its argv, every command and every signal; it never exits on SIGTERM/SIGINT/SIGHUP, so a test
-# sees a signal that would have killed openocd.
+# answers), "die" (exits without answering), "gate:<file>" (logs a `gated` event, then runs the
+# command once <file> exists) or "event:<name>" (logs that target event <name> failed, as
+# target_handle_event does, then runs the command and answers success). Otherwise flash write_image,
+# esp verify_bank_hash, flash list and flash read_bank work on FAKE_FLASH, a FAKE_BANK_SIZE image:
+# the write erases whole sectors and writes, the verify checks only the 4-byte-aligned prefix as
+# verify_bank_hash does; FAKE_CORRUPT=tail corrupts an unaligned segment's last byte, =after_verify
+# its first byte after the verify. `target names` lists WAB's targets, whose -work-area-backup
+# cget and configure read and set (each configure logs a `wab` event). FAKE_EVENTS gets its argv,
+# every command and every signal; it never exits on SIGTERM/SIGINT/SIGHUP, so a test sees a signal
+# that would have killed openocd.
 FAKE_OPENOCD = r'''#!/usr/bin/env python3
 import json, os, re, signal, socket, sys, time
 argv = sys.argv[1:]
@@ -108,9 +111,11 @@ def image():
 def store(img):
     with open(FLASH, 'wb') as f:
         f.write(img)
-def program(path, addr):
+def read(path):
     with open(path, 'rb') as f:
-        data = f.read()
+        return f.read()
+def write(path, addr):
+    data = read(path)
     img, n = image(), len(data)
     end = -(-(addr + n) // 4096) * 4096
     img[addr:end] = b'\xff' * (end - addr)
@@ -118,18 +123,32 @@ def program(path, addr):
     if os.environ.get('FAKE_CORRUPT') == 'tail' and n % 4:
         img[addr + n - 1] ^= 0xff
     store(img)
-    say('** Programming Finished in 1 ms **')
-    if img[addr:addr + (n & ~3)] != data[:n & ~3]:
-        say('** Verify Failed **')
-        return 'HIL-ERR ** Verify Failed **'
-    say('** Verify OK **')
+    say(f'Info : wrote {n} bytes from file {path}')
+    return 'HIL-OK '
+def verify(path, addr):
+    data, img = read(path), image()
+    n = len(data) & ~3
+    if img[addr:addr + n] != data[:n]:
+        say('Error: hash mismatch')
+        return 'HIL-ERR hash mismatch'
     if os.environ.get('FAKE_CORRUPT') == 'after_verify':
         img[addr] ^= 1
         store(img)
     return 'HIL-OK '
+WAB = {'esp32p4.hp.cpu0': '1', 'esp32p4.hp.cpu1': '0'}
 def model(cmd):
-    if m := re.fullmatch(r'program_esp \{(\S+)\} (0x[0-9a-f]+) verify no_skip_loaded', cmd):
-        return program(m[1], int(m[2], 16))
+    if m := re.fullmatch(r'flash write_image erase \{(\S+)\} (0x[0-9a-f]+)', cmd):
+        return write(m[1], int(m[2], 16))
+    if m := re.fullmatch(r'esp verify_bank_hash 0 \{(\S+)\} (0x[0-9a-f]+)', cmd):
+        return verify(m[1], int(m[2], 16))
+    if cmd == 'target names':
+        return 'HIL-OK ' + ' '.join(WAB)
+    if m := re.fullmatch(r'(\S+) cget -work-area-backup', cmd):
+        return 'HIL-OK ' + WAB[m[1]]
+    if m := re.fullmatch(r'(\S+) configure -work-area-backup ([01])', cmd):
+        WAB[m[1]] = m[2]
+        event(wab=dict(WAB))
+        return 'HIL-OK '
     if cmd == 'flash list':
         return ('HIL-OK {\n    name       {esp32p4.hp.cpu0.flash}\n    driver     esp32p4\n    base       0x00000000\n'
                 f'    size       0x{BANK:x}\n    bus_width  0\n    chip_width 0\n    target     esp32p4.hp.cpu0\n}}\n'
@@ -166,6 +185,10 @@ def run(cmd):
     if kind == 'err':
         say(f'Error: {text}')
         return f'HIL-ERR {text}'
+    if kind == 'event':
+        say(f'Error: [esp32p4.hp.cpu0] Execution of event {text} failed:')
+        say('Traceback (most recent call last):')
+        return model(cmd)
     say(f'Info : {cmd} done')
     return f'HIL-OK {text}'
 def reply(conn, text):
@@ -228,7 +251,7 @@ def fake_install(root, banner=BANNER, chips=('esp32p4', 'esp32c3'), board_body=N
     scripts = root / 'share' / 'openocd' / 'scripts'
     for sub in ('board', 'target', 'interface'):
         (scripts / sub).mkdir(parents=True, exist_ok=True)
-    (scripts / 'target' / 'esp_common.cfg').write_text('proc program_esp {filename args} {\n}\n')
+    (scripts / 'target' / 'esp_common.cfg').write_text('proc check_image_revision {filename exit} {\n}\n')
     (scripts / 'interface' / 'esp_usb_jtag.cfg').write_text('adapter driver esp_usb_jtag\n')
     for chip in chips:
         (scripts / 'target' / f'{chip}.cfg').write_text('source [find target/esp_common.cfg]\n')
@@ -326,7 +349,7 @@ class FindOpenocd(unittest.TestCase):
             oe.find_openocd(str(self.root / 'nope'))
         exe, scripts = fake_install(self.root)
         (scripts / 'target' / 'esp_common.cfg').write_text('# no procs\n')
-        with self.assertRaisesRegex(RuntimeError, 'no program_esp'):
+        with self.assertRaisesRegex(RuntimeError, 'no check_image_revision'):
             oe.find_openocd(str(exe))
         (scripts / 'target' / 'esp_common.cfg').unlink()
         with self.assertRaisesRegex(RuntimeError, 'no openocd-esp32 scripts'):
@@ -511,6 +534,19 @@ class SessionCase(unittest.TestCase):
         return self.run_op(lambda timeout: oe._run(BOARD, work, workdir=str(self.work), timeout=timeout,
                                                    openocd=str(self.exe)), **kw)
 
+    @staticmethod
+    def unreadable_log(after=0):
+        """The module's binary reads of openocd.log raise PermissionError after the first `after`."""
+        real, reads = open, [0]
+
+        def guarded(path, mode='r', *a, **kw):
+            if str(path).endswith('openocd.log') and mode == 'rb':
+                reads[0] += 1
+                if reads[0] > after:
+                    raise PermissionError(13, 'Permission denied', str(path))
+            return real(path, mode, *a, **kw)
+        return mock.patch.object(oe, 'open', guarded, create=True)
+
     def assertPending(self, op):
         a, = op.attempts
         self.assertEqual(a.cleanup, 'pending')
@@ -598,6 +634,46 @@ class Lifecycle(SessionCase):
         op = self.session(script={'reset run': 'err:target not examined'})
         self.assertEqual(self.tcl(), ['token?', 'init', 'reset run'])
         self.assertIn("'reset run' failed", op.session['failure'])
+        self.assertPending(op)
+
+    def test_an_event_failure_on_the_ends_reset_run_is_pending_without_shutdown(self):
+        op = self.session(script={'reset run': 'event:reset-assert-post'})
+        self.assertEqual(self.tcl(), ['token?', 'init', 'reset run'])
+        self.assertEqual(op.session['failure'], "'reset run' failed: event reset-assert-post failed on esp32p4.hp.cpu0")
+        self.assertPending(op)
+
+    def test_an_event_failure_fails_a_command_that_answered_success(self):
+        op = self.session(lambda s: (s.check('a'), s.check('never')), script={'a': 'event:halted'})
+        self.assertEqual(self.tcl(), ['token?', 'init', 'a', 'reset run', 'shutdown'])
+        self.assertEqual((op.steps[1]['outcome'], op.steps[1]['answer']), ('error', ''))
+        self.assertIn("'a' failed: event halted failed on esp32p4.hp.cpu0", op.session['failure'])
+        self.assertEnded(op)
+
+    def test_an_unreadable_log_fails_the_command_and_the_end_stays_pending(self):
+        with self.unreadable_log(after=1):
+            op = self.session(lambda s: (s.check('a'), s.check('never')))
+        self.assertEqual(self.tcl(), ['token?', 'init', 'a', 'reset run'])
+        self.assertIn("'a' failed: its log could not be read", op.session['failure'])
+        self.assertEqual([s['outcome'] for s in op.steps], ['ok', 'error', 'error'])
+        self.assertPending(op)
+
+    def test_an_unreadable_log_during_an_interrupt_keeps_the_interrupt_and_its_operation(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with self.unreadable_log(after=1), self.assertRaises(KeyboardInterrupt) as cm:
+            self.session(lambda s: s.check('slow'), timeout=30, script={'slow': 'hang'})
+        op = cm.exception.operation
+        self.assertEqual(op.steps[-1], {**op.steps[-1], 'cmd': 'slow', 'outcome': 'interrupted', 'log': []})
+        self.assertPending(op)
+
+    def test_an_event_failure_during_init_is_a_failed_init(self):
+        op = self.session(script={'init': 'event:examine-end'})
+        self.assertEqual(self.tcl(), ['token?', 'init'])
+        self.assertEqual(json.loads(Path(op.session['receipt']).read_text())['init'], 'failed')
+        self.assertIn('init failed: event examine-end failed', op.session['failure'])
         self.assertPending(op)
 
     def test_the_deadline_passing_between_commands_still_ends_the_session(self):
@@ -715,6 +791,50 @@ class Lifecycle(SessionCase):
         self.assertEqual(self.tcl()[-2:], ['reset run', 'shutdown'])
 
 
+class EventFailures(unittest.TestCase):
+    def test_only_the_line_target_handle_event_prints_matches(self):
+        # from a P4 session's log (openocd-esp32 v0.12.0-esp32-20260703, 2026-10-20)
+        lines = ['Error: [esp32p4.hp.cpu0] Failed to write memory (addr=0x500c2064)',
+                 'Error: [esp32p4.hp.cpu0] Execution of event reset-assert-post failed:',
+                 '/opt/ocd/share/openocd/scripts/target/esp32p4.cfg:43: Error: ',
+                 'Info : [esp32p4.hp.cpu0] Reset cause (3) - (Software core reset)',
+                 'Info : [esp32p4.hp.cpu0] Execution of event halted failed:',
+                 'Error: Execution of event halted failed:',
+                 'Error: [esp32p4.hp.cpu1] Execution of event gdb-attach failed: later']
+        self.assertEqual(oe._event_failures(lines), ['event reset-assert-post failed on esp32p4.hp.cpu0'])
+
+
+class ProgramRecord(unittest.TestCase):
+    """_program attaches a segment's `program` only once one of its commands has returned."""
+    REC = {'file': '/w/app.bin', 'copy': '/w/out/segment_0_0x8000.bin', 'offset': 0x8000}
+
+    def test_an_expired_deadline_sends_nothing_and_leaves_no_record(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        s = oe.Session([], td.name, 1, 'tok')
+        s.rec, s.deadline = {'init': 'ok', 'submitted': 0}, time.monotonic() - 1
+        rec = dict(self.REC)
+        with self.assertRaises(oe._Stop) as cm:
+            oe._program(s, rec)
+        self.assertTrue(cm.exception.timed_out)
+        self.assertEqual((s.steps, 'program' in rec), ([], False))
+
+    def test_what_returned_before_the_deadline_is_kept(self):
+        class Expiring:
+            def __init__(self):
+                self.steps = []
+
+            def ask(self, cmd):
+                if self.steps:
+                    raise oe._Stop(f'timed out before {cmd!r}', end=True, timed_out=True)
+                self.steps.append({'cmd': cmd, 'log': ['Info : checked']})
+                return True, 'ok'
+        rec = dict(self.REC)
+        with self.assertRaises(oe._Stop):
+            oe._program(Expiring(), rec)
+        self.assertEqual(rec['program'], {'ok': False, 'answer': 'ok', 'log': ['Info : checked'], 'verified': False})
+
+
 class TclDeadline(unittest.TestCase):
     """One absolute deadline covers the token check and the command's answer: a server slow at
     each in turn may not get the whole budget twice."""
@@ -775,8 +895,33 @@ class Programming(SessionCase):
                                                                  timeout=timeout, openocd=str(self.exe)),
                            **env, **kw)
 
-    def program_cmds(self, op):
-        return [f"program_esp {{{r['copy']}}} 0x{r['offset']:x} verify no_skip_loaded" for r in op.segments]
+    SETUP = ['target names', 'esp32p4.hp.cpu0 cget -work-area-backup', 'esp32p4.hp.cpu0 configure -work-area-backup 0',
+             'esp32p4.hp.cpu1 cget -work-area-backup', 'esp32p4.hp.cpu1 configure -work-area-backup 0',
+             'esp compression off', 'esp encrypt_binary no', 'esp flash_stub_clock_boost on']
+    # the fake's targets start with different values, so restoring index 0 to both would show
+    RESTORE = ['esp32p4.hp.cpu0 configure -work-area-backup 1', 'esp32p4.hp.cpu1 configure -work-area-backup 0']
+
+    PREFIX = ['reset init', 'flash probe 0', 'flash list', *SETUP]
+    PER_SEGMENT = ('check_image_revision {{{copy}}} 0', 'flash write_image erase {{{copy}}} {offset}',
+                   'esp verify_bank_hash 0 {{{copy}}} {offset}')
+    WRITE, VERIFY = 1, 2
+
+    def expected(self, copies):
+        """The commands from the first `reset init` to the last verify, for (copy, offset) pairs."""
+        return [*self.PREFIX, *(t.format(copy=c, offset=o) for c, o in copies for t in self.PER_SEGMENT)]
+
+    @staticmethod
+    def copies(op):
+        return [(r['copy'], f"0x{r['offset']:x}") for r in op.segments]
+
+    def script_key(self, n, which):
+        """FAKE_SCRIPT key of segment n's (from 1) PER_SEGMENT[which] command: its copy's path is
+        known only once the session runs, so the key is the command's first word and its
+        occurrence in expected()."""
+        seq = self.expected([(f'<copy{i}>', f'<offset{i}>') for i in range(1, n + 1)])
+        end = len(seq) - len(self.PER_SEGMENT) + which + 1
+        first = seq[end - 1].split()[0]
+        return f'{first}#{sum(c.split()[0] == first for c in seq[:end])}'
 
     def read_cmds(self, op):
         return [f"flash read_bank 0 {{{r['readBack']['file']}}} 0x{r['offset']:x} {r['readBack']['length']}"
@@ -784,9 +929,15 @@ class Programming(SessionCase):
 
     def test_each_segment_programmed_in_order_then_read_back_exactly(self):
         op = self.flash_op()
-        self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list',
-                                      *self.program_cmds(op), *self.read_cmds(op), 'reset run', 'shutdown'])
+        self.assertEqual(self.tcl(), ['token?', 'init', *self.expected(self.copies(op)), *self.RESTORE,
+                                      *self.read_cmds(op), 'reset run', 'shutdown'])
         self.assertEqual(op.returncode, 0)
+        self.assertEqual([e['wab'] for e in self.events() if 'wab' in e][-1],
+                         {'esp32p4.hp.cpu0': '1', 'esp32p4.hp.cpu1': '0'})
+        copy = op.segments[0]['copy']
+        first = [st for st in op.steps if copy in st['cmd']]
+        self.assertEqual(op.segments[0]['program']['log'], [ln for st in first for ln in st['log']])
+        self.assertIn(f'Info : wrote 5000 bytes from file {copy}', op.segments[0]['program']['log'])
         self.assertEnded(op)
         img = self.flash.read_bytes()
         for rec, seg in zip(op.segments, self.segs):
@@ -799,7 +950,7 @@ class Programming(SessionCase):
         self.assertEqual([r['erase'] for r in op.segments], [[0, 0x2000], [0x2000, 0x3000], [0x8000, 0x9000]])
 
     def test_an_input_replaced_after_admission_is_not_what_is_programmed(self):
-        # program_esp reopens the file it is given: a grown replacement would erase the next sector
+        # every write step reopens the file it is given: a grown replacement would erase the next sector
         admitted = self.files['app.bin'].read_bytes()
         real = oe.admit_segments
 
@@ -862,23 +1013,57 @@ class Programming(SessionCase):
         self.assertEqual(op.returncode, 1)
 
     def test_the_first_failed_segment_stops_programming(self):
-        op = self.flash_op(script={'program_esp#2': 'err:** Verify Failed **'})
-        self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list',
-                                      *self.program_cmds(op)[:2], 'reset run', 'shutdown'])
+        op = self.flash_op(script={self.script_key(2, self.VERIFY): 'err:hash mismatch'})
+        self.assertEqual(self.tcl(), ['token?', 'init', *self.expected(self.copies(op)[:2]), 'reset run', 'shutdown'])
         self.assertEqual([r.get('program', {}).get('ok') for r in op.segments], [True, False, None])
-        self.assertEqual(op.segments[1]['program']['answer'], '** Verify Failed **')
+        self.assertEqual([r.get('program', {}).get('verified') for r in op.segments], [True, False, None])
+        self.assertEqual(op.segments[1]['program']['answer'], 'hash mismatch')
         self.assertEqual(op.returncode, 1)
         self.assertEnded(op)
 
-    def test_a_program_call_without_verify_ok_is_a_failure(self):
-        op = self.flash_op(script={'program_esp#1': 'ok:'})
-        self.assertFalse(op.segments[0]['program']['verified'])
+    def test_an_event_failure_in_a_write_stops_before_the_next_segment(self):
+        op = self.flash_op(script={self.script_key(1, self.WRITE): 'event:reset-assert-post'})
+        self.assertEqual(self.tcl(), ['token?', 'init', *self.expected(self.copies(op)[:1])[:-1], 'reset run',
+                                      'shutdown'])
+        self.assertEqual(op.segments[0]['program'], {**op.segments[0]['program'], 'ok': False, 'verified': False,
+                                                     'answer': 'event reset-assert-post failed on esp32p4.hp.cpu0'})
+        self.assertNotIn('program', op.segments[1])
+        self.assertIn("failed at 'flash write_image erase'", op.session['failure'])
+        self.assertEqual(op.returncode, 1)
+        self.assertEnded(op)
+
+    def test_an_event_failure_on_the_first_reset_init_then_a_clean_one_proceeds(self):
+        op = self.flash_op(script={'reset#1': 'event:reset-assert-post'})
+        self.assertEqual(self.tcl()[:5], ['token?', 'init', 'reset init', 'reset init', 'flash probe 0'])
+        self.assertEqual(op.steps[1], {**op.steps[1], 'cmd': 'reset init', 'outcome': 'error',
+                                       'events': ['event reset-assert-post failed on esp32p4.hp.cpu0']})
+        self.assertEqual(op.returncode, 0)
+        self.assertEnded(op)
+
+    def test_an_unreadable_log_after_init_writes_nothing_and_ends_nothing(self):
+        with self.unreadable_log(after=1):
+            op = self.flash_op()
+        self.assertEqual(self.tcl(), ['token?', 'init', *['reset init'] * oe.RESET_INIT_ATTEMPTS, 'reset run'])
+        self.assertIn('its log could not be read', op.session['failure'])
+        self.assertEqual([r.get('program') for r in op.segments], [None, None, None])
+        self.assertPending(op)
+
+    def test_three_failed_reset_inits_stop_before_any_write(self):
+        op = self.flash_op(script={f'reset#{n}': 'event:reset-assert-post' for n in range(1, oe.RESET_INIT_ATTEMPTS + 1)})
+        self.assertEqual(self.tcl(), ['token?', 'init', *['reset init'] * oe.RESET_INIT_ATTEMPTS, 'reset run',
+                                      'shutdown'])
+        self.assertIn("'reset init' failed 3 times", op.session['failure'])
+        self.assertEqual([r.get('program') for r in op.segments], [None, None, None])
         self.assertEqual(op.returncode, 1)
         self.assertEnded(op)
 
     def test_a_timeout_during_programming_leaves_the_session_pending(self):
-        op = self.flash_op(timeout=3, script={'program_esp#2': 'hang'})
-        self.assertEqual(self.tcl()[-1], self.program_cmds(op)[1])
+        op = self.flash_op(timeout=3, script={self.script_key(2, self.WRITE): 'hang'})
+        self.assertEqual(self.tcl()[-1], self.expected(self.copies(op)[:2])[-2])
+        # the attempted segment keeps what returned; the next was never attempted
+        self.assertEqual(op.segments[1]['program'], {'ok': False, 'answer': '', 'verified': False,
+                                                     'log': op.steps[-2]['log']})
+        self.assertNotIn('program', op.segments[2])
         self.assertEqual((op.returncode, op.attempts[0].kind), (124, 'timed_out'))
         self.assertNotIn('reset run', self.tcl())
         self.assertPending(op)
@@ -886,13 +1071,22 @@ class Programming(SessionCase):
     def test_an_interrupt_during_programming_carries_the_segments(self):
         old = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, old)
-        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
-        timer.start()
-        self.addCleanup(timer.cancel)
-        with self.assertRaises(KeyboardInterrupt) as cm:
-            self.flash_op(timeout=30, script={'program_esp#1': 'hang'})
+
+        def interrupt_once_the_write_is_outstanding():
+            for _ in range(200):
+                if any(e.get('gated', '').startswith('flash write_image') for e in self.events()):
+                    os.kill(os.getpid(), signal.SIGINT)
+                    return
+                time.sleep(0.1)
+        watcher = threading.Thread(target=interrupt_once_the_write_is_outstanding, daemon=True)
+        watcher.start()
+        self.addCleanup(watcher.join, 30)
+        with self.assertRaises(KeyboardInterrupt) as cm:     # the gate never opens: the write stays outstanding
+            self.flash_op(timeout=30, script={self.script_key(1, self.WRITE): f'gate:{self.root / "never"}'})
         op = cm.exception.operation
         self.assertEqual(len(op.segments), 3)
+        self.assertEqual((op.segments[0]['program']['ok'], op.segments[0]['program']['verified']), (False, False))
+        self.assertNotIn('program', op.segments[1])
         self.assertEqual(op.session['security'], SECURITY)
         self.assertPending(op)
 
@@ -913,7 +1107,7 @@ class Programming(SessionCase):
 
     def test_an_unprobed_bank_is_refused_before_any_write(self):
         op = self.flash_op(bank=0)
-        self.assertNotIn(self.program_cmds(op)[0], self.tcl())
+        self.assertFalse([c for c in self.tcl() if c.startswith('flash write_image')])
         self.assertIn('not a probed whole-flash bank', op.session['failure'])
         self.assertEnded(op)
 
@@ -944,6 +1138,11 @@ class Reset(SessionCase):
         self.assertEqual(op.returncode, 0)
         self.assertFalse(hasattr(op, 'segments'))
         self.assertEnded(op)
+
+    def test_an_event_failure_on_reset_run_is_pending(self):
+        op = self.reset(script={'reset run': 'event:reset-assert-post'})
+        self.assertEqual((op.returncode, self.tcl()), (1, ['token?', 'init', 'reset run']))
+        self.assertPending(op)
 
     def test_an_init_outstanding_at_the_timeout_is_pending(self):
         op = self.reset(timeout=2, script={'init': 'hang'})
@@ -1055,6 +1254,28 @@ class End(SessionCase):
         rc, result = self.end(path)
         self.assertEqual(result['outcome'], 'failed')
         self.assertEqual(self.after(n), ['token?', 'done?', 'reset run'])
+        self.assertKept(path, rc)
+
+    def test_an_event_failure_on_reset_run_is_never_followed_by_shutdown(self):
+        path = self.pending({'reset run': 'event:reset-assert-post'})
+        n = len(self.tcl())
+        rc, result = self.end(path)
+        self.assertEqual((result['outcome'], result['events']),
+                         ('failed', ['event reset-assert-post failed on esp32p4.hp.cpu0']))
+        self.assertTrue(result['resetRun'].startswith('HIL-OK'))
+        self.assertEqual(self.after(n), ['token?', 'done?', 'reset run'])
+        self.assertNotEqual(self.receipt(path).get('cleanup'), 'done')
+        self.assertKept(path, rc)
+
+    def test_an_unreadable_log_for_reset_run_is_never_followed_by_shutdown(self):
+        path = self.pending()
+        n = len(self.tcl())
+        with self.unreadable_log():
+            rc, result = self.end(path)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertIn("'reset run' failed: its log could not be read", result['error'])
+        self.assertEqual(self.after(n), ['token?', 'done?', 'reset run'])
+        self.assertNotEqual(self.receipt(path).get('cleanup'), 'done')
         self.assertKept(path, rc)
 
     def test_a_server_still_running_after_shutdown_keeps_the_receipt(self):
