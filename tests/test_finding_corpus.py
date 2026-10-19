@@ -343,14 +343,16 @@ if __name__ == '__main__':
 
 
 FAKE_CLAUDE = r"""#!/usr/bin/env python3
-import json, os, re, sys
+import json, os, re, sys, uuid
 if '--version' in sys.argv:
     print('0.0.0 (fake)')
     sys.exit(0)
 prompt = sys.stdin.buffer.read().decode('utf-8')
 schema = json.loads(sys.argv[sys.argv.index('--json-schema') + 1])
-with open(os.environ['FAKE_LOG'], 'a') as log:
-    log.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': prompt}) + '\n')
+# a file per run: concurrent appends to one file interleave on Windows
+os.makedirs(os.environ['FAKE_LOG'], exist_ok=True)
+with open(os.path.join(os.environ['FAKE_LOG'], f'{uuid.uuid4().hex}.json'), 'x') as log:
+    log.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'prompt': prompt}))
 def verdict(why):
     if 'garble me' in why:
         return {'real': 'yes', 'reason': 'not the schema'}
@@ -384,7 +386,7 @@ class Replay(unittest.TestCase):
         self.root = Path(td.name)
         self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         self.env.update({'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
-                         'FAKE_LOG': str(self.root / 'fake.log'), 'HOME': str(self.root / 'home'),
+                         'FAKE_LOG': str(self.root / 'fake-log'), 'HOME': str(self.root / 'home'),
                          'USERPROFILE': str(self.root / 'home')})
         (self.root / 'home').mkdir()
         bin_dir = self.root / 'bin'
@@ -415,6 +417,9 @@ class Replay(unittest.TestCase):
     def digest(path):
         return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
+    def fake_runs(self):
+        return [json.loads(f.read_text(encoding='utf-8')) for f in (self.root / 'fake-log').glob('*.json')]
+
     def corpus(self):
         def one(i, line, why, needs='none', label='true'):
             return {'id': f'c{i}', 'repo': 'o/r', 'pr': 1, 'head': self.head, 'base': self.base, 'dir': 'src',
@@ -443,7 +448,7 @@ class Replay(unittest.TestCase):
         self.assertEqual(sorted((c['label'], tuple(c['caseIds'])) for c in calls['batch']),
                          [('verify:b0', ('c0', 'c1')), ('verify:d0x0:1', ('c2',))], 'the hardware case stays alone')
         self.assertTrue(all(c['prompt'] and c['schema'] for c in calls['batch']), 'each dispatch keeps what it was sent')
-        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text(encoding='utf-8').splitlines()]
+        logged = self.fake_runs()
         self.assertTrue(all(Path(x['cwd']).resolve() == (self.root / 'wt' / f'o-r-{self.head[:12]}').resolve() for x in logged))
         self.assertTrue(all(x['argv'][:7] == ['-p', '--agent', 'finding-verifier', '--model', 'opus', '--effort', 'high'] for x in logged))
         self.assertFalse(any('agreed' in x['prompt'] or '"label"' in x['prompt'] for x in logged), 'no truth reaches a verifier')
@@ -518,7 +523,7 @@ class Replay(unittest.TestCase):
         calls = [json.loads(l) for l in (out / 'calls.jsonl').read_text(encoding='utf-8').splitlines()]
         self.assertEqual(sorted((c['head'][:12], c['label'], tuple(c['caseIds'])) for c in calls if c['head'] == head2),
                          [(head2[:12], 'verify:d0x0:0', ('d0',)), (head2[:12], 'verify:d0x1:0', ('d1',))], 'scan:d0x1 is the second dimension')
-        logged = [json.loads(l) for l in (self.root / 'fake.log').read_text(encoding='utf-8').splitlines()]
+        logged = self.fake_runs()
         self.assertEqual({Path(x['cwd']).name for x in logged}, {f'o-r-{self.head[:12]}', f'o-r-{head2[:12]}'})
 
     def test_a_failing_head_stops_the_other_heads_dispatches_and_keeps_their_calls(self):
@@ -581,7 +586,7 @@ class Replay(unittest.TestCase):
             _, err = self.replay('single', corpus, ok=False)
             self.assertIn('REPLAY_CLAUDE must be a JSON array of nonempty strings', err, repr(bad))
         self.env['REPLAY_CLAUDE'] = stand_in
-        self.assertFalse((self.root / 'fake.log').exists(), 'no verifier was started')
+        self.assertEqual(self.fake_runs(), [], 'no verifier was started')
         self.replay('single', Path('corpus.jsonl'), '--worktrees', 'wt2', out='relative')
         self.assertTrue((self.root / 'relative' / 'verdicts.jsonl').exists(), 'relative paths resolve against the caller')
         self.assertTrue((self.root / 'wt2' / f'o-r-{self.head[:12]}' / 'src' / 'x.c').exists(), 'not inside the checkout')
