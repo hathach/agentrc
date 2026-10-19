@@ -378,6 +378,9 @@ async function run(opts = {}) {
       // none of the PR's id spaces (noTarget), it names a review body
       // (reviewBody) or the receipts are reshaped (receipts).
       const entries = JSON.parse(String(prompt).match(/Manifest: (\{.*\})$/)[1]).replies
+      // reply.py's error line before anything is posted (replyError), as the relay is told to return it.
+      const scriptError = opts.replyError && opts.replyError(label)
+      if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
       const failed = opts.dropDoneIds && opts.dropDoneIds(label)
       const receipt = ({ commentId, digest }) => failed
         ? { commentId, kind: 'review', replyId: null, digest, sent: false, posted: false, verified: false, resolved: null, error: 'posting failed' }
@@ -471,6 +474,8 @@ async function run(opts = {}) {
     }
     if (label.startsWith('reuse#')) {
       if (opts.reuse === null) return null
+      const scriptError = opts.replyError && opts.replyError(label)
+      if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
       const { reuses } = payloadOf(prompt, 'Reuses')
       return conforms(options.schema, { receipts: printed(reuses.map(u => ({
         commentId: u.commentId, kind: 'review', replyId: u.replyId, digest: u.bodyDigest,
@@ -3712,6 +3717,32 @@ test('a repair obligation survives a restart and still blocks a repost', async (
   assert.match(debtOf(first.result, 2).repair.error, /^read-back mismatch on body/)
   assert.equal(second.calls.some(c => c.label.startsWith('replies#')), false, 'reposted over a reply that needs repair')
   assert.ok(second.result.handoffs.some(h => h.commentId === 2), 'the restored repair is still handed off')
+})
+
+const RATE = 'gh: API rate limit exceeded for user ID 249515 (HTTP 403)'
+
+test('reply.py\'s error line fails the batch with that error, not a seal mismatch or a retry (#115)', async () => {
+  const { result, labels, logs } = await run({ reviews: oneValid, replyError: (label) => label.startsWith('resolve#') && RATE, args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(labels.some(l => /^resolve#1\.retry/.test(l)), false, 'an error line is an answer: no Sonnet retry')
+  assert.equal(logs.some(l => /does not match its seal/.test(l)), false)
+  assert.ok(logs.some(l => l.includes(`resolve#1 incomplete — reply.py: ${RATE}`)), logs.join('\n'))
+  assert.equal(result.history[0].fixNotePosts.detail, `reply.py: ${RATE}`)
+})
+
+test('reply.py\'s error line refuses a settlement with that error (#115)', async () => {
+  const { edited, at, state, settlement } = await reanswered()
+  const { result } = await run({ reviews: edited, preflight: at, replyError: (label) => label.startsWith('reuse#') && RATE, args: { ...YIELD, maxCycles: 6, state, replySettlements: [settlement] } })
+  assert.deepEqual(result.settlements, [{ commentId: 1, outcome: 'refused', why: `reply.py: ${RATE}` }])
+})
+
+test('receipts beside an error are not trusted: an error line carries no seal to check them by (#115)', async () => {
+  const withError = (label, line) => line && /^(resolve|reuse)#/.test(label) ? { ...line, error: 'HTTP 403', seal: 'bad-seal' } : line
+  const { result } = await run({ reviews: oneValid, garble: withError, args: { autoPush: true, maxCycles: 1 } })
+  assert.equal(result.history[0].fixNotePosts.pass, false)
+  assert.equal(result.state.answeredWith.some(([id]) => id === 1), false)
+  const { edited, at, state, settlement } = await reanswered()
+  const reused = await run({ reviews: edited, preflight: at, garble: withError, args: { ...YIELD, maxCycles: 6, state, replySettlements: [settlement] } })
+  assert.deepEqual(reused.result.settlements, [{ commentId: 1, outcome: 'refused', why: 'reply.py: HTTP 403' }])
 })
 
 // Comment 2 was answered by a reply (502) whose body reply.py will not post over.

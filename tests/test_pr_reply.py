@@ -153,7 +153,7 @@ class ReplyCase(unittest.TestCase):
 
     def receipts(self, out):
         """The printed receipts, with the nulls the script leaves out put back as pr-babysit does."""
-        if not out:
+        if not out or 'error' in out:
             return None
         for r in out['receipts']:
             self.assertNotIn(None, (r.get('resolved', False), r.get('error', '')), 'a null resolved or error is printed')
@@ -331,6 +331,20 @@ class ReplyTest(ReplyCase):
                 rc, receipts = self.run_script(bad)
                 self.assertEqual(rc, 2)
                 self.assertEqual(self.gh.calls, [])
+
+    def test_an_early_failure_ends_stdout_with_an_error_line(self):
+        # A relay copies the last stdout line: with none it improvises (#115).
+        with redirect_stderr(io.StringIO()):
+            rc, out = self.main('--manifest', self.json_file({'replies': []}))
+        self.assertEqual(rc, 2)
+        self.assertEqual(list(out), ['error'])
+        self.gh.down.add('user')
+        with redirect_stderr(io.StringIO()):
+            rc, out = self.main('--manifest', self.json_file({'replies': [{'commentId': 10, 'body': 'ok', 'digest': reply.fnv1a('ok')}]}))
+        self.assertEqual(rc, 2)
+        self.assertEqual(list(out), ['error'])
+        self.assertIn('HTTP 404', out['error'])
+        self.assertEqual(self.gh.mutations, [])
 
     def test_digest_mismatch_posts_nothing(self):
         self.gh.review_comment(10)
@@ -512,7 +526,7 @@ class ReceiptFileTest(ReplyCase):
                              (json.dumps(saved), 'another request'), (json.dumps(tampered), 'seal')]:
             Path(path).write_text(content)
             rc, out, err = self.run_saved(path, body='other words' if why == 'another request' else 'not so')
-            self.assertEqual((rc, out), (2, ''), why)
+            self.assertEqual((rc, list(json.loads(out))), (2, ['error']), why)
             self.assertIn(why, err)
         self.assertEqual(len(self.gh.mutations), 2, 'only the first run posted')
 
@@ -764,9 +778,11 @@ class ReconcileTest(ReplyCase):
         self.assertEqual(self.gh.mutations, [])
 
     def test_bad_pairs_and_reuse_files_are_usage_errors(self):
-        with self.assertRaises(SystemExit) as e:
-            self.main('--inspect', '20-901')
+        out = io.StringIO()
+        with self.assertRaises(SystemExit) as e, redirect_stdout(out), redirect_stderr(io.StringIO()):
+            reply.main(['--pr', str(PR), '--repo', REPO, '--inspect', '20-901'])
         self.assertEqual(e.exception.code, 2)
+        self.assertEqual(list(json.loads(out.getvalue().strip().splitlines()[-1])), ['error'], 'a usage error ends stdout with an error line too')
         path = self.json_file({'reuses': [{'commentId': 20, 'replyId': 901, 'bodyDigest': 'x'}]})
         self.assertEqual(self.main('--reuse', path)[0], 2)
         dup = {'commentId': 20, 'replyId': 901, 'bodyDigest': 'x', 'originalDigest': 'y'}

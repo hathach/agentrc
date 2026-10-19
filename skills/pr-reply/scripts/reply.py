@@ -38,7 +38,8 @@ reply may exist), posted that GitHub answered it, verified is true on a
 matching read-back, false on a mismatch and null when the read-back could not
 be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
-reply, resolved; 1 otherwise; 2 on a usage or manifest error. A null resolved or
+reply, resolved; 1 otherwise; 2 on a usage or manifest error, or a GitHub failure
+before any reply, with {"error": ...} as the last stdout line. A null resolved or
 error is left out of the line: a model relaying it drops a trailing null.
 
 --inspect reads, never writes: for each pair, whether REPLY is ours answering
@@ -512,8 +513,21 @@ def saved_receipt(path, request):
     return line, saved['code']
 
 
+def failed(message):
+    """Exit 2 before anything is posted: a relay copies the last stdout line, and with none it improvises (#115)."""
+    print(f'reply.py: {message}', file=sys.stderr)
+    print(json.dumps({'error': message}))
+    return 2
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        print(json.dumps({'error': f'usage: {message}'}))
+        super().error(message)
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--pr', type=int)
     mode = p.add_mutually_exclusive_group()
     mode.add_argument('--manifest')
@@ -539,8 +553,7 @@ def main(argv=None):
                    'entries': replies or reuses or edits}
         saved = saved_receipt(a.receipt, request) if a.receipt else None
     except (OSError, ValueError, json.JSONDecodeError) as e:
-        print(f'reply.py: {e}', file=sys.stderr)
-        return 2
+        return failed(str(e))
     if saved:
         print(json.dumps(saved[0]))
         return saved[1]
@@ -548,14 +561,12 @@ def main(argv=None):
     if not repo:
         rc, out, err = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'])
         if rc != 0:
-            print(f'reply.py: {err.strip()}', file=sys.stderr)
-            return 2
+            return failed(err.strip())
         repo = out.strip()
     try:
         poster = Poster(repo, a.pr)
     except ApiError as e:
-        print(f'reply.py: {e}', file=sys.stderr)
-        return 2
+        return failed(str(e))
     if a.inspect:
         inspected = [inspect(poster, c, r) for c, r in a.inspect]
         print(json.dumps(sealed({'inspected': inspected})))

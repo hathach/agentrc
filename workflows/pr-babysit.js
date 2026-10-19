@@ -654,6 +654,7 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
   `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
+  'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\'. ' +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 )
@@ -677,6 +678,7 @@ const RECEIPTS = withSeal({
   type: 'object', additionalProperties: false,
   required: ['receipts'],
   properties: {
+    error: { type: 'string' },
     receipts: {
       type: 'array',
       items: {
@@ -1601,7 +1603,8 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
     `Manifest: ${JSON.stringify({ replies })}`)
   const expected = new Map(replies.map(r => [r.commentId, r.digest]))
-  const receipts = out ? out.receipts.filter(r => expected.has(r.commentId)) : []
+  // An error line skips the seal check, so receipts beside it prove nothing.
+  const receipts = out && !out.error ? out.receipts.filter(r => expected.has(r.commentId)) : []
   const settled = new Set()
   const replied = []
   for (const [commentId, digest] of expected) {
@@ -1635,7 +1638,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   const gone = [...expected.keys()].filter(id => retired.has(id))
   const receipt = {
     pass: missing.length === 0,
-    detail: !out ? 'agent died'
+    detail: !out ? 'agent died' : out.error ? `reply.py: ${out.error}`
       : [missing.length ? `unsettled: ${missing.join(', ')}` : gone.length < expected.size ? 'posted and read back' : '',
         gone.length ? `not on the PR, nothing owed: ${gone.join(', ')}` : ''].filter(Boolean).join('; '),
     receipts, replied,
@@ -1762,10 +1765,10 @@ const settleCaller = async (cycle, digestOf, held, ended) => {
     `Reuses: ${JSON.stringify({ reuses: ready.map(s => ({ commentId: s.commentId, replyId: s.replyId, bodyDigest: s.bodyDigest, originalDigest: s.commentDigest })) })}`)
   const settled = []
   for (const s of ready) {
-    const mine = (out ? out.receipts : []).filter(r => r.commentId === s.commentId)
+    const mine = (out && !out.error ? out.receipts : []).filter(r => r.commentId === s.commentId)
     const r = mine.length === 1 ? mine[0] : null
     if (!r || r.replyId !== s.replyId || r.digest !== s.bodyDigest || r.sent || r.posted || !settles(r)) {
-      refuse(s, r ? r.error || 'reuse not verified' : 'no reuse receipt')
+      refuse(s, r ? r.error || 'reuse not verified' : out && out.error ? `reply.py: ${out.error}` : 'no reuse receipt')
       continue
     }
     // A marking our earlier answer still owes keeps that answer (a correction cancelled any it disproved); else the caller's answer owes one when its settlement names how.

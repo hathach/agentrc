@@ -57,7 +57,8 @@ thread was resolved, false when GitHub refused to resolve it, left out when
 unknown: for the two kinds without a thread, or when an API error cut the
 resolve short), `error` (left out when there is none). Exit 0 when every reply is verified
 and every review thread resolved, 1 otherwise, 2 for a bad manifest or an
-unreachable repo. `sent` and `posted` describe the run that recorded them, so a
+unreachable repo, which posts nothing and ends stdout with `{"error": ...}` (a GitHub rate limit
+included). `sent` and `posted` describe the run that recorded them, so a
 rerun that finds its earlier post reports both false; `verified` and `resolved`
 say whether the reply stands. A caller that may lose a run's output passes
 `--receipt <path>`: the same path again to get that run's receipt back, a
