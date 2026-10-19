@@ -182,12 +182,14 @@ def flock_nb(board: str):
 def write_record(fh, reason: str, **extra) -> None:
     """Holder record; the flock itself is already held. Raises OSError on a write failure: a
     hold whose record is missing is invisible to status/release, so every caller refuses it.
-    `extra` adds a tool's own fields (hil_reserve: token, start, locks, role)."""
-    fh.truncate(0)
+    `extra` adds a tool's own fields (hil_reserve: token, start, locks, role). Overwritten in
+    place, then cut to length: an interrupted rewrite leaves the old record or an unreadable
+    one, never the empty record a blocker would vanish as."""
     fh.seek(0)
     json.dump({'pid': os.getpid(), 'reason': reason,
                'since': time.strftime('%Y-%m-%dT%H:%M:%S%z'), **extra}, fh)
     fh.flush()
+    fh.truncate()
 
 
 def clear_record(fh) -> None:
@@ -478,12 +480,41 @@ def _write_journal(dfd, board, content) -> None:
     """Replace <board>.takeover durably: a crash leaves the old journal or the new one."""
     tmp = f'.{board}{JOURNAL}.{os.getpid()}.{secrets.token_hex(4)}'
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    try:
+        os.fchmod(fd, 0o644)                # umask-proof: another OS user's takeover reads it
+    except OSError:
+        os.close(fd)
+        raise
     with os.fdopen(fd, 'wb') as f:          # a buffered write is all or an exception
         f.write(json.dumps(content).encode())
         f.flush()
         os.fsync(f.fileno())
     os.rename(tmp, board + JOURNAL, src_dir_fd=dfd, dst_dir_fd=dfd)
     os.fsync(dfd)
+
+
+def _foreign_journals(boards) -> str:
+    """The journals of `boards` this user cannot replace, or '': a sticky dir lets only a
+    file's owner, the dir's owner or root rename over or unlink it."""
+    euid = os.geteuid()
+    if euid == 0:
+        return ''
+    dfd = _open_dir()
+    try:
+        st = os.fstat(dfd)
+        if not st.st_mode & stat.S_ISVTX or st.st_uid == euid:
+            return ''
+        foreign = []
+        for b in boards:
+            try:
+                uid = os.stat(b + JOURNAL, dir_fd=dfd, follow_symlinks=False).st_uid
+            except FileNotFoundError:
+                continue
+            if uid != euid:
+                foreign.append(f'{b}{JOURNAL} (uid {uid})')
+    finally:
+        os.close(dfd)
+    return ', '.join(foreign)
 
 
 def _drop_flocks(handles) -> None:
@@ -501,7 +532,8 @@ def take_over(board: str, reason: str, detail=''):
     its predecessor's record bytes and any earlier journal, then a cleanup-holder record:
     a crash anywhere leaves a journal, so the boards stay blocked. Only release_token of
     this live holder, after the recovery succeeded, clears records and journals.
-    Run only under a recovery dispatch naming these boards."""
+    Run only under a recovery dispatch naming these boards, as the OS user owning any
+    journal on them, or root."""
     try:
         boards = _lock_set(board)
     except OSError as e:
@@ -524,6 +556,16 @@ def take_over(board: str, reason: str, detail=''):
         _drop_flocks(handles)
         raise LockUnavailable(f'takeover of {board}: its lock set changed while it was taken '
                               f'({boards} -> {again}); nothing modified, run it again')
+    try:
+        foreign = _foreign_journals(boards)
+    except OSError as e:
+        _drop_flocks(handles)
+        raise _unavailable(e) from e
+    if foreign:
+        _drop_flocks(handles)
+        raise LockUnavailable(f'takeover of {board}: {foreign} belong to another OS user, and the sticky '
+                              f'lock dir lets only their owner or root replace them; nothing modified: run '
+                              f'the takeover and its `release --token` as that user or root')
     token = secrets.token_hex(8)
     try:
         fields = holder_fields(token, boards)
@@ -632,11 +674,13 @@ def cmd_hold(boards, reason, take_over_board=None):
     if devnull > 2:
         os.close(devnull)
 
-    def report(text):
+    def report(text) -> bool:
+        """False when the parent is gone or stopped waiting (EPIPE): it reports a failure."""
         try:
             os.write(w_fd, text.encode())
+            return True
         except OSError:
-            pass
+            return False
 
     if take_over_board:
         # a takeover holder is a cleanup holder: SIGTERM never ends it, release --token does
@@ -651,7 +695,8 @@ def cmd_hold(boards, reason, take_over_board=None):
             os._exit(0)
 
         signal.signal(signal.SIGUSR1, _recovered)    # before readiness: the token works at once
-        report(f'1{token} {", ".join(handles)}')
+        if not report(f'1{token} {", ".join(handles)}'):
+            os._exit(1)        # no end_takeover: the journals and records stay recovery blockers
         os.close(w_fd)
         while True:
             signal.pause()
@@ -674,7 +719,7 @@ def cmd_hold(boards, reason, take_over_board=None):
             mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
             handles.append(take_board_lock(b, reason, holder=HOLD_KIND, start=start))
             signal.pthread_sigmask(signal.SIG_SETMASK, mask)
-        report('1')
+        ready = report('1')
     except (BoardLocked, LockUnavailable) as e:
         # lost a race, a blocker, or a record failed: clear every record we wrote (the
         # flocks go with the exit) so no stale owned record outlives this holder
@@ -685,6 +730,8 @@ def cmd_hold(boards, reason, take_over_board=None):
         else:
             report(f'0{b}: {e}')
         os._exit(1)  # parent reports the failure
+    if not ready:
+        _bow_out()   # the parent reported a failure: a hold it never announced must not stay
     os.close(w_fd)
     while True:
         signal.pause()

@@ -495,15 +495,77 @@ class DetachedHolder(LockDir):
         with open(hil_lock.lock_path(other), 'r+') as fh:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)       # free too
 
+    def lose_readiness(self, waits_in):
+        """cmd_hold whose parent stops waiting (its select times out, the read end closes)
+        before the holder, held back in `waits_in` until then, reports readiness. Returns a
+        wait for the holder's exit, True once it is gone."""
+        closed, holder = Path(self.dir, 'parent-closed'), Path(self.dir, 'holder-pid')
+        real = getattr(hil_lock, waits_in)
+
+        def then_wait(*a, **k):                 # runs in the forked holder
+            holder.write_text(str(os.getpid()))
+            got = real(*a, **k)
+            deadline = time.monotonic() + 10
+            while not closed.exists() and time.monotonic() < deadline:
+                _sleep(0.01)
+            return got
+
+        def timed_out(rlist, *_):
+            null = os.open(os.devnull, os.O_RDONLY)
+            os.dup2(null, rlist[0])              # closes the pipe's only read end
+            os.close(null)
+            closed.touch()
+            return [], [], []
+        self.patch(hil_lock, waits_in, then_wait)
+        self.patch(hil_lock.select, 'select', timed_out)
+
+        def gone():
+            deadline = time.monotonic() + 10
+            while not holder.exists() and time.monotonic() < deadline:
+                _sleep(0.01)
+            pid = int(holder.read_text())
+            self.addCleanup(self.kill_quietly, pid, signal.SIGKILL)     # a takeover holder ignores SIGTERM
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                _sleep(0.02)
+            return False
+        return gone
+
+    def test_a_holder_whose_readiness_is_lost_leaves_no_owned_record(self):
+        other = BOARD + '-2'
+        gone = self.lose_readiness('take_board_lock')
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 1)
+        self.assertIn('holder failed to acquire locks', err.getvalue())
+        self.assertTrue(gone())
+        self.assertIsNone(hil_lock.read_record(BOARD))
+        self.assertIsNone(hil_lock.read_record(other))
+        self.assertTrue(self.flock_is_free())
+
+    def test_a_takeover_whose_readiness_is_lost_stays_a_recovery_blocker(self):
+        Takeover.blocked(self)
+        gone = self.lose_readiness('take_over')
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([], 'selftest recovery', take_over_board=BOARD), 1)
+        self.assertTrue(gone())
+        self.assertTrue(self.flock_is_free())
+        self.assertEqual(hil_lock.read_record(BOARD)['role'], 'cleanup-holder')
+        self.assertIsNotNone(hil_lock.journal_state(BOARD))
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            self.acquire()
+
     def wait_cleared(self, boards):
         deadline = time.monotonic() + 10
         while any(hil_lock.read_record(b) for b in boards) and time.monotonic() < deadline:
             _sleep(0.02)
 
     @staticmethod
-    def kill_quietly(pid):
+    def kill_quietly(pid, sig=signal.SIGTERM):
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, sig)
         except ProcessLookupError:
             pass
 
@@ -555,6 +617,7 @@ class SafeFiles(LockDir):
             with self.subTest(name=bad), self.assertRaisesRegex(hil_lock.LockUnavailable, 'invalid board lock name'):
                 hil_lock.take_board_lock(bad, 'selftest')
 
+    @unittest.skipIf(os.geteuid() == 0, 'a dir root owns passes as root-owned')
     def test_a_dir_another_user_owns_needs_the_sticky_bit(self):
         self.patch(hil_lock.os, 'geteuid', lambda: os.getuid() + 1)    # the dir is now "someone else's"
         os.chmod(self.dir, 0o777)
@@ -571,6 +634,10 @@ class SafeFiles(LockDir):
         self.acquire()
         self.assertEqual(stat.S_IMODE(os.stat(sub).st_mode), 0o755)
         self.assertEqual(stat.S_IMODE(os.stat(hil_lock.lock_path(BOARD)).st_mode), 0o666)
+        _, handles = hil_lock.take_over(BOARD + '-2', 'selftest recovery')
+        self.addCleanup(hil_lock.end_takeover, handles)
+        journal = os.path.join(sub, BOARD + '-2' + hil_lock.JOURNAL)
+        self.assertEqual(stat.S_IMODE(os.stat(journal).st_mode), 0o644)   # another OS user's takeover reads it
 
     def test_a_create_refused_by_the_dir_names_the_host_step(self):
         os.chmod(self.dir, 0o555)
@@ -692,6 +759,31 @@ class RecoveryBlockers(LockDir):
         self.dead_record(reason='hil_test.py')
         self.assertIsNotNone(self.acquire())
 
+    def test_a_rewrite_of_a_protected_record_killed_at_any_step_still_blocks(self):
+        class KilledAt:
+            """The record handle; its process is killed, unflushed, at the first call of `step`."""
+            def __init__(self, fh, step):
+                self.fh, self.step = fh, step
+
+            def __getattr__(self, name):
+                if name == self.step:
+                    os._exit(9)
+                return getattr(self.fh, name)
+        for step in ('seek', 'write', 'flush', 'truncate'):
+            with self.subTest(killed_at=step):
+                pid = os.fork()
+                if pid == 0:               # a protected reservation turning cleanup holder
+                    try:
+                        fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True, locks=[BOARD, 'x' * 40])
+                        hil_lock.write_record(KilledAt(fh, step), 'selftest', role='cleanup-holder')
+                    finally:
+                        os._exit(1)
+                self.assertEqual(os.waitpid(pid, 0)[1] >> 8, 9)
+                self.assertNotIn(hil_lock.record_state(BOARD)[0], ('absent', 'empty'))
+                with self.assertRaises(hil_lock.RecoveryBlocked):
+                    self.acquire()
+                os.unlink(hil_lock.lock_path(BOARD))
+
     def test_a_protected_taker_ends_with_release_board_lock(self):
         fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True)
         self.assertIs(hil_lock.read_record(BOARD)['protected'], True)
@@ -791,6 +883,26 @@ class Takeover(LockDir):
         hil_lock.end_takeover(handles)
         self.assertEqual(hil_lock.journal_names(), [])
         self.assertIsNotNone(self.acquire())
+
+    def test_another_users_journal_is_refused_naming_its_owner_before_anything_changes(self):
+        self.blocked([BOARD, self.OTHER])
+        _, handles = hil_lock.take_over(BOARD, 'selftest recovery')
+        hil_lock._drop_flocks(handles)               # that taker died
+        files = [hil_lock.lock_path(b) for b in (BOARD, self.OTHER)] + \
+                [os.path.join(self.dir, b + hil_lock.JOURNAL) for b in (BOARD, self.OTHER)]
+        before = [Path(f).read_bytes() for f in files]
+        os.chmod(self.dir, 0o1777)
+        self.patch(hil_lock.os, 'geteuid', lambda: os.getuid() + 1)     # its journals are another user's
+
+        def sticky(*a, **k):
+            raise PermissionError(1, 'Operation not permitted')
+        self.patch(hil_lock.os, 'rename', sticky)
+        with self.assertRaisesRegex(hil_lock.LockUnavailable,
+                                    rf'\(uid {os.getuid()}\).*owner or root.*nothing modified'):
+            hil_lock.take_over(BOARD, 'selftest recovery again')
+        self.assertEqual([Path(f).read_bytes() for f in files], before)
+        with self.assertRaises(hil_lock.RecoveryBlocked):                # every flock dropped
+            self.acquire()
 
     def test_token_release_of_a_dead_taker_is_refused(self):
         self.blocked()
