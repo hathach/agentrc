@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-      - run: python -m pip install pyyaml pre-commit
+      - run: python -m pip install pyyaml pre-commit pytest==9.1.1 pytest-xdist==3.8.0
       # an environment of its own: MSYS2's poppler brings a Python that would shadow this one on PATH
       - if: runner.os == 'Windows'
         run: |
@@ -41,4 +41,4 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq poppler-utils
       - name: optional tools found
         run: python -c "import shutil; [print(t, shutil.which(t)) for t in 'python node git bash jq awk pdfinfo pdftotext tshark editcap capinfos openocd kicad-cli xvfb-run pre-commit'.split()]"
-      - run: python -X utf8 -m unittest discover -s tests -v
+      - run: python -X utf8 -m pytest -n 8 -p no:cacheprovider --durations=40 tests
