@@ -136,12 +136,12 @@ const conforms = (schema, value, at) => {
 
 // state_transfer.py's envelope for a saved output holding `state`, all chunks or `chunks` ("1,3").
 const STATE_TRANSFER = fileURLToPath(new URL('../skills/pr-babysit/scripts/state_transfer.py', import.meta.url))
-const transferOf = (state, chunks) => {
+const transferOf = (state, chunks, pad) => {
   const dir = mkdtempSync(join(tmpdir(), 'pr-babysit-state-'))
   try {
     const file = join(dir, 'w.output')
     writeFileSync(file, JSON.stringify({ result: { state } }))
-    const done = spawnSync('python3', [STATE_TRANSFER, file, ...(chunks ? ['--chunks', chunks] : [])], { encoding: 'utf8' })
+    const done = spawnSync('python3', [STATE_TRANSFER, file, ...(chunks ? ['--chunks', chunks] : []), ...(pad ? ['--pad'] : [])], { encoding: 'utf8' })
     return JSON.parse(done.stdout.trim().split('\n').at(-1))
   } finally { rmSync(dir, { recursive: true, force: true }) }
 }
@@ -215,7 +215,8 @@ async function run(opts = {}) {
       // The real state_transfer.py on a saved output holding opts.load, then
       // opts.copy(envelope, label) for what the loader agent hands back.
       if (opts.load instanceof Error) throw opts.load
-      const envelope = transferOf(opts.load, (String(prompt).match(/ --chunks ([\d,]+)\n/) || [])[1])
+      const asked = String(prompt).match(/ --chunks ([\d,]+)( --pad)?\n/) || []
+      const envelope = transferOf(opts.load, asked[1], !!asked[2])
       const answer = opts.copy ? await opts.copy(envelope, label) : envelope
       return answer === null ? null : conforms(options.schema, answer, label)
     }
@@ -6662,7 +6663,10 @@ const saved = async (findings) => {
 const REASON = 'SKILL.md:146 at head (144 at eda9a913) — é ✓ "q" \\ end'
 const savedForLoad = () => saved([invalidFinding({ reason: REASON })])
 const loadWith = (state, stateRef, copy) => run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state, copy })
-const asks = (calls) => calls.filter(c => c.label.startsWith('state:load#')).map(c => (c.prompt.match(/ --chunks ([\d,]+)\n/) || [null, 'all'])[1])
+const asks = (calls) => calls.filter(c => c.label.startsWith('state:load#')).map(c => {
+  const m = c.prompt.match(/ --chunks ([\d,]+)( --pad)?\n/)
+  return m ? m[1] + (m[2] ? '+pad' : '') : 'all'
+})
 const flip = (data) => (data[0] === 'A' ? 'B' : 'A') + data.slice(1)
 const once = (change) => (env, label) => label === 'state:load#1' ? change(structuredClone(env)) : env
 // The live loader's "correction" (146 -> 144) made in a chunk together with its
@@ -6734,6 +6738,29 @@ test('a mis-copied, missing or duplicated chunk is asked for again alone', async
     : { ...env, chunks: [...env.chunks, { ...transferOf(state).chunks[last] }] })
   assert.deepEqual(asks(extra.calls), ['all', '0'])
   assert.equal(extra.labels[2], 'preflight')
+})
+
+test('a chunk mis-copied the same way twice is asked again padded, so its text differs (#147)', async () => {
+  const { state, stateRef } = await savedForLoad()
+  // The relays keep the source's sum and alter the data, as wf_70c961b3-aea's did, on every unpadded copy of chunk 1.
+  const stubborn = (env) => {
+    if (!env.pad) for (const c of env.chunks) if (c.i === 1) c.data = flip(c.data)
+    return env
+  }
+  const got = await loadWith(state, stateRef, stubborn)
+  assert.deepEqual(asks(got.calls), ['all', '1', '1+pad'])
+  assert.equal(got.labels[3], 'preflight')
+  assert.deepEqual(got.result.state.decisions, state.decisions)
+  // Two rounds without progress end the load; an answer whose pad is not the one asked for is no answer.
+  const both = await loadWith(state, stateRef, (env) => { for (const c of env.chunks) if (c.i === 1) c.data = flip(c.data); return env })
+  assert.deepEqual(asks(both.calls), ['all', '1', '1+pad'])
+  assert.equal(both.result.reason, 'state-transfer-failed')
+  const unpadded = await loadWith(state, stateRef, (env, label) => label === 'state:load#3' ? { ...env, pad: false } : stubborn(env))
+  assert.equal(unpadded.result.reason, 'state-transfer-failed')
+  // Every plain copy failing makes two idle rounds before any padded ask: the load runs on until each chunk had one.
+  const all = await loadWith(state, stateRef, (env) => { if (!env.pad) for (const c of env.chunks) c.data = flip(c.data); return env })
+  assert.equal(asks(all.calls).at(-1).endsWith('+pad'), true, asks(all.calls).join(' '))
+  assert.deepEqual(all.result.state.decisions, state.decisions)
 })
 
 test('changed metadata, or a chunk changed with its sum, asks for the whole state again', async () => {

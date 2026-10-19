@@ -80,6 +80,18 @@ class StateTransferTest(unittest.TestCase):
                          {k: full[k] for k in ('v', 'digest', 'length', 'size')})
         self.assertEqual(part['chunks'][0], full['chunks'][2])
 
+    def test_pad_shifts_every_chunk_by_one_byte_so_its_text_changes(self):
+        # #147: relays re-copied the same 512-byte encoding of text ending "the ." wrong every time.
+        _, plain = self.run_script(self.file, '--chunks', '1,2')
+        code, padded = self.run_script(self.file, '--chunks', '1,2', '--pad')
+        self.assertEqual(code, 0)
+        self.assertEqual((plain['pad'], padded['pad']), (False, True))
+        for p, q in zip(plain['chunks'], padded['chunks']):
+            raw = base64.b64decode(q['data'], validate=True)
+            self.assertEqual(raw[:1], transfer.PAD)
+            self.assertEqual(raw[1:], base64.b64decode(p['data']))
+            self.assertEqual(q['sum'], transfer.fnv1a(q['data']))
+
     def test_a_bad_file_or_argument_is_an_error_line(self):
         total = count(self.run_script(self.file)[1])
         cases = [

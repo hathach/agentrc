@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Hand pr-babysit a saved state in a form no model can "correct" on the way.
 
-  state_transfer.py FILE [--chunks I,J,...]
+  state_transfer.py FILE [--chunks I,J,...] [--pad]
 
 FILE is a saved Workflow output holding {"result": {"state": ...}}. The state
 is serialized as compact ASCII JSON (every non-ASCII character escaped), cut
 into SIZE-byte slices, and each slice base64-encoded on its own, so a slice can
 be decoded and checked alone and a mis-copied one asked for again. Each chunk
 carries sum, the FNV-1a of its data as the workflow computes it: it locates a
-copy error, while the state's own seal stays the check on the whole.
+copy error, while the state's own seal stays the check on the whole. --pad
+encodes each slice behind one PAD byte: every base64 group then carries other
+bytes, so a chunk a model mis-copies the same way every time reads differently.
 
-stdout ends with one JSON line {v, digest, length, size, chunks: [{i, data,
+stdout ends with one JSON line {v, digest, length, size, pad, chunks: [{i, data,
 sum}]}: the first PER_CALL chunks, or those --chunks names, at most PER_CALL;
 a model copying more mangles or truncates them. Exit 0 with that line; exit 2
 with {"error": ...} when FILE holds no state, the state exceeds MAX bytes or
@@ -29,6 +31,7 @@ VERSION = 1
 SIZE = 512
 PER_CALL = 4
 MAX = 64 * 1024
+PAD = b' '
 
 
 def load(path):
@@ -64,6 +67,7 @@ def collect(argv):
     p = Parser(prog='state_transfer.py', add_help=False)
     p.add_argument('file')
     p.add_argument('--chunks')
+    p.add_argument('--pad', action='store_true')
     a = p.parse_args(argv)
     state = load(a.file)
     payload = json.dumps(state, ensure_ascii=True, separators=(',', ':')).encode('ascii')
@@ -73,9 +77,9 @@ def collect(argv):
     ids = wanted(a.chunks, count) if a.chunks is not None else range(min(count, PER_CALL))
     chunks = []
     for i in ids:
-        data = base64.b64encode(payload[i * SIZE:(i + 1) * SIZE]).decode('ascii')
+        data = base64.b64encode((PAD if a.pad else b'') + payload[i * SIZE:(i + 1) * SIZE]).decode('ascii')
         chunks.append({'i': i, 'data': data, 'sum': fnv1a(data)})
-    return {'v': VERSION, 'digest': state['digest'], 'length': len(payload), 'size': SIZE, 'chunks': chunks}
+    return {'v': VERSION, 'digest': state['digest'], 'length': len(payload), 'size': SIZE, 'pad': a.pad, 'chunks': chunks}
 
 
 if __name__ == '__main__':

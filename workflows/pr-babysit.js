@@ -166,7 +166,7 @@ if (args.stateRef != null) {
   const ENVELOPE = {
     type: 'object', additionalProperties: false,
     properties: {
-      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, error: { type: 'string' },
+      v: { type: 'integer' }, digest: { type: 'string' }, length: { type: 'integer' }, size: { type: 'integer' }, pad: { type: 'boolean' }, error: { type: 'string' },
       chunks: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { i: { type: 'integer' }, data: { type: 'string' }, sum: { type: 'string' } } } },
     },
@@ -176,13 +176,16 @@ if (args.stateRef != null) {
   let got = new Map()
   let idle = 0
   let call = 0
+  // Asks each chunk has failed: every second re-ask goes padded (#147), so a deterministic mis-copy reads other text.
+  const failed = new Map()
+  const padded = (i) => (failed.get(i) || 0) % 2 === 0 && failed.has(i)
   const reset = (reason) => { why = reason; length = 0; got = new Map() }
   const fresh = (env) => env.v === 1 && env.size === SIZE && Number.isInteger(env.length) && env.length > 0 && env.length <= MAX &&
     env.digest === ref.digest && Array.isArray(env.chunks)
-  const take = (env, asked) => {
+  const take = (env, asked, pad) => {
     if (!env) return false
     if (typeof env.error === 'string') { why = `state_transfer.py: ${env.error}`; return false }
-    if (!fresh(env)) { why = 'the envelope metadata is malformed'; return false }
+    if (!fresh(env) || env.pad !== pad) { why = 'the envelope metadata is malformed'; return false }
     if (length && env.length !== length) { reset('the envelope length changed'); return false }
     length = env.length
     const want = new Set(asked || indices().slice(0, PER_CALL))
@@ -191,24 +194,29 @@ if (args.stateRef != null) {
     let added = false
     for (const [i, c] of byIndex) {
       if (!c || !want.has(i) || typeof c.data !== 'string' || c.sum !== fnv1a(c.data)) continue
-      const bytes = fromBase64(c.data)
+      const raw = fromBase64(c.data)
+      const bytes = raw !== null && pad ? (raw[0] === ' ' ? raw.slice(1) : null) : raw
       if (bytes !== null && bytes.length === Math.min(SIZE, length - i * SIZE)) { got.set(i, bytes); added = true }
     }
     return added
   }
   const indices = () => [...Array(Math.ceil(length / SIZE)).keys()]
   const missingOf = () => indices().filter(i => !got.has(i))
-  for (let round = 1; args.state == null && idle < 2 && round <= ROUNDS; round++) {
+  // Idle rounds end the load only once every missing chunk was asked padded too.
+  const untried = () => length > 0 && missingOf().some(i => (failed.get(i) || 0) < 3)
+  for (let round = 1; args.state == null && (idle < 2 || untried()) && round <= ROUNDS; round++) {
     const missing = length ? missingOf() : null
-    const groups = missing ? groupsOf(missing, PER_CALL) : [null]
-    const replies = await parallel(groups.map(asked => () => agent(
-      `Run exactly: python3 ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}` : ''}\n` +
+    const groups = missing ? [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
+      : [{ asked: null, pad: false }]
+    const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
+      `Run exactly: python3 ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}${pad ? ' --pad' : ''}` : ''}\n` +
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
     ).catch(e => { why = `loader died: ${e && e.message}`; return null })))
     let added = false
-    replies.forEach((env, g) => { added = take(env, groups[g]) || added })
+    replies.forEach((env, g) => { added = take(env, groups[g].asked, groups[g].pad) || added })
+    for (const { asked } of groups) for (const i of asked || indices().slice(0, PER_CALL)) if (!got.has(i)) failed.set(i, (failed.get(i) || 0) + 1)
     const left = missingOf()
     idle = added && left.length ? 0 : idle + 1
     if (!length || left.length) { if (length) why = `chunks ${left.join(',')} missing or mis-copied`; continue }
