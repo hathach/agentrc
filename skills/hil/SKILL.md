@@ -122,6 +122,11 @@ recovery stay the contract's. Linux only.
   `ValueError` before the tool runs. Every call takes an explicit `timeout`;
   `run=` injects the caller's runner, by default `scripts/hil_process.py`'s
   `run_cmd`.
+- A flash or reset returns an `Operation`: the last run's `CompletedProcess`
+  fields plus `attempts`, each run's command, command file, output and rc on
+  its own, never concatenated; `retried` is every attempt but the last. An
+  exception from the runner carries the operation so far as `.operation`. Only
+  a J-Link crash is rerun, and only when the caller passes `crash_retries`.
 - rc 0 means the tool reported success, not that the target runs the image;
   the project's own checks decide that. rc 124 means the runner killed the
   tool's process group on the timeout and reaped it for a bounded grace: a

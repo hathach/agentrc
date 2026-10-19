@@ -7,8 +7,9 @@ Every operation takes a flasher dict (`name`, `uid`, `args`, optional `vid_pid` 
 runs it through `run` (default hil_process.run_cmd, the instance loaded here as
 `hil_flash.hil_process`), called as `run(cmd, timeout=...)` or, for esptool,
 `run(cmd, cwd=..., timeout=...)`, so a caller injects its own runner. Every operation takes
-`timeout` explicitly. The result is the runner's CompletedProcess: rc 0 means the tool said
-it succeeded, not that the target runs the image; rc 124 means it was killed on the bound.
+`timeout` explicitly. A flash or reset returns an Operation: the last run's CompletedProcess
+fields plus every attempt on its own. rc 0 means the tool said it succeeded, not that the
+target runs the image; rc 124 means it was killed on the bound.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYOCD_LAUNCHER = os.path.join(HERE, 'pyocd', 'run_pyocd.py')
@@ -44,6 +46,57 @@ _VID_PID_WARNED: set = set()   # one warning per probe, not per command
 
 def _runner(run):
     return hil_process.run_cmd if run is None else run
+
+
+class Attempt(NamedTuple):
+    """One run of a tool: the command, its command file's contents if it has one, and the
+    runner's result, None when the run raised."""
+    cmd: str | list
+    script: str | None
+    result: subprocess.CompletedProcess | None
+
+    @property
+    def interrupted(self) -> bool:
+        return self.result is None
+
+    @property
+    def timed_out(self) -> bool:
+        # 124 is hil_process.run_cmd's mark for a run it killed on the bound
+        return self.result is not None and self.result.returncode == 124
+
+
+class Operation(subprocess.CompletedProcess):
+    """The last attempt's CompletedProcess fields, so a caller reading returncode and stdout
+    keeps working, plus `attempts`: every run in order with its own output, never
+    concatenated. Every attempt but the last was retried. An interrupted run's exception
+    carries the operation so far as `.operation`."""
+
+    def __init__(self, attempts: list):
+        last = attempts[-1]
+        r = subprocess.CompletedProcess(last.cmd, None) if last.interrupted else last.result
+        super().__init__(r.args, r.returncode, r.stdout, r.stderr)
+        self.attempts = tuple(attempts)
+
+    @property
+    def retried(self) -> tuple:
+        return self.attempts[:-1]
+
+
+def _attempt(attempts: list, run, cmd, script=None, **kw) -> subprocess.CompletedProcess:
+    try:
+        ret = run(cmd, **kw)
+    except BaseException as e:
+        attempts.append(Attempt(cmd, script, None))
+        e.operation = Operation(attempts)
+        raise
+    attempts.append(Attempt(cmd, script, ret))
+    return ret
+
+
+def _once(run, cmd, **kw) -> Operation:
+    attempts = []
+    _attempt(attempts, _runner(run), cmd, **kw)
+    return Operation(attempts)
 
 
 # -------------------------------------------------------------
@@ -69,34 +122,33 @@ def _command_file(script: list):
         Path(path).unlink(missing_ok=True)
 
 
-def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int,
-               run) -> subprocess.CompletedProcess:
+def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run) -> Operation:
     # crash_retries reruns share one deadline, taken once the command file is written.
     # A rerun is no proof the target was untouched.
-    run = _runner(run)
+    run, attempts, text = _runner(run), [], ''.join(f'{s}\n' for s in script)
     with _command_file(script) as path:
         cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
                f'-NoGui 1 -ExitOnError 1 -CommandFile {shlex.quote(path)}')
         deadline = time.monotonic() + timeout
-        ret = run(cmd, timeout=timeout)
+        ret = _attempt(attempts, run, cmd, text, timeout=timeout)
         for _ in range(crash_retries):
             left = deadline - time.monotonic()
             if ret.returncode not in JLINK_CRASH_RCS or left <= 0:
                 break
             print(f'JLinkExe -USB {flasher["uid"]} crashed (rc {ret.returncode}), rerunning', flush=True)
-            ret = run(cmd, timeout=left)
-    return ret
+            ret = _attempt(attempts, run, cmd, text, timeout=left)
+    return Operation(attempts)
 
 
 def flash_jlink(flasher: dict, firmware: str, *, timeout,
-                crash_retries: int = 0, run=None) -> subprocess.CompletedProcess:
+                crash_retries: int = 0, run=None) -> Operation:
     # loadfile resets and halts the target itself by default (J-Link Commander, LoadFile)
     script = ['halt', f'loadfile {firmware}', 'r', 'go', 'exit']
     return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
 
 
 def reset_jlink(flasher: dict, *, timeout,
-                crash_retries: int = 0, run=None) -> subprocess.CompletedProcess:
+                crash_retries: int = 0, run=None) -> Operation:
     script = ['halt', 'r', 'go', 'exit']
     return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
 
@@ -104,19 +156,18 @@ def reset_jlink(flasher: dict, *, timeout,
 # -------------------------------------------------------------
 # ST-Link
 # -------------------------------------------------------------
-def flash_stlink(flasher: dict, firmware: str, *, timeout, run=None) -> subprocess.CompletedProcess:
+def flash_stlink(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     # --verify catches the partial/corrupt write that exits 0 and sends the test phase
     # off to exercise bad firmware. Opt-IN here ("verify": true), unlike flash_openocd's
     # opt-out: a default-on read-back silently changes every roster entry that lacks the
     # key, including boards on rigs this was never validated against.
     verify = ' --verify' if flasher.get('verify', False) else ''
-    return _runner(run)(f'STM32_Programmer_CLI --connect port=swd sn={flasher["uid"]} --write {firmware}{verify} --go',
-                        timeout=timeout)
+    return _once(run, f'STM32_Programmer_CLI --connect port=swd sn={flasher["uid"]} --write {firmware}{verify} --go',
+                 timeout=timeout)
 
 
-def reset_stlink(flasher: dict, *, timeout, run=None) -> subprocess.CompletedProcess:
-    return _runner(run)(f'STM32_Programmer_CLI --connect port=swd sn={flasher["uid"]} --rst --go',
-                        timeout=timeout)
+def reset_stlink(flasher: dict, *, timeout, run=None) -> Operation:
+    return _once(run, f'STM32_Programmer_CLI --connect port=swd sn={flasher["uid"]} --rst --go', timeout=timeout)
 
 
 # -------------------------------------------------------------
@@ -163,18 +214,16 @@ def openocd_cmd_base(flasher: dict) -> str:
 # what some targets need (kx.cfg's `kinetis disable_wdog`; without it frdm_k64f's verify takes
 # 21 s). stm32f0x/f4x/f7x/l4x.cfg raise `adapter speed` to 8000 there, which their J-Link
 # recovery entries cannot run, so those entries empty the event in the roster instead.
-def flash_openocd(flasher: dict, firmware: str, *, timeout, run=None) -> subprocess.CompletedProcess:
+def flash_openocd(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     verify = ' verify' if flasher.get('verify', True) else ''
-    return _runner(run)(f'{openocd_cmd_base(flasher)} -c "program {firmware}{verify} reset exit"',
-                        timeout=timeout)
+    return _once(run, f'{openocd_cmd_base(flasher)} -c "program {firmware}{verify} reset exit"', timeout=timeout)
 
 
-def reset_openocd(flasher: dict, *, timeout, run=None) -> subprocess.CompletedProcess:
+def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
     # timeout: a post-hang recovery bounds this; an unbounded reset there would outlive the
     # caller's outer kill and orphan openocd on the probe, which is the stray the recovery
     # exists to avoid.
-    return _runner(run)(f'{openocd_cmd_base(flasher)} -c "init; reset run; exit"',
-                        timeout=timeout)
+    return _once(run, f'{openocd_cmd_base(flasher)} -c "init; reset run; exit"', timeout=timeout)
 
 
 # openocd interface cfgs whose discovery filters by VID/PID before opening; see convoy_safe
@@ -308,23 +357,22 @@ def convoy_safe(flasher: dict) -> bool:
 # esptool, lm4flash
 # -------------------------------------------------------------
 def flash_esptool(flasher: dict, *, chip: str, port: str, flash_args: str, cwd: str, timeout,
-                  run=None) -> subprocess.CompletedProcess:
+                  run=None) -> Operation:
     """`chip` is the build's IDF_TARGET, `flash_args` its flash_args file on one line, `cwd`
     the build directory the file's relative paths name, `port` the probe's serial device."""
     # esptool 5.2.0 emits cursor CSI codes off a TTY when TERM is xterm-like (logger.py); NO_COLOR
     # turns them off, output only
     command = (f'NO_COLOR=1 esptool --chip {chip} -p {port} {flasher["args"]} '
                f'--before=default_reset --after=hard_reset write_flash {flash_args}')
-    return _runner(run)(command, cwd=cwd, timeout=timeout)
+    return _once(run, command, cwd=cwd, timeout=timeout)
 
 
 # no reset_esptool: esptool's reset would be `--after hard_reset`, which is not wired here
 
 
-def flash_lm4flash(flasher: dict, firmware: str, *, timeout, run=None) -> subprocess.CompletedProcess:
+def flash_lm4flash(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     # TI Tiva-C / Stellaris ICDI: lightweight lm4flash, resets and runs after write
-    return _runner(run)(f'lm4flash -s {flasher["uid"]} {flasher["args"]} {firmware}',
-                        timeout=timeout)
+    return _once(run, f'lm4flash -s {flasher["uid"]} {flasher["args"]} {firmware}', timeout=timeout)
 
 
 # no reset_lm4flash: lm4flash has no reset-only mode; it resets+runs on flash
@@ -365,11 +413,11 @@ def _pyocd_argv(flasher: dict, verb: str, *extra: str, project_dir: str) -> list
 
 
 def flash_pyocd(flasher: dict, firmware: str, *, project_dir: str, timeout,
-                run=None) -> subprocess.CompletedProcess:
+                run=None) -> Operation:
     """`project_dir` is where pyocd runs and resolves relative roster args (run_pyocd.py)."""
-    return _runner(run)(_pyocd_argv(flasher, 'flash', os.path.abspath(firmware), project_dir=project_dir),
-                        timeout=timeout)
+    return _once(run, _pyocd_argv(flasher, 'flash', os.path.abspath(firmware), project_dir=project_dir),
+                 timeout=timeout)
 
 
-def reset_pyocd(flasher: dict, *, project_dir: str, timeout, run=None) -> subprocess.CompletedProcess:
-    return _runner(run)(_pyocd_argv(flasher, 'reset', project_dir=project_dir), timeout=timeout)
+def reset_pyocd(flasher: dict, *, project_dir: str, timeout, run=None) -> Operation:
+    return _once(run, _pyocd_argv(flasher, 'reset', project_dir=project_dir), timeout=timeout)

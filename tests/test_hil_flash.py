@@ -7,7 +7,9 @@ output and the result handed back. Only the pyOCD launcher path and its --projec
 argument are normalised, plus deliberate deltas since, each applied explicitly: J-Link
 command files are unique per invocation, reused by its crash reruns and removed after it
 (jlink_command_file_delta), the J-Link flash script has no reset before `loadfile`
-(jlink_flash_script_delta), and esptool runs with NO_COLOR=1 (esptool_no_color_delta). Equality there does not establish timing, signals or pyOCD's
+(jlink_flash_script_delta), esptool runs with NO_COLOR=1 (esptool_no_color_delta), and a
+flash or reset returns an Operation carrying the runner's results as its attempts, whose last
+one is the result compared (provider_invoke). Equality there does not establish timing, signals or pyOCD's
 project-directory behaviour; test_hil_process and test_hil_pyocd do."""
 import os
 import unittest
@@ -47,6 +49,24 @@ gen = load('hil_flash_gen_golden', DATA / 'gen_golden.py')
 
 
 def provider_invoke(case, run, ctx):
+    """invoke_op's result unwrapped: an Operation must hold exactly the runner's results, in
+    order, as its attempts and carry the last one's fields; that last result is compared."""
+    returned = []
+
+    def recording(cmd, **kw):
+        returned.append(run(cmd, **kw))
+        return returned[-1]
+    ret = invoke_op(case, recording, ctx)
+    if isinstance(ret, bool):
+        return ret
+    assert isinstance(ret, hf.Operation), ret
+    assert len(ret.attempts) == len(returned) and all(a.result is r for a, r in zip(ret.attempts, returned))
+    last = returned[-1]
+    assert (ret.args, ret.returncode, ret.stdout, ret.stderr) == (last.args, last.returncode, last.stdout, last.stderr)
+    return last
+
+
+def invoke_op(case, run, ctx):
     """What a project adapter passes for each case (tinyusb: 2 J-Link crash retries, the
     build's IDF_TARGET, flash_args and serial port)."""
     f, op, t = case['flasher'], case['op'], case['timeout']
@@ -340,6 +360,66 @@ class JLink(unittest.TestCase):
 
     def test_the_crash_rcs_are_shell_and_direct_signals(self):
         self.assertEqual(hf.JLINK_CRASH_RCS, {139, -11, 134, -6})
+
+
+class Record(unittest.TestCase):
+    """A flash or reset returns an Operation: CompletedProcess fields of its last run, plus
+    every attempt with its own command, command file, output and rc."""
+
+    def runner(self, results):
+        """A runner answering (rc, stdout) or an exception in turn."""
+        answers = iter(results)
+
+        def run(cmd, **kw):
+            rc = next(answers)
+            if isinstance(rc, BaseException):
+                raise rc
+            text = Path(shlex.split(cmd.rsplit('-CommandFile ', 1)[1])[0]).read_text() if '-CommandFile' in cmd else ''
+            return subprocess.CompletedProcess(cmd, rc[0], f'{rc[1]}|{text}', None)
+        return run
+
+    def test_every_crash_rerun_is_its_own_attempt(self):
+        with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()):
+            op = hf.flash_jlink(JLINK, '/fw/a.hex', timeout=30, crash_retries=2,
+                                run=self.runner([(139, 'S/N: 1'), (-6, 'double free'), (0, 'O.K.')]))
+        script = 'halt\nloadfile /fw/a.hex\nr\ngo\nexit\n'
+        self.assertIsInstance(op, subprocess.CompletedProcess)
+        self.assertEqual([(a.result.returncode, a.result.stdout, a.script) for a in op.attempts],
+                         [(139, f'S/N: 1|{script}', script), (-6, f'double free|{script}', script),
+                          (0, f'O.K.|{script}', script)])
+        self.assertEqual([a.cmd for a in op.attempts], [op.args] * 3)
+        self.assertEqual((op.returncode, op.stdout), (0, f'O.K.|{script}'))
+        self.assertEqual(op.retried, op.attempts[:2])
+        self.assertFalse(any(a.timed_out or a.interrupted for a in op.attempts))
+
+    def test_a_single_run_is_one_attempt_without_a_script(self):
+        f = {'name': 'x', 'uid': 'S1', 'args': '', 'vid_pid': '0x0001 0x0002'}
+        for fn, args, kw in ((hf.flash_stlink, ('fw',), {}), (hf.reset_stlink, (), {}),
+                             (hf.flash_openocd, ('fw',), {}), (hf.reset_openocd, (), {}),
+                             (hf.flash_lm4flash, ('fw',), {}),
+                             (hf.flash_esptool, (), {'chip': 'c', 'port': 'p', 'flash_args': 'a', 'cwd': '/'})):
+            with self.subTest(fn=fn.__name__):
+                op = fn(f, *args, timeout=7, run=self.runner([(3, 'out')]), **kw)
+                self.assertEqual(len(op.attempts), 1)
+                a, = op.attempts
+                self.assertEqual((a.cmd, a.script, a.result.returncode, a.result.stdout), (op.args, None, 3, 'out|'))
+                self.assertEqual(op.retried, ())
+
+    def test_a_timed_out_attempt_is_marked(self):
+        op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=self.runner([(124, 'partial')]))
+        self.assertTrue(op.attempts[0].timed_out)
+        self.assertEqual(op.stdout, 'partial|')
+
+    def test_an_interrupted_run_carries_the_operation_so_far(self):
+        for exc in (KeyboardInterrupt(), RuntimeError('spawn')):
+            with self.subTest(exc=type(exc).__name__), tempfile.TemporaryDirectory() as d, contextlib.chdir(d), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaises(type(exc)) as cm:
+                hf.reset_jlink(JLINK, timeout=30, crash_retries=2, run=self.runner([(139, 'S/N: 1'), exc]))
+            op = cm.exception.operation
+            self.assertEqual([a.interrupted for a in op.attempts], [False, True])
+            self.assertEqual(op.attempts[0].result.stdout, 'S/N: 1|halt\nr\ngo\nexit\n')
+            self.assertEqual((op.returncode, op.stdout), (None, None))
+            self.assertEqual(op.attempts[1].script, 'halt\nr\ngo\nexit\n')
 
 
 class StlinkLm4flashEsptool(unittest.TestCase):
