@@ -63,7 +63,10 @@ nothing in it through a link.
   `hil_lock.py hold --take-over <lock>` holds the blocker's whole lock set as a
   cleanup holder, journalling each record it replaces, and once the recovery
   succeeded `hil_lock.py release --token <token>` ends that live holder. A
-  dead holder is never released by token; it is taken over.
+  dead holder is never released by token; it is taken over. A takeover that
+  finds a journal owned by another OS user in a sticky lock dir refuses up
+  front, changing nothing, and names that uid: run it and its `release --token`
+  as that user or root.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
   ends with `release_board_lock`. `release` never signals a protected record,
   a cleanup holder or a legacy runner reason (`hil_test.py`, `pool_check`), and
