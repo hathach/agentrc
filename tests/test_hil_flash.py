@@ -198,6 +198,7 @@ def capture(fn, *args, rcs=(0,), took=0, **kw):
 
 
 JLINK = {'name': 'jlink', 'uid': 'S1', 'args': '-device x'}
+ABSENT = object()
 
 
 class JLink(unittest.TestCase):
@@ -411,10 +412,10 @@ class Record(unittest.TestCase):
         self.assertEqual((a.kind, a.timed_out, a.interrupted, a.errored, a.error), ('timed_out', True, False, False, None))
         self.assertEqual((op.stdout, op.cleanup, a.cleanup, op.receipts), ('partial|', 'unknown', 'unknown', ()))
 
-    def test_a_normal_exit_is_done_whatever_its_rc(self):
-        for rc in (0, 1, 139):
+    def test_without_a_reported_cleanup_every_outcome_is_unknown(self):
+        for rc in (0, 1, 124, 139):
             op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=self.runner([(rc, 'x')]))
-            self.assertEqual((op.attempts[0].kind, op.cleanup), ('exited', 'done'))
+            self.assertEqual((op.attempts[0].cleanup, op.cleanup), ('unknown', 'unknown'), rc)
 
     def raised(self, exc, before=()):
         """The operation a reset_jlink with 2 crash retries carries out on its exception."""
@@ -442,50 +443,79 @@ class Record(unittest.TestCase):
                 self.assertEqual((op.returncode, op.cleanup), (None, 'unknown'))
                 self.assertEqual((op.stdout, op.stderr), (b'partial', b'err') if exc is timeout else (None, None))
 
-    def test_a_runner_supplies_cleanup_and_receipt(self):
-        class Pending(subprocess.CompletedProcess):
-            cleanup, receipt = 'pending', {'pid': 41, 'start': 7}
+    @staticmethod
+    def answers(*items):
+        """A runner returning (rc, cleanup, receipt) in turn; cleanup ABSENT sets no attribute."""
+        it = iter(items)
 
         def run(cmd, **kw):
-            return Pending(cmd, 0, 'out', None)
-        op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=run)
+            rc, cleanup, receipt = next(it)
+            r = subprocess.CompletedProcess(cmd, rc, '', None)
+            if cleanup is not ABSENT:
+                r.cleanup = cleanup
+            r.receipt = receipt
+            return r
+        return run
+
+    def test_a_runner_supplies_cleanup_and_receipt(self):
+        op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=self.answers((0, 'pending', {'pid': 41, 'start': 7})))
         self.assertEqual((op.attempts[0].cleanup, op.attempts[0].receipt), ('pending', {'pid': 41, 'start': 7}))
         self.assertEqual((op.cleanup, op.receipts), ('pending', ({'pid': 41, 'start': 7},)))
         exc = KeyboardInterrupt()
         exc.cleanup, exc.receipt = 'pending', 'holder-9'
         op = self.raised(exc)
         self.assertEqual((op.attempts[0].cleanup, op.cleanup, op.receipts), ('pending', 'pending', ('holder-9',)))
-        for value, want in (('done', 'done'), ('bogus', 'unknown'), (None, 'done')):
-            Pending.cleanup = value
-            self.assertEqual(hf.reset_stlink({'uid': 'S1'}, timeout=7, run=run).cleanup, want, value)
+
+    def test_only_an_explicit_done_is_done(self):
+        for value, want in (('done', 'done'), ('unknown', 'unknown'), ('pending', 'pending'), ('', 'unknown'),
+                            (False, 'unknown'), (0, 'unknown'), (None, 'unknown'), ('DONE', 'unknown'),
+                            (True, 'unknown'), (ABSENT, 'unknown')):
+            op = hf.reset_stlink({'uid': 'S1'}, timeout=7, run=self.answers((0, value, None)))
+            self.assertEqual(op.cleanup, want, value)
 
     def test_the_operation_cleanup_is_the_worst_attempts(self):
-        def answers(*items):
-            it = iter(items)
-
-            def run(cmd, **kw):
-                rc, cleanup, receipt = next(it)
-                r = subprocess.CompletedProcess(cmd, rc, '', None)
-                r.cleanup, r.receipt = cleanup, receipt
-                return r
-            return run
         with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()):
             op = hf.reset_jlink(JLINK, timeout=30, crash_retries=2,
-                                run=answers((139, 'pending', 'r1'), (139, 'unknown', None), (0, 'done', None)))
+                                run=self.answers((139, 'done', None), (139, 'unknown', 'r2'), (0, 'done', None)))
         self.assertEqual(([a.cleanup for a in op.attempts], op.cleanup, op.receipts),
-                         (['pending', 'unknown', 'done'], 'pending', ('r1',)))
+                         (['done', 'unknown', 'done'], 'unknown', ('r2',)))
 
-    def test_the_default_runner_reports_done_or_unknown(self):
-        """hil_process.run_cmd for real: a normal exit is done, the timeout kill unknown."""
+    def test_no_crash_rerun_over_a_pending_session(self):
+        with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()) as out:
+            op = hf.reset_jlink(JLINK, timeout=30, crash_retries=2,
+                                run=self.answers((139, 'pending', 'r1'), (0, 'done', None)))
+        self.assertEqual(([(a.result.returncode, a.cleanup) for a in op.attempts], op.cleanup, op.receipts),
+                         ([(139, 'pending')], 'pending', ('r1',)))
+        self.assertNotIn('rerunning', out.getvalue())
+
+    def test_an_unknown_cleanup_still_reruns_a_crash(self):
+        """The default runner reports nothing, so every attempt is unknown: tinyusb's reruns stand."""
+        for cleanup in ('unknown', ABSENT):
+            with tempfile.TemporaryDirectory() as d, contextlib.chdir(d), contextlib.redirect_stdout(io.StringIO()):
+                op = hf.reset_jlink(JLINK, timeout=30, crash_retries=2,
+                                    run=self.answers((139, cleanup, None), (-6, cleanup, None), (0, cleanup, None)))
+            self.assertEqual([a.result.returncode for a in op.attempts], [139, -6, 0], cleanup)
+
+    def test_the_default_runner_reports_unknown(self):
+        """hil_process.run_cmd for real: a tool that exits 0 leaving a descendant behind, and one
+        killed on its bound; run_cmd reports no cleanup, so both are unknown."""
         with tempfile.TemporaryDirectory() as d:
             tool = Path(d) / 'lm4flash'
-            tool.write_text('#!/bin/sh\ncase "$*" in *slow*) sleep 30;; esac\necho ran\n')
+            tool.write_text('#!/bin/sh\ncase "$*" in *slow*) sleep 30;; esac\n'
+                            'sleep 30 </dev/null >/dev/null 2>&1 &\necho $!\n')
             tool.chmod(0o755)
             with mock.patch.dict(os.environ, {'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}'}), \
                     contextlib.redirect_stdout(io.StringIO()):
-                done = hf.flash_lm4flash({'uid': 'S1', 'args': ''}, 'fw.bin', timeout=10)
+                exited = hf.flash_lm4flash({'uid': 'S1', 'args': ''}, 'fw.bin', timeout=10)
                 killed = hf.flash_lm4flash({'uid': 'S1', 'args': ''}, 'slow.bin', timeout=0.5)
-        self.assertEqual((done.returncode, done.attempts[0].kind, done.cleanup), (0, 'exited', 'done'))
+        survivor = int(exited.stdout)
+
+        def reap():
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(survivor, 9)
+        self.addCleanup(reap)
+        os.kill(survivor, 0)   # the descendant outlived the tool's exit
+        self.assertEqual((exited.returncode, exited.attempts[0].kind, exited.cleanup), (0, 'exited', 'unknown'))
         self.assertEqual((killed.returncode, killed.attempts[0].kind, killed.cleanup), (124, 'timed_out', 'unknown'))
 
 

@@ -16,10 +16,11 @@ subprocess.TimeoutExpired raised, its partial output kept), `interrupted` (a Bas
 that is not an Exception, such as KeyboardInterrupt, or any exception with a true
 `interrupted` attribute) or `error` (any other exception, such as a launch failure). A
 runner's result or exception may carry `cleanup` ('done', 'pending' or 'unknown') and
-`receipt` (whatever identifies a session still outstanding). Without `cleanup`, the default
-runner's contract applies: hil_process.run_cmd reaps boundedly and abandons a survivor, so
-only an exit other than rc 124 is 'done'; rc 124 and every exception are 'unknown'. An
-unrecognised value reads as 'unknown'.
+`receipt` (whatever identifies a session still outstanding). Only a runner's explicit 'done'
+counts as done: a missing attribute or any other value reads as 'unknown', the default
+runner's included, since hil_process.run_cmd abandons a survivor of its bounded reap and a
+tool's exit does not prove its descendants exited. A J-Link crash is not rerun after an
+attempt whose cleanup is 'pending'.
 """
 
 from __future__ import annotations
@@ -96,8 +97,7 @@ class Attempt(NamedTuple):
 
 def _record(cmd, script, result, error) -> Attempt:
     source = result if error is None else error
-    default = 'done' if error is None and result.returncode != 124 else 'unknown'
-    cleanup = getattr(source, 'cleanup', None) or default
+    cleanup = getattr(source, 'cleanup', None)
     return Attempt(cmd, script, result, error, cleanup if cleanup in CLEANUP else 'unknown',
                    getattr(source, 'receipt', None))
 
@@ -164,8 +164,9 @@ def _command_file(script: list, *, prefix='hil_jlink_', suffix='.jlink', workdir
 
 
 def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run) -> Operation:
-    # crash_retries reruns share one deadline, taken once the command file is written.
-    # A rerun is no proof the target was untouched.
+    # crash_retries reruns share one deadline, taken once the command file is written, and
+    # never start over a session the runner reports pending. A rerun is no proof the target
+    # was untouched.
     run, attempts = _runner(run), []
     with _command_file(script) as (path, text):
         cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
@@ -174,7 +175,7 @@ def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run)
         ret = _attempt(attempts, run, cmd, text, timeout=timeout)
         for _ in range(crash_retries):
             left = deadline - time.monotonic()
-            if ret.returncode not in JLINK_CRASH_RCS or left <= 0:
+            if ret.returncode not in JLINK_CRASH_RCS or left <= 0 or attempts[-1].cleanup == 'pending':
                 break
             print(f'JLinkExe -USB {flasher["uid"]} crashed (rc {ret.returncode}), rerunning', flush=True)
             ret = _attempt(attempts, run, cmd, text, timeout=left)

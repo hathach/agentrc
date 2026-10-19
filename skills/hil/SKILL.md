@@ -133,12 +133,13 @@ recovery stay the contract's. Linux only.
   `interrupted` attribute) or `error` (any other exception, such as a launch
   failure), the exception itself as `error`, a `cleanup` status and a
   `receipt`. A runner reports the last two as `cleanup` (`done`, `pending`,
-  `unknown`) and `receipt` attributes on its result or exception. Without
-  them the default runner's contract applies: `run_cmd` reaps boundedly and
-  abandons a survivor, so an exit other than rc 124 is `done`, and rc 124 or
-  any exception is `unknown`, never `done`. The operation's `cleanup` is its
-  worst attempt's (`pending`, then `unknown`, then `done`) and `receipts`
-  lists every receipt.
+  `unknown`) and `receipt` attributes on its result or exception. Only an
+  explicit `done` counts: a missing attribute or any other value is
+  `unknown`, the default runner's included, since `run_cmd` abandons a
+  survivor of its bounded reap and a tool's exit does not prove its
+  descendants exited. The operation's `cleanup` is its worst attempt's
+  (`pending`, then `unknown`, then `done`) and `receipts` lists every
+  receipt. A J-Link crash is not rerun after an attempt reported `pending`.
 - `run_jlink_commands` and `run_stlink_commands` run one probe session of the
   caller's commands with the caller's connection profile, from a unique
   command file in `workdir`; `sysresetreq_jlink` and `sysresetreq_stlink` write
