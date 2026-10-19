@@ -95,7 +95,7 @@ def kill(pid):
 class ChiefRun(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
-        self.addCleanup(td.cleanup)
+        self.addCleanup(self.remove, td)
         self.root = Path(td.name)
         self.fake = self.root / 'fake'
         self.fake.mkdir()
@@ -146,6 +146,18 @@ class ChiefRun(unittest.TestCase):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
         self.addCleanup(lambda: proc.poll() is None and (kill(proc.pid), proc.wait()))   # its tree: Windows keeps claude
         return proc
+
+    @staticmethod
+    def remove(td):
+        # Windows: a launcher that has written its exit line can hold its logs open a moment longer.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                return td.cleanup()
+            except PermissionError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.1)
 
     def wait_until(self, what, ok):
         deadline = time.monotonic() + 10
@@ -412,7 +424,7 @@ class ChiefRun(unittest.TestCase):
         else:   # Windows: DETACHED_PROCESS stands for the session, so no console event from the caller reaches it
             control = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], creationflags=subprocess.CREATE_NO_WINDOW)
             self.addCleanup(lambda: (control.kill(), control.wait()))
-            self.assertTrue(has_console(control.pid), 'the probe sees a console where there is one')
+            self.wait_until('the probe to see a console where there is one', lambda: has_console(control.pid))
             self.assertFalse(has_console(pid), 'the launcher has no console')
         (self.fake / 'go').touch()
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 0 (result ok)'))

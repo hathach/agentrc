@@ -15,10 +15,20 @@ concurrency:
 
 jobs:
   unittest:
+    name: unittest (${{ matrix.os }}, ${{ matrix.shard }}/${{ matrix.shards }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, windows-2022]
+        shard: [0, 1, 2, 3, 4, 5]
+        include:
+          - {os: ubuntu-24.04, shards: 2}
+          - {os: windows-2022, shards: 6}
+        exclude:
+          - {os: ubuntu-24.04, shard: 2}
+          - {os: ubuntu-24.04, shard: 3}
+          - {os: ubuntu-24.04, shard: 4}
+          - {os: ubuntu-24.04, shard: 5}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -41,4 +51,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq poppler-utils
       - name: optional tools found
         run: python -c "import shutil; [print(t, shutil.which(t)) for t in 'python node git bash jq awk pdfinfo pdftotext tshark editcap capinfos openocd kicad-cli xvfb-run pre-commit'.split()]"
-      - run: python -X utf8 -m pytest -n 8 -p no:cacheprovider --durations=40 tests
+      # PYTHONUTF8 rather than -X utf8: xdist workers inherit the environment, not the flag
+      - run: python -m pytest -n 8 -p no:cacheprovider --durations=20 --shard ${{ matrix.shard }}/${{ matrix.shards }} tests
+        env:
+          PYTHONUTF8: '1'
