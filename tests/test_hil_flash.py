@@ -98,6 +98,10 @@ def provider_normalise(cmd, ctx):
     return cmd
 
 
+def map_calls(observed, rewrite):
+    return {**observed, 'calls': [rewrite(call) for call in observed['calls']]}
+
+
 def jlink_command_file_delta(case, observed):
     """The pre-move module named the file `<board>_<firmware name>.jlink` (flash) or
     `<board>_reset.jlink` (reset, kept in the working directory); now each invocation gets a
@@ -105,13 +109,14 @@ def jlink_command_file_delta(case, observed):
     if case['flasher']['name'].lower() != 'jlink' or case['op'] == 'rescue':
         return observed
     old = f"{case['board']}_{Path(gen.FIRMWARE).name if case['op'] == 'flash' else 'reset'}.jlink"
-    calls = []
-    for call in observed['calls']:
+
+    def rewrite(call):
         head, name = call['cmd'].rsplit('-CommandFile ', 1)
         assert name == old, (name, old)
-        calls.append({**call, 'cmd': head + COMMAND_FILE})
+        return {**call, 'cmd': head + COMMAND_FILE}
+    observed = map_calls(observed, rewrite)
     assert observed['left'] == ([old] if case['op'] == 'reset' else []), observed['left']
-    return {**observed, 'calls': calls, 'left': []}
+    return {**observed, 'left': []}
 
 
 PRE_MOVE_FLASH_SCRIPT = f'halt\nr\nloadfile {gen.FIRMWARE}\nr\ngo\nexit\n'
@@ -123,22 +128,22 @@ def jlink_flash_script_delta(case, observed):
     projects' CMake jlink targets already run it; the reset script is unchanged."""
     if case['flasher']['name'].lower() != 'jlink' or case['op'] != 'flash':
         return observed
-    calls = []
-    for call in observed['calls']:
+
+    def rewrite(call):
         assert call['script'] == PRE_MOVE_FLASH_SCRIPT, call['script']
-        calls.append({**call, 'script': FLASH_SCRIPT})
-    return {**observed, 'calls': calls}
+        return {**call, 'script': FLASH_SCRIPT}
+    return map_calls(observed, rewrite)
 
 
 def esptool_no_color_delta(case, observed):
     """esptool's command gains a NO_COLOR=1 prefix: output only, its arguments unchanged."""
     if case['flasher']['name'].lower() != 'esptool' or case['op'] == 'rescue':
         return observed
-    calls = []
-    for call in observed['calls']:
+
+    def rewrite(call):
         assert call['cmd'].startswith('esptool '), call['cmd']
-        calls.append({**call, 'cmd': f"NO_COLOR=1 {call['cmd']}"})
-    return {**observed, 'calls': calls}
+        return {**call, 'cmd': f"NO_COLOR=1 {call['cmd']}"}
+    return map_calls(observed, rewrite)
 
 
 def deltas(case, observed):
@@ -629,26 +634,13 @@ class Sessions(unittest.TestCase):
 
 
 class StlinkLm4flashEsptool(unittest.TestCase):
-    def test_stlink_verify_is_opt_in(self):
-        for extra, want in (({}, ''), ({'verify': True}, ' --verify'), ({'verify': False}, '')):
-            _, calls, _, _ = capture(hf.flash_stlink, {'name': 'stlink', 'uid': 'S1', **extra}, 'fw.elf', timeout=7)
-            self.assertEqual(calls, [(f'STM32_Programmer_CLI --connect port=swd sn=S1 --write fw.elf{want} --go',
-                                      {'timeout': 7})])
-
-    def test_stlink_reset_forwards_the_bound(self):
-        _, calls, _, _ = capture(hf.reset_stlink, {'name': 'stlink', 'uid': 'S1'}, timeout=11)
-        self.assertEqual(calls, [('STM32_Programmer_CLI --connect port=swd sn=S1 --rst --go', {'timeout': 11})])
-
-    def test_lm4flash(self):
-        _, calls, _, _ = capture(hf.flash_lm4flash, {'name': 'lm4flash', 'uid': 'S1', 'args': '-v'}, 'fw.bin',
+    def test_an_explicit_stlink_verify_false_is_no_verify(self):
+        # the golden rosters set stlink verify only to true or leave it out
+        _, calls, _, _ = capture(hf.flash_stlink, {'name': 'stlink', 'uid': 'S1', 'verify': False}, 'fw.elf',
                                  timeout=7)
-        self.assertEqual(calls, [('lm4flash -s S1 -v fw.bin', {'timeout': 7})])
+        self.assertEqual(calls, [('STM32_Programmer_CLI --connect port=swd sn=S1 --write fw.elf --go', {'timeout': 7})])
 
-    def test_esptool_runs_in_the_build_dir_and_never_resets_alone(self):
-        _, calls, _, _ = capture(hf.flash_esptool, {'name': 'esptool', 'uid': 'U', 'args': '-b 1500000'},
-                                 chip='esp32s3', port='/dev/ttyACM0', flash_args='0x0 a.bin', cwd='/b', timeout=7)
-        self.assertEqual(calls, [('NO_COLOR=1 esptool --chip esp32s3 -p /dev/ttyACM0 -b 1500000 --before=default_reset '
-                                  '--after=hard_reset write_flash 0x0 a.bin', {'cwd': '/b', 'timeout': 7})])
+    def test_esptool_and_lm4flash_never_reset_alone(self):
         self.assertFalse(hasattr(hf, 'reset_esptool'))
         self.assertFalse(hasattr(hf, 'reset_lm4flash'))
 
@@ -697,11 +689,6 @@ class Openocd(unittest.TestCase):
     def setUp(self):
         hf._VID_PID_WARNED.clear()
 
-    def test_vid_pid_flag_precedes_args(self):
-        cmd = hf.openocd_cmd_base({'uid': 'S1', 'args': '-f target/wch-riscv.cfg', 'vid_pid': '0x1a86 0x8010'})
-        self.assertEqual(cmd, 'openocd -c "tcl_port disabled" -c "gdb_port disabled" -c "telnet_port disabled" '
-                              '-c "adapter serial S1" -c "adapter usb vid_pid 0x1a86 0x8010" -f target/wch-riscv.cfg')
-
     def test_vid_pid_multiple_pairs(self):
         cmd = hf.openocd_cmd_base({'uid': 'S1', 'args': '-f i.cfg', 'vid_pid': '0x2e8a 0x000c 0x2e8a 0x000d'})
         self.assertIn('-c "adapter usb vid_pid 0x2e8a 0x000c 0x2e8a 0x000d"', cmd)
@@ -738,37 +725,10 @@ class Openocd(unittest.TestCase):
             hf.openocd_cmd_base({'name': 'openocd', 'uid': 'S-jl', 'args': '-f interface/jlink.cfg'})
         self.assertEqual(err.getvalue(), '')
 
-    def test_flash_uses_program_with_verify_by_default(self):
-        f = {'name': 'openocd', 'uid': 'S1', 'args': '-f interface/jlink.cfg -f target/k60.cfg'}
-        _, calls, _, _ = capture(hf.flash_openocd, f, '/tmp/fw.elf', timeout=7)
-        self.assertTrue(calls[0][0].endswith('-f target/k60.cfg -c "program /tmp/fw.elf verify reset exit"'))
-        self.assertEqual(calls[0][1], {'timeout': 7})
-        _, calls, _, _ = capture(hf.flash_openocd, {**f, 'verify': False}, '/tmp/fw.elf', timeout=7)
-        self.assertTrue(calls[0][0].endswith('-c "program /tmp/fw.elf reset exit"'))
-
-    def test_reset_is_bounded(self):
-        f = {'name': 'openocd', 'uid': 'S1', 'args': '-f interface/jlink.cfg'}
-        _, calls, _, _ = capture(hf.reset_openocd, f, timeout=9)
-        self.assertTrue(calls[0][0].endswith('-f interface/jlink.cfg -c "init; reset run; exit"'))
-        self.assertEqual(calls[0][1], {'timeout': 9})
-
 
 class Rescue(unittest.TestCase):
     RP2040 = {'name': 'openocd', 'uid': 'S1', 'vid_pid': '0x2e8a 0x000c',
               'args': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg'}
-    RP2350 = {**RP2040, 'args': '-f interface/cmsis-dap.cfg -f target/rp2350.cfg'}
-
-    def test_rp2040_rescue_keeps_the_pin_before_init(self):
-        ret, calls, _, _ = capture(hf.rescue_openocd, self.RP2040, f'x {hf.DAP_WEDGED[0]} y', timeout=13)
-        self.assertIs(ret, True)
-        cmd = calls[0][0]
-        self.assertIn('-c "adapter usb vid_pid 0x2e8a 0x000c" -c "set RESCUE 1" -f interface/cmsis-dap.cfg '
-                      '-f target/rp2040.cfg', cmd)
-        self.assertEqual(calls[0][1], {'timeout': 13})
-
-    def test_rp2350_rescue_swaps_the_cfg_and_shuts_down(self):
-        _, calls, _, _ = capture(hf.rescue_openocd, self.RP2350, hf.DAP_WEDGED[1], timeout=13)
-        self.assertTrue(calls[0][0].endswith('-f target/rp2350-rescue.cfg -c "shutdown"'))
 
     def test_the_result_is_the_rescue_commands_rc(self):
         for rc, want in ((0, True), (1, False), (124, False)):
