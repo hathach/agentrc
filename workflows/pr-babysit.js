@@ -1753,10 +1753,10 @@ const waitAfter = (cr, askedAt, observedAt) => {
 // A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again.
 const RETRY_WAIT_MAX_MS = 60 * 60000
 const retryLater = (cr, cycle, ms) => {
-  const wait = ms + 60000
-  if (wait > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
+  if (ms > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
   cr.done = false
-  cr.retryWaitMs = wait
+  // A minute past the reset, never past the cap: an estimated reset is exactly an hour out (#138).
+  cr.retryWaitMs = Math.min(ms + 60000, RETRY_WAIT_MAX_MS)
 }
 const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const asked = reviewClock.request

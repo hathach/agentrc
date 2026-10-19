@@ -210,7 +210,8 @@ class FailClosed(unittest.TestCase):
         self.assertEqual((alone['kind'], alone['retryAt']), ('limited', None), 'the status alone: limited, no reset time')
         self.assertIn('no reset time read', alone['reason'])
         older = comment(bot, body, at='2026-09-25T08:00:00Z', updated='2026-09-25T08:10:00Z', id_=4)
-        self.assertEqual(harvest.coderabbit(HEAD, [limited], [], [older], EVENT)['retryAt'], None, 'a notice before the status is not its notice')
+        self.assertEqual(harvest.coderabbit(HEAD, [limited], [], [older], EVENT)['retryAt'], '2026-09-25T09:01:00Z',
+                         'a notice after the head event with nothing between it and the status is its notice (#138)')
         self.assertEqual(harvest.coderabbit(HEAD, [], [], [notice], EVENT)['state'], 'unknown', 'without the status the edit still cannot be dated')
         later = status('success', 'Review completed', '2026-09-25T10:00:00Z')
         self.assertEqual(harvest.coderabbit(HEAD, [limited, later], [], [notice], EVENT)['state'], 'reviewed', 'a newer review supersedes the limit')
@@ -228,6 +229,35 @@ class FailClosed(unittest.TestCase):
         for issue in (posted, posted[::-1]):
             r = harvest.coderabbit(HEAD, [], [], issue, EVENT)
             self.assertEqual((r['kind'], r['retryAt']), ('limited', None), 'so do tied unedited ones')
+
+    def test_a_rate_limit_status_pairs_its_notice_either_side_unless_something_came_between(self):
+        """#138: the notice was edited a second before its "Review rate limited" status, and no reset was read."""
+        bot = 'coderabbitai[bot]'
+        body = harvest.CR_WALKTHROUGH + '\n' + harvest.CR_RATE + '\n> ## Review limit reached\n> **Next included review available in 40 minutes.**'
+        limited = status('success', 'Review rate limited', '2026-09-25T12:08:35Z')
+        notice = lambda updated, text=body: comment(bot, text, at='2026-09-25T07:00:00Z', updated=updated, id_=3)
+        for updated, reset in (('2026-09-25T12:08:30Z', '2026-09-25T12:48:30Z'), ('2026-09-25T12:08:34Z', '2026-09-25T12:48:34Z'),
+                               ('2026-09-25T12:08:35Z', '2026-09-25T12:48:35Z'), ('2026-09-25T12:08:36Z', '2026-09-25T12:48:36Z')):
+            with self.subTest(updated):
+                r = harvest.coderabbit(HEAD, [limited], [], [notice(updated)], EVENT)
+                self.assertEqual((r['kind'], r['retryAt']), ('limited', reset))
+        self.assertIsNone(harvest.coderabbit(HEAD, [limited], [], [notice('2026-09-25T07:59:59Z')], EVENT)['retryAt'], 'about an older push')
+        run_ = {'id': 11, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'success',
+                'started_at': '2026-09-25T12:08:31Z', 'completed_at': '2026-09-25T12:08:32Z'}
+        self.assertIsNone(harvest.coderabbit(HEAD, [limited], [run_], [notice('2026-09-25T12:08:30Z')], EVENT)['retryAt'], 'a run came between')
+        working = status('pending', 'Review in progress', '2026-09-25T12:08:32Z')
+        self.assertIsNone(harvest.coderabbit(HEAD, [working, limited], [], [notice('2026-09-25T12:08:30Z')], EVENT)['retryAt'],
+                          'another status came between')
+        self.assertEqual(harvest.coderabbit(HEAD, [working, limited], [], [notice('2026-09-25T12:08:34Z')], EVENT)['retryAt'], '2026-09-25T12:48:34Z')
+        self.assertIsNone(harvest.coderabbit(HEAD, [limited], [], [notice('2026-09-25T12:08:30Z')], None)['retryAt'],
+                          'nothing dates the head: only a notice at or after the status is its')
+        bare = notice('2026-09-25T12:08:34Z', harvest.CR_WALKTHROUGH + '\n' + harvest.CR_RATE + '\n> ## Review limit reached')
+        first, again = (harvest.coderabbit(HEAD, [limited], [], [bare], EVENT) for _ in range(2))
+        self.assertEqual((first['retryAt'], again['retryAt']), ('2026-09-25T13:08:34Z', '2026-09-25T13:08:34Z'),
+                         'no countdown: an hour after the notice, the same on every harvest')
+        self.assertIn('reset estimated an hour after the notice', first['reason'])
+        posted = comment(bot, harvest.CR_RATE + '\n> ## Review limit reached', at='2026-09-25T09:30:00Z')
+        self.assertEqual(harvest.coderabbit(HEAD, [], [], [posted], EVENT)['retryAt'], '2026-09-25T10:30:00Z', 'an unedited one alike')
 
     def test_a_rate_limit_countdown_reads_or_is_none(self):
         def at(countdown, updated='2026-09-25T09:00:00Z'):

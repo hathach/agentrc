@@ -42,7 +42,7 @@ One record per named reviewer, `state` one of `reviewed`, `working`,
 `queued`, `settled`, `absent`, `unknown`, or `harvested` for one whose state is
 not read; `kind` is `skipped`, `limited`,
 `paused` or `failed` on a `settled` record and null otherwise; `retryAt` is when
-a `limited` bot said its next review is available, else null; `sha` is the
+a `limited` bot said its next review is available, or the hour harvest.py estimates, else null; `sha` is the
 head on a `reviewed` record, else the head when the evidence is bound to it and
 null when it is not (a pause, a rate limit). `evidence` names the artifacts the
 state rests on, older ones included; `reason` is one line a human reads in the

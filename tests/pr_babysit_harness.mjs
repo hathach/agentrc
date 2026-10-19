@@ -6689,7 +6689,7 @@ test('a rate-limited CodeRabbit is asked once after its reset, then waited for',
 })
 
 test('a rate limit is not asked about without the switch, a reset time, or a reset within the hour', async () => {
-  for (const [args, retryAt] of [[{}, at(20)], [{ coderabbitTrigger: true }, null], [{ coderabbitTrigger: true }, at(60)]]) {
+  for (const [args, retryAt] of [[{}, at(20)], [{ coderabbitTrigger: true }, null], [{ coderabbitTrigger: true }, at(61)]]) {
     const { result, labels, logs } = await run({ args: { ...args, maxCycles: 3 }, reviews: quiet([limitedCr(retryAt)]) })
     assert.equal(result.pass, true, result.reason)
     assert.equal(result.cycles, 1)
@@ -6698,6 +6698,18 @@ test('a rate limit is not asked about without the switch, a reset time, or a res
   }
   const last = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, reviews: quiet([limitedCr(at(20))]) })
   assert.equal(last.result.pass, true, 'no cycle left to wait in')
+})
+
+test('a reset estimated an hour out is waited for to the cap, then asked about; one already passed is asked about at once (#138)', async () => {
+  let n = 0
+  const { labels, napMs } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 }, minutesPerCycle: 61,
+    reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(60)) : bot('coderabbit')]),
+  })
+  assert.equal(napMs[0], 60 * 60000, 'the minute past the reset stays within the hour')
+  assert.deepEqual(requests(labels), ['crrequest#2'])
+  const passed = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, reviews: quiet([limitedCr(at(-5))]) })
+  assert.deepEqual(requests(passed.labels), ['crrequest#1'])
 })
 
 test('a reset extended before the request is waited for again, and asked about once', async () => {
