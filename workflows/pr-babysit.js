@@ -2042,9 +2042,13 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     return null
   }
   const reran = judging.filter(c => judged.checks.find(j => j.link === c.link).failures.length === 0)
+  // The deadline starts no earlier than the judge's return, not at the inventory read before the evidence and judging;
+  // an unread time is left for the next read (#123).
+  const stamp = reran.length && !githubLimit ? await collect(`ci:collect#${cycle}.t`, `inventory --wait-seconds 0${ignoring}`, INVENTORY) : null
+  const rerunAt = stamp && !stamp.error && Number.isFinite(Date.parse(stamp.observedAt)) ? stamp.observedAt : undefined
   for (const c of reran) {
     if (reruns.some(r => r.workflow === c.workflow && r.check === c.name)) log(`cycle ${cycle}: CI judge re-ran ${c.workflow} / ${c.name} a second time`)
-    noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true, at: inv.observedAt })
+    noteRerun({ head: inv.head, link: c.link, workflow: c.workflow, check: c.name, sure: true, at: rerunAt })
     ciVerdicts.delete(c.link)
   }
   // An empty answer is a re-run by the contract.

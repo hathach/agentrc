@@ -2065,6 +2065,20 @@ test('a re-run that never registers stops ci-stuck after ciWait minutes, naming 
   assert.notEqual(early.result.reason, 'ci-stuck', 'within ciWait it is still settling')
 })
 
+test('a re-run\'s deadline starts after the judge returns, not at the inventory read before it (#123)', async () => {
+  // The evidence and the judging take ten minutes: the read after the judge sees minute 10.
+  const minutes = minuteOf([0, 15, 35, 40, 45])
+  const stamped = /^ci:collect#1\.t\b/
+  const opts = { ci: redWith(RIG).ci, reviews: WAITING, judge: rerunAll, args: { maxCycles: 5 } }
+  const { result, labels } = await run({ ...opts, clock: (label) => stamped.test(label) ? at(10) : minutes(label) })
+  assert.ok(labels.includes('ci:collect#1.t'), labels.join(' '))
+  assert.equal(result.reason, 'ci-stuck')
+  assert.equal(result.cycles, 4, '35 minutes after the inventory read but 25 after the judge is still settling')
+  const lost = await run({ ...opts, clock: minutes, garble: (label, line) => stamped.test(label) ? null : line })
+  assert.equal(lost.result.reason, 'ci-stuck')
+  assert.equal(lost.result.cycles, 5, 'an unread time is taken from the next read, at minute 15')
+})
+
 test('a re-run\'s deadline carries across launches; one from a state without its time starts at the resume (#123)', async () => {
   const first = await run({ args: YIELD, reviews: WAITING, ci: redWith(RIG).ci, judge: rerunAll })
   const { state } = first.result
