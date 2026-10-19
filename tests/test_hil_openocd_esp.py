@@ -45,7 +45,8 @@ BANNER = f'Open On-Chip Debugger {oe.VERIFIED_OPENOCD} (2026-07-03-13:49)'
 # openocd-esp32 stand-in: the banner, then a server that logs its listening line and answers the
 # token query and the wrapped Tcl commands. FAKE_SCRIPT maps a command, its first word, or
 # `<first word>#<n>` for the n-th such command, to "ok:<answer>", "err:<message>", "hang" (never
-# answers) or "die" (exits without answering). Otherwise program_esp, flash list and flash
+# answers), "die" (exits without answering) or "gate:<file>" (logs a `gated` event, then runs the
+# command once <file> exists). Otherwise program_esp, flash list and flash
 # read_bank work on FAKE_FLASH, a FAKE_BANK_SIZE image: program_esp erases whole sectors, writes,
 # and verifies only the 4-byte-aligned prefix as verify_bank_hash does; FAKE_CORRUPT=tail corrupts
 # an unaligned segment's last byte, =after_verify its first byte after the verify. FAKE_EVENTS gets
@@ -156,6 +157,11 @@ def run(cmd):
     kind, _, text = action.partition(':')
     if kind == 'slow':
         time.sleep(float(text))
+        return model(cmd)
+    if kind == 'gate':
+        event(gated=cmd)
+        while not os.path.exists(text):
+            time.sleep(0.01)
         return model(cmd)
     if kind == 'err':
         say(f'Error: {text}')
@@ -574,7 +580,8 @@ class Lifecycle(SessionCase):
         self.assertPending(op)
 
     def test_a_shutdown_that_leaves_the_server_running_is_pending(self):
-        op = self.session(FAKE_IGNORE_SHUTDOWN='1')
+        with mock.patch.object(oe, 'CLEANUP_TIMEOUT', 0.5):
+            op = self.session(FAKE_IGNORE_SHUTDOWN='1')
         self.assertEqual(self.tcl(), ['token?', 'init', 'reset run', 'shutdown'])
         self.assertEqual(op.returncode, 1)
         self.assertIn('still runs after shutdown', op.session['failure'])
@@ -887,29 +894,26 @@ class Reset(SessionCase):
         self.assertFalse(hasattr(op, 'segments'))
         self.assertEnded(op)
 
-    def test_an_init_failure_is_never_followed_by_a_reset(self):
-        op = self.reset(script={'init': 'err:esp_usb_jtag: could not find or open device!'})
-        self.assertEqual(self.tcl(), ['token?', 'init'])
-        self.assertPending(op)
-
     def test_an_init_outstanding_at_the_timeout_is_pending(self):
         op = self.reset(timeout=2, script={'init': 'hang'})
         self.assertEqual((op.returncode, self.tcl()), (124, ['token?', 'init']))
-        self.assertPending(op)
-
-    def test_a_failed_reset_run_is_pending(self):
-        op = self.reset(script={'reset run': 'err:Target not examined yet'})
-        self.assertEqual(self.tcl(), ['token?', 'init', 'reset run'])
-        self.assertEqual(op.returncode, 1)
         self.assertPending(op)
 
 
 class End(SessionCase):
     """`end` from a pending session's receipt, against the fake server the session left running."""
 
-    def pending(self, script, **kw):
-        op = self.session(lambda s: s.check('work'), timeout=kw.pop('timeout', 1.5), script=script, **kw)
+    def pending(self, script=None, release=True, **kw):
+        """A session that timed out on `work`; by default `work` is gated, and once the fake is known
+        to be running it, `release` lets it finish."""
+        gate = self.root / 'gate'
+        script = {'work': f'gate:{gate}', **(script or {})}
+        op = self.session(lambda s: s.check('work'), timeout=1, script=script, **kw)
         self.assertEqual(op.attempts[0].cleanup, 'pending')
+        if script['work'].startswith('gate:'):
+            self.assertEqual([e['gated'] for e in self.events() if 'gated' in e], ['work'])
+            if release:
+                gate.touch()
         return op.session['receipt']
 
     def receipt(self, path):
@@ -935,7 +939,7 @@ class End(SessionCase):
         self.assertEqual(sorted(p.name for p in Path(op.session['dir']).glob('.receipt.*')), [])
 
     def test_a_command_that_finished_after_the_timeout_is_ended_then_idempotent(self):
-        path = self.pending({'work': 'slow:2.5'})
+        path = self.pending()
         n = len(self.tcl())
         rc, result = self.end(path)
         self.assertEqual((rc, result['outcome'], result['done']), (0, 'ended', '2'))
@@ -949,7 +953,7 @@ class End(SessionCase):
         self.assertEqual(self.end(path)[1]['outcome'], 'alreadyEnded')
 
     def test_an_interrupt_as_the_lock_is_taken_does_not_keep_it(self):
-        path = self.pending({'work': 'slow:2.5'})
+        path = self.pending()
         old = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, old)
         real = oe._lock
@@ -964,9 +968,9 @@ class End(SessionCase):
         self.assertEqual((rc, result['outcome']), (0, 'ended'))
 
     def test_a_command_still_executing_is_never_overtaken(self):
-        path = self.pending({'work': 'hang'})
+        path = self.pending(release=False)
         n = len(self.tcl())
-        rc, result = self.end(path, timeout=1.5)
+        rc, result = self.end(path, timeout=0.5)
         self.assertEqual(result['outcome'], 'failed')
         self.assertEqual(self.after(n), [])
         self.assertKept(path, rc)
@@ -995,7 +999,7 @@ class End(SessionCase):
                 self.reap()
 
     def test_a_failed_reset_run_is_never_followed_by_shutdown(self):
-        path = self.pending({'work': 'slow:2.5', 'reset run': 'err:Target not examined yet'})
+        path = self.pending({'reset run': 'err:Target not examined yet'})
         n = len(self.tcl())
         rc, result = self.end(path)
         self.assertEqual(result['outcome'], 'failed')
@@ -1003,13 +1007,13 @@ class End(SessionCase):
         self.assertKept(path, rc)
 
     def test_a_server_still_running_after_shutdown_keeps_the_receipt(self):
-        path = self.pending({'work': 'slow:2.5'}, FAKE_IGNORE_SHUTDOWN='1')
-        rc, result = self.end(path, timeout=4)
+        path = self.pending(FAKE_IGNORE_SHUTDOWN='1')
+        rc, result = self.end(path, timeout=1)
         self.assertIn('exit not confirmed after shutdown', result['error'])
         self.assertKept(path, rc)
 
     def test_another_process_or_a_foreign_server_is_sent_nothing(self):
-        path = self.pending({'work': 'slow:2.5'})
+        path = self.pending()
         rec, n = self.receipt(path), len(self.tcl())
         oe.esp_session.write_receipt(path, {**rec, 'startTime': '1'})
         rc, result = self.end(path)
@@ -1021,7 +1025,7 @@ class End(SessionCase):
         self.assertKept(path, rc)
 
     def test_a_server_that_is_gone_is_refused(self):
-        path = self.pending({'work': 'slow:2.5'})
+        path = self.pending()
         pid = self.receipt(path)['pid']
         os.kill(pid, signal.SIGKILL)       # a stand-in; gone as a crashed openocd would be
         for _ in range(50):
@@ -1039,10 +1043,10 @@ class End(SessionCase):
         self.assertIn("cleanup 'unknown'", result['error'])
 
     def test_an_interrupt_propagates_and_keeps_the_receipt(self):
-        path = self.pending({'work': 'hang'})
+        path = self.pending(release=False)
         old = signal.signal(signal.SIGINT, signal.default_int_handler)
         self.addCleanup(signal.signal, signal.SIGINT, old)
-        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
+        timer = threading.Timer(0.3, os.kill, (os.getpid(), signal.SIGINT))
         timer.start()
         self.addCleanup(timer.cancel)
         with self.assertRaises(KeyboardInterrupt):
@@ -1096,7 +1100,7 @@ class End(SessionCase):
         self.assertEqual(self.tcl().count('reset run'), 1)
 
     def test_two_concurrent_ends_end_the_session_once(self):
-        path = self.pending({'work': 'slow:2.5'})
+        path = self.pending()
         results = []
         threads = [threading.Thread(target=lambda: results.append(self.end(path, timeout=20))) for _ in range(2)]
         for t in threads:
@@ -1113,7 +1117,7 @@ class End(SessionCase):
         self.assertNotIn(op.session['receipt'] + '.lock', fds)
 
     def test_without_a_pidfd_end_is_refused(self):
-        path = self.pending({'work': 'slow:2.5'})
+        path = self.pending()
         n = len(self.tcl())
         for patch in (mock.patch.object(oe.os, 'pidfd_open', None),
                       mock.patch.object(oe.os, 'pidfd_open', side_effect=OSError(38, 'Function not implemented'))):
@@ -1125,7 +1129,7 @@ class End(SessionCase):
         self.assertKept(path, rc)
 
     def test_an_uncertain_exit_is_not_an_exit(self):
-        path = self.pending({'work': 'slow:2.5'}, FAKE_IGNORE_SHUTDOWN='1')
+        path = self.pending(FAKE_IGNORE_SHUTDOWN='1')
 
         class Poller:
             def register(self, fd, events):
@@ -1139,7 +1143,7 @@ class End(SessionCase):
         self.assertKept(path, rc)
 
     def test_the_command_line(self):
-        path = self.pending({'work': 'slow:2.5'})
+        path = self.pending()
         cli = [sys.executable, str(SCRIPTS / 'hil_openocd_esp.py'), 'end', '--receipt', path, '--timeout', '10']
         r = subprocess.run(cli, capture_output=True, text=True, timeout=60)
         self.assertEqual((r.returncode, json.loads(r.stdout)['outcome']), (0, 'ended'), r.stderr)

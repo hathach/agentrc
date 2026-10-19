@@ -74,7 +74,7 @@ class RunCmdModes(unittest.TestCase):
         t0 = time.monotonic()
         with redirect_stdout(io.StringIO()):
             r = hp.run_cmd(r"printf 'p\377re'; printf warn >&2; sleep 30",
-                           binary=True, split_stderr=True, timeout=1)
+                           binary=True, split_stderr=True, timeout=0.2)
         self.assertEqual(r.returncode, 124)
         # killpg + bounded communicate: well under sleep 30
         self.assertLess(time.monotonic() - t0, 15)
@@ -84,7 +84,7 @@ class RunCmdModes(unittest.TestCase):
 
     def test_text_mode_timeout_stdout_stays_str(self):
         with redirect_stdout(io.StringIO()):
-            r = hp.run_cmd('sleep 30', timeout=1)
+            r = hp.run_cmd('sleep 30', timeout=0.2)
         self.assertEqual(r.returncode, 124)
         # a text-mode caller must never get bytes back, even empty
         self.assertIsInstance(r.stdout, str)
@@ -92,9 +92,9 @@ class RunCmdModes(unittest.TestCase):
 
     def test_split_stderr_timeout_stderr_is_never_none(self):
         with redirect_stdout(io.StringIO()) as cap:
-            r = hp.run_cmd('sleep 30', split_stderr=True, timeout=1)
+            r = hp.run_cmd('sleep 30', split_stderr=True, timeout=0.2)
         self.assertEqual((r.returncode, r.stdout, r.stderr), (124, '', ''))
-        self.assertIn('COMMAND TIMEOUT (1s): sleep 30', cap.getvalue())
+        self.assertIn('COMMAND TIMEOUT (0.2s): sleep 30', cap.getvalue())
 
     def test_failed_banner_includes_split_stderr(self):
         # with split_stderr the diagnostic is in .stderr; the banner must not go blank.
@@ -208,7 +208,7 @@ class RunAlongsideKeepsStderrOffThePayload(unittest.TestCase):
         self.assertEqual(r.stderr, b'noise\n')
 
     def test_a_timeout_returns_124(self):
-        r = hp.run_alongside(['sleep', '30'], lambda: None, 1)
+        r = hp.run_alongside(['sleep', '30'], lambda: None, 0.2)
         self.assertEqual(r.returncode, 124)
 
 
@@ -234,7 +234,7 @@ class RunWhileContract(unittest.TestCase):
         def boom():
             raise AssertionError('x')
         with mock.patch.object(hp.subprocess, 'Popen', spy), self.assertRaises(AssertionError):
-            hp.run_alongside(['sleep', '30'], boom, 1)
+            hp.run_alongside(['sleep', '30'], boom, 0.2)
         self.assertIsNotNone(procs[0].returncode, 'work() raising leaked the child')
 
     def test_the_child_is_in_its_own_session(self):
@@ -532,7 +532,7 @@ class InterruptAcrossTheFork(unittest.TestCase):
     def test_timeout_kills_the_grandchild(self):
         with self._popen_hook():
             with redirect_stdout(io.StringIO()):
-                r = hp.run_cmd(self.shell_cmd, timeout=1)
+                r = hp.run_cmd(self.shell_cmd, timeout=0.2)
         self.assertEqual(r.returncode, 124)
         self._assert_group_gone(self.procs[0].pid)
 
