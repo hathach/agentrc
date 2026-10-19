@@ -1,6 +1,6 @@
 # agentrc
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Build](https://github.com/hathach/agentrc/actions/workflows/tests.yml/badge.svg)](https://github.com/hathach/agentrc/actions/workflows/tests.yml)
 [![Greptile: The War on Bugs](https://www.greptile.com/badge.svg)](https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source)
 ![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/hathach/agentrc?utm_source=oss&utm_medium=github&utm_campaign=hathach%2Fagentrc&labelColor=171717&color=FF570A&link=https%3A%2F%2Fcoderabbit.ai&label=CodeRabbit+Reviews)
