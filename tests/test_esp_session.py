@@ -1,13 +1,18 @@
+import contextlib
+import importlib.util
 import json
 import os
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'esp_session.py'
 
@@ -495,6 +500,102 @@ class EspSessionTest(unittest.TestCase):
         self.assertIn('not openocd-esp32', out['error'])
         self.assertFalse(self.log.exists() and self.calls('gdb'))
 
+
+
+def load_module():
+    spec = importlib.util.spec_from_file_location('agentrc_esp_session', SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+es = load_module()
+
+
+class TclBounds(unittest.TestCase):
+    """Without a deadline every socket operation gets `timeout` (as before); with one, the connect,
+    token check, send and each receive share it."""
+
+    def serve(self, replies):
+        """One connection: per request, (delay before answering, chunks of the answer)."""
+        srv = socket.create_server(('127.0.0.1', 0))
+        self.addCleanup(srv.close)
+
+        def run():
+            conn, _ = srv.accept()
+            with conn, contextlib.suppress(OSError):    # a client past its deadline hangs up
+                for delay, chunks in replies:
+                    buf = b''
+                    while not buf.endswith(b'\x1a'):
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            return
+                        buf += chunk
+                    time.sleep(delay)
+                    for c in chunks:
+                        conn.sendall(c)
+                        time.sleep(0.05)
+                conn.recv(1)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        self.addCleanup(t.join, 5)
+        return srv.getsockname()[1]
+
+    def test_without_a_deadline_each_operation_gets_the_timeout(self):
+        port = self.serve([(0.25, [b'tok\x1a']), (0.25, [b'he', b'll', b'o\x1a'])])
+        tcl = es.Tcl(port, 'tok', 0.4)
+        self.addCleanup(tcl.close)
+        self.assertEqual(tcl('x'), 'hello')
+
+    def test_a_deadline_bounds_the_token_check_and_the_answer_together(self):
+        port = self.serve([(0.25, [b'tok\x1a']), (0.25, [b'hello\x1a'])])
+        tcl = es.Tcl(port, 'tok', deadline=time.monotonic() + 0.4)
+        with self.assertRaises(TimeoutError):
+            tcl('x')
+        self.assertIsNone(tcl.sock)
+
+    def test_a_deadline_bounds_a_reply_trickling_in_fragments(self):
+        port = self.serve([(0, [b'tok\x1a']), (0, [b'a'] * 20 + [b'\x1a'])])
+        tcl = es.Tcl(port, 'tok', deadline=time.monotonic() + 0.5)
+        with self.assertRaises(TimeoutError):
+            tcl('x')
+
+    def test_a_fragmented_answer_within_the_deadline(self):
+        port = self.serve([(0, [b'to', b'k\x1a']), (0, [b'he', b'llo', b'\x1a'])])
+        tcl = es.Tcl(port, 'tok', deadline=time.monotonic() + 5)
+        self.addCleanup(tcl.close)
+        self.assertEqual(tcl('x'), 'hello')
+
+
+class Receipts(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.d = Path(td.name)
+
+    def test_written_atomically_also_at_a_relative_path(self):
+        old = os.getcwd()
+        os.chdir(self.d)
+        self.addCleanup(os.chdir, old)
+        es.write_receipt('receipt.json', {'pid': 1})
+        es.write_receipt('receipt.json', {'pid': 2, 'closed': True})
+        self.assertEqual(json.loads((self.d / 'receipt.json').read_text()), {'pid': 2, 'closed': True})
+        self.assertEqual(sorted(p.name for p in self.d.iterdir()), ['receipt.json'])
+
+    def test_a_failure_before_the_replacement_keeps_the_old_receipt(self):
+        path = self.d / 'receipt.json'
+        es.write_receipt(str(path), {'pid': 1})
+        with mock.patch.object(es.json, 'dump', side_effect=OSError('disk full')), self.assertRaises(OSError):
+            es.write_receipt(str(path), {'pid': 2})
+        self.assertEqual(json.loads(path.read_text()), {'pid': 1})
+        self.assertEqual(sorted(p.name for p in self.d.iterdir()), ['receipt.json'])
+
+    def test_same_process_by_argv_tail_and_start_time(self):
+        me = {'pid': os.getpid(), 'argv': es.cmdline(os.getpid())[-1:], 'startTime': es.start_time(os.getpid())}
+        self.assertTrue(es.same_process(me))
+        self.assertFalse(es.same_process({**me, 'startTime': '1'}))
+        self.assertFalse(es.same_process({**me, 'argv': ['not-this']}))
+        self.assertFalse(es.same_process({k: v for k, v in me.items() if k != 'startTime'}))
 
 if __name__ == '__main__':
     unittest.main()

@@ -73,6 +73,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 OBSERVER = ['set pagination off', 'set confirm off', 'set width 0', 'set may-write-memory off',
@@ -135,16 +136,30 @@ def server_command(exe, a, ports, log, token=None):
 class Tcl:
     """The port picked here could have been taken by another server meanwhile: a connection must answer
     this session's token before anything else is sent, and every later command goes down that same
-    connection. A connection that fails is dropped; the next command opens and checks a new one."""
+    connection. A connection that fails is dropped; the next command opens and checks a new one.
 
-    def __init__(self, port, token, timeout=10):
-        self.port, self.token, self.timeout, self.sock = port, token, timeout, None
+    Each socket operation is bounded by `timeout` seconds, or, when `deadline` (a time.monotonic()
+    value, settable between calls) is set, the connect, token check, send and every receive share it
+    and TimeoutError is raised once it has passed."""
+
+    def __init__(self, port, token, timeout=10, deadline=None):
+        self.port, self.token, self.timeout, self.deadline, self.sock = port, token, timeout, deadline, None
+
+    def _bound(self, cmd):
+        if self.deadline is None:
+            return self.timeout
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(f'Tcl port {self.port}: no answer to {cmd!r} by the deadline')
+        return left
 
     def _ask(self, cmd):
         try:
+            self.sock.settimeout(self._bound(cmd))
             self.sock.sendall(cmd.encode() + TCL_END)
             buf = b''
             while not buf.endswith(TCL_END):
+                self.sock.settimeout(self._bound(cmd))
                 chunk = self.sock.recv(4096)
                 if not chunk:
                     raise ToolError(f'Tcl port {self.port} closed before answering {cmd!r}')
@@ -156,7 +171,7 @@ class Tcl:
 
     def __call__(self, cmd):
         if self.sock is None:
-            self.sock = socket.create_connection(('127.0.0.1', self.port), timeout=self.timeout)
+            self.sock = socket.create_connection(('127.0.0.1', self.port), timeout=self._bound(cmd))
             got = self._ask('if {[info exists ESPS_SESSION]} {set ESPS_SESSION}')
             if got != self.token:
                 self.close()
@@ -285,8 +300,18 @@ def size_of(path):
 
 
 def write_receipt(path, rec):
-    with open(path, 'w') as f:
-        json.dump(rec, f, indent=1)
+    """Replace the receipt atomically: a reader sees the old record or the new one, never part."""
+    fd, tmp = tempfile.mkstemp(prefix='.receipt.', dir=os.path.dirname(path) or '.')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(rec, f, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
 
 
 def cmdline(pid):
@@ -297,6 +322,14 @@ def cmdline(pid):
         return None
 
 
+def same_process(rec):
+    """Whether rec's pid is still the process rec names: same argv (a script stand-in runs under its
+    interpreter, which /proc lists first, so the argv's tail) and start time."""
+    running = cmdline(rec['pid'])
+    return running is not None and running[-len(rec['argv']):] == rec['argv'] \
+        and start_time(rec['pid']) == rec.get('startTime')
+
+
 def leave(receipt_path):
     with open(receipt_path) as f:
         rec = json.load(f)
@@ -304,9 +337,7 @@ def leave(receipt_path):
     if rec.get('closed'):
         result['error'] = 'the receipt is closed: that server already shut down'
         return result, 2
-    running = cmdline(rec['pid'])
-    # a script stand-in runs under its interpreter, which /proc lists first
-    if running is None or running[-len(rec['argv']):] != rec['argv'] or start_time(rec['pid']) != rec.get('startTime'):
+    if not same_process(rec):
         result['error'] = (f"process {rec['pid']} is not the openocd this receipt names (gone, or another "
                            f'process): nothing sent')
         return result, 2
