@@ -85,10 +85,28 @@ USJ_VID_PID = ('303a', '1001')       # interface/esp_usb_jtag.cfg's `adapter usb
 USB_LOCATION_MAX = 15
 
 CLEANUP_TIMEOUT = 30                 # seconds for the reviewed end: reset run, shutdown, exit
+# a GitHub Actions job sets these, and one set even to '' counts: the runner kills the processes
+# carrying the job's tracking id at job end (actions/runner v2.337.0 src/Runner.Worker/JobExtension.cs:586-592, 880-926)
+CI_JOB_ENV = ('RUNNER_TRACKING_ID', 'GITHUB_ACTIONS')
 
 _UID_RE = re.compile(r'[A-Za-z0-9_.:+-]+')
 _PATH_RE = re.compile(r'/[A-Za-z0-9_./+-]*')    # a path that reaches a Tcl command unquoted
 _CHIP = r'esp32[a-z0-9]*'
+
+
+def ci_refusal() -> str:
+    """Why a session is refused in this process, or '': flash and reset raise it before anything
+    starts, and a consumer checks it before its own preparatory sessions. `end` is not refused."""
+    job = [v for v in CI_JOB_ENV if v in os.environ]
+    if not job:
+        return ''
+    return (f'openocd_esp is refused under a CI job ({", ".join(job)} set): the runner kills the job\'s '
+            f'processes at its end, and that the openocd server or a cleanup holder survives it is not established')
+
+
+def _refuse_ci():
+    if why := ci_refusal():
+        raise RuntimeError(why)
 
 
 def admit(flasher: dict) -> tuple:
@@ -615,6 +633,7 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     offset, file, size, erased range, sha256, `program` (the call's answer and log, `verified`
     when it printed "** Verify OK **") and `readBack` (file, length, match, firstMismatch).
     Refusals raise ValueError or RuntimeError before anything starts."""
+    _refuse_ci()
     security = admit_security(security)
     admitted = admit_segments(segments)
     records = [rec for rec, _ in admitted]
@@ -669,6 +688,7 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
     cores, which panics a running app built with the end-of-stack watchpoint; the reset run
     that follows reboots it, and an init that failed leaves the session pending instead.
     Returns hil_flash's Operation, as flash_openocd_esp without `segments`."""
+    _refuse_ci()
     return _run(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
 
 

@@ -168,7 +168,9 @@ recovery stay the contract's. Linux only.
   and a confirmed shutdown end it; an init failure, a command outstanding at
   the timeout or interrupt, or a failed reset or shutdown leaves cleanup
   `pending` with the session's receipt, for the caller's cleanup holder, and no
-  retry, restore or test may overlap it.
+  retry, restore or test may overlap it. Under a CI job (`RUNNER_TRACKING_ID`
+  or `GITHUB_ACTIONS` set) flash and reset are refused, and a consumer calls
+  `ci_refusal()` before its own preparatory sessions; `end` stays available.
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
   deadline and never signalling it. It refuses on any doubt: the session (or

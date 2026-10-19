@@ -460,6 +460,8 @@ class SessionCase(unittest.TestCase):
         env = mock.patch.dict(os.environ, {'FAKE_BANNER': BANNER, 'FAKE_EVENTS': str(self.events_file)})
         env.start()
         self.addCleanup(env.stop)
+        for var in oe.CI_JOB_ENV:       # this suite runs in a GitHub Actions job too
+            os.environ.pop(var, None)
         cleanup = mock.patch.object(oe, 'CLEANUP_TIMEOUT', 3)
         cleanup.start()
         self.addCleanup(cleanup.stop)
@@ -882,6 +884,21 @@ class Programming(SessionCase):
         self.assertEnded(op)
 
 
+class CiJob(SessionCase):
+    def test_flash_and_reset_are_refused_under_each_ci_variable_before_anything_starts(self):
+        spawn = mock.patch.object(oe.subprocess, 'Popen', side_effect=AssertionError('spawned'))
+        version = mock.patch.object(oe.subprocess, 'run', side_effect=AssertionError('ran'))
+        for var in oe.CI_JOB_ENV:
+            for value in ('true', ''):
+                for name, op in (('flash', lambda: oe.flash_openocd_esp(BOARD, [], security=None,
+                                                                         workdir=str(self.work), timeout=5)),
+                                 ('reset', lambda: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5))):
+                    with self.subTest(var=var, value=value, op=name), mock.patch.dict(os.environ, {var: value}), \
+                            spawn, version, self.assertRaisesRegex(RuntimeError, rf'under a CI job \({var} set\)'):
+                        op()
+        self.assertEqual((self.events(), list(self.work.iterdir())), ([], []))
+
+
 class Reset(SessionCase):
     def reset(self, **kw):
         return self.run_op(lambda timeout: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=timeout,
@@ -1141,6 +1158,12 @@ class End(SessionCase):
             rc, result = self.end(path)
         self.assertIn('exit not confirmed', result['error'])
         self.assertKept(path, rc)
+
+    def test_end_is_not_refused_under_a_ci_job(self):
+        path = self.pending()
+        with mock.patch.dict(os.environ, dict.fromkeys(oe.CI_JOB_ENV, 'true')):
+            rc, result = self.end(path)
+        self.assertEqual((rc, result['outcome']), (0, 'ended'))
 
     def test_the_command_line(self):
         path = self.pending()
