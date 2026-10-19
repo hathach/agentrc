@@ -95,7 +95,7 @@ def kill(pid):
 class ChiefRun(unittest.TestCase):
     def setUp(self):
         td = tempfile.TemporaryDirectory()
-        self.addCleanup(self.remove, td)
+        self.addCleanup(td.cleanup)
         self.root = Path(td.name)
         self.fake = self.root / 'fake'
         self.fake.mkdir()
@@ -147,17 +147,10 @@ class ChiefRun(unittest.TestCase):
         self.addCleanup(lambda: proc.poll() is None and (kill(proc.pid), proc.wait()))   # its tree: Windows keeps claude
         return proc
 
-    @staticmethod
-    def remove(td):
-        # Windows: a launcher that has written its exit line can hold its logs open a moment longer.
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                return td.cleanup()
-            except PermissionError:
-                if time.monotonic() > deadline:
-                    raise
-                time.sleep(0.1)
+    def wait_launcher_gone(self, stdout):
+        """The exit line is written before the launcher exits, its logs still open until then."""
+        pid = int(stdout.split('launcher pid ')[1].split(',')[0])
+        self.wait_until('the launcher to exit', lambda: not alive(pid))
 
     def wait_until(self, what, ok):
         deadline = time.monotonic() + 10
@@ -501,6 +494,7 @@ class ChiefRun(unittest.TestCase):
         pid = int((self.fake / 'pid').read_text())
         self.addCleanup(lambda: alive(pid) and kill(pid))
         self.assertFalse(alive(pid), "claude.cmd's node stopped with its cmd.exe")
+        self.wait_launcher_gone(r.stdout)
 
     @unittest.skipUnless(os.name == 'nt', 'shutil.which and CreateProcess try the working directory first')
     def test_claude_is_found_on_path_alone(self):
@@ -583,6 +577,7 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1 (launcher failed: OSError: disk full)'))
         self.assertFalse(alive(int((self.fake / 'pid').read_text())), 'chief stopped before the exit line')
+        self.wait_launcher_gone(r.stdout)
 
     def test_a_claude_that_cannot_start_is_recorded(self):
         empty = self.root / 'empty'

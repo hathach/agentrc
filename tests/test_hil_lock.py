@@ -542,8 +542,9 @@ class DetachedHolder(LockDir):
 
         def then_wait(*a, **k):                 # runs in the forked holder
             # Renamed into place: gone() may read it the moment it exists.
-            Path(self.dir, 'holder-pid.tmp').write_text(str(os.getpid()))
-            os.replace(Path(self.dir, 'holder-pid.tmp'), holder)
+            tmp = holder.with_name('holder-pid.tmp')
+            tmp.write_text(str(os.getpid()))
+            os.replace(tmp, holder)
             got = real(*a, **k)
             deadline = time.monotonic() + 10
             while not closed.exists() and time.monotonic() < deadline:

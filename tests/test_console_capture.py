@@ -209,7 +209,9 @@ sys.exit(m.main(sys.argv[1:]))
     def test_the_device_going_away_ends_the_capture(self):
         self.feed(b'boot\n', delay=0.2)
         proc = self.start('--seconds', '10', '--lines', 'leave')
-        time.sleep(1.0)
+        deadline = time.monotonic() + 9    # the capture is reading once the boot line is written out
+        while not (self.out.exists() and self.out.read_bytes()) and time.monotonic() < deadline:
+            time.sleep(0.05)
         os.close(self.master)
         out, err = proc.communicate(timeout=30)
         out = json.loads(out)

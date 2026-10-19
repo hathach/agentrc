@@ -16,7 +16,6 @@ def pytest_collection_modifyitems(config, items):
         raise pytest.UsageError(f'--shard {spec}: expected I/K')
     if not 0 <= i < k:
         raise pytest.UsageError(f'--shard {spec}: I must be in 0..K-1')
-    order = sorted(item.nodeid for item in items)
-    mine = {nodeid for n, nodeid in enumerate(order) if n % k == i}
+    mine = set(sorted(item.nodeid for item in items)[i::k])
     config.hook.pytest_deselected(items=[item for item in items if item.nodeid not in mine])
     items[:] = [item for item in items if item.nodeid in mine]
