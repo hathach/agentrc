@@ -559,9 +559,11 @@ class DetachedHolder(LockDir):
 
         def gone():
             deadline = time.monotonic() + 10
-            while not holder.exists() and time.monotonic() < deadline:
+            text = ''
+            while not text and time.monotonic() < deadline:     # rewritten, so briefly empty, per board
+                text = holder.read_text() if holder.exists() else ''
                 _sleep(0.01)
-            pid = int(holder.read_text())
+            pid = int(text)
             self.addCleanup(self.kill_quietly, pid, signal.SIGKILL)     # a takeover holder ignores SIGTERM
             while time.monotonic() < deadline:
                 try:
