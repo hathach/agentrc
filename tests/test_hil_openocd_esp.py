@@ -7,6 +7,7 @@ import unittest
 if os.name == 'nt':
     raise unittest.SkipTest('hil_openocd_esp is Linux only')
 
+import hashlib
 import importlib.util
 import json
 import signal
@@ -36,14 +37,19 @@ hf = load('agentrc_hil_flash', SCRIPTS / 'hil_flash.py')
 
 SERIAL = '30:ED:A0:E0:C9:02'
 BOARD = {'name': 'openocd_esp', 'uid': SERIAL, 'args': '-f board/esp32p4-builtin.cfg'}
+SECURITY = {'flashEncryption': 'off', 'secureBoot': 'off', 'source': 'esptool transcript /w/security.txt'}
 BANNER = f'Open On-Chip Debugger {oe.VERIFIED_OPENOCD} (2026-07-03-13:49)'
 
 
 # openocd-esp32 stand-in: the banner, then a server that logs its listening line and answers the
-# token query and the wrapped Tcl commands. FAKE_SCRIPT maps a command, or `<command>#<n>` for its
-# n-th sending, to "ok:<answer>", "err:<message>", "hang" (never answers) or "die" (exits without
-# answering). FAKE_EVENTS gets its argv, every command and every signal it receives; it never
-# exits on SIGTERM/SIGINT/SIGHUP, so a test can see a signal that would have killed openocd.
+# token query and the wrapped Tcl commands. FAKE_SCRIPT maps a command, its first word, or
+# `<first word>#<n>` for the n-th such command, to "ok:<answer>", "err:<message>", "hang" (never
+# answers) or "die" (exits without answering). Otherwise program_esp, flash list and flash
+# read_bank work on FAKE_FLASH, a FAKE_BANK_SIZE image: program_esp erases whole sectors, writes,
+# and verifies only the 4-byte-aligned prefix as verify_bank_hash does; FAKE_CORRUPT=tail corrupts
+# an unaligned segment's last byte, =after_verify its first byte after the verify. FAKE_EVENTS gets
+# its argv, every command and every signal; it never exits on SIGTERM/SIGINT/SIGHUP, so a test
+# sees a signal that would have killed openocd.
 FAKE_OPENOCD = r'''#!/usr/bin/env python3
 import json, os, re, signal, socket, sys, time
 argv = sys.argv[1:]
@@ -90,10 +96,53 @@ if os.environ.get('FAKE_NO_LISTEN'):
 say(f'Info : Listening on port {port} for tcl connections')
 sent = {}
 WRAPPED = re.compile(r'^if \{\[catch \{(.*)\} hil_m\]\} \{set hil_m "HIL-ERR \$hil_m"\} else \{set hil_m "HIL-OK \$hil_m"\}$', re.S)
+FLASH, BANK = os.environ.get('FAKE_FLASH'), int(os.environ.get('FAKE_BANK_SIZE', '0'), 0)
+def image():
+    with open(FLASH, 'rb') as f:
+        return bytearray(f.read())
+def store(img):
+    with open(FLASH, 'wb') as f:
+        f.write(img)
+def program(path, addr):
+    with open(path, 'rb') as f:
+        data = f.read()
+    img, n = image(), len(data)
+    end = -(-(addr + n) // 4096) * 4096
+    img[addr:end] = b'\xff' * (end - addr)
+    img[addr:addr + n] = data
+    if os.environ.get('FAKE_CORRUPT') == 'tail' and n % 4:
+        img[addr + n - 1] ^= 0xff
+    store(img)
+    say('** Programming Finished in 1 ms **')
+    if img[addr:addr + (n & ~3)] != data[:n & ~3]:
+        say('** Verify Failed **')
+        return 'HIL-ERR ** Verify Failed **'
+    say('** Verify OK **')
+    if os.environ.get('FAKE_CORRUPT') == 'after_verify':
+        img[addr] ^= 1
+        store(img)
+    return 'HIL-OK '
+def model(cmd):
+    if m := re.fullmatch(r'program_esp \{(\S+)\} (0x[0-9a-f]+) verify no_skip_loaded', cmd):
+        return program(m[1], int(m[2], 16))
+    if cmd == 'flash list':
+        return ('HIL-OK {\n    name       {esp32p4.hp.cpu0.flash}\n    driver     esp32p4\n    base       0x00000000\n'
+                f'    size       0x{BANK:x}\n    bus_width  0\n    chip_width 0\n    target     esp32p4.hp.cpu0\n}}\n'
+                '{\n    name       {esp32p4.hp.cpu0.irom}\n    driver     esp32p4\n    base       0x40000000\n'
+                '    size       0x0\n}\n')
+    if m := re.fullmatch(r'flash read_bank 0 \{(\S+)\} (0x[0-9a-f]+) (\d+)', cmd):
+        off, n = int(m[2], 16), int(m[3])
+        with open(m[1], 'wb') as f:
+            f.write(image()[off:off + n])
+        return 'HIL-OK '
+    say(f'Info : {cmd} done')
+    return 'HIL-OK '
 def run(cmd):
     first = cmd.split()[0] if cmd.split() else ''
-    sent[cmd] = sent.get(cmd, 0) + 1
-    action = script.get(f'{cmd}#{sent[cmd]}', script.get(cmd, 'ok:'))
+    sent[first] = sent.get(first, 0) + 1
+    action = script.get(cmd, script.get(f'{first}#{sent[first]}', script.get(first)))
+    if action is None:
+        return model(cmd)
     if action == 'hang':
         time.sleep(120)
     if action == 'die':
@@ -649,6 +698,197 @@ class TclDeadline(unittest.TestCase):
         self.assertTrue(cm.exception.timed_out)
         self.assertEqual(s.steps[-1]['outcome'], 'outstanding')
         s.tcl.close()
+
+
+class Programming(SessionCase):
+    BANK = 0x10000
+
+    def setUp(self):
+        super().setUp()
+        build = self.root / 'build'
+        build.mkdir()
+        self.files = {}
+        for name, size in (('bootloader.bin', 5000), ('partition-table.bin', 1003), ('app.bin', 4096)):
+            self.files[name] = build / name
+            self.files[name].write_bytes(os.urandom(size))
+        self.segs = [{'offset': 0x0, 'file': str(self.files['bootloader.bin']), 'size': 5000},
+                     {'offset': 0x2000, 'file': str(self.files['partition-table.bin']), 'size': 1003},
+                     {'offset': 0x8000, 'file': str(self.files['app.bin']), 'size': 4096}]
+        self.flash = self.root / 'flash.img'
+        self.flash.write_bytes(b'\x5a' * self.BANK)
+
+    def flash_op(self, segs=None, *, bank=None, **kw):
+        env = {'FAKE_FLASH': str(self.flash), 'FAKE_BANK_SIZE': hex(self.BANK if bank is None else bank), **kw.pop('env', {})}
+        security = kw.pop('security', SECURITY)
+        return self.run_op(lambda timeout: oe.flash_openocd_esp(BOARD, self.segs if segs is None else segs,
+                                                                 security=security, workdir=str(self.work),
+                                                                 timeout=timeout, openocd=str(self.exe)),
+                           **env, **kw)
+
+    def program_cmds(self, segs=None):
+        return [f"program_esp {{{s['file']}}} 0x{s['offset']:x} verify no_skip_loaded" for s in segs or self.segs]
+
+    def read_cmds(self, op):
+        return [f"flash read_bank 0 {{{r['readBack']['file']}}} 0x{r['offset']:x} {r['readBack']['length']}"
+                for r in op.segments]
+
+    def test_each_segment_programmed_in_order_then_read_back_exactly(self):
+        op = self.flash_op()
+        self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list',
+                                      *self.program_cmds(), *self.read_cmds(op), 'reset run', 'shutdown'])
+        self.assertEqual(op.returncode, 0)
+        self.assertEnded(op)
+        img = self.flash.read_bytes()
+        for rec, seg in zip(op.segments, self.segs):
+            data = Path(seg['file']).read_bytes()
+            self.assertEqual(img[seg['offset']:seg['offset'] + seg['size']], data)
+            self.assertTrue(rec['program']['verified'])
+            self.assertEqual((rec['readBack']['match'], rec['readBack']['firstMismatch']), (True, None))
+            self.assertEqual(rec['sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual([r['readBack']['length'] for r in op.segments], [5000, 1004, 4096])
+        self.assertEqual([r['erase'] for r in op.segments], [[0, 0x2000], [0x2000, 0x3000], [0x8000, 0x9000]])
+
+    def test_the_callers_security_evidence_is_recorded(self):
+        op = self.flash_op()
+        self.assertEqual(op.session['security'], SECURITY)
+
+    def test_no_flash_without_security_evidence(self):
+        with self.assertRaises(TypeError):
+            oe.flash_openocd_esp(BOARD, self.segs, workdir=str(self.work), timeout=5, openocd=str(self.exe))
+        for security in (None, {}, {**SECURITY, 'flashEncryption': 'on'}, {**SECURITY, 'secureBoot': 'on'},
+                         {**SECURITY, 'secureBoot': False}, {**SECURITY, 'flashEncryption': 'unknown'},
+                         {**SECURITY, 'source': ''}, {k: v for k, v in SECURITY.items() if k != 'source'},
+                         {**SECURITY, 'extra': 1}, 'off'):
+            with self.subTest(security=security), self.assertRaisesRegex(ValueError, 'security'):
+                self.flash_op(security=security)
+        self.assertEqual(self.events(), [])
+
+    def test_a_corrupt_trailing_byte_the_verify_skips_fails_the_read_back(self):
+        op = self.flash_op(env={'FAKE_CORRUPT': 'tail'})
+        seg = op.segments[1]
+        self.assertTrue(seg['program']['verified'])
+        self.assertEqual((seg['readBack']['match'], seg['readBack']['firstMismatch']), (False, 1002))
+        self.assertNotIn('readBack', op.segments[2])
+        self.assertEqual(op.returncode, 1)
+        self.assertIn('differs at +0x3ea', op.session['failure'])
+        self.assertEnded(op)
+
+    def test_a_read_back_mismatch_after_a_good_verify_fails(self):
+        op = self.flash_op(env={'FAKE_CORRUPT': 'after_verify'})
+        self.assertEqual(op.segments[0]['readBack']['firstMismatch'], 0)
+        self.assertEqual(op.returncode, 1)
+        self.assertEnded(op)
+
+    def test_the_first_failed_segment_stops_programming(self):
+        op = self.flash_op(script={'program_esp#2': 'err:** Verify Failed **'})
+        self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list',
+                                      *self.program_cmds()[:2], 'reset run', 'shutdown'])
+        self.assertEqual([r.get('program', {}).get('ok') for r in op.segments], [True, False, None])
+        self.assertEqual(op.segments[1]['program']['answer'], '** Verify Failed **')
+        self.assertEqual(op.returncode, 1)
+        self.assertEnded(op)
+
+    def test_a_program_call_without_verify_ok_is_a_failure(self):
+        op = self.flash_op(script={'program_esp#1': 'ok:'})
+        self.assertFalse(op.segments[0]['program']['verified'])
+        self.assertEqual(op.returncode, 1)
+        self.assertEnded(op)
+
+    def test_a_timeout_during_programming_leaves_the_session_pending(self):
+        op = self.flash_op(timeout=3, script={'program_esp#2': 'hang'})
+        self.assertEqual(self.tcl()[-1], self.program_cmds()[1])
+        self.assertEqual((op.returncode, op.attempts[0].kind), (124, 'timed_out'))
+        self.assertNotIn('reset run', self.tcl())
+        self.assertPending(op)
+
+    def test_an_interrupt_during_programming_carries_the_segments(self):
+        old = signal.signal(signal.SIGINT, signal.default_int_handler)
+        self.addCleanup(signal.signal, signal.SIGINT, old)
+        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with self.assertRaises(KeyboardInterrupt) as cm:
+            self.flash_op(timeout=30, script={'program_esp#1': 'hang'})
+        op = cm.exception.operation
+        self.assertEqual(len(op.segments), 3)
+        self.assertEqual(op.session['security'], SECURITY)
+        self.assertPending(op)
+
+    def test_a_segment_ending_at_the_bank_end_is_accepted(self):
+        self.files['app.bin'].write_bytes(os.urandom(0x1000))
+        segs = [{'offset': self.BANK - 0x1000, 'file': str(self.files['app.bin']), 'size': 0x1000}]
+        op = self.flash_op(segs)
+        self.assertEqual(op.returncode, 0)
+
+    def test_a_segment_whose_erase_leaves_the_bank_is_refused_before_any_write(self):
+        segs = [self.segs[0], {'offset': self.BANK - 0x1000, 'file': self.segs[1]['file'], 'size': 1003}]
+        op = self.flash_op(segs, bank=self.BANK - 0x1000)
+        self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list', 'reset run',
+                                      'shutdown'])
+        self.assertIn('leaves bank esp32p4.hp.cpu0.flash', op.session['failure'])
+        self.assertEqual(op.returncode, 1)
+        self.assertEnded(op)
+
+    def test_an_unprobed_bank_is_refused_before_any_write(self):
+        op = self.flash_op(bank=0)
+        self.assertNotIn(self.program_cmds()[0], self.tcl())
+        self.assertIn('not a probed whole-flash bank', op.session['failure'])
+        self.assertEnded(op)
+
+
+class Segments(unittest.TestCase):
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.f = Path(td.name) / 'app.bin'
+        self.f.write_bytes(b'\x01' * 0x1001)
+
+    def seg(self, **kw):
+        return {'offset': 0x10000, 'file': str(self.f), 'size': 0x1001, **kw}
+
+    def test_admitted_segments_keep_their_order_and_bytes(self):
+        g = Path(str(self.f) + '2')
+        g.write_bytes(b'\x02' * 4)
+        got = oe.admit_segments([self.seg(), self.seg(offset=0x2000, file=str(g), size=4, encrypted='false')])
+        self.assertEqual([(r['offset'], r['erase'], d[:1]) for r, d in got],
+                         [(0x10000, [0x10000, 0x12000], b'\x01'), (0x2000, [0x2000, 0x3000], b'\x02')])
+
+    def test_guards(self):
+        for segs, why in (([], 'no segments'), (None, 'no segments'), ([self.seg(size=0)], 'positive'),
+                          ([self.seg(size=0x1000)], '4097 bytes, the segment says 4096'),
+                          ([self.seg(offset=0x10004)], 'multiple of 0x1000'), ([self.seg(offset=-0x1000)], 'multiple'),
+                          ([self.seg(offset=True)], 'multiple'), ([self.seg(size='0x1001')], 'positive'),
+                          ([self.seg(compress=True)], 'nothing but'), ([{'offset': 0, 'file': str(self.f)}], 'want'),
+                          ([self.seg(encrypted=True)], 'encrypted writes'), ([self.seg(encrypted='true')], 'encrypted'),
+                          ([self.seg(file=str(self.f) + 'x')], 'No such file'),
+                          ([self.seg(), self.seg(offset=0x11000)], 'overlap'), ([('0', str(self.f), 1)], 'want')):
+            with self.subTest(segs=segs, why=why), self.assertRaisesRegex(ValueError, why):
+                oe.admit_segments(segs)
+
+    def test_a_file_openocd_would_load_as_elf_ihex_or_srecord_is_refused(self):
+        # image.c autodetect_image_type reads these by their embedded addresses, not at the offset
+        for head in (b'\x7fELF\x01\x01\x01\x00\x00', b':020000040800F2\r\n', b':10010000214601360121470136007EFE09\r\n',
+                     b'S00F000068656C6C6F202020202000003C\r\n', b'S1137AF00A0A0D0000000000000000000000000061\r\n'):
+            self.f.write_bytes(head.ljust(0x1001, b'\x00'))
+            with self.subTest(head=head), self.assertRaisesRegex(ValueError, 'would load it as'):
+                oe.admit_segments([self.seg()])
+
+    def test_raw_binaries_that_only_resemble_those_are_admitted(self):
+        # an ESP image, files under 9 bytes, a record type past 05, a non-digit S type, a broken ELF magic
+        for head, pad in ((b'\xe9\x03\x02\x4f', True), (b':0200000', False), (b'S113', False),
+                          (b':02000006xx', True), (b'SA13000000', True), (b'\x7fEL\x00', True)):
+            self.f.write_bytes(head.ljust(0x1001, b'\x00') if pad else head)
+            with self.subTest(head=head):
+                self.assertEqual(len(oe.admit_segments([self.seg(size=self.f.stat().st_size)])), 1)
+
+    def test_a_path_that_would_reach_tcl_unquoted_is_refused(self):
+        odd = self.f.parent / 'a b.bin'
+        odd.write_bytes(b'\x00' * 4)
+        with self.assertRaisesRegex(ValueError, 'reaches Tcl'):
+            oe.admit_segments([{'offset': 0, 'file': str(odd), 'size': 4}])
+
+    def test_adjacent_erase_extents_are_fine(self):
+        self.assertEqual(len(oe.admit_segments([self.seg(), self.seg(offset=0x12000)])), 2)
 
 
 if __name__ == '__main__':

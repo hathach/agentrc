@@ -34,6 +34,7 @@ watchpoint panics it, and only the reset run brings it back.
 from __future__ import annotations
 
 import glob
+import hashlib
 import importlib.util
 import os
 import re
@@ -377,6 +378,7 @@ class Session:
         """hil_flash's Operation of one attempt, the session: argv, the commands sent as its
         script, the log as stdout, rc 0 (all done), 1 (failed), 124 (timed out) or None
         (raised), cleanup and receipt; plus `steps` and `session`."""
+        self.tcl.close()    # an outstanding command still completes; the receipt reconnects
         cleanup = self.cleanup()
         receipt = None if cleanup != 'pending' else self.receipt if self.receipt_written else self.rec
         rc = None if error is not None else 124 if self.timed_out else 1 if self.failure else 0
@@ -458,3 +460,173 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None):
         e.operation = _finish(s, e, **info)
         raise
     return _finish(s, **info)
+
+
+# -------------------------------------------------------------
+# Programming
+# -------------------------------------------------------------
+SECTOR = 4096           # FLASH_SECTOR_SIZE of every esp32*.c flash driver
+_SEGMENT_KEYS = {'offset', 'file', 'size', 'encrypted'}
+
+
+def _int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+_HEX = frozenset(b'0123456789abcdefABCDEF')
+
+
+def _loaded_as(head: bytes) -> str | None:
+    """What openocd would load a file starting with `head` as, if not a raw binary: program_esp
+    hands the file to `flash write_image erase` without a type (esp_common.cfg:642-663), which
+    autodetects ELF, Intel HEX and S-record (image.c:42-89, image_open :956-960) and places their
+    records at their own addresses rather than at the segment's offset."""
+    if len(head) < 9:
+        return None                      # image.c:57-62: under 9 bytes is always binary
+    if head[:4] == b'\x7fELF':
+        return 'ELF'
+    if head[0] == ord(':') and all(c in _HEX for c in head[1:7]) and head[7] == ord('0') \
+            and ord('0') <= head[8] < ord('6'):
+        return 'Intel HEX'
+    if head[0] == ord('S') and all(c in _HEX for c in head[1:4]) and ord('0') <= head[1] < ord('9'):
+        return 'S-record'
+    return None
+
+
+def admit_segments(segments) -> list:
+    """[(record, bytes)] for the caller's ordered segments ({offset, file, size}), or ValueError.
+
+    An offset is sector-aligned: `flash write_image erase` erases whole sectors around the
+    range but pads only its end with data (core.c:516-552, 883-900), so bytes before an
+    unaligned offset would be erased. Erase extents may not overlap. A length need not be a
+    multiple of 4: verify_bank_hash skips the last length % 4 bytes (esp_flash.c:1726-1730),
+    so the read-back covers them. `encrypted` may only be false: program_esp is run without
+    `encrypt` and writes plaintext; any other key is an option this backend does not apply."""
+    if not isinstance(segments, (list, tuple)) or not segments:
+        raise ValueError('no segments')
+    admitted, extents = [], []
+    for seg in segments:
+        if not isinstance(seg, dict) or not {'offset', 'file', 'size'} <= set(seg) <= _SEGMENT_KEYS:
+            raise ValueError(f'segment {seg!r}: want {{offset, file, size}} and nothing but `encrypted` false')
+        if seg.get('encrypted', False) not in (False, 'false'):
+            raise ValueError(f'segment {seg!r}: encrypted writes are refused (program_esp writes plaintext here)')
+        offset, size = seg['offset'], seg['size']
+        if not _int(offset) or offset < 0 or offset % SECTOR:
+            raise ValueError(f'segment {seg!r}: the offset must be a multiple of 0x{SECTOR:x}')
+        if not _int(size) or size <= 0:
+            raise ValueError(f'segment {seg!r}: the size must be a positive number of bytes')
+        path = os.path.abspath(str(seg['file']))
+        if not _PATH_RE.fullmatch(path):
+            raise ValueError(f'segment file {path!r}: letters, digits and _ . / + - only (it reaches Tcl)')
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+        except OSError as e:
+            raise ValueError(f'segment file {path}: {e}') from None
+        if len(data) != size:
+            raise ValueError(f'segment file {path}: {len(data)} bytes, the segment says {size}')
+        kind = _loaded_as(data[:9])
+        if kind:
+            raise ValueError(f'segment file {path}: openocd would load it as {kind}, at its own addresses; '
+                             f'give the raw binary')
+        end = -(-(offset + size) // SECTOR) * SECTOR
+        extents.append((offset, end, path))
+        admitted.append(({'offset': offset, 'file': path, 'size': size, 'erase': [offset, end],
+                          'sha256': hashlib.sha256(data).hexdigest()}, data))
+    extents.sort()
+    for (_, a_end, a), (b_start, _, b) in zip(extents, extents[1:]):
+        if b_start < a_end:
+            raise ValueError(f'segments {a} and {b} overlap in their erased sectors')
+    return admitted
+
+
+_SECURITY_KEYS = {'flashEncryption', 'secureBoot', 'source'}
+
+
+def admit_security(security) -> dict:
+    """The caller's evidence that the chip's flash encryption and secure boot are off, read from
+    the chip before programming: {flashEncryption: 'off', secureBoot: 'off', source: <where it was
+    read, such as a transcript>}. Anything else is refused: this backend writes plaintext without
+    `encrypt` and never decides the chip's security state itself."""
+    if not isinstance(security, dict) or set(security) != _SECURITY_KEYS \
+            or security['flashEncryption'] != 'off' or security['secureBoot'] != 'off' \
+            or not isinstance(security['source'], str) or not security['source'].strip():
+        raise ValueError(f'security evidence {security!r}: want {{flashEncryption: "off", secureBoot: "off", '
+                         f'source: <where it was read>}}; programming is refused otherwise')
+    return dict(security)
+
+
+_BANK_RE = re.compile(r'name\s+\{([^}]*)\}\s+driver\s+(\S+)\s+base\s+(0x[0-9a-fA-F]+)\s+size\s+(0x[0-9a-fA-F]+)')
+
+
+def _bank0(listing: str) -> dict:
+    # `flash list` (tcl.c:1454-1475); bank 0 is the whole flash, which program_esp's verify_bank_hash 0
+    # and read_bank 0 use (esp_common.cfg configure_esp_flash_bank)
+    m = _BANK_RE.search(listing)
+    if not m or not m[1].endswith('.flash') or int(m[3], 16) != 0 or not int(m[4], 16) \
+            or int(m[4], 16) % SECTOR:
+        raise _Stop(f'flash bank 0 is not a probed whole-flash bank: {listing[:200]!r}', end=True)
+    return {'name': m[1], 'driver': m[2], 'size': int(m[4], 16)}
+
+
+def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, openocd=None):
+    """Program `segments` in order, each by `program_esp <file> <offset> verify no_skip_loaded`
+    (esp_common.cfg:531-705; never its `exit`, whose program_error runs `shutdown error`,
+    startup.tcl:12-19), stopping at the first failure; then read every segment back with
+    `flash read_bank` and compare it byte for byte with the bytes admitted. One managed session
+    (module docstring) within `timeout` seconds, files in a new directory under `workdir`.
+
+    `security` is the caller's evidence that flash encryption and secure boot are off
+    (admit_security), required and recorded as `session['security']`.
+
+    Before the first write it runs `reset init` and `flash probe 0` and refuses a segment whose
+    erased sectors leave bank 0. Returns hil_flash's Operation, with `segments`: per segment its
+    offset, file, size, erased range, sha256, `program` (the call's answer and log, `verified`
+    when it printed "** Verify OK **") and `readBack` (file, length, match, firstMismatch).
+    Refusals raise ValueError or RuntimeError before anything starts."""
+    security = admit_security(security)
+    admitted = admit_segments(segments)
+    records = [rec for rec, _ in admitted]
+
+    def work(s):
+        s.check('reset init')
+        s.check('flash probe 0')
+        bank = _bank0(s.check('flash list'))
+        for rec in records:
+            if rec['erase'][1] > bank['size']:
+                raise _Stop(f"segment {rec['file']} at 0x{rec['offset']:x} leaves bank {bank['name']} "
+                            f"(0x{bank['size']:x} bytes)", end=True)
+        for rec in records:
+            ok, answer = s.ask(f"program_esp {{{rec['file']}}} 0x{rec['offset']:x} verify no_skip_loaded")
+            log = s.steps[-1]['log']
+            rec['program'] = {'ok': ok, 'answer': answer, 'log': log,
+                              'verified': ok and '** Verify OK **' in log}
+            if not rec['program']['verified']:
+                raise _Stop(f"programming {rec['file']} at 0x{rec['offset']:x} failed: {answer or 'no Verify OK'}",
+                            end=True)
+        for i, (rec, data) in enumerate(admitted):
+            # esp_algo_flash_read refuses an unaligned offset (esp_flash.c:986-989); the length is
+            # rounded up to 4 and only the segment's own bytes compared
+            length = -(-rec['size'] // 4) * 4
+            path = os.path.join(s.out, f'readback_{i}_0x{rec["offset"]:x}.bin')
+            rec['readBack'] = {'file': path, 'length': length, 'match': False, 'firstMismatch': None}
+            s.check(f"flash read_bank 0 {{{path}}} 0x{rec['offset']:x} {length}")
+            with open(path, 'rb') as f:
+                got = f.read()
+            diff = next((j for j, (a, b) in enumerate(zip(got, data)) if a != b), None)
+            if diff is None and len(got) != length:
+                diff = min(len(got), rec['size'])
+            rec['readBack'].update(match=diff is None, firstMismatch=diff)
+            if diff is not None:
+                raise _Stop(f"read-back of {rec['file']} at 0x{rec['offset']:x} differs at +0x{diff:x}", end=True)
+
+    try:
+        op = _run(flasher, work, workdir=workdir, timeout=timeout, openocd=openocd)
+    except BaseException as e:
+        if hasattr(e, 'operation'):
+            e.operation.segments = tuple(records)
+            e.operation.session['security'] = security
+        raise
+    op.segments = tuple(records)
+    op.session['security'] = security
+    return op
