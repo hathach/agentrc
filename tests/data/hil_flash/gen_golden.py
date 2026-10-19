@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -85,7 +86,7 @@ def record(case, module, invoke, normalise_cmd) -> dict:
         def run(cmd, **kw):
             script = None
             if isinstance(cmd, str) and '-CommandFile ' in cmd:
-                script = Path(cmd.rsplit('-CommandFile ', 1)[1]).read_text()
+                script = Path(shlex.split(cmd.rsplit('-CommandFile ', 1)[1])[0]).read_text()
             calls.append({'cmd': normalise_cmd(cmd, ctx), 'kw': kw, 'script': script})
             now[0] += case['took']
             results.append(subprocess.CompletedProcess(cmd, next(rcs), f'out{len(results)}', None))

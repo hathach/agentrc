@@ -4,8 +4,10 @@ every flasher of that commit's tinyusb.json and hfp.json (copies in tests/data/h
 plus a pyOCD entry, and requires exactly what tinyusb's module produced
 (tests/data/hil_flash/gen_golden.py): commands, J-Link scripts, cwd, timeouts, retries,
 output and the result handed back. Only the pyOCD launcher path and its --project-dir
-argument are normalised. Equality there does not establish timing, signals or pyOCD's
-project-directory behaviour; test_hil_process and test_hil_pyocd do."""
+argument are normalised, plus one deliberate delta since: J-Link command files are unique
+per attempt and removed after it (jlink_command_file_delta). Equality there does not
+establish timing, signals or pyOCD's project-directory behaviour; test_hil_process and
+test_hil_pyocd do."""
 import os
 import unittest
 
@@ -16,9 +18,12 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
+import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 from pathlib import Path
 from unittest import mock
@@ -41,8 +46,8 @@ gen = load('hil_flash_gen_golden', DATA / 'gen_golden.py')
 
 
 def provider_invoke(case, run, ctx):
-    """What a project adapter passes for each case (tinyusb: board name as the J-Link command
-    file stem, 2 crash retries, the build's IDF_TARGET, flash_args and serial port)."""
+    """What a project adapter passes for each case (tinyusb: 2 J-Link crash retries, the
+    build's IDF_TARGET, flash_args and serial port)."""
     f, op, t = case['flasher'], case['op'], case['timeout']
     name = f['name'].lower()
     if op == 'rescue':
@@ -51,16 +56,41 @@ def provider_invoke(case, run, ctx):
         return hf.flash_esptool(f, chip=gen.ESP_CHIP[case['board']], port=gen.ESP_PORT.format(uid=f['uid']),
                                 flash_args=gen.ESP_FLASH_ARGS.strip().replace('\n', ' '),
                                 cwd=str(ctx['fw_dir']), timeout=t, run=run)
-    kw = {'jlink': {'command_file_stem': case['board'], 'crash_retries': 2},
+    kw = {'jlink': {'crash_retries': 2},
           'pyocd': {'project_dir': str(ctx['project_dir'])}}.get(name, {})
     args = (gen.FIRMWARE,) if op == 'flash' else ()
     return getattr(hf, f'{op}_{name}')(f, *args, timeout=t, run=run, **kw)
 
 
+COMMAND_FILE = '-CommandFile {COMMAND_FILE}'
+
+
 def provider_normalise(cmd, ctx):
     if isinstance(cmd, list) and cmd[1:4] == [hf.PYOCD_LAUNCHER, '--project-dir', str(ctx['project_dir'])]:
         return [cmd[0], '{LAUNCHER}', *cmd[4:]]
+    if isinstance(cmd, str) and '-CommandFile ' in cmd:
+        head, tail = cmd.rsplit('-CommandFile ', 1)
+        path, = shlex.split(tail)
+        if (Path(path).parent == Path.cwd() and re.fullmatch(r'hil_jlink_\w+\.jlink', Path(path).name)
+                and tail == shlex.quote(path)):
+            return head + COMMAND_FILE
     return cmd
+
+
+def jlink_command_file_delta(case, observed):
+    """The pre-move module named the file `<board>_<firmware name>.jlink` (flash) or
+    `<board>_reset.jlink` (reset, kept in the working directory); now each attempt gets a
+    unique file in the working directory, removed after it."""
+    if case['flasher']['name'].lower() != 'jlink' or case['op'] == 'rescue':
+        return observed
+    old = f"{case['board']}_{Path(gen.FIRMWARE).name if case['op'] == 'flash' else 'reset'}.jlink"
+    calls = []
+    for call in observed['calls']:
+        head, name = call['cmd'].rsplit('-CommandFile ', 1)
+        assert name == old, (name, old)
+        calls.append({**call, 'cmd': head + COMMAND_FILE})
+    assert observed['left'] == ([old] if case['op'] == 'reset' else []), observed['left']
+    return {**observed, 'calls': calls, 'left': []}
 
 
 class Golden(unittest.TestCase):
@@ -68,6 +98,7 @@ class Golden(unittest.TestCase):
     def setUpClass(cls):
         golden = json.loads((DATA / 'golden.json').read_text())
         cls.observed = {tuple(c['case']): c['observed'] for c in golden['cases']}
+        cls.expected = {gen.key(c): jlink_command_file_delta(c, cls.observed[gen.key(c)]) for c in gen.cases()}
 
     def test_the_fixture_covers_every_case(self):
         self.assertEqual(list(self.observed), [gen.key(c) for c in gen.cases()])
@@ -81,7 +112,7 @@ class Golden(unittest.TestCase):
             for case in gen.cases():
                 with self.subTest(case=gen.key(case)):
                     self.assertEqual(gen.record(case, hf, provider_invoke, provider_normalise),
-                                     self.observed[gen.key(case)])
+                                     self.expected[gen.key(case)])
 
 
 def capture(fn, *args, rcs=(0,), took=0, **kw):
@@ -109,29 +140,150 @@ JLINK = {'name': 'jlink', 'uid': 'S1', 'args': '-device x'}
 
 
 class JLink(unittest.TestCase):
-    def test_flash_writes_the_script_runs_it_and_removes_it(self):
-        _, calls, left, _ = capture(hf.flash_jlink, JLINK, '/fw/a.hex', command_file_stem='b', timeout=7)
-        self.assertEqual(calls, [('JLinkExe -USB S1 -device x -if swd -JTAGConf -1,-1 -speed auto -NoGui 1 '
-                                  '-ExitOnError 1 -CommandFile b_a.hex.jlink', {'timeout': 7})])
-        self.assertEqual(left, [])
-        case = {'board': 'b', 'rcs': [0], 'took': 0}
-        observed = gen.record(case, hf, lambda c, run, ctx: hf.flash_jlink(
-            JLINK, '/fw/a.hex', command_file_stem='b', timeout=7, run=run), lambda cmd, ctx: cmd)
-        self.assertEqual(observed['calls'][0]['script'], 'halt\nr\nloadfile /fw/a.hex\nr\ngo\nexit\n')
+    PREFIX = 'JLinkExe -USB S1 -device x -if swd -JTAGConf -1,-1 -speed auto -NoGui 1 -ExitOnError 1 -CommandFile '
 
-    def test_reset_keeps_its_script(self):
-        _, calls, left, _ = capture(hf.reset_jlink, JLINK, command_file_stem='b', timeout=11)
-        self.assertEqual(calls[0][1], {'timeout': 11})
-        self.assertTrue(calls[0][0].endswith('-CommandFile b_reset.jlink'))
-        self.assertEqual(left, ['b_reset.jlink'])
+    def in_dir(self, d=None):
+        """chdir into a fresh directory (or d) for the test; returns it."""
+        d = d or self.enterContext(tempfile.TemporaryDirectory())
+        cwd = os.getcwd()
+        os.chdir(d)
+        self.addCleanup(os.chdir, cwd)
+        return d
+
+    def reading_run(self, seen, rcs=None, then=None):
+        """A runner recording (path, script, files beside it) per call."""
+        rcs = iter(rcs or [0] * 9)
+
+        def run(cmd, **kw):
+            self.assertTrue(cmd.startswith(self.PREFIX), cmd)
+            path, = shlex.split(cmd[len(self.PREFIX):])
+            seen.append((path, Path(path).read_text(), sorted(os.listdir(Path(path).parent))))
+            if then:
+                then()
+            return subprocess.CompletedProcess(cmd, next(rcs), '', '')
+        return run
+
+    def test_flash_writes_a_unique_script_in_the_cwd_runs_it_and_removes_it(self):
+        d, seen = self.in_dir(), []
+        hf.flash_jlink(JLINK, '/fw/a.hex', timeout=7, run=self.reading_run(seen))
+        (path, script, beside), = seen
+        self.assertEqual(Path(path).parent, Path(d).resolve())
+        self.assertRegex(Path(path).name, r'^hil_jlink_\w+\.jlink$')
+        self.assertEqual(script, 'halt\nr\nloadfile /fw/a.hex\nr\ngo\nexit\n')
+        self.assertEqual(beside, [Path(path).name])
+        self.assertEqual(os.listdir(d), [])
+
+    def test_reset_writes_its_script_every_time_and_removes_it(self):
+        d, seen = self.in_dir(), []
+        for _ in range(2):
+            hf.reset_jlink(JLINK, timeout=11, run=self.reading_run(seen))
+        self.assertEqual([s for _, s, _ in seen], ['halt\nr\ngo\nexit\n'] * 2)
+        self.assertEqual(os.listdir(d), [])
+
+    def test_a_stale_command_file_is_never_run_or_touched(self):
+        d, seen = self.in_dir(), []
+        stale = {'b_reset.jlink': 'erase\n', 'b_a.hex.jlink': 'erase\n'}
+        for name, text in stale.items():
+            Path(d, name).write_text(text)
+        hf.reset_jlink(JLINK, timeout=11, run=self.reading_run(seen))
+        hf.flash_jlink(JLINK, '/fw/a.hex', timeout=7, run=self.reading_run(seen))
+        self.assertEqual([s for _, s, _ in seen], ['halt\nr\ngo\nexit\n', 'halt\nr\nloadfile /fw/a.hex\nr\ngo\nexit\n'])
+        self.assertNotIn(Path(seen[0][0]).name, stale)
+        self.assertEqual({p.name: p.read_text() for p in Path(d).iterdir()}, stale)
+
+    def test_concurrent_invocations_in_one_cwd_get_their_own_files(self):
+        d, seen, errors = self.in_dir(), [], []
+        both_running = threading.Barrier(2, timeout=10)
+
+        def invoke(fn, *args):
+            try:
+                fn(JLINK, *args, timeout=7, run=self.reading_run(seen, then=both_running.wait))
+            except Exception as e:
+                errors.append(e)
+        threads = [threading.Thread(target=invoke, args=a) for a in ((hf.flash_jlink, '/fw/a.hex'),
+                                                                      (hf.reset_jlink,))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len({p for p, _, _ in seen}), 2)
+        self.assertEqual(sorted(s for _, s, _ in seen),
+                         sorted(['halt\nr\ngo\nexit\n', 'halt\nr\nloadfile /fw/a.hex\nr\ngo\nexit\n']))
+        self.assertEqual(os.listdir(d), [])
+
+    def test_the_file_is_removed_when_the_run_raises(self):
+        for exc in (RuntimeError('boom'), KeyboardInterrupt()):
+            with self.subTest(exc=type(exc).__name__):
+                d, seen = self.in_dir(), []
+
+                def interrupted():
+                    raise exc
+                for fn, args in ((hf.flash_jlink, ('/fw/a.hex',)), (hf.reset_jlink, ())):
+                    with self.assertRaises(type(exc)):
+                        fn(JLINK, *args, timeout=7, crash_retries=2, run=self.reading_run(seen, then=interrupted))
+                self.assertEqual(len(seen), 2)
+                self.assertEqual(os.listdir(d), [])
+
+    def test_crash_reruns_reuse_the_invocations_file_which_is_gone_afterwards(self):
+        d, seen = self.in_dir(), []
+        for fn, args in ((hf.flash_jlink, ('/fw/a.hex',)), (hf.reset_jlink, ())):
+            seen.clear()
+            with contextlib.redirect_stdout(io.StringIO()):
+                ret = fn(JLINK, *args, timeout=30, crash_retries=2, run=self.reading_run(seen, rcs=[139, -6, 0]))
+            self.assertEqual(ret.returncode, 0)
+            self.assertEqual(seen, [seen[0]] * 3)
+            self.assertEqual(seen[0][2], [Path(seen[0][0]).name])
+            self.assertEqual(os.listdir(d), [])
+
+    def test_no_attempt_starts_past_the_deadline_taken_after_the_file_write(self):
+        """Fake clock: writing the command file takes `prep` s, each run `took` s."""
+        self.in_dir()
+        real_command_file = hf._command_file
+
+        def timed(fn, *args, prep, took, timeout, rcs):
+            now, starts = [0.0], []
+
+            @contextlib.contextmanager
+            def slow_command_file(script):
+                with real_command_file(script) as path:
+                    now[0] += prep
+                    yield path
+
+            def run(cmd, timeout):
+                starts.append((now[0], timeout))
+                now[0] += took
+                return subprocess.CompletedProcess(cmd, rcs[len(starts) - 1], '', '')
+            with mock.patch.object(hf, '_command_file', slow_command_file), \
+                    mock.patch.object(hf, 'time', types.SimpleNamespace(monotonic=lambda: now[0])), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                fn(JLINK, *args, timeout=timeout, crash_retries=2, run=run)
+            return starts
+        for fn, args in ((hf.flash_jlink, ('/fw/a.hex',)), (hf.reset_jlink, ())):
+            with self.subTest(fn=fn.__name__):
+                # deadline = prep + timeout = 8: every attempt ends its bound there
+                starts = timed(fn, *args, prep=3, took=1, timeout=5, rcs=[139, 139, 139])
+                self.assertEqual(starts, [(3, 5), (4, 4), (5, 3)])
+                # the first run spends the bound: no rerun past it
+                self.assertEqual(timed(fn, *args, prep=3, took=5, timeout=5, rcs=[139, 139, 139]), [(3, 5)])
+
+    def test_the_path_is_shell_quoted(self):
+        base = self.enterContext(tempfile.TemporaryDirectory())
+        d = Path(base, "a b'$c")
+        d.mkdir()
+        seen = []
+        self.in_dir(d)
+        hf.reset_jlink(JLINK, timeout=11, run=self.reading_run(seen))
+        self.assertEqual(Path(seen[0][0]).parent, d.resolve())
+        self.assertEqual(os.listdir(d), [])
 
     def test_no_crash_rerun_by_default(self):
-        ret, calls, _, _ = capture(hf.reset_jlink, JLINK, command_file_stem='b', timeout=30, rcs=[139])
+        ret, calls, _, _ = capture(hf.reset_jlink, JLINK, timeout=30, rcs=[139])
         self.assertEqual((ret.returncode, len(calls)), (139, 1))
 
     def test_crash_reruns_share_one_deadline(self):
         def timeouts(fn, *args, **kw):
-            ret, calls, _, out = capture(fn, JLINK, *args, command_file_stem='b', crash_retries=2, **kw)
+            ret, calls, _, out = capture(fn, JLINK, *args, crash_retries=2, **kw)
             return ret.returncode, [k['timeout'] for _, k in calls], out.count('rerunning')
         self.assertEqual(timeouts(hf.flash_jlink, '/fw/a.hex', timeout=30, rcs=[139, -6, 0], took=10),
                          (0, [30, 20, 10], 2))
@@ -142,8 +294,7 @@ class JLink(unittest.TestCase):
 
     def test_other_failures_are_not_rerun(self):
         for rc in (1, 124):
-            ret, calls, _, _ = capture(hf.reset_jlink, JLINK, command_file_stem='b', timeout=5,
-                                       crash_retries=2, rcs=[rc])
+            ret, calls, _, _ = capture(hf.reset_jlink, JLINK, timeout=5, crash_retries=2, rcs=[rc])
             self.assertEqual((ret.returncode, len(calls)), (rc, 1))
 
     def test_the_crash_rcs_are_shell_and_direct_signals(self):

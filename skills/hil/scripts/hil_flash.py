@@ -13,6 +13,7 @@ it succeeded, not that the target runs the image; rc 124 means it was killed on 
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import os
 import re
@@ -21,6 +22,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -54,44 +56,48 @@ def _runner(run):
 JLINK_CRASH_RCS = {128 + signal.SIGSEGV, -signal.SIGSEGV, 128 + signal.SIGABRT, -signal.SIGABRT}
 
 
-def _run_jlink(flasher: dict, command_file: Path, *, timeout, crash_retries: int,
-               run) -> subprocess.CompletedProcess:
-    # crash_retries reruns share one deadline. A rerun is no proof the target was untouched.
-    run = _runner(run)
-    cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
-           f'-NoGui 1 -ExitOnError 1 -CommandFile {command_file}')
-    deadline = time.monotonic() + timeout
-    ret = run(cmd, timeout=timeout)
-    for _ in range(crash_retries):
-        left = deadline - time.monotonic()
-        if ret.returncode not in JLINK_CRASH_RCS or left <= 0:
-            break
-        print(f'JLinkExe -USB {flasher["uid"]} crashed (rc {ret.returncode}), rerunning', flush=True)
-        ret = run(cmd, timeout=left)
-    return ret
-
-
-def flash_jlink(flasher: dict, firmware: str, *, command_file_stem: str, timeout,
-                crash_retries: int = 0, run=None) -> subprocess.CompletedProcess:
-    # The command file is `<command_file_stem>_<firmware name>.jlink` in the current directory.
-    script = ['halt', 'r', f'loadfile {firmware}', 'r', 'go', 'exit']
-    f_jlink = Path(f'{command_file_stem}_{Path(firmware).name}.jlink')
-    with f_jlink.open('w') as f:
-        f.writelines(f'{s}\n' for s in script)
-    ret = _run_jlink(flasher, f_jlink, timeout=timeout, crash_retries=crash_retries, run=run)
-    f_jlink.unlink(missing_ok=True)
-    return ret
-
-
-def reset_jlink(flasher: dict, *, command_file_stem: str, timeout,
-                crash_retries: int = 0, run=None) -> subprocess.CompletedProcess:
-    # The command file is `<command_file_stem>_reset.jlink` in the current directory, kept.
-    script = ['halt', 'r', 'go', 'exit']
-    f_jlink = Path(f'{command_file_stem}_reset.jlink')
-    if not f_jlink.exists():
-        with f_jlink.open('w') as f:
+@contextlib.contextmanager
+def _command_file(script: list):
+    # A unique file per invocation in the current directory: a stale or concurrent file is
+    # never the one run, and none outlives the invocation.
+    fd, path = tempfile.mkstemp(prefix='hil_jlink_', suffix='.jlink', dir=os.getcwd())
+    try:
+        with os.fdopen(fd, 'w') as f:
             f.writelines(f'{s}\n' for s in script)
-    return _run_jlink(flasher, f_jlink, timeout=timeout, crash_retries=crash_retries, run=run)
+        yield path
+    finally:
+        Path(path).unlink(missing_ok=True)
+
+
+def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int,
+               run) -> subprocess.CompletedProcess:
+    # crash_retries reruns share one deadline, taken once the command file is written.
+    # A rerun is no proof the target was untouched.
+    run = _runner(run)
+    with _command_file(script) as path:
+        cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
+               f'-NoGui 1 -ExitOnError 1 -CommandFile {shlex.quote(path)}')
+        deadline = time.monotonic() + timeout
+        ret = run(cmd, timeout=timeout)
+        for _ in range(crash_retries):
+            left = deadline - time.monotonic()
+            if ret.returncode not in JLINK_CRASH_RCS or left <= 0:
+                break
+            print(f'JLinkExe -USB {flasher["uid"]} crashed (rc {ret.returncode}), rerunning', flush=True)
+            ret = run(cmd, timeout=left)
+    return ret
+
+
+def flash_jlink(flasher: dict, firmware: str, *, timeout,
+                crash_retries: int = 0, run=None) -> subprocess.CompletedProcess:
+    script = ['halt', 'r', f'loadfile {firmware}', 'r', 'go', 'exit']
+    return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
+
+
+def reset_jlink(flasher: dict, *, timeout,
+                crash_retries: int = 0, run=None) -> subprocess.CompletedProcess:
+    script = ['halt', 'r', 'go', 'exit']
+    return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
 
 
 # -------------------------------------------------------------
