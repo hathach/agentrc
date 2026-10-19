@@ -377,6 +377,21 @@ class DetachedHolder(LockDir):
         for b in boards:
             self.assertIsNone(hil_lock.read_record(b))
 
+    def test_release_waits_for_the_holder_to_drop_its_flock_after_clearing_its_record(self):
+        real_clear = hil_lock.clear_record
+
+        def clear_then_linger(fh):        # runs in the forked holder
+            real_clear(fh)
+            _sleep(0.5)
+
+        self.patch(hil_lock, 'clear_record', clear_then_linger)
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
+        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        with quiet():
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
+        self.assertTrue(self.flock_is_free())
+
     def test_a_board_recorded_after_the_release_scanned_is_cleared_before_the_named_one(self):
         other = BOARD + '-2'
         real_clear = hil_lock.clear_record

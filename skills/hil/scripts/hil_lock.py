@@ -806,14 +806,25 @@ def _boards_of(pid, start) -> list:
 
 def _wait_released(owned, named, deadline) -> list:
     """The boards of `owned` ({board: (pid, start) of its signalled holder}) still taken at the
-    deadline: by that holder's record, alive or not, by an unreadable one, or, on a board in
-    `named`, by any live holder. A board only _boards_of added is cleared once another holder
-    has it."""
+    deadline: by that holder's record, alive or not, or its flock, by an unreadable record, or,
+    on a board in `named`, by any live holder. A board only _boards_of added is cleared once
+    another holder has it."""
+    def holds_flock(b):
+        # the holder clears its records before it exits and the kernel drops its flocks
+        pid, start = owned[b]
+        try:
+            return proc_start(pid) == start and _holds_flock(pid, lock_path(b))
+        except OSError:
+            return True        # unproven either way: rechecked until the deadline
+
     def taken(b):
         state, rec = record_state(b)
-        if state != 'record':
-            return state == 'unreadable'
-        return (rec.get('pid'), rec.get('start')) == owned[b] or (b in named and _alive(rec))
+        if state == 'unreadable':
+            return True
+        if state == 'record' and ((rec.get('pid'), rec.get('start')) == owned[b]
+                                  or (b in named and _alive(rec))):
+            return True
+        return holds_flock(b)
     while True:
         still = sorted(b for b in owned if taken(b))
         if not still or time.monotonic() >= deadline:
