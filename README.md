@@ -277,6 +277,9 @@ python -X utf8 -m unittest discover -s tests
 ```
 
 Needs PyYAML; the pre-commit hook runs the same command (`pre-commit install`).
+CI runs the same tests in parallel and sharded across jobs under pytest-xdist
+(`.github/workflows/tests.yml`); `PYTHONUTF8=1 python -m pytest -n 8 --dist worksteal tests`
+does the same locally, `--shard I/K` (`tests/conftest.py`) runs one part of it.
 Where Git for Windows has `core.fsmonitor=true` (an installer option), each
 temporary test repository leaves a `git fsmonitor--daemon` behind; run the suite
 with `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=false`.
