@@ -3827,6 +3827,26 @@ test('a deferred sibling the offered note states does not keep it from being pos
   assert.equal(result.pass, true)
 })
 
+test('a deferred sibling whose point the offered note does not state keeps it handed off (#115)', async () => {
+  // The resumed launch defers the sibling with another reason, so its point is not the one the dead note carried.
+  let cycle = 0
+  const opts = (reason, state) => ({
+    args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, deferrals: [deferral({ findingId: '1#2', reason })], ...(state ? { state } : {}) },
+    ...(state ? { preflight: { head: state.expectedHead, prHead: state.expectedHead } } : {}),
+    dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
+    reviewsPerCycle: (prompt) => {
+      cycle++
+      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
+      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: JSON.parse(sha)[0].sha })
+      return { findings: [fixed, finding({ line: 2 })], replies: cycle === 1 ? [] : [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
+    },
+  })
+  const first = await run(opts('broken on master too; own PR'))
+  const { result, calls } = await run(opts('needs its own PR', first.result.state))
+  assert.equal(calls.some(c => c.label.startsWith('resolve#')), false, 'the offered note went out without the point now owed')
+  assert.match(debtOf(result, 1).repair.error, /offered fixNote is stale/)
+})
+
 test('a rebase drops a pending fix note\'s repair: the rewritten commit cannot be named again (#115)', async () => {
   const attempt = { body: `Fixed in ${HEAD}.\n\n- src/a.c:1`, how: 'fixNote', digest: 'd1', repair: { sha: HEAD, findings: ['1#1'] } }
   const state = adoptionState({ debt: [[1, { dismissals: [], notes: ['1#1'], digest: 'd1', attempt }]] })
