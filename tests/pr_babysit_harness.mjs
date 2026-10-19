@@ -3807,6 +3807,26 @@ test('a partial harvest before the note qualifies leaves no dismissal behind onc
   assert.equal(result.pass, true)
 })
 
+test('a deferred sibling the offered note states does not keep it from being posted (#115)', async () => {
+  let cycle = 0
+  const { result, calls } = await run({
+    args: { autoPush: true, maxCycles: 4, deferrals: [deferral({ findingId: '1#2' })] },
+    dropDoneIds: (label) => cycle === 1 && label.startsWith('resolve#'),
+    reviewsPerCycle: (prompt) => {
+      cycle++
+      const sha = String(prompt).match(/not yet posted[^[]*(\[.*?\])/)?.[1]
+      const fixed = cycle === 1 ? finding() : finding({ verdict: 'stale', fixedBy: JSON.parse(sha)[0].sha })
+      return { findings: [fixed, finding({ line: 2 })], replies: cycle === 1 ? [] : [{ commentId: 1, body: 'already fixed' }], bots: 'reviewed' }
+    },
+  })
+  const [offered] = manifestOf(calls, 'resolve#1')
+  assert.match(offered.body, new RegExp(`- src/a\\.c:2:\\n  .*${ISSUE}`))
+  assert.equal(manifestOf(calls, 'resolve#2')[0].body, offered.body, 'the offered body, deferred point included')
+  assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
+  assert.equal(result.handoffs, undefined)
+  assert.equal(result.pass, true)
+})
+
 test('a rebase drops a pending fix note\'s repair: the rewritten commit cannot be named again (#115)', async () => {
   const attempt = { body: `Fixed in ${HEAD}.\n\n- src/a.c:1`, how: 'fixNote', digest: 'd1', repair: { sha: HEAD, findings: ['1#1'] } }
   const state = adoptionState({ debt: [[1, { dismissals: [], notes: ['1#1'], digest: 'd1', attempt }]] })

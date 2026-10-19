@@ -2368,12 +2368,15 @@ const runLanes = async (cycle, entry, lanes) => {
     //   deferral: deferred points only; deferred points ride in a mixed comment's reply
     const ledger = new Map()
     const digestOf = new Map()
-    // A fix note whose post died is owed again, as offered, once a fresh judgment names its repair as what made every finding it covered stale (#115).
+    // A fix note whose post died is owed again, as offered, once a fresh judgment names its repair as what made every finding it covered stale (#115);
+    // a deferred sibling may stand beside them only as the offered body already states it.
     const ownFixed = new Set(unpostedNotes().filter(([id, { attempt: a }]) => {
       const now = r.findings.filter(f => f.commentId === id)
-      return now.length > 0 &&
-        now.every(f => f.verdict === 'stale' && !f.hold && f.fixedBy === a.repair.sha && f.commentDigest === a.digest && a.repair.findings.includes(f.findingId)) &&
-        a.repair.findings.every(k => now.some(f => f.findingId === k))
+      const fixed = now.filter(f => !f.deferral)
+      return fixed.length > 0 && now.every(f => !f.hold && f.commentDigest === a.digest) &&
+        fixed.every(f => f.verdict === 'stale' && f.fixedBy === a.repair.sha && a.repair.findings.includes(f.findingId)) &&
+        now.every(f => !f.deferral || `\n${a.body}\n`.includes(`\n${deferralLine(f)}\n`)) &&
+        a.repair.findings.every(k => fixed.some(f => f.findingId === k))
     }).map(([id]) => id))
     for (const f of r.findings) {
       const e = ledger.get(f.commentId) || { valid: 0, refuted: 0, deferred: 0 }
