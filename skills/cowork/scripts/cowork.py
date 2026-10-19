@@ -260,8 +260,8 @@ def publish(path, text):
     tmp.write_text(text)
     try:
         # Windows' rename never replaces either (the OS's, not the lock backend's), and leaves no second name a
-        # reader of `path` could hold open
-        (os.rename if os.name == 'nt' else os.link)(tmp, path)
+        # reader of `path` could hold open; a reader of `tmp` without delete sharing refuses it for a moment
+        retry(lambda: (os.rename if os.name == 'nt' else os.link)(tmp, path))
     except FileExistsError:
         return False
     finally:

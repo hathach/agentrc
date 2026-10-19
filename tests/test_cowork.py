@@ -1252,6 +1252,15 @@ class CoworkTest(unittest.TestCase):
             self.assertTrue(cowork.publish(target, 'killed\n'))
         self.assertEqual(target.read_text(), 'killed\n')
 
+    def test_a_verdict_is_published_after_a_reader_briefly_holds_its_temporary_file(self):
+        target = self.root / 'x.exit'
+        name = 'rename' if os.name == 'nt' else 'link'
+        with mock.patch.object(cowork, 'fcntl', None), mock.patch.object(cowork.time, 'sleep'), \
+                mock.patch.object(cowork.os, name, wraps=getattr(os, name),
+                                  side_effect=[PermissionError(13, 'in use'), mock.DEFAULT]) as move:
+            self.assertTrue(cowork.publish(target, '0\n'))
+        self.assertEqual((target.read_text(), move.call_count), ('0\n', 2))
+
     # --- one request in flight -----------------------------------------------------------
 
     def test_one_request_in_flight_per_side_and_the_next_resumes_the_same_session(self):
