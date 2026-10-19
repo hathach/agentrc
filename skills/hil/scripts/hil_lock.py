@@ -734,8 +734,8 @@ def _release_one(b, victims) -> int:
 
 def _boards_of(pid, start) -> list:
     """Every board whose record names the holder `pid` started at `start`."""
-    recs = {b: read_record(b) for b in lock_names()}
-    return [b for b, r in recs.items() if isinstance(r, dict) and (r.get('pid'), r.get('start')) == (pid, start)]
+    return [b for b in lock_names()
+            if isinstance(r := read_record(b), dict) and (r.get('pid'), r.get('start')) == (pid, start)]
 
 
 def cmd_release(boards):
