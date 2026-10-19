@@ -469,7 +469,9 @@ case "$action" in
     # the contract's Limits say what this host's does), so treat it as a forced re-enumeration, not
     # a power cycle. It goes straight at the root port -- no leaf walk (a leaf hub may claim ganged
     # switching and never cut power) -- and never
-    # writes the wedged device's sysfs or takes its lock, so it cannot join a D-state convoy.
+    # writes the wedged device's sysfs. Its power request takes no child's lock, but uhubctl opens
+    # the hubs and the root port's children first, so a device wedged right under that root port
+    # can still pull it into a D-state convoy (agentrc#149).
     # uhubctl exits 0 even when it does nothing ("No compatible devices detected" still returns
     # 0), so its status proves nothing -- the sysfs_gen check below is the only real verdict.
     [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
@@ -530,7 +532,8 @@ case "$action" in
     # incident, not verified under it. The price is root-cycle's hazard: disable_store
     # disconnects the child under the hub's lock first, so a wedged target would block it --
     # hence the serial that must answer, and a wedged leaf is left to root-cycle, whose libusb
-    # request has no child-disconnect in front.
+    # request has no child-disconnect in front, though uhubctl's opens before it can block on the
+    # same wedged leaf (agentrc#149).
     [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
     [[ "$target" == *.* ]] || refuse "hub-cycle: $target is on a root port; that is root-cycle's"
     hub=${target%.*}; port=${target##*.}
@@ -544,7 +547,7 @@ case "$action" in
     disable="$hubd/$hub:1.0/$hub-port$port/disable"
     [ -f "$disable" ] || refuse "hub-cycle: no port control file $disable"
     serial=$(lock_read "$idf/serial")
-    [ "$serial" != '?' ] || refuse "hub-cycle: $target's serial did not answer (wedged): the port write would block on its lock; use root-cycle"
+    [ "$serial" != '?' ] || refuse "hub-cycle: $target's serial did not answer (wedged): the port write would block on its lock; root-cycle is next, though it can block on it too (agentrc#149)"
     [ -n "$serial" ] || refuse "hub-cycle: $target has no readable serial to prove it answers"
     expect=${3:-}
     [ -z "$expect" ] || [ "$expect" = "$serial" ] || refuse "hub-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"

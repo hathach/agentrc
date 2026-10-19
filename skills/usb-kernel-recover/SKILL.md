@@ -130,9 +130,13 @@ A harness may also send Reset_TT to a full- or low-speed device's hub before a f
 that is the harness's own pre-flash lever, not a rung here.
 
 **Rung 2 — wedged PROBE: `root-cycle`.** A probe has no probe to reset it, so the
-port-side drop is the only lever left that avoids the KERNEL device lock. It
-commands the ROOT hub and never touches the wedged device's `device_lock` — which
-is exactly why rungs 1 and 3 are dangerous and this one is not.
+port-side drop is the only lever left. Its power request goes to the ROOT hub and
+takes no child's `device_lock`, but uhubctl (v2.6.0) first opens every hub and the
+root port's connected children (`libusb_open` -> `usbdev_open` ->
+`usb_lock_device`, uninterruptible; `-N` skips only the string reads). A device
+wedged directly under that root port can therefore block it in D state while every
+lock is held (agentrc#149): it is not a guaranteed escape, only the rung that does
+not write to the wedged device itself.
 
 That is a different lock from the host's **board flocks**, and this rung still needs
 those: it bounces every fixture under the root port, including boards another job is
