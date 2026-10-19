@@ -90,7 +90,8 @@ def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int,
 
 def flash_jlink(flasher: dict, firmware: str, *, timeout,
                 crash_retries: int = 0, run=None) -> subprocess.CompletedProcess:
-    script = ['halt', 'r', f'loadfile {firmware}', 'r', 'go', 'exit']
+    # loadfile resets and halts the target itself by default (J-Link Commander, LoadFile)
+    script = ['halt', f'loadfile {firmware}', 'r', 'go', 'exit']
     return _run_jlink(flasher, script, timeout=timeout, crash_retries=crash_retries, run=run)
 
 

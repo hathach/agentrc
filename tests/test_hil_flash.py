@@ -4,10 +4,11 @@ every flasher of that commit's tinyusb.json and hfp.json (copies in tests/data/h
 plus a pyOCD entry, and requires exactly what tinyusb's module produced
 (tests/data/hil_flash/gen_golden.py): commands, J-Link scripts, cwd, timeouts, retries,
 output and the result handed back. Only the pyOCD launcher path and its --project-dir
-argument are normalised, plus one deliberate delta since: J-Link command files are unique
-per attempt and removed after it (jlink_command_file_delta). Equality there does not
-establish timing, signals or pyOCD's project-directory behaviour; test_hil_process and
-test_hil_pyocd do."""
+argument are normalised, plus deliberate deltas since, each applied explicitly: J-Link
+command files are unique per invocation, reused by its crash reruns and removed after it
+(jlink_command_file_delta), and the J-Link flash script has no reset before `loadfile`
+(jlink_flash_script_delta). Equality there does not establish timing, signals or pyOCD's
+project-directory behaviour; test_hil_process and test_hil_pyocd do."""
 import os
 import unittest
 
@@ -79,8 +80,8 @@ def provider_normalise(cmd, ctx):
 
 def jlink_command_file_delta(case, observed):
     """The pre-move module named the file `<board>_<firmware name>.jlink` (flash) or
-    `<board>_reset.jlink` (reset, kept in the working directory); now each attempt gets a
-    unique file in the working directory, removed after it."""
+    `<board>_reset.jlink` (reset, kept in the working directory); now each invocation gets a
+    unique file in the working directory, reused by its crash reruns and removed after it."""
     if case['flasher']['name'].lower() != 'jlink' or case['op'] == 'rescue':
         return observed
     old = f"{case['board']}_{Path(gen.FIRMWARE).name if case['op'] == 'flash' else 'reset'}.jlink"
@@ -93,12 +94,32 @@ def jlink_command_file_delta(case, observed):
     return {**observed, 'calls': calls, 'left': []}
 
 
+PRE_MOVE_FLASH_SCRIPT = f'halt\nr\nloadfile {gen.FIRMWARE}\nr\ngo\nexit\n'
+FLASH_SCRIPT = f'halt\nloadfile {gen.FIRMWARE}\nr\ngo\nexit\n'
+
+
+def jlink_flash_script_delta(case, observed):
+    """Option B: the leading `r` of the pre-move J-Link flash script is dropped, as both
+    projects' CMake jlink targets already run it; the reset script is unchanged."""
+    if case['flasher']['name'].lower() != 'jlink' or case['op'] != 'flash':
+        return observed
+    calls = []
+    for call in observed['calls']:
+        assert call['script'] == PRE_MOVE_FLASH_SCRIPT, call['script']
+        calls.append({**call, 'script': FLASH_SCRIPT})
+    return {**observed, 'calls': calls}
+
+
+def deltas(case, observed):
+    return jlink_flash_script_delta(case, jlink_command_file_delta(case, observed))
+
+
 class Golden(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         golden = json.loads((DATA / 'golden.json').read_text())
         cls.observed = {tuple(c['case']): c['observed'] for c in golden['cases']}
-        cls.expected = {gen.key(c): jlink_command_file_delta(c, cls.observed[gen.key(c)]) for c in gen.cases()}
+        cls.expected = {gen.key(c): deltas(c, cls.observed[gen.key(c)]) for c in gen.cases()}
 
     def test_the_fixture_covers_every_case(self):
         self.assertEqual(list(self.observed), [gen.key(c) for c in gen.cases()])
@@ -106,6 +127,15 @@ class Golden(unittest.TestCase):
     def test_every_roster_flasher_kind_is_covered(self):
         names = {f['name'].lower() for *_, f in gen.flashers()}
         self.assertEqual(names, {'jlink', 'stlink', 'openocd', 'lm4flash', 'esptool', 'pyocd'})
+
+    def test_every_jlink_flash_case_carries_the_script_delta(self):
+        flash = [k for k in self.observed if k[3] == 'flash' and any(
+            c['script'] == PRE_MOVE_FLASH_SCRIPT for c in self.observed[k]['calls'])]
+        jlink = [gen.key(c) for c in gen.cases() if c['flasher']['name'].lower() == 'jlink' and c['op'] == 'flash']
+        self.assertEqual(flash, jlink)
+        self.assertTrue(jlink)
+        for k in jlink:
+            self.assertEqual({c['script'] for c in self.expected[k]['calls']}, {FLASH_SCRIPT})
 
     def test_the_provider_matches_the_pre_move_module(self):
         with mock.patch.object(hf, '_pyocd_python', return_value='/py'):
@@ -169,7 +199,7 @@ class JLink(unittest.TestCase):
         (path, script, beside), = seen
         self.assertEqual(Path(path).parent, Path(d).resolve())
         self.assertRegex(Path(path).name, r'^hil_jlink_\w+\.jlink$')
-        self.assertEqual(script, 'halt\nr\nloadfile /fw/a.hex\nr\ngo\nexit\n')
+        self.assertEqual(script, 'halt\nloadfile /fw/a.hex\nr\ngo\nexit\n')
         self.assertEqual(beside, [Path(path).name])
         self.assertEqual(os.listdir(d), [])
 
@@ -187,7 +217,7 @@ class JLink(unittest.TestCase):
             Path(d, name).write_text(text)
         hf.reset_jlink(JLINK, timeout=11, run=self.reading_run(seen))
         hf.flash_jlink(JLINK, '/fw/a.hex', timeout=7, run=self.reading_run(seen))
-        self.assertEqual([s for _, s, _ in seen], ['halt\nr\ngo\nexit\n', 'halt\nr\nloadfile /fw/a.hex\nr\ngo\nexit\n'])
+        self.assertEqual([s for _, s, _ in seen], ['halt\nr\ngo\nexit\n', 'halt\nloadfile /fw/a.hex\nr\ngo\nexit\n'])
         self.assertNotIn(Path(seen[0][0]).name, stale)
         self.assertEqual({p.name: p.read_text() for p in Path(d).iterdir()}, stale)
 
@@ -209,7 +239,7 @@ class JLink(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len({p for p, _, _ in seen}), 2)
         self.assertEqual(sorted(s for _, s, _ in seen),
-                         sorted(['halt\nr\ngo\nexit\n', 'halt\nr\nloadfile /fw/a.hex\nr\ngo\nexit\n']))
+                         sorted(['halt\nr\ngo\nexit\n', 'halt\nloadfile /fw/a.hex\nr\ngo\nexit\n']))
         self.assertEqual(os.listdir(d), [])
 
     def test_the_file_is_removed_when_the_run_raises(self):
