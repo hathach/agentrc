@@ -689,25 +689,18 @@ def _exited(pidfd, deadline) -> bool:
 
 
 def end_session(receipt: str, *, timeout: float = END_TIMEOUT) -> tuple:
-    """(rc, result) of ending the pending session a receipt names, all within one deadline of
-    `timeout` seconds; never a signal. rc 0: ended now, or the receipt is already closed after
-    the reviewed end; the receipt is then closed with the results, kept. rc 1: refused or failed,
-    the receipt kept open and the board held. Steps, each refusing on doubt:
+    """(rc, result) of ending the pending session a receipt names within `timeout` seconds (the
+    `hil` skill's Flashers has the caller's contract): 0 ended or already closed after the
+    reviewed end, 1 refused or failed with the receipt kept. OSError or ValueError for an
+    unreadable or malformed receipt; an interrupt propagates with the receipt kept.
 
-    - the receipt's lock is taken within the deadline, so its session has finalized and no
-      other `end` runs; held throughout, and the receipt is read only once it is taken;
-    - the process is the receipt's (argv and start time), held by a pidfd from then on; without
-      a pidfd its exit could not be confirmed, so the end is refused;
-    - init is `ok`: after a failed or unproven init the ordinary end is refused, NEEDS_RECOVERY;
-    - over the token-checked Tcl port, the server's `hil_done` equals the receipt's
-      `submitted`: the last command sent has run. An answer alone is no proof: the server reads
-      a connection 256 bytes at a time (tcl_server.c:172-176) and services connections in turn
-      (server.c:572-590), so an older command still unread on a dropped connection could run
-      after a new connection's, and one still running holds the server, so the query times out;
-    - `reset run` succeeds, then `shutdown`, and the identified process exits.
-
-    Raises OSError or ValueError for an unreadable or malformed receipt; an interrupt propagates
-    with the receipt kept."""
+    Invariants: the receipt's lock is held throughout and the receipt read only once it is
+    taken, so the session has finalized and no other `end` runs. The process is pinned by a
+    pidfd, the only accepted evidence of its exit. `hil_done` must equal `submitted` before
+    anything changes the target: an answer alone is no proof, since the server reads a
+    connection 256 bytes at a time (tcl_server.c:172-176) and services connections in turn
+    (server.c:572-590), so an older command still unread on a dropped connection could run
+    after a new connection's, and one still running holds the server, so the query times out."""
     deadline = time.monotonic() + timeout
     os.stat(receipt)
     while True:

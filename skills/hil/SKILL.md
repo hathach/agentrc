@@ -170,25 +170,25 @@ recovery stay the contract's. Linux only.
   `pending` with the session's receipt, for the caller's cleanup holder, and no
   retry, restore or test may overlap it.
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
-  a pending session, all within one deadline and without ever signalling it:
-  it takes the receipt's lock (`<receipt>.lock`, which a session holds until
-  it finalizes; still held at the deadline, by the session or another `end`:
-  refused), rereads the receipt, checks its process (argv, start time) through
-  a pidfd (refused where there is none) and its Tcl token, refuses after a
-  failed or unproven init (that board needs a separately reviewed recovery),
-  proves on the server that the last command sent has run, then
-  requires `reset run` to succeed before `shutdown` and confirms the process
-  exited. Exit 0 closes the receipt with the results and keeps it, and a rerun
-  on it exits 0 again; anything else (refusal, failure, timeout, interrupt)
-  exits 1 with the receipt open and the board held (2: bad usage or an
-  unreadable receipt). Releasing the board's cleanup holder (`hil_lock.py
+  a pending session with `reset run` and a confirmed shutdown, within one
+  deadline and never signalling it. It refuses on any doubt: the session (or
+  another `end`) still holds the receipt's lock, the process is not the
+  receipt's, no pidfd is available, init failed or is unproven (that board
+  needs a separately reviewed recovery), or the last command sent is not known
+  to have run. Exit 0 closes the receipt with the results and keeps it, and a
+  rerun on it exits 0 again; anything else (refusal, failure, timeout,
+  interrupt) exits 1 with the receipt open and the board held (2: bad usage or
+  an unreadable receipt). Releasing the board's cleanup holder (`hil_lock.py
   release --token TOKEN`) after exit 0 stays the caller's step.
 - rc 0 means the tool reported success, not that the target runs the image;
-  the project's own checks decide that. rc 124 means the runner killed the
-  tool's process group on the timeout and reaped it for a bounded grace: a
-  survivor is abandoned, so 124 proves neither that every descendant died nor
-  that the board is in a known state. A J-Link crash rerun is no proof the
-  target was untouched either.
+  the project's own checks decide that. rc 124 from the default runner means
+  it killed the tool's process group on the timeout and reaped it for a
+  bounded grace: a survivor is abandoned, so 124 proves neither that every
+  descendant died nor that the board is in a known state. An `openocd_esp`
+  timeout also returns 124; its `cleanup` says whether the session still
+  ended (`done`) or a command was outstanding and the server was left running
+  on purpose (`pending`). A J-Link crash rerun is no proof the target was
+  untouched either.
 
 ## Reporting
 

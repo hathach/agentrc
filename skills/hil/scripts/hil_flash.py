@@ -7,20 +7,8 @@ Every operation takes a flasher dict (`name`, `uid`, `args`, optional `vid_pid` 
 runs it through `run` (default hil_process.run_cmd, the instance loaded here as
 `hil_flash.hil_process`), called as `run(cmd, timeout=...)` or, for esptool,
 `run(cmd, cwd=..., timeout=...)`, so a caller injects its own runner. Every operation takes
-`timeout` explicitly. A flash or reset returns an Operation: the last run's CompletedProcess
-fields plus every attempt on its own. rc 0 means the tool said it succeeded, not that the
-target runs the image; rc 124 means it was killed on the bound.
-
-Each attempt is one kind: `exited` (the runner returned), `timed_out` (rc 124 returned, or
-subprocess.TimeoutExpired raised, its partial output kept), `interrupted` (a BaseException
-that is not an Exception, such as KeyboardInterrupt, or any exception with a true
-`interrupted` attribute) or `error` (any other exception, such as a launch failure). A
-runner's result or exception may carry `cleanup` ('done', 'pending' or 'unknown') and
-`receipt` (whatever identifies a session still outstanding). Only a runner's explicit 'done'
-counts as done: a missing attribute or any other value reads as 'unknown', the default
-runner's included, since hil_process.run_cmd abandons a survivor of its bounded reap and a
-tool's exit does not prove its descendants exited. A J-Link crash is not rerun after an
-attempt whose cleanup is 'pending'.
+`timeout` explicitly. A flash or reset returns an Operation of its Attempts; what their
+kinds, cleanup and receipts mean to a caller is the `hil` skill's (SKILL.md, Flashers).
 """
 
 from __future__ import annotations
@@ -63,9 +51,10 @@ CLEANUP = ('done', 'unknown', 'pending')   # least to most outstanding
 
 
 class Attempt(NamedTuple):
-    """One run of a tool (module docstring): the command, its command file's contents if it
-    has one, the runner's result (returncode None and any partial output when it raised),
-    the exception it raised, its cleanup status and outstanding-session receipt."""
+    """One run of a tool: the command, its command file's contents if it has one, the runner's
+    result (returncode None and any partial output when it raised), the exception it raised,
+    its cleanup ('done' only when the runner said so explicitly, else 'unknown' or the runner's
+    'pending') and the receipt of a session still outstanding."""
     cmd: str | list
     script: str | None
     result: subprocess.CompletedProcess
