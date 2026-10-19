@@ -222,9 +222,9 @@ class FailsClosed(LockDir):
         os.chmod(hil_lock.lock_path(BOARD), stat.S_IRUSR)
         self.assert_unavailable()
 
-    def test_record_write_failing_in_the_buffered_flush_refuses_and_drops_the_flock(self):
-        # RLIMIT_FSIZE 0 fails the record at its flush (EFBIG), and close() re-raises it;
-        # in a child, so the limit never reaches this process
+    def test_record_write_failing_refuses_and_drops_the_flock(self):
+        # RLIMIT_FSIZE 0 fails the record write (EFBIG); in a child, so the limit never
+        # reaches this process
         r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
@@ -413,7 +413,7 @@ class DetachedHolder(LockDir):
                 with quiet() as (_, err), mock.patch.object(hil_lock.signal, 'pidfd_send_signal', signal_then_replace):
                     self.assertEqual(hil_lock.cmd_release(named), rc, err.getvalue())
                 self.assertEqual(hil_lock.read_record(other)['reason'], 'replacement')
-                self.assertEqual('still locked' in err.getvalue(), bool(rc))
+                self.assertEqual('not released' in err.getvalue(), bool(rc))
 
     def test_a_sigterm_while_a_board_is_taken_still_clears_its_record(self):
         other = BOARD + '-2'
@@ -442,7 +442,30 @@ class DetachedHolder(LockDir):
         self.patch(hil_lock, 'RELEASE_WAIT', 0.2)
         with quiet() as (_, err):
             self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
-        self.assertIn(f'still locked: {BOARD}', err.getvalue())
+        self.assertIn(f'not released (a live holder or a leftover record): {BOARD}', err.getvalue())
+
+    def test_a_record_left_on_a_board_the_scan_missed_fails_the_release(self):
+        other = BOARD + '-2'
+        real_clear = hil_lock.clear_record
+
+        def failing_other_clear(fh):      # runs in the forked holder
+            if not os.readlink(f'/proc/self/fd/{fh.fileno()}').endswith(f'{other}.lock'):
+                real_clear(fh)
+
+        self.patch(hil_lock, 'clear_record', failing_other_clear)
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 0)
+        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        real_scan, scans = hil_lock._boards_of, []
+
+        def first_scan_before_other(pid, start):
+            scans.append(pid)
+            return real_scan(pid, start) if len(scans) > 1 else []
+
+        self.patch(hil_lock, '_boards_of', first_scan_before_other)
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+        self.assertIn(f'leftover record): {other}', err.getvalue())
 
     def take_when_free(self, b):
         deadline = time.monotonic() + 10
@@ -544,6 +567,34 @@ class DetachedHolder(LockDir):
         self.assertIsNone(hil_lock.read_record(BOARD))
         self.assertIsNone(hil_lock.read_record(other))
         self.assertTrue(self.flock_is_free())
+
+    def test_a_readiness_that_lands_as_the_wait_times_out_is_not_kept(self):
+        """The holder's readiness is in the pipe when the parent's select gives up: the parent
+        reports a failure, so neither hold nor takeover may stay."""
+        real = hil_lock.select.select
+
+        def ready_then_timed_out(rlist, *_):
+            real(rlist, [], [], 10)
+            return [], [], []
+        self.patch(hil_lock.select, 'select', ready_then_timed_out)
+        for take_over_board in (None, BOARD):
+            with self.subTest(take_over=take_over_board):
+                if take_over_board:
+                    Takeover.blocked(self)
+                with quiet() as (_, err):
+                    self.assertEqual(hil_lock.cmd_hold([] if take_over_board else [BOARD], 'selftest hold',
+                                                       take_over_board), 1)
+                if rec := hil_lock.read_record(BOARD):
+                    self.addCleanup(self.kill_quietly, rec['pid'], signal.SIGKILL)
+                self.assertIn('holder failed to acquire locks', err.getvalue())
+                deadline = time.monotonic() + 10
+                while not self.flock_is_free() and time.monotonic() < deadline:
+                    _sleep(0.02)
+                self.assertTrue(self.flock_is_free())
+                if take_over_board:          # an unannounced takeover stays a recovery blocker
+                    self.assertEqual(hil_lock.read_record(BOARD)['role'], 'cleanup-holder')
+                else:
+                    self.assertIsNone(hil_lock.read_record(BOARD))
 
     def test_a_takeover_whose_readiness_is_lost_stays_a_recovery_blocker(self):
         Takeover.blocked(self)
@@ -759,30 +810,52 @@ class RecoveryBlockers(LockDir):
         self.dead_record(reason='hil_test.py')
         self.assertIsNotNone(self.acquire())
 
-    def test_a_rewrite_of_a_protected_record_killed_at_any_step_still_blocks(self):
-        class KilledAt:
-            """The record handle; its process is killed, unflushed, at the first call of `step`."""
-            def __init__(self, fh, step):
-                self.fh, self.step = fh, step
+    def test_a_rewrite_of_a_protected_record_cut_short_anywhere_still_blocks(self):
+        """A protected reservation turning cleanup holder (hil_reserve drops `protected` and
+        adds `role`) dies mid-rewrite: cut at every byte (RLIMIT_FSIZE) and before every write
+        call, the board stays blocked."""
+        locks = [BOARD, 'x' * 40]
+        fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True, tool='t', locks=locks)
+        old = self.lock_bytes()
+        fh.close()
 
-            def __getattr__(self, name):
-                if name == self.step:
-                    os._exit(9)
-                return getattr(self.fh, name)
-        for step in ('seek', 'write', 'flush', 'truncate'):
-            with self.subTest(killed_at=step):
-                pid = os.fork()
-                if pid == 0:               # a protected reservation turning cleanup holder
-                    try:
-                        fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True, locks=[BOARD, 'x' * 40])
-                        hil_lock.write_record(KilledAt(fh, step), 'selftest', role='cleanup-holder')
-                    finally:
-                        os._exit(1)
-                self.assertEqual(os.waitpid(pid, 0)[1] >> 8, 9)
-                self.assertNotIn(hil_lock.record_state(BOARD)[0], ('absent', 'empty'))
-                with self.assertRaises(hil_lock.RecoveryBlocked):
-                    self.acquire()
-                os.unlink(hil_lock.lock_path(BOARD))
+        def rewrite(cut=None, kill_before=None):
+            Path(hil_lock.lock_path(BOARD)).write_bytes(old)
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    fh = hil_lock.flock_nb(BOARD)
+                    calls = []
+
+                    def counted(real):
+                        def call(*a):
+                            calls.append(1)
+                            if len(calls) == kill_before:
+                                os._exit(9)
+                            return real(*a)
+                        return call
+                    for name in ('write', 'pwrite', 'ftruncate'):
+                        setattr(os, name, counted(getattr(os, name)))
+                    if cut is not None:
+                        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+                        resource.setrlimit(resource.RLIMIT_FSIZE, (cut, cut))
+                    hil_lock.write_record(fh, 'selftest', tool='t', locks=locks, role='cleanup-holder', detail='d')
+                    os._exit(0)
+                finally:
+                    os._exit(1)
+            status = os.waitpid(pid, 0)[1] >> 8
+            with hil_lock.flock_nb(BOARD) as fh:
+                return status, hil_lock._blocker(BOARD, fh)
+
+        open_cuts = [cut for cut in range(len(old) + 40) if not rewrite(cut=cut)[1]]
+        self.assertEqual(open_cuts, [])
+        kill_before = 1
+        while True:
+            status, why = rewrite(kill_before=kill_before)
+            self.assertTrue(why, f'killed before write call {kill_before}')
+            if status == 0:               # the rewrite completed: a cleanup-holder record
+                break
+            kill_before += 1
 
     def test_a_protected_taker_ends_with_release_board_lock(self):
         fh = hil_lock.take_board_lock(BOARD, 'selftest', protected=True)
@@ -984,7 +1057,7 @@ class UnreadableRecords(LockDir):
         self.patch(hil_lock, 'RELEASE_WAIT', 0.1)
         with quiet() as (_, err):
             self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
-        self.assertIn('still locked', err.getvalue())
+        self.assertIn('not released', err.getvalue())
 
     def test_a_record_left_unreadable_is_not_a_completed_release(self):
         self.patch(hil_lock.time, 'sleep', lambda s: None)

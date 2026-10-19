@@ -183,13 +183,18 @@ def write_record(fh, reason: str, **extra) -> None:
     """Holder record; the flock itself is already held. Raises OSError on a write failure: a
     hold whose record is missing is invisible to status/release, so every caller refuses it.
     `extra` adds a tool's own fields (hil_reserve: token, start, locks, role). Overwritten in
-    place, then cut to length: an interrupted rewrite leaves the old record or an unreadable
-    one, never the empty record a blocker would vanish as."""
-    fh.seek(0)
-    json.dump({'pid': os.getpid(), 'reason': reason,
-               'since': time.strftime('%Y-%m-%dT%H:%M:%S%z'), **extra}, fh)
-    fh.flush()
-    fh.truncate()
+    place behind a non-JSON first byte that is restored last: an interrupted rewrite leaves
+    the old record or an unreadable one, never an empty record or a valid splice of new and
+    old bytes that a blocker would vanish as."""
+    data = json.dumps({'pid': os.getpid(), 'reason': reason,
+                       'since': time.strftime('%Y-%m-%dT%H:%M:%S%z'), **extra}).encode()
+    fd = fh.fileno()
+    os.pwrite(fd, b'#', 0)
+    done = 1
+    while done < len(data):
+        done += os.pwrite(fd, data[done:], done)
+    os.ftruncate(fd, len(data))
+    os.pwrite(fd, data[:1], 0)
 
 
 def clear_record(fh) -> None:
@@ -307,7 +312,7 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     except OSError as e:
         clear_record(fh)
         try:
-            fh.close()   # re-raises the failed buffered write, but the fd (and flock) still go
+            fh.close()   # even a failing close lets the fd (and flock) go
         except OSError:
             pass
         raise LockUnavailable(f'board lock unavailable: holder record: {e}') from e
@@ -635,15 +640,24 @@ def cmd_hold(boards, reason, take_over_board=None):
     # No pre-check: the holder's own LOCK_NB flock is the only authority, since a recorded
     # pid may be stale or recycled. The holder signals success through this pipe because a
     # generic is_locked() poll would be fooled by a RIVAL invocation's flock — only the
-    # holder knows whether it won every board.
+    # holder knows whether it won every board. It keeps a won hold only once the parent acks
+    # it, so a readiness landing as the parent's wait times out is never left running.
     r_fd, w_fd = os.pipe()
+    ack_r, ack_w = os.pipe()
     pid = os.fork()
     if pid > 0:
         os.close(w_fd)
+        os.close(ack_r)
         os.waitpid(pid, 0)  # reap intermediate child
         ready, _, _ = select.select([r_fd], [], [], 10)
         msg = os.read(r_fd, 4096).decode(errors='replace') if ready else ''
         os.close(r_fd)
+        if msg.startswith('1'):
+            try:
+                os.write(ack_w, b'1')
+            except OSError:
+                msg = '0holder exited before its readiness was acknowledged'
+        os.close(ack_w)     # unacknowledged, the holder reads EOF and bows out
         if msg.startswith('1'):
             if take_over_board:
                 token, held = msg[1:].split(' ', 1)
@@ -662,10 +676,10 @@ def cmd_hold(boards, reason, take_over_board=None):
         os._exit(0)
     # holder (grandchild): acquire all flocks, signal the parent, sleep until ended
     os.close(r_fd)
-    # Keep the success pipe clear of fds 0-2: invoked with stdio closed, os.pipe() can
-    # land there and the dup2 loop below would clobber it.
-    if w_fd <= 2:
-        w_fd = fcntl.fcntl(w_fd, fcntl.F_DUPFD, 3)
+    os.close(ack_w)
+    # Keep the pipes clear of fds 0-2: invoked with stdio closed, os.pipe() can land there
+    # and the dup2 loop below would clobber them.
+    w_fd, ack_r = (fcntl.fcntl(fd, fcntl.F_DUPFD, 3) if fd <= 2 else fd for fd in (w_fd, ack_r))
     # Detach stdio: a `hold` whose output is captured must see EOF when the front-end
     # exits — the immortal holder must not keep that pipe open.
     devnull = os.open(os.devnull, os.O_RDWR)
@@ -675,10 +689,11 @@ def cmd_hold(boards, reason, take_over_board=None):
         os.close(devnull)
 
     def report(text) -> bool:
-        """False when the parent is gone or stopped waiting (EPIPE): it reports a failure."""
+        """False when the parent is gone or stopped waiting (EPIPE, or no ack of a readiness):
+        it reports a failure."""
         try:
             os.write(w_fd, text.encode())
-            return True
+            return not text.startswith('1') or os.read(ack_r, 1) == b'1'
         except OSError:
             return False
 
@@ -824,9 +839,12 @@ def cmd_release(boards):
             print(f'ERROR: {e}', file=sys.stderr)
             rc = 1
     if owned:
-        still = _wait_released(owned, set(boards), time.monotonic() + RELEASE_WAIT)
+        still = set(_wait_released(owned, set(boards), time.monotonic() + RELEASE_WAIT))
+        # a board recorded after the first scan, whose clear failed, is found only by a second
+        still.update(*(_boards_of(*holder) for holder in set(owned.values())))
         if still:
-            print(f'ERROR: still locked: {", ".join(still)}', file=sys.stderr)
+            print(f'ERROR: not released (a live holder or a leftover record): {", ".join(sorted(still))}',
+                  file=sys.stderr)
             return 1
     return rc
 
