@@ -58,9 +58,10 @@ unknown: for the two kinds without a thread, or when an API error cut the
 resolve short), `error` (left out when there is none). Exit 0 when every reply is verified
 and every review thread resolved, 1 otherwise (a failed comment lookup, an inaccessible `--repo` or a GitHub rate
 limit included, is a receipt's `error`), 2 for a bad manifest or a failure to find the repo (`gh repo view`) or our
-login (`gh api user`), which posts nothing and ends stdout with `{"error": ...}`. `sent` and `posted` describe the
-run that recorded them, so a rerun that finds its earlier post reports both false; `verified` and `resolved`
-say whether the reply stands. A caller that may lose a run's output passes
+login (`gh api user`), which posts nothing and ends stdout with `{"error": ...}`; 2 also when `--receipt` cannot be
+saved, after the run, which still ends stdout with the receipts line: read that line, not the exit code, for what was
+posted. `sent` and `posted` describe the run that recorded them, so a rerun that finds its earlier post reports both
+false; `verified` and `resolved` say whether the reply stands. A caller that may lose a run's output passes
 `--receipt <path>`: the same path again to get that run's receipt back, a
 fresh path when the replies must be read back anew.
 
