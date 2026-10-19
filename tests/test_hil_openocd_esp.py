@@ -699,6 +699,21 @@ class Lifecycle(SessionCase):
         self.assertEqual(self.events(), [])
         self.assertEqual(list(self.work.iterdir()), [])
 
+    def test_a_closing_receipt_that_cannot_be_written_raises_with_the_operation(self):
+        real = oe.esp_session.write_receipt
+
+        def full_disk(path, rec):
+            if rec['closed']:
+                raise OSError(28, 'No space left on device')
+            return real(path, rec)
+        with mock.patch.object(oe.esp_session, 'write_receipt', full_disk), \
+                self.assertRaisesRegex(OSError, 'No space') as cm:
+            self.session(lambda s: s.check('esp foo'))
+        op = cm.exception.operation
+        self.assertEqual((op.returncode, op.attempts[0].cleanup), (0, 'done'))
+        self.assertIn('No space left on device', op.session['receiptError'])
+        self.assertEqual(self.tcl()[-2:], ['reset run', 'shutdown'])
+
 
 class TclDeadline(unittest.TestCase):
     """One absolute deadline covers the token check and the command's answer: a server slow at
@@ -760,8 +775,8 @@ class Programming(SessionCase):
                                                                  timeout=timeout, openocd=str(self.exe)),
                            **env, **kw)
 
-    def program_cmds(self, segs=None):
-        return [f"program_esp {{{s['file']}}} 0x{s['offset']:x} verify no_skip_loaded" for s in segs or self.segs]
+    def program_cmds(self, op):
+        return [f"program_esp {{{r['copy']}}} 0x{r['offset']:x} verify no_skip_loaded" for r in op.segments]
 
     def read_cmds(self, op):
         return [f"flash read_bank 0 {{{r['readBack']['file']}}} 0x{r['offset']:x} {r['readBack']['length']}"
@@ -770,7 +785,7 @@ class Programming(SessionCase):
     def test_each_segment_programmed_in_order_then_read_back_exactly(self):
         op = self.flash_op()
         self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list',
-                                      *self.program_cmds(), *self.read_cmds(op), 'reset run', 'shutdown'])
+                                      *self.program_cmds(op), *self.read_cmds(op), 'reset run', 'shutdown'])
         self.assertEqual(op.returncode, 0)
         self.assertEnded(op)
         img = self.flash.read_bytes()
@@ -782,6 +797,25 @@ class Programming(SessionCase):
             self.assertEqual(rec['sha256'], hashlib.sha256(data).hexdigest())
         self.assertEqual([r['readBack']['length'] for r in op.segments], [5000, 1004, 4096])
         self.assertEqual([r['erase'] for r in op.segments], [[0, 0x2000], [0x2000, 0x3000], [0x8000, 0x9000]])
+
+    def test_an_input_replaced_after_admission_is_not_what_is_programmed(self):
+        # program_esp reopens the file it is given: a grown replacement would erase the next sector
+        admitted = self.files['app.bin'].read_bytes()
+        real = oe.admit_segments
+
+        def admit_then_replace(segs):
+            out = real(segs)
+            self.files['app.bin'].write_bytes(os.urandom(2 * oe.SECTOR))
+            return out
+        with mock.patch.object(oe, 'admit_segments', admit_then_replace):
+            op = self.flash_op()
+        self.assertEqual(op.returncode, 0)
+        self.assertEnded(op)
+        img = self.flash.read_bytes()
+        self.assertEqual(img[0x8000:0x9000], admitted)
+        self.assertEqual(img[0x9000:0xa000], b'\x5a' * 0x1000)
+        copy = Path(op.segments[2]['copy'])
+        self.assertEqual((copy.parent, copy.read_bytes()), (Path(op.session['dir']), admitted))
 
     def test_the_callers_security_evidence_is_recorded(self):
         op = self.flash_op()
@@ -830,7 +864,7 @@ class Programming(SessionCase):
     def test_the_first_failed_segment_stops_programming(self):
         op = self.flash_op(script={'program_esp#2': 'err:** Verify Failed **'})
         self.assertEqual(self.tcl(), ['token?', 'init', 'reset init', 'flash probe 0', 'flash list',
-                                      *self.program_cmds()[:2], 'reset run', 'shutdown'])
+                                      *self.program_cmds(op)[:2], 'reset run', 'shutdown'])
         self.assertEqual([r.get('program', {}).get('ok') for r in op.segments], [True, False, None])
         self.assertEqual(op.segments[1]['program']['answer'], '** Verify Failed **')
         self.assertEqual(op.returncode, 1)
@@ -844,7 +878,7 @@ class Programming(SessionCase):
 
     def test_a_timeout_during_programming_leaves_the_session_pending(self):
         op = self.flash_op(timeout=3, script={'program_esp#2': 'hang'})
-        self.assertEqual(self.tcl()[-1], self.program_cmds()[1])
+        self.assertEqual(self.tcl()[-1], self.program_cmds(op)[1])
         self.assertEqual((op.returncode, op.attempts[0].kind), (124, 'timed_out'))
         self.assertNotIn('reset run', self.tcl())
         self.assertPending(op)
@@ -879,7 +913,7 @@ class Programming(SessionCase):
 
     def test_an_unprobed_bank_is_refused_before_any_write(self):
         op = self.flash_op(bank=0)
-        self.assertNotIn(self.program_cmds()[0], self.tcl())
+        self.assertNotIn(self.program_cmds(op)[0], self.tcl())
         self.assertIn('not a probed whole-flash bank', op.session['failure'])
         self.assertEnded(op)
 

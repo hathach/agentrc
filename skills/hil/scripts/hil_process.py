@@ -196,10 +196,11 @@ def run_alongside(argv: list, work, timeout: int, *,
         hold.release()  # a signal deferred across the fork raises here: killed, not reaped
         try:
             work()
-        except BaseException:
+        except Exception:
             # Reap first so the child never outlives us, then let the caller's error through.
             # A `return` inside a `finally` would SWALLOW it -- an assert in `work` would
-            # vanish and the caller would compare data it never finished sending.
+            # vanish and the caller would compare data it never finished sending. An
+            # interrupt is not reaped: it takes the kill-and-close path below, never waiting.
             _reap()
             raise
         return _reap()
@@ -274,6 +275,10 @@ def run_cmd(cmd: str | list, cwd: str | None = None, *, timeout: float,
             # worker lives for the whole run, so every wedged command would cost it two fds.
             out, err = None, None
             _close_pipes(p)
+        except BaseException:
+            # interrupted mid-reap, already killed: the BaseException handler below is a sibling
+            _close_pipes(p)
+            raise
         # prefer the post-kill buffers (supersets of the exception's), falling back to ex.*
         # when the child was unkillable. TimeoutExpired carries BYTES even for a text-mode
         # Popen, so the fallbacks must be decoded or a text-mode caller gets bytes exactly

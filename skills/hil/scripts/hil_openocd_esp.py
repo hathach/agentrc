@@ -294,7 +294,7 @@ class Session:
         self.log, self.receipt = os.path.join(out, 'openocd.log'), os.path.join(out, 'receipt.json')
         self.lock_fd = None
         self.tcl = esp_session.Tcl(tcl_port, token)
-        self.proc = self.rec = self.exit = self.failure = None
+        self.proc = self.rec = self.exit = self.failure = self.receipt_error = None
         self.receipt_written = self.closed = self.timed_out = False
         self.steps, self.deadline, self.seq = [], None, 0
 
@@ -415,8 +415,11 @@ class Session:
         if not self.closed and self.proc is not None:
             self.exit, self.closed = self.proc.returncode, True
             if self.receipt_written:
-                esp_session.write_receipt(self.receipt, {**self.rec, 'closed': True, 'cleanup': cleanup,
-                                                         'exit': self.exit})
+                try:
+                    esp_session.write_receipt(self.receipt, {**self.rec, 'closed': True, 'cleanup': cleanup,
+                                                             'exit': self.exit})
+                except OSError as e:
+                    self.receipt_error = e     # raised by _finish once the operation is built
         return cleanup
 
     def operation(self, error=None, **extra):
@@ -437,13 +440,15 @@ class Session:
         op = hil_flash.Operation([hil_flash.Attempt(self.argv, script, result, error, cleanup, receipt)])
         op.steps = tuple(self.steps)
         op.session = {**extra, 'dir': self.out, 'log': self.log, 'receipt': self.receipt, 'exit': self.exit,
-                      'failure': self.failure}
+                      'failure': self.failure,
+                      'receiptError': None if self.receipt_error is None else str(self.receipt_error)}
         return op
 
 
 def _finish(s, error=None, **info):
     """s.operation(error) with SIGINT/SIGTERM held until it is built, so an interrupt arriving
-    meanwhile still carries the operation and its receipt."""
+    meanwhile still carries the operation and its receipt. A closing receipt that could not be
+    written raises its OSError carrying the operation, unless `error` is already on its way."""
     hold = hil_process.InterruptHold()
     op = None
     try:
@@ -456,6 +461,9 @@ def _finish(s, error=None, **info):
             if op is not None:
                 late.operation = op
             raise
+    if error is None and s.receipt_error is not None:
+        s.receipt_error.operation = op
+        raise s.receipt_error
     return op
 
 
@@ -630,7 +638,8 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
 
     Before the first write it runs `reset init` and `flash probe 0` and refuses a segment whose
     erased sectors leave bank 0. Returns hil_flash's Operation, with `segments`: per segment its
-    offset, file, size, erased range, sha256, `program` (the call's answer and log, `verified`
+    offset, file, size, erased range, sha256, `copy` (the session's copy of the admitted bytes,
+    the file programmed), `program` (the call's answer and log, `verified`
     when it printed "** Verify OK **") and `readBack` (file, length, match, firstMismatch).
     Refusals raise ValueError or RuntimeError before anything starts."""
     _refuse_ci()
@@ -639,6 +648,15 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     records = [rec for rec, _ in admitted]
 
     def work(s):
+        # program_esp reopens its file: program a private copy, so an input replaced after
+        # admission cannot write past the checked erase range
+        try:
+            for i, (rec, data) in enumerate(admitted):
+                rec['copy'] = os.path.join(s.out, f'segment_{i}_0x{rec["offset"]:x}.bin')
+                with open(rec['copy'], 'xb') as f:
+                    f.write(data)
+        except OSError as e:
+            raise _Stop(f'copying the admitted segments: {e}', end=True) from None
         s.check('reset init')
         s.check('flash probe 0')
         bank = _bank0(s.check('flash list'))
@@ -647,7 +665,7 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
                 raise _Stop(f"segment {rec['file']} at 0x{rec['offset']:x} leaves bank {bank['name']} "
                             f"(0x{bank['size']:x} bytes)", end=True)
         for rec in records:
-            ok, answer = s.ask(f"program_esp {{{rec['file']}}} 0x{rec['offset']:x} verify no_skip_loaded")
+            ok, answer = s.ask(f"program_esp {{{rec['copy']}}} 0x{rec['offset']:x} verify no_skip_loaded")
             log = s.steps[-1]['log']
             rec['program'] = {'ok': ok, 'answer': answer, 'log': log,
                               'verified': ok and '** Verify OK **' in log}

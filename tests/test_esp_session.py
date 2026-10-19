@@ -590,12 +590,17 @@ class Receipts(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), {'pid': 1})
         self.assertEqual(sorted(p.name for p in self.d.iterdir()), ['receipt.json'])
 
+    @unittest.skipUnless(os.path.isdir('/proc/self'), 'the identity check reads /proc')
     def test_same_process_by_argv_tail_and_start_time(self):
         me = {'pid': os.getpid(), 'argv': es.cmdline(os.getpid())[-1:], 'startTime': es.start_time(os.getpid())}
         self.assertTrue(es.same_process(me))
         self.assertFalse(es.same_process({**me, 'startTime': '1'}))
         self.assertFalse(es.same_process({**me, 'argv': ['not-this']}))
         self.assertFalse(es.same_process({k: v for k, v in me.items() if k != 'startTime'}))
+
+    def test_same_process_refuses_without_proc(self):
+        with mock.patch.object(es, 'cmdline', return_value=None):
+            self.assertFalse(es.same_process({'pid': os.getpid(), 'argv': ['x'], 'startTime': '1'}))
 
 if __name__ == '__main__':
     unittest.main()

@@ -510,6 +510,35 @@ class InterruptAcrossTheFork(unittest.TestCase):
         self._assert_group_gone(p.pid)
         self.assertTrue(p.stdout.closed and p.stderr.closed, 'our pipe ends leaked')
 
+    def test_run_alongside_sigint_in_work_is_killed_without_a_reap(self):
+        # a reap first would wait out the whole timeout before Ctrl-C returned
+        def work():
+            signal.raise_signal(signal.SIGINT)
+        with self._never_reaped(), self._popen_hook():
+            with self.assertRaises(KeyboardInterrupt):
+                hp.run_alongside(self.shell_argv, work, timeout=T)
+        p = self.procs[0]
+        self._assert_group_gone(p.pid)
+        self.assertTrue(p.stdout.closed and p.stderr.closed, 'our pipe ends leaked')
+
+    def test_run_cmd_sigint_in_the_post_kill_reap_closes_the_pipes(self):
+        def interrupt_second_wait(p):
+            real, calls = p.communicate, []
+
+            def communicate(*args, **kwargs):
+                calls.append(1)
+                if len(calls) == 2:
+                    signal.raise_signal(signal.SIGINT)
+                return real(*args, **kwargs)
+            p.communicate = communicate
+
+        with self._popen_hook(interrupt_second_wait), redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                hp.run_cmd(self.shell_cmd, timeout=0.2, split_stderr=True)
+        p = self.procs[0]
+        self._assert_group_gone(p.pid)
+        self.assertTrue(p.stdout.closed and p.stderr.closed, 'our pipe ends leaked')
+
     def test_sigterm_while_holding_sigint_restores_it(self):
         # SIGTERM's raising handler fires right after SIGINT's handler was swapped, before
         # SIGTERM's is: the constructor's cleanup must still put SIGINT's back
