@@ -134,18 +134,11 @@ def openocd_cmd_base(flasher: dict) -> str:
         # silently does not apply and discovery goes back to opening every usbfs node --
         # the convoy this field exists to stop. The same key name carries a DIFFERENT
         # syntax under tinyusb's tests.dev_attached ('1a86_55d4'), so the typo is one copy away.
-        if valid_vid_pid(flasher['vid_pid']):
-            vid_pid = f'-c "adapter usb vid_pid {flasher["vid_pid"]}" '
-        else:
-            # stderr + once-per-probe, like the missing-pin branch below: a harness that
-            # captures stdout per test shows it only when the test FAILS, so on a PASSING
-            # run the operator would never learn the pin was silently dropped.
-            uid = flasher.get('uid', '?')
-            if uid not in _VID_PID_WARNED:
-                _VID_PID_WARNED.add(uid)
-                print(f'warning: {uid} has a malformed vid_pid {flasher["vid_pid"]!r} '
-                      f'(want "0xVVVV 0xPPPP"); probe pin DROPPED, so discovery will open '
-                      f'foreign usbfs nodes', file=sys.stderr, flush=True)
+        # Refused, not dropped: running unpinned reopens the convoy the explicit pin asked to avoid.
+        if not valid_vid_pid(flasher['vid_pid']):
+            raise ValueError(f'openocd flasher {flasher.get("uid")!r} has a malformed vid_pid '
+                             f'{flasher["vid_pid"]!r}: want "0xVVVV 0xPPPP" pairs')
+        vid_pid = f'-c "adapter usb vid_pid {flasher["vid_pid"]}" '
     elif not convoy_safe(flasher) and flasher.get('uid') not in _VID_PID_WARNED:
         # (unpinned yet convoy-safe is openocd over a CONVOY_SAFE_CFGS driver: no warning)
         # stderr, once per probe: a captured stdout would swallow this on a passing run and
@@ -224,12 +217,12 @@ def rescue_openocd(flasher: dict, flash_out: str = '', *, timeout, run=None) -> 
     return False
 
 
-# openocd's own syntax: one or more "0xVVVV 0xPPPP" pairs. Validated rather than merely
+# openocd's own syntax: one or more complete "0xVVVV 0xPPPP" pairs. Validated rather than merely
 # tested for truthiness -- `vid_pid` is a hand-edited roster field whose NAME is also used,
 # with a different syntax, by tinyusb's tests.dev_attached, and convoy_safe reads a non-empty
 # value as PROOF the flasher can deliver a recovery past a poisoned node. A typo there
 # silently promised a recovery that openocd would reject at startup.
-_VID_PID_RE = re.compile(r'^0x[0-9a-fA-F]{4}(\s+0x[0-9a-fA-F]{4})+$')
+_VID_PID_RE = re.compile(r'^0x[0-9a-fA-F]{4}\s+0x[0-9a-fA-F]{4}(\s+0x[0-9a-fA-F]{4}\s+0x[0-9a-fA-F]{4})*$')
 
 
 def valid_vid_pid(value) -> bool:

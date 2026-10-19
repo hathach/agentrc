@@ -371,12 +371,23 @@ class Openocd(unittest.TestCase):
         self.assertNotIn('vid_pid', cmd)
         self.assertEqual(err.getvalue().count('has no vid_pid pin'), 1)
 
-    def test_a_malformed_pin_is_dropped_with_a_warning(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            cmd = hf.openocd_cmd_base({'name': 'openocd', 'uid': 'S-bad', 'args': '-f i.cfg', 'vid_pid': '1a86_55d4'})
-        self.assertNotIn('vid_pid', cmd)
-        self.assertIn("malformed vid_pid '1a86_55d4'", err.getvalue())
+    def test_a_malformed_explicit_pin_is_refused_before_openocd_runs(self):
+        rp2040 = {'name': 'openocd', 'uid': 'S-bad', 'args': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg'}
+        for bad in ('1a86_55d4', '0x1a86', '0x1a86 0x8010 0x2e8a', '', '   ', None, 4660, ['0x1a86', '0x8010']):
+            f = {**rp2040, 'vid_pid': bad}
+            for fn, args in ((hf.flash_openocd, (f, 'fw.elf')), (hf.reset_openocd, (f,)),
+                             (hf.rescue_openocd, (f, hf.DAP_WEDGED[0]))):
+                with self.subTest(vid_pid=bad, fn=fn.__name__):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), self.assertRaises(ValueError) as cm:
+                        capture(fn, *args, timeout=7)
+                    self.assertIn(f"'S-bad' has a malformed vid_pid {bad!r}", str(cm.exception))
+                    self.assertEqual(err.getvalue(), '')
+        launches = []
+        with self.assertRaises(ValueError):
+            hf.flash_openocd({**rp2040, 'vid_pid': '0x1a86 0x8010 0x2e8a'}, 'fw.elf', timeout=7,
+                             run=lambda *a, **k: launches.append(a))
+        self.assertEqual(launches, [])
 
     def test_openocd_over_jlink_does_not_warn(self):
         err = io.StringIO()
@@ -462,9 +473,20 @@ class ConvoySafe(unittest.TestCase):
             self.assertFalse(self.f(flasher))
 
     def test_valid_vid_pid(self):
-        for value, want in (('0x2e8a 0x000c', True), (' 0x2e8a  0x000c ', True), ('0x2e8a 0x000c 0x2e8a 0x000d', True),
-                            ('0x2e8a', False), ('2e8a 000c', False), ('1a86_55d4', False), (None, False), ('', False)):
+        for value, want in (('0x2e8a 0x000c', True), (' 0x2e8a  0x000c ', True), ('0x2e8a\t0x000c\n', True),
+                            ('0x2e8a 0x000c 0x2e8a 0x000d', True), ('0x2e8a', False),
+                            ('0x2e8a 0x000c 0x2e8a', False), ('0x1234 0x5678 0x9abc', False),
+                            ('0x2e8a 0x000c 0x2e8a 0x000d 0x2e8a', False), ('0x2e8a0x000c', False),
+                            ('2e8a 000c', False), ('1a86_55d4', False), ('0x2e8a 0x000c,', False),
+                            (None, False), ('', False), ('   ', False), (0x2e8a, False),
+                            (['0x2e8a', '0x000c'], False), (b'0x2e8a 0x000c', False)):
             self.assertEqual(hf.valid_vid_pid(value), want, value)
+
+    def test_an_incomplete_pair_is_neither_convoy_safe_nor_a_pyocd_filter(self):
+        for f in ({'name': 'openocd', 'vid_pid': '0x2e8a 0x000c 0x2e8a'},
+                  {'name': 'pyocd', 'uid': 'U', 'vid_pid': '0x2e8a 0x000c 0x2e8a'}):
+            self.assertFalse(self.f(f), f)
+        self.assertIsNone(hf.pyocd_vid_pid({'name': 'pyocd', 'uid': 'U', 'vid_pid': '0x2e8a 0x000c 0x2e8a'}))
 
 
 class Pyocd(unittest.TestCase):

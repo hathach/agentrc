@@ -117,8 +117,9 @@ recovery stay the contract's. Linux only.
 
 - A flasher is a dict: `name` (`jlink`, `stlink`, `openocd`, `lm4flash`,
   `esptool`, `pyocd`), `uid` (the probe's serial), `args` (passed to the tool
-  verbatim), and optionally `vid_pid` (openocd's `0xVVVV 0xPPPP` pairs; pyocd
-  requires exactly one) and `verify`. Every call takes an explicit `timeout`;
+  verbatim), and optionally `vid_pid` (openocd's complete `0xVVVV 0xPPPP`
+  pairs; pyocd requires exactly one) and `verify`. A malformed `vid_pid` raises
+  `ValueError` before the tool runs. Every call takes an explicit `timeout`;
   `run=` injects the caller's runner, by default `scripts/hil_process.py`'s
   `run_cmd`.
 - rc 0 means the tool reported success, not that the target runs the image;
