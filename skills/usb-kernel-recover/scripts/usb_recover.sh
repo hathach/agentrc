@@ -42,6 +42,7 @@ SHIELD_ATTRS='bNumInterfaces bmAttributes bMaxPower configuration bConfiguration
 SYSFS=/sys
 SHIELD_STATE=/run/tinyusb-hil/shield
 FAIL_CHMOD=''          # a path whose chmod the tests make fail, to reach the rollback-failure branch
+PORT_WRITE_TIMEOUT=''
 if [ "$(id -u)" -ne 0 ]; then
   SYSFS=${USB_RECOVER_SYSFS:-/sys}
   SHIELD_STATE=${USB_RECOVER_STATE:-/run/tinyusb-hil/shield}
@@ -125,7 +126,8 @@ await_reenum() {  # await_reenum TARGET GEN: print its new generation; non-zero 
   return 1
 }
 
-PORT_WRITE_TIMEOUT=${PORT_WRITE_TIMEOUT:-15}   # s for one `disable` write and its read-back
+# s for one `disable` write and its read-back; a positive integer, never evaluated as an expression
+[[ $PORT_WRITE_TIMEOUT =~ ^[1-9][0-9]*$ ]] || PORT_WRITE_TIMEOUT=15
 PORT_OFF_SECS=2
 port_write() {
   # port_write FILE VALUE: write it and read it back in a child bounded by PORT_WRITE_TIMEOUT:

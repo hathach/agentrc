@@ -579,6 +579,14 @@ class HubCycle(VerbTree):
         self.assertIn('failed (off 1, on 0); power-on restored', out)
         self.assertEqual(self.written(), ['1', '0'])
 
+    def test_a_timeout_that_is_not_a_positive_integer_is_never_evaluated(self):
+        marker = Path(self.td.name) / 'evaluated'
+        out = self.cycle('13-1.6', REENUM=str(Path(self.td.name) / 'reenum'),
+                         USB_RECOVER_PORT_WRITE_TIMEOUT=f'PPID[$(touch {marker})]')
+        self.assertIn('re-enumerated', out)
+        self.assertEqual(self.written(), ['1', '0'])
+        self.assertFalse(marker.exists())
+
     def test_a_failed_on_write_is_reported_not_restored(self):
         out = self.cycle('13-1.6', code=1, HANG_VALUE='0')
         self.assertIn('power-on NOT restored', out)
