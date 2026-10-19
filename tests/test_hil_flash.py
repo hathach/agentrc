@@ -703,7 +703,8 @@ class Openocd(unittest.TestCase):
 
     def test_a_malformed_explicit_pin_is_refused_before_openocd_runs(self):
         rp2040 = {'name': 'openocd', 'uid': 'S-bad', 'args': '-f interface/cmsis-dap.cfg -f target/rp2040.cfg'}
-        for bad in ('1a86_55d4', '0x1a86', '0x1a86 0x8010 0x2e8a', '', '   ', None, 4660, ['0x1a86', '0x8010']):
+        for bad in ('1a86_55d4', '0x1a86', '0x1a86 0x8010 0x2e8a', '0x2e8a\n0x000c', '', '   ', None, 4660,
+                    ['0x1a86', '0x8010']):
             f = {**rp2040, 'vid_pid': bad}
             for fn, args in ((hf.flash_openocd, (f, 'fw.elf')), (hf.reset_openocd, (f,)),
                              (hf.rescue_openocd, (f, hf.DAP_WEDGED[0]))):
@@ -776,7 +777,10 @@ class ConvoySafe(unittest.TestCase):
             self.assertFalse(self.f(flasher))
 
     def test_valid_vid_pid(self):
-        for value, want in (('0x2e8a 0x000c', True), (' 0x2e8a  0x000c ', True), ('0x2e8a\t0x000c\n', True),
+        for value, want in (('0x2e8a 0x000c', True), (' 0x2e8a  0x000c ', True), ('\t0x2e8a\t0x000c\t', True),
+                            # a newline would split the Tcl `adapter usb vid_pid` command in two
+                            ('0x2e8a\n0x000c', False), ('0x2e8a 0x000c\n0x2e8a 0x000d', False),
+                            ('0x2e8a\t0x000c\n', False), ('\n0x2e8a 0x000c', False), ('0x2e8a\r0x000c', False),
                             ('0x2e8a 0x000c 0x2e8a 0x000d', True), ('0x2e8a', False),
                             ('0x2e8a 0x000c 0x2e8a', False), ('0x1234 0x5678 0x9abc', False),
                             ('0x2e8a 0x000c 0x2e8a 0x000d 0x2e8a', False), ('0x2e8a0x000c', False),

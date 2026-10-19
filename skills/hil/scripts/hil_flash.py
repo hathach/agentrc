@@ -347,12 +347,13 @@ def rescue_openocd(flasher: dict, flash_out: str = '', *, timeout, run=None) -> 
 # tested for truthiness -- `vid_pid` is a hand-edited roster field whose NAME is also used,
 # with a different syntax, by tinyusb's tests.dev_attached, and convoy_safe reads a non-empty
 # value as PROOF the flasher can deliver a recovery past a poisoned node. A typo there
-# silently promised a recovery that openocd would reject at startup.
-_VID_PID_RE = re.compile(r'^0x[0-9a-fA-F]{4}\s+0x[0-9a-fA-F]{4}(\s+0x[0-9a-fA-F]{4}\s+0x[0-9a-fA-F]{4})*$')
+# silently promised a recovery that openocd would reject at startup. Spaces and tabs only:
+# the value goes verbatim into a Tcl `-c` command, where a newline starts another command.
+_VID_PID_RE = re.compile(r'0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4}([ \t]+0x[0-9a-fA-F]{4}[ \t]+0x[0-9a-fA-F]{4})*')
 
 
 def valid_vid_pid(value) -> bool:
-    return isinstance(value, str) and bool(_VID_PID_RE.match(value.strip()))
+    return isinstance(value, str) and bool(_VID_PID_RE.fullmatch(value.strip(' \t')))
 
 
 def convoy_safe(flasher: dict) -> bool:
