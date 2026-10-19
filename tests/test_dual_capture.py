@@ -129,7 +129,8 @@ class DualCaptureTest(unittest.TestCase):
                                             '--timeout', '10', '--grace', '1')
                 pid = int(pidfile.read_text())
                 self.assertEqual(rc, 1, err)
-                if owner == 'side':
+                # a loaded host can poll the side before a tool that does not linger exits
+                if owner == 'side' or 'orphans' not in out:
                     self.assertTrue(out['sides'][0]['stopped'])
                     self.assertNotIn('descendantsLeft', out['sides'][0])
                 else:
