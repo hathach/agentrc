@@ -21,7 +21,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -376,6 +376,83 @@ class DetachedHolder(LockDir):
             self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
         for b in boards:
             self.assertIsNone(hil_lock.read_record(b))
+
+    def test_a_board_recorded_after_the_release_scanned_is_cleared_before_the_named_one(self):
+        other = BOARD + '-2'
+        real_clear = hil_lock.clear_record
+
+        def slow_other_clear(fh):         # runs in the forked holder
+            if os.readlink(f'/proc/self/fd/{fh.fileno()}').endswith(f'{other}.lock'):
+                _sleep(0.5)
+            real_clear(fh)
+
+        self.patch(hil_lock, 'clear_record', slow_other_clear)
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 0)
+        self.addCleanup(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+        self.patch(hil_lock, '_boards_of', lambda pid, start: [])     # as if scanned before `other` was recorded
+        with quiet():
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 0)
+        self.assertIsNone(hil_lock.read_record(other))
+
+    def test_a_board_only_the_scan_added_is_cleared_once_another_holder_takes_it(self):
+        other = BOARD + '-2'
+        self.patch(hil_lock, 'RELEASE_WAIT', 0.2)
+        real = hil_lock.signal.pidfd_send_signal
+        # a replacement on a board the caller named is still reported, as before the scan existed
+        for named, rc in (([BOARD], 0), ([BOARD, other], 1)):
+            with self.subTest(named=named), ExitStack() as stack:
+                with quiet():
+                    self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 0)
+                stack.callback(self.kill_quietly, hil_lock.read_record(BOARD)['pid'])
+
+                def signal_then_replace(fd, sig):
+                    real(fd, sig)
+                    stack.callback(hil_lock.release_board_lock, self.take_when_free(other))
+
+                with quiet() as (_, err), mock.patch.object(hil_lock.signal, 'pidfd_send_signal', signal_then_replace):
+                    self.assertEqual(hil_lock.cmd_release(named), rc, err.getvalue())
+                self.assertEqual(hil_lock.read_record(other)['reason'], 'replacement')
+                self.assertEqual('still locked' in err.getvalue(), bool(rc))
+
+    def test_a_sigterm_while_a_board_is_taken_still_clears_its_record(self):
+        other = BOARD + '-2'
+        real = hil_lock.take_board_lock
+
+        def take_then_sigterm(b, *a, **k):    # runs in the forked holder
+            fh = real(b, *a, **k)
+            if b == other:
+                os.kill(os.getpid(), signal.SIGTERM)    # between the record write and its handle append
+            return fh
+
+        self.patch(hil_lock, 'take_board_lock', take_then_sigterm)
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 1)
+        self.wait_cleared([BOARD, other])
+        self.assertIsNone(hil_lock.read_record(BOARD))
+        self.assertIsNone(hil_lock.read_record(other))
+
+    def test_a_record_its_dead_holder_left_fails_the_release(self):
+        with quiet():
+            self.assertEqual(hil_lock.cmd_hold([BOARD], 'selftest hold'), 0)
+        pid = hil_lock.read_record(BOARD)['pid']
+        self.addCleanup(self.kill_quietly, pid)
+        real = hil_lock.signal.pidfd_send_signal
+        self.patch(hil_lock.signal, 'pidfd_send_signal', lambda fd, sig: real(fd, signal.SIGKILL))
+        self.patch(hil_lock, 'RELEASE_WAIT', 0.2)
+        with quiet() as (_, err):
+            self.assertEqual(hil_lock.cmd_release([BOARD]), 1)
+        self.assertIn(f'still locked: {BOARD}', err.getvalue())
+
+    def take_when_free(self, b):
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                return hil_lock.take_board_lock(b, 'replacement')
+            except hil_lock.BoardLocked:
+                if time.monotonic() >= deadline:
+                    raise
+                _sleep(0.02)
 
     def test_a_repeated_name_holds_once(self):
         with quiet() as (out, _):

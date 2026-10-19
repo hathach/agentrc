@@ -661,20 +661,24 @@ def cmd_hold(boards, reason, take_over_board=None):
 
     def _bow_out(*_):
         # clear the records before dying so read_record/status stay truthful (the kernel
-        # drops the flocks themselves on exit either way)
-        for h in handles:
+        # drops the flocks themselves on exit either way); newest first, so a board recorded
+        # after a release scanned is cleared before the boards it named and waits for
+        for h in reversed(handles):
             clear_record(h)
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _bow_out)          # before readiness: a release works at once
     try:
         for b in boards:
+            # held off until the record is in `handles`: _bow_out would leave it behind
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
             handles.append(take_board_lock(b, reason, holder=HOLD_KIND, start=start))
+            signal.pthread_sigmask(signal.SIG_SETMASK, mask)
         report('1')
     except (BoardLocked, LockUnavailable) as e:
         # lost a race, a blocker, or a record failed: clear every record we wrote (the
         # flocks go with the exit) so no stale owned record outlives this holder
-        for h in handles:
+        for h in reversed(handles):
             clear_record(h)
         if type(e) is BoardLocked:
             report(f'0{b} locked: {holder_text(read_record(b))}')
@@ -738,26 +742,42 @@ def _boards_of(pid, start) -> list:
             if isinstance(r := read_record(b), dict) and (r.get('pid'), r.get('start')) == (pid, start)]
 
 
+def _wait_released(owned, named, deadline) -> list:
+    """The boards of `owned` ({board: (pid, start) of its signalled holder}) still taken at the
+    deadline: by that holder's record, alive or not, by an unreadable one, or, on a board in
+    `named`, by any live holder. A board only _boards_of added is cleared once another holder
+    has it."""
+    def taken(b):
+        state, rec = record_state(b)
+        if state != 'record':
+            return state == 'unreadable'
+        return (rec.get('pid'), rec.get('start')) == owned[b] or (b in named and _alive(rec))
+    while True:
+        still = sorted(b for b in owned if taken(b))
+        if not still or time.monotonic() >= deadline:
+            return still
+        time.sleep(0.05)
+
+
 def cmd_release(boards):
     rc = 0
     victims = {}
     for b in boards:
         rc |= _release_one(b, victims)
-    signalled = []
+    owned = {}
     for (pid, start), held in sorted(victims.items()):
         # SIGTERM ends the holder on every board it holds: wait for all of its records
-        owned = sorted({b for b, _ in held} | set(_boards_of(pid, start)))
+        theirs = {b for b, _ in held} | set(_boards_of(pid, start))
         try:
             _pidfd_signal(pid, start, signal.SIGTERM,
                           lambda: all(read_record(b) == info for b, info in held))
             print(f'released holder pid {pid}')
-            signalled += owned
+            owned.update(dict.fromkeys(theirs, (pid, start)))
         except ReleaseRefused as e:
             print(f'ERROR: {e}', file=sys.stderr)
             rc = 1
-    if signalled:
-        still = [b for b in _wait_cleared(signalled, time.monotonic() + RELEASE_WAIT)
-                 if is_locked(b) or record_state(b)[0] == 'unreadable']
+    if owned:
+        still = _wait_released(owned, set(boards), time.monotonic() + RELEASE_WAIT)
         if still:
             print(f'ERROR: still locked: {", ".join(still)}', file=sys.stderr)
             return 1
