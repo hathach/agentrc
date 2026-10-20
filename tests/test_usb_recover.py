@@ -750,6 +750,15 @@ class RootCycle(VerbTree):
         self.assertIn('interrupted before the power-off; nothing switched', out)
         self.assertEqual(self.ran(), ['check'])
 
+    def test_a_signal_after_the_check_passed_but_before_the_off_still_switches_nothing(self):
+        """An exported `echo` overrides the builtin and signals the shell from its `cycling` line,
+        which runs after the check's verdict and before the off request."""
+        echo = '() { [[ "$*" == "root-cycle: cycling "* ]] && kill -TERM $$; builtin echo "$@"; }'
+        out = self.cycle('13-1.6', code=1, **{'BASH_FUNC_echo%%': echo})
+        self.assertIn('interrupted before the power-off; nothing switched', out)
+        self.assertNotIn('failed (', out)
+        self.assertEqual(self.ran(), ['check'])
+
     def test_a_group_signal_during_the_off_or_its_delay_still_powers_the_port_back_on_once(self):
         for env, says in (({'RPC_off': 'hang'}, 'failed (off 143, on 0, interrupted)'),
                           ({'OFF_HANG': '1'}, 'failed (off 0, on 0, interrupted)')):

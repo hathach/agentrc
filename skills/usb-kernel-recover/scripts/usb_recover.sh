@@ -165,6 +165,8 @@ cycle_port() {
   while [ "$1" != -- ]; do offcmd+=("$1"); shift; done
   shift
   trap 'interrupted=yes' INT TERM HUP
+  # a signal already taken (root-cycle arms the trap before its check) must not reach the off request
+  [ -z "$interrupted" ] || { trap - INT TERM HUP; die "$label: interrupted before the power-off; nothing switched"; }
   supervised "${offcmd[@]}" || off=$?
   # `|| :`: a signal to the process group kills the sleep too, and set -e must not skip the restore
   if [ $off -eq 0 ] && [ -z "$interrupted" ]; then sleep "$secs" || :; fi
