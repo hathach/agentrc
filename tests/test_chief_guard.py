@@ -267,15 +267,19 @@ class ChiefGuard(unittest.TestCase):
                   r'find /tmp -execdir ./{} \;', r'find /tmp -ok x{}y \;',
                   # behind a wrapper, at any depth
                   r"find /usr/bin/git -maxdepth 0 -exec /usr/bin/env '{}' push \;",
-                  r"find /usr/bin/git -exec env nice -n 5 timeout 9 '{}' push \;"):
+                  r"find /usr/bin/git -exec env nice -n 5 timeout 9 '{}' push \;",
+                  # a wrapper with no program runs the words xargs reads
+                  "printf 'git push\\n' | xargs env", 'xargs nohup', 'xargs timeout 5', 'xargs -0 env -i'):
             self.assert_denied(c, 'run time')
         for c in ('echo /tmp/a | xargs cat', 'xargs grep -l foo', "find /tmp -name '*.c' -exec grep -l x {} +",
-                  r'find /tmp -exec wc -l {} \;', 'find /tmp -name x -type f'):
+                  r'find /tmp -exec wc -l {} \;', 'find /tmp -name x -type f', 'xargs', 'echo a | xargs -n1'):
             self.assert_allowed(c)
 
     def test_shell_options_outside_the_known_set_and_stdin_are_denied(self):
         for c in ('bash', 'sh', 'echo git push | bash', 'echo git push | sh', 'bash -',
-                  'bash -- -', 'bash <<< "git push"', 'cat script | bash -l'):
+                  'bash -- -', 'bash <<< "git push"', 'cat script | bash -l', "printf 'git push\\n' | bash /dev/stdin",
+                  'bash /dev/fd/0', 'sh /dev/fd/0', 'sh //dev/./stdin', 'bash -- /proc/self/fd/0', 'sudo -ns', 'sudo -i',
+                  'sudo -n -s'):
             self.assert_denied(c, 'stdin')
         for c in ('bash -s', 'bash -s arg', 'bash -O expand_aliases', 'bash -O expand_aliases /tmp/s.sh', 'bash -i', 'bash +x /tmp/s.sh',
                   'bash --rcfile /tmp/r /tmp/s.sh', 'bash -o vi -c "git log"'):
@@ -319,7 +323,9 @@ class ChiefGuard(unittest.TestCase):
         for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
                   'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',
                   'git ls-remote -u x origin', 'git ls-remote -qu x .', 'git grep --open-files-in-pager=vi chief',
-                  'git grep --open-files=vi chief', 'git grep --open chief', 'git grep -O chief', 'git grep -iO chief'):
+                  'git grep --open-files=vi chief', 'git grep --open chief', 'git grep -O chief', 'git grep -iO chief',
+                  # -e takes `--` as its pattern, so the option after it still runs
+                  "git grep -e -- --open-files-in-pager='sh -c \"git push\"' -- README.md"):
             self.assert_denied(c, 'runs a program')
         for c in ('git fetch -q origin', 'git fetch --prune origin', 'git ls-remote origin', 'git ls-remote --heads origin',
                   'git grep -o chief -- src', 'git grep -n chief'):
@@ -361,7 +367,9 @@ class ChiefGuard(unittest.TestCase):
 
     def test_dd_sort_and_refused_writers(self):
         for c in (f'dd if=/dev/zero of={self.wt}/src/a.c', f'sort -o {self.wt}/src/a.c /tmp/in',
-                  f'sort --output={self.wt}/src/a.c /tmp/in'):
+                  f'sort --output={self.wt}/src/a.c /tmp/in',
+                  # -T takes `--` as its directory, so -o after it is still the output
+                  f'sort -T -- -o {self.wt}/src/a.c /tmp/x'):
             self.assert_denied(c, 'literal absolute path')
         # sort writes only through a separate -o or --output=: a cluster holding o, another spelling, a compressor
         for c in (f'sort -no{self.wt}/x /tmp/in', 'sort -no /tmp/x /tmp/in', 'sort --output /tmp/x /tmp/in',
@@ -387,6 +395,13 @@ class ChiefGuard(unittest.TestCase):
             self.assert_denied(c, 'listing')
         for c in ('tar tf /tmp/a.tar', 'tar -tf /tmp/a.tar', 'tar -tvf /tmp/a.tar', 'tar tvf /tmp/a.tar'):
             self.assert_allowed(c)
+        # TAR_OPTIONS adds options to a listing too, --checkpoint-action=exec included
+        for c in ("""TAR_OPTIONS="--checkpoint=1 --checkpoint-action='exec=git push'" tar tf /tmp/a.tar""",
+                  'env TAR_OPTIONS=x tar tf /tmp/a.tar', 'export TAR_OPTIONS=x; tar tf /tmp/a.tar',
+                  'declare -x TAR_OPTIONS=x'):
+            self.assert_denied(c, 'TAR_OPTIONS')
+        self.env['TAR_OPTIONS'] = '--checkpoint=1'
+        self.assert_denied('tar tf /tmp/a.tar', 'listing')
 
     def test_curl_passes_only_as_a_plain_get(self):
         for c in (f'curl -o {self.wt}/src/a.c https://x', f'curl --output {self.wt}/src/a.c https://x',

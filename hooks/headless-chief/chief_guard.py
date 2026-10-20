@@ -65,7 +65,7 @@ GIT_READ = {
 GIT_GLOBAL_WITH_VALUE = {'-C', '--git-dir', '--work-tree', '--namespace', '--exec-path'}
 # read subcommands' options that run a program, in any spelling git's option parser accepts: (long options with their
 # shortest prefix matched, short letters); the whole short cluster is read, so a letter that is an earlier one's value
-# (`grep -eO`) is denied too
+# (`grep -eO`) is denied too, and so is every word past `--`, which a value-taking option may consume (`grep -e --`)
 GIT_EXEC = {'fetch': ({'--upload-pack': 3, '--exec': 3}, 'u'), 'ls-remote': ({'--upload-pack': 3, '--exec': 3}, 'u'),
             'grep': ({'--open-files-in-pager': 3}, 'O')}
 # `git -c key=value` is vetted against this allowlist: any value git may run a command from is kept out
@@ -117,7 +117,9 @@ WRAPPER_FLAGS = {
 # every GIT_CONFIG* variable (they inject configuration, core.fsmonitor included)
 PAGER_ENV = {'PAGER', 'GIT_PAGER'}
 RUN_ENV = {'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_EDITOR',
-           'EDITOR', 'VISUAL', 'GIT_SEQUENCE_EDITOR', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'BASHOPTS'}
+           'EDITOR', 'VISUAL', 'GIT_SEQUENCE_EDITOR', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'BASHOPTS', 'TAR_OPTIONS'}
+# builtins whose assignment operands set the environment a later command inherits
+DECLARES = {'export', 'declare', 'typeset', 'readonly', 'local'}
 SHELLS = {'sh', 'bash', 'zsh', 'dash'}
 SHELL_LONG = {'--login', '--noprofile', '--norc', '--posix'}
 # Windows programs a bash command can start that run a command line of their own: powershell reads bare words
@@ -165,6 +167,10 @@ UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
 HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
 UNKNOWN = '\0'
+STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
+              'plain words, or dispatch to a unit')
+# a script operand naming a descriptor (/dev/stdin, /dev/fd/0, /proc/self/fd/0) reads the commands piped in
+STDIN_PATH = re.compile(r'(^|/)(stdin|fd/\d+)$')
 WRITE_RULE = 'chief writes only its artifacts, named by a literal absolute path outside the task worktree; a worktree change goes to a writer'
 LINK_RULE = ('on Windows a link to the task worktree is a path this guard cannot follow; a link names a literal absolute '
              'source outside it') if os.name == 'nt' else \
@@ -294,9 +300,12 @@ class Guard:
                 self.writes(words[k + 1], 'the redirect')
         if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)=.*winsymlinks', w) for w in words):
             raise Denied('winsymlinks makes links this guard cannot follow on Windows; dispatch the step to a unit')
-        words, xargs, replace = unwrap([w for k, w in enumerate(words)
-                                        if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
+        words, xargs, replace, bare = unwrap([w for k, w in enumerate(words)
+                                              if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
         if not words:
+            if (indirect or xargs) and not bare:
+                raise Denied('a wrapper under xargs or find -exec with no program runs one known only at run time; name the '
+                             'program')
             return
         if indirect and '{}' in words[0].translate(UNQUOTED):
             raise Denied('`find -exec {}` runs a found path as the command, known only at run time; name the program')
@@ -316,6 +325,10 @@ class Guard:
             self.writes(source, f'`{cmd}`', verb='link', rule=LINK_RULE)
         if cmd == 'shopt' and 'expand_aliases' in [a.translate(UNQUOTED) for a in args]:
             raise Denied('`shopt expand_aliases` lets a later alias run a command under another name this guard cannot see')
+        if cmd in DECLARES:
+            for a in args:
+                if ASSIGNMENT.match(a):
+                    forbidden_env(a)
         if cmd == 'alias' and any('=' in a for a in args):
             raise Denied('an alias runs a command under another name this guard cannot see; run the command itself')
         if cmd in SHELLS:
@@ -339,7 +352,8 @@ class Guard:
             raise Denied('`wget` writes files and logs at paths this guard cannot place; fetch with `curl -o <absolute path outside the worktree>`, or dispatch to a unit')
         elif cmd == 'patch':
             raise Denied('`patch` edits files in place; chief writes its artifacts whole with Write, and a worktree change goes to a writer')
-        elif cmd == 'tar' and not (len(args) == 2 and re.fullmatch(r'-?tv?f', args[0]) and ':' not in args[1]):
+        elif cmd == 'tar' and (os.environ.get('TAR_OPTIONS') or
+                               not (len(args) == 2 and re.fullmatch(r'-?tv?f', args[0]) and ':' not in args[1])):
             raise Denied('`tar` other than a listing (`tar tf <local file>`) extracts, writes or runs a program this guard '
                          'cannot place; dispatch the step to a unit')
         elif cmd == 'curl':
@@ -379,7 +393,7 @@ class Guard:
             out = a.split('=', 1)[1] if a.startswith('--output=') else rest[k + 1] if a == '--output' and k + 1 < len(rest) else None
             if out is not None:
                 self.writes(out, f'`git {sub} --output`')
-        if sub in GIT_EXEC and (a := spelled(rest, *GIT_EXEC[sub])):
+        if sub in GIT_EXEC and (a := spelled([w for w in rest if w != '--'], *GIT_EXEC[sub])):
             raise Denied(f'`git {sub} {a}` runs a program this guard cannot vet (locally for a `.` remote); use the plain read')
         if sub in GIT_READ:
             return
@@ -423,8 +437,8 @@ class Guard:
         operand = args[k] if k < len(args) else None
         if command:
             return self.command((operand or '').translate(UNQUOTED), depth + 1)
-        if operand in (None, '-'):
-            raise Denied('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as plain words, or dispatch to a unit')
+        if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
+            raise Denied(STDIN_RULE)
 
     def find_exec(self, args, depth):
         """`find -exec`/`-execdir`/`-ok`/`-okdir` runs a command on the paths it finds, known only at run time: only a
@@ -636,9 +650,10 @@ def absolute(path):
 
 def unwrap(words):
     """(the command a word list runs, past assignments, keywords and wrappers with their options; whether xargs runs it,
-    with arguments known only at run time; xargs' -I replace string). An assignment a tool runs as a command, and a wrapper option outside the
-    wrapper's known table, are denied."""
-    xargs, replace = False, None
+    with arguments known only at run time; xargs' -I replace string; whether xargs was the last wrapper, so a missing
+    command is its echo). An assignment a tool runs as a command, a wrapper option outside the wrapper's known table,
+    and sudo starting a shell with no command, which reads stdin, are denied."""
+    xargs, replace, name = False, None, None
     while words:
         w = words[0]
         if w in KEYWORDS:
@@ -650,24 +665,26 @@ def unwrap(words):
             continue
         name = program(os.path.basename(w))
         if name == 'command' and any(re.fullmatch(r'-[pvV]*[vV][pvV]*', o) for o in options(words[1:])):
-            return [], False, None  # looks the names up, runs none
+            return [], False, None, True  # looks the names up, runs none
         if name in WRAPPERS:
             if name == 'xargs' and xargs:
                 raise Denied('xargs under xargs substitutes into the inner command at run time; run one xargs')
             xargs = xargs or name == 'xargs'
             words, values = strip_wrapper_options(name, words[1:])
             replace = values.get('-I', replace) if name == 'xargs' else replace
+            if name == 'sudo' and not words and ('-s' in values or '-i' in values):
+                raise Denied(STDIN_RULE)
             if name == 'timeout' and words:
                 words = words[1:]  # the duration
         else:
             break
-    return words, xargs, replace
+    return words, xargs, replace, name == 'xargs'
 
 
 def strip_wrapper_options(name, words):
-    """(a wrapper's words past its leading options, {option: value}). Each long option, and each letter of a short
-    cluster, must be in the wrapper's table with a known value: a letter taking a value takes the rest of its cluster,
-    else the next word."""
+    """(a wrapper's words past its leading options, {option: value, or True for a flag}). Each long option, and each
+    letter of a short cluster, must be in the wrapper's table with a known value: a letter taking a value takes the
+    rest of its cluster, else the next word."""
     value, flags = WRAPPERS[name], WRAPPER_FLAGS.get(name, set())
     given = {}
 
@@ -688,11 +705,15 @@ def strip_wrapper_options(name, words):
                 raise unknown(a)
             if opt in value and not eq:
                 given[opt], words = words[0] if words else '', words[1:]
+            elif opt in flags:
+                given[opt] = True
             continue
         for pos, ch in enumerate(a[1:], 1):
             opt = '-' + ch
             if opt not in value | flags:
                 raise unknown(a)
+            if opt in flags:
+                given[opt] = True
             if opt in value:
                 if pos == len(a) - 1:
                     given[opt], words = words[0] if words else '', words[1:]
@@ -777,12 +798,13 @@ def written(cmd, args):
 
 def sort_outputs(args):
     """The files sort writes: only a separate `-o PATH` or `--output=PATH`; a cluster holding o, another spelling of
-    --output and --compress-program (which runs a program) are denied."""
+    --output and --compress-program (which runs a program) are denied. Words past `--` are read too: a value-taking
+    option (`-T --`) may consume it."""
     out, k = [], 0
     while k < len(args):
         a, k = args[k], k + 1
         if a == '--':
-            break
+            continue
         if a == '-o':
             out.append(args[k] if k < len(args) else '')
             k += 1
