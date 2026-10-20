@@ -1135,6 +1135,39 @@ def _collector(dest):
             os.close(fd)
 
 
+def _aside(dest):
+    """Where a publication keeps dest's previous collection until its replacement is in place."""
+    return dest.with_name(f'.{dest.name}.old')
+
+
+def _settle(dest):
+    """Finish a publication a collector was interrupted in: with dest gone its previous collection
+    goes back, else dest is the replacement and the one set aside goes."""
+    old = _aside(dest)
+    if old.exists() or old.is_symlink():
+        if dest.exists() or dest.is_symlink():
+            _remove(old)
+        else:
+            old.rename(dest)
+
+
+def _publish(tmp, dest):
+    """Rename tmp to dest without ever removing dest first: Windows cannot rename onto an existing
+    directory, and a failed or interrupted publication must leave the previous collection."""
+    old = _aside(dest)
+    aside = dest.exists() or dest.is_symlink()
+    if aside:
+        dest.rename(old)
+    try:
+        tmp.rename(dest)
+    except BaseException:
+        if aside:
+            old.rename(dest)
+        raise
+    if aside:
+        _remove(old)
+
+
 def _uncovered(held, groups, optional):
     """What a cached complete collection did not fetch of these requirements, by type: a group
     member needs that exact entry in the inventory (a tree with its /, so a file never answers
@@ -1195,6 +1228,7 @@ def _collect(tree, dest, groups, optional, accept, st):
         fail(f'{COLLECTION} is the collection record itself, not an artifact path')
     identity = {'host': tree.host, 'dir': tree.dir, 'token': tree.token}
     with _collector(dest):
+        _settle(dest)
         held = _collection(dest)
         if held is None and dest.exists() and any(dest.iterdir()):
             fail(f'{dest} holds files but no {COLLECTION}; collect into a new dest')
@@ -1244,8 +1278,7 @@ def _collect(tree, dest, groups, optional, accept, st):
                      f'({"; ".join([*lost, *map(str, incomplete), *unaccepted]) or st["state"]}), '
                      f'so it is kept as it was')
             write_json(tmp / COLLECTION, record)
-            _remove(dest)
-            tmp.rename(dest)
+            _publish(tmp, dest)
             return record
         finally:
             _remove(tmp)

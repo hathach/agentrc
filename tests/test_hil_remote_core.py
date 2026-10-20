@@ -1687,6 +1687,32 @@ class Attempts(Rig):
         self.assertEqual((dest / 'out/late.json').read_text(), 'late')
         self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'], 'nothing stranded')
 
+    def test_a_failed_publication_keeps_the_collection_it_would_replace(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        held = rc_.collect(tree, dest, optional=['out/'])
+        (self.base / 'a1/out/late.json').write_text('late')
+        real = Path.rename
+
+        def rename(src, target):
+            if Path(target) == dest and src.name.endswith('.tmp'):
+                raise OSError(5, 'Input/output error')
+            return real(src, target)
+        with mock.patch.object(Path, 'rename', rename), self.assertRaises(OSError):
+            rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text()), held)
+        self.assertEqual((dest / 'out/report.json').read_text(), 'from the rig')
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
+        # interrupted with the collection set aside: the next collector puts it back
+        dest.rename(self.tmp / '.got.old')
+        self.assertEqual(rc_.collect(tree, dest, optional=['out/']), held)
+        # interrupted after the replacement was published: the next collector drops what was set aside
+        col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((col['state'], (dest / 'out/late.json').read_text()), ('complete', 'late'))
+        (self.tmp / '.got.old/out').mkdir(parents=True)
+        self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
+
     def test_running_partial_then_dead_never_complete_nor_relaunched(self):
         tree = self.create()
         self.stage(tree)
