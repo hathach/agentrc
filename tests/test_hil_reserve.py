@@ -25,6 +25,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_reserve.py'
 DATA = Path(__file__).resolve().parent / 'data' / 'hil_reserve'
+USB_RECOVER = SCRIPT.parents[2] / 'usb-kernel-recover' / 'scripts' / 'usb_recover.sh'
 TINYUSB, TINYUF2 = DATA / 'tinyusb.json', DATA / 'tinyuf2.json'
 
 spec = importlib.util.spec_from_file_location('hil_reserve_under_test', SCRIPT)
@@ -62,6 +63,20 @@ PY
     exit 0 ;;
 esac
 '''
+
+# a fake root_port_cycle.py for the real usb_recover.sh: logs each run; ACTION <verb>=refuse|hang|
+# survive (ignores USR2, the script's test KILL_SIG, so it outlives the bound)
+ROOT_PORT_CYCLE = f'''#!/bin/sh
+echo "$1" >> "$ARGV_OUT.rpc"
+case "$ACTION" in
+  "$1=refuse") exit 3 ;;
+  "$1=hang") exec {shutil.which('sleep')} 30 ;;
+  "$1=survive") echo $$ > "$ARGV_OUT.pid"; trap '' USR2; exec {shutil.which('sleep')} 30 >/dev/null 2>&1 ;;
+esac
+[ "$1" = check ] && echo 189:1536:4242
+exit 0
+'''
+SLEEP = f'#!/bin/sh\nexec {shutil.which("sleep")} 0.05\n'   # usb_recover.sh's polls and delays, shrunk
 
 
 class Child:
@@ -928,6 +943,61 @@ class HubScope(Fixture):
         p = self.run_hub(action='refuse-drop')
         self.assertIn('command exited 3', p.blocker())
         self.assertEqual(len(self.held()), 4)
+
+
+class RootCycleScript(Fixture):
+    """The real usb_recover.sh root-cycle under `run`, its root_port_cycle.py stubbed through the
+    script's non-root seams: a refusal before the power-off (exit 3) releases, while a surviving
+    run, or a hung one ended at the bound, keeps every reservation, even with power restored."""
+
+    def setUp(self):
+        super().setUp()
+        root = Path(self.td.name)
+        (root / 'sysroot/bus/usb').mkdir(parents=True)
+        (root / 'sysroot/bus/usb/devices').symlink_to(self.sys)
+        stub = self.bin / 'root_port_cycle.py'
+        for path, text in ((stub, ROOT_PORT_CYCLE), (self.bin / 'sleep', SLEEP)):
+            path.write_text(text)
+            path.chmod(0o755)
+        hr.RECOVER_SCRIPT = str(USB_RECOVER)
+        env = {'USB_RECOVER_SYSFS': str(root / 'sysroot'), 'USB_RECOVER_ROOT_PORT_CYCLE': str(stub),
+               'USB_RECOVER_PORT_WRITE_TIMEOUT': '1', 'USB_RECOVER_TEST_KILL_SIG': 'USR2'}
+        for k in env:
+            self.addCleanup(os.environ.pop, k, None)
+        os.environ.update(env)
+
+    def runs(self):
+        rpc = Path(str(self.argv_out) + '.rpc')
+        return rpc.read_text().split() if rpc.exists() else []
+
+    def test_a_refused_check_releases(self):
+        p = self.run_run(action='check=refuse')
+        out = p.output()
+        self.assertEqual((p.returncode, 'root-cycle refused before writing anything' in out), (1, True), out)
+        self.assertEqual(self.runs(), ['check'])
+        self.assertEqual(self.held(), set())
+
+    def test_a_surviving_off_keeps_every_reservation(self):
+        p = self.run_run(action='off=survive')
+        line = p.blocker()
+        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
+        self.addCleanup(lambda: hr.hil_lock.proc_start(orphan) and os.kill(orphan, signal.SIGKILL))
+        self.assertIn('command exited 1', line)
+        self.assertIn(f'surviving pids [{orphan}]', line)
+        self.assertEqual(self.runs(), ['check', 'off'])          # no power-on after a survivor
+        self.assert_cleanup_holder(p, token_of(line))
+
+    def test_a_hung_off_ended_at_the_bound_keeps_every_reservation_though_power_was_restored(self):
+        # not signal delivery: the command inherits SIGINT/SIGTERM/SIGHUP blocked from run()'s
+        # spawn, so the forwarded SIGTERM stays pending in bash and the hung off ends at the bound
+        p = self.run_run(action='off=hang')
+        self.wait_for(lambda: 'off' in self.runs(), 'the power-off run')
+        p.send_signal(signal.SIGTERM)
+        line = p.blocker()
+        self.assertIn('SIGTERM forwarded', line)
+        self.assertIn('command exited 1', line)
+        self.assertEqual(self.runs(), ['check', 'off', 'on'])
+        self.assert_cleanup_holder(p, token_of(line))
 
 
 if __name__ == '__main__':

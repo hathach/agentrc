@@ -5,13 +5,11 @@
 # Usage, by path (sudo's PATH does not include the script; <skill dir> is this skill's directory):
 #   sudo <skill dir>/scripts/usb_recover.sh <verb> ...
 #   authorized <busport>   # e.g. 3-2  -> deauthorize+reauthorize (re-enumerate, NO VBUS cut)
-#   root-cycle <busport> [serial]  # e.g. 13-1.6 -> uhubctl port-off/on at the ROOT port feeding
-#                          # it; [serial] is verified against the device and refused on mismatch,
-#                          # skipping the leaf hubs (which fake ganged switching and do not
-#                          # actually cut power). Bounces every sibling under that root port.
-#                          # Its power-off takes no device lock, but uhubctl's status pass
-#                          # opens the port's children first (agentrc#149).
-#                          # Exit 3: refused before uhubctl ran.
+#   root-cycle <busport> [serial]  # e.g. 13-1.6 -> port power off, 5 s, on at the ROOT port
+#                          # feeding it, sent over the root hub's own usbfs node only
+#                          # (root_port_cycle.py); [serial] is verified against the device and
+#                          # refused on mismatch. Bounces every sibling under that root port.
+#                          # Exit 3: refused before the power-off was sent.
 #   hub-cycle <busport> [serial]  # e.g. 5-3.2 -> ask the kernel to power the hub port feeding that
 #                          # LEAF off and on (its `disable` file: 1, 2 s, 0) under the hub's lock.
 #                          # Whether VBUS drops is the hub's: success proves re-enumeration, not a
@@ -43,11 +41,15 @@ SYSFS=/sys
 SHIELD_STATE=/run/tinyusb-hil/shield
 FAIL_CHMOD=''          # a path whose chmod the tests make fail, to reach the rollback-failure branch
 PORT_WRITE_TIMEOUT=''
+ROOT_PORT_CYCLE="$(dirname "$0")/root_port_cycle.py"
+KILL_SIG=KILL          # the tests' stand-in for a D-state child: a signal their stub survives
 if [ "$(id -u)" -ne 0 ]; then
   SYSFS=${USB_RECOVER_SYSFS:-/sys}
   SHIELD_STATE=${USB_RECOVER_STATE:-/run/tinyusb-hil/shield}
   FAIL_CHMOD=${USB_RECOVER_TEST_FAIL_CHMOD:-}
   PORT_WRITE_TIMEOUT=${USB_RECOVER_PORT_WRITE_TIMEOUT:-}
+  ROOT_PORT_CYCLE=${USB_RECOVER_ROOT_PORT_CYCLE:-$ROOT_PORT_CYCLE}
+  KILL_SIG=${USB_RECOVER_TEST_KILL_SIG:-KILL}
 fi
 
 USBPATH_RE='^[0-9]+-[0-9]+(\.[0-9]+)*$'
@@ -62,7 +64,7 @@ lock_read() {
   # Prints the value, '' when the attribute is absent, or '?' when it did not answer.
   #
   # Bounding these is load-bearing, not defensive: they are the FIRST thing root-cycle
-  # does, so on a real wedge an unbounded read blocks before reaching uhubctl at all
+  # does, so on a real wedge an unbounded read blocks before reaching the power request at all
   # (observed live: one attempt sat 3h; three concurrent invocations all frozen there).
   # The operator then reads that as "recovery didn't work" and escalates to a bare
   # `uhubctl -a cycle`, which tears the subtree down and blocks holding the ROOT HUB
@@ -93,8 +95,8 @@ lock_read() {
 #
 # This beats comparing devnum, which Linux reuses once the per-bus map wraps (observed live: a
 # single cycle moved one device 123 -> 113). It also beats watching for the node to vanish, since
-# `uhubctl -a cycle` holds the whole power-off window inside itself and a poll afterwards can
-# never witness the gap. The inode survives the gap, so no observation window is needed.
+# the cycle holds the whole power-off window before the poll starts, which can never witness the
+# gap. The inode survives the gap, so no observation window is needed.
 #
 # Crucially, if the disconnect is blocked on the wedged device's lock the kobject is never
 # recreated -- same inode -- which is exactly the case that must be reported as a failure. Verified
@@ -126,28 +128,56 @@ await_reenum() {  # await_reenum TARGET GEN: print its new generation; non-zero 
   return 1
 }
 
-# s for one `disable` write and its read-back; a positive integer, never evaluated as an expression
+# s for one port request (a `disable` write and its read-back, or one root_port_cycle.py run);
+# a positive integer, never evaluated as an expression
 [[ $PORT_WRITE_TIMEOUT =~ ^[1-9][0-9]*$ ]] || PORT_WRITE_TIMEOUT=15
 PORT_OFF_SECS=2
-port_write() {
-  # port_write FILE VALUE: write it and read it back in a child bounded by PORT_WRITE_TIMEOUT:
-  # both take the hub's lock. 0 done, 1 failed, 2 the child outlived SIGKILL (D state) and was
-  # left running -- it may still write, so no other write may follow it. The read-back is the
-  # shell's own `read`, so the timeout's SIGKILL reaches every process doing the work.
+ROOT_OFF_SECS=5
+interrupted='' survivor=''
+supervised() {
+  # supervised CMD...: run it in a child bounded by PORT_WRITE_TIMEOUT. Its own status; 124 when
+  # it was killed at the bound; 125 when it outlived SIGKILL (D state) for 1 s and was left
+  # running, its pid in $survivor -- it may still act, so no other request may follow it.
   local child n=0
-  sh -c 'echo "$2" > "$1" && read -r v < "$1" && [ "$v" = "$2" ]' sh "$1" "$2" &
+  "$@" &
   child=$!
   while kill -0 "$child" 2>/dev/null; do
     if [ $n -ge $((PORT_WRITE_TIMEOUT * 5)) ]; then
-      kill -9 "$child" 2>/dev/null
-      sleep 1
-      kill -0 "$child" 2>/dev/null && { survivor=$child; return 2; }
-      wait "$child" 2>/dev/null
-      return 1
+      kill -"$KILL_SIG" "$child" 2>/dev/null
+      for _ in 1 2 3 4 5; do
+        sleep 0.2
+        kill -0 "$child" 2>/dev/null || { wait "$child" 2>/dev/null; return 124; }
+      done
+      survivor=$child
+      return 125
     fi
     sleep 0.2; n=$((n + 1))
   done
-  wait "$child" || return 1
+  wait "$child"
+}
+cycle_port() {
+  # cycle_port LABEL SECS OFF_CMD... -- ON_CMD...: the off request, SECS, the on request, each
+  # supervised. From the off request on, any failure or interruption still runs the on request,
+  # unless a run survived (it could still act after the restore); anything but a clean cycle
+  # dies, never with 3.
+  local label=$1 secs=$2 off=0 on=0 restored offcmd=()
+  shift 2
+  while [ "$1" != -- ]; do offcmd+=("$1"); shift; done
+  shift
+  trap 'interrupted=yes' INT TERM HUP
+  supervised "${offcmd[@]}" || off=$?
+  # `|| :`: a signal to the process group kills the sleep too, and set -e must not skip the restore
+  if [ $off -eq 0 ] && [ -z "$interrupted" ]; then sleep "$secs" || :; fi
+  if [ -n "$survivor" ]; then
+    restored="not attempted: pid $survivor survived"
+  else
+    supervised "$@" || on=$?
+    [ $on -eq 0 ] && restored=restored || restored="NOT restored (${on})${survivor:+: pid $survivor survived}"
+  fi
+  trap - INT TERM HUP
+  if [ $off -ne 0 ] || [ $on -ne 0 ] || [ -n "$interrupted" ]; then
+    die "$label failed (off ${off}, on ${on}${interrupted:+, interrupted}); power-on ${restored}"
+  fi
 }
 usage() { sed -n '/^# Usage/,/^set -euo pipefail/p' "$0" | grep -E '^#   (sudo|[a-z])' >&2; exit 2; }
 
@@ -465,18 +495,14 @@ case "$action" in
     fi
     ;;
   root-cycle)
-    # Port-off/on at the ROOT port. NOTE: a controller's ppps may only drop D+/D- (VBUS stays up;
-    # the contract's Limits say what this host's does), so treat it as a forced re-enumeration, not
-    # a power cycle. It goes straight at the root port -- no leaf walk (a leaf hub may claim ganged
-    # switching and never cut power) -- and never
-    # writes the wedged device's sysfs. Its power request takes no child's lock, but uhubctl opens
-    # the hubs and the root port's children first, so a device wedged right under that root port
-    # can still pull it into a D-state convoy (agentrc#149).
-    # uhubctl exits 0 even when it does nothing ("No compatible devices detected" still returns
-    # 0), so its status proves nothing -- the sysfs_gen check below is the only real verdict.
+    # Port power off/on at the ROOT port. NOTE: a controller's ppps may only drop D+/D- (VBUS stays
+    # up; the contract's Limits say what this host's does), so treat it as a forced re-enumeration,
+    # not a power cycle. It goes straight at the root port -- no leaf walk (a leaf hub may claim
+    # ganged switching and never cut power) -- with root_port_cycle.py's raw hub request, never the
+    # port's `disable` file: disable_store usb_disconnect()s the child under the root hub's lock
+    # before cutting power (v6.12.107 port.c:132-141), which a wedged child blocks. The requests'
+    # exit status proves only the request; the sysfs_gen check below is the verdict.
     [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
-    UHUBCTL=$(command -v uhubctl || echo /sbin/uhubctl)
-    [ -x "$UHUBCTL" ] || refuse "uhubctl not installed"
     # Existence alone only proves *something* occupies that path -- bus numbers renumber every
     # boot, so a stale busport can name a different device entirely and we would cut power to its
     # whole subtree (every fixture under that root port). Callers that know what they expect pass the
@@ -502,17 +528,22 @@ case "$action" in
          "serial=$serial product=$(lock_read "$idf/product")"
     bus=${target%%-*}; rest=${target#*-}; rootport=${rest%%.*}
     gen=$(sysfs_gen "$target")
+    # check prints the root hub's identity token, which off and on must still find; the traps are
+    # armed first, so a signal before the power-off ends the cycle with nothing switched
+    tokf=$(mktemp) || die "root-cycle: cannot create a temporary file"
+    trap 'rm -f "$tokf"' EXIT
+    rc=0 token=''
+    trap 'interrupted=yes' INT TERM HUP
+    supervised "$ROOT_PORT_CYCLE" check "$bus" "$rootport" > "$tokf" || rc=$?
+    read -r token < "$tokf" || :
+    [ -z "$survivor" ] || die "root-cycle: check of bus $bus port $rootport failed (125): pid $survivor survived; nothing switched, no further request"
+    [ -z "$interrupted" ] || die "root-cycle: interrupted before the power-off; nothing switched"
+    [ $rc -ne 3 ] || refuse "root-cycle: bus $bus port $rootport refused (above); nothing switched"
+    [ $rc -eq 0 ] || die "root-cycle: check of bus $bus port $rootport failed (${rc}); nothing switched"
+    [[ "$token" =~ ^[0-9]+:[0-9]+:[0-9]+$ ]] || die "root-cycle: check printed no identity token; nothing switched"
     echo "root-cycle: cycling bus $bus root port $rootport (feeds $target, bounces its siblings; VBUS drop depends on the host's hub)"
-    # -S is load-bearing. By default uhubctl writes /sys/.../usb<bus>-port<n>/disable (observed:
-    # two O_WRONLY opens per cycle), and the kernel's disable_store() takes the ROOT HUB's lock and
-    # synchronously usb_disconnect()s the child BEFORE cutting power -- confirmed in v6.12.96
-    # drivers/usb/core/port.c: usb_lock_device(hdev), the UNINTERRUPTIBLE variant, then
-    # usb_disconnect(&port_dev->child) inside it. Against a wedged device that disconnect blocks on
-    # the very lock we are trying to free, so power never drops and uhubctl D-states holding the
-    # root hub's lock, poisoning the whole bus. -S forces the libusb path, which sends the
-    # power-off control transfer straight to the root hub with no child-disconnect in front.
-    "$UHUBCTL" -S -l "$bus" -p "$rootport" -a cycle -d 5 \
-      || die "uhubctl failed to cycle bus $bus port $rootport"
+    cycle_port "root-cycle: cycle of bus $bus port $rootport" "$ROOT_OFF_SECS" \
+      "$ROOT_PORT_CYCLE" off "$bus" "$rootport" "$token" -- "$ROOT_PORT_CYCLE" on "$bus" "$rootport" "$token"
     if now=$(await_reenum "$target" "$gen"); then
       echo "root-cycled $bus port $rootport: $target re-enumerated"\
            "(devnum $(cat "$SYSFS/bus/usb/devices/$target/devnum" 2>/dev/null || echo ?), gen $gen -> $now)"; exit 0
@@ -531,9 +562,9 @@ case "$action" in
     # 500-series xHCI (tinyuf2 bench history, 2026-10-14); that choice is made against that
     # incident, not verified under it. The price is root-cycle's hazard: disable_store
     # disconnects the child under the hub's lock first, so a wedged target would block it --
-    # hence the serial that must answer, and a wedged leaf is left to root-cycle, whose libusb
-    # request has no child-disconnect in front, though uhubctl's opens before it can block on the
-    # same wedged leaf (agentrc#149).
+    # hence the serial that must answer, and a wedged leaf is left to root-cycle, whose request
+    # has no child-disconnect in front and opens only the root hub's node, though a root hub lock
+    # already held still blocks it.
     [[ "$target" =~ $USBPATH_RE ]] || refuse "bad usb path: $target"
     [[ "$target" == *.* ]] || refuse "hub-cycle: $target is on a root port; that is root-cycle's"
     hub=${target%.*}; port=${target##*.}
@@ -547,29 +578,17 @@ case "$action" in
     disable="$hubd/$hub:1.0/$hub-port$port/disable"
     [ -f "$disable" ] || refuse "hub-cycle: no port control file $disable"
     serial=$(lock_read "$idf/serial")
-    [ "$serial" != '?' ] || refuse "hub-cycle: $target's serial did not answer (wedged): the port write would block on its lock; root-cycle is next, though it can block on it too (agentrc#149)"
+    [ "$serial" != '?' ] || refuse "hub-cycle: $target's serial did not answer (wedged): the port write would block on its lock; root-cycle is next"
     [ -n "$serial" ] || refuse "hub-cycle: $target has no readable serial to prove it answers"
     expect=${3:-}
     [ -z "$expect" ] || [ "$expect" = "$serial" ] || refuse "hub-cycle: $target has serial '$serial', expected '$expect' — stale busport, refusing"
     gen=$(sysfs_gen "$target")
     echo "hub-cycle: target $target serial=$serial; writing 1, then 0 after ${PORT_OFF_SECS} s, to $disable"
-    # from the first off write on, any failure or interruption still tries to power the port
-    # back on, unless a writer survived (it could still write after the restore)
-    interrupted='' survivor='' off=0 on=0
-    trap 'interrupted=yes' INT TERM HUP
-    port_write "$disable" 1 || off=$?
-    # `|| :`: a signal to the process group kills the sleep too, and set -e must not skip the restore
-    if [ $off -eq 0 ] && [ -z "$interrupted" ]; then sleep "$PORT_OFF_SECS" || :; fi
-    if [ -n "$survivor" ]; then
-      restored="not attempted: writer pid $survivor survived"
-    else
-      port_write "$disable" 0 || on=$?
-      [ $on -eq 0 ] && restored=restored || restored="NOT restored (write ${on})"
-    fi
-    trap - INT TERM HUP
-    if [ $off -ne 0 ] || [ $on -ne 0 ] || [ -n "$interrupted" ]; then
-      die "hub-cycle: cycle of $hub port $port failed (off ${off}, on ${on}${interrupted:+, interrupted}); power-on ${restored}"
-    fi
+    # each write is read back (both take the hub's lock) by the shell's own `read`, so the
+    # bound's SIGKILL reaches every process doing the work
+    write='echo "$2" > "$1" && read -r v < "$1" && [ "$v" = "$2" ]'
+    cycle_port "hub-cycle: cycle of $hub port $port" "$PORT_OFF_SECS" \
+      sh -c "$write" sh "$disable" 1 -- sh -c "$write" sh "$disable" 0
     if now=$(await_reenum "$target" "$gen"); then
       echo "hub-cycled $hub port $port: $target re-enumerated (gen $gen -> $now)"; exit 0
     fi

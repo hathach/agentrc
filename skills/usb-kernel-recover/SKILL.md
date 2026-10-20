@@ -130,13 +130,20 @@ A harness may also send Reset_TT to a full- or low-speed device's hub before a f
 that is the harness's own pre-flash lever, not a rung here.
 
 **Rung 2 — wedged PROBE: `root-cycle`.** A probe has no probe to reset it, so the
-port-side drop is the only lever left. Its power request goes to the ROOT hub and
-takes no child's `device_lock`, but uhubctl (v2.6.0) first opens every hub and the
-root port's connected children (`libusb_open` -> `usbdev_open` ->
-`usb_lock_device`, uninterruptible; `-N` skips only the string reads). A device
-wedged directly under that root port can therefore block it in D state while every
-lock is held (agentrc#149): it is not a guaranteed escape, only the rung that does
-not write to the wedged device itself.
+port-side drop is the only lever left. `scripts/root_port_cycle.py` sends
+ClearPortFeature(PORT_POWER), then SetPortFeature after 5 s, to the one root port
+feeding the target, over that root hub's own usbfs node: it opens no child, no other
+hub and no USB 3 companion bus (uhubctl opened every hub and the root port's children
+first, agentrc#149). Its sysfs checks are lock-free, and a check run validates the
+root hub and its per-port power switching before the power-off; off and on only
+re-verify the root hub's identity. Each run is supervised (15 s, then SIGKILL).
+
+It still takes the root hub's own `device_lock` (`usbdev_open`, every usbfs ioctl:
+uninterruptible), so a root hub lock already held, such as `hub_wq` disconnecting the
+wedged child under it, blocks it in D state. The script then names the surviving pid,
+sends no further request and fails (exit 1), and the reservation below stays held: the
+software rung failed, so follow the contract's terminal recovery. It is not a
+guaranteed escape, only the rung that opens nothing but the root hub.
 
 That is a different lock from the host's **board flocks**, and this rung still needs
 those: it bounces every fixture under the root port, including boards another job is
@@ -163,7 +170,7 @@ power switching in `wHubCharacteristics` (USB 2.0 §11.11, Table 11-13), and a h
 controller may advertise `ppps` yet never drop VBUS, so unless the contract's Limits
 say this host cuts power, treat it as a forced re-enumeration, never a power cycle — a
 device whose firmware is wedged can ride it out. Success is the sysfs inode changing,
-not uhubctl's exit code.
+not the requests' exit status.
 
 **Not a rung — a healthy leaf's port power-off/on: `hub-cycle`.** For a device that
 still answers, `hil_reserve.py run hub-cycle <busport>` holds every roster board, checks
@@ -177,7 +184,7 @@ re-enumeration, not a power cycle or a firmware restart; physical power guarante
 belong to the contract's Limits. Because the write takes the hub's lock, the script
 refuses a target whose serial read does not answer (the wedge signature): a wedged
 device belongs to the rungs above. It also refuses a hub and a root port, all before
-any write (exit 3, as `root-cycle` does for its guards before uhubctl runs; `hil_reserve`
+any write (exit 3, as `root-cycle` does for its guards before its power-off; `hil_reserve`
 then releases if the subtree is unchanged); any failure from the first write on is a
 blocker.
 
@@ -245,7 +252,7 @@ Observed: 5 boards missing with a completely clean D-state list, because
   `disable`, and `disable_store` takes `usb_lock_device(hdev)` uninterruptibly
   then calls `usb_disconnect(child)` inside it (port.c) — against a wedged child
   that blocks while holding the root hub's lock, poisoning the bus.
-  `usb_recover.sh` passes `-S`.
+  `usb_recover.sh` sends the hub request over usbfs instead.
 - **`echo 1 > .../remove`** to make a wedged device "go away": `remove_store` is
   the one attribute in sysfs.c taking the uninterruptible `usb_lock_device`
   (sysfs.c:765). It joins the convoy instead of clearing it.
@@ -267,8 +274,9 @@ Observed: 5 boards missing with a completely clean D-state list, because
 
 ## Limits
 
-- The script's `uhubctl` and `udevadm` calls run without a timeout; the serial and
-  product reads before them are bounded (2 s).
+- The script's `udevadm` call runs without a timeout; the serial and product reads are
+  bounded (2 s), and each port request (a `disable` write, a `root_port_cycle.py` run)
+  is supervised (15 s, then SIGKILL; a survivor ends the cycle).
 - `root-cycle` with a serial whose read times out warns and proceeds (the wedge
   signature is an unreadable serial): a low-level behaviour kept for compatibility.
   `hil_reserve.py run` admits such a target by udev's record of its serial, written when
