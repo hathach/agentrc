@@ -1224,7 +1224,8 @@ def _collect(tree, dest, groups, optional, accept, st):
         _remove(tmp)
         tmp.mkdir()
         try:
-            records = [r for r in RECORD_FILES if r not in {m for g in groups for m in g}]
+            grouped = {m for g in groups for m in g}
+            records = [r for r in RECORD_FILES if r not in grouped]
             got = copy_back(tree, tmp, groups, (*records, *optional))
             copied, incomplete = got
             unaccepted = [] if accept is None else _unaccepted(accept, tmp)
