@@ -7,11 +7,13 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import tmpdir  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'chief_guard.py'
 # Windows judges a /tmp path as MSYS bash maps it, through cygpath; without one it is denied
@@ -20,9 +22,7 @@ needs_msys = unittest.skipIf(os.name == 'nt' and not shutil.which('cygpath'), 'n
 
 class ChiefGuard(unittest.TestCase):
     def setUp(self):
-        td = tempfile.TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        self.root = Path(td.name).resolve()
+        self.root = tmpdir(self)
         self.project = self.root / 'wt'
         self.wt = self.project.as_posix()   # as a bash command names it: an unquoted backslash is an escape
         (self.project / 'src').mkdir(parents=True)
@@ -30,6 +30,7 @@ class ChiefGuard(unittest.TestCase):
         # GIT_* from a calling hook would point git at another repository
         self.env = {k: v for k, v in os.environ.items() if k != 'CLAUDE_PROJECT_DIR' and not k.startswith('GIT_')}
         subprocess.run(['git', 'init', '-q', str(self.project)], check=True, env=self.env)
+        self.guard = self.module()
 
     def event(self, command=None, tool='Bash', agent_type='chief', agent_id=None, file_path=None):
         event = {'hook_event_name': 'PreToolUse', 'tool_name': tool, 'cwd': str(self.project), 'agent_type': agent_type,
@@ -49,27 +50,41 @@ class ChiefGuard(unittest.TestCase):
         spec.loader.exec_module(guard)
         return guard
 
-    def main(self, guard, command):
+    def main(self, guard, command=None, **kw):
+        """(exit code, stderr) of guard.main on this event, in this process."""
         err = io.StringIO()
         with contextlib.redirect_stderr(err), mock.patch.dict(os.environ, self.env, clear=True):
-            return guard.main(self.event(command)), err.getvalue()
+            return guard.main(self.event(command, **kw)), err.getvalue()
+
+    def check(self, command=None, **kw):
+        """The test's guard run in this process (the agent filter runs only as a hook), its deadline fresh."""
+        self.guard.DEADLINE = time.monotonic() + 6
+        return self.main(self.guard, command, **kw)
 
     def assert_denied(self, command, *named, **kw):
-        r = self.hook(command, **kw)
-        self.assertEqual(r.returncode, 2, f'{command!r} passed')
+        code, err = self.check(command, **kw)
+        self.assertEqual(code, 2, f'{command!r} passed')
         for want in named:
-            self.assertIn(want, r.stderr)
+            self.assertIn(want, err)
 
     def assert_allowed(self, command, **kw):
-        r = self.hook(command, **kw)
-        self.assertEqual(r.returncode, 0, f'{command!r}: {r.stderr}')
+        code, err = self.check(command, **kw)
+        self.assertEqual(code, 0, f'{command!r}: {err}')
 
     def test_only_chief_own_calls_are_checked(self):
-        self.assert_allowed('git push', agent_type='code-writer', agent_id='a1')
-        # a subagent chief dispatched carries an agent_id even under chief's agent_type
-        self.assert_allowed('git push', agent_type='chief', agent_id='a2')
-        self.assert_allowed('git commit -m x', agent_type=None)
-        self.assert_denied('git push', 'changes the repository')
+        # run as Claude Code runs the hook: the agent filter, the exit code and the reason on stderr
+        for kw in ({'agent_type': 'code-writer', 'agent_id': 'a1'}, {'agent_type': None},
+                   # a subagent chief dispatched carries an agent_id even under chief's agent_type
+                   {'agent_type': 'chief', 'agent_id': 'a2'}):
+            r = self.hook('git push', **kw)
+            self.assertEqual((r.returncode, r.stderr), (0, ''), kw)
+        r = self.hook('git push')
+        self.assertEqual(r.returncode, 2)
+        self.assertRegex(r.stderr, r'^chief guard: `git push` changes the repository')
+        r = self.hook(None, tool='Write', file_path=str(self.project / 'src' / 'new.c'))
+        self.assertEqual(r.returncode, 2)
+        self.assertIn('literal absolute path', r.stderr)
+        self.assertEqual(self.hook('git status').returncode, 0)
 
     def test_git_reads_pass(self):
         for c in ('git status --porcelain', 'git log --oneline abc..HEAD', 'git -C /x log -1', 'git -c core.pager=cat diff',
@@ -80,7 +95,7 @@ class ChiefGuard(unittest.TestCase):
             self.assert_allowed(c)
 
     def test_git_writes_are_denied(self):
-        for c in ('git push origin HEAD', 'git commit -m x', 'git -C /x commit -am y', 'git -c a=b reset --hard',
+        for c in ('git push origin HEAD', 'git commit -m x', 'git -C /x commit -am y', 'git reset --hard',
                   'git rebase main', 'git checkout -b x', 'git switch main', 'git add -- src', 'git stash',
                   'git stash push -m x', 'git branch new', 'git branch -D old', 'git tag v1', 'git tag -d v1',
                   'git worktree remove x', 'git remote add o u', 'git config user.name x', 'git cherry-pick abc',
@@ -177,8 +192,13 @@ class ChiefGuard(unittest.TestCase):
 
     def test_combined_shell_flags_and_xargs_values(self):
         self.assert_denied("bash -lc 'git push origin HEAD'", 'changes the repository')
-        self.assert_denied('xargs -n 1 git push', 'changes the repository')
-        self.assert_denied('xargs -I {} git push origin {}', 'changes the repository')
+        self.assert_denied('xargs -n 1 git push', 'run time')
+        self.assert_denied('xargs -I {} git push origin {}', 'run time')
+        for cmd in ('echo /usr/bin/git | xargs -I X X push', "xargs -I '{}' '{}' push", 'xargs -IX /x/X push',
+                    'xargs -0 -I X env X push'):
+            self.assert_denied(cmd, 'command word')
+        self.assert_allowed('xargs -I X grep -n pattern X')
+        self.assert_denied("printf 'input\\n' | xargs -a /tmp/programs -I X xargs -I Y X push", 'xargs under xargs')
 
     def test_attached_gh_fields_imply_post(self):
         self.assert_denied('gh api repos/o/r/issues -ftitle=x', 'non-GET')
@@ -201,6 +221,185 @@ class ChiefGuard(unittest.TestCase):
 
     def test_an_unparsable_command_is_denied(self):
         self.assert_denied('echo "unterminated', 'cannot parse')
+
+    def test_dashed_git_words_and_scalar_are_denied(self):
+        # a dashed builtin runs the subcommand without the `git` word; judge it as `git <sub>`
+        for c in ('/usr/lib/git-core/git-push origin', 'git-push origin', 'git-commit -m x', 'git-lfs push',
+                  'git-upload-pack .'):
+            self.assert_denied(c, 'changes the repository')
+        for c in ('scalar clone https://x', 'scalar register', 'scalar run commit-graph'):
+            self.assert_denied(c, 'scalar')
+        for c in ('git-log --oneline', 'git-status --porcelain', 'git-diff HEAD'):
+            self.assert_allowed(c)
+
+    def test_a_runtime_command_word_or_git_subcommand_is_denied(self):
+        for c in ('$SHELL -c "git push"', '$(which git) push', '"$COMSPEC" //c git push', '${GIT} push',
+                  'git${IFS}push', 'git $sub', 'git ${verb} origin', 'git $(echo push) origin'):
+            self.assert_denied(c)
+        # a glob or brace in the command word names a program only at run time; a quoted one is a literal name
+        for c in ('/usr/bin/g?t push', '/usr/bin/gi* push', '/usr/bin/[g]it push', '{git,x} push', '/usr/bin/e?v git push'):
+            self.assert_denied(c, 'cannot tell what runs')
+        self.assert_allowed("'/tmp/a*b' --version")
+        # a wrapper resolved by path still reaches the command it runs
+        self.assert_denied('/usr/bin/env git push', 'changes the repository')
+
+    def test_wrapper_options_pass_only_when_every_letter_is_known(self):
+        for c in ('env -S "git push"', 'env -iS "git push"', 'env --split-string="git push"', 'env -Sgit\\ push',
+                  'env -iX git push', 'timeout --frobnicate 5 git log', 'nice --bogus git log', 'env --null=x git log',
+                  'xargs -0Z cat', 'xargs -i git push {}', 'xargs --replace git push {}', f'time -o {self.wt}/t git log'):
+            self.assert_denied(c, 'option')
+        for c in ('timeout 60 git log', 'nice -n 5 git status', 'nice -n5 git status', 'env -u FOO git log',
+                  'env -uFOO git log', 'env -iuFOO git log', 'env -i -u FOO git log', 'stdbuf -oL git status',
+                  'timeout --kill-after=5 10 git log', 'env - git log', 'nohup git log', 'xargs -0r -n1 cat'):
+            self.assert_allowed(c)
+
+    def test_git_gh_shells_and_writers_under_xargs_or_find_exec_are_denied(self):
+        # their arguments are only known at run time: `--output=<wt>/x` read from stdin made `git log` write
+        for c in (f"printf -- '--output={self.wt}/x\\n' | xargs git log", 'xargs git log', 'echo push | xargs git',
+                  'xargs gh pr view', 'xargs sh -c x', 'xargs bash', 'xargs rm', 'xargs cp -t /tmp', 'xargs python3',
+                  'xargs env git status', 'xargs sed -n p', 'xargs git-log', 'xargs -I {} curl -o {} https://x',
+                  r'find / -maxdepth 0 -exec git push \;', r'find /tmp -exec git log {} \;', r'find /tmp -execdir sh -c x \;',
+                  r'find /tmp -ok rm {} \;', r'find /tmp -okdir git status \;', r'find /tmp -exec tee /tmp/x \;',
+                  r'find /tmp -exec xargs git log \;', "printf '/tmp/a /tmp/b\\n' | xargs link", 'xargs ln',
+                  r'find /tmp -exec link {} /tmp/h \;', r'find /tmp -exec cp -l {} /tmp/h \;',
+                  # the found path itself as the command, quoted or not
+                  r'find /usr/bin/git -maxdepth 0 -exec {} push \;', r"find /usr/bin/git -exec '{}' push \;",
+                  r'find /tmp -execdir ./{} \;', r'find /tmp -ok x{}y \;',
+                  # behind a wrapper, at any depth
+                  r"find /usr/bin/git -maxdepth 0 -exec /usr/bin/env '{}' push \;",
+                  r"find /usr/bin/git -exec env nice -n 5 timeout 9 '{}' push \;"):
+            self.assert_denied(c, 'run time')
+        for c in ('echo /tmp/a | xargs cat', 'xargs grep -l foo', "find /tmp -name '*.c' -exec grep -l x {} +",
+                  r'find /tmp -exec wc -l {} \;', 'find /tmp -name x -type f'):
+            self.assert_allowed(c)
+
+    def test_shell_options_outside_the_known_set_and_stdin_are_denied(self):
+        for c in ('bash', 'sh', 'echo git push | bash', 'echo git push | sh', 'bash -',
+                  'bash -- -', 'bash <<< "git push"', 'cat script | bash -l'):
+            self.assert_denied(c, 'stdin')
+        for c in ('bash -s', 'bash -s arg', 'bash -O expand_aliases', 'bash -O expand_aliases /tmp/s.sh', 'bash -i', 'bash +x /tmp/s.sh',
+                  'bash --rcfile /tmp/r /tmp/s.sh', 'bash -o vi -c "git log"'):
+            self.assert_denied(c, 'shell option')
+        self.assert_denied('sh -e -c -x "git push"', 'changes the repository')
+        # a -c string is checked (a read passes), and a script operand is not followed
+        for c in ('bash -c "git log"', 'bash -lc "git log"', 'bash -e -c "git status"', 'bash /tmp/s.sh arg',
+                  'sh /tmp/s.sh', 'bash -- /tmp/s.sh', 'bash --norc /tmp/s.sh',
+                  'sh -ec -x "git log"'):
+            self.assert_allowed(c)
+
+    def test_aliases_are_denied(self):
+        for c in ('shopt -s expand_aliases', 'shopt -qs expand_aliases', 'shopt -s -q expand_aliases',
+                  'shopt expand_aliases && git log', "bash -c 'shopt -s expand_aliases'", "alias g='git push'",
+                  "BASHOPTS=expand_aliases bash -c 'g'"):
+            self.assert_denied(c)
+        for c in ('shopt -s globstar', 'alias'):
+            self.assert_allowed(c)
+
+    def test_git_configuration_that_runs_a_command_is_denied(self):
+        for c in ('git -c core.fsmonitor="git push" status', 'git -c core.sshCommand="sh -c x" fetch',
+                  "git -c credential.helper='!x' status", 'git -ccore.pager=less log', 'git -c a=b log',
+                  'git --config-env=core.pager=X status', 'git --config-env core.sshCommand=Y fetch',
+                  'git --exec-path=/tmp status', 'GIT_EXEC_PATH=/tmp git status',
+                  'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.fsmonitor GIT_CONFIG_VALUE_0=x git status',
+                  "GIT_CONFIG_PARAMETERS=\"'core.fsmonitor'='x'\" git status", 'GIT_CONFIG_GLOBAL=/tmp/c git status',
+                  'GIT_CONFIG_SYSTEM=/tmp/c git log', 'env GIT_CONFIG_COUNT=1 git status'):
+            self.assert_denied(c)
+        for c in ('git -c core.pager=cat diff', 'git -c color.ui=never log', 'git -c core.quotepath=off status',
+                  'git -ccolor.ui=always log', 'git -c core.quotepath=false -c color.ui=auto status'):
+            self.assert_allowed(c)
+
+    def test_env_assignments_that_run_a_command_are_denied(self):
+        for c in ('GIT_SSH_COMMAND="ssh -i k" git fetch', 'GIT_PAGER=less git log', 'PAGER=more git log',
+                  'GIT_EXTERNAL_DIFF=x git diff', 'env GIT_SSH_COMMAND=x git fetch', 'GIT_EDITOR=vim git log'):
+            self.assert_denied(c)
+        for c in ('GIT_PAGER=cat git log', 'PAGER=cat git log', 'env GIT_PAGER=cat git log', 'GIT_DIR=/tmp/r git log'):
+            self.assert_allowed(c)
+
+    def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):
+        for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
+                  'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',
+                  'git ls-remote -u x origin', 'git ls-remote -qu x .', 'git grep --open-files-in-pager=vi chief',
+                  'git grep --open-files=vi chief', 'git grep --open chief', 'git grep -O chief', 'git grep -iO chief'):
+            self.assert_denied(c, 'runs a program')
+        for c in ('git fetch -q origin', 'git fetch --prune origin', 'git ls-remote origin', 'git ls-remote --heads origin',
+                  'git grep -o chief -- src', 'git grep -n chief'):
+            self.assert_allowed(c)
+
+    def test_hard_link_sources_must_be_literal_paths_outside_the_worktree(self):
+        chief, root = (self.project / '.git' / 'chief').as_posix(), self.root.as_posix()
+        for c in (f'ln {self.wt}/src/a.c {chief}/h', f'ln {self.wt}/src/a.c /tmp/h', f'link {self.wt}/src/a.c /tmp/h',
+                  f'cp -l {self.wt}/src/a.c /tmp/h', f'cp --link {self.wt}/src/a.c /tmp/h',
+                  f'rsync -a --link-dest={self.wt}/src /tmp/a/ /tmp/b/',
+                  # a glob in the source expands to the worktree, which the literal word does not name
+                  f'ln {root}/w?/src/a.c {chief}/h', f'link {root}/w*/src/a.c /tmp/h', f'cp -l {root}/[w]t/src/a.c /tmp/h',
+                  f'ln {root}/{{wt,x}}/src/a.c /tmp/h',
+                  # any spelling getopt accepts for cp's link options
+                  f'cp --l {self.wt}/src/a.c /tmp/h', f'cp --li {self.wt}/src/a.c /tmp/h', f'cp --sy {self.wt}/src/a.c /tmp/h',
+                  f'cp --symbolic-link {self.wt}/src/a.c /tmp/h', f'cp -as {self.wt}/src/a.c /tmp/h', f'cp -al {self.wt}/src /tmp/s',
+                  # an -s that is the value of -S or --suffix leaves ln making a hard link
+                  f'ln -S -s {self.wt}/src/a.c /tmp/h', f'ln -fS -s {self.wt}/src/a.c /tmp/h',
+                  f'ln --suffix -s {self.wt}/src/a.c /tmp/h', f'ln --suff --symbolic {self.wt}/src/a.c /tmp/h'):
+            self.assert_denied(c, 'would link')
+        # a symlink is caught at the write instead; a copy and a hard link from outside are fine
+        for c in (f'ln -s {self.wt}/src /tmp/l', f'ln -S~ -s {self.wt}/src /tmp/l', f'ln --suffix=x -s {self.wt}/src /tmp/l',
+                  f'cp {self.wt}/src/a.c /tmp/h', 'ln /tmp/a /tmp/b',
+                  'cp -l /tmp/a /tmp/b', 'rsync -a --link-dest=/tmp/prev /tmp/a/ /tmp/b/'):
+            self.assert_allowed(c)
+
+    def test_unquoted_globs_in_a_write_target_are_denied(self):
+        for c in (f'rm {self.wt}/src/{{a,b}}.c', f'rm {self.wt}/sr?/a.c', f'rm {self.wt}/sr*/a.c',
+                  f'rm {self.wt}/[s]rc/a.c', f'cp /tmp/a {self.wt}/{{src,x}}/', 'rm /tmp/{a,b}', 'touch /tmp/x*'):
+            self.assert_denied(c, 'glob')
+        # a quoted metacharacter is a literal path outside the worktree
+        for c in ("rm '/tmp/a*.c'", "touch '/tmp/x[1].md'", "echo x > '/tmp/{a}.md'", "rm '/tmp/a?.c'"):
+            self.assert_allowed(c)
+
+    def test_dd_sort_and_refused_writers(self):
+        for c in (f'dd if=/dev/zero of={self.wt}/src/a.c', f'sort -o {self.wt}/src/a.c /tmp/in',
+                  f'sort --output={self.wt}/src/a.c /tmp/in'):
+            self.assert_denied(c, 'literal absolute path')
+        # sort writes only through a separate -o or --output=: a cluster holding o, another spelling, a compressor
+        for c in (f'sort -no{self.wt}/x /tmp/in', 'sort -no /tmp/x /tmp/in', 'sort --output /tmp/x /tmp/in',
+                  f'sort --out={self.wt}/x /tmp/in', 'sort --compress-program=x /tmp/in', 'sort --compress=x /tmp/in'):
+            self.assert_denied(c, 'sort')
+        for c in ('wget https://x', 'wget -O /tmp/f https://x', 'patch -p1 < /tmp/p'):
+            self.assert_denied(c)
+        for c in ('dd if=/dev/zero of=/tmp/x bs=1M', 'sort -o /tmp/out /tmp/in', 'sort -n --output=/tmp/out /tmp/in',
+                  'sort -rn /tmp/in', 'sort -k2 /tmp/in'):
+            self.assert_allowed(c)
+
+    def test_find_deleting_or_writing_primaries_are_denied(self):
+        for c in ('find /tmp -delete', f"find {self.wt} -name '*.o' -delete", 'find /tmp -fprint /tmp/l',
+                  'find /tmp -fprint0 /tmp/l', "find /tmp -fprintf /tmp/l '%p'", 'find /tmp -fls /tmp/l'):
+            self.assert_denied(c, 'cannot place')
+        self.assert_allowed('find /tmp -name x -print')
+
+    def test_tar_passes_only_as_a_local_listing(self):
+        for c in ('tar cf /tmp/a.tar src', 'tar -cf /tmp/a.tar src', 'tar xf /tmp/a.tar', 'tar -xzf /tmp/a.tgz -C /tmp',
+                  'tar --extr -f /tmp/a.tar', 'tar --cre -f /tmp/a.tar src', 'tar -g /tmp/snap -cf /tmp/a.tar src',
+                  'tar -tf host:/a.tar', 'tar tf /tmp/a.tar --to-command=x', 'tar -tvf /tmp/a.tar member',
+                  'tar -I x -tf /tmp/a.tar', 'tar -tzf /tmp/a.tgz', 'tar'):
+            self.assert_denied(c, 'listing')
+        for c in ('tar tf /tmp/a.tar', 'tar -tf /tmp/a.tar', 'tar -tvf /tmp/a.tar', 'tar tvf /tmp/a.tar'):
+            self.assert_allowed(c)
+
+    def test_curl_passes_only_as_a_plain_get(self):
+        for c in (f'curl -o {self.wt}/src/a.c https://x', f'curl --output {self.wt}/src/a.c https://x',
+                  f'curl --output={self.wt}/x https://x', f'curl -o{self.wt}/x https://x'):
+            self.assert_denied(c, 'literal absolute path')
+        for c in ('curl -O https://x/f', 'curl -J -O https://x/f', 'curl --remote-name https://x/f', 'curl -K /tmp/cfg https://x',
+                  'curl --config /tmp/cfg', "curl -w '%{output}' https://x", 'curl --write-out x https://x',
+                  f'curl --tlsv1.2 -o {self.wt}/x https://x', 'curl -fsSLo /tmp/x https://x', 'curl -d x https://x',
+                  f'curl -D {self.wt}/h https://x', f'curl -c {self.wt}/j https://x', 'curl --outp /tmp/x https://x',
+                  'curl -k https://x'):
+            self.assert_denied(c, 'plain GET')
+        for c in ('curl -X POST https://x', 'curl --request=PUT https://x'):
+            self.assert_denied(c, 'publishes')
+        self.assert_denied("curl -o '/tmp/#1' 'https://h/{a,b}'", 'literal path')
+        for c in ('curl -fsSL -o /tmp/x https://x', 'curl -s -H "A: b" -o /tmp/x https://x', 'curl -sSfL https://x',
+                  'curl --fail --silent --location --output /tmp/x https://x', 'curl -X GET https://x', 'curl -o - https://x',
+                  'curl -o/tmp/x https://x', 'curl --header=A:b https://x'):
+            self.assert_allowed(c)
 
     def test_a_non_ascii_worktree_is_still_the_worktree(self):
         # git names it in UTF-8: read in a locale's encoding (GBK) the guard crashed or missed it, and an erroring hook passes
@@ -261,21 +460,18 @@ class ChiefGuard(unittest.TestCase):
                 self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
 
     def test_a_link_suffix_or_target_directory_is_no_link_source(self):
-        # the Windows link check, run here on POSIX paths: a value -S or -t takes is not a source
-        guard, wt = self.module(), self.wt
-        with mock.patch.dict(os.environ, self.env, clear=True):
-            check = guard.Guard(self.event()).windows
-            for cmd, args in (('ln', ['-S', '.bak', '/tmp/a', '/tmp/b']), ('ln', ['-sfS', '~', '/tmp/a', '/tmp/b']),
-                              ('ln', ['--suffix', '.bak', '-s', '/tmp/a', '/tmp/b']), ('cp', ['-sS', '.bak', '/tmp/a', '/tmp/b']),
-                              ('ln', ['-s', '-t', '/tmp', '/tmp/a']), ('ln', ['-t', '/tmp', '-S', '.bak', '/tmp/a']),
-                              ('cp', ['-s', '-t', '/tmp', '-S', '.bak', '/tmp/a'])):
-                check(cmd, cmd, args)
-            for cmd, args in (('ln', ['-S', '.bak', f'{wt}/src', '/tmp/b']), ('ln', ['-S', '-s', f'{wt}/src', '/tmp/b']),
-                              ('ln', ['-s', '--', '-S', f'{wt}/src', '/tmp/b']), ('cp', ['-sS', '.bak', f'{wt}/src', '/tmp/b']),
-                              ('ln', ['-t', '/tmp', '-S', '.bak', f'{wt}/src']), ('ln', ['-st', '/tmp', f'{wt}/src']),
-                              ('ln', ['-s', '--target-dir', '/tmp', f'{wt}/src']), ('ln', ['-st/tmp', f'{wt}/src'])):
-                with self.subTest(args=args), self.assertRaisesRegex(guard.Denied, 'cannot follow'):
-                    check(cmd, cmd, args)
+        # the Windows link sources (every link), read here on POSIX paths: a value -S or -t takes is not a source
+        sources, wt = self.guard.link_sources, self.wt
+        for cmd, args in (('ln', ['-S', '.bak', '/tmp/a', '/tmp/b']), ('ln', ['-sfS', '~', '/tmp/a', '/tmp/b']),
+                          ('ln', ['--suffix', '.bak', '-s', '/tmp/a', '/tmp/b']), ('cp', ['-sS', '.bak', '/tmp/a', '/tmp/b']),
+                          ('ln', ['-s', '-t', '/tmp', '/tmp/a']), ('ln', ['-t', '/tmp', '-S', '.bak', '/tmp/a']),
+                          ('cp', ['-s', '-t', '/tmp', '-S', '.bak', '/tmp/a'])):
+            self.assertEqual(sources(cmd, args, symlinks=True), ['/tmp/a'], args)
+        for cmd, args in (('ln', ['-S', '.bak', f'{wt}/src', '/tmp/b']), ('ln', ['-S', '-s', f'{wt}/src', '/tmp/b']),
+                          ('ln', ['-s', '--', '-S', f'{wt}/src', '/tmp/b']), ('cp', ['-sS', '.bak', f'{wt}/src', '/tmp/b']),
+                          ('ln', ['-t', '/tmp', '-S', '.bak', f'{wt}/src']), ('ln', ['-st', '/tmp', f'{wt}/src']),
+                          ('ln', ['-s', '--target-dir', '/tmp', f'{wt}/src']), ('ln', ['-st/tmp', f'{wt}/src'])):
+            self.assertIn(f'{wt}/src', sources(cmd, args, symlinks=True), args)
 
     def test_a_cygwin_or_msys_python_denies_every_call(self):
         # os.name is 'posix' there, so every Windows check would be skipped
