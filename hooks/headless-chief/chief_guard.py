@@ -686,18 +686,20 @@ def strip_wrapper_options(name, words):
     letter of a short cluster, must be in the wrapper's table with a known value: a letter taking a value takes the
     rest of its cluster, else the next word."""
     value, flags = WRAPPERS[name], WRAPPER_FLAGS.get(name, set())
-    given = {}
+    given, ended = {}, False
 
     def unknown(a):
         return Denied(f'`{name}` has an option `{a}` this guard does not follow; run the command as plain words, or dispatch it to a unit')
     while words:
         a, words = words[0], words[1:]
-        if a == '--':
-            return words, given
-        if name == 'env' and ASSIGNMENT.match(a):
-            forbidden_env(a)
+        if a == '--' and not ended:
+            ended = True
             continue
-        if not a.startswith('-') or (a == '-' and '-' not in flags):
+        # env reads every word holding `=` before its program as an assignment, past `--` too
+        if name == 'env' and '=' in a and (ended or not a.startswith('-')):
+            forbidden_env(a, bash=False)
+            continue
+        if ended or not a.startswith('-') or (a == '-' and '-' not in flags):
             return [a] + words, given
         if a == '-' or a.startswith('--'):
             opt, eq, _ = a.partition('=')
@@ -723,10 +725,12 @@ def strip_wrapper_options(name, words):
     return words, given
 
 
-def forbidden_env(word):
-    """An env assignment a tool runs as a command: a pager other than cat, or a variable git executes from."""
+def forbidden_env(word, bash=True):
+    """An env assignment a tool runs as a command: a pager other than cat, or a variable git executes from. Only bash
+    reads `NAME+=value` as an append; env sets a variable named `NAME+`."""
     name, _, value = word.partition('=')
-    append, name = name.endswith('+'), name.removesuffix('+')
+    append = bash and name.endswith('+')
+    name = name.removesuffix('+') if append else name
     # an append extends a value this guard cannot see
     if name in PAGER_ENV and (append or value.translate(UNQUOTED) not in ('cat', '')):
         raise Denied(f'`{word.translate(UNQUOTED)}` runs a command as the pager; only `{name}=cat` passes')

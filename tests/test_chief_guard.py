@@ -332,6 +332,17 @@ class ChiefGuard(unittest.TestCase):
         for c in ('X+=1 git status', 'export PATH+=:/tmp/bin', 'X+=1'):
             self.assert_allowed(c)
 
+    def test_env_reads_every_word_with_an_equals_sign_as_an_assignment(self):
+        # GNU env sets any `x=y` word before its program, a name bash would refuse included, past `--` too
+        for c in ('env a.b=c git push', 'env -i a.b=c git push', 'env -u FOO a.b=c git push', 'env -- a.b=c git push',
+                  'env 1a=x git push', 'env a-b=c git push', 'nice env a.b=c git push', 'env -- -x=y git push'):
+            self.assert_denied(c, 'changes the repository')
+        self.assert_denied(f'env a.b=c rm {self.wt}/src/a.c', 'literal absolute path')
+        self.assert_denied('env -- GIT_PAGER=less git log', 'pager')
+        # env sets a variable named `GIT_PAGER+`, which leaves the pager alone
+        for c in ('env GIT_PAGER+=less git log', 'env a.b=c git log', 'env -- a=b git status'):
+            self.assert_allowed(c)
+
     def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):
         for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
                   'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',
