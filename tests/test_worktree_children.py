@@ -961,5 +961,36 @@ class LinkedWorkspace(unittest.TestCase):
                     wc.linked_workspace(tmp, str(stub))
 
 
+# prints the locale encoding, then the bytes of linked_worktree(argv[2]) as UTF-8 JSON, with the plugin at argv[1]
+LINKED = r'''import importlib.util, json, locale, os, sys
+spec = importlib.util.spec_from_file_location('worktree_children', sys.argv[1])
+wc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wc)
+print(locale.getpreferredencoding(False))
+print(json.dumps([os.fsencode(p).decode('utf-8') for p in wc.linked_worktree(sys.argv[2])]))
+'''
+
+
+@unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
+class NonUtf8Locale(unittest.TestCase):
+    def test_a_non_ascii_path_round_trips_whatever_the_locale(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
+        env.update(HOME=tempfile.gettempdir(), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
+                   GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t', GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
+        with tempfile.TemporaryDirectory() as tmp:
+            main, child = Path(tmp).resolve() / 'ré', Path(tmp).resolve() / 'ré--kid'
+            for args in (['init', '-q', str(main)], ['-C', str(main), 'commit', '-q', '--allow-empty', '-m', 'x'],
+                         ['-C', str(main), 'worktree', 'add', '-q', str(child)]):
+                subprocess.run(['git', *args], env=env, check=True, capture_output=True)
+            env.update(LC_ALL='C', PYTHONCOERCECLOCALE='0', PYTHONUTF8='0')
+            done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LINKED, str(SCRIPT), str(child)],
+                                  env=env, capture_output=True, encoding='utf-8')
+            encoding, _, answer = done.stdout.partition('\n')
+            if encoding.lower().replace('-', '') == 'utf8':
+                self.skipTest(f'the C locale encoding is {encoding} here')
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(json.loads(answer), [str(main / '.git' / 'worktrees' / 'ré--kid'), str(main / '.git')])
+
+
 if __name__ == '__main__':
     unittest.main()

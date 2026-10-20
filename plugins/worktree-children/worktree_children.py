@@ -92,7 +92,9 @@ class Keep(Exception):
 def run(args, cwd=None, input=None):
     """A finished command; one that cannot start reads as exit 127, so its check keeps the child."""
     try:
-        return subprocess.run(args, cwd=cwd, input=input, capture_output=True, text=True, env=ENV)
+        # decoded as os.fsdecode does, so paths round-trip: UTF-8 on Windows (git's), not the locale code page
+        return subprocess.run(args, cwd=cwd, input=input, capture_output=True, encoding=sys.getfilesystemencoding(),
+                              errors='surrogateescape', env=ENV)
     except OSError as e:
         return subprocess.CompletedProcess(args, 127, '', str(e))
 
