@@ -212,7 +212,17 @@ sys.exit(m.main(sys.argv[1:]))
         deadline = time.monotonic() + 9    # the capture is reading once the boot line is written out
         while not (self.out.exists() and self.out.read_bytes()) and time.monotonic() < deadline:
             time.sleep(0.05)
+        # pty_close wakes the reader before it hangs the slave up: hold the capture until its restore must fail
+        proc.send_signal(signal.SIGSTOP)
         os.close(self.master)
+        deadline = time.monotonic() + 9
+        while time.monotonic() < deadline:
+            try:
+                termios.tcgetattr(self.slave)
+            except termios.error:
+                break
+            time.sleep(0.01)
+        proc.send_signal(signal.SIGCONT)
         out, err = proc.communicate(timeout=30)
         out = json.loads(out)
         self.assertEqual(proc.returncode, 3, err)    # a hung-up port's settings could not be put back
