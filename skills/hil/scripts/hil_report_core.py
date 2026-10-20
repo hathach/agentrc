@@ -562,7 +562,8 @@ def _withdraw(report_dir: Path, schema: BodySchema, attempt_id: str, reason: str
 class Recovery(NamedTuple):
     """recover_publish's result: `outcome` repaired (the Markdown regenerated from the attempt's
     published JSON), withdrawn, removed (the live files byte-identical to the report the attempt
-    archived, named in `removed`) or unresolved; `problems` what failed on the way."""
+    archived, named in `removed`), unresolved, or refused (the current report is another
+    attempt's: nothing changed); `problems` what failed, or why it refused."""
     outcome: str
     problems: list
     removed: list
@@ -574,12 +575,18 @@ def recover_publish(report_dir, schema: BodySchema, attempt: Attempt | None, err
     attempt's JSON in place: its Markdown is regenerated (prepare_pair). Otherwise the report
     is withdrawn (withdraw_current, `err` the reason). When that fails too, each live file
     byte-identical to its copy in the record of the report the attempt archived is removed:
-    that is the predecessor, never this run's. A writer lock held by another writer raises
-    ReportError('writer') before anything changes; nothing here mutates the dir unlocked."""
+    that is the predecessor, never this run's. Nothing is done at all ('refused') unless the
+    current report is still the attempt's own, or the predecessor it archived, byte for byte,
+    or there is none: another writer's newer report is never withdrawn. A writer lock held by
+    another writer raises ReportError('writer') before anything changes; nothing here mutates
+    the dir unlocked."""
     report_dir = Path(report_dir)
     jpath, mpath, root = paths(report_dir, schema)
     problems = []
     with _writer(report_dir, schema):
+        foreign = _foreign(report_dir, schema, attempt)
+        if foreign:
+            return Recovery('refused', [foreign], [])
         if isinstance(err, ReportError) and err.stage == 'markdown':
             try:
                 _prepare(report_dir, schema)
@@ -603,6 +610,26 @@ def recover_publish(report_dir, schema: BodySchema, attempt: Attempt | None, err
                         live.unlink()
                         removed.append(live.name)
         return Recovery('removed' if removed else 'unresolved', problems, removed)
+
+
+def _foreign(report_dir: Path, schema: BodySchema, attempt: Attempt | None) -> str | None:
+    """Why the current report is neither `attempt`'s own nor the predecessor it archived; None
+    when it is one of them, or there is none."""
+    jpath, _, root = paths(report_dir, schema)
+    data = _read_bytes(jpath)
+    if data is None:
+        return None
+    if attempt is None:
+        return f'no attempt was given, so {jpath.name} cannot be shown to be its own or its predecessor'
+    reading = parse(data, schema)
+    owner = reading.meta['attempt_id'] if reading.meta else \
+        reading.body['attempt_id'] if reading.outcome == 'withdrawn' else None
+    if owner == attempt.attempt_id:
+        return None
+    if attempt.archived is not None and _read_bytes(root / attempt.archived / jpath.name) == data:
+        return None
+    return (f'{jpath.name} is {_archive_id(reading)}, neither attempt {attempt.attempt_id} nor the report it '
+            f'replaced ({attempt.archived}): another writer published it, so it is left as it is')
 
 
 def start_attempt(report_dir, schema: BodySchema, accumulate: bool, attempt_id: str | None = None) -> Attempt:

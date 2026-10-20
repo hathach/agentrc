@@ -15,6 +15,7 @@ import unittest
 if os.name == 'nt':
     raise unittest.SkipTest('the report writer lock tests use fcntl')
 
+import contextlib
 import fcntl
 import hashlib
 import importlib.util
@@ -765,12 +766,34 @@ class ArchiveAndWithdraw(Dir):
         self.assertIn('disk full', got.problems[0])
         self.assertEqual(self.files(), (None, None))
         self.assertEqual((core.paths(self.d, TINYUSB)[2] / 'a1' / 'hil_report.json').read_bytes(), self.before[0])
-        core.paths(self.d, TINYUSB)[0].write_text('{"not": "the archived bytes"}')
+        jpath, mpath = core.paths(self.d, TINYUSB)[:2]
+        jpath.write_bytes(self.before[0])
+        mpath.write_text('not the archived view')
         with mock.patch.object(core, '_withdraw', side_effect=core.ReportError('io', 'disk full')):
             got = core.recover_publish(self.d, TINYUSB, a2, err)
-        self.assertEqual((got.outcome, got.removed), ('unresolved', []))
-        self.assertTrue(core.paths(self.d, TINYUSB)[0].exists(), 'bytes not the archive\'s are never removed')
-        self.assertEqual(core.recover_publish(self.d, TINYUSB, None, err).outcome, 'unresolved')
+        self.assertEqual((got.outcome, got.removed), ('removed', ['hil_report.json']))
+        self.assertTrue(mpath.exists(), 'bytes not the archive\'s are never removed')
+        jpath.write_bytes(self.before[0])
+        self.assertEqual(core.recover_publish(self.d, TINYUSB, None, err).outcome, 'refused', 'no attempt to own it')
+
+    def test_recovery_never_touches_a_newer_report_another_writer_published(self):
+        a2 = core.start_attempt(self.d, TINYUSB, True, 'a2')
+        self.run_attempt(TINYUSB, usb_body([usb_row('b1', t='pass')]), accumulate=True, attempt_id='a3')
+        newer = self.files()
+        with self.assertRaises(core.ReportError) as cm:
+            core.publish(self.d, TINYUSB, usb_body([usb_row('b1', t='fail')]), self.meta(TINYUSB, a2))
+        self.assertEqual(cm.exception.stage, 'predecessor')
+        markdown = core.ReportError('markdown', 'disk full')
+        for err, failing in ((cm.exception, False), (cm.exception, True), (markdown, False)):
+            withdraw = mock.patch.object(core, '_withdraw', side_effect=core.ReportError('io', 'disk full')) \
+                if failing else contextlib.nullcontext()
+            with self.subTest(stage=err.stage, withdraw_fails=failing), withdraw:
+                got = core.recover_publish(self.d, TINYUSB, a2, err)
+                self.assertEqual((got.outcome, got.removed), ('refused', []))
+                self.assertIn('another writer published it', got.problems[0])
+                self.assertEqual(self.files(), newer, 'a3 stays current, neither withdrawn nor removed')
+        root = core.paths(self.d, TINYUSB)[2]
+        self.assertFalse((root / 'a3').exists() or (root / 'withdrawn-a2').exists())
 
     def test_recovery_never_mutates_while_another_writer_holds_the_dir(self):
         a2, err = self.failed_abort_publish()
