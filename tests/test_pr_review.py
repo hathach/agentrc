@@ -203,8 +203,10 @@ class Case(unittest.TestCase):
         sh(self.tmp, 'git', 'clone', '--quiet', self.remote.as_posix(), str(self.work))
         for k, v in (('user.name', 't'), ('user.email', 't@t'), ('commit.gpgsign', 'false')):
             sh(self.work, 'git', 'config', k, v)
-        self.env = mock.patch.dict(os.environ, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'commit.gpgsign', 'GIT_CONFIG_VALUE_0': 'false'})
+        self.env = mock.patch.dict(os.environ, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'commit.gpgsign', 'GIT_CONFIG_VALUE_0': 'false',
+                                                'HERDR_BIN_PATH': str(self.tmp / 'no-herdr')})  # no herdr: worktrees nest
         self.env.start()
+        os.environ.pop('HERDR_ENV', None)
         self.commit('src/core/a.c', 'int a;\n' * 20, 'base')
         sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
         self.base = sh(self.work, 'git', 'rev-parse', 'HEAD')
@@ -346,6 +348,87 @@ class Prepare(Case):
         sh(p['worktree'], 'git', '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--quiet', '-m', 'local')
         with self.assertRaisesRegex(facts.Unusable, 'not a head this script pinned'):
             self.prepare()
+
+    def herdr(self, entry=None):
+        """A stub herdr answering `worktree list` with entry (path filled in), or failing without one."""
+        stub = self.tmp / 'herdr'
+        body = f"print(json.dumps({{'result': {{'worktrees': [{{**{entry!r}, 'path': sys.argv[-1]}}]}}}}))" if entry \
+            else "sys.exit('herdr server unreachable')"
+        stub.write_text(f'#!{sys.executable}\nimport json, sys\n{body}\n')
+        stub.chmod(0o755)
+        os.environ['HERDR_BIN_PATH'] = str(stub)
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_a_herdr_worktree_gets_its_review_worktree_beside_it(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        head = self.push_pr()
+        sibling = self.tmp / f'clone--pr-review-{PR}'
+        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
+        p = self.prepare()
+        self.assertEqual(p['worktree'], sibling.as_posix())
+        self.assertEqual(sh(sibling, 'git', 'rev-parse', 'HEAD'), head)
+        self.herdr()  # an existing tree is reused without asking herdr
+        self.assertEqual(self.prepare()['worktree'], sibling.as_posix())
+        Path(sibling, 'src/core/a.c').write_text('local edit\n')
+        with self.assertRaisesRegex(facts.Unusable, 'uncommitted changes'):
+            self.prepare()
+        sh(sibling, 'git', 'checkout', '--', '.')
+        sh(self.clone, 'git', 'worktree', 'add', '--quiet', '--detach', str(self.clone / '.worktrees' / f'pr-review-{PR}'))
+        with self.assertRaisesRegex(facts.Unusable, 'both .* exist'):
+            self.prepare()
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_a_review_worktree_nests_unless_herdr_has_the_checkout_open_and_refuses_when_herdr_cannot_say(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        nested = (self.clone / '.worktrees' / f'pr-review-{PR}').as_posix()
+        self.herdr({'is_linked_worktree': False, 'open_workspace_id': 'w1'})
+        self.assertEqual(self.prepare()['worktree'], nested)
+        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
+        self.assertEqual(self.prepare()['worktree'], nested, 'a nested tree from before is reused where it is')
+        sh(self.clone, 'git', 'worktree', 'remove', nested)
+        self.herdr()
+        with self.assertRaisesRegex(facts.Unusable, 'cannot ask herdr .*unreachable'):
+            self.prepare()
+        self.herdr({'is_linked_worktree': False})
+        with mock.patch.object(prepare, 'PLUGIN', self.tmp / 'missing.py'), \
+                self.assertRaisesRegex(facts.Unusable, 'cannot ask herdr .*missing.py'):
+            self.prepare()
+        os.environ['HERDR_BIN_PATH'] = str(self.tmp / 'no-herdr')
+        os.environ['HERDR_ENV'] = '1'
+        with self.assertRaisesRegex(facts.Unusable, 'HERDR_ENV is set but .* not on PATH'):
+            self.prepare()
+        self.assertFalse(Path(nested).exists())
+        self.assertFalse((self.tmp / f'clone--pr-review-{PR}').exists())
+
+    def test_an_existing_tree_that_is_not_our_linked_worktree_is_refused_untouched(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        launcher = (sh(self.clone, 'git', 'branch', '--show-current'), sh(self.clone, 'git', 'rev-parse', 'HEAD'))
+        sibling = self.tmp / f'clone--pr-review-{PR}'
+        sibling.symlink_to(self.clone)  # the launcher's HEAD, main at the base, is a pinned commit
+        with self.assertRaisesRegex(facts.Unusable, 'is a symlink'):
+            self.prepare()
+        sibling.unlink()
+        sh(self.tmp, 'git', 'clone', '--quiet', self.remote.as_posix(), str(sibling))
+        with self.assertRaisesRegex(facts.Unusable, 'not a linked worktree of this repository'):
+            self.prepare()
+        subprocess.run(['rm', '-rf', str(sibling)])
+        (self.clone / '.worktrees' / f'pr-review-{PR}').mkdir(parents=True)
+        with self.assertRaisesRegex(facts.Unusable, 'not a linked worktree of this repository'):
+            self.prepare()
+        self.assertEqual((sh(self.clone, 'git', 'branch', '--show-current'), sh(self.clone, 'git', 'rev-parse', 'HEAD')),
+                         launcher)
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_a_malformed_herdr_entry_is_refused(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        self.herdr({'is_linked_worktree': 'false', 'open_workspace_id': 'w1'})  # the plugin's check: its tests list the rest
+        with self.assertRaisesRegex(facts.Unusable, 'cannot ask herdr .*malformed entry'):
+            self.prepare()
+        self.herdr({'is_linked_worktree': True, 'open_workspace_id': None})
+        self.assertEqual(self.prepare()['worktree'], (self.clone / '.worktrees' / f'pr-review-{PR}').as_posix())
 
     def test_ci_states(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')

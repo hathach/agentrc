@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Pin a PR for pr-review and check a pinned one has not moved.
 
-  prepare.py --pr N [--repo OWNER/NAME] [--max-groups 6] [--full]   # from the repository's primary checkout top level
+  prepare.py --pr N [--repo OWNER/NAME] [--max-groups 6] [--full]   # from the checkout's top level
   prepare.py --check --pr N --expected-head SHA [--repo OWNER/NAME]  # from the review worktree top level
 
 prepare fetches the PR head into refs/pr-review/<N>/<sha> (old heads stay, so
 a later push can be diffed against them) and the base branch, pins head, base
 and merge base, and puts branch pr-review-<N> at the head in
-.worktrees/pr-review-<N>. An existing worktree is reused only when it is clean
-and its branch tip is a head this script pinned; anything else is refused, never
-reset. It first settles the pending reviews of ours on the ledger (post.py
+.worktrees/pr-review-<N>, or in <checkout>--pr-review-<N> beside it when herdr
+lists the checkout as a linked worktree open in a workspace (herdr's removal of
+the checkout would take a nested tree along); a herdr on PATH that cannot
+answer, or HERDR_ENV set without one, refuses. An existing worktree at either
+place is reused only when it is clean and its branch tip is a head this script
+pinned; anything else, and a tree at both places, is refused, never reset. It
+first settles the pending reviews of ours on the ledger (post.py
 --sync): what the human submitted or deleted on GitHub is recorded, and one still
 pending, or a post never confirmed, refuses the run. It reads the ledger to choose the mode: `same` when the head was
 reviewed already, `incremental` when the last reviewed head is an ancestor and
@@ -32,9 +36,11 @@ to the facts file the line names, beside the ledger. {"error": ...}, exit 2,
 when a fact cannot be read or the pins disagree.
 """
 
+import importlib.util
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -51,6 +57,7 @@ TOOLING = re.compile(r'(^|/)(CMakeLists\.txt|Makefile|[^/]+\.(cmake|mk|py|sh|ps1
 PASSED = {'SUCCESS', 'SKIPPED', 'NEUTRAL'}
 PENDING = {'PENDING', 'QUEUED', 'IN_PROGRESS', 'WAITING', 'REQUESTED', 'EXPECTED', 'ACTION_REQUIRED'}
 FAILED = {'FAILURE', 'ERROR', 'TIMED_OUT', 'STARTUP_FAILURE', 'CANCELLED', 'STALE'}
+PLUGIN = Path(__file__).resolve().parents[3] / 'plugins' / 'worktree-children' / 'worktree_children.py'
 
 
 def gh_json(*argv, ok=(0,)):
@@ -123,10 +130,46 @@ def pin(remote, repo, pr, info):
     return head, base, git('merge-base', base, head).strip()
 
 
+def herdr_sibling(top):
+    """Whether a new worktree goes beside the checkout: herdr lists it as a linked worktree open in a workspace."""
+    name = os.environ.get('HERDR_BIN_PATH') or 'herdr'
+    herdr = shutil.which(name)
+    if not herdr:
+        if os.environ.get('HERDR_ENV'):
+            raise Unusable(f'HERDR_ENV is set but {name} is not on PATH: cannot tell where the review worktree goes')
+        return False
+    try:
+        spec = importlib.util.spec_from_file_location('worktree_children', PLUGIN)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        return plugin.linked_workspace(top, herdr)
+    except Exception as err:  # the plugin's Keep, or a plugin that cannot load
+        raise Unusable(f'cannot ask herdr where the review worktree goes: {err}')
+
+
+def own_worktree(path, top):
+    """Refuse an existing tree unless it is a linked worktree of this repository rooted at path: a symlink,
+    the launcher, another repository's tree or a stray directory would be switched to the PR head."""
+    if path.is_symlink():
+        raise Unusable(f'{path} is a symlink, not a review worktree; resolve by hand')
+    got = run('git', '-C', str(path), 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir',
+              '--git-common-dir')[1].splitlines()
+    ours = git('rev-parse', '--path-format=absolute', '--git-common-dir').strip()
+    real = [os.path.realpath(p) for p in got]
+    if (len(real) != 3 or real[0] != os.path.realpath(path) or real[0] == os.path.realpath(top) or real[1] == real[2]
+            or real[2] != os.path.realpath(ours)):
+        raise Unusable(f'{path} is not a linked worktree of this repository; resolve by hand')
+
+
 def worktree(top, pr, head):
-    path, branch = Path(top) / '.worktrees' / f'pr-review-{pr}', f'pr-review-{pr}'
+    branch = f'pr-review-{pr}'
+    nested, sibling = Path(top) / '.worktrees' / branch, Path(top).parent / f'{Path(top).name}--{branch}'
+    found = [p for p in (nested, sibling) if p.exists() or p.is_symlink()]
+    if len(found) > 1:
+        raise Unusable(f'both {nested} and {sibling} exist; remove the one you do not need by hand')
     pinned = {line.split()[0] for line in git('for-each-ref', '--format=%(objectname)', f'refs/pr-review/{pr}/').splitlines()}
-    if not path.exists():
+    if not found:
+        path = sibling if herdr_sibling(top) else nested
         if git('branch', '--list', branch).strip():
             tip = git('rev-parse', branch).strip()
             if tip not in pinned:
@@ -136,6 +179,8 @@ def worktree(top, pr, head):
         else:
             git('worktree', 'add', '--quiet', '-b', branch, str(path), head)
         return path.as_posix(), branch
+    path = found[0]
+    own_worktree(path, top)
     dirty = run('git', '-C', str(path), 'status', '--porcelain')[1].strip()
     if dirty:
         raise Unusable(f'{path} has uncommitted changes, left by an earlier run: {dirty.splitlines()[0]} ...; restore them first')

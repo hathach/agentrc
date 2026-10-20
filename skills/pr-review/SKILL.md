@@ -14,7 +14,7 @@ exit 2 means the facts could not be read, and nothing is filled in.
 
 ```bash
 S=~/.claude/skills/pr-review/scripts
-python3 $S/prepare.py --pr N [--repo O/R] [--full]            # primary checkout top level: pin, worktree, mode
+python3 $S/prepare.py --pr N [--repo O/R] [--full]            # checkout top level: pin, worktree, mode
 python3 $S/prepare.py --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 $S/threads.py --pr N --out FILE                         # every comment and thread, bodies in FILE
 python3 $S/ledger.py show --pr N [--finding ID] [--draft] [--pending]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists
@@ -28,11 +28,13 @@ python3 $S/result.py --output FILE                              # a launch, cond
 
 ## 1. Pin
 
-Run `prepare.py` from the repository's primary checkout. It first records what
+Run `prepare.py` from the checkout's top level. It first records what
 the human did with our pending reviews on GitHub, and refuses while one is
 still pending or a post was never confirmed: finish or delete the pending
 review on the PR, or reconcile what it names. It makes
-`.worktrees/pr-review-<N>` on branch `pr-review-<N>` at the PR head and picks
+`.worktrees/pr-review-<N>`, or the sibling `<checkout>--pr-review-<N>` when
+herdr has the checkout open as a linked worktree, on branch `pr-review-<N>` at
+the PR head (an existing tree at either place is reused) and picks
 the mode: `full` on a first review or after a force-push or rebase,
 `incremental` when the last reviewed head is an ancestor, `same` when this
 head was reviewed already. On `same`, launch in `discussion` mode, which only
