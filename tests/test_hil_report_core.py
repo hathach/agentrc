@@ -16,6 +16,7 @@ if os.name == 'nt':
     raise unittest.SkipTest('the report writer lock tests use fcntl')
 
 import fcntl
+import hashlib
 import importlib.util
 import json
 import shutil
@@ -738,11 +739,291 @@ class ArchiveAndWithdraw(Dir):
         self.assertEqual(core.withdraw_current(self.d, broken, 'a2', str(cm.exception)), 'a1')
         self.assertEqual(core.prepare_pair(self.d, TINYUSB).outcome, 'withdrawn')   # a1 never current again
 
+    def test_recovery_repairs_a_markdown_left_behind_by_its_published_json(self):
+        a2 = core.start_attempt(self.d, TINYUSB, True, 'a2')
+        real, md = os.replace, core.paths(self.d, TINYUSB)[1]
+        with mock.patch.object(core.os, 'replace', lambda s, d: (_ for _ in ()).throw(OSError(28, 'no space'))
+                               if Path(d) == md else real(s, d)), self.assertRaises(core.ReportError) as cm:
+            core.publish(self.d, TINYUSB, usb_body([usb_row('b1', t='fail')]), self.meta(TINYUSB, a2))
+        self.assertEqual(cm.exception.stage, 'markdown')
+        self.assertEqual(core.recover_publish(self.d, TINYUSB, a2, cm.exception), ('repaired', [], []))
+        j, m = self.files()
+        self.assertEqual(m, core.render_markdown(TINYUSB, json.loads(j)).encode())
+
+    def test_recovery_withdraws_a_report_the_attempt_did_not_publish(self):
+        a2, err = self.failed_abort_publish()
+        self.assertEqual(core.recover_publish(self.d, TINYUSB, a2, err).outcome, 'withdrawn')
+        r = core.parse(self.files()[0], TINYUSB)
+        self.assertEqual((r.outcome, r.body['attempt_id'], r.body['archived']), ('withdrawn', 'a2', 'a1'))
+        self.assertIn('ReportError', r.body['reason'])
+
+    def test_recovery_removes_only_the_archived_predecessors_bytes_when_it_cannot_withdraw(self):
+        a2, err = self.failed_abort_publish()
+        with mock.patch.object(core, '_withdraw', side_effect=core.ReportError('io', 'disk full')):
+            got = core.recover_publish(self.d, TINYUSB, a2, err)
+        self.assertEqual((got.outcome, got.removed), ('removed', ['hil_report.json', 'hil_report.md']))
+        self.assertIn('disk full', got.problems[0])
+        self.assertEqual(self.files(), (None, None))
+        self.assertEqual((core.paths(self.d, TINYUSB)[2] / 'a1' / 'hil_report.json').read_bytes(), self.before[0])
+        core.paths(self.d, TINYUSB)[0].write_text('{"not": "the archived bytes"}')
+        with mock.patch.object(core, '_withdraw', side_effect=core.ReportError('io', 'disk full')):
+            got = core.recover_publish(self.d, TINYUSB, a2, err)
+        self.assertEqual((got.outcome, got.removed), ('unresolved', []))
+        self.assertTrue(core.paths(self.d, TINYUSB)[0].exists(), 'bytes not the archive\'s are never removed')
+        self.assertEqual(core.recover_publish(self.d, TINYUSB, None, err).outcome, 'unresolved')
+
+    def test_recovery_never_mutates_while_another_writer_holds_the_dir(self):
+        a2, err = self.failed_abort_publish()
+        fd = os.open(self.d / '.hil_report.lock', os.O_RDWR)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with mock.patch.object(core, '_withdraw', side_effect=AssertionError('ran unlocked')), \
+                self.assertRaises(core.ReportError) as cm:
+            core.recover_publish(self.d, TINYUSB, a2, err)
+        self.assertEqual(cm.exception.stage, 'writer')
+        self.assertEqual(self.files(), self.before)
+
+    def write_withdrawal(self, where: Path, attempt_id, archived):
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(json.dumps({core.WITHDRAWN: {'version': 1, 'body_schema': TINYUSB.name,
+                                                      'attempt_id': attempt_id, 'archived': archived, 'reason': 'r'}}))
+
+    def test_read_current_follows_withdrawals_to_the_report_they_archived(self):
+        a2, err = self.failed_abort_publish()
+        core.withdraw_current(self.d, TINYUSB, 'a2', str(err))
+        r = core.read_current(self.d, TINYUSB)
+        self.assertEqual((r.outcome, r.meta['attempt_id'], r.raw), ('valid', 'a1', self.before[0]))
+        a3 = core.start_attempt(self.d, TINYUSB, True, 'a3')
+        self.assertEqual((a3.previous_attempt, a3.prior.meta['attempt_id']), ('withdrawn-a2', 'a1'),
+                         'an accumulating writer builds on the withdrawn report\'s rows')
+        root, jpath = core.paths(self.d, TINYUSB)[2], core.paths(self.d, TINYUSB)[0]
+        self.write_withdrawal(jpath, 'w1', 'withdrawn-w0')
+        self.write_withdrawal(root / 'withdrawn-w0' / 'hil_report.json', 'w0', 'withdrawn-w1')
+        self.write_withdrawal(root / 'withdrawn-w1' / 'hil_report.json', 'w1', 'withdrawn-w0')
+        self.assertEqual(core.read_current(self.d, TINYUSB).outcome, 'corrupt', 'a cycle')
+        self.write_withdrawal(jpath, 'w2', 'gone')
+        self.assertEqual(core.read_current(self.d, TINYUSB).outcome, 'missing')
+        self.write_withdrawal(jpath, 'w3', None)
+        r = core.read_current(self.d, TINYUSB)
+        self.assertEqual((r.outcome, r.body['attempt_id']), ('withdrawn', 'w3'), 'nothing to build on')
+
     def test_a_withdrawal_whose_archive_does_not_verify_keeps_the_report(self):
         with mock.patch.object(core, '_archive'), self.assertRaises(core.ReportError) as cm:
             core.withdraw_current(self.d, TINYUSB, 'a2', 'publish failed')
         self.assertEqual(cm.exception.stage, 'archive')
         self.assertEqual(self.files(), self.before)
+
+
+class Adopt(Dir):
+    """adopt over a local report dir and an incoming one, as a copy-back fetched it."""
+
+    def setUp(self):
+        super().setUp()
+        self.rig = self.d.parent / 'rig'
+
+    def pub(self, d, aid, cell='pass', accumulate=False, termination='completed'):
+        a = core.start_attempt(d, TINYUSB, accumulate, aid)
+        core.publish(d, TINYUSB, usb_body([usb_row('b1', t=cell)]), self.meta(TINYUSB, a, termination))
+
+    def adopt(self, **kw):
+        return core.adopt(self.d, self.rig, TINYUSB, **kw)
+
+    def current(self, d=None):
+        return core.read_document(core.paths(d or self.d, TINYUSB)[0], TINYUSB)
+
+    def record(self, d, aid):
+        return core.read_document(core.paths(d, TINYUSB)[2] / aid / 'hil_report.json', TINYUSB)
+
+    def retry_on_the_rig(self):
+        """The rig accumulates onto the uploaded local report, as an accumulating remote run does."""
+        self.pub(self.d, 'a1', 'fail')
+        self.rig.mkdir(parents=True)
+        shutil.copyfile(core.paths(self.d, TINYUSB)[0], core.paths(self.rig, TINYUSB)[0])
+        self.pub(self.rig, 'a2', 'pass', accumulate=True)
+
+    def not_promoted(self, got, why, attempt_id=None):
+        self.assertEqual(got.copied, [])
+        self.assertTrue(any(why in p for p in got.problems), got.problems)
+        r = self.current()
+        self.assertEqual(r.outcome, 'withdrawn', 'the local report is never left as the incoming run\'s')
+        if attempt_id:
+            self.assertEqual(r.body['attempt_id'], attempt_id)
+        return r
+
+    def test_a_retry_comes_home_with_its_chain(self):
+        self.retry_on_the_rig()
+        got = self.adopt()
+        self.assertEqual((got.copied, got.problems, got.conflicts, got.reading.meta['attempt_id']),
+                         (['hil_report.json', 'hil_report.md'], [], [], 'a2'))
+        self.assertEqual([c.attempt_id for c in core.read_chain(self.d, TINYUSB)], ['a1', 'a2'])
+        j, m = self.files()
+        self.assertEqual(m, core.render_markdown(TINYUSB, json.loads(j)).encode())
+
+    def test_an_unusable_pair_still_imports_and_withdraws_the_local_report(self):
+        self.retry_on_the_rig()
+        self.pub(self.rig, 'a3', 'pass', accumulate=True)     # a2 becomes a rig record
+        got = self.adopt(unusable='the pair did not all arrive', reason='copy-back failed')
+        self.assertEqual((got.reading, got.imported), (None, ['a2']))
+        r = self.not_promoted(got, 'did not all arrive')
+        self.assertEqual(r.body['archived'], 'a1')
+        self.assertTrue(r.body['reason'].startswith('copy-back failed: the pair did not all arrive'))
+        self.assertTrue(core.paths(self.d, TINYUSB)[1].read_text().startswith(core.NOTICE))
+
+    def test_a_local_report_that_cannot_be_archived_is_left_alone(self):
+        self.retry_on_the_rig()
+        held = core.paths(self.d, TINYUSB)[2] / 'a1'
+        held.mkdir(parents=True)
+        (held / 'hil_report.json').write_text('{"a different": "record"}')
+        before = self.files()
+        got = self.adopt()
+        self.assertEqual(got.copied, [])
+        self.assertTrue(any('cannot be archived' in p for p in got.problems), got.problems)
+        self.assertEqual(self.files(), before, 'neither replaced nor withdrawn')
+        self.assertEqual(self.current(self.rig).meta['attempt_id'], 'a2', 'the incoming report stays apart')
+
+    def test_a_chain_naming_a_record_held_differently_is_not_promoted(self):
+        self.pub(self.d, 'rig-1', 'pass')
+        self.pub(self.d, 'loc-2', 'pass')                      # rig-1 (a pass) is archived locally
+        self.pub(self.rig, 'rig-1', 'fail', termination='aborted')
+        self.pub(self.rig, 'rig-2', 'pass', accumulate=True)   # names the aborted rig-1
+        got = self.adopt()
+        self.assertEqual(got.conflicts, ['rig-1'])
+        self.not_promoted(got, 'chain names attempt record(s) rig-1', 'rig-2')
+        self.assertEqual(self.record(self.d, 'rig-1').meta['termination'], 'completed', 'never rewritten')
+        self.assertEqual(self.record(self.rig, 'rig-1').meta['termination'], 'aborted', 'kept apart, not dropped')
+        self.assertEqual([c.outcome for c in core.read_chain(self.d, TINYUSB)], ['withdrawn'])
+
+    def test_a_conflict_reached_through_a_record_only_the_local_side_holds_is_not_promoted(self):
+        self.pub(self.d, 'first', 'pass')
+        self.pub(self.d, 'middle', 'pass', accumulate=True)
+        self.pub(self.d, 'other', 'pass')
+        self.pub(self.rig, 'first', 'fail', termination='aborted')
+        self.pub(self.rig, 'middle', 'pass', accumulate=True)
+        self.pub(self.rig, 'latest', 'pass', accumulate=True)
+        shutil.rmtree(core.paths(self.rig, TINYUSB)[2] / 'middle')   # the bundle omits the intermediate
+        self.not_promoted(self.adopt(), 'chain names attempt record(s) first', 'latest')
+
+    def test_a_conflict_reached_through_a_withdrawals_archived_link_is_not_promoted(self):
+        self.pub(self.d, 'x', 'pass')
+        self.pub(self.d, 'loc', 'pass')                         # x (a pass) archived locally
+        self.pub(self.rig, 'x', 'fail', termination='aborted')
+        core.withdraw_current(self.rig, TINYUSB, 'w', 'publish failed')   # the rig's current archived its x
+        got = self.adopt()
+        self.assertEqual(got.conflicts, ['x'])
+        r = self.not_promoted(got, 'chain names attempt record(s) x', 'w')
+        self.assertEqual(r.body['archived'], 'loc')
+        self.assertEqual(self.record(self.d, 'x').meta['termination'], 'completed')
+        self.assertEqual(core.read_current(self.d, TINYUSB).meta['attempt_id'], 'loc', 'the local pass is not relinked')
+
+    def test_an_unrelated_conflicting_record_is_named_but_does_not_stop_the_report(self):
+        self.retry_on_the_rig()
+        self.pub(self.d, 'old', 'pass')
+        other = core.paths(self.rig, TINYUSB)[2] / 'old'
+        other.mkdir()
+        (other / 'hil_report.json').write_text('{"rows": [], "scope": "", "caveat": "other"}')
+        got = self.adopt()
+        self.assertEqual((got.conflicts, got.problems, self.current().meta['attempt_id']), (['old'], [], 'a2'))
+
+    def test_an_incoming_report_the_dir_holds_already_is_no_new_runs(self):
+        self.pub(self.d, 'a1', 'pass')
+        self.rig.mkdir()
+        for f in core.paths(self.d, TINYUSB)[:2]:
+            shutil.copyfile(f, self.rig / f.name)
+        self.not_promoted(self.adopt(), 'which', None)
+
+    def test_an_incoming_id_sealed_as_a_local_withdrawal_is_refused(self):
+        self.pub(self.d, 'a1', 'pass')
+        core.withdraw_current(self.d, TINYUSB, 'reused', 'publish failed')
+        self.pub(self.rig, 'reused', 'pass')
+        got = self.adopt()
+        r = self.not_promoted(got, 'is attempt reused')
+        self.assertNotEqual(r.body['attempt_id'], 'reused', 'a sealed id is never written again')
+        self.assertTrue((core.paths(self.d, TINYUSB)[2] / 'withdrawn-reused').is_dir())
+
+    def test_a_local_writer_cannot_publish_between_the_archive_and_the_promotion(self):
+        self.retry_on_the_rig()
+        before = self.files()
+        real, refused = core._import, []
+
+        def interleaved(*a, **kw):
+            try:
+                self.pub(self.d, 'sneak', 'fail')
+            except core.ReportError as e:
+                refused.append(e.stage)
+            return real(*a, **kw)
+        with mock.patch.object(core, '_import', interleaved):
+            got = self.adopt()
+        self.assertEqual((refused, got.problems), (['writer'], []))
+        self.assertEqual(self.current().meta['attempt_id'], 'a2')
+        self.assertEqual(self.record(self.d, 'a1').raw, before[0], 'the replaced report was archived first')
+        self.assertFalse((core.paths(self.d, TINYUSB)[2] / 'sneak').exists())
+
+    def test_a_record_created_meanwhile_is_a_conflict_never_an_error(self):
+        for same in (False, True):
+            with self.subTest(same=same):
+                shutil.rmtree(self.d.parent, ignore_errors=True)
+                self.retry_on_the_rig()
+                self.pub(self.rig, 'a3', 'pass', accumulate=True)   # a2 becomes a rig record
+                src = core.paths(self.rig, TINYUSB)[2] / 'a2' / 'hil_report.json'
+                real = os.rename
+
+                def racing(s, d, *a, **kw):
+                    if Path(d).name == 'a2':
+                        Path(d).mkdir()
+                        (Path(d) / 'hil_report.json').write_bytes(src.read_bytes() if same else b'{"other": 1}')
+                    return real(s, d, *a, **kw)
+                with mock.patch.object(core.os, 'rename', racing):
+                    got = self.adopt()
+                self.assertEqual((got.imported, got.conflicts), ([], [] if same else ['a2']))
+                if same:
+                    self.assertEqual(got.problems, [])
+                else:
+                    self.not_promoted(got, 'chain names attempt record(s) a2', 'a3')
+
+    def test_a_markdown_that_cannot_be_promoted_is_rendered_from_the_new_json_or_removed(self):
+        for failures, kept in ((1, True), (99, False)):
+            with self.subTest(failures=failures):
+                shutil.rmtree(self.d.parent, ignore_errors=True)
+                self.retry_on_the_rig()
+                md, real, left = core.paths(self.d, TINYUSB)[1], os.replace, [failures]
+
+                def replace(s, d, *a, **kw):
+                    if Path(d) == md and left[0]:
+                        left[0] -= 1
+                        raise OSError(28, 'disk full')
+                    return real(s, d, *a, **kw)
+                with mock.patch.object(core.os, 'replace', replace):
+                    got = self.adopt()
+                self.assertIn('hil_report.md could not be promoted', got.problems[0])
+                self.assertEqual(self.current().meta['attempt_id'], 'a2', 'the promoted JSON is the incoming run\'s')
+                self.assertEqual(('hil_report.md' in got.copied, md.exists()), (kept, kept))
+                if kept:
+                    self.assertEqual(md.read_bytes(), core.render_markdown(TINYUSB, json.loads(self.files()[0])).encode())
+
+    def test_a_chain_record_neither_side_holds_is_a_problem_but_the_report_lands(self):
+        self.retry_on_the_rig()
+        for f in core.paths(self.d, TINYUSB)[:2]:
+            f.unlink()
+        shutil.rmtree(core.paths(self.rig, TINYUSB)[2])
+        got = self.adopt()
+        self.assertTrue(any('a1, which neither side holds' in p for p in got.problems), got.problems)
+        self.assertEqual(self.current().meta['attempt_id'], 'a2')
+
+    def test_a_withdrawn_incoming_report_lands_as_unavailable(self):
+        self.retry_on_the_rig()
+        core.withdraw_current(self.rig, TINYUSB, 'a3', 'publish failed')
+        got = self.adopt()
+        self.assertEqual(got.copied, ['hil_report.json', 'hil_report.md'])
+        self.assertTrue(any('unavailable notice' in p for p in got.problems), got.problems)
+        self.assertEqual(self.current().outcome, 'withdrawn')
+
+    def test_roster_identity_is_portable(self):
+        self.d.mkdir(parents=True)
+        for where in (self.d / 'tinyusb.json', self.d.parent / 'elsewhere' / 'tinyusb.json'):
+            where.parent.mkdir(exist_ok=True)
+            where.write_text('{"boards": []}')
+            self.assertEqual(core.roster_identity(where), {'name': 'tinyusb.json',
+                                                           'sha256': hashlib.sha256(b'{"boards": []}').hexdigest()})
 
 
 # --- verdicts -----------------------------------------------------------------------------------
@@ -923,6 +1204,15 @@ class Sequences(Dir):
         res = self.verdict()
         self.assertEqual(self.board(res), ('pass', False))
         self.assertEqual(res['sequence']['attempts'], ['a2'])
+
+    def test_the_current_view_is_narrowed_to_the_requested_boards(self):
+        self.attempt([{'t': 'pass'}, {'t': 'fail'}], False, 'a1', boards=('b1', 'b2'))
+        chain = [c._replace(run=models.tinyusb_run(c.reading, ['b1', 'b2'])) for c in core.read_chain(self.d, TINYUSB)]
+        res = core.sequence_verdict(TINYUSB, ['b1'], chain)
+        self.assertEqual(chain[-1].run['verdict'], 'fail', 'the whole run, as eligibility reads it')
+        self.assertEqual((res['current']['verdict'], [r['board'] for r in res['current']['rows']]), ('pass', ['b1']))
+        res = core.sequence_verdict(TINYUSB, ['b3'], chain)
+        self.assertEqual((res['current']['verdict'], res['current']['rows']), ('not-run', []))
 
     def test_no_board_or_empty_coverage_never_passes(self):
         self.attempt([], False, 'a1', 'no-boards', '**HIL run selected no boards.**\n', boards=())

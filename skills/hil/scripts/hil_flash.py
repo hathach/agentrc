@@ -444,6 +444,34 @@ def flash_esptool(flasher: dict, *, chip: str, port: str, flash_args: str, cwd: 
     return _once(run, command, cwd=cwd, timeout=timeout)
 
 
+def esptool_input_problem(chip, flash_args, cwd) -> str:
+    """Why flash_esptool could not flash with these inputs ('' when it could): `chip` one plain
+    token, `flash_args` options then "<offset> <file>" pairs, every file present relative to
+    `cwd`. For a caller to check before it locks a board, so a flash cannot fail on its inputs;
+    finding the build's chip and flash_args is the caller's."""
+    if not isinstance(chip, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', chip):
+        return f'chip {chip!r}: want one plain token (an IDF_TARGET)'
+    if not isinstance(cwd, (str, os.PathLike)) or not os.path.isdir(cwd):
+        return f'cwd {cwd!r} is not a directory'
+    try:
+        tokens = shlex.split(flash_args)
+    except (ValueError, AttributeError) as e:
+        return f'flash_args: {e!r}'[:200]
+    while tokens and tokens[0].startswith('-'):
+        if '=' not in tokens.pop(0) and tokens:
+            tokens.pop(0)
+    if not tokens or len(tokens) % 2:
+        return 'flash_args: want "<offset> <file>" pairs after the options'
+    for offset, f in zip(tokens[::2], tokens[1::2]):
+        try:
+            int(offset, 0)
+        except ValueError:
+            return f'flash_args: offset {offset!r}'
+        if not (Path(cwd) / f).is_file():
+            return f'flash_args names {f}, which is missing from {cwd}'
+    return ''
+
+
 # no reset_esptool: esptool's reset would be `--after hard_reset`, which is not wired here
 
 

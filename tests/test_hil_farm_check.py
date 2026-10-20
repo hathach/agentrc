@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import shutil
 import signal
 import subprocess
 import sys
@@ -784,9 +785,37 @@ class Main(unittest.TestCase):
             self.assertEqual(doc['profile'], {'path': os.path.realpath(self.p.__file__),
                                               'digest': hashlib.sha256(b'# stub profile\n').hexdigest()})
             self.assertEqual((doc['_hil']['body_schema'], doc['_hil']['termination']), ('farm-check', 'completed'))
+            self.assertEqual(doc['_hil']['roster'], {'name': 'roster.json',
+                                                     'sha256': hashlib.sha256(Path(self.cfg).read_bytes()).hexdigest()},
+                             'portable: the operational path stays in `config`')
             self.assertEqual(code, 1)
             self.assertIn('farm check: host rig', err)
             self.assertIn('child noise', err)
+
+    def test_the_user_bin_dirs_go_on_path_for_the_call(self):
+        home = self.d / 'home'
+        (home / 'bin').mkdir(parents=True)
+        (home / '.local' / 'bin').mkdir(parents=True)
+        seen = []
+
+        def check(*a, **kw):
+            seen.append(os.environ['PATH'])
+            return row('b', 'ok')
+        for path, want in ((os.pathsep.join(['/usr/bin', '/bin']),
+                            [str(home / '.local/bin'), str(home / 'bin'), '/usr/bin', '/bin']),
+                           (os.pathsep.join(['/usr/bin', str(home / 'bin')]),     # already there: not again
+                            [str(home / '.local/bin'), '/usr/bin', str(home / 'bin')])):
+            with self.subTest(path=path), mock.patch.dict(os.environ, {'PATH': path}), \
+                    mock.patch.object(eng.Path, 'home', lambda: home):
+                seen.clear()
+                self.assertEqual(self.run_main(self.cfg, check=check)[0], 0)
+                self.assertEqual(seen[0].split(os.pathsep), want)
+                self.assertEqual(os.environ['PATH'], path, 'restored after the call')
+        shutil.rmtree(home / 'bin')
+        with mock.patch.dict(os.environ, {'PATH': '/usr/bin'}), mock.patch.object(eng.Path, 'home', lambda: home):
+            seen.clear()
+            self.run_main(self.cfg, check=check)
+            self.assertEqual(seen[0].split(os.pathsep), [str(home / '.local/bin'), '/usr/bin'], 'a missing dir is not added')
 
     def test_an_exception_restores_stdout(self):
         def boom(*a, **kw):

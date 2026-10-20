@@ -73,7 +73,8 @@ The others take no lock.
   --no-park requires.
 
 main(profile, argv, lock_module=...) takes the project's own loaded hil_lock instance in
-place of the engine's (module identity, test isolation); there is no lock-dir option.
+place of the engine's (module identity, test isolation); there is no lock-dir option. The
+engine loads hil_lock, hil_process, hil_report_core and hil_remote_core (RIG_PATH) beside it.
 """
 
 from __future__ import annotations
@@ -107,6 +108,7 @@ def _load(name):
 hil_lock = _load('hil_lock')
 hil_process = _load('hil_process')
 report_core = _load('hil_report_core')
+remote_core = _load('hil_remote_core')
 
 REASON = 'farm_check'
 HOLDER = 'hil_farm_check'
@@ -823,9 +825,12 @@ def _lock_api_problem(module):
 
 def main(profile, argv=None, *, state_dir=None, host=None, lock_module=None) -> int:
     """The launcher's entry point: returns the exit status (module docstring). `lock_module`
-    is the project's own hil_lock instance, used for this call in place of the engine's."""
+    is the project's own hil_lock instance, used for this call in place of the engine's. The
+    user bin dirs go on PATH for the call (_user_bins_on_path). The report's `_hil.roster` is
+    the roster's portable identity (hil_report_core.roster_identity); the document's `config`
+    keeps its real path."""
     global hil_lock
-    saved = hil_lock
+    saved, path = hil_lock, os.environ.get('PATH')
     if lock_module is not None:
         problem = _lock_api_problem(lock_module)
         if problem:
@@ -833,9 +838,24 @@ def main(profile, argv=None, *, state_dir=None, host=None, lock_module=None) -> 
             return 2
         hil_lock = lock_module
     try:
+        _user_bins_on_path()
         return _main(profile, argv, state_dir, host)
     finally:
         hil_lock = saved
+        if path is None:
+            os.environ.pop('PATH', None)
+        else:
+            os.environ['PATH'] = path
+
+
+def _user_bins_on_path() -> None:
+    """The rig's PATH prefix (hil_remote_core.RIG_PATH) ahead of PATH, in its order: flasher
+    CLIs live in those user bin dirs, which a non-login shell may lack. A dir is added only
+    when it exists and is not on PATH already."""
+    for d in reversed(remote_core.RIG_PATH.replace('$HOME', str(Path.home())).split(':')):
+        if os.path.isdir(d) and d not in os.environ.get('PATH', '').split(os.pathsep):
+            os.environ['PATH'] = f'{d}{os.pathsep}{os.environ.get("PATH", "")}'
+
 
 
 def _main(profile, argv, state_dir, host) -> int:
@@ -851,7 +871,7 @@ def _main(profile, argv, state_dir, host) -> int:
                 raise Refused('--no-park: the profile defines no verified "leave running" final state')
             cfg, boards = _roster(profile, host, args)
             try:
-                roster = {'path': os.path.realpath(cfg), 'digest': _sha256(cfg)}
+                config, roster = os.path.realpath(cfg), report_core.roster_identity(cfg)
             except OSError as e:
                 raise Refused(f'roster {cfg}: {e}')
             sdir = None if args.scan_only else _state_dir(state_dir or default_state_dir())
@@ -871,9 +891,9 @@ def _main(profile, argv, state_dir, host) -> int:
         except Refused as e:
             print(f'farm check: refused: {e}', file=sys.stderr)
             return 2
-        say(f'farm check: host {host}, config {roster["path"]}, {len(boards)} boards, {mode}')
+        say(f'farm check: host {host}, config {config}, {len(boards)} boards, {mode}')
         rows, aborted = check_farm(profile, boards, args, state_dir=sdir, prepared=prepared)
-    doc = farm_document(host, roster['path'], mode, rows, info, time.monotonic() - _t0)
+    doc = farm_document(host, config, mode, rows, info, time.monotonic() - _t0)
     code = exit_status(doc, aborted)
     meta = report_core.make_meta(FARM_SCHEMA, attempt,
                                  termination='aborted' if aborted else 'completed' if boards else 'no-boards',

@@ -660,6 +660,21 @@ class StlinkLm4flashEsptool(unittest.TestCase):
                          (0, 'NO_COLOR=1 TERM=xterm-256color args: --chip esp32s3 -p /dev/null -b 1500000 '
                              '--before=default_reset --after=hard_reset write_flash 0x0 a.bin\n'))
 
+    def test_esptool_inputs_are_checked_before_a_lock(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ('bootloader.bin', 'app.bin'):
+                (Path(d) / name).write_bytes(b'x')
+            args = '--flash_mode dio --flash_freq=80m 0x0 bootloader.bin 0x10000 app.bin'
+            self.assertEqual(hf.esptool_input_problem('esp32s3', args, d), '')
+            for chip, flash_args, cwd, why in (
+                    ('', args, d, 'chip'), ('esp32; reboot', args, d, 'chip'), (None, args, d, 'chip'),
+                    ('esp32', args, str(Path(d) / 'nope'), 'not a directory'), ('esp32', args, None, 'not a directory'),
+                    ('esp32', '0x0 "unterminated', d, 'flash_args'), ('esp32', '--flash_mode dio', d, 'pairs'),
+                    ('esp32', '0x0 app.bin 0x1000', d, 'pairs'), ('esp32', 'zero app.bin', d, "offset 'zero'"),
+                    ('esp32', '0x0 gone.bin', d, 'gone.bin, which is missing')):
+                with self.subTest(chip=chip, flash_args=flash_args, cwd=cwd):
+                    self.assertIn(why, hf.esptool_input_problem(chip, flash_args, cwd))
+
     def test_timeout_is_explicit_everywhere(self):
         for fn, args in ((hf.flash_stlink, ({}, 'fw')), (hf.reset_stlink, ({},)), (hf.flash_openocd, ({}, 'fw')),
                          (hf.reset_openocd, ({},)), (hf.flash_lm4flash, ({}, 'fw')),

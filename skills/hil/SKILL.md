@@ -211,7 +211,7 @@ recovery stay the contract's.
 |---|---|
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (`farm-check` skill) |
-| `hil_report_core.py` | the report document: `_hil` metadata, attempt archive and withdrawal, the Markdown view, run and sequence verdicts |
+| `hil_report_core.py` | the report document: `_hil` metadata and roster identity, attempt archive, withdrawal and publish recovery, adopting a fetched report, the Markdown view, run and sequence verdicts |
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
 | `hil_usbtest.py` | usbtest binding and bounded testusb case runs |
@@ -230,10 +230,11 @@ recovery stay the contract's.
   higher ancestor trusted and unchanged while any receipt names the directory.
 - A report is published through `hil_report_core`: the JSON is authoritative
   and the Markdown a view `prepare_pair` regenerates from it. An attempt that
-  cannot publish withdraws the live report (`withdraw_current`), so a
-  predecessor's result never reads as this run's. `apply_run_rules` and
-  `sequence_verdict` give the Verdicts and Caller rules below for one attempt
-  and for a retry sequence.
+  cannot publish recovers through `recover_publish` (a Markdown repair, or a
+  withdrawal of the live report), so a predecessor's result never reads as
+  this run's; a report published on a rig comes home through `adopt`.
+  `apply_run_rules` and `sequence_verdict` give the Verdicts and Caller rules
+  below for one attempt and for a retry sequence.
 - A remote attempt is created once, under its own lease, and launched once;
   it is never wiped by the core, and its retention is the project's.
 
