@@ -165,7 +165,7 @@ SPECIAL = PUNCTUATION + GLOB
 QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
 UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
 HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
-ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=')
+ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
 UNKNOWN = '\0'
 STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
               'plain words, or dispatch to a unit')
@@ -174,8 +174,8 @@ STDIN_PATH = re.compile(r'(^|/)(stdin|fd/\d+)$')
 WRITE_RULE = 'chief writes only its artifacts, named by a literal absolute path outside the task worktree; a worktree change goes to a writer'
 LINK_RULE = ('on Windows a link to the task worktree is a path this guard cannot follow; a link names a literal absolute '
              'source outside it') if os.name == 'nt' else \
-    ('a hard link to a task-worktree file lets a later write reach it through chief; a link names a literal absolute '
-     'source outside the worktree')
+    ('a link to the task worktree lets a later write reach it unseen (a hard link through chief\'s directory, a symlink '
+     'made in the same command); a link names a literal absolute source outside the worktree')
 
 
 class Denied(Exception):
@@ -298,7 +298,7 @@ class Guard:
         for k, w in enumerate(words[:-1]):
             if w in REDIRECTS and not (w == '>&' and words[k + 1].isdigit()):
                 self.writes(words[k + 1], 'the redirect')
-        if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)=.*winsymlinks', w) for w in words):
+        if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)\+?=.*winsymlinks', w) for w in words):
             raise Denied('winsymlinks makes links this guard cannot follow on Windows; dispatch the step to a unit')
         words, xargs, replace, bare = unwrap([w for k, w in enumerate(words)
                                               if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
@@ -510,20 +510,20 @@ def spelled(args, longs, letters, valued='', valued_longs=None):
     return None
 
 
-LN_VALUED = {'--suffix': 4, '--target-directory': 3}
+# cp's long options that take the next word as their value, with the shortest prefix getopt matches
+CP_VALUED = {'--suffix': 4, '--target-directory': 3, '--sparse': 4, '--no-preserve': 6}
 
 
 def link_sources(cmd, args, symlinks):
     """The paths a command links from. A hard link to a task-worktree file lets a later write reach it through chief's
-    exempt directory, which `resolved()` cannot detect; on Windows (symlinks) a symlink or an rsync reference directory
-    into the worktree is a path this guard cannot follow too. Elsewhere an ln symlink needs no check, as a write through
-    one resolves into the worktree and is denied at the write; cp counts both its link options in any getopt spelling."""
+    exempt directory, which `resolved()` cannot detect; a symlink lets a write in the same command reach it, as every
+    path is placed before any of the command runs; on Windows (symlinks) an rsync reference directory into the worktree
+    is a path this guard cannot follow too. cp counts both its link options in any getopt spelling."""
     if cmd == 'rsync':
         dest = r'--(link|copy|compare)-dest' if symlinks else r'--link-dest'
         return [a.split('=', 1)[1] if '=' in a else args[k + 1] for k, a in enumerate(args)
                 if re.fullmatch(dest + '(=.*)?', a) and ('=' in a or k + 1 < len(args))]
-    if cmd == 'link' or (cmd == 'ln' and (symlinks or not spelled(args, {'--symbolic': 4}, 's', 'St', LN_VALUED))) or \
-            (cmd == 'cp' and spelled(args, {'--link': 3, '--symbolic-link': 4}, 'ls', 'St')):
+    if cmd in ('link', 'ln') or (cmd == 'cp' and spelled(args, {'--link': 3, '--symbolic-link': 4}, 'ls', 'St', CP_VALUED)):
         operands, directories = getopt(args)
         # link, unlisted as a writer, names its target too; ln's lone operand is linked into the cwd
         return operands if cmd == 'link' or directories or len(operands) < 2 else operands[:-1]
@@ -726,8 +726,10 @@ def strip_wrapper_options(name, words):
 def forbidden_env(word):
     """An env assignment a tool runs as a command: a pager other than cat, or a variable git executes from."""
     name, _, value = word.partition('=')
-    if name in PAGER_ENV and value.translate(UNQUOTED) not in ('cat', ''):
-        raise Denied(f'`{name}={value.translate(UNQUOTED)}` runs a command as the pager; only cat passes')
+    append, name = name.endswith('+'), name.removesuffix('+')
+    # an append extends a value this guard cannot see
+    if name in PAGER_ENV and (append or value.translate(UNQUOTED) not in ('cat', '')):
+        raise Denied(f'`{word.translate(UNQUOTED)}` runs a command as the pager; only `{name}=cat` passes')
     if name in RUN_ENV or name.startswith('GIT_CONFIG'):
         raise Denied(f'`{name}` makes a tool run a command this guard cannot vet; dispatch the step to a unit')
 

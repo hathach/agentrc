@@ -319,6 +319,19 @@ class ChiefGuard(unittest.TestCase):
         for c in ('GIT_PAGER=cat git log', 'PAGER=cat git log', 'env GIT_PAGER=cat git log', 'GIT_DIR=/tmp/r git log'):
             self.assert_allowed(c)
 
+    def test_append_assignments_are_assignments(self):
+        # bash's `NAME+=value` prefixes a command as `NAME=value` does: read as a program word, it hid the command
+        self.assert_denied(f'REVIEW_VAR+=x rm {self.wt}/src/a.c', 'literal absolute path')
+        for c in ('X+=1 git push', 'env X+=1 git push', 'X+=1 Y=2 git push'):
+            self.assert_denied(c, 'changes the repository')
+        # an append extends a pager this guard cannot see, even with cat
+        for c in ('GIT_PAGER+=less git log', 'PAGER+=cat git log', 'export GIT_PAGER+=cat'):
+            self.assert_denied(c, 'pager')
+        for c in ('GIT_SSH_COMMAND+=x git fetch', 'GIT_CONFIG_COUNT+=1 git status', 'export TAR_OPTIONS+=x'):
+            self.assert_denied(c, 'cannot vet')
+        for c in ('X+=1 git status', 'export PATH+=:/tmp/bin', 'X+=1'):
+            self.assert_allowed(c)
+
     def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):
         for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
                   'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',
@@ -331,7 +344,7 @@ class ChiefGuard(unittest.TestCase):
                   'git grep -o chief -- src', 'git grep -n chief'):
             self.assert_allowed(c)
 
-    def test_hard_link_sources_must_be_literal_paths_outside_the_worktree(self):
+    def test_link_sources_must_be_literal_paths_outside_the_worktree(self):
         chief, root = (self.project / '.git' / 'chief').as_posix(), self.root.as_posix()
         for c in (f'ln {self.wt}/src/a.c {chief}/h', f'ln {self.wt}/src/a.c /tmp/h', f'link {self.wt}/src/a.c /tmp/h',
                   f'cp -l {self.wt}/src/a.c /tmp/h', f'cp --link {self.wt}/src/a.c /tmp/h',
@@ -344,16 +357,18 @@ class ChiefGuard(unittest.TestCase):
                   f'cp --symbolic-link {self.wt}/src/a.c /tmp/h', f'cp -as {self.wt}/src/a.c /tmp/h', f'cp -al {self.wt}/src /tmp/s',
                   # an -s that is the value of -S or --suffix leaves ln making a hard link
                   f'ln -S -s {self.wt}/src/a.c /tmp/h', f'ln -fS -s {self.wt}/src/a.c /tmp/h',
-                  f'ln --suffix -s {self.wt}/src/a.c /tmp/h', f'ln --suff --symbolic {self.wt}/src/a.c /tmp/h'):
+                  f'ln --suffix -s {self.wt}/src/a.c /tmp/h', f'ln --suff --symbolic {self.wt}/src/a.c /tmp/h',
+                  # a long option's value is the next word: -S is --suffix's, so -l still makes a hard link
+                  f'cp --suffix -S -l {self.wt}/src/a.c /tmp/hard && printf changed > /tmp/hard',
+                  f'cp --su -S --link {self.wt}/src/a.c /tmp/h', f'cp --target-directory -S -l {self.wt}/src/a.c',
+                  # every path is placed before the command runs: a write cannot see the symlink made before it
+                  f'ln -s {self.wt}/src /tmp/link && printf changed > /tmp/link/a.c',
+                  f'ln -s {self.wt}/src /tmp/l', f'ln -S~ -s {self.wt}/src /tmp/l', f'ln --suffix=x -s {self.wt}/src /tmp/l',
+                  # a relative symlink names a path from the link's directory, which this does not place
+                  'ln -s src /tmp/l', 'ln -s ../x /tmp/l'):
             self.assert_denied(c, 'would link')
-        # a symlink is caught at the write instead, but on Windows resolve() cannot see an MSYS one
-        for c in (f'ln -s {self.wt}/src /tmp/l', f'ln -S~ -s {self.wt}/src /tmp/l', f'ln --suffix=x -s {self.wt}/src /tmp/l'):
-            if os.name == 'nt':
-                self.assert_denied(c, 'would link')
-            else:
-                self.assert_allowed(c)
-        # a copy and a hard link from outside are fine
-        for c in (f'cp {self.wt}/src/a.c /tmp/h', 'ln /tmp/a /tmp/b',
+        # a copy and a link from outside are fine
+        for c in (f'cp {self.wt}/src/a.c /tmp/h', 'ln /tmp/a /tmp/b', 'ln -s /tmp/a /tmp/b', 'cp --suffix -S /tmp/a /tmp/b',
                   'cp -l /tmp/a /tmp/b', 'rsync -a --link-dest=/tmp/prev /tmp/a/ /tmp/b/'):
             self.assert_allowed(c)
 
@@ -609,6 +624,7 @@ class ChiefGuard(unittest.TestCase):
                   f'ln {self.msys()}/src/a.c /tmp/a.c', 'ln -s src /tmp/l', f'ln -s -t /tmp {self.wt}/src',
                   f'cp -s {self.wt}/src/a.c /tmp/a.c', f'cp -al {self.wt}/src /tmp/s', f'cp --link {self.wt}/src/a.c /tmp/a.c',
                   'MSYS=winsymlinks:nativestrict ln -s /tmp/a /tmp/b', 'export MSYS=winsymlinks:native',
+                  'MSYS+=winsymlinks:native ln -s /tmp/a /tmp/b', 'export CYGWIN+=winsymlinks',
                   'env CYGWIN=winsymlinks:lnk ln -s /tmp/a /tmp/b',
                   # getopt abbreviations and clusters, coreutils link, rsync's reference directories
                   f'cp --l {self.wt}/src/a.c /tmp/a.c', f'cp --lin {self.wt}/src/a.c /tmp/a.c', f'cp --sym {self.wt}/src/a.c /tmp/a.c',
