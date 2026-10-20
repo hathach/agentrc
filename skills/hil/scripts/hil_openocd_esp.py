@@ -388,6 +388,7 @@ class Session:
         except TimeoutError:
             raise _Stop(f'{cmd!r} still outstanding after the timeout', timed_out=True) from None
         except (OSError, esp_session.ToolError) as e:
+            esp_session.wait_exit(self.proc.pid, self.proc, 1)    # a dying server's port closes before it is reaped
             raise _Stop(f'{cmd!r}: {e}') from None
         finally:
             step['log'], events = _log_since(self.log, mark)    # never raises over an interrupt
