@@ -458,10 +458,11 @@ def read_fetch(stream, members, into):
     """Unpack a fetch stream of members (a tree ends in /) into the empty local dir into and
     return each member's outcome, or None when the stream is malformed or contradicts itself:
     an entry not asked for, of the wrong type (a file member must arrive as a file, a tree as a
-    directory) or twice, a status entry that is not one JSON object of strings, or an `ok`
-    member that never arrived. Nothing is published from here: into is only staging."""
+    directory) or twice, a status entry that is not one JSON object of strings, an `ok` member
+    that never arrived, or an `absent` one some of whose entries did. Nothing is published from
+    here: into is only staging."""
     wanted = {m.rstrip('/'): m.endswith('/') for m in members}
-    received, seen, status = set(), set(), None
+    received, seen, sent, status = set(), set(), set(), None
     try:
         with tarfile.open(fileobj=stream, mode='r|') as tar:
             for ti in tar:
@@ -481,8 +482,12 @@ def read_fetch(stream, members, into):
                     if wanted[ti.name] != ti.isdir():
                         return None
                     received.add(ti.name)
-                elif not any(is_tree and ti.name.startswith(m + '/') for m, is_tree in wanted.items()):
-                    return None
+                    sent.add(ti.name)
+                else:
+                    owner = next((m for m, is_tree in wanted.items() if is_tree and ti.name.startswith(m + '/')), None)
+                    if owner is None:
+                        return None
+                    sent.add(owner)
                 path = _local(into, ti.name, create=True)
                 if ti.isdir():
                     path.mkdir(exist_ok=True)
@@ -493,15 +498,33 @@ def read_fetch(stream, members, into):
         return None
     if status is None:
         return None
-    if any(status.get(m) == 'ok' and m.rstrip('/') not in received for m in members):
+    if any(status.get(m) == 'ok' and m.rstrip('/') not in received or
+           status.get(m) == 'absent' and m.rstrip('/') in sent for m in members):
         return None
     return {m: status.get(m, 'transport') for m in members}
 
 
+# A fetched member's outcome, beside `error: <why>` for a failed read on the rig and
+# `vanished: <why>` for a tree something left while it was sent: ok; absent (the member itself
+# is not in the tree); unsafe (reached through a link, or a link itself); not-a-file (a file
+# member that is not a regular file); truncated (shorter than its size when sent); replaced
+# (the tree is not this session's); transport (the session or its stream failed).
+OUTCOMES = ('ok', 'absent', 'unsafe', 'not-a-file', 'truncated', 'replaced', 'transport')
+
+
+class CopyBack(tuple):
+    """copy_back's (copied, incomplete), with .outcomes: {member: outcome} of every member."""
+
+    def __new__(cls, copied, incomplete, outcomes):
+        self = super().__new__(cls, (copied, incomplete))
+        self.outcomes = outcomes
+        return self
+
+
 def _fetch(tree, members, into):
     """Stream members from the rig into the empty local dir into, under the tree's guard:
-    {member: ok | missing | unsafe | not-a-file | truncated | error: ... | replaced | transport}.
-    A malformed or inconsistent stream is a transport failure of every member."""
+    {member: OUTCOMES or `error: ...`}. A malformed or inconsistent stream is a transport failure
+    of every member."""
     cmd = (f'{{ {tree_guard(tree)}; }} || exit {TREE_REPLACED}; '
            f'exec {shlex.join(["python3", "-c", RIG_PY, "fetch", tree.dir, tree.token, *members])}')
     with tempfile.TemporaryFile() as err:
@@ -519,8 +542,10 @@ def _fetch(tree, members, into):
 
 
 def copy_back(tree, dest, groups=(), optional=()):
-    """Fetch tree artifacts into dest at the same relative paths: each group (files, and
-    directory trees named with a trailing /) all or none, each optional file when present.
+    """Fetch tree artifacts into dest at the same relative paths, in one guarded ssh session:
+    each group all or none, each optional member when present. A member is a file, or a
+    directory tree named with a trailing /; a fetched tree replaces the local one whole and is
+    never merged with it (merging, as of create-only archives, is the adapter's).
 
     Containment: every path is the adapter's, checked lexically, never one read from a fetched
     file. On the rig each component is opened relative to its already-open parent without
@@ -531,12 +556,14 @@ def copy_back(tree, dest, groups=(), optional=()):
     Locally a parent under dest that is a link or not a directory refuses the copy-back.
 
     A group lands only whole: half of a report pair would publish last run's table beside this
-    run's data. A stale local copy of a group that did not all arrive, or of an optional file
-    the tree lacks, is removed. Returns (copied, the dest-relative paths written; incomplete,
-    the groups that did not all arrive). A tree is named with its trailing / in both."""
+    run's data. A stale local copy of a group that did not all arrive, or of an optional member
+    that did not arrive, is removed. Nothing lands before the whole stream is validated.
+    Returns a CopyBack: (copied, the dest-relative members written; incomplete, the groups that
+    did not all arrive), its .outcomes telling an absent optional member from a failed fetch.
+    A tree is named with its trailing / throughout."""
     dest = Path(dest)
     groups = [[_artifact(m) for m in g] for g in groups]
-    optional = [check_relative(p, 'an artifact path') for p in optional]
+    optional = [r + '/' if t else r for r, t in map(_artifact, optional)]
     members = list(dict.fromkeys([*(r + '/' if t else r for g in groups for r, t in g), *optional]))
     for m in members:
         _local(dest, m.rstrip('/'))
@@ -566,15 +593,15 @@ def copy_back(tree, dest, groups=(), optional=()):
                 for rel, _ in group:
                     _remove(_local(dest, rel))
                 incomplete.append([r + ('/' if t else '') for r, t in group])
-        for rel in optional:
-            if rel in copied:
+        for m in optional:
+            if m in copied:
                 continue
-            _remove(_local(dest, rel))
-            if status.get(rel) == 'ok':
-                place(rel, rel)
+            _remove(_local(dest, m.rstrip('/')))
+            if status.get(m) == 'ok':
+                place(m.rstrip('/'), m)
     finally:
         _remove(stage)
-    return copied, incomplete
+    return CopyBack(copied, incomplete, status)
 
 
 # --- attempts ------------------------------------------------------------------------------------
@@ -864,16 +891,24 @@ def fetch(d, token, *members):
     tar = tarfile.open(fileobj=sys.stdout.buffer, mode='w|', format=tarfile.PAX_FORMAT)
     for m in members:
         is_tree, parts = m.endswith('/'), m.rstrip('/').split('/')
+        # absent only when the member itself cannot be found: the walk to it, or a file member's
+        # own open; anything gone from a tree whose root is already open vanished mid-fetch
         try:
             fd = walk(root, parts if is_tree else parts[:-1])
-            try:
-                outcome[m] = add_tree(tar, fd, m.rstrip('/')) if is_tree else add_file(tar, fd, parts[-1], m)
-            finally:
-                os.close(fd)
         except FileNotFoundError:
-            outcome[m] = 'missing'
+            outcome[m] = 'absent'
+            continue
         except OSError as e:
             outcome[m] = 'unsafe' if e.errno in (errno.ELOOP, errno.ENOTDIR) else f'error: {e}'
+            continue
+        try:
+            outcome[m] = add_tree(tar, fd, m.rstrip('/')) if is_tree else add_file(tar, fd, parts[-1], m)
+        except FileNotFoundError as e:
+            outcome[m] = f'vanished: {e}' if is_tree else 'absent'
+        except OSError as e:
+            outcome[m] = 'unsafe' if e.errno in (errno.ELOOP, errno.ENOTDIR) else f'error: {e}'
+        finally:
+            os.close(fd)
     data = json.dumps(outcome).encode()
     ti = tarfile.TarInfo(FETCH_RESULT)
     ti.size = len(data)
@@ -1090,7 +1125,7 @@ def _collector(dest):
 def _uncovered(held, groups, optional):
     """What a cached complete collection did not fetch of these requirements, by type: a group
     member needs that exact entry in the inventory (a tree with its /, so a file never answers
-    for a tree), an optional file needs to have been asked for as one."""
+    for a tree), an optional member to have been asked for as the same type."""
     copied = set(held.get('copied') or ())
     asked = set((held.get('requested') or {}).get('optional') or ())
     return [*(m for g in groups for m in g if m not in copied), *(o for o in optional if o not in asked)]
@@ -1099,16 +1134,17 @@ def _uncovered(held, groups, optional):
 def collect(tree, dest, groups=(), optional=()):
     """Fetch the attempt's artifacts and its own records into dest, whatever its state, and
     return the collection record written beside them (dest/collection.json): `complete` only
-    when the attempt was done before the fetch began and every group and the completion record
-    arrived, else `incomplete`. The record names the attempt (host, dir, token) and what was
+    when the attempt was done before the fetch began, every group and the completion record
+    arrived and every optional member arrived or is absent (not lost to a failed fetch), else
+    `incomplete`; the record keeps each member's outcome. The record names the attempt (host, dir, token) and what was
     asked for. A complete collection is final: collecting it again returns it unfetched when it
     covers what is asked, and refuses when it does not; partial evidence never replaces it. A
     dest holding another attempt's collection, or files without a record, refuses. Collectors
     of one dest are serialised by a lock beside it, across the check and the publication."""
     dest = Path(dest)
     groups = [[f'{r}/' if t else r for r, t in map(_artifact, g)] for g in groups]
-    optional = [check_relative(o, 'an artifact path') for o in optional]
-    if COLLECTION in [m.rstrip('/') for g in groups for m in g] + optional:
+    optional = [f'{r}/' if t else r for r, t in map(_artifact, optional)]
+    if COLLECTION in [m.rstrip('/') for g in groups for m in g] + [o.rstrip('/') for o in optional]:
         fail(f'{COLLECTION} is the collection record itself, not an artifact path')
     identity = {'host': tree.host, 'dir': tree.dir, 'token': tree.token}
     with _collector(dest):
@@ -1133,12 +1169,14 @@ def collect(tree, dest, groups=(), optional=()):
         _remove(tmp)
         tmp.mkdir()
         try:
-            copied, incomplete = copy_back(tree, tmp, groups, (*RECORD_FILES, *optional))
-            complete = st['state'] == 'done' and not incomplete and f'{RECORDS}/done.json' in copied
+            got = copy_back(tree, tmp, groups, (*RECORD_FILES, *optional))
+            copied, incomplete = got
+            complete = (st['state'] == 'done' and not incomplete and f'{RECORDS}/done.json' in copied
+                        and all(got.outcomes.get(o) in ('ok', 'absent') for o in (*RECORD_FILES, *optional)))
             record = {'state': 'complete' if complete else 'incomplete', 'remoteState': st['state'],
                       'remote': tree.spec(), 'identity': identity,
                       'requested': {'groups': groups, 'optional': optional},
-                      'copied': copied, 'missing': incomplete, 'collectedAt': time.time()}
+                      'copied': copied, 'missing': incomplete, 'outcomes': got.outcomes, 'collectedAt': time.time()}
             write_json(tmp / COLLECTION, record)
             _remove(dest)
             tmp.rename(dest)

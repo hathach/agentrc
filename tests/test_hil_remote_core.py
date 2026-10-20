@@ -65,6 +65,9 @@ with open(os.environ['FAKE_LOG'], 'a') as f:
 down, drop = os.environ.get('FAKE_SSH_DOWN'), os.environ.get('FAKE_SSH_DROP')
 if down and down in cmd:
     sys.exit(255)
+prelude = os.environ.get('FAKE_FETCH_PRELUDE')
+if prelude and "' fetch " in cmd:
+    cmd = cmd.replace("python3 -c 'TOKEN_FILE", "python3 -c '" + open(prelude).read() + "TOKEN_FILE", 1)
 canned = os.environ.get('FAKE_FETCH_TAR')
 if canned and "' fetch " in cmd:
     sys.stdout.buffer.write(open(canned, 'rb').read())
@@ -180,6 +183,23 @@ _os.open = _pausing_open
 '''
 
 
+# Prepended to the rig helper's fetch (single-quote free: it is spliced into the quoted program):
+# a file named b.json is deleted just before the walk opens it, after its tree was scanned.
+B_JSON_VANISHES = """
+import os as _o
+_open = _o.open
+
+
+def _vanishing(path, flags, mode=0o777, *, dir_fd=None):
+    if dir_fd is not None and path == "b.json":
+        _o.unlink(path, dir_fd=dir_fd)
+    return _open(path, flags, mode, dir_fd=dir_fd)
+
+
+_o.open = _vanishing
+"""
+
+
 def fake(path, body):
     path.write_text(body)
     path.chmod(0o755)
@@ -258,7 +278,8 @@ class Rig(unittest.TestCase):
             status = rc_.run_remote(tree, list(argv), env)
             if status == rc_.TREE_REPLACED:
                 return status, [], []
-            return (status, *rc_.copy_back(tree, self.root, groups, optional))
+            self.got = rc_.copy_back(tree, self.root, groups, optional)
+            return (status, *self.got)
 
 
 # a remote dir the guards accept, on any client OS; these tests never reach it
@@ -628,6 +649,46 @@ class CopyBack(Rig):
             self.assertFalse([c for c in self.calls() if "' fetch " in c['argv'][-1]], 'fetched anyway')
         self.assertEqual(list(elsewhere.iterdir()), [])
 
+    def test_an_optional_tree_comes_home_when_present(self):
+        self.setenv(FAKE_WRITE='report.json report.attempts/a1/report.json report.attempts/a1/report.md')
+        status, copied, incomplete = self.sync_run(groups=[('report.json',)], optional=['report.attempts/', 'x.failed'])
+        self.assertEqual((status, copied, incomplete), (0, ['report.json', 'report.attempts/'], []))
+        self.assertEqual(self.got.outcomes, {'report.json': 'ok', 'report.attempts/': 'ok', 'x.failed': 'absent'})
+        self.assertEqual(self.remote_files(self.root / 'report.attempts'), ['a1/report.json', 'a1/report.md'])
+
+    def test_an_absent_optional_tree_leaves_the_group_complete(self):
+        (self.root / 'report.attempts/old').mkdir(parents=True)
+        (self.root / 'report.attempts/old/report.json').write_text('a stale local archive')
+        self.setenv(FAKE_WRITE='report.json')
+        status, copied, incomplete = self.sync_run(groups=[('report.json',)], optional=['report.attempts/'])
+        self.assertEqual((copied, incomplete), (['report.json'], []))
+        self.assertEqual(self.got.outcomes['report.attempts/'], 'absent')
+        self.assertFalse((self.root / 'report.attempts').exists(), 'a stale local tree is removed, never merged')
+
+    def test_a_failed_fetch_is_not_an_absent_member(self):
+        self.setenv(FAKE_WRITE='report.json report.attempts/a1/report.json')
+        for case, env in (('the ssh session', {'FAKE_SSH_DOWN': "' fetch "}),
+                          ('the stream', {'FAKE_FETCH_TAR': str(self.tmp / 'canned.tar')})):
+            with self.subTest(case):
+                (self.tmp / 'canned.tar').write_bytes(stream((rc_.FETCH_RESULT, None)))
+                self.setenv(**env)
+                _, copied, incomplete = self.sync_run(groups=[('report.json',)], optional=['report.attempts/'])
+                self.assertEqual((copied, incomplete), ([], [['report.json']]))
+                self.assertEqual(self.got.outcomes, {'report.json': 'transport', 'report.attempts/': 'transport'})
+                for k in env:
+                    del os.environ[k]
+
+    def test_a_symlinked_optional_tree_is_refused(self):
+        self.outside()
+        fake(self.bin / 'ssh', FAKE_SSH.replace(
+            "['sh', '-c', cmd]", "['sh', '-c', ('ln -s ../outside \"$0/report.attempts\"; ' if 'exec env' in cmd else '') + cmd, "
+                                 f"{str(self.remote)!r}]"))
+        self.setenv(FAKE_WRITE='report.json')
+        _, copied, incomplete = self.sync_run(groups=[('report.json',)], optional=['report.attempts/'])
+        self.assertTrue((self.remote / 'report.attempts/sub/x.log').is_file(), 'the link resolves on the rig')
+        self.assertEqual((copied, incomplete, self.got.outcomes['report.attempts/']), (['report.json'], [], 'unsafe'))
+        self.assertFalse((self.root / 'report.attempts').exists())
+
     def test_a_malformed_stream_publishes_nothing(self):
         canned = self.tmp / 'canned.tar'
         for case, data in (('a directory named report.json', stream(('report.json', None), status_entry(**{'report.json': 'ok'}))),
@@ -766,8 +827,8 @@ class FetchStream(unittest.TestCase):
         self.assertEqual(self.read(stream(('report.json', b'{}'), ('run', None), ('run/a.log', b'x'),
                                           status_entry(**{'report.json': 'ok', 'run/': 'ok'}))),
                          {'report.json': 'ok', 'run/': 'ok'})
-        self.assertEqual(self.read(stream(status_entry(**{'report.json': 'missing'}))),
-                         {'report.json': 'missing', 'run/': 'transport'})
+        self.assertEqual(self.read(stream(status_entry(**{'report.json': 'absent'}))),
+                         {'report.json': 'absent', 'run/': 'transport'})
 
     def test_malformed_or_inconsistent_streams(self):
         for case, data in (
@@ -776,10 +837,12 @@ class FetchStream(unittest.TestCase):
                 ('a directory status entry', stream((rc_.FETCH_RESULT, None))),
                 ('ok without the artifact', stream(status_entry(**{'report.json': 'ok'}))),
                 ('a tree ok without its root', stream(('run/a.log', b'x'), status_entry(**{'run/': 'ok'}))),
-                ('an entry not asked for', stream(('other.json', b'x'), status_entry(**{'report.json': 'missing'}))),
+                ('an entry not asked for', stream(('other.json', b'x'), status_entry(**{'report.json': 'absent'}))),
                 ('an entry leaving its root', stream(('run/../../x', b'x'), status_entry())),
                 ('a member twice', stream(('report.json', b'1'), ('report.json', b'2'), status_entry(**{'report.json': 'ok'}))),
                 ('two status entries', stream(status_entry(), status_entry())),
+                ('absent, yet its entries arrived', stream(('run', None), ('run/a.log', b'x'), status_entry(**{'run/': 'absent'}))),
+                ('an absent file that arrived', stream(('report.json', b'{}'), status_entry(**{'report.json': 'absent'}))),
                 ('a null status entry before a valid one', stream((rc_.FETCH_RESULT, b'null'), status_entry())),
                 ('a nested directory twice', stream(('run', None), ('run/sub', None), ('run/sub', None),
                                                     status_entry(**{'run/': 'ok'}))),
@@ -1305,6 +1368,27 @@ class Attempts(Rig):
         r = subprocess.run(['python3', '-c', whole], capture_output=True, text=True)
         self.assertIn('MemoryError', r.stderr)
 
+    def test_a_descendant_vanishing_mid_fetch_is_no_absent_tree(self):
+        tree = self.done_attempt(write='out/run/a.json out/run/b.json')
+        got, code, err, _ = self.rig_fetch(tree, B_JSON_VANISHES, ['out/run/', 'out/nothing/'])
+        self.assertEqual(code, 0, err)
+        self.assertTrue(got['out/run/'].startswith('vanished: '), got)
+        self.assertEqual(got['out/nothing/'], 'absent')
+        # through collect: incomplete, so not cached, and a retry fetches what is left
+        (self.base / 'a1/out/run/b.json').write_text('again')
+        prelude = self.tmp / 'prelude.py'
+        prelude.write_text(B_JSON_VANISHES)
+        self.setenv(FAKE_FETCH_PRELUDE=str(prelude))
+        dest = self.tmp / 'got'
+        col = rc_.collect(tree, dest, optional=['out/run/'])
+        self.assertEqual(col['state'], 'incomplete')
+        self.assertTrue(col['outcomes']['out/run/'].startswith('vanished: '))
+        self.assertFalse((dest / 'out/run').exists(), 'part of a tree landed')
+        del os.environ['FAKE_FETCH_PRELUDE']
+        col = rc_.collect(tree, dest, optional=['out/run/'])
+        self.assertEqual((col['state'], col['outcomes']['out/run/']), ('complete', 'ok'))
+        self.assertEqual(self.remote_files(dest / 'out/run'), ['a.json'])
+
     def test_a_file_that_shrinks_while_fetched_is_reported_truncated(self):
         tree = self.create()
         (self.base / 'a1/out/run').mkdir()
@@ -1374,6 +1458,19 @@ class Attempts(Rig):
         with self.assertRaises(RemoteError) as e:
             rc_.collect(tree, dest, [('out/report.json/',)])
         self.assertIn('did not fetch out/report.json/', e.exception.code)
+        # optional trees, typed the same way
+        logs = self.tmp / 'trees'
+        trees = rc_.collect(tree, logs, optional=['out/', 'gone/'])
+        self.assertEqual((trees['state'], trees['outcomes']['out/'], trees['outcomes']['gone/']), ('complete', 'ok', 'absent'))
+        self.assertEqual(rc_.collect(tree, logs, optional=['out/', 'gone/']), trees)
+        for optional, short in ((['out'], 'out'), (['gone'], 'gone'), (['other/'], 'other/')):
+            with self.subTest(optional), self.assertRaises(RemoteError) as e:
+                rc_.collect(tree, logs, optional=optional)
+            self.assertIn(f'did not fetch {short}', e.exception.code)
+        (self.base / 'a1/esc').symlink_to(self.tmp)
+        esc = rc_.collect(tree, self.tmp / 'esc', optional=['esc/'])
+        self.assertEqual((esc['state'], esc['outcomes']['esc/']), ('incomplete', 'unsafe'),
+                         'an optional member lost to the fetch is not an absent one')
         other = self.done_attempt('a2')
         with self.assertRaises(RemoteError) as e:
             rc_.collect(other, dest, [('out/report.json',)])
