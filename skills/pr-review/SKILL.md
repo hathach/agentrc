@@ -16,6 +16,7 @@ exit 2 means the facts could not be read, and nothing is filled in.
 S=~/.claude/skills/pr-review/scripts
 python3 $S/prepare.py --pr N [--repo O/R] [--full]            # checkout top level: pin, worktree, mode
 python3 $S/prepare.py --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
+python3 $S/prepare.py --release --pr N --token T                # any worktree: unlock that run's review tree
 python3 $S/threads.py --pr N --out FILE                         # every comment and thread, bodies in FILE
 python3 $S/ledger.py show --pr N [--finding ID] [--draft] [--pending]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists
 python3 $S/ledger.py disputes --pr N --threads FILE --head SHA  # replies on our threads still to judge
@@ -42,6 +43,13 @@ judges new replies on our threads and returns `nothing-new` when there are
 none; if the human wants the head reviewed again, run `prepare.py --full` and
 save with `--reason`. An `overCap` answer merged everything into one group:
 say so before launching.
+
+A sibling tree is locked for the run, so herdr's removal of the checkout keeps
+it; `lock.token` names the lock. Pass `--token <it>` to a repeated prepare for the
+same run (`--full` after `same`), and release it with `--release` when no launch
+follows. A sibling another run of this PR has locked refuses, naming that run's
+token: once you know that run ended, release its lock with that token, then
+prepare again.
 
 When `tooling` is not empty, the PR changes code that runs when it is built or
 tested. Before asking anything, dispatch a read-only Sonnet unit in the review
@@ -130,6 +138,9 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
 6. Report the verdict and its reasons, the counts, coverage lost, the CI and
    HIL rows, the receipts, `post.py`'s `overLength` and the result's
    `heldThreads`; never the draft's text.
+7. When `lock.token` is set, `prepare.py --release --pr N --token <it>`,
+   whatever the run ended with. A run killed before this step keeps the lock,
+   and so the tree, until it is released by hand.
 
 ## 5. After the launch
 

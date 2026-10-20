@@ -67,8 +67,9 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   removed checkouts' branches are deleted when their commits are pushed or a
   PR head, never-pushed ones kept. `cowork --worktree` lanes and `pr-review`'s
   trees are siblings too; a cowork lane's stays locked, so kept, while a
-  request is outstanding. Worktrees nested inside the checkout, made outside
-  herdr or before it placed them as siblings, go with it whatever they hold.
+  request is outstanding, and a pr-review tree while its review runs.
+  Worktrees nested inside the checkout, made outside herdr or before it
+  placed them as siblings, go with it whatever they hold.
   The `worktree-remove` skill checks for pending follow-ups before it asks
   herdr to remove.
 

@@ -367,15 +367,17 @@ class Prepare(Case):
         p = self.prepare()
         self.assertEqual(p['worktree'], sibling.as_posix())
         self.assertEqual(sh(sibling, 'git', 'rev-parse', 'HEAD'), head)
-        self.herdr()  # an existing tree is reused without asking herdr
-        self.assertEqual(self.prepare()['worktree'], sibling.as_posix())
+        self.herdr()  # an existing tree is reused without asking herdr, under the lock of the run that prepared it
+        token = p['lock']['token']
+        q = self.prepare('--token', token)
+        self.assertEqual((q['worktree'], q['lock']), (sibling.as_posix(), {'state': 'held', 'token': token}))
         Path(sibling, 'src/core/a.c').write_text('local edit\n')
         with self.assertRaisesRegex(facts.Unusable, 'uncommitted changes'):
-            self.prepare()
+            self.prepare('--token', token)
         sh(sibling, 'git', 'checkout', '--', '.')
         sh(self.clone, 'git', 'worktree', 'add', '--quiet', '--detach', str(self.clone / '.worktrees' / f'pr-review-{PR}'))
         with self.assertRaisesRegex(facts.Unusable, 'both .* exist'):
-            self.prepare()
+            self.prepare('--token', token)
 
     @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_a_review_worktree_nests_unless_herdr_has_the_checkout_open_and_refuses_when_herdr_cannot_say(self):
@@ -400,6 +402,87 @@ class Prepare(Case):
             self.prepare()
         self.assertFalse(Path(nested).exists())
         self.assertFalse((self.tmp / f'clone--pr-review-{PR}').exists())
+
+    def release(self, token):
+        return self.call(prepare, ['--release', '--pr', str(PR), '--repo', REPO, '--token', token])
+
+    def reason(self, tree):
+        return prepare.locks().get(os.path.realpath(tree))
+
+    def sibling_run(self):
+        """A pinned PR whose next prepare places its tree beside the checkout."""
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_a_sibling_review_tree_is_locked_for_its_run_and_a_nested_one_is_not(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        p = self.prepare()
+        self.assertEqual(p['lock'], {'state': 'none', 'token': None})
+        self.assertEqual(prepare.locks(), {})
+        sh(self.clone, 'git', 'worktree', 'remove', p['worktree'])
+        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
+        q = self.prepare()
+        token = q['lock']['token']
+        self.assertEqual(q['lock']['state'], 'taken')
+        self.assertRegex(token, r'^[0-9a-f]{16}$')
+        self.assertEqual(self.reason(q['worktree']), f'pr-review {PR} running {token}')
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_another_run_holding_the_sibling_refuses_before_anything_is_checked_out(self):
+        self.sibling_run()
+        a = self.prepare()  # its launcher killed: nothing saved or published, the lock stays
+        token = a['lock']['token']
+        self.commit('src/core/a.c', 'int c;\n', 'c')
+        self.push_pr()
+        with self.assertRaisesRegex(facts.Unusable, f'locked by pr-review run {token} of PR {PR}: once you know that run '
+                                    f'ended, release it with prepare.py --release --pr {PR} --token {token}'):
+            self.prepare()
+        self.assertEqual(sh(a['worktree'], 'git', 'rev-parse', 'HEAD'), a['head'])
+        self.assertEqual(sh(self.clone, 'git', 'rev-parse', f'pr-review-{PR}'), a['head'])
+        self.assertEqual(self.reason(a['worktree']), f'pr-review {PR} running {token}')
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_release_unlocks_only_the_runs_own_lock_once_and_a_stale_release_is_refused(self):
+        self.sibling_run()
+        a = self.prepare()
+        old, tree = a['lock']['token'], Path(a['worktree']).resolve().as_posix()
+        self.assertEqual(self.release(old), {'pr': PR, 'token': old, 'released': [tree]})
+        self.assertIsNone(self.reason(tree))
+        self.assertEqual(self.release(old)['released'], [])
+        new = self.prepare()['lock']['token']
+        self.assertNotEqual(new, old)
+        with self.assertRaisesRegex(facts.Unusable, f'another pr-review run of PR {PR} holds .*: nothing released'):
+            self.release(old)
+        self.assertEqual(self.reason(tree), f'pr-review {PR} running {new}')
+        self.assertEqual(self.release(new)['released'], [tree])
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_a_foreign_lock_is_left_by_prepare_and_release(self):
+        self.sibling_run()
+        p = self.prepare()
+        token = p['lock']['token']
+        self.release(token)
+        for foreign in ('kept by hand', f'pr-review {PR + 1} running {token}'):
+            sh(self.clone, 'git', 'worktree', 'lock', '--reason', foreign, p['worktree'])
+            self.assertEqual(self.prepare()['lock'], {'state': 'foreign', 'token': None})
+            self.assertEqual(self.release(token)['released'], [])
+            self.assertEqual(self.reason(p['worktree']), foreign)
+            sh(self.clone, 'git', 'worktree', 'unlock', p['worktree'])
+
+    def test_release_refuses_a_tree_that_is_not_the_prs_review_tree_and_a_missing_or_malformed_token(self):
+        other = self.tmp / 'clone--elsewhere'
+        sh(self.clone, 'git', 'worktree', 'add', '--quiet', '--detach', str(other))
+        sh(self.clone, 'git', 'worktree', 'lock', '--reason', f'pr-review {PR} running abc123', str(other))
+        with self.assertRaisesRegex(facts.Unusable, f"carries run abc123's lock but is not a pr-review-{PR} tree"):
+            self.release('abc123')
+        self.assertEqual(self.reason(other), f'pr-review {PR} running abc123')
+        with self.assertRaisesRegex(facts.Unusable, '--release needs --token'):
+            self.call(prepare, ['--release', '--pr', str(PR), '--repo', REPO])
+        with self.assertRaisesRegex(facts.Unusable, '--token must be the hex token'):
+            self.release('abc 123')
 
     def test_a_symlinked_review_tree_is_refused_untouched(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')
