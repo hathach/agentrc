@@ -12,15 +12,17 @@ import ast
 import importlib.util
 import inspect
 import io
+import json
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
 
@@ -280,7 +282,7 @@ class RunWhileContract(unittest.TestCase):
 
 
 class RunCmdCleanupShape(unittest.TestCase):
-    """run_cmd's two cleanup paths, asserted structurally.
+    """run_cmd's two cleanup paths, asserted structurally on _run, its body.
 
     Both must kill the process GROUP: start_new_session puts the child in its own group, so
     a flasher run through a shell keeps children a p.kill() cannot reach, and on the
@@ -290,7 +292,7 @@ class RunCmdCleanupShape(unittest.TestCase):
     masked the caller's exception: a shape an AST can pin.
     """
 
-    def _ast(self, name='run_cmd'):
+    def _ast(self, name='_run'):
         src = Path(hp.__file__).read_text()
         return next(n for n in ast.walk(ast.parse(src))
                     if isinstance(n, ast.FunctionDef) and n.name == name)
@@ -301,8 +303,11 @@ class RunCmdCleanupShape(unittest.TestCase):
     def _calls(tree):
         return [getattr(c.func, 'attr', getattr(c.func, 'id', '')) for c in ast.walk(tree) if isinstance(c, ast.Call)]
 
+    def test_run_cmd_is_the_shared_body_and_nothing_more(self):
+        self.assertEqual(self._calls(self._ast('run_cmd')), ['_run'])
+
     def test_no_cleanup_try_has_an_else(self):
-        for name in ('run_cmd', '_kill_group'):
+        for name in ('_run', '_kill_group'):
             for n in ast.walk(self._ast(name)):
                 if isinstance(n, ast.Try) and n.orelse:
                     self.fail(f'{name}: try/else at line {n.lineno}: an else here runs when the kill SUCCEEDED')
@@ -453,14 +458,14 @@ class InterruptAcrossTheFork(unittest.TestCase):
         self._assert_group_gone(self.procs[0].pid)
 
     def test_run_cmd_sigint_right_after_popen_returns(self):
-        with self._signal_after_popen_returns(hp.run_cmd, signal.SIGINT):
+        with self._signal_after_popen_returns(hp._run, signal.SIGINT):
             with self.assertRaises(KeyboardInterrupt):
                 hp.run_cmd(self.shell_cmd, timeout=T)
         self._assert_group_gone(self.procs[0].pid)
 
     def test_run_cmd_sigterm_right_after_popen_returns(self):
         self._sigterm_raises()
-        with self._signal_after_popen_returns(hp.run_cmd, signal.SIGTERM):
+        with self._signal_after_popen_returns(hp._run, signal.SIGTERM):
             with self.assertRaises(SystemExit):
                 hp.run_cmd(self.shell_cmd, timeout=T)
         self._assert_group_gone(self.procs[0].pid)
@@ -611,6 +616,618 @@ class InterruptAcrossTheFork(unittest.TestCase):
         r, ra = results[0]
         self.assertEqual((r.returncode, r.stdout), (0, 'ok'))
         self.assertEqual((ra.returncode, ra.stdout), (0, b'ok'))
+
+# The prelude of every run_tracked case: hil_process loaded by file path as `hp`, the case's
+# state dir as `S`, scratch dir `D`, and report(), whose JSON line the test reads back.
+TRACKED_CHILD = """
+import ctypes, glob, importlib.util, json, os, shlex, signal, subprocess, sys, threading, time
+spec = importlib.util.spec_from_file_location('agentrc_hil_process', sys.argv[1])
+hp = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hp)
+D = sys.argv[2]
+S = os.path.join(D, 'state')
+os.mkdir(S, 0o700)
+
+
+def report(**kw):
+    print('\\nRESULT ' + json.dumps(kw), flush=True)
+
+
+def kill(*pids):
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, TypeError):
+            pass
+
+
+def wait_file(path, budget=10):
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        try:
+            with open(path) as f:
+                text = f.read()
+            if text.endswith('\\n'):
+                return int(text)
+        except OSError:
+            pass
+        time.sleep(0.005)
+    raise SystemExit(f'{path} never written')
+
+
+def settled(receipt, want='done', budget=10):
+    deadline = time.monotonic() + budget
+    while hp.recheck(receipt) != want and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return hp.recheck(receipt)
+
+
+def subreaper():
+    v = ctypes.c_int()
+    ctypes.CDLL(None).prctl(37, ctypes.byref(v), 0, 0, 0)     # PR_GET_CHILD_SUBREAPER
+    return v.value
+
+
+def surveyed(receipt):
+    return [p['pid'] for p in ((receipt or {}).get('survivors') or {}).get('processes', ())]
+"""
+
+# forks a child that starts its own session and exits at once, over and over, so at any moment
+# only the newest hop lives; the last one writes its pid to argv[1] and sleeps
+HOPPER = ('import os, sys, time\n'
+          'end = time.monotonic() + float(sys.argv[2])\n'
+          'while time.monotonic() < end:\n'
+          '    if os.fork():\n'
+          '        os._exit(0)\n'
+          '    os.setsid()\n'
+          'open(sys.argv[1], "w").write(f"{os.getpid()}\\n")\n'
+          'time.sleep(30)\n')
+
+# a process whose main thread leaves by pthread_exit while another thread lives: a zombie
+# thread-group leader that is still running
+THREAD_LEADER = ('import ctypes, os, sys, threading, time\n'
+                 'threading.Thread(target=time.sleep, args=(30,)).start()\n'
+                 'open(sys.argv[1], "w").write(f"{os.getpid()}\\n")\n'
+                 'ctypes.CDLL(None).pthread_exit(None)\n')
+
+
+@unittest.skipUnless(os.path.isdir('/proc'), 'reads processes from /proc')
+class RunTracked(unittest.TestCase):
+    """run_tracked's completion evidence from its operation-owned supervisor, with real
+    processes, each case in a fresh interpreter. Every case kills what it leaves behind; the
+    test kills anything it reported too."""
+
+    def child(self, body: str, timeout=90) -> dict:
+        with tempfile.TemporaryDirectory() as d:
+            r = subprocess.run([sys.executable, '-c', TRACKED_CHILD + textwrap.dedent(body),
+                                str(SCRIPTS / 'hil_process.py'), d], capture_output=True, text=True, timeout=timeout)
+        line = next((x for x in r.stdout.splitlines() if x.startswith('RESULT ')), None)
+        self.assertIsNotNone(line, f'rc {r.returncode}\n{r.stdout}\n{r.stderr}')
+        res = json.loads(line[len('RESULT '):])
+        for pid in res.get('leftovers', ()):
+            with suppress(ProcessLookupError, TypeError):
+                os.kill(pid, signal.SIGKILL)
+        res['stdout'] = r.stdout
+        return res
+
+    def test_a_clean_exit_is_done_and_leaves_no_files(self):
+        res = self.child("""
+            r = hp.run_tracked('printf ok', timeout=20, settle=5, state_dir=S)
+            r2 = hp.run_tracked(['sh', '-c', 'exit 3'], timeout=20, settle=5, state_dir=S, quiet=True)
+            r3 = hp.run_tracked(r"printf 'a\\377'; printf e >&2", timeout=20, settle=5, state_dir=S, binary=True,
+                                split_stderr=True)
+            report(a=[r.returncode, r.stdout, r.stderr, r.cleanup, r.receipt], b=[r2.returncode, r2.cleanup, r2.receipt],
+                   c=[r3.stdout.hex(), r3.stderr.hex(), r3.cleanup], files=os.listdir(S), subreaper=subreaper(),
+                   handlers=[signal.getsignal(signal.SIGINT) is signal.default_int_handler,
+                             signal.getsignal(signal.SIGTERM) is signal.SIG_DFL])
+        """)
+        self.assertEqual(res['a'], [0, 'ok', None, 'done', None])
+        self.assertEqual(res['b'], [3, 'done', None])
+        self.assertEqual(res['c'], [b'a\xff'.hex(), b'e'.hex(), 'done'])
+        self.assertEqual(res['files'], [])
+        self.assertEqual(res['subreaper'], 0, 'the caller became a subreaper')
+        self.assertEqual(res['handlers'], [True, True], "the caller's handlers were not restored")
+
+    def test_a_descendant_left_behind_is_pending_until_it_ends(self):
+        res = self.child("""
+            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.5, state_dir=S)
+            pid = int(r.stdout)
+            before = hp.recheck(r.receipt)
+            kill(pid)
+            report(rc=r.returncode, pid=pid, cleanup=r.cleanup, receipt=r.receipt, before=before,
+                   after=settled(r.receipt), subreaper=subreaper(), leftovers=[pid])
+        """)
+        self.assertEqual((res['rc'], res['cleanup'], res['before'], res['after']), (0, 'pending', 'pending', 'done'))
+        self.assertIn(res['pid'], [p['pid'] for p in res['receipt']['survivors']['processes']])
+        self.assertIsInstance(res['receipt']['supervisor']['start'], int)
+        self.assertEqual(res['subreaper'], 0)
+
+    def test_a_timeout_kill_is_done_once_the_group_is_gone(self):
+        res = self.child("""
+            t0 = time.monotonic()
+            r = hp.run_tracked('sleep 30 & sleep 30; wait', timeout=0.3, settle=5, state_dir=S)
+            report(rc=r.returncode, cleanup=r.cleanup, receipt=r.receipt, took=time.monotonic() - t0)
+        """)
+        self.assertEqual((res['rc'], res['cleanup'], res['receipt']), (124, 'done', None))
+        self.assertLess(res['took'], 10)
+        self.assertIn('COMMAND TIMEOUT (0.3s): sleep 30 & sleep 30; wait', res['stdout'])
+
+    def test_a_grandchild_in_its_own_session_is_owned(self):
+        """It outlives its parent and reparents to the supervisor: pending until it ends."""
+        res = self.child("""
+            out = []
+            for cmd, timeout in (('setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $!', 20),
+                                 ('setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $!; sleep 30', 0.5)):
+                r = hp.run_tracked(cmd, timeout=timeout, settle=0.5, state_dir=S)
+                pid = int(r.stdout.split()[0])
+                with open(f'/proc/{pid}/stat') as f:
+                    fields = f.read().rpartition(')')[2].split()
+                out.append({'rc': r.returncode, 'pid': pid, 'sid': int(fields[3]), 'ppid': int(fields[1]),
+                            'cleanup': r.cleanup, 'supervisor': r.receipt['supervisor']['pid'],
+                            'surveyed': surveyed(r.receipt)})
+                kill(pid)
+                out[-1]['after'] = settled(r.receipt)
+            report(out=out, leftovers=[o['pid'] for o in out])
+        """)
+        for case, rc in zip(res['out'], (0, 124)):
+            self.assertEqual((case['rc'], case['cleanup'], case['after']), (rc, 'pending', 'done'))
+            self.assertEqual(case['sid'], case['pid'], 'the grandchild did not start its own session')
+            self.assertEqual(case['ppid'], case['supervisor'], 'not reparented to the supervisor')
+            self.assertIn(case['pid'], case['surveyed'])
+
+    def test_a_descendant_forking_away_while_its_parent_exits_is_never_done(self):
+        """Each hop forks a new session leader and exits at once, the race that beat a /proc
+        scan; the wait sees every reparented hop."""
+        res = self.child(f"""
+            out = []
+            for _ in range(5):
+                pidfile = os.path.join(D, 'hop')
+                argv = [sys.executable, '-c', {HOPPER!r}, pidfile, '0.3']
+                r = hp.run_tracked(shlex.join(argv) + ' </dev/null >/dev/null 2>&1', timeout=20, settle=0.1,
+                                   state_dir=S)
+                last = wait_file(pidfile)
+                out.append({{'cleanup': r.cleanup, 'before': hp.recheck(r.receipt), 'last': last}})
+                kill(last)
+                out[-1]['after'] = settled(r.receipt)
+                os.unlink(pidfile)
+            report(out=out, leftovers=[o['last'] for o in out])
+        """)
+        for case in res['out']:
+            self.assertEqual((case['cleanup'], case['before'], case['after']), ('pending', 'pending', 'done'))
+
+    def test_a_zombie_leader_with_a_live_thread_is_pending(self):
+        res = self.child(f"""
+            pidfile = os.path.join(D, 'leader')
+            argv = [sys.executable, '-c', {THREAD_LEADER!r}, pidfile]
+            r = hp.run_tracked(shlex.join(argv) + ' </dev/null >/dev/null 2>&1 &', timeout=20, settle=0.5, state_dir=S)
+            pid = wait_file(pidfile)
+            with open(f'/proc/{{pid}}/stat') as f:
+                state = f.read().rpartition(')')[2].split()[0]
+            tasks = os.listdir(f'/proc/{{pid}}/task')
+            kill(pid)
+            report(cleanup=r.cleanup, state=state, tasks=len(tasks), after=settled(r.receipt), leftovers=[pid])
+        """)
+        self.assertEqual(res['state'], 'Z', 'the leader thread did not exit')
+        self.assertGreater(res['tasks'], 1)
+        self.assertEqual((res['cleanup'], res['after']), ('pending', 'done'))
+
+    def test_an_unreadable_survey_never_decides(self):
+        """The supervisor itself, driven directly with its /proc listing failing: the
+        survivor still keeps it pending, and done comes only from its wait."""
+        res = self.child("""
+            def unreadable(root):
+                raise PermissionError(13, 'Permission denied')
+            hp._survey = unreadable
+            rfd, wfd = os.pipe()
+            pidfile = os.path.join(D, 'gc')
+            job = {'cmd': f'setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {pidfile}', 'cwd': None,
+                   'timeout': 20, 'settle': 0.3, 'reap_grace': 2, 'binary': False, 'split_stderr': False,
+                   'report_fd': wfd, 'token': 't', 'lock': os.path.join(S, 'l'), 'record': os.path.join(S, 'r')}
+            msgs = []
+
+            def reader():
+                with os.fdopen(rfd) as f:
+                    for line in f:
+                        msgs.append(json.loads(line))
+                        if msgs[-1].get('cleanup') == 'pending':
+                            kill(wait_file(pidfile))
+            t = threading.Thread(target=reader)
+            t.start()
+            rc = hp._supervise(job)
+            t.join(10)
+            with open(job['record']) as f:
+                rec = json.load(f)
+            report(rc=rc, msgs=[{k: m.get(k) for k in ('cleanup', 'survivors')} for m in msgs if 'result' in m],
+                   record=rec['cleanup'], leftovers=[wait_file(pidfile)])
+        """)
+        self.assertEqual(res['rc'], 0)
+        self.assertEqual(res['msgs'], [{'cleanup': 'pending', 'survivors': None}])
+        self.assertEqual(res['record'], 'done')
+
+    def test_an_interrupt_during_the_first_wait_kills_and_carries_the_evidence(self):
+        res = self.child("""
+            def alarm(*_):
+                raise KeyboardInterrupt
+            signal.signal(signal.SIGALRM, alarm)
+            out = []
+            for cmd in ('sleep 30', f'setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {D}/gc; sleep 30'):
+                signal.setitimer(signal.ITIMER_REAL, 0.5)
+                t0 = time.monotonic()
+                try:
+                    hp.run_tracked(cmd, timeout=20, settle=0.5, state_dir=S)
+                    out.append('not interrupted')
+                except KeyboardInterrupt as e:
+                    o = {'cleanup': e.cleanup, 'receipt': e.receipt, 'took': time.monotonic() - t0}
+                    if e.receipt:
+                        o['gc'] = wait_file(f'{D}/gc')
+                        o['before'] = hp.recheck(e.receipt)
+                        kill(o['gc'])
+                        o['after'] = settled(e.receipt)
+                    out.append(o)
+            report(out=out, leftovers=[o.get('gc') for o in out if isinstance(o, dict)])
+        """)
+        killed, escaped = res['out']
+        self.assertEqual((killed['cleanup'], killed['receipt']), ('done', None))
+        self.assertLess(killed['took'], 10)
+        self.assertEqual((escaped['cleanup'], escaped['before'], escaped['after']), ('pending', 'pending', 'done'))
+
+    def test_an_interrupt_during_spawn_still_reaches_the_operation(self):
+        res = self.child("""
+            real = subprocess.Popen
+
+            def popen(*a, **k):
+                p = real(*a, **k)
+                signal.raise_signal(signal.SIGINT)      # deferred by the hold across the fork
+                return p
+            hp.subprocess.Popen = popen
+            try:
+                hp.run_tracked('sleep 30', timeout=20, settle=2, state_dir=S)
+                report(error='not interrupted')
+            except KeyboardInterrupt as e:
+                hp.subprocess.Popen = real
+                report(cleanup=e.cleanup, receipt=e.receipt, files=os.listdir(S))
+        """)
+        self.assertEqual((res['cleanup'], res['receipt'], res['files']), ('done', None, []))
+
+    def test_a_second_interrupt_while_waiting_for_the_report_is_unknown_with_a_receipt(self):
+        res = self.child("""
+            def alarm(*_):
+                raise KeyboardInterrupt
+            signal.signal(signal.SIGALRM, alarm)
+            signal.setitimer(signal.ITIMER_REAL, 0.5, 0.7)
+            try:
+                hp.run_tracked(f'setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {D}/gc; sleep 30',
+                               timeout=20, settle=5, state_dir=S)
+                report(error='not interrupted')
+            except KeyboardInterrupt as e:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                gc = wait_file(f'{D}/gc')
+                first = e.__context__
+                o = {'cleanup': e.cleanup, 'has_receipt': e.receipt is not None,
+                     'first': [getattr(first, 'cleanup', None), getattr(first, 'receipt', None) is not None],
+                     'before': hp.recheck(e.receipt)}
+                kill(gc)
+                report(after=settled(e.receipt), leftovers=[gc], **o)
+        """)
+        self.assertEqual((res['cleanup'], res['has_receipt'], res['first']), ('unknown', True, ['unknown', True]))
+        self.assertEqual((res['before'], res['after']), ('pending', 'done'))
+
+    def test_a_killed_supervisor_is_unknown(self):
+        res = self.child("""
+            r = hp.run_tracked('setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3,
+                               state_dir=S)
+            pid = int(r.stdout)
+            before = hp.recheck(r.receipt)
+            sup = r.receipt['supervisor']['pid']
+            kill(sup)
+            os.waitpid(sup, 0)
+            after = hp.recheck(r.receipt)
+            kill(pid)
+            report(cleanup=r.cleanup, before=before, after=after, leftovers=[pid])
+        """)
+        self.assertEqual((res['cleanup'], res['before'], res['after']), ('pending', 'pending', 'unknown'))
+
+    def test_a_late_report_is_unknown_and_recheck_follows_the_supervisor(self):
+        res = self.child("""
+            hp.SUPERVISOR_MARGIN = 0.5
+            stopped = []
+
+            def stop():
+                while not (recs := glob.glob(os.path.join(S, '*.json'))):
+                    time.sleep(0.005)
+                with open(recs[0]) as f:
+                    pid = json.load(f)['pid']
+                os.kill(pid, signal.SIGSTOP)
+                stopped.append(pid)
+            t = threading.Thread(target=stop)
+            t.start()
+            t0 = time.monotonic()
+            try:
+                hp.run_tracked('sleep 0.2', timeout=1, settle=0.2, reap_grace=0.5, state_dir=S)
+                report(error='no error')
+            except RuntimeError as e:
+                took = time.monotonic() - t0
+                t.join()
+                before = hp.recheck(e.receipt)
+                os.kill(stopped[0], signal.SIGCONT)
+                report(cleanup=e.cleanup, took=took, before=before, after=settled(e.receipt),
+                       supervisor=e.receipt['supervisor']['pid'] == stopped[0])
+        """)
+        self.assertEqual((res['cleanup'], res['before'], res['after'], res['supervisor']),
+                         ('unknown', 'pending', 'done', True))
+        self.assertLess(res['took'], 10)
+
+    def test_an_untrusted_state_dir_is_refused_before_anything_starts(self):
+        res = self.child("""
+            out = {}
+            open_dir = os.path.join(D, 'open')
+            os.mkdir(open_dir)
+            os.chmod(open_dir, 0o777)
+            loose = os.path.join(D, 'loose')
+            os.mkdir(loose)
+            os.chmod(loose, 0o770)
+            os.mkdir(os.path.join(loose, 'state'), 0o700)
+            sticky = os.path.join(D, 'sticky')
+            os.mkdir(sticky)
+            os.chmod(sticky, 0o1777)
+            os.mkdir(os.path.join(sticky, 'state'), 0o700)
+            for name, d in (('open', open_dir), ('loose parent', os.path.join(loose, 'state')),
+                            ('sticky parent', os.path.join(sticky, 'state'))):
+                try:
+                    r = hp.run_tracked(f'touch {D}/ran-{name.split()[0]}', timeout=20, settle=1, state_dir=d)
+                    out[name] = [r.cleanup, os.listdir(d)]
+                except PermissionError as e:
+                    out[name] = ['refused', e.cleanup, e.receipt, os.listdir(d)]
+            report(out=out, ran=sorted(x for x in os.listdir(D) if x.startswith('ran-')))
+        """)
+        self.assertEqual(res['out'], {'open': ['refused', 'done', None, []],
+                                      'loose parent': ['refused', 'done', None, []],
+                                      'sticky parent': ['done', []]})
+        self.assertEqual(res['ran'], ['ran-sticky'])
+
+    def test_a_replaced_lock_or_record_is_never_done(self):
+        """What a user who could write the state dir would do: an unlocked lock and a matching
+        `done` record put in place while the survivor lives."""
+        res = self.child("""
+            r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.3, state_dir=S)
+            pid = int(r.stdout)
+            os.unlink(r.receipt['lock'])
+            os.close(os.open(r.receipt['lock'], os.O_CREAT | os.O_WRONLY, 0o600))
+            st = os.stat(r.receipt['lock'])
+            os.unlink(r.receipt['record'])
+            with open(os.open(r.receipt['record'], os.O_CREAT | os.O_WRONLY, 0o600), 'w') as f:
+                json.dump({'token': r.receipt['token'], 'cleanup': 'done', 'lock': [st.st_dev, st.st_ino]}, f)
+            forged = hp.recheck(r.receipt)
+            kill(pid)
+            time.sleep(0.5)
+            report(cleanup=r.cleanup, forged=forged, after=hp.recheck(r.receipt), leftovers=[pid])
+        """)
+        self.assertEqual((res['cleanup'], res['forged'], res['after']), ('pending', 'unknown', 'unknown'))
+
+    def test_a_timeout_is_reported_by_the_runner_not_inferred_from_the_status(self):
+        """`exit 124` with a descendant holding the pipe is killed by the timeout: the banner
+        prints although the leader's own status is 124; a plain exit 124 prints none."""
+        res = self.child("""
+            out = {}
+            for name, run in (('cmd', lambda c, t: hp.run_cmd(c, timeout=t, quiet=True)),
+                              ('tracked', lambda c, t: hp.run_tracked(c, timeout=t, settle=1, state_dir=S, quiet=True))):
+                for cmd, t in (('sleep 30 & exit 124', 0.3), ('exit 124', 20)):
+                    import io, contextlib
+                    with contextlib.redirect_stdout(io.StringIO()) as cap:
+                        r = run(cmd, t)
+                    out[f'{name} {cmd}'] = [r.returncode, 'COMMAND TIMEOUT' in cap.getvalue()]
+            report(out=out)
+        """)
+        for name in ('cmd', 'tracked'):
+            self.assertEqual(res['out'][f'{name} sleep 30 & exit 124'], [124, True], name)
+            self.assertEqual(res['out'][f'{name} exit 124'], [124, False], name)
+
+    def test_an_interrupt_as_the_pipe_closes_stays_an_interrupt_with_the_evidence(self):
+        """SIGINT on the return of the pipe's close, after the descriptor is released: the
+        handler's close is a no-op, so the interrupt, not EBADF, escapes with the evidence."""
+        res = self.child("""
+            fired = []
+
+            def local(frame, event, arg):
+                if event == 'return' and not fired:
+                    fired.append(1)
+                    signal.raise_signal(signal.SIGINT)
+                return local
+
+            def tracer(frame, event, arg):
+                return local if frame.f_code is hp._Reports.close.__code__ else None
+            sys.settrace(tracer)
+            try:
+                hp.run_tracked(f'sleep 30 </dev/null >/dev/null 2>&1 & echo $! > {D}/gc', timeout=20, settle=0.3,
+                               state_dir=S)
+                sys.settrace(None)
+                report(error='not interrupted')
+            except BaseException as e:
+                sys.settrace(None)
+                gc = wait_file(f'{D}/gc')
+                o = {'type': type(e).__name__, 'cleanup': getattr(e, 'cleanup', None),
+                     'before': hp.recheck(e.receipt)}
+                kill(gc)
+                report(after=settled(e.receipt), fired=len(fired), leftovers=[gc], **o)
+        """)
+        self.assertEqual(res['fired'], 1)
+        self.assertEqual((res['type'], res['cleanup'], res['before'], res['after']),
+                         ('KeyboardInterrupt', 'pending', 'pending', 'done'))
+
+    def _interrupt_after(self, marker: str, nth: int, cmd: str, alarm: float | None) -> dict:
+        """SIGINT at the line after the `nth` line of run_tracked equal to `marker`, optionally
+        after a first interrupt by SIGALRM at `alarm`."""
+        return self.child(f"""
+            import inspect
+            src, first = inspect.getsourcelines(hp.run_tracked)
+            hits = [i for i, x in enumerate(src) if x.strip() == {marker!r}]
+            line = first + hits[{nth}] + 1
+            fired = []
+
+            def local(frame, event, arg):
+                if event == 'line' and frame.f_lineno == line and not fired:
+                    fired.append(1)
+                    signal.raise_signal(signal.SIGINT)
+                return local
+
+            def tracer(frame, event, arg):
+                return local if frame.f_code is hp.run_tracked.__code__ else None
+
+            def alarm(*_):
+                raise KeyboardInterrupt
+            signal.signal(signal.SIGALRM, alarm)
+            if {alarm!r}:
+                signal.setitimer(signal.ITIMER_REAL, {alarm!r})
+            sys.settrace(tracer)
+            try:
+                hp.run_tracked({cmd!r}, timeout=20, settle=1, state_dir=S)
+                sys.settrace(None)
+                report(error='not interrupted')
+            except KeyboardInterrupt as e:
+                sys.settrace(None)
+                report(fired=len(fired), cleanup=e.cleanup, receipt=e.receipt, files=os.listdir(S),
+                       recheck=None if e.receipt is None else settled(e.receipt))
+        """)
+
+    def test_an_interrupt_right_after_the_files_go_still_says_done(self):
+        for name, nth, cmd, alarm in (('normal completion', 0, 'true', None),
+                                      ('interrupted completion', 1, 'sleep 30', 0.5)):
+            with self.subTest(name):
+                res = self._interrupt_after('_tidy(receipt)', nth, cmd, alarm)
+                self.assertEqual(res['fired'], 1)
+                self.assertEqual((res['cleanup'], res['receipt'], res['files']), ('done', None, []))
+
+    def test_an_interrupt_before_the_verdict_is_known_keeps_the_files(self):
+        """Interrupted between the report and the verdict the caller can show: unknown, but
+        every file stays, so recheck still reaches done."""
+        res = self._interrupt_after("r, killed = _follow(sup, hold, reports, receipt, cmd, timeout, settle, reap_grace)",
+                                    0, 'true', None)
+        self.assertEqual(res['fired'], 1)
+        self.assertEqual((res['cleanup'], res['recheck']), ('unknown', 'done'))
+        self.assertEqual(len(res['files']), 3)
+
+    def test_an_interrupt_as_the_report_arrives_is_unknown_with_a_receipt(self):
+        res = self.child("""
+            real = hp._final
+
+            def interrupted(*a, **k):
+                hp._final = real
+                real(*a, **k)
+                raise KeyboardInterrupt
+            hp._final = interrupted
+            try:
+                hp.run_tracked('true', timeout=20, settle=1, state_dir=S)
+                report(error='not interrupted')
+            except KeyboardInterrupt as e:
+                report(cleanup=e.cleanup, has_receipt=e.receipt is not None, after=settled(e.receipt))
+        """)
+        self.assertEqual((res['cleanup'], res['has_receipt'], res['after']), ('unknown', True, 'done'))
+
+    def test_a_spawn_error_started_nothing(self):
+        res = self.child("""
+            try:
+                hp.run_tracked(['/nonexistent/hil-run-tracked'], timeout=20, settle=1, state_dir=S)
+            except FileNotFoundError as e:
+                report(cleanup=e.cleanup, receipt=e.receipt, filename=e.filename)
+        """)
+        self.assertEqual((res['cleanup'], res['receipt'], res['filename']), ('done', None, '/nonexistent/hil-run-tracked'))
+
+    def test_the_callers_other_children_are_not_the_operations(self):
+        res = self.child("""
+            pre = subprocess.Popen(['sleep', '30'])
+            other = []
+
+            def spawn():
+                time.sleep(0.2)
+                other.append(subprocess.Popen(['sleep', '30']))
+            t = threading.Thread(target=spawn)
+            t.start()
+            r = hp.run_tracked('sleep 0.6', timeout=20, settle=0.3, state_dir=S)
+            t.join()
+            kill(pre.pid, other[0].pid)
+            pre.wait()
+            other[0].wait()
+            report(result=[r.cleanup, r.receipt], leftovers=[pre.pid, other[0].pid])
+        """)
+        self.assertEqual(res['result'], ['done', None])
+
+    def test_bounds_and_state_dir_are_explicit(self):
+        with tempfile.TemporaryDirectory() as d:
+            for kw in ({'timeout': T, 'settle': 1}, {'timeout': T, 'state_dir': d}, {'settle': 1, 'state_dir': d}):
+                with self.subTest(kw=kw), self.assertRaises(TypeError):
+                    hp.run_tracked('true', **kw)
+            for kw in ({'timeout': None}, {'settle': None}, {'state_dir': None}):
+                with self.subTest(kw=kw), self.assertRaises(ValueError):
+                    hp.run_tracked('true', **{'timeout': T, 'settle': 1, 'state_dir': d, **kw})
+
+    def test_reports_are_read_bounded_and_malformed_ones_refused(self):
+        rfd, wfd = os.pipe()
+        reports = hp._Reports(rfd)
+        self.addCleanup(reports.close)
+        t0 = time.monotonic()
+        self.assertIsNone(reports.next(time.monotonic() + 0.2))
+        self.assertLess(time.monotonic() - t0, 5)
+        os.write(wfd, b'{"hello": {"start": 7}}\nnot json\n[1]\n{"result": {}, "cleanup": "done"}\n')
+        os.close(wfd)
+        deadline = time.monotonic() + 5
+        self.assertEqual(reports.next(deadline), {'hello': {'start': 7}})
+        self.assertIsNone(reports.next(deadline))
+        self.assertIsNone(reports.next(deadline))
+        self.assertEqual(reports.next(deadline), {'result': {}, 'cleanup': 'done'})
+        self.assertIsNone(reports.next(deadline), 'EOF')
+        reports.close()
+        reports.close()     # owned and idempotent: the descriptor is released once
+
+    def test_recheck_without_a_supervisor_is_unknown(self):
+        with tempfile.TemporaryDirectory() as top:
+            d = os.path.join(top, 'state')
+            os.mkdir(d, 0o700)
+            receipt = {'token': 't', 'lock': os.path.join(d, 'l'), 'record': os.path.join(d, 'r')}
+            self.assertEqual(hp.recheck(receipt), 'unknown')
+            os.close(os.open(receipt['lock'], os.O_CREAT | os.O_WRONLY, 0o600))
+            st = os.stat(receipt['lock'])
+            lock_id = [st.st_dev, st.st_ino]
+            self.assertEqual(hp.recheck(receipt), 'unknown')
+            record = Path(receipt['record'])
+            for text in ('{"token": "other", "cleanup": "done", "lock": %s}', '{"token": "t", "cleanup": "done"}',
+                         '{"token": "t", "cleanup": "pending", "lock": %s}', 'not json'):
+                record.write_text(text.replace('%s', json.dumps(lock_id)))
+                self.assertEqual(hp.recheck(receipt), 'unknown', text)
+            record.write_text(json.dumps({'token': 't', 'cleanup': 'done', 'lock': lock_id}))
+            record.chmod(0o600)
+            self.assertEqual(hp.recheck(receipt), 'done')
+            record.chmod(0o620)
+            self.assertEqual(hp.recheck(receipt), 'unknown', 'a record another user could write')
+            record.chmod(0o600)
+            self.assertEqual(hp.recheck({**receipt, 'supervisor': {'lock': [0, 0]}}), 'unknown', 'another lock')
+            os.chmod(d, 0o770)
+            self.assertEqual(hp.recheck(receipt), 'unknown', 'an untrusted state_dir')
+
+    def test_the_survey_lists_unreadable_entries_apart(self):
+        p = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        real_open = open
+
+        def guarded(path, *a, **k):
+            if path == f'/proc/{p.pid}/stat':
+                raise PermissionError(13, 'Permission denied')
+            return real_open(path, *a, **k)
+        self.assertIn(p.pid, [x['pid'] for x in hp._survey(os.getpid())['processes']])
+        with mock.patch('builtins.open', guarded):
+            got = hp._survey(os.getpid())
+        self.assertNotIn(p.pid, [x['pid'] for x in got['processes']])
+        self.assertIn(p.pid, got['unreadable'])
+
+    def test_the_supervisor_entry_refuses_other_usage(self):
+        r = subprocess.run([sys.executable, '-I', str(SCRIPTS / 'hil_process.py')], capture_output=True, text=True,
+                           timeout=T)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('--supervise', r.stderr)
+
+    def test_run_cmd_reports_no_evidence(self):
+        r = hp.run_cmd('true', timeout=T)
+        self.assertFalse(hasattr(r, 'cleanup') or hasattr(r, 'receipt'))
 
 
 if __name__ == '__main__':

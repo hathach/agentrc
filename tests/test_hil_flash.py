@@ -840,6 +840,123 @@ class Pyocd(unittest.TestCase):
             with mock.patch.dict(os.environ, {'PATH': td}):
                 self.assertRaises(RuntimeError, hf._pyocd_python)
 
+# A project's chain in miniature, in its own interpreter: the profile's flash step calls the
+# adapter (tinyusb's board-shaped flash_*), which calls the provider with its runner, run_tracked
+# through hil_flash's own hil_process instance. argv: hil_flash.py, the fake tools' dir; stdout's
+# last line is JSON.
+CHAIN = """
+import contextlib, importlib.util, io, json, os, signal, sys, time
+spec = importlib.util.spec_from_file_location('agentrc_hil_flash', sys.argv[1])
+hf = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hf)
+os.environ['PATH'] = sys.argv[2] + os.pathsep + os.environ['PATH']
+os.chdir(sys.argv[2])
+STATE = os.path.join(sys.argv[2], 'state')
+os.mkdir(STATE, 0o700)
+
+
+def run(cmd, cwd=None, timeout=None, **kw):
+    return hf.hil_process.run_tracked(cmd, cwd, timeout=timeout, settle=1, state_dir=STATE, reap_grace=2,
+                                      quiet=True, **kw)
+
+
+def adapter_flash(board, fw, timeout):
+    f = board['flasher']
+    if f['name'] == 'jlink':
+        return hf.flash_jlink(f, fw, timeout=timeout, crash_retries=2, run=run)
+    return hf.flash_lm4flash(f, fw, timeout=timeout, run=run)
+
+
+def profile_flash(board, fw, timeout=10):
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            op = adapter_flash(board, fw, timeout)
+    except BaseException as e:
+        op = e.operation
+    listed = [p for r in op.receipts for p in (r['survivors'] or {}).get('processes', ())]
+    for p in listed:
+        os.kill(p['pid'], signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while any(hf.hil_process.recheck(r) == 'pending' for r in op.receipts) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return {'kinds': [a.kind for a in op.attempts], 'rcs': [a.result.returncode for a in op.attempts],
+            'cleanups': [a.cleanup for a in op.attempts], 'cleanup': op.cleanup,
+            'survivors': [sorted(p['comm'] for p in (r['survivors'] or {}).get('processes', ())) for r in op.receipts],
+            'rechecked': [hf.hil_process.recheck(r) for r in op.receipts], 'leftovers': [p['pid'] for p in listed]}
+
+
+def alarm(*_):
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGALRM, alarm)
+lm4 = {'flasher': {'name': 'lm4flash', 'uid': 'S1', 'args': ''}}
+out = {fw: profile_flash(lm4, fw) for fw in ('clean.bin', 'daemon.bin', 'escape.bin')}
+out['slow.bin'] = profile_flash(lm4, 'slow.bin', timeout=0.5)
+signal.setitimer(signal.ITIMER_REAL, 0.5)
+out['interrupted'] = profile_flash(lm4, 'slow.bin')
+for uid in ('CLEAN', 'ESCAPE'):
+    out[uid] = profile_flash({'flasher': {'name': 'jlink', 'uid': uid, 'args': '-device x'}}, 'fw.hex')
+print('RESULT ' + json.dumps(out))
+"""
+
+LM4FLASH = """#!/bin/sh
+case "$*" in
+  *daemon.bin) sleep 30 </dev/null >/dev/null 2>&1 & ;;
+  *escape.bin) setsid sleep 30 </dev/null >/dev/null 2>&1 & ;;
+  *slow.bin) sleep 30 ;;
+esac
+echo flashed
+"""
+
+# crashes on its first run in each directory state, as libjlinkarm does before target access
+JLINKEXE = """#!/bin/sh
+case "$*" in *ESCAPE*) setsid sleep 30 </dev/null >/dev/null 2>&1 & ;; esac
+state="$PWD/jlink-$2"
+[ -e "$state" ] || { : > "$state"; kill -SEGV $$; }
+echo O.K.
+"""
+
+
+class TrackedChain(unittest.TestCase):
+    """The profile -> adapter -> provider -> runner chain with run_tracked and fake tools on
+    PATH, real processes throughout: the operation's cleanup is the supervisor's evidence, a
+    pending one resolves by recheck once its survivor ends, and a J-Link crash is rerun only
+    over a run proven ended."""
+
+    def test_the_operation_carries_the_runners_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, text in (('lm4flash', LM4FLASH), ('JLinkExe', JLINKEXE)):
+                tool = Path(d) / name
+                tool.write_text(text)
+                tool.chmod(0o755)
+            r = subprocess.run([sys.executable, '-c', CHAIN, str(SCRIPTS / 'hil_flash.py'), d],
+                               capture_output=True, text=True, timeout=120)
+        line = next((x for x in r.stdout.splitlines() if x.startswith('RESULT ')), None)
+        self.assertIsNotNone(line, f'rc {r.returncode}\n{r.stdout}\n{r.stderr}')
+        out = json.loads(line[len('RESULT '):])
+        for case in out.values():
+            for pid in case['leftovers']:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, 9)
+
+        def summary(case):
+            return case['kinds'], case['cleanups'], case['cleanup'], case['survivors']
+        self.assertEqual(summary(out['clean.bin']), (['exited'], ['done'], 'done', []))
+        for fw in ('daemon.bin', 'escape.bin'):
+            self.assertEqual(summary(out[fw]), (['exited'], ['pending'], 'pending', [['sleep']]), fw)
+            self.assertEqual(out[fw]['rechecked'], ['done'], 'the survivor was killed')
+        self.assertEqual(summary(out['slow.bin']), (['timed_out'], ['done'], 'done', []))
+        self.assertEqual(out['slow.bin']['rcs'], [124])
+        self.assertEqual(summary(out['interrupted']), (['interrupted'], ['done'], 'done', []))
+        self.assertEqual(out['interrupted']['rcs'], [None])
+        crash, ok = out['CLEAN']['rcs']
+        self.assertIn(crash, hf.JLINK_CRASH_RCS)
+        self.assertEqual((ok, out['CLEAN']['cleanups'], out['CLEAN']['cleanup']), (0, ['done', 'done'], 'done'))
+        self.assertEqual(len(out['ESCAPE']['rcs']), 1, 'a crash rerun started over a run not proven ended')
+        self.assertIn(out['ESCAPE']['rcs'][0], hf.JLINK_CRASH_RCS)
+        self.assertEqual((out['ESCAPE']['cleanup'], out['ESCAPE']['survivors']), ('pending', [['sleep']]))
+
 
 if __name__ == '__main__':
     unittest.main()
