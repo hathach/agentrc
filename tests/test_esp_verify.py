@@ -10,12 +10,13 @@ import signal
 import stat
 import subprocess
 import sys
-import tempfile
 import time
 import unittest
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills/target-debug/scripts/esp_verify.py'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import make_stub, pid_alive, tmpdir  # noqa: E402
 SPEC = importlib.util.spec_from_file_location('esp_verify', SCRIPT)
 esp_verify = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(esp_verify)
@@ -29,24 +30,6 @@ def native(path):
     # MSYS2's python uses '/' for os.sep; give Windows the backslash form an IDF venv path has
     return path.replace('/', '\\') if NT else path
 
-
-def alive(pid):
-    if not NT:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        return True
-    import ctypes
-    kernel32 = ctypes.WinDLL('kernel32')
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    handle = kernel32.OpenProcess(0x00100000, False, pid)    # SYNCHRONIZE
-    if not handle:
-        return False
-    try:
-        return kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0x102    # WAIT_TIMEOUT
-    finally:
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 # The headers/verdicts are from esptool 5.5.0 cmds.py:2671-2700; fatal exit is 2.
 FAKE_ESPTOOL = '''#!/usr/bin/env python3
@@ -121,9 +104,7 @@ if mode == 'late_failure':
 
 class VerifyTest(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name).resolve()  # esp_verify reports resolved image paths
+        self.root = tmpdir(self)  # esp_verify reports resolved image paths
         self.manifest = self.root / 'flasher_args.json'
         self.call = self.root / 'call.json'
         self.tool = self.root / 'fake esptool'
@@ -238,7 +219,7 @@ class VerifyTest(unittest.TestCase):
         self.assertIn('Connected to', result['stdout'])
         self.assertIn('ROM loader', result['chipState'])
         if NT:    # the whole tree: its child held the pipes
-            self.assertFalse(alive(int(child.read_text())))
+            self.assertFalse(pid_alive(int(child.read_text())))
 
     @unittest.skipUnless(NT, 'taskkill')
     def test_an_unlaunchable_taskkill_still_kills_the_tool(self):
@@ -257,12 +238,12 @@ class VerifyTest(unittest.TestCase):
         self.assertEqual(code, 3, result)
         self.assertIn('did not finish within 1 s', result['error'])
         self.assertIsNone(result['tool_exit'])
-        self.assertTrue(alive(int(child.read_text())))    # what taskkill would have ended
+        self.assertTrue(pid_alive(int(child.read_text())))    # what taskkill would have ended
         self.assertIn('a process it started survived and may still hold', result['error'])
 
     @staticmethod
     def reap(pid):
-        if alive(pid):
+        if pid_alive(pid):
             os.kill(pid, signal.SIGTERM if NT else signal.SIGKILL)
 
     def test_native_output_is_decoded_as_utf8_with_crlf_and_stray_bytes(self):
@@ -387,16 +368,9 @@ class VerifyTest(unittest.TestCase):
 
     @unittest.skipUnless(NT, 'Windows launcher')
     def test_path_fallback_is_path_only_on_windows(self):
-        try:
-            from pip._vendor.distlib.scripts import ScriptMaker
-        except ImportError:
-            self.skipTest('the launcher comes from pip (its vendored distlib)')
-        shutil.copy(self.tool, self.root / 'esptool.py')
         for target in ('bin', 'cwd'):
-            maker = ScriptMaker(str(self.root), str(self.root / target))
-            maker.executable = sys.executable
-            maker.variants = {''}
-            self.assertEqual(maker.make('esptool.py'), [os.path.join(self.root, target, 'esptool.exe')])
+            (self.root / target).mkdir()
+            make_stub(self.root / target, 'esptool', FAKE_ESPTOOL.split('\n', 1)[1])
         self.env.pop('ESP_VERIFY_ESPTOOL')
         # the cwd's esptool.exe (a checkout's) is a decoy that shutil.which and CreateProcess would run first
         code, result = self.run_cli(cwd=str(self.root / 'cwd'), PATH=str(self.root / 'bin'))

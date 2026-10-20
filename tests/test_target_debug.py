@@ -14,7 +14,6 @@ import json
 import struct
 import os
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -27,6 +26,8 @@ from unittest import mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'pc_sample.py'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import make_stub  # noqa: E402
 _spec = importlib.util.spec_from_file_location('pc_sample', SCRIPT)
 pc_sample = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pc_sample)
@@ -59,25 +60,9 @@ JLINK = 'JLink.exe' if os.name == 'nt' else 'JLinkExe'
 
 
 def make_tool(d, name, body):
-    """A fake tool in d that starts by name, its path: a POSIX script, or on Windows, which cannot start a
-    shebang script, a launcher .exe for the same Python source (JLinkExe is JLink.exe there)."""
-    if os.name != 'nt':
-        f = Path(d) / name
-        f.write_text(body)
-        f.chmod(f.stat().st_mode | stat.S_IEXEC)
-        return f
-    try:
-        from pip._vendor.distlib.scripts import ScriptMaker
-    except ImportError:
-        raise unittest.SkipTest('Windows fakes need pip (its vendored distlib launcher)')
-    name = 'JLink' if name == 'JLinkExe' else name
-    src = Path(d) / 'stub-src'
-    src.mkdir(exist_ok=True)
-    (src / name).write_text('#!/usr/bin/env python3\n' + body.split('\n', 1)[1], encoding='utf-8')
-    maker = ScriptMaker(str(src), str(d))
-    maker.executable, maker.variants = sys.executable, {''}
-    maker.make(name)
-    return Path(d) / f'{name}.exe'
+    """A fake tool in d that starts by name, its path, running the Python body after its shebang line (JLinkExe is
+    JLink.exe on Windows)."""
+    return make_stub(d, 'JLink' if os.name == 'nt' and name == 'JLinkExe' else name, body.split('\n', 1)[1])
 
 
 def fake_tools(case, d, tools):
@@ -1119,20 +1104,13 @@ class PcSampleOpenOCDTest(FakeToolsCase):
 
     @unittest.skipUnless(os.name == 'nt', 'POSIX run() kills the tool alone, as before')
     def test_a_hung_tool_is_killed_with_its_children(self):
-        import ctypes
         pidfile = self.d / 'grandchild'
         tool = (f'import subprocess, sys, time; p = subprocess.Popen([sys.executable, "-c", "import time; '
                 f'time.sleep(60)"]); open({str(pidfile)!r}, "w").write(str(p.pid)); time.sleep(60)')
         with self.assertRaisesRegex(probe_state.ToolError, 'did not finish within'):
             probe_state.run([sys.executable, '-c', tool], 3)
         pid = int(pidfile.read_text())
-        k32 = ctypes.windll.kernel32
-        handle = k32.OpenProcess(0x1000, False, pid)    # PROCESS_QUERY_LIMITED_INFORMATION
-        code = ctypes.c_ulong()
-        if handle:
-            k32.GetExitCodeProcess(handle, ctypes.byref(code))
-            k32.CloseHandle(handle)
-        if handle and code.value == 259:    # STILL_ACTIVE
+        if pid_alive(pid):
             subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True)
             self.fail('the grandchild outlived the timeout')
 

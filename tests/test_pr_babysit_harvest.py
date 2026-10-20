@@ -4,7 +4,6 @@ import hashlib
 import importlib.util
 import io
 import json
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -13,6 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'harvest.py'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import run_gh_as  # noqa: E402
 spec = importlib.util.spec_from_file_location('pr_babysit_harvest', SCRIPT)
 harvest = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(harvest)
@@ -317,19 +318,6 @@ class FailClosed(unittest.TestCase):
             self.assertEqual(harvest.head_event('o/r', 7, view, HEAD)[0], None)
             timeline[0]['commit_id'] = None
             self.assertEqual(harvest.head_event('o/r', 7, view, HEAD)[0], '2026-09-25T09:00:00Z', 'GitHub leaves a reopen\'s commit_id null')
-
-
-def run_gh_as(stub):
-    """Patch subprocess.run so `gh ...` runs stub under this Python, never a gh found on PATH; anything but git fails."""
-    real = subprocess.run
-
-    def run(argv, *a, **kw):
-        if argv[0] == 'gh':
-            argv = [sys.executable, str(stub), *argv[1:]]
-        elif argv[0] not in ('git', sys.executable):
-            raise AssertionError(f'{argv[0]} must not run in this test: only git, and gh as the stub')
-        return real(argv, *a, **kw)
-    return mock.patch.object(subprocess, 'run', run)
 
 
 class FakeGh:

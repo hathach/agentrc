@@ -22,16 +22,14 @@ try:
     import yaml
 except ImportError:  # a minimal native Python, such as MinGW's, may ship none
     yaml = None
-try:
-    from pip._vendor.distlib.scripts import ScriptMaker
-except ImportError:  # a Python without pip: no launchers for the fake CLIs on Windows
-    ScriptMaker = None
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'skills' / 'cowork' / 'scripts' / 'cowork.py'
 SKILL = ROOT / 'skills' / 'cowork' / 'SKILL.md'
 sys.path.insert(0, str(SCRIPT.parent))
 import cowork  # noqa: E402
+sys.path.insert(0, str(ROOT / 'tests'))
+from helpers import make_stub  # noqa: E402
 
 # Stand-ins for the real CLIs: record argv, stdin, cwd and environment, then emit an
 # event stream. With FAKE_GATE set they hold until that file exists, so a test can
@@ -174,19 +172,11 @@ def launcher(bin_dir, name, script):
     """<bin_dir>/<name>.exe running `script` with this Python: CreateProcess
     runs only an .exe by name, and a missing stand-in must never fall through
     to the real CLI on PATH."""
-    source = bin_dir.parent / 'launch' / f'{name}.py'
-    source.parent.mkdir(exist_ok=True)
-    source.write_text(f'#!python\nimport runpy\nrunpy.run_path({str(script)!r}, run_name="__main__")\n',
-                      encoding='utf-8')
-    maker = ScriptMaker(str(source.parent), str(bin_dir))
-    maker.executable, maker.variants = sys.executable, {''}
-    maker.make(source.name)
+    make_stub(bin_dir, name, f'import runpy\nrunpy.run_path({str(script)!r}, run_name="__main__")\n')
 
 
 class CoworkTest(unittest.TestCase):
     def setUp(self):
-        if os.name == 'nt' and ScriptMaker is None:
-            self.skipTest("needs pip's distlib to build the fake CLIs' launchers")
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name).resolve()  # as git and getcwd name it: Windows' long name, not TEMP's 8.3 one
         self.root = base / 'repo'

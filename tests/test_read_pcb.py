@@ -18,6 +18,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'skills' / 'read-pcb' / 'scripts'))
 import pcb  # noqa: E402
+sys.path.insert(0, str(ROOT / 'tests'))
+from helpers import tmpdir  # noqa: E402
 
 DATA = ROOT / 'tests' / 'data' / 'read_pcb'
 EAGLE = DATA / 'eagle.sch'
@@ -73,8 +75,7 @@ def run(*args):
 
 class Tmp(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()).resolve()  # as pcb.py reports it: Windows' long TEMP name
-        self.addCleanup(rmtree, self.tmp)
+        self.tmp = tmpdir(self)  # as pcb.py reports it
 
     def write(self, name, data):
         path = self.tmp / name

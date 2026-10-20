@@ -1,7 +1,7 @@
 """Tests for the rtt skill's rtt.py: the JlinkRtt and OpenocdRtt console
 classes and the CLI, against a fake JLinkExe or openocd named by RTT_JLINK_EXE /
 RTT_OPENOCD_EXE -- real subprocesses and sockets, no hardware, stdlib only (on
-Windows the stubs need pip's vendored distlib; without it their tests skip)."""
+Windows the stubs need pip's vendored distlib; without it their tests fail)."""
 import contextlib
 import importlib.util
 import io
@@ -19,6 +19,8 @@ from pathlib import Path
 from unittest import mock
 
 CLI = Path(__file__).resolve().parents[1] / 'skills' / 'rtt' / 'scripts' / 'rtt.py'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import make_stub, pid_alive  # noqa: E402
 
 # loaded by path and registered under a fixed name, as a harness importing the
 # classes would: RttError must be picklable across a fork Pool
@@ -44,51 +46,6 @@ def setUpModule():
 def tearDownModule():
     _no_tools_env.stop()
     _no_tools.cleanup()
-
-
-def make_stub(bin_dir, name, source):
-    """An executable `name` in bin_dir running the Python `source`: a shebang script, or
-    on Windows, which cannot exec one, a distlib launcher exe. Returns its path."""
-    bin_dir = Path(bin_dir)
-    if os.name != 'nt':
-        script = bin_dir / name
-        script.write_text(f'#!{sys.executable}\n{source}', encoding='utf-8')
-        script.chmod(0o755)
-        return script
-    try:
-        from pip._vendor.distlib.scripts import ScriptMaker
-    except ImportError:
-        raise unittest.SkipTest('Windows stubs need pip (its vendored distlib launcher)')
-    source_dir = bin_dir / f'{name}-source'
-    source_dir.mkdir()
-    (source_dir / name).write_text(f'#!python\n{source}', encoding='utf-8')
-    maker = ScriptMaker(str(source_dir), str(bin_dir))
-    maker.executable = sys.executable
-    maker.make(name)
-    exe = bin_dir / f'{name}.exe'
-    if not exe.is_file():
-        raise AssertionError(f'no {exe} stub')
-    return exe
-
-
-def pid_alive(pid):
-    if os.name != 'nt':
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return False
-        return True
-    import ctypes   # os.kill(pid, 0) would TerminateProcess it on Windows
-    handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-    if not handle:
-        return False
-    try:
-        exit_code = ctypes.c_ulong()
-        if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
-            return False
-        return exit_code.value == 259  # STILL_ACTIVE
-    finally:
-        ctypes.windll.kernel32.CloseHandle(handle)
 
 
 def skip_without_a_shared_console(test):

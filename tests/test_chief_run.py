@@ -20,6 +20,8 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'headless-chief' / 'scripts' / 'chief_run.py'
 CAPTURE = Path(__file__).resolve().parent / 'data' / 'chief_run' / 'stream.jsonl'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import make_stub, pid_alive  # noqa: E402
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
@@ -61,21 +63,6 @@ def result(body='chief: stage · done', is_error=False, subtype='success'):
     return {'type': 'result', 'subtype': subtype, 'is_error': is_error, 'result': body}
 
 
-def alive(pid):
-    if os.name != 'nt':
-        return Path(f'/proc/{pid}').exists()
-    import ctypes   # os.kill(pid, 0) would terminate it on Windows
-    kernel32 = ctypes.WinDLL('kernel32')
-    kernel32.OpenProcess.restype = ctypes.c_void_p
-    handle = kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
-    if not handle:
-        return False
-    try:
-        return kernel32.WaitForSingleObject(ctypes.c_void_p(handle), 0) == 0x102   # WAIT_TIMEOUT: still running
-    finally:
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
-
-
 def has_console(pid):
     """Windows: does the process have a console; AttachConsole asks it from a process without one."""
     probe = ('import ctypes, sys; k = ctypes.WinDLL("kernel32", use_last_error=True); '
@@ -101,20 +88,7 @@ class ChiefRun(unittest.TestCase):
         self.fake.mkdir()
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        if os.name == 'nt':
-            # Windows cannot exec a shebang file: a real claude.exe launcher runs the fake, found before any real claude
-            try:
-                from pip._vendor.distlib.scripts import ScriptMaker
-            except ImportError:
-                self.skipTest("needs pip's vendored distlib to build a fake claude.exe")
-            (self.fake / 'claude').write_text(FAKE)
-            maker = ScriptMaker(str(self.fake), str(self.bin))
-            maker.executable = sys.executable
-            maker.make('claude')
-            self.assertTrue((self.bin / 'claude.exe').is_file())
-        else:
-            (self.bin / 'claude').write_text(FAKE)
-            (self.bin / 'claude').chmod(0o755)
+        make_stub(self.bin, 'claude', FAKE.split('\n', 1)[1])
         self.worktree = self.root / 'wt'
         self.worktree.mkdir()
         self.task = self.root / 'task.md'
@@ -153,7 +127,7 @@ class ChiefRun(unittest.TestCase):
         remove them): its exit is waited for before the test's directory goes."""
         if 'launcher pid ' in r.stdout:
             pid = int(r.stdout.split('launcher pid ')[1].split(',')[0])
-            self.addCleanup(self.wait_until, 'the launcher to exit', lambda: not alive(pid))
+            self.addCleanup(self.wait_until, 'the launcher to exit', lambda: not pid_alive(pid))
         return r
 
     def wait_until(self, what, ok):
@@ -403,7 +377,7 @@ class ChiefRun(unittest.TestCase):
         started = next(t for t in self.texts() if t.startswith('launcher: started pid '))
         kill(int(started.split()[3].rstrip(',')))   # taskkill /T /F on the started pid, as SKILL.md says
         self.assertEqual(proc.wait(timeout=10), 1)
-        self.assertFalse(alive(int((self.fake / 'pid').read_text())), 'chief outlived the launcher')
+        self.assertFalse(pid_alive(int((self.fake / 'pid').read_text())), 'chief outlived the launcher')
         self.assertTrue(self.texts()[-1].startswith('launcher: exit 1 (claude exited 1)'), self.texts())
 
     def test_it_returns_at_once_and_the_launcher_runs_on_in_its_own_session(self):
@@ -411,8 +385,8 @@ class ChiefRun(unittest.TestCase):
         r = self.run_it(detached=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         pid = int(r.stdout.split('launcher pid ')[1].split(',')[0])
-        self.addCleanup(lambda: alive(pid) and kill(pid))
-        self.assertTrue(alive(pid), 'it returned while the launcher runs on')
+        self.addCleanup(lambda: pid_alive(pid) and kill(pid))
+        self.assertTrue(pid_alive(pid), 'it returned while the launcher runs on')
         self.assertFalse(self.logged('launcher: exit'), 'it returned while chief was held at its gate')
         self.assertIn(str(self.out / 'progress.log'), r.stdout)
         self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
@@ -496,8 +470,8 @@ class ChiefRun(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1 (launcher failed: OSError: disk full)'))
         pid = int((self.fake / 'pid').read_text())
-        self.addCleanup(lambda: alive(pid) and kill(pid))
-        self.assertFalse(alive(pid), "claude.cmd's node stopped with its cmd.exe")
+        self.addCleanup(lambda: pid_alive(pid) and kill(pid))
+        self.assertFalse(pid_alive(pid), "claude.cmd's node stopped with its cmd.exe")
 
     @unittest.skipUnless(os.name == 'nt', 'shutil.which and CreateProcess try the working directory first')
     def test_claude_is_found_on_path_alone(self):
@@ -579,7 +553,7 @@ class ChiefRun(unittest.TestCase):
         r = self.detach(subprocess.run([sys.executable, '-c', failing, *self.argv(detached=True)[2:]], env=self.env, capture_output=True, text=True, timeout=30))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 1 (launcher failed: OSError: disk full)'))
-        self.assertFalse(alive(int((self.fake / 'pid').read_text())), 'chief stopped before the exit line')
+        self.assertFalse(pid_alive(int((self.fake / 'pid').read_text())), 'chief stopped before the exit line')
 
     def test_a_claude_that_cannot_start_is_recorded(self):
         empty = self.root / 'empty'

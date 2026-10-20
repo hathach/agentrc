@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'shadow_guard.py'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import make_stub  # noqa: E402
 
 
 class ShadowGuard(unittest.TestCase):
@@ -117,17 +119,7 @@ class ShadowGuard(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'CreateProcess tries the working directory before PATH')
     def test_a_git_in_the_project_is_not_the_one_run(self):
         # Claude Code runs the hook in the project, a contributor's checkout: its git.exe must not run
-        try:
-            from pip._vendor.distlib.scripts import ScriptMaker
-        except ImportError:
-            self.skipTest('no distlib to build a git.exe stub')
-        fake = self.root / 'fake'
-        fake.mkdir()
-        (fake / 'git').write_text(f'#!/usr/bin/env python3\nimport pathlib, sys\npathlib.Path({str(self.root / "ran")!r}).touch()\nsys.exit(1)\n')
-        maker = ScriptMaker(str(fake), str(self.project))
-        maker.executable = sys.executable
-        maker.make('git')
-        self.assertTrue((self.project / 'git.exe').is_file())
+        make_stub(self.project, 'git', f'import pathlib, sys\npathlib.Path({str(self.root / "ran")!r}).touch()\nsys.exit(1)\n')
         self.env = {k: v for k, v in self.env.items() if k.lower() != 'nodefaultcurrentdirectoryinexepath'}   # Claude Code sets it
         self.installed('workflows', 'pr-babysit.js', 'new')
         self.local('workflows', 'pr-babysit.js', 'old')

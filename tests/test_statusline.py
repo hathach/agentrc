@@ -12,6 +12,9 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import make_stub  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1] / 'statusline'
 spec = importlib.util.spec_from_file_location('codex_usage', ROOT / 'statusline-codex-usage.py')
 codex_usage = importlib.util.module_from_spec(spec)
@@ -34,28 +37,6 @@ def plain(text):
 
 def window(used, mins):
     return {'usedPercent': used, 'windowDurationMins': mins, 'resetsAt': 1}
-
-
-def make_stub(bin_dir, name, source):
-    """`name` on `bin_dir`, running the Python `source`: a shebang script, or on Windows, which
-    cannot exec one, a launcher exe, so no real `name` further down PATH ever runs instead."""
-    script = bin_dir / name
-    if os.name != 'nt':
-        script.write_text(f'#!{sys.executable}\n{source}')
-        script.chmod(0o755)
-        return
-    try:
-        from pip._vendor.distlib.scripts import ScriptMaker
-    except ImportError:
-        raise unittest.SkipTest('no distlib to build a stub launcher') from None
-    source_dir = bin_dir.parent / f'{name}-source'
-    source_dir.mkdir()
-    (source_dir / name).write_text(f'#!python\n{source}')
-    maker = ScriptMaker(str(source_dir), str(bin_dir))
-    maker.executable = sys.executable
-    maker.make(name)
-    if not (bin_dir / f'{name}.exe').is_file():
-        raise AssertionError(f'no {name}.exe stub')
 
 
 BASH = shutil.which('bash') or 'bash'  # a bare 'bash' finds WSL's launcher in System32 first on Windows
