@@ -3,8 +3,10 @@ speed, the unit or run unbounded, derives the speed from sysfs, pins the tool
 to the selected unit, and reports a capture already holding it; addr reads
 SET_ADDRESS out of a capture and names every device when several enumerated."""
 import contextlib
+import fnmatch
 import io
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -158,7 +160,40 @@ class UsbfsRoomTest(unittest.TestCase):
         with self.assertRaises(sniff.Refused) as e:
             self.room(16, 1)
         self.assertIn('1 other capture(s) running; with this one usb_sniffer needs about 32 MiB', str(e.exception))
-        self.assertIn('usbcore.usbfs_memory_mb is 16: `echo 32 | sudo tee', str(e.exception))
+        self.assertIn('usbcore.usbfs_memory_mb is 16: install the udev rule (SKILL.md, Setup), `echo 32 | sudo tee',
+                      str(e.exception))
+
+    def test_the_udev_rule_is_offered_only_where_its_limit_would_be_enough(self):
+        for limit, others, offered in ((16, 1, True), (16, 3, True), (16, 4, False), (64, 4, False)):
+            with self.assertRaises(sniff.Refused) as e:
+                self.room(limit, others)
+            self.assertEqual('install the udev rule' in str(e.exception), offered, (limit, others))
+
+
+class UdevRuleTest(unittest.TestCase):
+    RULES = SCRIPT.parent / '88-usb-sniffer.rules'
+    LIMIT = 'ATTR{[module/usbcore]parameters/usbfs_memory_mb}'
+
+    def limit_rule(self):
+        """The limit rule's keys, each with its operator: {'ACTION!=': 'remove', ...}."""
+        lines = [ln for ln in self.RULES.read_text().splitlines() if self.LIMIT in ln]
+        self.assertEqual(len(lines), 1, lines)
+        return {key + op: value for key, op, value in re.findall(r'(\S+?)(==|!=|=)"([^"]*)"', lines[0])}
+
+    def test_a_sniffer_event_raises_a_finite_limit_below_64_to_64(self):
+        keys = self.limit_rule()
+        globs = keys.pop(self.LIMIT + '==').split('|')
+        self.assertEqual(keys, {'SUBSYSTEM==': 'usb', 'ACTION!=': 'remove', 'ATTR{idVendor}==': '6666',
+                                'ATTR{idProduct}==': '6620', self.LIMIT + '=': str(sniff.RULE_USBFS_MB)})
+        raised = [n for n in range(1001) if any(fnmatch.fnmatchcase(str(n), g) for g in globs)]
+        self.assertEqual(raised, list(range(1, sniff.RULE_USBFS_MB)))   # 0 is no limit, and a larger one stays
+
+    @unittest.skipUnless(shutil.which('udevadm'), 'needs udevadm')
+    def test_udevadm_verifies_the_rules(self):
+        r = subprocess.run(['udevadm', 'verify', str(self.RULES)], capture_output=True, text=True)
+        if r.returncode and 'Unknown command verb' in r.stdout + r.stderr:
+            self.skipTest('udevadm has no verify (systemd < 254)')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
 # runs sniff.py's main with its host paths replaced: argv is SYSFS USBFS USBFS_LIMIT ARGS...
@@ -224,7 +259,6 @@ class SetAddressesTest(unittest.TestCase):
         self.assertEqual(sniff.set_addresses('12\t9\n40\t\n77\t9\n90\t12\n'), {9: [12, 77], 12: [90]})
 
     def test_address_filter_is_anchored_so_9_does_not_match_19(self):
-        import re
         pattern = re.search(r'matches "([^"]+)"', sniff.addr_filter(9)).group(1)
         self.assertTrue(re.search(pattern, '9.0'))
         self.assertFalse(re.search(pattern, '19.0'))

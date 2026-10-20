@@ -40,6 +40,7 @@ USBFS_LIMIT = Path('/sys/module/usbcore/parameters/usbfs_memory_mb')   # one lim
 # MiB of usbfs a capture is budgeted: upstream 57a24e1's Linux queue (usb.c, 16 x 512*2000 B) plus the kernel's
 # per-URB accounting; one capture fits the default limit of 16, two fit 32 (both seen on hardware)
 TOOL_USBFS_MB = 16
+RULE_USBFS_MB = 64   # the limit 88-usb-sniffer.rules raises a lower one to
 
 
 class Refused(Exception):
@@ -174,9 +175,10 @@ def usbfs_room(others):
         raise Refused(f'cannot read the usbfs buffer limit {USBFS_LIMIT}: {e}')
     need = (others + 1) * TOOL_USBFS_MB
     if limit and need > limit:
+        rule = 'install the udev rule (SKILL.md, Setup), ' if limit < RULE_USBFS_MB and need <= RULE_USBFS_MB else ''
         raise Refused(f'{others} other capture(s) running; with this one usb_sniffer needs about {need} MiB of '
-                      f'usbfs buffers, but usbcore.usbfs_memory_mb is {limit}: `echo {need} | sudo tee {USBFS_LIMIT}` '
-                      '(SKILL.md, Setup), or wait')
+                      f'usbfs buffers, but usbcore.usbfs_memory_mb is {limit}: {rule}'
+                      f'`echo {need} | sudo tee {USBFS_LIMIT}` for this boot, or wait')
 
 
 def userns():

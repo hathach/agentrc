@@ -1,3 +1,5 @@
 # ataradov usb-sniffer capture port, and a blank FX2LP before its firmware is loaded
 ATTRS{idVendor}=="6666", ATTRS{idProduct}=="6620", MODE="0666"
 ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="8613", MODE="0666"
+# raise the shared usbfs buffer limit for concurrent captures; leave 0 (no limit) and larger ones alone
+SUBSYSTEM=="usb", ACTION!="remove", ATTR{idVendor}=="6666", ATTR{idProduct}=="6620", ATTR{[module/usbcore]parameters/usbfs_memory_mb}=="[1-9]|[1-5][0-9]|6[0-3]", ATTR{[module/usbcore]parameters/usbfs_memory_mb}="64"

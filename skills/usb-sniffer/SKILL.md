@@ -51,11 +51,14 @@ $S capture raw.pcapng --speed hs --seconds 15 --serial 4433459538463a    # expli
   Ubuntu's AppArmor policy needs the profile from Setup. The `+` line and the
   summary name the unit; the pcapng does not, so keep the serial with the file.
 - Two units capture at once from two shells, each with its own `--serial` and
-  output, once `usbfs_memory_mb` has room for both (Setup): the default holds
-  one capture, a second dies with `LIBUSB_ERROR_NO_MEM`. `capture` refuses
-  first with the value to set; other usbfs users share the limit, so the
-  estimate can still fall short. A unit refused as in use may be another session's capture: wait or
-  take another unit, and stop the holder only when it is your own abandoned one.
+  output. Each capture queues ~16 MiB of usbfs buffers against the kernel's
+  one global `usbfs_memory_mb`, 16 by default: a second capture would die
+  with `LIBUSB_ERROR_NO_MEM`. The Setup udev rule raises a lower finite limit
+  to 64 (about four captures) whenever a unit is plugged in, at boot and on
+  Setup's trigger; without it `capture` refuses first with the value to set.
+  Other usbfs users share the limit, so the estimate can still fall short. A
+  unit refused as in use may be another session's capture: wait or take
+  another unit, and stop the holder only when it is your own abandoned one.
 - The speed must be the tapped **segment's**: an FS device behind an HS hub
   is HS on the hub's upstream cable (you will see SPLIT transactions, not
   native FS packets — tap the device's own cable at `fs` for those). Wrong
@@ -134,15 +137,12 @@ the tap) and lists every device when several enumerated — pick by frame order.
 ## Setup (one-time)
 
 ```bash
-sudo cp <skill dir>/scripts/88-usb-sniffer.rules /etc/udev/rules.d/   # capture port + blank FX2LP
-sudo udevadm control --reload-rules && sudo udevadm trigger -s usb
+sudo cp <skill dir>/scripts/88-usb-sniffer.rules /etc/udev/rules.d/   # capture port + blank FX2LP, usbfs limit
+sudo udevadm control --reload-rules && sudo udevadm trigger -s usb --settle
+cat /sys/module/usbcore/parameters/usbfs_memory_mb   # with a unit attached: 0 (no limit) or >= 64, until reboot
 # Ubuntu only (AppArmor restricts unprivileged user namespaces): lets every user's unshare make one, not only captures
 sudo cp <skill dir>/scripts/usb-sniffer-unshare.apparmor /etc/apparmor.d/usb-sniffer-unshare
 sudo apparmor_parser -r /etc/apparmor.d/usb-sniffer-unshare
-# two units at once, if usbfs_memory_mb is below 32 and not 0 (no limit): 16 MiB per capture, 64 as an example;
-# this boot, then every boot
-echo 64 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb
-echo 'w /sys/module/usbcore/parameters/usbfs_memory_mb - - - - 64' | sudo tee /etc/tmpfiles.d/usb-sniffer.conf
 # binary from the ataradov repo (bin/usb_sniffer_linux) + Wireshark extcap symlink (Wireshark >= 4.x)
 cp usb_sniffer_linux ~/.local/bin/usb_sniffer && chmod +x ~/.local/bin/usb_sniffer
 mkdir -p ~/.local/lib/wireshark/extcap && ln -sf ~/.local/bin/usb_sniffer ~/.local/lib/wireshark/extcap/usb_sniffer
