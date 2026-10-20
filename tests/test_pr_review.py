@@ -401,15 +401,25 @@ class Prepare(Case):
         self.assertFalse(Path(nested).exists())
         self.assertFalse((self.tmp / f'clone--pr-review-{PR}').exists())
 
+    def test_a_symlinked_review_tree_is_refused_untouched(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        launcher = (sh(self.clone, 'git', 'branch', '--show-current'), sh(self.clone, 'git', 'rev-parse', 'HEAD'))
+        sibling = self.tmp / f'clone--pr-review-{PR}'
+        try:
+            sibling.symlink_to(self.clone, target_is_directory=True)  # the launcher's HEAD, main at the base, is a pinned commit
+        except OSError as e:  # Windows without Developer Mode
+            self.skipTest(f'cannot create a symlink: {e}')
+        with self.assertRaisesRegex(facts.Unusable, 'is a symlink'):
+            self.prepare()
+        self.assertEqual((sh(self.clone, 'git', 'branch', '--show-current'), sh(self.clone, 'git', 'rev-parse', 'HEAD')),
+                         launcher)
+
     def test_an_existing_tree_that_is_not_our_linked_worktree_is_refused_untouched(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')
         self.push_pr()
         launcher = (sh(self.clone, 'git', 'branch', '--show-current'), sh(self.clone, 'git', 'rev-parse', 'HEAD'))
         sibling = self.tmp / f'clone--pr-review-{PR}'
-        sibling.symlink_to(self.clone)  # the launcher's HEAD, main at the base, is a pinned commit
-        with self.assertRaisesRegex(facts.Unusable, 'is a symlink'):
-            self.prepare()
-        sibling.unlink()
         sh(self.tmp, 'git', 'clone', '--quiet', self.remote.as_posix(), str(sibling))
         with self.assertRaisesRegex(facts.Unusable, 'not a linked worktree of this repository'):
             self.prepare()
