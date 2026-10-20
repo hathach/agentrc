@@ -70,8 +70,9 @@ nothing in it through a link.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
   ends with `release_board_lock`. `release` never signals a protected record,
   a cleanup holder or a runner reason (`hil_test.py`, `farm_check`, the legacy
-  `pool_check`), and signals only `hil_lock.py hold`'s own holder, proven by its start time and
-  its flock. A record from a helper older than the mark carries none and is
+  `pool_check`), and signals only `hil_lock.py hold`'s own holder, proven by
+  its start time and its flock. A record from a helper older than the mark
+  carries none and is
   taken like any other: protection across projects holds once every project
   on the host runs this helper.
 - A rig-wide operation, one that can reset or renumber a board you do not
@@ -198,6 +199,42 @@ recovery stay the contract's. Linux only.
   ended (`done`) or a command was outstanding and the server was left running
   on purpose (`pending`). A J-Link crash rerun is no proof the target was
   untouched either.
+
+## Shared mechanisms
+
+A project's harness loads these from the agentrc it pins, as it loads the lock
+helper; each script's docstring is its contract. They carry mechanics only:
+rosters, the boards and cases a run selects, images, retries, report fields and
+recovery stay the contract's.
+
+| Script | Gives |
+|---|---|
+| `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
+| `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (`farm-check` skill) |
+| `hil_report_core.py` | the report document: `_hil` metadata, attempt archive and withdrawal, the Markdown view, run and sequence verdicts |
+| `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
+| `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
+| `hil_usbtest.py` | usbtest binding and bounded testusb case runs |
+| `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
+
+- A process started under a protected reservation (`protected=True`) is
+  proven ended before the board is released: `run_tracked`'s `done`, or a
+  `recheck` of its receipt that answers `done`. Anything else keeps a cleanup
+  holder or the protected record for the contract's Recovery, and no
+  in-process board I/O follows until that proof (the farm check's
+  `ctx.settle()`).
+- `run_tracked`'s `state_dir` is the caller's: a directory of its uid that no
+  other user can write, in a parent of its uid or root's that no other user
+  can write unless sticky. Only those two are checked: the caller keeps every
+  higher ancestor trusted and unchanged while any receipt names the directory.
+- A report is published through `hil_report_core`: the JSON is authoritative
+  and the Markdown a view `prepare_pair` regenerates from it. An attempt that
+  cannot publish withdraws the live report (`withdraw_current`), so a
+  predecessor's result never reads as this run's. `apply_run_rules` and
+  `sequence_verdict` give the Verdicts and Caller rules below for one attempt
+  and for a retry sequence.
+- A remote attempt is created once, under its own lease, and launched once;
+  it is never wiped by the core, and its retention is the project's.
 
 ## Reporting
 

@@ -833,7 +833,7 @@ class DumpRing(unittest.TestCase):
 
 
 class StripBanner(unittest.TestCase):
-    # both harness consumers (device_info verdict, pool_check aliveness) judge
+    # both harness consumers (device_info verdict, farm check aliveness) judge
     # target-aliveness through this ONE filter -- pin its shape here
     def test_drops_banner_keeps_target(self):
         raw = (b'SEGGER J-Link V9.66 - Real time terminal output\r\n'

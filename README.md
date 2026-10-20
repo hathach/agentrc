@@ -105,9 +105,12 @@ plain path such as `C:\tmp` there.
 Not on Windows yet; [#148](https://github.com/hathach/agentrc/issues/148) has
 the skipped tests and notes for a port:
 
-- `hil`'s rig-host scripts (`hil_lock.py`, `hil_reserve.py`, `usb_observe.py`)
-  and `usb-kernel-recover`'s `usb_recover.sh`: POSIX `flock` and `fork`,
-  `/proc` and sysfs.
+- `hil`'s rig-host scripts (`hil_lock.py`, `hil_reserve.py`, `usb_observe.py`,
+  `hil_process.py`, `hil_farm_check.py`, `hil_tt.py`, `hil_usbtest.py`) and
+  `usb-kernel-recover`'s `usb_recover.sh`: POSIX `flock` and `fork`, `/proc`
+  and sysfs.
+- `hil`'s `hil_report_core.py` locks its writer with `msvcrt` on Windows, but
+  its tests use `fcntl` and skip there.
 - `lsusbt`: sysfs.
 - `usb-kernel-debug`: kernel dynamic debug and usbmon, which have no Windows
   counterpart to port to.
