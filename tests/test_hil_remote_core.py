@@ -1713,6 +1713,43 @@ class Attempts(Rig):
         self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
         self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
 
+    def test_an_interrupt_after_the_replacement_landed_keeps_it(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        rc_.collect(tree, dest, optional=['out/'])
+        (self.base / 'a1/out/late.json').write_text('late')
+        real = Path.rename
+
+        def rename(src, target):
+            real(src, target)
+            if Path(target) == dest and src.name.endswith('.tmp'):
+                raise KeyboardInterrupt
+        with mock.patch.object(Path, 'rename', rename), self.assertRaises(KeyboardInterrupt):
+            rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((dest / 'out/late.json').read_text(), 'late')
+        col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((col['state'], col['unaccepted']), ('complete', []))
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
+
+    def test_a_set_aside_collection_that_cannot_be_removed_waits_for_the_next_collector(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        rc_.collect(tree, dest, optional=['out/'])
+        (self.base / 'a1/out/late.json').write_text('late')
+        real = rc_._remove
+
+        def remove(p):
+            if Path(p).name == '.got.old':
+                raise PermissionError(13, 'Permission denied')
+            return real(p)
+        with mock.patch.object(rc_, '_remove', remove):
+            col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+            self.assertEqual((col['state'], (dest / 'out/late.json').read_text()), ('complete', 'late'))
+            self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
+        self.assertTrue((self.tmp / '.got.old').exists())
+        self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
+
     def test_running_partial_then_dead_never_complete_nor_relaunched(self):
         tree = self.create()
         self.stage(tree)

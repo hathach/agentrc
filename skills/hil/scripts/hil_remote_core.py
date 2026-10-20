@@ -1146,9 +1146,15 @@ def _settle(dest):
     old = _aside(dest)
     if old.exists() or old.is_symlink():
         if dest.exists() or dest.is_symlink():
-            _remove(old)
+            _drop(old)
         else:
             old.rename(dest)
+
+
+def _drop(old):
+    """Remove a set-aside collection dest has replaced; one that resists waits for the next _settle."""
+    with contextlib.suppress(OSError):
+        _remove(old)
 
 
 def _publish(tmp, dest):
@@ -1161,11 +1167,11 @@ def _publish(tmp, dest):
     try:
         tmp.rename(dest)
     except BaseException:
-        if aside:
+        if aside and not (dest.exists() or dest.is_symlink()):   # interrupted after the rename landed: keep it
             old.rename(dest)
         raise
     if aside:
-        _remove(old)
+        _drop(old)
 
 
 def _uncovered(held, groups, optional):
