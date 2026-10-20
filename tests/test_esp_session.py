@@ -46,6 +46,14 @@ tcl_port = next(int(c.split()[2]) for c in cs if c.startswith('tcl port '))
 state_path = os.environ['FAKE_STATE']
 with open(state_path, 'w') as f:
     json.dump({c: 'running' for c in cores}, f)
+gate = os.environ.get('FAKE_LISTEN_GATE')
+if gate:
+    import time
+    deadline = time.monotonic() + 60
+    while not os.path.exists(gate):
+        if time.monotonic() > deadline:
+            sys.exit(1)
+        time.sleep(0.05)
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(('127.0.0.1', tcl_port)); srv.listen(4)
 say(f'Info : Listening on port {gdb_port} for gdb connections')
@@ -461,8 +469,12 @@ class EspSessionTest(unittest.TestCase):
                 out_dir = self.d / f'out-{which}'
                 argv = self.session('inspect', '--timeout', '30')
                 argv[argv.index(str(self.out))] = str(out_dir)
+                # the server case's openocd listens only once the gate exists: still not listening when the session ends
+                gate = out_dir / 'listen'
                 rc, out, err = self.run_cli([sys.executable, '-c', driver, which, *argv[2:]],
-                                            FAKE_OCD_LOG=str(out_dir / 'openocd.log'))
+                                            FAKE_OCD_LOG=str(out_dir / 'openocd.log'),
+                                            **({'FAKE_LISTEN_GATE': str(gate)} if which == 'server' else {}))
+                gate.touch()
                 self.assertEqual(rc, 3, err)
                 self.assertIn('interrupted by signal 15', out['error'])
                 receipt_file = out_dir / 'receipt.json'
@@ -473,7 +485,11 @@ class EspSessionTest(unittest.TestCase):
                     continue
                 # the server, not yet listening, is recorded and left to leave --receipt rather than lost
                 self.assertIn(f'leave --receipt {receipt_file}', out['error'])
-                self.assertFalse(json.loads(receipt_file.read_text())['closed'])
+                receipt = json.loads(receipt_file.read_text())
+                self.assertFalse(receipt['closed'])
+                deadline = time.monotonic() + 30    # leave needs the gated server listening
+                while 'Listening on port' not in Path(receipt['log']).read_text() and time.monotonic() < deadline:
+                    time.sleep(0.05)
                 rc, out, err = self.run_cli([sys.executable, str(SCRIPT), 'leave', '--receipt', str(receipt_file)],
                                             FAKE_OCD_LOG=str(out_dir / 'openocd.log'))
                 self.assertEqual(rc, 0, err)

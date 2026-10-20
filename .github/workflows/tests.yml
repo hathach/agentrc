@@ -67,7 +67,4 @@ jobs:
           unshare --user --map-root-user --mount true
       - name: optional tools found
         run: python -c "import shutil; [print(t, shutil.which(t)) for t in 'python node git bash jq awk pdfinfo pdftotext tshark editcap capinfos openocd kicad-cli xvfb-run pre-commit'.split()]"
-      # PYTHONUTF8 rather than -X utf8: xdist workers inherit the environment, not the flag
-      - run: python -m pytest -n 8 --dist worksteal -p no:cacheprovider --durations=20 --shard ${{ matrix.shard }}/${{ matrix.shards }} tests
-        env:
-          PYTHONUTF8: '1'
+      - run: python -X utf8 -m pytest -n 8 --dist worksteal -p no:cacheprovider --durations=20 --shard ${{ matrix.shard }}/${{ matrix.shards }} tests
