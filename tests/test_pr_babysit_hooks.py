@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -86,6 +87,13 @@ class HooksTest(unittest.TestCase):
                               env=env or self.env, capture_output=True, text=True)
         return done.returncode, json.loads(done.stdout.splitlines()[-1])
 
+    def wait_for(self, done, failure, seconds=10):
+        deadline = time.monotonic() + seconds
+        while not done():
+            if time.monotonic() > deadline:
+                self.fail(failure)
+            time.sleep(0.05)
+
     def snap(self, lines):
         return {line.split(' ', 2)[2]: line.split(' ', 2)[:2] for line in lines}
 
@@ -134,11 +142,25 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('--deadline-seconds', '2', 'a.txt', env={**self.env, 'HOOK_PID': str(pid)})
         self.assertEqual(code, 2)
         self.assertRegex(out['error'], r'pre-commit did not finish within 2 s')
-        hook, deadline = int(pid.read_text()), time.monotonic() + 10
-        while running(hook):
-            if time.monotonic() > deadline:
-                self.fail(f'the hook ({hook}) outlived the kill')
-            time.sleep(0.05)
+        hook = int(pid.read_text())
+        self.wait_for(lambda: not running(hook), f'the hook ({hook}) outlived the kill')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX signals')
+    def test_hooks_go_down_with_an_interrupted_or_terminated_run(self):
+        self.configure('slow')
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(signal=sig.name):
+                pid = Path(self.repo.parent) / f'hook-{sig.name}.pid'
+                proc = subprocess.Popen([sys.executable, str(SCRIPT), 'a.txt'], cwd=self.repo,
+                                        env={**self.env, 'HOOK_PID': str(pid)}, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
+                self.addCleanup(proc.kill)
+                self.wait_for(lambda: pid.exists() and pid.read_text().strip(), 'the hook never started', 20)
+                hook = int(pid.read_text())
+                self.addCleanup(subprocess.run, ['kill', '-9', str(hook)], capture_output=True)
+                proc.send_signal(sig)
+                self.assertNotEqual(proc.wait(timeout=10), 0)
+                self.wait_for(lambda: not running(hook), f'the hook ({hook}) outlived the {sig.name}')
 
     @unittest.skipUnless(shutil.which('setsid') and os.name != 'nt', 'needs setsid')
     def test_a_process_that_escapes_the_kill_does_not_hold_the_result(self):

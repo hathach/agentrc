@@ -111,7 +111,10 @@ def kill_tree(proc):
         taskkill = os.path.join(os.environ.get('SystemRoot') or 'C:\\Windows', 'System32', 'taskkill.exe')
         subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True)
     else:
-        os.killpg(proc.pid, signal.SIGKILL)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
 
 def pre_commit(paths, deadline, start, attempt):
@@ -133,6 +136,10 @@ def pre_commit(paths, deadline, start, attempt):
             # A descendant in another session outlived the kill and still holds the output pipe.
             raise Unusable(f'{late}; a process it started survived the kill and may still be running')
         raise Unusable(f'{late}; its process group was killed, though a process that left it may survive')
+    except BaseException:
+        # Its own process group spares the hooks the caller's Ctrl-C or kill, so they go down with this run.
+        kill_tree(proc)
+        raise
     return proc.returncode, out
 
 
@@ -170,4 +177,6 @@ def collect(argv):
 
 
 if __name__ == '__main__':
+    # SIGTERM unwinds like Ctrl-C, through pre_commit's kill of the hook group.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(128 + signal.SIGTERM))
     sys.exit(report(collect, sys.argv[1:], seal=True))
