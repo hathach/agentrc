@@ -144,6 +144,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import circleci  # noqa: E402
 import rtd  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 POLL = 30
 ATTEMPT = (
@@ -431,16 +433,6 @@ def stored_verdicts(folder):
         raise Failed(f'verdicts.json: {e}')
 
 
-def replace(src, dst):
-    """os.replace; on Windows retried while a reader still holds dst open, which fails it there."""
-    for _ in range(50 if os.name == 'nt' else 0):
-        try:
-            return os.replace(src, dst)
-        except PermissionError:
-            time.sleep(0.02)
-    os.replace(src, dst)
-
-
 def remember(repo, pr, head, data):
     try:
         # strict UTF-8 first: json.loads(bytes) would take a BOM, UTF-16/32 and encoded surrogates
@@ -458,7 +450,7 @@ def remember(repo, pr, head, data):
         stored[e['link']] = patched(stored.get(e['link']), e) if 'patch' in e else e
     tmp = folder / f'verdicts.json.{time.time_ns()}'
     tmp.write_text(json.dumps(stored, ensure_ascii=False), encoding='utf-8')
-    replace(tmp, folder / 'verdicts.json')
+    windows.replace(tmp, folder / 'verdicts.json')
     return {'head': head}
 
 

@@ -452,6 +452,21 @@ class PrRefreshTest(unittest.TestCase):
         self.assertEqual(self.cache()['prs'], ['o/r#1', 'o/r#2', 'o/s#3'])
         self.assertEqual(len(self.calls()), 1)
 
+    def test_a_refused_publish_is_dropped_on_windows_and_raised_elsewhere(self):
+        self.answer(self.all())
+        self.refresh()
+        path = self.cache_dir / f'{SID}.json'
+        before = self.cache()
+        denied = PermissionError(13, 'denied')
+        with mock.patch.object(prs.os, 'name', 'nt'), mock.patch.object(prs.windows, 'replace', side_effect=denied):
+            prs.publish(path, {'prs': ['o/r#9']})   # a render held it throughout: the next publish lands
+        self.assertEqual(self.cache(), before)
+        self.assertEqual(list(self.cache_dir.glob('*.tmp')), [])
+        with mock.patch.object(prs.os, 'name', 'posix'), mock.patch.object(prs.windows, 'replace', side_effect=denied), \
+                self.assertRaises(PermissionError):
+            prs.publish(path, {'prs': ['o/r#9']})   # a real failure to persist, which refresh must not poll past
+        self.assertEqual(self.cache(), before)
+
     def test_a_publish_waits_out_a_reader_of_the_cache(self):
         self.answer(self.all())
         self.refresh()

@@ -630,7 +630,8 @@ class GateTest(unittest.TestCase):
         def taskkill(args, **kw):
             killed.append(args[1:3])
             os.kill(int(args[-1]), signal.SIGTERM)
-        with mock.patch.object(gate.os, 'name', 'nt'), mock.patch.object(subprocess, 'run', taskkill), \
+        with mock.patch.object(gate.os, 'name', 'nt'), mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                mock.patch.object(subprocess, 'run', taskkill), \
                 mock.patch.object(subprocess.Popen, 'communicate', side_effect=KeyboardInterrupt), \
                 self.assertRaises(KeyboardInterrupt):
             gate.run_tree([sys.executable, '-c', 'import time; time.sleep(30)'], input=b'', timeout=30)

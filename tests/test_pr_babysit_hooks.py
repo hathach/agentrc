@@ -10,6 +10,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'hooks.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_hooks', SCRIPT)
@@ -258,6 +259,20 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script()
         self.assertEqual(code, 2)
         self.assertIn('usage', out['error'])
+
+
+class KillTreeTest(unittest.TestCase):
+    def test_windows_takes_the_tree_with_a_bounded_taskkill(self):
+        # the Windows branch, run anywhere with taskkill stood in for: it must not hang the deadline's cleanup
+        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(proc.wait)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        with mock.patch.object(hooks.os, 'name', 'nt'), mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                mock.patch.object(hooks.windows.subprocess, 'run') as taskkill:
+            hooks.kill_tree(proc)
+        self.assertEqual(taskkill.call_args.args[0][1:], ['/T', '/F', '/PID', str(proc.pid)])
+        self.assertEqual(taskkill.call_args.kwargs['timeout'], 10)
+        self.assertIsNotNone(proc.poll(), 'the run itself is killed whatever taskkill did')
 
 
 class ModifiedByTest(unittest.TestCase):

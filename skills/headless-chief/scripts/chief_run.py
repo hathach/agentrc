@@ -32,6 +32,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_cost  # noqa: E402
 from shadows import on_path, refusal  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 MARKER = 'chief: '
 HELD = []   # the run.lock this launcher holds until it exits
@@ -132,9 +134,7 @@ def stop(child):
     """Terminate claude; on Windows its tree, as an npm claude.cmd is cmd.exe running node and its tools are children."""
     if os.name != 'nt':
         return child.terminate()
-    # by path: taskkill run from the caller's directory, a checkout, could be its own
-    taskkill = os.path.join(os.environ.get('SystemRoot') or 'C:\\Windows', 'System32', 'taskkill.exe')
-    subprocess.run([taskkill, '/T', '/F', '/PID', str(child.pid)], capture_output=True, creationflags=NO_WINDOW)
+    windows.kill_tree(child, 10)
 
 
 def child_env():

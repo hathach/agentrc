@@ -32,10 +32,12 @@ import subprocess
 import sys
 import time
 import urllib.parse
-from pathlib import PureWindowsPath
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from search import DB, LIB, log_lookup, norm, resolve, tag_list  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "lib"))
+import windows  # noqa: E402
 
 INDEX = os.path.join(LIB, ".read-doc")
 # pdftotext's output changes with its options; bump VERSION when either changes.
@@ -143,20 +145,10 @@ def is_current(meta, bid, src):
             and library_path(meta.get("path")) == library_path(os.path.relpath(src, LIB)))
 
 
-def on_path(name, path=None):
-    """Windows: the program in an absolute PATH directory, not the one shutil.which and
-    CreateProcess find first in the current or python's own directory, nor a relative entry's."""
-    for d in (os.environ.get("PATH", "") if path is None else path).split(os.pathsep):
-        p = os.path.join(d, name + ".exe")
-        if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(p):
-            return p
-    return None
-
-
 def pdfinfo():
     if os.name != "nt":
         return "pdfinfo"
-    found = on_path("pdfinfo")
+    found = windows.on_path("pdfinfo", (".exe",))
     if not found:
         raise Unavailable("pdfinfo is not on PATH; install poppler")
     return found
@@ -168,7 +160,8 @@ def extractor():
     EXTRACTOR stays the manifest's identity."""
     cmd = [*EXTRACTOR, "-enc", "UTF-8"]
     if os.name == "nt" and cmd[0] == "pdftotext":
-        cmd[0] = on_path("pdftotext", os.path.dirname(pdfinfo())) or on_path("pdftotext")
+        cmd[0] = (windows.on_path("pdftotext", (".exe",), [os.path.dirname(pdfinfo())])
+                  or windows.on_path("pdftotext", (".exe",)))
         if not cmd[0]:
             raise Unavailable("pdftotext is not on PATH; install poppler")
     return cmd

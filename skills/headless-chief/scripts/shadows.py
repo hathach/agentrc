@@ -6,25 +6,21 @@ branch's stale copy of an agentrc entry runs in place of the installed one.
 import filecmp
 import os
 import subprocess
-from pathlib import Path, PureWindowsPath
+import sys
+from pathlib import Path
 
 AGENTRC = Path(__file__).resolve().parents[3]   # the agentrc checkout this module runs from
+sys.path.insert(0, str(AGENTRC / 'lib'))
+import windows  # noqa: E402
+
 KINDS = {'workflows': '.js', 'agents': '.md'}
 FOLD = str.casefold if os.name == 'nt' else str   # NTFS names match without case
 
 
 def on_path(name, exts):
-    """Windows: the program as PATH alone finds it, the first of exts in each directory, else None; shutil.which and
-    CreateProcess try the working directory, a contributor's checkout, first, as does a relative PATH entry.
-    Elsewhere the name, as execvp finds it."""
-    if os.name != 'nt':
-        return name
-    for d in os.environ.get('PATH', '').split(os.pathsep):
-        for e in exts:
-            p = os.path.join(d, name + e)
-            if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(p):
-                return p
-    return None
+    """Windows: the program as PATH alone finds it (windows.on_path), else None. Elsewhere the name, as execvp
+    finds it."""
+    return windows.on_path(name, exts) if os.name == 'nt' else name
 
 
 def project(payload, timeout=None):

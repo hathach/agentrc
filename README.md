@@ -21,6 +21,7 @@ workflows/     saved workflows (Claude only)
 bin/           commands for the human, such as lsusbt
 statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
 plugins/       herdr plugins, one folder each with a herdr-plugin.toml
+lib/           windows.py, the Windows runtime helpers the scripts reach through their resolved path
 tests/         unit tests for skill scripts, hooks and the installer
 ```
 

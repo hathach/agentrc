@@ -47,6 +47,9 @@ import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
+
 
 # esptool 5.5.0 __init__.py:295-349, 421-430, 1140-1158.
 # Refuse detect: cmds.py:2230-2235 guesses 4MB if size detection fails.
@@ -113,17 +116,11 @@ def split_command(line):
 def find_tool(name):
     if os.name != 'nt':
         return name if shutil.which(name) else None
-    # Windows: the file with its extension, since CreateProcess adds only .exe; a bare name on PATH only,
-    # since shutil.which and CreateProcess search the cwd (perhaps a checkout) first
+    # Windows: the file with its extension, since CreateProcess adds only .exe; a bare name on PATH only
     exts = ('',) if name.lower().endswith(('.exe', '.cmd', '.bat')) else ('.exe', '.cmd', '.bat')
-    # '.', 'bin', '\bin' or an empty entry would name a directory of the cwd or its drive
-    dirs = [''] if os.path.dirname(name) else [d for d in os.environ.get('PATH', '').split(os.pathsep)
-                                               if os.path.isabs(d) and os.path.splitdrive(d)[0]]
-    for directory in dirs:
-        for ext in exts:
-            if os.path.isfile(os.path.join(directory, name + ext)):
-                return os.path.join(directory, name + ext)
-    return None
+    if os.path.dirname(name):
+        return next((name + ext for ext in exts if os.path.isfile(name + ext)), None)
+    return windows.on_path(name, exts)
 
 
 def decode_nt(output):
@@ -150,12 +147,7 @@ def run_tool(command, env, timeout):
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
-            taskkill = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe')
-            try:
-                subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                pass    # still kill the tool itself, or Popen's exit waits on it
-            proc.kill()
+            windows.kill_tree(proc, 10)
             try:
                 exc.stdout, exc.stderr = proc.communicate(timeout=KILLED_DRAIN_S)
             except subprocess.TimeoutExpired:

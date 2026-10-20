@@ -36,6 +36,9 @@ except ImportError:  # Windows
     fcntl = None
     import msvcrt
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'lib'))
+import windows  # noqa: E402
+
 SESSION_ID = re.compile(r'[A-Za-z0-9-]+')
 REPO = re.compile(r'[\w.-]+/[\w.-]+')
 PR_ID = re.compile(REPO.pattern + r'#[1-9][0-9]*')
@@ -145,17 +148,12 @@ def render(cache):
 def publish(path, cache):
     tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
     tmp.write_text(json.dumps(cache))
-    if os.name != 'nt':
-        os.replace(tmp, path)
-        return
-    # Windows refuses the replace while a render reads the cache: retry, then leave it to the next publish
-    for _ in range(50):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            time.sleep(0.02)
-    tmp.unlink(missing_ok=True)
+    try:
+        windows.replace(tmp, path)
+    except PermissionError:
+        if os.name != 'nt':
+            raise
+        tmp.unlink(missing_ok=True)   # Windows: a render read the cache throughout; the next publish lands
 
 
 def query(prs):

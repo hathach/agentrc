@@ -39,13 +39,16 @@ import sys
 import tempfile
 import time
 from collections import Counter, defaultdict
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 try:
     import fcntl
 except ImportError:  # Windows
     fcntl = None
     import msvcrt
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'lib'))
+import windows  # noqa: E402
 
 MODEL = 'gpt-6.1-sol'  # codex exec -m
 EFFORT = 'medium'  # model_reasoning_effort
@@ -118,31 +121,10 @@ def release(file):
             file.close()
 
 
-def replace(source, target):
-    """os.replace; on Windows retried while another process has `target` open
-    (a prune reading state.json unlocked, an indexer), which refuses it."""
-    for _ in range(50 if os.name == 'nt' else 0):
-        try:
-            return os.replace(source, target)
-        except PermissionError:
-            time.sleep(0.02)
-    return os.replace(source, target)
-
-
-def on_path(name, exts):
-    """Windows: `name` from PATH alone, not the cwd, which shutil.which and
-    CreateProcess search first, a checkout that may be a contributor's, as does a relative PATH entry."""
-    for directory in os.environ.get('PATH', '').split(os.pathsep):
-        for ext in exts:
-            path = os.path.join(directory, name + ext)
-            if PureWindowsPath(directory).drive and PureWindowsPath(directory).root and os.path.isfile(path):
-                return path
-
-
 def codex_exe():
     if os.name != 'nt':
         return 'codex'
-    found = on_path('codex', ('.exe', '.cmd', '.bat'))
+    found = windows.on_path('codex', ('.exe', '.cmd', '.bat'))
     if not found:
         raise FileNotFoundError('codex is not on PATH')
     return found
@@ -157,9 +139,7 @@ def run_tree(cmd, input, timeout, **kwargs):
         try:
             process.communicate(input, timeout=timeout)
         except BaseException:
-            taskkill = os.path.join(os.environ.get('SystemRoot', 'C:/Windows'), 'System32', 'taskkill.exe')
-            subprocess.run([taskkill, '/T', '/F', '/PID', str(process.pid)], capture_output=True)
-            process.wait()
+            windows.kill_tree(process, 10)
             raise
     return subprocess.CompletedProcess(cmd, process.returncode)
 
@@ -623,7 +603,7 @@ class Locked:
         path = self.directory / 'state.json'
         temporary = path.with_suffix('.tmp')
         temporary.write_text(json.dumps(self.state))
-        replace(temporary, path)
+        windows.replace(temporary, path)  # Windows: retried while a prune reading state.json unlocked holds it
         release(self.lock)
 
 

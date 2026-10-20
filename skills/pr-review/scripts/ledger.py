@@ -70,6 +70,8 @@ except ImportError:  # Windows
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
 from facts import FULL_SHA, Parser, Unusable, git, report, run  # noqa: E402
 from launch_result import load_output  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 VERSION = 2
 CUT = 160
@@ -173,12 +175,7 @@ def locked(path):
 def store(path, led):
     tmp = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(led, indent=1, sort_keys=True) + '\n', encoding='utf-8')
-    for _ in range(49 if os.name == 'nt' else 0):
-        try:
-            return os.replace(tmp, path)
-        except PermissionError:  # Windows: a reader without the lock has the ledger open
-            time.sleep(0.02)
-    os.replace(tmp, path)
+    windows.replace(tmp, path)  # Windows: retried while a reader without the lock has the ledger open
 
 
 def digest(value):

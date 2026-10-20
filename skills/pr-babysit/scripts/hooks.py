@@ -29,6 +29,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Unusable, checkout_top, git, report  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 CONFIG = '.pre-commit-config.yaml'
 DEADLINE = 540
@@ -107,9 +109,7 @@ def modified_by(output, exit_code):
 
 def kill_tree(proc):
     if os.name == 'nt':
-        # by full path: a bare name would find a taskkill.exe in the checkout first
-        taskkill = os.path.join(os.environ.get('SystemRoot') or 'C:\\Windows', 'System32', 'taskkill.exe')
-        subprocess.run([taskkill, '/T', '/F', '/PID', str(proc.pid)], capture_output=True)
+        windows.kill_tree(proc, 10)
     else:
         try:
             os.killpg(proc.pid, signal.SIGKILL)

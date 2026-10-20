@@ -349,7 +349,8 @@ _running = []    # the tool run() waits on, for a signal handler that stops it r
 
 
 def kill(proc):
-    """Kill the tool; on Windows its whole process tree, which TerminateProcess alone would leave running."""
+    """Kill the tool; on Windows its whole process tree, which TerminateProcess alone would leave running. Kept here,
+    not lib/windows.py's kill_tree: pc_sample.py and this file are copied around without the rest of agentrc."""
     if os.name == 'nt':
         try:
             subprocess.run([os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe'),

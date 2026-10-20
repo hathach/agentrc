@@ -5,23 +5,17 @@ Codex 0.154 exposes rate limits only through the app-server JSON-RPC
 (`account/rateLimits/read`); there is no `codex usage` subcommand.
 """
 import json, os, subprocess, sys
-from pathlib import PureWindowsPath
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
+import windows  # noqa: E402
 
 WEEK_MINS = 10080
 WEEK_MIN, WEEK_MAX = 9576, 10584   # codex TUI treats +/-5% of a week as weekly
 
 
-def on_path(name, exts):
-    """Windows: `name` from PATH alone, not the cwd, which CreateProcess searches first, nor a relative entry."""
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        for e in exts:
-            p = os.path.join(d, name + e)
-            if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(p):
-                return p
-
-
 def read_rate_limits(timeout=25):
-    exe = "codex" if os.name != "nt" else on_path("codex", (".exe", ".cmd", ".bat"))
+    exe = "codex" if os.name != "nt" else windows.on_path("codex", (".exe", ".cmd", ".bat"))
     if not exe:
         return None
     p = subprocess.Popen([exe, "-c", "analytics.enabled=false", "app-server"],
@@ -48,12 +42,7 @@ def read_rate_limits(timeout=25):
                 return m.get("result")
         return None
     finally:
-        if os.name != "nt":
-            p.kill()
-        else:  # npm's codex.cmd runs cmd.exe, then node: kill the tree
-            taskkill = os.path.join(os.environ.get("SystemRoot", "C:/Windows"), "System32", "taskkill.exe")
-            subprocess.run([taskkill, "/T", "/F", "/PID", str(p.pid)], capture_output=True)
-            p.wait()
+        windows.kill_tree(p, 10)   # Windows: npm's codex.cmd runs cmd.exe, then node
 
 
 def weekly(result):
