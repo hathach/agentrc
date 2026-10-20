@@ -243,6 +243,7 @@ async function run(opts = {}) {
       if (push.pushed) prHead = to
       return push
     }
+    if (label === 'stop:ci') return conforms(options.schema, { stopped: true }, label)
     if (label.startsWith('prstate#')) {
       // preflight.py --state before a publication the CI lane is not watching: OPEN unless opts.prState (a value, or a function of the label) says otherwise.
       const state = typeof opts.prState === 'function' ? opts.prState(label) : opts.prState === undefined ? 'OPEN' : opts.prState
@@ -287,6 +288,8 @@ async function run(opts = {}) {
       } else if (/collect\.py bases /.test(text)) {
         answer = { head, bases: links.map(link => ({ link, base: baseOf(link) })) }
       } else if (/ inventory /.test(text)) {
+        // opts.inventoryWait(calls, label): hold an inventory read, as a wait still polling.
+        if (opts.inventoryWait) await opts.inventoryWait(calls, label)
         answer = {
           head: ci.headSha ?? head, status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
@@ -1460,7 +1463,7 @@ test('the fixer is told to stage nothing, and how to verify', async () => {
 test('the CI lane waits out its budget in slices, 30 minutes by default', async () => {
   const sliceCalls = (calls) => calls.filter(c => /^ci:collect#1\.\d+$/.test(c.label))
   const slices = (calls) => sliceCalls(calls)
-    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+)(?: --brief)?(?: --ignore-check '[^']*')* --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
+    .map(c => Number(c.prompt.match(/collect\.py inventory --wait-seconds (\d+)(?: --brief)?(?: --ignore-check '[^']*')* --stop-file '[^']*' --repo 'hathach\/tinyusb' --pr 3888 --head [0-9a-f]{40}`/)[1]))
   const { calls } = await run({ ci: RUNNING, args: { maxCycles: 1 } })
   assert.equal(slices(calls).reduce((a, b) => a + b), 30 * 60)
   const briefs = sliceCalls(calls).map(c => / --brief /.test(c.prompt))
@@ -2184,6 +2187,20 @@ test('once one lane met a rate limit, the other makes no further GitHub call thi
   assert.equal(posting.result.reason, 'github-rate-limited')
   assert.equal(posting.labels.some(l => /^(prstate|replies)#/.test(l)), false, 'the write gate stops before reading the PR state')
   assert.equal(posting.result.state.cyclesUsed, 0)
+})
+
+test('a limit the review lane met stops the CI wait in flight before its next poll, not at its end', async () => {
+  const hold = (calls, label) => label === 'ci:collect#1.1' ? afterReviewLane('reviews#1')(calls) : undefined
+  const { result, calls } = await run({ reviews: LIMITED_REVIEWS, ci: { status: 'running', infraRerun: [], realFailures: [] }, inventoryWait: hold, args: { maxCycles: 4 } })
+  assert.equal(result.reason, 'github-rate-limited')
+  const file = `${PIN.receipts}/ci-stop-1`
+  assert.ok(calls.find(c => c.label === 'ci:collect#1.1').prompt.includes(` --stop-file '${file}'`))
+  const stops = calls.filter(c => c.label === 'stop:ci')
+  assert.equal(stops.length, 1)
+  assert.ok(stops[0].prompt.includes(`'${file}'`))
+  const own = await run({ reviews: WAITING, garble: limitedInventory, args: { maxCycles: 4 } })
+  assert.equal(own.result.reason, 'github-rate-limited')
+  assert.equal(own.calls.some(c => c.label === 'stop:ci'), false, 'the collector\'s own limit ended its wait already')
 })
 
 test('another harvest error keeps today\'s path: every reviewer unknown, re-armed (#90)', async () => {

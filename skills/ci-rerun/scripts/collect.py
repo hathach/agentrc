@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Collect a PR's CI state for a watcher, so no model spends turns waiting or listing.
 
-  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief] [--ignore-check NAME...]
+  collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief] [--ignore-check NAME...] [--stop-file PATH]
   collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...]
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
@@ -13,7 +13,9 @@ prints one JSON object {head, status, mergeable, pending, registered, ignored, w
 refused for a rate limit, as pr-babysit's facts.py reports it; every
 line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
-again). The PR is read again on every poll. A check named exactly an
+again). The PR is read again on every poll; once --stop-file PATH exists (the
+caller met a GitHub rate limit elsewhere) it ends as an error before its next
+GitHub call, the first one included. A check named exactly an
 --ignore-check NAME (a review bot's status the caller tracks elsewhere) is left
 out of everything below, so a listing of only those is one with no check
 registered; `ignored` names those present, sorted, [] when none. `status` is
@@ -169,6 +171,9 @@ COMPARATOR = {'GT': '>', 'LT': '<'}
 CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
 
 
+STOP_FILE = None  # inventory --stop-file
+
+
 class Failed(Exception):
     def __init__(self, message, limit=None):
         super().__init__(message)
@@ -194,6 +199,8 @@ def rate_limit(stderr):
 
 
 def gh(*args, raw=False):
+    if STOP_FILE and os.path.exists(STOP_FILE):
+        raise Failed(f'stopped before the next GitHub call: {STOP_FILE} exists')
     try:
         done = subprocess.run(['gh', *args], capture_output=True)
     except OSError as e:
@@ -986,6 +993,7 @@ def main(argv=None):
     p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
     p.add_argument('--offset', type=int, help='recall: where the page to print starts, of the lone --check')
     p.add_argument('--ignore-check', action='append', default=[], metavar='NAME', help='inventory: leave out the checks of this exact name')
+    p.add_argument('--stop-file', metavar='PATH', help='inventory: make no further GitHub call once PATH exists')
     a = p.parse_args(argv)
     if a.offset is not None and (a.command != 'recall' or len(a.check) != 1):
         p.error('--offset is for recall with exactly one --check')
@@ -995,6 +1003,8 @@ def main(argv=None):
         p.error('--brief is for inventory')
     if a.ignore_check and a.command != 'inventory':
         p.error('--ignore-check is for inventory')
+    if a.stop_file and a.command != 'inventory':
+        p.error('--stop-file is for inventory')
     if '' in a.ignore_check or len(set(a.ignore_check)) != len(a.ignore_check):
         p.error('an --ignore-check name is empty or given more than once')
     if (a.command in ('failures', 'bases', 'recall')) != bool(a.check or a.gate):
@@ -1003,6 +1013,8 @@ def main(argv=None):
         p.error('a link is given more than once')
     if not SHA.fullmatch(a.head):
         p.error('--head must be a full 40-hex SHA')
+    global STOP_FILE
+    STOP_FILE = a.stop_file
     try:
         if a.command == 'inventory':
             out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds), set(a.ignore_check)), a.brief)

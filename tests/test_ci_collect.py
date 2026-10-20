@@ -207,6 +207,29 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []), 'pending checks are counted, not listed')
         self.assertEqual((self.calls.count(['pr', 'checks']), self.calls.count(['pr', 'view'])), (3, 4), 'the PR is read before, on every poll and after')
 
+    def test_a_stop_file_ends_the_wait_before_the_next_poll(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('hil', 'pending', JOB.format(3))]]
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stop = Path(tmp.name) / 'stop'
+        polls = []
+
+        def sleep(s):
+            self.clock[0] += s
+            polls.append(s)
+            if len(polls) == 2:
+                stop.touch()
+        with mock.patch.object(collect.time, 'sleep', sleep):
+            rc, r = self.main('--wait-seconds', '600', '--stop-file', str(stop))
+        self.assertEqual(rc, 1)
+        self.assertIn(f'stopped before the next GitHub call: {stop} exists', r['error'])
+        self.assertEqual((self.calls.count(['pr', 'checks']), self.calls.count(['pr', 'view'])), (2, 2),
+                         'no GitHub call once the file exists')
+        rc, r = self.main('--wait-seconds', '0', '--stop-file', str(stop))
+        self.assertEqual(rc, 1, 'nor a first one')
+        self.assertEqual(self.calls.count(['pr', 'view']), 2)
+
     def test_brief_lists_no_checks_only_while_running(self):
         self.heads = [HEAD]
         self.listings = [[self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]

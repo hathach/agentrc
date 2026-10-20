@@ -668,7 +668,20 @@ const withNulls = (s, v) => {
 }
 // The first refusal for a GitHub rate limit this cycle: facts.py's rateLimit plus its error (#90).
 let githubLimit = null
-const noteLimit = (limit) => { githubLimit = githubLimit || limit }
+// While a CI wait runs beside the review lane, the file collect.py checks before each GitHub call: a limit the
+// review lane meets ends that wait at its next poll, not at the slice's end. The collector's own limit ends it already.
+let ciStopFile = null
+let ciStopSent = null
+const STOPPED = { type: 'object', additionalProperties: false, required: ['stopped'], properties: { stopped: { type: 'boolean' }, error: { type: 'string' } } }
+const noteLimit = (limit, from = '') => {
+  if (githubLimit) return
+  githubLimit = limit
+  if (!ciStopFile || from.startsWith('ci:')) return
+  ciStopSent = relayRun(
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`touch -- ${shq(ciStopFile)} && echo '{"stopped": true}'\` ` + relayed(STOPPED),
+    { label: 'stop:ci', phase: 'Triage', model: 'haiku', effort: 'low', schema: STOPPED },
+  )
+}
 // A copy that fails its script's seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, ...opts }) => {
@@ -677,7 +690,7 @@ const relayAgent = async (prompt, { fileTool, ...opts }) => {
     log(`${opts.label}: the relayed copy does not match its seal`)
     return null
   }
-  if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit })
+  if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
   return v
 }
 // A dead or unsealed relay gets one fresh Sonnet agent (Haiku mis-copies a long line); only for a script safe to run twice.
@@ -1842,7 +1855,8 @@ const ciLaneRun = async (cycle, lanes, entry) => {
       (payload ? `\n${JSON.stringify(payload)}` : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }
     return relayRun(prompt(command), opts).then(got => {
-      if (got) return got
+      // A retry after a rate limit would only call GitHub again.
+      if (got || githubLimit) return got
       shortened = shortened || /--wait-seconds [1-9]/.test(command)
       return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts)
     })
@@ -1874,11 +1888,15 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   let inv = null
   let last = false
   let left = unregistered ? 0 : ciWait * 60
+  const stop = `${pinned.receipts.trim()}/ci-stop-${cycle}`
   for (let k = 1; ; k++) {
     const slice = Math.min(lanes.reviewDone ? 540 : 180, left)
     // A --brief slice still running prints no checks, so a relay copies nothing it reads again; the budget's last slice is whole.
     last = left - slice < 30
-    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}${ignoring}`, INVENTORY)
+    ciStopFile = lanes.reviewDone ? null : stop
+    inv = await collect(`ci:collect#${cycle}.${k}`, `inventory --wait-seconds ${slice}${last ? '' : ' --brief'}${ignoring} --stop-file ${shq(stop)}`, INVENTORY)
+    ciStopFile = null
+    if (githubLimit) await ciStopSent
     if (inventoryFailed(inv)) return null
     left -= slice
     if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended || reviewOnly(inv) || githubLimit) break
