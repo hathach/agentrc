@@ -118,6 +118,8 @@ WRAPPER_FLAGS = {
 PAGER_ENV = {'PAGER', 'GIT_PAGER'}
 RUN_ENV = {'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_EDITOR',
            'EDITOR', 'VISUAL', 'GIT_SEQUENCE_EDITOR', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'BASHOPTS', 'TAR_OPTIONS'}
+# GIT_TRACE* values git reads as off or stderr; any other is an fd, an absolute path or a socket it appends trace to
+GIT_TRACE_QUIET = {'', '0', 'false', '1', '2', 'true'}
 # builtins whose assignment operands set the environment a later command inherits
 DECLARES = {'export', 'declare', 'typeset', 'readonly', 'local'}
 SHELLS = {'sh', 'bash', 'zsh', 'dash'}
@@ -736,8 +738,9 @@ def strip_wrapper_options(name, words):
 
 
 def forbidden_env(word, bash=True):
-    """An env assignment a tool runs as a command: a pager other than cat, or a variable git executes from. Only bash
-    reads `NAME+=value` as an append; env sets a variable named `NAME+`."""
+    """An env assignment a tool runs as a command: a pager other than cat, or a variable git executes from; or a
+    GIT_TRACE* naming where git writes trace output. Only bash reads `NAME+=value` as an append; env sets a variable
+    named `NAME+`."""
     name, _, value = word.partition('=')
     append = bash and name.endswith('+')
     name = name.removesuffix('+') if append else name
@@ -746,6 +749,9 @@ def forbidden_env(word, bash=True):
         raise Denied(f'`{word.translate(UNQUOTED)}` runs a command as the pager; only `{name}=cat` passes')
     if name in RUN_ENV or name.startswith('GIT_CONFIG'):
         raise Denied(f'`{name}` makes a tool run a command this guard cannot vet; dispatch the step to a unit')
+    if name.startswith('GIT_TRACE') and (append or value.translate(UNQUOTED).lower() not in GIT_TRACE_QUIET):
+        raise Denied(f'`{word.translate(UNQUOTED)}` makes git write trace output to a file this guard cannot vet; only '
+                     f'`{name}=1` (stderr) or `{name}=0` passes')
 
 
 def options(words):

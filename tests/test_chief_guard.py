@@ -308,6 +308,14 @@ class ChiefGuard(unittest.TestCase):
                   "GIT_CONFIG_PARAMETERS=\"'core.fsmonitor'='x'\" git status", 'GIT_CONFIG_GLOBAL=/tmp/c git status',
                   'GIT_CONFIG_SYSTEM=/tmp/c git log', 'env GIT_CONFIG_COUNT=1 git status'):
             self.assert_denied(c)
+        # git appends trace output to the file, socket or fd a GIT_TRACE* value names, with no redirect to judge
+        for c in (f'GIT_TRACE={self.wt}/src/a.c git status', f'export GIT_TRACE2_EVENT={self.wt}/x; git log',
+                  'GIT_TRACE2=af_unix:/tmp/s git log', 'env GIT_TRACE_PACKET=/tmp/t git status', 'GIT_TRACE=3 git log',
+                  'GIT_TRACE+=1 git status'):
+            self.assert_denied(c, 'trace output')
+        for c in ('GIT_TRACE=1 git status', 'GIT_TRACE=true git log', 'GIT_TRACE2_PERF=2 git status',
+                  'GIT_TRACE=0 git log', 'export GIT_TRACE=False'):
+            self.assert_allowed(c)
         for c in ('git -c core.pager=cat diff', 'git -c color.ui=never log', 'git -c core.quotepath=off status',
                   'git -ccolor.ui=always log', 'git -c core.quotepath=false -c color.ui=auto status'):
             self.assert_allowed(c)
