@@ -39,6 +39,21 @@ SCRIPTS = {
 }
 
 
+def running(pid):
+    """A killed hook is a zombie until whoever inherited it reaps it: that is not running."""
+    if os.path.isdir('/proc'):
+        try:
+            with open(f'/proc/{pid}/stat') as f:
+                return f.read().rsplit(')', 1)[1].split()[0] not in ('Z', 'X')
+        except OSError:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 @unittest.skipUnless(shutil.which('pre-commit'), 'pre-commit is not installed')
 class HooksTest(unittest.TestCase):
     def setUp(self):
@@ -119,8 +134,11 @@ class HooksTest(unittest.TestCase):
         code, out = self.run_script('--deadline-seconds', '2', 'a.txt', env={**self.env, 'HOOK_PID': str(pid)})
         self.assertEqual(code, 2)
         self.assertRegex(out['error'], r'pre-commit did not finish within 2 s')
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int(pid.read_text()), 0)
+        hook, deadline = int(pid.read_text()), time.monotonic() + 10
+        while running(hook):
+            if time.monotonic() > deadline:
+                self.fail(f'the hook ({hook}) outlived the kill')
+            time.sleep(0.05)
 
     @unittest.skipUnless(shutil.which('setsid') and os.name != 'nt', 'needs setsid')
     def test_a_process_that_escapes_the_kill_does_not_hold_the_result(self):
