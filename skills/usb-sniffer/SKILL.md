@@ -139,7 +139,7 @@ the tap) and lists every device when several enumerated — pick by frame order.
 ```bash
 sudo cp <skill dir>/scripts/88-usb-sniffer.rules /etc/udev/rules.d/   # capture port + blank FX2LP, usbfs limit
 sudo udevadm control --reload-rules && sudo udevadm trigger -s usb --settle
-cat /sys/module/usbcore/parameters/usbfs_memory_mb   # with a unit attached: 0 (no limit) or >= 64, until reboot
+cat /sys/module/usbcore/parameters/usbfs_memory_mb   # with a unit attached: 0 (no limit) or >= 64
 # Ubuntu only (AppArmor restricts unprivileged user namespaces): lets every user's unshare make one, not only captures
 sudo cp <skill dir>/scripts/usb-sniffer-unshare.apparmor /etc/apparmor.d/usb-sniffer-unshare
 sudo apparmor_parser -r /etc/apparmor.d/usb-sniffer-unshare
