@@ -173,9 +173,9 @@ STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cann
 STDIN_PATH = re.compile(r'(^|/)(stdin|fd/\d+)$')
 WRITE_RULE = 'chief writes only its artifacts, named by a literal absolute path outside the task worktree; a worktree change goes to a writer'
 LINK_RULE = ('on Windows a link to the task worktree is a path this guard cannot follow; a link names a literal absolute '
-             'source outside it') if os.name == 'nt' else \
+             'source outside it, not one holding it') if os.name == 'nt' else \
     ('a link to the task worktree lets a later write reach it unseen (a hard link through chief\'s directory, a symlink '
-     'made in the same command); a link names a literal absolute source outside the worktree')
+     'made in the same command); a link names a literal absolute source outside the worktree, not one holding it')
 
 
 class Denied(Exception):
@@ -240,8 +240,9 @@ class Guard:
     def __init__(self, payload):
         self.payload, self.root = payload, None
 
-    def inside(self, path):
-        """Is this absolute path in the worktree, chief's own directory apart; the worktree is read once, on first use."""
+    def inside(self, path, ancestors=False):
+        """Is this absolute path in the worktree, chief's own directory apart, or with ancestors one holding it; the
+        worktree is read once, on first use."""
         if self.root is None:
             try:
                 root, chief = project(self.payload, timeout=remaining())
@@ -249,20 +250,22 @@ class Guard:
                 raise Denied(TOO_LONG) from None
             self.root, self.chief = resolved(root), chief and resolved(chief)
         p = resolved(path)
-        return p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
+        return (p.is_relative_to(self.root) and not (self.chief and p.is_relative_to(self.chief))
+                or ancestors and self.root.is_relative_to(p))
 
-    def outside(self, path):
+    def outside(self, path, ancestors=False):
         """Is this word a literal absolute path outside the worktree."""
         path = path.translate(UNQUOTED)
         if path == '/dev/null':
             return True
-        return not (UNKNOWN in path or '$' in path or not (places := absolute(path)) or any(self.inside(p) for p in places))
+        return not (UNKNOWN in path or '$' in path or not (places := absolute(path)) or any(self.inside(p, ancestors) for p in places))
 
     def writes(self, path, why, glob=True, verb='write', rule=WRITE_RULE):
         if glob and GLOBSET & set(path):
             raise Denied(f'{why} would {verb} {path.translate(UNQUOTED)}, which names an unquoted glob or brace: it must name '
                          'one literal path; quote it if it is a literal path, or dispatch the step to a unit')
-        if not self.outside(path):
+        # a link to a directory holding the worktree reaches it as a link to the worktree does
+        if not self.outside(path, ancestors=verb == 'link'):
             raise Denied(f'{why} would {verb} {path.translate(UNQUOTED)}: {rule}')
 
     def command(self, command, depth=0):
@@ -652,7 +655,7 @@ def unwrap(words):
     """(the command a word list runs, past assignments, keywords and wrappers with their options; whether xargs runs it,
     with arguments known only at run time; xargs' -I replace string; whether xargs was the last wrapper, so a missing
     command is its echo). An assignment a tool runs as a command, a wrapper option outside the wrapper's known table,
-    and sudo starting a shell with no command, which reads stdin, are denied."""
+    a wrapper word expanded at run time, and sudo starting a shell with no command, which reads stdin, are denied."""
     xargs, replace, name = False, None, None
     while words:
         w = words[0]
@@ -670,12 +673,17 @@ def unwrap(words):
             if name == 'xargs' and xargs:
                 raise Denied('xargs under xargs substitutes into the inner command at run time; run one xargs')
             xargs = xargs or name == 'xargs'
-            words, values = strip_wrapper_options(name, words[1:])
+            given = words[1:]
+            words, values = strip_wrapper_options(name, given)
             replace = values.get('-I', replace) if name == 'xargs' else replace
             if name == 'sudo' and not words and ('-s' in values or '-i' in values):
                 raise Denied(STDIN_RULE)
             if name == 'timeout' and words:
                 words = words[1:]  # the duration
+            # bash splits an expansion into words, so one option value or assignment may hold the program
+            if any('$' in w or UNKNOWN in w for w in given[:len(given) - len(words)]):
+                raise Denied(f'`{name}` takes a word expanded at run time, which may split into more words and hide the '
+                             'program; give its options and assignments literally')
         else:
             break
     return words, xargs, replace, name == 'xargs'
@@ -695,8 +703,10 @@ def strip_wrapper_options(name, words):
         if a == '--' and not ended:
             ended = True
             continue
-        # env reads every word holding `=` before its program as an assignment, past `--` too
-        if name == 'env' and '=' in a and (ended or not a.startswith('-')):
+        # env reads every word holding `=` before its program as an assignment, past `--` too; sudo one before `--` not
+        # starting with `/`, then reads options again
+        if '=' in a and (name == 'env' and (ended or not a.startswith('-'))
+                         or name == 'sudo' and not (ended or a.startswith(('-', '/')))):
             forbidden_env(a, bash=False)
             continue
         if ended or not a.startswith('-') or (a == '-' and '-' not in flags):

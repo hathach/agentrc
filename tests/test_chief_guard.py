@@ -343,6 +343,27 @@ class ChiefGuard(unittest.TestCase):
         for c in ('env GIT_PAGER+=less git log', 'env a.b=c git log', 'env -- a=b git status'):
             self.assert_allowed(c)
 
+    def test_sudo_reads_words_with_an_equals_sign_before_its_command_as_assignments(self):
+        # sudo sets `x=y` words before `--` that do not start with `/`, then reads its options again
+        for c in ('sudo a.b=c git push', 'sudo -n a.b=c git push', 'sudo A=1 -u root git push', 'sudo a-b=c git push'):
+            self.assert_denied(c, 'changes the repository')
+        self.assert_denied(f'sudo a.b=c rm {self.wt}/src/a.c', 'literal absolute path')
+        self.assert_denied('sudo GIT_PAGER=less git log', 'pager')
+        # past `--`, or from `/`, sudo runs the word itself; like env it sets a variable named `GIT_PAGER+`
+        for c in ('sudo -- a.b=c git push', 'sudo /tmp/a=b git push', 'sudo GIT_PAGER+=less git log', 'sudo a.b=c git log'):
+            self.assert_allowed(c)
+
+    def test_a_wrapper_word_expanded_at_run_time_is_denied(self):
+        # bash splits an unquoted expansion: one option value, duration or assignment may hold the program
+        for c in (f"X='FOO rm {self.wt}/src/a.c'; env -u $X true", f"X='5 rm {self.wt}/src/a.c'; timeout $X true",
+                  f"X='b rm {self.wt}/src/a.c'; env a=$X true", "X='5 git push'; timeout $X",
+                  "O='-s KILL'; timeout $O 30 git push", 'nice -n $N git log', 'timeout --kill-after=$K 5 git log',
+                  'sudo -u $U git log', 'sudo A=$X git log', 'xargs -n $(nproc) cat', 'env -u "$X" git log'):
+            self.assert_denied(c, 'expanded at run time')
+        # bash does not split an assignment's value, and the program's own arguments are its own
+        for c in ('GIT_DIR=$HOME/r git log', 'timeout 5 echo $X', 'env -u FOO cat "$F"', 'nice -n 5 git log -- $P'):
+            self.assert_allowed(c)
+
     def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):
         for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
                   'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',
@@ -376,11 +397,14 @@ class ChiefGuard(unittest.TestCase):
                   f'ln -s {self.wt}/src /tmp/link && printf changed > /tmp/link/a.c',
                   f'ln -s {self.wt}/src /tmp/l', f'ln -S~ -s {self.wt}/src /tmp/l', f'ln --suffix=x -s {self.wt}/src /tmp/l',
                   # a relative symlink names a path from the link's directory, which this does not place
-                  'ln -s src /tmp/l', 'ln -s ../x /tmp/l'):
+                  'ln -s src /tmp/l', 'ln -s ../x /tmp/l',
+                  # a directory holding the worktree reaches it through the link as the worktree itself does
+                  f'ln -s {self.wt}/.. /tmp/n && printf x > /tmp/n/wt/src/a.c', f'ln -s / /tmp/n && printf x > /tmp/n{self.wt}/src/a.c',
+                  f'ln -s {self.wt}/.. /tmp/n && rm /tmp/n/wt/src/a.c', f'ln -s {root} /tmp/n', f'cp -as {root} /tmp/n'):
             self.assert_denied(c, 'would link')
         # a copy and a link from outside are fine
         for c in (f'cp {self.wt}/src/a.c /tmp/h', 'ln /tmp/a /tmp/b', 'ln -s /tmp/a /tmp/b', 'cp --suffix -S /tmp/a /tmp/b',
-                  'cp -l /tmp/a /tmp/b', 'rsync -a --link-dest=/tmp/prev /tmp/a/ /tmp/b/'):
+                  'cp -l /tmp/a /tmp/b', 'rsync -a --link-dest=/tmp/prev /tmp/a/ /tmp/b/', f'ln -s {root}/x /tmp/l'):
             self.assert_allowed(c)
 
     def test_unquoted_globs_in_a_write_target_are_denied(self):
