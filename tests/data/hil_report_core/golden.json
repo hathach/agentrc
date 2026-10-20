@@ -1,0 +1,74 @@
+{
+  "sources": {
+    "tinyusb": {
+      "commit": "2c992c00272bcba4e06cdcc7ed5a76cc9aac3278",
+      "path": "test/hil/helper/hil_report.py"
+    },
+    "tinyuf2": {
+      "commit": "ce6db76ef8ef9135fef19ac14bb76fcc57ae913f",
+      "path": ".claude/skills/hil-contract/scripts/hil_ci.py"
+    }
+  },
+  "tinyusb_render_report": {
+    "two_boards_variants_metrics": "**✅ 4 passed · ❌ 2 failed · ⚪ 2 skipped · blank not run**\n\n| Board              | usbtest  | cdc_msc_throughput | msc_file_explorer | cdc_msc | cdc_msc_hid | host_info_to_device_cdc | duration |\n| ------------------ | :------: | :----------------: | :---------------: | :-----: | :---------: | :---------------------: | :------: |\n| stm32f407disco     | ❌ 29/30 |     480.0 MBps     |                   |   ✅    |     ⚪      |                         |   119s   |\n| raspberry_pi_pico2 |          |                    |  ⚪ board wedged  |   ❌    |             |           ✅            |    7s    |\n| mimxrt1064_evk-dma |          |                    |                   |   ✅    |             |                         |          |",
+    "scoped_with_abort_caveat": "**HIL run aborted: worker pool timed out after 3600s.**\n\n_Scoped run: 1 board(s) — stm32f723disco. Boards/tests not listed were not run._\n\n**✅ 1 passed · ❌ 1 failed · ⚪ 0 skipped · blank not run**\n\n| Board          | cdc_msc | pool-timeout | duration |\n| -------------- | :-----: | :----------: | :------: |\n| stm32f723disco |   ✅    |      ❌      |  3600s   |",
+    "no_boards": "**HIL run selected no boards.** filters intersected to nothing\n\nNo tests were run.",
+    "retired_row_and_history": "**✅ 2 passed · ❌ 0 failed · ⚪ 0 skipped · blank not run**\n\n| Board               | board-locked | cdc_msc | duration |\n| ------------------- | :----------: | :-----: | :------: |\n| ch32v307v_r1_1v0-fs |     held     |   ✅    |   12s    |",
+    "malformed_rows": "**✅ 1 passed · ❌ 0 failed · ⚪ 0 skipped · blank not run**\n\n| Board  | cdc_msc | duration |\n| ------ | :-----: | :------: |\n| boardA |   ✅    |          |\n| half   |         |          |\n| ?      |         |          |",
+    "lock_and_build_cells": "**✅ 1 passed · ❌ 3 failed · ⚪ 0 skipped · blank not run**\n\n| Board          |         board-locked         |     cleanup-pending     |   lock-unavailable   |   run-aborted    | duration |\n| -------------- | :--------------------------: | :---------------------: | :------------------: | :--------------: | :------: |\n| nanoch32v203   | held by hil_test.py pid 4242 |                         | ❌ lock dir unusable |                  |          |\n| feather_rp2040 |                              | ❌ receipt r1 holder 77 |                      | ❌ build refused |    1s    |"
+  },
+  "tinyuf2_verdict": {
+    "no_report": [
+      "blocker",
+      "run ended without a report (exit 137)"
+    ],
+    "no_row": [
+      "blocker",
+      "report has no row for B (exit 1): boom"
+    ],
+    "ran_none": [
+      "blocker",
+      "cleanup failed or no report; board held: None {}"
+    ],
+    "refused_before_hardware": [
+      "not-run",
+      "no probe"
+    ],
+    "probe_users": [
+      "blocker",
+      "p"
+    ],
+    "untouched_failure": [
+      "not-run",
+      "install: x (nothing written)"
+    ],
+    "abort_without_failed_step": [
+      "blocker",
+      "aborted: None"
+    ],
+    "held_after_cleanup": [
+      "blocker",
+      "cleanup failed or no report; board held: None {'pass': False, 'state': 'blinky copied', 'heldAfter': True, 'holder': {'pid': 9}}"
+    ],
+    "in_process_holder": [
+      "blocker",
+      "cleanup failed or no report; board held: None {'pass': False, 'heldAfter': True, 'holder': {'pid': 9, 'inProcess': True}}"
+    ],
+    "locked": [
+      "not-run",
+      "locked: held by pid 7"
+    ],
+    "locked_recovery_blocker": [
+      "blocker",
+      "locked: cleanup holder 8"
+    ],
+    "pass": [
+      "pass",
+      ""
+    ],
+    "fail_after_write": [
+      "fail",
+      "copy: drive vanished"
+    ]
+  }
+}

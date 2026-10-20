@@ -1,0 +1,51 @@
+{
+  "tinyusb_docs": {
+    "two_boards_variants_metrics": {
+      "rows": [
+        {"board": "stm32f407disco", "cells": {"device/cdc_msc": "pass", "device/usbtest": "❌ 29/30", "device/cdc_msc_throughput": "480.0 MBps", "host/cdc_msc_hid": "skip"}, "duration": "119s"},
+        {"board": "raspberry_pi_pico2", "cells": {"device/cdc_msc": "fail", "dual/host_info_to_device_cdc": "pass", "device/msc_file_explorer": "⚪ board wedged"}, "duration": "7s"},
+        {"board": "mimxrt1064_evk-dma", "cells": {"device/cdc_msc": "pass"}, "duration": null}
+      ],
+      "scope": "", "caveat": ""
+    },
+    "scoped_with_abort_caveat": {
+      "rows": [{"board": "stm32f723disco", "cells": {"device/cdc_msc": "pass", "pool-timeout": "fail"}, "duration": "3600s"}],
+      "scope": "1 board(s) — stm32f723disco",
+      "caveat": "**HIL run aborted: worker pool timed out after 3600s.**\n"
+    },
+    "no_boards": {"rows": [], "scope": "", "caveat": "**HIL run selected no boards.** filters intersected to nothing\n"},
+    "retired_row_and_history": {
+      "rows": [
+        {"board": "ch32v307v_r1_1v0", "cells": {}, "duration": null, "history": [{"board-locked": "held by ci"}], "retired": true},
+        {"board": "ch32v307v_r1_1v0-fs", "cells": {"device/cdc_msc": "pass", "board-locked": "held"}, "duration": "12s", "history": [{"device/cdc_msc": "fail"}]}
+      ],
+      "scope": "", "caveat": ""
+    },
+    "malformed_rows": {
+      "rows": [{"board": "boardA", "cells": {"cdc_msc": "pass"}}, {"board": "half"}, {}],
+      "scope": "", "caveat": ""
+    },
+    "lock_and_build_cells": {
+      "rows": [
+        {"board": "nanoch32v203", "cells": {"board-locked": "held by hil_test.py pid 4242", "lock-unavailable": "❌ lock dir unusable"}, "duration": null},
+        {"board": "feather_rp2040", "cells": {"run-aborted": "❌ build refused", "cleanup-pending": "❌ receipt r1 holder 77"}, "duration": "1s"}
+      ],
+      "scope": "", "caveat": ""
+    }
+  },
+  "tinyuf2_verdicts": [
+    {"name": "no_report", "code": 137, "report": null},
+    {"name": "no_row", "code": 1, "report": {"pass": false, "caveat": "", "results": [], "error": "boom"}},
+    {"name": "ran_none", "code": 1, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": null, "pass": false}]}},
+    {"name": "refused_before_hardware", "code": 2, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": false, "detail": "no probe"}]}},
+    {"name": "probe_users", "code": 2, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": false, "probeUsers": [5], "detail": "p"}]}},
+    {"name": "untouched_failure", "code": 1, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": true, "pass": false, "steps": [{"step": "install", "pass": false, "detail": "x"}], "cleanup": {"pass": true, "state": "untouched"}}]}},
+    {"name": "abort_without_failed_step", "code": 1, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": true, "pass": false, "steps": [], "cleanup": {"pass": true, "state": "untouched"}}]}},
+    {"name": "held_after_cleanup", "code": 4, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": true, "pass": false, "steps": [{"step": "install", "pass": true}], "cleanup": {"pass": false, "state": "blinky copied", "heldAfter": true, "holder": {"pid": 9}}}]}},
+    {"name": "in_process_holder", "code": null, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": true, "pass": false, "steps": [{"step": "install", "pass": true}], "cleanup": {"pass": false, "heldAfter": true, "holder": {"pid": 9, "inProcess": true}}}]}},
+    {"name": "locked", "code": 1, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": false, "pass": false, "locked": true, "recoveryBlocker": false, "detail": "held by pid 7"}]}},
+    {"name": "locked_recovery_blocker", "code": 1, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": false, "pass": false, "locked": true, "recoveryBlocker": true, "detail": "cleanup holder 8"}]}},
+    {"name": "pass", "code": 0, "report": {"pass": true, "caveat": "", "results": [{"board": "B", "ran": true, "pass": true, "steps": [{"step": "install", "pass": true}, {"step": "dfu", "pass": true}], "cleanup": {"pass": true, "state": "blinky copied", "heldAfter": false}}]}},
+    {"name": "fail_after_write", "code": 1, "report": {"pass": false, "caveat": "", "results": [{"board": "B", "ran": true, "pass": false, "steps": [{"step": "install", "pass": true}, {"step": "copy", "pass": false, "detail": "drive vanished"}], "cleanup": {"pass": true, "state": "blinky copied", "heldAfter": false}}]}}
+  ]
+}

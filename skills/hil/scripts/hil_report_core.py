@@ -1,0 +1,717 @@
+#!/usr/bin/env python3
+"""The HIL report document shared by the project harnesses (`hil` skill, Reporting and
+Verdicts). Stdlib only, no registry: a project passes its BodySchema and its own rows.
+
+A report is the project's native JSON body (its field paths unchanged) plus one reserved
+`_hil` metadata object. `<stem>.json` is authoritative; `<stem>.md` is a view rendered from the
+serialised JSON and regenerable from it (prepare_pair), so the pair is not crash-atomic.
+Every attempt that a later one replaces is archived first, create-only, under
+`<stem>.attempts/<attempt id>/`; an accumulated attempt names its predecessor in
+`_hil.previous_attempt`, which read_chain follows. One writer per report dir: each call
+that writes holds `.<stem>.lock` and refuses, never waits, while another holds it.
+
+Adapters keep the native outcome fields their verdicts need (a runner's exit status, an
+in-process holder) in the body; `_hil.termination` says only how the run ended.
+
+Verdicts follow the `hil` skill: apply_run_rules for one attempt's rows, sequence_verdict
+for a retry sequence, which stays apart from the current attempt's view.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import time
+import unicodedata
+from pathlib import Path
+from typing import Callable, NamedTuple
+
+try:
+    import fcntl
+except ImportError:   # Windows: a consumer's copy-back location
+    fcntl = None
+    import msvcrt
+
+META = '_hil'
+META_VERSION = 1
+TERMINATIONS = ('completed', 'timeout', 'aborted', 'no-boards')
+VERDICTS = ('blocker', 'fail', 'not-run', 'pass')   # precedence order
+EVIDENCE = ('firmware-validation', 'farm-health')
+READABLE = ('empty', 'valid')                       # the other outcomes: missing, corrupt, unsupported
+NOTICE = '**HIL report unavailable'
+_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
+_META_TYPES = {'version': int, 'body_schema': str, 'body_version': int, 'attempt_id': str,
+               'previous_attempt': (str, type(None)), 'termination': str, 'invocation': list,
+               'selection': list, 'host': str, 'roster': dict}
+_META_OPTIONAL = {'build': dict, 'legacy_text': str}
+_ROW_KEYS = {'board', 'verdict', 'detail', 'evidence'}
+
+
+class ReportError(Exception):
+    """A report operation refused or failed. `stage` names where; `published` the files it had
+    already replaced, so a caller reports exactly what reached the dir."""
+
+    def __init__(self, stage: str, msg: str, published=()):
+        super().__init__(f'{stage}: {msg}')
+        self.stage = stage
+        self.published = tuple(published)
+
+
+class BodySchema(NamedTuple):
+    """A project's report body. `name` and `version` go into `_hil` as body_schema and
+    body_version; `reads` are the older body versions it still reads. `check(body)` raises
+    ValueError or TypeError on a body it cannot use; `empty(body)` says a valid body holds no
+    result; `render(body)` returns the whole Markdown file; `legacy(raw)` returns the body of a
+    document without `_hil`, or is None to refuse every such document. `evidence` is what the
+    document may count as: a 'farm-health' body never yields validation verdicts."""
+    name: str
+    version: int
+    stem: str
+    evidence: str
+    check: Callable[[dict], None]
+    empty: Callable[[dict], bool]
+    render: Callable[[dict], str]
+    legacy: Callable[[dict], dict] | None = None
+    reads: tuple = ()
+
+
+class Reading(NamedTuple):
+    """One document read: `outcome` missing | corrupt | unsupported | empty | valid; `body` the
+    native fields (every project field kept, `_hil` removed), `meta` its `_hil` (None for a
+    legacy document) and `raw` the file's bytes."""
+    outcome: str
+    body: dict | None
+    meta: dict | None
+    detail: str = ''
+    raw: bytes | None = None
+
+    @property
+    def legacy(self) -> bool:
+        return self.meta is None and self.outcome in READABLE
+
+
+class Attempt(NamedTuple):
+    """An attempt started by start_attempt. `previous_attempt` is set only when accumulating;
+    `prior` is then the reading it accumulates onto. `archived` is the archive id of the
+    report it replaces, `legacy_text` a prior Markdown whose JSON could not be read."""
+    attempt_id: str
+    previous_attempt: str | None
+    prior: Reading | None
+    archived: str | None
+    legacy_text: str | None
+
+
+class AttemptContext(NamedTuple):
+    """One attempt of a chain (read_chain, oldest first). The project fills `run`
+    (apply_run_rules of a readable attempt), `retry` (this attempt is an eligible retry of its
+    predecessor's fails: no locked peer, within the retry count) and `final` (boards whose
+    fail the contract names final)."""
+    attempt_id: str
+    previous_attempt: str | None
+    outcome: str   # a Reading outcome, or 'mismatched'
+    reading: Reading
+    run: dict | None = None
+    retry: bool = False
+    final: frozenset = frozenset()
+
+
+# --- tables ---------------------------------------------------------------------------------
+def display_width(s: str) -> int:
+    """Terminal columns, not characters: the ✅ ❌ ⚪ marks are one character and two
+    columns, so len() pads a cell holding one a column short of the header rule."""
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in s)
+
+
+def pad(s: str, width: int, center: bool = False) -> str:
+    """str.ljust/center, measured in display columns."""
+    room = max(0, width - display_width(s))
+    if not center:
+        return s + ' ' * room
+    left = room // 2
+    return ' ' * left + s + ' ' * (room - left)
+
+
+def table(headers: list, rows: list, center=frozenset()) -> str:
+    """An aligned Markdown table of string cells, each column as wide as its widest cell; the
+    columns whose index is in `center` are centred (`:--:`), the rest left-aligned."""
+    if any(len(r) != len(headers) for r in rows):
+        raise ValueError(f'every row needs {len(headers)} cells')
+    widths = [max([display_width(h)] + [display_width(r[i]) for r in rows])
+              for i, h in enumerate(headers)]
+
+    def line(values):
+        return '| ' + ' | '.join(pad(v, w, i in center)
+                                 for i, (v, w) in enumerate(zip(values, widths))) + ' |'
+
+    sep = '| ' + ' | '.join(':' + '-' * (w - 2) + ':' if i in center else '-' * w
+                            for i, w in enumerate(widths)) + ' |'
+    return '\n'.join([line(headers), sep] + [line(r) for r in rows])
+
+
+def matrix(label: str, columns: list, rows: list, marks: dict, headers: list | None = None) -> str:
+    """Rows of (row label, {column: value}) as a table: the label column left-aligned, then one
+    centred column per entry of `columns`, in that order, headed by `headers` (default the
+    column keys). A value shows as marks.get(value, value), an absent one blank."""
+    headers = list(columns) if headers is None else list(headers)
+    if len(headers) != len(columns):
+        raise ValueError('one header per column')
+    body = []
+    for name, cells in rows:
+        if any(not isinstance(v, str) for v in cells.values()):
+            raise TypeError(f'row {name}: cell values must be strings')
+        body.append([name] + [marks.get(cells[c], cells[c]) if c in cells else '' for c in columns])
+    return table([label] + headers, body, center=frozenset(range(1, len(columns) + 1)))
+
+
+# --- reading --------------------------------------------------------------------------------
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _meta_problem(meta, schema: BodySchema):
+    """(outcome, detail) for `_hil` this schema cannot use, else None."""
+    if not isinstance(meta, dict):
+        return 'corrupt', f'{META} is not an object'
+    if type(meta.get('version')) is not int or meta['version'] != META_VERSION:
+        return 'unsupported', f'{META} version {meta.get("version")!r}; this core reads {META_VERSION}'
+    if meta.get('body_schema') != schema.name:
+        return 'unsupported', f'body schema {meta.get("body_schema")!r}, not {schema.name!r}'
+    if type(meta.get('body_version')) is not int or \
+            meta['body_version'] not in (schema.version, *schema.reads):
+        return 'unsupported', f'{schema.name} body version {meta.get("body_version")!r} is not readable here'
+    unknown = set(meta) - set(_META_TYPES) - set(_META_OPTIONAL)
+    if unknown:
+        return 'corrupt', f'{META} has unknown fields {sorted(unknown)}'
+    for k, t in {**_META_TYPES, **{k: v for k, v in _META_OPTIONAL.items() if k in meta}}.items():
+        if k not in meta or not isinstance(meta[k], t) or isinstance(meta[k], bool):
+            return 'corrupt', f'{META}.{k} is missing or not {t}'
+    if not _ID.match(meta['attempt_id']) or \
+            (meta['previous_attempt'] is not None and not _ID.match(meta['previous_attempt'])):
+        return 'corrupt', f'{META} attempt ids must match {_ID.pattern}'
+    if meta['termination'] not in TERMINATIONS:
+        return 'corrupt', f'{META}.termination {meta["termination"]!r} is not one of {TERMINATIONS}'
+    if not all(isinstance(x, str) for x in meta['invocation'] + meta['selection']):
+        return 'corrupt', f'{META}.invocation and .selection must be lists of strings'
+    return None
+
+
+def parse(data: bytes, schema: BodySchema) -> Reading:
+    """A document's bytes read through `schema`: an unknown `_hil` version or body schema is
+    unsupported, never read as legacy; a document without `_hil` is read only by
+    schema.legacy."""
+    try:
+        raw = json.loads(data.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as e:
+        return Reading('corrupt', None, None, f'not JSON: {e}', data)
+    if not isinstance(raw, dict):
+        return Reading('corrupt', None, None, 'not a JSON object', data)
+    meta = raw.get(META)
+    body = {k: v for k, v in raw.items() if k != META}
+    if META in raw:
+        problem = _meta_problem(meta, schema)
+        if problem:
+            return Reading(problem[0], None, None, problem[1], data)
+    elif schema.legacy is None:
+        return Reading('unsupported', None, None, f'no {META} metadata and {schema.name} reads no legacy report', data)
+    try:
+        if META not in raw:
+            body = schema.legacy(body)
+            if not isinstance(body, dict) or META in body:
+                raise ValueError('the legacy reader returned no body')
+        schema.check(body)
+        empty = schema.empty(body)
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        return Reading('corrupt', None, None, f'{schema.name} body: {e}', data)
+    return Reading('empty' if empty else 'valid', body, meta, '', data)
+
+
+def read_document(path, schema: BodySchema) -> Reading:
+    """The report at `path` (tinyuf2's --report names one directly)."""
+    path = Path(path)
+    if not path.exists():
+        return Reading('missing', None, None, f'{path} not found')
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        return Reading('corrupt', None, None, f'cannot read {path}: {e}')
+    return parse(data, schema)
+
+
+def paths(report_dir, schema: BodySchema) -> tuple:
+    """(json, md, attempts root) of `schema` in `report_dir`."""
+    d = Path(report_dir)
+    return d / f'{schema.stem}.json', d / f'{schema.stem}.md', d / f'{schema.stem}.attempts'
+
+
+# --- metadata and serialisation -------------------------------------------------------------
+def new_attempt_id() -> str:
+    return f'{time.strftime("%Y%m%dT%H%M%S")}-{os.getpid()}-{secrets.token_hex(4)}'
+
+
+def make_meta(schema: BodySchema, attempt: Attempt, *, termination: str, invocation: list,
+              selection: list, host: str, roster: dict, build: dict | None = None,
+              legacy_text: str | None = None) -> dict:
+    """`_hil` for a document of `attempt`. `build` is provenance the caller has, omitted when
+    None, never filled in; `legacy_text` is attempt.legacy_text when the caller publishes it."""
+    meta = {'version': META_VERSION, 'body_schema': schema.name, 'body_version': schema.version,
+            'attempt_id': attempt.attempt_id, 'previous_attempt': attempt.previous_attempt,
+            'termination': termination, 'invocation': list(invocation), 'selection': list(selection),
+            'host': host, 'roster': dict(roster)}
+    if build is not None:
+        meta['build'] = dict(build)
+    if legacy_text is not None:
+        meta['legacy_text'] = legacy_text
+    problem = _meta_problem(meta, schema)
+    if problem:
+        raise ValueError(problem[1])
+    return meta
+
+
+def serialise(schema: BodySchema, body: dict, meta: dict) -> str:
+    """The document's JSON text, validated: what publish writes and what a stdout-only caller
+    prints. Raises ReportError('validate' | 'serialise')."""
+    try:
+        if not isinstance(body, dict) or META in body:
+            raise ValueError(f'a body is an object without the reserved {META} field')
+        problem = _meta_problem(meta, schema)
+        if problem:
+            raise ValueError(problem[1])
+        if meta['body_version'] != schema.version:
+            raise ValueError(f'{schema.name} writes body version {schema.version} only')
+        schema.check(body)
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
+        raise ReportError('validate', str(e)) from e
+    try:
+        return json.dumps({**body, META: meta}, indent=2, allow_nan=False) + '\n'
+    except (ValueError, TypeError) as e:
+        raise ReportError('serialise', str(e)) from e
+
+
+def _legacy_section(text: str) -> str:
+    return ('\n_Legacy text: a previous attempt\'s rendered output whose JSON could not be read. '
+            'Its rows are not in this report\'s JSON, no verdict is read from them and no later '
+            'run merges them._\n\n' + text)
+
+
+def render_markdown(schema: BodySchema, doc: dict) -> str:
+    """The Markdown view of a parsed document: schema.render of its body, then any labelled
+    legacy text its `_hil` carries."""
+    meta = doc.get(META) or {}
+    md = schema.render({k: v for k, v in doc.items() if k != META})
+    if not isinstance(md, str):
+        raise TypeError(f'{schema.name} render returned {type(md).__name__}, not str')
+    if meta.get('legacy_text'):
+        md += _legacy_section(meta['legacy_text'])
+    return md
+
+
+def _markdown_bytes(schema: BodySchema, doc: dict, where) -> bytes:
+    """render_markdown encoded, or ReportError('render'): a project renderer's any failure,
+    or a lone surrogate a JSON string may carry, leaves the dir as it was."""
+    try:
+        return render_markdown(schema, doc).encode('utf-8')
+    except Exception as e:  # noqa: BLE001
+        raise ReportError('render', f'{where}: {type(e).__name__}: {e}') from e
+
+
+def _notice(reading: Reading, name: str) -> str:
+    return f'{NOTICE}: {name} is {reading.outcome}.** {reading.detail}\n'
+
+
+# --- files ----------------------------------------------------------------------------------
+@contextlib.contextmanager
+def _writer(report_dir: Path, schema: BodySchema):
+    lock = report_dir / f'.{schema.stem}.lock'
+    try:
+        report_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as e:
+        raise ReportError('writer', f'cannot open {lock}: {e}') from e
+    try:
+        try:
+            if fcntl:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as e:
+            raise ReportError('writer', f'another writer holds {lock}') from e
+        try:
+            yield
+        except OSError as e:
+            raise ReportError('io', str(e)) from e
+        finally:
+            if not fcntl:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
+
+
+def _stage(path: Path, data: bytes) -> Path:
+    """`data` in a fresh temp file beside `path`, synced; the umask applies, as to the file it replaces."""
+    tmp = path.with_name(f'.{path.name}.{secrets.token_hex(6)}.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return tmp
+
+
+def _replace_one(path: Path, data: bytes) -> None:
+    tmp = _stage(path, data)
+    try:
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _read_bytes(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _archive_id(reading: Reading) -> str:
+    if reading.meta is not None:
+        return reading.meta['attempt_id']
+    kind = 'legacy' if reading.outcome in READABLE else reading.outcome
+    return f'{kind}-{_digest(reading.raw)}'
+
+
+def _archive(root: Path, aid: str, files: dict) -> None:
+    """Create-only: an existing record of `aid` must hold the same authoritative file (the
+    JSON, else the only file); it is never rewritten."""
+    final = root / aid
+    key = next(iter(files))
+    if final.exists():
+        if _read_bytes(final / key) == files[key]:
+            return
+        raise ReportError('archive', f'{final} already holds a different record; an attempt record is never rewritten')
+    root.mkdir(parents=True, exist_ok=True)
+    tmp = root / f'.{aid}.{secrets.token_hex(6)}.tmp'
+    os.mkdir(tmp)
+    try:
+        for name, data in files.items():
+            (tmp / name).write_bytes(data)
+        os.rename(tmp, final)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if final.exists() and _read_bytes(final / key) == files[key]:
+            return
+        raise
+
+
+def _archive_current(report_dir: Path, schema: BodySchema, attempt_id: str):
+    """Archive the published report for `attempt_id`; (archive id, reading, legacy text) or
+    (None, reading, None) when there is none. An unsupported report or a used attempt id is
+    refused before anything is archived."""
+    jpath, mpath, root = paths(report_dir, schema)
+    data, md = _read_bytes(jpath), _read_bytes(mpath)
+    reading = Reading('missing', None, None, f'{jpath} not found') if data is None else parse(data, schema)
+    if reading.outcome == 'unsupported':
+        raise ReportError('predecessor', f'{jpath}: {reading.detail}; refusing to replace or accumulate onto it')
+    aid = None if data is None and md is None else \
+        f'legacy-text-{_digest(md)}' if data is None else _archive_id(reading)
+    if attempt_id == aid or (root / attempt_id).exists():
+        raise ReportError('attempt', f'attempt id {attempt_id} is already used')
+    if aid is None:
+        return None, reading, None
+    if data is None:
+        _archive(root, aid, {mpath.name: md})
+        return aid, reading, md.decode('utf-8', errors='replace')
+    if reading.outcome in READABLE:
+        doc = {**reading.body, **({META: reading.meta} if reading.meta else {})}
+        files = {jpath.name: data, mpath.name: _markdown_bytes(schema, doc, f'archiving {jpath}')}
+        legacy = None
+    else:
+        files = {jpath.name: data, **({mpath.name: md} if md is not None else {})}
+        legacy = md.decode('utf-8', errors='replace') if md is not None else None
+    _archive(root, aid, files)
+    return aid, reading, legacy
+
+
+def start_attempt(report_dir, schema: BodySchema, accumulate: bool, attempt_id: str | None = None) -> Attempt:
+    """Begin an attempt: archive the report it replaces (fresh or accumulated alike), refuse an
+    unsupported one or a reused attempt id. Only an accumulating attempt links its predecessor
+    and gets the prior reading; a corrupt prior is linked, so its sequence never passes."""
+    report_dir = Path(report_dir)
+    attempt_id = attempt_id or new_attempt_id()
+    if not _ID.match(attempt_id):
+        raise ReportError('attempt', f'attempt id {attempt_id!r} must match {_ID.pattern}')
+    with _writer(report_dir, schema):
+        aid, reading, legacy = _archive_current(report_dir, schema, attempt_id)
+    if not accumulate:
+        return Attempt(attempt_id, None, None, aid, None)
+    return Attempt(attempt_id, aid, reading, aid, legacy)
+
+
+def _guard_predecessor(report_dir: Path, schema: BodySchema, meta: dict) -> None:
+    """Refuse a write by a sealed (archived) attempt, by an attempt other than the current
+    report's own unless that report is archived, or naming a predecessor that is neither the
+    archived current report nor an archived record."""
+    jpath, mpath, root = paths(report_dir, schema)
+    aid, previous = meta['attempt_id'], meta['previous_attempt']
+    if (root / aid).exists():
+        raise ReportError('sealed', f'attempt {aid} is archived; its record is never written again')
+    data = _read_bytes(jpath)
+    if data is None:
+        md = _read_bytes(mpath)
+        if md is not None and _read_bytes(root / f'legacy-text-{_digest(md)}' / mpath.name) != md:
+            raise ReportError('predecessor', f'{mpath} is not archived: begin the attempt with start_attempt')
+        if previous is not None and not (root / previous).is_dir():
+            raise ReportError('predecessor', f'predecessor {previous} has no archived record')
+        return
+    reading = parse(data, schema)
+    if reading.meta is not None and reading.meta['attempt_id'] == aid:
+        if reading.meta['previous_attempt'] != previous:
+            raise ReportError('predecessor', f'attempt {aid} already names predecessor '
+                                             f'{reading.meta["previous_attempt"]}, not {previous}')
+        return   # a repeated write inside one attempt
+    if reading.outcome == 'unsupported' or _read_bytes(root / _archive_id(reading) / jpath.name) != data:
+        raise ReportError('predecessor', f'{jpath} belongs to another attempt and is not archived: '
+                                         'begin the attempt with start_attempt')
+    if previous is not None and previous != _archive_id(reading):
+        raise ReportError('predecessor', f'{jpath} is attempt {_archive_id(reading)}, not the predecessor {previous}')
+
+
+def publish(report_dir, schema: BodySchema, body: dict, meta: dict) -> tuple:
+    """Validate and serialise, render the Markdown from the serialised snapshot, stage both
+    beside their targets, then replace the JSON and then the Markdown, each atomically.
+    Returns (json path, md path). Raises ReportError: before 'replace' nothing in the dir
+    changed; at 'markdown' the JSON is the new one and the Markdown is removed or left stale
+    (`published`), for prepare_pair to regenerate."""
+    report_dir = Path(report_dir)
+    text = serialise(schema, body, meta)
+    md = _markdown_bytes(schema, json.loads(text), 'publishing')
+    jpath, mpath, _ = paths(report_dir, schema)
+    with _writer(report_dir, schema):
+        _guard_predecessor(report_dir, schema, meta)
+        staged = []
+        try:
+            try:
+                staged.append(_stage(jpath, text.encode('utf-8')))
+                staged.append(_stage(mpath, md))
+                os.replace(staged[0], jpath)
+            except OSError as e:
+                raise ReportError('replace', f'{jpath}: {e}') from e
+            try:
+                os.replace(staged[1], mpath)
+            except OSError as e:
+                with contextlib.suppress(OSError):
+                    os.unlink(mpath)
+                state = 'left STALE' if mpath.exists() else 'absent'
+                raise ReportError('markdown', f'{mpath} not replaced ({e}); the previous one is {state}',
+                                  published=(str(jpath),)) from e
+        finally:
+            for tmp in staged:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+    return jpath, mpath
+
+
+def prepare_pair(report_dir, schema: BodySchema) -> Reading:
+    """Make `<stem>.md` match `<stem>.json` before a consumer (copy-back, CI upload) exposes
+    the pair: regenerated from a readable JSON, else an explicit unavailable notice with any
+    earlier Markdown kept below it as labelled legacy text. Never leaves stale Markdown."""
+    report_dir = Path(report_dir)
+    jpath, mpath, _ = paths(report_dir, schema)
+    with _writer(report_dir, schema):
+        reading = read_document(jpath, schema)
+        md = None
+        if reading.outcome in READABLE:
+            try:
+                md = _markdown_bytes(schema, {**reading.body, **({META: reading.meta} if reading.meta else {})},
+                                     'render failed')
+            except ReportError as e:   # shown as the notice instead
+                reading = reading._replace(outcome='corrupt', detail=str(e))
+        if md is None:
+            md = _notice(reading, jpath.name)
+            old = _read_bytes(mpath)
+            text = old.decode('utf-8', errors='replace') if old is not None else ''
+            if text.startswith(NOTICE):   # an earlier notice: its legacy text is labelled already
+                md += text.split('\n', 1)[1] if '\n' in text else ''
+            elif text.strip():
+                md += _legacy_section(text)
+            md = md.encode('utf-8', errors='backslashreplace')
+        if _read_bytes(mpath) != md:
+            _replace_one(mpath, md)
+    return reading
+
+
+def _entry(path: Path):
+    data = _read_bytes(path) if path.is_file() else None
+    return None if data is None else {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+
+
+def inventory(report_dir, schema: BodySchema) -> dict:
+    """The current pair and every archived attempt's files, with sizes and SHA-256."""
+    jpath, mpath, root = paths(report_dir, schema)
+    attempts = []
+    if root.is_dir():
+        for d in sorted(root.iterdir()):
+            if d.is_dir() and _ID.match(d.name):
+                attempts.append({'attempt_id': d.name,
+                                 'files': {f.name: _entry(f) for f in sorted(d.iterdir()) if f.is_file()}})
+    return {'current': {jpath.name: _entry(jpath), mpath.name: _entry(mpath)}, 'attempts': attempts}
+
+
+def read_chain(report_dir, schema: BodySchema, limit: int = 256) -> list:
+    """The current report and the predecessors its `previous_attempt` links name, oldest first,
+    as AttemptContexts. A link whose record is missing, unreadable, of another schema, roster
+    or host, or not the attempt it claims is kept with that outcome and ends the walk."""
+    jpath, _, root = paths(report_dir, schema)
+    current = read_document(jpath, schema)
+    if current.outcome == 'missing':
+        return []
+    chain = [AttemptContext(_archive_id(current) if current.raw is not None else 'unreadable',
+                            (current.meta or {}).get('previous_attempt'), current.outcome, current)]
+    seen = {chain[0].attempt_id}
+    while chain[-1].previous_attempt and chain[-1].outcome in READABLE:
+        aid, newer = chain[-1].previous_attempt, chain[-1].reading
+        reading = read_document(root / aid / jpath.name, schema)
+        outcome = reading.outcome
+        if aid in seen or len(chain) >= limit:
+            outcome, reading = 'mismatched', reading._replace(detail=f'{aid} repeats in the chain or exceeds {limit}')
+        elif outcome in READABLE:
+            claimed = reading.meta['attempt_id'] if reading.meta else f'legacy-{_digest(reading.raw)}'
+            same = all((reading.meta or {}).get(k) == newer.meta.get(k) for k in ('host', 'roster')) \
+                if reading.meta and newer.meta else True
+            if claimed != aid or not same:
+                outcome = 'mismatched'
+                reading = reading._replace(detail=f'record {aid} is {claimed}, or of another host or roster')
+        seen.add(aid)
+        chain.append(AttemptContext(aid, (reading.meta or {}).get('previous_attempt') if outcome in READABLE else None,
+                                    outcome, reading))
+    return chain[::-1]
+
+
+# --- verdicts -------------------------------------------------------------------------------
+def _fold(rows: list, requested: list) -> str:
+    if not requested:
+        return 'not-run'
+    return min((r['verdict'] for r in rows), key=VERDICTS.index)
+
+
+def _validation(schema: BodySchema) -> None:
+    if schema.evidence != 'firmware-validation':
+        raise ValueError(f'{schema.name} is {schema.evidence} evidence, never a validation verdict')
+
+
+def apply_run_rules(schema: BodySchema, requested: list, rows: list, termination: str, caveat: str) -> dict:
+    """One attempt's verdict from the project's rows, one {board, verdict, detail, evidence}
+    per requested board (`hil` skill, Verdicts): a missing row is a blocker; an abort or
+    timeout makes every board a blocker; no selection leaves every non-blocker board
+    not-run, a board without a row too; any other run-level caveat denies a pass, as an inconclusive run (blocker).
+    No requested board is not-run, never a pass."""
+    _validation(schema)
+    if termination not in TERMINATIONS:
+        raise ValueError(f'termination {termination!r} is not one of {TERMINATIONS}')
+    if not isinstance(caveat, str):
+        raise ValueError('caveat must be a string')
+    if len(set(requested)) != len(requested) or not all(isinstance(b, str) and b for b in requested):
+        raise ValueError(f'requested boards must be distinct names: {requested}')
+    got = {}
+    for r in rows:
+        if not isinstance(r, dict) or set(r) != _ROW_KEYS:
+            raise ValueError(f'a row has exactly {sorted(_ROW_KEYS)}: {r!r}')
+        if r['verdict'] not in VERDICTS or not isinstance(r['detail'], str) or \
+                not (isinstance(r['evidence'], list) and all(isinstance(e, str) for e in r['evidence'])):
+            raise ValueError(f'row {r["board"]!r}: verdict one of {VERDICTS}, detail a string, evidence a list of strings')
+        if r['board'] not in requested or r['board'] in got:
+            raise ValueError(f'row {r["board"]!r} is not one requested board\'s only row')
+        got[r['board']] = dict(r, evidence=list(r['evidence']))
+    out = []
+    for b in requested:
+        r = got.get(b) or {'board': b, 'verdict': 'not-run' if termination == 'no-boards' else 'blocker',
+                           'detail': 'no report row for this board', 'evidence': []}
+        if termination in ('aborted', 'timeout'):
+            r = dict(r, verdict='blocker', detail=f'run {termination}: {r["detail"]}')
+        elif termination == 'no-boards' and r['verdict'] != 'blocker':
+            r = dict(r, verdict='not-run', detail=f'the run selected no boards: {r["detail"]}')
+        elif caveat and r['verdict'] == 'pass':
+            r = dict(r, verdict='blocker', detail=f'run caveat denies a pass: {caveat.strip()}')
+        out.append(r)
+    return {'verdict': _fold(out, requested), 'termination': termination, 'caveat': caveat, 'rows': out}
+
+
+def _retryable(c: AttemptContext, board: str) -> bool:
+    """`board`'s fail in `c` may be retried (`hil` skill, Caller rules): a completed run with
+    no blocker, an empty caveat, and a result the contract does not name final."""
+    run = c.run
+    return (run is not None and run['termination'] == 'completed' and not run['caveat']
+            and not any(r['verdict'] == 'blocker' for r in run['rows']) and board not in c.final
+            and any(r['board'] == board and r['verdict'] == 'fail' for r in run['rows']))
+
+
+def _eligible(before: AttemptContext, after: AttemptContext, board: str) -> bool:
+    """`after` is an eligible retry of `before`'s fail on `board`."""
+    return after.retry and after.previous_attempt == before.attempt_id and _retryable(before, board)
+
+
+def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
+    """The retry-sequence verdict over `chain` (read_chain, oldest first, each readable
+    attempt's `run` filled), apart from `current`, the last attempt's own run. An earlier
+    blocker stands; only an eligible fail-then-pass is a pass, marked flaky, citing both
+    attempts, and only when it is the board's one fail so far; a fail that was not retryable,
+    or a second fail, stays unresolved for the rest of the sequence. A
+    missing, corrupt, unsupported or mismatched attempt in the chain denies every pass."""
+    _validation(schema)
+    broken = [{'attempt_id': c.attempt_id, 'outcome': c.outcome, 'detail': c.reading.detail}
+              for c in chain if c.outcome not in READABLE or c.run is None]
+    rows = []
+    for b in requested:
+        verdict, flaky, retried, detail, evidence, seen = None, False, False, 'not run in any attempt', [], []
+        sticky = False   # a fail no later pass may clear
+        before = None
+        for c in chain:
+            mine = next((r for r in (c.run or {}).get('rows', []) if r['board'] == b), None)
+            if mine is not None:
+                seen.append(c.attempt_id)
+                v, was = mine['verdict'], verdict
+                # this attempt retries the board's fail: counted whatever it found, so once only
+                is_retry = verdict == 'fail' and before is not None and _eligible(before, c, b)
+                if verdict == 'blocker' or (v == 'not-run' and verdict is not None):
+                    pass
+                elif v == 'pass' and verdict == 'fail':
+                    if is_retry and not retried and not sticky:
+                        verdict, flaky = 'pass', True
+                        evidence = evidence + [f'{c.attempt_id}: {e}' for e in mine['evidence']]
+                        detail = f'flaky: failed in {before.attempt_id} ({detail}), passed on retry {c.attempt_id}'
+                    else:
+                        detail += f'; a later pass in {c.attempt_id} is not an eligible retry'
+                elif v == 'fail' and was == 'fail':   # every unresolved fail stays cited
+                    detail += f'; failed again in {c.attempt_id}: {mine["detail"]}'
+                    evidence = evidence + [f'{c.attempt_id}: {e}' for e in mine['evidence']]
+                else:
+                    flaky = flaky and v == 'pass' and verdict == 'pass'
+                    if not flaky:
+                        verdict, detail = v, mine['detail']
+                        evidence = [f'{c.attempt_id}: {e}' for e in mine['evidence']]
+                if v == 'fail' and (was == 'fail' or retried):
+                    sticky = True
+                retried = retried or is_retry
+            before = c
+        if verdict is None:
+            verdict = 'not-run'
+        if verdict == 'pass' and broken:
+            verdict, flaky = 'blocker', False
+            detail = 'earlier evidence unavailable: ' + '; '.join(f'{x["attempt_id"]} {x["outcome"]}' for x in broken)
+        rows.append({'board': b, 'verdict': verdict, 'flaky': flaky, 'detail': detail,
+                     'evidence': evidence, 'attempts': seen})
+    return {'current': chain[-1].run if chain else None,
+            'sequence': {'verdict': _fold(rows, requested), 'rows': rows,
+                         'attempts': [c.attempt_id for c in chain], 'broken': broken}}
