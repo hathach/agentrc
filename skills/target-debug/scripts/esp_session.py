@@ -56,7 +56,7 @@ Output: one JSON object on stdout; <out> keeps openocd.log, gdb.log (values), gd
 and monitor output; budget writes both into gdb.log to keep their order) and receipt.json.
 
 Exit: 0 done and every core running at the end; 1 done, but an expression failed or a budget
-location was refused or unresolved (reported); 2 bad usage; 3 openocd, gdb or the Tcl port failed (a
+location was refused or unresolved (reported); 2 bad usage, or Windows, refused; 3 openocd, gdb or the Tcl port failed (a
 budget location gdb could not ask about or resolved to several addresses included; gdb exiting
 non-zero or by a signal leaves no budget), the run was interrupted, a core was left halted, removal
 is unchecked or failed, or the shutdown failed.
@@ -437,6 +437,10 @@ def main(argv=None):
     p.add_argument('--timeout', type=float, default=60,
                    help='bound on the gdb session, or on recover, in seconds (default 60)')
     a = p.parse_args(argv)
+    if os.name == 'nt':    # before any probe session: a Windows run could not end it as Leave says
+        print('esp_session.py: not on Windows yet (#130): openocd is detached and identified as a POSIX session '
+              '(/proc)', file=sys.stderr)
+        return 2
     if a.mode == 'leave':
         if not a.receipt or a.out:
             p.error('leave takes --receipt only')

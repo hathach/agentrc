@@ -44,8 +44,8 @@ watchpoints in this version.
 Dumps are read while halted, so they are coherent with the PC; the same address rules as
 probe_state.py --save apply, and an existing file is refused.
 
-The first SIGINT or SIGTERM stops the session; the cleanup, end anchor and restore still
-run (each bounded), and later signals are only recorded.
+The first SIGINT or SIGTERM (Windows: Ctrl-C or Ctrl-Break) stops the session; the cleanup,
+end anchor and restore still run (each bounded), and later signals are only recorded.
 
 AUTOPSY_GDB, AUTOPSY_JLINK_GDBSERVER and PROBE_STATE_OPENOCD name the tools when they are
 not `arm-none-eabi-gdb`, `JLinkGDBServer` and `openocd` on PATH; PROBE_STATE_JLINK_EXE
@@ -67,10 +67,13 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_state  # noqa: E402
 from probe_state import Capture, OpenOCD, ToolError, core_state, cpuid_state  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 ICSR = 0xE000ED04
 BACKTRACE_FRAMES = 16
@@ -78,6 +81,12 @@ SERVER_READY = {'jlink': 'Waiting for GDB connection', 'openocd': 'for gdb conne
 OBSERVER = ['set may-write-memory off', 'set may-write-registers off', 'set may-call-functions off',
             'set may-insert-breakpoints off', 'set pagination off', 'set confirm off', 'set width 0']
 NO_RESTART = 'exec SetRestartOnClose = 0'
+# Windows: the server and gdb in a group of their own, so a Ctrl-C at the console reaches this script alone, and
+# CTRL_BREAK_EVENT, sent to a group, can stop one of them; POSIX asks with SIGTERM (openocd ignored SIGINT)
+NEW_GROUP = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+ASK_STOP = signal.CTRL_BREAK_EVENT if os.name == 'nt' else signal.SIGTERM
+# SIGBREAK: Ctrl-Break at a Windows console
+STOP_SIGNALS = tuple(filter(None, (getattr(signal, n, None) for n in ('SIGTERM', 'SIGINT', 'SIGBREAK'))))
 # Every core polled before any resume: an SMP resume fails for a core OpenOCD has not polled
 # (verified 2026-10-16 raspberry_pi_pico), and the next poll then halted both.
 POLL_ALL = 'foreach t [target names] {$t arp_poll}'
@@ -166,17 +175,22 @@ def wait_ready(proc, log_path, marker, deadline):
 
 
 def stop(proc, grace):
-    """Let the process exit by itself within `grace` s, then SIGTERM (openocd ignored SIGINT), then SIGKILL."""
+    """Let the process exit by itself within `grace` s, then ask it to stop (ASK_STOP), then kill it, on Windows
+    with its tree, each step bounded."""
     if proc is None or proc.poll() is not None:
         return
-    for sig, wait in ((None, grace), (signal.SIGTERM, 5), (signal.SIGKILL, 5)):
-        if sig is not None:
-            proc.send_signal(sig)
+    for ask, wait in ((None, grace), (ASK_STOP, 5)):
+        if ask is not None:
+            try:
+                proc.send_signal(ask)
+            except OSError:
+                continue    # Windows: no console shared with it, so no CTRL_BREAK; the kill below still runs
         try:
             proc.wait(wait)
             return
         except subprocess.TimeoutExpired:
             continue
+    windows.kill_tree(proc, 5)
 
 
 def start_anchor_recovery(route, backend, err):
@@ -279,7 +293,7 @@ def main(argv=None):
     # One protected block from the first probe session to the server's stop, so a signal anywhere
     # in it still reaches the cleanup, the end anchor and the restore.
     try:
-        for sig in (signal.SIGTERM, signal.SIGINT):
+        for sig in STOP_SIGNALS:
             signal.signal(sig, on_signal)
         touched = True
         before = anchor(backend, 30, keep_halted=True)
@@ -294,13 +308,14 @@ def main(argv=None):
         cmd = server_command(route, ident, backend, a, ports, server_exe)
         result['server'] = cmd
         with open(server_log, 'w') as log:
-            server = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+            server = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                      creationflags=NEW_GROUP)
         wait_ready(server, server_log, SERVER_READY[route], time.monotonic() + 20)
         argv = [gdb, '-nx', '-batch', a.elf]
         for c in gdb_commands(route, ports[0], a.expr, dumps, not halted, len(before['cores']) > 1):
             argv += ['-ex', c]
         with open(gdb_log, 'w') as out, open(gdb_err, 'w') as err:
-            gdb_proc = subprocess.Popen(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL)
+            gdb_proc = subprocess.Popen(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL, creationflags=NEW_GROUP)
             try:
                 gdb_proc.wait(a.timeout)
             except subprocess.TimeoutExpired:

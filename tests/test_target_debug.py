@@ -11,8 +11,10 @@ import importlib.util
 import io
 import hashlib
 import json
+import ntpath
 import struct
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,7 +29,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'pc_sample.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import make_stub  # noqa: E402
+from helpers import make_stub, pid_alive, tmpdir  # noqa: E402
 _spec = importlib.util.spec_from_file_location('pc_sample', SCRIPT)
 pc_sample = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pc_sample)
@@ -57,12 +59,18 @@ sys.stdout.buffer.write((os.linesep.join(out) + os.linesep).encode())
 LINK = ('--interface', 'swd', '--speed', '4000')
 # the J-Link Commander name probe_state.py looks up on PATH
 JLINK = 'JLink.exe' if os.name == 'nt' else 'JLinkExe'
+# the J-Link tools' names on Windows, where they are looked up as these .exe files
+NT_NAMES = {'JLinkExe': 'JLink', 'JLinkGDBServer': 'JLinkGDBServerCL'}
+
+
+def nt_name(name):
+    return NT_NAMES.get(name, name) if os.name == 'nt' else name
 
 
 def make_tool(d, name, body):
-    """A fake tool in d that starts by name, its path, running the Python body after its shebang line (JLinkExe is
-    JLink.exe on Windows)."""
-    return make_stub(d, 'JLink' if os.name == 'nt' and name == 'JLinkExe' else name, body.split('\n', 1)[1])
+    """A fake tool in d that starts by name, its path, running the Python body after its shebang line (under its
+    Windows name there)."""
+    return make_stub(d, nt_name(name), body.split('\n', 1)[1])
 
 
 def fake_tools(case, d, tools):
@@ -73,9 +81,21 @@ def fake_tools(case, d, tools):
     for name, body in tools:
         stub = make_tool(d, name, body)
         with mock.patch.dict(os.environ, {'PATH': env['PATH']}):
-            found = pc_sample.which(JLINK if name == 'JLinkExe' else name)
+            found = pc_sample.which(nt_name(name))
         case.assertEqual(found and Path(found).resolve(), stub.resolve(), name)
     return env
+
+
+class CopiedAloneTest(unittest.TestCase):
+    def test_pc_sample_and_probe_state_load_without_the_rest_of_agentrc(self):
+        # the pair is copied to rigs as is: nothing outside these two files may be imported
+        d = tmpdir(self)
+        for name in ('pc_sample.py', 'probe_state.py'):
+            shutil.copy(SCRIPT.parent / name, d / name)
+        code = 'import sys; sys.path.insert(0, sys.argv[1]); import pc_sample; print(pc_sample.probe_state_module().__file__)'
+        r = subprocess.run([sys.executable, '-I', '-c', code, str(d)], capture_output=True, text=True, cwd=d, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(Path(r.stdout.strip()).resolve(), d / 'probe_state.py')
 
 
 class CliTest(unittest.TestCase):
@@ -1160,7 +1180,6 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertIn('no-such-openocd not found', r.stderr)
 
 
-@unittest.skipIf(os.name == 'nt', 'JLinkExe and openocd stubs require POSIX executable semantics')
 class ProbeStateCliTest(FakeToolsCase):
     tools = (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE))
 
@@ -1334,7 +1353,8 @@ class ProbeStateCliTest(FakeToolsCase):
         rc, out, err = self.run_cli('k64f', *LINK, '--save', '0x10', '32', str(target), FAKE_MEM=str(mem))
         self.assertEqual(rc, 0, err)
         self.assertEqual(target.read_bytes(), bytes(range(16, 48)))
-        self.assertEqual(out['saves'], [{'file': str(target), 'address': '0x00000010', 'size': 32, 'bytes': 32,
+        self.assertEqual(out['saves'], [{'file': probe_state.tool_path(target), 'address': '0x00000010', 'size': 32,
+                                         'bytes': 32,
                                          'complete': True, 'sha256': hashlib.sha256(bytes(range(16, 48))).hexdigest()}])
         rc, out, err = self.run_cli('k64f', *LINK, '--save', '0x10', '32', str(target), FAKE_MEM=str(mem))
         self.assertEqual(rc, 2)
@@ -1413,7 +1433,7 @@ class ProbeStateCliTest(FakeToolsCase):
         self.assertIn('read_memory: failed', out['error'])
         rc, out, err = self.run_cli('k64f', *LINK, PATH='/nonexistent')
         self.assertEqual(rc, 3)
-        self.assertIn('JLinkExe not found', out['error'])
+        self.assertIn(f'{JLINK} not found', out['error'])
 
     def test_refusals_launch_nothing(self):
         bin_ = self.d / 'fw.bin'
@@ -1441,7 +1461,84 @@ class ProbeStateCliTest(FakeToolsCase):
 AUTOPSY = SCRIPT.parent / 'autopsy.py'
 
 
-@unittest.skipIf(os.name == 'nt', 'gdb, server and probe stubs require POSIX executable semantics')
+class WindowsPathTest(unittest.TestCase):
+    """probe_state's tool paths under Windows' path rules, run anywhere with ntpath standing in."""
+
+    class Refused(Exception):
+        pass
+
+    def error(self, msg):
+        raise self.Refused(msg)
+
+    def regions(self, *paths, reserved=()):
+        p = types.SimpleNamespace(error=self.error)
+        with mock.patch.object(probe_state, 'os', types.SimpleNamespace(name='nt', path=ntpath)):
+            return probe_state.parse_regions(p, '--save', [('0x20000000', '4', path) for path in paths], False,
+                                             reserved)
+
+    def test_a_drive_path_reaches_the_tools_with_forward_slashes(self):
+        self.assertEqual(self.regions('C:\\Users\\dev\\ram.bin'), [('C:/Users/dev/ram.bin', 0x20000000, 4)])
+
+    def test_names_match_without_case_and_separator(self):
+        with self.assertRaisesRegex(self.Refused, 'named twice'):
+            self.regions('C:\\dumps\\a.bin', 'c:/DUMPS/A.BIN')
+        with self.assertRaisesRegex(self.Refused, 'a file this script writes'):
+            self.regions('c:/OUT/gdb.log', reserved=['C:\\out\\gdb.log'])
+
+    def test_a_short_name_or_a_blank_is_refused(self):
+        for path in ('C:\\Users\\RUNNER~1\\a.bin', 'C:\\Users\\First Last\\a.bin'):
+            with self.subTest(path=path), self.assertRaisesRegex(self.Refused, 'characters'):
+                self.regions(path)
+
+
+class AutopsyStopTest(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('autopsy_stop', AUTOPSY)
+        self.autopsy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.autopsy)
+
+    def stuck(self, send_signal=None):
+        """A process that never exits: every wait times out."""
+        return mock.Mock(**{'poll.return_value': None, 'wait.side_effect': subprocess.TimeoutExpired('x', 1),
+                            'send_signal.side_effect': send_signal})
+
+    def test_it_waits_asks_then_kills(self):
+        proc = self.stuck()
+        self.autopsy.stop(proc, 3)
+        self.assertEqual([c for c in proc.mock_calls if c[0] != 'poll'],
+                         [mock.call.wait(3), mock.call.send_signal(self.autopsy.ASK_STOP), mock.call.wait(5),
+                          mock.call.kill(), mock.call.wait(5)])
+
+    def test_a_request_it_cannot_send_goes_straight_to_the_kill(self):
+        # Windows: CTRL_BREAK_EVENT needs a console shared with the process
+        proc = self.stuck(send_signal=OSError(6, 'The handle is invalid'))
+        self.autopsy.stop(proc, 0)
+        self.assertEqual([c for c in proc.mock_calls if c[0] != 'poll'],
+                         [mock.call.wait(0), mock.call.send_signal(self.autopsy.ASK_STOP), mock.call.kill(),
+                          mock.call.wait(5)])
+
+    def test_a_server_ignoring_the_request_is_killed_with_its_children(self):
+        child = 'import time; time.sleep(60)'
+        server = (f'import signal, subprocess, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                  f'signal.signal(getattr(signal, "SIGBREAK", signal.SIGTERM), signal.SIG_IGN); '
+                  f'p = subprocess.Popen([sys.executable, "-c", {child!r}]); print(p.pid, flush=True); time.sleep(60)')
+        proc = subprocess.Popen([sys.executable, '-c', server], stdout=subprocess.PIPE, text=True,
+                                creationflags=self.autopsy.NEW_GROUP)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.stdout.close)
+        grandchild = int(proc.stdout.readline())
+        self.addCleanup(lambda: pid_alive(grandchild) and os.kill(grandchild, signal.SIGTERM))
+        t0 = time.monotonic()
+        self.autopsy.stop(proc, 0)
+        self.assertIsNotNone(proc.poll())
+        self.assertLess(time.monotonic() - t0, 15)
+        if os.name == 'nt':    # taskkill /T; POSIX kills the server alone, as before
+            deadline = time.monotonic() + 5
+            while pid_alive(grandchild) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertFalse(pid_alive(grandchild))
+
+
 class AutopsyCliTest(FakeToolsCase):
     tools = (('JLinkExe', FAKE_JLINK_STATE), ('openocd', FAKE_OPENOCD_STATE), ('arm-none-eabi-gdb', FAKE_GDB),
              ('JLinkGDBServer', FAKE_JLINK_GDBSERVER))
@@ -1616,6 +1713,7 @@ class AutopsyCliTest(FakeToolsCase):
             gap)
         return rc, json.loads(stdout), stderr
 
+    @unittest.skipIf(os.name == 'nt', 'Windows sends no SIGTERM; test_ctrl_break_still_reaches_the_end_anchor')
     def test_a_signal_after_the_anchor_still_reaches_the_end_anchor(self):
         rc, out, err = self.interrupt('k64f', lambda ss: any(s['script'] == 'server' for s in ss), *LINK,
                                       FAKE_SERVER_DELAY='5')
@@ -1624,6 +1722,7 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertFalse(out['after']['cores']['core']['halted'])
         self.assertEqual((self.d / 'state').read_text(), '01010001')
 
+    @unittest.skipIf(os.name == 'nt', 'Windows sends no SIGTERM')
     def test_a_signal_during_the_anchor_reports_an_unknown_state(self):
         rc, out, err = self.interrupt('k64f', lambda ss: True, *LINK, FAKE_JLINK_SLEEP='5')
         self.assertEqual(rc, 3, err)
@@ -1654,7 +1753,7 @@ class AutopsyCliTest(FakeToolsCase):
         argv = ['--hil-config', str(self.config), '--board', 'k64f', '--elf', str(self.elf), '--out',
                 str(self.d / 'out'), *LINK]
         stdout = io.StringIO()
-        for sig in (signal.SIGTERM, signal.SIGINT):    # main() installs its own handlers
+        for sig in autopsy.STOP_SIGNALS:    # main() installs its own handlers
             self.addCleanup(signal.signal, sig, signal.getsignal(sig))
         with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(autopsy, 'anchor', anchor), \
                 contextlib.redirect_stdout(stdout):
@@ -1666,6 +1765,7 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertFalse(out['after']['cores']['core']['halted'])
         self.assertEqual((self.d / 'state').read_text(), '01010001')
 
+    @unittest.skipIf(os.name == 'nt', 'Windows sends no SIGTERM')
     def test_signals_still_run_cleanup_and_the_end_anchor(self):
         # each session takes 0.5 s, so the second signal lands in the cleanup, after the first one's handler ran:
         # two deliveries before Python runs the handler count once
@@ -1676,6 +1776,30 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertIn('interrupted by signal 15, 15', out['error'])
         self.assertTrue(out['restored'])
         self.assertFalse(out['after']['cores']['max32665.cpu']['halted'])
+
+    @unittest.skipUnless(os.name == 'nt', 'Ctrl-Break, the Windows console interrupt')
+    def test_ctrl_break_still_reaches_the_end_anchor(self):
+        import ctypes
+        if ctypes.windll.kernel32.GetConsoleProcessList((ctypes.c_uint32 * 1)(), 1) == 0:
+            self.skipTest('this runner has no console for autopsy to share')
+        # its own group: CTRL_BREAK_EVENT goes to a group, and the server and gdb are in theirs
+        proc = subprocess.Popen([sys.executable, str(AUTOPSY), '--hil-config', str(self.config), '--board', 'k64f',
+                                 '--elf', str(self.elf), '--out', str(self.d / 'out'), *LINK],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd='/',
+                                env={**self.env, 'FAKE_SERVER_DELAY': '5'},
+                                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        deadline = time.monotonic() + 20
+        while not (self.log.exists() and any(s['script'] == 'server' for s in self.sessions())) \
+                and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.3)
+        proc.send_signal(signal.CTRL_BREAK_EVENT)
+        stdout, stderr = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 3, stderr)
+        out = json.loads(stdout)
+        self.assertIn(f'interrupted by signal {int(signal.SIGBREAK)}', out['error'])
+        self.assertFalse(out['after']['cores']['core']['halted'])
+        self.assertEqual((self.d / 'state').read_text(), '01010001')
 
     def test_refusals_launch_nothing(self):
         (self.d / 'exists.bin').write_bytes(b'')

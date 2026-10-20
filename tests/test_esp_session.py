@@ -1,5 +1,6 @@
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -182,7 +183,7 @@ if os.environ.get('FAKE_GDB_DIE_AFTER') == 'end':
 BOARD = ['--board-cfg', 'board/esp32p4-builtin.cfg', '--adapter-serial', '30:ED:A0:E0:C9:02']
 
 
-@unittest.skipIf(os.name == 'nt', 'openocd and gdb stubs require POSIX executable semantics')
+@unittest.skipIf(os.name == 'nt', 'esp_session.py refuses on Windows: WindowsRefusal')
 class EspSessionTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
@@ -617,6 +618,21 @@ class Receipts(unittest.TestCase):
     def test_same_process_refuses_without_proc(self):
         with mock.patch.object(es, 'cmdline', return_value=None):
             self.assertFalse(es.same_process({'pid': os.getpid(), 'argv': ['x'], 'startTime': '1'}))
+
+
+class WindowsRefusal(unittest.TestCase):
+    def test_windows_is_refused_in_one_line_before_any_probe_session(self):
+        for argv in (['recover', '--out', 'out', *BOARD], ['leave', '--receipt', 'receipt.json']):
+            err = io.StringIO()
+            with self.subTest(mode=argv[0]), mock.patch.object(es.os, 'name', 'nt'), \
+                    mock.patch.object(es.subprocess, 'Popen', side_effect=AssertionError('launched')) as popen, \
+                    mock.patch.object(es, 'leave', side_effect=AssertionError('left')), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(es.main(argv), 2)
+            popen.assert_not_called()
+            self.assertEqual(len(err.getvalue().splitlines()), 1, err.getvalue())
+            self.assertIn('not on Windows yet', err.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()

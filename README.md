@@ -118,6 +118,8 @@ the skipped tests and notes for a port:
 - the capture scripts of `usb-sniffer` (`sniff.py`), `etm-trace`
   (`etm_capture.py`) and `target-debug` (`dual_capture.py`): usbfs, `/proc`
   and POSIX process control.
+- `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
+  as a POSIX session and identifies it through `/proc` (#130).
 - `install.py --herdr-plugin` refuses on Windows; `worktree-remove` has no
   Windows test.
 

@@ -117,8 +117,8 @@ _OCD_CORE_RE = re.compile(r'^T([BA]) (\S+) (0x[0-9a-fA-F]+)$', re.M)
 _OCD_SERIAL_RE = re.compile(r'Serial# = (\S+)')
 _OCD_VOLTAGE_RE = re.compile(r'Target voltage: ([0-9.]+)')
 _PROBE_CLIENT_RE = re.compile(r'JLink|openocd|pyocd', re.I)
-# Paths reach OpenOCD's Tcl and JLinkExe's comma-separated arguments unquoted
-SAFE_PATH = re.compile(r'[A-Za-z0-9_./+-]+')
+# Paths reach OpenOCD's Tcl and JLinkExe's comma-separated arguments unquoted; on Windows as C:/..., tool_path's form
+SAFE_PATH = re.compile(r'([A-Za-z]:)?[A-Za-z0-9_./+-]+')
 ET_EXEC = 2
 STT_OBJECT, STT_FUNC = 1, 2
 SHN_UNDEF, SHN_ABS, SHN_COMMON = 0, 0xFFF1, 0xFFF2
@@ -812,22 +812,30 @@ def is_rp2040(ident):
     return 'rp2040' in (ident.get('device') or ident.get('cfg')).lower()
 
 
+def tool_path(path):
+    """path absolute, in the form the probe tools and gdb take unquoted: on Windows the long name (an 8.3 one, such as
+    a runner's TEMP, has a ~) with / separators after the drive."""
+    return os.path.realpath(path).replace('\\', '/') if os.name == 'nt' else os.path.abspath(path)
+
+
 def parse_regions(p, flag, triples, rp2040, reserved=()):
     """[(absolute path, addr, size)] from ADDR LEN FILE triples, or p.error(); whether a file
     exists is the caller's check."""
     regions = []
+    taken = {os.path.normcase(tool_path(r)) for r in reserved}    # normcase: NTFS names match without case
     for addr_s, len_s, path in triples:
         addr, size = parse_int(p, flag, addr_s), parse_int(p, flag, len_s)
-        path = os.path.abspath(path)
+        path = tool_path(path)
         try:
             check_region(f'{flag} {path}', addr, size, rp2040)
         except ValueError as e:
             p.error(str(e))
         if not SAFE_PATH.fullmatch(path):
             p.error(f'{flag} {path}: the path has characters the probe tools would misread '
-                    f'(letters, digits, _ . / + - only)')
-        if path in [r[0] for r in regions] or path in reserved:
+                    f'(a drive, then letters, digits, _ . / + - only)')
+        if os.path.normcase(path) in taken:
             p.error(f'{flag} {path}: named twice, or a file this script writes itself')
+        taken.add(os.path.normcase(path))
         regions.append((path, addr, size))
     return regions
 
@@ -916,10 +924,11 @@ def main(argv=None):
         return 3
 
     with tempfile.TemporaryDirectory(prefix='probe_state.') as tmp:
+        tmp = tool_path(tmp)
         if not SAFE_PATH.fullmatch(tmp):
-            return fail(f'temporary directory {tmp!r} has unsafe characters')
-        dumps = [(os.path.join(tmp, f'seg{i}.bin'), addr, len(d)) for i, (addr, d) in enumerate(segments)]
-        dumps += [(os.path.join(tmp, f'read{i}.bin'), addr, size) for i, (_, addr, size) in enumerate(reads)]
+            return fail(f'temporary directory {tmp!r} has unsafe characters: set TMPDIR')
+        dumps = [(f'{tmp}/seg{i}.bin', addr, len(d)) for i, (addr, d) in enumerate(segments)]
+        dumps += [(f'{tmp}/read{i}.bin', addr, size) for i, (_, addr, size) in enumerate(reads)]
         dumps += saves
         try:
             cap = Capture(a.samples, a.interval_ms, a.budget, dumps)
