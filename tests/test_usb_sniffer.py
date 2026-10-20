@@ -66,7 +66,8 @@ def hold(test, path):
 def fake_units(units):
     with tempfile.TemporaryDirectory() as d:
         sysfs = fake_sysfs(Path(d) / 'sys', [*units, ('5-3', None, '189:600', '5', '89', '1366:0105')])
-        (sysfs / '5-2.2:1.0').mkdir(exist_ok=True)                    # an interface: no idVendor
+        interface = '5-2.2:1.0' if os.name != 'nt' else '5-2.2_1.0'  # Windows forbids ':' in a name
+        (sysfs / interface).mkdir(exist_ok=True)                      # an interface: no idVendor
         with mock.patch.object(sniff, 'SYSFS', sysfs):
             return sniff.units()
 
