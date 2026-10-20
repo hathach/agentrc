@@ -18,6 +18,11 @@ own worktree .worktrees/cowork-<side>-<lane> on branch
 cowork/<host branch>/<side>-<lane>, created at this checkout's HEAD, the
 lane's `base`, and never moved by cowork; a send to it is refused while the
 tree is dirty. Its kind is the `read-only` marker file or the `base` file.
+When herdr lists this checkout as a linked worktree open in a workspace, a
+new or recreated tree is the sibling <checkout>--cowork-<side>-<lane> instead
+(herdr_sibling); a lane uses whichever of the two holds its tree, refused when
+both do. While a sibling tree's lane has a request outstanding, the tree holds
+the lane's `git worktree lock` (guard).
 A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
@@ -48,6 +53,7 @@ import contextlib
 import datetime
 import errno
 import functools
+import importlib.util
 import json
 import os
 import re
@@ -95,6 +101,7 @@ PRESETS = {'astra': ('gpt-6-astra', 'high'), 'sol': ('gpt-6.1-sol', 'high')}
 PRESET = 'sol'  # the Codex default while no preference file names one
 FIELDS = ('session', 'model', 'effort', 'tier')
 GIT_ENCODING = 'utf-8' if fcntl is None else None  # git speaks UTF-8 there, not the ANSI code page; else the locale's
+PLUGIN = Path(__file__).resolve().parents[3] / 'plugins' / 'worktree-children' / 'worktree_children.py'
 
 
 def die(message, code=FAILED):
@@ -169,8 +176,90 @@ def kind(box):
     return 'worktree' if (box / 'base').exists() else None
 
 
+def places(root, box):
+    """A worktree lane's two possible trees: nested in the checkout, or its herdr sibling."""
+    name = f'cowork-{box.parent.name}-{box.name}'
+    return root / '.worktrees' / name, root.parent / f'{root.name}--{name}'
+
+
+def lane_trees(root, box):
+    """Those of the lane's places that hold something, a dangling symlink included."""
+    return [p for p in places(root, box) if p.exists() or p.is_symlink()]
+
+
 def lane_root(root, box):
-    return root / '.worktrees' / f'cowork-{box.parent.name}-{box.name}'
+    """The lane's tree: the place that holds one, the nested place while neither does; refused when both do."""
+    found = lane_trees(root, box)
+    if len(found) > 1:
+        die(f'lane {box.name} has a tree at both {found[0]} and {found[1]}; move the one it does not use aside', BUSY)
+    return found[0] if found else places(root, box)[0]
+
+
+def herdr_sibling(root):
+    """Whether a new lane's tree goes beside the checkout: herdr lists it as a linked worktree open in a
+    workspace, and herdr's removal of it would take a nested tree along whatever it holds."""
+    herdr = os.environ.get('HERDR_BIN_PATH') or (shutil.which('herdr') if fcntl else nt_on_path('herdr', ('.exe',)))
+    if not (herdr and os.path.isfile(herdr)):
+        if os.environ.get('HERDR_ENV'):
+            die(f'HERDR_ENV is set but herdr is not on PATH ({herdr or "none"}): cannot tell where the lane\'s '
+                f'worktree goes', BUSY)
+        return False
+    try:
+        spec = importlib.util.spec_from_file_location('worktree_children', PLUGIN)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+        return plugin.linked_workspace(root, herdr)  # the herdr found here, never one the checkout holds
+    except Exception as failure:  # the plugin's Keep, or a plugin that cannot load
+        die(f'cannot ask herdr where the lane\'s worktree goes: {failure}', BUSY)
+
+
+def foreign(root, tree):
+    """(why, git dir): why `tree` is not a linked worktree of this repository rooted there, '' with its
+    private git dir when it is. A symlink, the host checkout, a stray directory or another repository's
+    tree is never moved, locked or removed."""
+    if tree.is_symlink() or not tree.is_dir():
+        return 'a symlink or not a directory', None
+    got = git(tree, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir',
+              check=False)
+    real = [os.path.realpath(p) for p in got.stdout.splitlines()]
+    if got.returncode or len(real) != 3:
+        return f'git cannot read it: {got.stderr.strip()}', None
+    ours = os.path.realpath(git(root, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip())
+    if real[0] != os.path.realpath(tree) or real[0] == os.path.realpath(root) or real[1] == real[2] or real[2] != ours:
+        return f'toplevel {real[0]}, common git dir {real[2]}', None
+    return '', Path(real[1])
+
+
+def lock_reason(box):
+    return f'cowork {box.parent.name}/{box.name} has a request outstanding'
+
+
+def guard(root, box, tree, gitdir):
+    """Lock the lane's tree, when it is its sibling, for its outstanding requests, running or undelivered:
+    herdr's removal of the checkout lets the worktree-children plugin sweep a clean sibling, and the plugin
+    keeps a locked one. The lane's lock is shared by its requests; a lock already there, the lane's or
+    anyone's, is left as it is. Under admission, on a tree claim() has checked (its git dir)."""
+    if tree == places(root, box)[1] and not (gitdir / 'locked').exists():
+        git(root, 'worktree', 'lock', '--reason', lock_reason(box), str(tree))
+
+
+def unguard(root, box, tree, gitdir=None):
+    """Unlock the lane's tree, when it is its sibling and the lane holds the lock; True if it did. Never
+    someone else's lock, nor a tree that is not the lane's own (foreign, unless claim() passed its git
+    dir). OSError when it cannot tell or cannot unlock."""
+    if tree != places(root, box)[1] or not (tree.exists() or tree.is_symlink()):
+        return False
+    if gitdir is None:
+        why, gitdir = foreign(root, tree)
+        if why:
+            raise OSError(f'{tree} is not a linked worktree of this repository ({why})')
+    lock = gitdir / 'locked'
+    if not lock.exists() or lock.read_text().strip() != lock_reason(box):
+        return False
+    done = git(root, 'worktree', 'unlock', str(tree), check=False)
+    if done.returncode:
+        raise OSError(f'git worktree unlock {tree}: {done.stderr.strip()}')
+    return True
 
 
 def tree_of(box, host):
@@ -178,27 +267,29 @@ def tree_of(box, host):
     return lane_root(host, box) if kind(box) == 'worktree' else host
 
 
-def claim(tree, box):
-    """The tree is this lane's worktree, on its branch, and clean; else refuse
-    before any git command that would move or delete it. Returns the branch."""
-    top = git(tree, 'rev-parse', '--show-toplevel', check=False).stdout.strip()
-    branch = git(tree, 'symbolic-ref', '--short', 'HEAD', check=False).stdout.strip()
-    if Path(top) != tree or not (branch.startswith('cowork/') and branch.endswith(f'/{box.parent.name}-{box.name}')):
-        die(f'{tree} is not lane {box.name}\'s worktree (toplevel {top or "none"}, branch {branch or "none"}); '
-            f'move it aside', BUSY)
+def claim(root, tree, box):
+    """The tree is this lane's worktree (a linked worktree of this repository, on its branch) and clean;
+    else refuse before any git command that would move or delete it. Returns the branch and its git dir."""
+    why, gitdir = foreign(root, tree)
+    branch = '' if why else git(tree, 'symbolic-ref', '--short', 'HEAD', check=False).stdout.strip()
+    if why or not (branch.startswith('cowork/') and branch.endswith(f'/{box.parent.name}-{box.name}')):
+        detail = why or f'branch {branch or "none"}'
+        die(f'{tree} is not lane {box.name}\'s worktree ({detail}); move it aside', BUSY)
     dirty = git(tree, 'status', '--porcelain').stdout
     if dirty:
         die(f'lane {box.name} has uncommitted changes in {tree}; commit or discard them first:\n{dirty}', BUSY)
-    return branch
+    return branch, gitdir
 
 
 def sync_lane(root, box):
     """The lane's worktree, created at the host's HEAD on first use, or
     recreated on its branch when the tree is gone; refused while dirty. The
     lane's commits stay where the coworker made them: integrating them is the
-    host's. Under admission."""
+    host's. Where a new or recreated tree goes is herdr_sibling's. Under admission. Returns the tree and
+    its git dir."""
     tree, lane = lane_root(root, box), box.name
-    if not tree.exists():
+    if not (tree.exists() or tree.is_symlink()):
+        tree = places(root, box)[1 if herdr_sibling(root) else 0]
         git(root, 'worktree', 'prune')
         host = git(root, 'symbolic-ref', '--short', 'HEAD', check=False)
         if host.returncode:
@@ -211,9 +302,10 @@ def sync_lane(root, box):
         git(root, 'worktree', 'add', '-q', *([] if known else ['-b', branch]), str(tree), branch if known else head)
         if not known:
             (box / 'base').write_text(head + '\n')
-    claim(tree, box)
+    _, gitdir = claim(root, tree, box)
     if not (box / 'base').exists():  # a tree made but never recorded: its kind is unknown, never the host's
         die(f'lane {lane}\'s worktree {tree} has no record of its base; reset the lane before retrying', BUSY)
+    return tree, gitdir
 
 
 def drop_lane(root, box):
@@ -221,13 +313,21 @@ def drop_lane(root, box):
     dirty or the branch has commits the host does not."""
     tree, lane, side = lane_root(root, box), box.name, box.parent.name
     git(root, 'worktree', 'prune')
-    if not tree.exists():
+    if not (tree.exists() or tree.is_symlink()):
         return
-    branch = claim(tree, box)
+    branch, gitdir = claim(root, tree, box)
     if git(root, 'merge-base', '--is-ancestor', branch, 'HEAD', check=False).returncode:
         die(f'lane {lane} has commits on {branch} that HEAD lacks; merge the lane branch into this checkout, '
             f'or integrate it by hand and retire the worktree (git worktree remove, then git branch -D)', BUSY)
-    git(root, 'worktree', 'remove', str(tree))
+    try:
+        owned = unguard(root, box, tree, gitdir)
+    except OSError as failure:
+        die(f'{side}/{lane}: {failure}', BUSY)
+    removed = git(root, 'worktree', 'remove', str(tree), check=False)
+    if removed.returncode:
+        if owned:
+            guard(root, box, tree, gitdir)
+        die(f'git worktree remove in {root}: {removed.stderr.strip()}')
     git(root, 'branch', '-q', '-d', branch)
     print(f'{side}/{lane}: worktree {tree} removed, branch {branch} deleted')
 
@@ -978,14 +1078,15 @@ def err_tail(box, request):
     return text_of(err)[-2000:] if err.exists() else ''
 
 
-def deliver(box, request, out=None):
+def deliver(root, box, request, out=None):
     """Print a settled request's reply, or its failure, on stdout, then its
     diagnostics and one receipt line on stderr, then remove its files: the
     coworker's session store keeps the turn. With `out`, write all of that to
     the file instead and print only a short receipt naming it; a file that
     cannot be written is refused and keeps the request for a reader with a
     writable one, since a long reply printed instead may be cut. Under admission, so two readers
-    cannot both claim it, and only once both streams have taken the text."""
+    cannot both claim it, and only once both streams have taken the text. The
+    lane's last outstanding request releases its tree's lock (guard)."""
     with admission(box):
         lock = box / f'{request}.lock'
         if not lock.exists():
@@ -1029,6 +1130,12 @@ def deliver(box, request, out=None):
             # the receipt again, so it stays the last line, as callers read it
             print(f'cowork request {request}: delivered, but {failure.filename} is still open in another process; '
                   f'{kept}\n{receipt}', end='', file=sys.stderr, flush=True)
+        if kind(box) == 'worktree' and not requests(box):
+            try:
+                unguard(root, box, places(root, box)[1])
+            except OSError as failure:  # delivered all the same; a lock left in place only keeps the tree
+                print(f'cowork request {request}: delivered, but the lane\'s worktree lock stays: {failure}\n{receipt}',
+                      end='', file=sys.stderr, flush=True)
     return code
 
 
@@ -1044,7 +1151,7 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
     from birth; the caller keeps nothing open. Refused while one is in flight,
     and for a lane of another kind than the flags assert, or a dirty worktree.
     A new named lane is read-only unless --worktree makes it a worktree lane."""
-    lane = box.name
+    lane, tree, gitdir = box.name, None, None
     with admission(box):
         busy = running(box)
         if busy:
@@ -1066,8 +1173,10 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
             if lane_kind == 'read-only':
                 no_edit = True
             else:
-                sync_lane(root, box)
+                tree, gitdir = sync_lane(root, box)
         settle_pair(box, side, model, effort, tier)
+        if gitdir:
+            guard(root, box, tree, gitdir)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
         (box / f'{request}.task').write_text(task, encoding='utf-8')
         (box / f'{request}.jsonl').touch()
@@ -1211,13 +1320,13 @@ def main(argv=None):
         if a.detach:
             return 0
         held(box / f'{request}.lock', wait=True)  # wait through teardown, even if the verdict exists
-        return deliver(box, request)
+        return deliver(root, box, request)
 
     if a.cmd == 'read':
         box = find(gitdir, a.request)
         if a.wait:
             held(box / f'{a.request}.lock', wait=True)
-        return deliver(box, a.request, a.out and a.out.absolute())
+        return deliver(root, box, a.request, a.out and a.out.absolute())
 
     if a.cmd == 'kill':
         box = find(gitdir, a.request)
@@ -1249,7 +1358,8 @@ def main(argv=None):
                     shown += 1
                     fields = lane_fields(box)
                     model, tier = fields['model'], fields['tier']
-                    where = {'main': '', 'read-only': ', read-only', 'worktree': f', in {lane_root(root, box)}',
+                    trees = ' and '.join(map(str, lane_trees(root, box) or places(root, box)[:1]))
+                    where = {'main': '', 'read-only': ', read-only', 'worktree': f', in {trees}',
                              None: ', kind unknown'}[kind(box)]
                     pair = f', {model} at {fields["effort"]} effort' if model else ''
                     if side == 'codex' and model:

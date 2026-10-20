@@ -84,7 +84,20 @@ make during a read-only review changes the snapshot too.
 A worktree lane lives at `.worktrees/cowork-<side>-<lane>` on branch
 `cowork/<host branch>/<side>-<lane>`, created at your HEAD (its `base`); the
 request header names the tree, branch and that commit. A detached host gets
-no worktree lane. `reset` removes a worktree lane's tree and branch, refused
+no worktree lane. When herdr lists your checkout as a linked worktree open in
+a workspace, a new or recreated tree is the sibling
+`<checkout>--cowork-<side>-<lane>` instead, which herdr's removal of the
+checkout leaves to the worktree-children plugin; herdr on PATH is asked
+whatever `HERDR_ENV` says. A send that needs a new tree is refused (exit 3)
+when herdr cannot answer or answers with a malformed entry, or `HERDR_ENV` is
+set without herdr on PATH. A lane uses whichever place holds its tree, so
+herdr is not asked again while it exists; a tree at both places, or one that
+is not a linked worktree of this repository on the lane's branch (a symlink,
+your checkout, another repository's tree), is refused before any change. While
+a sibling lane has a request outstanding, running or undelivered (a killed one
+too), cowork holds `git worktree lock` on its tree, which the plugin keeps;
+delivering the last one, or `reset`, unlocks it, and a lock someone else took
+is never touched. `reset` removes a worktree lane's tree and branch, refused
 while the tree is dirty or the branch has commits your HEAD lacks: merge the
 lane branch, or integrate it by hand and retire the worktree (`git worktree
 remove`, then `git branch -D`). A lane that has a session but no record of
