@@ -238,9 +238,11 @@ def guard(root, box, tree, gitdir):
     """Lock the lane's tree, when it is its sibling, for its outstanding requests, running or undelivered:
     herdr's removal of the checkout lets the worktree-children plugin sweep a clean sibling, and the plugin
     keeps a locked one. The lane's lock is shared by its requests; a lock already there, the lane's or
-    anyone's, is left as it is. Under admission, on a tree claim() has checked (its git dir)."""
+    anyone's, is left as it is. Under admission, on a tree claim() has checked (its git dir). True if it locked."""
     if tree == places(root, box)[1] and not (gitdir / 'locked').exists():
         git(root, 'worktree', 'lock', '--reason', lock_reason(box), str(tree))
+        return True
+    return False
 
 
 def unguard(root, box, tree, gitdir=None):
@@ -1175,12 +1177,20 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
             else:
                 tree, gitdir = sync_lane(root, box)
         settle_pair(box, side, model, effort, tier)
-        if gitdir:
-            guard(root, box, tree, gitdir)
         request = f'{side}-{lane}-{datetime.datetime.now():%Y%m%d-%H%M%S-%f}'
-        (box / f'{request}.task').write_text(task, encoding='utf-8')
-        (box / f'{request}.jsonl').touch()
-        with (box / f'{request}.lock').open('w') as lock, (box / f'{request}.err').open('ab') as err:
+        took = bool(gitdir) and guard(root, box, tree, gitdir)
+        try:
+            (box / f'{request}.task').write_text(task, encoding='utf-8')
+            (box / f'{request}.jsonl').touch()
+            lock = (box / f'{request}.lock').open('w')
+        except BaseException as failure:
+            if took:  # no request was recorded, so no delivery would release it; sweep() takes the files
+                try:
+                    unguard(root, box, tree, gitdir)
+                except OSError as stuck:
+                    failure.add_note(f"the lane's worktree lock stays: {stuck}")
+            raise
+        with lock, (box / f'{request}.err').open('ab') as err:
             if fcntl is None:
                 # The open handle is the lock. A middle process starts the runner and exits, so once this
                 # returns the runner is no descendant of `send` that a harness's tree kill could reach.

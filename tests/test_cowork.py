@@ -2187,6 +2187,31 @@ class CoworkTest(unittest.TestCase):
         self.assertIsNone(self.lock_of(tree))
 
     @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_a_send_that_records_no_request_releases_only_the_lock_it_took(self):
+        self.commit('a.txt', 'a')
+        self.herdr()
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        tree, box = self.sibling(), self.box(lane='impl')
+        request = self.detached()
+        self.gate.touch()
+        until(lambda: not cowork.held(box / f'{request}.lock'))
+        real = Path.write_text
+        def write_text(path, *args, **kwargs):
+            if path.suffix == '.task':
+                raise OSError(errno.ENOSPC, 'No space left on device')
+            return real(path, *args, **kwargs)
+        with mock.patch.object(Path, 'write_text', write_text):
+            self.assertRaises(OSError, self.send, '--lane', 'impl', '--task', 'y')
+        self.assertIsNotNone(self.lock_of(tree), 'the undelivered request still holds it')
+        self.assertEqual(cowork.requests(box), [request])
+        self.assertEqual(self.run_cli('read', request)[0], 0)
+        self.assertIsNone(self.lock_of(tree))
+        with mock.patch.object(Path, 'write_text', write_text):
+            self.assertRaises(OSError, self.send, '--lane', 'impl', '--task', 'z')
+        self.assertIsNone(self.lock_of(tree), 'a lock taken for a request never recorded is released')
+        self.assertEqual(cowork.requests(box), [])
+
+    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_reset_unlocks_only_after_its_checks_and_never_a_foreign_lock(self):
         self.commit('a.txt', 'a')
         self.herdr()
