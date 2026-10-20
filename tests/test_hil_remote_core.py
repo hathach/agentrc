@@ -710,6 +710,16 @@ class CopyBack(Rig):
             rc_.copy_back(tree, self.root, [('run/',)], ['run/report.json'])
         self.assertIn('is inside the tree run/', e.exception.code)
 
+    def test_a_member_of_two_groups_or_a_group_and_optional_is_refused(self):
+        tree = rc_.Tree('rig', '/tmp/t', '/tmp/t.lock', 'tok', self.root)
+        for groups, optional in (([('report.json', 'report.md')], ['report.json']),
+                                 ([('report.json', 'report.md'), ('report.json', 'cfg.json')], [])):
+            with self.subTest(groups=groups, optional=optional), self.assertRaises(RemoteError) as e:
+                rc_.copy_back(tree, self.root, groups, optional)
+            self.assertIn('report.json', e.exception.code)
+            self.assertIn('a group lands all or none', e.exception.code)
+        self.assertEqual(self.calls(), [], 'refused before the rig')
+
 
 class Units(unittest.TestCase):
     def test_snapshot_pins_the_bytes_it_copied(self):
@@ -808,6 +818,22 @@ class Units(unittest.TestCase):
                 ({'tokenOk': True, 'launch': launch, 'done': 'unreadable', 'driverLock': 'free', 'driverAlive': False}, 'inconclusive')):
             with self.subTest(probe):
                 self.assertEqual(rc_.attempt_state(probe), state)
+
+    def test_a_wait_bounds_each_status_poll_by_the_time_left(self):
+        tree = rc_.Tree('rig', '/tmp/t', '/tmp/t.lock', 'tok', Path('.'))
+        given = []
+
+        def slow_rig(host, op, *args, timeout=rc_.RIG_SECS):
+            given.append(timeout)
+            time.sleep(timeout)   # a rig that answers no poll
+            return 255, '', f'ssh to {host} did not return within {timeout:g} s'
+        with mock.patch.object(rc_, '_rig', slow_rig), mock.patch.object(rc_, 'STATUS_MIN_SECS', 0.2):
+            t = time.monotonic()
+            code, st = rc_.wait_attempt(tree, 0.5, poll=0.05)
+            took = time.monotonic() - t
+        self.assertEqual((code, st['state']), (rc_.INCONCLUSIVE, 'unreachable'))
+        self.assertTrue(given and all(0.2 <= g <= 0.5 for g in given), given)
+        self.assertLess(took, 0.5 + 0.2 + 0.3, 'a poll past the deadline is bounded by STATUS_MIN_SECS')
 
     def test_the_rig_helper_is_one_program(self):
         compile(rc_.RIG_PY, 'rig', 'exec')
@@ -957,6 +983,11 @@ class RunRecords(unittest.TestCase):
             self.run_('r2', lambda: rc_.fail('no build under cmake-build/'))
         self.assertEqual(e.exception.code, 'error: no build under cmake-build/', 'the refusal still reaches stderr')
         self.assertEqual(self.wait('r2')[1], {'state': 'done', 'runId': 'r2', 'exit': 1, 'reports': []})
+
+    def test_a_done_record_that_cannot_be_written_still_releases_the_run(self):
+        with self.assertRaises(TypeError):
+            self.run_('r9', lambda: (0, [object()]))   # reports JSON cannot hold
+        self.assertEqual(self.wait('r9', timeout=1)[0], rc_.DEAD, 'a finished run never reads as running')
 
     def test_a_run_id_is_used_once(self):
         self.run_('r3', lambda: (0, []))
@@ -1490,6 +1521,17 @@ class Attempts(Rig):
         with self.assertRaises(RemoteError) as e:
             rc_.collect(tree, self.tmp / 'got2', [(rc_.COLLECTION,)])
         self.assertIn('is the collection record itself', e.exception.code)
+
+    def test_a_cached_collection_whose_files_were_moved_out_is_refused(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        col = rc_.collect(tree, dest, [('out/report.json', f'{rc_.RECORDS}/done.json')])
+        self.assertEqual(col['state'], 'complete', 'a record file may be a group member too')
+        self.assertEqual(rc_.collect(tree, dest, [('out/report.json',)]), col)
+        (dest / 'out/report.json').rename(self.tmp / 'adopted.json')   # an adoption moves the report out
+        with self.assertRaises(RemoteError) as e:
+            rc_.collect(tree, dest, [('out/report.json',)])
+        self.assertIn('out/report.json are gone', e.exception.code)
 
     def paused_collector(self, dest, seam, args, accept=None):
         """collect(a1, dest, <args>, accept=<accept>) in another interpreter, paused once `seam`

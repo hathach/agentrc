@@ -1051,9 +1051,10 @@ def _retryable(c: AttemptContext, board: str) -> bool:
             and any(r['board'] == board and r['verdict'] == 'fail' for r in run['rows']))
 
 
-def _eligible(before: AttemptContext, after: AttemptContext, board: str) -> bool:
-    """`after` is an eligible retry of `before`'s fail on `board`."""
-    return after.retry and after.previous_attempt == before.attempt_id and _retryable(before, board)
+def _eligible(failed: AttemptContext, before: AttemptContext, after: AttemptContext, board: str) -> bool:
+    """`after`, following `before`, is an eligible retry of `failed`'s fail on `board`; `before`
+    is `failed` or a later attempt that left the board not-run (an admission refusal)."""
+    return after.retry and after.previous_attempt == before.attempt_id and _retryable(failed, board)
 
 
 def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
@@ -1063,9 +1064,10 @@ def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
     reads every attempt's whole run. An earlier blocker stands; only an eligible
     fail-then-pass is a pass, marked flaky, citing both attempts, and only when it is the
     board's one fail so far; a fail that was not retryable, or a second fail, stays unresolved
-    for the rest of the sequence. A missing, corrupt, unsupported or mismatched attempt in the
-    chain denies every pass; a withdrawn one ended without a report, so every requested board
-    is a blocker."""
+    for the rest of the sequence. An attempt that left the board not-run (locked, say) uses no
+    retry: a later retry still answers the fail. A missing, corrupt, unsupported or mismatched
+    attempt in the chain denies every pass; a withdrawn one ended without a report, so every
+    requested board is a blocker."""
     _validation(schema)
     broken = [{'attempt_id': c.attempt_id, 'outcome': c.outcome, 'detail': c.reading.detail}
               for c in chain if c.outcome not in READABLE or c.run is None]
@@ -1073,21 +1075,23 @@ def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
     for b in requested:
         verdict, flaky, retried, detail, evidence, seen = None, False, False, 'not run in any attempt', [], []
         sticky = False   # a fail no later pass may clear
-        before = None
+        before = failed = None   # the previous attempt; the one whose fail a retry answers
         for c in chain:
             mine = next((r for r in (c.run or {}).get('rows', []) if r['board'] == b), None)
+            unexercised = mine is not None and mine['verdict'] == 'not-run' and verdict == 'fail'
             if mine is not None:
                 seen.append(c.attempt_id)
                 v, was = mine['verdict'], verdict
                 # this attempt retries the board's fail: counted whatever it found, so once only
-                is_retry = verdict == 'fail' and before is not None and _eligible(before, c, b)
+                is_retry = verdict == 'fail' and failed is not None and not unexercised \
+                    and _eligible(failed, before, c, b)
                 if verdict == 'blocker' or (v == 'not-run' and verdict is not None):
                     pass
                 elif v == 'pass' and verdict == 'fail':
                     if is_retry and not retried and not sticky:
                         verdict, flaky = 'pass', True
                         evidence = evidence + [f'{c.attempt_id}: {e}' for e in mine['evidence']]
-                        detail = f'flaky: failed in {before.attempt_id} ({detail}), passed on retry {c.attempt_id}'
+                        detail = f'flaky: failed in {failed.attempt_id} ({detail}), passed on retry {c.attempt_id}'
                     else:
                         detail += f'; a later pass in {c.attempt_id} is not an eligible retry'
                 elif v == 'fail' and was == 'fail':   # every unresolved fail stays cited
@@ -1101,6 +1105,8 @@ def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
                 if v == 'fail' and (was == 'fail' or retried):
                     sticky = True
                 retried = retried or is_retry
+            if not unexercised:
+                failed = c
             before = c
         if verdict is None:
             verdict = 'not-run'

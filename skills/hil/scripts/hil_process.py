@@ -641,6 +641,9 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
     if timeout is None or settle is None or state_dir is None:
         raise ValueError('run_tracked needs an explicit timeout, settle and state_dir')
     try:
+        # the job crosses to the supervisor as JSON: path-like arguments as run_cmd's Popen takes them
+        argv = cmd if isinstance(cmd, str) else [os.fspath(a) for a in cmd]
+        cwd = None if cwd is None else os.fspath(cwd)
         base = os.path.join(trusted_dir(state_dir), f'hil_op_{secrets.token_hex(8)}')
         log = open(f'{base}.log', 'xb')
     except BaseException as e:
@@ -649,7 +652,7 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
                'record': f'{base}.json', 'log': f'{base}.log', 'survivors': None}
     rfd, wfd = os.pipe()
     reports = _Reports(rfd)
-    job = {'cmd': cmd, 'cwd': cwd, 'timeout': timeout, 'settle': settle, 'reap_grace': reap_grace,
+    job = {'cmd': argv, 'cwd': cwd, 'timeout': timeout, 'settle': settle, 'reap_grace': reap_grace,
            'binary': binary, 'split_stderr': split_stderr, 'report_fd': wfd, 'token': receipt['token'],
            'lock': receipt['lock'], 'record': receipt['record']}
     hold = InterruptHold()

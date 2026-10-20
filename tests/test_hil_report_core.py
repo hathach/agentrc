@@ -1152,6 +1152,20 @@ class Sequences(Dir):
         self.assertEqual(self.board(res, 'b1'), ('fail', False))
         self.assertEqual(self.board(res, 'b2'), ('pass', False))
 
+    def test_a_locked_admission_between_a_fail_and_its_retry_uses_no_retry(self):
+        self.attempt([{'t': 'fail'}], False, 'a1')
+        self.attempt([{'board-locked': 'held'}], True, 'a2')
+        self.attempt([{'t': 'pass'}], True, 'a3')
+        res = self.verdict(retry={'a2', 'a3'})
+        self.assertEqual(self.board(res), ('pass', True))
+        self.assertIn('failed in a1', res['sequence']['rows'][0]['detail'])
+        # admitted again, the retry that ran is the one: its fail stays, a later pass does not clear it
+        self.attempt([{'t': 'fail'}], False, 'b1')
+        self.attempt([{'board-locked': 'held'}], True, 'b2')
+        self.attempt([{'t': 'fail'}], True, 'b3')
+        self.attempt([{'t': 'pass'}], True, 'b4')
+        self.assertEqual(self.board(self.verdict(retry={'b2', 'b3', 'b4'})), ('fail', False))
+
     def test_an_earlier_abort_survives_retry_aggregation(self):
         self.attempt([{'t': 'pass'}], False, 'a1', 'aborted', '**HIL run aborted: worker raised.**\n')
         self.attempt([{'t': 'pass'}], True, 'a2')

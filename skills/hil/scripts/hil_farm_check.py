@@ -910,9 +910,15 @@ def _main(profile, argv, state_dir, host) -> int:
     if args.report_dir:
         try:
             report_core.publish(args.report_dir, FARM_SCHEMA, doc, meta)
-        except report_core.ReportError as e:
+        except (report_core.ReportError, OSError) as e:
             print(f'farm check: report not persisted: {e}', file=sys.stderr)
             code = max(code, 1)
+            # the predecessor stays live until withdrawn: it must not read as this check's result
+            try:
+                rec = report_core.recover_publish(args.report_dir, FARM_SCHEMA, attempt, e)
+            except (report_core.ReportError, OSError) as again:
+                rec = report_core.Recovery('unresolved', [str(again)], [])
+            print(f'farm check: report {rec.outcome}' + ''.join(f'; {p}' for p in rec.problems), file=sys.stderr)
     return code
 
 

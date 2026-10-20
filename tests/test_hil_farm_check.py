@@ -936,6 +936,39 @@ class Main(unittest.TestCase):
         with self.assertRaises(ValueError):
             core.apply_run_rules(eng.FARM_SCHEMA, ['b'], [], 'completed', '')
 
+    def test_a_check_that_cannot_publish_withdraws_the_previous_result(self):
+        rd = self.d / 'reports'
+        code, _, _ = self.run_main(self.cfg, '--report-dir', str(rd), check=lambda *a, **kw: row('b', 'ok'))
+        self.assertEqual(code, 0)
+        real = core.os.replace
+
+        def failing(times):
+            left = [times]
+
+            def replace(src, dst, *a, **kw):
+                if str(dst).endswith('farm_check.json') and left[0]:
+                    left[0] -= 1
+                    raise OSError(28, 'no space')
+                return real(src, dst, *a, **kw)
+            return replace
+        with mock.patch.object(core.os, 'replace', failing(1)):
+            code, _, err = self.run_main(self.cfg, '--report-dir', str(rd), check=lambda *a, **kw: row('b', 'failed'))
+        self.assertEqual(code, 1)
+        self.assertIn('report not persisted', err)
+        self.assertIn('report withdrawn', err)
+        reading = core.read_document(rd / 'farm_check.json', eng.FARM_SCHEMA)
+        self.assertEqual(reading.outcome, 'withdrawn', 'the earlier ok check never reads as this one')
+        self.assertIn(core.NOTICE, (rd / 'farm_check.md').read_text())
+        # a withdrawal that cannot be written either: the predecessor it archived goes
+        code, _, _ = self.run_main(self.cfg, '--report-dir', str(rd), check=lambda *a, **kw: row('b', 'ok'))
+        self.assertEqual(code, 0)
+        with mock.patch.object(core.os, 'replace', failing(2)):
+            code, _, err = self.run_main(self.cfg, '--report-dir', str(rd), check=lambda *a, **kw: row('b', 'failed'))
+        self.assertEqual(code, 1)
+        self.assertIn('report removed', err)
+        self.assertFalse((rd / 'farm_check.json').exists())
+        self.assertFalse((rd / 'farm_check.md').exists())
+
 
 # --- process integration ------------------------------------------------------------------------
 LAUNCHER = """

@@ -86,6 +86,7 @@ RIG_SECS = 180       # one rig helper call: the lease wait (60 s) and a slow lin
 # under the Bash tool's 10-min foreground cap, so one wait is one tool call
 WAIT_SECS = 570
 POLL_SECS = 5
+STATUS_MIN_SECS = 15   # a wait's last status poll: past its deadline by at most this
 # a background launch writes its started record within this, or it never started
 START_SECS = 30
 # wait exit statuses beside 0 (done); refusals exit 1
@@ -561,15 +562,21 @@ def copy_back(tree, dest, groups=(), optional=()):
     Locally a parent under dest that is a link or not a directory refuses the copy-back.
 
     A group lands only whole: half of a report pair would publish last run's table beside this
-    run's data. A stale local copy of a group that did not all arrive, or of an optional member
-    that did not arrive, is removed. Nothing lands before the whole stream is validated.
+    run's data, so a member in two groups, or in a group and optional, is refused. A stale
+    local copy of a group that did not all arrive, or of an optional member that did not
+    arrive, is removed. Nothing lands before the whole stream is validated.
     Returns a CopyBack: (copied, the dest-relative members written; incomplete, the groups that
     did not all arrive), its .outcomes telling an absent optional member from a failed fetch.
     A tree is named with its trailing / throughout."""
     dest = Path(dest)
     groups = [[_artifact(m) for m in g] for g in groups]
     optional = [_artifact(m) for m in optional]
-    members = list(dict.fromkeys([*(m for g in groups for m in g), *optional]))
+    grouped = [m for g in groups for m in dict.fromkeys(g)]
+    shared = sorted({m for m in grouped if grouped.count(m) > 1} | (set(grouped) & set(optional)))
+    if shared:
+        fail(f'the artifact(s) {", ".join(shared)} belong to two groups, or a group and optional: '
+             f'a group lands all or none')
+    members = list(dict.fromkeys([*grouped, *optional]))
     for m in members:
         _local(dest, m.rstrip('/'))
         inside = [t for t in members if t.endswith('/') and t != m and m.startswith(t)]
@@ -940,15 +947,15 @@ RIG_PY = (f'TOKEN_FILE, RECORDS, REFUSED, FETCH_RESULT, RIG_PATH = {TOKEN_FILE!r
           f'{FETCH_RESULT!r}, {RIG_PATH!r}\n' + _RIG_BODY)
 
 
-def _rig(host, op, *args):
+def _rig(host, op, *args, timeout=RIG_SECS):
     """Run the rig helper's op over ssh: (exit status, stdout, stderr); exit 255 with the reason
-    when ssh did not return within RIG_SECS."""
+    when ssh did not return within timeout seconds."""
     try:
         r = subprocess.run(ssh_argv(host, shlex.join(['python3', '-c', RIG_PY, op, *args])),
                            stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding='utf-8',
-                           errors='replace', timeout=RIG_SECS)
+                           errors='replace', timeout=timeout)
     except subprocess.TimeoutExpired:
-        return 255, '', f'ssh to {host} did not return within {RIG_SECS} s'
+        return 255, '', f'ssh to {host} did not return within {timeout:g} s'
     return r.returncode, r.stdout, r.stderr.strip()
 
 
@@ -1054,9 +1061,10 @@ def attempt_state(probe):
     return 'inconclusive'
 
 
-def attempt_status(tree):
-    """The rig's evidence on the attempt, with its `state` (attempt_state, or unreachable)."""
-    rc, out, err = _rig(tree.host, 'status', tree.dir, tree.lock, tree.token)
+def attempt_status(tree, timeout=RIG_SECS):
+    """The rig's evidence on the attempt, with its `state` (attempt_state, or unreachable when
+    the rig did not answer within timeout seconds)."""
+    rc, out, err = _rig(tree.host, 'status', tree.dir, tree.lock, tree.token, timeout=timeout)
     raw = _marked(out, 'HIL_REMOTE_STATUS')
     where = {'host': tree.host, 'dir': tree.dir}
     if raw is None:
@@ -1069,11 +1077,12 @@ def wait_attempt(tree, timeout, *, poll=POLL_SECS, dest=None, groups=(), optiona
     """Poll the attempt for up to timeout seconds, each poll a new ssh session: (0, status) once
     done, collected into dest when given (collect, without probing the done attempt again);
     (DEAD, ...) dead or never launched; (RUNNING, ...) still running at the timeout;
-    (INCONCLUSIVE, ...) evidence incomplete or the rig unreachable at the timeout. Waiting
-    never launches, signals or cancels the attempt."""
+    (INCONCLUSIVE, ...) evidence incomplete or the rig unreachable at the timeout. Each poll
+    gets the time left, at least STATUS_MIN_SECS, so polling ends by then. Waiting never
+    launches, signals or cancels the attempt."""
     deadline = time.monotonic() + timeout
     while True:
-        st = attempt_status(tree)
+        st = attempt_status(tree, min(RIG_SECS, max(STATUS_MIN_SECS, deadline - time.monotonic())))
         if st['state'] == 'gone':
             fail(f"{tree.spec()} is not this attempt's tree any more (removed or replaced)")
         if st['state'] == 'done':
@@ -1135,6 +1144,15 @@ def _uncovered(held, groups, optional):
     return [*(m for g in groups for m in g if m not in copied), *(o for o in optional if o not in asked)]
 
 
+def _gone(held, dest):
+    """The members a cached collection copied that dest no longer holds as that type: an
+    adoption moves a report and its records out, for one."""
+    def there(m):
+        p = dest / m.rstrip('/')
+        return not p.is_symlink() and (p.is_dir() if m.endswith('/') else p.is_file())
+    return [m for m in held.get('copied') or () if not there(m)]
+
+
 def _unaccepted(accept, path):
     """accept(path)'s missing evidence, checked to be a list of strings."""
     missing = accept(path)
@@ -1161,10 +1179,10 @@ def collect(tree, dest, groups=(), optional=(), accept=None):
     they were: they stay complete by transport but are never returned as accepted.
 
     A collection complete by the caller's predicate is final: collecting it again returns it
-    unfetched when it covers what is asked, and refuses when it does not; partial evidence
-    never replaces it. A dest holding another attempt's collection, or files without a record,
-    refuses. Collectors of one dest are serialised by a lock beside it, across the cache check,
-    the predicate, the fetch and the publication."""
+    unfetched when it covers what is asked and dest still holds all it copied, and refuses
+    when it does not; partial evidence never replaces it. A dest holding another attempt's
+    collection, or files without a record, refuses. Collectors of one dest are serialised by a
+    lock beside it, across the cache check, the predicate, the fetch and the publication."""
     return _collect(tree, dest, groups, optional, accept, None)
 
 
@@ -1185,6 +1203,10 @@ def _collect(tree, dest, groups, optional, accept, st):
             if held.get('identity') != identity:
                 fail(f'{dest} holds the collection of another attempt ({held.get("remote")}); collect into a new dest')
             if held.get('state') == 'complete':
+                gone = _gone(held, dest)
+                if gone:
+                    fail(f'{dest} holds a complete collection whose {", ".join(gone)} are gone (moved out, by an '
+                         f'adoption, or removed); collect into a new dest')
                 short = _uncovered(held, groups, optional)
                 if short:
                     fail(f'{dest} holds a complete collection that did not fetch {", ".join(short)}; '
@@ -1202,7 +1224,8 @@ def _collect(tree, dest, groups, optional, accept, st):
         _remove(tmp)
         tmp.mkdir()
         try:
-            got = copy_back(tree, tmp, groups, (*RECORD_FILES, *optional))
+            records = [r for r in RECORD_FILES if r not in {m for g in groups for m in g}]
+            got = copy_back(tree, tmp, groups, (*records, *optional))
             copied, incomplete = got
             unaccepted = [] if accept is None else _unaccepted(accept, tmp)
             complete = (st['state'] == 'done' and not incomplete and f'{RECORDS}/done.json' in copied
@@ -1368,14 +1391,16 @@ def run_recorded(runs, run_id, body, record=None):
         rc = e.code if isinstance(e.code, int) else int(e.code is not None)
         raise
     finally:
-        write_json(done, {'runId': run_id, 'exit': rc, 'reports': reports})
         try:
-            _unlock(lock)
-        finally:
-            os.close(lock)
-        if not fcntl:
-            with contextlib.suppress(OSError):   # a waiter's probe holding the file open makes Windows refuse; the next sweep takes it
-                started.with_name(f'.{started.name}.{os.getpid()}.tmp').unlink(missing_ok=True)
+            write_json(done, {'runId': run_id, 'exit': rc, 'reports': reports})
+        finally:   # no done record: the lock still goes, so a waiter reads the run dead, never running
+            try:
+                _unlock(lock)
+            finally:
+                os.close(lock)
+            if not fcntl:
+                with contextlib.suppress(OSError):   # a waiter's probe holding the file open makes Windows refuse; the next sweep takes it
+                    started.with_name(f'.{started.name}.{os.getpid()}.tmp').unlink(missing_ok=True)
 
 
 def sweep_stale_tmps(runs):

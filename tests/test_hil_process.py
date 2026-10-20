@@ -729,6 +729,15 @@ class RunTracked(unittest.TestCase):
         self.assertEqual(res['subreaper'], 0, 'the caller became a subreaper')
         self.assertEqual(res['handlers'], [True, True], "the caller's handlers were not restored")
 
+    def test_path_arguments_run_as_run_cmd_runs_them(self):
+        res = self.child("""
+            from pathlib import Path
+            r = hp.run_tracked([Path('/bin/sh'), '-c', 'pwd'], Path(D), timeout=20, settle=5, state_dir=S)
+            report(a=[r.returncode, r.stdout.strip() == os.path.realpath(D), r.cleanup], files=os.listdir(S))
+        """)
+        self.assertEqual(res['a'], [0, True, 'done'])
+        self.assertEqual(res['files'], [])
+
     def test_a_descendant_left_behind_is_pending_until_it_ends(self):
         res = self.child("""
             r = hp.run_tracked('sleep 30 </dev/null >/dev/null 2>&1 & echo $!', timeout=20, settle=0.5, state_dir=S)
