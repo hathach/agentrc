@@ -152,6 +152,17 @@ class Reading(Dir):
                 self.assertEqual(r.outcome, 'unsupported')
                 self.assertIsNone(r.body)
 
+    def test_a_withdrawal_record_is_never_evidence(self):
+        rec = {'_hil_withdrawn': {'version': 1, 'body_schema': 'tinyusb-hil-report', 'attempt_id': 'a2',
+                                  'archived': 'a1', 'reason': 'disk full'}}
+        r = self.read(rec)
+        self.assertEqual((r.outcome, r.legacy), ('withdrawn', False))
+        self.assertIn('attempt a2 could not publish', r.detail)
+        self.assertEqual(self.read(rec, TINYUF2).outcome, 'unsupported')
+        self.assertEqual(self.read({**rec, 'rows': []}).outcome, 'corrupt')
+        self.assertEqual(self.read({'_hil_withdrawn': {**rec['_hil_withdrawn'], 'attempt_id': '../x'}}).outcome,
+                         'corrupt')
+
     def test_valid_empty_and_valid(self):
         self.assertEqual(self.read(self.published(body=usb_body([]))).outcome, 'empty')
         r = self.read(self.published())
@@ -201,6 +212,31 @@ class Metadata(Dir):
                 self.meta(TINYUSB, a, **{'termination': 'completed', **kw})
         with self.assertRaises(ValueError):
             self.meta(TINYUSB, core.Attempt('../x', None, None, None, None))
+
+    def test_attempt_ids_and_archive_references(self):
+        longest = 'x' * 128
+        for previous in (None, 'a1', longest, 'withdrawn-' + longest, 'legacy-0123456789abcdef',
+                         'legacy-text-0123456789abcdef', 'corrupt-0123456789abcdef'):
+            with self.subTest(previous):
+                self.meta(TINYUSB, core.Attempt(longest, previous, None, None, None))
+        for aid, previous in (('x' * 129, None), ('withdrawn-a1', None), ('legacy-a', None), ('corrupt-1', None),
+                              ('a2', 'withdrawn-' + 'x' * 129), ('a2', 'withdrawn-withdrawn-a1'),
+                              ('a2', 'legacy-xyz'), ('a2', '../a1')):
+            with self.subTest((aid, previous)), self.assertRaises(ValueError):
+                self.meta(TINYUSB, core.Attempt(aid, previous, None, None, None))
+        with self.assertRaises(core.ReportError):
+            core.start_attempt(self.d, TINYUSB, False, 'withdrawn-a1')
+
+    def test_a_longest_id_round_trips_through_a_withdrawal(self):
+        ids = ['a' * 128, 'b' * 128, 'c' * 128]
+        self.run_attempt(TINYUSB, usb_body([usb_row('b1', t='pass')]), attempt_id=ids[0])
+        core.start_attempt(self.d, TINYUSB, True, ids[1])
+        core.withdraw_current(self.d, TINYUSB, ids[1], 'publish failed')
+        a3 = self.run_attempt(TINYUSB, usb_body([usb_row('b1', t='pass')]), accumulate=True, attempt_id=ids[2])
+        self.assertEqual(a3.previous_attempt, 'withdrawn-' + ids[1])
+        self.assertEqual([c.attempt_id for c in core.read_chain(self.d, TINYUSB)], ['withdrawn-' + ids[1], ids[2]])
+        self.assertEqual({a['attempt_id'] for a in core.inventory(self.d, TINYUSB)['attempts']},
+                         {ids[0], 'withdrawn-' + ids[1]})
 
     def test_serialise_validates_without_writing(self):
         a = core.Attempt('a1', None, None, None, None)
@@ -554,6 +590,159 @@ class Attempts(Dir):
         self.assertEqual([a['attempt_id'] for a in inv['attempts']], ['a1'])
         self.assertEqual(set(inv['attempts'][0]['files']), {'hil_report.json', 'hil_report.md'})
         self.assertEqual(len(inv['attempts'][0]['files']['hil_report.json']['sha256']), 64)
+
+
+class ArchiveAndWithdraw(Dir):
+    def setUp(self):
+        super().setUp()
+        self.run_attempt(TINYUSB, usb_body([usb_row('b1', t='pass')]), attempt_id='a1')
+        self.before = self.files()
+
+    def test_archive_current_archives_like_start_attempt_and_seals(self):
+        self.assertEqual(core.archive_current(self.d, TINYUSB), 'a1')
+        self.assertEqual(core.archive_current(self.d, TINYUSB), 'a1')   # idempotent
+        self.assertEqual(self.files(), self.before)                     # the pair stays in place
+        rec = core.paths(self.d, TINYUSB)[2] / 'a1'
+        self.assertEqual((rec / 'hil_report.json').read_bytes(), self.before[0])
+        self.assertEqual((rec / 'hil_report.md').read_bytes(), self.before[1])
+        with self.assertRaises(core.ReportError) as cm:
+            core.publish(self.d, TINYUSB, usb_body([]), self.meta(TINYUSB, core.Attempt('a1', None, None, None, None)))
+        self.assertEqual(cm.exception.stage, 'sealed')
+        a = core.start_attempt(self.d, TINYUSB, True, 'a2')   # the same record, reused
+        self.assertEqual(a.previous_attempt, 'a1')
+
+    def test_archive_current_shares_start_attempts_rules(self):
+        empty = self.d.parent / 'empty'
+        self.assertIsNone(core.archive_current(empty, TINYUSB))
+        core.paths(self.d, TINYUSB)[0].write_text('{')
+        self.assertTrue(core.archive_current(self.d, TINYUSB).startswith('corrupt-'))
+        core.paths(self.d, TINYUSB)[0].write_text(json.dumps({**usb_body([]), '_hil': {'version': 99}}))
+        with self.assertRaises(core.ReportError) as cm:
+            core.archive_current(self.d, TINYUSB)
+        self.assertEqual(cm.exception.stage, 'predecessor')
+        core.paths(self.d, TINYUSB)[0].write_bytes(self.before[0])
+        broken = TINYUSB._replace(render=lambda b: 1 / 0)
+        shutil.rmtree(core.paths(self.d, TINYUSB)[2])
+        with self.assertRaises(core.ReportError) as cm:
+            core.archive_current(self.d, broken)
+        self.assertEqual((cm.exception.stage, cm.exception.published), ('render', ()))
+        self.assertFalse(core.paths(self.d, TINYUSB)[2].exists())
+
+    def failed_abort_publish(self):
+        """a2 accumulates onto the passing a1, aborts, and its abort report fails to publish."""
+        a2 = core.start_attempt(self.d, TINYUSB, True, 'a2')
+        abort = usb_body([usb_row('b1', **{'run-aborted': 'fail'})], caveat='**HIL run aborted.**\n')
+        real = os.replace
+
+        def fail_json(src, dst, *a, **kw):
+            if str(dst).endswith('.json'):
+                raise OSError(28, 'no space')
+            return real(src, dst, *a, **kw)
+
+        with mock.patch.object(core.os, 'replace', fail_json), self.assertRaises(core.ReportError) as cm:
+            core.publish(self.d, TINYUSB, abort, self.meta(TINYUSB, a2, 'aborted'))
+        self.assertEqual(self.files(), self.before)   # the passing a1 is still the live pair
+        return a2, cm.exception
+
+    def sequence(self):
+        chain = [c._replace(run=models.tinyusb_run(c.reading, ['b1']) if c.outcome in core.READABLE else None,
+                            retry=True) for c in core.read_chain(self.d, TINYUSB)]
+        return core.sequence_verdict(TINYUSB, ['b1'], chain)['sequence']
+
+    def retry_a3(self):
+        """a3 accumulates and passes. No prepare_pair first: the record alone must hold."""
+        a3 = core.start_attempt(self.d, TINYUSB, True, 'a3')
+        self.assertEqual(a3.previous_attempt, 'withdrawn-a2')
+        core.publish(self.d, TINYUSB, usb_body([usb_row('b1', t='pass')]), self.meta(TINYUSB, a3))
+        seq = self.sequence()
+        self.assertEqual(seq['attempts'], ['withdrawn-a2', 'a3'])
+        self.assertEqual(seq['rows'][0]['verdict'], 'blocker')
+
+    def test_an_abort_fallback_after_a_failed_publish_is_never_prepared_into_a_passing_pair(self):
+        a2, err = self.failed_abort_publish()
+        self.assertEqual(core.withdraw_current(self.d, TINYUSB, a2.attempt_id, str(err)), 'a1')
+        j, m = self.files()
+        r = core.parse(j, TINYUSB)
+        self.assertEqual((r.outcome, r.body['attempt_id'], r.body['archived']), ('withdrawn', 'a2', 'a1'))
+        self.assertTrue(m.decode().startswith(core.NOTICE))
+        self.assertIn('attempt a2 could not publish', m.decode())
+        self.assertNotIn('✅', m.decode())
+        self.assertEqual(core.prepare_pair(self.d, TINYUSB).outcome, 'withdrawn')
+        self.assertEqual(self.files(), (j, m))   # preparation writes the same notice
+        self.assertEqual((core.paths(self.d, TINYUSB)[2] / 'a1' / 'hil_report.json').read_bytes(), self.before[0])
+        self.assertEqual(self.sequence()['rows'][0]['verdict'], 'blocker')   # a2 ended without a report
+        with self.assertRaises(core.ReportError) as cm:   # the withdrawn attempt never publishes
+            core.publish(self.d, TINYUSB, usb_body([]), self.meta(TINYUSB, a2, 'aborted'))
+        self.assertEqual(cm.exception.stage, 'sealed')
+        self.retry_a3()
+
+    def test_an_interrupted_withdrawal_keeps_the_sequence_boundary(self):
+        """The live Markdown already absent (a failed Markdown publication), and the notice
+        write fails after the record: the record alone carries the boundary."""
+        core.paths(self.d, TINYUSB)[1].unlink()
+        self.before = self.files()
+        a2, err = self.failed_abort_publish()
+        real = core._replace_one
+        with mock.patch.object(core, '_replace_one',
+                               side_effect=lambda p, d: real(p, d) if p.suffix == '.json' else (_ for _ in ()).throw(
+                                   OSError(5, 'io'))), self.assertRaises(core.ReportError):
+            core.withdraw_current(self.d, TINYUSB, a2.attempt_id, str(err))
+        j, m = self.files()
+        self.assertIsNone(m)
+        self.assertEqual(core.parse(j, TINYUSB).outcome, 'withdrawn')
+        self.retry_a3()
+
+    def test_a_withdrawn_id_stays_sealed_after_a_successor_publishes(self):
+        a2, err = self.failed_abort_publish()
+        core.withdraw_current(self.d, TINYUSB, 'a2', str(err))
+        root = core.paths(self.d, TINYUSB)[2]
+        with self.assertRaises(core.ReportError) as cm:   # the live withdrawal, refused before archiving
+            core.start_attempt(self.d, TINYUSB, False, 'a2')
+        self.assertEqual(cm.exception.stage, 'attempt')
+        self.assertFalse((root / 'withdrawn-a2').exists())
+        a3 = core.start_attempt(self.d, TINYUSB, True, 'a3')
+        core.publish(self.d, TINYUSB, usb_body([usb_row('b1', t='pass')]), self.meta(TINYUSB, a3))
+        with self.assertRaises(core.ReportError) as cm:
+            core.start_attempt(self.d, TINYUSB, False, 'a2')
+        self.assertEqual(cm.exception.stage, 'attempt')
+        with self.assertRaises(core.ReportError) as cm:
+            core.publish(self.d, TINYUSB, usb_body([usb_row('b1', t='pass')]), self.meta(TINYUSB, a2))
+        self.assertEqual(cm.exception.stage, 'sealed')
+        with self.assertRaises(core.ReportError) as cm:
+            core.withdraw_current(self.d, TINYUSB, 'a2', 'again')
+        self.assertEqual(cm.exception.stage, 'sealed')
+        self.assertEqual(self.sequence()['attempts'], ['withdrawn-a2', 'a3'])
+
+    def test_a_withdrawal_retry_keeps_its_record(self):
+        a2, err = self.failed_abort_publish()
+        real = core._replace_one
+        with mock.patch.object(core, '_replace_one',
+                               side_effect=lambda p, d: real(p, d) if p.suffix == '.json' else (_ for _ in ()).throw(
+                                   OSError(5, 'io'))), self.assertRaises(core.ReportError):
+            core.withdraw_current(self.d, TINYUSB, 'a2', str(err))
+        record = self.files()[0]
+        self.assertEqual(core.withdraw_current(self.d, TINYUSB, 'a2', 'retried'), 'a1')
+        j, m = self.files()
+        self.assertEqual(j, record)
+        self.assertTrue(m.decode().startswith(core.NOTICE))
+        self.assertEqual(core.prepare_pair(self.d, TINYUSB).outcome, 'withdrawn')
+        self.assertEqual(self.files(), (j, m))
+        self.retry_a3()
+
+    def test_withdrawal_reuses_an_archive_without_rendering(self):
+        broken = TINYUSB._replace(render=lambda b: 1 / 0)
+        a2 = core.start_attempt(self.d, TINYUSB, True, 'a2')   # archives a1
+        with self.assertRaises(core.ReportError) as cm:
+            core.publish(self.d, broken, usb_body([]), self.meta(TINYUSB, a2, 'aborted'))
+        self.assertEqual(cm.exception.stage, 'render')
+        self.assertEqual(core.withdraw_current(self.d, broken, 'a2', str(cm.exception)), 'a1')
+        self.assertEqual(core.prepare_pair(self.d, TINYUSB).outcome, 'withdrawn')   # a1 never current again
+
+    def test_a_withdrawal_whose_archive_does_not_verify_keeps_the_report(self):
+        with mock.patch.object(core, '_archive'), self.assertRaises(core.ReportError) as cm:
+            core.withdraw_current(self.d, TINYUSB, 'a2', 'publish failed')
+        self.assertEqual(cm.exception.stage, 'archive')
+        self.assertEqual(self.files(), self.before)
 
 
 # --- verdicts -----------------------------------------------------------------------------------

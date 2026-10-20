@@ -7,7 +7,10 @@ A report is the project's native JSON body (its field paths unchanged) plus one 
 serialised JSON and regenerable from it (prepare_pair), so the pair is not crash-atomic.
 Every attempt that a later one replaces is archived first, create-only, under
 `<stem>.attempts/<attempt id>/`; an accumulated attempt names its predecessor in
-`_hil.previous_attempt`, which read_chain follows. One writer per report dir: each call
+`_hil.previous_attempt`, which read_chain follows; an archived attempt is sealed. When an
+attempt cannot publish, withdraw_current archives the live report and replaces its JSON with
+a withdrawal record (outcome 'withdrawn', reserved `_hil_withdrawn` field), which no
+preparation renders as evidence and which the next accumulated attempt links. One writer per report dir: each call
 that writes holds `.<stem>.lock` and refuses, never waits, while another holds it.
 
 Adapters keep the native outcome fields their verdicts need (a runner's exit status, an
@@ -42,9 +45,13 @@ META_VERSION = 1
 TERMINATIONS = ('completed', 'timeout', 'aborted', 'no-boards')
 VERDICTS = ('blocker', 'fail', 'not-run', 'pass')   # precedence order
 EVIDENCE = ('firmware-validation', 'farm-health')
-READABLE = ('empty', 'valid')                       # the other outcomes: missing, corrupt, unsupported
+READABLE = ('empty', 'valid')   # the other outcomes: missing, corrupt, unsupported, withdrawn
+WITHDRAWN = '_hil_withdrawn'
 NOTICE = '**HIL report unavailable'
-_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
+_ID_TEXT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
+# derived archive references; an attempt id never starts with one of these
+_RESERVED = ('legacy-', 'corrupt-', 'unsupported-', 'withdrawn-', 'unreadable')
+_DIGEST_REF = re.compile(r'(legacy|legacy-text|corrupt)-[0-9a-f]{16}\Z')
 _META_TYPES = {'version': int, 'body_schema': str, 'body_version': int, 'attempt_id': str,
                'previous_attempt': (str, type(None)), 'termination': str, 'invocation': list,
                'selection': list, 'host': str, 'roster': dict}
@@ -173,6 +180,17 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+def _is_id(s) -> bool:
+    """An attempt id: path-safe, at most 128 characters, outside the derived namespaces."""
+    return isinstance(s, str) and bool(_ID_TEXT.match(s)) and not s.startswith(_RESERVED)
+
+
+def _is_ref(s) -> bool:
+    """An archive reference: an attempt id, `withdrawn-<attempt id>`, or a digest-named record."""
+    return _is_id(s) or isinstance(s, str) and (
+        s.startswith('withdrawn-') and _is_id(s[len('withdrawn-'):]) or bool(_DIGEST_REF.match(s)))
+
+
 def _meta_problem(meta, schema: BodySchema):
     """(outcome, detail) for `_hil` this schema cannot use, else None."""
     if not isinstance(meta, dict):
@@ -190,9 +208,9 @@ def _meta_problem(meta, schema: BodySchema):
     for k, t in {**_META_TYPES, **{k: v for k, v in _META_OPTIONAL.items() if k in meta}}.items():
         if k not in meta or not isinstance(meta[k], t) or isinstance(meta[k], bool):
             return 'corrupt', f'{META}.{k} is missing or not {t}'
-    if not _ID.match(meta['attempt_id']) or \
-            (meta['previous_attempt'] is not None and not _ID.match(meta['previous_attempt'])):
-        return 'corrupt', f'{META} attempt ids must match {_ID.pattern}'
+    if not _is_id(meta['attempt_id']) or \
+            (meta['previous_attempt'] is not None and not _is_ref(meta['previous_attempt'])):
+        return 'corrupt', f'{META}.attempt_id must be an attempt id, previous_attempt an archive reference'
     if meta['termination'] not in TERMINATIONS:
         return 'corrupt', f'{META}.termination {meta["termination"]!r} is not one of {TERMINATIONS}'
     if not all(isinstance(x, str) for x in meta['invocation'] + meta['selection']):
@@ -210,6 +228,8 @@ def parse(data: bytes, schema: BodySchema) -> Reading:
         return Reading('corrupt', None, None, f'not JSON: {e}', data)
     if not isinstance(raw, dict):
         return Reading('corrupt', None, None, 'not a JSON object', data)
+    if WITHDRAWN in raw:
+        return _withdrawal(raw, schema, data)
     meta = raw.get(META)
     body = {k: v for k, v in raw.items() if k != META}
     if META in raw:
@@ -228,6 +248,23 @@ def parse(data: bytes, schema: BodySchema) -> Reading:
     except (ValueError, TypeError, KeyError, AttributeError) as e:
         return Reading('corrupt', None, None, f'{schema.name} body: {e}', data)
     return Reading('empty' if empty else 'valid', body, meta, '', data)
+
+
+def _withdrawal(raw: dict, schema: BodySchema, data: bytes) -> Reading:
+    """A withdrawal record: outcome 'withdrawn', its fields as the body, never evidence."""
+    w = raw[WITHDRAWN]
+    if set(raw) != {WITHDRAWN} or not isinstance(w, dict) or \
+            set(w) != {'version', 'body_schema', 'attempt_id', 'archived', 'reason'}:
+        return Reading('corrupt', None, None, f'malformed {WITHDRAWN} record', data)
+    if w['version'] != META_VERSION or w['body_schema'] != schema.name:
+        return Reading('unsupported', None, None, f'{WITHDRAWN} record of {w["body_schema"]!r} '
+                                                  f'version {w["version"]!r}', data)
+    if not (_is_id(w['attempt_id']) and isinstance(w['reason'], str)
+            and (w['archived'] is None or _is_ref(w['archived']))):
+        return Reading('corrupt', None, None, f'malformed {WITHDRAWN} record', data)
+    prior = f'the previous report, attempt {w["archived"]}, is archived and' if w['archived'] else 'no previous report'
+    return Reading('withdrawn', w, None, f'attempt {w["attempt_id"]} could not publish its report '
+                                         f'({w["reason"]}); {prior} is not current evidence', data)
 
 
 def read_document(path, schema: BodySchema) -> Reading:
@@ -388,6 +425,8 @@ def _read_bytes(path: Path) -> bytes | None:
 def _archive_id(reading: Reading) -> str:
     if reading.meta is not None:
         return reading.meta['attempt_id']
+    if reading.outcome == 'withdrawn':
+        return f'withdrawn-{reading.body["attempt_id"]}'
     kind = 'legacy' if reading.outcome in READABLE else reading.outcome
     return f'{kind}-{_digest(reading.raw)}'
 
@@ -415,10 +454,17 @@ def _archive(root: Path, aid: str, files: dict) -> None:
         raise
 
 
-def _archive_current(report_dir: Path, schema: BodySchema, attempt_id: str):
-    """Archive the published report for `attempt_id`; (archive id, reading, legacy text) or
-    (None, reading, None) when there is none. An unsupported report or a used attempt id is
-    refused before anything is archived."""
+def _used(root: Path, current: Reading, attempt_id: str) -> bool:
+    """`attempt_id` has a record, archived or live, or was withdrawn: it never writes again."""
+    live = current.meta['attempt_id'] if current.meta else \
+        current.body['attempt_id'] if current.outcome == 'withdrawn' else None
+    return attempt_id == live or (root / attempt_id).exists() or (root / f'withdrawn-{attempt_id}').exists()
+
+
+def _archive_current(report_dir: Path, schema: BodySchema, attempt_id: str | None = None):
+    """Archive the published report, which stays in place; (archive id, reading, legacy text)
+    or (None, reading, None) when there is none. An unsupported report, or `attempt_id`
+    already used, is refused before anything is archived."""
     jpath, mpath, root = paths(report_dir, schema)
     data, md = _read_bytes(jpath), _read_bytes(mpath)
     reading = Reading('missing', None, None, f'{jpath} not found') if data is None else parse(data, schema)
@@ -426,22 +472,64 @@ def _archive_current(report_dir: Path, schema: BodySchema, attempt_id: str):
         raise ReportError('predecessor', f'{jpath}: {reading.detail}; refusing to replace or accumulate onto it')
     aid = None if data is None and md is None else \
         f'legacy-text-{_digest(md)}' if data is None else _archive_id(reading)
-    if attempt_id == aid or (root / attempt_id).exists():
+    if attempt_id is not None and _used(root, reading, attempt_id):
         raise ReportError('attempt', f'attempt id {attempt_id} is already used')
     if aid is None:
         return None, reading, None
     if data is None:
         _archive(root, aid, {mpath.name: md})
         return aid, reading, md.decode('utf-8', errors='replace')
+    if _read_bytes(root / aid / jpath.name) == data:   # sealed already: no render needed
+        return aid, reading, None
     if reading.outcome in READABLE:
         doc = {**reading.body, **({META: reading.meta} if reading.meta else {})}
         files = {jpath.name: data, mpath.name: _markdown_bytes(schema, doc, f'archiving {jpath}')}
         legacy = None
     else:
         files = {jpath.name: data, **({mpath.name: md} if md is not None else {})}
-        legacy = md.decode('utf-8', errors='replace') if md is not None else None
+        legacy = md.decode('utf-8', errors='replace') if md is not None and reading.outcome != 'withdrawn' else None
     _archive(root, aid, files)
     return aid, reading, legacy
+
+
+def archive_current(report_dir, schema: BodySchema) -> str | None:
+    """Archive the current pair as start_attempt does, and seal it: its archive id, or None
+    when there is no current report. The pair stays in place."""
+    with _writer(Path(report_dir), schema):
+        return _archive_current(Path(report_dir), schema)[0]
+
+
+def withdraw_current(report_dir, schema: BodySchema, attempt_id: str, reason: str) -> str | None:
+    """For an attempt whose publication failed: archive the current report (sealing it; an
+    existing identical archive is reused without rendering), verify the archived JSON, then
+    atomically replace the JSON with a withdrawal record naming `attempt_id`, and the
+    Markdown with the notice prepare_pair writes for it. Returns the archived id. The record
+    is written first, so an interruption still leaves it as the current report; a repeat call
+    for the same attempt keeps that record and rewrites only the notice. An attempt archived
+    or withdrawn earlier is refused ('sealed')."""
+    report_dir = Path(report_dir)
+    jpath, mpath, root = paths(report_dir, schema)
+    if not _is_id(attempt_id):
+        raise ReportError('attempt', f'attempt id {attempt_id!r} must match {_ID_TEXT.pattern} '
+                                     f'and start with none of {_RESERVED}')
+    record = {WITHDRAWN: {'version': META_VERSION, 'body_schema': schema.name, 'attempt_id': attempt_id,
+                          'archived': None, 'reason': ' '.join(reason.split())}}
+    with _writer(report_dir, schema):
+        data = _read_bytes(jpath)
+        current = parse(data, schema) if data is not None else None
+        if current is not None and current.outcome == 'withdrawn' and current.body['attempt_id'] == attempt_id:
+            aid = current.body['archived']   # a retry: the record stands
+        else:
+            if (root / attempt_id).exists() or (root / f'withdrawn-{attempt_id}').exists():
+                raise ReportError('sealed', f'attempt {attempt_id} is archived or withdrawn already')
+            aid, reading, _ = _archive_current(report_dir, schema)
+            if reading.raw is not None and _read_bytes(root / aid / jpath.name) != reading.raw:
+                raise ReportError('archive', f'{root / aid} does not hold {jpath}; it stays current')
+            record[WITHDRAWN]['archived'] = aid
+            data = (json.dumps(record, indent=2) + '\n').encode('utf-8', errors='backslashreplace')
+            _replace_one(jpath, data)
+        _replace_one(mpath, _notice(parse(data, schema), jpath.name).encode('utf-8', errors='backslashreplace'))
+    return aid
 
 
 def start_attempt(report_dir, schema: BodySchema, accumulate: bool, attempt_id: str | None = None) -> Attempt:
@@ -450,8 +538,9 @@ def start_attempt(report_dir, schema: BodySchema, accumulate: bool, attempt_id: 
     and gets the prior reading; a corrupt prior is linked, so its sequence never passes."""
     report_dir = Path(report_dir)
     attempt_id = attempt_id or new_attempt_id()
-    if not _ID.match(attempt_id):
-        raise ReportError('attempt', f'attempt id {attempt_id!r} must match {_ID.pattern}')
+    if not _is_id(attempt_id):
+        raise ReportError('attempt', f'attempt id {attempt_id!r} must match {_ID_TEXT.pattern} '
+                                     f'and start with none of {_RESERVED}')
     with _writer(report_dir, schema):
         aid, reading, legacy = _archive_current(report_dir, schema, attempt_id)
     if not accumulate:
@@ -465,8 +554,8 @@ def _guard_predecessor(report_dir: Path, schema: BodySchema, meta: dict) -> None
     archived current report nor an archived record."""
     jpath, mpath, root = paths(report_dir, schema)
     aid, previous = meta['attempt_id'], meta['previous_attempt']
-    if (root / aid).exists():
-        raise ReportError('sealed', f'attempt {aid} is archived; its record is never written again')
+    if (root / aid).exists() or (root / f'withdrawn-{aid}').exists():
+        raise ReportError('sealed', f'attempt {aid} is archived or withdrawn; it never writes again')
     data = _read_bytes(jpath)
     if data is None:
         md = _read_bytes(mpath)
@@ -476,6 +565,8 @@ def _guard_predecessor(report_dir: Path, schema: BodySchema, meta: dict) -> None
             raise ReportError('predecessor', f'predecessor {previous} has no archived record')
         return
     reading = parse(data, schema)
+    if reading.outcome == 'withdrawn' and reading.body['attempt_id'] == aid:
+        raise ReportError('sealed', f'attempt {aid} was withdrawn; it never publishes again')
     if reading.meta is not None and reading.meta['attempt_id'] == aid:
         if reading.meta['previous_attempt'] != previous:
             raise ReportError('predecessor', f'attempt {aid} already names predecessor '
@@ -563,7 +654,7 @@ def inventory(report_dir, schema: BodySchema) -> dict:
     attempts = []
     if root.is_dir():
         for d in sorted(root.iterdir()):
-            if d.is_dir() and _ID.match(d.name):
+            if d.is_dir() and _is_ref(d.name):
                 attempts.append({'attempt_id': d.name,
                                  'files': {f.name: _entry(f) for f in sorted(d.iterdir()) if f.is_file()}})
     return {'current': {jpath.name: _entry(jpath), mpath.name: _entry(mpath)}, 'attempts': attempts}
@@ -668,7 +759,8 @@ def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
     blocker stands; only an eligible fail-then-pass is a pass, marked flaky, citing both
     attempts, and only when it is the board's one fail so far; a fail that was not retryable,
     or a second fail, stays unresolved for the rest of the sequence. A
-    missing, corrupt, unsupported or mismatched attempt in the chain denies every pass."""
+    missing, corrupt, unsupported or mismatched attempt in the chain denies every pass; a
+    withdrawn one ended without a report, so every requested board is a blocker."""
     _validation(schema)
     broken = [{'attempt_id': c.attempt_id, 'outcome': c.outcome, 'detail': c.reading.detail}
               for c in chain if c.outcome not in READABLE or c.run is None]
@@ -707,7 +799,11 @@ def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
             before = c
         if verdict is None:
             verdict = 'not-run'
-        if verdict == 'pass' and broken:
+        withdrawn = [x['attempt_id'] for x in broken if x['outcome'] == 'withdrawn']
+        if withdrawn:
+            verdict, flaky = 'blocker', False
+            detail = f'{", ".join(withdrawn)} ended without a published report; ' + detail
+        elif verdict == 'pass' and broken:
             verdict, flaky = 'blocker', False
             detail = 'earlier evidence unavailable: ' + '; '.join(f'{x["attempt_id"]} {x["outcome"]}' for x in broken)
         rows.append({'board': b, 'verdict': verdict, 'flaky': flaky, 'detail': detail,
