@@ -569,6 +569,8 @@ def close(*_):
     open(st, 'w').write('00030003' if keep else '01010001')
     sys.exit(0)
 signal.signal(signal.SIGTERM, close)
+if hasattr(signal, 'SIGBREAK'):    # Windows: autopsy asks with CTRL_BREAK_EVENT
+    signal.signal(signal.SIGBREAK, close)
 time.sleep(float(os.environ.get('FAKE_SERVER_DELAY', '0')))
 print('Waiting for GDB connection...', flush=True)
 while not os.path.exists(os.environ['FAKE_STOP']):
@@ -1486,7 +1488,8 @@ class WindowsPathTest(unittest.TestCase):
             self.regions('c:/OUT/gdb.log', reserved=['C:\\out\\gdb.log'])
 
     def test_a_short_name_or_a_blank_is_refused(self):
-        for path in ('C:\\Users\\RUNNER~1\\a.bin', 'C:\\Users\\First Last\\a.bin'):
+        # a short name that names nothing: Windows' realpath expands one that exists, such as a runner's RUNNER~1
+        for path in ('C:\\NOSUCH~1\\a.bin', 'C:\\Users\\First Last\\a.bin'):
             with self.subTest(path=path), self.assertRaisesRegex(self.Refused, 'characters'):
                 self.regions(path)
 

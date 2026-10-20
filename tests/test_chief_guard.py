@@ -340,9 +340,14 @@ class ChiefGuard(unittest.TestCase):
                   f'ln -S -s {self.wt}/src/a.c /tmp/h', f'ln -fS -s {self.wt}/src/a.c /tmp/h',
                   f'ln --suffix -s {self.wt}/src/a.c /tmp/h', f'ln --suff --symbolic {self.wt}/src/a.c /tmp/h'):
             self.assert_denied(c, 'would link')
-        # a symlink is caught at the write instead; a copy and a hard link from outside are fine
-        for c in (f'ln -s {self.wt}/src /tmp/l', f'ln -S~ -s {self.wt}/src /tmp/l', f'ln --suffix=x -s {self.wt}/src /tmp/l',
-                  f'cp {self.wt}/src/a.c /tmp/h', 'ln /tmp/a /tmp/b',
+        # a symlink is caught at the write instead, but on Windows resolve() cannot see an MSYS one
+        for c in (f'ln -s {self.wt}/src /tmp/l', f'ln -S~ -s {self.wt}/src /tmp/l', f'ln --suffix=x -s {self.wt}/src /tmp/l'):
+            if os.name == 'nt':
+                self.assert_denied(c, 'would link')
+            else:
+                self.assert_allowed(c)
+        # a copy and a hard link from outside are fine
+        for c in (f'cp {self.wt}/src/a.c /tmp/h', 'ln /tmp/a /tmp/b',
                   'cp -l /tmp/a /tmp/b', 'rsync -a --link-dest=/tmp/prev /tmp/a/ /tmp/b/'):
             self.assert_allowed(c)
 

@@ -453,6 +453,8 @@ class ChiefRun(unittest.TestCase):
     def cmd_claude(self, where, marker=None):
         """An npm-style claude.cmd: cmd.exe running the fake, or only touching marker."""
         where.mkdir(exist_ok=True)
+        if not marker:
+            (self.fake / 'claude').write_text(FAKE, encoding='utf-8')   # make_stub keeps no source beside its launcher
         run = f'type nul > "{marker}"' if marker else f'"{sys.executable}" "{self.fake / "claude"}" %*'
         (where / 'claude.cmd').write_text(f'@echo off\r\n{run}\r\nexit /b %errorlevel%\r\n')
         return where
