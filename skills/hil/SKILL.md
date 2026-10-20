@@ -69,8 +69,8 @@ nothing in it through a link.
   as that user or root.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
   ends with `release_board_lock`. `release` never signals a protected record,
-  a cleanup holder or a legacy runner reason (`hil_test.py`, `pool_check`), and
-  signals only `hil_lock.py hold`'s own holder, proven by its start time and
+  a cleanup holder or a runner reason (`hil_test.py`, `farm_check`, the legacy
+  `pool_check`), and signals only `hil_lock.py hold`'s own holder, proven by its start time and
   its flock. A record from a helper older than the mark carries none and is
   taken like any other: protection across projects holds once every project
   on the host runs this helper.

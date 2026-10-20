@@ -160,6 +160,7 @@ through its `Build contract:` and `HIL contract:` lines:
 | Skill | Use it to | Start with |
 |---|---|---|
 | [`hil`](skills/hil/SKILL.md) | run a project's HIL tests and judge their results: contract sections, board locks, verdicts, retries | the project's `HIL contract:` page |
+| [`farm-check`](skills/farm-check/SKILL.md) | check a HIL farm's health: probe on the bus, a light image flashes, the board comes back and is restored; never a test verdict | the project's farm-check launcher, from its `HIL contract:` page |
 | [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO; Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
 | [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |
 | [`etm-trace`](skills/etm-trace/SKILL.md) | instruction-level trace through a J-Trace and Ozone: hot functions, coverage, history before a fault | `etm_capture.py --jdebug <ref.jdebug> --elf <elf> --probe jtrace --duration-ms 10000 --out <dir>`, then `etm_profile.py <dir> --elf <elf>` |

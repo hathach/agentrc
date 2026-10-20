@@ -20,7 +20,7 @@ import time
 BOARD_LOCK_DIR = '/tmp/tinyusb-hil-locks'
 CI_REASON = 'hil_test.py'
 # records naming these are never signalled by `release`, with or without the protected mark
-PROTECTED_REASONS = {CI_REASON, 'pool_check'}
+PROTECTED_REASONS = {CI_REASON, 'pool_check', 'farm_check'}
 # a holder record role that never frees on its own: a recovery blocker (`hil` Board locks)
 CLEANUP_ROLE = 'cleanup-holder'
 RECOVERY_BLOCKER = "recovery blocker: release it only through the project's recovery procedure"
@@ -197,12 +197,14 @@ def write_record(fh, reason: str, **extra) -> None:
     os.pwrite(fd, data[:1], 0)
 
 
-def clear_record(fh) -> None:
-    """Clear our record before dropping the flock so records stay truthful."""
+def clear_record(fh) -> bool:
+    """Clear our record before dropping the flock so records stay truthful; False when the
+    truncate failed and the record is still there."""
     try:
         fh.truncate(0)
     except OSError:
-        pass
+        return False
+    return True
 
 
 def release_board_lock(fh) -> None:

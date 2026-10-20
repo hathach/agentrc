@@ -123,7 +123,7 @@ class LoadedByPath(unittest.TestCase):
     helper whose protected reasons differ)."""
 
     def test_the_values_adapters_check(self):
-        self.assertEqual(hil_lock.PROTECTED_REASONS, {'hil_test.py', 'pool_check'})
+        self.assertEqual(hil_lock.PROTECTED_REASONS, {'hil_test.py', 'pool_check', 'farm_check'})
         self.assertEqual(hil_lock.CI_REASON, 'hil_test.py')
         self.assertEqual(hil_lock.CLEANUP_ROLE, 'cleanup-holder')
         self.assertTrue(issubclass(hil_lock.LockUnavailable, RuntimeError))
@@ -158,6 +158,15 @@ class Record(LockDir):
         plain = {'pid': 1, 'reason': 'r', 'since': 's', 'detail': 'kept'}
         self.assertEqual(hil_lock.holder_text(plain), json.dumps(plain))
         self.assertEqual(hil_lock.holder_text(None), 'unknown holder')
+
+    def test_clear_record_says_whether_the_record_is_gone(self):
+        fh = self.acquire()
+        self.assertTrue(hil_lock.clear_record(fh))
+        self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
+        hil_lock.write_record(fh, 'selftest')
+        with mock.patch.object(fh, 'truncate', side_effect=OSError(5, 'Input/output error')):
+            self.assertFalse(hil_lock.clear_record(fh))
+        self.assertEqual(hil_lock.read_record(BOARD)['reason'], 'selftest')
 
     def test_a_missing_or_unparsable_record_reads_as_none(self):
         self.assertIsNone(hil_lock.read_record(BOARD))
