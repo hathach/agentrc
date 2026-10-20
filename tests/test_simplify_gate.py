@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,14 @@ FINDING = {'file': 'a.txt', 'line': 1, 'problem': 'dead branch', 'alternative': 
 
 def sh(cwd, *args):
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+def rmtree(path):
+    """shutil.rmtree that also removes git's read-only objects, which Windows refuses to delete."""
+    def writable(func, p, _):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    shutil.rmtree(path, **({'onexc': writable} if sys.version_info >= (3, 12) else {'onerror': writable}))
 
 
 def make_repo(path):
@@ -317,8 +326,8 @@ class GateTest(unittest.TestCase):
         self.assertIn('-foreign original\n+foreign edited\n', self.s.patch(), 'uncached, read from the sibling')
         blobs.rmdir()
         blobs.with_name('aside').rename(blobs)
-        shutil.rmtree(other)
-        shutil.rmtree(wt)
+        rmtree(other)
+        rmtree(wt)
         sh(self.root, 'git', 'gc', '-q', '--prune=now')
         patch = self.s.patch()
         self.assertIn('-foreign original\n+foreign edited\n', patch, 'the baseline is the commit it was created at')
