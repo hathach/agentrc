@@ -378,6 +378,8 @@ class ChiefGuard(unittest.TestCase):
 
     def test_link_sources_must_be_literal_paths_outside_the_worktree(self):
         chief, root = (self.project / '.git' / 'chief').as_posix(), self.root.as_posix()
+        # the root holding the worktree is its drive on Windows, where `/` is Git's install or the cwd's drive
+        top, below = Path(self.project.anchor).as_posix(), self.project.relative_to(self.project.anchor).as_posix()
         for c in (f'ln {self.wt}/src/a.c {chief}/h', f'ln {self.wt}/src/a.c /tmp/h', f'link {self.wt}/src/a.c /tmp/h',
                   f'cp -l {self.wt}/src/a.c /tmp/h', f'cp --link {self.wt}/src/a.c /tmp/h',
                   f'rsync -a --link-dest={self.wt}/src /tmp/a/ /tmp/b/',
@@ -399,7 +401,7 @@ class ChiefGuard(unittest.TestCase):
                   # a relative symlink names a path from the link's directory, which this does not place
                   'ln -s src /tmp/l', 'ln -s ../x /tmp/l',
                   # a directory holding the worktree reaches it through the link as the worktree itself does
-                  f'ln -s {self.wt}/.. /tmp/n && printf x > /tmp/n/wt/src/a.c', f'ln -s / /tmp/n && printf x > /tmp/n{self.wt}/src/a.c',
+                  f'ln -s {self.wt}/.. /tmp/n && printf x > /tmp/n/wt/src/a.c', f'ln -s {top} /tmp/n && printf x > /tmp/n/{below}/src/a.c',
                   f'ln -s {self.wt}/.. /tmp/n && rm /tmp/n/wt/src/a.c', f'ln -s {root} /tmp/n', f'cp -as {root} /tmp/n'):
             self.assert_denied(c, 'would link')
         # a copy and a link from outside are fine
