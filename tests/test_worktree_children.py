@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import shlex
@@ -27,6 +28,12 @@ if sys.argv[1:3] == ['worktree', 'list']:
         entry['open_workspace_id'] = 'w9'
     print(json.dumps({'result': {'worktrees': [None] if mode == 'null' else [entry]}}))
     sys.exit(1 if mode == 'failed' else 0)
+'''
+
+# herdr answering `worktree list` with the entry in entry.json beside it, its path filled in
+ENTRY = r'''import json, os, sys
+entry = json.loads(open(os.path.join(os.path.dirname(__file__), 'entry.json')).read())
+print(json.dumps({'result': {'worktrees': [{**entry, 'path': sys.argv[-1]}]}}))
 '''
 
 # gh: `repo view` names t/repo; `api graphql` prints the search page in $STUB_PRS, else fails
@@ -927,6 +934,31 @@ class WorktreeChildren(unittest.TestCase):
             self.assertEqual(self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': bad}).returncode, 2, bad)
         for argv in ([], ['cleanup', str(self.parent), '--branch', 'a', 'b'], ['cleanup', str(self.parent), 'x']):
             self.assertEqual(self.run_script(*argv).returncode, 2, argv)
+
+
+
+@unittest.skipIf(os.name == 'nt', 'a stub executable')
+class LinkedWorkspace(unittest.TestCase):
+    def test_a_linked_open_checkout_answers_true_and_a_malformed_entry_is_kept(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wc)
+        with tempfile.TemporaryDirectory() as tmp:
+            stub, entry = Path(tmp) / 'herdr', Path(tmp) / 'entry.json'
+            stub.write_text(f'#!{sys.executable}\n{ENTRY}')
+            stub.chmod(0o755)
+            for answer, want in (({'is_linked_worktree': True, 'open_workspace_id': 'w1'}, True),
+                                 ({'is_linked_worktree': True}, False),
+                                 ({'is_linked_worktree': True, 'open_workspace_id': None}, False),
+                                 ({'is_linked_worktree': False, 'open_workspace_id': 'w1'}, False)):
+                entry.write_text(json.dumps(answer))
+                self.assertEqual(wc.linked_workspace(tmp, str(stub)), want, answer)
+            for answer in ({'open_workspace_id': 'w1'}, {'is_linked_worktree': 'false', 'open_workspace_id': 'w1'},
+                           {'is_linked_worktree': True, 'open_workspace_id': ''},
+                           {'is_linked_worktree': True, 'open_workspace_id': 1}):
+                entry.write_text(json.dumps(answer))
+                with self.subTest(answer=answer), self.assertRaisesRegex(wc.Keep, 'malformed entry'):
+                    wc.linked_workspace(tmp, str(stub))
 
 
 if __name__ == '__main__':
