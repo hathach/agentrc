@@ -111,7 +111,7 @@ def reset_tt(busport, speed, *, run=None) -> bool:
               file=sys.stderr)
         return False
     if r.returncode != 0:
-        out = r.stdout.decode('utf-8', errors='ignore') if isinstance(r.stdout, bytes) else str(r.stdout or '')
+        out = _process().cmd_stdout_text(r.stdout)
         print(f'Reset_TT {node} port {port} failed: {out.strip()}', file=sys.stderr)
     return True
 

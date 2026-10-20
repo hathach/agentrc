@@ -139,6 +139,7 @@ class RunCmdModes(unittest.TestCase):
     def test_a_long_argv_payload_is_named_not_dumped(self):
         body = 'x' * 61
         self.assertEqual(hp._cmd_label(['python3', '-c', body]), 'python3 -c <61-char program>')
+        self.assertEqual(hp._cmd_label([Path('/bin/true'), '-v']), '/bin/true -v', 'a Path argv element')
 
     def test_strip_workflow_markers(self):
         self.assertEqual(hp.strip_workflow_markers(f'{hp.GROUP_MARK}title'), 'title')
@@ -1093,7 +1094,7 @@ class RunTracked(unittest.TestCase):
         for name, nth, cmd, alarm in (('normal completion', 0, 'true', None),
                                       ('interrupted completion', 1, 'sleep 30', 0.5)):
             with self.subTest(name):
-                res = self._interrupt_after('_tidy(receipt)', nth, cmd, alarm)
+                res = self._interrupt_after('tidy(receipt)', nth, cmd, alarm)
                 self.assertEqual(res['fired'], 1)
                 self.assertEqual((res['cleanup'], res['receipt'], res['files']), ('done', None, []))
 
@@ -1202,6 +1203,18 @@ class RunTracked(unittest.TestCase):
             self.assertEqual(hp.recheck({**receipt, 'supervisor': {'lock': [0, 0]}}), 'unknown', 'another lock')
             os.chmod(d, 0o770)
             self.assertEqual(hp.recheck(receipt), 'unknown', 'an untrusted state_dir')
+
+    def test_tidy_removes_a_runs_files_and_skips_what_it_cannot(self):
+        with tempfile.TemporaryDirectory() as d:
+            receipt = {k: os.path.join(d, k) for k in ('lock', 'record', 'log')}
+            for path in receipt.values():
+                Path(path).write_text('')
+            os.unlink(receipt['record'])
+            hp.tidy(receipt)
+            self.assertEqual(os.listdir(d), [])
+            Path(receipt['log']).write_text('')
+            hp.tidy({'lock': None, 'log': receipt['log']})     # no record path, an unusable lock path
+            self.assertEqual(os.listdir(d), [])
 
     def test_the_survey_lists_unreadable_entries_apart(self):
         p = subprocess.Popen(['sleep', '30'])

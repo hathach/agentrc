@@ -277,7 +277,8 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
     None under sudo, whose wrapper's reaping proves nothing. `sudo_forbidden` refuses a
     sudo-wrapped testusb (a caller that must confirm a recovery)."""
     # -A <node> confines testusb's ftw() device scan to the DUT: with -D alone it opens every
-    # usbfs node, blocking on any peer's held device lock (#4047). -A must precede -D, it clears it.
+    # usbfs node, blocking on any peer's held device lock (hathach/tinyusb#4047). -A must
+    # precede -D, it clears it.
     cmd = [testusb, '-A', node, '-D', node, '-t', str(num), *params]
     result = {}
     if needs_sudo(node):
@@ -311,8 +312,9 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
         except subprocess.TimeoutExpired:
             # SIGKILL had no effect: the child is in uninterruptible sleep on the DUT's
             # device lock or an in-kernel usbfs ioctl. A finite hold is reaped once it ends,
-            # so watch the child for `wedge_confirm` before calling it a wedge (#3944). Under
-            # sudo the child is the wrapper and reaps at once, which proves nothing.
+            # so watch the child for `wedge_confirm` before calling it a wedge
+            # (hathach/tinyusb#3944). Under sudo the child is the wrapper and reaps at once,
+            # which proves nothing.
             if cmd[0] != 'sudo':
                 t0 = time.monotonic()
                 try:

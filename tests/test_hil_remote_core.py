@@ -811,8 +811,9 @@ class Units(unittest.TestCase):
 
     def test_the_rig_helper_is_one_program(self):
         compile(rc_.RIG_PY, 'rig', 'exec')
-        self.assertTrue(rc_.RIG_PY.startswith(f'TOKEN_FILE, RECORDS, REFUSED, FETCH_RESULT = {rc_.TOKEN_FILE!r}, '
-                                              f'{rc_.RECORDS!r}, {rc_.RIG_REFUSED}, {rc_.FETCH_RESULT!r}\n'))
+        self.assertTrue(rc_.RIG_PY.startswith(f'TOKEN_FILE, RECORDS, REFUSED, FETCH_RESULT, RIG_PATH = {rc_.TOKEN_FILE!r}, '
+                                              f'{rc_.RECORDS!r}, {rc_.RIG_REFUSED}, {rc_.FETCH_RESULT!r}, '
+                                              f'{rc_.RIG_PATH!r}\n'))
 
 
 class FetchStream(unittest.TestCase):
@@ -1490,28 +1491,38 @@ class Attempts(Rig):
             rc_.collect(tree, self.tmp / 'got2', [(rc_.COLLECTION,)])
         self.assertIn('is the collection record itself', e.exception.code)
 
-    def test_collectors_of_one_dest_are_serialised(self):
-        """The incomplete collector pauses holding the dest after its fetch; meanwhile the attempt
-        completes and a second collector is refused, so the partial result cannot overwrite a
-        complete one published in between."""
-        tree = self.create()
-        self.setenv(FAKE_WRITE='out/early.log', FAKE_LATE='out/report.json', FAKE_SLEEP='1')
-        self.launch(tree)
-        dest, paused = self.tmp / 'got', self.tmp / 'paused'
+    def paused_collector(self, dest, seam, args, accept=None):
+        """collect(a1, dest, <args>, accept=<accept>) in another interpreter, paused once `seam`
+        has run (copy_back, or `accept`, the source of a predicate, on a freshly fetched tree)
+        until the file `resume` exists."""
+        paused = self.tmp / 'paused'
         script = textwrap.dedent(f'''
-            import importlib.util, sys, time
+            import importlib.util, os, time
             from pathlib import Path
             spec = importlib.util.spec_from_file_location('core', {str(SCRIPT)!r})
             m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
-            copy_back = m.copy_back
-            def paused(*a, **k):
-                got = copy_back(*a, **k)
+
+            def pause():
                 Path({str(paused)!r}).write_text('x')
-                time.sleep(3)
-                return got
-            m.copy_back = paused
+                while not Path({str(self.tmp / 'resume')!r}).exists():
+                    time.sleep(0.02)
+            accept = {accept or 'None'}
+            if {seam!r} == 'copy_back':
+                real = m.copy_back
+                def copy_back(*a, **k):
+                    got = real(*a, **k)
+                    pause()
+                    return got
+                m.copy_back = copy_back
+            else:
+                predicate = accept
+                def accept(path):
+                    missing = predicate(path)
+                    if Path(path) != Path({str(dest)!r}):
+                        pause()
+                    return missing
             tree = m.load_attempt(Path({str(self.root)!r}), Path({str(self.runs)!r}), 'a1')
-            print(m.collect(tree, Path({str(dest)!r}), [('out/report.json',)])['state'])
+            print(m.collect(tree, Path({str(dest)!r}), {args}, accept=accept)['state'])
         ''')
         first = subprocess.Popen([sys.executable, '-c', script], stdout=subprocess.PIPE, text=True)
         self.addCleanup(first.wait)
@@ -1520,14 +1531,94 @@ class Attempts(Rig):
         while not paused.exists() and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(paused.exists())
+        return first
+
+    def test_collectors_of_one_dest_are_serialised(self):
+        """The incomplete collector pauses holding the dest after its fetch; meanwhile the attempt
+        completes and a second collector is refused, so the partial result cannot overwrite a
+        complete one published in between."""
+        tree = self.create()
+        self.setenv(FAKE_WRITE='out/early.log', FAKE_LATE='out/report.json', FAKE_SLEEP='1')
+        self.launch(tree)
+        dest = self.tmp / 'got'
+        first = self.paused_collector(dest, 'copy_back', "[('out/report.json',)]")
         self.assertEqual(self.wait(tree)[0], 0)   # complete evidence is now on the rig
         with self.assertRaises(RemoteError) as e:
             rc_.collect(tree, dest, [('out/report.json',)])
         self.assertIn('another collector holds', e.exception.code)
+        (self.tmp / 'resume').write_text('x')
         self.assertEqual(first.communicate(timeout=30)[0].strip(), 'incomplete')
         self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text())['state'], 'incomplete')
         self.assertEqual(rc_.collect(tree, dest, [('out/report.json',)])['state'], 'complete')
         self.assertEqual(rc_.collect(tree, dest, [('out/report.json',)])['state'], 'complete')
+
+    # a predicate over the collected tree, and its source for a collector in another interpreter
+    @staticmethod
+    def late(path):
+        return [] if (Path(path) / 'out/late.json').is_file() else ['out/late.json']
+    LATE = "lambda path: [] if (Path(path) / 'out/late.json').is_file() else ['out/late.json']"
+
+    def ssh_ops(self, since):
+        """The rig helper ops of the ssh calls logged since index `since`."""
+        return [next((op for op in ('status', 'fetch') if f"' {op} " in ' '.join(c['argv'])), '?')
+                for c in self.calls()[since:] if c['tool'] == 'ssh']
+
+    def test_a_done_attempt_is_collected_on_the_status_that_saw_it_done(self):
+        tree = self.done_attempt()
+        before = len(self.calls())
+        code, st = self.wait(tree, dest=self.tmp / 'got', groups=[('out/report.json',)])
+        self.assertEqual((code, st['collection']['state']), (0, 'complete'))
+        self.assertEqual(self.ssh_ops(before), ['status', 'fetch'])
+
+    def test_a_predicate_rejects_until_the_rig_has_what_it_asks_for(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((col['state'], col['missing'], col['unaccepted']), ('incomplete', [], ['out/late.json']))
+        self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text()), col)
+        (self.base / 'a1/out/late.json').write_text('late')
+        col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((col['state'], col['unaccepted']), ('complete', []))
+        self.assertEqual((dest / 'out/late.json').read_text(), 'late')
+        before = len(self.calls())
+        self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
+        self.assertEqual(self.ssh_ops(before), [], 'complete by the predicate: final, never fetched again')
+        with self.assertRaises(RemoteError) as e:
+            rc_.collect(tree, self.tmp / 'odd', optional=['out/'], accept=lambda path: 'out/late.json')
+        self.assertIn('returns a list of strings', e.exception.code)
+
+    def test_a_cached_complete_collection_short_by_the_predicate_is_collected_again(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        self.assertEqual(rc_.collect(tree, dest, optional=['out/'])['state'], 'complete')
+        (self.base / 'a1/out/late.json').write_text('late')
+        before = len(self.calls())
+        col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual(self.ssh_ops(before), ['status', 'fetch'], 'collected again in the same call')
+        self.assertEqual((col['state'], col['unaccepted']), ('complete', []))
+        self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text()), col)
+        self.assertEqual((dest / 'out/late.json').read_text(), 'late')
+
+    def test_collectors_with_a_predicate_never_strand_or_remove_a_complete_collection(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        held = rc_.collect(tree, dest, optional=['out/'])
+        (self.base / 'a1/out/late.json').write_text('late')
+        first = self.paused_collector(dest, 'accept', "optional=['out/']", self.LATE)
+        # the first has fetched and holds the dest: the complete collection stays published meanwhile
+        self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text()), held)
+        self.assertTrue((dest / 'out/report.json').is_file())
+        with self.assertRaises(RemoteError) as e:
+            rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertIn('another collector holds', e.exception.code)
+        self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text()), held)
+        (self.tmp / 'resume').write_text('x')
+        self.assertEqual(first.communicate(timeout=30)[0].strip(), 'complete')
+        before = len(self.calls())
+        col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((col['state'], self.ssh_ops(before)), ('complete', []))
+        self.assertEqual((dest / 'out/late.json').read_text(), 'late')
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'], 'nothing stranded')
 
     def test_running_partial_then_dead_never_complete_nor_relaunched(self):
         tree = self.create()

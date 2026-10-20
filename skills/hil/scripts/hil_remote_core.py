@@ -93,8 +93,12 @@ RUNNING, DEAD, INCONCLUSIVE = 3, 4, 5
 
 
 # --- paths ---------------------------------------------------------------------------------------
+def _plain_remote_dir(d):
+    return bool(REMOTE_DIR_RE.match(d)) and '..' not in d and '//' not in d
+
+
 def check_remote_dir(remote_dir, what='REMOTE_DIR'):
-    if not REMOTE_DIR_RE.match(remote_dir) or '..' in remote_dir or '//' in remote_dir:
+    if not _plain_remote_dir(remote_dir):
         fail(f'{what} must be /path or ~/path of [A-Za-z0-9_.~/-], no "..", no "//", no trailing '
              f'slash: {remote_dir}')
 
@@ -422,8 +426,9 @@ def verify_remote(tree, digests, base='.'):
 
 # --- copy-back -----------------------------------------------------------------------------------
 def _artifact(member):
-    """(tree-relative path, is a directory tree): a member ending in / is a tree."""
-    return check_relative(member.rstrip('/'), 'an artifact path'), member.endswith('/')
+    """The member's canonical spelling: its tree-relative path, ending in / when it names a
+    directory tree."""
+    return check_relative(member.rstrip('/'), 'an artifact path') + ('/' if member.endswith('/') else '')
 
 
 def _remove(p):
@@ -563,8 +568,8 @@ def copy_back(tree, dest, groups=(), optional=()):
     A tree is named with its trailing / throughout."""
     dest = Path(dest)
     groups = [[_artifact(m) for m in g] for g in groups]
-    optional = [r + '/' if t else r for r, t in map(_artifact, optional)]
-    members = list(dict.fromkeys([*(r + '/' if t else r for g in groups for r, t in g), *optional]))
+    optional = [_artifact(m) for m in optional]
+    members = list(dict.fromkeys([*(m for g in groups for m in g), *optional]))
     for m in members:
         _local(dest, m.rstrip('/'))
         inside = [t for t in members if t.endswith('/') and t != m and m.startswith(t)]
@@ -578,27 +583,28 @@ def copy_back(tree, dest, groups=(), optional=()):
     try:
         status = _fetch(tree, members, stage) if members else {}
 
-        def place(rel, name):
-            if name in copied:
+        def place(m):
+            if m in copied:
                 return
+            rel = m.rstrip('/')
             target = _local(dest, rel, create=True)
             _remove(target)
             os.replace(stage / rel, target)
-            copied.append(name)
+            copied.append(m)
         for group in groups:
-            if all(status.get(r + '/' if t else r) == 'ok' for r, t in group):
-                for rel, is_tree in group:
-                    place(rel, rel + '/' if is_tree else rel)
+            if all(status.get(m) == 'ok' for m in group):
+                for m in group:
+                    place(m)
             else:
-                for rel, _ in group:
-                    _remove(_local(dest, rel))
-                incomplete.append([r + ('/' if t else '') for r, t in group])
+                for m in group:
+                    _remove(_local(dest, m.rstrip('/')))
+                incomplete.append(list(group))
         for m in optional:
             if m in copied:
                 continue
             _remove(_local(dest, m.rstrip('/')))
             if status.get(m) == 'ok':
-                place(m.rstrip('/'), m)
+                place(m)
     finally:
         _remove(stage)
     return CopyBack(copied, incomplete, status)
@@ -633,6 +639,19 @@ def proc_stat(pid):
         return fields[0], fields[19]
     except (OSError, IndexError, ValueError, TypeError):
         return None
+
+
+def lease_flock(fd, mode, secs, poll):
+    """flock(mode) on fd, retried every poll s for secs; False when it stayed held."""
+    deadline = time.monotonic() + secs
+    while True:
+        try:
+            fcntl.flock(fd, mode | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(poll)
 
 
 def token_of(d):
@@ -687,8 +706,8 @@ def supervise(d, records, token, cwd, env, argv, held, w):
         if opened != fd:
             os.dup2(opened, fd)
             os.close(opened)
-    home = os.environ.get('HOME', '')
-    run_env = {**os.environ, 'PATH': f'{home}/.local/bin:{home}/bin:{os.environ.get("PATH", "")}', **env}
+    rig_path = RIG_PATH.replace('$HOME', os.environ.get('HOME', ''))
+    run_env = {**os.environ, 'PATH': f'{rig_path}:{os.environ.get("PATH", "")}', **env}
     record = {'token': token, 'argv': list(argv), 'cwd': cwd, 'env': sorted(env), 'launchedAt': time.time(),
               'pid': os.getpid(), 'start': proc_stat(os.getpid())[1], 'sid': os.getsid(0)}
     try:
@@ -712,15 +731,8 @@ def launch(d, lease_path, token, cwd, env, *argv):
         lease = os.open(lease_path, os.O_WRONLY | os.O_APPEND)
     except OSError as e:
         refuse(f'the attempt lease {lease_path}: {e}')
-    deadline = time.monotonic() + 60
-    while True:
-        try:
-            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            break
-        except BlockingIOError:
-            if time.monotonic() > deadline:
-                refuse(f'{lease_path} stayed held for 60 s -- not launching')
-            time.sleep(0.1)
+    if not lease_flock(lease, fcntl.LOCK_EX, 60, 0.1):
+        refuse(f'{lease_path} stayed held for 60 s -- not launching')
     if token_of(d) != token:
         refuse(f"{d} is not this attempt's tree any more -- not launching")
     records = f'{d}/{RECORDS}'
@@ -753,52 +765,47 @@ def launch(d, lease_path, token, cwd, env, *argv):
 def status(d, lease_path, token):
     out = {'tokenOk': token_of(d) == token}
     if out['tokenOk']:
-        # a shared hold on the lease for the whole probe: launch's claim-to-fork section holds it
-        # exclusively, so the probe sees a launch before or after that section, never inside it
-        try:
-            lease = os.open(lease_path, os.O_RDONLY)
-        except OSError:
-            out['lease'] = 'missing'
-            print('\nHIL_REMOTE_STATUS=' + json.dumps(out), flush=True)
-            return
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                fcntl.flock(lease, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() > deadline:
-                    out['leaseBusy'] = True
-                    print('\nHIL_REMOTE_STATUS=' + json.dumps(out), flush=True)
-                    return
-                time.sleep(0.05)
-        records = f'{d}/{RECORDS}'
-        try:
-            fd = os.open(f'{records}/driver.lock', os.O_RDONLY)
-        except FileNotFoundError:
-            out['driverLock'] = 'missing'
-        else:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                out['driverLock'] = 'free'
-            except BlockingIOError:
-                out['driverLock'] = 'held'
-            finally:
-                os.close(fd)
-        out['claimed'] = os.path.exists(f'{records}/launch.claim')
-        for name in ('launch', 'done'):
-            try:
-                with open(f'{records}/{name}.json') as f:
-                    out[name] = json.loads(f.read())
-            except FileNotFoundError:
-                out[name] = None
-            except (OSError, ValueError):
-                out[name] = 'unreadable'
-        launch = out['launch']
-        if isinstance(launch, dict) and 'pid' in launch:
-            st = proc_stat(launch['pid'])
-            out['driverAlive'] = bool(st) and st[0] != 'Z' and st[1] == launch.get('start')
+        probe(d, lease_path, out)
     print('\nHIL_REMOTE_STATUS=' + json.dumps(out), flush=True)
+
+
+def probe(d, lease_path, out):
+    # a shared hold on the lease for the whole probe: launch's claim-to-fork section holds it
+    # exclusively, so the probe sees a launch before or after that section, never inside it
+    try:
+        lease = os.open(lease_path, os.O_RDONLY)
+    except OSError:
+        out['lease'] = 'missing'
+        return
+    if not lease_flock(lease, fcntl.LOCK_SH, 5, 0.05):
+        out['leaseBusy'] = True
+        return
+    records = f'{d}/{RECORDS}'
+    try:
+        fd = os.open(f'{records}/driver.lock', os.O_RDONLY)
+    except FileNotFoundError:
+        out['driverLock'] = 'missing'
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            out['driverLock'] = 'free'
+        except BlockingIOError:
+            out['driverLock'] = 'held'
+        finally:
+            os.close(fd)
+    out['claimed'] = os.path.exists(f'{records}/launch.claim')
+    for name in ('launch', 'done'):
+        try:
+            with open(f'{records}/{name}.json') as f:
+                out[name] = json.loads(f.read())
+        except FileNotFoundError:
+            out[name] = None
+        except (OSError, ValueError):
+            out[name] = 'unreadable'
+    launch = out['launch']
+    if isinstance(launch, dict) and 'pid' in launch:
+        st = proc_stat(launch['pid'])
+        out['driverAlive'] = bool(st) and st[0] != 'Z' and st[1] == launch.get('start')
 
 
 def opendir(parent, name):
@@ -929,8 +936,8 @@ elif op == 'fetch':
 else:
     refuse(f'unknown op {op}')
 '''
-RIG_PY = (f'TOKEN_FILE, RECORDS, REFUSED, FETCH_RESULT = {TOKEN_FILE!r}, {RECORDS!r}, {RIG_REFUSED}, '
-          f'{FETCH_RESULT!r}\n' + _RIG_BODY)
+RIG_PY = (f'TOKEN_FILE, RECORDS, REFUSED, FETCH_RESULT, RIG_PATH = {TOKEN_FILE!r}, {RECORDS!r}, {RIG_REFUSED}, '
+          f'{FETCH_RESULT!r}, {RIG_PATH!r}\n' + _RIG_BODY)
 
 
 def _rig(host, op, *args):
@@ -981,7 +988,7 @@ def create_attempt(root, runs, run_id, host, base, dirs=()):
     d = _marked(out, 'HIL_REMOTE_DIR')
     if rc or not d:
         fail(f'creating attempt {run_id} on {host} failed (exit {rc}): {err}')
-    if not d.startswith('/') or not REMOTE_DIR_RE.match(d) or '..' in d or '//' in d:
+    if not d.startswith('/') or not _plain_remote_dir(d):
         fail(f'the rig named attempt {run_id} {d!r}, not a plain absolute path')
     write_json(record, {**data, 'dir': d})
     return _attempt_tree(root, {**data, 'dir': d})
@@ -1058,11 +1065,12 @@ def attempt_status(tree):
     return {'state': attempt_state(probe), **where, **probe}
 
 
-def wait_attempt(tree, timeout, *, poll=POLL_SECS, dest=None, groups=(), optional=()):
+def wait_attempt(tree, timeout, *, poll=POLL_SECS, dest=None, groups=(), optional=(), accept=None):
     """Poll the attempt for up to timeout seconds, each poll a new ssh session: (0, status) once
-    done, collected into dest when given; (DEAD, ...) dead or never launched; (RUNNING, ...)
-    still running at the timeout; (INCONCLUSIVE, ...) evidence incomplete or the rig
-    unreachable at the timeout. Waiting never launches, signals or cancels the attempt."""
+    done, collected into dest when given (collect, without probing the done attempt again);
+    (DEAD, ...) dead or never launched; (RUNNING, ...) still running at the timeout;
+    (INCONCLUSIVE, ...) evidence incomplete or the rig unreachable at the timeout. Waiting
+    never launches, signals or cancels the attempt."""
     deadline = time.monotonic() + timeout
     while True:
         st = attempt_status(tree)
@@ -1070,7 +1078,7 @@ def wait_attempt(tree, timeout, *, poll=POLL_SECS, dest=None, groups=(), optiona
             fail(f"{tree.spec()} is not this attempt's tree any more (removed or replaced)")
         if st['state'] == 'done':
             if dest is not None:
-                st['collection'] = collect(tree, dest, groups, optional)
+                st['collection'] = _collect(tree, dest, groups, optional, accept, st)
             return 0, st
         if st['state'] in ('dead', 'not-launched'):
             return DEAD, st
@@ -1105,10 +1113,7 @@ def _collector(dest):
     path = dest.with_name(f'.{dest.name}.collect.lock')
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        else:
-            win_lock(fd, block=False)
+        _lock_ex(fd, block=False)
     except BlockingIOError:
         os.close(fd)
         fail(f'another collector holds {path}: one collector per destination at a time')
@@ -1116,8 +1121,7 @@ def _collector(dest):
         yield
     finally:
         try:
-            if not fcntl:
-                win_unlock(fd)
+            _unlock(fd)
         finally:
             os.close(fd)
 
@@ -1131,19 +1135,42 @@ def _uncovered(held, groups, optional):
     return [*(m for g in groups for m in g if m not in copied), *(o for o in optional if o not in asked)]
 
 
-def collect(tree, dest, groups=(), optional=()):
+def _unaccepted(accept, path):
+    """accept(path)'s missing evidence, checked to be a list of strings."""
+    missing = accept(path)
+    if not isinstance(missing, (list, tuple)) or not all(isinstance(m, str) for m in missing):
+        fail(f'a collection predicate returns a list of strings, not {missing!r}')
+    return list(missing)
+
+
+def collect(tree, dest, groups=(), optional=(), accept=None):
     """Fetch the attempt's artifacts and its own records into dest, whatever its state, and
     return the collection record written beside them (dest/collection.json): `complete` only
     when the attempt was done before the fetch began, every group and the completion record
-    arrived and every optional member arrived or is absent (not lost to a failed fetch), else
-    `incomplete`; the record keeps each member's outcome. The record names the attempt (host, dir, token) and what was
-    asked for. A complete collection is final: collecting it again returns it unfetched when it
-    covers what is asked, and refuses when it does not; partial evidence never replaces it. A
-    dest holding another attempt's collection, or files without a record, refuses. Collectors
-    of one dest are serialised by a lock beside it, across the check and the publication."""
+    arrived, every optional member arrived or is absent (not lost to a failed fetch) and
+    `accept` finds nothing missing, else `incomplete`; the record keeps each member's outcome.
+    The record names the attempt (host, dir, token) and what was asked for.
+
+    `accept(path)` is the caller's completeness predicate over a collected tree (a requirement
+    the member lists cannot state, such as artifacts that depend on how far the run got): the
+    evidence missing from it as a list of strings, empty when acceptable. It runs on the
+    fetched tree before publication, its answer kept as the record's `unaccepted`, and on a
+    cached complete collection, which it may find short: that one is collected again in the
+    same call.
+
+    A collection complete by the caller's predicate is final: collecting it again returns it
+    unfetched when it covers what is asked, and refuses when it does not; partial evidence
+    never replaces it. A dest holding another attempt's collection, or files without a record,
+    refuses. Collectors of one dest are serialised by a lock beside it, across the cache check,
+    the predicate, the fetch and the publication."""
+    return _collect(tree, dest, groups, optional, accept, None)
+
+
+def _collect(tree, dest, groups, optional, accept, st):
+    """collect, `st` the attempt status a caller already saw `done`, or None to probe it."""
     dest = Path(dest)
-    groups = [[f'{r}/' if t else r for r, t in map(_artifact, g)] for g in groups]
-    optional = [f'{r}/' if t else r for r, t in map(_artifact, optional)]
+    groups = [[_artifact(m) for m in g] for g in groups]
+    optional = [_artifact(m) for m in optional]
     if COLLECTION in [m.rstrip('/') for g in groups for m in g] + [o.rstrip('/') for o in optional]:
         fail(f'{COLLECTION} is the collection record itself, not an artifact path')
     identity = {'host': tree.host, 'dir': tree.dir, 'token': tree.token}
@@ -1159,24 +1186,29 @@ def collect(tree, dest, groups=(), optional=()):
                 if short:
                     fail(f'{dest} holds a complete collection that did not fetch {", ".join(short)}; '
                          f'collect into a new dest')
-                return held
-        st = attempt_status(tree)
-        if st['state'] == 'gone':
-            fail(f"{tree.spec()} is not this attempt's tree any more (removed or replaced)")
-        if st['state'] == 'unreachable':
-            fail(f'cannot reach {tree.host} to collect {tree.dir}: {st["detail"]}')
+                if accept is None or not _unaccepted(accept, dest):
+                    return held
+        if st is None:
+            st = attempt_status(tree)
+            if st['state'] == 'gone':
+                fail(f"{tree.spec()} is not this attempt's tree any more (removed or replaced)")
+            if st['state'] == 'unreachable':
+                fail(f'cannot reach {tree.host} to collect {tree.dir}: {st["detail"]}')
         tmp = dest.with_name(f'.{dest.name}.{os.getpid()}.tmp')
         _remove(tmp)
         tmp.mkdir()
         try:
             got = copy_back(tree, tmp, groups, (*RECORD_FILES, *optional))
             copied, incomplete = got
+            unaccepted = [] if accept is None else _unaccepted(accept, tmp)
             complete = (st['state'] == 'done' and not incomplete and f'{RECORDS}/done.json' in copied
-                        and all(got.outcomes.get(o) in ('ok', 'absent') for o in (*RECORD_FILES, *optional)))
+                        and all(got.outcomes.get(o) in ('ok', 'absent') for o in (*RECORD_FILES, *optional))
+                        and not unaccepted)
             record = {'state': 'complete' if complete else 'incomplete', 'remoteState': st['state'],
                       'remote': tree.spec(), 'identity': identity,
-                      'requested': {'groups': groups, 'optional': optional},
-                      'copied': copied, 'missing': incomplete, 'outcomes': got.outcomes, 'collectedAt': time.time()}
+                      'requested': {'groups': groups, 'optional': optional}, 'copied': copied,
+                      'missing': incomplete, 'unaccepted': unaccepted, 'outcomes': got.outcomes,
+                      'collectedAt': time.time()}
             write_json(tmp / COLLECTION, record)
             _remove(dest)
             tmp.rename(dest)
@@ -1214,10 +1246,7 @@ def publish_locked(path, data):
         f.write(json.dumps(data) + '\n')
     fd = os.open(tmp, os.O_RDONLY)
     try:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        else:
-            win_lock(fd)
+        _lock_ex(fd)
         os.link(tmp, path)
     except BaseException:
         os.close(fd)
@@ -1260,6 +1289,20 @@ def win_unlock(fd):
         msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
     finally:
         os.lseek(fd, pos, os.SEEK_SET)
+
+
+def _lock_ex(fd, block=True):
+    """flock(LOCK_EX), or win_lock on Windows; BlockingIOError when not `block` and it is held."""
+    if fcntl:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if block else fcntl.LOCK_NB))
+    else:
+        win_lock(fd, block)
+
+
+def _unlock(fd):
+    """Before closing a _lock_ex descriptor: Windows needs win_unlock, POSIX's close releases it."""
+    if not fcntl:
+        win_unlock(fd)
 
 
 # a waiter's probe holds the lock for a moment; a run holds it for its whole life
@@ -1317,8 +1360,7 @@ def run_recorded(runs, run_id, body, record=None):
     finally:
         write_json(done, {'runId': run_id, 'exit': rc, 'reports': reports})
         try:
-            if not fcntl:
-                win_unlock(lock)
+            _unlock(lock)
         finally:
             os.close(lock)
         if not fcntl:

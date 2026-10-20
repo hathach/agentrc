@@ -185,6 +185,12 @@ def _is_id(s) -> bool:
     return isinstance(s, str) and bool(_ID_TEXT.match(s)) and not s.startswith(_RESERVED)
 
 
+def _check_id(attempt_id) -> None:
+    if not _is_id(attempt_id):
+        raise ReportError('attempt', f'attempt id {attempt_id!r} must match {_ID_TEXT.pattern} '
+                                     f'and start with none of {_RESERVED}')
+
+
 def _is_ref(s) -> bool:
     """An archive reference: an attempt id, `withdrawn-<attempt id>`, or a digest-named record."""
     return _is_id(s) or isinstance(s, str) and (
@@ -268,7 +274,7 @@ def _withdrawal(raw: dict, schema: BodySchema, data: bytes) -> Reading:
 
 
 def read_document(path, schema: BodySchema) -> Reading:
-    """The report at `path` (tinyuf2's --report names one directly)."""
+    """The report at `path`."""
     path = Path(path)
     if not path.exists():
         return Reading('missing', None, None, f'{path} not found')
@@ -422,6 +428,16 @@ def _read_bytes(path: Path) -> bytes | None:
         return None
 
 
+def _doc(reading: Reading) -> dict:
+    """A readable reading as the document it was parsed from."""
+    return {**reading.body, **({META: reading.meta} if reading.meta else {})}
+
+
+def _sealed(root: Path, aid: str) -> bool:
+    """`aid` is archived or withdrawn: it never writes again."""
+    return (root / aid).exists() or (root / f'withdrawn-{aid}').exists()
+
+
 def _archive_id(reading: Reading) -> str:
     if reading.meta is not None:
         return reading.meta['attempt_id']
@@ -458,7 +474,7 @@ def _used(root: Path, current: Reading, attempt_id: str) -> bool:
     """`attempt_id` has a record, archived or live, or was withdrawn: it never writes again."""
     live = current.meta['attempt_id'] if current.meta else \
         current.body['attempt_id'] if current.outcome == 'withdrawn' else None
-    return attempt_id == live or (root / attempt_id).exists() or (root / f'withdrawn-{attempt_id}').exists()
+    return attempt_id == live or _sealed(root, attempt_id)
 
 
 def _archive_current(report_dir: Path, schema: BodySchema, attempt_id: str | None = None):
@@ -482,8 +498,7 @@ def _archive_current(report_dir: Path, schema: BodySchema, attempt_id: str | Non
     if _read_bytes(root / aid / jpath.name) == data:   # sealed already: no render needed
         return aid, reading, None
     if reading.outcome in READABLE:
-        doc = {**reading.body, **({META: reading.meta} if reading.meta else {})}
-        files = {jpath.name: data, mpath.name: _markdown_bytes(schema, doc, f'archiving {jpath}')}
+        files = {jpath.name: data, mpath.name: _markdown_bytes(schema, _doc(reading), f'archiving {jpath}')}
         legacy = None
     else:
         files = {jpath.name: data, **({mpath.name: md} if md is not None else {})}
@@ -509,9 +524,7 @@ def withdraw_current(report_dir, schema: BodySchema, attempt_id: str, reason: st
     or withdrawn earlier is refused ('sealed')."""
     report_dir = Path(report_dir)
     jpath, mpath, root = paths(report_dir, schema)
-    if not _is_id(attempt_id):
-        raise ReportError('attempt', f'attempt id {attempt_id!r} must match {_ID_TEXT.pattern} '
-                                     f'and start with none of {_RESERVED}')
+    _check_id(attempt_id)
     record = {WITHDRAWN: {'version': META_VERSION, 'body_schema': schema.name, 'attempt_id': attempt_id,
                           'archived': None, 'reason': ' '.join(reason.split())}}
     with _writer(report_dir, schema):
@@ -520,7 +533,7 @@ def withdraw_current(report_dir, schema: BodySchema, attempt_id: str, reason: st
         if current is not None and current.outcome == 'withdrawn' and current.body['attempt_id'] == attempt_id:
             aid = current.body['archived']   # a retry: the record stands
         else:
-            if (root / attempt_id).exists() or (root / f'withdrawn-{attempt_id}').exists():
+            if _sealed(root, attempt_id):
                 raise ReportError('sealed', f'attempt {attempt_id} is archived or withdrawn already')
             aid, reading, _ = _archive_current(report_dir, schema)
             if reading.raw is not None and _read_bytes(root / aid / jpath.name) != reading.raw:
@@ -538,9 +551,7 @@ def start_attempt(report_dir, schema: BodySchema, accumulate: bool, attempt_id: 
     and gets the prior reading; a corrupt prior is linked, so its sequence never passes."""
     report_dir = Path(report_dir)
     attempt_id = attempt_id or new_attempt_id()
-    if not _is_id(attempt_id):
-        raise ReportError('attempt', f'attempt id {attempt_id!r} must match {_ID_TEXT.pattern} '
-                                     f'and start with none of {_RESERVED}')
+    _check_id(attempt_id)
     with _writer(report_dir, schema):
         aid, reading, legacy = _archive_current(report_dir, schema, attempt_id)
     if not accumulate:
@@ -554,7 +565,7 @@ def _guard_predecessor(report_dir: Path, schema: BodySchema, meta: dict) -> None
     archived current report nor an archived record."""
     jpath, mpath, root = paths(report_dir, schema)
     aid, previous = meta['attempt_id'], meta['previous_attempt']
-    if (root / aid).exists() or (root / f'withdrawn-{aid}').exists():
+    if _sealed(root, aid):
         raise ReportError('sealed', f'attempt {aid} is archived or withdrawn; it never writes again')
     data = _read_bytes(jpath)
     if data is None:
@@ -625,8 +636,7 @@ def prepare_pair(report_dir, schema: BodySchema) -> Reading:
         md = None
         if reading.outcome in READABLE:
             try:
-                md = _markdown_bytes(schema, {**reading.body, **({META: reading.meta} if reading.meta else {})},
-                                     'render failed')
+                md = _markdown_bytes(schema, _doc(reading), 'render failed')
             except ReportError as e:   # shown as the notice instead
                 reading = reading._replace(outcome='corrupt', detail=str(e))
         if md is None:
@@ -691,8 +701,8 @@ def read_chain(report_dir, schema: BodySchema, limit: int = 256) -> list:
 
 
 # --- verdicts -------------------------------------------------------------------------------
-def _fold(rows: list, requested: list) -> str:
-    if not requested:
+def _fold(rows: list) -> str:
+    if not rows:
         return 'not-run'
     return min((r['verdict'] for r in rows), key=VERDICTS.index)
 
@@ -736,7 +746,7 @@ def apply_run_rules(schema: BodySchema, requested: list, rows: list, termination
         elif caveat and r['verdict'] == 'pass':
             r = dict(r, verdict='blocker', detail=f'run caveat denies a pass: {caveat.strip()}')
         out.append(r)
-    return {'verdict': _fold(out, requested), 'termination': termination, 'caveat': caveat, 'rows': out}
+    return {'verdict': _fold(out), 'termination': termination, 'caveat': caveat, 'rows': out}
 
 
 def _retryable(c: AttemptContext, board: str) -> bool:
@@ -809,5 +819,5 @@ def sequence_verdict(schema: BodySchema, requested: list, chain: list) -> dict:
         rows.append({'board': b, 'verdict': verdict, 'flaky': flaky, 'detail': detail,
                      'evidence': evidence, 'attempts': seen})
     return {'current': chain[-1].run if chain else None,
-            'sequence': {'verdict': _fold(rows, requested), 'rows': rows,
+            'sequence': {'verdict': _fold(rows), 'rows': rows,
                          'attempts': [c.attempt_id for c in chain], 'broken': broken}}

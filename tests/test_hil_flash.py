@@ -856,7 +856,7 @@ os.mkdir(STATE, 0o700)
 
 
 def run(cmd, cwd=None, timeout=None, **kw):
-    return hf.hil_process.run_tracked(cmd, cwd, timeout=timeout, settle=1, state_dir=STATE, reap_grace=2,
+    return hf.hil_process.run_tracked(cmd, cwd, timeout=timeout, settle=0.3, state_dir=STATE, reap_grace=2,
                                       quiet=True, **kw)
 
 

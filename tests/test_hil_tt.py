@@ -174,7 +174,9 @@ class ChildClosure(unittest.TestCase):
             ran.append(cmd)
             return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                   timeout=kw['timeout'])
-        ok, err = self.reset(copy, run)
+        # the parent reads the failure through the hil_process a deployment keeps beside it
+        with mock.patch.object(copy, '_hil_process', hp):
+            ok, err = self.reset(copy, run)
         self.assertEqual(ran[0][2], str(alone / 'hil_tt.py'))
         self.assertTrue(ok)
         self.assertIn('Inappropriate ioctl', err)

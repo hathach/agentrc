@@ -132,10 +132,6 @@ def say(msg: str) -> None:
     print(f'[{time.monotonic() - _t0:6.1f}s] {msg}', file=sys.__stdout__, flush=True)
 
 
-def _label(cmd) -> str:
-    return cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))
-
-
 def _sha256(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -255,7 +251,7 @@ class Context:
     def run(self, cmd, cwd=None, *, timeout, **kw) -> subprocess.CompletedProcess:
         if open_runs := self.open_runs():
             raise Outstanding(f'not started, earlier runs not proven ended: {_evidence(open_runs)}')
-        entry = {'cmd': _label(cmd), 'cleanup': 'unknown', 'receipt': None}
+        entry = {'cmd': hil_process._cmd_label(cmd), 'cleanup': 'unknown', 'receipt': None}
         self.ledger.append(entry)
         try:
             r = hil_process.run_tracked(cmd, cwd, timeout=timeout, settle=SETTLE, state_dir=self.state_dir, **kw)
@@ -270,24 +266,19 @@ def _evidence(open_runs: list) -> str:
     return '; '.join(f'{e["cmd"]} ({e["cleanup"]})' for e in open_runs)
 
 
-def _tidy(receipt: dict) -> None:
-    for key in ('lock', 'record', 'log'):
-        with contextlib.suppress(OSError, TypeError, KeyError):
-            os.unlink(receipt[key])
-
-
 def _settle(ledger: list) -> None:
-    """Recheck every run not proven ended until all are or RECHECK_WAIT passed; a receipt
-    proven done is removed, nothing else is."""
+    """Recheck every run not proven ended until all are, none left has a receipt to recheck,
+    or RECHECK_WAIT passed; a receipt proven done is removed, nothing else is."""
     deadline = time.monotonic() + RECHECK_WAIT
     while True:
         for e in ledger:
             if e['cleanup'] != 'done' and e['receipt'] is not None:
                 e['cleanup'] = hil_process.recheck(e['receipt'])
                 if e['cleanup'] == 'done':
-                    _tidy(e['receipt'])
+                    hil_process.tidy(e['receipt'])
                     e['receipt'] = None
-        if all(e['cleanup'] == 'done' for e in ledger) or time.monotonic() >= deadline:
+        if not any(e['cleanup'] != 'done' and e['receipt'] is not None for e in ledger) \
+                or time.monotonic() >= deadline:
             return
         time.sleep(0.1)
 
@@ -296,7 +287,7 @@ def operation_record(op, step: str) -> dict:
     attempts = getattr(op, 'attempts', ())
     return {'step': step, 'returncode': getattr(op, 'returncode', None), 'cleanup': getattr(op, 'cleanup', 'unknown'),
             'receipts': list(getattr(op, 'receipts', ())),
-            'attempts': [{'cmd': _label(a.cmd), 'kind': a.kind, 'returncode': a.result.returncode,
+            'attempts': [{'cmd': hil_process._cmd_label(a.cmd), 'kind': a.kind, 'returncode': a.result.returncode,
                           'cleanup': a.cleanup, 'error': None if a.error is None else repr(a.error)[:200]}
                          for a in attempts]}
 
@@ -588,28 +579,15 @@ def _holder_argv(job: dict) -> list:
     return [sys.executable, '-I', os.path.abspath(__file__), '--hold', json.dumps(job)]
 
 
-def _read_line(fd: int, deadline: float) -> bytes:
-    """One line from `fd` within `deadline`; b'' at EOF or past it."""
-    buf = b''
-    while not buf.endswith(b'\n'):
-        left = deadline - time.monotonic()
-        if left <= 0 or not select.select([fd], [], [], left)[0]:
-            return b''
-        chunk = os.read(fd, 4096)
-        if not chunk:
-            return b''
-        buf += chunk
-    return buf
-
-
 def _cleanup_holder(fh, lock: str, detail: str, receipts: list) -> tuple:
     """Hand `fh`'s flock to a cleanup holder (`--hold`, a fresh interpreter given the lock's
     descriptor): (token, '') once its record names it, else (None, why) with the holder gone
     and the protected record, or a record naming the dead holder, left as the blocker. Every
     wait is bounded by HOLDER_READY; an interrupt ends the handoff the same way."""
-    fds, proc = {}, None
+    fds, proc, reports = {}, None, None
     try:
         fds['hello_r'], fds['hello_w'] = os.pipe()
+        reports = hil_process._Reports(fds.pop('hello_r'))     # owns and closes it from here on
         fds['go_r'], fds['go_w'] = os.pipe()
         job = {'lock_fd': fh.fileno(), 'hello_fd': fds['hello_w'], 'go_fd': fds['go_r'], 'receipts': receipts,
                'wait': HOLDER_READY}
@@ -618,19 +596,17 @@ def _cleanup_holder(fh, lock: str, detail: str, receipts: list) -> tuple:
                                 start_new_session=True)
         for k in ('hello_w', 'go_r'):
             os.close(fds.pop(k))
-        line = _read_line(fds['hello_r'], time.monotonic() + HOLDER_READY)
-        try:
-            hello = json.loads(line)
-            pid, start = hello['pid'], hello['start']
-        except (ValueError, TypeError, KeyError):
-            raise RuntimeError(f'no readiness within {HOLDER_READY}s: {line[:100]!r}') from None
+        hello = reports.next(time.monotonic() + HOLDER_READY)
+        if hello is None or 'pid' not in hello or 'start' not in hello:
+            raise RuntimeError(f'no readiness within {HOLDER_READY}s: {hello!r}')
+        pid, start = hello['pid'], hello['start']
         if pid != proc.pid or start is None or hil_lock.proc_start(pid) != start:
             raise RuntimeError(f'readiness from pid {pid} is not the holder started as {proc.pid}')
         token = secrets.token_hex(8)
         hil_lock.write_record(fh, REASON, protected=True, holder=HOLDER, role=hil_lock.CLEANUP_ROLE, detail=detail,
                               receipts=receipts, pid=pid, start=start, token=token, locks=[lock])
         os.write(fds['go_w'], b'1')
-        if _read_line(fds['hello_r'], time.monotonic() + HOLDER_READY) != b'held\n':
+        if reports.next(time.monotonic() + HOLDER_READY) != {'held': True}:
             raise RuntimeError('the holder did not confirm the handoff')
         return token, ''
     except BaseException as e:
@@ -644,6 +620,8 @@ def _cleanup_holder(fh, lock: str, detail: str, receipts: list) -> tuple:
         for fd in fds.values():
             with contextlib.suppress(OSError):
                 os.close(fd)
+        if reports is not None:
+            reports.close()
 
 
 def _hold(job: dict) -> int:
@@ -663,11 +641,11 @@ def _hold(job: dict) -> int:
 
     signal.signal(signal.SIGUSR1, bow_out)
     pid = os.getpid()
-    os.write(job['hello_fd'], json.dumps({'pid': pid, 'start': hil_lock.proc_start(pid)}).encode() + b'\n')
+    hil_process._send(job['hello_fd'], {'pid': pid, 'start': hil_lock.proc_start(pid)})
     ready = select.select([job['go_fd']], [], [], job['wait'])[0]
     if not ready or os.read(job['go_fd'], 1) != b'1':
         return 1
-    os.write(job['hello_fd'], b'held\n')
+    hil_process._send(job['hello_fd'], {'held': True})
     os.close(job['hello_fd'])
     os.close(job['go_fd'])
     while True:
@@ -782,7 +760,7 @@ def _state_dir(path: str) -> str:
         except FileExistsError:
             pass
         # the receipts it holds decide `done`, so another user must not be able to replace them
-        return hil_process._trusted_dir(path)
+        return hil_process.trusted_dir(path)
     except OSError as e:
         raise Refused(f'state dir {path}: {e}')
 

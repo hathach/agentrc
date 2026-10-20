@@ -31,11 +31,11 @@ Contract:
   `recheck` answers from the supervisor's lock and record. `state_dir` must be a directory of
   the caller's uid that no other user can write, in an immediate parent no other user can
   write unless sticky: run_tracked (PermissionError, before anything starts) and recheck
-  (unknown) check those two only, since a replaced lock or record would forge `done`. Higher
-  ancestors are not checked; the caller must keep them trusted and unchanged for as long as a
-  receipt names the directory. Files of a `done` run are removed only once the verdict is on
-  the result or exception; the others stay for recheck and are the caller's to remove. A
-  missing file reads as unknown.
+  (unknown) check those two only (`trusted_dir`), since a replaced lock or record would forge
+  `done`. Higher ancestors are not checked; the caller must keep them trusted and unchanged
+  for as long as a receipt names the directory. Files of a `done` run are removed only once
+  the verdict is on the result or exception; the others stay for recheck and are the
+  caller's to remove (`tidy`, once a recheck answers `done`). A missing file reads as unknown.
 """
 
 from __future__ import annotations
@@ -248,7 +248,7 @@ def _cmd_label(cmd) -> str:
     noisiest thing in a failing row."""
     if isinstance(cmd, str):
         return cmd
-    parts = [a if len(a) <= 60 else f'<{len(a)}-char program>' for a in cmd]
+    parts = [a if len(a) <= 60 else f'<{len(a)}-char program>' for a in map(str, cmd)]
     return ' '.join(parts)
 
 
@@ -294,6 +294,7 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
     except BaseException:
         hold.release()
         raise
+    timed_out = False
     try:
         if track is not None:
             track['popen'] = p
@@ -301,6 +302,7 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
         out, err = p.communicate(timeout=timeout)
         r = subprocess.CompletedProcess(args=cmd, returncode=p.returncode, stdout=out, stderr=err)
     except subprocess.TimeoutExpired as ex:
+        timed_out = True
         if track is not None:
             track['timed_out'] = True
         _kill_group(p)
@@ -335,8 +337,7 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
         timeout_err = _typed(err if err is not None else ex.stderr)
         if split_stderr and timeout_err is None:
             timeout_err = b'' if binary else ''
-        _print_banner(f'COMMAND TIMEOUT ({timeout}s): {_cmd_label(cmd)}', timeout_out, timeout_err)
-        return subprocess.CompletedProcess(args=cmd, returncode=124, stdout=timeout_out, stderr=timeout_err)
+        r = subprocess.CompletedProcess(args=cmd, returncode=124, stdout=timeout_out, stderr=timeout_err)
     except BaseException:
         # BaseException, not Exception (as in CPython's own subprocess.run):
         # KeyboardInterrupt is the case that matters, and start_new_session put the child in
@@ -346,13 +347,20 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
         _kill_group(p)
         _close_pipes(p)
         raise
+    _announce(cmd, r, timeout, timed_out, quiet, verbose)
+    return r
 
-    if r.returncode != 0 and not quiet:
+
+def _announce(cmd, r: subprocess.CompletedProcess, timeout, timed_out: bool, quiet: bool, verbose: bool) -> None:
+    """A finished command's banner: a timeout always, a failure unless `quiet`, else its output
+    when `verbose`. `timed_out` is the kill's own evidence: rc 124 may be the command's."""
+    if timed_out:
+        _print_banner(f'COMMAND TIMEOUT ({timeout}s): {_cmd_label(cmd)}', r.stdout, r.stderr)
+    elif r.returncode != 0 and not quiet:
         _print_banner(f'COMMAND FAILED: {_cmd_label(cmd)}', r.stdout, r.stderr)
     elif verbose:
         print(cmd)
         print(cmd_stdout_text(r.stdout))
-    return r
 
 
 # --- run_tracked: completion proven by an operation-owned supervisor -------------------------
@@ -403,7 +411,7 @@ def _write_record(path: str, rec: dict) -> None:
     os.replace(tmp, path)
 
 
-def _trusted_dir(path: str) -> str:
+def trusted_dir(path: str) -> str:
     """`path` resolved, refused (PermissionError) unless it is a directory of ours that nobody
     else can write, in an immediate parent of ours or root's that nobody else can write unless
     it is sticky. Only those two are checked: keeping every higher ancestor trusted and
@@ -586,11 +594,12 @@ def _attach(target, cleanup: str, receipt: dict | None):
     return target
 
 
-def _tidy(receipt: dict) -> None:
-    """A done run's files: nothing is left to recheck."""
-    for path in (receipt['lock'], receipt['record'], receipt['log']):
-        with contextlib.suppress(OSError):
-            os.unlink(path)
+def tidy(receipt) -> None:
+    """Remove the files of a run whose receipt is `done`: nothing is left to recheck. Best
+    effort: a file already gone, or a receipt without a usable path, is skipped."""
+    for key in ('lock', 'record', 'log'):
+        with contextlib.suppress(OSError, TypeError, KeyError):
+            os.unlink(receipt[key])
 
 
 def recheck(receipt: dict) -> str:
@@ -598,7 +607,7 @@ def recheck(receipt: dict) -> str:
     state: its lock, the file it created, is held while it lives, and its record, a file of
     ours, says `done` only once nothing is left. Anything unverifiable is unknown."""
     try:
-        _trusted_dir(os.path.dirname(receipt['lock']))
+        trusted_dir(os.path.dirname(receipt['lock']))
         fd = os.open(receipt['lock'], os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return 'unknown'
@@ -632,7 +641,7 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
     if timeout is None or settle is None or state_dir is None:
         raise ValueError('run_tracked needs an explicit timeout, settle and state_dir')
     try:
-        base = os.path.join(_trusted_dir(state_dir), f'hil_op_{secrets.token_hex(8)}')
+        base = os.path.join(trusted_dir(state_dir), f'hil_op_{secrets.token_hex(8)}')
         log = open(f'{base}.log', 'xb')
     except BaseException as e:
         raise _attach(e, 'done', None)
@@ -663,14 +672,8 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
         r, killed = _follow(sup, hold, reports, receipt, cmd, timeout, settle, reap_grace)
         known = r.cleanup, r.receipt
         if r.cleanup == 'done':
-            _tidy(receipt)
-        if killed:
-            _print_banner(f'COMMAND TIMEOUT ({timeout}s): {_cmd_label(cmd)}', r.stdout, r.stderr)
-        elif r.returncode != 0 and not quiet:
-            _print_banner(f'COMMAND FAILED: {_cmd_label(cmd)}', r.stdout, r.stderr)
-        elif verbose:
-            print(cmd)
-            print(cmd_stdout_text(r.stdout))
+            tidy(receipt)
+        _announce(cmd, r, timeout, killed, quiet, verbose)
         reports.close()
         return r
     except BaseException as e:
@@ -679,7 +682,7 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
             _attach(e, *known)
         try:
             if e.cleanup == 'done':
-                _tidy(receipt)
+                tidy(receipt)
             reports.close()
         except BaseException as again:
             raise _attach(again, e.cleanup, e.receipt)

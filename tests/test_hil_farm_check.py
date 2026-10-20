@@ -415,6 +415,24 @@ class Engine(unittest.TestCase):
         self.assertIn('unavailable', row['note'][-1])
 
     # --- the profile's seams on ctx -------------------------------------------------------------
+    def test_a_run_is_labelled_whatever_its_argv_holds(self):
+        def tracked(cmd, cwd=None, **kw):
+            r = subprocess.CompletedProcess(cmd, 0, '', None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        patch(self, eng.hil_process, 'run_tracked', tracked)
+        ctx = eng.Context(dict(BOARD), self.args, str(self.state), eng.new_row('b'))
+        ctx.run([Path('/opt/flash'), '-v'], timeout=5)
+        self.assertEqual(ctx.ledger, [{'cmd': '/opt/flash -v', 'cleanup': 'done', 'receipt': None}])
+
+    def test_settle_waits_only_while_a_receipt_can_still_answer(self):
+        patch(self, eng, 'RECHECK_WAIT', 5)
+        ledger = [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}]
+        t = time.monotonic()
+        eng._settle(ledger)
+        self.assertLess(time.monotonic() - t, 1, 'no receipt left to recheck, nothing to wait for')
+        self.assertEqual(ledger, [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}], 'it stays unresolved')
+
     def test_settle_holds_in_process_board_io_until_every_run_is_proven_ended(self):
         reset = 'STM32_Programmer_CLI --connect port=swd sn=P --rst --go'
         patch(self, eng, '_cleanup_holder', lambda *a: (None, 'no holder in this test'))
@@ -656,7 +674,7 @@ class Engine(unittest.TestCase):
         self.assertTrue(lk.is_cleanup_holder(rec))
         self.assertTrue(lk._holds_flock(rec['pid'], lk.lock_path('b')))
         # its receipt cannot be rechecked: unknown, never released
-        with self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
+        with mock.patch.object(lk, 'RELEASE_WAIT', 0.3), self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
             lk.release_token(rec['token'])
 
     # --- interruption ---------------------------------------------------------------------------
@@ -901,6 +919,7 @@ def load(name, path):
 eng = load('agentrc_hil_farm_check', sys.argv[1])
 eng.hil_lock.BOARD_LOCK_DIR = sys.argv[2]
 eng.RECHECK_WAIT = 1
+eng.SETTLE = 0.3
 prof = load('farm_profile', sys.argv[3])
 sys.exit(eng.main(prof, sys.argv[5:], state_dir=sys.argv[4], host='rig'))
 """
@@ -1065,7 +1084,7 @@ class Process(unittest.TestCase):
         with self.assertRaises(lk.BoardLocked):
             self.take()
         self.assertTrue(lk.is_cleanup_holder(lk.read_record('farmb')))
-        with self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
+        with mock.patch.object(lk, 'RELEASE_WAIT', 0.3), self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
             lk.release_token(token)      # its survivor still runs
         self.kill(survivor)
         deadline = time.monotonic() + 20
@@ -1075,6 +1094,7 @@ class Process(unittest.TestCase):
                 break
             except lk.ReleaseRefused:
                 self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
         self.take()
 
     def test_a_holder_whose_supervisor_died_is_never_released_by_token(self):
@@ -1090,7 +1110,7 @@ class Process(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
         self.kill(survivor)      # gone too, but nothing proves it any more
-        with self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
+        with mock.patch.object(lk, 'RELEASE_WAIT', 0.3), self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
             lk.release_token(r['cleanup']['token'])
         with self.assertRaises(lk.BoardLocked):
             self.take()

@@ -217,12 +217,13 @@ recovery stay the contract's.
 | `hil_usbtest.py` | usbtest binding and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 
-- A process started under a protected reservation (`protected=True`) is
-  proven ended before the board is released: `run_tracked`'s `done`, or a
-  `recheck` of its receipt that answers `done`. Anything else keeps a cleanup
-  holder or the protected record for the contract's Recovery, and no
-  in-process board I/O follows until that proof (the farm check's
-  `ctx.settle()`).
+- The farm check engine releases a board it reserved (`protected=True`) only
+  once every process it started there is proven ended: `run_tracked`'s
+  `done`, or a `recheck` of its receipt that answers `done`. Anything else
+  keeps a cleanup holder or the protected record for the contract's
+  Recovery, and no in-process board I/O follows until that proof
+  (`ctx.settle()`). `run_tracked` only supplies the evidence; any other
+  caller enforces its own reservation policy.
 - `run_tracked`'s `state_dir` is the caller's: a directory of its uid that no
   other user can write, in a parent of its uid or root's that no other user
   can write unless sticky. Only those two are checked: the caller keeps every
