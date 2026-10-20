@@ -11,12 +11,13 @@ below.
 
     /simplify-gate [on [--model M] [--effort E] | off]
 
-Scope is the turn: the checkout and the worktrees nested in it (index blob ids, with
-dirty and untracked files hashed into the object store as git would store
-them) is snapshotted when a prompt arrives and again at Stop, and the diff of
-the two is queued as a batch. A peer sharing the checkout may have made some
-of it, which the challenge says, so Claude rejects findings on files it
-neither wrote nor commissioned. Batches stay queued until a review covers them, so edits after the
+Scope is the turn: the checkout, the worktrees nested in it and its `<checkout>--*`
+sibling worktrees (index blob ids, with dirty and untracked files hashed into
+the object store as git would store them) is snapshotted when a prompt arrives
+and again at Stop, and the diff of the two is queued as a batch. A peer
+sharing the checkout may have made some of it, which the challenge says, so
+Claude rejects findings on files it neither wrote nor commissioned. Batches
+stay queued until a review covers them, so edits after the
 round limit, a failed run, or a Stop while a review is still running are
 reviewed in a later turn. At Stop the queued patch goes to `codex exec`, one
 review at a time and at most two rounds per user turn; Codex never edits.
@@ -29,6 +30,7 @@ import contextlib
 import difflib
 import errno
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -60,6 +62,7 @@ STORE = '.blobs'  # the shared blob store, beside session directories named by a
 TEMP = '.tmp-'  # prefix of a blob file still being written
 PRUNE_DAYS, REPORT_DAYS = 30, 90
 SCRIPT = Path(__file__).resolve()
+PLUGIN = SCRIPT.parents[2] / 'plugins' / 'worktree-children' / 'worktree_children.py'
 SCHEMA = {
     'type': 'object', 'additionalProperties': False, 'required': ['findings'],
     'properties': {'findings': {'type': 'array', 'items': {
@@ -266,11 +269,39 @@ def symlinks(tree):
         return True
 
 
-def snapshot_tree(tree, blobs):
-    """{path: [mode, blob id]} for every tracked, dirty or untracked file of one
-    worktree. Blob ids match git's, so staging or committing a file is not a
-    change. Submodules keep their index entry untouched: their content is out
-    of scope."""
+def index_stamp(tree):
+    """HEAD and the index file's mtime, size and inode: while they hold and the
+    tree stays clean, its index entries are the ones read last time."""
+    index = Path(os.fsdecode(git(tree, 'rev-parse', '--path-format=absolute', '--git-path', 'index')).strip())
+    try:
+        st = index.stat()
+    except FileNotFoundError:  # nothing staged yet
+        return [head(tree)]
+    return [head(tree), st.st_mtime_ns, st.st_size, st.st_ino]
+
+
+def tree_files(snap, prefix):
+    """The entries of the tree at `prefix` in `snap`, unprefixed, without those of the trees nested in it."""
+    inner = [p for p in snap['trees'] if p != prefix and p.startswith(prefix)]
+    return {name[len(prefix):]: entry for name, entry in snap['files'].items()
+            if name.startswith(prefix) and not any(name.startswith(p) for p in inner)}
+
+
+def snapshot_tree(tree, blobs, previous=None, prefix=''):
+    """({path: [mode, blob id]} for every tracked, dirty or untracked file of one
+    worktree, its stamp). Blob ids match git's, so staging or committing a file is
+    not a change. Submodules keep their index entry untouched: their content is out
+    of scope. A clean tree (no dirty or untracked file) gets an index_stamp; one
+    whose stamp is the same in `previous`, the last snapshot, where it was clean
+    too, takes its entries from there instead of reading the index again."""
+    stamp = index_stamp(tree)
+    commit = stamp[0]
+    dirty = git(tree, 'diff-files', '--name-only', '-z').split(b'\0')
+    untracked = git(tree, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0')
+    if any(dirty) or any(untracked):
+        stamp = None
+    elif previous and previous.get('stamps', {}).get(prefix) == stamp:
+        return tree_files(previous, prefix), stamp
     files, links = {}, None    # links: core.symlinks, read at the first link checked out as a plain file
     for record in git(tree, 'ls-files', '--stage', '-z').split(b'\0'):
         if record:
@@ -281,11 +312,9 @@ def snapshot_tree(tree, blobs):
             files[os.fsdecode(name)] = [mode, sha]
     # A staged, uncommitted blob is reachable only through the index; once the
     # turn drops it, a gc would prune it before Stop renders the change.
-    for name in git(tree, 'diff-index', '--cached', '--name-only', '-z', head(tree)).split(b'\0'):
+    for name in git(tree, 'diff-index', '--cached', '--name-only', '-z', commit).split(b'\0'):
         if name and os.fsdecode(name) in files:
             keep_blob(tree, blobs, files[os.fsdecode(name)])
-    dirty = git(tree, 'diff-files', '--name-only', '-z').split(b'\0')
-    untracked = git(tree, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0')
     for name in {os.fsdecode(n) for n in dirty + untracked if n}:
         if files.get(name, [''])[0] == '160000':
             continue
@@ -310,20 +339,70 @@ def snapshot_tree(tree, blobs):
             files.pop(name, None)
             continue
         files[name] = [mode, blob_id(tree, blobs, name, content, mode, filtered)]
-    return files
+    return files, stamp
 
 
-def snapshot(root, blobs):
-    """`root` and the worktrees nested in it, keyed relative to `root`: a task
-    worktree under `.worktrees/` is where the session's edits often land while
-    the project directory still names the primary checkout. A worktree outside
-    `root` is another session's checkout."""
-    snap = {'files': {}, 'trees': []}
-    for tree in (t for t in worktrees(root) if t.is_relative_to(root)):
+def sibling_worktrees(root, listed):
+    """`root`'s `<root>--*` siblings that are linked worktrees of any repository, as the
+    worktree-children plugin finds and defines them; the user rule reserves that prefix for
+    them. Those `git worktree list` gave (`listed`) are root's own; any other is checked
+    with the plugin, and one that is neither a pruned leftover nor a linked worktree is an
+    error, not out of scope."""
+    try:
+        spec = importlib.util.spec_from_file_location('worktree_children', PLUGIN)
+        plugin = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(plugin)
+    except Exception as error:  # no scope without the predicate
+        raise ValueError(f'cannot load the worktree-children plugin from {PLUGIN}: {error!r}')
+    own = {os.path.realpath(t) for t in listed}
+    trees = []
+    for child in plugin.children(root):
+        if os.path.realpath(child) not in own:
+            if pruned(child):
+                continue
+            try:
+                plugin.linked_worktree(child)
+            except plugin.Keep as reason:
+                raise ValueError(f'{child}: {reason}')
+        trees.append(child)
+    return trees
+
+
+def pruned(child):
+    """Whether child's `.git` file names a git dir that is gone: a pruned worktree's leftover, as
+    worktrees() drops. Only its absence counts; a git dir that cannot be read is no proof."""
+    line = (child / '.git').read_text(encoding='utf-8').strip()
+    if not line.startswith('gitdir: '):
+        raise ValueError(f'{child}/.git does not name a git dir')
+    try:
+        os.stat(child / line[len('gitdir: '):])
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    return False
+
+
+def tree_of(root, name):
+    """The worktree whose object store holds a snapshot key's blobs: a sibling's
+    (`../<name>/...`) may belong to another repository."""
+    return root.parent / name.split('/')[1] if name.startswith('../') else root
+
+
+def snapshot(root, blobs, previous=None):
+    """`root`, the worktrees nested in it and its sibling worktrees, keyed relative
+    to `root` (`../<sibling>/...`): a task worktree under `.worktrees/` or, in a
+    herdr checkout, beside it is where the session's edits often land while the
+    project directory still names the checkout. Any other worktree is another
+    session's checkout. `previous`, the last snapshot, spares re-reading a tree
+    that has not changed (snapshot_tree)."""
+    snap = {'files': {}, 'trees': [], 'stamps': {}}
+    listed = worktrees(root)
+    # disjoint: nested ones lie under root, siblings beside it
+    for tree in [t for t in listed if t.is_relative_to(root)] + sibling_worktrees(root, listed):
         prefix = Path(os.path.relpath(tree, root)).as_posix()
         prefix = '' if prefix == '.' else prefix + '/'
         snap['trees'].append(prefix)
-        snap['files'].update({prefix + n: e for n, e in snapshot_tree(tree, blobs).items()})
+        files, snap['stamps'][prefix] = snapshot_tree(tree, blobs, previous, prefix)
+        snap['files'].update({prefix + n: e for n, e in files.items()})
     return snap
 
 
@@ -383,14 +462,14 @@ def coalesce(batches):
 def patch_text(root, blobs, changes):
     """Both sides are the stored form, so a change is rendered as git sees it,
     whatever the attributes say now."""
-    def content(entry):
+    def content(name, entry):
         if entry is None:
             return ''
         mode, sha = entry
         if mode == '160000':
             return f'[submodule at commit {sha}]\n'
         cached = blobs / sha
-        raw = cached.read_bytes() if cached.exists() else git(root, 'cat-file', 'blob', sha)
+        raw = cached.read_bytes() if cached.exists() else git(tree_of(root, name), 'cat-file', 'blob', sha)
         if b'\0' in raw:
             return f'[binary blob {sha}, {len(raw)} bytes]\n'
         return raw.decode('utf-8', errors='replace')
@@ -399,8 +478,8 @@ def patch_text(root, blobs, changes):
     for name, runs in sorted(changes.items()):
         for old, new in runs:
             parts.append(f'\nPath: {json.dumps(name)}; mode {old and old[0]} -> {new and new[0]}\n')
-            for line in difflib.unified_diff(content(old).splitlines(keepends=True),
-                                             content(new).splitlines(keepends=True),
+            for line in difflib.unified_diff(content(name, old).splitlines(keepends=True),
+                                             content(name, new).splitlines(keepends=True),
                                              fromfile='before/' + name, tofile='after/' + name):
                 parts.append(line if line.endswith('\n') else line + '\n\\ No newline at end of file\n')
     return ''.join(parts)
@@ -503,9 +582,9 @@ def queue_delta(root, directory, state, now):
         delta = diff(root, state['cursor'], now)
         if delta:
             state['batches'].append(delta)
-            for old, new in delta.values():
-                keep_blob(root, directory / 'blobs', old)
-                keep_blob(root, directory / 'blobs', new)
+            for name, (old, new) in delta.items():
+                keep_blob(tree_of(root, name), directory / 'blobs', old)
+                keep_blob(tree_of(root, name), directory / 'blobs', new)
     state['cursor'] = now
 
 
@@ -522,7 +601,7 @@ def stop(root, directory, state, payload):
     if state['cursor'] is None:
         state['notes'].append('baseline taken at this Stop (gate switched on mid-turn?); '
                               'earlier edits in this turn are not reviewed')
-    queue_delta(root, directory, state, snapshot(root, directory / 'blobs'))
+    queue_delta(root, directory, state, snapshot(root, directory / 'blobs', state['cursor']))
     if state['errors']:
         state['open_turn'] = False
         return reply(state, incomplete(state)), None
@@ -559,7 +638,7 @@ def finish(root, directory, state, job, findings, error, skipped=None):
         # The turn closes here: edits made while Codex ran (a background task,
         # a peer) are queued now. A blocked turn's next Stop queues them.
         try:
-            queue_delta(root, directory, state, snapshot(root, directory / 'blobs'))
+            queue_delta(root, directory, state, snapshot(root, directory / 'blobs', state['cursor']))
         except (OSError, ValueError, subprocess.SubprocessError) as failure:
             state['errors'].append(f'edits made during the review could not be captured: {failure}')
     if error:
@@ -636,7 +715,7 @@ def handle(root, directory, payload):
         try:
             if event == 'UserPromptSubmit':
                 if not FED_BACK.search(payload.get('prompt', '')):  # a blocked Stop fed back is not a new turn
-                    now = snapshot(root, directory / 'blobs')
+                    now = snapshot(root, directory / 'blobs', state['cursor'])
                     if state['open_turn']:
                         # Interrupted before Stop, or a review still running:
                         # edits since the cursor are this session's, not dirt.

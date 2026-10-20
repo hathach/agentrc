@@ -221,7 +221,7 @@ class GateTest(unittest.TestCase):
             sh(self.root, 'git', 'config', 'core.symlinks', symlinks)
             sh(self.root, 'git', 'update-index', '--add', '--cacheinfo', f'120000,{sha},link')
             with mock.patch.object(gate.os, 'name', 'nt'):
-                got = gate.snapshot_tree(self.root, blobs)['link'][0]
+                got = gate.snapshot_tree(self.root, blobs)[0]['link'][0]
             sh(self.root, 'git', 'add', 'link')
             self.assertEqual((got, sh(self.root, 'git', 'ls-files', '-s', 'link').split()[0]), (want, want), symlinks)
 
@@ -278,6 +278,142 @@ class GateTest(unittest.TestCase):
         sh(self.root, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'sibling')
         (wt / 'a.txt').write_text('elsewhere\n')
         self.assertEqual(self.s.stop(), {})
+
+    def test_edits_in_a_sibling_worktree_are_tracked(self):
+        wt = self.base / 'repo--task'
+        sh(self.root, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'task')
+        self.new_turn()
+        (wt / 'a.txt').write_text('in sibling\n')
+        (wt / 'c.txt').unlink()
+        sh(wt, 'git', 'add', '-A')
+        sh(wt, 'git', 'commit', '-qm', 'wt')
+        name = '../repo--task/a.txt'
+        reply = self.review([{**FINDING, 'file': name}])
+        patch = self.s.prompts[0]
+        self.assertIn(f'Path: "{name}"', patch)
+        self.assertIn('-a\n+in sibling\n', patch, 'an edit, not a creation')
+        self.assertIn('Path: "../repo--task/c.txt"', patch, 'the deletion is kept')
+        self.assertIn(f'{name}:1: dead branch', reply['reason'], 'a finding on a sibling path is in scope')
+
+    def test_a_sibling_of_another_repository_created_mid_turn_reads_its_own_store(self):
+        other = self.base / 'other'
+        other.mkdir()
+        sh(other, 'git', 'init', '-q', '-b', 'main')
+        (other / 'o.txt').write_text('foreign original\n')
+        (other / 'gone.txt').write_text('foreign deleted\n')
+        sh(other, 'git', 'add', '-A')
+        sh(other, 'git', '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'init')
+        wt = self.base / 'repo--other'
+        sh(other, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'task')
+        (wt / 'o.txt').write_text('foreign edited\n')
+        (wt / 'gone.txt').unlink()
+        self.s.results = [OSError('no codex'), OSError('no codex')]
+        self.s.stop()  # the batch stays queued with both sides cached
+        self.assertEqual([e[:18] for e in self.s.state()['errors']], ['codex failed twice'],
+                         'blobs come from the sibling, not the root repository')
+        blobs = self.s.directory / 'blobs'
+        blobs.rename(blobs.with_name('aside'))
+        blobs.mkdir()
+        self.assertIn('-foreign original\n+foreign edited\n', self.s.patch(), 'uncached, read from the sibling')
+        blobs.rmdir()
+        blobs.with_name('aside').rename(blobs)
+        shutil.rmtree(other)
+        shutil.rmtree(wt)
+        sh(self.root, 'git', 'gc', '-q', '--prune=now')
+        patch = self.s.patch()
+        self.assertIn('-foreign original\n+foreign edited\n', patch, 'the baseline is the commit it was created at')
+        self.assertIn('-foreign deleted\n', patch)
+
+    def test_only_sibling_worktrees_are_in_scope(self):
+        (self.base / 'repo--plain').mkdir()
+        (self.base / 'repo--plain' / 'x.txt').write_text('a plain directory\n')
+        neighbour = self.base / 'neighbour'
+        sh(self.root, 'git', 'worktree', 'add', '-q', str(neighbour), '-b', 'neighbour')
+        os.symlink(neighbour, self.base / 'repo--link')
+        self.new_turn()
+        (neighbour / 'a.txt').write_text('elsewhere\n')
+        (self.base / 'repo--plain' / 'x.txt').write_text('still plain\n')
+        self.assertEqual(self.s.stop(), {})
+        self.assertEqual(self.s.state()['cursor']['trees'], [''])
+
+    def test_a_pruned_siblings_leftover_is_skipped(self):
+        wt = self.base / 'repo--gone'
+        sh(self.root, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'gone')
+        shutil.rmtree(self.root / '.git' / 'worktrees' / 'repo--gone')
+        self.new_turn()
+        (wt / 'a.txt').write_text('no longer a worktree\n')
+        self.assertEqual(self.s.stop(), {})
+        self.assertEqual(self.s.state()['errors'], [])
+
+    @unittest.skipIf(os.name == 'nt' or os.geteuid() == 0, 'POSIX permissions, which root ignores')
+    def test_a_sibling_whose_git_dir_cannot_be_read_is_a_failed_snapshot(self):
+        wt = self.base / 'repo--task'
+        sh(self.root, 'git', 'worktree', 'add', '-q', str(wt), '-b', 'task')
+        self.new_turn()
+        (wt / 'a.txt').write_text('edited\n')
+        gitdir = self.root / '.git' / 'worktrees' / 'repo--task'
+        gitdir.chmod(0)
+        try:
+            reply = self.s.stop()
+        finally:
+            gitdir.chmod(0o755)
+        self.assertIn('challenge incomplete', reply['systemMessage'])
+        self.assertEqual(self.s.calls, [])
+
+    def test_a_sibling_with_a_git_file_that_is_no_linked_worktree_is_a_failed_snapshot(self):
+        self.new_turn()
+        sh(self.base, 'git', 'init', '-q', '--separate-git-dir', str(self.base / 'sep.git'), str(self.base / 'repo--sep'))
+        self.write('a.txt', 'a2\n')
+        reply = self.s.stop()
+        self.assertIn('challenge incomplete', reply['systemMessage'])
+        self.assertIn('a primary checkout', reply['systemMessage'])
+
+    def test_an_unchanged_clean_tree_reuses_its_entries_and_any_change_reads_it_again(self):
+        (self.root / '.git' / 'info' / 'exclude').write_text('.worktrees/\n')  # else root lists it untracked
+        sh(self.root, 'git', 'worktree', 'add', '-q', str(self.root / '.worktrees' / 'task'), '-b', 'task')
+        sh(self.root, 'git', 'worktree', 'add', '-q', str(self.base / 'repo--side'), '-b', 'side')
+        self.write('s.txt', 'staged, never committed\n')
+        sh(self.root, 'git', 'add', 's.txt')
+        blobs = self.base / 'cache' / 'blobs'
+        blobs.mkdir(parents=True)
+        real, read = gate.git, []
+        def git(tree, *args):
+            if args[:2] == ('ls-files', '--stage'):
+                read.append(Path(tree).name)
+            return real(tree, *args)
+        def snapshot(previous):
+            read.clear()
+            with mock.patch.object(gate, 'git', git):
+                snap = gate.snapshot(self.root, blobs, previous)
+            self.assertEqual(snap, gate.snapshot(self.root, blobs), 'the same as a full snapshot')
+            return snap, sorted(read)
+        index = self.root / '.git' / 'index'
+        sh(self.root, 'git', 'config', 'core.trustctime', 'false')  # so restoring the times makes a.txt clean
+        st = (self.root / 'a.txt').stat()
+        stat = (st.st_atime_ns, st.st_mtime_ns)
+        prev, _ = snapshot(None)
+        for change, reread in (
+                (lambda: None, []),
+                (lambda: sh(self.root, 'git', 'commit', '-qm', 'staged'), ['repo']),  # HEAD
+                (lambda: (shutil.copy2(index, index.with_name('copy')), os.replace(index.with_name('copy'), index)),
+                 ['repo']),  # the index file, same content
+                (lambda: self.write('a.txt', 'b\n'), ['repo']),
+                (lambda: (self.write('a.txt', 'a\n'), os.utime(self.root / 'a.txt', ns=stat[:2])),
+                 ['repo']),  # clean again, index untouched, but it was not clean last time
+                (lambda: (self.base / 'repo--side' / 'new.txt').write_text('untracked\n'), ['repo--side']),
+                (lambda: None, ['repo--side']),
+                (lambda: sh(self.root, 'git', 'worktree', 'remove', '--force', str(self.base / 'repo--side')), [])):
+            change()
+            prev, got = snapshot(prev)
+            self.assertEqual(got, reread)
+        self.assertIn('s.txt', prev['files'])
+
+    def test_a_plugin_that_cannot_load_is_a_failed_snapshot(self):
+        self.write('a.txt', 'a2\n')
+        with mock.patch.object(gate, 'PLUGIN', self.base / 'missing.py'):
+            reply = self.s.stop()
+        self.assertIn('cannot load the worktree-children plugin', reply['systemMessage'])
+        self.assertEqual(self.s.calls, [])
 
     def test_a_worktree_removed_after_its_edit_keeps_the_edit(self):
         wt = self.root / '.worktrees' / 'task'
@@ -481,11 +617,11 @@ class GateTest(unittest.TestCase):
     def test_a_skipped_challenge_still_reports_a_failed_snapshot(self):
         self.write('a.txt', 'a2\n')
         real_snapshot, taken = gate.snapshot, []
-        def second_fails(root, blobs):
+        def second_fails(root, blobs, previous=None):
             taken.append(1)
             if len(taken) > 1:
                 raise ValueError('index is unmerged')
-            return real_snapshot(root, blobs)
+            return real_snapshot(root, blobs, previous)
         with mock.patch.object(gate, 'PROMPT_LIMIT', 100), mock.patch.object(gate, 'snapshot', second_fails):
             message = self.s.stop()['systemMessage']
         self.assertIn('could not be captured: index is unmerged', message)
@@ -690,10 +826,10 @@ class GateTest(unittest.TestCase):
     def test_edits_missed_by_a_failed_snapshot_are_reported_and_queued_at_the_next_prompt(self):
         self.write('a.txt', 'a2\n')
         real_snapshot = gate.snapshot
-        def snapshot_failing_after_codex(root, blobs):
+        def snapshot_failing_after_codex(root, blobs, previous=None):
             if self.s.calls:
                 raise ValueError('index is unmerged')
-            return real_snapshot(root, blobs)
+            return real_snapshot(root, blobs, previous)
         self.s.on_codex = lambda: self.write('b.txt', 'written during the review\n')
         with mock.patch.object(gate, 'snapshot', snapshot_failing_after_codex):
             reply = self.review()
