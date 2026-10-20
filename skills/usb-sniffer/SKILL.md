@@ -14,14 +14,20 @@ wire really ACK?), or doesn't exist (an MCU host runs no kernel; a Linux
 gadget's UDC bypasses usbmon). Where a Linux PC is the host, usbmon is
 cheaper — no hardware, no locks.
 
-`scripts/sniff.py` owns the mechanics: `capture` (bounded, at the tapped
-segment's speed) and `addr` (the DUT's wire address out of a capture).
+`scripts/sniff.py` owns the mechanics: `list` (the attached units),
+`capture` (bounded, at the tapped segment's speed, on one named unit) and
+`addr` (the DUT's wire address out of a capture).
 
 ## Find the sniffer and what it taps
 
 ```bash
-lsusb -d 6666:6620          # capture port present? (github.com/ataradov/usb-sniffer)
+S=<skill dir>/scripts/sniff.py
+$S list                     # serial, sniffer port, usbfs node, holder (busy PID | unknown PID | idle)
 ```
+
+Several units can sit on one PC, each tapping a different bench; `capture`
+then needs `--serial`. Know which serial taps which bench before capturing:
+the serial is the unit, its tap is cabling.
 
 The sniffer is a passive tap: host-side and device-side connectors pass
 through, the capture port is a separate USB device. What it taps is a cabling
@@ -34,11 +40,22 @@ capturing alone perturbs nothing and the sniffer itself needs no lock.
 ## Capture
 
 ```bash
-S=<skill dir>/scripts/sniff.py
 $S capture raw.pcapng --port 3-2.7 --seconds 30 --limit 3000000 --fold   # speed from the tapped port's sysfs entry
-$S capture raw.pcapng --speed hs --seconds 15                            # explicit speed
+$S capture raw.pcapng --speed hs --seconds 15 --serial 4433459538463a    # explicit speed, one of several units
 ```
 
+- `--serial` names the sniffer, `--port` the tapped device: never the same
+  port. The upstream tool opens the first sniffer it can, so `capture` runs it
+  in a user and mount namespace where `/dev/bus/usb` holds only the selected
+  unit's node; nothing on the host changes. Debian 13 allows such namespaces;
+  Ubuntu's AppArmor policy needs the profile from Setup. The `+` line and the
+  summary name the unit; the pcapng does not, so keep the serial with the file.
+- Two units capture at once from two shells, each with its own `--serial` and
+  output, once `usbfs_memory_mb` has room for both (Setup): the default holds
+  one capture, a second dies with `LIBUSB_ERROR_NO_MEM`. `capture` refuses
+  first with the value to set; other usbfs users share the limit, so the
+  estimate can still fall short. A unit refused as in use may be another session's capture: wait or
+  take another unit, and stop the holder only when it is your own abandoned one.
 - The speed must be the tapped **segment's**: an FS device behind an HS hub
   is HS on the hub's upstream cable (you will see SPLIT transactions, not
   native FS packets — tap the device's own cable at `fs` for those). Wrong
@@ -119,6 +136,13 @@ the tap) and lists every device when several enumerated — pick by frame order.
 ```bash
 sudo cp <skill dir>/scripts/88-usb-sniffer.rules /etc/udev/rules.d/   # capture port + blank FX2LP
 sudo udevadm control --reload-rules && sudo udevadm trigger -s usb
+# Ubuntu only (AppArmor restricts unprivileged user namespaces): lets every user's unshare make one, not only captures
+sudo cp <skill dir>/scripts/usb-sniffer-unshare.apparmor /etc/apparmor.d/usb-sniffer-unshare
+sudo apparmor_parser -r /etc/apparmor.d/usb-sniffer-unshare
+# two units at once, if usbfs_memory_mb is below 32 and not 0 (no limit): 16 MiB per capture, 64 as an example;
+# this boot, then every boot
+echo 64 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb
+echo 'w /sys/module/usbcore/parameters/usbfs_memory_mb - - - - 64' | sudo tee /etc/tmpfiles.d/usb-sniffer.conf
 # binary from the ataradov repo (bin/usb_sniffer_linux) + Wireshark extcap symlink (Wireshark >= 4.x)
 cp usb_sniffer_linux ~/.local/bin/usb_sniffer && chmod +x ~/.local/bin/usb_sniffer
 mkdir -p ~/.local/lib/wireshark/extcap && ln -sf ~/.local/bin/usb_sniffer ~/.local/lib/wireshark/extcap/usb_sniffer
@@ -129,5 +153,5 @@ Never run `--mcu-eeprom` / `--fpga-flash` / `--fpga-erase` against a working sni
 ## At session end
 
 Delete or `editcap`-trim multi-hundred-MB raws before handing off, release
-any board lock, and leave no capture process behind (`pgrep -a usb_sniffer`;
-`capture` refuses to start while one runs).
+any board lock, and leave no capture process behind (`$S list` shows each
+unit's holder; `capture` refuses a unit one holds).

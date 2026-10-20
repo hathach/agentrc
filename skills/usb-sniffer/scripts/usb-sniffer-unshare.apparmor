@@ -1,0 +1,11 @@
+# Lets unshare create the user namespace sniff.py capture pins the tool in, on hosts whose AppArmor
+# restricts unprivileged user namespaces (Ubuntu 24.04: kernel.apparmor_restrict_unprivileged_userns=1).
+# Same form as upstream AppArmor's lxc-unshare profile. It applies to every user's unshare.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile usb-sniffer-unshare /usr/bin/unshare flags=(unconfined) {
+  userns,
+
+  include if exists <local/usb-sniffer-unshare>
+}
