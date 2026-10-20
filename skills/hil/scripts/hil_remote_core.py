@@ -1156,7 +1156,9 @@ def collect(tree, dest, groups=(), optional=(), accept=None):
     evidence missing from it as a list of strings, empty when acceptable. It runs on the
     fetched tree before publication, its answer kept as the record's `unaccepted`, and on a
     cached complete collection, which it may find short: that one is collected again in the
-    same call.
+    same call and replaced only by a complete one. A refresh that is not complete (a failed
+    fetch, or still short) refuses with RemoteError and leaves the cached files and record as
+    they were: they stay complete by transport but are never returned as accepted.
 
     A collection complete by the caller's predicate is final: collecting it again returns it
     unfetched when it covers what is asked, and refuses when it does not; partial evidence
@@ -1178,6 +1180,7 @@ def _collect(tree, dest, groups, optional, accept, st):
         held = _collection(dest)
         if held is None and dest.exists() and any(dest.iterdir()):
             fail(f'{dest} holds files but no {COLLECTION}; collect into a new dest')
+        refreshing = None   # what the predicate finds missing from a cached complete collection
         if held is not None:
             if held.get('identity') != identity:
                 fail(f'{dest} holds the collection of another attempt ({held.get("remote")}); collect into a new dest')
@@ -1186,7 +1189,8 @@ def _collect(tree, dest, groups, optional, accept, st):
                 if short:
                     fail(f'{dest} holds a complete collection that did not fetch {", ".join(short)}; '
                          f'collect into a new dest')
-                if accept is None or not _unaccepted(accept, dest):
+                refreshing = [] if accept is None else _unaccepted(accept, dest)
+                if not refreshing:
                     return held
         if st is None:
             st = attempt_status(tree)
@@ -1209,6 +1213,12 @@ def _collect(tree, dest, groups, optional, accept, st):
                       'requested': {'groups': groups, 'optional': optional}, 'copied': copied,
                       'missing': incomplete, 'unaccepted': unaccepted, 'outcomes': got.outcomes,
                       'collectedAt': time.time()}
+            if refreshing and not complete:
+                lost = [f'{m} {o}' for m, o in got.outcomes.items() if o not in ('ok', 'absent')]
+                fail(f'{dest} holds a complete collection the predicate finds short '
+                     f'({", ".join(refreshing)}); its refresh is not complete either '
+                     f'({"; ".join([*lost, *map(str, incomplete), *unaccepted]) or st["state"]}), '
+                     f'so it is kept as it was')
             write_json(tmp / COLLECTION, record)
             _remove(dest)
             tmp.rename(dest)

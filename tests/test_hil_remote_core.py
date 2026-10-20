@@ -1599,6 +1599,31 @@ class Attempts(Rig):
         self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text()), col)
         self.assertEqual((dest / 'out/late.json').read_text(), 'late')
 
+    def test_a_refresh_that_is_not_complete_keeps_the_cached_collection(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        held = rc_.collect(tree, dest, optional=['out/'])
+
+        def unchanged():
+            self.assertEqual(json.loads((dest / rc_.COLLECTION).read_text()), held)
+            self.assertEqual((dest / 'out/report.json').read_text(), 'from the rig')
+        self.setenv(FAKE_SSH_DOWN="' fetch ")
+        with self.assertRaises(RemoteError) as e:
+            rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertIn('out/ transport', e.exception.code)
+        self.assertIn('kept as it was', e.exception.code)
+        unchanged()
+        del os.environ['FAKE_SSH_DOWN']
+        with self.assertRaises(RemoteError) as e:     # fetched whole, still short
+            rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertIn('the predicate finds short (out/late.json)', e.exception.code)
+        unchanged()
+        (self.base / 'a1/out/late.json').write_text('late')
+        col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((col['state'], col['unaccepted']), ('complete', []))
+        self.assertEqual((dest / 'out/late.json').read_text(), 'late')
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
+
     def test_collectors_with_a_predicate_never_strand_or_remove_a_complete_collection(self):
         tree = self.done_attempt()
         dest = self.tmp / 'got'
