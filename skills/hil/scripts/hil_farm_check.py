@@ -38,7 +38,12 @@ run inside the reservation and never take a lock; a process any of them starts g
 `ctx.run` (hil_flash's `run=`: hil_process.run_tracked with the engine's state dir), and an
 exception from one keeps its `.operation`, which the row records. ctx.run raises
 `Outstanding` instead of starting a command while an earlier one is not proven ended; a
-profile lets it propagate. observe_before is observation only and must not change the board;
+profile lets it propagate. In-process board I/O (a UART open, poll or write) after any
+ctx.run goes through ctx.settle() first, which raises Outstanding the same way.
+ctx.record(operation) keeps an Operation on the row as soon as it completed, so a later
+exception or interrupt in the same callback cannot lose it; one also returned or raised is
+recorded once. ctx.flash_error_line(text) is the engine's reading of a failed flash's output.
+observe_before is observation only and must not change the board;
 every other [lock] call is taken to change it once entered, whether or not it ran a process.
 The others take no lock.
   roster(host, config, args) -> {'path', 'boards': [dict], 'named_only': [dict]}: this host's
@@ -53,7 +58,9 @@ The others take no lock.
       str, 'image': IMAGE | None}, 'notes': [str]} or {'refused': {'status': 'flash-failed'
       | 'failed', 'notes': [str]}}. IMAGE is {'path', 'variant', 'label', 'provenance'};
       provenance is {'kind': 'ci', 'repo', 'commit', 'run', 'artifact', 'conclusion'},
-      {'kind': 'local', 'receipt'} or {'kind': 'missing', 'reason'}.
+      {'kind': 'local', 'receipt'} or {'kind': 'missing', 'reason'}. Any other key of the
+      plan, or of an IMAGE, is the profile's own data: the engine passes the plan unchanged to
+      flash, observe and final_state and reads nothing else from it.
   flash(ctx, board, plan) -> hil_flash Operation, or raises with `.operation` [lock]
   observe(ctx, board, plan, before) -> {'status': 'ok' | 'failed' | 'flash-failed', 'device':
       str, 'notes': [str], 'unverified': [str], 'evidence': [str]} [lock]
@@ -64,6 +71,9 @@ The others take no lock.
   any board; raising refuses); observe_before(ctx, board, plan) -> before [lock];
   LEAVE_RUNNING = True when final_state defines and verifies a "leave running" state, which
   --no-park requires.
+
+main(profile, argv, lock_module=...) takes the project's own loaded hil_lock instance in
+place of the engine's (module identity, test isolation); there is no lock-dir option.
 """
 
 from __future__ import annotations
@@ -207,20 +217,40 @@ def _note_cleanup(entry: dict, source) -> None:
 
 class Context:
     """What a profile call inside the reservation gets: `run` (call it as hil_flash's `run=`),
-    `board`, `args` and `say`. `ledger` keeps every run's cleanup and receipt; a run is entered
-    before it starts, so an interrupt mid-call still counts. `touched` is set before any
-    callback that may change the board is entered."""
+    `settle`, `record`, `flash_error_line`, `board`, `args` and `say`. `ledger` keeps every
+    run's cleanup and receipt; a run is entered before it starts, so an interrupt mid-call
+    still counts. `touched` is set before any callback that may change the board is entered;
+    `step` names the callback running."""
 
-    def __init__(self, board: dict, args, state_dir: str):
+    def __init__(self, board: dict, args, state_dir: str, row: dict):
         self.board, self.args, self.say = board, args, say
         self.state_dir = state_dir
+        self.row = row
         self.ledger = []
         self.touched = False
+        self.step = None
+        self._recorded = []
 
     def open_runs(self) -> list:
         """The runs not proven ended, after rechecking them for at most RECHECK_WAIT."""
         _settle(self.ledger)
         return [e for e in self.ledger if e['cleanup'] != 'done']
+
+    def settle(self) -> None:
+        """Before in-process board I/O: raises Outstanding unless every run is proven ended."""
+        if open_runs := self.open_runs():
+            raise Outstanding(f'earlier runs not proven ended: {_evidence(open_runs)}')
+
+    def record(self, op) -> None:
+        """Keep `op` on the row under the current step, once however often it is given."""
+        if op is None or any(o is op for o in self._recorded):
+            return
+        self._recorded.append(op)
+        self.row['operations'].append(operation_record(op, self.step))
+
+    @staticmethod
+    def flash_error_line(text: str) -> str:
+        return flash_error_line(text)
 
     def run(self, cmd, cwd=None, *, timeout, **kw) -> subprocess.CompletedProcess:
         if open_runs := self.open_runs():
@@ -354,7 +384,7 @@ def check_board(profile, board: dict, args, state_dir, prepared=None) -> dict:
         return _not_taken(row, 'blocked' if live_holder else 'locked', str(e))
     except hil_lock.LockUnavailable as e:
         return _not_taken(row, 'failed', str(e))
-    ctx = Context(board, args, state_dir)
+    ctx = Context(board, args, state_dir, row)
     try:
         _reserved(profile, ctx, plan, row, fh, lock)
     except KeyboardInterrupt:
@@ -388,21 +418,22 @@ def _reserved(profile, ctx: Context, plan, row, fh, lock) -> None:
         _end_reservation(fh, lock, ctx, plan, row, final)
 
 
-def _call(row: dict, step: str, fn, *a):
+def _call(ctx: Context, step: str, fn, *a):
     """A profile callback; an exception's `.operation` goes on the row before it propagates."""
+    ctx.step = step
     try:
         return fn(*a)
     except BaseException as e:
-        if getattr(e, 'operation', None) is not None:
-            row['operations'].append(operation_record(e.operation, step))
+        ctx.record(getattr(e, 'operation', None))
         raise
 
 
-def _operations(row: dict, step: str, out: dict) -> None:
+def _operations(ctx: Context, out: dict) -> None:
     ops = out.get('operations', [])
     if not isinstance(ops, list):
-        raise ValueError(f'{step}: operations must be a list: {ops!r}')
-    row['operations'].extend(operation_record(op, step) for op in ops)
+        raise ValueError(f'{ctx.step}: operations must be a list: {ops!r}')
+    for op in ops:
+        ctx.record(op)
 
 
 def _flash_failed(row: dict, label: str, why: str) -> None:
@@ -419,18 +450,18 @@ def _attempt(profile, ctx: Context, plan: dict, row: dict) -> dict | None:
     try:
         before = None
         if hasattr(profile, 'observe_before'):
-            before = _call(row, 'observe_before', profile.observe_before, ctx, ctx.board, plan)
+            before = _call(ctx, 'observe_before', profile.observe_before, ctx, ctx.board, plan)
         if open_runs := ctx.open_runs():
             row['note'].append(f'flash not run, the observation is not proven ended: {_evidence(open_runs)}')
             row['verification'] = {'result': 'unverified', 'reasons': ['observation not proven ended']}
             return None
         ctx.touched = True
         try:
-            op = _call(row, 'flash', profile.flash, ctx, ctx.board, plan)
+            op = _call(ctx, 'flash', profile.flash, ctx, ctx.board, plan)
         except Exception as e:
             _flash_failed(row, label, repr(e)[:90])
             return None
-        row['operations'].append(operation_record(op, 'flash'))
+        ctx.record(op)
         if op.returncode != 0:
             out = hil_process.cmd_stdout_text(op.stdout) + '\n' + hil_process.cmd_stdout_text(op.stderr)
             _flash_failed(row, label, flash_error_line(out) or f'rc={op.returncode}')
@@ -440,8 +471,8 @@ def _attempt(profile, ctx: Context, plan: dict, row: dict) -> dict | None:
             row['note'].append(f'observation not run, the flash is not proven ended: {_evidence(open_runs)}')
             row['verification'] = {'result': 'unverified', 'reasons': ['flash not proven ended']}
             return None
-        obs = _observation(_call(row, 'observe', profile.observe, ctx, ctx.board, plan, before))
-        _operations(row, 'observe', obs)
+        obs = _observation(_call(ctx, 'observe', profile.observe, ctx, ctx.board, plan, before))
+        _operations(ctx, obs)
         row['status'], row['device'] = obs['status'], obs['device']
         row['note'].extend(obs['notes'])
         row['observations'].extend(obs['evidence'])
@@ -469,8 +500,8 @@ def _final_state(profile, ctx: Context, plan: dict, row: dict, observation) -> d
         return {'result': 'not-run', 'verified': False,
                 'evidence': [f'not proven ended ({e["cleanup"]}): {e["cmd"]}' for e in open_runs]}
     try:
-        out = _final(_call(row, 'final', profile.final_state, ctx, ctx.board, plan, observation))
-        _operations(row, 'final', out)
+        out = _final(_call(ctx, 'final', profile.final_state, ctx, ctx.board, plan, observation))
+        _operations(ctx, out)
     except KeyboardInterrupt:
         row['interrupted'] = True
         return {'result': 'interrupted', 'verified': False, 'evidence': ['interrupted']}
@@ -792,8 +823,44 @@ def parser_for(profile) -> argparse.ArgumentParser:
     return p
 
 
-def main(profile, argv=None, *, state_dir=None, host=None) -> int:
-    """The launcher's entry point: returns the exit status (module docstring)."""
+LOCK_FUNCTIONS = ('take_board_lock', 'read_record', 'write_record', 'clear_record', 'is_cleanup_holder',
+                  'proc_start')
+LOCK_EXCEPTIONS = ('BoardLocked', 'RecoveryBlocked', 'LockUnavailable')
+
+
+def _lock_api_problem(module):
+    """Why `module` cannot stand in for hil_lock, or None."""
+    bad = [a for a in LOCK_FUNCTIONS if not callable(getattr(module, a, None))]
+    bad += [a for a in LOCK_EXCEPTIONS
+            if not (isinstance(getattr(module, a, None), type) and issubclass(getattr(module, a), BaseException))]
+    if not isinstance(getattr(module, 'CLEANUP_ROLE', None), str):
+        bad.append('CLEANUP_ROLE')
+    if bad:
+        return f'lock module lacks {", ".join(bad)}'
+    reasons = getattr(module, 'PROTECTED_REASONS', None)
+    if not isinstance(reasons, (set, frozenset, tuple, list)) or REASON not in reasons:
+        return f'lock module lacks the {REASON} reason'
+    return None
+
+
+def main(profile, argv=None, *, state_dir=None, host=None, lock_module=None) -> int:
+    """The launcher's entry point: returns the exit status (module docstring). `lock_module`
+    is the project's own hil_lock instance, used for this call in place of the engine's."""
+    global hil_lock
+    saved = hil_lock
+    if lock_module is not None:
+        problem = _lock_api_problem(lock_module)
+        if problem:
+            print(f'farm check: refused: {problem}', file=sys.stderr)
+            return 2
+        hil_lock = lock_module
+    try:
+        return _main(profile, argv, state_dir, host)
+    finally:
+        hil_lock = saved
+
+
+def _main(profile, argv, state_dir, host) -> int:
     global _t0
     _t0 = time.monotonic()
     args = parser_for(profile).parse_args(argv)

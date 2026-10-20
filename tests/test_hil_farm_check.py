@@ -414,6 +414,75 @@ class Engine(unittest.TestCase):
         self.assertEqual((row['status'], row['flash']), ('failed', '❌ lock'))
         self.assertIn('unavailable', row['note'][-1])
 
+    # --- the profile's seams on ctx -------------------------------------------------------------
+    def test_settle_holds_in_process_board_io_until_every_run_is_proven_ended(self):
+        reset = 'STM32_Programmer_CLI --connect port=swd sn=P --rst --go'
+        patch(self, eng, '_cleanup_holder', lambda *a: (None, 'no holder in this test'))
+        for cleanup in ('pending', 'unknown', 'done'):
+            with self.subTest(cleanup=cleanup):
+                io = []
+
+                def observe(ctx, board, plan, before):
+                    ctx.record(hf.reset_stlink({'uid': 'P'}, timeout=5, run=ctx.run))
+                    ctx.settle()
+                    io.append('uart opened')
+                    return dict(self.p.observed)
+                self.p.observe = observe
+                self.outcomes[reset] = (0, cleanup, '')
+                self.rechecks[reset] = cleanup
+                row = self.check()
+                self.assertEqual([o['step'] for o in row['operations']][:2], ['flash', 'observe'])
+                if cleanup == 'done':
+                    self.assertEqual((io, row['status']), (['uart opened'], 'ok'))
+                    continue
+                self.assertEqual((io, row['status'], row['cleanup']['result']), ([], 'blocked', 'not-run'))
+                self.assertTrue(any('Outstanding' in n for n in row['note']), row['note'])
+                lk.release_board_lock(lk.flock_nb('b'))   # the test's own stand-in for the recovery
+
+    def test_a_recorded_operation_survives_a_later_failure_and_is_kept_once(self):
+        for failure in (RuntimeError('serial port gone'), KeyboardInterrupt(), None):
+            with self.subTest(failure=type(failure).__name__):
+                def final_state(ctx, board, plan, observation):
+                    op = hf.flash_lm4flash(board['flasher'], plan['final']['image']['path'], timeout=5, run=ctx.run)
+                    ctx.record(op)
+                    if failure is not None:
+                        raise failure
+                    return {'verified': True, 'evidence': [], 'notes': [], 'operations': [op]}
+                self.p.final_state = final_state
+                row = self.check()
+                self.assertEqual([o['step'] for o in row['operations']], ['flash', 'final'])
+                self.assertEqual(row['cleanup']['result'], {'RuntimeError': 'error', 'KeyboardInterrupt': 'interrupted',
+                                                            'NoneType': 'verified'}[type(failure).__name__])
+                if failure is not None:
+                    lk.release_board_lock(lk.flock_nb('b'))
+
+    def test_flash_error_line_is_reachable_from_ctx(self):
+        seen = []
+
+        def flash(ctx, board, plan):
+            seen.append(ctx.flash_error_line('Info: connecting\nError: no target\nbye\n'))
+            return hf.flash_lm4flash(board['flasher'], plan['image']['path'], timeout=5, run=ctx.run)
+        self.p.flash = flash
+        self.check()
+        self.assertEqual(seen, ['Error: no target'])
+
+    def test_extra_plan_keys_are_the_profiles_own_data(self):
+        plan, seen = self.p.plan, []
+
+        def with_extras(*a):
+            out = plan(*a)
+            out['kind'] = 'host'
+            out['image']['sidecars'] = ['config.env']
+            return out
+        self.p.plan = with_extras
+
+        def flash(ctx, board, plan):
+            seen.append((plan['kind'], plan['image']['sidecars']))
+            return hf.flash_lm4flash(board['flasher'], plan['image']['path'], timeout=5, run=ctx.run)
+        self.p.flash = flash
+        self.assertEqual(self.check()['status'], 'ok')
+        self.assertEqual(seen, [('host', ['config.env'])])
+
     # --- handing a survivor's board to a cleanup holder -----------------------------------------
     def handoff(self, argv=None, popen=None):
         """A flash that leaves a survivor (`pending`) with the holder's start replaced."""
@@ -654,7 +723,7 @@ class Main(unittest.TestCase):
         self.p = StubProfile(self.d)
         self.cfg = str(self.d / 'roster.json')
 
-    def run_main(self, *argv, host='rig', check=None):
+    def run_main(self, *argv, host='rig', check=None, **kw):
         if check:
             patch(self, eng, 'check_board_safe', check)
         with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
@@ -666,7 +735,7 @@ class Main(unittest.TestCase):
             streams = sys.stdout, sys.stderr     # a test runner's capture objects are not fds 1 and 2
             sys.stdout, sys.stderr = (open(fd, 'w', encoding='utf-8', closefd=False) for fd in (1, 2))
             try:
-                code = eng.main(self.p, list(argv), state_dir=str(self.state), host=host)
+                code = eng.main(self.p, list(argv), state_dir=str(self.state), host=host, **kw)
             except (SystemExit, RuntimeError) as e:
                 code = e
             finally:
@@ -758,6 +827,44 @@ class Main(unittest.TestCase):
         doc = json.loads(out.splitlines()[0])
         self.assertEqual((code, [r['name'] for r in doc['rows']]), (1, ['b']))
         self.assertEqual((doc['_hil']['selection'], doc['_hil']['termination']), (['b', 'c'], 'aborted'))
+
+    def test_the_projects_lock_module_is_used_for_the_call(self):
+        mine = load('hil_lock')
+        mine.BOARD_LOCK_DIR = str(self.d / 'project-locks')
+        engine_lock = eng.hil_lock
+        seen = []
+
+        def tracked(cmd, cwd=None, **kw):
+            seen.append(sorted(os.listdir(mine.BOARD_LOCK_DIR)))
+            r = subprocess.CompletedProcess(cmd, 0, 'ok', None)
+            r.cleanup, r.receipt = 'done', None
+            return r
+        patch(self, eng.hil_process, 'run_tracked', tracked)
+        code, _, _ = self.run_main(self.cfg, lock_module=mine)
+        self.assertEqual((code, seen[0]), (0, ['b.lock']))
+        self.assertFalse((self.d / 'locks').exists(), "the engine's own instance was not used")
+        self.assertIs(eng.hil_lock, engine_lock)
+
+    def test_a_lock_module_without_the_farm_check_reason_is_refused(self):
+        api = eng.LOCK_FUNCTIONS + eng.LOCK_EXCEPTIONS + ('CLEANUP_ROLE', 'PROTECTED_REASONS')
+        old = types.SimpleNamespace(**{a: getattr(lk, a) for a in api})
+        old.PROTECTED_REASONS = {'hil_test.py', 'pool_check'}
+        code, _, err = self.run_main(self.cfg, lock_module=old, check=lambda *a, **kw: self.fail('checked'))
+        self.assertEqual(code, 2)
+        self.assertIn('farm_check', err)
+        code, _, err = self.run_main(self.cfg, lock_module=types.SimpleNamespace(), check=lambda *a, **kw: self.fail('checked'))
+        self.assertEqual(code, 2)
+        self.assertIn('take_board_lock', err)
+        # present but of the wrong type: refused before the engine runs, not a crash inside it
+        for name, value in (('take_board_lock', None), ('RecoveryBlocked', None), ('RecoveryBlocked', int),
+                            ('CLEANUP_ROLE', None), ('PROTECTED_REASONS', None), ('PROTECTED_REASONS', 'farm_check')):
+            with self.subTest(name=name, value=value):
+                bad = types.SimpleNamespace(**{a: getattr(lk, a) for a in api})
+                setattr(bad, name, value)
+                with mock.patch.object(eng, '_main', side_effect=AssertionError('entered _main')):
+                    code, _, err = self.run_main(self.cfg, lock_module=bad)
+                self.assertEqual(code, 2)
+                self.assertIn(name if name != 'PROTECTED_REASONS' else 'farm_check', err)
 
     def test_a_report_is_persisted_only_on_request_in_its_own_namespace(self):
         self.run_main(self.cfg, check=lambda *a, **kw: row('b', 'ok'))
