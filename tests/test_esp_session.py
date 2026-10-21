@@ -17,7 +17,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'esp_session.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import end, guard_survivors, proc_stat, reap_if_ours  # noqa: E402
+from helpers import SURVIVOR_GUARD_OFF, end, guard_survivors, proc_stat, reap_if_ours  # noqa: E402
 
 # openocd-esp32 stand-in: --version banner; init/shutdown sessions; a server that logs its examination and
 # listening lines and answers the Tcl commands esp_session sends, with core states in FAKE_STATE.
@@ -195,6 +195,8 @@ def setUpModule():
 
 
 @unittest.skipIf(os.name == 'nt', 'esp_session.py refuses on Windows: WindowsRefusal')
+@unittest.skipIf(SURVIVOR_GUARD_OFF, f"its fake servers are ended through the survivor guard's pidfds, off here: "
+                                     f'{SURVIVOR_GUARD_OFF}')
 class EspSessionTest(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()

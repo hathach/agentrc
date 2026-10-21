@@ -137,6 +137,19 @@ class SurvivorGuard(unittest.TestCase):
         with mock.patch.object(helpers, 'children', with_a_stranger):
             self.assertNotIn(os.getppid(), helpers.descendants())
 
+    def test_the_children_of_a_parent_whose_pid_was_reused_are_skipped(self):
+        parent, kid = 2 ** 30, 2 ** 30 + 1      # past any pid_max: no real process
+        tree = {os.getpid(): [parent], parent: [kid]}
+        stats = {kid: [(parent, 'S', '3')]}
+        stats[parent] = [(os.getpid(), 'S', '1'), (os.getpid(), 'S', '2')]    # reused after its list was read
+        real = helpers.proc_stat
+
+        def proc_stat(pid):
+            return (stats[pid].pop(0) if len(stats[pid]) > 1 else stats[pid][0]) if pid in stats else real(pid)
+        with mock.patch.object(helpers, 'children', lambda pid: tree.get(pid, [])), \
+                mock.patch.object(helpers, 'proc_stat', proc_stat):
+            self.assertEqual(helpers.descendants(), {parent: (os.getpid(), 'S', '1')})
+
     def test_a_survivor_reparented_while_a_walk_runs_is_still_found(self):
         baseline = {(pid, st[2]) for pid, st in helpers.descendants().items()}
         p = subprocess.Popen(['sleep', '60'])

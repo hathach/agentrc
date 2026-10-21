@@ -118,14 +118,16 @@ def children(pid):
 
 def descendants():
     """{pid: (ppid, state, start time)} of every descendant of this process, each still the child of the process
-    whose list named it when read, not a later process reusing its pid."""
-    found, frontier = {}, [os.getpid()]
+    whose list named it when read, not a later process reusing its pid or its parent's."""
+    found, frontier = {}, [(os.getpid(), None)]
     while frontier:
-        parent = frontier.pop()
-        for kid in children(parent):
-            if kid not in found and (st := proc_stat(kid)) and st[0] == parent:
-                found[kid] = st
-                frontier.append(kid)
+        parent, start = frontier.pop()
+        kids = {kid: st for kid in children(parent)
+                if kid not in found and (st := proc_stat(kid)) and st[0] == parent}
+        if start is not None and ((st := proc_stat(parent)) is None or st[2] != start):
+            continue    # the parent's pid now names another process; a reparented orphan shows in the next walk
+        found.update(kids)
+        frontier += [(kid, st[2]) for kid, st in kids.items()]
     return found
 
 
