@@ -288,7 +288,7 @@ def heredocs(command):
             raise Denied(f'no line after this heredoc ends it with {word.group(3)}, so bash reads the rest of the command '
                          'as its body; end the body with its delimiter alone on a line')
         found.append(HEREDOC.match(command, start + openers[0]))
-        start += sum(len(skipped) + 1 for skipped in lines[i:end + 1])
+        start = found[-1].end() + 1
         i = end + 1
     return found
 
