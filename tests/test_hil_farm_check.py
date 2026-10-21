@@ -575,8 +575,9 @@ class Engine(unittest.TestCase):
     def test_a_holder_that_registers_late_is_ended(self):
         real = lk._holder_argv
 
-        def late(job):
-            return ['sh', '-c', 'sleep 3; exec "$@"', 'sh', *real(job)]
+        def late(job):      # the delay in the holder's own process, so ending it leaves no survivor
+            return [sys.executable, '-c', 'import os, sys, time; time.sleep(3); os.execv(sys.argv[1], sys.argv[1:])',
+                    *real(job)]
         self.assert_failed_handoff(self.handoff(late))
         self.assertNotIn('role', lk.read_record('b'))
 
