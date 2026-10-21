@@ -314,6 +314,26 @@ def reset_openocd(flasher: dict, *, timeout, run=None) -> Operation:
     return _once(run, f'{openocd_cmd_base(flasher)} -c "init; reset run; exit"', timeout=timeout)
 
 
+def run_openocd_commands(flasher: dict, commands: list, *, timeout, run=None, workdir=None) -> Operation:
+    """One openocd session: `init`, then `commands` (openocd Tcl commands) in order, then
+    `shutdown`, from a script file in `workdir` run after the flasher's own config. openocd
+    logs its transcript to stderr, exits 0 on the `shutdown`, and stops at the first failing
+    command with exit 1, skipping the rest. The raw result only: judging the transcript,
+    retrying and recovering stay the caller's."""
+    # `shutdown`, not `exit`: outside a telnet/Tcl session `exit` is a deprecated alias of it
+    # (server.c handle_exit_command). Without either openocd stays in its server loop.
+    base, script = openocd_cmd_base(flasher), ['init', *commands, 'shutdown']
+    with _command_file(script, prefix='hil_openocd_', suffix='.tcl', workdir=workdir) as (path, text):
+        return _once(run, f'{base} -f {shlex.quote(path)}', script=text, timeout=timeout)
+
+
+def sysresetreq_openocd(flasher: dict, *, timeout, run=None, workdir=None) -> Operation:
+    """SYSRESETREQ through an openocd session, not the probe's reset (reset_openocd). The reset
+    may drop the connection mid-write, so the caller judges the write's issue, not the exit."""
+    return run_openocd_commands(flasher, [f'mww 0x{SCB_AIRCR:08X} 0x{AIRCR_SYSRESETREQ:08X}'], timeout=timeout,
+                                run=run, workdir=workdir)
+
+
 # openocd interface cfgs whose discovery filters by VID/PID before opening; see convoy_safe
 CONVOY_SAFE_CFGS = ('interface/jlink.cfg', 'interface/stlink.cfg', 'interface/ti-icdi.cfg')
 
