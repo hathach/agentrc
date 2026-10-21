@@ -50,25 +50,16 @@ stdout ends with one JSON line; {"error": ...} and exit 2 when the ledger or
 the output cannot be read, or they disagree.
 """
 
-import errno
 import hashlib
 import json
 import os
 import re
 import sys
-import time
-from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    import fcntl
-except ImportError:  # Windows
-    fcntl = None
-    import msvcrt
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
-from facts import FULL_SHA, Parser, Unusable, git, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, git, locked, report, run  # noqa: E402
 from launch_result import load_output  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -144,32 +135,6 @@ def load(path, repo, pr):
     if led.get('repo') != repo or led.get('pr') != pr:
         raise Unusable(f'ledger {path} is for {led.get("repo")}#{led.get("pr")}, not {repo}#{pr}')
     return led
-
-
-@contextmanager
-def locked(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix('.lock'), 'a') as fd:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        else:
-            # msvcrt locks are mandatory and per handle: lock a byte past the content; LK_LOCK gives up after ~10 s.
-            os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
-            while True:
-                try:
-                    msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError as e:
-                    if e.errno not in (errno.EACCES, errno.EDEADLOCK):
-                        raise
-                    time.sleep(0.05)
-            try:
-                yield
-            finally:
-                # Windows may release a closed handle's lock only after a delay.
-                os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
-                msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def store(path, led):

@@ -100,12 +100,17 @@ def trigger(pr, head):
     return {'outcome': 'ticked', 'detail': f"comment {c['id']}"}
 
 
-def unopened(pr, head):
-    """None when PR N is open at HEAD, else why not."""
+def pull_at(pr, head):
+    """(PR N's pull object, None) when it is open at HEAD, else (it, why not)."""
     pull = gh_json('api', f'repos/{{owner}}/{{repo}}/pulls/{pr}')
     if pull['state'] != 'open' or pull['head']['sha'] != head:
-        return f"PR {pr} is {pull['state']} at {pull['head']['sha'][:9]}, not open at {head[:9]}"
-    return None
+        return pull, f"PR {pr} is {pull['state']} at {pull['head']['sha'][:9]}, not open at {head[:9]}"
+    return pull, None
+
+
+def unopened(pr, head):
+    """None when PR N is open at HEAD, else why not."""
+    return pull_at(pr, head)[1]
 
 
 def request(pr, head):

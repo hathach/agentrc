@@ -7,11 +7,19 @@ rate_limit` (which spends no quota) shows exhausted, null when it shows none, an
 secondary when none is exhausted or gh names a secondary limit."""
 
 import argparse
+import errno
 import json
 import os
 import re
 import subprocess
 import time
+from contextlib import contextmanager
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+    import msvcrt
 
 FULL_SHA = re.compile(r'\A[0-9a-f]{40}\Z')  # \Z: $ would let a trailing newline through
 # The human is the sole author: no line may credit an agent, model, tool or session, nor link a Claude or ChatGPT session anywhere.
@@ -128,6 +136,33 @@ def checkout_top():
     if os.path.realpath(top) != os.path.realpath('.'):
         raise Unusable(f'run from the checkout top level {top}, not {os.getcwd()}')
     return top
+
+
+@contextmanager
+def locked(path):
+    """path's .lock beside it held exclusively for the block, waiting while another process holds it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix('.lock'), 'a') as fd:
+        if fcntl:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        else:
+            # msvcrt locks are mandatory and per handle: lock a byte past the content; LK_LOCK gives up after ~10 s.
+            os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
+            while True:
+                try:
+                    msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as e:
+                    if e.errno not in (errno.EACCES, errno.EDEADLOCK):
+                        raise
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                # Windows may release a closed handle's lock only after a delay.
+                os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
+                msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def report(collect, argv, seal=False, limits=False):

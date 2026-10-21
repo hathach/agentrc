@@ -175,7 +175,7 @@ if (adoptProtected.length && args.adoptHead == null) throw new Error('adoptProte
 // The caller's word that each named commit's change to these protected paths passed the review those paths require (#186).
 const adoptReviewedProtected = args.adoptReviewedProtected ?? []
 if (!Array.isArray(adoptReviewedProtected) || adoptReviewedProtected.some(e => !e || typeof e !== 'object' ||
-    Object.keys(e).sort().join() !== 'paths,sha' || typeof e.sha !== 'string' || !/^[0-9a-f]{40}$/.test(e.sha) ||
+    Object.keys(e).sort().join() !== 'paths,sha' || typeof e.sha !== 'string' || !FULL_SHA.test(e.sha) ||
     !Array.isArray(e.paths) || !e.paths.length || e.paths.some(f => typeof f !== 'string' || !f || canon(f) !== f))) {
   throw new Error('adoptReviewedProtected must be an array of { sha: full 40-hex commit SHA, paths: plain repository-relative paths }')
 }
@@ -562,18 +562,14 @@ const SONAR = withSeal({
   },
 })
 // outcome is checked in code: an error line's relay fills it with ''.
-const CRTRIGGER = withSeal({
+// A trigger script's line: coderabbit_trigger.py's, which --request adds retryAt to, or greptile_trigger.py's.
+const TRIGGER = withSeal({
   type: 'object', additionalProperties: false,
   required: ['outcome', 'detail', 'at'],
   properties: {
     error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
     retryAt: { type: ['string', 'null'] },
   },
-})
-const GTRIGGER = withSeal({
-  type: 'object', additionalProperties: false,
-  required: ['outcome', 'detail', 'at'],
-  properties: { error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' } },
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
@@ -883,13 +879,12 @@ const stateOut = () => {
   return { ...st, digest: sealOf(st) }
 }
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
-// SonarCloud's own check, not an Actions job: its gate is never a CI-lane fix.
-const sonarGate = (rf) => !rf.workflow && /^SonarCloud\b/.test(rf.check)
-// Greptile's confidence check: a score of its review, which no local diff raises; collect.py reads it by its app and output.
-const greptileGate = (rf) => !rf.workflow && rf.check === 'Greptile Review'
-const gateCheck = (rf) => sonarGate(rf) || greptileGate(rf)
-const ciState = (rf) => rf.accepted ? 'accepted' : sonarGate(rf) ? 'sonarGate' : greptileGate(rf) ? 'greptileGate'
-  : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
+// SonarCloud's own check, and Greptile's confidence check, a score of its review that collect.py reads by its app and
+// output: neither is an Actions job, and no local diff clears either gate.
+const gateOf = (rf) => rf.workflow ? null : /^SonarCloud\b/.test(rf.check) ? 'sonarGate' : rf.check === 'Greptile Review' ? 'greptileGate' : null
+const GATE_LABEL = { sonarGate: 'SonarCloud gate', greptileGate: 'Greptile confidence gate' }
+const ciState = (rf) => rf.accepted ? 'accepted'
+  : gateOf(rf) ?? (rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real')
 const launchRollup = () => {
   const findings = new Map()
   const ci = new Map()
@@ -1072,7 +1067,7 @@ const botCell = (b, headWaitedMin) => {
   }
   return `${b.state} (${b.reason})`
 }
-const botOut = ({ done, triggeredMin, retryWaitMs, unknownMin, required, ...b }) => b
+const botOut = ({ done, triggeredMin, retryWaitMs, unknownMin, ...b }) => b
 const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
   : rs.bots.map(b => `${b.bot} ${botCell(b, rs.waitedMin)}`).join(' · ')
 
@@ -1390,8 +1385,7 @@ const cycleSummary = (entry) => {
       cell(rf.firstError),
       rf.verdict === 'real' ? 'ci-real' : rf.verdict,
       state === 'accepted' ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
-      : state === 'sonarGate' ? 'left red: a SonarCloud gate, not a CI-lane fix'
-        : state === 'greptileGate' ? 'left red: a Greptile confidence gate, not a CI-lane fix'
+      : GATE_LABEL[state] ? `left red: a ${GATE_LABEL[state]}, not a CI-lane fix`
         : state === 'rigSide' ? 'left red for the rig'
           : state === 'unclassified' ? 'left red: not placed by its evidence'
             : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
@@ -1782,7 +1776,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   // Once per head, whatever the outcome: a failed tick is not retried into a storm.
   if (manual && reviewClock.triggeredAt === undefined) {
     if (await ended('crtrigger')) return
-    const { t, outcome } = await relayCodeRabbit(cycle, 'crtrigger', `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
+    const { t, outcome } = await relayTrigger(cycle, 'crtrigger', CRTRIGGER_SCRIPT, `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
       ['ticked', 'already', 'notSkipped', 'failed'])
     // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
@@ -1793,13 +1787,13 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   if (!asks.length || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
   waitAfter(cr, asks.reduce((a, b) => Date.parse(a) >= Date.parse(b) ? a : b), r.observedAt)
 }
-// One coderabbit_trigger.py run through a relay: its line, and the outcome, `failed` for a line it cannot read.
-const relayCodeRabbit = async (cycle, kind, task, flag, outcomes) => {
+// One trigger script's run through a relay: its line, and the outcome, `failed` for a line it cannot read.
+const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
   const label = `${kind}#${cycle}`
   const t = await relayOnce(
-    `${IN_CHECKOUT}${task}: run \`python3 ${CRTRIGGER_SCRIPT} --pr ${args.pr} --head ${expectedHead}${flag}\` ` +
-    relayed(CRTRIGGER) + ' Change nothing on GitHub yourself.',
-    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: CRTRIGGER })
+    `${IN_CHECKOUT}${task}: run \`python3 ${script} --pr ${args.pr} --head ${expectedHead}${flag}\` ` +
+    relayed(TRIGGER) + ' Change nothing on GitHub yourself.',
+    { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
   const outcome = known ? t.outcome : 'failed'
   const detail = known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`
@@ -1829,7 +1823,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const dueMs = Date.parse(cr.retryAt) - Date.parse(r.observedAt)
   if (dueMs > 0) return retryLater(cr, cycle, dueMs)
   if (await ended('crrequest')) return
-  const { t, outcome } = await relayCodeRabbit(cycle, 'crrequest', `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
+  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
     ['requested', 'already', 'notDue', 'notLimited', 'failed'])
   const atOk = !!t && Number.isFinite(Date.parse(t.at))
   const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
@@ -1843,26 +1837,18 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
 // A Greptile that reviews only on PR open never sees a pushed head unasked: under greptileTrigger, one `@greptileai` per
 // head once it stayed absent through a grace, then the silent-bot cap counted from the request.
 const GREPTILE_GRACE_MIN = 2
-const GTRIGGER_OUTCOMES = ['requested', 'already', 'notOpen', 'failed', 'uncertain', 'ambiguous']
-// Marks Greptile required; returns how its request ended when that leaves the head unreviewed.
-const requestGreptile = async (cycle, r, bots, ended) => {
+// Returns how Greptile's request ended when that leaves the head unreviewed.
+const requestGreptile = async (cycle, r, bots, lanes, ended) => {
   const g = bots.bots.find(b => b.bot === 'greptile')
-  if (!g || !greptileRequired) return null
-  g.required = true
-  if (g.state !== 'absent' && g.state !== 'queued') return null
+  if (!g || !greptileRequired || (g.state !== 'absent' && g.state !== 'queued')) return null
   if (greptileTrigger && g.state === 'absent' && reviewClock.greptileAt === undefined) {
     g.done = false
-    if (bots.waitedMin < GREPTILE_GRACE_MIN || await ended('greptile')) return null
-    const label = `greptile#${cycle}`
-    const t = await relayOnce(
-      `${IN_CHECKOUT}Ask Greptile to review PR #${args.pr}: run \`python3 ${GTRIGGER_SCRIPT} --pr ${args.pr} --head ${expectedHead}\` ` +
-      relayed(GTRIGGER) + ' Change nothing on GitHub yourself.',
-      { label, phase: 'Push', model: 'haiku', effort: 'low', schema: GTRIGGER })
-    const known = !!t && !t.error && GTRIGGER_OUTCOMES.includes(t.outcome)
-    const outcome = known ? t.outcome : 'failed'
-    log(`cycle ${cycle}: ${label}: ${outcome} (${known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`})`)
-    // What changed since the harvest is for the next harvest to read.
-    if (outcome === 'notOpen') return null
+    // The script reads the PR open at the head itself, just before it posts; another lane's closure or rate limit holds it here.
+    if (bots.waitedMin < GREPTILE_GRACE_MIN || lanes.prState || githubLimit) return null
+    const { t, outcome } = await relayTrigger(cycle, 'greptile', GTRIGGER_SCRIPT, `Ask Greptile to review PR #${args.pr}`, '',
+      ['requested', 'already', 'notOpen', 'failed', 'uncertain', 'ambiguous'])
+    // Merged or closed ends the launch; open at another head stops: the head this run must have reviewed is not the PR's.
+    if (outcome === 'notOpen') return await ended('greptile') ? null : outcome
     const asked = ['requested', 'already'].includes(outcome) && Number.isFinite(Date.parse(t.at))
     // Once per head, whatever the outcome: a failed, uncertain or ambiguous request is never repeated into a second comment.
     reviewClock.greptileAt = asked ? t.at : null
@@ -2007,7 +1993,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (exhausted) entry.ciWaited = { head: inv.head, registered: inv.registered, pending: inv.pending, waiting: inv.waiting }
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
-  const gated = failing.filter(c => gateCheck({ check: c.name, workflow: c.workflow }))
+  const gated = failing.filter(c => gateOf({ check: c.name, workflow: c.workflow }))
   // A gate is read afresh each time: a verdict an older launch stored for its link stands for nothing.
   for (const c of gated) ciVerdicts.delete(c.link)
   // A re-run is timed from when it was asked; one carried from a state without that time, from this launch's first read (#123).
@@ -2265,7 +2251,7 @@ const runLanes = async (cycle, entry, lanes) => {
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)
     if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended)
-    const unasked = r !== nobody ? await requestGreptile(cycle, r, entry.bots, ended) : null
+    const unasked = r !== nobody ? await requestGreptile(cycle, r, entry.bots, lanes, ended) : null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
     if (unasked) {
       log(`cycle ${cycle}: Greptile must review ${expectedHead.slice(0, 7)}, and its request ended ${unasked} — stopping, the head unreviewed`)
@@ -2664,7 +2650,7 @@ const runLanes = async (cycle, entry, lanes) => {
     // A mark may clear the SonarCloud gate this run failed on: read CI again rather than fix it.
     const marked = (entry.sonarMarked || 0) + await settleSonar(cycle, entry, ended)
     if (lanes.prState) return prEnded(cycle, lanes.prState)
-    if (marked > 0 && c.realFailures.some(sonarGate)) {
+    if (marked > 0 && c.realFailures.some(rf => gateOf(rf) === 'sonarGate')) {
       log(`cycle ${cycle}: ${marked} SonarCloud issue(s) marked false positive — re-arming to read the SonarCloud check again`)
       return rearm()
     }
@@ -2683,7 +2669,7 @@ const runLanes = async (cycle, entry, lanes) => {
       if (!c.realFailures.some(rf => rf.key === a.key)) log(`cycle ${cycle}: accepted failure ${a.key} matches no failure on this head`)
     }
     const unfixable = c.realFailures.filter(rf => !['real', 'accepted'].includes(ciState(rf)))
-    for (const rf of unfixable) log(`cycle ${cycle}: ${sonarGate(rf) ? 'SonarCloud gate' : greptileGate(rf) ? 'Greptile gate' : rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
+    for (const rf of unfixable) log(`cycle ${cycle}: ${GATE_LABEL[gateOf(rf)] ?? rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
     const fixable = c.realFailures.filter(rf => ciState(rf) === 'real')
     if (fixable.length > 0) {
       const work = groupWork(fixable.map(rf => ({
@@ -2745,7 +2731,7 @@ const runLanes = async (cycle, entry, lanes) => {
         }
         return unresolvedVerdict(cycle, owedNow)
       }
-      const unreviewed = entry.bots.bots.find(b => b.required && b.state !== 'reviewed')
+      const unreviewed = greptileRequired && entry.bots.bots.find(b => b.bot === 'greptile' && b.state !== 'reviewed')
       if (unreviewed) {
         log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'}, but Greptile has not reviewed ${expectedHead.slice(0, 7)}, ` +
           `and greptileTrigger made its review required: ${botCell(unreviewed, entry.bots.waitedMin)} — stopping`)
@@ -2765,8 +2751,8 @@ const runLanes = async (cycle, entry, lanes) => {
         log(`cycle ${cycle}: CI red with ${unclassified.length} failure(s) the watcher could not place — no justified fix; investigate before relaunching`)
         return stop(cycle, 'ci-red-unclassified', { outstanding: outstanding() })
       }
-      const gates = unfixable.filter(sonarGate)
-      const greptile = unfixable.filter(greptileGate)
+      const gates = unfixable.filter(rf => gateOf(rf) === 'sonarGate')
+      const greptile = unfixable.filter(rf => gateOf(rf) === 'greptileGate')
       const rig = unfixable.length - gates.length - greptile.length
       const beside = (n, what) => n ? ` and ${n} ${what}` : ''
       // SonarCloud's stop takes precedence; both gates stay in the observation with their state.

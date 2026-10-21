@@ -7546,7 +7546,7 @@ test("Greptile's confidence check is read by collect.py as a gate, never judged 
   assert.equal(result.reason, 'ci-red-greptile-gate')
   assert.equal(result.cycles, 1, 'another cycle would meet the same gate')
   assert.ok(logs.some(l => /CI red from Greptile's confidence check \(Base review: Confidence 4\/5 — below your required 5\/5\) — its review scored below the repository's threshold, which no CI-lane fix raises: a new score needs a new Greptile review of the head, or the caller accepts the gate by its key/.test(l)), logs.join('\n'))
-  assert.ok(logs.some(l => /Greptile gate CI failure \(not fixing\): Greptile Review/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /Greptile confidence gate CI failure \(not fixing\): Greptile Review/.test(l)), logs.join('\n'))
   assert.ok(logs.some(l => /\| left red: a Greptile confidence gate, not a CI-lane fix +\| - /.test(l)), 'the cycle table names it, with no commit')
   assert.deepEqual(result.rollup.ci, { total: 1, fixed: 0, open: 0, accepted: 0, sonarGate: 0, greptileGate: 1, rigSide: 0, unclassified: 0 })
   assert.deepEqual(result.observation.ci.realFailures.map(({ check, workflow, job, complete, signature, verdict, state }) => ({ check, workflow, job, complete, signature, verdict, state })),
@@ -7799,7 +7799,7 @@ test('greptileTrigger waits out a grace with Greptile absent, asks once, then wa
   const call = calls.find(c => c.label === 'greptile#3')
   assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
   assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
-  assert.ok(labels.includes('prstate#3-greptile'), 'the PR state is read before the comment')
+  assert.equal(labels.some(l => l.startsWith('prstate#')), false, 'the script reads the PR open at the head itself, just before it posts')
   assert.match(calls.find(c => c.label === 'reviews#1').prompt, /of those, coderabbit, greptile auto-run on every push.*--auto-run coderabbit,greptile`/)
   assert.ok(logs.includes('cycle 3: greptile#3: requested (comment 7)'), logs.join('\n'))
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), greptileAt: at(2) })
@@ -7834,12 +7834,15 @@ test('a failed, uncertain or lost request stops greptile-unreviewed at once and 
     assert.equal(result.state.reviewClock.greptileAt, null, 'tried, and not tried again')
     assert.equal(result.state.greptileRequired, true)
   }
-  // notOpen asks nothing: the next harvest reads what changed.
-  let n = 0
-  const moved = await run({ args: { ...GT, maxCycles: 4 }, minutesPerCycle: 3, gTrigger: { outcome: 'notOpen', detail: 'PR 3888 is closed' },
-    reviewsPerCycle: () => ++n < 3 ? silentG() : quiet([bot('coderabbit'), bot('greptile')]) })
-  assert.equal(moved.result.pass, true, moved.result.reason)
-  assert.deepEqual(gAsks(moved.labels), ['greptile#2'], 'the head is reviewed by the next harvest')
+  // notOpen posted nothing: the PR's state, read then, ends the launch, or, still open at another head, stops it.
+  const notOpen = { outcome: 'notOpen', detail: 'PR 3888 is closed at 0f1e2d3, not open at 0f1e2d3' }
+  const closed = await run({ args: { ...GT, maxCycles: 4 }, minutesPerCycle: 3, gTrigger: notOpen, prState: 'CLOSED', reviews: silentG() })
+  assert.equal(closed.result.reason, 'pr-closed')
+  assert.deepEqual(closed.labels.filter(l => /^(greptile|prstate)#/.test(l)), ['greptile#2', 'prstate#2-greptile'])
+  const moved = await run({ args: { ...GT, maxCycles: 4 }, minutesPerCycle: 3, gTrigger: { ...notOpen, detail: 'PR 3888 is open at c0ffee1, not open at 0f1e2d3' }, reviews: silentG() })
+  assert.equal(moved.result.reason, 'greptile-unreviewed')
+  assert.ok(moved.logs.includes('cycle 2: Greptile must review 0f1e2d3, and its request ended notOpen — stopping, the head unreviewed'), moved.logs.join('\n'))
+  assert.equal(moved.result.state.reviewClock.greptileAt, undefined, 'nothing was asked')
 })
 
 test('the obligation outlives the switch: a resume without greptileTrigger still waits and blocks, asking nothing', async () => {

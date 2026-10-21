@@ -35,62 +35,25 @@ one JSON line {outcome, detail, at, seal} (seal: facts.sealed). Exit 2 with
 A rerun after a lost line reports `already`.
 """
 
-import errno
 import json
 import os
 import sys
 import time
-from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    import fcntl
-except ImportError:  # Windows
-    fcntl = None
-    import msvcrt
-
 sys.path.insert(0, str(Path(__file__).parent))
-from coderabbit_trigger import unopened  # noqa: E402
-from facts import FULL_SHA, Parser, Unusable, attempt, git, report  # noqa: E402
+from coderabbit_trigger import pull_at  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, git, locked, report, utc  # noqa: E402
 from harvest import gh_json, head_event, newest, pages, stamp  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 REQUEST = '@greptileai'
-
-
-def now():
-    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
 def record_dir():
     common = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').strip())
     return common / 'pr-babysit' / 'greptile'
-
-
-@contextmanager
-def locked(path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path.with_suffix('.lock'), 'a') as fd:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-            return
-        # msvcrt locks are mandatory and per handle: lock a byte past the content; LK_LOCK gives up after ~10 s.
-        os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
-        while True:
-            try:
-                msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except OSError as e:
-                if e.errno not in (errno.EACCES, errno.EDEADLOCK):
-                    raise
-                time.sleep(0.05)
-        try:
-            yield
-        finally:
-            # Windows may release a closed handle's lock only after a delay.
-            os.lseek(fd.fileno(), 1 << 30, os.SEEK_SET)
-            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def read(path):
@@ -106,7 +69,7 @@ def read(path):
 
 
 def claim(path, seen):
-    record = {'claimedAt': now(), 'seen': seen}
+    record = {'claimedAt': utc(time.time()), 'seen': seen}
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
@@ -119,7 +82,7 @@ def claim(path, seen):
 def receipt(path, record, comment, at):
     tmp = path.with_name(path.name + '.tmp')
     tmp.write_text(json.dumps({**record, 'receipt': {'id': comment, 'at': at}}), encoding='utf-8')
-    os.replace(tmp, path)
+    windows.replace(tmp, path)  # Windows: retried while another process has the record open
 
 
 def asks(pr):
@@ -141,10 +104,10 @@ def found(path, record, outcome, pr, why):
 
 
 def request(pr, head):
-    why = unopened(pr, head)
+    pull, why = pull_at(pr, head)
     if why:
         return {'outcome': 'notOpen', 'detail': why}
-    repo = gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
+    repo = pull['base']['repo']['full_name']
     path = record_dir() / f"{repo.replace('/', '-')}-{pr}-{head}.json"
     with locked(path):
         record = read(path)
@@ -154,7 +117,7 @@ def request(pr, head):
         if record:
             return found(path, record, 'already', pr, f"an attempt claimed this head at {record['claimedAt']} and its comment is not on the PR")
         standing = asks(pr)
-        view = gh_json('pr', 'view', str(pr), '--json', 'headRefOid,headRefName,headRepository')
+        view = {'headRefName': pull['head']['ref'], 'headRepository': {'nameWithOwner': pull['head']['repo']['full_name']}}
         event_at, evidence = head_event(repo, pr, view, head, reopens=False)
         if standing and event_at is None:
             return {'outcome': 'failed', 'detail': f"the head event time is unknown ({evidence}), so comment {standing[-1]['id']} "
@@ -162,14 +125,14 @@ def request(pr, head):
         after = [c for c in standing if stamp(c['created_at']) > stamp(event_at)]
         if after:
             c = newest(after, 'created_at')
-            receipt(path, {'claimedAt': now(), 'seen': [x['id'] for x in standing]}, c['id'], c['created_at'])
+            receipt(path, {'claimedAt': utc(time.time()), 'seen': [x['id'] for x in standing]}, c['id'], c['created_at'])
             return {'outcome': 'already', 'detail': f"comment {c['id']}", 'at': c['created_at']}
         tied = [c for c in standing if stamp(c['created_at']) == stamp(event_at)]
         if tied:
             return {'outcome': 'ambiguous', 'detail': f"comment {tied[0]['id']} was made at {event_at}, the head event's own second ({evidence}): "
                                                       'nothing posted'}
         # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
-        why = unopened(pr, head)
+        why = pull_at(pr, head)[1]
         if why:
             return {'outcome': 'notOpen', 'detail': why}
         mine = claim(path, [c['id'] for c in standing])
@@ -200,7 +163,7 @@ def collect(argv):
     if not FULL_SHA.match(a.head):
         raise Unusable(f'not a full SHA: {a.head!r}')
     try:
-        return {'at': now(), **request(a.pr, a.head)}
+        return {'at': utc(time.time()), **request(a.pr, a.head)}
     except (KeyError, TypeError, AttributeError) as e:
         raise Unusable(f'gh answered in a shape greptile_trigger.py does not read ({e!r})')
 

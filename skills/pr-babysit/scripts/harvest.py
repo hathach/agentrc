@@ -47,6 +47,8 @@ from facts import FULL_SHA, Parser, RateLimited, Unusable, report, run  # noqa: 
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
 import comment_digest  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import greptile as greptile_check  # noqa: E402  the confidence check's recogniser, which collect.py shares
 
 KNOWN = ('copilot', 'coderabbit', 'greptile', 'code-scanning')
 SETTLED = ('coderabbit', 'greptile')
@@ -68,10 +70,7 @@ REVIEW_SUBMITTED = ('COMMENTED', 'APPROVED', 'CHANGES_REQUESTED')
 GREPTILE_PAUSED = 'Greptile has paused reviews on this repository'
 GREPTILE_ERROR = 'Greptile encountered an error while reviewing this PR'
 GREPTILE_STATUS = '<!-- greptile-status -->'
-# Its check concluding failure on a review that scored below the repository's confidence threshold; collect.py reads it as a gate.
-GREPTILE_BELOW = re.compile(r'\bConfidence (\d+)/(\d+) \u2014 below your required (\d+)/(\d+)$')
-GREPTILE_GATE = "Greptile reviewed this pull request successfully \u2014 this check reflects your team's confidence threshold, not a review failure."
-# How long that result may stand before its review on the head counts as not observed: pr-babysit's REVIEW_CAP_MIN.
+# How long a below-threshold confidence result may stand before its review on the head counts as not observed: pr-babysit's REVIEW_CAP_MIN.
 GREPTILE_REVIEW_WAIT = timedelta(minutes=10)
 FAILED_RUN = ('failure', 'cancelled', 'timed_out', 'action_required')
 RUN_PROGRESS = {'queued': ('queued', 'check run queued'), 'in_progress': ('working', 'check run in progress')}
@@ -264,7 +263,7 @@ def coderabbit_run(run_, ev, head):
 
 
 def greptile(head, checks, issue, reviews, event_at, now=None):
-    runs = [c for c in checks if (c.get('app') or {}).get('slug') == 'greptile-apps' and c.get('name') == 'Greptile Review']
+    runs = [c for c in checks if (c.get('app') or {}).get('slug') == greptile_check.APP and c.get('name') == greptile_check.CHECK]
     r, unordered = latest_run(runs)
     if unordered:
         return record('greptile', 'unknown', unordered)
@@ -309,10 +308,10 @@ def greptile(head, checks, issue, reviews, event_at, now=None):
         return record('greptile', 'reviewed', 'check run completed with a review', ev, head)
     if r['status'] == 'completed' and r.get('conclusion') == 'neutral' and summary.startswith(GREPTILE_ERROR + '.'):
         return record('greptile', 'settled', 'check run reports an error', ev, head, 'failed')
-    below = (bool(GREPTILE_BELOW.search(title)), summary.startswith(GREPTILE_GATE))
-    if r['status'] == 'completed' and r.get('conclusion') == 'failure' and all(below):
+    below = greptile_check.threshold(r)
+    if r['status'] == 'completed' and below == 'complete':
         return below_threshold(head, r, title, reviews, ev, now or datetime.now(timezone.utc))
-    if r['status'] == 'completed' and r.get('conclusion') in FAILED_RUN and not any(below):
+    if r['status'] == 'completed' and r.get('conclusion') in FAILED_RUN and below is None:
         return record('greptile', 'settled', f"check run {r['conclusion']}", ev, head, 'failed')
     return record('greptile', 'unknown', f"check run {r['status']}/{r.get('conclusion')} with a summary this does not read", ev)
 

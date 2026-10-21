@@ -1751,7 +1751,7 @@ class Lock(unittest.TestCase):
                     pass
             except OSError as e:
                 raised.append(e.errno)
-        with mock.patch.object(ledger.msvcrt, 'locking', side_effect=OSError(errno.EBADF, 'bad file descriptor')):
+        with mock.patch.object(facts.msvcrt, 'locking', side_effect=OSError(errno.EBADF, 'bad file descriptor')):
             t = threading.Thread(target=take, daemon=True)
             t.start()
             t.join(5)

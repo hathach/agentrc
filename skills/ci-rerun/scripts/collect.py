@@ -106,7 +106,7 @@ title (else the summary's first line); no such run, runs it cannot order or an
 output with neither leaves the entry's `error`.
 
 A --gate (a red SonarCloud gate check, or Greptile's confidence check named
-GREPTILE_CHECK; failures needs a --check or a --gate,
+greptile.CHECK; failures needs a --check or a --gate,
 no link twice) is stale the same way, stays out of the detail file and is
 printed in `gates` (always present), one {link, failures} each: its
 sonarcloud.io link naming the project and the PR is read for the quality
@@ -116,8 +116,8 @@ failing condition of an ERROR gate that names its metric, value, comparator
 and threshold, or else one incomplete entry, its firstError saying why: the
 gate lists none, reads passing now, or could not be read. A Greptile check is
 its check run, read as a --check's is: one complete entry, its title, when the
-run is by GREPTILE_APP, concluded failure, and its title and summary are the
-below-threshold result (GREPTILE_BELOW, GREPTILE_GATE); else one incomplete
+run is by greptile.APP and is the below-threshold result whole (lib/greptile.py's
+threshold, which harvest.py shares); else one incomplete
 entry saying what was read. The PR head is read again after the gates too.
 
 remember: stores a judge's verdicts for the head beside its evidence, so a
@@ -155,6 +155,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import circleci  # noqa: E402
 import rtd  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import greptile  # noqa: E402
 import windows  # noqa: E402
 
 POLL = 30
@@ -182,11 +183,6 @@ NEVER_STARTED = 'GitHub Actions job cancelled before any step ran'
 COMPARATOR = {'GT': '>', 'LT': '<'}
 CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
 NO_RUN = 'no reader for this check: its link names no run'
-# Greptile's confidence check: harvest.py reads the same result as a review.
-GREPTILE_CHECK = 'Greptile Review'
-GREPTILE_APP = 'greptile-apps'
-GREPTILE_BELOW = re.compile(r'\bConfidence (\d+)/(\d+) \u2014 below your required (\d+)/(\d+)$')
-GREPTILE_GATE = "Greptile reviewed this pull request successfully \u2014 this check reflects your team's confidence threshold, not a review failure."
 
 
 STOP_FILE = None  # inventory --stop-file
@@ -896,9 +892,9 @@ def greptile_gate(repo, head, check):
         output = r.get('output') or {}
         title, summary = ((output.get(k) or '').strip() for k in ('title', 'summary'))
         app = (r.get('app') or {}).get('slug')
-        if app != GREPTILE_APP:
-            first = f'check run {r.get("id")} is by app {app!r}, not {GREPTILE_APP}'
-        elif r.get('conclusion') == 'failure' and GREPTILE_BELOW.search(title) and summary.startswith(GREPTILE_GATE):
+        if app != greptile.APP:
+            first = f'check run {r.get("id")} is by app {app!r}, not {greptile.APP}'
+        elif greptile.threshold(r) == 'complete':
             return {'link': check['link'], 'failures': [{'firstError': title, 'signature': signature(title), 'complete': True}]}
         else:
             first = f'check run {r.get("id")} {r.get("status")}/{r.get("conclusion")} is not a confidence threshold result: {title or summary[:200]!r}'
@@ -998,7 +994,7 @@ def failures(repo, pr, head, links, gates=()):
             entry['error'] = str(e)
         checks.append(entry)
     unread = prior_verdicts(repo, pr, head, checks)
-    read = [greptile_gate(repo, head, failing[link]) if failing[link]['name'] == GREPTILE_CHECK else gate(link, pr) for link in gates]
+    read = [greptile_gate(repo, head, failing[link]) if failing[link]['name'] == greptile.CHECK else gate(link, pr) for link in gates]
     out = {'head': head, 'baseRef': now['baseRef'], 'baseSha': now['baseSha'], **({'priorErrors': unread} if unread else {})}
     if any(c['error'] is None for c in checks):
         out['changed'], why = changed_paths(repo, pr)

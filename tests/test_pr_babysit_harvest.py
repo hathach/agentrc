@@ -160,11 +160,7 @@ class SettleRules(unittest.TestCase):
             with self.subTest(why):
                 self.assertEqual(self.read_below([run], [])['state'], 'unknown')
 
-    def test_the_threshold_result_reads_as_collect_py_reads_it(self):
-        spec_ = importlib.util.spec_from_file_location('ci_collect_for_harvest', SCRIPT.parents[2] / 'ci-rerun' / 'scripts' / 'collect.py')
-        collect = importlib.util.module_from_spec(spec_)
-        spec_.loader.exec_module(collect)
-        self.assertEqual((harvest.GREPTILE_BELOW.pattern, harvest.GREPTILE_GATE), (collect.GREPTILE_BELOW.pattern, collect.GREPTILE_GATE))
+    def test_the_wait_for_a_scored_review_is_the_workflows_review_cap(self):
         workflow_src = (SCRIPT.parents[3] / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
         self.assertIn(f'const REVIEW_CAP_MIN = {int(harvest.GREPTILE_REVIEW_WAIT.total_seconds() // 60)}\n', workflow_src)
 

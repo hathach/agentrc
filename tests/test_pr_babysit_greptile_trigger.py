@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / 'skills/pr-babysit/scripts'))
 spec = importlib.util.spec_from_file_location('greptile_trigger', ROOT / 'skills/pr-babysit/scripts/greptile_trigger.py')
 trigger = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(trigger)
+import facts  # noqa: E402
 import harvest  # noqa: E402  the script's GET helpers, which call facts.run through harvest
 
 HEAD = 'a' * 40
@@ -48,12 +49,9 @@ class Rig:
 
     def run(self, *argv, ok=(0,)):
         path = argv[-1]
-        if path == 'nameWithOwner':
-            return 0, json.dumps({'nameWithOwner': 'o/r'})
-        if path == 'headRefOid,headRefName,headRepository':
-            return 0, json.dumps({'headRefOid': self.head, 'headRefName': 'fix', 'headRepository': {'nameWithOwner': 'o/r'}})
         if path.endswith('/pulls/7'):
-            return 0, json.dumps({'state': self.state, 'head': {'sha': self.head}})
+            return 0, json.dumps({'state': self.state, 'base': {'repo': {'full_name': 'o/r'}},
+                                  'head': {'sha': self.head, 'ref': 'fix', 'repo': {'full_name': 'o/r'}}})
         if '/issues/comments/' in path:
             if self.readback is not None:
                 return self.readback(path)
@@ -192,7 +190,7 @@ class Trigger(unittest.TestCase):
                 self.assertEqual(rig.posts, [])
 
     def test_two_concurrent_runs_post_at_most_once(self):
-        if trigger.fcntl is None:
+        if facts.fcntl is None:
             self.skipTest('the concurrency check runs on POSIX')
         rig = Rig(pause=0.3)
         outs = []
