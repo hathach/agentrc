@@ -349,6 +349,14 @@ class Guard:
             return self.command(' '.join(args).translate(UNQUOTED), depth + 1)
         if cmd == 'find':
             self.find_exec(args, depth)
+        if cmd in ('git', 'gh'):
+            # bash expands a brace list into several words, which may hide an option this guard reads one word at a time;
+            # a `--` after a bare option may be its value (`grep -e --`), so options may go on past it
+            end = next((k for k, a in enumerate(args) if a == '--' and not (k and re.fullmatch(r'-[^=]*', args[k - 1]))),
+                       len(args))
+            if any(BRACES.search(a) for a in args[:end]):
+                raise Denied(f'`{cmd}` takes an unquoted brace list before `--`, which bash expands into words that may '
+                             'hide an option; quote it')
         if cmd == 'git':
             self.git(args)
         elif cmd == 'scalar':
