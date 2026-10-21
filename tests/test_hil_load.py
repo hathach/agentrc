@@ -148,14 +148,21 @@ class Load(unittest.TestCase):
         self.assertEqual(self.runs('a.py'), 1)
 
     def test_a_module_registered_from_the_path_under_another_name_is_reused(self):
-        p = self.counted('a.py')
-        own = importlib.util.spec_from_file_location(self.name('consumer'), p)
-        mine = importlib.util.module_from_spec(own)
-        sys.modules[own.name] = mine
-        own.loader.exec_module(mine)
-        self.assertIs(hl.load(self.name('a'), p), mine)
-        self.assertIs(sys.modules[self.name('a')], mine)
-        self.assertEqual(self.runs('a.py'), 1)
+        for case in ('the same path', 'a differently named symlink'):
+            with self.subTest(case=case):
+                n = len(self.names)
+                p = self.counted(f'real{n}.py')
+                registered = p
+                if case != 'the same path':
+                    registered = self.dir / f'different_name{n}.py'
+                    registered.symlink_to(p)
+                own = importlib.util.spec_from_file_location(self.name(f'consumer{n}'), registered)
+                mine = importlib.util.module_from_spec(own)
+                sys.modules[own.name] = mine
+                own.loader.exec_module(mine)
+                self.assertIs(hl.load(self.name(f'a{n}'), p), mine)
+                self.assertIs(sys.modules[self.name(f'a{n}')], mine)
+                self.assertEqual(self.runs(f'real{n}.py'), 1)
 
     def test_a_second_path_under_one_name_is_refused(self):
         one, two = self.counted('one/a.py'), self.counted('two/a.py')
@@ -177,25 +184,21 @@ class Load(unittest.TestCase):
         sys.modules[self.name('ctx')] = ns = types.SimpleNamespace(hl=hl, **kw)
         return ns
 
-    def test_a_module_loaded_under_a_differently_named_path_is_reused(self):
-        p = self.counted('real.py')
-        (self.dir / 'different_name.py').symlink_to(p)
-        own = importlib.util.spec_from_file_location(self.name('consumer'), self.dir / 'different_name.py')
-        mine = importlib.util.module_from_spec(own)
-        sys.modules[own.name] = mine
-        own.loader.exec_module(mine)
-        self.assertIs(hl.load(self.name('a'), p), mine)
-        self.assertEqual(self.runs('real.py'), 1)
-
-    def test_every_alias_of_a_failed_run_is_removed_and_a_retry_runs_again(self):
-        alias = self.name('alias')
-        p = self.write('bad.py', f'import sys\nsys.modules[{alias!r}] = sys.modules[__name__]\nraise RuntimeError("half run")\n')
-        with self.assertRaisesRegex(RuntimeError, 'half run'):
-            hl.load(self.name('bad'), p)
-        self.assertFalse(self.name('bad') in sys.modules)
-        self.assertFalse(alias in sys.modules)
-        p.write_text('DONE = True\n')
-        self.assertTrue(hl.load(alias, p).DONE)
+    def test_a_failed_or_interrupted_run_is_rolled_back_with_every_alias_and_a_retry_runs_again(self):
+        seen = 'import sys\nSEEN = __name__ in sys.modules\n'
+        for case, exc, aliased in (('a failure', RuntimeError, False), ('an interrupt', KeyboardInterrupt, False),
+                                   ('a secondary alias', RuntimeError, True)):
+            with self.subTest(case=case):
+                n = len(self.names)
+                name, alias = self.name(f'bad{n}'), self.name(f'alias{n}')
+                aliasing = f'sys.modules[{alias!r}] = sys.modules[__name__]\n' if aliased else ''
+                p = self.write(f'bad{n}.py', f'{seen}{aliasing}raise {exc.__name__}("half run")\n')
+                with self.assertRaisesRegex(exc, 'half run'):
+                    hl.load(name, p)
+                self.assertNotIn(name, sys.modules)
+                self.assertNotIn(alias, sys.modules)
+                p.write_text(seen)
+                self.assertTrue(hl.load(alias if aliased else name, p).SEEN, 'registered before it runs')
 
     def test_a_circular_load_is_refused_not_served_partial(self):
         self.ctx()
@@ -320,20 +323,6 @@ class Load(unittest.TestCase):
         if 'value' in out_b:
             self.assertTrue(out_b['value'].A_DONE, 'b got a partially initialized a')
         self.assertTrue('value' in out_a or 'value' in out_b, (out_a, out_b))
-
-    def test_a_failed_run_is_rolled_back_and_the_next_load_runs_again(self):
-        p = self.write('bad.py', 'import sys\nSEEN = __name__ in sys.modules\nraise RuntimeError("half run")\n')
-        with self.assertRaisesRegex(RuntimeError, 'half run'):
-            hl.load(self.name('bad'), p)
-        self.assertFalse(self.name('bad') in sys.modules)
-        p.write_text('import sys\nSEEN = __name__ in sys.modules\n')
-        self.assertTrue(hl.load(self.name('bad'), p).SEEN, 'registered before it runs')
-
-    def test_an_interrupted_run_is_rolled_back(self):
-        p = self.write('kb.py', 'raise KeyboardInterrupt\n')
-        with self.assertRaises(KeyboardInterrupt):
-            hl.load(self.name('kb'), p)
-        self.assertFalse(self.name('kb') in sys.modules)
 
     def test_a_missing_file_is_refused_naming_it(self):
         with self.assertRaises(ImportError) as cm:

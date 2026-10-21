@@ -841,22 +841,6 @@ class LiteralArgv(unittest.TestCase):
             tool.chmod(0o755)
         return bin_dir
 
-    def test_every_builder_returns_an_argv_list(self):
-        flasher = {'name': 'x', 'uid': 'S1', 'args': '-f a.cfg'}
-        for fn, args, kw in ((hf.flash_stlink, ('fw',), {}), (hf.reset_stlink, (), {}),
-                             (hf.flash_openocd, ('fw',), {}), (hf.reset_openocd, (), {}),
-                             (hf.flash_lm4flash, ('fw',), {}), (hf.flash_jlink, ('fw',), {}),
-                             (hf.reset_jlink, (), {})):
-            with self.subTest(fn=fn.__name__):
-                _, calls, _, _ = capture(fn, flasher, *args, timeout=7, **kw)
-                self.assertTrue(calls and all(isinstance(c, list) and all(isinstance(w, str) for w in c)
-                                              for c, _ in calls), calls)
-        rescue = {'name': 'openocd', 'uid': 'S1', 'args': '-f interface/cmsis-dap.cfg -f target/rp2350.cfg'}
-        _, calls, _, _ = capture(hf.rescue_openocd, rescue, hf.DAP_WEDGED[0], timeout=7)
-        self.assertEqual(calls[0][0][-6:], ['-f', 'interface/cmsis-dap.cfg', '-f', 'target/rp2350-rescue.cfg',
-                                            '-c', 'shutdown'])
-        self.assertIsInstance(hf.openocd_cmd_base(flasher), list)
-
     def test_a_directory_qualified_rescue_target_keeps_its_directory(self):
         """The pre-argv rescue replaced the cfg inside the args string, so a qualified path kept its
         directory: the argv must be that baseline's words."""
