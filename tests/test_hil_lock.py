@@ -24,7 +24,7 @@ import tempfile
 import threading
 import time
 import types
-from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
 
@@ -67,6 +67,51 @@ def quiet():
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         yield out, err
+
+
+def fork_child(body, timeout=10):
+    """The exit code of a forked child running body() (0 once it returns, 1 when it raises), or
+    None when it had to be killed past `timeout`."""
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            body()
+            code = 0
+        finally:
+            os._exit(code)
+    deadline = time.monotonic() + timeout
+    while not (done := os.waitpid(pid, os.WNOHANG))[0]:
+        if time.monotonic() > deadline:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            return None
+        time.sleep(0.05)
+    return os.waitstatus_to_exitcode(done[1])
+
+
+def make_receipt(test, state: Path, uid=None):
+    """A run_tracked receipt in `state`, a new dir of `uid` (default ours), whose supervisor still
+    holds its lock: `pending` until done()."""
+    state.mkdir(mode=0o700)
+    lock, record = state / 'hil_op_t.lock', state / 'hil_op_t.json'
+    fh = open(lock, 'w')
+    test.addCleanup(fh.close)
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    st = os.fstat(fh.fileno())
+    if uid is not None:
+        os.chown(state, uid, uid)
+        os.chown(lock, uid, uid)
+
+    def done():
+        fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump({'token': 't', 'lock': [st.st_dev, st.st_ino], 'cleanup': 'done'}, f)
+        if uid is not None:
+            os.chown(record, uid, uid)
+        fh.close()
+    return {'token': 't', 'supervisor': {'pid': 4242, 'start': '1', 'lock': [st.st_dev, st.st_ino]},
+            'lock': str(lock), 'record': str(record), 'log': str(state / 'hil_op_t.log'), 'survivors': None}, done
 
 
 class LockDir(unittest.TestCase):
@@ -524,14 +569,14 @@ class DetachedHolder(LockDir):
 
     def test_a_record_write_that_fails_in_the_holder_leaves_no_owned_record(self):
         other = BOARD + '-2'
-        real, calls = hil_lock.write_record, []
+        real, calls = hil_lock._write_record, []
 
-        def write_record(fh, reason, **extra):
+        def write_record(fh, *a):
             calls.append(fh)
             if len(calls) == 2:                 # the first record is written, the second fails
                 raise OSError('disk full')
-            real(fh, reason, **extra)
-        self.patch(hil_lock, 'write_record', write_record)     # inherited by the forked holder
+            real(fh, *a)
+        self.patch(hil_lock, '_write_record', write_record)     # inherited by the forked holder
         with quiet() as (_, err):
             self.assertEqual(hil_lock.cmd_hold([BOARD, other], 'selftest hold'), 1)
         self.assertIn('holder failed to acquire locks', err.getvalue())
@@ -927,20 +972,15 @@ class RecoveryBlockers(LockDir):
         self.assertIsNotNone(self.acquire())
 
 
-PRE_154 = '9e41f6fc89375df73d453c45e4c5a97103830fcd'   # hil_lock.py of helpers older than ACQUIRING; CI fetches it
+# The hil_lock.py of helpers older than ACQUIRING, byte-identical: skills/hil/scripts/hil_lock.py at
+# 9e41f6fc89375df73d453c45e4c5a97103830fcd.
+PRE_154 = Path(__file__).resolve().parent / 'data' / 'hil_lock_pre154.py'
 
 
 def load_pre154():
-    """The hil_lock.py installed consumers on older agentrc pins run. A clone without that commit
-    fails rather than skips the cross-version rows (CI's shallow checkout fetches it)."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_') or k.startswith('GIT_CONFIG')}
-    r = subprocess.run(['git', '-C', str(SCRIPT.parent), 'show', f'{PRE_154}:skills/hil/scripts/hil_lock.py'],
-                       capture_output=True, env=env)
-    if r.returncode:
-        raise AssertionError(f'pre-#154 hil_lock.py unreadable ({r.stderr.decode(errors="replace").strip()}): '
-                             f'git fetch --no-tags --depth=1 origin {PRE_154}')
+    """The hil_lock.py installed consumers on older agentrc pins run."""
     mod = types.ModuleType('agentrc_hil_lock_pre154')
-    exec(compile(r.stdout, f'hil_lock.py@{PRE_154[:7]}', 'exec'), mod.__dict__)
+    exec(compile(PRE_154.read_bytes(), str(PRE_154), 'exec'), mod.__dict__)
     return mod
 
 
@@ -1120,6 +1160,19 @@ class AcquisitionSentinel(LockDir):
             self.assertNotEqual(byte0, b'~', where)
             if status == 9 and k > 1:      # behind REWRITING: refused by both, as before #154
                 self.assertEqual(new, 'blocked', where)
+
+    def test_a_public_rewrite_never_writes_the_acquisition_sentinel(self):
+        def rewrite(m, arm):
+            fh = m.flock_nb(BOARD)
+            arm()
+            m.write_record(fh, 'selftest', acquiring=True, first='~')
+        self.prepare(self.DEAD)
+        self.assertEqual(self.run_child(rewrite, hil_lock, kill_at=2), 9)
+        self.assertEqual(self.lock_bytes()[:1], b'#')
+        self.prepare(self.DEAD)
+        self.assertEqual(self.run_child(rewrite, hil_lock), 0)
+        self.assertEqual({k: v for k, v in hil_lock.read_record(BOARD).items() if k in ('acquiring', 'first')},
+                         {'acquiring': True, 'first': '~'}, 'only fields of the record')
 
     def test_a_write_that_makes_no_progress_fails_instead_of_looping(self):
         def zero_at(n):
@@ -1393,22 +1446,7 @@ class HandOver(LockDir):
     OTHER = BOARD + '-2'
 
     def receipt(self):
-        """A run_tracked receipt whose supervisor still holds its lock: `pending` until done()."""
-        state = Path(self.dir, 'state')
-        state.mkdir(mode=0o700)
-        lock, record = state / 'hil_op_t.lock', state / 'hil_op_t.json'
-        fh = open(lock, 'w')
-        self.addCleanup(fh.close)
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        st = os.fstat(fh.fileno())
-
-        def done():
-            fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, 'w') as f:
-                json.dump({'token': 't', 'lock': [st.st_dev, st.st_ino], 'cleanup': 'done'}, f)
-            fh.close()
-        return {'token': 't', 'supervisor': {'pid': 4242, 'start': '1', 'lock': [st.st_dev, st.st_ino]},
-                'lock': str(lock), 'record': str(record), 'log': str(state / 'hil_op_t.log'), 'survivors': None}, done
+        return make_receipt(self, Path(self.dir, 'state'))
 
     def hand_over(self, receipts=(), boards=(BOARD,)):
         handles = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in boards}
@@ -1432,9 +1470,8 @@ class HandOver(LockDir):
         receipt, done = self.receipt()
         token, pid = self.hand_over([receipt], (BOARD, self.OTHER))
         rec = hil_lock.read_record(BOARD)
-        self.assertEqual((rec['role'], rec['protected'], rec['release_when'], rec['receipts'], rec['locks'],
-                          rec['holder']),
-                         ('cleanup-holder', True, 'receipts-done', [receipt], sorted([BOARD, self.OTHER]), 'selftest'))
+        self.assertEqual((rec['role'], rec['protected'], rec['receipts'], rec['locks'], rec['holder']),
+                         ('cleanup-holder', True, [receipt], sorted([BOARD, self.OTHER]), 'selftest'))
         self.assertNotEqual(pid, os.getpid())
         self.assertTrue(hil_lock._holds_flock(pid, hil_lock.lock_path(self.OTHER)))
         sent = self.signals()
@@ -1445,7 +1482,7 @@ class HandOver(LockDir):
         self.assertEqual(sent, [])
         # the holder's own recheck decides: a release that slips past the up-front check leaves it holding
         self.patch(hil_lock, 'RELEASE_WAIT', 0.5)
-        with mock.patch.object(hil_lock, '_release_blocker', lambda rec: ''):
+        with mock.patch.object(hil_lock, '_release_blocker', lambda *a: ''):
             with self.assertRaisesRegex(hil_lock.ReleaseRefused, f'signalled, but holder pid {pid} left its records'):
                 hil_lock.release_token(token)
         self.assertEqual((sent, hil_lock.read_record(BOARD)), ([signal.SIGUSR1], rec))
@@ -1490,6 +1527,41 @@ class HandOver(LockDir):
         with self.assertRaises(hil_lock.RecoveryBlocked):
             self.acquire()
 
+    def test_a_malformed_or_disagreeing_predicate_refuses_up_front(self):
+        token, pid = self.hand_over(boards=(BOARD, self.OTHER))
+        sent = self.signals()
+        recs = {b: hil_lock.read_record(b) for b in (BOARD, self.OTHER)}
+        for receipts, why in (('x', r"its receipts 'x' are not a list"), (None, 'its receipts None are not a list')):
+            for b, rec in recs.items():
+                Path(hil_lock.lock_path(b)).write_text(json.dumps({**rec, 'receipts': receipts}))
+            with self.assertRaisesRegex(hil_lock.ReleaseRefused, f'release predicate cannot be evaluated: {why}'):
+                hil_lock.release_token(token)
+        Path(hil_lock.lock_path(BOARD)).write_text(json.dumps(recs[BOARD]))
+        Path(hil_lock.lock_path(self.OTHER)).write_text(json.dumps({k: v for k, v in recs[self.OTHER].items()
+                                                                    if k != 'receipts'}))
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'its records disagree on their receipts'):
+            hil_lock.release_token(token)
+        self.assertEqual(sent, [])
+
+    def test_the_holder_reads_its_predicate_from_every_record_it_holds(self):
+        receipt, done = self.receipt()
+        done()
+        fhs = [hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in (BOARD, self.OTHER)]
+        for fh in fhs:
+            self.addCleanup(fh.close)
+
+        def records(*receipts):
+            for fh, r in zip(fhs, receipts):
+                hil_lock.write_record(fh, 'selftest run', **({} if r is None else {'receipts': r}))
+            return hil_lock._releasable(fhs)
+        self.assertTrue(records(None, None), 'no receipts: no predicate')
+        self.assertTrue(records([receipt], [receipt]))
+        self.assertFalse(records([receipt], []), 'records that disagree')
+        self.assertFalse(records([receipt], None), 'records that disagree')
+        self.assertFalse(records('x', 'x'), 'malformed receipts')
+        records(None, None)
+        os.pwrite(fhs[1].fileno(), b'#', 0)
+        self.assertFalse(hil_lock._releasable(fhs), 'an unreadable record')
 
     def test_unprotected_handles_are_refused_before_anything_changes(self):
         fhs = {BOARD: hil_lock.take_board_lock(BOARD, 'selftest run', protected=True),
@@ -1529,54 +1601,217 @@ class HandOver(LockDir):
                     Path(hil_lock.lock_path(b)).write_text('')     # the test's stand-in for the recovery
 
     def test_a_release_that_lands_on_another_thread_ends_the_hold(self):
-        pid = os.fork()
-        if pid == 0:
-            code = 1
-            try:
-                fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
-                r, _ = os.pipe()
-                reader = threading.Thread(target=os.read, args=(r, 1), daemon=True)   # SIGUSR1 unblocked there
-                reader.start()
-                wake = hil_lock.arm_release()
-                signal.pthread_kill(reader.ident, signal.SIGUSR1)     # before the holder waits
-                hil_lock.hold_until_released({BOARD: fh}, wake)
-                code = 0
-            finally:
-                os._exit(code)
-        deadline = time.monotonic() + 10
-        while not (done := os.waitpid(pid, os.WNOHANG))[0]:
-            if time.monotonic() > deadline:
-                os.kill(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
-                self.fail('the holder never ended')
-            time.sleep(0.05)
-        self.assertEqual(os.waitstatus_to_exitcode(done[1]), 0)     # -10: SIGUSR1's default action killed it
+        def holder():
+            fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
+            r, _ = os.pipe()
+            reader = threading.Thread(target=os.read, args=(r, 1), daemon=True)   # SIGUSR1 unblocked there
+            reader.start()
+            wake = hil_lock.arm_release()
+            signal.pthread_kill(reader.ident, signal.SIGUSR1)     # before the holder waits
+            hil_lock.wait_for_release(wake, [fh])
+            hil_lock.release_board_lock(fh)
+        # None: it never ended; -10: SIGUSR1's default action killed it
+        self.assertEqual(fork_child(holder), 0)
         self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
         self.assertIsNotNone(self.acquire())
 
-
     def test_a_release_ends_the_hold_of_a_holder_started_with_sigusr1_blocked(self):
+        def holder():
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})    # as a parent's mask leaves it
+            fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
+            wake = hil_lock.arm_release()
+            os.kill(os.getpid(), signal.SIGUSR1)
+            hil_lock.wait_for_release(wake, [fh])
+            hil_lock.release_board_lock(fh)
+        self.assertEqual(fork_child(holder), 0, 'the release stayed pending behind the inherited mask')
+        self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
+
+
+class RechecksAs(LockDir):
+    """_rechecks_as's child, here under our own ids: signalled and reaped only through its pidfd,
+    its fds never leaked, and the whole recheck bounded by RELEASE_WAIT."""
+
+    def setUp(self):
+        super().setUp()
+        self.ids = (os.geteuid(), os.getegid(), os.getgroups())
+        if os.geteuid() != 0:
+            self.patch(os, 'setgroups', lambda groups: None)    # needs CAP_SETGID even for our own groups
+        self.receipt, self.done = make_receipt(self, Path(self.dir, 'state'))
+        self.process = hil_lock._process()
+        self.kill = os.kill
+        self.patch(os, 'kill', lambda *a: self.fail('signalled by a bare pid'))
+
+    def test_the_child_rechecks_and_is_reaped_through_its_pidfd(self):
+        self.assertEqual(hil_lock._rechecks_as(self.ids, [self.receipt]), ['pending'])
+        self.done()
+        self.assertEqual(hil_lock._rechecks_as(self.ids, [self.receipt]), ['done'])
+
+    def test_an_ignored_sigchld_reaps_it_first(self):
+        real = self.process._Reports
+
+        class Slow(real):
+            def next(self, deadline):
+                msg = super().next(deadline)
+                _sleep(0.3)               # the kernel reaps the exited child meanwhile
+                return msg
+        self.patch(self.process, '_Reports', Slow)
+        old = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        self.addCleanup(signal.signal, signal.SIGCHLD, old)
+        self.done()
+        self.assertEqual(hil_lock._rechecks_as(self.ids, [self.receipt]), ['done'])
+
+    def test_a_fork_failure_leaks_no_descriptor(self):
+        def fork():
+            raise BlockingIOError(11, 'Resource temporarily unavailable')
+        self.patch(os, 'fork', fork)
+        before = sorted(os.listdir('/proc/self/fd'))
+        states = hil_lock._rechecks_as(self.ids, [self.receipt])
+        self.assertEqual(sorted(os.listdir('/proc/self/fd')), before)
+        self.assertRegex(states[0], r'^unknown \(not rechecked as uid \d+: BlockingIOError\(11')
+
+    def test_an_interrupt_after_a_close_closes_nothing_twice_and_still_reaps(self):
+        pipes, pids, me = [], [], os.getpid()
+        real_pipe, real_close, real_pidfd_open = os.pipe, os.close, os.pidfd_open
+        self.patch(os, 'pipe', lambda: (pipes.append(real_pipe()), pipes[-1])[1])
+        self.patch(os, 'pidfd_open', lambda pid, *a: (pids.append(pid), real_pidfd_open(pid, *a))[1])
+
+        def close(fd):
+            real_close(fd)
+            if os.getpid() == me and pipes and fd == pipes[0][1] and not hasattr(close, 'fired'):
+                close.fired = True        # right after the report writer is closed
+                raise KeyboardInterrupt
+        self.patch(os, 'close', close)
+        before = sorted(os.listdir('/proc/self/fd'))
+        with self.assertRaises(KeyboardInterrupt):
+            hil_lock._rechecks_as(self.ids, [self.receipt])
+        self.assertEqual(sorted(os.listdir('/proc/self/fd')), before)
+        with self.assertRaises(ChildProcessError):      # reaped through its pidfd
+            os.waitpid(pids[0], os.WNOHANG)
+
+    def test_a_child_that_never_exits_is_abandoned_within_the_bound(self):
+        pids, real = [], os.pidfd_open
+        self.patch(os, 'pidfd_open', lambda pid, *a: (pids.append(pid), real(pid, *a))[1])
+        self.patch(hil_lock, '_rechecks', lambda receipts: _sleep(60))           # in the child
+        self.patch(hil_lock.signal, 'pidfd_send_signal', lambda fd, sig: None)   # as a D-state wait ignores SIGKILL
+        self.patch(hil_lock, 'RELEASE_WAIT', 0.5)
+        t = time.monotonic()
+        states = hil_lock._rechecks_as(self.ids, [self.receipt])
+        self.assertLess(time.monotonic() - t, 2)
+        self.assertEqual(states, [f'unknown (the recheck child as uid {os.geteuid()} did not exit within 0.5s; '
+                                  f'abandoned)'])
+        self.assertEqual(len(pids), 1)
+        self.kill(pids[0], signal.SIGKILL)
+        os.waitpid(pids[0], 0)
+
+
+# Run as root by CrossUserRelease: release_token of argv[3] with hil_lock argv[1] over lock dir argv[2].
+RELEASE_AS_ROOT = r'''
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.BOARD_LOCK_DIR = sys.argv[2]
+try:
+    print(json.dumps(['released', m.release_token(sys.argv[3])]))
+except m.ReleaseRefused as e:
+    print(json.dumps(['refused', str(e)]))
+'''
+
+
+class CrossUserRelease(LockDir):
+    """Root releasing another user's receipt-backed cleanup holder rechecks the receipts as that
+    holder: hil_process.recheck trusts only files of the evaluating euid. Covers this helper's
+    holder and an older farm check's, whose record carries `receipts` and no other predicate
+    field. As root the holder is uid 65534; otherwise root is `sudo -n`, skipped without it."""
+
+    NOBODY = 65534
+
+    def setUp(self):
+        super().setUp()
+        if os.geteuid() == 0:
+            self.holder_uid = self.NOBODY
+        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
+            self.holder_uid = None
+        else:
+            self.skipTest('needs root, or sudo -n, to release as another OS user')
+        shared = tempfile.mkdtemp(prefix='hil-lock-release-', dir='/tmp')
+        self.addCleanup(shutil.rmtree, shared)
+        os.chmod(shared, 0o1777)              # root's _open_dir refuses another user's dir unless sticky
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        self.states = Path(shared if self.holder_uid else self.dir)
+        hil_lock._process()                   # loaded here: a holder dropped to 65534 may not read it
+
+    def start_holder(self, receipts, older):
+        """(token, pid) of a forked cleanup holder of BOARD as the holder uid; `older` handles
+        SIGUSR1 as hil_farm_check's own `--hold` did before hand_to_cleanup_holder."""
+        token = f'x1{int(older)}'
+        r, w = os.pipe()
         pid = os.fork()
         if pid == 0:
-            code = 1
             try:
-                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})    # as a parent's mask leaves it
-                fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
-                wake = hil_lock.arm_release()
-                os.kill(os.getpid(), signal.SIGUSR1)
-                hil_lock.hold_until_released({BOARD: fh}, wake)
-                code = 0
+                for fd in map(int, os.listdir('/proc/self/fd')):
+                    if fd > 2 and fd != w:        # a receipt's lock among them: its flock is the supervisor's
+                        with suppress(OSError):
+                            os.close(fd)
+                if self.holder_uid is not None:
+                    os.setgroups([])
+                    os.setresgid(self.holder_uid, self.holder_uid, self.holder_uid)
+                    os.setresuid(self.holder_uid, self.holder_uid, self.holder_uid)
+                wake = None if older else hil_lock.arm_release()
+                fh = hil_lock.take_board_lock(BOARD, 'farm_check', protected=True)
+
+                def bow_out(*_):
+                    if all(hil_lock._process().recheck(r) == 'done' for r in receipts):
+                        hil_lock.release_board_lock(fh)
+                        os._exit(0)
+                if older:
+                    signal.signal(signal.SIGUSR1, bow_out)
+                me = os.getpid()
+                hil_lock.write_record(fh, 'farm_check', protected=True, holder='hil_farm_check',
+                                      role=hil_lock.CLEANUP_ROLE, detail='d', receipts=receipts, pid=me,
+                                      start=hil_lock.proc_start(me), token=token, locks=[BOARD])
+                os.write(w, b'1')
+                if older:
+                    while True:
+                        signal.pause()
+                hil_lock.wait_for_release(wake, [fh])
+                hil_lock.release_board_lock(fh)
+                os._exit(0)
             finally:
-                os._exit(code)
-        deadline = time.monotonic() + 10
-        while not (done := os.waitpid(pid, os.WNOHANG))[0]:
-            if time.monotonic() > deadline:
-                os.kill(pid, signal.SIGKILL)
+                os._exit(1)
+        os.close(w)
+        def reap():
+            DetachedHolder.kill_quietly(pid, signal.SIGKILL)
+            with suppress(ChildProcessError):     # reaped by the test
                 os.waitpid(pid, 0)
-                self.fail('the release stayed pending behind the inherited mask')
-            time.sleep(0.05)
-        self.assertEqual(os.waitstatus_to_exitcode(done[1]), 0)
-        self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
+        self.addCleanup(reap)
+        with os.fdopen(r, 'rb') as f:
+            self.assertEqual(f.read(1), b'1')
+        return token, pid
+
+    def release_as_root(self, token) -> list:
+        if os.geteuid() == 0:
+            try:
+                return json.loads(json.dumps(['released', hil_lock.release_token(token)]))
+            except hil_lock.ReleaseRefused as e:
+                return ['refused', str(e)]
+        r = subprocess.run(['sudo', '-n', sys.executable, '-I', '-c', RELEASE_AS_ROOT, str(SCRIPT),
+                            hil_lock.BOARD_LOCK_DIR, token], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_root_rechecks_the_receipts_as_the_holder(self):
+        for older in (False, True):
+            with self.subTest(holder='older farm check' if older else 'hil_lock'):
+                receipt, done = make_receipt(self, self.states / f'state{int(older)}', self.holder_uid)
+                token, pid = self.start_holder([receipt], older)
+                verdict, why = self.release_as_root(token)
+                self.assertEqual(verdict, 'refused')
+                self.assertRegex(why, r'not proven ended: receipt t \(supervisor pid 4242\) pending$')
+                done()
+                self.assertEqual(self.release_as_root(token), ['released', [pid, [BOARD]]])
+                self.assertEqual(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]), 0)
+                self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
 
 
 class UnreadableRecords(LockDir):

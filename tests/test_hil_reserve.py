@@ -500,11 +500,11 @@ class Run(Fixture):
 
     def test_a_record_write_that_fails_halfway_refuses_and_clears_what_it_wrote(self):
         def patch(m):
-            def write_record(fh, reason, **extra):
+            def write_record(fh, *a):
                 fh.write(json.dumps({'pid': os.getpid(), 'reason': 'half'}))
                 fh.flush()
                 raise OSError('disk full')
-            m.hil_lock.write_record = write_record
+            m.hil_lock._write_record = write_record
         p = self.run_run(patch=patch)
         out = p.output()
         self.assertEqual((p.returncode, 'board lock unavailable: holder record: disk full' in out), (1, True), out)
@@ -759,7 +759,7 @@ class Run(Fixture):
         ppid = Path(f'/proc/{orphan}/stat').read_text().rpartition(')')[2].split()[1]
         self.assertEqual(int(ppid), p.pid)       # the holder is this process, still the subreaper
         self.assert_cleanup_holder(p, token)
-        self.assertNotIn('release_when', self.records()['raspberry_pi_pico2'])
+        self.assertNotIn('receipts', self.records()['raspberry_pi_pico2'])     # no release predicate
         rc, out = main('release', '--token', token)
         self.assertEqual(rc, 0, out)
         self.assertEqual(p.wait(), 1)

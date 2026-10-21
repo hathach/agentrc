@@ -410,7 +410,8 @@ class Reservation:
                       f'`hil_reserve.py release --token {self.token}`', file=stream, flush=True)
             except (OSError, ValueError):
                 pass
-        hil_lock.hold_until_released(dict(zip(self.locks, self.handles)), wake)
+        hil_lock.wait_for_release(wake, self.handles)
+        self.release()
         os._exit(1)
 
 

@@ -69,10 +69,13 @@ nothing in it through a link.
   as that user or root.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
   ends with `release_board_lock`, or hands its held locks to a cleanup holder
-  with `hand_to_cleanup_holder`; given the receipts of runs not proven ended,
-  that holder clears only once each rechecks `done`, and `release --token`
-  refuses up front naming the open receipt. `takeover_predecessor` reads the
-  record a takeover replaced. `release` never signals a protected record,
+  with `hand_to_cleanup_holder`, which loads `scripts/hil_process.py` from
+  beside the lock helper, so a consumer stages both; given the receipts of runs
+  not proven ended, that holder clears only once each rechecks `done`, and
+  `release --token` refuses up front naming the open receipt, rechecked as the
+  holder's OS user when root releases it. A cleanup holder of its own waits in
+  `wait_for_release` and then ends its hold itself. `takeover_predecessor`
+  reads the record a takeover replaced. `release` never signals a protected record,
   a cleanup holder or a runner reason (`hil_test.py`, `farm_check`, the legacy
   `pool_check`), and signals only `hil_lock.py hold`'s own holder, proven by
   its start time and its flock. A record from a helper older than the mark
@@ -165,7 +168,8 @@ recovery stay the contract's. Linux only.
   serial, exactly one match, and pinned before init; it is never convoy-safe.
   The caller hard-resets the chip out of its ROM loader first: one left there
   (esptool `--after no-reset`) faults the flash stub after `reset init`; the
-  provider waits `BOOT_SETTLE` (1 s) before starting openocd, so a caller's
+  provider resolves the USJ and starts openocd no earlier than `BOOT_SETTLE`
+  (1 s) after the call, its own admission counting toward it, so a caller's
   hard reset needs no wait of its own. A
   command whose log shows a failed target event hook (`Execution of event
   <name> failed:`), or cannot be read, fails although openocd answers success:

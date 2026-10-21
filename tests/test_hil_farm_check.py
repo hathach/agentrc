@@ -428,11 +428,12 @@ class Engine(unittest.TestCase):
 
     def test_settle_waits_only_while_a_receipt_can_still_answer(self):
         patch(self, eng, 'RECHECK_WAIT', 5)
-        ledger = [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}]
+        ctx = eng.Context(dict(BOARD), self.args, str(self.state), eng.new_row('b'))
+        ctx.ledger.append({'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None})
         t = time.monotonic()
-        eng._settle(types.SimpleNamespace(ledger=ledger, recheck_by=None))
+        self.assertEqual(ctx.open_runs(), [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}],
+                         'it stays unresolved')
         self.assertLess(time.monotonic() - t, 1, 'no receipt left to recheck, nothing to wait for')
-        self.assertEqual(ledger, [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}], 'it stays unresolved')
 
     def test_one_recheck_wait_per_reservation_and_time_never_clears_a_run(self):
         clock, answers = [100.0], []
@@ -441,16 +442,17 @@ class Engine(unittest.TestCase):
         patch(self, eng, 'RECHECK_WAIT', 5)
         patch(self, eng.hil_process, 'recheck', lambda r: answers.pop(0) if answers else 'pending')
         patch(self, eng.hil_process, 'tidy', lambda r: None)
-        ctx = types.SimpleNamespace(ledger=[{'cmd': 'flash', 'cleanup': 'pending', 'receipt': 'r1'}], recheck_by=None)
-        eng._settle(ctx)
+        ctx = eng.Context(dict(BOARD), self.args, str(self.state), eng.new_row('b'))
+        ctx.ledger.append({'cmd': 'flash', 'cleanup': 'pending', 'receipt': 'r1'})
+        ctx.open_runs()
         self.assertEqual(ctx.recheck_by, 105.0, 'the first open run starts the one wait')
         self.assertAlmostEqual(clock[0], 105.0, delta=0.15)
         waited = clock[0]
         self.assertEqual(ctx.ledger[0]['cleanup'], 'pending', 'time alone never clears it')
-        eng._settle(ctx)
+        ctx.open_runs()
         self.assertEqual(clock[0], waited, 'a later call rechecks once, without waiting')
         answers.append('done')
-        eng._settle(ctx)
+        self.assertEqual(ctx.open_runs(), [])
         self.assertEqual((ctx.ledger[0]['cleanup'], ctx.ledger[0]['receipt']), ('done', None), 'a late answer still counts')
 
     def test_settle_holds_in_process_board_io_until_every_run_is_proven_ended(self):
@@ -697,7 +699,7 @@ class Engine(unittest.TestCase):
         self.assertEqual((row['cleanup']['blocker'], row['cleanup']['token']), ('cleanup-holder', rec['token']))
         self.assertTrue(lk.is_cleanup_holder(rec))
         self.assertTrue(lk._holds_flock(rec['pid'], lk.lock_path('b')))
-        self.assertEqual(rec['release_when'], 'receipts-done')
+        self.assertTrue(rec['receipts'])         # its release predicate
         signals = []
         with mock.patch.object(lk.signal, 'pidfd_send_signal', lambda fd, sig: signals.append(sig)):
             # its receipt cannot be rechecked: unknown, refused up front naming it and the holder

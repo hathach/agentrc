@@ -29,9 +29,10 @@ holder (`role: cleanup-holder`, hil_lock.hand_to_cleanup_holder's fresh interpre
 the lock's descriptor) keeps the flock, and the row names its token. `hil_lock.py release
 --token` refuses, naming the open receipts, until every receipt it holds rechecks `done`;
 anything else is the contract's Recovery. Every other outcome, a failed handoff to the
-holder included, leaves the protected record on the free flock for a recovery takeover. A check killed outright leaves
-its protected record the same way and prints no report. SIGINT stops the check after the
-current board's cleanup; the report then says `termination: aborted`.
+holder included, leaves the protected record on the free flock for a recovery takeover. A
+check killed outright leaves its protected record the same way and prints no report.
+SIGINT stops the check after the current board's cleanup; the report then says
+`termination: aborted`.
 
 Profile (a module; `__file__` names it in the report, with its digest). Calls marked [lock]
 run inside the reservation and never take a lock; a process any of them starts goes through
@@ -227,9 +228,30 @@ class Context:
         self.recheck_by = None   # the reservation's one RECHECK_WAIT, set when a run is first found open
         self._recorded = []
 
+    def _recheck(self) -> None:
+        """Recheck every run not proven ended until all are, none left has a receipt to recheck,
+        or the reservation's one RECHECK_WAIT, counted from when a run was first found open,
+        passed: a later call rechecks once without waiting. A receipt proven done is removed,
+        nothing else is; time alone never clears a run."""
+        def rechecking():
+            return [e for e in self.ledger if e['cleanup'] != 'done' and e['receipt'] is not None]
+        while True:
+            for e in rechecking():
+                e['cleanup'] = hil_process.recheck(e['receipt'])
+                if e['cleanup'] == 'done':
+                    hil_process.tidy(e['receipt'])
+                    e['receipt'] = None
+            if not rechecking():
+                return
+            if self.recheck_by is None:
+                self.recheck_by = time.monotonic() + RECHECK_WAIT
+            if time.monotonic() >= self.recheck_by:
+                return
+            time.sleep(0.1)
+
     def open_runs(self) -> list:
         """The runs not proven ended, after rechecking them within the reservation's RECHECK_WAIT."""
-        _settle(self)
+        self._recheck()
         return [e for e in self.ledger if e['cleanup'] != 'done']
 
     def settle(self) -> None:
@@ -264,28 +286,6 @@ class Context:
 
 def _evidence(open_runs: list) -> str:
     return '; '.join(f'{e["cmd"]} ({e["cleanup"]})' for e in open_runs)
-
-
-def _settle(ctx: Context) -> None:
-    """Recheck every run not proven ended until all are, none left has a receipt to recheck, or
-    the reservation's one RECHECK_WAIT, counted from when a run was first found open, passed:
-    a later call rechecks once without waiting. A receipt proven done is removed, nothing else
-    is; time alone never clears a run."""
-    def rechecking():
-        return [e for e in ctx.ledger if e['cleanup'] != 'done' and e['receipt'] is not None]
-    while True:
-        for e in rechecking():
-            e['cleanup'] = hil_process.recheck(e['receipt'])
-            if e['cleanup'] == 'done':
-                hil_process.tidy(e['receipt'])
-                e['receipt'] = None
-        if not rechecking():
-            return
-        if ctx.recheck_by is None:
-            ctx.recheck_by = time.monotonic() + RECHECK_WAIT
-        if time.monotonic() >= ctx.recheck_by:
-            return
-        time.sleep(0.1)
 
 
 def operation_record(op, step: str) -> dict:
@@ -540,7 +540,7 @@ def _keep_blocked(row: dict, fh, why: str) -> None:
 
 
 def _finalize(fh, lock: str, ctx: Context, plan: dict, row: dict, final: dict) -> None:
-    _settle(ctx)
+    ctx._recheck()
     open_ops = [e for e in ctx.ledger if e['cleanup'] != 'done']
     receipts = [e['receipt'] for e in open_ops if e['receipt'] is not None]
     cleanup = {'postcondition': plan['final']['postcondition'], 'image': None, 'result': final['result'],
