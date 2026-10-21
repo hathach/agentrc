@@ -488,6 +488,9 @@ class SessionCase(unittest.TestCase):
         cleanup = mock.patch.object(oe, 'CLEANUP_TIMEOUT', 3)
         cleanup.start()
         self.addCleanup(cleanup.stop)
+        settle = mock.patch.object(oe, 'BOOT_SETTLE', 0)
+        settle.start()
+        self.addCleanup(settle.stop)
         self.addCleanup(self.reap)
         # a pending session's Popen is dropped with its server running, by design
         filters = mock.patch.object(warnings, 'filters', list(warnings.filters))
@@ -573,6 +576,20 @@ class SessionCase(unittest.TestCase):
 
 
 class Lifecycle(SessionCase):
+    def test_the_server_starts_boot_settle_after_the_call_outside_the_timeout(self):
+        started, real = [], oe.Session.start
+
+        def start(session, deadline):
+            started.append((time.monotonic(), deadline))
+            return real(session, deadline)
+        with mock.patch.object(oe, 'BOOT_SETTLE', 0.5), mock.patch.object(oe.Session, 'start', start):
+            t0 = time.monotonic()
+            op = self.session(lambda s: None, timeout=5)
+        (at, deadline), = started
+        self.assertGreaterEqual(at - t0, 0.5)
+        self.assertGreaterEqual(deadline - at, 4.9, 'the settle is not taken from the timeout')
+        self.assertEqual(op.returncode, 0)
+
     def test_success_is_init_the_work_then_reset_run_and_a_confirmed_shutdown(self):
         op = self.session(lambda s: s.check('esp foo'))
         self.assertEqual(self.tcl(), ['token?', 'init', 'esp foo', 'reset run', 'shutdown'])

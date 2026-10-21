@@ -90,6 +90,10 @@ USJ_VID_PID = ('303a', '1001')       # interface/esp_usb_jtag.cfg's `adapter usb
 USB_LOCATION_MAX = 15
 
 CLEANUP_TIMEOUT = 30                 # seconds for the reviewed end: reset run, shutdown, exit
+# seconds before the server starts. A workaround, not a silicon rule: on the htpc P4 rev v1.0 a session
+# whose init came within ms of another tool's hard reset failed every reset-assert-post hook, one ~150 ms
+# or more later passed (#160); the P4 TRM, errata and datasheets give no post-reset debug window.
+BOOT_SETTLE = 1.0
 # a GitHub Actions job sets these, and one set even to '' counts: the runner kills the processes
 # carrying the job's tracking id at job end (actions/runner v2.337.0 src/Runner.Worker/JobExtension.cs:586-592, 880-926)
 CI_JOB_ENV = ('RUNNER_TRACKING_ID', 'GITHUB_ACTIONS')
@@ -504,13 +508,15 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
     """Admit, resolve and start a session in a new directory under `workdir`, init it, run
     `work(session)` within `timeout` seconds, then end it as the module docstring says; `record`
     joins the operation's `session`. Refusals raise before anything starts; an exception after
-    the start carries `.operation`."""
+    the start carries `.operation`. The server starts BOOT_SETTLE seconds after the call, outside
+    `timeout`."""
     chip, cfgs = admit(flasher)
     workdir = _workdir(workdir)
     tool = find_openocd(openocd)
     check_cfgs(chip, cfgs, tool['scripts'])
     location = usj_location(flasher['uid'])
     out = tempfile.mkdtemp(prefix='hil_openocd_esp_', dir=workdir)
+    time.sleep(BOOT_SETTLE)
     port, token = esp_session.free_ports(1)[0], secrets.token_hex(8)
     s = Session(server_argv(tool, cfgs, location, flasher['uid'], tcl_port=port, token=token,
                             log=os.path.join(out, 'openocd.log')), out, port, token)

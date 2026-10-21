@@ -158,7 +158,9 @@ recovery stay the contract's. Linux only.
   target/<chip>.cfg` and nothing else. The USJ's bus-port is resolved by
   serial, exactly one match, and pinned before init; it is never convoy-safe.
   The caller hard-resets the chip out of its ROM loader first: one left there
-  (esptool `--after no-reset`) faults the flash stub after `reset init`. A
+  (esptool `--after no-reset`) faults the flash stub after `reset init`; the
+  provider waits `BOOT_SETTLE` (1 s) before starting openocd, so a caller's
+  hard reset needs no wait of its own. A
   command whose log shows a failed target event hook (`Execution of event
   <name> failed:`), or cannot be read, fails although openocd answers success:
   a flash writes nothing after three such `reset init`s, and such a `reset run`
