@@ -1280,6 +1280,38 @@ class Takeover(LockDir):
         self.assertEqual(hil_lock.journal_names(), [])
         self.assertIsNotNone(self.acquire())
 
+    def test_takeover_predecessor_names_the_original_holder_through_a_dead_takers_journal(self):
+        self.blocked()
+        _, handles = hil_lock.take_over(BOARD, 'selftest recovery')
+        first = self.journal(BOARD)
+        hil_lock._drop_flocks(handles)               # that taker died
+        token, handles = hil_lock.take_over(BOARD, 'selftest recovery again')
+        self.addCleanup(hil_lock.end_takeover, handles)
+        state, rec = hil_lock.takeover_predecessor(BOARD, token)
+        self.assertEqual((state, rec['reason'], rec['protected']), ('record', 'selftest run', True))
+        with self.assertRaisesRegex(LookupError, 'not the takeover of token'):
+            hil_lock.takeover_predecessor(BOARD, first['token'])
+        with self.assertRaisesRegex(LookupError, 'no takeover journal'):
+            hil_lock.takeover_predecessor(self.OTHER, token)
+
+    def test_takeover_predecessor_refuses_an_unreadable_chain(self):
+        path = os.path.join(self.dir, BOARD + hil_lock.JOURNAL)
+        for journal, why in (('{"tok', 'cannot be read'),
+                             (json.dumps({'token': 't', 'predecessor': '', 'prior': {}}), 'earlier takeover that cannot be read'),
+                             (json.dumps({'token': 't', 'predecessor': '', 'prior': 'x'}), 'earlier takeover that cannot be read'),
+                             (json.dumps({'token': 't', 'prior': None}), "of token 't' kept no predecessor"),
+                             (json.dumps({'token': 't', 'predecessor': '', 'prior': {'token': 'u'}}), "of token 'u' kept no predecessor"),
+                             *((json.dumps({'token': 't', 'predecessor': '', 'prior': {
+                                 **middle, 'prior': {'token': 'v', 'predecessor': '{"reason": "selftest run"}', 'prior': None}}}),
+                                rf"of token {middle.get('token')!r} kept no predecessor")
+                               for middle in ({'predecessor': ''}, {'token': 7, 'predecessor': ''}, {'token': 'u'}))):
+            with self.subTest(journal=journal):
+                Path(path).write_text(journal)
+                with self.assertRaisesRegex(LookupError, why):
+                    hil_lock.takeover_predecessor(BOARD, 't')
+        Path(path).write_text(json.dumps({'token': 't', 'predecessor': '#{"pid": 1', 'prior': None}))
+        self.assertEqual(hil_lock.takeover_predecessor(BOARD, 't'), ('unreadable', None))
+
     def test_another_users_journal_is_refused_naming_its_owner_before_anything_changes(self):
         self.blocked([BOARD, self.OTHER])
         _, handles = hil_lock.take_over(BOARD, 'selftest recovery')

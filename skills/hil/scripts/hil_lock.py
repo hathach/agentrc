@@ -259,6 +259,29 @@ def journal_state(board: str):
     return None if state == 'absent' else rec or {}
 
 
+def takeover_predecessor(board: str, token: str):
+    """(state, record), as record_state gives them, of what the takeover holding `board` under
+    `token` replaced: the oldest journal's predecessor, so a takeover of a dead taker names the
+    original holder. LookupError says why it cannot be told: no journal, `token` not at the
+    head of the chain, or a chain element that cannot be read."""
+    _check_name(board)
+    journal = journal_state(board)
+    if journal is None:
+        raise LookupError(f'{board} has no takeover journal')
+    if not journal or journal.get('token') != token:
+        raise LookupError(f'{board}{JOURNAL} is not the takeover of token {token}'
+                          f'{"" if journal else ": it cannot be read"}')
+    while True:
+        if not isinstance(journal.get('token'), str) or not isinstance(journal.get('predecessor'), str):
+            raise LookupError(f'{board}{JOURNAL}: the takeover of token {journal.get("token")!r} kept no predecessor')
+        prior = journal.get('prior')
+        if prior is None:
+            return _parse(journal['predecessor'].encode())
+        if not isinstance(prior, dict) or not prior:
+            raise LookupError(f'{board}{JOURNAL} names an earlier takeover that cannot be read')
+        journal = prior
+
+
 def is_cleanup_holder(info) -> bool:
     return isinstance(info, dict) and info.get('role') == CLEANUP_ROLE
 
