@@ -57,6 +57,7 @@ import shlex
 import secrets
 import select
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -65,7 +66,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/pyocd/run_pyocd.py',
-         'skills/hil/scripts/pyocd/user_script.py', 'skills/target-debug/scripts/esp_session.py')
+         'skills/hil/scripts/pyocd/user_script.py', 'skills/target-debug/scripts/esp_session.py',
+         'skills/hil/scripts/esptool_session.py')
+ESPTOOL_SESSION = os.path.join(HERE, 'esptool_session.py')   # read_security's child
 
 
 def _hil_load():
@@ -114,8 +117,9 @@ _CHIP = r'esp32[a-z0-9]*'
 
 
 def ci_refusal() -> str:
-    """Why a session is refused in this process, or '': flash and reset raise it before anything
-    starts, and a consumer checks it before its own preparatory sessions. `end` is not refused."""
+    """Why a session is refused in this process under a CI job, or '': part of refusal(), which
+    flash, reset and read_security raise before anything starts and a consumer checks before its
+    own preparatory sessions. `end` is not refused."""
     job = [v for v in CI_JOB_ENV if v in os.environ]
     if not job:
         return ''
@@ -123,8 +127,22 @@ def ci_refusal() -> str:
             f'processes at its end, and that the openocd server or a cleanup holder survives it is not established')
 
 
-def _refuse_ci():
+def refusal(*, retains_lock=False) -> str:
+    """Why an openocd_esp session, or board access preparing one (read_security, a consumer's own
+    esptool session), is refused in this process ('' when admitted): ci_refusal(), or a caller
+    that does not declare `retains_lock=True`, that it keeps the board lock through a session
+    left pending (hands it to a cleanup holder rather than release it). Deny by default: anything
+    but True refuses."""
     if why := ci_refusal():
+        return why
+    if retains_lock is not True:
+        return ('openocd_esp is refused to a caller that does not declare retains_lock=True: a session it leaves '
+                'running needs the board lock kept through its cleanup, which this caller has not undertaken')
+    return ''
+
+
+def _admit_session(retains_lock):
+    if why := refusal(retains_lock=retains_lock):
         raise RuntimeError(why)
 
 
@@ -236,17 +254,54 @@ def _usj_walk(serial: str) -> list:
     return found
 
 
+def _usj(serial: str) -> tuple:
+    """(busport, bus, dev) of the one USJ with `serial`, the same in two walks."""
+    first = _usj_walk(serial)
+    if _usj_walk(serial) != first:
+        raise RuntimeError(f'USJ serial {serial}: moved or re-enumerated during resolution ({first[0][0]})')
+    return first[0]
+
+
 def usj_location(serial: str) -> str:
     """The bus-port of the one USJ with `serial`, for `adapter usb location`; RuntimeError when
     it is missing, ambiguous, unidentifiable or changes between two walks. No serial-only
     fallback."""
-    first = _usj_walk(serial)
-    if _usj_walk(serial) != first:
-        raise RuntimeError(f'USJ serial {serial}: moved or re-enumerated during resolution ({first[0][0]})')
-    busport = first[0][0]
+    busport = _usj(serial)[0]
     if not usb_observe.BUSPORT_RE.fullmatch(busport) or len(busport) > USB_LOCATION_MAX:
         raise RuntimeError(f'USJ serial {serial}: bus-port {busport!r} is not a location openocd can match')
     return busport
+
+
+USBFS_ROOT, DEV_ROOT = '/dev/bus/usb', '/dev'
+
+
+def usj_node(serial: str) -> str:
+    """The usbfs node of the one USJ with `serial`, resolved as usj_location resolves it, such as
+    the node an earlier session's openocd may still hold open."""
+    _, bus, dev = _usj(serial)
+    return os.path.join(USBFS_ROOT, f'{bus:03d}', f'{dev:03d}')
+
+
+def usj_tty(serial: str) -> str:
+    """The serial device (ttyACM) of the one USJ with `serial`, found under that device's own
+    interfaces in sysfs, never a by-id name: exactly one tty, a character device, and the USJ at
+    the same bus-port and number after it was found. RuntimeError otherwise."""
+    found = _usj(serial)
+    busport = found[0]
+    ttys = sorted({os.path.basename(t) for t in glob.glob(os.path.join(usb_observe.SYS_USB_DEVICES,
+                                                                        glob.escape(busport) + ':*', 'tty', '*'))})
+    if len(ttys) != 1:
+        raise RuntimeError(f'USJ serial {serial} at {busport}: want one tty, found {ttys or "none"}')
+    tty = os.path.join(DEV_ROOT, ttys[0])
+    try:
+        is_chr = stat.S_ISCHR(os.stat(tty).st_mode)
+    except OSError as e:
+        raise RuntimeError(f'USJ serial {serial}: {tty}: {e}') from None
+    if not is_chr:
+        raise RuntimeError(f'USJ serial {serial}: {tty} is not a character device')
+    if _usj(serial) != found:
+        raise RuntimeError(f'USJ serial {serial}: re-enumerated while its tty was resolved ({busport})')
+    return tty
 
 
 def server_argv(tool: dict, cfgs: list, location: str, serial: str, *, tcl_port: int, token: str,
@@ -566,7 +621,7 @@ def _run(flasher: dict, work, *, workdir, timeout, openocd=None, record=None):
 # Programming
 # -------------------------------------------------------------
 SECTOR = 4096           # FLASH_SECTOR_SIZE of every esp32*.c flash driver
-_SEGMENT_KEYS = {'offset', 'file', 'size', 'encrypted'}
+_SEGMENT_KEYS = {'offset', 'file', 'size', 'encrypted', 'sha256'}
 
 
 def _int(v):
@@ -602,13 +657,16 @@ def admit_segments(segments) -> list:
     unaligned offset would be erased. Erase extents may not overlap. A length need not be a
     multiple of 4: verify_bank_hash skips the last length % 4 bytes (esp_flash.c:1726-1730),
     so the read-back covers them. `encrypted` may only be false: the writes run with `esp
-    encrypt_binary no` and write plaintext; any other key is an option this backend does not apply."""
+    encrypt_binary no` and write plaintext. An optional `sha256` (segments_from_flash_args',
+    or a caller's record) must be the admitted bytes' hash. Any other key is an option this
+    backend does not apply."""
     if not isinstance(segments, (list, tuple)) or not segments:
         raise ValueError('no segments')
     admitted, extents = [], []
     for seg in segments:
         if not isinstance(seg, dict) or not {'offset', 'file', 'size'} <= set(seg) <= _SEGMENT_KEYS:
-            raise ValueError(f'segment {seg!r}: want {{offset, file, size}} and nothing but `encrypted` false')
+            raise ValueError(f'segment {seg!r}: want {{offset, file, size}} and nothing but `encrypted` false '
+                             f'and `sha256`')
         if seg.get('encrypted', False) not in (False, 'false'):
             raise ValueError(f'segment {seg!r}: encrypted writes are refused (the writes are plaintext here)')
         offset, size = seg['offset'], seg['size']
@@ -626,6 +684,9 @@ def admit_segments(segments) -> list:
             raise ValueError(f'segment file {path}: {e}') from None
         if len(data) != size:
             raise ValueError(f'segment file {path}: {len(data)} bytes, the segment says {size}')
+        digest = hashlib.sha256(data).hexdigest()
+        if 'sha256' in seg and seg['sha256'] != digest:
+            raise ValueError(f'segment file {path}: sha256 {digest}, the segment says {seg["sha256"]!r}')
         kind = _loaded_as(data[:9])
         if kind:
             raise ValueError(f'segment file {path}: openocd would load it as {kind}, at its own addresses; '
@@ -633,7 +694,7 @@ def admit_segments(segments) -> list:
         end = -(-(offset + size) // SECTOR) * SECTOR
         extents.append((offset, end, path))
         admitted.append(({'offset': offset, 'file': path, 'size': size, 'erase': [offset, end],
-                          'sha256': hashlib.sha256(data).hexdigest()}, data))
+                          'sha256': digest}, data))
     extents.sort()
     for (_, a_end, a), (b_start, _, b) in zip(extents, extents[1:]):
         if b_start < a_end:
@@ -655,6 +716,154 @@ def admit_security(security) -> dict:
         raise ValueError(f'security evidence {security!r}: want {{flashEncryption: "off", secureBoot: "off", '
                          f'source: <where it was read>}}; programming is refused otherwise')
     return dict(security)
+
+
+# Chips whose eFuse fields the reader relies on were checked in their TRM: SPI_BOOT_CRYPT_CNT
+# EFUSE_RD_REPEAT_DATA1_REG[20:18] (odd count of 1s: encryption on) and SECURE_BOOT_EN
+# EFUSE_RD_REPEAT_DATA2_REG[20] (1: on), which esptool reads (targets/*.py). ESP32-P4: book 4889
+# (v1.3 TRM) p485/p487 and book 6567 (v3.x TRM v0.7) p943-945; ESP32-S3: book 4890 (TRM v1.8)
+# p433-434. Not ESP32-S31: its TRM v0.1 (book 6558) has no eFuse chapter yet, and esptool 5.2.0
+# and 5.3.1 read different bits there.
+SECURITY_CHIPS = ('esp32p4', 'esp32s3')
+ESP_BAUD = 921600
+
+
+def security_evidence(result, *, chip: str, source: str) -> dict:
+    """admit_security's evidence from esptool_session.py's `security` op `result`, read on the
+    ROM loader of `chip`: `flags` and `flashCryptCnt` of the ROM's GET_SECURITY_INFO (esptool
+    loader.py: flags bit 0 SECURE_BOOT_EN, the count SPI_BOOT_CRYPT_CNT), the session's own
+    reading of them as `rom`, and esptool's eFuse register reading as `efuse`. Off only when
+    the count is 0 and bit 0 clear; on only when the count has an odd number of 1s or bit 0 is
+    set; each as the eFuse reading says. ValueError for anything else: a chip not in
+    SECURITY_CHIPS, a missing or malformed field, a nonzero even count (the ESP32-S3 TRM's
+    XTS-AES chapter reads 3 as on, its eFuse chapter as off), or sources that disagree. This
+    returns evidence only: whether a flash may follow is admit_security's."""
+    if chip not in SECURITY_CHIPS:
+        raise ValueError(f'{chip}: no checked eFuse layout for its security state (SECURITY_CHIPS)')
+    try:
+        flags, count, rom, efuse = result['flags'], result['flashCryptCnt'], result['rom'], result['efuse']
+        well_formed = (result.get('op') == 'security' and _int(flags) and 0 <= flags < 1 << 32 and _int(count)
+                       and 0 <= count < 8 and all(isinstance(d, dict) and set(d) == {'flashEncryption', 'secureBoot'}
+                                                  for d in (rom, efuse)))
+    except (TypeError, KeyError, AttributeError):
+        well_formed = False
+    if not well_formed:
+        raise ValueError(f'security evidence {result!r}: not an esptool_session security result')
+    if count and not bin(count).count('1') % 2:
+        raise ValueError(f'SPI_BOOT_CRYPT_CNT {count:#x}: neither off (0) nor an odd count; the sources disagree')
+    read = {'flashEncryption': 'on' if count else 'off', 'secureBoot': 'on' if flags & 1 else 'off'}
+    for name, value in read.items():
+        if rom[name] != value or efuse[name] != value:
+            raise ValueError(f'{name}: GET_SECURITY_INFO reads {value}, the session read {rom[name]!r} from it '
+                             f'and {efuse[name]!r} from the eFuse registers; contradictory evidence')
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError('security evidence needs its source')
+    return {**read, 'source': f'{source}: GET_SECURITY_INFO flags {flags:#010x}, SPI_BOOT_CRYPT_CNT {count:#x}; '
+                              f'eFuse flash encryption {efuse["flashEncryption"]}, secure boot {efuse["secureBoot"]}'}
+
+
+def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=False, esptool: str = 'esptool',
+                  run=None, baud: int = ESP_BAUD):
+    """Read the security state of the chip behind the USJ with `serial` before an openocd_esp
+    flash: one esptool_session.py child, under the interpreter of `esptool` (hil_flash
+    tool_python), on usj_tty(serial), that reads GET_SECURITY_INFO and the eFuses on the ROM
+    loader, then hard-resets the chip out of it, run through `run` (hil_flash's). Refused, before
+    any board access, as `refusal(retains_lock=)` refuses and for a chip not in SECURITY_CHIPS.
+    Returns hil_flash's Operation of the child with `security`, security_evidence's dict; a
+    failed child or evidence that is unknown or contradictory raises, carrying `.operation`."""
+    _admit_session(retains_lock)
+    if chip not in SECURITY_CHIPS:
+        raise ValueError(f'{chip}: no checked eFuse layout for its security state (SECURITY_CHIPS)')
+    tty, python = usj_tty(serial), hil_flash.tool_python(esptool)
+    with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
+        ops = os.path.join(td, 'ops.json')
+        with open(ops, 'w') as f:
+            json.dump([{'op': 'security'}], f)
+        argv = [python, '-B', ESPTOOL_SESSION, '--port', tty, '--chip', chip, '--baud', str(baud),
+                '--after', 'hard-reset', ops]
+        op = hil_flash._once(run, argv, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
+    try:
+        lines = hil_process.cmd_stdout_text(op.stdout).strip().splitlines()
+        try:
+            out = json.loads(lines[-1]) if lines else None
+        except ValueError:
+            out = None
+        if op.returncode != 0 or not isinstance(out, dict) or out.get('ok') is not True:
+            raise RuntimeError(f'esptool_session on {tty} (rc {op.returncode}): '
+                               f'{(out or {}).get("error") if isinstance(out, dict) else "no result line"}')
+        result = (out.get('results') or [None])[0]
+        op.security = security_evidence(result, chip=chip,
+                                        source=f'esptool {out.get("esptool")} on {tty}, USJ {serial}, ROM loader')
+    except (ValueError, RuntimeError) as e:
+        e.operation = op
+        raise
+    return op
+
+
+# flash_args options esptool applies to an image header as it writes; any other (--encrypt...) is refused
+_HEADER_OPTIONS = {f'--flash{sep}{key}' for sep in '-_' for key in ('mode', 'freq', 'size')}
+
+
+def segments_from_flash_args(build_dir, chip: str, *, timeout, flash_args: str | None = None, run=None,
+                             esptool: str = 'esptool') -> list:
+    """The ordered {offset, file, size, sha256} segments esptool's write_flash would write from
+    an ESP-IDF build's flash_args (`flash_args`, the file's text a caller already checked, else
+    read from `build_dir`), for flash_openocd_esp. `chip` must be the build's IDF_TARGET
+    (config.env). openocd writes each file as it is, while esptool rewrites an image header to
+    the options' flash mode, frequency and size: `esptool merge-bin` with the same options, run
+    through `run` (hil_flash's), must reproduce every file's bytes at its offset, or the build
+    is refused. The sha256 binds those checked bytes to what flash_openocd_esp admits."""
+    build = os.path.abspath(build_dir)
+    try:
+        with open(os.path.join(build, 'config.env')) as f:
+            target = json.load(f).get('IDF_TARGET')
+        text = flash_args if flash_args is not None else open(os.path.join(build, 'flash_args')).read()
+    except (OSError, ValueError, AttributeError) as e:
+        raise ValueError(f'{build}: {e}') from None
+    if target != chip:
+        raise ValueError(f'{build} is built for {target!r}, not {chip!r}')
+    tokens, options = shlex.split(text), []
+    while tokens and tokens[0].startswith('-'):
+        opt = tokens.pop(0)
+        if opt.split('=', 1)[0] not in _HEADER_OPTIONS:
+            raise ValueError(f'flash_args option {opt} is not one openocd_esp applies')
+        if '=' not in opt:
+            if not tokens:
+                raise ValueError(f'flash_args option {opt} has no value')
+            opt = f'{opt}={tokens.pop(0)}'
+        options.append(opt)
+    if not tokens or len(tokens) % 2:
+        raise ValueError(f'{build} flash_args: want "<offset> <file>" pairs after the options')
+    segments, files = [], []
+    for offset, name in zip(tokens[::2], tokens[1::2]):
+        path = os.path.join(build, name)
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+            segments.append({'offset': int(offset, 0), 'file': path, 'size': len(data),
+                             'sha256': hashlib.sha256(data).hexdigest()})
+        except (OSError, ValueError) as e:
+            raise ValueError(f'{build} flash_args {offset} {name}: {e}') from None
+        files.append(data)
+    with tempfile.TemporaryDirectory(prefix='hil_merge_') as td:
+        merged = os.path.join(td, 'merged.bin')
+        argv = hil_flash.esptool_argv(esptool, '--chip', chip, 'merge-bin', '-o', merged, *options,
+                                      *(x for seg in segments for x in (hex(seg['offset']), seg['file'])))
+        op = hil_flash._once(run, argv, cwd=build, env=dict(hil_flash.ESPTOOL_ENV), timeout=timeout)
+        try:
+            with open(merged, 'rb') as f:
+                image = f.read()     # raw, from offset 0 (merge-bin's default --target-offset)
+        except OSError:
+            image = None
+    if op.returncode != 0 or image is None:
+        e = RuntimeError(f'esptool merge-bin exited {op.returncode}: what write_flash would write is not known')
+        e.operation = op
+        raise e
+    for seg, data in zip(segments, files):
+        if image[seg['offset']:seg['offset'] + seg['size']] != data:
+            raise ValueError(f"esptool would rewrite {seg['file']} at 0x{seg['offset']:x} (its header differs from "
+                             f"the flash_args settings); openocd_esp programs files as they are")
+    return segments
 
 
 _BANK_RE = re.compile(r'name\s+\{([^}]*)\}\s+driver\s+(\S+)\s+base\s+(0x[0-9a-fA-F]+)\s+size\s+(0x[0-9a-fA-F]+)')
@@ -720,14 +929,16 @@ def _program(s, rec):
     program['ok'] = program['verified'] = True
 
 
-def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, openocd=None):
+def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, openocd=None, retains_lock=False):
     """Program `segments` in order, each verified, stopping at the first failure, then read every
     segment back with `flash read_bank` and compare it byte for byte with the bytes admitted. One
     managed session (module docstring) within `timeout` seconds, files in a new directory under
     `workdir`. The chip must not sit in its ROM loader (the `hil` skill's Flashers).
 
     `security` is the caller's evidence that flash encryption and secure boot are off
-    (admit_security), required and recorded as `session['security']`.
+    (admit_security, such as read_security's), required and recorded as `session['security']`.
+    `retains_lock=True` is the caller's declaration that it keeps the board lock through a
+    session left pending; without it the flash is refused (refusal).
 
     Nothing is written without a `reset init` whose event hooks all passed, within
     RESET_INIT_ATTEMPTS (_reset_init), nor a segment whose erased sectors leave bank 0; no reset
@@ -736,7 +947,7 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     (the session's copy of the admitted bytes, the file programmed), `program` once attempted
     (_program) and `readBack` (file, length, match, firstMismatch). Refusals raise ValueError
     or RuntimeError before anything starts."""
-    _refuse_ci()
+    _admit_session(retains_lock)
     security = admit_security(security)
     admitted = admit_segments(segments)
     records = [rec for rec, _ in admitted]
@@ -792,14 +1003,14 @@ def flash_openocd_esp(flasher: dict, segments, *, security, workdir, timeout, op
     return op
 
 
-def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
+def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None, retains_lock=False):
     """Reset and run the chip through a managed session: init within `timeout` seconds, then the
     reviewed end, `reset run` and a confirmed shutdown within CLEANUP_TIMEOUT. init examines the
     cores, which panics a running app built with the end-of-stack watchpoint; the reset run
     that follows reboots it. An init or a reset run that failed, a failed event hook included,
-    leaves the session pending instead.
+    leaves the session pending instead. Refused without `retains_lock=True` (refusal).
     Returns hil_flash's Operation, as flash_openocd_esp without `segments`."""
-    _refuse_ci()
+    _admit_session(retains_lock)
     return _run(flasher, lambda s: None, workdir=workdir, timeout=timeout, openocd=openocd)
 
 
@@ -809,6 +1020,39 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None):
 END_TIMEOUT = 60
 _RECEIPT_KEYS = ('pid', 'startTime', 'argv', 'ports', 'token', 'log', 'closed', 'init', 'submitted')
 NEEDS_RECOVERY = 'the board stays held and needs a separately reviewed recovery'
+
+
+def session_state(receipt) -> str:
+    """The state of the session a receipt names (its path, or the record itself when the provider
+    could not write it), reread on every call, for lock retention: 'ended' (closed after the
+    reviewed end), 'unresolved' (closed without it, or its process gone), 'running' (a process
+    with the receipt's pid and start time, a zombie included, or one whose /proc entry could not
+    be read) or 'unreadable' (no well-formed receipt). Liveness by pid and start time only, never
+    the argv: whether `end` may address the server is esp_session.same_process's (argv and start
+    time), which a 'running' session need not satisfy."""
+    rec = receipt
+    if not isinstance(rec, dict):
+        try:
+            with open(receipt) as f:
+                rec = json.load(f)
+        except (OSError, ValueError, TypeError):
+            return 'unreadable'
+    try:
+        closed, pid, start = rec['closed'], rec['pid'], rec['startTime']
+        if not isinstance(closed, bool) or not _int(pid) or pid <= 0 or not str(start).isdigit():
+            return 'unreadable'
+    except (KeyError, TypeError):
+        return 'unreadable'
+    if closed:
+        return 'ended' if rec.get('cleanup') == 'done' else 'unresolved'
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            fields = f.read().rsplit(')', 1)[1].split()
+    except (FileNotFoundError, ProcessLookupError):
+        return 'unresolved'
+    except OSError:
+        return 'running'
+    return 'running' if len(fields) > 19 and fields[19] == str(start) else 'unresolved'
 
 
 def _exited(pidfd, deadline) -> bool:

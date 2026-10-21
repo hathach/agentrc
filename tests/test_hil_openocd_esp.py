@@ -940,7 +940,8 @@ class Programming(SessionCase):
         security = kw.pop('security', SECURITY)
         return self.run_op(lambda timeout: oe.flash_openocd_esp(BOARD, self.segs if segs is None else segs,
                                                                  security=security, workdir=str(self.work),
-                                                                 timeout=timeout, openocd=str(self.exe)),
+                                                                 timeout=timeout, openocd=str(self.exe),
+                                                                 retains_lock=True),
                            **env, **kw)
 
     SETUP = ['target names', 'esp32p4.hp.cpu0 cget -work-area-backup', 'esp32p4.hp.cpu0 configure -work-area-backup 0',
@@ -1022,7 +1023,8 @@ class Programming(SessionCase):
 
     def test_no_flash_without_security_evidence(self):
         with self.assertRaises(TypeError):
-            oe.flash_openocd_esp(BOARD, self.segs, workdir=str(self.work), timeout=5, openocd=str(self.exe))
+            oe.flash_openocd_esp(BOARD, self.segs, workdir=str(self.work), timeout=5, openocd=str(self.exe),
+                                 retains_lock=True)
         for security in (None, {}, {**SECURITY, 'flashEncryption': 'on'}, {**SECURITY, 'secureBoot': 'on'},
                          {**SECURITY, 'secureBoot': False}, {**SECURITY, 'flashEncryption': 'unknown'},
                          {**SECURITY, 'source': ''}, {k: v for k, v in SECURITY.items() if k != 'source'},
@@ -1166,9 +1168,12 @@ class CiJob(SessionCase):
         version = mock.patch.object(oe.subprocess, 'run', side_effect=AssertionError('ran'))
         for var in oe.CI_JOB_ENV:
             for value in ('true', ''):
-                for name, op in (('flash', lambda: oe.flash_openocd_esp(BOARD, [], security=None,
+                for name, op in (('flash', lambda: oe.flash_openocd_esp(BOARD, [], security=None, retains_lock=True,
                                                                          workdir=str(self.work), timeout=5)),
-                                 ('reset', lambda: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5))):
+                                 ('reset', lambda: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5,
+                                                                        retains_lock=True)),
+                                 ('security', lambda: oe.read_security(SERIAL, chip='esp32p4', retains_lock=True,
+                                                                       workdir=str(self.work), timeout=5))):
                     with self.subTest(var=var, value=value, op=name), mock.patch.dict(os.environ, {var: value}), \
                             spawn, version, self.assertRaisesRegex(RuntimeError, rf'under a CI job \({var} set\)'):
                         op()
@@ -1178,7 +1183,7 @@ class CiJob(SessionCase):
 class Reset(SessionCase):
     def reset(self, **kw):
         return self.run_op(lambda timeout: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=timeout,
-                                                                 openocd=str(self.exe)), **kw)
+                                                                 openocd=str(self.exe), retains_lock=True), **kw)
 
     def test_init_then_reset_run_and_a_confirmed_shutdown(self):
         op = self.reset()
@@ -1535,3 +1540,373 @@ class Segments(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RetainedLock(SessionCase):
+    """Deny by default: no openocd_esp session, and no board access preparing one, runs for a
+    caller that does not declare it keeps the board lock through a pending cleanup."""
+
+    def test_every_entry_point_refuses_an_undeclared_caller_before_any_access(self):
+        never = {'side_effect': AssertionError('touched')}
+        guards = [mock.patch.object(oe.subprocess, 'Popen', **never), mock.patch.object(oe.subprocess, 'run', **never),
+                  mock.patch.object(oe, 'usj_tty', **never), mock.patch.object(oe, '_usj_walk', **never),
+                  mock.patch.object(oe.hil_flash, 'tool_python', **never),
+                  mock.patch.object(oe.hil_flash, '_once', **never)]
+        for g in guards:
+            g.start()
+            self.addCleanup(g.stop)
+        ops = {'flash': lambda **kw: oe.flash_openocd_esp(BOARD, [], security=SECURITY, workdir=str(self.work),
+                                                           timeout=5, **kw),
+               'reset': lambda **kw: oe.reset_openocd_esp(BOARD, workdir=str(self.work), timeout=5, **kw),
+               'security': lambda **kw: oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=5,
+                                                         **kw)}
+        for name, op in ops.items():
+            for kw in ({}, {'retains_lock': False}, {'retains_lock': 'yes'}, {'retains_lock': 1},
+                       {'retains_lock': None}):
+                with self.subTest(op=name, kw=kw), self.assertRaisesRegex(RuntimeError, 'retains_lock=True'):
+                    op(**kw)
+        self.assertEqual((self.events(), list(self.work.iterdir())), ([], []))
+
+    def test_refusal_is_the_check_a_consumer_makes_before_its_own_sessions(self):
+        self.assertIn('retains_lock=True', oe.refusal())
+        self.assertEqual(oe.refusal(retains_lock=True), '')
+        with mock.patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}):
+            self.assertIn('under a CI job', oe.refusal(retains_lock=True))
+
+
+class SessionState(unittest.TestCase):
+    """session_state: liveness by pid and start time, for keeping a board locked; never the
+    identity `end` needs to address the server."""
+
+    def setUp(self):
+        self.d = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.p = subprocess.Popen(['sleep', '60'])
+        self.addCleanup(self.p.wait)
+        self.addCleanup(self.p.kill)
+        self.rec = {'pid': self.p.pid, 'startTime': oe.esp_session.start_time(self.p.pid),
+                    'argv': ['openocd', '-l', 'x'],
+                    'ports': [None, None, 1], 'token': 't', 'log': str(self.d / 'log'), 'closed': False,
+                    'tool': 'hil_openocd_esp', 'init': 'ok', 'submitted': 1}
+
+    def write(self, rec):
+        path = self.d / 'receipt.json'
+        path.write_text(json.dumps(rec))
+        return str(path)
+
+    def test_closed_receipts(self):
+        self.assertEqual(oe.session_state({**self.rec, 'closed': True, 'cleanup': 'done'}), 'ended')
+        for cleanup in ('unknown', 'pending', None):
+            self.assertEqual(oe.session_state(self.write({**self.rec, 'closed': True, 'cleanup': cleanup})),
+                             'unresolved')
+
+    def test_a_live_pid_with_its_start_time_runs_whatever_its_argv(self):
+        self.assertEqual(oe.session_state(self.rec), 'running')
+        self.assertEqual(oe.session_state(self.write(self.rec)), 'running')
+        self.assertEqual(oe.session_state({**self.rec, 'startTime': int(self.rec['startTime'])}), 'running')
+        # liveness says running, yet the process is not the server the receipt names: end must not address it
+        self.assertFalse(oe.esp_session.same_process(self.rec))
+        rc, result = oe.end_session(self.write(self.rec), timeout=2)
+        self.assertEqual((rc, result['outcome']), (1, 'refused'))
+        self.assertIn('not the openocd this receipt names', result['error'])
+        self.assertIsNone(self.p.poll(), 'never signalled')
+
+    def test_a_reused_pid_or_a_gone_process_is_unresolved(self):
+        self.assertEqual(oe.session_state({**self.rec, 'startTime': str(int(self.rec['startTime']) + 1)}),
+                         'unresolved')
+        self.p.kill()
+        self.p.wait()
+        self.assertEqual(oe.session_state(self.rec), 'unresolved')
+
+    def test_an_unreadable_proc_entry_is_not_ruled_out(self):
+        real = open
+
+        def guarded(path, *a, **kw):
+            if str(path) == f'/proc/{self.p.pid}/stat':
+                raise PermissionError(13, 'Permission denied', str(path))
+            return real(path, *a, **kw)
+        with mock.patch.object(oe, 'open', guarded, create=True):
+            self.assertEqual(oe.session_state(self.rec), 'running')
+
+    def test_a_receipt_that_is_not_well_formed_is_unreadable(self):
+        bad = self.d / 'bad.json'
+        bad.write_text('{')
+        for receipt in (str(self.d / 'none.json'), str(bad), None, {**self.rec, 'pid': 'x'},
+                        {**self.rec, 'pid': True}, {**self.rec, 'pid': 0}, {**self.rec, 'closed': 'no'},
+                        {**self.rec, 'startTime': None}, {k: v for k, v in self.rec.items() if k != 'pid'}, []):
+            with self.subTest(receipt=receipt):
+                self.assertEqual(oe.session_state(receipt), 'unreadable')
+
+
+class UsjTtyNode(unittest.TestCase):
+    def setUp(self):
+        self.bus = FakeBus(self)
+        self.dev = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        p = mock.patch.object(oe, 'DEV_ROOT', str(self.dev))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def tty(self, busport, name, iface='1.0', node=True):
+        d = self.bus.sys / f'{busport}:{iface}' / 'tty' / name
+        d.mkdir(parents=True)
+        if node:
+            (self.dev / name).symlink_to(os.devnull)    # a character device
+
+    def test_the_node_and_the_tty_of_the_one_usj(self):
+        self.bus.add('5-3.4')
+        self.bus.add('5-3.1', 'AA:BB:CC:DD:EE:FF', dev=9)
+        self.tty('5-3.4', 'ttyACM3')
+        self.tty('5-3.1', 'ttyACM1')
+        self.assertEqual(oe.usj_node(SERIAL), '/dev/bus/usb/005/014')
+        self.assertEqual(oe.usj_tty(SERIAL), str(self.dev / 'ttyACM3'))
+
+    def test_a_missing_or_ambiguous_usj_is_refused(self):
+        self.bus.add('5-3.4')
+        self.bus.add('3-1', bus=3, dev=2)
+        for fn in (oe.usj_tty, oe.usj_node):
+            with self.subTest(fn=fn.__name__), self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+                fn(SERIAL)
+            with self.subTest(fn=fn.__name__), self.assertRaisesRegex(RuntimeError, 'no 303a:1001'):
+                fn('AA:BB:CC:DD:EE:FF')
+
+    def test_no_tty_two_ttys_or_no_device_node_is_refused(self):
+        self.bus.add('5-3.4')
+        with self.assertRaisesRegex(RuntimeError, 'want one tty, found none'):
+            oe.usj_tty(SERIAL)
+        self.tty('5-3.4', 'ttyACM3', node=False)
+        with self.assertRaisesRegex(RuntimeError, 'ttyACM3'):
+            oe.usj_tty(SERIAL)
+        (self.dev / 'ttyACM3').write_text('')
+        with self.assertRaisesRegex(RuntimeError, 'not a character device'):
+            oe.usj_tty(SERIAL)
+        self.tty('5-3.4', 'ttyACM4', iface='1.2')
+        with self.assertRaisesRegex(RuntimeError, r"want one tty, found \['ttyACM3', 'ttyACM4'\]"):
+            oe.usj_tty(SERIAL)
+
+    def test_a_usj_that_re_enumerates_while_its_tty_is_found_is_refused(self):
+        self.bus.add('5-3.4')
+        self.tty('5-3.4', 'ttyACM3')
+        walks = iter([[('5-3.4', 5, 14)], [('5-3.4', 5, 14)], [('5-3.4', 5, 15)], [('5-3.4', 5, 15)]])
+        with mock.patch.object(oe, '_usj_walk', lambda serial: next(walks)), \
+                self.assertRaisesRegex(RuntimeError, 're-enumerated while its tty was resolved'):
+            oe.usj_tty(SERIAL)
+
+
+OFF = {'flashEncryption': 'off', 'secureBoot': 'off'}
+
+
+def sec(flags=0, count=0, rom=None, efuse=None, **kw):
+    return {'op': 'security', 'flags': flags, 'flashCryptCnt': count, 'rom': dict(rom or OFF),
+            'efuse': dict(efuse or OFF), **kw}
+
+
+class SecurityEvidence(unittest.TestCase):
+    """The one reader: evidence only, refused when unknown or contradictory; admit_security
+    alone decides that a flash may follow."""
+
+    def test_off_from_every_source_is_admitted(self):
+        for chip in ('esp32p4', 'esp32s3'):
+            ev = oe.security_evidence(sec(flags=0x40), chip=chip, source='esptool 5.3.1 on /dev/ttyACM3')
+            self.assertEqual({k: ev[k] for k in OFF}, OFF)
+            self.assertIn('GET_SECURITY_INFO flags 0x00000040, SPI_BOOT_CRYPT_CNT 0x0', ev['source'])
+            self.assertEqual(oe.admit_security(ev), ev)
+
+    def test_enabled_evidence_is_returned_and_programming_refused(self):
+        on = {'flashEncryption': 'on', 'secureBoot': 'off'}
+        for count in (1, 7, 4):
+            ev = oe.security_evidence(sec(count=count, rom=on, efuse=on), chip='esp32p4', source='s')
+            self.assertEqual(ev['flashEncryption'], 'on')
+            with self.assertRaisesRegex(ValueError, 'programming is refused'):
+                oe.admit_security(ev)
+        sb = {'flashEncryption': 'off', 'secureBoot': 'on'}
+        ev = oe.security_evidence(sec(flags=1, rom=sb, efuse=sb), chip='esp32s3', source='s')
+        self.assertEqual(ev['secureBoot'], 'on')
+        with self.assertRaisesRegex(ValueError, 'programming is refused'):
+            oe.admit_security(ev)
+
+    def test_contradictory_evidence_is_refused(self):
+        on = {'flashEncryption': 'on', 'secureBoot': 'off'}
+        for result in (sec(count=1), sec(count=1, rom=on), sec(count=1, efuse=on), sec(efuse=on), sec(rom=on),
+                       sec(flags=1), sec(flags=1, rom={'flashEncryption': 'off', 'secureBoot': 'on'}),
+                       sec(count=3, rom=on, efuse=on), sec(count=3), sec(count=5, rom=on, efuse=on), sec(count=6)):
+            with self.subTest(result=result), self.assertRaisesRegex(ValueError, 'contradictory|disagree'):
+                oe.security_evidence(result, chip='esp32p4', source='s')
+
+    def test_unknown_evidence_is_refused(self):
+        for chip in ('esp32s31', 'esp32', 'esp32c3', ''):
+            with self.subTest(chip=chip), self.assertRaisesRegex(ValueError, 'no checked eFuse layout'):
+                oe.security_evidence(sec(), chip=chip, source='s')
+        for result in (None, {}, [], sec(op='md5'), sec(flags='0'), sec(flags=True), sec(flags=-1), sec(flags=1 << 32),
+                       sec(count=8), sec(count=None), {**sec(), 'rom': None}, {**sec(), 'efuse': {'secureBoot': 'off'}},
+                       {**sec(), 'rom': {**OFF, 'extra': 'off'}}, {k: v for k, v in sec().items() if k != 'efuse'},
+                       sec(rom={'flashEncryption': 'unknown', 'secureBoot': 'off'})):
+            with self.subTest(result=result), self.assertRaises(ValueError):
+                oe.security_evidence(result, chip='esp32p4', source='s')
+        with self.assertRaisesRegex(ValueError, 'source'):
+            oe.security_evidence(sec(), chip='esp32p4', source=' ')
+
+
+class ReadSecurity(unittest.TestCase):
+    def setUp(self):
+        self.work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        for target, value in (('usj_tty', lambda serial: '/dev/ttyACM3'),):
+            p = mock.patch.object(oe, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(oe.hil_flash, 'tool_python', lambda tool: f'/py-of-{tool}')
+        p.start()
+        self.addCleanup(p.stop)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for var in oe.CI_JOB_ENV:
+            os.environ.pop(var, None)
+
+    def read(self, stdout, rc=0, chip='esp32p4', **kw):
+        seen = []
+
+        def run(argv, **k):
+            seen.append((argv, k, json.loads(Path(argv[-1]).read_text())))
+            return subprocess.CompletedProcess(argv, rc, stdout, None)
+        try:
+            return oe.read_security(SERIAL, chip=chip, workdir=str(self.work), timeout=30, retains_lock=True,
+                                    esptool='esptool-5.3.1', run=run, **kw), seen
+        finally:
+            self.assertEqual(list(self.work.iterdir()), [])
+
+    def line(self, result, ok=True):
+        return 'Connecting...\n' + json.dumps({'ok': ok, 'esptool': '5.3.1', 'results': [result], 'error': 'E'}) + '\n'
+
+    def test_one_session_child_reads_and_hard_resets(self):
+        op, seen = self.read(self.line(sec()))
+        (argv, kw, ops), = seen
+        self.assertEqual(argv[:-1], ['/py-of-esptool-5.3.1', '-B', oe.ESPTOOL_SESSION, '--port', '/dev/ttyACM3',
+                                     '--chip', 'esp32p4', '--baud', '921600', '--after', 'hard-reset'])
+        self.assertEqual((kw, ops), ({'env': {'NO_COLOR': '1'}, 'timeout': 30}, [{'op': 'security'}]))
+        self.assertEqual({k: op.security[k] for k in OFF}, OFF)
+        self.assertIn(f'esptool 5.3.1 on /dev/ttyACM3, USJ {SERIAL}', op.security['source'])
+        self.assertEqual(oe.admit_security(op.security), op.security)
+
+    def test_a_failed_child_or_unusable_evidence_raises_with_the_operation(self):
+        on = {'flashEncryption': 'on', 'secureBoot': 'off'}
+        for stdout, rc, exc in ((self.line(sec()), 1, RuntimeError), (self.line(sec(), ok=False), 0, RuntimeError),
+                                ('no json\n', 0, RuntimeError), ('', 124, RuntimeError),
+                                (self.line(sec(count=1)), 0, ValueError), (self.line(sec(efuse=on)), 0, ValueError),
+                                (self.line(None), 0, ValueError)):
+            with self.subTest(stdout=stdout, rc=rc), self.assertRaises(exc) as cm:
+                self.read(stdout, rc=rc)
+            self.assertEqual(cm.exception.operation.returncode, rc)
+
+    def test_an_unchecked_chip_is_refused_before_any_access(self):
+        with mock.patch.object(oe, 'usj_tty', side_effect=AssertionError('touched')), \
+                self.assertRaisesRegex(ValueError, 'no checked eFuse layout'):
+            self.read(self.line(sec()), chip='esp32s31')
+
+
+FAKE_ESPTOOL = r'''#!{python}
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ['FAKE_ESPTOOL_LOG'], 'a') as f:
+    f.write(json.dumps({'argv': args, 'cwd': os.getcwd(), 'NO_COLOR': os.environ.get('NO_COLOR')}) + '\n')
+if os.environ.get('FAKE_ESPTOOL_RC'):
+    sys.exit(int(os.environ['FAKE_ESPTOOL_RC']))
+out = args[args.index('-o') + 1]
+rest = [a for a in args[args.index('-o') + 2:] if not a.startswith('--')]
+image = bytearray()
+for off, name in zip(rest[::2], rest[1::2]):
+    data = bytearray(open(name, 'rb').read())
+    if os.environ.get('FAKE_REWRITE') == off:
+        data[3] ^= 0xFF       # the header byte write_flash would set from --flash-size/--flash-freq
+    image += b'\xff' * (int(off, 0) - len(image))
+    image[int(off, 0):] = data
+open(out, 'wb').write(image)
+'''
+
+
+class SegmentsFromFlashArgs(unittest.TestCase):
+    """The merge-bin no-rewrite guard: esptool's own merge of the build's flash_args must leave
+    every file's bytes unchanged, since openocd writes them as they are."""
+    FLASH_ARGS = '--flash_mode dio --flash_freq 80m --flash_size 4MB\n0x2000 bootloader/bootloader.bin\n' \
+                 '0x8000 partition_table/partition-table.bin\n0x10000 app.bin\n'
+
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.build, self.log = root / 'build', root / 'esptool.jsonl'
+        for rel, data in (('bootloader/bootloader.bin', b'\xe9\x03\x02\x20' + b'\x01' * 60),
+                          ('partition_table/partition-table.bin', b'\xaa\x50' * 16), ('app.bin', b'\xe9\x05' * 300)):
+            (self.build / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.build / rel).write_bytes(data)
+        (self.build / 'flash_args').write_text(self.FLASH_ARGS)
+        (self.build / 'config.env').write_text(json.dumps({'IDF_TARGET': 'esp32p4'}))
+        self.esptool = root / 'fake esptool'
+        self.esptool.write_text(FAKE_ESPTOOL.replace('{python}', sys.executable))
+        self.esptool.chmod(0o755)
+        env = mock.patch.dict(os.environ, {'FAKE_ESPTOOL_LOG': str(self.log)})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop('FAKE_REWRITE', None)
+        os.environ.pop('FAKE_ESPTOOL_RC', None)
+
+    def segments(self, chip='esp32p4', **kw):
+        return oe.segments_from_flash_args(str(self.build), chip, timeout=30, esptool=str(self.esptool), **kw)
+
+    def calls(self):
+        return [json.loads(x) for x in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def test_the_build_s_segments_in_order_with_their_hashes(self):
+        segs = self.segments()
+        files = ['bootloader/bootloader.bin', 'partition_table/partition-table.bin', 'app.bin']
+        self.assertEqual([(s['offset'], s['file'], s['size'], s['sha256']) for s in segs],
+                         [(o, str(self.build / f), (self.build / f).stat().st_size,
+                           hashlib.sha256((self.build / f).read_bytes()).hexdigest())
+                          for o, f in zip((0x2000, 0x8000, 0x10000), files)])
+        (call,) = self.calls()
+        self.assertEqual(call['argv'][:4], ['--chip', 'esp32p4', 'merge-bin', '-o'])
+        self.assertEqual(call['argv'][5:], ['--flash_mode=dio', '--flash_freq=80m', '--flash_size=4MB',
+                                            '0x2000', str(self.build / files[0]), '0x8000', str(self.build / files[1]),
+                                            '0x10000', str(self.build / files[2])])
+        self.assertEqual((call['cwd'], call['NO_COLOR']), (str(self.build), '1'))
+        self.assertEqual(len(oe.admit_segments(segs)), 3)
+
+    def test_a_header_esptool_would_rewrite_is_refused(self):
+        for off in ('0x2000', '0x10000'):
+            with self.subTest(off=off), mock.patch.dict(os.environ, {'FAKE_REWRITE': off}), \
+                    self.assertRaisesRegex(ValueError, f'esptool would rewrite .* at {off}'):
+                self.segments()
+
+    def test_a_file_changed_after_the_guard_is_not_admitted(self):
+        segs = self.segments()
+        (self.build / 'app.bin').write_bytes(b'\xe9\x06' * 300)
+        with self.assertRaisesRegex(ValueError, 'sha256'):
+            oe.admit_segments(segs)
+
+    def test_a_failed_merge_is_refused_with_its_operation(self):
+        with mock.patch.dict(os.environ, {'FAKE_ESPTOOL_RC': '2'}), \
+                self.assertRaisesRegex(RuntimeError, 'merge-bin exited 2') as cm:
+            self.segments()
+        self.assertEqual(cm.exception.operation.returncode, 2)
+
+    def test_inputs_are_refused_before_esptool_runs(self):
+        for flash_args, chip, why in (
+                ('--encrypt 0x10000 app.bin', 'esp32p4', 'not one openocd_esp applies'),
+                ('--flash_mode', 'esp32p4', 'has no value'), ('--flash_mode dio', 'esp32p4', 'pairs'),
+                ('0x10000 app.bin 0x20000', 'esp32p4', 'pairs'), ('zero app.bin', 'esp32p4', 'zero'),
+                ('0x10000 gone.bin', 'esp32p4', 'gone.bin'), ('0x10000 "app.bin', 'esp32p4', 'quotation'),
+                (self.FLASH_ARGS, 'esp32s3', "built for 'esp32p4', not 'esp32s3'")):
+            with self.subTest(flash_args=flash_args, chip=chip), self.assertRaisesRegex(ValueError, why):
+                self.segments(chip=chip, flash_args=flash_args)
+        (self.build / 'config.env').unlink()
+        with self.assertRaisesRegex(ValueError, 'config.env'):
+            self.segments()
+        self.assertEqual(self.calls(), [])
+
+    def test_the_callers_checked_text_is_used_not_the_file(self):
+        (self.build / 'flash_args').write_text('--encrypt 0x10000 app.bin\n')
+        segs = self.segments(flash_args='0x10000 app.bin')
+        self.assertEqual([s['offset'] for s in segs], [0x10000])
+
+    def test_names_with_spaces_and_metacharacters_stay_literal(self):
+        odd = 'app $(touch PWNED);*.bin'
+        (self.build / odd).write_bytes(b'\x01' * 8)
+        segs = self.segments(flash_args=f"0x10000 '{odd}'")
+        self.assertEqual(segs[0]['file'], str(self.build / odd))
+        self.assertNotIn('PWNED', os.listdir(self.build))

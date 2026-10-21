@@ -207,21 +207,39 @@ recovery stay the contract's. Linux only.
   a flash writes nothing after three such `reset init`s, and such a `reset run`
   leaves the session pending.
   A flash takes the caller's ordered segments (sector-aligned offset, raw
-  binary file, size), programs each with verify, stops at the first failure
-  and reads every segment back byte for byte. It also requires `security`, the
-  caller's evidence read from the chip before programming (for tinyuf2, with
-  esptool over the same USJ's serial port):
-  `{"flashEncryption": "off", "secureBoot": "off", "source": <where it was
-  read>}`. Without it, or with either feature not `off`, the flash is refused
-  before anything starts; the provider never infers or defaults the chip's
-  security state, and records the evidence in the operation. Each operation is
+  binary file, size, optionally its `sha256`, which the admitted bytes must
+  match), programs each with verify, stops at the first failure and reads
+  every segment back byte for byte. `segments_from_flash_args(build_dir, chip,
+  timeout=)` gives them from an ESP-IDF build's `flash_args` (or the
+  caller's already-checked text, `flash_args=`), refusing an option other than
+  flash mode, frequency and size, a build whose `config.env` names another
+  chip, and any file `esptool merge-bin` with the same options would rewrite.
+  A flash also requires `security`, the caller's evidence read from the chip
+  before programming: `{"flashEncryption": "off", "secureBoot": "off",
+  "source": <where it was read>}`. Without it, or with either feature not
+  `off`, the flash is refused before anything starts; the provider never
+  infers or defaults the chip's security state, and records the evidence in
+  the operation. The one reader is `security_evidence(result, chip=,
+  source=)`, over the result of `scripts/esptool_session.py`'s `security` op
+  (the ROM's GET_SECURITY_INFO and the eFuse registers, which must agree), or
+  `read_security(serial, chip=, workdir=, timeout=, retains_lock=True)`, which
+  runs that op alone on the USJ's tty and hard-resets the chip; unknown or
+  contradictory evidence, or a chip outside `SECURITY_CHIPS` (ESP32-P4,
+  ESP32-S3), is refused. `usj_tty(serial)` and `usj_node(serial)` give the
+  USJ's serial device and usbfs node, resolved as its bus-port is.
+  Flash, reset and `read_security` run only for a caller that passes
+  `retains_lock=True`, declaring it keeps the board lock through a session
+  left pending; anything else is refused before any access, and a consumer
+  calls `refusal(retains_lock=True)` before its own preparatory sessions.
+  `session_state(receipt)` is a session's state for lock retention (`ended`,
+  `running`, `unresolved`, `unreadable`) by pid and start time alone; it never
+  says `end` may address the server. Each operation is
   one session that is never killed: after a command that returned, `reset run`
   and a confirmed shutdown end it; an init failure, a command outstanding at
   the timeout or interrupt, or a failed reset or shutdown leaves cleanup
   `pending` with the session's receipt, for the caller's cleanup holder, and no
   retry, restore or test may overlap it. Under a CI job (`RUNNER_TRACKING_ID`
-  or `GITHUB_ACTIONS` set) flash and reset are refused, and a consumer calls
-  `ci_refusal()` before its own preparatory sessions; `end` stays available.
+  or `GITHUB_ACTIONS` set) `refusal()` refuses too; `end` stays available.
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
   deadline and never signalling it. It refuses on any doubt: the session (or
