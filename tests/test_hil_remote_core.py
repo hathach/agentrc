@@ -932,8 +932,10 @@ class Drift(unittest.TestCase):
         self.assertIn('git rev-parse HEAD', e.exception.code)
 
     def test_a_hooks_git_environment_neither_redirects_nor_reconfigures_it(self):
-        other = Path(tempfile.mkdtemp(dir=self.root.parent))
-        self.addCleanup(shutil.rmtree, other)
+        # TemporaryDirectory, not mkdtemp+rmtree: its cleanup clears git's read-only objects on Windows
+        tmp = tempfile.TemporaryDirectory(dir=self.root.parent)
+        self.addCleanup(tmp.cleanup)
+        other = Path(tmp.name)
         subprocess.run(['git', '-C', str(other), 'init', '-q'], check=True)
         (other / 'a').write_text('a')
         subprocess.run(['git', '-C', str(other), 'add', 'a'], check=True)
