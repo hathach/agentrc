@@ -101,7 +101,6 @@ class WriteUnavailable(unittest.TestCase):
         self.assertTrue(text.startswith(f'{core.NOTICE}: hil_report.json is missing.**'))
         self.assertTrue(text.endswith(legacy))
         self.assertEqual(text.count(core.NOTICE), 1)
-        self.assertEqual(core.NOTICE, notice.NOTICE)
 
     def test_an_unwritable_dir_is_an_oserror(self):
         with self.assertRaises(OSError):

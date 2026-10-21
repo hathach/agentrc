@@ -95,14 +95,13 @@ def _compose(head: str, old: bytes | None) -> bytes:
     return md.encode('utf-8', errors='backslashreplace')
 
 
-def _write_notice(md: Path, head: str) -> bytes:
+def _write_notice(md: Path, head: str) -> None:
     """write_unavailable under the writer lock its caller holds: the notice composed over the
-    current `md`, replaced only when it differs. Returns the notice."""
+    current `md`, replaced only when it differs."""
     old = _read_bytes(md)
     data = _compose(head, old)
     if old != data:
         _replace_one(md, data)
-    return data
 
 
 def _read_bytes(path: Path) -> bytes | None:

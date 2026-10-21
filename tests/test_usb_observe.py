@@ -395,6 +395,12 @@ class UsbScan(unittest.TestCase):
                          [('1-1', 5), ('1-2', None)])
         self.assertEqual(self.reads, [])
 
+    def test_an_unfiltered_walk_skips_a_device_without_both_ids(self):
+        self.dev('1-1', 'cafe', '4010')
+        self.dev('1-2', 'cafe', '')
+        (self.dev('1-3', 'cafe', '4010') / 'idVendor').unlink()
+        self.assertEqual([d['busport'] for d in uo.usb_devices()], ['1-1'])
+
     def test_root_hubs_interfaces_and_serialless_devices_are_left_out(self):
         self.dev('usb1', '1d6b', '0002', serial='0000:00:14.0')
         self.dev('1-1', 'cafe', '4010', serial='UID1')

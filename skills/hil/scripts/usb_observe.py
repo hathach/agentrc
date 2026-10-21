@@ -206,15 +206,11 @@ def usb_devices(vid_pid=None, vid=None) -> list:
         if ':' in os.path.basename(d):
             continue
         ino = enumeration_id(d)       # before the attributes, so a later change shows
-        try:
-            with open(os.path.join(d, 'idVendor')) as f:
-                dev_vid = f.read().strip()
-            with open(os.path.join(d, 'idProduct')) as f:
-                dev_pid = f.read().strip()
-        except OSError:
-            continue          # vanished mid-walk, or not a device dir: a fact, not unknown
         if ino is None:
             continue
+        dev_vid, dev_pid = _free_attr(d, 'idVendor'), _free_attr(d, 'idProduct')
+        if dev_vid is None or dev_pid is None:
+            continue          # vanished mid-walk, or not a device dir: a fact, not unknown
         if vid_pid is not None and (dev_vid, dev_pid) != tuple(vid_pid):
             continue          # ruled out for free, without touching the locked attribute
         if vid is not None and dev_vid != vid:

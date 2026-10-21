@@ -576,19 +576,42 @@ class SessionCase(unittest.TestCase):
 
 
 class Lifecycle(SessionCase):
-    def test_the_server_starts_boot_settle_after_the_call_outside_the_timeout(self):
-        started, real = [], oe.Session.start
+    def test_the_usj_and_server_wait_out_boot_settle_from_the_call_and_the_timeout_follows(self):
+        """A controlled clock in place of the module's `time`: admission's own time counts toward the
+        settle, the USJ is resolved after it, and the server's deadline starts where the settle ends."""
+        class Clock:
+            now = 1000.0
+
+            def monotonic(self):
+                return self.now
+
+            def sleep(self, seconds):
+                order.append(('sleep', seconds))
+                self.now += seconds
+        real_find, real_usj, clock = oe.find_openocd, oe.usj_location, Clock()
+
+        def find_openocd(openocd):
+            tool = real_find(openocd)
+            clock.now += admission
+            return tool
+
+        def usj_location(serial):
+            order.append(('usj', clock.now))
+            return real_usj(serial)
 
         def start(session, deadline):
-            started.append((time.monotonic(), deadline))
-            return real(session, deadline)
-        with mock.patch.object(oe, 'BOOT_SETTLE', 0.5), mock.patch.object(oe.Session, 'start', start):
-            t0 = time.monotonic()
-            op = self.session(lambda s: None, timeout=5)
-        (at, deadline), = started
-        self.assertGreaterEqual(at - t0, 0.5)
-        self.assertGreaterEqual(deadline - at, 4.9, 'the settle is not taken from the timeout')
-        self.assertEqual(op.returncode, 0)
+            order.append(('start', clock.now, deadline))
+            raise KeyboardInterrupt     # stops before anything spawns
+        for admission in (0, 0.25, 1.0, 1.5):     # binary-exact, so the sleep compares equal
+            with self.subTest(admission=admission):
+                order, clock.now = [], 1000.0
+                with mock.patch.object(oe, 'time', clock), mock.patch.object(oe, 'BOOT_SETTLE', 1.0), \
+                        mock.patch.object(oe, 'find_openocd', find_openocd), \
+                        mock.patch.object(oe, 'usj_location', usj_location), \
+                        mock.patch.object(oe.Session, 'start', start), self.assertRaises(KeyboardInterrupt):
+                    self.session(timeout=5)
+                at = 1000.0 + max(1.0, admission)
+                self.assertEqual(order, [('sleep', max(0, 1.0 - admission)), ('usj', at), ('start', at, at + 5)])
 
     def test_success_is_init_the_work_then_reset_run_and_a_confirmed_shutdown(self):
         op = self.session(lambda s: s.check('esp foo'))

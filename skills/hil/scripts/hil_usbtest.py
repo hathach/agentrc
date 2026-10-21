@@ -5,8 +5,8 @@ stdlib only.
 The device lookup, driver registration and binding, the bounded testusb case run and its
 parsing, and the upstream host controller check. Every project value is a parameter: the
 device VID:PID, the reference id whose capability profile it inherits, the interface, the
-usbfs node, the case, its testusb options and every bound. Which cases run, their options, throughput,
-recovery and the report are the caller's.
+usbfs node, the case, its testusb options and every bound. Which cases run, their options,
+throughput, recovery and the report are the caller's.
 
 Failures that make a battery meaningless exit (SystemExit with the reason), as a CLI
 battery does; a case's own outcome is its result dict.
@@ -194,9 +194,7 @@ def _confirm(cached, peers, serial, timeout):
     """The cached device re-described after a bounded read of its own serial, or None when a
     full scan must decide: the device gone or re-enumerated, its serial another board's, or a
     peer the last scan could not read now answering (it may answer `serial` too)."""
-    dev = next((d for d in peers if (d['busport'], d['ino']) == cached['target']), None)
-    if dev is None:
-        return None
+    dev = next(d for d in peers if (d['busport'], d['ino']) == cached['target'])
     sn = usb_observe.read_sysfs(os.path.join(dev['dir'], 'serial'), timeout)
     if sn is None or sn.lower() != serial.lower() \
             or usb_observe.enumeration_id(dev['dir']) != dev['ino']:
@@ -252,10 +250,10 @@ def find_device(vid, pid, serial=None, timeout=SERIAL_GRACE):
         # the picture is walked after the scan, and cached only if it still holds every device
         # the scan read: one observation, so nothing the scan never saw can hide behind it
         peers = usb_observe.usb_devices(vid_pid=(vid, pid))
-        read = _identities(scanned)
-        if read <= _identities(peers):
+        read, picture = _identities(scanned), _identities(peers)
+        if read <= picture:
             _DEV_CACHE[key] = {'target': (hit['sysname'], matches[0]['ino']),
-                               'picture': _identities(peers),
+                               'picture': picture,
                                'unread': [d['dir'] for d in peers
                                           if (d['busport'], d['ino']) not in read]}
     return hit
