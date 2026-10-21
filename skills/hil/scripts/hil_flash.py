@@ -121,13 +121,13 @@ class Operation(subprocess.CompletedProcess):
     operation so far as `.operation`. `cleanup` is the worst attempt's ('pending' over
     'unknown' over 'done'), `receipts` every outstanding session's receipt in order."""
 
-    def __init__(self, attempts: list):
+    def __init__(self, attempts: list, retry_refused=None):
         r = attempts[-1].result
         super().__init__(r.args, r.returncode, r.stdout, r.stderr)
         self.attempts = tuple(attempts)
         self.cleanup = max((a.cleanup for a in attempts), key=CLEANUP.index)
         self.receipts = tuple(a.receipt for a in attempts if a.receipt is not None)
-        self.retry_refused = None
+        self.retry_refused = retry_refused
 
     @property
     def retried(self) -> tuple:
@@ -259,9 +259,7 @@ def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, 
             if retry_delay:
                 time.sleep(retry_delay)
             _attempt(attempts, run, argv, text, timeout=timeout)
-    op = Operation(attempts)
-    op.retry_refused = refused
-    return op
+    return Operation(attempts, retry_refused=refused)
 
 
 # Cortex-M SCB AIRCR and the SYSRESETREQ write tinyuf2's runner issues to it
