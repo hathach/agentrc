@@ -282,6 +282,8 @@ Observed: 5 boards missing with a completely clean D-state list, because
   `hil_reserve.py run` admits such a target by udev's record of its serial, written when
   the device was added and read without touching it, refuses one with neither, and
   counts the subtree restored only from sysfs reads afterwards, never from that record.
+- `hil_reserve.py run root-cycle` has not been run against a real wedge; its
+  hardware trial is agentrc#149.
 - `sudo` runs a user-owned script from a user-writable checkout: the existing trust
   boundary of the install, not widened by this skill.
 - Which hubs and controllers a host has, whether a port cycle cuts power there, and

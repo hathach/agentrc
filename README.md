@@ -110,8 +110,8 @@ the skipped tests and notes for a port:
   `hil_process.py`, `hil_farm_check.py`, `hil_tt.py`, `hil_usbtest.py`) and
   `usb-kernel-recover`'s `usb_recover.sh`: POSIX `flock` and `fork`, `/proc`
   and sysfs.
-- `hil`'s `hil_report_core.py` locks its writer with `msvcrt` on Windows, but
-  its tests use `fcntl` and skip there.
+- `hil`'s `hil_report_notice.py` locks the report writer with `msvcrt` on Windows,
+  but its tests and `hil_report_core.py`'s use `fcntl` and skip there.
 - `lsusbt`: sysfs.
 - `usb-kernel-debug`: kernel dynamic debug and usbmon, which have no Windows
   counterpart to port to.

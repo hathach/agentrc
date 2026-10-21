@@ -68,7 +68,11 @@ nothing in it through a link.
   front, changing nothing, and names that uid: run it and its `release --token`
   as that user or root.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
-  ends with `release_board_lock`. `release` never signals a protected record,
+  ends with `release_board_lock`, or hands its held locks to a cleanup holder
+  with `hand_to_cleanup_holder`; given the receipts of runs not proven ended,
+  that holder clears only once each rechecks `done`, and `release --token`
+  refuses up front naming the open receipt. `takeover_predecessor` reads the
+  record a takeover replaced. `release` never signals a protected record,
   a cleanup holder or a runner reason (`hil_test.py`, `farm_check`, the legacy
   `pool_check`), and signals only `hil_lock.py hold`'s own holder, proven by
   its start time and its flock. A record from a helper older than the mark
@@ -108,7 +112,9 @@ helper and any cleanup state.
   this run's.
 - A runner that watches the bus (is the board enumerated, which process holds
   its usbfs node) loads this skill's `scripts/usb_observe.py` the way it loads
-  the lock helper, one module instance per process; it observes only.
+  the lock helper, one module instance per process; it observes only. Its
+  `jlink_serial_match` and `jlink_serial_candidates` decide whether a J-Link's
+  zero-padded serial is a roster uid.
 
 ## Flashers
 
@@ -213,10 +219,11 @@ recovery stay the contract's.
 |---|---|
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (`farm-check` skill) |
+| `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
 | `hil_report_core.py` | the report document: `_hil` metadata and roster identity, attempt archive, withdrawal and publish recovery, adopting a fetched report, the Markdown view, run and sequence verdicts |
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
-| `hil_usbtest.py` | usbtest binding and bounded testusb case runs |
+| `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 
 - The farm check engine releases a board it reserved (`protected=True`) only
