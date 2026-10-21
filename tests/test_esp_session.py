@@ -1,4 +1,5 @@
 import contextlib
+import ctypes
 import importlib.util
 import io
 import json
@@ -25,6 +26,12 @@ argv = sys.argv[1:]
 if argv == ['--version']:
     sys.stderr.write(os.environ.get('FAKE_BANNER', 'Open On-Chip Debugger v0.12.0-esp32-20260703 (2026-07-03-13:49)') + '\n')
     sys.exit(0)
+try:
+    start = open('/proc/self/stat').read().rsplit(')', 1)[1].split()[19]
+except OSError:
+    start = '?'
+with open(os.environ['FAKE_PIDS'], 'a') as f:
+    f.write(f'{os.getpid()} {start}\n')
 cs = [argv[i + 1] for i, a in enumerate(argv) if a == '-c']
 log = argv[argv.index('-l') + 1]
 cores = os.environ.get('FAKE_CORES', 'chip.cpu0,chip.cpu1').split(',')
@@ -182,6 +189,109 @@ if os.environ.get('FAKE_GDB_DIE_AFTER') == 'end':
 
 BOARD = ['--board-cfg', 'board/esp32p4-builtin.cfg', '--adapter-serial', '30:ED:A0:E0:C9:02']
 
+PR_SET_CHILD_SUBREAPER, PR_GET_CHILD_SUBREAPER = 36, 37
+BASELINE, ORIGINAL_SUBREAPER, SUBREAPER = set(), None, False
+
+
+def proc_stat(pid):
+    """(ppid, state, start time) of pid, None once it is gone."""
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            fields = f.read().rsplit(')', 1)[1].split()
+    except (OSError, IndexError):
+        return None
+    return int(fields[1]), fields[0], fields[19]
+
+
+def processes():
+    names = os.listdir('/proc') if os.path.isdir('/proc') else ()
+    return {pid: st for pid in map(int, filter(str.isdigit, names)) if (st := proc_stat(pid))}
+
+
+def descendants(table):
+    found, parents = [], {os.getpid()}
+    while kids := [p for p, (ppid, _, _) in table.items() if ppid in parents]:
+        found += kids
+        parents = set(kids)
+    return found
+
+
+def prctl(option, arg):
+    """prctl's result, None without it (not Linux)."""
+    try:
+        return ctypes.CDLL(None, use_errno=True).prctl(option, arg, 0, 0, 0)
+    except (OSError, AttributeError, TypeError):
+        return None
+
+
+def get_subreaper():
+    flag = ctypes.c_int()
+    return flag.value if prctl(PR_GET_CHILD_SUBREAPER, ctypes.byref(flag)) == 0 else None
+
+
+def set_subreaper(flag):
+    """Set whether orphaned descendants are reparented to this process rather than init, so the guard still sees
+    them; False without prctl (not Linux): an orphan then escapes the guard."""
+    return prctl(PR_SET_CHILD_SUBREAPER, int(flag)) == 0
+
+
+def reap_if_ours(pid, start):
+    """Reap pid if it is still the process that started at start and is now a zombie of this process."""
+    st = proc_stat(pid)
+    if st and st[2] == start and st[1] == 'Z' and st[0] == os.getpid():
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)
+
+
+def end(pid, start):
+    """SIGKILL pid if it is still the process that started at start, and wait until it is gone or a zombie,
+    reaped if it is this process's."""
+    if (st := proc_stat(pid)) is None or st[2] != start:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 10
+    while (st := proc_stat(pid)) and st[2] == start and st[1] != 'Z' and time.monotonic() < deadline:
+        time.sleep(0.02)
+    reap_if_ours(pid, start)
+
+
+def check_no_survivors(baseline):
+    """Kill every descendant of this process missing from baseline ((pid, start time) pairs), reap the zombies
+    left to it, and fail naming the ones that still ran."""
+    named = {}
+    for _ in range(20):
+        table = processes()
+        left = [p for p in descendants(table) if (p, table[p][2]) not in baseline
+                and (table[p][1] != 'Z' or table[p][0] == os.getpid())]
+        if not left:
+            break
+        for pid in left:
+            if table[pid][1] == 'Z':
+                reap_if_ours(pid, table[pid][2])
+            else:
+                named.setdefault(pid, ' '.join(es.cmdline(pid) or ()))
+                end(pid, table[pid][2])
+    if named:
+        raise AssertionError('killed processes that outlived their test: '
+                             + '; '.join(f'{pid} {cmd}' for pid, cmd in named.items()))
+
+
+def setUpModule():
+    global BASELINE, ORIGINAL_SUBREAPER, SUBREAPER
+    table = processes()
+    BASELINE = {(pid, table[pid][2]) for pid in descendants(table)}
+    ORIGINAL_SUBREAPER = get_subreaper()
+    SUBREAPER = ORIGINAL_SUBREAPER is not None and set_subreaper(True)
+
+
+def tearDownModule():
+    try:
+        check_no_survivors(BASELINE)
+    finally:
+        if SUBREAPER:
+            set_subreaper(ORIGINAL_SUBREAPER)
+
 
 @unittest.skipIf(os.name == 'nt', 'esp_session.py refuses on Windows: WindowsRefusal')
 class EspSessionTest(unittest.TestCase):
@@ -200,7 +310,46 @@ class EspSessionTest(unittest.TestCase):
         self.log = self.d / 'log.json'
         self.out = self.d / 'out'
         self.env = {**os.environ, 'PATH': f'{self.d}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log),
-                    'FAKE_STATE': str(self.d / 'state.json'), 'FAKE_OCD_LOG': str(self.out / 'openocd.log')}
+                    'FAKE_STATE': str(self.d / 'state.json'), 'FAKE_OCD_LOG': str(self.out / 'openocd.log'),
+                    'FAKE_PIDS': str(self.d / 'servers')}
+        self.addCleanup(self.end_servers)
+        stop = threading.Event()
+        reaper = threading.Thread(target=self.reap_servers, args=(stop,), daemon=True)
+        reaper.start()
+        self.addCleanup(reaper.join)
+        self.addCleanup(stop.set)
+
+    def server_pids(self):
+        """(pid, start time) each fake server this test started wrote at its start."""
+        pids = self.d / 'servers'
+        lines = pids.read_text().splitlines() if pids.exists() else []
+        return [(int(pid), start) for pid, start in map(str.split, lines)]
+
+    def reap_servers(self, stop):
+        """Reap an exited server at once, as init would: as a zombie of this subreaper it would still look alive
+        to esp_session's exit checks."""
+        while not stop.wait(0.02):
+            for pid, start in self.server_pids():
+                reap_if_ours(pid, start)
+
+    def end_servers(self):
+        """End the fake servers this test started, identified by pid and a command line naming this test's
+        directory, not by receipts, which tests rewrite, leave open or rename with their output directory."""
+        for pid, start in self.server_pids():
+            if str(self.d) in ' '.join(es.cmdline(pid) or ()):
+                end(pid, start)
+            else:
+                reap_if_ours(pid, start)
+
+    def test_a_stale_registration_never_takes_another_childs_status(self):
+        child = subprocess.Popen(['sh', '-c', 'exit 7'])
+        deadline = time.monotonic() + 5
+        while (st := proc_stat(child.pid)) and st[1] != 'Z' and time.monotonic() < deadline:
+            time.sleep(0.02)
+        (self.d / 'servers').write_text(f'{child.pid} 1\n')    # its pid, an earlier process's start time
+        time.sleep(0.2)    # several passes of the reaper
+        self.end_servers()
+        self.assertEqual(child.wait(timeout=5), 7)
 
     def session(self, mode, *args):
         return [sys.executable, str(SCRIPT), mode, '--out', str(self.out), *BOARD, '--rtos', 'FreeRTOS',
@@ -435,6 +584,8 @@ class EspSessionTest(unittest.TestCase):
     def test_a_signal_still_ends_the_session(self):
         proc = subprocess.Popen(self.session('inspect', '--timeout', '30'), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, env={**self.env, 'FAKE_GDB_HANG': '1'})
+        self.addCleanup(proc.communicate)
+        self.addCleanup(proc.kill)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline and not (self.out / 'openocd.log').exists():
             time.sleep(0.05)
@@ -517,6 +668,44 @@ class EspSessionTest(unittest.TestCase):
         self.assertIn('not openocd-esp32', out['error'])
         self.assertFalse(self.log.exists() and self.calls('gdb'))
 
+
+# this module's guard in an interpreter of its own, so its baseline holds nothing of the suite's: subreaper flag
+# argv[2] before the module setup; a detached sleep grandchild; the module teardown's error, then the flag after it
+GUARD_DRIVER = r'''
+import importlib.util, json, subprocess, sys, time
+spec = importlib.util.spec_from_file_location('guarded', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.set_subreaper(int(sys.argv[2]))
+m.setUpModule()
+pid = int(subprocess.run(['sh', '-c', 'setsid sleep 60 </dev/null >/dev/null 2>&1 & echo $!'], capture_output=True,
+                         text=True, check=True, timeout=10).stdout)
+deadline = time.monotonic() + 5
+while m.es.cmdline(pid) != ['sleep', '60'] and time.monotonic() < deadline:
+    time.sleep(0.02)
+try:
+    m.tearDownModule()
+    error = None
+except AssertionError as e:
+    error = str(e)
+print(json.dumps({'pid': pid, 'error': error, 'gone': m.proc_stat(pid) is None, 'subreaper': m.get_subreaper()}))
+'''
+
+
+@unittest.skipIf(os.name == 'nt', 'sh and setsid')
+class SurvivorGuard(unittest.TestCase):
+    def test_a_detached_grandchild_is_named_and_killed_and_the_flag_restored(self):
+        if get_subreaper() is None:
+            self.skipTest('no PR_SET_CHILD_SUBREAPER: the orphan would go to init')
+        for before in (0, 1):
+            with self.subTest(subreaper=before):
+                r = subprocess.run([sys.executable, '-c', GUARD_DRIVER, str(Path(__file__).resolve()), str(before)],
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                out = json.loads(r.stdout)
+                self.assertEqual(out['error'], f"killed processes that outlived their test: {out['pid']} sleep 60")
+                self.assertTrue(out['gone'])
+                self.assertEqual(out['subreaper'], before)
 
 
 def load_module():
