@@ -192,7 +192,10 @@ def literal(word):
     then take their stand-ins."""
     plain = word.translate(SEPARATORS_BACK)
     return plain.translate(BRACES_QUOTED) if braces(plain) and not braces(word) else plain
-HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+HEREDOC = re.compile(r'(?<!<)<<(?!<)-?[ \t]*')   # `<<<` is a here-string
+# the delimiter word up to an unquoted metacharacter; `$` or a backquote may make bash read more into it than this does
+DELIMITER = re.compile(r"""(?:[^\s;&|<>()'"\\$`]|\\.|'[^']*'|"[^"\\$`]*")+(?![^\s;&|<>()])""")
+UNQUOTE = re.compile(r"""\\(.)|'([^']*)'|"([^"]*)\"""")
 CONTINUED = re.compile(r'(?<!\\)(?:\\\\)*\\\n')  # an odd run of backslashes before a newline
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
 UNKNOWN = '\0'
@@ -301,17 +304,27 @@ class Guard:
     def command(self, command, depth=0):
         if depth > 3:
             raise Denied('commands nested this deep are not checked; run them as plain words, or dispatch them to a unit')
-        bodies = []
-
-        def heredoc(m):
+        bodies, text, pos = [], '', 0
+        while (m := HEREDOC.search(command, pos)) and (eol := command.find('\n', m.end())) >= 0:
+            if not (word := DELIMITER.match(command, m.end())):
+                raise Denied("this guard cannot read the heredoc's delimiter, so it cannot tell where bash ends the body; "
+                             'spell the delimiter as a plain or quoted word')
+            delimiter = UNQUOTE.sub(lambda q: ''.join(g or '' for g in q.groups()), word.group())
+            lines = command[eol + 1:].split('\n')
+            ends = (k for k, line in enumerate(lines) if (line.lstrip('\t') if '-' in m.group() else line) == delimiter)
+            if (n := next(ends, None)) is None:  # bash reads the rest as the body; this guard reads it as commands
+                text, pos = text + command[pos:m.end()], m.end()
+                continue
+            rest, body, quoted = command[word.end():eol], '\n'.join(lines[:n]), set('\\\'"') & set(word.group())
             # bash joins a continued line before it reads the body and, unquoted, before it matches the delimiter
-            if CONTINUED.search(m.group(3) + '\n') or not m.group(1) and CONTINUED.search(m.group(4) + '\n'):
+            if CONTINUED.search(rest + '\n') or not quoted and CONTINUED.search(body + '\n'):
                 raise Denied("a line continuation on a heredoc's line or in an unquoted heredoc body moves where bash "
                              'starts or ends the body; join the line, or quote the delimiter')
-            if not m.group(1):  # an unquoted body still runs its substitutions
-                bodies.extend(substitutions(m.group(4), quotes=False)[1])
-            return '<<HEREDOC' + m.group(3) + '\n'
-        text, subs = substitutions(HEREDOC.sub(heredoc, command))
+            if not quoted:  # an unquoted body still runs its substitutions
+                bodies.extend(substitutions(body, quotes=False)[1])
+            text += command[pos:m.start()] + '<<HEREDOC' + rest + '\n'
+            pos = eol + 1 + sum(len(line) + 1 for line in lines[:n]) + len(lines[n])
+        text, subs = substitutions(text + command[pos:])
         for body in bodies + subs:
             self.command(body, depth + 1)
         lex = shlex.shlex(text.replace('\n', ' ; '), posix=True, punctuation_chars=PUNCTUATION)

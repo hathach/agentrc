@@ -128,6 +128,28 @@ class ChiefGuard(unittest.TestCase):
         self.assert_denied("cat > src/x.md <<'EOF'\nhello\nEOF", 'literal absolute path')
         self.assert_denied("cat <<EOF | tee src/x\nhi\nEOF", 'literal absolute path')
 
+    def test_a_heredoc_ends_where_bash_ends_it(self):
+        # the delimiter is the whole word, quote removed; the body ends at the first line holding just it
+        for c in ('cat <<EOF-1\nEOF-1\ngit push\nEOF', "cat <<'EOF-1'\nhi\nEOF-1\ngit push\nEOF",
+                  'cat <<"EOF-1"\nhi\nEOF-1\ngit push\nEOF', "cat <<'EOF'-1\nhi\nEOF-1\ngit push\nEOF",
+                  'cat <<E"O"F\nhi\nEOF\ngit push\nE"O"F', 'cat <<\\EOF\nhi\nEOF\ngit push\n\\EOF',
+                  # only `<<-` strips leading tabs, and neither strips spaces, so a later heredoc cannot swallow it
+                  'cat <<D\nhi\n  D\ncat <<X\nD\ngit push\nX', 'cat <<D\nhi\nD \ncat <<X\nD\ngit push\nX',
+                  'cat <<-D\nhi\n  D\ncat <<X\n\tD\ngit push\nX',
+                  # a here-string has no body
+                  'cat <<<EOF\ngit push\nEOF'):
+            with self.subTest(c=c):
+                self.assert_denied(c, 'changes the repository')
+        # bash may read more into a delimiter holding `$` or a backquote than this guard does
+        for c in ("cat <<$'A'\nhi\nA\ngit push\n$A", 'cat <<"A\\"B"\nhi\nA"B\ngit push\nA\\"B', 'cat <<`a b`\nhi\n`a\n'):
+            with self.subTest(c=c):
+                self.assert_denied(c, "heredoc's delimiter")
+        for c in ("cat <<'EOF-1'\ngit push\nEOF-1", 'cat <<"EOF-1"\ngit push\nEOF-1', "cat <<'EOF'-1\ngit push\nEOF-1",
+                  'cat <<-EOF\n\tgit push\n\tEOF', 'cat <<EOF;echo x\ngit push\nEOF', 'cat <<EOF\nEOF\ngit status',
+                  'cat <<<"a b"\ngit status', 'echo $((1<<2))'):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+
     def test_gh_reads_pass(self):
         for c in ('gh pr view 12 --json state', 'gh pr checks 12', 'gh -R o/r pr list', 'gh issue view 3',
                   'gh run view 99 --log-failed', 'gh api repos/o/r/pulls/1', 'gh api -X GET search/issues -f q=x',
@@ -487,7 +509,8 @@ class ChiefGuard(unittest.TestCase):
                          ('sed "-\\\ni" s/a/b/ src/a.c', 'in place'),
                          # on a heredoc's line it moves the body; in an unquoted body it may form the delimiter early
                          ('cat <<EOF \\\n| sh\ngit push\nEOF', 'heredoc'),
-                         ('cat <<EOF\nhi\nE\\\nOF\ngit push\nEOF', 'heredoc')):
+                         ('cat <<EOF\nhi\nE\\\nOF\ngit push\nEOF', 'heredoc'),
+                         ('cat <<EOF-1\nhi\nEOF-\\\n1\nEOF-1', 'heredoc')):
             with self.subTest(c=c):
                 self.assert_denied(c, named)
         # a comment after a continued blank stays a comment; single quotes and a quoted heredoc body keep it literal
