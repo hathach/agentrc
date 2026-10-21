@@ -61,6 +61,22 @@ class RunCmdModes(unittest.TestCase):
         r = hp.run_cmd(['printf', '%s', 'a b; echo no'], timeout=T)
         self.assertEqual((r.returncode, r.stdout), (0, 'a b; echo no'))
 
+    def test_env_adds_literal_variables_to_the_inherited_environment(self):
+        value = 'a b;$(touch PWNED)`id`*'
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'HIL_KEEP': 'kept'}):
+            r = hp.run_cmd(['sh', '-c', 'printf "%s|%s|%s" "$HIL_KEEP" "$HIL_NEW" "$NO_COLOR"'], d, timeout=T,
+                           env={'HIL_NEW': value, 'NO_COLOR': '1'})
+            self.assertEqual(os.listdir(d), [])
+            self.assertNotIn('HIL_NEW', os.environ)
+        self.assertEqual((r.returncode, r.stdout), (0, f'kept|{value}|1'))
+
+    def test_a_malformed_env_is_refused_before_anything_starts(self):
+        for env in ({'A=B': 'x'}, {'': 'x'}, {'A': 1}, {'A': 'x\0y'}, ['A', 'x'], 'A=x'):
+            with self.subTest(env=env), mock.patch.object(hp.subprocess, 'Popen') as popen, \
+                    self.assertRaisesRegex(ValueError, 'env'):
+                hp.run_cmd(['true'], timeout=T, env=env)
+            popen.assert_not_called()
+
     def test_cwd_is_honoured(self):
         with tempfile.TemporaryDirectory() as d:
             r = hp.run_cmd('pwd', d, timeout=T)
@@ -742,6 +758,21 @@ class RunTracked(unittest.TestCase):
             report(a=[r.returncode, r.stdout.strip() == os.path.realpath(D), r.cleanup], files=os.listdir(S))
         """)
         self.assertEqual(res['a'], [0, True, 'done'])
+        self.assertEqual(res['files'], [])
+
+    def test_env_reaches_the_command_and_a_malformed_one_starts_nothing(self):
+        res = self.child("""
+            r = hp.run_tracked(['sh', '-c', 'printf %s "$HIL_NEW"'], timeout=20, settle=5, state_dir=S,
+                               env={'HIL_NEW': 'a b;$(id)'})
+            try:
+                hp.run_tracked(['true'], timeout=20, settle=5, state_dir=S, env={'A=B': 'x'})
+                bad = None
+            except ValueError as e:
+                bad = [str(e), e.cleanup, e.receipt]
+            report(a=[r.returncode, r.stdout, r.cleanup], bad=bad, files=os.listdir(S))
+        """)
+        self.assertEqual(res['a'], [0, 'a b;$(id)', 'done'])
+        self.assertEqual(res['bad'][1:], ['done', None])
         self.assertEqual(res['files'], [])
 
     def test_a_descendant_left_behind_is_pending_until_it_ends(self):

@@ -148,11 +148,16 @@ recovery stay the contract's. Linux only.
 
 - A flasher is a dict: `name` (`jlink`, `stlink`, `openocd`, `lm4flash`,
   `esptool`, `pyocd`), `uid` (the probe's serial), `args` (passed to the tool
-  verbatim), and optionally `vid_pid` (openocd's complete `0xVVVV 0xPPPP`
-  pairs; pyocd requires exactly one) and `verify`. A malformed `vid_pid` raises
-  `ValueError` before the tool runs. Every call takes an explicit `timeout`;
-  `run=` injects the caller's runner, by default `scripts/hil_process.py`'s
-  `run_cmd`.
+  as the words a shell would split them into, never expanded), and optionally
+  `vid_pid` (openocd's complete `0xVVVV 0xPPPP` pairs; pyocd requires exactly
+  one) and `verify`. A malformed `vid_pid` raises `ValueError` before the tool
+  runs. Every call takes an explicit `timeout`; `run=` injects the caller's
+  runner, by default `scripts/hil_process.py`'s `run_cmd`. Every command is an
+  argv list, never a shell string: a runner is called as `run(argv,
+  timeout=...)`, and for esptool `run(argv, cwd=..., env=..., timeout=...)`,
+  `env` the variables to add to the inherited environment (`run_cmd(env=)` and
+  `run_tracked(env=)` take it). `flash_esptool(esptool=)` names the esptool
+  executable, by default `esptool` on PATH.
 - A flash or reset returns an `Operation`: the last run's `CompletedProcess`
   fields plus `attempts`, each run's command, command file, output and rc on
   its own, never concatenated; `retried` is every attempt but the last. An
@@ -179,7 +184,12 @@ recovery stay the contract's. Linux only.
   command file in `workdir`; `sysresetreq_jlink` and `sysresetreq_stlink` write
   AIRCR SYSRESETREQ through such a session, a reset distinct from the probe's
   (`reset_jlink`, `reset_stlink`). Their results are raw: judging the
-  transcript, retrying and recovering stay the caller's.
+  transcript and recovering stay the caller's. `run_jlink_commands` and
+  `sysresetreq_jlink` take an optional `retry_if(attempt)`: while it answers
+  true the whole session reruns, at most `retries` times (default 1),
+  `retry_delay` s apart, each run its own `timeout`. A rerun is refused after
+  an attempt whose cleanup is not an explicit `done` or that names a receipt;
+  the operation's `retry_refused` then says why.
 - `openocd_esp` is `scripts/hil_openocd_esp.py`'s (`flash_openocd_esp`,
   `reset_openocd_esp`): an Espressif chip's built-in USB-Serial/JTAG through
   openocd-esp32 v0.12.0-esp32-20260703 only, found by `HIL_OPENOCD_ESP`, else

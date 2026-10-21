@@ -4,6 +4,7 @@ stdlib only, no module state: every bound and switch is a parameter.
 
 Contract:
 - `cmd` a STRING runs through the shell; a LIST is an argv that goes straight to execve.
+  `env`, a mapping of names to strings, is added to the inherited environment.
 - The child runs in its own session (start_new_session), so the terminal's SIGINT never
   reaches it and its whole process group can be killed.
 - On `timeout` the group is SIGKILLed and reaped for at most `reap_grace` more seconds, then
@@ -256,19 +257,31 @@ def _cmd_label(cmd) -> str:
 
 def run_cmd(cmd: str | list, cwd: str | None = None, *, timeout: float,
             binary: bool = False, split_stderr: bool = False, quiet: bool = False,
-            reap_grace: float = REAP_GRACE, verbose: bool = False) -> subprocess.CompletedProcess:
+            reap_grace: float = REAP_GRACE, verbose: bool = False,
+            env: dict | None = None) -> subprocess.CompletedProcess:
     """Bounded subprocess: own session, killpg on expiry, rc 124 when it had to be killed.
 
     `cmd` is a shell STRING or an argv LIST. argv exists for a program that cannot survive
-    a trip through the shell -- a multi-line `python3 -c` body -- which is how a harness
-    runs a library call that no in-process bound can contain. A daemon thread cannot bound
+    a trip through the shell -- a multi-line `python3 -c` body, a path with spaces -- and is
+    what every hil_flash builder produces; `env` adds its variables to the inherited
+    environment, so no `NAME=value` prefix needs a shell either. A daemon thread cannot bound
     a C call that holds the GIL, so for those the child process IS the bound.
     """
-    return _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose)
+    return _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose, env=env)
+
+
+def _environ(env) -> dict | None:
+    """The child's whole environment: ours plus `env`, refused unless it maps names to strings."""
+    if env is None:
+        return None
+    if not isinstance(env, dict) or not all(isinstance(k, str) and k and '=' not in k and '\0' not in k
+                                            and isinstance(v, str) and '\0' not in v for k, v in env.items()):
+        raise ValueError(f'env {env!r}: want a mapping of variable names to strings')
+    return {**os.environ, **env}
 
 
 def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
-         track: dict | None = None) -> subprocess.CompletedProcess:
+         track: dict | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
     """run_cmd; `track` receives the Popen as 'popen' before any deferred interrupt can unwind,
     and 'timed_out' True when the timeout killed the group."""
     if timeout is None:
@@ -283,6 +296,7 @@ def _run(cmd, cwd, timeout, binary, split_stderr, quiet, reap_grace, verbose,
         'shell': isinstance(cmd, str),
         'stdout': subprocess.PIPE,
         'stderr': subprocess.PIPE if split_stderr else subprocess.STDOUT,
+        'env': _environ(env),
     }
     if not binary:
         popen_kwargs.update({'text': True, 'encoding': 'utf-8', 'errors': 'replace'})
@@ -511,7 +525,7 @@ def _supervise(job: dict) -> int:
         if phase['asked']:
             raise KeyboardInterrupt
         r = _run(job['cmd'], job['cwd'], job['timeout'], job['binary'], job['split_stderr'], True,
-                 job['reap_grace'], False, track)
+                 job['reap_grace'], False, track, job.get('env'))
         phase['now'] = 'after'
         result = {'returncode': r.returncode, 'stdout': _encode(r.stdout), 'stderr': _encode(r.stderr),
                   'killed': track.get('timed_out', False)}
@@ -638,11 +652,13 @@ def recheck(receipt: dict) -> str:
 
 def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, settle: float, state_dir: str,
                 binary: bool = False, split_stderr: bool = False, quiet: bool = False,
-                reap_grace: float = REAP_GRACE, verbose: bool = False) -> subprocess.CompletedProcess:
+                reap_grace: float = REAP_GRACE, verbose: bool = False,
+            env: dict | None = None) -> subprocess.CompletedProcess:
     """run_cmd through an operation-owned supervisor, plus completion evidence (module contract)."""
     if timeout is None or settle is None or state_dir is None:
         raise ValueError('run_tracked needs an explicit timeout, settle and state_dir')
     try:
+        _environ(env)       # refused here, before anything starts, not in the supervisor
         # the job crosses to the supervisor as JSON: path-like arguments as run_cmd's Popen takes them
         argv = cmd if isinstance(cmd, str) else [os.fspath(a) for a in cmd]
         cwd = None if cwd is None else os.fspath(cwd)
@@ -654,7 +670,7 @@ def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, sett
                'record': f'{base}.json', 'log': f'{base}.log', 'survivors': None}
     rfd, wfd = os.pipe()
     reports = _Reports(rfd)
-    job = {'cmd': argv, 'cwd': cwd, 'timeout': timeout, 'settle': settle, 'reap_grace': reap_grace,
+    job = {'cmd': argv, 'cwd': cwd, 'env': env, 'timeout': timeout, 'settle': settle, 'reap_grace': reap_grace,
            'binary': binary, 'split_stderr': split_stderr, 'report_fd': wfd, 'token': receipt['token'],
            'lock': receipt['lock'], 'record': receipt['record']}
     hold = InterruptHold()

@@ -7,8 +7,8 @@ output and the result handed back. Only the pyOCD launcher path and its --projec
 argument are normalised, plus deliberate deltas since, each applied explicitly: J-Link
 command files are unique per invocation, reused by its crash reruns and removed after it
 (jlink_command_file_delta), the J-Link flash script has no reset before `loadfile`
-(jlink_flash_script_delta), esptool runs with NO_COLOR=1 (esptool_no_color_delta), and a
-flash or reset returns an Operation carrying the runner's results as its attempts, whose last
+(jlink_flash_script_delta), esptool runs with NO_COLOR=1 (esptool_no_color_delta), every
+command is the pre-move shell string's words as an argv list (argv_delta), and a flash or reset returns an Operation carrying the runner's results as its attempts, whose last
 one is the result compared (provider_invoke). Equality there does not establish timing, signals or pyOCD's
 project-directory behaviour; test_hil_process and test_hil_pyocd do."""
 import os
@@ -91,12 +91,10 @@ COMMAND_FILE = '-CommandFile {COMMAND_FILE}'
 def provider_normalise(cmd, ctx):
     if isinstance(cmd, list) and cmd[1:4] == [hf.PYOCD_LAUNCHER, '--project-dir', str(ctx['project_dir'])]:
         return [cmd[0], '{LAUNCHER}', *cmd[4:]]
-    if isinstance(cmd, str) and '-CommandFile ' in cmd:
-        head, tail = cmd.rsplit('-CommandFile ', 1)
-        path, = shlex.split(tail)
-        if (Path(path).parent == Path.cwd() and re.fullmatch(r'hil_jlink_\w+\.jlink', Path(path).name)
-                and tail == shlex.quote(path)):
-            return head + COMMAND_FILE
+    if isinstance(cmd, list) and cmd[-2:-1] == ['-CommandFile']:
+        path = Path(cmd[-1])
+        if path.parent == Path.cwd() and re.fullmatch(r'hil_jlink_\w+\.jlink', path.name):
+            return [*cmd[:-1], '{COMMAND_FILE}']
     return cmd
 
 
@@ -138,18 +136,28 @@ def jlink_flash_script_delta(case, observed):
 
 
 def esptool_no_color_delta(case, observed):
-    """esptool's command gains a NO_COLOR=1 prefix: output only, its arguments unchanged."""
+    """esptool runs with NO_COLOR=1 in its environment: output only, its arguments unchanged."""
     if case['flasher']['name'].lower() != 'esptool' or case['op'] == 'rescue':
         return observed
 
     def rewrite(call):
         assert call['cmd'].startswith('esptool '), call['cmd']
-        return {**call, 'cmd': f"NO_COLOR=1 {call['cmd']}"}
+        return {**call, 'kw': {**call['kw'], 'env': {'NO_COLOR': '1'}}}
+    return map_calls(observed, rewrite)
+
+
+def argv_delta(case, observed):
+    """No shell runs a command: each pre-move shell string is now its words, as the shell split
+    them, in an argv list; none of the rosters' args used expansion, quoting aside."""
+    def rewrite(call):
+        cmd = call['cmd']
+        return {**call, 'cmd': shlex.split(cmd) if isinstance(cmd, str) else cmd}
     return map_calls(observed, rewrite)
 
 
 def deltas(case, observed):
-    return esptool_no_color_delta(case, jlink_flash_script_delta(case, jlink_command_file_delta(case, observed)))
+    return argv_delta(case, esptool_no_color_delta(
+        case, jlink_flash_script_delta(case, jlink_command_file_delta(case, observed))))
 
 
 def setUpModule():
@@ -213,7 +221,8 @@ ABSENT = object()
 
 
 class JLink(unittest.TestCase):
-    PREFIX = 'JLinkExe -USB S1 -device x -if swd -JTAGConf -1,-1 -speed auto -NoGui 1 -ExitOnError 1 -CommandFile '
+    PREFIX = ['JLinkExe', '-USB', 'S1', '-device', 'x', '-if', 'swd', '-JTAGConf', '-1,-1', '-speed', 'auto',
+              '-NoGui', '1', '-ExitOnError', '1', '-CommandFile']
 
     def in_dir(self, d=None):
         """chdir into a fresh directory (or d) for the test; returns it."""
@@ -228,8 +237,8 @@ class JLink(unittest.TestCase):
         rcs = iter(rcs or [0] * 9)
 
         def run(cmd, **kw):
-            self.assertTrue(cmd.startswith(self.PREFIX), cmd)
-            path, = shlex.split(cmd[len(self.PREFIX):])
+            self.assertEqual(cmd[:-1], self.PREFIX)
+            path = cmd[-1]
             seen.append((path, Path(path).read_text(), sorted(os.listdir(Path(path).parent))))
             if then:
                 then()
@@ -349,7 +358,7 @@ class JLink(unittest.TestCase):
                 # the first run spends the bound: no rerun past it
                 self.assertEqual(timed(fn, *args, prep=3, took=5, timeout=5, rcs=[139, 139, 139]), [(3, 5)])
 
-    def test_the_path_is_shell_quoted(self):
+    def test_the_path_is_one_literal_argv_word(self):
         base = self.enterContext(tempfile.TemporaryDirectory())
         d = Path(base, "a b'$c")
         d.mkdir()
@@ -395,7 +404,7 @@ class Record(unittest.TestCase):
             rc = next(answers)
             if isinstance(rc, BaseException):
                 raise rc
-            text = Path(shlex.split(cmd.rsplit('-CommandFile ', 1)[1])[0]).read_text() if '-CommandFile' in cmd else ''
+            text = Path(cmd[cmd.index('-CommandFile') + 1]).read_text() if '-CommandFile' in cmd else ''
             return subprocess.CompletedProcess(cmd, rc[0], f'{rc[1]}|{text}', None)
         return run
 
@@ -639,6 +648,86 @@ class Sessions(unittest.TestCase):
         self.assertEqual(text.encode(), b'-c port=SWD sn=0035 mode=HOTPLUG\n-w32 0xE000ED0C 0x05FA0004 -nv\n')
 
 
+class SessionRetry(unittest.TestCase):
+    """run_jlink_commands' optional retry_if: the caller's judgement reruns the whole session,
+    bounded, and never over an attempt whose cleanup is unresolved."""
+    UF2 = Sessions.UF2
+    PROFILE = {**Sessions.PROFILE, 'timeout': 9}
+
+    def runner(self, answers, seen):
+        """Each call answers (rc, cleanup, receipt) in turn, recording its command file's text."""
+        it = iter(answers)
+
+        def run(argv, **kw):
+            rc, cleanup, receipt = next(it)
+            seen.append((Path(argv[-1]).read_text(), kw))
+            r = subprocess.CompletedProcess(argv, rc, f'rc {rc}', None)
+            if cleanup is not None:
+                r.cleanup = cleanup
+            r.receipt = receipt
+            return r
+        return run
+
+    def call(self, answers, **kw):
+        seen, slept = [], []
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        with mock.patch.object(hf, 'time', types.SimpleNamespace(monotonic=lambda: 0.0, sleep=slept.append)):
+            op = hf.run_jlink_commands(self.UF2, ['h'], run=self.runner(answers, seen), workdir=d, **self.PROFILE,
+                                       **kw)
+        self.assertEqual(os.listdir(d), [])
+        return op, seen, slept
+
+    def test_no_retry_without_retry_if(self):
+        op, seen, _ = self.call([(-11, 'done', None), (0, 'done', None)])
+        self.assertEqual((len(op.attempts), op.returncode, op.retry_refused), (1, -11, None))
+
+    def test_a_judged_failure_reruns_the_same_session_within_the_bound(self):
+        judged = []
+
+        def died_at_connect(attempt):
+            judged.append(attempt.result.returncode)
+            return attempt.result.returncode != 0
+        op, seen, slept = self.call([(-11, 'done', None), (-11, 'done', None), (-11, 'done', None)],
+                                    retry_if=died_at_connect, retries=2, retry_delay=2)
+        self.assertEqual([a.result.returncode for a in op.attempts], [-11, -11, -11])
+        self.assertEqual(judged, [-11, -11])
+        self.assertEqual(slept, [2, 2])
+        self.assertEqual([t for t, _ in seen], ['h\nexit\n'] * 3)
+        self.assertEqual([k for _, k in seen], [{'timeout': 9}] * 3)
+        self.assertIsNone(op.retry_refused)
+        op, _, _ = self.call([(-11, 'done', None), (0, 'done', None)], retry_if=died_at_connect, retries=3)
+        self.assertEqual([a.result.returncode for a in op.attempts], [-11, 0])
+
+    def test_a_retry_over_an_unresolved_cleanup_is_refused(self):
+        for cleanup, receipt in ((None, None), ('unknown', None), ('pending', None), ('done', '/r/receipt.json')):
+            with self.subTest(cleanup=cleanup, receipt=receipt):
+                op, seen, slept = self.call([(-11, cleanup, receipt), (0, 'done', None)],
+                                            retry_if=lambda a: True, retries=2, retry_delay=1)
+                self.assertEqual((len(op.attempts), len(seen), slept), (1, 1, []))
+                self.assertIn(cleanup or 'unknown', op.retry_refused)
+                self.assertEqual(op.returncode, -11)
+
+    def test_the_bound_is_explicit_and_checked(self):
+        for kw in ({'retries': -1}, {'retries': True}, {'retries': 1.5}, {'retry_delay': -1},
+                   {'retry_delay': float('inf')}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                self.call([(0, 'done', None)], retry_if=lambda a: True, **kw)
+
+    def test_a_raising_judgement_carries_the_operation(self):
+        def boom(attempt):
+            raise RuntimeError('judge')
+        with self.assertRaises(RuntimeError) as cm:
+            self.call([(-11, 'done', None)], retry_if=boom)
+        self.assertEqual(len(cm.exception.operation.attempts), 1)
+
+    def test_sysresetreq_forwards_the_retry(self):
+        seen = []
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        op = hf.sysresetreq_jlink(self.UF2, run=self.runner([(-6, 'done', None), (0, 'done', None)], seen),
+                                  workdir=d, retry_if=lambda a: a.result.returncode < 0, **self.PROFILE)
+        self.assertEqual([a.result.returncode for a in op.attempts], [-6, 0])
+
+
 class Uid(unittest.TestCase):
     """A uid that is not one plain word is refused before any command file or spawn: every
     builder splices it into a shell line, a command file or a Tcl `-c` command."""
@@ -689,7 +778,8 @@ class StlinkLm4flashEsptool(unittest.TestCase):
         # the golden rosters set stlink verify only to true or leave it out
         _, calls, _, _ = capture(hf.flash_stlink, {'name': 'stlink', 'uid': 'S1', 'verify': False}, 'fw.elf',
                                  timeout=7)
-        self.assertEqual(calls, [('STM32_Programmer_CLI --connect port=swd sn=S1 --write fw.elf --go', {'timeout': 7})])
+        self.assertEqual(calls, [(['STM32_Programmer_CLI', '--connect', 'port=swd', 'sn=S1', '--write', 'fw.elf', '--go'],
+                                  {'timeout': 7})])
 
     def test_esptool_and_lm4flash_never_reset_alone(self):
         self.assertFalse(hasattr(hf, 'reset_esptool'))
@@ -734,6 +824,91 @@ class StlinkLm4flashEsptool(unittest.TestCase):
                 fn(*args)
 
 
+ODD = 'a b;$(touch PWNED)`id`*'   # spaces and shell metacharacters, none of which may act
+
+
+class LiteralArgv(unittest.TestCase):
+    """Every built command is an argv list and its environment a mapping: no shell parses a path,
+    a roster arg or a flash_args file name, so spaces and metacharacters arrive as written."""
+
+    def tools(self, d, *names):
+        """Fake tools on PATH printing each argument on its own line."""
+        bin_dir = Path(d) / 'bin dir'
+        bin_dir.mkdir()
+        for name in names:
+            tool = bin_dir / name
+            tool.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n')
+            tool.chmod(0o755)
+        return bin_dir
+
+    def test_every_builder_returns_an_argv_list(self):
+        flasher = {'name': 'x', 'uid': 'S1', 'args': '-f a.cfg'}
+        for fn, args, kw in ((hf.flash_stlink, ('fw',), {}), (hf.reset_stlink, (), {}),
+                             (hf.flash_openocd, ('fw',), {}), (hf.reset_openocd, (), {}),
+                             (hf.flash_lm4flash, ('fw',), {}), (hf.flash_jlink, ('fw',), {}),
+                             (hf.reset_jlink, (), {})):
+            with self.subTest(fn=fn.__name__):
+                _, calls, _, _ = capture(fn, flasher, *args, timeout=7, **kw)
+                self.assertTrue(calls and all(isinstance(c, list) and all(isinstance(w, str) for w in c)
+                                              for c, _ in calls), calls)
+        rescue = {'name': 'openocd', 'uid': 'S1', 'args': '-f interface/cmsis-dap.cfg -f target/rp2350.cfg'}
+        _, calls, _, _ = capture(hf.rescue_openocd, rescue, hf.DAP_WEDGED[0], timeout=7)
+        self.assertEqual(calls[0][0][-6:], ['-f', 'interface/cmsis-dap.cfg', '-f', 'target/rp2350-rescue.cfg',
+                                            '-c', 'shutdown'])
+        self.assertIsInstance(hf.openocd_cmd_base(flasher), list)
+
+    def test_roster_args_are_split_as_words_never_expanded(self):
+        _, calls, _, _ = capture(hf.flash_lm4flash, {'name': 'lm4flash', 'uid': 'S1', 'args': "-v '$HOME x' *"},
+                                 ODD, timeout=7)
+        self.assertEqual(calls, [(['lm4flash', '-s', 'S1', '-v', '$HOME x', '*', ODD], {'timeout': 7})])
+
+    def test_paths_with_spaces_and_metacharacters_reach_the_tool_literally(self):
+        with tempfile.TemporaryDirectory() as d:
+            bin_dir = self.tools(d, 'STM32_Programmer_CLI', 'lm4flash')
+            with mock.patch.dict(os.environ, {'PATH': f'{bin_dir}{os.pathsep}{os.environ["PATH"]}'}):
+                st = hf.flash_stlink({'name': 'stlink', 'uid': 'S1'}, ODD, timeout=10, run=quiet_run(d))
+                lm = hf.flash_lm4flash({'name': 'lm4flash', 'uid': 'S1', 'args': "'-x y'"}, ODD, timeout=10,
+                                       run=quiet_run(d))
+            self.assertNotIn('PWNED', os.listdir(d))
+        self.assertEqual(st.stdout.splitlines(), ['--connect', 'port=swd', 'sn=S1', '--write', ODD, '--go'])
+        self.assertEqual(lm.stdout.splitlines(), ['-s', 'S1', '-x y', ODD])
+
+    def test_esptool_takes_its_executable_and_files_literally_with_its_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = self.tools(d, 'my esptool') / 'my esptool'
+            build = Path(d) / 'build $x'
+            build.mkdir()
+            with mock.patch.dict(os.environ):
+                os.environ.pop('NO_COLOR', None)
+                seen = []
+
+                def run(cmd, **kw):
+                    seen.append(kw['env'])
+                    return quiet_run(build)(cmd, **kw)
+                r = hf.flash_esptool({'name': 'esptool', 'uid': 'U', 'args': ''}, chip='esp32s3', port='/dev/x y',
+                                     flash_args=f"--flash_mode dio 0x0 'boot loader.bin' 0x10000 {shlex.quote(ODD)}",
+                                     cwd=str(build), timeout=10, run=run, esptool=str(exe))
+            self.assertNotIn('PWNED', os.listdir(build))
+        self.assertEqual(seen, [{'NO_COLOR': '1'}])
+        self.assertEqual(r.args[0], str(exe))
+        self.assertEqual(r.stdout.splitlines(), ['--chip', 'esp32s3', '-p', '/dev/x y', '--before=default_reset',
+                                                 '--after=hard_reset', 'write_flash', '--flash_mode', 'dio', '0x0',
+                                                 'boot loader.bin', '0x10000', ODD])
+
+    def test_a_missing_esptool_executable_is_refused(self):
+        for exe in ('', None, 3):
+            with self.subTest(exe=exe), self.assertRaises(ValueError):
+                hf.esptool_argv(exe, '--chip', 'esp32s3')
+
+
+def quiet_run(cwd):
+    """The provider runner in `cwd`, as a caller injects it."""
+    def run(cmd, **kw):
+        kw.pop('cwd', None)
+        return hf.hil_process.run_cmd(cmd, str(cwd), **kw)
+    return run
+
+
 class DefaultRunner(unittest.TestCase):
     def test_run_defaults_to_the_provider_runner(self):
         """No run= reaches hil_process.run_cmd with the caller's bound: a fake tool on PATH."""
@@ -757,7 +932,7 @@ class Openocd(unittest.TestCase):
 
     def test_vid_pid_multiple_pairs(self):
         cmd = hf.openocd_cmd_base({'uid': 'S1', 'args': '-f i.cfg', 'vid_pid': '0x2e8a 0x000c 0x2e8a 0x000d'})
-        self.assertIn('-c "adapter usb vid_pid 0x2e8a 0x000c 0x2e8a 0x000d"', cmd)
+        self.assertEqual(cmd[-4:], ['-c', 'adapter usb vid_pid 0x2e8a 0x000c 0x2e8a 0x000d', '-f', 'i.cfg'])
 
     def test_no_pin_warns_once_on_stderr(self):
         err = io.StringIO()

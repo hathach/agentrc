@@ -15,6 +15,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import shlex
 import shutil
 import signal
 import subprocess
@@ -153,7 +154,7 @@ class Engine(unittest.TestCase):
 
     def tracked(self, cmd, cwd=None, *, timeout, settle, state_dir, **kw):
         self.assertEqual(state_dir, str(self.state))
-        name = cmd.rsplit('/', 1)[-1]
+        name = (shlex.join(cmd) if isinstance(cmd, list) else cmd).rsplit('/', 1)[-1]
         self.ran.append(name)
         out = self.outcomes.get(name, (0, 'done', 'ok'))
         if isinstance(out, BaseException):

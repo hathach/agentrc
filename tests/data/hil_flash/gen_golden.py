@@ -87,6 +87,8 @@ def record(case, module, invoke, normalise_cmd) -> dict:
             script = None
             if isinstance(cmd, str) and '-CommandFile ' in cmd:
                 script = Path(shlex.split(cmd.rsplit('-CommandFile ', 1)[1])[0]).read_text()
+            elif isinstance(cmd, list) and '-CommandFile' in cmd:
+                script = Path(cmd[cmd.index('-CommandFile') + 1]).read_text()
             calls.append({'cmd': normalise_cmd(cmd, ctx), 'kw': kw, 'script': script})
             now[0] += case['took']
             results.append(subprocess.CompletedProcess(cmd, next(rcs), f'out{len(results)}', None))
