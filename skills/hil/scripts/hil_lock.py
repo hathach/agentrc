@@ -925,14 +925,16 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
     hold. A handle whose record is not shown protected raises ValueError before anything is
     touched: the caller still owns every handle, and must end or protect them itself.
     Otherwise each record is first rewritten with `detail`, `receipts` and the lock set, so
-    a takeover of one board still covers them all; a rewrite cut short leaves the protected
-    record or an unreadable one, both recovery blockers. A handoff that fails, each of its
-    waits bounded by `wait`, raises LockUnavailable with such a record, or a cleanup-holder
-    record naming the holder it ended, left as the blocker; an
-    interrupt ends it the same way and propagates. With `receipts` (hil_process.run_tracked's)
-    the holder's release predicate is every one rechecking `done`. `extra` adds fields to the
-    cleanup-holder record. Past the ValueError the caller closes its handles either way,
-    never clearing them. Needs hil_process.py beside this file, with or without receipts."""
+    a takeover of any rewritten board covers them all; a board whose rewrite failed keeps
+    its prior record, so its own takeover covers only what that names (the failure message
+    names it); a rewrite cut short leaves the protected record or an unreadable one, both
+    recovery blockers. A handoff that fails, each of its waits bounded by `wait`, raises
+    LockUnavailable with such a record, or a cleanup-holder record naming the holder it
+    ended, left as the blocker; an interrupt ends it the same way and propagates. With
+    `receipts` (hil_process.run_tracked's) the holder's release predicate is every one
+    rechecking `done`. `extra` adds fields to the cleanup-holder record. Past the ValueError
+    the caller closes its handles either way, never clearing them. Needs hil_process.py
+    beside this file, with or without receipts."""
     unprotected = [b for b, fh in handles.items() if not _protected_handle(fh)]
     if unprotected:
         raise ValueError(f'cleanup holder handoff refused: {", ".join(unprotected)} not taken protected; '
