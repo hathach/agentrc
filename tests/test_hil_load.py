@@ -239,6 +239,45 @@ class Load(unittest.TestCase):
         t.join(10)
         self.assertIs(out.get('value'), m)
 
+    def test_two_paths_loaded_at_once_under_one_name_have_one_winner(self):
+        ctx = self.ctx(barrier=threading.Barrier(2))
+        paths = [self.write(f'{d}/a.py', 'import time\ntime.sleep(0.3)\nDONE = True\n') for d in ('one', 'two')]
+        name = self.name('a')
+
+        def racer(path):
+            ctx.barrier.wait(10)
+            return hl.load(name, path)
+        runs = [self.thread(lambda p=p: racer(p)) for p in paths]
+        for t, _ in runs:
+            t.join(30)
+            self.assertFalse(t.is_alive())
+        outs = [out for _, out in runs]
+        won = [out['value'] for out in outs if 'value' in out]
+        lost = [out['error'] for out in outs if 'error' in out]
+        self.assertEqual((len(won), len(lost)), (1, 1), outs)
+        self.assertIsInstance(lost[0], ImportError)
+        self.assertIn('is already loaded from', str(lost[0]))
+        self.assertIs(sys.modules[name], won[0])
+        self.assertTrue(won[0].DONE)
+
+    def test_an_ordinary_import_that_fails_while_waited_for_is_not_published(self):
+        ctx = self.ctx(started=threading.Event(), go=threading.Event())
+        mod = self.name('failing')
+        p = self.write(f'{mod}.py', f'import sys\nctx = sys.modules[{self.name("ctx")!r}]\n'
+                                    f'ctx.started.set()\nctx.go.wait(10)\nraise RuntimeError("failed run")\n')
+        self.on_path()
+        t, out = self.thread(lambda: importlib.import_module(mod))
+        self.assertTrue(ctx.started.wait(10))
+        timer = threading.Timer(0.3, ctx.go.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with self.assertRaisesRegex(ImportError, 'failed to initialize in another thread'):
+            hl.load(self.name('alias'), p)
+        t.join(10)
+        self.assertIsInstance(out.get('error'), RuntimeError)
+        self.assertFalse(self.name('alias') in sys.modules)
+        self.assertFalse(mod in sys.modules)
+
     def test_a_cross_thread_cycle_with_an_ordinary_import_ends(self):
         """Thread A loads a.py, which imports b; thread B imports b, which loads a.py. Each ends, with a
         complete module or an error, never a partial one or a hang."""
