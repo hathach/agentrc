@@ -23,6 +23,7 @@ except ImportError:   # Windows: a consumer's copy-back location
     fcntl = None
     import msvcrt
 
+FILES = ()   # loads nothing by path, and is loadable without hil_load.py (hil_report_core)
 NOTICE = '**HIL report unavailable'
 
 

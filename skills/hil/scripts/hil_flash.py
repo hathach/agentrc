@@ -29,16 +29,25 @@ from typing import NamedTuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYOCD_LAUNCHER = os.path.join(HERE, 'pyocd', 'run_pyocd.py')
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py',
+         'skills/hil/scripts/pyocd/run_pyocd.py', 'skills/hil/scripts/pyocd/user_script.py')
 
 
-def _load(name):
-    spec = importlib.util.spec_from_file_location(f'agentrc_{name}', os.path.join(HERE, f'{name}.py'))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
 
 
-hil_process = _load('hil_process')
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
+hil_process = hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 _VID_PID_WARNED: set = set()   # one warning per probe, not per command
 

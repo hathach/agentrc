@@ -47,18 +47,26 @@ RE_FAIL = re.compile(r'test (\d+) --> (\d+) \((.*)\)')
 _HEX4 = re.compile(r'[0-9a-f]{4}\Z')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py')
 
 
-def _load(name):
-    spec = importlib.util.spec_from_file_location(f'agentrc_{name}', os.path.join(HERE, f'{name}.py'))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
 
 
-# find_device's walk and bounded reads. A harness that loads usb_observe itself assigns its
-# instance here, so the strand memo its path_stranded checks read is the one find_device fed.
-usb_observe = _load('usb_observe')
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
+# find_device's walk and bounded reads: the process's one usb_observe (hil_load), so the strand
+# memo a harness's path_stranded checks read is the one find_device fed
+usb_observe = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 
 SERIAL_GRACE = 1.0   # find_device's bound on one `serial` read, tighter than usb_observe's
                      # default on purpose: a runner calls it after every case and in its

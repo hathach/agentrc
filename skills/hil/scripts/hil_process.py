@@ -57,6 +57,8 @@ import threading
 import time
 from typing import Any
 
+FILES = ()   # launches only itself by path (hil_load.py)
+
 # Post-SIGKILL reap, spent ON TOP of a timeout whenever the child has to be killed. A caller
 # budgeting several bounded steps must add one of these PER STEP, or its own outer bound fires
 # mid-step -- for a flasher, orphaning it on the probe.

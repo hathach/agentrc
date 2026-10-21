@@ -51,6 +51,8 @@ except ImportError:  # Windows
     fcntl = None
     import msvcrt
 
+FILES = ()   # loads and launches nothing by path (hil_load.py)
+
 
 class RemoteError(SystemExit):
     def __init__(self, why):

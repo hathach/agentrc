@@ -69,17 +69,27 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_process.py',
+         'skills/hil/scripts/usb_observe.py', 'skills/usb-kernel-recover/scripts/usb_recover.sh',
+         'skills/usb-kernel-recover/scripts/root_port_cycle.py')
 
 
-def _load(name):
-    spec = importlib.util.spec_from_file_location(f'agentrc_{name}', os.path.join(HERE, f'{name}.py'))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
 
 
-hil_lock = _load('hil_lock')
-uo = _load('usb_observe')
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
+hil_lock = hil_load.load_file('skills/hil/scripts/hil_lock.py')
+uo = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 
 LOCK_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs

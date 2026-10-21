@@ -19,6 +19,24 @@ import subprocess
 import sys
 import time
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py')
+
+
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
+
+
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
 
 BOARD_LOCK_DIR = '/tmp/tinyusb-hil-locks'
 CI_REASON = 'hil_test.py'
@@ -493,20 +511,9 @@ def _wait_cleared(boards, pid, start, deadline) -> list:
         time.sleep(0.05)
 
 
-_hil_process = None
-
-
 def _process():
-    """hil_process, loaded from beside this file on first use: only the hand-over and a release
-    predicate need it."""
-    global _hil_process
-    if _hil_process is None:
-        spec = importlib.util.spec_from_file_location(
-            'agentrc_hil_process', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hil_process.py'))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _hil_process = mod
-    return _hil_process
+    """hil_process, loaded on first use: only the hand-over and a release predicate need it."""
+    return hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 
 def _receipt_text(r) -> str:

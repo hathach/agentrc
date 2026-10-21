@@ -9,6 +9,8 @@ import os
 import re
 import threading
 
+FILES = ()   # loads and launches nothing by path (hil_load.py)
+
 # Roots of the scan and the stray-holder lookup; module globals so unit tests can point them at a tree
 SYS_USB_DEVICES = '/sys/bus/usb/devices'
 PROC_ROOT = '/proc'

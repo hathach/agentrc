@@ -40,22 +40,31 @@ import os
 import re
 import secrets
 import shutil
+import sys
 import time
 import unicodedata
 from pathlib import Path
 from typing import Callable, NamedTuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_report_notice.py')
 
 
-def _load(name):
-    spec = importlib.util.spec_from_file_location(f'agentrc_{name}', os.path.join(HERE, f'{name}.py'))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
 
 
-hil_report_notice = _load('hil_report_notice')
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
+hil_report_notice = hil_load.load_file('skills/hil/scripts/hil_report_notice.py')
 NOTICE = hil_report_notice.NOTICE
 _legacy_section, _read_bytes = hil_report_notice._legacy_section, hil_report_notice._read_bytes
 _stage, _replace_one = hil_report_notice._stage, hil_report_notice._replace_one

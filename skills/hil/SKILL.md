@@ -69,8 +69,8 @@ nothing in it through a link.
   as that user or root.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
   ends with `release_board_lock`, or hands its held locks to a cleanup holder
-  with `hand_to_cleanup_holder`, which loads `scripts/hil_process.py` from
-  beside the lock helper, so a consumer stages both; given the receipts of runs
+  with `hand_to_cleanup_holder`, which loads `scripts/hil_process.py` (in the
+  lock helper's `FILES`, below); given the receipts of runs
   not proven ended, that holder clears only once each rechecks `done`, and
   `release --token` refuses up front naming the open receipt, rechecked as the
   holder's OS user when root releases it. A cleanup holder of its own waits in
@@ -221,6 +221,7 @@ recovery stay the contract's.
 
 | Script | Gives |
 |---|---|
+| `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (`farm-check` skill) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
@@ -230,6 +231,16 @@ recovery stay the contract's.
 | `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 
+- Load agentrc files through `hil_load.py` (its docstring has the bootstrap):
+  `load(name, path)` reuses the module already loaded from that file under any
+  name, so the harness's names and the scripts' own `agentrc_<stem>` loads are
+  one instance (one strand memo, one runner), and refuses a second checkout or
+  pin under one name. A harness loader of its own is reused only when it
+  registers what it loads in `sys.modules`, before the scripts load it.
+- Each script exports `FILES`, a literal of the agentrc-root-relative files it
+  loads or launches by path, transitively, and refuses at import naming any
+  that is missing. What a harness requires and stages is each script it loads
+  plus its `FILES`, never a restated list; `hil_report_notice.py` loads alone.
 - The farm check engine releases a board it reserved (`protected=True`) only
   once every process it started there is proven ended: `run_tracked`'s
   `done`, or a `recheck` of its receipt that answers `done`. Anything else

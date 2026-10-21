@@ -63,21 +63,30 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/scripts/hil_process.py',
+         'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/pyocd/run_pyocd.py',
+         'skills/hil/scripts/pyocd/user_script.py', 'skills/target-debug/scripts/esp_session.py')
 
 
-def _load(name, path):
-    spec = importlib.util.spec_from_file_location(f'agentrc_{name}', path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
 
 
-usb_observe = _load('usb_observe', os.path.join(HERE, 'usb_observe.py'))
-hil_process = _load('hil_process', os.path.join(HERE, 'hil_process.py'))
-hil_flash = _load('hil_flash', os.path.join(HERE, 'hil_flash.py'))
-# Tcl token check, receipts and process identity; a consumer staging this skill stages it too
-ESP_SESSION = os.path.join(HERE, '..', '..', 'target-debug', 'scripts', 'esp_session.py')
-esp_session = _load('esp_session', ESP_SESSION)
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
+usb_observe = hil_load.load_file('skills/hil/scripts/usb_observe.py')
+hil_process = hil_load.load_file('skills/hil/scripts/hil_process.py')
+hil_flash = hil_load.load_file('skills/hil/scripts/hil_flash.py')
+# Tcl token check, receipts and process identity
+esp_session = hil_load.load_file('skills/target-debug/scripts/esp_session.py')
 
 # The build whose program_esp, flash write_image/read_bank, esp_usb_jtag and shutdown paths were
 # read; another build is refused until its source is checked again. The pin also covers the `esp`

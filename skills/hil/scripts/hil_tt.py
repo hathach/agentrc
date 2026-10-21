@@ -25,6 +25,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py')
 SYS_USB = Path('/sys/bus/usb/devices')
 _CTRLTRANSFER = struct.Struct('@BBHHHIP')                   # struct usbdevfs_ctrltransfer
 USBDEVFS_CONTROL = 0xC0005500 | _CTRLTRANSFER.size << 16   # _IOWR('U', 0, ...)
@@ -36,18 +37,26 @@ HELPER_TIMEOUT = 10
 # still be waiting there, so another would only queue behind it.
 _unconfirmed: set = set()
 
-_hil_process = None
+
+def _hil_load():
+    """hil_load.py from beside this file, the process's one `agentrc_hil_load`."""
+    spec = importlib.util.spec_from_file_location('agentrc_hil_load', os.path.join(HERE, 'hil_load.py'))
+    if spec.name not in sys.modules:
+        if not os.path.isfile(spec.origin):
+            raise ImportError(f'{spec.origin} is missing')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        sys.modules.setdefault(spec.name, mod)
+    return sys.modules[spec.name].load(spec.name, spec.origin)
+
+
+if __name__ != '__main__':      # the root child loads nothing but this file
+    hil_load = _hil_load()
+    hil_load.require(__file__, FILES)
 
 
 def _process():
-    # loaded on first use, not at import: the root child runs this file alone
-    global _hil_process
-    if _hil_process is None:
-        spec = importlib.util.spec_from_file_location('agentrc_hil_process', os.path.join(HERE, 'hil_process.py'))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _hil_process = mod
-    return _hil_process
+    return hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 
 def tt_port(busport, speed):

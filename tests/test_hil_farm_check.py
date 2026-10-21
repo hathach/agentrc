@@ -42,6 +42,7 @@ eng = load('hil_farm_check')
 hf = load('hil_flash')
 lk = eng.hil_lock
 core = eng.report_core
+RECHECK = eng.hil_process.recheck   # before Engine stubs it: hil_lock's release predicate is the same instance
 
 BOARD = {'name': 'b', 'uid': 'U', 'flasher': {'name': 'lm4flash', 'uid': 'P', 'args': ''}}
 LOCAL = {'kind': 'local', 'receipt': 'build-receipt.json'}
@@ -706,6 +707,7 @@ class Engine(unittest.TestCase):
         self.assertTrue(lk.is_cleanup_holder(rec))
         self.assertTrue(lk._holds_flock(rec['pid'], lk.lock_path('b')))
         self.assertTrue(rec['receipts'])         # its release predicate
+        patch(self, eng.hil_process, 'recheck', RECHECK)
         signals = []
         with mock.patch.object(lk.signal, 'pidfd_send_signal', lambda fd, sig: signals.append(sig)):
             # its receipt cannot be rechecked: unknown, refused up front naming it and the holder
