@@ -9,8 +9,12 @@ load(name, path) returns the module of the file at `path`, registered as sys.mod
   two checkouts or pins in one process;
 - the same resolved path registered under another name (a consumer's own path loader that
   registers what it loads, or another load() name): that module, registered as `name` too;
-- otherwise the file runs as a new module registered as `name` before it runs (pickle and a
-  circular load find it); one whose run raises is removed again.
+- otherwise the file runs as a new module, marked initializing and registered as `name` before
+  it runs (pickle finds it), under Python's import lock for `name`; one whose run raises is
+  removed under every name it got.
+
+A module still running is never returned: a load waits for another thread's run (its own or an
+ordinary import's), and raises ImportError for a circular load or a cross-thread cycle.
 
 load_file(rel) is load('agentrc_<stem>', ROOT/rel), the names the scripts load each other
 under. Each script exports FILES, the launch-time closure of the ROOT-relative files it loads
@@ -39,46 +43,73 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-import threading
+# Python's own per-module import locks (private, unchanged since 3.4). Holding them, a load waits for
+# and is waited on by ordinary imports, and a wait that would close a cycle across threads raises
+# _DeadlockError instead of hanging.
+from importlib._bootstrap import _DeadlockError, _ModuleLockManager
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
-# a nested load (a module loading its siblings as it runs) comes from the same thread
-_lock = threading.RLock()
+_FILE_LOCK = 'hil_load file '   # + resolved path: one load of a file at a time, whatever its names
 
 
 def _origin(module):
     f = getattr(module, '__file__', None)
-    return os.path.realpath(f) if f else None
+    return os.path.realpath(f) if isinstance(f, str) else None
+
+
+def _complete(module, name):
+    """`module` once no other thread runs it; ImportError while it is still running (a circular load,
+    or a cycle with another thread's import), never a partial module."""
+    spec = getattr(module, '__spec__', None)
+    if getattr(spec, '_initializing', False):
+        try:
+            with _ModuleLockManager(spec.name):
+                pass
+        except _DeadlockError:
+            pass
+        if getattr(spec, '_initializing', False):
+            raise ImportError(f'{name}: {module.__file__} is still being initialized', name=name)
+    return module
 
 
 def load(name: str, path) -> object:
     real = os.path.realpath(path)
-    with _lock:
-        mod = sys.modules.get(name)
-        if mod is not None:
-            if _origin(mod) != real:
-                raise ImportError(f'{name} is already loaded from {_origin(mod) or "no file"}, '
-                                  f'not {real}: one process loads one copy of it', name=name, path=real)
-            return mod
-        base = os.path.basename(real)
-        for other in list(sys.modules.values()):
-            f = getattr(other, '__file__', None)
-            if f and os.path.basename(f) == base and os.path.realpath(f) == real:
-                sys.modules[name] = other
-                return other
-        if not os.path.isfile(real):
-            raise ImportError(f'{real} is missing', name=name, path=real)
-        spec = importlib.util.spec_from_file_location(name, real)
-        mod = importlib.util.module_from_spec(spec)
+    try:
+        with _ModuleLockManager(_FILE_LOCK + real):
+            return _load_locked(name, real)
+    except _DeadlockError as e:
+        raise ImportError(f'{name}: loading {real} deadlocked with an import in another thread ({e})',
+                          name=name, path=real) from e
+
+
+def _load_locked(name, real):
+    mod = sys.modules.get(name)
+    if mod is not None:
+        if _origin(mod) != real:
+            raise ImportError(f'{name} is already loaded from {_origin(mod) or "no file"}, '
+                              f'not {real}: one process loads one copy of it', name=name, path=real)
+        return _complete(mod, name)
+    for other in list(sys.modules.values()):
+        if _origin(other) == real:
+            sys.modules[name] = _complete(other, name)
+            return other
+    if not os.path.isfile(real):
+        raise ImportError(f'{real} is missing', name=name, path=real)
+    spec = importlib.util.spec_from_file_location(name, real)
+    mod = importlib.util.module_from_spec(spec)
+    spec._initializing = True          # as importlib marks a running module, before it is registered
+    with _ModuleLockManager(name):     # an ordinary import of `name` waits for the run
         sys.modules[name] = mod
         try:
             spec.loader.exec_module(mod)
         except BaseException:
-            if sys.modules.get(name) is mod:
-                del sys.modules[name]
+            for key, value in list(sys.modules.items()):
+                if value is mod:       # its own name and any alias registered while it ran
+                    del sys.modules[key]
             raise
-        return mod
+        finally:
+            spec._initializing = False
+    return mod
 
 
 def load_file(rel: str) -> object:

@@ -10,6 +10,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import types
 import unittest
 from pathlib import Path, PurePosixPath
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -169,11 +171,101 @@ class Load(unittest.TestCase):
         with self.assertRaisesRegex(ImportError, 'no file'):
             hl.load(self.name('a'), self.counted('a.py'))
 
+    def ctx(self, **kw):
+        """What a test file's body reaches as sys.modules['hil_load_test_ctx']."""
+        sys.modules[self.name('ctx')] = ns = types.SimpleNamespace(hl=hl, **kw)
+        return ns
+
+    def test_a_module_loaded_under_a_differently_named_path_is_reused(self):
+        p = self.counted('real.py')
+        (self.dir / 'different_name.py').symlink_to(p)
+        own = importlib.util.spec_from_file_location(self.name('consumer'), self.dir / 'different_name.py')
+        mine = importlib.util.module_from_spec(own)
+        sys.modules[own.name] = mine
+        own.loader.exec_module(mine)
+        self.assertIs(hl.load(self.name('a'), p), mine)
+        self.assertEqual(self.runs('real.py'), 1)
+
+    def test_every_alias_of_a_failed_run_is_removed_and_a_retry_runs_again(self):
+        alias = self.name('alias')
+        p = self.write('bad.py', f'import sys\nsys.modules[{alias!r}] = sys.modules[__name__]\nraise RuntimeError("half run")\n')
+        with self.assertRaisesRegex(RuntimeError, 'half run'):
+            hl.load(self.name('bad'), p)
+        self.assertFalse(self.name('bad') in sys.modules)
+        self.assertFalse(alias in sys.modules)
+        p.write_text('DONE = True\n')
+        self.assertTrue(hl.load(alias, p).DONE)
+
+    def test_a_circular_load_is_refused_not_served_partial(self):
+        self.ctx()
+        p = self.write('circ.py', f'import sys\nctx = sys.modules[{self.name("ctx")!r}]\n'
+                                  f'try:\n    ctx.hl.load({self.name("alias")!r}, __file__)\n'
+                                  f'except ImportError as e:\n    REFUSED = str(e)\nDONE = True\n')
+        m = hl.load(self.name('circ'), p)
+        self.assertTrue(m.DONE)
+        self.assertIn('still being initialized', m.REFUSED)
+        self.assertFalse(self.name('alias') in sys.modules)
+        self.assertFalse(m.__spec__._initializing)
+
+    def on_path(self):
+        sys.path.insert(0, str(self.dir))
+        self.addCleanup(sys.path.remove, str(self.dir))
+
+    def thread(self, target):
+        out = {}
+
+        def run():
+            try:
+                out['value'] = target()
+            except BaseException as e:     # noqa: BLE001 - reported to the test
+                out['error'] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t, out
+
+    def test_an_ordinary_import_running_in_another_thread_is_waited_for(self):
+        ctx = self.ctx(started=threading.Event(), go=threading.Event())
+        mod = self.name('slow')
+        p = self.write(f'{mod}.py', f'import sys\nctx = sys.modules[{self.name("ctx")!r}]\n'
+                                    f'ctx.started.set()\nctx.go.wait(10)\nDONE = True\n')
+        self.on_path()
+        t, out = self.thread(lambda: importlib.import_module(mod))
+        self.assertTrue(ctx.started.wait(10))
+        timer = threading.Timer(0.3, ctx.go.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        m = hl.load(self.name('a'), p)
+        self.assertTrue(m.DONE, 'a partially initialized module was returned')
+        t.join(10)
+        self.assertIs(out.get('value'), m)
+
+    def test_a_cross_thread_cycle_with_an_ordinary_import_ends(self):
+        """Thread A loads a.py, which imports b; thread B imports b, which loads a.py. Each ends, with a
+        complete module or an error, never a partial one or a hang."""
+        ctx = self.ctx(a_running=threading.Event(), b_running=threading.Event())
+        a, b, c = self.name('cyc_a'), self.name('cyc_b'), self.name('ctx')
+        pa = self.write('cyc_a.py', f'import sys\nctx = sys.modules[{c!r}]\nctx.a_running.set()\n'
+                                    f'ctx.b_running.wait(10)\nimport {b}\nDONE = True\n')
+        self.write(f'{b}.py', f'import sys\nctx = sys.modules[{c!r}]\nctx.b_running.set()\nctx.a_running.wait(10)\n'
+                              f'A_DONE = getattr(ctx.hl.load({a!r}, {str(pa)!r}), "DONE", False)\nDONE = True\n')
+        self.on_path()
+        ta, out_a = self.thread(lambda: hl.load(a, pa))
+        tb, out_b = self.thread(lambda: importlib.import_module(b))
+        for t in (ta, tb):
+            t.join(30)
+            self.assertFalse(t.is_alive(), 'the import cycle hung')
+        for out in (out_a, out_b):
+            if 'value' in out:
+                self.assertTrue(out['value'].DONE)
+        if 'value' in out_b:
+            self.assertTrue(out_b['value'].A_DONE, 'b got a partially initialized a')
+        self.assertTrue('value' in out_a or 'value' in out_b, (out_a, out_b))
+
     def test_a_failed_run_is_rolled_back_and_the_next_load_runs_again(self):
         p = self.write('bad.py', 'import sys\nSEEN = __name__ in sys.modules\nraise RuntimeError("half run")\n')
         with self.assertRaisesRegex(RuntimeError, 'half run'):
             hl.load(self.name('bad'), p)
-        self.assertNotIn(self.name('bad'), sys.modules)
+        self.assertFalse(self.name('bad') in sys.modules)
         p.write_text('import sys\nSEEN = __name__ in sys.modules\n')
         self.assertTrue(hl.load(self.name('bad'), p).SEEN, 'registered before it runs')
 
@@ -181,13 +273,13 @@ class Load(unittest.TestCase):
         p = self.write('kb.py', 'raise KeyboardInterrupt\n')
         with self.assertRaises(KeyboardInterrupt):
             hl.load(self.name('kb'), p)
-        self.assertNotIn(self.name('kb'), sys.modules)
+        self.assertFalse(self.name('kb') in sys.modules)
 
     def test_a_missing_file_is_refused_naming_it(self):
         with self.assertRaises(ImportError) as cm:
             hl.load(self.name('none'), self.dir / 'none.py')
         self.assertIn(str((self.dir / 'none.py').resolve()), str(cm.exception))
-        self.assertNotIn(self.name('none'), sys.modules)
+        self.assertFalse(self.name('none') in sys.modules)
 
     def test_require_names_every_missing_file(self):
         with self.assertRaises(ImportError) as cm:
@@ -219,15 +311,14 @@ class Files(unittest.TestCase):
         seen = 0
         for rel in MODULES:
             files = files_of(rel)
-            if files is None:
-                self.assertFalse(closure(rel), f'{rel} loads or launches files by path but exports no FILES')
-                continue
+            self.assertIsNotNone(files, f'{rel} exports no FILES literal')
             seen += 1
             self.assertEqual(len(files), len(set(files)), rel)
             self.assertEqual(set(files), closure(rel), rel)
             for f in files:
                 self.assertTrue((ROOT / f).is_file(), f'{rel}: FILES names {f}, which does not exist')
-        self.assertGreater(seen, 8, 'the FILES walk went vacuous')
+        self.assertEqual(seen, len(MODULES))
+        self.assertGreater(seen, 12, 'the FILES walk went vacuous')
         self.assertIn('skills/usb-kernel-recover/scripts/root_port_cycle.py', files_of('skills/hil/scripts/hil_reserve.py'))
         self.assertIn('skills/target-debug/scripts/esp_session.py', files_of('skills/hil/scripts/hil_openocd_esp.py'))
 

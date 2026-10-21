@@ -16,6 +16,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+FILES = ()   # loads and launches nothing by path (hil_load.py)
+
 DFU_CLASS = (0xFE, 0x01, 0x01)
 DFU_DETACH = 0x00
 DETACH_TIMEOUT_MS = 1000   # wDetachTimeOut; a bitWillDetach device leaves the bus by itself

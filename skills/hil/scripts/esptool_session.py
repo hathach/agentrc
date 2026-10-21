@@ -18,6 +18,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+FILES = ()   # loads and launches nothing by path (hil_load.py)
+
 ESPTOOL_VERSION = '5.2.0'   # the API this session is written and bench-checked against
 
 
