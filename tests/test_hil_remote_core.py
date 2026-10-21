@@ -931,6 +931,32 @@ class Drift(unittest.TestCase):
             rc_.git(self.root / 'nope', 'rev-parse', 'HEAD')
         self.assertIn('git rev-parse HEAD', e.exception.code)
 
+    def test_a_hooks_git_environment_neither_redirects_nor_reconfigures_it(self):
+        other = Path(tempfile.mkdtemp(dir=self.root.parent))
+        self.addCleanup(shutil.rmtree, other)
+        subprocess.run(['git', '-C', str(other), 'init', '-q'], check=True)
+        (other / 'a').write_text('a')
+        subprocess.run(['git', '-C', str(other), 'add', 'a'], check=True)
+        before = (other / '.git' / 'index').read_bytes()
+        (self.root / 'é.txt').write_text('x')
+        self.commit('non-ascii')
+        head = rc_.git(self.root, 'rev-parse', 'HEAD')
+        (self.root / 'é.txt').write_text('edited')
+        os.environ.update({'GIT_DIR': str(other / '.git'), 'GIT_WORK_TREE': str(other),
+                           'GIT_INDEX_FILE': str(other / '.git' / 'index'),
+                           'GIT_OBJECT_DIRECTORY': str(other / '.git' / 'objects'),
+                           'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.quotePath', 'GIT_CONFIG_VALUE_0': 'false'})
+        self.assertEqual(rc_.checkout_drift(self.root, head),
+                         ['tracked files changed since HEAD: "\\303\\251.txt"'])
+        self.assertEqual((other / '.git' / 'index').read_bytes(), before)
+
+    def test_status_never_runs_the_checkouts_fsmonitor_hook(self):
+        marker = self.root.parent / f'{self.root.name}.fsmonitor'
+        self.addCleanup(marker.unlink, missing_ok=True)
+        self.git('config', 'core.fsmonitor', f'touch {shlex.quote(str(marker))}; false')
+        self.assertEqual(rc_.checkout_drift(self.root, self.head), [])
+        self.assertFalse(marker.exists())
+
 
 class RunRecords(unittest.TestCase):
     """A wrapper's local started/done records and the wait on them. No rig: the body is stubbed,
