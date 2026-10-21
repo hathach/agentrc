@@ -6,14 +6,21 @@ safety bound. Procedural, routing, budget, efficiency and wording rules get no p
 """
 import json
 import re
+import sys
 import tomllib
 import unittest
 from pathlib import Path
 
 import yaml
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 AGENTS = Path(__file__).resolve().parents[1] / 'agents'
 SKILLS = AGENTS.parent / 'skills'
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class AgentFiles(unittest.TestCase):

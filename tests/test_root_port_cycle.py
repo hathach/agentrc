@@ -4,6 +4,7 @@ character device, and nothing reaches a real one. Covers the selection of exactl
 refusals before any open or request, the identity token across runs, and that on needs no
 descriptor. The kernel's side is the skill's hardware trial, not this file's."""
 import os
+import sys
 import unittest
 
 if os.name == 'nt':
@@ -20,6 +21,8 @@ import types
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'usb-kernel-recover' / 'scripts' / 'root_port_cycle.py'
 spec = importlib.util.spec_from_file_location('root_port_cycle_under_test', SCRIPT)
@@ -31,6 +34,10 @@ RDEV = os.makedev(189, 1536)
 NODE = '/fake-dev/bus/usb/013/001'
 USB2_DESC = bytes([9, 0x29, 4, 0x09, 0x00, 10, 0, 0x00, 0xff])           # per-port LPSM, 4 ports
 SS_DESC = bytes([12, 0x2A, 4, 0x09, 0x00, 10, 0, 0, 0, 0, 0, 0])
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class FakeOS:

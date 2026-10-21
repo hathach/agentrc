@@ -10,6 +10,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 spec = importlib.util.spec_from_file_location(
     'ci_collect', Path(__file__).resolve().parents[1] / 'skills' / 'ci-rerun' / 'scripts' / 'collect.py')
@@ -31,6 +33,10 @@ GREPTILE = 'https://app.greptile.com/tinyusb/github/hathach/agentrc/-/pull/165'
 BELOW_TITLE = 'Base review: Confidence 4/5 \u2014 below your required 5/5'
 BELOW_SUMMARY = ("Greptile reviewed this pull request successfully \u2014 this check reflects your team's confidence threshold, not a review "
                  'failure. The review scored 4/5, below the 5/5 this repository requires for the check to pass.')
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 def greptile_run(title=BELOW_TITLE, summary=BELOW_SUMMARY, **over):

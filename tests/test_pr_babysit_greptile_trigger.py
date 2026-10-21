@@ -18,11 +18,17 @@ trigger = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(trigger)
 import facts  # noqa: E402
 import harvest  # noqa: E402  the script's GET helpers, which call facts.run through harvest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 HEAD = 'a' * 40
 PUSHED = '2026-10-21T10:00:00Z'
 RUN = {'id': 1, 'event': 'push', 'path': '.github/workflows/ci.yml', 'created_at': PUSHED, 'head_sha': HEAD,
        'head_branch': 'fix', 'head_repository': {'full_name': 'o/r'}}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Rig:

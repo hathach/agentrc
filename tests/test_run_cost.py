@@ -2,11 +2,14 @@
 import importlib.util
 import io
 import json
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'headless-chief' / 'scripts' / 'run_cost.py'
 spec = importlib.util.spec_from_file_location('run_cost', SCRIPT)
@@ -14,6 +17,10 @@ run_cost = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run_cost)
 
 SID = '11111111-2222-3333-4444-555555555555'
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 def turn(mid, model, ts, inp=0, out=0, read=0, w5m=0, w1h=0):

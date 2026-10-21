@@ -16,10 +16,16 @@ import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'usb_observe.py'
 NODE = '/dev/bus/usb/003/007'
 TESTUSB_ARGV = ['testusb', '-A', NODE, '-D', NODE, '-t', '11', '-c', '256']
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 def load():

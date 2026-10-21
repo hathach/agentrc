@@ -4,12 +4,15 @@ import importlib.util
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'sonar.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_sonar', SCRIPT)
@@ -18,6 +21,10 @@ spec.loader.exec_module(sonar)
 
 HEAD = 'a' * 40
 OTHER = 'b' * 40
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 def scanning(key, pr=7, project='o_r', login=sonar.BOT, link_pr=None):

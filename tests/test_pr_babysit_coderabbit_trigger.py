@@ -13,12 +13,18 @@ spec = importlib.util.spec_from_file_location('coderabbit_trigger', ROOT / 'skil
 trigger = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(trigger)
 import harvest  # noqa: E402  the script's GET helpers, which call facts.run through harvest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 HEAD = 'a' * 40
 BOX = '> - [ ] <!-- {"checkboxId":"e9bb8d72-00e8-4f67-9cb2-caf3b22574fe"} --> 🔍 Trigger review'
 BOT = 'coderabbitai[bot]'
 SKIP = {'context': 'CodeRabbit', 'state': 'success', 'updated_at': '2026-10-12T11:41:10Z',
         'description': 'Review skipped: manual review required for this OSS repository'}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Rig:

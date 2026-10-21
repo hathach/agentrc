@@ -2,6 +2,7 @@
 leaves running, a double-forked one or a zombie leader with a live thread included, is named and killed, whether
 the test passed, failed or timed out; a process that was already running is left alone; the child-subreaper flag
 comes back as it was, and a flag it cannot set or restore fails."""
+import ast
 import json
 import os
 import subprocess
@@ -189,6 +190,19 @@ class SurvivorGuard(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, 'could not restore the child-subreaper flag to'):
                 case.check()
 
+
+
+class EveryModule(unittest.TestCase):
+    def test_every_test_module_runs_under_the_survivor_guard(self):
+        unguarded = []
+        for path in sorted(Path(__file__).resolve().parent.glob('test_*.py')):
+            setups = [n for n in ast.parse(path.read_text()).body
+                      if isinstance(n, ast.FunctionDef) and n.name == 'setUpModule']
+            if not any(isinstance(c, ast.Call) and ast.unparse(c) in ('guard_survivors(__name__)',
+                                                                       'helpers.guard_survivors(__name__)')
+                       for s in setups for c in ast.walk(s)):
+                unguarded.append(path.name)
+        self.assertEqual(unguarded, [], 'each needs setUpModule(): guard_survivors(__name__)')
 
 if __name__ == '__main__':
     unittest.main()
