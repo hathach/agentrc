@@ -51,7 +51,8 @@ import comment_digest  # noqa: E402
 KNOWN = ('copilot', 'coderabbit', 'greptile', 'code-scanning')
 SETTLED = ('coderabbit', 'greptile')
 AUTHOR = {'code-scanning': 'github-advanced-security'}
-HEAD_ACTIVITIES = {'opened', 'synchronize', 'reopened', 'ready_for_review'}
+ARRIVALS = {'opened', 'synchronize'}
+HEAD_ACTIVITIES = ARRIVALS | {'reopened', 'ready_for_review'}
 CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit.ai -->'
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
@@ -357,12 +358,13 @@ def copilot(head, reviews):
     return record('copilot', state, reason, [f"review {v['id']} on {head[:8]}"], head if state != 'unknown' else None, kind)
 
 
-def head_event(repo, n, view, head):
-    """(the latest head event's time, its evidence), (None, why) when nothing dates it."""
+def head_event(repo, n, view, head, reopens=True):
+    """(the latest head event's time, its evidence), (None, why) when nothing dates it; without reopens, the head's
+    arrival alone, leaving out a reopen or ready event on the same SHA."""
     branch, head_repo = view['headRefName'], view['headRepository']['nameWithOwner']
     runs = sorted(pages(f'repos/{repo}/actions/runs?head_sha={head}', 'workflow_runs'), key=lambda x: stamp(x['created_at']), reverse=True)
-    best = next((x for x in runs if dates_head(repo, x, branch, head_repo)), None)
-    timeline = pages(f'repos/{repo}/issues/{n}/timeline')
+    best = next((x for x in runs if dates_head(repo, x, branch, head_repo, HEAD_ACTIVITIES if reopens else ARRIVALS)), None)
+    timeline = pages(f'repos/{repo}/issues/{n}/timeline') if reopens else []
     # A reopen or ready event keeps the head (GitHub leaves its commit_id null); one naming another commit is about an earlier push.
     tl = newest([e for e in timeline if e.get('event') in ('reopened', 'ready_for_review') and e.get('commit_id') in (None, head)], 'created_at')
     if tl and (best is None or stamp(tl['created_at']) > stamp(best['created_at'])):
@@ -372,14 +374,14 @@ def head_event(repo, n, view, head):
     return None, 'no push or head-activity pull_request run on this branch and head, and no reopen or ready event'
 
 
-def dates_head(repo, run_, branch, head_repo):
-    """Whether a run on the head was started by the head's arrival: a push, or a pull_request run on head activity only."""
+def dates_head(repo, run_, branch, head_repo, activities=HEAD_ACTIVITIES):
+    """Whether a run on the head was started by the head's arrival: a push, or a pull_request run on those activities only."""
     if run_.get('head_branch') != branch or (run_.get('head_repository') or {}).get('full_name') != head_repo:
         return False
     if run_.get('event') == 'push':
         return True
     types = pr_types(repo, run_['path'], run_['head_sha']) if run_.get('event') == 'pull_request' else None
-    return types is not None and types <= HEAD_ACTIVITIES
+    return types is not None and types <= activities
 
 
 @functools.cache

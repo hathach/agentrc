@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, adoptReviewedProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, greptileTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, adoptReviewedProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -132,6 +132,10 @@ const coderabbitTrigger = args.coderabbitTrigger ?? false
 if (typeof coderabbitTrigger !== 'boolean') throw new Error('coderabbitTrigger must be a boolean')
 if (coderabbitTrigger && args.autoPush !== true) throw new Error("coderabbitTrigger ticks CodeRabbit's Trigger review box: it needs autoPush")
 if (coderabbitTrigger && !autoRun.includes('coderabbit')) throw new Error(`coderabbitTrigger needs coderabbit in autoRun ${JSON.stringify(autoRun)}`)
+const greptileTrigger = args.greptileTrigger ?? false
+if (typeof greptileTrigger !== 'boolean') throw new Error('greptileTrigger must be a boolean')
+if (greptileTrigger && args.autoPush !== true) throw new Error('greptileTrigger comments `@greptileai` on the PR: it needs autoPush')
+if (greptileTrigger && !reviewers.includes('greptile')) throw new Error(`greptileTrigger needs greptile in reviewers ${JSON.stringify(reviewers)}`)
 const reviewLane = lane !== 'ci'
 // CodeRabbit's own check, by its exact name: the review lane waits on it, so CI leaves it out (#80). Never SonarCloud or code scanning, which are CI.
 const ciIgnored = reviewLane && autoRun.includes('coderabbit') ? ['CodeRabbit'] : []
@@ -282,10 +286,11 @@ if (args.state !== undefined && args.state !== null) {
     [st.deferrals, st.acceptedFailures, st.decisions, st.holds].every(Array.isArray) &&
     st.acceptedFailures.every(a => typeof (st.version === 3 ? a && a.key : a) === 'string') && (st.build === null || typeof st.build === 'string') &&
     (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
-    (st.last === null || (st.last && typeof st.last === 'object')) &&
+    (st.last === null || (st.last && typeof st.last === 'object')) && (st.greptileRequired === undefined || st.greptileRequired === true) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
+      (st.reviewClock.greptileAt == null || Number.isFinite(Date.parse(st.reviewClock.greptileAt))) &&
       (st.reviewClock.request === undefined || (st.reviewClock.request && Number.isFinite(Date.parse(st.reviewClock.request.retryAt)) &&
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
@@ -565,6 +570,11 @@ const CRTRIGGER = withSeal({
     retryAt: { type: ['string', 'null'] },
   },
 })
+const GTRIGGER = withSeal({
+  type: 'object', additionalProperties: false,
+  required: ['outcome', 'detail', 'at'],
+  properties: { error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' } },
+})
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
   required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'changes', 'refusal'],
@@ -646,13 +656,14 @@ const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
 const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
 const SONAR_SCRIPT = '~/.claude/skills/pr-babysit/scripts/sonar.py'
 const CRTRIGGER_SCRIPT = '~/.claude/skills/pr-babysit/scripts/coderabbit_trigger.py'
+const GTRIGGER_SCRIPT = '~/.claude/skills/pr-babysit/scripts/greptile_trigger.py'
 const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
 const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
 const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build.py'
 const SCOPE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/scope_check.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
-const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
+const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
 const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
@@ -828,7 +839,13 @@ let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
 // When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
 // triggeredAt: absent until this head's one CodeRabbit trigger, then when the script finished, or null when it failed.
+// greptileAt the same for its one `@greptileai` request.
 let reviewClock = restored ? restored.reviewClock : null
+// Latched by the first launch with greptileTrigger: from then on every head of this run needs Greptile's review, whatever
+// later launches pass; only posting the request stays with the switch.
+const greptileRequired = greptileTrigger || (!!restored && restored.greptileRequired === true)
+// The reviewers this cycle waits on: autoRun, and Greptile once its review is required.
+const waitedOn = greptileRequired && !autoRun.includes('greptile') ? [...autoRun, 'greptile'] : autoRun
 // A landed but unpushed commit is the caller's to decide, never the next baseline.
 const pendingOf = () => {
   const last = history[history.length - 1]
@@ -849,6 +866,7 @@ const pendingOf = () => {
 const stateOut = () => {
   const st = {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
+    ...(greptileRequired ? { greptileRequired } : {}),
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
     acceptedFailures: acceptedArg.map(a => a.key),
@@ -1001,7 +1019,7 @@ const reviewsWhy = (r) => {
     if ((b.state === 'settled') !== (b.kind !== null)) return `${b.bot} is ${b.state} with kind ${JSON.stringify(b.kind)}`
     if ((b.state === 'reviewed' || b.state === 'settled') && !b.evidence.some(e => e.trim())) return `${b.bot} ${b.state} with no evidence`
     if (b.state !== 'reviewed' && !b.reason.trim()) return `${b.bot} ${b.state} with no reason`
-    if (b.state === 'harvested' && (autoRun.includes(b.bot) || b.bot === 'copilot')) return `${b.bot} is harvested, a state only a reviewer whose state is not read takes`
+    if (b.state === 'harvested' && (waitedOn.includes(b.bot) || b.bot === 'copilot')) return `${b.bot} is harvested, a state only a reviewer whose state is not read takes`
     if (b.retryAt !== null && !(b.kind === 'limited' && Number.isFinite(Date.parse(b.retryAt)))) return `${b.bot} has retryAt ${JSON.stringify(b.retryAt)} on a ${b.state}/${b.kind} record`
   }
   const missing = reviewers.filter(bot => !seen.has(bot))
@@ -1026,7 +1044,7 @@ const settleBots = (r) => {
   const waitedMin = Math.floor((Date.parse(r.observedAt) - Date.parse(start)) / 60000)
   const unknown = {}
   const bots = r.bots.map(b => {
-    const done = !autoRun.includes(b.bot) || b.state === 'reviewed' || b.state === 'settled' ||
+    const done = !waitedOn.includes(b.bot) || b.state === 'reviewed' || b.state === 'settled' ||
       ((b.state === 'queued' || b.state === 'absent') && waitedMin >= REVIEW_CAP_MIN)
     if (done || b.state !== 'unknown') return { ...b, done }
     const reading = JSON.stringify([b.reason, b.evidence])
@@ -1040,7 +1058,7 @@ const settleBots = (r) => {
 }
 const botCell = (b, headWaitedMin) => {
   if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
-  if (!autoRun.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
+  if (!waitedOn.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
   const waitedMin = b.triggeredMin ?? headWaitedMin
   if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again after ${b.retryAt})`
   if (b.state === 'settled' && b.triggeredMin !== undefined) {
@@ -1054,7 +1072,7 @@ const botCell = (b, headWaitedMin) => {
   }
   return `${b.state} (${b.reason})`
 }
-const botOut = ({ done, triggeredMin, retryWaitMs, unknownMin, ...b }) => b
+const botOut = ({ done, triggeredMin, retryWaitMs, unknownMin, required, ...b }) => b
 const botsLine = (rs) => rs.bots.length === 0 ? 'no bot gates done'
   : rs.bots.map(b => `${b.bot} ${botCell(b, rs.waitedMin)}`).join(' · ')
 
@@ -1822,6 +1840,39 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   if (asking) waitAfter(cr, t.at, r.observedAt)
 }
 
+// A Greptile that reviews only on PR open never sees a pushed head unasked: under greptileTrigger, one `@greptileai` per
+// head once it stayed absent through a grace, then the silent-bot cap counted from the request.
+const GREPTILE_GRACE_MIN = 2
+const GTRIGGER_OUTCOMES = ['requested', 'already', 'notOpen', 'failed', 'uncertain', 'ambiguous']
+// Marks Greptile required; returns how its request ended when that leaves the head unreviewed.
+const requestGreptile = async (cycle, r, bots, ended) => {
+  const g = bots.bots.find(b => b.bot === 'greptile')
+  if (!g || !greptileRequired) return null
+  g.required = true
+  if (g.state !== 'absent' && g.state !== 'queued') return null
+  if (greptileTrigger && g.state === 'absent' && reviewClock.greptileAt === undefined) {
+    g.done = false
+    if (bots.waitedMin < GREPTILE_GRACE_MIN || await ended('greptile')) return null
+    const label = `greptile#${cycle}`
+    const t = await relayOnce(
+      `${IN_CHECKOUT}Ask Greptile to review PR #${args.pr}: run \`python3 ${GTRIGGER_SCRIPT} --pr ${args.pr} --head ${expectedHead}\` ` +
+      relayed(GTRIGGER) + ' Change nothing on GitHub yourself.',
+      { label, phase: 'Push', model: 'haiku', effort: 'low', schema: GTRIGGER })
+    const known = !!t && !t.error && GTRIGGER_OUTCOMES.includes(t.outcome)
+    const outcome = known ? t.outcome : 'failed'
+    log(`cycle ${cycle}: ${label}: ${outcome} (${known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`})`)
+    // What changed since the harvest is for the next harvest to read.
+    if (outcome === 'notOpen') return null
+    const asked = ['requested', 'already'].includes(outcome) && Number.isFinite(Date.parse(t.at))
+    // Once per head, whatever the outcome: a failed, uncertain or ambiguous request is never repeated into a second comment.
+    reviewClock.greptileAt = asked ? t.at : null
+    if (!asked) return outcome
+  }
+  if (typeof reviewClock.greptileAt === 'string') waitAfter(g, reviewClock.greptileAt, r.observedAt)
+  else if (reviewClock.greptileAt === null) g.done = true
+  return null
+}
+
 // The caller's replies on comments handed to it settle once reply.py reads both back at the head they were judged on; a dry run settles none. Returns the ids settled.
 const settlements = []
 let settlementsTried = false
@@ -2173,8 +2224,8 @@ const runLanes = async (cycle, entry, lanes) => {
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure; ` +
       `the reviewers to harvest on this PR are ${reviewers.join(', ')}, and no others: report one bot record for each; ` +
-      `${autoRun.length ? `of those, ${autoRun.join(', ')} auto-run on every push` : 'none of them auto-run'}. ${IN_CHECKOUT}` +
-      `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${autoRun.length ? ` --auto-run ${autoRun.join(',')}` : ''}\`. ` +
+      `${waitedOn.length ? `of those, ${waitedOn.join(', ')} auto-run on every push` : 'none of them auto-run'}. ${IN_CHECKOUT}` +
+      `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
       `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
@@ -2214,7 +2265,12 @@ const runLanes = async (cycle, entry, lanes) => {
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)
     if (r !== nobody) await triggerCodeRabbit(cycle, r, entry.bots, ended)
+    const unasked = r !== nobody ? await requestGreptile(cycle, r, entry.bots, ended) : null
     if (lanes.prState) return prEnded(cycle, lanes.prState)
+    if (unasked) {
+      log(`cycle ${cycle}: Greptile must review ${expectedHead.slice(0, 7)}, and its request ended ${unasked} — stopping, the head unreviewed`)
+      return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: entry.bots.bots.filter(b => b.bot === 'greptile').map(botOut) })
+    }
     const reviewsSettled = !!entry.bots && entry.bots.bots.every(b => b.done)
     const pendingBots = entry.bots ? entry.bots.bots.filter(b => !b.done) : []
 
@@ -2688,6 +2744,12 @@ const runLanes = async (cycle, entry, lanes) => {
           return stop(cycle, 'held-awaiting-caller', { outstanding: owedNow, held })
         }
         return unresolvedVerdict(cycle, owedNow)
+      }
+      const unreviewed = entry.bots.bots.find(b => b.required && b.state !== 'reviewed')
+      if (unreviewed) {
+        log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'}, but Greptile has not reviewed ${expectedHead.slice(0, 7)}, ` +
+          `and greptileTrigger made its review required: ${botCell(unreviewed, entry.bots.waitedMin)} — stopping`)
+        return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: [botOut(unreviewed)] })
       }
       log(`cycle ${cycle}: ${acceptedOnly(c) ? `CI red only from ${c.realFailures.length} accepted failure(s)` : 'PR is green'} with no unresolved valid findings${deferrals.size ? `; ${deferrals.size} deferred` : ''}`)
       return {

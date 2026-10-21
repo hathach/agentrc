@@ -518,6 +518,11 @@ async function run(opts = {}) {
       const answer = typeof opts.crTrigger === 'function' ? opts.crTrigger(label) : 'crTrigger' in opts ? opts.crTrigger : { outcome: 'ticked', detail: 'comment 5' }
       return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
     }
+    if (label.startsWith('greptile#')) {
+      // greptile_trigger.py's line: requested unless opts.gTrigger(label) answers otherwise, finished when the validator last observed.
+      const answer = typeof opts.gTrigger === 'function' ? opts.gTrigger(label) : 'gTrigger' in opts ? opts.gTrigger : { outcome: 'requested', detail: 'comment 7' }
+      return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
+    }
     if (label.startsWith('crrequest#')) {
       // coderabbit_trigger.py --request's line: requested unless opts.crRequest(label) answers otherwise.
       const answer = typeof opts.crRequest === 'function' ? opts.crRequest(label) : 'crRequest' in opts ? opts.crRequest
@@ -7774,4 +7779,163 @@ test('a rejudge still refuses a repair that names no reply of ours', async () =>
   await assert.rejects(resumeAt(state, { reviews: { findings: [], replies: [], bots: 'reviewed' },
     args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, rejudge: [{ commentId: 2, reason: 'x' }] } }),
   /rejudge: comment 2 has no answer of ours in the state/)
+})
+
+// greptileTrigger (#185): Greptile reviews only on PR open in such a repository, so a pushed head is asked for once.
+const G = { reviewers: ['coderabbit', 'greptile'], autoRun: ['coderabbit'] }
+const GT = { ...G, greptileTrigger: true }
+const gAsks = (labels) => labels.filter(l => l.startsWith('greptile#'))
+const silentG = (over = {}) => quiet([bot('coderabbit'), absent('greptile', { reason: 'no check run and no applicable refusal on the head', ...over })])
+
+test('greptileTrigger waits out a grace with Greptile absent, asks once, then waits for its review', async () => {
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { ...GT, maxCycles: 6 },
+    reviewsPerCycle: () => ++n < 5 ? silentG() : quiet([bot('coderabbit'), bot('greptile')]),
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.equal(result.cycles, 5)
+  assert.deepEqual(gAsks(labels), ['greptile#3'], 'two minutes after the first observation, once')
+  const call = calls.find(c => c.label === 'greptile#3')
+  assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
+  assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
+  assert.ok(labels.includes('prstate#3-greptile'), 'the PR state is read before the comment')
+  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /of those, coderabbit, greptile auto-run on every push.*--auto-run coderabbit,greptile`/)
+  assert.ok(logs.includes('cycle 3: greptile#3: requested (comment 7)'), logs.join('\n'))
+  assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), greptileAt: at(2) })
+  assert.equal(result.state.greptileRequired, true)
+  assert.equal(result.state.config.autoRun.join(), 'coderabbit', 'the switch is not pinned')
+})
+
+test('a head Greptile never reviews within the cap after the request stops greptile-unreviewed, never passing', async () => {
+  const { result, logs, labels } = await run({ args: { ...GT, maxCycles: 8 }, minutesPerCycle: 2, reviews: silentG() })
+  assert.equal(result.pass, false)
+  assert.equal(result.reason, 'greptile-unreviewed')
+  assert.equal(result.cycles, 7, 'ten minutes from the request at minute 2')
+  assert.deepEqual(gAsks(labels), ['greptile#2'])
+  assert.equal(result.head, HEAD)
+  assert.deepEqual(result.bots.map(b => [b.bot, b.state]), [['greptile', 'absent']])
+  assert.ok(logs.some(l => /cycle 7: PR green, but Greptile has not reviewed 0f1e2d3, and greptileTrigger made its review required: absent, wait expired after 10m: head unreviewed/.test(l)), logs.join('\n'))
+})
+
+test('a failed, uncertain or lost request stops greptile-unreviewed at once and is never repeated', async () => {
+  for (const [gTrigger, line] of [
+    [{ outcome: 'failed', detail: 'the head event time is unknown' }, 'failed (the head event time is unknown)'],
+    [{ outcome: 'uncertain', detail: 'comment 9 was posted and does not read back' }, 'uncertain (comment 9 was posted and does not read back)'],
+    [{ outcome: 'ambiguous', detail: 'comment 9 was made at the head event second' }, 'ambiguous (comment 9 was made at the head event second)'],
+    [{ error: 'gh: HTTP 502', outcome: '', detail: '', at: '' }, 'failed (gh: HTTP 502)'],
+    [null, 'failed (no answer)'],
+  ]) {
+    const { result, logs, labels } = await run({ args: { ...GT, maxCycles: 5 }, minutesPerCycle: 3, gTrigger, reviews: silentG() })
+    assert.equal(result.reason, 'greptile-unreviewed', line)
+    assert.equal(result.cycles, 2)
+    assert.deepEqual(gAsks(labels), gTrigger === null ? ['greptile#2', 'greptile#2.retry'] : ['greptile#2'])
+    assert.ok(logs.includes(`cycle 2: greptile#2: ${line}`), logs.join('\n'))
+    assert.equal(result.state.reviewClock.greptileAt, null, 'tried, and not tried again')
+    assert.equal(result.state.greptileRequired, true)
+  }
+  // notOpen asks nothing: the next harvest reads what changed.
+  let n = 0
+  const moved = await run({ args: { ...GT, maxCycles: 4 }, minutesPerCycle: 3, gTrigger: { outcome: 'notOpen', detail: 'PR 3888 is closed' },
+    reviewsPerCycle: () => ++n < 3 ? silentG() : quiet([bot('coderabbit'), bot('greptile')]) })
+  assert.equal(moved.result.pass, true, moved.result.reason)
+  assert.deepEqual(gAsks(moved.labels), ['greptile#2'], 'the head is reviewed by the next harvest')
+})
+
+test('the obligation outlives the switch: a resume without greptileTrigger still waits and blocks, asking nothing', async () => {
+  const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
+  // Recorded during the grace, before the first yield.
+  const a = await run({ args: { ...YG, greptileTrigger: true }, reviews: silentG() })
+  assert.equal(a.result.reason, 'yielded')
+  assert.deepEqual(a.result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0) })
+  assert.equal(a.result.state.greptileRequired, true)
+  const b = await run({ args: { ...YG, state: a.result.state }, clockOffset: 3, reviews: silentG() })
+  assert.equal(b.result.reason, 'yielded', 'still waited on without the switch')
+  assert.deepEqual(gAsks(b.labels), [], 'and never asked without it')
+  assert.match(b.calls.find(c => c.label === 'reviews#2').prompt, /--auto-run coderabbit,greptile`/)
+  const c = await run({ args: { ...YG, state: b.result.state }, clockOffset: 10, reviews: silentG() })
+  assert.equal(c.result.reason, 'greptile-unreviewed')
+  // After a request, the cap runs from it.
+  const asked = await run({ args: { ...YG, greptileTrigger: true, state: a.result.state }, clockOffset: 3, reviews: silentG() })
+  assert.deepEqual(gAsks(asked.labels), ['greptile#2'])
+  assert.equal(asked.result.state.reviewClock.greptileAt, at(3))
+  const early = await run({ args: { ...YG, state: asked.result.state }, clockOffset: 12, reviews: silentG() })
+  assert.equal(early.result.reason, 'yielded', 'nine minutes after the request')
+  const late = await run({ args: { ...YG, state: asked.result.state }, clockOffset: 13, reviews: silentG() })
+  assert.equal(late.result.reason, 'greptile-unreviewed')
+  const reviewed = await run({ args: { ...YG, state: asked.result.state }, clockOffset: 5, reviews: quiet([bot('coderabbit'), bot('greptile')]) })
+  assert.equal(reviewed.result.pass, true, 'only its review discharges it')
+  await assert.rejects(run({ args: { ...YG, state: { ...asked.result.state, reviewClock: { ...asked.result.state.reviewClock, greptileAt: 'soon' } } } }), /not a pr-babysit state/)
+  await assert.rejects(run({ args: { ...YG, state: { ...asked.result.state, greptileRequired: false } } }), /not a pr-babysit state/)
+})
+
+test('a Greptile queued or working under the switch is required across a yield, and blocks unreviewed without it', async () => {
+  const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
+  for (const state of ['queued', 'working']) {
+    const seen = silentG({ state, sha: 'head', reason: `check run ${state}` })
+    const a = await run({ args: { ...YG, greptileTrigger: true }, reviews: seen })
+    assert.equal(a.result.reason, 'yielded', state)
+    assert.equal(a.result.state.greptileRequired, true, state)
+    assert.deepEqual(gAsks(a.labels), [], `${state}: Greptile is on it, nothing to ask`)
+    const b = await run({ args: { ...YG, state: a.result.state }, clockOffset: 3, reviews: seen })
+    assert.equal(b.result.reason, 'yielded', `${state}: still waited on`)
+    const c = await run({ args: { ...YG, state: b.result.state }, clockOffset: 11, reviews: silentG() })
+    assert.equal(c.result.reason, 'greptile-unreviewed', `${state}: gone without a review`)
+    assert.deepEqual(gAsks(c.labels), [])
+  }
+})
+
+test('a head Greptile already reviewed, or is scoring, is never asked again', async () => {
+  const below = bot('greptile', { reason: 'review posted, its confidence below the threshold: Base review: Confidence 4/5 — below your required 5/5' })
+  const { result, labels } = await gateRun([GREPTILE_GATE], { args: { ...GT, autoPush: true, maxCycles: 3 }, minutesPerCycle: 5, reviews: quiet([bot('coderabbit'), below]) })
+  assert.equal(result.reason, 'ci-red-greptile-gate')
+  assert.deepEqual(gAsks(labels), [])
+  const scoring = bot('greptile', { state: 'working', sha: 'head', reason: 'confidence result at t, its review on the head not posted yet' })
+  const waiting = await gateRun([GREPTILE_GATE], { args: { ...GT, autoPush: true, maxCycles: 3 }, minutesPerCycle: 5, reviews: quiet([bot('coderabbit'), scoring]) })
+  assert.deepEqual(gAsks(waiting.labels), [])
+  assert.equal(waiting.result.reason, 'reviews-pending')
+})
+
+test('without the switch Greptile is harvested only; the switch needs autoPush and greptile among the reviewers', async () => {
+  const { result, labels, calls } = await run({ args: { ...G, maxCycles: 3 } })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual(gAsks(labels), [])
+  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /--auto-run coderabbit`/)
+  assert.equal(result.state.greptileRequired, undefined)
+  await assert.rejects(run({ args: { ...GT, autoPush: false } }), /greptileTrigger comments `@greptileai` on the PR: it needs autoPush/)
+  await assert.rejects(run({ args: { ...GT, greptileTrigger: 'yes' } }), /greptileTrigger must be a boolean/)
+  await assert.rejects(run({ args: { greptileTrigger: true } }), /greptileTrigger needs greptile in reviewers \["coderabbit"\]/)
+  // With greptile auto-running too, the switch adds the request and the blocker.
+  const auto = await run({ args: { reviewers: ['greptile'], greptileTrigger: true, maxCycles: 8 }, minutesPerCycle: 2, reviews: quiet([absent('greptile')]) })
+  assert.equal(auto.result.reason, 'greptile-unreviewed')
+  assert.deepEqual(gAsks(auto.labels), ['greptile#2'])
+})
+
+test('the requirement latches for the run: a head adopted without the switch is still waited on and blocks unreviewed', async () => {
+  const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
+  const reviewedG = quiet([bot('coderabbit'), bot('greptile')])
+  // Latched even when Greptile already reviewed the head the switch first met.
+  for (const reviews of [silentG(), reviewedG]) {
+    const a = await run({ args: { ...YG, greptileTrigger: true }, reviews })
+    assert.equal(a.result.state.greptileRequired, true)
+    const b = await run({ args: { ...YG, state: a.result.state, adoptHead: ADOPT }, preflight: { head: ADOPT, prHead: HEAD }, clockOffset: 20, reviews: silentG() })
+    assert.equal(b.result.state.expectedHead, ADOPT)
+    assert.match(b.calls.find(c => c.label === 'reviews#2').prompt, /--auto-run coderabbit,greptile`/)
+    assert.equal(b.result.reason, 'yielded', 'the new head is waited on, not passed')
+    assert.deepEqual(gAsks(b.labels), [], 'nothing asked without the switch')
+    assert.equal(b.result.state.reviewClock.sha, ADOPT)
+    assert.equal(b.result.state.greptileRequired, true)
+    const c = await run({ args: { ...YG, state: b.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 31, reviews: silentG() })
+    assert.equal(c.result.reason, 'greptile-unreviewed')
+    const d = await run({ args: { ...YG, state: b.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 22, reviews: reviewedG })
+    assert.equal(d.result.pass, true, d.result.reason)
+  }
+  // With the switch back, the new head is asked about once, its timing fresh.
+  const a = await run({ args: { ...YG, greptileTrigger: true }, reviews: silentG() })
+  const b = await run({ args: { ...YG, greptileTrigger: true, state: a.result.state }, clockOffset: 3, reviews: silentG() })
+  assert.equal(b.result.state.reviewClock.greptileAt, at(3))
+  const pushed = await run({ args: { ...YG, greptileTrigger: true, state: b.result.state, adoptHead: ADOPT }, preflight: { head: ADOPT, prHead: HEAD }, clockOffset: 5, reviews: silentG() })
+  assert.deepEqual(pushed.result.state.reviewClock, { sha: ADOPT, eventAt: null, since: at(5) })
+  const asked = await run({ args: { ...YG, greptileTrigger: true, state: pushed.result.state }, preflight: { head: ADOPT, prHead: ADOPT }, clockOffset: 7, reviews: silentG() })
+  assert.deepEqual(gAsks(asked.labels), ['greptile#4'])
 })

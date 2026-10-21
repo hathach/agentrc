@@ -22,6 +22,18 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   hour away, naps until the reset and comments `@coderabbitai review` (a limit
   notice has no box), then waits the same way. Needs
   `autoPush` and `coderabbit` in `autoRun`; never restored from a state.
+- `greptileTrigger` (boolean, default false): set in the repository's
+  `CLAUDE.md` when Greptile reviews only on PR open, so a pushed head is
+  reviewed only on request. Greptile is then waited on, as if in `autoRun`.
+  Once per head, when Greptile has stayed absent for 2 minutes, comments
+  exactly `@greptileai` (`greptile_trigger.py`), then waits for the review up
+  to the silent-bot cap counted from the request. A head Greptile already
+  reviewed or is scoring is never asked about. The first launch with the switch
+  latches the run: its state requires Greptile's review of every later head,
+  so a launch without the switch keeps waiting on Greptile, asking nothing. A
+  failed, uncertain or ambiguous request, or no review within the cap, stops
+  `greptile-unreviewed`, never a pass. Needs `autoPush` and `greptile` in
+  `reviewers`; the switch itself is never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
   paths are ignored; any other pre-existing edit refuses the start.
 - `protected`: regex over repo-relative paths kept out of every fix scope (a

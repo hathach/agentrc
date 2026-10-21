@@ -80,6 +80,10 @@ STALLED = {
     'ci-red-greptile-gate': "Greptile's confidence check fails: a score below the repository's threshold needs a new Greptile review "
                             "of the head, else the user accepts it by its key; a check that could not be read as one (complete false) "
                             "needs inspecting first",
+    'greptile-unreviewed': 'Greptile has not reviewed the head, and a greptileTrigger launch made its review required for every head of '
+                           'this run: its request failed, was uncertain (the detail names the attempt record) or ambiguous, or no '
+                           'review came within the cap after it; read `bots` and the PR, and relaunch once Greptile reviewed the head; '
+                           "shipping the head unreviewed is the user's decision",
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
                 'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
