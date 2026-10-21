@@ -287,6 +287,7 @@ if (args.state !== undefined && args.state !== null) {
     st.acceptedFailures.every(a => typeof (st.version === 3 ? a && a.key : a) === 'string') && (st.build === null || typeof st.build === 'string') &&
     (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
     (st.last === null || (st.last && typeof st.last === 'object')) && (st.greptileRequired === undefined || st.greptileRequired === true) &&
+    (st.coderabbitRequired === undefined || st.coderabbitRequired === true) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
@@ -840,8 +841,16 @@ let reviewClock = restored ? restored.reviewClock : null
 // Latched by the first launch with greptileTrigger: from then on every head of this run needs Greptile's review, whatever
 // later launches pass; only posting the request stays with the switch.
 const greptileRequired = greptileTrigger || (!!restored && restored.greptileRequired === true)
-// The reviewers this cycle waits on: autoRun, and Greptile once its review is required.
-const waitedOn = greptileRequired && !autoRun.includes('greptile') ? [...autoRun, 'greptile'] : autoRun
+// The same for coderabbitTrigger (#191); a state from before this latch records the switch by an ask in its clock.
+const coderabbitRequired = coderabbitTrigger || (!!restored && (restored.coderabbitRequired === true ||
+  (!!restored.reviewClock && (restored.reviewClock.triggeredAt !== undefined || restored.reviewClock.request !== undefined))))
+// The reviewers whose review of the head a pass needs, in stop precedence.
+const REQUIRED = [
+  { bot: 'coderabbit', name: 'CodeRabbit', stop: 'coderabbit-unreviewed', on: coderabbitRequired },
+  { bot: 'greptile', name: 'Greptile', stop: 'greptile-unreviewed', on: greptileRequired },
+].filter(r => r.on)
+// The reviewers this cycle waits on: autoRun, and each one whose review is required.
+const waitedOn = [...new Set([...autoRun, ...REQUIRED.map(r => r.bot)])]
 // A landed but unpushed commit is the caller's to decide, never the next baseline.
 const pendingOf = () => {
   const last = history[history.length - 1]
@@ -863,6 +872,7 @@ const stateOut = () => {
   const st = {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
     ...(greptileRequired ? { greptileRequired } : {}),
+    ...(coderabbitRequired ? { coderabbitRequired } : {}),
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
     acceptedFailures: acceptedArg.map(a => a.key),
@@ -1771,10 +1781,10 @@ const settleSonar = async (cycle, entry, ended) => {
 const MANUAL_SKIP = /^review skipped: manual review required/i
 const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
-  if (!coderabbitTrigger || !cr) return
+  if (!coderabbitRequired || !cr) return
   const manual = cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
-  // Once per head, whatever the outcome: a failed tick is not retried into a storm.
-  if (manual && reviewClock.triggeredAt === undefined) {
+  // Once per head, whatever the outcome: a failed tick is not retried into a storm. Without the switch, only an earlier ask is waited on.
+  if (coderabbitTrigger && manual && reviewClock.triggeredAt === undefined) {
     if (await ended('crtrigger')) return
     const { t, outcome } = await relayTrigger(cycle, 'crtrigger', CRTRIGGER_SCRIPT, `Tick CodeRabbit's Trigger review box on PR #${args.pr}`, '',
       ['ticked', 'already', 'notSkipped', 'failed'])
@@ -1819,7 +1829,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     if (asked.at !== null && Date.parse(asked.retryAt) === Date.parse(cr.retryAt)) waitAfter(cr, asked.at, r.observedAt)
     return
   }
-  if (cr.retryAt === null) return
+  if (!coderabbitTrigger || cr.retryAt === null) return
   const dueMs = Date.parse(cr.retryAt) - Date.parse(r.observedAt)
   if (dueMs > 0) return retryLater(cr, cycle, dueMs)
   if (await ended('crrequest')) return
@@ -2731,17 +2741,22 @@ const runLanes = async (cycle, entry, lanes) => {
         }
         return unresolvedVerdict(cycle, owedNow)
       }
-      const unreviewed = greptileRequired && entry.bots.bots.find(b => b.bot === 'greptile' && b.state !== 'reviewed')
-      if (unreviewed) {
-        log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'}, but Greptile has not reviewed ${expectedHead.slice(0, 7)}, ` +
-          `and greptileTrigger made its review required: ${botCell(unreviewed, entry.bots.waitedMin)} — stopping`)
-        return stop(cycle, 'greptile-unreviewed', { head: expectedHead, bots: [botOut(unreviewed)] })
+      const bots = entry.bots ? entry.bots.bots : []
+      const missing = REQUIRED.map(r => ({ r, b: bots.find(b => b.bot === r.bot && b.state !== 'reviewed') })).filter(m => m.b)
+      if (missing.length) {
+        const why = missing.map(({ r, b }) => `${r.name} has not reviewed ${expectedHead.slice(0, 7)}, and ${r.bot}Trigger made its review required: ` +
+          botCell(b, entry.bots.waitedMin)).join('; ')
+        log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'}, but ${why} — stopping`)
+        return stop(cycle, missing[0].r.stop, { head: expectedHead, bots: missing.map(m => botOut(m.b)) })
       }
+      // A pass shows every reviewer whose state was read and is not a review of the head (#193).
+      const unreviewed = bots.filter(b => b.state !== 'reviewed' && b.state !== 'harvested').map(botOut)
       log(`cycle ${cycle}: ${acceptedOnly(c) ? `CI red only from ${c.realFailures.length} accepted failure(s)` : 'PR is green'} with no unresolved valid findings${deferrals.size ? `; ${deferrals.size} deferred` : ''}`)
       return {
         pass: true, cycles: cycle, history,
         ...(acceptedOnly(c) ? { acceptedFailures: c.realFailures.map(rf => ({ check: rf.check, workflow: rf.workflow, job: rf.job, cell: rf.cell, signature: rf.signature, key: rf.key, verdict: rf.verdict, ...rf.accepted })) } : {}),
         ...(deferrals.size ? { deferrals: [...deferrals].map(([findingId, d]) => ({ findingId, ...(d.issueUrl ? { issueUrl: d.issueUrl } : { ownerDecision: d.reason }) })) } : {}),
+        ...(unreviewed.length ? { unreviewed } : {}),
       }
     }
     if (unfixable.length > 0 && fixable.length === 0 && c.infraRerun.length === 0 && c.status !== 'running') {

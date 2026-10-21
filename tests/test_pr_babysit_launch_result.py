@@ -246,6 +246,16 @@ class LaunchResultTest(unittest.TestCase):
                                    'evidence': ['comment 5'], 'retryAt': '2026-10-13T10:55:19Z'})
         self.assertEqual((bots[1]['bot'], bots[1]['kind'], bots[1]['evidence']), ('copilot', 'limited', ['review 3313 on aaaaaaaa']))
 
+    def test_a_pass_names_the_reviewers_that_did_not_review_the_head(self):
+        # #191/#193: a pass is no review; whoever merges on a bot's review reads which did not
+        unreviewed = [{'bot': 'greptile', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'evidence': ['review 51 on aaaaaaaa'],
+                       'reason': 'paused notice on the head: Greptile did not review it', 'retryAt': None}]
+        s = self.run_it(output(result={'pass': True, 'status': 'complete', 'reason': None, 'unreviewed': unreviewed}))[1]
+        self.assertEqual(s['result']['unreviewed'], unreviewed)
+        self.assertIn('passed with reviewer(s) that did not review the head: greptile settled/limited '
+                      '(paused notice on the head: Greptile did not review it)', s['notes'])
+        self.assertFalse([n for n in self.run_it(output(result={'pass': True, 'status': 'complete', 'reason': None}))[1]['notes'] if 'did not review' in n])
+
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):
         data = output()
         obs = data['result']['observation']
