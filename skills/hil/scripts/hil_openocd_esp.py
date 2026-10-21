@@ -728,6 +728,11 @@ SECURITY_CHIPS = ('esp32p4', 'esp32s3')
 ESP_BAUD = 921600
 
 
+def _security_chip(chip: str):
+    if chip not in SECURITY_CHIPS:
+        raise ValueError(f'{chip}: no checked eFuse layout for its security state (SECURITY_CHIPS)')
+
+
 def security_evidence(result, *, chip: str, source: str) -> dict:
     """admit_security's evidence from esptool_session.py's `security` op `result`, read on the
     ROM loader of `chip`: `flags` and `flashCryptCnt` of the ROM's GET_SECURITY_INFO (esptool
@@ -738,8 +743,7 @@ def security_evidence(result, *, chip: str, source: str) -> dict:
     SECURITY_CHIPS, a missing or malformed field, a nonzero even count (the ESP32-S3 TRM's
     XTS-AES chapter reads 3 as on, its eFuse chapter as off), or sources that disagree. This
     returns evidence only: whether a flash may follow is admit_security's."""
-    if chip not in SECURITY_CHIPS:
-        raise ValueError(f'{chip}: no checked eFuse layout for its security state (SECURITY_CHIPS)')
+    _security_chip(chip)
     try:
         flags, count, rom, efuse = result['flags'], result['flashCryptCnt'], result['rom'], result['efuse']
         well_formed = (result.get('op') == 'security' and _int(flags) and 0 <= flags < 1 << 32 and _int(count)
@@ -772,8 +776,7 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
     Returns hil_flash's Operation of the child with `security`, security_evidence's dict; a
     failed child or evidence that is unknown or contradictory raises, carrying `.operation`."""
     _admit_session(retains_lock)
-    if chip not in SECURITY_CHIPS:
-        raise ValueError(f'{chip}: no checked eFuse layout for its security state (SECURITY_CHIPS)')
+    _security_chip(chip)
     tty, python = usj_tty(serial), hil_flash.tool_python(esptool)
     with tempfile.TemporaryDirectory(prefix='hil_security_', dir=_workdir(workdir)) as td:
         ops = os.path.join(td, 'ops.json')
