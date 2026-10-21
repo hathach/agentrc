@@ -653,7 +653,7 @@ def recheck(receipt: dict) -> str:
 def run_tracked(cmd: str | list, cwd: str | None = None, *, timeout: float, settle: float, state_dir: str,
                 binary: bool = False, split_stderr: bool = False, quiet: bool = False,
                 reap_grace: float = REAP_GRACE, verbose: bool = False,
-            env: dict | None = None) -> subprocess.CompletedProcess:
+                env: dict | None = None) -> subprocess.CompletedProcess:
     """run_cmd through an operation-owned supervisor, plus completion evidence (module contract)."""
     if timeout is None or settle is None or state_dir is None:
         raise ValueError('run_tracked needs an explicit timeout, settle and state_dir')
