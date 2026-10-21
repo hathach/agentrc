@@ -518,6 +518,15 @@ class Capture:
         return out
 
 
+def jlink_serial_match(uid: str, serial: str) -> bool:
+    """usb_observe.jlink_serial_match's rule, kept here so this file runs copied alone (a test
+    holds the two to one table): equal, or both all-digit and equal but for J-Link's zero
+    padding, never for a uid of zeros alone."""
+    u, s = uid.lower(), serial.lower()
+    stripped = u.lstrip('0')
+    return u == s or bool(u.isdigit() and stripped and s.isdigit() and s.lstrip('0') == stripped)
+
+
 class JLink:
     others = {}    # Commander attaches to one core
     REG = {'CPUID': CPUID, 'DHCSR': DHCSR, 'DEMCR': DEMCR, 'FPCTRL': FP_CTRL, 'DWTCTRL': DWT_CTRL, 'PCSR': DWT_PCSR}
@@ -532,7 +541,7 @@ class JLink:
         sn, vt = _JLINK_SN_RE.search(text), _JLINK_VTREF_RE.search(text)
         if sn:
             self.connection['serial'] = sn.group(1)
-            if sn.group(1).lstrip('0') != self.probe.lstrip('0'):
+            if not jlink_serial_match(self.probe, sn.group(1)):
                 raise ToolError(f'connected to J-Link S/N {sn.group(1)}, not the requested {self.probe}')
         if vt:
             self.connection['vtref'] = float(vt.group(1))

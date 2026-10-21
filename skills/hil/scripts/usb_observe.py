@@ -209,6 +209,25 @@ def usb_scan(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> l
     return out
 
 
+def jlink_serial_match(uid: str, serial: str) -> str | None:
+    """'exact' when a probe's serial is the roster uid (case aside), 'padded' when only J-Link's zero
+    padding of an all-digit serial separates them (681295394 is 000681295394), else None. A uid
+    of zeros alone never matches by padding: a placeholder serial must not stand for a device."""
+    u, s = uid.lower(), serial.lower()
+    if u == s:
+        return 'exact'
+    stripped = u.lstrip('0')
+    return 'padded' if u.isdigit() and stripped and s.isdigit() and s.lstrip('0') == stripped else None
+
+
+def jlink_serial_candidates(uid: str, serials: dict) -> list:
+    """The sorted keys of serials ({key: serial}) that are uid's probe, the exact matches alone
+    when there are any."""
+    tiers = {k: jlink_serial_match(uid, s) for k, s in serials.items()}
+    best = 'exact' if 'exact' in tiers.values() else 'padded'
+    return sorted(k for k, t in tiers.items() if t == best)
+
+
 def _proc_stat(pid) -> tuple | None:
     """(comm, state, starttime, ppid, pgrp) from /proc/<pid>/stat, or None when the process
     is gone."""

@@ -96,6 +96,14 @@ class CopiedAloneTest(unittest.TestCase):
         r = subprocess.run([sys.executable, '-I', '-c', code, str(d)], capture_output=True, text=True, cwd=d, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(Path(r.stdout.strip()).resolve(), d / 'probe_state.py')
+        # and identifies its J-Link with nothing else beside it
+        code = ('import sys; sys.path.insert(0, sys.argv[1]); import probe_state as p\n'
+                'j = p.JLink("000681295394", "X", "swd", "4000"); j._identify("S/N: 681295394")\n'
+                'try:\n    j._identify("S/N: 123")\nexcept p.ToolError as e:\n    print(j.connection["serial"], e)')
+        r = subprocess.run([sys.executable, '-I', '-c', code, str(d)], capture_output=True, text=True, cwd=d, timeout=30,
+                           env={**os.environ, 'PROBE_STATE_JLINK_EXE': sys.executable})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), '123 connected to J-Link S/N 123, not the requested 000681295394')
 
 
 class CliTest(unittest.TestCase):

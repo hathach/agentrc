@@ -400,6 +400,37 @@ class FakeRig:
                 f'I:1\nE:ID_SERIAL=X_{udev_serial}\nE:ID_SERIAL_SHORT={udev_serial}\n')
 
 
+class JLinkSerial(unittest.TestCase):
+    """J-Link reports a numeric serial zero-padded (681295394 is 000681295394); probe_state keeps
+    the same rule so it runs copied alone, held to this table."""
+    TABLE = (('681295394', '681295394', 'exact'), ('E6614C311B597D32', 'e6614c311b597d32', 'exact'),
+             ('681295394', '000681295394', 'padded'), ('000681295394', '681295394', 'padded'),
+             ('0681295394', '00681295394', 'padded'),
+             ('123456', '000123456', 'padded'), ('000123456', '123456', 'padded'), ('123456', '000123457', None),
+             ('000', '0', None), ('0', '', None), ('000', '000', 'exact'),
+             ('12a', '012a', None), ('681295394', '6812953940', None))
+
+    def test_the_rule_and_probe_states_copy_of_it(self):
+        spec = importlib.util.spec_from_file_location(
+            'probe_state', SCRIPT.parents[2] / 'target-debug' / 'scripts' / 'probe_state.py')
+        probe_state = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe_state)
+        for uid, serial, want in self.TABLE:
+            with self.subTest(uid=uid, serial=serial):
+                self.assertEqual(uo.jlink_serial_match(uid, serial), want)
+                self.assertEqual(probe_state.jlink_serial_match(uid, serial), want is not None)
+
+    def test_candidates_prefer_an_exact_match_over_a_padded_one(self):
+        serials = {'1-1': '000681295394', '1-2': '681295394', '1-3': '123456'}
+        self.assertEqual(uo.jlink_serial_candidates('681295394', serials), ['1-2'])
+        del serials['1-2']
+        self.assertEqual(uo.jlink_serial_candidates('681295394', serials), ['1-1'])
+        self.assertEqual(uo.jlink_serial_candidates('000', {'1-1': '0'}), [])
+        self.assertEqual(uo.jlink_serial_candidates('123456', {'1-1': '123456', '1-2': '0123456'}), ['1-1'])
+        self.assertEqual(uo.jlink_serial_candidates('123456', {'1-2': '0123456', '1-1': '000123456', '1-3': '1'}),
+                         ['1-1', '1-2'], 'every best-tier match stays visible')
+
+
 class HolderLookup(unittest.TestCase):
     def setUp(self):
         self.rig = FakeRig(self)
