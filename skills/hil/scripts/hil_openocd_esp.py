@@ -827,20 +827,20 @@ def segments_from_flash_args(build_dir, chip: str, *, timeout, flash_args: str |
         raise ValueError(f'{build}: {e}') from None
     if target != chip:
         raise ValueError(f'{build} is built for {target!r}, not {chip!r}')
-    tokens, options = shlex.split(text), []
-    while tokens and tokens[0].startswith('-'):
-        opt = tokens.pop(0)
+    given, pairs = hil_flash.flash_args_tokens(text)
+    options = []
+    for opt, value in given:
         if opt.split('=', 1)[0] not in _HEADER_OPTIONS:
             raise ValueError(f'flash_args option {opt} is not one openocd_esp applies')
         if '=' not in opt:
-            if not tokens:
+            if value is None:
                 raise ValueError(f'flash_args option {opt} has no value')
-            opt = f'{opt}={tokens.pop(0)}'
+            opt = f'{opt}={value}'
         options.append(opt)
-    if not tokens or len(tokens) % 2:
+    if pairs is None:
         raise ValueError(f'{build} flash_args: want "<offset> <file>" pairs after the options')
     segments, files = [], []
-    for offset, name in zip(tokens[::2], tokens[1::2]):
+    for offset, name in pairs:
         path = os.path.join(build, name)
         try:
             with open(path, 'rb') as f:

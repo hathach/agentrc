@@ -523,6 +523,19 @@ def flash_esptool(flasher: dict, *, chip: str, port: str, flash_args: str, cwd: 
     return _once(run, argv, cwd=cwd, env=dict(ESPTOOL_ENV), timeout=timeout)
 
 
+def flash_args_tokens(text) -> tuple:
+    """(options, pairs) of an ESP-IDF flash_args text, split as a shell would: each leading
+    option as (token, value), its value the next token unless the token carries `=` or none is
+    left (None), then the "<offset> <file>" pairs, None unless whole pairs follow. shlex.split's
+    errors propagate."""
+    tokens, options = shlex.split(text), []
+    while tokens and tokens[0].startswith('-'):
+        opt = tokens.pop(0)
+        options.append((opt, tokens.pop(0) if '=' not in opt and tokens else None))
+    pairs = list(zip(tokens[::2], tokens[1::2])) if tokens and not len(tokens) % 2 else None
+    return options, pairs
+
+
 def esptool_input_problem(chip, flash_args, cwd) -> str:
     """Why flash_esptool could not flash with these inputs ('' when it could): `chip` one plain
     token, `flash_args` options then "<offset> <file>" pairs, every file present relative to
@@ -533,15 +546,12 @@ def esptool_input_problem(chip, flash_args, cwd) -> str:
     if not isinstance(cwd, (str, os.PathLike)) or not os.path.isdir(cwd):
         return f'cwd {cwd!r} is not a directory'
     try:
-        tokens = shlex.split(flash_args)
+        _, pairs = flash_args_tokens(flash_args)
     except (ValueError, AttributeError) as e:
         return f'flash_args: {e!r}'[:200]
-    while tokens and tokens[0].startswith('-'):
-        if '=' not in tokens.pop(0) and tokens:
-            tokens.pop(0)
-    if not tokens or len(tokens) % 2:
+    if pairs is None:
         return 'flash_args: want "<offset> <file>" pairs after the options'
-    for offset, f in zip(tokens[::2], tokens[1::2]):
+    for offset, f in pairs:
         try:
             int(offset, 0)
         except ValueError:
