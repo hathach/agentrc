@@ -7,7 +7,9 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default
   `reviewers` without `copilot` and `code-scanning`, which are only harvested.
-  Every reviewer is reported with its state; only these are waited on.
+  Every reviewer is reported with its state; only these are waited on, which is
+  not a review: a pass lists each reviewer whose state was read and is not a
+  review of the head in `unreviewed`. Only a trigger switch makes one required.
 - `maxCycles`: cycle ceiling, default 16; a resumed launch defaults to its state's.
 - `autoPush` (default false, a dry run: fixes left uncommitted, nothing posted)
   and `markSonar` (needs `autoPush` and `SONAR_TOKEN`: marks the SonarCloud
@@ -20,8 +22,13 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   skipped that way, then waits for the review up to the silent-bot cap. Once
   per head too, when CodeRabbit is rate-limited with a reset time under an
   hour away, naps until the reset and comments `@coderabbitai review` (a limit
-  notice has no box), then waits the same way. Needs
-  `autoPush` and `coderabbit` in `autoRun`; never restored from a state.
+  notice has no box), then waits the same way. The first launch with the
+  switch latches the run, as `greptileTrigger` does: every later head needs
+  CodeRabbit's review, a launch without the switch waits on an earlier ask and
+  asks nothing, and a head left unreviewed (a failed tick, no review within
+  the cap, a skip or limit with nothing more to ask) stops
+  `coderabbit-unreviewed`, never a pass. Needs `autoPush` and `coderabbit` in
+  `autoRun`; the switch itself is never restored from a state.
 - `greptileTrigger` (boolean, default false): set in the repository's
   `CLAUDE.md` when Greptile reviews only on PR open, so a pushed head is
   reviewed only on request. Greptile is then waited on, as if in `autoRun`.

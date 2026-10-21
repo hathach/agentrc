@@ -219,6 +219,7 @@ class LaunchResultTest(unittest.TestCase):
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
+        reasons |= {m.group(2) for m in re.finditer(r"""\bstop: (['"])(.+?)\1""", source)}  # the GATES table
         historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced
         sets = (handled_elsewhere, set(launch_result.REFUSED), set(launch_result.ENDED), set(launch_result.STALLED))
         self.assertEqual(sum(map(len, sets)), len(set().union(*sets)), 'each reason is handled one way')
@@ -252,6 +253,16 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD[:8], 'reason': 'Review rate limited',
                                    'evidence': ['comment 5'], 'retryAt': '2026-10-13T10:55:19Z'})
         self.assertEqual((bots[1]['bot'], bots[1]['kind'], bots[1]['evidence']), ('copilot', 'limited', ['review 3313 on aaaaaaaa']))
+
+    def test_a_pass_names_the_reviewers_that_did_not_review_the_head(self):
+        # #191/#193: a pass is no review; whoever merges on a bot's review reads which did not
+        unreviewed = [{'bot': 'greptile', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'evidence': ['review 51 on aaaaaaaa'],
+                       'reason': 'paused notice on the head: Greptile did not review it', 'retryAt': None}]
+        s = self.run_it(output(result={'pass': True, 'status': 'complete', 'reason': None, 'unreviewed': unreviewed}))[1]
+        self.assertEqual(s['result']['unreviewed'], unreviewed)
+        self.assertIn('passed with reviewer(s) that did not review the head: greptile settled/limited '
+                      '(paused notice on the head: Greptile did not review it)', s['notes'])
+        self.assertFalse([n for n in self.run_it(output(result={'pass': True, 'status': 'complete', 'reason': None}))[1]['notes'] if 'did not review' in n])
 
     def test_a_reply_receipt_names_the_verdicts_it_answered(self):
         data = output()

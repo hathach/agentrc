@@ -84,6 +84,12 @@ STALLED = {
                            'this run: its request failed, was uncertain (the detail names the attempt record) or ambiguous, or no '
                            'review came within the cap after it; read `bots` and the PR, and relaunch once Greptile reviewed the head; '
                            "shipping the head unreviewed is the user's decision",
+    'coderabbit-unreviewed': 'CodeRabbit has not reviewed the head, and a coderabbitTrigger launch made its review required for every '
+                             'head of this run: its trigger failed or no review came within the cap after it, or it was skipped or '
+                             'rate-limited with nothing more to ask; a run asks once per head, so read `bots` and the PR: a limited '
+                             'record whose retryAt is past and that was never asked gets its one ask from a relaunch with '
+                             'coderabbitTrigger, otherwise relaunch once CodeRabbit reviewed the head (on a request the user made, or '
+                             "a new head); shipping the head unreviewed is the user's decision",
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
                 'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
@@ -300,6 +306,9 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
                             + (f"; the user's rejudge request: {cut(h['rejudge'].get('reason') or '')}" if isinstance(h.get('rejudge'), dict) else '')
                             + (f"; {unsettled.pop(h.get('commentId'))}" if h.get('commentId') in unsettled else ''))
         blockers += [f'comment {c}: {why}' for c, why in unsettled.items()]
+        if result.get('unreviewed'):
+            notes.append('passed with reviewer(s) that did not review the head: ' + '; '.join(
+                f"{b.get('bot')} {b.get('state')}{'/' + b['kind'] if b.get('kind') else ''} ({cut(b.get('reason') or '')})" for b in result['unreviewed']))
         for u in result.get('sonarUnmarked') or []:
             last = u.get('last') or {}
             blockers.append(f"SonarCloud issue of comment {u.get('commentId')} not marked false positive: "

@@ -420,6 +420,22 @@ class ChiefGuard(unittest.TestCase):
                   'timeout 5 cat /tmp/*.c {a,b}', 'env A={} git log'):
             self.assert_allowed(c)
 
+    def test_a_git_or_gh_brace_list_before_the_double_dash_is_denied(self):
+        # #190: bash expands each into words, an option among them
+        for c in (f'git log {{--output={self.wt}/src/a.c,-1}}', r'git fetch {--upload-pack=touch\ /tmp/pwn,.}',
+                  'gh api {-XPOST,repos/o/r/issues}', 'gh api repos/o/r/issues {-XPOST,-q.}', 'git {-C,/tmp} log',
+                  'git log x{a,b}y', 'git log {1..3}', 'timeout 5 git log {--output=/tmp/o,-1}',
+                  'git-log {--output=/tmp/o,-1}', 'git log {-p,-1} -- src/{a,b}.c',
+                  # a `--` an option may take as its value ends nothing
+                  'git grep -e -- {--open-files-in-pager=echo,-n} -- README.md', 'gh api -q -- {-XPOST,repos/o/r/issues}',
+                  'git log -1 -- src/{a,b}.c'):
+            self.assert_denied(c, 'brace list')
+        # quoted or escaped is literal, a bare `{}` is no expansion, and past `--` a pathspec is git's own
+        for c in ("git log '{--output=x,-1}'", 'git log "{a,b}"', r'git log \{a,b\}', 'git log --format={}',
+                  'git log -- src/{a,b}.c', 'git log --format=%H -- src/{a,b}.c', "gh api repos/o/r/pulls -q '.[]|{a,b}'",
+                  'gh pr list -- {a,b}'):
+            self.assert_allowed(c)
+
     def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):
         for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
                   'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',
