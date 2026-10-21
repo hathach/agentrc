@@ -21,6 +21,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
@@ -1382,6 +1383,200 @@ class TakeoverEdges(LockDir):
         with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'does not hold the flocks'):
             hil_lock.release_token('tok')
         self.assertEqual(signals, [])
+
+
+class HandOver(LockDir):
+    """hand_to_cleanup_holder: a runner's own flocks go to a fresh-interpreter cleanup holder whose
+    release predicate (every run_tracked receipt `done`) release_token checks up front and the
+    holder rechecks before clearing; a failed handoff leaves the protected record."""
+
+    OTHER = BOARD + '-2'
+
+    def receipt(self):
+        """A run_tracked receipt whose supervisor still holds its lock: `pending` until done()."""
+        state = Path(self.dir, 'state')
+        state.mkdir(mode=0o700)
+        lock, record = state / 'hil_op_t.lock', state / 'hil_op_t.json'
+        fh = open(lock, 'w')
+        self.addCleanup(fh.close)
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        st = os.fstat(fh.fileno())
+
+        def done():
+            fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, 'w') as f:
+                json.dump({'token': 't', 'lock': [st.st_dev, st.st_ino], 'cleanup': 'done'}, f)
+            fh.close()
+        return {'token': 't', 'supervisor': {'pid': 4242, 'start': '1', 'lock': [st.st_dev, st.st_ino]},
+                'lock': str(lock), 'record': str(record), 'log': str(state / 'hil_op_t.log'), 'survivors': None}, done
+
+    def hand_over(self, receipts=(), boards=(BOARD,)):
+        handles = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in boards}
+        try:
+            token = hil_lock.hand_to_cleanup_holder(handles, 'selftest run', detail='park failed', receipts=receipts,
+                                                    wait=5, holder='selftest')
+        finally:
+            for fh in handles.values():
+                fh.close()
+        pid = hil_lock.read_record(boards[0])['pid']
+        self.addCleanup(DetachedHolder.kill_quietly, pid, signal.SIGKILL)
+        return token, pid
+
+    def signals(self):
+        sent = []
+        real = hil_lock.signal.pidfd_send_signal
+        self.patch(hil_lock.signal, 'pidfd_send_signal', lambda fd, sig: (sent.append(sig), real(fd, sig)))
+        return sent
+
+    def test_an_open_receipt_refuses_up_front_and_the_holder_ends_once_it_is_done(self):
+        receipt, done = self.receipt()
+        token, pid = self.hand_over([receipt], (BOARD, self.OTHER))
+        rec = hil_lock.read_record(BOARD)
+        self.assertEqual((rec['role'], rec['protected'], rec['release_when'], rec['receipts'], rec['locks'],
+                          rec['holder']),
+                         ('cleanup-holder', True, 'receipts-done', [receipt], sorted([BOARD, self.OTHER]), 'selftest'))
+        self.assertNotEqual(pid, os.getpid())
+        self.assertTrue(hil_lock._holds_flock(pid, hil_lock.lock_path(self.OTHER)))
+        sent = self.signals()
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused,
+                                    rf'not signalled: holder pid {pid} of token {token} keeps {BOARD}, {self.OTHER}: '
+                                    r'its operations are not proven ended: receipt t \(supervisor pid 4242\) pending'):
+            hil_lock.release_token(token)
+        self.assertEqual(sent, [])
+        # the holder's own recheck decides: a release that slips past the up-front check leaves it holding
+        self.patch(hil_lock, 'RELEASE_WAIT', 0.5)
+        with mock.patch.object(hil_lock, '_release_blocker', lambda rec: ''):
+            with self.assertRaisesRegex(hil_lock.ReleaseRefused, f'signalled, but holder pid {pid} left its records'):
+                hil_lock.release_token(token)
+        self.assertEqual((sent, hil_lock.read_record(BOARD)), ([signal.SIGUSR1], rec))
+        done()
+        self.patch(hil_lock, 'RELEASE_WAIT', 5)
+        self.assertEqual(hil_lock.release_token(token), (pid, sorted([BOARD, self.OTHER])))
+        for b in (BOARD, self.OTHER):
+            self.assertIsNone(hil_lock.read_record(b))
+        self.assertIsNotNone(self.acquire())
+
+    def test_token_mismatch_pid_reuse_and_a_partial_lock_set_signal_nothing(self):
+        token, pid = self.hand_over(boards=(BOARD, self.OTHER))
+        sent = self.signals()
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, 'no holder record carries token nope'):
+            hil_lock.release_token('nope')
+        recs = {b: hil_lock.read_record(b) for b in (BOARD, self.OTHER)}
+        for b, rec in recs.items():
+            Path(hil_lock.lock_path(b)).write_text(json.dumps({**rec, 'start': '1'}))
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, rf'pid {pid} is not the recorded holder'):
+            hil_lock.release_token(token)
+        Path(hil_lock.lock_path(BOARD)).write_text(json.dumps(recs[BOARD]))
+        Path(hil_lock.lock_path(self.OTHER)).write_text('')
+        with self.assertRaisesRegex(hil_lock.ReleaseRefused, r'record lock set .* != files carrying it'):
+            hil_lock.release_token(token)
+        self.assertEqual(sent, [])
+        Path(hil_lock.lock_path(self.OTHER)).write_text(json.dumps(recs[self.OTHER]))
+        self.assertEqual(hil_lock.release_token(token), (pid, sorted([BOARD, self.OTHER])))   # no predicate
+
+    def test_a_failed_handoff_leaves_the_protected_record(self):
+        receipt, _ = self.receipt()
+        fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
+        self.patch(hil_lock, '_holder_argv', lambda job: [sys.executable, '-c', 'pass'])
+        before = sorted(os.listdir('/proc/self/fd'))
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'cleanup holder handoff failed: .*no readiness'):
+            hil_lock.hand_to_cleanup_holder({BOARD: fh}, 'selftest run', detail='park failed', receipts=[receipt],
+                                            wait=2)
+        self.assertEqual(sorted(os.listdir('/proc/self/fd')), before)
+        fh.close()
+        rec = hil_lock.read_record(BOARD)
+        self.assertEqual((rec['protected'], rec['detail'], rec['receipts']), (True, 'park failed', [receipt]))
+        self.assertNotIn('role', rec)
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            self.acquire()
+
+
+    def test_unprotected_handles_are_refused_before_anything_changes(self):
+        fhs = {BOARD: hil_lock.take_board_lock(BOARD, 'selftest run', protected=True),
+               self.OTHER: hil_lock.take_board_lock(self.OTHER, 'selftest run')}
+        for fh in fhs.values():
+            self.addCleanup(fh.close)
+        before = {b: Path(hil_lock.lock_path(b)).read_bytes() for b in fhs}
+        self.patch(hil_lock, '_holder_argv', lambda job: self.fail('a holder was started'))
+        with self.assertRaisesRegex(ValueError, rf'{self.OTHER} not taken protected; nothing changed'):
+            hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed')
+        self.assertEqual({b: Path(hil_lock.lock_path(b)).read_bytes() for b in fhs}, before)
+        with self.assertRaises(hil_lock.BoardLocked):        # still the caller's
+            hil_lock.take_board_lock(self.OTHER, 'rival')
+
+    def test_a_failed_rewrite_or_an_interrupt_leaves_every_board_blocked(self):
+        self.patch(hil_lock, '_holder_argv', lambda job: [sys.executable, '-c', 'pass'])
+        real = hil_lock.write_record
+
+        def no_space(*a, **k):
+            raise OSError(28, 'No space left on device')
+
+        def interrupt_second(fh, *a, calls=[], **k):
+            calls.append(1)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real(fh, *a, **k)
+        for fault, raised in ((no_space, hil_lock.LockUnavailable), (interrupt_second, KeyboardInterrupt)):
+            with self.subTest(fault=fault.__name__):
+                fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in (BOARD, self.OTHER)}
+                with mock.patch.object(hil_lock, 'write_record', fault), self.assertRaises(raised):
+                    hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
+                for fh in fhs.values():
+                    fh.close()
+                for b in fhs:
+                    with self.assertRaises(hil_lock.RecoveryBlocked):
+                        hil_lock.take_board_lock(b, 'rival')
+                    Path(hil_lock.lock_path(b)).write_text('')     # the test's stand-in for the recovery
+
+    def test_a_release_that_lands_on_another_thread_ends_the_hold(self):
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
+                r, _ = os.pipe()
+                reader = threading.Thread(target=os.read, args=(r, 1), daemon=True)   # SIGUSR1 unblocked there
+                reader.start()
+                wake = hil_lock.arm_release()
+                signal.pthread_kill(reader.ident, signal.SIGUSR1)     # before the holder waits
+                hil_lock.hold_until_released({BOARD: fh}, wake)
+                code = 0
+            finally:
+                os._exit(code)
+        deadline = time.monotonic() + 10
+        while not (done := os.waitpid(pid, os.WNOHANG))[0]:
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                self.fail('the holder never ended')
+            time.sleep(0.05)
+        self.assertEqual(os.waitstatus_to_exitcode(done[1]), 0)     # -10: SIGUSR1's default action killed it
+        self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
+        self.assertIsNotNone(self.acquire())
+
+
+    def test_a_release_ends_the_hold_of_a_holder_started_with_sigusr1_blocked(self):
+        pid = os.fork()
+        if pid == 0:
+            code = 1
+            try:
+                signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})    # as a parent's mask leaves it
+                fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
+                wake = hil_lock.arm_release()
+                os.kill(os.getpid(), signal.SIGUSR1)
+                hil_lock.hold_until_released({BOARD: fh}, wake)
+                code = 0
+            finally:
+                os._exit(code)
+        deadline = time.monotonic() + 10
+        while not (done := os.waitpid(pid, os.WNOHANG))[0]:
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                self.fail('the release stayed pending behind the inherited mask')
+            time.sleep(0.05)
+        self.assertEqual(os.waitstatus_to_exitcode(done[1]), 0)
+        self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
 
 
 class UnreadableRecords(LockDir):

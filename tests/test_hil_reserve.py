@@ -751,6 +751,20 @@ class Run(Fixture):
                 p.kill()
                 self.recovered()
 
+    def test_a_survivor_stays_a_child_of_the_cleanup_holder_until_the_token_release(self):
+        p = self.run_run(action='survivor')
+        token = p.token()
+        orphan = int(Path(str(self.argv_out) + '.pid').read_text())
+        self.addCleanup(lambda: os.kill(orphan, signal.SIGKILL) if hr.hil_lock.proc_start(orphan) else None)
+        ppid = Path(f'/proc/{orphan}/stat').read_text().rpartition(')')[2].split()[1]
+        self.assertEqual(int(ppid), p.pid)       # the holder is this process, still the subreaper
+        self.assert_cleanup_holder(p, token)
+        self.assertNotIn('release_when', self.records()['raspberry_pi_pico2'])
+        rc, out = main('release', '--token', token)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(p.wait(), 1)
+        self.assertEqual(self.held(), set())
+
     def test_sigterm_during_the_command_is_forwarded_and_ends_as_a_blocker(self):
         p = self.run_run(action='hang')
         self.wait_for(lambda: self.argv_out.exists(), 'the command to start')

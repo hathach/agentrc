@@ -392,16 +392,13 @@ class Reservation:
         return os.waitstatus_to_exitcode(status)    # a signal death stays negative, as Popen's
 
     def hold_as_cleanup_holder(self, problems):
-        """Never returns: the records say cleanup-holder and only SIGUSR1 ends the hold.
+        """Never returns: the records, protected since acquire, say cleanup-holder and only
+        release_token's SIGUSR1 ends the hold, in this process, which stays the subreaper of the
+        command's descendants.
         A record or output failure is reported where possible and never abandons the hold."""
         self.phase = 'cleanup'
         detail = '; '.join(problems)
-
-        def bow_out(*_):
-            self.release()
-            os._exit(1)
-
-        signal.signal(signal.SIGUSR1, bow_out)
+        wake = hil_lock.arm_release()
         try:
             self.record(role=hil_lock.CLEANUP_ROLE, detail=detail)
         except OSError as e:
@@ -413,8 +410,8 @@ class Reservation:
                       f'`hil_reserve.py release --token {self.token}`', file=stream, flush=True)
             except (OSError, ValueError):
                 pass
-        while True:
-            signal.pause()
+        hil_lock.hold_until_released(dict(zip(self.locks, self.handles)), wake)
+        os._exit(1)
 
 
 def restoration_gaps(before, busport, rosters, deadline, scope='root'):

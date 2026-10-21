@@ -6,6 +6,7 @@ hold/release/status CLI. A project's HIL contract wraps it for its roster and lo
 import argparse
 import errno
 import fcntl
+import importlib.util
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import secrets
 import select
 import signal
 import stat
+import subprocess
 import sys
 import time
 
@@ -32,6 +34,8 @@ DIR_MODE = 0o755
 SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a one-time host step '
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
 RELEASE_WAIT = 3.0            # s a signalled holder gets to clear its records and exit
+HANDOFF_WAIT = 10.0           # s a handed-over cleanup holder gets for each step of the handoff
+RELEASE_RECEIPTS = 'receipts-done'   # release_when: every run_tracked receipt in `receipts` rechecks done
 _NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*\Z')
 
 
@@ -484,11 +488,53 @@ def _wait_cleared(boards, pid, start, deadline) -> list:
         time.sleep(0.05)
 
 
+_process = None
+
+
+def _recheck(receipt) -> str:
+    """hil_process.recheck, loaded from beside this file on first use: only a holder that waits
+    for receipts needs it."""
+    global _process
+    if _process is None:
+        spec = importlib.util.spec_from_file_location(
+            'agentrc_hil_process', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'hil_process.py'))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _process = mod
+    return _process.recheck(receipt)
+
+
+def _receipt_text(r) -> str:
+    sup = r.get('supervisor') if isinstance(r, dict) else None
+    pid = sup.get('pid') if isinstance(sup, dict) else None
+    return f'receipt {r.get("token")} (supervisor pid {pid})' if isinstance(r, dict) else f'receipt {r!r:.80}'
+
+
+def _release_blocker(rec) -> str:
+    """Why a cleanup holder's recorded release predicate (`release_when`) is false now, or ''
+    when it has none or it holds. One that cannot be evaluated is false."""
+    when = rec.get('release_when')
+    if when is None:
+        return ''
+    receipts = rec.get('receipts')
+    if when != RELEASE_RECEIPTS or not isinstance(receipts, list):
+        return f'its release predicate {when!r} cannot be evaluated'
+    open_runs = []
+    for r in receipts:
+        try:
+            state = _recheck(r)
+        except Exception as e:       # a malformed receipt or a missing hil_process proves nothing
+            state = f'unknown ({e!r:.80})'
+        if state != 'done':
+            open_runs.append(f'{_receipt_text(r)} {state}')
+    return f'its operations are not proven ended: {"; ".join(open_runs)}' if open_runs else ''
+
+
 def release_token(token: str):
-    """End the token's holder: its token, pid, start, role and lock set agree on every board
-    that carries the token, it is alive as recorded, and SIGUSR1 reaches it through a pidfd;
-    returns (pid, boards) once its records and flocks are gone. A dead holder is refused: its boards
-    need a recovery takeover."""
+    """End the token's holder: its token, pid, start, role, lock set and release predicate agree
+    on every board that carries the token, it is alive as recorded, its predicate holds, and
+    SIGUSR1 reaches it through a pidfd; returns (pid, boards) once its records and flocks are
+    gone. A dead holder is refused: its boards need a recovery takeover."""
     found = {}
     for b in lock_names():
         rec = read_record(b)
@@ -501,7 +547,7 @@ def release_token(token: str):
     if not isinstance(pid, int) or pid <= 0 or start is None or not isinstance(lockset, list):
         raise ReleaseRefused(f'not signalled: token {token}: the record on {next(iter(found))} lacks pid/start/locks')
     for b, rec in found.items():
-        if rec.get('pid') != pid or rec.get('start') != start or rec.get('locks') != lockset:
+        if any(rec.get(k) != first.get(k) for k in ('pid', 'start', 'locks', 'release_when', 'receipts')):
             raise ReleaseRefused(f'not signalled: token {token}: the record on {b} disagrees with the others')
         if not is_cleanup_holder(rec):
             raise ReleaseRefused(f'not signalled: holder pid {pid} is not a cleanup holder on {b}: '
@@ -515,6 +561,10 @@ def release_token(token: str):
                 f'pid {pid} is not the recorded holder (start {live} != {start})')
         raise ReleaseRefused(f'not signalled: {gone}; its boards need a recovery takeover '
                              f'(`hil_lock.py hold --take-over {lockset[0]}`)')
+    why = _release_blocker(first)
+    if why:
+        raise ReleaseRefused(f'not signalled: holder pid {pid} of token {token} keeps '
+                             f'{", ".join(sorted(found))}: {why}')
 
     def still_valid():
         return all(read_record(b) == found[b] and _holds_flock(pid, lock_path(b)) for b in found)
@@ -528,7 +578,9 @@ def release_token(token: str):
     _pidfd_signal(pid, start, signal.SIGUSR1, still_valid)
     left = _wait_cleared(sorted(found), pid, start, time.monotonic() + RELEASE_WAIT)
     if left:
-        raise ReleaseRefused(f'signalled, but holder pid {pid} left its records or flocks on {", ".join(left)}')
+        why = _release_blocker(first)      # it held above, but the holder's own recheck decides
+        raise ReleaseRefused(f'signalled, but holder pid {pid} left its records or flocks on {", ".join(left)}'
+                             + (f': {why}' if why else ''))
     return pid, sorted(found)
 
 
@@ -688,6 +740,175 @@ def end_takeover(handles) -> None:
         fh.close()
 
 
+# --- cleanup holders ------------------------------------------------------------------------
+def arm_release() -> int:
+    """Before a cleanup holder's records name it, from the main thread: SIGUSR1, release_token's
+    signal, then only writes its number to the returned descriptor, whichever thread receives
+    it, so a release that comes at once is never lost and never kills a holder with threads
+    of its own (hil_reserve's usb_observe readers). A signal mask cannot do that: it is per
+    thread, and those threads already run."""
+    r, w = os.pipe()
+    os.set_blocking(w, False)
+    signal.set_wakeup_fd(w)                            # first: a signal that lands next is written
+    signal.signal(signal.SIGUSR1, lambda *_: None)    # a handler, so no thread ever takes the default action
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR1})   # a mask inherited across exec would keep it pending
+    return r
+
+
+def hold_until_released(handles, wake, *, receipts=(), journals=False) -> None:
+    """A cleanup holder's wait over `handles` ({board: handle}) on `wake`, arm_release's
+    descriptor: each SIGUSR1 rechecks the release predicate its records name (with
+    `receipts`, every one `done`; none without), the authority release_token's own check only
+    anticipates. Once it holds, the records are cleared, then with `journals` (a takeover)
+    the journals, and the handles closed."""
+    pred = _release_fields(list(receipts))
+    while True:
+        if signal.SIGUSR1 in os.read(wake, 512) and not _release_blocker(pred):   # other signals' numbers too
+            break
+    if journals:
+        end_takeover(handles)
+        return
+    for fh in handles.values():
+        release_board_lock(fh)
+
+
+def _release_fields(receipts: list) -> dict:
+    """The record fields of a cleanup holder's release predicate: none without receipts."""
+    return {'release_when': RELEASE_RECEIPTS, 'receipts': receipts} if receipts else {'receipts': receipts}
+
+
+def _send(fd, msg) -> None:
+    try:
+        os.write(fd, (json.dumps(msg) + '\n').encode())     # one short line: a single pipe write
+    except OSError:
+        pass
+
+
+def _next_message(fd, buf, deadline):
+    """The next line on `fd` as a dict; None at EOF, past `deadline` or for a malformed line."""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    while b'\n' not in buf:
+        left = deadline - time.monotonic()
+        if left <= 0 or not poller.poll(int(left * 1000) + 1):
+            return None
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            return None
+        buf += chunk
+    line, _, rest = bytes(buf).partition(b'\n')
+    buf[:] = rest
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
+def _holder_argv(job: dict) -> list:
+    return [sys.executable, '-I', os.path.abspath(__file__), '--cleanup-holder', json.dumps(job)]
+
+
+def _protected_handle(fh) -> bool:
+    try:
+        state, rec = _parse(_handle_record(fh))
+    except OSError:
+        return False
+    return state == 'record' and rec.get('protected') is True
+
+
+def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF_WAIT, **extra) -> str:
+    """Hand the flocks of `handles` ({board: handle} the caller took with take_board_lock(...,
+    protected=True)) to a cleanup holder, a fresh interpreter given their descriptors, so the
+    caller can go on or exit; returns its token once its records name it and it confirmed the
+    hold. A handle whose record is not shown protected raises ValueError before anything is
+    touched: the caller still owns every handle, and must end or protect them itself.
+    Otherwise each record is first rewritten with `detail` and `receipts`; a rewrite cut
+    short leaves the protected record or an unreadable one, both recovery blockers. A handoff
+    that fails, each of its waits bounded by `wait`, raises LockUnavailable with such a
+    record, or a cleanup-holder record naming the holder it ended, left as the blocker; an
+    interrupt ends it the same way and propagates. With `receipts` (hil_process.run_tracked's)
+    the holder's release predicate is every one rechecking `done`. `extra` adds fields to the
+    cleanup-holder record. Past the ValueError the caller closes its handles either way,
+    never clearing them."""
+    unprotected = [b for b, fh in handles.items() if not _protected_handle(fh)]
+    if unprotected:
+        raise ValueError(f'cleanup holder handoff refused: {", ".join(unprotected)} not taken protected; '
+                         f'nothing changed, the caller still holds every board')
+    receipts = list(receipts)
+    unwritten = []
+    for b, fh in handles.items():
+        try:
+            write_record(fh, reason, protected=True, detail=detail, receipts=receipts)
+        except OSError as e:
+            unwritten.append(f'{b}: {e}')
+    fds, proc, buf = {}, None, bytearray()
+    try:
+        fds['hello_r'], fds['hello_w'] = os.pipe()
+        fds['go_r'], fds['go_w'] = os.pipe()
+        job = {'locks': {b: fh.fileno() for b, fh in handles.items()}, 'hello_fd': fds['hello_w'],
+               'go_fd': fds['go_r'], 'receipts': receipts, 'wait': wait}
+        proc = subprocess.Popen(_holder_argv(job), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True,
+                                pass_fds=(*job['locks'].values(), fds['hello_w'], fds['go_r']))
+        for k in ('hello_w', 'go_r'):
+            os.close(fds.pop(k))
+        hello = _next_message(fds['hello_r'], buf, time.monotonic() + wait)
+        if hello is None or 'pid' not in hello or 'start' not in hello:
+            raise RuntimeError(f'no readiness within {wait}s: {hello!r}')
+        pid, start = hello['pid'], hello['start']
+        if pid != proc.pid or start is None or proc_start(pid) != start:
+            raise RuntimeError(f'readiness from pid {pid} is not the holder started as {proc.pid}')
+        token = secrets.token_hex(8)
+        for fh in handles.values():
+            write_record(fh, reason, protected=True, role=CLEANUP_ROLE, detail=detail, **_release_fields(receipts),
+                         **extra, pid=pid, start=start, token=token, locks=sorted(handles))
+        os.write(fds['go_w'], b'1')
+        if _next_message(fds['hello_r'], buf, time.monotonic() + wait) != {'held': True}:
+            raise RuntimeError('the holder did not confirm the handoff')
+        return token
+    except BaseException as e:
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=wait)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                pass
+        if not isinstance(e, Exception):
+            raise
+        lost = f' (protected record not written on {"; ".join(unwritten)})' if unwritten else ''
+        raise LockUnavailable(f'cleanup holder handoff failed: {e!r:.200}{lost}') from e
+    finally:
+        for fd in fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _handed_holder(job: dict) -> int:
+    """The cleanup holder hand_to_cleanup_holder starts: report readiness, keep the inherited
+    flocks once the handing process recorded it as their holder, confirm, and hold until
+    released. Not handed over within `wait`, it exits, dropping only its copies."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+    wake = arm_release()
+    handles = {b: os.fdopen(fd, 'r+') for b, fd in job['locks'].items()}
+    pid = os.getpid()
+    _send(job['hello_fd'], {'pid': pid, 'start': proc_start(pid)})
+    ready = select.select([job['go_fd']], [], [], job['wait'])[0]
+    if not ready or os.read(job['go_fd'], 1) != b'1':
+        return 1
+    _send(job['hello_fd'], {'held': True})
+    os.close(job['hello_fd'])
+    os.close(job['go_fd'])
+    hold_until_released(handles, wake, receipts=job['receipts'])
+    return 0
+
+
 # --- operator CLI (hold/release/status) ------------------------------------
 def is_locked(board: str) -> bool:
     """True if the recorded holder process is still alive.
@@ -776,21 +997,17 @@ def cmd_hold(boards, reason, take_over_board=None):
     if take_over_board:
         # a takeover holder is a cleanup holder: SIGTERM never ends it, release --token does
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        wake = arm_release()   # before its records name it: the token works at once
         try:
             token, handles = take_over(take_over_board, reason)
         except (BoardLocked, LockUnavailable) as e:
             report(f'0{e}')
             os._exit(1)
-        def _recovered(*_):
-            end_takeover(handles)
-            os._exit(0)
-
-        signal.signal(signal.SIGUSR1, _recovered)    # before readiness: the token works at once
         if not report(f'1{token} {", ".join(handles)}'):
             os._exit(1)        # no end_takeover: the journals and records stay recovery blockers
         os.close(w_fd)
-        while True:
-            signal.pause()
+        hold_until_released(handles, wake, journals=True)
+        os._exit(0)
 
     handles = []
     start = proc_start(os.getpid())
@@ -976,7 +1193,9 @@ Usage:
 A holder process holds ALL boards given in one `hold` call; releasing any of
 them ends that holder and releases all of its boards. A takeover holder is a
 cleanup holder over the blocked board's whole lock set; only `release --token`
-ends it, once the recovery succeeded.
+ends it, once the recovery succeeded. A cleanup holder that records a release
+predicate (the run_tracked receipts it waits for) ends only once that holds:
+until then `release --token` refuses, naming what is still open.
 """
 
 
@@ -1011,4 +1230,6 @@ def main():
 
 
 if __name__ == '__main__':
+    if sys.argv[1:2] == ['--cleanup-holder'] and len(sys.argv) == 3:   # started by hand_to_cleanup_holder
+        sys.exit(_handed_holder(json.loads(sys.argv[2])))
     main()

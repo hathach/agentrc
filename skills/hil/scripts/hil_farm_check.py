@@ -25,11 +25,11 @@ started under it, or when every process started under it is proven ended
 final state. Nothing moves on while an earlier process is not proven ended: ctx.run refuses
 a new command, and the engine runs neither the observation nor the final state. Otherwise
 the board keeps a recovery blocker: while a process the check started survives, a cleanup
-holder (`role: cleanup-holder`, this file run as `--hold` in a fresh interpreter, given the
-lock's descriptor) keeps the flock, and the row names its token. `hil_lock.py release
---token` ends it only once every receipt it holds rechecks `done`; anything else is the
-contract's Recovery. Every other outcome, a failed handoff to the holder included, leaves the
-protected record on the free flock for a recovery takeover. A check killed outright leaves
+holder (`role: cleanup-holder`, hil_lock.hand_to_cleanup_holder's fresh interpreter given
+the lock's descriptor) keeps the flock, and the row names its token. `hil_lock.py release
+--token` refuses, naming the open receipts, until every receipt it holds rechecks `done`;
+anything else is the contract's Recovery. Every other outcome, a failed handoff to the
+holder included, leaves the protected record on the free flock for a recovery takeover. A check killed outright leaves
 its protected record the same way and prints no report. SIGINT stops the check after the
 current board's cleanup; the report then says `termination: aborted`.
 
@@ -86,9 +86,6 @@ import importlib.util
 import io
 import json
 import os
-import select
-import secrets
-import signal
 import socket
 import subprocess
 import sys
@@ -115,7 +112,7 @@ HOLDER = 'hil_farm_check'
 SCHEMA_VERSION = 1
 SETTLE = 2.0          # s run_tracked waits for an operation's descendants once it ended
 RECHECK_WAIT = 5.0    # s an operation not yet proven ended gets before the board's cleanup is decided
-HOLDER_READY = 10.0   # s the cleanup holder gets to record itself
+HOLDER_READY = 10.0   # s the cleanup holder gets for each step of its handoff
 STATUSES = ('ok', 'flash-failed', 'failed', 'locked', 'blocked')
 MARKS = {'ok': '✅ ok', 'flash-failed': '❌ flash-failed', 'failed': '❌ failed', 'locked': '🔒 locked',
          'blocked': '⛔ blocked'}
@@ -562,15 +559,18 @@ def _finalize(fh, lock: str, ctx: Context, plan: dict, row: dict, final: dict) -
         cleanup['evidence'].append('the record could not be cleared')
     row['check_status'], row['status'] = row['status'], 'blocked'
     detail = (f'farm check cleanup unresolved: {final["result"]}; ' + '; '.join(cleanup['evidence']))[:500]
-    with contextlib.suppress(OSError):
-        hil_lock.write_record(fh, REASON, protected=True, detail=detail, receipts=receipts)
     token = None
     if any(e['cleanup'] == 'pending' for e in open_ops):
-        token, why = _cleanup_holder(fh, lock, detail, receipts)
-        if why == 'interrupted':
+        try:     # fh was taken protected, as the handoff requires: a failure leaves a recovery blocker
+            token = hil_lock.hand_to_cleanup_holder({lock: fh}, REASON, detail=detail, receipts=receipts,
+                                                    wait=HOLDER_READY, holder=HOLDER)
+        except KeyboardInterrupt:
             row['interrupted'] = True
-        elif why:
-            cleanup['evidence'].append(f'cleanup holder handoff failed: {why}')
+        except hil_lock.LockUnavailable as e:
+            cleanup['evidence'].append(str(e))
+    else:
+        with contextlib.suppress(OSError):
+            hil_lock.write_record(fh, REASON, protected=True, detail=detail, receipts=receipts)
     if token:
         cleanup['blocker'], cleanup['token'] = 'cleanup-holder', token
         row['note'].append(f'cleanup holder (token {token}) keeps the board for recovery, which ends it with '
@@ -581,83 +581,6 @@ def _finalize(fh, lock: str, ctx: Context, plan: dict, row: dict, final: dict) -
     with contextlib.suppress(OSError):
         fh.close()   # never clear_record: the record is the blocker
     say(f'{row["name"]:26} BLOCKED: {cleanup["blocker"]} ({final["result"]})')
-
-
-def _holder_argv(job: dict) -> list:
-    return [sys.executable, '-I', os.path.abspath(__file__), '--hold', json.dumps(job)]
-
-
-def _cleanup_holder(fh, lock: str, detail: str, receipts: list) -> tuple:
-    """Hand `fh`'s flock to a cleanup holder (`--hold`, a fresh interpreter given the lock's
-    descriptor): (token, '') once its record names it, else (None, why) with the holder gone
-    and the protected record, or a record naming the dead holder, left as the blocker. Every
-    wait is bounded by HOLDER_READY; an interrupt ends the handoff the same way."""
-    fds, proc, reports = {}, None, None
-    try:
-        fds['hello_r'], fds['hello_w'] = os.pipe()
-        reports = hil_process._Reports(fds.pop('hello_r'))     # owns and closes it from here on
-        fds['go_r'], fds['go_w'] = os.pipe()
-        job = {'lock_fd': fh.fileno(), 'hello_fd': fds['hello_w'], 'go_fd': fds['go_r'], 'receipts': receipts,
-               'wait': HOLDER_READY}
-        proc = subprocess.Popen(_holder_argv(job), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                stderr=subprocess.DEVNULL, pass_fds=(fh.fileno(), fds['hello_w'], fds['go_r']),
-                                start_new_session=True)
-        for k in ('hello_w', 'go_r'):
-            os.close(fds.pop(k))
-        hello = reports.next(time.monotonic() + HOLDER_READY)
-        if hello is None or 'pid' not in hello or 'start' not in hello:
-            raise RuntimeError(f'no readiness within {HOLDER_READY}s: {hello!r}')
-        pid, start = hello['pid'], hello['start']
-        if pid != proc.pid or start is None or hil_lock.proc_start(pid) != start:
-            raise RuntimeError(f'readiness from pid {pid} is not the holder started as {proc.pid}')
-        token = secrets.token_hex(8)
-        hil_lock.write_record(fh, REASON, protected=True, holder=HOLDER, role=hil_lock.CLEANUP_ROLE, detail=detail,
-                              receipts=receipts, pid=pid, start=start, token=token, locks=[lock])
-        os.write(fds['go_w'], b'1')
-        if reports.next(time.monotonic() + HOLDER_READY) != {'held': True}:
-            raise RuntimeError('the holder did not confirm the handoff')
-        return token, ''
-    except BaseException as e:
-        if proc is not None:
-            with contextlib.suppress(OSError):
-                proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired, KeyboardInterrupt):
-                proc.wait(timeout=HOLDER_READY)
-        return None, 'interrupted' if isinstance(e, KeyboardInterrupt) else repr(e)[:200]
-    finally:
-        for fd in fds.values():
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        if reports is not None:
-            reports.close()
-
-
-def _hold(job: dict) -> int:
-    """The cleanup holder: report readiness, then keep the inherited flock once the engine has
-    recorded it as the holder, and confirm. Never handed over within `wait`, it exits, dropping
-    its copy.
-    SIGUSR1 (release_token) ends it only once every receipt rechecks `done`."""
-    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, signal.SIG_IGN)
-    fh = os.fdopen(job['lock_fd'], 'r+')
-    receipts = job['receipts']
-
-    def bow_out(*_):
-        if all(hil_process.recheck(r) == 'done' for r in receipts):
-            hil_lock.release_board_lock(fh)
-            os._exit(0)
-
-    signal.signal(signal.SIGUSR1, bow_out)
-    pid = os.getpid()
-    hil_process._send(job['hello_fd'], {'pid': pid, 'start': hil_lock.proc_start(pid)})
-    ready = select.select([job['go_fd']], [], [], job['wait'])[0]
-    if not ready or os.read(job['go_fd'], 1) != b'1':
-        return 1
-    hil_process._send(job['hello_fd'], {'held': True})
-    os.close(job['hello_fd'])
-    os.close(job['go_fd'])
-    while True:
-        signal.pause()
 
 
 # --- the farm -------------------------------------------------------------------------------
@@ -810,7 +733,7 @@ def parser_for(profile) -> argparse.ArgumentParser:
 
 
 LOCK_FUNCTIONS = ('take_board_lock', 'read_record', 'write_record', 'clear_record', 'is_cleanup_holder',
-                  'proc_start')
+                  'hand_to_cleanup_holder')
 LOCK_EXCEPTIONS = ('BoardLocked', 'RecoveryBlocked', 'LockUnavailable')
 
 
@@ -926,9 +849,3 @@ def _main(profile, argv, state_dir, host) -> int:
                 rec = report_core.Recovery('unresolved', [str(again)], [])
             print(f'farm check: report {rec.outcome}' + ''.join(f'; {p}' for p in rec.problems), file=sys.stderr)
     return code
-
-
-if __name__ == '__main__':
-    if len(sys.argv) != 3 or sys.argv[1] != '--hold':
-        sys.exit('usage: hil_farm_check.py --hold JOB  (started by the farm check engine)')
-    sys.exit(_hold(json.loads(sys.argv[2])))

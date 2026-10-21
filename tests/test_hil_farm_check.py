@@ -455,7 +455,9 @@ class Engine(unittest.TestCase):
 
     def test_settle_holds_in_process_board_io_until_every_run_is_proven_ended(self):
         reset = 'STM32_Programmer_CLI --connect port=swd sn=P --rst --go'
-        patch(self, eng, '_cleanup_holder', lambda *a: (None, 'no holder in this test'))
+        def no_holder(*a, **kw):
+            raise lk.LockUnavailable('no holder in this test')
+        patch(self, lk, 'hand_to_cleanup_holder', no_holder)
         for cleanup in ('pending', 'unknown', 'done'):
             with self.subTest(cleanup=cleanup):
                 io = []
@@ -528,7 +530,7 @@ class Engine(unittest.TestCase):
         self.rechecks['light.bin'] = 'pending'
         patch(self, eng, 'HOLDER_READY', 1)
         if argv is not None:
-            patch(self, eng, '_holder_argv', lambda job: argv(job))
+            patch(self, lk, '_holder_argv', lambda job: argv(job))
         if popen is not None:
             patch(self, eng.subprocess, 'Popen', popen)
         t = time.monotonic()
@@ -561,8 +563,10 @@ class Engine(unittest.TestCase):
         self.assert_failed_handoff(self.handoff(lambda job: ['sh', '-c', 'kill -STOP $$']))
 
     def test_a_holder_that_registers_late_is_ended(self):
+        real = lk._holder_argv
+
         def late(job):
-            return ['sh', '-c', 'sleep 3; exec "$@"', 'sh', *eng._holder_argv(job)]
+            return ['sh', '-c', 'sleep 3; exec "$@"', 'sh', *real(job)]
         self.assert_failed_handoff(self.handoff(late))
         self.assertNotIn('role', lk.read_record('b'))
 
@@ -693,9 +697,14 @@ class Engine(unittest.TestCase):
         self.assertEqual((row['cleanup']['blocker'], row['cleanup']['token']), ('cleanup-holder', rec['token']))
         self.assertTrue(lk.is_cleanup_holder(rec))
         self.assertTrue(lk._holds_flock(rec['pid'], lk.lock_path('b')))
-        # its receipt cannot be rechecked: unknown, never released
-        with mock.patch.object(lk, 'RELEASE_WAIT', 0.3), self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
-            lk.release_token(rec['token'])
+        self.assertEqual(rec['release_when'], 'receipts-done')
+        signals = []
+        with mock.patch.object(lk.signal, 'pidfd_send_signal', lambda fd, sig: signals.append(sig)):
+            # its receipt cannot be rechecked: unknown, refused up front naming it and the holder
+            with self.assertRaisesRegex(lk.ReleaseRefused, rf"not signalled: holder pid {rec['pid']} .* "
+                                        r'not proven ended: receipt light\.bin \(supervisor pid None\) unknown'):
+                lk.release_token(rec['token'])
+        self.assertEqual(signals, [])
 
     # --- interruption ---------------------------------------------------------------------------
     def test_an_interrupted_flash_still_restores_and_stops_the_farm(self):
@@ -1165,7 +1174,7 @@ class Process(unittest.TestCase):
         with self.assertRaises(lk.BoardLocked):
             self.take()
         self.assertTrue(lk.is_cleanup_holder(lk.read_record('farmb')))
-        with mock.patch.object(lk, 'RELEASE_WAIT', 0.3), self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
+        with self.assertRaisesRegex(lk.ReleaseRefused, 'not signalled: .* not proven ended: receipt .* pending'):
             lk.release_token(token)      # its survivor still runs
         self.kill(survivor)
         deadline = time.monotonic() + 20
@@ -1191,7 +1200,7 @@ class Process(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.05)
         self.kill(survivor)      # gone too, but nothing proves it any more
-        with mock.patch.object(lk, 'RELEASE_WAIT', 0.3), self.assertRaisesRegex(lk.ReleaseRefused, 'left its records'):
+        with self.assertRaisesRegex(lk.ReleaseRefused, 'not signalled: .* not proven ended: receipt .* unknown'):
             lk.release_token(r['cleanup']['token'])
         with self.assertRaises(lk.BoardLocked):
             self.take()
