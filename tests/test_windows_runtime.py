@@ -13,10 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'lib'))
 import windows  # noqa: E402
 sys.path.insert(0, str(ROOT / 'tests'))
-from helpers import pid_alive, tmpdir  # noqa: E402
+from helpers import guard_survivors, pid_alive, tmpdir  # noqa: E402
 
 NT = os.name == 'nt'
 SLEEP = [sys.executable, '-c', 'import time; time.sleep(60)']
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class OnPathTest(unittest.TestCase):

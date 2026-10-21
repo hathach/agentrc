@@ -12,6 +12,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 try:
     import termios
@@ -19,6 +21,10 @@ except ImportError:  # Windows: only the Win32 backend cases run
     termios = None
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'console_capture.py'
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 @unittest.skipIf(os.name == 'nt', 'ptys are POSIX')

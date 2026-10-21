@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'skills' / 'pr-babysit' / 'scripts' / 'state_transfer.py'
@@ -34,6 +36,10 @@ def count(envelope):
 
 def decode(envelope):
     return b''.join(base64.b64decode(c['data']) for c in sorted(envelope['chunks'], key=lambda c: c['i']))
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class StateTransferTest(unittest.TestCase):

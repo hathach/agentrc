@@ -29,7 +29,7 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'pc_sample.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import make_stub, pid_alive, tmpdir  # noqa: E402
+from helpers import guard_survivors, make_stub, pid_alive, tmpdir  # noqa: E402
 _spec = importlib.util.spec_from_file_location('pc_sample', SCRIPT)
 pc_sample = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(pc_sample)
@@ -84,6 +84,10 @@ def fake_tools(case, d, tools):
             found = pc_sample.which(nt_name(name))
         case.assertEqual(found and Path(found).resolve(), stub.resolve(), name)
     return env
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class CopiedAloneTest(unittest.TestCase):
@@ -1538,7 +1542,8 @@ class AutopsyStopTest(unittest.TestCase):
         self.addCleanup(proc.wait)
         self.addCleanup(proc.stdout.close)
         grandchild = int(proc.stdout.readline())
-        self.addCleanup(lambda: pid_alive(grandchild) and os.kill(grandchild, signal.SIGTERM))
+        kill = getattr(signal, 'SIGKILL', signal.SIGTERM)    # the grandchild inherits the server's ignored SIGTERM
+        self.addCleanup(lambda: pid_alive(grandchild) and os.kill(grandchild, kill))
         t0 = time.monotonic()
         self.autopsy.stop(proc, 0)
         self.assertIsNotNone(proc.poll())

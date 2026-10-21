@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'credit-guard' / 'credit_guard.py'
 spec = importlib.util.spec_from_file_location('credit_guard', SCRIPT)
@@ -27,6 +29,10 @@ def usage(enabled=True, **percent):
 
 def ev(name, sid=SID):
     return {'hook_event_name': name, 'session_id': sid}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Guard(unittest.TestCase):

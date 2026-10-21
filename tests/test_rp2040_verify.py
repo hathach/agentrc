@@ -11,6 +11,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'rp2040_verify.py'
 _spec = importlib.util.spec_from_file_location('rp2040_verify', SCRIPT)
@@ -34,6 +36,10 @@ sys.exit(int(os.environ.get('FAKE_RC', '0')))
 '''
 
 VERIFIED = 'Info : something|RESULT verified 31136 bytes in 0.043000s|DHCSR 0x01000001'
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 @unittest.skipIf(os.name == 'nt', 'OpenOCD and nm stubs require POSIX executable semantics')

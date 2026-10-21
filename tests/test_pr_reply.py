@@ -11,6 +11,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-reply' / 'scripts' / 'reply.py'
 spec = importlib.util.spec_from_file_location('pr_reply', SCRIPT)
@@ -22,6 +24,10 @@ REPO, PR, ME = 'o/r', 7, 'hathach'
 ECHO = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + ' ✓ 修复'.encode())"
 STRAY = "import sys; sys.stdout.buffer.write(b'ok \\xff'); sys.stderr.buffer.write(b'err \\xfe'); sys.exit(1)"
 GH = reply.gh  # the real one: ReplyCase patches it
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class FakeGitHub:

@@ -29,7 +29,7 @@ SKILL = ROOT / 'skills' / 'cowork' / 'SKILL.md'
 sys.path.insert(0, str(SCRIPT.parent))
 import cowork  # noqa: E402
 sys.path.insert(0, str(ROOT / 'tests'))
-from helpers import make_stub  # noqa: E402
+from helpers import guard_survivors, make_stub, pid_alive  # noqa: E402
 
 # Stand-ins for the real CLIs: record argv, stdin, cwd and environment, then emit an
 # event stream. With FAKE_GATE set they hold until that file exists, so a test can
@@ -169,11 +169,7 @@ def spawn_holding(lock, argv):
 def gone(pid):
     if os.name == 'nt':
         return cowork.nt_born(pid) is None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+    return not pid_alive(pid)
 
 
 def launcher(bin_dir, name, script):
@@ -181,6 +177,10 @@ def launcher(bin_dir, name, script):
     runs only an .exe by name, and a missing stand-in must never fall through
     to the real CLI on PATH."""
     make_stub(bin_dir, name, f'import runpy\nrunpy.run_path({str(script)!r}, run_name="__main__")\n')
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class CoworkTest(unittest.TestCase):

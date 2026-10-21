@@ -11,6 +11,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'hooks.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_hooks', SCRIPT)
@@ -54,6 +56,10 @@ def running(pid):
     except ProcessLookupError:
         return False
     return True
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 @unittest.skipUnless(shutil.which('pre-commit'), 'pre-commit is not installed')

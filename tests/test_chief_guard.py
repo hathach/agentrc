@@ -13,11 +13,15 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import tmpdir  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'chief_guard.py'
 # Windows judges a /tmp path as MSYS bash maps it, through cygpath; without one it is denied
 needs_msys = unittest.skipIf(os.name == 'nt' and not shutil.which('cygpath'), 'no cygpath to map /tmp')
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class ChiefGuard(unittest.TestCase):

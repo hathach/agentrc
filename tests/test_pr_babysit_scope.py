@@ -6,9 +6,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'scope_check.py'
 STAR = [] if os.name == 'nt' else ['src/*.c']  # NTFS forbids * in a file name
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class ScopeCheckTest(unittest.TestCase):

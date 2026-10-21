@@ -16,7 +16,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills/target-debug/scripts/esp_verify.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import make_stub, pid_alive, tmpdir  # noqa: E402
+from helpers import guard_survivors, make_stub, pid_alive, tmpdir  # noqa: E402
 SPEC = importlib.util.spec_from_file_location('esp_verify', SCRIPT)
 esp_verify = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(esp_verify)
@@ -100,6 +100,10 @@ if mode == 'late_failure':
     print('ERROR: A fatal error occurred: Lost connection during reset.', file=sys.stderr)
     sys.exit(2)
 '''
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class VerifyTest(unittest.TestCase):

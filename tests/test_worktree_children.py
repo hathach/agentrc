@@ -8,6 +8,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'plugins' / 'worktree-children' / 'worktree_children.py'
@@ -71,6 +73,10 @@ os.scandir = failing_scandir
 sys.argv = sys.argv[1:]
 runpy.run_path(sys.argv[0], run_name='__main__')
 '''
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 @unittest.skipIf(os.name == 'nt', 'POSIX paths and a shell submodule foreach')

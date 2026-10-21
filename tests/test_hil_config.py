@@ -9,6 +9,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = {'rtt': ROOT / 'skills' / 'rtt' / 'scripts' / 'rtt.py',
@@ -67,6 +69,10 @@ RESOLVE_CASES = [
 ]
 BAD_FILES = [('[]', 'expected {"boards"'), ('{"boards": {}}', 'expected {"boards"'),
              ('{"boards": ["k64f"]}', 'expected {"boards"'), ('{"boards": [', '--hil-config'), ('{}', 'expected {"boards"')]
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Config(unittest.TestCase):

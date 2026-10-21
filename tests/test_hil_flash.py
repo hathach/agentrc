@@ -30,6 +30,8 @@ import threading
 import types
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'skills' / 'hil' / 'scripts'
@@ -148,6 +150,10 @@ def esptool_no_color_delta(case, observed):
 
 def deltas(case, observed):
     return esptool_no_color_delta(case, jlink_flash_script_delta(case, jlink_command_file_delta(case, observed)))
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Golden(unittest.TestCase):

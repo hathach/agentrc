@@ -13,7 +13,7 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'preflight.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import run_gh_as  # noqa: E402
+from helpers import guard_survivors, run_gh_as  # noqa: E402
 spec = importlib.util.spec_from_file_location('pr_babysit_preflight', SCRIPT)
 preflight = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(preflight)
@@ -23,6 +23,10 @@ VIEW = {'headRefName': 'fix', 'headRefOid': 'f' * 40, 'baseRefOid': 'b' * 40, 'b
         'headRepositoryOwner': {'id': 'x', 'login': 'someone'},
         'headRepository': {'id': 'y', 'name': 'tinyusb'}, 'url': 'https://github.com/hathach/tinyusb/pull/7', 'state': 'OPEN'}
 REF = {'ref': 'refs/heads/master', 'object': {'type': 'commit', 'sha': 'c' * 40}}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class PreflightTest(unittest.TestCase):

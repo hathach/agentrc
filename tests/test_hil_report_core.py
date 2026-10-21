@@ -27,6 +27,8 @@ import sys
 import tempfile
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / 'data' / 'hil_report_core'
 
@@ -57,6 +59,10 @@ def usb_row(board, **cells):
 def uf2_body(rows, path='/runs/run-1/hil_report.json', **extra):
     return {'pass': all(r.get('pass') for r in rows) and bool(rows), 'caveat': '', 'results': rows,
             'reportPath': path, **extra}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Dir(unittest.TestCase):

@@ -21,6 +21,8 @@ import time
 import warnings
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / 'skills' / 'hil' / 'scripts'
@@ -259,6 +261,10 @@ def fake_install(root, banner=BANNER, chips=('esp32p4', 'esp32c3'), board_body=N
             board_body or f'# example\n\nsource [find interface/esp_usb_jtag.cfg]\nsource [find target/{chip}.cfg]\n')
     (scripts / 'target' / 'esp32.cfg').write_text('')    # a chip without a USJ
     return root / 'bin' / 'openocd', scripts
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class FakeBus:

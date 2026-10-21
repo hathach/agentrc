@@ -21,6 +21,8 @@ import titles  # noqa: E402
 import vendor_arm  # noqa: E402
 import vendor_microchip  # noqa: E402
 import vendor_ti  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 
 def doc(doc_id, aliases=()):
@@ -30,6 +32,10 @@ def doc(doc_id, aliases=()):
 
 def legacy(*titles):
     return {doclib.norm_title(t): {'id': n, 'title': t} for n, t in enumerate(titles, 1)}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Legacy(unittest.TestCase):

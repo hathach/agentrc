@@ -11,6 +11,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'usb-kernel-debug' / 'scripts' / 'usbcap.py'
 DYNDBG = SCRIPT.with_name('usb_dyndbg.sh')
@@ -28,6 +30,10 @@ Bus 003 Device 009: ID cafe:4001 TinyUSB TinyUSB CDC MSC
 Bus 005 Device 012: ID cafe:4010 TinyUSB TinyUSB usbtest
 Bus 005 Device 013: ID 1366:0101 SEGGER J-Link PLUS
 """
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class ResolveTest(unittest.TestCase):

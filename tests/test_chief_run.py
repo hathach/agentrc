@@ -21,7 +21,7 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'headless-chief' / 'scripts' / 'chief_run.py'
 CAPTURE = Path(__file__).resolve().parent / 'data' / 'chief_run' / 'stream.jsonl'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import make_stub, pid_alive  # noqa: E402
+from helpers import guard_survivors, make_stub, pid_alive  # noqa: E402
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
@@ -77,6 +77,10 @@ def kill(pid):
         subprocess.run(['taskkill', '/T', '/F', '/PID', str(pid)], capture_output=True)
     else:
         os.kill(pid, signal.SIGKILL)
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class ChiefRun(unittest.TestCase):

@@ -25,6 +25,8 @@ import post  # noqa: E402
 import prepare  # noqa: E402
 import result  # noqa: E402
 import threads  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 REPO, PR, ME = 'o/r', 7, 'reviewer'
 REAL_RUN = facts.run
@@ -38,6 +40,10 @@ def sh(cwd, *argv):
 REFUSALS = {'refused': 'gh: API rate limit exceeded for user ID 1. (HTTP 403)',
             'invalid': 'gh: Validation Failed: {"resource":"PullRequestReview","code":"custom"} (HTTP 422)',
             'secondary': 'gh: You have exceeded a secondary rate limit. (HTTP 429)'}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class FakeGitHub:

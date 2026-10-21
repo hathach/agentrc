@@ -3,10 +3,13 @@ import io
 import json
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('launch_result', ROOT / 'skills/pr-babysit/scripts/launch_result.py')
@@ -48,6 +51,10 @@ def output(**over):
                 {'type': 'workflow_agent', 'label': 'reviews#2', 'model': 'claude-opus-5-5', 'state': 'done', 'startedAt': 1, 'tokens': 500, 'durationMs': 9000},
                 {'type': 'workflow_agent', 'label': 'ci:collect#2.f', 'model': 'claude-haiku-4-5', 'state': 'failed', 'startedAt': 3, 'tokens': 50, 'durationMs': 1000}],
             'result': result, **over}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class LaunchResultTest(unittest.TestCase):

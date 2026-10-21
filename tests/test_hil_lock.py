@@ -27,6 +27,8 @@ import types
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors, pid_alive  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_lock.py'
 
@@ -112,6 +114,10 @@ def make_receipt(test, state: Path, uid=None):
         fh.close()
     return {'token': 't', 'supervisor': {'pid': 4242, 'start': '1', 'lock': [st.st_dev, st.st_ino]},
             'lock': str(lock), 'record': str(record), 'log': str(state / 'hil_op_t.log'), 'survivors': None}, done
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class LockDir(unittest.TestCase):
@@ -626,9 +632,7 @@ class DetachedHolder(LockDir):
             pid = int(text)
             self.addCleanup(self.kill_quietly, pid, signal.SIGKILL)     # a takeover holder ignores SIGTERM
             while time.monotonic() < deadline:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
+                if not pid_alive(pid):
                     return True
                 _sleep(0.02)
             return False

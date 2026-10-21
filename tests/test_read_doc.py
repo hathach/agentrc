@@ -27,6 +27,8 @@ STATE = tempfile.TemporaryDirectory()
 os.environ['XDG_STATE_HOME'] = STATE.name
 import search  # noqa: E402
 import locate  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 # Git for Windows puts an xpdf pdftotext on PATH but no pdfinfo; extraction runs both.
 needs_poppler = unittest.skipUnless(shutil.which('pdfinfo') and shutil.which('pdftotext'),
@@ -79,6 +81,10 @@ def minimal_pdf(title):
     out += b''.join(b'%010d 00000 n \n' % off for off in offsets)
     out += b'trailer\n<< /Size %d /Root 1 0 R /Info 4 0 R >>\nstartxref\n%d\n%%%%EOF\n' % (len(objs) + 1, xref)
     return bytes(out)
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Pages(unittest.TestCase):

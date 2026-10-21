@@ -5,6 +5,7 @@ foreign owner blocks unshield while a dead one does not. Never run as root: the 
 (USB_RECOVER_SYSFS/USB_RECOVER_STATE) are ignored under root and the partial-acquisition
 case chmods a root-owned procfs file expecting EPERM."""
 import os
+import sys
 import unittest
 
 if os.name == 'nt':
@@ -16,6 +17,8 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'usb-kernel-recover' / 'scripts' / 'usb_recover.sh'
 ATTRS = ['bNumInterfaces', 'bmAttributes', 'bMaxPower', 'configuration', 'bConfigurationValue',
@@ -25,6 +28,10 @@ MODE = {'bConfigurationValue': 0o644, 'avoid_reset_quirk': 0o644}   # the rest a
 
 def mode(path):
     return os.stat(path).st_mode & 0o777
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Tree(unittest.TestCase):

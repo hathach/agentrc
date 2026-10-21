@@ -13,7 +13,7 @@ from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import make_stub  # noqa: E402
+from helpers import guard_survivors, make_stub  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1] / 'statusline'
 spec = importlib.util.spec_from_file_location('codex_usage', ROOT / 'statusline-codex-usage.py')
@@ -40,6 +40,10 @@ def window(used, mins):
 
 
 BASH = shutil.which('bash') or 'bash'  # a bare 'bash' finds WSL's launcher in System32 first on Windows
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class CodexWeeklyTest(unittest.TestCase):

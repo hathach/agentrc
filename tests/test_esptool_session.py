@@ -10,6 +10,8 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'esptool_session.py'
 T = 30   # a bound no test here should reach
@@ -46,6 +48,10 @@ STUB_ESPTOOL = {
         def reset_chip(esp, mode): log('reset', mode)
     '''),
 }
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class EsptoolSession(unittest.TestCase):

@@ -23,6 +23,8 @@ import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'hil_reserve.py'
 DATA = Path(__file__).resolve().parent / 'data' / 'hil_reserve'
@@ -80,6 +82,10 @@ esac
 exit 0
 '''
 SLEEP = f'#!/bin/sh\nexec {shutil.which("sleep")} 0.05\n'   # usb_recover.sh's polls and delays, shrunk
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class Child:

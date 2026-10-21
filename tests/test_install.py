@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'install.py'
@@ -49,6 +51,10 @@ def guard_command(script):
     python3 and a hook that cannot start lets the call through."""
     command = shlex.quote(script.as_posix())
     return f'{shlex.quote(Path(sys.executable).as_posix())} {command}' if os.name == 'nt' else command
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class InstallTest(unittest.TestCase):

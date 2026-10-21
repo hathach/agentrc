@@ -25,6 +25,8 @@ import time
 from contextlib import contextmanager, redirect_stdout, suppress
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -40,6 +42,10 @@ def load(name):
 hp = load('hil_process')
 uo = load('usb_observe')
 T = 20   # a bound no test here should reach
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class RunCmdModes(unittest.TestCase):

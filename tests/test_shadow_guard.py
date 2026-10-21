@@ -11,7 +11,11 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'hooks' / 'headless-chief' / 'shadow_guard.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import make_stub  # noqa: E402
+from helpers import guard_survivors, make_stub  # noqa: E402
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class ShadowGuard(unittest.TestCase):

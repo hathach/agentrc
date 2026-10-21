@@ -19,6 +19,8 @@ import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -33,6 +35,10 @@ def load(name, where=SCRIPTS):
 
 tt = load('hil_tt')
 hp = load('hil_process')
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class TtPort(unittest.TestCase):

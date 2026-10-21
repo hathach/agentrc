@@ -12,6 +12,8 @@ import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'ci-rerun' / 'scripts'
 
@@ -28,6 +30,10 @@ ci, rtd = load('circleci'), load('rtd')
 W1, W2, NEW = '3a705162-e09b-4ef8-9488-d034f9818421', '7a72feba-da90-4613-bd4e-7b6b4b674475', 'd2814134-464c-4966-9dff-c403909287d9'
 BASE = 'https://circleci.com/api/v1.1/project/github/o/r/'
 WORKFLOW = 'https://circleci.com/api/v2/workflow/'
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class CircleciTest(unittest.TestCase):

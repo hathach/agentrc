@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'skills' / 'read-pcb' / 'scripts'))
 import pcb  # noqa: E402
 sys.path.insert(0, str(ROOT / 'tests'))
-from helpers import tmpdir  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 DATA = ROOT / 'tests' / 'data' / 'read_pcb'
 EAGLE = DATA / 'eagle.sch'
@@ -51,6 +51,7 @@ os.utime(sch, ns=(st.st_atime_ns, st.st_mtime_ns))
 
 def setUpModule():
     # The host's own read-pcb settings would decide which clones and sources the tests see.
+    guard_survivors(__name__)
     patcher = unittest.mock.patch.dict(os.environ)
     patcher.start()
     unittest.addModuleCleanup(patcher.stop)

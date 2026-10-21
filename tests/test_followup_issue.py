@@ -10,6 +10,8 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'followup-issue' / 'scripts' / 'publish.py'
 spec = importlib.util.spec_from_file_location('followup_publish', SCRIPT)
@@ -19,6 +21,10 @@ spec.loader.exec_module(publish)
 REPO, ME = 'o/r', 'hathach'
 # A gh stand-in that echoes stdin and appends UTF-8 text: a real process, so the pipe decoding is the script's own.
 ECHO = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read() + ' ✓ 修复'.encode())"
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class FakeGitHub:

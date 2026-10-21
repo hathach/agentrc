@@ -16,6 +16,8 @@ SCRIPTS = ROOT / "skills" / "read-doc" / "scripts"
 HISTORY = Path("read-doc") / "lookups.jsonl"
 sys.path.insert(0, str(ROOT / "tests"))
 from test_read_doc import FIXTURE, fake_library, needs_poppler  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 
 SEARCH = {
@@ -57,6 +59,10 @@ FIND = {
                "total_hits": 5,
                "hits": [[7, "first"], [11, "second"], [20, "third"], [30, "fourth"]]},
 }
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class History(unittest.TestCase):

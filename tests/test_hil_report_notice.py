@@ -15,6 +15,8 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts'
 
@@ -31,6 +33,10 @@ core = _load('agentrc_hil_report_core', SCRIPTS / 'hil_report_core.py')
 SCHEMA = core.BodySchema('t', 1, 'hil_report', 'firmware-validation', check=lambda b: None,
                          empty=lambda b: False, render=lambda b: 'view\n')
 LEGACY = '\n_Legacy text: '
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class WriteUnavailable(unittest.TestCase):

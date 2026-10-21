@@ -1,5 +1,4 @@
 import contextlib
-import ctypes
 import importlib.util
 import io
 import json
@@ -17,6 +16,8 @@ from pathlib import Path
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'esp_session.py'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import end, guard_survivors, proc_stat, reap_if_ours  # noqa: E402
 
 # openocd-esp32 stand-in: --version banner; init/shutdown sessions; a server that logs its examination and
 # listening lines and answers the Tcl commands esp_session sends, with core states in FAKE_STATE.
@@ -189,108 +190,8 @@ if os.environ.get('FAKE_GDB_DIE_AFTER') == 'end':
 
 BOARD = ['--board-cfg', 'board/esp32p4-builtin.cfg', '--adapter-serial', '30:ED:A0:E0:C9:02']
 
-PR_SET_CHILD_SUBREAPER, PR_GET_CHILD_SUBREAPER = 36, 37
-BASELINE, ORIGINAL_SUBREAPER, SUBREAPER = set(), None, False
-
-
-def proc_stat(pid):
-    """(ppid, state, start time) of pid, None once it is gone."""
-    try:
-        with open(f'/proc/{pid}/stat') as f:
-            fields = f.read().rsplit(')', 1)[1].split()
-    except (OSError, IndexError):
-        return None
-    return int(fields[1]), fields[0], fields[19]
-
-
-def processes():
-    names = os.listdir('/proc') if os.path.isdir('/proc') else ()
-    return {pid: st for pid in map(int, filter(str.isdigit, names)) if (st := proc_stat(pid))}
-
-
-def descendants(table):
-    found, parents = [], {os.getpid()}
-    while kids := [p for p, (ppid, _, _) in table.items() if ppid in parents]:
-        found += kids
-        parents = set(kids)
-    return found
-
-
-def prctl(option, arg):
-    """prctl's result, None without it (not Linux)."""
-    try:
-        return ctypes.CDLL(None, use_errno=True).prctl(option, arg, 0, 0, 0)
-    except (OSError, AttributeError, TypeError):
-        return None
-
-
-def get_subreaper():
-    flag = ctypes.c_int()
-    return flag.value if prctl(PR_GET_CHILD_SUBREAPER, ctypes.byref(flag)) == 0 else None
-
-
-def set_subreaper(flag):
-    """Set whether orphaned descendants are reparented to this process rather than init, so the guard still sees
-    them; False without prctl (not Linux): an orphan then escapes the guard."""
-    return prctl(PR_SET_CHILD_SUBREAPER, int(flag)) == 0
-
-
-def reap_if_ours(pid, start):
-    """Reap pid if it is still the process that started at start and is now a zombie of this process."""
-    st = proc_stat(pid)
-    if st and st[2] == start and st[1] == 'Z' and st[0] == os.getpid():
-        with contextlib.suppress(ChildProcessError):
-            os.waitpid(pid, os.WNOHANG)
-
-
-def end(pid, start):
-    """SIGKILL pid if it is still the process that started at start, and wait until it is gone or a zombie,
-    reaped if it is this process's."""
-    if (st := proc_stat(pid)) is None or st[2] != start:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    deadline = time.monotonic() + 10
-    while (st := proc_stat(pid)) and st[2] == start and st[1] != 'Z' and time.monotonic() < deadline:
-        time.sleep(0.02)
-    reap_if_ours(pid, start)
-
-
-def check_no_survivors(baseline):
-    """Kill every descendant of this process missing from baseline ((pid, start time) pairs), reap the zombies
-    left to it, and fail naming the ones that still ran."""
-    named = {}
-    for _ in range(20):
-        table = processes()
-        left = [p for p in descendants(table) if (p, table[p][2]) not in baseline
-                and (table[p][1] != 'Z' or table[p][0] == os.getpid())]
-        if not left:
-            break
-        for pid in left:
-            if table[pid][1] == 'Z':
-                reap_if_ours(pid, table[pid][2])
-            else:
-                named.setdefault(pid, ' '.join(es.cmdline(pid) or ()))
-                end(pid, table[pid][2])
-    if named:
-        raise AssertionError('killed processes that outlived their test: '
-                             + '; '.join(f'{pid} {cmd}' for pid, cmd in named.items()))
-
-
 def setUpModule():
-    global BASELINE, ORIGINAL_SUBREAPER, SUBREAPER
-    table = processes()
-    BASELINE = {(pid, table[pid][2]) for pid in descendants(table)}
-    ORIGINAL_SUBREAPER = get_subreaper()
-    SUBREAPER = ORIGINAL_SUBREAPER is not None and set_subreaper(True)
-
-
-def tearDownModule():
-    try:
-        check_no_survivors(BASELINE)
-    finally:
-        if SUBREAPER:
-            set_subreaper(ORIGINAL_SUBREAPER)
+    guard_survivors(__name__)
 
 
 @unittest.skipIf(os.name == 'nt', 'esp_session.py refuses on Windows: WindowsRefusal')
@@ -667,45 +568,6 @@ class EspSessionTest(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn('not openocd-esp32', out['error'])
         self.assertFalse(self.log.exists() and self.calls('gdb'))
-
-
-# this module's guard in an interpreter of its own, so its baseline holds nothing of the suite's: subreaper flag
-# argv[2] before the module setup; a detached sleep grandchild; the module teardown's error, then the flag after it
-GUARD_DRIVER = r'''
-import importlib.util, json, subprocess, sys, time
-spec = importlib.util.spec_from_file_location('guarded', sys.argv[1])
-m = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(m)
-m.set_subreaper(int(sys.argv[2]))
-m.setUpModule()
-pid = int(subprocess.run(['sh', '-c', 'setsid sleep 60 </dev/null >/dev/null 2>&1 & echo $!'], capture_output=True,
-                         text=True, check=True, timeout=10).stdout)
-deadline = time.monotonic() + 5
-while m.es.cmdline(pid) != ['sleep', '60'] and time.monotonic() < deadline:
-    time.sleep(0.02)
-try:
-    m.tearDownModule()
-    error = None
-except AssertionError as e:
-    error = str(e)
-print(json.dumps({'pid': pid, 'error': error, 'gone': m.proc_stat(pid) is None, 'subreaper': m.get_subreaper()}))
-'''
-
-
-@unittest.skipIf(os.name == 'nt', 'sh and setsid')
-class SurvivorGuard(unittest.TestCase):
-    def test_a_detached_grandchild_is_named_and_killed_and_the_flag_restored(self):
-        if get_subreaper() is None:
-            self.skipTest('no PR_SET_CHILD_SUBREAPER: the orphan would go to init')
-        for before in (0, 1):
-            with self.subTest(subreaper=before):
-                r = subprocess.run([sys.executable, '-c', GUARD_DRIVER, str(Path(__file__).resolve()), str(before)],
-                                   capture_output=True, text=True, timeout=60)
-                self.assertEqual(r.returncode, 0, r.stderr)
-                out = json.loads(r.stdout)
-                self.assertEqual(out['error'], f"killed processes that outlived their test: {out['pid']} sleep 60")
-                self.assertTrue(out['gone'])
-                self.assertEqual(out['subreaper'], before)
 
 
 def load_module():

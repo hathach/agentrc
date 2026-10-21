@@ -16,6 +16,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'etm-trace' / 'scripts'
 
@@ -53,6 +55,7 @@ Idx Name          Size      VMA       LMA       File off  Algn
 
 def setUpModule():
     """The ELFs here are empty files: section headers come from a stub objdump."""
+    guard_survivors(__name__)
     d = tempfile.TemporaryDirectory()
     unittest.addModuleCleanup(d.cleanup)
     stub = Path(d.name) / 'objdump'

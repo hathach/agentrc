@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'bin' / 'lsusbt'
 
@@ -24,6 +26,10 @@ NAMES = {'001:001': 'Linux Foundation 2.0 root hub', '001:002': 'Terminus Techno
 SERIALS = {(1, 1): '0000:00:14.0', (1, 11): '000681295394', (1, 12): '84:F7:03:C0:84:E4', (1, 13): 'ABC123'}
 BOARDS = {'boards': [{'name': 'esp32s3', 'uid': '84F703C084E4'},
                      {'name': 'stm32h7', 'uid': '1234', 'flasher': {'uid': '681295394'}}]}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 @unittest.skipUnless(sys.platform.startswith('linux'), 'reads Linux sysfs')

@@ -20,7 +20,7 @@ from unittest import mock
 
 CLI = Path(__file__).resolve().parents[1] / 'skills' / 'rtt' / 'scripts' / 'rtt.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import make_stub, pid_alive  # noqa: E402
+from helpers import guard_survivors, make_stub, pid_alive  # noqa: E402
 
 # loaded by path and registered under a fixed name, as a harness importing the
 # classes would: RttError must be picklable across a fork Pool
@@ -33,6 +33,7 @@ _no_tools = _no_tools_env = None
 
 
 def setUpModule():
+    guard_survivors(__name__)
     # every server a test does not stub resolves to an absent path: a run that should
     # have been refused fails to start, never reaching a real probe tool on PATH
     global _no_tools, _no_tools_env

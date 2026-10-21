@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'commits.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_commits', SCRIPT)
@@ -19,6 +21,10 @@ ENV = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COM
 # Names git quotes outside -z; NTFS forbids " and a newline, so Windows takes non-ASCII ones git quotes too.
 QUOTED = 'src/quote"name.c' if os.name != 'nt' else 'src/naïve name.c'
 NEWLINE = 'c\nd.c' if os.name != 'nt' else 'cé d.c'
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class CommitsTest(unittest.TestCase):

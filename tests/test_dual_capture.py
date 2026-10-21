@@ -9,6 +9,8 @@ import time
 import unittest
 from unittest import mock
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts' / 'dual_capture.py'
 _spec = importlib.util.spec_from_file_location('dual_capture', SCRIPT)
@@ -26,6 +28,10 @@ def wait_until(cond, seconds=5):
     while not cond() and time.monotonic() < deadline:
         time.sleep(0.02)
     return cond()
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 @unittest.skipIf(sys.platform.startswith('linux'), 'the refusal is for other hosts')
