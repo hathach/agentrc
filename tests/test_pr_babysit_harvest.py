@@ -588,6 +588,39 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('no reviewer auto-runs', got['headEventEvidence'])
         self.assertEqual(len(got['comments']), 3, 'the comments are still harvested')
 
+    def test_a_greptile_outside_autorun_whose_only_output_on_the_head_is_a_pause_reads_settled_limited(self):
+        """#193: PR #189's shape, Greptile requested but not auto-run, its one review on the head a pause notice."""
+        paused = greptile_review(HEAD, id_=51, body=harvest.GREPTILE_PAUSED + ' -- it used its 100 free open-source review credits.')
+        inline = {'id': 42, 'user': user('greptile-apps[bot]'), 'body': 'nit', 'path': 'a.c', 'line': 5, 'commit_id': HEAD,
+                  'created_at': EVENT, 'updated_at': EVENT, 'in_reply_to_id': None, 'html_url': 'u/42'}
+        for name, reviews, comments, want in (
+                ('pause only', [paused], [], ('settled', 'limited')),
+                ('pause on an older head', [paused | {'commit_id': OLD}], [], ('harvested', None)),
+                ('pause and a review', [paused, greptile_review(HEAD, id_=52)], [], ('harvested', None)),
+                ('pause and an inline comment', [paused], [inline], ('harvested', None)),
+                ('another author', [paused | {'user': user('hathach')}], [], ('harvested', None))):
+            with self.subTest(name):
+                answers = self.answers([HEAD])
+                answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].extend(reviews)
+                answers['api --paginate --slurp repos/o/r/pulls/7/comments?per_page=100'][0][0].extend(comments)
+                code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit,copilot,greptile', '--auto-run', 'coderabbit')
+                self.assertEqual(code, 0, got)
+                g = next(b for b in got['bots'] if b['bot'] == 'greptile')
+                self.assertEqual((g['state'], g['kind']), want, g)
+                if want[0] == 'settled':
+                    self.assertEqual((g['sha'], g['evidence']), (HEAD, [f'review 51 on {HEAD[:8]}']))
+                    self.assertIn(51, [c['commentId'] for c in got['comments']], 'the notice is still harvested')
+
+    def test_a_greptile_pause_reads_without_any_auto_run_artifact(self):
+        answers = self.answers([HEAD])
+        for k in [k for k in answers if '/actions/runs' in k or '/timeline' in k or '/contents/' in k or '/statuses' in k or '/check-runs' in k]:
+            del answers[k]
+        answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'] = [
+            [[greptile_review(HEAD, id_=51, body=harvest.GREPTILE_PAUSED)]], [[]]]
+        code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'greptile')
+        self.assertEqual((code, [(b['state'], b['kind']) for b in got['bots']]), (0, [('settled', 'limited')]), got)
+        self.assertEqual([c['commentId'] for c in got['comments']], [51], 'the reviews are read once')
+
     def test_usage(self):
         for argv in (['--pr', '7', '--reviewers', 'coderabbit', '--auto-run', 'greptile'], ['--pr', '7', '--reviewers', 'bard'], ['--pr', '7'],
                      ['--pr', '7', '--reviewers', 'code-scanning', '--auto-run', 'code-scanning'],

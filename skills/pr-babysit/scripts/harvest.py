@@ -315,11 +315,15 @@ def greptile(head, checks, issue, reviews, event_at, now=None):
     return record('greptile', 'unknown', f"check run {r['status']}/{r.get('conclusion')} with a summary this does not read", ev)
 
 
+def head_reviews(reviews, bot, head):
+    """A bot's submitted reviews on the head."""
+    return [v for v in reviews or [] if bot in (v['user']['login'] or '').lower() and v.get('commit_id') == head and v.get('state') in REVIEW_SUBMITTED]
+
+
 def below_threshold(head, r, title, reviews, ev, now):
     """A confidence result below the threshold is Greptile's review scored, once its review on the head is posted; the
     review may land either side of the check, so the result alone waits GREPTILE_REVIEW_WAIT for it."""
-    mine = [v for v in reviews or [] if 'greptile' in (v['user']['login'] or '').lower() and v.get('commit_id') == head
-            and v.get('state') in REVIEW_SUBMITTED and GREPTILE_PAUSED not in (v.get('body') or '')]
+    mine = [v for v in head_reviews(reviews, 'greptile', head) if GREPTILE_PAUSED not in (v.get('body') or '')]
     if mine:
         v = newest(mine, 'submitted_at') or mine[0]
         return record('greptile', 'reviewed', f'review posted, its confidence below the threshold: {title}', [*ev, f"review {v['id']} on {head[:8]}"], head)
@@ -331,6 +335,16 @@ def below_threshold(head, r, title, reviews, ev, now):
     wait = int(GREPTILE_REVIEW_WAIT.total_seconds() // 60)
     return record('greptile', 'settled', f"review not observed: no Greptile review on the head {wait} minutes after its confidence result at {r['completed_at']}",
                   ev, head, 'failed')
+
+
+def greptile_paused(head, reviews, harvested):
+    """Greptile outside autoRun: settled limited when its only output on the head is a pause notice (#193), else None."""
+    mine = head_reviews(reviews, 'greptile', head)
+    inline = any(c['source'] == 'greptile' and c['kind'] == 'review' and c['commitId'] == head for c in harvested)
+    if not mine or inline or not all(GREPTILE_PAUSED in (v.get('body') or '') for v in mine):
+        return None
+    v = newest(mine, 'submitted_at') or mine[0]
+    return record('greptile', 'settled', 'paused notice on the head: Greptile did not review it', [f"review {v['id']} on {head[:8]}"], head, 'limited')
 
 
 def copilot_reading(body):
@@ -346,7 +360,7 @@ def copilot_reading(body):
 
 
 def copilot(head, reviews):
-    mine = [v for v in reviews if 'copilot' in (v['user']['login'] or '').lower() and v.get('commit_id') == head and v.get('state') in REVIEW_SUBMITTED]
+    mine = head_reviews(reviews, 'copilot', head)
     if not mine:
         return record('copilot', 'absent', 'no Copilot review on the head')
     v, why = newest_reading(mine, 'submitted_at', lambda v: copilot_reading(v.get('body')))
@@ -449,7 +463,7 @@ def observe(repo, n, reviewers, auto):
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
     checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
     issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
-    reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if 'greptile' in auto or 'copilot' in reviewers else None
+    reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if 'greptile' in reviewers or 'copilot' in reviewers else None
     harvested = comments(repo, n, reviewers, issue, reviews)
     now = datetime.now(timezone.utc)
     bots = []
@@ -460,6 +474,8 @@ def observe(repo, n, reviewers, auto):
             bots.append(greptile(head, checks, issue, reviews, event_at, now))
         elif bot == 'copilot':
             bots.append(copilot(head, reviews))
+        elif bot == 'greptile' and (paused := greptile_paused(head, reviews, harvested)):
+            bots.append(paused)
         else:
             n_ = sum(c['source'] == bot for c in harvested)
             bots.append(record(bot, 'harvested', f'{n_} comment(s) harvested; it does not auto-run here, so its state is not read'))
