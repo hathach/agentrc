@@ -365,7 +365,24 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     and LockUnavailable when the lock cannot be taken or recorded (fail-closed).
 
     `protected` marks the record: `release` never signals it, and a record left on a free
-    flock is a recovery blocker, so its taker must end with release_board_lock."""
+    flock is a recovery blocker, so its taker must end with release_board_lock. It also
+    declares the taker's group on that first record, before any hardware access: `locks`,
+    the names of every board the run takes (unique, this one among them; default this board
+    alone), so a takeover from any member takes the group (agentrc#197). A taker of several
+    boards that fails partway ends the ones it took with release_board_lock; a record that
+    could not be cleared stays a blocker naming the whole group. A malformed group raises
+    ValueError before anything is touched."""
+    if protected:
+        try:
+            _check_name(board)
+        except OSError as e:
+            raise _unavailable(e) from e
+        locks = extra.get('locks', [board])
+        if not (isinstance(locks, (list, tuple)) and all(isinstance(b, str) and _NAME.match(b) for b in locks)
+                and board in locks and len(set(locks)) == len(locks)):
+            raise ValueError(f'protected group {locks!r:.200} must be unique valid lock names, {board} among them')
+        locks = list(locks)
+        extra = {'protected': True, **extra, 'locks': locks}
     try:
         fh = flock_nb(board)
     except BlockingIOError:
@@ -381,8 +398,6 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         fh.close()
         raise RecoveryBlocked(f'board {board}: {why} ({RECOVERY_BLOCKER}: '
                               f'`hil_lock.py hold --take-over {board}` under a recovery dispatch)')
-    if protected:
-        extra = {'protected': True, **extra}
     # announce ourselves so the other side's conflict message is truthful
     try:
         _write_record(fh, ACQUIRING, reason, extra)
@@ -715,27 +730,61 @@ def release_token(token: str):
 
 
 # --- recovery takeover ----------------------------------------------------------------------
+def _declared(b):
+    """The boards `b`'s record and journal chain name as their lock sets, or None when they name
+    none: an older helper's record, or one cut short mid-write. OSError when a journal cannot be
+    read or a `locks` is not a list of names: the set they cover is unknown."""
+    names, found = [], False
+    journal = journal_state(b)
+    if journal == {}:
+        raise OSError(errno.EINVAL, f'{b}{JOURNAL} cannot be read, so the lock set it covers is unknown: '
+                                    f'inspect it by hand')
+    chain = [read_record(b)]
+    while isinstance(journal, dict) and journal:
+        chain.append(journal)
+        journal = journal.get('prior')
+    for rec in chain:
+        locks = rec.get('locks') if isinstance(rec, dict) else None
+        if not locks:
+            continue
+        if not isinstance(locks, list) or not all(isinstance(n, str) for n in locks):
+            raise OSError(errno.EINVAL, f'{b}: lock set {locks!r:.80} is not a list of names, so the set it '
+                                        f'covers is unknown: inspect it by hand')
+        names += locks
+        found = True
+    return names if found else None
+
+
+def _naming() -> dict:
+    """{board: [every board whose readable record or journal chain names it]}."""
+    named = {}
+    for b in sorted(set(lock_names()) | set(journal_names())):
+        try:
+            names = _declared(b) or []
+        except OSError:
+            continue           # unknown here; it is refused when the takeover reaches it
+        for n in names:
+            named.setdefault(n, []).append(b)
+    return named
+
+
 def _lock_set(board) -> list:
-    """The board plus every board its record or journal chain names, transitively."""
-    todo, seen = [board], set()
+    """The board plus every board its record or journal chain names, transitively. A board
+    that names none also adds every board naming it, so a group its other members declare is
+    taken whole from any member (agentrc#197)."""
+    todo, seen, naming = [board], set(), None
     while todo:
         b = todo.pop()
         if b in seen:
             continue
         _check_name(b)
         seen.add(b)
-        names = []
-        rec = read_record(b)
-        if isinstance(rec, dict):
-            names += rec.get('locks') or []
-        journal = journal_state(b)
-        if journal == {}:
-            raise OSError(errno.EINVAL, f'{b}{JOURNAL} cannot be read, so the lock set it covers is unknown: '
-                                        f'inspect it by hand')
-        while isinstance(journal, dict) and journal:
-            names += journal.get('locks') or []
-            journal = journal.get('prior')
-        todo += [n for n in names if isinstance(n, str)]
+        names = _declared(b)
+        if names is None:
+            if naming is None:
+                naming = _naming()
+            names = naming.get(b, [])
+        todo += names
     return sorted(seen)
 
 
@@ -790,7 +839,8 @@ def _drop_flocks(handles) -> None:
 
 
 def take_over(board: str, reason: str, detail=''):
-    """Recovery takeover of `board` and every board its record or journal chain names, all
+    """Recovery takeover of `board` and every board its record or journal chain names (one
+    naming none, an older helper's record or one cut short, adds every board naming it), all
     or nothing; returns (token, {board: handle}). Each board first gets a journal holding
     its predecessor's record bytes and any earlier journal, then a cleanup-holder record:
     a crash anywhere leaves a journal, so the boards stay blocked. Only release_token of
@@ -917,36 +967,46 @@ def _holder_argv(job: dict) -> list:
     return [sys.executable, '-I', os.path.abspath(__file__), '--cleanup-holder', json.dumps(job)]
 
 
-def _protected_handle(fh) -> bool:
+def _handed_group(board, fh):
+    """The group the protected record behind `fh` declares (a record without one: `board`
+    alone), or None when the record is not shown protected."""
     try:
         state, rec = _parse(_handle_record(fh))
     except OSError:
-        return False
-    return state == 'record' and rec.get('protected') is True
+        return None
+    if state != 'record' or rec.get('protected') is not True:
+        return None
+    return rec.get('locks', [board])
 
 
 def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF_WAIT, **extra) -> str:
     """Hand the flocks of `handles` ({board: handle} the caller took with take_board_lock(...,
     protected=True)) to a cleanup holder, a fresh interpreter given their descriptors, so the
     caller can go on or exit; returns its token once its records name it and it confirmed the
-    hold. A handle whose record is not shown protected raises ValueError before anything is
+    hold. A handle whose record is not shown protected, or does not declare exactly the handed
+    boards as its group (take_board_lock's `locks`), raises ValueError before anything is
     touched: the caller still owns every handle, and must end or protect them itself.
-    Otherwise each record is first rewritten with `detail`, `receipts` and the lock set, so
-    a takeover of any rewritten board covers them all; a board whose rewrite failed keeps
-    its prior record, so its own takeover covers only what that names (the failure message
-    names it); a rewrite cut short leaves the protected record or an unreadable one, both
-    recovery blockers. A handoff that fails, each of its waits bounded by `wait`, raises
-    LockUnavailable with such a record, or a cleanup-holder record naming the holder it
-    ended, left as the blocker; an interrupt ends it the same way and propagates. With
+    Otherwise each record is first rewritten with `detail`, `receipts` and the lock set; a
+    board whose rewrite failed keeps its prior record (the failure message names it), and
+    one cut short is unreadable, both recovery blockers whose takeover still takes the whole
+    group, declared on every member since acquisition. A handoff that fails, each of its
+    waits bounded by `wait`, raises LockUnavailable with such a record, or a cleanup-holder
+    record naming the holder it ended, left as the blocker; an interrupt ends it the same way and propagates. With
     `receipts` (hil_process.run_tracked's) the holder's release predicate is every one
     rechecking `done`. `extra` adds fields to the cleanup-holder record. Past the ValueError
     the caller closes its handles either way, never clearing them. Needs hil_process.py
     beside this file, with or without receipts."""
-    unprotected = [b for b, fh in handles.items() if not _protected_handle(fh)]
+    receipts, locks = list(receipts), sorted(handles)
+    groups = {b: _handed_group(b, fh) for b, fh in handles.items()}
+    unprotected = [b for b, g in groups.items() if g is None]
     if unprotected:
         raise ValueError(f'cleanup holder handoff refused: {", ".join(unprotected)} not taken protected; '
                          f'nothing changed, the caller still holds every board')
-    receipts, locks = list(receipts), sorted(handles)
+    other = [f'{b} declares {g!r:.80}' for b, g in groups.items()
+             if not isinstance(g, list) or sorted(map(str, g)) != locks]
+    if other:
+        raise ValueError(f'cleanup holder handoff refused: the group taken protected is not the handed boards '
+                         f'{locks} ({"; ".join(other)}); nothing changed, the caller still holds every board')
     unwritten = []
     for b, fh in handles.items():
         try:

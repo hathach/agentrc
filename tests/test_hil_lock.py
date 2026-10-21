@@ -1453,7 +1453,7 @@ class HandOver(LockDir):
         return make_receipt(self, Path(self.dir, 'state'))
 
     def hand_over(self, receipts=(), boards=(BOARD,)):
-        handles = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in boards}
+        handles = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=list(boards)) for b in boards}
         try:
             token = hil_lock.hand_to_cleanup_holder(handles, 'selftest run', detail='park failed', receipts=receipts,
                                                     wait=5, holder='selftest')
@@ -1463,6 +1463,10 @@ class HandOver(LockDir):
         pid = hil_lock.read_record(boards[0])['pid']
         self.addCleanup(DetachedHolder.kill_quietly, pid, signal.SIGKILL)
         return token, pid
+
+    def group(self):
+        boards = [BOARD, self.OTHER]
+        return {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards) for b in boards}
 
     def signals(self):
         sent = []
@@ -1532,7 +1536,7 @@ class HandOver(LockDir):
             self.acquire()
 
     def test_a_failed_multi_board_handoff_leaves_a_takeover_of_one_board_the_whole_group(self):
-        fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in (BOARD, self.OTHER)}
+        fhs = self.group()
         self.patch(hil_lock, '_holder_argv', lambda job: [sys.executable, '-c', 'pass'])
         with self.assertRaisesRegex(hil_lock.LockUnavailable, 'cleanup holder handoff failed: .*no readiness'):
             hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
@@ -1605,7 +1609,7 @@ class HandOver(LockDir):
             return real(fh, *a, **k)
         for fault, raised in ((no_space, hil_lock.LockUnavailable), (interrupt_second, KeyboardInterrupt)):
             with self.subTest(fault=fault.__name__):
-                fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in (BOARD, self.OTHER)}
+                fhs = self.group()
                 with mock.patch.object(hil_lock, 'write_record', fault), self.assertRaises(raised):
                     hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
                 for fh in fhs.values():
@@ -1640,6 +1644,131 @@ class HandOver(LockDir):
             hil_lock.release_board_lock(fh)
         self.assertEqual(fork_child(holder), 0, 'the release stayed pending behind the inherited mask')
         self.assertEqual(hil_lock.record_state(BOARD)[0], 'empty')
+
+
+class ProtectedGroup(LockDir):
+    """agentrc#197: a protected taker declares its whole group on its first record, so a takeover
+    from any member, the one whose hand-over rewrite failed or was cut short included, takes the
+    group; an older helper's record, which declares none, adds every board naming it."""
+
+    A, B = BOARD, BOARD + '-2'
+
+    def group(self):
+        boards = [self.A, self.B]
+        return {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards) for b in boards}
+
+    def recover(self, board) -> list:
+        _, handles = hil_lock.take_over(board, 'selftest recovery')
+        hil_lock.end_takeover(handles)
+        return sorted(handles)
+
+    def no_holder(self):
+        self.patch(hil_lock, '_holder_argv', lambda job: [sys.executable, '-c', 'pass'])
+
+    def test_the_group_is_declared_on_the_first_record_and_a_malformed_one_touches_nothing(self):
+        fh = hil_lock.take_board_lock(self.A, 'selftest run', protected=True)
+        self.addCleanup(fh.close)
+        self.assertEqual(hil_lock.read_record(self.A)['locks'], [self.A])
+        for locks in ([self.A], [self.B, self.B], [self.B, '../x'], [self.B, 1], self.B, None):
+            with self.subTest(locks=locks), self.assertRaises(ValueError):
+                hil_lock.take_board_lock(self.B, 'selftest run', protected=True, locks=locks)
+        self.assertFalse(os.path.exists(hil_lock.lock_path(self.B)))
+
+    def test_recovery_from_the_member_whose_rewrite_failed_takes_the_group(self):
+        fhs = self.group()
+        real = hil_lock.write_record
+
+        def fail_on_b(fh, *a, **k):
+            if fh is fhs[self.B]:
+                raise OSError(28, 'No space left on device')
+            return real(fh, *a, **k)
+        self.no_holder()
+        with mock.patch.object(hil_lock, 'write_record', fail_on_b):
+            with self.assertRaisesRegex(hil_lock.LockUnavailable, rf'not written on {self.B}: \[Errno 28\]'):
+                hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
+        for fh in fhs.values():
+            fh.close()
+        self.assertEqual(hil_lock.read_record(self.A)['detail'], 'park failed')
+        self.assertNotIn('detail', hil_lock.read_record(self.B))      # its prior record
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            hil_lock.take_board_lock(self.B, 'rival')
+        self.assertEqual(self.recover(self.B), [self.A, self.B])
+
+    def test_recovery_from_the_member_whose_rewrite_was_cut_short_takes_the_group(self):
+        def hand_over_and_die():
+            fhs = self.group()
+            real, b = hil_lock._pwrite_all, fhs[self.B].fileno()
+
+            def die(fd, data, offset):
+                if fd == b and offset == 1:          # past its REWRITING byte
+                    os.pwrite(fd, data[:5], offset)
+                    os._exit(9)
+                return real(fd, data, offset)
+            hil_lock._pwrite_all = die
+            hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
+        self.assertEqual(fork_child(hand_over_and_die), 9)
+        self.assertEqual(hil_lock.record_state(self.B)[0], 'unreadable')
+        self.assertEqual(hil_lock.read_record(self.A)['locks'], [self.A, self.B])
+        self.assertEqual(self.recover(self.B), [self.A, self.B])
+
+    def test_an_older_helpers_record_without_a_group(self):
+        old = load_pre154()
+        self.patch(old, 'BOARD_LOCK_DIR', self.dir)
+        old.take_board_lock(self.B, 'selftest run', protected=True).close()
+        self.assertNotIn('locks', hil_lock.read_record(self.B))
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            hil_lock.take_board_lock(self.B, 'rival')
+        self.assertEqual(self.recover(self.B), [self.B], 'alone: that board, as before')
+        # an older pin's hand-over that rewrote A naming both and failed on B
+        fhs = {b: old.take_board_lock(b, 'selftest run', protected=True) for b in (self.A, self.B)}
+        old.write_record(fhs[self.A], 'selftest run', protected=True, detail='park failed', locks=[self.A, self.B])
+        for fh in fhs.values():
+            fh.close()
+        self.assertEqual(self.recover(self.B), [self.A, self.B])
+
+    def test_a_record_whose_group_is_not_a_list_of_names_refuses_the_takeover(self):
+        Path(hil_lock.lock_path(self.A)).write_text(json.dumps(
+            {'pid': 999999999, 'reason': 'selftest run', 'protected': True, 'locks': self.B}))
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'is not a list of names'):
+            hil_lock.take_over(self.A, 'selftest recovery')
+        self.assertEqual(hil_lock.journal_names(), [])
+
+    def test_a_partial_acquisition_rolls_back_and_a_failed_rollback_blocks_the_whole_group(self):
+        boards = [self.A, self.B]
+        rival = hil_lock.take_board_lock(self.B, 'rival')
+
+        def acquire():
+            taken = []
+            try:
+                for b in boards:
+                    taken.append(hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=boards))
+            except hil_lock.BoardLocked:
+                for fh in taken:
+                    hil_lock.release_board_lock(fh)
+                raise
+        with self.assertRaises(hil_lock.BoardLocked):
+            acquire()
+        hil_lock.release_board_lock(hil_lock.take_board_lock(self.A, 'next'))     # free again
+        with mock.patch.object(hil_lock, 'clear_record', lambda fh: False), self.assertRaises(hil_lock.BoardLocked):
+            acquire()
+        self.assertEqual(hil_lock.read_record(self.A)['locks'], boards)
+        with self.assertRaises(hil_lock.RecoveryBlocked):
+            hil_lock.take_board_lock(self.A, 'next')
+        with self.assertRaises(hil_lock.BoardLocked):        # the rival's board: nothing modified
+            hil_lock.take_over(self.A, 'selftest recovery')
+        self.assertEqual(hil_lock.journal_names(), [])
+        hil_lock.release_board_lock(rival)
+        self.assertEqual(self.recover(self.A), boards)
+
+    def test_a_handoff_of_boards_other_than_the_declared_group_changes_nothing(self):
+        fhs = self.group()
+        for fh in fhs.values():
+            self.addCleanup(fh.close)
+        before = {b: Path(hil_lock.lock_path(b)).read_bytes() for b in fhs}
+        self.patch(hil_lock, '_holder_argv', lambda job: self.fail('a holder was started'))
+        with self.assertRaisesRegex(ValueError, rf'not the handed boards \[.{self.A}.\] .*nothing changed'):
+            hil_lock.hand_to_cleanup_holder({self.A: fhs[self.A]}, 'selftest run', detail='park failed')
+        self.assertEqual({b: Path(hil_lock.lock_path(b)).read_bytes() for b in fhs}, before)
 
 
 class RechecksAs(LockDir):

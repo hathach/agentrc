@@ -69,9 +69,16 @@ nothing in it through a link.
   as that user or root.
 - A taker whose interrupted run needs recovery takes with `protected=True` and
   ends with `release_board_lock`, or hands its held locks to a cleanup holder
-  with `hand_to_cleanup_holder`, which loads `scripts/hil_process.py` (in the
-  lock helper's `FILES`, below); given the receipts of runs
-  not proven ended, that holder clears only once each rechecks `done`, and
+  with `hand_to_cleanup_holder`. A protected take declares the run's whole
+  group, `locks=` every board it takes (default the board alone), on the
+  board's first record, before any hardware access, so a takeover from any
+  member takes the group; a taker failing partway ends what it took, and a
+  record it could not clear stays a blocker naming the group. The hand-over
+  refuses, changing nothing, unless the handed boards are exactly that group,
+  and loads `scripts/hil_process.py` (in the lock helper's `FILES`, below). A
+  record that declares no group (an older helper's, or one cut short) is
+  taken over with every board whose record names it. Given the receipts of runs
+  not proven ended, the handed-over holder clears only once each rechecks `done`, and
   `release --token` refuses up front naming the open receipt, rechecked as the
   holder's OS user when root releases it. A cleanup holder of its own waits in
   `wait_for_release` and then ends its hold itself. `takeover_predecessor`
