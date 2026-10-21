@@ -1011,22 +1011,17 @@ def _handed_group(board, fh):
 
 
 def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF_WAIT, **extra) -> str:
-    """Hand the flocks of `handles` ({board: handle} the caller took with take_board_lock(...,
+    """Hand the flocks of `handles` ({board: handle} taken with take_board_lock(...,
     protected=True)) to a cleanup holder, a fresh interpreter given their descriptors, so the
-    caller can go on or exit; returns its token once its records name it and it confirmed the
-    hold. A handle whose record is not shown protected, or does not declare exactly the handed
-    boards as its group (take_board_lock's `locks`), raises ValueError before anything is
-    touched: the caller still owns every handle, and must end or protect them itself.
-    Otherwise each record is first rewritten with `detail`, `receipts` and the lock set; a
-    board whose rewrite failed keeps its prior record (the failure message names it), and
-    one cut short is unreadable, both recovery blockers whose takeover still takes the whole
-    group, declared on every member since acquisition. A handoff that fails, each of its
-    waits bounded by `wait`, raises LockUnavailable with such a record, or a cleanup-holder
-    record naming the holder it ended, left as the blocker; an interrupt ends it the same way and propagates. With
-    `receipts` (hil_process.run_tracked's) the holder's release predicate is every one
-    rechecking `done`. `extra` adds fields to the cleanup-holder record. Past the ValueError
+    caller can go on or exit; returns its token once the holder confirmed the hold. Unless
+    every record is shown protected and declares exactly the handed boards as its group,
+    raises ValueError with nothing touched: the caller still owns every handle. Otherwise a
+    failed handoff, each wait bounded by `wait`, raises LockUnavailable (an interrupt
+    propagates) and leaves every board a recovery blocker whose takeover takes the group.
+    With `receipts` (hil_process.run_tracked's) the holder releases only once every one
+    rechecks `done`; `extra` adds fields to the cleanup-holder record. Past the ValueError
     the caller closes its handles either way, never clearing them. Needs hil_process.py
-    beside this file, with or without receipts."""
+    beside this file."""
     receipts, locks = list(receipts), sorted(handles)
     groups = {b: _handed_group(b, fh) for b, fh in handles.items()}
     unprotected = [b for b, g in groups.items() if g is None]

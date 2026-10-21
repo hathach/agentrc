@@ -92,17 +92,15 @@ nothing in it through a link.
 - A session a consumer cannot prove ended outlives its run in the board's
   pending-session record, `hil_lock.PendingSessions(<lock>, <kind>)`
   (`<lock>.<kind>-pending.json` in the lock dir), so every later invocation,
-  whatever its run dir or project, refuses while it lists one. `add` lists
-  sessions, each a dict with a `receipt`; `read` is `None` when the record is
-  unreadable, which is kept and refuses; `clear(ended)` removes it only once
-  the consumer's `ended` holds for every session, otherwise refusing with
-  their receipts, and `clear(ended, note=..., **evidence)`, after a separately
-  reviewed recovery, removes it whatever it holds, once the note, the evidence
-  and its content are appended to `<record>.cleared.jsonl` (`cleared()`).
-  Each holds `<record>.mutex`, never the board's flock; the record is replaced
-  atomically and fsynced with the dir. Another OS user reads it but, in the
-  sticky dir, can neither replace nor remove it. What a receipt means and how
-  its session is recovered stay the consumer's.
+  whatever its run dir or project, refuses while it lists one or cannot be
+  read; an unreadable record is kept. `add` lists sessions, each a dict with a
+  `receipt`; `clear(ended)` removes the record only once the consumer's
+  `ended` holds for every session, otherwise refusing with their receipts;
+  `clear(ended, note=..., **evidence)`, only after a separately reviewed
+  recovery, removes it whatever it holds, once note, evidence and content are
+  logged (`cleared()`). It needs no board lock; another OS user can read it
+  but not replace or remove it. What a receipt means and how its session is
+  recovered stay the consumer's; the class docstring has the mechanics.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
@@ -193,53 +191,39 @@ recovery stay the contract's. Linux only.
 - `openocd_esp` is `scripts/hil_openocd_esp.py`'s (`flash_openocd_esp`,
   `reset_openocd_esp`): an Espressif chip's built-in USB-Serial/JTAG through
   openocd-esp32 v0.12.0-esp32-20260703 only, found by `HIL_OPENOCD_ESP`, else
-  `openocd` on PATH. `uid` is the USJ serial; `args`
-  is `-f board/<chip>-builtin.cfg` or `-f interface/esp_usb_jtag.cfg -f
-  target/<chip>.cfg` and nothing else. The USJ's bus-port is resolved by
-  serial, exactly one match, and pinned before init; it is never convoy-safe.
-  The caller hard-resets the chip out of its ROM loader first: one left there
-  (esptool `--after no-reset`) faults the flash stub after `reset init`; the
-  provider resolves the USJ and starts openocd no earlier than `BOOT_SETTLE`
-  (1 s) after the call, its own admission counting toward it, so a caller's
-  hard reset needs no wait of its own. A
-  command whose log shows a failed target event hook (`Execution of event
-  <name> failed:`), or cannot be read, fails although openocd answers success:
-  a flash writes nothing after three such `reset init`s, and such a `reset run`
-  leaves the session pending.
-  A flash takes the caller's ordered segments (sector-aligned offset, raw
-  binary file, size, optionally its `sha256`, which the admitted bytes must
-  match), programs each with verify, stops at the first failure and reads
-  every segment back byte for byte. `segments_from_flash_args(build_dir, chip,
-  timeout=)` gives them from an ESP-IDF build's `flash_args` (or the
-  caller's already-checked text, `flash_args=`), refusing an option other than
-  flash mode, frequency and size, a build whose `config.env` names another
-  chip, and any file `esptool merge-bin` with the same options would rewrite.
+  `openocd` on PATH. `uid` is the USJ serial; `args` is
+  `-f board/<chip>-builtin.cfg` or `-f interface/esp_usb_jtag.cfg -f
+  target/<chip>.cfg` and nothing else. It is never convoy-safe. The caller
+  hard-resets the chip out of its ROM loader first and needs no wait of its
+  own (`BOOT_SETTLE`). A command whose log shows a failed target event hook
+  fails although openocd answers success. A flash takes the caller's ordered
+  segments (sector-aligned offset, raw binary file, size, optionally its
+  `sha256`), verifies each and reads every one back;
+  `segments_from_flash_args(build_dir, chip, timeout=)` gives them from an
+  ESP-IDF build's `flash_args`, refusing a build openocd would not write as
+  esptool does.
   A flash also requires `security`, the caller's evidence read from the chip
   before programming: `{"flashEncryption": "off", "secureBoot": "off",
   "source": <where it was read>}`. Without it, or with either feature not
   `off`, the flash is refused before anything starts; the provider never
-  infers or defaults the chip's security state, and records the evidence in
-  the operation. The one reader is `security_evidence(result, chip=,
-  source=)`, over the result of `scripts/esptool_session.py`'s `security` op
-  (the ROM's GET_SECURITY_INFO and the eFuse registers, which must agree), or
-  `read_security(serial, chip=, workdir=, timeout=, retains_lock=True)`, which
-  runs that op alone on the USJ's tty and hard-resets the chip; unknown or
-  contradictory evidence, or a chip outside `SECURITY_CHIPS` (ESP32-P4,
-  ESP32-S3), is refused. `usj_tty(serial)` and `usj_node(serial)` give the
-  USJ's serial device and usbfs node, resolved as its bus-port is.
+  infers or defaults the chip's security state. `read_security(serial, chip=,
+  workdir=, timeout=, retains_lock=True)` reads it and hard-resets the chip;
+  `security_evidence(result, chip=, source=)` reads a `security` op of the
+  caller's own `scripts/esptool_session.py`. Unknown or contradictory
+  evidence, or a chip outside `SECURITY_CHIPS` (ESP32-P4, ESP32-S3), is
+  refused.
   Flash, reset and `read_security` run only for a caller that passes
   `retains_lock=True`, declaring it keeps the board lock through a session
-  left pending; anything else is refused before any access, and a consumer
-  calls `refusal(retains_lock=True)` before its own preparatory sessions.
-  `session_state(receipt)` is a session's state for lock retention (`ended`,
-  `running`, `unresolved`, `unreadable`) by pid and start time alone; it never
-  says `end` may address the server. Each operation is
-  one session that is never killed: after a command that returned, `reset run`
-  and a confirmed shutdown end it; an init failure, a command outstanding at
-  the timeout or interrupt, or a failed reset or shutdown leaves cleanup
-  `pending` with the session's receipt, for the caller's cleanup holder, and no
-  retry, restore or test may overlap it. Under a CI job (`RUNNER_TRACKING_ID`
-  or `GITHUB_ACTIONS` set) `refusal()` refuses too; `end` stays available.
+  left pending, and never under a CI job (`RUNNER_TRACKING_ID` or
+  `GITHUB_ACTIONS` set; `end` stays available); anything else is refused before any access, and a
+  consumer calls `refusal(retains_lock=True)` before its own preparatory
+  sessions. Each operation is one session, bounded by its `timeout`, that is
+  never killed: it ends with `reset run` and a confirmed shutdown, or leaves
+  cleanup `pending` with the session's receipt for the caller's cleanup
+  holder, and no retry, restore or test may overlap it.
+  `session_state(receipt)` is a session's state for lock retention, by pid
+  and start time alone. The module and function docstrings have the
+  mechanics, `usj_tty` and `usj_node` included.
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
   deadline and never signalling it. It refuses on any doubt: the session (or
