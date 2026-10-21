@@ -1927,5 +1927,73 @@ class SegmentsFromFlashArgs(unittest.TestCase):
         self.assertNotIn('PWNED', os.listdir(self.build))
 
 
+
+class FlashArgsTokens(unittest.TestCase):
+    """hil_flash.esptool_input_problem and segments_from_flash_args read flash_args alike: each
+    input's verdict from both, and what an accepted one pairs with which offset, exactly."""
+    PAIRS = 'flash_args: want "<offset> <file>" pairs after the options'
+    CASES = (   # flash_args, esptool_input_problem, segments_from_flash_args ((offset, file) pairs, merge-bin args)
+        ('0x0 boot.bin 0x10000 app.bin', '',
+         ([(0, 'boot.bin'), (0x10000, 'app.bin')], ['0x0', 'boot.bin', '0x10000', 'app.bin'])),
+        ('--flash_mode dio --flash_freq 80m --flash_size 4MB 0x0 boot.bin', '',
+         ([(0, 'boot.bin')], ['--flash_mode=dio', '--flash_freq=80m', '--flash_size=4MB', '0x0', 'boot.bin'])),
+        ('--flash-mode=dio --flash_freq=80m 0x0 boot.bin', '',
+         ([(0, 'boot.bin')], ['--flash-mode=dio', '--flash_freq=80m', '0x0', 'boot.bin'])),
+        ("--flash_mode 'dio' 0x10000 'odd name.bin'", '',
+         ([(0x10000, 'odd name.bin')], ['--flash_mode=dio', '0x10000', 'odd name.bin'])),
+        ('--flash_mode dio\n0x0 boot.bin\n0x10000 app.bin\n', '',
+         ([(0, 'boot.bin'), (0x10000, 'app.bin')], ['--flash_mode=dio', '0x0', 'boot.bin', '0x10000', 'app.bin'])),
+        ('0x10000 "app.bin', "flash_args: ValueError('No closing quotation')", 'No closing quotation'),
+        ('--flash_mode', PAIRS, 'flash_args option --flash_mode has no value'),
+        ('--flash_mode dio', PAIRS, f'{{build}} {PAIRS}'),
+        ('0x10000 app.bin 0x20000', PAIRS, f'{{build}} {PAIRS}'),
+        ('', PAIRS, f'{{build}} {PAIRS}'),
+        ('zero app.bin', "flash_args: offset 'zero'",
+         "{build} flash_args zero app.bin: invalid literal for int() with base 0: 'zero'"),
+        ('0x10000 gone.bin', 'flash_args names gone.bin, which is missing from {build}',
+         "{build} flash_args 0x10000 gone.bin: [Errno 2] No such file or directory: '{build}/gone.bin'"),
+        ('--encrypt 0x10000 app.bin', PAIRS, 'flash_args option --encrypt is not one openocd_esp applies'),
+        ('--encrypt=1 0x10000 app.bin', '', 'flash_args option --encrypt=1 is not one openocd_esp applies'),
+        ('-z 0x0 boot.bin', PAIRS, 'flash_args option -z is not one openocd_esp applies'),
+        ('--flash_mode --flash_freq 80m 0x0 boot.bin', PAIRS, f'{{build}} {PAIRS}'),
+        ('--flash_mode dio --bad', PAIRS, 'flash_args option --bad is not one openocd_esp applies'),
+        ('0x0 boot.bin --flash_mode dio', "flash_args: offset '--flash_mode'",
+         "{build} flash_args --flash_mode dio: [Errno 2] No such file or directory: '{build}/dio'"),
+    )
+
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.build, self.log = root / 'build', root / 'esptool.jsonl'
+        self.build.mkdir()
+        for name in ('boot.bin', 'app.bin', 'odd name.bin'):
+            (self.build / name).write_bytes(b'\x01' * 8)
+        (self.build / 'config.env').write_text(json.dumps({'IDF_TARGET': 'esp32p4'}))
+        self.esptool = root / 'fake esptool'
+        self.esptool.write_text(FAKE_ESPTOOL.replace('{python}', sys.executable))
+        self.esptool.chmod(0o755)
+        self.enterContext(mock.patch.dict(os.environ, {'FAKE_ESPTOOL_LOG': str(self.log)}))
+        os.environ.pop('FAKE_REWRITE', None)
+        os.environ.pop('FAKE_ESPTOOL_RC', None)
+
+    def segments(self, text):
+        self.log.unlink(missing_ok=True)
+        try:
+            segs = oe.segments_from_flash_args(str(self.build), 'esp32p4', timeout=30, flash_args=text,
+                                               esptool=str(self.esptool))
+        except ValueError as e:
+            return str(e).replace(str(self.build), '{build}')
+        (call,) = [json.loads(x) for x in self.log.read_text().splitlines()]
+
+        def rel(a):
+            return os.path.relpath(a, self.build) if a.startswith(f'{self.build}/') else a
+        return [(s['offset'], rel(s['file'])) for s in segs], [rel(a) for a in call['argv'][5:]]
+
+    def test_both_callers_read_every_input_as_before(self):
+        for text, problem, segments in self.CASES:
+            with self.subTest(flash_args=text):
+                self.assertEqual(oe.hil_flash.esptool_input_problem('esp32p4', text, str(self.build))
+                                 .replace(str(self.build), '{build}'), problem)
+                self.assertEqual(self.segments(text), segments)
+
 if __name__ == '__main__':
     unittest.main()
