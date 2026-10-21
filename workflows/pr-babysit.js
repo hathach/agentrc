@@ -867,7 +867,11 @@ const stateOut = () => {
 const findingState = (f) => f.hold ? 'held' : f.deferral ? 'deferred' : f.verdict === 'valid' ? 'valid' : f.verdict === 'stale' ? 'stale' : 'refuted'
 // SonarCloud's own check, not an Actions job: its gate is never a CI-lane fix.
 const sonarGate = (rf) => !rf.workflow && /^SonarCloud\b/.test(rf.check)
-const ciState = (rf) => rf.accepted ? 'accepted' : sonarGate(rf) ? 'sonarGate' : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
+// Greptile's confidence check: a score of its review, which no local diff raises; collect.py reads it by its app and output.
+const greptileGate = (rf) => !rf.workflow && rf.check === 'Greptile Review'
+const gateCheck = (rf) => sonarGate(rf) || greptileGate(rf)
+const ciState = (rf) => rf.accepted ? 'accepted' : sonarGate(rf) ? 'sonarGate' : greptileGate(rf) ? 'greptileGate'
+  : rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real'
 const launchRollup = () => {
   const findings = new Map()
   const ci = new Map()
@@ -894,7 +898,7 @@ const launchRollup = () => {
   return {
     cycles: history.slice(launchFrom).map(e => e.cycle),
     findings: tally(findings, ['fixed', 'open', 'refuted', 'stale', 'deferred', 'held']),
-    ci: tally(ci, ['fixed', 'open', 'accepted', 'sonarGate', 'rigSide', 'unclassified']),
+    ci: tally(ci, ['fixed', 'open', 'accepted', 'sonarGate', 'greptileGate', 'rigSide', 'unclassified']),
     ciChecks: { ...ciChecks }, reran: reran.size, pushed, replies,
   }
 }
@@ -1369,6 +1373,7 @@ const cycleSummary = (entry) => {
       rf.verdict === 'real' ? 'ci-real' : rf.verdict,
       state === 'accepted' ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
       : state === 'sonarGate' ? 'left red: a SonarCloud gate, not a CI-lane fix'
+        : state === 'greptileGate' ? 'left red: a Greptile confidence gate, not a CI-lane fix'
         : state === 'rigSide' ? 'left red for the rig'
           : state === 'unclassified' ? 'left red: not placed by its evidence'
             : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
@@ -1951,7 +1956,9 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (exhausted) entry.ciWaited = { head: inv.head, registered: inv.registered, pending: inv.pending, waiting: inv.waiting }
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
-  const gated = failing.filter(c => sonarGate({ check: c.name, workflow: c.workflow }))
+  const gated = failing.filter(c => gateCheck({ check: c.name, workflow: c.workflow }))
+  // A gate is read afresh each time: a verdict an older launch stored for its link stands for nothing.
+  for (const c of gated) ciVerdicts.delete(c.link)
   // A re-run is timed from when it was asked; one carried from a state without that time, from this launch's first read (#123).
   for (const r of ciReruns) if (r.at === undefined) r.at = inv.observedAt
   const reruns = ciReruns.filter(r => r.head === inv.head)
@@ -2050,7 +2057,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     return null
   }
   if (!sameLinks(ev.gates.map(g => g.link), gated.map(c => c.link))) {
-    log(`cycle ${cycle}: SonarCloud gate evidence came back for ${JSON.stringify(ev.gates.map(g => g.link))}, asked for ${JSON.stringify(gated.map(c => c.link))} — re-arming`)
+    log(`cycle ${cycle}: gate evidence came back for ${JSON.stringify(ev.gates.map(g => g.link))}, asked for ${JSON.stringify(gated.map(c => c.link))} — re-arming`)
     return null
   }
   report.realFailures.push(...gated.flatMap(c => keyed(c, ev.gates.find(g => g.link === c.link).failures
@@ -2620,7 +2627,7 @@ const runLanes = async (cycle, entry, lanes) => {
       if (!c.realFailures.some(rf => rf.key === a.key)) log(`cycle ${cycle}: accepted failure ${a.key} matches no failure on this head`)
     }
     const unfixable = c.realFailures.filter(rf => !['real', 'accepted'].includes(ciState(rf)))
-    for (const rf of unfixable) log(`cycle ${cycle}: ${sonarGate(rf) ? 'SonarCloud gate' : rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
+    for (const rf of unfixable) log(`cycle ${cycle}: ${sonarGate(rf) ? 'SonarCloud gate' : greptileGate(rf) ? 'Greptile gate' : rf.verdict} CI failure (not fixing): ${rf.check} — ${rf.firstError.slice(0, 120)}`)
     const fixable = c.realFailures.filter(rf => ciState(rf) === 'real')
     if (fixable.length > 0) {
       const work = groupWork(fixable.map(rf => ({
@@ -2697,13 +2704,23 @@ const runLanes = async (cycle, entry, lanes) => {
         return stop(cycle, 'ci-red-unclassified', { outstanding: outstanding() })
       }
       const gates = unfixable.filter(sonarGate)
+      const greptile = unfixable.filter(greptileGate)
+      const rig = unfixable.length - gates.length - greptile.length
+      const beside = (n, what) => n ? ` and ${n} ${what}` : ''
+      // SonarCloud's stop takes precedence; both gates stay in the observation with their state.
       if (reviewsSettled && gates.length > 0) {
-        const rig = unfixable.length - gates.length
-        log(`cycle ${cycle}: CI red from the SonarCloud gate (${gates.map(rf => rf.firstError.slice(0, 80)).join('; ')})${rig ? ` and ${rig} rig-side failure(s)` : ''} — ` +
+        log(`cycle ${cycle}: CI red from the SonarCloud gate (${gates.map(rf => rf.firstError.slice(0, 80)).join('; ')})${beside(greptile.length, 'Greptile gate failure(s)')}${beside(rig, 'rig-side failure(s)')} — ` +
           (gates.some(rf => rf.complete)
             ? 'its failing condition needs resolving (a rating or issue count clears when the answered issues are marked, by markSonar or a human; coverage or duplication needs its own change), or the caller accepts the gate'
             : 'no failing condition was read: inspect the gate on SonarCloud, or relaunch once its check reports again'))
         return stop(cycle, 'ci-red-sonar-gate', { outstanding: outstanding() })
+      }
+      if (reviewsSettled && greptile.length > 0) {
+        log(`cycle ${cycle}: CI red from Greptile's confidence check (${greptile.map(rf => rf.firstError.slice(0, 120)).join('; ')})${beside(rig, 'rig-side failure(s)')} — ` +
+          (greptile.some(rf => rf.complete)
+            ? 'its review scored below the repository\'s threshold, which no CI-lane fix raises: a new score needs a new Greptile review of the head, or the caller accepts the gate by its key'
+            : 'it is not a confidence result this reads: inspect the check on GitHub, or relaunch once it reports again'))
+        return stop(cycle, 'ci-red-greptile-gate', { outstanding: outstanding() })
       }
       if (reviewsSettled) {
         log(`cycle ${cycle}: CI red only from rig-side failures — rig attention needed (the caller's), nothing to fix in the PR`)

@@ -98,8 +98,15 @@ When any check was read, the detail file lists the PR's `changed`
 paths (null with `changedError` when they could not be read or may be
 incomplete), and the PR head is read again after them. A --check that is no longer a failing check of the head is a stale
 snapshot: exit 1, before anything is read. Read the Docs needs RTD_TOKEN (see rtd.py).
+A check whose link names no run (an app's check run) is read from the newest
+check run on the head with its name and its link as details_url: its entry
+holds `app`, `checkRun`, `conclusion` and `output` {title, summary} as GitHub
+reports them, its log those lines and the output text, and firstError the
+title (else the summary's first line); no such run, runs it cannot order or an
+output with neither leaves the entry's `error`.
 
-A --gate (a red SonarCloud gate check; failures needs a --check or a --gate,
+A --gate (a red SonarCloud gate check, or Greptile's confidence check named
+GREPTILE_CHECK; failures needs a --check or a --gate,
 no link twice) is stale the same way, stays out of the detail file and is
 printed in `gates` (always present), one {link, failures} each: its
 sonarcloud.io link naming the project and the PR is read for the quality
@@ -107,8 +114,11 @@ gate's status (SONAR_TOKEN when set, sent to sonarcloud.io only), and
 `failures` is [{firstError, signature, complete}], one complete entry per
 failing condition of an ERROR gate that names its metric, value, comparator
 and threshold, or else one incomplete entry, its firstError saying why: the
-gate lists none, reads passing now, or could not be read. The PR head is read
-again after the gates too.
+gate lists none, reads passing now, or could not be read. A Greptile check is
+its check run, read as a --check's is: one complete entry, its title, when the
+run is by GREPTILE_APP, concluded failure, and its title and summary are the
+below-threshold result (GREPTILE_BELOW, GREPTILE_GATE); else one incomplete
+entry saying what was read. The PR head is read again after the gates too.
 
 remember: stores a judge's verdicts for the head beside its evidence, so a
 later launch recalls them instead of carrying them in its state. It reads a
@@ -171,6 +181,12 @@ SONARCLOUD = 'https://sonarcloud.io'
 NEVER_STARTED = 'GitHub Actions job cancelled before any step ran'
 COMPARATOR = {'GT': '>', 'LT': '<'}
 CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
+NO_RUN = 'no reader for this check: its link names no run'
+# Greptile's confidence check: harvest.py reads the same result as a review.
+GREPTILE_CHECK = 'Greptile Review'
+GREPTILE_APP = 'greptile-apps'
+GREPTILE_BELOW = re.compile(r'\bConfidence (\d+)/(\d+) \u2014 below your required (\d+)/(\d+)$')
+GREPTILE_GATE = "Greptile reviewed this pull request successfully \u2014 this check reflects your team's confidence threshold, not a review failure."
 
 
 STOP_FILE = None  # inventory --stop-file
@@ -835,6 +851,60 @@ def gate(link, pr):
     return {'link': link, 'failures': failures or [{'firstError': first, 'signature': signature(first), 'complete': False}]}
 
 
+def check_run(repo, head, check):
+    """The newest check run on the head with the check's name and its link as details_url, or Failed: none, or
+    runs it cannot order (an undated one among several, or two started at once)."""
+    query = urllib.parse.urlencode({'check_name': check['name'], 'filter': 'all', 'per_page': 100})
+    pages = gh('api', '--paginate', '--slurp', f'repos/{repo}/commits/{head}/check-runs?{query}')
+    runs = [r for page in pages for r in page.get('check_runs') or []
+            if r.get('name') == check['name'] and r.get('details_url') == check['link']]
+    if not runs:
+        raise Failed(NO_RUN)
+    if len(runs) > 1 and not all(r.get('started_at') for r in runs):
+        raise Failed(f'check runs {", ".join(str(r.get("id")) for r in runs)} name this link, one undated: which one failed cannot be told')
+    newest = max(runs, key=lambda r: r.get('started_at') or '')
+    tied = [r for r in runs if r.get('started_at') == newest.get('started_at')]
+    if len(tied) > 1:
+        raise Failed(f'check runs {", ".join(str(r.get("id")) for r in tied)} name this link and started together: which one failed cannot be told')
+    return newest
+
+
+def app_check(repo, head, check, folder):
+    """An app's check run with no Actions, CircleCI or Read the Docs run behind it: its output as GitHub reports it."""
+    r = check_run(repo, head, check)
+    output = r.get('output') or {}
+    title, summary, text = ((output.get(k) or '').strip() for k in ('title', 'summary', 'text'))
+    shown = [line for line in [title, *summary.splitlines()] if line.strip()]
+    if not shown:
+        raise Failed(f'check run {r.get("id")} reports no output title or summary')
+    lines = [f'check run {r.get("id")} by {(r.get("app") or {}).get("slug")}: {r.get("status")}/{r.get("conclusion")}', *shown, *text.splitlines()]
+    return {'app': (r.get('app') or {}).get('slug'), 'checkRun': r.get('id'), 'conclusion': r.get('conclusion'),
+            'output': {'title': title, 'summary': summary}, 'log': save(folder, f'check-run-{r.get("id")}.log', lines), 'base': None,
+            'firstError': shown[0], 'signature': signature(shown[0]), 'files': [], 'diagnostics': shown[:KEEP]}
+
+
+def greptile_gate(repo, head, check):
+    """A red Greptile check as `gate` gives one: complete when it is Greptile's own result that the review scored below the
+    repository's confidence threshold, its title the failure; else one incomplete failure saying what was read."""
+    try:
+        r = check_run(repo, head, check)
+    except Failed as e:
+        if e.limit:
+            raise
+        first = f'Greptile check not read: {e}'
+    else:
+        output = r.get('output') or {}
+        title, summary = ((output.get(k) or '').strip() for k in ('title', 'summary'))
+        app = (r.get('app') or {}).get('slug')
+        if app != GREPTILE_APP:
+            first = f'check run {r.get("id")} is by app {app!r}, not {GREPTILE_APP}'
+        elif r.get('conclusion') == 'failure' and GREPTILE_BELOW.search(title) and summary.startswith(GREPTILE_GATE):
+            return {'link': check['link'], 'failures': [{'firstError': title, 'signature': signature(title), 'complete': True}]}
+        else:
+            first = f'check run {r.get("id")} {r.get("status")}/{r.get("conclusion")} is not a confidence threshold result: {title or summary[:200]!r}'
+    return {'link': check['link'], 'failures': [{'firstError': first, 'signature': signature(first), 'complete': False}]}
+
+
 def circle(repo, number, folder):
     lines = []
     for name, tail in circleci.failed_steps(repo, number, 150):
@@ -921,14 +991,14 @@ def failures(repo, pr, head, links, gates=()):
             elif kind == 'circleci':
                 entry.update(circle(repo, ident, folder))
             else:
-                entry['error'] = 'no reader for this check: its link names no run'
+                entry.update(app_check(repo, head, check, folder))
         except (Failed, rtd.Failed, circleci.Failed) as e:
             if getattr(e, 'limit', None):
                 raise
             entry['error'] = str(e)
         checks.append(entry)
     unread = prior_verdicts(repo, pr, head, checks)
-    read = [gate(link, pr) for link in gates]
+    read = [greptile_gate(repo, head, failing[link]) if failing[link]['name'] == GREPTILE_CHECK else gate(link, pr) for link in gates]
     out = {'head': head, 'baseRef': now['baseRef'], 'baseSha': now['baseSha'], **({'priorErrors': unread} if unread else {})}
     if any(c['error'] is None for c in checks):
         out['changed'], why = changed_paths(repo, pr)
@@ -982,7 +1052,7 @@ def main(argv=None):
     p.add_argument('--wait-seconds', type=int, default=0)
     p.add_argument('--brief', action='store_true', help='inventory: while still running, print the state without its checks')
     p.add_argument('--check', action='append', default=[], metavar='LINK')
-    p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate check, read for the caller')
+    p.add_argument('--gate', action='append', default=[], metavar='LINK', help='failures: a red SonarCloud gate or Greptile confidence check, read for the caller')
     p.add_argument('--offset', type=int, help='recall: where the page to print starts, of the lone --check')
     p.add_argument('--ignore-check', action='append', default=[], metavar='NAME', help='inventory: leave out the checks of this exact name')
     p.add_argument('--stop-file', metavar='PATH', help='inventory: make no further GitHub call once PATH exists')

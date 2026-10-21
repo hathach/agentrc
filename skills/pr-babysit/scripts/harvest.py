@@ -67,6 +67,12 @@ REVIEW_SUBMITTED = ('COMMENTED', 'APPROVED', 'CHANGES_REQUESTED')
 GREPTILE_PAUSED = 'Greptile has paused reviews on this repository'
 GREPTILE_ERROR = 'Greptile encountered an error while reviewing this PR'
 GREPTILE_STATUS = '<!-- greptile-status -->'
+# Its check concluding failure on a review that scored below the repository's confidence threshold; collect.py reads it as a gate.
+GREPTILE_BELOW = re.compile(r'\bConfidence (\d+)/(\d+) \u2014 below your required (\d+)/(\d+)$')
+GREPTILE_GATE = "Greptile reviewed this pull request successfully \u2014 this check reflects your team's confidence threshold, not a review failure."
+# How long that result may stand before its review on the head counts as not observed: pr-babysit's REVIEW_CAP_MIN.
+GREPTILE_REVIEW_WAIT = timedelta(minutes=10)
+FAILED_RUN = ('failure', 'cancelled', 'timed_out', 'action_required')
 RUN_PROGRESS = {'queued': ('queued', 'check run queued'), 'in_progress': ('working', 'check run in progress')}
 
 
@@ -256,7 +262,7 @@ def coderabbit_run(run_, ev, head):
     return record('coderabbit', 'unknown', f"check run {run_['status']}/{run_.get('conclusion')} is not one this reads", ev)
 
 
-def greptile(head, checks, issue, reviews, event_at):
+def greptile(head, checks, issue, reviews, event_at, now=None):
     runs = [c for c in checks if (c.get('app') or {}).get('slug') == 'greptile-apps' and c.get('name') == 'Greptile Review']
     r, unordered = latest_run(runs)
     if unordered:
@@ -295,13 +301,37 @@ def greptile(head, checks, issue, reviews, event_at):
     if not r:
         return record('greptile', 'absent', 'no check run and no applicable refusal on the head')
     summary = ((r.get('output') or {}).get('summary') or '').strip()
+    title = ((r.get('output') or {}).get('title') or '').strip()
     if r['status'] in RUN_PROGRESS:
         return record('greptile', *RUN_PROGRESS[r['status']], ev, head)
     if r['status'] == 'completed' and r.get('conclusion') == 'success' and summary.startswith('Greptile has reviewed the Pull Request.'):
         return record('greptile', 'reviewed', 'check run completed with a review', ev, head)
     if r['status'] == 'completed' and r.get('conclusion') == 'neutral' and summary.startswith(GREPTILE_ERROR + '.'):
         return record('greptile', 'settled', 'check run reports an error', ev, head, 'failed')
+    below = (bool(GREPTILE_BELOW.search(title)), summary.startswith(GREPTILE_GATE))
+    if r['status'] == 'completed' and r.get('conclusion') == 'failure' and all(below):
+        return below_threshold(head, r, title, reviews, ev, now or datetime.now(timezone.utc))
+    if r['status'] == 'completed' and r.get('conclusion') in FAILED_RUN and not any(below):
+        return record('greptile', 'settled', f"check run {r['conclusion']}", ev, head, 'failed')
     return record('greptile', 'unknown', f"check run {r['status']}/{r.get('conclusion')} with a summary this does not read", ev)
+
+
+def below_threshold(head, r, title, reviews, ev, now):
+    """A confidence result below the threshold is Greptile's review scored, once its review on the head is posted; the
+    review may land either side of the check, so the result alone waits GREPTILE_REVIEW_WAIT for it."""
+    mine = [v for v in reviews or [] if 'greptile' in (v['user']['login'] or '').lower() and v.get('commit_id') == head
+            and v.get('state') in REVIEW_SUBMITTED and GREPTILE_PAUSED not in (v.get('body') or '')]
+    if mine:
+        v = newest(mine, 'submitted_at') or mine[0]
+        return record('greptile', 'reviewed', f'review posted, its confidence below the threshold: {title}', [*ev, f"review {v['id']} on {head[:8]}"], head)
+    done = stamp(r.get('completed_at'))
+    if done is None:
+        return record('greptile', 'unknown', 'a confidence result with no completion time, and no Greptile review on the head', ev)
+    if now - done < GREPTILE_REVIEW_WAIT:
+        return record('greptile', 'working', f"confidence result at {r['completed_at']}, its review on the head not posted yet", ev, head)
+    wait = int(GREPTILE_REVIEW_WAIT.total_seconds() // 60)
+    return record('greptile', 'settled', f"review not observed: no Greptile review on the head {wait} minutes after its confidence result at {r['completed_at']}",
+                  ev, head, 'failed')
 
 
 def copilot_reading(body):
@@ -422,18 +452,19 @@ def observe(repo, n, reviewers, auto):
     issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
     reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if 'greptile' in auto or 'copilot' in reviewers else None
     harvested = comments(repo, n, reviewers, issue, reviews)
+    now = datetime.now(timezone.utc)
     bots = []
     for bot in reviewers:
         if bot == 'coderabbit' and bot in auto:
             bots.append(coderabbit(head, statuses, checks, issue, event_at))
         elif bot == 'greptile' and bot in auto:
-            bots.append(greptile(head, checks, issue, reviews, event_at))
+            bots.append(greptile(head, checks, issue, reviews, event_at, now))
         elif bot == 'copilot':
             bots.append(copilot(head, reviews))
         else:
             n_ = sum(c['source'] == bot for c in harvested)
             bots.append(record(bot, 'harvested', f'{n_} comment(s) harvested; it does not auto-run here, so its state is not read'))
-    return {'headSha': head, 'observedAt': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    return {'headSha': head, 'observedAt': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
             'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested}
 
 

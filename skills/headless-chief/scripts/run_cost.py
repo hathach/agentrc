@@ -361,8 +361,8 @@ def did(record):
 
 
 FINDINGS = (('fixed', 'fixed'), ('open', 'open'), ('refuted', 'refuted'), ('stale', 'stale'), ('deferred', 'deferred'), ('held', 'held'))
-CI = (('fixed', 'fixed'), ('open', 'open'), ('accepted', 'accepted'), ('sonarGate', 'Sonar gate'), ('rigSide', 'rig-side'),
-      ('unclassified', 'unclassified'))
+CI = (('fixed', 'fixed'), ('open', 'open'), ('accepted', 'accepted'), ('sonarGate', 'Sonar gate'), ('greptileGate', 'Greptile gate'),
+      ('rigSide', 'rig-side'), ('unclassified', 'unclassified'))
 
 
 def state_line(numbered):

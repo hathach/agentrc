@@ -77,6 +77,9 @@ STALLED = {
     'ci-red-rig-side': 'CI is red only from rig-side failures: relaunch once they are repaired and re-run, or the user accepts them',
     'ci-red-sonar-gate': "the SonarCloud gate fails: relaunch only when markSonar has an answered issue to mark or the gate changed; "
                          "otherwise it is the user's to resolve or accept",
+    'ci-red-greptile-gate': "Greptile's confidence check fails: a score below the repository's threshold needs a new Greptile review "
+                            "of the head, else the user accepts it by its key; a check that could not be read as one (complete false) "
+                            "needs inspecting first",
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
                 'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
@@ -156,7 +159,7 @@ ATTENTION = ('check', 'cell', 'state', 'verdict', 'key', 'complete', 'files')
 
 
 def ci_summary(ci, keys=False):
-    """Counts by verdict, accepted and sonarGate apart; complete rig-side or accepted failures as their cells per check, or
+    """Counts by verdict, accepted and the gates apart; complete rig-side or accepted failures as their cells per check, or
     with keys as {cell, key}; every other failure by the fields a caller acts on, its firstError cut."""
     failures = ci.get('realFailures') or []
     settled = lambda f: f.get('complete') is True and f.get('state') in ('accepted', 'rigSide')

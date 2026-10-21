@@ -26,6 +26,17 @@ RTD = 'https://app.readthedocs.org/projects/p/builds/{}/'
 CIRCLE = 'https://circleci.com/gh/o/r/{}'
 UF2 = Path(__file__).resolve().parent / 'data' / 'tinyuf2_hil'  # real ESP32-S3 battery reports, paths scrubbed
 S3 = 'espressif_esp32s3_devkitc_1'
+GREPTILE = 'https://app.greptile.com/tinyusb/github/hathach/agentrc/-/pull/165'
+# Check run 118615785789 on hathach/agentrc PR 165, as GitHub reports it.
+BELOW_TITLE = 'Base review: Confidence 4/5 \u2014 below your required 5/5'
+BELOW_SUMMARY = ("Greptile reviewed this pull request successfully \u2014 this check reflects your team's confidence threshold, not a review "
+                 'failure. The review scored 4/5, below the 5/5 this repository requires for the check to pass.')
+
+
+def greptile_run(title=BELOW_TITLE, summary=BELOW_SUMMARY, **over):
+    return {'id': 118615785789, 'name': 'Greptile Review', 'head_sha': HEAD, 'status': 'completed', 'conclusion': 'failure',
+            'started_at': '2026-10-20T12:02:14Z', 'completed_at': '2026-10-20T12:06:54Z', 'details_url': GREPTILE,
+            'app': {'slug': 'greptile-apps'}, 'output': {'title': title, 'summary': summary, 'text': None}, **over}
 
 
 
@@ -469,6 +480,7 @@ class FailuresTest(unittest.TestCase):
         self.run_jobs = {'72': [{'name': 'hil (x.json)', 'conclusion': 'skipped', 'databaseId': 41}],
                          '70': [{'name': 'hil (x.json)', 'conclusion': 'failure', 'databaseId': 40}]}
         self.changed = ['src/host/msc.c', 'test/hil/tiny usb.json']
+        self.check_runs = []   # the head's check runs, one page; 'limited' refuses the read
         self.calls = []
 
         def run(argv, **kw):
@@ -485,6 +497,8 @@ class FailuresTest(unittest.TestCase):
             limited = mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 403: API rate limit exceeded for user ID 1.')
             if argv[1:3] == ['api', 'rate_limit']:
                 return ok({'resources': {'core': {'remaining': 0, 'reset': 1790000060}}})
+            if argv[1:3] == ['api', '--paginate'] and f'/commits/{HEAD}/check-runs?' in argv[4]:
+                return limited if self.check_runs == 'limited' else ok([{'total_count': len(self.check_runs), 'check_runs': self.check_runs}])
             if argv[1:3] == ['api', '--paginate']:
                 if self.changed == 'limited':
                     return limited
@@ -1017,6 +1031,38 @@ class FailuresTest(unittest.TestCase):
     def test_a_link_without_a_run_is_an_entry_error_not_a_guess(self):
         c = self.entries('https://greptile.com/')[0]
         self.assertEqual((c['provider'], c['error']), ('other', 'no reader for this check: its link names no run'))
+        self.check_runs = [greptile_run(name='bot (other)', details_url='https://greptile.com/'), greptile_run(name='bot', details_url='https://greptile.com/x')]
+        c = self.entries('https://greptile.com/')[0]
+        self.assertEqual(c['error'], 'no reader for this check: its link names no run', 'a run needs both the name and the link')
+
+    def test_an_app_check_run_with_no_actions_run_is_read_from_its_output(self):
+        self.checks.append({'name': 'Greptile Review', 'workflow': '', 'bucket': 'fail', 'link': GREPTILE})
+        self.check_runs = [greptile_run(id=1, conclusion='success', title='Base review', started_at='2026-10-20T11:00:00Z',
+                                        summary='Greptile has reviewed the Pull Request.\n\n6 files reviewed, 0 comments added.'),
+                           greptile_run()]
+        c = self.entries(GREPTILE)[0]
+        self.assertEqual({k: c[k] for k in ('provider', 'error', 'app', 'checkRun', 'conclusion', 'output', 'firstError', 'signature', 'files', 'base')},
+                         {'provider': 'other', 'error': None, 'app': 'greptile-apps', 'checkRun': 118615785789, 'conclusion': 'failure',
+                          'output': {'title': BELOW_TITLE, 'summary': BELOW_SUMMARY}, 'firstError': BELOW_TITLE, 'signature': BELOW_TITLE,
+                          'files': [], 'base': None})
+        self.assertEqual(c['diagnostics'], [BELOW_TITLE, BELOW_SUMMARY])
+        self.assertEqual(Path(c['log']).read_text(encoding='utf-8').splitlines(),
+                         ['check run 118615785789 by greptile-apps: completed/failure', BELOW_TITLE, BELOW_SUMMARY])
+        [listed] = [x for x in self.calls if x[:2] == ['api', '--paginate'] and '/check-runs?' in x[3]]
+        self.assertEqual(listed[3], f'repos/o/r/commits/{HEAD}/check-runs?check_name=Greptile+Review&filter=all&per_page=100')
+
+    def test_app_check_runs_it_cannot_order_or_read_are_an_entry_error(self):
+        self.checks.append({'name': 'Greptile Review', 'workflow': '', 'bucket': 'fail', 'link': GREPTILE})
+        for runs, error in (([greptile_run(), greptile_run(id=2)], 'check runs 118615785789, 2 name this link and started together'),
+                            ([greptile_run(), greptile_run(id=2, started_at=None)], 'check runs 118615785789, 2 name this link, one undated'),
+                            ([greptile_run(title='', summary='')], 'check run 118615785789 reports no output title or summary')):
+            with self.subTest(error):
+                self.check_runs = runs
+                self.assertTrue(self.entries(GREPTILE)[0]['error'].startswith(error))
+        self.check_runs = 'limited'
+        rc, r = self.main(GREPTILE)
+        self.assertEqual(rc, 1)
+        self.assertIn('rate limit', r['error'])
 
     T1, T2, T3 = ('01:00:00Z', '01:05:00Z'), ('02:00:00Z', '02:05:00Z'), ('03:00:00Z', '03:05:00Z')
 
@@ -1260,6 +1306,36 @@ class FailuresTest(unittest.TestCase):
         self.checks.append({'name': 'SonarCloud', 'workflow': '', 'bucket': 'fail', 'link': self.SONAR})
         c = self.entries(self.SONAR)[0]
         self.assertEqual((c['provider'], c['error']), ('other', 'no reader for this check: its link names no run'))
+
+    def greptile_gate(self, *runs, bucket='fail'):
+        self.checks.append({'name': 'Greptile Review', 'workflow': '', 'bucket': bucket, 'link': GREPTILE})
+        self.check_runs = list(runs)
+        return self.main(extra=['--gate', GREPTILE])
+
+    def test_greptiles_below_threshold_result_is_one_complete_gate_failure(self):
+        rc, r = self.greptile_gate(greptile_run())
+        self.assertEqual(rc, 0, r)
+        self.assertEqual(r['gates'], [{'link': GREPTILE, 'failures': [{'firstError': BELOW_TITLE, 'signature': BELOW_TITLE, 'complete': True}]}])
+        self.assertEqual(json.loads(Path(r['detail']).read_text())['checks'], [], 'the judge reads nothing of it')
+
+    def test_any_other_greptile_check_is_one_incomplete_gate_failure_saying_what_was_read(self):
+        cases = ((greptile_run(app={'slug': 'greptile-lookalike'}), "check run 118615785789 is by app 'greptile-lookalike', not greptile-apps"),
+                 (greptile_run(title='Base review', summary='Greptile could not finish this review.'),
+                  "check run 118615785789 completed/failure is not a confidence threshold result: 'Base review'"),
+                 (greptile_run(summary='Greptile reviewed this pull request.'), 'check run 118615785789 completed/failure is not a confidence threshold result'),
+                 (greptile_run(conclusion='cancelled'), 'check run 118615785789 completed/cancelled is not a confidence threshold result'),
+                 (greptile_run(details_url='https://app.greptile.com/x'), 'Greptile check not read: no reader for this check: its link names no run'))
+        for run, why in cases:
+            with self.subTest(why):
+                self.checks = self.checks[:3]
+                rc, r = self.greptile_gate(run)
+                self.assertEqual(rc, 0, r)
+                self.assertTrue(self.only(r).startswith(why), self.only(r))
+
+    def test_a_greptile_gate_no_longer_failing_is_stale(self):
+        rc, r = self.greptile_gate(greptile_run(), bucket='pass')
+        self.assertEqual(rc, 1)
+        self.assertIn(f'stale snapshot: no longer failing checks of the head: {GREPTILE}', r['error'])
 
     def test_gate_is_for_failures_and_takes_each_link_once(self):
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):

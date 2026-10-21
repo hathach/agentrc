@@ -113,6 +113,12 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(ci['verdicts'], {'sonarGate': 1, 'rig-side': 1})
         self.assertEqual(list(ci['settledCells']), ['hil-tinyusb (tinyusb.json)'])
         self.assertEqual([f['check'] for f in ci['attention']], ['SonarCloud Code Analysis'], 'the gate needs attention')
+        greptile = {**gate, 'check': 'Greptile Review', 'verdict': 'real', 'state': 'greptileGate'}
+        o['result']['observation']['ci']['realFailures'] = [gate, greptile, failure('f072 cdc')]
+        rc, s = self.run_it(o)
+        ci = s['observation']['ci']
+        self.assertEqual(ci['verdicts'], {'sonarGate': 1, 'greptileGate': 1, 'rig-side': 1}, 'each gate counted apart, whatever its verdict')
+        self.assertEqual([f['check'] for f in ci['attention']], ['SonarCloud Code Analysis', 'Greptile Review'])
 
     def test_a_launch_that_threw_keeps_the_state_it_was_given(self):
         rc, s = self.run_it('', '--state-ref', '/t/w1.output:4841042f', '--checkout', self.repo())

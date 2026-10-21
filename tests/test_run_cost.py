@@ -229,7 +229,7 @@ class RunCostTest(unittest.TestCase):
     def test_the_brief_form_tables_launches_and_usage_and_writes_the_full_output(self):
         records = self.session / 'workflows'
         records.mkdir(parents=True)
-        rollup = {'findings': {'total': 3, 'fixed': 1, 'refuted': 2, 'open': 0}, 'ci': {'total': 4, 'fixed': 1, 'rigSide': 3},
+        rollup = {'findings': {'total': 3, 'fixed': 1, 'refuted': 2, 'open': 0}, 'ci': {'total': 5, 'fixed': 1, 'greptileGate': 1, 'rigSide': 3},
                   'replies': 2, 'pushed': ['44563dc0abc', 'e5380505def']}
         state = {'expectedHead': '9a8b7c6d5e4f', 'cyclesUsed': 4, 'maxCycles': 10}
         (records / 'wf_aaa.json').write_text(json.dumps({'runId': 'wf_aaa', 'startTime': 2, 'totalTokens': 271025, 'agentCount': 3, 'workflowName': 'pr-babysit',
@@ -251,7 +251,7 @@ class RunCostTest(unittest.TestCase):
         self.assertEqual(launches['chief units'], ['biggest: Explore ×1', '', '', '', '0.60'])
         self.assertEqual(launches['**total**'], ['', '', '**11.0 m**', '', '**5.68**'])
         self.assertIn('Refused before any agent ran: wf_bad (deferral reason too long).', out)
-        self.assertIn('State after launch 1: 9a8b7c6; findings 1 fixed · 2 refuted; CI 1 fixed · 3 rig-side; 4/10 cycles used.', out)
+        self.assertIn('State after launch 1: 9a8b7c6; findings 1 fixed · 2 refuted; CI 1 fixed · 1 Greptile gate · 3 rig-side; 4/10 cycles used.', out)
         usage = self.breakout(out, 1)
         self.assertEqual(usage['chief (own turns)'], ['opus', '–', '1', '5 k', '–', '2.50'])
         self.assertEqual(usage['fix'], ['opus', '1', '1', '20 k', '0.5 m', '2.24'])

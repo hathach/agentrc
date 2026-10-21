@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +43,26 @@ def status(state, desc, at='2026-09-25T09:00:00Z'):
 def greptile_run(status_, conclusion=None, summary='Greptile has reviewed the Pull Request.', at='2026-09-25T09:00:00Z'):
     return {'id': 9, 'name': 'Greptile Review', 'app': {'slug': 'greptile-apps'}, 'status': status_, 'conclusion': conclusion,
             'started_at': at, 'output': {'summary': summary}}
+
+
+# Check run 118615785789 on hathach/agentrc PR 165, as GitHub reports it.
+BELOW_TITLE = 'Base review: Confidence 4/5 \u2014 below your required 5/5'
+BELOW_SUMMARY = ("Greptile reviewed this pull request successfully \u2014 this check reflects your team's confidence threshold, not a review "
+                 'failure. The review scored 4/5, below the 5/5 this repository requires for the check to pass.')
+CONCLUDED = '2026-10-20T12:06:54Z'
+
+
+def below_run(title=BELOW_TITLE, summary=BELOW_SUMMARY, conclusion='failure', completed=CONCLUDED):
+    return {**greptile_run('completed', conclusion, summary, at='2026-10-20T12:02:14Z'), 'id': 118615785789, 'completed_at': completed,
+            'output': {'title': title, 'summary': summary, 'text': None}}
+
+
+def minutes_after(at, n):
+    return datetime.fromisoformat(at.replace('Z', '+00:00')) + timedelta(minutes=n)
+
+
+def greptile_review(commit, at='2026-10-20T12:06:52Z', id_=50, body='<h3>Greptile Summary</h3>'):
+    return {**review('greptile-apps[bot]', commit, body, at, id_), 'state': 'COMMENTED'}
 
 
 class SettleRules(unittest.TestCase):
@@ -97,6 +118,55 @@ class SettleRules(unittest.TestCase):
         self.assertEqual(harvest.greptile(HEAD, [], [], [paused], EVENT)['state'], 'absent', 'a review on an older commit settles nothing')
         paused['commit_id'] = HEAD
         self.assertEqual(harvest.greptile(HEAD, [], [], [paused], EVENT)['kind'], 'limited')
+
+    def read_below(self, runs, reviews, minutes=3):
+        return harvest.greptile(HEAD, runs, [], reviews, EVENT, minutes_after(CONCLUDED, minutes))
+
+    def test_a_confidence_result_below_the_threshold_is_a_review_once_its_review_on_the_head_is_posted(self):
+        got = self.read_below([below_run()], [greptile_review(HEAD)])
+        self.assertEqual((got['state'], got['sha'], got['kind']), ('reviewed', HEAD, None))
+        self.assertEqual(got['evidence'], ['check run 118615785789 completed/failure at 2026-10-20T12:02:14Z', f'review 50 on {HEAD[:8]}'])
+        self.assertIn(BELOW_TITLE, got['reason'])
+
+    def test_either_arrival_order_settles_reviewed(self):
+        # The check first: its result waits for the review, which then settles it.
+        self.assertEqual(self.read_below([below_run()], [])['state'], 'working')
+        self.assertEqual(self.read_below([below_run()], [greptile_review(HEAD, at='2026-10-20T12:08:00Z')])['state'], 'reviewed')
+        # The review first, two seconds before the check concluded (PR 179): the running check is what is read.
+        early = [greptile_review(HEAD, at='2026-10-20T12:06:52Z')]
+        self.assertEqual(self.read_below([greptile_run('in_progress', at='2026-10-20T12:02:14Z')], early)['state'], 'working')
+        self.assertEqual(self.read_below([below_run()], early)['state'], 'reviewed')
+
+    def test_a_result_with_no_review_on_the_head_waits_then_is_settled_failed(self):
+        for reviews, why in (([], 'no review'), ([greptile_review(OLD)], 'a review of an older head'),
+                             ([{**greptile_review(HEAD), 'state': 'PENDING'}], 'an unsubmitted review'),
+                             ([greptile_review(HEAD, at='2026-10-20T12:00:00Z', body=harvest.GREPTILE_PAUSED + ' on this repository')], 'a paused notice the run superseded')):
+            with self.subTest(why):
+                waiting = self.read_below([below_run()], reviews, minutes=9)
+                self.assertEqual((waiting['state'], waiting['sha']), ('working', HEAD))
+                self.assertIn('its review on the head not posted yet', waiting['reason'])
+                late = self.read_below([below_run()], reviews, minutes=10)
+                self.assertEqual((late['state'], late['kind'], late['sha']), ('settled', 'failed', HEAD))
+                self.assertTrue(late['reason'].startswith('review not observed: '), late['reason'])
+
+    def test_a_genuinely_failed_run_is_settled_failed_and_an_ambiguous_one_unknown(self):
+        for conclusion in ('failure', 'cancelled', 'timed_out', 'action_required'):
+            got = self.read_below([below_run('Review failed', 'Greptile could not finish this review.', conclusion)], [greptile_review(HEAD)])
+            self.assertEqual((got['state'], got['kind'], got['reason']), ('settled', 'failed', f'check run {conclusion}'), conclusion)
+        for run, why in ((below_run(summary='Greptile reviewed this pull request.'), 'a threshold title with another summary'),
+                         (below_run(title='Base review'), 'the threshold summary under another title'),
+                         (below_run(conclusion='cancelled'), 'the threshold result not concluding failure'),
+                         (below_run(completed=None), 'no completion time to wait from')):
+            with self.subTest(why):
+                self.assertEqual(self.read_below([run], [])['state'], 'unknown')
+
+    def test_the_threshold_result_reads_as_collect_py_reads_it(self):
+        spec_ = importlib.util.spec_from_file_location('ci_collect_for_harvest', SCRIPT.parents[2] / 'ci-rerun' / 'scripts' / 'collect.py')
+        collect = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(collect)
+        self.assertEqual((harvest.GREPTILE_BELOW.pattern, harvest.GREPTILE_GATE), (collect.GREPTILE_BELOW.pattern, collect.GREPTILE_GATE))
+        workflow_src = (SCRIPT.parents[3] / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
+        self.assertIn(f'const REVIEW_CAP_MIN = {int(harvest.GREPTILE_REVIEW_WAIT.total_seconds() // 60)}\n', workflow_src)
 
     def test_digest_and_aliases_are_pr_replys_comment_digest(self):
         rabbit = 'x\n\n<!-- This is an auto-generated reply by CodeRabbit -->\n\n✅ Addressed in commit a3f8bc8'
@@ -416,6 +486,18 @@ class EndToEnd(unittest.TestCase):
         by_id = {c['commentId']: c for c in got['comments']}
         self.assertEqual((by_id[22]['body'], by_id[22]['bodyOmitted'], by_id[22]['digest']), (None, 'coderabbit-walkthrough', harvest.digest(walk)))
         self.assertEqual(by_id[20]['body'], 'walkthrough', 'a CodeRabbit issue comment without the marker stays verbatim')
+
+    def test_greptiles_confidence_result_is_read_with_its_review_on_the_head(self):
+        argv = ['--pr', '7', '--reviewers', 'coderabbit,greptile', '--auto-run', 'coderabbit,greptile']
+        for reviews, state in (([greptile_review(HEAD)], 'reviewed'), ([], 'settled')):
+            with self.subTest(state):
+                answers = self.answers([HEAD])
+                answers[f'api --paginate --slurp repos/o/r/commits/{HEAD}/check-runs?per_page=100'] = [[{'check_runs': [below_run()]}]]
+                answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].extend(reviews)
+                code, got = self.harvest(answers, *argv)
+                self.assertEqual(code, 0, got)
+                self.assertEqual([(b['bot'], b['state']) for b in got['bots']], [('coderabbit', 'reviewed'), ('greptile', state)],
+                                 'the result concluded long before this read: without a review it is not observed')
 
     def test_copilot_is_harvested_and_read_from_its_review(self):
         answers = self.answers([HEAD])

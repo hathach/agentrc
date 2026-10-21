@@ -949,7 +949,7 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
   assert.deepEqual(result.rollup, {
     cycles: [1], findings: { total: 3, fixed: 1, open: 0, refuted: 1, stale: 1, deferred: 0, held: 0 },
-    ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, rigSide: 0, unclassified: 0 }, ciChecks: { judged: 0, partial: 0, reused: 0, unchanged: 0 },
+    ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, greptileGate: 0, rigSide: 0, unclassified: 0 }, ciChecks: { judged: 0, partial: 0, reused: 0, unchanged: 0 },
     reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
   })
 })
@@ -957,7 +957,7 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
 test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
   const red = redWith(RIG, PVS, UNPLACED).ci
   const first = await run({ args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
-  assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, sonarGate: 0, rigSide: 1, unclassified: 1 })
+  assert.deepEqual(first.result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 1, sonarGate: 0, greptileGate: 0, rigSide: 1, unclassified: 1 })
   const dry = await run({ args: { autoPush: false, maxCycles: 3 }, reviews: { findings: [finding()], replies: [], bots: 'reviewed' } })
   assert.deepEqual(dry.result.rollup.findings, { total: 1, fixed: 0, open: 1, refuted: 0, stale: 0, deferred: 0, held: 0 }, 'a dry run fixes nothing')
   const twice = await run({ args: { autoPush: true, maxCycles: 2 }, reviews: WAITING, ci: redWith(RIG).ci })
@@ -7456,7 +7456,7 @@ test('a SonarCloud gate is never a CI-lane fix: it stops the run on its own reas
   assert.equal(result.reason, 'ci-red-sonar-gate')
   assert.equal(result.cycles, 1, 'another cycle would meet the same gate')
   assert.ok(logs.some(l => /CI red from the SonarCloud gate \(condition failed: new_security_rating 3 > 1\) and 1 rig-side failure\(s\) — its failing condition needs resolving/.test(l)), logs.join('\n'))
-  assert.deepEqual(result.rollup.ci, { total: 2, fixed: 0, open: 0, accepted: 0, sonarGate: 1, rigSide: 1, unclassified: 0 })
+  assert.deepEqual(result.rollup.ci, { total: 2, fixed: 0, open: 0, accepted: 0, sonarGate: 1, greptileGate: 0, rigSide: 1, unclassified: 0 })
   assert.ok(logs.some(l => /\| left red: a SonarCloud gate, not a CI-lane fix +\| - /.test(l)), 'the cycle table names it, with no commit')
   // An Actions job running the scanner is an ordinary CI failure.
   const job = await run({ ci: { status: 'red', infraRerun: [], realFailures: [{ ...gate, check: 'SonarQube (stm32h743eval)', workflow: 'static_analysis' }] }, args: { autoPush: false, maxCycles: 1 } })
@@ -7524,9 +7524,80 @@ test('a gate with no condition read stops without claiming one, and a mixed pair
 test('gate evidence missing or doubled for a requested link re-arms', async () => {
   for (const gates of [(a) => ({ ...a, gates: [] }), (a) => ({ ...a, gates: [a.gates[0], a.gates[0]] })]) {
     const { labels, logs } = await gateRun([GATE], { gates, args: { autoPush: true, maxCycles: 1 } })
-    assert.ok(logs.some(l => /SonarCloud gate evidence came back for .*, asked for \["https:\/\/sonarcloud\.io[^"]*"\] — re-arming/.test(l)), logs.join('\n'))
+    assert.ok(logs.some(l => /cycle 1: gate evidence came back for .*, asked for \["https:\/\/sonarcloud\.io[^"]*"\] — re-arming/.test(l)), logs.join('\n'))
     assert.equal(labels.some(l => l.startsWith('ci:judge')), false)
   }
+})
+
+// Check run 118615785789 on hathach/agentrc PR 165: Greptile's confidence check, which collect.py reads as a gate.
+const GREPTILE_GATE = { check: 'Greptile Review', workflow: '', link: 'https://app.greptile.com/tinyusb/github/hathach/agentrc/-/pull/165',
+  firstError: 'Base review: Confidence 4/5 — below your required 5/5', files: [], verdict: 'real' }
+
+test("Greptile's confidence check is read by collect.py as a gate, never judged or fixed, and stops on its own reason", async () => {
+  const { calls, labels, result, logs } = await gateRun([GREPTILE_GATE])
+  assert.deepEqual(ciLabels(labels), ['ci:collect#1.1', 'ci:collect#1.f'], 'no judge, nothing remembered')
+  assert.match(calls.find(c => c.label === 'ci:collect#1.f').prompt, / failures --gate 'https:\/\/app\.greptile\.com\/[^']*\/pull\/165' --repo /)
+  assert.equal(labels.some(l => l.startsWith('fix:')), false, 'no local diff raises a review score')
+  assert.equal(result.reason, 'ci-red-greptile-gate')
+  assert.equal(result.cycles, 1, 'another cycle would meet the same gate')
+  assert.ok(logs.some(l => /CI red from Greptile's confidence check \(Base review: Confidence 4\/5 — below your required 5\/5\) — its review scored below the repository's threshold, which no CI-lane fix raises: a new score needs a new Greptile review of the head, or the caller accepts the gate by its key/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /Greptile gate CI failure \(not fixing\): Greptile Review/.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /\| left red: a Greptile confidence gate, not a CI-lane fix +\| - /.test(l)), 'the cycle table names it, with no commit')
+  assert.deepEqual(result.rollup.ci, { total: 1, fixed: 0, open: 0, accepted: 0, sonarGate: 0, greptileGate: 1, rigSide: 0, unclassified: 0 })
+  assert.deepEqual(result.observation.ci.realFailures.map(({ check, workflow, job, complete, signature, verdict, state }) => ({ check, workflow, job, complete, signature, verdict, state })),
+    [{ check: 'Greptile Review', workflow: '', job: 'Greptile Review', complete: true, signature: GREPTILE_GATE.firstError, verdict: 'real', state: 'greptileGate' }])
+  // A check the collector could not read as a threshold result is still the gate's: left red, never fixed.
+  const other = await gateRun([{ ...GREPTILE_GATE, gate: { failures: [{ firstError: 'check run 9 completed/failure is not a confidence threshold result', signature: 'x', complete: false }] } }])
+  assert.equal(other.result.reason, 'ci-red-greptile-gate')
+  assert.equal(other.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false)
+  assert.ok(other.logs.some(l => /— it is not a confidence result this reads: inspect the check on GitHub/.test(l)), other.logs.join('\n'))
+  // In the CI lane alone it is never fixed either.
+  const ciOnly = await run({ ci: { status: 'red', infraRerun: [], realFailures: [GREPTILE_GATE] }, args: { lane: 'ci', autoPush: true, yieldAfterCycle: true, maxCycles: 1 } })
+  assert.equal(ciOnly.labels.some(l => l.startsWith('fix:') || l.startsWith('ci:judge')), false, ciOnly.labels.join(', '))
+  // The same name from an Actions job is an ordinary CI failure.
+  const job = await gateRun([{ ...GREPTILE_GATE, workflow: 'review', link: undefined }], { args: { autoPush: false, maxCycles: 1 } })
+  assert.ok(job.labels.includes('ci:judge#1'), 'a job with a workflow is judged')
+})
+
+test('beside a SonarCloud gate the Greptile gate keeps its state, and the SonarCloud stop goes first', async () => {
+  const { result, logs } = await gateRun([GATE, GREPTILE_GATE, { check: 'hil / pico', workflow: 'Build', firstError: 'board did not enumerate', files: [], verdict: 'rig-side' }])
+  assert.equal(result.reason, 'ci-red-sonar-gate')
+  assert.deepEqual(result.observation.ci.realFailures.map(rf => rf.state), ['sonarGate', 'greptileGate', 'rigSide'])
+  assert.deepEqual(result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 0, sonarGate: 1, greptileGate: 1, rigSide: 1, unclassified: 0 })
+  assert.ok(logs.some(l => /SonarCloud gate \(condition failed: new_security_rating 3 > 1\) and 1 Greptile gate failure\(s\) and 1 rig-side failure\(s\) — /.test(l)), logs.join('\n'))
+})
+
+test('a Greptile gate accepted by its key passes with the accepted failure listed', async () => {
+  const key = keyOf({ ...GREPTILE_GATE, signature: GREPTILE_GATE.firstError })
+  const { result } = await gateRun([GREPTILE_GATE], { args: { autoPush: true, maxCycles: 2, acceptedFailures: [{ key, reason: 'score accepted for this PR', scope: 'this head' }] } })
+  assert.equal(result.pass, true, JSON.stringify(result.reason))
+  assert.deepEqual(result.acceptedFailures.map(a => [a.check, a.key, a.reason]), [['Greptile Review', key, 'score accepted for this PR']])
+  assert.deepEqual(result.rollup.ci, { total: 1, fixed: 0, open: 0, accepted: 1, sonarGate: 0, greptileGate: 0, rigSide: 0, unclassified: 0 })
+})
+
+test('a Greptile gate waits while its review is still being read, rather than stopping', async () => {
+  const working = { findings: [], replies: [], bots: [bot('greptile', { state: 'working', sha: null, evidence: ['check run 9 completed/failure'], reason: 'confidence result at t, its review on the head not posted yet' })] }
+  const { result, logs } = await gateRun([GREPTILE_GATE], { reviews: working, args: { autoPush: true, maxCycles: 1, reviewers: ['greptile'], autoRun: ['greptile'] } })
+  assert.notEqual(result.reason, 'ci-red-greptile-gate', logs.join('\n'))
+  assert.equal(logs.some(l => /CI red from Greptile's confidence check/.test(l)), false)
+})
+
+test('a resumed state holding an old verdict for the Greptile link reads the gate afresh and drops that verdict', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const st = first.result.state
+  const [{ head }] = st.ciCache.entries
+  const old = { link: GREPTILE_GATE.link, bucket: 'fail', failures: [{ ...GREPTILE_GATE, job: GREPTILE_GATE.check, cell: null, runId: null, complete: true, signature: 'x', verdict: 'unclassified' }] }
+  store.set(`${head} ${old.link}`, old)
+  const carried = seal({ ...st, ciCache: { ...st.ciCache, entries: [...st.ciCache.entries, { head, link: old.link, bucket: 'fail', digest: 'deadbeef' }] } })
+  const again = await run({ store, args: { ...YIELD, state: carried }, reviews: { findings: [], replies: [], bots: 'reviewed' }, ci: redWith(RIG, GREPTILE_GATE).ci })
+  const asked = again.calls.filter(c => c.label.startsWith('ci:collect#2.r')).map(c => c.prompt).join('\n')
+  assert.doesNotMatch(asked, /greptile/, 'its stored verdict is not recalled')
+  assert.equal(again.labels.some(l => l.startsWith('fix:')), false)
+  assert.match(again.calls.find(c => c.label === 'ci:collect#2.f').prompt, /--gate 'https:\/\/app\.greptile\.com/)
+  assert.deepEqual(again.result.observation.ci.realFailures.map(rf => [rf.check, rf.state]), [['hil / pico', 'rigSide'], ['Greptile Review', 'greptileGate']])
+  assert.equal(again.result.reason, 'ci-red-greptile-gate')
+  assert.equal(again.result.state.ciCache.entries.some(e => e.link === old.link), false, 'the old verdict is not carried on')
 })
 
 test('yieldOnChange keeps a launch going through cycles that only waited, and pauses after one the caller must see', async () => {
