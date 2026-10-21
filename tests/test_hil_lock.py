@@ -1771,6 +1771,246 @@ class ProtectedGroup(LockDir):
         self.assertEqual({b: Path(hil_lock.lock_path(b)).read_bytes() for b in fhs}, before)
 
 
+PENDING_AS = r'''
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location('agentrc_hil_lock', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.BOARD_LOCK_DIR, lock, uid = sys.argv[2], sys.argv[3], int(sys.argv[4])
+os.setgroups([])
+os.setresgid(uid, uid, uid)
+os.setresuid(uid, uid, uid)
+out = {}
+for name, f in (('read', lambda: m.PendingSessions(lock, 'selftest').read()),
+                ('add', lambda: m.PendingSessions(lock, 'selftest').add([{'receipt': 'theirs'}])),
+                ('clear', lambda: m.PendingSessions(lock, 'selftest').clear(lambda e: True)),
+                ('own', lambda: m.PendingSessions(lock + '-theirs', 'selftest').add([{'receipt': 'theirs'}]))):
+    try:
+        out[name] = ['ok', f()]
+    except Exception as e:
+        out[name] = [type(e).__name__, str(e)]
+print(json.dumps(out))
+'''
+
+
+class Pending(LockDir):
+    """PendingSessions: a board's pending-session record beside its lock, read, extended and
+    cleared under its own mutex, replaced atomically; it reads TinyUF2's existing marks
+    (<lock>.tinyuf2-openocd-pending.json) unchanged. Whether a session ended stays the caller's."""
+
+    KIND = 'tinyuf2-openocd'
+
+    def setUp(self):
+        super().setUp()
+        self.mark = hil_lock.PendingSessions(BOARD, self.KIND)
+
+    def file(self, suffix=''):
+        return Path(self.dir, f'{BOARD}.{self.KIND}-pending.json{suffix}')
+
+    @staticmethod
+    def sessions(*names):
+        return [{'cmd': 'openocd', 'receipt': f'/run/{n}/receipt.json', 'pid': 1, 'start': 2} for n in names]
+
+    def test_reads_and_writes_tinyuf2_marks_unchanged(self):
+        old, new = self.sessions('a'), self.sessions('b')
+        with open(self.file('.mutex'), 'w'):            # TinyUF2 made the mutex first
+            pass
+        self.file().write_text(json.dumps({'sessions': old}, indent=1))     # its write_mark
+        logged = {'mark': str(self.file()), 'sessions': old, 'notEnded': [], 'note': 'n', 'hold': {}, 'at': 'x'}
+        self.file('.cleared.jsonl').write_text(json.dumps(logged) + '\nnot json\n')
+        self.assertEqual((os.fspath(self.mark), str(self.mark)), (str(self.file()), str(self.file())))
+        self.assertEqual(self.mark.read(), old)
+        self.assertEqual(self.mark.cleared(), [logged])
+        self.assertEqual(self.mark.add(new + old), old + new)
+        self.assertEqual(self.file().read_text(), json.dumps({'sessions': old + new}, indent=1))
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted(p.name for p in (
+            self.file(), self.file('.mutex'), self.file('.cleared.jsonl'))))
+        for name in (f'{BOARD}.lock', f'{BOARD}.takeover'):
+            self.assertNotIn(name, os.listdir(self.dir))
+        self.assertEqual((hil_lock.lock_names(), hil_lock.journal_names()), ([], []))
+
+    def test_modes_ignore_the_umask(self):
+        old = os.umask(0o077)
+        self.addCleanup(os.umask, old)
+        self.mark.add(self.sessions('a'))
+        self.mark.clear(lambda e: False, note='reviewed')
+        self.mark.add(self.sessions('b'))
+        modes = {p.name: stat.S_IMODE(p.stat().st_mode) for p in Path(self.dir).iterdir()}
+        self.assertEqual(modes, {self.file().name: 0o644, self.file('.mutex').name: 0o666,
+                                 self.file('.cleared.jsonl').name: 0o666})
+
+    def test_an_unreadable_record_is_kept_and_refuses_until_a_reviewed_clear(self):
+        for data in (b'{', b'[]', b'{"sessions": "x"}', b'{"sessions": [1]}', b'{"sessions": [{"pid": 1}]}',
+                     b'\xff'):
+            with self.subTest(data=data):
+                self.file().write_bytes(data)
+                self.assertIsNone(self.mark.read())
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'unreadable: kept'):
+                    self.mark.add(self.sessions('a'))
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'unreadable: a session may still be pending'):
+                    self.mark.clear(lambda e: True)
+                self.assertEqual(self.file().read_bytes(), data)
+                cleared = self.mark.clear(lambda e: True, note='reviewed', hold={'pid': 7})
+                self.assertFalse(self.file().exists())
+                self.assertEqual((cleared['sessions'], cleared['unreadable'], cleared['hold']),
+                                 (None, data.decode(errors='replace'), {'pid': 7}))
+                self.assertEqual(self.mark.cleared()[-1]['unreadable'], data.decode(errors='replace'))
+
+    def test_a_clear_is_refused_while_a_session_is_not_ended(self):
+        a, b = self.sessions('a', 'b')
+        self.mark.add([a, b])
+        before = self.file().read_bytes()
+
+        def only_a(e):
+            if e is not a and e['receipt'] == b['receipt']:
+                raise RuntimeError('receipt unreadable')
+            return e['receipt'] == a['receipt']
+        for ended in (only_a, lambda e: 'yes'):
+            with self.subTest(ended=ended):
+                with self.assertRaisesRegex(hil_lock.PendingRefused, 'not ended'):
+                    self.mark.clear(ended)
+                self.assertEqual(self.file().read_bytes(), before)
+        self.assertFalse(self.file('.cleared.jsonl').exists())
+        self.assertEqual(self.mark.clear(lambda e: True), {'mark': str(self.file()), 'sessions': [a, b],
+                                                           'notEnded': []})
+        self.assertFalse(self.file().exists())
+        self.assertEqual(self.mark.clear(lambda e: False), {'mark': str(self.file()), 'sessions': [],
+                                                            'notEnded': []})
+        self.mark.add([a, b])
+        cleared = self.mark.clear(only_a, note='ended by hand', hold={'pid': 7})
+        self.assertEqual((cleared['notEnded'], cleared['note']), ([b['receipt']], 'ended by hand'))
+        logged = self.mark.cleared()
+        self.assertEqual(len(logged), 1)
+        self.assertEqual({k: v for k, v in logged[0].items() if k != 'at'}, cleared)
+        self.assertFalse(self.file().exists())
+
+    def test_a_malformed_session_is_refused_before_anything_is_touched(self):
+        for sessions in ([{'pid': 1}], [{'receipt': 3}], ['x']):
+            with self.subTest(sessions=sessions), self.assertRaises(ValueError):
+                self.mark.add(sessions)
+        self.assertEqual(os.listdir(self.dir), [])
+        with self.assertRaises(OSError):
+            hil_lock.PendingSessions('../x', self.KIND)
+
+    def test_concurrent_updates_lose_nothing(self):
+        def writer(n):
+            def body():
+                for i in range(10):
+                    self.mark.add(self.sessions(f'{n}-{i}'))
+            return body
+        pids = []
+        for n in range(8):
+            pid = os.fork()
+            if pid == 0:
+                code = 1
+                try:
+                    writer(n)()
+                    code = 0
+                finally:
+                    os._exit(code)
+            pids.append(pid)
+        self.assertEqual([os.waitstatus_to_exitcode(os.waitpid(p, 0)[1]) for p in pids], [0] * 8)
+        got = [e['receipt'] for e in self.mark.read()]
+        self.assertEqual(sorted(got), sorted(f'/run/{n}-{i}/receipt.json' for n in range(8) for i in range(10)))
+        self.assertEqual([f for f in os.listdir(self.dir) if f.startswith('.')], [])
+
+    def interrupted(self, action):
+        """For each k, a child running action() killed right before its k-th call that can persist
+        or remove anything; yields after each, until one completes."""
+        names = ('open', 'fchmod', 'pwrite', 'write', 'fsync', 'close', 'rename', 'unlink')
+        for k in range(1, 60):
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    calls = []
+
+                    def counted(real):
+                        def call(*a, **kw):
+                            calls.append(1)
+                            if len(calls) == k:
+                                os._exit(9)
+                            return real(*a, **kw)
+                        return call
+                    for name in names:
+                        setattr(os, name, counted(getattr(os, name)))
+                    action()
+                    os._exit(0)
+                finally:
+                    os._exit(1)
+            code = os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1])
+            self.assertIn(code, (0, 9))
+            yield code
+            if code == 0:
+                return
+        self.fail('never completed')
+
+    def reset(self, *sessions):
+        for f in os.listdir(self.dir):
+            os.unlink(os.path.join(self.dir, f))
+        self.mark.add(sessions)
+
+    def test_an_interrupted_add_leaves_the_old_record_or_the_new_one(self):
+        a, b = self.sessions('a', 'b')
+        seen = set()
+        self.reset(a)
+        for code in self.interrupted(lambda: self.mark.add([b])):
+            got = self.mark.read()
+            self.assertIn(got, ([a], [a, b]))
+            seen.add(len(got))
+            self.assertEqual(self.mark.add([b]), [a, b])     # the next writer is never stuck
+            self.reset(a)
+        self.assertEqual(seen, {1, 2})
+
+    def test_an_interrupted_reviewed_clear_never_removes_the_record_before_its_note_is_logged(self):
+        a = self.sessions('a')[0]
+        seen = set()
+        self.reset(a)
+        for code in self.interrupted(lambda: self.mark.clear(lambda e: False, note='reviewed')):
+            logged = [e for e in self.mark.cleared() if e.get('note') == 'reviewed']
+            present = self.file().exists()
+            self.assertTrue(present or logged, 'removed without its note')
+            seen.add((present, bool(logged)))
+            if present:
+                self.assertEqual(self.mark.read(), [a])
+            self.reset(a)
+        self.assertIn((True, False), seen)
+        self.assertIn((False, True), seen)
+
+    def test_another_os_user_reads_the_record_and_can_neither_replace_nor_remove_it(self):
+        if os.geteuid() == 0:
+            argv = [sys.executable]
+        elif shutil.which('sudo') and subprocess.run(['sudo', '-n', 'true'], capture_output=True).returncode == 0:
+            argv = ['sudo', '-n', sys.executable]
+        else:
+            self.skipTest('needs root, or sudo -n, to act as another OS user')
+        shared = tempfile.mkdtemp(prefix='hil-lock-pending-', dir='/tmp')
+        root = argv[:-1]                    # [] as root, else sudo -n
+        self.addCleanup(subprocess.run, [*root, 'rm', '-rf', shared])
+        os.chmod(shared, 0o1777)
+        subprocess.run([*root, 'chown', '0:0', shared], check=True)    # as the host step makes it: root's
+        self.patch(hil_lock, 'BOARD_LOCK_DIR', shared)
+        ours = hil_lock.PendingSessions(BOARD, 'selftest')
+        ours.add([{'receipt': 'ours'}])
+        before = Path(ours.path).read_bytes()
+        r = subprocess.run([*argv, '-I', '-c', PENDING_AS, str(SCRIPT), shared, BOARD, '65534'],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = json.loads(r.stdout)
+        self.assertEqual(out['read'], ['ok', [{'receipt': 'ours'}]])
+        self.assertEqual((out['add'][0], out['clear'][0]), ('PermissionError', 'PermissionError'))
+        self.assertEqual(out['own'], ['ok', [{'receipt': 'theirs'}]])
+        self.assertEqual(Path(ours.path).read_bytes(), before)
+        theirs = hil_lock.PendingSessions(BOARD + '-theirs', 'selftest')
+        self.assertEqual(theirs.read(), [{'receipt': 'theirs'}])
+        if os.geteuid() != 0:
+            with self.assertRaises(PermissionError):
+                theirs.add([{'receipt': 'ours'}])
+            with self.assertRaises(PermissionError):
+                theirs.clear(lambda e: True)
+            self.assertEqual(theirs.read(), [{'receipt': 'theirs'}])
+        self.assertEqual([f for f in os.listdir(shared) if f.startswith('.')], [])
+
+
 class RechecksAs(LockDir):
     """_rechecks_as's child, here under our own ids: signalled and reaped only through its pidfd,
     its fds never leaked, and the whole recheck bounded by RELEASE_WAIT."""

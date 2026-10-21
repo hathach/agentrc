@@ -4,6 +4,7 @@ flocks in BOARD_LOCK_DIR and their holder records (`hil` skill, Board locks), wi
 hold/release/status CLI. A project's HIL contract wraps it for its roster and lock names.
 """
 import argparse
+import contextlib
 import errno
 import fcntl
 import importlib.util
@@ -149,6 +150,28 @@ def _read_file(board, suffix):
         return f.read()
 
 
+def _replace_file(dfd, name, data: bytes) -> None:
+    """Replace `name` in the lock dir `dfd` with `data`, atomically and durably: a crash leaves
+    the old file or the new one, and the rename itself is fsynced through the dir. 0644 whatever
+    the umask, so another OS user reads it; in a sticky dir only its owner or root replaces it.
+    A failed replace removes its temp file; one a crash leaves is hidden and never read."""
+    tmp = f'.{name}.{os.getpid()}.{secrets.token_hex(4)}'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
+    try:
+        try:
+            os.fchmod(fd, 0o644)
+            _pwrite_all(fd, data, 0)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp, dir_fd=dfd)
+        raise
+    os.fsync(dfd)
+
+
 def _parse(data):
     """'absent', 'empty', 'unreadable' or 'record', with the record's dict."""
     if data is None:
@@ -208,8 +231,17 @@ def _pwrite_all(fd, data, offset) -> None:
     while data:
         n = os.pwrite(fd, data, offset)
         if n <= 0:
-            raise OSError(errno.EIO, f'holder record write made no progress at offset {offset}')
+            raise OSError(errno.EIO, f'write made no progress at offset {offset}')
         data, offset = data[n:], offset + n
+
+
+def _write_all(fd, data) -> None:
+    """os.write until every byte is written, for an O_APPEND fd; no progress raises."""
+    while data:
+        n = os.write(fd, data)
+        if n <= 0:
+            raise OSError(errno.EIO, 'write made no progress')
+        data = data[n:]
 
 
 def write_record(fh, reason: str, **extra) -> None:
@@ -790,19 +822,7 @@ def _lock_set(board) -> list:
 
 def _write_journal(dfd, board, content) -> None:
     """Replace <board>.takeover durably: a crash leaves the old journal or the new one."""
-    tmp = f'.{board}{JOURNAL}.{os.getpid()}.{secrets.token_hex(4)}'
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644, dir_fd=dfd)
-    try:
-        os.fchmod(fd, 0o644)                # umask-proof: another OS user's takeover reads it
-    except OSError:
-        os.close(fd)
-        raise
-    with os.fdopen(fd, 'wb') as f:          # a buffered write is all or an exception
-        f.write(json.dumps(content).encode())
-        f.flush()
-        os.fsync(f.fileno())
-    os.rename(tmp, board + JOURNAL, src_dir_fd=dfd, dst_dir_fd=dfd)
-    os.fsync(dfd)
+    _replace_file(dfd, board + JOURNAL, json.dumps(content).encode())
 
 
 def _foreign_journals(boards) -> str:
@@ -1084,6 +1104,154 @@ def _handed_holder(job: dict) -> int:
     for fh in handles:
         release_board_lock(fh)
     return 0
+
+
+# --- pending sessions -----------------------------------------------------------------------
+PENDING = '-pending.json'           # <lock>.<kind>-pending.json, beside the board's lock file
+PENDING_MUTEX = '.mutex'            # <record>.mutex: never replaced or removed; not '.lock', a board's suffix
+PENDING_CLEARED = '.cleared.jsonl'  # <record>.cleared.jsonl: every clear made after a reviewed recovery
+
+
+class PendingRefused(RuntimeError):
+    """A pending-session record was kept as it is: it cannot be read, or lists a session its
+    consumer has not proven ended."""
+
+
+def _sessions_ok(sessions) -> bool:
+    return isinstance(sessions, list) and all(isinstance(e, dict) and isinstance(e.get('receipt'), (str, dict))
+                                              for e in sessions)
+
+
+class PendingSessions(os.PathLike):
+    """A board's pending-session record, <lock>.<kind>-pending.json in BOARD_LOCK_DIR: the
+    sessions a consumer (`kind`, e.g. `tinyuf2-openocd`) left on the board without proving them
+    ended, so a later invocation, whatever its run dir or project, refuses until they are.
+    `{"sessions": [...]}`, each session a dict whose `receipt` (a path or a record) identifies
+    it; what a receipt means, when its session counts as ended and what a refusal does stay the
+    consumer's. Every read, write and removal holds an flock on <record>.mutex (0666, never
+    removed), so the board lock need not be held; the record is replaced atomically and fsynced
+    with its dir (_replace_file), 0644. A record that cannot be parsed, or lists a malformed
+    session, is unreadable: kept as it is, and it refuses."""
+
+    def __init__(self, lock, kind):
+        _check_name(lock)
+        _check_name(kind)
+        self.lock, self.suffix = lock, f'.{kind}{PENDING}'
+        self.name = lock + self.suffix
+
+    @property
+    def path(self) -> str:
+        return os.path.join(BOARD_LOCK_DIR, self.name)
+
+    def __fspath__(self):
+        return self.path
+
+    def __str__(self):
+        return self.path
+
+    @contextlib.contextmanager
+    def _locked(self):
+        """The mutex held; yields the lock dir's fd, created on first use."""
+        dfd = _open_dir(create=True)
+        try:
+            fd = _open_file(dfd, self.name + PENDING_MUTEX, os.O_RDWR, create=True)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield dfd
+            finally:
+                os.close(fd)
+        finally:
+            os.close(dfd)
+
+    def _read(self):
+        try:
+            data = _read_file(self.lock, self.suffix)
+            rec = data is not None and json.loads(data)
+        except (OSError, ValueError):
+            return None
+        if data is None:
+            return []
+        sessions = rec.get('sessions') if isinstance(rec, dict) else None
+        return sessions if _sessions_ok(sessions) else None
+
+    def read(self):
+        """The sessions it lists, [] without a record; None when it is unreadable."""
+        with self._locked():
+            return self._read()
+
+    def add(self, sessions) -> list:
+        """List `sessions` too, each one whose receipt no listed session has, and return what the
+        record lists. ValueError for a malformed session and PendingRefused for an unreadable
+        record, both before anything is written; OSError when the record cannot be replaced (in
+        a sticky dir, another OS user's), the previous one kept."""
+        sessions = list(sessions)
+        if not _sessions_ok(sessions):
+            raise ValueError(f'a pending session is a dict with a receipt: {sessions!r:.200}')
+        with self._locked() as dfd:
+            merged = self._read()
+            if merged is None:
+                raise PendingRefused(f'{self.path} is unreadable: kept as it is')
+            listed = len(merged)
+            for e in sessions:
+                if all(e['receipt'] != m['receipt'] for m in merged):
+                    merged.append(e)
+            if len(merged) > listed:
+                _replace_file(dfd, self.name, json.dumps({'sessions': merged}, indent=1).encode())
+            return merged
+
+    def clear(self, ended, note=None, **evidence) -> dict:
+        """Remove the record once `ended(session)`, the consumer's reading of its receipt, is
+        True for every session it lists (one that raises is not ended); or, given the `note` of a
+        separately reviewed recovery, whatever it holds, once the note, `evidence` (e.g. the
+        hold that proved it) and the record's sessions, or an unreadable record's text, are
+        appended to <record>.cleared.jsonl and fsynced. PendingRefused otherwise, naming the
+        receipts, the record kept; OSError when it cannot be logged or removed (in a sticky dir,
+        another OS user's), the record kept. Returns {mark, sessions, notEnded} plus what was
+        logged."""
+        with self._locked() as dfd:
+            sessions = self._read()
+            if sessions is None and note is None:
+                raise PendingRefused(f'{self.path} is unreadable: a session may still be pending; it is cleared only '
+                                     f'with the note of a separately reviewed recovery')
+            left = [e['receipt'] for e in sessions or [] if not _ended(ended, e)]
+            if left and note is None:
+                raise PendingRefused(f'{self.path}: sessions {left} are not ended')
+            cleared = {'mark': self.path, 'sessions': sessions, 'notEnded': left}
+            if note is not None:
+                cleared.update(note=note, **evidence)
+                raw = _read_file(self.lock, self.suffix) if sessions is None else None
+                if raw:
+                    cleared['unreadable'] = raw.decode(errors='replace')
+                line = json.dumps(dict(cleared, at=time.strftime('%Y-%m-%dT%H:%M:%S%z'))) + '\n'
+                fd = _open_file(dfd, self.name + PENDING_CLEARED, os.O_WRONLY | os.O_APPEND, create=True)
+                try:
+                    _write_all(fd, line.encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.name, dir_fd=dfd)     # a removal a crash loses only refuses again
+            return cleared
+
+    def cleared(self) -> list:
+        """Every entry <record>.cleared.jsonl holds, oldest first; a line that is not a JSON
+        object is skipped."""
+        with self._locked():
+            data = _read_file(self.lock, self.suffix + PENDING_CLEARED) or b''
+        found = []
+        for line in data.splitlines():
+            with contextlib.suppress(ValueError):
+                entry = json.loads(line)
+                if isinstance(entry, dict):
+                    found.append(entry)
+        return found
+
+
+def _ended(ended, session) -> bool:
+    try:
+        return ended(session) is True
+    except Exception:
+        return False
 
 
 # --- operator CLI (hold/release/status) ------------------------------------

@@ -89,6 +89,20 @@ nothing in it through a link.
   carries none and is
   taken like any other: protection across projects holds once every project
   on the host runs this helper.
+- A session a consumer cannot prove ended outlives its run in the board's
+  pending-session record, `hil_lock.PendingSessions(<lock>, <kind>)`
+  (`<lock>.<kind>-pending.json` in the lock dir), so every later invocation,
+  whatever its run dir or project, refuses while it lists one. `add` lists
+  sessions, each a dict with a `receipt`; `read` is `None` when the record is
+  unreadable, which is kept and refuses; `clear(ended)` removes it only once
+  the consumer's `ended` holds for every session, otherwise refusing with
+  their receipts, and `clear(ended, note=..., **evidence)`, after a separately
+  reviewed recovery, removes it whatever it holds, once the note, the evidence
+  and its content are appended to `<record>.cleared.jsonl` (`cleared()`).
+  Each holds `<record>.mutex`, never the board's flock; the record is replaced
+  atomically and fsynced with the dir. Another OS user reads it but, in the
+  sticky dir, can neither replace nor remove it. What a receipt means and how
+  its session is recovered stay the consumer's.
 - A rig-wide operation, one that can reset or renumber a board you do not
   hold (a hub's power, a root-port cycle, a controller rebind), holds every
   board on the host first, across every project's roster there; a contract's
