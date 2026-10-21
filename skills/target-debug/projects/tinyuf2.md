@@ -73,3 +73,9 @@ it in the checkout in front of you.**
   covers the S31. The second-stage bootloader drives the NeoPixel through dedicated GPIO channel 0 with
   `NEOPIXEL_T0H_NS=250` (`bootloader_start.c:322-329`). source-checked at ba97530, 2026-10-16; none of it exercised on
   hardware in this skill's sessions.
+- S31 commissioning, htpc 2026-10-21, tinyuf2 2346572, esptool 5.3.1 (5.2.0 cannot reach its flash over the USJ):
+  chip revision v0.0, uid 30EDA0F40A94, 16 MB flash (0x46/0x4018). `get-security-info` (stub and `--no-stub` ROM) and
+  `espefuse summary` read secure boot, flash encryption and secure download off; those field meanings rest on esptool
+  5.3.1's espefuse map only, as the TRM's eFuse chapter (book 6558 v0.1) is still to be added. 5.3.1's RTS hard reset
+  brings TinyUF2 up, not the ROM loader. `--try-reentry` decided `dfu-detach`; 10 DFU_DETACH cycles under a hold showed
+  disconnect and re-enumeration only, no USB reset on DETACH. verified 2026-10-21 htpc: run-20261021-234618-912997.
