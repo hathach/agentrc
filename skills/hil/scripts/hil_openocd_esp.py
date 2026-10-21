@@ -790,7 +790,7 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
             out = None
         if op.returncode != 0 or not isinstance(out, dict) or out.get('ok') is not True:
             raise RuntimeError(f'esptool_session on {tty} (rc {op.returncode}): '
-                               f'{(out or {}).get("error") if isinstance(out, dict) else "no result line"}')
+                               f'{out.get("error") if isinstance(out, dict) else "no result line"}')
         results = out.get('results')
         if not isinstance(results, list) or not results:
             raise RuntimeError(f'esptool_session on {tty}: results {results!r}, want the security op\'s')
