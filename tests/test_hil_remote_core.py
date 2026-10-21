@@ -1757,7 +1757,7 @@ class Attempts(Rig):
         self.assertEqual((col['state'], col['unaccepted']), ('complete', []))
         self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
 
-    def test_a_set_aside_collection_that_cannot_be_removed_waits_for_the_next_collector(self):
+    def test_a_replaced_collection_that_cannot_be_removed_waits_for_the_next_collector(self):
         tree = self.done_attempt()
         dest = self.tmp / 'got'
         rc_.collect(tree, dest, optional=['out/'])
@@ -1765,15 +1765,38 @@ class Attempts(Rig):
         real = rc_._remove
 
         def remove(p):
-            if Path(p).name == '.got.old':
+            if Path(p).name.startswith('.got.drop-'):
                 raise PermissionError(13, 'Permission denied')
             return real(p)
         with mock.patch.object(rc_, '_remove', remove):
             col = rc_.collect(tree, dest, optional=['out/'], accept=self.late)
             self.assertEqual((col['state'], (dest / 'out/late.json').read_text()), ('complete', 'late'))
             self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
-        self.assertTrue((self.tmp / '.got.old').exists())
+        self.assertEqual([p.name[:10] for p in self.tmp.glob('.got.[!c]*')], ['.got.drop-'])
         self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
+
+    def test_a_partly_removed_collection_is_never_restored(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        rc_.collect(tree, dest, optional=['out/'])
+        (self.base / 'a1/out/late.json').write_text('late')
+        real = rc_._remove
+        partly = []
+
+        def remove(p):
+            if Path(p).name == '.got.old' or Path(p).name.startswith('.got.drop-'):
+                (Path(p) / 'out/report.json').unlink()
+                partly.append(p)
+                raise OSError(5, 'Input/output error')
+            return real(p)
+        with mock.patch.object(rc_, '_remove', remove):
+            rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual(len(partly), 1)
+        shutil.rmtree(dest)
+        (self.base / 'a1/out/report.json').write_text('fetched again')
+        col = rc_.collect(tree, dest, optional=['out/'])
+        self.assertEqual((col['state'], (dest / 'out/report.json').read_text()), ('complete', 'fetched again'))
         self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
 
     def test_running_partial_then_dead_never_complete_nor_relaunched(self):

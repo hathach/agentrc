@@ -30,6 +30,7 @@ import argparse
 import contextlib
 import errno
 import functools
+import glob
 import hashlib
 import json
 import os
@@ -1156,17 +1157,22 @@ def _settle(dest):
     """Finish a publication a collector was interrupted in: with dest gone its previous collection
     goes back, else dest is the replacement and the one set aside goes."""
     old = _aside(dest)
+    if (old.exists() or old.is_symlink()) and not (dest.exists() or dest.is_symlink()):
+        old.rename(dest)
+    _drop(dest)
+
+
+def _drop(dest):
+    """Remove the collection dest has replaced, renamed first to a name _settle never restores, so
+    a removal that fails part-way leaves debris rather than a collection; debris that resists
+    waits for the next _settle."""
+    old = _aside(dest)
     if old.exists() or old.is_symlink():
-        if dest.exists() or dest.is_symlink():
-            _drop(old)
-        else:
-            old.rename(dest)
-
-
-def _drop(old):
-    """Remove a set-aside collection dest has replaced; one that resists waits for the next _settle."""
-    with contextlib.suppress(OSError):
-        _remove(old)
+        with contextlib.suppress(OSError):
+            old.rename(dest.with_name(f'.{dest.name}.drop-{secrets.token_hex(8)}'))
+    for debris in dest.parent.glob(f'.{glob.escape(dest.name)}.drop-*'):
+        with contextlib.suppress(OSError):
+            _remove(debris)
 
 
 def _publish(tmp, dest):
@@ -1183,7 +1189,7 @@ def _publish(tmp, dest):
             old.rename(dest)
         raise
     if aside:
-        _drop(old)
+        _drop(dest)
 
 
 def _uncovered(held, groups, optional):
