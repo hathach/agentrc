@@ -13,7 +13,9 @@ an erroring hook pass, and any error denies.
 
 The boundary is deny what it cannot interpret, within the command families it knows (git, gh, shells,
 wrappers, xargs and find -exec, writers and linkers): it follows a few plain forms of those and refuses
-the rest rather than grow general parsing. A program outside them passes with its arguments.
+the rest rather than grow general parsing. It is mistake-only, not an allowlist: a program outside them passes
+with its arguments by design, even one that runs them as a command (setsid, ssh, awk, ...), and such a program
+is not a defect to patch one by one.
 
 The cost is what chief can no longer run directly: piping commands into a shell, shell or wrapper options
 outside the small tables, git or a writer fed by xargs or find -exec, globs in a write target even
@@ -120,6 +122,9 @@ RUN_ENV = {'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SS
            'EDITOR', 'VISUAL', 'GIT_SEQUENCE_EDITOR', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'BASHOPTS', 'TAR_OPTIONS'}
 # GIT_TRACE* values git reads as off or stderr; any other is an fd, an absolute path or a socket it appends trace to
 GIT_TRACE_QUIET = {'', '0', 'false', '1', '2', 'true'}
+# git's trace destinations: GIT_TRACE, each GIT_TRACE_* key but two booleans, and the three Trace2 targets; the other
+# GIT_TRACE2_* are settings (trace2/tr2_sysenv.c)
+GIT_TRACE_TARGET = re.compile(r'GIT_TRACE(2(_EVENT|_PERF)?|_(?!(REDACT|CURL_NO_DATA)$).*)?', re.S)
 # builtins whose assignment operands set the environment a later command inherits
 DECLARES = {'export', 'declare', 'typeset', 'readonly', 'local'}
 SHELLS = {'sh', 'bash', 'zsh', 'dash'}
@@ -162,6 +167,8 @@ PUNCTUATION = ';&|<>()'
 # unquoted, these expand a write target to several paths or none; a quoted one is a literal path character
 GLOB = '{}*?['
 GLOBSET = set(GLOB)
+# an unquoted brace list or sequence in any word; a bare `{}` (xargs -I, find -exec) is no expansion
+BRACES = re.compile(r'\{.*(,|\.\.).*\}', re.S)
 # a quoted or escaped operator or glob character stays a word character: these stand in for it until a path is judged
 SPECIAL = PUNCTUATION + GLOB
 QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
@@ -682,10 +689,12 @@ def unwrap(words):
                 raise Denied(STDIN_RULE)
             if name == 'timeout' and words:
                 words = words[1:]  # the duration
-            # bash splits an expansion into words, so one option value or assignment may hold the program
-            if any('$' in w or UNKNOWN in w for w in given[:len(given) - len(words)]):
+            # bash splits an expansion into words, and expands a glob or brace into several, so one option value or
+            # assignment may hold the program
+            if any('$' in w or UNKNOWN in w or (GLOBSET - set('{}')) & set(w) or BRACES.search(w)
+                   for w in given[:len(given) - len(words)]):
                 raise Denied(f'`{name}` takes a word expanded at run time, which may split into more words and hide the '
-                             'program; give its options and assignments literally')
+                             'program; give its options and assignments literally, a glob or brace quoted')
         else:
             break
     return words, xargs, replace, name == 'xargs'
@@ -739,17 +748,18 @@ def strip_wrapper_options(name, words):
 
 def forbidden_env(word, bash=True):
     """An env assignment a tool runs as a command: a pager other than cat, or a variable git executes from; or a
-    GIT_TRACE* naming where git writes trace output. Only bash reads `NAME+=value` as an append; env sets a variable
-    named `NAME+`."""
+    trace destination naming where git writes trace output. Only bash reads `NAME+=value` as an append; env sets a
+    variable named `NAME+`. On Windows git reads the environment without case."""
     name, _, value = word.partition('=')
     append = bash and name.endswith('+')
     name = name.removesuffix('+') if append else name
+    key = name.upper() if os.name == 'nt' else name
     # an append extends a value this guard cannot see
-    if name in PAGER_ENV and (append or value.translate(UNQUOTED) not in ('cat', '')):
+    if key in PAGER_ENV and (append or value.translate(UNQUOTED) not in ('cat', '')):
         raise Denied(f'`{word.translate(UNQUOTED)}` runs a command as the pager; only `{name}=cat` passes')
-    if name in RUN_ENV or name.startswith('GIT_CONFIG'):
+    if key in RUN_ENV or key.startswith('GIT_CONFIG'):
         raise Denied(f'`{name}` makes a tool run a command this guard cannot vet; dispatch the step to a unit')
-    if name.startswith('GIT_TRACE') and (append or value.translate(UNQUOTED).lower() not in GIT_TRACE_QUIET):
+    if GIT_TRACE_TARGET.fullmatch(key) and (append or value.translate(UNQUOTED).lower() not in GIT_TRACE_QUIET):
         raise Denied(f'`{word.translate(UNQUOTED)}` makes git write trace output to a file this guard cannot vet; only '
                      f'`{name}=1` (stderr) or `{name}=0` passes')
 

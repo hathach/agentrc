@@ -319,6 +319,34 @@ class ChiefGuard(unittest.TestCase):
         for c in ('git -c core.pager=cat diff', 'git -c color.ui=never log', 'git -c core.quotepath=off status',
                   'git -ccolor.ui=always log', 'git -c core.quotepath=false -c color.ui=auto status'):
             self.assert_allowed(c)
+        # only a destination is denied: the other GIT_TRACE2_* are settings (git's trace2/tr2_sysenv.c), and GIT_TRACE_REDACT
+        # and GIT_TRACE_CURL_NO_DATA booleans; GIT_TRACE_BARE is a trace key git opens like any other
+        for c in ('GIT_TRACE2_EVENT=1 GIT_TRACE2_EVENT_NESTING=10 git status --porcelain', 'GIT_TRACE2_EVENT_NESTING=10 git status',
+                  'GIT_TRACE2_CONFIG_PARAMS=core.bare git status', 'GIT_TRACE2_ENV_VARS=LANG git status',
+                  'GIT_TRACE2_MAX_FILES=5 git status', 'GIT_TRACE2_PERF_BRIEF=yes git status', 'GIT_TRACE2_DST_DEBUG=yes git log',
+                  'export GIT_TRACE2_ENV_VARS=LANG,HOME', 'env GIT_TRACE2_BRIEF=yes git log', 'GIT_TRACE_REDACT=no git fetch',
+                  'GIT_TRACE_CURL_NO_DATA=yes git fetch'):
+            self.assert_allowed(c)
+        for c in ('GIT_TRACE2_PERF=/tmp/p git status', 'GIT_TRACE_BARE=/tmp/b git status', 'GIT_TRACE_CURL=/tmp/c git fetch'):
+            self.assert_denied(c, 'trace output')
+        code, err = self.check('GIT_TRACE2_EVENT_NESTING=10 GIT_TRACE2_EVENT=/tmp/e git status')
+        self.assertEqual(code, 2)
+        self.assertIn('`GIT_TRACE2_EVENT=/tmp/e`', err)
+        self.assertNotIn('NESTING', err)
+
+    def test_windows_reads_env_names_without_case(self):
+        # Git for Windows reads its environment through GetEnvironmentVariableW, which ignores case
+        cases = (('git_trace=C:/repo/src/a.c git status', 'trace output'), ('env Git_Trace2_Event=C:/repo/x git status', 'trace output'),
+                 ('export git_trace=C:/repo/x; git status', 'trace output'),
+                 ('declare -x git_trace2_perf=C:/repo/x; git status', 'trace output'), ('git_pager=less git log', 'pager'),
+                 ('Git_Ssh_Command=x git fetch', 'cannot vet'), ('git_config_parameters=x git status', 'cannot vet'))
+        with mock.patch.object(self.guard.os, 'name', 'nt'):
+            for c, why in cases:
+                self.assert_denied(c, why)
+            self.assert_allowed('git_trace2_event_nesting=10 git status')
+        if os.name != 'nt':   # elsewhere git reads the name as written
+            for c, _ in cases:
+                self.assert_allowed(c)
 
     def test_env_assignments_that_run_a_command_are_denied(self):
         for c in ('GIT_SSH_COMMAND="ssh -i k" git fetch', 'GIT_PAGER=less git log', 'PAGER=more git log',
@@ -370,6 +398,22 @@ class ChiefGuard(unittest.TestCase):
             self.assert_denied(c, 'expanded at run time')
         # bash does not split an assignment's value, and the program's own arguments are its own
         for c in ('GIT_DIR=$HOME/r git log', 'timeout 5 echo $X', 'env -u FOO cat "$F"', 'nice -n 5 git log -- $P'):
+            self.assert_allowed(c)
+
+    def test_a_wrapper_word_bash_expands_into_more_words_is_denied(self):
+        # an unquoted brace or glob in a word a wrapper strips becomes words bash hands it: the program among them
+        for c in ('timeout {5,git,push}', f'env -u {{A,rm,{self.wt}/src/a.c}} true', f'nice -n {{5,rm,{self.wt}/src/a.c}}',
+                  f'cd {self.wt} && timeout * true', 'timeout {5,{git,push}}', 'env -u{A,B} git log', 'env A={x,y} git log',
+                  'sudo -u {a,b} git log', 'timeout -s {KILL,TERM} 5 git log', 'timeout --kill-after={1..3} 5 git log',
+                  'nice -n [5] git log', 'timeout 5? git log', 'xargs -n {1,2} cat',
+                  # behind another wrapper
+                  'nice -n 5 timeout {5,git,push}', 'env -i nice -n {1..3} git log',
+                  r"find /tmp -exec env nice -n {5,git,push} \;"):
+            self.assert_denied(c, 'expanded at run time')
+        # a quoted brace or glob is literal, a bare `{}` is no expansion, and the program's own arguments are its own
+        for c in ("timeout '{5,git,push}' true", "env -u 'A*' git log", 'env -u "{A,B}" git log', 'nice -n \\{5,git\\} true',
+                  'echo a | xargs -I {} grep -l x {}', 'xargs -I{} cat {}', r'find /tmp -exec timeout 5 cat {} \;',
+                  'timeout 5 cat /tmp/*.c {a,b}', 'env A={} git log'):
             self.assert_allowed(c)
 
     def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):

@@ -228,7 +228,9 @@ mv $d/settings.json.new $d/settings.json
 chores itself, and every worktree edit, long build or investigation and review goes
 to the repository's agents, skills and workflows. `hooks/headless-chief/chief_guard.py`
 denies chief's own direct `git`/`gh` writes, workflow-only publishers and writes
-into its worktree, a guard against mistakes, not isolation. Its direct Codex exchanges go through `agents/coworker.md`, the
+into its worktree, a guard against mistakes, not isolation: it judges only the command
+families it knows, and a program outside them passes by design, even one that runs its
+arguments as a command. Its direct Codex exchanges go through `agents/coworker.md`, the
 `cowork.py` transport. `workflows/code-audit.js` is its saved review: one `code-verifier`
 per directory x dimension, then `finding-verifier` on every finding (on Sonnet for a
 scanner-labelled nit)
