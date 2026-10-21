@@ -15,7 +15,9 @@ recover_publish picks that or the Markdown repair after a failed publish, and re
 resolves a withdrawal to the report it archived. adopt makes a report published elsewhere (a
 rig's, fetched) the current one, importing its attempt records, or withdraws the local one.
 One writer per report dir: each call that writes holds `.<stem>.lock` and refuses, never
-waits, while another holds it.
+waits, while another holds it. That lock, the unavailable notice and the atomic replace are
+hil_report_notice's, loaded from beside this file; a consumer whose core failed to load
+writes the notice through it alone.
 
 `_hil.roster` is the caller's; roster_identity gives the portable {name, sha256} form, which
 read_chain compares whole across attempts.
@@ -32,6 +34,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -42,11 +45,20 @@ import unicodedata
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-try:
-    import fcntl
-except ImportError:   # Windows: a consumer's copy-back location
-    fcntl = None
-    import msvcrt
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location(f'agentrc_{name}', os.path.join(HERE, f'{name}.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+hil_report_notice = _load('hil_report_notice')
+NOTICE = hil_report_notice.NOTICE
+_legacy_section, _read_bytes = hil_report_notice._legacy_section, hil_report_notice._read_bytes
+_stage, _replace_one = hil_report_notice._stage, hil_report_notice._replace_one
 
 META = '_hil'
 CHAIN_LIMIT = 256     # links followed from one report: read_chain, read_current, adopt
@@ -56,7 +68,6 @@ VERDICTS = ('blocker', 'fail', 'not-run', 'pass')   # precedence order
 EVIDENCE = ('firmware-validation', 'farm-health')
 READABLE = ('empty', 'valid')   # the other outcomes: missing, corrupt, unsupported, withdrawn
 WITHDRAWN = '_hil_withdrawn'
-NOTICE = '**HIL report unavailable'
 _ID_TEXT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z')
 # derived archive references; an attempt id never starts with one of these
 _RESERVED = ('legacy-', 'corrupt-', 'unsupported-', 'withdrawn-', 'unreadable')
@@ -344,12 +355,6 @@ def serialise(schema: BodySchema, body: dict, meta: dict) -> str:
         raise ReportError('serialise', str(e)) from e
 
 
-def _legacy_section(text: str) -> str:
-    return ('\n_Legacy text: a previous attempt\'s rendered output whose JSON could not be read. '
-            'Its rows are not in this report\'s JSON, no verdict is read from them and no later '
-            'run merges them._\n\n' + text)
-
-
 def render_markdown(schema: BodySchema, doc: dict) -> str:
     """The Markdown view of a parsed document: schema.render of its body, then any labelled
     legacy text its `_hil` carries."""
@@ -378,63 +383,18 @@ def _notice(reading: Reading, name: str) -> str:
 # --- files ----------------------------------------------------------------------------------
 @contextlib.contextmanager
 def _writer(report_dir: Path, schema: BodySchema):
-    lock = report_dir / f'.{schema.stem}.lock'
     try:
-        report_dir.mkdir(parents=True, exist_ok=True)
-        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o666)
+        fd = hil_report_notice._acquire(report_dir, schema.stem)
+    except hil_report_notice.WriterHeld as e:
+        raise ReportError('writer', str(e)) from e
     except OSError as e:
-        raise ReportError('writer', f'cannot open {lock}: {e}') from e
+        raise ReportError('writer', f'cannot open {hil_report_notice.lock_path(report_dir, schema.stem)}: {e}') from e
     try:
-        try:
-            if fcntl:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:
-                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-        except OSError as e:
-            raise ReportError('writer', f'another writer holds {lock}') from e
-        try:
-            yield
-        except OSError as e:
-            raise ReportError('io', str(e)) from e
-        finally:
-            if not fcntl:
-                os.lseek(fd, 0, os.SEEK_SET)
-                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        yield
+    except OSError as e:
+        raise ReportError('io', str(e)) from e
     finally:
-        os.close(fd)
-
-
-def _stage(path: Path, data: bytes) -> Path:
-    """`data` in a fresh temp file beside `path`, synced; the umask applies, as to the file it replaces."""
-    tmp = path.with_name(f'.{path.name}.{secrets.token_hex(6)}.tmp')
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
-    try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
-    return tmp
-
-
-def _replace_one(path: Path, data: bytes) -> None:
-    tmp = _stage(path, data)
-    try:
-        os.replace(tmp, path)
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        raise
-
-
-def _read_bytes(path: Path) -> bytes | None:
-    try:
-        return path.read_bytes()
-    except FileNotFoundError:
-        return None
+        hil_report_notice._release(fd)
 
 
 def _doc(reading: Reading) -> dict:
@@ -763,15 +723,8 @@ def _prepare(report_dir: Path, schema: BodySchema) -> Reading:
         except ReportError as e:   # shown as the notice instead
             reading = reading._replace(outcome='corrupt', detail=str(e))
     if md is None:
-        md = _notice(reading, jpath.name)
-        old = _read_bytes(mpath)
-        text = old.decode('utf-8', errors='replace') if old is not None else ''
-        if text.startswith(NOTICE):   # an earlier notice: its legacy text is labelled already
-            md += text.split('\n', 1)[1] if '\n' in text else ''
-        elif text.strip():
-            md += _legacy_section(text)
-        md = md.encode('utf-8', errors='backslashreplace')
-    if _read_bytes(mpath) != md:
+        hil_report_notice._write_notice(mpath, _notice(reading, jpath.name))
+    elif _read_bytes(mpath) != md:
         _replace_one(mpath, md)
     return reading
 

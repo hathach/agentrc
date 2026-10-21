@@ -491,6 +491,23 @@ class PreparePair(Dir):
         self.assertEqual(core.prepare_pair(self.d, broken).outcome, 'corrupt')
         self.assertIn('render failed', (self.d / 'hil_report.md').read_text())
 
+    def test_the_notice_bytes_are_kept_from_before_hil_report_notice(self):
+        """prepare_pair's notice, byte for byte as the core wrote it before the notice moved into
+        hil_report_notice: over earlier Markdown, then over an earlier notice (not nested)."""
+        head = ('**HIL report unavailable: hil_report.json is corrupt.** not JSON: Expecting value: line 1 '
+                'column 11 (char 10)\n')
+        self.d.mkdir(parents=True)
+        (self.d / 'hil_report.json').write_text('{"rows": [')
+        (self.d / 'hil_report.md').write_bytes(b'\xff\xfeold\n')
+        core.prepare_pair(self.d, TINYUSB)
+        self.assertEqual((self.d / 'hil_report.md').read_bytes(), (
+            head + "\n_Legacy text: a previous attempt's rendered output whose JSON could not be read. Its rows "
+            "are not in this report's JSON, no verdict is read from them and no later run merges them._\n\n"
+            '��old\n').encode())
+        (self.d / 'hil_report.md').write_text('**HIL report unavailable: x is missing.** old\n\n_Legacy text: kept_\n')
+        core.prepare_pair(self.d, TINYUSB)
+        self.assertEqual((self.d / 'hil_report.md').read_text(), head + '\n_Legacy text: kept_\n')
+
 
 # --- attempts -----------------------------------------------------------------------------------
 class Attempts(Dir):
