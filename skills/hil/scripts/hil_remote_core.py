@@ -1162,6 +1162,9 @@ def _settle(dest):
     _drop(dest)
 
 
+DROP_TOKEN_BYTES = 8   # debris names end in this many random bytes, hex
+
+
 def _drop(dest):
     """Remove the collection dest has replaced, renamed first to a name _settle never restores, so
     a removal that fails part-way leaves debris rather than a collection; debris that resists
@@ -1169,8 +1172,8 @@ def _drop(dest):
     old = _aside(dest)
     if old.exists() or old.is_symlink():
         with contextlib.suppress(OSError):
-            old.rename(dest.with_name(f'.{dest.name}.drop-{secrets.token_hex(8)}'))
-    for debris in dest.parent.glob(f'.{glob.escape(dest.name)}.drop-*'):
+            old.rename(dest.with_name(f'.{dest.name}.drop-{secrets.token_hex(DROP_TOKEN_BYTES)}'))
+    for debris in dest.parent.glob(f'.{glob.escape(dest.name)}.drop-' + '[0-9a-f]' * (2 * DROP_TOKEN_BYTES)):
         with contextlib.suppress(OSError):
             _remove(debris)
 

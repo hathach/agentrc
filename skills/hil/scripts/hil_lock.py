@@ -924,10 +924,11 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
     caller can go on or exit; returns its token once its records name it and it confirmed the
     hold. A handle whose record is not shown protected raises ValueError before anything is
     touched: the caller still owns every handle, and must end or protect them itself.
-    Otherwise each record is first rewritten with `detail` and `receipts`; a rewrite cut
-    short leaves the protected record or an unreadable one, both recovery blockers. A handoff
-    that fails, each of its waits bounded by `wait`, raises LockUnavailable with such a
-    record, or a cleanup-holder record naming the holder it ended, left as the blocker; an
+    Otherwise each record is first rewritten with `detail`, `receipts` and the lock set, so
+    a takeover of one board still covers them all; a rewrite cut short leaves the protected
+    record or an unreadable one, both recovery blockers. A handoff that fails, each of its
+    waits bounded by `wait`, raises LockUnavailable with such a record, or a cleanup-holder
+    record naming the holder it ended, left as the blocker; an
     interrupt ends it the same way and propagates. With `receipts` (hil_process.run_tracked's)
     the holder's release predicate is every one rechecking `done`. `extra` adds fields to the
     cleanup-holder record. Past the ValueError the caller closes its handles either way,
@@ -936,11 +937,11 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
     if unprotected:
         raise ValueError(f'cleanup holder handoff refused: {", ".join(unprotected)} not taken protected; '
                          f'nothing changed, the caller still holds every board')
-    receipts = list(receipts)
+    receipts, locks = list(receipts), sorted(handles)
     unwritten = []
     for b, fh in handles.items():
         try:
-            write_record(fh, reason, protected=True, detail=detail, receipts=receipts)
+            write_record(fh, reason, protected=True, detail=detail, receipts=receipts, locks=locks)
         except OSError as e:
             unwritten.append(f'{b}: {e}')
     fds, proc, reports = {}, None, None
@@ -965,7 +966,7 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
         token = secrets.token_hex(8)
         for fh in handles.values():
             write_record(fh, reason, protected=True, role=CLEANUP_ROLE, detail=detail, receipts=receipts, **extra,
-                         pid=pid, start=start, token=token, locks=sorted(handles))
+                         pid=pid, start=start, token=token, locks=locks)
         os.write(fds['go_w'], b'1')
         if reports.next(time.monotonic() + wait) != {'held': True}:
             raise RuntimeError('the holder did not confirm the handoff')

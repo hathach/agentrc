@@ -1778,6 +1778,17 @@ class Attempts(Rig):
         self.assertEqual(rc_.collect(tree, dest, optional=['out/'], accept=self.late), col)
         self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock'])
 
+    def test_debris_removal_spares_a_sibling_that_only_shares_its_prefix(self):
+        tree = self.done_attempt()
+        dest = self.tmp / 'got'
+        rc_.collect(tree, dest, optional=['out/'])
+        (self.tmp / '.got.drop-backup').mkdir()
+        (self.tmp / '.got.drop-backup/keep').write_text('mine')
+        (self.base / 'a1/out/late.json').write_text('late')
+        rc_.collect(tree, dest, optional=['out/'], accept=self.late)
+        self.assertEqual((self.tmp / '.got.drop-backup/keep').read_text(), 'mine')
+        self.assertEqual(sorted(p.name for p in self.tmp.glob('.got*')), ['.got.collect.lock', '.got.drop-backup'])
+
     def test_a_partly_removed_collection_is_never_restored(self):
         tree = self.done_attempt()
         dest = self.tmp / 'got'

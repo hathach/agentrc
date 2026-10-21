@@ -1527,6 +1527,17 @@ class HandOver(LockDir):
         with self.assertRaises(hil_lock.RecoveryBlocked):
             self.acquire()
 
+    def test_a_failed_multi_board_handoff_leaves_a_takeover_of_one_board_the_whole_group(self):
+        fhs = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True) for b in (BOARD, self.OTHER)}
+        self.patch(hil_lock, '_holder_argv', lambda job: [sys.executable, '-c', 'pass'])
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'cleanup holder handoff failed: .*no readiness'):
+            hil_lock.hand_to_cleanup_holder(fhs, 'selftest run', detail='park failed', wait=2)
+        for fh in fhs.values():
+            fh.close()
+        _, handles = hil_lock.take_over(BOARD, 'recover')
+        self.addCleanup(hil_lock.end_takeover, handles)
+        self.assertEqual(sorted(handles), sorted([BOARD, self.OTHER]))
+
     def test_a_malformed_or_disagreeing_predicate_refuses_up_front(self):
         token, pid = self.hand_over(boards=(BOARD, self.OTHER))
         sent = self.signals()
