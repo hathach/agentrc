@@ -140,27 +140,29 @@ class Trigger(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir)
         self.assertEqual(self.run_with(Rig(readback=rig.readback))[1]['outcome'], 'uncertain', 'a read-back of another body')
 
-    def test_a_reopen_on_the_same_head_is_not_asked_again(self):
+    def test_a_reopen_after_a_recorded_request_is_not_asked_again(self):
         rig = Rig()
         self.assertEqual(self.run_with(rig)[1]['outcome'], 'requested')
         rig.timeline = [{'event': 'reopened', 'commit_id': None, 'created_at': '2026-10-21T11:00:00Z'},
                         {'event': 'ready_for_review', 'commit_id': None, 'created_at': '2026-10-21T11:01:00Z'}]
         self.assertEqual(self.run_with(rig)[1], {'outcome': 'already', 'detail': 'comment 101', 'at': '2026-10-21T10:05:00Z', 'seal': mock.ANY})
         self.assertEqual(len(rig.posts), 1)
-        # Another checkout, with no record, reads the request as made after the head's arrival all the same.
-        fresh = Rig(comments=rig.comments, timeline=rig.timeline)
-        self.dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.dir)
-        self.assertEqual(self.run_with(fresh)[1]['outcome'], 'already')
-        self.assertEqual((fresh.posts, self.record()['receipt']['id']), ([], 101))
-        # nor does a same-SHA pull_request run its workflow may have started on the reopen
-        reopen_run = dict(RUN, id=2, event='pull_request', created_at='2026-10-21T11:00:00Z')
-        fresh = Rig(comments=rig.comments, runs=(reopen_run, RUN), timeline=rig.timeline)
-        self.dir = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.dir)
+
+    def test_a_reopen_after_an_unrecorded_request_asks_once_more(self):
+        made_elsewhere = {'id': 60, 'body': '@greptileai', 'created_at': '2026-10-21T10:05:00Z'}
+        rig = Rig(comments=[made_elsewhere], timeline=[{'event': 'reopened', 'commit_id': None, 'created_at': '2026-10-21T11:00:00Z'}])
+        self.assertEqual(self.run_with(rig)[1]['outcome'], 'requested')
+        self.assertEqual(len(rig.posts), 1)
+
+    def test_a_default_types_pull_request_run_dates_a_later_head(self):
+        # the owner asked for the previous head by hand; this head arrived later and only a pull_request run whose
+        # workflow also runs on reopened dates it (agentrc's own workflows: push covers main alone)
+        earlier = {'id': 61, 'body': '@greptileai', 'created_at': '2026-10-21T09:00:00Z'}
+        run_ = dict(RUN, event='pull_request', created_at=PUSHED)
+        rig = Rig(comments=[earlier], runs=(run_,))
         with mock.patch.object(harvest, 'pr_types', lambda *a: {'opened', 'synchronize', 'reopened'}):
-            self.assertEqual(self.run_with(fresh)[1]['outcome'], 'already')
-        self.assertEqual(fresh.posts, [])
+            self.assertEqual(self.run_with(rig)[1]['outcome'], 'requested')
+        self.assertEqual(len(rig.posts), 1)
 
     def test_a_request_at_the_head_event_second_is_ambiguous_and_nothing_is_posted(self):
         tied = {'id': 50, 'body': '@greptileai', 'created_at': PUSHED}

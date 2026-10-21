@@ -16,8 +16,8 @@ claim without a receipt only looks for the comment that claim made. The outcome:
              an error or not at all, found posted since the claim
   already    the record holds a receipt for SHA, an earlier claim's comment is
              found posted, or an exact `@greptileai` comment is on the PR after
-             the head's arrival (harvest.py's head event, a reopen or ready
-             event on the same SHA left out), then recorded as the receipt
+             the head's latest event (harvest.py's head event, a reopen or
+             ready event included), then recorded as the receipt
   notOpen    the PR is not open at SHA, read again just before the claim:
              nothing posted
   failed     the head event time is unknown while an `@greptileai` comment
@@ -33,6 +33,10 @@ comment's time on those, else the UTC time the script finished. stdout ends with
 one JSON line {outcome, detail, at, seal} (seal: facts.sealed). Exit 2 with
 {"error": ...} when the arguments are wrong or GitHub's answer cannot be read.
 A rerun after a lost line reports `already`.
+Deduplication is this checkout's: with no receipt recorded here, a later
+head event on the same SHA (a reopen after a request made elsewhere or by
+hand) leads to one more request. Nothing dates a head's first arrival
+reliably, so a duplicate is preferred to a missed review.
 """
 
 import json
@@ -118,7 +122,7 @@ def request(pr, head):
             return found(path, record, 'already', pr, f"an attempt claimed this head at {record['claimedAt']} and its comment is not on the PR")
         standing = asks(pr)
         view = {'headRefName': pull['head']['ref'], 'headRepository': {'nameWithOwner': pull['head']['repo']['full_name']}}
-        event_at, evidence = head_event(repo, pr, view, head, reopens=False)
+        event_at, evidence = head_event(repo, pr, view, head)
         if standing and event_at is None:
             return {'outcome': 'failed', 'detail': f"the head event time is unknown ({evidence}), so comment {standing[-1]['id']} "
                                                    'cannot be placed before or after it: nothing posted'}
