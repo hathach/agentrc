@@ -52,6 +52,7 @@ Signals: SIGINT/SIGTERM/SIGHUP before the command release the untouched reservat
 exit 130; during the command SIGINT/SIGTERM are forwarded to its process group, while SIGHUP
 (a lost terminal or SSH session, not a request to abort) is noted and ignored so the mutation
 completes; afterwards all three are noted and ignored, so a hangup never ends a cleanup hold.
+The command starts with no signal blocked, so its own traps see what is forwarded.
 A command that cannot be started at all releases the reservation and refuses. SIGUSR1 is
 ignored until the cleanup-holder state.
 """
@@ -64,7 +65,6 @@ import os
 import re
 import secrets
 import signal
-import subprocess
 import sys
 import time
 
@@ -90,11 +90,13 @@ SCOPE_NAME = {'root': 'root port', 'hub': 'hub'}
 REFUSED_UNWRITTEN = 3     # usb_recover.sh, either verb: refused before its first mutation
 DEFAULT_BUDGET = 60.0
 PROGRESS_EVERY = 60.0
+WAIT_POLL = 0.05           # s between looks at whether the command has ended
 RESTORE_POLL = 0.5         # between restoration looks; a node back later than this before the deadline is missed
 # the one command `run` builds; a test points this at a stub through the module, never the CLI
 RECOVER_SCRIPT = os.path.normpath(os.path.join(HERE, '..', '..', 'usb-kernel-recover', 'scripts', 'usb_recover.sh'))
 PR_SET_CHILD_SUBREAPER = 36
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+SPAWN_SIGDEF = (signal.SIGPIPE, signal.SIGXFSZ)     # what Python ignores and Popen restores in a child
 _ABSENT = object()
 
 
@@ -360,30 +362,34 @@ class Reservation:
     def run(self, argv):
         """argv in its own process group; returns its exit code. A command that cannot be
         started mutated nothing: the reservation is released and Refused raised."""
-        # a signal that lands while the child is being spawned waits until its group is known
-        held = set(HANDLED_SIGNALS)
-        signal.pthread_sigmask(signal.SIG_BLOCK, held)
+        # a signal that lands while the child is being spawned waits until its group is known;
+        # the child itself starts unblocked, so its traps see a forwarded signal
+        prev = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
         try:
             try:
-                proc = subprocess.Popen(argv, process_group=0)
+                pid = os.posix_spawnp(argv[0], argv, os.environ, setpgroup=0, setsigmask=(),
+                                      setsigdef=SPAWN_SIGDEF)
             except OSError as e:
                 self.release()
                 raise Refused(f'cannot start {argv[0]}: {e}')
-            self.pgid = proc.pid
+            self.pgid = pid
             self.phase = 'command'
         finally:
-            signal.pthread_sigmask(signal.SIG_UNBLOCK, held)
+            signal.pthread_sigmask(signal.SIG_SETMASK, prev)
+        next_progress = time.monotonic() + PROGRESS_EVERY
         while True:
-            try:
-                rc = proc.wait(timeout=PROGRESS_EVERY)
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
                 break
-            except subprocess.TimeoutExpired:
+            if time.monotonic() >= next_progress:
+                next_progress += PROGRESS_EVERY
                 try:
                     print(f'hil_reserve: {os.path.basename(argv[2])} still running', flush=True)
                 except (OSError, ValueError):
                     pass    # a lost reader never abandons a running mutation
+            time.sleep(WAIT_POLL)
         self.phase = 'post'
-        return rc
+        return os.waitstatus_to_exitcode(status)    # a signal death stays negative, as Popen's
 
     def hold_as_cleanup_holder(self, problems):
         """Never returns: the records say cleanup-holder and only SIGUSR1 ends the hold.
