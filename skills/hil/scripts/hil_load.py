@@ -74,8 +74,8 @@ def _complete(module, name, key):
             pass
         if getattr(spec, '_initializing', False):
             raise ImportError(f'{name}: {module.__file__} is still being initialized', name=name)
-        if sys.modules.get(key) is not module:
-            raise ImportError(f'{name}: {module.__file__} failed to initialize in another thread', name=name)
+    if sys.modules.get(key) is not module:     # also a run that failed after the caller found it
+        raise ImportError(f'{name}: {module.__file__} failed to initialize in another thread', name=name)
     return module
 
 

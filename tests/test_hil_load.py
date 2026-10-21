@@ -14,6 +14,7 @@ import threading
 import types
 import unittest
 from pathlib import Path, PurePosixPath
+from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
@@ -277,6 +278,26 @@ class Load(unittest.TestCase):
         self.assertIsInstance(out.get('error'), RuntimeError)
         self.assertFalse(self.name('alias') in sys.modules)
         self.assertFalse(mod in sys.modules)
+
+    def test_an_import_that_fails_after_the_scan_found_it_is_not_published(self):
+        """The failure lands between the alias scan's snapshot and the wait: by then the module is no
+        longer initializing, and only its missing registration tells."""
+        p = self.counted('late.py')
+        spec = importlib.util.spec_from_file_location(self.name('late'), p)
+        found = importlib.util.module_from_spec(spec)
+        spec._initializing = True
+        sys.modules[spec.name] = found
+        real_origin = hl._origin
+
+        def origin(module):
+            if module is found:          # the ordinary import fails just after the scan reads it
+                sys.modules.pop(spec.name, None)
+                spec._initializing = False
+            return real_origin(module)
+        with mock.patch.object(hl, '_origin', origin), \
+                self.assertRaisesRegex(ImportError, 'failed to initialize in another thread'):
+            hl.load(self.name('alias'), p)
+        self.assertFalse(self.name('alias') in sys.modules)
 
     def test_a_cross_thread_cycle_with_an_ordinary_import_ends(self):
         """Thread A loads a.py, which imports b; thread B imports b, which loads a.py. Each ends, with a
