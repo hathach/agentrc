@@ -125,30 +125,52 @@ class ChiefGuard(unittest.TestCase):
     @needs_msys
     def test_heredoc_body_is_data_but_its_line_counts(self):
         self.assert_allowed("cat > /tmp/brief.md <<'EOF'\ngit push\ngh pr merge 1\nEOF")
+        self.assert_allowed("cat > /tmp/brief.md <<'EOF'\n# Brief\n\nline 2\nEOF\ncat /tmp/brief.md")
         self.assert_denied("cat > src/x.md <<'EOF'\nhello\nEOF", 'literal absolute path')
         self.assert_denied("cat <<EOF | tee src/x\nhi\nEOF", 'literal absolute path')
 
     def test_a_heredoc_ends_where_bash_ends_it(self):
-        # the delimiter is the whole word, quote removed; the body ends at the first line holding just it
+        # the body ends at the first line holding just the delimiter
+        for c in (  # only `<<-` strips leading tabs, and neither strips spaces, so a later heredoc cannot swallow it
+                  'cat <<D\nhi\n  D\ncat <<X\nD\ngit push\nX', 'cat <<D\nhi\nD \ncat <<X\nD\ngit push\nX',
+                  'cat <<-D\nhi\n  D\ncat <<X\n\tD\ngit push\nX', 'cat <<EOF\nEOF\ngit push\nEOF',
+                  # a here-string has no body
+                  'cat <<<EOF\ngit push\nEOF',
+                  # a heredoc ending each line, read in linear time
+                  ': <<E\nx\nE\n' * 32000 + 'git push\n'):
+            with self.subTest(c=c[:60]):
+                start = time.monotonic()
+                self.assert_denied(c, 'changes the repository')
+                self.assertLess(time.monotonic() - start, 3)
+        # a delimiter that is not a plain or fully quoted word: bash reads its end, or its word, otherwise
         for c in ('cat <<EOF-1\nEOF-1\ngit push\nEOF', "cat <<'EOF-1'\nhi\nEOF-1\ngit push\nEOF",
                   'cat <<"EOF-1"\nhi\nEOF-1\ngit push\nEOF', "cat <<'EOF'-1\nhi\nEOF-1\ngit push\nEOF",
                   'cat <<E"O"F\nhi\nEOF\ngit push\nE"O"F', 'cat <<\\EOF\nhi\nEOF\ngit push\n\\EOF',
-                  # only `<<-` strips leading tabs, and neither strips spaces, so a later heredoc cannot swallow it
-                  'cat <<D\nhi\n  D\ncat <<X\nD\ngit push\nX', 'cat <<D\nhi\nD \ncat <<X\nD\ngit push\nX',
-                  'cat <<-D\nhi\n  D\ncat <<X\n\tD\ngit push\nX',
-                  # a here-string has no body
-                  'cat <<<EOF\ngit push\nEOF'):
+                  "cat <<$'A'\nhi\nA\ngit push\n$A", 'cat <<"A\\"B"\nhi\nA"B\ngit push\nA\\"B', 'cat <<`a b`\nhi\n`a\n',
+                  "cat <<'EOF-1'\ngit push\nEOF-1", 'cat <<"EOF-1"\ngit push\nEOF-1', "cat <<'EOF'-1\ngit push\nEOF-1",
+                  'cat <<EOF-1\nhi\nEOF-\\\n1\nEOF-1', "cat <<'E-F'\nx\\\n#'\nE-F\nsed -i s/a/b/ src/a.c\n# '",
+                  'cat <<EOF#\nhi\nEOF#\ngit push\nEOF', 'cat <<EOF\r\nhi\nEOF\r\ngit push\nEOF',
+                  'cat <<:\r\nbody\n:\r\ngit push\n:', 'cat << -E\nhi\n-E\ngit push\nE',
+                  # read over the raw command, a `<<` in a comment or quotes counts too
+                  '# <<:\ngit push\n:', "echo '<<: '\ngit push\n:", "echo '<<EOF'\ngit push\nEOF",
+                  'cat <<A <<B\nA\ncat <<:\nB\ngit push\n:'):
             with self.subTest(c=c):
-                self.assert_denied(c, 'changes the repository')
-        # bash may read more into a delimiter holding `$` or a backquote than this guard does
-        for c in ("cat <<$'A'\nhi\nA\ngit push\n$A", 'cat <<"A\\"B"\nhi\nA"B\ngit push\nA\\"B', 'cat <<`a b`\nhi\n`a\n'):
-            with self.subTest(c=c):
-                self.assert_denied(c, "heredoc's delimiter")
-        for c in ("cat <<'EOF-1'\ngit push\nEOF-1", 'cat <<"EOF-1"\ngit push\nEOF-1', "cat <<'EOF'-1\ngit push\nEOF-1",
-                  'cat <<-EOF\n\tgit push\n\tEOF', 'cat <<EOF;echo x\ngit push\nEOF', 'cat <<EOF\nEOF\ngit status',
-                  'cat <<<"a b"\ngit status', 'echo $((1<<2))'):
-            with self.subTest(c=c):
+                self.assert_denied(c, "heredoc's delimiter", "plain word delimiter such as EOF or 'EOF'")
+        # bash reads the rest of the command as an unterminated body
+        for c in ("cat <<A\ncat <<':'\n$(git push)\n:", "cat <<A\ncat <<'B'\n$(git push)\nB", 'cat <<-A\nhi\n A\n',
+                  ': <<A\n' * 32000 + 'git push\n'):
+            with self.subTest(c=c[:60]):
+                self.assert_denied(c, 'no line after this heredoc ends it')
+        for c in ('cat <<-EOF\n\tgit push\n\tEOF', 'cat <<EOF;echo x\ngit push\nEOF', 'cat <<EOF\nEOF\ngit status',
+                  'cat <<EOF2\nhi\nEOF2\ngit status', 'cat <<"EOF"\n$(git push)\nEOF', "cat <<- 'EOF'\n\thi\n\tEOF",
+                  'cat <<<"a b"\ngit status', 'cat <<<"$x"', 'echo $((1<<2))',
+                  # a `<<` on the last line opens no body
+                  "grep -n '<<-' f", 'git status\ngrep -c "<<EOF-1" f', "echo '<<'", 'echo $((1<<2)) ' * 30000):
+            with self.subTest(c=c[:60]):
+                start = time.monotonic()
                 self.assert_allowed(c)
+                self.assertLess(time.monotonic() - start, 3)
+        self.assert_denied("git commit -F - <<'EOF'\nfix x\n\nbody\nEOF", '`git commit` changes the repository')
 
     def test_gh_reads_pass(self):
         for c in ('gh pr view 12 --json state', 'gh pr checks 12', 'gh -R o/r pr list', 'gh issue view 3',
