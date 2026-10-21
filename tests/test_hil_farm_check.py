@@ -430,9 +430,28 @@ class Engine(unittest.TestCase):
         patch(self, eng, 'RECHECK_WAIT', 5)
         ledger = [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}]
         t = time.monotonic()
-        eng._settle(ledger)
+        eng._settle(types.SimpleNamespace(ledger=ledger, recheck_by=None))
         self.assertLess(time.monotonic() - t, 1, 'no receipt left to recheck, nothing to wait for')
         self.assertEqual(ledger, [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}], 'it stays unresolved')
+
+    def test_one_recheck_wait_per_reservation_and_time_never_clears_a_run(self):
+        clock, answers = [100.0], []
+        patch(self, eng, 'time', types.SimpleNamespace(monotonic=lambda: clock[0],
+                                                       sleep=lambda s: clock.__setitem__(0, clock[0] + s)))
+        patch(self, eng, 'RECHECK_WAIT', 5)
+        patch(self, eng.hil_process, 'recheck', lambda r: answers.pop(0) if answers else 'pending')
+        patch(self, eng.hil_process, 'tidy', lambda r: None)
+        ctx = types.SimpleNamespace(ledger=[{'cmd': 'flash', 'cleanup': 'pending', 'receipt': 'r1'}], recheck_by=None)
+        eng._settle(ctx)
+        self.assertEqual(ctx.recheck_by, 105.0, 'the first open run starts the one wait')
+        self.assertAlmostEqual(clock[0], 105.0, delta=0.15)
+        waited = clock[0]
+        self.assertEqual(ctx.ledger[0]['cleanup'], 'pending', 'time alone never clears it')
+        eng._settle(ctx)
+        self.assertEqual(clock[0], waited, 'a later call rechecks once, without waiting')
+        answers.append('done')
+        eng._settle(ctx)
+        self.assertEqual((ctx.ledger[0]['cleanup'], ctx.ledger[0]['receipt']), ('done', None), 'a late answer still counts')
 
     def test_settle_holds_in_process_board_io_until_every_run_is_proven_ended(self):
         reset = 'STM32_Programmer_CLI --connect port=swd sn=P --rst --go'

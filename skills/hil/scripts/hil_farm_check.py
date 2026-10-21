@@ -227,11 +227,12 @@ class Context:
         self.ledger = []
         self.touched = False
         self.step = None
+        self.recheck_by = None   # the reservation's one RECHECK_WAIT, set when a run is first found open
         self._recorded = []
 
     def open_runs(self) -> list:
-        """The runs not proven ended, after rechecking them for at most RECHECK_WAIT."""
-        _settle(self.ledger)
+        """The runs not proven ended, after rechecking them within the reservation's RECHECK_WAIT."""
+        _settle(self)
         return [e for e in self.ledger if e['cleanup'] != 'done']
 
     def settle(self) -> None:
@@ -268,19 +269,24 @@ def _evidence(open_runs: list) -> str:
     return '; '.join(f'{e["cmd"]} ({e["cleanup"]})' for e in open_runs)
 
 
-def _settle(ledger: list) -> None:
-    """Recheck every run not proven ended until all are, none left has a receipt to recheck,
-    or RECHECK_WAIT passed; a receipt proven done is removed, nothing else is."""
-    deadline = time.monotonic() + RECHECK_WAIT
+def _settle(ctx: Context) -> None:
+    """Recheck every run not proven ended until all are, none left has a receipt to recheck, or
+    the reservation's one RECHECK_WAIT, counted from when a run was first found open, passed:
+    a later call rechecks once without waiting. A receipt proven done is removed, nothing else
+    is; time alone never clears a run."""
+    def rechecking():
+        return [e for e in ctx.ledger if e['cleanup'] != 'done' and e['receipt'] is not None]
     while True:
-        for e in ledger:
-            if e['cleanup'] != 'done' and e['receipt'] is not None:
-                e['cleanup'] = hil_process.recheck(e['receipt'])
-                if e['cleanup'] == 'done':
-                    hil_process.tidy(e['receipt'])
-                    e['receipt'] = None
-        if not any(e['cleanup'] != 'done' and e['receipt'] is not None for e in ledger) \
-                or time.monotonic() >= deadline:
+        for e in rechecking():
+            e['cleanup'] = hil_process.recheck(e['receipt'])
+            if e['cleanup'] == 'done':
+                hil_process.tidy(e['receipt'])
+                e['receipt'] = None
+        if not rechecking():
+            return
+        if ctx.recheck_by is None:
+            ctx.recheck_by = time.monotonic() + RECHECK_WAIT
+        if time.monotonic() >= ctx.recheck_by:
             return
         time.sleep(0.1)
 
@@ -537,7 +543,7 @@ def _keep_blocked(row: dict, fh, why: str) -> None:
 
 
 def _finalize(fh, lock: str, ctx: Context, plan: dict, row: dict, final: dict) -> None:
-    _settle(ctx.ledger)
+    _settle(ctx)
     open_ops = [e for e in ctx.ledger if e['cleanup'] != 'done']
     receipts = [e['receipt'] for e in open_ops if e['receipt'] is not None]
     cleanup = {'postcondition': plan['final']['postcondition'], 'image': None, 'result': final['result'],
