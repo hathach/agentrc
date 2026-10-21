@@ -791,10 +791,12 @@ def read_security(serial: str, *, chip: str, workdir, timeout, retains_lock=Fals
         if op.returncode != 0 or not isinstance(out, dict) or out.get('ok') is not True:
             raise RuntimeError(f'esptool_session on {tty} (rc {op.returncode}): '
                                f'{(out or {}).get("error") if isinstance(out, dict) else "no result line"}')
-        result = (out.get('results') or [None])[0]
-        op.security = security_evidence(result, chip=chip,
+        results = out.get('results')
+        if not isinstance(results, list) or not results:
+            raise RuntimeError(f'esptool_session on {tty}: results {results!r}, want the security op\'s')
+        op.security = security_evidence(results[0], chip=chip,
                                         source=f'esptool {out.get("esptool")} on {tty}, USJ {serial}, ROM loader')
-    except (ValueError, RuntimeError) as e:
+    except Exception as e:      # every parse failure carries the child's operation, its cleanup and receipt
         e.operation = op
         raise
     return op

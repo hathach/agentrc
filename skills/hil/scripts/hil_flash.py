@@ -406,7 +406,8 @@ def rescue_openocd(flasher: dict, flash_out: str = '', *, timeout, run=None) -> 
     for cfg, (rescue_cfg, pre, post) in RESCUE_CFG.items():
         if cfg in flasher['args']:
             base = openocd_cmd_base({**flasher, 'args': ''})
-            args = [rescue_cfg if a == cfg else a for a in _args(flasher)]
+            # in each word, as the pre-argv string replace did: a directory-qualified cfg keeps its directory
+            args = [a.replace(cfg, rescue_cfg) for a in _args(flasher)]
             return _runner(run)([*base, *pre, *args, *post], timeout=timeout).returncode == 0
     return False
 

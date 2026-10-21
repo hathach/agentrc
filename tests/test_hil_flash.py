@@ -857,6 +857,20 @@ class LiteralArgv(unittest.TestCase):
                                             '-c', 'shutdown'])
         self.assertIsInstance(hf.openocd_cmd_base(flasher), list)
 
+    def test_a_directory_qualified_rescue_target_keeps_its_directory(self):
+        """The pre-argv rescue replaced the cfg inside the args string, so a qualified path kept its
+        directory: the argv must be that baseline's words."""
+        for cfg, pre, post in (('target/rp2350.cfg', [], ['-c', 'shutdown']),
+                               ('target/rp2040.cfg', ['-c', 'set RESCUE 1'], [])):
+            qualified = f'/opt/openocd/scripts/{cfg}'
+            rescue = {'name': 'openocd', 'uid': 'S1', 'args': f'-f interface/cmsis-dap.cfg -f {qualified}'}
+            baseline_args = rescue['args'].replace(cfg, hf.RESCUE_CFG[cfg][0])
+            _, calls, _, _ = capture(hf.rescue_openocd, rescue, hf.DAP_WEDGED[0], timeout=7)
+            with self.subTest(cfg=cfg):
+                self.assertEqual(calls[0][0], [*hf.openocd_cmd_base({**rescue, 'args': ''}), *pre,
+                                               *shlex.split(baseline_args), *post])
+                self.assertIn(f'/opt/openocd/scripts/{hf.RESCUE_CFG[cfg][0]}', calls[0][0])
+
     def test_roster_args_are_split_as_words_never_expanded(self):
         _, calls, _, _ = capture(hf.flash_lm4flash, {'name': 'lm4flash', 'uid': 'S1', 'args': "-v '$HOME x' *"},
                                  ODD, timeout=7)

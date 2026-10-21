@@ -1796,6 +1796,25 @@ class ReadSecurity(unittest.TestCase):
                 self.read(stdout, rc=rc)
             self.assertEqual(cm.exception.operation.returncode, rc)
 
+    def test_every_malformed_result_carries_the_pending_operation(self):
+        receipt = {'token': 'r1', 'lock': '/state/hil_op_r1.lock'}
+
+        def pending_run(stdout):
+            def run(argv, **kw):
+                r = subprocess.CompletedProcess(argv, 0, stdout, None)
+                r.cleanup, r.receipt = 'pending', receipt
+                return r
+            return run
+        for out in ({'ok': True, 'results': {'unexpected': 1}}, {'ok': True, 'results': 7}, {'ok': True, 'results': []},
+                    {'ok': True}, {'ok': True, 'results': [7]}, {'ok': True, 'results': [None]},
+                    {'ok': True, 'results': [{'op': 'security'}]}, [1, 2], 'ok'):
+            with self.subTest(out=out), self.assertRaises((RuntimeError, ValueError)) as cm:
+                oe.read_security(SERIAL, chip='esp32p4', workdir=str(self.work), timeout=30, retains_lock=True,
+                                 run=pending_run(json.dumps(out) + '\n'))
+            op = cm.exception.operation
+            self.assertEqual((op.cleanup, op.receipts), ('pending', (receipt,)))
+        self.assertEqual(list(self.work.iterdir()), [])
+
     def test_an_unchecked_chip_is_refused_before_any_access(self):
         with mock.patch.object(oe, 'usj_tty', side_effect=AssertionError('touched')), \
                 self.assertRaisesRegex(ValueError, 'no checked eFuse layout'):
