@@ -480,6 +480,22 @@ class ChiefGuard(unittest.TestCase):
         self.assert_allowed('sed -n p x' + '{,' * 3200)
         self.assertLess(time.monotonic() - start, 1)
 
+    def test_a_line_continuation_joins_its_lines(self):
+        # bash removes a backslash-newline before it splits words or expands braces, inside double quotes too
+        for c, named in (('sed {-i,s/a/b/,src/a.c\\\n}', 'brace list'), ('sed -{i..i\\\n} s/a/b/ src/a.c', 'brace list'),
+                         ('sed \\\n-i s/a/b/ src/a.c', 'in place'), ('sed -\\\ni s/a/b/ src/a.c', 'in place'),
+                         ('sed "-\\\ni" s/a/b/ src/a.c', 'in place'),
+                         # on a heredoc's line it moves the body; in an unquoted body it may form the delimiter early
+                         ('cat <<EOF \\\n| sh\ngit push\nEOF', 'heredoc'),
+                         ('cat <<EOF\nhi\nE\\\nOF\ngit push\nEOF', 'heredoc')):
+            with self.subTest(c=c):
+                self.assert_denied(c, named)
+        # a comment after a continued blank stays a comment; single quotes and a quoted heredoc body keep it literal
+        for c in ('git status \\\n--short', "git log -1 \\\n# it's a note", "grep -c 'a\\\n' src/a.c",
+                  "cat <<'EOF'\nhi\nE\\\nOF\ngit push\nEOF", 'cat <<EOF\na \\\\\nEOF'):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+
     def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):
         for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
                   'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',

@@ -193,6 +193,7 @@ def literal(word):
     plain = word.translate(SEPARATORS_BACK)
     return plain.translate(BRACES_QUOTED) if braces(plain) and not braces(word) else plain
 HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+CONTINUED = re.compile(r'(?<!\\)(?:\\\\)*\\\n')  # an odd run of backslashes before a newline
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
 UNKNOWN = '\0'
 STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
@@ -218,7 +219,8 @@ def substitutions(text, quotes=True):
     while i < len(text):
         c = text[i]
         if c == '\\' and not single:
-            out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
+            if text[i + 1:i + 2] != '\n':  # a line continuation: bash removes it before it splits words
+                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
             i += 2
             continue
         if quotes and c == "'" and not double:
@@ -302,6 +304,10 @@ class Guard:
         bodies = []
 
         def heredoc(m):
+            # bash joins a continued line before it reads the body and, unquoted, before it matches the delimiter
+            if CONTINUED.search(m.group(3) + '\n') or not m.group(1) and CONTINUED.search(m.group(4) + '\n'):
+                raise Denied("a line continuation on a heredoc's line or in an unquoted heredoc body moves where bash "
+                             'starts or ends the body; join the line, or quote the delimiter')
             if not m.group(1):  # an unquoted body still runs its substitutions
                 bodies.extend(substitutions(m.group(4), quotes=False)[1])
             return '<<HEREDOC' + m.group(3) + '\n'
