@@ -1,27 +1,34 @@
 """helpers.guard_survivors, the guard every module that spawns processes runs its tests under: a process a test
-leaves running, a double-forked one included, is named and killed, whether the test passed, failed or timed out;
-a process that was already running is left alone; the child-subreaper flag comes back as it was."""
+leaves running, a double-forked one or a zombie leader with a live thread included, is named and killed, whether
+the test passed, failed or timed out; a process that was already running is left alone; the child-subreaper flag
+comes back as it was, and a flag it cannot set or restore fails."""
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import helpers  # noqa: E402
 from helpers import SURVIVOR_GUARD_OFF, end, guard_survivors, proc_stat  # noqa: E402
 
 # the guard in an interpreter of its own, so nothing of this suite is in its baselines: subreaper flag argv[2]
 # before the run; tests that each write the pid they leave behind to argv[3]/<test name>; a process started
-# before them; each test's outcome, whether each leaked pid is gone, the earlier process still running, and the flag
+# before them; each test's outcome, whether each leaked pid is gone, the earlier process still running, the flag,
+# and how the zombie leader looked while its thread ran
 DRIVER = r'''
 import io, json, os, subprocess, sys, time, unittest
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import helpers
+from test_hil_process import THREAD_LEADER
 helpers.set_subreaper(int(sys.argv[2]))
 helpers.SURVIVOR_GRACE = 0.2
 out = Path(sys.argv[3])
+leader = {}
 
 
 def leaked(name, pid):
@@ -59,6 +66,13 @@ class Leaks(Base):
     def test_timed_out(self):
         subprocess.run(['sh', '-c', f'sleep 60 & echo $! > {out}/timed_out; wait'], timeout=1)
 
+    def test_thread_leader(self):
+        p = subprocess.Popen([sys.executable, '-c', THREAD_LEADER, str(out / 'thread_leader')])
+        deadline = time.monotonic() + 10
+        while (helpers.proc_stat(p.pid) or (0, ''))[1] != 'Z' and time.monotonic() < deadline:
+            time.sleep(0.02)
+        leader.update(zombie=helpers.proc_stat(p.pid)[1] == 'Z', alive=helpers.pid_alive(p.pid), poll=p.poll())
+
     def test_clean(self):
         subprocess.run(['sleep', '0'], check=True)
 
@@ -76,7 +90,7 @@ earlier.kill()
 earlier.wait()
 gone = {n: helpers.proc_stat(p) is None for n, p in pids.items()}
 print(json.dumps({'outcomes': outcomes, 'pids': pids, 'gone': gone,
-                  'earlier': running, 'subreaper': helpers.get_subreaper(), 'run': result.testsRun}))
+                  'earlier': running, 'leader': leader, 'subreaper': helpers.get_subreaper(), 'run': result.testsRun}))
 '''
 
 
@@ -93,12 +107,15 @@ class SurvivorGuard(unittest.TestCase):
                                     out], capture_output=True, text=True, timeout=120)
                 self.assertEqual(r.returncode, 0, r.stderr)
                 res = json.loads(r.stdout)
-                self.assertEqual(res['run'], 5)
-                self.assertEqual(sorted(res['pids']), ['child', 'double_forked', 'failed', 'timed_out'])
+                self.assertEqual(res['run'], 6)
+                self.assertEqual(sorted(res['pids']),
+                                 ['child', 'double_forked', 'failed', 'thread_leader', 'timed_out'])
                 self.assertEqual(sorted(res['outcomes']), sorted(res['pids']))
                 for name, pid in res['pids'].items():
-                    self.assertIn(f'killed processes that outlived their test: {pid} sleep 60', res['outcomes'][name])
+                    command = '' if name == 'thread_leader' else ' sleep 60'
+                    self.assertIn(f'killed processes that outlived their test: {pid}{command}', res['outcomes'][name])
                     self.assertTrue(res['gone'][name], name)
+                self.assertEqual(res['leader'], {'zombie': True, 'alive': True, 'poll': None})
                 self.assertIn('the test fails', res['outcomes']['failed'])
                 self.assertIn('TimeoutExpired', res['outcomes']['timed_out'])
                 self.assertTrue(res['earlier'])
@@ -111,6 +128,53 @@ class SurvivorGuard(unittest.TestCase):
         end(p.pid, '1')    # its pid, an earlier process's start time
         self.assertIsNone(p.poll())
         self.assertIn(proc_stat(p.pid)[1], 'RS')
+
+    def test_a_listed_pid_that_is_not_the_listing_processs_child_is_skipped(self):
+        real = helpers.children
+
+        def with_a_stranger(pid):    # as a child that exited and whose pid was reused after the list was read
+            return real(pid) + [os.getppid()] if pid == os.getpid() else real(pid)
+        with mock.patch.object(helpers, 'children', with_a_stranger):
+            self.assertNotIn(os.getppid(), helpers.descendants())
+
+    def test_a_survivor_reparented_while_a_walk_runs_is_still_found(self):
+        baseline = {(pid, st[2]) for pid, st in helpers.descendants().items()}
+        p = subprocess.Popen(['sleep', '60'])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        real, missed = helpers.children, []
+
+        def first_walk_misses_it(pid):    # its parent exited after the list was read, so no list held it
+            kids = real(pid)
+            if pid == os.getpid() and not missed:
+                missed.append(p.pid)
+                return [k for k in kids if k != p.pid]
+            return kids
+        with mock.patch.object(helpers, 'children', first_walk_misses_it), \
+                mock.patch.object(helpers, 'SURVIVOR_GRACE', 0), \
+                self.assertRaisesRegex(AssertionError, f'outlived their test: {p.pid} sleep 60'):
+            helpers.check_no_survivors(baseline)
+        self.assertEqual(missed, [p.pid])
+
+    def test_a_flag_it_cannot_set_or_restore_fails(self):
+        class Case:
+            def addCleanup(self, check):
+                self.check = check
+        with mock.patch.object(helpers, 'set_subreaper', return_value=False), \
+                self.assertRaisesRegex(AssertionError, 'could not set the child-subreaper flag'):
+            helpers.start_survivor_guard(Case())
+        real, first = helpers.set_subreaper, [True]
+
+        def sets_but_never_restores(flag):
+            if first:
+                first.pop()
+                return real(flag)
+            return False
+        case = Case()
+        with mock.patch.object(helpers, 'set_subreaper', sets_but_never_restores):
+            helpers.start_survivor_guard(case)
+            with self.assertRaisesRegex(AssertionError, 'could not restore the child-subreaper flag to'):
+                case.check()
 
 
 if __name__ == '__main__':

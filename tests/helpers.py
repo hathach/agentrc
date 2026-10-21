@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import functools
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -46,10 +47,8 @@ def pid_alive(pid):
             os.kill(pid, 0)
         except ProcessLookupError:
             return False
-        st = proc_stat(pid)    # a zombie has exited: an orphan left to the survivor guard's subreaper stays one
-        return st is None or st[1] != 'Z'
-    import ctypes   # os.kill(pid, 0) would terminate it on Windows
-    kernel32 = ctypes.WinDLL('kernel32')
+        return not exited(pid)    # an orphan left to the survivor guard's subreaper stays a zombie
+    kernel32 = ctypes.WinDLL('kernel32')    # os.kill(pid, 0) would terminate it on Windows
     kernel32.OpenProcess.restype = ctypes.c_void_p
     handle = kernel32.OpenProcess(0x00100000, False, pid)   # SYNCHRONIZE
     if not handle:
@@ -86,13 +85,25 @@ SURVIVOR_GRACE = 2      # seconds a process the test's cleanup already ended get
 
 
 def proc_stat(pid):
-    """(ppid, state, start time) of pid, None once it is gone."""
+    """(ppid, state, start time) of pid, or of the thread 'pid/task/tid', None once it is gone."""
     try:
         with open(f'/proc/{pid}/stat') as f:
             fields = f.read().rsplit(')', 1)[1].split()
     except (OSError, IndexError):
         return None
     return int(fields[1]), fields[0], fields[19]
+
+
+def exited(pid):
+    """Whether pid is a zombie whose threads have all exited too (a zombie leader's may still run); False where
+    /proc cannot tell."""
+    if (st := proc_stat(pid)) is None or st[1] != 'Z':
+        return False
+    with contextlib.suppress(OSError):
+        for tid in os.listdir(f'/proc/{pid}/task'):
+            if (task := proc_stat(f'{pid}/task/{tid}')) and task[1] not in 'ZX':
+                return False
+    return True
 
 
 def children(pid):
@@ -106,11 +117,13 @@ def children(pid):
 
 
 def descendants():
-    """{pid: (ppid, state, start time)} of every descendant of this process."""
+    """{pid: (ppid, state, start time)} of every descendant of this process, each still the child of the process
+    whose list named it when read, not a later process reusing its pid."""
     found, frontier = {}, [os.getpid()]
     while frontier:
-        for kid in children(frontier.pop()):
-            if kid not in found and (st := proc_stat(kid)):
+        parent = frontier.pop()
+        for kid in children(parent):
+            if kid not in found and (st := proc_stat(kid)) and st[0] == parent:
                 found[kid] = st
                 frontier.append(kid)
     return found
@@ -139,51 +152,72 @@ def get_subreaper():
 
 def set_subreaper(flag):
     """Set whether orphaned descendants are reparented to this process rather than init, so the guard still sees
-    a double-forked one."""
-    return prctl(PR_SET_CHILD_SUBREAPER, int(flag)) == 0
+    a double-forked one; whether the flag now reads back as set."""
+    return prctl(PR_SET_CHILD_SUBREAPER, int(flag)) == 0 and get_subreaper() == int(flag)
+
+
+@contextlib.contextmanager
+def pinned(pid, start):
+    """A pidfd for pid while it is still the process that started at start, else None: unlike the pid, the pidfd
+    never names a later process that reuses it."""
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        yield None
+        return
+    try:
+        yield fd if (st := proc_stat(pid)) and st[2] == start else None
+    finally:
+        os.close(fd)
+
+
+def reap(fd):
+    with contextlib.suppress(ChildProcessError):    # not this process's child
+        os.waitid(os.P_PIDFD, fd, os.WEXITED | os.WNOHANG)
 
 
 def reap_if_ours(pid, start):
-    """Reap pid if it is still the process that started at start and is now a zombie of this process."""
-    st = proc_stat(pid)
-    if st and st[2] == start and st[1] == 'Z' and st[0] == os.getpid():
-        with contextlib.suppress(ChildProcessError):
-            os.waitpid(pid, os.WNOHANG)
+    """Reap pid if it is still the process that started at start, has exited and is a child of this process."""
+    with pinned(pid, start) as fd:
+        if fd is not None:
+            reap(fd)
 
 
 def end(pid, start):
-    """SIGKILL pid if it is still the process that started at start, and wait until it is gone or a zombie,
-    reaped if it is this process's."""
-    if (st := proc_stat(pid)) is None or st[2] != start:
-        return
-    with contextlib.suppress(ProcessLookupError):
-        os.kill(pid, signal.SIGKILL)
-    deadline = time.monotonic() + 10
-    while (st := proc_stat(pid)) and st[2] == start and st[1] != 'Z' and time.monotonic() < deadline:
-        time.sleep(0.02)
-    reap_if_ours(pid, start)
+    """SIGKILL pid if it is still the process that started at start, wait until it has exited, and reap it if it
+    is this process's."""
+    with pinned(pid, start) as fd:
+        if fd is None:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        select.select([fd], [], [], 10)    # readable once every thread has exited
+        reap(fd)
 
 
 def check_no_survivors(baseline):
     """Give every descendant of this process missing from baseline ((pid, start time) pairs) SURVIVOR_GRACE to
-    exit, then kill it; reap the zombies left to this process, and fail naming the ones that still ran."""
-    named, deadline = {}, time.monotonic() + SURVIVOR_GRACE
+    exit, then kill it; reap the zombies left to this process, and fail naming the ones that still ran. Done only
+    once two walks in a row find the same: a process reparented while one walk ran shows in the next."""
+    named, deadline, settled = {}, time.monotonic() + SURVIVOR_GRACE, None
     for _ in range(1000):
-        table = descendants()
-        left = [p for p, (ppid, state, start) in table.items() if (p, start) not in baseline
-                and (state != 'Z' or ppid == os.getpid())]
-        for pid in left:
-            if table[pid][1] == 'Z':
-                reap_if_ours(pid, table[pid][2])
-        running = [p for p in left if table[p][1] != 'Z']
+        new = {p: st for p, st in descendants().items() if (p, st[2]) not in baseline}
+        running = {p: start for p, (_, _, start) in new.items() if not exited(p)}
+        for pid, (ppid, _, start) in new.items():
+            if pid not in running and ppid == os.getpid():
+                reap_if_ours(pid, start)
         if not running:
-            break
+            if settled == new:
+                break
+            settled = new
+            continue
+        settled = None
         if time.monotonic() < deadline:
             time.sleep(0.05)
             continue
-        for pid in running:
+        for pid, start in running.items():
             named.setdefault(pid, cmdline(pid))
-            end(pid, table[pid][2])
+            end(pid, start)
     if named:
         raise AssertionError('killed processes that outlived their test: '
                              + '; '.join(f'{pid} {cmd}' for pid, cmd in named.items()))
@@ -195,8 +229,14 @@ def survivor_guard_off():
         return 'no /proc to name descendants by pid and start time'
     if not os.path.exists(f'/proc/self/task/{os.getpid()}/children'):
         return 'no /proc/<pid>/task/<tid>/children (CONFIG_PROC_CHILDREN) to find descendants by'
-    if get_subreaper() is None:
+    if (flag := get_subreaper()) is None or not set_subreaper(flag):
         return 'no PR_SET_CHILD_SUBREAPER: a double-forked survivor would escape to init'
+    if not all(hasattr(m, name) for m, name in ((os, 'pidfd_open'), (os, 'P_PIDFD'), (signal, 'pidfd_send_signal'))):
+        return 'no pidfd_open, waitid(P_PIDFD) and pidfd_send_signal to hold a process across pid reuse'
+    try:
+        os.close(os.pidfd_open(os.getpid()))
+    except OSError as e:
+        return f'pidfd_open: {e.strerror}: no pidfd to hold a process across pid reuse'
     return None
 
 
@@ -208,14 +248,16 @@ def start_survivor_guard(case):
     for survivors after the case's other cleanups: registered first, it runs last."""
     baseline = {(pid, start) for pid, (_, _, start) in descendants().items()}
     original = get_subreaper()
-    set_subreaper(True)
+    if not set_subreaper(True):
+        raise AssertionError('the survivor guard could not set the child-subreaper flag')
 
     def check():
         try:
             check_no_survivors(baseline)
         finally:
-            set_subreaper(original)
             case._survivor_guard = False
+            if not set_subreaper(original):
+                raise AssertionError(f'the survivor guard could not restore the child-subreaper flag to {original}')
     case.addCleanup(check)
 
 
