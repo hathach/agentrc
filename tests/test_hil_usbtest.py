@@ -17,6 +17,7 @@ import importlib.util
 import io
 import itertools
 import select
+import shutil
 import signal
 import stat
 import subprocess
@@ -635,6 +636,187 @@ class DmesgTail(unittest.TestCase):
         lines = [f'usbtest {i}' if i % 2 else f'other {i}' for i in range(30)]
         patch(self, hu, '_sudo_soft', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '\n'.join(lines), ''))
         self.assertEqual(hu.dmesg_tail().splitlines(), [f'usbtest {i}' for i in range(15, 30, 2)])
+
+
+class FindDevice(unittest.TestCase):
+    """find_device is usbtest's lookup on usb_observe.usb_scan: a full scan reads every
+    vid:pid peer's bounded `serial`; a device found by serial is cached and re-confirmed by
+    its own serial alone while the lock-free picture of its peers holds."""
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        self.root = Path(td.name)
+        uo = load('usb_observe')            # a fresh strand memo per test
+        patch(self, uo, 'SYS_USB_DEVICES', td.name)
+        patch(self, hu, 'usb_observe', uo)
+        patch(self, hu, '_DEV_CACHE', {})
+        self.reads = []
+        real = uo.read_sysfs
+
+        self.on_read = {}                   # busport -> called once before its serial is read
+
+        def counting(path, *a, **k):
+            busport = os.path.basename(os.path.dirname(path))
+            self.reads.append(busport)
+            if busport in self.on_read:
+                self.on_read.pop(busport)()
+            return real(path, *a, **k)
+        patch(self, uo, 'read_sysfs', counting)
+        self.devnums = itertools.count(2)   # each enumeration gets a new address, as the kernel's
+
+    def dev(self, busport, serial='UID1', pid=PID, **attrs):
+        d = self.root / busport
+        d.mkdir()
+        values = {'idVendor': VID, 'idProduct': pid, 'busnum': busport.split('-')[0],
+                  'devnum': str(next(self.devnums)), 'speed': '480', 'bcdDevice': '0102',
+                  'serial': serial, **attrs}
+        for name, value in values.items():
+            if value is not None:
+                (d / name).write_text(value + '\n')
+        return d
+
+    def gone(self, busport):
+        shutil.rmtree(self.root / busport)
+
+    def replace(self, busport, serial='UID1', **attrs):
+        """A new enumeration at `busport`: made before the old one is removed, so its dir
+        cannot reuse the old inode, as kernfs never does."""
+        old = self.root / busport
+        os.rename(old, self.root / f'old{next(self.devnums)}')
+        self.dev(busport, serial, **attrs)
+
+    def find(self, serial='UID1', timeout=0.05):
+        self.reads.clear()
+        return hu.find_device(VID, PID, serial, timeout=timeout)
+
+    def test_the_device_answering_the_serial_is_described(self):
+        self.dev('3-1', serial='UID1', bcdDevice='0103')
+        self.dev('3-2', serial='OTHER')
+        self.dev('3-3', serial='UID1', pid='4011')
+        self.assertEqual(self.find('uid1'), {'sysname': '3-1', 'serial': 'UID1',
+                                             'node': '/dev/bus/usb/003/002', 'speed': '480', 'tier': 3})
+
+    def test_ids_match_as_ints_or_hex_strings_of_either_case(self):
+        self.dev('3-1')
+        for ids in ((0xcafe, 0x4010), ('CAFE', '4010'), (VID, PID)):
+            with self.subTest(ids=ids):
+                self.assertEqual(hu.find_device(*ids, 'UID1', timeout=0.05)['sysname'], '3-1')
+
+    def test_a_wedged_peer_costs_one_bounded_read_per_scan(self):
+        self.dev('1-1')
+        self.dev('1-3', serial='OTHER')
+        os.mkfifo(self.dev('1-2', serial=None) / 'serial')       # a read that never answers
+        self.assertEqual(self.find(timeout=0.5)['sysname'], '1-1')
+        self.assertEqual(self.reads.count('1-2'), 1)
+        t0 = time.monotonic()
+        for _ in range(3):
+            self.assertEqual(self.find(timeout=0.5)['sysname'], '1-1')
+            self.assertEqual(sorted(self.reads), ['1-1', '1-2'],
+                             'the cached path reads its own serial and the unread peer, once each')
+        self.assertLess(time.monotonic() - t0, 0.5, 'the stranded peer cost its grace again')
+
+    def test_a_dual_port_enumeration_is_ambiguous_until_it_drops(self):
+        self.dev('1-1')
+        self.dev('1-2')
+        self.assertEqual(self.find(), {'ambiguous': ['1-1', '1-2']})
+        self.assertEqual(hu._DEV_CACHE, {})
+        self.gone('1-2')
+        self.assertEqual(self.find()['sysname'], '1-1')
+
+    def test_a_second_device_after_the_cache_is_ambiguous(self):
+        self.dev('1-1')
+        self.find()
+        self.assertTrue(hu._DEV_CACHE)
+        self.dev('1-2')
+        self.assertEqual(self.find(), {'ambiguous': ['1-1', '1-2']})
+
+    def test_a_peer_unreadable_at_scan_time_that_answers_later_is_rescanned(self):
+        """The serial of a device that was readable to nobody may be ours: once it answers,
+        the cache no longer knows the match count."""
+        self.dev('1-1')
+        self.dev('1-2', serial=None)
+        self.find()
+        (self.root / '1-2' / 'serial').write_text('UID1\n')     # same enumeration, now answers
+        self.assertEqual(self.find(), {'ambiguous': ['1-1', '1-2']})
+
+    def test_a_renumbered_sysname_is_re_resolved_by_serial(self):
+        self.dev('1-1')
+        self.assertEqual(self.find()['node'], '/dev/bus/usb/001/002')
+        self.gone('1-1')
+        self.dev('1-1', serial='OTHER')                         # another board took the port
+        self.dev('2-3')
+        self.assertEqual(self.find(), {'sysname': '2-3', 'serial': 'UID1',
+                                       'node': '/dev/bus/usb/002/004', 'speed': '480', 'tier': 2})
+
+    def test_a_re_enumeration_during_the_cached_read_is_rescanned(self):
+        self.dev('1-1')
+        self.find()
+        self.on_read['1-1'] = lambda: self.replace('1-1')
+        self.assertEqual(self.find()['node'], '/dev/bus/usb/001/004',
+                         "the old enumeration's node went out with the new one's serial")
+
+    def test_a_peer_re_enumerated_at_the_same_address_is_rescanned(self):
+        """devnum wraps (v6.12 hub.c choose_devnum), so busport, busnum and devnum can all
+        repeat: only the dir's inode tells the new enumeration apart."""
+        self.dev('1-1')
+        self.dev('1-2', serial='OTHER')
+        self.find()
+        self.replace('1-2', devnum=(self.root / '1-2' / 'devnum').read_text().strip())
+        self.assertEqual(self.find(), {'ambiguous': ['1-1', '1-2']})
+
+    def test_a_device_seen_only_by_the_scan_is_not_cached(self):
+        """Picture and selection from one observation: a device that came for the scan and
+        left before the picture must not be cached against a picture that never held it."""
+        uo, real = hu.usb_observe, hu.usb_observe.usb_scan
+
+        def visiting(**kw):
+            self.dev('1-1')
+            try:
+                return real(**kw)
+            finally:
+                self.gone('1-1')
+        patch(self, uo, 'usb_scan', visiting)
+        self.assertEqual(self.find()['sysname'], '1-1')
+        patch(self, uo, 'usb_scan', real)
+        self.assertIsNone(self.find())
+
+    def test_the_cached_port_answering_another_serial_is_never_trusted(self):
+        self.dev('1-1')
+        self.find()
+        (self.root / '1-1' / 'serial').write_text('OTHER\n')
+        self.assertIsNone(self.find())
+        self.assertEqual(hu._DEV_CACHE, {})
+
+    def test_a_missing_or_malformed_attribute_is_refused_not_guessed(self):
+        for attrs, named in (({'busnum': None}, 'busnum'), ({'devnum': 'x'}, 'devnum'),
+                             ({'speed': None}, 'speed'), ({'speed': 'fast'}, 'speed'),
+                             ({'speed': 'unknown'}, 'speed'), ({'bcdDevice': '12'}, 'bcdDevice')):
+            with self.subTest(named, **attrs):
+                self.dev('1-1', **attrs)
+                try:
+                    self.assertEqual([d['busport'] for d in hu.usb_observe.usb_scan()], ['1-1'],
+                                     'usb_scan keeps the device its callers always received')
+                    with self.assertRaises(SystemExit) as cm:
+                        self.find()
+                    self.assertIn(named, str(cm.exception.code))
+                finally:
+                    self.gone('1-1')
+
+    def test_a_device_that_left_mid_walk_is_not_found(self):
+        gone = {'busport': '1-1', 'dir': str(self.root / '1-1'), 'ino': 1, 'vid': VID, 'pid': PID,
+                'busnum': None, 'devnum': None, 'speed': None, 'bcdDevice': None, 'serial': 'UID1'}
+        patch(self, hu.usb_observe, 'usb_scan', lambda **kw: [gone])
+        self.assertIsNone(self.find())
+
+    def test_several_devices_without_a_serial_is_a_named_exit(self):
+        self.dev('1-1', serial='A')
+        self.assertEqual(self.find(None)['serial'], 'A')
+        self.assertEqual(hu._DEV_CACHE, {}, 'only a serial lookup is cached')
+        self.dev('1-2', serial='B')
+        with self.assertRaises(SystemExit) as cm:
+            self.find(None)
+        self.assertIn('use --serial: ', str(cm.exception.code))
 
 
 class HostCompat(unittest.TestCase):

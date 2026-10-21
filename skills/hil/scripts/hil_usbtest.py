@@ -2,10 +2,10 @@
 """Linux usbtest/testusb mechanics shared by the HIL harnesses (`hil` skill). Linux only,
 stdlib only.
 
-Driver registration and binding, the bounded testusb case run and its parsing, and the
-upstream host controller check. Every project value is a parameter: the device VID:PID,
-the reference id whose capability profile it inherits, the interface, the usbfs node, the
-case, its testusb options and every bound. Which cases run, their options, throughput,
+The device lookup, driver registration and binding, the bounded testusb case run and its
+parsing, and the upstream host controller check. Every project value is a parameter: the
+device VID:PID, the reference id whose capability profile it inherits, the interface, the
+usbfs node, the case, its testusb options and every bound. Which cases run, their options, throughput,
 recovery and the report are the caller's.
 
 Failures that make a battery meaningless exit (SystemExit with the reason), as a CLI
@@ -25,6 +25,7 @@ testusb reporting quirks run_case works around:
 from __future__ import annotations
 
 import fcntl
+import importlib.util
 import os
 import re
 import subprocess
@@ -44,6 +45,25 @@ HELPER_TIMEOUT = 30         # default bound for sudo helpers (dmesg/modprobe/set
 RE_PASS = re.compile(r'test (\d+),\s*(\d+)\.(\d+) secs')
 RE_FAIL = re.compile(r'test (\d+) --> (\d+) \((.*)\)')
 _HEX4 = re.compile(r'[0-9a-f]{4}\Z')
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location(f'agentrc_{name}', os.path.join(HERE, f'{name}.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# find_device's walk and bounded reads. A harness that loads usb_observe itself assigns its
+# instance here, so the strand memo its path_stranded checks read is the one find_device fed.
+usb_observe = _load('usb_observe')
+
+SERIAL_GRACE = 1.0   # find_device's bound on one `serial` read, tighter than usb_observe's
+                     # default on purpose: a runner calls it after every case and in its
+                     # startup poll, so N wedged peers cost N x this on the scan that meets them
+_DEV_CACHE: dict = {}   # (vid, pid, serial lowercased) -> what find_device last resolved
 
 
 def run(cmd, **kw):
@@ -140,6 +160,105 @@ def dmesg_tail():
 def needs_sudo(node):
     """Device nodes are usually opened directly (udev rule); sudo only if not."""
     return not os.access(node, os.W_OK) and os.geteuid() != 0
+
+
+# speed_show's values (v6.12 drivers/usb/core/sysfs.c:145-177) less 'unknown', which names no speed
+_SPEEDS = ('1.5', '12', '480', '5000', '10000', '20000')
+
+
+def _describe(dev, serial):
+    """find_device's result for usb_observe entry `dev`, whose `serial` the caller read and
+    matched; None when it left the bus mid-walk. A present device whose node, speed or tier
+    attribute is missing or malformed is a named exit, never a guess."""
+    bad = [k for k in ('busnum', 'devnum') if dev[k] is None]
+    if dev['speed'] not in _SPEEDS:
+        bad.append('speed')
+    bcd = dev['bcdDevice']
+    if bcd is None or not _HEX4.match(bcd):
+        bad.append('bcdDevice')
+    if bad:
+        if not os.path.isdir(dev['dir']):
+            return None
+        sys.exit(f"{dev['busport']} ({dev['vid']}:{dev['pid']} serial {serial}) has no usable "
+                 f"{', '.join(bad)}: refusing to guess its node, speed or tier")
+    return {'sysname': dev['busport'], 'serial': serial,
+            'node': '/dev/bus/usb/%03d/%03d' % (dev['busnum'], dev['devnum']),
+            'speed': dev['speed'], 'tier': int(bcd[-2:], 16)}
+
+
+def _identities(devs):
+    return {(d['busport'], d['ino']) for d in devs}
+
+
+def _confirm(cached, peers, serial, timeout):
+    """The cached device re-described after a bounded read of its own serial, or None when a
+    full scan must decide: the device gone or re-enumerated, its serial another board's, or a
+    peer the last scan could not read now answering (it may answer `serial` too)."""
+    dev = next((d for d in peers if (d['busport'], d['ino']) == cached['target']), None)
+    if dev is None:
+        return None
+    sn = usb_observe.read_sysfs(os.path.join(dev['dir'], 'serial'), timeout)
+    if sn is None or sn.lower() != serial.lower() \
+            or usb_observe.enumeration_id(dev['dir']) != dev['ino']:
+        return None
+    if any(usb_observe.read_sysfs(os.path.join(d, 'serial'), timeout) is not None
+           for d in cached['unread']):
+        return None
+    return _describe(dev, sn)
+
+
+def _hex_id(value):
+    """A vid or pid as sysfs writes it, from an int (0xcafe) or a hex string ('CAFE')."""
+    return f'{value:04x}' if isinstance(value, int) else value.lower()
+
+
+def find_device(vid, pid, serial=None, timeout=SERIAL_GRACE):
+    """The enumerated `vid`:`pid` device answering `serial` (any, when None): {sysname, serial,
+    node, speed, tier}, {'ambiguous': [sysnames]} when several answer `serial`, or None. Several
+    devices without a `serial` to choose is a named exit. `vid` and `pid` are ints or hex strings.
+
+    A full scan (usb_observe.usb_scan) pays a bounded `serial` read on every vid:pid peer, and
+    a runner calls this after every case, so a device found by `serial` is cached: the next
+    call reads only its own serial, the one attribute that tells identical boards apart -- a
+    busport can name a different board after a renumber (controller reset, reboot). The cache
+    holds only while the lock-free picture of vid:pid devices is unchanged (none added, gone or
+    re-enumerated: each changes an enumeration_id) and every peer the scan could not read
+    still cannot be read, so a second device answering `serial` always reaches the full scan.
+    A wedged peer costs one bounded read per call, at once after the first (read_sysfs
+    memoises it).
+    """
+    vid, pid = _hex_id(vid), _hex_id(pid)
+    key = (vid, pid, serial.lower()) if serial else None
+    cached = _DEV_CACHE.pop(key, None)
+    if cached:
+        peers = usb_observe.usb_devices(vid_pid=(vid, pid))
+        if _identities(peers) == cached['picture']:
+            hit = _confirm(cached, peers, serial, timeout)
+            if hit:
+                _DEV_CACHE[key] = cached
+                return hit
+    scanned = usb_observe.usb_scan(vid_pid=(vid, pid), timeout=timeout)
+    matches = [d for d in scanned if serial is None or d['serial'].lower() == serial.lower()]
+    if len(matches) > 1:
+        if serial:
+            # Dual-port parts (nanoch32v203, ch32v307) briefly enumerate BOTH ports with
+            # one serial around a variant reflash, and picking one could bind the stale
+            # port -- report ambiguity so the caller retries until it drops.
+            return {'ambiguous': sorted(d['busport'] for d in matches)}
+        sys.exit(f'multiple {vid}:{pid} devices found, use --serial: '
+                 + ', '.join(d['serial'] for d in matches))
+    hit = _describe(matches[0], matches[0]['serial']) if matches else None
+    if hit and serial:
+        # the picture is walked after the scan, and cached only if it still holds every device
+        # the scan read: one observation, so nothing the scan never saw can hide behind it
+        peers = usb_observe.usb_devices(vid_pid=(vid, pid))
+        read = _identities(scanned)
+        if read <= _identities(peers):
+            _DEV_CACHE[key] = {'target': (hit['sysname'], matches[0]['ino']),
+                               'picture': _identities(peers),
+                               'unread': [d['dir'] for d in peers
+                                          if (d['busport'], d['ino']) not in read]}
+    return hit
 
 
 def check_host_compat(node):

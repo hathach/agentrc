@@ -164,8 +164,72 @@ def read_sysfs(path: str, timeout: float = SYSFS_READ_GRACE) -> str | None:
     return None
 
 
+def _free_attr(d: str, name: str) -> str | None:
+    """A lock-free attribute's value, or None when absent, unreadable or empty."""
+    try:
+        with open(os.path.join(d, name)) as f:
+            return f.read().strip() or None
+    except (OSError, ValueError):
+        return None
+
+
+def _int_or_none(text: str | None) -> int | None:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def enumeration_id(d: str) -> int | None:
+    """Device dir `d`'s inode, or None when it is gone. kernfs numbers every node it creates
+    afresh for the boot (v6.12 fs/kernfs/dir.c:630-640, the inode from it at inode.c:251),
+    so a re-enumeration at the same busport changes it even when the bus hands out the same
+    devnum again (hub.c choose_devnum wraps at 128). os.stat never calls ->show(), so it
+    cannot block on a wedged device."""
+    try:
+        return os.stat(d).st_ino
+    except OSError:
+        return None
+
+
+def usb_devices(vid_pid=None, vid=None) -> list:
+    """usb_scan's walk without its one locked read: [{busport, dir, ino, vid, pid, busnum,
+    devnum, speed, bcdDevice}] for every enumerated device matching the filters, `serial`
+    never read, so it cannot block. `ino` is the enumeration_id the attributes were read
+    under; busnum and devnum are ints. Any of the last four that is absent or malformed is
+    None, and never drops the device."""
+    out = []
+    for d in glob.glob(os.path.join(SYS_USB_DEVICES, '*-*')):
+        # `in`, not endswith: an interface is '<busport>:<cfg>.<ifnum>' (2-4:1.0), which
+        # CONTAINS the colon rather than ending with it. Screening them out here is worth
+        # real time: interfaces are most of the matches.
+        if ':' in os.path.basename(d):
+            continue
+        ino = enumeration_id(d)       # before the attributes, so a later change shows
+        try:
+            with open(os.path.join(d, 'idVendor')) as f:
+                dev_vid = f.read().strip()
+            with open(os.path.join(d, 'idProduct')) as f:
+                dev_pid = f.read().strip()
+        except OSError:
+            continue          # vanished mid-walk, or not a device dir: a fact, not unknown
+        if ino is None:
+            continue
+        if vid_pid is not None and (dev_vid, dev_pid) != tuple(vid_pid):
+            continue          # ruled out for free, without touching the locked attribute
+        if vid is not None and dev_vid != vid:
+            continue          # same, for callers that know the VID but not the PID
+        # lock-free sysfs_emit too (v6.12 sysfs.c:145-217 speed/busnum/devnum, :705 bcdDevice)
+        out.append({'busport': os.path.basename(d), 'dir': d, 'ino': ino, 'vid': dev_vid, 'pid': dev_pid,
+                    'busnum': _int_or_none(_free_attr(d, 'busnum')),
+                    'devnum': _int_or_none(_free_attr(d, 'devnum')),
+                    'speed': _free_attr(d, 'speed'), 'bcdDevice': _free_attr(d, 'bcdDevice')})
+    return out
+
+
 def usb_scan(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> list:
-    """Enumerated USB devices matching the filters: [{busport, dir, vid, pid, serial}].
+    """Enumerated USB devices matching the filters: usb_devices' entries, each with its
+    `serial` added.
 
     Three rules, one implementation for every caller:
 
@@ -179,33 +243,19 @@ def usb_scan(vid_pid=None, serial=None, vid=None, timeout=SYSFS_READ_GRACE) -> l
       every peer that shares its VID -- so the bound is what stops one wedged DUT from
       stalling every caller (see read_sysfs).
 
-    A device whose serial is missing or unreadable is not returned.
+    A device whose serial is missing or unreadable, or that re-enumerated while it was read,
+    is not returned; the next scan sees the new enumeration.
     """
     out = []
-    for d in glob.glob(os.path.join(SYS_USB_DEVICES, '*-*')):
-        # `in`, not endswith: an interface is '<busport>:<cfg>.<ifnum>' (2-4:1.0), which
-        # CONTAINS the colon rather than ending with it. Screening them out here is worth
-        # real time: interfaces are most of the matches.
-        if ':' in os.path.basename(d):
-            continue
-        try:
-            with open(os.path.join(d, 'idVendor')) as f:
-                dev_vid = f.read().strip()
-            with open(os.path.join(d, 'idProduct')) as f:
-                dev_pid = f.read().strip()
-        except OSError:
-            continue          # vanished mid-walk, or not a device dir: a fact, not unknown
-        if vid_pid is not None and (dev_vid, dev_pid) != tuple(vid_pid):
-            continue          # ruled out for free, without touching the locked attribute
-        if vid is not None and dev_vid != vid:
-            continue          # same, for callers that know the VID but not the PID
-        sn = read_sysfs(os.path.join(d, 'serial'), timeout)
+    for dev in usb_devices(vid_pid, vid):
+        sn = read_sysfs(os.path.join(dev['dir'], 'serial'), timeout)
         if sn is None:
             continue          # serial missing or unreadable (wedged, stranded, OSError)
+        if enumeration_id(dev['dir']) != dev['ino']:
+            continue          # re-enumerated across the read: this serial is not the entry's device
         if serial is not None and sn.lower() != serial.lower():
             continue
-        out.append({'busport': os.path.basename(d), 'dir': d,
-                    'vid': dev_vid, 'pid': dev_pid, 'serial': sn})
+        out.append({**dev, 'serial': sn})
     return out
 
 
