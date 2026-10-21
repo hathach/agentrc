@@ -390,6 +390,12 @@ def _unavailable(e) -> LockUnavailable:
     return LockUnavailable(f'board lock unavailable: {e}{hint}')
 
 
+def _valid_group(locks, board) -> bool:
+    """A protected group as its taker declares it: unique valid lock names, `board` among them."""
+    return (isinstance(locks, (list, tuple)) and all(isinstance(b, str) and _NAME.match(b) for b in locks)
+            and board in locks and len(set(locks)) == len(locks))
+
+
 def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     """Take the board's flock and record ourselves as its holder; returns the open handle
     (keep it referenced; release_board_lock ends it). Raises BoardLocked when another session
@@ -410,8 +416,7 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         except OSError as e:
             raise _unavailable(e) from e
         locks = extra.get('locks', [board])
-        if not (isinstance(locks, (list, tuple)) and all(isinstance(b, str) and _NAME.match(b) for b in locks)
-                and board in locks and len(set(locks)) == len(locks)):
+        if not _valid_group(locks, board):
             raise ValueError(f'protected group {locks!r:.200} must be unique valid lock names, {board} among them')
         locks = list(locks)
         extra = {'protected': True, **extra, 'locks': locks}
@@ -766,7 +771,8 @@ def _links(b):
     """(names, problem): the boards `b`'s readable record and journal chain declare as their lock
     sets (None when they declare none: an older helper's record, or one cut short mid-write),
     and why the set they cover is unknown, or '': a journal that cannot be read, or a `locks`
-    present but not a non-empty list of names."""
+    present but not a non-empty list of names, whose names still count so discovery reaches
+    this board and refuses there."""
     names, problem = None, ''
     journal = journal_state(b)
     if journal == {}:
@@ -781,8 +787,9 @@ def _links(b):
         locks = rec['locks']
         if not isinstance(locks, list) or not locks or not all(isinstance(n, str) for n in locks):
             problem = problem or f'{b}: lock set {locks!r:.80} is not a list of names'
-            continue
-        names = (names or []) + locks
+        readable = [n for n in locks if isinstance(n, str)] if isinstance(locks, list) else []
+        if readable:
+            names = (names or []) + readable
     return names, problem
 
 
@@ -1027,7 +1034,7 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
         raise ValueError(f'cleanup holder handoff refused: {", ".join(unprotected)} not taken protected; '
                          f'nothing changed, the caller still holds every board')
     other = [f'{b} declares {g!r:.80}' for b, g in groups.items()
-             if not isinstance(g, list) or sorted(map(str, g)) != locks]
+             if not _valid_group(g, b) or sorted(g) != locks]
     if other:
         raise ValueError(f'cleanup holder handoff refused: the group taken protected is not the handed boards '
                          f'{locks} ({"; ".join(other)}); nothing changed, the caller still holds every board')

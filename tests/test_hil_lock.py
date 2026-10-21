@@ -1735,6 +1735,24 @@ class ProtectedGroup(LockDir):
                     hil_lock.take_over(self.A, 'selftest recovery')
                 self.assertEqual(hil_lock.journal_names(), [])
 
+    def test_a_malformed_group_still_names_its_readable_members_and_refuses(self):
+        Path(hil_lock.lock_path(self.A)).write_text('{}')                  # declares nothing
+        held = {'pid': 999999999, 'reason': 'selftest run', 'protected': True}
+        for where in ('record', 'journal'):
+            with self.subTest(where=where):
+                journal = Path(self.dir, self.B + hil_lock.JOURNAL)
+                if where == 'record':
+                    Path(hil_lock.lock_path(self.B)).write_text(json.dumps({**held, 'locks': [self.A, 1]}))
+                else:
+                    Path(hil_lock.lock_path(self.B)).write_text(json.dumps(held))
+                    journal.write_text(json.dumps({'token': 'selftest', 'locks': [self.A, 1]}))
+                before = Path(hil_lock.lock_path(self.B)).read_bytes()
+                with self.assertRaisesRegex(hil_lock.LockUnavailable, f'{self.B}: lock set .* is not a list of names'):
+                    hil_lock.take_over(self.A, 'selftest recovery')
+                self.assertEqual(Path(hil_lock.lock_path(self.B)).read_bytes(), before)
+                self.assertEqual(hil_lock.read_record(self.A), {})
+                self.assertEqual(hil_lock.journal_names(), [self.B] if where == 'journal' else [])
+
     def test_a_member_whose_chain_is_partly_unreadable_still_names_the_group_and_refuses(self):
         Path(hil_lock.lock_path(self.A)).write_bytes(b'#{"pid": 9')        # cut short: declares nothing
         Path(hil_lock.lock_path(self.B)).write_text(json.dumps(
