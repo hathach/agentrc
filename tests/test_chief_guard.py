@@ -458,15 +458,23 @@ class ChiefGuard(unittest.TestCase):
                 self.assert_denied(expanded)
         # nested, a sequence, a prefix and suffix, an empty alternative, one too long to expand, inside a substitution
         for c in ('sed {{-i,-n},x}', 'sed -{i..i} x', 'sed x{-i,y}z', 'sed {,-i} x', 'sort {1..999999999}',
-                  'cat <<EOF\n$(sed {-i,x})\nEOF'):
+                  'cat <<EOF\n$(sed {-i,x})\nEOF',
+                  # one unquoted separator is enough
+                  r'sed {-i\,x,y}', "sed {-i',',x}", r'sed -{i.\.i,i} x'):
             self.assert_denied(c, 'brace list')
         # a brace target stays denied even when every path it expands to is outside the worktree
         self.assert_denied('rm /tmp/{a,b}', 'brace list')
         # quoted or escaped is literal, `{}` and `{a}` expand to nothing else, an unscreened command, heredoc data
         for c in ("sed -n p '{-i,x}'", 'sed -n p "{-i,x}"', r'sed -n p \{-i,x\}', 'sed -n p {}', 'sed -n p {a}',
                   r'find . -exec cat {} \;', 'xargs -I {} cat {}', 'A={a,b} git log', "cat <<'EOF'\nsed {-i,x}\nEOF",
-                  'ls src/{a,b}.c'):
+                  'ls src/{a,b}.c',
+                  # bash expands no brace whose separators are all quoted or escaped
+                  r'sed -n p /tmp/{a\,b}', r'sed -n p /tmp/{a\..b}', r'sed -n p /tmp/{a.\.b}',
+                  "sed -n p /tmp/{a','b}", r'rm /tmp/{a\,b}', r'rm /tmp/{a\..b}'):
             self.assert_allowed(c)
+        # its path is still placed, and a quoted dot stays a dot
+        self.assert_denied(rf'rm {self.wt}/src/{{a\,b}}', 'literal absolute path')
+        self.assert_denied("python3 'push.py'", 'workflow')
         # a long word of `{,` with no `}` is no brace list, read in linear time
         start = time.monotonic()
         self.assert_allowed('sed -n p x' + '{,' * 3200)

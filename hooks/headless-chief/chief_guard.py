@@ -178,10 +178,20 @@ def braces(word):
     return 0 <= i < k and (',' in word[i + 1:k] or '..' in word[i + 1:k])
 
 
-# a quoted or escaped operator or glob character stays a word character: these stand in for it until a path is judged
-SPECIAL = PUNCTUATION + GLOB
+# a quoted or escaped operator or glob character stays a word character: these stand in for it until a path is judged;
+# a brace separator's stand-in lasts only until literal() reads the word
+SPECIAL = PUNCTUATION + GLOB + ',.'
 QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
 UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
+SEPARATORS_BACK = str.maketrans({QUOTED[c]: c for c in ',.'})
+BRACES_QUOTED = str.maketrans({c: QUOTED[c] for c in '{}'})
+
+
+def literal(word):
+    """The word with its brace separators back; bash expands no brace whose separators are all quoted, so its braces
+    then take their stand-ins."""
+    plain = word.translate(SEPARATORS_BACK)
+    return plain.translate(BRACES_QUOTED) if braces(plain) and not braces(word) else plain
 HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
 UNKNOWN = '\0'
@@ -306,7 +316,7 @@ class Guard:
         except ValueError as e:
             raise Denied(f'cannot parse this command ({e}); run it as plain words, or dispatch it to a unit')
         seg = []
-        for t in [o for t in tokens for o in operators(t)] + [';']:
+        for t in [literal(o) for t in tokens for o in operators(t)] + [';']:
             if t in SEPARATORS:
                 if seg:
                     self.segment(seg, depth)
