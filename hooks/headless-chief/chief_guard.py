@@ -196,6 +196,10 @@ OPENER = re.compile(r'(?<!<)<<(?!<)')   # `<<<` is a here-string
 # the delimiter as bash reads it, a plain or fully quoted word that a metacharacter ends
 DELIMITER = re.compile(r"""(-)?[ \t]*(['"]?)(\w+)\2(?=[ \t\n;&|<>()]|$)""")
 HEREDOC = re.compile(r"""(?<!<)<<(-)?[ \t]*(['"]?)(\w+)\2([^\n]*)\n(.*?)^(?(1)\t*)\3$""", re.S | re.M)
+# a `<<` bash reads as a shift or as comment text: in a `$((...))` holding no quote, escape, substitution or nested
+# parenthesis, or on a line a `#` starts, before any such character
+ARITHMETIC = re.compile(r'(?<![$\\])\$\(\([^\n()\'"`\\]*\)\)')
+COMMENT = re.compile(r'[ \t]*#[^\n()\'"`\\$]*')
 CONTINUED = re.compile(r'(?<!\\)(?:\\\\)*\\\n')  # an odd run of backslashes before a newline
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
 UNKNOWN = '\0'
@@ -258,20 +262,35 @@ def substitutions(text, quotes=True):
 
 
 def heredocs(command):
-    """Deny a heredoc whose body HEREDOC cannot end where bash does. Read over the raw command, a `<<` in quotes or a
-    comment counts too; one on the last line has no body."""
-    ends, start = ({}, {}), 0   # each line, and as `<<-` reads it, to where it last starts
-    for line in command.split('\n'):
-        ends[0][line] = ends[1][line.lstrip('\t')] = start
-        start += len(line) + 1
-    for m in OPENER.finditer(command, 0, max(command.rfind('\n'), 0)):
-        if not (word := DELIMITER.match(command, m.end())):
+    """Each heredoc's HEREDOC match, read forward as bash reads them: its body is skipped, and with it the rest of its
+    opener's line. Deny one whose delimiter HEREDOC cannot read as bash does, one no line ends, and a second on a line,
+    whose body bash reads after the first's. A `<<` in quotes or a trailing comment counts too; one in `$((...))`, on a
+    comment line or on the last line opens no body."""
+    found, lines, i, start = [], command.split('\n'), 0, 0
+    while i < len(lines) - 1:
+        line = lines[i]
+        masked = ARITHMETIC.sub(lambda a: ' ' * len(a.group()), line)
+        if (comment := COMMENT.match(line)) and not (i and lines[i - 1].endswith('\\')):  # a continued line is no comment
+            masked = ' ' * comment.end() + masked[comment.end():]
+        openers = [o.start() for o in OPENER.finditer(masked)]
+        if not openers:
+            i, start = i + 1, start + len(line) + 1
+            continue
+        if len(openers) > 1:
+            raise Denied('bash reads the body of a second heredoc on a line after the first one\'s, which this guard does '
+                         'not follow; put each heredoc on its own line')
+        if not (word := DELIMITER.match(line, openers[0] + 2)):
             raise Denied("this guard reads a heredoc's delimiter only as a plain word, so it cannot tell where bash ends "
                          "this body; use a plain word delimiter such as EOF or 'EOF'")
-        # bash reads the rest as the body; HEREDOC would rescan it to the end for each such opener
-        if ends[bool(word.group(1))].get(word.group(3), -1) < m.start():
+        end = next((j for j in range(i + 1, len(lines))
+                    if (lines[j].lstrip('\t') if word.group(1) else lines[j]) == word.group(3)), None)
+        if end is None:
             raise Denied(f'no line after this heredoc ends it with {word.group(3)}, so bash reads the rest of the command '
                          'as its body; end the body with its delimiter alone on a line')
+        found.append(HEREDOC.match(command, start + openers[0]))
+        start += sum(len(skipped) + 1 for skipped in lines[i:end + 1])
+        i = end + 1
+    return found
 
 
 def operators(token):
@@ -318,26 +337,24 @@ class Guard:
         if not self.outside(path, ancestors=verb == 'link'):
             raise Denied(f'{why} would {verb} {path.translate(UNQUOTED)}: {rule}')
 
-    def command(self, command, depth=0):
+    def command(self, command, depth=0, raw=True):
         if depth > 3:
             raise Denied('commands nested this deep are not checked; run them as plain words, or dispatch them to a unit')
-        bodies = []
-        heredocs(command)
-
-        def heredoc(m):
+        bodies, text, pos = [], [], 0
+        for m in heredocs(command) if raw else ():
             # bash joins a continued line before it reads the body and, unquoted, before it matches the delimiter
             if CONTINUED.search(m.group(4) + '\n') or not m.group(2) and CONTINUED.search(m.group(5)):
                 raise Denied("a line continuation on a heredoc's line or in an unquoted heredoc body moves where bash "
                              'starts or ends the body; join the line, or quote the delimiter')
             if not m.group(2):  # an unquoted body still runs its substitutions
                 bodies.extend(substitutions(m.group(5), quotes=False)[1])
-            return '<<HEREDOC' + m.group(4) + '\n'
-        # no heredoc starts on the last line, and one holding a `<` ends none: HEREDOC would rescan it for each `<<`
-        cut = command.rfind('\n') + 1
-        cut = cut if '<' in command[cut:] else len(command)
-        text, subs = substitutions(HEREDOC.sub(heredoc, command[:cut]) + command[cut:])
-        for body in bodies + subs:
+            text.append(command[pos:m.start()] + '<<HEREDOC' + m.group(4) + '\n')
+            pos = m.end()
+        text, subs = substitutions(''.join(text) + command[pos:])
+        for body in bodies:
             self.command(body, depth + 1)
+        for body in subs:  # cut from text whose heredocs are read, so a placeholder there opens none
+            self.command(body, depth + 1, raw=False)
         lex = shlex.shlex(text.replace('\n', ' ; '), posix=True, punctuation_chars=PUNCTUATION)
         lex.whitespace_split = True
         lex.commenters = ''  # substitutions() dropped the comments; a # inside a word is data

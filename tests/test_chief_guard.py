@@ -126,6 +126,14 @@ class ChiefGuard(unittest.TestCase):
     def test_heredoc_body_is_data_but_its_line_counts(self):
         self.assert_allowed("cat > /tmp/brief.md <<'EOF'\ngit push\ngh pr merge 1\nEOF")
         self.assert_allowed("cat > /tmp/brief.md <<'EOF'\n# Brief\n\nline 2\nEOF\ncat /tmp/brief.md")
+        # a `<<` in a body is data, whatever follows it, read in linear time
+        for c in ("cat > /tmp/brief.md <<'EOF'\nx = 1 << 2\nEOF", "cat > /tmp/brief.md <<'EOF'\na << b\nEOF",
+                  "cat > /tmp/brief.md <<'EOF'\nuse cout << x; here\nEOF", "cat > /tmp/brief.md <<EOF\nrun cat <<EOF-1\nEOF",
+                  "cat > /tmp/brief.md <<'EOF'\n" + 'a << b\n' * 30000 + 'EOF'):
+            with self.subTest(c=c[:60]):
+                start = time.monotonic()
+                self.assert_allowed(c)
+                self.assertLess(time.monotonic() - start, 3)
         self.assert_denied("cat > src/x.md <<'EOF'\nhello\nEOF", 'literal absolute path')
         self.assert_denied("cat <<EOF | tee src/x\nhi\nEOF", 'literal absolute path')
 
@@ -137,7 +145,12 @@ class ChiefGuard(unittest.TestCase):
                   # a here-string has no body
                   'cat <<<EOF\ngit push\nEOF',
                   # a heredoc ending each line, read in linear time
-                  ': <<E\nx\nE\n' * 32000 + 'git push\n'):
+                  ': <<E\nx\nE\n' * 32000 + 'git push\n',
+                  # a shift in `$((...))` or a `<<` on a comment line opens no body
+                  'x=$((1 << 3))\ngit push\n3', '# <<:\ngit push\n:', '# <<EOF\ngit push\nEOF',
+                  # a substitution is read past a heredoc in it, its placeholder no opener, an unquoted body's own screened
+                  'echo "$(cat <<\'EOF\'\nx\nEOF\ngit push\nHEREDOC\n)"', 'echo "$(cat <<EOF\n$(git push)\nEOF\n)"',
+                  'echo "`cat <<EOF\n$(git push)\nEOF\n`"'):
             with self.subTest(c=c[:60]):
                 start = time.monotonic()
                 self.assert_denied(c, 'changes the repository')
@@ -151,11 +164,16 @@ class ChiefGuard(unittest.TestCase):
                   'cat <<EOF-1\nhi\nEOF-\\\n1\nEOF-1', "cat <<'E-F'\nx\\\n#'\nE-F\nsed -i s/a/b/ src/a.c\n# '",
                   'cat <<EOF#\nhi\nEOF#\ngit push\nEOF', 'cat <<EOF\r\nhi\nEOF\r\ngit push\nEOF',
                   'cat <<:\r\nbody\n:\r\ngit push\n:', 'cat << -E\nhi\n-E\ngit push\nE',
-                  # read over the raw command, a `<<` in a comment or quotes counts too
-                  '# <<:\ngit push\n:', "echo '<<: '\ngit push\n:", "echo '<<EOF'\ngit push\nEOF",
-                  'cat <<A <<B\nA\ncat <<:\nB\ngit push\n:'):
+                  # read over the raw command, a `<<` in quotes or a trailing comment counts too
+                  "echo '<<: '\ngit push\n:", "echo '<<EOF'\ngit push\nEOF", 'git status # <<:\ngit push\n:',
+                  '$((1))# <<:\ngit push\n:'):
             with self.subTest(c=c):
                 self.assert_denied(c, "heredoc's delimiter", "plain word delimiter such as EOF or 'EOF'")
+        # bash reads a second heredoc's body after the first's, where HEREDOC reads commands
+        for c in ('cat <<A <<B\nA\ncat <<:\nB\ngit push\n:', 'cat <<A <<B\nA\ncat <<C\nB\ngit push\nC',
+                  'cat <<A <<B\nA\ngit push\nB'):
+            with self.subTest(c=c):
+                self.assert_denied(c, 'second heredoc on a line')
         # bash reads the rest of the command as an unterminated body
         for c in ("cat <<A\ncat <<':'\n$(git push)\n:", "cat <<A\ncat <<'B'\n$(git push)\nB", 'cat <<-A\nhi\n A\n',
                   ': <<A\n' * 32000 + 'git push\n'):
@@ -164,6 +182,12 @@ class ChiefGuard(unittest.TestCase):
         for c in ('cat <<-EOF\n\tgit push\n\tEOF', 'cat <<EOF;echo x\ngit push\nEOF', 'cat <<EOF\nEOF\ngit status',
                   'cat <<EOF2\nhi\nEOF2\ngit status', 'cat <<"EOF"\n$(git push)\nEOF', "cat <<- 'EOF'\n\thi\n\tEOF",
                   'cat <<<"a b"\ngit status', 'cat <<<"$x"', 'echo $((1<<2))',
+                  # a heredoc in a substitution, its placeholder no opener when the substitution is read
+                  'echo "$(cat <<\'EOF\'\nhello\nEOF\n)"', 'echo "$(cat <<EOF\nhello\nEOF\n)"',
+                  'x="$(cat <<\'EOF\'\nhello\nEOF\n)"\necho "$x"', 'echo "`cat <<\'EOF\'\nhello\nEOF\n`"',
+                  'gh issue view 3 --json body --jq "$(cat <<\'EOF\'\n.body\nEOF\n)"',
+                  # a shift or a comment line opens no body
+                  'x=$((1 << 3))\necho $x', '# 1 << 2\ngit status', 'echo $((1<<2))\n' * 30000,
                   # a `<<` on the last line opens no body
                   "grep -n '<<-' f", 'git status\ngrep -c "<<EOF-1" f', "echo '<<'", 'echo $((1<<2)) ' * 30000):
             with self.subTest(c=c[:60]):
