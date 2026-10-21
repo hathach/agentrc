@@ -658,8 +658,11 @@ def cygpath(posix):
     if posix not in MAPPED:
         # the first cygpath on PATH: another MSYS install than the bash running the command may mount / elsewhere
         exe = on_path('cygpath', ('.exe',))
+        # started from a non-MSYS process, msys-2.0.dll globs and brace-expands its arguments (dcrt0.cc globify)
+        env = {**os.environ, 'MSYS': f"{os.environ.get('MSYS', '')} noglob".strip()}
         try:
-            got = exe and subprocess.run([exe, '-m', posix], capture_output=True, encoding='utf-8', timeout=remaining())
+            got = exe and subprocess.run([exe, '-m', posix], capture_output=True, encoding='utf-8', env=env,
+                                         timeout=remaining())
         except subprocess.TimeoutExpired:
             raise Denied(TOO_LONG) from None
         except (OSError, ValueError, subprocess.SubprocessError):

@@ -734,6 +734,7 @@ class ChiefGuard(unittest.TestCase):
             if args[0] != 'cygpath.exe':
                 return real(args, **kw)
             calls.append(kw['timeout'])
+            self.assertIn('noglob', kw['env']['MSYS'].split(), 'msys-2.0.dll would brace-expand the path')
             return subprocess.CompletedProcess(args, 0, 'C:/Program Files/Git/usr/x\n', '')
         with mock.patch.object(guard, 'on_path', lambda name, exts: name + '.exe'), mock.patch.object(subprocess, 'run', fast):
             self.assertEqual(self.main(guard, 'echo a > /usr/x; echo b > /usr/x; touch /usr/x')[0], 0)
