@@ -1538,10 +1538,6 @@ class Segments(unittest.TestCase):
         self.assertEqual(len(oe.admit_segments([self.seg(), self.seg(offset=0x12000)])), 2)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class RetainedLock(SessionCase):
     """Deny by default: no openocd_esp session, and no board access preparing one, runs for a
     caller that does not declare it keeps the board lock through a pending cleanup."""
@@ -1929,3 +1925,7 @@ class SegmentsFromFlashArgs(unittest.TestCase):
         segs = self.segments(flash_args=f"0x10000 '{odd}'")
         self.assertEqual(segs[0]['file'], str(self.build / odd))
         self.assertNotIn('PWNED', os.listdir(self.build))
+
+
+if __name__ == '__main__':
+    unittest.main()
