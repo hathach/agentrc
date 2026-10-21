@@ -197,8 +197,10 @@ class Load(unittest.TestCase):
                     hl.load(name, p)
                 self.assertNotIn(name, sys.modules)
                 self.assertNotIn(alias, sys.modules)
-                p.write_text(seen)
-                self.assertTrue(hl.load(alias if aliased else name, p).SEEN, 'registered before it runs')
+                p.write_text(f'{seen}DONE = True\n')
+                m = hl.load(alias if aliased else name, p)
+                self.assertTrue(m.SEEN, 'registered before it runs')
+                self.assertTrue(m.DONE, 'the retry ran the replacement source')
 
     def test_a_circular_load_is_refused_not_served_partial(self):
         self.ctx()
