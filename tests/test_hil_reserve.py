@@ -19,6 +19,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -48,7 +49,7 @@ case "$ACTION" in
   survivor) setsid sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   survivor-same-group) sleep 30 </dev/null >/dev/null 2>&1 & echo $! > "$ARGV_OUT.pid"; exit 0 ;;
   hang) sleep 30; exit 0 ;;
-  signals) grep -E '^Sig(Blk|Ign):' /proc/$$/status > "$ARGV_OUT.sig"; exit 0 ;;
+  signals) exec grep -E '^Sig(Blk|Ign):' /proc/$$/status > "$ARGV_OUT.sig" ;;
   trap) exec bash -c 'trap "echo TRAPPED; exit 7" TERM; trap "echo HUP TRAPPED" HUP; for _ in $(seq 50); do sleep 0.1; done' ;;
   refuse) exit 3 ;;
   refuse-drop) mv "$SYS_DEVICES/3-1.4.1" "$SYS_DEVICES/.gone"; exit 3 ;;
@@ -779,6 +780,8 @@ class Run(Fixture):
             for when in ('before', 'after'):
                 with self.subTest(sig=sig.name, when=when):
                     def patch(m, sig=sig, when=when):
+                        # a second thread, as a sysfs reader can be: the kernel may hand it the signal
+                        threading.Thread(target=time.sleep, args=(60,), daemon=True).start()
                         real = m.os.posix_spawnp
 
                         def spawn(*a, **k):

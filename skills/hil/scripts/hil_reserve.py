@@ -307,9 +307,10 @@ class Reservation:
         except (OSError, ValueError) as e:
             raise Refused(f'holder record fields: {e}')
         self.handles = []
-        self.phase = 'pre'          # pre -> command -> post -> cleanup
+        self.phase = 'pre'          # pre -> spawn -> command -> post -> cleanup
         self.pgid = None
         self.noted = []
+        self.deferred = []
 
     def install_signals(self):
         signal.signal(signal.SIGUSR1, signal.SIG_IGN)     # meaningful only as a cleanup holder
@@ -317,6 +318,9 @@ class Reservation:
             signal.signal(s, self._on_signal)
 
     def _on_signal(self, signum, _):
+        if self.phase == 'spawn':        # the group is not known yet: run() replays it
+            self.deferred.append(signum)
+            return
         name = signal.Signals(signum).name
         if self.phase == 'pre':          # nothing mutated yet: give the locks back and stop
             self.release()
@@ -362,20 +366,25 @@ class Reservation:
     def run(self, argv):
         """argv in its own process group; returns its exit code. A command that cannot be
         started mutated nothing: the reservation is released and Refused raised."""
-        # a signal that lands while the child is being spawned waits until its group is known;
-        # the child itself starts unblocked, so its traps see a forwarded signal
-        prev = signal.pthread_sigmask(signal.SIG_BLOCK, HANDLED_SIGNALS)
+        # a signal that lands while the child is being spawned waits until its group is known:
+        # any thread may take it, but its handler runs here and the 'spawn' phase defers it
+        # (glibc blocks every signal around posix_spawn's clone, so the spawn is never
+        # interrupted); the child itself starts unblocked, so its traps see a forwarded signal
+        self.phase = 'spawn'
         try:
             try:
                 pid = os.posix_spawnp(argv[0], argv, os.environ, setpgroup=0, setsigmask=(),
                                       setsigdef=SPAWN_SIGDEF)
             except OSError as e:
+                self.phase = 'pre'
                 self.release()
                 raise Refused(f'cannot start {argv[0]}: {e}')
             self.pgid = pid
             self.phase = 'command'
         finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, prev)
+            deferred, self.deferred = self.deferred, []
+            for signum in deferred:
+                self._on_signal(signum, None)
         next_progress = time.monotonic() + PROGRESS_EVERY
         while True:
             done, status = os.waitpid(pid, os.WNOHANG)
