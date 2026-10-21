@@ -1726,12 +1726,23 @@ class ProtectedGroup(LockDir):
             fh.close()
         self.assertEqual(self.recover(self.B), [self.A, self.B])
 
-    def test_a_record_whose_group_is_not_a_list_of_names_refuses_the_takeover(self):
-        Path(hil_lock.lock_path(self.A)).write_text(json.dumps(
-            {'pid': 999999999, 'reason': 'selftest run', 'protected': True, 'locks': self.B}))
-        with self.assertRaisesRegex(hil_lock.LockUnavailable, 'is not a list of names'):
+    def test_a_group_present_but_not_a_list_of_names_refuses_the_takeover(self):
+        for locks in (self.B, False, 0, '', {}, [], None, [1]):
+            with self.subTest(locks=locks):
+                Path(hil_lock.lock_path(self.A)).write_text(json.dumps(
+                    {'pid': 999999999, 'reason': 'selftest run', 'protected': True, 'locks': locks}))
+                with self.assertRaisesRegex(hil_lock.LockUnavailable, 'is not a list of names'):
+                    hil_lock.take_over(self.A, 'selftest recovery')
+                self.assertEqual(hil_lock.journal_names(), [])
+
+    def test_a_member_whose_chain_is_partly_unreadable_still_names_the_group_and_refuses(self):
+        Path(hil_lock.lock_path(self.A)).write_bytes(b'#{"pid": 9')        # cut short: declares nothing
+        Path(hil_lock.lock_path(self.B)).write_text(json.dumps(
+            {'pid': 999999999, 'reason': 'selftest run', 'protected': True, 'locks': [self.A, self.B]}))
+        Path(self.dir, self.B + hil_lock.JOURNAL).write_text('{"locks": [')
+        with self.assertRaisesRegex(hil_lock.LockUnavailable, f'{self.B}{hil_lock.JOURNAL} cannot be read'):
             hil_lock.take_over(self.A, 'selftest recovery')
-        self.assertEqual(hil_lock.journal_names(), [])
+        self.assertEqual(hil_lock.journal_names(), [self.B])
 
     def test_a_partial_acquisition_rolls_back_and_a_failed_rollback_blocks_the_whole_group(self):
         boards = [self.A, self.B]
@@ -1883,6 +1894,44 @@ class Pending(LockDir):
         self.assertEqual(len(logged), 1)
         self.assertEqual({k: v for k, v in logged[0].items() if k != 'at'}, cleared)
         self.assertFalse(self.file().exists())
+
+    def test_a_failed_append_leaves_no_torn_entry_and_loses_none(self):
+        a = self.sessions('a')[0]
+        self.mark.add([a])
+        self.mark.clear(lambda e: False, note='first')
+        self.mark.add([a])
+        real, calls = os.write, []
+
+        def short_then_full(fd, data):
+            calls.append(1)
+            if len(calls) == 1:
+                return real(fd, data[:10])
+            raise OSError(28, 'No space left on device')
+        with mock.patch.object(hil_lock.os, 'write', short_then_full), self.assertRaises(OSError):
+            self.mark.clear(lambda e: False, note='second')
+        self.assertTrue(self.file().exists())
+        self.assertFalse(self.file('.cleared.jsonl').read_bytes().endswith(b'\n'))
+        self.assertEqual([e['note'] for e in self.mark.cleared()], ['first'])
+        self.mark.clear(lambda e: False, note='retry')
+        self.assertFalse(self.file().exists())
+        self.assertEqual([e['note'] for e in self.mark.cleared()], ['first', 'retry'])
+        self.assertEqual(len(self.file('.cleared.jsonl').read_bytes().splitlines()), 2)
+
+    def test_the_log_is_durable_in_its_dir_before_the_record_goes(self):
+        self.mark.add(self.sessions('a'))
+        events, fsync, unlink = [], os.fsync, os.unlink
+
+        def logged_fsync(fd):
+            events.append('dir' if stat.S_ISDIR(os.fstat(fd).st_mode) else 'file')
+            return fsync(fd)
+
+        def logged_unlink(name, *a, **k):
+            events.append(f'unlink {name}')
+            return unlink(name, *a, **k)
+        with mock.patch.object(hil_lock.os, 'fsync', logged_fsync), \
+                mock.patch.object(hil_lock.os, 'unlink', logged_unlink):
+            self.mark.clear(lambda e: False, note='reviewed')
+        self.assertEqual(events, ['file', 'dir', f'unlink {self.file().name}'])
 
     def test_a_malformed_session_is_refused_before_anything_is_touched(self):
         for sessions in ([{'pid': 1}], [{'receipt': 3}], ['x']):

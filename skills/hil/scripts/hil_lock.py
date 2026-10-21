@@ -762,40 +762,44 @@ def release_token(token: str):
 
 
 # --- recovery takeover ----------------------------------------------------------------------
-def _declared(b):
-    """The boards `b`'s record and journal chain name as their lock sets, or None when they name
-    none: an older helper's record, or one cut short mid-write. OSError when a journal cannot be
-    read or a `locks` is not a list of names: the set they cover is unknown."""
-    names, found = [], False
+def _links(b):
+    """(names, problem): the boards `b`'s readable record and journal chain declare as their lock
+    sets (None when they declare none: an older helper's record, or one cut short mid-write),
+    and why the set they cover is unknown, or '': a journal that cannot be read, or a `locks`
+    present but not a non-empty list of names."""
+    names, problem = None, ''
     journal = journal_state(b)
     if journal == {}:
-        raise OSError(errno.EINVAL, f'{b}{JOURNAL} cannot be read, so the lock set it covers is unknown: '
-                                    f'inspect it by hand')
+        problem = f'{b}{JOURNAL} cannot be read'
     chain = [read_record(b)]
     while isinstance(journal, dict) and journal:
         chain.append(journal)
         journal = journal.get('prior')
     for rec in chain:
-        locks = rec.get('locks') if isinstance(rec, dict) else None
-        if not locks:
+        if not isinstance(rec, dict) or 'locks' not in rec:
             continue
-        if not isinstance(locks, list) or not all(isinstance(n, str) for n in locks):
-            raise OSError(errno.EINVAL, f'{b}: lock set {locks!r:.80} is not a list of names, so the set it '
-                                        f'covers is unknown: inspect it by hand')
-        names += locks
-        found = True
-    return names if found else None
+        locks = rec['locks']
+        if not isinstance(locks, list) or not locks or not all(isinstance(n, str) for n in locks):
+            problem = problem or f'{b}: lock set {locks!r:.80} is not a list of names'
+            continue
+        names = (names or []) + locks
+    return names, problem
+
+
+def _declared(b):
+    """_links' names; OSError when the set they cover is unknown."""
+    names, problem = _links(b)
+    if problem:
+        raise OSError(errno.EINVAL, f'{problem}, so the lock set it covers is unknown: inspect it by hand')
+    return names
 
 
 def _naming() -> dict:
-    """{board: [every board whose readable record or journal chain names it]}."""
+    """{board: [every board whose readable record or journal chain names it]}: a board whose
+    chain is partly unknown still names what is readable; the takeover refuses on reaching it."""
     named = {}
     for b in sorted(set(lock_names()) | set(journal_names())):
-        try:
-            names = _declared(b) or []
-        except OSError:
-            continue           # unknown here; it is refused when the takeover reaches it
-        for n in names:
+        for n in _links(b)[0] or []:
             named.setdefault(n, []).append(b)
     return named
 
@@ -1223,28 +1227,42 @@ class PendingSessions(os.PathLike):
                 if raw:
                     cleared['unreadable'] = raw.decode(errors='replace')
                 line = json.dumps(dict(cleared, at=time.strftime('%Y-%m-%dT%H:%M:%S%z'))) + '\n'
-                fd = _open_file(dfd, self.name + PENDING_CLEARED, os.O_WRONLY | os.O_APPEND, create=True)
+                fd = _open_file(dfd, self.name + PENDING_CLEARED, os.O_RDWR | os.O_APPEND, create=True)
                 try:
+                    os.ftruncate(fd, _whole_lines(fd))     # an earlier append's torn line goes
                     _write_all(fd, line.encode())
                     os.fsync(fd)
                 finally:
                     os.close(fd)
+                os.fsync(dfd)                          # the log's entry durable before the record goes
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(self.name, dir_fd=dfd)     # a removal a crash loses only refuses again
             return cleared
 
     def cleared(self) -> list:
         """Every entry <record>.cleared.jsonl holds, oldest first; a line that is not a JSON
-        object is skipped."""
+        object, or a last one without its newline (an append that failed), is skipped."""
         with self._locked():
             data = _read_file(self.lock, self.suffix + PENDING_CLEARED) or b''
         found = []
-        for line in data.splitlines():
+        for line in data[:data.rfind(b'\n') + 1].splitlines():
             with contextlib.suppress(ValueError):
                 entry = json.loads(line)
                 if isinstance(entry, dict):
                     found.append(entry)
         return found
+
+
+def _whole_lines(fd) -> int:
+    """The size of `fd`'s file up to and including its last newline."""
+    end = os.fstat(fd).st_size
+    while end > 0:
+        start = max(0, end - 4096)
+        chunk = os.pread(fd, end - start, start)
+        if b'\n' in chunk:
+            return start + chunk.rindex(b'\n') + 1
+        end = start
+    return 0
 
 
 def _ended(ended, session) -> bool:
