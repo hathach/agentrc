@@ -7617,7 +7617,7 @@ test('beside a SonarCloud gate the Greptile gate keeps its state, and the SonarC
   assert.equal(result.reason, 'ci-red-sonar-gate')
   assert.deepEqual(result.observation.ci.realFailures.map(rf => rf.state), ['sonarGate', 'greptileGate', 'rigSide'])
   assert.deepEqual(result.rollup.ci, { total: 3, fixed: 0, open: 0, accepted: 0, sonarGate: 1, greptileGate: 1, rigSide: 1, unclassified: 0 })
-  assert.ok(logs.some(l => /SonarCloud gate \(condition failed: new_security_rating 3 > 1\) and 1 Greptile gate failure\(s\) and 1 rig-side failure\(s\) — /.test(l)), logs.join('\n'))
+  assert.ok(logs.some(l => /SonarCloud gate \(condition failed: new_security_rating 3 > 1\) and 1 Greptile confidence gate failure\(s\) and 1 rig-side failure\(s\) — /.test(l)), logs.join('\n'))
 })
 
 test('a Greptile gate accepted by its key passes with the accepted failure listed', async () => {

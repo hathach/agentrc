@@ -212,6 +212,7 @@ class LaunchResultTest(unittest.TestCase):
         source = (ROOT / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
+        reasons |= {m.group(2) for m in re.finditer(r"""\bstop: (['"])(.+?)\1""", source)}  # the GATES table
         historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced
         sets = (handled_elsewhere, set(launch_result.REFUSED), set(launch_result.ENDED), set(launch_result.STALLED))
         self.assertEqual(sum(map(len, sets)), len(set().union(*sets)), 'each reason is handled one way')
