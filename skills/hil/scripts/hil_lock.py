@@ -26,6 +26,8 @@ CLEANUP_ROLE = 'cleanup-holder'
 RECOVERY_BLOCKER = "recovery blocker: release it only through the project's recovery procedure"
 HOLD_KIND = 'hil_lock-hold'   # `holder` of a record this CLI's own hold process wrote
 JOURNAL = '.takeover'         # <board>.takeover: an unfinished or live recovery takeover
+REWRITING = b'#'              # byte 0 of a record being rewritten: unreadable, so a blocker
+ACQUIRING = b'~'              # byte 0 while take_board_lock writes its first record: a free board
 DIR_MODE = 0o755
 SHARE_STEP = (f'a second OS user needs the lock dir sticky and world-writable, a one-time host step '
               f'once every project on the host runs this helper: sudo install -d -m 1777 {BOARD_LOCK_DIR}')
@@ -179,22 +181,32 @@ def flock_nb(board: str):
 
 
 # --- holder records -------------------------------------------------------------------------
-def write_record(fh, reason: str, **extra) -> None:
+def _pwrite_all(fd, data, offset) -> None:
+    """os.pwrite until every byte is written; a write that makes no progress raises."""
+    while data:
+        n = os.pwrite(fd, data, offset)
+        if n <= 0:
+            raise OSError(errno.EIO, f'holder record write made no progress at offset {offset}')
+        data, offset = data[n:], offset + n
+
+
+def write_record(fh, reason: str, *, acquiring=False, **extra) -> None:
     """Holder record; the flock itself is already held. Raises OSError on a write failure: a
     hold whose record is missing is invisible to status/release, so every caller refuses it.
     `extra` adds a tool's own fields (hil_reserve: token, start, locks, role). Overwritten in
-    place behind a non-JSON first byte that is restored last: an interrupted rewrite leaves
-    the old record or an unreadable one, never an empty record or a valid splice of new and
-    old bytes that a blocker would vanish as."""
+    place, inode kept, behind a non-JSON first byte that is restored last: an interrupted
+    rewrite leaves the old record or an unreadable one, never an empty record or a valid
+    splice of new and old bytes that a blocker would vanish as. That byte is REWRITING, or
+    ACQUIRING for take_board_lock's first record only (agentrc#154): its taker never returned,
+    so a free flock under it is a free board; a helper older than ACQUIRING reads it as
+    unreadable and refuses, fail-closed as for REWRITING."""
     data = json.dumps({'pid': os.getpid(), 'reason': reason,
                        'since': time.strftime('%Y-%m-%dT%H:%M:%S%z'), **extra}).encode()
     fd = fh.fileno()
-    os.pwrite(fd, b'#', 0)
-    done = 1
-    while done < len(data):
-        done += os.pwrite(fd, data[done:], done)
+    _pwrite_all(fd, ACQUIRING if acquiring else REWRITING, 0)
+    _pwrite_all(fd, data[1:], 1)
     os.ftruncate(fd, len(data))
-    os.pwrite(fd, data[:1], 0)
+    _pwrite_all(fd, data[:1], 0)
 
 
 def clear_record(fh) -> bool:
@@ -214,13 +226,24 @@ def release_board_lock(fh) -> None:
     fh.close()
 
 
+def _record(board: str):
+    """(bytes, state, record) of the board's holder record; bytes None when absent or unsafe."""
+    try:
+        data = _read_file(board, '.lock')
+    except OSError:
+        return None, 'unreadable', None
+    return (data, *_parse(data))
+
+
 def record_state(board: str):
     """(state, record) of the board's holder record: 'absent', 'empty', 'unreadable' (an
     unsafe file, bad JSON, or JSON that is not an object) or 'record' with its dict."""
-    try:
-        return _parse(_read_file(board, '.lock'))
-    except OSError:
-        return 'unreadable', None
+    return _record(board)[1:]
+
+
+def _acquiring(data) -> bool:
+    """A record take_board_lock was still writing: on a free flock, its taker never returned."""
+    return data is not None and data[:1] == ACQUIRING
 
 
 def read_record(board: str):
@@ -270,6 +293,8 @@ def _blocker(board, fh) -> str:
     if journal is not None:
         return f'takeover journal {json.dumps(journal)}'
     data = _handle_record(fh)
+    if _acquiring(data):
+        return ''
     state, rec = _parse(data)
     if state == 'record' and is_recovery_blocker(rec):
         return f'stale record {json.dumps(rec)}'
@@ -310,7 +335,7 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
         extra = {'protected': True, **extra}
     # announce ourselves so the other side's conflict message is truthful
     try:
-        write_record(fh, reason, **extra)
+        write_record(fh, reason, acquiring=True, **extra)
     except OSError as e:
         clear_record(fh)
         try:
@@ -894,11 +919,13 @@ def cmd_status():
     lines = []
     for b in sorted(set(lock_names()) | set(journal_names())):
         journal = journal_state(b)
-        state, info = record_state(b)
+        data, state, info = _record(b)
         if _alive(info):
             lines.append(f'{b}: {holder_text(info)}')
         elif state == 'record' and is_recovery_blocker(info):
             lines.append(f'{b}: stale {json.dumps(info)} ({RECOVERY_BLOCKER})')
+        elif _acquiring(data):
+            lines.append(f'{b}: acquisition in progress or interrupted (free once its taker is gone)')
         elif state == 'unreadable':
             lines.append(f'{b}: unreadable record ({RECOVERY_BLOCKER} unless its holder still runs)')
         if journal is not None:

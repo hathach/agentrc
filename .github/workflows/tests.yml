@@ -38,6 +38,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+      # test_hil_lock's cross-version rows read hil_lock.py as older helpers run it (POSIX-only module)
+      - if: runner.os == 'Linux'
+        run: git fetch --no-tags --depth=1 origin 9e41f6fc89375df73d453c45e4c5a97103830fcd
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
