@@ -633,6 +633,51 @@ class Sessions(unittest.TestCase):
         self.assertEqual(text.encode(), b'-c port=SWD sn=0035 mode=HOTPLUG\n-w32 0xE000ED0C 0x05FA0004 -nv\n')
 
 
+class Uid(unittest.TestCase):
+    """A uid that is not one plain word is refused before any command file or spawn: every
+    builder splices it into a shell line, a command file or a Tcl `-c` command."""
+    BAD = ('0725;reboot', '0725 -x', '0725"', "0725'", '07\n25', '$(id)', '`id`', '', None, 725)
+    PROFILE = {'interface': 'SWD', 'speed': '4000', 'autoconnect': True, 'device': 'X'}
+
+    def builders(self, d):
+        fw = {'firmware': 'fw.elf', 'timeout': 5}
+        return {
+            'flash_jlink': lambda f: hf.flash_jlink(f, workdir=d, **fw, run=self.run_),
+            'reset_jlink': lambda f: hf.reset_jlink(f, workdir=d, timeout=5, run=self.run_),
+            'run_jlink_commands': lambda f: hf.run_jlink_commands(f, ['h'], workdir=d, timeout=5, run=self.run_,
+                                                                  **self.PROFILE),
+            'flash_stlink': lambda f: hf.flash_stlink(f, **fw, run=self.run_),
+            'reset_stlink': lambda f: hf.reset_stlink(f, timeout=5, run=self.run_),
+            'run_stlink_commands': lambda f: hf.run_stlink_commands(f, ['-halt'], connect_mode='UR', workdir=d,
+                                                                    timeout=5, run=self.run_),
+            'flash_openocd': lambda f: hf.flash_openocd({**f, 'vid_pid': '0x1366 0x0101'}, **fw, run=self.run_),
+            'reset_openocd': lambda f: hf.reset_openocd({**f, 'vid_pid': '0x1366 0x0101'}, timeout=5, run=self.run_),
+            'flash_lm4flash': lambda f: hf.flash_lm4flash(f, **fw, run=self.run_),
+            'flash_pyocd': lambda f: hf.flash_pyocd({**f, 'vid_pid': '0x0d28 0x0204'}, **fw, project_dir=d,
+                                                    run=self.run_),
+            'reset_pyocd': lambda f: hf.reset_pyocd({**f, 'vid_pid': '0x0d28 0x0204'}, project_dir=d, timeout=5,
+                                                    run=self.run_),
+        }
+
+    def run_(self, cmd, **kw):
+        self.ran.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, '', None)
+
+    def test_every_builder_refuses_a_uid_that_is_not_one_plain_word(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        for name, build in self.builders(d).items():
+            for uid in self.BAD:
+                with self.subTest(builder=name, uid=uid):
+                    self.ran = []
+                    with self.assertRaisesRegex(ValueError, 'want a probe serial'):
+                        build({'name': name.split('_')[-1], 'uid': uid, 'args': '-f x.cfg'})
+                    self.assertEqual((self.ran, os.listdir(d)), ([], []))
+
+    def test_every_roster_serial_form_is_a_plain_word(self):
+        for uid in ('000725000000', '0035', '30:ED:A0:E0:C9:02', 'E6614103E7176A23', 'a.b_c+d-e'):
+            self.assertTrue(hf.UID_RE.fullmatch(uid), uid)
+
+
 class StlinkLm4flashEsptool(unittest.TestCase):
     def test_an_explicit_stlink_verify_false_is_no_verify(self):
         # the golden rosters set stlink verify only to true or leave it out

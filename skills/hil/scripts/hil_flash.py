@@ -47,6 +47,18 @@ def _runner(run):
     return hil_process.run_cmd if run is None else run
 
 
+UID_RE = re.compile(r'[A-Za-z0-9_.:+-]+')
+
+
+def _uid(flasher: dict) -> str:
+    """The flasher's probe serial, refused unless it is one plain word: the builders splice it into
+    shell command lines, command files and Tcl `-c` commands."""
+    uid = flasher.get('uid')
+    if not isinstance(uid, str) or not UID_RE.fullmatch(uid):
+        raise ValueError(f'{flasher.get("name")} uid {uid!r}: want a probe serial (letters, digits and _ . : + -)')
+    return uid
+
+
 CLEANUP = ('done', 'unknown', 'pending')   # least to most outstanding
 
 
@@ -156,9 +168,9 @@ def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run,
     # crash_retries reruns share one deadline, taken once the command file is written, and
     # never start over a session the runner reports pending or names by a receipt. A rerun is
     # no proof the target was untouched.
-    run, attempts = _runner(run), []
+    run, attempts, uid = _runner(run), [], _uid(flasher)
     with _command_file(script, workdir=workdir) as (path, text):
-        cmd = (f'JLinkExe -USB {flasher["uid"]} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
+        cmd = (f'JLinkExe -USB {uid} {flasher["args"]} -if swd -JTAGConf -1,-1 -speed auto '
                f'-NoGui 1 -ExitOnError 1 -CommandFile {shlex.quote(path)}')
         deadline = time.monotonic() + timeout
         ret = _attempt(attempts, run, cmd, text, timeout=timeout)
@@ -167,7 +179,7 @@ def _run_jlink(flasher: dict, script: list, *, timeout, crash_retries: int, run,
             if ret.returncode not in JLINK_CRASH_RCS or left <= 0 \
                     or attempts[-1].cleanup == 'pending' or attempts[-1].receipt is not None:
                 break
-            print(f'JLinkExe -USB {flasher["uid"]} crashed (rc {ret.returncode}), rerunning', flush=True)
+            print(f'JLinkExe -USB {uid} crashed (rc {ret.returncode}), rerunning', flush=True)
             ret = _attempt(attempts, run, cmd, text, timeout=left)
     return Operation(attempts)
 
@@ -191,9 +203,9 @@ def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, 
     with the caller's connection profile: `device` replaces the flasher's `args` (a session
     may connect as the core), `autoconnect` False leaves the flag out. The raw result only:
     judging the transcript, retrying and recovering stay the caller's."""
-    script = [*commands, 'exit']
+    script, uid = [*commands, 'exit'], _uid(flasher)
     with _command_file(script, workdir=workdir) as (path, text):
-        argv = ['JLinkExe', '-USB', flasher['uid'], '-device', device, '-if', interface, '-speed', str(speed),
+        argv = ['JLinkExe', '-USB', uid, '-device', device, '-if', interface, '-speed', str(speed),
                 *(['-autoconnect', '1'] if autoconnect else []), '-NoGui', '1', '-ExitOnError', '1',
                 '-CommandFile', path]
         return _once(run, argv, script=text, timeout=timeout)
@@ -221,12 +233,12 @@ def flash_stlink(flasher: dict, firmware: str, *, timeout, run=None) -> Operatio
     # opt-out: a default-on read-back silently changes every roster entry that lacks the
     # key, including boards on rigs this was never validated against.
     verify = ' --verify' if flasher.get('verify', False) else ''
-    return _once(run, f'STM32_Programmer_CLI --connect port=swd sn={flasher["uid"]} --write {firmware}{verify} --go',
+    return _once(run, f'STM32_Programmer_CLI --connect port=swd sn={_uid(flasher)} --write {firmware}{verify} --go',
                  timeout=timeout)
 
 
 def reset_stlink(flasher: dict, *, timeout, run=None) -> Operation:
-    return _once(run, f'STM32_Programmer_CLI --connect port=swd sn={flasher["uid"]} --rst --go', timeout=timeout)
+    return _once(run, f'STM32_Programmer_CLI --connect port=swd sn={_uid(flasher)} --rst --go', timeout=timeout)
 
 
 def run_stlink_commands(flasher: dict, commands: list, *, connect_mode: str, timeout, run=None,
@@ -234,7 +246,7 @@ def run_stlink_commands(flasher: dict, commands: list, *, connect_mode: str, tim
     """One STM32_Programmer_CLI script session: an SWD connect to the flasher's ST-LINK in
     `connect_mode`, then `commands`, from a script file in `workdir`. The raw result only:
     judging the transcript, retrying and recovering stay the caller's."""
-    script = [f'-c port=SWD sn={flasher["uid"]} mode={connect_mode}', *commands]
+    script = [f'-c port=SWD sn={_uid(flasher)} mode={connect_mode}', *commands]
     with _command_file(script, prefix='hil_stlink_', suffix='.prg', workdir=workdir) as (path, text):
         return _once(run, ['STM32_Programmer_CLI', '-script', path], script=text, timeout=timeout)
 
@@ -255,7 +267,7 @@ def openocd_cmd_base(flasher: dict) -> str:
     # strings -- a wedged node makes that open hang unkillably (the 2026-08-10 convoy).
     # BEFORE args, because the rescue cfgs run `init` internally and reject (or never see)
     # a config command that follows it.
-    vid_pid = ''
+    uid, vid_pid = _uid(flasher), ''
     if 'vid_pid' in flasher:
         # Validated HERE too, not just in convoy_safe: openocd only warns ("incomplete
         # vid_pid configuration directive") and exits 0 on a malformed value, so the pin
@@ -276,7 +288,7 @@ def openocd_cmd_base(flasher: dict) -> str:
               f'probe discovery will open every usbfs node (hangs on a wedged one)',
               file=sys.stderr, flush=True)
     return (f'openocd -c "tcl_port disabled" -c "gdb_port disabled" -c "telnet_port disabled" '
-            f'-c "adapter serial {flasher["uid"]}" {vid_pid}{flasher["args"]}')
+            f'-c "adapter serial {uid}" {vid_pid}{flasher["args"]}')
 
 
 # `verify` is on by default, opted out per board with "verify": false. ch32v103r and
@@ -477,7 +489,7 @@ def esptool_input_problem(chip, flash_args, cwd) -> str:
 
 def flash_lm4flash(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     # TI Tiva-C / Stellaris ICDI: lightweight lm4flash, resets and runs after write
-    return _once(run, f'lm4flash -s {flasher["uid"]} {flasher["args"]} {firmware}', timeout=timeout)
+    return _once(run, f'lm4flash -s {_uid(flasher)} {flasher["args"]} {firmware}', timeout=timeout)
 
 
 # no reset_lm4flash: lm4flash has no reset-only mode; it resets+runs on flash
@@ -509,12 +521,12 @@ def _pyocd_python() -> str:
 
 
 def _pyocd_argv(flasher: dict, verb: str, *extra: str, project_dir: str) -> list:
-    vid_pid = pyocd_vid_pid(flasher)
+    uid, vid_pid = _uid(flasher), pyocd_vid_pid(flasher)
     if vid_pid is None:
         raise ValueError(f'pyocd flasher {flasher.get("uid")!r} needs a uid and one "vid_pid" pair')
     # -W: with no matching probe pyocd otherwise waits for one to be plugged in
     return [_pyocd_python(), PYOCD_LAUNCHER, '--project-dir', str(project_dir), *vid_pid, verb, '-W',
-            '-u', f'cmsisdap:{flasher["uid"]}', *shlex.split(flasher.get('args', '')), *extra]
+            '-u', f'cmsisdap:{uid}', *shlex.split(flasher.get('args', '')), *extra]
 
 
 def flash_pyocd(flasher: dict, firmware: str, *, project_dir: str, timeout,

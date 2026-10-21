@@ -94,7 +94,6 @@ CLEANUP_TIMEOUT = 30                 # seconds for the reviewed end: reset run, 
 # carrying the job's tracking id at job end (actions/runner v2.337.0 src/Runner.Worker/JobExtension.cs:586-592, 880-926)
 CI_JOB_ENV = ('RUNNER_TRACKING_ID', 'GITHUB_ACTIONS')
 
-_UID_RE = re.compile(r'[A-Za-z0-9_.:+-]+')
 _PATH_RE = re.compile(r'/[A-Za-z0-9_./+-]*')    # a path that reaches a Tcl command unquoted
 _CHIP = r'esp32[a-z0-9]*'
 
@@ -121,7 +120,7 @@ def admit(flasher: dict) -> tuple:
     if (flasher.get('name') or '') != 'openocd_esp':
         raise ValueError(f'not an openocd_esp flasher: {flasher.get("name")!r}')
     uid = flasher.get('uid')
-    if not isinstance(uid, str) or not _UID_RE.fullmatch(uid):
+    if not isinstance(uid, str) or not hil_flash.UID_RE.fullmatch(uid):
         raise ValueError(f'openocd_esp uid {uid!r}: want the USJ serial (letters, digits and _ . : + -)')
     if 'vid_pid' in flasher:
         raise ValueError('openocd_esp takes no vid_pid: interface/esp_usb_jtag.cfg selects 303a:1001 and the '
