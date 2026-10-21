@@ -27,8 +27,8 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
 - `protected`: regex over repo-relative paths kept out of every fix scope (a
   review fix needing one is withheld, a CI fix's guess at one dropped) and
   never committed or published; an adopted chain may carry one only in commits
-  the PR already has, or in a merge from the base that takes either parent's
-  version of it.
+  the PR already has, in a merge from the base that takes either parent's
+  version of it, or as `adoptProtected` or `adoptReviewedProtected` permits.
 - `generated`: regex over repo-relative paths a fixer's build regenerates; a
   plain modification to one is admitted into the commit on the caller's word
   that the repository hooks validate it.
@@ -92,8 +92,17 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
 - `adoptProtected`: exact repository-relative paths matching `protected` that a
   base merge in the `adoptHead` chain may change, such as a conflict resolved
   in a protected roster; only with `adoptHead`, per launch. A path an
-  unpublished ordinary commit of the chain also touches stays refused, and
+  unpublished ordinary commit of the chain also touches stays refused unless
+  `adoptReviewedProtected` names every unpublished commit changing it, and
   writers and hooks stay bound by `protected`.
+- `adoptReviewedProtected`: `[{ sha, paths }]`, `sha` a full 40-hex commit of
+  the `adoptHead` chain and `paths` the exact protected paths it changes: the
+  caller's word that those changes passed the review the paths require (such
+  as the peer review a repository's `CLAUDE.md` asks for). Each unpublished
+  commit changing a protected path needs its own entry naming that path, a
+  rename both its names, a base merge included; approving one commit approves
+  no other. Only with `adoptHead`, per launch; writers and hooks stay bound by
+  `protected`.
 - `rebasedHead`: full SHA of the PR head after a history rewrite (rebase,
   force-push) the user authorized: with the checkout at it and no unpublished
   candidate, the state is re-pinned to it unaudited, keeping cycles used,

@@ -15,7 +15,8 @@ and state, which are condensed; receipts are kept verbatim, each reply receipt
 with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings on
 its comment (a refutedPosts reply answers stale findings as well as invalid ones).
 `budget` is the returned state's
-cyclesUsed and maxCycles. `blockers` lists what the caller must settle before
+cyclesUsed and maxCycles; `pinned` its config, the arguments a continuation
+passes unchanged, read from the --state-ref output when the launch returned no state. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch
 included, the latter with the caller's response, and a stop another launch on the same state would repeat,
 with what must change first; `notes` what is absent but harmless.
@@ -217,6 +218,20 @@ def ide_drift(line):
     return all(IDE_DRIFT.match(p) for p in line[3:].split(' -> '))
 
 
+def pinned_by(ref, notes):
+    """The config of the state a stateRef names, or None with a note saying why."""
+    try:
+        result = ((load_output(ref['outputFile']) or {}).get('result') or {})
+    except Unusable as e:
+        notes.append(f'the stateRef\'s pinned arguments are unread: {e}')
+        return None
+    config = (result.get('state') or {}).get('config')
+    if result.get('stateDigest') != ref['digest'] or not isinstance(config, dict):
+        notes.append(f"the stateRef's output holds no state of digest {ref['digest']}: its pinned arguments are unread")
+        return None
+    return config
+
+
 def checkout(path):
     return {'branch': git('-C', path, 'rev-parse', '--abbrev-ref', 'HEAD').strip(),
             'head': git('-C', path, 'rev-parse', 'HEAD').strip(),
@@ -225,7 +240,7 @@ def checkout(path):
 
 def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     blockers, notes = [], []
-    summary = {'launch': None, 'result': None, 'stateRef': None, 'budget': None, 'observation': None, 'receipts': None,
+    summary = {'launch': None, 'result': None, 'stateRef': None, 'budget': None, 'pinned': None, 'observation': None, 'receipts': None,
                'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
     result = output.get('result') if output else None
     if output is None:
@@ -241,6 +256,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             summary['stateRef'] = {'outputFile': output_path, 'digest': result['stateDigest']}
             used, most = result['state'].get('cyclesUsed'), result['state'].get('maxCycles')
             summary['budget'] = {'cyclesUsed': used, 'maxCycles': most}
+            summary['pinned'] = result['state'].get('config')
             if result.get('pass') is not True and result.get('reason') not in ENDED and isinstance(used, int) and isinstance(most, int) and used >= most:
                 blockers.append(f'cycle budget spent: {used} of {most}; a relaunch needs a larger maxCycles, the user\'s decision')
         if result.get('reason') in REFUSED:
@@ -297,6 +313,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     if summary['stateRef'] is None and state_ref:
         summary['stateRef'] = state_ref
         notes.append('this launch returned no new state: continue from the stateRef it was given')
+        summary['pinned'] = pinned_by(state_ref, notes)
     return summary
 
 

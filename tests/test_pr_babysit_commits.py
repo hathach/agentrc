@@ -122,7 +122,8 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual({k: v for k, v in out.items() if k != 'seal'}, {
             'from': self.base, 'to': two, 'published': self.base, 'base': self.base, 'tip': self.base, 'commits': [one, two], 'refusal': '',
-            'paths': ['b.c', NEWLINE], 'unpublished': ['b.c', NEWLINE], 'mergeOnly': []}, 'each path once, a name holding a newline whole')
+            'paths': ['b.c', NEWLINE], 'unpublished': ['b.c', NEWLINE], 'mergeOnly': [],
+            'changes': [{'sha': one, 'paths': ['b.c']}, {'sha': two, 'paths': ['b.c', NEWLINE]}]}, 'each path once, a name holding a newline whole')
 
     def test_unpublished_holds_only_what_the_commits_after_the_published_head_touch(self):
         self.write('b.c', 'b\n')
@@ -135,6 +136,27 @@ class CommitsTest(unittest.TestCase):
             code, out = self.run_script('chain', self.base, three, '--published', published, '--base', self.base, '--tip', self.base)
             self.assertEqual(code, 0)
             self.assertEqual(out['unpublished'], want, f'{published[:7]}: a published path edited again later is unpublished again; a foreign head publishes nothing')
+
+    def test_changes_hold_each_unpublished_commit_and_the_paths_it_touches(self):
+        self.write('b.c', 'b\n')
+        self.write('d.c', 'd\n')
+        one = self.commit('one', 'b.c', 'd.c')
+        self.git('mv', 'b.c', 'r.c')
+        self.git('rm', '-q', 'd.c')
+        two = self.commit('rename and delete')
+        self.write('r.c', 'rr\n')
+        three = self.commit('three', 'r.c')
+        for published, want in ((self.base, [(one, ['b.c', 'd.c']), (two, ['b.c', 'd.c', 'r.c']), (three, ['r.c'])]),
+                                (two, [(three, ['r.c'])]), (three, [])):
+            out = self.chain_of(three, published, self.base)
+            self.assertEqual(out['changes'], [{'sha': c, 'paths': ps} for c, ps in want],
+                             f'{published[:7]}: a rename is both its names, a deletion its path, and a published commit is not listed')
+
+    def test_changes_list_a_base_merge_by_the_paths_it_owns(self):
+        one, tip, merge = self.base_merge(base_files={'a.c': 'base\n'}, pr_files={'a.c': 'pr\n'}, resolve=lambda: self.write('a.c', 'both\n'))
+        self.write('a.c', 'more\n')
+        two = self.commit('after', 'a.c')
+        self.assertEqual(self.chain_of(two, one, tip)['changes'], [{'sha': merge, 'paths': ['a.c']}, {'sha': two, 'paths': ['a.c']}])
 
     def refusal(self, *argv):
         code, out = self.run_script(*argv)

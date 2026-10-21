@@ -31,7 +31,8 @@ python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkou
 ```
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
-launch and lists the `blockers` to settle before continuing.
+launch, lists the `blockers` to settle before continuing, and shows as `pinned`
+the arguments the state is fixed to, which a continuation passes unchanged.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
 `commits.py commit` stages and commits exactly its paths; `hooks.py` runs the repository's

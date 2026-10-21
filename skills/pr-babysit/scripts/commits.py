@@ -25,8 +25,9 @@ refused.
 reports from, to, published, base and tip as given, commits (the SHAs of
 FROM..TO, oldest first), paths (each path any of them touches, once),
 unpublished (each path the commits after P touch, once; all of them when P is
-not a chain commit), mergeOnly (each unpublished path only merge links touch)
-and refusal, "" or why the chain cannot be adopted: empty,
+not a chain commit), mergeOnly (each unpublished path only merge links touch),
+changes ({sha, paths} per commit after P, oldest first, so a protected path is
+covered commit by commit) and refusal, "" or why the chain cannot be adopted: empty,
 not ending at TO, or a link refused.
 `head` resolves HEAD once and reads everything from that SHA; HEAD moving while
 it reads is an error. It reports parent and scope (PATH) as given, sha, entries
@@ -37,7 +38,7 @@ message. PATH is never read as an option or as pathspec magic.
 
 stdout ends with one JSON line: `head` prints {parent, scope, sha, entries,
 refusal}, `chain` {from, to, published, base, tip, commits, paths, unpublished,
-mergeOnly, refusal}, each line but an error one with its `seal` (facts.sealed). Exit 0
+mergeOnly, changes, refusal}, each line but an error one with its `seal` (facts.sealed). Exit 0
 with that line; exit 2 with {"error": ...} when git cannot answer or the
 arguments are wrong, or when no base in the checkout holds a merge link's
 second parent while B or T is not in the checkout.
@@ -125,6 +126,7 @@ def chain(start, end, published, base, tip):
     ordinary = set(touched(c for c in found[after:] if len(c['parents']) == 1))
     return {'from': start, 'to': end, 'published': published, 'base': base, 'tip': tip, 'commits': shas, 'paths': touched(found),
             'unpublished': unpublished, 'mergeOnly': [p for p in unpublished if p not in ordinary],
+            'changes': [{'sha': c['sha'], 'paths': c['paths']} for c in found[after:]],
             'refusal': chain_refusal(start, end, bases, found)}
 
 

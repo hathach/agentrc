@@ -10,7 +10,7 @@ if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
 if (!args || !args.pr) {
-  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
+  throw new Error('args must be { pr: number, reviewers?, autoRun?, maxCycles?, autoPush?, markSonar?, coderabbitTrigger?, checkoutDir?, protected?, generated?, ciWait?, ciNotes?, acceptedFailures?, deferrals?, replySettlements?, build?, yieldAfterCycle?, yieldOnChange?, lane?, state?, stateRef?, adoptHead?, adoptProtected?, adoptReviewedProtected?, rebasedHead?, rejudge? }; run from the PR branch checkout or point checkoutDir at it')
 }
 args.pr = Number(args.pr)
 if (!Number.isInteger(args.pr) || args.pr <= 0) {
@@ -168,6 +168,17 @@ if (!Array.isArray(adoptProtected) || adoptProtected.some(f => typeof f !== 'str
 }
 if (new Set(adoptProtected).size !== adoptProtected.length) throw new Error('adoptProtected names a path twice')
 if (adoptProtected.length && args.adoptHead == null) throw new Error('adoptProtected goes with the adoptHead it was given for')
+// The caller's word that each named commit's change to these protected paths passed the review those paths require (#186).
+const adoptReviewedProtected = args.adoptReviewedProtected ?? []
+if (!Array.isArray(adoptReviewedProtected) || adoptReviewedProtected.some(e => !e || typeof e !== 'object' ||
+    Object.keys(e).sort().join() !== 'paths,sha' || typeof e.sha !== 'string' || !/^[0-9a-f]{40}$/.test(e.sha) ||
+    !Array.isArray(e.paths) || !e.paths.length || e.paths.some(f => typeof f !== 'string' || !f || canon(f) !== f))) {
+  throw new Error('adoptReviewedProtected must be an array of { sha: full 40-hex commit SHA, paths: plain repository-relative paths }')
+}
+if (new Set(adoptReviewedProtected.map(e => e.sha)).size !== adoptReviewedProtected.length) throw new Error('adoptReviewedProtected names a commit twice')
+if (adoptReviewedProtected.some(e => new Set(e.paths).size !== e.paths.length)) throw new Error('adoptReviewedProtected names a path twice for one commit')
+if (adoptReviewedProtected.length && args.adoptHead == null) throw new Error('adoptReviewedProtected goes with the adoptHead it was given for')
+const reviewedChange = (sha, f) => adoptReviewedProtected.some(e => e.sha === sha && e.paths.includes(f))
 
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
 const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
@@ -282,7 +293,10 @@ if (args.state !== undefined && args.state !== null) {
   if (!shaped) throw new Error(`state is not a pr-babysit state of version 3 or ${STATE_VERSION}`)
   if (st.digest !== sealOf(st)) throw new Error('state digest mismatch: the state was changed after the launch that returned it')
   if (JSON.stringify(st.config) !== JSON.stringify(config)) {
-    throw new Error(`state was made by a run with different arguments: ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
+    const differ = [...new Set([...Object.keys(st.config), ...Object.keys(config)])]
+      .filter(k => JSON.stringify(st.config[k]) !== JSON.stringify(config[k]))
+      .map(k => `${k}: ${JSON.stringify(st.config[k]) ?? 'absent'} vs ${JSON.stringify(config[k]) ?? 'absent'}`)
+    throw new Error(`state was made by a run with different arguments (${differ.join('; ')}): ${JSON.stringify(st.config)} vs ${JSON.stringify(config)}`)
   }
   if (st.build !== buildCmd) log(`build changed since the last launch: ${JSON.stringify(st.build)} → ${JSON.stringify(buildCmd)}`)
   restored = st.version === 3 ? { ...st, version: STATE_VERSION, acceptedFailures: st.acceptedFailures.map(a => a.key) } : st
@@ -553,12 +567,19 @@ const CRTRIGGER = withSeal({
 })
 const ADOPT_AUDIT = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'refusal'],
+  required: ['from', 'to', 'published', 'base', 'tip', 'commits', 'paths', 'unpublished', 'mergeOnly', 'changes', 'refusal'],
   properties: {
     error: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, published: { type: 'string' }, base: { type: 'string' },
     tip: { type: 'string' },
     commits: { type: 'array', items: { type: 'string' } }, paths: { type: 'array', items: { type: 'string' } },
     unpublished: { type: 'array', items: { type: 'string' } }, mergeOnly: { type: 'array', items: { type: 'string' } },
+    changes: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false, required: ['sha', 'paths'],
+        properties: { sha: { type: 'string' }, paths: { type: 'array', items: { type: 'string' } } },
+      },
+    },
     refusal: { type: 'string' },
   },
 })
@@ -2823,12 +2844,17 @@ if (adoptHead !== null) {
   const paths = audit ? audit.paths : []
   const badPath = paths.find(f => !canon(f))
   // A protected path the PR already carries is the caller's history; only what this run would publish is guarded (#49),
-  // unless only a base merge changes it and the caller named it in adoptProtected (#97).
+  // unless only a base merge changes it and the caller named it in adoptProtected (#97), or adoptReviewedProtected
+  // names every unpublished commit that changes it (#186).
   const mergeOnly = audit && !audit.error ? audit.mergeOnly.map(canon) : []
-  const guarded = [], waived = []
+  const guarded = [], waived = [], reviewed = []
   if (protectedRe && audit && !audit.error) {
     for (const f of new Set(audit.unpublished.map(canon))) {
-      if (f && protectedRe.test(f)) (mergeOnly.includes(f) && adoptProtected.includes(f) ? waived : guarded).push(f)
+      if (!f || !protectedRe.test(f)) continue
+      const by = audit.changes.filter(c => c.paths.some(p => canon(p) === f))
+      if (mergeOnly.includes(f) && adoptProtected.includes(f)) waived.push(f)
+      else if (by.length && by.every(c => reviewedChange(c.sha, f))) reviewed.push(...by.map(c => `${c.sha.slice(0, 7)} ${f}`))
+      else guarded.push(f)
     }
   }
   const why = !audit ? 'the audit agent died'
@@ -2838,7 +2864,8 @@ if (adoptHead !== null) {
     : audit.refusal ? audit.refusal
     : badPath !== undefined ? `a path this run cannot represent: ${JSON.stringify(badPath)}`
     : guarded.length ? `protected path(s) in the chain: ${guarded.join(', ')}` +
-      (guarded.every(f => mergeOnly.includes(f)) ? '; only a base merge changes them, which adoptProtected may permit' : '')
+      (guarded.every(f => mergeOnly.includes(f)) ? '; only a base merge changes them, which adoptProtected may permit'
+        : "; adoptReviewedProtected may permit a reviewed commit's change to them, by its full SHA and each path")
     : null
   if (why) {
     log(`preflight: adoption refused — ${why}`)
@@ -2849,6 +2876,7 @@ if (adoptHead !== null) {
     return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: why }))
   }
   if (waived.length) log(`preflight: adopting a base merge's change to protected path(s) ${waived.join(', ')}, named in adoptProtected`)
+  if (reviewed.length) log(`preflight: adopting reviewed change(s) to protected path(s) ${reviewed.join(', ')}, named in adoptReviewedProtected`)
   if (prHead !== X && !shas.includes(prHead)) {
     log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor a commit of the chain to ${adoptHead.slice(0, 7)}`)
     return finish(stop(cyclesUsed, 'wrong-head', { head: prHead, expected: [X, adoptHead] }))
