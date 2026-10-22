@@ -116,7 +116,8 @@ class JLinkDump(unittest.TestCase):
         self.addCleanup(d.cleanup)
         self.dir = Path(d.name)
         env = fake_tools(self, self.dir, (('JLinkExe', FAKE_JLINK),))
-        self.env = {'PATH': env['PATH'], 'FAKE_MEM': str(self.dir / 'mem.json'), 'FAKE_LOG': str(self.dir / 'log.json')}
+        # the whole environment, cleared into place: an inherited PROBE_STATE_* override would start a real tool
+        self.env = {**env, 'FAKE_MEM': str(self.dir / 'mem.json'), 'FAKE_LOG': str(self.dir / 'log.json')}
         self.out = self.dir / 'out'
 
     def target(self, ring, wroff, halted=False, cpuid=CPUID_M4, name=b'SysView\0', advance=False):
@@ -130,7 +131,7 @@ class JLinkDump(unittest.TestCase):
         argv = ['--out', str(self.out), '--channel', '1', '--addr', hex(CB), '--probe', '123', '--device', 'X',
                 '--interface', 'swd', '--speed', '4000', *extra]
         out = io.StringIO()
-        with unittest.mock.patch.dict(os.environ, {**self.env, **env}), contextlib.redirect_stdout(out):
+        with unittest.mock.patch.dict(os.environ, {**self.env, **env}, clear=True), contextlib.redirect_stdout(out):
             rc = dump.main(argv)
         return rc, json.loads(out.getvalue())
 
@@ -235,7 +236,7 @@ class JLinkDump(unittest.TestCase):
         self.target(bytes(range(64)), wroff=8)
         argv = ['--out', str(self.out), '--channel', '1', '--elf', str(elf), '--probe', '123', '--device', 'X',
                 '--interface', 'swd', '--speed', '4000']
-        with unittest.mock.patch.dict(os.environ, self.env), contextlib.redirect_stdout(io.StringIO()):
+        with unittest.mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(dump.main(argv), 0)
 
 
