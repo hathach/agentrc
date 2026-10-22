@@ -84,6 +84,10 @@ def launch(output, path, digest, tree, url):
         stopped = f" (stopped {result['reason']})" if result.get('reason') else ''
         blockers.append(f"launch: status {result.get('status')}, pass {result.get('pass')}, lane {obs.get('lane')}{stopped}: "
                         'a merge needs a complete `both` launch that passed')
+    # The workflow always writes all of these but reanswer; one missing is a state this does not read.
+    missing = [k for k in ('acceptedFailures', 'deferrals', 'holds', 'debt', 'pending') if k not in state]
+    if missing:
+        blockers.append(f"launch: its state has no {', '.join(missing)}")
     for key, what in (('acceptedFailures', 'accepted CI failure(s)'), ('deferrals', 'deferred finding(s)'), ('holds', 'held finding(s)'),
                       ('debt', 'comment(s) still owed a reply'), ('reanswer', 'comment(s) to answer again')):
         if state.get(key):
@@ -93,9 +97,10 @@ def launch(output, path, digest, tree, url):
     pinned = pr_identity((state.get('pin') or {}).get('prUrl'))
     if pinned != url:
         blockers.append(f"launch: its state is pinned to {(state.get('pin') or {}).get('prUrl')!r}, not the PR the grant names")
+    # summarize() compares the checkout with the state; the observation's heads are this one's to compare.
     heads = {'checkout': (tree or {}).get('head'), 'state': state.get('expectedHead'), 'reviewed': obs.get('reviewedHead'),
              'reviews': reviews.get('headSha'), 'ci': (obs.get('ci') or {}).get('headSha')}
-    if len(set(heads.values())) != 1 or not all(FULL_SHA.match(h or '') for h in heads.values()):
+    if any(not FULL_SHA.match(h or '') or (k in ('reviewed', 'reviews', 'ci') and h != heads['state']) for k, h in heads.items()):
         blockers.append(f'launch: heads disagree or are not full SHAs: {heads}')
     if not reviews.get('fingerprint'):
         blockers.append('launch: no review fingerprint (an older output, or a harvest that failed): it cannot authorize a merge')
@@ -113,15 +118,27 @@ def view(repo, n):
         raise Unusable(f'the PR query answered in a shape merge.py does not read ({e!r}): {json.dumps(got)[:300]}')
 
 
-def settled_view(repo, n):
-    """The PR once GitHub has computed its mergeability, which it does lazily: UNKNOWN on the first read is common."""
+def poll(repo, n, done, tolerate=False):
+    """The PR, read until done(pr) holds or READBACK_TRIES reads are spent; with tolerate, a failed read is skipped and the
+    last good one kept (None when none was), else it is Unusable."""
+    pr = None
     for tried in range(READBACK_TRIES):
         if tried:
             time.sleep(READBACK_WAIT)
-        pr = view(repo, n)
-        if pr['state'] != 'OPEN' or 'UNKNOWN' not in (pr['mergeable'], pr['mergeStateStatus']):
+        try:
+            pr = view(repo, n)
+        except Unusable:
+            if not tolerate:
+                raise
+            continue
+        if done(pr):
             break
     return pr
+
+
+def settled_view(repo, n):
+    """The PR once GitHub has computed its mergeability, which it does lazily: UNKNOWN on the first read is common."""
+    return poll(repo, n, lambda pr: pr['state'] != 'OPEN' or 'UNKNOWN' not in (pr['mergeable'], pr['mergeStateStatus']))
 
 
 def pr_blockers(pr, url, base, state):
@@ -177,13 +194,18 @@ def required_checks(repo, base, head):
     if not required:
         return blockers, []
     runs = harvest.pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs')
-    statuses = harvest.pages(f'repos/{repo}/commits/{head}/statuses')
+    statuses = None
     seen = []
     for r in required:
         mine = [x for x in runs if x.get('name') == r['context'] and (r['app'] is None or (x.get('app') or {}).get('id') == r['app'])]
-        latest_run = max(mine, key=lambda x: x['id'], default=None)
-        latest_status = None if r['app'] is not None else harvest.newest([x for x in statuses if x.get('context') == r['context']], 'updated_at')
-        if latest_run:
+        latest_run, unordered = harvest.latest_run(mine) if mine else (None, '')
+        # A commit status names no app, so it stands in only where any source may provide the check and no run does.
+        if not mine and r['app'] is None and statuses is None:
+            statuses = harvest.pages(f'repos/{repo}/commits/{head}/statuses')
+        latest_status = harvest.newest([x for x in statuses or [] if x.get('context') == r['context']], 'updated_at') if not mine and r['app'] is None else None
+        if unordered:
+            state, ok = f'its runs cannot be ordered: {unordered}', False
+        elif latest_run:
             state, ok = f"{latest_run.get('status')}/{latest_run.get('conclusion')}", latest_run.get('status') == 'completed' and latest_run.get('conclusion') in PASSED
         elif latest_status:
             state, ok = latest_status.get('state'), latest_status.get('state') == 'success'
@@ -231,16 +253,7 @@ def ci_blockers(repo, n, head):
 
 def readback(repo, n, merged_any):
     """(outcome, the PR) after a merge request: merged_any says GitHub accepted it."""
-    pr = None
-    for tried in range(READBACK_TRIES):
-        if tried:
-            time.sleep(READBACK_WAIT)
-        try:
-            pr = view(repo, n)
-        except Unusable:
-            continue
-        if pr['state'] != 'OPEN' or not merged_any:
-            break
+    pr = poll(repo, n, lambda pr: pr['state'] != 'OPEN' or not merged_any, tolerate=True)
     if pr is None:
         return 'uncertain', None
     if pr['state'] == 'MERGED':
@@ -282,9 +295,10 @@ def collect(argv):
         return receipt(n, head, 'closed', blockers, pr=pr, detail='the PR is closed')
     if not FULL_SHA.match(head or ''):
         raise Unusable(f"the launch's state names no full head SHA: {head!r}")
+    blockers += pr_blockers(pr, url, a.base, facts['state'])
     if pr['headRefOid'] != head:
         blockers.append(f"github: the PR head is {pr['headRefOid']}, not the launch's {head}: it rejoins through adoptHead and needs fresh reviews")
-    blockers += pr_blockers(pr, url, a.base, facts['state'])
+        return receipt(n, head, 'not-ready', blockers, pr=pr, detail='the head moved: reviews, CI and required checks were not inspected')
     required, checks = required_checks(repo, a.base, head)
     blockers += required
     blockers += review_blockers(repo, n, facts['fingerprint'], head)

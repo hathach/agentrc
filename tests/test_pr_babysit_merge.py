@@ -2,11 +2,13 @@
 Stubs prove the plumbing only; the first live merge is the real test."""
 import copy
 import importlib.util
+import io
 import json
 import re
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -15,6 +17,8 @@ sys.path.insert(0, str(SCRIPTS))
 spec = importlib.util.spec_from_file_location('pr_babysit_merge', SCRIPTS / 'merge.py')
 merge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(merge)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from helpers import guard_survivors  # noqa: E402
 
 HEAD = 'a' * 40
 OTHER = 'b' * 40
@@ -48,6 +52,10 @@ def live(**over):
     squash = over.pop('squashMergeAllowed', True)
     pr.update(over)
     return {'data': {'repository': {'squashMergeAllowed': squash, 'pullRequest': pr}}}
+
+
+def setUpModule():
+    guard_survivors(__name__)
 
 
 class World:
@@ -167,9 +175,9 @@ class MergeTest(unittest.TestCase):
     def test_required_checks_from_protection_and_rules(self):
         self.world.protection = {'required_status_checks': {'contexts': ['lint'], 'checks': [{'context': 'test'}]}}
         self.world.rules = [{'type': 'required_status_checks', 'parameters': {'required_status_checks': [{'context': 'build'}]}}]
-        self.world.runs = [{'id': 1, 'name': 'build', 'status': 'completed', 'conclusion': 'failure'},
-                           {'id': 2, 'name': 'build', 'status': 'completed', 'conclusion': 'success'},
-                           {'id': 3, 'name': 'test', 'status': 'completed', 'conclusion': 'neutral'}]
+        self.world.runs = [{'id': 1, 'name': 'build', 'status': 'completed', 'conclusion': 'failure', 'started_at': '2026-10-01T00:00:00Z'},
+                           {'id': 2, 'name': 'build', 'status': 'completed', 'conclusion': 'success', 'started_at': '2026-10-01T01:00:00Z'},
+                           {'id': 3, 'name': 'test', 'status': 'completed', 'conclusion': 'neutral', 'started_at': '2026-10-01T00:00:00Z'}]
         self.world.statuses = [{'context': 'lint', 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'}]
         got = self.run_it()
         self.assertEqual(got['outcome'], 'ready', 'a rerun that passed, a neutral run and a success status pass')
@@ -178,10 +186,15 @@ class MergeTest(unittest.TestCase):
                                                                  {'context': 'test', 'app': None, 'state': 'completed/neutral'}])
         self.world.runs[2]['status'] = 'in_progress'
         self.assertBlocked(self.run_it(), "required check 'test' on the head: in_progress")
+        self.world.runs[2]['status'] = 'completed'
+        self.world.runs.append({**self.world.runs[2], 'id': 4, 'conclusion': 'failure'})
+        self.assertBlocked(self.run_it(), "required check 'test' on the head: its runs cannot be ordered")
+        self.world.runs = [{'id': 5, 'name': 'lint', 'status': 'completed', 'conclusion': 'failure', 'started_at': '2026-10-01T00:00:00Z'}]
+        self.assertBlocked(self.run_it(), "required check 'lint' on the head: completed/failure")  # a run outranks a success status
 
     def test_a_check_required_from_an_app_passes_only_on_that_app_s_run(self):
         self.world.rules = [{'type': 'required_status_checks', 'parameters': {'required_status_checks': [{'context': 'build', 'integration_id': 42}]}}]
-        self.world.runs = [{'id': 2, 'name': 'build', 'status': 'completed', 'conclusion': 'success', 'app': {'id': 99}}]
+        self.world.runs = [{'id': 2, 'name': 'build', 'status': 'completed', 'conclusion': 'success', 'app': {'id': 99}, 'started_at': '2026-10-01T00:00:00Z'}]
         self.world.statuses = [{'context': 'build', 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'}]
         self.world.views = [live(mergeStateStatus='BLOCKED')]
         self.assertBlocked(self.run_it(None, '--merge'), "required check 'build' on the head: not registered by app 42")
@@ -225,7 +238,10 @@ class MergeTest(unittest.TestCase):
 
     def test_one_head_everywhere(self):
         self.world.views = [live(headRefOid=OTHER)]
-        self.assertBlocked(self.run_it(), 'rejoins through adoptHead')
+        got = self.run_it()
+        self.assertBlocked(got, 'rejoins through adoptHead')
+        self.assertEqual((self.world.harvested, self.world.ran), ([], []), 'nothing more is read for a head that moved')
+        self.assertIn('not inspected', got['detail'])
         self.world.views = [live()]
         self.tree_head = OTHER
         self.assertBlocked(self.run_it(), 'heads disagree')
@@ -272,6 +288,12 @@ class MergeTest(unittest.TestCase):
             with self.subTest(key):
                 self.assertBlocked(self.run_it(launch_output({key: value}), '--merge'), 'launch: ')
 
+    def test_a_state_missing_a_key_it_always_carries_is_not_read_as_clean(self):
+        out = launch_output()
+        del out['result']['state']['holds']
+        out['result']['state']['digest'] = out['result']['stateDigest'] = merge.state_digest(out['result']['state'])
+        self.assertBlocked(self.run_it(out), 'its state has no holds')
+
     def test_the_state_must_be_the_one_named_and_intact(self):
         self.assertBlocked(self.run_it(None, digest='deadbeef'), 'not --state-digest deadbeef')
         out = launch_output()
@@ -288,7 +310,9 @@ class MergeTest(unittest.TestCase):
     def test_unreadable_facts_exit_2(self):
         path = self.dir / 'bad.output'
         path.write_text('{not json')
-        self.assertEqual(merge.report(merge.collect, [*BASE_ARGS, 'x', '--output', str(path)]), 2)
+        with redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(merge.report(merge.collect, [*BASE_ARGS, 'x', '--output', str(path)]), 2)
+        self.assertIn('is not JSON', out.getvalue())
         path.write_text('')
         with self.assertRaisesRegex(merge.Unusable, 'launch threw'):
             merge.collect([*BASE_ARGS, 'x', '--output', str(path)])

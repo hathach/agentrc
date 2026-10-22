@@ -121,9 +121,9 @@ def load_output(path):
     return output
 
 
-def cut(text):
+def cut(text, limit=CUT):
     text = ' '.join(str(text).split())
-    return text if len(text) <= CUT else text[:CUT] + '…'
+    return text if len(text) <= limit else text[:limit] + '…'
 
 
 def elapsed(progress):
@@ -249,29 +249,13 @@ def pinned_by(ref, notes):
     return config
 
 
-GATES = {'sonarGate': 'SonarCloud gate', 'greptileGate': 'Greptile confidence gate'}
-CI_LEFT = {'rigSide': 'left red for the rig', 'unclassified': 'left red: not placed by its evidence'}
 TABLE_CUT = 90
 
 
-def md_cell(text, cut_at=TABLE_CUT):
-    text = ' '.join(str(text if text is not None else '').split()).replace('\\', '\\\\').replace('|', '\\|')
-    return (text if len(text) <= cut_at else text[:cut_at - 1] + '…') or '-'
-
-
-def outcome(row):
-    """A row's outcome in words: its repair for a valid finding or a real CI failure, else what was decided."""
-    state, repair = row.get('state'), row.get('repair')
-    if repair:
-        text = repair.get('outcome', '?') + (f": {repair['detail']}" if repair.get('detail') else '')
-        text += ', since already fixed' if row.get('laterState') == 'stale' else ''
-    elif row.get('lane') == 'ci':
-        text = (f"accepted: {row.get('accepted')}" if state == 'accepted' else f'left red: the {GATES[state]}' if state in GATES
-                else CI_LEFT.get(state, state or '?'))
-    else:
-        text = {'stale': 'already fixed', 'invalid': 'refuted', 'refuted': 'refuted',
-                'deferred': f"deferred: {row.get('deferral') or 'the PR owner\'s decision'}", 'held': f"held: {row.get('hold')}"}.get(state, state or '?')
-    return ('comment edited since; ' if row.get('edited') else '') + text
+def md_cell(text, limit=TABLE_CUT):
+    """One table cell: cut as cut() does, then its backslashes and pipes escaped."""
+    text = cut('' if text is None else text, limit)
+    return text.replace('\\', '\\\\').replace('|', '\\|') or '-'
 
 
 def reply_text(reply):
@@ -298,7 +282,7 @@ def findings_table(rollup):
     head = ['Source', 'Where', 'Finding', 'Verdict', 'Outcome', 'Commit', 'Reply']
     body = [[md_cell(r.get('source'), 24), md_cell(r.get('at') if r.get('lane') == 'review' else r.get('cell'), 40),
              md_cell(r.get('claim') if r.get('lane') == 'review' else r.get('firstError')), md_cell(r.get('verdict'), 12),
-             md_cell(outcome(r)), md_cell((r.get('repair') or {}).get('sha'), 40), md_cell(reply_text(r.get('reply')), 60)] for r in rows]
+             md_cell(r.get('outcome')), md_cell((r.get('repair') or {}).get('sha'), 40), md_cell(reply_text(r.get('reply')), 60)] for r in rows]
     width = [max(len(c) for c in col) for col in zip(head, *body)]
     line = lambda cells: '| ' + ' | '.join(c.ljust(w) for c, w in zip(cells, width)) + ' |'
     return '\n'.join(['; '.join(coverage), '', line(head), line(['-' * w for w in width]), *map(line, body)])

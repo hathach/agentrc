@@ -741,6 +741,7 @@ test('reviewers: [] runs no review lane at all and still completes', async () =>
   assert.equal(labels.some(l => l.startsWith('reviews#')), false, 'nobody to harvest, so nobody is asked')
   assert.equal(labels.some(l => l.startsWith('fix:')), false)
   assert.ok(logs.some(l => l === 'cycle 1: no reviewers requested — CI lane only'))
+  assert.deepEqual(result.rollup.observed, { reviews: false, ci: true }, 'no validator ran, so no review was observed')
   assert.equal(result.pass, true, `a CI-only run must still reach a verdict (got ${result.reason})`)
   assert.deepEqual(result.history[0].reviews, { findings: [], replies: [], bots: [] })
 })
@@ -976,7 +977,7 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.deepEqual(observed, { reviews: true, ci: true })
   const byId = Object.fromEntries(found.map(r => [r.findingId, r]))
   assert.deepEqual(byId['1#1'], { lane: 'review', source: 'coderabbit', findingId: '1#1', commentId: 1, commentDigest: 'd1', at: 'src/a.c:1', claim: 'real bug',
-    verdict: 'valid', state: 'valid', repair: { outcome: 'pushed', sha: shaFor(1) }, repairCycle: 1, edited: false, lastCycle: 1,
+    verdict: 'valid', state: 'valid', repair: { outcome: 'pushed', sha: shaFor(1) }, outcome: 'fixed + pushed — stat:src/a.c', repairCycle: 1, edited: false, lastCycle: 1,
     reply: { how: 'fixNotePosts', cycle: 1, replyId: result.history[0].fixNotePosts.receipts[0].replyId, settled: true } }, 'the full SHA it was pushed in, and its fix note')
   assert.deepEqual([byId['3#3'].state, byId['3#3'].repair, byId['3#3'].reply.how, byId['2#2'].state, byId['2#2'].reply.how],
     ['refuted', null, 'refutedPosts', 'stale', 'refutedPosts'])

@@ -32,11 +32,7 @@ python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkou
 python3 $S/merge.py --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--merge]  # chief's merge gate; inspects without --merge
 ```
 
-`merge.py` is chief's, run only under its merge exception (`agents/chief.md`):
-it re-reads a passed `both` launch's PR, both CodeRabbit's and Greptile's
-reviews of the head, CI, the base branch's required checks and the review
-`fingerprint`, and with `--merge` squash-merges with a head guard. A
-launch's `pass` alone is no reason to merge.
+`merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception.
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch, lists the `blockers` to settle before continuing, and shows as `pinned`

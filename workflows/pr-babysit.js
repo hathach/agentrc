@@ -918,14 +918,18 @@ const repairOf = (fixes, id, push, pushFailed) => {
     return rejected ? { outcome: 'rejected by the writer', detail: rejected.evidence } : { outcome: 'withheld' }
   }
   if (fix.addresses !== true) return { outcome: 'unverified', detail: fix.checkReason }
-  const sha = (p) => /^[0-9a-f]{7,40}$/.test(String(p.sha || '').trim()) ? String(p.sha).trim() : null
   if (pushFailed) {
     if (pushFailed.committed === null) return { outcome: 'commit outcome unknown', detail: pushFailed.detail }
     if (!pushFailed.committed) return { outcome: 'commit failed', detail: pushFailed.detail }
-    return { outcome: pushFailed.published === 'unknown' ? 'committed, publication unknown' : 'committed, not pushed', sha: sha(pushFailed), detail: pushFailed.detail }
+    return { outcome: pushFailed.published === 'unknown' ? 'committed, publication unknown' : 'committed, not pushed', sha: fullSha(pushFailed), detail: pushFailed.detail }
   }
-  return push ? { outcome: 'pushed', sha: sha(push) } : { outcome: 'uncommitted' }
+  return push ? { outcome: 'pushed', sha: fullSha(push) } : { outcome: 'uncommitted' }
 }
+// A CI failure left unfixed, in the words of the cycle summary and the findings rows alike; null for one to fix.
+const ciLeft = (rf, state) => state === 'accepted' ? `accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`
+  : GATE_LABEL[state] ? `left red: a ${GATE_LABEL[state]}, not a CI-lane fix`
+    : state === 'rigSide' ? 'left red for the rig'
+      : state === 'unclassified' ? 'left red: not placed by its evidence' : null
 const POST_BATCHES = ['refutedPosts', 'deferralPosts', 'fixNotePosts']
 // cycle -> the findings a usable review report harvested, before those answered by hand are dropped: what the findings rows show.
 const reviewedCycles = new Map()
@@ -965,12 +969,15 @@ const launchRollup = () => {
   const cycles = history.slice(launchFrom)
   const fixedBy = (fixes, id, push) => !!(push && fixes && fixes.some(x => x.ids.includes(id) && x.addresses === true))
   // A later cycle's `stale` (the fix already landed) keeps the repair that made it so.
-  const row = (key, fields, repair, cycle) => {
+  // outcome: what the findings table shows, repair the same as data.
+  const row = (key, fields, repair, outcome, cycle) => {
     const prior = rows.get(key)
     const keep = prior && prior.repair && fields.state === 'stale'
-    rows.set(key, { ...(keep ? { ...prior, laterState: 'stale' } : { ...fields, repair, repairCycle: repair ? cycle : prior ? prior.repairCycle : null }),
+    rows.set(key, { ...(keep ? { ...prior, laterState: 'stale' } : { ...fields, repair, outcome, repairCycle: repair ? cycle : prior ? prior.repairCycle : null }),
       edited: prior ? prior.edited : false, lastCycle: cycle })
   }
+  const reviewOutcome = (f, state) => state === 'stale' ? 'already fixed' : state === 'refuted' ? 'refuted'
+    : state === 'deferred' ? `deferred: ${f.deferral.issueUrl || 'the PR owner\'s decision'}` : `held: ${f.hold}`
   for (const e of cycles) {
     for (const f of (e.reviews && e.reviews.findings) || []) {
       const state = findingState(f)
@@ -984,21 +991,26 @@ const launchRollup = () => {
       row(key, { lane: 'review', source: f.source, findingId: f.findingId, commentId: f.commentId, commentDigest: f.commentDigest,
         at: `${f.file}:${f.line}`, claim: String(f.claim).slice(0, 200), verdict: f.overturned ? 'overturned' : f.verdict, state,
         ...(state === 'deferred' ? { deferral: f.deferral.issueUrl || null } : {}), ...(state === 'held' ? { hold: f.hold } : {}) },
-      state === 'valid' ? repairOf(e.reviewFixes, f.findingId, e.reviewPush, e.reviewPushFailed) : null, e.cycle)
+      state === 'valid' ? repairOf(e.reviewFixes, f.findingId, e.reviewPush, e.reviewPushFailed) : null,
+      state === 'valid' ? fixCell(e.reviewFixes, f.findingId, e.reviewPush, e.reviewPushFailed) : reviewOutcome(f, state), e.cycle)
     }
     for (const rf of (e.ci && e.ci.realFailures) || []) {
       const state = ciState(rf)
       ci.set(failureKey(rf), state !== 'real' ? state : fixedBy(e.ciFixes, rf.id, e.ciPush) ? 'fixed' : 'open')
       row(`ci ${failureKey(rf)}`, { lane: 'ci', source: `ci:${rf.check}`, check: rf.check, cell: rf.cell ?? null,
         firstError: String(rf.firstError || '').slice(0, 200), verdict: rf.verdict, state, ...(state === 'accepted' ? { accepted: rf.accepted.reason } : {}) },
-      state === 'real' ? repairOf(e.ciFixes, rf.id, e.ciPush, e.ciPushFailed) : null, e.cycle)
+      state === 'real' ? repairOf(e.ciFixes, rf.id, e.ciPush, e.ciPushFailed) : null,
+      ciLeft(rf, state) ?? fixCell(e.ciFixes, rf.id, e.ciPush, e.ciPushFailed), e.cycle)
     }
     for (const r of (e.ci && e.ci.infraRerun) || []) reran.add(r)
     if (e.adoption && e.adoption.publication === 'pushed') pushed.push(e.adoption.to.slice(0, 8))
     for (const p of [e.reviewPush, e.ciPush]) if (shaOf(p) !== '-') pushed.push(shaOf(p))
     for (const p of [e.refutedPosts, e.deferralPosts, e.fixNotePosts]) replies += ((p && p.replied) || []).length
   }
-  for (const r of rows.values()) if (r.lane === 'review') r.reply = replyRow(cycles, r.commentId, r.commentDigest, r.edited)
+  for (const r of rows.values()) {
+    if (r.lane === 'review') r.reply = replyRow(cycles, r.commentId, r.commentDigest, r.edited)
+    r.outcome = `${r.edited ? 'comment edited since; ' : ''}${r.outcome}${r.laterState === 'stale' ? ', since already fixed' : ''}`
+  }
   const tally = (m, keys) => Object.fromEntries([['total', m.size], ...keys.map(k => [k, [...m.values()].filter(v => v === k).length])])
   return {
     cycles: cycles.map(e => e.cycle),
@@ -1418,26 +1430,29 @@ const mdTable = (headers, rows) => {
   return [line(headers), line(w.map(n => '-'.repeat(n))), ...rows.map(line)].join('\n')
 }
 // The SHA is model output: a mislabeled commit in the table is worse than none.
-const shaOf = (push) => {
+const fullSha = (push) => {
   const s = push && push.sha && String(push.sha).trim()
-  return s && /^[0-9a-f]{7,40}$/.test(s) ? s.slice(0, 8) : '-'
+  return s && /^[0-9a-f]{7,40}$/.test(s) ? s : null
 }
+const shaOf = (push) => fullSha(push) ? fullSha(push).slice(0, 8) : '-'
+// repairOf's outcome as the cycle summary words it, with the fix's diffstat and any regenerated files.
 const fixCell = (fixes, id, push, pushFailed) => {
-  if (!fixes) return 'no fix attempted this cycle'
-  const fix = fixes.find(x => x.ids.includes(id) || x.rejected.some(r => r.id === id))
-  if (!fix) return 'withheld (no fix dispatched)'
-  if (fix.addresses !== true) return `unverified: ${fix.checkReason}`
-  const stat = fix.diffstat ? ` — ${fix.diffstat}` : ''
-  // A rejected push leaves the fix committed; a failed commit leaves it only in the tree.
-  if (pushFailed) {
-    const detail = pushFailed.detail || 'no detail'
-    if (pushFailed.committed === null) return `fixed, COMMIT OUTCOME UNKNOWN: ${detail} — inspect HEAD and the worktree${stat}`
-    return pushFailed.committed
-      ? `fixed + committed ${pushFailed.sha ? pushFailed.sha.slice(0, 7) : '(SHA unknown)'}, ${pushFailed.published === 'unknown' ? 'PUBLICATION UNKNOWN' : 'NOT PUSHED'}: ${detail}${stat}`
-      : `fixed, COMMIT FAILED: ${detail}${stat}`
+  const r = repairOf(fixes, id, push, pushFailed)
+  const fix = fixes && fixes.find(x => x.ids.includes(id))
+  const stat = fix && fix.diffstat ? ` — ${fix.diffstat}` : ''
+  const detail = r.detail || 'no detail'
+  switch (r.outcome) {
+    case 'no fix attempted': return 'no fix attempted this cycle'
+    case 'withheld': return 'withheld (no fix dispatched)'
+    case 'rejected by the writer': case 'unverified': return `${r.outcome}: ${r.detail}`
+    // A rejected push leaves the fix committed; a failed commit leaves it only in the tree.
+    case 'commit outcome unknown': return `fixed, COMMIT OUTCOME UNKNOWN: ${detail} — inspect HEAD and the worktree${stat}`
+    case 'commit failed': return `fixed, COMMIT FAILED: ${detail}${stat}`
+    case 'committed, not pushed': case 'committed, publication unknown':
+      return `fixed + committed ${r.sha ? r.sha.slice(0, 7) : '(SHA unknown)'}, ${r.outcome === 'committed, not pushed' ? 'NOT PUSHED' : 'PUBLICATION UNKNOWN'}: ${detail}${stat}`
   }
   const hook = push && push.generated && push.generated.length ? `, with regenerated ${push.generated.join(', ')}` : ''
-  return `${push ? 'fixed + pushed' : 'fixed, uncommitted'}${hook}${stat}`
+  return `${r.outcome === 'pushed' ? 'fixed + pushed' : 'fixed, uncommitted'}${hook}${stat}`
 }
 const VERDICT_ORDER = { valid: 0, stale: 1, invalid: 2 }
 // Comments on none of the PR's id spaces owe nothing; per cycle.
@@ -1478,11 +1493,7 @@ const cycleSummary = (entry) => {
       cell(`ci:${rf.check}`, 24),
       cell(rf.firstError),
       rf.verdict === 'real' ? 'ci-real' : rf.verdict,
-      state === 'accepted' ? cell(`accepted, not fixed: ${rf.accepted.reason} (${rf.accepted.scope})`, 60)
-      : GATE_LABEL[state] ? `left red: a ${GATE_LABEL[state]}, not a CI-lane fix`
-        : state === 'rigSide' ? 'left red for the rig'
-          : state === 'unclassified' ? 'left red: not placed by its evidence'
-            : cell(fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
+      cell(ciLeft(rf, state) ?? fixCell(entry.ciFixes, rf.id, entry.ciPush, entry.ciPushFailed), 60),
       state === 'real' ? shaOf(entry.ciPush) : '-',
     ])
   }
@@ -2347,7 +2358,7 @@ const runLanes = async (cycle, entry, lanes) => {
         return stop(cycle, 'review-report-unusable', { detail: why })
       }
     }
-    if (reviewLane) reviewedCycles.set(cycle, r.findings)
+    if (reviewLane && r !== nobody) reviewedCycles.set(cycle, r.findings)
     entry.bots = r === nobody
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)
