@@ -35,7 +35,7 @@ def output(**over):
         'rollup': {'cycles': [2], 'findings': {'total': 1, 'fixed': 1}, 'ci': {'total': 2}, 'reran': 0, 'pushed': [NEXT[:8]], 'replies': 1},
         'pending': [{'bot': 'greptile', 'state': 'absent', 'reason': 'no check run'}],
         'observation': {'reviewedHead': HEAD, 'lane': 'both',
-                        'reviews': {'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
+                        'reviews': {'fingerprint': f'coderabbit|coderabbit|{"f" * 32}', 'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
                                     'findings': [{'findingId': '7#1', 'commentId': 7, 'commentDigest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid',
                                                   'file': 'a.c', 'line': 3}]},
                         'ci': {'status': 'red', 'headSha': HEAD, 'infraRerun': [],
@@ -89,6 +89,8 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['stateRef'], {'outputFile': (self.dir / 'w.output').resolve().as_posix(), 'digest': '0123abcd'},
                          'with slashes: the workflow puts it in a shell command')
         self.assertEqual(s['blockers'], [], 'a push past the reviewed head is not a disagreement')
+        self.assertEqual((s['observation']['fingerprint'], s['observation']['bots'][0]['sha']), (f'coderabbit|coderabbit|{"f" * 32}', HEAD),
+                         'the review evidence a merge compares, and the full SHA a bot reviewed')
         self.assertEqual(s['observation']['findings'], [{'id': '7#1', 'digest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid', 'at': 'a.c:3'}])
         ci = s['observation']['ci']
         self.assertEqual(ci['verdicts'], {'rig-side': 1, 'real': 1})
@@ -250,7 +252,7 @@ class LaunchResultTest(unittest.TestCase):
             {'bot': 'copilot', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'the requesting user reached the Copilot quota',
              'evidence': ['review 3313 on aaaaaaaa'], 'retryAt': None}]
         bots = self.run_it(data)[1]['observation']['bots']
-        self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD[:8], 'reason': 'Review rate limited',
+        self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'Review rate limited',
                                    'evidence': ['comment 5'], 'retryAt': '2026-10-13T10:55:19Z'})
         self.assertEqual((bots[1]['bot'], bots[1]['kind'], bots[1]['evidence']), ('copilot', 'limited', ['review 3313 on aaaaaaaa']))
 

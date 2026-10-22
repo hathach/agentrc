@@ -426,6 +426,54 @@ class WithoutPyYaml(unittest.TestCase):
                 bare.pr_types('o/r', '.github/workflows/build.yml', HEAD)
 
 
+class Fingerprint(unittest.TestCase):
+    REVIEWERS, AUTO = ['coderabbit', 'greptile'], ['coderabbit', 'greptile']
+
+    def evidence(self):
+        inline = harvest.entry('review', {'id': 40, 'user': user('coderabbitai[bot]'), 'html_url': 'u/40'}, 'coderabbit', 'fix this', EVENT, EVENT)
+        reviews = [review('coderabbitai[bot]', HEAD, '', id_=31) | {'state': 'COMMENTED'}, review('hathach', HEAD, 'lgtm', id_=32) | {'state': 'APPROVED'}]
+        statuses = [status('success', 'Review completed') | {'id': 5}, {'id': 6, 'context': 'ci', 'state': 'pending', 'description': ''}]
+        checks = [below_run(), {'id': 7, 'name': 'build', 'status': 'in_progress', 'conclusion': None}]
+        return [inline], reviews, statuses, checks
+
+    def fp(self, harvested, reviews, statuses, checks):
+        return harvest.fingerprint(self.REVIEWERS, self.AUTO, harvested, reviews, statuses, checks)
+
+    def test_it_changes_with_the_review_evidence_and_nothing_else(self):
+        base = self.fp(*self.evidence())
+        self.assertTrue(base.startswith('coderabbit,greptile|coderabbit,greptile|'))
+        changes = {
+            'an edited comment': lambda h, r, s, c: h[0].update(digest='0' * 12),
+            'a new comment': lambda h, r, s, c: h.append({**h[0], 'commentId': 41}),
+            'an empty review': lambda h, r, s, c: r.append(review('greptile-apps[bot]', HEAD, '', id_=33) | {'state': 'COMMENTED'}),
+            'a dismissed review': lambda h, r, s, c: r[0].update(state='DISMISSED'),
+            'a CodeRabbit status': lambda h, r, s, c: s[0].update(description='Review skipped'),
+            'a rerun Greptile check': lambda h, r, s, c: c[0].update(id=8),
+            'a new Greptile score': lambda h, r, s, c: c[0]['output'].update(title='Base review: Confidence 5/5'),
+        }
+        for name, change in changes.items():
+            with self.subTest(name):
+                ev = self.evidence()
+                change(*ev)
+                self.assertNotEqual(self.fp(*ev), base)
+        same = {
+            'a human review': lambda h, r, s, c: r[1].update(state='CHANGES_REQUESTED'),
+            'another status': lambda h, r, s, c: s[1].update(state='success'),
+            'another check': lambda h, r, s, c: c[1].update(status='completed', conclusion='success'),
+            'a later edit time': lambda h, r, s, c: (h[0].update(updatedAt='2026-09-26T00:00:00Z'), s[0].update(updated_at='2026-09-26T00:00:00Z')),
+            'the order read': lambda h, r, s, c: r.reverse(),
+        }
+        for name, change in same.items():
+            with self.subTest(name):
+                ev = self.evidence()
+                change(*ev)
+                self.assertEqual(self.fp(*ev), base)
+
+    def test_the_reviewer_lists_are_part_of_it(self):
+        ev = self.evidence()
+        self.assertNotEqual(harvest.fingerprint(['coderabbit', 'greptile'], ['coderabbit'], *ev), self.fp(*ev))
+
+
 class EndToEnd(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -439,8 +487,8 @@ class EndToEnd(unittest.TestCase):
         run = lambda id_, event, path, at, h=HEAD: {'id': id_, 'event': event, 'path': path, 'created_at': at, 'head_sha': h,
                                                     'head_branch': 'fix', 'head_repository': {'full_name': 'o/r'}}
         a = {'repo view --json nameWithOwner': [{'nameWithOwner': R}],
-             f'pr view {N} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
-             f'pr view {N} --json headRefOid': [{'headRefOid': h} for h in heads[1:] + heads[-1:]]}
+             f'pr view {N} -R {R} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
+             f'pr view {N} -R {R} --json headRefOid': [{'headRefOid': h} for h in heads[1:] + heads[-1:]]}
         for h in set(heads):
             a[f'api --paginate --slurp repos/{R}/actions/runs?head_sha={h}&per_page=100'] = [[{'workflow_runs': [
                 run(1, 'pull_request', '.github/workflows/label.yml', '2026-09-25T09:00:00Z', h),
@@ -476,6 +524,13 @@ class EndToEnd(unittest.TestCase):
                          'only the named reviewers, and no empty review body')
         self.assertEqual(got['comments'][0]['digest'], harvest.digest('fix this'))
         self.assertEqual(got['comments'][0]['body'], 'fix this')
+        self.assertRegex(got['fingerprint'], r'^coderabbit,copilot\|coderabbit\|[0-9a-f]{32}$')
+        self.assertEqual(self.harvest(self.answers([HEAD]))[1]['fingerprint'], got['fingerprint'], 'a second read of the same evidence')
+
+    def test_the_repo_named_is_read_instead_of_the_checkouts(self):
+        answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items() if not k.startswith('repo view')}
+        code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--repo', 'up/r')
+        self.assertEqual((code, got['headSha']), (0, HEAD), got)
 
     def test_the_walkthrough_is_harvested_without_its_body(self):
         answers = self.answers([HEAD])
@@ -550,7 +605,7 @@ class EndToEnd(unittest.TestCase):
                 ('secondary', {'core': {'remaining': 5000, 'reset': 1790000000}}, (None, True))):
             with self.subTest(name):
                 answers = self.answers([HEAD])
-                answers['pr view 7 --json headRefOid,headRefName,headRepository'] = [limited]
+                answers['pr view 7 -R o/r --json headRefOid,headRefName,headRepository'] = [limited]
                 answers['api rate_limit'] = [{'resources': resources}]
                 code, got = self.harvest(answers)
                 self.assertEqual(code, 2)
@@ -558,7 +613,7 @@ class EndToEnd(unittest.TestCase):
                 self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), want)
                 self.assertRegex(got['rateLimit']['observedAt'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
         answers = self.answers([HEAD])
-        answers['pr view 7 --json headRefOid,headRefName,headRepository'] = [{'stderr': 'HTTP 404: Not Found'}]
+        answers['pr view 7 -R o/r --json headRefOid,headRefName,headRepository'] = [{'stderr': 'HTTP 404: Not Found'}]
         code, got = self.harvest(answers)
         self.assertEqual((code, 'rateLimit' in got), (2, False), 'another failure keeps its plain error line')
 

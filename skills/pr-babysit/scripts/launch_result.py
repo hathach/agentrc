@@ -286,8 +286,8 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         obs = result.get('observation') or {}
         reviews, ci, actions = obs.get('reviews') or {}, obs.get('ci'), obs.get('actions') or {}
         summary['observation'] = {
-            'lane': obs.get('lane'), 'reviewedHead': obs.get('reviewedHead'),
-            'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'kind': b.get('kind'), 'sha': (b.get('sha') or '')[:8] or None,
+            'lane': obs.get('lane'), 'reviewedHead': obs.get('reviewedHead'), 'fingerprint': reviews.get('fingerprint'),
+            'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'kind': b.get('kind'), 'sha': b.get('sha'),
                       'reason': cut(b.get('reason') or ''), 'evidence': [cut(e) for e in b.get('evidence') or []], 'retryAt': b.get('retryAt')}
                      for b in reviews.get('bots') or []],
             'findings': [{'id': f.get('findingId'), 'digest': f.get('commentDigest'), 'source': f.get('source'), 'verdict': f.get('verdict'),

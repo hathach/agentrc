@@ -354,7 +354,7 @@ async function run(opts = {}) {
       const observedAt = at((opts.clockOffset ?? 0) + (validatorCalls++) * (opts.minutesPerCycle ?? 1))
       observed = observedAt
       return {
-        headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', ...r,
+        headSha: head, observedAt, headEventAt: null, headEventEvidence: 'stub', fingerprint: 'stub', ...r,
         bots: bots.map(b => ({ ...b, sha: b.sha === 'head' ? head : b.sha })),
       }
     }
@@ -928,6 +928,13 @@ test('a clean green PR passes and still logs a summary', async () => {
   assert.deepEqual(summaries(logs).length, 1)
   assert.match(summaries(logs)[0], /^cycle 1 summary — CI green, reviews: coderabbit reviewed 0f1e2d3\n\(no bot findings/)
   assert.equal(result.history[0].summary, summaries(logs)[0])
+})
+
+test("harvest.py's fingerprint reaches the final observation unchanged, for a merge to compare", async () => {
+  const fingerprint = `coderabbit,greptile|coderabbit,greptile|${'0123456789abcdef'.repeat(2)}`
+  const { result } = await run({ reviews: { findings: [], replies: [], bots: 'reviewed', fingerprint } })
+  assert.equal(result.pass, true)
+  assert.equal(result.observation.reviews.fingerprint, fingerprint)
 })
 
 test('the summary tables every verdict, fix and pushed SHA', async () => {
@@ -2119,7 +2126,7 @@ test('a re-run\'s deadline carries across launches; one from a state without its
 
 // #90: every harvest of a launch hit a secondary limit, and each failed cycle was charged.
 const LIMIT = { observedAt: at(5), resetAt: null, secondary: true }
-const LIMITED_REVIEWS = { headSha: '', headEventEvidence: 'rate limited', bots: [], botsWhole: true, findings: [], replies: [],
+const LIMITED_REVIEWS = { headSha: '', headEventEvidence: 'rate limited', fingerprint: '', bots: [], botsWhole: true, findings: [], replies: [],
   rateLimit: { error: 'gh api: HTTP 403: You have exceeded a secondary rate limit.', ...LIMIT } }
 const limitedInventory = (label, line) => label.startsWith('ci:collect#') && line && 'status' in line
   ? { ...line, error: 'gh pr checks: GraphQL: API rate limit exceeded', rateLimit: { ...LIMIT, resetAt: at(60), secondary: false }, seal: '' } : line
@@ -2806,7 +2813,7 @@ test('a mislabeled commit SHA is not shown as a commit', async () => {
 })
 
 test('a harvest that failed twice stops the launch at once, whatever the validator calls it (#205)', async () => {
-  const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', bots: [], botsWhole: true,
+  const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', fingerprint: '', bots: [], botsWhole: true,
     findings: [], replies: [], harvestError: 'PyYAML is not installed' }
   const { result, labels, logs } = await run({ reviews: failed, args: { autoPush: true, maxCycles: 4 } })
   assert.equal(result.reason, 'harvest-failed')
@@ -6587,7 +6594,7 @@ const headLine = (logs) => summaries(logs).map(s => s.split('\n')[0])
 test('the validator contract is per-bot records, not a done flag', async () => {
   const { calls } = await run({})
   const schema = calls.find(c => c.label === 'reviews#1').schema
-  assert.deepEqual(schema.required, ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'findings', 'replies'])
+  assert.deepEqual(schema.required, ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'findings', 'replies'])
   assert.deepEqual(schema.properties.bots.items.required, ['bot', 'state', 'kind', 'sha', 'evidence', 'reason', 'retryAt'])
   assert.deepEqual(schema.properties.bots.items.properties.state.enum, ['reviewed', 'working', 'queued', 'settled', 'absent', 'unknown', 'harvested'])
 })

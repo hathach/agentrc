@@ -448,10 +448,12 @@ const BOT_STATES = ['reviewed', 'working', 'queued', 'settled', 'absent', 'unkno
 const SETTLED_KINDS = ['skipped', 'limited', 'paused', 'failed']
 const REVIEWS = {
   type: 'object', additionalProperties: false,
-  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'bots', 'findings', 'replies'],
+  required: ['headSha', 'observedAt', 'headEventAt', 'headEventEvidence', 'fingerprint', 'bots', 'findings', 'replies'],
   properties: {
     headSha: { type: 'string' }, observedAt: { type: 'string' },
     headEventAt: { type: ['string', 'null'] }, headEventEvidence: { type: 'string' },
+    // harvest.py's, unchanged: the review evidence a merge checks again (merge.py).
+    fingerprint: { type: 'string' },
     bots: {
       type: 'array',
       items: {
