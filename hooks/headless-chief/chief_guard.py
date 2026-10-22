@@ -187,13 +187,16 @@ QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
 UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
 SEPARATORS_BACK = str.maketrans({QUOTED[c]: c for c in ',.'})
 BRACES_QUOTED = str.maketrans({c: QUOTED[c] for c in '{}'})
+# marks where a quote or escape starts in a word, until segment() reads whether bash takes it as an assignment
+QUOTING = chr(0xE000 + len(SPECIAL))
 
 
 def literal(word):
     """The word with its brace separators back; bash expands no brace whose separators are all quoted, so its braces
     then take their stand-ins."""
     plain = word.translate(SEPARATORS_BACK)
-    return plain.translate(BRACES_QUOTED) if braces(plain) and not braces(word) else plain
+    separators_quoted = braces(plain.replace(QUOTING, '')) and not braces(word.replace(QUOTING, ''))
+    return plain.translate(BRACES_QUOTED) if separators_quoted else plain
 
 
 # the operators bash reads across a line continuation, longest first; `<(` and `>(` are process substitutions
@@ -285,7 +288,7 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             continue
         if c == '\\':
             if text[i + 1:i + 2] != '\n':  # a line continuation: bash removes it before it reads words or operators
-                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
+                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]) + (QUOTING if mode == 'shell' else ''))
             i += 2
             continue
         token, j = ahead(text, i) if c in '$<>(' else ('', i)
@@ -372,7 +375,7 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
                 single = True
             elif double and c in QUOTED:
                 c = QUOTED[c]
-            out.append(c)
+            out.append(QUOTING + c if mode == 'shell' and c in '"\'' else c)
             i += 1
     if close:
         raise Denied(f'this command leaves a substitution open (no `{close}`), which bash does not read as this guard '
@@ -430,7 +433,7 @@ def operators(token):
 
 class Guard:
     def __init__(self, payload):
-        self.payload, self.root = payload, None
+        self.payload, self.root, self.evaluated = payload, None, False
 
     def inside(self, path, ancestors=False):
         """Is this absolute path in the worktree, chief's own directory apart, or with ancestors one holding it; the
@@ -488,13 +491,14 @@ class Guard:
 
     def segment(self, words, depth, indirect=False):
         remaining()
+        marked = [w for k, w in enumerate(words) if w not in STREAMS and not (k and words[k - 1] in STREAMS)]
+        words = [w.replace(QUOTING, '') for w in words]
         for k, w in enumerate(words[:-1]):
             if w in REDIRECTS and not (w == '>&' and words[k + 1].isdigit()):
                 self.writes(words[k + 1], 'the redirect')
         if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)\+?=.*winsymlinks', w) for w in words):
             raise Denied('winsymlinks makes links this guard cannot follow on Windows; dispatch the step to a unit')
-        words, xargs, replace, bare = unwrap([w for k, w in enumerate(words)
-                                              if w not in STREAMS and not (k and words[k - 1] in STREAMS)])
+        words, xargs, replace, bare = unwrap([w.replace(QUOTING, '') for w in marked])
         if not words:
             if (indirect or xargs) and not bare:
                 raise Denied('a wrapper under xargs or find -exec with no program runs one known only at run time; name the '
@@ -532,9 +536,13 @@ class Guard:
             for a in args:
                 if ASSIGNMENT.match(a):
                     forbidden_env(a)
+        # bash reads an operand as declare's assignment only past an unquoted command word that keywords and assignments
+        # alone precede, and with its name unquoted; eval's operands it splits and globs first
+        assigns = not self.evaluated and QUOTING not in marked[-len(words)] and all(
+            w in KEYWORDS or ASSIGNMENT.match(w) for w in marked[:len(marked) - len(words)])
         if cmd in ('declare', 'typeset', 'local') and any(
-                not DECLARED.match(a) and (UNKNOWN in a or '$' in a or (GLOBSET - set('{}')) & set(a))
-                for a in (args[:args.index('--')] if '--' in args else args)):
+                not (assigns and DECLARED.match(m)) and (UNKNOWN in a or '$' in a or (GLOBSET - set('{}')) & set(a))
+                for a, m in zip(args[:args.index('--')] if '--' in args else args, marked[len(marked) - len(args):])):
             raise Denied(f'`{cmd}` takes a word expanded at run time, which may supply `-i` where this guard cannot see '
                          'it; give its options literally, a glob quoted')
         if cmd == 'let' or (cmd in DECLARES and spelled(args, {}, 'i')):
@@ -545,6 +553,7 @@ class Guard:
         if cmd in SHELLS:
             return self.shell(args, depth)
         if cmd == 'eval':
+            self.evaluated = True
             return self.command(' '.join(args).translate(UNQUOTED), depth + 1)
         if cmd == 'find':
             self.find_exec(args, depth)

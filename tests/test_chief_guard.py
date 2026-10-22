@@ -283,12 +283,17 @@ class ChiefGuard(unittest.TestCase):
                   'echo "${x@\\\nP}"', "eval 'echo ${!x}'",
                   # an option expanded at run time, a glob matching a file `-i` included
                   'flags=-i; declare $flags y', 'declare -$f y', 'local ${f:--i} y', 'declare "$f" y',
-                  'typeset `echo -i` y', 'declare -? y', 'declare $n=1'):
+                  'typeset `echo -i` y', 'declare -? y', 'declare $n=1',
+                  # an assignment-shaped operand bash splits and globs as any word: nullglob drops `z=*` from '* -i y=x'
+                  'builtin declare z=$flags', 'command declare z=$flags', 'builtin typeset z=$flags',
+                  "declare 'z='$flags", 'declare z"="$flags', 'declare \\z=$flags', 'eval declare z=$flags',
+                  'f(){ builtin local z=$flags; }; f', '\\declare z=$flags', "'declare' z=$flags"):
             with self.subTest(c=c):
                 self.assert_denied(c, 'this guard cannot see')
         for c in ('echo ${!prefix*} ${!prefix@} ${!arr[@]} ${!arr[*]}', 'echo ${x@Q}', 'declare -a a', 'declare +i x',
                   'declare x=1', 'local -r y=1', 'echo $((i+1))', '((n++))', 'echo ${a[1]}', 'declare x=$v',
-                  'local a[$i]=$v', 'declare -- $x', "declare '-?' y", 'export $n'):
+                  'local a[$i]=$v', 'declare -- $x', "declare '-?' y", 'export $n', 'local z=$v', 'a=1 declare z=$v',
+                  'if declare z=$v; then :; fi'):
             with self.subTest(c=c):
                 self.assert_allowed(c)
         self.assert_denied('echo ${x:-@P}', 'this guard cannot see')  # a trailing @P is read as the operator
