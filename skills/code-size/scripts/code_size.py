@@ -1572,7 +1572,8 @@ def run_diff(args, requested_sha, unsupported, baseline_repo):
                 combined_failures += failures
 
                 if args.bloaty:
-                    elfs = [{os.path.relpath(e, build_dirs[side]): e for e in profile.elfs(build_dirs[side], example)}
+                    elfs = [{os.path.relpath(e, build_dirs[side]).replace(os.sep, '/'): e
+                             for e in profile.elfs(build_dirs[side], example)}
                             for side in ('base', 'current')]
                     paired = sorted(elfs[0].keys() & elfs[1].keys())
                     # Bloaty expects one regex; OR-join all filters (current side

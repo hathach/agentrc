@@ -1862,8 +1862,8 @@ class MainFailure(ProfileCase):
             code, out = self._run_main(tmp, ['-b', 'b', '--bloaty'], build, lambda *_a, **_k: sizes, run)
         self.assertEqual(code, 0)
         self.assertEqual([c[-3:] for c in bloaty_cmds[::2]],
-                         [[os.path.join(tmp, 'b', 'build', e), '--', os.path.join(tmp, 'b', 'base', e)]
-                          for e in ('a/a.elf', 'b/b.elf')])
+                         [[os.path.join(tmp, 'b', 'build', d, e), '--', os.path.join(tmp, 'b', 'base', d, e)]
+                          for d, e in (('a', 'a.elf'), ('b', 'b.elf'))])
         self.assertIn('--- bloaty sections a/a.elf ---', out)
 
     def test_a_failed_base_setup_still_removes_the_worktree(self):
