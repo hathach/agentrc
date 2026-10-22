@@ -211,6 +211,7 @@ CONTINUED = re.compile(r'(?<!\\)(?:\\\\)*\\\n')  # an odd run of backslashes bef
 WORD_START = ' \t\n;&|()'
 CLOSERS = {')': '(', '}': '{'}
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
+DECLARED = re.compile(r'[A-Za-z_]\w*(\[[^]]*\])?\+?=')  # declare's assignment, which bash neither splits nor globs
 UNKNOWN = '\0'
 STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
               'plain words, or dispatch to a unit')
@@ -531,7 +532,12 @@ class Guard:
             for a in args:
                 if ASSIGNMENT.match(a):
                     forbidden_env(a)
-        if cmd == 'let' or cmd in DECLARES and spelled(args, {}, 'i'):
+        if cmd in ('declare', 'typeset', 'local') and any(
+                not DECLARED.match(a) and (UNKNOWN in a or '$' in a or (GLOBSET - set('{}')) & set(a))
+                for a in (args[:args.index('--')] if '--' in args else args)):
+            raise Denied(f'`{cmd}` takes a word expanded at run time, which may supply `-i` where this guard cannot see '
+                         'it; give its options literally, a glob quoted')
+        if cmd == 'let' or (cmd in DECLARES and spelled(args, {}, 'i')):
             raise Denied(f'`{cmd}` evaluates values as arithmetic, where a name runs any substitution its value holds, '
                          'which this guard cannot see; compute with `$((...))`')
         if cmd == 'alias' and any('=' in a for a in args):

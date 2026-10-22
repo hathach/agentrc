@@ -280,11 +280,15 @@ class ChiefGuard(unittest.TestCase):
         for c in ("x='b[$(git push)]'; let x", "x='b[$(git push)]'; declare -i y; y=x", 'typeset -i y', 'local -ir y',
                   'declare -gi y', 'builtin let x', 'command declare -i y', "bash -c 'let x'",
                   "x='a[$(git push)]'; echo ${!x}", "x='$(git push)'; echo ${x@P}", "x='`git push`'; echo ${x@P}",
-                  'echo "${x@\\\nP}"', "eval 'echo ${!x}'"):
+                  'echo "${x@\\\nP}"', "eval 'echo ${!x}'",
+                  # an option expanded at run time, a glob matching a file `-i` included
+                  'flags=-i; declare $flags y', 'declare -$f y', 'local ${f:--i} y', 'declare "$f" y',
+                  'typeset `echo -i` y', 'declare -? y', 'declare $n=1'):
             with self.subTest(c=c):
                 self.assert_denied(c, 'this guard cannot see')
         for c in ('echo ${!prefix*} ${!prefix@} ${!arr[@]} ${!arr[*]}', 'echo ${x@Q}', 'declare -a a', 'declare +i x',
-                  'declare x=1', 'local -r y=1', 'echo $((i+1))', '((n++))', 'echo ${a[1]}'):
+                  'declare x=1', 'local -r y=1', 'echo $((i+1))', '((n++))', 'echo ${a[1]}', 'declare x=$v',
+                  'local a[$i]=$v', 'declare -- $x', "declare '-?' y", 'export $n'):
             with self.subTest(c=c):
                 self.assert_allowed(c)
         self.assert_denied('echo ${x:-@P}', 'this guard cannot see')  # a trailing @P is read as the operator
