@@ -262,6 +262,89 @@ def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, 
     return Operation(attempts, retry_refused=refused)
 
 
+# Each JLinkExe -CommandFile command's completion line in its own output chunk, by its first
+# word, formatted with its arguments, from recorded transcripts (V9.78 and V9.84; SEGGER
+# documents the commands, not their output): `g`/`go` print none, and any line after `r`'s
+# fails. A device script's AfterResetTarget() may close either form of `r` (the MK64 and
+# LPC4088 reset via SYSRESETREQ, V9.78).
+_AFTER_RESET = r'(?:AfterResetTarget\(\) start\n(?:AfterResetTarget\(\)\n)?AfterResetTarget\(\) end - Took .*\n)?'
+JLINK_DONE = {'h': r'^PC = [0-9A-F]{{8}}, ', 'halt': r'^PC = [0-9A-F]{{8}}, ', 'regs': r'^PC = [0-9A-F]{{8}}, ',
+              'r': r'^Reset delay: \d+ ms\n(?:(?:.*\n)*?ResetTarget\(\) end - Took .*\nDevice specific reset executed\.\n'
+                   + _AFTER_RESET.replace('{', '{{').replace('}', '}}') +
+                   r'|(?![\s\S]*^ResetTarget\(\) start$)(?:.*\n)*?Reset: Reset device via AIRCR\.SYSRESETREQ\.\n'
+                   + _AFTER_RESET.replace('{', '{{').replace('}', '}}') + r')\s*\Z',
+              'g': '', 'go': '', 'sleep': r'^Sleep\({0}\)$',
+              'mem32': r'^{0} = [0-9A-F]{{8}}', 'w4': r'^Writing {1} -> {0}$', 'verifybin': r'^Verify successful\.$',
+              'loadfile': r'^O\.K\.$', 'exit': r'^Script processing completed\.$'}
+# A failure line in any command's chunk, from JLinkExe V9.84's own diagnostics (its strings:
+# "****** Error: %s" for the DLL's errors, "Error occurred: ...", "Error while ...", "Could not
+# read memory." and the like); a connect's own notes, such as "Could not find valid reset
+# vector.", are judged by its commands completing.
+JLINK_ERRORS = (r'(?m)^\*+ Error|^Error (occurred|while)|ERROR|Verify failed|Cannot connect|ResetTarget failed|'
+                r'Failed to (halt|reconnect|write memory)|CPU (is )?not halted|Could not (read|write) memory|'
+                r'Could not read current PC')
+
+
+def jlink_echoed(out: str) -> list:
+    """(command, output chunk) for each command a JLinkExe -CommandFile transcript echoes, in
+    order, each chunk ending at the next echo."""
+    parts = re.split(r'(?m)^J-Link>(.*)$', out)
+    return [(c.strip(), chunk) for c, chunk in zip(parts[1::2], parts[2::2])]
+
+
+def jlink_after(out: str, command: str) -> list:
+    """The output chunk of each echo of `command`."""
+    return [chunk for c, chunk in jlink_echoed(out) if c == command]
+
+
+def jlink_judgment(out: str, commands: list) -> dict:
+    """Whether a JLinkExe -CommandFile transcript shows `commands` (without the closing `exit`),
+    then `exit`, each echoed once per occurrence and in order with its completion line
+    (JLINK_DONE) and no failure line (JLINK_ERRORS) in its own chunk. JLinkExe can exit 0 with
+    every command failed (no probe with the serial), and -ExitOnError ends a script at a failed
+    verifybin but not at a failed reset, which the next commands outlive, so no exit code or
+    transcript-wide match stands in for a command's own output. A command with no completion
+    rule fails. Returns {'ok', 'problem' ('' when ok), 'commands': [{'command', 'done', 'error'}]}."""
+    want, got = [*commands, 'exit'], jlink_echoed(out)
+    judged = []
+    for c, chunk in got:
+        rule = JLINK_DONE.get(c.split()[0] if c else '')
+        error = re.search(JLINK_ERRORS, chunk)
+        judged.append({'command': c, 'done': bool(rule is not None and re.search(rule.format(*c.split()[1:]), chunk,
+                                                                                re.M)),
+                       'error': error[0] if error else None})
+    if [c for c, _ in got] != want:
+        problem = f'echoed {[c for c, _ in got]!r:.300}, not the script {want!r:.300}'
+    elif bad := next((j for j in judged if j['error'] or not j['done']), None):
+        what = f'failed ({bad["error"]!r})' if bad['error'] else (
+            'has no completion rule' if bad['command'].split()[0] not in JLINK_DONE else 'did not complete')
+        problem = f'{bad["command"]!r} {what}'
+    else:
+        problem = ''
+    return {'ok': not problem, 'problem': problem, 'commands': judged}
+
+
+def jlink_completed(out: str, commands: list) -> bool:
+    return jlink_judgment(out, commands)['ok']
+
+
+def jlink_problem(op) -> str:
+    """Why a J-Link session Operation (flash_jlink, reset_jlink, run_jlink_commands,
+    sysresetreq_jlink) did not complete its command file, '' when it did: its last attempt,
+    which must have exited 0, judged by jlink_judgment against the command file it ran. An
+    earlier attempt's output never counts."""
+    last = op.attempts[-1]
+    if last.kind != 'exited':
+        return f'JLinkExe {last.kind.replace("_", " ")}'
+    if last.result.returncode != 0:
+        return f'JLinkExe exit {last.result.returncode}'
+    lines = (last.script or '').splitlines()
+    if not lines or lines[-1] != 'exit':
+        return 'no command file ending in exit to judge against'
+    out = hil_process.cmd_stdout_text(last.result.stdout)
+    return jlink_judgment(out, lines[:-1])['problem']
+
+
 # Cortex-M SCB AIRCR and the SYSRESETREQ write tinyuf2's runner issues to it
 SCB_AIRCR, AIRCR_SYSRESETREQ = 0xE000ED0C, 0x05FA0004
 

@@ -1,0 +1,83 @@
+SEGGER J-Link Commander V9.78 (Compiled Sep 16 2026 16:34:54)
+DLL version V9.78, compiled Sep 16 2026 16:34:09
+
+J-Link Commander will now exit on Error
+
+J-Link Command File read successfully.
+Processing script file...
+J-Link>halt
+J-Link connection not established yet but required for command.
+Connecting to J-Link ...O.K.
+Firmware: J-Link OpenSDA 2 compiled Jan 31 2023 13:42:38
+Hardware version: V1.00
+J-Link uptime (since boot): 1d 03h 14m 26s
+S/N: 621000000
+VTref=3.300V
+Target connection not established yet but required for command.
+Device "MK64FN1M0XXX12" selected.
+
+
+Connecting to target via SWD
+ConfigTargetSettings() start
+ConfigTargetSettings() end - Took 9us
+InitTarget() start
+InitTarget()
+SWD selected. Executing JTAG -> SWD switching sequence.
+InitTarget() end - Took 64.2ms
+Found SW-DP with ID 0x2BA01477
+DPv0 detected
+CoreSight SoC-400 or earlier
+Scanning AP map to find all available APs
+AP[2]: Stopped AP scan as end of AP map has been reached
+AP[0]: AHB-AP (IDR: 0x24770011, ADDR: 0x00000000)
+AP[1]: JTAG-AP (IDR: 0x001C0000, ADDR: 0x01000000)
+Iterating through AP map to find AHB-AP to use
+AP[0]: Core found
+AP[0]: AHB-AP ROM base: 0xE00FF000
+CPUID register: 0x410FC241. Implementer code: 0x41 (ARM)
+Found Cortex-M4 r0p1, Little endian.
+FPUnit: 6 code (BP) slots and 2 literal slots
+CoreSight components:
+ROMTbl[0] @ E00FF000
+[0][0]: E000E000 CID B105E00D PID 000BB00C SCS-M7
+[0][1]: E0001000 CID B105E00D PID 003BB002 DWT
+[0][2]: E0002000 CID B105E00D PID 002BB003 FPB
+[0][3]: E0000000 CID B105E00D PID 003BB001 ITM
+[0][4]: E0040000 CID B105900D PID 000BB9A1 TPIU
+[0][5]: E0041000 CID B105900D PID 000BB925 ETM
+[0][6]: E0042000 CID B105900D PID 003BB907 ETB
+[0][7]: E0043000 CID B105900D PID 001BB908 CSTF
+Memory zones:
+  Zone: "Default" Description: Default access mode
+Cortex-M4 identified.
+PC = 000008BE, CycleCnt = 00613BD4
+R0 = 00000000, R1 = 00000000, R2 = 00000000, R3 = 00000000
+R4 = 00000000, R5 = 00209F90, R6 = FFFFFFFF, R7 = 000003E8
+R8 = 00000000, R9 = 00000000, R10= 00000000, R11= 00000000
+R12= 00000000
+SP(R13)= 2002FFD0, MSP= 2002FFD0, PSP= 00000000, R14(LR) = 00000731
+XPSR = 81000000: APSR = Nzcvq, EPSR = 01000000, IPSR = 000 (NoException)
+CFBP = 00000000, CONTROL = 00, FAULTMASK = 00, BASEPRI = 00, PRIMASK = 00
+
+FPS0 = 00000000, FPS1 = 00000000, FPS2 = 00000000, FPS3 = 00000000
+FPS4 = 00000000, FPS5 = 00000000, FPS6 = 00000000, FPS7 = 00000000
+FPS8 = 00000000, FPS9 = 00000000, FPS10= 00000000, FPS11= 00000000
+FPS12= 00000000, FPS13= 00000000, FPS14= 00000000, FPS15= 00000000
+FPS16= 00000000, FPS17= 00000000, FPS18= 00000000, FPS19= 00000000
+FPS20= 00000000, FPS21= 00000000, FPS22= 00000000, FPS23= 00000000
+FPS24= 00000000, FPS25= 00000000, FPS26= 00000000, FPS27= 00000000
+FPS28= 00000000, FPS29= 00000000, FPS30= 00000000, FPS31= 00000000
+FPSCR= 00000000
+J-Link>r
+Reset delay: 0 ms
+Reset type: NORMAL (https://kb.segger.com/J-Link_Reset_Strategies)
+Reset: Halt core after reset via DEMCR.VC_CORERESET.
+Reset: Reset device via AIRCR.SYSRESETREQ.
+AfterResetTarget() start
+AfterResetTarget()
+AfterResetTarget() end - Took 54.9ms
+J-Link>go
+Memory map 'after startup completion point' is active
+J-Link>exit
+
+Script processing completed.

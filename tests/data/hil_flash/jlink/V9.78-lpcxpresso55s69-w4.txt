@@ -1,0 +1,69 @@
+SEGGER J-Link Commander V9.78 (Compiled Sep 16 2026 16:34:54)
+DLL version V9.78, compiled Sep 16 2026 16:34:09
+
+J-Link Commander will now exit on Error
+
+J-Link Command File read successfully.
+Processing script file...
+J-Link>w4 E000ED0C 05FA0004
+J-Link connection not established yet but required for command.
+Connecting to J-Link ...O.K.
+Firmware: J-Link LPCXpresso V2 compiled May  2 2023 17:39:56
+Hardware version: V1.00
+J-Link uptime (since boot): 5d 08h 36m 14s
+S/N: 727648789
+VTref=3.300V
+Target connection not established yet but required for command.
+Device "LPC55S69_M33_0" selected.
+
+
+Connecting to target via SWD
+ConfigTargetSettings() start
+Disabling flash programming optimizations: Compare, SkipBlankDataOnProg
+ConfigTargetSettings() end - Took 11us
+InitTarget() start
+InitTarget() end - Took 898us
+Found SW-DP with ID 0x6BA02477
+DPIDR: 0x6BA02477
+CoreSight SoC-400 or earlier
+Scanning AP map to find all available APs
+AP[3]: Stopped AP scan as end of AP map has been reached
+AP[0]: AHB-AP (IDR: 0x84770001, ADDR: 0x00000000)
+AP[1]: AHB-AP (IDR: 0x84770001, ADDR: 0x01000000)
+AP[2]: JTAG-AP (IDR: 0x002A0000, ADDR: 0x02000000)
+Iterating through AP map to find AHB-AP to use
+AP[0]: Core found
+AP[0]: AHB-AP ROM base: 0xE00FE000
+CPUID register: 0x410FD213. Implementer code: 0x41 (ARM)
+Feature set: Mainline
+Cache: No cache
+Found Cortex-M33 r0p3, Little endian.
+Cortex-M: The connected J-Link (S/N 727648789) uses an old firmware module: V1 (current is 3)
+
+**************************
+WARNING: Cortex-M (ARMv8-M and later): The connected J-Link (S/N 727648789) uses an old firmware module that does not handle I/D-cache correctly. Proper debugging functionality cannot be guaranteed if cache is enabled
+**************************
+
+FPUnit: 8 code (BP) slots and 0 literal slots
+Security extension: implemented
+Secure debug: enabled
+CoreSight components:
+ROMTbl[0] @ E00FE000
+[0][0]: E00FF000 CID B105100D PID 000BB4C9 ROM Table
+ROMTbl[1] @ E00FF000
+[1][0]: E000E000 CID B105900D PID 000BBD21 DEVARCH 47702A04 DEVTYPE 00 Cortex-M33
+[1][1]: E0001000 CID B105900D PID 000BBD21 DEVARCH 47701A02 DEVTYPE 00 DWT
+[1][2]: E0002000 CID B105900D PID 000BBD21 DEVARCH 47701A03 DEVTYPE 00 FPB
+[1][3]: E0000000 CID B105900D PID 000BBD21 DEVARCH 47701A01 DEVTYPE 43 ITM
+[0][1]: E0040000 CID B105900D PID 000BBD21 DEVARCH 00000000 DEVTYPE 11 TPIU
+SetupTarget() start
+Disabling flash programming optimizations: Compare, SkipBlankDataOnProg
+SetupTarget() end - Took 256us
+Memory zones:
+  Zone: "Default" Description: Default access mode
+Cortex-M33 identified.
+Writing 05FA0004 -> E000ED0C
+J-Link>exit
+
+Script processing completed.
+

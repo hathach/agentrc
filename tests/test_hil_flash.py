@@ -863,6 +863,109 @@ class StlinkLm4flashEsptool(unittest.TestCase):
 ODD = 'a b;$(touch PWNED)`id`*'   # spaces and shell metacharacters, none of which may act
 
 
+JLINK_CORPUS = DATA / 'jlink'
+
+
+def jlink_fixture(name):
+    return (JLINK_CORPUS / name).read_text()
+
+
+class JLinkJudgment(unittest.TestCase):
+    """Each J-Link command judged from its own chunk of a recorded transcript (MANIFEST.json: host,
+    board, device, JLinkExe version and the command file each was recorded with)."""
+    FLASH = 'V9.78-imxrt1064_evk-halt-loadfile-r-go.txt'
+    RESET = 'V9.78-nrf52840dk-halt-r-go.txt'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = json.loads((JLINK_CORPUS / 'MANIFEST.json').read_text())
+
+    def commands(self, name):
+        return self.manifest[name]['commands']
+
+    def test_every_recorded_session_completes(self):
+        self.assertGreaterEqual({m['version'] for m in self.manifest.values()}, {'V9.78', 'V9.84'})
+        for name, m in self.manifest.items():
+            with self.subTest(name):
+                self.assertEqual(hf.jlink_judgment(jlink_fixture(name), m['commands']),
+                                 {'ok': True, 'problem': '', 'commands': mock.ANY})
+
+    def test_a_failed_chunk_fails_whatever_the_rest_says(self):
+        good = jlink_fixture(self.FLASH)
+        cases = {'no probe, exit 0': ('J-Link>halt\nJ-Link connection not established yet but required for command.\n'
+                                      'Connecting to J-Link ...FAILED: Cannot connect to J-Link.\n', 'echoed'),
+                 'a failed reset outlived': (re.sub(r'(?s)J-Link>r\n.*?J-Link>go', 'J-Link>r\nReset delay: 0 ms\n'
+                                                    'ResetTarget() start\nResetTarget failed (-1).\nJ-Link>go', good),
+                                             "'r' failed"),
+                 'loadfile without O.K.': (good.replace('O.K.\n', ''), 'did not complete'),
+                 'a DLL error in go': (good.replace('J-Link>exit', '****** Error: CPU is not halted\nJ-Link>exit'),
+                                       "'go' failed"),
+                 'no exit': (good.replace('J-Link>exit\n', ''), 'echoed'),
+                 'cut short': (good.replace('Script processing completed.', ''), "'exit' did not complete"),
+                 'an extra echo': (good.replace('J-Link>exit', 'J-Link>go\nJ-Link>exit'), 'echoed'),
+                 'nothing': ('', 'echoed')}
+        for what, (out, why) in cases.items():
+            with self.subTest(what):
+                j = hf.jlink_judgment(out, self.commands(self.FLASH))
+                self.assertFalse(j['ok'])
+                self.assertIn(why, j['problem'])
+
+    def test_a_failed_verify_ends_the_script_and_fails(self):
+        name = 'V9.84-metro_m7_1011-h-verifybin-r-g.txt'
+        out = jlink_fixture(name)
+        cut = out[:out.index('Verify successful.')] + 'Verify failed @ address 0x60000400.\nERROR: Verify failed.\n' \
+            'Script processing completed.\n'
+        self.assertIn('echoed', hf.jlink_judgment(cut, self.commands(name))['problem'])
+
+    def test_repeated_commands_are_judged_per_occurrence(self):
+        name = 'V9.78-lpcxpresso55s69-h-verifybin-verifybin-r-g.txt'
+        cmds = self.commands(name)
+        self.assertEqual(sum(c.startswith('verifybin') for c in cmds), 2)
+        self.assertTrue(hf.jlink_completed(jlink_fixture(name), cmds))
+        once = [c for i, c in enumerate(cmds) if not (c.startswith('verifybin') and i == cmds.index(c))]
+        self.assertFalse(hf.jlink_completed(jlink_fixture(name), once))
+
+    def test_a_command_without_a_completion_rule_never_passes(self):
+        out = 'J-Link>erase\nErasing done.\nJ-Link>exit\nScript processing completed.\n'
+        self.assertEqual(hf.jlink_judgment(out, ['erase'])['problem'], "'erase' has no completion rule")
+
+    def test_reset_after_target_hooks(self):
+        """A device script's AfterResetTarget() closes `r` (MK64, LPC4088); nothing else may."""
+        out = jlink_fixture('V9.78-frdm_k64f-halt-r-go.txt')
+        self.assertTrue(hf.jlink_completed(out, ['halt', 'r', 'go']))
+        self.assertFalse(hf.jlink_completed(out.replace('AfterResetTarget() end', 'Something else\nAfterResetTarget() end'),
+                                            ['halt', 'r', 'go']))
+
+    def test_the_problem_of_an_operation_is_its_last_attempt_judged_against_its_command_file(self):
+        good = jlink_fixture(self.RESET)
+
+        def op(*outs, script='halt\nr\ngo\nexit\n'):
+            attempts = [hf._record(['JLinkExe'], script, subprocess.CompletedProcess([], rc, out, ''), err)
+                        for rc, out, err in outs]
+            return hf.Operation(attempts)
+        self.assertEqual(hf.jlink_problem(op((0, good, None))), '')
+        self.assertEqual(hf.jlink_problem(op((0, good, None), (-11, '', None))), 'JLinkExe exit -11')
+        self.assertIn('echoed', hf.jlink_problem(op((-11, good, None), (0, '', None))), 'an earlier attempt never counts')
+        self.assertEqual(hf.jlink_problem(op((1, good, None))), 'JLinkExe exit 1')
+        self.assertEqual(hf.jlink_problem(op((None, good, subprocess.TimeoutExpired('JLinkExe', 5)))),
+                         'JLinkExe timed out')
+        self.assertIn('echoed', hf.jlink_problem(op((0, good, None), script='halt\nloadfile /x/a.hex\nr\ngo\nexit\n')))
+        self.assertEqual(hf.jlink_problem(op((0, good, None), script=None)),
+                         'no command file ending in exit to judge against')
+
+    def test_the_providers_scripts_are_judged_as_they_run(self):
+        """flash_jlink and reset_jlink's own command files are the recorded ones."""
+        for fn, name, extra in ((hf.flash_jlink, self.FLASH, ('/x/tinyuf2.hex',)), (hf.reset_jlink, self.RESET, ())):
+            with self.subTest(fn.__name__):
+                out = jlink_fixture(name)
+                if extra:
+                    out = re.sub(r'loadfile \S+', f'loadfile {extra[0]}', out)
+                with tempfile.TemporaryDirectory() as d:
+                    op = fn(JLINK, *extra, timeout=5, workdir=d,
+                            run=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ''))
+                self.assertEqual(hf.jlink_problem(op), '')
+
+
 class ResetProblem(unittest.TestCase):
     """A reset that exited 0 counts only with the target's answer in its output."""
 

@@ -1,0 +1,120 @@
+SEGGER J-Link Commander V9.78 (Compiled Sep 16 2026 16:34:54)
+DLL version V9.78, compiled Sep 16 2026 16:34:09
+
+J-Link Commander will now exit on Error
+
+J-Link Command File read successfully.
+Processing script file...
+J-Link>halt
+J-Link connection not established yet but required for command.
+Connecting to J-Link ...O.K.
+Firmware: J-Link LPCXpresso V2 compiled May  2 2023 17:39:56
+Hardware version: V1.00
+J-Link uptime (since boot): 5d 08h 36m 04s
+S/N: 727648789
+VTref=3.300V
+Target connection not established yet but required for command.
+Device "LPC55S69_M33_0" selected.
+
+
+Connecting to target via SWD
+ConfigTargetSettings() start
+Disabling flash programming optimizations: Compare, SkipBlankDataOnProg
+ConfigTargetSettings() end - Took 13us
+InitTarget() start
+InitTarget() end - Took 3.35ms
+Found SW-DP with ID 0x6BA02477
+DPIDR: 0x6BA02477
+CoreSight SoC-400 or earlier
+Scanning AP map to find all available APs
+AP[3]: Stopped AP scan as end of AP map has been reached
+AP[0]: AHB-AP (IDR: 0x84770001, ADDR: 0x00000000)
+AP[1]: AHB-AP (IDR: 0x84770001, ADDR: 0x01000000)
+AP[2]: JTAG-AP (IDR: 0x002A0000, ADDR: 0x02000000)
+Iterating through AP map to find AHB-AP to use
+AP[0]: Core found
+AP[0]: AHB-AP ROM base: 0xE00FE000
+CPUID register: 0x410FD213. Implementer code: 0x41 (ARM)
+Feature set: Mainline
+Cache: No cache
+Found Cortex-M33 r0p3, Little endian.
+Cortex-M: The connected J-Link (S/N 727648789) uses an old firmware module: V1 (current is 3)
+
+**************************
+WARNING: Cortex-M (ARMv8-M and later): The connected J-Link (S/N 727648789) uses an old firmware module that does not handle I/D-cache correctly. Proper debugging functionality cannot be guaranteed if cache is enabled
+**************************
+
+FPUnit: 8 code (BP) slots and 0 literal slots
+Security extension: implemented
+Secure debug: enabled
+CoreSight components:
+ROMTbl[0] @ E00FE000
+[0][0]: E00FF000 CID B105100D PID 000BB4C9 ROM Table
+ROMTbl[1] @ E00FF000
+[1][0]: E000E000 CID B105900D PID 000BBD21 DEVARCH 47702A04 DEVTYPE 00 Cortex-M33
+[1][1]: E0001000 CID B105900D PID 000BBD21 DEVARCH 47701A02 DEVTYPE 00 DWT
+[1][2]: E0002000 CID B105900D PID 000BBD21 DEVARCH 47701A03 DEVTYPE 00 FPB
+[1][3]: E0000000 CID B105900D PID 000BBD21 DEVARCH 47701A01 DEVTYPE 43 ITM
+[0][1]: E0040000 CID B105900D PID 000BBD21 DEVARCH 00000000 DEVTYPE 11 TPIU
+SetupTarget() start
+Disabling flash programming optimizations: Compare, SkipBlankDataOnProg
+SetupTarget() end - Took 1.63ms
+Memory zones:
+  Zone: "Default" Description: Default access mode
+Cortex-M33 identified.
+PC = 000004FE, CycleCnt = 00960EF7
+R0 = FFFFFFFF, R1 = 00000001, R2 = 00000001, R3 = 4008C000
+R4 = 00000001, R5 = 000C38E8, R6 = FFFFFFFF, R7 = 000003E8
+R8 = 5AC3C35A, R9 = 0C00F001, R10= 00000000, R11= 00000000
+R12= 0000000F
+SP(R13)= 20032FF0, MSP= 20032FF0, PSP= 00000000, R14(LR) = 0000061B
+XPSR = A9000000: APSR = NzCvQ, EPSR = 01000000, IPSR = 000 (NoException)
+CFBP = 00000000, CONTROL = 00, FAULTMASK = 00, BASEPRI = 00, PRIMASK = 00
+MSPLIM = 20032800
+PSPLIM = 00000000
+
+Security extension regs:
+MSP_S = 20032FF0, MSP_NS = 00000000
+MSPLIM_S = 20032800, MSPLIM_NS = 00000000
+PSP_S = 00000000, PSP_NS = FFFFFFFC
+PSPLIM_S = 00000000, PSPLIM_NS = 00000000
+CONTROL_S  = 00, FAULTMASK_S  = 00, BASEPRI_S  = 00, PRIMASK_S  = 00
+CONTROL_NS = 00, FAULTMASK_NS = 00, BASEPRI_NS = 00, PRIMASK_NS = 00
+
+FPS0 = 00000000, FPS1 = 00000000, FPS2 = 00000000, FPS3 = 00000000
+FPS4 = 00000000, FPS5 = 00000000, FPS6 = 00000000, FPS7 = 00000000
+FPS8 = 00000000, FPS9 = 00000000, FPS10= 00000000, FPS11= 00000000
+FPS12= 00000000, FPS13= 00000000, FPS14= 00000000, FPS15= 00000000
+FPS16= 00000000, FPS17= 00000000, FPS18= 00000000, FPS19= 00000000
+FPS20= 00000000, FPS21= 00000000, FPS22= 00000000, FPS23= 00000000
+FPS24= 00000000, FPS25= 00000000, FPS26= 00000000, FPS27= 00000000
+FPS28= 00000000, FPS29= 00000000, FPS30= 00000000, FPS31= 00000000
+FPSCR= 00000000
+J-Link>loadfile /x/tinyuf2.hex
+'loadfile': Performing implicit reset & halt of MCU.
+ResetTarget() start
+Reset strategy selected in debugger ignored. Performing device specific reset.
+Reset handler addr: 0x00000200
+ResetTarget() end - Took 208ms
+Device specific reset executed.
+Downloading file [/x/tinyuf2.hex]...
+Comparing flash   [000%]100%] Done.
+Erasing flash     [000%]000%]100%] Done.
+Programming flash [000%]000%]000%]000%]005%]005%]010%]010%]010%]010%]015%]015%]020%]020%]025%]025%]025%]025%]030%]030%]035%]035%]040%]040%]040%]040%]045%]045%]050%]050%]055%]055%]055%]055%]060%]060%]065%]065%]070%]070%]070%]070%]075%]075%]080%]080%]085%]085%]085%]085%]090%]090%]095%]095%]100%] Done.
+J-Link: Flash download: Bank 0 @ 0x00000000: 1 range affected (13824 bytes)
+J-Link: Flash download: Total: 0.233s (Prepare: 0.041s, Erase: 0.052s, Program & Verify: 0.116s, Restore: 0.022s)
+J-Link: Flash download: Program & Verify speed: 116 KB/s
+O.K.
+J-Link>r
+Reset delay: 0 ms
+ResetTarget() start
+Reset strategy selected in debugger ignored. Performing device specific reset.
+Reset handler addr: 0x00000270
+ResetTarget() end - Took 209ms
+Device specific reset executed.
+J-Link>go
+Memory map 'after startup completion point' is active
+J-Link>exit
+
+Script processing completed.
+

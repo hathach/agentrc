@@ -1,0 +1,425 @@
+{
+ "V9.78-ea4088_quickstart-halt-r-go.txt": {
+  "board": "ea4088_quickstart",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "LPC4088",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-frdm_k64f-halt-r-go.txt": {
+  "board": "frdm_k64f",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "MK64FN1M0xxx12",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-imxrt1064_evk-h-g-sleep-h-regs-mem32-g-sleep-h-regs-verifybin-g.txt": {
+  "board": "imxrt1064_evk",
+  "commands": [
+   "h",
+   "g",
+   "sleep 1200",
+   "h",
+   "regs",
+   "mem32 E000ED08 1",
+   "g",
+   "sleep 10",
+   "h",
+   "regs",
+   "verifybin /x/app.bin,0x7000c000",
+   "g"
+  ],
+  "device": "MIMXRT1064xxx6A",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-imxrt1064_evk-h-verifybin-r-g.txt": {
+  "board": "imxrt1064_evk",
+  "commands": [
+   "h",
+   "verifybin /x/hex-70000000.bin,0x70000000",
+   "r",
+   "g"
+  ],
+  "device": "MIMXRT1064xxx6A",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-imxrt1064_evk-h-w4-mem32-g.txt": {
+  "board": "imxrt1064_evk",
+  "commands": [
+   "h",
+   "w4 400D410C 00000000",
+   "mem32 400D410C 1",
+   "g"
+  ],
+  "device": "MIMXRT1064xxx6A",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-imxrt1064_evk-halt-loadfile-r-go.txt": {
+  "board": "imxrt1064_evk",
+  "commands": [
+   "halt",
+   "loadfile /x/tinyuf2.hex",
+   "r",
+   "go"
+  ],
+  "device": "MIMXRT1064xxx6A",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-imxrt1064_evk-mem32.txt": {
+  "board": "imxrt1064_evk",
+  "commands": [
+   "mem32 400D410C 1"
+  ],
+  "device": "MIMXRT1064xxx6A",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-imxrt1064_evk-w4.txt": {
+  "board": "imxrt1064_evk",
+  "commands": [
+   "w4 E000ED0C 05FA0004"
+  ],
+  "device": "MIMXRT1064xxx6A",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso11u37-halt-r-go.txt": {
+  "board": "lpcxpresso11u37",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "LPC11U37/401",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso55s69-h-g-sleep-h-regs-mem32-g-sleep-h-regs-verifybin-g.txt": {
+  "board": "lpcxpresso55s69",
+  "commands": [
+   "h",
+   "g",
+   "sleep 1200",
+   "h",
+   "regs",
+   "mem32 E000ED08 1",
+   "g",
+   "sleep 10",
+   "h",
+   "regs",
+   "verifybin /x/app.bin,0x10000",
+   "g"
+  ],
+  "device": "LPC55S69_M33_0",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso55s69-h-verifybin-verifybin-r-g.txt": {
+  "board": "lpcxpresso55s69",
+  "commands": [
+   "h",
+   "verifybin /x/hex-0.bin,0x0",
+   "verifybin /x/hex-200.bin,0x200",
+   "r",
+   "g"
+  ],
+  "device": "LPC55S69_M33_0",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso55s69-h-w4-mem32-g.txt": {
+  "board": "lpcxpresso55s69",
+  "commands": [
+   "h",
+   "w4 4002C05C 00000000",
+   "mem32 4002C05C 1",
+   "g"
+  ],
+  "device": "LPC55S69_M33_0",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso55s69-halt-loadfile-r-go.txt": {
+  "board": "lpcxpresso55s69",
+  "commands": [
+   "halt",
+   "loadfile /x/tinyuf2.hex",
+   "r",
+   "go"
+  ],
+  "device": "LPC55S69_M33_0",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso55s69-halt-r-go.txt": {
+  "board": "lpcxpresso55s69",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "LPC55S69_M33_0",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso55s69-mem32.txt": {
+  "board": "lpcxpresso55s69",
+  "commands": [
+   "mem32 4002C05C 1"
+  ],
+  "device": "LPC55S69_M33_0",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-lpcxpresso55s69-w4.txt": {
+  "board": "lpcxpresso55s69",
+  "commands": [
+   "w4 E000ED0C 05FA0004"
+  ],
+  "device": "LPC55S69_M33_0",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-metro_m4_express-halt-r-go.txt": {
+  "board": "metro_m4_express",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "ATSAMD51J19",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-mimxrt1064_evk-halt-r-go.txt": {
+  "board": "mimxrt1064_evk",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "MIMXRT1064xxx6A",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-nrf52840dk-halt-r-go.txt": {
+  "board": "nrf52840dk",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "nrf52840_xxaa",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-nrf5340dk-halt-r-go.txt": {
+  "board": "nrf5340dk",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "nrf5340_xxaa_app",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-nrf54lm20dk-halt-r-go.txt": {
+  "board": "nrf54lm20dk",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "NRF54LM20A_M33",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-ra4m1_ek-halt-r-go.txt": {
+  "board": "ra4m1_ek",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "R7FA4M1AB",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f072disco-halt-r-go.txt": {
+  "board": "stm32f072disco",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "stm32f072rb",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f407disco-h-g-sleep-h-regs-mem32-g-sleep-h-regs-verifybin-g.txt": {
+  "board": "stm32f407disco",
+  "commands": [
+   "h",
+   "g",
+   "sleep 1200",
+   "h",
+   "regs",
+   "mem32 E000ED08 1",
+   "g",
+   "sleep 10",
+   "h",
+   "regs",
+   "verifybin /x/app.bin,0x8010000",
+   "g"
+  ],
+  "device": "Cortex-M4",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f407disco-h-w4-mem32-g.txt": {
+  "board": "stm32f407disco",
+  "commands": [
+   "h",
+   "w4 2000FFFC F01669EF",
+   "mem32 2000FFFC 1",
+   "g"
+  ],
+  "device": "Cortex-M4",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f407disco-halt-loadfile-r-go.txt": {
+  "board": "stm32f407disco",
+  "commands": [
+   "halt",
+   "loadfile /x/tinyuf2.hex",
+   "r",
+   "go"
+  ],
+  "device": "stm32f407vg",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f407disco-halt-r-go.txt": {
+  "board": "stm32f407disco",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "stm32f407vg",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f407disco-mem32.txt": {
+  "board": "stm32f407disco",
+  "commands": [
+   "mem32 2000FFFC 1"
+  ],
+  "device": "Cortex-M4",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f407disco-sleep-h-verifybin-r-g.txt": {
+  "board": "stm32f407disco",
+  "commands": [
+   "sleep 1000",
+   "h",
+   "verifybin /x/hex-8000000.bin,0x8000000",
+   "r",
+   "g"
+  ],
+  "device": "Cortex-M4",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f407disco-w4.txt": {
+  "board": "stm32f407disco",
+  "commands": [
+   "w4 E000ED0C 05FA0004"
+  ],
+  "device": "Cortex-M4",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32f723disco-halt-r-go.txt": {
+  "board": "stm32f723disco",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "stm32f723ie",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.78-stm32l476disco-halt-r-go.txt": {
+  "board": "stm32l476disco",
+  "commands": [
+   "halt",
+   "r",
+   "go"
+  ],
+  "device": "STM32L476VG",
+  "host": "ci.lan",
+  "version": "V9.78"
+ },
+ "V9.84-metro_m7_1011-h-verifybin-r-g.txt": {
+  "board": "metro_m7_1011",
+  "commands": [
+   "h",
+   "verifybin /x/hex-60000400.bin,0x60000400",
+   "r",
+   "g"
+  ],
+  "device": "MIMXRT1011DAE5A",
+  "host": "htpc",
+  "version": "V9.84"
+ },
+ "V9.84-metro_m7_1011-h-w4-mem32-g.txt": {
+  "board": "metro_m7_1011",
+  "commands": [
+   "h",
+   "w4 400D410C 00000000",
+   "mem32 400D410C 1",
+   "g"
+  ],
+  "device": "MIMXRT1011DAE5A",
+  "host": "htpc",
+  "version": "V9.84"
+ },
+ "V9.84-metro_m7_1011-halt-loadfile-r-go.txt": {
+  "board": "metro_m7_1011",
+  "commands": [
+   "halt",
+   "loadfile /x/tinyuf2.hex",
+   "r",
+   "go"
+  ],
+  "device": "MIMXRT1011DAE5A",
+  "host": "htpc",
+  "version": "V9.84"
+ },
+ "V9.84-metro_m7_1011-w4.txt": {
+  "board": "metro_m7_1011",
+  "commands": [
+   "w4 E000ED0C 05FA0004"
+  ],
+  "device": "MIMXRT1011DAE5A",
+  "host": "htpc",
+  "version": "V9.84"
+ }
+}

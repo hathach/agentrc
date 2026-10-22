@@ -199,6 +199,10 @@ recovery stay the contract's. Linux only.
   the ROM loader (`chip_id` without the stub, then a hard reset); lm4flash has
   no reset-only mode. A reset that exits 0 has not necessarily reached the
   target: `reset_problem(name, op)` reads its output for the target's answer.
+  A J-Link session can exit 0 with every command failed: `jlink_problem(op)`
+  judges its last attempt, each command from its own output chunk against the
+  command file it ran (`jlink_judgment`, from recorded transcripts; an
+  unknown command or output shape fails).
 - A flash or reset returns an `Operation`: the last run's `CompletedProcess`
   fields plus `attempts`, each run's command, command file, output and rc on
   its own, never concatenated; `retried` is every attempt but the last. An
