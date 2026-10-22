@@ -261,8 +261,7 @@ def check_board(profile, board: dict, args, state_dir) -> dict:
     except hil_lock.RecoveryBlocked as e:
         return _not_taken(row, 'blocked', str(e))
     except hil_lock.BoardLocked as e:
-        live_holder = hil_lock.is_cleanup_holder(hil_lock.read_record(lock))
-        return _not_taken(row, 'blocked' if live_holder else 'locked', str(e))
+        return _not_taken(row, 'locked', str(e))
     except hil_lock.LockUnavailable as e:
         return _not_taken(row, 'failed', str(e))
     ctx = Context(args, state_dir)
@@ -541,8 +540,7 @@ def parser_for(profile) -> argparse.ArgumentParser:
     return p
 
 
-LOCK_FUNCTIONS = ('take_board_lock', 'read_record', 'write_record', 'clear_record', 'is_cleanup_holder',
-                  'hand_to_cleanup_holder')
+LOCK_FUNCTIONS = ('take_board_lock', 'write_record', 'clear_record', 'hand_to_cleanup_holder')
 LOCK_EXCEPTIONS = ('BoardLocked', 'RecoveryBlocked', 'LockUnavailable')
 
 

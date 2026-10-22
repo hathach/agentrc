@@ -68,8 +68,10 @@ class BoardLocked(RuntimeError):
 
 
 class RecoveryBlocked(BoardLocked):
-    """The flock is free but the board carries an unresolved recovery: a cleanup holder or a
-    protected run that died, or a takeover journal. Only a recovery takeover clears it."""
+    """The board carries an unresolved recovery, never waited out: on a free flock, the record
+    of a cleanup holder or a protected run that died, or a takeover journal, which only a
+    recovery takeover clears; on a held flock, a live cleanup holder or a takeover journal,
+    which the project's recovery procedure ends."""
 
 
 class ReleaseRefused(RuntimeError):
@@ -364,6 +366,18 @@ def holder_text(info) -> str:
     return f'{text} ({RECOVERY_BLOCKER})' if info.get('role') == CLEANUP_ROLE else text
 
 
+def _held_refusal(board) -> BoardLocked:
+    """Why a flock another process holds refuses `board`: RecoveryBlocked for a cleanup holder or
+    with a takeover journal, else BoardLocked (contention)."""
+    rec, journal = read_record(board), journal_state(board)
+    why = f'board locked: {holder_text(rec)}'
+    if journal is not None:
+        why += f'; takeover journal {json.dumps(journal)}'
+    if is_cleanup_holder(rec):     # holder_text names it a recovery blocker
+        return RecoveryBlocked(why)
+    return BoardLocked(why) if journal is None else RecoveryBlocked(f'{why} ({RECOVERY_BLOCKER})')
+
+
 def _handle_record(fh) -> bytes:
     fd = fh.fileno()
     return os.pread(fd, os.fstat(fd).st_size, 0)
@@ -399,8 +413,9 @@ def _valid_group(locks, board) -> bool:
 def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     """Take the board's flock and record ourselves as its holder; returns the open handle
     (keep it referenced; release_board_lock ends it). Raises BoardLocked when another session
-    holds the board, RecoveryBlocked when its flock is free but a recovery is unresolved,
-    and LockUnavailable when the lock cannot be taken or recorded (fail-closed).
+    holds the board, RecoveryBlocked when a recovery is unresolved (a free flock with a
+    blocker record or a journal, or one a cleanup holder holds or that has a journal), and
+    LockUnavailable when the lock cannot be taken or recorded (fail-closed).
 
     `protected` marks the record: `release` never signals it, and a record left on a free
     flock is a recovery blocker, so its taker must end with release_board_lock. It also
@@ -423,7 +438,7 @@ def take_board_lock(board: str, reason: str, *, protected=False, **extra):
     try:
         fh = flock_nb(board)
     except BlockingIOError:
-        raise BoardLocked(f'board locked: {holder_text(read_record(board))}') from None
+        raise _held_refusal(board) from None
     except OSError as e:
         raise _unavailable(e) from e
     try:

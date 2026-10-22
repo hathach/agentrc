@@ -14,6 +14,7 @@ import fcntl
 import importlib.util
 import io
 import json
+import re
 import resource
 import shutil
 import signal
@@ -330,6 +331,32 @@ class Contention(LockDir):
         self.holder(b'{"pid": PID, "rea')
         with self.assertRaisesRegex(RuntimeError, '^board locked: unknown holder$'):
             self.acquire()
+
+    def test_a_live_protected_run_is_contention(self):
+        self.holder(self.record(reason='hil_test.py', protected=True))
+        with self.assertRaises(hil_lock.BoardLocked) as cm:
+            self.acquire()
+        self.assertNotIsInstance(cm.exception, hil_lock.RecoveryBlocked)
+
+    def test_a_live_cleanup_holder_or_a_journal_on_a_held_flock_is_a_recovery_blocker(self):
+        """Never waited out (hil Board locks): the refusal says so at acquisition, and touches nothing."""
+        journal = Path(self.dir, BOARD + hil_lock.JOURNAL)
+        cases = (('cleanup holder', self.record(reason='selftest', role='cleanup-holder'), None),
+                 ('journal', self.record(reason='hil_test.py'), json.dumps({'token': 't', 'locks': [BOARD]})),
+                 ('unreadable journal', self.record(reason='hil_test.py'), '{"tok'))
+        for what, record, journal_text in cases:
+            with self.subTest(what):
+                if journal_text is not None:
+                    journal.write_text(journal_text)
+                p = self.holder(record)
+                before = (self.lock_bytes(), journal.read_bytes() if journal.exists() else None)
+                with self.assertRaisesRegex(hil_lock.RecoveryBlocked,
+                                            '^board locked: .*' + re.escape(hil_lock.RECOVERY_BLOCKER)):
+                    self.acquire()
+                self.assertEqual((self.lock_bytes(), journal.read_bytes() if journal.exists() else None), before)
+                p.stdin.close()
+                p.wait()
+                journal.unlink(missing_ok=True)
 
 
 class CleanupHolder(LockDir):

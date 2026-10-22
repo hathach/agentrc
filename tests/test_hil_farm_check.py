@@ -300,6 +300,13 @@ class Engine(unittest.TestCase):
         self.hold('hil_reserve', role=lk.CLEANUP_ROLE)
         self.assertEqual(self.check()['status'], 'blocked')
 
+    def test_a_held_board_with_a_takeover_journal_is_blocked_not_locked(self):
+        self.hold()
+        (self.locks / ('b' + lk.JOURNAL)).write_text(json.dumps({'token': 't', 'locks': ['b']}))
+        row = self.check()
+        self.assertEqual((row['status'], self.ran), ('blocked', []))
+        self.assertIn('takeover journal', row['note'][-1])
+
     def test_an_unusable_lock_is_an_error_not_a_holder(self):
         self.locks.mkdir()
         os.mkdir(self.locks / 'b.lock')
