@@ -8,13 +8,15 @@ import io
 import json
 import os
 import struct
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, pid_alive  # noqa: E402
 from test_target_debug import BSS, OBJ, elf32, fake_tools  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts'
@@ -120,6 +122,10 @@ class JLinkDump(unittest.TestCase):
         self.env = {**env, 'FAKE_MEM': str(self.dir / 'mem.json'), 'FAKE_LOG': str(self.dir / 'log.json')}
         self.out = self.dir / 'out'
 
+    def argv(self, *extra):
+        return ['--out', str(self.out), '--channel', '1', '--addr', hex(CB), '--probe', '123', '--device', 'X',
+                '--interface', 'swd', '--speed', '4000', *extra]
+
     def target(self, ring, wroff, halted=False, cpuid=CPUID_M4, name=b'SysView\0', advance=False):
         mem = {'cpuid': cpuid, 'halted': halted,
                'bytes': {hex(CB): control_block(len(ring), wroff).hex(), hex(RING_AT): ring.hex(),
@@ -128,11 +134,9 @@ class JLinkDump(unittest.TestCase):
         (self.dir / 'mem.json').write_text(json.dumps(mem))
 
     def run_dump(self, *extra, **env):
-        argv = ['--out', str(self.out), '--channel', '1', '--addr', hex(CB), '--probe', '123', '--device', 'X',
-                '--interface', 'swd', '--speed', '4000', *extra]
         out = io.StringIO()
         with unittest.mock.patch.dict(os.environ, {**self.env, **env}, clear=True), contextlib.redirect_stdout(out):
-            rc = dump.main(argv)
+            rc = dump.main(self.argv(*extra))
         return rc, json.loads(out.getvalue())
 
     def sessions(self):
@@ -229,6 +233,37 @@ class JLinkDump(unittest.TestCase):
         rc, r = self.run_dump()
         self.assertEqual(rc, 3)
         self.assertIn('M-profile', r['error'])
+
+    def test_a_missing_tool_is_a_tool_failure(self):
+        rc, r = self.run_dump(PROBE_STATE_JLINK_EXE=str(self.dir / 'missing' / 'JLinkExe'))
+        self.assertEqual(rc, 3)
+        self.assertIn('not found', r['error'])
+        self.assertEqual(json.loads((self.out / 'dump.json').read_text())['error'], r['error'])
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX SIGTERM')
+    def test_sigterm_kills_the_tool_session_and_writes_the_dump_record(self):
+        stub = self.dir / 'stub'
+        stub.mkdir()
+        pid_file = self.dir / 'tool.pid'
+        env = fake_tools(self, stub, (('JLinkExe', '#!\nimport os, sys, time\n'
+                                                   f'open({str(pid_file)!r}, "w").write(str(os.getpid()))\n'
+                                                   'time.sleep(60)\n'),))
+        proc = subprocess.Popen([sys.executable, str(SCRIPTS / 'sysview_dump.py'), *self.argv()], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 30
+            while not (pid_file.exists() and pid_file.read_text()) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            tool = int(pid_file.read_text())
+            proc.terminate()
+            _, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(proc.returncode, 3, err)
+        self.assertFalse(pid_alive(tool))
+        self.assertIn('stopped by signal', json.loads((self.out / 'dump.json').read_text())['error'])
 
     def test_elf_gives_the_control_block(self):
         elf = self.dir / 'fw.elf'

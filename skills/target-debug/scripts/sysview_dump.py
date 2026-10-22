@@ -24,14 +24,16 @@ write leaves a partial newest packet at the front, past which the decoder resync
 
 PROBE_STATE_JLINK_EXE and PROBE_STATE_OPENOCD name the tools when they are not on PATH.
 
-Exit: 0 dumped; 2 bad usage; 3 the probe or tool failed, the read was incomplete or incoherent, the buffer is not
-SystemView's, or a --resume was not seen to take (the dump is written).
+Exit: 0 dumped; 2 bad usage; 3 the probe or tool failed or is missing, the read was incomplete or incoherent, the
+buffer is not SystemView's, a --resume was not seen to take (the dump is written), or SIGTERM or SIGHUP stopped the
+session (the tool is killed, the core's state is unknown).
 """
 import argparse
 import hashlib
 import json
 import os
 import re
+import signal
 import struct
 import sys
 import tempfile
@@ -48,6 +50,7 @@ MAX_RING = 1 << 20
 NAME = b'SysView'   # SEGGER_SYSVIEW_Init_Ex's label for its channel
 S_HALT = 1 << 17
 CPUID = 0xE000ED00
+STOP_SIGNALS = tuple(filter(None, (getattr(signal, n, None) for n in ('SIGTERM', 'SIGHUP'))))
 
 
 def header_len(channel):
@@ -158,6 +161,11 @@ def openocd_dump(backend, cb, channel, resume, tmp, timeout):
     return header, d, again, state.group(1), after.group(1) if after else 'unknown'
 
 
+def on_signal(signum, _frame):
+    # raised inside probe_state.run(), which kills the tool session before passing it on
+    raise ToolError(f'stopped by signal {signum}')
+
+
 def resolve_backend(a, p):
     """(route, identity, backend) from the HIL config or the explicit flags, or p.error()."""
     if a.hil_config or a.board:
@@ -226,11 +234,7 @@ def main(argv=None):
         p.error('--channel must be 0..31')
     cb = control_block(a, p)
     prepare_out(p, a.out)
-    route, ident, backend = resolve_backend(a, p)
-    result = {'backend': route, **ident, 'controlBlock': f'0x{cb:08x}', 'channel': a.channel}
-    clients = ps.other_probe_clients()
-    if clients:
-        result['otherProbeClients'] = clients
+    result = {'controlBlock': f'0x{cb:08x}', 'channel': a.channel}
 
     def finish(rc):
         with open(os.path.join(a.out, 'dump.json'), 'w') as f:
@@ -242,11 +246,21 @@ def main(argv=None):
         result['error'] = msg
         return finish(3)
 
+    try:
+        route, ident, backend = resolve_backend(a, p)
+    except ToolError as e:    # a missing probe tool: exit 3, not bad usage
+        return fail(str(e))
+    result = {'backend': route, **ident, **result}
+    clients = ps.other_probe_clients()
+    if clients:
+        result['otherProbeClients'] = clients
+
     with tempfile.TemporaryDirectory(prefix='sysview_dump.') as tmp:
         tmp = ps.tool_path(tmp)
         if not ps.SAFE_PATH.fullmatch(tmp):
             return fail(f'temporary directory {tmp!r} has unsafe characters: set TMPDIR')
         dump = jlink_dump if route == 'jlink' else openocd_dump
+        previous = {sig: signal.signal(sig, on_signal) for sig in STOP_SIGNALS}
         try:
             t0 = time.monotonic()
             header, d, again, before, after = dump(backend, cb, a.channel, a.resume, tmp, a.timeout)
@@ -254,6 +268,9 @@ def main(argv=None):
             ring = read_file(f'{tmp}/ring.bin', d[2], 'ring')
         except (ToolError, ValueError, OSError) as e:
             return fail(str(e))
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
         result['core'] = {'before': before, 'after': after}
         name, buf, size, wroff, rdoff, flags = d
         result['descriptor'] = {'sName': f'0x{name:08x}', 'pBuffer': f'0x{buf:08x}', 'SizeOfBuffer': size,

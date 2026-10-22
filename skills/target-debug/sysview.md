@@ -254,8 +254,9 @@ sysview_dump.py --out DIR --channel N (--elf FILE | --addr ADDR)
 - 32-bit little-endian RTT layouts only; anything else is refused.
 - `--out` (new or empty) receives `header.bin`, `ring.bin`, `capture.SVDat` (the ring from `WrOff`, oldest byte
   first) and `dump.json` (addresses, offsets, sizes, core state before and after).
-- Exit: 0 dumped; 2 bad usage; 3 the probe or tool failed, the read was incomplete or incoherent, the buffer is not
-  SystemView's, or a resume was not seen to take.
+- Exit: 0 dumped; 2 bad usage; 3 the probe or tool failed or is missing, the read was incomplete or incoherent, the
+  buffer is not SystemView's, a resume was not seen to take, or SIGTERM or SIGHUP stopped the session (the tool is
+  killed, the core's state is unknown). `dump.json` is written on exit 3 too, with the `error`.
 
 ### What a harness replaces
 
