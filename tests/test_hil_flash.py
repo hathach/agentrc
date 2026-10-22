@@ -568,7 +568,7 @@ class Sessions(unittest.TestCase):
         seen = []
 
         def run(argv, **k):
-            path = (shlex.split(argv) if isinstance(argv, str) else argv)[-1]
+            path = argv[-1]
             seen.append((argv, k, path, Path(path).read_text(), sorted(os.listdir(Path(path).parent))))
             return subprocess.CompletedProcess(argv, rc, 'transcript', None)
         op = fn(*args, run=run, workdir=workdir, **kw)

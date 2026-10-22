@@ -188,10 +188,11 @@ recovery stay the contract's. Linux only.
   `retry_delay` s apart, each run its own `timeout`. A rerun is refused after
   an attempt whose cleanup is not an explicit `done` or that names a receipt;
   the operation's `retry_refused` then says why.
-- `run_openocd_commands` and `sysresetreq_openocd` are the same pair for
-  openocd: one `openocd_cmd_base` session running `init`, the caller's Tcl
-  commands and `shutdown` from a unique script in `workdir`. openocd logs to
-  stderr and stops at the first failing command with exit 1.
+- `run_openocd_commands` runs one `openocd_cmd_base` session: `init`, the
+  caller's Tcl commands and `shutdown`, from a unique script in `workdir`;
+  `sysresetreq_openocd` writes AIRCR SYSRESETREQ through it. openocd logs to
+  stderr and stops at the first failing command with exit 1. Neither takes
+  `retry_if`: judging, retrying and recovering stay the caller's.
 - `openocd_esp` is `scripts/hil_openocd_esp.py`'s (`flash_openocd_esp`,
   `reset_openocd_esp`): an Espressif chip's built-in USB-Serial/JTAG through
   openocd-esp32 v0.12.0-esp32-20260703 only, found by `HIL_OPENOCD_ESP`, else

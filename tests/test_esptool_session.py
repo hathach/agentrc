@@ -111,7 +111,7 @@ class EsptoolSession(unittest.TestCase):
         code, out, calls = self.session([{'op': 'md5', 'addr': 0, 'size': 0x1000},
                                          {'op': 'read', 'addr': 0, 'size': 1, 'file': str(self.tmp / 'x')}],
                                         STUB_FAIL_READ='1')
-        self.assertEqual((code, [r['op'] for r in out['results']]), (1, ['md5']))
+        self.assertEqual((code, out['esptool'], [r['op'] for r in out['results']]), (1, '5.3.1', ['md5']))
         self.assertIn('timed out', out['error'])
         self.assertEqual(calls[-1], ['close'])
         self.assertNotIn('reset', [c[0] for c in calls])
