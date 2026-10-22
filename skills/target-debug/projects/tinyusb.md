@@ -108,6 +108,57 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   cache var and is silently ignored; the definitions that take effect are the build contract's. carried over. Its
   reference project: `hw/bsp/rp2040/boards/pico2_etm_trace/ozone/rp2350.jdebug`, checked in fad6bd546.
 
+## SystemView
+
+Except the 2026-10-22 measurements, all of this is carried over from the experimental firmware on the unmerged branch
+`claude/add-systemview-debug` (PR #3880 at 49e49f810). None of it is on master as of 2026-10-22; check that it has
+landed before building on any name below. `sysview.md` has the routes and how to read the numbers. Its
+`sysview_ci.py` imported `sysview_record.rtt_cb_from_elf`; with agentrc's scripts it passes `--elf` instead.
+
+- Build: CMake `-DSYSVIEW=1..4` (1 the USB ISR, 2 adds the `usbd`/`usbh` core, 3 the `dcd`/`hcd` API, 4 the class
+  drivers), `-DSYSVIEW_POST_MORTEM=1` on top for the dump route, and `-DSYSVIEW_BUFFER_SIZE`. `make` refuses it.
+  `SysView` is up-buffer 1. User events use the fixed base `TU_SV_EVENT_BASE` (512), named host-side with
+  `--event-map`.
+- ISR spans come from whichever entry the port uses: the `tud_int_handler`/`tuh_int_handler` macros, or the driver's
+  own handler (rp2040). `ch32v20x`'s FSDEV port 0 and the PIO-USB host driver record none. The ISR depth counter in
+  `src/common/tusb_sysview.c` folds a dual-role BSP's back-to-back device and host handler calls into one span, and
+  folds genuine nesting the same way: a USB IRQ preempting another (ch32v20x's high-priority one) records no span of
+  its own.
+- FreeRTOS task tables need `sysview_freertos_hooks.h` included at the end of the family's `FreeRTOSConfig.h`; wired
+  in `nrf`, `samd5x_e5x`, `stm32f4`, `stm32f7` and `stm32h7`. Other FreeRTOS families build with a CMake warning and
+  empty task tables. `heap` is `null` on every stock example, all of which allocate statically.
+- Buffer: RAM-rich families default `SYSVIEW_BUFFER_SIZE` to 65536, the rest to 4096. At 4096 mimxrt1064_evk lost
+  96.7% of its ISR exits at ~109 Hz; at 65536 stm32h743nucleo and raspberry_pi_pico lost nothing in a 15 s CDC burst
+  over OpenOCD while feather_nrf52840_express, on an OpenOCD-over-J-Link path, lost in 73 bursts.
+- `cdc_msc_freertos`'s 1024-byte task stacks overflowed during enumeration at level 4; the example raises them under
+  `CFG_TUD_SYSVIEW`. `SYSVIEW_RAM_BASE` is `0x10000000` on lpc11/13/17/40/43 and `0x02000000` on lpc15, set in their
+  `family.cmake`.
+- An idle enumerated CDC device emits a USB event about every 2.016 s: a rate check with no traffic reads the median
+  gap as 2× the intended 1.000 s.
+- ch32v307v_r1_1v0 at level 4 dropped off the bus under sustained CDC traffic. The old notes blame the recorder's
+  interrupt masking in one place and, after an A/B, persistent SDI debug access in another; which applies to this
+  drop is unresolved.
+- Measured windows: metro_m4_express's attach-only stream decoded 2.4–5.6 s of a 15 s workload; a post-mortem ring
+  of 16 KB held ~20–25 ms of CDC bulk on same54_xplained, and one of 4096 B decoded to 0.16 s on ch32v307v_r1_1v0.
+- Reference numbers (`cdc_msc_freertos`, level 4): same54_xplained over live J-Link had ISR 96/98/99 p50 27–33 µs,
+  `tud_task` p50 23 µs and overflow 0 at 16 KB. stm32h743nucleo over OpenOCD had ISR 117 (OTG_FS IRQn 101 + 16) at
+  p50 4.3 µs; the old skill also claims a matching J-Link capture, which its board notes contradict (no J-Link
+  wired), so treat that comparison as unestablished.
+- 2026-10-22 on ci.lan with these scripts, firmware from 49e49f810 at level 4, a CDC burst as the workload:
+  - stm32f407disco `cdc_msc_freertos` (its on-board ST-LINK runs J-Link firmware, serial 000773661813), same image
+    over both streaming routes: live J-Link 8.4 s, ISR 83 p50/p99 18.1/21.1 µs, SysTick 8.8/10.1, `tud_task` (#512)
+    23.4/26.2, ready→run 7.2, overflow 131; OpenOCD RTT (`interface/jlink.cfg`) 17.1 s, ISR 83 18.1/22.4, SysTick
+    8.8/10.1, overflow 1136, and SystemView reported errors loading the capture (-161).
+  - Its post-mortem build's 64 KiB ring decoded to 12205 events, only the last 158 (6 ms) timed.
+  - metro_m4_express `cdc_msc_freertos` live J-Link: a 21.7 s window for `--duration-ms 8000` (the trace starts at
+    boot; why is not established), ISR 96/98/99 p50 35.8/37.4/32.6 µs, overflow 10.
+  - raspberry_pi_pico `cdc_msc` OpenOCD RTT: 17.7 s, ISR 21 (n 19829) p50/p99 8/15 µs in whole microseconds,
+    overflow 0.
+  - ch32v307v_r1_1v0 `cdc_msc` post-mortem dump of its 4 KB ring: 0.147 s, the function table populated and no ISR
+    rows.
+- nanoch32v203's tick runs at 838.5 Hz with or without SystemView: `board_millis()` and every timeout derived from it
+  run 16% slow, a board clock bug.
+
 ## Espressif integration
 
 - Resolve the board's family from `hw/bsp/*/boards/<board>` before selecting the debug backend;

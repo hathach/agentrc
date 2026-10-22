@@ -1,6 +1,6 @@
 ---
 name: target-debug
-description: "Use when firmware misbehaves on real hardware and its own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO. Also ETM instruction trace and profiling with a SEGGER J-Trace and Ozone: hot functions, ISR timing, code coverage, what ran before a fault or hang; \"No trace clock present\". Also for Espressif chips over the built-in USB-Serial-JTAG (303a:1001) or pad JTAG with openocd-esp32, when openocd says \"could not find or open device\", or the debug port becomes the firmware's USB device."
+description: "Use when firmware misbehaves on real hardware and its own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO. Also ETM instruction trace and profiling with a SEGGER J-Trace and Ozone: hot functions, ISR timing, code coverage, what ran before a fault or hang; \"No trace clock present\". Also SEGGER SystemView: per-task and per-ISR CPU load, ready→run latency, the scheduling timeline, a post-mortem trace of what ran before a hang. Also for Espressif chips over the built-in USB-Serial-JTAG (303a:1001) or pad JTAG with openocd-esp32, when openocd says \"could not find or open device\", or the debug port becomes the firmware's USB device."
 ---
 
 # target-debug — target-side capture & debugging over a debug probe
@@ -12,13 +12,13 @@ Pi).
 
 ## Which skill answers what
 
-| Skill                 | Answers | Needs |
-| --------------------- | --- | --- |
-| **`target-debug`**    | **what the target did** (driver state, faults, where the core spins, which instructions ran) | a debug probe on the target; a J-Trace for instruction trace |
-| `rtt`                 | the target's log/console stream, and a post-mortem ring dump | a probe, firmware that logs over SEGGER RTT |
-| `usb-sniffer`         | what crossed the wire (PIDs, handshakes, resets) | the hardware tap cabled in; role-agnostic |
-| a project's `sysview` | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | the project ships the skill; a J-Link/J-Trace for live capture, or an OpenOCD probe for raw RTT capture |
-| `usb-kernel-debug`    | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
+| Skill                     | Answers | Needs |
+| ------------------------- | --- | --- |
+| **`target-debug`**        | **what the target did** (driver state, faults, where the core spins, which instructions ran) | a debug probe on the target; a J-Trace for instruction trace |
+| `rtt`                     | the target's log/console stream, and a post-mortem ring dump | a probe, firmware that logs over SEGGER RTT |
+| `usb-sniffer`             | what crossed the wire (PIDs, handshakes, resets) | the hardware tap cabled in; role-agnostic |
+| SystemView (`sysview.md`) | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | firmware built with SystemView's recorder; a J-Link/J-Trace for live recording, an OpenOCD probe for RTT streaming, either for a post-mortem dump |
+| `usb-kernel-debug`        | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
 
 **Espressif targets** (ESP32-S2/S3/P4/S31 and the C series): read `espressif.md` first; it names the tools, the JTAG
 route per chip and the console.
@@ -148,7 +148,7 @@ The Core column says where a technique exists; a row that names a core family do
 | DWT data trace                     | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                               | none                                                    | stream one address's accesses: value + accessor PC                                                             |
 | Vector catch                       | Cortex-M (ARMv6-M: HardFault and reset only)                                                  | none until a fault fires                                | crash-shaped wedges — autopsy AT the faulting pc                                                               |
 | RAM ring-buffer                    | any; one ring per writing core                                                                | ~tens of cycles per event                               | ISR ordering/timing bugs                                                                                       |
-| SystemView (project's `sysview`)   | any the project's `sysview` supports                                                          | recorder in the firmware, per event                     | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
+| SystemView                         | any with an RTT path and a timestamp the firmware supplies (`sysview.md`)                     | recorder in the firmware, per event                     | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
 | Log lines (RTT)                    | any with a probe RTT path (J-Link, OpenOCD); none in the measured TinyUSB Espressif builds    | µs per line                                             | logic bugs that survive logging                                                                                |
 | Log lines (UART)                   | any                                                                                           | up to ms per line when the write path polls a full FIFO | same, when no debug-probe RTT path                                                                             |
 | ETM instruction trace              | Cortex-M with an ETM (optional on ARMv7-M, Armv8-M; none on ARMv6-M), wired to a J-Trace      | trace setup; halts; reflash+reset unless `--attach`     | exact instruction counts, coverage, ISR timing, the history before a fault/hang; confirm J-Trace wiring first  |
@@ -164,7 +164,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - SWO exception trace, hardware PC-sampling, DWT data trace: `swo-dwt.md`.
 - Vector catch and the fault registers: `fault-autopsy.md`.
 - RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code, the `nm` check, the GDB dump.
-- SystemView: the project's `sysview` skill.
+- SystemView: `sysview.md` — `sysview_record.py` (live J-Link recording, decoding a raw capture),
+  `sysview_report.py`, `sysview_dump.py` (post-mortem ring); RTT streaming is `rtt.py --channel`.
 - Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands (`console_capture.py` for a UART), the drain
   model; the channel itself is the `rtt` skill's.
 - ETM instruction trace: `etm-trace.md` — `etm_capture.py`, `etm_profile.py`; per-board notes in `etm-boards.md`.

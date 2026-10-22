@@ -118,6 +118,8 @@ the skipped tests and notes for a port:
 - the capture scripts of `usb-sniffer` (`sniff.py`) and `target-debug`
   (`etm_capture.py`, `dual_capture.py`): usbfs, `/proc` and POSIX process
   control.
+- `target-debug`'s `sysview_record.py`, which refuses there: it drives SystemView
+  under Xvfb and tracks its processes through `/proc` and process groups.
 - `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
   as a POSIX session and identifies it through `/proc` (#130).
 - `install.py --herdr-plugin` refuses on Windows; `worktree-remove` has no
@@ -173,7 +175,7 @@ through its `Build contract:` and `HIL contract:` lines:
 | Skill | Use it to | Start with |
 |---|---|---|
 | [`hil`](skills/hil/SKILL.md) | run a project's HIL tests and judge their results: contract sections, board locks, verdicts, retries; a farm check (each board's probe on the bus and resetting it), never a test verdict | the project's `HIL contract:` page |
-| [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO, ETM instruction trace (J-Trace + Ozone); Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
+| [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO, ETM instruction trace (J-Trace + Ozone), SEGGER SystemView scheduling profiles; Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
 | [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |
 | [`usb-kernel-debug`](skills/usb-kernel-debug/SKILL.md) | capture Linux host URBs (usbmon); kernel dynamic debug on a host or gadget | `usbcap.py <vid:pid> 10`; `sudo usb_dyndbg.sh on\|off usbcore xhci_hcd` |
 | [`usb-sniffer`](skills/usb-sniffer/SKILL.md) | what crossed D+/D- with the ataradov sniffer, where usbmon cannot see | `sniff.py capture raw.pcapng --port <port> --seconds 30` |

@@ -147,9 +147,9 @@ polls — bursty logs can drop lines; prefer J-Link where both exist. The drain-
 
 A wedged RTT build holds a log tail in RAM only if a live drain was running (the default mode drops writes once the ring
 fills): the drain model, the headless-proven server and the manual ring read are the **rtt** skill's post-mortem
-section. Otherwise instrument with the RAM ring above. The exemption is a SystemView post-mortem build (the project's
-`sysview` skill says how): its channel is an overwrite ring that holds the most recent events with no drain, which
-answers "what ran right before this hang".
+section. Otherwise instrument with the RAM ring above. The exemption is a SystemView post-mortem build (`sysview.md`,
+"Post-mortem dump"): its channel is an overwrite ring that holds the most recent events with no drain, which answers
+"what ran right before this hang".
 
 ## USB: dual-side capture — the default for enumeration/transfer bugs
 
