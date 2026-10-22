@@ -1,5 +1,5 @@
-"""Tests for lib/windows.py: the PATH-only program lookup, the bounded tree kill and the retried replace. The
-Windows branches run here with os.name and the system calls stood in for; the real ones run on Windows CI."""
+"""Tests for lib/windows.py: the PATH-only program lookup, Git Bash, the bounded tree kill and the retried replace.
+The Windows branches run here with os.name and the system calls stood in for; the real ones run on Windows CI."""
 import os
 import subprocess
 import sys
@@ -63,6 +63,26 @@ class OnPathTest(unittest.TestCase):
         path = os.pathsep.join(['', '.', 'bin', os.path.splitdrive(base / 'cwd' / 'bin')[1], str(base / 'path')])
         with mock.patch.dict(os.environ, {'PATH': path}):
             self.assertEqual(windows.on_path('tool', ('.exe',)), os.path.join(base / 'path', 'tool.exe'))
+
+
+class BashTest(unittest.TestCase):
+    def found(self, files, *path):
+        with mock.patch.object(windows.os, 'name', 'nt'), mock.patch.object(windows.os, 'pathsep', ';'), \
+                mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows', 'PATH': ';'.join(path)}), \
+                mock.patch.object(windows.os.path, 'isfile', lambda p: p in files):
+            return windows.bash()
+
+    def test_git_bash_comes_from_path_alone_never_system32s_wsl_launcher(self):
+        system32, git = os.path.join('C:\\Windows', 'System32'), 'C:\\Program Files\\Git\\bin'
+        files = {os.path.join(d, 'bash.exe') for d in (system32, git, '.', 'bin')}
+        for entry in (system32, f'"{system32}"'):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.found(files, entry, '.', 'bin', f'"{git}"'), os.path.join(git, 'bash.exe'))
+        self.assertIsNone(self.found(files, system32, '.', 'bin', ''))
+
+    def test_elsewhere_bash_runs_by_name(self):
+        with mock.patch.object(windows.os, 'name', 'posix'):
+            self.assertEqual(windows.bash(), 'bash')
 
 
 class KillTreeTest(unittest.TestCase):

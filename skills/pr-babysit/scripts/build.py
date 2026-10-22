@@ -34,10 +34,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Parser, Unusable, checkout_top, git, report  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 LOGS = Path(tempfile.gettempdir()) / 'pr-babysit-builds'
 STAGES = ('setup', 'prerequisite', 'build')
@@ -68,13 +71,8 @@ def snapshot(paths):
 
 def bash():
     """'bash'; on Windows bash.exe from PATH alone: not the cwd, the PR's checkout, nor System32's WSL launcher."""
-    if os.name != 'nt':
-        return 'bash'
-    wsl = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'bash.exe'))
-    for d in os.environ.get('PATH', '').split(os.pathsep):
-        path = os.path.join(d, 'bash.exe')
-        if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
-            return path
+    if found := windows.bash():
+        return found
     raise Unusable('no bash.exe on PATH (System32 holds only the WSL launcher)')
 
 

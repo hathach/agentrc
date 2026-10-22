@@ -1,5 +1,6 @@
 """Windows runtime helpers the skills, hooks and statusline share: a program lookup that never takes the working
-directory, a bounded process-tree kill, and os.replace retried while another process holds the target open.
+directory, Git Bash found that way, a bounded process-tree kill, and os.replace retried while another process holds the
+target open.
 
 A script reaches it through its resolved path, as chief_guard.py reaches shadows.py:
 `sys.path.insert(0, str(Path(__file__).resolve().parents[N] / 'lib'))`, then `import windows`.
@@ -33,6 +34,15 @@ def on_path(name, exts, path=None):
             if os.path.isfile(program):
                 return program
     return None
+
+
+def bash():
+    """'bash'; on Windows bash.exe from PATH alone, never System32's WSL launcher, else None."""
+    if os.name != 'nt':
+        return 'bash'
+    system32 = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32'))
+    return on_path('bash', ['.exe'], [d for d in os.environ.get('PATH', '').split(os.pathsep)
+                                      if os.path.normcase(os.path.normpath(d.strip('"'))) != system32])
 
 
 def kill_tree(proc, timeout):

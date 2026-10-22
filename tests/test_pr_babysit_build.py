@@ -152,25 +152,9 @@ class BuildTest(unittest.TestCase):
                 exit = out['exit']
             self.assertEqual((code, out['stage'], out['exit'], out['setup'], out['requires']), (0, 'build', exit, '', []), command)
 
-    @unittest.skipUnless(os.name == 'nt', 'POSIX runs bash by name, as execvp finds it')
-    def test_bash_comes_from_path_alone_never_system32s_wsl_launcher_or_the_cwd(self):
-        root = self.repo.parent / 'Windows'
-        (root / 'System32').mkdir(parents=True)
-        real = self.repo.parent / 'Git' / 'bin'
-        real.mkdir(parents=True)
-        for exe in (root / 'System32' / 'bash.exe', real / 'bash.exe', self.repo / 'bash.exe',
-                    self.repo / 'bin' / 'bash.exe', self.repo / 'rooted' / 'bash.exe'):
-            exe.parent.mkdir(exist_ok=True)
-            exe.write_bytes(b'')
-        rooted = os.path.splitdrive(self.repo / 'rooted')[1]  # no drive: the cwd's drive decides
-        cwd = os.getcwd()
-        os.chdir(self.repo)
-        self.addCleanup(os.chdir, cwd)
-        on_path = lambda *dirs: {'SystemRoot': str(root), 'PATH': os.pathsep.join(map(str, dirs))}
-        with mock.patch.dict(os.environ, on_path(root / 'System32', '.', real)):
-            self.assertEqual(Path(build.bash()), real / 'bash.exe')
-        with mock.patch.dict(os.environ, on_path(root / 'System32', '.', 'bin', rooted, '')), self.assertRaisesRegex(build.Unusable, 'no bash.exe on PATH'):
-            os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)
+    def test_no_bash_on_path_is_its_error(self):
+        # the lookup itself is windows.bash()'s, tested in test_windows_runtime
+        with mock.patch.object(build.windows, 'bash', return_value=None), self.assertRaisesRegex(build.Unusable, 'no bash.exe on PATH'):
             build.bash()
 
     @unittest.skipUnless(os.name == 'nt', "POSIX runs bash by name; the checkout's bash.bat is a Windows hijack")

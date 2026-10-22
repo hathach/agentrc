@@ -29,7 +29,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from pathlib import PureWindowsPath
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
 BUILD = re.compile(r'^(https://app\.readthedocs\.(?:org|com))/projects/([\w-]+)/builds/(\d+)/?$')
 
@@ -49,13 +52,8 @@ class Failed(Exception):
 
 def bash():
     """'bash'; on Windows bash.exe from PATH alone: not the cwd, a checkout's bash.bat, nor System32's WSL launcher."""
-    if os.name != 'nt':
-        return 'bash'
-    wsl = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'bash.exe'))
-    for d in os.environ.get('PATH', '').split(os.pathsep):
-        path = os.path.join(d, 'bash.exe')
-        if PureWindowsPath(d).drive and PureWindowsPath(d).root and os.path.isfile(path) and os.path.normcase(os.path.normpath(path)) != wsl:
-            return path
+    if found := windows.bash():
+        return found
     raise Failed('RTD_TOKEN is not in the environment and no bash.exe is on PATH for a login shell (System32 holds only WSL)')
 
 
