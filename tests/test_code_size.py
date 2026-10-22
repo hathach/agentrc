@@ -2633,6 +2633,12 @@ class Compare(ProfileCase):
         self.assertIn('Baseline: dddddddddd (approximate) https://github.com/x/y/actions/runs/1 - 2 master '
                       'commits before this build', md)
 
+    def test_an_approximate_baseline_labels_the_base_side_with_its_own_commit(self):
+        md, _c, _d = self.compare([_shard('b1', {'device/a/a.elf': _elf(1)}, sha='d')],
+                                  [_shard('b1', {'device/a/a.elf': _elf(2)})],
+                                  baseline={'sha': 'd' * 40, 'url': 'https://example/run/1', 'exact': False})
+        self.assertIn('| File (dddddddddd → cccccccccc) |', unpad(md))
+
     def test_an_unavailable_baseline_is_said_so(self):
         md, _c, data = self.compare([], [_shard('b1', {'device/a/a.elf': _elf(1)})],
                                     baseline={'sha': None, 'url': None, 'exact': False, 'note': 'base x is not on master'})

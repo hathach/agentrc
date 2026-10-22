@@ -1967,6 +1967,8 @@ def compare_runs(base, cur, baseline=None, symbols=False):
     if commit_failure := _base_commit_failure(base_commits, baseline):
         failures.append(commit_failure)
         base_shards = {}
+    elif base_commits:  # the measured commit: older than the merge base when approximate
+        labels = (next(iter(base_commits))[0][:10], labels[1])
 
     sides, no_baseline, outside = {'base': {}, 'current': {}}, [], 0
     for board, shard in sorted(cur_shards.items()):
