@@ -229,6 +229,32 @@ class JLinkDump(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn('read 128 of 256', r['error'])
 
+    def test_a_failure_after_the_halt_records_the_core_state(self):
+        self.target(bytes(64), wroff=0)
+        mem = json.loads((self.dir / 'mem.json').read_text())
+        mem['bytes'][hex(CB)] = b'NOT RTT'.ljust(0x48, b'\0').hex()
+        (self.dir / 'mem.json').write_text(json.dumps(mem))
+        rc, r = self.run_dump('--resume')
+        self.assertEqual(rc, 3)
+        self.assertIn('no "SEGGER RTT"', r['error'])
+        self.assertEqual(json.loads((self.out / 'dump.json').read_text())['core'],
+                         {'before': 'running', 'after': 'halted'})
+        self.assertEqual(len(self.sessions()), 1)
+
+    def test_a_failure_in_the_second_session_leaves_the_state_after_unknown(self):
+        self.target(bytes(64), wroff=0)
+        real_run = dump.ps.run
+
+        def second_session_times_out(cmd, timeout, stdin=None):
+            if 'ring.bin' in stdin:
+                raise dump.ToolError('JLinkExe did not finish within 30 s')
+            return real_run(cmd, timeout, stdin)
+
+        with unittest.mock.patch.object(dump.ps, 'run', second_session_times_out):
+            rc, r = self.run_dump('--resume')
+        self.assertEqual(rc, 3)
+        self.assertEqual(r['core'], {'before': 'running', 'after': 'unknown'})
+
     def test_not_m_profile_is_refused(self):
         self.target(bytes(64), wroff=0, cpuid=0x4100_0000)
         rc, r = self.run_dump()
@@ -264,7 +290,9 @@ class JLinkDump(unittest.TestCase):
                 proc.wait()
         self.assertEqual(proc.returncode, 3, err)
         self.assertFalse(pid_alive(tool))
-        self.assertIn('stopped by signal', json.loads((self.out / 'dump.json').read_text())['error'])
+        record = json.loads((self.out / 'dump.json').read_text())
+        self.assertIn('stopped by signal', record['error'])
+        self.assertEqual(record['core'], {'before': 'unknown', 'after': 'unknown'})
 
     @unittest.skipIf(os.name == 'nt', 'POSIX SIGTERM')
     def test_a_stop_signal_while_a_failure_is_recorded_is_not_turned_into_an_error(self):
@@ -362,7 +390,9 @@ class TclOpenOCD:
         text = self.tcl.eval('join $out "\\n"')
         err = [line for line in text.splitlines() if line.startswith('ERROR ')]
         if err:
-            raise dump.ToolError(f'openocd: {err[0][6:]}')
+            failure = dump.ToolError(f'openocd: {err[0][6:]}')
+            failure.text = text
+            raise failure
         return text, []
 
     def calls(self):
@@ -374,17 +404,18 @@ class OpenOCDDump(unittest.TestCase):
     def memory(self, size=64, wroff=5, name=b'SysView', **cb):
         return {CB: control_block(size, wroff, **cb), RING_AT: bytes(range(size)), NAME_AT: name.ljust(16, b'\0')}
 
-    def run_session(self, fake, resume=False):
+    def run_session(self, fake, resume=False, core=None):
         with tempfile.TemporaryDirectory() as tmp:
-            return dump.openocd_dump(fake, CB, 1, resume, tmp, 30)
+            return dump.openocd_dump(fake, CB, 1, resume, tmp, 30, {} if core is None else core)
 
     def test_halts_dumps_and_resumes_only_a_running_core(self):
         for state, resume, after in (('running', False, 'halted'), ('running', True, 'running'),
                                      ('halted', True, 'halted')):
             with self.subTest(state=state, resume=resume):
                 fake = TclOpenOCD(self.memory(), state)
-                header, d, again, before, got = self.run_session(fake, resume)
-                self.assertEqual((before, got, d), (state, after, again))
+                core = {}
+                header, d, again = self.run_session(fake, resume, core)
+                self.assertEqual((core, d), ({'before': state, 'after': after}, again))
                 self.assertEqual(('halt' in fake.calls()), state == 'running')
                 self.assertFalse(any('reset' in c for c in fake.calls()))
 
@@ -406,10 +437,30 @@ class OpenOCDDump(unittest.TestCase):
                 self.assertFalse([c for c in fake.calls() if c.startswith('dump_image')])
 
     def test_a_core_that_does_not_halt_is_refused(self):
-        fake = TclOpenOCD(self.memory(), nohalt=True)
+        fake, core = TclOpenOCD(self.memory(), nohalt=True), {}
         with self.assertRaisesRegex(dump.ToolError, 'did not halt'):
-            self.run_session(fake)
+            self.run_session(fake, core=core)
         self.assertFalse([c for c in fake.calls() if c.startswith(('read_memory', 'dump_image'))])
+        self.assertEqual(core, {'before': 'running', 'after': 'running'})
+
+    def test_a_tcl_error_after_the_halt_records_the_core_state(self):
+        fake, core = TclOpenOCD(self.memory(max_up=1)), {}
+        with self.assertRaisesRegex(dump.ToolError, 'MaxNumUpBuffers'):
+            self.run_session(fake, resume=True, core=core)
+        self.assertEqual(core, {'before': 'running', 'after': 'halted'})
+        self.assertNotIn('resume', fake.calls())
+
+    def test_a_session_that_prints_nothing_leaves_the_core_unknown(self):
+        class Killed:
+            def batch(self, body, timeout):
+                failure = dump.ToolError('stopped by signal 15')
+                failure.text = ''
+                raise failure
+
+        core = {}
+        with self.assertRaisesRegex(dump.ToolError, 'signal'):
+            self.run_session(Killed(), core=core)
+        self.assertEqual(core, {'before': 'unknown', 'after': 'unknown'})
 
 
 class Usage(unittest.TestCase):

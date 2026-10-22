@@ -476,6 +476,23 @@ class Usage(unittest.TestCase):
                 with self.subTest(out):
                     self.assertIn('deletes /tmp/sv-*', self.usage('--out', out, '--from-raw', str(raw)))
 
+    def test_inputs_inside_a_tmp_sv_directory_are_refused(self):
+        # SystemView would delete them at startup, before a decode reads --from-raw
+        sv = Path(tempfile.mkdtemp(prefix='sv-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, sv)
+        raw = sv / 'c.SVDat'
+        raw.write_bytes(b'x')
+        live = ['--probe', '1', '--device', 'X', '--interface', 'swd', '--speed', '4000', '--duration-ms', '100']
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(record, 'resolve_live', return_value=0x1), \
+                mock.patch.object(record, 'prepare_out', side_effect=AssertionError('the guard let it through')):
+            cases = {'--from-raw': ['--from-raw', str(raw)],
+                     '--elf': ['--elf', str(sv / 'fw.elf')] + live,
+                     '--hil-config': ['--hil-config', str(sv / 'hil.json'), '--board', 'b'] + live}
+            for flag, argv in cases.items():
+                with self.subTest(flag):
+                    self.assertIn(f'{flag} {sv}', self.usage('--out', d + '/o', *argv))
+
     def test_openocd_board_is_refused_for_live(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d) / 'hil.json'

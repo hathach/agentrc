@@ -144,8 +144,9 @@ sudo apt-get install -y xvfb xdotool imagemagick
 # SystemView: segger.com/downloads/systemview (Linux .deb, installs /usr/bin/systemview); JLinkExe: segger.com/jlink
 ```
 
-- SystemView deletes `/tmp/sv-*` at startup: `sysview_record.py` refuses such an `--out`, but nothing guards a build
-  or capture directory there. carried over (a build tree erased mid-session).
+- SystemView deletes `/tmp/sv-*` at startup: `sysview_record.py` refuses an `--out`, `--from-raw`, `--elf` or
+  `--hil-config` there, but nothing guards another build or capture directory. carried over (a build tree erased
+  mid-session).
 - Linux only, and `unshare --user --map-root-user --mount` must work for the operator (unprivileged user
   namespaces). SystemView's J-Link DLL opens every J-Link it can reach at startup, live or decode, whichever probe
   `-usb` names: on a rig that raised a terms-of-use notice per other board's on-board probe and a "Communication timed
@@ -257,7 +258,8 @@ sysview_dump.py --out DIR --channel N (--elf FILE | --addr ADDR)
   first) and `dump.json` (addresses, offsets, sizes, core state before and after).
 - Exit: 0 dumped; 2 bad usage; 3 the probe or tool failed or is missing, the read was incomplete or incoherent, the
   buffer is not SystemView's, a resume was not seen to take, or SIGTERM or SIGHUP stopped the session (the tool is
-  killed, the core's state is unknown). `dump.json` is written on exit 3 too, with the `error`.
+  killed, the core's state after it unknown). `dump.json` is written on exit 3 too, with the `error` and, once a
+  probe session began, `core`: each state as far as it was established, `unknown` otherwise.
 
 ### What a harness replaces
 

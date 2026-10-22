@@ -25,8 +25,8 @@ to the run, repeats the load until the title names that copy, and only then expo
 SystemView has closed the file and its size holds.
 
 The license notice ("Continue under SFL": non-commercial or educational use) and the J-Link terms of use are
-accepted, as the operator has directed for every SEGGER notice. Never put --out under /tmp/sv-*: SystemView deletes
-that pattern at startup.
+accepted, as the operator has directed for every SEGGER notice. SystemView deletes /tmp/sv-* at startup, so an
+--out, --from-raw, --elf or --hil-config there is refused.
 
 Exit: 0 recorded and exported; 2 bad usage or not Linux; 3 a tool, the probe, the workload or an export failed, or a
 signal stopped the run (record.json says which).
@@ -470,6 +470,11 @@ def resolve_live(a, p):
     return control_block(a, p)
 
 
+def in_sv_tmp(path):
+    resolved = Path(path).resolve()
+    return any(d.parent == Path('/tmp') and d.name.startswith('sv-') for d in (resolved, *resolved.parents))
+
+
 def on_signal(signum, _frame):
     raise Failure(f'stopped by signal {signum}')
 
@@ -507,8 +512,9 @@ def main(argv=None):
     if missing:
         p.error(f"not on PATH: {', '.join(missing)} (SystemView's deb, xvfb, xdotool, util-linux)")
     out = Path(a.out).resolve()
-    if any(d.parent == Path('/tmp') and d.name.startswith('sv-') for d in (out, *out.parents)):
-        p.error(f'--out {a.out}: SystemView deletes /tmp/sv-* at startup')
+    for flag, path in (('--out', a.out), ('--from-raw', a.from_raw), ('--elf', a.elf), ('--hil-config', a.hil_config)):
+        if path and in_sv_tmp(path):
+            p.error(f'{flag} {path}: SystemView deletes /tmp/sv-* at startup')
     prepare_out(p, str(out))
 
     record = {'started': now(), 'argv': [shlex.quote(x) for x in (argv if argv is not None else sys.argv[1:])],

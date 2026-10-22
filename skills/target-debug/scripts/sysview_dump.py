@@ -26,7 +26,8 @@ PROBE_STATE_JLINK_EXE and PROBE_STATE_OPENOCD name the tools when they are not o
 
 Exit: 0 dumped; 2 bad usage; 3 the probe or tool failed or is missing, the read was incomplete or incoherent, the
 buffer is not SystemView's, a --resume was not seen to take (the dump is written), or SIGTERM or SIGHUP stopped the
-session (the tool is killed, the core's state is unknown).
+session (the tool is killed, the core's state after it unknown). dump.json's core holds each state as far as it was
+established, failures included, and "unknown" otherwise.
 """
 import argparse
 import hashlib
@@ -90,10 +91,11 @@ def halted(dhcsr):
     return bool(dhcsr & S_HALT)
 
 
-def jlink_dump(backend, cb, channel, resume, tmp, timeout):
-    """(header, descriptor, descriptor read again, core state before, core state after) over two Commander
-    sessions, each DHCSR read placed to prove the state it claims."""
+def jlink_dump(backend, cb, channel, resume, tmp, timeout, core):
+    """(header, descriptor, descriptor read again) over two Commander sessions, each DHCSR read placed to prove the
+    state it claims; core's before and after are set as each is established, so a failure still reports them."""
     hlen, dhcsr = header_len(channel), f'mem32 {ps.DHCSR:X}, 1'
+    core.update(before='unknown', after='unknown')
     s1 = ['exec SetRestartOnClose = 0', f'mem32 {CPUID:X}, 1', dhcsr, 'h', dhcsr,
           f'savebin {tmp}/hdr1.bin, 0x{cb:08X}, 0x{hlen:X}', 'qc']
     text = ps.run(backend.cmd, timeout, '\n'.join(s1) + '\n')
@@ -103,11 +105,14 @@ def jlink_dump(backend, cb, channel, resume, tmp, timeout):
         raise ToolError(f'incomplete first session: {len(reads)}/3 reads; last output:\n{ps.tail(text)}')
     ps.check_m_profile(reads[0][1])
     running = not halted(reads[1][1])
+    core['before'] = 'running' if running else 'halted'
     if not halted(reads[2][1]):
         raise ToolError(f'the core did not halt (DHCSR 0x{reads[2][1]:08x})')
+    core['after'] = 'halted'
     header = read_file(f'{tmp}/hdr1.bin', hlen, 'control block')
     d = descriptor(header, channel)
     go = resume and running
+    core['after'] = 'unknown'    # until the second session's reads say otherwise
     s2 = ([] if go else ['exec SetRestartOnClose = 0']) + [
         'h', dhcsr, f'savebin {tmp}/ring.bin, 0x{d[1]:08X}, 0x{d[2]:X}',
         f'savebin {tmp}/hdr2.bin, 0x{cb:08X}, 0x{hlen:X}', f'savebin {tmp}/name.bin, 0x{d[0]:08X}, 0x10', dhcsr] + (
@@ -116,49 +121,66 @@ def jlink_dump(backend, cb, channel, resume, tmp, timeout):
     states = [int(v, 16) for a, v in ps._MEM32_RE.findall(text) if int(a, 16) == ps.DHCSR]
     if len(states) < 2 or not halted(states[0]) or not halted(states[1]):
         raise ToolError(f'the core was not halted throughout the reads (DHCSR {[hex(v) for v in states]})')
-    after = 'halted'
+    core['after'] = 'halted'
     if go:
         # a g not seen to take leaves the core to the DLL's restart at close: its final state is not known
-        after = 'running' if len(states) > 2 and not halted(states[2]) else 'unknown'
+        core['after'] = 'running' if len(states) > 2 and not halted(states[2]) else 'unknown'
     again = descriptor(read_file(f'{tmp}/hdr2.bin', hlen, 'control block, second read'), channel)
-    return header, d, again, 'running' if running else 'halted', after
+    return header, d, again
 
 
 OPENOCD_TCL = '''set t [target current]
 $t arp_poll
 set was [$t curstate]
 echo "STATE $was"
-if {$was ne "halted"} {halt 1000}
-if {[$t curstate] ne "halted"} {error "the core did not halt: [$t curstate]"}
-if {[binary format c* [read_memory $cb 8 10]] ne "SEGGER RTT"} {error "no SEGGER RTT control block at $cb"}
-set up [read_memory [expr {$cb + 0x10}] 32 1]
-if {$up <= $ch || $up > 32} {error "MaxNumUpBuffers $up: no up-buffer $ch"}
-lassign [read_memory [expr {$cb + 0x18 + $ch * 0x18}] 32 6] name buf size wr rd
-if {!$name || !$buf || !$size || $size > $maxring || $wr >= $size || $rd >= $size || $buf + $size > 0x100000000} {
-  error "up-buffer $ch is not a usable ring: $name $buf $size $wr $rd"
+if {[catch {
+  if {$was ne "halted"} {halt 1000}
+  if {[$t curstate] ne "halted"} {error "the core did not halt: [$t curstate]"}
+  if {[binary format c* [read_memory $cb 8 10]] ne "SEGGER RTT"} {error "no SEGGER RTT control block at $cb"}
+  set up [read_memory [expr {$cb + 0x10}] 32 1]
+  if {$up <= $ch || $up > 32} {error "MaxNumUpBuffers $up: no up-buffer $ch"}
+  lassign [read_memory [expr {$cb + 0x18 + $ch * 0x18}] 32 6] name buf size wr rd
+  if {!$name || !$buf || !$size || $size > $maxring || $wr >= $size || $rd >= $size || $buf + $size > 0x100000000} {
+    error "up-buffer $ch is not a usable ring: $name $buf $size $wr $rd"
+  }
+  dump_image $tmp/hdr1.bin $cb $hlen
+  dump_image $tmp/ring.bin $buf $size
+  dump_image $tmp/hdr2.bin $cb $hlen
+  dump_image $tmp/name.bin $name 16
+  if {$resume && $was eq "running"} {resume}
+} err]} {
+  catch {echo "AFTER [$t curstate]"}
+  error $err
 }
-dump_image $tmp/hdr1.bin $cb $hlen
-dump_image $tmp/ring.bin $buf $size
-dump_image $tmp/hdr2.bin $cb $hlen
-dump_image $tmp/name.bin $name 16
-if {$resume && $was eq "running"} {resume}
 echo "AFTER [$t curstate]"'''
 
 
-def openocd_dump(backend, cb, channel, resume, tmp, timeout):
+def openocd_states(text):
+    """{'before': STATE, 'after': AFTER} for those lines the session printed."""
+    return {key: m.group(1) for key, tag in (('before', 'STATE'), ('after', 'AFTER'))
+            if (m := re.search(rf'^{tag} (\S+)$', text, re.M))}
+
+
+def openocd_dump(backend, cb, channel, resume, tmp, timeout, core):
     """The same over one OpenOCD session, which checks the descriptor before it follows a pointer in it and takes
-    the core state from the target itself."""
+    the core state from the target itself, a failed session's included."""
     head = (f'set cb 0x{cb:08x}; set ch {channel}; set hlen 0x{header_len(channel):x}; set maxring {MAX_RING}; '
             f'set resume {int(resume)}; set tmp {{{tmp}}}\n')
-    text, _ = backend.batch(head + OPENOCD_TCL, timeout + MAX_RING / 10000)
-    state, after = re.search(r'^STATE (\S+)$', text, re.M), re.search(r'^AFTER (\S+)$', text, re.M)
-    if not state:
+    core.update(before='unknown', after='unknown')
+    try:
+        text, _ = backend.batch(head + OPENOCD_TCL, timeout + MAX_RING / 10000)
+    except ToolError as e:
+        core.update(openocd_states(getattr(e, 'text', '')))
+        raise
+    states = openocd_states(text)
+    core.update(states)
+    if 'before' not in states:
         raise ToolError(f'no core state read; last output:\n{ps.tail(text)}')
     hlen = header_len(channel)
     header = read_file(f'{tmp}/hdr1.bin', hlen, 'control block')
     d = descriptor(header, channel)
     again = descriptor(read_file(f'{tmp}/hdr2.bin', hlen, 'control block, second read'), channel)
-    return header, d, again, state.group(1), after.group(1) if after else 'unknown'
+    return header, d, again
 
 
 def on_signal(signum, _frame):
@@ -263,10 +285,10 @@ def main(argv=None):
             return fail(f'temporary directory {tmp!r} has unsafe characters: set TMPDIR')
         dump = jlink_dump if route == 'jlink' else openocd_dump
         previous = {sig: signal.signal(sig, on_signal) for sig in STOP_SIGNALS}
-        error = None
+        error, core = None, {}
         try:
             t0 = time.monotonic()
-            header, d, again, before, after = dump(backend, cb, a.channel, a.resume, tmp, a.timeout)
+            header, d, again = dump(backend, cb, a.channel, a.resume, tmp, a.timeout, core)
             result['sessionMs'] = round((time.monotonic() - t0) * 1000)
             ring = read_file(f'{tmp}/ring.bin', d[2], 'ring')
         except (ToolError, ValueError, OSError) as e:
@@ -274,9 +296,10 @@ def main(argv=None):
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+        if core:
+            result['core'] = core
         if error is not None:    # recorded with on_signal gone: a later stop signal acts as it did before the session
             return fail(error)
-        result['core'] = {'before': before, 'after': after}
         name, buf, size, wroff, rdoff, flags = d
         result['descriptor'] = {'sName': f'0x{name:08x}', 'pBuffer': f'0x{buf:08x}', 'SizeOfBuffer': size,
                                 'WrOff': wroff, 'RdOff': rdoff, 'Flags': flags}
@@ -296,8 +319,8 @@ def main(argv=None):
             f.write(data)
     result['files'] = {fname: {'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
                        for fname, data in files.items()}
-    if a.resume and before == 'running' and after != 'running':
-        return fail(f'dumped, but the core was not seen running after the resume ({after})')
+    if a.resume and core['before'] == 'running' and core['after'] != 'running':
+        return fail(f'dumped, but the core was not seen running after the resume ({core["after"]})')
     return finish(0)
 
 
