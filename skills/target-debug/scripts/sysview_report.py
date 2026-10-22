@@ -63,9 +63,9 @@ def matched_seconds(m):
 
 
 def pct(sorted_vals, p):
-    """Nearest-rank percentile, index (n-1)*p/100."""
+    """Nearest-rank percentile: the smallest value with at least p% of the values at or below it."""
     n = len(sorted_vals)
-    return sorted_vals[min(n - 1, int((n - 1) * p / 100))]
+    return sorted_vals[max(0, -(-n * p // 100) - 1)]
 
 
 def us(sec):
@@ -106,6 +106,9 @@ CONTEXT_COLUMNS = {'Name', 'Activations', 'CPU Load', 'Total Run Time', 'Total B
 EVENT_COLUMNS = {'event', 'detail', 'context', 'timestampint', 'eventint'}
 CONTEXT_TIMES = ('cpu_pct', 'total_ms', 'blocked_ms', 'min_us', 'avg_us', 'max_us')
 SWITCHES = ('Task Run', 'ISR Enter', 'System Idle')
+# SystemView's context for the time from a task's block (Task Stop Ready) or an ISR exit into the scheduler to the next
+# switch (UM08027 6.1.1.4, 7.6.10)
+SCHEDULER = 'Scheduler'
 
 
 def read_csv(path, columns, what):
@@ -212,7 +215,7 @@ class Scan:
                 open_calls.clear()
             elif event in ('Task Run', 'System Idle') and self.losses and self.losses[-1][1] is None and ts is not None:
                 self.losses[-1][1] = ts
-            if ts is not None and (lost or event in ('Task Run', 'System Idle', 'ISR Enter', 'ISR Exit')):
+            if ts is not None and (lost or event in SWITCHES or event in ('ISR Exit', 'Task Block')):
                 runner = isrs[-1] if isrs else task
                 if runner is not None and last is not None and ts > last:
                     self.segments.append((last, ts, runner))
@@ -223,6 +226,11 @@ class Scan:
                 elif event == 'ISR Exit':
                     if isrs:
                         isrs.pop()
+                    if detail == 'Returns to Scheduler':
+                        task = SCHEDULER
+                elif event == 'Task Block':
+                    if ctx == task:
+                        task = SCHEDULER
                 else:
                     task = ctx
                 last = ts

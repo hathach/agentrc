@@ -153,6 +153,8 @@ class Percentiles(unittest.TestCase):
         self.assertEqual(report.pct([10, 100], 50), 10)
         self.assertEqual(report.pct(list(range(1, 101)), 50), 50)
         self.assertEqual(report.pct(list(range(1, 101)), 99), 99)
+        self.assertEqual(report.pct([10, 100], 99), 100)
+        self.assertEqual(report.pct([10, 20, 30], 1), 10)
 
 
 class Unavailable(Case):
@@ -386,6 +388,21 @@ class Workload(Case):
     def test_anchor_without_events_is_bad_usage(self):
         self.usage_error('--workload-event', '516', events=False)
 
+    def test_time_after_a_block_or_an_isr_exit_to_the_scheduler_is_the_schedulers(self):
+        rows = [ev(0, 'Task Run', context='cdc'), ev(1000, 'Task Block', 'Delayed', context='cdc'),
+                ev(1500, 'Task Run', context='io'), ev(2000, 'ISR Enter', 'Runs for 200.000 us', context='SysTick'),
+                ev(2200, 'ISR Exit', 'Returns to Scheduler', context='SysTick'), ev(2600, 'Task Run', context='cdc'),
+                ev(5000, 'Stop', context='cdc')]
+        r = self.run_report('--window', '0:0.003', rows=rows)
+        busy = {c['name']: c['busy_ms'] for c in r['contexts_workload']}
+        self.assertEqual(busy, {'cdc': 1.4, 'Scheduler': 0.9, 'io': 0.5, 'SysTick': 0.2})
+
+    def test_blocking_another_task_keeps_the_runner(self):
+        rows = [ev(0, 'Task Run', context='cdc'), ev(1000, 'Task Block', 'Suspended', context='io'),
+                ev(5000, 'Stop', context='cdc')]
+        r = self.run_report('--window', '0:0.003', rows=rows)
+        self.assertEqual([c['name'] for c in r['contexts_workload']], ['cdc'])
+
     def test_busy_never_exceeds_the_window(self):
         r = self.run_report('--window', '0:0.005', rows=schedule())
         self.assertLessEqual(sum(c['cpu_pct_workload'] for c in r['contexts_workload']), 100.0)
@@ -407,6 +424,11 @@ class RealExports(unittest.TestCase):
         self.assertTrue({'cdc', 'usbd', 'Idle', 'SysTick'} <= names)
         self.assertEqual({row['name'] for row in r['ready_run']}, {'io', 'cdc'})
         self.assertEqual(r['overflow'], 0)
+
+    def test_freertos_scheduler_after_a_task_blocks(self):
+        # cdc blocks at 194.303 us; SystemView names the context Scheduler until Tmr Svc runs at 203.268 us
+        r = self.run_on('h743-freertos', '--window', '0.000196:0.000200')
+        self.assertEqual([c['name'] for c in r['contexts_workload']], ['Scheduler'])
 
     def test_baremetal_overflow_and_functions(self):
         r = self.run_on('f407-baremetal')
