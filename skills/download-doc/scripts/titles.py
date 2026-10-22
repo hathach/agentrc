@@ -26,6 +26,8 @@ PROSE = re.compile(r'^(this|the|it|introducing)\b', re.I)
 DOCWORDS = r'(reference manual|user manual|users? guide|data ?sheet|errata|' \
            r'programming manual|application note|design reference|product brief)'
 DOCLINE = re.compile(DOCWORDS, re.I)
+# an index title that is only the document type: "Data Sheet", "Errata Sheet"
+GENERIC = re.compile(DOCWORDS + r'( sheet)?', re.I)
 
 TYPE_WORD = {
     'Errata Sheet': 'Errata', 'Errata': 'Errata',
@@ -119,9 +121,13 @@ def title(doc):
     stem = (doc.get('stem') or '').strip()
     word = TYPE_WORD.get(doc.get('type', ''), doc.get('type') or '')
 
-    # vendor index title, then summary -- neither if it reads as prose
+    # vendor index title, then summary -- neither if it reads as prose, names only the
+    # document type, or is only the id ("MCXC041_1N86K.pdf")
+    def describes(s):
+        rest = strip_id(strip_id(s, code), stem)
+        return bool(rest) and not GENERIC.fullmatch(rest)
     candidates = [clean(src) for src in (doc.get('title'), doc.get('summary'))
-                  if usable(src) and not PROSE.match(clean(src))]
+                  if usable(src) and not PROSE.match(clean(src)) and describes(clean(src))]
     head = candidates[0] if candidates else code
     head = strip_id(strip_id(head, code), stem)
 
@@ -196,6 +202,16 @@ if __name__ == '__main__':
           'title': 'This document details all known silicon errata for the i.MX RT1170A.',
           'summary': 'Chip Errata for i.MX RT1170A'},
          "IMXRT1170ACE Chip Errata for i.MX RT1170A Rev 1.6"),
+
+        ("type-only title falls through to summary (real NXP index)",
+         {'code': 'K12P80M50SF4', 'type': 'Data Sheet', 'version': '5', 'title': 'Data Sheet',
+          'summary': 'Kinetis K12 Data Sheet: 50MHz Arm Cortex-M4 microcontroller (MCU)'},
+         "K12P80M50SF4 Kinetis K12 Data Sheet: 50MHz Arm Cortex-M4 microcontroller (MCU) Rev 5"),
+
+        ("id-only title falls through to summary (real NXP index)",
+         {'code': 'MCXC041_1N86K', 'type': 'Errata', 'version': '1.0', 'title': 'MCXC041_1N86K.pdf',
+          'summary': 'Mask Set Errata for Mask 1N86K'},
+         "MCXC041_1N86K Mask Set Errata for Mask 1N86K Rev 1.0"),
 
         # --- normal path -------------------------------------------------------
         ("ST errata straight from the index",

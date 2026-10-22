@@ -22,6 +22,9 @@ USB_SCOPE_NOTE = ("the document taxonomy classifies by product line, not by peri
 
 AUTHOR = "NXP Semiconductors"
 PACE_SECONDS = 2
+# False after an enumerate_docs() that kept going past a failed index page: its list
+# is not the whole scope, so sync.py records no USB verdict from it.
+ENUMERATION_COMPLETE = True
 
 # The literal braces are part of the path — the API takes its query as a brace-wrapped
 # blob, not as normal query parameters. Keep them.
@@ -104,6 +107,8 @@ def enumerate_docs(types=None, device=DEFAULT_DEVICE, limit=None) -> list:
     `device` is a key of DEVICE_TAX. Use 'Arm MCU' for everything modern; the LPC2000
     and LPC3000 branches are ARM7/ARM9 legacy parts you usually want to exclude.
     """
+    global ENUMERATION_COMPLETE
+    ENUMERATION_COMPLETE = True
     device_tax = DEVICE_TAX.get(device, device)
     out: dict = {}
     for kind in (types or list(TYPE_TAX)):
@@ -117,6 +122,7 @@ def enumerate_docs(types=None, device=DEFAULT_DEVICE, limit=None) -> list:
             except (RuntimeError, json.JSONDecodeError) as e:
                 print(f"  {kind}: page at {start} failed ({e}); keeping what we have",
                       file=sys.stderr)
+                ENUMERATION_COMPLETE = False
                 break
             total = int(d.get("totalcount") or 0)
             results = d.get("results") or []

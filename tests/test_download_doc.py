@@ -1266,6 +1266,33 @@ class VendorSync(unittest.TestCase):
         self.assertIn('left out: 3 document(s)', err)
         self.assertEqual(json.loads(cache.read_text())['st:STM32X0']['source'], 'pdf:3 docs')
 
+    def test_a_failed_index_page_does_not_exclude_a_family_from_later_runs(self):
+        # Three readable datasheets without USB settle "no USB", unless a page went missing.
+        def nxp_run(fail):
+            def page(tax, device_tax, start):
+                if tax != vendor_nxp.TYPE_TAX['datasheet']:
+                    return {'totalcount': 0, 'results': []}
+                if start and fail:
+                    raise RuntimeError('HTTP 503')
+                return {'totalcount': 3 if not fail else 6, 'results': [
+                    {'metaData': {'code': f'LPC99DS{start + n}'}, 'url': f'https://nxp.com/LPC99DS{start + n}.pdf',
+                     'title': f'LPC99 datasheet {start + n}'} for n in range(3)]}
+            cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
+            cache.unlink(missing_ok=True)
+            with unittest.mock.patch.object(vendor_nxp, '_page', page), \
+                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None), \
+                    unittest.mock.patch.object(vendor_nxp, 'ENUMERATION_COMPLETE', True):
+                code, _, err = run_sync('nxp')
+            return code, err, json.loads(cache.read_text()) if cache.exists() else {}
+        sync.enumerate_vendor = self.enumerate_vendor
+        self.peek_usb_in('none')
+        code, err, verdicts = nxp_run(fail=False)
+        self.assertEqual((code, verdicts['nxp:LPC99']['usb']), (1, False), err)
+        code, err, verdicts = nxp_run(fail=True)
+        self.assertEqual(code, 0, err)
+        self.assertIn('page at 3 failed', err)
+        self.assertNotIn('nxp:LPC99', verdicts)
+
 class UsbResolution(unittest.TestCase):
     """A family is recorded as having no USB only from documents actually read."""
 

@@ -530,6 +530,8 @@ def main() -> int:
 
     print(f"enumerating {args.vendor} ...", file=sys.stderr)
     docs = enumerate_vendor(args.vendor, args)
+    # An adapter that kept what it had past a failed fetch says so; the list is partial.
+    complete = complete and getattr(mod, "ENUMERATION_COMPLETE", True)
     if not docs:
         # An empty list cannot tell a failed fetch from a scope that matches nothing;
         # the adapter's own messages above are the only evidence of which.
