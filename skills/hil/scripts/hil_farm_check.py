@@ -404,6 +404,9 @@ def _finalize(fh, lock: str, ctx: Context, row: dict) -> None:
     else:
         cleanup['blocker'] = 'stale-record'
         row['note'].append(f'protected record kept: recovery takes it over (`hil_lock.py hold --take-over {lock}`)')
+    if retained:
+        row['note'].append('first end every session in cleanup.retained with its provider (openocd_esp: '
+                           '`hil_openocd_esp.py end --receipt`, exit 0): neither release nor takeover checks them')
     with contextlib.suppress(OSError):
         fh.close()   # never clear_record: the record is the blocker
     say(f'{row["name"]:26} BLOCKED: {cleanup["blocker"]} ({cleanup["result"]})')

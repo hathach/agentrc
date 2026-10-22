@@ -891,6 +891,8 @@ class JLinkJudgment(unittest.TestCase):
             with self.subTest(name):
                 self.assertEqual(hf.jlink_judgment(jlink_fixture(name), m['commands']),
                                  {'ok': True, 'problem': '', 'commands': mock.ANY})
+                script = '\n'.join([*m['commands'], 'exit']) + '\n'
+                self.assertEqual(hf.jlink_problem(op_of((0, jlink_fixture(name), None), script=script)), '')
 
     def test_a_failed_chunk_fails_whatever_the_rest_says(self):
         good = jlink_fixture(self.FLASH)

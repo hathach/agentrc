@@ -164,8 +164,11 @@ current board's cleanup.
   that its firmware, USB or anything else works.
 - A `blocked` row's cleanup names its blocker: a cleanup holder's `token`, which
   Recovery releases with `hil_lock.py release --token` (refused until every
-  process the check started is proven ended), or a protected record, which needs
-  a recovery takeover.
+  process the check ran through `ctx.run` is proven ended), or a protected
+  record, which needs a recovery takeover. Neither checks a session listed in
+  its cleanup's `retained` (one the profile's provider left running, an
+  openocd_esp server): Recovery ends each first (`hil_openocd_esp.py end
+  --receipt`, exit 0).
 - Exit 0 no failed row, 1 a failed row or an aborted check, 2 refused before any
   board, 4 any blocked row. `locked` and `unsupported` rows are unverified, not
   healthy: read the table, never `$?` alone.

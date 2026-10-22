@@ -392,6 +392,7 @@ class Engine(unittest.TestCase):
         rec = lk.read_record('b')
         self.assertTrue(lk.is_cleanup_holder(rec))
         self.assertEqual(rec['retained'], receipts)
+        self.assertIn('`hil_openocd_esp.py end --receipt`', row['note'][-1], 'release --token does not check them')
         lk.release_token(row['cleanup']['token'])
 
     def test_a_failed_handoff_keeps_the_retained_receipts_in_the_protected_record(self):
@@ -405,6 +406,7 @@ class Engine(unittest.TestCase):
         rec = lk.read_record('b')
         self.assertEqual((rec['protected'], rec['retained']), (True, receipts))
         self.assertNotIn('role', rec)
+        self.assertIn('neither release nor takeover checks them', row['note'][-1])
 
     # --- handing a survivor's board to a cleanup holder -----------------------------------------
     def handoff(self, argv=None, popen=None):
