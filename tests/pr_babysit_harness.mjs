@@ -2818,6 +2818,13 @@ test('a harvest that failed twice stops the launch at once, whatever the validat
   assert.ok(logs.some(l => l === 'cycle 1: harvest.py failed twice — PyYAML is not installed'), logs.join('\n'))
 })
 
+test('a report carrying both a rate limit and a harvest error takes the rate-limit path', async () => {
+  const { result } = await run({ reviews: { ...LIMITED_REVIEWS, harvestError: 'PyYAML is not installed' }, args: { maxCycles: 4 } })
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.deepEqual(result.rateLimit, LIMITED_REVIEWS.rateLimit)
+  assert.equal(result.state.cyclesUsed, 0)
+})
+
 test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')
