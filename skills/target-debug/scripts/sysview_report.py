@@ -103,7 +103,7 @@ def load_event_map(path):
 
 CONTEXT_COLUMNS = {'Name', 'Activations', 'CPU Load', 'Total Run Time', 'Total Blocked Time', 'Min Run Time',
                    'Max Run Time'}
-EVENT_COLUMNS = {'event', 'detail', 'context', 'timestampint', 'eventint'}
+EVENT_COLUMNS = {'event', 'detail', 'context', 'contextint', 'contextoutint', 'timestampint', 'eventint'}
 CONTEXT_TIMES = ('cpu_pct', 'total_ms', 'blocked_ms', 'min_us', 'avg_us', 'max_us')
 SWITCHES = ('Task Run', 'ISR Enter', 'System Idle')
 # SystemView's context for the time from a task's block (Task Stop Ready) or an ISR exit into the scheduler to the next
@@ -229,7 +229,9 @@ class Scan:
                     if detail == 'Returns to Scheduler':
                         task = SCHEDULER
                 elif event == 'Task Block':
-                    if ctx == task:
+                    # the running context leaves only when the blocked task is itself; blocking or suspending another
+                    # task keeps it (SystemView 4.10b exports)
+                    if row['contextoutint'] != row['contextint']:
                         task = SCHEDULER
                 else:
                     task = ctx

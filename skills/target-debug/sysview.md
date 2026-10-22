@@ -120,8 +120,9 @@ what ran, in order; `sysview_report.py --post-mortem` takes durations and load f
 
 - **CPU load** is a share of the whole capture, first event to last (`live_window_s`), idle included; for the share
   during the workload give an anchor and read `contexts_workload`. Bare-metal firmware has no Task Run or Idle events,
-  so only ISR shares appear there and they do not sum to 100. The time from a task blocking, or an ISR exiting into
-  the scheduler, to the next switch is `Scheduler`'s, as SystemView names it.
+  so only ISR shares appear there and they do not sum to 100. The time from a task blocking itself, or an ISR exiting
+  into the scheduler, to the next switch is `Scheduler`'s, as SystemView names it; a task that blocks or suspends
+  another keeps running.
 - **ISR duration** spans the wrapped handler's enter→exit, for the invocations coverage and loss let through. A span
   far longer than the handler's instruction count is a lead (waiting on the peripheral is one cause): check it on the
   timeline and with target-side evidence.

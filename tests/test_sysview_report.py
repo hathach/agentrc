@@ -1,6 +1,7 @@
 """Tests for sysview_report.py: call/return pairing across loss, the null rules for an export without events or
-without a time base, the explicit workload anchors, the event map, and two real exports (tests/data/sysview: an
-stm32h743nucleo FreeRTOS slice and an stm32f407disco bare-metal slice with an overflow). No SystemView."""
+without a time base, the explicit workload anchors, the event map, and real exports (tests/data/sysview: an
+stm32h743nucleo FreeRTOS slice, a trimmed re-decode of it whose task blocks another task, and an stm32f407disco
+bare-metal slice with an overflow). No SystemView."""
 import contextlib
 import importlib.util
 import io
@@ -25,6 +26,7 @@ EV_HEADER = ('sequencenum,timestamp,context,event,detail,timestampint,'
 CTX_HEADER = ('Name,Type,Core,Stack Information,Activations,Total Blocked Time,Total Run Time,Time Interrupted,'
               'CPU Load,Last Run Time,Min Run Time,Max Run Time\n')
 CTX_ROW = 'ISR 83,#83,Core 0,,10,,0.000 100 000 s,0.000 000 ms,0.33 %,0.003 ms,0.003 571 ms,0.027 774 ms\n'
+SCHED_ID = '0x0000000400000000'     # the Scheduler's context id in SystemView 4.10b exports
 INIT = 'Cycle Freq.: 1000000, CPU Freq.: 48000000, ID Base: 0x20000000, ID Shift: 0'
 
 
@@ -32,8 +34,9 @@ def setUpModule():
     guard_survivors(__name__)
 
 
-def ev(ts, event, detail='', context='ctx', eventint=0):
-    return f'0,0.0,"{context}","{event}","{detail}",{ts},0x0,0x0,0x0,{eventint},0,0,\n'
+def ev(ts, event, detail='', context='ctx', eventint=0, ctx_out='0x0'):
+    """ctx_out: the contextoutint SystemView gives a row whose event switches the running context away."""
+    return f'0,0.0,"{context}","{event}","{detail}",{ts},0x0,0x0,{ctx_out},{eventint},0,0,\n'
 
 
 class Case(unittest.TestCase):
@@ -248,6 +251,7 @@ class Unavailable(Case):
             'empty contexts': ('', None),
             'empty events': (CTX_HEADER + CTX_ROW, ''),
             'truncated event row': (CTX_HEADER + CTX_ROW, EV_HEADER + '0,0.0,"ctx","Init"\n'),
+            'no contextoutint': (CTX_HEADER + CTX_ROW, EV_HEADER.replace(',contextoutint', '')),
         }
         for what, (contexts, events) in cases.items():
             with self.subTest(what):
@@ -389,7 +393,7 @@ class Workload(Case):
         self.usage_error('--workload-event', '516', events=False)
 
     def test_time_after_a_block_or_an_isr_exit_to_the_scheduler_is_the_schedulers(self):
-        rows = [ev(0, 'Task Run', context='cdc'), ev(1000, 'Task Block', 'Delayed', context='cdc'),
+        rows = [ev(0, 'Task Run', context='cdc'), ev(1000, 'Task Block', 'Delayed', context='cdc', ctx_out=SCHED_ID),
                 ev(1500, 'Task Run', context='io'), ev(2000, 'ISR Enter', 'Runs for 200.000 us', context='SysTick'),
                 ev(2200, 'ISR Exit', 'Returns to Scheduler', context='SysTick'), ev(2600, 'Task Run', context='cdc'),
                 ev(5000, 'Stop', context='cdc')]
@@ -398,7 +402,8 @@ class Workload(Case):
         self.assertEqual(busy, {'cdc': 1.4, 'Scheduler': 0.9, 'io': 0.5, 'SysTick': 0.2})
 
     def test_blocking_another_task_keeps_the_runner(self):
-        rows = [ev(0, 'Task Run', context='cdc'), ev(1000, 'Task Block', 'Suspended', context='io'),
+        # a real export names the running task in context and prefixes the blocked one to the detail
+        rows = [ev(0, 'Task Run', context='cdc'), ev(1000, 'Task Block', 'io, Suspended', context='cdc'),
                 ev(5000, 'Stop', context='cdc')]
         r = self.run_report('--window', '0:0.003', rows=rows)
         self.assertEqual([c['name'] for c in r['contexts_workload']], ['cdc'])
@@ -429,6 +434,11 @@ class RealExports(unittest.TestCase):
         # cdc blocks at 194.303 us; SystemView names the context Scheduler until Tmr Svc runs at 203.268 us
         r = self.run_on('h743-freertos', '--window', '0.000196:0.000200')
         self.assertEqual([c['name'] for c in r['contexts_workload']], ['Scheduler'])
+
+    def test_freertos_task_blocking_another_keeps_running(self):
+        # the h743 slice re-decoded with cdc's Task Block at 194.303 us naming blinky: cdc runs on to 203.268 us
+        r = self.run_on('h743-block-other-task', '--window', '0.000196:0.000200')
+        self.assertEqual([c['name'] for c in r['contexts_workload']], ['cdc'])
 
     def test_baremetal_overflow_and_functions(self):
         r = self.run_on('f407-baremetal')
