@@ -2679,9 +2679,6 @@ test('an accepted failure is named by its key, and a wrong key accepts nothing',
   const wrong = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey({ key: '0'.repeat(16) })] } })
   assert.notEqual(wrong.result.pass, true)
   assert.ok(wrong.logs.some(l => /accepted failure 0{16} matches no failure on this head/.test(l)), wrong.logs.join('\n'))
-  const twice = await run({ ...redWith(PVS, { ...PVS }), args: { acceptedFailures: [byKey()] } })
-  assert.notEqual(twice.result.pass, true, 'a key that names two observed failures accepts neither')
-  assert.ok(twice.logs.some(l => /listed 2 times; one acceptance covers one/.test(l)))
 })
 
 test('acceptedFailures are checked for shape before anything runs', async () => {
@@ -2748,6 +2745,19 @@ test('the key holds no judge label, so a failure judged again with another cell,
   assert.notEqual(keys[0], keys[1], 'a HIL cell is told apart by the signature collect.py prefixes with it')
 })
 
+test('one acceptance covers every failure its key names, such as two HIL cells failing the same way (#225)', async () => {
+  const esp = (cell, over) => ({ ...cellFailure(cell, 'rig-side'), signature: 'esptool 5.3.1 is installed; the runner needs esptool 5.2.0', ...over })
+  const accepted = { key: keyOf(esp('esp32s3')), reason: 'host esptool', scope: 'ci.lan' }
+  const both = await run({ ...redWith(RIG), judge: judgeWith([esp('esp32s3'), esp('p4')]), args: { acceptedFailures: [accepted] } })
+  assert.equal(both.result.pass, true, JSON.stringify(both.result.reason))
+  assert.deepEqual(both.result.acceptedFailures.map(f => [f.cell, f.key]), [['esp32s3', accepted.key], ['p4', accepted.key]])
+  // the key holds no cell, so a relabel or a cell gone keeps the acceptance (#36)
+  const relabeled = await run({ ...redWith(RIG), judge: judgeWith([esp('p4')]), args: { acceptedFailures: [accepted] } })
+  assert.equal(relabeled.result.pass, true, JSON.stringify(relabeled.result.reason))
+  const partial = await run({ ...redWith(RIG), judge: judgeWith([esp('esp32s3'), esp('p4', { complete: false })]), args: { acceptedFailures: [accepted] } })
+  assert.notEqual(partial.result.pass, true, 'each still needs a complete listing of its job')
+})
+
 test('only the exact failure is accepted: another diagnostic, another check or a second failure is not', async () => {
   for (const [failures, label] of [
     [[{ ...PVS, signature: 'license expired' }], 'a new diagnostic on the accepted check'],
@@ -2772,15 +2782,10 @@ test('a CI report for another head is not fixed, accepted or counted green', asy
   }
 })
 
-test('an acceptance needs a complete listing of the job and covers one failure', async () => {
-  for (const [failures, why] of [
-    [[{ ...PVS, complete: false }], /not accepted — the watcher did not list every failure of its job/],
-    [[PVS, { ...PVS, cell: 'arm' }], /not accepted — the same failure is listed 2 times; one acceptance covers one/],
-  ]) {
-    const { result, logs } = await run({ ...redWith(...failures), args: { acceptedFailures: [byKey()] } })
-    assert.notEqual(result.pass, true)
-    assert.ok(logs.some(l => why.test(l)), logs.join('\n'))
-  }
+test('an acceptance needs a complete listing of the job', async () => {
+  const { result, logs } = await run({ ...redWith({ ...PVS, complete: false }), args: { acceptedFailures: [byKey()] } })
+  assert.notEqual(result.pass, true)
+  assert.ok(logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), logs.join('\n'))
 })
 
 test('an acceptance not renewed on a resumed launch no longer applies, and says so', async () => {

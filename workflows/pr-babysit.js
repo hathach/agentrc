@@ -53,7 +53,8 @@ if (!Number.isInteger(ciWait) || ciWait < 1) {
 const acceptedArg = args.acceptedFailures ?? []
 const failureKey = (x) => JSON.stringify([x.workflow, x.job, x.cell, x.signature])
 // The 16-hex key a caller copies: 64-bit FNV-1a of the collector's workflow and check and the failure's signature, never the judge's
-// workflow, job or cell labels, which a re-judgement can change (#36). A HIL cell is in its signature, a matrix leg in its check name.
+// workflow, job or cell labels, which a re-judgement can change (#36). A HIL cell collect.py reads is in its signature, a matrix leg in
+// its check name; failures one key names, such as HIL rows collect.py does not read, share its acceptance (#225).
 const keyOf = (c, f) => {
   let h = 0xcbf29ce484222325n
   for (const ch of JSON.stringify([c.workflow, c.name, f.signature])) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
@@ -63,7 +64,7 @@ const keyed = (c, failures) => failures.map(f => ({ ...f, key: keyOf(c, f) }))
 const acceptedShaped = (a) => a && typeof a === 'object' && Object.keys(a).length === 3 && typeof a.key === 'string' && /^[0-9a-f]{16}$/.test(a.key) &&
   ['reason', 'scope'].every(k => typeof a[k] === 'string' && a[k].trim().length > 0)
 if (!Array.isArray(acceptedArg) || !acceptedArg.every(acceptedShaped) || new Set(acceptedArg.map(a => a.key)).size !== acceptedArg.length) {
-  throw new Error('acceptedFailures must be [{ key: the 16 hex a result shows beside the failure, reason, scope }], one per failure')
+  throw new Error('acceptedFailures must be [{ key: the 16 hex a result shows beside the failure, reason, scope }], one per key')
 }
 const allDeferrals = args.deferrals ?? []
 const ISSUE_URL = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/issues\/\d+$/
@@ -2674,14 +2675,11 @@ const runLanes = async (cycle, entry, lanes) => {
       return rearm()
     }
     c.realFailures.forEach((rf, i) => { rf.id = `ci:${i}:${rf.check}` })
-    // One acceptance covers one exact failure, and only when the watcher listed every failure of its job.
-    const seenTimes = (rf) => c.realFailures.filter(x => x.key === rf.key).length
+    // An acceptance covers each failure its key names (#225), and only when the watcher listed every failure of its job.
     for (const rf of c.realFailures) {
       const a = acceptedArg.find(x => x.key === rf.key)
       if (!a) continue
-      const why = !rf.complete ? 'the watcher did not list every failure of its job'
-        : seenTimes(rf) > 1 ? `the same failure is listed ${seenTimes(rf)} times; one acceptance covers one` : null
-      if (why) log(`cycle ${cycle}: ${rf.check} matches an accepted failure but is not accepted — ${why}`)
+      if (!rf.complete) log(`cycle ${cycle}: ${rf.check} matches an accepted failure but is not accepted — the watcher did not list every failure of its job`)
       else rf.accepted = { reason: a.reason, scope: a.scope }
     }
     for (const a of acceptedArg) {

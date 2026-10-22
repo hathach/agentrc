@@ -66,7 +66,8 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   a stored unclassified failure is judged again once the notes change.
 - `acceptedFailures`: `[{ key, reason, scope }]`, `key` the 16-hex one the
   result shows beside a failure: never fixed, and a run red only from them
-  passes, listing them. Per launch.
+  passes, listing them. A key covers every failure shown with it, such as
+  two HIL cells failing the same way. Per launch.
 - `deferrals`: `[{ findingId, commentDigest, issueUrl, reason }]`: valid
   findings left to an existing issue, answered with it, on the caller's word
   that the issue covers the finding; without `issueUrl`,
