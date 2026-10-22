@@ -107,11 +107,23 @@ class CliTest(unittest.TestCase):
         agents = [agent('w1:p1', os.getcwd(), 'claude'), agent('w1:p2', os.getcwd())]
         good = RESULT.format(id='w1:p1-7')
         for capture in (good.replace('STATUS: DONE', 'STATUS: DONE\nSTATUS: BLOCKED'),
-                        good.replace('FOR: w1:p1-7', 'FOR: w1:p1-7\nFOR: w1:p1-6')):
+                        good.replace('FOR: w1:p1-7', 'FOR: w1:p1-7\nFOR: w1:p1-6'),
+                        good.replace('FOR: w1:p1-7', 'FOR: w1:p1-7\nFOR:'),
+                        good.replace('FOR: w1:p1-7', 'FOR: w1:p1-7 extra')):
             with self.subTest(capture=capture):
                 rc, _, _ = run_main(['read', '--from', 'w1:p2', '--for', 'w1:p1-7'], agents, capture)
                 self.assertEqual(rc, peer.MALFORMED)
         self.assertEqual(run_main(['read', '--from', 'w1:p2', '--for', 'w1:p1-7'], agents, good)[0], 0)
+
+    def test_send_accepts_a_task_or_delta_quoting_a_bare_files_line(self):
+        agents = [agent('w1:p1', os.getcwd(), 'claude'), agent('w1:p2', os.getcwd())]
+        for extra in (['--task', 'the old request said:\nFILES:\nfix it'],
+                      ['--task', 'fix it', '--delta', 'the old request said:\nFILES:']):
+            with self.subTest(extra=extra):
+                rc, _, out = run_main(['send', '--to', 'w1:p2', '--files', 'src/a.c', '--dry-run', *extra],
+                                      agents)
+                self.assertEqual(rc, 0)
+                self.assertIn('FILES: src/a.c', out)
 
 
 class ExtractTest(unittest.TestCase):
@@ -276,6 +288,17 @@ class StrictnessTest(unittest.TestCase):
         self.assertTrue(any('FOR is blank' in p for p in peer.check('result', text)))
         body = peer.build_request('w1:p1-1', 'Claude, w1:p1', 'src/a.c', 'task').replace('ID: w1:p1-1', 'ID:')
         self.assertTrue(any('ID is blank' in p for p in peer.check('request', body)))
+
+    def test_a_blank_or_padded_extra_for_value_is_refused(self):
+        good = RESULT.format(id='w1:p1-9')
+        for for_lines, problem in (('FOR: w1:p1-9\nFOR:', 'FOR is blank'),
+                                   ('FOR: w1:p1-9 extra', 'FOR "w1:p1-9 extra" is not a single id')):
+            with self.subTest(for_lines):
+                text = good.replace('FOR: w1:p1-9', for_lines)
+                body, note = peer.extract_result(text, 'w1:p1-9')
+                self.assertIsNone(body)
+                self.assertEqual(note.status, peer.MALFORMED)
+                self.assertTrue(any(problem in p for p in peer.check('result', text)))
 
     def test_check_catches_a_terminator_for_another_envelope(self):
         text = RESULT.format(id='x').replace('END RESULT x', 'END RESULT y')

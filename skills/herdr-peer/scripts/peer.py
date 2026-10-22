@@ -188,8 +188,14 @@ def head_fields(kind, text):
 
 
 def result_ids(text):
-    """The distinct ids the FOR lines of a result envelope's head name."""
-    return sorted({v.split()[0] for v in head_fields('result', text).get('FOR', []) if v})
+    """The distinct values, verbatim, of the FOR lines of a result envelope's head."""
+    return sorted(set(head_fields('result', text).get('FOR', [])))
+
+
+def claims(ids, req_id):
+    """Whether FOR values claim req_id; one with words after it still does, so
+    the envelope is called malformed instead of skipped as another round's."""
+    return any(v.split()[:1] == [req_id] for v in ids)
 
 
 def extract_result(text, req_id):
@@ -216,12 +222,12 @@ def extract_result(text, req_id):
     matching = []
     for body in blocks:
         ids = result_ids(body)
-        if req_id not in ids:
+        if not claims(ids, req_id):
             continue
-        if len(ids) > 1:
-            return None, Note(f'an envelope answering {req_id} also says FOR: '
-                              f'{", ".join(i for i in ids if i != req_id)}; it must name one id',
-                              MALFORMED)
+        if ids != [req_id]:
+            given = ' and '.join(f'"{i}"' for i in ids)
+            return None, Note(f'an envelope answering {req_id} gives FOR as {given}; '
+                              f'it must name {req_id} alone', MALFORMED)
         end = END_ID.search(body.rsplit('\n', 1)[-1])
         if not end or end.group(1) != req_id:
             return None, Note(f'an envelope says FOR: {req_id} but closes with '
@@ -237,7 +243,7 @@ def extract_result(text, req_id):
     if matching:
         # The complete one need not be the answer: a rerun of the same id may be
         # streaming right now, so this is the duplicate case caught mid-write.
-        if partial and req_id in result_ids(partial):
+        if partial and claims(result_ids(partial), req_id):
             return None, Note(f'a complete envelope answers {req_id} and another for the '
                               'same id is still being written; resolve by hand', MALFORMED)
         return matching[0], None
@@ -245,9 +251,9 @@ def extract_result(text, req_id):
         return None, Note('an envelope began but this capture holds no END RESULT for it: '
                           'it may still be streaming, or be beyond the line window', NO_ANSWER)
     if blocks:
-        seen = sorted({i for body in blocks for i in result_ids(body)})
+        seen = sorted({i for body in blocks for i in result_ids(body) if i})
         if not seen:
-            return None, Note('a complete envelope is present but carries no FOR line; '
+            return None, Note('a complete envelope is present but carries no FOR id; '
                               'it is malformed', MALFORMED)
         return None, Note(f'this capture holds no envelope for {req_id}; '
                           f'it answers {", ".join(seen)}', NO_ANSWER)
@@ -257,12 +263,13 @@ def extract_result(text, req_id):
 def check(kind, text):
     """Shape only. Says nothing about whether the content is true. A result's
     fields come from its head (head_fields), so its answer may quote field
-    lines; a request's from anywhere, since its DELTA and TASK may span lines."""
+    lines; a request's from the first line naming each, since its DELTA and
+    TASK may span lines and quote a field line below the header's."""
     problems = []
     if not re.search(LEAD + re.escape(MARKER[kind]), text):
         problems.append(f'missing the {kind} header line')
     fields = head_fields(kind, text) if kind == 'result' else {
-        f: re.findall(LEAD + f + r':[ \t]*(.*?)[ \t]*$', text, re.M) for f in FIELDS[kind]}
+        f: re.findall(LEAD + f + r':[ \t]*(.*?)[ \t]*$', text, re.M)[:1] for f in FIELDS[kind]}
     for field in FIELDS[kind]:
         if not fields.get(field):
             problems.append(f'missing required field {field}')
@@ -272,20 +279,24 @@ def check(kind, text):
 
     marker = TERMINATOR[kind]
     close = re.search(LEAD + marker + r'\s+(\S+)', text, re.M)
-    opened = (fields.get(FIELDS[kind][0]) or [''])[0].split()[:1]
-    if fields.get(FIELDS[kind][0]) and not opened:
-        problems.append(f'{FIELDS[kind][0]} is blank; it carries the envelope id')
+    id_field = FIELDS[kind][0]
+    ids = fields.get(id_field, [])
+    if '' in ids:
+        problems.append(f'{id_field} is blank; it carries the envelope id')
+    problems += [f'{id_field} "{v}" is not a single id'
+                 for v in sorted(set(ids)) if v and v.split() != [v]]
+    opened = next((v.split()[0] for v in ids if v), None)
     if not close:
         problems.append(f'missing the closing {marker} <id> line')
-    elif opened and opened[0] != close.group(1):
-        problems.append(f'{marker} names {close.group(1)} but the envelope is {opened[0]}')
+    elif opened and opened != close.group(1):
+        problems.append(f'{marker} names {close.group(1)} but the envelope is {opened}')
 
     if kind == 'result':
         statuses = sorted(set(fields.get('STATUS', [])))
         problems += [f'STATUS "{s}" is not one of {", ".join(STATUSES)}'
                      for s in statuses if s not in STATUSES]
-        ids = sorted({v.split()[0] for v in fields.get('FOR', []) if v})
-        for field, values in (('FOR', ids), ('STATUS', statuses)):
+        fors = sorted({v for v in fields.get('FOR', []) if v})
+        for field, values in (('FOR', fors), ('STATUS', statuses)):
             if len(values) > 1:
                 problems.append(f'the envelope gives {field} as both {" and ".join(values)}')
     return problems
