@@ -17,26 +17,30 @@ def setUpModule():
     guard_survivors(__name__)
 
 
+# Absolute on every platform: on Windows a drive-less '/w' is drive-relative, so no peer cwd.
+W, OTHER = os.path.abspath(os.sep + 'w'), os.path.abspath(os.sep + 'other')
+
+
 def agent(pane, cwd, kind='codex'):
     return {'pane_id': pane, 'cwd': cwd, 'agent': kind, 'agent_status': 'idle'}
 
 
 class FindPeersTest(unittest.TestCase):
-    def _find(self, agents, cwd='/w', me='w1:p1'):
+    def _find(self, agents, cwd=W, me='w1:p1'):
         with mock.patch.dict('os.environ', {'HERDR_ENV': '1'}), \
              mock.patch.object(peer, 'herdr', return_value={'result': {'agents': agents}}):
             return peer.find_peers(cwd=cwd, me=me)
 
     def test_excludes_self(self):
-        found = self._find([agent('w1:p1', '/w', 'claude'), agent('w1:p2', '/w')])
+        found = self._find([agent('w1:p1', W, 'claude'), agent('w1:p2', W)])
         self.assertEqual([p['pane_id'] for p in found], ['w1:p2'])
 
     def test_excludes_other_worktrees(self):
-        found = self._find([agent('w2:p1', '/other'), agent('w1:p2', '/w')])
+        found = self._find([agent('w2:p1', OTHER), agent('w1:p2', W)])
         self.assertEqual([p['pane_id'] for p in found], ['w1:p2'])
 
     def test_reports_every_candidate_rather_than_choosing(self):
-        found = self._find([agent('w1:p2', '/w'), agent('w1:p3', '/w')])
+        found = self._find([agent('w1:p2', W), agent('w1:p3', W)])
         self.assertEqual(len(found), 2)
 
     def test_a_record_without_an_absolute_cwd_or_a_pane_id_is_no_peer(self):
