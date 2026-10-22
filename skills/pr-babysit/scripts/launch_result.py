@@ -20,6 +20,8 @@ passes unchanged, read from the --state-ref output when the launch returned no s
 trusting or continuing the launch, a spent cycle budget and a refused launch
 included, the latter with the caller's response, and a stop another launch on the same state would repeat,
 with what must change first; `notes` what is absent but harmless.
+`findingsTable` is the launch's findings and CI failures as one Markdown table, a row each, with its outcome, commit
+and reply, under a coverage line naming a lane the launch did not observe; an older output without rows says so.
 A launch that stopped on a merged or closed PR is terminal: a note says so, and a
 spent budget is no blocker.
 `logs` leaves out lines another field carries whole and folds repeated ones into one.
@@ -247,6 +249,61 @@ def pinned_by(ref, notes):
     return config
 
 
+GATES = {'sonarGate': 'SonarCloud gate', 'greptileGate': 'Greptile confidence gate'}
+CI_LEFT = {'rigSide': 'left red for the rig', 'unclassified': 'left red: not placed by its evidence'}
+TABLE_CUT = 90
+
+
+def md_cell(text, cut_at=TABLE_CUT):
+    text = ' '.join(str(text if text is not None else '').split()).replace('\\', '\\\\').replace('|', '\\|')
+    return (text if len(text) <= cut_at else text[:cut_at - 1] + '…') or '-'
+
+
+def outcome(row):
+    """A row's outcome in words: its repair for a valid finding or a real CI failure, else what was decided."""
+    state, repair = row.get('state'), row.get('repair')
+    if repair:
+        text = repair.get('outcome', '?') + (f": {repair['detail']}" if repair.get('detail') else '')
+        text += ', since already fixed' if row.get('laterState') == 'stale' else ''
+    elif row.get('lane') == 'ci':
+        text = (f"accepted: {row.get('accepted')}" if state == 'accepted' else f'left red: the {GATES[state]}' if state in GATES
+                else CI_LEFT.get(state, state or '?'))
+    else:
+        text = {'stale': 'already fixed', 'invalid': 'refuted', 'refuted': 'refuted',
+                'deferred': f"deferred: {row.get('deferral') or 'the PR owner\'s decision'}", 'held': f"held: {row.get('hold')}"}.get(state, state or '?')
+    return ('comment edited since; ' if row.get('edited') else '') + text
+
+
+def reply_text(reply):
+    if not reply:
+        return '-'
+    how = {'refutedPosts': 'refutation', 'deferralPosts': 'deferral', 'fixNotePosts': 'fix note'}.get(reply.get('how'), reply.get('how'))
+    return ' '.join(x for x in (how, str(reply['replyId']) if reply.get('replyId') else '', 'settled' if reply.get('settled') else
+                                f"not settled: {reply.get('error') or 'unknown'}") if x)
+
+
+def findings_table(rollup):
+    """The launch's rows as Markdown under a coverage line; never an empty table read as a clean launch."""
+    if not isinstance(rollup, dict):
+        return 'findings unavailable'
+    if 'rows' not in rollup:
+        return 'findings unavailable (older output)'
+    rows, observed = rollup.get('rows') or [], rollup.get('observed') or {}
+    coverage = []
+    for lane, key, name in (('review', 'reviews', 'reviews'), ('ci', 'ci', 'CI')):
+        count = sum(r.get('lane') == lane for r in rows)
+        coverage.append(f'{name}: {count} row(s)' if count else f'{name}: no findings reported' if observed.get(key) else f'{name} not observed')
+    if not rows:
+        return '; '.join(coverage)
+    head = ['Source', 'Where', 'Finding', 'Verdict', 'Outcome', 'Commit', 'Reply']
+    body = [[md_cell(r.get('source'), 24), md_cell(r.get('at') if r.get('lane') == 'review' else r.get('cell'), 40),
+             md_cell(r.get('claim') if r.get('lane') == 'review' else r.get('firstError')), md_cell(r.get('verdict'), 12),
+             md_cell(outcome(r)), md_cell((r.get('repair') or {}).get('sha'), 40), md_cell(reply_text(r.get('reply')), 60)] for r in rows]
+    width = [max(len(c) for c in col) for col in zip(head, *body)]
+    line = lambda cells: '| ' + ' | '.join(c.ljust(w) for c, w in zip(cells, width)) + ' |'
+    return '\n'.join(['; '.join(coverage), '', line(head), line(['-' * w for w in width]), *map(line, body)])
+
+
 def checkout(path):
     return {'branch': git('-C', path, 'rev-parse', '--abbrev-ref', 'HEAD').strip(),
             'head': git('-C', path, 'rev-parse', 'HEAD').strip(),
@@ -256,7 +313,7 @@ def checkout(path):
 def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     blockers, notes = [], []
     summary = {'launch': None, 'result': None, 'stateRef': None, 'budget': None, 'pinned': None, 'observation': None, 'receipts': None,
-               'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
+               'findingsTable': 'findings unavailable', 'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
     result = output.get('result') if output else None
     if output is None:
         blockers.append('the output file is empty: the launch threw before returning a result (its error is in the Workflow tool result)')
@@ -267,6 +324,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             blockers.append('the output carries no result object')
     if isinstance(result, dict):
         summary['result'] = {k: v for k, v in result.items() if k not in CONDENSED}
+        summary['findingsTable'] = findings_table(result.get('rollup'))
         if result.get('state') and result.get('stateDigest'):
             summary['stateRef'] = {'outputFile': output_path, 'digest': result['stateDigest']}
             used, most = result['state'].get('cyclesUsed'), result['state'].get('maxCycles')

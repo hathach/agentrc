@@ -113,6 +113,40 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['logs'][-1], '(1 "not fixing" CI failure lines, one per failure listed under ci)')
         self.assertTrue(s['logs'][1].endswith('whole line in the output\'s logs)'))
 
+    def test_the_findings_table_quotes_every_row_with_its_outcome(self):
+        sha = 'c' * 40
+        rows = [
+            {'lane': 'review', 'source': 'greptile', 'at': 'a.c:3', 'claim': 'pipe | back\\slash\nnewline ' + 'x' * 200, 'verdict': 'valid', 'state': 'valid',
+             'repair': {'outcome': 'pushed', 'sha': sha}, 'laterState': 'stale', 'reply': {'how': 'fixNotePosts', 'replyId': 9, 'settled': True}},
+            {'lane': 'review', 'source': 'coderabbit', 'at': 'b.c:1', 'claim': 'old body', 'verdict': 'invalid', 'state': 'refuted', 'repair': None,
+             'edited': True, 'reply': {'how': 'refutedPosts', 'replyId': None, 'settled': False, 'error': 'offered, no receipt shows it posted'}},
+            {'lane': 'review', 'source': 'coderabbit', 'at': 'c.c:2', 'claim': 'later', 'verdict': 'valid', 'state': 'deferred', 'deferral': None, 'repair': None},
+            {'lane': 'review', 'source': 'coderabbit', 'at': 'd.c:2', 'claim': 'x', 'verdict': 'valid', 'state': 'valid',
+             'repair': {'outcome': 'committed, not pushed', 'sha': sha, 'detail': 'rejected'}},
+            {'lane': 'ci', 'source': 'ci:build', 'cell': 'f072 cdc', 'firstError': 'boom', 'verdict': 'real', 'state': 'greptileGate', 'repair': None},
+            {'lane': 'ci', 'source': 'ci:lint', 'cell': None, 'firstError': 'E1', 'verdict': 'real', 'state': 'accepted', 'accepted': 'known', 'repair': None},
+        ]
+        table = launch_result.findings_table({'rows': rows, 'observed': {'reviews': True, 'ci': True}}).split('\n')
+        self.assertEqual(table[0], 'reviews: 4 row(s); CI: 2 row(s)')
+        self.assertEqual(len(table), 3 + 1 + len(rows))
+        first = table[4]
+        self.assertIn('pipe \\| back\\\\slash newline', first, 'escaped, on one line')
+        self.assertIn('…', first, 'a long claim is cut')
+        self.assertIn(f'pushed, since already fixed | {sha}', ' '.join(first.split()), 'the full SHA, kept through a later stale')
+        self.assertIn('fix note 9 settled', first)
+        self.assertIn('comment edited since; refuted', table[5])
+        self.assertIn('refutation not settled: offered, no receipt shows it posted', table[5])
+        self.assertIn("deferred: the PR owner's decision", table[6])
+        self.assertIn('committed, not pushed: rejected', table[7])
+        self.assertIn('left red: the Greptile confidence gate', table[8])
+        self.assertIn('accepted: known', table[9])
+        for row in table[2:]:
+            self.assertEqual(row.count(' | '), 6, row)
+        self.assertEqual(launch_result.findings_table({'rows': [], 'observed': {'reviews': True, 'ci': False}}), 'reviews: no findings reported; CI not observed')
+        self.assertEqual(launch_result.findings_table({'cycles': [1]}), 'findings unavailable (older output)')
+        rc, s = self.run_it(output())
+        self.assertEqual(s['findingsTable'], 'findings unavailable (older output)', 'the fixture predates rows')
+
     def test_a_failure_is_settled_by_the_state_the_workflow_gave_it_not_its_verdict(self):
         gate = {**failure('gate', verdict='rig-side'), 'check': 'SonarCloud Code Analysis', 'workflow': '', 'cell': None, 'state': 'sonarGate'}
         o = output()

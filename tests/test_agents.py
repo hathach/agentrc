@@ -170,6 +170,7 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(phrase, rules)
         self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
         self.assertIn('Merging stays off. My own words asking to merge a named PR', rules)
+        self.assertIn("Each pr-babysit launch gets a `Findings` subsection holding its reading's `findingsTable` verbatim", body)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '
                       'until the task is done, the PR changes, or the human narrows or withdraws it', readme)

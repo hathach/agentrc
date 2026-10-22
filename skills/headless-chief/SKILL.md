@@ -60,9 +60,9 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    or with `cost none` and why.
    Open the message that reports the exit, with or without `report.md`, with
    the target, and, unasked, relay verbatim the Launches
-   table with its State line and chief's `Worth a look:` line, the Usage table
-   and chief's decisions for the user; a row that dwarfs the work it did is worth
-   a word.
+   table with its State line and chief's `Worth a look:` line, the Usage table,
+   each launch's `Findings` table from chief's report and chief's decisions for
+   the user; a row that dwarfs the work it did is worth a word.
    The exit code, the number on the `launcher: exit` line, says how the run
    ended, not whether the task passed:
 

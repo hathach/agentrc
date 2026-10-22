@@ -909,34 +909,104 @@ const gateOf = (rf) => rf.workflow ? null : GATES.find(g => g.match(rf.check))?.
 const GATE_LABEL = Object.fromEntries(GATES.map(g => [g.key, g.label]))
 const ciState = (rf) => rf.accepted ? 'accepted'
   : gateOf(rf) ?? (rf.verdict === 'rig-side' ? 'rigSide' : rf.verdict === 'unclassified' ? 'unclassified' : 'real')
+// A finding's or CI failure's repair in one cycle, fixCell's outcomes as data; a commit SHA only where one is recorded.
+const repairOf = (fixes, id, push, pushFailed) => {
+  if (!fixes) return { outcome: 'no fix attempted' }
+  const fix = fixes.find(x => x.ids.includes(id))
+  if (!fix) {
+    const rejected = fixes.flatMap(x => x.rejected).find(r => r.id === id)
+    return rejected ? { outcome: 'rejected by the writer', detail: rejected.evidence } : { outcome: 'withheld' }
+  }
+  if (fix.addresses !== true) return { outcome: 'unverified', detail: fix.checkReason }
+  const sha = (p) => /^[0-9a-f]{7,40}$/.test(String(p.sha || '').trim()) ? String(p.sha).trim() : null
+  if (pushFailed) {
+    if (pushFailed.committed === null) return { outcome: 'commit outcome unknown', detail: pushFailed.detail }
+    if (!pushFailed.committed) return { outcome: 'commit failed', detail: pushFailed.detail }
+    return { outcome: pushFailed.published === 'unknown' ? 'committed, publication unknown' : 'committed, not pushed', sha: sha(pushFailed), detail: pushFailed.detail }
+  }
+  return push ? { outcome: 'pushed', sha: sha(push) } : { outcome: 'uncommitted' }
+}
+const POST_BATCHES = ['refutedPosts', 'deferralPosts', 'fixNotePosts']
+// cycle -> the findings a usable review report harvested, before those answered by hand are dropped: what the findings rows show.
+const reviewedCycles = new Map()
+// The last reply this launch posted or settled on a comment as it read at digest, joined by that digest, never by the
+// reply's own: a post batch answers the comment as its own cycle harvested it, a caller's settlement the digest it was given.
+const replyRow = (cycles, commentId, digest, edited) => {
+  let got = null
+  for (const e of cycles) {
+    if (!(reviewedCycles.get(e.cycle) || []).some(f => f.commentId === commentId && f.commentDigest === digest)) continue
+    for (const kind of POST_BATCHES) {
+      const p = e[kind]
+      const r = p && (p.receipts || []).find(x => x.commentId === commentId)
+      if (r) got = { how: kind, cycle: e.cycle, replyId: r.replyId, settled: (p.replied || []).includes(commentId), ...(r.error ? { error: r.error } : {}) }
+    }
+  }
+  const s = [...settlements].reverse().find(x => x.commentId === commentId && settlementsArg.some(a => a.commentId === commentId && a.commentDigest === digest))
+  if (s) got = { how: 'caller', replyId: s.replyId ?? null, settled: s.outcome === 'settled', ...(s.outcome !== 'settled' ? { error: `${s.outcome}: ${s.why}` } : {}) }
+  // A reply offered with no receipt to show for it: its POST may or may not have landed.
+  const a = (debt.get(commentId) || {}).attempt
+  if (!got && a && a.digest === digest) got = { how: a.how, replyId: null, settled: false, error: 'offered, no receipt shows it posted' }
+  // A handoff outranks any earlier answer of ours on the body it concerns, its digest, else the comment as it reads now:
+  // a correction or a rejudge found it owed again.
+  const handed = (debt.get(commentId) || {}).digest
+  if (handedOff(commentId) && (handed !== undefined ? handed === digest : !edited) && !(got && got.how === 'caller' && got.settled)) return { how: 'handed to the caller', replyId: got ? got.replyId : null, settled: false, error: handoffWhy(commentId) }
+  if (got) return got
+  const earlier = answeredWith.get(commentId)
+  return earlier && earlier.digest === digest ? { how: earlier.how === 'byHand' ? 'by hand' : `${earlier.how}, earlier`, replyId: null, settled: true } : null
+}
 const launchRollup = () => {
   const findings = new Map()
   const ci = new Map()
   const pushed = []
   const reran = new Set()
+  // The launch's findings one row each: a review finding per id and comment digest, a CI failure per failureKey.
+  const rows = new Map()
   let replies = 0
+  const cycles = history.slice(launchFrom)
   const fixedBy = (fixes, id, push) => !!(push && fixes && fixes.some(x => x.ids.includes(id) && x.addresses === true))
-  for (const e of history.slice(launchFrom)) {
+  // A later cycle's `stale` (the fix already landed) keeps the repair that made it so.
+  const row = (key, fields, repair, cycle) => {
+    const prior = rows.get(key)
+    const keep = prior && prior.repair && fields.state === 'stale'
+    rows.set(key, { ...(keep ? { ...prior, laterState: 'stale' } : { ...fields, repair, repairCycle: repair ? cycle : prior ? prior.repairCycle : null }),
+      edited: prior ? prior.edited : false, lastCycle: cycle })
+  }
+  for (const e of cycles) {
     for (const f of (e.reviews && e.reviews.findings) || []) {
       const state = findingState(f)
       const now = state !== 'valid' ? state : fixedBy(e.reviewFixes, f.findingId, e.reviewPush) ? 'fixed' : 'open'
       if (!(now === 'stale' && findings.get(f.findingId) === 'fixed')) findings.set(f.findingId, now)
     }
+    for (const f of reviewedCycles.get(e.cycle) || []) {
+      const state = findingState(f)
+      const key = `review ${f.findingId} ${f.commentDigest}`
+      for (const r of rows.values()) if (r.lane === 'review' && r.commentId === f.commentId && r.commentDigest !== f.commentDigest) r.edited = true
+      row(key, { lane: 'review', source: f.source, findingId: f.findingId, commentId: f.commentId, commentDigest: f.commentDigest,
+        at: `${f.file}:${f.line}`, claim: String(f.claim).slice(0, 200), verdict: f.overturned ? 'overturned' : f.verdict, state,
+        ...(state === 'deferred' ? { deferral: f.deferral.issueUrl || null } : {}), ...(state === 'held' ? { hold: f.hold } : {}) },
+      state === 'valid' ? repairOf(e.reviewFixes, f.findingId, e.reviewPush, e.reviewPushFailed) : null, e.cycle)
+    }
     for (const rf of (e.ci && e.ci.realFailures) || []) {
       const state = ciState(rf)
       ci.set(failureKey(rf), state !== 'real' ? state : fixedBy(e.ciFixes, rf.id, e.ciPush) ? 'fixed' : 'open')
+      row(`ci ${failureKey(rf)}`, { lane: 'ci', source: `ci:${rf.check}`, check: rf.check, cell: rf.cell ?? null,
+        firstError: String(rf.firstError || '').slice(0, 200), verdict: rf.verdict, state, ...(state === 'accepted' ? { accepted: rf.accepted.reason } : {}) },
+      state === 'real' ? repairOf(e.ciFixes, rf.id, e.ciPush, e.ciPushFailed) : null, e.cycle)
     }
     for (const r of (e.ci && e.ci.infraRerun) || []) reran.add(r)
     if (e.adoption && e.adoption.publication === 'pushed') pushed.push(e.adoption.to.slice(0, 8))
     for (const p of [e.reviewPush, e.ciPush]) if (shaOf(p) !== '-') pushed.push(shaOf(p))
     for (const p of [e.refutedPosts, e.deferralPosts, e.fixNotePosts]) replies += ((p && p.replied) || []).length
   }
+  for (const r of rows.values()) if (r.lane === 'review') r.reply = replyRow(cycles, r.commentId, r.commentDigest, r.edited)
   const tally = (m, keys) => Object.fromEntries([['total', m.size], ...keys.map(k => [k, [...m.values()].filter(v => v === k).length])])
   return {
-    cycles: history.slice(launchFrom).map(e => e.cycle),
+    cycles: cycles.map(e => e.cycle),
     findings: tally(findings, ['fixed', 'open', 'refuted', 'stale', 'deferred', 'held']),
     ci: tally(ci, ['fixed', 'open', 'accepted', ...GATES.map(g => g.key), 'rigSide', 'unclassified']),
     ciChecks: { ...ciChecks }, reran: reran.size, pushed, replies,
+    rows: [...rows.values()],
+    observed: { reviews: cycles.some(e => reviewedCycles.has(e.cycle)), ci: cycles.some(e => !!e.ci) },
   }
 }
 const actionsOf = (e) => ({
@@ -2277,6 +2347,7 @@ const runLanes = async (cycle, entry, lanes) => {
         return stop(cycle, 'review-report-unusable', { detail: why })
       }
     }
+    if (reviewLane) reviewedCycles.set(cycle, r.findings)
     entry.bots = r === nobody
       ? (reviewLane ? { waitedMin: 0, since: null, clock: null, bots: [] } : null)
       : settleBots(r)

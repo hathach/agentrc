@@ -967,11 +967,61 @@ test('the summary tables every verdict, fix and pushed SHA', async () => {
   assert.deepEqual([rows[1][4], rows[2][4]], ['-', '-'], 'only fixed findings carry a commit')
   assert.match(rows[2][1], /refuted \\\| with a pipe/, 'a pipe in a claim is escaped, not table-breaking')
   assert.equal(result.history[0].reviewPush.sha, shaFor(1))
-  assert.deepEqual(result.rollup, {
+  const { rows: found, observed, ...tallies } = result.rollup
+  assert.deepEqual(tallies, {
     cycles: [1], findings: { total: 3, fixed: 1, open: 0, refuted: 1, stale: 1, deferred: 0, held: 0 },
     ci: { total: 0, fixed: 0, open: 0, accepted: 0, sonarGate: 0, greptileGate: 0, rigSide: 0, unclassified: 0 }, ciChecks: { judged: 0, partial: 0, reused: 0, unchanged: 0 },
     reran: 0, pushed: [shaFor(1).slice(0, 8)], replies: 3,
   })
+  assert.deepEqual(observed, { reviews: true, ci: true })
+  const byId = Object.fromEntries(found.map(r => [r.findingId, r]))
+  assert.deepEqual(byId['1#1'], { lane: 'review', source: 'coderabbit', findingId: '1#1', commentId: 1, commentDigest: 'd1', at: 'src/a.c:1', claim: 'real bug',
+    verdict: 'valid', state: 'valid', repair: { outcome: 'pushed', sha: shaFor(1) }, repairCycle: 1, edited: false, lastCycle: 1,
+    reply: { how: 'fixNotePosts', cycle: 1, replyId: result.history[0].fixNotePosts.receipts[0].replyId, settled: true } }, 'the full SHA it was pushed in, and its fix note')
+  assert.deepEqual([byId['3#3'].state, byId['3#3'].repair, byId['3#3'].reply.how, byId['2#2'].state, byId['2#2'].reply.how],
+    ['refuted', null, 'refutedPosts', 'stale', 'refutedPosts'])
+})
+
+test('findings rows: a fix keeps its commit through a later stale, an edit is a new row, a resumed launch shows its own cycles', async () => {
+  let cycle = 0
+  const fixedThenStale = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ({ findings: [finding({ verdict: ++cycle === 1 ? 'valid' : 'stale' })], replies: [], bots: 'reviewed' }),
+  })
+  const [row] = fixedThenStale.result.rollup.rows
+  assert.deepEqual([row.state, row.laterState, row.repair, row.repairCycle, row.lastCycle], ['valid', 'stale', { outcome: 'pushed', sha: shaFor(1) }, 1, 2])
+  cycle = 0
+  const edited = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ({ findings: [finding({ commentDigest: ++cycle === 1 ? 'old' : 'new' })], replies: [], bots: 'reviewed' }),
+  })
+  assert.deepEqual(edited.result.rollup.rows.map(r => [r.commentDigest, r.edited, r.repair.outcome, r.repairCycle]),
+    [['old', true, 'pushed', 1], ['new', false, 'pushed', 2]], 'the edited body is its own row')
+  cycle = 0
+  const renumbered = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ({ findings: [++cycle === 1 ? finding() : finding({ line: 2, commentDigest: 'new' })], replies: [], bots: 'reviewed' }),
+  })
+  assert.deepEqual(renumbered.result.rollup.rows.map(r => [r.findingId, r.edited]), [['1#1', true], ['1#2', false]], 'an edit that renumbers its points')
+  cycle = 0
+  const answeredThenEdited = await run({
+    args: { autoPush: true, maxCycles: 2 },
+    reviewsPerCycle: () => ++cycle === 1 ? oneValid : { findings: [invalidFinding({ commentDigest: 'edited' })], replies: [], bots: 'reviewed' },
+  })
+  assert.deepEqual(answeredThenEdited.result.handoffs.map(h => h.commentId), [1])
+  assert.deepEqual(answeredThenEdited.result.rollup.rows.map(r => [r.commentDigest, r.reply.how, r.reply.settled]),
+    [['d1', 'fixNotePosts', true], ['edited', 'handed to the caller', false]], 'the edit hands off the new body; the old one keeps its reply')
+  const dry = await run({ args: { autoPush: false, maxCycles: 1 }, reviews: oneValid })
+  assert.deepEqual(dry.result.rollup.rows[0].repair, { outcome: 'uncommitted' }, 'a dry run leaves the fix uncommitted')
+  const red = redWith(RIG, PVS, UNPLACED).ci
+  const first = await run({ args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
+  assert.deepEqual(first.result.rollup.rows.map(r => [r.lane, r.state, r.repair]).sort(),
+    [['ci', 'accepted', null], ['ci', 'rigSide', null], ['ci', 'unclassified', null]])
+  assert.equal(first.result.rollup.rows.find(r => r.state === 'accepted').accepted, byKey().reason)
+  const again = await run({ args: { ...YIELD, state: first.result.state, acceptedFailures: [byKey()] }, reviews: WAITING, ci: red })
+  assert.deepEqual([...new Set(again.result.rollup.rows.map(r => r.lastCycle))], [2], "the carried cycle is the previous launch's")
+  const ciOnly = await run({ args: { ...YIELD, lane: 'ci' }, ci: red })
+  assert.deepEqual(ciOnly.result.rollup.observed, { reviews: false, ci: true })
 })
 
 test('a launch rollup counts its own cycles, each finding and CI failure once', async () => {
@@ -3051,6 +3101,7 @@ test('a publisher agent that throws is a failed push, not a crash', async () => 
     assert.equal(result.history[0].reviewPushFailed.detail, detail)
     assert.equal(result.history[0].reviewPushFailed.committed, committed)
     assert.match(rowsOf(summaries(logs)[0])[0][3], row, throwOn)
+    assert.equal(result.rollup.rows[0].repair.outcome, { 'recheck#': 'commit failed', 'commit#': 'commit outcome unknown', 'push#': 'committed, publication unknown' }[throwOn], throwOn)
     if (throwOn === 'push#') assert.equal(result.state.pending.stage, 'publication-unknown')
   }
 })
@@ -3683,6 +3734,7 @@ const reanswered = async () => {
   const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
   const seen = await run({ reviews: edited, preflight: at, args: { ...YIELD, state: first.result.state } })
   assert.deepEqual(seen.result.handoffs.map(h => h.commentId), [1])
+  assert.deepEqual(seen.result.rollup.rows.map(r => [r.commentDigest, r.reply && r.reply.how]), [['edited', 'handed to the caller']])
   return { edited, at, state: seen.result.state, settlement: { commentId: 1, commentDigest: 'edited', replyId: 777, bodyDigest: 'abcd1234', headSha: at.head } }
 }
 
@@ -3692,6 +3744,8 @@ test('the caller\'s reply settles a handed-off comment once reply.py reads both 
   assert.deepEqual(payloadOf(calls.find(c => c.label === 'reuse#3').prompt, 'Reuses').reuses,
     [{ commentId: 1, replyId: 777, bodyDigest: 'abcd1234', originalDigest: 'edited' }])
   assert.deepEqual(result.settlements, [{ commentId: 1, outcome: 'settled', replyId: 777 }])
+  assert.deepEqual(result.rollup.rows.map(r => [r.commentDigest, r.reply]), [['edited', { how: 'caller', replyId: 777, settled: true }]],
+    "the settled comment keeps its row, with the caller's reply")
   assert.ok(logs.includes("cycle 3: comment 1 settled on the caller's reply 777"), logs.join('\n'))
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'nothing is posted for it')
   assert.equal(result.handoffs, undefined)
@@ -4777,6 +4831,8 @@ test('an explained flip on a posted refutation is fixed and handed to the caller
   assert.ok(logs.some(l => /1#1 was refuted in a posted reply and is valid now .* handed to the caller for a correction/.test(l)))
   const why = 'our posted refutation of 1#1 is wrong: 1#1 is valid now (the challenger: the caller does not check it on the ISR path)'
   assert.deepEqual(result.handoffs, [{ commentId: 1, commentDigest: 'd1', why }])
+  assert.deepEqual(result.rollup.rows[0].reply, { how: 'handed to the caller', replyId: null, settled: false, error: why },
+    'the row shows the correction owed, not our earlier refutation as settled')
   assert.notEqual(result.pass, true, 'an uncorrected refutation blocks the green exit')
   const resumed = await resumeAt(result.state, { reviews: { ...flipped, findings: [finding({ verdict: 'stale' })] }, args: { maxCycles: 6 } })
   assert.equal(resumed.result.corrections, undefined, 'reported once')
@@ -6636,6 +6692,7 @@ test('a harvest that leaves an auto-running bot unaccounted for is refused, not 
     assert.match(result.detail, why)
     assert.ok(logs.some(l => why.test(l) && l.startsWith('cycle 1: validator report unusable')))
     assert.equal(labels.some(l => l.startsWith('fix:') || l.startsWith('replies#')), false, 'nothing acted on')
+    assert.equal(result.rollup.observed.reviews, false, 'a refused report observed nothing')
   }
 })
 
@@ -7804,6 +7861,8 @@ test('a rejudge the user asked for hands an answered comment to the caller until
   const asked = await run({ reviews: quiet, preflight: at, args: { ...LONG, state: first.result.state, rejudge: [{ commentId: 1, reason }] } })
   assert.deepEqual(asked.result.handoffs, [{ commentId: 1, why: `the user asked to judge our answer again: ${reason}`, rejudge: { reason } }])
   assert.notEqual(asked.result.pass, true, 'an answer the user asked to judge again is still owed')
+  const rejudged = await run({ reviews: oneValid, preflight: at, args: { ...LONG, state: first.result.state, rejudge: [{ commentId: 1, reason }] } })
+  assert.equal(rejudged.result.rollup.rows[0].reply.how, 'handed to the caller', 'a rejudge outranks the fix note already posted')
   assert.equal(asked.calls.some(c => c.label.startsWith('replies#')), false, 'the run never answers it itself')
   // it stays without the argument, and through a harvest that judges the comment valid
   const later = await run({ reviews: quiet, preflight: at, args: { ...LONG, state: asked.result.state } })
