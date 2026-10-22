@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One esptool connection for a HIL runner (`hil` skill), run as its own child so the runner can time it out,
 kill it and see it survive: connect into download mode, run the ops in order, then reset or not. Stdlib only
-besides the esptool it drives, which must be ESPTOOL_VERSION: any other is refused before connecting.
+besides the esptool it drives, whose version the result line reports.
 
   esptool_session.py --port DEV --chip CHIP --baud N --after hard-reset|no-reset OPS.json
 
@@ -20,13 +20,8 @@ sys.dont_write_bytecode = True
 
 FILES = ()   # loads and launches nothing by path (hil_load.py)
 
-# the API this session is written against; 5.3.1 over 5.2.0 reads the ESP32-S31's SPI_BOOT_CRYPT_CNT and
-# SECURE_BOOT_EN at its eFuse table's bits (5.2.0 read the P4's) and loads the v2 flasher stub by default
-ESPTOOL_VERSION = '5.3.1'
-
-
 def security(esp):
-    """The chip's flash encryption and secure boot state from two sources, both on the ROM loader: esptool 5.3.1's
+    """The chip's flash encryption and secure boot state from two sources, both on the ROM loader: esptool's
     GET_SECURITY_INFO (loader.py get_security_info: flags bit 0 SECURE_BOOT_EN, flash_crypt_cnt enabled when its
     count of 1 bits is odd) and its eFuse register reads (targets/*.py get_flash_encryption_enabled,
     get_secure_boot_enabled; on the P4 EFUSE_RD_REPEAT_DATA1_REG [20:18] SPI_BOOT_CRYPT_CNT and
@@ -67,9 +62,6 @@ def main():
     results, esp = [], None
     try:
         import esptool
-        if esptool.__version__ != ESPTOOL_VERSION:
-            raise RuntimeError(f'esptool {esptool.__version__} is installed for {sys.executable}; '
-                               f'this session needs esptool {ESPTOOL_VERSION}')
         from esptool import cmds
         ops = json.load(open(args.ops))
         if any(op['op'] == 'security' for op in ops[1:]):

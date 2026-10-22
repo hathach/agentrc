@@ -17,7 +17,7 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'hil' / 'scripts' / 'e
 T = 30   # a bound no test here should reach
 
 STUB_ESPTOOL = {
-    'esptool/__init__.py': "import os\n__version__ = os.environ.get('STUB_VERSION', '5.3.1')\n",
+    'esptool/__init__.py': "__version__ = '5.3.1'\n",
     'esptool/cmds.py': textwrap.dedent('''
         import json, os
         LOG = os.environ['STUB_LOG']
@@ -89,14 +89,6 @@ class EsptoolSession(unittest.TestCase):
         self.assertEqual(calls[0], ['connect', '/dev/x', 'default-reset'])
         self.assertEqual(calls[2], ['baud', 921600])
         self.assertEqual(calls[-2], ['reset', 'hard-reset'])
-
-    def test_another_esptool_is_refused_before_connecting(self):
-        for version in ('5.2.0', '5.3.0', '5.3'):
-            with self.subTest(version):
-                code, out, calls = self.session([{'op': 'md5', 'addr': 0, 'size': 0x1000}], STUB_VERSION=version)
-                self.assertEqual((code, out['ok'], out['results'], calls), (1, False, [], []))
-                self.assertIn(f'esptool {version} is installed', out['error'])
-                self.assertIn('needs esptool 5.3.1', out['error'])
 
     def test_a_write_is_refused(self):
         code, out, calls = self.session([{'op': 'write', 'addr': 0x8000, 'file': str(self.tmp / 'seg.bin')}])
