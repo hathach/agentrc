@@ -243,6 +243,10 @@ class ChiefGuard(unittest.TestCase):
                          ('echo $((echo a) )', 'arithmetic'), ('((git push) )', 'arithmetic'),
                          ('echo $(( $(git status) ))', 'arithmetic'), ('echo $((1)', 'arithmetic'),
                          ('echo $(git status', 'open'), ('echo ${x', 'open'), ("echo $'a", 'never closes'),
+                         ('x=a; echo "${x/a/<(git push)}"', 'process substitution'),
+                         ('echo ${x/a/>(git push)}', 'process substitution'),
+                         ('echo ${y:-<(git push)}', 'process substitution'),
+                         ('echo ${y:-<<(git push)}', 'process substitution'),
                          ('echo `echo \\`date\\``', 'backtick'), ('echo `date', 'backtick'),
                          ('echo ' + '$(' * 9 + 'date' + ')' * 9, 'nested this deep')):
             with self.subTest(c=c):

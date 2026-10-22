@@ -303,6 +303,9 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
                              'the case as its own command')
             frames.append((sub, subs))
             out.append(UNKNOWN)
+        elif token in ('<(', '>(') and mode == 'param':
+            raise Denied('this guard does not read a process substitution inside `${...}`, which bash may run; run it '
+                         'as its own command, or dispatch the step to a unit')
         elif token == '$((' or token == '((' and shell:
             i = arithmetic(text, j)
             out.append(UNKNOWN if token == '$((' else ':')
