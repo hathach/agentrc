@@ -306,7 +306,9 @@ class Load(unittest.TestCase):
 
     def test_a_cross_thread_cycle_with_an_ordinary_import_ends(self):
         """Thread A loads a.py, which imports b; thread B imports b, which loads a.py. Each ends, with a
-        complete module or an error, never a partial one or a hang."""
+        complete module or an ImportError, never a partial one or a hang. Both may fail: since CPython
+        3.13.16 a thread whose waited-for import failed elsewhere retries it itself, closing the cycle in
+        one thread."""
         ctx = self.ctx(a_running=threading.Event(), b_running=threading.Event())
         a, b, c = self.name('cyc_a'), self.name('cyc_b'), self.name('ctx')
         pa = self.write('cyc_a.py', f'import sys\nctx = sys.modules[{c!r}]\nctx.a_running.set()\n'
@@ -322,9 +324,10 @@ class Load(unittest.TestCase):
         for out in (out_a, out_b):
             if 'value' in out:
                 self.assertTrue(out['value'].DONE)
+            else:
+                self.assertIsInstance(out['error'], ImportError)
         if 'value' in out_b:
             self.assertTrue(out_b['value'].A_DONE, 'b got a partially initialized a')
-        self.assertTrue('value' in out_a or 'value' in out_b, (out_a, out_b))
 
     def test_a_missing_file_is_refused_naming_it(self):
         with self.assertRaises(ImportError) as cm:
