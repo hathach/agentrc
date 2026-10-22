@@ -354,6 +354,61 @@ class Engine(unittest.TestCase):
         self.assertEqual(ctx.open_runs(), [])
         self.assertEqual((ctx.ledger[0]['cleanup'], ctx.ledger[0]['receipt']), ('done', None), 'a late answer still counts')
 
+    # --- a session the provider left running (ctx.retain) ---------------------------------------
+    def test_a_retained_session_is_pending_once_and_never_rechecked(self):
+        patch(self, eng.hil_process, 'recheck', lambda r: self.fail(f'rechecked {r!r}'))
+        ctx = eng.Context(self.args, str(self.state))
+        ctx.retain('openocd_esp session', [])
+        self.assertEqual(ctx.ledger, [], 'no receipts, no entry')
+        for _ in range(2):
+            ctx.retain('openocd_esp session', ['/s/r1.json'])
+        ctx.retain('openocd_esp session', [{'pid': 7, 'startTime': '1', 'log': '/s/l'}])
+        self.assertEqual([e['retained'] for e in ctx.ledger], [['/s/r1.json'], [{'pid': 7, 'startTime': '1', 'log': '/s/l'}]])
+        self.assertEqual({e['cleanup'] for e in ctx.open_runs()}, {'pending'})
+        with self.assertRaisesRegex(eng.Outstanding, 'openocd_esp session'):
+            ctx.run(['reset'], timeout=5)
+        self.assertEqual(self.ran, [])
+        with self.assertRaises(TypeError):
+            ctx.retain('openocd_esp session', [object()])
+
+    def test_a_retained_session_hands_the_board_to_a_cleanup_holder_naming_its_receipts(self):
+        receipts = ['/s/' + 'r' * 600 + '.json']     # past the detail's 500 characters
+        reset = self.p.reset
+
+        def retaining(ctx, board):
+            try:
+                return reset(ctx, board)
+            finally:
+                ctx.retain('openocd_esp session', receipts)
+        self.p.reset = retaining
+        patch(self, eng, 'HOLDER_READY', 5)
+        row = self.check()
+        self.assertEqual((row['status'], row['cleanup']['blocker'], row['cleanup']['retained']),
+                         ('blocked', 'cleanup-holder', receipts))
+        rec = lk.read_record('b')
+        self.assertTrue(lk.is_cleanup_holder(rec))
+        self.assertEqual(rec['retained'], receipts)
+        lk.release_token(row['cleanup']['token'])
+
+    def test_a_failed_handoff_keeps_the_retained_receipts_in_the_protected_record(self):
+        receipts = ['/s/r1.json', {'pid': 7, 'startTime': '1', 'log': '/s/l'}]
+        reset = self.p.reset
+
+        def retaining(ctx, board):
+            try:
+                return reset(ctx, board)
+            finally:
+                ctx.retain('openocd_esp session', receipts)
+        self.p.reset = retaining
+        patch(self, eng, 'HOLDER_READY', 1)
+        patch(self, lk, '_holder_argv', lambda job: ['/nonexistent/holder'])
+        row = self.check()
+        self.assert_failed_handoff(row)
+        self.assertEqual(row['cleanup']['retained'], receipts)
+        rec = lk.read_record('b')
+        self.assertEqual((rec['protected'], rec['retained']), (True, receipts))
+        self.assertNotIn('role', rec)
+
     # --- handing a survivor's board to a cleanup holder -----------------------------------------
     def handoff(self, argv=None, popen=None):
         """A reset that leaves a survivor (`pending`) with the holder's start replaced."""

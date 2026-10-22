@@ -48,7 +48,8 @@ Profile (a module; `__file__` names it in the report, with its digest):
       engine's state dir). A non-zero returncode is a failed reset; one that exits 0 without
       the target's answer in its transcript raises, carrying its `.operation`, which the row
       keeps. ctx.run raises `Outstanding` instead of starting a command while an earlier one
-      is not proven ended; the profile lets it propagate.
+      is not proven ended; the profile lets it propagate. A session the provider leaves
+      running outside ctx.run is reported with ctx.retain(detail, receipts).
   Optional: add_arguments(parser).
 
 main(profile, argv, lock_module=...) takes the project's own loaded hil_lock instance in
@@ -153,9 +154,9 @@ def _note_cleanup(entry: dict, source) -> None:
 
 
 class Context:
-    """What the profile's reset gets: `run` (call it as hil_flash's `run=`) and `args`. `ledger`
-    keeps every run's cleanup and receipt; a run is entered before it starts, so an interrupt
-    mid-call still counts."""
+    """What the profile's reset gets: `run` (call it as hil_flash's `run=`), `retain` and `args`.
+    `ledger` keeps every run's cleanup and receipt; a run is entered before it starts, so an
+    interrupt mid-call still counts."""
 
     def __init__(self, args, state_dir: str):
         self.args, self.state_dir = args, state_dir
@@ -187,6 +188,18 @@ class Context:
         """The runs not proven ended, after rechecking them within the reservation's RECHECK_WAIT."""
         self._recheck()
         return [e for e in self.ledger if e['cleanup'] != 'done']
+
+    def retain(self, detail: str, receipts) -> None:
+        """A session the profile's provider left running outside `run` (an openocd_esp server):
+        pending until the contract's recovery ends it, so nothing more starts on the board and
+        its lock passes to a cleanup holder. `receipts` (JSON values) are the provider's own,
+        never rechecked here; the row and the holder's record carry them whole. No receipts, no
+        entry; the same detail and receipts are entered once."""
+        receipts = list(receipts)
+        json.dumps(receipts)          # a TypeError now, not a finalization failure later
+        entry = {'cmd': detail, 'cleanup': 'pending', 'receipt': None, 'retained': receipts}
+        if receipts and entry not in self.ledger:
+            self.ledger.append(entry)
 
     def run(self, cmd, cwd=None, *, timeout, **kw) -> subprocess.CompletedProcess:
         if open_runs := self.open_runs():
@@ -356,8 +369,11 @@ def _finalize(fh, lock: str, ctx: Context, row: dict) -> None:
     ctx._recheck()
     open_ops = [e for e in ctx.ledger if e['cleanup'] != 'done']
     receipts = [e['receipt'] for e in open_ops if e['receipt'] is not None]
+    retained = [r for e in open_ops for r in e.get('retained', ())]
     cleanup = {'result': 'unresolved' if open_ops else 'release-failed', 'receipts': receipts, 'blocker': None,
-               'released': False, 'evidence': [f'not proven ended ({e["cleanup"]}): {e["cmd"]}' for e in open_ops]}
+               'released': False, 'evidence': [f'not proven ended ({e["cleanup"]}): {e["cmd"]}' for e in open_ops],
+               **({'retained': retained} if retained else {})}
+    extra = {'retained': retained} if retained else {}
     row['cleanup'] = cleanup
     if not open_ops:
         # proven clear through our own descriptor, while the flock is still ours
@@ -373,14 +389,14 @@ def _finalize(fh, lock: str, ctx: Context, row: dict) -> None:
     if any(e['cleanup'] == 'pending' for e in open_ops):
         try:     # fh was taken protected, as the handoff requires: a failure leaves a recovery blocker
             token = hil_lock.hand_to_cleanup_holder({lock: fh}, REASON, detail=detail, receipts=receipts,
-                                                    wait=HOLDER_READY, holder=HOLDER)
+                                                    wait=HOLDER_READY, holder=HOLDER, **extra)
         except KeyboardInterrupt:
             row['interrupted'] = True
         except hil_lock.LockUnavailable as e:
             cleanup['evidence'].append(str(e))
     else:
         with contextlib.suppress(OSError):
-            hil_lock.write_record(fh, REASON, protected=True, detail=detail, receipts=receipts)
+            hil_lock.write_record(fh, REASON, protected=True, detail=detail, receipts=receipts, **extra)
     if token:
         cleanup['blocker'], cleanup['token'] = 'cleanup-holder', token
         row['note'].append(f'cleanup holder (token {token}) keeps the board for recovery, which ends it with '

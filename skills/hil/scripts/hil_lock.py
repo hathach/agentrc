@@ -1034,7 +1034,8 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
     failed handoff, each wait bounded by `wait`, raises LockUnavailable (an interrupt
     propagates) and leaves every board a recovery blocker whose takeover takes the group.
     With `receipts` (hil_process.run_tracked's) the holder releases only once every one
-    rechecks `done`; `extra` adds fields to the cleanup-holder record. Past the ValueError
+    rechecks `done`; `extra` adds fields to every record it writes, so a failed handoff's
+    protected record keeps them too. Past the ValueError
     the caller closes its handles either way, never clearing them. Needs hil_process.py
     beside this file."""
     receipts, locks = list(receipts), sorted(handles)
@@ -1051,7 +1052,7 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
     unwritten = []
     for b, fh in handles.items():
         try:
-            write_record(fh, reason, protected=True, detail=detail, receipts=receipts, locks=locks)
+            write_record(fh, reason, protected=True, detail=detail, receipts=receipts, **extra, locks=locks)
         except OSError as e:
             unwritten.append(f'{b}: {e}')
     fds, proc, reports = {}, None, None
