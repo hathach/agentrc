@@ -538,7 +538,9 @@ class Guard:
             raise Denied('`find -exec {}` runs a found path as the command, known only at run time; name the program')
         if replace and replace.translate(UNQUOTED) in words[0].translate(UNQUOTED):
             raise Denied('`xargs -I` puts its input in the command word, known only at run time; name the program')
-        if UNKNOWN in words[0] or '$' in words[0] or GLOBSET & set(words[0]):
+        # a bare tilde prefix (`~`, `~-`, `~+`, `~user`) expands to a whole path, so its program name too; past a `/` the
+        # name stays literal
+        if UNKNOWN in words[0] or '$' in words[0] or GLOBSET & set(words[0]) or re.fullmatch(r'~[^/]*', words[0]):
             raise Denied('the command word is set at runtime, so this guard cannot tell what runs; name the program directly')
         name = program(os.path.basename(words[0]))
         # a dashed builtin runs the subcommand without the `git` word: judged as `git <sub>`

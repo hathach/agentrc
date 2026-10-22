@@ -467,6 +467,13 @@ class ChiefGuard(unittest.TestCase):
         for c in ('/usr/bin/g?t push', '/usr/bin/gi* push', '/usr/bin/[g]it push', '{git,x} push', '/usr/bin/e?v git push'):
             self.assert_denied(c, 'cannot tell what runs')
         self.assert_allowed("'/tmp/a*b' --version")
+        # a bare tilde prefix as the command word expands to $HOME, $OLDPWD, $PWD or a user's home; a quoted one is literal
+        for c in ('HOME=/usr/bin/git; ~ push', "bash -c '~ push'", "eval '~- push'", '~+ push', '~root push'):
+            self.assert_denied(c, 'cannot tell what runs')
+        for c in ("'~' x", '\\~ x'):
+            self.assert_allowed(c)
+        self.assert_denied('~/bin/git push', 'changes the repository')
+        self.assert_allowed('~/bin/git status')
         # a wrapper resolved by path still reaches the command it runs
         self.assert_denied('/usr/bin/env git push', 'changes the repository')
 
