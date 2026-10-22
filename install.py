@@ -46,7 +46,8 @@ STATUSLINE = {'type': 'command', 'command': 'bash "$HOME/.claude/statusline.sh"'
 
 def available(kind):
     if kind == 'skill':
-        return sorted(p.name for p in (REPO / 'skills').iterdir() if p.is_dir())
+        # a moved skill's directory can outlive it, kept by an ignored __pycache__
+        return sorted(p.name for p in (REPO / 'skills').iterdir() if (p / 'SKILL.md').is_file())
     if kind == 'agent':
         return sorted(p.stem for p in (REPO / 'agents').glob('*.md'))
     if kind == 'workflow':
@@ -172,13 +173,15 @@ def unlink(dst):
 
 
 def prune(kind):
-    """Drop our links whose source left the repo; leave every other link alone."""
+    """Drop our links whose source left the repo, or is a skill directory without SKILL.md; leave every other link
+    alone, and never the directory a link names."""
     source = REPO / {'skill': 'skills', 'agent': 'agents', 'hook': 'hooks', 'workflow': 'workflows', 'bin': 'bin'}[kind]
     for parent in dirs(kind):
         for path in parent.iterdir() if parent.is_dir() else ():
-            if not path.is_symlink() or path.exists():
+            if not path.is_symlink():
                 continue
-            if inside(target(path), source):
+            gone = not path.exists() or kind == 'skill' and not (path / 'SKILL.md').is_file()
+            if gone and inside(target(path), source):
                 unlink(path)
 
 

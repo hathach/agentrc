@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shlex
@@ -38,7 +40,7 @@ else:
     sys.exit('unexpected ' + repr(args))
 json.dump(state, open(os.environ['STUB_STATE'], 'w'))
 '''
-SKILLS = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
+SKILLS = sorted(p.name for p in (ROOT / 'skills').iterdir() if (p / 'SKILL.md').is_file())
 spec = importlib.util.spec_from_file_location('install', SCRIPT)
 install = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(install)
@@ -245,6 +247,26 @@ class InstallTest(unittest.TestCase):
         self.ok('install', '--skill')
         names = sorted(p.name for p in (self.claude / 'skills').iterdir())
         self.assertEqual(names, sorted(SKILLS + ['foreign', 'mine']))
+
+    def test_a_skill_directory_without_skill_md_is_not_linked_and_its_link_is_pruned(self):
+        repo = self.home / 'repo'
+        (repo / 'skills' / 'kept').mkdir(parents=True)
+        (repo / 'skills' / 'kept' / 'SKILL.md').write_text('x')
+        (repo / 'skills' / 'moved' / 'scripts' / '__pycache__').mkdir(parents=True)
+        (repo / 'skills' / 'odd' / 'SKILL.md').mkdir(parents=True)
+        (repo / 'hooks').mkdir()
+        for d in (self.claude / 'skills', self.codex / 'skills'):
+            d.mkdir(parents=True)
+            os.symlink(repo / 'skills' / 'moved', d / 'moved')
+            os.symlink(Path(os.path.relpath(repo / 'skills' / 'odd', d)), d / 'odd')
+        (self.claude / 'skills' / 'real').mkdir()
+        os.symlink(self.home, self.claude / 'skills' / 'foreign')
+        with mock.patch.object(install, 'REPO', repo), mock.patch.object(Path, 'home', return_value=self.home), \
+                contextlib.redirect_stdout(io.StringIO()):
+            install.main(['install', '--skill'])
+        self.assertEqual(sorted(p.name for p in (self.claude / 'skills').iterdir()), ['foreign', 'kept', 'real'])
+        self.assertEqual(sorted(p.name for p in (self.codex / 'skills').iterdir()), ['kept'])
+        self.assertTrue((repo / 'skills' / 'moved' / 'scripts' / '__pycache__').is_dir(), 'the directory itself stays')
 
     def test_replacing_a_link_never_touches_a_neighbouring_file(self):
         (self.claude / 'skills').mkdir(parents=True)
