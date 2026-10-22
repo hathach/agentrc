@@ -399,6 +399,13 @@ class ChiefGuard(unittest.TestCase):
     def test_an_unparsable_command_is_denied(self):
         self.assert_denied('echo "unterminated', 'cannot parse')
 
+    def test_a_trailing_backslash_is_denied(self):
+        # bash keeps it literal: `wt/..\` is a file `..\` in the worktree, not the worktree's parent
+        for c in (f'touch {self.wt}/..\\', f'echo x > {self.wt}/..\\', f'cp /etc/hostname {self.wt}/..\\',
+                  f'git log -1 --output={self.wt}/..\\', f"bash -c 'touch {self.wt}/..\\'",
+                  f'eval "touch {self.wt}/..\\\\"', 'echo a\\', 'git status\\'):
+            self.assert_denied(c, 'cannot parse')
+
     def test_dashed_git_words_and_scalar_are_denied(self):
         # a dashed builtin runs the subcommand without the `git` word; judge it as `git <sub>`
         for c in ('/usr/lib/git-core/git-push origin', 'git-push origin', 'git-commit -m x', 'git-lfs push',

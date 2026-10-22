@@ -288,7 +288,9 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             continue
         if c == '\\':
             if text[i + 1:i + 2] != '\n':  # a line continuation: bash removes it before it reads words or operators
-                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]) + (QUOTING if mode == 'shell' else ''))
+                # a trailing backslash stays bare, for shlex to deny
+                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2])
+                           + (QUOTING if mode == 'shell' and i + 1 < len(text) else ''))
             i += 2
             continue
         token, j = ahead(text, i) if c in '$<>(' else ('', i)
