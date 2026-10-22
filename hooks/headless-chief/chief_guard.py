@@ -288,6 +288,10 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
         shell = bare and mode == 'shell'
         if token == '$[':
             raise Denied('`$[...]` is arithmetic this guard does not read; use `$((...))`')
+        if mode == 'param' and (c == "'" or token == "$'"):
+            raise Denied('this guard does not read a single quote inside `${...}`, which bash reads as a plain character '
+                         'in double quotes or a heredoc and runs what it quotes in a subscript; set the value in a plain '
+                         'assignment first, or dispatch the step to a unit')
         if token == "$'" and bare:
             while j < len(text) and text[j] != "'":
                 remaining()
@@ -328,7 +332,12 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             if end < 0 or text[end - 1] == '\\':
                 raise Denied('this guard reads a backtick substitution only to the next backtick, unescaped; use '
                              '`$(...)` for nesting, and close it')
-            frames.append(lexed(text[i + 1:end], depth=depth + 1)[:2])
+            body = text[i + 1:end]
+            # bash drops the backslash of `\$` and `\\`, and of `\"` inside double quotes, before it reads the body
+            if '\\$' in body or '\\\\' in body or double and '\\"' in body:
+                raise Denied('this guard does not read the backslashes bash removes from a backtick substitution '
+                             'first; use `$(...)`')
+            frames.append(lexed(body, depth=depth + 1)[:2])
             out.append(UNKNOWN)
             i = end + 1
         elif shell and c == '#' and (not out or out[-1][-1:] in WORD_START and out[-1][:1] != '\\'):

@@ -247,7 +247,16 @@ class ChiefGuard(unittest.TestCase):
                          ('echo ${x/a/>(git push)}', 'process substitution'),
                          ('echo ${y:-<(git push)}', 'process substitution'),
                          ('echo ${y:-<<(git push)}', 'process substitution'),
+                         # bash reads a quote in `${...}` as a plain character in double quotes or a heredoc, and
+                         # runs a quoted subscript
+                         ('unset x; echo "${x:-\'$(git push)\'}"', 'single quote inside `${...}`'),
+                         ("unset x; cat <<EOF\n${x:-'$(git push)'}\nEOF", 'single quote inside `${...}`'),
+                         ("unset a; echo ${a['$(git push)']}", 'single quote inside `${...}`'),
+                         ("echo ${x:-$'a'}", 'single quote inside `${...}`'),
                          ('echo `echo \\`date\\``', 'backtick'), ('echo `date', 'backtick'),
+                         # bash drops the backslash of `\$`, `\\` and, in double quotes, `\"` before it reads the body
+                         ('echo `echo "\\$(git push)"`', 'backslashes'), ("echo `echo \\\\'$(git push)\\\\'`", 'backslashes'),
+                         ('echo "`echo \\"\'\\" $(git push) \\"\'\\"`"', 'backslashes'),
                          ('echo ' + '$(' * 9 + 'date' + ')' * 9, 'nested this deep')):
             with self.subTest(c=c):
                 self.assert_denied(c, named)
