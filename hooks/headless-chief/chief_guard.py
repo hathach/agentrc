@@ -538,15 +538,15 @@ class Guard:
             for a in args:
                 if ASSIGNMENT.match(a):
                     forbidden_env(a)
-        # bash reads an operand as declare's assignment only past an unquoted command word that keywords and assignments
-        # alone precede, and with its name unquoted; eval's operands it splits and globs first
-        assigns = not self.evaluated and QUOTING not in marked[-len(words)] and all(
-            w in KEYWORDS or ASSIGNMENT.match(w) for w in marked[:len(marked) - len(words)])
-        if cmd in ('declare', 'typeset', 'local') and any(
-                not (assigns and DECLARED.match(m)) and (UNKNOWN in a or '$' in a or (GLOBSET - set('{}')) & set(a))
-                for a, m in zip(args[:args.index('--')] if '--' in args else args, marked[len(marked) - len(args):])):
-            raise Denied(f'`{cmd}` takes a word expanded at run time, which may supply `-i` where this guard cannot see '
-                         'it; give its options literally, a glob quoted')
+        if cmd in ('declare', 'typeset', 'local'):
+            # bash reads an operand as declare's assignment only past an unquoted command word that keywords and
+            # assignments alone precede, and with its name unquoted; eval's operands it splits and globs first
+            assigns = not self.evaluated and QUOTING not in marked[-len(words)] and all(
+                w in KEYWORDS or ASSIGNMENT.match(w) for w in marked[:len(marked) - len(words)])
+            if any(not (assigns and DECLARED.match(m)) and (UNKNOWN in a or '$' in a or (GLOBSET - set('{}')) & set(a))
+                   for a, m in zip(args[:args.index('--')] if '--' in args else args, marked[len(marked) - len(args):])):
+                raise Denied(f'`{cmd}` takes a word expanded at run time, which may supply `-i` where this guard cannot '
+                             'see it; give its options literally, a glob quoted')
         if cmd == 'let' or (cmd in DECLARES and spelled(args, {}, 'i')):
             raise Denied(f'`{cmd}` evaluates values as arithmetic, where a name runs any substitution its value holds, '
                          'which this guard cannot see; compute with `$((...))`')
