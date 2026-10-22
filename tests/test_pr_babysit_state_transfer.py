@@ -133,5 +133,14 @@ class StateTransferTest(unittest.TestCase):
         self.assertEqual(json.loads(out), [transfer.fnv1a(s) for s in samples])
 
 
+    @unittest.skipUnless(shutil.which('node'), 'needs Node.js')
+    def test_the_workflow_measures_a_state_as_this_script_does(self):
+        source = (ROOT / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
+        fns = '\n'.join(re.search(rf'^const {name} = .*$', source, re.M).group(0) for name in ('STATE_MAX', 'stateBytes'))
+        samples = [STATE, {'s': '\x7f\x00\u2028😀'}]
+        out = subprocess.run(['node', '-e', f'{fns}\nconsole.log(JSON.stringify([STATE_MAX, {json.dumps(samples)}.map(stateBytes)]))'],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(json.loads(out), [transfer.MAX, [len(json.dumps(s, ensure_ascii=True, separators=(',', ':'))) for s in samples]])
+
 if __name__ == '__main__':
     unittest.main()

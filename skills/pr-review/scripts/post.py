@@ -204,7 +204,7 @@ def live_thread(comments, root):
 
 
 def live_key(thread, login, known):
-    """The pushback in the thread, keyed as ledger.py disputes keys it."""
+    """The pushback in the thread, keyed as ledger.py show --head keys its disputes."""
     return ledger_digest([[c['id'], c['digest']] for c in pushback(thread, known, login)])
 
 

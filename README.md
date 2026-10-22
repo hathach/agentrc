@@ -80,8 +80,9 @@ and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or
   MSYS2's mingw build), not the WindowsApps alias and not MSYS2's
   `/usr/bin/python3`, for the workflows' script calls and the simplify gate's
-  wrapper; PyYAML in it for `pr-babysit`'s `harvest.py`, which `pr-review` also
-  imports, and for the tests. `install.py` registers a Python hook as
+  wrapper; PyYAML in it for the tests, and for `pr-babysit`'s `harvest.py`, which
+  `pr-review` also imports, to date a head by its pull_request runs (without it
+  they go unread and the harvest says so). `install.py` registers a Python hook as
   `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot
   start lets the tool call through; rerun it after replacing that Python, and
   name the interpreter the same way in the credit guard's recipe below.
@@ -140,7 +141,7 @@ Agent collaboration and PRs:
 | [`followup-issue`](skills/followup-issue/SKILL.md) | open a follow-up issue, or comment new evidence on one that covers the topic, read it back, never post twice | `publish.py create --repo o/r --allow-repo o/r --title t --body-file f` |
 | [`pr-babysit`](skills/pr-babysit/SKILL.md) | the fact collectors the pr-babysit workflow runs before it commits a fix | `preflight.py --pr N`, `hooks.py <path>...` |
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR: pin it, pick rig boards, run the pr-review workflow, leave it as a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
-| [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's log, rerun its failed jobs once after an infra failure | `circleci.py log <job>`, `rerun <job>...` |
+| [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's or Read the Docs build's log, rerun it once after an infra failure | `circleci.py log <job>`, `rerun <job>...`, `rtd.py log <url>` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
 | [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a herdr worktree when its task is done: check it, gate on pending follow-ups and PR state, then herdr removes it and the `worktree-children` plugin its siblings and branches | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
 

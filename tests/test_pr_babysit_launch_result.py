@@ -161,13 +161,18 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}))
         self.assertEqual(s['blockers'], [], 'a launch that passed on its last cycle needs no relaunch')
 
+    def test_a_state_too_large_to_load_is_a_blocker(self):
+        rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 70000,
+                                           'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))
+        self.assertEqual(s['blockers'], ['the returned state is 70000 bytes, over the 65536 a launch loads: no launch can continue '
+                                         'from it; keep the output file and report it, never reset or reconstruct the state'])
+
     def test_a_launch_stopped_at_load_is_a_blocker_and_keeps_the_state_it_was_given(self):
-        # tinyusb#4019: a relaunch at 5 of 5 loaded its whole state only to stop.
         stopped = {'agentCount': 1, 'totalTokens': 30000, 'logs': [], 'workflowProgress': [], 'result': {
-            'pass': False, 'status': 'blocked', 'reason': 'budget-exhausted-unverified', 'detail': 'shows 5 of 5', 'stateRef': {'outputFile': '/t/w1.output', 'digest': '4841042f'}}}
+            'pass': False, 'status': 'blocked', 'reason': 'state-transfer-failed', 'detail': 'state digest mismatch'}}
         rc, s = self.run_it(stopped, '--state-ref', '/t/w1.output:4841042f')
         self.assertEqual((s['stateRef'], s['budget']), ({'outputFile': '/t/w1.output', 'digest': '4841042f'}, None))
-        self.assertTrue(any(b.startswith('the launch stopped before loading its state') for b in s['blockers']), s['blockers'])
+        self.assertTrue(any(b.startswith('the state did not load') for b in s['blockers']), s['blockers'])
 
     def test_a_refused_launch_is_a_blocker_that_forbids_starting_over(self):
         for reason, says in (('state-transfer-failed', 'never reset or reconstruct the state'),
@@ -212,7 +217,7 @@ class LaunchResultTest(unittest.TestCase):
     def test_every_stop_reason_of_the_workflow_is_refused_or_handled_elsewhere(self):
         handled_elsewhere = {  # blocked by receipts, budget, heads or CI fields, or left to chief's judgment
             'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable',
-            'cycle-threw', 'maxCycles reached', 'deferred-replies-unresolved', 'dirty-start',
+            'cycle-threw', 'deferred-replies-unresolved', 'dirty-start', 'dry-run',
             'duplicate-finding-ids', 'fix-verification-failed', 'held-awaiting-caller', 'preflight-died', 'preflight-failed', 'push-failed',
             'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending',
             'wrong-branch', 'wrong-remote', 'yielded'}
@@ -220,10 +225,9 @@ class LaunchResultTest(unittest.TestCase):
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop: (['"])(.+?)\1""", source)}  # the GATES table
-        historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced
         sets = (handled_elsewhere, set(launch_result.REFUSED), set(launch_result.ENDED), set(launch_result.STALLED))
         self.assertEqual(sum(map(len, sets)), len(set().union(*sets)), 'each reason is handled one way')
-        self.assertEqual(reasons, set().union(*sets) - historical,
+        self.assertEqual(reasons, set().union(*sets),
                          'a stop reason was added or renamed: give it a REFUSED response or name it here')
 
     def test_a_stop_another_launch_would_repeat_says_what_must_change(self):
@@ -240,6 +244,31 @@ class LaunchResultTest(unittest.TestCase):
                           'out of scope per https://x/1 (y): defer it by findingId, or drop the topic'])
         for reason in ('yielded', 'pr-merged'):
             self.assertEqual(self.run_it(stopped(reason))[1]['blockers'], [], reason)
+
+    def test_an_unreviewed_coderabbit_says_whether_a_relaunch_asks_from_the_runs_record(self):
+        # #243: chief relaunched for an ask the run had already spent on the head.
+        def stopped(ask):
+            return {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
+                    'result': {'stateDigest': '0123abcd', 'pass': False, 'status': 'blocked', 'reason': 'coderabbit-unreviewed', 'cycles': 2,
+                               'state': {'expectedHead': HEAD, 'cyclesUsed': 2, 'maxCycles': 16}, 'coderabbitAsk': ask}}
+        for ask, says in (
+                ({'relaunchAsks': None, 'asked': [{'ask': 'request', 'at': '2026-10-23T01:10:00Z'}]},
+                 'already used its one ask on the head (an `@coderabbitai review` comment at 2026-10-23T01:10:00Z), so a relaunch will not ask'),
+                ({'relaunchAsks': None, 'asked': [{'ask': 'tick', 'at': None}]}, '(a Trigger review tick that failed), so a relaunch will not ask'),
+                ({'relaunchAsks': None, 'asked': []}, "nothing in CodeRabbit's state is ours to ask, so a relaunch will not ask"),
+                ({'relaunchAsks': 'tick', 'asked': []}, 'a relaunch with coderabbitTrigger ticks it once'),
+                ({'relaunchAsks': 'request', 'asked': [], 'retryAt': '2026-10-23T02:07:00Z'},
+                 'rate-limited until 2026-10-23T02:07:00Z and this run never asked on the head: a relaunch with coderabbitTrigger after that')):
+            with self.subTest(ask):
+                blockers = self.run_it(stopped(ask))[1]['blockers']
+                self.assertEqual(len(blockers), 1, blockers)
+                self.assertIn(says, blockers[0])
+                self.assertEqual('`@coderabbitai review` on the PR or accepts the head' in blockers[0], ask['relaunchAsks'] is None, blockers[0])
+        # An output without the record: a failed tick leaves nothing on the PR, so its ask cannot be read there.
+        blockers = self.run_it(stopped(None))[1]['blockers']
+        self.assertEqual(len(blockers), 1, blockers)
+        self.assertIn('does not record its asks, and a failed tick leaves nothing on the PR, so a relaunch may not ask again: '
+                      'the user comments `@coderabbitai review`', blockers[0])
 
     def test_every_reviewer_keeps_its_state_kind_and_evidence(self):
         # #85: a Copilot quota notice left no finding, so its record is the only trace.

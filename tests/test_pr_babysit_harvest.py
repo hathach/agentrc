@@ -417,13 +417,13 @@ def workflow(on):
 
 
 class WithoutPyYaml(unittest.TestCase):
-    def test_only_reading_a_workflow_needs_pyyaml(self):
+    def test_only_reading_a_workflow_needs_pyyaml_and_without_it_none_is_read(self):
         """sonar.py and coderabbit_trigger.py import this file for its gh helpers, under a python3 that may lack PyYAML."""
         with mock.patch.dict(sys.modules, {'yaml': None}):
             bare = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(bare)
-            with self.assertRaisesRegex(bare.Unusable, 'PyYAML is not installed'):
-                bare.pr_types('o/r', '.github/workflows/build.yml', HEAD)
+            with mock.patch.object(bare, 'gh_json', side_effect=AssertionError('a workflow was fetched')):
+                self.assertIsNone(bare.pr_types('o/r', '.github/workflows/build.yml', HEAD))
 
 
 class EndToEnd(unittest.TestCase):
@@ -476,6 +476,19 @@ class EndToEnd(unittest.TestCase):
                          'only the named reviewers, and no empty review body')
         self.assertEqual(got['comments'][0]['digest'], harvest.digest('fix this'))
         self.assertEqual(got['comments'][0]['body'], 'fix this')
+
+    def test_without_pyyaml_no_pull_request_run_dates_the_head_and_the_evidence_says_why(self):
+        answers = self.answers([HEAD])
+        answers[f'api --paginate --slurp repos/o/r/commits/{HEAD}/statuses?per_page=100'] = [[[]]]
+        answers['api --paginate --slurp repos/o/r/issues/7/comments?per_page=100'][0][0].append(
+            comment('coderabbitai[bot]', harvest.CR_RATE + '\n> ## Review limit reached', at='2026-09-25T09:30:00Z', id_=22))
+        code, got = self.harvest(answers)
+        self.assertEqual((code, got['headEventAt'], got['bots'][0]['state']), (0, '2026-09-25T08:00:00Z', 'settled'), 'with PyYAML')
+        harvest.pr_types.cache_clear()
+        with mock.patch.object(harvest, 'yaml', None):
+            code, got = self.harvest(answers)
+        self.assertEqual((code, got['headEventAt'], got['bots'][0]['state']), (0, None, 'unknown'), 'the notice is not settled on a guess')
+        self.assertTrue(got['headEventEvidence'].endswith('; PyYAML is not installed, so no pull_request run was read'), got['headEventEvidence'])
 
     def test_the_walkthrough_is_harvested_without_its_body(self):
         answers = self.answers([HEAD])

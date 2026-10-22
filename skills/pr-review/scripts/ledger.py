@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """pr-review's per-PR ledger: what each review of a PR found, drafted and posted.
 
-  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE]
+  ledger.py show --pr N [--repo OWNER/NAME] [--finding ID | --draft | --pending | --threads FILE [--head SHA]]
   ledger.py save --pr N --output FILE [--repo OWNER/NAME] [--reason TEXT]
-  ledger.py disputes --pr N --threads FILE --head SHA [--repo OWNER/NAME]
 
 The ledger is <git common dir>/agentrc/pr-review/<owner>__<name>/<N>.json,
 one per PR, shared by every worktree of the clone. Only this script and
 post.py write it, under an exclusive lock, by write-then-rename.
 
-show prints the last review that reached the PR (posted or partial:
+show prints the last review that reached the PR (posted:
 head, mergeBase, verdict, status), its standing findings (open, upheld,
 disputed: id, file, line, severity with its P0-P4 priority, the grading
 behind it, its claim, and the number of the defect it shares with other findings
@@ -27,12 +26,13 @@ or confirmed (pending, drafted or uncertain: head, status, event, digest) with a
 findings as show lists them, or null, since show itself lists only reviews that
 reached the PR. With --threads, a threads.py snapshot, it also lists each
 settled finding whose thread is still open and due to be resolved (resolveDue,
-resolve_due()), and in heldThreads those it never resolves again by itself.
+resolve_due()), and in heldThreads those it never resolves again by itself;
+--head adds the disputes on that head.
 
-disputes joins a threads.py snapshot to the findings whose inline comment our
+The disputes join the threads.py snapshot to the findings whose inline comment our
 own verified review posted (commentId, recorded by post.py from its read-back):
 on each such thread, the replies by anyone but us or a bot after our last
-verified answer there are pushback to judge (pushback()). Its key is the ordered reply ids and body digests; a key
+verified answer there are pushback to judge (pushback()). A dispute's key is the ordered reply ids and body digests; a key
 already judged on this head is not listed again, and an edited reply is a new
 key. Only ids, digests and authors are printed, never bodies.
 
@@ -148,8 +148,8 @@ def digest(value):
 
 
 # An uncertain review may not be on the PR at all: it is reconciled before anything builds on it.
-REACHED = ('posted', 'partial')
-UNSETTLED = ('pending', 'drafted', 'partial', 'uncertain')
+REACHED = ('posted',)
+UNSETTLED = ('pending', 'drafted', 'uncertain')
 # A drafted review is a pending review of ours on GitHub; an uncertain one may be.
 ONLINE = ('drafted', 'uncertain')
 # Not yet on the PR, or not known to be: a second draft for the head waits for it.
@@ -328,8 +328,9 @@ def anchor(draft, merge_base, head):
     """Comments on lines the diff does not show go into the body: GitHub refuses them inline."""
     inline, moved, cache = [], [], {}
     for c in draft['comments']:
-        ok = cache.setdefault(c['path'], added_lines(merge_base, head, c['path']))
-        (inline if c['line'] in ok else moved).append(c)
+        if c['path'] not in cache:
+            cache[c['path']] = added_lines(merge_base, head, c['path'])
+        (inline if c['line'] in cache[c['path']] else moved).append(c)
     body = draft['body']
     if moved:
         body += '\n\n' + '\n\n'.join(f"**{c['path']}:{c['line']}**: {c['body']}" for c in moved)
@@ -502,20 +503,21 @@ def save(led, result, reason):
             'replies': len(draft['replies']), 'findings': len(review['findings'])}
 
 
-def read_snapshot(path, pr):
+def read_snapshot(path, repo, pr):
     try:
         snapshot = json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError, ValueError) as e:
         raise Unusable(f'--threads {path} unreadable: {e}')
-    if snapshot.get('pr') != pr:
-        raise Unusable(f"--threads is a snapshot of PR {snapshot.get('pr')}, not {pr}")
+    # PR numbers repeat across repositories; a snapshot naming neither is threads.py's to write again.
+    if (snapshot.get('repo'), snapshot.get('pr')) != (repo, pr):
+        raise Unusable(f"--threads is a snapshot of {snapshot.get('repo')}#{snapshot.get('pr')}, not {repo}#{pr}")
     return snapshot
 
 
 def collect(argv):
     p = Parser(prog='ledger.py')
     sub = p.add_subparsers(dest='cmd', required=True)
-    for name in ('show', 'save', 'disputes'):
+    for name in ('show', 'save'):
         s = sub.add_parser(name)
         s.add_argument('--pr', type=int, required=True)
         s.add_argument('--repo')
@@ -524,20 +526,22 @@ def collect(argv):
     which.add_argument('--draft', action='store_true')
     which.add_argument('--pending', action='store_true')
     which.add_argument('--threads')
-    sub.choices['disputes'].add_argument('--threads', required=True)
-    sub.choices['disputes'].add_argument('--head', required=True)
+    sub.choices['show'].add_argument('--head')
     sub.choices['save'].add_argument('--output', required=True)
     sub.choices['save'].add_argument('--reason')
     a = p.parse_args(argv)
     repo = repo_of(a.repo)
     path = ledger_path(repo, a.pr)
-    snapshot = read_snapshot(a.threads, a.pr) if getattr(a, 'threads', None) else None
-    if a.cmd == 'show':
-        return {'ledger': path.as_posix(), **show(load(path, repo, a.pr), a.finding, a.draft, snapshot, a.pending)}
-    if a.cmd == 'disputes':
+    if getattr(a, 'head', None) is not None:
+        if not a.threads:
+            p.error('--head needs --threads')
         if not FULL_SHA.match(a.head):
             raise Unusable('--head must be a full SHA')
-        return {'disputes': disputes(load(path, repo, a.pr), snapshot, a.head)}
+    snapshot = read_snapshot(a.threads, repo, a.pr) if getattr(a, 'threads', None) else None
+    if a.cmd == 'show':
+        led = load(path, repo, a.pr)
+        out = {'ledger': path.as_posix(), **show(led, a.finding, a.draft, snapshot, a.pending)}
+        return {**out, 'disputes': disputes(led, snapshot, a.head)} if a.head else out
     result = (load_output(a.output) or {}).get('result')
     if not isinstance(result, dict):
         raise Unusable(f'--output {a.output} holds no Workflow result')

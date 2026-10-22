@@ -18,8 +18,7 @@ python3 $S/prepare.py --pr N [--repo O/R] [--full]            # checkout top lev
 python3 $S/prepare.py --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 $S/prepare.py --release --pr N --token T                # any worktree: unlock that run's review tree
 python3 $S/threads.py --pr N --out FILE                         # every comment and thread, bodies in FILE
-python3 $S/ledger.py show --pr N [--finding ID] [--draft] [--pending]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists
-python3 $S/ledger.py disputes --pr N --threads FILE --head SHA  # replies on our threads still to judge
+python3 $S/ledger.py show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge
 python3 $S/ledger.py save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
 python3 $S/post.py --pr N --expected-head SHA [--auto]         # a pending GitHub review; --auto: submit it
 python3 $S/post.py --pr N --expected-head SHA --decline --reason TEXT
@@ -37,12 +36,12 @@ review on the PR, or reconcile what it names. It makes
 herdr has the checkout open as a linked worktree, on branch `pr-review-<N>` at
 the PR head (an existing tree at either place is reused) and picks
 the mode: `full` on a first review or after a force-push or rebase,
-`incremental` when the last reviewed head is an ancestor, `same` when this
-head was reviewed already. On `same`, launch in `discussion` mode, which only
-judges new replies on our threads and returns `nothing-new` when there are
-none; if the human wants the head reviewed again, run `prepare.py --full` and
-save with `--reason`. An `overCap` answer merged everything into one group:
-say so before launching.
+`incremental` when the last reviewed head is an ancestor and the merge base is
+unchanged, `same` when this head was reviewed already. On `same`, launch in
+`discussion` mode, which only judges new replies on our threads and returns
+`nothing-new` when there are none; if the human wants the head reviewed again,
+run `prepare.py --full` and save with `--reason`. An `overCap` answer merged
+everything into one group: say so before launching.
 
 A sibling tree is locked for the run, so herdr's removal of the checkout keeps
 it; `lock.token` names the lock. Pass `--token <it>` to a repeated prepare for the

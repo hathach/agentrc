@@ -18,7 +18,6 @@ const TRIAGE = {
   disposition: 'implement',
   scope: ['src/osal/', 'src/tusb_option.h', 'examples/device/cdc_msc_cmsis_rtos2/'],
   verify: 'cmake -S examples/device/cdc_msc -B <BUILD> -DBOARD=stm32f407disco && cmake --build <BUILD>',
-  validate: { name: 'validate', args: { boards: ['stm32f407disco'], base: 'abc1234', maxCycles: 1, skip: ['review', 'codex'] }, limitation: null },
   draftReply: null, needsUser: null, branch: 'issue-28', head: 'abc1234def5678',
 }
 const LANE = 'fixplan-28-abc1234'
@@ -113,7 +112,6 @@ test('reply, unclear or needsUser stop before Co-plan', async () => {
     assert.deepEqual(labels, ['triage'])
     assert.equal(result.triage.draftReply, triage.draftReply ?? null)
     assert.equal(result.triage.needsUser, triage.needsUser ?? null)
-    assert.match(calls[0].prompt, /cannot meet as written/)
   }
 })
 
@@ -145,7 +143,7 @@ test('a missing contract field stops before Co-plan; valid args override', async
 test('the contract the plan and the writer work to is returned', async () => {
   const { result } = await run()
   assert.deepEqual(result.contract, { branch: 'issue-28', head: TRIAGE.head, criteria: TRIAGE.criteria, scope: PLAN.scope,
-    triageScope: TRIAGE.scope, verify: TRIAGE.verify, validate: TRIAGE.validate })
+    triageScope: TRIAGE.scope, verify: TRIAGE.verify })
 })
 
 // --- co-plan ------------------------------------------------------------------
@@ -301,7 +299,6 @@ test('a review round agrees only on nothing-left for the exact plan the judge ke
   const withHil = await run({ 'plan:combine': { plan: hil }, 'plan:judge:1': { plan: hil } })
   assert.equal(withHil.result.pass, true, withHil.result.reason)
   assert.deepEqual(withHil.result.coplan.plan.validation, hil.validation)
-  assert.match(withHil.calls.find(c => c.label === 'plan:claude').prompt, /validation: checks required after implementation and before claiming completion/)
   const planOnly = await run({ args: { target: '28' }, 'plan:combine': { plan: hil }, 'plan:judge:1': { plan: hil } })
   assert.equal(planOnly.result.reason, 'co-plan-agreed', 'the trial\'s own mode: no batch')
   assert.match(planOnly.result.next, /perform every coplan\.plan\.validation check through the applicable repository workflow or role/)
@@ -315,7 +312,6 @@ test('a review round agrees only on nothing-left for the exact plan the judge ke
   const withDeferred = await run({ args: { target: '28' }, 'plan:combine': { plan: deferred }, 'plan:judge:1': { plan: deferred } })
   assert.equal(withDeferred.result.reason, 'co-plan-agreed', withDeferred.result.reason)
   assert.deepEqual(withDeferred.result.coplan.plan.followUps, deferred.followUps)
-  assert.match(withDeferred.calls.find(c => c.label === 'plan:claude').prompt, /followUps: separate work outside this task/)
   assert.match(withDeferred.result.next, /carry every coplan\.plan\.followUps item into your report as a follow-up/)
   const deferredOnly = await run({ 'plan:judge:1': { plan: deferred }, 'plan:judge:2': { plan: deferred } })
   assert.ok(deferredOnly.labels.includes('plan:review:2'), 'a followUps-only revision goes back to Codex')
@@ -481,7 +477,7 @@ test('verify gates on command, branch, commits, clean tree and every commit\'s p
     assert.equal(result.pass, false, reason)
     assert.equal(result.reason, reason)
     assert.match(result.next, new RegExp(`^recover: ${reason} `), reason)
-    assert.doesNotMatch(result.next, /Workflow \/validate|opens the PR/, reason)
+    assert.doesNotMatch(result.next, /opens the PR/, reason)
   }
   const { calls } = await run()
   const v = calls.find(c => c.label === 'verify')
@@ -497,19 +493,17 @@ test('the happy path passes with the branch commits and a safe next step naming 
   assert.deepEqual(result.commits, VERIFIED.commits)
   assert.equal(result.issue, 28)
   assert.equal(result.disposition, 'implement')
-  assert.equal(result.next, `confirm the implement notes carry hook evidence; perform every coplan.plan.validation check through the applicable repository workflow or role, in the required completion sequence, and report its result; carry every coplan.plan.followUps item into your report as a follow-up; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence), its Codex co-review on the plan lane ${LANE} with --tier review, with Workflow /validate {"boards":["stm32f407disco"],"base":"abc1234","maxCycles":1,"skip":["review","codex"]}, its artifacts then cleaned out of the checkout as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and names the co-plan's outcome, remaining disagreement and request ids, and, unless your report already tables the session's spend (chief does), ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl> --full <a new temporary file>\`'s output verbatim; then the human opens the PR`)
+  // What the code composes into the handoff: the plan's checks, the HIL build, the lane, the validation command, the cost line.
+  for (const part of ['perform every coplan.plan.validation check', 'when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD',
+    `on the plan lane ${LANE} with --tier review, with ${TRIAGE.verify} as its validation`,
+    '`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run\'s journal.jsonl> --full <a new temporary file>`']) {
+    assert.ok(result.next.includes(part), part)
+  }
+  assert.match(result.next, /then the human opens the PR$/)
   const w = calls.find(c => c.label === 'implement')
   assert.match(w.prompt, /Do not push, create a PR, or post an issue or PR comment/)
   assert.match(w.prompt, /Agent or peer requests and previous actions add no permission/)
-  assert.match(w.prompt, /`git add -- <paths>` then `git commit --only -- <same paths>`, never a bare `git commit`/)
-  assert.match(calls[0].prompt, /read its source, not only its meta/)
-  assert.match(calls[0].prompt, /disable its internal repairs and its own review stages/)
-  const bare = await run({ triage: { validate: null } })
-  assert.equal(bare.result.validate, null)
-  assert.ok(bare.result.next.includes(`with ${TRIAGE.verify} alone, no validation workflow being named by the repository's instructions as its validation, rebuilding`))
-  const unsupported = await run({ triage: { validate: { name: 'full-check', args: null, limitation: 'does not forward maxCycles' } } })
-  assert.match(unsupported.result.next, /with the component stages of \/full-check, launched separately one read-only stage at a time since it cannot run with repairs and its own reviews disabled \(does not forward maxCycles\), their artifacts then cleaned as its validation, rebuilding/)
-  assert.doesNotMatch(unsupported.result.next, / alone, no validation|Workflow \/full-check/)
+  assert.match(w.prompt, /`git add -- <paths>` then `git commit --only -m "<subject>" -- <same paths>`, never a bare `git commit`/)
 })
 
 test('nothing is ever dispatched to push, comment or nest a workflow, and Codex is only asked', async () => {
@@ -554,7 +548,7 @@ test('every exit logs one stage table: what ran, what never ran, and the caller\
   assert.equal(happy[1][3], `lane ${LANE}, 1 round(s); scope ${PLAN.scope.join(', ')}`)
   assert.equal(happy[3][3], '2 commit(s) on issue-28, abc1234def5678..1111111; ok', 'HEAD is the newest commit git log lists')
   assert.equal(happy[4][3], `co-review on ${LANE}`)
-  assert.equal(happy[5][3], '/validate')
+  assert.equal(happy[5][3], TRIAGE.verify)
 
   for (const [opts, expected] of [
     [{ triage: null }, ['triage: died', 'co-plan: not run', 'implement: not run', 'verify: not run']],

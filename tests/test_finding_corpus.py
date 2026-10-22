@@ -383,6 +383,22 @@ print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'to
 """
 
 
+class Score(unittest.TestCase):
+    def test_disputed_truth_is_right_in_no_count(self):
+        truth = {'t': ('true', True), 'f': ('false', True), 'd': (None, True), 's': ('true', False)}
+        corpus = [{'id': i, 'truth': {'label': label}} for i, (label, _) in truth.items()]
+        env = {'before': {'corpus': 'x', 'cases': sorted(truth)}, 'after': {'corpus': 'x', 'cases': sorted(truth)}}
+        calls = [{'label': 'verify:d0x0:0', 'caseIds': sorted(truth), 'cost': 1.0, 'durationMs': 1000, 'model': 'opus', 'effort': 'high',
+                  'models': [OPUS]}]
+        for disputed in ('confirmed', 'refuted'):
+            kinds = {'t': 'confirmed', 'f': 'confirmed', 'd': disputed, 's': 'unverified'}
+            records = {i: {'id': i, 'kind': kinds[i], 'routing': {'hardware': hw}} for i, (_, hw) in truth.items()}
+            f = score.report(corpus, (records, calls, env), (records, calls, env), corpus_digest='x')['figures']['single']
+            self.assertEqual((f['settled'], f['right'], f['wrong']), (3, 1, ['f']), disputed)
+            self.assertEqual(f['byHardware'], {'True': {'cases': 3, 'right': 1}, 'False': {'cases': 1, 'right': 0}, 'None': {'cases': 0, 'right': 0}},
+                             disputed)
+
+
 class Replay(unittest.TestCase):
     """replay.mjs drives code-audit.js itself against a stand-in claude; score.py reads what it wrote."""
 

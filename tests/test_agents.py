@@ -53,8 +53,8 @@ class AgentFiles(unittest.TestCase):
                 self.assertIn(trigger, ' '.join((AGENTS / f'{name}.md').read_text().split()))
 
     def test_pr_review_validator_keeps_the_keys_tinyusb_dismissals_are_keyed_on(self):
-        """tinyusb's pr-babysit keys dismissal debt on findingId and detects
-        edited comments through commentDigest; its tests read this file."""
+        """pr-babysit.js keys deferrals on findingId and detects edited
+        comments through commentDigest."""
         body = (AGENTS / 'pr-review-validator.md').read_text()
         example = self.contract_example('pr-review-validator.md')
         finding = example['findings'][0]
@@ -116,10 +116,10 @@ class AgentFiles(unittest.TestCase):
         debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
         self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
 
-    def test_hardware_commit_recipes_put_options_before_the_pathspec(self):
+    def test_commit_recipes_put_options_before_the_pathspec(self):
         """An option after `--` is read as a path, so the recipe must carry -m before it."""
-        for name in ('chief.md', 'hw-debugger.md'):
-            body = (AGENTS / name).read_text()
+        for path in (AGENTS / 'chief.md', AGENTS / 'hw-debugger.md', AGENTS.parent / 'workflows' / 'fix-issue.js'):
+            body, name = path.read_text(), path.name
             self.assertIn('git commit --only -m "<subject>" -- <same paths>', body, name)
             self.assertNotIn('git commit --only -- <same paths>', body, name)
 

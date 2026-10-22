@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Parser, Unusable, git, report  # noqa: E402
+from state_transfer import MAX  # noqa: E402
 
 CONDENSED = ('history', 'observation', 'state')
 NOT_FIXING = re.compile(r'^cycle \d+: [\w -]+ CI failure \(not fixing\): ')
@@ -49,10 +50,7 @@ ADOPTION_REFUSED = 'the adoption was refused: investigate and report it, never a
 BASE_FETCH = ('; this one lacks the base: fetch the base branch from the PR\'s base repository (not assuming the push remote, '
               'changing no credentials), then retry the same adoption with the same stateRef and adoptHead; '
               'a base that moved again can need another retry')
-# budget-exhausted-unverified is no longer produced; kept so an older launch's output still reads.
 REFUSED = {
-    'budget-exhausted-unverified': 'the launch stopped before loading its state, whose copy showed the cycle budget spent; '
-                                   'the launch that saved that state is the authority: read it before relaunching',
     'state-transfer-failed': 'the state did not load: keep the output file it came from and report it, never reset or reconstruct the state',
     'state-mismatch': "the PR or its remote differs from the state's pin (compare the result's pin with expected): report it; "
                       "starting over is the user's decision, never a reset or a fresh launch",
@@ -71,6 +69,9 @@ REFUSED = {
     'stale-workflow': "this session's cached workflow definition calls a script the install lacks: relaunch from a fresh session, never by hand",
     'pr-state-unread': 'the PR state could not be read before a GitHub write, so that write did not run: relaunch once `gh pr view` answers',
 }
+USER_ASKS = ('the user comments `@coderabbitai review` on the PR or accepts the head '
+             'unreviewed, and a relaunch helps only once CodeRabbit reviewed the head, or on a new head')
+CR_UNREVIEWED = 'CodeRabbit has not reviewed the head, and a coderabbitTrigger launch made its review required for every head of this run'
 ENDED = {'pr-merged': 'the PR is merged; nothing to continue', 'pr-closed': 'the PR is closed; nothing to continue'}
 # Stops another launch on the same state repeats: what must change first (chief's rule against relaunching on an unchanged blocker).
 STALLED = {
@@ -84,12 +85,8 @@ STALLED = {
                            'this run: its request failed, was uncertain (the detail names the attempt record) or ambiguous, or no '
                            'review came within the cap after it; read `bots` and the PR, and relaunch once Greptile reviewed the head; '
                            "shipping the head unreviewed is the user's decision",
-    'coderabbit-unreviewed': 'CodeRabbit has not reviewed the head, and a coderabbitTrigger launch made its review required for every '
-                             'head of this run: its trigger failed or no review came within the cap after it, or it was skipped or '
-                             'rate-limited with nothing more to ask; a run asks once per head, so read `bots` and the PR: a limited '
-                             'record whose retryAt is past and that was never asked gets its one ask from a relaunch with '
-                             'coderabbitTrigger, otherwise relaunch once CodeRabbit reviewed the head (on a request the user made, or '
-                             "a new head); shipping the head unreviewed is the user's decision",
+    'coderabbit-unreviewed': CR_UNREVIEWED + '; this output does not record its asks, and a failed tick leaves nothing on the PR, '
+                             'so a relaunch may not ask again: ' + USER_ASKS,
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
                 'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
@@ -98,9 +95,27 @@ STALLED = {
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       'python3 on PATH lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared',
+    'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
+                         'expired gh login or a module the python3 on PATH lacks, or relaunch once a passing cause (a GitHub outage) cleared',
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
                      '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',
 }
+
+
+ASKS = {'tick': 'a Trigger review tick', 'request': 'an `@coderabbitai review` comment'}
+
+
+def coderabbit_blocker(ask):
+    """coderabbit-unreviewed from the run's own record of its asks on the head (#243: a relaunch for an ask already spent)."""
+    if ask.get('relaunchAsks') == 'tick':
+        return f"{CR_UNREVIEWED}; it skipped the head for a manual review and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once"
+    if ask.get('relaunchAsks') == 'request':
+        return (f"{CR_UNREVIEWED}; it is rate-limited until {ask.get('retryAt')} and this run never asked on the head: a relaunch with "
+                'coderabbitTrigger after that comments `@coderabbitai review` once')
+    asked = '; '.join(f"{ASKS.get(a.get('ask'), a.get('ask'))} {'at ' + a['at'] if a.get('at') else 'that failed'}"
+                      for a in ask.get('asked') or [])
+    why = f'this run already used its one ask on the head ({asked})' if asked else "nothing in CodeRabbit's state is ours to ask"
+    return f'{CR_UNREVIEWED}; {why}, so a relaunch will not ask CodeRabbit on this head: {USER_ASKS}'
 
 
 def load_output(path):
@@ -274,11 +289,16 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             summary['pinned'] = result['state'].get('config')
             if result.get('pass') is not True and result.get('reason') not in ENDED and isinstance(used, int) and isinstance(most, int) and used >= most:
                 blockers.append(f'cycle budget spent: {used} of {most}; a relaunch needs a larger maxCycles, the user\'s decision')
+        if result.get('stateTooLarge'):
+            blockers.append(f"the returned state is {result['stateTooLarge']} bytes, over the {MAX} a launch loads: no launch can continue "
+                            'from it; keep the output file and report it, never reset or reconstruct the state')
         if result.get('reason') in REFUSED:
             blockers.append(REFUSED[result['reason']])
         if result.get('reason') in ENDED:
             notes.append(ENDED[result['reason']])
-        if result.get('reason') in STALLED:
+        if result.get('reason') == 'coderabbit-unreviewed' and isinstance(result.get('coderabbitAsk'), dict):
+            blockers.append(coderabbit_blocker(result['coderabbitAsk']))
+        elif result.get('reason') in STALLED:
             blockers.append(STALLED[result['reason']])
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "

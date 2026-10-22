@@ -15,7 +15,8 @@ evidence it cannot order, or a read that failed makes that bot `unknown`,
 never `absent`.
 
 stdout ends with one JSON line: headSha, observedAt, headEventAt (null when no
-run or timeline event dates the head, or no bot auto-runs), headEventEvidence, bots (one record per
+run or timeline event dates the head, or no bot auto-runs), headEventEvidence (saying so when, without
+PyYAML, no pull_request run on the head could be read to date it), bots (one record per
 --reviewers name: bot, state, kind, sha, evidence, reason, retryAt: when a rate-limited
 bot's notice says its next review is available, an hour after a CodeRabbit notice
 giving no countdown, else null), and comments (every
@@ -40,6 +41,12 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Only reading a workflow file needs PyYAML; sonar.py and coderabbit_trigger.py import this file under a python3 that may lack it.
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, RateLimited, Unusable, report, run  # noqa: E402
@@ -379,10 +386,14 @@ def head_event(repo, n, view, head):
     # A reopen or ready event keeps the head (GitHub leaves its commit_id null); one naming another commit is about an earlier push.
     tl = newest([e for e in timeline if e.get('event') in ('reopened', 'ready_for_review') and e.get('commit_id') in (None, head)], 'created_at')
     if tl and (best is None or stamp(tl['created_at']) > stamp(best['created_at'])):
-        return tl['created_at'], f"timeline {tl['event']} at {tl['created_at']}"
-    if best:
-        return best['created_at'], f"run {best['id']} ({best['event']}, {best['path']}) created {best['created_at']}"
-    return None, 'no push or head-activity pull_request run on this branch and head, and no reopen or ready event'
+        at, why = tl['created_at'], f"timeline {tl['event']} at {tl['created_at']}"
+    elif best:
+        at, why = best['created_at'], f"run {best['id']} ({best['event']}, {best['path']}) created {best['created_at']}"
+    else:
+        at, why = None, 'no push or head-activity pull_request run on this branch and head, and no reopen or ready event'
+    if yaml is None and any(x.get('event') == 'pull_request' for x in runs):
+        why += '; PyYAML is not installed, so no pull_request run was read'
+    return at, why
 
 
 def dates_head(repo, run_, branch, head_repo):
@@ -397,11 +408,9 @@ def dates_head(repo, run_, branch, head_repo):
 
 @functools.cache
 def pr_types(repo, path, sha):
-    """The pull_request activity types a workflow revision runs on, or None when they cannot be read."""
-    try:
-        import yaml  # here, so sonar.py and coderabbit_trigger.py, which import this file, run without PyYAML
-    except ImportError:
-        raise Unusable('PyYAML is not installed')
+    """The pull_request activity types a workflow revision runs on, or None when they cannot be read, PyYAML missing too."""
+    if yaml is None:
+        return None
     try:
         meta = gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         doc = yaml.safe_load(base64.b64decode(meta['content']).decode())

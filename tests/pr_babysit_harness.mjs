@@ -51,6 +51,8 @@ const seal = ({ digest, ...st }) => ({ ...st, digest: fnv1a(canonical(JSON.parse
 const bare = (v) => Array.isArray(v) ? v.map(bare)
   : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).filter(([, x]) => x !== null).map(([k, x]) => [k, bare(x)])) : v
 const sealLine = (facts) => ({ ...facts, seal: fnv1a(canonical(bare(facts))) })
+// [reviewers, auto-runners] as the validator prompt's harvest command names them.
+const harvestFlags = (prompt) => ['--reviewers', '--auto-run'].map(f => new RegExp(`${f} ([^\\s\`]+)`).exec(String(prompt))?.[1].split(',') ?? [])
 // The JSON a prompt ends with after `key: `, or its trailing list on a line of its own.
 const payloadOf = (prompt, key) => JSON.parse(String(prompt).match(new RegExp(`${key}: (\\{.*\\})$`))[1])
 const trailingList = (prompt) => JSON.parse(String(prompt).slice(String(prompt).indexOf('\n[') + 1))
@@ -337,10 +339,9 @@ async function run(opts = {}) {
       if (Array.isArray(r.findings)) r.findings = r.findings.map(f => ({ related: null, changeReason: null, fixedBy: null, ...f }))
       // `bots: 'reviewed'` / `'pending'` name every auto-running bot in that
       // state; explicit records are filled the same way, one field at a time.
-      // The auto-running bots are the ones the workflow's prompt names.
+      // The auto-running bots are the ones the harvest command names.
       // Every other reviewer gets the harvested record harvest.py gives it, unless the case lists its records whole.
-      const autoRun = (String(prompt).match(/of those, (.+?) auto-run on every push/)?.[1].split(', ')) ?? []
-      const named = String(prompt).match(/reviewers to harvest on this PR are (.+?), and no others/)?.[1].split(', ') ?? []
+      const [named, autoRun] = harvestFlags(prompt)
       const bots = r.bots === 'reviewed' || r.bots === undefined ? autoRun.map(b => bot(b))
         : r.bots === 'pending' ? autoRun.map(b => bot(b, { state: 'absent', sha: null, evidence: [], reason: 'nothing on head' }))
           : r.bots
@@ -678,14 +679,14 @@ test('omitted reviewers default to coderabbit and greptile auto-running, and cod
     const { calls, result } = await run({ args: { reviewers } })
     assert.equal(result.pass, true)
     const prompt = calls.find(c => c.label.startsWith('reviews#')).prompt
-    assert.match(prompt, /harvest on this PR are coderabbit, greptile, code-scanning, and no others: report one bot record for each; of those, coderabbit, greptile auto-run on every push/)
+    assert.deepEqual(harvestFlags(prompt), [['coderabbit', 'greptile', 'code-scanning'], ['coderabbit', 'greptile']])
     assert.deepEqual(result.state.config.autoRun, ['coderabbit', 'greptile'])
   }
 })
 
 test('code-scanning is never waited for, and its findings are fixed like any bot\'s', async () => {
   const alone = await run({ args: { reviewers: ['code-scanning'] } })
-  assert.match(alone.calls.find(c => c.label.startsWith('reviews#')).prompt, /harvest on this PR are code-scanning, and no others: report one bot record for each; none of them auto-run\./)
+  assert.deepEqual(harvestFlags(alone.calls.find(c => c.label.startsWith('reviews#')).prompt), [['code-scanning'], []])
   assert.equal(alone.result.pass, true, JSON.stringify(alone.result.reason))
   const { calls, logs } = await run({
     args: { reviewers: ['code-scanning'] },
@@ -698,7 +699,7 @@ test('code-scanning is never waited for, and its findings are fixed like any bot
 test('the requested reviewers, normalized, are the ones the validator is asked for', async () => {
   const { calls } = await run({ args: { reviewers: ['  CodeRabbit ', 'CopIlot'] } })
   const reviews = calls.find(c => c.label.startsWith('reviews#'))
-  assert.match(reviews.prompt, /the reviewers to harvest on this PR are coderabbit, copilot, and no others/)
+  assert.deepEqual(harvestFlags(reviews.prompt)[0], ['coderabbit', 'copilot'])
   assert.doesNotMatch(reviews.prompt, /greptile/i, 'an unrequested bot must not be harvested')
 })
 
@@ -706,27 +707,27 @@ test('the auto-running reviewers are named apart from the harvest list', async (
   // Harvest-only Copilot must never become a settlement requirement.
   const split = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'], autoRun: [' CodeRabbit '] } })
   const prompt = split.calls.find(c => c.label.startsWith('reviews#')).prompt
-  assert.match(prompt, /harvest on this PR are greptile, coderabbit, copilot, and no others: report one bot record for each; of those, coderabbit auto-run on every push\./)
+  assert.deepEqual(harvestFlags(prompt), [['greptile', 'coderabbit', 'copilot'], ['coderabbit']])
   // Default: everybody harvested; copilot, harvest-only, is not waited for.
   const same = await run({ args: { reviewers: ['greptile', 'coderabbit', 'copilot'] } })
-  assert.match(same.calls.find(c => c.label.startsWith('reviews#')).prompt, /of those, greptile, coderabbit auto-run/)
+  assert.deepEqual(harvestFlags(same.calls.find(c => c.label.startsWith('reviews#')).prompt)[1], ['greptile', 'coderabbit'])
   const nobody = await run({ args: { reviewers: ['copilot'], autoRun: [] } })
-  assert.match(nobody.calls.find(c => c.label.startsWith('reviews#')).prompt, /none of them auto-run\./)
+  assert.deepEqual(harvestFlags(nobody.calls.find(c => c.label.startsWith('reviews#')).prompt)[1], [])
 })
 
 test('greptile is harvested and waited for, or harvested only', async () => {
   const waited = await run({ args: { reviewers: [' Greptile '] } })
-  assert.match(waited.calls.find(c => c.label.startsWith('reviews#')).prompt, /harvest on this PR are greptile, and no others: report one bot record for each; of those, greptile auto-run on every push/)
+  assert.deepEqual(harvestFlags(waited.calls.find(c => c.label.startsWith('reviews#')).prompt), [['greptile'], ['greptile']])
   assert.deepEqual(waited.result.state.config.autoRun, ['greptile'])
   const harvested = await run({ args: { reviewers: ['greptile'], autoRun: [] } })
-  assert.match(harvested.calls.find(c => c.label.startsWith('reviews#')).prompt, /harvest on this PR are greptile, and no others: report one bot record for each; none of them auto-run/)
+  assert.deepEqual(harvestFlags(harvested.calls.find(c => c.label.startsWith('reviews#')).prompt), [['greptile'], []])
   assert.equal(harvested.result.pass, true, JSON.stringify(harvested.result.reason))
 })
 
 test('the usual launch, copilot and coderabbit, waits for coderabbit only', async () => {
   const { calls, result } = await run({ args: { reviewers: ['copilot', 'coderabbit'] } })
   const reviews = calls.find(c => c.label.startsWith('reviews#'))
-  assert.match(reviews.prompt, /the reviewers to harvest on this PR are copilot, coderabbit, and no others/)
+  assert.deepEqual(harvestFlags(reviews.prompt), [['copilot', 'coderabbit'], ['coderabbit']])
   assert.deepEqual(result.state.config.reviewers, ['copilot', 'coderabbit'])
   assert.deepEqual(result.state.config.autoRun, ['coderabbit'])
   assert.equal(result.pass, true, JSON.stringify(result.reason))
@@ -1284,7 +1285,7 @@ test('a second rejection of the same finding, across a resumed launch, stops for
   const aliased = await run({ reviews: rewrittenEnd, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state } })
   assert.equal(aliased.result.reason, 'fix-verification-failed', 'a digest CodeRabbit only rewrote the end of is the same body')
   const dry = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: false, maxCycles: 3, yieldAfterCycle: true } })
-  assert.equal(dry.result.dryRun, true)
+  assert.deepEqual([dry.result.dryRun, dry.result.reason], [true, 'dry-run'])
   const afterDry = await run({ reviews: oneValid, fix: rejecting('1#1'), args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: dry.result.state } })
   assert.equal(afterDry.result.reason, 'fix-verification-failed', 'a dry run keeps the rejection it verified')
   // An answered comment owes no debt: only the hold keeps a twice-rejected finding outstanding (#44).
@@ -1383,7 +1384,7 @@ test('groups the overlap merge joins get one writer and one verifier, and every 
 
 test('a dry run leaves the fix uncommitted', async () => {
   const { result, logs, labels } = await run({ reviews: oneValid, args: { autoPush: false } })
-  assert.equal(result.dryRun, true)
+  assert.deepEqual([result.dryRun, result.reason], [true, 'dry-run'])
   assert.equal(labels.some(l => l.startsWith('push#') || l.startsWith('replies#')), false)
   assert.match(rowsOf(summaries(logs)[0])[0][3], /fixed, uncommitted/)
 })
@@ -1398,7 +1399,7 @@ test('a dry run dispatches no publisher and no posting agent', async () => {
       replies: [{ commentId: 2, body: 'no' }], bots: 'reviewed',
     },
   })
-  assert.equal(result.dryRun, true)
+  assert.deepEqual([result.dryRun, result.reason], [true, 'dry-run'])
   for (const l of labels) {
     assert.ok(!/^(push#|recheck#|replies#|resolve#)/.test(l), `${l} ran in a dry run`)
   }
@@ -1530,7 +1531,7 @@ test('CI that saw nothing move through two whole waits on one head stops ci-stuc
   assert.deepEqual([result.head, result.pending], [HEAD, 2])
   assert.ok(logs.some(l => l.includes('still running with the same 2 pending check(s) after two whole waits')), logs.join('\n'))
   const moving = await run({ ci: RUNNING, args: { maxCycles: 3 } })
-  assert.equal(moving.result.reason, 'maxCycles reached', 'a wait that saw CI move re-arms')
+  assert.equal(moving.result.reason, 'budget-exhausted', 'a wait that saw CI move re-arms')
   // A wait cut short by the review lane is no whole wait.
   const cut = await run({ ci: stuck, throwOn: (l) => l.startsWith('reviews#'), args: { maxCycles: 3 } })
   assert.notEqual(cut.result.reason, 'ci-stuck')
@@ -1552,7 +1553,7 @@ test('CI that saw nothing move through two whole waits on one head stops ci-stuc
   // A slice its relay retried ran without its wait: no whole wait, on either kind of head.
   const retried = (l) => /^ci:collect#\d+\.1$/.test(l)
   const short = await run({ ci: stuck, throwOn: retried, args: { maxCycles: 3, ciWait: 1 } })
-  assert.equal(short.result.reason, 'maxCycles reached')
+  assert.equal(short.result.reason, 'budget-exhausted')
   const none = { ...RUNNING, pending: 0, registered: 0, waiting: 'none' }
   const shortNone = await run({ ci: none, throwOn: retried, args: { maxCycles: 1, ciWait: 1 } })
   assert.notEqual(shortNone.result.pass, true)
@@ -1839,6 +1840,7 @@ const RIG = { check: 'hil / pico', firstError: 'board did not enumerate', files:
 const WAITING = { findings: [], replies: [], bots: 'pending' }
 const YIELD = { autoPush: true, maxCycles: 3, yieldAfterCycle: true }
 const ciLabels = (labels) => labels.filter(l => l.startsWith('ci:'))
+const cycleOf = (label) => Number(label.match(/#(\d+)/)[1])
 const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
 // A judge that re-ran every check it was given: an empty failure list is a re-run by the contract.
 const rerunAll = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: [] })) })
@@ -1847,7 +1849,7 @@ test('a same-head relaunch recalls the judged verdicts from the store: no judge'
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(first.labels), ['ci:collect#1.1', 'ci:collect#1.f', 'ci:judge#1', 'ci:collect#1.w'])
-  assert.deepEqual(Object.keys(first.result.state.ciCache.entries[0]).sort(), ['bucket', 'digest', 'head', 'link'], 'the state keeps digests only')
+  assert.deepEqual(Object.keys(first.result.state.ciCache.entries[0]).sort(), ['bucket', 'digest', 'link'], 'the state keeps digests only, of its expectedHead')
   const again = await run({ store, args: { ...YIELD, state: first.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
   assert.deepEqual(ciLabels(again.labels), ['ci:collect#2.1', 'ci:collect#2.r1'])
   assert.match(again.calls.find(c => c.label === 'ci:collect#2.r1').prompt, / recall --check 'https:\/\/github\.com\/o\/r\/actions\/runs\/1\/job\/1' --repo /)
@@ -2220,13 +2222,57 @@ test('another harvest error keeps today\'s path: every reviewer unknown, re-arme
   assert.equal(result.state.cyclesUsed, 2)
 })
 
+const cacheFill = (n, from = 0) => Array.from({ length: n }, (_, i) => ({ link: job(from + i), bucket: 'fail', digest: fnv1a(String(from + i)) }))
+
+test('a saved state stays loadable: the oldest CI verdict digests go first, and a state still too large is named', async () => {
+  const entries = cacheFill(900)
+  const spent = (over) => { const state = adoptionState({ cyclesUsed: 1, maxCycles: 1, ...over }); return run({ args: adoptionArgs(state, { adoptHead: undefined }) }) }
+  const small = await spent({ ciCache: { reruns: [], entries: [{ ...entries[0], head: HEAD }] } })
+  assert.equal(small.result.reason, 'budget-exhausted')
+  assert.deepEqual(small.result.state.ciCache.entries, [entries[0]], 'an entry saved with its head still loads, and is saved without it')
+  const cached = await spent({ ciCache: { reruns: [], entries } })
+  const kept = cached.result.state.ciCache.entries
+  assert.ok(kept.length > 0 && kept.length < entries.length, `${kept.length} kept`)
+  assert.deepEqual(kept, entries.slice(entries.length - kept.length), 'the newest are kept')
+  const dropped = entries.length - kept.length
+  assert.ok(cached.logs.some(l => new RegExp(`^state: \\d+ bytes, over the 65536 a launch loads — the ${dropped} oldest of 900 CI verdict digest\\(s\\) left out`).test(l)), cached.logs.join('\n'))
+  assert.equal(cached.result.stateTooLarge, undefined)
+  assert.equal(transferOf(cached.result.state).error, undefined)
+  const st = cached.result.state
+  assert.match(transferOf(seal({ ...st, ciCache: { ...st.ciCache, entries: entries.slice(dropped - 1) } })).error, /^state too large/, 'as many as fit')
+  // Measured as state_transfer.py measures it: a non-ASCII character is six bytes there.
+  const decisions = Array.from({ length: 40 }, (_, i) => [`${i}#1`, { verdict: 'invalid', reason: '→'.repeat(300) }])
+  const big = await spent({ decisions, ciCache: { reruns: [], entries: entries.slice(0, 10) } })
+  assert.deepEqual(big.result.state.ciCache.entries, entries.slice(0, 10), 'none left out when leaving them all out would not fit either')
+  assert.equal(big.logs.some(l => /left out/.test(l)), false)
+  const refused = transferOf(big.result.state).error
+  assert.match(refused, /^state too large: \d+ bytes/)
+  assert.equal(big.result.stateTooLarge, Number(refused.match(/(\d+) bytes/)[1]))
+  assert.ok(big.logs.some(l => l === `state: ${big.result.stateTooLarge} bytes, over the 65536 a launch loads — no launch can continue from it`))
+  assert.ok(JSON.stringify(big.result.state).length < 65536, 'the JSON length alone would have passed it')
+})
+
+test('a relaunch from a trimmed state recalls a verdict it kept', async () => {
+  const store = new Map()
+  const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
+  const st = first.result.state
+  const padded = seal({ ...st, ciCache: { ...st.ciCache, entries: [...cacheFill(900, 1000), ...st.ciCache.entries] } })
+  const trimmed = await run({ store, args: { ...YIELD, state: padded }, reviews: WAITING, ci: redWith(RIG).ci })
+  const kept = trimmed.result.state.ciCache.entries
+  assert.ok(kept.length > 1 && kept.length < 901, `${kept.length} kept`)
+  assert.deepEqual(kept.at(-1), st.ciCache.entries[0])
+  const again = await run({ store, args: { ...YIELD, state: trimmed.result.state }, reviews: WAITING, ci: redWith(RIG).ci })
+  assert.deepEqual(ciLabels(again.labels), ['ci:collect#3.1', 'ci:collect#3.r1'], 'no judge')
+  assert.ok(again.logs.some(l => /CI verdicts reused for 1 check\(s\)/.test(l)))
+})
+
 test('a re-run recorded under a copy\'s link still settles the execution it copied', async () => {
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const st = first.result.state
   const job = (n) => `https://github.com/o/r/actions/runs/1/job/${n}`
   // an older launch re-ran it under J2, a copy; the listing now shows J3, a copy of J2, resolved to J1
-  const old = seal({ ...st, ciCache: { ...st.ciCache, reruns: [{ head: st.ciCache.entries[0].head, link: job(2), workflow: 'ci', check: 'hil / pico', sure: true }] } })
+  const old = seal({ ...st, ciCache: { ...st.ciCache, reruns: [{ head: st.expectedHead, link: job(2), workflow: 'ci', check: 'hil / pico', sure: true }] } })
   const copied = await run({ store, args: { ...YIELD, state: old }, reviews: WAITING, ci: redWith({ ...RIG, link: job(1), aliases: [job(3), job(2)] }).ci })
   assert.deepEqual(ciLabels(copied.labels), ['ci:collect#2.1'], 'not reused as red: still settling')
   assert.equal(copied.result.history.at(-1).ci.status, 'running')
@@ -2259,6 +2305,37 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
   // Both copies turn red to green with the head intact: nothing downstream would notice.
   const green = await run({ reviews: WAITING, ci: redWith(RIG).ci, garble: (l, a) => l.startsWith('ci:collect#1.1') ? { ...a, status: 'green', checks: [] } : a })
   assert.ok(green.logs.some(l => /cycle 1: CI inventory failed — the collector died/.test(l)), green.logs.join('\n'))
+})
+
+test('a collector failing the same way on two cycles running stops ci-collect-failed; a passing failure re-arms after a backoff', async () => {
+  const failing = (error, when = () => true) => (l, a) => l.startsWith('ci:collect#') && when(cycleOf(l))
+    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], observedAt: '', seal: '' }
+    : a
+  const auth = await run({ args: { maxCycles: 4 }, garble: failing('gh: authentication expired') })
+  assert.deepEqual([auth.result.reason, auth.result.detail, auth.result.cycles], ['ci-collect-failed', 'gh: authentication expired', 2], auth.logs.join('\n'))
+  assert.deepEqual(auth.napMs, [60000], 'the first cycle without a report waits like any other')
+  assert.equal(auth.labels.filter(l => l.startsWith('reviews#')).length, 2, 'no validator past the second failure')
+  const died = await run({ args: { maxCycles: 4 }, throwOn: 'ci:collect#' })
+  assert.deepEqual([died.result.reason, died.result.detail], ['ci-collect-failed', 'the collector died'])
+  const once = await run({ args: { maxCycles: 3 }, garble: failing('gh: HTTP 502', (c) => c === 1) })
+  assert.notEqual(once.result.reason, 'ci-collect-failed')
+  assert.equal(once.result.pass, true, once.logs.join('\n'))
+  const varied = await run({ args: { maxCycles: 3 }, garble: failing((c) => `gh: HTTP 50${c}`) })
+  assert.equal(varied.result.reason, 'budget-exhausted')
+  // The failure is carried in the state: a resumed launch meeting it again stops at once.
+  const first = await run({ args: { maxCycles: 3, yieldAfterCycle: true }, garble: failing('gh: authentication expired') })
+  assert.equal(first.result.state.last.ciCollectFailed.error, 'gh: authentication expired')
+  const resumed = await run({ args: { maxCycles: 3, yieldAfterCycle: true, state: first.result.state }, garble: failing('gh: authentication expired') })
+  assert.deepEqual([resumed.result.reason, resumed.result.cycles], ['ci-collect-failed', 2])
+  // A failure is of the head the collector queried, not of one the review lane pushed while it ran.
+  const untilFixNote = async (calls) => { for (let i = 0; i < 500 && !calls.some(c => c.label === 'resolve#1'); i++) await tick() }
+  const pushed = await run({ reviews: oneValid, inventoryWait: untilFixNote, args: { maxCycles: 3, yieldAfterCycle: true }, garble: failing('gh: HTTP 502') })
+  const moved = pushed.result.state.expectedHead
+  assert.ok(pushed.labels.includes('resolve#1') && moved !== HEAD, pushed.logs.join('\n'))
+  assert.match(pushed.calls.find(c => c.label === 'ci:collect#1.1').prompt, new RegExp(`--head ${HEAD}`))
+  assert.equal(pushed.result.state.last.ciCollectFailed.head, HEAD)
+  const onPushed = await run({ preflight: { head: moved, prHead: moved }, args: { maxCycles: 3, yieldAfterCycle: true, state: pushed.result.state }, garble: failing('gh: HTTP 502') })
+  assert.notEqual(onPushed.result.reason, 'ci-collect-failed', 'one failure on each of two heads')
 })
 
 test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
@@ -2397,12 +2474,10 @@ test('a state missing a field the writer always saves is refused', async () => {
   const { digest, ...st } = (await run({ args: YIELD })).result.state
   for (const key of ['deferrals', 'acceptedFailures', 'decisions', 'holds', 'ciCache', 'build']) {
     const { [key]: _, ...partial } = st
-    await assert.rejects(run({ args: { ...YIELD, state: seal(partial) } }), /state is not a pr-babysit state of version 3 or 4/, key)
+    await assert.rejects(run({ args: { ...YIELD, state: seal(partial) } }), /state is not a pr-babysit state of version 4/, key)
   }
 })
 
-// A state as a version-3 launch saved it: acceptedFailures as [{ key }], sealed in that form.
-const asV3 = ({ digest, ...st }) => seal({ ...st, version: 3, acceptedFailures: st.acceptedFailures.map(key => ({ key })) })
 // Load a state and save it again with no cycle run: its spent budget stops the launch before preflight.
 const reload = async (state, args = {}) => {
   const r = await run({ args: { ...YIELD, ...args, maxCycles: undefined, state } })
@@ -2411,7 +2486,7 @@ const reload = async (state, args = {}) => {
   return r.result.state
 }
 
-test('a saved state survives a load and save unchanged, and a version-3 one migrates to the same state', async () => {
+test('a saved state survives a load and save unchanged', async () => {
   const twice = async (opts, later = opts) => {
     const first = await run({ ...opts, args: { ...YIELD, ...opts.args } })
     const at = { head: first.result.state.expectedHead, prHead: first.result.state.expectedHead }
@@ -2435,25 +2510,7 @@ test('a saved state survives a load and save unchanged, and a version-3 one migr
     // An acceptance holds only while each launch renews it.
     const renewed = name === 'accepted failures' ? { acceptedFailures: [byKey()] } : {}
     assert.deepEqual(await reload(spent, renewed), spent, `${name}: a load and save changes nothing`)
-    assert.deepEqual(await reload(asV3(spent), renewed), spent, `${name}: the version-3 copy loads as the same state`)
   }
-  const v3 = asV3(cases['accepted failures'].result.state)
-  await assert.rejects(run({ args: { ...YIELD, state: { ...v3, acceptedFailures: [{ key: '0'.repeat(16) }] } } }), /state digest mismatch/, 'a version-3 state is checked as saved')
-})
-
-test('a version-3 state resumes a launch, by state and by stateRef, and its accepted keys are still read', async () => {
-  const first = await run({ ...redWith(PVS), args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING })
-  const v3 = asV3(first.result.state)
-  const resumed = await run({ ...redWith(PVS), args: { ...YIELD, state: v3 }, reviews: WAITING })
-  assert.equal(resumed.result.state.version, 4)
-  assert.equal(resumed.result.state.cyclesUsed, 2)
-  assert.ok(resumed.logs.includes(`accepted failure not renewed by this launch, no longer accepted: key ${PVS_KEY}`), resumed.logs.join('\n'))
-  const loaded = await run({ ...redWith(PVS), args: { ...YIELD, stateRef: { outputFile: '/tmp/tasks/w1.output', digest: v3.digest } }, load: v3, reviews: WAITING })
-  assert.equal(loaded.labels[0], 'state:load#1')
-  assert.equal(loaded.result.state.cyclesUsed, 2, 'the loaded version-3 state carries the budget')
-  const forged = seal({ ...v3, acceptedFailures: [PVS_KEY] })
-  await assert.rejects(run({ args: { ...YIELD, state: forged } }), /not a pr-babysit state of version 3 or 4/, 'a version-3 state with version-4 keys')
-  await assert.rejects(run({ args: { ...YIELD, state: seal({ ...first.result.state, acceptedFailures: [{ key: PVS_KEY }] }) } }), /not a pr-babysit state/)
 })
 
 test('ciNotes reach the judge prompt verbatim, and only when given', async () => {
@@ -3767,8 +3824,7 @@ test('a dry run reports refutations it would post rather than deferring them', a
     reviews: { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'no' }], bots: 'reviewed' },
   })
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'a dry run must post nothing')
-  assert.equal(result.dryRun, true)
-  assert.equal(result.reason, undefined)
+  assert.deepEqual([result.dryRun, result.reason], [true, 'dry-run'])
 })
 
 test('a dropped dismissal survives a later harvest that reports fewer', async () => {
@@ -4525,7 +4581,7 @@ test('a deferral already answered cannot be changed to another issue or reason',
 
 test('a dry run applies a deferral but posts nothing', async () => {
   const { result, labels } = await run({ reviews: oneValid, args: { deferrals: [deferral()], autoPush: false } })
-  assert.equal(result.dryRun, true)
+  assert.deepEqual([result.dryRun, result.reason], [true, 'dry-run'])
   assert.equal(labels.some(l => /^(defer#|fix:)/.test(l)), false)
   assert.deepEqual(result.state.deferrals.map(([id]) => id), ['1#1'])
 })
@@ -5332,7 +5388,7 @@ test('a dry run still runs the fixers it is allowed to run', async () => {
   })
   assert.ok(calls.some(c => c.label.startsWith('fix:')), 'the dry run skipped the fixer')
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'a dry run must post nothing')
-  assert.equal(result.dryRun, true)
+  assert.deepEqual([result.dryRun, result.reason], [true, 'dry-run'])
 })
 
 test('re-overturning a finding does not retire a different dismissal', async () => {
@@ -5372,7 +5428,7 @@ test('a dry run runs the CI fixer before reporting withheld replies', async () =
   })
   assert.ok(calls.some(c => c.label.startsWith('fix:')), 'the dry run skipped the CI fixer')
   assert.equal(calls.some(c => c.label.startsWith('replies#')), false, 'a dry run must post nothing')
-  assert.equal(result.dryRun, true)
+  assert.deepEqual([result.dryRun, result.reason], [true, 'dry-run'])
 })
 
 test('a dismissal survives the fix that moves its line', async () => {
@@ -5426,15 +5482,6 @@ test('an edit is recorded before a refused deferral stops the run, and survives 
   assert.equal(reverted.labels.some(l => l.startsWith('defer#')), false)
   assert.notEqual(reverted.result.pass, true)
   assert.deepEqual(reverted.result.handoffs, [{ commentId: 1, commentDigest: 'd1', why: 'edited after its finding ids were carried' }])
-})
-
-test('an older state carrying seenSinceEdit loads as an edited comment for the caller', async () => {
-  const st = adoptionState({ debt: [[7, { dismissals: ['7#1'], notes: [], seenSinceEdit: ['7#1'], digest: 'after' }]], last: null, cyclesUsed: 0 })
-  const { result, calls } = await run({ args: { autoPush: true, maxCycles: 4, yieldAfterCycle: true, reviewers: ['coderabbit'], state: st },
-    reviews: { findings: [invalidFinding({ commentId: 7, findingId: '7#1', commentDigest: 'after' })], replies: [{ commentId: 7, body: 'no' }], bots: 'reviewed' } })
-  assert.equal(calls.some(c => c.label.startsWith('replies#')), false)
-  assert.deepEqual(result.handoffs, [{ commentId: 7, commentDigest: 'after', why: 'edited after its finding ids were carried' }])
-  assert.deepEqual(debtOf(result, 7), { dismissals: ['7#1'], notes: [], edited: true, digest: 'after' })
 })
 
 test('an edited comment goes to the caller: a later refutation does not answer it', async () => {
@@ -6282,7 +6329,7 @@ const publishing = { reviews: oneValid, scope: ['src/a.c'], args: { autoPush: tr
 test('recorded hook output is committed, audited and pushed with the fix', async () => {
   const { result, logs, calls } = await run({ ...publishing, hooks: gen })
   assert.equal(result.history[0].reviewPush.pass, true, 'the widened commit is pushed')
-  assert.equal(result.reason, 'maxCycles reached', 'and the cycle re-arms for the fresh CI run, as after any push')
+  assert.equal(result.reason, 'budget-exhausted', 'and the cycle re-arms for the fresh CI run, as after any push')
   const commit = calls.find(c => c.label === 'commit#1-review')
   assert.deepEqual(pathLine(commit.prompt), ['src/a.c', 'docs/boards.rst'], 'the committer is handed the widened list')
   const audit = calls.find(c => c.label === 'audit#1-review')
@@ -6783,7 +6830,7 @@ test('a last cycle that pushed reports the budget spent, not old-head records on
     reviews: { findings: [finding()], replies: [], bots: [absent('greptile', { state: 'working', reason: 'Review in progress' }), bot('coderabbit')] },
   })
   assert.equal(result.state.expectedHead, shaFor(1))
-  assert.equal(result.reason, 'maxCycles reached')
+  assert.equal(result.reason, 'budget-exhausted')
   assert.equal(result.pending, undefined)
 })
 
@@ -6907,6 +6954,7 @@ test('a rate-limited CodeRabbit is asked once after its reset, then waited for',
   assert.equal(silent.result.reason, 'coderabbit-unreviewed')
   assert.equal(silent.result.cycles, 3)
   assert.deepEqual(requests(silent.labels), ['crrequest#2'])
+  assert.deepEqual(silent.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: at(21) }] }, 'its one ask is spent: a relaunch asks nothing (#243)')
   assert.equal(headLine(silent.logs)[2], 'cycle 3 summary — CI green, reviews: coderabbit settled (limited: Review rate limited; no review 21m after its trigger)')
 })
 
@@ -6917,10 +6965,12 @@ test('a rate limit is not asked about without the switch, a reset time, or a res
     assert.equal(result.reason, want)
     assert.equal(result.cycles, 1)
     assert.deepEqual(requests(labels), [])
+    if (want) assert.deepEqual(result.coderabbitAsk, retryAt ? { relaunchAsks: 'request', asked: [], retryAt } : { relaunchAsks: null, asked: [] })
     assert.equal(headLine(logs)[0], 'cycle 1 summary — CI green, reviews: coderabbit settled (limited: Review rate limited)')
   }
   const last = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, reviews: quiet([limitedCr(at(20))]) })
   assert.equal(last.result.reason, 'coderabbit-unreviewed', 'no cycle left to wait in')
+  assert.deepEqual(last.result.coderabbitAsk, { relaunchAsks: 'request', asked: [], retryAt: at(20) }, 'never asked: a relaunch after the reset asks')
 })
 
 test('a reset estimated an hour out is waited for to the cap, then asked about; one already passed is asked about at once (#138)', async () => {
@@ -7020,6 +7070,7 @@ test('a failed or lost trigger stops CodeRabbit unreviewed, logged and not asked
     assert.ok(logs.includes(`cycle 1: crtrigger#1: ${line}`), logs.join('\n'))
     assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit settled (skipped: ${MANUAL})`)
     assert.equal(result.state.reviewClock.triggeredAt, null, 'tried and not waiting')
+    assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }] }, 'a failed tick is not tried again')
   }
 })
 
@@ -7091,8 +7142,7 @@ test('a changed or old-format state is refused before anything runs', async () =
   const trace = []
   await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...state, cyclesUsed: 0 } } }), /state digest mismatch/)
   await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: JSON.stringify(state).replace('"cyclesUsed":1', '"cyclesUsed":0') } }), /state digest mismatch/)
-  const { last, digest, ...rest } = state
-  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: { ...rest, version: 2, history: [last] } } }), /not a pr-babysit state of version 3 or 4/)
+  await assert.rejects(run({ trace, args: { yieldAfterCycle: true, maxCycles: 3, state: seal({ ...state, version: 3 }) } }), /not a pr-babysit state of version 4/)
   assert.deepEqual(trace, [], 'no agent ran')
 })
 
@@ -7664,10 +7714,10 @@ test('a resumed state holding an old verdict for the Greptile link reads the gat
   const store = new Map()
   const first = await run({ store, args: YIELD, reviews: WAITING, ci: redWith(RIG).ci })
   const st = first.result.state
-  const [{ head }] = st.ciCache.entries
+  const head = st.expectedHead
   const old = { link: GREPTILE_GATE.link, bucket: 'fail', failures: [{ ...GREPTILE_GATE, job: GREPTILE_GATE.check, cell: null, runId: null, complete: true, signature: 'x', verdict: 'unclassified' }] }
   store.set(`${head} ${old.link}`, old)
-  const carried = seal({ ...st, ciCache: { ...st.ciCache, entries: [...st.ciCache.entries, { head, link: old.link, bucket: 'fail', digest: 'deadbeef' }] } })
+  const carried = seal({ ...st, ciCache: { ...st.ciCache, entries: [...st.ciCache.entries, { link: old.link, bucket: 'fail', digest: 'deadbeef' }] } })
   const again = await run({ store, args: { ...YIELD, state: carried }, reviews: { findings: [], replies: [], bots: 'reviewed' }, ci: redWith(RIG, GREPTILE_GATE).ci })
   const asked = again.calls.filter(c => c.label.startsWith('ci:collect#2.r')).map(c => c.prompt).join('\n')
   assert.doesNotMatch(asked, /greptile/, 'its stored verdict is not recalled')
@@ -7679,7 +7729,6 @@ test('a resumed state holding an old verdict for the Greptile link reads the gat
 })
 
 test('yieldOnChange keeps a launch going through cycles that only waited, and pauses after one the caller must see', async () => {
-  const cycleOf = (label) => Number(label.match(/#(\d+)/)[1])
   const ON = { autoPush: true, maxCycles: 4, yieldOnChange: true }
   // CI settles only in cycle 3: one launch, no pause.
   const waited = await run({ args: ON, ci: (label) => cycleOf(label) < 3 ? RUNNING : GREEN })
@@ -7719,7 +7768,6 @@ test('yieldOnChange pauses when the handoffs change, and refuses yieldAfterCycle
 
 test('a launch that runs several cycles returns every cycle\'s publication receipts', async () => {
   // Cycle 1 answers a refuted finding while CI runs; cycle 2 finds CI green and ends the launch.
-  const cycleOf = (label) => Number(label.match(/#(\d+)/)[1])
   const refuted = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'Not so: line 3.' }], bots: 'reviewed' }
   const { result, logs } = await run({ args: { autoPush: true, maxCycles: 4, yieldOnChange: true }, reviews: refuted,
     ci: (label) => cycleOf(label) < 2 ? RUNNING : GREEN })
@@ -7873,7 +7921,7 @@ test('greptileTrigger waits out a grace with Greptile absent, asks once, then wa
   assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
   assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
   assert.equal(labels.some(l => l.startsWith('prstate#')), false, 'the script reads the PR open at the head itself, just before it posts')
-  assert.match(calls.find(c => c.label === 'reviews#1').prompt, /of those, coderabbit, greptile auto-run on every push.*--auto-run coderabbit,greptile`/)
+  assert.deepEqual(harvestFlags(calls.find(c => c.label === 'reviews#1').prompt)[1], ['coderabbit', 'greptile'])
   assert.ok(logs.includes('cycle 3: greptile#3: requested (comment 7)'), logs.join('\n'))
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), greptileAt: at(2) })
   assert.equal(result.state.greptileRequired, true)

@@ -31,7 +31,8 @@ at most --max-groups review groups, merging to shallower directories when they
 exceed it. `tooling` lists the PR's changed paths that execute when the PR is
 built or tested (build files, scripts, CI, the HIL harness): the caller reads
 their diff before building anything. `ci` summarises the head's checks:
-`unobserved` with none, `red`, `pending` (action_required included), `green`.
+`unobserved` with none, `red`, `pending` (action_required included), `green`,
+`unknown` for a state none of these covers.
 
 --release unlocks the pr-review-<N> sibling whose lock carries the token, once
 the run that took it has ended; nothing locked by it is a no-op, and while
@@ -266,7 +267,6 @@ def prepare(a):
     with locked(path):
         led = load(path, repo, a.pr)
         synced = sync(repo, a.pr, led, lambda: store(path, led))
-        # A partial review is on the PR, so its threads can still be discussed; save refuses a second draft.
         refuse_unsettled(led, head, ('pending',))
         online = [r for r, _ in publications(led) if r['status'] in ONLINE]
         if online and online[-1]['status'] == 'drafted':

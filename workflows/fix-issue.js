@@ -1,6 +1,6 @@
 export const meta = {
   name: 'fix-issue',
-  description: 'Triage one target (issue number, GitHub URL, file path or text) against this checkout, co-plan it with Codex, implement the agreed plan with code-writer committing on the current branch, run the build the repository names, and report what stays with the human: the validation workflow, review rounds, the PR',
+  description: 'Triage one target (issue number, GitHub URL, file path or text) against this checkout, co-plan it with Codex, implement the agreed plan with code-writer committing on the current branch, run the build the repository names, and report what stays with the human: validation, review rounds, the PR',
   whenToUse: 'From the task worktree on its branch, for "fix issue N". Never pushes or comments; a question, an unclear target, an unagreed plan or a change to the target\'s own acceptance criteria stops with a report for the human instead of code. The writer runs only with batch: true, which chief passes because its own completion sequence replaces per-step review; otherwise the run stops once the plan is agreed. One run per worktree, and nothing else edits it while the run plans.',
   phases: [{ title: 'Triage' }, { title: 'Co-plan' }, { title: 'Implement' }, { title: 'Verify' }, { title: 'Report' }],
 }
@@ -41,7 +41,7 @@ const finish = (result, validation = '', review = '') => {
 
 const TRIAGE = {
   type: 'object', additionalProperties: false,
-  required: ['target', 'kind', 'issue', 'repo', 'title', 'summary', 'criteria', 'disposition', 'scope', 'verify', 'validate', 'draftReply', 'needsUser', 'branch', 'head'],
+  required: ['target', 'kind', 'issue', 'repo', 'title', 'summary', 'criteria', 'disposition', 'scope', 'verify', 'draftReply', 'needsUser', 'branch', 'head'],
   properties: {
     target: { type: 'string' }, kind: { enum: ['issue', 'url', 'file', 'text'] },
     issue: { type: ['integer', 'null'] }, repo: { type: 'string' },
@@ -49,12 +49,6 @@ const TRIAGE = {
     disposition: { enum: ['fix', 'implement', 'reply', 'unclear'] },
     scope: { type: 'array', items: { type: 'string' } },
     verify: { type: ['string', 'null'] },
-    validate: {
-      anyOf: [{ type: 'null' }, {
-        type: 'object', additionalProperties: false, required: ['name', 'args', 'limitation'],
-        properties: { name: { type: 'string' }, args: { type: ['object', 'null'] }, limitation: { type: ['string', 'null'] } },
-      }],
-    },
     draftReply: { type: ['string', 'null'] }, needsUser: { type: ['string', 'null'] },
     branch: { type: 'string' }, head: { type: 'string' },
   },
@@ -124,10 +118,6 @@ const triage = await agent(
   'instead of a command (a `Build contract:` line pointing at a skill file), read that file and return the concrete ' +
   'invocation it defines for this scope, not the pointer. null when the repository names neither, and null too when a ' +
   'named contract is missing, unreadable, or defines no invocation for this scope: never infer or compose a substitute. ' +
-  'validate: the saved validation workflow those instructions name; read its source, not only its meta, and choose args that ' +
-  'disable its internal repairs and its own review stages (a coworker lane reviews later) and set its base to the current HEAD ' +
-  'SHA: { name, args, limitation: null }. When it cannot be run that way, { name, args: null, limitation: <why> }; null only ' +
-  'when no such workflow exists. ' +
   'branch: `git rev-parse --abbrev-ref HEAD`; head: `git rev-parse HEAD`. Read only.',
   { label: 'triage', phase: 'Triage', agentType: 'Explore', schema: TRIAGE },
 ).catch(quiet('triage'))
@@ -159,7 +149,7 @@ if (missing.length) {
   return finish({ pass: false, reason: 'triage-incomplete', target, triage, missing })
 }
 ran('triage', 'Explore', 'done', `${found}; scope ${scope.join(', ')}; verify: ${verify}`)
-const contractOf = planScope => ({ branch, head, criteria, scope: planScope, triageScope: scope, verify, validate: triage.validate })
+const contractOf = planScope => ({ branch, head, criteria, scope: planScope, triageScope: scope, verify })
 
 // --- Co-plan: Claude and Codex draft from one brief, an Opus judge and Codex review the combined plan in rounds.
 const within = (path, root) => path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`)
@@ -331,7 +321,7 @@ const dev = await agent(
   'If a step cannot be done as planned or needs a path it does not list, stop before deviating and report notes starting ' +
   '`plan-deviation:` with the step and why.\n' +
   `Repository: ${triage.repo}. Scope, touch nothing outside it: ${planScope.join(', ')}. Verify with: ${verify}\n` +
-  `${STOPS} Stage and commit only your own scope: \`git add -- <paths>\` then \`git commit --only -- <same paths>\`, never a bare \`git commit\`, \`git add -A\` or \`commit -a\`; imperative ` +
+  `${STOPS} Stage and commit only your own scope: \`git add -- <paths>\` then \`git commit --only -m "<subject>" -- <same paths>\`, never a bare \`git commit\`, \`git add -A\` or \`commit -a\`; imperative ` +
   "subject, no trailers, a commit per step where the hooks allow, only after the build and the repository's required pre-commit " +
   'checks pass; a hook failing on a partial change means regrouping paths, not bypassing it.',
   { label: 'implement', phase: 'Implement', agentType: 'code-writer', schema: DEV },
@@ -369,14 +359,10 @@ const reason = !verified.pass ? 'verify-failed'
   : verified.outOfScope.length ? 'out-of-scope' : null
 if (reason) log(`verify: ${reason} — ${verified.detail}`)
 ran('verify', 'haiku', reason || 'pass', `${verified.commits.length} commit(s) on ${verified.branch || '?'}, ${head}..${verified.commits.length ? verified.commits[0].split(' ')[0] : head}; ${cut(verified.detail)}`)
-const v = triage.validate
-const [check, checkLabel] = v && v.args ? [`Workflow /${v.name} ${JSON.stringify(v.args)}, its artifacts then cleaned out of the checkout`, `/${v.name}`]
-  : v ? [`the component stages of /${v.name}, launched separately one read-only stage at a time since it cannot run with repairs and its own reviews disabled (${v.limitation}), their artifacts then cleaned`, `/${v.name} by its component stages`]
-    : [`${verify} alone, no validation workflow being named by the repository's instructions`, `${verify} alone`]
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
-  : `confirm the implement notes carry hook evidence; ${HANDOFF}; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence), its Codex co-review on the plan lane ${lane} with --tier review, with ${check} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and names the co-plan's outcome, remaining disagreement and request ids, and, unless your report already tables the session's spend (chief does), ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl> --full <a new temporary file>\`'s output verbatim; then the human opens the PR`
+  : `confirm the implement notes carry hook evidence; ${HANDOFF}; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence), its Codex co-review on the plan lane ${lane} with --tier review, with ${verify} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and names the co-plan's outcome, remaining disagreement and request ids, and, unless your report already tables the session's spend (chief does), ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl> --full <a new temporary file>\`'s output verbatim; then the human opens the PR`
 return finish({
   pass: !reason, reason, target, issue: triage.issue, kind: triage.kind, disposition: triage.disposition,
-  triage, contract, coplan, implement: dev, commits: verified.commits, verify: verified, validate: triage.validate, next,
-}, checkLabel, `co-review on ${lane}`)
+  triage, contract, coplan, implement: dev, commits: verified.commits, verify: verified, next,
+}, verify, `co-review on ${lane}`)

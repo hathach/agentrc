@@ -27,8 +27,10 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   CodeRabbit's review, a launch without the switch waits on an earlier ask and
   asks nothing, and a head left unreviewed (a failed tick, no review within
   the cap, a skip or limit with nothing more to ask) stops
-  `coderabbit-unreviewed`, never a pass. Needs `autoPush` and `coderabbit` in
-  `autoRun`; the switch itself is never restored from a state.
+  `coderabbit-unreviewed`, never a pass; its `coderabbitAsk` lists the asks
+  made on the head and names the one a relaunch would still make, if any.
+  Needs `autoPush` and `coderabbit` in `autoRun`; the switch itself is never
+  restored from a state.
 - `greptileTrigger` (boolean, default false): set in the repository's
   `CLAUDE.md` when Greptile reviews only on PR open, so a pushed head is
   reviewed only on request. Greptile is then waited on, as if in `autoRun`.
