@@ -1,3 +1,4 @@
 {
-  "autoReview": ["open"]
+  "autoReview": ["open"],
+  "effort": "base"
 }
