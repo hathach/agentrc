@@ -164,6 +164,13 @@ print('{"error": {"type": "rate_limit_error"}}')
 sys.exit(1)
 """
 
+# runs script $2 with stub dir $1 first on PATH: Git for Windows' bin/bash.exe wrapper puts its mingw64/bin, which
+# holds a real curl, and usr/bin ahead of the inherited PATH; $BASH, the bash it wraps, prepends nothing
+STUBS_FIRST = '''bin=$1 script=$2
+command -v cygpath >/dev/null && { bin=$(cygpath -u "$bin"); script=$(cygpath -u "$script"); }
+export PATH="$bin:$PATH"
+exec "$BASH" "$script"'''
+
 
 class UsageTest(unittest.TestCase):
     def setUp(self):
@@ -184,8 +191,8 @@ class UsageTest(unittest.TestCase):
 
     def render(self, cfg=None, payload='{}'):
         env = self.env if cfg is None else {**self.env, 'CLAUDE_CONFIG_DIR': str(cfg)}
-        done = subprocess.run([BASH, str(ROOT / 'statusline.sh')], input=payload, capture_output=True,
-                              encoding='utf-8', env=env, timeout=30)
+        done = subprocess.run([BASH, '-c', STUBS_FIRST, 'bash', str(self.home / 'bin'), str(ROOT / 'statusline.sh')],
+                              input=payload, capture_output=True, encoding='utf-8', env=env, timeout=30)
         self.assertEqual(done.returncode, 0, done.stderr)
         deadline = time.monotonic() + 10
         while any(self.home.rglob('.statusline-*.lock')) and time.monotonic() < deadline:
