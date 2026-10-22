@@ -695,11 +695,11 @@ def reset_esptool(flasher: dict, *, port: str, timeout, run=None, esptool: str =
 def esptool_runtime(esptool: str = 'esptool', *, timeout: float = 60) -> dict:
     """The esptool a flash and its helper sessions run, checked with no device: `esptool` (a
     name on PATH or a path) resolved once to an absolute path, its interpreter by tool_python
-    (the venv path kept, never resolved past its symlink), that interpreter importing an esptool
-    package from the sys.path the script gets (its resolved directory first, unless
-    PYTHONSAFEPATH) and the executable's `version` naming the same version. {'exe', 'python',
-    'version', 'package'}; RuntimeError otherwise. Not cached: a caller keeps the identity for
-    its run."""
+    (the venv path kept, never resolved past its symlink), that interpreter importing one esptool
+    package both from the sys.path the script gets (its resolved directory first, unless
+    PYTHONSAFEPATH) and from the one a helper session beside this file gets, and the executable's
+    `version` naming the same version. {'exe', 'python', 'version', 'package'}; RuntimeError
+    otherwise. Not cached: a caller keeps the identity for its run."""
     exe = shutil.which(esptool)
     if exe is None:
         raise RuntimeError(f'{esptool} is not on PATH')
@@ -709,20 +709,31 @@ def esptool_runtime(esptool: str = 'esptool', *, timeout: float = 60) -> dict:
              'if not getattr(sys.flags, "safe_path", False): sys.path[0] = sys.argv[1]\n'
              'import esptool\n'
              'print(json.dumps([esptool.__version__, esptool.__file__]))')
+    helpers = os.path.realpath(HERE)
     try:
-        imported = subprocess.run([python, '-B', '-c', probe, os.path.dirname(os.path.realpath(exe))],
-                                  capture_output=True, text=True, timeout=timeout, cwd='/')
+        imported, helper = (subprocess.run([python, '-B', '-c', probe, path0], capture_output=True, text=True,
+                                           timeout=timeout, cwd='/')
+                            for path0 in (os.path.dirname(os.path.realpath(exe)), helpers))
         said = subprocess.run([exe, 'version'], capture_output=True, text=True, timeout=timeout, cwd='/',
                               env={**os.environ, **ESPTOOL_ENV})
     except (OSError, subprocess.TimeoutExpired) as e:
         raise RuntimeError(f'esptool runtime {exe}: {e}') from None
-    try:
-        version, package = json.loads(imported.stdout.strip().splitlines()[-1]) if imported.returncode == 0 else ()
-        if not (isinstance(version, str) and isinstance(package, str)):
-            raise TypeError
-    except (ValueError, IndexError, TypeError):
+
+    def package_of(probed):
+        try:
+            version, package = json.loads(probed.stdout.strip().splitlines()[-1]) if probed.returncode == 0 else ()
+        except (ValueError, IndexError, TypeError):
+            return None
+        return (version, package) if isinstance(version, str) and isinstance(package, str) else None
+    runtime = package_of(imported)
+    if runtime is None:
         raise RuntimeError(f'{python}, the interpreter of {exe}, imports no esptool package: '
-                           f'{(imported.stderr or imported.stdout).strip()[-200:]!r}') from None
+                           f'{(imported.stderr or imported.stdout).strip()[-200:]!r}')
+    version, package = runtime
+    found = package_of(helper)
+    if found != runtime:
+        raise RuntimeError(f'{python} imports {found[1] if found else "no esptool package"} for helper sessions in '
+                           f'{helpers}, not {package}, the package {exe} imports')
     if said.returncode or re.findall(r'^esptool v(\S+)$', said.stdout, re.M) != [version]:
         raise RuntimeError(f'{exe} version does not report {version}, the package its interpreter imports: '
                            f'rc {said.returncode}, {said.stdout.strip()[-200:]!r}')

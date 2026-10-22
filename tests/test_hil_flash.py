@@ -1090,21 +1090,29 @@ class EsptoolRuntime(unittest.TestCase):
         exe = self.exe()
         self.assertEqual(hf.esptool_runtime(exe), {'exe': exe, 'python': sys.executable, 'version': '9.9.9',
                                                    'package': str(self.d / 'pkg' / 'esptool' / '__init__.py')})
+        with contextlib.chdir(self.d):
+            self.assertEqual(hf.esptool_runtime('./esptool')['exe'], exe)
 
-    def test_the_package_is_the_one_the_script_imports(self):
+    def test_a_package_the_helper_sessions_do_not_import_is_refused(self):
         (self.d / 'esptool').mkdir()
         (self.d / 'esptool' / '__init__.py').write_text("__version__ = '9.9.9'\n")   # beside it: first on its path
-        exe = self.exe(name='esptool-cli')
-        self.assertEqual(hf.esptool_runtime(exe)['package'], str(self.d / 'esptool' / '__init__.py'))
-        with contextlib.chdir(self.d):
-            self.assertEqual(hf.esptool_runtime('./esptool-cli')['exe'], exe)
+        no_other = subprocess.run([sys.executable, '-c', 'import esptool'], capture_output=True).returncode != 0
+        for what, package in (('another package', '9.9.9'), ('no package', None)):
+            with self.subTest(what):
+                if package is None and not no_other:
+                    self.skipTest('this interpreter has an esptool package outside the user site')
+                os.environ['PYTHONPATH'] = ''
+                exe = self.exe(name='esptool-cli', package=package)
+                with self.assertRaisesRegex(RuntimeError, 'for helper sessions in .*, not '
+                                            + re.escape(str(self.d / 'esptool' / '__init__.py'))):
+                    hf.esptool_runtime(exe)
 
     def test_a_failed_or_malformed_import_probe_is_refused(self):
         said = subprocess.CompletedProcess([], 0, 'esptool v9.9.9\n', '')
         for what, probe in (('exit 1', subprocess.CompletedProcess([], 1, '["9.9.9", "/p"]\n', 'boom')),
                             ('no package path', subprocess.CompletedProcess([], 0, '["9.9.9", null]\n', '')),
                             ('not a pair', subprocess.CompletedProcess([], 0, '"9.9.9"\n', ''))):
-            with self.subTest(what), mock.patch.object(hf.subprocess, 'run', side_effect=[probe, said]), \
+            with self.subTest(what), mock.patch.object(hf.subprocess, 'run', side_effect=[probe, probe, said]), \
                     self.assertRaisesRegex(RuntimeError, 'imports no esptool package'):
                 hf.esptool_runtime(self.exe())
 

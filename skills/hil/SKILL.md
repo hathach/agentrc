@@ -208,8 +208,8 @@ recovery stay the contract's. Linux only.
   unknown command or output shape fails). `esptool_problem(op)` does the same
   for `flash_esptool` against the offsets its last attempt wrote (each written
   once, verified, then the hard reset), `esptool_runtime()` the esptool the flash and its helper sessions run (one
-  package, its version), and `esptool_port(uid)` the one tty for a probe
-  serial, refusing an ambiguous or missing one.
+  package, the one `scripts/esptool_session.py` imports too, its version), and `esptool_port(uid)` the one tty for
+  a probe serial, refusing an ambiguous or missing one.
 - A flash or reset returns an `Operation`: the last run's `CompletedProcess`
   fields plus `attempts`, each run's command, command file, output and rc on
   its own, never concatenated; `retried` is every attempt but the last. An
