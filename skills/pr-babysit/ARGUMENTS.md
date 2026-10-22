@@ -1,6 +1,6 @@
 # pr-babysit arguments
 
-The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workflows/pr-babysit.js`).
+The `args` object `workflows/pr-babysit.js` takes (installed as `${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js`).
 
 - `pr` (number, required).
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;

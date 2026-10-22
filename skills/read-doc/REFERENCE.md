@@ -57,7 +57,7 @@ for books that no longer have a PDF in the library metadata. Run it after
 importing documents, or nightly:
 
 ```cron
-17 3 * * * python3 ~/.claude/skills/read-doc/scripts/locate.py build --all >/dev/null
+17 3 * * * python3 ${AGENTRC_DIR:-$HOME/.claude}/skills/read-doc/scripts/locate.py build --all >/dev/null
 ```
 
 Photography books are skipped by tag (`--skip-tag` replaces that list); a

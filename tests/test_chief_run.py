@@ -690,6 +690,22 @@ class ChiefRun(unittest.TestCase):
         copy.write_text('new')
         self.assertEqual(self.run_it().returncode, 0)
 
+    def test_a_project_install_link_to_this_checkout_shadows_nothing(self):
+        self.stream(init(), result())
+        self.installed('workflows', 'pr-babysit.js', 'an older user install')
+        self.installed('agents', 'chief.md', 'an older user install')
+        for kind, name in (('workflows', 'pr-babysit.js'), ('agents', 'chief.md')):   # as install.py --project links them
+            link = self.worktree / '.claude' / kind / name
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(SCRIPT.parents[3] / kind / name)
+        r = self.run_it()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        shutil.rmtree(self.out)
+        (self.fake / 'argv.json').unlink()
+        link.unlink()
+        link.symlink_to(self.project('agents', 'elsewhere.md', 'old'))   # a link to anything else is still a copy
+        self.assert_refused(self.run_it(), ['.claude/agents/chief.md'], ['pr-babysit.js'])
+
     def test_the_user_scope_follows_claude_config_dir(self):
         self.stream(init(), result())
         cfg = self.root / 'cfg'

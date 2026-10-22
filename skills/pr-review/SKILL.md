@@ -13,7 +13,7 @@ repo view`). Scripts print one JSON line, the last on stdout; `{"error"}` with
 exit 2 means the facts could not be read, and nothing is filled in.
 
 ```bash
-S=~/.claude/skills/pr-review/scripts
+S=${AGENTRC_DIR:-$HOME/.claude}/skills/pr-review/scripts
 python3 $S/prepare.py --pr N [--repo O/R] [--full]            # checkout top level: pin, worktree, mode
 python3 $S/prepare.py --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
 python3 $S/prepare.py --release --pr N --token T                # any worktree: unlock that run's review tree
@@ -117,8 +117,8 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
    local board's entry is added or enabled in the worktree's rig config,
    uncommitted, by the hardware unit, and restored before step 3. Each row it
    passes on is built from the report that run wrote, by the verdicts of the
-   shared `hil` page, read by path (`~/.claude/skills/hil/SKILL.md`; under
-   Codex `~/.codex/skills/hil/SKILL.md`), never through a skill lookup a
+   shared `hil` page, read by path (`${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md`; under
+   Codex `${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md`), never through a skill lookup a
    project's own skill could shadow, with the HIL contract's Results
    predicates: `{board, verdict:
    pass|fail|not-run, regression: verified|none|unknown, testedHead, report}`. A

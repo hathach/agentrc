@@ -759,7 +759,8 @@ test('the preflight pins the checkout without touching it', async () => {
   assert.equal(pre.label, 'preflight')
   assert.match(pre.prompt, /Editing and committing nothing/)
   assert.ok(pre.prompt.includes('preflight.py --pr 3888 --needs '), pre.prompt)
-  const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
+  const scripts = new Set([...body.matchAll(/`\$\{AGENTRC\}(\/skills\/[\w./-]+\.py)`/g)].map(m => '"${AGENTRC_DIR:-$HOME/.claude}"' + m[1]).filter(p => !p.endsWith('/preflight.py')))
+  assert.ok(scripts.size >= 10, 'the script constants were found')
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
     ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
@@ -2566,7 +2567,7 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
   assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
   const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
   assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
-  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `python3 ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888` /)
+  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `python3 "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888` /)
   // A copy that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
   const miscopied = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
   assert.equal(miscopied.result.reason, 'pr-state-unread')

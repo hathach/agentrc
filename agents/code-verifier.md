@@ -14,7 +14,7 @@ Whenever a conclusion, hypothesis, review finding, experiment or code change dep
 
 ## Reporting discipline
 
-Coverage-first: report every issue you find, including uncertain or low-severity ones; do NOT filter for importance or confidence, a downstream `finding-verifier` does that. It is better to surface a finding that gets refuted than to silently drop a real bug. `severity` is a provisional level on the one scale (critical|high|medium|low|nit) defined in the Severity section of `~/.claude/agents/finding-verifier.md` (`~/.codex/agents/` under Codex): read it before assigning one. `confidence` is high|medium|low. `snippet` is the offending line(s); `why` concisely explains the triggering conditions, failure mechanism and consequence.
+Coverage-first: report every issue you find, including uncertain or low-severity ones; do NOT filter for importance or confidence, a downstream `finding-verifier` does that. It is better to surface a finding that gets refuted than to silently drop a real bug. `severity` is a provisional level on the one scale (critical|high|medium|low|nit) defined in the Severity section of `${AGENTRC_DIR:-$HOME/.claude}/agents/finding-verifier.md` (`${AGENTRC_DIR:-$HOME/.codex}/agents/` under Codex): read it before assigning one. `confidence` is high|medium|low. `snippet` is the offending line(s); `why` concisely explains the triggering conditions, failure mechanism and consequence.
 
 ## Output contract
 

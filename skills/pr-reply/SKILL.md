@@ -21,7 +21,7 @@ answer (a `Fixed in ` note, or anything else) still blocks it. Its receipts are
 the evidence; a `201` from GitHub is not.
 
 ```bash
-R=~/.claude/skills/pr-reply/scripts/reply.py
+R=${AGENTRC_DIR:-$HOME/.claude}/skills/pr-reply/scripts/reply.py
 python3 $R --pr <N> --manifest <file.json>
 # file.json: {"replies": [{"commentId": 4013179956, "body": "...", "digest": "<8 hex>"}]}
 python3 $R --digest "$body"      # the digest of a body, for a manifest written by hand

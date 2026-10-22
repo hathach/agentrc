@@ -10,7 +10,7 @@ agentrc's `worktree-children` herdr plugin then removes the siblings and
 deletes the branches. Their docstrings hold every check and exit code.
 
 ```bash
-python3 ~/.claude/skills/worktree-remove/scripts/worktree_remove.py [PATH] --dry-run [--pending "<item>"]...
+python3 ${AGENTRC_DIR:-$HOME/.claude}/skills/worktree-remove/scripts/worktree_remove.py [PATH] --dry-run [--pending "<item>"]...
 ```
 
 - Pass each follow-up of this task, including a headless chief report's, that

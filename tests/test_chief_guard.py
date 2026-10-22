@@ -326,6 +326,11 @@ class ChiefGuard(unittest.TestCase):
         self.assert_denied('python3 ~/.claude/skills/pr-babysit/scripts/push.py --pr 1', 'inside its workflow')
         self.assert_denied('python3 -X utf8 /x/sonar.py --pr 1', 'inside its workflow')
         self.assert_allowed('python3 ~/.claude/skills/pr-babysit/scripts/launch_result.py --output /tmp/o')
+        # the form the skills and agents write, which a project install's AGENTRC_DIR points at the checkout
+        self.assert_denied('python3 ${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts/push.py --pr 1', 'inside its workflow')
+        self.assert_allowed('python3 ${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts/launch_result.py --output /tmp/o')
+        self.assert_allowed('python3 ${AGENTRC_DIR:-$HOME/.claude}/skills/headless-chief/scripts/run_cost.py --journal /tmp/j '
+                            '--full /tmp/f')
 
     def test_writes_inside_the_worktree_are_denied(self):
         for c in (f'echo x > {self.wt}/a', f'rm {self.wt}/src/a.c', f'mv /tmp/a {self.wt}/src/',

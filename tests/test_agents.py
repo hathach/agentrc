@@ -33,7 +33,7 @@ class AgentFiles(unittest.TestCase):
                 if (AGENTS / f'{stem}.toml').exists():  # the toml is optional: install.py links it when present
                     toml = tomllib.loads((AGENTS / f'{stem}.toml').read_text())
                     self.assertEqual(toml['name'], stem)
-                    self.assertIn(f'~/.codex/agents/{stem}.md', toml['developer_instructions'])
+                    self.assertIn(f'${{AGENTRC_DIR:-$HOME/.codex}}/agents/{stem}.md', toml['developer_instructions'])
 
     def test_chief_accepts_the_changed_criteria_hw_debugger_reports_on(self):
         """chief cannot read hw-debugger.md, so each carries the list of what counts
@@ -191,8 +191,8 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('no human grant or verbatim exchange is needed for its hardware operations', skill)
         # lock authority is the shared hil page's, read by path; target-debug keeps no copy of its rules
         self.assertIn("the shared `hil` page's Board locks names for that board and operation, read by path", skill)
-        self.assertIn('`~/.claude/skills/hil/SKILL.md`', skill)
-        self.assertIn('`~/.codex/skills/hil/SKILL.md`', skill)
+        self.assertIn('`${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md`', skill)
+        self.assertIn('`${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md`', skill)
         for stale in ('forced-lock recovery', 'never force'):
             self.assertNotIn(stale, skill)
         self.assertIn('a CI runner is never stopped', skill)
@@ -221,8 +221,8 @@ class AgentFiles(unittest.TestCase):
 
     def test_hil_operator_refuses_hardware_work_without_the_project_contract(self):
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
-        self.assertIn('`~/.claude/skills/hil/SKILL.md`', body)
-        self.assertIn('`~/.codex/skills/hil/SKILL.md`', body)
+        self.assertIn('`${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md`', body)
+        self.assertIn('`${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md`', body)
         self.assertIn('perform no hardware action and return the blocker', body)
         self.assertIn('Never invent a command, choose another rig, bypass a lock, or report unexecuted work as passing.', body)
         page = ' '.join((SKILLS / 'hil' / 'SKILL.md').read_text().split())

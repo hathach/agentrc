@@ -70,8 +70,8 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
 - **Lock.** Hold the board through its HIL contract's Reservation for the whole hardware phase. A refused hold waits
   within the lock-wait budget, then returns `blocked` with the holder; a recovery blocker (a cleanup holder, a
   protected record left behind or a takeover journal) returns `blocked` at once. Never kill a holder, release a hold not yours or bypass a lock unless the prompt carries the scope
-  the shared `hil` page's Board locks names for that board and operation, read by path (`~/.claude/skills/hil/SKILL.md`;
-  under Codex `~/.codex/skills/hil/SKILL.md`), never through a skill lookup a project's own skill could shadow; a
+  the shared `hil` page's Board locks names for that board and operation, read by path (`${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md`;
+  under Codex `${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md`), never through a skill lookup a project's own skill could shadow; a
   refusal alone never adds it, and a CI runner is never stopped. Reuse a supplied HIL reproduction while its firmware,
   configuration, reproducer and relevant rig inputs match; otherwise resolve equivalent
   manual steps through the HIL contract, and if there are none return `blocked` naming the exact HIL reproduction

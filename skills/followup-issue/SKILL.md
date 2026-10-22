@@ -9,7 +9,7 @@ description: Open one follow-up issue, or comment new evidence on the open issue
 a repository; its docstring defines the checks, the receipt and the exit codes.
 
 ```bash
-P=~/.claude/skills/followup-issue/scripts/publish.py
+P=${AGENTRC_DIR:-$HOME/.claude}/skills/followup-issue/scripts/publish.py
 python3 $P create --repo <o/r> --allow-repo <o/r> [--allow-repo hathach/agentrc] --title "<t>" --body-file <f> [--label <l>]
 python3 $P comment --repo <o/r> --allow-repo <o/r> --issue <N> --body-file <f>
 ```

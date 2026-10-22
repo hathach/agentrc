@@ -12,7 +12,7 @@ the workflow refuses to publish, and the caller never fills in what is
 missing. Each script's docstring says what it reports.
 
 ```bash
-S=~/.claude/skills/pr-babysit/scripts
+S=${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts
 python3 $S/preflight.py --pr N [--needs P]   # the checkout and the PR it must stay; P a script the workflow calls
 python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
 python3 $S/preflight.py --state N            # before a GitHub write: is the PR still OPEN?

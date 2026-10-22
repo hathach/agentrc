@@ -1,7 +1,7 @@
 name = "finding-verifier"
-description = "Load the canonical finding-verifier agent from ~/.codex/agents/finding-verifier.md."
+description = "Load the canonical finding-verifier agent from ${AGENTRC_DIR:-$HOME/.codex}/agents/finding-verifier.md."
 model = "gpt-6-sol"
 model_reasoning_effort = "xhigh"
 developer_instructions = """
-Before acting, read ~/.codex/agents/finding-verifier.md completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
+Before acting, read ${AGENTRC_DIR:-$HOME/.codex}/agents/finding-verifier.md completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
 """
