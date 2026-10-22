@@ -94,14 +94,14 @@ def halted(dhcsr):
 def note_before(core, text):
     """core['before'] from the first session's output, complete or not, once an M-profile CPUID and the DHCSR read
     before the halt are in it."""
-    reads = [(int(a, 16), int(v, 16)) for a, v in ps._MEM32_RE.findall(text)][:2]
-    if [a for a, _ in reads] != [CPUID, ps.DHCSR]:
+    reads = ps.JLink._in_order(text, [CPUID, ps.DHCSR])
+    if len(reads) != 2:
         return
     try:
-        ps.check_m_profile(reads[0][1])
+        ps.check_m_profile(reads[0])
     except ToolError:
         return
-    core['before'] = 'halted' if halted(reads[1][1]) else 'running'
+    core['before'] = 'halted' if halted(reads[1]) else 'running'
 
 
 def jlink_dump(backend, cb, channel, resume, tmp, timeout, core):
