@@ -38,6 +38,7 @@ Your final message is parsed by a program. Return ONLY this JSON: its first char
 
 `rateLimit` appears only on a rate-limited harvest, as above:
 `{"error": "...", "observedAt": "...", "resetAt": "<ISO 8601 or null>", "secondary": false}`.
+`harvestError` appears only on a harvest that failed twice without a rate limit, as above.
 One record per named reviewer, `state` one of `reviewed`, `working`,
 `queued`, `settled`, `absent`, `unknown`, or `harvested` for one whose state is
 not read; `kind` is `skipped`, `limited`,
