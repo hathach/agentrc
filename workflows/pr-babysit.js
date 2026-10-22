@@ -489,6 +489,8 @@ const REVIEWS = {
         properties: { commentId: { type: 'integer' }, body: { type: 'string' } },
       },
     },
+    // harvest.py's error, verbatim, when it failed twice for any other reason (#205).
+    harvestError: { type: 'string' },
     // harvest.py's error line when GitHub refused it for a rate limit, with that error.
     rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
   },
@@ -2255,6 +2257,12 @@ const runLanes = async (cycle, entry, lanes) => {
     if (r.rateLimit) {
       noteLimit(r.rateLimit)
       return null
+    }
+    // Copied, not described: the validator's own words for one error change every cycle, so no wait clocks it (#205).
+    if (r.harvestError) {
+      log(`cycle ${cycle}: harvest.py failed twice — ${r.harvestError}`)
+      entry.error = `harvest.py failed: ${r.harvestError}`
+      return stop(cycle, 'harvest-failed', { detail: r.harvestError })
     }
     if (reviewLane && reviewers.length === 0) log(`cycle ${cycle}: no reviewers requested — CI lane only`)
     entry.reviews = reviewLane ? r : null

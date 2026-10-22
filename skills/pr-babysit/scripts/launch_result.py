@@ -96,6 +96,8 @@ STALLED = {
     'github-rate-limited': 'GitHub refused a call for a rate limit (`rateLimit`): relaunch from the stateRef after its resetAt, '
                            'or after a few minutes for a secondary limit',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
+    'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
+                      'python3 on PATH lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared',
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
                      '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',
 }

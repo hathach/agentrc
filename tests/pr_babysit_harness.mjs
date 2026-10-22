@@ -2805,6 +2805,19 @@ test('a mislabeled commit SHA is not shown as a commit', async () => {
   assert.equal(rowsOf(summaries(relabeled.logs)[0])[0][4], shaFor(1).slice(0, 8))
 })
 
+test('a harvest that failed twice stops the launch at once, whatever the validator calls it (#205)', async () => {
+  const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', bots: [], botsWhole: true,
+    findings: [], replies: [], harvestError: 'PyYAML is not installed' }
+  const { result, labels, logs } = await run({ reviews: failed, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(result.reason, 'harvest-failed')
+  assert.equal(result.detail, 'PyYAML is not installed')
+  assert.equal(result.history[0].error, 'harvest.py failed: PyYAML is not installed')
+  assert.deepEqual(labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], 'no further cycle')
+  assert.equal(labels.some(l => /^(fix:|commit#|push#)/.test(l)), false)
+  assert.equal(result.history[0].ci.status, 'green', 'the CI lane is still awaited')
+  assert.ok(logs.some(l => l === 'cycle 1: harvest.py failed twice — PyYAML is not installed'), logs.join('\n'))
+})
+
 test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')
