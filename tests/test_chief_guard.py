@@ -129,8 +129,76 @@ class ChiefGuard(unittest.TestCase):
     @needs_msys
     def test_heredoc_body_is_data_but_its_line_counts(self):
         self.assert_allowed("cat > /tmp/brief.md <<'EOF'\ngit push\ngh pr merge 1\nEOF")
+        self.assert_allowed("cat > /tmp/brief.md <<'EOF'\n# Brief\n\nline 2\nEOF\ncat /tmp/brief.md")
+        # a `<<` in a body is data, whatever follows it, read in linear time
+        for c in ("cat > /tmp/brief.md <<'EOF'\nx = 1 << 2\nEOF", "cat > /tmp/brief.md <<'EOF'\na << b\nEOF",
+                  "cat > /tmp/brief.md <<'EOF'\nuse cout << x; here\nEOF", "cat > /tmp/brief.md <<EOF\nrun cat <<EOF-1\nEOF",
+                  "cat > /tmp/brief.md <<'EOF'\n" + 'a << b\n' * 30000 + 'EOF'):
+            with self.subTest(c=c[:60]):
+                start = time.monotonic()
+                self.assert_allowed(c)
+                self.assertLess(time.monotonic() - start, 3)
         self.assert_denied("cat > src/x.md <<'EOF'\nhello\nEOF", 'literal absolute path')
         self.assert_denied("cat <<EOF | tee src/x\nhi\nEOF", 'literal absolute path')
+
+    def test_a_heredoc_ends_where_bash_ends_it(self):
+        # the body ends at the first line holding just the delimiter
+        for c in (  # only `<<-` strips leading tabs, and neither strips spaces, so a later heredoc cannot swallow it
+                  'cat <<D\nhi\n  D\ncat <<X\nD\ngit push\nX', 'cat <<D\nhi\nD \ncat <<X\nD\ngit push\nX',
+                  'cat <<-D\nhi\n  D\ncat <<X\n\tD\ngit push\nX', 'cat <<EOF\nEOF\ngit push\nEOF',
+                  # a here-string has no body
+                  'cat <<<EOF\ngit push\nEOF',
+                  # a heredoc ending each line, read in linear time
+                  ': <<E\nx\nE\n' * 32000 + 'git push\n',
+                  # a shift in `$((...))` or a `<<` on a comment line opens no body
+                  'x=$((1 << 3))\ngit push\n3', '# <<:\ngit push\n:', '# <<EOF\ngit push\nEOF',
+                  # a substitution is read past a heredoc in it, its placeholder no opener, an unquoted body's own screened
+                  'echo "$(cat <<\'EOF\'\nx\nEOF\ngit push\nHEREDOC\n)"', 'echo "$(cat <<EOF\n$(git push)\nEOF\n)"',
+                  'echo "`cat <<EOF\n$(git push)\nEOF\n`"'):
+            with self.subTest(c=c[:60]):
+                start = time.monotonic()
+                self.assert_denied(c, 'changes the repository')
+                self.assertLess(time.monotonic() - start, 3)
+        # a delimiter that is not a plain or fully quoted word: bash reads its end, or its word, otherwise
+        for c in ('cat <<EOF-1\nEOF-1\ngit push\nEOF', "cat <<'EOF-1'\nhi\nEOF-1\ngit push\nEOF",
+                  'cat <<"EOF-1"\nhi\nEOF-1\ngit push\nEOF', "cat <<'EOF'-1\nhi\nEOF-1\ngit push\nEOF",
+                  'cat <<E"O"F\nhi\nEOF\ngit push\nE"O"F', 'cat <<\\EOF\nhi\nEOF\ngit push\n\\EOF',
+                  "cat <<$'A'\nhi\nA\ngit push\n$A", 'cat <<"A\\"B"\nhi\nA"B\ngit push\nA\\"B', 'cat <<`a b`\nhi\n`a\n',
+                  "cat <<'EOF-1'\ngit push\nEOF-1", 'cat <<"EOF-1"\ngit push\nEOF-1', "cat <<'EOF'-1\ngit push\nEOF-1",
+                  'cat <<EOF-1\nhi\nEOF-\\\n1\nEOF-1', "cat <<'E-F'\nx\\\n#'\nE-F\nsed -i s/a/b/ src/a.c\n# '",
+                  'cat <<EOF#\nhi\nEOF#\ngit push\nEOF', 'cat <<EOF\r\nhi\nEOF\r\ngit push\nEOF',
+                  'cat <<:\r\nbody\n:\r\ngit push\n:', 'cat << -E\nhi\n-E\ngit push\nE',
+                  # read over the raw command, a `<<` in quotes or a trailing comment counts too
+                  "echo '<<: '\ngit push\n:", "echo '<<EOF'\ngit push\nEOF", 'git status # <<:\ngit push\n:',
+                  '$((1))# <<:\ngit push\n:'):
+            with self.subTest(c=c):
+                self.assert_denied(c, "heredoc's delimiter", "plain word delimiter such as EOF or 'EOF'")
+        # bash reads a second heredoc's body after the first's, where HEREDOC reads commands
+        for c in ('cat <<A <<B\nA\ncat <<:\nB\ngit push\n:', 'cat <<A <<B\nA\ncat <<C\nB\ngit push\nC',
+                  'cat <<A <<B\nA\ngit push\nB'):
+            with self.subTest(c=c):
+                self.assert_denied(c, 'second heredoc on a line')
+        # bash reads the rest of the command as an unterminated body
+        for c in ("cat <<A\ncat <<':'\n$(git push)\n:", "cat <<A\ncat <<'B'\n$(git push)\nB", 'cat <<-A\nhi\n A\n',
+                  ': <<A\n' * 32000 + 'git push\n'):
+            with self.subTest(c=c[:60]):
+                self.assert_denied(c, 'no line after this heredoc ends it')
+        for c in ('cat <<-EOF\n\tgit push\n\tEOF', 'cat <<EOF;echo x\ngit push\nEOF', 'cat <<EOF\nEOF\ngit status',
+                  'cat <<EOF2\nhi\nEOF2\ngit status', 'cat <<"EOF"\n$(git push)\nEOF', "cat <<- 'EOF'\n\thi\n\tEOF",
+                  'cat <<<"a b"\ngit status', 'cat <<<"$x"', 'echo $((1<<2))',
+                  # a heredoc in a substitution, its placeholder no opener when the substitution is read
+                  'echo "$(cat <<\'EOF\'\nhello\nEOF\n)"', 'echo "$(cat <<EOF\nhello\nEOF\n)"',
+                  'x="$(cat <<\'EOF\'\nhello\nEOF\n)"\necho "$x"', 'echo "`cat <<\'EOF\'\nhello\nEOF\n`"',
+                  'gh issue view 3 --json body --jq "$(cat <<\'EOF\'\n.body\nEOF\n)"',
+                  # a shift or a comment line opens no body
+                  'x=$((1 << 3))\necho $x', '# 1 << 2\ngit status', 'echo $((1<<2))\n' * 30000,
+                  # a `<<` on the last line opens no body
+                  "grep -n '<<-' f", 'git status\ngrep -c "<<EOF-1" f', "echo '<<'", 'echo $((1<<2)) ' * 30000):
+            with self.subTest(c=c[:60]):
+                start = time.monotonic()
+                self.assert_allowed(c)
+                self.assertLess(time.monotonic() - start, 3)
+        self.assert_denied("git commit -F - <<'EOF'\nfix x\n\nbody\nEOF", '`git commit` changes the repository')
 
     def test_gh_reads_pass(self):
         for c in ('gh pr view 12 --json state', 'gh pr checks 12', 'gh -R o/r pr list', 'gh issue view 3',
@@ -411,8 +479,7 @@ class ChiefGuard(unittest.TestCase):
                   'sudo -u {a,b} git log', 'timeout -s {KILL,TERM} 5 git log', 'timeout --kill-after={1..3} 5 git log',
                   'nice -n [5] git log', 'timeout 5? git log', 'xargs -n {1,2} cat',
                   # behind another wrapper
-                  'nice -n 5 timeout {5,git,push}', 'env -i nice -n {1..3} git log',
-                  r"find /tmp -exec env nice -n {5,git,push} \;"):
+                  'nice -n 5 timeout {5,git,push}', 'env -i nice -n {1..3} git log', 'echo | xargs env nice -n {1..3} cat'):
             self.assert_denied(c, 'expanded at run time')
         # a quoted brace or glob is literal, a bare `{}` is no expansion, and the program's own arguments are its own
         for c in ("timeout '{5,git,push}' true", "env -u 'A*' git log", 'env -u "{A,B}" git log', 'nice -n \\{5,git\\} true',
@@ -436,6 +503,72 @@ class ChiefGuard(unittest.TestCase):
                   'gh pr list -- {a,b}'):
             self.assert_allowed(c)
 
+    def test_a_brace_list_given_to_a_command_whose_words_the_guard_reads_is_denied(self):
+        # #199: each hides what its expanded form shows, past `--` too; the expanded form must stay denied
+        for c, expanded in (('sed {-i,s/a/b/,src/a.c}', 'sed -i s/a/b/ src/a.c'),
+                            ('tar tf {/tmp/a.tar,--checkpoint=1,--checkpoint-action=exec=echo}',
+                             'tar tf /tmp/a.tar --checkpoint=1 --checkpoint-action=exec=echo'),
+                            ('perl {-pi,-e,s/a/b/,src/a.c}', 'perl -pi -e s/a/b/ src/a.c'),
+                            ('curl {-K,/tmp/cfg,https://x}', 'curl -K /tmp/cfg https://x'),
+                            ('find {/tmp,-delete}', 'find /tmp -delete'), ('find -- {/tmp,-delete}', 'find -- /tmp -delete'),
+                            (f'curl {{-o,{self.wt}/src/a}} https://h/', f'curl -o {self.wt}/src/a https://h/'),
+                            (r'find . {-exec,rm} {} \;', r'find . -exec rm {} \;'),
+                            ("bash {-c,'git push'}", "bash -c 'git push'"),
+                            (f'dd {{of={self.wt}/src/a,if=/tmp/in}}', f'dd of={self.wt}/src/a if=/tmp/in'),
+                            (f'chmod {{--reference={self.wt}/src/a,{self.wt}/src/b}}',
+                             f'chmod --reference={self.wt}/src/a {self.wt}/src/b'),
+                            ('export {GIT_PAGER=less,X=1}', 'export GIT_PAGER=less X=1'),
+                            ('shopt -s {expand_aliases,x}', 'shopt -s expand_aliases x'),
+                            ('python3 {push.py,x}', 'python3 push.py x'),
+                            ('timeout 5 sed {-i,x}', 'timeout 5 sed -i x'),
+                            ('env A=1 find {/tmp,-delete}', 'env A=1 find /tmp -delete'),
+                            (f'rm {{-r,{self.wt}/src}}', f'rm -r {self.wt}/src'),
+                            (f'ln {{-s,/tmp/x,{self.wt}/src/y}}', f'ln -s /tmp/x {self.wt}/src/y'),
+                            (f'cp /tmp/a {self.wt}/{{src,x}}/', f'cp /tmp/a {self.wt}/src/ {self.wt}/x/')):
+            with self.subTest(c=c):
+                self.assert_denied(c, 'brace list')
+                self.assert_denied(expanded)
+        # nested, a sequence, a prefix and suffix, an empty alternative, one too long to expand, inside a substitution
+        for c in ('sed {{-i,-n},x}', 'sed -{i..i} x', 'sed x{-i,y}z', 'sed {,-i} x', 'sort {1..999999999}',
+                  'cat <<EOF\n$(sed {-i,x})\nEOF',
+                  # one unquoted separator is enough
+                  r'sed {-i\,x,y}', "sed {-i',',x}", r'sed -{i.\.i,i} x'):
+            self.assert_denied(c, 'brace list')
+        # a brace target stays denied even when every path it expands to is outside the worktree
+        self.assert_denied('rm /tmp/{a,b}', 'brace list')
+        # quoted or escaped is literal, `{}` and `{a}` expand to nothing else, an unscreened command, heredoc data
+        for c in ("sed -n p '{-i,x}'", 'sed -n p "{-i,x}"', r'sed -n p \{-i,x\}', 'sed -n p {}', 'sed -n p {a}',
+                  r'find . -exec cat {} \;', 'xargs -I {} cat {}', 'A={a,b} git log', "cat <<'EOF'\nsed {-i,x}\nEOF",
+                  'ls src/{a,b}.c',
+                  # bash expands no brace whose separators are all quoted or escaped
+                  r'sed -n p /tmp/{a\,b}', r'sed -n p /tmp/{a\..b}', r'sed -n p /tmp/{a.\.b}',
+                  "sed -n p /tmp/{a','b}", r'rm /tmp/{a\,b}', r'rm /tmp/{a\..b}'):
+            self.assert_allowed(c)
+        # its path is still placed, and a quoted dot stays a dot
+        self.assert_denied(rf'rm {self.wt}/src/{{a\,b}}', 'literal absolute path')
+        self.assert_denied("python3 'push.py'", 'workflow')
+        # a long word of `{,` with no `}` is no brace list, read in linear time
+        start = time.monotonic()
+        self.assert_allowed('sed -n p x' + '{,' * 3200)
+        self.assertLess(time.monotonic() - start, 1)
+
+    def test_a_line_continuation_joins_its_lines(self):
+        # bash removes a backslash-newline before it splits words or expands braces, inside double quotes too
+        for c, named in (('sed {-i,s/a/b/,src/a.c\\\n}', 'brace list'), ('sed -{i..i\\\n} s/a/b/ src/a.c', 'brace list'),
+                         ('sed \\\n-i s/a/b/ src/a.c', 'in place'), ('sed -\\\ni s/a/b/ src/a.c', 'in place'),
+                         ('sed "-\\\ni" s/a/b/ src/a.c', 'in place'),
+                         # on a heredoc's line it moves the body; in an unquoted body it may form the delimiter early
+                         ('cat <<EOF \\\n| sh\ngit push\nEOF', 'heredoc'),
+                         ('cat <<EOF\nhi\nE\\\nOF\ngit push\nEOF', 'heredoc'),
+                         ('cat <<EOF-1\nhi\nEOF-\\\n1\nEOF-1', 'heredoc')):
+            with self.subTest(c=c):
+                self.assert_denied(c, named)
+        # a comment after a continued blank stays a comment; single quotes and a quoted heredoc body keep it literal
+        for c in ('git status \\\n--short', "git log -1 \\\n# it's a note", "grep -c 'a\\\n' src/a.c",
+                  "cat <<'EOF'\nhi\nE\\\nOF\ngit push\nEOF", 'cat <<EOF\na \\\\\nEOF'):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+
     def test_read_options_that_run_a_program_are_denied_in_any_spelling(self):
         for c in ("git fetch --upload-pack='git push' .", 'git fetch --upload=x .', 'git ls-remote --upload-pack=x origin',
                   'git ls-remote --upload-pa=x .', 'git ls-remote --upl x .', 'git ls-remote --exec=x .',
@@ -457,7 +590,6 @@ class ChiefGuard(unittest.TestCase):
                   f'rsync -a --link-dest={self.wt}/src /tmp/a/ /tmp/b/',
                   # a glob in the source expands to the worktree, which the literal word does not name
                   f'ln {root}/w?/src/a.c {chief}/h', f'link {root}/w*/src/a.c /tmp/h', f'cp -l {root}/[w]t/src/a.c /tmp/h',
-                  f'ln {root}/{{wt,x}}/src/a.c /tmp/h',
                   # any spelling getopt accepts for cp's link options
                   f'cp --l {self.wt}/src/a.c /tmp/h', f'cp --li {self.wt}/src/a.c /tmp/h', f'cp --sy {self.wt}/src/a.c /tmp/h',
                   f'cp --symbolic-link {self.wt}/src/a.c /tmp/h', f'cp -as {self.wt}/src/a.c /tmp/h', f'cp -al {self.wt}/src /tmp/s',
@@ -482,8 +614,8 @@ class ChiefGuard(unittest.TestCase):
             self.assert_allowed(c)
 
     def test_unquoted_globs_in_a_write_target_are_denied(self):
-        for c in (f'rm {self.wt}/src/{{a,b}}.c', f'rm {self.wt}/sr?/a.c', f'rm {self.wt}/sr*/a.c',
-                  f'rm {self.wt}/[s]rc/a.c', f'cp /tmp/a {self.wt}/{{src,x}}/', 'rm /tmp/{a,b}', 'touch /tmp/x*'):
+        for c in (f'rm {self.wt}/sr?/a.c', f'rm {self.wt}/sr*/a.c', f'rm {self.wt}/[s]rc/a.c', 'touch /tmp/x*',
+                  'printf x > /tmp/{a,b}'):
             self.assert_denied(c, 'glob')
         # a quoted metacharacter is a literal path outside the worktree
         for c in ("rm '/tmp/a*.c'", "touch '/tmp/x[1].md'", "echo x > '/tmp/{a}.md'", "rm '/tmp/a?.c'"):
@@ -675,6 +807,7 @@ class ChiefGuard(unittest.TestCase):
             if args[0] != 'cygpath.exe':
                 return real(args, **kw)
             calls.append(kw['timeout'])
+            self.assertIn('noglob', kw['env']['MSYS'].split(), 'msys-2.0.dll would brace-expand the path')
             return subprocess.CompletedProcess(args, 0, 'C:/Program Files/Git/usr/x\n', '')
         with mock.patch.object(guard, 'on_path', lambda name, exts: name + '.exe'), mock.patch.object(subprocess, 'run', fast):
             self.assertEqual(self.main(guard, 'echo a > /usr/x; echo b > /usr/x; touch /usr/x')[0], 0)

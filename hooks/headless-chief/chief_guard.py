@@ -159,6 +159,8 @@ FIND_WRITES = {'-delete', '-fprint', '-fprint0', '-fprintf', '-fls'}
 # what xargs or find -exec may run: a read; git, gh, shells, eval, interpreters and every writer are denied there
 INDIRECT_DENY = ({'git', 'gh', 'eval', 'sed', 'perl', 'curl', 'tar', 'dd', 'sort', 'find', 'link'} | SHELLS | WORKFLOW_ONLY
                  | PY_LAUNCHERS | WRITERS_ALL | WRITERS_LAST | WRITERS_AFTER_FIRST)
+# commands whose words this guard reads one at a time, so a brace list bash expands into several may hide one
+BRACE_CHECKED = INDIRECT_DENY | DECLARES | {'shopt'}
 SEPARATORS = {';', '&&', '||', '|', '&', '(', ')', '|&', ';;'}
 REDIRECTS = {'>', '>>', '&>', '&>>', '>|', '>&'}
 STREAMS = REDIRECTS | {'<', '<<', '<<<'}
@@ -167,13 +169,38 @@ PUNCTUATION = ';&|<>()'
 # unquoted, these expand a write target to several paths or none; a quoted one is a literal path character
 GLOB = '{}*?['
 GLOBSET = set(GLOB)
-# an unquoted brace list or sequence in any word; a bare `{}` (xargs -I, find -exec) is no expansion
-BRACES = re.compile(r'\{.*(,|\.\.).*\}', re.S)
-# a quoted or escaped operator or glob character stays a word character: these stand in for it until a path is judged
-SPECIAL = PUNCTUATION + GLOB
+
+
+def braces(word):
+    """Does this word hold an unquoted brace list or sequence; a bare `{}` (xargs -I, find -exec) is no expansion.
+    Linear: the regex `\\{.*(,|\\.\\.).*\\}` takes seconds on a long word of `{,` with no `}`."""
+    i, k = word.find('{'), word.rfind('}')
+    return 0 <= i < k and (',' in word[i + 1:k] or '..' in word[i + 1:k])
+
+
+# a quoted or escaped operator or glob character stays a word character: these stand in for it until a path is judged;
+# a brace separator's stand-in lasts only until literal() reads the word
+SPECIAL = PUNCTUATION + GLOB + ',.'
 QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
 UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
-HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)(\w+)\1([^\n]*)\n(.*?)\n[ \t]*\2[ \t]*(?=\n|$)", re.S)
+SEPARATORS_BACK = str.maketrans({QUOTED[c]: c for c in ',.'})
+BRACES_QUOTED = str.maketrans({c: QUOTED[c] for c in '{}'})
+
+
+def literal(word):
+    """The word with its brace separators back; bash expands no brace whose separators are all quoted, so its braces
+    then take their stand-ins."""
+    plain = word.translate(SEPARATORS_BACK)
+    return plain.translate(BRACES_QUOTED) if braces(plain) and not braces(word) else plain
+OPENER = re.compile(r'(?<!<)<<(?!<)')   # `<<<` is a here-string
+# the delimiter as bash reads it, a plain or fully quoted word that a metacharacter ends
+DELIMITER = re.compile(r"""(-)?[ \t]*(['"]?)(\w+)\2(?=[ \t\n;&|<>()]|$)""")
+HEREDOC = re.compile(r"""(?<!<)<<(-)?[ \t]*(['"]?)(\w+)\2([^\n]*)\n(.*?)^(?(1)\t*)\3$""", re.S | re.M)
+# a `<<` bash reads as a shift or as comment text: in a `$((...))` holding no quote, escape, substitution or nested
+# parenthesis, or on a line a `#` starts, before any such character
+ARITHMETIC = re.compile(r'(?<![$\\])\$\(\([^\n()\'"`\\]*\)\)')
+COMMENT = re.compile(r'[ \t]*#[^\n()\'"`\\$]*')
+CONTINUED = re.compile(r'(?<!\\)(?:\\\\)*\\\n')  # an odd run of backslashes before a newline
 ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\+?=')   # bash's `NAME+=value` appends
 UNKNOWN = '\0'
 STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
@@ -199,7 +226,8 @@ def substitutions(text, quotes=True):
     while i < len(text):
         c = text[i]
         if c == '\\' and not single:
-            out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
+            if text[i + 1:i + 2] != '\n':  # a line continuation: bash removes it before it splits words
+                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
             i += 2
             continue
         if quotes and c == "'" and not double:
@@ -231,6 +259,38 @@ def substitutions(text, quotes=True):
         out.append(c)
         i += 1
     return ''.join(out), bodies
+
+
+def heredocs(command):
+    """Each heredoc's HEREDOC match, read forward as bash reads them: its body is skipped, and with it the rest of its
+    opener's line. Deny one whose delimiter HEREDOC cannot read as bash does, one no line ends, and a second on a line,
+    whose body bash reads after the first's. A `<<` in quotes or a trailing comment counts too; one in `$((...))`, on a
+    comment line or on the last line opens no body."""
+    found, lines, i, start = [], command.split('\n'), 0, 0
+    while i < len(lines) - 1:
+        line = lines[i]
+        masked = ARITHMETIC.sub(lambda a: ' ' * len(a.group()), line)
+        if (comment := COMMENT.match(line)) and not (i and lines[i - 1].endswith('\\')):  # a continued line is no comment
+            masked = ' ' * comment.end() + masked[comment.end():]
+        openers = [o.start() for o in OPENER.finditer(masked)]
+        if not openers:
+            i, start = i + 1, start + len(line) + 1
+            continue
+        if len(openers) > 1:
+            raise Denied('bash reads the body of a second heredoc on a line after the first one\'s, which this guard does '
+                         'not follow; put each heredoc on its own line')
+        if not (word := DELIMITER.match(line, openers[0] + 2)):
+            raise Denied("this guard reads a heredoc's delimiter only as a plain word, so it cannot tell where bash ends "
+                         "this body; use a plain word delimiter such as EOF or 'EOF'")
+        end = next((j for j in range(i + 1, len(lines))
+                    if (lines[j].lstrip('\t') if word.group(1) else lines[j]) == word.group(3)), None)
+        if end is None:
+            raise Denied(f'no line after this heredoc ends it with {word.group(3)}, so bash reads the rest of the command '
+                         'as its body; end the body with its delimiter alone on a line')
+        found.append(HEREDOC.match(command, start + openers[0]))
+        start = found[-1].end() + 1
+        i = end + 1
+    return found
 
 
 def operators(token):
@@ -277,18 +337,24 @@ class Guard:
         if not self.outside(path, ancestors=verb == 'link'):
             raise Denied(f'{why} would {verb} {path.translate(UNQUOTED)}: {rule}')
 
-    def command(self, command, depth=0):
+    def command(self, command, depth=0, raw=True):
         if depth > 3:
             raise Denied('commands nested this deep are not checked; run them as plain words, or dispatch them to a unit')
-        bodies = []
-
-        def heredoc(m):
-            if not m.group(1):  # an unquoted body still runs its substitutions
-                bodies.extend(substitutions(m.group(4), quotes=False)[1])
-            return '<<HEREDOC' + m.group(3) + '\n'
-        text, subs = substitutions(HEREDOC.sub(heredoc, command))
-        for body in bodies + subs:
+        bodies, text, pos = [], [], 0
+        for m in heredocs(command) if raw else ():
+            # bash joins a continued line before it reads the body and, unquoted, before it matches the delimiter
+            if CONTINUED.search(m.group(4) + '\n') or not m.group(2) and CONTINUED.search(m.group(5)):
+                raise Denied("a line continuation on a heredoc's line or in an unquoted heredoc body moves where bash "
+                             'starts or ends the body; join the line, or quote the delimiter')
+            if not m.group(2):  # an unquoted body still runs its substitutions
+                bodies.extend(substitutions(m.group(5), quotes=False)[1])
+            text.append(command[pos:m.start()] + '<<HEREDOC' + m.group(4) + '\n')
+            pos = m.end()
+        text, subs = substitutions(''.join(text) + command[pos:])
+        for body in bodies:
             self.command(body, depth + 1)
+        for body in subs:  # cut from text whose heredocs are read, so a placeholder there opens none
+            self.command(body, depth + 1, raw=False)
         lex = shlex.shlex(text.replace('\n', ' ; '), posix=True, punctuation_chars=PUNCTUATION)
         lex.whitespace_split = True
         lex.commenters = ''  # substitutions() dropped the comments; a # inside a word is data
@@ -297,7 +363,7 @@ class Guard:
         except ValueError as e:
             raise Denied(f'cannot parse this command ({e}); run it as plain words, or dispatch it to a unit')
         seg = []
-        for t in [o for t in tokens for o in operators(t)] + [';']:
+        for t in [literal(o) for t in tokens for o in operators(t)] + [';']:
             if t in SEPARATORS:
                 if seg:
                     self.segment(seg, depth)
@@ -331,6 +397,16 @@ class Guard:
         if (indirect or xargs) and (cmd in INDIRECT_DENY or cmd.startswith('python')):
             raise Denied(f'`{cmd}` under xargs or find -exec takes arguments known only at run time; run it with literal '
                          'arguments, or dispatch the step to a unit')
+        if cmd in BRACE_CHECKED or cmd.startswith('python'):
+            # bash expands a brace list into several words, which may hide an option this guard reads one word at a time;
+            # past git's or gh's `--` a word is a pathspec, unless that `--` may be a bare option's value (`grep -e --`)
+            end = len(args)
+            if cmd in ('git', 'gh'):
+                end = next((k for k, a in enumerate(args) if a == '--' and not (k and re.fullmatch(r'-[^=]*', args[k - 1]))),
+                           len(args))
+            if any(braces(a) for a in args[:end]):
+                raise Denied(f'`{cmd}` takes an unquoted brace list, which bash expands into words that may hide an '
+                             'option; quote it')
         if os.name == 'nt':
             self.windows(words[0], name)
         for source in link_sources(cmd, args, symlinks=os.name == 'nt'):
@@ -349,14 +425,6 @@ class Guard:
             return self.command(' '.join(args).translate(UNQUOTED), depth + 1)
         if cmd == 'find':
             self.find_exec(args, depth)
-        if cmd in ('git', 'gh'):
-            # bash expands a brace list into several words, which may hide an option this guard reads one word at a time;
-            # a `--` after a bare option may be its value (`grep -e --`), so options may go on past it
-            end = next((k for k, a in enumerate(args) if a == '--' and not (k and re.fullmatch(r'-[^=]*', args[k - 1]))),
-                       len(args))
-            if any(BRACES.search(a) for a in args[:end]):
-                raise Denied(f'`{cmd}` takes an unquoted brace list before `--`, which bash expands into words that may '
-                             'hide an option; quote it')
         if cmd == 'git':
             self.git(args)
         elif cmd == 'scalar':
@@ -631,8 +699,11 @@ def cygpath(posix):
     if posix not in MAPPED:
         # the first cygpath on PATH: another MSYS install than the bash running the command may mount / elsewhere
         exe = on_path('cygpath', ('.exe',))
+        # started from a non-MSYS process, msys-2.0.dll globs and brace-expands its arguments (dcrt0.cc globify)
+        env = {**os.environ, 'MSYS': f"{os.environ.get('MSYS', '')} noglob".strip()}
         try:
-            got = exe and subprocess.run([exe, '-m', posix], capture_output=True, encoding='utf-8', timeout=remaining())
+            got = exe and subprocess.run([exe, '-m', posix], capture_output=True, encoding='utf-8', env=env,
+                                         timeout=remaining())
         except subprocess.TimeoutExpired:
             raise Denied(TOO_LONG) from None
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -699,7 +770,7 @@ def unwrap(words):
                 words = words[1:]  # the duration
             # bash splits an expansion into words, and expands a glob or brace into several, so one option value or
             # assignment may hold the program
-            if any('$' in w or UNKNOWN in w or (GLOBSET - set('{}')) & set(w) or BRACES.search(w)
+            if any('$' in w or UNKNOWN in w or (GLOBSET - set('{}')) & set(w) or braces(w)
                    for w in given[:len(given) - len(words)]):
                 raise Denied(f'`{name}` takes a word expanded at run time, which may split into more words and hide the '
                              'program; give its options and assignments literally, a glob or brace quoted')

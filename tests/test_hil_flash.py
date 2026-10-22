@@ -555,9 +555,12 @@ class Record(unittest.TestCase):
 
 
 class Sessions(unittest.TestCase):
-    """run_jlink_commands/run_stlink_commands and the SYSRESETREQ operations built on them:
-    the caller's connection profile, a unique command file in `workdir`, one raw attempt."""
+    """run_jlink_commands/run_stlink_commands/run_openocd_commands and the SYSRESETREQ operations
+    built on them: the caller's connection profile, a unique command file in `workdir`, one raw
+    attempt."""
     UF2 = {'name': 'jlink', 'uid': '000725000000', 'args': '-device MIMXRT1011DAE5A'}
+    MAX32666 = {'name': 'openocd', 'uid': 'E6614103E7176A23', 'vid_pid': '0x2e8a 0x000c',
+                'args': '-f interface/cmsis-dap.cfg -f target/max32665.cfg'}
     PROFILE = {'interface': 'SWD', 'speed': '4000', 'autoconnect': True, 'device': 'MIMXRT1011DAE5A'}
 
     def session(self, fn, *args, rc=0, workdir=None, **kw):
@@ -565,7 +568,7 @@ class Sessions(unittest.TestCase):
         seen = []
 
         def run(argv, **k):
-            path = argv[-1]
+            path = (shlex.split(argv) if isinstance(argv, str) else argv)[-1]
             seen.append((argv, k, path, Path(path).read_text(), sorted(os.listdir(Path(path).parent))))
             return subprocess.CompletedProcess(argv, rc, 'transcript', None)
         op = fn(*args, run=run, workdir=workdir, **kw)
@@ -607,6 +610,18 @@ class Sessions(unittest.TestCase):
         self.assertEqual(argv, ['STM32_Programmer_CLI', '-script', path])
         self.assertEqual(text, '-c port=SWD sn=0035 mode=HOTPLUG\n-halt\n-r32 0xE000ED08 1\n')
 
+    def test_openocd_session_cmd_and_script(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        commands = ['halt', 'reg pc', 'mdw 0xE000ED08', 'mww 0x2008BFFC 0xf01669ef', 'reset run']
+        _, cmd, path, text = self.session(hf.run_openocd_commands, self.MAX32666, commands, workdir=d, timeout=120)
+        self.assertEqual(Path(path).parent, Path(d))
+        self.assertRegex(Path(path).name, r'^hil_openocd_\w+\.tcl$')
+        self.assertEqual(cmd, ['openocd', '-c', 'tcl_port disabled', '-c', 'gdb_port disabled',
+                               '-c', 'telnet_port disabled', '-c', 'adapter serial E6614103E7176A23',
+                               '-c', 'adapter usb vid_pid 0x2e8a 0x000c',
+                               '-f', 'interface/cmsis-dap.cfg', '-f', 'target/max32665.cfg', '-f', path])
+        self.assertEqual(text, 'init\nhalt\nreg pc\nmdw 0xE000ED08\nmww 0x2008BFFC 0xf01669ef\nreset run\nshutdown\n')
+
     def test_the_workdir_defaults_to_the_cwd(self):
         d = self.enterContext(tempfile.TemporaryDirectory())
         with contextlib.chdir(d):
@@ -626,9 +641,11 @@ class Sessions(unittest.TestCase):
 
         def run(argv, **k):
             raise KeyboardInterrupt
-        for fn, kw in ((hf.run_jlink_commands, self.PROFILE), (hf.run_stlink_commands, {'connect_mode': 'HOTPLUG'})):
+        for fn, f, kw in ((hf.run_jlink_commands, self.UF2, self.PROFILE),
+                          (hf.run_stlink_commands, self.UF2, {'connect_mode': 'HOTPLUG'}),
+                          (hf.run_openocd_commands, self.MAX32666, {})):
             with self.assertRaises(KeyboardInterrupt) as cm:
-                fn(self.UF2, ['h'], timeout=5, run=run, workdir=d, **kw)
+                fn(f, ['h'], timeout=5, run=run, workdir=d, **kw)
             self.assertTrue(cm.exception.operation.attempts[0].interrupted)
         self.assertEqual(os.listdir(d), [])
 
@@ -646,6 +663,12 @@ class Sessions(unittest.TestCase):
                                            connect_mode='HOTPLUG', workdir=d, timeout=120)
         self.assertEqual(argv, ['STM32_Programmer_CLI', '-script', path])
         self.assertEqual(text.encode(), b'-c port=SWD sn=0035 mode=HOTPLUG\n-w32 0xE000ED0C 0x05FA0004 -nv\n')
+
+    def test_sysresetreq_openocd_writes_aircr_in_one_session(self):
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        _, cmd, path, text = self.session(hf.sysresetreq_openocd, self.MAX32666, workdir=d, timeout=120)
+        self.assertEqual(cmd, [*hf.openocd_cmd_base(self.MAX32666), '-f', path])
+        self.assertEqual(text.encode(), b'init\nmww 0xE000ED0C 0x05FA0004\nshutdown\n')
 
 
 class SessionRetry(unittest.TestCase):
@@ -747,6 +770,10 @@ class Uid(unittest.TestCase):
                                                                     timeout=5, run=self.run_),
             'flash_openocd': lambda f: hf.flash_openocd({**f, 'vid_pid': '0x1366 0x0101'}, **fw, run=self.run_),
             'reset_openocd': lambda f: hf.reset_openocd({**f, 'vid_pid': '0x1366 0x0101'}, timeout=5, run=self.run_),
+            'run_openocd_commands': lambda f: hf.run_openocd_commands({**f, 'vid_pid': '0x2e8a 0x000c'}, ['halt'],
+                                                                      workdir=d, timeout=5, run=self.run_),
+            'sysresetreq_openocd': lambda f: hf.sysresetreq_openocd({**f, 'vid_pid': '0x2e8a 0x000c'}, workdir=d,
+                                                                    timeout=5, run=self.run_),
             'flash_lm4flash': lambda f: hf.flash_lm4flash(f, **fw, run=self.run_),
             'flash_pyocd': lambda f: hf.flash_pyocd({**f, 'vid_pid': '0x0d28 0x0204'}, **fw, project_dir=d,
                                                     run=self.run_),
@@ -946,7 +973,8 @@ class Openocd(unittest.TestCase):
                     ['0x1a86', '0x8010']):
             f = {**rp2040, 'vid_pid': bad}
             for fn, args in ((hf.flash_openocd, (f, 'fw.elf')), (hf.reset_openocd, (f,)),
-                             (hf.rescue_openocd, (f, hf.DAP_WEDGED[0]))):
+                             (hf.rescue_openocd, (f, hf.DAP_WEDGED[0])), (hf.run_openocd_commands, (f, ['halt'])),
+                             (hf.sysresetreq_openocd, (f,))):
                 with self.subTest(vid_pid=bad, fn=fn.__name__):
                     err = io.StringIO()
                     with contextlib.redirect_stderr(err), self.assertRaises(ValueError) as cm:
@@ -957,7 +985,11 @@ class Openocd(unittest.TestCase):
         with self.assertRaises(ValueError):
             hf.flash_openocd({**rp2040, 'vid_pid': '0x1a86 0x8010 0x2e8a'}, 'fw.elf', timeout=7,
                              run=lambda *a, **k: launches.append(a))
-        self.assertEqual(launches, [])
+        d = self.enterContext(tempfile.TemporaryDirectory())
+        with self.assertRaises(ValueError):
+            hf.run_openocd_commands({**rp2040, 'vid_pid': '0x1a86'}, ['halt'], timeout=7, workdir=d,
+                                    run=lambda *a, **k: launches.append(a))
+        self.assertEqual((launches, os.listdir(d)), ([], []))
 
     def test_openocd_over_jlink_does_not_warn(self):
         err = io.StringIO()
