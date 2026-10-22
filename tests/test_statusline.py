@@ -1,3 +1,4 @@
+import datetime
 import importlib.util
 import json
 import os
@@ -154,6 +155,131 @@ class RenderTest(unittest.TestCase):
                 while 'retry_after' not in prs.load(cache) and time.monotonic() < deadline:
                     time.sleep(0.05)  # the worker publishes its failed poll before the directory goes
 
+
+# records the poll in STUB_DIR/NAME and fails as a rate-limited one does
+FAILED_POLL = """import os, sys
+with open(os.path.join(os.environ['STUB_DIR'], 'NAME'), 'a') as polls:
+    polls.write('poll\\n')
+print('{"error": {"type": "rate_limit_error"}}')
+sys.exit(1)
+"""
+
+
+class UsageTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.home = Path(tmp.name)
+        self.cfg = self.home / '.claude'
+        self.cfg.mkdir()
+        (self.home / 'bin').mkdir()
+        make_stub(self.home / 'bin', 'curl', FAILED_POLL.replace('NAME', 'curl'))
+        self.env = {**os.environ, 'HOME': str(self.home), 'USERPROFILE': str(self.home), 'STUB_DIR': str(self.home),
+                    'PATH': f"{self.home / 'bin'}{os.pathsep}{os.environ['PATH']}"}
+        self.env.pop('CLAUDE_CONFIG_DIR', None)
+
+    def sign_in(self):
+        (self.cfg / '.credentials.json').write_text(json.dumps({'claudeAiOauth': {'accessToken': 'fake'}}))
+        (self.home / '.claude.json').write_text(json.dumps({'oauthAccount': {'emailAddress': 'me@default.invalid'}}))
+
+    def render(self, cfg=None, payload='{}'):
+        env = self.env if cfg is None else {**self.env, 'CLAUDE_CONFIG_DIR': str(cfg)}
+        done = subprocess.run([BASH, str(ROOT / 'statusline.sh')], input=payload, capture_output=True,
+                              encoding='utf-8', env=env, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        deadline = time.monotonic() + 10
+        while any(self.home.rglob('.statusline-*.lock')) and time.monotonic() < deadline:
+            time.sleep(0.05)  # the detached poll is done once it drops its lock
+        self.assertFalse(any(self.home.rglob('.statusline-*.lock')), 'a poll left its lock behind')
+        return plain(done.stdout)
+
+    def polls(self, name):
+        path = self.home / name
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    def test_an_alternate_config_never_borrows_the_default_accounts_credentials_or_identity(self):
+        self.sign_in()
+        (self.home / 'alt').mkdir()
+        self.assertNotIn('default.invalid', self.render(self.home / 'alt'))
+        self.assertEqual(self.polls('curl'), 0)
+        for cfg in (f'{self.cfg}/', None):  # the default config, named explicitly or implied
+            with self.subTest(cfg=cfg):
+                self.assertIn('default.invalid', self.render(cfg))
+                self.assertEqual(self.polls('curl'), 1, 'one poll for the default account in the interval')
+
+    def test_a_failed_poll_waits_out_the_interval_and_keeps_the_last_good_usage(self):
+        self.sign_in()
+        good = json.dumps({'five_hour': {'utilization': 37}})
+        cache = self.cfg / 'statusline-usage.json'
+        cache.write_text(good)
+        os.utime(cache, (time.time() - 600,) * 2)
+        (self.cfg / 'statusline-codex-usage.py').write_text(FAILED_POLL.replace('NAME', 'codex'))
+        make_stub(self.home / 'bin', 'codex', 'pass')
+        for _ in range(2):
+            self.assertIn('s37%', self.render())
+        self.assertEqual((self.polls('curl'), self.polls('codex')), (1, 1))
+        self.assertEqual(cache.read_text(), good)
+        for mark in self.cfg.glob('.statusline-*.polled'):
+            os.utime(mark, (time.time() - 600,) * 2)
+        self.render()
+        self.assertEqual((self.polls('curl'), self.polls('codex')), (2, 2), 'a poll is due again after the interval')
+
+    def test_a_poll_sweeps_the_temp_files_a_killed_poll_left(self):
+        self.sign_in()
+        left, live, other = (self.cfg / name for name in ('statusline-usage.json.4242.tmp',
+                                                           'statusline-usage.json.4343.tmp', 'other.4242.tmp'))
+        for path in (left, live, other):
+            path.write_text('{')
+        for path in (left, other):
+            os.utime(path, (time.time() - 600,) * 2)
+        self.render()
+        self.assertEqual([path.exists() for path in (left, live, other)], [False, True, True])
+
+    def test_no_poll_starts_when_its_mark_cannot_be_written(self):
+        self.sign_in()
+        make_stub(self.home / 'bin', 'touch', 'import sys; sys.exit(1)')
+        for _ in range(2):
+            self.render()
+        self.assertEqual(self.polls('curl'), 0)
+
+    def test_a_window_missing_from_the_payload_shows_unknown_not_zero(self):
+        cases = {'s37%/ w? F?': {'five_hour': {'utilization': 37}},
+                 's?/ w12% F?': {'limits': [{'kind': 'weekly_all', 'percent': 12}]},
+                 's0%/ w0% F0%': {'five_hour': {'utilization': 0}, 'seven_day': {'utilization': 0},
+                                  'seven_day_opus': {'utilization': 0}},
+                 's?/ w? F?': {}}
+        for shown, payload in cases.items():
+            with self.subTest(payload=payload):
+                (self.cfg / 'statusline-usage.json').write_text(json.dumps(payload))
+                self.assertIn(' ' + shown, self.render())
+
+    def test_crlf_line_ends_from_python_leave_empty_fields_empty(self):
+        site = self.home / 'site'
+        site.mkdir()
+        (site / 'sitecustomize.py').write_text("import sys; sys.stdout.reconfigure(newline='\\r\\n')\n")
+        lf = self.render()
+        self.env['PYTHONPATH'] = str(site)  # Windows' text-mode stdout
+        self.assertEqual(self.render(), lf)
+
+    def test_the_inputs_weekly_reset_wins_and_credits_and_codex_follow(self):
+        cache_reset = datetime.datetime(2030, 2, 3, 9, 30).astimezone().isoformat()
+        (self.cfg / 'statusline-usage.json').write_text(json.dumps({
+            'limits': [{'kind': 'weekly_all', 'percent': 55, 'resets_at': cache_reset}],
+            'spend': {'enabled': True, 'used': {'amount_minor': 3154, 'exponent': 2}}}))
+        (self.cfg / 'statusline-codex-usage.json').write_text(json.dumps({'percent': 97}))
+        self.assertIn(' s?/ w55% F? ↻Feb03 09:30 $31.54/ C97%', self.render())
+        payload = {'rate_limits': {'seven_day': {'resets_at': datetime.datetime(2030, 1, 2, 12, 0).timestamp()}}}
+        self.assertIn(' w55% F? ↻Jan02 12:00 $31.54/ C97%', self.render(payload=json.dumps(payload)))
+
+    def test_malformed_input_or_caches_render_the_rest(self):
+        (self.cfg / 'statusline-usage.json').write_text(json.dumps({'five_hour': {'utilization': 37}, 'spend': 'x'}))
+        (self.cfg / 'statusline-codex-usage.json').write_text('[')
+        for payload in ('not json', '[]', json.dumps({'model': {'display_name': 5}, 'context_window': 'x'})):
+            with self.subTest(payload=payload):
+                shown = self.render(payload=payload)
+                self.assertIn(' s37%/ w? F?', shown)
+                self.assertNotIn('$', shown)
+                self.assertNotIn('C', shown.split('F?')[1])
 
 class PrScanTest(unittest.TestCase):
     def scan(self, *lines):

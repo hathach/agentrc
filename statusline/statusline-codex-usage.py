@@ -14,7 +14,7 @@ WEEK_MINS = 10080
 WEEK_MIN, WEEK_MAX = 9576, 10584   # codex TUI treats +/-5% of a week as weekly
 
 
-def read_rate_limits(timeout=25):
+def read_rate_limits():
     exe = "codex" if os.name != "nt" else windows.on_path("codex", (".exe", ".cmd", ".bat"))
     if not exe:
         return None

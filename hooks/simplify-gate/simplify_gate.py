@@ -660,6 +660,14 @@ def new_state():
             'replies': [], 'errors': [], 'notes': []}
 
 
+def save_state(directory, state):
+    """Replace the state file whole; the caller holds the state lock."""
+    path = directory / 'state.json'
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(state))
+    windows.replace(temporary, path)  # Windows: retried while a prune reading state.json unlocked holds it
+
+
 class Locked:
     """The state file under an exclusive lock, written back on exit."""
 
@@ -679,10 +687,7 @@ class Locked:
         return self.state
 
     def __exit__(self, *exc):
-        path = self.directory / 'state.json'
-        temporary = path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(self.state))
-        windows.replace(temporary, path)  # Windows: retried while a prune reading state.json unlocked holds it
+        save_state(self.directory, self.state)
         release(self.lock)
 
 
@@ -928,6 +933,11 @@ class Pruner:
         if settled(state) and idle > days * 86400:
             for path, st in files:
                 self.drop(path, 'diagnostics', st)
+            if state['open_turn']:
+                self.note(f'interrupted turn, idle over {days} days (snapshot kept)',
+                          f'{directory}: {idle / 86400:.0f} days')
+            elif state['cursor'] is not None:
+                self.compact(directory, state, entries)
             keep = referenced(state)
             for path, st in blobs:
                 if path.name not in keep and stat.S_ISREG(st.st_mode):
@@ -940,6 +950,17 @@ class Pruner:
         for path, st in blobs:
             if stat.S_ISREG(st.st_mode) and BLOB_NAME.fullmatch(path.name):
                 self.relink(path, st)
+
+    def compact(self, directory, state, entries):
+        """Drop a closed turn's cursor, a snapshot of the whole checkout that only
+        an interrupted turn's recovery or a Stop without a prompt reads; the next
+        prompt takes a new one. The state is written before its blobs go."""
+        before = next(st.st_size for path, st in entries if path.name == 'state.json')
+        state['cursor'] = None
+        if self.apply:
+            save_state(directory, state)
+        self.freed['compacted states'] += max(before - len(json.dumps(state)), 0)
+        self.files['compacted states'] += 1
 
     def sweep(self, now):
         """Drop store copies no session links any more, and stale partial writes."""
@@ -966,8 +987,10 @@ def size(count):
 
 def prune(cache, apply=False, days=PRUNE_DAYS, report_days=REPORT_DAYS, now=None):
     """Free what settled sessions no longer need; report, never delete, the rest.
-    Never removes a session directory, its state, its lock files or a blob its
-    state references. Returns the report text."""
+    A closed turn's state loses its cursor, and the blobs only that referenced;
+    an interrupted turn keeps its cursor. Never removes a session directory, its
+    state, its lock files or a blob its state still references. Returns the
+    report text."""
     now = time.time() if now is None else now
     pruner = Pruner(cache, apply)
     sessions = sorted(p for p in cache.iterdir() if p.name != STORE) if cache.is_dir() else []
@@ -978,9 +1001,10 @@ def prune(cache, apply=False, days=PRUNE_DAYS, report_days=REPORT_DAYS, now=None
             pruner.note('symlinked or not a directory (left untouched)', directory)
     pruner.sweep(now)
     verb = 'freed' if apply else 'would free (dry run; --apply to act)'
-    lines = [f'simplify-gate prune: {cache}, {len(sessions)} session(s); settled sessions idle over {days} days expire',
-             f'{verb}:']
-    for category in ('diagnostics', 'unreferenced blobs', 'relinked duplicates', 'unused store blobs'):
+    lines = [f'simplify-gate prune: {cache}, {len(sessions)} session(s); settled sessions idle over {days} days '
+             'expire, closed turns lose their snapshot', f'{verb}:']
+    for category in ('compacted states', 'diagnostics', 'unreferenced blobs', 'relinked duplicates',
+                     'unused store blobs'):
         lines.append(f'  {category:20} {size(pruner.freed[category]):>10}  ({pruner.files[category]} file(s))')
     lines.append(f'  {"total":20} {size(sum(pruner.freed.values())):>10}')
     for heading, items in pruner.report.items():

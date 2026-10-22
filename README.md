@@ -21,7 +21,7 @@ workflows/     saved workflows (Claude only)
 bin/           commands for the human, such as lsusbt
 statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
 plugins/       herdr plugins, one folder each with a herdr-plugin.toml
-lib/           windows.py, the Windows runtime helpers the scripts reach through their resolved path
+lib/           helpers the scripts share through their resolved path: windows.py (Windows runtime), greptile.py
 tests/         unit tests for skill scripts, hooks and the installer
 ```
 
@@ -180,7 +180,8 @@ through its `Build contract:` and `HIL contract:` lines:
 
 ## Simplify gate (per repository)
 
-`hooks/simplify-gate` snapshots the checkout and the worktrees nested in it when a prompt
+`hooks/simplify-gate` snapshots the checkout, the worktrees nested in it and its `<checkout>--*` sibling worktrees
+(linked worktrees of any repository; the user rules reserve that prefix for them) when a prompt
 arrives and when the session stops, then sends the diff to a read-only
 `codex exec` YAGNI challenge at Stop: at most two rounds per user turn, one
 retry on Codex failure, then the stop goes through with a notice. One review
