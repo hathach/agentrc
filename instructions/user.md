@@ -213,6 +213,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   my yes to that offer, is the grant unless I narrow it: launch without a
   further question, following `~/code/agentrc/README.md`'s headless PR
   publishing recipe.
+- Merging stays off. My own words asking to merge a named PR ("make a PR for
+  issue 123 and chief, and merge when ready") grant chief one squash merge
+  of it once ready per `agents/chief.md`'s merge exception, with everything
+  the babysit grant covers. Opening a PR, asking for babysitting, `autoPush`
+  or a yes to an offer that did not name merging grants none.
 - "Launch chief", headless, always means the `headless-chief` skill, never a
   bare `claude -p --agent chief`, even where a repo recipe names one.
 - Standing grant: on a PR I asked `pr-review` to review, its `post.py` may

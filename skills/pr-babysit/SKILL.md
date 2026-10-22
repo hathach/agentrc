@@ -29,7 +29,14 @@ python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--
 python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 $S/state_transfer.py <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
 python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR]  # the caller's reading of a launch
+python3 $S/merge.py --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--merge]  # chief's merge gate; inspects without --merge
 ```
+
+`merge.py` is chief's, run only under its merge exception (`agents/chief.md`):
+it re-reads a passed `both` launch's PR, both CodeRabbit's and Greptile's
+reviews of the head, CI, the base branch's required checks and the review
+`fingerprint`, and with `--merge` squash-merges with a head guard. A
+launch's `pass` alone is no reason to merge.
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch, lists the `blockers` to settle before continuing, and shows as `pinned`
@@ -39,7 +46,7 @@ A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight o
 `commits.py commit` stages and commits exactly its paths; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, `sonar.py` comments on and resolves SonarCloud issues, and `coderabbit_trigger.py` edits
-CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment, and `greptile_trigger.py` posts one `@greptileai` comment. Run any of them by hand only with the user's authorization to publish there.
+CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment, and `greptile_trigger.py` posts one `@greptileai` comment, and `merge.py --merge` merges the PR. Run any of them by hand only with the user's authorization to publish there.
 
 ## Arguments
 
