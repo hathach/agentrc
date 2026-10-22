@@ -46,11 +46,20 @@ prompts included, where `codex resume` / `claude --resume` find it.
 its requests and their state, then one line counting the idle lanes;
 `status --all` lists every lane with a session instead.
 
+`kill <id>` records the request as `killed` unless it has a verdict
+already, which then stands and is delivered as it is. On POSIX, whatever the
+verdict, it then SIGKILLs, each with its tree, every process other than the
+runner that has the request's lock open for writing, a tool reparented out
+of the CLI's tree included, and prints `<id>: <outcome>` only once the lock
+is let go; still held after 10 s, it exits 1 naming the holders' pids. On
+Windows it takes the CLI's tree and job only before a verdict: a tool that
+outlives a finished turn keeps the lane busy until it exits.
+
 ## Exit codes
 
 1 the turn failed, or never ran because the tree could not be checked
-before it; 3 unknown or delivered request, a `--out` FILE that cannot be
-written, the lane busy, a lane of another
+before it, or a `kill` left the request's lock held; 3 unknown or delivered
+request, a `--out` FILE that cannot be written, the lane busy, a lane of another
 kind than the flags assert, a pinned or kindless lane, a dirty worktree
 lane, or reset refused; 4 an empty reply, a writer's reply without its
 "Files touched" line, or under `--no-edit` the tree changed or could not be

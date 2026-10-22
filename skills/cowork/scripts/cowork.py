@@ -27,7 +27,8 @@ A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
 runner has read it, .lock (the runner and CLI hold its flock through
 teardown, so liveness does not depend on pid reuse; the CLI pid is written
-inside; on Windows an open write handle stands for the flock), .jsonl
+inside, on POSIX followed by the runner's pid and start time; on Windows an
+open write handle stands for the flock), .jsonl
 (CLI stdout), .err (stderr), and at settle .reply and .exit
 (the outcome, first writer wins).
 One request per lane is in flight: a send while one is refused.
@@ -39,13 +40,15 @@ to read; read delivers a reply whose send died or detached, waiting for
 release with --wait and refusing a running request otherwise, and with --out
 writing what it would print to that file in one step, printing only a short
 receipt that names it; status lists the lanes holding a request and counts
-the idle ones, --all lists every lane; reset removes
-everything of a lane, its worktree included once its branch is merged. Exit
-codes: 1 failed, 3 unknown or delivered request, a lane busy, not ready or
-of the wrong kind, or reset refused, 4 an empty reply, a writer's reply
-without its "Files touched" line, or a --no-edit turn that changed the tree
-or after which it could not be checked; a tree unreadable before the turn
-runs none and fails.
+the idle ones, --all lists every lane; kill records the request as killed
+unless it has a verdict already and, on POSIX whatever the verdict, stops
+everything still holding its lock, reporting once the lock is let go; reset
+removes everything of a lane, its worktree included once its branch is
+merged. Exit codes: 1 failed, or a kill that left the lock held, 3 unknown
+or delivered request, a lane busy, not ready or of the wrong kind, or reset
+refused, 4 an empty reply, a writer's reply without its "Files touched"
+line, or a --no-edit turn that changed the tree or after which it could not
+be checked; a tree unreadable before the turn runs none and fails.
 """
 
 import argparse
@@ -78,6 +81,7 @@ SIDES = ('codex', 'claude')
 FAILED, BUSY, MALFORMED = 1, 3, 4
 OUTCOMES = {'replied': 0, 'no-footer': MALFORMED, 'empty-reply': MALFORMED, 'tree-changed': MALFORMED,
             'unverified': MALFORMED, 'failed': FAILED, 'killed': FAILED, 'died': FAILED}  # a request's exit code
+LET_GO = 10  # seconds `kill` waits for a request's lock to be let go
 FOOTER = re.compile(r'^Files touched: (\S.*)$', re.M)
 LANE = re.compile(r'^(?!all$)[a-z0-9-]{1,40}$')
 BOOTSTRAP = (  # the receiver's whole contract, so it need not read the driver's skill
@@ -460,12 +464,9 @@ def nt_created(process):
 
 @contextlib.contextmanager
 def holder(pid, lock_file):
-    """That process if it is the CLI holding the request lock, else None: on
-    Windows a handle to it, open until the block ends, so the pid cannot pass
-    to another process while the caller acts on it; elsewhere True."""
-    if fcntl:
-        yield True if holds(pid, lock_file) else None
-        return
+    """On Windows, that process if it is the CLI holding the request lock, else
+    None: a handle to it, open until the block ends, so the pid cannot pass to
+    another process while the caller acts on it."""
     process = kernel32.OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     try:
         try:
@@ -584,15 +585,90 @@ def holds(pid, lock_file):
     if fcntl is None:  # no /proc: the one created when the runner recorded beside its pid
         with holder(pid, lock_file) as process:
             return process is not None
+    return bool(lock_fds(pid, lock_file))
+
+
+def lock_fds(pid, lock_file):
+    """The names of that process's descriptors open on the request lock, under /proc."""
     def target(fd):
         try:
             return os.readlink(fd)
         except OSError:  # closed since listed: a CLI opens and closes files all the time
             return None
     try:
-        return any(target(fd) == str(lock_file) for fd in Path(f'/proc/{pid}/fd').iterdir())
+        return [fd.name for fd in Path(f'/proc/{pid}/fd').iterdir() if target(fd) == str(lock_file)]
     except OSError:
+        return []
+
+
+def writes(pid, lock_file):
+    """True if that process has the request lock open for writing, as the runner opened it and its CLI and what
+    they spawned inherit it; held()'s probe and a waiting reader open it read-only."""
+    for fd in lock_fds(pid, lock_file):
+        try:
+            info = Path(f'/proc/{pid}/fdinfo/{fd}').read_text()
+        except OSError:
+            continue
+        flags = next((line.split()[1] for line in info.splitlines() if line.startswith('flags:')), None)
+        if flags and int(flags, 8) & os.O_ACCMODE != os.O_RDONLY:
+            return True
+    return False
+
+
+def writers(lock_file):
+    try:
+        pids = [int(name) for name in os.listdir('/proc') if name.isdigit()]
+    except OSError:  # no /proc
+        return []
+    return [pid for pid in pids if writes(pid, lock_file)]
+
+
+def let_go(lock_file):
+    """kill's teardown on POSIX: until nothing holds the request lock, SIGKILL the tree of each other process
+    that has it open for writing, reparented or not; all but the runner, which concludes and exits once its
+    CLI is gone. False if the lock is still held after LET_GO seconds."""
+    deadline = time.monotonic() + LET_GO
+    while held(lock_file):
+        if time.monotonic() > deadline:
+            return False
+        for pid in writers(lock_file):
+            if pid == os.getpid():
+                continue
+            try:
+                pidfd = os.pidfd_open(pid)
+            except OSError:  # gone since listed
+                continue
+            try:
+                # checked after the pidfd is taken: while its process lives, the pid still names it
+                if writes(pid, lock_file) and not runner_of(pid, lock_file):
+                    kill_tree(pid, process=pidfd, deadline=deadline)
+            finally:
+                os.close(pidfd)
+        time.sleep(0.1)
+    return True
+
+
+def proc_born(pid):
+    """When a live process started, in clock ticks since boot, from /proc; None once it is gone."""
+    try:
+        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def runner_record():
+    """The runner's line in the request lock on POSIX, after the CLI's: its pid and start time."""
+    return f'{os.getpid()} {proc_born(os.getpid())}\n'
+
+
+def runner_of(pid, lock_file):
+    """True if that process is the runner the request lock records."""
+    try:
+        recorded = lock_file.read_text().split('\n')[1]
+    except (OSError, IndexError):
         return False
+    born = proc_born(pid)
+    return born is not None and recorded == f'{pid} {born}'
 
 
 def lock_record(pid, born=None):
@@ -606,7 +682,7 @@ def lock_record(pid, born=None):
 
 def cli_pid(lock_file):
     """The CLI pid the runner wrote into the request lock, '' before it got there."""
-    return (lock_file.read_text().split() or [''])[0]
+    return (lock_file.read_text().split('\n')[0].split() or [''])[0]
 
 
 def requests(box):
@@ -780,7 +856,7 @@ def children_of():
     return table
 
 
-def kill_tree(pid, job=None, process=None):
+def kill_tree(pid, job=None, process=None, deadline=None):
     """SIGKILL a process and everything under it. Codex runs its shell tool
     in its own session, so the process group is not enough. Freeze each
     process as it is found and rescan until the frozen tree grows no more,
@@ -792,7 +868,12 @@ def kill_tree(pid, job=None, process=None):
     once, all but a tool that asked to break away, which taskkill took while
     its parent lived. `kill` passes the CLI's handle instead (holder): it
     keeps the pid from being reused under taskkill, and terminates the CLI
-    should taskkill fail."""
+    should taskkill fail. On POSIX each process is signalled through a pidfd,
+    a child only once its pidfd is open and it is still the child of its
+    frozen, live parent, so a pid that passed to another process is never
+    signalled, and nothing is walked from a process found gone; `process` is
+    the caller's pidfd for `pid`, else one is opened. The walk stops growing
+    at `deadline` (monotonic), killing what it froze."""
     if fcntl is None:
         # System32's, by full path: CreateProcess would try the working directory, the checkout, first
         taskkill = os.path.join(os.environ.get('SystemRoot', ''), 'System32', 'taskkill.exe')
@@ -808,22 +889,74 @@ def kill_tree(pid, job=None, process=None):
         if process:
             kernel32.TerminateProcess(process, 1)
         return
-    frozen = set()
-    while True:
-        table, stack, grown = children_of(), [pid], False
-        while stack:
-            current = stack.pop()
-            if current not in frozen:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(current, signal.SIGSTOP)
-                frozen.add(current)
-                grown = True
-            stack.extend(table.get(current, []))
-        if not grown:
-            break
-    for victim in frozen:
+    if not hasattr(os, 'pidfd_open'):  # not Linux: no /proc to walk either, so the root alone, by number
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(victim, signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)
+        return
+    try:
+        root = os.pidfd_open(pid) if process is None else process
+    except OSError:  # gone
+        return
+    frozen = {}  # pid: pidfd of each process identified and sent SIGSTOP; each signal goes through its pidfd
+    try:
+        if not signalled(root, signal.SIGSTOP):
+            return  # gone: nothing found under its pid is ours
+        frozen[pid] = root
+        while True:
+            table, stack, grown = children_of(), [pid], False
+            while stack:
+                parent = stack.pop()
+                for child in table.get(parent, []):
+                    if child not in frozen:
+                        fd = child_of(child, parent, frozen[parent])
+                        if fd is None:
+                            continue
+                        if not signalled(fd, signal.SIGSTOP):
+                            os.close(fd)
+                            continue
+                        frozen[child] = fd
+                        grown = True
+                    stack.append(child)
+            if not grown or deadline is not None and time.monotonic() > deadline:
+                break
+        for fd in frozen.values():
+            signalled(fd, signal.SIGKILL)
+    finally:
+        for fd in {root, *frozen.values()} - {process}:
+            os.close(fd)
+
+
+def signalled(pidfd, sig):
+    """Signal the process behind a pidfd; False once it is gone. One we may not signal (sudo's child) still
+    counts: it is there, and its parent dies."""
+    try:
+        signal.pidfd_send_signal(pidfd, sig)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def child_of(pid, parent, parent_fd):
+    """A pidfd for `pid` if it is a child of the process behind `parent_fd`, whose pid is `parent`, else None.
+    Both checks follow the pidfd: while its process lives the pid names it, and a parent alive after its pid
+    was read as the ppid was that ppid's owner then."""
+    try:
+        fd = os.pidfd_open(pid)
+    except OSError:
+        return None
+    if parent_of(pid) == parent and signalled(parent_fd, 0):
+        return fd
+    os.close(fd)
+    return None
+
+
+def parent_of(pid):
+    try:
+        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def run(side, box, host, request, no_edit, lock_fd):
@@ -832,6 +965,8 @@ def run(side, box, host, request, no_edit, lock_fd):
     exit_file, reply, stream = (box / f'{request}.{ext}' for ext in ('exit', 'reply', 'jsonl'))
     status, child, before, job = 'failed', None, None, None
     root = tree_of(box, host)
+    if fcntl:  # for `kill`, which spares this runner: it concludes once its CLI is gone
+        os.pwrite(lock_fd, ('\n' + runner_record()).encode(), 0)
     try:
         if exit_file.exists():  # killed before it started
             status = 'killed'
@@ -865,7 +1000,7 @@ def run(side, box, host, request, no_edit, lock_fd):
             os.lseek(lock_fd, 0, os.SEEK_SET)
             os.write(lock_fd, lock_record(child.pid).encode())
         else:
-            os.pwrite(lock_fd, lock_record(child.pid).encode(), 0)  # for `kill`, should this runner die first
+            os.pwrite(lock_fd, (lock_record(child.pid) + runner_record()).encode(), 0)
         while child.poll() is None and not exit_file.exists():
             time.sleep(0.2)
         status = 'killed' if exit_file.exists() else str(child.returncode)
@@ -1345,11 +1480,18 @@ def main(argv=None):
             if not lock.exists():
                 die(f'no request {a.request} in this worktree: delivered already', BUSY)
             pid = cli_pid(lock)
-            if publish(exit_file, 'killed\n') and pid:  # our CLI, orphaned or not; a runner still there sees it too
+            # our CLI, orphaned or not; a runner still there sees it too. On POSIX let_go takes it
+            if publish(exit_file, 'killed\n') and pid and fcntl is None:
                 with holder(int(pid), lock) as process:
                     if process:
                         kill_tree(int(pid), process=process)
-            print(f'{a.request}: {exit_file.read_text().strip()}')
+            outcome = exit_file.read_text().strip()
+        # outside admission: the runner may need it to conclude
+        if fcntl and not let_go(lock):
+            stuck = ', '.join(map(str, writers(lock))) or 'unknown'
+            die(f'{a.request}: {outcome}, but its lock is still held after {LET_GO} s (pid {stuck}); '
+                f'the lane stays busy until it is let go', FAILED)
+        print(f'{a.request}: {outcome}')
         return 0
 
     if a.cmd == 'status':

@@ -19,7 +19,7 @@ S=<skill dir>/scripts/cowork.py
 
 python3 $S send (--task "..." | --task -) [--lane L] [--worktree] [--no-edit] [--tier review|expert|default] [--detach]
 python3 $S read [--wait] [--out FILE] <id>  # the reply of a detached or dead sender
-python3 $S kill <id>             # the running request, with all it spawned
+python3 $S kill <id>             # the request and what still holds it, with all they spawned
 python3 $S status [--all]        # busy lanes, undelivered requests; --all every lane
 python3 $S reset codex|claude <lane>|all
 python3 $S default [astra|sol]   # the Codex default tier's preset on this host
@@ -96,7 +96,8 @@ to `--tier review`, keeping its history.
 
 Report a reply by its outcome, the disagreement left and what was not
 verified, naming the lane and request id: the full turn stays in the CLI's
-own store (`grep -rl <id> ~/.codex/sessions ~/.claude/projects`). Report
+own store
+(`grep -rl <id> "${CODEX_HOME:-$HOME/.codex}/sessions" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"`). Report
 transport failures and their diagnostics; request artifacts are removed on
 delivery, and those diagnostics need not appear in the CLI session. For each
 finding, say whether you reproduced it or only read the code.

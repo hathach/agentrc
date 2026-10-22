@@ -1,6 +1,7 @@
 import contextlib
 import errno
 import io
+import itertools
 import json
 import os
 import shutil
@@ -1384,6 +1385,7 @@ class CoworkTest(unittest.TestCase):
         with holding(box / 'codex-x.lock') as lock:  # a runner still holds it, but its CLI is gone
             lock.write(cowork.lock_record(stranger.pid, None if fcntl else cowork.nt_born(stranger.pid) - 1))
             lock.flush()
+            threading.Timer(0.3, lock.close).start()  # the runner concludes and lets go
             with mock.patch.object(cowork, 'kill_tree') as kill:
                 code, out, _ = self.run_cli('kill', 'codex-x')
             self.assertEqual(out.strip(), 'codex-x: killed')
@@ -1502,6 +1504,142 @@ class CoworkTest(unittest.TestCase):
         until(lambda: not cowork.held(lock))
         code, out, _ = self.run_cli('read', request)
         self.assertEqual((code, out), (0, 'codex reply\nFiles touched: none\n'))
+
+    def codex_leaves_a_daemon(self, posing_as_runner=False):
+        """A fake codex whose tool double-forks a sleeper into its own session with the inherited lock: out of the
+        CLI's tree once its parent exits; posing as the runner, with `_run` and the request id in its argv.
+        Returns the daemon's pid once it has written it."""
+        pid_file = self.root / 'daemon.pid'
+        pid_file.unlink(missing_ok=True)
+        daemon = ("import os, sys, time\nif os.fork(): sys.exit(0)\nos.setsid()\n"
+                  f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)")
+        argv = f'sys.executable, "-c", {daemon!r}' + (', "_run", "codex", "main", os.environ["COWORK_TURN"]'
+                                                      if posing_as_runner else '')
+        self.codex_does(f'import subprocess; subprocess.run([{argv}], close_fds=False)')
+        return lambda: until(lambda: pid_file.exists() and pid_file.read_text()) or int(pid_file.read_text())
+
+    def reap(self, pid):
+        if not gone(pid):
+            os.kill(pid, 9)
+
+    @unittest.skipIf(fcntl is None, 'POSIX kill takes what holds the lock; on Windows the job object does')
+    def test_kill_takes_a_reparented_holder_of_the_lock_while_the_turn_runs(self):
+        for posing in (False, True):  # the runner is spared by the identity it recorded, not by its argv
+            with self.subTest(posing_as_runner=posing):
+                daemon_pid = self.codex_leaves_a_daemon(posing)
+                proc, request = self.send_gated('--task', 'x')
+                daemon = daemon_pid()
+                self.addCleanup(self.reap, daemon)
+                lock = self.box() / f'{request}.lock'
+                code, out, _ = self.run_cli('kill', request)
+                self.assertEqual((code, out), (0, f'{request}: killed\n'))
+                self.assertFalse(cowork.held(lock))
+                self.assertEqual(proc.wait(timeout=10), cowork.FAILED, 'the waiting send, a reader of the lock, delivers')
+                self.assertIn('was killed', proc.stdout.read())
+                until(lambda: gone(daemon), timeout=5)
+                self.fake('codex', FAKE_CODEX)
+                self.assertEqual(self.send('--task', 'next')[0], 0)
+
+    @unittest.skipIf(fcntl is None, 'POSIX kill takes what holds the lock; on Windows the job object does')
+    def test_kill_after_the_verdict_takes_a_reparented_holder_and_keeps_the_reply(self):
+        daemon_pid = self.codex_leaves_a_daemon()
+        request = self.send('--detach', '--task', 'x')[1]
+        lock = self.box() / f'{request}.lock'
+        daemon = daemon_pid()
+        self.addCleanup(self.reap, daemon)
+        until(lambda: (self.box() / f'{request}.exit').exists())
+        self.assertTrue(cowork.held(lock), 'the daemon keeps the lane busy')
+        reader = self.read_wait(request)
+        self.assertIn(daemon, cowork.writers(lock))
+        self.assertNotIn(reader.pid, cowork.writers(lock), 'a reader never counts')
+        code, out, _ = self.run_cli('kill', request)
+        self.assertEqual((code, out), (0, f'{request}: replied\n'), 'the first verdict stands')
+        self.assertFalse(cowork.held(lock))
+        out, err = reader.communicate(timeout=10)
+        self.assertEqual((reader.returncode, out, err), (0, 'codex reply\nFiles touched: none\n', receipt(request)))
+        until(lambda: gone(daemon), timeout=5)
+        self.fake('codex', FAKE_CODEX)
+        self.assertEqual(self.send('--task', 'next')[0], 0)
+
+    @unittest.skipIf(fcntl is None, 'POSIX kill waits for the lock to be let go')
+    def test_a_kill_that_leaves_the_lock_held_fails_and_says_by_whom(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        with holding(box / 'codex-x.lock'), mock.patch.object(cowork, 'LET_GO', 0.3):  # kill never signals itself
+            code, out, err = self.run_cli('kill', 'codex-x')
+        self.assertEqual((code, out), (cowork.FAILED, ''))
+        self.assertIn(f'codex-x: killed, but its lock is still held after 0.3 s (pid {os.getpid()})', err)
+
+    @unittest.skipIf(fcntl is None, 'POSIX kill takes what holds the lock')
+    def test_kill_signals_no_listed_writer_that_no_longer_holds_the_lock(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        stranger = subprocess.Popen(SLEEP)  # a writer that let go once listed, or a pid reused since
+        self.addCleanup(lambda: (stranger.kill(), stranger.wait()))
+        with holding(box / 'codex-x.lock'), mock.patch.object(cowork, 'LET_GO', 0.3), \
+             mock.patch.object(cowork, 'writers', lambda lock: [stranger.pid]), \
+             mock.patch.object(cowork.os, 'kill') as kill, \
+             mock.patch.object(cowork.signal, 'pidfd_send_signal') as pidfd_kill:
+            code, _, _ = self.run_cli('kill', 'codex-x')
+        self.assertEqual(code, cowork.FAILED)
+        self.assertEqual((kill.call_args_list, pidfd_kill.call_args_list), ([], []))
+
+    @unittest.skipIf(fcntl is None, 'POSIX kill takes what holds the lock')
+    def test_a_kill_whose_tree_keeps_growing_gives_up_at_its_deadline(self):
+        box = self.box()
+        box.mkdir(parents=True)
+        (box / 'codex-x.task').write_text('p')
+        with holding(box / 'codex-x.lock') as lock:
+            tool = spawn_holding(lock, SLEEP)
+        self.addCleanup(lambda: (tool.kill(), tool.wait()))
+        spawned = itertools.count(1 << 30)  # past any pid_max: pids no process has, each the tool's child
+        pidfd = os.pidfd_open(tool.pid)
+        self.addCleanup(os.close, pidfd)
+        start = time.monotonic()
+        with mock.patch.object(cowork, 'LET_GO', 0.5), \
+             mock.patch.object(cowork, 'children_of', lambda: {tool.pid: [next(spawned)]}), \
+             mock.patch.object(cowork, 'parent_of', lambda pid: tool.pid), \
+             mock.patch.object(cowork.os, 'pidfd_open', lambda pid: os.dup(pidfd)), \
+             mock.patch.object(cowork.signal, 'pidfd_send_signal'):
+            code, _, err = self.run_cli('kill', 'codex-x')  # a tree that keeps spawning and takes no signal
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(code, cowork.FAILED)
+        self.assertIn(f'(pid {tool.pid})', err)
+
+    def running_untouched(self, proc):
+        """Alive and not stopped, given the time a signal takes to land."""
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=0.5)
+        if proc.returncode is not None:
+            return False
+        return Path(f'/proc/{proc.pid}/stat').read_text().rsplit(')', 1)[1].split()[0] not in ('T', 't')
+
+    @unittest.skipIf(not hasattr(os, 'pidfd_open'), 'the tree walk follows pidfds')
+    def test_kill_tree_walks_nothing_from_a_root_that_is_gone(self):
+        bystander = subprocess.Popen(SLEEP)
+        self.addCleanup(lambda: (bystander.kill(), bystander.wait()))
+        root = subprocess.Popen(SLEEP)
+        pidfd = os.pidfd_open(root.pid)
+        self.addCleanup(os.close, pidfd)
+        root.kill()
+        root.wait()  # reaped: its pid may name another process now
+        with mock.patch.object(cowork, 'children_of', lambda: {root.pid: [bystander.pid]}), \
+             mock.patch.object(cowork, 'parent_of', lambda pid: root.pid):
+            cowork.kill_tree(root.pid, process=pidfd)
+        self.assertTrue(self.running_untouched(bystander))
+
+    @unittest.skipIf(not hasattr(os, 'pidfd_open'), 'the tree walk follows pidfds')
+    def test_kill_tree_signals_no_listed_child_whose_parent_is_another(self):
+        bystander = subprocess.Popen(SLEEP)  # its pid listed under the root: a child that exited, its pid reused
+        self.addCleanup(lambda: (bystander.kill(), bystander.wait()))
+        root = subprocess.Popen(SLEEP)
+        self.addCleanup(lambda: (root.kill(), root.wait()))
+        with mock.patch.object(cowork, 'children_of', lambda: {root.pid: [bystander.pid]}):
+            cowork.kill_tree(root.pid)
+        self.assertEqual(root.wait(timeout=5), -9)
+        self.assertTrue(self.running_untouched(bystander))
 
     def test_kill_of_a_delivered_request_leaves_no_orphan_verdict(self):
         _, request, _, _ = self.send('--task', 'done')
