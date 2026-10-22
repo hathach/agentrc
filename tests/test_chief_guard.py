@@ -275,6 +275,27 @@ class ChiefGuard(unittest.TestCase):
                 self.check(c)
                 self.assertLess(time.monotonic() - start, 3)
 
+    def test_a_value_bash_evaluates_again_is_denied_where_the_command_says_so(self):
+        # #223: these evaluate a variable's value as a name, a prompt or arithmetic, running any substitution it holds
+        for c in ("x='b[$(git push)]'; let x", "x='b[$(git push)]'; declare -i y; y=x", 'typeset -i y', 'local -ir y',
+                  'declare -gi y', 'builtin let x', 'command declare -i y', "bash -c 'let x'",
+                  "x='a[$(git push)]'; echo ${!x}", "x='$(git push)'; echo ${x@P}", "x='`git push`'; echo ${x@P}",
+                  'echo "${x@\\\nP}"', "eval 'echo ${!x}'"):
+            with self.subTest(c=c):
+                self.assert_denied(c, 'this guard cannot see')
+        for c in ('echo ${!prefix*} ${!prefix@} ${!arr[@]} ${!arr[*]}', 'echo ${x@Q}', 'declare -a a', 'declare +i x',
+                  'declare x=1', 'local -r y=1', 'echo $((i+1))', '((n++))', 'echo ${a[1]}'):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+        self.assert_denied('echo ${x:-@P}', 'this guard cannot see')  # a trailing @P is read as the operator
+        # a name in arithmetic or a subscript: bash evaluates its value, which this guard does not follow (module
+        # docstring); denying names there would deny every counter and indexed read
+        for c in ("x='b[$(git push)]'; echo $((x))", "x='b[$(git push)]'; ((x))", "x='b[$(git push)]'; echo $(($x))",
+                  "x='b[$(git push)]'; echo ${a[x]}", 'x="a[\\$(git push)]"; echo $((x))',
+                  "d='$'; y=\"a[${d}(git push)]\"; echo $((y))", "k='b[$(git push)]'; echo \"${a[$k]}\""):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+
     def test_gh_reads_pass(self):
         for c in ('gh pr view 12 --json state', 'gh pr checks 12', 'gh -R o/r pr list', 'gh issue view 3',
                   'gh run view 99 --log-failed', 'gh api repos/o/r/pulls/1', 'gh api -X GET search/issues -f q=x',

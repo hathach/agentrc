@@ -15,7 +15,9 @@ The boundary is deny what it cannot interpret, within the command families it kn
 wrappers, xargs and find -exec, writers and linkers): it follows a few plain forms of those and refuses
 the rest rather than grow general parsing. It is mistake-only, not an allowlist: a program outside them passes
 with its arguments by design, even one that runs them as a command (setsid, ssh, awk, ...), and such a program
-is not a defect to patch one by one.
+is not a defect to patch one by one. Likewise a variable named in arithmetic or an array subscript, whose value
+bash evaluates as code (#223): `let`, `declare -i`, `${!name}` and `${name@P}`, which evaluate a value the same way,
+are denied, but no value is followed.
 
 The cost is what chief can no longer run directly: piping commands into a shell, shell or wrapper options
 outside the small tables, git or a writer fed by xargs or find -exec, globs in a write target even
@@ -198,9 +200,11 @@ def literal(word):
 TOKENS = ('<<<', '$((', '<<', '$(', '${', '$[', "$'", '((', '<(', '>(')
 # the delimiter as bash reads it, a plain or fully quoted word that a metacharacter ends
 DELIMITER = re.compile(r"""(-)?[ \t]*(['"]?)(\w+)\2(?=[ \t\n;&|<>()]|$)""")
-# the arithmetic this guard reads as bash does: names, numbers, `$NAME`, operators, blanks and parentheses; one way to
-# match each character, so a mismatch fails in linear time
+# the arithmetic whose bounds this guard reads as bash does: names, numbers, `$NAME`, operators, blanks and parentheses;
+# one way to match each character, so a mismatch fails in linear time
 ARITHMETIC = re.compile(r'(?:[\w\s+\-*/%<>=!&|^~?:,#\[\]()]|\$(?=[A-Za-z_])|\$\{[A-Za-z_]\w*\})*')
+# the `${!...}` forms that list names or keys; any other reads a variable named by a value
+NAME_LISTS = re.compile(r'![A-Za-z_]\w*([*@]|\[[*@]\])')
 # a case pattern's `)` closes a substitution here, not in bash
 CASE = re.compile(r'(?<![^\s;&|()])case(?![^\s;&|()<>])')
 CONTINUED = re.compile(r'(?<!\\)(?:\\\\)*\\\n')  # an odd run of backslashes before a newline
@@ -243,7 +247,7 @@ def ahead(text, i):
 
 def arithmetic(text, i):
     """The index past the `))` that closes the arithmetic starting at i: the first unmatched `)` directly followed by
-    another. Denied unless its body is ARITHMETIC, read alike by bash and this guard."""
+    another. Denied unless its body is ARITHMETIC, whose bounds bash and this guard read alike."""
     depth, j = 0, i
     while (j := past(text, j)) < len(text):
         remaining()
@@ -314,7 +318,10 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             i = arithmetic(text, j)
             out.append(UNKNOWN if token == '$((' else ':')
         elif token == '${':
-            _, subs, i = lexed(text, j, '}', 'param', depth + 1)
+            body, subs, i = lexed(text, j, '}', 'param', depth + 1)
+            if body.startswith('!') and not NAME_LISTS.fullmatch(body) or body.endswith('@P'):
+                raise Denied('`${!name}` and `${name@P}` evaluate a value as a name or a prompt, running any '
+                             'substitution in it, which this guard cannot see; expand the variable directly')
             frames.extend(subs)
             out.append(UNKNOWN)
         elif token == '<<<' and shell:
@@ -524,6 +531,9 @@ class Guard:
             for a in args:
                 if ASSIGNMENT.match(a):
                     forbidden_env(a)
+        if cmd == 'let' or cmd in DECLARES and spelled(args, {}, 'i'):
+            raise Denied(f'`{cmd}` evaluates values as arithmetic, where a name runs any substitution its value holds, '
+                         'which this guard cannot see; compute with `$((...))`')
         if cmd == 'alias' and any('=' in a for a in args):
             raise Denied('an alias runs a command under another name this guard cannot see; run the command itself')
         if cmd in SHELLS:
