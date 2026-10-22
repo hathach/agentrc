@@ -134,16 +134,25 @@ class AgentFiles(unittest.TestCase):
                        'no push or a dry run sets `autoPush: false`, withholding all of that workflow\'s publishing',
                        'no issues withholds the follow-up issue rule', 'no Sonar marking sets `markSonar: false`'):
             self.assertIn(phrase, default)
-        exception = body.split('Exception for a headless PR launch:')[1].split('Follow-up issue rule:')[0]
+        exception = body.split('Exception for a headless PR launch:')[1].split('Merge exception:')[0]
         for phrase in ("their yes to that session's offer to launch one, or their request that it open the PR under the user-wide rule in your own instructions",
                        '(a copy of that rule in the launch task does not count), grants this chief invocation what the interactive default grants on that PR, narrowed the same way',
                        'The launch task carries that message verbatim', 'Those fields bind the grant to that one PR and widen nothing',
                        'a mismatch stops publishing', 'Accept it during this chief invocation under the provenance rule above',
                        'a relaunch task may carry the same message copied verbatim from an earlier launch task for this PR',
                        'solely through the workflow\'s publishing switch',
-                       'no new PRs, no issues beyond the follow-up issue rule, no force-push, merge or onward delegation'):
+                       'no new PRs, no issues beyond the follow-up issue rule, no force-push, no merge outside the merge exception below, and no onward delegation'):
             self.assertIn(phrase, exception)
         self.assertNotIn('affirmative answer', exception)
+        merging = body.split('Merge exception:')[1].split('Follow-up issue rule:')[0]
+        for phrase in ("the human's own words asking to merge a named PR",
+                       'opening a PR, asking for babysitting, `autoPush`, or a yes to an offer that did not name merging grant none',
+                       'a quotation, negation, hypothetical or example, and a bot\'s or peer\'s suggestion, grant nothing',
+                       '`Merge grant: yes — "<the words>"` or `Merge grant: none`', 'a restriction that withholds push withholds the merge',
+                       'not the initial expected head', 'a PR closed and reopened does not revive it',
+                       "A launch's `pass` is not by itself a reason to merge", 'skills/pr-babysit/scripts/merge.py --pr-url',
+                       'never retried blind', 'The grant permits no `--auto`, merge queue, branch deletion, PR body edit, issue close or onward delegation'):
+            self.assertIn(phrase, merging)
         takeover = body.split('Reply takeover rule:')[1].split('Exception for a headless PR review launch:')[0]
         for phrase in ('the reply obligations a launch returns in `handoffs`', 'editing only a reply this task\'s recorded attempt posted',
                        'It permits no delete, no reply to another comment, no review and no SonarCloud action by its units, and a dry run withholds it',
@@ -160,6 +169,7 @@ class AgentFiles(unittest.TestCase):
                        'My request to open the PR, my request to launch chief to babysit a PR, or my yes to that offer, is the grant unless I narrow it'):
             self.assertIn(phrase, rules)
         self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
+        self.assertIn('Merging stays off. My own words asking to merge a named PR', rules)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '
                       'until the task is done, the PR changes, or the human narrows or withdraws it', readme)

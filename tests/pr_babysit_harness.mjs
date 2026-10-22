@@ -937,6 +937,14 @@ test("harvest.py's fingerprint reaches the final observation unchanged, for a me
   assert.equal(result.observation.reviews.fingerprint, fingerprint)
 })
 
+test("merge.py's state digest is the workflow's, on a returned state", async () => {
+  const { result } = await run({ args: { deferrals: [{ findingId: '1#1', commentDigest: 'c0ffee00c0ff', reason: 'naïve ✓ "q" \\ \t' }] } })
+  const done = spawnSync('python3', ['-X', 'utf8', '-c', 'import json,sys; sys.path.insert(0, sys.argv[1]); from merge import state_digest; print(state_digest(json.loads(sys.stdin.read())))',
+    join(STATE_TRANSFER, '..')], { input: JSON.stringify(result.state), encoding: 'utf8' })
+  assert.equal(done.status, 0, done.stderr)
+  assert.equal(done.stdout.trim(), result.state.digest)
+})
+
 test('the summary tables every verdict, fix and pushed SHA', async () => {
   const { result, logs } = await run({
     reviews: {

@@ -372,6 +372,8 @@ class ChiefGuard(unittest.TestCase):
         self.assert_denied('python3 ~/.claude/skills/pr-babysit/scripts/push.py --pr 1', 'inside its workflow')
         self.assert_denied('python3 -X utf8 /x/sonar.py --pr 1', 'inside its workflow')
         self.assert_allowed('python3 ~/.claude/skills/pr-babysit/scripts/launch_result.py --output /tmp/o')
+        self.assert_allowed('python3 ~/.claude/skills/pr-babysit/scripts/merge.py --pr-url https://github.com/o/r/pull/1 --base main '
+                            '--checkout . --output /tmp/o --state-digest 0123abcd --merge')
 
     def test_writes_inside_the_worktree_are_denied(self):
         for c in (f'echo x > {self.wt}/a', f'rm {self.wt}/src/a.c', f'mv /tmp/a {self.wt}/src/',

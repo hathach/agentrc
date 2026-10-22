@@ -110,20 +110,25 @@ def fnv1a(text):
     return f'{h:08x}'
 
 
-def sealed(facts):
-    """facts plus the seal pr-babysit checks a relayed copy against: fnv1a over the
-    canonical JSON with null members left out, so a copy that drops one still matches."""
+def canonical(v, nulls=False):
+    """The workflow's canonical JSON: keys in UTF-16 code-unit order, as JavaScript's sort() compares them, and null
+    members left out unless nulls."""
     def bare(v):
-        # Keys in UTF-16 code-unit order, as JavaScript's sort() compares them.
         if isinstance(v, dict):
-            return {k: bare(v[k]) for k in sorted(v, key=lambda k: k.encode('utf-16-be', 'surrogatepass')) if v[k] is not None}
+            return {k: bare(v[k]) for k in sorted(v, key=lambda k: k.encode('utf-16-be', 'surrogatepass')) if nulls or v[k] is not None}
         if isinstance(v, list):
             return [bare(x) for x in v]
         return v
-    # Top-level error stays out: a checked line has none, and a relay may fill in error: ''.
-    text = json.dumps(bare({k: v for k, v in facts.items() if k != 'error'}), separators=(',', ':'), ensure_ascii=False)
+    text = json.dumps(bare(v), separators=(',', ':'), ensure_ascii=False)
     # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
-    return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
+    return re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text)
+
+
+def sealed(facts):
+    """facts plus the seal pr-babysit checks a relayed copy against: fnv1a over the
+    canonical JSON with null members left out, so a copy that drops one still matches."""
+    # Top-level error stays out: a checked line has none, and a relay may fill in error: ''.
+    return {**facts, 'seal': fnv1a(canonical({k: v for k, v in facts.items() if k != 'error'}))}
 
 
 def git(*argv):
