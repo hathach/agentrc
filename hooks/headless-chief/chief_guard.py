@@ -17,7 +17,9 @@ the rest rather than grow general parsing. It is mistake-only, not an allowlist:
 with its arguments by design, even one that runs them as a command (setsid, ssh, awk, ...), and such a program
 is not a defect to patch one by one. Likewise a variable named in arithmetic or an array subscript, whose value
 bash evaluates as code (#223): `let`, `declare -i`, `${!name}` and `${name@P}`, which evaluate a value the same way,
-are denied, but no value is followed.
+are denied, but no value is followed; so are a `-c` or eval string the outer shell expands first, where a value
+becomes commands, and the forms that run a command later or out of sight: `coproc`, `function`, a trap action and a
+script that is a substitution (#229).
 
 The cost is what chief can no longer run directly: piping commands into a shell, shell or wrapper options
 outside the small tables, git or a writer fed by xargs or find -exec, globs in a write target even
@@ -164,8 +166,8 @@ INDIRECT_DENY = ({'git', 'gh', 'eval', 'sed', 'perl', 'curl', 'tar', 'dd', 'sort
 # commands whose words this guard reads one at a time, so a brace list bash expands into several may hide one
 BRACE_CHECKED = INDIRECT_DENY | DECLARES | {'shopt'}
 SEPARATORS = {';', '&&', '||', '|', '&', '(', ')', '|&', ';;'}
-REDIRECTS = {'>', '>>', '&>', '&>>', '>|', '>&'}
-STREAMS = REDIRECTS | {'<', '<<', '<<<'}
+REDIRECTS = {'>', '>>', '&>', '&>>', '>|', '>&', '<>'}
+STREAMS = REDIRECTS | {'<', '<<', '<<<', '<&'}
 OPERATORS = sorted(SEPARATORS | STREAMS, key=len, reverse=True)
 PUNCTUATION = ';&|<>()'
 # unquoted, these expand a write target to several paths or none; a quoted one is a literal path character
@@ -180,9 +182,10 @@ def braces(word):
     return 0 <= i < k and (',' in word[i + 1:k] or '..' in word[i + 1:k])
 
 
-# a quoted or escaped operator, glob or newline character stays a word character: these stand in for it until a path
-# is judged or a `-c` or eval string is read; a brace separator's stand-in lasts only until literal() reads the word
-SPECIAL = PUNCTUATION + GLOB + ',.' + '\n'
+# a quoted or escaped operator, glob, newline, `$` or `~` character stays a word character: these stand in for it until
+# a path is judged or a `-c` or eval string is read (a `$` in double quotes is bare, bash expands it); a brace
+# separator's stand-in lasts only until literal() reads the word
+SPECIAL = PUNCTUATION + GLOB + ',.' + '\n' + '$~'
 QUOTED = {c: chr(0xE000 + i) for i, c in enumerate(SPECIAL)}
 UNQUOTED = str.maketrans({v: k for k, v in QUOTED.items()})
 SEPARATORS_BACK = str.maketrans({QUOTED[c]: c for c in ',.'})
@@ -287,15 +290,19 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             i += 1
             continue
         if c == '\\':
-            if text[i + 1:i + 2] != '\n':  # a line continuation: bash removes it before it reads words or operators
+            if double and text[i + 1:i + 2] in ('$', '`'):  # bash drops this backslash, shlex keeps it
+                out.append(QUOTED.get(text[i + 1], text[i + 1]))
+            elif text[i + 1:i + 2] != '\n':  # a line continuation: bash removes it before it reads words or operators
                 # a trailing backslash stays bare, for shlex to deny
-                out.append(c + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2])
-                           + (QUOTING if mode == 'shell' and i + 1 < len(text) else ''))
+                out.append((QUOTING if mode == 'shell' and i + 1 < len(text) else '') + c
+                           + QUOTED.get(text[i + 1:i + 2], text[i + 1:i + 2]))
             i += 2
             continue
         token, j = ahead(text, i) if c in '$<>(' else ('', i)
         bare = mode != 'body' and not double   # where quotes, newlines and closers are syntax
         shell = bare and mode == 'shell'
+        if shell and c in '<>' and token not in ('<(', '>('):
+            fd(out)
         if token == '$[':
             raise Denied('`$[...]` is arithmetic this guard does not read; use `$((...))`')
         if mode == 'param' and (c == "'" or token == "$'"):
@@ -353,7 +360,7 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
             frames.append(lexed(body, depth=depth + 1)[:2])
             out.append(UNKNOWN)
             i = end + 1
-        elif shell and c == '#' and (not out or out[-1][-1:] in WORD_START and out[-1][:1] != '\\'):
+        elif shell and c == '#' and (not out or ends_word(out[-1])):
             i = text.find('\n', i)  # a comment, to its newline: its quotes, substitutions and backslashes are text
             i = len(text) if i < 0 else i
         elif c == '\n' and bare:
@@ -375,7 +382,7 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
                 double = not double
             elif mode != 'body' and c == "'" and not double:
                 single = True
-            elif double and c in QUOTED:
+            elif double and c in QUOTED and c != '$':
                 c = QUOTED[c]
             out.append(QUOTING + c if mode == 'shell' and c in '"\'' else c)
             i += 1
@@ -385,6 +392,27 @@ def lexed(text, i=0, close=None, mode='shell', depth=0):
     if pending:
         raise unended(pending[0])
     return ''.join(out), frames, i
+
+
+def fd(out):
+    """Drop a redirect's file descriptor, the unquoted digits that make a whole word before it (`2>f`; `2 >f` keeps
+    the argument)."""
+    k = len(out)
+    while k and len(out[k - 1]) == 1 and out[k - 1] in '0123456789':
+        k -= 1
+    # digits after a redirect operator, blanks between or not, are its operand (`2>&1>f`, `2>& 1>f`, `> 2>f`)
+    j = k
+    while j and out[j - 1] in (' ', '\t'):
+        j -= 1
+    if k < len(out) and (not k or ends_word(out[k - 1])) \
+            and not ''.join(out[max(0, j - 2):j]).endswith(('<', '>', '<&', '>&')):
+        del out[k:]
+
+
+def ends_word(piece):
+    """Does a piece of lexed() output end a word: an unescaped blank or operator character (an escape is the piece
+    QUOTING, backslash, character)."""
+    return piece[-1:] in WORD_START and '\\' not in piece[:2]
 
 
 def unended(word):
@@ -540,10 +568,12 @@ class Guard:
                     forbidden_env(a)
         if cmd in ('declare', 'typeset', 'local'):
             # bash reads an operand as declare's assignment only past an unquoted command word that keywords and
-            # assignments alone precede, and with its name unquoted; eval's operands it splits and globs first
+            # assignments alone precede, and with its name and `=` unquoted; eval's operands it splits and globs first.
+            # A leading unquoted `~` expands to $HOME, $PWD or $OLDPWD, any of which may be `-i`
             assigns = not self.evaluated and QUOTING not in marked[-len(words)] and all(
                 w in KEYWORDS or ASSIGNMENT.match(w) for w in marked[:len(marked) - len(words)])
-            if any(not (assigns and DECLARED.match(m)) and (UNKNOWN in a or '$' in a or (GLOBSET - set('{}')) & set(a))
+            if any(not (assigns and DECLARED.match(m))
+                   and (UNKNOWN in a or '$' in a or m.startswith('~') or (GLOBSET - set('{}')) & set(a))
                    for a, m in zip(args[:args.index('--')] if '--' in args else args, marked[len(marked) - len(args):])):
                 raise Denied(f'`{cmd}` takes a word expanded at run time, which may supply `-i` where this guard cannot '
                              'see it; give its options literally, a glob quoted')
@@ -552,11 +582,24 @@ class Guard:
                          'which this guard cannot see; compute with `$((...))`')
         if cmd == 'alias' and any('=' in a for a in args):
             raise Denied('an alias runs a command under another name this guard cannot see; run the command itself')
+        if cmd in ('coproc', 'function'):
+            raise Denied(f'`{cmd}` runs a command this guard does not read; run it as a plain command, a function '
+                         'defined as `name() {{ ...; }}`')
+        if cmd == 'trap':
+            # only literal words that list (`-l`, `-p` before any `--`), or reset or ignore (`-`, '' or a lone signal as
+            # the action)
+            ended = args[:1] == ['--']
+            action = args[1:] if ended else args
+            if any(map(expanded, args)) or \
+                    len(action) > 1 and action[0] not in ('-', '') + (() if ended else ('-l', '-p')):
+                raise Denied('a trap action runs later, where this guard cannot see it; run the command directly')
         if cmd in SHELLS:
             return self.shell(args, depth)
+        if cmd in ('source', '.'):
+            return script(args[1:] if args[:1] == ['--'] else args)
         if cmd == 'eval':
             self.evaluated = True
-            return self.command(' '.join(args).translate(UNQUOTED), depth + 1)
+            return self.command(code(args), depth + 1)
         if cmd == 'find':
             self.find_exec(args, depth)
         if cmd == 'git':
@@ -656,11 +699,9 @@ class Guard:
             if a not in SHELL_LONG and not re.fullmatch(r'-[celuvx]+', a):
                 raise Denied(f'`{a}` is a shell option this guard does not follow; pass the commands to `-c`, or dispatch to a unit')
             command = command or 'c' in a[1:] and not a.startswith('--')
-        operand = args[k] if k < len(args) else None
         if command:
-            return self.command((operand or '').translate(UNQUOTED), depth + 1)
-        if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
-            raise Denied(STDIN_RULE)
+            return self.command(code(args[k:k + 1]), depth + 1)
+        script(args[k:])
 
     def find_exec(self, args, depth):
         """`find -exec`/`-execdir`/`-ok`/`-okdir` runs a command on the paths it finds, known only at run time: only a
@@ -703,6 +744,32 @@ class Guard:
                 if '#' in value:
                     raise Denied('`curl -o` with `#` names its file from the URL at run time; give one literal path')
                 self.writes(value, '`curl -o`')
+
+
+def expanded(word):
+    """Does bash expand this word at run time: a variable, a substitution, or an unquoted glob or brace character."""
+    return UNKNOWN in word or '$' in word or bool(GLOBSET & set(word))
+
+
+def code(words):
+    """The `-c` or eval words as the inner shell reads them, joined; one the outer shell expands first, by a variable, a
+    substitution, a tilde, a glob or a brace list, is denied, since a value there becomes commands."""
+    if any(expanded(w) or re.search(r'(^|[=:])~', w) for w in words):
+        raise Denied('this string is expanded before bash runs it as commands, so a value becomes commands this guard '
+                     'cannot see; single-quote it')
+    return ' '.join(words).translate(UNQUOTED)
+
+
+def script(operands):
+    """A shell's or `source`'s script operand, not followed like any program's file, unless it is stdin or a value
+    known only at run time."""
+    operand = operands[0] if operands else None
+    if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
+        raise Denied(STDIN_RULE)
+    if expanded(operand):
+        raise Denied('this script is a value known only at run time (a substitution, a variable or a glob), which this '
+                     'guard cannot read; name the script file, a glob character quoted')
+
 
 def spelled(args, longs, letters, valued='', valued_longs=None):
     """The first word before `--` that spells one of these options as getopt reads it: a long option (longs maps it to
