@@ -225,8 +225,8 @@ def main(argv=None):
     if not 0 <= a.channel < 32:
         p.error('--channel must be 0..31')
     cb = control_block(a, p)
-    route, ident, backend = resolve_backend(a, p)
     prepare_out(p, a.out)
+    route, ident, backend = resolve_backend(a, p)
     result = {'backend': route, **ident, 'controlBlock': f'0x{cb:08x}', 'channel': a.channel}
     clients = ps.other_probe_clients()
     if clients:
