@@ -1,4 +1,4 @@
-"""Tests for lib/windows.py: the PATH-only program lookup, Git Bash, the bounded tree kill and the retried replace.
+"""Tests for lib/windows.py: the PATH-only program lookup, Git Bash, the bounded tree kill, the retry and the replace.
 The Windows branches run here with os.name and the system calls stood in for; the real ones run on Windows CI."""
 import os
 import subprocess
@@ -164,6 +164,35 @@ class KillTreeTest(unittest.TestCase):
         while pid_alive(grandchild_pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertFalse(pid_alive(grandchild_pid), 'the grandchild outlived the tree kill')
+
+
+class RetryTest(unittest.TestCase):
+    def test_windows_retries_a_refused_step_until_it_succeeds(self):
+        step = mock.Mock(side_effect=[PermissionError(13, 'in use'), PermissionError(13, 'in use'), 'done'])
+        with mock.patch.object(windows.os, 'name', 'nt'), mock.patch.object(windows.time, 'sleep') as sleep:
+            self.assertEqual(windows.retry(step, tries=5), 'done')
+        self.assertEqual((step.call_count, sleep.call_count), (3, 2))
+
+    def test_windows_raises_the_last_refusal_after_its_tries(self):
+        refusals = [PermissionError(13, f'in use {n}') for n in range(3)]
+        step = mock.Mock(side_effect=refusals)
+        with mock.patch.object(windows.os, 'name', 'nt'), mock.patch.object(windows.time, 'sleep'), \
+                self.assertRaises(PermissionError) as raised:
+            windows.retry(step, tries=3)
+        self.assertEqual((step.call_count, raised.exception), (3, refusals[-1]))
+
+    def test_any_other_failure_escapes_at_once(self):
+        step = mock.Mock(side_effect=FileExistsError(17, 'exists'))
+        with mock.patch.object(windows.os, 'name', 'nt'), mock.patch.object(windows.time, 'sleep') as sleep, \
+                self.assertRaises(FileExistsError):
+            windows.retry(step)
+        self.assertEqual((step.call_count, sleep.call_count), (1, 0))
+
+    def test_elsewhere_the_step_runs_once(self):
+        step = mock.Mock(side_effect=PermissionError(13, 'denied'))
+        with mock.patch.object(windows.os, 'name', 'posix'), self.assertRaises(PermissionError):
+            windows.retry(step)
+        self.assertEqual(step.call_count, 1)
 
 
 class ReplaceTest(unittest.TestCase):

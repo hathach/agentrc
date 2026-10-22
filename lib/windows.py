@@ -1,6 +1,6 @@
 """Windows runtime helpers the skills, hooks and statusline share: a program lookup that never takes the working
-directory, Git Bash found that way, a bounded process-tree kill, and os.replace retried while another process holds the
-target open.
+directory, Git Bash found that way, a bounded process-tree kill, and a file step, os.replace among them, retried
+while another process holds the file open.
 
 A script reaches it through its resolved path, as chief_guard.py reaches shadows.py:
 `sys.path.insert(0, str(Path(__file__).resolve().parents[N] / 'lib'))`, then `import windows`.
@@ -65,12 +65,18 @@ def kill_tree(proc, timeout):
         return None
 
 
-def replace(src, dst, tries=50):
-    """os.replace; on Windows retried 20 ms apart, tries times in all, while another process (a reader, an indexer)
-    has dst open, which refuses it there. The last PermissionError escapes with dst untouched."""
+def retry(step, tries=50):
+    """step(); on Windows retried 20 ms apart, tries times in all, while another process (a reader, an indexer) has
+    its file open, which refuses removing or replacing it there. The last PermissionError escapes, any other at once."""
     for _ in range(tries - 1 if os.name == 'nt' else 0):
         try:
-            return os.replace(src, dst)
+            return step()
         except PermissionError:
             time.sleep(0.02)
-    return os.replace(src, dst)
+    return step()
+
+
+def replace(src, dst, tries=50):
+    """os.replace, retried as retry() does while another process has dst open. The last PermissionError escapes with
+    dst untouched."""
+    return retry(lambda: os.replace(src, dst), tries)

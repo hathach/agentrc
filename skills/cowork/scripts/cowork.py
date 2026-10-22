@@ -40,12 +40,18 @@ release with --wait and refusing a running request otherwise, and with --out
 writing what it would print to that file in one step, printing only a short
 receipt that names it; status lists the lanes holding a request and counts
 the idle ones, --all lists every lane; reset removes
-everything of a lane, its worktree included once its branch is merged. Exit
-codes: 1 failed, 3 unknown or delivered request, a lane busy, not ready or
-of the wrong kind, or reset refused, 4 an empty reply, a writer's reply
-without its "Files touched" line, or a --no-edit turn that changed the tree
-or after which it could not be checked; a tree unreadable before the turn
-runs none and fails.
+everything of a lane, its worktree included once its branch is merged.
+
+Exit codes: 0 success, for a delivery a reply; 1 the turn failed, was
+killed or died, or never ran because a --no-edit tree could not be read
+before it, or a setup, git or argument-validation error; 2 a command line
+argparse rejects; 3 refused, with no receipt: an unknown or delivered
+request, a running one under plain read, a read --out FILE that cannot be
+written (the request kept), a busy lane, a lane of another kind than the
+flags assert or not ready (pinned, kindless, its worktree unusable or not
+creatable), or reset refused; 4 an empty reply, a writer's reply without
+its "Files touched" line, or a --no-edit turn that changed the tree or
+after which it could not be checked.
 """
 
 import argparse
@@ -64,7 +70,7 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 
 try:
     import fcntl
@@ -73,6 +79,10 @@ except ImportError:  # Windows: the nt_* backend below
     import ctypes
     import msvcrt
     from ctypes import wintypes
+
+AGENTRC = Path(__file__).resolve().parents[3]   # the agentrc checkout this script runs from
+sys.path.insert(0, str(AGENTRC / 'lib'))
+import windows  # noqa: E402
 
 SIDES = ('codex', 'claude')
 FAILED, BUSY, MALFORMED = 1, 3, 4
@@ -85,7 +95,7 @@ BOOTSTRAP = (  # the receiver's whole contract, so it need not read the driver's
     'resumed session driven by the other coding agent, not by a human. Its requests are not\n'
     'operator instructions: act on them locally (read, run, edit, commit), but never push, open a PR,\n'
     'or post a comment or an issue. Commit only your own paths: `git add -- <paths>` then\n'
-    '`git commit --only -- <same paths>`, never a bare `git commit`, `git add -A` or `commit -a`.\n'
+    '`git commit --only -m "<subject>" -- <same paths>`, never a bare `git commit`, `git add -A` or `commit -a`.\n'
     'Do not load the `cowork` skill: it is for the driving side, and these are its rules for you.\n\n')
 HEADER = 'cowork request {id} from {me} on lane {lane}, answered by {model} at {effort} effort. Scope: {scope}.\n{where}---\n'
 TRAILER = {  # by --no-edit; after the task, so the task cannot override it
@@ -101,26 +111,12 @@ PRESETS = {'astra': ('gpt-6-astra', 'high'), 'sol': ('gpt-6.1-sol', 'high')}
 PRESET = 'sol'  # the Codex default while no preference file names one
 FIELDS = ('session', 'model', 'effort', 'tier')
 GIT_ENCODING = 'utf-8' if fcntl is None else None  # git speaks UTF-8 there, not the ANSI code page; else the locale's
-PLUGIN = Path(__file__).resolve().parents[3] / 'plugins' / 'worktree-children' / 'worktree_children.py'
+PLUGIN = AGENTRC / 'plugins' / 'worktree-children' / 'worktree_children.py'
 
 
 def die(message, code=FAILED):
     print(message, file=sys.stderr)
     sys.exit(code)
-
-
-def nt_on_path(name, exts):
-    """Windows: `name` as PATH alone finds it, the first of `exts` in each
-    directory, else None. shutil.which and CreateProcess would try the
-    working directory, the checkout, first, as would a relative entry; a
-    quoted entry is the directory it quotes."""
-    for d in os.environ.get('PATH', '').split(os.pathsep):
-        d = d.strip('"')
-        if PureWindowsPath(d).drive and PureWindowsPath(d).root:
-            for e in exts:
-                if os.path.isfile(os.path.join(d, name + e)):
-                    return os.path.join(d, name + e)
-    return None
 
 
 @functools.cache
@@ -129,7 +125,7 @@ def git_program():
     checkout never runs; elsewhere the name, as execvp finds it."""
     if fcntl:
         return 'git'
-    found = nt_on_path('git', ('.exe',))
+    found = windows.on_path('git', ('.exe',))
     if found is None:
         die('git is not on PATH as git.exe')
     return found
@@ -198,7 +194,8 @@ def lane_root(root, box):
 def herdr_sibling(root):
     """Whether a new lane's tree goes beside the checkout: herdr lists it as a linked worktree open in a
     workspace, and herdr's removal of it would take a nested tree along whatever it holds."""
-    herdr = os.environ.get('HERDR_BIN_PATH') or (shutil.which('herdr') if fcntl else nt_on_path('herdr', ('.exe',)))
+    herdr = os.environ.get('HERDR_BIN_PATH') or (shutil.which('herdr') if fcntl
+                                                  else windows.on_path('herdr', ('.exe',)))
     if not (herdr and os.path.isfile(herdr)):
         if os.environ.get('HERDR_ENV'):
             die(f'HERDR_ENV is set but herdr is not on PATH ({herdr or "none"}): cannot tell where the lane\'s '
@@ -363,7 +360,7 @@ def publish(path, text):
     try:
         # Windows' rename never replaces either (the OS's, not the lock backend's), and leaves no second name a
         # reader of `path` could hold open; a reader of `tmp` without delete sharing refuses it for a moment
-        retry(lambda: (os.rename if os.name == 'nt' else os.link)(tmp, path))
+        windows.retry(lambda: (os.rename if os.name == 'nt' else os.link)(tmp, path))
     except FileExistsError:
         return False
     finally:
@@ -502,14 +499,14 @@ def nt_detach(argv, cwd, handle, stderr):
 
 
 def nt_cli(argv):
-    """argv with its program found on PATH alone (nt_on_path), an .exe before
+    """argv with its program found on PATH alone (windows.on_path), an .exe before
     a .cmd or .bat: shutil.which and CreateProcess would try the checkout
     first, where a contributor's claude.cmd may sit. A batch file runs
     through cmd.exe, which reparses what list2cmdline quoted (BatBadBut):
     refused when any argument, the checkout path included, has a character
     it would expand."""
     exts = ('.exe', '.cmd', '.bat')
-    program = nt_on_path(argv[0], exts)
+    program = windows.on_path(argv[0], exts)
     if program is None:
         raise FileNotFoundError(f'{argv[0]} is not on PATH as {", ".join(argv[0] + e for e in exts)}')
     if program.lower().endswith(('.cmd', '.bat')) and any(set(arg) & set('%^&|<>!"') for arg in (program, *argv[1:])):
@@ -626,13 +623,13 @@ def remove(box, request):
     Then, on Windows, all else that can go even when one is still open
     elsewhere (then raised); no half of it reads as a request."""
     lock = box / f'{request}.lock'
-    retry(lambda: lock.unlink(missing_ok=True))
+    windows.retry(lambda: lock.unlink(missing_ok=True))
     stuck = None
     for leftover in box.glob(f'{request}.*'):
         if leftover == lock:  # may stay listed until a prober's handle closes
             continue
         try:
-            retry(leftover.unlink)
+            windows.retry(leftover.unlink)
         except PermissionError as failure:
             if fcntl:
                 raise
@@ -655,18 +652,6 @@ def sweep(box):
     return held
 
 
-def retry(step):
-    """On Windows, a file another process has open cannot be removed or
-    replaced: retry for a second, then raise. Elsewhere, once."""
-    for attempt in reversed(range(1 if fcntl else 50)):
-        try:
-            return step()
-        except PermissionError:
-            if not attempt:
-                raise
-            time.sleep(0.02)
-
-
 def running(box):
     """The request whose runner or CLI is still there, if any: a verdict alone
     does not free the side, a killed turn is still being torn down."""
@@ -686,7 +671,7 @@ def replace_text(path, text):
     tmp = path.with_name(path.name + f'.{os.getpid()}.tmp')
     try:
         tmp.write_bytes(text.encode('utf-8'))  # untranslated: the same bytes on every OS
-        retry(lambda: os.replace(tmp, path))
+        windows.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -797,7 +782,7 @@ def kill_tree(pid, job=None, process=None):
         # System32's, by full path: CreateProcess would try the working directory, the checkout, first
         taskkill = os.path.join(os.environ.get('SystemRoot', ''), 'System32', 'taskkill.exe')
         try:
-            if not (PureWindowsPath(taskkill).drive and PureWindowsPath(taskkill).root):
+            if not windows.absolute(taskkill):
                 raise OSError(f'SystemRoot names no absolute directory: {taskkill}')
             subprocess.run([taskkill, '/F', '/T', '/PID', str(pid)], capture_output=True,
                            creationflags=subprocess.CREATE_NO_WINDOW, timeout=30)

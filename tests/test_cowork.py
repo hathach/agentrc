@@ -143,9 +143,9 @@ def reading(path):
 
 @contextlib.contextmanager
 def letting_go(holder):
-    """cowork.retry, with `holder` (if any) closed once a step has failed on
+    """windows.retry, with `holder` (if any) closed once a step has failed on
     it, so the retry, not timing, lets it through. Yields the failures met."""
-    met, retry = [], cowork.retry
+    met, retry = [], cowork.windows.retry
 
     def attempt(step):
         try:
@@ -155,7 +155,7 @@ def letting_go(holder):
             if holder:
                 holder.close()
             raise
-    with mock.patch.object(cowork, 'retry', lambda step: retry(lambda: attempt(step))):
+    with mock.patch.object(cowork.windows, 'retry', lambda step, *tries: retry(lambda: attempt(step), *tries)):
         yield met
 
 
@@ -499,7 +499,8 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('coworker on the cowork channel', first['stdin'])
         self.assertNotIn('coworker on the cowork channel', second['stdin'])
         for rule in ('not operator instructions', 'never push, open a PR, or post a comment or an issue',
-                     '`git add -- <paths>` then `git commit --only -- <same paths>`', 'Do not load the `cowork` skill'):
+                     '`git add -- <paths>` then `git commit --only -m "<subject>" -- <same paths>`',
+                     'Do not load the `cowork` skill'):
             self.assertIn(rule, ' '.join(first['stdin'].split()), 'the receiver gets its rules inline')
         for call in (first, second):
             self.assertRegex(call['stdin'], r'cowork request codex-\S+ from claude')
@@ -901,22 +902,6 @@ class CoworkTest(unittest.TestCase):
             with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': os.pathsep.join(map(str, path))}):
                 self.assertEqual(cowork.nt_cli(['codex', 'exec']), [str(found), 'exec'], 'PATH order, then .exe first')
 
-    @unittest.skipIf(os.name != 'nt', 'PATH entries are quoted, and relative ones searched, on Windows only')
-    def test_a_quoted_path_entry_is_its_directory_and_a_relative_one_is_skipped(self):
-        found = Path(self.tmp.name) / 'Program Files' / 'Codex'
-        found.mkdir(parents=True)
-        (found / 'codex.exe').touch()
-        (self.root / 'codex.exe').touch()  # the checkout, the working directory
-        for path, cwd, expected in ((f'"{found}"', self.root, found / 'codex.exe'),
-                                    (os.pathsep.join(('', self.root.name, str(found))), self.root.parent, found / 'codex.exe'),
-                                    ('.', self.root, None)):
-            with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': path}), contextlib.chdir(cwd):
-                if expected is None:
-                    with self.assertRaises(FileNotFoundError):
-                        cowork.nt_cli(['codex', 'exec'])
-                else:
-                    self.assertEqual(cowork.nt_cli(['codex', 'exec']), [str(expected), 'exec'])
-
     @unittest.skipIf(os.name != 'nt', 'CreateProcess searches the current directory on Windows only')
     def test_git_is_found_on_path_alone_never_in_the_checkout(self):
         decoy = Path(self.tmp.name) / 'decoy'
@@ -1253,9 +1238,8 @@ class CoworkTest(unittest.TestCase):
 
     def test_a_verdict_is_published_after_a_reader_briefly_holds_its_temporary_file(self):
         target = self.root / 'x.exit'
-        name = 'rename' if os.name == 'nt' else 'link'
-        with mock.patch.object(cowork, 'fcntl', None), mock.patch.object(cowork.time, 'sleep'), \
-                mock.patch.object(cowork.os, name, wraps=getattr(os, name),
+        with mock.patch.object(cowork.windows.os, 'name', 'nt'), mock.patch.object(cowork.windows.time, 'sleep'), \
+                mock.patch.object(cowork.os, 'rename', wraps=os.rename,
                                   side_effect=[PermissionError(13, 'in use'), mock.DEFAULT]) as move:
             self.assertTrue(cowork.publish(target, '0\n'))
         self.assertEqual((target.read_text(), move.call_count), ('0\n', 2))

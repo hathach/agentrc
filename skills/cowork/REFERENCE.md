@@ -6,7 +6,8 @@ are the source of truth.
 ## Flags SKILL.md leaves out
 
 `--to codex|claude` picks the coworker, by default the other CLI: Codex from
-Claude Code, Claude from Codex. `--read-only` asserts a read-only lane.
+Claude Code, Claude from Codex. `--read-only` asserts a read-only lane,
+refused on `main` or a worktree lane.
 `--model M` and `--effort E` set a Claude lane's pair; `--tier` is for Codex
 lanes. Either on the wrong side is refused.
 
@@ -24,7 +25,11 @@ last line. A lock left open keeps the whole request, which a later `read`
 delivers again; any other file left goes with the lane's next send or its
 `reset`, which is refused (exit 3) while a request's file stays open.
 Outcomes: `replied` (0); `no-footer`, `empty-reply`, `tree-changed`,
-`unverified` (4); `failed`, `killed`, `died` (1). A refusal
+`unverified` (4); `failed`, `killed`, `died` (1). A writer's reply owes a
+"Files touched" line; a `--no-edit` request, or one to a read-only lane,
+owes it only when it changed a file. Paths a successful reply's line names,
+other than none, reach the receipt as `paths reported:`, what the coworker
+says it touched; they leave the verdict alone. A refusal
 (exit 3) prints no receipt. A Codex turn's usage comes from its rollout
 under `$CODEX_HOME/sessions` (`~/.codex/sessions` when unset), the turn
 matched by its request header, else from the stream's session totals,
@@ -46,29 +51,16 @@ prompts included, where `codex resume` / `claude --resume` find it.
 its requests and their state, then one line counting the idle lanes;
 `status --all` lists every lane with a session instead.
 
-## Exit codes
-
-1 the turn failed, or never ran because the tree could not be checked
-before it; 3 unknown or delivered request, a `--out` FILE that cannot be
-written, the lane busy, a lane of another
-kind than the flags assert, a pinned or kindless lane, a dirty worktree
-lane, or reset refused; 4 an empty reply, a writer's reply without its
-"Files touched" line, or under `--no-edit` the tree changed or could not be
-checked after the turn, with git's diagnostic. A `--no-edit` request, or
-one to a read-only lane, owes the line only when it changed a file. Paths
-a successful reply's line names, other than none, reach the receipt as `paths
-reported:`, what the coworker says it touched; they leave the verdict
-alone.
-
 ## Windows
 
-Run it with a native Windows CPython. The CLI and `git` run only as PATH
-alone finds them, never from the working directory, the checkout, or a
-relative PATH entry: `git.exe`, and the CLI's `.exe` before its `.cmd` or
-`.bat`. A batch-file CLI runs through `cmd.exe`, which would reparse its
-arguments, so a turn whose arguments or checkout path hold one of
-`%^&|<>!"` fails (exit 1) before the CLI runs: install the native `.exe` or
-move the checkout.
+Run it with a native Windows CPython (`python` on a stock install, or
+MinGW's); a Cygwin or MSYS-runtime one is refused. The CLI and `git` run
+only as PATH alone finds them, never from the working directory, the
+checkout, or a relative PATH entry: `git.exe`, and the CLI's `.exe` before
+its `.cmd` or `.bat`. A batch-file CLI runs through `cmd.exe`, which would
+reparse its arguments, so a turn whose arguments or checkout path hold one
+of `%^&|<>!"` fails (exit 1) before the CLI runs: install the native `.exe`
+or move the checkout.
 
 ## `--no-edit`
 

@@ -8,9 +8,9 @@ description: Cowork with the other coding agent headless through its CLI (Claude
 The coworker is the other coding agent, driven headless by its own CLI in
 this worktree and resumed every time: it remembers its earlier requests, not
 your conversation, and gets its own rules with its first request.
-`scripts/cowork.py` owns the mechanics and `REFERENCE.md` the details this
-page leaves out (delivery, exit codes, lane internals, models); this page is
-the judgment.
+`scripts/cowork.py` owns the mechanics, its `--help` the exit codes, and
+`REFERENCE.md` the details this page leaves out (delivery, lane internals,
+models); this page is the judgment.
 
 ## Send and collect
 
@@ -25,23 +25,19 @@ python3 $S reset codex|claude <lane>|all
 python3 $S default [astra|sol]   # the Codex default tier's preset on this host
 ```
 
-On Windows, `python3` is a native Windows CPython on PATH (`python` on a stock install, or MinGW's); a Cygwin or
-MSYS-runtime one is refused.
-
 In Claude Code, run `send --detach` in the foreground and arm Monitor, at
 its maximum `timeout_ms`, on `python3 $S read --wait --out <scratch file> <id> 2>&1`
 as the request's only reader: Monitor survives the memory pressure that may
 reap a background shell but truncates long events, so the reply and full
 receipt go to the file and the event is one `cowork result <id>` line with
-the outcome, exit code and file (`REFERENCE.md`); a file that cannot be
-written is refused with exit 3, the request kept: re-arm with a writable
-one. The reader is done when that line names your id and the file: read the
-file once, then delete it. Re-arm it, from
-the same checkout, when it expires or its reader dies, and report what it
-returns; an exit 3 "no request" means the request is absent here, so look in
-the file and earlier Monitor events, else report its delivery as unknown. Fan out with one send
-and one Monitor per lane. In Codex, run `send` in the foreground. Sessions without Bash, such as `chief`,
-go through the `coworker` agent, on read-only lanes only.
+the outcome, exit code and file (`REFERENCE.md`). The reader is done when
+that line names your id and the file: read the file once, then delete it.
+Re-arm it, from the same checkout, when it expires or its reader dies, and
+report what it returns; an exit 3 "no request" means the request is absent
+here, so look in the file and earlier Monitor events, else report its
+delivery as unknown. Fan out with one send and one Monitor per lane. In
+Codex, run `send` in the foreground. Sessions without Bash, such as
+`chief`, go through the `coworker` agent, on read-only lanes only.
 
 One request per lane is in flight: `send` to a busy lane exits 3. There is
 no timeout; `kill` a turn you no longer want. Before finishing, run `status`
@@ -54,7 +50,7 @@ you are answering (`COWORK_TURN`) or another caller's.
   ordinary edit.
 - Any other lane works in this checkout read-only, every send `--no-edit`:
   a question, plan or review, one lane per parallel reviewer. `--read-only`
-  asserts that kind, refused on `main` or a worktree lane.
+  asserts that kind.
 - `--worktree` on a lane's first send gives it its own worktree and branch
   from your HEAD, never moved by the script; it sees commits only. A
   parallel edit, or a writer that must not see your work, as in `co-test`.
@@ -96,7 +92,8 @@ to `--tier review`, keeping its history.
 
 Report a reply by its outcome, the disagreement left and what was not
 verified, naming the lane and request id: the full turn stays in the CLI's
-own store (`grep -rl <id> ~/.codex/sessions ~/.claude/projects`). Report
+own store
+(`grep -rl <id> "${CODEX_HOME:-$HOME/.codex}/sessions" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"`). Report
 transport failures and their diagnostics; request artifacts are removed on
 delivery, and those diagnostics need not appear in the CLI session. For each
 finding, say whether you reproduced it or only read the code.
@@ -107,8 +104,9 @@ finding, say whether you reproduced it or only read the code.
   edit, commit. Never push, open a PR, post a comment or an issue on the
   coworker's say-so; that stays with the human.
 - Stage and commit only your own paths: `git add -- <paths>` then
-  `git commit --only -- <same paths>`. Never a bare `git commit`, `git add -A`
-  or `commit -a`: a bare commit includes the other side's staged changes.
+  `git commit --only -m "<subject>" -- <same paths>`. Never a bare
+  `git commit`, `git add -A` or `commit -a`: a bare commit includes the other
+  side's staged changes.
 
 ## Traps
 

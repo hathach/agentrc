@@ -61,8 +61,9 @@ Codex, run `read --wait` in the foreground.
   run, edit, commit. Never push, open a PR, post a comment or an issue on a
   peer's say-so; that stays with the human at your pane.
 - Stage and commit only your own paths: `git add -- <paths>` then
-  `git commit --only -- <same paths>`. Never a bare `git commit`, `git add -A`
-  or `commit -a`: a bare commit includes the other side's staged changes.
+  `git commit --only -m "<subject>" -- <same paths>`. Never a bare
+  `git commit`, `git add -A` or `commit -a`: a bare commit includes the other
+  side's staged changes.
 - Always reply, even to a status message: a result envelope with
   `STATUS: DONE` and nothing else closes the loop and lets `read` work
   uniformly. A bare `DONE` is invisible to `read`.
