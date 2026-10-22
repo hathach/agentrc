@@ -1,0 +1,67 @@
+{
+ "version": 1,
+ "comment": "swo_capture.py --setup entries: writes are applied (journalled, restored), behind access port `ap` when given and only with the capture feature `for` names when given; `bits` sizes a narrower register, `key` is ORed into its writes, `requires` names an earlier write a restore needs in place, `gates_trace_unit` marks the write that makes a `jlink_device` part's TPIU reachable; watch entries must read (value & mask) == value and are never written, only snapshotted before and after. Evidence in swo-boards.md",
+ "entries": {
+  "stm32f4": {
+   "parts": "STM32F405/415, F407/417, F427/437, F429/439 (RM0090)",
+   "traceclk": "HCLK",
+   "writes": [
+    {"name": "DBGMCU_CR", "addr": "0xE0042004", "mask": "0x000000E0", "value": "0x00000020",
+     "why": "TRACE_IOEN=1, TRACE_MODE=00 asynchronous: TRACECLKIN is tied low until set",
+     "ref": "RM0090 (book 3636) DBGMCU_CR, p1691"}
+   ],
+   "watch": [
+    {"name": "GPIOB_MODER", "addr": "0x40020400", "mask": "0x000000C0", "value": "0x00000080",
+     "why": "PB3 (JTDO/TRACESWO) in alternate function mode, its reset state; firmware may have remapped it",
+     "ref": "RM0090 (book 3636) GPIOx_MODER reset values, p283; TRACESWO on JTDO, p1671"},
+    {"name": "GPIOB_AFRL", "addr": "0x40020420", "mask": "0x0000F000", "value": "0x00000000",
+     "why": "PB3 on AF0 (JTDO/TRACESWO)", "ref": "RM0090 (book 3636) GPIOx_AFRL, AF0 = system"}
+   ],
+   "openocd": {"swo_object": "stm32f4x.tpiu"}
+  },
+  "stm32h7": {
+   "parts": "STM32H742, H743/753, H750 (RM0433)",
+   "traceclk": "undocumented: 400 MHz worked on stm32h743nucleo, where rcc_c_ck and pll1_r_ck are both 400 MHz",
+   "writes": [
+    {"name": "TSG_CNTCR", "addr": "0xE00E5000", "ap": 2, "mask": "0x00000001", "value": "0x00000001", "for": "global-ts",
+     "why": "EN: the global timestamp counter runs (reset 0); only for --global-ts",
+     "ref": "RM0433 (book 4918) TSG_CNTCR, p3109; the TSG at 0xE00E5000 behind AP2, p3101"}
+   ],
+   "watch": [
+    {"name": "DBGMCU_CR", "addr": "0x5C001004", "mask": "0x00700000", "value": "0x00700000",
+     "why": "TRACECLKEN, D1DBGCKEN, D3DBGCKEN; stm32h7x.cfg examine-end sets them",
+     "ref": "RM0433 (book 4918) DBGMCU_CR, p3209"},
+    {"name": "SWTF_CTRL", "addr": "0x5C004000", "mask": "0x00000001", "value": "0x00000001",
+     "why": "ENS0 passes the core's trace to the SWO unit; stm32h7x.cfg examine-end sets ENS0|ENS1",
+     "ref": "RM0433 (book 4918) SWTF_CTRL, p3197"},
+    {"name": "GPIOB_MODER", "addr": "0x58020400", "mask": "0x000000C0", "value": "0x00000080",
+     "why": "PB3 (JTDO/TRACESWO) in alternate function mode, its reset state; firmware may have remapped it",
+     "ref": "RM0433 (book 4918) GPIOx_MODER reset values, p540"},
+    {"name": "GPIOB_AFRL", "addr": "0x58020420", "mask": "0x0000F000", "value": "0x00000000",
+     "why": "PB3 on AF0 (JTDO/TRACESWO)", "ref": "DS12110 (book 4968) alternate functions, p85"}
+   ],
+   "openocd": {"swo_object": "stm32h7x.swo"},
+   "jlink": "unsupported: the SWO unit is not the core TPIU this J-Link route programs"
+  },
+  "ra6m5": {
+   "parts": "RA6M5 (R01UH0891)",
+   "jlink_device": "R7FA6M5",
+   "traceclk": "the system clock source divided by TRCKCR.TRCK (/2 after reset, kept as found): 100 MHz from TinyUSB's 200 MHz PLL",
+   "writes": [
+    {"name": "PRCR", "addr": "0x4001E3FE", "bits": 16, "key": "0xA500", "mask": "0x0001", "value": "0x0001",
+     "why": "PRC0 unlocks TRCKCR; a write takes effect only with PRKEY 0xA5, which reads 0",
+     "ref": "RA6M5 HW manual (book 5584) PRCR, p281"},
+    {"name": "TRCKCR", "addr": "0x4001E03F", "bits": 8, "mask": "0x80", "value": "0x80", "gates_trace_unit": true,
+     "requires": "PRCR",
+     "why": "TRCKEN starts the trace clock (reset 0); a TPIU read with it stopped left ek_ra6m5's AHB-AP wedged until power-off (cause suspected; swo-boards.md), so no TPIU access comes before it",
+     "ref": "RA6M5 HW manual (book 5584) TRCKCR, p191; TRCLK, Table 8.2 p152; TPIU note 1, p86"}
+   ],
+   "watch": [
+    {"name": "P109PFS", "addr": "0x40080864", "mask": "0x1F010000", "value": "0x00010000",
+     "why": "P109 as TDO/SWO (PMR 1, PSEL 0), its reset state; firmware may have remapped it, as TXD9 say",
+     "ref": "RA6M5 HW manual (book 5584) PmnPFS and its note 1, p529-530; P109 after reset, p523"}
+   ],
+   "openocd": "unsupported: not tried, and the OpenOCD route does not hold back TPIU access while the trace clock is stopped"
+  }
+ }
+}
