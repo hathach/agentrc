@@ -768,9 +768,9 @@ def script(operands):
     operand = operands[0] if operands else None
     if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
         raise Denied(STDIN_RULE)
-    if expanded(operand):
-        raise Denied('this script is a value known only at run time (a substitution, a variable or a glob), which this '
-                     'guard cannot read; name the script file, a glob character quoted')
+    if expanded(operand) or operand.startswith('~'):
+        raise Denied('this script is a value known only at run time (a substitution, a variable, a tilde or a glob), '
+                     'which this guard cannot read; name the script file, a tilde or glob character quoted')
 
 
 def spelled(args, longs, letters, valued='', valued_longs=None):

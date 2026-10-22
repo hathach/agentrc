@@ -527,10 +527,13 @@ class ChiefGuard(unittest.TestCase):
                   'bash --rcfile /tmp/r /tmp/s.sh', 'bash -o vi -c "git log"'):
             self.assert_denied(c, 'shell option')
         self.assert_denied('sh -e -c -x "git push"', 'changes the repository')
+        # an unquoted leading tilde names the script only at run time, after HOME may point it at stdin
+        for c in ('source ~/s.sh', 'bash ~', "HOME=/dev/fd; printf 'git push' | bash ~/0", 'sh ~root/s', 'bash ~+/s'):
+            self.assert_denied(c, 'tilde')
         # a -c string is checked (a read passes), and a script operand is not followed
         for c in ('bash -c "git log"', 'bash -lc "git log"', 'bash -e -c "git status"', 'bash /tmp/s.sh arg',
                   'sh /tmp/s.sh', 'bash -- /tmp/s.sh', 'bash --norc /tmp/s.sh',
-                  'sh -ec -x "git log"'):
+                  'sh -ec -x "git log"', "bash '~/s.sh'", 'bash \\~/s.sh'):
             self.assert_allowed(c)
 
     def test_aliases_are_denied(self):
