@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import struct
 import subprocess
 import sys
@@ -264,6 +265,33 @@ class JLinkDump(unittest.TestCase):
         self.assertEqual(proc.returncode, 3, err)
         self.assertFalse(pid_alive(tool))
         self.assertIn('stopped by signal', json.loads((self.out / 'dump.json').read_text())['error'])
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX SIGTERM')
+    def test_a_stop_signal_while_a_failure_is_recorded_is_not_turned_into_an_error(self):
+        self.target(bytes(64), wroff=0)
+        caught = []
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.signal(signal.SIGTERM, lambda s, _: caught.append(s)))
+        real_dump = json.dump
+
+        def signalled_dump(*args, **kw):
+            signal.raise_signal(signal.SIGTERM)
+            return real_dump(*args, **kw)
+
+        with unittest.mock.patch.object(dump.json, 'dump', signalled_dump):
+            rc, r = self.run_dump(FAKE_NOHALT='1')
+        self.assertEqual((rc, caught), (3, [signal.SIGTERM]))
+        self.assertEqual(json.loads((self.out / 'dump.json').read_text())['error'], r['error'])
+
+    def test_an_interrupted_record_write_leaves_no_partial_dump_json(self):
+        self.target(bytes(64), wroff=0)
+
+        def cut_dump(obj, f, **kw):
+            f.write('{')
+            raise KeyboardInterrupt
+
+        with unittest.mock.patch.object(dump.json, 'dump', cut_dump), self.assertRaises(KeyboardInterrupt):
+            self.run_dump(FAKE_NOHALT='1')
+        self.assertFalse((self.out / 'dump.json').exists())
 
     def test_elf_gives_the_control_block(self):
         elf = self.dir / 'fw.elf'

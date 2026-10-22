@@ -237,8 +237,10 @@ def main(argv=None):
     result = {'controlBlock': f'0x{cb:08x}', 'channel': a.channel}
 
     def finish(rc):
-        with open(os.path.join(a.out, 'dump.json'), 'w') as f:
+        record = os.path.join(a.out, 'dump.json')
+        with open(record + '.tmp', 'w') as f:     # renamed whole, so an interrupted write leaves no partial record
             json.dump(result, f, indent=1)
+        os.replace(record + '.tmp', record)
         print(json.dumps(result))
         return rc
 
@@ -261,16 +263,19 @@ def main(argv=None):
             return fail(f'temporary directory {tmp!r} has unsafe characters: set TMPDIR')
         dump = jlink_dump if route == 'jlink' else openocd_dump
         previous = {sig: signal.signal(sig, on_signal) for sig in STOP_SIGNALS}
+        error = None
         try:
             t0 = time.monotonic()
             header, d, again, before, after = dump(backend, cb, a.channel, a.resume, tmp, a.timeout)
             result['sessionMs'] = round((time.monotonic() - t0) * 1000)
             ring = read_file(f'{tmp}/ring.bin', d[2], 'ring')
         except (ToolError, ValueError, OSError) as e:
-            return fail(str(e))
+            error = str(e)
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+        if error is not None:    # recorded with on_signal gone: a later stop signal acts as it did before the session
+            return fail(error)
         result['core'] = {'before': before, 'after': after}
         name, buf, size, wroff, rdoff, flags = d
         result['descriptor'] = {'sName': f'0x{name:08x}', 'pBuffer': f'0x{buf:08x}', 'SizeOfBuffer': size,
