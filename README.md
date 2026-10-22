@@ -159,6 +159,13 @@ schematics in a directory you name:
 |---|---|---|
 | [`read-pcb`](skills/read-pcb/SKILL.md) | answer board-wiring questions (which pin, net, part or revision) from the schematic | `pcb.py find --in <dir> <board>`, then `net <sch> <net>` |
 
+Firmware footprint; the project supplies the launcher, its builds and its CI
+baseline through the `Code size` section of its `Build contract:`:
+
+| Skill | Use it to | Start with |
+|---|---|---|
+| [`code-size`](skills/code-size/SKILL.md) | measure flash/RAM per board, file, section or symbol, and diff it against a base ref or CI's stored snapshots | `<launcher> diff -b <board>` |
+
 Firmware and USB debugging on real hardware; `target-debug` maps which one
 answers what, and the project supplies the build variant and board locks
 through its `Build contract:` and `HIL contract:` lines:
