@@ -13,6 +13,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -305,9 +306,18 @@ class Recorder(unittest.TestCase):
     def test_sigterm_stops_the_run_and_cleans_up(self):
         before = signal.getsignal(signal.SIGTERM)
         pidfile = self.dir / 'workload.pid'
-        timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGTERM))
-        timer.start()
-        self.addCleanup(timer.cancel)
+        cancelled = threading.Event()
+
+        def kill_once_the_workload_runs():    # a fixed delay can fire before a loaded host starts the workload
+            deadline = time.monotonic() + 30
+            while not cancelled.wait(0.05) and time.monotonic() < deadline:
+                if pidfile.exists() and pidfile.read_text().strip():
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+        killer = threading.Thread(target=kill_once_the_workload_runs, daemon=True)
+        killer.start()
+        self.addCleanup(killer.join)
+        self.addCleanup(cancelled.set)
         rc, r = self.run_main('--probe', '123', '--device', 'X', '--interface', 'swd', '--speed', '4000',
                               '--addr', '0x24000000', '--duration-ms', '10000',
                               '--workload', f'echo $$ > {pidfile}; sleep 30')
