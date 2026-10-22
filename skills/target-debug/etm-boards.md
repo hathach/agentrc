@@ -1,4 +1,4 @@
-# etm-trace — per-board reference
+# ETM trace — per-board reference
 
 Validated boards: trace config table + hard-won caveats. Read the row AND the
 caveat for a board before capturing on it; add a row + caveat when a new board
@@ -191,8 +191,8 @@ Board caveats (beyond the table):
   core; width 2/4 blocked on a dead D1 line at J403.16 (clean at DC by
   meter, dead at speed — probe-channel crosscheck on a known-good width-4
   board pending). No Ethernet while tracing.
-- **SEGGER ref boards**: run their own demo (ladder step 3 flags); `--isr`
-  degrades gracefully without a live SysTick.
+- **SEGGER ref boards**: run their own demo (bring-up ladder step 3 flags);
+  `--isr` degrades gracefully without a live SysTick.
 
 ## Adding a new board
 

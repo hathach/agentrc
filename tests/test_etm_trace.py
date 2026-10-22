@@ -1,4 +1,4 @@
-"""Tests for the etm-trace scripts: etm_capture.py inherits its trace config
+"""Tests for the ETM trace scripts: etm_capture.py inherits its trace config
 from an explicit reference Ozone project wherever it is run from and refuses
 ambiguous or incomplete inputs; etm_profile.py parses Ozone's code-profile
 report and refuses anything else. No Ozone, no hardware."""
@@ -19,7 +19,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
-SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'etm-trace' / 'scripts'
+SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts'
 
 
 def load(name):

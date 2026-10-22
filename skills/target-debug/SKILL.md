@@ -1,6 +1,6 @@
 ---
 name: target-debug
-description: "Use when firmware misbehaves on real hardware and its own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO. Also for Espressif chips over the built-in USB-Serial-JTAG (303a:1001) or pad JTAG with openocd-esp32, when openocd says \"could not find or open device\", or the debug port becomes the firmware's USB device."
+description: "Use when firmware misbehaves on real hardware and its own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO. Also ETM instruction trace and profiling with a SEGGER J-Trace and Ozone: hot functions, ISR timing, code coverage, what ran before a fault or hang; \"No trace clock present\". Also for Espressif chips over the built-in USB-Serial-JTAG (303a:1001) or pad JTAG with openocd-esp32, when openocd says \"could not find or open device\", or the debug port becomes the firmware's USB device."
 ---
 
 # target-debug — target-side capture & debugging over a debug probe
@@ -14,9 +14,8 @@ Pi).
 
 | Skill                 | Answers | Needs |
 | --------------------- | --- | --- |
-| **`target-debug`**    | **what the target did** (driver state, faults, where the core spins) | a debug probe on the target |
+| **`target-debug`**    | **what the target did** (driver state, faults, where the core spins, which instructions ran) | a debug probe on the target; a J-Trace for instruction trace |
 | `rtt`                 | the target's log/console stream, and a post-mortem ring dump | a probe, firmware that logs over SEGGER RTT |
-| `etm-trace`           | exactly which instructions ran (profile, coverage, history) | a SEGGER J-Trace wired to this board; follow `etm-trace`'s confirmation rule |
 | `usb-sniffer`         | what crossed the wire (PIDs, handshakes, resets) | the hardware tap cabled in; role-agnostic |
 | a project's `sysview` | where CPU time goes: task/ISR schedule, per-context load, switch and ready→run timing, or what ran right before a crash/hang | the project ships the skill; a J-Link/J-Trace for live capture, or an OpenOCD probe for raw RTT capture |
 | `usb-kernel-debug`    | what a Linux host exchanged (usbmon URBs) and why its kernel acted (dynamic debug) | Linux on either end: PC host or gadget peer |
@@ -63,7 +62,7 @@ rules bind the unit; its role file adds only what it may edit and when it stops.
   `blocked` with what the caller must supply. Use `needs-user` for human-only action or a permission still required for
   publishing, destructive actions on data or third-party access, instead of waiting for an answer. Establish the
   physical setup a technique needs before using it. If wiring cannot be established from current evidence or the
-  supplied setup information, name the missing setup and proposed experiment in `next`: for ETM, follow `etm-trace`'s
+  supplied setup information, name the missing setup and proposed experiment in `next`: for ETM, follow `etm-trace.md`'s
   per-board wiring rule.
 - **Identity.** Verify worktree, branch and HEAD, then board, probe serial and host against the prompt, or the probe
   against the HIL config entry it names, before acting. Resolve the board's family and debug backend from the project's
@@ -152,6 +151,7 @@ The Core column says where a technique exists; a row that names a core family do
 | SystemView (project's `sysview`)   | any the project's `sysview` supports                                                          | recorder in the firmware, per event                     | scheduling-shaped bugs: throughput jitter, a task starved or preempted, an ISR too long — not logic/state bugs |
 | Log lines (RTT)                    | any with a probe RTT path (J-Link, OpenOCD); none in the measured TinyUSB Espressif builds    | µs per line                                             | logic bugs that survive logging                                                                                |
 | Log lines (UART)                   | any                                                                                           | up to ms per line when the write path polls a full FIFO | same, when no debug-probe RTT path                                                                             |
+| ETM instruction trace              | Cortex-M with an ETM (optional on ARMv7-M, Armv8-M; none on ARMv6-M), wired to a J-Trace      | trace setup; halts; reflash+reset unless `--attach`     | exact instruction counts, coverage, ISR timing, the history before a fault/hang; confirm J-Trace wiring first  |
 | dprintf / conditional breakpoint   | any                                                                                           | halt+resume per hit (~ms)                               | low-rate probes post-wedge; never ISR-rate events                                                              |
 | GDB halt / breakpoints             | any; the hardware budget is per chip (`gdb.md`; `espressif.md`, Attach, "Breakpoint budgets") | stops USB service entirely                              | post-mortem state autopsy once wedged                                                                          |
 
@@ -167,6 +167,7 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - SystemView: the project's `sysview` skill.
 - Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands (`console_capture.py` for a UART), the drain
   model; the channel itself is the `rtt` skill's.
+- ETM instruction trace: `etm-trace.md` — `etm_capture.py`, `etm_profile.py`; per-board notes in `etm-boards.md`.
 - Chip and family constraints (flash reads, reset domains, probe misreads): `families.md`; Espressif chips:
   `espressif.md`.
 - dprintf, GDB halt and breakpoints: `gdb.md` — GDB servers, OpenOCD batch sessions, the halted autopsy
@@ -229,6 +230,6 @@ Every entry there says how it is known (verified when, on which revision and boa
 symbol exists in the checkout in front of you before relying on it. When a session establishes something reusable —
 reproduced, or read in a source — add it with the same evidence, or correct the entry it contradicts, where it holds:
 only for this project, its file here; for any firmware on the chip, `families.md` (Espressif chips: `espressif.md`); for
-a probe or tool, the technique file (RTT and trace per-board caveats: `rtt/boards.md`, `etm-trace/boards.md`). Leave out
-the session's chronology and dead ends. A project with no file: work from its source, and start one when there is
-something worth keeping.
+a probe or tool, the technique file (RTT and trace per-board caveats: the `rtt` skill's `boards.md`, `etm-boards.md`).
+Leave out the session's chronology and dead ends. A project with no file: work from its source, and start one when there
+is something worth keeping.

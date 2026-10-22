@@ -1,6 +1,6 @@
 # TinyUSB (`hathach/tinyusb`) — debugging notes
 
-What is specific to this project when using `target-debug` (its `espressif.md` included), `rtt`, `etm-trace`,
+What is specific to this project when using `target-debug` (its `espressif.md` included), `rtt`,
 `usb-sniffer` or `usb-kernel-debug` on it: names to inspect, what a symptom usually means, which example proves what.
 For building a debug variant, taking a rig board or handling a failed `usbtest` case, follow the project's own
 `CLAUDE.md` (`Build contract:`, `HIL contract:`, `usbtest battery:`), not this file; chip and probe behaviour is in
@@ -96,12 +96,12 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   at reset. symbol checked in fad6bd546 (seven families).
 - Reference Ozone projects live beside the board: `hw/bsp/<family>/boards/<board>/ozone/*.jdebug`; the project's
   board-info tool prints the one for a board. 15 of 15 resolve through `etm_capture.py --jdebug`. verified 2026-09-17
-  fad6bd546 (resolution only; boards.md has the captures).
+  fad6bd546 (resolution only; `etm-boards.md` has the captures).
 - The bare-metal examples have no SysTick handler on rp2040/rp2350, so there is no ready calibration beat for
   `etm_profile.py --isr`: `dcd_rp2040_irq` is the USB ISR, `alarm_pool_irq_handler` the timer one, neither at a fixed
   rate. A known-rate beat has to be added for the measurement (a repeating hardware timer in the BSP, reverted
   afterwards). verified 2026-09-18 fad6bd546 pico2_etm_trace: 154–156 µs by ETM against 157.3 µs by DWT CYCCNT.
-- `etm_profile.py --isr` entries, per board, from the validated captures in etm-trace's boards.md (carried over):
+- `etm_profile.py --isr` entries, per board, from the validated captures in `etm-boards.md` (carried over):
   mcb1800 `USB0_IRQHandler,dcd_int_handler`; ra6m5_ek `tusb_int_handler,dcd_int_handler` (FSP's
   `usbfs_interrupt_handler` symbol never executes); ra8m1_ek `tusb_int_handler`.
 - pico2_etm_trace sets `TRACE_ETM` in its own `board.cmake`: no build flag. A bare `-DSYS_CLK_KHZ=` only sets a CMake

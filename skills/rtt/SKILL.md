@@ -14,8 +14,8 @@ SystemView claims its own `"SysView"` up-buffer on the same control block —
 they coexist. The debug probe reads/writes this RAM while the core runs, so
 everything here is zero-wiring: no UART, no VCOM.
 
-Scope: byte transport and console. Timing/profiling → `etm-trace`;
-debugging decision flows → `target-debug`;
+Scope: byte transport and console. Timing/profiling and debugging decision
+flows → `target-debug`;
 Espressif consoles → `target-debug`'s `espressif.md` (UART0 or the
 USB-Serial-JTAG CDC; no SEGGER RTT in the measured builds).
 

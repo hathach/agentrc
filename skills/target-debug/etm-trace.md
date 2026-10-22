@@ -1,18 +1,14 @@
----
-name: etm-trace
-description: Use when logs, GDB or PC-sampling cannot answer and you need instruction-level execution data from a SEGGER J-Trace and Ozone — hot functions by instruction count, ISR timing, on-target code coverage, what ran right before a fault or hang. ETM trace; "No trace clock present".
----
+# ETM instruction trace — unattended J-Trace + Ozone
 
-# etm-trace — unattended ETM instruction trace via J-Trace + Ozone
+Part of the `target-debug` skill (its technique ladder says when to reach for
+this; its Delegated sessions, Rig discipline and Warnings apply). Arm only: the
+ETM is optional on ARMv7-M (ARMv7-M ARM C1.9) and on Armv8-M Main and Baseline
+(Armv8-M ARM B13.1), absent on ARMv6-M.
 
 Streams full instruction (ETM) trace from a board wired to a SEGGER J-Trace,
 headlessly: no GUI, scripted end to end. Produces hot-function profile, code
-coverage, and optionally the raw instruction history.
-
-Which debug skill answers what: `target-debug`'s table.
-
-Use `target-debug`'s DWT PC-sampling for a quick statistical profile; use
-this skill for exact counts, coverage, or instruction-by-instruction history.
+coverage, and optionally the raw instruction history. For a quick statistical
+profile, PC-sampling (`techniques.md`, "PC-sampling") needs no J-Trace.
 
 ## Requirements
 
@@ -27,9 +23,8 @@ this skill for exact counts, coverage, or instruction-by-instruction history.
   (≥ V3.38 for the automation socket) and
   `xvfb-run`; the capture script refuses to run without either.
 - Firmware whose init enables the trace pins and trace clock. How to build that
-  variant is the project's build contract (`target-debug`, "What the project
-  supplies"); what the init is called there, its notes (`target-debug`'s
-  `projects/`).
+  variant is the project's build contract (SKILL.md, "What the project
+  supplies"); what the init is called there, its notes (`projects/`).
 - A board with a reference Ozone project captures with `--jdebug <file>` and
   inherits its device, TIF speed, trace timing/width, core clock, hooks and
   J-Link script (where a project keeps them: its notes); any other
@@ -39,7 +34,7 @@ this skill for exact counts, coverage, or instruction-by-instruction history.
   reference) is refused until you pass `--cortex-m-default-hooks` (SP/PC from
   the ELF's vector table) — right for a plain Cortex-M image, wrong for one a
   ROM bootloader must start; `--attach` runs neither hook and asks for none. Verified
-  boards: `boards.md` in this skill directory.
+  boards: `etm-boards.md`.
 
 ## Rig discipline
 
@@ -48,8 +43,6 @@ this skill for exact counts, coverage, or instruction-by-instruction history.
   session (check `fuser /dev/bus/usb/<bus>/<dev>`), surface it and ask. The
   capture script uses automation port **19201**, never an interactive Ozone's
   19200.
-- Shared rig boards: hold the project's board lock first (its `HIL contract:`
-  names the skill that owns it).
 - Reference projects are interactive projects — automation never opens them
   (Ozone rewrites project files); the script generates a throwaway project.
 - The default capture reflashes and resets the target (`--attach` doesn't).
@@ -84,7 +77,7 @@ Choosing capture flags (semantics in `--help`):
 - raw history: `--trace-csv` (~80 MB/1M instructions) — when sequence/timing
   matters, e.g. feeding `--isr`
 - stream dies (overflow/unknown-packet): `--no-timestamps`, then reduce the
-  core clock (`boards.md`); marginal wiring: sweep `--trace-timing`,
+  core clock (`etm-boards.md`); marginal wiring: sweep `--trace-timing`,
   isolate lines with `--trace-width`. "capture OK" requires nonzero profile
   totals — silence (no trace at all) fails with its own error
 - deeper data: `--profile-lines-csv` (hottest lines), `--profile-insts-csv`
@@ -95,7 +88,7 @@ Choosing capture flags (semantics in `--help`):
   width, plus `--jlink-script` when the firmware doesn't init the trace pins
 
 First trace on a board — or after any rewiring — is a bring-up, not a plain
-capture: follow `boards.md`, "Adding a new board" (vendor example first), and
+capture: follow `etm-boards.md`, "Adding a new board" (vendor example first), and
 read it before touching hardware.
 
 Analyzer: `--isr ENTRY[,BODY..] --tick-symbol SYM --tick-hz HZ` gives ISR
@@ -164,7 +157,7 @@ request `itrace.csv`, `profile_lines.csv`, `profile_insts.csv`, `samples.csv`,
 ## Per-board notes
 
 Every validated board has a row (config: core clock, TRACECLK, width, timing,
-physical setup, TODO) and a caveat entry in `boards.md` (same directory) —
+physical setup, TODO) and a caveat entry in `etm-boards.md` —
 **read a board's row and caveat before capturing on it**; new validations add
 both. Timing semantics and clock columns are explained at the top of that file.
 

@@ -300,6 +300,7 @@ The ladder's Core column says where a technique exists; these are the substitute
 | PC-sampling without a halt | none (no DWT_PCSR); repeated telnet `halt; reg pc; resume` halts the core per sample, more intrusive than a RAM ring and untested as a histogram |
 | Vector catch               | none: breakpoint the panic handler; RISC-V `mcause`/`mepc`/`mtval` are the CFSR/BFAR analogs |
 | SWO / DWT data trace       | none: apptrace over JTAG is the analog (needs `CONFIG_APPTRACE` + app init; untested) |
+| ETM instruction trace      | no recipe here; ESP32-P4 and S31 HP CPUs have a RISC-V Trace Encoder that stores trace packets in system memory (TRM book 4889 ch. 2, TRM book 6558 ch. 1; untested) |
 
 ## Variants
 
