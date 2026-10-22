@@ -309,10 +309,12 @@ def jlink_judgment(out: str, commands: list) -> dict:
     judged = []
     for c, chunk in got:
         rule = JLINK_DONE.get(c.split()[0] if c else '')
+        try:          # an echo missing the arguments its rule names completes nothing
+            done = rule is not None and bool(re.search(rule.format(*c.split()[1:]), chunk, re.M))
+        except (IndexError, KeyError, ValueError, re.error):
+            done = False
         error = re.search(JLINK_ERRORS, chunk)
-        judged.append({'command': c, 'done': bool(rule is not None and re.search(rule.format(*c.split()[1:]), chunk,
-                                                                                re.M)),
-                       'error': error[0] if error else None})
+        judged.append({'command': c, 'done': done, 'error': error[0] if error else None})
     if [c for c, _ in got] != want:
         problem = f'echoed {[c for c, _ in got]!r:.300}, not the script {want!r:.300}'
     elif bad := next((j for j in judged if j['error'] or not j['done']), None):

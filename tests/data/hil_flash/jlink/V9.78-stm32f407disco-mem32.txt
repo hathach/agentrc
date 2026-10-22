@@ -45,4 +45,3 @@ Cortex-M4 identified.
 J-Link>exit
 
 Script processing completed.
-

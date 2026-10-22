@@ -885,6 +885,8 @@ class JLinkJudgment(unittest.TestCase):
 
     def test_every_recorded_session_completes(self):
         self.assertGreaterEqual({m['version'] for m in self.manifest.values()}, {'V9.78', 'V9.84'})
+        self.assertTrue(any('Skipped. Contents already match' in jlink_fixture(n) for n in self.manifest),
+                        'an already-matching image is recorded too')
         for name, m in self.manifest.items():
             with self.subTest(name):
                 self.assertEqual(hf.jlink_judgment(jlink_fixture(name), m['commands']),
@@ -903,6 +905,7 @@ class JLinkJudgment(unittest.TestCase):
                  'no exit': (good.replace('J-Link>exit\n', ''), 'echoed'),
                  'cut short': (good.replace('Script processing completed.', ''), "'exit' did not complete"),
                  'an extra echo': (good.replace('J-Link>exit', 'J-Link>go\nJ-Link>exit'), 'echoed'),
+                 'an echo without its arguments': (good.replace('J-Link>go', 'J-Link>sleep\nJ-Link>go'), 'echoed'),
                  'nothing': ('', 'echoed')}
         for what, (out, why) in cases.items():
             with self.subTest(what):

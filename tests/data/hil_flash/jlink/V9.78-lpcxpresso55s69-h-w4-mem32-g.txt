@@ -99,4 +99,3 @@ Memory map 'after startup completion point' is active
 J-Link>exit
 
 Script processing completed.
-

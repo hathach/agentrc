@@ -66,4 +66,3 @@ Cortex-M33 identified.
 J-Link>exit
 
 Script processing completed.
-

@@ -57,4 +57,3 @@ Writing 05FA0004 -> E000ED0C
 J-Link>exit
 
 Script processing completed.
-

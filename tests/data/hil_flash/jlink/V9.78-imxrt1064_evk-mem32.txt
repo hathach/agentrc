@@ -57,4 +57,3 @@ Cortex-M7 identified.
 J-Link>exit
 
 Script processing completed.
-

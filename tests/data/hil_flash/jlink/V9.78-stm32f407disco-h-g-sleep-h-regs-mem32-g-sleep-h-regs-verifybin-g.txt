@@ -152,4 +152,3 @@ J-Link>g
 J-Link>exit
 
 Script processing completed.
-
