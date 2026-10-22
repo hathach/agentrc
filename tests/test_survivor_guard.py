@@ -14,7 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import helpers  # noqa: E402
-from helpers import SURVIVOR_GUARD_OFF, end, guard_survivors, proc_stat  # noqa: E402
+from helpers import SURVIVOR_GUARD_OFF, end, guard_survivors, pid_alive  # noqa: E402
 
 # the guard in an interpreter of its own, so nothing of this suite is in its baselines: subreaper flag argv[2]
 # before the run; tests that each write the pid they leave behind to argv[3]/<test name>; a process started
@@ -128,7 +128,7 @@ class SurvivorGuard(unittest.TestCase):
         self.addCleanup(p.kill)
         end(p.pid, '1')    # its pid, an earlier process's start time
         self.assertIsNone(p.poll())
-        self.assertIn(proc_stat(p.pid)[1], 'RS')
+        self.assertTrue(pid_alive(p.pid))    # any live state: one still exec'ing can show D
 
     def test_a_listed_pid_that_is_not_the_listing_processs_child_is_skipped(self):
         real = helpers.children
