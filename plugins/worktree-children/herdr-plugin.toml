@@ -2,6 +2,7 @@ id = "agentrc.worktree-children"
 name = "Worktree children"
 version = "0.2.0"
 min_herdr_version = "0.9.1"
+platforms = ["linux"]
 description = "Remove a herdr worktree's <name>--* sibling worktrees with it, keeping any that hold work, and delete branches whose commits are pushed"
 
 [[events]]

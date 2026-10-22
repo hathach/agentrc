@@ -61,17 +61,10 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   (`/` as `-`), never inside it; the `<checkout>--` prefix is reserved for them.
   A dependency checked out as a worktree of another repository is a sibling
   too, `<checkout>--dep-<name>`, symlinked into the checkout, never nested.
-  Removing the checkout in herdr removes its clean siblings with it (the
-  agentrc `worktree-children` plugin, `install.py install --herdr-plugin`):
-  ignored files go, siblings holding work are kept and reported, and the
-  removed checkouts' branches are deleted when their commits are pushed or a
-  PR head, never-pushed ones kept. `cowork --worktree` lanes and `pr-review`'s
-  trees are siblings too; a cowork lane's stays locked, so kept, while a
-  request is outstanding, and a pr-review tree while its review runs.
-  Worktrees nested inside the checkout, made outside herdr or before it
-  placed them as siblings, go with it whatever they hold.
-  The `worktree-remove` skill checks for pending follow-ups before it asks
-  herdr to remove.
+  Remove a checkout with the `worktree-remove` skill; its clean siblings and
+  their pushed or PR-head branches go with it (agentrc's `worktree-children`
+  plugin, whose docstring has the rules). The skill refuses a checkout holding
+  nested worktrees, which herdr's own menu would delete whatever they hold.
 
 # Coding style
 - Comment only when the code cannot say it itself: a non-obvious *why*, a

@@ -262,6 +262,7 @@ class SkillFiles(unittest.TestCase):
                 meta = yaml.safe_load(skill.joinpath('SKILL.md').read_text().split('---')[1])
                 self.assertEqual(meta['name'], skill.name)
                 self.assertIsInstance(meta['description'], str)
+                self.assertTrue(meta['description'].strip())
 
 
 if __name__ == '__main__':

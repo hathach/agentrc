@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
@@ -24,10 +25,14 @@ if sys.argv[1:3] == ['worktree', 'list']:
         sys.exit('herdr server unreachable')
     if mode == 'recreate':
         os.makedirs(os.environ['STUB_PARENT'], exist_ok=True)
+    if mode == 'dangle' and not os.path.lexists(os.environ['STUB_PARENT']):
+        os.symlink(os.environ['STUB_PARENT'] + '-gone', os.environ['STUB_PARENT'])
     path = sys.argv[sys.argv.index('--cwd') + 1]
     entry = {'path': path, 'is_linked_worktree': True}
     if mode == 'open':
         entry['open_workspace_id'] = 'w9'
+    if mode == 'falsy':
+        entry['open_workspace_id'] = False
     print(json.dumps({'result': {'worktrees': [None] if mode == 'null' else [entry]}}))
     sys.exit(1 if mode == 'failed' else 0)
 '''
@@ -50,6 +55,20 @@ if sys.argv[1:3] == ['repo', 'view']:
     print('t/repo')
 else:
     print(open(prs).read())
+'''
+
+# runs the script with something at the parent path (argv[3]) only at the third look, as a replacement
+# moved in and out again would be
+BLINK = r'''import os, sys, runpy
+lexists, parent, looks = os.path.lexists, sys.argv[3], []
+def blinking(path):
+    if os.fspath(path) != parent:
+        return lexists(path)
+    looks.append(path)
+    return len(looks) == 3
+os.path.lexists = blinking
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
 '''
 
 # runs the script with DirEntry.is_dir failing on `inner`, as a stat can on a filesystem without d_type
@@ -378,7 +397,8 @@ class WorktreeChildren(unittest.TestCase):
 
     def test_an_open_or_unconfirmed_herdr_workspace_keeps_the_child(self):
         for mode, reason in (('open', 'open in herdr workspace w9'), ('down', 'herdr could not list it'),
-                             ('failed', 'herdr could not list it'), ('null', 'herdr could not list it')):
+                             ('failed', 'herdr could not list it'), ('null', 'herdr could not list it'),
+                             ('falsy', 'malformed entry')):
             with self.subTest(mode):
                 self.tearDown()
                 self.setUp()
@@ -861,7 +881,7 @@ class WorktreeChildren(unittest.TestCase):
         chief = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', '--agent', 'chief'], cwd=child)
         self.addCleanup(chief.wait)
         self.addCleanup(chief.kill)
-        self.assert_kept(child, f'a headless chief runs in it: pid {chief.pid}')
+        self.assert_kept(child, f'a chief session (headless or interactive) runs in it: pid {chief.pid}')
 
     def test_a_cowork_lane_with_a_request_keeps_the_child(self):
         child = self.child()
@@ -869,6 +889,79 @@ class WorktreeChildren(unittest.TestCase):
         box.mkdir(parents=True)
         (box / 'codex-review-1.lock').write_text('')
         self.assert_kept(child, 'cowork lane codex/review holds a running or undelivered request')
+
+    def test_a_staying_childs_own_children_and_link_targets_stay(self):
+        target = self.child('dep-x')  # sorted before the child linking to it
+        chained = self.child('dep-y')
+        owner = self.child('z')
+        (owner / 'notes.txt').write_text('wip')
+        (owner / 'build' / 'dep').symlink_to(Path('..') / '..' / target.name)
+        owned = self.child('z--dep')
+        (owned / 'build' / 'next').symlink_to(chained / 'lib')
+        other = self.child('other')
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        for kid in (target, chained, owner, owned):
+            self.assertTrue(kid.is_dir(), kid)
+        self.assertFalse(other.exists())
+        self.assertIn(f'kept {owned}: owned by parent--z, which stays', done.stdout)
+        self.assertIn(f'kept {target}: parent--z, which stays, links into it', done.stdout)
+        self.assertIn(f'kept {chained}: parent--z--dep, which stays, links into it', done.stdout)
+        [note] = self.notifications()
+        for kid in (target, chained, owned):
+            self.assertIn(kid.name, note[note.index('--body') + 1])
+
+    def test_every_child_a_staying_childs_link_passes_through_stays(self):
+        bridge, target = self.child('bridge'), self.child('dep')
+        owner = self.child('z')
+        (owner / 'notes.txt').write_text('wip')
+        (owner / 'build' / 'use').symlink_to(Path('..') / '..' / bridge.name / 'build' / 'forward')
+        (bridge / 'build' / 'forward').symlink_to(Path('..') / '..' / target.name)
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        for kid in (bridge, target):
+            self.assertTrue(kid.is_dir(), kid)
+            self.assertIn(f'kept {kid}: parent--z, which stays, links into it', done.stdout)
+            self.assertTrue(self.branch_exists(kid.name.removeprefix('parent--')))
+
+    def test_a_staying_childs_link_through_a_sibling_and_back_out_holds_both(self):
+        passed, target = self.child('a'), self.child('b')
+        owner = self.child('z')
+        (owner / 'notes.txt').write_text('wip')
+        (owner / 'build' / 'use').symlink_to(f'../../{passed.name}/../{target.name}')
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        for kid in (passed, target):
+            self.assertTrue(kid.is_dir(), kid)
+            self.assertIn(f'kept {kid}: parent--z, which stays, links into it', done.stdout)
+
+    def test_children_linking_in_a_cycle_stay(self):
+        a, b, plain = self.child('a'), self.child('b'), self.child('w')
+        (a / 'build' / 'peer').symlink_to(Path('..') / '..' / b.name)
+        (b / 'build' / 'peer').symlink_to(Path('..') / '..' / a.name)
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {a}: links with parent--b in a cycle', done.stdout)
+        self.assertIn(f'kept {b}: links with parent--a in a cycle', done.stdout)
+        self.assertTrue(a.is_dir() and b.is_dir() and self.branch_exists('a') and self.branch_exists('b'))
+        self.assertFalse(plain.exists())
+
+    def test_a_child_whose_removal_fails_keeps_what_it_holds(self):
+        other = self.repo('other')  # no submodules: a plain removal, which re-checks cleanliness
+        target, owner = self.child('dep-x', repo=other), self.child('z', repo=other)
+        (owner / 'build' / 'dep').symlink_to(Path('..') / '..' / target.name)
+        owned, plain = self.child('z--dep', repo=other), self.child('w', repo=other)
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), env=self.git_wrapper(
+            f'*" worktree remove "*"{owner} "*) echo late > "{owner}/late.txt"'))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {owner}: `git worktree remove` failed', done.stdout)
+        self.assertIn(f'kept {owned}: owned by parent--z, which stays', done.stdout)
+        self.assertIn(f'kept {target}: parent--z, which stays, links into it', done.stdout)
+        for kid in (target, owner, owned):
+            self.assertTrue(kid.is_dir(), kid)
+            self.assertTrue(self.branch_exists(kid.name.removeprefix('parent--'), other))
+        self.assertFalse(plain.exists())
 
     def test_a_childs_store_inside_another_child_keeps_the_holder(self):
         holder, user = self.child('a'), self.child('b')
@@ -896,35 +989,71 @@ class WorktreeChildren(unittest.TestCase):
         command = [str(SCRIPT), 'cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip]
         self.assertIn(f'retry: {shlex.join(command)}', done.stdout)
 
+    def test_a_dangling_symlink_at_the_parent_path_stops_the_sweep(self):
+        child = self.child()
+        self.drop_parent()
+        self.parent.symlink_to(self.t / 'gone')
+        done = self.run_script('cleanup', str(self.parent))
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertTrue(child.is_dir())
+        self.assertIn(f'{self.parent} exists: not touching its children', done.stdout)
+
     def test_a_parent_recreated_during_the_checks_stops_the_sweep(self):
+        for mode in ('recreate', 'dangle'):  # a dangling symlink occupies the path too
+            with self.subTest(mode):
+                self.tearDown()
+                self.setUp()
+                kids = [self.child(), self.child('second')]
+                self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
+                tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
+                self.mode.write_text(mode)
+                self.drop_parent()
+                done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
+                self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                self.assertTrue(os.path.lexists(self.parent))
+                for kid in kids:
+                    self.assertTrue(kid.is_dir(), done.stdout)
+                    self.assertNotIn(f'removed {kid}', done.stdout)
+                self.assertTrue(self.branch_exists('parent'), done.stdout)
+                self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
+                self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}",
+                              done.stdout)
+                calls = map(json.loads, self.calls.read_text().splitlines())
+                lists = [c for c in calls if c[:2] == ['worktree', 'list']]
+                self.assertEqual(len(lists), 1, 'the second child is not checked once the parent is back')
+
+    def test_a_parent_seen_once_during_the_checks_stops_the_sweep_though_it_is_gone_again(self):
         kids = [self.child(), self.child('second')]
         self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
         tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
-        self.mode.write_text('recreate')
         self.drop_parent()
-        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
+        done = subprocess.run([sys.executable, '-c', BLINK, str(SCRIPT), 'cleanup', str(self.parent),
+                               '--branch', str(self.main / '.git'), 'parent', tip],
+                              env=self.env, capture_output=True, text=True)
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertTrue(self.parent.is_dir())
         for kid in kids:
             self.assertTrue(kid.is_dir(), done.stdout)
-            self.assertNotIn(f'removed {kid}', done.stdout)
-        self.assertTrue(self.branch_exists('parent'), done.stdout)
-        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
-        self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}", done.stdout)
+        self.assertTrue(self.branch_exists('parent') and self.branch_exists('child'), done.stdout)
+        self.assertIn(f'{self.parent} exists again: not touching its children', done.stdout)
 
     def test_a_parent_recreated_during_a_failing_check_keeps_the_queued_branches(self):
-        kid = self.child()
-        (kid / 'dirty.txt').write_text('uncommitted')
-        self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
-        tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
-        self.mode.write_text('recreate')
-        self.drop_parent()
-        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
-        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
-        self.assertTrue(kid.is_dir(), done.stdout)
-        self.assertTrue(self.branch_exists('parent'), done.stdout)
-        self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
-        self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}", done.stdout)
+        for mode in ('recreate', 'dangle'):
+            with self.subTest(mode):
+                self.tearDown()
+                self.setUp()
+                kid = self.child()
+                (kid / 'dirty.txt').write_text('uncommitted')
+                self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
+                tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
+                self.mode.write_text(mode)
+                self.drop_parent()
+                done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
+                self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                self.assertTrue(kid.is_dir(), done.stdout)
+                self.assertTrue(self.branch_exists('parent'), done.stdout)
+                self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
+                self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}",
+                              done.stdout)
 
     def test_the_event_reads_herdrs_envelope_and_bad_events_are_usage_errors(self):
         child = self.child()
@@ -961,10 +1090,50 @@ class LinkedWorkspace(unittest.TestCase):
                 self.assertEqual(wc.linked_workspace(tmp, str(stub)), want, answer)
             for answer in ({'open_workspace_id': 'w1'}, {'is_linked_worktree': 'false', 'open_workspace_id': 'w1'},
                            {'is_linked_worktree': True, 'open_workspace_id': ''},
-                           {'is_linked_worktree': True, 'open_workspace_id': 1}):
+                           {'is_linked_worktree': True, 'open_workspace_id': 1},
+                           {'is_linked_worktree': True, 'open_workspace_id': False},
+                           {'is_linked_worktree': True, 'open_workspace_id': 0}):
                 entry.write_text(json.dumps(answer))
-                with self.subTest(answer=answer), self.assertRaisesRegex(wc.Keep, 'malformed entry'):
-                    wc.linked_workspace(tmp, str(stub))
+                for consumer in (lambda: wc.linked_workspace(tmp, str(stub)), lambda: wc.check_herdr(tmp)):
+                    with self.subTest(answer=answer), mock.patch.object(wc, 'HERDR', str(stub)), \
+                            self.assertRaisesRegex(wc.Keep, 'malformed entry'):
+                        consumer()
+            # the removal check keeps any open workspace, whatever the linked flag
+            for answer, kept in (({'is_linked_worktree': True}, False),
+                                 ({'is_linked_worktree': False, 'open_workspace_id': 'w1'}, True)):
+                entry.write_text(json.dumps(answer))
+                with mock.patch.object(wc, 'HERDR', str(stub)):
+                    if kept:
+                        self.assertRaisesRegex(wc.Keep, 'open in herdr workspace w1', wc.check_herdr, tmp)
+                    else:
+                        wc.check_herdr(tmp)
+
+
+@unittest.skipIf(os.name == 'nt', 'symlinks')
+class Planning(unittest.TestCase):
+    def test_each_tree_is_searched_at_most_once_and_only_when_it_can_matter(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wc)
+        walked, walk = [], wc.walk
+
+        def counted(top):
+            walked.append(Path(top).name)
+            return walk(top)
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(wc, 'walk', counted):
+            s, a, b, c, d = (Path(tmp) / n for n in 'sabcd')
+            for tree, target in ((s, a), (a, b), (b, c), (c, d), (d, None)):
+                tree.mkdir()
+                if target:
+                    (tree / 'link').symlink_to(target)
+            self.assertEqual(wc.removal_plan([], [s, a]), ([], {}))
+            self.assertEqual(walked, [])
+            self.assertEqual(set(wc.removal_plan([a, b, c], [s])[1]), {a, b, c})
+            self.assertEqual(walked, ['s', 'a', 'b'], 'c holds nothing left to protect')
+            walked.clear()
+            self.assertEqual(wc.removal_plan([a, b, c, d], []), ([a, b, c, d], {}))
+            self.assertEqual(sorted(walked), ['a', 'b', 'c', 'd'])
 
 
 # prints the locale encoding, then the bytes of linked_worktree(argv[2]) as UTF-8 JSON, with the plugin at argv[1]

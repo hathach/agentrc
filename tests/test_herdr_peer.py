@@ -1,13 +1,13 @@
+import io
+import os
 import sys
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'skills' / 'herdr-peer' / 'scripts'))
-SKILL = ROOT / 'skills' / 'herdr-peer' / 'SKILL.md'
 import peer  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
@@ -39,6 +39,12 @@ class FindPeersTest(unittest.TestCase):
         found = self._find([agent('w1:p2', '/w'), agent('w1:p3', '/w')])
         self.assertEqual(len(found), 2)
 
+    def test_a_record_without_an_absolute_cwd_or_a_pane_id_is_no_peer(self):
+        here = os.getcwd()  # where an empty or relative cwd would resolve
+        found = self._find([{'pane_id': 'w1:p2', 'agent': 'codex'}, agent('w1:p3', ''), agent('w1:p4', '.'),
+                            {'cwd': here, 'agent': 'codex'}, agent('', here), agent('w1:p5', here)], cwd=here)
+        self.assertEqual([p['pane_id'] for p in found], ['w1:p5'])
+
     def test_refuses_outside_herdr(self):
         with mock.patch.dict('os.environ', {'HERDR_ENV': '0'}), \
              self.assertRaises(SystemExit):
@@ -52,6 +58,56 @@ STATUS: DONE
 FILES: src/a.c
 Added the bounds check; test_a passes.
 END RESULT {id}"""
+
+
+def run_main(argv, agents, capture=''):
+    """peer.main on argv with Herdr mocked: (exit status, the herdr calls made, stdout)."""
+    calls, out = [], io.StringIO()
+
+    def herdr(*args):
+        calls.append(args)
+        return {'result': {'agents': agents}}
+
+    def herdr_raw(*args):
+        calls.append(args)
+        return capture
+
+    with mock.patch.dict('os.environ', {'HERDR_ENV': '1', 'HERDR_PANE_ID': 'w1:p1'}), \
+         mock.patch.object(peer, 'herdr', side_effect=herdr), \
+         mock.patch.object(peer, 'herdr_raw', side_effect=herdr_raw), \
+         mock.patch.object(sys, 'argv', ['peer.py', *argv]), \
+         redirect_stdout(out), redirect_stderr(io.StringIO()):
+        try:
+            rc = peer.main()
+        except SystemExit as e:
+            rc = e.code
+    return rc, calls, out.getvalue()
+
+
+class CliTest(unittest.TestCase):
+    def test_peers_lists_a_record_without_an_agent_kind_as_unknown(self):
+        rc, _, out = run_main(['peers'], [{'pane_id': 'w1:p2', 'cwd': os.getcwd()}])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, 'w1:p2\tunknown\t?\n')
+
+    def test_send_and_read_refuse_a_pane_whose_record_lacks_a_cwd(self):
+        agents = [agent('w1:p1', os.getcwd(), 'claude'), {'pane_id': 'w1:p2', 'agent': 'codex'}]
+        for argv in (['send', '--to', 'w1:p2', '--files', 'none', '--task', 'a question'],
+                     ['read', '--from', 'w1:p2', '--for', 'w1:p1-7']):
+            with self.subTest(argv[0]):
+                rc, calls, _ = run_main(argv, agents)
+                self.assertEqual(rc, 2)
+                self.assertEqual(calls, [('agent', 'list')])
+
+    def test_read_exits_malformed_on_contradictory_head_fields(self):
+        agents = [agent('w1:p1', os.getcwd(), 'claude'), agent('w1:p2', os.getcwd())]
+        good = RESULT.format(id='w1:p1-7')
+        for capture in (good.replace('STATUS: DONE', 'STATUS: DONE\nSTATUS: BLOCKED'),
+                        good.replace('FOR: w1:p1-7', 'FOR: w1:p1-7\nFOR: w1:p1-6')):
+            with self.subTest(capture=capture):
+                rc, _, _ = run_main(['read', '--from', 'w1:p2', '--for', 'w1:p1-7'], agents, capture)
+                self.assertEqual(rc, peer.MALFORMED)
+        self.assertEqual(run_main(['read', '--from', 'w1:p2', '--for', 'w1:p1-7'], agents, good)[0], 0)
 
 
 class ExtractTest(unittest.TestCase):
@@ -124,6 +180,15 @@ class CheckTest(unittest.TestCase):
         text = RESULT.format(id='x').replace('STATUS: DONE', 'STATUS: LGTM')
         self.assertTrue(any('not one of' in p for p in peer.check('result', text)))
 
+    def test_a_result_may_quote_a_blank_files_line_in_its_answer(self):
+        text = RESULT.format(id='x').replace('test_a passes.', 'test_a passes. The old reply said:\nFILES:')
+        self.assertEqual(peer.check('result', text), [])
+
+    def test_a_request_with_a_multiline_delta_passes(self):
+        body = peer.build_request('w1:p1-1', 'Claude, w1:p1', 'src/a.c', 'add a bounds check',
+                                  'rebased on main\nFILES: was src/b.c last round\nnothing else')
+        self.assertEqual(peer.check('request', body), [])
+
     def test_a_request_carries_files_and_task(self):
         body = peer.build_request('w1:p1-1', 'Claude, w1:p1', 'src/a.c', 'add a bounds check')
         self.assertIn('FILES: src/a.c', body)
@@ -182,6 +247,31 @@ class StrictnessTest(unittest.TestCase):
     def test_check_requires_the_terminator(self):
         text = RESULT.format(id='x').replace('END RESULT x', '')
         self.assertTrue(any('END RESULT' in p for p in peer.check('result', text)))
+
+    def test_contradictory_head_fields_are_refused_in_either_order(self):
+        good = RESULT.format(id='w1:p1-9')
+        for twice in ('FOR: w1:p1-9\nFOR: w1:p1-8', 'FOR: w1:p1-8\nFOR: w1:p1-9'):
+            with self.subTest(twice):
+                text = good.replace('FOR: w1:p1-9', twice)
+                body, note = peer.extract_result(text, 'w1:p1-9')
+                self.assertIsNone(body)
+                self.assertEqual(note.status, peer.MALFORMED)
+                self.assertTrue(any('FOR as both' in p for p in peer.check('result', text)))
+        text = good.replace('STATUS: DONE', 'STATUS: DONE\nSTATUS: BLOCKED')
+        self.assertTrue(any('STATUS as both' in p for p in peer.check('result', text)))
+
+    def test_field_lines_quoted_in_the_answer_are_prose(self):
+        text = RESULT.format(id='w1:p1-9').replace(
+            'test_a passes.', 'test_a passes. The old reply said:\nFOR: w1:p1-6\nSTATUS: BLOCKED')
+        body, note = peer.extract_result(text, 'w1:p1-9')
+        self.assertIsNone(note)
+        self.assertEqual(peer.check('result', body), [])
+
+    def test_a_blank_correlation_id_is_caught_in_both_kinds(self):
+        text = RESULT.format(id='x').replace('FOR: x', 'FOR:')
+        self.assertTrue(any('FOR is blank' in p for p in peer.check('result', text)))
+        body = peer.build_request('w1:p1-1', 'Claude, w1:p1', 'src/a.c', 'task').replace('ID: w1:p1-1', 'ID:')
+        self.assertTrue(any('ID is blank' in p for p in peer.check('request', body)))
 
     def test_check_catches_a_terminator_for_another_envelope(self):
         text = RESULT.format(id='x').replace('END RESULT x', 'END RESULT y')
@@ -263,22 +353,6 @@ class AwaitTest(unittest.TestCase):
              self.assertRaises(SystemExit) as raised:
             peer.settle('w1:p2', 1000)
         self.assertEqual(raised.exception.code, 5)
-
-
-class Frontmatter(unittest.TestCase):
-    """A bare `word: ` inside an unquoted description is a YAML mapping, not
-    prose, and the whole block stops parsing. Cheap to write, silent to hit."""
-
-    def head(self):
-        return SKILL.read_text().split('---')[1]
-
-    def test_parses_as_yaml(self):
-        yaml.safe_load(self.head())
-
-    def test_declares_name_and_description(self):
-        fm = yaml.safe_load(self.head())
-        self.assertEqual(fm['name'], 'herdr-peer')
-        self.assertTrue(fm['description'].strip())
 
 
 if __name__ == '__main__':

@@ -10,7 +10,7 @@ agentrc's `worktree-children` herdr plugin then removes the siblings and
 deletes the branches. Their docstrings hold every check and exit code.
 
 ```bash
-python3 ~/.claude/skills/worktree-remove/scripts/worktree_remove.py [PATH] --dry-run [--pending "<item>"]...
+python3 <skill dir>/scripts/worktree_remove.py [PATH] --dry-run [--pending "<item>"]...
 ```
 
 - Pass each follow-up of this task, including a headless chief report's, that
@@ -25,4 +25,6 @@ python3 ~/.claude/skills/worktree-remove/scripts/worktree_remove.py [PATH] --dry
   workspace and its panes, this session's included. Tell the human before
   running it that the outcome is in the plugin log the report names.
 - Exit 3 or 5: report the message; never work around a refusal, such as with
-  `git worktree remove` or herdr's own menu, which skips the gate.
+  `git worktree remove` or herdr's own menu, which skips the gate. A chief
+  session found in the worktree, yours included, means a chief cannot remove
+  its own worktree: ask the human to run this from a plain session.

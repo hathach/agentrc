@@ -5,17 +5,18 @@
     worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
 
 Children of `<dir>/<name>` are the entries `<dir>/<name>--*` (grandchildren `<name>--a--b`
-too) with a `.git` file that are linked git worktrees of any repository: the `<name>--` prefix is reserved for
-them by the user rule. Nothing runs while `<dir>/<name>` exists again, checked before each removal
-too: a late event or a retry must not sweep the children of a replacement parent.
+too, unless `<name>--a` stays) with a `.git` file that are linked git worktrees of any repository: the `<name>--`
+prefix is reserved for them by the user rule. Nothing runs while anything, a dangling symlink included, is at
+`<dir>/<name>` again, checked before each removal too: a late event or a retry must not sweep the children of a
+replacement parent.
 
 A child is removed only when every check below passes; otherwise it is kept and its reasons reported.
 `git worktree remove` re-checks cleanliness at removal; `--force`, which skips that, is used only
 for a child with submodules (git refuses those otherwise), so a write racing its checks is lost.
 - herdr confirms it is not open as its own workspace (`herdr worktree list --cwd <child>`);
   herdr unreachable or an unexpected answer keeps it;
-- no headless chief runs in it and none of its cowork lanes holds a request (running or
-  undelivered); the skills' own code decides, and code that cannot load keeps it;
+- no chief session (headless or interactive) runs in it and none of its cowork lanes holds a
+  request (running or undelivered); the skills' own code decides, and code that cannot load keeps it;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
   the remotes' only after fetching each configured remote as branches are (below), first;
 - in the child and in every initialized submodule, recursively: `git status` shows no tracked
@@ -33,7 +34,11 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   present under the same name and object id in the primary checkout's copy of that submodule
   (`<common git dir>/modules/<name>`, used only when self-contained: no alternates, no commondir,
   no symlink);
-  an annotated tag therefore needs that copy. Remote-tracking refs are trusted as fetched.
+  an annotated tag therefore needs that copy. Remote-tracking refs are trusted as fetched;
+- no child that stays owns it by name (`<kept>--*`) or has a symlink resolving through or into it,
+  a child it holds this way staying too; a child that stays and cannot be searched for symlinks
+  keeps them all. Removals go holders first, and a child whose removal fails keeps what it holds;
+  children linking in a cycle, which no order protects, are kept with what they hold.
 Deleted by policy: ignored files and commits only a reflog still names. No `git worktree prune`
 runs: it would touch unrelated worktrees. herdr removes the parent before this runs, with its
 own checks only: the worktree-remove skill's pending-work gate is skipped by a removal from
@@ -217,8 +222,9 @@ def linked_worktree(child):
 
 
 def herdr_entry(path, herdr=None):
-    """herdr's `worktree list` entry for the checkout at path, asking `herdr` (default HERDR); Keep when
-    herdr cannot say."""
+    """herdr's `worktree list` entry for the checkout at path, asking `herdr` (default HERDR), its
+    `is_linked_worktree` a bool and its `open_workspace_id` absent, null or a nonempty string; Keep when
+    herdr cannot say or answers with a malformed entry."""
     done = run([herdr or HERDR, 'worktree', 'list', '--cwd', str(path)])
     try:
         if done.returncode:
@@ -229,6 +235,9 @@ def herdr_entry(path, herdr=None):
         raise Keep(f'herdr could not list it (exit {done.returncode}: {done.stderr.strip()[:200]})')
     if len(mine) != 1:
         raise Keep('herdr does not list it')
+    linked, workspace = mine[0].get('is_linked_worktree'), mine[0].get('open_workspace_id')
+    if not isinstance(linked, bool) or not (workspace is None or isinstance(workspace, str) and workspace):
+        raise Keep(f'herdr answered `worktree list` for {path} with a malformed entry: {mine[0]}')
     return mine[0]
 
 
@@ -237,10 +246,7 @@ def linked_workspace(path, herdr=None):
     worktree of the cowork and pr-review skills goes beside it; Keep when herdr cannot say or answers
     with a malformed entry."""
     entry = herdr_entry(path, herdr)
-    linked, workspace = entry.get('is_linked_worktree'), entry.get('open_workspace_id')
-    if not isinstance(linked, bool) or not (workspace is None or isinstance(workspace, str) and workspace):
-        raise Keep(f'herdr answered `worktree list` for {path} with a malformed entry: {entry}')
-    return linked and workspace is not None
+    return entry['is_linked_worktree'] and entry.get('open_workspace_id') is not None
 
 
 def check_herdr(child):
@@ -324,7 +330,7 @@ def check_store(store, child, gitdir, common, doomed):
 
 
 def check_agents(path, gitdir):
-    """Keep a checkout a headless chief or a cowork lane still works in."""
+    """Keep a checkout a chief session, headless or interactive, or a cowork lane still works in."""
     sys.path[:0] = [str(SKILLS / 'headless-chief' / 'scripts'), str(SKILLS / 'cowork' / 'scripts')]
     try:
         import chief_run
@@ -335,7 +341,7 @@ def check_agents(path, gitdir):
         del sys.path[:2]
     chiefs = chief_run.running_chiefs(Path(path))
     if chiefs:
-        raise Keep(f'a headless chief runs in it: pid {", ".join(map(str, chiefs))}')
+        raise Keep(f'a chief session (headless or interactive) runs in it: pid {", ".join(map(str, chiefs))}')
     for box in cowork.boxes(gitdir):
         if cowork.requests(box):
             raise Keep(f'cowork lane {box.parent.name}/{box.name} holds a running or undelivered request')
@@ -379,6 +385,85 @@ def check(child):
     """content_check for a child herdr has not open as a workspace of its own."""
     check_herdr(child)
     return content_check(child)
+
+
+def link_hops(link):
+    """Every path resolving link enters, each directory resolved: a link reaches every tree on the
+    way, through a symlink or a `..`, not only its final target."""
+    hops, path, rest, links = [], os.sep, os.path.abspath(link).split(os.sep), 0
+    while rest:
+        name = rest.pop(0)
+        if name in ('', '.'):
+            continue
+        if name == '..':
+            path = os.path.dirname(path)  # path holds no symlink, so this is the physical parent
+            continue
+        step = os.path.join(path, name)
+        hops.append(step)
+        if not os.path.islink(step):
+            path = step
+            continue
+        links += 1
+        if links > 40:  # Linux's own limit: a loop
+            raise OSError(f'too many levels of symbolic links in {link}')
+        target = os.readlink(step)
+        path = os.sep if os.path.isabs(target) else path
+        rest = target.split(os.sep) + rest
+    return hops
+
+
+def reach(tree, scan):
+    """(the paths tree's symlinks enter, the error that stopped searching it or None), searched once
+    per scan, the cache of one planning pass: a big tree takes tens of seconds to walk."""
+    if tree not in scan:
+        try:
+            scan[tree] = [hop for top, _, _, links in walk(tree) for name in links
+                          for hop in link_hops(os.path.join(top, name))], None
+        except (Keep, OSError) as err:
+            scan[tree] = [], err
+    return scan[tree]
+
+
+def holds(leaving, staying, scan):
+    """{path: why} of each path in leaving that a staying checkout, or one held through it, owns by
+    name (`<staying>--*`) or reaches through a symlink: removing it would cut off a survivor's own
+    child or dependency. scan caches the trees searched (see reach)."""
+    held, staying = {}, list(staying)
+    while staying and len(held) < len(leaving):
+        stay = Path(staying.pop())
+        for path in [p for p in leaving if p not in held]:
+            if path.name.startswith(stay.name + '--'):
+                held[path] = f'owned by {stay.name}, which stays'
+            else:
+                targets, blind = reach(stay, scan)  # searched only when a name does not settle it
+                root = os.path.realpath(path)
+                if blind:
+                    held[path] = f'cannot tell whether {stay.name}, which stays, links into it: {blind}'
+                elif any(t == root or t.startswith(root + os.sep) for t in targets):
+                    held[path] = f'{stay.name}, which stays, links into it'
+                else:
+                    continue
+            staying.append(path)
+    return held
+
+
+def removal_plan(removable, staying, scan=None):
+    """(order, {path: why}): removable minus what stays, ordered so each goes after every one that
+    would hold it should its removal fail, and what stays: what staying holds, and what no order
+    can protect, a link cycle and what it holds. scan caches the trees searched (see reach)."""
+    scan = {} if scan is None else scan
+    kept = holds(removable, staying, scan)
+    left = [p for p in removable if p not in kept]
+    would = {p: holds([o for o in left if o != p], [p], scan) for p in left}
+    order = []
+    while left:
+        free = [p for p in left if not any(p in would[o] for o in left if o != p)]
+        if not free:
+            kept.update((p, f'links with {next(o.name for o in left if p in would[o])} in a cycle') for p in left)
+            break
+        order.append(free[0])
+        left.remove(free[0])
+    return order, kept
 
 
 def head_branch(path):
@@ -543,7 +628,7 @@ def cleanup(parent, branches=(), kept_branches=()):
     parent = Path(parent)
     for name, why in kept_branches:
         log(f'kept branch {name}: {why}')
-    if parent.exists():
+    if os.path.lexists(parent):
         log(f'{parent} exists: not touching its children')
         for branch in branches:
             log(f'kept branch {branch[1]} in {branch[0]}: {parent} exists')
@@ -551,29 +636,54 @@ def cleanup(parent, branches=(), kept_branches=()):
             log(f'retry: {retry(parent, branches)}')
         return 2
     kept, kept_branches, unsettled = [], list(kept_branches), []
+
+    def keep(child, why):
+        kept.append((child.name, str(why)))
+        log(f'kept {child}: {why}')
+
     if branches:
         log(f'branches to settle: {retry(parent, branches)}')
-    branches, stopped = list(branches), False
-    for child in children(parent):
+    branches = list(branches)
+    found, removals, stopped = children(parent), {}, False
+    for child in found:  # every check first: a child that stays may hold one sorted before it
+        stopped = os.path.lexists(parent)  # once seen, stays seen: the replacement may be mid-move
+        if stopped:
+            break
         try:
-            removal = check(child)
+            removals[child] = check(child)
+        except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
+            keep(child, why)
+    stopped, scan = stopped or os.path.lexists(parent), {}
+    if stopped:  # it returned during the checks: its replacement's children are not ours
+        log(f'{parent} exists again: not touching its children')
+    staying = [c for c in found if c not in removals]
+    pending, held = ([], {}) if stopped else removal_plan(list(removals), staying, scan)
+    for child, why in held.items():
+        keep(child, why)
+    while pending:
+        child = pending.pop(0)
+        removal = removals[child]
+        try:
             head = head_branch(child)
             branch = head and (str(removal[0]), *head)
             if branch:
                 log(f'removing {child}; its branch is retried by: {retry(parent, [branch])}')
-            if parent.exists():
+            if os.path.lexists(parent):
                 log(f'{parent} exists again: not touching {child} or the children after it')
                 stopped = True
                 break
             remove(child, *removal)
             log(f'removed {child}')
-        except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
-            kept.append((child.name, str(why)))
-            log(f'kept {child}: {why}')
+        except (Keep, OSError) as why:
+            keep(child, why)
+            scan.pop(child, None)  # what made git refuse may have changed it too
+            for other, hold in holds(pending, [child], scan).items():  # it stays after all
+                pending.remove(other)
+                keep(other, hold)
             continue
         if branch:
             branches.append(branch)
-    stopped = stopped or parent.exists()  # it may have returned during a check that kept its child
+    stopped = stopped or os.path.lexists(parent)  # it may have returned during a check that kept its child
     for branch in branches:  # only now: a detached child checked above may hang on one of them
         try:
             if stopped:  # the parent's replacement may not have checked its branch out yet
