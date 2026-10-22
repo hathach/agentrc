@@ -26,8 +26,8 @@ PROBE_STATE_JLINK_EXE and PROBE_STATE_OPENOCD name the tools when they are not o
 
 Exit: 0 dumped; 2 bad usage; 3 the probe or tool failed or is missing, the read was incomplete or incoherent, the
 buffer is not SystemView's, a --resume was not seen to take (the dump is written), or SIGTERM or SIGHUP stopped the
-session (the tool is killed, the core's state after it unknown). dump.json's core holds each state as far as it was
-established, failures included, and "unknown" otherwise.
+session (the tool is killed, the core's state after it unknown unless the tool reported it before the kill).
+dump.json's core holds each state as far as it was established, failures included, and "unknown" otherwise.
 """
 import argparse
 import hashlib
