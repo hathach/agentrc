@@ -467,6 +467,15 @@ class Usage(unittest.TestCase):
                 with self.subTest(want):
                     self.assertIn(want, self.usage(*argv))
 
+    def test_out_inside_a_tmp_sv_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(record, 'prepare_out', side_effect=AssertionError('the guard let it through')):
+            raw = Path(d) / 'c.SVDat'
+            raw.write_bytes(b'x')
+            for out in ('/tmp/sv-x', '/tmp/sv-project/nested/out'):
+                with self.subTest(out):
+                    self.assertIn('deletes /tmp/sv-*', self.usage('--out', out, '--from-raw', str(raw)))
+
     def test_openocd_board_is_refused_for_live(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = Path(d) / 'hil.json'

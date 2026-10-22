@@ -507,7 +507,7 @@ def main(argv=None):
     if missing:
         p.error(f"not on PATH: {', '.join(missing)} (SystemView's deb, xvfb, xdotool, util-linux)")
     out = Path(a.out).resolve()
-    if out.parent == Path('/tmp') and out.name.startswith('sv-'):
+    if any(d.parent == Path('/tmp') and d.name.startswith('sv-') for d in (out, *out.parents)):
         p.error(f'--out {a.out}: SystemView deletes /tmp/sv-* at startup')
     prepare_out(p, str(out))
 
