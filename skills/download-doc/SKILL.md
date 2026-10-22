@@ -1,6 +1,6 @@
 ---
 name: download-doc
-description: List, download and import vendor hardware docs (datasheets, reference manuals, errata, user manuals, app notes) into the Calibre library, and refresh copies the vendor has revised. Use whenever the user wants a chip's datasheet or reference manual, asks to update/check/audit their documentation library, or wants a vendor's docs (ST, NXP, Microchip, TI, Renesas, Espressif, Raspberry Pi, Arm...) fetched in bulk, even without saying "Calibre".
+description: List, fetch, download, import or refresh vendor hardware docs (datasheets, reference manuals, errata, user manuals, app notes) in the Calibre library — a chip's document, a vendor's docs in bulk, or a documentation-library update, check or audit — even when Calibre is not named.
 ---
 
 # download-doc
@@ -13,7 +13,7 @@ the web for a manual, so its value depends on being complete and *not stale*.
 | File | Role |
 |---|---|
 | `scripts/sync.py` | CLI: sync a vendor (enumerate → plan → `--apply` imports/replaces), or `add`, `refresh` or `remove` one document. Dry run by default. |
-| `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py --help` lists them, each docstring gives its scope |
+| `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py --help` lists them, each docstring gives its scope. Renesas, Microchip and HPMicro only read a hand-harvested cache; their docstrings say how to build it |
 | `scripts/doclib.py` | Shared core: transport, revisions, Calibre I/O, planning |
 | `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry run by default. |
 | `references/st.md`, `references/nxp.md` | Per-vendor endpoints, quirks, the NXP gated-download flow |
@@ -48,8 +48,7 @@ Plan lines: `NEW`, `OUTDATED old -> new`, `GATED` (needs a person, below), `LEGA
 (filed by hand before identifiers existed; reported, never touched), `UNCHECKABLE`
 (revision cannot be compared). The coverage block must add up per type — catalogue
 equals the sum of the buckets — and names unparseable revisions; `--strict` makes them
-a non-zero exit. "0 found" usually means the vendor is throttling: wait and re-run,
-cached progress is kept.
+a non-zero exit.
 
 ## Add one document
 
@@ -104,11 +103,13 @@ Dedup depends on matching these exactly; `maintaining.md` gives the reasons.
 - `--apply` refuses while something holds the library. **The Calibre GUI's write lock**:
   ask the user to close it, never kill it — or configure a content-server user in the
   gitignored `secret.yml` beside this file (`calibre:` block; `Library._server_creds`
-  documents it). **A FreeFileSync `calibre-library.ffs_batch` mirror** to omv: let it
-  finish. On Windows the mirror check cannot see command lines; pause the mirror yourself
-  before `--apply`.
-- Replacing or removing a book keeps no copy of the old one; remove through
-  `refresh` or `sync.py remove`, never `calibredb remove` by hand.
+  documents it). The server is used only for the library it serves; with the GUI open,
+  no other library (a scratch copy included) can be written. **A FreeFileSync
+  `calibre-library.ffs_batch` mirror** to omv: let it finish. On Windows the mirror
+  check cannot see command lines; pause the mirror yourself before `--apply`.
+- Replacing or removing a book moves the old one to Calibre's Recycle Bin (kept 14
+  days by default; restore it there); remove through `refresh` or `sync.py remove`,
+  never `calibredb remove` by hand.
 - Gated documents (login, per-document EULA, NXP moderated request, `*-NDA`) are
   reported per document with the reason. **Never accept a licence or submit a request
   form without the user's explicit say-so**; `references/nxp.md` has the flow.

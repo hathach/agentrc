@@ -151,60 +151,65 @@ class History(unittest.TestCase):
                 self.assertEqual(words[1:], expected)
                 self.assertTrue(Path(words[2]).is_absolute())
 
-    @needs_poppler
-    @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
-    def test_show_command_repeats_a_real_logged_find(self):
+    def logged_library(self, content):
+        """A one-book library whose PDF holds content -> (the PDF, an env that logs lookups in it)."""
         library = Path(self.tmp.name) / "library"
         library.mkdir()
         fake_library(str(library),
                      [(1, "RM0001 reference manual", ["reference-manual"], True)]).close()
         pdf = library / "Vendor" / "RM0001 reference manual (1)" / "RM0001 reference manual.pdf"
-        pdf.write_bytes(FIXTURE.read_bytes())
+        pdf.write_bytes(content)
         env = dict(self.env, CALIBRE_LIBRARY=str(library))
         env.pop("READ_DOC_HISTORY", None)
-        invoke_main = ("import sys; sys.path.insert(0, sys.argv[1]); import locate; "
-                       "raise SystemExit(locate.main(sys.argv[2:]))")
+        return pdf, env
+
+    def logged_run(self, module, env, *args):
+        """module.main(args) run as the skill runs it -> (its result, the record it logged)."""
+        invoke_main = (f"import sys; sys.path.insert(0, sys.argv[1]); import {module}; "
+                       f"raise SystemExit({module}.main(sys.argv[2:]))")
+        done = subprocess.run([sys.executable, "-c", invoke_main, str(SCRIPTS), *args],
+                              capture_output=True, encoding="utf-8", env=env)
+        return done, json.loads(self.path.read_text().splitlines()[-1])
+
+    def replay(self, record, env):
+        """The command `history show` prints for record, run through sh."""
+        shown = self.run_history("show", record["id"])
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        command = shown.stdout.rstrip().rsplit("\n\n", 1)[1]
+        return subprocess.run(["sh", "-c", command], capture_output=True, encoding="utf-8", env=env)
+
+    @needs_poppler
+    @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
+    def test_show_command_repeats_a_real_logged_find(self):
+        _, env = self.logged_library(FIXTURE.read_bytes())
         # A term that looks like an option must replay as a term, not a usage error.
         for term, code in (("SIE_CTRL", 0), ("-SIE_CTRL", 1)):
             with self.subTest(term=term):
-                original = subprocess.run(
-                    [sys.executable, "-c", invoke_main, str(SCRIPTS), "find", "--book", "1",
-                     "--term=" + term, "--context", "0", "--limit", "2"],
-                    capture_output=True, encoding="utf-8", env=env)
+                original, record = self.logged_run("locate", env, "find", "--book", "1", "--term=" + term,
+                                                   "--context", "0", "--limit", "2")
                 self.assertEqual(original.returncode, code, original.stderr)
-                record = json.loads(self.path.read_text().splitlines()[-1])
-
-                shown = self.run_history("show", record["id"])
-                self.assertEqual(shown.returncode, 0, shown.stderr)
-                command = shown.stdout.rstrip().rsplit("\n\n", 1)[1]
-                replay = subprocess.run(["sh", "-c", command], capture_output=True, encoding="utf-8",
-                                        env=env)
+                replay = self.replay(record, env)
                 self.assertEqual(replay.returncode, code, replay.stderr)
                 self.assertEqual(replay.stdout, original.stdout)
 
     @needs_poppler
     @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
     def test_a_logged_page_lists_and_replays(self):
-        library = Path(self.tmp.name) / "library"
-        library.mkdir()
-        fake_library(str(library),
-                     [(1, "RM0001 reference manual", ["reference-manual"], True)]).close()
-        pdf = library / "Vendor" / "RM0001 reference manual (1)" / "RM0001 reference manual.pdf"
-        pdf.write_bytes(FIXTURE.read_bytes())
-        env = dict(self.env, CALIBRE_LIBRARY=str(library))
-        env.pop("READ_DOC_HISTORY", None)
-        invoke_main = ("import sys; sys.path.insert(0, sys.argv[1]); import locate; "
-                       "raise SystemExit(locate.main(sys.argv[2:]))")
-        original = subprocess.run([sys.executable, "-c", invoke_main, str(SCRIPTS), "page", "--book", "1",
-                                   "--pages", "1"], capture_output=True, encoding="utf-8", env=env)
+        _, env = self.logged_library(FIXTURE.read_bytes())
+        original, record = self.logged_run("locate", env, "page", "--book", "1", "--pages", "1")
         self.assertEqual(original.returncode, 0, original.stderr)
-        record = json.loads(self.path.read_text().splitlines()[-1])
         listed = self.run_history("list")
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertIn(f"page {record['id']} pages=1 of RM0001 reference manual (1)", listed.stdout)
-        command = self.run_history("show", record["id"]).stdout.rstrip().rsplit("\n\n", 1)[1]
-        replay = subprocess.run(["sh", "-c", command], capture_output=True, encoding="utf-8", env=env)
-        self.assertEqual(replay.stdout, original.stdout)
+        self.assertEqual(self.replay(record, env).stdout, original.stdout)
+
+    @unittest.skipIf(shutil.which("sh") is None, "the replay is a sh command")
+    def test_a_logged_search_with_paths_replays_with_paths(self):
+        pdf, env = self.logged_library(b"%PDF")
+        original, record = self.logged_run("search", env, "RM0001", "--path")
+        self.assertEqual(original.returncode, 0, original.stderr)
+        self.assertIn(str(pdf), original.stdout)
+        self.assertEqual(self.replay(record, env).stdout, original.stdout)
 
     def test_bad_json_and_unknown_versions_are_reported_and_skipped(self):
         missing = copy.deepcopy(SEARCH)

@@ -161,7 +161,7 @@ def main() -> int:
     if not args.apply:
         print("\n  dry run — nothing written. Re-run with --apply")
         return 0
-    lib = doclib.Library()
+    lib = doclib.Library(LIB)  # the library the plan was read from
     blockers = lib.blockers()
     for b in blockers:
         print(f"BLOCKED: {b}", file=sys.stderr)

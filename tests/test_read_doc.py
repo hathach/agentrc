@@ -934,7 +934,7 @@ class History(unittest.TestCase):
         rec, = self.records()
         self.assertEqual((code, rec['exit'], rec['op'], rec['error']), (0, 0, 'search', None))
         self.assertEqual(rec['query'], {'keywords': ['rm0001', 'es0001'], 'any': True,
-                                        'kind': None, 'limit': search.LIMIT})
+                                        'kind': None, 'limit': search.LIMIT, 'path': False})
         self.assertEqual(rec['result']['books'], [[1, 'reference-manual', 'RM0001 reference manual'],
                                                   [2, 'errata', 'ES0001 errata']])
         self.assertEqual(rec['result']['kinds'], {'reference-manual': 1, 'errata': 1})

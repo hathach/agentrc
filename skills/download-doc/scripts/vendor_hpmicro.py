@@ -14,8 +14,10 @@ documents. Treat "the page says there is nothing" as unproven until something th
 executes JavaScript has looked.
 
 Enumeration therefore needs a browser once (the page's data endpoint refuses headless
-clients); the resulting paths are cached here and the PDFs themselves download fine
-headlessly.
+clients); the PDFs themselves download fine headlessly. No script here harvests the
+list: the cache holds each PDF's path relative to BASE (`<dir>/<name>.pdf`), separated
+by whitespace, copied from the English documents page in a browser. Its freshness is
+otherwise unknown.
 """
 from __future__ import annotations
 
@@ -59,9 +61,8 @@ def _version(name: str) -> str | None:
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
     if not CACHE.exists():
-        print(f"  no harvested list at {CACHE} — collect it through a browser "
-              f"(see this module's docstring)", file=sys.stderr)
-        return []
+        raise SystemExit(f"{CACHE} is missing: harvest HPMicro's English document list "
+                         f"through a browser as this module's docstring describes")
     want = {f.upper() for f in families} if families else None
     docs = []
     for rel in CACHE.read_text(encoding="utf-8").split():

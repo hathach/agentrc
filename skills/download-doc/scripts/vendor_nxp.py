@@ -95,7 +95,10 @@ def _page(type_tax: str, device_tax: str, start: int, max_: int = 100) -> dict:
                                device_tax=device_tax), timeout=45)
 
 
-def enumerate_docs(types=None, device="Arm MCU", limit=None) -> list:
+DEFAULT_DEVICE = "Arm MCU"
+
+
+def enumerate_docs(types=None, device=DEFAULT_DEVICE, limit=None) -> list:
     """Enumerate NXP docs for one device-taxonomy branch.
 
     `device` is a key of DEVICE_TAX. Use 'Arm MCU' for everything modern; the LPC2000
@@ -136,11 +139,11 @@ def enumerate_docs(types=None, device="Arm MCU", limit=None) -> list:
                     title=(r.get("title") or "").strip(),
                     url=url, author=AUTHOR,
                     family=[f for f in [family_of(code)] if f] or
-                           ([device] if device != "Arm MCU" else []),
+                           ([device] if device != DEFAULT_DEVICE else []),
                     desc=(r.get("summary") or "").strip())
             start += len(results)
             if limit and len(out) >= limit:
-                break
+                return list(out.values())[:limit]
             time.sleep(PACE_SECONDS)
     return list(out.values())
 

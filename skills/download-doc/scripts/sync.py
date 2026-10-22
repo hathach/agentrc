@@ -45,14 +45,7 @@ VENDORS = {"st": vendor_st, "nxp": vendor_nxp, "espressif": vendor_espressif,
 
 
 def enumerate_vendor(name: str, args) -> list:
-    """Dispatch to the vendor adapter.
-
-    Explicit table, and an unknown name raises. This used to be a chain of `if`s
-    ending in a bare `return vendor_nxp.enumerate_docs(...)`, so a vendor missing
-    from the chain silently enumerated NXP instead — `sync.py allwinner` planned an
-    import of 353 NXP documents and looked entirely normal doing it. A fallback that
-    substitutes a different vendor is worse than a crash.
-    """
+    """Dispatch to the vendor adapter."""
     common = dict(families=args.family.split(",") if args.family else None,
                   types=args.types.split(",") if args.types else None)
     if name == "espressif":
@@ -60,20 +53,22 @@ def enumerate_vendor(name: str, args) -> list:
             chips=args.chips.split(",") if args.chips else None,
             types=common["types"], refresh=args.refresh)
     if name == "nxp":
-        return vendor_nxp.enumerate_docs(types=common["types"], device=args.device,
-                                         limit=args.limit)
+        return vendor_nxp.enumerate_docs(types=common["types"],
+                                         device=args.device or vendor_nxp.DEFAULT_DEVICE)
     if name == "st":
         return vendor_st.enumerate_docs(refresh=args.refresh, **common)
     if name == "ti":
         return vendor_ti.enumerate_docs(
             parts=args.parts.split(",") if args.parts else None, **common)
-    # VENDORS is the single source of truth: argparse takes its choices from it and
-    # dispatch reads it here. A second copy of this table is what let "wch" be
-    # accepted by one and rejected by the other.
-    mod = VENDORS.get(name)
-    if mod is None:
-        raise SystemExit(f"no adapter wired for vendor {name!r} — add it to enumerate_vendor")
-    return mod.enumerate_docs(**common)
+    # VENDORS, which argparse takes its choices from, never a fallback adapter: a chain
+    # ending in NXP once planned 353 NXP documents for `sync.py allwinner`.
+    return VENDORS[name].enumerate_docs(**common)
+
+
+# The vendors that honour each selector. Anywhere else it would be ignored while still
+# counting as a named device, which turns the default USB scope off.
+HONOURED_BY = {"chips": {"espressif"}, "device": {"nxp"}, "parts": {"ti"},
+               "refresh": {"st", "espressif"}, "family": set(VENDORS) - {"espressif", "nxp"}}
 
 
 def verified(pdf: Path, doc, mod) -> tuple:
@@ -351,7 +346,8 @@ def replace(lib, old_id: int, doc, pdf: Path) -> tuple:
         new_id, why = None, str(e) or type(e).__name__
     if new_id:
         return new_id, None
-    return None, f"book #{old_id} was removed but the new copy was not added ({why})"
+    return None, (f"book #{old_id} was removed but the new copy was not added ({why}); "
+                  f"restore #{old_id} from Calibre's Recycle Bin")
 
 
 def refresh_main(argv: list) -> int:
@@ -362,9 +358,9 @@ def refresh_main(argv: list) -> int:
 
     The --revision is compared before anything is downloaded: newer (or a book whose
     revision cannot be read) goes ahead, the same one is nothing to do, and one that
-    cannot be compared is refused. --apply removes the old book, keeping no copy,
-    and adds the new one. Exit 0 planned, refreshed or already current, 1 refused or
-    failed, 2 a usage error, a blocker, or a library that could not be read.
+    cannot be compared is refused. --apply moves the old book to Calibre's Recycle
+    Bin and adds the new one. Exit 0 planned, refreshed or already current, 1 refused
+    or failed, 2 a usage error, a blocker, or a library that could not be read.
     """
     ap = doc_parser("sync.py refresh", refresh_main.__doc__)
     ap.add_argument("--revision", required=True, help="the newer revision, as the document prints it")
@@ -402,8 +398,8 @@ def refresh_main(argv: list) -> int:
             print(f"  note: the library spells it {have['ident']}; the new book takes "
                   f"{doc.ident}, as --id gives it", file=sys.stderr)
         if not a.apply:
-            print(f"\ndry run — nothing changed. --apply removes #{have['id']}, keeping no "
-                  f"copy, and adds the above", file=sys.stderr)
+            print(f"\ndry run — nothing changed. --apply moves #{have['id']} to Calibre's "
+                  f"Recycle Bin and adds the above", file=sys.stderr)
             return 0
         again, why = refresh_target(lib, doc)
         if not why and (again["id"], again["rev"]) != (have["id"], have["rev"]):
@@ -423,10 +419,9 @@ def refresh_main(argv: list) -> int:
 
 
 def remove_main(argv: list) -> int:
-    """Remove one book by its Calibre id, keeping no copy: an old copy refresh cannot
-    reach, such as a book filed by hand with no identifier. Dry run by default. Exit 0
-    planned or removed, 1 no such book or the removal failed, 2 a usage error, a
-    blocker, or a library that could not be read.
+    """Move one book, by its Calibre id, to Calibre's Recycle Bin: an old copy refresh
+    cannot reach, such as a book filed by hand with no identifier. Dry run by default. Exit 0 planned or removed, 1 no such book or the
+    removal failed, 2 a usage error, a blocker, or a library that could not be read.
     """
     ap = argparse.ArgumentParser(prog="sync.py remove", description=remove_main.__doc__)
     ap.add_argument("book_id", type=int, help="the book's Calibre id")
@@ -448,14 +443,15 @@ def remove_main(argv: list) -> int:
     print(f"REMOVE #{a.book_id} {book.get('title', '')}\n  author      {book.get('authors', '')}\n"
           f"  identifiers {idents}")
     if not a.apply:
-        print("\ndry run — nothing changed. --apply removes it, keeping no copy", file=sys.stderr)
+        print("\ndry run — nothing changed. --apply moves it to Calibre's Recycle Bin",
+              file=sys.stderr)
         return 0
     try:
         lib.remove(a.book_id)
     except doclib.RemoveError as e:
         print(f"FAILED: {e}", file=sys.stderr)
         return 1
-    print(f"\nREMOVED #{a.book_id}\n{REINDEX}")
+    print(f"\nREMOVED #{a.book_id} — moved to Calibre's Recycle Bin\n{REINDEX}")
     return 0
 
 
@@ -470,12 +466,16 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("vendor", choices=sorted(VENDORS))
     ap.add_argument("--types", help="comma list: datasheet,errata,reference-manual,...")
-    ap.add_argument("--family", help="family tags: STM32H7,STM32U5,... for ST, Armv8-M,ADIv5 for Arm (default: all)")
-    ap.add_argument("--device", default="Arm MCU", help="NXP only: taxonomy branch")
-    ap.add_argument("--chips", help="Espressif only: esp32-s3,esp32-p4 (default: USB-OTG parts)")
-    ap.add_argument("--parts", help="TI only: ina3221,tca9548a (default: parts in the TinyUSB BSP)")
-    ap.add_argument("--limit", type=int, help="stop after N documents (smoke tests)")
-    ap.add_argument("--refresh", action="store_true", help="re-fetch cached indexes")
+    only = {opt: "/".join(sorted(vendors)) + " only" for opt, vendors in HONOURED_BY.items()}
+    ap.add_argument("--family", help="family tags: STM32H7,STM32U5,... for ST, Armv8-M,ADIv5 for Arm "
+                                     "(default: all); not for "
+                                     + "/".join(sorted(set(VENDORS) - HONOURED_BY["family"])))
+    ap.add_argument("--device", help=f"{only['device']}: taxonomy branch "
+                                     f"(default: {vendor_nxp.DEFAULT_DEVICE})")
+    ap.add_argument("--chips", help=f"{only['chips']}: esp32-s3,esp32-p4 (default: USB-OTG parts)")
+    ap.add_argument("--parts", help=f"{only['parts']}: ina3221,tca9548a (default: parts in the TinyUSB BSP)")
+    ap.add_argument("--limit", type=int, help="plan at most N documents (smoke tests)")
+    ap.add_argument("--refresh", action="store_true", help=f"{only['refresh']}: re-fetch cached indexes")
     ap.add_argument("--apply", action="store_true", help="actually import/replace")
     ap.add_argument("--all-types", action="store_true",
                     help="include non-technical docs (product briefs, technical notes)")
@@ -487,8 +487,11 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero if any revision cannot be parsed (for automation)")
     args = ap.parse_args()
-    if args.parts and args.vendor != "ti":
-        ap.error("--parts is TI only")
+    for opt, vendors in HONOURED_BY.items():
+        if getattr(args, opt) and args.vendor not in vendors:
+            ap.error(f"--{opt} does not apply to {args.vendor} (only {', '.join(sorted(vendors))})")
+    if args.limit is not None and args.limit < 1:
+        ap.error("--limit must be a positive number")
 
     lib = doclib.Library()
     if blocked(lib, args.apply):
@@ -497,12 +500,15 @@ def main() -> int:
     # Defaults, applied only where the user has not said otherwise. Naming --types or a
     # device scope explicitly turns the corresponding default off entirely.
     mod = VENDORS[args.vendor]
+    # Only a run over the vendor's whole default scope may record that a family has no
+    # USB, or that it stays kept: later runs act on the record and never revisit it.
+    complete = not (args.types or args.limit)
     if not args.types and not args.all_types:
         args.types = ",".join(sorted(doclib.TECHNICAL_TYPES))
         print("scope: technical documents only (datasheet, errata, manuals, app notes) "
               "— --all-types to widen", file=sys.stderr)
-    named_device = any([args.family, args.chips, args.parts, args.vendor == "nxp" and
-                        args.device != "Arm MCU"])
+    named_device = any([args.family, args.chips, args.parts,
+                        args.device not in (None, vendor_nxp.DEFAULT_DEVICE)])
     usb_scope = getattr(mod, "USB_SCOPE", None)
     note = getattr(mod, "USB_SCOPE_NOTE", "")
     apply_usb = not named_device and not args.all_devices
@@ -525,20 +531,9 @@ def main() -> int:
     print(f"enumerating {args.vendor} ...", file=sys.stderr)
     docs = enumerate_vendor(args.vendor, args)
     if not docs:
-        # "0 found" has two very different causes and guessing wastes the user's time:
-        # either the index never arrived, or it arrived and the filters matched nothing.
-        # Re-enumerate unfiltered to tell them apart before blaming the network.
-        probe_args = argparse.Namespace(**vars(args))
-        probe_args.types = None
-        unfiltered = enumerate_vendor(args.vendor, probe_args)
-        if unfiltered:
-            kinds = sorted({d.doc_type for d in unfiltered})
-            print(f"index is fine ({len(unfiltered)} documents) but no document matched "
-                  f"--types {args.types}. Available here: {', '.join(kinds)}",
-                  file=sys.stderr)
-        else:
-            print("no index available — the vendor is likely throttling; wait a few "
-                  "minutes and re-run (progress is cached)", file=sys.stderr)
+        # An empty list cannot tell a failed fetch from a scope that matches nothing;
+        # the adapter's own messages above are the only evidence of which.
+        print(f"{args.vendor}: no documents for the requested scope", file=sys.stderr)
         return 1
 
     # Resolve USB capability per family, peeking into one document per unresolved
@@ -556,16 +551,18 @@ def main() -> int:
         if unresolved:
             print(f"resolving USB capability for {len(unresolved)} famil(ies) by reading "
                   f"one document each: {', '.join(unresolved)}", file=sys.stderr)
-        peek_tmp = Path.home() / ".cache" / "download-doc" / "peek"
-        for fam in unresolved:
-            cands = doclib.peek_order([d for d in docs if fam in (d.family or [])])
-            usb.resolve(args.vendor, fam, cands, peek_tmp)
-            v = usb.get(args.vendor, fam)
-            label = ("USB" if v and v["usb"] is True else
-                     "no USB" if v and v["usb"] is False else "unresolved")
-            print(f"  {fam:<12} {label:<10} "
-                  f"({v['source'] if v else 'unresolved'}: "
-                  f"{v['evidence'][:48] if v else '-'})", file=sys.stderr)
+        # Only the verdict is reused (usb-capability.json); a resolved family is never
+        # peeked again, so the PDFs live for this run alone.
+        with tempfile.TemporaryDirectory(prefix="download-doc-peek-") as peek_tmp:
+            for fam in unresolved:
+                cands = doclib.peek_order([d for d in docs if fam in (d.family or [])])
+                usb.resolve(args.vendor, fam, cands, Path(peek_tmp), complete)
+                v = usb.get(args.vendor, fam)
+                label = ("USB" if v and v["usb"] is True else
+                         "no USB" if v and v["usb"] is False else "unresolved")
+                print(f"  {fam:<12} {label:<10} "
+                      f"({v['source'] if v else 'unresolved'}: "
+                      f"{v['evidence'][:48] if v else '-'})", file=sys.stderr)
         keep = []
         for d in docs:
             fams_d = [f for f in (d.family or []) if f not in PSEUDO]
@@ -587,9 +584,21 @@ def main() -> int:
             why = ("not confirmed USB (--usb-only)" if args.usb_only
                    else "families with no USB controller")
             print(f"left out: {len(non_usb)} document(s) — {why}", file=sys.stderr)
+        if not docs:
+            print(f"{args.vendor}: no documents left after the USB filter — "
+                  f"--all-devices keeps them", file=sys.stderr)
+            return 1
 
-    idx = lib.index()
-    p = doclib.plan(docs, idx, lib.legacy_index(docs[0].author))
+    # Capped only now: USB resolution must see every document of a family, or a
+    # truncated family is cached as having no USB and later runs drop all of it.
+    if args.limit:
+        docs = docs[:args.limit]
+    try:
+        idx, legacy = lib.index(), lib.legacy_index(docs[0].author)
+    except RuntimeError as e:
+        print(f"BLOCKED: cannot read the library: {e}", file=sys.stderr)
+        return 2
+    p = doclib.plan(docs, idx, legacy)
     needs_human = [d for d in p["new"]
                    if args.vendor == "nxp" and vendor_nxp.is_gated(d)]
     fetchable = [d for d in p["new"] if d not in needs_human]
@@ -640,33 +649,46 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="download-doc-"))
     added = replaced = failed = unsafe = 0
     skipped: list = []
+    no_metadata: list = []
+    try:
+        for doc in fetchable:
+            pdf, why = fetch(doc, mod, tmp)
+            if pdf is None:
+                skipped.append((doc.doc_id, why))
+                failed += 1
+                continue
+            try:
+                book_id = lib.add(doc, pdf)
+            except RuntimeError as e:
+                skipped.append((doc.doc_id, str(e) or type(e).__name__))
+                failed += 1
+                continue
+            if book_id:
+                added += 1
+                if lib.last_add_status == "added-no-metadata":
+                    no_metadata.append((doc.doc_id, book_id))
+            elif lib.last_add_status == "duplicate":
+                skipped.append((doc.doc_id, "already in the library under this title"))
+            else:
+                skipped.append((doc.doc_id, "calibredb add reported no book id"))
+                failed += 1
 
-    for doc in fetchable:
-        pdf, why = fetch(doc, mod, tmp)
-        if pdf is None:
-            skipped.append((doc.doc_id, why))
-            failed += 1
-            continue
-        if lib.add(doc, pdf):
-            added += 1
-        elif getattr(lib, "last_add_status", "") == "duplicate":
-            skipped.append((doc.doc_id, "already in the library under this title"))
-        else:
-            skipped.append((doc.doc_id, "calibredb add reported no book id"))
-            failed += 1
-
-    for doc, have in p["outdated"]:
-        pdf, why = fetch(doc, mod, tmp)
-        if pdf is None:
-            skipped.append((doc.doc_id, f"{why}; local copy left alone"))
-            failed += 1
-            continue
-        _, failure = replace(lib, have["id"], doc, pdf)
-        if failure:
-            skipped.append((doc.doc_id, failure))
-            unsafe += 1
-        else:
-            replaced += 1
+        for doc, have in p["outdated"]:
+            pdf, why = fetch(doc, mod, tmp)
+            if pdf is None:
+                skipped.append((doc.doc_id, f"{why}; local copy left alone"))
+                failed += 1
+                continue
+            book_id, failure = replace(lib, have["id"], doc, pdf)
+            if failure:
+                skipped.append((doc.doc_id, failure))
+                unsafe += 1
+            else:
+                replaced += 1
+                if lib.last_add_status == "added-no-metadata":
+                    no_metadata.append((doc.doc_id, book_id))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     print("\n" + "=" * 68)
     print(f"IMPORTED  {added} new" + (f" + {replaced} replaced" if replaced else ""))
@@ -694,6 +716,10 @@ def main() -> int:
         print(f"    {len(skipped):>3} failed:")
         for doc_id, why in skipped[:8]:
             print(f"        - {doc_id[:40]:<40} {why[:46]}")
+    if no_metadata:
+        print("ADDED WITHOUT METADATA (no comments/revision; set them by hand)")
+        for doc_id, book_id in no_metadata:
+            print(f"    #{book_id:<6} {doc_id}")
     print("=" * 68)
     for doc_id, why in skipped:
         print(f"  SKIPPED {doc_id:<22} {why}")
@@ -704,8 +730,8 @@ def main() -> int:
                                         "gated": needs_human}):
         print(line)
     if failed:
-        print(f"  ({failed} of the above failed to download and are counted as imported "
-              f"attempts — see SKIPPED lines)")
+        print(f"  ({failed} of the above failed to download or import and are counted as "
+              f"imported attempts — see SKIPPED lines)")
 
     if needs_human:
         print(f"\n{len(needs_human)} documents need a signed-in browser; "

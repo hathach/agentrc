@@ -33,14 +33,9 @@ errors.
 
 ## USB scope per vendor
 
-The USB scope is per-adapter and honest about what it cannot know:
-
-| Vendor | Scope | Why |
-|---|---|---|
-| Espressif | S2, S3, S31, P4 | datasheet-verified USB OTG; USB-Serial/JTAG-only parts (C3/C6/H2) excluded on purpose |
-| Raspberry Pi | everything | every RP2040/RP2350 part has a USB controller |
-| ST | **no filter** | not derivable — see below |
-| NXP | **no filter** | taxonomy classifies by product line, not peripheral |
+Each adapter declares its scope in `USB_SCOPE` and `USB_SCOPE_NOTE`: a set of parts,
+`"all"`, or `None` for "resolve per family from the documents themselves", which
+`sync.py` does through `doclib.UsbIndex` and reports on every run.
 
 ⚠️ Don't be tempted to mine ST's datasheet blurbs for "USB". It looks like it works —
 it finds USB in 10 of 24 series — and it is wrong: STM32G4, L5, U5 and WB all have USB
@@ -60,7 +55,7 @@ an import log alongside them — two sources of truth drift, and one `calibredb 
 --for-machine` at startup gives you the same answer in one query, survives log loss,
 and sees books added by any other route. Cache it in memory for the run, not on disk.
 
-The `Revision:` comments line is read back by `Library.index()` when the title carries
+The `Revision:` comments line is read back by `Library.entry()` when the title carries
 no `Rev n` — titles only hold numeric revisions, so a letter or date revision lives
 there and nowhere else.
 
@@ -156,7 +151,7 @@ warns in a sync, and blocks `add`, which files a hand-typed ID only on `ok` (or 
 `skipped` under `--id-not-printed`): a typo is the likelier cause there.
 
 **Reconcile coverage per type, and print it.** `catalogue == new + current + legacy +
-outdated + gated`, per document type, every run. This is the one check that catches a
+outdated + incomparable + gated`, per document type, every run. This is the one check that catches a
 silent drop — and unlike an exception, a silent drop reports as a confident success.
 It's also what lets you *prove* a fix cost nothing rather than argue about it:
 `124 = 91 + 33 + 0`.
@@ -229,11 +224,11 @@ enumerate_docs(...) -> list[doclib.Doc]   # Doc(vendor, doc_id, doc_type, versio
 Normalize `doc_type` to the shared tag vocabulary (`sync.KINDS`) so the library stays
 searchable across vendors, set `verify_id=False` where the ID is not printed in the
 document, and put the vendor's quirks in `references/<name>.md` rather than in the
-core. Then add it to `VENDORS` in `sync.py`. If the vendor already has books from
+core. Then import it in `sync.py` and add it to `VENDORS` there. If the vendor already has books from
 `sync.py add`, keep their identifier scheme and author so the adapter's diff sees them.
 If you find yourself special-casing a vendor inside `doclib.py`, the abstraction is
 leaking.
 
-Run `python3 <skill dir>/scripts/doclib.py` for the self-test (revision parsing and doc-ID regexes,
-with the real-world values as fixtures) and `python3 -X utf8 -m unittest
-tests.test_download_doc` from the agentrc checkout after touching the core.
+Run `python3 -X utf8 -m unittest tests.test_download_doc` from the agentrc checkout after
+touching the core; it also runs the self-tests of `doclib.py` (revision parsing and doc-ID
+regexes) and `titles.py`, whose real-world fixtures live beside the code.
