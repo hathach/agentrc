@@ -125,6 +125,14 @@ class CliTest(unittest.TestCase):
                 self.assertEqual(rc, 0)
                 self.assertIn('FILES: src/a.c', out)
 
+    def test_send_refuses_a_blank_files_line_in_the_header(self):
+        agents = [agent('w1:p1', os.getcwd(), 'claude'), agent('w1:p2', os.getcwd())]
+        argv = ['send', '--to', 'w1:p2', '--task', 'fix it', '--dry-run', '--files']
+        self.assertEqual(run_main(argv + ['src/a.c'], agents)[0], 0)
+        rc, calls, _ = run_main(argv + ['src/a.c\nFILES:'], agents)
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls, [('agent', 'list')])
+
 
 class ExtractTest(unittest.TestCase):
     def test_pulls_the_matching_envelope(self):
@@ -191,6 +199,11 @@ class CheckTest(unittest.TestCase):
         self.assertTrue(any('FILES is blank' in p for p in peer.check('result', text)))
         body = peer.build_request('w1:p1-1', 'Claude, w1:p1', '', 'task')
         self.assertTrue(any('FILES is blank' in p for p in peer.check('request', body)))
+
+    def test_a_blank_files_line_repeated_in_a_request_header_is_caught(self):
+        body = peer.build_request('w1:p1-1', 'Claude, w1:p1', 'src/a.c', 'task').replace(
+            'FILES: src/a.c', 'FILES: src/a.c\nFILES:')
+        self.assertIn('FILES is blank; list the paths, or "none"', peer.check('request', body))
 
     def test_an_invented_status_is_caught(self):
         text = RESULT.format(id='x').replace('STATUS: DONE', 'STATUS: LGTM')

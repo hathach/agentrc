@@ -263,13 +263,19 @@ def extract_result(text, req_id):
 def check(kind, text):
     """Shape only. Says nothing about whether the content is true. A result's
     fields come from its head (head_fields), so its answer may quote field
-    lines; a request's from the first line naming each, since its DELTA and
-    TASK may span lines and quote a field line below the header's."""
+    lines; a request's ID, FROM and FILES from every line before its DELTA or
+    TASK, since those may span lines and quote a field line."""
     problems = []
     if not re.search(LEAD + re.escape(MARKER[kind]), text):
         problems.append(f'missing the {kind} header line')
-    fields = head_fields(kind, text) if kind == 'result' else {
-        f: re.findall(LEAD + f + r':[ \t]*(.*?)[ \t]*$', text, re.M)[:1] for f in FIELDS[kind]}
+    if kind == 'result':
+        fields = head_fields(kind, text)
+    else:
+        body = re.search(LEAD + r'(?:DELTA|TASK):', text, re.M)
+        head = text[:body.start()] if body else text
+        fields = {f: re.findall(LEAD + f + r':[ \t]*(.*?)[ \t]*$',
+                                text if f in ('DELTA', 'TASK') else head, re.M)
+                  for f in FIELDS[kind]}
     for field in FIELDS[kind]:
         if not fields.get(field):
             problems.append(f'missing required field {field}')
