@@ -273,21 +273,23 @@ def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, 
 # fails. A device script's AfterResetTarget() may close either form of `r` (the MK64 and
 # LPC4088 reset via SYSRESETREQ, V9.78).
 _AFTER_RESET = r'(?:AfterResetTarget\(\) start\n(?:AfterResetTarget\(\)\n)?AfterResetTarget\(\) end - Took .*\n)?'
-JLINK_DONE = {'h': r'^PC = [0-9A-F]{{8}}, ', 'halt': r'^PC = [0-9A-F]{{8}}, ', 'regs': r'^PC = [0-9A-F]{{8}}, ',
+_PC = r'^PC = [0-9A-F]{{8}}, '
+JLINK_DONE = {'h': _PC, 'halt': _PC, 'regs': _PC,
               'r': r'^Reset delay: \d+ ms\n(?:(?:.*\n)*?ResetTarget\(\) end - Took .*\nDevice specific reset executed\.\n'
-                   + _AFTER_RESET.replace('{', '{{').replace('}', '}}') +
+                   + _AFTER_RESET +
                    r'|(?![\s\S]*^ResetTarget\(\) start$)(?:.*\n)*?Reset: Reset device via AIRCR\.SYSRESETREQ\.\n'
-                   + _AFTER_RESET.replace('{', '{{').replace('}', '}}') + r')\s*\Z',
+                   + _AFTER_RESET + r')\s*\Z',
               'g': '', 'go': '', 'sleep': r'^Sleep\({0}\)$',
               'mem32': r'^{0} = [0-9A-F]{{8}}', 'w4': r'^Writing {1} -> {0}$', 'verifybin': r'^Verify successful\.$',
               'loadfile': r'^O\.K\.$', 'exit': r'^Script processing completed\.$'}
 # A failure line in any command's chunk, from JLinkExe V9.84's own diagnostics (its strings:
 # "****** Error: %s" for the DLL's errors, "Error occurred: ...", "Error while ...", "Could not
-# read memory." and the like); a connect's own notes, such as "Could not find valid reset
-# vector.", are judged by its commands completing.
-JLINK_ERRORS = (r'(?m)^\*+ Error|^Error (occurred|while)|ERROR|Verify failed|Cannot connect|ResetTarget failed|'
-                r'Failed to (halt|reconnect|write memory)|CPU (is )?not halted|Could not (read|write) memory|'
-                r'Could not read current PC')
+# read memory." and the like), and the connect and reset failures V9.78 prints; a connect's own
+# notes, such as "Could not find valid reset vector.", are judged by its commands completing.
+JLINK_ERRORS = (r'(?m)^\*+ Error|^Error (occurred|while)|ERROR|Verify failed|Cannot connect|Could not connect|'
+                r'ResetTarget failed|Failed to (halt|reconnect|write memory)|CPU (is )?not halted|'
+                r'Could not (read|write) memory|Could not read current PC|CPU may not have been reset|'
+                r'CPU did not halt after reset')
 
 
 def jlink_echoed(out: str) -> list:
@@ -331,24 +333,33 @@ def jlink_judgment(out: str, commands: list) -> dict:
     return {'ok': not problem, 'problem': problem, 'commands': judged}
 
 
-def jlink_completed(out: str, commands: list) -> bool:
-    return jlink_judgment(out, commands)['ok']
+def _last_exited(op, tool: str) -> tuple:
+    """(problem, stdout text) of an Operation's last attempt: the problem '' only when it
+    exited 0. An earlier attempt never counts."""
+    last = op.attempts[-1]
+    if last.kind != 'exited':
+        return f'{tool} {last.kind.replace("_", " ")}', ''
+    if last.result.returncode != 0:
+        return f'{tool} exit {last.result.returncode}', ''
+    return '', hil_process.cmd_stdout_text(last.result.stdout)
 
 
 def jlink_problem(op) -> str:
     """Why a J-Link session Operation (flash_jlink, reset_jlink, run_jlink_commands,
     sysresetreq_jlink) did not complete its command file, '' when it did: its last attempt,
-    which must have exited 0, judged by jlink_judgment against the command file it ran. An
-    earlier attempt's output never counts."""
-    last = op.attempts[-1]
-    if last.kind != 'exited':
-        return f'JLinkExe {last.kind.replace("_", " ")}'
-    if last.result.returncode != 0:
-        return f'JLinkExe exit {last.result.returncode}'
-    lines = (last.script or '').splitlines()
+    which must have exited 0, judged by jlink_judgment against the command file it ran, with
+    no failure line (JLINK_ERRORS) before the first echo or on stderr."""
+    problem, out = _last_exited(op, 'JLinkExe')
+    if problem:
+        return problem
+    lines = (op.attempts[-1].script or '').splitlines()
     if not lines or lines[-1] != 'exit':
         return 'no command file ending in exit to judge against'
-    out = hil_process.cmd_stdout_text(last.result.stdout)
+    preamble = re.split(r'(?m)^J-Link>', out, maxsplit=1)[0]
+    for where, text in (('before the first command', preamble),
+                        ('on stderr', hil_process.cmd_stdout_text(op.attempts[-1].result.stderr))):
+        if said := re.search(JLINK_ERRORS, text):
+            return f'failed {where} ({said[0]!r})'
     return jlink_judgment(out, lines[:-1])['problem']
 
 
@@ -769,16 +780,19 @@ def esptool_flash_judgment(out: str, offsets) -> dict:
     return {'ok': not problem, 'problem': problem, 'wrote': wrote}
 
 
-def esptool_problem(op, offsets) -> str:
-    """Why a flash_esptool Operation did not flash `offsets` (esptool_offsets of the flash_args
-    it ran), '' when it did: its last attempt exited 0 and its transcript passes
-    esptool_flash_judgment. An earlier attempt's output never counts."""
-    last = op.attempts[-1]
-    if last.kind != 'exited':
-        return f'esptool {last.kind.replace("_", " ")}'
-    if last.result.returncode != 0:
-        return f'esptool exit {last.result.returncode}'
-    return esptool_flash_judgment(hil_process.cmd_stdout_text(last.result.stdout), offsets)['problem']
+def esptool_problem(op) -> str:
+    """Why a flash_esptool Operation did not flash what it ran, '' when it did: its last
+    attempt exited 0 and its transcript passes esptool_flash_judgment over the offsets of that
+    attempt's own write_flash arguments."""
+    problem, out = _last_exited(op, 'esptool')
+    if problem:
+        return problem
+    cmd = op.attempts[-1].cmd
+    try:
+        offsets = esptool_offsets(shlex.join(cmd[cmd.index('write_flash') + 1:]))
+    except (ValueError, TypeError, AttributeError) as e:
+        return f'no write_flash arguments to judge against: {e}'
+    return esptool_flash_judgment(out, offsets)['problem']
 
 
 SERIAL_BY_ID = '/dev/serial/by-id'
@@ -882,7 +896,6 @@ def reset_pyocd(flasher: dict, *, project_dir: str, timeout, run=None) -> Operat
 # STM32CubeProgrammer 2.23 device info, openocd 0ce743125 DP/core examination. A backend not
 # listed: its exit status alone says whether the target answered.
 RESET_CONTACT = {
-    'jlink': ('identified.', 'Found SW-DP', 'Found JTAG'),
     'stlink': ('Device ID',),
     'openocd': ('Examination succeed', 'Examined RISC-V core', 'processor detected', 'SWD DPIDR'),
 }
@@ -890,8 +903,6 @@ RESET_CONTACT = {
 # only logs a failed event hook (a reset-assert hook then replaces the reset); pyocd only logs an
 # inaccessible core or an invalid reset method; esptool exits 0 when the port refuses RTS/DTR.
 RESET_REFUTED = {
-    'jlink': ('Could not connect', 'Cannot connect', 'Failed to halt CPU', 'CPU may not have been reset',
-              'CPU did not halt after reset'),
     'openocd': ('examination failed', 'Execution of event'),
     'pyocd': ('is not accessible after reset', 'Invalid reset method'),
     'esptool': ('Chip was NOT reset',),
@@ -900,8 +911,11 @@ RESET_REFUTED = {
 
 def reset_problem(name: str, op) -> str:
     """Why the `name` backend's reset Operation `op`, which exited 0, does not show the target
-    answering and resetting ('' when it does). A non-zero exit is the caller's to judge."""
+    answering and resetting ('' when it does). A non-zero exit is the caller's to judge. J-Link
+    is jlink_problem's: its `halt` completing is the target answering."""
     name = name.lower()
+    if name == 'jlink':
+        return jlink_problem(op)
     out = hil_process.cmd_stdout_text(op.stdout) + '\n' + hil_process.cmd_stdout_text(op.stderr)
     if said := next((m for m in RESET_REFUTED.get(name, ()) if m in out), None):
         return f'exit 0, but the output says {said!r}'

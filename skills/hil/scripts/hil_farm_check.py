@@ -370,10 +370,10 @@ def _finalize(fh, lock: str, ctx: Context, row: dict) -> None:
     open_ops = [e for e in ctx.ledger if e['cleanup'] != 'done']
     receipts = [e['receipt'] for e in open_ops if e['receipt'] is not None]
     retained = [r for e in open_ops for r in e.get('retained', ())]
+    extra = {'retained': retained} if retained else {}
     cleanup = {'result': 'unresolved' if open_ops else 'release-failed', 'receipts': receipts, 'blocker': None,
                'released': False, 'evidence': [f'not proven ended ({e["cleanup"]}): {e["cmd"]}' for e in open_ops],
-               **({'retained': retained} if retained else {})}
-    extra = {'retained': retained} if retained else {}
+               **extra}
     row['cleanup'] = cleanup
     if not open_ops:
         # proven clear through our own descriptor, while the flock is still ours

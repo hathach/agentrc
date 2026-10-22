@@ -924,9 +924,9 @@ class JLinkJudgment(unittest.TestCase):
         name = 'V9.78-lpcxpresso55s69-h-verifybin-verifybin-r-g.txt'
         cmds = self.commands(name)
         self.assertEqual(sum(c.startswith('verifybin') for c in cmds), 2)
-        self.assertTrue(hf.jlink_completed(jlink_fixture(name), cmds))
+        self.assertTrue(hf.jlink_judgment(jlink_fixture(name), cmds)['ok'])
         once = [c for i, c in enumerate(cmds) if not (c.startswith('verifybin') and i == cmds.index(c))]
-        self.assertFalse(hf.jlink_completed(jlink_fixture(name), once))
+        self.assertFalse(hf.jlink_judgment(jlink_fixture(name), once)['ok'])
 
     def test_a_command_without_a_completion_rule_never_passes(self):
         out = 'J-Link>erase\nErasing done.\nJ-Link>exit\nScript processing completed.\n'
@@ -935,17 +935,14 @@ class JLinkJudgment(unittest.TestCase):
     def test_reset_after_target_hooks(self):
         """A device script's AfterResetTarget() closes `r` (MK64, LPC4088); nothing else may."""
         out = jlink_fixture('V9.78-frdm_k64f-halt-r-go.txt')
-        self.assertTrue(hf.jlink_completed(out, ['halt', 'r', 'go']))
-        self.assertFalse(hf.jlink_completed(out.replace('AfterResetTarget() end', 'Something else\nAfterResetTarget() end'),
-                                            ['halt', 'r', 'go']))
+        self.assertTrue(hf.jlink_judgment(out, ['halt', 'r', 'go'])['ok'])
+        self.assertFalse(hf.jlink_judgment(out.replace('AfterResetTarget() end', 'Something else\nAfterResetTarget() end'),
+                                           ['halt', 'r', 'go'])['ok'])
 
     def test_the_problem_of_an_operation_is_its_last_attempt_judged_against_its_command_file(self):
         good = jlink_fixture(self.RESET)
 
-        def op(*outs, script='halt\nr\ngo\nexit\n'):
-            attempts = [hf._record(['JLinkExe'], script, subprocess.CompletedProcess([], rc, out, ''), err)
-                        for rc, out, err in outs]
-            return hf.Operation(attempts)
+        op = op_of
         self.assertEqual(hf.jlink_problem(op((0, good, None))), '')
         self.assertEqual(hf.jlink_problem(op((0, good, None), (-11, '', None))), 'JLinkExe exit -11')
         self.assertIn('echoed', hf.jlink_problem(op((-11, good, None), (0, '', None))), 'an earlier attempt never counts')
@@ -955,6 +952,16 @@ class JLinkJudgment(unittest.TestCase):
         self.assertIn('echoed', hf.jlink_problem(op((0, good, None), script='halt\nloadfile /x/a.hex\nr\ngo\nexit\n')))
         self.assertEqual(hf.jlink_problem(op((0, good, None), script=None)),
                          'no command file ending in exit to judge against')
+
+    def test_a_failure_line_anywhere_fails_a_session_that_completed(self):
+        good = jlink_fixture(self.RESET)
+        r = good.index('Reset delay:')
+        for said in ('Could not connect to target.', 'CPU may not have been reset (DHCSR.S_RESET_ST never gets set).',
+                     'CPU did not halt after reset.'):
+            with self.subTest(said=said):
+                self.assertIn("'r' failed", hf.jlink_problem(op_of((0, good[:r] + said + '\n' + good[r:], None))))
+                self.assertIn('before the first command', hf.jlink_problem(op_of((0, said + '\n' + good, None))))
+                self.assertIn('on stderr', hf.jlink_problem(op_of((0, good, None), stderr=said)))
 
     def test_the_providers_scripts_are_judged_as_they_run(self):
         """flash_jlink and reset_jlink's own command files are the recorded ones."""
@@ -967,6 +974,12 @@ class JLinkJudgment(unittest.TestCase):
                     op = fn(JLINK, *extra, timeout=5, workdir=d,
                             run=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ''))
                 self.assertEqual(hf.jlink_problem(op), '')
+
+
+def op_of(*outs, script='halt\nr\ngo\nexit\n', stderr=''):
+    """A reset_jlink Operation of these (rc, stdout, error) attempts."""
+    return hf.Operation([hf._record(['JLinkExe'], script, subprocess.CompletedProcess([], rc, out, stderr), err)
+                         for rc, out, err in outs])
 
 
 ESPTOOL_CORPUS = DATA / 'esptool'
@@ -1029,17 +1042,24 @@ class EsptoolJudgment(unittest.TestCase):
         twice = esptool_synthetic([0, 0])
         self.assertIn('repeat', hf.esptool_flash_judgment(twice, [0, 0])['problem'])
 
-    def test_the_problem_of_a_flash_is_its_last_attempt_judged(self):
+    def test_the_problem_of_a_flash_is_its_last_attempt_judged_against_what_it_wrote(self):
         good = esptool_synthetic(self.OFFSETS)
+        args = '--flash-mode dio 0x0 "boot loader.bin" 0x8000 p.bin 0xe000 o.bin 0x410000 a.bin'
 
-        def op(*outs):
-            return hf.Operation([hf._record(['esptool'], None, subprocess.CompletedProcess([], rc, out, ''), err)
+        def op(*outs, flash_args=args):
+            cmd = hf.esptool_argv('esptool', '-p', '/dev/x', 'write_flash', *shlex.split(flash_args))
+            return hf.Operation([hf._record(cmd, None, subprocess.CompletedProcess([], rc, out, ''), err)
                                  for rc, out, err in outs])
-        self.assertEqual(hf.esptool_problem(op((0, good, None)), self.OFFSETS), '')
-        self.assertEqual(hf.esptool_problem(op((2, good, None)), self.OFFSETS), 'esptool exit 2')
-        self.assertEqual(hf.esptool_problem(op((None, good, subprocess.TimeoutExpired('esptool', 5))), self.OFFSETS),
+        self.assertEqual(hf.esptool_problem(op((0, good, None))), '')
+        self.assertEqual(hf.esptool_problem(op((2, good, None))), 'esptool exit 2')
+        self.assertEqual(hf.esptool_problem(op((None, good, subprocess.TimeoutExpired('esptool', 5)))),
                          'esptool timed out')
-        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), (0, '', None)), self.OFFSETS))
+        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), (0, '', None))))
+        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), flash_args='0x0 b.bin 0x9000 p.bin')))
+        for bad in (['esptool', 'chip_id'], ['esptool', 'write_flash', '--flash-mode', 'dio']):
+            with self.subTest(cmd=bad):
+                o = hf.Operation([hf._record(bad, None, subprocess.CompletedProcess([], 0, good, ''), None)])
+                self.assertIn('no write_flash arguments to judge against', hf.esptool_problem(o))
 
     def test_the_offsets_are_the_flash_args_pairs(self):
         self.assertEqual(hf.esptool_offsets('--flash-mode dio --flash-size 8MB 0x0 b.bin 0x8000 p.bin'), [0, 0x8000])
@@ -1164,10 +1184,14 @@ class ResetProblem(unittest.TestCase):
     def op(stdout='', stderr=None):
         return subprocess.CompletedProcess([], 0, stdout, stderr)
 
+    def test_jlink_is_its_session_judged(self):
+        good = jlink_fixture(JLinkJudgment.RESET)
+        self.assertEqual(hf.reset_problem('JLink', op_of((0, good, None))), '')
+        self.assertIn('echoed', hf.reset_problem('jlink', op_of((0, 'J-Link>exit\nScript processing completed.\n',
+                                                                  None))))
+
     def test_each_backend_needs_its_contact_line(self):
-        cases = [('jlink', 'Found SW-DP with ID 0x2BA01477\nCortex-M4 identified.\n', ''),
-                 ('JLink', 'J-Link>go\nScript processing completed.\n', 'no line shows the target answering'),
-                 ('stlink', 'Device ID   : 0x413\n', ''),
+        cases = [('stlink', 'Device ID   : 0x413\n', ''),
                  ('stlink', 'ST-LINK SN  : P\n', 'no line shows the target answering'),
                  ('openocd', 'Info : [rp2040.core0] Examination succeed\n', ''),
                  ('openocd', 'Info : wlink_init ok\nInfo : [riscv.cpu] Examined RISC-V core\n', ''),
@@ -1181,8 +1205,7 @@ class ResetProblem(unittest.TestCase):
                 self.assertIn(why, got)
 
     def test_a_refuting_line_wins_whatever_else_answered(self):
-        cases = [('jlink', 'Cortex-M4 identified.\nReset: CPU may not have been reset (DHCSR.S_RESET_ST never gets set).'),
-                 ('openocd', 'Info : SWD DPIDR 0x0bc12477\nWarn : target max32665.cpu examination failed'),
+        cases = [('openocd', 'Info : SWD DPIDR 0x0bc12477\nWarn : target max32665.cpu examination failed'),
                  ('openocd', 'Info : [rp2040.core0] Examination succeed\n'
                              'Error: [rp2040.core0] Execution of event reset-assert failed:\nboom'),
                  ('pyocd', 'Core 0 is not accessible after reset'),

@@ -371,8 +371,8 @@ class Engine(unittest.TestCase):
         with self.assertRaises(TypeError):
             ctx.retain('openocd_esp session', [object()])
 
-    def test_a_retained_session_hands_the_board_to_a_cleanup_holder_naming_its_receipts(self):
-        receipts = ['/s/' + 'r' * 600 + '.json']     # past the detail's 500 characters
+    def retain_after_reset(self, receipts):
+        """The profile's reset leaves a session the provider kept running, as openocd_esp's can."""
         reset = self.p.reset
 
         def retaining(ctx, board):
@@ -381,6 +381,10 @@ class Engine(unittest.TestCase):
             finally:
                 ctx.retain('openocd_esp session', receipts)
         self.p.reset = retaining
+
+    def test_a_retained_session_hands_the_board_to_a_cleanup_holder_naming_its_receipts(self):
+        receipts = ['/s/' + 'r' * 600 + '.json']     # past the detail's 500 characters
+        self.retain_after_reset(receipts)
         patch(self, eng, 'HOLDER_READY', 5)
         row = self.check()
         self.assertEqual((row['status'], row['cleanup']['blocker'], row['cleanup']['retained']),
@@ -392,14 +396,7 @@ class Engine(unittest.TestCase):
 
     def test_a_failed_handoff_keeps_the_retained_receipts_in_the_protected_record(self):
         receipts = ['/s/r1.json', {'pid': 7, 'startTime': '1', 'log': '/s/l'}]
-        reset = self.p.reset
-
-        def retaining(ctx, board):
-            try:
-                return reset(ctx, board)
-            finally:
-                ctx.retain('openocd_esp session', receipts)
-        self.p.reset = retaining
+        self.retain_after_reset(receipts)
         patch(self, eng, 'HOLDER_READY', 1)
         patch(self, lk, '_holder_argv', lambda job: ['/nonexistent/holder'])
         row = self.check()
