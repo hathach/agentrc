@@ -1,9 +1,8 @@
 """skills/hil/scripts/hil_farm_check.py is the farm check engine a project's launcher runs with
-its profile, moved from tinyusb's test/hil/helper/hil_pool_check.py (2c992c002) with the engine
-cases of test_hil_pool_check.py. A stub profile drives the engine through the real hil_flash
-provider with a faked tracked runner (plumbing only), and process-integration tests run the
-engine in its own interpreter with a fake flasher on PATH, the real run_tracked and real
-locks in a temp dir: handled interruption, abrupt death, a surviving child. No hardware."""
+its profile. A stub profile drives the engine through the real hil_flash provider with a faked
+tracked runner (plumbing only), and process-integration tests run the engine in its own
+interpreter with a fake flasher on PATH, the real run_tracked and real locks in a temp dir:
+handled interruption, abrupt death, a surviving child. No hardware."""
 import os
 import unittest
 
@@ -45,8 +44,8 @@ lk = eng.hil_lock
 core = eng.report_core
 RECHECK = eng.hil_process.recheck   # before Engine stubs it: hil_lock's release predicate is the same instance
 
-BOARD = {'name': 'b', 'uid': 'U', 'flasher': {'name': 'lm4flash', 'uid': 'P', 'args': ''}}
-LOCAL = {'kind': 'local', 'receipt': 'build-receipt.json'}
+BOARD = {'name': 'b', 'flasher': {'name': 'stlink', 'uid': 'P', 'args': ''}}
+RESET = 'STM32_Programmer_CLI --connect port=swd sn=P --rst --go'
 
 
 def patch(test, obj, name, value):
@@ -60,25 +59,15 @@ def setUpModule():
 
 
 class StubProfile:
-    """A profile whose answers each test sets; its flashes go through hil_flash with ctx.run."""
-
-    LEAVE_RUNNING = False
+    """A profile whose answers each test sets; its reset goes through hil_flash with ctx.run."""
 
     def __init__(self, d: Path):
         self.d = d
         self.__file__ = str(d / 'stub_profile.py')
         Path(self.__file__).write_text('# stub profile\n')
-        for name in ('light.bin', 'park.bin', 'verify.bin'):
-            (d / name).write_bytes(name.encode())
         self.boards = [dict(BOARD)]
         self.candidates = ['1-1']
-        self.provenance = dict(LOCAL)
-        self.refused = None
-        self.observed = {'status': 'ok', 'device': '✅ cafe:4001', 'notes': [], 'unverified': [], 'evidence': ['uid back']}
-        self.final = {'verified': True, 'evidence': ['parked'], 'notes': []}
-        self.final_extra = []
-        self.calls = []
-        self.records = []           # the board's lock record as each flash saw it
+        self.records = []           # the board's lock record as each reset saw it
 
     def roster(self, host, config, args):
         if config is None and host != 'rig':
@@ -90,45 +79,15 @@ class StubProfile:
     def lock_name(self, board):
         return board['name']
 
+    def probe_name(self, board):
+        return board['flasher']['name']
+
     def probe_candidates(self, board):
         return list(self.candidates)
 
-    def scan_device(self, board):
-        self.calls.append('scan')
-        return {'device': '⚫ off bus (parked?)', 'notes': ['scanned']}
-
-    def prepare(self, boards, args, say):
-        self.calls.append('prepare')
-        return {'prepared': True}
-
-    def image(self, name):
-        return {'path': str(self.d / name), 'variant': 'b', 'label': name.split('.')[0], 'provenance': self.provenance}
-
-    def plan(self, board, args, prepared, leave_running):
-        self.calls.append(('plan', prepared, leave_running))
-        if self.refused:
-            return {'refused': self.refused}
-        return {'image': self.image('light.bin'),
-                'final': {'postcondition': 'parked in board_test', 'image': self.image('park.bin')},
-                'notes': ['variant: b']}
-
-    def flash(self, ctx, board, plan):
-        self.calls.append('flash')
+    def reset(self, ctx, board):
         self.records.append(lk.read_record(board['name']))
-        return hf.flash_lm4flash(board['flasher'], plan['image']['path'], timeout=5, run=ctx.run)
-
-    def observe(self, ctx, board, plan, before):
-        self.calls.append('observe')
-        return dict(self.observed)
-
-    def final_state(self, ctx, board, plan, observation):
-        self.calls.append('final')
-        if isinstance(self.final, BaseException):
-            raise self.final
-        ops = [hf.flash_lm4flash(board['flasher'], plan['final']['image']['path'], timeout=5, run=ctx.run)]
-        for extra in self.final_extra:     # a second command of the same final state
-            ops.append(hf.flash_lm4flash(board['flasher'], str(self.d / extra), timeout=5, run=ctx.run))
-        return dict(self.final, operations=ops)
+        return hf.reset_stlink(board['flasher'], timeout=5, run=ctx.run)
 
 
 class Engine(unittest.TestCase):
@@ -148,13 +107,13 @@ class Engine(unittest.TestCase):
         patch(self, eng.hil_process, 'recheck', lambda receipt: self.rechecks.get(receipt['token'], 'unknown'))
         self.p = StubProfile(self.d)
         self.ran = []
-        self.outcomes = {}          # image name -> (rc, cleanup, stdout) or an exception
+        self.outcomes = {}          # command -> (rc, cleanup, stdout) or an exception
         self.rechecks = {}
-        self.args = types.SimpleNamespace(scan_only=False, no_park=False, verbose=False)
+        self.args = types.SimpleNamespace(verbose=False)
 
     def tracked(self, cmd, cwd=None, *, timeout, settle, state_dir, **kw):
         self.assertEqual(state_dir, str(self.state))
-        name = (shlex.join(cmd) if isinstance(cmd, list) else cmd).rsplit('/', 1)[-1]
+        name = shlex.join(cmd) if isinstance(cmd, list) else cmd
         self.ran.append(name)
         out = self.outcomes.get(name, (0, 'done', 'ok'))
         if isinstance(out, BaseException):
@@ -183,214 +142,146 @@ class Engine(unittest.TestCase):
         lk.write_record(fh, record.pop('reason', 'farm_check'), **record)
         fh.close()
 
-    # --- moved from test_hil_pool_check: check_board up to and around the flash ----------------
-    def test_a_free_board_is_taken_under_the_protected_reason_and_released(self):
+    def doc(self, *rows):
+        return eng.farm_document('rig', 'r.json', list(rows), {}, 0)
+
+    # --- the reset ------------------------------------------------------------------------------
+    def test_a_free_board_is_reset_under_the_protected_reason_and_released(self):
         row = self.check()
         rec = self.p.records[0]
         self.assertEqual((rec['reason'], rec['protected']), ('farm_check', True))
         self.assertIn('farm_check', lk.PROTECTED_REASONS)
-        self.assertEqual((row['status'], self.ran), ('ok', ['light.bin', 'park.bin']))
+        self.assertEqual((row['status'], row['probe'], row['location'], self.ran), ('ok', '✅ stlink', '1-1', [RESET]))
+        self.assertEqual((row['cleanup']['result'], row['cleanup']['released']), ('released', True))
+        self.assertEqual(self.doc(row)['rows'][0]['coverage'], 'reset-attempted')
         self.assertEqual(lk.record_state('b')[0], 'empty')
         self.take()
 
-    def test_a_device_that_does_not_come_back_fails_and_is_still_restored(self):
-        self.p.observed = dict(self.p.observed, status='failed', device='❌ not enumerated')
+    def test_a_failed_reset_fails_and_still_releases(self):
+        self.outcomes[RESET] = (1, 'done', 'Info: x\nError: No STM32 target found!\n')
         row = self.check()
-        self.assertEqual((row['status'], row['device'], row['cleanup']['result']), ('failed', '❌ not enumerated', 'verified'))
-        self.assertEqual(row['verification'], {'result': 'unverified', 'reasons': ['failed']})
-        self.take()
-
-    def test_a_failed_flash_is_flash_failed_and_still_runs_the_final_state(self):
-        self.outcomes['light.bin'] = (1, 'done', 'Info: x\nError: no target\n')
-        row = self.check()
-        self.assertEqual((row['status'], row['note'][-1]), ('flash-failed', 'flash: Error: no target'))
-        self.assertEqual(self.ran, ['light.bin', 'park.bin'])
-        self.assertNotIn('observe', self.p.calls)
+        self.assertEqual((row['status'], row['note'][-1]), ('failed', 'reset rc=1: Error: No STM32 target found!'))
         self.assertEqual(row['operations'][0]['attempts'][0]['returncode'], 1)
+        self.assertEqual(row['cleanup']['result'], 'released')
+        self.take()
 
-    def test_a_raised_flash_keeps_its_operation_on_the_row(self):
-        self.outcomes['light.bin'] = OSError(2, 'No such file or directory', 'lm4flash')
+    def test_a_raised_reset_keeps_its_operation_on_the_row(self):
+        self.outcomes[RESET] = OSError(2, 'No such file or directory', 'STM32_Programmer_CLI')
         row = self.check()
-        self.assertEqual(row['status'], 'flash-failed')
-        self.assertTrue(row['note'][-1].startswith('flash: FileNotFoundError'), row['note'])
+        self.assertEqual(row['status'], 'failed')
+        self.assertTrue(row['note'][-1].startswith('reset: FileNotFoundError'), row['note'])
         self.assertEqual(row['operations'][0]['attempts'][0]['kind'], 'error')
-        self.assertEqual(row['cleanup']['result'], 'verified')
+        self.assertEqual(row['cleanup']['result'], 'released')
 
-    def test_a_flash_that_raised_before_running_anything_still_gets_its_final_state(self):
-        # it may have changed the board in process (a serial write, a library call)
-        def boom(ctx, board, plan):
+    def test_a_reset_whose_transcript_shows_no_target_fails_with_its_operation(self):
+        # rc 0 without the target's answer: the profile raises, carrying the operation
+        def reset(ctx, board):
+            op = hf.reset_stlink(board['flasher'], timeout=5, run=ctx.run)
+            e = RuntimeError('no target answered')
+            e.operation = op
+            raise e
+        self.p.reset = reset
+        row = self.check()
+        self.assertEqual((row['status'], row['note'][-1]), ('failed', "reset: RuntimeError('no target answered')"))
+        self.assertEqual(len(row['operations']), 1)
+        self.take()
+
+    def test_a_reset_that_raised_before_running_anything_fails_and_releases(self):
+        def boom(ctx, board):
             raise RuntimeError('no serial device for the probe')
-        self.p.flash = boom
+        self.p.reset = boom
         row = self.check()
-        self.assertEqual((row['status'], row['cleanup']['result'], self.ran), ('flash-failed', 'verified', ['park.bin']))
+        self.assertEqual((row['status'], row['operations'], row['cleanup']['result']), ('failed', [], 'released'))
         self.take()
 
-    def test_only_an_observation_before_any_mutation_leaves_the_board_untouched(self):
-        def boom(ctx, board, plan):
-            raise RuntimeError('serial port gone')
-        self.p.observe_before = boom
+    def test_a_probe_without_a_reset_only_mode_is_unsupported(self):
+        self.p.reset = lambda ctx, board: None
         row = self.check()
-        self.assertEqual((row['status'], row['cleanup']['result'], self.ran), ('failed', 'untouched', []))
-        self.assertNotIn('flash', self.p.calls)
+        doc = self.doc(row)
+        self.assertEqual((row['status'], row['note'], self.ran), ('unsupported', ['the probe has no reset-only mode'], []))
+        self.assertEqual((doc['rows'][0]['coverage'], eng.exit_status(doc)), ('unsupported', 0))
         self.take()
 
-    def test_the_final_states_operations_are_kept_on_the_row(self):
-        row = self.check()
-        self.assertEqual([(o['step'], o['attempts'][0]['cmd'].rsplit('/', 1)[-1]) for o in row['operations']],
-                         [('flash', 'light.bin'), ('final', 'park.bin')])
-
-    def test_a_failed_final_state_keeps_its_operation(self):
-        self.outcomes['park.bin'] = OSError(5, 'Input/output error')
-        row = self.check()
-        self.assertEqual((row['status'], row['cleanup']['result']), ('blocked', 'error'))
-        self.assertEqual([o['step'] for o in row['operations']], ['flash', 'final'])
-        self.assertEqual(row['operations'][1]['attempts'][0]['kind'], 'error')
-
-    def test_a_missing_final_image_fails_before_the_lock(self):
-        (self.d / 'park.bin').unlink()
-        row = self.check()
-        self.assertEqual((row['status'], self.ran), ('flash-failed', []))
-        self.assertIn('image missing', row['note'][-1])
-        self.assertFalse(self.locks.exists())
-
-    def test_a_plan_refusal_touches_nothing(self):
-        # tinyusb: no light image, an RTT host board, a board only its runner can hold (openocd_esp)
-        self.p.refused = {'status': 'flash-failed', 'notes': ['only hil_test.py keeps an openocd_esp session']}
-        row = self.check()
-        self.assertEqual((row['status'], row['note'], self.ran), ('flash-failed', self.p.refused['notes'], []))
-        self.assertFalse(self.locks.exists())
-
-    def test_a_malformed_plan_is_the_boards_own_error_row(self):
-        self.p.plan = lambda *a: {'image': {'path': 'x'}}
-        row = self.check()
-        self.assertEqual((row['status'], row['device'], self.ran), ('failed', '❌ error', []))
-        self.assertIn('ValueError', row['note'][0])
+    def test_a_malformed_reset_result_fails(self):
+        def ran_then_none(ctx, board):
+            hf.reset_stlink(board['flasher'], timeout=5, run=ctx.run)
+        for reset in (lambda ctx, board: 'done', ran_then_none):
+            self.p.reset = reset
+            row = self.check()
+            self.assertEqual(row['status'], 'failed')
+            self.assertIn('ValueError', row['note'][-1])
+        self.take()
 
     def test_a_board_without_a_name_is_its_own_error_row(self):
-        row = self.check({'uid': 'U'})
+        row = self.check({'flasher': BOARD['flasher']})
         self.assertEqual((row['name'], row['status']), ('?', 'failed'))
         self.assertIn('KeyError', row['note'][0])
+        self.assertEqual(self.doc(row)['rows'][0]['coverage'], 'reset-not-attempted')
 
-    # --- probe matching, images, provenance ---------------------------------------------------
-    def test_an_ambiguous_probe_reports_its_candidates_and_picks_none(self):
+    # --- probe matching -------------------------------------------------------------------------
+    def test_an_ambiguous_probe_lists_its_locations_and_picks_none(self):
         self.p.candidates = ['1-1', '1-2']
-        for scan in (False, True):
-            self.args.scan_only = scan
-            row = self.check()
-            self.assertEqual((row['status'], row['probe'], row['probe_busport']), ('flash-failed', '⚠ ambiguous', None))
-            self.assertIn('1-1, 1-2', row['note'][0])
-        self.assertEqual(self.ran, [])
+        row = self.check()
+        self.assertEqual((row['status'], row['probe'], row['location']), ('failed', '⚠ stlink', '1-1, 1-2'))
+        self.assertIn('ambiguous', row['note'][0])
+        self.assertEqual((self.ran, self.p.records), ([], []))
+        self.assertFalse(self.locks.exists())
+        self.assertEqual(self.doc(row)['rows'][0]['coverage'], 'reset-not-attempted')
 
-    def test_a_missing_probe_is_flash_failed(self):
+    def test_a_missing_probe_fails_before_the_lock(self):
         self.p.candidates = []
         row = self.check()
-        self.assertEqual((row['status'], row['probe'], self.ran), ('flash-failed', '❌ missing', []))
-
-    def test_the_image_carries_its_digest_and_local_provenance(self):
-        row = self.check()
-        want = hashlib.sha256(b'light.bin').hexdigest()
-        self.assertEqual(row['image'], {'variant': 'b', 'label': 'light', 'path': str(self.d / 'light.bin'),
-                                        'digest': want, 'provenance': LOCAL})
-        self.assertEqual(row['cleanup']['image']['digest'], hashlib.sha256(b'park.bin').hexdigest())
-
-    def test_missing_provenance_is_explicit_and_none_is_refused(self):
-        self.p.provenance = {'kind': 'missing', 'reason': 'built from a dirty tree'}
-        self.assertEqual(self.check()['image']['provenance']['kind'], 'missing')
-        for bad in (None, {'kind': 'ci', 'repo': 'o/r'}, {'kind': 'guess'}):
-            self.p.provenance = bad
-            row = self.check()
-            self.assertEqual(row['device'], '❌ error', bad)
-        self.assertEqual(self.ran.count('light.bin'), 1)
-
-    def test_scan_only_takes_no_lock_and_flashes_nothing(self):
-        self.args.scan_only = True
-        row = self.check()
-        self.assertEqual((row['status'], row['device'], row['note']), ('ok', '⚫ off bus (parked?)', ['scanned']))
-        self.assertEqual((self.ran, self.p.calls), ([], ['scan']))
+        self.assertEqual((row['status'], row['probe'], row['location'], self.ran), ('failed', '❌ stlink', '–', []))
         self.assertFalse(self.locks.exists())
 
-    # --- verification and cleanup ---------------------------------------------------------------
-    def test_verification_and_cleanup_are_reported_apart(self):
-        self.p.final = {'verified': False, 'evidence': ['device still enumerated'], 'notes': ['park unverified']}
+    def test_a_probe_name_that_is_not_a_string_is_the_boards_own_error(self):
+        self.p.probe_name = lambda board: None
         row = self.check()
-        self.assertEqual((row['status'], row['check_status']), ('blocked', 'ok'))
-        self.assertEqual(row['verification'], {'result': 'verified', 'reasons': []})
-        self.assertEqual((row['cleanup']['result'], row['cleanup']['evidence']), ('unverified', ['device still enumerated']))
-        self.p.final = {'verified': True, 'evidence': ['parked'], 'notes': []}
-        self.p.observed = dict(self.p.observed, unverified=['cafe:4001 before the flash too: new image unverified'])
-        lk.release_board_lock(lk.flock_nb('b'))   # the test's own stand-in for the recovery
-        row = self.check()
-        self.assertEqual((row['status'], row['verification']['result'], row['cleanup']['result']),
-                         ('ok', 'unverified', 'verified'))
+        self.assertEqual((row['status'], self.ran), ('failed', []))
+        self.assertIn('ValueError', row['note'][0])
 
-    def test_a_failed_cleanup_keeps_the_protected_record_as_a_blocker(self):
-        self.p.final = RuntimeError('park flash failed')
+    # --- processes not proven ended -------------------------------------------------------------
+    def test_a_reset_not_proven_ended_keeps_the_protected_record(self):
+        self.outcomes[RESET] = (0, 'unknown', 'ok')
         row = self.check()
-        self.assertEqual((row['status'], row['cleanup']['result'], row['cleanup']['blocker']),
-                         ('blocked', 'error', 'stale-record'))
+        self.assertEqual((row['status'], row['check_status'], row['cleanup']['result'], row['cleanup']['blocker']),
+                         ('blocked', 'ok', 'unresolved', 'stale-record'))
+        self.assertEqual(row['cleanup']['receipts'], [{'token': RESET, 'lock': '/nonexistent'}])
+        self.assertEqual(self.doc(row)['rows'][0]['coverage'], 'blocked-after')
         rec = lk.read_record('b')
         self.assertEqual((rec['reason'], rec['protected']), ('farm_check', True))
         with self.assertRaises(lk.RecoveryBlocked):
             self.take()
 
-    def test_a_flash_not_proven_ended_skips_the_final_state(self):
-        self.outcomes['light.bin'] = (0, 'unknown', 'ok')
-        row = self.check()
-        self.assertEqual(self.ran, ['light.bin'])
-        self.assertNotIn('final', self.p.calls)
-        self.assertEqual((row['status'], row['cleanup']['result'], row['cleanup']['blocker']),
-                         ('blocked', 'not-run', 'stale-record'))
-        self.assertEqual(row['cleanup']['receipts'], [{'token': 'light.bin', 'lock': '/nonexistent'}])
-
-    def test_a_flash_not_proven_ended_runs_no_observation(self):
-        self.outcomes['light.bin'] = (0, 'unknown', 'ok')
-
-        def observe(ctx, board, plan, before):
-            self.p.calls.append('observe')
-            hf.reset_stlink({'uid': 'P'}, timeout=5, run=ctx.run)
-            return dict(self.p.observed)
-        self.p.observe = observe
-        row = self.check()
-        self.assertEqual(self.ran, ['light.bin'])
-        self.assertNotIn('observe', self.p.calls)
-        self.assertEqual((row['status'], row['verification']['reasons']), ('blocked', ['flash not proven ended']))
-        self.assertTrue(any(n.startswith('observation not run') for n in row['note']), row['note'])
-
-    def test_an_observation_not_proven_ended_enters_no_flash(self):
-        def observe_before(ctx, board, plan):
-            hf.reset_stlink({'uid': 'P'}, timeout=5, run=ctx.run)
-        self.p.observe_before = observe_before
-        self.outcomes['STM32_Programmer_CLI --connect port=swd sn=P --rst --go'] = (0, 'unknown', '')
-        row = self.check()
-        self.assertNotIn('flash', self.p.calls)
-        self.assertEqual(len(self.ran), 1)
-        self.assertEqual((row['status'], row['cleanup']['result']), ('blocked', 'not-run'))
-        self.assertTrue(any(n.startswith('flash not run') for n in row['note']), row['note'])
-
-    def test_a_command_not_proven_ended_stops_the_next_one_in_the_final_state(self):
-        self.p.final_extra = ['verify.bin']
-        self.outcomes['park.bin'] = (0, 'unknown', 'ok')
-        row = self.check()
-        self.assertEqual(self.ran, ['light.bin', 'park.bin'])
-        self.assertEqual((row['status'], row['cleanup']['result']), ('blocked', 'error'))
-        self.assertIn('Outstanding', row['cleanup']['evidence'][0])
-        self.assertEqual(row['cleanup']['receipts'], [{'token': 'park.bin', 'lock': '/nonexistent'}])
-
-    def test_a_flash_proven_ended_on_recheck_lets_the_final_state_run(self):
-        self.outcomes['light.bin'] = (0, 'pending', 'ok')
-        self.rechecks['light.bin'] = 'done'
-        row = self.check()
-        self.assertEqual((row['status'], self.ran), ('ok', ['light.bin', 'park.bin']))
+    def test_a_reset_proven_ended_on_recheck_releases(self):
+        self.outcomes[RESET] = (0, 'pending', 'ok')
+        self.rechecks[RESET] = 'done'
+        self.assertEqual(self.check()['status'], 'ok')
         self.take()
 
+    def test_a_command_not_proven_ended_stops_the_next_one(self):
+        second = 'STM32_Programmer_CLI --connect port=swd sn=Q --rst --go'
+
+        def reset(ctx, board):
+            hf.reset_stlink(board['flasher'], timeout=5, run=ctx.run)
+            return hf.reset_stlink(dict(board['flasher'], uid='Q'), timeout=5, run=ctx.run)
+        self.p.reset = reset
+        self.outcomes[RESET] = (0, 'unknown', 'ok')
+        row = self.check()
+        self.assertEqual(self.ran, [RESET])
+        self.assertNotIn(second, self.ran)
+        self.assertEqual((row['status'], row['check_status']), ('blocked', 'failed'))
+        self.assertTrue(any('Outstanding' in n for n in row['note']), row['note'])
+
     # --- incoming locks -------------------------------------------------------------------------
-    def test_a_held_board_is_locked_never_waited_on(self):
+    def test_a_held_board_is_locked_never_waited_on_and_keeps_its_probe(self):
         self.hold()
         t = time.monotonic()
         row = self.check()
         self.assertLess(time.monotonic() - t, 2)
-        self.assertEqual((row['status'], row['flash'], self.ran), ('locked', '🔒 locked', []))
+        self.assertEqual((row['status'], row['probe'], row['location'], self.ran), ('locked', '✅ stlink', '1-1', []))
         self.assertIn('hil_test.py', row['note'][-1])
+        self.assertEqual(self.doc(row)['rows'][0]['coverage'], 'skipped-locked')
 
     def test_no_bypass(self):
         self.hold()
@@ -398,29 +289,22 @@ class Engine(unittest.TestCase):
             self.assertEqual(self.check()['status'], 'locked')
         self.assertEqual(self.ran, [])
 
-    def test_a_stale_protected_record_is_blocked_before_any_mutation(self):
+    def test_a_stale_protected_record_is_blocked_before_the_reset(self):
         self.stale(protected=True)
         row = self.check()
-        self.assertEqual((row['status'], row['flash'], self.ran), ('blocked', '⛔ blocked', []))
-        doc = eng.farm_document('rig', 'r.json', 'full', [row], {}, 0)
+        self.assertEqual((row['status'], self.ran), ('blocked', []))
+        doc = self.doc(row)
         self.assertEqual((doc['rows'][0]['coverage'], eng.exit_status(doc)), ('blocked-before', 4))
 
     def test_a_live_cleanup_holder_is_blocked_not_locked(self):
         self.hold('hil_reserve', role=lk.CLEANUP_ROLE)
         self.assertEqual(self.check()['status'], 'blocked')
 
-    def test_the_legacy_reason_stays_protected_and_its_stale_record_does_not_block(self):
-        self.assertTrue(lk.is_protected({'reason': 'pool_check'}))
-        fh = self.hold('pool_check')
-        self.assertEqual(self.check()['status'], 'locked')
-        fh.close()   # an old pool check that died: unmarked, its record is no blocker
-        self.assertEqual(self.check()['status'], 'ok')
-
     def test_an_unusable_lock_is_an_error_not_a_holder(self):
         self.locks.mkdir()
         os.mkdir(self.locks / 'b.lock')
         row = self.check()
-        self.assertEqual((row['status'], row['flash']), ('failed', '❌ lock'))
+        self.assertEqual((row['status'], self.ran), ('failed', []))
         self.assertIn('unavailable', row['note'][-1])
 
     # --- the profile's seams on ctx -------------------------------------------------------------
@@ -430,13 +314,13 @@ class Engine(unittest.TestCase):
             r.cleanup, r.receipt = 'done', None
             return r
         patch(self, eng.hil_process, 'run_tracked', tracked)
-        ctx = eng.Context(dict(BOARD), self.args, str(self.state), eng.new_row('b'))
-        ctx.run([Path('/opt/flash'), '-v'], timeout=5)
-        self.assertEqual(ctx.ledger, [{'cmd': '/opt/flash -v', 'cleanup': 'done', 'receipt': None}])
+        ctx = eng.Context(self.args, str(self.state))
+        ctx.run([Path('/opt/reset'), '-v'], timeout=5)
+        self.assertEqual(ctx.ledger, [{'cmd': '/opt/reset -v', 'cleanup': 'done', 'receipt': None}])
 
-    def test_settle_waits_only_while_a_receipt_can_still_answer(self):
+    def test_the_recheck_waits_only_while_a_receipt_can_still_answer(self):
         patch(self, eng, 'RECHECK_WAIT', 5)
-        ctx = eng.Context(dict(BOARD), self.args, str(self.state), eng.new_row('b'))
+        ctx = eng.Context(self.args, str(self.state))
         ctx.ledger.append({'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None})
         t = time.monotonic()
         self.assertEqual(ctx.open_runs(), [{'cmd': 'lost', 'cleanup': 'unknown', 'receipt': None}],
@@ -450,8 +334,8 @@ class Engine(unittest.TestCase):
         patch(self, eng, 'RECHECK_WAIT', 5)
         patch(self, eng.hil_process, 'recheck', lambda r: answers.pop(0) if answers else 'pending')
         patch(self, eng.hil_process, 'tidy', lambda r: None)
-        ctx = eng.Context(dict(BOARD), self.args, str(self.state), eng.new_row('b'))
-        ctx.ledger.append({'cmd': 'flash', 'cleanup': 'pending', 'receipt': 'r1'})
+        ctx = eng.Context(self.args, str(self.state))
+        ctx.ledger.append({'cmd': 'reset', 'cleanup': 'pending', 'receipt': 'r1'})
         ctx.open_runs()
         self.assertEqual(ctx.recheck_by, 105.0, 'the first open run starts the one wait')
         self.assertAlmostEqual(clock[0], 105.0, delta=0.15)
@@ -463,81 +347,11 @@ class Engine(unittest.TestCase):
         self.assertEqual(ctx.open_runs(), [])
         self.assertEqual((ctx.ledger[0]['cleanup'], ctx.ledger[0]['receipt']), ('done', None), 'a late answer still counts')
 
-    def test_settle_holds_in_process_board_io_until_every_run_is_proven_ended(self):
-        reset = 'STM32_Programmer_CLI --connect port=swd sn=P --rst --go'
-        def no_holder(*a, **kw):
-            raise lk.LockUnavailable('no holder in this test')
-        patch(self, lk, 'hand_to_cleanup_holder', no_holder)
-        for cleanup in ('pending', 'unknown', 'done'):
-            with self.subTest(cleanup=cleanup):
-                io = []
-
-                def observe(ctx, board, plan, before):
-                    ctx.record(hf.reset_stlink({'uid': 'P'}, timeout=5, run=ctx.run))
-                    ctx.settle()
-                    io.append('uart opened')
-                    return dict(self.p.observed)
-                self.p.observe = observe
-                self.outcomes[reset] = (0, cleanup, '')
-                self.rechecks[reset] = cleanup
-                row = self.check()
-                self.assertEqual([o['step'] for o in row['operations']][:2], ['flash', 'observe'])
-                if cleanup == 'done':
-                    self.assertEqual((io, row['status']), (['uart opened'], 'ok'))
-                    continue
-                self.assertEqual((io, row['status'], row['cleanup']['result']), ([], 'blocked', 'not-run'))
-                self.assertTrue(any('Outstanding' in n for n in row['note']), row['note'])
-                lk.release_board_lock(lk.flock_nb('b'))   # the test's own stand-in for the recovery
-
-    def test_a_recorded_operation_survives_a_later_failure_and_is_kept_once(self):
-        for failure in (RuntimeError('serial port gone'), KeyboardInterrupt(), None):
-            with self.subTest(failure=type(failure).__name__):
-                def final_state(ctx, board, plan, observation):
-                    op = hf.flash_lm4flash(board['flasher'], plan['final']['image']['path'], timeout=5, run=ctx.run)
-                    ctx.record(op)
-                    if failure is not None:
-                        raise failure
-                    return {'verified': True, 'evidence': [], 'notes': [], 'operations': [op]}
-                self.p.final_state = final_state
-                row = self.check()
-                self.assertEqual([o['step'] for o in row['operations']], ['flash', 'final'])
-                self.assertEqual(row['cleanup']['result'], {'RuntimeError': 'error', 'KeyboardInterrupt': 'interrupted',
-                                                            'NoneType': 'verified'}[type(failure).__name__])
-                if failure is not None:
-                    lk.release_board_lock(lk.flock_nb('b'))
-
-    def test_flash_error_line_is_reachable_from_ctx(self):
-        seen = []
-
-        def flash(ctx, board, plan):
-            seen.append(ctx.flash_error_line('Info: connecting\nError: no target\nbye\n'))
-            return hf.flash_lm4flash(board['flasher'], plan['image']['path'], timeout=5, run=ctx.run)
-        self.p.flash = flash
-        self.check()
-        self.assertEqual(seen, ['Error: no target'])
-
-    def test_extra_plan_keys_are_the_profiles_own_data(self):
-        plan, seen = self.p.plan, []
-
-        def with_extras(*a):
-            out = plan(*a)
-            out['kind'] = 'host'
-            out['image']['sidecars'] = ['config.env']
-            return out
-        self.p.plan = with_extras
-
-        def flash(ctx, board, plan):
-            seen.append((plan['kind'], plan['image']['sidecars']))
-            return hf.flash_lm4flash(board['flasher'], plan['image']['path'], timeout=5, run=ctx.run)
-        self.p.flash = flash
-        self.assertEqual(self.check()['status'], 'ok')
-        self.assertEqual(seen, [('host', ['config.env'])])
-
     # --- handing a survivor's board to a cleanup holder -----------------------------------------
     def handoff(self, argv=None, popen=None):
-        """A flash that leaves a survivor (`pending`) with the holder's start replaced."""
-        self.outcomes['light.bin'] = (0, 'pending', 'ok')
-        self.rechecks['light.bin'] = 'pending'
+        """A reset that leaves a survivor (`pending`) with the holder's start replaced."""
+        self.outcomes[RESET] = (0, 'pending', 'ok')
+        self.rechecks[RESET] = 'pending'
         patch(self, eng, 'HOLDER_READY', 1)
         if argv is not None:
             patch(self, lk, '_holder_argv', lambda job: argv(job))
@@ -546,11 +360,10 @@ class Engine(unittest.TestCase):
         t = time.monotonic()
         row = self.check()
         self.assertLess(time.monotonic() - t, 8, 'every wait of the handoff is bounded')
-        doc = eng.farm_document('rig', 'r.json', 'full', [row], {}, 0)
+        doc = self.doc(row)
         self.assertEqual((row['status'], row['coverage'], row['check_status'], eng.exit_status(doc)),
-                         ('blocked', 'blocked-after', 'failed', 4))
-        self.assertEqual(row['cleanup']['receipts'], [{'token': 'light.bin', 'lock': '/nonexistent'}])
-        self.assertNotIn('final', self.p.calls)
+                         ('blocked', 'blocked-after', 'ok', 4))
+        self.assertEqual(row['cleanup']['receipts'], [{'token': RESET, 'lock': '/nonexistent'}])
         with self.assertRaises(lk.BoardLocked):   # RecoveryBlocked, or the holder's live flock
             self.take()
         return row
@@ -627,7 +440,7 @@ class Engine(unittest.TestCase):
         self.assertNotIn('role', lk.read_record('b'))
 
     def test_an_interrupt_during_finalization_keeps_the_blocked_row_and_stops_the_farm(self):
-        self.p.final = {'verified': False, 'evidence': ['still enumerated'], 'notes': []}
+        self.outcomes[RESET] = (0, 'unknown', 'ok')
         self.p.boards = [dict(BOARD), dict(BOARD, name='c')]
         real = lk.write_record
 
@@ -637,7 +450,7 @@ class Engine(unittest.TestCase):
             return real(fh, reason, **extra)
         patch(self, eng.hil_lock, 'write_record', write_record)
         rows, aborted = eng.check_farm(self.p, self.p.boards, self.args, state_dir=str(self.state))
-        doc = eng.farm_document('rig', 'r.json', 'full', rows, {}, 0)
+        doc = eng.farm_document('rig', 'r.json', rows, {}, 0)
         self.assertEqual((aborted, [r['name'] for r in rows], eng.exit_status(doc, aborted)), (True, ['b'], 4))
         self.assertEqual((rows[0]['status'], rows[0]['cleanup']['blocker'], rows[0]['interrupted']),
                          ('blocked', 'stale-record', True))
@@ -649,35 +462,39 @@ class Engine(unittest.TestCase):
         real, calls = eng._end_reservation, []
 
         def end(*a):
-            calls.append(a[-1]['result'])
+            calls.append(1)
             if len(calls) == 1:
                 raise KeyboardInterrupt     # before its own interrupt hold is in place
             return real(*a)
         patch(self, eng, '_end_reservation', end)
         return calls
 
+    def test_a_reset_that_exits_the_process_still_finalizes(self):
+        def reset(ctx, board):
+            hf.reset_stlink(board['flasher'], timeout=5, run=ctx.run)
+            raise SystemExit(3)
+        self.p.reset = reset
+        with self.assertRaises(SystemExit):
+            self.check()
+        self.take()
+
     def test_an_interrupt_before_finalization_finalizes_from_the_same_ledger(self):
         calls = self.interrupt_before_finalization()
         row = self.check()
-        self.assertEqual(calls, ['verified', 'interrupted'])
-        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['blocker']), ('blocked', True, 'stale-record'))
-        with self.assertRaises(lk.RecoveryBlocked):
-            self.take()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((row['status'], row['interrupted'], row['cleanup']['result']), ('ok', True, 'released'))
+        self.take()
 
-    def test_an_interrupt_before_finalization_keeps_a_pending_observations_receipt(self):
-        def observe_before(ctx, board, plan):    # its run survives; it returns no operation
-            ctx.run('observe-probe', timeout=5)
-        self.p.observe_before = observe_before
-        self.outcomes['observe-probe'] = (0, 'pending', '')
-        self.rechecks['observe-probe'] = 'pending'
+    def test_an_interrupt_before_finalization_keeps_a_pending_resets_receipt(self):
+        self.outcomes[RESET] = (0, 'pending', '')
+        self.rechecks[RESET] = 'pending'
         patch(self, eng, 'HOLDER_READY', 2)
         self.interrupt_before_finalization()
         row = self.check()
-        receipt = {'token': 'observe-probe', 'lock': '/nonexistent'}
+        receipt = {'token': RESET, 'lock': '/nonexistent'}
         rec = lk.read_record('b')
         if isinstance(rec, dict) and isinstance(rec.get('pid'), int) and rec['pid'] != os.getpid():
             self.addCleanup(Process.kill, rec['pid'])
-        self.assertNotIn('flash', self.p.calls)
         self.assertEqual((row['status'], row['interrupted'], row['cleanup']['receipts'], row['cleanup']['blocker']),
                          ('blocked', True, [receipt], 'cleanup-holder'))
         self.assertEqual((rec['receipts'], rec['token']), ([receipt], row['cleanup']['token']))
@@ -693,7 +510,7 @@ class Engine(unittest.TestCase):
             return fh
         patch(self, eng.hil_lock, 'take_board_lock', take)
         row = self.check()
-        doc = eng.farm_document('rig', 'r.json', 'full', [row], {}, 0)
+        doc = self.doc(row)
         self.assertEqual((row['status'], row['check_status'], row['cleanup']['result'], row['cleanup']['released'],
                           eng.exit_status(doc)), ('blocked', 'ok', 'release-failed', False, 4))
         self.assertIn('the record could not be cleared', row['cleanup']['evidence'])
@@ -714,60 +531,59 @@ class Engine(unittest.TestCase):
         with mock.patch.object(lk.signal, 'pidfd_send_signal', lambda fd, sig: signals.append(sig)):
             # its receipt cannot be rechecked: unknown, refused up front naming it and the holder
             with self.assertRaisesRegex(lk.ReleaseRefused, rf"not signalled: holder pid {rec['pid']} .* "
-                                        r'not proven ended: receipt light\.bin \(supervisor pid None\) unknown'):
+                                        r'not proven ended: receipt STM32_Programmer_CLI .* unknown'):
                 lk.release_token(rec['token'])
         self.assertEqual(signals, [])
 
     # --- interruption ---------------------------------------------------------------------------
-    def test_an_interrupted_flash_still_restores_and_stops_the_farm(self):
-        self.outcomes['light.bin'] = KeyboardInterrupt()
+    def test_an_interrupted_reset_proven_ended_releases_and_stops_the_farm(self):
+        self.outcomes[RESET] = KeyboardInterrupt()
         self.p.boards = [dict(BOARD), dict(BOARD, name='c')]
         rows, aborted = eng.check_farm(self.p, self.p.boards, self.args, state_dir=str(self.state))
         self.assertTrue(aborted)
         self.assertEqual([r['name'] for r in rows], ['b'])
-        self.assertEqual((rows[0]['status'], rows[0]['cleanup']['result'], self.ran),
-                         ('failed', 'verified', ['light.bin', 'park.bin']))
+        self.assertEqual((rows[0]['status'], rows[0]['cleanup']['result']), ('failed', 'released'))
         self.assertEqual(rows[0]['operations'][0]['attempts'][0]['kind'], 'interrupted')
         self.take()
 
 
 def row(name, status, **kw):
-    return eng.new_row(name, probe='✅ 1-1', probe_busport='1-1', status=status, **kw)
+    return eng.new_row(name, probe='✅ stlink', location='1-1', status=status, **kw)
 
 
 class Document(unittest.TestCase):
     def test_coverage_says_what_each_status_covers(self):
-        rows = [row('a', 'ok'), row('b', 'locked'), row('c', 'failed'), row('d', 'blocked'),
-                row('e', 'blocked', check_status='ok')]
-        doc = eng.farm_document('ci', 'tinyusb.json', 'full', rows, {'path': 'p', 'digest': 'd'}, 1.23)
+        entered = {'result': 'released'}
+        rows = [row('a', 'ok', cleanup=entered), row('b', 'locked'), row('c', 'failed'),
+                row('c2', 'failed', cleanup=entered), row('u', 'unsupported', cleanup=entered), row('d', 'blocked'),
+                row('e', 'blocked', check_status='ok', cleanup={'result': 'unresolved'})]
+        doc = eng.farm_document('ci', 'tinyusb.json', rows, {'path': 'p', 'digest': 'd'}, 1.23)
         self.assertEqual([r['coverage'] for r in doc['rows']],
-                         ['full-attempted', 'skipped-locked', 'full-attempted', 'blocked-before', 'blocked-after'])
-        self.assertEqual(doc['counts'], {'ok': 1, 'flash-failed': 0, 'failed': 1, 'locked': 1, 'blocked': 2})
-        self.assertEqual((doc['schema_version'], doc['check'], doc['host'], doc['config'], doc['mode'], doc['elapsed_s']),
-                         (1, 'farm-check', 'ci', 'tinyusb.json', 'full', 1.2))
-
-    def test_every_scan_only_row_is_probe_only(self):
-        doc = eng.farm_document('ci', 'x.json', 'scan-only', [row('a', 'ok'), row('b', 'flash-failed')], {}, 0)
-        self.assertEqual({r['coverage'] for r in doc['rows']}, {'probe-only'})
+                         ['reset-attempted', 'skipped-locked', 'reset-not-attempted', 'reset-attempted', 'unsupported',
+                          'blocked-before', 'blocked-after'])
+        self.assertEqual(doc['counts'], {'ok': 1, 'failed': 2, 'unsupported': 1, 'locked': 1, 'blocked': 2})
+        self.assertEqual((doc['schema_version'], doc['check'], doc['host'], doc['config'], doc['elapsed_s']),
+                         (2, 'farm-check', 'ci', 'tinyusb.json', 1.2))
 
     def test_exit_status(self):
         def code(*statuses, aborted=False):
-            return eng.exit_status(eng.farm_document('h', 'c', 'full', [row(s, s) for s in statuses], {}, 0), aborted)
-        self.assertEqual(code('ok', 'locked'), 0)
+            return eng.exit_status(eng.farm_document('h', 'c', [row(s, s) for s in statuses], {}, 0), aborted)
+        self.assertEqual(code('ok', 'locked', 'unsupported'), 0)
         self.assertEqual(code(), 0)
-        self.assertEqual(code('ok', 'flash-failed'), 1)
         self.assertEqual(code('ok', 'failed'), 1)
         self.assertEqual(code('ok', aborted=True), 1)
         self.assertEqual(code('failed', 'blocked'), 4)
 
     def test_the_table_is_a_rendering_of_the_document(self):
-        doc = eng.farm_document('ci', 'x.json', 'full', [row('a', 'locked', note=['held']), row('b', 'blocked')], {}, 0)
+        doc = eng.farm_document('ci', 'x.json', [row('a', 'locked', note=['held']), row('b', 'blocked'),
+                                                 row('c', 'unsupported')], {}, 0)
         lines = eng.render_table(doc).splitlines()
-        self.assertTrue(lines[1].startswith('| Board'))
-        self.assertIn('🔒 locked', lines[3])
-        self.assertIn('held', lines[3])
+        self.assertEqual([c.strip() for c in lines[1].strip('|').split('|')],
+                         ['Board', 'Probe', 'Location', 'Reset/Status', 'Note'])
+        self.assertEqual([c.strip() for c in lines[3].strip('|').split('|')], ['a', '✅ stlink', '1-1', '🔒 locked', 'held'])
         self.assertIn('⛔ blocked', lines[4])
-        self.assertTrue(lines[-1].startswith('farm check: 0 ok · 0 flash-failed · 0 failed · 1 locked · 1 blocked'))
+        self.assertIn('➖ unsupported', lines[5])
+        self.assertTrue(lines[-1].startswith('farm check: 0 ok · 0 failed · 1 unsupported · 1 locked · 1 blocked'))
 
 
 class Main(unittest.TestCase):
@@ -810,7 +626,7 @@ class Main(unittest.TestCase):
             err.seek(0)
             return code, out.read().decode(), err.read().decode()
 
-    def noisy_board(self, profile, board, args, state_dir, prepared=None):
+    def noisy_board(self, profile, board, args, state_dir):
         print('python noise')
         os.write(1, b'child noise\n')
         return row(board['name'], 'failed')
@@ -865,40 +681,26 @@ class Main(unittest.TestCase):
         self.assertIsInstance(code, RuntimeError)
         self.assertEqual(out, 'after\n')
 
-    def test_the_default_output_is_the_table(self):
+    def test_the_default_output_is_the_table_and_the_state_dir_is_private(self):
         code, out, _ = self.run_main(self.cfg, check=lambda *a, **kw: row('b', 'ok'))
         self.assertEqual(code, 0)
         self.assertIn('| Board', out)
-        self.assertIn('farm check: 1 ok · 0 flash-failed', out)
-
-    def test_only_a_full_check_prepares(self):
-        self.run_main(self.cfg, '--scan-only', check=lambda *a, **kw: row('b', 'ok'))
-        self.assertEqual(self.p.calls, [])
-        self.assertFalse(self.state.exists(), 'a scan-only check needs no state dir')
-        self.run_main(self.cfg, check=lambda *a, **kw: row('b', 'ok'))
-        self.assertEqual(self.p.calls, ['prepare'])
+        self.assertIn('farm check: 1 ok · 0 failed · 0 unsupported', out)
         self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
 
     def test_an_unknown_host_without_a_roster_is_refused_before_anything(self):
         code, out, err = self.run_main('--json', host='elsewhere', check=lambda *a, **kw: self.fail('checked'))
-        self.assertEqual((code, out, self.p.calls), (2, 'after\n', []))
+        self.assertEqual((code, out), (2, 'after\n'))
         self.assertIn('no roster for host elsewhere', err)
         self.assertEqual(self.run_main(self.cfg, host='elsewhere', check=lambda *a, **kw: row('b', 'ok'))[0], 0)
 
     def test_refusals_before_any_board_exit_2(self):
-        cases = {'unknown board': ['-b', 'nope'], 'no-park unsupported': ['--no-park']}
-        for name, argv in cases.items():
-            code, _, err = self.run_main(self.cfg, *argv, check=lambda *a, **kw: self.fail('checked'))
-            self.assertEqual(code, 2, name)
-        self.assertEqual(self.run_main('--bogus')[0].code, 2)
-        self.p.observe = None
+        code, _, err = self.run_main(self.cfg, '-b', 'nope', check=lambda *a, **kw: self.fail('checked'))
+        self.assertEqual(code, 2)
+        for removed in ('--bogus', '--scan-only', '--no-park', '-B'):
+            self.assertEqual(self.run_main(self.cfg, removed)[0].code, 2, removed)
+        self.p.reset = None
         self.assertEqual(self.run_main(self.cfg)[0], 2)
-
-    def test_no_park_runs_when_the_profile_verifies_leave_running(self):
-        self.p.LEAVE_RUNNING = True
-        seen = []
-        self.run_main(self.cfg, '--no-park', check=lambda p, b, args, *a, **kw: seen.append(args.no_park) or row('b', 'ok'))
-        self.assertEqual(seen, [True])
 
     def test_named_boards_include_named_only_ones(self):
         seen = []
@@ -935,7 +737,7 @@ class Main(unittest.TestCase):
     def test_a_lock_module_without_the_farm_check_reason_is_refused(self):
         api = eng.LOCK_FUNCTIONS + eng.LOCK_EXCEPTIONS + ('CLEANUP_ROLE', 'PROTECTED_REASONS')
         old = types.SimpleNamespace(**{a: getattr(lk, a) for a in api})
-        old.PROTECTED_REASONS = {'hil_test.py', 'pool_check'}
+        old.PROTECTED_REASONS = {'hil_test.py'}
         code, _, err = self.run_main(self.cfg, lock_module=old, check=lambda *a, **kw: self.fail('checked'))
         self.assertEqual(code, 2)
         self.assertIn('farm_check', err)
@@ -1027,15 +829,12 @@ sys.exit(eng.main(prof, sys.argv[5:], state_dir=sys.argv[4], host='rig'))
 """
 
 PROFILE = """
-import importlib.util, json, os
+import importlib.util, os
 spec = importlib.util.spec_from_file_location('agentrc_hil_flash', os.environ['HIL_FLASH'])
 hf = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hf)
 D = os.environ['FARM_DIR']
-BOARD = {'name': 'farmb', 'flasher': {'name': 'lm4flash', 'uid': 'P', 'args': ''}}
-
-def image(name):
-    return {'path': os.path.join(D, name), 'variant': 'farmb', 'label': name, 'provenance': {'kind': 'local', 'receipt': 'r'}}
+BOARD = {'name': 'farmb', 'flasher': {'name': 'stlink', 'uid': 'P', 'args': ''}}
 
 def roster(host, config, args):
     return {'path': os.path.join(D, 'roster.json'), 'boards': [BOARD], 'named_only': []}
@@ -1043,41 +842,28 @@ def roster(host, config, args):
 def lock_name(board):
     return board['name']
 
+def probe_name(board):
+    return board['flasher']['name']
+
 def probe_candidates(board):
     return ['1-1']
 
-def scan_device(board):
-    return {'device': '-', 'notes': []}
-
-def plan(board, args, prepared, leave_running):
-    return {'image': image('light.bin'), 'final': {'postcondition': 'parked', 'image': image('park.bin')}, 'notes': []}
-
-def flash(ctx, board, plan):
-    return hf.flash_lm4flash(board['flasher'], plan['image']['path'], timeout=60, run=ctx.run)
-
-def observe(ctx, board, plan, before):
-    return {'status': 'ok', 'device': 'up', 'notes': [], 'unverified': [], 'evidence': []}
-
-def final_state(ctx, board, plan, observation):
-    op = hf.flash_lm4flash(board['flasher'], plan['final']['image']['path'], timeout=60, run=ctx.run)
-    return {'verified': op.returncode == 0 and os.environ.get('FARM_PARK') != 'unverified', 'evidence': [], 'notes': []}
+def reset(ctx, board):
+    return hf.reset_stlink(board['flasher'], timeout=60, run=ctx.run)
 """
 
-LM4FLASH = """#!/bin/sh
-case "$*" in
-  *light.bin*)
-    case "$FARM_MODE" in
-      slow) echo $$ > "$FARM_DIR/flashing"; exec sleep 60 ;;
-      survivor) setsid sleep 60 </dev/null >/dev/null 2>&1 & echo $! > "$FARM_DIR/survivor" ;;
-    esac ;;
+STM32_CLI = """#!/bin/sh
+case "$FARM_MODE" in
+  slow) echo $$ > "$FARM_DIR/resetting"; exec sleep 60 ;;
+  survivor) setsid sleep 60 </dev/null >/dev/null 2>&1 & echo $! > "$FARM_DIR/survivor" ;;
 esac
-echo flashed
+echo reset
 """
 
 
 class Process(unittest.TestCase):
     """The engine in its own interpreter: profile -> hil_flash -> ctx.run -> run_tracked, with
-    a fake lm4flash on PATH and real locks in a temp dir."""
+    a fake STM32_Programmer_CLI on PATH and real locks in a temp dir."""
 
     def setUp(self):
         td = tempfile.TemporaryDirectory()
@@ -1088,15 +874,13 @@ class Process(unittest.TestCase):
         self.state.mkdir(mode=0o700)
         self.addCleanup(self.quiesce)
         patch(self, lk, 'BOARD_LOCK_DIR', str(self.locks))
-        for name, text in (('lm4flash', LM4FLASH), ('farm_profile.py', PROFILE)):
+        for name, text in (('STM32_Programmer_CLI', STM32_CLI), ('farm_profile.py', PROFILE), ('roster.json', '{}')):
             (self.d / name).write_text(text)
-        (self.d / 'lm4flash').chmod(0o755)
-        for name in ('light.bin', 'park.bin', 'roster.json'):
-            (self.d / name).write_text(name)
+        (self.d / 'STM32_Programmer_CLI').chmod(0o755)
 
-    def start(self, mode='', park=''):
+    def start(self, mode=''):
         env = dict(os.environ, PATH=f'{self.d}{os.pathsep}{os.environ["PATH"]}', FARM_DIR=str(self.d),
-                   FARM_MODE=mode, FARM_PARK=park, HIL_FLASH=str(SCRIPTS / 'hil_flash.py'))
+                   FARM_MODE=mode, HIL_FLASH=str(SCRIPTS / 'hil_flash.py'))
         p = subprocess.Popen([sys.executable, '-c', LAUNCHER, str(SCRIPTS / 'hil_farm_check.py'), str(self.locks),
                               str(self.d / 'farm_profile.py'), str(self.state), '--json'],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
@@ -1144,29 +928,25 @@ class Process(unittest.TestCase):
         fh = lk.take_board_lock('farmb', 'test')
         lk.release_board_lock(fh)
 
-    def interrupt(self, park):
-        p = self.start('slow', park)
-        self.wait_for('flashing')
-        os.kill(p.pid, signal.SIGINT)
-        return self.finish(p)
+    def test_a_real_reset_is_ok_and_released(self):
+        code, r, doc = self.finish(self.start())
+        self.assertEqual((code, r['status'], r['location'], r['cleanup']['result'], doc['_hil']['termination']),
+                         (0, 'ok', '1-1', 'released', 'completed'))
+        self.take()
 
-    def test_a_handled_interruption_with_a_verified_cleanup_releases(self):
-        code, r, doc = self.interrupt('')
+    def test_a_handled_interruption_ends_the_reset_and_releases(self):
+        p = self.start('slow')
+        self.wait_for('resetting')
+        os.kill(p.pid, signal.SIGINT)
+        code, r, doc = self.finish(p)
         self.assertEqual((code, r['status'], r['cleanup']['result'], doc['_hil']['termination']),
-                         (1, 'failed', 'verified', 'aborted'))
+                         (1, 'failed', 'released', 'aborted'))
         self.assertEqual(r['operations'][0]['attempts'][0]['kind'], 'interrupted')
         self.take()
 
-    def test_a_handled_interruption_with_an_unresolved_cleanup_keeps_the_blocker(self):
-        code, r, _ = self.interrupt('unverified')
-        self.assertEqual((code, r['status'], r['check_status'], r['cleanup']['blocker']),
-                         (4, 'blocked', 'failed', 'stale-record'))
-        with self.assertRaises(lk.RecoveryBlocked):
-            self.take()
-
     def test_abrupt_death_leaves_no_report_and_a_blocker(self):
         p = self.start('slow')
-        self.wait_for('flashing')
+        self.wait_for('resetting')
         p.kill()
         out, _ = p.communicate(timeout=30)
         self.assertEqual(out, '')
@@ -1179,8 +959,7 @@ class Process(unittest.TestCase):
         token = r['cleanup'].get('token')
         self.addCleanup(lambda: [self.kill(p) for p in [(lk.read_record('farmb') or {}).get('pid')] if isinstance(p, int)])
         self.assertEqual((code, r['status'], r['check_status'], r['cleanup']['result'], r['cleanup']['blocker']),
-                         (4, 'blocked', 'failed', 'not-run', 'cleanup-holder'))
-        self.assertEqual(r['verification']['reasons'], ['flash not proven ended'])
+                         (4, 'blocked', 'ok', 'unresolved', 'cleanup-holder'))
         listed = [x['pid'] for rc in r['cleanup']['receipts'] for x in (rc['survivors'] or {}).get('processes', ())]
         self.assertIn(survivor, listed)
         with self.assertRaises(lk.BoardLocked):

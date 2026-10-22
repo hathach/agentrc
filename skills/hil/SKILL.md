@@ -1,6 +1,6 @@
 ---
 name: hil
-description: Shared HIL rig rules - contract sections, board locks, running, reporting, verdicts, retries. Use before a HIL run, a manual session on a rig board, or judging a HIL result, in a repository with a `HIL contract:` line.
+description: Shared HIL rig rules - contract sections, board locks, running, farm check, reporting, verdicts, retries. Use before a HIL run, a manual session on a rig board, judging a HIL result, or a farm check (board/probe health - is each board's probe on the bus and does it reset the board) after rig maintenance, a reboot or re-cabling, in a repository with a `HIL contract:` line.
 ---
 
 # hil — running a project's HIL
@@ -83,9 +83,9 @@ nothing in it through a link.
   holder's OS user when root releases it. A cleanup holder of its own waits in
   `wait_for_release` and then ends its hold itself. `takeover_predecessor`
   reads the record a takeover replaced. `release` never signals a protected record,
-  a cleanup holder or a runner reason (`hil_test.py`, `farm_check`, the legacy
-  `pool_check`), and signals only `hil_lock.py hold`'s own holder, proven by
-  its start time and its flock. A record from a helper older than the mark
+  a cleanup holder or a runner reason (`hil_test.py`, `farm_check`), and
+  signals only `hil_lock.py hold`'s own holder, proven by its start time and
+  its flock. A record from a helper older than the mark
   carries none and is
   taken like any other: protection across projects holds once every project
   on the host runs this helper.
@@ -138,6 +138,46 @@ helper and any cleanup state.
   `jlink_serial_match` and `jlink_serial_candidates` decide whether a J-Link's
   zero-padded serial is a roster uid.
 
+## Farm check
+
+A farm check tells whether each board of the host's roster is present: exactly
+one of its flash probes is on the bus and a reset through it succeeds. It
+flashes nothing and checks no USB; the board runs whatever image it had. Run it
+when asked for a farm or board/probe health check, after rig maintenance, a
+reboot or re-cabling, or before a HIL campaign; a HIL run needs none first.
+
+Run the launcher the contract names, from the project's checkout: it loads the
+engine (`scripts/hil_farm_check.py`) from the agentrc the project pins, with the
+project's profile. Never run an installed engine against a project whose pin is
+older, or the reverse.
+
+The check takes each free board's lock itself (`farm_check`, protected). A held
+board is reported `locked`, its probe still shown, and skipped: never waited on,
+released or bypassed. A recovery blocker is reported `blocked` and left to the
+contract's Recovery. Never kill a running check: one killed outright leaves its
+board blocked for a recovery takeover. An interrupt (SIGINT) ends it after the
+current board's cleanup.
+
+- Statuses: `ok` (the probe reset the board), `failed` (no probe, an ambiguous
+  one, or a failed reset), `unsupported` (the probe has no reset-only mode),
+  `locked`, `blocked`. `ok` says the probe reached and reset the board now, not
+  that its firmware, USB or anything else works.
+- A `blocked` row's cleanup names its blocker: a cleanup holder's `token`, which
+  Recovery releases with `hil_lock.py release --token` (refused until every
+  process the check started is proven ended), or a protected record, which needs
+  a recovery takeover.
+- Exit 0 no failed row, 1 a failed row or an aborted check, 2 refused before any
+  board, 4 any blocked row. `locked` and `unsupported` rows are unverified, not
+  healthy: read the table, never `$?` alone.
+- Never a test verdict: it validates no firmware and no PR. A persisted report
+  (`--report-dir`: `farm_check.json`/`.md`, its own attempt records) is
+  farm-health evidence and never joins or replaces a harness report.
+
+Paste the table whole with its footer, never a digest like "27/27 healthy".
+Below it only what the table cannot show: held boards with their holders, and
+each blocked board with its token or record and that its recovery is a separate
+dispatch.
+
 ## Flashers
 
 A runner that flashes or resets through this skill's `scripts/hil_flash.py`
@@ -155,7 +195,10 @@ recovery stay the contract's. Linux only.
   timeout=...)`, and for esptool `run(argv, cwd=..., env=..., timeout=...)`,
   `env` the variables to add to the inherited environment (`run_cmd(env=)` and
   `run_tracked(env=)` take it). `flash_esptool(esptool=)` names the esptool
-  executable, by default `esptool` on PATH.
+  executable, by default `esptool` on PATH. `reset_esptool` resets through
+  the ROM loader (`chip_id` without the stub, then a hard reset); lm4flash has
+  no reset-only mode. A reset that exits 0 has not necessarily reached the
+  target: `reset_problem(name, op)` reads its output for the target's answer.
 - A flash or reset returns an `Operation`: the last run's `CompletedProcess`
   fields plus `attempts`, each run's command, command file, output and rc on
   its own, never concatenated; `retried` is every attempt but the last. An
@@ -261,7 +304,7 @@ recovery stay the contract's.
 |---|---|
 | `hil_load.py` | the one path loader: one module per file per process, a second path under one name refused |
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
-| `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (`farm-check` skill) |
+| `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
 | `hil_report_core.py` | the report document: `_hil` metadata and roster identity, attempt archive, withdrawal and publish recovery, adopting a fetched report, the Markdown view, run and sequence verdicts |
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
@@ -283,8 +326,7 @@ recovery stay the contract's.
   once every process it started there is proven ended: `run_tracked`'s
   `done`, or a `recheck` of its receipt that answers `done`. Anything else
   keeps a cleanup holder or the protected record for the contract's
-  Recovery, and no in-process board I/O follows until that proof
-  (`ctx.settle()`). `run_tracked` only supplies the evidence; any other
+  Recovery. `run_tracked` only supplies the evidence; any other
   caller enforces its own reservation policy.
 - `run_tracked`'s `state_dir` is the caller's: a directory of its uid that no
   other user can write, in a parent of its uid or root's that no other user

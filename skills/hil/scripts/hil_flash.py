@@ -581,7 +581,14 @@ def esptool_input_problem(chip, flash_args, cwd) -> str:
     return ''
 
 
-# no reset_esptool: esptool's reset would be `--after hard_reset`, which is not wired here
+def reset_esptool(flasher: dict, *, port: str, timeout, run=None, esptool: str = 'esptool') -> Operation:
+    """A reset through the ROM loader: `chip_id` without the stub needs the loader's SYNC reply
+    and writes no flash, then `--after=hard_reset` leaves the chip running. Exit 0 with `Chip
+    was NOT reset` in the output (a port refusing RTS/DTR) is no reset; judging that is the
+    caller's."""
+    argv = esptool_argv(esptool, '-p', port, *_args(flasher), '--no-stub', '--before=default_reset',
+                        '--after=hard_reset', 'chip_id')
+    return _once(run, argv, env=dict(ESPTOOL_ENV), timeout=timeout)
 
 
 def flash_lm4flash(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
@@ -641,3 +648,39 @@ def flash_pyocd(flasher: dict, firmware: str, *, project_dir: str, timeout,
 
 def reset_pyocd(flasher: dict, *, project_dir: str, timeout, run=None) -> Operation:
     return _once(run, _pyocd_argv(flasher, 'reset', project_dir=project_dir), timeout=timeout)
+
+
+# -------------------------------------------------------------
+# Judging a reset
+# -------------------------------------------------------------
+# A reset_* that exits 0 shows the target answered only with one of these in its output, read
+# from each tool's source at the rig's versions: JLinkExe V9.78 core identification,
+# STM32CubeProgrammer 2.23 device info, openocd 0ce743125 DP/core examination. A backend not
+# listed: its exit status alone says whether the target answered.
+RESET_CONTACT = {
+    'jlink': ('identified.', 'Found SW-DP', 'Found JTAG'),
+    'stlink': ('Device ID',),
+    'openocd': ('Examination succeed', 'Examined RISC-V core', 'processor detected', 'SWD DPIDR'),
+}
+# Output showing no reset although the tool exited 0: openocd only warns on a failed examine and
+# only logs a failed event hook (a reset-assert hook then replaces the reset); pyocd only logs an
+# inaccessible core or an invalid reset method; esptool exits 0 when the port refuses RTS/DTR.
+RESET_REFUTED = {
+    'jlink': ('Could not connect', 'Cannot connect', 'Failed to halt CPU', 'CPU may not have been reset',
+              'CPU did not halt after reset'),
+    'openocd': ('examination failed', 'Execution of event'),
+    'pyocd': ('is not accessible after reset', 'Invalid reset method'),
+    'esptool': ('Chip was NOT reset',),
+}
+
+
+def reset_problem(name: str, op) -> str:
+    """Why the `name` backend's reset Operation `op`, which exited 0, does not show the target
+    answering and resetting ('' when it does). A non-zero exit is the caller's to judge."""
+    name = name.lower()
+    out = hil_process.cmd_stdout_text(op.stdout) + '\n' + hil_process.cmd_stdout_text(op.stderr)
+    if said := next((m for m in RESET_REFUTED.get(name, ()) if m in out), None):
+        return f'exit 0, but the output says {said!r}'
+    if name in RESET_CONTACT and not any(m in out for m in RESET_CONTACT[name]):
+        return 'exit 0, but no line shows the target answering'
+    return ''

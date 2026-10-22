@@ -177,7 +177,7 @@ class LoadedByPath(unittest.TestCase):
     helper whose protected reasons differ)."""
 
     def test_the_values_adapters_check(self):
-        self.assertEqual(hil_lock.PROTECTED_REASONS, {'hil_test.py', 'pool_check', 'farm_check'})
+        self.assertEqual(hil_lock.PROTECTED_REASONS, {'hil_test.py', 'farm_check'})
         self.assertEqual(hil_lock.CI_REASON, 'hil_test.py')
         self.assertEqual(hil_lock.CLEANUP_ROLE, 'cleanup-holder')
         self.assertTrue(issubclass(hil_lock.LockUnavailable, RuntimeError))

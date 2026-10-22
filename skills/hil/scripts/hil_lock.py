@@ -42,7 +42,7 @@ hil_load.require(__file__, FILES)
 BOARD_LOCK_DIR = '/tmp/tinyusb-hil-locks'
 CI_REASON = 'hil_test.py'
 # records naming these are never signalled by `release`, with or without the protected mark
-PROTECTED_REASONS = {CI_REASON, 'pool_check', 'farm_check'}
+PROTECTED_REASONS = {CI_REASON, 'farm_check'}
 # a holder record role that never frees on its own: a recovery blocker (`hil` Board locks)
 CLEANUP_ROLE = 'cleanup-holder'
 RECOVERY_BLOCKER = "recovery blocker: release it only through the project's recovery procedure"

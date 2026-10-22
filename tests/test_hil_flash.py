@@ -808,9 +808,18 @@ class StlinkLm4flashEsptool(unittest.TestCase):
         self.assertEqual(calls, [(['STM32_Programmer_CLI', '--connect', 'port=swd', 'sn=S1', '--write', 'fw.elf', '--go'],
                                   {'timeout': 7})])
 
-    def test_esptool_and_lm4flash_never_reset_alone(self):
-        self.assertFalse(hasattr(hf, 'reset_esptool'))
+    def test_lm4flash_never_resets_alone(self):
         self.assertFalse(hasattr(hf, 'reset_lm4flash'))
+
+    def test_esptool_resets_through_the_rom_loader_without_the_stub(self):
+        seen = []
+
+        def run(cmd, **kw):
+            seen.append((cmd, kw))
+            return subprocess.CompletedProcess(cmd, 0, '', None)
+        hf.reset_esptool({'name': 'esptool', 'uid': 'U', 'args': '-b 1500000'}, port='/dev/x y', timeout=9, run=run)
+        self.assertEqual(seen, [(['esptool', '-p', '/dev/x y', '-b', '1500000', '--no-stub', '--before=default_reset',
+                                  '--after=hard_reset', 'chip_id'], {'env': {'NO_COLOR': '1'}, 'timeout': 9})])
 
     def test_esptool_runs_with_no_color_in_its_environment(self):
         """Through the provider runner's shell, with a colour-capable TERM: a fake esptool on PATH."""
@@ -853,6 +862,41 @@ class StlinkLm4flashEsptool(unittest.TestCase):
 
 ODD = 'a b;$(touch PWNED)`id`*'   # spaces and shell metacharacters, none of which may act
 
+
+class ResetProblem(unittest.TestCase):
+    """A reset that exited 0 counts only with the target's answer in its output."""
+
+    @staticmethod
+    def op(stdout='', stderr=None):
+        return subprocess.CompletedProcess([], 0, stdout, stderr)
+
+    def test_each_backend_needs_its_contact_line(self):
+        cases = [('jlink', 'Found SW-DP with ID 0x2BA01477\nCortex-M4 identified.\n', ''),
+                 ('JLink', 'J-Link>go\nScript processing completed.\n', 'no line shows the target answering'),
+                 ('stlink', 'Device ID   : 0x413\n', ''),
+                 ('stlink', 'ST-LINK SN  : P\n', 'no line shows the target answering'),
+                 ('openocd', 'Info : [rp2040.core0] Examination succeed\n', ''),
+                 ('openocd', 'Info : wlink_init ok\nInfo : [riscv.cpu] Examined RISC-V core\n', ''),
+                 ('openocd', 'Info : Listening on port 3333\n', 'no line shows the target answering'),
+                 ('pyocd', '', ''),
+                 ('esptool', 'Hard resetting via RTS pin...\n', '')]
+        for name, out, why in cases:
+            with self.subTest(name=name, out=out):
+                got = hf.reset_problem(name, self.op(out))
+                self.assertEqual(bool(got), bool(why), got)
+                self.assertIn(why, got)
+
+    def test_a_refuting_line_wins_whatever_else_answered(self):
+        cases = [('jlink', 'Cortex-M4 identified.\nReset: CPU may not have been reset (DHCSR.S_RESET_ST never gets set).'),
+                 ('openocd', 'Info : SWD DPIDR 0x0bc12477\nWarn : target max32665.cpu examination failed'),
+                 ('openocd', 'Info : [rp2040.core0] Examination succeed\n'
+                             'Error: [rp2040.core0] Execution of event reset-assert failed:\nboom'),
+                 ('pyocd', 'Core 0 is not accessible after reset'),
+                 ('pyocd', '0000123 E Invalid reset method: invalid [reset_cmd]'),
+                 ('esptool', 'Chip was NOT reset. Setting RTS failed')]
+        for name, out in cases:
+            with self.subTest(name=name, out=out):
+                self.assertIn('the output says', hf.reset_problem(name, self.op(stderr=out.encode())))
 
 class LiteralArgv(unittest.TestCase):
     """Every built command is an argv list and its environment a mapping: no shell parses a path,

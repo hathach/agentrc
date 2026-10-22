@@ -1,77 +1,55 @@
 #!/usr/bin/env python3
-"""Farm check engine shared by the HIL projects (`farm-check` skill). Linux only, stdlib only.
+"""Farm check engine shared by the HIL projects (the `hil` skill's Farm check). Linux only, stdlib only.
 
-For every board of the host's roster: is its flash probe on the bus, does a light image
-flash, does the board come back, and is it left in the profile's final state, verified? A
-project's launcher passes its profile module to main(). No recovery: a wedged probe or board
-is reported. Farm health only, never firmware-validation evidence.
+For every board of the host's roster: is exactly one of its flash probes on the bus, and does a
+reset through it succeed? A board its probe resets counts as present. No firmware is fetched or
+flashed and the board's USB is not checked: whatever image it ran runs again. No recovery: a
+wedged probe or board is reported. Farm health only, never firmware-validation evidence.
 
-Row statuses: ok; flash-failed (firmware not delivered or shown not delivered); failed (the
-check ran but did not verify); locked (a live holder: skipped, never waited on, no bypass);
-blocked (a recovery blocker). `coverage`: probe-only (--scan-only), skipped-locked,
-full-attempted, blocked-before (an incoming recovery blocker, a live cleanup holder or a
-stale protected record, refused before any mutation) or blocked-after (this check's cleanup
-is unresolved; `check_status` keeps the check's own status). `verification` (the light image)
-and `cleanup` (the final state) are reported apart.
+Row statuses: ok (the reset succeeded); failed (no probe, an ambiguous probe, a reset that
+failed or raised, or the board's own error); unsupported (the probe has no reset-only mode:
+unverified, not ok); locked (a live holder: skipped, never waited on, no bypass); blocked (a
+recovery blocker). `coverage`: reset-not-attempted, reset-attempted, unsupported,
+skipped-locked, blocked-before (an incoming recovery blocker, a live cleanup holder or a stale
+protected record, refused before the reset) or blocked-after (this check's cleanup is
+unresolved; `check_status` keeps the check's own status).
 
-Exit: 0 every exercised row ok; 1 any failed or flash-failed row, an aborted run, or a report
-that could not be persisted; 2 refused before any board (usage, unknown host, profile, state
-dir, report dir); 4 any blocked row, over 1. Read the document for detail, never $? alone.
+Exit: 0 no failed row (unsupported and locked rows are unverified, not failures); 1 any failed
+row, an aborted run, or a report that could not be persisted; 2 refused before any board
+(usage, unknown host, profile, state dir, report dir); 4 any blocked row, over 1. Read the
+document for detail, never $? alone.
 
 Reservation: a board is taken with hil_lock.take_board_lock(lock, 'farm_check',
-protected=True). It is released only when no mutating callback was entered and no process
-started under it, or when every process started under it is proven ended
-(hil_process.run_tracked's `done`, or a recheck of its receipt) and the profile verified the
-final state. Nothing moves on while an earlier process is not proven ended: ctx.run refuses
-a new command, and the engine runs neither the observation nor the final state. Otherwise
+protected=True). It is released once every process started under it is proven ended
+(hil_process.run_tracked's `done`, or a recheck of its receipt), whether or not the reset
+succeeded; ctx.run refuses a new command while an earlier one is not proven ended. Otherwise
 the board keeps a recovery blocker: while a process the check started survives, a cleanup
 holder (`role: cleanup-holder`, hil_lock.hand_to_cleanup_holder's fresh interpreter given
 the lock's descriptor) keeps the flock, and the row names its token. `hil_lock.py release
 --token` refuses, naming the open receipts, until every receipt it holds rechecks `done`;
-anything else is the contract's Recovery. Every other outcome, a failed handoff to the
-holder included, leaves the protected record on the free flock for a recovery takeover. A
-check killed outright leaves its protected record the same way and prints no report.
-SIGINT stops the check after the current board's cleanup; the report then says
-`termination: aborted`.
+anything else is the contract's Recovery. Every other outcome, a failed handoff to the holder
+or a record that cannot be cleared included, leaves the protected record on the free flock
+for a recovery takeover. A check killed outright leaves its protected record the same way and
+prints no report. SIGINT stops the check after the current board's cleanup; the report then
+says `termination: aborted`.
 
-Profile (a module; `__file__` names it in the report, with its digest). Calls marked [lock]
-run inside the reservation and never take a lock; a process any of them starts goes through
-`ctx.run` (hil_flash's `run=`: hil_process.run_tracked with the engine's state dir), and an
-exception from one keeps its `.operation`, which the row records. ctx.run raises
-`Outstanding` instead of starting a command while an earlier one is not proven ended; a
-profile lets it propagate. In-process board I/O (a UART open, poll or write) after any
-ctx.run goes through ctx.settle() first, which raises Outstanding the same way.
-ctx.record(operation) keeps an Operation on the row as soon as it completed, so a later
-exception or interrupt in the same callback cannot lose it; one also returned or raised is
-recorded once. ctx.flash_error_line(text) is the engine's reading of a failed flash's output.
-observe_before is observation only and must not change the board;
-every other [lock] call is taken to change it once entered, whether or not it ran a process.
-The others take no lock.
+Profile (a module; `__file__` names it in the report, with its digest):
   roster(host, config, args) -> {'path', 'boards': [dict], 'named_only': [dict]}: this host's
       permitted roster (`config` the CLI's CONFIG or None). Raises for an unknown host
-      without an explicit roster, before any fetch, lock or flash. `named_only` boards are
-      checked only when -b names them. Every board dict has a `name`.
+      without an explicit roster, before any lock. `named_only` boards are checked only when
+      -b names them. Every board dict has a `name`.
   lock_name(board) -> str: the board's lock name.
+  probe_name(board) -> str: the board's flasher, shown beside the probe mark.
   probe_candidates(board) -> [busport]: every probe matching the board under the project's
       constraints, best tier only; more than one is reported as ambiguous, never picked.
-  scan_device(board) -> {'device': str, 'notes': [str]}: --scan-only's device cell.
-  plan(board, args, prepared, leave_running) -> {'image': IMAGE, 'final': {'postcondition':
-      str, 'image': IMAGE | None}, 'notes': [str]} or {'refused': {'status': 'flash-failed'
-      | 'failed', 'notes': [str]}}. IMAGE is {'path', 'variant', 'label', 'provenance'};
-      provenance is {'kind': 'ci', 'repo', 'commit', 'run', 'artifact', 'conclusion'},
-      {'kind': 'local', 'receipt'} or {'kind': 'missing', 'reason'}. Any other key of the
-      plan, or of an IMAGE, is the profile's own data: the engine passes the plan unchanged to
-      flash, observe and final_state and reads nothing else from it.
-  flash(ctx, board, plan) -> hil_flash Operation, or raises with `.operation` [lock]
-  observe(ctx, board, plan, before) -> {'status': 'ok' | 'failed' | 'flash-failed', 'device':
-      str, 'notes': [str], 'unverified': [str], 'evidence': [str]} [lock]
-  final_state(ctx, board, plan, observation | None) -> {'verified': bool, 'evidence': [str],
-      'notes': [str]} [lock]
-  observe and final_state may add 'operations': the hil_flash Operations they ran.
-  Optional: add_arguments(parser); prepare(boards, args, say) -> prepared (full mode, before
-  any board; raising refuses); observe_before(ctx, board, plan) -> before [lock];
-  LEAVE_RUNNING = True when final_state defines and verifies a "leave running" state, which
-  --no-park requires.
+  reset(ctx, board) -> hil_flash Operation, or None when the probe has no reset-only mode and
+      nothing was started. It runs inside the reservation and takes no lock; every process it
+      starts goes through `ctx.run` (hil_flash's `run=`: hil_process.run_tracked with the
+      engine's state dir). A non-zero returncode is a failed reset; one that exits 0 without
+      the target's answer in its transcript raises, carrying its `.operation`, which the row
+      keeps. ctx.run raises `Outstanding` instead of starting a command while an earlier one
+      is not proven ended; the profile lets it propagate.
+  Optional: add_arguments(parser).
 
 main(profile, argv, lock_module=...) takes the project's own loaded hil_lock instance in
 place of the engine's (module identity, test isolation); there is no lock-dir option. The
@@ -120,16 +98,14 @@ remote_core = hil_load.load_file('skills/hil/scripts/hil_remote_core.py')
 
 REASON = 'farm_check'
 HOLDER = 'hil_farm_check'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SETTLE = 2.0          # s run_tracked waits for an operation's descendants once it ended
 RECHECK_WAIT = 5.0    # s an operation not yet proven ended gets before the board's cleanup is decided
 HOLDER_READY = 10.0   # s the cleanup holder gets for each step of its handoff
-STATUSES = ('ok', 'flash-failed', 'failed', 'locked', 'blocked')
-MARKS = {'ok': '✅ ok', 'flash-failed': '❌ flash-failed', 'failed': '❌ failed', 'locked': '🔒 locked',
+STATUSES = ('ok', 'failed', 'unsupported', 'locked', 'blocked')
+MARKS = {'ok': '✅ ok', 'failed': '❌ failed', 'unsupported': '➖ unsupported', 'locked': '🔒 locked',
          'blocked': '⛔ blocked'}
-REQUIRED = ('roster', 'lock_name', 'probe_candidates', 'scan_device', 'plan', 'flash', 'observe', 'final_state')
-PROVENANCE = {'ci': ('repo', 'commit', 'run', 'artifact', 'conclusion'), 'local': ('receipt',),
-              'missing': ('reason',)}
+REQUIRED = ('roster', 'lock_name', 'probe_name', 'probe_candidates', 'reset')
 
 _t0 = time.monotonic()
 
@@ -164,51 +140,6 @@ def profile_info(profile) -> dict:
         raise Refused(f'profile file unreadable: {e}')
 
 
-def _image(img, what) -> dict:
-    if not isinstance(img, dict) or not all(isinstance(img.get(k), str) and img[k] for k in ('path', 'variant', 'label')):
-        raise ValueError(f'{what}: want path, variant and label strings: {img!r}')
-    prov = img.get('provenance')
-    kind = prov.get('kind') if isinstance(prov, dict) else None
-    if kind not in PROVENANCE or any(k not in prov for k in PROVENANCE[kind]):
-        raise ValueError(f'{what}: provenance must be one of {sorted(PROVENANCE)} with its fields: {prov!r}')
-    return img
-
-
-def _plan(profile, board, args, prepared) -> dict:
-    plan = profile.plan(board, args, prepared, args.no_park)
-    if isinstance(plan, dict) and 'refused' in plan:
-        r = plan['refused']
-        if not isinstance(r, dict) or r.get('status') not in ('flash-failed', 'failed'):
-            raise ValueError(f'plan refusal: want status flash-failed or failed: {r!r}')
-        _strings(r.get('notes'), 'plan refusal notes')
-        return plan
-    if not isinstance(plan, dict) or not isinstance(plan.get('final'), dict) \
-            or not isinstance(plan['final'].get('postcondition'), str):
-        raise ValueError(f'plan: want image, final {{postcondition, image}} and notes: {plan!r}')
-    _image(plan.get('image'), 'plan image')
-    if plan['final'].get('image') is not None:
-        _image(plan['final']['image'], 'plan final image')
-    _strings(plan.get('notes'), 'plan notes')
-    return plan
-
-
-def _observation(obs) -> dict:
-    if not isinstance(obs, dict) or obs.get('status') not in ('ok', 'failed', 'flash-failed') \
-            or not isinstance(obs.get('device'), str):
-        raise ValueError(f'observe: want status ok, failed or flash-failed and a device cell: {obs!r}')
-    for k in ('notes', 'unverified', 'evidence'):
-        _strings(obs.get(k), f'observe {k}')
-    return obs
-
-
-def _final(out) -> dict:
-    if not isinstance(out, dict) or not isinstance(out.get('verified'), bool):
-        raise ValueError(f'final_state: want verified (bool), evidence and notes: {out!r}')
-    _strings(out.get('evidence'), 'final_state evidence')
-    _strings(out.get('notes'), 'final_state notes')
-    return out
-
-
 # --- the reservation's processes ------------------------------------------------------------
 class Outstanding(RuntimeError):
     """ctx.run refused to start a command: an earlier one is not proven ended."""
@@ -222,21 +153,14 @@ def _note_cleanup(entry: dict, source) -> None:
 
 
 class Context:
-    """What a profile call inside the reservation gets: `run` (call it as hil_flash's `run=`),
-    `settle`, `record`, `flash_error_line`, `board`, `args` and `say`. `ledger` keeps every
-    run's cleanup and receipt; a run is entered before it starts, so an interrupt mid-call
-    still counts. `touched` is set before any callback that may change the board is entered;
-    `step` names the callback running."""
+    """What the profile's reset gets: `run` (call it as hil_flash's `run=`) and `args`. `ledger`
+    keeps every run's cleanup and receipt; a run is entered before it starts, so an interrupt
+    mid-call still counts."""
 
-    def __init__(self, board: dict, args, state_dir: str, row: dict):
-        self.board, self.args, self.say = board, args, say
-        self.state_dir = state_dir
-        self.row = row
+    def __init__(self, args, state_dir: str):
+        self.args, self.state_dir = args, state_dir
         self.ledger = []
-        self.touched = False
-        self.step = None
         self.recheck_by = None   # the reservation's one RECHECK_WAIT, set when a run is first found open
-        self._recorded = []
 
     def _recheck(self) -> None:
         """Recheck every run not proven ended until all are, none left has a receipt to recheck,
@@ -264,22 +188,6 @@ class Context:
         self._recheck()
         return [e for e in self.ledger if e['cleanup'] != 'done']
 
-    def settle(self) -> None:
-        """Before in-process board I/O: raises Outstanding unless every run is proven ended."""
-        if open_runs := self.open_runs():
-            raise Outstanding(f'earlier runs not proven ended: {_evidence(open_runs)}')
-
-    def record(self, op) -> None:
-        """Keep `op` on the row under the current step, once however often it is given."""
-        if op is None or any(o is op for o in self._recorded):
-            return
-        self._recorded.append(op)
-        self.row['operations'].append(operation_record(op, self.step))
-
-    @staticmethod
-    def flash_error_line(text: str) -> str:
-        return flash_error_line(text)
-
     def run(self, cmd, cwd=None, *, timeout, **kw) -> subprocess.CompletedProcess:
         if open_runs := self.open_runs():
             raise Outstanding(f'not started, earlier runs not proven ended: {_evidence(open_runs)}')
@@ -298,17 +206,17 @@ def _evidence(open_runs: list) -> str:
     return '; '.join(f'{e["cmd"]} ({e["cleanup"]})' for e in open_runs)
 
 
-def operation_record(op, step: str) -> dict:
+def operation_record(op) -> dict:
     attempts = getattr(op, 'attempts', ())
-    return {'step': step, 'returncode': getattr(op, 'returncode', None), 'cleanup': getattr(op, 'cleanup', 'unknown'),
+    return {'returncode': getattr(op, 'returncode', None), 'cleanup': getattr(op, 'cleanup', 'unknown'),
             'receipts': list(getattr(op, 'receipts', ())),
             'attempts': [{'cmd': hil_process._cmd_label(a.cmd), 'kind': a.kind, 'returncode': a.result.returncode,
                           'cleanup': a.cleanup, 'error': None if a.error is None else repr(a.error)[:200]}
                          for a in attempts]}
 
 
-def flash_error_line(out: str) -> str:
-    """Most informative line of a failed flash's output: last error-looking line,
+def error_line(out: str) -> str:
+    """Most informative line of a failed command's output: last error-looking line,
     else the last non-empty one."""
     lines = [l.strip() for l in out.splitlines() if l.strip()]
     for l in reversed(lines):
@@ -320,66 +228,33 @@ def flash_error_line(out: str) -> str:
 
 # --- one board ------------------------------------------------------------------------------
 def new_row(name: str, **cells) -> dict:
-    return {'name': name, 'probe': '❌ missing', 'probe_busport': None, 'flash': '–', 'device': '–',
-            'note': [], 'status': 'failed', 'image': None, 'operations': [], 'observations': [],
-            'verification': None, 'cleanup': None, **cells}
-
-
-def _image_record(img) -> dict | None:
-    if img is None:
-        return None
-    return {'variant': img['variant'], 'label': img['label'], 'path': img['path'],
-            'digest': _sha256(img['path']), 'provenance': dict(img['provenance'])}
+    return {'name': name, 'probe': '–', 'location': '–', 'note': [], 'status': 'failed', 'operations': [],
+            'cleanup': None, **cells}
 
 
 def _probe(profile, board, row) -> str | None:
+    tool = profile.probe_name(board)
+    if not isinstance(tool, str) or not tool:
+        raise ValueError(f'probe_name: want a string: {tool!r}')
     cands = _strings(list(profile.probe_candidates(board)), 'probe candidates')
     if len(cands) == 1:
-        row['probe'], row['probe_busport'] = f'✅ {cands[0]}', cands[0]
+        row['probe'], row['location'] = f'✅ {tool}', cands[0]
         return cands[0]
     if cands:
-        row['probe'] = '⚠ ambiguous'
-        row['note'].append(f'probe ambiguous: {", ".join(cands)} all match; none picked')
+        row['probe'], row['location'] = f'⚠ {tool}', ', '.join(cands)
+        row['note'].append('probe ambiguous: every location matches; none picked')
         say(f'{row["name"]:26} probe AMBIGUOUS ({", ".join(cands)})')
     else:
+        row['probe'] = f'❌ {tool}'
+        row['note'].append('probe not on the bus')
         say(f'{row["name"]:26} probe MISSING')
     return None
 
 
-def check_board(profile, board: dict, args, state_dir, prepared=None) -> dict:
-    name = board['name']
-    row = new_row(name)
-    note = row['note']
-    probe = _probe(profile, board, row)
-
-    if args.scan_only:
-        scan = profile.scan_device(board)
-        if not isinstance(scan, dict) or not isinstance(scan.get('device'), str):
-            raise ValueError(f'scan_device: want a device cell: {scan!r}')
-        note.extend(_strings(scan.get('notes'), 'scan_device notes'))
-        row['device'] = scan['device']
-        row['status'] = 'ok' if probe else 'flash-failed'
-        if probe:
-            say(f'{name:26} probe ✅ {probe}  {row["device"]}')
+def check_board(profile, board: dict, args, state_dir) -> dict:
+    row = new_row(board['name'])
+    if not _probe(profile, board, row):
         return row
-    if not probe:
-        row['status'] = 'flash-failed'
-        return row
-    plan = _plan(profile, board, args, prepared)
-    if 'refused' in plan:
-        row['status'] = plan['refused']['status']
-        note.extend(plan['refused']['notes'])
-        return row
-    note.extend(plan['notes'])
-    images = [plan['image'], plan['final']['image']]
-    gone = [img['path'] for img in images if img is not None and not os.path.isfile(img['path'])]
-    if gone:
-        # checked before the lock: a board flashed without its final image cannot be restored
-        row['status'] = 'flash-failed'
-        note.append(f'image missing: {", ".join(gone)}')
-        return row
-    row['image'] = _image_record(plan['image'])
-
     lock = profile.lock_name(board)
     try:
         fh = hil_lock.take_board_lock(lock, REASON, protected=True)
@@ -390,16 +265,18 @@ def check_board(profile, board: dict, args, state_dir, prepared=None) -> dict:
         return _not_taken(row, 'blocked' if live_holder else 'locked', str(e))
     except hil_lock.LockUnavailable as e:
         return _not_taken(row, 'failed', str(e))
-    ctx = Context(board, args, state_dir, row)
+    ctx = Context(args, state_dir)
     try:
-        _reserved(profile, ctx, plan, row, fh, lock)
+        try:
+            _reset(profile, ctx, board, row)
+        finally:
+            _end_reservation(fh, lock, ctx, row)
     except KeyboardInterrupt:
         row['interrupted'] = True
     # an interrupt that came before finalization could defer it: finalize from the same ledger
     while row['cleanup'] is None:
         try:
-            _end_reservation(fh, lock, ctx, plan, row, {'result': 'interrupted', 'verified': False,
-                                                          'evidence': ['interrupted before the cleanup was decided']})
+            _end_reservation(fh, lock, ctx, row)
         except KeyboardInterrupt:
             row['interrupted'] = True
     return row
@@ -407,123 +284,50 @@ def check_board(profile, board: dict, args, state_dir, prepared=None) -> dict:
 
 def _not_taken(row: dict, status: str, why: str) -> dict:
     row['status'] = status
-    row['flash'] = {'locked': '🔒 locked', 'blocked': '⛔ blocked'}.get(status, '❌ lock')
     row['note'].append(why)
     say(f'{row["name"]:26} {status}: {why}')
     return row
 
 
-def _reserved(profile, ctx: Context, plan, row, fh, lock) -> None:
-    final = {'result': 'not-run', 'verified': False, 'evidence': []}
+def _record(row: dict, op) -> None:
+    if op is not None:
+        row['operations'].append(operation_record(op))
+
+
+def _reset(profile, ctx: Context, board: dict, row: dict) -> None:
+    """Run the profile's reset; the row records what happened and every exception stays here."""
     try:
-        observation = _attempt(profile, ctx, plan, row)
-        final = _final_state(profile, ctx, plan, row, observation)
-    except KeyboardInterrupt:
-        row['interrupted'] = True
-    finally:
-        _end_reservation(fh, lock, ctx, plan, row, final)
-
-
-def _call(ctx: Context, step: str, fn, *a):
-    """A profile callback; an exception's `.operation` goes on the row before it propagates."""
-    ctx.step = step
-    try:
-        return fn(*a)
-    except BaseException as e:
-        ctx.record(getattr(e, 'operation', None))
-        raise
-
-
-def _operations(ctx: Context, out: dict) -> None:
-    ops = out.get('operations', [])
-    if not isinstance(ops, list):
-        raise ValueError(f'{ctx.step}: operations must be a list: {ops!r}')
-    for op in ops:
-        ctx.record(op)
-
-
-def _flash_failed(row: dict, label: str, why: str) -> None:
-    row['note'].append(f'flash: {why}')
-    row['flash'] = f'❌ {label}'
-    row['status'] = 'flash-failed'
-    row['verification'] = {'result': 'unverified', 'reasons': ['flash failed']}
-    say(f'{row["name"]:26} flash FAILED ({label})')
-
-
-def _attempt(profile, ctx: Context, plan: dict, row: dict) -> dict | None:
-    """Flash and observe; the row records what happened and every exception stays here."""
-    label = plan['image']['label']
-    try:
-        before = None
-        if hasattr(profile, 'observe_before'):
-            before = _call(ctx, 'observe_before', profile.observe_before, ctx, ctx.board, plan)
-        if open_runs := ctx.open_runs():
-            row['note'].append(f'flash not run, the observation is not proven ended: {_evidence(open_runs)}')
-            row['verification'] = {'result': 'unverified', 'reasons': ['observation not proven ended']}
-            return None
-        ctx.touched = True
         try:
-            op = _call(ctx, 'flash', profile.flash, ctx, ctx.board, plan)
-        except Exception as e:
-            _flash_failed(row, label, repr(e)[:90])
-            return None
-        ctx.record(op)
-        if op.returncode != 0:
-            out = hil_process.cmd_stdout_text(op.stdout) + '\n' + hil_process.cmd_stdout_text(op.stderr)
-            _flash_failed(row, label, flash_error_line(out) or f'rc={op.returncode}')
-            return None
-        row['flash'] = f'✅ {label}'
-        if open_runs := ctx.open_runs():
-            row['note'].append(f'observation not run, the flash is not proven ended: {_evidence(open_runs)}')
-            row['verification'] = {'result': 'unverified', 'reasons': ['flash not proven ended']}
-            return None
-        obs = _observation(_call(ctx, 'observe', profile.observe, ctx, ctx.board, plan, before))
-        _operations(ctx, obs)
-        row['status'], row['device'] = obs['status'], obs['device']
-        row['note'].extend(obs['notes'])
-        row['observations'].extend(obs['evidence'])
-        reasons = list(obs['unverified']) + ([] if obs['status'] == 'ok' else [obs['status']])
-        row['verification'] = {'result': 'unverified' if reasons else 'verified', 'reasons': reasons}
-        say(f'{row["name"]:26} {row["flash"]}  {row["device"]}')
-        return obs
+            op = profile.reset(ctx, board)
+        except BaseException as e:
+            _record(row, getattr(e, 'operation', None))
+            raise
+        if op is None and not ctx.ledger:
+            row['status'] = 'unsupported'
+            row['note'].append('the probe has no reset-only mode')
+        elif not isinstance(getattr(op, 'returncode', None), int):
+            raise ValueError(f'reset: want an Operation, or None having started nothing: {op!r}')
+        else:
+            _record(row, op)
+            if op.returncode == 0:
+                row['status'] = 'ok'
+            else:
+                line = error_line(hil_process.cmd_stdout_text(op.stdout) + '\n' + hil_process.cmd_stdout_text(op.stderr))
+                row['note'].append(f'reset rc={op.returncode}' + (f': {line}' if line else ''))
+        say(f'{row["name"]:26} {MARKS[row["status"]]}')
     except KeyboardInterrupt:
         row['interrupted'] = True
         row['note'].append('interrupted')
     except Exception as e:
-        row['note'].append(f'error: {e!r}'[:120])
-        row['device'] = '❌ error'
-    if row['status'] == 'ok':
-        row['status'] = 'failed'
-    row['verification'] = {'result': 'unverified', 'reasons': row['note'][-1:]}
-    return None
+        row['note'].append(f'reset: {e!r}'[:120])
 
 
-def _final_state(profile, ctx: Context, plan: dict, row: dict, observation) -> dict:
-    """The final state, run only once every earlier process is proven ended."""
-    if not ctx.touched and not ctx.ledger:
-        return {'result': 'untouched', 'verified': True, 'evidence': []}
-    if open_runs := ctx.open_runs():
-        return {'result': 'not-run', 'verified': False,
-                'evidence': [f'not proven ended ({e["cleanup"]}): {e["cmd"]}' for e in open_runs]}
-    try:
-        out = _final(_call(ctx, 'final', profile.final_state, ctx, ctx.board, plan, observation))
-        _operations(ctx, out)
-    except KeyboardInterrupt:
-        row['interrupted'] = True
-        return {'result': 'interrupted', 'verified': False, 'evidence': ['interrupted']}
-    except Exception as e:
-        return {'result': 'error', 'verified': False, 'evidence': [repr(e)[:200]]}
-    row['note'].extend(out['notes'])
-    return {'result': 'verified' if out['verified'] else 'unverified', 'verified': out['verified'],
-            'evidence': out['evidence']}
-
-
-def _end_reservation(fh, lock: str, ctx: Context, plan: dict, row: dict, final: dict) -> None:
+def _end_reservation(fh, lock: str, ctx: Context, row: dict) -> None:
     """Release the board, or keep its recovery blocker; never raises. An interrupt is deferred
     until the decision is carried out, its waits all bounded, and then only marks the row."""
     hold = hil_process.InterruptHold()
     try:
-        _finalize(fh, lock, ctx, plan, row, final)
+        _finalize(fh, lock, ctx, row)
     except Exception as e:
         _keep_blocked(row, fh, f'finalization failed: {e!r}'[:200])
     finally:
@@ -536,8 +340,8 @@ def _end_reservation(fh, lock: str, ctx: Context, plan: dict, row: dict, final: 
 def _keep_blocked(row: dict, fh, why: str) -> None:
     """A finalization cut short: unless the board was released, the row is blocked and the
     record, whatever it now says, stays the blocker."""
-    cleanup = row['cleanup'] or {'postcondition': None, 'image': None, 'result': 'interrupted', 'evidence': [],
-                                 'receipts': [], 'blocker': None, 'released': False}
+    cleanup = row['cleanup'] or {'result': 'interrupted', 'evidence': [], 'receipts': [], 'blocker': None,
+                                 'released': False}
     row['cleanup'] = cleanup
     if cleanup['released']:
         return
@@ -549,26 +353,23 @@ def _keep_blocked(row: dict, fh, why: str) -> None:
         fh.close()   # never clear_record: the record is the blocker
 
 
-def _finalize(fh, lock: str, ctx: Context, plan: dict, row: dict, final: dict) -> None:
+def _finalize(fh, lock: str, ctx: Context, row: dict) -> None:
     ctx._recheck()
     open_ops = [e for e in ctx.ledger if e['cleanup'] != 'done']
     receipts = [e['receipt'] for e in open_ops if e['receipt'] is not None]
-    cleanup = {'postcondition': plan['final']['postcondition'], 'image': None, 'result': final['result'],
-               'evidence': list(final['evidence']), 'receipts': receipts, 'blocker': None, 'released': False}
+    cleanup = {'result': 'unresolved' if open_ops else 'release-failed', 'receipts': receipts, 'blocker': None,
+               'released': False, 'evidence': [f'not proven ended ({e["cleanup"]}): {e["cmd"]}' for e in open_ops]}
     row['cleanup'] = cleanup
-    with contextlib.suppress(OSError):
-        cleanup['image'] = _image_record(plan['final']['image'])
-    if final['verified'] and not open_ops:
+    if not open_ops:
         # proven clear through our own descriptor, while the flock is still ours
         if hil_lock.clear_record(fh) and os.fstat(fh.fileno()).st_size == 0:
-            cleanup['released'] = True
+            cleanup['result'], cleanup['released'] = 'released', True
             with contextlib.suppress(OSError):
                 fh.close()
             return
-        cleanup['result'] = 'release-failed'
         cleanup['evidence'].append('the record could not be cleared')
     row['check_status'], row['status'] = row['status'], 'blocked'
-    detail = (f'farm check cleanup unresolved: {final["result"]}; ' + '; '.join(cleanup['evidence']))[:500]
+    detail = (f'farm check cleanup unresolved: {cleanup["result"]}; ' + '; '.join(cleanup['evidence']))[:500]
     token = None
     if any(e['cleanup'] == 'pending' for e in open_ops):
         try:     # fh was taken protected, as the handoff requires: a failure leaves a recovery blocker
@@ -590,21 +391,21 @@ def _finalize(fh, lock: str, ctx: Context, plan: dict, row: dict, final: dict) -
         row['note'].append(f'protected record kept: recovery takes it over (`hil_lock.py hold --take-over {lock}`)')
     with contextlib.suppress(OSError):
         fh.close()   # never clear_record: the record is the blocker
-    say(f'{row["name"]:26} BLOCKED: {cleanup["blocker"]} ({final["result"]})')
+    say(f'{row["name"]:26} BLOCKED: {cleanup["blocker"]} ({cleanup["result"]})')
 
 
 # --- the farm -------------------------------------------------------------------------------
-def check_board_safe(profile, board, args, state_dir, prepared=None) -> dict:
+def check_board_safe(profile, board, args, state_dir) -> dict:
     """Isolate one board's exceptions: a crashing board must not discard every other row."""
     try:
-        return check_board(profile, board, args, state_dir, prepared)
+        return check_board(profile, board, args, state_dir)
     except Exception as e:
         name = board.get('name', '?') if isinstance(board, dict) else '?'
         say(f'{name:26} INTERNAL ERROR: {e!r}')
-        return new_row(name, probe='–', device='❌ error', note=[repr(e)[:120]])
+        return new_row(name, note=[repr(e)[:120]])
 
 
-def check_farm(profile, boards: list, args, *, state_dir, prepared=None) -> tuple:
+def check_farm(profile, boards: list, args, *, state_dir) -> tuple:
     """(rows, aborted): one row per board in order; SIGINT ends the loop after the board in
     hand, whose cleanup has run."""
     rows = []
@@ -612,7 +413,7 @@ def check_farm(profile, boards: list, args, *, state_dir, prepared=None) -> tupl
     with contextlib.nullcontext() if args.verbose else contextlib.redirect_stdout(io.StringIO()):
         for b in boards:
             try:
-                rows.append(check_board_safe(profile, b, args, state_dir, prepared))
+                rows.append(check_board_safe(profile, b, args, state_dir))
             except KeyboardInterrupt:
                 return rows, True
             if rows[-1].get('interrupted'):
@@ -620,40 +421,41 @@ def check_farm(profile, boards: list, args, *, state_dir, prepared=None) -> tupl
     return rows, False
 
 
-def _coverage(row: dict, mode: str) -> str:
-    if mode == 'scan-only':
-        return 'probe-only'
+def _coverage(row: dict) -> str:
+    entered = row['cleanup'] is not None   # every reservation the engine entered is finalized
     if row['status'] == 'locked':
         return 'skipped-locked'
+    if row['status'] == 'unsupported':
+        return 'unsupported'
     if row['status'] == 'blocked':
-        return 'blocked-after' if 'check_status' in row else 'blocked-before'
-    return 'full-attempted'
+        return 'blocked-after' if entered else 'blocked-before'
+    return 'reset-attempted' if entered else 'reset-not-attempted'
 
 
-def farm_document(host: str, config: str, mode: str, rows: list, profile: dict, elapsed_s: float) -> dict:
+def farm_document(host: str, config: str, rows: list, profile: dict, elapsed_s: float) -> dict:
     """The one result the table, the JSON and a persisted report all come from."""
     counts = dict.fromkeys(STATUSES, 0)
     for r in rows:
         counts[r['status']] += 1
-        r['coverage'] = _coverage(r, mode)
+        r['coverage'] = _coverage(r)
     return {'schema_version': SCHEMA_VERSION, 'check': 'farm-check', 'host': host, 'config': config,
-            'mode': mode, 'profile': profile, 'rows': rows, 'counts': counts, 'elapsed_s': round(elapsed_s, 1)}
+            'profile': profile, 'rows': rows, 'counts': counts, 'elapsed_s': round(elapsed_s, 1)}
 
 
 def exit_status(doc: dict, aborted: bool = False) -> int:
     c = doc['counts']
     if c['blocked']:
         return 4
-    return 1 if c['failed'] or c['flash-failed'] or aborted else 0
+    return 1 if c['failed'] or aborted else 0
 
 
 def render_table(doc: dict) -> str:
-    headers = ['Board', 'Probe', 'Flash', 'Device', 'Status', 'Note']
-    cells = [[r['name'], r['probe'], r['flash'], r['device'], MARKS.get(r['status'], r['status']),
-              '; '.join(r['note'])] for r in doc['rows']]
+    headers = ['Board', 'Probe', 'Location', 'Reset/Status', 'Note']
+    cells = [[r['name'], r['probe'], r['location'], MARKS.get(r['status'], r['status']), '; '.join(r['note'])]
+             for r in doc['rows']]
     c = doc['counts']
     return '\n'.join(['', report_core.table(headers, cells), '',
-                      f'farm check: {c["ok"]} ok · {c["flash-failed"]} flash-failed · {c["failed"]} failed '
+                      f'farm check: {c["ok"]} ok · {c["failed"]} failed · {c["unsupported"]} unsupported '
                       f'· {c["locked"]} locked · {c["blocked"]} blocked · in {doc["elapsed_s"]:.0f}s']) + '\n'
 
 
@@ -675,7 +477,7 @@ FARM_SCHEMA = report_core.BodySchema(name='farm-check', version=SCHEMA_VERSION, 
 
 @contextlib.contextmanager
 def stdout_to_stderr():
-    """fd 1 onto stderr, so no flasher or fetch child can write to stdout either."""
+    """fd 1 onto stderr, so no reset child can write to stdout either."""
     sys.stdout.flush()
     saved = os.dup(1)
     try:
@@ -726,13 +528,10 @@ def _roster(profile, host: str, args) -> tuple:
 
 
 def parser_for(profile) -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description='Farm check: probe, light flash, return and final state of '
-                                            "every board of this host's roster")
+    p = argparse.ArgumentParser(description="Farm check: each board of this host's roster is present when its "
+                                            'one matching probe resets it')
     p.add_argument('config', nargs='?', help="roster file (default: the profile's for this host)")
     p.add_argument('-b', '--board', action='append', default=[], help='only these boards')
-    p.add_argument('--scan-only', action='store_true', help='probe presence only: no locks, flashing or fetch')
-    p.add_argument('--no-park', action='store_true',
-                   help="leave the light image running; refused unless the profile verifies that state")
     p.add_argument('--json', action='store_true',
                    help='print only the result document on stdout; progress goes to stderr')
     p.add_argument('--report-dir', help='also persist farm_check.json/.md there, under its own attempt records')
@@ -802,18 +601,15 @@ def _main(profile, argv, state_dir, host) -> int:
     _t0 = time.monotonic()
     args = parser_for(profile).parse_args(argv)
     host = host or socket.gethostname()
-    mode = 'scan-only' if args.scan_only else 'full'
     with stdout_to_stderr() if args.json else contextlib.nullcontext():
         try:
             info = profile_info(profile)
-            if args.no_park and getattr(profile, 'LEAVE_RUNNING', False) is not True:
-                raise Refused('--no-park: the profile defines no verified "leave running" final state')
             cfg, boards = _roster(profile, host, args)
             try:
                 config, roster = os.path.realpath(cfg), report_core.roster_identity(cfg)
             except OSError as e:
                 raise Refused(f'roster {cfg}: {e}')
-            sdir = None if args.scan_only else _state_dir(state_dir or default_state_dir())
+            sdir = _state_dir(state_dir or default_state_dir())
             if args.report_dir:
                 try:
                     attempt = report_core.start_attempt(args.report_dir, FARM_SCHEMA, False)
@@ -821,18 +617,12 @@ def _main(profile, argv, state_dir, host) -> int:
                     raise Refused(f'report dir {args.report_dir}: {e}')
             else:
                 attempt = report_core.Attempt(report_core.new_attempt_id(), None, None, None, None)
-            prepared = None
-            if not args.scan_only and hasattr(profile, 'prepare'):
-                try:
-                    prepared = profile.prepare(boards, args, say)
-                except Exception as e:
-                    raise Refused(f'profile prepare: {e!r}')
         except Refused as e:
             print(f'farm check: refused: {e}', file=sys.stderr)
             return 2
-        say(f'farm check: host {host}, config {config}, {len(boards)} boards, {mode}')
-        rows, aborted = check_farm(profile, boards, args, state_dir=sdir, prepared=prepared)
-    doc = farm_document(host, config, mode, rows, info, time.monotonic() - _t0)
+        say(f'farm check: host {host}, config {config}, {len(boards)} boards')
+        rows, aborted = check_farm(profile, boards, args, state_dir=sdir)
+    doc = farm_document(host, config, rows, info, time.monotonic() - _t0)
     code = exit_status(doc, aborted)
     meta = report_core.make_meta(FARM_SCHEMA, attempt,
                                  termination='aborted' if aborted else 'completed' if boards else 'no-boards',
