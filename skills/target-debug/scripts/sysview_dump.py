@@ -91,6 +91,19 @@ def halted(dhcsr):
     return bool(dhcsr & S_HALT)
 
 
+def note_before(core, text):
+    """core['before'] from the first session's output, complete or not, once an M-profile CPUID and the DHCSR read
+    before the halt are in it."""
+    reads = [(int(a, 16), int(v, 16)) for a, v in ps._MEM32_RE.findall(text)][:2]
+    if [a for a, _ in reads] != [CPUID, ps.DHCSR]:
+        return
+    try:
+        ps.check_m_profile(reads[0][1])
+    except ToolError:
+        return
+    core['before'] = 'halted' if halted(reads[1][1]) else 'running'
+
+
 def jlink_dump(backend, cb, channel, resume, tmp, timeout, core):
     """(header, descriptor, descriptor read again) over two Commander sessions, each DHCSR read placed to prove the
     state it claims; core's before and after are set as each is established, so a failure still reports them."""
@@ -98,14 +111,19 @@ def jlink_dump(backend, cb, channel, resume, tmp, timeout, core):
     core.update(before='unknown', after='unknown')
     s1 = ['exec SetRestartOnClose = 0', f'mem32 {CPUID:X}, 1', dhcsr, 'h', dhcsr,
           f'savebin {tmp}/hdr1.bin, 0x{cb:08X}, 0x{hlen:X}', 'qc']
-    text = ps.run(backend.cmd, timeout, '\n'.join(s1) + '\n')
+    try:
+        text = ps.run(backend.cmd, timeout, '\n'.join(s1) + '\n')
+    except ToolError as e:
+        backend._identify(getattr(e, 'text', ''))    # another probe's reads say nothing about this core
+        note_before(core, getattr(e, 'text', ''))
+        raise
     backend._identify(text)
+    note_before(core, text)
     reads = [(int(a, 16), int(v, 16)) for a, v in ps._MEM32_RE.findall(text)]
     if [a for a, _ in reads] != [CPUID, ps.DHCSR, ps.DHCSR]:
         raise ToolError(f'incomplete first session: {len(reads)}/3 reads; last output:\n{ps.tail(text)}')
     ps.check_m_profile(reads[0][1])
     running = not halted(reads[1][1])
-    core['before'] = 'running' if running else 'halted'
     if not halted(reads[2][1]):
         raise ToolError(f'the core did not halt (DHCSR 0x{reads[2][1]:08x})')
     core['after'] = 'halted'

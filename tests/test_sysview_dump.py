@@ -255,6 +255,26 @@ class JLinkDump(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertEqual(r['core'], {'before': 'running', 'after': 'unknown'})
 
+    def test_a_cut_first_session_records_the_state_before_its_reads_establish(self):
+        reads = {'cpuid': 'E000ED00 = 410FC241', 'running': 'E000EDF0 = 00010001',
+                 'halted': 'E000EDF0 = 00030003', 'not M': 'E000ED00 = 41000000'}
+        cases = {('killed', 'cpuid', 'running', 'halted'): 'running',
+                 ('killed', 'cpuid', 'halted'): 'halted',
+                 ('exits', 'cpuid', 'running'): 'running',
+                 ('killed', 'cpuid'): 'unknown',
+                 ('killed', 'not M', 'running', 'halted'): 'unknown'}
+        for (end, *lines), before in cases.items():
+            with self.subTest(end=end, lines=lines):
+                stub = Path(tempfile.mkdtemp(dir=self.dir))
+                out = '\\n'.join(['S/N: 123', 'VTref=3.300V', *(reads[n] for n in lines)])
+                env = fake_tools(self, stub, (('JLinkExe', '#!\nimport sys, time\nsys.stdin.read()\n'
+                                                           f'print("{out}", flush=True)\n'
+                                                           + ('time.sleep(30)\n' if end == 'killed' else '')),))
+                self.out = stub / 'out'
+                rc, r = self.run_dump('--resume', '--timeout', '0.5', PATH=env['PATH'])
+                self.assertEqual(rc, 3)
+                self.assertEqual(r['core'], {'before': before, 'after': 'unknown'})
+
     def test_not_m_profile_is_refused(self):
         self.target(bytes(64), wroff=0, cpuid=0x4100_0000)
         rc, r = self.run_dump()
