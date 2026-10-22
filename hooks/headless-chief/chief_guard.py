@@ -862,7 +862,7 @@ def remaining():
 def program(word):
     """A command word as Windows finds its program: without case, an executable suffix, trailing dots and spaces or a
     `:stream`, all of which Windows drops from a file name; elsewhere the word itself."""
-    if os.name != 'nt':
+    if os.name != 'nt' or word == '.':  # `.` is bash's builtin, found before any file
         return word
     name = os.path.basename(word).split(':')[0].rstrip('. ').lower()
     return re.sub(r'\.(exe|com|bat|cmd)$', '', name).rstrip('. ')
