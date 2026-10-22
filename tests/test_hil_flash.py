@@ -969,6 +969,194 @@ class JLinkJudgment(unittest.TestCase):
                 self.assertEqual(hf.jlink_problem(op), '')
 
 
+ESPTOOL_CORPUS = DATA / 'esptool'
+
+
+def esptool_synthetic(offsets, *, stub=True, uncompressed=False):
+    """A write_flash transcript in the shape tinyuf2's bench recorded with esptool 5.2.0 (CSI
+    codes, the underscore spellings' warning); without the stub, or a stub run that found
+    compression would not shrink a segment (5.3.1), each write uncompressed."""
+    out = "\x1b[0;33mWarning:\x1b[0m Deprecated: Command 'write_flash' is deprecated. Use 'write-flash' instead.\n"
+    for off in offsets:
+        if stub and uncompressed:
+            out += 'Note: Cannot compress \'x.bin\' more than the original size, will flash uncompressed.\n'
+        out += (f'Writing at 0x{off:08x} [====] 100.0% \x1b[1A\x1b[2K\nWrote 9 bytes '
+                f'{"(9 compressed) " if stub and not uncompressed else ""}at 0x{off:08x} in 0.1 seconds (100.0 kbit/s).\n'
+                'Verifying written data...\nHash of data verified.\n')
+    return out + '\nHard resetting via RTS pin...\n'
+
+
+class EsptoolJudgment(unittest.TestCase):
+    OFFSETS = [0x0, 0x8000, 0xe000, 0x410000]
+
+    def test_recorded_and_documented_forms_pass(self):
+        manifest = json.loads((ESPTOOL_CORPUS / 'MANIFEST.json').read_text())
+        for name, m in manifest.items():
+            with self.subTest(name):
+                self.assertEqual(hf.esptool_flash_judgment((ESPTOOL_CORPUS / name).read_text(), m['offsets']),
+                                 {'ok': True, 'problem': '', 'wrote': m['offsets']})
+        for form, kw in (('stub', {}), ('--no-stub', {'stub': False}), ('uncompressed', {'uncompressed': True})):
+            with self.subTest(form):
+                out = esptool_synthetic(self.OFFSETS, **kw)
+                self.assertTrue(hf.esptool_flash_judgment(out, self.OFFSETS)['ok'])
+                self.assertTrue(hf.esptool_flash_judgment(out.replace('Wrote', '\x1b[2K\x1b[1AWrote'), self.OFFSETS)['ok'])
+
+    def test_every_write_needs_its_own_verify_and_the_reset_follows(self):
+        out = (ESPTOOL_CORPUS / '5.3.1-espressif_esp32s3_devkitm_1-stub.txt').read_text()
+        first = out.index('Hash of data verified.')
+        moved = out[:first] + out[first + len('Hash of data verified.'):]
+        moved = moved.replace('Hard resetting', 'Hash of data verified.\nHard resetting', 1)
+        last = out.rindex('Hash of data verified.')
+        past_reset = out[:last] + out[last + len('Hash of data verified.'):] + 'Hash of data verified.\n'
+        cases = {'a write missing': (out.replace('at 0x00008000 in', 'at 0x00009000 in'), 'not the requested'),
+                 'a write twice': (out.replace('at 0x0000e000 in', 'at 0x00008000 in'), 'not the requested'),
+                 'an extra write': (out + 'Wrote 1 bytes at 0x00500000 in 0.1 seconds.\n', 'not the requested'),
+                 'an unknown write line': (out + 'Wrote 1 bytes at 0x500000 in 0.1 seconds.\n', 'unknown shape'),
+                 'a verify missing': (out.replace('Hash of data verified.\n', '', 1), 'no verify between the write at 0x0 '),
+                 'a verify moved to the last write': (moved, 'no verify between the write at 0x0 '),
+                 'the last verify past the reset': (past_reset, 'no verify between the write at 0x410000 '),
+                 'no hard reset': (out.replace('Hard resetting via RTS pin...', ''), 'no hard reset'),
+                 'a fatal error': (out + 'A fatal error occurred: Packet content transfer stopped\n', 'fatal error'),
+                 'not reset': (out.replace('Hard resetting via RTS pin...', 'Chip was NOT reset.'), 'NOT reset'),
+                 'an unknown format': ('Flashed 4 regions OK\n', 'not the requested'),
+                 'nothing': ('', 'not the requested')}
+        for what, (text, why) in cases.items():
+            with self.subTest(what):
+                j = hf.esptool_flash_judgment(text, self.OFFSETS)
+                self.assertFalse(j['ok'])
+                self.assertIn(why, j['problem'])
+        self.assertEqual(hf.esptool_flash_judgment(out, [])['problem'], 'no offsets requested')
+        twice = esptool_synthetic([0, 0])
+        self.assertIn('repeat', hf.esptool_flash_judgment(twice, [0, 0])['problem'])
+
+    def test_the_problem_of_a_flash_is_its_last_attempt_judged(self):
+        good = esptool_synthetic(self.OFFSETS)
+
+        def op(*outs):
+            return hf.Operation([hf._record(['esptool'], None, subprocess.CompletedProcess([], rc, out, ''), err)
+                                 for rc, out, err in outs])
+        self.assertEqual(hf.esptool_problem(op((0, good, None)), self.OFFSETS), '')
+        self.assertEqual(hf.esptool_problem(op((2, good, None)), self.OFFSETS), 'esptool exit 2')
+        self.assertEqual(hf.esptool_problem(op((None, good, subprocess.TimeoutExpired('esptool', 5))), self.OFFSETS),
+                         'esptool timed out')
+        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), (0, '', None)), self.OFFSETS))
+
+    def test_the_offsets_are_the_flash_args_pairs(self):
+        self.assertEqual(hf.esptool_offsets('--flash-mode dio --flash-size 8MB 0x0 b.bin 0x8000 p.bin'), [0, 0x8000])
+        with self.assertRaises(ValueError):
+            hf.esptool_offsets('--flash-mode dio')
+
+
+class EsptoolRuntime(unittest.TestCase):
+    """One esptool: the executable on PATH and its interpreter's package report one version."""
+
+    def setUp(self):
+        self.d = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.d / 'pkg' / 'esptool').mkdir(parents=True)
+        self.env = self.enterContext(mock.patch.dict(os.environ, {'PYTHONNOUSERSITE': '1', 'PYTHONPATH': ''}))
+
+    def exe(self, says='9.9.9', shebang=None, package='9.9.9', name='esptool'):
+        if package is not None:
+            (self.d / 'pkg' / 'esptool' / '__init__.py').write_text(f'__version__ = {package!r}\n')
+            os.environ['PYTHONPATH'] = str(self.d / 'pkg')
+        exe = self.d / name
+        exe.write_text(f'{shebang or "#!" + sys.executable}\nprint("esptool v{says}")\nprint("{says}")\n')
+        exe.chmod(0o755)
+        return str(exe)
+
+    def test_one_package_and_its_version(self):
+        exe = self.exe()
+        self.assertEqual(hf.esptool_runtime(exe), {'exe': exe, 'python': sys.executable, 'version': '9.9.9',
+                                                   'package': str(self.d / 'pkg' / 'esptool' / '__init__.py')})
+
+    def test_the_package_is_the_one_the_script_imports(self):
+        (self.d / 'esptool').mkdir()
+        (self.d / 'esptool' / '__init__.py').write_text("__version__ = '9.9.9'\n")   # beside it: first on its path
+        exe = self.exe(name='esptool-cli')
+        self.assertEqual(hf.esptool_runtime(exe)['package'], str(self.d / 'esptool' / '__init__.py'))
+        with contextlib.chdir(self.d):
+            self.assertEqual(hf.esptool_runtime('./esptool-cli')['exe'], exe)
+
+    def test_a_failed_or_malformed_import_probe_is_refused(self):
+        said = subprocess.CompletedProcess([], 0, 'esptool v9.9.9\n', '')
+        for what, probe in (('exit 1', subprocess.CompletedProcess([], 1, '["9.9.9", "/p"]\n', 'boom')),
+                            ('no package path', subprocess.CompletedProcess([], 0, '["9.9.9", null]\n', '')),
+                            ('not a pair', subprocess.CompletedProcess([], 0, '"9.9.9"\n', ''))):
+            with self.subTest(what), mock.patch.object(hf.subprocess, 'run', side_effect=[probe, said]), \
+                    self.assertRaisesRegex(RuntimeError, 'imports no esptool package'):
+                hf.esptool_runtime(self.exe())
+
+    def test_refusals(self):
+        cases = (('a mismatched executable', {'says': '1.0'}, 'does not report 9.9.9'),
+                 ('no python shebang', {'shebang': '#!/bin/sh'}, 'want an absolute python shebang'))
+        for what, kw, why in cases:
+            with self.subTest(what), self.assertRaisesRegex(RuntimeError, why):
+                hf.esptool_runtime(self.exe(**kw))
+        with self.assertRaisesRegex(RuntimeError, 'is not on PATH'):
+            hf.esptool_runtime(str(self.d / 'missing'))
+        unreadable = self.exe(name='esptool-unreadable')
+        os.chmod(unreadable, 0o111)
+        if not os.access(unreadable, os.R_OK):   # root reads it anyway
+            with self.assertRaisesRegex(RuntimeError, 'Permission denied'):
+                hf.esptool_runtime(unreadable)
+        with mock.patch.object(hf.subprocess, 'run', side_effect=subprocess.TimeoutExpired('x', 1)), \
+                self.assertRaisesRegex(RuntimeError, 'timed out'):
+            hf.esptool_runtime(self.exe())
+
+    def test_no_package_for_its_interpreter(self):
+        exe = self.exe(package=None)
+        probe = subprocess.run([sys.executable, '-c', 'import esptool'], capture_output=True)
+        if probe.returncode == 0:
+            self.skipTest('this interpreter has an esptool package outside the user site')
+        with self.assertRaisesRegex(RuntimeError, 'imports no esptool package'):
+            hf.esptool_runtime(exe)
+
+
+class EsptoolPort(unittest.TestCase):
+    def setUp(self):
+        self.byid = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(hf, 'SERIAL_BY_ID', str(self.byid)))
+
+    def link(self, name, target='/dev/null'):
+        (self.byid / name).symlink_to(target)
+
+    def test_one_bridge_link_to_a_character_device(self):
+        self.link('usb-Silicon_Labs_CP2102N_USB_to_UART_abc123-if00-port0')
+        self.link('usb-Silicon_Labs_CP2102N_USB_to_UART_abc1234-if00-port0')   # another serial with this prefix
+        self.assertEqual(hf.esptool_port('abc123'), '/dev/null')
+
+    def test_refusals(self):
+        regular = self.byid.parent / 'regular'
+        regular.write_text('')
+        self.addCleanup(regular.unlink)
+        cases = (('none', [], 'found none'),
+                 ('two interfaces', [('usb-FTDI_Dual_RS232_ab1-if00-port0', '/dev/null'),
+                                     ('usb-FTDI_Dual_RS232_ab1-if01-port0', '/dev/zero')], 'found ['),
+                 ('dangling', [('usb-x_ab1-if00-port0', '/nonexistent/tty')], 'No such file'),
+                 ('not a device', [('usb-x_ab1-if00-port0', str(regular))], 'not a character device'))
+        for what, links, why in cases:
+            with self.subTest(what):
+                for p in self.byid.iterdir():
+                    p.unlink()
+                for name, target in links:
+                    self.link(name, target)
+                with self.assertRaisesRegex(RuntimeError, re.escape(why)):
+                    hf.esptool_port('ab1')
+        for uid in ('', 'a*b', 'a[1]', None):
+            with self.subTest(uid=uid), self.assertRaisesRegex(RuntimeError, 'want a probe serial'):
+                hf.esptool_port(uid)
+
+    def test_a_usj_serial_goes_to_usj_tty_only(self):
+        seen = []
+        fake = types.SimpleNamespace(usj_tty=lambda serial: seen.append(serial) or '/dev/ttyACM3')
+        with mock.patch.object(hf.hil_load, 'load_file', lambda rel: fake if rel.endswith('hil_openocd_esp.py')
+                               else self.fail(rel)):
+            self.assertEqual(hf.esptool_port('30:ED:A0:E0:C9:02'), '/dev/ttyACM3')
+            self.link('usb-x_ab1-if00-port0')
+            self.assertEqual(hf.esptool_port('ab1'), '/dev/null')
+        self.assertEqual(seen, ['30:ED:A0:E0:C9:02'])
+
+
 class ResetProblem(unittest.TestCase):
     """A reset that exited 0 counts only with the target's answer in its output."""
 

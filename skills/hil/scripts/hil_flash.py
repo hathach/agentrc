@@ -16,12 +16,15 @@ an Operation of its Attempts; what their kinds, cleanup and receipts mean to a c
 from __future__ import annotations
 
 import contextlib
+import glob
 import importlib.util
+import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,7 +35,9 @@ from typing import NamedTuple
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYOCD_LAUNCHER = os.path.join(HERE, 'pyocd', 'run_pyocd.py')
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py',
-         'skills/hil/scripts/pyocd/run_pyocd.py', 'skills/hil/scripts/pyocd/user_script.py')
+         'skills/hil/scripts/pyocd/run_pyocd.py', 'skills/hil/scripts/pyocd/user_script.py',
+         'skills/hil/scripts/hil_openocd_esp.py', 'skills/hil/scripts/usb_observe.py',
+         'skills/target-debug/scripts/esp_session.py', 'skills/hil/scripts/esptool_session.py')
 
 
 def _hil_load():
@@ -676,6 +681,137 @@ def reset_esptool(flasher: dict, *, port: str, timeout, run=None, esptool: str =
     return _once(run, argv, env=dict(ESPTOOL_ENV), timeout=timeout)
 
 
+def esptool_runtime(esptool: str = 'esptool', *, timeout: float = 60) -> dict:
+    """The esptool a flash and its helper sessions run, checked with no device: `esptool` (a
+    name on PATH or a path) resolved once to an absolute path, its interpreter by tool_python
+    (the venv path kept, never resolved past its symlink), that interpreter importing an esptool
+    package from the sys.path the script gets (its resolved directory first, unless
+    PYTHONSAFEPATH) and the executable's `version` naming the same version. {'exe', 'python',
+    'version', 'package'}; RuntimeError otherwise. Not cached: a caller keeps the identity for
+    its run."""
+    exe = shutil.which(esptool)
+    if exe is None:
+        raise RuntimeError(f'{esptool} is not on PATH')
+    exe = os.path.abspath(exe)
+    python = tool_python(exe)
+    probe = ('import json, sys\n'
+             'if not getattr(sys.flags, "safe_path", False): sys.path[0] = sys.argv[1]\n'
+             'import esptool\n'
+             'print(json.dumps([esptool.__version__, esptool.__file__]))')
+    try:
+        imported = subprocess.run([python, '-B', '-c', probe, os.path.dirname(os.path.realpath(exe))],
+                                  capture_output=True, text=True, timeout=timeout, cwd='/')
+        said = subprocess.run([exe, 'version'], capture_output=True, text=True, timeout=timeout, cwd='/',
+                              env={**os.environ, **ESPTOOL_ENV})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f'esptool runtime {exe}: {e}') from None
+    try:
+        version, package = json.loads(imported.stdout.strip().splitlines()[-1]) if imported.returncode == 0 else ()
+        if not (isinstance(version, str) and isinstance(package, str)):
+            raise TypeError
+    except (ValueError, IndexError, TypeError):
+        raise RuntimeError(f'{python}, the interpreter of {exe}, imports no esptool package: '
+                           f'{(imported.stderr or imported.stdout).strip()[-200:]!r}') from None
+    if said.returncode or re.findall(r'^esptool v(\S+)$', said.stdout, re.M) != [version]:
+        raise RuntimeError(f'{exe} version does not report {version}, the package its interpreter imports: '
+                           f'rc {said.returncode}, {said.stdout.strip()[-200:]!r}')
+    return {'exe': exe, 'python': python, 'version': version, 'package': package}
+
+
+def esptool_offsets(flash_args: str) -> list:
+    """The offsets flash_esptool writes for `flash_args` (flash_args_tokens' pairs), in order."""
+    _, pairs = flash_args_tokens(flash_args)
+    if not pairs:
+        raise ValueError('flash_args: want "<offset> <file>" pairs after the options')
+    return [int(offset, 0) for offset, _ in pairs]
+
+
+# any CSI sequence: esptool 5.2.0 and 5.3.1 move the cursor off a TTY too
+_CSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+# esptool 5.2.0/5.3.1 cmds.py write_flash and loader.py hard_reset, as recorded on ci.lan (5.3.1)
+# and the tinyuf2 bench (5.2.0): a write's line, compressed by the stub unless it would not
+# shrink or the run has --no-stub, then that write's verify; the hard reset after the last
+_ESP_WROTE = re.compile(r'^Wrote \d+ bytes (?:\(\d+ compressed\) )?at 0x([0-9a-f]{8}) in ', re.M)
+_ESP_RESET = re.compile(r'^Hard resetting via RTS pin\.\.\.$', re.M)
+_ESP_REFUTED = ('A fatal error occurred', 'Chip was NOT reset', 'Verify failed', 'MD5 of file does not match')
+
+
+def esptool_flash_judgment(out: str, offsets) -> dict:
+    """Whether a flash_esptool transcript writes every requested offset once, each write
+    followed by its own `Hash of data verified.` before the next write or, for the last, the
+    hard reset; CSI sequences ignored. An unknown output shape fails. {'ok', 'problem' (''
+    when ok), 'wrote': [offsets as written]}."""
+    text = _CSI.sub('', out)
+    writes = list(_ESP_WROTE.finditer(text))
+    wrote, want = [int(m[1], 16) for m in writes], sorted(offsets)
+    reset = _ESP_RESET.search(text, writes[-1].end()) if writes else None
+    problem = ''
+    if not want:
+        problem = 'no offsets requested'
+    elif len(set(want)) != len(want):
+        problem = f'offsets {[hex(o) for o in want]} repeat'
+    elif len(re.findall(r'^Wrote ', text, re.M)) != len(writes):
+        problem = 'a Wrote line of an unknown shape'
+    elif sorted(wrote) != want:
+        problem = f'wrote {[hex(o) for o in wrote]}, not the requested {[hex(o) for o in want]}'
+    elif said := next((m for m in _ESP_REFUTED if m in text), None):
+        problem = f'the output says {said!r}'
+    elif reset is None:
+        problem = 'no hard reset after the last write'
+    else:
+        ends = [m.start() for m in writes[1:]] + [reset.start()]
+        unverified = [hex(int(m[1], 16)) for m, end in zip(writes, ends)
+                      if 'Hash of data verified.' not in text[m.end():end]]
+        if unverified:
+            problem = f'no verify between the write at {", ".join(unverified)} and the next write or the reset'
+        elif text.count('Hash of data verified.') != len(want):
+            problem = f'{text.count("Hash of data verified.")} verifies for {len(want)} writes'
+    return {'ok': not problem, 'problem': problem, 'wrote': wrote}
+
+
+def esptool_problem(op, offsets) -> str:
+    """Why a flash_esptool Operation did not flash `offsets` (esptool_offsets of the flash_args
+    it ran), '' when it did: its last attempt exited 0 and its transcript passes
+    esptool_flash_judgment. An earlier attempt's output never counts."""
+    last = op.attempts[-1]
+    if last.kind != 'exited':
+        return f'esptool {last.kind.replace("_", " ")}'
+    if last.result.returncode != 0:
+        return f'esptool exit {last.result.returncode}'
+    return esptool_flash_judgment(hil_process.cmd_stdout_text(last.result.stdout), offsets)['problem']
+
+
+SERIAL_BY_ID = '/dev/serial/by-id'
+USJ_SERIAL = re.compile(r'[0-9A-F]{2}(?::[0-9A-F]{2}){5}')   # a chip's USB-Serial/JTAG serial: its MAC
+
+
+def esptool_port(uid: str) -> str:
+    """The serial device esptool opens for a roster uid (UID_RE, as every flasher's): a
+    USB-Serial/JTAG serial (USJ_SERIAL) through hil_openocd_esp.usj_tty, loaded only then (it
+    starts nothing); a USB-UART bridge serial through its /dev/serial/by-id link, exactly one,
+    resolving to a character device. RuntimeError naming the candidates otherwise. Resolve it
+    just before use, under the board's reservation: tty numbering moves with re-enumeration."""
+    if not isinstance(uid, str) or not UID_RE.fullmatch(uid):
+        raise RuntimeError(f'uid {uid!r}: want a probe serial')
+    if USJ_SERIAL.fullmatch(uid):
+        try:
+            openocd_esp = hil_load.load_file('skills/hil/scripts/hil_openocd_esp.py')
+        except ImportError as e:
+            raise RuntimeError(f'USJ serial {uid}: {e}') from None
+        return openocd_esp.usj_tty(uid)
+    links = sorted(glob.glob(os.path.join(SERIAL_BY_ID, f'*_{glob.escape(uid)}-if*')))
+    if len(links) != 1:
+        raise RuntimeError(f'bridge serial {uid}: want one {SERIAL_BY_ID} link, found {links or "none"}')
+    tty = os.path.realpath(links[0])
+    try:
+        is_chr = stat.S_ISCHR(os.stat(tty).st_mode)
+    except OSError as e:
+        raise RuntimeError(f'bridge serial {uid}: {links[0]} -> {tty}: {e}') from None
+    if not is_chr:
+        raise RuntimeError(f'bridge serial {uid}: {links[0]} -> {tty} is not a character device')
+    return tty
+
+
 def flash_lm4flash(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     # TI Tiva-C / Stellaris ICDI: lightweight lm4flash, resets and runs after write
     return _once(run, ['lm4flash', '-s', _uid(flasher), *_args(flasher), str(firmware)], timeout=timeout)
@@ -702,8 +838,11 @@ def tool_python(tool: str) -> str:
     exe = shutil.which(tool)
     if exe is None:
         raise RuntimeError(f'{tool} is not on PATH')
-    with open(exe, 'rb') as f:
-        line = f.readline().decode(errors='replace').strip()
+    try:
+        with open(exe, 'rb') as f:
+            line = f.readline().decode(errors='replace').strip()
+    except OSError as e:
+        raise RuntimeError(f'{exe}: {e}') from None
     py = line[2:] if line.startswith('#!') else ''
     if not (os.path.isabs(py) and os.path.basename(py).startswith('python') and os.access(py, os.X_OK)):
         raise RuntimeError(f'{exe}: want an absolute python shebang, got {line!r}')
