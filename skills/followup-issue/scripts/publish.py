@@ -12,9 +12,9 @@ create first lists the open issues: ours with the same title and body is the
 earlier run's issue, another with the same title is a collision for the caller
 to judge, so nothing is created; a listing that fails creates nothing. comment
 posts on an open issue unless ours with the same body is there. A created issue
-or comment is read back and compared; when the response was lost the listing is
-read again for ours with the same body before anything is said. Nothing is ever
-edited, closed or deleted.
+or comment is read back and compared; when the response was lost or unusable
+the listing is read again for ours with the same body before anything is said.
+Nothing is ever edited, closed or deleted.
 
 A valid invocation's stdout ends with one JSON line {"repo", "action", "issue",
 "url", "outcome", "posted", "candidates", "error"}, null fields left out (posted
@@ -54,7 +54,18 @@ def gh(args, stdin=None):
     return r.returncode, r.stdout, r.stderr
 
 
-def api(method, path, body=None, paginate=False):
+def usable(x, need):
+    """An object holding the keys in need, whose fields the checks read, when there, have the shape they read."""
+    if not isinstance(x, dict) or any(x.get(k) is None for k in need):
+        return False
+    labels = x.get('labels', [])
+    return (isinstance(x.get('user') or {}, dict) and all(isinstance(x.get(k, ''), str) for k in ('title', 'html_url'))
+            and isinstance(labels, list)
+            and all(isinstance(lb, dict) and isinstance(lb.get('name'), str) for lb in labels))
+
+
+def api(method, path, body=None, paginate=False, need=()):
+    """An object, or a listing's objects, each usable; anything else is an ApiError."""
     args = ['api', '-X', method, path]
     if paginate:
         args += ['--paginate', '--slurp']
@@ -65,28 +76,37 @@ def api(method, path, body=None, paginate=False):
     rc, out, err = gh(args, stdin)
     if rc != 0:
         raise ApiError(err.strip() or out.strip())
-    data = json.loads(out) if out.strip() else None
-    return [x for page in data for x in page] if paginate else data
+    try:
+        data = json.loads(out)
+        if paginate and not (isinstance(data, list) and data and all(isinstance(page, list) for page in data)):
+            raise ValueError('not a list of pages')   # else {} or [{}] would read as no issues and post again
+        items = [x for page in data for x in page] if paginate else [data]
+        if not all(usable(x, need) for x in items):
+            raise ValueError(f'not objects with {", ".join(need) or "fields"} of the expected shape')
+    except (ValueError, TypeError) as e:
+        raise ApiError(f'unusable response ({e}): {out.strip()[:200]}')
+    return items if paginate else data
 
 
 class Issues:
     def __init__(self, repo):
         self.repo = repo
-        self.me = api('GET', 'user')['login']
+        self.me = api('GET', 'user', need=('login',))['login']
 
     def open_issues(self):
         """Open issues only: the issues endpoint lists pull requests too."""
-        items = api('GET', f'repos/{self.repo}/issues?state=open&per_page=100', paginate=True)
+        items = api('GET', f'repos/{self.repo}/issues?state=open&per_page=100', paginate=True,
+                    need=('number', 'html_url', 'title'))
         return [i for i in items if 'pull_request' not in i]
 
     def issue(self, number):
-        return api('GET', f'repos/{self.repo}/issues/{number}')
+        return api('GET', f'repos/{self.repo}/issues/{number}', need=('number',))
 
     def comments(self, number):
-        return api('GET', f'repos/{self.repo}/issues/{number}/comments?per_page=100', paginate=True)
+        return api('GET', f'repos/{self.repo}/issues/{number}/comments?per_page=100', paginate=True, need=('html_url',))
 
     def ours(self, item, body):
-        return item.get('user', {}).get('login') == self.me and item.get('body') == body
+        return (item.get('user') or {}).get('login') == self.me and item.get('body') == body
 
     def differs(self, issue, args, body):
         """What keeps issue from being the one args asks for, by name."""
@@ -147,7 +167,8 @@ def create(gi, args, body):
         return receipt(repo, 'create', 'collision',
                        candidates=[{'issue': i['number'], 'url': i['html_url'], 'title': i['title']} for i in same])
     try:
-        made = api('POST', f'repos/{repo}/issues', {'title': args.title, 'body': body, 'labels': args.label})
+        made = api('POST', f'repos/{repo}/issues', {'title': args.title, 'body': body, 'labels': args.label},
+                   need=('number',))
     except ApiError as e:
         return recover_issue(gi, args, body, f'create response lost: {e}')
     try:
@@ -188,7 +209,7 @@ def comment(gi, args, body):
     if mine:
         return receipt(repo, 'comment', 'verified', number, mine['html_url'])
     try:
-        made = api('POST', f'repos/{repo}/issues/{number}/comments', {'body': body})
+        made = api('POST', f'repos/{repo}/issues/{number}/comments', {'body': body}, need=('id',))
     except ApiError as e:
         return recover_comment(gi, args, body, f'comment response lost: {e}')
     try:

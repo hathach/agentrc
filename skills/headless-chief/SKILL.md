@@ -81,4 +81,4 @@ headless recipe.
 
 The rest of the directory is for autopsy: `stream.jsonl` (every event,
 raw), `stderr.log`, and `session`, whose id names the transcript:
-`ls ~/.claude/projects/*/<id>.jsonl`.
+`ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/<id>.jsonl`.

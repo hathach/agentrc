@@ -40,6 +40,7 @@ class FakeGitHub:
         self.lose = set()      # POST paths whose response is lost after the write lands
         self.drop = set()      # POST paths whose response is lost and whose write never lands
         self.tamper = None     # a function altering what a read-back returns
+        self.garble = {}       # (method, path): what gh prints instead, one per call, after any write lands; None answers
 
     def add_issue(self, number, title, body='b', login='someone', state='open', pr=False):
         self.issues[number] = {'number': number, 'title': title, 'body': body, 'user': {'login': login},
@@ -70,7 +71,9 @@ class FakeGitHub:
             return 1, '', f'gh: Not Found (HTTP 404)\n{path}'
         if method == 'POST' and bare in self.lose:
             return 1, '', 'gh: connection reset'
-        return 0, json.dumps(out), ''
+        queue = self.garble.get((method, bare))
+        garbled = queue.pop(0) if queue else None
+        return 0, json.dumps(out) if garbled is None else garbled, ''
 
     def rest(self, method, path, body, paginate):
         def page(xs):
@@ -242,6 +245,96 @@ class PublishTest(unittest.TestCase):
         code, r = self.create('x')
         self.assertEqual((code, r['outcome']), (1, 'uncertain'))
         self.assertNotIn('posted', r)
+
+    def unusable(self, method, path, *outputs):
+        self.fake.garble[(method, f'repos/{REPO}/{path}')] = list(outputs)
+
+    def test_an_unusable_create_response_is_recovered_by_relisting(self):
+        for n, bad in enumerate(('{', '', 'null', '[]', '{"html_url": "u"}', '{"number": null}'), 1):
+            self.unusable('POST', 'issues', bad)
+            code, r = self.create(f'x {n}')
+            self.assertEqual((code, r['outcome'], r['posted'], r['issue']), (0, 'verified', True, n), bad)
+            self.assertEqual(len(self.fake.posts), n, 'one POST each time')
+
+    def test_an_unusable_answer_after_a_create_is_uncertain_not_refused(self):
+        self.unusable('POST', 'issues', '{')
+        self.unusable('GET', 'issues', None, '[[{"title": "x"}]]')   # the check before, then the relisting
+        code, r = self.create('x')
+        self.assertEqual((code, r['outcome']), (1, 'uncertain'))
+        self.assertNotIn('posted', r)
+        self.assertIn('relisting failed: unusable response', r['error'])
+        self.unusable('GET', 'issues/2', '{"title": "y"}')
+        code, r = self.create('y')
+        self.assertEqual((code, r['outcome'], r['posted'], r['issue']), (1, 'uncertain', True, 2), 'read-back unusable')
+        self.assertEqual(len(self.fake.posts), 2, 'one POST each time')
+
+    def test_an_unusable_answer_before_any_post_is_refused(self):
+        for method, path in (('GET', 'issues'), ('GET', 'labels/followup')):
+            self.unusable(method, path, '<html>')
+            code, r = self.create('x', '--label', 'followup')
+            self.assertEqual((code, r['outcome']), (2, 'refused'), path)
+        self.fake.garble[('GET', 'user')] = ['{"login": null}']
+        code, r = self.create('x')
+        self.assertEqual((code, r['outcome']), (2, 'refused'))
+        self.fake.add_issue(3, 'covers it')
+        for path, bad in (('issues/3', '{"state": "open"}'), ('issues/3/comments', '[[{"body": "no url"}]]')):
+            self.unusable('GET', path, bad)
+            code, r = self.run_script('comment', '--issue', '3', '--body-file', self.body())
+            self.assertEqual((code, r['outcome']), (2, 'refused'), path)
+        self.assertEqual(self.fake.posts, [])
+
+    def test_a_listing_that_is_not_a_list_of_pages_of_issues_is_never_read_as_empty(self):
+        body = self.body()
+        self.create('x', body=body)   # ours: a listing read as empty would post it again
+        self.fake.add_comment(1, 'Ours.\n', ME)
+        bad = ('{}', '""', '[]', '[{}]', '[""]', '[[{"number": 2, "html_url": "u", "title": "x", "user": ["bad"]}]]')
+        for out in bad:
+            self.unusable('GET', 'issues', out)
+            code, r = self.create('x', body=body)
+            self.assertEqual((code, r['outcome']), (2, 'refused'), out)
+            self.unusable('GET', 'issues/1/comments', out)
+            code, r = self.run_script('comment', '--issue', '1', '--body-file', self.body('Ours.\n'))
+            self.assertEqual((code, r['outcome']), (2, 'refused'), out)
+        self.assertEqual(len(self.fake.posts), 1, 'nothing posted again')
+        self.fake.lose.update({f'repos/{REPO}/issues', f'repos/{REPO}/issues/1/comments'})
+        for n, out in enumerate(bad, 1):
+            self.unusable('GET', 'issues', None, out)   # the check before, then the relisting after the lost response
+            code, r = self.create(f'y {n}')
+            self.assertEqual((code, r['outcome']), (1, 'uncertain'), out)
+            self.assertNotIn('posted', r)
+            self.unusable('GET', 'issues/1/comments', None, out)
+            code, r = self.run_script('comment', '--issue', '1', '--body-file', self.body(f'More {n}.\n'))
+            self.assertEqual((code, r['outcome']), (1, 'uncertain'), out)
+        self.assertEqual(len(self.fake.posts), 1 + 2 * len(bad), 'one POST each time')
+
+    def test_a_read_back_whose_fields_cannot_be_read_is_uncertain(self):
+        self.fake.add_issue(3, 'covers it')
+        for n, bad in enumerate(({'user': ['bad']}, {'labels': [{}]}, {'labels': None}, {'labels': [{'name': ['x']}]},
+                                 {'title': 5}, {'html_url': ['u']}), 1):
+            self.fake.tamper = lambda i: {**i, **bad}
+            code, r = self.create(f'x {n}')
+            self.assertEqual((code, r['outcome'], r['posted']), (1, 'uncertain', True), bad)
+            if 'labels' not in bad:   # a comment has no labels
+                self.fake.tamper = lambda c: {**c, **bad} if 'issue_url' in c else c   # the comment's read-back only
+                code, r = self.run_script('comment', '--issue', '3', '--body-file', self.body(f'C {n}.\n'))
+                self.assertEqual((code, r['outcome'], r['posted']), (1, 'uncertain', True), bad)
+
+    def test_an_unusable_comment_response_goes_the_lost_response_way(self):
+        self.fake.add_issue(3, 'covers it')
+        self.unusable('POST', 'issues/3/comments', '{"html_url": "u"}')
+        code, r = self.run_script('comment', '--issue', '3', '--body-file', self.body('One.\n'))
+        self.assertEqual((code, r['outcome'], r['posted']), (0, 'verified', True), 'recovered by relisting')
+        self.unusable('POST', 'issues/3/comments', '{')
+        self.unusable('GET', 'issues/3/comments', None, '[[{"body": "x"}]]')   # the check before, then the relisting
+        code, r = self.run_script('comment', '--issue', '3', '--body-file', self.body('Two.\n'))
+        self.assertEqual((code, r['outcome']), (1, 'uncertain'))
+        self.assertNotIn('posted', r)
+        code, r = self.run_script('comment', '--issue', '3', '--body-file', self.body('Three.\n'))
+        self.assertEqual((code, r['outcome'], r['posted']), (0, 'verified', True))
+        self.unusable('GET', 'issues/comments/' + str(self.fake.next_id + 1), '{')
+        code, r = self.run_script('comment', '--issue', '3', '--body-file', self.body('Four.\n'))
+        self.assertEqual((code, r['outcome'], r['posted']), (1, 'uncertain', True), 'read-back unusable')
+        self.assertEqual(len(self.fake.posts), 4, 'one POST each time')
 
     def test_a_read_back_that_differs_is_a_mismatch(self):
         self.fake.tamper = lambda i: {**i, 'body': 'changed'}
