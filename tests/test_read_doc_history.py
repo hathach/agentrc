@@ -208,7 +208,10 @@ class History(unittest.TestCase):
         pdf, env = self.logged_library(b"%PDF")
         original, record = self.logged_run("search", env, "RM0001", "--path")
         self.assertEqual(original.returncode, 0, original.stderr)
-        self.assertIn(str(pdf), original.stdout)
+        # Not a string match: on Windows the library's realpath undoes the temp dir's 8.3 short name.
+        printed = [line.split(" ", 3)[3] for line in original.stdout.splitlines() if line.startswith("  PDF ")]
+        self.assertEqual(len(printed), 1, original.stdout)
+        self.assertTrue(os.path.samefile(printed[0], pdf), printed[0])
         self.assertEqual(self.replay(record, env).stdout, original.stdout)
 
     def test_bad_json_and_unknown_versions_are_reported_and_skipped(self):
