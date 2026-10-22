@@ -589,20 +589,41 @@ def _receipt_text(r) -> str:
     return f'receipt {r.get("token")} (supervisor pid {pid})' if isinstance(r, dict) else f'receipt {r!r:.80}'
 
 
-def _release_receipts(recs) -> list:
+def _release_receipts(recs, key='receipts') -> list:
     """The release predicate of a cleanup holder's records `recs`: the run_tracked receipts in
-    their `receipts`, every one of which must recheck `done`; none when they carry no
-    `receipts` (a takeover's or hil_reserve's holder). ValueError when the records disagree
-    or it is not a list."""
-    named = [('receipts' in r, r.get('receipts')) for r in recs]
+    their `receipts`, every one of which must recheck `done`, or with key='retained' the
+    sessions a provider left running, every one of which must read ended (_retained_state);
+    none when they carry no such key (a takeover's or hil_reserve's holder). ValueError when
+    the records disagree or it is not a list."""
+    named = [(key in r, r.get(key)) for r in recs]
     if any(n != named[0] for n in named):
-        raise ValueError('its records disagree on their receipts')
+        raise ValueError(f'its records disagree on their {key}')
     present, receipts = named[0] if named else (False, None)
     if not present:
         return []
     if not isinstance(receipts, list):
-        raise ValueError(f'its receipts {receipts!r:.80} are not a list')
+        raise ValueError(f'its {key} {receipts!r:.80} are not a list')
     return receipts
+
+
+def _retained_state(receipt) -> str:
+    """'ended' once the session receipt at path `receipt` (esp_session's receipt format) is
+    closed after its provider's reviewed end, as `hil_openocd_esp.py end` leaves it on exit 0
+    (`closed` true, `cleanup` 'done'), else why not. A receipt kept as a record, not a path, is
+    never reread, so never ended: its board needs a recovery takeover."""
+    if not isinstance(receipt, str):
+        return 'not a receipt path, so never proven ended'
+    try:
+        # non-blocking: a FIFO in its place must not hang a release
+        with os.fdopen(os.open(receipt, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)) as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return 'not a regular file'
+            rec = json.load(f)
+    except (OSError, ValueError) as e:
+        return f'unreadable ({e!r:.80})'
+    if not isinstance(rec, dict) or rec.get('closed') is not True:
+        return 'not closed'
+    return 'ended' if rec.get('cleanup') == 'done' else f'closed with cleanup {rec.get("cleanup")!r:.40}'
 
 
 def _rechecks(receipts) -> list:
@@ -707,9 +728,17 @@ def _kill_and_reap(pidfd, deadline) -> bool:
         os.close(pidfd)
 
 
-def _release_blocker(receipts, holder=None) -> str:
-    """Why the release predicate `receipts` is false now, or '' when every one rechecks `done`.
-    `holder`, (pid, start), is whose ownership context rechecks them (_holder_ids)."""
+def _release_blocker(receipts, holder=None, retained=()) -> str:
+    """Why the release predicate is false now, or '' when every one of `receipts` rechecks `done`
+    and every one of `retained` reads ended. `holder`, (pid, start), is whose ownership context
+    rechecks the receipts (_holder_ids)."""
+    sessions = [f'{r!r:.120} {s}' for r, s in ((r, _retained_state(r)) for r in retained) if s != 'ended']
+    why = (f'its retained sessions are not proven ended (end each with `hil_openocd_esp.py end --receipt`, '
+           f'exit 0): {"; ".join(sessions)}') if sessions else ''
+    return '; '.join(w for w in (why, _receipts_blocker(receipts, holder)) if w)
+
+
+def _receipts_blocker(receipts, holder) -> str:
     if not receipts:
         return ''
     try:
@@ -749,7 +778,7 @@ def release_token(token: str):
         raise ReleaseRefused(f'not signalled: token {token}: record lock set {sorted(lockset)} '
                              f'!= files carrying it {sorted(found)}')
     try:
-        receipts = _release_receipts(found.values())
+        receipts, retained = _release_receipts(found.values()), _release_receipts(found.values(), 'retained')
     except ValueError as e:
         raise ReleaseRefused(f'not signalled: token {token}: its release predicate cannot be evaluated: {e}')
     live = proc_start(pid)
@@ -758,7 +787,7 @@ def release_token(token: str):
                 f'pid {pid} is not the recorded holder (start {live} != {start})')
         raise ReleaseRefused(f'not signalled: {gone}; its boards need a recovery takeover '
                              f'(`hil_lock.py hold --take-over {lockset[0]}`)')
-    why = _release_blocker(receipts, (pid, start))
+    why = _release_blocker(receipts, (pid, start), retained)
     if why:
         raise ReleaseRefused(f'not signalled: holder pid {pid} of token {token} keeps '
                              f'{", ".join(sorted(found))}: {why}')
@@ -775,7 +804,7 @@ def release_token(token: str):
     _pidfd_signal(pid, start, signal.SIGUSR1, still_valid)
     left = _wait_cleared(sorted(found), pid, start, time.monotonic() + RELEASE_WAIT)
     if left:
-        why = _release_blocker(receipts, (pid, start))   # it held above, but the holder's own recheck decides
+        why = _release_blocker(receipts, (pid, start), retained)   # it held above, but the holder's own recheck decides
         raise ReleaseRefused(f'signalled, but holder pid {pid} left its records or flocks on {", ".join(left)}'
                              + (f': {why}' if why else ''))
     return pid, sorted(found)
@@ -1004,7 +1033,7 @@ def _releasable(handles) -> bool:
             return False
         recs.append(rec)
     try:
-        return not _release_blocker(_release_receipts(recs))
+        return not _release_blocker(_release_receipts(recs), None, _release_receipts(recs, 'retained'))
     except ValueError:
         return False
 
@@ -1034,8 +1063,9 @@ def hand_to_cleanup_holder(handles, reason, *, detail, receipts=(), wait=HANDOFF
     failed handoff, each wait bounded by `wait`, raises LockUnavailable (an interrupt
     propagates) and leaves every board a recovery blocker whose takeover takes the group.
     With `receipts` (hil_process.run_tracked's) the holder releases only once every one
-    rechecks `done`; `extra` adds fields to every record it writes, so a failed handoff's
-    protected record keeps them too. Past the ValueError
+    rechecks `done`, and with `retained=` (session receipt paths a provider left running) only
+    once every one reads ended (_retained_state); `extra` adds fields to every record it
+    writes, so a failed handoff's protected record keeps them too. Past the ValueError
     the caller closes its handles either way, never clearing them. Needs hil_process.py
     beside this file."""
     receipts, locks = list(receipts), sorted(handles)
@@ -1576,7 +1606,8 @@ A holder process holds ALL boards given in one `hold` call; releasing any of
 them ends that holder and releases all of its boards. A takeover holder is a
 cleanup holder over the blocked board's whole lock set; only `release --token`
 ends it, once the recovery succeeded. A cleanup holder that records a release
-predicate (the run_tracked receipts it waits for) ends only once that holds:
+predicate (the run_tracked receipts it waits for, the provider sessions in its
+`retained`) ends only once that holds:
 until then `release --token` refuses, naming what is still open.
 """
 

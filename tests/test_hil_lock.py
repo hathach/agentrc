@@ -1479,11 +1479,11 @@ class HandOver(LockDir):
     def receipt(self):
         return make_receipt(self, Path(self.dir, 'state'))
 
-    def hand_over(self, receipts=(), boards=(BOARD,)):
+    def hand_over(self, receipts=(), boards=(BOARD,), **extra):
         handles = {b: hil_lock.take_board_lock(b, 'selftest run', protected=True, locks=list(boards)) for b in boards}
         try:
             token = hil_lock.hand_to_cleanup_holder(handles, 'selftest run', detail='park failed', receipts=receipts,
-                                                    wait=5, holder='selftest')
+                                                    wait=5, holder='selftest', **extra)
         finally:
             for fh in handles.values():
                 fh.close()
@@ -1527,6 +1527,49 @@ class HandOver(LockDir):
         for b in (BOARD, self.OTHER):
             self.assertIsNone(hil_lock.read_record(b))
         self.assertIsNotNone(self.acquire())
+
+    def test_a_retained_session_refuses_up_front_and_the_holder_ends_once_its_receipt_reads_ended(self):
+        receipt = Path(self.dir, 'session', 'receipt.json')
+        token, pid = self.hand_over(retained=[str(receipt)])
+        self.assertEqual(hil_lock.read_record(BOARD)['retained'], [str(receipt)])
+        sent = self.signals()
+        receipt.parent.mkdir()
+        for content, state in ((None, 'unreadable'), ({'closed': False, 'cleanup': None}, 'not closed'),
+                               ({'closed': True, 'cleanup': 'unknown'}, "closed with cleanup 'unknown'")):
+            if content is not None:
+                receipt.write_text(json.dumps(content))
+            with self.assertRaisesRegex(hil_lock.ReleaseRefused,
+                                        rf'not signalled: holder pid {pid} of token {token} keeps {BOARD}: its '
+                                        r'retained sessions are not proven ended \(end each with '
+                                        rf'`hil_openocd_esp.py end --receipt`, exit 0\): .*receipt.json\' {state}'):
+                hil_lock.release_token(token)
+        self.assertEqual(sent, [])
+        # the holder's own check decides: a release that slips past the up-front check leaves it holding
+        rec = hil_lock.read_record(BOARD)
+        self.patch(hil_lock, 'RELEASE_WAIT', 0.5)
+        with mock.patch.object(hil_lock, '_release_blocker', lambda *a: ''):
+            with self.assertRaisesRegex(hil_lock.ReleaseRefused, f'signalled, but holder pid {pid} left its records'):
+                hil_lock.release_token(token)
+        self.assertEqual((sent, hil_lock.read_record(BOARD)), ([signal.SIGUSR1], rec))
+        receipt.write_text(json.dumps({'closed': True, 'cleanup': 'done'}))
+        self.patch(hil_lock, 'RELEASE_WAIT', 5)
+        self.assertEqual(hil_lock.release_token(token), (pid, [BOARD]))
+        self.assertIsNone(hil_lock.read_record(BOARD))
+
+    def test_a_retained_session_reads_ended_only_from_a_closed_receipt_file(self):
+        fifo = Path(self.dir, 'fifo')
+        os.mkfifo(fifo)
+        for receipt, state in (({'closed': True, 'cleanup': 'done'}, 'not a receipt path, so never proven ended'),
+                               (str(fifo), 'not a regular file'),
+                               (str(Path(self.dir, 'none.json')), 'unreadable (FileNotFoundError')):
+            self.assertTrue(hil_lock._retained_state(receipt).startswith(state), receipt)
+        fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
+        self.addCleanup(fh.close)
+        ended = Path(self.dir, 'ended.json')
+        ended.write_text(json.dumps({'closed': True, 'cleanup': 'done'}))
+        for retained, releasable in (([str(ended)], True), ([str(ended), str(fifo)], False), ('x', False)):
+            hil_lock.write_record(fh, 'selftest run', retained=retained)
+            self.assertEqual(hil_lock._releasable([fh]), releasable, retained)
 
     def test_token_mismatch_pid_reuse_and_a_partial_lock_set_signal_nothing(self):
         token, pid = self.hand_over(boards=(BOARD, self.OTHER))

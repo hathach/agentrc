@@ -382,8 +382,9 @@ class Engine(unittest.TestCase):
                 ctx.retain('openocd_esp session', receipts)
         self.p.reset = retaining
 
-    def test_a_retained_session_hands_the_board_to_a_cleanup_holder_naming_its_receipts(self):
-        receipts = ['/s/' + 'r' * 600 + '.json']     # past the detail's 500 characters
+    def test_a_retained_session_hands_the_board_to_a_cleanup_holder_released_once_it_ended(self):
+        receipt = self.d / ('r' * 200) / ('r' * 200) / ('r' * 200 + '.json')     # past the detail's 500 characters
+        receipts = [str(receipt)]
         self.retain_after_reset(receipts)
         patch(self, eng, 'HOLDER_READY', 5)
         row = self.check()
@@ -392,8 +393,16 @@ class Engine(unittest.TestCase):
         rec = lk.read_record('b')
         self.assertTrue(lk.is_cleanup_holder(rec))
         self.assertEqual(rec['retained'], receipts)
-        self.assertIn('`hil_openocd_esp.py end --receipt`', row['note'][-1], 'release --token does not check them')
-        lk.release_token(row['cleanup']['token'])
+        self.assertIn('`hil_openocd_esp.py end --receipt`', row['note'][-1])
+        self.assertIn('release --token refuses until each ended', row['note'][-1])
+        token = row['cleanup']['token']
+        with self.assertRaisesRegex(lk.ReleaseRefused, 'retained sessions are not proven ended'):
+            lk.release_token(token)
+        self.assertEqual(lk.read_record('b'), rec)
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({'closed': True, 'cleanup': 'done'}))    # as `hil_openocd_esp.py end` leaves it
+        lk.release_token(token)
+        self.assertIsNone(lk.read_record('b'))
 
     def test_a_failed_handoff_keeps_the_retained_receipts_in_the_protected_record(self):
         receipts = ['/s/r1.json', {'pid': 7, 'startTime': '1', 'log': '/s/l'}]
@@ -406,7 +415,7 @@ class Engine(unittest.TestCase):
         rec = lk.read_record('b')
         self.assertEqual((rec['protected'], rec['retained']), (True, receipts))
         self.assertNotIn('role', rec)
-        self.assertIn('neither release nor takeover checks them', row['note'][-1])
+        self.assertIn('a takeover does not check them', row['note'][-1])
 
     # --- handing a survivor's board to a cleanup holder -----------------------------------------
     def handoff(self, argv=None, popen=None):

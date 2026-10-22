@@ -193,8 +193,9 @@ class Context:
         """A session the profile's provider left running outside `run` (an openocd_esp server):
         pending until the contract's recovery ends it, so nothing more starts on the board and
         its lock passes to a cleanup holder. `receipts` (JSON values) are the provider's own,
-        never rechecked here; the row and the holder's record carry them whole. No receipts, no
-        entry; the same detail and receipts are entered once."""
+        never rechecked here; the row and the holder's record carry them whole, and the holder
+        releases only once each is a receipt path its provider closed as ended (hil_lock's
+        release predicate). No receipts, no entry; the same detail and receipts are entered once."""
         receipts = list(receipts)
         json.dumps(receipts)          # a TypeError now, not a finalization failure later
         entry = {'cmd': detail, 'cleanup': 'pending', 'receipt': None, 'retained': receipts}
@@ -406,7 +407,8 @@ def _finalize(fh, lock: str, ctx: Context, row: dict) -> None:
         row['note'].append(f'protected record kept: recovery takes it over (`hil_lock.py hold --take-over {lock}`)')
     if retained:
         row['note'].append('first end every session in cleanup.retained with its provider (openocd_esp: '
-                           '`hil_openocd_esp.py end --receipt`, exit 0): neither release nor takeover checks them')
+                           '`hil_openocd_esp.py end --receipt`, exit 0): release --token refuses until each '
+                           'ended; a takeover does not check them')
     with contextlib.suppress(OSError):
         fh.close()   # never clear_record: the record is the blocker
     say(f'{row["name"]:26} BLOCKED: {cleanup["blocker"]} ({cleanup["result"]})')
