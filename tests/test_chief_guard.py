@@ -313,6 +313,13 @@ class ChiefGuard(unittest.TestCase):
             with self.subTest(c=c):
                 self.assert_allowed(c)
 
+    def test_windows_keeps_dot_as_the_source_builtin(self):
+        # Windows drops a file name's trailing dots, which once left `.` an empty program name
+        with mock.patch.object(self.guard.os, 'name', 'nt'):
+            for c in ('. <(echo git status)', '. /tmp/*.sh'):
+                with self.subTest(c=c):
+                    self.assert_denied(c, 'known only at run time')
+
     def test_a_value_bash_evaluates_again_is_denied_where_the_command_says_so(self):
         # #223: these evaluate a variable's value as a name, a prompt or arithmetic, running any substitution it holds
         for c in ("x='b[$(git push)]'; let x", "x='b[$(git push)]'; declare -i y; y=x", 'typeset -i y', 'local -ir y',
@@ -468,9 +475,10 @@ class ChiefGuard(unittest.TestCase):
             self.assert_denied(c, 'cannot tell what runs')
         self.assert_allowed("'/tmp/a*b' --version")
         # a bare tilde prefix as the command word expands to $HOME, $OLDPWD, $PWD or a user's home; a quoted one is literal
-        for c in ('HOME=/usr/bin/git; ~ push', "bash -c '~ push'", "eval '~- push'", '~+ push', '~root push'):
+        for c in ('HOME=/usr/bin/git; ~ push', "bash -c '~ push'", "eval '~- push'", '~+ push', '~root push',
+                  'env ~ push', 'sudo ~ push', 'echo x | xargs ~ push', 'find . -exec ~ push \\;'):
             self.assert_denied(c, 'cannot tell what runs')
-        for c in ("'~' x", '\\~ x'):
+        for c in ("'~' x", '"~" x', '\\~ x'):
             self.assert_allowed(c)
         self.assert_denied('~/bin/git push', 'changes the repository')
         self.assert_allowed('~/bin/git status')
