@@ -147,9 +147,9 @@ sudo apt-get install -y xvfb xdotool imagemagick
 # SystemView: segger.com/downloads/systemview (Linux .deb, installs /usr/bin/systemview); JLinkExe: segger.com/jlink
 ```
 
-- SystemView deletes `/tmp/sv-*` at startup: `sysview_record.py` refuses an `--out`, `--from-raw`, `--elf` or
-  `--hil-config` there, but nothing guards another build or capture directory. carried over (a build tree erased
-  mid-session).
+- SystemView deletes `/tmp/sv-*` at startup (a build tree was erased mid-session that way). `sysview_record.py`
+  gives it a private `/tmp` holding only the X server's socket directory and, under `/tmp/.sysview_record`, its
+  temporary HOME and `--out`, so the host's `/tmp` is out of its reach.
 - Linux only, and `unshare --user --map-root-user --mount` must work for the operator (unprivileged user
   namespaces). SystemView's J-Link DLL opens every J-Link it can reach at startup, live or decode, whichever probe
   `-usb` names: on a rig that raised a terms-of-use notice per other board's on-board probe and a "Communication timed

@@ -46,6 +46,11 @@ while True:
 FAKE_SYSTEMVIEW = '''
 import json, os, socket, sys, time
 state, args = os.environ['FAKE_STATE'], sys.argv[1:]
+def host(path):
+    for seen, src in json.loads(os.environ.get('FAKE_NS', '{}')).items():
+        if path.startswith(seen + '/'):
+            return src + path[len(seen):]
+    raise SystemExit(f'{path} is not in the private /tmp')
 open(state + '.pid', 'w').write(str(os.getpid()))
 json.dump(args, open(state + '.args', 'w'))
 def windows(w=None):
@@ -79,10 +84,10 @@ while True:
         if os.environ.get('FAKE_EXIT_AFTER_START'):
             sys.exit(0)
     elif verb == '-save':
-        open(arg, 'wb').write(b'\\0' * 10 + b'recording')
+        open(host(arg), 'wb').write(b'\\0' * 10 + b'recording')
     elif verb.startswith('-export') and not os.environ.get('FAKE_NO_EXPORT'):
         text = {'-export-contexts': 'Name,Activations\\n', '-export': 'sequencenum,event\\n'}.get(verb, 'terminal\\n')
-        with open(arg, 'w') as f:
+        with open(host(arg), 'w') as f:
             if os.environ.get('FAKE_SLOW_EXPORT'):
                 f.write(text[:5]); f.flush(); time.sleep(1)
                 text = text[5:]
@@ -104,12 +109,19 @@ elif a[0] == 'key':
     json.dump(w, open(state, 'w'))
 '''
 
-# unshare as usb_jail calls it: log the namespace script, then exec the command after it
+# unshare as usb_jail calls it: log the namespace script, then exec the command after it with FAKE_NS mapping each
+# path the script binds into its private /tmp to the host directory behind it
 FAKE_UNSHARE = '''
-import os, sys
+import json, os, shlex, sys
 a = sys.argv[1:]
 i = a.index('-ec')
-open(os.environ['FAKE_STATE'] + '.unshare', 'w').write(a[i + 1])
+script = a[i + 1]
+open(os.environ['FAKE_STATE'] + '.unshare', 'w').write(script)
+steps = [shlex.split(s) for s in script.split('; ')]
+stage = next(s[2] for s in steps if s[:2] == ['mount', '--move'])
+binds = {'/tmp' + s[3][len(stage):]: s[2] for s in steps if s[:2] == ['mount', '--bind'] and s[3].startswith(stage)}
+os.environ['FAKE_NS'] = json.dumps(binds)
+open(os.environ['FAKE_STATE'] + '.ns', 'w').write(os.environ['FAKE_NS'])
 os.execvp(a[i + 3], a[i + 3:])
 '''
 
@@ -148,7 +160,21 @@ class Recorder(unittest.TestCase):
             patcher = mock.patch.object(record, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        for target, name, value in ((record.tempfile, 'tempdir', str(self.tmp)), (record, 'USB_SYSFS', self.sysfs)):
+        real_fd_links = record.fd_links
+
+        def fd_links(pid):
+            # the kernel shows a namespaced process's open files by their namespace paths; the fake runs unjailed
+            ns = Path(str(self.state) + '.ns')
+            binds = json.loads(ns.read_text()) if ns.exists() else {}
+            out = set()
+            for link in real_fd_links(pid):
+                for seen, src in binds.items():
+                    if link.startswith(src + '/'):
+                        link = seen + link[len(src):]
+                out.add(link)
+            return out
+        for target, name, value in ((record.tempfile, 'tempdir', str(self.tmp)), (record, 'USB_SYSFS', self.sysfs),
+                                    (record, 'fd_links', fd_links)):
             patcher = mock.patch.object(target, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -188,9 +214,10 @@ class Recorder(unittest.TestCase):
         self.assertRegex(r['loadedTitle'], r' - sysview-[0-9a-f]{32}\.SVDat \|')
         self.assertEqual(r['systemviewVersion'], '4.10b')
         load, = self.loads()
-        self.assertRegex(load, r'^-load .*/sysview-[0-9a-f]{32}\.SVDat$')
-        self.assertEqual(self.commands()[1:], [f'-export-contexts {self.out / "contexts.csv"}',
-                                               f'-export {self.out / "events.txt"}', '-quit'])
+        self.assertRegex(load, r'^-load /tmp/\.sysview_record/home/sysview-[0-9a-f]{32}\.SVDat$')
+        seen = record.NS_TMP / 'out'    # --out as SystemView sees it in its private /tmp
+        self.assertEqual(self.commands()[1:], [f'-export-contexts {seen / "contexts.csv"}',
+                                               f'-export {seen / "events.txt"}', '-quit'])
         self.assertEqual(r['registryCopied'], ['SEGGER_REG_HKEY_CURRENT_USER.xml'])
         self.assertEqual(os.listdir(self.home / '.config' / 'SEGGER'), ['SEGGER_REG_HKEY_CURRENT_USER.xml'])
         self.assert_nothing_left()
@@ -214,6 +241,7 @@ class Recorder(unittest.TestCase):
         rc, r = self.run_main('--from-raw', str(self.raw), FAKE_SLOW_EXPORT='1')
         self.assertEqual(rc, 0, r)
         self.assertEqual((self.out / 'contexts.csv').read_text(), 'Name,Activations\n')
+        self.assertEqual(r['exports'], {'contexts.csv': 17, 'events.txt': 18})    # the sizes once closed
 
     def test_silent_xvfb_fails_and_cleans_up(self):
         rc, r = self.run_main('--from-raw', str(self.raw), FAKE_XVFB_SILENT='1')
@@ -267,8 +295,9 @@ class Recorder(unittest.TestCase):
     def test_live_records_saves_and_exports_the_saved_recording(self):
         rc, r = self.live('--workload', 'sleep 30')
         self.assertEqual(rc, 0, r)
-        saved = self.out / 'recording.SVDat'
+        saved = record.NS_TMP / 'out' / 'recording.SVDat'
         self.assertEqual(self.commands()[:3], ['-start', '-stop', f'-save {saved}'])
+        self.assertTrue((self.out / 'recording.SVDat').exists())
         self.assertRegex(self.commands()[3], r'^-load .*/sysview-[0-9a-f]{32}\.SVDat$')
         self.assertEqual(r['recordingTitle'], 'SEGGER SystemView V4.10b - *New Recording - app [FreeRTOS] on board')
         self.assertEqual(r['dialogsAnswered'].get('Recorder Configuration'), 1)
@@ -354,8 +383,39 @@ class Recorder(unittest.TestCase):
     def test_a_decode_sees_no_usb_device(self):
         rc, r = self.run_main('--from-raw', str(self.raw))
         self.assertEqual(rc, 0, r)
-        self.assertNotIn('--bind', self.jail())
+        self.assertNotIn('/dev/bus/usb/', self.jail())
         self.assertIn('mount -t tmpfs none /dev/bus/usb', self.jail())
+
+    def test_systemview_gets_a_private_tmp_with_only_its_home_out_and_x_socket(self):
+        rc, r = self.run_main('--from-raw', str(self.raw))
+        self.assertEqual(rc, 0, r)
+        steps = self.jail().split('; ')
+        stage = next(s for s in steps if s.startswith('mount --move')).split()[2]
+        self.assertEqual(steps[-2:], [f'mount --move {stage} /tmp', 'exec "$@"'])
+        self.assertIn(f'mount -t tmpfs none {stage}', steps)
+        binds = {s.split()[3][len(stage):]: s.split()[2] for s in steps if s.startswith('mount --bind')
+                 and s.split()[3].startswith(stage)}
+        home = binds.pop('/.sysview_record/home')
+        self.assertEqual(Path(home).parent, self.tmp)    # the run's temporary HOME
+        self.assertEqual(binds.pop('/.sysview_record/out'), str(self.out))
+        self.assertEqual(binds, {'/.X11-unix': '/tmp/.X11-unix'} if Path('/tmp/.X11-unix').is_dir() else {})
+
+    def test_an_out_with_spaces_is_bound_and_exported(self):
+        self.out = self.dir / 'my out'
+        rc, r = self.run_main('--from-raw', str(self.raw))
+        self.assertEqual(rc, 0, r)
+        self.assertIn(f"mount --bind '{self.out}' ", self.jail())
+        self.assertEqual((self.out / 'events.txt').read_text(), 'sequencenum,event\n')
+
+    def test_an_out_under_a_tmp_sv_directory_is_reached_only_through_the_private_tmp(self):
+        # SystemView deletes /tmp/sv-* at startup; inside its namespace the host's /tmp is not there to delete
+        sv = Path(tempfile.mkdtemp(prefix='sv-', dir='/tmp'))
+        self.addCleanup(shutil.rmtree, sv)
+        self.out = sv / 'out'
+        rc, r = self.run_main('--from-raw', str(self.raw))
+        self.assertEqual(rc, 0, r)
+        self.assertEqual((self.out / 'contexts.csv').read_text(), 'Name,Activations\n')
+        self.assertNotIn(str(sv), ' '.join(self.commands()))
 
     def test_a_probe_not_on_the_bus_or_ambiguous_fails(self):
         self.usb_device('9-9', '123', 9, 9)
@@ -465,7 +525,6 @@ class Usage(unittest.TestCase):
                 'is for a live recording': ['--out', d + '/o', '--from-raw', str(raw), '--probe', '1'],
                 'no such non-empty file': ['--out', d + '/o', '--from-raw', d + '/none'],
                 'not an empty directory': ['--out', str(full), '--from-raw', str(raw)],
-                'deletes /tmp/sv-*': ['--out', '/tmp/sv-x', '--from-raw', str(raw)],
                 'needs --interface and --speed': ['--out', d + '/o', '--probe', '1', '--device', 'X', '--addr', '0x1',
                                                   '--duration-ms', '1'],
                 'must be kHz': ['--out', d + '/o'] + live[:7] + ['auto'] + live[8:],
@@ -476,32 +535,6 @@ class Usage(unittest.TestCase):
             for want, argv in cases.items():
                 with self.subTest(want):
                     self.assertIn(want, self.usage(*argv))
-
-    def test_out_inside_a_tmp_sv_directory_is_refused(self):
-        with tempfile.TemporaryDirectory() as d, \
-                mock.patch.object(record, 'prepare_out', side_effect=AssertionError('the guard let it through')):
-            raw = Path(d) / 'c.SVDat'
-            raw.write_bytes(b'x')
-            for out in ('/tmp/sv-x', '/tmp/sv-project/nested/out'):
-                with self.subTest(out):
-                    self.assertIn('deletes /tmp/sv-*', self.usage('--out', out, '--from-raw', str(raw)))
-
-    def test_inputs_inside_a_tmp_sv_directory_are_refused(self):
-        # SystemView would delete them at startup, before a decode reads --from-raw
-        sv = Path(tempfile.mkdtemp(prefix='sv-', dir='/tmp'))
-        self.addCleanup(shutil.rmtree, sv)
-        raw = sv / 'c.SVDat'
-        raw.write_bytes(b'x')
-        live = ['--probe', '1', '--device', 'X', '--interface', 'swd', '--speed', '4000', '--duration-ms', '100']
-        with tempfile.TemporaryDirectory() as d, \
-                mock.patch.object(record, 'resolve_live', return_value=0x1), \
-                mock.patch.object(record, 'prepare_out', side_effect=AssertionError('the guard let it through')):
-            cases = {'--from-raw': ['--from-raw', str(raw)],
-                     '--elf': ['--elf', str(sv / 'fw.elf')] + live,
-                     '--hil-config': ['--hil-config', str(sv / 'hil.json'), '--board', 'b'] + live}
-            for flag, argv in cases.items():
-                with self.subTest(flag):
-                    self.assertIn(f'{flag} {sv}', self.usage('--out', d + '/o', *argv))
 
     def test_openocd_board_is_refused_for_live(self):
         with tempfile.TemporaryDirectory() as d:

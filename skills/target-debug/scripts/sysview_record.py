@@ -25,8 +25,9 @@ to the run, repeats the load until the title names that copy, and only then expo
 SystemView has closed the file and its size holds.
 
 The license notice ("Continue under SFL": non-commercial or educational use) and the J-Link terms of use are
-accepted, as the operator has directed for every SEGGER notice. SystemView deletes /tmp/sv-* at startup, so an
---out, --from-raw, --elf or --hil-config there is refused.
+accepted, as the operator has directed for every SEGGER notice. SystemView deletes /tmp/sv-* at startup, so the
+namespace also gives it a private /tmp holding only the X server's socket directory and, under NS_TMP, its HOME and
+--out: the host's /tmp is out of its reach, and the commands it is sent name those namespace paths.
 
 Exit: 0 recorded and exported; 2 bad usage or not Linux; 3 a tool, the probe, the workload or an export failed, or a
 signal stopped the run (record.json says which).
@@ -54,6 +55,7 @@ from sysview_dump import control_block, prepare_out  # noqa: E402
 
 TOOLS = ('systemview', 'Xvfb', 'xdotool', 'unshare')
 USB_SYSFS, USB_DEV = Path('/sys/bus/usb/devices'), Path('/dev/bus/usb')
+X11_DIR, NS_TMP = Path('/tmp/.X11-unix'), Path('/tmp/.sysview_record')
 REGISTRY = ('SEGGER_REG_HKEY_CURRENT_USER.xml', 'JLinkDLL.ini')
 BANNER = re.compile(rb'SEGGER SystemView V(\S+) Command Server')
 # title fragment -> keys that answer it: mnemonics or the default button, never screen positions
@@ -173,10 +175,12 @@ def usb_node(serial):
     return hits[0]
 
 
-def usb_jail(cmd, keep, scratch):
-    """cmd in a user and mount namespace whose /dev/bus/usb holds only the device nodes in keep, at their own paths.
-    Each node is bind-mounted aside before the empty tmpfs covers /dev/bus/usb, then back in place; unshare execs
-    sh, which execs cmd, so the pid stays cmd's."""
+def usb_jail(cmd, keep, scratch, dirs):
+    """cmd in a user and mount namespace whose /dev/bus/usb holds only the device nodes in keep, at their own paths,
+    and whose /tmp is a private tmpfs holding X11_DIR and each host directory of dirs ({name: path}) at
+    NS_TMP/name. Each node is bind-mounted aside before the empty tmpfs covers /dev/bus/usb, then back in place; the
+    new /tmp is built on a tmpfs staged in scratch while the host's paths are still visible, then moved over /tmp.
+    unshare execs sh, which execs cmd, so the pid stays cmd's."""
     q = shlex.quote
     steps = []
     for i, node in enumerate(keep):
@@ -187,6 +191,16 @@ def usb_jail(cmd, keep, scratch):
     for i, node in enumerate(keep):
         steps += [f'mkdir -p {q(str(node.parent))}', f'touch {q(str(node))}',
                   f'mount --bind {q(str(scratch / f"usb{i}"))} {q(str(node))}']
+    stage = scratch / 'tmp'
+    stage.mkdir()
+    steps.append(f'mount -t tmpfs none {q(str(stage))}')
+    binds = {NS_TMP / name: Path(path) for name, path in dirs.items()}
+    if X11_DIR.is_dir():
+        binds[X11_DIR] = X11_DIR
+    for seen, src in binds.items():
+        dest = stage / seen.relative_to('/tmp')
+        steps += [f'mkdir -p {q(str(dest))}', f'mount --bind {q(str(src))} {q(str(dest))}']
+    steps.append(f'mount --move {q(str(stage))} /tmp')
     return ['unshare', '--user', '--map-root-user', '--mount', 'sh', '-ec', '; '.join(steps + ['exec "$@"']), 'sh',
             *cmd]
 
@@ -209,10 +223,11 @@ class SystemView:
                     shutil.copy2(src, segger / name)
                     self.copied.append(name)
             self.display = self.start_xvfb()
-            self.env = {**os.environ, 'HOME': str(self.home), 'XDG_CONFIG_HOME': str(self.home / '.config'),
-                        'DISPLAY': self.display}
+            self.ns = {'home': self.home, 'out': out}
+            self.env = {**os.environ, 'HOME': str(self.ns_path(self.home)),
+                        'XDG_CONFIG_HOME': str(self.ns_path(self.home / '.config')), 'DISPLAY': self.display}
             self.log = open(out / 'systemview.log', 'wb')
-            cmd = usb_jail(['systemview', *args, '-single', '-port', str(self.port)], usb_nodes, self.home)
+            cmd = usb_jail(['systemview', *args, '-single', '-port', str(self.port)], usb_nodes, self.home, self.ns)
             self.sv = subprocess.Popen(cmd, env=self.env,
                                        stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         except BaseException as e:
@@ -221,6 +236,13 @@ class SystemView:
             except (Failure, OSError, subprocess.SubprocessError) as cleanup:
                 e.cleanup_error = str(cleanup)
             raise
+
+    def ns_path(self, path):
+        """path, inside HOME or --out, as SystemView sees it in its namespace."""
+        for name, base in self.ns.items():
+            if path == base or base in path.parents:
+                return NS_TMP / name / path.relative_to(base)
+        raise ValueError(f'{path} is outside the directories SystemView sees')
 
     def start_xvfb(self):
         read, write = os.pipe()
@@ -323,7 +345,7 @@ class SystemView:
         deadline, resend = time.monotonic() + LOAD_S, 0
         while time.monotonic() < deadline:
             if time.monotonic() >= resend:
-                self.send(f'-load {copy}')
+                self.send(f'-load {self.ns_path(copy)}')
                 resend = time.monotonic() + LOAD_RETRY_S
             title = self.poll()
             if shown.search(title):
@@ -334,12 +356,13 @@ class SystemView:
     def write(self, command, path):
         """Run a command that writes path, which does not exist yet; its size once SystemView has closed it and
         the size holds."""
-        self.send(f'{command} {path}')
+        seen = self.ns_path(path)
+        self.send(f'{command} {seen}')
         deadline, last, still = time.monotonic() + EXPORT_S, -1, 0
         while time.monotonic() < deadline:
             self.poll()
             size = path.stat().st_size if path.exists() else -1
-            done = size > 0 and size == last and str(path) not in fd_links(self.sv.pid)
+            done = size > 0 and size == last and str(seen) not in fd_links(self.sv.pid)
             still = still + 1 if done else 0
             if still >= 2:
                 return size
@@ -469,11 +492,6 @@ def resolve_live(a, p):
     return control_block(a, p)
 
 
-def in_sv_tmp(path):
-    resolved = Path(path).resolve()
-    return any(d.parent == Path('/tmp') and d.name.startswith('sv-') for d in (resolved, *resolved.parents))
-
-
 def on_signal(signum, _frame):
     raise Failure(f'stopped by signal {signum}')
 
@@ -511,9 +529,6 @@ def main(argv=None):
     if missing:
         p.error(f"not on PATH: {', '.join(missing)} (SystemView's deb, xvfb, xdotool, util-linux)")
     out = Path(a.out).resolve()
-    for flag, path in (('--out', a.out), ('--from-raw', a.from_raw), ('--elf', a.elf), ('--hil-config', a.hil_config)):
-        if path and in_sv_tmp(path):
-            p.error(f'{flag} {path}: SystemView deletes /tmp/sv-* at startup')
     prepare_out(p, str(out))
 
     record = {'started': now(), 'argv': [shlex.quote(x) for x in (argv if argv is not None else sys.argv[1:])],
