@@ -455,7 +455,7 @@ class FakeRig:
 
 class JLinkSerial(unittest.TestCase):
     """J-Link reports a numeric serial zero-padded (681295394 is 000681295394); probe_state keeps
-    the same rule so it runs copied alone, held to this table."""
+    its own copy of the rule rather than importing it from the hil skill, held to this table."""
     TABLE = (('681295394', '681295394', 'exact'), ('E6614C311B597D32', 'e6614c311b597d32', 'exact'),
              ('681295394', '000681295394', 'padded'), ('000681295394', '681295394', 'padded'),
              ('0681295394', '00681295394', 'padded'),

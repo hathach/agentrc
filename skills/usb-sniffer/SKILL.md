@@ -50,15 +50,13 @@ $S capture raw.pcapng --speed hs --seconds 15 --serial 4433459538463a    # expli
   unit's node; nothing on the host changes. Debian 13 allows such namespaces;
   Ubuntu's AppArmor policy needs the profile from Setup. The `+` line and the
   summary name the unit; the pcapng does not, so keep the serial with the file.
-- Two units capture at once from two shells, each with its own `--serial` and
-  output. Each capture queues ~16 MiB of usbfs buffers against the kernel's
-  one global `usbfs_memory_mb`, 16 by default: a second capture would die
-  with `LIBUSB_ERROR_NO_MEM`. The Setup udev rule raises a lower finite limit
-  to 64 (about four captures) whenever a unit is plugged in, at boot and on
-  Setup's trigger; without it `capture` refuses first with the value to set.
-  Other usbfs users share the limit, so the estimate can still fall short. A
-  unit refused as in use may be another session's capture: wait or take
-  another unit, and stop the holder only when it is your own abandoned one.
+- Several units capture at once from separate shells, each with its own
+  `--serial` and output, within the kernel's one usbfs buffer limit (the Setup
+  udev rule raises it); `capture` refuses one that would not fit and prints
+  the value to set. Other usbfs users share the limit, so a capture can still
+  die with `LIBUSB_ERROR_NO_MEM`. A unit refused as in use may be another
+  session's capture: wait or take another unit, and stop the holder only when
+  it is your own abandoned one.
 - The speed must be the tapped **segment's**: an FS device behind an HS hub
   is HS on the hub's upstream cable (you will see SPLIT transactions, not
   native FS packets — tap the device's own cable at `fs` for those). Wrong

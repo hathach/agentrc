@@ -201,10 +201,9 @@ Each technique's recipe, read when you reach for it (files beside this one):
   does.
 - **"Flash OK" can lie** (silent no-op — old firmware keeps running). When behavior contradicts the flashed code, read
   the image back: `probe_state.py --verify <flashed.elf>` (J-Link and OpenOCD boards, `techniques.md` "Probe state"), on
-  RP2040 `rp2040_verify.py` instead, since its flash reads need a flash-resident halt that `probe_state.py` does not
-  establish (`families.md`); on mismatch reflash before debugging further. Espressif: `esp_verify.py` over the build's
-  `flasher_args.json` (`espressif.md`, "After an abnormal end"), never an objcopy of the ELF, since the flashed image is
-  esptool's `elf2image` output.
+  RP2040 `rp2040_verify.py` (`families.md`), since `probe_state.py` refuses flash there; on mismatch reflash before
+  debugging further. Espressif: `esp_verify.py` over the build's `flasher_args.json` (`espressif.md`, "After an abnormal
+  end"), never an objcopy of the ELF, since the flashed image is esptool's `elf2image` output.
 - **A marginal link can fake a deterministic firmware bug** — down to failing the same test at the same iteration twice.
   "USB disconnect" in dmesg on a freshly re-cabled port (high devnum = churn) points at the plug before the code: first
   sustained bulk traffic is when a bad contact drops. Before declaring a regression, re-run the OLD build on the SAME

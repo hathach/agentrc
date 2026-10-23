@@ -37,7 +37,8 @@ core it finds halted untouched, and the flag is refused for a J-Link board. A mu
 target is refused before that session, since an SMP halt stops every core. A core found
 halted when that session starts is reported and not touched. A session that fails, times
 out or is stopped by SIGINT or SIGTERM after its guards passed is followed by one that
-polls the core and resumes it when it was left halted.
+polls the core and resumes it when it was left halted, unless its tool still ran KILL_WAIT s
+after its kill (D state): no session follows that one, and the core's state is unknown.
 
 --budget reads FP_CTRL (BP_CTRL on ARMv6-M) and DWT_CTRL: NUM_CODE is the hardware
 breakpoint count, NUMCOMP the watchpoint comparator count. NUMCOMP is reported only
@@ -56,7 +57,7 @@ read on a running core is not coherent, and a saved region proves nothing about 
 restores the board. The same ordinary-memory rule applies, and it is architectural only:
 a vendor device mapped inside Code, SRAM or RAM is the caller's to avoid. On RP2040 the
 whole XIP region (0x10000000-0x1FFFFFFF: flash and its aliases, the XIP controller and
-SSI; RP2040 datasheet 2.2.2) is refused for --read and --save: flash reads need the
+SSI; RP2040 datasheet 2.2.2) is refused for --read, --save and --verify: flash reads need the
 flash-resident halt of `rp2040_verify.py`, which this script does not establish, and the
 controller registers have read side effects (XIP STREAM_FIFO).
 
@@ -78,12 +79,14 @@ a multi-core target.
 """
 import argparse
 import collections
+import contextlib
 import hashlib
 import json
 import math
 import os
 import re
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -91,11 +94,18 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pc_sample import (DEMCR, DEMCR_TRCENA, DHCSR, DWT_PCSR, HALT_WAIT_MS, HIL_PROBE_ROUTES, SENTINEL,  # noqa: E402
-                       SPEED_RE, ToolError, hil_flasher, hil_jlink_device, which)
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import windows  # noqa: E402
 
+DWT_PCSR = 0xE000101C
+DHCSR = 0xE000EDF0
+DEMCR = 0xE000EDFC
+DEMCR_TRCENA = 1 << 24  # DWTENA on ARMv6-M; DWT reads are invalid while it is 0
+SENTINEL = 0xFFFFFFFF
+HALT_WAIT_MS = 500    # each halt of the halting fallback
+SPEED_RE = re.compile(r'[1-9][0-9]*|auto|adaptive')
 CPUID = 0xE000ED00
 # FP_CTRL (ARMv7-M C1-906, Armv8-M D1.2.109) and BP_CTRL (ARMv6-M C1-352) share the address
 FP_CTRL = 0xE0002000
@@ -125,6 +135,86 @@ SHN_UNDEF, SHN_ABS, SHN_COMMON = 0, 0xFFF1, 0xFFF2
 SHT_PROGBITS, SHT_NOBITS = 1, 8
 SHF_ALLOC, SHF_EXECINSTR = 0x2, 0x4
 NO_JLINK_HALT = 'J-Link Commander cannot branch, so it could not leave a core it finds halted untouched'
+
+
+class ToolError(RuntimeError):
+    pass
+
+
+def which(name):
+    """shutil.which, except that on Windows a bare name is looked up on PATH only: shutil.which and
+    CreateProcess both try the current directory first, which may be a checkout under test."""
+    if os.name != 'nt' or os.path.dirname(name):
+        return shutil.which(name)
+    exts = [''] if os.path.splitext(name)[1].lower() in ('.exe', '.cmd', '.bat') else ['.exe', '.cmd', '.bat']
+    for d in os.environ.get('PATH', '').split(os.pathsep):
+        if not (os.path.isabs(d) and os.path.splitdrive(d)[0]):
+            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
+        for e in exts:
+            path = os.path.join(d, name + e)
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+HIL_PROBE_ROUTES = {'jlink': 'jlink', 'openocd': 'openocd', 'stlink': 'openocd'}
+
+
+def hil_flasher(path, board):
+    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name",
+    "flasher": {"name", "uid", "args", "vid_pid"}}]}), checked but not completed: only
+    flasher.name must be there, what else is missing is the caller's to supply. Raises
+    ValueError. Kept identical in rtt.py and probe_state.py (see rtt.py's module docstring)."""
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            config = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError(f'--hil-config {path}: {e}')
+    boards = config.get('boards') if isinstance(config, dict) else None
+    if not isinstance(boards, list) or not all(isinstance(b, dict) for b in boards):
+        raise ValueError(f'--hil-config {path}: expected {{"boards": [{{...}}, ...]}}')
+    found = [b for b in boards if b.get('name') == board]
+    if len(found) != 1:
+        names = ', '.join(sorted(str(b.get('name')) for b in boards))
+        raise ValueError(f'--board {board}: {len(found)} entries of that name in {path} (it has: {names})')
+    flasher = found[0].get('flasher')
+    if not isinstance(flasher, dict) or not isinstance(flasher.get('name'), str):
+        raise ValueError(f'--board {board}: no flasher.name in {path}')
+    if flasher['name'] not in HIL_PROBE_ROUTES:
+        raise ValueError(f"--board {board} is flashed over {flasher['name']!r}, which is no debug-probe route "
+                         f"(known: {', '.join(HIL_PROBE_ROUTES)}); name the probe with explicit flags")
+    for key in ('uid', 'args', 'vid_pid'):
+        if key in flasher and (not isinstance(flasher[key], str) or not flasher[key].strip()):
+            raise ValueError(f'--board {board}: flasher.{key} in {path} must be a non-empty string, '
+                             f'got {flasher[key]!r}')
+    return flasher
+
+
+def hil_jlink_device(board, flasher):
+    """The J-Link device of a jlink entry, whose args may be exactly `-device NAME`: any
+    other flag there would be one this script silently drops."""
+    if 'args' not in flasher:
+        return None
+    try:
+        words = shlex.split(flasher['args'])
+    except ValueError as e:
+        raise ValueError(f"--board {board}: flasher.args {flasher['args']!r}: {e}")
+    if len(words) != 2 or words[0] != '-device' or not words[1].strip():
+        raise ValueError(f"--board {board}: flasher.args must be exactly '-device NAME', got "
+                         f"{flasher['args']!r}; pass the probe flags explicitly instead")
+    return words[1]
+
+
+def hil_merge(given, board, **resolved):
+    """Fill the flags the caller left out; one the caller gave must agree with the file."""
+    for flag, value in resolved.items():
+        explicit = getattr(given, flag)
+        if value is None:
+            continue
+        if explicit is not None and explicit.strip() != value.strip():
+            raise ValueError(f"--{flag.replace('_', '-')} {explicit!r} contradicts --board {board}, "
+                             f"which has {value!r}")
+        setattr(given, flag, value)
 
 
 def dhcsr_state(v):
@@ -268,8 +358,13 @@ def check_region(what, addr, size, rp2040):
     if memory_class(addr, size) is None:
         raise ValueError(f'{what}: 0x{addr:08x}+{size} is not within Code, SRAM or RAM of the M-profile address map; '
                          f'peripheral and system space can have read side effects and is not read here')
+    if rp2040:
+        check_rp2040_xip(what, addr, size)
+
+
+def check_rp2040_xip(what, addr, size):
     lo, hi = RP2040_XIP_REGION
-    if rp2040 and addr <= hi and addr + size - 1 >= lo:
+    if addr <= hi and addr + size - 1 >= lo:
         raise ValueError(f'{what}: 0x{addr:08x}+{size} is in the RP2040 XIP region (flash, the XIP controller, SSI): '
                          f'flash reads need the flash-resident halt of rp2040_verify.py (families.md, "RP2040 flash '
                          f'verification") and the controller registers have read side effects')
@@ -337,27 +432,28 @@ class HaltRefused(ToolError):
         self.dhcsr = dhcsr
 
 
-def tool(env, posix, windows=None):
-    name = os.environ.get(env) or (windows if os.name == 'nt' and windows else posix)
+class Unreaped(ToolError):
+    """run()'s tool still ran KILL_WAIT s after its kill began: it may still hold the probe, so no probe session
+    follows it."""
+
+
+class Cancelled(ToolError):
+    """stop_running() ended run()'s wait for its tool."""
+
+
+UNREAPED_NOTE = 'the core state is unknown: no further probe session was started while that tool may hold the probe'
+
+
+def tool(env, posix, nt_name=None):
+    name = os.environ.get(env) or (nt_name if os.name == 'nt' and nt_name else posix)
     exe = which(name)
     if not exe:
         raise ToolError(f'{name} not found - install it or set {env}')
     return exe
 
 
-_running = []    # the tool run() waits on, for a signal handler that stops it rather than raising
-
-
-def kill(proc):
-    """Kill the tool; on Windows its whole process tree, which TerminateProcess alone would leave running. Kept here,
-    not lib/windows.py's kill_tree: pc_sample.py and this file are copied around without the rest of agentrc."""
-    if os.name == 'nt':
-        try:
-            subprocess.run([os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32', 'taskkill.exe'),
-                            '/T', '/F', '/PID', str(proc.pid)], capture_output=True, timeout=10)
-        except (OSError, subprocess.TimeoutExpired):
-            pass    # proc.kill() below still stops the tool itself
-    proc.kill()
+_running = []    # [the tool once its wait begins, a signal stop_running() took before that] of each run()
+KILL_WAIT = 10    # s a killed tool has to exit, taskkill included; one in D state on a wedged USB host outlives SIGKILL
 
 
 def ansi_codec():
@@ -388,54 +484,94 @@ def ansi_path(path):
                     f'arguments in, and has no 8.3 short name: set TMPDIR to a directory that is not')
 
 
-def stop_running():
-    """Kill the tool run() is waiting on; run() then fails with its output. Called from a signal handler: on
-    Windows its taskkill may block that handler up to 10 s."""
-    for proc in list(_running):
+def stop_running(signum):
+    """From a signal handler: end the wait of the run() in progress by raising Cancelled there, so run() kills its
+    tool in its own cleanup and fails with the output. A run() still starting its tool cancels its wait as it
+    begins; outside a run() nothing happens, so a tool is never left unregistered and its output never lost."""
+    for entry in _running:
+        if entry[0] is None:
+            entry[1] = signum
+        else:
+            raise Cancelled(f'interrupted by signal {signum}')
+
+
+class Feeder:
+    """The tool's stdin written from a thread (communicate() on Windows writes it outside its timeout). A writer
+    blocked on a tool that reads nothing holds the pipe's lock, and close() would wait for it: release() closes the
+    pipe only when no writer began, or the one that did has finished."""
+
+    def __init__(self, pipe, data):
+        self.pipe, self.data = pipe, data
+        self.gate, self.began, self.abandoned = threading.Lock(), False, False
+        self.thread = threading.Thread(target=self.feed, daemon=True)
+
+    def feed(self):
+        with self.gate:
+            if self.abandoned:
+                return
+            self.began = True
         try:
-            kill(proc)
-        except OSError:
-            pass
+            self.pipe.write(self.data)
+        except (OSError, ValueError):
+            pass    # the tool exited, or was killed, before it read everything
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                self.pipe.close()
 
-
-def feed(pipe, data):
-    try:
-        pipe.write(data)
-        pipe.close()
-    except (OSError, ValueError):
-        pass    # the tool exited, or was killed, before it read everything
+    def release(self, timeout):
+        with self.gate:
+            self.abandoned = True    # a writer that has not begun never will
+            began = self.began
+        if began:
+            self.thread.join(timeout)
+            if self.thread.is_alive():
+                return    # left to the tool's death to break
+        self.pipe.close()
 
 
 def run(cmd, timeout, stdin=None):
     """The tool's stdout and stderr as one text. Its output goes to a file, so a session that times out
     or is interrupted (any exception, a signal handler's included) still carries what it printed, as
-    the exception's .text; the tool is killed then. The timeout covers feeding stdin too."""
+    the exception's .text; the tool is killed then, with its tree. A tool still running KILL_WAIT s
+    after its kill began fails the session naming its pid (Unreaped). The timeout covers feeding stdin too."""
     with tempfile.TemporaryFile() as out:
-        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
-                                stdout=out, stderr=subprocess.STDOUT)
-        _running.append(proc)
-        caught, feeder = None, None
+        entry = [None, None]
+        _running.append(entry)
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
+                                    stdout=out, stderr=subprocess.STDOUT)
+        except BaseException:
+            _running.remove(entry)
+            raise
+        caught, feeder, unreaped = None, None, False
         try:
             if os.name == 'nt' and stdin is not None:
-                # communicate() on Windows writes stdin in this thread, outside its timeout
-                thread = threading.Thread(target=feed, args=(proc.stdin, stdin.encode()), daemon=True)
-                thread.start()
-                feeder = thread    # only once started: the cleanup below joins it
+                feeder = Feeder(proc.stdin, stdin.encode())    # before start(), which any exception can interrupt
+                feeder.thread.start()
+            # stop_running() raises from here on, inside this try; before, through the feeder's start, it records
+            entry[0] = proc
+            if entry[1] is not None:
+                raise Cancelled(f'interrupted by signal {entry[1]}')
+            if feeder:
                 proc.wait(timeout=timeout)
             else:
                 proc.communicate(None if stdin is None else stdin.encode(), timeout=timeout)
         except BaseException as e:
             caught = e
+        deadline = None    # set in the loop: a call out here could run a handler outside every try
         while True:
             # a signal handler's exception during this cleanup is kept and the cleanup retried, so the tool
-            # is never left running and its output never lost
+            # is always killed and its output never lost; the retries share one KILL_WAIT
             try:
-                if proc.poll() is None:
-                    kill(proc)
-                proc.wait()
+                if entry in _running:
+                    _running.remove(entry)
+                if deadline is None:
+                    deadline = time.monotonic() + KILL_WAIT
+                if not unreaped and proc.poll() is None:
+                    unreaped = windows.kill_tree(proc, max(0, deadline - time.monotonic()), total=True) is None
                 if feeder:
-                    feeder.join(5)
-                if proc.stdin and not (feeder and feeder.is_alive()):
+                    feeder.release(max(0, deadline - time.monotonic()))
+                elif proc.stdin:
                     proc.stdin.close()
                 out.seek(0)
                 text = out.read().decode(errors='replace')
@@ -444,7 +580,11 @@ def run(cmd, timeout, stdin=None):
                 break
             except BaseException as e:
                 caught = e
-        _running.remove(proc)
+    if unreaped:
+        err = Unreaped(f'{os.path.basename(cmd[0])} pid {proc.pid} still ran {KILL_WAIT} s after its kill began '
+                       f'(D state?): see usb-kernel-recover')
+        err.text = text
+        raise err from caught
     if isinstance(caught, subprocess.TimeoutExpired):
         err = ToolError(f'{os.path.basename(cmd[0])} did not finish within {timeout:.0f} s')
         err.text = text
@@ -519,8 +659,8 @@ class Capture:
 
 
 def jlink_serial_match(uid: str, serial: str) -> bool:
-    """usb_observe.jlink_serial_match's rule, kept here so this file runs copied alone (a test
-    holds the two to one table): equal, or both all-digit and equal but for J-Link's zero
+    """usb_observe.jlink_serial_match's rule, copied rather than imported from the hil skill (a
+    test holds the two to one table): equal, or both all-digit and equal but for J-Link's zero
     padding, never for a uid of zeros alone."""
     u, s = uid.lower(), serial.lower()
     stripped = u.lstrip('0')
@@ -557,7 +697,14 @@ class JLink:
         try:
             text = run(self.cmd, timeout, '\n'.join(lines + ['qc']) + '\n')
         except ToolError as err:
-            self._identify(err.text)    # another probe's reads say nothing about this core
+            try:
+                self._identify(err.text)    # another probe's reads say nothing about this core
+            except ToolError as other:
+                if not isinstance(err, Unreaped):
+                    raise
+                stuck = Unreaped(f'{other}; {err}')
+                stuck.text, stuck.partial = err.text, []
+                raise stuck from err
             err.partial = self._in_order(err.text, want)
             raise
         self._identify(text)
@@ -705,6 +852,8 @@ class OpenOCD:
         """The recovery outcome, as the tail of a failure message."""
         try:
             _, reads = self.batch(self.RECOVER_TCL, timeout)
+        except Unreaped as e:
+            return f'; the recovery session failed too ({e}); {UNREAPED_NOTE}'
         except ToolError as e:
             return f'; the recovery session failed too ({e}): check the core with probe_state.py'
         dhcsr = [v for name, v in reads if name == 'DHCSR']
@@ -726,11 +875,11 @@ class OpenOCD:
         signals, stopping = [], True
 
         def on_signal(signum, _frame):
-            # nothing is raised here: the halting session is killed and fails with its output, which
-            # decides the recovery; a signal during the recovery is only recorded
+            # the halting session's run() is cancelled, kills its tool and fails with its output, which decides
+            # the recovery; a signal during the recovery is only recorded
             signals.append(signum)
             if stopping:
-                stop_running()
+                stop_running(signum)
 
         previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
         try:
@@ -746,11 +895,19 @@ class OpenOCD:
             stopping = False
             if failure is None and not signals:
                 return pcs, dhcsr[0], dhcsr[1]
+            what = str(failure)
+            if signals:
+                what = f'interrupted by signal {signals[0]}'
+                if failure is not None and not isinstance(failure, Cancelled):
+                    what += f'; {failure}'
+            if isinstance(failure, Unreaped):
+                stuck = Unreaped(f'halting fallback: {what}; {UNREAPED_NOTE}')
+                stuck.text = text
+                raise stuck from failure
             refused = re.search(r'^ERROR refused (halted|multicore): ', text, re.M)
             first = next((int(v, 16) for name, v in _OCD_READ_RE.findall(text) if name == 'DHCSR'), None)
             if refused and refused.group(1) == 'halted' and first is not None and not signals:
                 raise HaltRefused(f'halting fallback: {failure}', first) from failure
-            what = f'interrupted by signal {signals[0]}' if signals else str(failure)
             if failure is None:
                 after = ''    # the loop finished, resume included, before the signal could stop it
             elif re.search(r'^GUARDED$', text, re.M):
@@ -901,6 +1058,9 @@ def main(argv=None):
     rp2040 = is_rp2040(ident)
     reads = []
     try:
+        if rp2040:
+            for addr, data in segments:
+                check_rp2040_xip(f'--verify {a.verify}', addr, len(data))
         if a.read:
             reads = resolve_reads(a.elf, a.read, rp2040)
     except OSError as e:

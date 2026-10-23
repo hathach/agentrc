@@ -8,7 +8,8 @@ connect -> flash -> run for --duration-ms under streaming trace -> halt ->
 export. Outputs in --out:
   code_profile.txt   hot functions (run/fetch counts) + code coverage
   itrace.csv         raw instruction history (only with --trace-csv)
-  ozone_console.log, jlink.log, ozone_gui.log   session evidence
+  session.log, ozone_console.log, jlink.log, ozone_gui.log   session evidence
+  etm_capture.jdebug the generated Ozone project
 
 Requires firmware whose init enables the trace pins and clock, and the board
 wired to a J-Trace.

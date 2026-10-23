@@ -25,7 +25,9 @@ Importable API, kept stable for harnesses that load this file by path: JlinkRtt
 (J-Link) and OpenocdRtt (openocd-driven probes) expose the slice of pyserial a
 test harness uses — read/in_waiting/write/close/timeout, reset_input_buffer,
 context-manager use, plus an `eof` latch — alongside RttError, RTT_BANNER_RE and
-strip_banner. One self-contained file, stdlib only: it is copied to rigs as is.
+strip_banner. One self-contained file, stdlib only: tinyusb stages rtt.py alone (its
+hil-contract hil_remote.py) and loads it by path (test/hil/hil_test.py), so a rename or
+CLI change needs those consumers updated.
 """
 import argparse
 import contextlib
@@ -771,7 +773,7 @@ def hil_flasher(path, board):
     """The `flasher` of one board in a project's HIL config json ({"boards": [{"name",
     "flasher": {"name", "uid", "args", "vid_pid"}}]}), checked but not completed: only
     flasher.name must be there, what else is missing is the caller's to supply. Raises
-    ValueError. Kept identical in rtt.py and pc_sample.py, which are copied around alone."""
+    ValueError. Kept identical in rtt.py and probe_state.py (see rtt.py's module docstring)."""
     try:
         with open(path, encoding='utf-8-sig') as f:
             config = json.load(f)
@@ -895,8 +897,8 @@ def main() -> int:
             flasher = hil_flasher(args.hil_config, args.board)
             route = HIL_PROBE_ROUTES[flasher['name']]
             if flasher['name'] == 'stlink' and 'args' in flasher:
-                raise ValueError(f"--board {args.board}: a stlink entry's args are st-flash's, not "
-                                 f"openocd's; pass --cfg, and the probe flags, explicitly")
+                raise ValueError(f"--board {args.board}: a stlink entry's args are not openocd's; "
+                                 f"pass --cfg, and the probe flags, explicitly")
             hil_merge(args, args.board, backend=route, probe=flasher.get('uid'),
                       vid_pid=flasher.get('vid_pid') if route == 'openocd' else None,
                       device=hil_jlink_device(args.board, flasher) if route == 'jlink' else None,
@@ -1051,7 +1053,8 @@ def main() -> int:
             # so "never forwarded" must come from the forwarded flag, not the gate
             print('rtt: -i stdin was never forwarded to the target (no input arrived, '
                   'or the console closed first)', file=sys.stderr)
-        if args.interactive and not saw_output.is_set():
+        if not saw_output.is_set():
+            # J-Link's banner alone fills stdout: this note is the only sign the target never spoke
             print('rtt: no target output within the window', file=sys.stderr)
         return rc
 
@@ -1069,10 +1072,10 @@ def main() -> int:
                 rc = 1
                 break
             if chunk:
-                if args.interactive and not saw_output.is_set():
+                if not saw_output.is_set():
                     # target data = anything past the J-Link banner's final line
                     # ('Process: <name>'); the openocd server has no banner
-                    seen = (seen + chunk)[-65536:]
+                    seen += chunk
                     if args.backend != 'jlink':
                         saw_output.set()
                     else:
@@ -1080,6 +1083,7 @@ def main() -> int:
                         j = seen.find(b'\n', i) if i >= 0 else -1
                         if j >= 0 and len(seen) > j + 1:
                             saw_output.set()
+                    seen = seen[-65536:]   # bounded only after the check: a big read must not cut the banner
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
             elif con.eof:

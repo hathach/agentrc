@@ -155,11 +155,9 @@ python3 <hil skill dir>/scripts/hil_reserve.py run root-cycle <busport> \
 ```
 
 One `--roster` per project with boards on this host (the contract's Hosts/rosters
-names them and each project's lock-name field): it refuses a device under that root
-port the rosters do not explain, holds every board of every roster, runs this script's
-`root-cycle` itself, and keeps the locks as a `role: cleanup-holder` record, printing
-the token the contract's recovery procedure releases with, on anything but a clean,
-fully re-enumerated outcome (`hil_reserve.py --help` has the exact rules). A refusal
+names them and each project's lock-name field). `hil_reserve.py --help` has its
+coverage, hold and release rules; a hold it keeps prints the token the contract's
+recovery procedure releases with. A refusal
 naming a runner's holder (`hil_test.py`) means CI is mid-test — wait, do not force.
 Give it the wedged probe's own busport (e.g. `13-1.6`), not the `13-1` hub path: the
 script derives the root port itself, and the serial guard and the success check both
@@ -173,20 +171,11 @@ device whose firmware is wedged can ride it out. Success is the sysfs inode chan
 not the requests' exit status.
 
 **Not a rung — a healthy leaf's port power-off/on: `hub-cycle`.** For a device that
-still answers, `hil_reserve.py run hub-cycle <busport>` holds every roster board, checks
-coverage under the parent hub, and has this script write the hub port's `disable` file
-1, then 0 after 2 s: a targeted kernel request to power that port off and on, under the
-hub's lock. Whether VBUS physically drops is the hub's: a ganged hub cuts the gang only
-when this was the last port in it needing power, and restoring one port powers the gang
-(USB 2.0 §11.11); a hub without switches drops the port only logically; a USB 3 hub's
-companion port may keep VBUS up (USB 3.2 Table 10-2). Success therefore proves
-re-enumeration, not a power cycle or a firmware restart; physical power guarantees
-belong to the contract's Limits. Because the write takes the hub's lock, the script
-refuses a target whose serial read does not answer (the wedge signature): a wedged
-device belongs to the rungs above. It also refuses a hub and a root port, all before
-any write (exit 3, as `root-cycle` does for its guards before its power-off; `hil_reserve`
-then releases if the subtree is unchanged); any failure from the first write on is a
-blocker.
+still answers, `hil_reserve.py run hub-cycle <busport>`, under the same reservation.
+Success proves re-enumeration, not a power cycle. A wedged device is never hub-cycled:
+the request runs under the hub's lock, so the script refuses a target whose serial
+does not answer, and the rungs above own it. Its guards, timing and the hub-dependent
+VBUS caveats are `usb_recover.sh`'s usage and its hub-cycle comment.
 
 **Rung 3 — terminal case: a driver ioctl that OWNS the lock.** No software cure:
 the task is uninterruptible and SIGKILL is queued, not delivered. Reboot with
@@ -278,8 +267,8 @@ Observed: 5 boards missing with a completely clean D-state list, because
   bounded (2 s), and each port request (a `disable` write, a `root_port_cycle.py` run)
   is supervised (15 s, then SIGKILL; a survivor ends the cycle).
 - `root-cycle` with a serial whose read times out warns and proceeds (the wedge
-  signature is an unreadable serial): a low-level behaviour kept for compatibility.
-  `hil_reserve.py run` admits such a target by udev's record of its serial, written when
+  signature is an unreadable serial): this is how `hil_reserve.py run` hands over a
+  wedged target. It admits one by udev's record of its serial, written when
   the device was added and read without touching it, refuses one with neither, and
   counts the subtree restored only from sysfs reads afterwards, never from that record.
 - `hil_reserve.py run root-cycle` has not been run against a real wedge; its

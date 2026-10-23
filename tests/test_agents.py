@@ -113,6 +113,7 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('establishes that it matches the pinned artifact', body)
 
     def test_an_off_board_follow_up_claims_no_hardware_cleanup(self):
+        # (d) safety bound: a false `done` cleanup receipt would let chief schedule the board.
         debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
         self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
 

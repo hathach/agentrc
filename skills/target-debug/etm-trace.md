@@ -103,7 +103,8 @@ must be short and return to other code between beats
 
 Outputs in `<dir>`: `code_profile.txt` (run/fetch counts + coverage); on
 request `itrace.csv`, `profile_lines.csv`, `profile_insts.csv`, `samples.csv`,
-`power.csv`; `session.log` / `ozone_console.log` / `jlink.log` as evidence.
+`power.csv`; `session.log` / `ozone_console.log` / `jlink.log` / `ozone_gui.log`
+as evidence, and the generated `etm_capture.jdebug`.
 
 ## Reading results
 
@@ -147,7 +148,7 @@ request `itrace.csv`, `profile_lines.csv`, `profile_insts.csv`, `samples.csv`,
   the scripts send numeric/plain commands only — keep it that way when
   extending them (UM08025 §6.7).
 - Ozone has no `--help`/`--version` — any such probe opens the GUI; check
-  with `which ozone` only.
+  with `which ozone Ozone` (or `$ETM_OZONE`) only.
 - **`--trace-only` is experimental**: ETM start/stop comparators are scarce
   and erratic — low-rate handler windows may silently not record, adjacent
   instructions leak in, timestamps are invalid across gaps, and the profile
