@@ -1283,7 +1283,11 @@ def capture(a, b, out_dir):
         with contextlib.suppress(ToolError, OSError):
             cap['dhcsr_after'] = f'0x{b.read32(DHCSR):08x}'
         cap['after'] = snapshot(b, list(before))
-        reachable = not b.gate or b.gate_open()   # the restore stops a trace clock the setup started
+        try:
+            reachable = not b.gate or b.gate_open()   # the restore stops a trace clock the setup started
+        except (ToolError, OSError) as e:
+            reachable = False
+            failures.append(f"after: {b.gate['name']}: {e}")
         cap['trace_unit_after'] = snapshot(b, (unit_regs if reachable else []) + setup_writes + setup_watch)
     cap['errors'] = failures
     cap['restore'] = restore_failures or 'complete'

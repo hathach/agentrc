@@ -622,6 +622,20 @@ class Capture(unittest.TestCase):
         prcr = next(e for e in self.journal()[1] if e['name'] == 'PRCR')
         self.assertEqual((prcr['bits'], prcr['key']), (16, 0xA500))
 
+    def test_ra_teardown_survives_a_failed_trace_clock_read(self):
+        t = FakeRA()
+        gate_open = t.gate_open
+
+        def fail_after_restore():
+            if (FakeRA.PRCR, 0xA500) in t.writes:   # the restore relocks PRCR last
+                raise cap.ToolError('memU8: E31')
+            return gate_open()
+        t.gate_open = fail_after_restore
+        record, failures = self.run_capture(t, setup=self.setup('ra6m5'))
+        self.assertEqual((failures, record['errors'], record['restore'], t.stalled),
+                         (['after: TRCKCR: memU8: E31'], ['after: TRCKCR: memU8: E31'], 'complete', []))
+        self.assertEqual((t.mem[FakeRA.TRCKCR], t.mem[FakeRA.PRCR]), (0x01, 0))
+
     def test_ra_without_its_setup_or_observing_is_refused_untouched(self):
         t = FakeRA()
         with self.assertRaisesRegex(cap.Refused, r'R7FA6M5BH: its TPIU stalls.*--setup ra6m5'):
