@@ -10,7 +10,8 @@ The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workf
   Every reviewer is reported with its state; only these are waited on, which is
   not a review: a pass lists each reviewer whose state was read and is not a
   review of the head in `unreviewed`. Only a trigger switch makes one required.
-- `maxCycles`: cycle ceiling, default 16; a resumed launch defaults to its state's.
+- `maxCycles`: cycle ceiling, default 16, counting a cycle that only waited on
+  CI or bots; a resumed launch defaults to its state's.
 - `autoPush` (default false, a dry run: fixes left uncommitted, nothing posted)
   and `markSonar` (needs `autoPush` and `SONAR_TOKEN`: marks the SonarCloud
   issue behind a refuted code-scanning comment, or a fixed one SonarCloud still

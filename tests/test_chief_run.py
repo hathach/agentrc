@@ -182,7 +182,10 @@ class ChiefRun(unittest.TestCase):
 
     def test_the_child_gets_the_task_the_worktree_and_a_clean_env(self):
         self.stream(init(), result())
-        self.assertEqual(self.run_it('--permission-mode', 'bypassPermissions').returncode, 0)
+        lead = {k: 'lead' for k in ('CLAUDE_PID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
+                                    'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_BRIDGE_SESSION_ID',
+                                    'CLAUDE_CODE_SESSION_ATTENDED')}
+        self.assertEqual(self.run_it('--permission-mode', 'bypassPermissions', **lead).returncode, 0)
         self.assertEqual((self.fake / 'stdin.txt').read_text(), 'Babysit PR 1.\n')
         self.assertEqual(Path((self.fake / 'cwd').read_text()).resolve(), self.worktree.resolve())
         self.assertEqual(json.loads((self.fake / 'argv.json').read_text()),
@@ -191,6 +194,7 @@ class ChiefRun(unittest.TestCase):
         env = json.loads((self.fake / 'env.json').read_text())
         self.assertNotIn('CLAUDECODE', env)
         self.assertFalse([k for k in env if k.startswith('HERDR_')], env.keys())
+        self.assertFalse(lead.keys() & env.keys(), 'none of the lead session\'s identity reaches chief')
         self.assertEqual(env['CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'], '0')
 
     def test_only_the_first_line_of_a_message_is_a_status_line(self):

@@ -94,6 +94,7 @@ test('a slash-form number reaches triage verbatim, not as JSON', async () => {
   const { result, calls } = await run({ args: '28' })
   assert.match(calls[0].prompt, /"28"/)
   assert.equal(calls[0].agentType, 'Explore')
+  assert.equal(calls[0].model, 'sonnet', 'triage is a lookup, not an Opus turn')
   assert.equal(result.target, '28')
   const url = await run({ args: 'https://github.com/hathach/tinyusb/issues/28' })
   assert.match(url.calls[0].prompt, /issues\/28/)
@@ -159,6 +160,8 @@ test('both planners get one byte-identical brief, neither sees the other, Codex 
   assert.match(codex.prompt, new RegExp(`send --lane ${LANE} --tier review`))
   assert.equal(taskOf(codex.prompt), claude.prompt, 'the same brief, byte for byte')
   assert.match(claude.prompt, /PLAN: draft/)
+  assert.match(claude.prompt, /Every step edits at least one of its listed paths, each inside scope/, 'the step-path rule is stated')
+  assert.match(claude.prompt, /never in a step of its own without paths/)
   assert.match(claude.prompt, /a CMSIS-RTOS2 OSAL, tested with CMSIS-RTOS over FreeRTOS/)
   assert.doesNotMatch(claude.prompt, /osal_cmsis_rtos2/, 'no draft leaks into the brief')
   const status = calls.find(c => c.label === 'plan:status')
@@ -377,6 +380,19 @@ test('the agreed plan\'s own status, emptiness or reach stops before any writer'
     assert.equal(result.pass, false)
     assert.ok(result.next, reason)
   }
+  for (const [steps, detail] of [
+    [[...PLAN.steps, { id: 'S3', change: 'run verify, git diff --check, review the diff', paths: [], check: 'make check' }], /step S3: no path/],
+    [[PLAN.steps[0], { id: 's2', change: 'x', paths: ['hw/bsp/board.c'], check: '' }], /step s2: a path outside the plan scope/],
+    [[{ id: 's1', change: 'x', paths: ['/etc/passwd'], check: '' }, { id: 's2', change: 'x', paths: [], check: '' }],
+      /step s1: a path that is absolute or has an empty, \. or \.\. segment; step s2: no path/],
+  ]) {
+    const { result } = await run({ 'plan:judge:1': { plan: { ...PLAN, steps } }, 'plan:combine': { plan: { ...PLAN, steps } } })
+    assert.equal(result.reason, 'plan-invalid')
+    assert.match(result.next, detail, 'next names each offending step and its case')
+    if (steps[0] === PLAN.steps[0]) assert.doesNotMatch(result.next, /step s1:/, 'a valid step is not named')
+  }
+  const badScope = await run({ 'plan:judge:1': { plan: { ...PLAN, scope: [...PLAN.scope, '/abs/'] } }, 'plan:combine': { plan: { ...PLAN, scope: [...PLAN.scope, '/abs/'] } } })
+  assert.match(badScope.result.next, /scope: a path that is absolute/)
   for (const scope of [['../x/'], ['/abs/'], ['C:/abs/'], ['c:\\abs\\'], ['C:foo/'], ['C:'], ['src/./osal/']]) {
     const bad = await run({ args: { target: '28', batch: true, scope } })
     assert.deepEqual(bad.result.missing, ['scope'], `${scope}: a caller scope that escapes is no scope`)

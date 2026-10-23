@@ -119,7 +119,7 @@ const triage = await agent(
   'invocation it defines for this scope, not the pointer. null when the repository names neither, and null too when a ' +
   'named contract is missing, unreadable, or defines no invocation for this scope: never infer or compose a substitute. ' +
   'branch: `git rev-parse --abbrev-ref HEAD`; head: `git rev-parse HEAD`. Read only.',
-  { label: 'triage', phase: 'Triage', agentType: 'Explore', schema: TRIAGE },
+  { label: 'triage', phase: 'Triage', agentType: 'Explore', model: 'sonnet', schema: TRIAGE },
 ).catch(quiet('triage'))
 if (!triage) {
   ran('triage', 'Explore', 'died', '')
@@ -174,12 +174,11 @@ const NEXT = {
   'needs-user': 'ask the human the blocker in coplan.plan, then re-run on a fresh lane',
   'hardware-triage-required': "take chief's manual hardware path: hw-debugger diagnosis with uncommitted experiments, then co-plan the finalization on a fresh lane before any fix commit",
   'scope-extension-required': 'ask the human to extend the scope as coplan.plan.blocker says, then re-run with that scope',
-  'plan-invalid': `the agreed plan had no steps or reached outside its own scope; ${fresh}`,
 }
-const stopPlan = (reason, fact) => {
+const stopPlan = (reason, fact, next = NEXT[reason]) => {
   log(`co-plan: ${reason} — ${fact}`)
   ran('co-plan', 'Plan+Codex', reason, cut(fact))
-  return finish({ pass: false, reason, target, triage, contract: contractOf(scope), coplan, next: NEXT[reason] })
+  return finish({ pass: false, reason, target, triage, contract: contractOf(scope), coplan, next })
 }
 const coworker = (label, op, task) => agent(
   `Operation: ${op}.${task === undefined ? '' : `\n<<<task\n${task}\ntask>>>`}\nReturn the output schema's fields as your instructions define them.`,
@@ -228,7 +227,9 @@ const brief =
   `Scope from triage, provisional: ${scope.join(', ')}. The plan may widen it within the target's own task` +
   `${Array.isArray(args.scope) ? `, never beyond this ceiling: ${scope.join(', ')}` : ''}.\nVerify command, fixed: ${verify}\n` +
   'Read the code. Plan ordered steps, each with its change, the paths it touches and a check its writer runs after it; ' +
-  'scope = every path the steps touch. status: agreed when the plan is ready to implement; needs-user, with blocker, when it needs a ' +
+  'scope = every path the steps touch. Every step edits at least one of its listed paths, each inside scope; a check or ' +
+  "validation goes in a step's check or the plan's validation, never in a step of its own without paths. " +
+  'status: agreed when the plan is ready to implement; needs-user, with blocker, when it needs a ' +
   "human decision; hardware-triage, with blocker, when a supported fix needs hardware behaviour observed on a board first; " +
   "scope-extension, with blocker, when the change needs work outside the target's task; unresolved when you cannot settle it. " +
   'remaining: unresolved decisions needed to approve the plan, every item preventing implementation; validation: checks required after implementation and before claiming completion ' +
@@ -293,10 +294,13 @@ for (let round = 1; round <= 3; round++) {
 }
 if (coplan.status !== 'agreed') return stopPlan('plan-unresolved', `no agreement in ${coplan.rounds} round(s)`)
 const planScope = plan.scope.map(s => s.trim())
-const invalid = !plan.steps.length || !planScope.length ? 'no steps or no scope'
-  : ![...planScope, ...plan.steps.flatMap(st => st.paths)].every(relative) ? 'a path that is absolute or has an empty, . or .. segment'
-    : !plan.steps.every(st => st.paths.length && covered(st.paths.map(p => p.trim()), planScope)) ? 'a step with no path or one outside the plan scope' : null
-if (invalid) return stopPlan('plan-invalid', invalid)
+const BAD_PATH = 'a path that is absolute or has an empty, . or .. segment'
+const stepFault = st => !st.paths.length ? 'no path' : !st.paths.every(relative) ? BAD_PATH
+  : !covered(st.paths.map(p => p.trim()), planScope) ? 'a path outside the plan scope' : null
+const faults = [...(planScope.every(relative) ? [] : [`scope: ${BAD_PATH}`]),
+  ...plan.steps.map(st => [st.id, stepFault(st)]).filter(([, f]) => f).map(([id, f]) => `step ${id}: ${f}`)]
+const invalid = !plan.steps.length || !planScope.length ? 'no steps or no scope' : faults.join('; ') || null
+if (invalid) return stopPlan('plan-invalid', invalid, `the agreed plan breaks the step rules (${invalid}); ${fresh}`)
 if (Array.isArray(args.scope) && !covered(planScope, scope)) {
   return stopPlan('scope-extension-required', `plan scope ${planScope.join(', ')} exceeds the ceiling ${scope.join(', ')}`)
 }
