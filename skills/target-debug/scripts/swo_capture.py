@@ -116,7 +116,8 @@ WATCH_FUNCTION_V7 = {
     ('w', 'val'): 0b1101, ('w', 'offset'): 0b1101 | E, ('w', 'pcval'): 0b1111, ('w', 'offval'): 0b1111 | E,
 }
 ARMV7M_PARTS = {0xC23: 'Cortex-M3', 0xC24: 'Cortex-M4', 0xC27: 'Cortex-M7'}
-ARMV8M_MAIN_PARTS = {0xD21: 'Cortex-M33', 0xD22: 'Cortex-M55', 0xD23: 'Cortex-M85', 0xD31: 'Cortex-M52'}
+ARMV8M_MAIN_PARTS = {0xD21: 'Cortex-M33', 0xD22: 'Cortex-M55', 0xD23: 'Cortex-M85', 0xD31: 'Cortex-M35P'}
+ARM_CHINA_ARMV8M_MAIN_PARTS = {0xD24: 'Cortex-M52'}   # implementer 0x63, Arm China
 NO_ITM_PARTS = {0xC20: 'Cortex-M0', 0xC60: 'Cortex-M0+', 0xC21: 'Cortex-M1', 0xD20: 'Cortex-M23'}
 
 REG_NAMES = {DEMCR: 'DEMCR', DBGMCU_CR_F4: 'DBGMCU_CR', ITM_TER: 'ITM_TER0', ITM_TPR: 'ITM_TPR', ITM_TCR: 'ITM_TCR',
@@ -644,9 +645,11 @@ def load_journal(path):
 # ---------------------------------------------------------------------------------------------------
 
 def core_kind(cpuid):
-    part = (cpuid >> 4) & 0xFFF
-    if (cpuid >> 24) != 0x41:
-        return 'unknown', f'implementer 0x{cpuid >> 24:02x}'
+    implementer, part = cpuid >> 24, (cpuid >> 4) & 0xFFF
+    if implementer == 0x63 and part in ARM_CHINA_ARMV8M_MAIN_PARTS:
+        return 'armv8-m', ARM_CHINA_ARMV8M_MAIN_PARTS[part]
+    if implementer != 0x41:
+        return 'unknown', f'implementer 0x{implementer:02x}'
     if part in ARMV7M_PARTS:
         return 'armv7-m', ARMV7M_PARTS[part]
     if part in ARMV8M_MAIN_PARTS:

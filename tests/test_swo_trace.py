@@ -349,6 +349,14 @@ class FakeRA(FakeTarget):
         return bool(self.mem[self.TRCKCR] & 0x80)
 
 
+class CoreKind(unittest.TestCase):
+    def test_a_core_is_named_by_its_implementer_and_part(self):
+        self.assertEqual(cap.core_kind(0x410FD310), ('armv8-m', 'Cortex-M35P'))
+        self.assertEqual(cap.core_kind(0x630FD242), ('armv8-m', 'Cortex-M52'))   # Arm China
+        self.assertEqual(cap.core_kind(0x410FD240), ('unknown', 'part 0xd24'))
+        self.assertEqual(cap.core_kind(0x630FD210), ('unknown', 'implementer 0x63'))
+
+
 class Rates(unittest.TestCase):
     def test_an_exact_divisor_passes(self):
         self.assertEqual(cap.check_rates(args(), None)[:2], (112, 1_500_000.0))
