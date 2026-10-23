@@ -290,6 +290,9 @@ if (args.state !== undefined && args.state !== null) {
     (st.reanswer === undefined || Array.isArray(st.reanswer)) && ciCacheShaped(st.ciCache) &&
     (st.last === null || (st.last && typeof st.last === 'object')) && (st.greptileRequired === undefined || st.greptileRequired === true) &&
     (st.coderabbitRequired === undefined || st.coderabbitRequired === true) &&
+    (st.coderabbitRead === undefined || (st.coderabbitRead && ['head', 'state', 'reason'].every(k => typeof st.coderabbitRead[k] === 'string') &&
+      (st.coderabbitRead.kind === null || typeof st.coderabbitRead.kind === 'string') &&
+      (st.coderabbitRead.retryAt === null || Number.isFinite(Date.parse(st.coderabbitRead.retryAt))))) &&
     (st.reviewClock === null || (st.reviewClock && typeof st.reviewClock === 'object' && typeof st.reviewClock.sha === 'string' &&
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
@@ -874,10 +877,12 @@ const pendingOf = () => {
   return null
 }
 const stateOut = () => {
+  const crRead = coderabbitRead()
   const st = {
     version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
     ...(greptileRequired ? { greptileRequired } : {}),
     ...(coderabbitRequired ? { coderabbitRequired } : {}),
+    ...(crRead ? { coderabbitRead: crRead } : {}),
     answeredWith: [...answeredWith],
     deferrals: [...deferrals],
     acceptedFailures: acceptedArg.map(a => a.key),
@@ -1856,10 +1861,17 @@ const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
 }
 // A trigger script's comment, a receipt in its cycle's botAsks (#272); `already` found one standing, maybe a lost line's.
 const ASK_OF = { crtrigger: ['coderabbit', 'tick'], crrequest: ['coderabbit', 'request'], greptile: ['greptile', 'request'] }
-// The last reading of CodeRabbit in this launch when it is required and that reading of the head is no review of it.
+// The last reading of a required CodeRabbit on the head: this launch's, else the one carried from an earlier launch, so a
+// launch that stops before its own harvest still names the ask.
+const coderabbitRead = () => {
+  if (!coderabbitRequired) return null
+  const read = history.slice(launchFrom).reverse().find(e => e.bots)
+  if (!read) return restored && restored.coderabbitRead && restored.coderabbitRead.head === expectedHead ? restored.coderabbitRead : null
+  const cr = read.head === expectedHead && read.bots.bots.find(b => b.bot === 'coderabbit')
+  return cr ? { head: read.head, state: cr.state, kind: cr.kind, reason: cr.reason, retryAt: cr.retryAt } : null
+}
 const unreviewedCodeRabbit = () => {
-  const read = coderabbitRequired && history.slice(launchFrom).reverse().find(e => e.bots)
-  const cr = read && read.head === expectedHead && read.bots.bots.find(b => b.bot === 'coderabbit')
+  const cr = coderabbitRead()
   return cr && cr.state !== 'reviewed' ? cr : null
 }
 // This run's asks of CodeRabbit on the stopped head, and which one a relaunch with coderabbitTrigger would still make. An ask

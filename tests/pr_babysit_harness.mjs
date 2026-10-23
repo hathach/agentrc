@@ -7127,6 +7127,29 @@ test('the CodeRabbit requirement outlives its switch: a resume waits on the earl
   assert.equal(never.result.state.coderabbitRequired, undefined, 'no switch, no ask: not required')
 })
 
+test('a resume that stops before its own harvest still names the CodeRabbit ask from the last reading of the head', async () => {
+  const Y = { maxCycles: 4, yieldAfterCycle: true }
+  const ticked = await run({ args: { ...Y, coderabbitTrigger: true }, reviews: quiet([skippedCr()]) })
+  const limited = await run({ args: { ...Y, coderabbitTrigger: true }, clockOffset: 21, reviews: quiet([limitedCr(at(20))]) })
+  const unasked = await run({ args: { ...Y, coderabbitTrigger: true }, reviews: quiet([limitedCr(at(30))]) })
+  assert.deepEqual(unasked.result.state.coderabbitRead, { head: HEAD, state: 'settled', kind: 'limited', reason: 'Review rate limited', retryAt: at(30) })
+  for (const [name, a, want] of [['tick', ticked, { relaunchAsks: null, asked: [{ ask: 'tick', at: at(0) }] }],
+    ['request', limited, { relaunchAsks: null, asked: [{ ask: 'request', at: at(21) }] }],
+    ['unasked', unasked, { relaunchAsks: 'request', asked: [], retryAt: at(30) }]]) {
+    const b = await run({ args: { ...Y, state: a.result.state }, reviews: new Error('validator exploded') })
+    assert.equal(b.result.reason, 'review-validator-died', name)
+    assert.deepEqual(b.result.coderabbitAsk, want, `${name}: the carried reading answers for a launch with none of its own`)
+    assert.deepEqual(b.result.state.coderabbitRead, a.result.state.coderabbitRead, `${name}: and is carried on`)
+  }
+  const reviewed = await run({ args: { ...Y, state: ticked.result.state }, reviews: quiet([bot('coderabbit')]) })
+  assert.equal(reviewed.result.state.coderabbitRead.state, 'reviewed', 'this launch\'s reading replaces the carried one')
+  const moved = await run({ args: { ...Y, state: ticked.result.state, adoptHead: ADOPT }, preflight: { head: ADOPT, prHead: HEAD }, reviews: new Error('validator exploded') })
+  assert.equal(moved.result.reason, 'review-validator-died')
+  assert.equal(moved.result.coderabbitAsk, undefined, 'a reading of another head says nothing of this one')
+  assert.equal(moved.result.state.coderabbitRead, undefined, 'nor is it carried')
+  await assert.rejects(run({ args: { ...Y, state: seal({ ...ticked.result.state, coderabbitRead: { head: HEAD } }) } }), /not a pr-babysit state/)
+})
+
 test('a pass names each reviewer read without a review of the head; two required reviews missing stop on CodeRabbit first', async () => {
   const pass = await run({ args: { ...G, maxCycles: 2 }, reviews: quiet([skippedCr(), bot('greptile', { state: 'settled', kind: 'limited', reason: 'paused notice on the head: Greptile did not review it' })]) })
   assert.equal(pass.result.pass, true, pass.result.reason)
