@@ -12,7 +12,6 @@ hook pass, so any error denies too.
 import json
 import os
 import re
-import shlex
 import sys
 
 
@@ -40,7 +39,7 @@ def command(cmd):
     """Why a Bash or Monitor command is not a plain captain.py call, or None."""
     if not isinstance(cmd, str) or SHELL.search(cmd):
         return 'only a plain `python3 ~/.claude/skills/captain/scripts/captain.py <subcommand> ...` runs here'
-    words = shlex.split(cmd)
+    words = cmd.split()
     if len(words) < 3 or words[0] != 'python3' or words[1] not in SCRIPTS:
         return 'only the installed captain.py runs here, as `python3 ~/.claude/skills/captain/scripts/captain.py`'
     if words[2] not in SUBCOMMANDS:
