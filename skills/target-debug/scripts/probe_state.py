@@ -926,9 +926,7 @@ class OpenOCD:
             except ToolError as e:
                 failure, text = e, getattr(e, 'text', text)
             stopping = False
-            if failure is None and not signals:
-                result = pcs, dhcsr[0], dhcsr[1]
-            else:
+            if failure is not None or signals:
                 what = str(failure)
                 if signals:
                     what = f'interrupted by signal {signals[0]}'
@@ -957,7 +955,7 @@ class OpenOCD:
                 signal.signal(sig, handler)
         if signals:    # landed while the handlers were restored; the loop had resumed the core
             raise ToolError(f'halting fallback: interrupted by signal {signals[0]}')
-        return result
+        return pcs, dhcsr[0], dhcsr[1]
 
 
 def resolve(a, p):
