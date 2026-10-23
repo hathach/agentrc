@@ -50,7 +50,7 @@ STRIDE = 0x18       # SEGGER_RTT_BUFFER_UP: sName, pBuffer, SizeOfBuffer, WrOff,
 MAX_RING = 1 << 20
 NAME = b'SysView'   # SEGGER_SYSVIEW_Init_Ex's label for its channel
 S_HALT = 1 << 17
-CPUID = 0xE000ED00
+S1_READS = [ps.DHCSR, ps.CPUID, ps.DHCSR]    # DHCSR, CPUID, h, DHCSR: CPUID tells the two DHCSR reads apart
 STOP_SIGNALS = tuple(filter(None, (getattr(signal, n, None) for n in ('SIGTERM', 'SIGHUP'))))
 
 
@@ -92,16 +92,17 @@ def halted(dhcsr):
 
 
 def note_before(core, text):
-    """core['before'] from the first session's output, complete or not, once an M-profile CPUID and the DHCSR read
-    before the halt are in it."""
-    reads = ps.JLink._in_order(text, [CPUID, ps.DHCSR])
+    """core['before'] from the first session's output, complete or not, once the DHCSR read before the halt and an
+    M-profile CPUID are in it."""
+    reads = ps.JLink._in_order(text, S1_READS[:2])
     if len(reads) != 2:
         return
+    before, cpuid = reads
     try:
-        ps.check_m_profile(reads[0])
+        ps.check_m_profile(cpuid)
     except ToolError:
         return
-    core['before'] = 'halted' if halted(reads[1]) else 'running'
+    core['before'] = 'halted' if halted(before) else 'running'
 
 
 def jlink_dump(backend, cb, channel, resume, tmp, timeout, core):
@@ -109,23 +110,27 @@ def jlink_dump(backend, cb, channel, resume, tmp, timeout, core):
     state it claims; core's before and after are set as each is established, so a failure still reports them."""
     hlen, dhcsr = header_len(channel), f'mem32 {ps.DHCSR:X}, 1'
     core.update(before='unknown', after='unknown')
-    s1 = ['exec SetRestartOnClose = 0', f'mem32 {CPUID:X}, 1', dhcsr, 'h', dhcsr,
+    s1 = ['exec SetRestartOnClose = 0', dhcsr, f'mem32 {ps.CPUID:X}, 1', 'h', dhcsr,
           f'savebin {tmp}/hdr1.bin, 0x{cb:08X}, 0x{hlen:X}', 'qc']
     try:
         text = ps.run(backend.cmd, timeout, '\n'.join(s1) + '\n')
     except ToolError as e:
-        backend._identify(getattr(e, 'text', ''))    # another probe's reads say nothing about this core
+        try:
+            backend._identify(getattr(e, 'text', ''))    # another probe's reads say nothing about this core
+        except ToolError as wrong:
+            raise ToolError(f'{e}; {wrong}') from e
         note_before(core, getattr(e, 'text', ''))
         raise
     backend._identify(text)
     note_before(core, text)
-    reads = [(int(a, 16), int(v, 16)) for a, v in ps._MEM32_RE.findall(text)]
-    if [a for a, _ in reads] != [CPUID, ps.DHCSR, ps.DHCSR]:
+    reads = ps.JLink._in_order(text, S1_READS)
+    if len(reads) != 3:
         raise ToolError(f'incomplete first session: {len(reads)}/3 reads; last output:\n{ps.tail(text)}')
-    ps.check_m_profile(reads[0][1])
-    running = not halted(reads[1][1])
-    if not halted(reads[2][1]):
-        raise ToolError(f'the core did not halt (DHCSR 0x{reads[2][1]:08x})')
+    before, cpuid, after = reads
+    ps.check_m_profile(cpuid)
+    running = not halted(before)
+    if not halted(after):
+        raise ToolError(f'the core did not halt (DHCSR 0x{after:08x})')
     core['after'] = 'halted'
     header = read_file(f'{tmp}/hdr1.bin', hlen, 'control block')
     d = descriptor(header, channel)

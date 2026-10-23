@@ -258,11 +258,12 @@ class JLinkDump(unittest.TestCase):
     def test_a_cut_first_session_records_the_state_before_its_reads_establish(self):
         reads = {'cpuid': 'E000ED00 = 410FC241', 'running': 'E000EDF0 = 00010001',
                  'halted': 'E000EDF0 = 00030003', 'not M': 'E000ED00 = 41000000'}
-        cases = {('killed', 'cpuid', 'running', 'halted'): 'running',
-                 ('killed', 'cpuid', 'halted'): 'halted',
-                 ('exits', 'cpuid', 'running'): 'running',
-                 ('killed', 'cpuid'): 'unknown',
-                 ('killed', 'not M', 'running', 'halted'): 'unknown'}
+        cases = {('killed', 'running', 'cpuid', 'halted'): 'running',
+                 ('killed', 'halted', 'cpuid'): 'halted',
+                 ('exits', 'running', 'cpuid'): 'running',
+                 ('killed', 'running'): 'unknown',
+                 ('exits', 'cpuid', 'halted'): 'unknown',    # the read before the halt failed
+                 ('killed', 'running', 'not M', 'halted'): 'unknown'}
         for (end, *lines), before in cases.items():
             with self.subTest(end=end, lines=lines):
                 stub = Path(tempfile.mkdtemp(dir=self.dir))
@@ -274,6 +275,19 @@ class JLinkDump(unittest.TestCase):
                 rc, r = self.run_dump('--resume', '--timeout', '3', PATH=env['PATH'])
                 self.assertEqual(rc, 3)
                 self.assertEqual(r['core'], {'before': before, 'after': 'unknown'})
+
+    def test_a_cut_session_on_another_probe_keeps_both_errors(self):
+        def cut_on_another_probe(cmd, timeout, stdin=None):
+            failure = dump.ToolError('JLinkExe did not finish within 3 s')
+            failure.text = 'S/N: 999\nE000EDF0 = 00010001\nE000ED00 = 410FC241\n'
+            raise failure
+
+        with unittest.mock.patch.object(dump.ps, 'run', cut_on_another_probe):
+            rc, r = self.run_dump()
+        self.assertEqual(rc, 3)
+        self.assertEqual(r['error'], 'JLinkExe did not finish within 3 s; connected to J-Link S/N 999, not the '
+                                     'requested 123')
+        self.assertEqual(r['core'], {'before': 'unknown', 'after': 'unknown'})
 
     def test_not_m_profile_is_refused(self):
         self.target(bytes(64), wroff=0, cpuid=0x4100_0000)
