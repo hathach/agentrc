@@ -66,7 +66,7 @@ class VerdictTest(unittest.TestCase):
         return guard.verdict({'tool_name': tool, 'tool_input': tool_input})
 
     def test_plain_script_calls_pass(self):
-        home_script = os.path.expanduser('~/.claude/skills/captain/scripts/captain.py')
+        home_script = (Path.home() / '.claude/skills/captain/scripts/captain.py').as_posix()
         for cmd in [f'{RUN} list', f'{RUN} list --json', f'{RUN} enroll', f'{RUN} enroll --replace',
                     f'{RUN} ask w2:p1 w3:p4', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
                     f'{RUN} cancel m-0a1b', f'{RUN} relay w2:p1 w3:p4',

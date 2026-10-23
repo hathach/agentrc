@@ -26,7 +26,9 @@ def crashed(kind, value, tb):
 
 
 SKILL = os.path.expanduser('~/.claude/skills/captain')
-SCRIPTS = ('~/.claude/skills/captain/scripts/captain.py', os.path.join(SKILL, 'scripts', 'captain.py'))
+# the home-expanded form takes forward slashes: a Windows backslash is an escape in the Bash tool's shell
+SCRIPTS = ('~/.claude/skills/captain/scripts/captain.py',
+           os.path.join(SKILL, 'scripts', 'captain.py').replace(os.sep, '/'))
 STATE = os.path.expanduser('~/.cache/agentrc/captain')
 SUBCOMMANDS = ('list', 'enroll', 'ask', 'collect', 'reports', 'cancel', 'relay', 'withdraw', 'open')
 TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9:._=-]*|--[a-z][a-z-]*')
