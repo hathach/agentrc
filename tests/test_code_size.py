@@ -696,6 +696,35 @@ class LinkermapSizes(ProfileCase):
                                       'portable/b/x.c': {'flash': 0x80, 'ram': 0}})
 
 
+class LoadModule(unittest.TestCase):
+    def setUp(self):
+        self.root = tmpdir(self)
+        sd.load_module.cache_clear()
+        self.addCleanup(sd.load_module.cache_clear)
+
+    def module(self, source):
+        """A file holding `source` and the name it is loaded as, unregistered after the test."""
+        name = 'code_size_load_module_probe'
+        path = self.root / f'{name}.py'
+        path.write_text(source, encoding='utf-8')
+        self.addCleanup(sys.modules.pop, name, None)
+        return name, path
+
+    def test_the_module_is_registered_while_it_executes(self):
+        name, path = self.module('from __future__ import annotations\nfrom dataclasses import dataclass\n'
+                                 '@dataclass\nclass Record:\n    size: int\n')
+        m = sd.load_module(name, path)
+        self.assertEqual(m.Record(1).size, 1)
+        self.assertIs(sys.modules[name], m)
+        self.assertIs(sd.load_module(name, path), m)
+
+    def test_a_module_that_raises_is_not_left_registered(self):
+        name, path = self.module('raise SystemExit("boom")\n')
+        with self.assertRaises(SystemExit):
+            sd.load_module(name, path)
+        self.assertNotIn(name, sys.modules)
+
+
 # .text in flash, .data copied from flash to RAM, .bss in RAM
 THREE_SECTIONS = ([('.text', PROGBITS, AX, 0x10000000, 0x400),
                    ('.data', PROGBITS, WA, 0x20000000, 0x10),
