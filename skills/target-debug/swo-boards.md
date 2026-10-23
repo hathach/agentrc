@@ -4,14 +4,14 @@ Validated boards for `swo_capture.py` (`swo-dwt.md`). Read the row and its notes
 when a board is validated. A family's register requirements are its `--setup` entry in `scripts/swo_boards.json`,
 whose `ref` fields cite the documents; this file holds what was measured. Board names are TinyUSB BSP aliases. The
 firmware behind the stm32 rows is TinyUSB's `examples/device/board_test` built with `SWO_FIXTURE=1`, whose timers,
-nested interrupt, ITM marker and watched variable have known rates; ek_ra6m5 ran unmodified `cdc_msc`, so its row
+nested interrupt, ITM marker and watched variable have known rates; ra6m5_ek ran unmodified `cdc_msc`, so its row
 has no fixture golden checks and no injected-failure cleanup.
 
 | Board           | Probe, route                        | Setup   | Trace clock         | Exact SWO rates used | Verified                                                                |
 |-----------------|-------------------------------------|---------|---------------------|----------------------|-------------------------------------------------------------------------|
 | stm32f407disco  | on-board J-Link (ST-Link reflashed) | stm32f4 | HCLK 168 MHz        | 1.5 MHz (4.5 MHz/3)  | exc, LTS, ITM, data trace, PC sample, observe, comparator, PB3, restore |
 | stm32h743nucleo | STLINK-V3, OpenOCD `stlink-dap.cfg` | stm32h7 | 400 MHz (see notes) | 16 MHz               | exc, LTS, ITM, data trace, PC sample, PB3, restore                      |
-| ek_ra6m5        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, trace clock gate, restore                                     |
+| ra6m5_ek        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, trace clock gate, restore                                     |
 
 ## stm32f407disco
 
@@ -41,7 +41,7 @@ has no fixture golden checks and no injected-failure cleanup.
   1 in 263 KB); the decode flags each.
 - OpenOCD's `-pin-freq 0` picks 24 MHz, not a divisor of 400 MHz: always name the rate.
 
-## ek_ra6m5
+## ra6m5_ek
 
 - Its TPIU must not be touched while TRCKCR.TRCKEN is 0, the reset state. One TPIU read (TPIU_CSPSR) through J-Link
   Commander then left the AHB-AP with a transfer in progress: CSW.TrInProg set, TAR at that address, CPUID and the

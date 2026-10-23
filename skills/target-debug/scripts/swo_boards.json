@@ -53,7 +53,7 @@
      "ref": "RA6M5 HW manual (book 5584) PRCR, p281"},
     {"name": "TRCKCR", "addr": "0x4001E03F", "bits": 8, "mask": "0x80", "value": "0x80", "gates_trace_unit": true,
      "requires": "PRCR",
-     "why": "TRCKEN starts the trace clock (reset 0); a TPIU read with it stopped left ek_ra6m5's AHB-AP wedged until power-off (cause suspected; swo-boards.md), so no TPIU access comes before it",
+     "why": "TRCKEN starts the trace clock (reset 0); a TPIU read with it stopped left ra6m5_ek's AHB-AP wedged until power-off (cause suspected; swo-boards.md), so no TPIU access comes before it",
      "ref": "RA6M5 HW manual (book 5584) TRCKCR, p191; TRCLK, Table 8.2 p152; TPIU note 1, p86"}
    ],
    "watch": [

@@ -165,7 +165,7 @@ was also checked by hand on a Cortex-M7.
 | DWT profiling counters, cycle-count events                | yes         | stm32f407disco                                      |
 | CYCMATCH                                                  | yes         | stm32h743nucleo                                     |
 | Global timestamps                                         | yes         | stm32h743nucleo (TSG behind AP2)                    |
-| Armv8-M SWO, trace clock gate                             | yes         | ek_ra6m5 (`cdc_msc` exception trace, no fixture)    |
+| Armv8-M SWO, trace clock gate                             | yes         | ra6m5_ek (`cdc_msc` exception trace, no fixture)    |
 | Armv8-M data trace (`--watch`, `--cycmatch`)              | no          | refused on Armv8-M                                  |
 | Manchester SWO, TPIU formatter, parallel trace, CMSIS-DAP | no          | deferred                                            |
 
