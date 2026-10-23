@@ -1141,6 +1141,57 @@ class Planning(unittest.TestCase):
             self.assertEqual(sorted(walked), ['a', 'b', 'c', 'd'])
 
 
+class LinkHops(unittest.TestCase):
+    """link_hops and holds on this platform's own paths, Windows drives included."""
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        self.wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.wc)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.t = Path(os.path.realpath(tmp.name))
+        try:
+            self.link(self.t / 'probe', self.t)
+        except (OSError, NotImplementedError) as err:  # Windows without the symlink privilege
+            self.skipTest(f'cannot create a symlink here: {err}')
+
+    def link(self, link, target):
+        os.symlink(target, link, target_is_directory=True)
+
+    def test_hops_are_absolute_from_the_anchor(self):
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        self.link(kept / 'abs', clean / 'lib')
+        self.link(kept / 'rel', Path('..') / clean.name / 'lib')
+        anchor = os.path.splitdrive(str(self.t))[0] + os.sep
+        for name in ('abs', 'rel'):
+            hops = self.wc.link_hops(str(kept / name))
+            self.assertTrue(all(os.path.isabs(h) and h.startswith(anchor) for h in hops), hops)
+            self.assertIn(str(kept / name), hops)
+            self.assertEqual(hops[-2:], [str(clean), str(clean / 'lib')])
+        self.link(kept / 'up', os.sep.join(['..'] * (len(self.t.parts) + 3)))  # `..` stops at the anchor
+        self.assertEqual(self.wc.link_hops(str(kept / 'up'))[-1], str(kept / 'up'))
+
+    def test_a_kept_siblings_symlink_keeps_the_clean_sibling_it_reaches(self):
+        kept, clean, plain = self.t / 'parent--z', self.t / 'parent--b', self.t / 'parent--w'
+        for tree in (kept, clean / 'lib', plain):
+            tree.mkdir(parents=True)
+        self.link(kept / 'dep', clean / 'lib')
+        self.assertEqual(self.wc.removal_plan([clean, plain], [kept]),
+                         ([plain], {clean: 'parent--z, which stays, links into it'}))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows path forms')
+    def test_windows_targets_are_anchored_on_their_own_drive(self):
+        anchored = self.wc.anchored
+        self.assertEqual(anchored('\\\\?\\D:\\x\\y', 'C:\\w'), ('D:\\', ['x', 'y']))
+        self.assertEqual(anchored('\\\\?\\UNC\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
+        self.assertEqual(anchored('D:/x/y', 'C:\\w'), ('D:\\', ['x', 'y']))
+        self.assertEqual(anchored('\\x', 'C:\\w'), ('C:\\', ['x']))
+        self.assertEqual(anchored('x/y', 'C:\\w'), ('C:\\w', ['x', 'y']))
+        self.assertRaises(OSError, anchored, 'D:x', 'C:\\w')
+
+
 # prints the locale encoding, then the bytes of linked_worktree(argv[2]) as UTF-8 JSON, with the plugin at argv[1]
 LINKED = r'''import importlib.util, json, locale, os, sys
 spec = importlib.util.spec_from_file_location('worktree_children', sys.argv[1])
