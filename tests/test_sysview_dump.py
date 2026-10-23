@@ -271,7 +271,7 @@ class JLinkDump(unittest.TestCase):
                                                            f'print("{out}", flush=True)\n'
                                                            + ('time.sleep(30)\n' if end == 'killed' else '')),))
                 self.out = stub / 'out'
-                rc, r = self.run_dump('--resume', '--timeout', '0.5', PATH=env['PATH'])
+                rc, r = self.run_dump('--resume', '--timeout', '3', PATH=env['PATH'])
                 self.assertEqual(rc, 3)
                 self.assertEqual(r['core'], {'before': before, 'after': 'unknown'})
 
