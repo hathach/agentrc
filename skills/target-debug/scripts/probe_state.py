@@ -927,33 +927,37 @@ class OpenOCD:
                 failure, text = e, getattr(e, 'text', text)
             stopping = False
             if failure is None and not signals:
-                return pcs, dhcsr[0], dhcsr[1]
-            what = str(failure)
-            if signals:
-                what = f'interrupted by signal {signals[0]}'
-                if failure is not None and not isinstance(failure, Cancelled):
-                    what += f'; {failure}'
-            if isinstance(failure, Unreaped):
-                stuck = Unreaped(f'halting fallback: {what}; {UNREAPED_NOTE}')
-                stuck.text = text
-                raise stuck from failure
-            refused = re.search(r'^ERROR refused (halted|multicore): ', text, re.M)
-            first = next((int(v, 16) for name, v in _OCD_READ_RE.findall(text) if name == 'DHCSR'), None)
-            if refused and refused.group(1) == 'halted' and first is not None and not signals:
-                raise HaltRefused(f'halting fallback: {failure}', first) from failure
-            if failure is None:
-                after = ''    # the loop finished, resume included, before the signal could stop it
-            elif re.search(r'^GUARDED$', text, re.M):
-                after = self.recover(30)
-            elif refused:
-                after = ''
+                result = pcs, dhcsr[0], dhcsr[1]
             else:
-                after = ('; it stopped before its guards passed, so it halted nothing: check the core with '
-                         'probe_state.py')
-            raise ToolError(f'halting fallback: {what}{after}') from failure
+                what = str(failure)
+                if signals:
+                    what = f'interrupted by signal {signals[0]}'
+                    if failure is not None and not isinstance(failure, Cancelled):
+                        what += f'; {failure}'
+                if isinstance(failure, Unreaped):
+                    stuck = Unreaped(f'halting fallback: {what}; {UNREAPED_NOTE}')
+                    stuck.text = text
+                    raise stuck from failure
+                refused = re.search(r'^ERROR refused (halted|multicore): ', text, re.M)
+                first = next((int(v, 16) for name, v in _OCD_READ_RE.findall(text) if name == 'DHCSR'), None)
+                if refused and refused.group(1) == 'halted' and first is not None and not signals:
+                    raise HaltRefused(f'halting fallback: {failure}', first) from failure
+                if failure is None:
+                    after = ''    # the loop finished, resume included, before the signal could stop it
+                elif re.search(r'^GUARDED$', text, re.M):
+                    after = self.recover(30)
+                elif refused:
+                    after = ''
+                else:
+                    after = ('; it stopped before its guards passed, so it halted nothing: check the core with '
+                             'probe_state.py')
+                raise ToolError(f'halting fallback: {what}{after}') from failure
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+        if signals:    # landed while the handlers were restored; the loop had resumed the core
+            raise ToolError(f'halting fallback: interrupted by signal {signals[0]}')
+        return result
 
 
 def resolve(a, p):

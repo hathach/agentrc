@@ -1443,6 +1443,19 @@ class PcSampleOpenOCDTest(FakeToolsCase):
     def test_a_signal_after_the_fallback_finished_needs_no_recovery(self):
         self.assertEqual(self.halt_with_signal(None), ('halting fallback: interrupted by signal 15', 0))
 
+    def test_a_signal_while_the_handlers_are_restored_is_reported(self):
+        real_signal, raised = signal.signal, []
+
+        def restore(sig, handler):
+            if getattr(handler, '__name__', '') != 'on_signal' and not raised:
+                raised.append(sig)
+                signal.raise_signal(signal.SIGTERM)    # on_signal still holds SIGTERM
+            return real_signal(sig, handler)
+        with mock.patch.object(signal, 'signal', restore):
+            self.assertEqual(self.halt_with_signal(None, signalled=False),
+                             ('halting fallback: interrupted by signal 15', 0))
+        self.assertEqual(raised, [signal.SIGINT])
+
     def test_run_feeds_stdin_within_the_timeout(self):
         start = time.monotonic()
         with self.assertRaisesRegex(probe_state.ToolError, 'did not finish within'):
