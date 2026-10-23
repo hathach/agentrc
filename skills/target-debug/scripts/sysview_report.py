@@ -21,7 +21,8 @@ import re
 import sys
 from pathlib import Path
 
-from sysview_decode import MALFORMED, TIMING_LOST
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sysview_decode import MALFORMED, TIMING_LOST  # noqa: E402
 
 # SystemView's text forms in its event export (SystemView 4.10b, Linux)
 TIME_RE = re.compile(r'([\d. ]+)\s*(s|ms|us)$')
