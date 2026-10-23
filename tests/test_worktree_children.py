@@ -406,14 +406,19 @@ class WorktreeChildren(unittest.TestCase):
                 self.mode.write_text(mode)
                 self.assert_kept(child, reason)
 
-    def test_a_missing_herdr_keeps_every_child_and_reports_them(self):
+    def test_no_herdr_has_no_workspace_to_keep_a_child_unless_herdr_env_expects_one(self):
         kids = [self.child(), self.child('second')]
         self.drop_parent()
-        done = self.run_script('cleanup', str(self.parent), env={'HERDR_BIN_PATH': str(self.t / 'no-herdr')})
+        missing = {'HERDR_BIN_PATH': str(self.t / 'no-herdr')}
+        done = self.run_script('cleanup', str(self.parent), env={**missing, 'HERDR_ENV': '1'})
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         for kid in kids:
             self.assertTrue(kid.is_dir())
-            self.assertIn(f'kept {kid}: herdr could not list it', done.stdout)
+            self.assertIn(f'kept {kid}: HERDR_ENV is set', done.stdout)
+        done = self.run_script('cleanup', str(self.parent), env={**missing, 'HERDR_ENV': ''})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        for kid in kids:
+            self.assertFalse(kid.exists())
 
     def test_a_private_ref_on_a_unique_commit_keeps_the_child(self):
         child = self.child()

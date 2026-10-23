@@ -66,7 +66,8 @@ every session's instructions:
   steps run first, so a refusal of herdr's (such as `min_herdr_version`) changes
   nothing.
   `worktree-children` removes a herdr worktree's `<name>--*` sibling worktrees
-  when herdr removes it, keeping and reporting any that hold work, and deletes
+  when herdr removes it (`worktree-remove` runs the same cleanup itself for a
+  worktree herdr has not open), keeping and reporting any that hold work, and deletes
   the removed worktrees' branches whose commits are on their remote or a PR
   head (its docstring lists the checks); `worktree_children.py cleanup <parent>`
   retries, with the `--branch` arguments its log names.
@@ -201,8 +202,8 @@ the skipped tests and notes for a port:
   under Xvfb and tracks its processes through `/proc` and process groups.
 - `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
   as a POSIX session and identifies it through `/proc` (#130).
-- `install.py --herdr-plugin` refuses on Windows; `worktree-remove` has no
-  Windows test.
+- `install.py --herdr-plugin` refuses on Windows; `worktree-remove` is tested
+  there only without herdr.
 
 The hardware-debug scripts run on Windows but are unverified on a board there
 (#130), and their tests skip the cases that drive POSIX stub executables or
@@ -223,7 +224,7 @@ Agent collaboration and PRs:
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR: pin it, pick rig boards, run the pr-review workflow, leave it as a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's or Read the Docs build's log, rerun it once after an infra failure | `circleci.py log <job>`, `rerun <job>...`, `rtd.py log <url>` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
-| [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a herdr worktree when its task is done: check it, gate on pending follow-ups and PR state, then herdr removes it and the `worktree-children` plugin its siblings and branches | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
+| [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a worktree when its task is done: check it, gate on pending follow-ups and PR state, then herdr removes it and the `worktree-children` plugin its siblings and branches, or without a herdr workspace git and the plugin's cleanup | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
 
 Hardware documentation, from the Calibre library at `~/Documents/calibre-library`
 (`CALIBRE_LIBRARY` overrides):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove the sibling child worktrees of a herdr worktree once herdr has removed it.
+"""Remove the sibling child worktrees of a worktree once herdr, or worktree-remove without herdr, has removed it.
 
     worktree_children.py event               # herdr's worktree.removed hook (HERDR_PLUGIN_EVENT_JSON)
     worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
@@ -14,7 +14,8 @@ A child is removed only when every check below passes; otherwise it is kept and 
 `git worktree remove` re-checks cleanliness at removal; `--force`, which skips that, is used only
 for a child with submodules (git refuses those otherwise), so a write racing its checks is lost.
 - herdr confirms it is not open as its own workspace (`herdr worktree list --cwd <child>`);
-  herdr unreachable or an unexpected answer keeps it;
+  herdr unreachable or an unexpected answer keeps it. With no herdr (none at HERDR_BIN_PATH or
+  on PATH) none can be open; HERDR_ENV set without one keeps it;
 - no chief session (headless or interactive) runs in it and none of its cowork lanes holds a
   request (running or undelivered); the skills' own code decides, and code that cannot load keeps it;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
@@ -66,6 +67,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -249,8 +251,18 @@ def linked_workspace(path, herdr=None):
     return entry['is_linked_worktree'] and entry.get('open_workspace_id') is not None
 
 
+def herdr_found():
+    """Whether there is a herdr to ask; without one no checkout is open in a herdr workspace. Keep when
+    HERDR_ENV says this runs under herdr but none is found."""
+    if shutil.which(HERDR):
+        return True
+    if os.environ.get('HERDR_ENV'):
+        raise Keep(f'HERDR_ENV is set but {HERDR} is not found: cannot tell what herdr has open')
+    return False
+
+
 def check_herdr(child):
-    workspace = herdr_entry(child).get('open_workspace_id')
+    workspace = herdr_found() and herdr_entry(child).get('open_workspace_id')
     if workspace:
         raise Keep(f'open in herdr workspace {workspace}')
 
