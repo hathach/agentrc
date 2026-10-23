@@ -208,7 +208,7 @@ class Recorder(unittest.TestCase):
         return [c for c in self.commands() if c.startswith('-load ')]
 
     def test_decode_answers_the_license_and_exports_the_loaded_file(self):
-        rc, r = self.run_main('--from-raw', str(self.raw), FAKE_DIALOG='No Commercial-Use License | SystemView')
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_DIALOG='No Commercial-Use License | SystemView')
         self.assertEqual(rc, 0, r)
         self.assertEqual(set(r['exports']), {'contexts.csv', 'events.txt'})
         self.assertRegex(r['loadedTitle'], r' - sysview-[0-9a-f]{32}\.SVDat \|')
@@ -223,7 +223,7 @@ class Recorder(unittest.TestCase):
         self.assert_nothing_left()
 
     def test_a_load_dropped_during_startup_is_sent_again(self):
-        rc, r = self.run_main('--from-raw', str(self.raw), FAKE_DROP_LOADS='1')
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_DROP_LOADS='1')
         self.assertEqual(rc, 0, r)
         self.assertEqual(len(self.loads()), 2)
         self.assertEqual(len(set(self.loads())), 1)
@@ -232,36 +232,36 @@ class Recorder(unittest.TestCase):
         raw = self.dir / 'Sample_Multicore.SVDat'
         raw.write_bytes(b'\0' * 10)
         with mock.patch.object(record, 'LOAD_S', 0.6):
-            rc, r = self.run_main('--from-raw', str(raw), FAKE_DROP_LOADS='99')
+            rc, r = self.run_main('--gui', '--from-raw', str(raw), FAKE_DROP_LOADS='99')
         self.assertEqual(rc, 3)
         self.assertIn('did not show Sample_Multicore.SVDat', r['error'])
         self.assertFalse((self.out / 'contexts.csv').exists())
 
     def test_an_export_still_open_is_waited_for(self):
-        rc, r = self.run_main('--from-raw', str(self.raw), FAKE_SLOW_EXPORT='1')
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_SLOW_EXPORT='1')
         self.assertEqual(rc, 0, r)
         self.assertEqual((self.out / 'contexts.csv').read_text(), 'Name,Activations\n')
         self.assertEqual(r['exports'], {'contexts.csv': 17, 'events.txt': 18})    # the sizes once closed
 
     def test_silent_xvfb_fails_and_cleans_up(self):
-        rc, r = self.run_main('--from-raw', str(self.raw), FAKE_XVFB_SILENT='1')
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_XVFB_SILENT='1')
         self.assertEqual(rc, 3)
         self.assertIn('Xvfb reported no display', r['error'])
         self.assert_nothing_left()
 
     def test_no_events_and_terminal_exports(self):
-        rc, r = self.run_main('--from-raw', str(self.raw), '--no-events', '--export-terminal')
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw), '--no-events', '--export-terminal')
         self.assertEqual((rc, set(r['exports'])), (0, {'contexts.csv', 'terminal.csv'}))
 
     def test_unknown_dialog_fails_the_run(self):
-        rc, r = self.run_main('--from-raw', str(self.raw), FAKE_DIALOG='Something Else')
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_DIALOG='Something Else')
         self.assertEqual(rc, 3)
         self.assertIn("unexpected SystemView dialog 'Something Else'", r['error'])
         self.assert_nothing_left()
 
     def test_sample_still_loaded_is_never_exported(self):
         with mock.patch.object(record, 'LOAD_S', 0.6):
-            rc, r = self.run_main('--from-raw', str(self.raw),
+            rc, r = self.run_main('--gui', '--from-raw', str(self.raw),
                                   FAKE_TITLE='SEGGER SystemView V4.10b - Sample_Multicore')
         self.assertEqual(rc, 3)
         self.assertIn('did not show capture.SVDat', r['error'])
@@ -269,7 +269,7 @@ class Recorder(unittest.TestCase):
 
     def test_missing_export_fails(self):
         with mock.patch.object(record, 'EXPORT_S', 0.5):
-            rc, r = self.run_main('--from-raw', str(self.raw), FAKE_NO_EXPORT='1')
+            rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_NO_EXPORT='1')
         self.assertEqual(rc, 3)
         self.assertIn('-export-contexts wrote no complete contexts.csv', r['error'])
         self.assert_nothing_left()
@@ -281,7 +281,7 @@ class Recorder(unittest.TestCase):
             port = other.getsockname()[1]
             other.setblocking(False)
             with mock.patch.object(record, 'free_port', return_value=port):
-                rc, r = self.run_main('--from-raw', str(self.raw))
+                rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
             with self.assertRaises(BlockingIOError):
                 other.accept()    # nothing was sent to the other listener, -quit included
         self.assertEqual(rc, 3)
@@ -361,7 +361,7 @@ class Recorder(unittest.TestCase):
         self.assertEqual((rc, r['workload']['ended'], r['workload']['exit']), (0, 'exited', 0))
 
     def test_an_error_dialog_is_answered_and_counted(self):
-        rc, r = self.run_main('--from-raw', str(self.raw), FAKE_DIALOG='SystemView Error')
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_DIALOG='SystemView Error')
         self.assertEqual(rc, 0, r)
         self.assertEqual(r['dialogsAnswered'], {'SystemView Error': 1})
         self.assertEqual(r['systemviewErrors'], 1)
@@ -381,13 +381,13 @@ class Recorder(unittest.TestCase):
         self.assertNotIn('002/009', jail)
 
     def test_a_decode_sees_no_usb_device(self):
-        rc, r = self.run_main('--from-raw', str(self.raw))
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
         self.assertEqual(rc, 0, r)
         self.assertNotIn('/dev/bus/usb/', self.jail())
         self.assertIn('mount -t tmpfs none /dev/bus/usb', self.jail())
 
     def test_systemview_gets_a_private_tmp_with_only_its_home_out_and_x_socket(self):
-        rc, r = self.run_main('--from-raw', str(self.raw))
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
         self.assertEqual(rc, 0, r)
         steps = self.jail().split('; ')
         stage = next(s for s in steps if s.startswith('mount --move')).split()[2]
@@ -402,7 +402,7 @@ class Recorder(unittest.TestCase):
 
     def test_an_out_with_spaces_is_bound_and_exported(self):
         self.out = self.dir / 'my out'
-        rc, r = self.run_main('--from-raw', str(self.raw))
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
         self.assertEqual(rc, 0, r)
         self.assertIn(f"mount --bind '{self.out}' ", self.jail())
         self.assertEqual((self.out / 'events.txt').read_text(), 'sequencenum,event\n')
@@ -412,7 +412,7 @@ class Recorder(unittest.TestCase):
         sv = Path(tempfile.mkdtemp(prefix='sv-', dir='/tmp'))
         self.addCleanup(shutil.rmtree, sv)
         self.out = sv / 'out'
-        rc, r = self.run_main('--from-raw', str(self.raw))
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
         self.assertEqual(rc, 0, r)
         self.assertEqual((self.out / 'contexts.csv').read_text(), 'Name,Activations\n')
         self.assertNotIn(str(sv), ' '.join(self.commands()))
@@ -443,7 +443,7 @@ class Recorder(unittest.TestCase):
 
     def test_a_group_outliving_sigkill_fails_the_cleanup_after_all_of_it(self):
         with self.survivors():
-            rc, r = self.run_main('--from-raw', str(self.raw))
+            rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
         self.assertEqual(rc, 3)
         self.assertNotIn('error', r)
         self.assertRegex(r['cleanupError'], r'still running after SIGKILL: SystemView \(group \d+\), Xvfb')
@@ -451,7 +451,7 @@ class Recorder(unittest.TestCase):
 
     def test_a_startup_failure_survives_a_failed_cleanup(self):
         with self.survivors():
-            rc, r = self.run_main('--from-raw', str(self.raw), FAKE_XVFB_SILENT='1')
+            rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_XVFB_SILENT='1')
         self.assertEqual(rc, 3)
         self.assertIn('Xvfb reported no display', r['error'])
         self.assertIn('still running after SIGKILL: Xvfb', r['cleanupError'])
@@ -483,7 +483,7 @@ class OffLinux(unittest.TestCase):
             out = Path(d) / 'out'
             err = io.StringIO()
             with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
-                record.main(['--out', str(out), '--from-raw', __file__])
+                record.main(['--out', str(out), '--gui', '--from-raw', __file__])
             self.assertEqual(cm.exception.code, 2)
             self.assertIn('Linux-only', err.getvalue())
             self.assertFalse(out.exists())
@@ -502,7 +502,7 @@ class Usage(unittest.TestCase):
             raw.write_bytes(b'x')
             out = Path(d) / 'out'
             with mock.patch.object(record.shutil, 'which', return_value=None):
-                self.assertIn('not on PATH: systemview', self.usage('--out', str(out), '--from-raw', str(raw)))
+                self.assertIn('not on PATH: systemview', self.usage('--out', str(out), '--gui', '--from-raw', str(raw)))
             self.assertFalse(out.exists())
 
     def usage(self, *argv):

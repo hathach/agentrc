@@ -1,0 +1,84 @@
+{
+  "contexts": [
+    {
+      "name": "SysTick",
+      "activations": 17,
+      "cpu_pct": 0.96,
+      "total_ms": 0.063,
+      "blocked_ms": null,
+      "min_us": 9.0,
+      "avg_us": 3.7,
+      "max_us": 9.0
+    },
+    {
+      "name": "Scheduler",
+      "activations": 34,
+      "cpu_pct": 1.63,
+      "total_ms": 0.107,
+      "blocked_ms": null,
+      "min_us": 3.0,
+      "avg_us": 3.2,
+      "max_us": 12.9
+    },
+    {
+      "name": "cdc",
+      "activations": 17,
+      "cpu_pct": 2.87,
+      "total_ms": 0.189,
+      "blocked_ms": 0.098,
+      "min_us": 19.5,
+      "avg_us": 11.1,
+      "max_us": 71.4
+    },
+    {
+      "name": "Idle",
+      "activations": 17,
+      "cpu_pct": 94.54,
+      "total_ms": 6.272,
+      "blocked_ms": null,
+      "min_us": 526.4,
+      "avg_us": 368.9,
+      "max_us": 955.7
+    }
+  ],
+  "isr": [
+    {
+      "name": "SysTick",
+      "n": 17,
+      "p50_us": 0.0,
+      "p99_us": 9.0,
+      "max_us": 9.0
+    }
+  ],
+  "ready_run": [
+    {
+      "name": "cdc",
+      "n": 17,
+      "p50_us": 0.0,
+      "p99_us": 7.3,
+      "max_us": 7.3
+    }
+  ],
+  "functions": [
+    {
+      "id": 515,
+      "name": "#515",
+      "n": 17,
+      "p50_us": 0.0,
+      "p99_us": 2.1,
+      "max_us": 2.1
+    }
+  ],
+  "markers": [],
+  "stack": [],
+  "heap": null,
+  "overflow": 0,
+  "dropped_pairs": 0,
+  "live_window_s": 0.006567,
+  "workload_window_s": null,
+  "workload_anchor": null,
+  "contexts_workload": null,
+  "warnings": [
+    "the first 222 events share the first timestamp with more than one context switch: if this is a decoded post-mortem ring they are untimed, pass --post-mortem"
+  ]
+}

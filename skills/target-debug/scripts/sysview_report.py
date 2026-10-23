@@ -162,8 +162,7 @@ def timestamp(row):
 
 def time_base(rows, warnings):
     """Timestamp frequency in Hz, or None when the export gives no usable one."""
-    init = next((r for r in rows if r['event'] == 'Init'), None)
-    m = FREQ_RE.search(init['detail']) if init else None
+    m = next((m for r in rows if r['event'] == 'Init' for m in [FREQ_RE.search(r['detail'])] if m), None)
     if not m or not int(m.group(1)):
         warnings.append('no Init record with the timestamp frequency: time-derived metrics withheld')
         return None
@@ -208,10 +207,10 @@ class Scan:
             event, detail, ctx, ts = row['event'], row['detail'], row['context'], row['ts']
             # a switch whose return context was lost renders as "Returns to *** OVERFLOW ***" with no Overflow row of
             # its own: most of the loss in a heavily overflowing capture
-            lost = event == '*** Overflow ***' or '*** OVERFLOW ***' in detail
+            lost = event == '*** Overflow ***' or '*** OVERFLOW ***' in detail or row.get('timing_loss', False)
             if lost:
                 self.overflow += 1
-                if not self.losses or self.losses[-1][1] is not None:
+                if ts is not None and (not self.losses or self.losses[-1][1] is not None):
                     self.losses.append([ts, None])
                 # a call open across the gap may have lost its return; SystemView would splice it to a later one
                 self.dropped_pairs += sum(map(len, open_calls.values()))
@@ -241,7 +240,11 @@ class Scan:
                 last = ts
             mark = MARK_RE.match(event)
             func = FUNC_RE.match(event)
-            if lost:
+            if row.get('malformed_payload'):
+                self.dropped_pairs += sum(map(len, open_calls.values()))
+                open_calls.clear()
+                self.mark_open = False
+            if lost or row.get('malformed_payload'):
                 pass
             elif event == 'ISR Enter':
                 m = RUNS_RE.search(detail)
@@ -371,18 +374,44 @@ def report(args):
         rows = read_csv(ev_path, EVENT_COLUMNS, 'events')
         for r in rows:
             r['ts'] = timestamp(r)
-        freq = time_base(rows, warnings)
-        head = timed_from(rows) if freq else 0
+        try:
+            metadata = json.loads((out / 'decode.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            metadata = {}
+        if not isinstance(metadata, dict) or metadata.get('decoder') != 'native':
+            metadata = {}
+        timed = metadata.get('timedEvents', len(rows))
+        losses = metadata.get('timingLosses', [])
+        if (not isinstance(timed, int) or not 0 <= timed <= len(rows)
+                or any(r['ts'] is None for r in rows[:timed])
+                or any(r['ts'] is not None for r in rows[timed:])):
+            timed, losses = len(rows), []
+        if losses:
+            warnings.append(f'native timing lost at byte {losses[0]["offset"]}: time-derived metrics cover '
+                            f'the first {timed} events; {len(losses)} timing loss boundary(s)')
+        loss_rows = {loss['row'] for loss in losses}
+        malformed = {str(d['offset']) for d in metadata.get('diagnostics', [])
+                     if d['reason'].startswith('malformed payload:')}
+        if malformed:
+            warnings.append(f'{len(malformed)} malformed payload(s): dependent call, marker and heap spans withheld '
+                            '(decode.json diagnostics)')
+        for i, r in enumerate(rows):
+            r['timing_loss'] = i in loss_rows
+            r['malformed_payload'] = r.get('eventoffset') in malformed
+        trailing_losses = sum(loss['row'] == len(rows) for loss in losses)
+        freq = time_base(rows[:timed], warnings)
+        head = timed_from(rows[:timed]) if freq else 0
         if head and not args.post_mortem:
             warnings.append(f'the first {head} events share the first timestamp with more than one context switch: '
                             f'if this is a decoded post-mortem ring they are untimed, pass --post-mortem')
             head = 0
         elif head:
             warnings.append(f'the first {head} events share one timestamp and are left out as untimed: '
-                            f'event and time metrics cover the {len(rows) - head} timed events after them; '
+                            f'event and time metrics cover the {timed - head} timed events after them; '
                             f'contexts.csv times withheld')
             rows = rows[head:]
-            if len(rows) < 2 or rows[-1]['ts'] <= rows[0]['ts']:
+            timed -= head
+            if timed < 2 or rows[timed - 1]['ts'] <= rows[0]['ts']:
                 warnings.append('the timed events span nothing: time-derived metrics withheld')
                 freq = None
         scan = Scan(rows, args.workload_marker, args.workload_event, unknown_start=bool(head))
@@ -391,7 +420,8 @@ def report(args):
             net, allocs, frees = map(int, scan.heap.groups())
             heap = {'allocs': allocs, 'frees': frees, 'net_bytes': net}
         result.update(stack=[{'name': k, 'bytes_used': v} for k, v in scan.stack.items()], heap=heap,
-                      overflow=scan.overflow, dropped_pairs=scan.dropped_pairs)
+                      overflow=scan.overflow + trailing_losses,
+                      dropped_pairs=scan.dropped_pairs)
     if freq is None or head:
         for c in result['contexts']:
             c.update(dict.fromkeys(CONTEXT_TIMES))

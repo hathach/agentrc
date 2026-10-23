@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Unattended SEGGER SystemView on a headless Linux host: record live over a J-Link, or decode a raw capture, and
-export the analysis for sysview_report.py. The contract (arguments, files in --out, exit codes) is the target-debug
+"""Record SEGGER SystemView on Linux over a J-Link, or decode a raw capture natively on any platform,
+and export the analysis for sysview_report.py. The contract (arguments, files in --out, exit codes) is the target-debug
 skill's sysview.md, "Script interface".
 
   sysview_record.py --out DIR (--hil-config FILE --board NAME | --probe SN --device NAME) --interface swd|jtag
                     --speed KHZ (--elf FILE | --addr ADDR) --duration-ms N [--workload CMD]
                     [--no-events] [--export-terminal]
-  sysview_record.py --out DIR --from-raw FILE [--no-events] [--export-terminal]
+  sysview_record.py --out DIR --from-raw FILE [--no-events] [--gui [--export-terminal]]
 
 SystemView runs under an Xvfb of its own (-displayfd picks a free display) with a temporary HOME, so its ini and
 recent-file state never touch the user's; the SEGGER registry file (license key) and JLinkDLL.ini are copied in. It
@@ -29,8 +29,8 @@ accepted, as the operator has directed for every SEGGER notice. SystemView delet
 namespace also gives it a private /tmp holding only the X server's socket directory and, under NS_TMP, its HOME and
 --out: the host's /tmp is out of its reach, and the commands it is sent name those namespace paths.
 
-Exit: 0 recorded and exported; 2 bad usage or not Linux; 3 a tool, the probe, the workload or an export failed, or a
-signal stopped the run (record.json says which).
+Exit: 0 recorded and exported; 2 bad usage or a GUI request off Linux; 3 decoding, a tool, the probe, the workload or
+an export failed, or a signal stopped the run (record.json says which).
 """
 import argparse
 import datetime
@@ -496,10 +496,38 @@ def on_signal(signum, _frame):
     raise Failure(f'stopped by signal {signum}')
 
 
+def record_native(a, raw, argv, parser):
+    from sysview_decode import DecodeError, decode_file
+
+    out = Path(a.out).resolve()
+    prepare_out(parser, str(out))
+    record = {'started': now(), 'argv': list(argv if argv is not None else sys.argv[1:]),
+              'mode': 'decode', 'decoder': 'native', 'exports': {}}
+    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, getattr(signal, 'SIGHUP', None))
+                if sig is not None}
+    rc = 0
+    try:
+        record['decode'] = decode_file(raw, out, a.no_events)
+        for name in ('contexts.csv', 'events.txt'):
+            if (out / name).is_file():
+                record['exports'][name] = (out / name).stat().st_size
+    except (Failure, OSError, DecodeError, KeyboardInterrupt) as e:
+        record['error'] = str(e) or type(e).__name__
+        rc = 3
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        record['ended'] = now()
+        (out / 'record.json').write_text(json.dumps(record, indent=1), encoding='utf-8')
+    print(json.dumps(record))
+    return rc
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--out', required=True, help='new or empty output directory')
     p.add_argument('--from-raw', metavar='FILE', help='decode this raw capture instead of recording')
+    p.add_argument('--gui', action='store_true', help='use the Linux SystemView GUI to decode --from-raw')
     p.add_argument('--hil-config', metavar='FILE', help="the project's HIL config json (a jlink entry)")
     p.add_argument('--board', metavar='NAME', help='board name in --hil-config')
     p.add_argument('--probe', help='J-Link serial')
@@ -513,8 +541,8 @@ def main(argv=None):
     p.add_argument('--no-events', action='store_true', help='skip events.txt (large: megabytes per second)')
     p.add_argument('--export-terminal', action='store_true', help='also export terminal.csv')
     a = p.parse_args(argv)
-    if sys.platform != 'linux':
-        p.error(f'Linux-only (Xvfb, /proc, POSIX process groups); this is {sys.platform}')
+    if a.gui and not a.from_raw:
+        p.error('--gui is for --from-raw; live recording already uses the GUI')
     if a.from_raw:
         live = [f for f in ('hil_config', 'board', 'probe', 'device', 'interface', 'speed', 'elf', 'addr',
                             'duration_ms', 'workload') if getattr(a, f) is not None]
@@ -523,7 +551,13 @@ def main(argv=None):
         raw = Path(a.from_raw).resolve()
         if not raw.is_file() or not raw.stat().st_size:
             p.error(f'--from-raw {a.from_raw}: no such non-empty file')
-    else:
+        if not a.gui:
+            if a.export_terminal:
+                p.error('--export-terminal requires --gui; native decoding does not export the terminal channel')
+            return record_native(a, raw, argv, p)
+    if sys.platform != 'linux':
+        p.error(f'Linux-only (Xvfb, /proc, POSIX process groups); this is {sys.platform}')
+    if not a.from_raw:
         cb = resolve_live(a, p)
     missing = [t for t in TOOLS if not shutil.which(t)]
     if missing:
