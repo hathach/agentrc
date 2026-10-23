@@ -51,9 +51,9 @@ you are answering (`COWORK_TURN`) or another caller's.
 
 - `main` works in this checkout and edits your uncommitted work: the
   ordinary edit.
-- Any other lane works in this checkout read-only, every send `--no-edit`:
-  a question, plan or review, one lane per parallel reviewer. `--read-only`
-  asserts that kind.
+- Any other lane, unless its first send had `--worktree`, works in this
+  checkout read-only, every send `--no-edit`: a question, plan or review,
+  one lane per parallel reviewer. `--read-only` asserts that kind.
 - `--worktree` on a lane's first send gives it its own worktree and branch
   from your HEAD, never moved by the script; it sees commits only. A
   parallel edit, or a writer that must not see your work, as in `co-test`.
