@@ -1186,6 +1186,8 @@ class LinkHops(unittest.TestCase):
         anchored = self.wc.anchored
         self.assertEqual(anchored('\\\\?\\D:\\x\\y', 'C:\\w'), ('D:\\', ['x', 'y']))
         self.assertEqual(anchored('\\\\?\\UNC\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
+        self.assertEqual(anchored('\\\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
+        self.assertEqual(anchored('\\\\?\\UNC\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
         self.assertEqual(anchored('D:/x/y', 'C:\\w'), ('D:\\', ['x', 'y']))
         self.assertEqual(anchored('\\x', 'C:\\w'), ('C:\\', ['x']))
         self.assertEqual(anchored('x/y', 'C:\\w'), ('C:\\w', ['x', 'y']))
