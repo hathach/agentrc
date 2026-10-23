@@ -3,6 +3,7 @@ mnemonic, an unknown dialog failing the run, the command port checked to be this
 the window names the file this run loaded, a live recording's save, load-back and workload accounting, the user's
 SEGGER config left untouched, and the usage checks. Stubs prove the plumbing only; no SystemView, no probe."""
 import contextlib
+import gzip
 import importlib.util
 import io
 import json
@@ -19,10 +20,12 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, make_stub, pid_alive  # noqa: E402
+from helpers import guard_survivors, make_stub, pid_alive, tmpdir  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
+import sysview_decode as decode  # noqa: E402
+
 spec = importlib.util.spec_from_file_location('sysview_record', SCRIPTS / 'sysview_record.py')
 record = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(record)
@@ -544,6 +547,70 @@ class Usage(unittest.TestCase):
             self.assertIn('over a J-Link only', self.usage('--out', d + '/o', '--hil-config', str(cfg), '--board', 'b',
                                                            '--interface', 'swd', '--speed', '4000', '--addr', '0x1',
                                                            '--duration-ms', '1'))
+
+
+class NativeRecorder(unittest.TestCase):
+    @staticmethod
+    def capture():
+        fixture = Path(__file__).parent / 'fixtures/sysview/baremetal/capture.SVDat.gz'
+        return gzip.decompress(fixture.read_bytes())
+
+    def test_native_signal_writes_failure_record_and_restores_handler(self):
+        for sig in (signal.SIGTERM, getattr(signal, 'SIGHUP', signal.SIGTERM)):
+            with self.subTest(signal=sig):
+                tmp = tmpdir(self)
+                root = Path(tmp)
+                raw = root / 'raw'
+                raw.write_bytes(self.capture())
+                previous = signal.getsignal(sig)
+                with mock.patch.object(decode, 'decode_file', side_effect=lambda *a: signal.raise_signal(sig)), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(record.main(['--from-raw', str(raw), '--out', str(root / 'out')]), 3)
+                metadata = json.loads((root / 'out/record.json').read_text())
+                self.assertEqual(metadata['error'], f'stopped by signal {sig}')
+                self.assertIn('ended', metadata)
+                self.assertEqual(signal.getsignal(sig), previous)
+
+    def test_native_decode_bypasses_linux_tools_and_probe_setup(self):
+        for platform in ('linux', 'darwin', 'win32'):
+            with self.subTest(platform=platform):
+                tmp = tmpdir(self)
+                root = Path(tmp)
+                raw = root / 'raw'
+                raw.write_bytes(self.capture())
+                with mock.patch.object(record.sys, 'platform', platform), \
+                        mock.patch.object(record.shutil, 'which', side_effect=AssertionError('tool lookup')), \
+                        mock.patch.object(record, 'SystemView', side_effect=AssertionError('GUI launched')), \
+                        mock.patch.object(record, 'resolve_live', side_effect=AssertionError('probe accessed')), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(record.main(['--from-raw', str(raw), '--out', str(root / 'out')]), 0)
+                metadata = json.loads((root / 'out/record.json').read_text())
+                self.assertEqual(metadata['decoder'], 'native')
+                self.assertEqual(set(metadata['exports']), {'events.txt', 'contexts.csv'})
+
+    def test_no_events_and_terminal_refusal(self):
+        tmp = tmpdir(self)
+        root = Path(tmp)
+        raw = root / 'raw'
+        raw.write_bytes(self.capture())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(record.main(['--from-raw', str(raw), '--out', str(root / 'out'), '--no-events']), 0)
+        self.assertFalse((root / 'out/events.txt').exists())
+        error = io.StringIO()
+        with contextlib.redirect_stderr(error), self.assertRaises(SystemExit) as cm:
+            record.main(['--from-raw', str(raw), '--out', str(root / 'other'), '--export-terminal'])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn('requires --gui', error.getvalue())
+        self.assertFalse((root / 'other').exists())
+
+    def test_decode_failure_is_recorded(self):
+        tmp = tmpdir(self)
+        root = Path(tmp)
+        raw = root / 'raw'
+        raw.write_bytes(b'not SystemView')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(record.main(['--from-raw', str(raw), '--out', str(root / 'out')]), 3)
+        self.assertIn('synchronization', json.loads((root / 'out/record.json').read_text())['error'])
 
 
 if __name__ == '__main__':

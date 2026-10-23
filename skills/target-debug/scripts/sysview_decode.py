@@ -35,28 +35,29 @@ NAMES = {0: 'NOP', 1: '*** Overflow ***', 2: 'ISR Enter', 3: 'ISR Exit', 4: 'Tas
          24: 'Init', 25: 'Resource Name', 26: 'Print', 27: 'Num Modules', 28: 'End Call', 29: 'Task Terminate'}
 # SystemView 4.10b Description/SYSVIEW_FreeRTOS.txt; UM08027 pp. 38, 146 (see fixture claim record).
 FREERTOS_STATES = {4: 'Delayed', 27: 'Suspended'}
+OS_NAME_RE = re.compile(r'(?:^|,)O=([^,]+)')
+MALFORMED = 'Malformed payload: '
+MALFORMED_DIAGNOSTIC = MALFORMED.lower()
+TIMING_LOST = '*** TIMING LOST ***'
 
 
 def blocked_time_evidence(os_name):
-    evidence = {'os': os_name, 'reason': 'No verified OS preemption-state rule for total blocked time.',
-                'manual': 'UM08027 4.10 rev.0, sections 3.6 and 6.1.5.3, pp. 38, 146'}
     if os_name == 'FreeRTOS':
-        evidence.update(source='SystemView_V410b/Description/SYSVIEW_FreeRTOS.txt',
-                        sourceSha256='bed4b8dd7842b252ef4a371a6df28d7114b335da5c6ea0df1ef305e2ab5b7da0',
-                        stateMask=255, taskStates={str(k): v for k, v in FREERTOS_STATES.items()},
-                        preemptingTaskStates=None,
-                        reason='The installed FreeRTOS description has no PreemptingTaskStates entry; its two '
-                               'TaskState labels do not resolve the jl-wrapped cdc blocked-time gap.',
-                        unresolvedExample={'capture': 'jl-wrapped', 'context': 'cdc', 'frequency': 168000000,
-                                           'guiTicks': 859427, 'intervalTicks': 729886, 'gapTicks': 129541})
-    return evidence
+        return 'FreeRTOS has no verified preemption-state rule that reproduces GUI blocked time; use --gui.'
+    return 'No verified OS preemption-state rule for total blocked time; use --gui.'
+
+
+def rounded_ns(ticks, frequency):
+    return (2 * ticks * 1_000_000_000 + frequency) // (2 * frequency)
+
+
+def format_duration(ticks, frequency, unit=None):
+    unit = unit or ('ms' if ticks * 1000 >= frequency else 'us')
+    value = rounded_ns(ticks, frequency) if unit == 'us' else ticks * {'ms': 1_000_000, 's': 1000}[unit] // frequency
+    return f'{value // 1000}.{value % 1000:03d} {unit}'
 
 
 class DecodeError(ValueError):
-    pass
-
-
-class TimestampError(DecodeError):
     pass
 
 
@@ -75,7 +76,10 @@ class Reader:
     def uint(self):
         value = 0
         for shift in range(0, 35, 7):
-            b = self.take(1)[0]
+            if self.pos >= self.end:
+                raise DecodeError('truncated packet')
+            b = self.data[self.pos]
+            self.pos += 1
             if shift == 28 and b > 15:
                 raise DecodeError('varint exceeds 32 bits')
             value |= (b & 127) << shift
@@ -98,7 +102,7 @@ class Packet:
     delta: int
     offset: int
     data: bytes
-    gap: bool = False
+    gap: dict = None
     problem: str = ''
 
 
@@ -108,8 +112,7 @@ def packet_at(data, offset):
     args, text, problem = [], '', ''
     if event < 24:
         if event == 23:
-            args.append(r.uint())
-            r.take(4)  # SEGGER_SYSVIEW_SampleData: IEEE754 float, not a varint.
+            args = [r.uint(), r.uint()]  # _EncodeFloat encodes the IEEE754 U32 bit pattern as a varint.
         else:
             count, has_text = LAYOUT[event]
             args = [r.uint() for _ in range(count)]
@@ -130,9 +133,7 @@ def packet_at(data, offset):
                     text = payload.string()
                 elif args[0] not in (0, 2, 3, 4, 5):
                     payload.pos = payload.end  # Other extensions carry typed binary data.
-            elif event not in (24, 27, 28, 29) and event < 32:
-                payload.pos = payload.end
-            if event >= 32:
+            elif event not in (24, 27, 28, 29):
                 payload.pos = payload.end  # User/module payloads are opaque and need not contain varints.
             while payload.pos < payload.end:
                 args.append(payload.uint())
@@ -151,7 +152,7 @@ def packet_at(data, offset):
     try:
         delta = r.uint()
     except DecodeError as e:
-        raise TimestampError('timestamp delta: ' + str(e)) from e
+        raise DecodeError('timestamp delta: ' + str(e)) from e
     return Packet(event, args, text, delta, offset, data[offset:r.pos], problem=problem), r.pos
 
 
@@ -190,7 +191,7 @@ def stream(data, diagnostics):
     if sync != offset:
         diagnostics.append({'offset': offset, 'bytes': sync - offset, 'reason': 'discarded unsynchronized head'})
     offset = after
-    gap = False
+    gap = None
     while offset < len(data):
         if data.startswith(SYNC, offset):
             offset += len(SYNC)
@@ -206,14 +207,14 @@ def stream(data, diagnostics):
             sync, after = find_sync(data, start + 1)
             end = len(data) if sync < 0 else sync
             diagnostic = {'offset': start, 'bytes': end - start, 'reason': str(e)}
-            if sync >= 0 or isinstance(e, TimestampError):
+            if sync >= 0:
                 diagnostic['timingLost'] = True
             diagnostics.append(diagnostic)
             if sync < 0:
                 return
-            offset, gap = after, True
+            offset, gap = after, diagnostic
             continue
-        packet.gap, gap = gap, False
+        packet.gap, gap = gap, None
         yield packet
 
 
@@ -243,7 +244,6 @@ class Decoder:
                          LOST: Context('*** OVERFLOW ***')}
         self.freq = self.shift = self.clock = 0
         self.stream_freq = 0
-        self.time_lost = False
         self.timing_losses = []
         self.timed_events = None
         self.timed_clock = 0
@@ -255,6 +255,10 @@ class Decoder:
         self.task_order, self.isr_order = [], []
         self.activated_ready = set()
         self.scheduler_pending = False
+
+    @property
+    def time_lost(self):
+        return bool(self.timing_losses)
 
     def context(self, key):
         if key not in self.contexts:
@@ -268,11 +272,7 @@ class Decoder:
     def duration(self, ticks):
         if not self.freq or self.time_lost:
             return ''
-        if ticks * 1000 >= self.freq:
-            us = ticks * 1_000_000 // self.freq
-            return f'{us // 1000}.{us % 1000:03d} ms'
-        ns = (2 * ticks * 1_000_000_000 + self.freq) // (2 * self.freq)
-        return f'{ns // 1000}.{ns % 1000:03d} us'
+        return format_duration(ticks, self.freq)
 
     def end_frame(self, ts):
         f = self.current
@@ -292,8 +292,9 @@ class Decoder:
         return elapsed
 
     def begin_frame(self, key, ts, row=None):
+        ctx = self.context(key)
         if not self.time_lost and key not in self.activated_ready:
-            self.context(key).activations += 1
+            ctx.activations += 1
         self.activated_ready.discard(key)
         self.current = Frame(key, ts, [row] if row is not None else [])
 
@@ -322,23 +323,19 @@ class Decoder:
             self.finish_partial(self.timed_clock)
             self.timed_events = len(self.rows)
             self.lose()
-            self.time_lost = True
         self.timing_losses.append({'row': len(self.rows), 'offset': offset, 'reason': reason})
 
-    def decode(self, data):
-        first = True
+    def decode(self, data, format_rows=True):
         for p in stream(data, self.diagnostics):
-            self.clock += 0 if first else p.delta
-            first = False
+            self.clock += p.delta if self.rows else 0
             if p.gap:
-                gap = self.diagnostics[-1]
-                self.lose_time(gap['offset'], gap['reason'])
+                self.lose_time(p.gap['offset'], p.gap['reason'])
             if p.problem:
                 self.calls.clear()
                 self.markers.clear()
                 self.invalidate_heaps()
                 self.diagnostics.append({'offset': p.offset, 'bytes': len(p.data),
-                                         'reason': 'malformed payload: ' + p.problem})
+                                         'reason': MALFORMED_DIAGNOSTIC + p.problem})
             event, args = p.event, p.args
             ts = int(self.rows[-1]['timestampint']) + 1 if event == 1 and self.rows else self.clock
             if event == 24 and not p.problem:
@@ -358,10 +355,10 @@ class Decoder:
                    'detail': '', 'timestampint': ts, 'contextinint': self.current.context,
                    'contextint': self.current.context, 'contextoutint': self.current.context,
                    'eventint': event, 'eventoffset': p.offset, 'eventsize': len(p.data),
-                   'eventdata': p.data.hex(' ').upper() + ' '}
+                   'eventdata': p.data.hex(' ').upper() + ' ' if format_rows else ''}
             self.rows.append(row)
             if p.problem:
-                row['detail'] = 'Malformed payload: ' + p.problem
+                row['detail'] = MALFORMED + p.problem
                 continue
             if event == 1:
                 self.lose()
@@ -376,8 +373,7 @@ class Decoder:
                 if self.current.context >> 32 in (1, 2):
                     elapsed = self.end_frame(ts)
                     parent = self.parents.pop() if self.parents else Frame(LOST, ts)
-                    if event != 20:
-                        parent.interrupted += max(0, elapsed)
+                    parent.interrupted += self.current.interrupted if event == 20 else max(0, elapsed)
                     self.current = parent
                 if event == 18:
                     self.scheduler_pending = True
@@ -429,6 +425,7 @@ class Decoder:
                     row['contextoutint'] = SCHEDULER
             elif event == 8:
                 ctx = self.context(TASK | args[0])
+                row['task_id'] = args[0]
                 row['detail'] = f'{ctx.name} (0x{args[0]:08X})'
             elif event == 9:
                 ctx = self.context(TASK | args[0])
@@ -445,7 +442,7 @@ class Decoder:
                 row['detail'] = f'{args[0] | args[1] << 32} us'
             elif event == 14:
                 row['detail'] = p.text
-                os_name = re.search(r'(?:^|,)O=([^,]+)', p.text)
+                os_name = OS_NAME_RE.search(p.text)
                 if os_name:
                     self.os_name = os_name[1]
                 for ident, name in re.findall(r'I#(\d+)=([^,]+)', p.text):
@@ -493,12 +490,16 @@ class Decoder:
                 self.calls.setdefault((event, self.current.context), []).append(ts)
         if not self.rows:
             raise DecodeError('no complete events after synchronization')
-        for diagnostic in self.diagnostics:
-            if diagnostic.get('timingLost') and not any(x['offset'] == diagnostic['offset'] for x in self.timing_losses):
-                self.lose_time(diagnostic['offset'], diagnostic['reason'])
         self.finish_partial(self.clock)
         if self.timed_events is None:
             self.timed_events = len(self.rows)
+        if format_rows:
+            self.format_rows()
+        return self
+
+    def format_rows(self):
+        context_ids = {key: f'0x{key:016X}' for key in self.contexts}
+        boundaries = {loss['row'] for loss in self.timing_losses}
         # Init has no epoch; cycles wrap, and pfGetTime is sampled separately from the packet timestamp.
         for i, row in enumerate(self.rows):
             if i >= self.timed_events:
@@ -511,20 +512,25 @@ class Decoder:
             if self.freq and row['timestampint'] != '':
                 row['timestamp'] = f'{row["timestampint"] / self.freq:.9f}'
             if row['eventint'] == 8:
-                p, _ = packet_at(data, row['eventoffset'])
-                row['detail'] = f'{self.context(TASK | p.args[0]).name} (0x{p.args[0]:08X})'
+                ident = row.pop('task_id')
+                row['detail'] = f'{self.context(TASK | ident).name} (0x{ident:08X})'
+            if i in boundaries:
+                row['detail'] = (row['detail'] + ' ' + TIMING_LOST).lstrip()
             for key in ('contextinint', 'contextint', 'contextoutint'):
-                row[key] = f'0x{row[key]:016X}'
-        return self
+                row[key] = context_ids[row[key]]
 
     def finish_partial(self, ts):
         if self.time_lost:
             return
-        for frame in [*self.parents, self.current]:
+        outstanding = 0
+        # UM08027 3.6 and 6.1.2.1-2: a suspended ancestor cannot execute during an unfinished ISR.
+        for frame in reversed([*self.parents, self.current]):
+            interruption = frame.interrupted + outstanding
             if frame.context not in (0, LOST):
                 ctx = self.context(frame.context)
                 ctx.total += ts - frame.start
-                ctx.interrupted += frame.interrupted
+                ctx.interrupted += interruption
+            outstanding = max(0, ts - frame.start) if frame.context >> 32 == 1 else interruption
 
     def extension(self, row, args, text):
         kind = args[0]
@@ -536,7 +542,7 @@ class Decoder:
             if not self.have_init:
                 return
             self.heaps[heap] = {'size': size << self.shift, 'metadata': metadata,
-                                'blocks': {}, 'allocations': 0, 'frees': 0}
+                                'blocks': {}, 'used': 0, 'allocations': 0, 'frees': 0}
             row['event'] = 'Define Heap'
         elif kind in (3, 4, 5):
             heap, address = args[1:3]
@@ -548,15 +554,16 @@ class Decoder:
                 if address not in h['blocks']:
                     self.invalidate_heaps()
                     return
-                del h['blocks'][address]
+                h['used'] -= h['blocks'].pop(address)
                 h['frees'] += 1
             else:
                 if address in h['blocks']:
                     self.invalidate_heaps()
                     return
                 h['blocks'][address] = (args[3] << self.shift) + h['metadata']
+                h['used'] += h['blocks'][address]
                 h['allocations'] += 1
-            used = sum(h['blocks'].values())
+            used = h['used']
             if used > h['size'] or not h['size']:
                 self.invalidate_heaps()
                 return
@@ -573,7 +580,7 @@ class Decoder:
             def seconds(ticks, unit='s'):
                 if not timed:
                     return ''
-                ns = (2 * ticks * 1_000_000_000 + self.freq) // (2 * self.freq)
+                ns = rounded_ns(ticks, self.freq)
                 scale, precision = (1_000_000_000, 9) if unit == 's' else (1_000_000, 6)
                 return f'{ns // scale}.{ns % scale:0{precision}d} {unit}'
             rows.append({'Name': c.name, 'Type': c.kind, 'Core': 'Core 0', 'Stack Information': c.stack,
@@ -594,7 +601,7 @@ def write_csv(path, columns, rows):
 
 
 def decode_file(raw, out, no_events=False):
-    result = Decoder().decode(Path(raw).read_bytes())
+    result = Decoder().decode(Path(raw).read_bytes(), format_rows=not no_events)
     out = Path(out)
     write_csv(out / 'contexts.csv', CONTEXT_COLUMNS, result.context_rows())
     if not no_events:

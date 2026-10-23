@@ -21,6 +21,8 @@ import re
 import sys
 from pathlib import Path
 
+from sysview_decode import MALFORMED, TIMING_LOST
+
 # SystemView's text forms in its event export (SystemView 4.10b, Linux)
 TIME_RE = re.compile(r'([\d. ]+)\s*(s|ms|us)$')
 RUNS_RE = re.compile(r'Runs for (\S+) (us|ms)')
@@ -114,7 +116,7 @@ SCHEDULER = 'Scheduler'
 def read_csv(path, columns, what):
     """The rows of a SystemView export with every column it needs; Usage for anything else."""
     try:
-        with open(path, newline='', errors='replace') as f:
+        with open(path, encoding='utf-8', newline='', errors='replace') as f:
             reader = csv.DictReader(f)
             fields = set(reader.fieldnames or ())
             rows = list(reader)
@@ -207,7 +209,7 @@ class Scan:
             event, detail, ctx, ts = row['event'], row['detail'], row['context'], row['ts']
             # a switch whose return context was lost renders as "Returns to *** OVERFLOW ***" with no Overflow row of
             # its own: most of the loss in a heavily overflowing capture
-            lost = event == '*** Overflow ***' or '*** OVERFLOW ***' in detail or row.get('timing_loss', False)
+            lost = event == '*** Overflow ***' or '*** OVERFLOW ***' in detail or TIMING_LOST in detail
             if lost:
                 self.overflow += 1
                 if ts is not None and (not self.losses or self.losses[-1][1] is not None):
@@ -240,19 +242,20 @@ class Scan:
                 last = ts
             mark = MARK_RE.match(event)
             func = FUNC_RE.match(event)
-            if row.get('malformed_payload'):
+            malformed = detail.startswith(MALFORMED)
+            if malformed:
                 self.dropped_pairs += sum(map(len, open_calls.values()))
                 open_calls.clear()
                 self.mark_open = False
-            if lost or row.get('malformed_payload'):
+            if lost or malformed:
                 pass
             elif event == 'ISR Enter':
                 m = RUNS_RE.search(detail)
-                if m:
+                if m and ts is not None:
                     self.isr.setdefault(ctx, []).append(matched_seconds(m))
             elif event == 'Task Ready':
                 m = READY_RE.search(detail)
-                if m:
+                if m and ts is not None:
                     self.ready.setdefault(detail.split(',')[0], []).append(matched_seconds(m))
             elif event == 'Stack Info':
                 m = STACK_RE.match(detail)
@@ -272,10 +275,10 @@ class Scan:
                 else:
                     call_ts = open_calls[key].pop()
                     m = RETURNS_RE.search(detail)
-                    if m:
-                        self.funcs.setdefault(fid, []).append(matched_seconds(m))
-                    elif call_ts is None or ts is None:
+                    if call_ts is None or ts is None:
                         self.dropped_pairs += 1
+                    elif m:
+                        self.funcs.setdefault(fid, []).append(matched_seconds(m))
                     else:
                         self.funcs.setdefault(fid, []).append((call_ts, ts))
                 if workload_event == fid and ts is not None:
@@ -284,7 +287,7 @@ class Scan:
                 mid = int(mark.group(2), 16)
                 if mark.group(1) == 'Stop':
                     m = RAN_RE.search(detail)
-                    if m:
+                    if m and ts is not None:
                         self.markers.setdefault(mid, []).append(matched_seconds(m))
                 if mid == workload_marker and ts is not None:
                     if mark.group(1) == 'Start':
@@ -374,32 +377,20 @@ def report(args):
         rows = read_csv(ev_path, EVENT_COLUMNS, 'events')
         for r in rows:
             r['ts'] = timestamp(r)
-        try:
-            metadata = json.loads((out / 'decode.json').read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            metadata = {}
-        if not isinstance(metadata, dict) or metadata.get('decoder') != 'native':
-            metadata = {}
-        timed = metadata.get('timedEvents', len(rows))
-        losses = metadata.get('timingLosses', [])
-        if (not isinstance(timed, int) or not 0 <= timed <= len(rows)
-                or any(r['ts'] is None for r in rows[:timed])
-                or any(r['ts'] is not None for r in rows[timed:])):
-            timed, losses = len(rows), []
-        if losses:
-            warnings.append(f'native timing lost at byte {losses[0]["offset"]}: time-derived metrics cover '
+        timed = next((i for i, r in enumerate(rows) if r['ts'] is None), len(rows))
+        losses = [r for r in rows if TIMING_LOST in r['detail']]
+        # Native exports scope contexts.csv to this marked prefix; unreadable GUI rows establish no such scope.
+        native_prefix = (timed < len(rows) and TIMING_LOST in rows[timed]['detail']
+                         and all(not r['timestampint'].strip() for r in rows[timed:]))
+        if native_prefix:
+            warnings.append(f'native timing lost at event {timed}: time-derived metrics cover '
                             f'the first {timed} events; {len(losses)} timing loss boundary(s)')
-        loss_rows = {loss['row'] for loss in losses}
-        malformed = {str(d['offset']) for d in metadata.get('diagnostics', [])
-                     if d['reason'].startswith('malformed payload:')}
+        malformed = sum(r['detail'].startswith(MALFORMED) for r in rows)
         if malformed:
-            warnings.append(f'{len(malformed)} malformed payload(s): dependent call, marker and heap spans withheld '
-                            '(decode.json diagnostics)')
-        for i, r in enumerate(rows):
-            r['timing_loss'] = i in loss_rows
-            r['malformed_payload'] = r.get('eventoffset') in malformed
-        trailing_losses = sum(loss['row'] == len(rows) for loss in losses)
-        freq = time_base(rows[:timed], warnings)
+            warnings.append(f'{malformed} malformed payload(s): dependent call, marker and heap spans withheld')
+        for r in rows[timed:]:
+            r['ts'] = None
+        freq = time_base(rows[:timed] if native_prefix else rows, warnings)
         head = timed_from(rows[:timed]) if freq else 0
         if head and not args.post_mortem:
             warnings.append(f'the first {head} events share the first timestamp with more than one context switch: '
@@ -420,7 +411,7 @@ def report(args):
             net, allocs, frees = map(int, scan.heap.groups())
             heap = {'allocs': allocs, 'frees': frees, 'net_bytes': net}
         result.update(stack=[{'name': k, 'bytes_used': v} for k, v in scan.stack.items()], heap=heap,
-                      overflow=scan.overflow + trailing_losses,
+                      overflow=scan.overflow,
                       dropped_pairs=scan.dropped_pairs)
     if freq is None or head:
         for c in result['contexts']:

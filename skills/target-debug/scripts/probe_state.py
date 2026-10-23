@@ -452,6 +452,7 @@ def tool(env, posix, nt_name=None):
     return exe
 
 
+STOP_SIGNALS = tuple(s for s in (getattr(signal, n, None) for n in ('SIGTERM', 'SIGHUP')) if s is not None)
 _running = []    # [the tool once its wait begins, a signal stop_running() took before that] of each run()
 KILL_WAIT = 10    # s a killed tool has to exit, taskkill included; one in D state on a wedged USB host outlives SIGKILL
 # s of KILL_WAIT a POSIX tool gets to exit on SIGTERM before SIGKILL: an openocd SIGKILLed on a J-Link never
@@ -508,8 +509,7 @@ def stop_signals_cancel():
     def on_signal(signum, _frame):
         got.append(signum)
         stop_running(signum)
-    sigs = [s for s in (getattr(signal, n, None) for n in ('SIGTERM', 'SIGHUP')) if s is not None]
-    previous = {sig: signal.signal(sig, on_signal) for sig in sigs}
+    previous = {sig: signal.signal(sig, on_signal) for sig in STOP_SIGNALS}
     try:
         yield
     finally:

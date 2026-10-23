@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts'
+sys.path.insert(0, str(SCRIPTS))
 DATA = Path(__file__).resolve().parent / 'data' / 'sysview'
 spec = importlib.util.spec_from_file_location('sysview_report', SCRIPTS / 'sysview_report.py')
 report = importlib.util.module_from_spec(spec)
@@ -161,6 +162,32 @@ class Percentiles(unittest.TestCase):
 
 
 class Unavailable(Case):
+    def test_unmarked_unreadable_timestamp_withholds_all_timing_despite_annotations(self):
+        for stamp in ('', 'unreadable'):
+            with self.subTest(stamp=stamp):
+                rows = [ev(100, 'Function #512'), ev(stamp, 'NOP'),
+                        ev(300, 'Function #512', 'Returns after 200.000 us'),
+                        ev(350, 'ISR Enter', 'Runs for 50.000 us'),
+                        ev(400, 'Task Ready', 'worker, runs after 25.000 us'),
+                        ev(450, 'Stop Marker 0x00000001', 'Ran for 75.000 us')]
+                result = self.run_report(rows=rows)
+                for key in ('functions', 'isr', 'ready_run', 'markers', 'live_window_s', 'contexts_workload'):
+                    self.assertIsNone(result[key], key)
+                self.assertTrue(all(result['contexts'][0][key] is None for key in report.CONTEXT_TIMES))
+                self.assertEqual(result['contexts'][0]['activations'], 10)
+                self.assertTrue(any('unreadable timestamps' in warning for warning in result['warnings']))
+
+    def test_partial_or_misplaced_native_loss_marker_does_not_establish_context_scope(self):
+        for rows in ([ev(100, 'Function #512'), ev('', 'Start'),
+                      ev('', 'Init', INIT + ' ' + report.TIMING_LOST)],
+                     [ev(100, 'Function #512'), ev('', 'Start', report.TIMING_LOST),
+                      ev(300, 'Function #512', 'Returns after 200.000 us')],
+                     [ev(100, 'Function #512'), ev('unreadable', 'Start', report.TIMING_LOST)]):
+            with self.subTest(rows=rows):
+                result = self.run_report(rows=rows)
+                self.assertIsNone(result['live_window_s'])
+                self.assertTrue(all(result['contexts'][0][key] is None for key in report.CONTEXT_TIMES))
+
     def test_no_events_nulls_every_event_metric(self):
         r = self.run_report(events=False)
         for key in ('isr', 'ready_run', 'functions', 'markers', 'stack', 'heap', 'overflow', 'dropped_pairs',

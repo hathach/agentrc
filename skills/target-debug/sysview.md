@@ -194,7 +194,7 @@ sysview_record.py --out DIR --from-raw FILE [--no-events] [--gui [--export-termi
   `--duration-ms` expires is the normal end, not a failure; it exiting non-zero before then fails the run (exit 3).
   `record.json` holds its exit status and how it ended (`exited` or `deadline`).
 - `--from-raw` decodes bytes another route captured (`rtt.py --channel N`, `sysview_dump.py`), with no probe. Native
-  decoding runs before Linux, tool, signal and namespace setup. `--gui` selects the existing SEGGER export. Native
+  decoding bypasses Linux, tool and namespace setup. `--gui` selects the existing SEGGER export. Native
   `--export-terminal` is refused with a message directing the caller to `--gui`.
 - `record.json` `dialogsAnswered` counts each dialog answered, by title fragment, and `systemviewErrors` the
   SystemView error dialogs among them; `sysview_report.py` warns when it is nonzero.
@@ -206,7 +206,6 @@ sysview_record.py --out DIR --from-raw FILE [--no-events] [--gui [--export-termi
 
 ```text
 sysview_decode.py FILE --out DIR [--no-events]
-sysview_corpus.py --root CORPUS --manifest MANIFEST --out DIFF_DIR [--baseline-decoder FILE.py]
 ```
 
 - The decoder accepts the pinned single-core SystemView RTT streams, chronological post-mortem rings, and the text
@@ -215,7 +214,8 @@ sysview_corpus.py --root CORPUS --manifest MANIFEST --out DIFF_DIR [--baseline-d
   `--gui`. Unknown length-delimited events retain their packet bytes. With an OS description, IDs 32–511 are OS
   events; otherwise they are unnamed functions. IDs from 512 are user functions.
 - A wrapped head is discarded up to the ten-zero synchronization record. Truncated trailing packets are reported
-  in `decode.json` and excluded. An unreadable delta, resynchronization, or frequency change ends the timed segment:
+  in `decode.json` and excluded without counting a timing loss. Resynchronization or a frequency change ends the
+  timed segment:
   earlier timestamps and metrics remain valid, later timestamps are blank. Init supplies no epoch, cycle samples
   wrap, and OS time samples are taken separately from the packet clock, so none re-anchor its exact timeline.
   Missing Init withholds report timing. Complete deltas accumulate without a host-side counter wrap.
@@ -226,25 +226,13 @@ sysview_corpus.py --root CORPUS --manifest MANIFEST --out DIFF_DIR [--baseline-d
 - Overflow invalidates open call, marker, ready and interrupt spans and heap state. The native decoder does not
   splice those spans across loss. Aggregate context runtime includes observed partial execution at EOF; duration
   samples include complete spans only.
-- Large GUI exports can give an overflow return context at 1,000-row export boundaries
-  without a corresponding loss packet. Lossy GUI annotations can span missing events; native annotations withhold
-  those durations. Native task blocked time is blank: the FreeRTOS OS description supplies state labels but no
-  `PreemptingTaskStates`, and its GUI total-blocked aggregation remains unresolved. `decode.json` records the source
-  and reason. Use `--gui` when those GUI aggregate statistics are required.
-- `decode.json` records the source, decoded event count, timestamp frequency, whether timing was lost, and byte
-  offsets/reasons for damaged input. `timedEvents` bounds the timed prefix and `timingLosses` identifies its loss
-  boundaries. The report retains prefix metrics, counts timing loss in `overflow`, and warns about damaged payloads.
-  A successful decode can have diagnostics; inspect them before using the report. Exit 0 means a usable prefix was
-  decoded, not that the capture is complete. Exit 2 means invalid input or output directory. The recorder wrapper
-  records decode failures, KeyboardInterrupt, and SIGTERM (also SIGHUP where available) in `record.json` with exit 3.
-- `sysview_corpus.py` verifies SHA-256 hashes and every GUI row's packet bytes before comparing normalized rows and
-  report JSON. Each difference retains its reason and packet/interval evidence. Exit 0 requires zero unexplained
-  differences and passing robustness checks; exit 1 means a failed comparison, and exit 2 means the corpus could
-  not be verified. Manifest mode `robustness` is allowed only for the explicitly hash-listed MAX32666 corrupt capture:
-  GUI diffs remain informational, while packet offsets, diagnostics, framing and timing checks must pass.
-  `--baseline-decoder` counts previously differing fields now fixed. Provenance, retrieval instructions,
-  normalization rules and known gaps are in `tests/fixtures/sysview/README.md` at the repo root;
-  `tests/fixtures/sysview/corpus.json` is the full corpus manifest.
+- Native task blocked time is blank; use `--gui` when the GUI aggregate statistics are required.
+- `decode.json` records the source, decoded event count, timestamp frequency and byte offsets/reasons for damaged
+  input. The event rows retain valid-prefix timestamps and mark loss boundaries; the report needs no `decode.json`
+  to retain prefix metrics, count timing loss in `overflow`, or warn about malformed payloads. A successful decode
+  can have diagnostics; inspect them before using the report. Exit 0 means a usable prefix was decoded, not that the
+  capture is complete; exit 2 means invalid input or output directory.
+- Corpus runner and manifest: `bench/sysview/`; provenance and reproduction: `tests/fixtures/sysview/README.md`.
 
 ### `sysview_report.py` — numbers from an export directory
 
@@ -280,6 +268,9 @@ warnings:   [str]
   (`--no-events`); every time-derived one (the contexts' load and times, the duration tables, the window figures)
   without a usable time base: no Init record (no timestamp frequency) or non-monotonic timestamps. `[]` means measured
   and none seen.
+  An explicit native timing-loss boundary followed entirely by blank timestamps retains the established prefix's
+  event and context timing; duration annotations in the untimed suffix are ignored. Unmarked unreadable timestamps
+  withhold all time-derived metrics, including the full-capture context timings.
 - `--post-mortem` declares a decoded post-mortem ring. More than one task switch or ISR entry at the first timestamp
   then marks an untimed head: the events up to the first later timestamp are left out of every events-derived field,
   the contexts' times are `null`, who ran before the first task switch after them is unknown (busy shares overlapping

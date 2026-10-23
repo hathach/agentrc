@@ -1,8 +1,9 @@
 # SystemView decoder references
 
 These are real capture slices, not generated packet streams. `fixture.json` gives the original corpus path, byte
-interval, uncompressed SHA-256, GUI row count and retained row indices. `capture.SVDat.gz` is lossless gzip with a
-fixed mtime. The small cases retain every GUI row. Overflow retains initialization and the loss/recovery tail;
+interval, uncompressed SHA-256 and GUI row count; retained row indices are the event CSV `sequencenum` values.
+`capture.SVDat.gz` is lossless gzip with a fixed mtime. The small cases retain every GUI row. Overflow retains
+initialization and the loss/recovery tail;
 timer-wrap retains initialization and the boundary tail, with the complete raw prefix needed to reconstruct time.
 Checked-in event CSVs use LF endings and omit the GUI's trailing space after the last hex byte.
 Where present, `contexts.csv` and `report.json` cover the complete slice, not just the selected event rows. Report
@@ -45,7 +46,8 @@ The durable working copy is outside the repository:
 /home/hathach/.cache/agentrc-sysview-followups-2026-10-23/corpus-manifest.json
 ```
 
-`corpus.json` is the checked-in copy of that manifest. It includes SHA-256 and sizes for the original captures,
+`bench/sysview/corpus.json` is the checked-in copy of that manifest. It includes SHA-256 and sizes for the original
+captures,
 GUI exports, campaign reports and dump metadata. Capture provenance is the ci.lan campaign on 2026-10-22/23 and
 TinyUSB's `SYSVIEW=4` cdc_msc recordings. The original `record.json` and `dump.json` files retain the commands and
 capture metadata. The H743 export, initially absent, was generated on ci.lan with SystemView 4.10b on 2026-10-23.
@@ -59,9 +61,9 @@ Retrieve from that maintained cache (or copy it from the dev host using the same
 relative paths; do not substitute a later recording with the same board name. To reproduce:
 
 ```bash
-python skills/target-debug/scripts/sysview_corpus.py \
+python bench/sysview/sysview_corpus.py \
   --root /home/hathach/.cache/agentrc-sysview-followups-2026-10-23/corpus \
-  --manifest tests/fixtures/sysview/corpus.json --out /tmp/sysview-corpus-diffs
+  --manifest bench/sysview/corpus.json --out /tmp/sysview-corpus-diffs
 ```
 
 `--out` must be new or empty. The runner verifies the manifest and every GUI event's `eventoffset`, `eventsize` and
@@ -69,8 +71,6 @@ python skills/target-debug/scripts/sysview_corpus.py \
 summary per capture, and exits 1 on any unexplained difference or failed robustness check. A mismatched pair or
 unavailable/changed file is an error (2), never a pass. Captures without a GUI export are listed explicitly and cannot
 contribute differential coverage. Repeat exports of the F407 post-mortem capture are checked separately.
-An optional `--baseline-decoder FILE.py` runs a previous decoder and reports `fixedCount` and `fixedDifferences`:
-previously differing field paths that now compare equal. This does not count newly decoded rows as fixed fields.
 
 Normalization excludes display timestamps and sequence numbers, whose integer timestamp and packet offset are
 already checked. It retains context identities, packet bytes and the built-in event details the report consumes.
@@ -87,9 +87,8 @@ or independently accounting for the intervals.
   artifact. Separately, exported packet-byte fields capped at exactly 512 bytes must equal the raw frame prefix.
   Opposite display rounding is accepted only at an exact half-nanosecond midpoint derived from packet deltas.
 - `loss-withheld`: an execution annotation ends at overflow/capture end, or a ready interval crosses an overflow,
-  with the exact endpoint ticks matching the GUI annotation. Unreadable deltas and frequency changes are verified
-  from raw framing; the runner recomputes reports with those clock-loss boundaries. Bounded malformed payloads
-  with readable deltas preserve timing. For CPU load, it sums completed ISR intervals in
+  with the exact endpoint ticks matching the GUI annotation. Bounded malformed payloads with readable deltas
+  preserve timing. For CPU load, it sums completed ISR intervals in
   enclosing task runs later discarded at overflow, verifies the GUI runtime/interruption totals, removes exactly
   those intervals, and requires the resulting CPU percentage to equal native output.
 - `gui-inconsistent`: an already active task's GUI ready latency contradicts the time to its next Task Run, or its
@@ -98,12 +97,16 @@ or independently accounting for the intervals.
   for being odd; ambiguous duplicate context names disable aggregate proofs.
 - `gui-warning`: removing GUI error-dialog warnings, after any proven loss accounting, gives exactly the native
   warnings. Other row or report differences do not prevent this classification.
-- `withheld-undefined`: native blocked time is null and `decode.json` has the verified source/OS evidence for
-  withholding it. The runner checks the OS named in the raw stream and includes observed Task Stop Ready reasons.
-- `informational`: GUI diffs for an explicitly hash-listed `mode: "robustness"` capture. This mode checks every
-  packet offset and complete packet bytes, every malformed-payload and framing diagnostic, withheld arguments,
+- `withheld-undefined`: native blocked time is null and `decode.json` gives the one-line reason for withholding it.
+  The runner checks the OS named in the raw stream and includes observed Task Stop Ready reasons; the source and
+  unresolved aggregation evidence are recorded below.
+- `informational`: GUI diffs for a manifest-designated `mode: "robustness"` capture with a verified SHA-256. This
+  mode checks every packet offset and complete packet bytes, every malformed-payload and framing diagnostic,
+  withheld arguments,
   absence of resynchronization, reconstructed timestamps, clock-loss boundaries, loss reporting, and report timing
-  against the valid prefix. Missing diagnostics or packets fail even when GUI differences are informational.
+  against the valid prefix. Timestamp deltas and frame ends are read directly from raw bytes, independently of the
+  decoder packet/stream implementation. A single separate pass sums GUI intervals for aggregate proofs. Missing
+  diagnostics or packets fail even when GUI differences are informational.
 - `unexplained`: every other difference, including a report difference whose proposed accounting does not close.
 
 ## Boundaries and remaining limits
@@ -131,10 +134,15 @@ MAX32666 retains all 16626 packet offsets and diagnoses 60 malformed bounded pay
 truncated tail. Every complete packet's delta parses, so all complete rows retain timing; only dependent spans are
 withheld. A report warning names the malformed-payload count. A high unsigned delta is not treated as a negative
 delta without evidence: the wire format permits that value. Context identities after corrupt transitions remain
-different from the GUI's, and are informational only for this hash-listed capture.
+different from the GUI's, and are informational for this manifest-designated robustness capture.
 
-The small truncated fixture ends inside a timestamp delta. Its valid-prefix timestamps/metrics are unchanged, with
-one additional timing loss and warning. The full cut2 capture ends inside a payload; no complete row loses timing.
+The trimmed FreeRTOS fixture ends inside an ISR. GUI Idle CPU load is 85.26%; subtracting the unfinished ISR
+from Idle execution gives 85.11%. The runner proves this from the event intervals; partial spans contribute runtime
+and interruption totals but never completed duration samples. Timer callbacks also propagate their accumulated ISR
+interruption to the enclosing context, without treating the timer callback itself as an interrupt.
+
+The small truncated fixture ends inside a timestamp delta; the full cut2 capture ends inside a payload. Both are
+plain end-of-capture diagnostics: neither changes complete-row timing or adds an overflow count.
 Wrapped captures keep timing from their first synchronization point. No current packet re-anchors a lost exact
 recording clock: Init has frequencies only, cycles wrap, and `RecordSystime` samples OS/cycle time before the packet
 timestamp. The decoder preserves the measured prefix rather than guessing the sampling offset or missing wraps.
@@ -148,7 +156,8 @@ coverage remains missing; native macOS/Windows execution remains unrun.
 Packet implementation: TinyUSB's pinned `lib/SystemView`, commit `92ca7a810c5765ba64911919acd511c61b6b083f`,
 `SYSVIEW/SEGGER_SYSVIEW.c`, `.h`, `_Int.h`, and `_ConfDefaults.h`. The header exposes compatibility version 3.32;
 its comment explicitly says that this is not the target-source release number. Encoding evidence is
-`ENCODE_U32`, `_EncodeStr`, `_SendPacket`, `_SendPacket_Ex`, `_TrySendOverflowPacket`, `_SendSyncInfo`,
+`ENCODE_U32`, `_EncodeFloat` (the float U32 bit pattern is varint-encoded), `_EncodeStr`, `_SendPacket`,
+`_SendPacket_Ex`, `_TrySendOverflowPacket`, `_SendSyncInfo`,
 `SEGGER_SYSVIEW_RecordSystime`, the task/ISR/timer recorders, and heap extension recorders. The decoder does not
 change target code, register access, synchronization, timestamps or capture transport.
 
@@ -179,6 +188,11 @@ Calibre book **2464**, *SEGGER SystemView User Guide*, UM08027, software 4.10, r
   Section 6.1.3.1, p. 143, lookup `9567d72ea7b2`; `RecordSystime` sends a U32/U64 sample, section 7.6.13, p. 218,
   lookup `1e24d8651fd2`. The pinned source samples that value separately from `_SendPacket_Ex`'s timestamp.
   **Not established:** an exact packet-clock offset after loss; native decoding does not re-anchor from these samples.
+- **Verified:** Active time excludes interrupt suspension even when an ISR is unfinished at Stop/EOF, including
+  nested ISRs and ISRs inside timer callbacks. Section 3.6, p. 38, lookup `709cdef9d076`, defines runtime,
+  interruption and CPU load; sections 6.1.2.1–6.1.2.2, pp. 141–142, lookup `1cc119338d14`, define ISR entry/return.
+  Native accounting propagates outstanding ISR time to suspended ancestors and the timer's accumulated interrupt
+  time to its parent, preserving these definitions without manufacturing completed duration samples.
 - **Verified:** ISR-to-scheduler records request a scheduling transition when an interrupt causes a task switch.
   Section 6.1.2, pp. 141–142, lookup `c887eeace880`. Native decoding retains that request until the outer ISR exits;
   the MAX32666 GUI rows and synthetic nested-interrupt tests check that behavior.

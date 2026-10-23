@@ -806,13 +806,14 @@ class ProbeStateUnitTest(unittest.TestCase):
             except probe_state.ToolError as e:
                 errors.append(e)
 
-        with mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)):
+        with mock.patch.object(probe_state, 'TERM_GRACE', 0.01), \
+                mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)):
             caller = threading.Thread(target=call, daemon=True)
             caller.start()
             caller.join(20)
         self.assertFalse(caller.is_alive(), 'run() never returned')
         self.assertEqual(len(waits), 1)
-        grace = 0 if os.name == 'nt' else probe_state.TERM_GRACE    # Windows has no SIGTERM step
+        grace = 0 if os.name == 'nt' else 0.01    # Windows has no SIGTERM step
         self.assertTrue(probe_state.KILL_WAIT - grace - 1 < waits[0] <= probe_state.KILL_WAIT - grace, waits)
         self.assertIsInstance(errors[0], probe_state.Unreaped)
         self.assertEqual(str(errors[0]), f'{os.path.basename(sys.executable)} pid {procs[0].pid} still ran 10 s after '
@@ -946,7 +947,8 @@ class ProbeStateUnitTest(unittest.TestCase):
     def test_a_tool_that_outlives_its_kill_after_a_signal_costs_one_bounded_wait(self):
         procs, waits, errors = [], [], []
         self.stop_on(signal.SIGTERM, 0.5)
-        with mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)):
+        with mock.patch.object(probe_state, 'TERM_GRACE', 0.01), \
+                mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)):
             try:
                 probe_state.run(self.GUARDED_TOOL, 20)
             except probe_state.ToolError as e:

@@ -10,11 +10,8 @@ Exit: 0 no unexplained differences; 1 unexplained differences; 2 missing/changed
 import argparse
 import bisect
 import contextlib
-import copy
-import csv
 import hashlib
 import io
-import importlib.util
 import json
 import re
 import sys
@@ -22,23 +19,26 @@ import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
+SCRIPTS = Path(__file__).resolve().parents[2] / 'skills' / 'target-debug' / 'scripts'
+sys.path.insert(0, str(SCRIPTS))
 import sysview_decode as decoder
 import sysview_report as report
+from sysview_dump import prepare_out
 
 
 # OS-specific rendering is supplied by the GUI's OS description files; the report ignores it.
 REPORT_EVENTS = {1, 2, 3, 4, 6, 7, 15, 16, 17, 18, 21, 24, 28, 31}
 CLASSES = ('gui-export-artifact', 'loss-withheld', 'gui-warning', 'gui-inconsistent',
            'withheld-undefined', 'informational', 'unexplained')
-ROBUSTNESS_CAPTURES = {'8f8948a12c67f10946d54bda0cde8ce5da5d1e5aa23b50dcb1c1772cc558ee1c': 'max32666-corrupt'}
 GUI_WARNING = re.compile(r'SystemView showed \d+ error dialog\(s\) while recording or loading \(record.json, '
                          r'systemviewErrors\): the export may be incomplete')
 LOST = f'0x{decoder.LOST:016X}'
 
 
 def read_rows(path):
-    with Path(path).open(encoding='utf-8', errors='replace', newline='') as f:
-        return list(csv.DictReader(f))
+    contexts = Path(path).name == 'contexts.csv'
+    columns = set(decoder.CONTEXT_COLUMNS if contexts else decoder.EVENT_COLUMNS)
+    return report.read_csv(path, columns, 'contexts' if contexts else 'events')
 
 
 def normalized_rows(rows):
@@ -110,23 +110,18 @@ def annotation_matches(detail, ticks, freq):
     m = re.search(r'(?:Runs for|Idle for|runs after) (\d+\.\d{3}) (us|ms|s)$', detail)
     if not m or not freq or ticks < 0:
         return False
-    scale = {'us': 1_000_000_000, 'ms': 1_000_000, 's': 1000}[m[2]]
-    value = ((2 * ticks * scale + freq) // (2 * freq) if m[2] == 'us' else ticks * scale // freq)
-    return m[1] == f'{value // 1000}.{value % 1000:03d}'
+    return m[1] + ' ' + m[2] == decoder.format_duration(ticks, freq, m[2])
 
 
-def row_proofs(data, gui, native):
+def row_proofs(packets, gui, native, gui_normal, native_normal):
     """Only edit the comparison copy after a packet/interval proof and an exact native-value check."""
-    cleaned = copy.deepcopy(gui)
+    cleaned = [dict(row) for row in gui]
     proofs = {}
     if len(gui) != len(native) or any(int(g['eventoffset']) != int(n['eventoffset']) for g, n in zip(gui, native)):
         return cleaned, proofs
-    packets = [decoder.packet_at(data, int(r['eventoffset']))[0] for r in gui]
     stamps = [int(r['timestampint']) for r in gui]
     losses = [i for i, p in enumerate(packets) if p.event == 1]
     freq = next((p.args[0] for p in packets if p.event == 24 and not p.problem), 0)
-    formatter = decoder.Decoder()
-    formatter.freq = freq
     names = {r['contextint']: r['context'] for r in gui}
 
     def justify(i, field, value, category, reason, **evidence):
@@ -232,12 +227,11 @@ def row_proofs(data, gui, native):
             if source is None:
                 continue
             crossing = losses[bisect.bisect_right(losses, source):bisect.bisect_left(losses, end)]
-            value = name if i < crossing[-1] else name + ', runs after ' + formatter.duration(stamps[end] - stamps[i])
+            value = name if i < crossing[-1] else name + ', runs after ' + decoder.format_duration(stamps[end] - stamps[i], freq)
             justify(i, 'detail', value, 'loss-withheld',
                     'GUI ready latency starts before an overflow; later Ready rows repeat that same annotation.',
                     startRow=source, endRow=end, overflowRows=crossing, ticks=stamps[end] - stamps[source])
     calls = defaultdict(list)
-    gui_normal, native_normal = normalized_rows(gui), normalized_rows(native)
     for i, g in enumerate(gui):
         if packets[i].problem or packets[i].event == 1:
             calls.clear()
@@ -264,7 +258,7 @@ def row_proofs(data, gui, native):
     return cleaned, proofs
 
 
-def report_with_rows(gui, rows, metadata=None):
+def report_with_rows(gui, rows):
     with tempfile.TemporaryDirectory(prefix='sysview-accounting-') as tmp:
         path = Path(tmp)
         decoder.write_csv(path / 'events.txt', rows[0].keys(), rows)
@@ -272,211 +266,144 @@ def report_with_rows(gui, rows, metadata=None):
         record = Path(gui) / 'record.json'
         if record.is_file():
             (path / 'record.json').write_bytes(record.read_bytes())
-        if metadata:
-            (path / 'decode.json').write_text(json.dumps(metadata), encoding='utf-8')
         return json_report(path)
 
 
-def clock_losses(data):
-    diagnostics, losses = [], []
-    frequency = 0
-    packets = list(decoder.stream(data, diagnostics))
-    for i, packet in enumerate(packets):
-        if packet.gap:
-            gap = next(d for d in reversed(diagnostics) if d.get('timingLost') and d['offset'] < packet.offset)
-            losses.append({'row': i, 'offset': gap['offset'], 'reason': gap['reason']})
-        if packet.event == 24 and not packet.problem:
-            if frequency and frequency != packet.args[0]:
-                losses.append({'row': i, 'offset': packet.offset, 'reason': 'timestamp frequency changed'})
-            frequency = packet.args[0]
-    for diagnostic in diagnostics:
-        if diagnostic.get('timingLost') and not any(x['offset'] == diagnostic['offset'] for x in losses):
-            losses.append({'row': len(packets), 'offset': diagnostic['offset'], 'reason': diagnostic['reason']})
-    return packets, losses
-
-
-def context_accounting(data, rows):
-    """Independent interval sums from the GUI's context identities, for captures without loss packets."""
-    packets = [decoder.packet_at(data, int(r['eventoffset']))[0] for r in rows]
-    if any(p.event == 1 or p.problem for p in packets):
-        return {}
+def context_accounting(packets, rows, gui_dir=None):
+    """Independent GUI interval sums, including completed interrupts in task runs discarded by loss."""
+    if any(p.problem for p in packets):
+        return {}, {}
     freq = next((p.args[0] for p in packets if p.event == 24), 0)
     stamps = [int(r['timestampint']) for r in rows]
-    if not freq or not stamps or stamps[-1] <= stamps[0]:
-        return {}
+    if not freq or not stamps or stamps[-1] <= stamps[0] or any(a > b for a, b in zip(stamps, stamps[1:])):
+        return {}, {}
     names = {int(r['contextint'], 16): r['context'] for r in rows}
     labels = [name for key, name in names.items() if key]
     if len(labels) != len(set(labels)):
-        return {}
-    total, interrupted, activations = Counter(), Counter(), defaultdict(list)
-    intervals, runs, pending = defaultdict(list), defaultdict(list), set()
-    active = [{'key': 0, 'exclusive': 0}]
-    previous = stamps[0]
+        return {}, {}
+    total, interrupted, completed_irqs = Counter(), Counter(), Counter()
+    activations, intervals, runs, discarded = (defaultdict(list) for _ in range(4))
+    pending = set()
 
-    def close(frame):
-        if frame['exclusive'] > 0:
-            runs[frame['key']].append(frame['exclusive'])
+    def frame(key, row):
+        return {'key': key, 'row': row, 'ticks': 0, 'irq': 0, 'exclusive': 0, 'irqs': []}
 
+    def close(f, complete=True):
+        key = f['key']
+        total[key] += f['ticks']
+        interrupted[key] += f['irq']
+        if complete and f['exclusive'] > 0:
+            runs[key].append(f['exclusive'])
+
+    active = [frame(0, 0)]
     for i, (r, p) in enumerate(zip(rows, packets)):
-        ts = stamps[i]
-        if ts < previous:
-            return {}
-        delta = ts - previous
-        for depth, frame in enumerate(active):
-            key = frame['key']
-            total[key] += delta
-            if any(f['key'] >> 32 == 1 for f in active[depth + 1:]):
-                interrupted[key] += delta
+        delta = stamps[i] - stamps[i - 1] if i else 0
+        for depth, f in enumerate(active):
+            key = f['key']
+            f['ticks'] += delta
+            if any(child['key'] >> 32 == 1 for child in active[depth + 1:]):
+                f['irq'] += delta
             else:
-                frame['exclusive'] += delta
+                f['exclusive'] += delta
             if delta:
                 intervals[key].append({'startRow': i - 1, 'endRow': i, 'ticks': delta})
-        previous = ts
         key, out = int(r['contextint'], 16), int(r['contextoutint'], 16)
         before = active[-1]['key'] if active else 0
-        if p.event == 6:
+        if p.event == 1:
+            for f in active:
+                if f['key'] >> 32 == 8:
+                    discarded[f['key']].extend({**span, 'taskStartRow': f['row'], 'overflowRow': i}
+                                               for span in f['irqs'])
+            active, pending = [], set()
+        elif p.event == 6:
             task = decoder.TASK | p.args[0]
             root = active[0]['key'] if active else 0
             if task != root and task not in pending:
                 activations[task].append(i)
                 pending.add(task)
-        elif p.event == 7:
-            pending.discard(decoder.TASK | p.args[0])
-        if p.event in (2, 19):
+        elif p.event in (2, 19):
             activations[key].append(i)
-            active.append({'key': key, 'exclusive': 0})
+            active.append(frame(key, i))
         elif p.event in (3, 18, 20):
             if active and active[-1]['key'] >> 32 in (1, 2):
-                close(active.pop())
+                ended = active.pop()
+                close(ended)
+                if ended['key'] >> 32 == 1 and active and active[-1]['key'] >> 32 == 8:
+                    parent = active[-1]
+                    completed_irqs[parent['key']] += ended['ticks']
+                    parent['irqs'].append({'startRow': ended['row'], 'endRow': i, 'ticks': ended['ticks']})
             if p.event == 18 and out == decoder.SCHEDULER and (not active or active[-1]['key'] != out):
-                for frame in active:
-                    close(frame)
-                active = [{'key': out, 'exclusive': 0}]
+                for f in active:
+                    close(f)
+                active = [frame(out, i)]
                 activations[out].append(i)
-        elif p.event in (4, 17, 5, 7) and before != out:
-            for frame in active:
-                close(frame)
-            active = [{'key': out, 'exclusive': 0}]
-            if out not in pending:
-                activations[out].append(i)
-            pending.discard(out)
+        elif p.event in (4, 17, 5, 7):
+            if p.event == 7:
+                pending.discard(decoder.TASK | p.args[0])
+            if before != out:
+                for f in active:
+                    close(f)
+                active = [frame(out, i)]
+                if out not in pending:
+                    activations[out].append(i)
+                pending.discard(out)
         elif p.event == 11:
+            for f in active:
+                close(f, complete=False)
             active = []
-    result = {}
-    for key, name in names.items():
-        if key == 0:
-            continue
-        count = len(activations[key])
-        seconds = round(total[key] / freq, 9)
-        metrics = {'activations': count, 'total_ms': round(seconds * 1000, 3),
-                   'avg_us': round(seconds / count * 1e6, 1) if count else None,
-                   'cpu_pct': round((total[key] - interrupted[key]) / (stamps[-1] - stamps[0]) * 100, 2),
-                   'min_us': round(round(min(runs[key], default=0) / freq, 9) * 1e6, 1),
-                   'max_us': round(round(max(runs[key], default=0) / freq, 9) * 1e6, 1)}
-        result[name] = {'metrics': metrics, 'activationRows': activations[key], 'intervals': intervals[key],
-                        'runtimeTicks': total[key], 'interruptedTicks': interrupted[key],
-                        'frequency': freq, 'windowTicks': stamps[-1] - stamps[0]}
-    return result
-
-
-def lost_interruption_accounting(data, rows, gui_dir):
-    """Account for completed ISR intervals whose enclosing task execution is later lost."""
-    packets = [decoder.packet_at(data, int(r['eventoffset']))[0] for r in rows]
-    if any(p.problem for p in packets):
-        return {}
-    freq = next((p.args[0] for p in packets if p.event == 24), 0)
-    stamps = [int(r['timestampint']) for r in rows]
-    if any(a > b for a, b in zip(stamps, stamps[1:])):
-        return {}
+    for f in active:
+        close(f, complete=False)
     window = stamps[-1] - stamps[0]
-    if not freq or window <= 0:
-        return {}
-    runtime, interrupted, kept = Counter(), Counter(), Counter()
-    discarded = defaultdict(list)
-    stack, root, root_start, pending = [], 0, 0, []
-
-    def finish(end, lost=False):
-        if root >> 32 != 8:
-            return
-        if lost:
-            for entry in pending:
-                discarded[root].append({**entry, 'taskStartRow': root_start, 'overflowRow': end})
-        else:
-            runtime[root] += int(rows[end]['timestampint']) - int(rows[root_start]['timestampint'])
-            kept[root] += sum(entry['ticks'] for entry in pending)
-
-    for i, (r, p) in enumerate(zip(rows, packets)):
-        key, out = int(r['contextint'], 16), int(r['contextoutint'], 16)
-        if p.event == 1:
-            finish(i, lost=True)
-            stack, root, pending = [], 0, []
-        elif p.event in (4, 17):
-            if root != key:
-                finish(i)
-                root, root_start, pending = key, i, []
-        elif p.event == 2:
-            stack.append((i, int(r['contextinint'], 16)))
-        elif p.event in (3, 18):
-            if stack:
-                start, parent = stack.pop()
-                if parent >> 32 == 8:
-                    ticks = int(r['timestampint']) - int(rows[start]['timestampint'])
-                    if ticks < 0:
-                        return {}
-                    interrupted[parent] += ticks
-                    pending.append({'startRow': start, 'endRow': i, 'ticks': ticks})
-            if p.event == 18 and not stack:
-                finish(i)
-                root, pending = decoder.SCHEDULER, []
-        elif p.event in (5, 7, 11) and key != out:
-            finish(i)
-            root, pending = out, []
-    finish(len(rows) - 1)
-    names = {int(r['contextint'], 16): r['context'] for r in rows}
-    labels = [name for key, name in names.items() if key]
-    if len(labels) != len(set(labels)):
-        return {}
-    exported = {r['Name']: r for r in read_rows(Path(gui_dir) / 'contexts.csv')}
-    result = {}
+    contexts = {}
+    if not any(p.event == 1 for p in packets):
+        for key, name in names.items():
+            if key == 0:
+                continue
+            count = len(activations[key])
+            seconds = round(total[key] / freq, 9)
+            metrics = {'activations': count, 'total_ms': round(seconds * 1000, 3),
+                       'avg_us': round(seconds / count * 1e6, 1) if count else None,
+                       'cpu_pct': round((total[key] - interrupted[key]) / window * 100, 2),
+                       'min_us': round(round(min(runs[key], default=0) / freq, 9) * 1e6, 1),
+                       'max_us': round(round(max(runs[key], default=0) / freq, 9) * 1e6, 1)}
+            contexts[name] = {'metrics': metrics, 'activationRows': activations[key], 'intervals': intervals[key],
+                              'runtimeTicks': total[key], 'interruptedTicks': interrupted[key],
+                              'frequency': freq, 'windowTicks': window}
+    interruptions = {}
+    exported = {r['Name']: r for r in read_rows(Path(gui_dir) / 'contexts.csv')} if gui_dir else {}
     for key, spans in discarded.items():
         name = names[key]
         context = exported.get(name, {})
         gui_time = report.seconds(context.get('Total Run Time', ''))
         gui_interrupted = report.seconds(context.get('Time Interrupted', ''))
         if (gui_time is None or gui_interrupted is None
-                or round(runtime[key] / freq, 9) != round(gui_time, 9)
-                or round(interrupted[key] / freq, 9) != round(gui_interrupted, 9)
-                or interrupted[key] - kept[key] != sum(span['ticks'] for span in spans)):
+                or round(total[key] / freq, 9) != round(gui_time, 9)
+                or round(completed_irqs[key] / freq, 9) != round(gui_interrupted, 9)
+                or completed_irqs[key] - interrupted[key] != sum(span['ticks'] for span in spans)):
             continue
-        result[name] = {'runtimeTicks': runtime[key], 'guiInterruptedTicks': interrupted[key],
-                        'retainedInterruptedTicks': kept[key], 'removedSpans': spans,
-                        'frequency': freq, 'windowTicks': window,
-                        'guiCpu': round((runtime[key] - interrupted[key]) / window * 100, 2),
-                        'accountedCpu': round((runtime[key] - kept[key]) / window * 100, 2)}
-    return result
+        interruptions[name] = {'runtimeTicks': total[key], 'guiInterruptedTicks': completed_irqs[key],
+                               'retainedInterruptedTicks': interrupted[key], 'removedSpans': spans,
+                               'frequency': freq, 'windowTicks': window,
+                               'guiCpu': round((total[key] - completed_irqs[key]) / window * 100, 2),
+                               'accountedCpu': round((total[key] - interrupted[key]) / window * 100, 2)}
+    return contexts, interruptions
 
 
-def classify(data, gui, native, gui_report, native_report, gui_dir, diffs, report_diffs, metadata=None):
+def classify(packets, gui, native, gui_report, native_report, gui_dir, diffs, report_diffs,
+             gui_normal, native_normal, metadata=None):
     metadata = metadata or {}
-    cleaned, proofs = row_proofs(data, gui, native)
+    cleaned, proofs = row_proofs(packets, gui, native, gui_normal, native_normal)
     for diff in diffs:
         match = re.fullmatch(r'events\[(\d+)\]\.(\w+)', diff['path'])
         proof = proofs.get((int(match[1]), match[2])) if match else None
         diff.update(proof or {'classification': 'unexplained', 'reason': 'No packet/interval proof closes this difference.'})
-    packets, losses = clock_losses(data)
-    timed = losses[0]['row'] if losses else len(packets)
-    timing_verified = (bool(losses) and losses == metadata.get('timingLosses')
-                       and timed == metadata.get('timedEvents') and len(packets) == len(gui)
-                       and all(int(g['eventoffset']) == p.offset for g, p in zip(gui, packets))
-                       and all(n['timestampint'] == '' for n in native[timed:]))
-    accounted = report_with_rows(gui_dir, cleaned, metadata if timing_verified else None)
-    contexts = context_accounting(data, cleaned) if any(d['path'].startswith('report.contexts') for d in report_diffs) else {}
-    interruptions = (lost_interruption_accounting(data, cleaned, gui_dir)
-                     if any(d['path'].endswith('.cpu_pct') for d in report_diffs) else {})
+    accounted = report_with_rows(gui_dir, cleaned)
+    contexts, interruptions = (context_accounting(packets, cleaned, gui_dir)
+                              if any(d['path'].startswith('report.contexts') for d in report_diffs) else ({}, {}))
     remaining = {d['path'] for d in differences(accounted, native_report, 'report')}
     event_proofs = [proof for (i, field), proof in proofs.items() if field in ('detail', 'duration_us')]
     os_names = [m[1] for p in packets if p.event == 14
-                for m in [re.search(r'(?:^|,)O=([^,]+)', p.text)] if m]
+                for m in [decoder.OS_NAME_RE.search(p.text)] if m]
     blocked_evidence = decoder.blocked_time_evidence(os_names[-1] if os_names else '')
     for diff in report_diffs:
         proof = {'classification': 'unexplained', 'reason': 'Report accounting does not close this difference.'}
@@ -490,16 +417,12 @@ def classify(data, gui, native, gui_report, native_report, gui_dir, diffs, repor
                 category = 'loss-withheld' if any(p['classification'] == 'loss-withheld' for p in relevant) else relevant[0]['classification']
                 proof = {'classification': category, 'reason': 'Recomputing the GUI report after proven row corrections gives the exact native value.',
                          'accountedValue': diff['native'], 'rowProofs': [p['row'] for p in relevant]}
-        if diff['path'] not in remaining and timing_verified:
-            proof = {'classification': 'loss-withheld',
-                     'reason': 'Recomputing the GUI report with byte-verified clock-loss boundaries gives the exact native value.',
-                     'accountedValue': diff['native'], 'timingLosses': losses}
         warnings = [w for w in accounted['warnings'] if not GUI_WARNING.fullmatch(w)]
         dialogs = [w for w in gui_report['warnings'] if GUI_WARNING.fullmatch(w)]
         if diff['path'].startswith('report.warnings') and dialogs and warnings == native_report['warnings']:
             proof = {'classification': 'gui-warning',
                      'reason': 'Removing GUI-only error-dialog warnings after proven loss accounting gives the native warnings.',
-                     'warnings': dialogs, 'timingLosses': losses if timing_verified else []}
+                     'warnings': dialogs}
         match = re.fullmatch(r'report.contexts\[(\d+)\]\.(\w+)', diff['path'])
         if match:
             index, metric = int(match[1]), match[2]
@@ -518,41 +441,116 @@ def classify(data, gui, native, gui_report, native_report, gui_dir, diffs, repor
             if (metric == 'blocked_ms' and diff['native'] is None
                     and native_report['contexts'][index]['name'] == name
                     and metadata.get('withheldMetrics', {}).get('blockedTime') == blocked_evidence):
-                proof = {'classification': 'withheld-undefined', 'reason': blocked_evidence['reason'],
+                proof = {'classification': 'withheld-undefined', 'reason': blocked_evidence,
                          'context': name, 'evidence': blocked_evidence,
                          'taskStopReadyReasons': dict(Counter(p.args[1] for p in packets if p.event == 7))}
         diff.update(proof)
     return proofs
 
 
-def robustness_checks(data, gui, native, metadata, native_report):
-    packets, losses = clock_losses(data)
-    framing = []
-    list(decoder.stream(data, framing))
-    malformed = [{'offset': p.offset, 'bytes': len(p.data), 'reason': 'malformed payload: ' + p.problem}
+def raw_clock(data, offsets):
+    """Rebuild clocks directly from the wire, independently of decoder Reader/Packet/stream."""
+    def uint(pos):
+        value = 0
+        for shift in range(0, 35, 7):
+            if pos >= len(data):
+                raise ValueError('raw clock: truncated U32')
+            byte = data[pos]
+            pos += 1
+            if shift == 28 and byte > 15:
+                raise ValueError('raw clock: invalid U32')
+            value |= (byte & 127) << shift
+            if byte < 128:
+                return value, pos
+        raise ValueError('raw clock: unterminated U32')
+
+    counts = (0, 1, 1, 0, 1, 0, 1, 2, 1, 2, 0, 0, 1, 2, 0, 1, 1, 0, 0, 1, 0, 4, 1, 2)
+    stamps, ends, frequencies = [], [], []
+    clock, frequency = 0, 0
+    for i, offset in enumerate(offsets):
+        event, pos = uint(offset)
+        if event >= 24:
+            size, pos = uint(pos)
+            if event == 24:
+                new_frequency, _ = uint(pos)
+                if frequency and new_frequency != frequency:
+                    frequencies.append(i)
+                frequency = new_frequency
+            pos += size
+            if pos > len(data):
+                raise ValueError('raw clock: truncated payload')
+        else:
+            for _ in range(counts[event]):
+                _, pos = uint(pos)
+            if event in (9, 14, 22):
+                size = data[pos]
+                pos += 1
+                if size == 255:
+                    size = int.from_bytes(data[pos:pos + 2], 'big')
+                    pos += 2
+                pos += size
+        delta, end = uint(pos)
+        clock += delta if i else 0
+        stamps.append(stamps[-1] + 1 if event == 1 and i else clock)
+        ends.append(end)
+    gaps = [i for i in range(1, len(offsets)) if ends[i - 1] > offsets[i]
+            or any(data[ends[i - 1]:offsets[i]])]
+    return stamps, ends, frequencies, gaps
+
+
+def framing_diagnostics(data, offsets, ends, diagnostics):
+    """Check zero padding and a final cut against the bytes between the GUI's complete frames."""
+    padding = []
+    for start, end in zip(ends[:-1], offsets[1:]):
+        gap = data[start:end]
+        if any(gap) or start > end:
+            return False
+        padding.extend(range(start + len(gap) // 10 * 10, end))
+    tail = ends[-1]
+    while tail < len(data) and data[tail] == 0:
+        if data[tail:tail + 10] == b'\0' * 10:
+            tail += 10
+        else:
+            padding.append(tail)
+            tail += 1
+    expected = [{'offset': offset, 'bytes': 1, 'reason': 'unexpected padding byte'} for offset in padding]
+    actual = [d for d in diagnostics if not d['reason'].startswith(decoder.MALFORMED_DIAGNOSTIC)
+              and d['reason'] != 'timestamp frequency changed']
+    if tail < len(data):
+        try:
+            raw_clock(data, [tail])
+        except (ValueError, IndexError):
+            if (not actual or actual[-1].get('offset') != tail or actual[-1].get('bytes') != len(data) - tail
+                    or actual[-1].get('timingLost') or 'truncated packet' not in actual[-1]['reason']):
+                return False
+            actual = actual[:-1]
+        else:
+            return False
+    return actual == expected
+
+
+def robustness_checks(data, packets, gui, native, metadata, native_report):
+    malformed = [{'offset': p.offset, 'bytes': len(p.data), 'reason': decoder.MALFORMED_DIAGNOSTIC + p.problem}
                  for p in packets if p.problem]
-    diagnostics = [d for d in metadata['diagnostics'] if d['reason'].startswith('malformed payload:')]
-    timed = losses[0]['row'] if losses else len(packets)
-    expected_time, clock = [], 0
-    for i, p in enumerate(packets):
-        clock += p.delta if i else 0
-        ts = expected_time[-1] + 1 if p.event == 1 and i else clock
-        expected_time.append(ts)
+    diagnostics = [d for d in metadata['diagnostics'] if d['reason'].startswith(decoder.MALFORMED_DIAGNOSTIC)]
+    expected_time, ends, frequency_rows, gaps = raw_clock(data, [int(r['eventoffset']) for r in gui])
+    timed = min([*frequency_rows, *gaps], default=len(gui))
+    boundaries = sorted(set(frequency_rows + gaps))
     checks = {
         'packetOffsets': [int(r['eventoffset']) for r in native] == [int(r['eventoffset']) for r in gui],
         'packetBytes': len(native) == len(packets) and all(
             int(r['eventoffset']) == p.offset and int(r['eventint']) == p.event
             and int(r['eventsize']) == len(p.data) and bytes.fromhex(r['eventdata']) == p.data
-            for r, p in zip(native, packets)),
+            and p.offset + len(p.data) == end for r, p, end in zip(native, packets, ends)),
         'malformedDiagnostics': diagnostics == malformed,
-        'framingDiagnostics': [d for d in metadata['diagnostics']
-                               if not d['reason'].startswith('malformed payload:')
-                               and d['reason'] != 'timestamp frequency changed'] == framing,
+        'framingDiagnostics': framing_diagnostics(data, [int(r['eventoffset']) for r in gui], ends,
+                                                  metadata['diagnostics']),
         'malformedArgumentsWithheld': all(not p.args and not p.text
             and r['event'] == decoder.NAMES.get(p.event, f'Event #{p.event}')
-            and r['detail'] == 'Malformed payload: ' + p.problem for r, p in zip(native, packets) if p.problem),
-        'noResynchronization': not any(p.gap for p in packets),
-        'clockBoundaries': metadata.get('timingLosses') == losses and metadata.get('timedEvents') == timed,
+            and r['detail'] == decoder.MALFORMED + p.problem for r, p in zip(native, packets) if p.problem),
+        'noResynchronization': not gaps,
+        'clockBoundaries': ([i for i, r in enumerate(native) if decoder.TIMING_LOST in r['detail']] == boundaries
+                            and metadata.get('timedEvents') == timed),
         'timestamps': all(r['timestampint'] == (str(ts) if i < timed else '')
                           for i, (r, ts) in enumerate(zip(native, expected_time))),
     }
@@ -564,20 +562,21 @@ def robustness_checks(data, gui, native, metadata, native_report):
         raw.write_bytes(data[:prefix_end])
         decoder.decode_file(raw, path)
         prefix = json_report(path)
-    timing = ('isr', 'ready_run', 'functions', 'markers', 'live_window_s', 'workload_window_s', 'contexts_workload')
+    timing = ('contexts', 'isr', 'ready_run', 'functions', 'markers', 'live_window_s',
+              'workload_window_s', 'contexts_workload')
     checks['reportTimedPrefix'] = all(native_report[k] == prefix[k] for k in timing)
-    checks['lossCounted'] = not losses or (native_report['overflow'] >= len(losses)
+    checks['lossCounted'] = not boundaries or (native_report['overflow'] >= len(boundaries)
                                           and any('native timing lost' in w for w in native_report['warnings']))
-    return {'checks': checks, 'malformedPackets': malformed, 'timingLosses': losses,
+    return {'checks': checks, 'malformedPackets': malformed, 'timingLossRows': boundaries,
             'timedEvents': timed, 'passed': all(checks.values())}
 
 
-def compare(raw, gui, out, baseline=None, mode='parity'):
+def compare(raw, gui, out, mode='parity', raw_sha256=None):
     data = Path(raw).read_bytes()
     if mode not in ('parity', 'robustness'):
         raise decoder.DecodeError(f'unknown comparison mode: {mode}')
-    if mode == 'robustness' and hashlib.sha256(data).hexdigest() not in ROBUSTNESS_CAPTURES:
-        raise decoder.DecodeError('robustness mode requires an explicitly allow-listed corrupt capture')
+    if mode == 'robustness' and hashlib.sha256(data).hexdigest() != raw_sha256:
+        raise decoder.DecodeError('robustness mode requires a verified manifest checksum')
     expected = read_rows(Path(gui) / 'events.txt')
     for i, row in enumerate(expected):
         offset, size = int(row['eventoffset']), int(row['eventsize'])
@@ -587,33 +586,26 @@ def compare(raw, gui, out, baseline=None, mode='parity'):
     out = Path(out)
     metadata = decoder.decode_file(raw, out)
     native = read_rows(out / 'events.txt')
-    diffs = list(differences(normalized_rows(expected), normalized_rows(native), 'events'))
+    packets = [decoder.packet_at(data, int(r['eventoffset']))[0] for r in expected]
+    gui_normal, native_normal = normalized_rows(expected), normalized_rows(native)
+    diffs = list(differences(gui_normal, native_normal, 'events'))
     counts = Counter(re.sub(r'\[\d+\]', '[]', d['path']) for d in diffs)
     gui_report, native_report = json_report(gui), json_report(out)
     report_diffs = list(differences(gui_report, native_report, 'report'))
     robustness = None
     if mode == 'robustness':
-        robustness = robustness_checks(data, expected, native, metadata, native_report)
+        robustness = robustness_checks(data, packets, expected, native, metadata, native_report)
         for diff in [*diffs, *report_diffs]:
-            diff.update(classification='informational', reason='Allow-listed corrupt-wire capture: GUI parity is not an oracle; see robustness checks.')
+            diff.update(classification='informational', reason='Manifest-designated corrupt-wire capture: GUI parity is not an oracle; see robustness checks.')
     else:
-        classify(data, expected, native, gui_report, native_report, gui, diffs, report_diffs, metadata)
+        classify(packets, expected, native, gui_report, native_report, gui, diffs, report_diffs,
+                 gui_normal, native_normal, metadata)
     classes = Counter(d['classification'] for d in [*diffs, *report_diffs])
-    fixed = []
-    if baseline:
-        with tempfile.TemporaryDirectory(prefix='sysview-baseline-') as tmp:
-            baseline.decode_file(raw, tmp)
-            old_rows = read_rows(Path(tmp) / 'events.txt')
-            old = [*differences(normalized_rows(expected), normalized_rows(old_rows), 'events'),
-                   *differences(gui_report, json_report(tmp), 'report')]
-        current = {d['path'] for d in [*diffs, *report_diffs]}
-        fixed = [d for d in old if d['path'] not in current]
     return {'raw': str(raw), 'gui': str(gui), 'rawRowsVerified': len(expected), 'nativeRows': len(native),
             'rowDiffCount': len(diffs), 'rowDiffFields': dict(counts), 'rowDiffs': diffs,
             'reportDiffs': report_diffs, 'equal': not diffs and not report_diffs,
             'classifications': {key: classes[key] for key in CLASSES}, 'mode': mode, 'robustness': robustness,
-            'accepted': robustness['passed'] if robustness is not None else not classes['unexplained'],
-            'fixedCount': len(fixed), 'fixedDifferences': fixed}
+            'accepted': robustness['passed'] if robustness is not None else not classes['unexplained']}
 
 
 def verify(root, files):
@@ -629,37 +621,26 @@ def main(argv=None):
     p.add_argument('--root', type=Path, required=True)
     p.add_argument('--manifest', type=Path, required=True)
     p.add_argument('--out', type=Path, required=True)
-    p.add_argument('--baseline-decoder', type=Path, help='previous decoder source; count differences now fixed')
     a = p.parse_args(argv)
     try:
         manifest = json.loads(a.manifest.read_text(encoding='utf-8'))
         verify(a.root, manifest['files'])
-        baseline = None
-        if a.baseline_decoder:
-            spec = importlib.util.spec_from_file_location('sysview_baseline', a.baseline_decoder)
-            if spec is None or spec.loader is None:
-                raise decoder.DecodeError('--baseline-decoder must name a Python source file')
-            baseline = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = baseline
-            spec.loader.exec_module(baseline)
-        if a.out.exists() and (not a.out.is_dir() or any(a.out.iterdir())):
-            raise decoder.DecodeError('--out must be a new or empty directory')
-        a.out.mkdir(parents=True, exist_ok=True)
+        prepare_out(p, str(a.out))
         results = []
         for case in manifest['captures']:
             with tempfile.TemporaryDirectory(prefix='sysview-corpus-') as tmp:
-                result = compare(a.root / case['raw'], a.root / case['gui'], tmp, baseline, case.get('mode', 'parity'))
+                result = compare(a.root / case['raw'], a.root / case['gui'], tmp, case.get('mode', 'parity'),
+                                 manifest['files'][case['raw']]['sha256'])
             result['name'] = case['name']
             (a.out / f'{case["name"]}.json').write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
             summary = {key: result[key] for key in ('name', 'rawRowsVerified', 'nativeRows', 'rowDiffCount', 'equal')}
             summary['reportDiffCount'] = len(result['reportDiffs'])
-            summary['fixed'] = result['fixedCount']
             summary.update(result['classifications'])
             summary['accepted'] = result['accepted']
             results.append(summary)
             print(json.dumps(summary), flush=True)
         (a.out / 'summary.json').write_text(json.dumps(results, indent=2) + '\n', encoding='utf-8')
-    except (OSError, ValueError, KeyError) as e:
+    except (OSError, ValueError, KeyError, report.Usage) as e:
         p.error(str(e))
     return int(any(not r['accepted'] for r in results))
 

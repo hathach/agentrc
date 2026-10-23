@@ -496,33 +496,6 @@ def on_signal(signum, _frame):
     raise Failure(f'stopped by signal {signum}')
 
 
-def record_native(a, raw, argv, parser):
-    from sysview_decode import DecodeError, decode_file
-
-    out = Path(a.out).resolve()
-    prepare_out(parser, str(out))
-    record = {'started': now(), 'argv': list(argv if argv is not None else sys.argv[1:]),
-              'mode': 'decode', 'decoder': 'native', 'exports': {}}
-    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, getattr(signal, 'SIGHUP', None))
-                if sig is not None}
-    rc = 0
-    try:
-        record['decode'] = decode_file(raw, out, a.no_events)
-        for name in ('contexts.csv', 'events.txt'):
-            if (out / name).is_file():
-                record['exports'][name] = (out / name).stat().st_size
-    except (Failure, OSError, DecodeError, KeyboardInterrupt) as e:
-        record['error'] = str(e) or type(e).__name__
-        rc = 3
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-        record['ended'] = now()
-        (out / 'record.json').write_text(json.dumps(record, indent=1), encoding='utf-8')
-    print(json.dumps(record))
-    return rc
-
-
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--out', required=True, help='new or empty output directory')
@@ -540,7 +513,10 @@ def main(argv=None):
     p.add_argument('--workload', metavar='CMD', help='shell command run for the recording, stopped at its end')
     p.add_argument('--no-events', action='store_true', help='skip events.txt (large: megabytes per second)')
     p.add_argument('--export-terminal', action='store_true', help='also export terminal.csv')
+    from sysview_decode import DecodeError, decode_file
+
     a = p.parse_args(argv)
+    native = bool(a.from_raw and not a.gui)
     if a.gui and not a.from_raw:
         p.error('--gui is for --from-raw; live recording already uses the GUI')
     if a.from_raw:
@@ -554,12 +530,11 @@ def main(argv=None):
         if not a.gui:
             if a.export_terminal:
                 p.error('--export-terminal requires --gui; native decoding does not export the terminal channel')
-            return record_native(a, raw, argv, p)
-    if sys.platform != 'linux':
+    if not native and sys.platform != 'linux':
         p.error(f'Linux-only (Xvfb, /proc, POSIX process groups); this is {sys.platform}')
     if not a.from_raw:
         cb = resolve_live(a, p)
-    missing = [t for t in TOOLS if not shutil.which(t)]
+    missing = [t for t in TOOLS if not shutil.which(t)] if not native else []
     if missing:
         p.error(f"not on PATH: {', '.join(missing)} (SystemView's deb, xvfb, xdotool, util-linux)")
     out = Path(a.out).resolve()
@@ -567,6 +542,8 @@ def main(argv=None):
 
     record = {'started': now(), 'argv': [shlex.quote(x) for x in (argv if argv is not None else sys.argv[1:])],
               'mode': 'decode' if a.from_raw else 'live', 'exports': {}}
+    if native:
+        record['decoder'] = 'native'
     if a.from_raw:
         sv_args = []
     else:
@@ -576,18 +553,24 @@ def main(argv=None):
             record['workload'] = {'cmd': a.workload}
         sv_args = ['-recorder', 'J-Link', '-device', a.device, '-usb', a.probe, '-if', a.interface.upper(),
                    '-speed', a.speed, '-rttcbaddr', f'0x{cb:08X}']
-    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    previous = {sig: signal.signal(sig, on_signal) for sig in ps.STOP_SIGNALS}
     rc, sv = 0, None
     try:
         try:
-            sv = SystemView(out, sv_args, () if a.from_raw else (usb_node(a.probe),))
-            record.update(display=sv.display, port=sv.port, registryCopied=sv.copied)
-            sv.wait_ready()
-            if a.from_raw:
-                decode(sv, out, a, record, raw)
+            if native:
+                record['decode'] = decode_file(raw, out, a.no_events)
+                for name in ('contexts.csv', 'events.txt'):
+                    if (out / name).is_file():
+                        record['exports'][name] = (out / name).stat().st_size
             else:
-                record_live(sv, out, a, record)
-        except (Failure, OSError, subprocess.SubprocessError, KeyboardInterrupt) as e:
+                sv = SystemView(out, sv_args, () if a.from_raw else (usb_node(a.probe),))
+                record.update(display=sv.display, port=sv.port, registryCopied=sv.copied)
+                sv.wait_ready()
+                if a.from_raw:
+                    decode(sv, out, a, record, raw)
+                else:
+                    record_live(sv, out, a, record)
+        except (Failure, OSError, DecodeError, subprocess.SubprocessError, KeyboardInterrupt) as e:
             record['error'] = str(e) or type(e).__name__
             if hasattr(e, 'cleanup_error'):
                 record['cleanupError'] = e.cleanup_error
@@ -608,7 +591,7 @@ def main(argv=None):
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         record['ended'] = now()
-        (out / 'record.json').write_text(json.dumps(record, indent=1))
+        (out / 'record.json').write_text(json.dumps(record, indent=1), encoding='utf-8')
     print(json.dumps(record))
     return rc
 
