@@ -36,7 +36,7 @@ class HookTest(unittest.TestCase):
     def test_denies_captain_and_passes_everyone_else(self):
         self.assertEqual(call('Bash', command='gh pr merge 12').returncode, 2)
         self.assertEqual(call('Bash', agent_type='chief', command='gh pr merge 12').returncode, 0)
-        self.assertEqual(call('Bash', agent_id='sub-1', command='gh pr merge 12').returncode, 0)
+        self.assertEqual(call('Bash', agent_id='sub-1', command='gh pr merge 12').returncode, 2)
         self.assertEqual(call('Bash', agent_type=None, command='git push').returncode, 0)
 
     def test_allows_its_own_script(self):

@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import unittest
 from contextlib import contextmanager
@@ -178,6 +179,28 @@ class AccountTest(unittest.TestCase):
         """Set, Claude Code keeps its state in <dir>/.claude.json rather than ~/.claude.json: another install."""
         home = str(Path('~/.claude').expanduser())
         self.assertEqual(self._account(f'CLAUDE_CONFIG_DIR={home}\0'.encode()), f'config:{home}')
+
+
+class HerdrTimeoutTest(unittest.TestCase):
+    """A hung herdr fails like any herdr error instead of holding the ledger lock forever."""
+
+    def hangs(self, *args, timeout=None, **kw):
+        raise subprocess.TimeoutExpired(args[0], timeout)
+
+    def test_timed_out_call_fails(self):
+        with mock.patch.object(captain.subprocess, 'run', side_effect=self.hangs) as run:
+            out = captain.run_herdr('agent', 'list')
+            self.assertEqual(run.call_args.kwargs['timeout'], captain.HERDR_TIMEOUT_S)
+            self.assertNotEqual(out.returncode, 0)
+            self.assertEqual(captain.submit('w2:p1', 'hi')[0], 'uncertain')
+            self.assertTrue(captain.start('n', 'w2:p1'))
+            with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                captain.herdr_text('agent', 'list')
+
+    def test_start_outwaits_herdr_s_own_limit(self):
+        with mock.patch.object(captain.subprocess, 'run', side_effect=self.hangs) as run:
+            captain.start('n', 'w2:p1')
+        self.assertGreater(run.call_args.kwargs['timeout'], captain.START_MS / 1000)
 
 
 def pinned(pane):

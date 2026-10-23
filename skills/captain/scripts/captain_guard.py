@@ -3,11 +3,11 @@
 account: captain only relays and reports, so its own calls may run the installed captain.py with a known
 subcommand, read its state and skill, load its skill and Monitor, and ask the human; every other call is denied.
 
-Only captain's own calls are checked, as a backstop to the declaration: the payload names agent_type `captain`
-and carries no agent_id, which every subagent call does. An allowlist, so a tool or command added later is
-denied until it is named here. A guard against mistakes and drift, not isolation: captain.py itself runs herdr
-and types into other panes, and the checks in it stay the authority. Exit 2 denies; Claude Code lets an erroring
-hook pass, so any error denies too.
+Only captain's calls are checked, as a backstop to the declaration: the payload names agent_type `captain`,
+whether captain runs as the session's agent or as another session's subagent. An allowlist, so a tool or command
+added later is denied until it is named here. A guard against mistakes and drift, not isolation: captain.py itself
+runs herdr and types into other panes, and the checks in it stay the authority. Exit 2 denies; Claude Code lets an
+erroring hook pass, so any error denies too.
 """
 import json
 import os
@@ -81,7 +81,7 @@ def verdict(payload):
 
 def main():
     payload = json.load(sys.stdin.buffer)
-    if payload.get('agent_type') != 'captain' or payload.get('agent_id'):
+    if payload.get('agent_type') != 'captain':
         return 0
     why = verdict(payload)
     if why:

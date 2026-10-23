@@ -41,6 +41,7 @@ except ImportError:   # Windows: Herdr and /proc are POSIX-only, so the captain 
 
 CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # main is CLAUDE_CONFIG_DIR unset
 START_MS = 60000
+HERDR_TIMEOUT_S = 30
 SGR = re.compile(r'\x1b\[([0-9;]*)m')
 OTHER_ESCAPE = re.compile(r'\x1b\[[0-9;?]*[A-Za-ln-z]')
 RULE = re.compile(r'^─{20,}')  # the top rule may end in a session label: ──── alo68 ─
@@ -69,8 +70,12 @@ def die(msg, code=1):
     raise SystemExit(code)
 
 
-def run_herdr(*args):
-    return subprocess.run(['herdr', *args], capture_output=True, encoding='utf-8')
+def run_herdr(*args, timeout=HERDR_TIMEOUT_S):
+    """A hung herdr must not hold the ledger lock: past timeout it fails like any herdr error."""
+    try:
+        return subprocess.run(['herdr', *args], capture_output=True, encoding='utf-8', timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(['herdr', *args], 124, '', f'no answer within {timeout} s')
 
 
 def herdr_text(*args):
@@ -836,7 +841,8 @@ def enroll(replace):
 
 def start(name, pane):
     """Start Claude Code in pane: None once herdr sees it ready for input, else herdr's error."""
-    out = run_herdr('agent', 'start', name, '--kind', 'claude', '--pane', pane, '--timeout', str(START_MS))
+    out = run_herdr('agent', 'start', name, '--kind', 'claude', '--pane', pane, '--timeout', str(START_MS),
+                    timeout=START_MS / 1000 + HERDR_TIMEOUT_S)
     return None if out.returncode == 0 else (out.stderr or out.stdout).strip() or f'exit {out.returncode}'
 
 
