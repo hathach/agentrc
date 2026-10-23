@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -485,6 +486,18 @@ class RealExports(unittest.TestCase):
             shutil.copytree(DATA / 'f407-baremetal', Path(d) / 'x')
             report.main([str(Path(d) / 'x')])
         self.assertIn('overflow:', out.getvalue())
+
+
+class LoadByPath(unittest.TestCase):
+    def test_loads_without_the_scripts_dir_on_sys_path(self):
+        # this module puts SCRIPTS on sys.path itself, so only a fresh -I interpreter can show the script finds
+        # sysview_decode on its own
+        code = ('import importlib.util, sys\n'
+                'spec = importlib.util.spec_from_file_location("sysview_report", sys.argv[1])\n'
+                'spec.loader.exec_module(importlib.util.module_from_spec(spec))\n')
+        r = subprocess.run([sys.executable, '-I', '-c', code, str(SCRIPTS / 'sysview_report.py')],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
 
 
 if __name__ == '__main__':
