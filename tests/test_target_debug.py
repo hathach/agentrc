@@ -1361,23 +1361,23 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         backend.current, backend.others, backend.batch = 'max32665.cpu', {}, batch
         return backend
 
-    def halt_with_signal(self, raises, signalled=True):
-        """halt_reads over a session that takes SIGTERM unless not signalled; raises: the failure it then ends
+    def halt_with_signal(self, raises, signalled=True, sig=signal.SIGTERM):
+        """halt_reads over a session that takes sig unless not signalled; raises: the failure it then ends
         with."""
         def batch(body, timeout):
             if signalled:
-                signal.raise_signal(signal.SIGTERM)    # os.kill would terminate the process on Windows
+                signal.raise_signal(sig)    # os.kill would terminate the process on Windows
             if raises:
                 raise raises
             return 'R DHCSR 0x01010001\nGUARDED\nH 0x08001000\nR DHCSR 0x01010001\n', \
                 [('DHCSR', 0x01010001), ('DHCSR', 0x01010001)]
 
-        previous = signal.getsignal(signal.SIGTERM)
+        previous = signal.getsignal(sig)
         backend = self.single_core(batch)
         with mock.patch.object(backend, 'recover', return_value='; recovered') as recover:
             with self.assertRaises(probe_state.ToolError) as cm:
                 backend.halt_reads(1, 500, 10, 30)
-        self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        self.assertIs(signal.getsignal(sig), previous)
         self.assertNotIsInstance(cm.exception, probe_state.HaltRefused)
         self.assertEqual(isinstance(cm.exception, probe_state.Unreaped), isinstance(raises, probe_state.Unreaped))
         return str(cm.exception), recover.call_count
@@ -1397,6 +1397,13 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
         self.assertEqual(self.halt_with_signal(failure),
                          ('halting fallback: interrupted by signal 15; openocd exited 1; recovered', 1))
+
+    @unittest.skipIf(os.name == 'nt', 'Windows has no SIGHUP')
+    def test_a_hangup_that_stopped_the_fallback_past_its_guards_recovers(self):
+        failure = probe_state.Cancelled(f'interrupted by signal {int(signal.SIGHUP)}')
+        failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
+        self.assertEqual(self.halt_with_signal(failure, sig=signal.SIGHUP),
+                         (f'halting fallback: interrupted by signal {int(signal.SIGHUP)}; recovered', 1))
 
     def test_a_signal_that_left_the_fallback_tool_running_still_names_it(self):
         # the tool may still hold the probe: no recovery session, and the core state is unknown

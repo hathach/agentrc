@@ -36,7 +36,7 @@ PC and resumes. It is OpenOCD-only: J-Link Commander cannot branch, so it could 
 core it finds halted untouched, and the flag is refused for a J-Link board. A multi-core
 target is refused before that session, since an SMP halt stops every core. A core found
 halted when that session starts is reported and not touched. A session that fails, times
-out or is stopped by SIGINT or SIGTERM after its guards passed is followed by one that
+out or is stopped by SIGINT, SIGTERM or SIGHUP after its guards passed is followed by one that
 polls the core and resumes it when it was left halted, unless its tool still ran KILL_WAIT s
 after its kill (D state): no session follows that one, and the core's state is unknown.
 
@@ -914,7 +914,7 @@ class OpenOCD:
             if stopping:
                 stop_running(signum)
 
-        previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
+        previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, *STOP_SIGNALS)}
         try:
             failure, text = None, ''
             try:
