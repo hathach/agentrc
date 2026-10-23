@@ -1412,22 +1412,22 @@ def load_setup(key, p):
 
 
 def make_backend(a, p):
-    pc = sibling('pc_sample')
+    ps = sibling('probe_state')
     if bool(a.hil_config) != bool(a.board):
         p.error('--hil-config and --board go together')
     route = None
     if a.hil_config:
         try:
-            flasher = pc.hil_flasher(a.hil_config, a.board)
-            route = pc.HIL_PROBE_ROUTES[flasher['name']]
+            flasher = ps.hil_flasher(a.hil_config, a.board)
+            route = ps.HIL_PROBE_ROUTES[flasher['name']]
             if route == 'jlink':
                 if a.cfg or a.vid_pid:
                     raise ValueError('--cfg and --vid-pid are OpenOCD flags; this board is a J-Link one')
-                pc.hil_merge(a, a.board, probe=flasher.get('uid'), device=pc.hil_jlink_device(a.board, flasher))
+                ps.hil_merge(a, a.board, probe=flasher.get('uid'), device=ps.hil_jlink_device(a.board, flasher))
             else:
                 if a.device:
                     raise ValueError('--device is a J-Link flag; this board is an OpenOCD one')
-                pc.hil_merge(a, a.board, probe=flasher.get('uid'), cfg=flasher.get('args'),
+                ps.hil_merge(a, a.board, probe=flasher.get('uid'), cfg=flasher.get('args'),
                              vid_pid=flasher.get('vid_pid'))
         except ValueError as e:
             p.error(str(e))
@@ -1451,7 +1451,7 @@ def make_backend(a, p):
     if route == 'jlink':
         if not (a.interface and a.speed):
             p.error('a J-Link needs --interface and --speed')
-        if not pc.SPEED_RE.fullmatch(a.speed):
+        if not ps.SPEED_RE.fullmatch(a.speed):
             p.error(f'--speed {a.speed!r}: kHz, auto or adaptive')
         if a.swo_object or a.vid_pid:
             p.error('--swo-object and --vid-pid are OpenOCD flags')
