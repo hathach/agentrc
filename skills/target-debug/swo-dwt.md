@@ -9,8 +9,8 @@ With SWO wired, the core's DWT and ITM emit packets while it runs: **exception t
 return, with local timestamps: ISR order, nesting and duration), **hardware PC sampling** (a histogram without polling
 `DWT_PCSR`), **data trace** (every access to a watched address: value, accessor PC or address offset) and the
 firmware's own **ITM stimulus** writes. Two scripts beside this file do it, `swo_capture.py` and `swo_decode.py`; their
-docstrings are the full contract. They import sibling modules (`pc_sample.py`, `probe_state.py`): copy the whole
-`scripts/` directory to the rig host, not the two files.
+docstrings are the full contract. They import `probe_state.py` beside them, which loads the repository's `lib/`: on
+the rig host run them from an agentrc checkout, such as a project's pinned `lib/agentrc`, not from copied files.
 
 ## Capture
 

@@ -183,7 +183,7 @@ def trace_gate(device):
 
 
 def free_ports(n):
-    # the copy autopsy.py and esp_session.py keep: importing either drags lib/ modules a copied scripts/ dir lacks
+    # same behaviour as autopsy.py's and esp_session.py's
     socks = [socket.socket() for _ in range(n)]
     try:
         for s in socks:
