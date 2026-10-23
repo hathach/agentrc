@@ -61,13 +61,13 @@ class Trigger(unittest.TestCase):
     def test_an_unticked_box_on_a_skipped_head_is_ticked_and_read_back(self):
         rig = Rig()
         code, out = self.run_with(rig)
-        self.assertEqual((code, out['outcome'], out['detail']), (0, 'ticked', 'comment 5'))
+        self.assertEqual((code, out['outcome'], out['detail'], out['commentId']), (0, 'ticked', 'comment 5', 5))
         self.assertRegex(out['at'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$')
         self.assertEqual(rig.patches, [f'summary\n{BOX.replace("[ ]", "[x]", 1)}\nend'])
 
     def test_a_ticked_box_is_left_alone(self):
         rig = Rig(comments=[{'id': 5, 'user': {'login': BOT}, 'body': BOX.replace('[ ]', '[x]', 1)}])
-        self.assertEqual(self.run_with(rig)[1], {'outcome': 'already', 'detail': 'comment 5', 'at': mock.ANY, 'seal': mock.ANY})
+        self.assertEqual(self.run_with(rig)[1], {'outcome': 'already', 'detail': 'comment 5', 'commentId': 5, 'at': mock.ANY, 'seal': mock.ANY})
         self.assertEqual(rig.patches, [])
 
     def test_nothing_is_edited_unless_coderabbit_skipped_this_head(self):
@@ -79,7 +79,9 @@ class Trigger(unittest.TestCase):
                  'undated': Rig(statuses=(dict(SKIP, updated_at=None),))}
         for what, rig in cases.items():
             with self.subTest(what):
-                self.assertEqual(self.run_with(rig)[1]['outcome'], 'notSkipped')
+                out = self.run_with(rig)[1]
+                self.assertEqual(out['outcome'], 'notSkipped')
+                self.assertNotIn('commentId', out)
                 self.assertEqual(rig.patches, [])
 
     def test_failures(self):
@@ -91,6 +93,7 @@ class Trigger(unittest.TestCase):
             with self.subTest(what):
                 code, out = self.run_with(rig)
                 self.assertEqual((code, out['outcome']), (0, 'failed'))
+                self.assertNotIn('commentId', out)
 
     def test_an_unreadable_github_answer_is_an_error_line(self):
         rig = Rig()
@@ -155,14 +158,14 @@ class Request(unittest.TestCase):
     def test_a_reset_limit_is_asked_once_and_read_back(self):
         rig = RequestRig()
         code, out = self.run_with(rig)
-        self.assertEqual((code, out['outcome'], out['detail'], out['at']), (0, 'requested', 'comment 99', '2026-10-13T11:00:01Z'))
+        self.assertEqual((code, out['outcome'], out['detail'], out['commentId'], out['at']), (0, 'requested', 'comment 99', 99, '2026-10-13T11:00:01Z'))
         self.assertEqual(out['retryAt'], LIMITED['retryAt'])
         self.assertEqual(len(rig.posts), 1)
 
     def test_an_earlier_request_after_the_reset_is_not_repeated(self):
         mine = {'id': 50, 'body': '@coderabbitai review\n', 'created_at': '2026-10-13T10:56:00Z'}
         code, out = self.run_with(rig := RequestRig(comments=[mine]))
-        self.assertEqual((out['outcome'], out['detail'], out['at']), ('already', 'comment 50', '2026-10-13T10:56:00Z'))
+        self.assertEqual((out['outcome'], out['detail'], out['commentId'], out['at']), ('already', 'comment 50', 50, '2026-10-13T10:56:00Z'))
         self.assertEqual(rig.posts, [])
         before = dict(mine, created_at='2026-10-13T10:50:00Z')
         self.assertEqual(self.run_with(RequestRig(comments=[before]))[1]['outcome'], 'requested', 'one asked before the reset was rate-limited too')
@@ -174,6 +177,7 @@ class Request(unittest.TestCase):
             with self.subTest(what):
                 code, out = self.run_with(rig)
                 self.assertEqual((code, out['outcome'], out['retryAt']), (0, 'notDue', retry))
+                self.assertNotIn('commentId', out)
                 self.assertEqual(rig.posts, [])
 
     def test_nothing_is_posted_unless_limited_on_the_open_head(self):
@@ -199,6 +203,7 @@ class Request(unittest.TestCase):
             with self.subTest(what):
                 code, out = self.run_with(rig)
                 self.assertEqual((code, out['outcome'], out['retryAt']), (0, 'failed', None))
+                self.assertNotIn('commentId', out)
                 self.assertIsInstance(out['detail'], str)
 
 

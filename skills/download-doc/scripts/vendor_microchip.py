@@ -10,7 +10,9 @@ downloads are ordinary.
 
 The list comes from `https://www.microchip.com/documents_{1,2}.xml`, two sitemaps
 holding 36,328 direct PDF URLs — the whole document catalogue, no scraping of product
-pages required. Re-harvest with the browser when it goes stale.
+pages required. No script here harvests them: the cache is one `url<TAB>lastmod` line
+per PDF URL in those sitemaps, saved from a browser. Re-harvest when it goes stale; its
+freshness is otherwise unknown.
 
 Filenames are the only identifier: `SAM-D20-Family-Silicon-Errata-...-DS80000747.pdf`.
 Note the hyphens — matching `SAMD20` contiguously finds 358 documents where the
@@ -101,9 +103,8 @@ def _entries():
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
     if not CACHE.exists():
-        print(f"  no harvested URL list at {CACHE} — the catalogue must be collected "
-              f"through a browser (see this module's docstring)", file=sys.stderr)
-        return []
+        raise SystemExit(f"{CACHE} is missing: harvest Microchip's documents sitemaps "
+                         f"through a browser as this module's docstring describes")
     want = {f.upper() for f in families} if families else None
     docs, seen = [], set()
     for url, mod in _entries():

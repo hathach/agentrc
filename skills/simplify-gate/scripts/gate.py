@@ -36,7 +36,8 @@ def main():
     parser.add_argument('--model')
     parser.add_argument('--effort', choices=gate.EFFORTS)
     parser.add_argument('--apply', action='store_true', help='prune: act, not just report')
-    parser.add_argument('--days', type=int, help=f'prune: settled sessions idle longer expire (default {gate.PRUNE_DAYS})')
+    parser.add_argument('--days', type=int,
+                        help=f'prune: settled sessions idle longer expire or compact (default {gate.PRUNE_DAYS})')
     parser.add_argument('--report-days', type=int,
                         help=f'prune: report unresolved sessions idle longer (default {gate.REPORT_DAYS})')
     args = parser.parse_args()

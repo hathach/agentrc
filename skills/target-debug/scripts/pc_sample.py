@@ -25,64 +25,24 @@ exit code.
 """
 import argparse
 import collections
-import json
 import math
 import os
-import re
-import shlex
-import shutil
 import subprocess
 import sys
 
-DWT_PCSR = 0xE000101C
-DHCSR = 0xE000EDF0
-DEMCR = 0xE000EDFC
-DEMCR_TRCENA = 1 << 24  # DWTENA on ARMv6-M; DWT reads are invalid while it is 0
-SENTINEL = 0xFFFFFFFF
-HALT_WAIT_MS = 500    # each halt of the halting fallback
-SPEED_RE = re.compile(r'[1-9][0-9]*|auto|adaptive')
-
-
-class ToolError(RuntimeError):
-    pass
-
-
-def which(name):
-    """shutil.which, except that on Windows a bare name is looked up on PATH only: shutil.which and
-    CreateProcess both try the current directory first, which may be a checkout under test."""
-    if os.name != 'nt' or os.path.dirname(name):
-        return shutil.which(name)
-    exts = [''] if os.path.splitext(name)[1].lower() in ('.exe', '.cmd', '.bat') else ['.exe', '.cmd', '.bat']
-    for d in os.environ.get('PATH', '').split(os.pathsep):
-        if not (os.path.isabs(d) and os.path.splitdrive(d)[0]):
-            continue    # '.', 'bin' or '\bin' would name a directory of the cwd or its drive
-        for e in exts:
-            path = os.path.join(d, name + e)
-            if os.path.isfile(path):
-                return path
-    return None
-
-
-def probe_state_module():
-    # run as a script, this module is __main__: register it so probe_state's import shares ToolError
-    sys.modules.setdefault('pc_sample', sys.modules[__name__])
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    try:
-        import probe_state
-    except ImportError as e:
-        raise ToolError(f'pc_sample.py needs probe_state.py next to it: {e}')
-    return probe_state
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import probe_state  # noqa: E402
 
 
 def sample(backend, samples, interval_ms, timeout):
     """(pcs, [dhcsr before, after], {other core: (before, after)}) through probe_state's session."""
-    ps = probe_state_module()
-    cap = ps.Capture(samples, interval_ms, False, [])
+    cap = probe_state.Capture(samples, interval_ms, False, [])
     vals = cap.unpack(backend.observe(cap, timeout))
-    ps.check_m_profile(vals['cpuid'])
-    if not vals['demcr'] & DEMCR_TRCENA:
-        raise ToolError(f"DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{vals['demcr']:08x}): DWT_PCSR samples "
-                        f'are not valid while trace is disabled; enable trace from a debugger session first')
+    probe_state.check_m_profile(vals['cpuid'])
+    if not vals['demcr'] & probe_state.DEMCR_TRCENA:
+        raise probe_state.ToolError(f"DEMCR.TRCENA (DWTENA on ARMv6-M) is 0 (DEMCR=0x{vals['demcr']:08x}): DWT_PCSR "
+                                    f'samples are not valid while trace is disabled; enable trace from a debugger '
+                                    f'session first')
     return vals['pcs'], [vals['dhcsr0'], vals['dhcsr1']], backend.others
 
 
@@ -90,19 +50,19 @@ def symbolize(addr2line, elf, pcs, timeout):
     """{pc: (func, 'file:line')} for the given PCs; a PC addr2line cannot place is ('??', '')."""
     if not pcs:
         return {}
-    exe = which(addr2line)
+    exe = probe_state.which(addr2line)
     if not exe:
-        raise ToolError(f'{addr2line} not on PATH')
+        raise probe_state.ToolError(f'{addr2line} not on PATH')
     cmd = [exe, '-e', elf, '-f', '-C'] + [f'0x{pc:08x}' for pc in pcs]
     try:
         r = subprocess.run(cmd, capture_output=True, encoding='utf-8', errors='replace', timeout=timeout)
     except subprocess.TimeoutExpired as e:
-        raise ToolError(f'{addr2line} did not finish within {timeout:.0f} s') from e
+        raise probe_state.ToolError(f'{addr2line} did not finish within {timeout:.0f} s') from e
     if r.returncode != 0:
-        raise ToolError(f'{addr2line} failed: {r.stderr.strip() or r.stdout.strip()}')
+        raise probe_state.ToolError(f'{addr2line} failed: {r.stderr.strip() or r.stdout.strip()}')
     lines = r.stdout.splitlines()
     if len(lines) != 2 * len(pcs):
-        raise ToolError(f'{addr2line} returned {len(lines)} lines for {len(pcs)} addresses')
+        raise probe_state.ToolError(f'{addr2line} returned {len(lines)} lines for {len(pcs)} addresses')
     out = {}
     for i, pc in enumerate(pcs):
         func, loc = lines[2 * i].strip(), lines[2 * i + 1].strip()
@@ -112,8 +72,8 @@ def symbolize(addr2line, elf, pcs, timeout):
 
 def report(pcs, dhcsr, symbols, top, out=sys.stdout, what='samples'):
     """Histogram by function (a spin loop is several PCs), each with its PC sites."""
-    usable = [pc for pc in pcs if pc not in (0, SENTINEL)]
-    sentinel = sum(1 for pc in pcs if pc == SENTINEL)
+    usable = [pc for pc in pcs if pc not in (0, probe_state.SENTINEL)]
+    sentinel = sum(1 for pc in pcs if pc == probe_state.SENTINEL)
     no_pcsr = sum(1 for pc in pcs if pc == 0)
     by_pc = collections.Counter(usable)
     by_func = collections.Counter()
@@ -138,66 +98,6 @@ def report(pcs, dhcsr, symbols, top, out=sys.stdout, what='samples'):
     return len(usable)
 
 
-HIL_PROBE_ROUTES = {'jlink': 'jlink', 'openocd': 'openocd', 'stlink': 'openocd'}
-
-
-def hil_flasher(path, board):
-    """The `flasher` of one board in a project's HIL config json ({"boards": [{"name",
-    "flasher": {"name", "uid", "args", "vid_pid"}}]}), checked but not completed: only
-    flasher.name must be there, what else is missing is the caller's to supply. Raises
-    ValueError. Kept identical in rtt.py and pc_sample.py, which are copied around alone."""
-    try:
-        with open(path, encoding='utf-8-sig') as f:
-            config = json.load(f)
-    except (OSError, ValueError) as e:
-        raise ValueError(f'--hil-config {path}: {e}')
-    boards = config.get('boards') if isinstance(config, dict) else None
-    if not isinstance(boards, list) or not all(isinstance(b, dict) for b in boards):
-        raise ValueError(f'--hil-config {path}: expected {{"boards": [{{...}}, ...]}}')
-    found = [b for b in boards if b.get('name') == board]
-    if len(found) != 1:
-        names = ', '.join(sorted(str(b.get('name')) for b in boards))
-        raise ValueError(f'--board {board}: {len(found)} entries of that name in {path} (it has: {names})')
-    flasher = found[0].get('flasher')
-    if not isinstance(flasher, dict) or not isinstance(flasher.get('name'), str):
-        raise ValueError(f'--board {board}: no flasher.name in {path}')
-    if flasher['name'] not in HIL_PROBE_ROUTES:
-        raise ValueError(f"--board {board} is flashed over {flasher['name']!r}, which is no debug-probe route "
-                         f"(known: {', '.join(HIL_PROBE_ROUTES)}); name the probe with explicit flags")
-    for key in ('uid', 'args', 'vid_pid'):
-        if key in flasher and (not isinstance(flasher[key], str) or not flasher[key].strip()):
-            raise ValueError(f'--board {board}: flasher.{key} in {path} must be a non-empty string, '
-                             f'got {flasher[key]!r}')
-    return flasher
-
-
-def hil_jlink_device(board, flasher):
-    """The J-Link device of a jlink entry, whose args may be exactly `-device NAME`: any
-    other flag there would be one this script silently drops."""
-    if 'args' not in flasher:
-        return None
-    try:
-        words = shlex.split(flasher['args'])
-    except ValueError as e:
-        raise ValueError(f"--board {board}: flasher.args {flasher['args']!r}: {e}")
-    if len(words) != 2 or words[0] != '-device' or not words[1].strip():
-        raise ValueError(f"--board {board}: flasher.args must be exactly '-device NAME', got "
-                         f"{flasher['args']!r}; pass the probe flags explicitly instead")
-    return words[1]
-
-
-def hil_merge(given, board, **resolved):
-    """Fill the flags the caller left out; one the caller gave must agree with the file."""
-    for flag, value in resolved.items():
-        explicit = getattr(given, flag)
-        if value is None:
-            continue
-        if explicit is not None and explicit.strip() != value.strip():
-            raise ValueError(f"--{flag.replace('_', '-')} {explicit!r} contradicts --board {board}, "
-                             f"which has {value!r}")
-        setattr(given, flag, value)
-
-
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--probe', help='J-Link serial (rigs run several probes)')
@@ -214,8 +114,8 @@ def main(argv=None):
     p.add_argument('--speed', help='J-Link: interface speed in kHz, or "auto"/"adaptive"; no default')
     p.add_argument('--halt-samples', type=int, default=0,
                    help='openocd boards: halt reads when the samples gave no usable PC from a running core')
-    p.add_argument('--halt-timeout-ms', type=int, default=HALT_WAIT_MS,
-                   help=f'wait for each halt (default {HALT_WAIT_MS})')
+    p.add_argument('--halt-timeout-ms', type=int, default=probe_state.HALT_WAIT_MS,
+                   help=f'wait for each halt (default {probe_state.HALT_WAIT_MS})')
     p.add_argument('--timeout', type=float, help='bound on each tool run in seconds '
                    '(default: samples x (interval + 50 ms) + 20 s)')
     p.add_argument('--top', type=int, default=15, help='histogram rows (default 15)')
@@ -227,22 +127,23 @@ def main(argv=None):
     backend = None
     if a.hil_config:
         try:
-            flasher = hil_flasher(a.hil_config, a.board)
+            flasher = probe_state.hil_flasher(a.hil_config, a.board)
             if flasher['name'] == 'openocd':
                 if a.probe or a.device:
                     raise ValueError('--probe and --device are J-Link flags; an openocd board takes its HIL entry')
-                _, _, backend = probe_state_module().resolve(a, p)
+                _, _, backend = probe_state.resolve(a, p)
             elif flasher['name'] != 'jlink':
                 raise ValueError(f"--board {a.board} is flashed over {flasher['name']!r}; pc_sample.py "
                                  f"samples over a J-Link or openocd only")
             else:
-                hil_merge(a, a.board, probe=flasher.get('uid'), device=hil_jlink_device(a.board, flasher))
-        except (ValueError, ToolError) as e:
+                probe_state.hil_merge(a, a.board, probe=flasher.get('uid'),
+                                      device=probe_state.hil_jlink_device(a.board, flasher))
+        except (ValueError, probe_state.ToolError) as e:
             p.error(str(e))
     if a.halt_samples < 0 or a.halt_timeout_ms <= 0:
         p.error('--halt-samples must be non-negative, --halt-timeout-ms positive')
     if a.halt_samples and backend is None:
-        p.error(f'--halt-samples is for openocd boards: {probe_state_module().NO_JLINK_HALT}')
+        p.error(f'--halt-samples is for openocd boards: {probe_state.NO_JLINK_HALT}')
     if backend is None:
         if not (a.probe and a.device):
             p.error('need --probe and --device (or --hil-config with --board)')
@@ -250,13 +151,13 @@ def main(argv=None):
             p.error('--probe and --device must not be empty')
         if not (a.interface and a.speed):
             p.error('a J-Link needs --interface and --speed')
-        if not SPEED_RE.fullmatch(a.speed):
+        if not probe_state.SPEED_RE.fullmatch(a.speed):
             p.error(f'--speed must be kHz, "auto" or "adaptive", got {a.speed!r}')
         if os.environ.get('PC_SAMPLE_JLINK_EXE'):
             p.error('PC_SAMPLE_JLINK_EXE is no longer read: name J-Link Commander with PROBE_STATE_JLINK_EXE')
         try:
-            backend = probe_state_module().JLink(a.probe, a.device, a.interface, a.speed)
-        except ToolError as e:
+            backend = probe_state.JLink(a.probe, a.device, a.interface, a.speed)
+        except probe_state.ToolError as e:
             p.error(str(e))
     if a.samples <= 0 or a.interval_ms < 0 or a.top <= 0:
         p.error('--samples and --top must be positive, --interval-ms non-negative')
@@ -274,15 +175,15 @@ def main(argv=None):
             with open(a.raw, 'w', newline='\n') as f:
                 f.writelines(f'{pc:08x}\n' for pc in pcs)
         found_running = not (dhcsr[0] | dhcsr[1]) & (1 << 17)
-        if a.halt_samples and found_running and not any(pc not in (0, SENTINEL) for pc in pcs):
+        if a.halt_samples and found_running and not any(pc not in (0, probe_state.SENTINEL) for pc in pcs):
             try:
                 halted_pcs, *halted_dhcsr = backend.halt_reads(a.halt_samples, a.halt_timeout_ms, a.interval_ms,
                                                                a.timeout)
-            except ToolError as e:
+            except probe_state.ToolError as e:
                 fallback_error = str(e)
-        wanted = {pc for pc in pcs + halted_pcs if pc not in (0, SENTINEL)}
+        wanted = {pc for pc in pcs + halted_pcs if pc not in (0, probe_state.SENTINEL)}
         symbols = symbolize(a.addr2line, a.elf, sorted(wanted), timeout)
-    except ToolError as e:
+    except probe_state.ToolError as e:
         print(f'error: {e}', file=sys.stderr)
         return 1
     usable = report(pcs, dhcsr, symbols, a.top)

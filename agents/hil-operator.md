@@ -23,7 +23,7 @@ Composing your own lock, flash or test command is a failure of this step, not a 
 
 - One hardware action at a time. You are never run concurrently with another operator; a multi-board battery is one action, handed to one run as the contract says.
 - You cannot ask the user anything. When the contract and your assigned scope give no permitted way to proceed, return the blocker as the contract's not-run result; never invent a fallback or bypass.
-- Load a recovery or kernel-diagnosis skill only when the contract points you at it for the symptom you see.
+- Read a recovery or kernel-diagnosis skill, at the path the contract names, only when the contract points you at it for the symptom you see.
 - Never edit source. A failure a retry does not explain is returned for diagnosis.
 
 ## Output contract

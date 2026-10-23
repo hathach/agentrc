@@ -19,20 +19,24 @@ python3 <skill dir>/scripts/gate.py            # usage, same as `help`
 The state is one marker file in the repository's git common dir, so every
 worktree sees the same switch and a new worktree inherits it. `on` without
 flags keeps the overrides already in the marker; `off` deletes them with the
-marker. A change takes effect at the next tool call, no session restart.
+marker. The hooks run at UserPromptSubmit and Stop, so a change takes effect at the next prompt or Stop, no
+session restart; switched on mid-turn in a session with no saved baseline, the gate takes its baseline at that Stop
+and says the turn's earlier edits are not reviewed.
 
 Status shows `on`/`off`, then the model and effort with their source: `(repo)`
 from the marker, `(default)` from `hooks/simplify-gate/simplify_gate.py`. The
-hooks are registered once per machine when the skill is installed
-(`~/code/agentrc/install.py install --skill`); if status says on
-but no challenge ever runs, check that first.
+hooks are registered in `~/.claude/settings.json` when the agentrc checkout's `install.py install --skill` installs
+the skill; if status says on but no challenge ever runs, check that first.
 
 `prune` works on the user's gate cache (`$XDG_CACHE_HOME/agentrc/simplify-gate`),
 not a repository, and is a dry run until `--apply`. Sessions share one copy of
 each cached blob, hard-linked from the `.blobs` store; prune relinks older
 private copies to it after checking their content, drops the logs and
 unreferenced blobs of settled sessions (no queued batch, finding or error) idle
-over `--days`, and drops store copies no session links. It never removes a
-session's directory, state, lock files or referenced blobs, skips sessions a
-hook holds, and only reports unresolved sessions idle over `--report-days` and
-state it cannot read.
+over `--days`, and drops store copies no session links. A settled session whose
+last turn closed also loses its checkout snapshot, and with it the blobs only
+that snapshot held; its next prompt takes a new one. One whose turn was
+interrupted keeps its snapshot, the baseline its edits are reviewed against,
+and is listed. It never removes a session's directory or lock files, nor a blob
+its state still references, skips sessions a hook holds, and only reports
+unresolved sessions idle over `--report-days` and state it cannot read.

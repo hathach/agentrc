@@ -23,7 +23,10 @@ or 0xFFFFFFFF (Armv8-M). The probe tools set it at connect: J-Link Commander V9.
 cleared by hand, held clear for 2 s with the core running, set again at the next connect) and OpenOCD, whose cortex_m
 examine replaces DEMCR with TRCENA plus its own vector-catch bits (`cortex_m.c` in 0.12.0+dev-g0ce743125). Through them
 it reads set; a tool that leaves it clear needs it set from a debugger session (read DEMCR, `w4 E000EDFC` with bit 24
-added). The script itself never writes.
+added). The script itself never writes. A J-Link Commander close leaves CYCCNT stopped on a running core until the
+next connect; it ran on after an OpenOCD session (V9.78, verified 2026-10-23 stm32f407disco). A cleared TRCENA is the
+suspected mechanism, not observed, since every connect sets it before it can be read. A firmware timestamp taken
+from CYCCNT stands still meanwhile.
 
 The histogram's top entries are the spin site; a flat histogram = core is servicing normally — and an idle loop has a
 hot spot of its own: learn it from a healthy run before reading a wedged one. The sentinel means the target halted or
@@ -147,9 +150,9 @@ polls — bursty logs can drop lines; prefer J-Link where both exist. The drain-
 
 A wedged RTT build holds a log tail in RAM only if a live drain was running (the default mode drops writes once the ring
 fills): the drain model, the headless-proven server and the manual ring read are the **rtt** skill's post-mortem
-section. Otherwise instrument with the RAM ring above. The exemption is a SystemView post-mortem build (the project's
-`sysview` skill says how): its channel is an overwrite ring that holds the most recent events with no drain, which
-answers "what ran right before this hang".
+section. Otherwise instrument with the RAM ring above. The exemption is a SystemView post-mortem build (`sysview.md`,
+"Post-mortem dump"): its channel is an overwrite ring that holds the most recent events with no drain, which answers
+"what ran right before this hang".
 
 ## USB: dual-side capture — the default for enumeration/transfer bugs
 

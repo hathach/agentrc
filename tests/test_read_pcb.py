@@ -255,7 +255,8 @@ class KicadNetlist(Refusals):
     def test_a_part_keeps_its_fields_sheet_and_dnp_without_repeating_the_footprint(self):
         d = self.design()
         self.assertEqual((d.parts['J1'].attributes, d.parts['J1'].sheet), ({'MPN': 'CUSB31'}, '/usb/'))
-        self.assertEqual(d.parts['U1'].dnp, ['(all)'])
+        self.assertEqual(pcb.part_line(d.parts['U1']), 'U1  AP2112  reg:AP2112  [DNP]')
+        self.assertEqual(pcb.part_line(d.parts['J1']), 'J1  USB C  conn:USB_C  lib:USB_C  MPN=CUSB31')
 
     def test_one_pin_on_two_nets_is_refused_naming_both(self):
         with self.refused('U1 pin 4 is on both unconnected-by-choice and /VOUT'):

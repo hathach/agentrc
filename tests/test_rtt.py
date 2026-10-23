@@ -60,10 +60,15 @@ def skip_without_a_shared_console(test):
 # what close() sends a server after its gentle stop: on Windows a console break
 STOP_SIGNAL = 'SIGBREAK' if os.name == 'nt' else 'SIGTERM'
 
+# FAKE_JLINK's greeting, sent at connect as Commander's
+BANNER = b'SEGGER J-Link fake - Real time terminal output\r\nJ-Link FakeProbe V1.0, SN=000\r\nProcess: JLinkExe\r\n'
+
 # Serves -RTTTelnetPort like J-Link Commander: greets, echoes input uppercased, exits on
 # stdin 'exit' (JlinkRtt.close()'s contract). FAKE_JLINK_MODE=die_after_greet sends the
 # greeting then drops the connection and exits — the probe-unplug/crash case;
 # FAKE_JLINK_MODE=tick also streams a line every 50 ms — the continuous-capture case;
+# FAKE_JLINK_MODE=banner_only/split_banner send only the greeting (split_banner over several
+# reads) — a target that never writes, or no control block;
 # FAKE_JLINK_MODE=ignore_exit misses 'exit' and leaves, exit code 0, only on the stop
 # signal (SIGTERM, or the console break on Windows).
 FAKE_JLINK = '''import os, signal, socket, sys, threading, time
@@ -83,9 +88,14 @@ def serve():
     # the real server sends its banner AT CONNECT, before the control block is
     # found — target data only flows later; the CLI's -i gate must not release
     # on the banner
-    conn.sendall(b'SEGGER J-Link fake - Real time terminal output\\r\\n'
-                 b'J-Link FakeProbe V1.0, SN=000\\r\\nProcess: JLinkExe\\r\\n')
-    if mode == 'banner_only':
+    banner = %r
+    if mode == 'split_banner':
+        # cut inside 'Process: ' and between the last line's CR and LF
+        for part in (banner[:30], banner[30:83], banner[83:97], banner[97:]):
+            conn.sendall(part); time.sleep(0.05)
+    else:
+        conn.sendall(banner)
+    if mode in ('banner_only', 'split_banner'):
         while True:
             if not conn.recv(4096): os._exit(0)
     if mode == 'deaf':
@@ -139,7 +149,7 @@ for line in sys.stdin:
     if line.strip() == 'exit' and mode != 'ignore_exit': break
 while mode == 'ignore_exit':
     time.sleep(0.05)   # short naps: Windows runs the handler between them
-'''
+''' % (BANNER,)
 
 LINK = ('--interface', 'swd', '--speed', 'auto')
 BOARD = {'flasher': {'uid': '000', 'args': '-device FAKE'}}
@@ -287,6 +297,7 @@ class JlinkRttFakeProbe(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn(b'hello from target', r.stdout)
         self.assertIn(b'server closed', r.stderr)
+        self.assertNotIn(b'no target output', r.stderr)
 
     def test_peer_reset_latches_eof(self):
         # a killed server closes with RST when bytes are unread; the read side must
@@ -426,6 +437,53 @@ class JlinkRttFakeProbe(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn(b'never forwarded', r.stderr)
         self.assertIn(b'no target output', r.stderr)
+
+    def _capture(self, mode='', *flags):
+        env = dict(os.environ, **self._env, FAKE_JLINK_MODE=mode)
+        return subprocess.run([sys.executable, str(CLI), '--backend', 'jlink', '--probe', '000',
+                               '--device', 'FAKE', *LINK, '--seconds', '1', *flags],
+                              env=env, input=b'', capture_output=True, timeout=20)
+
+    def test_cli_a_capture_with_only_the_banner_says_so(self):
+        # Commander greets whether or not it ever finds the control block: a non-empty
+        # stdout is no evidence the target spoke, so the note is printed without -i too
+        for mode in ('banner_only', 'split_banner'):
+            r = self._capture(mode)
+            self.assertEqual(r.returncode, 0, mode)
+            self.assertEqual(r.stdout, BANNER, mode)       # stdout is the stream as received
+            self.assertIn(b'rtt: no target output within the window', r.stderr, mode)
+
+    def test_cli_a_large_read_after_the_banner_is_target_output(self):
+        # the banner check must still see the Process line when a read fills its 64 KiB window
+        big = b'x' * 65536
+        for chunks in ([BANNER + big], [BANNER, big]):
+            class Console:
+                eof = False
+
+                def __init__(self, *_a, **_k):
+                    self.chunks = list(chunks)
+
+                @property
+                def in_waiting(self):
+                    return len(self.chunks[0]) if self.chunks else 0
+
+                def read(self, _size):
+                    if self.chunks:
+                        return self.chunks.pop(0)
+                    time.sleep(0.01)
+                    return b''
+
+                def close(self):
+                    pass
+
+            out, err = io.BytesIO(), io.StringIO()
+            argv = [str(CLI), '--backend', 'jlink', '--probe', '000', '--device', 'FAKE', *LINK, '--seconds', '0.3']
+            with mock.patch.object(sys, 'argv', argv), mock.patch.object(rtt, 'JlinkRtt', Console), \
+                    mock.patch('signal.signal'), mock.patch.object(sys, 'stdout', mock.Mock(buffer=out)), \
+                    contextlib.redirect_stderr(err):
+                self.assertEqual(rtt.main(), 0, len(chunks))
+            self.assertEqual(out.getvalue(), BANNER + big, len(chunks))
+            self.assertNotIn('no target output', err.getvalue(), len(chunks))
 
     def test_cli_downstream_pipe_close(self):
         # a real `rtt.py | head`-style consumer: close the read end mid-stream
@@ -747,6 +805,7 @@ class DumpRing(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(self.out.read_bytes(), b'R' * 0x400)
         self.assertIn('ring: 1024 B at 0x20001000, WrOff=0x10 RdOff=0x0', r.stderr)
+        self.assertNotIn('no target output', r.stderr)   # a dump is not a capture window
 
     def test_an_existing_file_is_never_overwritten(self):
         self.out.write_text('an earlier dump')
@@ -811,7 +870,8 @@ class StripBanner(unittest.TestCase):
 
 # Serves like `openocd ... -c "rtt server start PORT CH"`: parses the port from its
 # single shell-quoted command line, greets, echoes uppercased. No banner (matches the
-# real openocd rtt server, which sends target data only). FAKE_OPENOCD_MODE=linger keeps
+# real openocd rtt server, which sends target data only); FAKE_OPENOCD_MODE=silent skips the
+# greeting, as a found block the firmware never writes does. FAKE_OPENOCD_MODE=linger keeps
 # it up after the client leaves, as the real server does, until the stop signal
 # (SIGTERM, or the console break on Windows) ends it with exit code 0.
 FAKE_OPENOCD = '''import os, re, signal, socket, sys, threading, time
@@ -823,7 +883,8 @@ port = int(re.search(r'rtt server start (\\d+)', ' '.join(sys.argv)).group(1))
 srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 srv.bind(('127.0.0.1', port)); srv.listen(1)
 conn, _ = srv.accept()
-conn.sendall(b'hello from target\\r\\n')
+if os.environ.get('FAKE_OPENOCD_MODE') != 'silent':
+    conn.sendall(b'hello from target\\r\\n')
 while True:
     d = conn.recv(4096)
     if not d: break
@@ -895,6 +956,16 @@ class OpenocdRttFakeProbe(unittest.TestCase):
         self.assertIsNotNone(proc.poll())      # no zombie, no probe held
         with self.assertRaises(RuntimeError):
             con.write(b'x')                    # same post-close contract as JlinkRtt
+
+    def test_cli_openocd_capture_notes_a_silent_target_only(self):
+        for mode, said in (('silent', b''), ('', b'hello from target\r\n')):
+            r = subprocess.run([sys.executable, str(CLI), '--backend', 'openocd', '--probe', '000',
+                                '--cfg', '-f fake.cfg', '--addr', '20000000', '--seconds', '1'],
+                               env=dict(os.environ, RTT_OPENOCD_EXE=str(self._exe), FAKE_OPENOCD_MODE=mode),
+                               input=b'', capture_output=True, timeout=20)
+            self.assertEqual(r.returncode, 0, (mode, r.stderr))
+            self.assertEqual(r.stdout, said, mode)
+            self.assertEqual(b'no target output' in r.stderr, mode == 'silent', (mode, r.stderr))
 
     def test_close_signals_a_server_that_outlives_its_client_before_killing_it(self):
         skip_without_a_shared_console(self)

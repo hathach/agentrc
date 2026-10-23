@@ -3,8 +3,9 @@
 
     run_cost.py (--session-id ID | --journal PATH) [--full FILE]
 
---session-id finds ~/.claude/projects/*/ID.jsonl; --journal is any Workflow journal of
-the session (<session>/subagents/workflows/<run>/journal.jsonl), which an interactive
+--session-id finds $CLAUDE_CONFIG_DIR/projects/*/ID.jsonl (~/.claude when unset or
+empty); --journal is any Workflow journal of the session
+(<session>/subagents/workflows/<run>/journal.jsonl), which an interactive
 chief already holds. Prints a Markdown table: one row per stage and model of each
 Workflow run in start order, then chief's own turns and the agents it ran itself, then
 the total. A stage is an agent's label up to its first `#`, or up to `:` before a path
@@ -14,11 +15,11 @@ sums their first-to-last records, idle time included; it is `-` when one of them
 used another model, since that time cannot be split between the two.
 
 The total is claude's own: the session's last cost-state record. Each model's cost
-there is allocated over its rows by RATES, so a row's dollars are a share of claude's
-figure (generic weights for a model with no rate). A model the record lists and no
-transcript shows keeps its cost on an `unallocated` row; a model it does not list has
-`-`. With no record at all, every row is priced at RATES (`-` for a model with no
-rate). A note under the table says the figures cover the whole session, and when there
+there is allocated over its rows by RATES, each request at its prompt's rate card, so
+a row's dollars are a share of claude's figure (generic weights for a model with no
+rate). A model the record lists and no transcript shows keeps its cost on an
+`unallocated` row; a model it does not list has `-`. With no record at all, every row
+is priced at RATES (`-` for a model with no rate). A note under the table says the figures cover the whole session, and when there
 was no record.
 
 Two breakout tables follow, each summing the rows above with its share of the total:
@@ -49,18 +50,27 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-PROJECTS = Path.home() / '.claude' / 'projects'
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from shadows import user_scope  # noqa: E402
+
 PARTS = ('in', 'out', 'read', 'w5m', 'w1h')
 # $ per million tokens for PARTS, by model id prefix; each fits claude's cost-state
-# records exactly (2026-09). GENERIC is only a weighting, for a model not listed.
-RATES = {'claude-opus-5-5': (4, 20, 0.2, 5, 8), 'claude-sonnet-5': (2, 10, 0.2, 2.5, 4),
+# records exactly (2026-10). GENERIC is only a weighting, for a model not listed.
+RATES = {'claude-opus-5-5': (4, 20, 0.2, 5, 8), 'claude-sonnet-5-5': (2, 10, 0.2, 2.5, 4),
+         'claude-sonnet-5': (2, 10, 0.2, 2.5, 4), 'claude-haiku-5-5': (0.1, 0.5, 0.01, 0.125, 0.2),
          'claude-haiku-4-5': (1, 5, 0.1, 1.25, 2)}
+# a request whose prompt (cached tokens included) exceeds the tokens is billed at the second card
+LONG = {'claude-haiku-5-5': (100_000, (0.5, 2.5, 0.05, 0.625, 1))}
 GENERIC = (1, 5, 0.1, 1.25, 2)
 
 
-def rate_of(model):
-    """The rate of a listed model id, bare or with a suffix: `-<date>` or `[1m]`."""
-    return next((v for k, v in RATES.items() if model == k or model.startswith((k + '-', k + '['))), None)
+def rate_of(model, prompt=0):
+    """The rate of a listed model id, bare or with a suffix: `-<date>` or `[1m]`, for a request of prompt tokens;
+    the longest id wins, so claude-sonnet-5-5 is not claude-sonnet-5 with a suffix."""
+    key = next((k for k in sorted(RATES, key=len, reverse=True) if model == k or model.startswith((k + '-', k + '['))), None)
+    if key is None:
+        return None
+    return LONG[key][1] if key in LONG and prompt > LONG[key][0] else RATES[key]
 
 
 def priced_at(rate, tokens):
@@ -73,9 +83,10 @@ class Failed(Exception):
 
 def session_dir(session_id=None, journal=None):
     if session_id:
-        found = sorted(PROJECTS.glob(f'*/{session_id}.jsonl'))
+        projects = user_scope() / 'projects'
+        found = sorted(projects.glob(f'*/{session_id}.jsonl'))
         if len(found) != 1:
-            raise Failed(f'{len(found)} transcripts named {session_id}.jsonl under {PROJECTS}')
+            raise Failed(f'{len(found)} transcripts named {session_id}.jsonl under {projects}')
         return found[0].with_suffix('')
     path = Path(journal).resolve()
     if path.name != 'journal.jsonl' or len(path.parents) < 4 or path.parents[1].name != 'workflows' \
@@ -96,7 +107,8 @@ def records(path):
 
 @functools.lru_cache(maxsize=None)
 def usage_of(path):
-    """{model: {turns, peak, tokens: Counter of PARTS}}, first and last timestamp, of one transcript."""
+    """{model: {turns, peak, tokens: Counter of PARTS, list: $ at RATES, GENERIC's for a model with no rate}}, first
+    and last timestamp, of one transcript."""
     last, t0, t1 = {}, None, None
     for e in records(path):
         ts = e.get('timestamp')
@@ -111,10 +123,12 @@ def usage_of(path):
         part = {'in': u.get('input_tokens', 0), 'out': u.get('output_tokens', 0), 'read': u.get('cache_read_input_tokens', 0),
                 'w1h': split.get('ephemeral_1h_input_tokens', 0)}
         part['w5m'] = u.get('cache_creation_input_tokens', 0) - part['w1h']
-        m = by_model.setdefault(model, {'turns': 0, 'peak': 0, 'tokens': Counter()})
+        m = by_model.setdefault(model, {'turns': 0, 'peak': 0, 'tokens': Counter(), 'list': 0.0})
+        prompt = part['in'] + part['read'] + part['w5m'] + part['w1h']
         m['turns'] += 1
-        m['peak'] = max(m['peak'], part['in'] + part['read'] + part['w5m'] + part['w1h'])
+        m['peak'] = max(m['peak'], prompt)
         m['tokens'].update(part)
+        m['list'] += priced_at(rate_of(model, prompt) or GENERIC, part)
     return by_model, t0, t1
 
 
@@ -152,7 +166,7 @@ def transcript_of(meta_path):
 
 def row(group, stage, model, **given):
     return {'group': group, 'stage': stage, 'model': model, 'paths': set(), 'turns': 0, 'peak': 0,
-            'tokens': Counter(), 'secs': 0.0, 'cost': None, **given}
+            'tokens': Counter(), 'list': 0.0, 'secs': 0.0, 'cost': None, **given}
 
 
 def rows_for(group, agents):
@@ -167,7 +181,8 @@ def rows_for(group, agents):
             r['turns'] += m['turns']
             r['peak'] = max(r['peak'], m['peak'])
             r['tokens'].update(m['tokens'])
-    return sorted(acc.values(), key=lambda r: -priced_at(rate_of(r['model']) or GENERIC, r['tokens']))
+            r['list'] += m['list']
+    return sorted(acc.values(), key=lambda r: -r['list'])
 
 
 def runs_of(session):
@@ -194,24 +209,21 @@ def priced(rows, state):
     """Sets each row's share of its model's recorded cost, or None."""
     if state is None:
         for r in rows:
-            rate = rate_of(r['model'])
-            if rate:
-                r['cost'] = priced_at(rate, r['tokens'])
+            if rate_of(r['model']):
+                r['cost'] = r['list']
         return rows
-    tokens = defaultdict(Counter)
+    totals = defaultdict(float)
     for r in rows:
-        tokens[r['model']].update(r['tokens'])
-    for model, total in tokens.items():
-        rate = rate_of(model)
+        totals[r['model']] += r['list']
+    for model, total in totals.items():
         cost = state.get(model)
         if cost is None:
             continue
-        weight = lambda t: priced_at(rate or GENERIC, t)
         for r in (r for r in rows if r['model'] == model):
-            r['cost'] = cost * weight(r['tokens']) / weight(total) if weight(total) else None
+            r['cost'] = cost * r['list'] / total if total else None
     # a model claude billed that no transcript on disk shows: its cost stays in the total, unallocated
     for model, cost in state.items():
-        if cost is not None and model not in tokens:
+        if cost is not None and model not in totals:
             rows.append(row('-', 'unallocated: no transcript', model, cost=cost))
     return rows
 

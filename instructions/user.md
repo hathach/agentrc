@@ -61,17 +61,10 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   (`/` as `-`), never inside it; the `<checkout>--` prefix is reserved for them.
   A dependency checked out as a worktree of another repository is a sibling
   too, `<checkout>--dep-<name>`, symlinked into the checkout, never nested.
-  Removing the checkout in herdr removes its clean siblings with it (the
-  agentrc `worktree-children` plugin, `install.py install --herdr-plugin`):
-  ignored files go, siblings holding work are kept and reported, and the
-  removed checkouts' branches are deleted when their commits are pushed or a
-  PR head, never-pushed ones kept. `cowork --worktree` lanes and `pr-review`'s
-  trees are siblings too; a cowork lane's stays locked, so kept, while a
-  request is outstanding, and a pr-review tree while its review runs.
-  Worktrees nested inside the checkout, made outside herdr or before it
-  placed them as siblings, go with it whatever they hold.
-  The `worktree-remove` skill checks for pending follow-ups before it asks
-  herdr to remove.
+  Remove a checkout with the `worktree-remove` skill; its clean siblings and
+  their pushed or PR-head branches go with it (agentrc's `worktree-children`
+  plugin, whose docstring has the rules). The skill refuses a checkout holding
+  nested worktrees, which herdr's own menu would delete whatever they hold.
 
 # Coding style
 - Comment only when the code cannot say it itself: a non-obvious *why*, a
@@ -213,6 +206,11 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   my yes to that offer, is the grant unless I narrow it: launch without a
   further question, following `~/code/agentrc/README.md`'s headless PR
   publishing recipe.
+- Merging stays off. My own words asking to merge a named PR ("make a PR for
+  issue 123 and chief, and merge when ready") grant chief one squash merge
+  of it once ready per `agents/chief.md`'s merge exception, with everything
+  the babysit grant covers. Opening a PR, asking for babysitting, `autoPush`
+  or a yes to an offer that did not name merging grants none.
 - "Launch chief", headless, always means the `headless-chief` skill, never a
   bare `claude -p --agent chief`, even where a repo recipe names one.
 - Standing grant: on a PR I asked `pr-review` to review, its `post.py` may

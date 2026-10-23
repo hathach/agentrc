@@ -126,6 +126,8 @@ def repeat_command(record):
         command = ["python3", os.path.join(directory, "search.py")]
         if query["any"]:
             command.append("--any")
+        if query.get("path"):   # records from before it was logged have no "path"
+            command.append("--path")
         if query["kind"] is not None:
             command.extend(("--kind", query["kind"]))
         command.extend(("--limit", str(query["limit"]), "--", *query["keywords"]))

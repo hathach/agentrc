@@ -23,7 +23,8 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 
-LIBRARY = Path(os.environ.get("CALIBRE_LIBRARY") or "~/Documents/calibre-library").expanduser()
+DEFAULT_LIBRARY = Path("~/Documents/calibre-library").expanduser()
+LIBRARY = Path(os.environ.get("CALIBRE_LIBRARY") or DEFAULT_LIBRARY).expanduser()
 UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/139.0.0.0 Safari/537.36")
 
@@ -401,16 +402,16 @@ class Library:
     """calibredb wrapper.
 
     The GUI takes an exclusive write lock, so imports need it closed unless
-    content-server credentials are configured (see _server_creds), in which case
-    writes go through the running GUI's server instead.
+    content-server credentials are configured for this library (see _server_creds),
+    in which case writes go through the running GUI's server instead.
     """
 
     def __init__(self, path: Path = LIBRARY):
         self.path = path
-        self.server = self._server_creds()
+        self.server = self._server_creds(path)
 
     @staticmethod
-    def _server_creds():
+    def _server_creds(path: Path):
         """Optional write-through-the-GUI credentials, read from the gitignored
         `secret.yml` beside SKILL.md (or `$DOWNLOAD_DOC_SECRET`) so they are never
         typed into a command by hand:
@@ -419,6 +420,12 @@ class Library:
               server_url: http://localhost:8080
               username: <name>
               password: <secret>
+              library: ~/Documents/calibre-library
+
+        `library` is the library the server serves, unquoted, defaulting to
+        DEFAULT_LIBRARY; for any other `path` this returns None. The GUI's lock refuses
+        calibredb on every library, so without that check a run aimed at a scratch
+        library would read and write the served one.
 
         Calibre's content server accepts reads unauthenticated but answers writes with
         "Forbidden" until a user exists (Preferences -> Sharing over the net -> Require
@@ -437,8 +444,11 @@ class Library:
         blk = re.search(r"^calibre:\s*$(.*?)(?=^\S|\Z)", f.read_text(encoding="utf-8"), re.M | re.S)
         if not blk:
             return None
-        g = dict(re.findall(r"^\s+(\w+):\s*(\S+)\s*$", blk.group(1), re.M))
+        g = dict(re.findall(r"^\s+(\w+):[ \t]*(\S.*?)[ \t]*$", blk.group(1), re.M))
         if not (g.get("username") and g.get("password")):
+            return None
+        served = Path(g.get("library") or DEFAULT_LIBRARY).expanduser()
+        if served.resolve() != Path(path).expanduser().resolve():
             return None
         return (g.get("server_url", "http://localhost:8080"), g["username"], g["password"])
 
@@ -447,7 +457,7 @@ class Library:
     # It is transient and clears on retry, so a single sample must not sink a whole run.
     _LOCK_MSG = "another calibre program"
 
-    def _run(self, *args, check=True, tries=4) -> str:
+    def _run(self, *args, tries=4) -> str:
         for attempt in range(tries):
             p = subprocess.run(["calibredb", "--with-library", str(self.path), *args],
                                capture_output=True, text=True)
@@ -494,17 +504,15 @@ class Library:
                     raise RuntimeError(
                         "the Calibre GUI is open and holds the library's write lock. "
                         "Close it, or define a content-server user and put the credentials "
-                        "in secret.yml under `calibre:` (see Library._server_creds).")
+                        "and this library's path in secret.yml under `calibre:` "
+                        "(see Library._server_creds).")
                 if attempt < tries - 1:
                     print(f"  calibredb reported a lock (attempt {attempt + 1}/{tries}); "
                           f"retrying — a sync is probably touching the library",
                           file=sys.stderr)
                     time.sleep(2 + 2 * attempt)
                     continue
-            if check:
-                raise RuntimeError(err)
-            return p.stdout
-        return ""
+            raise RuntimeError(err)
 
     @staticmethod
     def _cmdlines():
@@ -622,7 +630,7 @@ class Library:
         """{normalized title: {id, title}} for this vendor's books that carry no
         identifier — i.e. everything filed by hand before the skill existed."""
         books = json.loads(self._run("list", "--for-machine", "-f", "id,title,identifiers",
-                                     "--search", f'authors:"{author}"', check=False) or "[]")
+                                     "--search", f'authors:"{author}"') or "[]")
         return {norm_title(b["title"]): {"id": b["id"], "title": b["title"]}
                 for b in books if not (b.get("identifiers") or {})}
 
@@ -640,12 +648,20 @@ class Library:
         else:
             self.last_add_status = "added"
         if book_id:   # `add` has no comments flag, so set it in a second call
-            self._run("set_metadata", "--field", f"comments:{doc.comments()}",
-                      "--field", f"publisher:{doc.author}", str(book_id), check=False)
+            try:
+                self._run("set_metadata", "--field", f"comments:{doc.comments()}",
+                          "--field", f"publisher:{doc.author}", str(book_id))
+            except RuntimeError as e:
+                # A letter or date revision lives only in comments: without it the next
+                # sync cannot read the book's revision and replaces it again.
+                print(f"  note: book #{book_id} filed without comments/revision: {e}",
+                      file=sys.stderr)
+                self.last_add_status = "added-no-metadata"
         return book_id
 
     def remove(self, book_id: int) -> None:
-        """calibredb remove is immediate, with no undo and no copy kept."""
+        """calibredb remove moves the book to the library's Recycle Bin, where Calibre
+        keeps it 14 days by default; restore it from there."""
         try:
             self._run("remove", str(book_id))
         except RuntimeError as e:
@@ -659,12 +675,16 @@ class RemoveError(RuntimeError):
 # ---------------------------------------------------------------- planning
 
 def page1_text(path: Path, pages: int = 2) -> str:
+    """The first pages' text, or "" when there is none to read: no pdftotext, a failed
+    extraction, or a document without a text layer."""
     if not shutil.which("pdftotext"):
         return ""
     # -enc UTF-8: Git for Windows' xpdf pdftotext writes Latin-1 by default.
     p = subprocess.run(["pdftotext", "-enc", "UTF-8", "-f", "1", "-l", str(pages), str(path), "-"],
                        capture_output=True, encoding="utf-8", errors="replace")
-    return re.sub(r"\s+", " ", p.stdout or "")
+    if p.returncode != 0:
+        return ""
+    return re.sub(r"\s+", " ", p.stdout or "").strip()
 
 
 def verify_identity(pdf: Path, doc: "Doc") -> tuple:
@@ -733,8 +753,8 @@ def cap_families(fams: list, limit: int = 6, wide: str = "wide") -> list:
     return fams if len(fams) <= limit else [wide]
 
 
-def reconcile(docs: list, buckets: dict, extra: dict | None = None) -> list:
-    """Per-type arithmetic: catalogue == imported + current + legacy + failed.
+def reconcile(docs: list, buckets: dict) -> list:
+    """Per-type arithmetic: catalogue == the sum of `buckets`.
 
     This is the check that catches a silent drop, which is the failure mode that has
     actually bitten this skill twice. A mismatch means documents evaporated between
@@ -752,7 +772,7 @@ def reconcile(docs: list, buckets: dict, extra: dict | None = None) -> list:
     for kind, c in sorted(per_type.items()):
         total = c["catalogue"]
         parts = {k: v for k, v in c.items() if k != "catalogue"}
-        accounted = sum(parts.values()) + (extra or {}).get(kind, 0)
+        accounted = sum(parts.values())
         flag = "" if accounted == total else f"  <-- MISMATCH, {total - accounted} unaccounted"
         detail = " + ".join(f"{v} {k}" for k, v in sorted(parts.items())) or "0"
         lines.append(f"  {kind:<20} catalogue {total:>4} = {detail}{flag}")
@@ -838,30 +858,36 @@ class UsbIndex:
         step = len(cands) / n
         return [cands[int(i * step)] for i in range(n)]
 
-    def resolve(self, vendor: str, family: str, cands: list, tmp: Path,
+    def resolve(self, vendor: str, family: str, cands: list, tmp: Path, complete: bool,
                 budget: int = 6) -> bool | None:
         """Settle one family. Stops at the first positive; a negative is only recorded
-        after the budget is spent *and* a reference manual has been consulted, because
-        a datasheet proves USB present, never absent."""
-        seen_rm, read = False, 0
+        after the budget is spent *and* a reference manual has been read, because a
+        datasheet proves USB present, never absent. `complete`: cands is the family's
+        whole default scope, not a narrowed run's subset."""
+        seen_rm, read, unread = False, 0, False
         for cand in self.spread(cands, budget):
-            v = self.peek(cand, tmp, record=False)
+            v = self.peek(cand, tmp)
             # Count documents actually READ. A gated or dead link teaches nothing, and
             # counting attempts let families be excluded on one readable datasheet while
             # the rest were behind a login — absence of evidence wearing the costume of
             # evidence of absence.
             read += v is not None
-            seen_rm = seen_rm or cand.doc_type == "reference-manual"
+            unread = unread or v is None
+            seen_rm = seen_rm or (v is not None and cand.doc_type == "reference-manual")
             if v:
                 self.set(vendor, family, True, f"pdf:{cand.doc_id}", self.last_evidence)
                 return True
         if not seen_rm:
             rm = next((c for c in cands if c.doc_type == "reference-manual"), None)
-            if rm is not None and self.peek(rm, tmp, record=False):
+            v = self.peek(rm, tmp) if rm is not None else None
+            if v:
                 self.set(vendor, family, True, f"pdf:{rm.doc_id}", self.last_evidence)
                 return True
-            seen_rm = rm is not None
-        if not cands:
+            unread = unread or (rm is not None and v is None)
+            seen_rm = v is not None
+        # A narrowed run's subset or a failed read settles nothing, not even "kept": a
+        # recorded verdict is never revisited, so record none and let a later run try.
+        if not cands or not complete or unread:
             return None
         # Refuse to record a negative on thin evidence. A "no" drops every document for
         # the family, so it needs either a reference manual (which covers the whole
@@ -884,18 +910,18 @@ class UsbIndex:
                  "no USB peripheral found")
         return False
 
-    def peek(self, doc: "Doc", tmp: Path, record: bool = True) -> bool | None:
+    def peek(self, doc: "Doc", tmp: Path) -> bool | None:
         """Settle a family by reading one of its documents. Returns the verdict."""
         pdf = tmp / f"peek-{doc.doc_id}.pdf"
         got = pdf if pdf.exists() and pdf.stat().st_size > 1024 else download(doc.url, pdf)
         if got is None:
             return None
-        text = USB_DECOYS.sub("", page1_text(got, pages=60))
+        text = page1_text(got, pages=60)
+        if not text:    # nothing read is no evidence, least of all of absence
+            return None
+        text = USB_DECOYS.sub("", text)
         m = USB_EVIDENCE.search(text)
         self.last_evidence = m.group(0) if m else "no USB peripheral found"
-        if record:
-            for fam in doc.family or []:
-                self.set(doc.vendor, fam, bool(m), f"pdf:{doc.doc_id}", self.last_evidence)
         return bool(m)
 
 

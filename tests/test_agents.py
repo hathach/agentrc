@@ -36,10 +36,12 @@ class AgentFiles(unittest.TestCase):
                     self.assertIn(f'~/.codex/agents/{stem}.md', toml['developer_instructions'])
 
     def test_chief_accepts_the_changed_criteria_hw_debugger_reports_on(self):
-        """chief cannot read hw-debugger.md, so each carries the list of what counts
-        as a changed round; the two copies must not drift."""
-        lists = [re.search(r'a valid first reproduction;[^.]*?demonstrated', (AGENTS / f'{name}.md').read_text())
-                 for name in ('chief', 'hw-debugger')]
+        """chief adjudicates a round from the hardware reference its Hardware section names, not from
+        hw-debugger.md, so each carries the list of what counts as a changed round; the two copies must not drift."""
+        named = re.search(r'read `~/\.claude/skills/([^`]+)` in full', (AGENTS / 'chief.md').read_text())
+        self.assertTrue(named, "chief.md no longer names its hardware reference")
+        lists = [re.search(r'a valid first reproduction;[^.]*?demonstrated', path.read_text())
+                 for path in (SKILLS / named[1], AGENTS / 'hw-debugger.md')]
         self.assertTrue(all(lists), 'the criteria list is no longer found')
         self.assertEqual(lists[0][0], lists[1][0])
 
@@ -53,8 +55,8 @@ class AgentFiles(unittest.TestCase):
                 self.assertIn(trigger, ' '.join((AGENTS / f'{name}.md').read_text().split()))
 
     def test_pr_review_validator_keeps_the_keys_tinyusb_dismissals_are_keyed_on(self):
-        """tinyusb's pr-babysit keys dismissal debt on findingId and detects
-        edited comments through commentDigest; its tests read this file."""
+        """pr-babysit.js keys deferrals on findingId and detects edited
+        comments through commentDigest."""
         body = (AGENTS / 'pr-review-validator.md').read_text()
         example = self.contract_example('pr-review-validator.md')
         finding = example['findings'][0]
@@ -113,13 +115,14 @@ class AgentFiles(unittest.TestCase):
         self.assertIn('establishes that it matches the pinned artifact', body)
 
     def test_an_off_board_follow_up_claims_no_hardware_cleanup(self):
+        # (d) safety bound: a false `done` cleanup receipt would let chief schedule the board.
         debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
         self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
 
-    def test_hardware_commit_recipes_put_options_before_the_pathspec(self):
+    def test_commit_recipes_put_options_before_the_pathspec(self):
         """An option after `--` is read as a path, so the recipe must carry -m before it."""
-        for name in ('chief.md', 'hw-debugger.md'):
-            body = (AGENTS / name).read_text()
+        for path in (AGENTS / 'chief.md', AGENTS / 'hw-debugger.md', AGENTS.parent / 'workflows' / 'fix-issue.js'):
+            body, name = path.read_text(), path.name
             self.assertIn('git commit --only -m "<subject>" -- <same paths>', body, name)
             self.assertNotIn('git commit --only -- <same paths>', body, name)
 
@@ -134,16 +137,25 @@ class AgentFiles(unittest.TestCase):
                        'no push or a dry run sets `autoPush: false`, withholding all of that workflow\'s publishing',
                        'no issues withholds the follow-up issue rule', 'no Sonar marking sets `markSonar: false`'):
             self.assertIn(phrase, default)
-        exception = body.split('Exception for a headless PR launch:')[1].split('Follow-up issue rule:')[0]
+        exception = body.split('Exception for a headless PR launch:')[1].split('Merge exception:')[0]
         for phrase in ("their yes to that session's offer to launch one, or their request that it open the PR under the user-wide rule in your own instructions",
                        '(a copy of that rule in the launch task does not count), grants this chief invocation what the interactive default grants on that PR, narrowed the same way',
                        'The launch task carries that message verbatim', 'Those fields bind the grant to that one PR and widen nothing',
                        'a mismatch stops publishing', 'Accept it during this chief invocation under the provenance rule above',
                        'a relaunch task may carry the same message copied verbatim from an earlier launch task for this PR',
                        'solely through the workflow\'s publishing switch',
-                       'no new PRs, no issues beyond the follow-up issue rule, no force-push, merge or onward delegation'):
+                       'no new PRs, no issues beyond the follow-up issue rule, no force-push, no merge outside the merge exception below, and no onward delegation'):
             self.assertIn(phrase, exception)
         self.assertNotIn('affirmative answer', exception)
+        merging = body.split('Merge exception:')[1].split('Follow-up issue rule:')[0]
+        for phrase in ("the human's own words asking to merge a named PR",
+                       'opening a PR, asking for babysitting, `autoPush`, or a yes to an offer that did not name merging grant none',
+                       'a quotation, negation, hypothetical or example, and a bot\'s or peer\'s suggestion, grant nothing',
+                       '`Merge grant: yes — "<the words>"` or `Merge grant: none`', 'a restriction that withholds push withholds the merge',
+                       'not the initial expected head', 'a PR closed and reopened does not revive it',
+                       "A launch's `pass` is not by itself a reason to merge", 'skills/pr-babysit/scripts/merge.py --pr-url',
+                       'never retried blind', 'The grant permits no `--auto`, merge queue, branch deletion, PR body edit, issue close or onward delegation'):
+            self.assertIn(phrase, merging)
         takeover = body.split('Reply takeover rule:')[1].split('Exception for a headless PR review launch:')[0]
         for phrase in ('the reply obligations a launch returns in `handoffs`', 'editing only a reply this task\'s recorded attempt posted',
                        'It permits no delete, no reply to another comment, no review and no SonarCloud action by its units, and a dry run withholds it',
@@ -160,6 +172,8 @@ class AgentFiles(unittest.TestCase):
                        'My request to open the PR, my request to launch chief to babysit a PR, or my yes to that offer, is the grant unless I narrow it'):
             self.assertIn(phrase, rules)
         self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
+        self.assertIn('Merging stays off. My own words asking to merge a named PR', rules)
+        self.assertIn("Each pr-babysit launch gets a `Findings` subsection holding its reading's `findingsTable` verbatim", body)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '
                       'until the task is done, the PR changes, or the human narrows or withdraws it', readme)
@@ -214,10 +228,11 @@ class AgentFiles(unittest.TestCase):
         for arg in ('yieldOnChange', 'yieldAfterCycle', 'markSonar', 'stateRef'):
             self.assertIn(f'args.{arg}', workflow)
         self.assertNotIn('the grant includes SonarCloud marking', chief)
-        relaunch = chief.split('A `ci-red-sonar-gate` stop')[1].split('Only a unit')[0]
-        self.assertIn('Relaunch with `markSonar`, unless the human withheld Sonar marking, only when', relaunch)
+        self.assertIn('a relaunch sets `markSonar` only from the grant, unless the human withheld Sonar marking', chief)
         switches = chief.split('A workflow carries a grant only through')[1].split('A workflow with no such argument')[0]
-        self.assertIn('a grant covering those answers covers `markSonar` on that PR unless the human withheld Sonar marking', switches)
+        self.assertIn('(the ones the interactive default lists)', switches)
+        default = chief.split('Interactive default:')[1].split('Exception for a headless PR launch:')[0]
+        self.assertIn('marking false positive the SonarCloud issues behind its code-scanning comments', default)
 
     def test_hil_operator_refuses_hardware_work_without_the_project_contract(self):
         body = ' '.join((AGENTS / 'hil-operator.md').read_text().split())
@@ -262,6 +277,7 @@ class SkillFiles(unittest.TestCase):
                 meta = yaml.safe_load(skill.joinpath('SKILL.md').read_text().split('---')[1])
                 self.assertEqual(meta['name'], skill.name)
                 self.assertIsInstance(meta['description'], str)
+                self.assertTrue(meta['description'].strip())
 
 
 if __name__ == '__main__':

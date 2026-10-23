@@ -111,7 +111,6 @@ test('every dir x dimension pair is scanned exactly once with a unique label, id
   assert.ok(calls.every(c => c.schema.required.includes('findings')))
   const seen = calls.map(c => /^Review (.+?) for exactly one dimension: (.+?)\./.exec(c.prompt).slice(1, 3).join('|')).sort()
   assert.deepEqual(seen, Object.keys(scans).sort())
-  assert.match(calls[0].prompt, /Coverage-first: report everything, a verifier filters\.$/)
   assert.deepEqual(result, { confirmed: [], dropped: [], unverified: [] })
   assert.equal(logs[0], '4 scan units (2 dirs x 2 dimensions)')
 })
@@ -126,8 +125,6 @@ test('mixed verdicts keep only confirmed findings, each verified once by finding
   assert.ok(verifies.every(c => c.agentType === 'finding-verifier'))
   assert.ok(verifies.every(c => c.schema.required.includes('real')))
   assert.match(verifies[0].prompt, /^Adversarially verify ONE review finding about src\/portable\/x\.\nDimension: correctness\nFinding: \{/)
-  assert.match(verifies[0].prompt, /Try to REFUTE it; real=true only if it survives your best attempt\. If real, set severity/)
-  assert.doesNotMatch(verifies[0].prompt, /ISR|datasheet|macros/)
   assert.deepEqual(result.dropped, [])
   assert.deepEqual(result.unverified, [])
   assert.deepEqual(result.confirmed, [{

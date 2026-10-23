@@ -35,7 +35,7 @@ def output(**over):
         'rollup': {'cycles': [2], 'findings': {'total': 1, 'fixed': 1}, 'ci': {'total': 2}, 'reran': 0, 'pushed': [NEXT[:8]], 'replies': 1},
         'pending': [{'bot': 'greptile', 'state': 'absent', 'reason': 'no check run'}],
         'observation': {'reviewedHead': HEAD, 'lane': 'both',
-                        'reviews': {'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
+                        'reviews': {'fingerprint': f'coderabbit|coderabbit|{"f" * 32}', 'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
                                     'findings': [{'findingId': '7#1', 'commentId': 7, 'commentDigest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid',
                                                   'file': 'a.c', 'line': 3}]},
                         'ci': {'status': 'red', 'headSha': HEAD, 'infraRerun': [],
@@ -89,6 +89,8 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['stateRef'], {'outputFile': (self.dir / 'w.output').resolve().as_posix(), 'digest': '0123abcd'},
                          'with slashes: the workflow puts it in a shell command')
         self.assertEqual(s['blockers'], [], 'a push past the reviewed head is not a disagreement')
+        self.assertEqual((s['observation']['fingerprint'], s['observation']['bots'][0]['sha']), (f'coderabbit|coderabbit|{"f" * 32}', HEAD),
+                         'the review evidence a merge compares, and the full SHA a bot reviewed')
         self.assertEqual(s['observation']['findings'], [{'id': '7#1', 'digest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid', 'at': 'a.c:3'}])
         ci = s['observation']['ci']
         self.assertEqual(ci['verdicts'], {'rig-side': 1, 'real': 1})
@@ -110,6 +112,34 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['notes'], [])
         self.assertEqual(s['logs'][-1], '(1 "not fixing" CI failure lines, one per failure listed under ci)')
         self.assertTrue(s['logs'][1].endswith('whole line in the output\'s logs)'))
+
+    def test_the_findings_table_quotes_every_row_with_its_outcome(self):
+        sha = 'c' * 40
+        rows = [
+            {'lane': 'review', 'source': 'greptile', 'at': 'a.c:3', 'claim': 'pipe | back\\slash\nnewline ' + 'x' * 200, 'verdict': 'valid', 'state': 'valid',
+             'repair': {'outcome': 'pushed', 'sha': sha}, 'outcome': 'fixed + pushed, since already fixed', 'reply': {'how': 'fixNotePosts', 'replyId': 9, 'settled': True}},
+            {'lane': 'review', 'source': 'coderabbit', 'at': 'b.c:1', 'claim': 'old body', 'verdict': 'invalid', 'state': 'refuted', 'repair': None,
+             'outcome': 'comment edited since; refuted', 'reply': {'how': 'refutedPosts', 'replyId': None, 'settled': False, 'error': 'offered, no receipt shows it posted'}},
+            {'lane': 'ci', 'source': 'ci:build', 'cell': 'f072 cdc', 'firstError': 'boom', 'verdict': 'real', 'state': 'greptileGate', 'repair': None,
+             'outcome': 'left red: a Greptile confidence gate, not a CI-lane fix'},
+        ]
+        table = launch_result.findings_table({'rows': rows, 'observed': {'reviews': True, 'ci': True}}).split('\n')
+        self.assertEqual(table[0], 'reviews: 2 row(s); CI: 1 row(s)')
+        self.assertEqual(len(table), 3 + 1 + len(rows))
+        first = ' '.join(table[4].split())
+        self.assertIn('pipe \\| back\\\\slash newline', first, 'escaped, on one line')
+        self.assertIn('…', first, 'a long claim is cut')
+        self.assertIn(f'fixed + pushed, since already fixed | {sha} | fix note 9 settled', first, 'the workflow\'s outcome text and the full SHA')
+        self.assertIn('refutation not settled: offered, no receipt shows it posted', table[5])
+        self.assertIn('| f072 cdc |', table[6])
+        for row in table[2:]:
+            self.assertEqual(row.count(' | '), 6, row)
+        self.assertEqual(launch_result.md_cell(None), '-')
+        self.assertEqual(launch_result.md_cell('y' * 200, 10), 'y' * 10 + '…')
+        self.assertEqual(launch_result.findings_table({'rows': [], 'observed': {'reviews': True, 'ci': False}}), 'reviews: no findings reported; CI not observed')
+        self.assertEqual(launch_result.findings_table({'cycles': [1]}), 'findings unavailable (older output)')
+        rc, s = self.run_it(output())
+        self.assertEqual(s['findingsTable'], 'findings unavailable (older output)', 'the fixture predates rows')
 
     def test_a_failure_is_settled_by_the_state_the_workflow_gave_it_not_its_verdict(self):
         gate = {**failure('gate', verdict='rig-side'), 'check': 'SonarCloud Code Analysis', 'workflow': '', 'cell': None, 'state': 'sonarGate'}
@@ -161,13 +191,18 @@ class LaunchResultTest(unittest.TestCase):
         rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'state': {'expectedHead': NEXT, 'cyclesUsed': 5, 'maxCycles': 5}}))
         self.assertEqual(s['blockers'], [], 'a launch that passed on its last cycle needs no relaunch')
 
+    def test_a_state_too_large_to_load_is_a_blocker(self):
+        rc, s = self.run_it(output(result={'pass': True, 'status': 'complete', 'stateTooLarge': 70000,
+                                           'state': {'expectedHead': NEXT, 'cyclesUsed': 1, 'maxCycles': 5}}))
+        self.assertEqual(s['blockers'], ['the returned state is 70000 bytes, over the 65536 a launch loads: no launch can continue '
+                                         'from it; keep the output file and report it, never reset or reconstruct the state'])
+
     def test_a_launch_stopped_at_load_is_a_blocker_and_keeps_the_state_it_was_given(self):
-        # tinyusb#4019: a relaunch at 5 of 5 loaded its whole state only to stop.
         stopped = {'agentCount': 1, 'totalTokens': 30000, 'logs': [], 'workflowProgress': [], 'result': {
-            'pass': False, 'status': 'blocked', 'reason': 'budget-exhausted-unverified', 'detail': 'shows 5 of 5', 'stateRef': {'outputFile': '/t/w1.output', 'digest': '4841042f'}}}
+            'pass': False, 'status': 'blocked', 'reason': 'state-transfer-failed', 'detail': 'state digest mismatch'}}
         rc, s = self.run_it(stopped, '--state-ref', '/t/w1.output:4841042f')
         self.assertEqual((s['stateRef'], s['budget']), ({'outputFile': '/t/w1.output', 'digest': '4841042f'}, None))
-        self.assertTrue(any(b.startswith('the launch stopped before loading its state') for b in s['blockers']), s['blockers'])
+        self.assertTrue(any(b.startswith('the state did not load') for b in s['blockers']), s['blockers'])
 
     def test_a_refused_launch_is_a_blocker_that_forbids_starting_over(self):
         for reason, says in (('state-transfer-failed', 'never reset or reconstruct the state'),
@@ -212,7 +247,7 @@ class LaunchResultTest(unittest.TestCase):
     def test_every_stop_reason_of_the_workflow_is_refused_or_handled_elsewhere(self):
         handled_elsewhere = {  # blocked by receipts, budget, heads or CI fields, or left to chief's judgment
             'adopt-needs-push', 'adopt-push-failed', 'adopt-push-unknown', 'budget-exhausted', 'build-unverifiable',
-            'cycle-threw', 'maxCycles reached', 'deferred-replies-unresolved', 'dirty-start',
+            'cycle-threw', 'deferred-replies-unresolved', 'dirty-start', 'dry-run',
             'duplicate-finding-ids', 'fix-verification-failed', 'held-awaiting-caller', 'preflight-died', 'preflight-failed', 'push-failed',
             'review-challenger-died', 'review-report-unusable', 'review-validator-died', 'reviews-pending',
             'wrong-branch', 'wrong-remote', 'yielded'}
@@ -220,10 +255,9 @@ class LaunchResultTest(unittest.TestCase):
         reasons = {m.group(2) for m in re.finditer(r"""pass: false\b[^{}]*?\breason: (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop\([\w.]+, (['"])(.+?)\1""", source)}
         reasons |= {m.group(2) for m in re.finditer(r"""\bstop: (['"])(.+?)\1""", source)}  # the GATES table
-        historical = {'budget-exhausted-unverified'}  # still read from older outputs, no longer produced
         sets = (handled_elsewhere, set(launch_result.REFUSED), set(launch_result.ENDED), set(launch_result.STALLED))
         self.assertEqual(sum(map(len, sets)), len(set().union(*sets)), 'each reason is handled one way')
-        self.assertEqual(reasons, set().union(*sets) - historical,
+        self.assertEqual(reasons, set().union(*sets),
                          'a stop reason was added or renamed: give it a REFUSED response or name it here')
 
     def test_a_stop_another_launch_would_repeat_says_what_must_change(self):
@@ -241,6 +275,44 @@ class LaunchResultTest(unittest.TestCase):
         for reason in ('yielded', 'pr-merged'):
             self.assertEqual(self.run_it(stopped(reason))[1]['blockers'], [], reason)
 
+    def test_an_unreviewed_coderabbit_says_whether_a_relaunch_asks_from_the_runs_record(self):
+        # #243: chief relaunched for an ask the run had already spent on the head.
+        def stopped(ask):
+            return {'agentCount': 1, 'totalTokens': 10, 'logs': [], 'workflowProgress': [],
+                    'result': {'stateDigest': '0123abcd', 'pass': False, 'status': 'blocked', 'reason': 'coderabbit-unreviewed', 'cycles': 2,
+                               'state': {'expectedHead': HEAD, 'cyclesUsed': 2, 'maxCycles': 16}, 'coderabbitAsk': ask}}
+        for ask, says in (
+                ({'relaunchAsks': None, 'asked': [{'ask': 'request', 'at': '2026-10-23T01:10:00Z'}]},
+                 'already used its one ask on the head (an `@coderabbitai review` comment at 2026-10-23T01:10:00Z), so a relaunch will not ask'),
+                ({'relaunchAsks': None, 'asked': [{'ask': 'tick', 'at': None}]}, '(a Trigger review tick that failed), so a relaunch will not ask'),
+                ({'relaunchAsks': None, 'asked': []}, "nothing in CodeRabbit's state is ours to ask, so a relaunch will not ask"),
+                ({'relaunchAsks': 'tick', 'asked': []}, 'a relaunch with coderabbitTrigger ticks it once'),
+                ({'relaunchAsks': 'request', 'asked': [], 'retryAt': '2026-10-23T02:07:00Z'},
+                 'rate-limited until 2026-10-23T02:07:00Z and this run never asked on the head: a relaunch with coderabbitTrigger after that')):
+            with self.subTest(ask):
+                blockers = self.run_it(stopped(ask))[1]['blockers']
+                self.assertEqual(len(blockers), 1, blockers)
+                self.assertIn(says, blockers[0])
+                self.assertEqual('`@coderabbitai review` on the PR or accepts the head' in blockers[0], ask['relaunchAsks'] is None, blockers[0])
+        # #272: another stop with CodeRabbit unreviewed notes whether a relaunch asks; its own blocker is unchanged.
+        for reason in ('reviews-pending', 'budget-exhausted', 'yielded'):
+            for ask, says in (({'relaunchAsks': None, 'asked': [{'ask': 'tick', 'at': '2026-10-23T01:00:00Z'}]},
+                               'CodeRabbit has not reviewed the head; this run already used its one ask on the head (a Trigger review tick '
+                               'at 2026-10-23T01:00:00Z), so a relaunch will not ask CodeRabbit on this head'),
+                              ({'relaunchAsks': 'tick', 'asked': []}, 'CodeRabbit has not reviewed the head; it skipped the head for a manual review '
+                               'and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once')):
+                with self.subTest(reason=reason, ask=ask):
+                    data = stopped(ask)
+                    data['result']['reason'] = reason
+                    s = self.run_it(data)[1]
+                    self.assertEqual(s['notes'], [says])
+                    self.assertFalse([b for b in s['blockers'] if 'CodeRabbit' in b], s['blockers'])
+        # An output without the record: a failed tick leaves nothing on the PR, so its ask cannot be read there.
+        blockers = self.run_it(stopped(None))[1]['blockers']
+        self.assertEqual(len(blockers), 1, blockers)
+        self.assertIn('does not record its asks, and a failed tick leaves nothing on the PR, so a relaunch may not ask again: '
+                      'the user comments `@coderabbitai review`', blockers[0])
+
     def test_every_reviewer_keeps_its_state_kind_and_evidence(self):
         # #85: a Copilot quota notice left no finding, so its record is the only trace.
         data = output()
@@ -250,7 +322,7 @@ class LaunchResultTest(unittest.TestCase):
             {'bot': 'copilot', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'the requesting user reached the Copilot quota',
              'evidence': ['review 3313 on aaaaaaaa'], 'retryAt': None}]
         bots = self.run_it(data)[1]['observation']['bots']
-        self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD[:8], 'reason': 'Review rate limited',
+        self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'Review rate limited',
                                    'evidence': ['comment 5'], 'retryAt': '2026-10-13T10:55:19Z'})
         self.assertEqual((bots[1]['bot'], bots[1]['kind'], bots[1]['evidence']), ('copilot', 'limited', ['review 3313 on aaaaaaaa']))
 
@@ -284,6 +356,18 @@ class LaunchResultTest(unittest.TestCase):
         _, s = self.run_it(data)
         self.assertEqual([(r['batch'], r['commentId']) for r in s['receipts']['replies']], [('refutedPosts', 501), ('fixNotePosts', 7)])
         self.assertEqual([p['lane'] for p in s['receipts']['pushes']], ['reviewPush'])
+        self.assertEqual(s['receipts']['botAsks'], [])
+
+    def test_bot_asks_are_receipts_of_every_cycle_verbatim(self):
+        # #272: the bot asks a launch posted were only in its logs.
+        data = output()
+        obs = data['result']['observation']
+        tick = {'bot': 'coderabbit', 'kind': 'tick', 'outcome': 'ticked', 'commentId': 5, 'at': '2026-10-23T01:00:00Z', 'sha': HEAD}
+        ask = {'bot': 'greptile', 'kind': 'request', 'outcome': 'requested', 'commentId': 7, 'at': '2026-10-23T01:02:00Z', 'sha': HEAD}
+        obs['launchActions'] = [{'cycle': 1, 'botAsks': [tick]}, {'cycle': 2, 'botAsks': None}, {'cycle': 3, **obs['actions'], 'botAsks': [ask]}]
+        _, s = self.run_it(data)
+        self.assertEqual(s['receipts']['botAsks'], [tick, ask])
+        self.assertEqual(s['blockers'], [])
 
     def test_each_receipt_keeps_its_own_cycle_s_verdicts(self):
         data = output()

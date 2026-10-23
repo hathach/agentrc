@@ -50,8 +50,8 @@ class RunCostTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.projects = Path(tmp.name)
-        patcher = mock.patch.object(run_cost, 'PROJECTS', self.projects)
+        self.projects = Path(tmp.name) / 'projects'
+        patcher = mock.patch.dict('os.environ', {'CLAUDE_CONFIG_DIR': tmp.name})
         patcher.start()
         self.addCleanup(patcher.stop)
         run_cost.usage_of.cache_clear()   # each test writes its own transcripts at the same paths
@@ -173,6 +173,15 @@ class RunCostTest(unittest.TestCase):
         with mock.patch.dict(run_cost.RATES, clear=True):
             self.assertTrue(self.table(self.main('--session-id', SID)[1])[-1].endswith('| **-** | |'), 'no rate, no dollars')
 
+    def test_the_current_models_are_priced_without_a_record(self):
+        write(self.session.with_suffix('.jsonl'), [turn('m6', 'claude-haiku-5-5', '2026-09-25T09:59:00Z', inp=900, out=2000),
+                                                   turn('m7', 'claude-haiku-5-5', '2026-09-25T09:59:10Z', inp=1000, out=10000, w5m=8000),
+                                                   turn('m8', 'claude-sonnet-5-5', '2026-09-25T09:59:30Z', out=10, w1h=1000)])
+        rows = self.rows(self.main('--session-id', SID)[1])
+        # haiku: a 90K prompt at 0.1/0.5 (0.009 + 0.1); a 900K one, over 100K, at 0.5/2.5/0.625 (0.05 + 2.5 + 0.5)
+        # sonnet: 1,000 out, 0.1M 1h writes at 10/4
+        self.assertEqual((rows[('chief', 'chief', 'haiku-5-5')][7], rows[('chief', 'chief', 'sonnet-5-5')][7]), ('3.16', '0.41'))
+
     def test_an_unlisted_model_leaves_dollars_out(self):
         write(self.session.with_suffix('.jsonl'), self.chief + [cost_state(**{'claude-opus-5-5': OPUS})])
         out = self.main('--session-id', SID)[1]
@@ -193,6 +202,12 @@ class RunCostTest(unittest.TestCase):
             self.assertEqual(run_cost.rate_of(model), opus, model)
         for model in ('claude-opus-5-50', 'claude-sonnet-50', 'claude-opus-5'):
             self.assertIsNone(run_cost.rate_of(model), model)
+        with mock.patch.dict(run_cost.RATES, {'claude-sonnet-5': (9,) * 5, 'claude-sonnet-5-5': (1,) * 5}, clear=True):
+            self.assertEqual(run_cost.rate_of('claude-sonnet-5-5-20261001'), (1,) * 5, 'the longest id, not a dated sonnet-5')
+            self.assertEqual(run_cost.rate_of('claude-sonnet-5-20261001'), (9,) * 5)
+        haiku, long = run_cost.RATES['claude-haiku-5-5'], run_cost.LONG['claude-haiku-5-5'][1]
+        self.assertEqual([run_cost.rate_of('claude-haiku-5-5', n) for n in (100_000, 100_001)], [haiku, long], 'over 100K only')
+        self.assertEqual(run_cost.rate_of('claude-opus-5-5', 900_000), opus, 'one card')
 
     def test_runs_are_listed_in_start_order(self):
         write(self.session.with_suffix('.jsonl'), self.chief)

@@ -31,7 +31,9 @@ server's close, which restarts it: reported as a core that ran, which the end an
 halted again. If the pre-attach anchor itself fails, the core is restarted only when its partial
 output shows it was found running; otherwise its state is reported unknown. A core found
 halted is not resumed, and a multi-core target found with mixed core states is refused,
-since the attach halts every core and a resume moves every core.
+since the attach halts every core and a resume moves every core. A probe tool still running
+after its kill (probe_state.py's KILL_WAIT; D state) may still hold the probe: no session
+follows it, and the core's state is reported unknown.
 
 gdb runs with may-write-memory, may-write-registers, may-call-functions and
 may-insert-breakpoints off, so expressions read and never write, call or break. Each
@@ -71,7 +73,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_state  # noqa: E402
-from probe_state import Capture, OpenOCD, ToolError, core_state, cpuid_state  # noqa: E402
+from probe_state import UNREAPED_NOTE, Capture, OpenOCD, ToolError, Unreaped, core_state, cpuid_state  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
 
@@ -195,6 +197,8 @@ def stop(proc, grace):
 
 def start_anchor_recovery(route, backend, err):
     """What a failed pre-attach anchor left, restarting a J-Link core only if it was found running."""
+    if isinstance(err, Unreaped):
+        return f'; {UNREAPED_NOTE}'
     if route != 'jlink':
         return ''
     partial = getattr(err, 'partial', [])
@@ -206,12 +210,14 @@ def start_anchor_recovery(route, backend, err):
     try:
         anchor(backend, 30, keep_halted=False)
         return '; the core was found running and a second session restarted it'
+    except Unreaped as e:
+        return f'; the core was found running and the restarting session failed too ({e}); {UNREAPED_NOTE}'
     except (ToolError, Interrupted) as e:
         return f'; the core was found running and the restarting session failed too ({e}): check it with probe_state.py'
 
 
 def restore(route, backend, timeout):
-    """None, or why the restoring session failed. J-Link has nothing to send: the end anchor that
+    """None, or the restoring session's failure. J-Link has nothing to send: the end anchor that
     found the core halted restarted it when it closed."""
     if route == 'jlink':
         return None
@@ -219,7 +225,7 @@ def restore(route, backend, timeout):
         backend.batch(OCD_RESTORE, timeout)
         return None
     except (ToolError, Interrupted) as e:
-        return str(e)
+        return e
 
 
 def end_state_error(before, after, resumed):
@@ -380,18 +386,22 @@ def main(argv=None):
         if end_state_error(before, after, resume):
             # A J-Link anchor's own close sets the state, so a second one shows what this one left.
             result['afterServer'] = after
+            failed = None
             if resume:
                 failed = restore(route, backend, 30)
-                if failed:
-                    errors.append(f'restoring session: {failed}')
-                result['restored'] = True
+                if isinstance(failed, Unreaped):
+                    errors.append(f'restoring session: {failed}; {UNREAPED_NOTE}')
+                else:
+                    if failed:
+                        errors.append(f'restoring session: {failed}')
+                    result['restored'] = True
             else:
                 ran = [n for n, c in after['cores'].items() if not c['halted']]
                 errors.append(f"{', '.join(ran)} found halted, ran after the attach (afterServer)")
-            after = anchor(backend, 30, keep_halted=not resume)
+            after = None if isinstance(failed, Unreaped) else anchor(backend, 30, keep_halted=not resume)
     except (ToolError, Interrupted) as e:
         after = None
-        errors.append(f'end anchor: {e}')
+        errors.append(f'end anchor: {e}' + (f'; {UNREAPED_NOTE}' if isinstance(e, Unreaped) else ''))
     if after is not None:
         result['after'] = after
         wrong = end_state_error(before, after, resume)

@@ -1120,7 +1120,7 @@ class PruneTest(unittest.TestCase):
     def test_settled_idle_diagnostics_and_unreferenced_blobs_expire_only_with_apply(self):
         kept, dropped = self.blob('kept'), self.blob('dropped')
         logs = ('codex-1-0.log', 'result-1-0.json', 'schema.json')
-        old = self.session('old', age_days=40, blobs=[kept, dropped], cursor=[kept[0]], files=logs)
+        old = self.session('old', age_days=40, blobs=[kept, dropped], cursor=[kept[0]], files=logs, open_turn=True)
         (old / 'review.lock').touch()
         self.age(old, 40)
         recent = self.session('recent', age_days=5, blobs=[self.blob('recent')], files=logs)
@@ -1128,12 +1128,76 @@ class PruneTest(unittest.TestCase):
         self.assertRegex(report, r'diagnostics +12 B  \(3 file')
         self.assertRegex(report, r'unreferenced blobs +7 B  \(1 file')
         self.assertTrue(all((old / name).exists() for name in logs))
+        self.assertIn(f'interrupted turn, idle over 30 days (snapshot kept): 1\n  {old}: 40 days', report)
         self.prune(apply=True)
         self.assertEqual(sorted(os.listdir(old)), ['blobs', 'lock', 'review.lock', 'state.json'])
         self.assertEqual(os.listdir(old / 'blobs'), [kept[0]])
         self.assertTrue((self.store / kept[0]).samefile(old / 'blobs' / kept[0]))
         self.assertTrue(all((recent / name).exists() for name in logs), 'a recent session keeps its logs')
         self.assertEqual(len(os.listdir(recent / 'blobs')), 1, 'and its blobs')
+
+    def test_a_closed_idle_turn_loses_its_snapshot_and_the_blobs_only_it_held(self):
+        only, shared = self.blob('only this cursor'), self.blob('shared')
+        old = self.session('old', age_days=40, blobs=[only, shared], cursor=[only[0], shared[0]],
+                           notes=['a note still to deliver'], rounds=2)
+        live = self.session('live', age_days=1, cursor=[shared[0]])
+        self.store.mkdir()
+        os.link(old / 'blobs' / shared[0], self.store / shared[0])
+        os.link(self.store / shared[0], live / 'blobs' / shared[0])
+        self.age(old, 40)
+        self.age(live, 1)
+        before = {d: (d / 'state.json').read_text() for d in (old, live)}
+        lock = (old / 'lock').stat().st_ino
+        report = self.prune()
+        self.assertEqual({d: (d / 'state.json').read_text() for d in (old, live)}, before, 'a dry run changes nothing')
+        self.assertEqual(sorted(os.listdir(old / 'blobs')), sorted([only[0], shared[0]]))
+        self.prune(apply=True)
+        state = json.loads((old / 'state.json').read_text())
+        self.assertEqual(state, {**json.loads(before[old]), 'cursor': None}, 'notes and counters kept')
+        freed = len(before[old]) - (old / 'state.json').stat().st_size
+        self.assertRegex(report, rf'compacted states +{freed} B  \(1 file')
+        self.assertRegex(report, r'unreferenced blobs +16 B  \(2 file')
+        self.assertEqual(os.listdir(old / 'blobs'), [])
+        self.assertEqual((old / 'lock').stat().st_ino, lock, 'the lock file stays the one waiters hold')
+        self.assertEqual((live / 'state.json').read_text(), before[live], 'a young session is untouched')
+        self.assertEqual(os.listdir(self.store), [shared[0]], 'a blob another session links stays')
+        self.assertTrue((self.store / shared[0]).samefile(live / 'blobs' / shared[0]))
+        self.assertRegex(self.prune(apply=True), r'total +0 B')
+
+    def test_compaction_keeps_an_interrupted_turn_and_a_closed_one_takes_a_new_baseline(self):
+        root = make_repo(self.base / 'repo')
+        (root / 'big.txt').write_text('untracked\n')
+        sha = self.blob('untracked\n')[0]
+        closed = Session(root, self.cache / 'closed')
+        closed.prompt()
+        (root / 'a.txt').write_text('closed turn\n')
+        closed.results = [json.dumps({'findings': []})]
+        closed.stop()
+        interrupted = Session(root, self.cache / 'interrupted')
+        interrupted.prompt()
+        (root / 'c.txt').write_text('interrupted edit\n')
+        for s in (closed, interrupted):
+            self.age(s.directory, 40)
+        locks = {s: (s.directory / 'lock').stat().st_ino for s in (closed, interrupted)}
+        kept = interrupted.state()
+        report = self.prune(apply=True)
+        self.assertIn(f'interrupted turn, idle over 30 days (snapshot kept): 1\n  {interrupted.directory}', report)
+        self.assertEqual(interrupted.state(), kept)
+        self.assertIsNone(closed.state()['cursor'])
+        self.assertEqual(os.listdir(closed.directory / 'blobs'), [])
+        self.assertTrue((interrupted.directory / 'blobs' / sha).samefile(self.store / sha))
+        self.assertEqual({s: (s.directory / 'lock').stat().st_ino for s in locks}, locks)
+        interrupted.prompt()
+        interrupted.results = [json.dumps({'findings': []})]
+        interrupted.stop()
+        self.assertIn('+interrupted edit\n', interrupted.prompts[-1])
+        self.assertIn('baseline taken', closed.stop()['systemMessage'])
+        closed.prompt()
+        (root / 'b.txt').write_text('b\n')
+        closed.results = [json.dumps({'findings': []})]
+        closed.stop()
+        self.assertIn('+b\n', closed.prompts[-1])
+        self.assertNotIn('interrupted edit', closed.prompts[-1])
 
     def test_a_busy_session_is_skipped(self):
         sha, content = self.blob('busy')

@@ -140,6 +140,17 @@ class KillTreeTest(unittest.TestCase):
         self.assertIsNone(windows.kill_tree(proc, 5))
         proc.kill.assert_called_once()
 
+    def test_a_total_budget_bounds_taskkill_and_the_wait_together(self):
+        proc = mock.Mock(**{'poll.return_value': None, 'wait.side_effect': subprocess.TimeoutExpired('x', 1)})
+        slow = mock.Mock(side_effect=lambda *a, **k: time.sleep(0.3))
+        with mock.patch.object(windows.os, 'name', 'nt'), mock.patch.dict(os.environ, {'SystemRoot': 'C:\\Windows'}), \
+                mock.patch.object(windows.subprocess, 'run', slow):
+            self.assertIsNone(windows.kill_tree(proc, 1, total=True))
+        self.assertEqual(slow.call_args.kwargs['timeout'], 1)
+        proc.kill.assert_called_once()
+        wait, = proc.wait.call_args.args
+        self.assertLess(wait, 0.75)    # what the slow taskkill left of the second
+
     def test_elsewhere_the_child_alone_is_killed(self):
         with mock.patch.object(windows.subprocess, 'run') as ran:
             code = windows.kill_tree(self.spawn(), 5)

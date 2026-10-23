@@ -35,15 +35,12 @@ python3 <skill dir>/scripts/rtt.py --backend jlink --probe <serial> --device <JL
 #   --interface and --speed have no default; -i forwards stdin to the target; --seconds 0 streams until Ctrl-C/EOF
 #   --stop-file <fresh path>: automation ends a --seconds 0 capture by creating the
 #   file (exit 0); a path that already exists is a completed cancellation, so exit 0
-#   alone never proves target output
+#   alone never proves target output; a capture that saw none prints
+#   `rtt: no target output within the window` on stderr
 ```
 
-Windows is supported by the script (`JLink.exe` default) but unverified on hardware. Teardown sends Commander `exit`
-(openocd has none), then CTRL_BREAK to the server's process group when it shares the console, then `taskkill`s the
-tree if the server is still alive, each rung after up to 5 s. A bare tool name is looked up as `<name>.exe` in the
-PATH entries with a drive and root (`C:\...`) only, never the cwd or python's directory. `RTT_JLINK_EXE`,
-`RTT_OPENOCD_EXE` and `RTT_NM` override the server and nm executables on any platform; give a full path for a tool
-that is not on PATH.
+Windows: supported by the script, unverified on hardware; `RTT_JLINK_EXE`, `RTT_OPENOCD_EXE`, `RTT_NM` override the
+tools (full path for one not on PATH).
 
 `--device` is the J-Link device name of the MCU. Always pass the probe
 serial — rigs and benches run several probes, and an unpinned flash grabs
@@ -99,20 +96,14 @@ a full-RAM scan is slower and can match stale RAM after a soft reset):
 ```bash
 python3 <skill dir>/scripts/rtt.py --backend openocd --probe <serial> \
   --cfg "-f interface/stlink.cfg -f target/stm32h7x.cfg" --elf <flashed.elf> --seconds 20
-#   --channel: up-buffer index (0 = "Terminal" console; any other is whatever the
-#   firmware configured there, e.g. SystemView's "SysView"); -i forwards stdin → the SAME-numbered down-buffer
-#   --vid-pid "0x2e8a 0x000c": pin the probe by USB IDs. With --probe it keeps openocd
-#   discovery off foreign usbfs nodes; alone it must match exactly ONE attached probe
-#   --addr 0x2000xxxx: explicit control-block address when the flashed elf is not at hand
-#   --reset-before-attach: reset the target INSIDE the session (2 s settle, then
-#   attach — the control block must exist before `rtt start` can find it; the ring's
-#   NO_BLOCK_SKIP head-retention is what preserves byte 0 across the settle) —
-#   required for streams that only decode from byte 0
-#   (SystemView emits its Init record, carrying the timestamp frequency, once at boot;
-#   a mid-flight attach yields a stream no decoder can lock onto). Verified on
+#   --channel, -i (into the same-numbered down-buffer), --addr: see --help
+#   --vid-pid with --probe keeps openocd discovery off foreign usbfs nodes; alone it
+#   must match exactly ONE attached probe
+#   --reset-before-attach: reset INSIDE the session, 2 s settle, then attach (the ring's
+#   NO_BLOCK_SKIP head-retention is what preserves byte 0 across the settle), for streams
+#   that only decode from byte 0 (SystemView's boot Init record). Verified on
 #   stm32h743nucleo: after the ring is drained, a plain attach misses the boot preamble
-#   entirely and this flag captures it. NOT for SAMD5x (an in-session reset via the DSU
-#   leaves the core held) or WCH SDI.
+#   entirely and this flag captures it. NOT for SAMD5x (below) or WCH SDI.
 ```
 
 No reader drains the up-buffer during that 2 s settle. Size the ring for the

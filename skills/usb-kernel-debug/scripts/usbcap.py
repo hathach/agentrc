@@ -12,7 +12,8 @@ matches listed; pass the bus instead. An existing outfile is refused, never
 overwritten. A capture with no URB in it fails and keeps the file: the bus
 was idle, or the selector named the wrong one. Linux only (usbmon). Assumes
 usbmon is loaded and /dev/usbmon* is readable by the wireshark group (see
-SKILL.md), so tshark captures without sudo; running as root is refused.
+SKILL.md, usbmon — capture), so tshark captures without sudo; running as
+root is refused.
 """
 import argparse
 import os
@@ -76,7 +77,7 @@ def main():
     needed = ['tshark', 'capinfos'] + ([] if args.target == 'auto' or args.target.isdigit() else ['lsusb'])
     missing = [t for t in needed if not shutil.which(t)]
     if missing:
-        sys.exit(f'{", ".join(missing)} not on PATH (SKILL.md, Setup)')
+        sys.exit(f'{", ".join(missing)} not on PATH (SKILL.md, usbmon — capture)')
     try:
         os.close(os.open(args.outfile, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))  # reserved: nothing else can claim it now
     except FileExistsError:

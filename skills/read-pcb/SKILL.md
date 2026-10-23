@@ -1,6 +1,6 @@
 ---
 name: read-pcb
-description: Use when a board-wiring question should be answered from the schematic, not memory or a pinout image — which MCU pin or GPIO drives a signal, what sits on a net, what a connector, jumper or switch connects, a part's value, MPN or package, per revision — for boards in hathach/pcb, READ_PCB_SOURCES repos or a design directory the user names (KiCad/EAGLE), including while writing firmware for it.
+description: Answer board-wiring questions from EAGLE/KiCad schematics — pins/GPIOs, nets, connectors, jumpers/switches, values, MPNs, packages and revisions — including during firmware work, for hathach/pcb, READ_PCB_SOURCES repos or a user-named design directory.
 ---
 
 # Read PCB
@@ -58,8 +58,9 @@ to switch.
   `net GND` lists the real parts only.
 - `[no-connect]` is an explicit no-connect flag. `(no net)` is a pin wired to
   nothing.
-- Values are the schematic's base values. `[DNP in variant X]` marks a part
-  not populated in that named variant, not in the built board.
+- Values are the schematic's base values. `[DNP]` (KiCad) marks a part not
+  fitted on the board; `[DNP in variant X]` (EAGLE) one not populated in that
+  named variant only.
 - A part's own behaviour (registers, electrical limits) comes from its
   datasheet through `read-doc`, by value or MPN.
 

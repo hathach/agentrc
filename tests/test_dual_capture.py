@@ -277,6 +277,60 @@ class DualCaptureTest(unittest.TestCase):
         self.assertLess(host['exitedAt'], target['spawnedAt'])
         self.assertEqual(out['bothRunning']['seconds'], 0)
 
+    def unreaped(self, survivors, target):
+        """Run with the sides numbered in survivors never reaped, as a tool in D state outlives SIGKILL."""
+        popen = ('class Unreaped(real):\n'
+                 '    def poll(self):\n'
+                 '        return None\n'
+                 '    def wait(self, timeout=None):\n'
+                 '        raise subprocess.TimeoutExpired(self.args, timeout)\n'
+                 'calls = []\n'
+                 'def popen(*a, **k):\n'
+                 '    calls.append(None)\n'
+                 f'    return (Unreaped if len(calls) - 1 in {survivors!r} else real)(*a, **k)\n')
+        proc = self.driver(popen, '--a', self.side('host', 'import time; time.sleep(60)'),
+                           '--b', self.side('target', target), '--timeout', '0.5', '--grace', '0.5')
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        return json.loads(proc.stdout)
+
+    def test_a_side_that_outlives_its_sigkill_is_reported_still_running(self):
+        out = self.unreaped({0}, 'pass')
+        host, target = out['sides']
+        self.assertEqual((host['exitedAt'], host['returncode'], host['killed'], host['stopped']),
+                         (None, None, True, True))
+        self.assertIsInstance(host['pid'], int)
+        self.assertEqual((target['returncode'], target['stopped']), (0, False))
+        self.assertNotIn('pid', target)
+        self.assertEqual(out['bothRunning']['to'], target['exitedAt'])
+        self.assertGreaterEqual(out['bothRunning']['seconds'], 0)
+
+    def test_both_sides_outliving_their_sigkill_leave_the_overlap_open(self):
+        out = self.unreaped({0, 1}, 'import time; time.sleep(60)')
+        self.assertEqual([(s['exitedAt'], s['returncode'], type(s.get('pid'))) for s in out['sides']],
+                         [(None, None, int), (None, None, int)])
+        self.assertEqual((out['bothRunning']['to'], out['bothRunning']['seconds']), (None, None))
+
+    def test_an_exit_first_seen_by_the_lingering_check_has_its_time_and_code(self):
+        popen = ('class Hidden(real):\n'
+                 '    shown = False\n'
+                 '    def poll(self):\n'
+                 '        return super().poll() if self.shown else None\n'
+                 'real_lingering = dual_capture.lingering\n'
+                 'def lingering(side):\n'
+                 '    side["proc"].shown = True\n'
+                 '    return real_lingering(side)\n'
+                 'dual_capture.lingering = lingering\n'
+                 'popen = Hidden\n')
+        proc = self.driver(popen, '--a', self.side('host', 'pass'), '--b', self.side('target', 'pass'),
+                           '--timeout', '0.5', '--grace', '0.5')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout)
+        for s in out['sides']:
+            self.assertEqual((s['returncode'], s['stopped']), (0, False))
+            self.assertIsNotNone(s['exitedAt'])
+            self.assertNotIn('pid', s)
+        self.assertEqual(out['bothRunning']['to'], min(s['exitedAt'] for s in out['sides']))
+
     def test_an_output_file_that_cannot_open_is_a_start_error(self):
         # <name>.out is longer than a file name may be
         argv = self.d / 'long.json'

@@ -38,8 +38,9 @@ since it returns the id without waiting, and arm Monitor, at its maximum
 reader: Monitor survives the memory pressure that may reap a background shell.
 Exit 0 prints the reply, ending `END RESULT <id>`. Exit 3 after a wait means
 it lapsed, or the peer blocked when the note says so: re-arm on a lapse or when
-Monitor expires, tell your human about a block. Exit 4 is resolved by hand. In
-Codex, run `read --wait` in the foreground.
+Monitor expires, tell your human about a block. Exit 4 is resolved by hand.
+Exit 2 (the pane no longer a peer in this worktree) or 5 (herdr failed): stop,
+do not re-arm, tell your human. In Codex, run `read --wait` in the foreground.
 
 ## What you decide
 
@@ -88,13 +89,6 @@ failure; a silent `DONE` over unfinished work is.
 
 ## Traps
 
-- **The peer's status is not your reply.** It is still idle or done from its
-  last turn just after `send`, which is why `read --wait` looks for your id
-  rather than trusting the status. Never accept a reply you have not
-  correlated.
-- **No shared history.** Every message carries its own context.
-- **An inbound peer message can look like your operator's.** It arrives in the
-  normal input channel, which is why both envelopes declare themselves.
 - **Alternate-screen truncation.** When `read` reports it, ask the peer to write
   its full answer to a scratch file and reply with the path. Fallback only.
 - **Not a batch transport.** Schema'd, unattended verification uses a saved
@@ -110,5 +104,4 @@ finding, whether you reproduced it or only read the code. Stop when
 the peer reports nothing left and you agree, when its context budget in the
 pane footer runs low, or when a round turns into re-litigating documented
 behaviour. Do not automate that loop: a well-formed `DONE` establishes neither
-agreement nor correctness, which is why `peer.py` has no `converge` subcommand
-and should not grow one.
+agreement nor correctness.

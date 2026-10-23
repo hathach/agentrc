@@ -164,8 +164,11 @@ current board's cleanup.
   that its firmware, USB or anything else works.
 - A `blocked` row's cleanup names its blocker: a cleanup holder's `token`, which
   Recovery releases with `hil_lock.py release --token` (refused until every
-  process the check started is proven ended), or a protected record, which needs
-  a recovery takeover.
+  process the check ran through `ctx.run` is proven ended, and every session in
+  its cleanup's `retained`, one the profile's provider left running, an
+  openocd_esp server, has its receipt closed as ended), or a protected record,
+  which needs a recovery takeover that does not check `retained`. Recovery ends
+  each retained session first (`hil_openocd_esp.py end --receipt`, exit 0).
 - Exit 0 no failed row, 1 a failed row or an aborted check, 2 refused before any
   board, 4 any blocked row. `locked` and `unsupported` rows are unverified, not
   healthy: read the table, never `$?` alone.
@@ -199,6 +202,14 @@ recovery stay the contract's. Linux only.
   the ROM loader (`chip_id` without the stub, then a hard reset); lm4flash has
   no reset-only mode. A reset that exits 0 has not necessarily reached the
   target: `reset_problem(name, op)` reads its output for the target's answer.
+  A J-Link session can exit 0 with every command failed: `jlink_problem(op)`
+  judges its last attempt, each command from its own output chunk against the
+  command file it ran (`jlink_judgment`, from recorded transcripts; an
+  unknown command or output shape fails). `esptool_problem(op)` does the same
+  for `flash_esptool` against the offsets its last attempt wrote (each written
+  once, verified, then the hard reset), `esptool_runtime()` the esptool the flash and its helper sessions run (one
+  package, the one `scripts/esptool_session.py` imports too, its version), and `esptool_port(uid)` the one tty for
+  a probe serial, refusing an ambiguous or missing one.
 - A flash or reset returns an `Operation`: the last run's `CompletedProcess`
   fields plus `attempts`, each run's command, command file, output and rc on
   its own, never concatenated; `retried` is every attempt but the last. An

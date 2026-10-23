@@ -146,10 +146,12 @@ def report(corpus, single, batch, evidence=None, corpus_digest=None):
         settled = [c for c in corpus if c['truth']['label'] is not None and c['id'] in records]
         said[name] = {i: {'confirmed': True, 'refuted': False}.get(r['kind']) for i, r in records.items()}
         wrong[name] = {c['id'] for c in settled if said[name][c['id']] is not None and said[name][c['id']] != (c['truth']['label'] == 'true')}
+        # one set for the overall and per-group counts: a case with disputed (null) truth is right in neither
+        right = {c['id'] for c in settled if said[name][c['id']] is not None} - wrong[name]
         costs = cost_by_case(calls) if costed(calls) else None
         figures[name] = {
             'records': len(records), 'kinds': dict(kinds), 'settled': len(settled),
-            'right': sum(said[name][c['id']] is not None for c in settled) - len(wrong[name]), 'wrong': sorted(wrong[name]),
+            'right': len(right), 'wrong': sorted(wrong[name]),
             'falseRefutations': sorted(i for i in wrong[name] if not said[name][i]), 'falseConfirmations': sorted(i for i in wrong[name] if said[name][i]),
             'citing': sum(bool(CITES.search(reason(r))) for r in records.values()),
             'cost': round(sum(c['cost'] for c in calls), 4) if costs is not None else None,
@@ -157,7 +159,7 @@ def report(corpus, single, batch, evidence=None, corpus_digest=None):
             'dispatches': len(calls), 'retries': sum(c['label'].endswith('.retry') for c in calls),
             'models': sorted({(c['model'], c['effort']) for c in calls}), 'seconds': round(sum(c['durationMs'] for c in calls) / 1000),
             'byHardware': {str(h): {'cases': sum(r['routing']['hardware'] is h for r in records.values()),
-                                    'right': sum(r['routing']['hardware'] is h and said[name][i] is not None and i not in wrong[name] for i, r in records.items())}
+                                    'right': sum(r['routing']['hardware'] is h and i in right for i, r in records.items())}
                            for h in (True, False, None)},
         }
     s, b = figures['single'], figures['batch']

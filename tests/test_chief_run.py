@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -181,7 +182,10 @@ class ChiefRun(unittest.TestCase):
 
     def test_the_child_gets_the_task_the_worktree_and_a_clean_env(self):
         self.stream(init(), result())
-        self.assertEqual(self.run_it('--permission-mode', 'bypassPermissions').returncode, 0)
+        lead = {k: 'lead' for k in ('CLAUDE_PID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
+                                    'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_BRIDGE_SESSION_ID',
+                                    'CLAUDE_CODE_SESSION_ATTENDED')}
+        self.assertEqual(self.run_it('--permission-mode', 'bypassPermissions', **lead).returncode, 0)
         self.assertEqual((self.fake / 'stdin.txt').read_text(), 'Babysit PR 1.\n')
         self.assertEqual(Path((self.fake / 'cwd').read_text()).resolve(), self.worktree.resolve())
         self.assertEqual(json.loads((self.fake / 'argv.json').read_text()),
@@ -190,6 +194,7 @@ class ChiefRun(unittest.TestCase):
         env = json.loads((self.fake / 'env.json').read_text())
         self.assertNotIn('CLAUDECODE', env)
         self.assertFalse([k for k in env if k.startswith('HERDR_')], env.keys())
+        self.assertFalse(lead.keys() & env.keys(), 'none of the lead session\'s identity reaches chief')
         self.assertEqual(env['CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'], '0')
 
     def test_only_the_first_line_of_a_message_is_a_status_line(self):
@@ -279,8 +284,9 @@ class ChiefRun(unittest.TestCase):
                 self.assertEqual((self.out / 'report.md').exists(), report)
                 shutil.rmtree(self.out)
 
-    def test_the_session_cost_is_tabled_and_ends_the_exit_line(self):
-        session = self.root / '.claude' / 'projects' / '-wt' / 's-1'
+    def transcript(self, config, dollars=0.2):
+        """Session s-1's transcripts under config/projects: chief's and one preflight agent's, on Haiku."""
+        session = config / 'projects' / '-wt' / 's-1'
         run = session / 'subagents' / 'workflows' / 'wf_a'
         run.mkdir(parents=True)
         usage = {'input_tokens': 50000, 'output_tokens': 10000, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
@@ -289,8 +295,11 @@ class ChiefRun(unittest.TestCase):
         (run / 'agent-a1.meta.json').write_text(json.dumps({'description': 'preflight'}))
         (run / 'agent-a1.jsonl').write_text(turn('m1'))
         state = {'type': 'cost-state', 'modelUsage': {'claude-haiku-4-5': {
-            'costUSD': 0.2, 'inputTokens': 100000, 'outputTokens': 20000, 'cacheReadInputTokens': 0, 'cacheCreationInputTokens': 0}}}
+            'costUSD': dollars, 'inputTokens': 100000, 'outputTokens': 20000, 'cacheReadInputTokens': 0, 'cacheCreationInputTokens': 0}}}
         session.with_suffix('.jsonl').write_text(turn('m2') + json.dumps(state) + '\n')
+
+    def test_the_session_cost_is_tabled_and_ends_the_exit_line(self):
+        self.transcript(self.root / '.claude')
         self.stream(init(), result())
         self.assertEqual(self.run_it().returncode, 0)
         self.assertTrue(self.texts()[-1].endswith(' · cost $0.20'), self.texts())
@@ -333,6 +342,19 @@ class ChiefRun(unittest.TestCase):
         with mock.patch.object(chief_run.run_cost, 'report', lambda session, full_path: (full_path.write_text('| t |'), 'B', '1.00')), \
                 mock.patch.object(chief_run.run_cost, 'session_dir', lambda session_id: self.root):
             self.assertRegex(chief_run.cost(blocker, 's-1', blocker / 'report.md'), r'^cost none \((NotADirectoryError|FileNotFoundError): ')
+
+    def test_the_session_cost_is_read_from_claude_config_dir_alone(self):
+        cfg = self.root / 'cfg'
+        self.transcript(self.root / '.claude', 9.99)   # the same session id in the default tree
+        self.stream(init(), result())
+        self.assertEqual(self.run_it(CLAUDE_CONFIG_DIR=str(cfg)).returncode, 0)
+        self.assertRegex(self.texts()[-1], rf' · cost none \(run_cost: 0 transcripts named s-1\.jsonl under {re.escape(str(cfg))}',
+                         'no fallback to the default tree')
+        self.transcript(cfg)
+        for config, dollars in ((str(cfg), '0.20'), ('', '9.99')):   # empty: HOME/.claude
+            shutil.rmtree(self.out)
+            self.assertEqual(self.run_it(CLAUDE_CONFIG_DIR=config).returncode, 0)
+            self.assertTrue(self.texts()[-1].endswith(f' · cost ${dollars}'), (config, self.texts()))
 
     def test_a_cost_it_cannot_read_leaves_the_run_as_it_was(self):
         self.stream(init(), result())

@@ -14,7 +14,8 @@ Refused (exit 3), nothing changed:
   (`herdr worktree open --path <PATH>` first); herdr unreachable;
 - herdr has the plugin unlinked, disabled, or linked from another checkout than this script's;
 - PATH fails the plugin's content check, the one each sibling gets (its docstring lists them);
-  a running headless chief among them means a chief cannot remove its own worktree;
+  a chief session in PATH, headless or interactive and the caller's own included, refuses it: a
+  chief cannot remove its own worktree, so the human runs this from a plain session;
 - this script, the plugin, the report directory or the plugin's log lies inside PATH or a
   sibling to be removed;
 - a git or GitHub lookup the gate needs fails or comes back incomplete.
@@ -191,6 +192,10 @@ def plan(path, pending):
         except (wc.Keep, OSError) as err:
             why = str(err)
         siblings.append(dict(path=child, why=why, head=wc.head_branch(child), common=wc.common_dir(child / '.git')))
+    _, held = wc.removal_plan([s['path'] for s in siblings if s['why'] is None],
+                              [s['path'] for s in siblings if s['why']])
+    for s in siblings:
+        s['why'] = s['why'] or held.get(s['path'])
     leaving = [root] + [s['path'] for s in siblings if s['why'] is None]
     for needed in (Path(__file__).resolve(), PLUGIN_DIR, REPORTS, PLUGIN_LOG):
         if wc.is_within(needed, leaving):
@@ -212,7 +217,10 @@ def plan(path, pending):
                 s['branch'] = f'branch {name} stays: {why}'
                 items.append(f'{s["path"].name}: {s["branch"]}')
         items += gate(s['common'], name, tip)
-    links = [l for tree in leaving for l in links_leaving(tree)]
+    try:
+        links = [l for tree in leaving for l in links_leaving(tree)]
+    except (wc.Keep, OSError) as why:  # a tree changed since its check
+        raise Refused(f'listing the symlinks leaving the removed trees: {why}')
     token = hashlib.sha256('\n'.join(items).encode()).hexdigest()[:12]
     return dict(root=root, workspace=ws, force=force, checkouts=checkouts, links=links, items=items, token=token)
 
@@ -223,11 +231,11 @@ def command(p):
 
 def report(p, heading):
     lines = [f'# {heading}', '',
-             f'Removal of {p["root"]} (herdr workspace {p["workspace"]}): removal requested; the plugin log '
-             f'has the result: {PLUGIN_LOG}', '', f'Command: `{" ".join(command(p))}`', '', '## Inventory', '']
+             f'Plan to remove {p["root"]} (herdr workspace {p["workspace"]}); the plugin log records what '
+             f'the removal does: {PLUGIN_LOG}', '', f'Command: `{" ".join(command(p))}`', '', '## Inventory', '']
     for s in p['checkouts']:
-        fate = ('removed by herdr' if s['path'] == p['root'] else
-                'removed by the plugin' if s['why'] is None else f'stays: {s["why"]}')
+        fate = ('herdr removes it' if s['path'] == p['root'] else
+                'the plugin removes it' if s['why'] is None else f'stays: {s["why"]}')
         lines.append(f'- {s["path"]}: {fate}' + (f'; {s["branch"]}' if s['branch'] else ''))
     lines += ['', '## Symlinks leaving the removed trees', '']
     lines += [f'- {link} -> {target}' for link, target in p['links']] or ['- none']

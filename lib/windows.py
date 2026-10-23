@@ -4,7 +4,7 @@ while another process holds the file open.
 
 A script reaches it through its resolved path, as chief_guard.py reaches shadows.py:
 `sys.path.insert(0, str(Path(__file__).resolve().parents[N] / 'lib'))`, then `import windows`.
-rtt.py, and pc_sample.py with the probe_state.py it loads, are copied around alone and keep their own copies."""
+rtt.py keeps its own copies (see its module docstring)."""
 import contextlib
 import os
 import subprocess
@@ -45,12 +45,14 @@ def bash():
                                       if os.path.normcase(os.path.normpath(d.strip('"'))) != system32])
 
 
-def kill_tree(proc, timeout):
+def kill_tree(proc, timeout, total=False):
     """Kill the Popen proc and, on Windows, its descendants, which Popen.kill (TerminateProcess) leaves running,
     then wait up to timeout s for proc; its exit code, or None if it still runs. Windows runs taskkill /T /F from
     SystemRoot's System32, never a taskkill.exe the working directory holds, bounded by timeout s; a SystemRoot that
-    is not absolute, or a taskkill that fails or hangs, still reaches proc.kill(). A proc that already exited is
-    left alone: its pid could name another process's tree. Draining proc's pipes stays the caller's."""
+    is not absolute, or a taskkill that fails or hangs, still reaches proc.kill(). With total, the wait gets only
+    what taskkill left of timeout. A proc that already exited is left alone: its pid could name another process's
+    tree. Draining proc's pipes stays the caller's."""
+    end = time.monotonic() + timeout
     if os.name == 'nt' and proc.poll() is None:
         system_root = os.environ.get('SystemRoot', '')
         if absolute(system_root):
@@ -60,7 +62,7 @@ def kill_tree(proc, timeout):
                                creationflags=NO_WINDOW)
     proc.kill()
     try:
-        return proc.wait(timeout)
+        return proc.wait(max(0, end - time.monotonic()) if total else timeout)
     except subprocess.TimeoutExpired:
         return None
 
