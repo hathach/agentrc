@@ -264,6 +264,19 @@ class LaunchResultTest(unittest.TestCase):
                 self.assertEqual(len(blockers), 1, blockers)
                 self.assertIn(says, blockers[0])
                 self.assertEqual('`@coderabbitai review` on the PR or accepts the head' in blockers[0], ask['relaunchAsks'] is None, blockers[0])
+        # #272: another stop with CodeRabbit unreviewed notes whether a relaunch asks; its own blocker is unchanged.
+        for reason in ('reviews-pending', 'budget-exhausted', 'yielded'):
+            for ask, says in (({'relaunchAsks': None, 'asked': [{'ask': 'tick', 'at': '2026-10-23T01:00:00Z'}]},
+                               'CodeRabbit has not reviewed the head; this run already used its one ask on the head (a Trigger review tick '
+                               'at 2026-10-23T01:00:00Z), so a relaunch will not ask CodeRabbit on this head'),
+                              ({'relaunchAsks': 'tick', 'asked': []}, 'CodeRabbit has not reviewed the head; it skipped the head for a manual review '
+                               'and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once')):
+                with self.subTest(reason=reason, ask=ask):
+                    data = stopped(ask)
+                    data['result']['reason'] = reason
+                    s = self.run_it(data)[1]
+                    self.assertEqual(s['notes'], [says])
+                    self.assertFalse([b for b in s['blockers'] if 'CodeRabbit' in b], s['blockers'])
         # An output without the record: a failed tick leaves nothing on the PR, so its ask cannot be read there.
         blockers = self.run_it(stopped(None))[1]['blockers']
         self.assertEqual(len(blockers), 1, blockers)
@@ -313,6 +326,18 @@ class LaunchResultTest(unittest.TestCase):
         _, s = self.run_it(data)
         self.assertEqual([(r['batch'], r['commentId']) for r in s['receipts']['replies']], [('refutedPosts', 501), ('fixNotePosts', 7)])
         self.assertEqual([p['lane'] for p in s['receipts']['pushes']], ['reviewPush'])
+        self.assertEqual(s['receipts']['botAsks'], [])
+
+    def test_bot_asks_are_receipts_of_every_cycle_verbatim(self):
+        # #272: the bot asks a launch posted were only in its logs.
+        data = output()
+        obs = data['result']['observation']
+        tick = {'bot': 'coderabbit', 'kind': 'tick', 'outcome': 'ticked', 'commentId': 5, 'at': '2026-10-23T01:00:00Z', 'sha': HEAD}
+        ask = {'bot': 'greptile', 'kind': 'request', 'outcome': 'requested', 'commentId': 7, 'at': '2026-10-23T01:02:00Z', 'sha': HEAD}
+        obs['launchActions'] = [{'cycle': 1, 'botAsks': [tick]}, {'cycle': 2, 'botAsks': None}, {'cycle': 3, **obs['actions'], 'botAsks': [ask]}]
+        _, s = self.run_it(data)
+        self.assertEqual(s['receipts']['botAsks'], [tick, ask])
+        self.assertEqual(s['blockers'], [])
 
     def test_each_receipt_keeps_its_own_cycle_s_verdicts(self):
         data = output()

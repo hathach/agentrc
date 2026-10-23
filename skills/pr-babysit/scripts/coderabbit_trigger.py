@@ -32,10 +32,10 @@ after the reset). The outcome:
 
 and the line adds retryAt, the reset it read, null when it read none.
 
-detail names the comment ("comment N") on ticked, already and requested; at is
-the UTC time the script finished, or the request comment's time on requested
-and already. stdout ends with one JSON line {outcome, detail, at, seal} (seal:
-facts.sealed). Exit 2 with {"error": ...} when the arguments are wrong or
+detail names the comment ("comment N") on ticked, already and requested, and
+commentId is its id there; at is the UTC time the script finished, or the
+request comment's time on requested and already. stdout ends with one JSON line
+{outcome, detail, at, commentId?, seal} (seal: facts.sealed). Exit 2 with {"error": ...} when the arguments are wrong or
 GitHub's answer cannot be read. A rerun after a lost line reports `already`.
 """
 
@@ -84,7 +84,7 @@ def trigger(pr, head):
         raise Failed(f'{len(holders)} CodeRabbit comments hold one Trigger review box, not 1')
     c = holders[0]
     if BOX.search(c['body'])['mark'] != ' ':
-        return {'outcome': 'already', 'detail': f"comment {c['id']}"}
+        return {'outcome': 'already', 'detail': f"comment {c['id']}", 'commentId': c['id']}
     body = BOX.sub(lambda m: f"{m['pre']}x{m['post']}", c['body'])
     path = f'repos/{{owner}}/{{repo}}/issues/comments/{c["id"]}'
     # On stdin: a long summary comment can pass the kernel's 128 KiB limit on one argument.
@@ -97,7 +97,7 @@ def trigger(pr, head):
         m = None
     if not m or m['mark'] == ' ':
         raise Failed(f'comment {c["id"]} reads back without the box ticked')
-    return {'outcome': 'ticked', 'detail': f"comment {c['id']}"}
+    return {'outcome': 'ticked', 'detail': f"comment {c['id']}", 'commentId': c['id']}
 
 
 def pull_at(pr, head):
@@ -127,7 +127,7 @@ def request(pr, head):
     path = f'repos/{{owner}}/{{repo}}/issues/{pr}/comments'
     asked = [c for c in pages(path) if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= stamp(cr['retryAt'])]
     if asked:
-        return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'at': asked[0]['created_at'], **reset}
+        return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}
     # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
     why = unopened(pr, head)
     if why:
@@ -142,7 +142,7 @@ def request(pr, head):
         raise Failed(f'the posted request does not read back ({e})')
     if (back.get('body') or '').strip() != REQUEST:
         raise Failed(f"comment {posted['id']} reads back as another body")
-    return {'outcome': 'requested', 'detail': f"comment {posted['id']}", 'at': back['created_at'], **reset}
+    return {'outcome': 'requested', 'detail': f"comment {posted['id']}", 'commentId': posted['id'], 'at': back['created_at'], **reset}
 
 
 def collect(argv):

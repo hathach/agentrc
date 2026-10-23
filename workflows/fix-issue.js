@@ -298,7 +298,7 @@ const BAD_PATH = 'a path that is absolute or has an empty, . or .. segment'
 const stepFault = st => !st.paths.length ? 'no path' : !st.paths.every(relative) ? BAD_PATH
   : !covered(st.paths.map(p => p.trim()), planScope) ? 'a path outside the plan scope' : null
 const faults = [...(planScope.every(relative) ? [] : [`scope: ${BAD_PATH}`]),
-  ...plan.steps.map(st => [st.id, stepFault(st)]).filter(([, f]) => f).map(([id, f]) => `step ${id}: ${f}`)]
+  ...plan.steps.flatMap(st => { const f = stepFault(st); return f ? [`step ${st.id}: ${f}`] : [] })]
 const invalid = !plan.steps.length || !planScope.length ? 'no steps or no scope' : faults.join('; ') || null
 if (invalid) return stopPlan('plan-invalid', invalid, `the agreed plan breaks the step rules (${invalid}); ${fresh}`)
 if (Array.isArray(args.scope) && !covered(planScope, scope)) {

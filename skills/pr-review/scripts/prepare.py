@@ -118,11 +118,13 @@ def ci_summary(repo, pr):
 
 def groups_of(paths, cap):
     """Changed directories (a top-level file stands for itself), made shallower until at most cap
-    remain; past the top level everything is one group, the whole tree, which the diff still scopes."""
+    remain; past the top level everything is one group, the whole tree, which the diff still scopes.
+    A directory inside another group is dropped: that group's pathspec already covers it."""
     parts = [p.split('/') for p in paths]
     depth = max([len(x) - 1 for x in parts] + [1])
     while depth >= 1:
-        got = sorted({'/'.join(x[:min(depth, len(x) - 1)]) if len(x) > 1 else x[0] for x in parts})
+        dirs = {'/'.join(x[:min(depth, len(x) - 1)]) if len(x) > 1 else x[0] for x in parts}
+        got = sorted(d for d in dirs if not any(d.startswith(o + '/') for o in dirs))
         if len(got) <= cap:
             return got, False
         depth -= 1

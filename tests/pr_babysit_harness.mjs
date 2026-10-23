@@ -516,18 +516,18 @@ async function run(opts = {}) {
     if (label.startsWith('crtrigger#')) {
       // coderabbit_trigger.py's line: the box ticked unless opts.crTrigger(label) answers otherwise, finished when the
       // validator last observed unless it says when; null is a dead relay.
-      const answer = typeof opts.crTrigger === 'function' ? opts.crTrigger(label) : 'crTrigger' in opts ? opts.crTrigger : { outcome: 'ticked', detail: 'comment 5' }
+      const answer = typeof opts.crTrigger === 'function' ? opts.crTrigger(label) : 'crTrigger' in opts ? opts.crTrigger : { outcome: 'ticked', detail: 'comment 5', commentId: 5 }
       return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
     }
     if (label.startsWith('greptile#')) {
       // greptile_trigger.py's line: requested unless opts.gTrigger(label) answers otherwise, finished when the validator last observed.
-      const answer = typeof opts.gTrigger === 'function' ? opts.gTrigger(label) : 'gTrigger' in opts ? opts.gTrigger : { outcome: 'requested', detail: 'comment 7' }
+      const answer = typeof opts.gTrigger === 'function' ? opts.gTrigger(label) : 'gTrigger' in opts ? opts.gTrigger : { outcome: 'requested', detail: 'comment 7', commentId: 7 }
       return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
     }
     if (label.startsWith('crrequest#')) {
       // coderabbit_trigger.py --request's line: requested unless opts.crRequest(label) answers otherwise.
       const answer = typeof opts.crRequest === 'function' ? opts.crRequest(label) : 'crRequest' in opts ? opts.crRequest
-        : { outcome: 'requested', detail: 'comment 99', retryAt: null }
+        : { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: null }
       return answer === null ? null : conforms(options.schema, { at: answer.error ? '' : observed, ...structuredClone(answer) }, label)
     }
     if (label.startsWith('build:resolve#')) {
@@ -6869,6 +6869,9 @@ test('coderabbitTrigger ticks the Trigger review box on a manual-review skip, th
   assert.ok(logs.includes('cycle 1: crtrigger#1: ticked (comment 5)'), logs.join('\n'))
   assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 10m to cap)`)
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), triggeredAt: at(0) })
+  assert.deepEqual(result.observation.launchActions.map(a => a.botAsks),
+    [[{ bot: 'coderabbit', kind: 'tick', outcome: 'ticked', commentId: 5, at: at(0), sha: HEAD }], undefined], 'the tick is a receipt of its cycle (#272)')
+  assert.equal(result.coderabbitAsk, undefined, 'a pass names no ask')
 })
 
 test('a head is triggered once, across cycles and a resumed state, and stops unreviewed after the cap', async () => {
@@ -6877,7 +6880,7 @@ test('a head is triggered once, across cycles and a resumed state, and stops unr
   assert.equal(capped.result.cycles, 3)
   assert.deepEqual(triggers(capped.labels), ['crtrigger#1'])
   assert.equal(headLine(capped.logs)[2], `cycle 3 summary — CI green, reviews: coderabbit settled (skipped: ${MANUAL}; no review 10m after its trigger)`)
-  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true }, crTrigger: { outcome: 'already', detail: 'comment 5' }, reviews: quiet([skippedCr()]) })
+  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true }, crTrigger: { outcome: 'already', detail: 'comment 5', commentId: 5 }, reviews: quiet([skippedCr()]) })
   assert.equal(a.result.reason, 'yielded')
   assert.equal(a.result.state.reviewClock.triggeredAt, at(0))
   const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true, state: a.result.state }, clockOffset: 3, reviews: quiet([skippedCr()]) })
@@ -6885,7 +6888,7 @@ test('a head is triggered once, across cycles and a resumed state, and stops unr
   assert.deepEqual(triggers(b.labels), [])
   await assert.rejects(run({ args: { maxCycles: 3, state: { ...a.result.state, reviewClock: { ...a.result.state.reviewClock, triggeredAt: 'never' } } } }), /not a pr-babysit state/)
   // The cap runs from when the script finished, not from the harvest before it.
-  const late = await run({ args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 5, crTrigger: { outcome: 'ticked', detail: 'comment 5', at: at(4) }, reviews: quiet([skippedCr()]) })
+  const late = await run({ args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 5, crTrigger: { outcome: 'ticked', detail: 'comment 5', commentId: 5, at: at(4) }, reviews: quiet([skippedCr()]) })
   assert.equal(late.result.reason, 'coderabbit-unreviewed')
   assert.equal(late.result.cycles, 4)
   assert.equal(late.result.state.reviewClock.triggeredAt, at(4))
@@ -6912,6 +6915,7 @@ test('a CodeRabbit queued after its trigger waits out the cap from the trigger, 
   const perCycle = () => ({ ...quiet([++n === 1 ? skippedCr() : queued]), headEventAt: at(-20) })
   const early = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, reviewsPerCycle: perCycle })
   assert.equal(early.result.reason, 'reviews-pending')
+  assert.deepEqual(early.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: at(0) }] }, 'any stop with CodeRabbit unreviewed says it (#272)')
   assert.equal(headLine(early.logs)[1], 'cycle 2 summary — CI green, reviews: coderabbit queued (review requested, 9m to cap)')
   n = 0
   const late = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, minutesPerCycle: 5, reviewsPerCycle: perCycle })
@@ -6949,6 +6953,7 @@ test('a rate-limited CodeRabbit is asked once after its reset, then waited for',
   assert.ok(logs.includes('cycle 2: crrequest#2: requested (comment 99)'), logs.join('\n'))
   assert.equal(headLine(logs)[1], 'cycle 2 summary — CI green, reviews: coderabbit review triggered (Review rate limited, 10m to cap)')
   assert.deepEqual(result.state.reviewClock.request, { at: at(21), retryAt: at(20) })
+  assert.deepEqual(result.observation.launchActions[1].botAsks, [{ bot: 'coderabbit', kind: 'request', outcome: 'requested', commentId: 99, at: at(21), sha: HEAD }])
   // The same limit still showing after the cap: settled, not asked again.
   const silent = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 21, reviews: quiet([limitedCr(at(20))]) })
   assert.equal(silent.result.reason, 'coderabbit-unreviewed')
@@ -6990,7 +6995,7 @@ test('a reset extended before the request is waited for again, and asked about o
   const { result, labels, logs, napMs } = await run({
     args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 21,
     crRequest: (label) => label === 'crrequest#2' ? { outcome: 'notDue', detail: 'Review rate limited', retryAt: at(30) }
-      : { outcome: 'requested', detail: 'comment 99', retryAt: at(30) },
+      : { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: at(30) },
     reviewsPerCycle: () => quiet([++n < 4 ? limitedCr(at(20)) : bot('coderabbit')]),
   })
   assert.equal(result.pass, true, result.reason)
@@ -7025,7 +7030,7 @@ test('a fresh limit after the request, or a request that failed, stops CodeRabbi
 test('after a request, the same limit or a queued review waits from the request, and notLimited waits for the next harvest', async () => {
   // The limit is its reset time: other evidence around the same reset is the same limit.
   let m = 0
-  const crRequest = { outcome: 'requested', detail: 'comment 99', retryAt: at(0) }
+  const crRequest = { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: at(0) }
   const same = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, crRequest, reviewsPerCycle: () => quiet([limitedCr(at(0), [`check run ${++m}`])]) })
   assert.equal(same.result.reason, 'reviews-pending', 'one minute after the request is not its cap')
   assert.deepEqual(requests(same.labels), ['crrequest#1'])
@@ -7070,8 +7075,20 @@ test('a failed or lost trigger stops CodeRabbit unreviewed, logged and not asked
     assert.ok(logs.includes(`cycle 1: crtrigger#1: ${line}`), logs.join('\n'))
     assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit settled (skipped: ${MANUAL})`)
     assert.equal(result.state.reviewClock.triggeredAt, null, 'tried and not waiting')
+    assert.equal(result.observation.actions.botAsks, undefined, 'no comment named, no receipt')
     assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }] }, 'a failed tick is not tried again')
   }
+})
+
+test('a cycle that asked a bot to review and then met a GitHub rate limit stays charged', async () => {
+  const { result, labels } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 4 }, reviews: quiet([skippedCr()]),
+    inventoryWait: afterReviewLane('crtrigger#1'), garble: limitedInventory,
+  })
+  assert.equal(result.reason, 'github-rate-limited')
+  assert.deepEqual(triggers(labels), ['crtrigger#1'])
+  assert.deepEqual(result.observation.actions.botAsks.map(a => [a.kind, a.commentId]), [['tick', 5]])
+  assert.equal(result.state.cyclesUsed, 1, 'the posted ask is work: the cycle is not rolled back')
 })
 
 test('the CodeRabbit requirement outlives its switch: a resume waits on the earlier ask, asks nothing, and stops at its cap (#191)', async () => {
@@ -7085,11 +7102,13 @@ test('the CodeRabbit requirement outlives its switch: a resume waits on the earl
     assert.equal(b.result.reason, 'yielded', `${name}: three minutes after the ask, still waiting`)
     assert.deepEqual([...triggers(b.labels), ...requests(b.labels)], [], `${name}: nothing asked without the switch`)
     assert.equal(b.result.state.coderabbitRequired, true, name)
+    assert.deepEqual(b.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: name, at: at(asked) }] }, `${name}: a pause says the ask is spent`)
     const c = await run({ args: { ...Y, state: b.result.state }, clockOffset: asked + 10, reviews })
     assert.equal(c.result.reason, 'coderabbit-unreviewed', `${name}: the cap counted from the ask`)
     assert.deepEqual(c.result.bots.map(b => [b.bot, b.state, b.kind]), [['coderabbit', 'settled', name === 'tick' ? 'skipped' : 'limited']])
     const d = await run({ args: { ...Y, state: b.result.state }, clockOffset: asked + 5, reviews: quiet([bot('coderabbit')]) })
     assert.equal(d.result.pass, true, `${name}: only its review discharges it`)
+    assert.equal(d.result.coderabbitAsk, undefined, name)
   }
   // A new head without the switch is never ticked or asked about: a skip or a limit with nothing to wait on stops at once.
   for (const [name, reviews] of [['skipped', quiet([skippedCr()])], ['limited', quiet([limitedCr(at(15))])]]) {
@@ -7923,6 +7942,7 @@ test('greptileTrigger waits out a grace with Greptile absent, asks once, then wa
   assert.equal(labels.some(l => l.startsWith('prstate#')), false, 'the script reads the PR open at the head itself, just before it posts')
   assert.deepEqual(harvestFlags(calls.find(c => c.label === 'reviews#1').prompt)[1], ['coderabbit', 'greptile'])
   assert.ok(logs.includes('cycle 3: greptile#3: requested (comment 7)'), logs.join('\n'))
+  assert.deepEqual(result.observation.launchActions.flatMap(a => a.botAsks || []), [{ bot: 'greptile', kind: 'request', outcome: 'requested', commentId: 7, at: at(2), sha: HEAD }])
   assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), greptileAt: at(2) })
   assert.equal(result.state.greptileRequired, true)
   assert.equal(result.state.config.autoRun.join(), 'coderabbit', 'the switch is not pinned')
@@ -7942,7 +7962,7 @@ test('a head Greptile never reviews within the cap after the request stops grept
 test('a failed, uncertain or lost request stops greptile-unreviewed at once and is never repeated', async () => {
   for (const [gTrigger, line] of [
     [{ outcome: 'failed', detail: 'the head event time is unknown' }, 'failed (the head event time is unknown)'],
-    [{ outcome: 'uncertain', detail: 'comment 9 was posted and does not read back' }, 'uncertain (comment 9 was posted and does not read back)'],
+    [{ outcome: 'uncertain', detail: 'comment 9 was posted and does not read back', commentId: 9 }, 'uncertain (comment 9 was posted and does not read back)'],
     [{ outcome: 'ambiguous', detail: 'comment 9 was made at the head event second' }, 'ambiguous (comment 9 was made at the head event second)'],
     [{ error: 'gh: HTTP 502', outcome: '', detail: '', at: '' }, 'failed (gh: HTTP 502)'],
     [null, 'failed (no answer)'],
@@ -7954,6 +7974,9 @@ test('a failed, uncertain or lost request stops greptile-unreviewed at once and 
     assert.ok(logs.includes(`cycle 2: greptile#2: ${line}`), logs.join('\n'))
     assert.equal(result.state.reviewClock.greptileAt, null, 'tried, and not tried again')
     assert.equal(result.state.greptileRequired, true)
+    // #272: a comment posted without a read-back is still a receipt, marked uncertain.
+    assert.deepEqual(result.observation.launchActions.flatMap(a => a.botAsks || []).map(r => [r.outcome, r.commentId]),
+      gTrigger && gTrigger.outcome === 'uncertain' ? [['uncertain', 9]] : [], line)
   }
   // notOpen posted nothing: the PR's state, read then, ends the launch, or, still open at another head, stops it.
   const notOpen = { outcome: 'notOpen', detail: 'PR 3888 is closed at 0f1e2d3, not open at 0f1e2d3' }

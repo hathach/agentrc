@@ -573,7 +573,7 @@ const TRIGGER = withSeal({
   required: ['outcome', 'detail', 'at'],
   properties: {
     error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
-    retryAt: { type: ['string', 'null'] },
+    retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] },
   },
 })
 const ADOPT_AUDIT = withSeal({
@@ -959,7 +959,7 @@ const actionsOf = (e) => ({
   reviewFixes: e.reviewFixes || null, ciFixes: e.ciFixes || null,
   reviewPush: e.reviewPush || e.reviewPushFailed || null, ciPush: e.ciPush || e.ciPushFailed || null,
   refutedPosts: e.refutedPosts || null, fixNotePosts: e.fixNotePosts || null, deferralPosts: e.deferralPosts || null, error: e.error || null,
-  adoption: e.adoption || null,
+  adoption: e.adoption || null, ...(e.botAsks ? { botAsks: e.botAsks } : {}),
 })
 // status: complete, paused (a cycle ran, another may follow) or blocked.
 const finish = (verdict, status) => {
@@ -982,6 +982,8 @@ const finish = (verdict, status) => {
   const sonarUnmarked = !markSonar ? [] : [...answeredWith].filter(([, a]) => a.sonar)
     .map(([commentId, a]) => ({ commentId, how: (a.sonarOf || a).how, last: sonarLast.get(commentId) || (sonarDown ? { outcome: 'not asked', detail: sonarDown } : null) }))
   const { reason, pass, cycles, history: cycleHistory, ...rest } = verdict
+  const crAsk = !pass && !['pr-merged', 'pr-closed'].includes(reason) ? unreviewedCodeRabbit() : null
+  if (crAsk) rest.coderabbitAsk = coderabbitAskOf(crAsk)
   return {
     stateDigest: state.digest, status: status || (pass ? 'complete' : 'blocked'), ...(reason !== undefined ? { reason } : {}), pass, cycles,
     rollup: launchRollup(), ...rest, ...(size > STATE_MAX ? { stateTooLarge: size } : {}), ...(corrections.length ? { corrections } : {}), ...(handoffs.length ? { handoffs } : {}), ...(settlements.length ? { settlements } : {}), ...(sonarUnmarked.length ? { sonarUnmarked } : {}), history: cycleHistory, observation, state,
@@ -1842,9 +1844,23 @@ const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
   const outcome = known ? t.outcome : 'failed'
+  // An uncertain request posted a comment it could not read back: a receipt, not a verified one.
+  if (known && ['ticked', 'requested', 'already', 'uncertain'].includes(outcome) && Number.isInteger(t.commentId)) {
+    const entry = history[history.length - 1]
+    const [bot, ask] = ASK_OF[kind]
+    entry.botAsks = [...(entry.botAsks || []), { bot, kind: ask, outcome, commentId: t.commentId, at: t.at, sha: expectedHead }]
+  }
   const detail = known ? t.detail : !t ? 'no answer' : t.error || `unknown outcome ${JSON.stringify(t.outcome)}`
   log(`cycle ${cycle}: ${label}: ${outcome}${detail ? ` (${detail})` : ''}`)
   return { t: known ? t : null, outcome }
+}
+// A trigger script's comment, a receipt in its cycle's botAsks (#272); `already` found one standing, maybe a lost line's.
+const ASK_OF = { crtrigger: ['coderabbit', 'tick'], crrequest: ['coderabbit', 'request'], greptile: ['greptile', 'request'] }
+// The last reading of CodeRabbit in this launch when it is required and that reading of the head is no review of it.
+const unreviewedCodeRabbit = () => {
+  const read = coderabbitRequired && history.slice(launchFrom).reverse().find(e => e.bots)
+  const cr = read && read.head === expectedHead && read.bots.bots.find(b => b.bot === 'coderabbit')
+  return cr && cr.state !== 'reviewed' ? cr : null
 }
 // This run's asks of CodeRabbit on the stopped head, and which one a relaunch with coderabbitTrigger would still make. An ask
 // whose `at` is null was tried and failed.
@@ -2807,8 +2823,7 @@ const runLanes = async (cycle, entry, lanes) => {
         const why = missing.map(({ r, b }) => `${r.name} has not reviewed ${expectedHead.slice(0, 7)}, and ${r.bot}Trigger made its review required: ` +
           botCell(b, entry.bots.waitedMin)).join('; ')
         log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'}, but ${why} — stopping`)
-        const cr = missing.find(m => m.r.bot === 'coderabbit')
-        return stop(cycle, missing[0].r.stop, { head: expectedHead, bots: missing.map(m => botOut(m.b)), ...(cr ? { coderabbitAsk: coderabbitAskOf(cr.b) } : {}) })
+        return stop(cycle, missing[0].r.stop, { head: expectedHead, bots: missing.map(m => botOut(m.b)) })
       }
       // A pass shows every reviewer whose state was read and is not a review of the head (#193).
       const unreviewed = bots.filter(b => b.state !== 'reviewed' && b.state !== 'harvested').map(botOut)

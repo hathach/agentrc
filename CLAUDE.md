@@ -12,6 +12,12 @@ User-wide rules are in `instructions/user.md`; edit them there, and keep
   substituting the skill under edit.
 - Verify every change with `python -X utf8 -m unittest discover -s tests`,
   which also runs the workflow harnesses under node.
+- `pr-review` dimensions for this repo (no firmware, so no hardware
+  conformance): `correctness: logic, error and edge paths, state machines,
+  resource lifetime`; `concurrency: interrupt and thread safety, shared state,
+  ordering, reentrancy`; `API, compatibility and conventions: public API and
+  configuration, backward compatibility, tests and docs kept in step, the
+  repository's own conventions`.
 - `pr-babysit` args for this repo:
   `{"pr": <num>, "reviewers": ["coderabbit", "copilot", "greptile"], "autoRun": ["coderabbit"], "coderabbitTrigger": true, "greptileTrigger": true}`;
   Greptile auto-reviews on `open` events (`.greptile/config.json`); request

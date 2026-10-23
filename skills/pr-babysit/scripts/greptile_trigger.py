@@ -29,8 +29,10 @@ claim without a receipt only looks for the comment that claim made. The outcome:
              while the record stands; detail names it
 
 detail names the comment ("comment N") on requested and already; at is that
-comment's time on those, else the UTC time the script finished. stdout ends with
-one JSON line {outcome, detail, at, seal} (seal: facts.sealed). Exit 2 with
+comment's time on those, else the UTC time the script finished. commentId is the
+comment's id on requested and already, and on an uncertain one that was posted
+and did not read back. stdout ends with one JSON line {outcome, detail, at,
+commentId?, seal} (seal: facts.sealed). Exit 2 with
 {"error": ...} when the arguments are wrong or GitHub's answer cannot be read.
 A rerun after a lost line reports `already`.
 Deduplication is this checkout's: with no receipt recorded here, a later
@@ -93,8 +95,9 @@ def asks(pr):
     return [c for c in pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments') if (c.get('body') or '').strip() == REQUEST]
 
 
-def uncertain(path, why):
-    return {'outcome': 'uncertain', 'detail': f'{why}; nothing is posted for this head from this checkout while {path} stands'}
+def uncertain(path, why, comment=None):
+    return {'outcome': 'uncertain', 'detail': f'{why}; nothing is posted for this head from this checkout while {path} stands',
+            **({'commentId': comment} if comment is not None else {})}
 
 
 def found(path, record, outcome, pr, why):
@@ -104,7 +107,7 @@ def found(path, record, outcome, pr, why):
         return uncertain(path, why)
     c = min(new, key=lambda c: stamp(c['created_at']))
     receipt(path, record, c['id'], c['created_at'])
-    return {'outcome': outcome, 'detail': f"comment {c['id']}", 'at': c['created_at']}
+    return {'outcome': outcome, 'detail': f"comment {c['id']}", 'commentId': c['id'], 'at': c['created_at']}
 
 
 def request(pr, head):
@@ -117,7 +120,7 @@ def request(pr, head):
         record = read(path)
         if record and record.get('receipt'):
             r = record['receipt']
-            return {'outcome': 'already', 'detail': f"comment {r['id']}", 'at': r['at']}
+            return {'outcome': 'already', 'detail': f"comment {r['id']}", 'commentId': r['id'], 'at': r['at']}
         if record:
             return found(path, record, 'already', pr, f"an attempt claimed this head at {record['claimedAt']} and its comment is not on the PR")
         standing = asks(pr)
@@ -130,7 +133,7 @@ def request(pr, head):
         if after:
             c = newest(after, 'created_at')
             receipt(path, {'claimedAt': utc(time.time()), 'seen': [x['id'] for x in standing]}, c['id'], c['created_at'])
-            return {'outcome': 'already', 'detail': f"comment {c['id']}", 'at': c['created_at']}
+            return {'outcome': 'already', 'detail': f"comment {c['id']}", 'commentId': c['id'], 'at': c['created_at']}
         tied = [c for c in standing if stamp(c['created_at']) == stamp(event_at)]
         if tied:
             return {'outcome': 'ambiguous', 'detail': f"comment {tied[0]['id']} was made at {event_at}, the head event's own second ({evidence}): "
@@ -152,11 +155,11 @@ def request(pr, head):
         try:
             back = gh_json('api', f'repos/{{owner}}/{{repo}}/issues/comments/{posted}')
         except Unusable as e:
-            return uncertain(path, f'comment {posted} was posted and does not read back ({e})')
+            return uncertain(path, f'comment {posted} was posted and does not read back ({e})', posted)
         if (back.get('body') or '').strip() != REQUEST:
-            return uncertain(path, f'comment {posted} reads back as another body')
+            return uncertain(path, f'comment {posted} reads back as another body', posted)
         receipt(path, mine, posted, back['created_at'])
-        return {'outcome': 'requested', 'detail': f'comment {posted}', 'at': back['created_at']}
+        return {'outcome': 'requested', 'detail': f'comment {posted}', 'commentId': posted, 'at': back['created_at']}
 
 
 def collect(argv):

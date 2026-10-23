@@ -13,7 +13,9 @@ complete) is listed by its cell per check, and --keys adds each one's key.
 `result` keeps every top-level result field verbatim except history, observation
 and state, which are condensed; receipts are kept verbatim, each reply receipt
 with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings on
-its comment (a refutedPosts reply answers stale findings as well as invalid ones).
+its comment (a refutedPosts reply answers stale findings as well as invalid ones),
+and `botAsks` the trigger scripts' comments asking a bot to review (`already`
+found one standing, `uncertain` posted one that did not read back).
 `budget` is the returned state's
 cyclesUsed and maxCycles; `pinned` its config, the arguments a continuation
 passes unchanged, read from the --state-ref output when the launch returned no state. `blockers` lists what the caller must settle before
@@ -105,17 +107,22 @@ STALLED = {
 ASKS = {'tick': 'a Trigger review tick', 'request': 'an `@coderabbitai review` comment'}
 
 
-def coderabbit_blocker(ask):
-    """coderabbit-unreviewed from the run's own record of its asks on the head (#243: a relaunch for an ask already spent)."""
+def relaunch_ask(ask):
+    """Whether a relaunch asks CodeRabbit on the head, from the run's own record of its asks (#243: a relaunch for an ask
+    already spent)."""
     if ask.get('relaunchAsks') == 'tick':
-        return f"{CR_UNREVIEWED}; it skipped the head for a manual review and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once"
+        return 'it skipped the head for a manual review and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once'
     if ask.get('relaunchAsks') == 'request':
-        return (f"{CR_UNREVIEWED}; it is rate-limited until {ask.get('retryAt')} and this run never asked on the head: a relaunch with "
+        return (f"it is rate-limited until {ask.get('retryAt')} and this run never asked on the head: a relaunch with "
                 'coderabbitTrigger after that comments `@coderabbitai review` once')
     asked = '; '.join(f"{ASKS.get(a.get('ask'), a.get('ask'))} {'at ' + a['at'] if a.get('at') else 'that failed'}"
                       for a in ask.get('asked') or [])
     why = f'this run already used its one ask on the head ({asked})' if asked else "nothing in CodeRabbit's state is ours to ask"
-    return f'{CR_UNREVIEWED}; {why}, so a relaunch will not ask CodeRabbit on this head: {USER_ASKS}'
+    return f'{why}, so a relaunch will not ask CodeRabbit on this head'
+
+
+def coderabbit_blocker(ask):
+    return f'{CR_UNREVIEWED}; {relaunch_ask(ask)}' + ('' if ask.get('relaunchAsks') in ASKS else f': {USER_ASKS}')
 
 
 def load_output(path):
@@ -152,7 +159,7 @@ def finding_verdicts(findings, comment_id):
 
 
 def receipts(cycles, findings):
-    """Pushes, replies and the adoption every cycle of the launch recorded, verbatim, and what about them blocks.
+    """Pushes, replies, bot asks and the adoption every cycle of the launch recorded, verbatim, and what about them blocks.
 
     A reply batch's `pass` is the workflow's own verdict that every comment it
     owed is settled, its detail naming any that is not; the receipts are evidence.
@@ -160,8 +167,9 @@ def receipts(cycles, findings):
     retries what that one left unsettled. Each receipt carries the verdicts its
     own cycle harvested, the last harvest where a cycle recorded none.
     """
-    pushes, replies, blocking, adoption, batches = [], [], [], None, {}
+    pushes, replies, asks, blocking, adoption, batches = [], [], [], [], None, {}
     for actions in cycles:
+        asks += actions.get('botAsks') or []
         harvest = actions.get('findings', findings)
         for lane in ('reviewPush', 'ciPush'):
             p = actions.get(lane)
@@ -179,7 +187,7 @@ def receipts(cycles, findings):
                  for kind, posts in batches.items() if posts.get('pass') is not True]
     if adoption and adoption.get('publication') not in ('pushed', 'already-published', None):
         blocking.append(f'uncertain publication: adoption {adoption.get("from", "")[:8]}..{adoption.get("to", "")[:8]}: {adoption.get("publication")}')
-    return {'pushes': pushes, 'replies': replies, 'adoption': adoption}, blocking
+    return {'pushes': pushes, 'replies': replies, 'botAsks': asks, 'adoption': adoption}, blocking
 
 
 ATTENTION = ('check', 'cell', 'state', 'verdict', 'key', 'complete', 'files')
@@ -296,10 +304,14 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             blockers.append(REFUSED[result['reason']])
         if result.get('reason') in ENDED:
             notes.append(ENDED[result['reason']])
-        if result.get('reason') == 'coderabbit-unreviewed' and isinstance(result.get('coderabbitAsk'), dict):
-            blockers.append(coderabbit_blocker(result['coderabbitAsk']))
-        elif result.get('reason') in STALLED:
-            blockers.append(STALLED[result['reason']])
+        ask = result.get('coderabbitAsk') if isinstance(result.get('coderabbitAsk'), dict) else None
+        if ask and result.get('reason') == 'coderabbit-unreviewed':
+            blockers.append(coderabbit_blocker(ask))
+        else:
+            if result.get('reason') in STALLED:
+                blockers.append(STALLED[result['reason']])
+            if ask:
+                notes.append(f'CodeRabbit has not reviewed the head; {relaunch_ask(ask)}')
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]

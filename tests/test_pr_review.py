@@ -594,6 +594,9 @@ class Prepare(Case):
         self.assertEqual(prepare.groups_of(paths, 2), (['README.md', 'src'], False))
         self.assertEqual(prepare.groups_of(paths, 1), (['.'], True))
         self.assertEqual(prepare.groups_of(['a.c', 'b.c'], 6), (['a.c', 'b.c'], False))
+        # #271: skills/cowork/scripts was scanned again under skills/cowork.
+        nested = ['skills/cowork/SKILL.md', 'skills/cowork/scripts/cowork.py', 'agents/coworker.md']
+        self.assertEqual(prepare.groups_of(nested, 6), (['agents', 'skills/cowork'], False))
 
 
 class Ledger(Case):
