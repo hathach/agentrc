@@ -21,7 +21,7 @@ workflows/     saved workflows (Claude only)
 bin/           commands for the human, such as lsusbt
 statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
 plugins/       herdr plugins, one folder each with a herdr-plugin.toml
-lib/           windows.py, the Windows runtime helpers the scripts reach through their resolved path
+lib/           helpers the scripts share through their resolved path: windows.py (Windows runtime), greptile.py
 tests/         unit tests for skill scripts, hooks and the installer
 ```
 
@@ -80,8 +80,9 @@ and write UTF-8 themselves, so no `-X utf8` or `PYTHONUTF8` is needed. Bash's
 - a `python3` that is a native CPython 3.12+ (python.org's install manager or
   MSYS2's mingw build), not the WindowsApps alias and not MSYS2's
   `/usr/bin/python3`, for the workflows' script calls and the simplify gate's
-  wrapper; PyYAML in it for `pr-babysit`'s `harvest.py`, which `pr-review` also
-  imports, and for the tests. `install.py` registers a Python hook as
+  wrapper; PyYAML in it for the tests, and for `pr-babysit`'s `harvest.py`, which
+  `pr-review` also imports, to date a head by its pull_request runs (without it
+  they go unread and the harvest says so). `install.py` registers a Python hook as
   `'<the python that ran install.py>' '<hook>.py'`, since a hook that cannot
   start lets the tool call through; rerun it after replacing that Python, and
   name the interpreter the same way in the credit guard's recipe below.
@@ -118,6 +119,8 @@ the skipped tests and notes for a port:
 - the capture scripts of `usb-sniffer` (`sniff.py`) and `target-debug`
   (`etm_capture.py`, `dual_capture.py`): usbfs, `/proc` and POSIX process
   control.
+- `target-debug`'s `sysview_record.py`, which refuses there: it drives SystemView
+  under Xvfb and tracks its processes through `/proc` and process groups.
 - `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
   as a POSIX session and identifies it through `/proc` (#130).
 - `install.py --herdr-plugin` refuses on Windows; `worktree-remove` has no
@@ -140,7 +143,7 @@ Agent collaboration and PRs:
 | [`followup-issue`](skills/followup-issue/SKILL.md) | open a follow-up issue, or comment new evidence on one that covers the topic, read it back, never post twice | `publish.py create --repo o/r --allow-repo o/r --title t --body-file f` |
 | [`pr-babysit`](skills/pr-babysit/SKILL.md) | the fact collectors the pr-babysit workflow runs before it commits a fix | `preflight.py --pr N`, `hooks.py <path>...` |
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR: pin it, pick rig boards, run the pr-review workflow, leave it as a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
-| [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's log, rerun its failed jobs once after an infra failure | `circleci.py log <job>`, `rerun <job>...` |
+| [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's or Read the Docs build's log, rerun it once after an infra failure | `circleci.py log <job>`, `rerun <job>...`, `rtd.py log <url>` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
 | [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a herdr worktree when its task is done: check it, gate on pending follow-ups and PR state, then herdr removes it and the `worktree-children` plugin its siblings and branches | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
 
@@ -173,14 +176,15 @@ through its `Build contract:` and `HIL contract:` lines:
 | Skill | Use it to | Start with |
 |---|---|---|
 | [`hil`](skills/hil/SKILL.md) | run a project's HIL tests and judge their results: contract sections, board locks, verdicts, retries; a farm check (each board's probe on the bus and resetting it), never a test verdict | the project's `HIL contract:` page |
-| [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO, ETM instruction trace (J-Trace + Ozone); Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
+| [`target-debug`](skills/target-debug/SKILL.md) | explain what the firmware did: GDB autopsy, faults, RAM trace, PC sampling, SWO, ETM instruction trace (J-Trace + Ozone), SEGGER SystemView scheduling profiles; Espressif chips over USB-Serial-JTAG or pad JTAG with openocd-esp32 (read its `espressif.md` first) | `pc_sample.py --probe <uid> --device <dev> --interface swd --speed 4000 --elf <elf>` |
 | [`rtt`](skills/rtt/SKILL.md) | console or log over a debug probe (SEGGER RTT), live or post-mortem | `rtt.py --backend jlink --probe <serial> --device <dev> --interface swd --speed auto --seconds 20` |
 | [`usb-kernel-debug`](skills/usb-kernel-debug/SKILL.md) | capture Linux host URBs (usbmon); kernel dynamic debug on a host or gadget | `usbcap.py <vid:pid> 10`; `sudo usb_dyndbg.sh on\|off usbcore xhci_hcd` |
 | [`usb-sniffer`](skills/usb-sniffer/SKILL.md) | what crossed D+/D- with the ataradov sniffer, where usbmon cannot see | `sniff.py capture raw.pcapng --port <port> --seconds 30` |
 
 ## Simplify gate (per repository)
 
-`hooks/simplify-gate` snapshots the checkout and the worktrees nested in it when a prompt
+`hooks/simplify-gate` snapshots the checkout, the worktrees nested in it and its `<checkout>--*` sibling worktrees
+(linked worktrees of any repository; the user rules reserve that prefix for them) when a prompt
 arrives and when the session stops, then sends the diff to a read-only
 `codex exec` YAGNI challenge at Stop: at most two rounds per user turn, one
 retry on Codex failure, then the stop goes through with a notice. One review
@@ -279,10 +283,13 @@ unspecified review scope defaults to the whole PR; ask only when the PR,
 repository or worktree is ambiguous. A relaunch for the same PR task copies
 the grant verbatim from the earlier launch task, without asking again, until
 the task is done, the PR changes, or the human narrows or withdraws it; a
-later restriction rides along verbatim. A PR review submits under its own PR
-review exception, as `skills/pr-review/SKILL.md` asks it; its pending reviews
-need no exchange, under chief's standing exception. Leave the checkout to chief
-until it exits.
+later restriction rides along verbatim. A merge is granted only by the
+human's own words asking to merge that PR, under chief's merge exception: the
+task then also names the base branch and carries `Merge grant: yes — "<the
+words>"`, else `Merge grant: none`, a line a relaunch copies too. A PR review
+submits under its own PR review exception, as `skills/pr-review/SKILL.md` asks
+it; its pending reviews need no exchange, under chief's standing exception.
+Leave the checkout to chief until it exits.
 
 ## Tests
 

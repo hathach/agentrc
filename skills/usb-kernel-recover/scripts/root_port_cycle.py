@@ -17,6 +17,9 @@ Locks: the open (devio.c:1051) and every usbfs ioctl (devio.c:2608) take the roo
 lock uninterruptibly; only the transfer waits killably with TIMEOUT_MS (devio.c:1151). A root
 hub lock already held, e.g. by hub_wq disconnecting a child (hub.c:5896, 2334), leaves a run in
 D state, hence the supervision. Sources: Linux v6.12.107, USB 2.0, USB 3.2, uhubctl v2.6.0.
+
+Run by path by usb_recover.sh (ROOT_PORT_CYCLE), and listed in skills/hil/scripts/hil_reserve.py's
+FILES: a rename or CLI change needs both updated.
 """
 import ctypes
 import fcntl

@@ -60,6 +60,9 @@ location was refused or unresolved (reported); 2 bad usage, or Windows, refused;
 budget location gdb could not ask about or resolved to several addresses included; gdb exiting
 non-zero or by a signal leaves no budget), the run was interrupted, a core was left halted, removal
 is unchecked or failed, or the shutdown failed.
+
+Loaded by path by agentrc's skills/hil/scripts/hil_openocd_esp.py (and listed in hil_flash.py's FILES) and staged
+by tinyusb's hil-contract hil_remote.py: a rename or CLI change needs those consumers updated.
 """
 import argparse
 import contextlib
@@ -93,7 +96,7 @@ class Interrupted(Exception):
 
 
 def free_ports(n):
-    # kept identical with rtt.py's; the session token covers a port taken between this and openocd's bind
+    # same behaviour as rtt.py's; the session token covers a port taken between this and openocd's bind
     socks = [socket.socket() for _ in range(n)]
     try:
         for s in socks:

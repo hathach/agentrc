@@ -126,7 +126,8 @@ class FakeGitHub:
             self.mutations.append(('resolve', tid))
             self.threads[tid]['resolved'] = True
             return 0, json.dumps({'data': {'resolveReviewThread': {'thread': {'isResolved': True}}}}), ''
-        nodes = [{'id': t, 'isResolved': v['resolved'], 'comments': {'nodes': [{'databaseId': i} for i in v['ids']]}}
+        first = int(re.search(r'comments\(first:(\d+)\)', q).group(1))
+        nodes = [{'id': t, 'isResolved': v['resolved'], 'comments': {'nodes': [{'databaseId': i} for i in v['ids'][:first]]}}
                  for t, v in self.threads.items()]
         return 0, json.dumps({'data': {'repository': {'pullRequest': {'reviewThreads': {
             'pageInfo': {'hasNextPage': False, 'endCursor': None}, 'nodes': nodes}}}}}), ''
@@ -252,6 +253,24 @@ class ReplyTest(ReplyCase):
         self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted']), (0, 901, False), 'the retry reuses the reply')
         self.assertEqual(len(self.gh.mutations), 1)
 
+    def test_a_listing_of_another_shape_posts_nothing(self):
+        # a malformed listing must not read as one without our reply, which would post it again
+        body = 'Fixed in abc1234.'
+        self.gh.add_review(10)
+        self.gh.issue_comment(800, f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-10\n\n{body}', ME)
+        real = self.gh.rest
+        for shape in ({}, [{}], [[], {}], [], [[7]]):
+            with self.subTest(shape=shape):
+                self.gh.rest = lambda method, path, b, paginate: (
+                    shape if paginate and path.split('?')[0] == f'repos/{REPO}/issues/{PR}/comments' else real(method, path, b, paginate))
+                rc, receipts = self.run_script([{'commentId': 10, 'body': body}])
+                self.assertEqual((rc, receipts[0]['sent'], receipts[0]['posted'], receipts[0]['verified']), (1, False, False, False))
+                self.assertIn('unusable response', receipts[0]['error'])
+                self.assertEqual(self.gh.mutations, [])
+        self.gh.rest = real
+        rc, receipts = self.run_script([{'commentId': 10, 'body': body}])
+        self.assertEqual((rc, receipts[0]['replyId'], receipts[0]['posted']), (0, 800, False), 'read whole, the reply is found')
+
     def test_quoted_reply_of_the_same_kind_in_other_words_is_left_to_a_human(self):
         self.gh.add_review(30)
         quote = f'> https://github.com/{REPO}/pull/{PR}#pullrequestreview-30\n\n'
@@ -362,6 +381,15 @@ class ReplyTest(ReplyCase):
                 self.assertIn('rate limit', receipts[0]['error'])
                 self.assertEqual((receipts[1]['commentId'], receipts[1]['replyId'], receipts[1]['verified']), (11, 56, False))
                 self.assertIn('not tried', receipts[1]['error'])
+
+    def test_a_comment_deep_in_a_long_thread_resolves_it(self):
+        # a thread lists its comments in pages; its first comment names it
+        self.gh.review_comment(10)
+        for cid in range(11, 71):
+            self.gh.review_comment(cid, f'note {cid}', thread='T10', parent=10)
+        rc, receipts = self.run_script([{'commentId': 65, 'body': 'answered'}])
+        self.assertEqual((rc, receipts[0]['resolved'], receipts[0]['error']), (0, True, None))
+        self.assertEqual(self.gh.mutations[-1], ('resolve', 'T10'))
 
     def test_already_resolved_thread_is_left_alone(self):
         self.gh.review_comment(10)
@@ -587,8 +615,10 @@ class ReceiptFileTest(ReplyCase):
         self.assertIn('receipt not saved: disk full', err)
 
     def test_inspect_takes_no_receipt(self):
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             reply.main(['--pr', str(PR), '--repo', REPO, '--inspect', '10', '--receipt', os.path.join(self.tmp, 'x')])
+        self.assertEqual(json.loads(out.getvalue()), {'error': 'usage: --receipt is for --manifest, --reuse and --edit'})
 
 
 class SealTest(ReplyCase):
@@ -605,7 +635,6 @@ class SealTest(ReplyCase):
             _, out = self.main(*args)
             line = {k: v for k, v in out.items() if k != 'seal'}
             self.assertEqual(out['seal'], facts.sealed(line)['seal'], args)
-        self.assertEqual(reply.sealed({'receipts': [], 'error': 'x'})['seal'], facts.sealed({'receipts': [], 'error': 'x'})['seal'])
 
 
 class ReconcileTest(ReplyCase):

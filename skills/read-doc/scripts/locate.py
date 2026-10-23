@@ -219,7 +219,7 @@ def extract(bid, src):
                 "extractor": EXTRACTOR, "version": VERSION}
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(meta) + "\n" + body)
-        retried(os.replace, tmp, text_path(bid))
+        windows.replace(tmp, text_path(bid))
         return meta
     finally:
         if os.path.exists(tmp):

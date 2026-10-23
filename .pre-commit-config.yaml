@@ -3,8 +3,8 @@ repos:
     hooks:
       - id: skill-tests
         name: skill-tests
-        files: ^(skills/|tests/|hooks/|workflows/|install\.py$)
         entry: python -X utf8 -m pytest -n 8 --dist worksteal -p no:cacheprovider -q tests
         pass_filenames: false
+        always_run: true
         language: python
         additional_dependencies: [pyyaml, pytest==9.1.1, pytest-xdist==3.8.0]

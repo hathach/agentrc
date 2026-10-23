@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Where each requested review bot stands on a PR's head, and every comment its reviewers left.
 
-  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile
+  harvest.py --pr N --reviewers copilot,coderabbit,greptile,code-scanning --auto-run coderabbit,greptile [--repo OWNER/REPO]
 
 --auto-run names the bots settled from their artifacts, only coderabbit and greptile. Copilot is read
 from its newest submitted review on the head; any other reviewer is `harvested`, its state not read.
 
-Run from the PR checkout. It settles first and harvests second: the bots'
+Run from the PR checkout; --repo names the PR's repository instead of the checkout's. It settles first and harvests second: the bots'
 artifacts are read, then the three comment endpoints, then the head again; a
 head that moved restarts the read once on the new head, and one that moves
 again is an error. The settle rules are this file's, and its tests', and read
@@ -15,7 +15,8 @@ evidence it cannot order, or a read that failed makes that bot `unknown`,
 never `absent`.
 
 stdout ends with one JSON line: headSha, observedAt, headEventAt (null when no
-run or timeline event dates the head, or no bot auto-runs), headEventEvidence, bots (one record per
+run or timeline event dates the head, or no bot auto-runs), headEventEvidence (saying so when, without
+PyYAML, no pull_request run on the head could be read to date it), bots (one record per
 --reviewers name: bot, state, kind, sha, evidence, reason, retryAt: when a rate-limited
 bot's notice says its next review is available, an hour after a CodeRabbit notice
 giving no countdown, else null), and comments (every
@@ -24,7 +25,10 @@ review|issue|review-body, commentId, source, author, body verbatim, digest
 (pr-reply's comment_digest.py: sha256 of the body, 12 hex, without what
 CodeRabbit rewrites at its end), aliases (the digests a body's earlier forms
 may have been recorded under; left out when there are none), path, line,
-commitId, createdAt, updatedAt, inReplyTo, url). Two bodies no finding comes from are left
+commitId, createdAt, updatedAt, inReplyTo, url), and fingerprint: `<reviewers>|<auto-run>|<32 hex>`, a
+sha256 over what the bots left that a review of the head could rest on (each comment's kind, id and digest, each
+submitted review by a reviewer, empty ones too, and the head's statuses and check runs from CodeRabbit and Greptile),
+never over a time, so a new, edited or dismissed review or a changed bot status changes it. Two bodies no finding comes from are left
 out, with body null, bodyOmitted and bodyLength: a CodeRabbit issue comment that opens
 with its walkthrough marker (CR_WALKTHROUGH), the auto-generated summary,
 "coderabbit-walkthrough"; and a Copilot review body saying it could not review,
@@ -35,11 +39,18 @@ head, or a comment endpoint, plus facts.py's rateLimit when GitHub refused gh fo
 
 import base64
 import functools
+import hashlib
 import json
 import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# Only reading a workflow file needs PyYAML; sonar.py and coderabbit_trigger.py import this file under a python3 that may lack it.
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, RateLimited, Unusable, report, run  # noqa: E402
@@ -379,10 +390,14 @@ def head_event(repo, n, view, head):
     # A reopen or ready event keeps the head (GitHub leaves its commit_id null); one naming another commit is about an earlier push.
     tl = newest([e for e in timeline if e.get('event') in ('reopened', 'ready_for_review') and e.get('commit_id') in (None, head)], 'created_at')
     if tl and (best is None or stamp(tl['created_at']) > stamp(best['created_at'])):
-        return tl['created_at'], f"timeline {tl['event']} at {tl['created_at']}"
-    if best:
-        return best['created_at'], f"run {best['id']} ({best['event']}, {best['path']}) created {best['created_at']}"
-    return None, 'no push or head-activity pull_request run on this branch and head, and no reopen or ready event'
+        at, why = tl['created_at'], f"timeline {tl['event']} at {tl['created_at']}"
+    elif best:
+        at, why = best['created_at'], f"run {best['id']} ({best['event']}, {best['path']}) created {best['created_at']}"
+    else:
+        at, why = None, 'no push or head-activity pull_request run on this branch and head, and no reopen or ready event'
+    if yaml is None and any(x.get('event') == 'pull_request' for x in runs):
+        why += '; PyYAML is not installed, so no pull_request run was read'
+    return at, why
 
 
 def dates_head(repo, run_, branch, head_repo):
@@ -397,11 +412,9 @@ def dates_head(repo, run_, branch, head_repo):
 
 @functools.cache
 def pr_types(repo, path, sha):
-    """The pull_request activity types a workflow revision runs on, or None when they cannot be read."""
-    try:
-        import yaml  # here, so sonar.py and coderabbit_trigger.py, which import this file, run without PyYAML
-    except ImportError:
-        raise Unusable('PyYAML is not installed')
+    """The pull_request activity types a workflow revision runs on, or None when they cannot be read, PyYAML missing too."""
+    if yaml is None:
+        return None
     try:
         meta = gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
@@ -454,8 +467,22 @@ def comments(repo, n, reviewers, issue=None, reviews=None):
     return got
 
 
+def fingerprint(reviewers, auto, harvested, reviews, statuses, checks):
+    """`<reviewers>|<auto-run>|<32 hex>` over the review evidence on the PR, so a later harvest can tell whether any of
+    it changed; the reviewer lists are in it because they decide what is read."""
+    records = [['comment', c['kind'], c['commentId'], c['digest']] for c in harvested]
+    records += [['review', v['id'], v.get('commit_id'), v.get('state'), digest(v.get('body'))]
+                for v in reviews if source_of(v['user']['login'], reviewers)]
+    records += [['status', x.get('id'), x.get('context'), x['state'], x.get('description')] for x in statuses if x.get('context') == 'CodeRabbit']
+    records += [['check', c['id'], c.get('name'), c['status'], c.get('conclusion'), (c.get('output') or {}).get('title'),
+                 digest((c.get('output') or {}).get('summary'))]
+                for c in checks if c.get('name') == 'CodeRabbit' or (c.get('app') or {}).get('slug') == greptile_check.APP]
+    blob = json.dumps(sorted(json.dumps(r) for r in records))
+    return f"{','.join(reviewers)}|{','.join(auto)}|{hashlib.sha256(blob.encode()).hexdigest()[:32]}"
+
+
 def observe(repo, n, reviewers, auto):
-    view = gh_json('pr', 'view', str(n), '--json', 'headRefOid,headRefName,headRepository')
+    view = gh_json('pr', 'view', str(n), '-R', repo, '--json', 'headRefOid,headRefName,headRepository')
     head = view['headRefOid']
     if not FULL_SHA.match(head or ''):
         raise Unusable(f'gh pr view {n}: no head SHA')
@@ -463,7 +490,7 @@ def observe(repo, n, reviewers, auto):
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
     checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
     issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
-    reviews = pages(f'repos/{repo}/pulls/{n}/reviews') if 'greptile' in reviewers or 'copilot' in reviewers else None
+    reviews = pages(f'repos/{repo}/pulls/{n}/reviews')
     harvested = comments(repo, n, reviewers, issue, reviews)
     now = datetime.now(timezone.utc)
     bots = []
@@ -480,7 +507,8 @@ def observe(repo, n, reviewers, auto):
             n_ = sum(c['source'] == bot for c in harvested)
             bots.append(record(bot, 'harvested', f'{n_} comment(s) harvested; it does not auto-run here, so its state is not read'))
     return {'headSha': head, 'observedAt': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested}
+            'headEventAt': event_at, 'headEventEvidence': event_why, 'bots': bots, 'comments': harvested,
+            'fingerprint': fingerprint(reviewers, auto, harvested, reviews, statuses, checks)}
 
 
 def collect(argv):
@@ -488,6 +516,7 @@ def collect(argv):
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--reviewers', required=True)
     p.add_argument('--auto-run', default='')
+    p.add_argument('--repo')
     a = p.parse_args(argv)
     reviewers = [r for r in a.reviewers.split(',') if r]
     auto = [r for r in a.auto_run.split(',') if r]
@@ -495,10 +524,10 @@ def collect(argv):
     if unknown or not set(auto) <= set(reviewers):
         raise Unusable(f'reviewers are {", ".join(KNOWN)}, and --auto-run a subset of them among {", ".join(SETTLED)}: {unknown or auto}')
     try:
-        repo = gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
+        repo = a.repo or gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
         for _ in range(2):
             seen = observe(repo, a.pr, reviewers, auto)
-            again = gh_json('pr', 'view', str(a.pr), '--json', 'headRefOid')['headRefOid']
+            again = gh_json('pr', 'view', str(a.pr), '-R', repo, '--json', 'headRefOid')['headRefOid']
             if again == seen['headSha']:
                 return seen
     except (KeyError, TypeError, AttributeError, IndexError, ValueError) as e:

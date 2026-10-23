@@ -43,25 +43,8 @@ and exits 1 when any build could not be re-run; builds of one version share one
 new build. The token is `RTD_TOKEN`, from the environment or a login shell; without it
 the script exits 2.
 
-# A PR's CI for a judge
-
-`scripts/collect.py` is `pr-babysit`'s CI lane without a model: `inventory`
-waits a bounded time and lists a head's failed and cancelled checks with a
-count of pending ones (a failed CircleCI job counts as pending until its
-workflow finishes and can be re-run), calling a PR that conflicts with its base
-`conflicting`, or at once `merged`/`closed` for a PR no longer open, leaving
-out any `--ignore-check NAME` (a review bot's status the caller waits on
-elsewhere), and
-`failures` saves each failing check's log and diagnostics, with the base
-branch's run of the same job, for the
-`pr-ci-watcher` judge; `remember` and `recall` keep the judge's verdicts beside
-that evidence, so a relaunch reuses them. Its docstring is the contract.
-
-```bash
-K=~/.claude/skills/ci-rerun/scripts/collect.py
-python3 $K inventory --repo <owner/name> --pr <N> --head <sha> --wait-seconds 540
-python3 $K failures --repo <owner/name> --pr <N> --head <sha> --check <link>...
-```
+`scripts/collect.py` is pr-babysit's CI collector, not a tool for this skill's
+users: its docstring is the contract.
 
 # Judgment
 

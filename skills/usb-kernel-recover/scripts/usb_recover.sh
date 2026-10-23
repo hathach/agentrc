@@ -4,7 +4,7 @@
 #
 # Usage, by path (sudo's PATH does not include the script; <skill dir> is this skill's directory):
 #   sudo <skill dir>/scripts/usb_recover.sh <verb> ...
-#   authorized <busport>   # e.g. 3-2  -> deauthorize+reauthorize (re-enumerate, NO VBUS cut)
+#   authorized <busport>   # e.g. 3-2  -> deauthorize+reauthorize: unconfigure and reconfigure, no re-enumeration, NO VBUS cut
 #   root-cycle <busport> [serial]  # e.g. 13-1.6 -> port power off, 5 s, on at the ROOT port
 #                          # feeding it, sent over the root hub's own usbfs node only
 #                          # (root_port_cycle.py); [serial] is verified against the device and
@@ -28,6 +28,9 @@
 #                          # (same inode) and drop the record; refused while a DIFFERENT owner
 #                          # is still alive. A stale record (owner gone) needs no pid.
 #   shield-status [busport] # records, their owners (alive/dead) and what is still shielded
+#
+# Run by path from tinyusb's hil-contract SKILL.md and agentrc's skills/hil/scripts/hil_reserve.py:
+# a rename or CLI change needs those consumers updated.
 set -euo pipefail
 
 # The shield's locking attributes: served under the device lock, so a wedged device blocks
@@ -70,14 +73,9 @@ lock_read() {
   # `uhubctl -a cycle`, which tears the subtree down and blocks holding the ROOT HUB
   # lock -- taking the whole bus with it. That is how one wedge becomes an incident.
   #
-  # `timeout` is enough, though this said for a while that it was not (claiming the read
-  # sits in D state, where SIGKILL is not delivered, so timeout waitpid()s forever). It
-  # does not: v6.12.101 drivers/usb/core/sysfs.c takes the lock for every READ through
-  # usb_lock_device_interruptible -> device_lock_interruptible -> mutex_lock_interruptible,
-  # so the waiter sleeps INTERRUPTIBLY and SIGTERM ends it. Uninterruptible is the usbfs
-  # ioctl HOLDER, not us. The abandon-a-background-reader dance that claim justified is
-  # gone, and with it a fail-open where an absent attribute answered '?' -- the wedge
-  # signature, which root-cycle reads as "cannot confirm serial, proceed".
+  # `timeout` ends it: v6.12.101 drivers/usb/core/sysfs.c takes the lock for every READ through
+  # usb_lock_device_interruptible, so the waiter sleeps interruptibly; only the usbfs ioctl
+  # holder is not.
   local v rc=0
   # `|| rc=$?`, never a bare assignment: under this script's `set -e` a command
   # substitution that FAILS (an absent attribute -- most hubs and probes have no
@@ -85,6 +83,14 @@ lock_read() {
   v=$(timeout 2 cat "$1" 2>/dev/null) || rc=$?
   [ "$rc" -eq 124 ] && { echo '?'; return; }      # timed out: nobody answered
   printf '%s\n' "$v"
+}
+
+# Refuse to touch a PCI function that is not a USB controller (class 0x0c03xx), so a stray or
+# mistyped BDF can't unbind/reset an unrelated device (storage, NIC) on a shared HIL host.
+require_usb_controller() {
+  local addr=$1 cls
+  cls=$(cat "$SYSFS/bus/pci/devices/$addr/class" 2>/dev/null) || die "no such pci device: $addr"
+  [[ "$cls" =~ ^0x0c03 ]] || die "$addr is not a USB controller (class $cls); refusing"
 }
 
 # Generation marker for "did this device actually re-enumerate". A real disconnect destroys the
@@ -108,14 +114,6 @@ lock_read() {
 # The trailing slash is load-bearing: /sys/bus/usb/devices/<busport> is a SYMLINK with its own
 # separate inode, so without it stat reports the link rather than the device it points at, and the
 # value would never change. Do not "tidy" it away.
-# Refuse to touch a PCI function that is not a USB controller (class 0x0c03xx), so a stray or
-# mistyped BDF can't unbind/reset an unrelated device (storage, NIC) on a shared HIL host.
-require_usb_controller() {
-  local addr=$1 cls
-  cls=$(cat "$SYSFS/bus/pci/devices/$addr/class" 2>/dev/null) || die "no such pci device: $addr"
-  [[ "$cls" =~ ^0x0c03 ]] || die "$addr is not a USB controller (class $cls); refusing"
-}
-
 sysfs_gen() { stat -c %i "$SYSFS/bus/usb/devices/$1/" 2>/dev/null || echo none; }
 
 await_reenum() {  # await_reenum TARGET GEN: print its new generation; non-zero after ten 1 s looks without one

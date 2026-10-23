@@ -90,3 +90,20 @@ family.
   p1277-1278, p1291), so a system reset drops the device until firmware sets PWRDWN. A J-Link `r; g` gave "USB
   disconnect" and re-enumeration 325 ms later, while a bare halt stayed connected. verified 2026-08-16 stm32f407disco
   (`usb-kernel-recover`, rung 1; firmware revision not recorded).
+
+## MAX3266x
+
+- The Cortex-M4's DWT has no cycle counter: `DWT_CTRL` read `0x4F000000`, i.e. NUMCOMP 4 with NOTRCPKT, NOEXTTRIG,
+  NOCYCCNT and NOPRFCNT all set (ARMv7-M ARM DDI 0403D, book 1244, pp. C1-880–C1-881), and CYCCNT stayed 0 with
+  TRCENA set. Anything timed by CYCCNT (SystemView's default Cortex-M timestamp, a DWT-based delay) reads zero there
+  without a build or link error. carried over (2026-08-11 max32666fthr, tinyusb SystemView build).
+
+## WCH QingKe (SDI)
+
+- What a WCH-Link attach does to the target, by part: ch32v20x and ch32v30x survive an OpenOCD attach and halt with RAM
+  intact, so a halted RAM dump works; ch32v10x resets on every attach and ch582m's OpenOCD attach resets it, so neither
+  keeps a RAM ring across an attach. Streaming from a running hart is out on all of them (`rtt`, transport matrix).
+  carried over (2026-08-11 nanoch32v203, 2026-09-04 ch32v307v_r1_1v0 dump; OpenOCD 0.12.0+dev-02620,
+  `hathach/openocd` tinyusb branch).
+- That OpenOCD's init halts the hart, so a tool reading the state after `init` sees `halted` on a running ch32v30x:
+  `sysview_dump.py`'s `core.before` reads `halted` there (2026-10-22 ch32v307v_r1_1v0).

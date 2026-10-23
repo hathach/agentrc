@@ -86,50 +86,23 @@ receipt, and its rerun reports only what it did itself.
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comment_digest  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+from seal import RATE_LIMITED, fnv1a, sealed  # noqa: E402
 
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owner:$o,name:$r){'
                  'pullRequest(number:$p){reviewThreads(first:100,after:$c){pageInfo{hasNextPage endCursor}'
-                 'nodes{id isResolved comments(first:50){nodes{databaseId}}}}}}}')
+                 'nodes{id isResolved comments(first:1){nodes{databaseId}}}}}}}')
 RESOLVE_MUTATION = 'mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}'
 
 
 class ApiError(Exception):
     pass
-
-
-# What pr-babysit reads as a rate limit in a receipt's error.
-RATE_LIMITED = re.compile(r'rate limit|HTTP 429', re.I)
-
-
-def fnv1a(text):
-    """The same checksum pr-babysit computes over a body it hands out."""
-    h = 0x811c9dc5
-    for ch in text:
-        h = ((h ^ ord(ch)) * 0x01000193) & 0xffffffff
-    return f'{h:08x}'
-
-
-def sealed(facts):
-    """facts plus pr-babysit's seal, as its facts.py computes it: fnv1a over the canonical
-    JSON with null members left out, so a relay that copies a line wrong is caught."""
-    def bare(v):
-        # Keys in UTF-16 code-unit order, as JavaScript's sort() compares them.
-        if isinstance(v, dict):
-            return {k: bare(v[k]) for k in sorted(v, key=lambda k: k.encode('utf-16-be', 'surrogatepass')) if v[k] is not None}
-        if isinstance(v, list):
-            return [bare(x) for x in v]
-        return v
-    # Top-level error stays out: a checked line has none, and a relay may fill in error: ''.
-    text = json.dumps(bare({k: v for k, v in facts.items() if k != 'error'}), separators=(',', ':'), ensure_ascii=False)
-    # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
-    return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
 
 
 def gh(args, stdin=None):
@@ -150,12 +123,18 @@ def api(method, path, body=None, paginate=False):
     rc, out, err = gh(args, stdin)
     if rc != 0:
         raise ApiError(err.strip() or out.strip())
+    if paginate:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
+        # else {} or [{}] would read as a listing without our reply, and post it again
+        if not (isinstance(data, list) and data and all(isinstance(page, list) and all(isinstance(x, dict) for x in page) for page in data)):
+            raise ApiError(f'unusable response (not a list of pages of objects): {out.strip()[:200]}')
+        return [x for page in data for x in page]
     if not out.strip():
         return None
-    data = json.loads(out)
-    if paginate:
-        return [x for page in data for x in page]
-    return data
+    return json.loads(out)
 
 
 def graphql(query, variables):
@@ -263,7 +242,10 @@ class Poster:
         bad = ([] if c.get('body') == body else ['body']) + self.misplaced(kind, target, c)
         return (True, None) if not bad else (False, f'read-back mismatch on {", ".join(bad)}')
 
-    def resolve(self, comment_id):
+    def resolve(self, target):
+        """Resolve review comment target's thread, found by its first comment: the target can lie past any page of
+        the thread's comments."""
+        root = thread_root(target)
         owner, name = self.repo.split('/', 1)
         cursor = None
         while True:
@@ -272,14 +254,14 @@ class Poster:
                 v['c'] = cursor
             page = graphql(THREADS_QUERY, v)['data']['repository']['pullRequest']['reviewThreads']
             for t in page['nodes']:
-                if any(c['databaseId'] == comment_id for c in t['comments']['nodes']):
+                if [c['databaseId'] for c in t['comments']['nodes']] == [root]:
                     if t['isResolved']:
                         return None
                     r = graphql(RESOLVE_MUTATION, {'id': t['id']})
                     ok = r.get('data', {}).get('resolveReviewThread', {}).get('thread', {}).get('isResolved')
                     return None if ok else 'resolve mutation did not report isResolved'
             if not page['pageInfo']['hasNextPage']:
-                return f'no review thread contains comment {comment_id}'
+                return f'no review thread contains comment {target["id"]}'
             cursor = page['pageInfo']['endCursor']
 
 
@@ -380,7 +362,7 @@ def receipt(comment_id, reply_id, digest):
 def reuse(poster, item):
     rc = receipt(item['commentId'], item['replyId'], item['bodyDigest'])
     try:
-        _, text, why = read_again(poster, item, rc)
+        original, text, why = read_again(poster, item, rc)
         if text is not None:
             rc['digest'] = fnv1a(text)
         if why:
@@ -388,7 +370,7 @@ def reuse(poster, item):
             return rc
         rc['verified'] = True
         if rc['kind'] == 'review':
-            rc['error'] = poster.resolve(item['commentId'])
+            rc['error'] = poster.resolve(original)
             rc['resolved'] = rc['error'] is None
     except ApiError as e:
         # Once the comment is found, a failed read leaves the reply unknown; a
@@ -418,7 +400,7 @@ def edit(poster, item):
             rc['posted'] = True
         rc['verified'], rc['error'] = poster.verify(kind, original, item['replyId'], body)
         if rc['verified'] and kind == 'review':
-            rc['error'] = poster.resolve(item['commentId'])
+            rc['error'] = poster.resolve(original)
             rc['resolved'] = rc['error'] is None
     except ApiError as e:
         rc['error'] = str(e)
@@ -451,7 +433,7 @@ def handle(poster, item):
         rc['replyId'] = reply_id
         rc['verified'], rc['error'] = poster.verify(kind, original, reply_id, body)
         if rc['verified'] and kind == 'review':
-            rc['error'] = poster.resolve(item['commentId'])
+            rc['error'] = poster.resolve(original)
             rc['resolved'] = rc['error'] is None
     except ApiError as e:
         rc['error'] = str(e)

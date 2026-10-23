@@ -16,12 +16,15 @@ an Operation of its Attempts; what their kinds, cleanup and receipts mean to a c
 from __future__ import annotations
 
 import contextlib
+import glob
 import importlib.util
+import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -32,7 +35,9 @@ from typing import NamedTuple
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYOCD_LAUNCHER = os.path.join(HERE, 'pyocd', 'run_pyocd.py')
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py',
-         'skills/hil/scripts/pyocd/run_pyocd.py', 'skills/hil/scripts/pyocd/user_script.py')
+         'skills/hil/scripts/pyocd/run_pyocd.py', 'skills/hil/scripts/pyocd/user_script.py',
+         'skills/hil/scripts/hil_openocd_esp.py', 'skills/hil/scripts/usb_observe.py',
+         'skills/target-debug/scripts/esp_session.py', 'skills/hil/scripts/esptool_session.py')
 
 
 def _hil_load():
@@ -260,6 +265,102 @@ def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, 
                 time.sleep(retry_delay)
             _attempt(attempts, run, argv, text, timeout=timeout)
     return Operation(attempts, retry_refused=refused)
+
+
+# Each JLinkExe -CommandFile command's completion line in its own output chunk, by its first
+# word, formatted with its arguments, from recorded transcripts (V9.78 and V9.84; SEGGER
+# documents the commands, not their output): `g`/`go` print none, and any line after `r`'s
+# fails. A device script's AfterResetTarget() may close either form of `r` (the MK64 and
+# LPC4088 reset via SYSRESETREQ, V9.78).
+_AFTER_RESET = r'(?:AfterResetTarget\(\) start\n(?:AfterResetTarget\(\)\n)?AfterResetTarget\(\) end - Took .*\n)?'
+_PC = r'^PC = [0-9A-F]{{8}}, '
+JLINK_DONE = {'h': _PC, 'halt': _PC, 'regs': _PC,
+              'r': r'^Reset delay: \d+ ms\n(?:(?:.*\n)*?ResetTarget\(\) end - Took .*\nDevice specific reset executed\.\n'
+                   + _AFTER_RESET +
+                   r'|(?![\s\S]*^ResetTarget\(\) start$)(?:.*\n)*?Reset: Reset device via AIRCR\.SYSRESETREQ\.\n'
+                   + _AFTER_RESET + r')\s*\Z',
+              'g': '', 'go': '', 'sleep': r'^Sleep\({0}\)$',
+              'mem32': r'^{0} = [0-9A-F]{{8}}', 'w4': r'^Writing {1} -> {0}$', 'verifybin': r'^Verify successful\.$',
+              'loadfile': r'^O\.K\.$', 'exit': r'^Script processing completed\.$'}
+# A failure line in any command's chunk, from JLinkExe V9.84's own diagnostics (its strings:
+# "****** Error: %s" for the DLL's errors, "Error occurred: ...", "Error while ...", "Could not
+# read memory." and the like), and the connect and reset failures V9.78 prints; a connect's own
+# notes, such as "Could not find valid reset vector.", are judged by its commands completing.
+JLINK_ERRORS = (r'(?m)^\*+ Error|^Error (occurred|while)|ERROR|Verify failed|Cannot connect|Could not connect|'
+                r'ResetTarget failed|Failed to (halt|reconnect|write memory)|CPU (is )?not halted|'
+                r'Could not (read|write) memory|Could not read current PC|CPU may not have been reset|'
+                r'CPU did not halt after reset')
+
+
+def jlink_echoed(out: str) -> list:
+    """(command, output chunk) for each command a JLinkExe -CommandFile transcript echoes, in
+    order, each chunk ending at the next echo."""
+    parts = re.split(r'(?m)^J-Link>(.*)$', out)
+    return [(c.strip(), chunk) for c, chunk in zip(parts[1::2], parts[2::2])]
+
+
+def jlink_after(out: str, command: str) -> list:
+    """The output chunk of each echo of `command`."""
+    return [chunk for c, chunk in jlink_echoed(out) if c == command]
+
+
+def jlink_judgment(out: str, commands: list) -> dict:
+    """Whether a JLinkExe -CommandFile transcript shows `commands` (without the closing `exit`),
+    then `exit`, each echoed once per occurrence and in order with its completion line
+    (JLINK_DONE) and no failure line (JLINK_ERRORS) in its own chunk. JLinkExe can exit 0 with
+    every command failed (no probe with the serial), and -ExitOnError ends a script at a failed
+    verifybin but not at a failed reset, which the next commands outlive, so no exit code or
+    transcript-wide match stands in for a command's own output. A command with no completion
+    rule fails. Returns {'ok', 'problem' ('' when ok), 'commands': [{'command', 'done', 'error'}]}."""
+    want, got = [*commands, 'exit'], jlink_echoed(out)
+    judged = []
+    for c, chunk in got:
+        rule = JLINK_DONE.get(c.split()[0] if c else '')
+        try:          # an echo missing the arguments its rule names completes nothing
+            done = rule is not None and bool(re.search(rule.format(*c.split()[1:]), chunk, re.M))
+        except (IndexError, KeyError, ValueError, re.error):
+            done = False
+        error = re.search(JLINK_ERRORS, chunk)
+        judged.append({'command': c, 'done': done, 'error': error[0] if error else None})
+    if [c for c, _ in got] != want:
+        problem = f'echoed {[c for c, _ in got]!r:.300}, not the script {want!r:.300}'
+    elif bad := next((j for j in judged if j['error'] or not j['done']), None):
+        what = f'failed ({bad["error"]!r})' if bad['error'] else (
+            'has no completion rule' if bad['command'].split()[0] not in JLINK_DONE else 'did not complete')
+        problem = f'{bad["command"]!r} {what}'
+    else:
+        problem = ''
+    return {'ok': not problem, 'problem': problem, 'commands': judged}
+
+
+def _last_exited(op, tool: str) -> tuple:
+    """(problem, stdout text) of an Operation's last attempt: the problem '' only when it
+    exited 0. An earlier attempt never counts."""
+    last = op.attempts[-1]
+    if last.kind != 'exited':
+        return f'{tool} {last.kind.replace("_", " ")}', ''
+    if last.result.returncode != 0:
+        return f'{tool} exit {last.result.returncode}', ''
+    return '', hil_process.cmd_stdout_text(last.result.stdout)
+
+
+def jlink_problem(op) -> str:
+    """Why a J-Link session Operation (flash_jlink, reset_jlink, run_jlink_commands,
+    sysresetreq_jlink) did not complete its command file, '' when it did: its last attempt,
+    which must have exited 0, judged by jlink_judgment against the command file it ran, with
+    no failure line (JLINK_ERRORS) before the first echo or on stderr."""
+    problem, out = _last_exited(op, 'JLinkExe')
+    if problem:
+        return problem
+    lines = (op.attempts[-1].script or '').splitlines()
+    if not lines or lines[-1] != 'exit':
+        return 'no command file ending in exit to judge against'
+    preamble = re.split(r'(?m)^J-Link>', out, maxsplit=1)[0]
+    for where, text in (('before the first command', preamble),
+                        ('on stderr', hil_process.cmd_stdout_text(op.attempts[-1].result.stderr))):
+        if said := re.search(JLINK_ERRORS, text):
+            return f'failed {where} ({said[0]!r})'
+    return jlink_judgment(out, lines[:-1])['problem']
 
 
 # Cortex-M SCB AIRCR and the SYSRESETREQ write tinyuf2's runner issues to it
@@ -591,6 +692,151 @@ def reset_esptool(flasher: dict, *, port: str, timeout, run=None, esptool: str =
     return _once(run, argv, env=dict(ESPTOOL_ENV), timeout=timeout)
 
 
+def esptool_runtime(esptool: str = 'esptool', *, timeout: float = 60) -> dict:
+    """The esptool a flash and its helper sessions run, checked with no device: `esptool` (a
+    name on PATH or a path) resolved once to an absolute path, its interpreter by tool_python
+    (the venv path kept, never resolved past its symlink), that interpreter importing one esptool
+    package both from the sys.path the script gets (its resolved directory first, unless
+    PYTHONSAFEPATH) and from the one a helper session beside this file gets, and the executable's
+    `version` naming the same version. {'exe', 'python', 'version', 'package'}; RuntimeError
+    otherwise. Not cached: a caller keeps the identity for its run."""
+    exe = shutil.which(esptool)
+    if exe is None:
+        raise RuntimeError(f'{esptool} is not on PATH')
+    exe = os.path.abspath(exe)
+    python = tool_python(exe)
+    probe = ('import json, sys\n'
+             'if not getattr(sys.flags, "safe_path", False): sys.path[0] = sys.argv[1]\n'
+             'import esptool\n'
+             'print(json.dumps([esptool.__version__, esptool.__file__]))')
+    helpers = os.path.realpath(HERE)
+    try:
+        imported, helper = (subprocess.run([python, '-B', '-c', probe, path0], capture_output=True, text=True,
+                                           timeout=timeout, cwd='/')
+                            for path0 in (os.path.dirname(os.path.realpath(exe)), helpers))
+        said = subprocess.run([exe, 'version'], capture_output=True, text=True, timeout=timeout, cwd='/',
+                              env={**os.environ, **ESPTOOL_ENV})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f'esptool runtime {exe}: {e}') from None
+
+    def package_of(probed):
+        try:
+            version, package = json.loads(probed.stdout.strip().splitlines()[-1]) if probed.returncode == 0 else ()
+        except (ValueError, IndexError, TypeError):
+            return None
+        return (version, package) if isinstance(version, str) and isinstance(package, str) else None
+    runtime = package_of(imported)
+    if runtime is None:
+        raise RuntimeError(f'{python}, the interpreter of {exe}, imports no esptool package: '
+                           f'{(imported.stderr or imported.stdout).strip()[-200:]!r}')
+    version, package = runtime
+    found = package_of(helper)
+    if found != runtime:
+        raise RuntimeError(f'{python} imports {found[1] if found else "no esptool package"} for helper sessions in '
+                           f'{helpers}, not {package}, the package {exe} imports')
+    if said.returncode or re.findall(r'^esptool v(\S+)$', said.stdout, re.M) != [version]:
+        raise RuntimeError(f'{exe} version does not report {version}, the package its interpreter imports: '
+                           f'rc {said.returncode}, {said.stdout.strip()[-200:]!r}')
+    return {'exe': exe, 'python': python, 'version': version, 'package': package}
+
+
+def esptool_offsets(flash_args: str) -> list:
+    """The offsets flash_esptool writes for `flash_args` (flash_args_tokens' pairs), in order."""
+    _, pairs = flash_args_tokens(flash_args)
+    if not pairs:
+        raise ValueError('flash_args: want "<offset> <file>" pairs after the options')
+    return [int(offset, 0) for offset, _ in pairs]
+
+
+# any CSI sequence: esptool 5.2.0 and 5.3.1 move the cursor off a TTY too
+_CSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+# esptool 5.2.0/5.3.1 cmds.py write_flash and loader.py hard_reset, as recorded on ci.lan (5.3.1)
+# and the tinyuf2 bench (5.2.0): a write's line, compressed by the stub unless it would not
+# shrink or the run has --no-stub, then that write's verify; the hard reset after the last
+_ESP_WROTE = re.compile(r'^Wrote \d+ bytes (?:\(\d+ compressed\) )?at 0x([0-9a-f]{8}) in ', re.M)
+_ESP_RESET = re.compile(r'^Hard resetting via RTS pin\.\.\.$', re.M)
+_ESP_REFUTED = ('A fatal error occurred', 'Chip was NOT reset', 'Verify failed', 'MD5 of file does not match')
+
+
+def esptool_flash_judgment(out: str, offsets) -> dict:
+    """Whether a flash_esptool transcript writes every requested offset once, each write
+    followed by its own `Hash of data verified.` before the next write or, for the last, the
+    hard reset; CSI sequences ignored. An unknown output shape fails. {'ok', 'problem' (''
+    when ok), 'wrote': [offsets as written]}."""
+    text = _CSI.sub('', out)
+    writes = list(_ESP_WROTE.finditer(text))
+    wrote, want = [int(m[1], 16) for m in writes], sorted(offsets)
+    reset = _ESP_RESET.search(text, writes[-1].end()) if writes else None
+    problem = ''
+    if not want:
+        problem = 'no offsets requested'
+    elif len(set(want)) != len(want):
+        problem = f'offsets {[hex(o) for o in want]} repeat'
+    elif len(re.findall(r'^Wrote ', text, re.M)) != len(writes):
+        problem = 'a Wrote line of an unknown shape'
+    elif sorted(wrote) != want:
+        problem = f'wrote {[hex(o) for o in wrote]}, not the requested {[hex(o) for o in want]}'
+    elif said := next((m for m in _ESP_REFUTED if m in text), None):
+        problem = f'the output says {said!r}'
+    elif reset is None:
+        problem = 'no hard reset after the last write'
+    else:
+        ends = [m.start() for m in writes[1:]] + [reset.start()]
+        unverified = [hex(int(m[1], 16)) for m, end in zip(writes, ends)
+                      if 'Hash of data verified.' not in text[m.end():end]]
+        if unverified:
+            problem = f'no verify between the write at {", ".join(unverified)} and the next write or the reset'
+        elif text.count('Hash of data verified.') != len(want):
+            problem = f'{text.count("Hash of data verified.")} verifies for {len(want)} writes'
+    return {'ok': not problem, 'problem': problem, 'wrote': wrote}
+
+
+def esptool_problem(op) -> str:
+    """Why a flash_esptool Operation did not flash what it ran, '' when it did: its last
+    attempt exited 0 and its transcript passes esptool_flash_judgment over the offsets of that
+    attempt's own write_flash arguments."""
+    problem, out = _last_exited(op, 'esptool')
+    if problem:
+        return problem
+    cmd = op.attempts[-1].cmd
+    try:
+        offsets = esptool_offsets(shlex.join(cmd[cmd.index('write_flash') + 1:]))
+    except (ValueError, TypeError, AttributeError) as e:
+        return f'no write_flash arguments to judge against: {e}'
+    return esptool_flash_judgment(out, offsets)['problem']
+
+
+SERIAL_BY_ID = '/dev/serial/by-id'
+USJ_SERIAL = re.compile(r'[0-9A-F]{2}(?::[0-9A-F]{2}){5}')   # a chip's USB-Serial/JTAG serial: its MAC
+
+
+def esptool_port(uid: str) -> str:
+    """The serial device esptool opens for a roster uid (UID_RE, as every flasher's): a
+    USB-Serial/JTAG serial (USJ_SERIAL) through hil_openocd_esp.usj_tty, loaded only then (it
+    starts nothing); a USB-UART bridge serial through its /dev/serial/by-id link, exactly one,
+    resolving to a character device. RuntimeError naming the candidates otherwise. Resolve it
+    just before use, under the board's reservation: tty numbering moves with re-enumeration."""
+    if not isinstance(uid, str) or not UID_RE.fullmatch(uid):
+        raise RuntimeError(f'uid {uid!r}: want a probe serial')
+    if USJ_SERIAL.fullmatch(uid):
+        try:
+            openocd_esp = hil_load.load_file('skills/hil/scripts/hil_openocd_esp.py')
+        except ImportError as e:
+            raise RuntimeError(f'USJ serial {uid}: {e}') from None
+        return openocd_esp.usj_tty(uid)
+    links = sorted(glob.glob(os.path.join(SERIAL_BY_ID, f'*_{glob.escape(uid)}-if*')))
+    if len(links) != 1:
+        raise RuntimeError(f'bridge serial {uid}: want one {SERIAL_BY_ID} link, found {links or "none"}')
+    tty = os.path.realpath(links[0])
+    try:
+        is_chr = stat.S_ISCHR(os.stat(tty).st_mode)
+    except OSError as e:
+        raise RuntimeError(f'bridge serial {uid}: {links[0]} -> {tty}: {e}') from None
+    if not is_chr:
+        raise RuntimeError(f'bridge serial {uid}: {links[0]} -> {tty} is not a character device')
+    return tty
+
+
 def flash_lm4flash(flasher: dict, firmware: str, *, timeout, run=None) -> Operation:
     # TI Tiva-C / Stellaris ICDI: lightweight lm4flash, resets and runs after write
     return _once(run, ['lm4flash', '-s', _uid(flasher), *_args(flasher), str(firmware)], timeout=timeout)
@@ -617,8 +863,11 @@ def tool_python(tool: str) -> str:
     exe = shutil.which(tool)
     if exe is None:
         raise RuntimeError(f'{tool} is not on PATH')
-    with open(exe, 'rb') as f:
-        line = f.readline().decode(errors='replace').strip()
+    try:
+        with open(exe, 'rb') as f:
+            line = f.readline().decode(errors='replace').strip()
+    except OSError as e:
+        raise RuntimeError(f'{exe}: {e}') from None
     py = line[2:] if line.startswith('#!') else ''
     if not (os.path.isabs(py) and os.path.basename(py).startswith('python') and os.access(py, os.X_OK)):
         raise RuntimeError(f'{exe}: want an absolute python shebang, got {line!r}')
@@ -658,7 +907,6 @@ def reset_pyocd(flasher: dict, *, project_dir: str, timeout, run=None) -> Operat
 # STM32CubeProgrammer 2.23 device info, openocd 0ce743125 DP/core examination. A backend not
 # listed: its exit status alone says whether the target answered.
 RESET_CONTACT = {
-    'jlink': ('identified.', 'Found SW-DP', 'Found JTAG'),
     'stlink': ('Device ID',),
     'openocd': ('Examination succeed', 'Examined RISC-V core', 'processor detected', 'SWD DPIDR'),
 }
@@ -666,8 +914,6 @@ RESET_CONTACT = {
 # only logs a failed event hook (a reset-assert hook then replaces the reset); pyocd only logs an
 # inaccessible core or an invalid reset method; esptool exits 0 when the port refuses RTS/DTR.
 RESET_REFUTED = {
-    'jlink': ('Could not connect', 'Cannot connect', 'Failed to halt CPU', 'CPU may not have been reset',
-              'CPU did not halt after reset'),
     'openocd': ('examination failed', 'Execution of event'),
     'pyocd': ('is not accessible after reset', 'Invalid reset method'),
     'esptool': ('Chip was NOT reset',),
@@ -676,8 +922,11 @@ RESET_REFUTED = {
 
 def reset_problem(name: str, op) -> str:
     """Why the `name` backend's reset Operation `op`, which exited 0, does not show the target
-    answering and resetting ('' when it does). A non-zero exit is the caller's to judge."""
+    answering and resetting ('' when it does). A non-zero exit is the caller's to judge. J-Link
+    is jlink_problem's: its `halt` completing is the target answering."""
     name = name.lower()
+    if name == 'jlink':
+        return jlink_problem(op)
     out = hil_process.cmd_stdout_text(op.stdout) + '\n' + hil_process.cmd_stdout_text(op.stderr)
     if said := next((m for m in RESET_REFUTED.get(name, ()) if m in out), None):
         return f'exit 0, but the output says {said!r}'

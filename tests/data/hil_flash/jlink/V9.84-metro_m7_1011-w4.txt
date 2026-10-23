@@ -1,0 +1,58 @@
+SEGGER J-Link Commander V9.84 (Compiled Oct  7 2026 14:39:34)
+DLL version V9.84, compiled Oct  7 2026 14:38:44
+
+J-Link Commander will now exit on Error
+
+J-Link Command File read successfully.
+Processing script file...
+J-Link>w4 E000ED0C 05FA0004
+J-Link connection not established yet but required for command.
+Connecting to J-Link ...O.K.
+Firmware: J-Link EDU Mini V1 compiled Sep 24 2026 13:41:44
+Hardware version: V1.00
+J-Link uptime (since boot): 3d 08h 16m 54s
+S/N: 801012283
+License(s): FlashBP,GDB
+USB speed mode: Full speed (12 MBit/s)
+VTref=3.299V
+Target connection not established yet but required for command.
+Device "MIMXRT1011XXX5A" selected.
+
+
+Connecting to target via SWD
+Found SW-DP with ID 0x0BD11477
+DPIDR: 0x0BD11477
+CoreSight SoC-400 or earlier
+Scanning AP map to find all available APs
+AP[1]: Stopped AP scan as end of AP map has been reached
+AP[0]: AHB-AP (IDR: 0x04770041, ADDR: 0x00000000)
+Iterating through AP map to find AHB-AP to use
+AP[0]: Core found
+AP[0]: AHB-AP ROM base: 0xE00FD000
+CPUID register: 0x411FC272. Implementer code: 0x41 (ARM)
+Cache: L1 I/D-cache present
+Found Cortex-M7 r1p2, Little endian.
+FPUnit: 8 code (BP) slots and 0 literal slots
+CoreSight components:
+ROMTbl[0] @ E00FD000
+[0][0]: E00FE000 CID B105100D PID 000BB4C8 ROM Table
+ROMTbl[1] @ E00FE000
+[1][0]: E00FF000 CID B105100D PID 000BB4C7 ROM Table
+ROMTbl[2] @ E00FF000
+[2][0]: E000E000 CID B105E00D PID 000BB00C SCS-M7
+[2][1]: E0001000 CID B105E00D PID 000BB002 DWT
+[2][2]: E0002000 CID B105E00D PID 000BB00E FPB-M7
+[2][3]: E0000000 CID B105E00D PID 000BB001 ITM
+[1][1]: E0041000 CID B105900D PID 001BB975 ETM-M7
+[1][2]: E0042000 CID B105900D PID 004BB906 CTI
+[0][1]: E0040000 CID B105900D PID 000BB9A9 TPIU-M7
+[0][2]: E0043000 CID B105F00D PID 001BB101 TSG
+I-Cache L1: 16 KB, 256 Sets, 32 Bytes/Line, 2-Way
+D-Cache L1: 8 KB, 64 Sets, 32 Bytes/Line, 4-Way
+Memory zones:
+  Zone: "Default" Description: Default access mode
+Cortex-M7 identified.
+Writing 05FA0004 -> E000ED0C
+J-Link>exit
+
+Script processing completed.

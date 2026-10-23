@@ -1,5 +1,6 @@
-"""--hil-config/--board on rtt.py and pc_sample.py: the same resolver in both (they are
-copied around alone), the same cases for both, and a refusal before anything is launched."""
+"""--hil-config/--board: the same resolver in rtt.py and probe_state.py (see rtt.py's module
+docstring), the same cases for both, and on rtt.py's and pc_sample.py's CLI a refusal before
+anything is launched."""
 import importlib.util
 import inspect
 import json
@@ -13,20 +14,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = {'rtt': ROOT / 'skills' / 'rtt' / 'scripts' / 'rtt.py',
-           'pc_sample': ROOT / 'skills' / 'target-debug' / 'scripts' / 'pc_sample.py'}
+TARGET_DEBUG = ROOT / 'skills' / 'target-debug' / 'scripts'
+SCRIPTS = {'rtt': ROOT / 'skills' / 'rtt' / 'scripts' / 'rtt.py', 'pc_sample': TARGET_DEBUG / 'pc_sample.py'}
+RESOLVERS = {'rtt': SCRIPTS['rtt'], 'probe_state': TARGET_DEBUG / 'probe_state.py'}
 TINYUSB_CONFIG = Path.home() / 'code' / 'tinyusb' / 'test' / 'hil' / 'tinyusb.json'
 
 
 def load(name):
-    spec = importlib.util.spec_from_file_location(f'hil_{name}', SCRIPTS[name])
+    spec = importlib.util.spec_from_file_location(f'hil_{name}', RESOLVERS[name])
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
 
-MODULES = {name: load(name) for name in SCRIPTS}
+MODULES = {name: load(name) for name in RESOLVERS}
 
 # one entry per flasher kind a HIL config carries, in the project's own format
 BOARDS = [
@@ -87,9 +89,11 @@ class Config(unittest.TestCase):
 class Resolver(Config):
     def test_both_scripts_carry_the_same_resolver(self):
         for func in ('hil_flasher', 'hil_jlink_device', 'hil_merge'):
+            for name, path in RESOLVERS.items():
+                self.assertEqual(Path(inspect.getsourcefile(getattr(MODULES[name], func))), path, func)
             self.assertEqual(inspect.getsource(getattr(MODULES['rtt'], func)),
-                             inspect.getsource(getattr(MODULES['pc_sample'], func)), func)
-        self.assertEqual(MODULES['rtt'].HIL_PROBE_ROUTES, MODULES['pc_sample'].HIL_PROBE_ROUTES)
+                             inspect.getsource(getattr(MODULES['probe_state'], func)), func)
+        self.assertEqual(MODULES['rtt'].HIL_PROBE_ROUTES, MODULES['probe_state'].HIL_PROBE_ROUTES)
 
     def test_a_config_is_read_as_utf8_whatever_the_locale(self):
         # U+A000 leaves a stray 0x80 that GBK cannot decode, U+0141 a 0x81 that cp1252 cannot
@@ -98,7 +102,7 @@ class Resolver(Config):
         env = {k: v for k, v in os.environ.items() if k not in ('PYTHONUTF8', 'PYTHONIOENCODING')}
         if os.name != 'nt':
             env['LC_ALL'] = 'C'    # ASCII; Windows reads the ANSI code page whatever the locale variables say
-        for name, script in SCRIPTS.items():
+        for name, script in RESOLVERS.items():
             with self.subTest(script=name):
                 code = ('import importlib.util, sys; s = importlib.util.spec_from_file_location("m", sys.argv[1]); '
                         'm = importlib.util.module_from_spec(s); s.loader.exec_module(m); '
@@ -262,7 +266,7 @@ class Cli(Config):
                                 ('blank_uid', 'must be a non-empty string'), ('blank_dev', "must be exactly '-device NAME'"), ('twin', '2 entries of that name'),
                                 ('absent', '0 entries of that name')):
                 self.refused(name, ['--board', board, *extra], want)
-        self.refused('rtt', ['--board', 'stlink_args', '--addr', '20000000', '--cfg', '-f x.cfg'], "st-flash's, not")
+        self.refused('rtt', ['--board', 'stlink_args', '--addr', '20000000', '--cfg', '-f x.cfg'], "args are not openocd's")
         self.refused('pc_sample', ['--board', 'max32', '--elf', str(self.elf), *self.LINK], 'J-Link only')
         self.refused('pc_sample', ['--board', 'h743', '--elf', str(self.elf), *self.LINK],
                      'samples over a J-Link or openocd only')

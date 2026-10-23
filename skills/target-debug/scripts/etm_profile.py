@@ -138,9 +138,7 @@ def sym_ranges(syms, names):
 
 
 def iter_itrace(path):
-    """Yield (t_raw, addr) chronologically-reversed (file order: newest first).
-    Also returns the timestamp unit from the header via generator .send? No -
-    caller reads unit separately with itrace_unit()."""
+    """Yield (t_raw, addr) chronologically-reversed (file order: newest first)."""
     with open(path, newline="", errors="replace") as f:
         rd = csv.reader(f)
         hdr = next(rd, None) or []

@@ -83,7 +83,8 @@ class Part:
     pins: list = field(default_factory=list)
 
     def dnp_notes(self):
-        return [f"[DNP in variant {v}]" for v in self.dnp]
+        """A None entry is KiCad's own do-not-populate: not fitted on the board at all."""
+        return ["[DNP]" if v is None else f"[DNP in variant {v}]" for v in self.dnp]
 
     def repeated(self):
         """EAGLE pin names that more than one gate carries, such as D on a dual FET."""
@@ -341,7 +342,7 @@ def load_kicad_netlist(data, path):
             c.findtext("footprint") or None,
             {f.get("name"): f.text or "" for f in c.iterfind("fields/field") if f.get("name") != "Footprint"},
             sheet=sheet.get("names") if sheet is not None else None,
-            dnp=["(all)"] if c.find("property[@name='dnp']") is not None else [])
+            dnp=[None] if c.find("property[@name='dnp']") is not None else [])
     nets = {}
     seen = {}
     for net in root.iterfind("nets/net"):

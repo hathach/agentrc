@@ -91,7 +91,7 @@ class Trigger(unittest.TestCase):
     def test_an_unrequested_head_is_asked_once_read_back_and_recorded(self):
         rig = Rig()
         code, out = self.run_with(rig)
-        self.assertEqual((code, out['outcome'], out['detail'], out['at']), (0, 'requested', 'comment 101', '2026-10-21T10:05:00Z'))
+        self.assertEqual((code, out['outcome'], out['detail'], out['commentId'], out['at']), (0, 'requested', 'comment 101', 101, '2026-10-21T10:05:00Z'))
         self.assertEqual(len(rig.posts), 1)
         self.assertEqual(self.record()['receipt'], {'id': 101, 'at': '2026-10-21T10:05:00Z'})
         self.assertEqual(self.run_with(rig)[1]['outcome'], 'already')
@@ -100,7 +100,7 @@ class Trigger(unittest.TestCase):
     def test_a_request_after_the_head_event_is_not_repeated_one_before_it_is(self):
         after = {'id': 50, 'body': '@greptileai\n', 'created_at': '2026-10-21T10:01:00Z'}
         code, out = self.run_with(rig := Rig(comments=[after]))
-        self.assertEqual((out['outcome'], out['detail'], out['at']), ('already', 'comment 50', '2026-10-21T10:01:00Z'))
+        self.assertEqual((out['outcome'], out['detail'], out['commentId'], out['at']), ('already', 'comment 50', 50, '2026-10-21T10:01:00Z'))
         self.assertEqual(rig.posts, [])
         self.assertEqual(self.record()['receipt'], {'id': 50, 'at': '2026-10-21T10:01:00Z'}, 'the match is recorded as the receipt')
         self.dir = Path(tempfile.mkdtemp())
@@ -113,7 +113,7 @@ class Trigger(unittest.TestCase):
     def test_a_lost_post_answer_is_found_posted_and_never_posted_again(self):
         rig = Rig(post_code=1)
         code, out = self.run_with(rig)
-        self.assertEqual((code, out['outcome'], out['detail']), (0, 'requested', 'comment 101'))
+        self.assertEqual((code, out['outcome'], out['detail'], out['commentId']), (0, 'requested', 'comment 101', 101))
         rig = Rig(post_out='garbled')
         self.dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir)
@@ -124,6 +124,7 @@ class Trigger(unittest.TestCase):
         rig = Rig(post_code=1, lost=True)
         code, out = self.run_with(rig)
         self.assertEqual((code, out['outcome']), (0, 'uncertain'))
+        self.assertNotIn('commentId', out, 'no comment of the claim is known')
         self.assertIn('HTTP 502', out['detail'])
         self.assertIn(str(self.dir / f'o-r-7-{HEAD}.json'), out['detail'])
         self.assertEqual(self.run_with(rig)[1]['outcome'], 'uncertain', 'the claim is reconciled, never posted again')
@@ -135,7 +136,7 @@ class Trigger(unittest.TestCase):
     def test_a_lost_read_back_is_uncertain_then_reconciled(self):
         rig = Rig(readback=lambda path: (_ for _ in ()).throw(trigger.Unusable(f'gh api {path}: HTTP 502')))
         code, out = self.run_with(rig)
-        self.assertEqual((code, out['outcome']), (0, 'uncertain'))
+        self.assertEqual((code, out['outcome'], out['commentId']), (0, 'uncertain', 101))
         self.assertIn('comment 101 was posted and does not read back', out['detail'])
         self.assertNotIn('receipt', self.record())
         rig.readback = None
@@ -144,14 +145,15 @@ class Trigger(unittest.TestCase):
         rig.readback = lambda path: (0, json.dumps({'id': 101, 'body': 'edited', 'created_at': '2026-10-21T10:05:00Z'}))
         self.dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir)
-        self.assertEqual(self.run_with(Rig(readback=rig.readback))[1]['outcome'], 'uncertain', 'a read-back of another body')
+        out = self.run_with(Rig(readback=rig.readback))[1]
+        self.assertEqual((out['outcome'], out['commentId']), ('uncertain', 101), 'a read-back of another body')
 
     def test_a_reopen_after_a_recorded_request_is_not_asked_again(self):
         rig = Rig()
         self.assertEqual(self.run_with(rig)[1]['outcome'], 'requested')
         rig.timeline = [{'event': 'reopened', 'commit_id': None, 'created_at': '2026-10-21T11:00:00Z'},
                         {'event': 'ready_for_review', 'commit_id': None, 'created_at': '2026-10-21T11:01:00Z'}]
-        self.assertEqual(self.run_with(rig)[1], {'outcome': 'already', 'detail': 'comment 101', 'at': '2026-10-21T10:05:00Z', 'seal': mock.ANY})
+        self.assertEqual(self.run_with(rig)[1], {'outcome': 'already', 'detail': 'comment 101', 'commentId': 101, 'at': '2026-10-21T10:05:00Z', 'seal': mock.ANY})
         self.assertEqual(len(rig.posts), 1)
 
     def test_a_reopen_after_an_unrecorded_request_asks_once_more(self):
@@ -175,6 +177,7 @@ class Trigger(unittest.TestCase):
         rig = Rig(comments=[tied])
         code, out = self.run_with(rig)
         self.assertEqual((code, out['outcome']), (0, 'ambiguous'))
+        self.assertNotIn('commentId', out)
         self.assertIn('comment 50', out['detail'])
         self.assertEqual(rig.posts, [])
         self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
@@ -186,6 +189,7 @@ class Trigger(unittest.TestCase):
         rig = Rig(comments=[standing], runs=())
         code, out = self.run_with(rig)
         self.assertEqual((code, out['outcome']), (0, 'failed'))
+        self.assertNotIn('commentId', out)
         self.assertIn('head event time is unknown', out['detail'])
         self.assertEqual(rig.posts, [])
         self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')

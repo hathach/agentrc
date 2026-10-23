@@ -1,0 +1,60 @@
+SEGGER J-Link Commander V9.78 (Compiled Sep 16 2026 16:34:54)
+DLL version V9.78, compiled Sep 16 2026 16:34:09
+
+J-Link Commander will now exit on Error
+
+J-Link Command File read successfully.
+Processing script file...
+J-Link>halt
+J-Link connection not established yet but required for command.
+Connecting to J-Link ...O.K.
+Firmware: J-Link LPCXpresso V2 compiled Aug 25 2023 12:01:15
+Hardware version: V1.00
+J-Link uptime (since boot): 23d 02h 36m 06s
+S/N: 724441579
+VTref=3.300V
+Target connection not established yet but required for command.
+Device "LPC11U37/401" selected.
+
+
+Connecting to target via SWD
+Found SW-DP with ID 0x0BB11477
+DPIDR: 0x0BB11477
+CoreSight SoC-400 or earlier
+Scanning AP map to find all available APs
+AP[1]: Stopped AP scan as end of AP map has been reached
+AP[0]: AHB-AP (IDR: 0x04770021, ADDR: 0x00000000)
+Iterating through AP map to find AHB-AP to use
+AP[0]: Core found
+AP[0]: AHB-AP ROM base: 0xE00FF000
+CPUID register: 0x410CC200. Implementer code: 0x41 (ARM)
+Found Cortex-M0 r0p0, Little endian.
+Cortex-M: The connected J-Link (S/N 724441579) uses an old firmware module: V1 (current is 3)
+FPUnit: 4 code (BP) slots and 0 literal slots
+CoreSight components:
+ROMTbl[0] @ E00FF000
+[0][0]: E000E000 CID B105E00D PID 000BB008 SCS
+[0][1]: E0001000 CID B105E00D PID 000BB00A DWT
+[0][2]: E0002000 CID B105E00D PID 000BB00B FPB
+Memory zones:
+  Zone: "Default" Description: Default access mode
+Cortex-M0 identified.
+PC = 0000017E, CycleCnt = 00000000
+R0 = 00000000, R1 = 00000001, R2 = 00000001, R3 = 00000000
+R4 = 000003E8, R5 = FFFFFFFF, R6 = 00000001, R7 = 0027D738
+R8 = 08080808, R9 = 09090909, R10= 10101010, R11= 11111111
+R12= 00000001
+SP(R13)= 200047E0, MSP= 200047E0, PSP= 100019D0, R14(LR) = 0000017D
+XPSR = 61000000: APSR = nZCvq, EPSR = 01000000, IPSR = 000 (NoException)
+CFBP = 00000000, CONTROL = 00, FAULTMASK = 00, BASEPRI = 00, PRIMASK = 00
+FPU regs: FPU not enabled / not implemented on connected CPU.
+J-Link>r
+Reset delay: 0 ms
+Reset type: NORMAL (https://kb.segger.com/J-Link_Reset_Strategies)
+Reset: Halt core after reset via DEMCR.VC_CORERESET.
+Reset: Reset device via AIRCR.SYSRESETREQ.
+J-Link>go
+Memory map 'after startup completion point' is active
+J-Link>exit
+
+Script processing completed.

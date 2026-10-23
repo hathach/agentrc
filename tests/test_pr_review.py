@@ -331,8 +331,6 @@ class Prepare(Case):
         self.save(self.result_for(p))
         with self.assertRaisesRegex(facts.Unusable, 'pending draft .* post, reconcile or decline it first'):
             self.prepare()
-        self.mark_posted(p, 'partial')
-        self.assertEqual(self.prepare()['mode'], 'same', 'a partial review is on the PR: its threads can be discussed')
         self.mark_posted(p)
         self.assertEqual(self.prepare()['mode'], 'same')
         sh(self.work, 'git', 'commit', '--quiet', '--amend', '-m', 'b again')
@@ -596,6 +594,9 @@ class Prepare(Case):
         self.assertEqual(prepare.groups_of(paths, 2), (['README.md', 'src'], False))
         self.assertEqual(prepare.groups_of(paths, 1), (['.'], True))
         self.assertEqual(prepare.groups_of(['a.c', 'b.c'], 6), (['a.c', 'b.c'], False))
+        # #271: skills/cowork/scripts was scanned again under skills/cowork.
+        nested = ['skills/cowork/SKILL.md', 'skills/cowork/scripts/cowork.py', 'agents/coworker.md']
+        self.assertEqual(prepare.groups_of(nested, 6), (['agents', 'skills/cowork'], False))
 
 
 class Ledger(Case):
@@ -621,8 +622,10 @@ class Ledger(Case):
         self.assertIsNone(ledger.refuse_off_scale({'findings': [], 'claims': [{**claim, 'verdict': 'refuted', 'severity': None}]}))
 
     def test_save_numbers_findings_anchors_comments_and_fixes_the_digest(self):
-        out = self.save(self.result_for(self.p))
+        with mock.patch.object(ledger, 'added_lines', wraps=ledger.added_lines) as diffed:
+            out = self.save(self.result_for(self.p))
         self.assertEqual((out['inline'], out['moved'], out['findings']), (1, 1, 1))
+        self.assertEqual(diffed.call_count, 1, 'one diff per path, however many comments it carries')
         led = json.loads(Path(self.p['ledger']).read_text())
         rev = led['reviews'][0]
         self.assertEqual(rev['status'], 'pending')
@@ -1449,12 +1452,12 @@ class Pushback(PostCase):
         comments = [{'id': self.root, 'author': ME, 'bot': False, 'digest': 'r0', 'body': 'root', 'url': 'https://x/r0'}]
         comments += [{'id': i, 'author': who, 'bot': bot, 'digest': harvest.digest(body), 'body': body} for i, who, body, bot in thread]
         f = Path(self.p['facts']).parent / f'threads-{self.head}.json'
-        f.write_text(json.dumps({'pr': PR, 'viewer': ME, 'comments': comments,
+        f.write_text(json.dumps({'repo': REPO, 'pr': PR, 'viewer': ME, 'comments': comments,
                                  'threads': [{'threadId': 'T', 'resolved': False, 'outdated': False, 'commentIds': [c['id'] for c in comments]}]}))
         return f
 
     def disputes(self, snap):
-        return self.call(ledger, ['disputes', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head])['disputes']
+        return self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), '--head', self.head])['disputes']
 
     def dispute(self, state, answer=None):
         snap = self.snapshot((950, 'contrib', 'intentional', False))
@@ -1491,6 +1494,28 @@ class Pushback(PostCase):
         self.assertEqual([r['id'] for r in chat[0]['replies']], [950], 'a comment of ours no receipt verified settles nothing')
         edited = self.disputes(self.snapshot((950, 'contrib', 'intentional, see line 3', False)))
         self.assertNotEqual(edited[0]['key'], got[0]['key'])
+
+    def test_show_with_a_head_carries_the_disputes_of_that_snapshot(self):
+        snap = self.snapshot((950, 'contrib', 'intentional', False))
+        show = ['show', '--pr', str(PR), '--repo', REPO]
+        shown = self.call(ledger, [*show, '--threads', str(snap), '--head', self.head])
+        self.assertEqual([(d['findingId'], [r['id'] for r in d['replies']]) for d in shown['disputes']], [('pr7-f1', [950])])
+        self.assertEqual({k: v for k, v in shown.items() if k != 'disputes'}, self.call(ledger, [*show, '--threads', str(snap)]))
+        with self.assertRaisesRegex(facts.Unusable, 'full SHA'):
+            self.call(ledger, [*show, '--threads', str(snap), '--head', self.head[:12]])
+        with self.assertRaisesRegex(facts.Unusable, 'needs --threads'):
+            self.call(ledger, [*show, '--head', self.head])
+
+    def test_a_snapshot_of_another_repository_or_none_named_is_refused(self):
+        snap = self.snapshot((950, 'contrib', 'intentional', False))
+        self.assertEqual(len(self.disputes(snap)), 1)
+        good = json.loads(snap.read_text())
+        for wrong in ({**good, 'repo': 'other/r'}, {k: v for k, v in good.items() if k != 'repo'}, {**good, 'pr': PR + 1}):
+            snap.write_text(json.dumps(wrong))
+            for head in ([], ['--head', self.head]):
+                with self.subTest(repo=wrong.get('repo'), pr=wrong['pr'], head=bool(head)):
+                    with self.assertRaisesRegex(facts.Unusable, f'--threads is a snapshot of .*, not {REPO}#{PR}'):
+                        self.call(ledger, ['show', '--pr', str(PR), '--repo', REPO, '--threads', str(snap), *head])
 
     def test_a_long_answer_is_named_in_its_pending_review(self):
         self.discuss('upheld', {'body': ' '.join(['w'] * 61), 'resolve': False})
@@ -1550,7 +1575,8 @@ class Pushback(PostCase):
     def test_a_published_answer_settles_the_pushback_before_it(self):
         self.discuss('upheld', {'body': 'Still stands.', 'resolve': False})
         led = self.led()
-        led['reviews'][0]['answerPublications'][-1]['receipts']['staged'] = [{'state': 'published', 'replyId': 960}]
+        staged = {'kind': 'answer', 'findingId': 'pr7-f1', 'commentId': self.root, 'resolve': False, 'state': 'published', 'replyId': 960}
+        led['reviews'][0]['answerPublications'][-1]['receipts']['staged'] = [staged]
         Path(self.p['ledger']).write_text(json.dumps(led))
         got = self.disputes(self.snapshot((950, 'contrib', 'intentional', False), (960, ME, 'Still stands.', False),
                                           (970, 'contrib', 'still intentional', False)))
@@ -1844,6 +1870,14 @@ class Severity(unittest.TestCase):
                 self.assertEqual(tuple(re.findall(r"'(\w+)'", got)), want, f'{wf} {const}')
             got = re.search(r"^const IMPACT = \{.*?required: \[([^\]]*)\]", src, re.M | re.S).group(1)
             self.assertEqual(re.findall(r"'(\w+)'", got), facts_, f'{wf} IMPACT')
+
+
+class Limits(unittest.TestCase):
+    def test_the_gate_measures_drafts_against_the_workflows_limits(self):
+        src = (ROOT / 'workflows' / 'pr-review.js').read_text(encoding='utf-8')
+        got = dict(re.findall(r'(\w+): (\d+)', re.search(r'^const LIMIT = \{([^}]*)\}', src, re.M).group(1)))
+        self.assertEqual((int(got['comment']), int(got['answer']), int(got['lineChars'])),
+                         (post.COMMENT_WORDS, post.REPLY_WORDS, post.LINE_CHARS))
 
 
 class Workflow(unittest.TestCase):

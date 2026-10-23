@@ -1,6 +1,6 @@
 ---
 name: read-doc
-description: Use when you need authoritative hardware/protocol facts from a primary source rather than memory (datasheet, reference manual/TRM, errata, pinout, register/bitfield layout, memory map, eval-board schematic PDF, USB spec) before stating, changing or reviewing anything that depends on hardware or protocol behaviour, or to read/open/look up a manual, book or PDF/EPUB in the user's Calibre library. Board wiring in EAGLE/KiCad is `read-pcb`'s.
+description: Use for primary-source hardware/protocol facts (datasheet, reference manual/TRM, errata, register/bitfield, memory map, pinout, schematic PDF, USB spec) before stating, changing or reviewing what depends on them, or to read, open or look up a manual, book, PDF or EPUB in the user's Calibre library. EAGLE/KiCad wiring is `read-pcb`'s.
 ---
 
 # Read Doc

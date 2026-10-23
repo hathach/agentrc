@@ -33,12 +33,16 @@ async function run(args, stubs = {}) {
     check: { ok: true, head: H, top: '/w', repo: args.repo, pr: args.pr, ci: { state: 'green', counts: {} }, pins: { mergeBase: args.mergeBase, scopeBase: args.scopeBase, mode: args.mode, groups: args.groups } },
     threads: { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 },
     ledger: { reviews: 0, open: [] },
-    disputes: { disputes: [] },
     claims: { claims: [] },
   }
   const agent = async (prompt, options) => {
     calls.push({ label: options.label, prompt: String(prompt), options })
     const v = pick(options.label, prompt)
+    // `stubs.disputes` is the ledger answer's disputes, unless that answer names its own.
+    if (options.label === 'ledger') {
+      const l = v === undefined ? defaults.ledger : v
+      return l && typeof l === 'object' && !('disputes' in l) ? { ...l, disputes: stubs.disputes?.disputes ?? [] } : l
+    }
     if (v !== undefined) return v
     if (options.label in defaults) return defaults[options.label]
     if (options.label === 'write') {
@@ -145,7 +149,7 @@ test('a clean full review approves only with green CI, full coverage and hardwar
   assert.match(calls.find(c => c.label === 'check').prompt, /prepare\.py --check --pr 7 --repo o\/r --expected-head b{40}/)
   const at = (l) => calls.findIndex(c => c.label === l)
   assert.ok(at('threads') < at('ledger'), 'show reads the snapshot threads.py wrote')
-  assert.match(calls[at('ledger')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json'/)
+  assert.match(calls[at('ledger')].prompt, /ledger\.py show .*--threads '\/tmp\/ledger\/7\/threads-b{40}\.json' --head b{40}\n/)
   assert.deepEqual(result.heldThreads, [])
   assert.doesNotMatch(result.draft.body, /agentrc|Claude|generated/i)
 
@@ -275,8 +279,7 @@ test('open thread claims are judged; a confirmed one covers our same finding and
 test('one defect found by several dimensions is one comment and one blocker; each finding keeps its record', async () => {
   const two = audited(finding('overrun in the copy'), finding('the copy overruns', 'medium'))
   two.confirmed.push({ dir: 'src/core', dim: 'hardware: y', findings: [finding('other defect', 'high', 20)] })
-  const { result, calls } = await run(BASE, { audit: two, group: { groups: [{ findings: [1, 0], claims: [] }] } })
-  assert.match(calls.find(c => c.label === 'group').prompt, /whole substance is that defect/)
+  const { result } = await run(BASE, { audit: two, group: { groups: [{ findings: [1, 0], claims: [] }] } })
   assert.deepEqual(result.findings.map(f => [f.why, f.status, f.defect]),
     [['overrun in the copy', 'open', 0], ['the copy overruns', 'open', 0], ['other defect', 'open', undefined]], 'both keep their record under one defect')
   assert.deepEqual(result.draft.comments.map(c => c.finding), [0, 2])
@@ -336,12 +339,12 @@ test('a dead or malformed answer on muted findings posts them all and leaves cov
   }
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const row = (id, severity, commentId) => ({ id, status: 'open', file: 'src/core/a.c', line: 10, severity, confidence: 'high', impact: IMP, severityReason: 'g', commentId, why: `w ${id}` })
-  const standing = await run(inc, { ledger: { reviews: 1, open: [row('pr7-f1', 'high', 901), row('pr7-f2', 'low', 902)] }, check: pinned(inc),
+  const standing = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [row('pr7-f1', 'high', 901), row('pr7-f2', 'low', 902)] }, check: pinned(inc),
     recheck: (p) => ({ state: 'open', reason: /pr7-f2/.test(p) ? 'still, and the reference comment is gone' : 'still' }), group, beyond: { beyond: [{ finding: 0, issue: 'more' }] } })
   assert.match(standing.calls.find(c => c.label === 'beyond').prompt, /"verified":"still, and the reference comment is gone"/)
   assert.match(standing.result.draft.body, /not stated in full by any comment:\n- \*\*low\*\* `src\/core\/a\.c:10`: w pr7-f2\n  still, and the reference comment is gone$/m, 'its own comment is not enough once its group speaks for it')
   assert.doesNotMatch(standing.result.draft.body, /more/, 'the issue named is never printed')
-  const lead = await run(inc, { ledger: { reviews: 1, open: [row('pr7-f1', 'high', null), row('pr7-f2', 'low', 902)] }, check: pinned(inc),
+  const lead = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [row('pr7-f1', 'high', null), row('pr7-f2', 'low', 902)] }, check: pinned(inc),
     recheck: { state: 'open', reason: 'still' }, group })
   assert.match(lead.result.draft.body, /not stated in full by any comment:\n- \*\*high\*\* `src\/core\/a\.c:10`: w pr7-f1$/m, 'a group mate\'s comment never states the lead')
   assert.doesNotMatch(lead.result.draft.body, /w pr7-f2/, 'its own comment states the muted member')
@@ -364,6 +367,54 @@ test('a threads receipt that is not the script\'s line is asked again once on a 
   assert.notEqual(died.result.status, 'blocked', 'a relay that throws gets the retry too')
   const dead = await run(BASE, { threads: (prompt, label) => thrown(label) })
   assert.deepEqual([dead.result.reason, dead.result.detail], ['threads-failed', 'the threads relay died'])
+  assert.deepEqual(dead.logs.filter(l => / errored — /.test(l)), ['threads errored — threads exploded', 'threads:retry errored — threads:retry exploded'])
+})
+
+test('the script relays run as the relay role', async () => {
+  const { calls } = await run({ ...BASE, mode: 'incremental', scopeBase: OLD }, { check: pinned({ ...BASE, mode: 'incremental', scopeBase: OLD }),
+    ledger: { reviews: 1, last: { head: OLD }, open: [] }, threads: (prompt, label) => label === 'threads' ? null : { file: `${BASE.factsDir}/threads-${H}.json`, count: 0 } })
+  const relays = calls.filter(c => c.options.agentType === 'relay')
+  assert.deepEqual(relays.map(c => c.label), ['check', 'threads', 'threads:retry', 'ledger'], 'one relay reads the ledger and its disputes')
+})
+
+test('a ledger answer missing its members, or not of the review prepare pinned, blocks instead of dropping standing findings', async () => {
+  const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
+  const standing = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 }
+  const still = { state: 'open', reason: 'still' }
+  const good = await run(inc, { check: pinned(inc), ledger: { reviews: 1, last: { head: OLD }, open: [standing] }, recheck: still })
+  assert.equal(good.result.verdict.event, 'REQUEST_CHANGES')
+  for (const ledger of [{}, { reviews: 1 }, { reviews: 1, last: { head: OLD } }, { open: [standing] }, { reviews: 0, last: null, open: [] },
+    { reviews: 1, open: [standing] }, { reviews: 1, last: { head: MB }, open: [standing] }]) {
+    const { result, labels } = await run(inc, { check: pinned(inc), ledger, recheck: still })
+    assert.deepEqual([result.status, result.reason], ['blocked', 'ledger-failed'], JSON.stringify(ledger))
+    assert.ok(!labels.some(l => l.startsWith('recheck:')), JSON.stringify(ledger))
+  }
+  const disc = { ...BASE, mode: 'discussion' }
+  const same = { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }
+  const older = await run(disc, { check: same, ledger: { reviews: 1, last: { head: OLD }, open: [standing] } })
+  assert.equal(older.result.reason, 'ledger-failed', 'a discussion continues the review of this very head')
+  assert.notEqual((await run(BASE, { ledger: { reviews: 0, last: null, open: [] } })).result.status, 'blocked', 'a first full review reads an empty ledger')
+  assert.equal((await run(BASE, { ledger: { reviews: 2, open: [] } })).result.verdict.event, 'APPROVE', 'a full review rechecks whatever stands')
+  assert.equal((await run(BASE, { ledger: { reviews: 2 } })).result.reason, 'ledger-failed')
+  assert.equal((await run(BASE, { ledger: { reviews: 0, last: null, open: [], disputes: null } })).result.reason, 'ledger-failed', 'no disputes is no answer')
+})
+
+test('a draft or check agent that throws takes its null path; a check relay that throws blocks', async () => {
+  const thrown = (label) => () => { throw new Error(`${label} exploded`) }
+  const check = await run(BASE, { check: thrown('check') })
+  assert.deepEqual([check.result.reason, check.result.detail], ['check-failed', 'the check relay died'])
+  const write = await run(BASE, { audit: audited(finding('a')), write: thrown('write') })
+  assert.deepEqual([write.result.verdict.event, write.result.draft.comments.map(c => c.body)], ['REQUEST_CHANGES', ['**high**: a']])
+  const checked = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: '**high**: a, and more' }] }, 'check-draft': thrown('check-draft') })
+  assert.deepEqual(checked.result.draft.comments.map(c => c.body), ['**high**: a'], 'unchecked: the finding\'s own words')
+  const shorten = await run(BASE, { audit: audited(finding('a')), write: { summary: '- ok', comments: [{ finding: 0, body: `**high**: ${'w '.repeat(80).trim()}` }] }, shorten: thrown('shorten') })
+  assert.ok(shorten.logs.some(l => /over length, for the human to shorten/.test(l)))
+  const nits = audited(finding('a', 'nit'), finding('a too', 'nit'))
+  const beyond = await run(BASE, { audit: nits, group: { groups: [{ findings: [0, 1], claims: [] }] }, beyond: thrown('beyond') })
+  assert.deepEqual([beyond.result.draft.comments.length, beyond.result.coverage.unjudged], [2, [{ kind: 'beyond' }]])
+  for (const [label, r] of Object.entries({ check, write, 'check-draft': checked, shorten, beyond })) {
+    assert.ok(r.logs.includes(`${label} errored — ${label} exploded`), `${label} logs its error`)
+  }
 })
 
 test('an invalid or dead grouping is judged again once, told why, before its findings stay ungrouped (#150)', async () => {
@@ -378,6 +429,7 @@ test('an invalid or dead grouping is judged again once, told why, before its fin
   }
   const both = await run(BASE, { audit: two, group: () => { throw thrown } })
   assert.deepEqual([both.result.coverage.unjudged, both.result.draft.comments.length], [[{ kind: 'group' }], 3])
+  assert.deepEqual(both.logs.filter(l => / errored — /.test(l)), ['group errored — group exploded', 'group:retry errored — group exploded'])
 })
 
 test('a grouping that names an item twice, nothing, one member or two files is distrusted whole; a dead one is unjudged', async () => {
@@ -406,16 +458,16 @@ test('a claims-only group needs a path, and a claim that covered a finding count
   const row = { id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', confidence: 'high', impact: IMP, severityReason: 'g', commentId: null, defect: 0 }
   const thread = { claims: [{ commentId: 55, author: 'a[bot]', bot: true, path: 'src/core/a.c', line: 10, claim: 'overrun' }] }
   const standingRow = { ...row, why: 'overrun past the buffer end' }
-  const again = await run(inc, { ledger: { reviews: 1, open: [standingRow] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' }, claims: thread,
+  const again = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [standingRow] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' }, claims: thread,
     judge: () => confirmedAs('low'), group: { groups: [{ findings: [0], claims: ['55#1'] }] } })
   assert.match(again.calls.find(c => c.label === 'group').prompt, /overrun past the buffer end/, 'standing findings are regrouped every run, whole')
   assert.deepEqual(again.result.verdict.reasons, ['1 blocking finding(s) open'], 'the high finding and its low claim are one defect, counted high')
   assert.match(again.result.draft.body, /our review grades it \*\*high\*\*/)
   assert.doesNotMatch(again.result.draft.body, /Still standing/, 'the thread states it')
-  const resolved = await run(inc, { ledger: { reviews: 1, open: [standingRow] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' } })
+  const resolved = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [standingRow] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' } })
   assert.equal(resolved.result.verdict.event, 'REQUEST_CHANGES', 'its thread gone, the finding still stands on its own')
   assert.match(resolved.result.draft.body, /Still standing from earlier reviews, not stated in full by any comment:\n- \*\*high\*\* `src\/core\/a\.c:10`: overrun past the buffer end/)
-  const refound = await run(inc, { ledger: { reviews: 1, open: [{ ...standingRow, commentId: 900 }] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' },
+  const refound = await run(inc, { ledger: { reviews: 1, last: { head: OLD }, open: [{ ...standingRow, commentId: 900 }] }, check: pinned(inc), recheck: { state: 'open', reason: 'still' },
     audit: audited(finding('overrun again', 'medium')), group: { groups: [{ findings: [0, 1], claims: [] }] } })
   assert.deepEqual(refound.result.findings.map(f => [f.id, f.defect]), [['pr7-f1', 0], [undefined, 0]], 'a new copy of a standing finding joins its defect')
   assert.deepEqual([refound.result.draft.comments, refound.result.verdict.reasons], [[], ['1 blocking finding(s) open']])
@@ -424,7 +476,7 @@ test('a claims-only group needs a path, and a claim that covered a finding count
 test('findings linked as one defect on an earlier review are regrouped, and count once only while still one', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
   const row = (id, commentId) => ({ id, status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', confidence: 'high', impact: IMP, severityReason: 'g', commentId, why: `w ${id}`, defect: 0 })
-  const ledger = { reviews: 1, open: [row('pr7-f1', 901), row('pr7-f2', null)] }
+  const ledger = { reviews: 1, last: { head: OLD }, open: [row('pr7-f1', 901), row('pr7-f2', null)] }
   const still = { state: 'open', reason: 'still' }
   const both = await run(inc, { ledger, check: pinned(inc), recheck: still, group: { groups: [{ findings: [0, 1], claims: [] }] } })
   assert.match(both.calls.find(c => c.label === 'group').prompt, /w pr7-f2/, 'standing findings are regrouped: a push can split them')
@@ -444,7 +496,7 @@ test('findings linked as one defect on an earlier review are regrouped, and coun
 
 test('an incremental review rechecks earlier findings: fixed ones get a fix note, open ones keep their severity', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
-  const ledger = { reviews: 1, open: [{ id: 'pr7-f1', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 },
+  const ledger = { reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 },
     { id: 'pr7-f2', file: 'src/core/a.c', line: 30, severity: 'low', commentId: 902 }] }
   const fixed = await run(inc, { ledger, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
   assert.deepEqual(fixed.audits[0].diff, { base: OLD, head: H })
@@ -452,14 +504,14 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.equal(fixed.result.verdict.event, 'APPROVE')
   assert.match(fixed.result.draft.body, /the changes since cccccccccccc/)
   assert.deepEqual(fixed.result.draft.resolves, [])
-  const deferred = { reviews: 1, open: [{ ...ledger.open[0], status: 'fixed', resolveDue: { replied: true } }, ledger.open[1]] }
+  const deferred = { reviews: 1, last: { head: OLD }, open: [{ ...ledger.open[0], status: 'fixed', resolveDue: { replied: true } }, ledger.open[1]] }
   const again = await run(inc, { ledger: deferred, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
   assert.deepEqual(again.result.draft.replies.map(r => r.commentId), [902], 'a due resolve with our reply on the thread needs no new note')
   assert.deepEqual(again.result.draft.resolves, [{ findingId: 'pr7-f1', commentId: 901 }])
   assert.match(again.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /judge that text, not the draft/)
   const reopened = await run(inc, { ledger: deferred, recheck: () => ({ state: 'open', reason: 'back' }), check: pinned(inc) })
   assert.deepEqual(reopened.result.draft.resolves, [], 'standing again: nothing to resolve')
-  const noted = { reviews: 1, open: [{ ...deferred.open[0], resolveDue: { replied: false } }] }
+  const noted = { reviews: 1, last: { head: OLD }, open: [{ ...deferred.open[0], resolveDue: { replied: false } }] }
   const renote = await run(inc, { ledger: noted, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })
   assert.deepEqual([renote.result.draft.replies.map(r => r.commentId), renote.result.draft.resolves], [[901], []],
     'with no reply of ours there, the note is drafted; the thread resolves once it is published')
@@ -467,7 +519,7 @@ test('an incremental review rechecks earlier findings: fixed ones get a fix note
   assert.deepEqual((await run(inc, { ledger: { ...deferred, heldThreads: held }, recheck: () => ({ state: 'fixed', reason: 'guarded now' }), check: pinned(inc) })).result.heldThreads, held)
   const unjudged = await run(inc, { ledger: deferred, recheck: () => null, check: pinned(inc) })
   assert.deepEqual(unjudged.result.draft.resolves, [], 'no recheck on this head, no resolve')
-  const conceded = { reviews: 1, open: [{ ...deferred.open[0], status: 'withdrawn' }] }
+  const conceded = { reviews: 1, last: { head: OLD }, open: [{ ...deferred.open[0], status: 'withdrawn' }] }
   const kept = await run(inc, { ledger: conceded, recheck: () => ({ state: 'withdrawn', reason: 'still wrong' }), check: pinned(inc) })
   assert.match(kept.calls.find(c => c.label === 'recheck:pr7-f1').prompt, /withdrawn if it was withdrawn earlier/)
   assert.deepEqual(kept.result.draft.resolves, [{ findingId: 'pr7-f1', commentId: 901 }])
@@ -488,7 +540,7 @@ test('args that differ from the pins prepare recorded for this head are blocked 
   }
 })
 
-const LEDGER = { reviews: 1, open: [{ id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 },
+const LEDGER = { reviews: 1, last: { head: OLD }, open: [{ id: 'pr7-f1', status: 'open', file: 'src/core/a.c', line: 10, severity: 'high', commentId: 901 },
   { id: 'pr7-f2', status: 'open', file: 'src/core/a.c', line: 30, severity: 'medium', commentId: 902 }] }
 const DISPUTE = { findingId: 'pr7-f1', key: 'k1', rootCommentId: 901, outdated: false, replies: [{ id: 950, digest: 'd', author: 'contrib' }] }
 
@@ -510,7 +562,7 @@ test('pushback on our thread is judged with the replies as evidence and answered
 
 test('upheld keeps its severity and leaves the thread open; disputed only blocks approval; a dead verifier records nothing', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
-  const base = { check: pinned(inc), ledger: { reviews: 1, open: [LEDGER.open[0]] }, disputes: { disputes: [DISPUTE] } }
+  const base = { check: pinned(inc), ledger: { reviews: 1, last: { head: OLD }, open: [LEDGER.open[0]] }, disputes: { disputes: [DISPUTE] } }
   const upheld = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'line 12 still reads it unmasked' }) })
   assert.equal(upheld.result.verdict.event, 'REQUEST_CHANGES')
   assert.deepEqual(upheld.result.findings[0].disputes[0].answer, { body: 'This still stands: line 12 still reads it unmasked', resolve: false })
@@ -531,29 +583,30 @@ test('upheld keeps its severity and leaves the thread open; disputed only blocks
   const dead = await run(inc, { ...base, recheck: () => null })
   assert.equal(dead.result.findings[0].disputes, undefined)
   assert.deepEqual(dead.result.coverage.unjudged, [{ kind: 'recheck', id: 'pr7-f1' }])
-  const kept = await run(inc, { ...base, disputes: { disputes: [] }, ledger: { reviews: 1, open: [{ ...LEDGER.open[0], status: 'upheld' }] }, recheck: () => ({ state: 'open', reason: 'same' }) })
+  const kept = await run(inc, { ...base, disputes: { disputes: [] }, ledger: { reviews: 1, last: { head: OLD }, open: [{ ...LEDGER.open[0], status: 'upheld' }] }, recheck: () => ({ state: 'open', reason: 'same' }) })
   assert.equal(kept.result.findings[0].status, 'upheld', 'no new reply cannot turn upheld back into open')
 })
 
 test('a discussion run judges only answered findings, with no audit and no claims pass', async () => {
   const disc = { ...BASE, mode: 'discussion' }
-  const { result, audits, labels } = await run(disc, { check: { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }, ledger: LEDGER,
+  const reviewed = { ...LEDGER, last: { head: H } }
+  const { result, audits, labels } = await run(disc, { check: { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }, ledger: reviewed,
     disputes: { disputes: [DISPUTE] }, recheck: () => ({ state: 'upheld', reason: 'still' }) })
   assert.deepEqual(audits, [])
   assert.ok(!labels.includes('claims'))
   assert.deepEqual(labels.filter(l => l.startsWith('recheck:')), ['recheck:pr7-f1'])
   assert.equal(result.mode, 'discussion')
   const both = { disputes: [DISPUTE, { ...DISPUTE, findingId: 'pr7-f2', key: 'k2', rootCommentId: 902 }] }
-  const two = await run(disc, { check: { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }, ledger: LEDGER, disputes: both,
+  const two = await run(disc, { check: { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }, ledger: reviewed, disputes: both,
     recheck: () => ({ state: 'upheld', reason: 'still' }), group: { groups: [{ findings: [0, 1], claims: [] }] } })
   assert.deepEqual([two.labels.includes('group'), two.result.findings.map(f => 'defect' in f)], [false, [false, false]], 'a discussion leaves the saved groups alone')
-  const idle = await run(disc, { check: { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }, ledger: LEDGER })
+  const idle = await run(disc, { check: { ...pinned(BASE), pins: { ...pinned(BASE).pins, mode: 'same' } }, ledger: reviewed })
   assert.equal(idle.result.status, 'nothing-new')
 })
 
 test('a thread answer over its limit is shortened, then marked long; the answer prompt carries the format', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
-  const base = { check: pinned(inc), ledger: { reviews: 1, open: [LEDGER.open[0]] }, disputes: { disputes: [DISPUTE] } }
+  const base = { check: pinned(inc), ledger: { reviews: 1, last: { head: OLD }, open: [LEDGER.open[0]] }, disputes: { disputes: [DISPUTE] } }
   const wordy = 'w '.repeat(61).trim()
   const short = await run(inc, { ...base, recheck: () => ({ state: 'upheld', reason: 'r', answer: wordy }),
     shorten: { comments: [], answers: [{ finding: 'pr7-f1', body: 'Still stands: `a.c:12` reads it unmasked.' }] }, 'check-draft': { bad: [], summaryBad: false, answersBad: [] } })
@@ -587,7 +640,7 @@ test('a reviewer\'s label never sets our level, and a confirmed claim without it
 
 test('a recheck regrades only with the facts behind it; without them the old level stands and coverage is lost', async () => {
   const inc = { ...BASE, mode: 'incremental', scopeBase: OLD }
-  const base = { check: pinned(inc), ledger: { reviews: 1, open: [{ ...LEDGER.open[0], confidence: 'high', impact: IMP, severityReason: 'old' }] } }
+  const base = { check: pinned(inc), ledger: { reviews: 1, last: { head: OLD }, open: [{ ...LEDGER.open[0], confidence: 'high', impact: IMP, severityReason: 'old' }] } }
   const facts = { impact: { ...IMP, recovery: 'a retry' }, severityReason: 'the host retries', confidence: 'medium' }
   const down = await run(inc, { ...base, recheck: () => ({ state: 'open', reason: 'still', severity: 'medium', ...facts }) })
   const f = down.result.findings[0]

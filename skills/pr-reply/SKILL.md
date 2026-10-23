@@ -35,35 +35,12 @@ python3 $R --pr <N> --edit <file.json>
 python3 $R --pr <N> --manifest <file.json> --receipt <path>   # also --reuse, --edit: replay a saved run
 ```
 
-Every entry carries the body's digest (FNV-1a, 32-bit, over code points); the
-script refuses an entry whose body does not match it, so a body copied wrong
-never reaches the PR. A workflow computes the digests itself; by hand, use
-`--digest`. A reply's digest, in a receipt, an inspection or a `--reuse` or
-`--edit` entry, is always its text's, the quote line left out, so a posting
-receipt's `digest` settles that reply under `--reuse`. The original's digest
-is `scripts/comment_digest.py`'s, the one pr-babysit harvests with: what
-CodeRabbit rewrites at its comment's end does not change it. An inspection or
-a saved receipt from before these rules may carry an older digest: inspect
-again, with a fresh receipt path.
-
-The last stdout line is `{"receipts": [...], "seal": ...}`, one receipt per manifest entry (the seal is pr-babysit's check that a relayed copy is exact):
-`kind` (`review`, `issue` or `review-body`; `none` when all three were searched
-and the id is on none of them, so the caller owes it nothing; `null` when a
-lookup failed before that was known), `replyId`, `digest`, `sent` (a POST was issued;
-with `replyId` null the response was lost and the reply may exist), `posted`
-(false when an identical reply was reused), `verified` (true, false on a
-mismatch, null when the read-back could not be fetched), `resolved` (true when the
-thread was resolved, false when GitHub refused to resolve it, left out when
-unknown: for the two kinds without a thread, or when an API error cut the
-resolve short), `error` (left out when there is none). Exit 0 when every reply is verified
-and every review thread resolved, 1 otherwise (a failed comment lookup, an inaccessible `--repo` or a GitHub rate
-limit included, is a receipt's `error`), 2 for a bad manifest or a failure to find the repo (`gh repo view`) or our
-login (`gh api user`), which posts nothing and ends stdout with `{"error": ...}`; 2 also when `--receipt` cannot be
-saved, after the run, which still ends stdout with the receipts line: read that line, not the exit code, for what was
-posted. `sent` and `posted` describe the run that recorded them, so a rerun that finds its earlier post reports both
-false; `verified` and `resolved` say whether the reply stands. A caller that may lose a run's output passes
-`--receipt <path>`: the same path again to get that run's receipt back, a
-fresh path when the replies must be read back anew.
+Every entry carries its body's digest (`--digest` by hand); the script refuses
+one that does not match, so a body copied wrong never reaches the PR. The last
+stdout line is `{"receipts": [...], "seal": ...}`, one receipt per entry: read
+that line, not the exit code, for what was posted. The docstring (`reply.py
+--help`) is the contract for the digests, the receipt fields, the exit codes
+and `--receipt` replay.
 
 ## Judgment
 

@@ -4,7 +4,8 @@ envelope, correlate a reply with it, and check an envelope's shape.
 
 Judgment stays in SKILL.md. This script never chooses a peer when several
 match and never decides whether a result is good; it reports and lets the
-caller decide.
+caller decide. Nor does it run review rounds: a well-formed DONE establishes
+neither agreement nor correctness, so there is no `converge` subcommand.
 
   peer.py peers
   peer.py send --to w1F:p2 --files "src/a.c src/b.c" (--task "..." | --task-file t.md) [--delta ...]
@@ -38,7 +39,7 @@ FIELDS = {
 LEAD = r'^[\s•●⏺>|-]*'
 RESULT_START = re.compile(LEAD + re.escape(MARKER['result']))
 RESULT_END = re.compile(LEAD + TERMINATOR['result'] + r'\b')
-FOR_LINE = re.compile(LEAD + r'FOR:\s*(\S+)', re.M)
+FIELD_LINE = re.compile(LEAD + r'([A-Z]+):\s*(.*?)\s*$')
 END_ID = re.compile(TERMINATOR['result'] + r'\s+(\S+)')
 
 
@@ -116,13 +117,17 @@ def agent_list():
 
 
 def find_peers(cwd=None, me=None, agents=None):
-    """Every live agent sharing our cwd that is not us. Never picks one."""
+    """Every live agent sharing our cwd that is not us. Never picks one. A
+    record without a pane id or an absolute cwd is none: an empty cwd would
+    resolve to ours."""
     if os.environ.get('HERDR_ENV') != '1':
         die('not inside Herdr (HERDR_ENV != 1)', 2)
     here = os.path.realpath(cwd or os.getcwd())
     me = me or os.environ.get('HERDR_PANE_ID')
     return [a for a in (agents if agents is not None else agent_list())
-            if os.path.realpath(a.get('cwd', '')) == here and a.get('pane_id') != me]
+            if isinstance(a.get('pane_id'), str) and a['pane_id'] and a['pane_id'] != me
+            and isinstance(a.get('cwd'), str) and os.path.isabs(a['cwd'])
+            and os.path.realpath(a['cwd']) == here]
 
 
 def require_peer(pane, me=None, agents=None):
@@ -165,6 +170,34 @@ def build_request(req_id, sender, files, task, delta=None):
     ])
 
 
+def head_fields(kind, text):
+    """{field: [values]} of the field lines leading kind's envelope in text,
+    from its header to the first line naming none of kind's fields: a field
+    line quoted in the answer below is prose, not a second value."""
+    lines = text.splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if re.match(LEAD + re.escape(MARKER[kind]), line)), len(lines))
+    fields = {}
+    for line in lines[start + 1:]:
+        m = FIELD_LINE.match(line)
+        if line.strip() and not (m and m.group(1) in FIELDS[kind]):
+            break
+        if m:
+            fields.setdefault(m.group(1), []).append(m.group(2))
+    return fields
+
+
+def result_ids(text):
+    """The distinct values, verbatim, of the FOR lines of a result envelope's head."""
+    return sorted(set(head_fields('result', text).get('FOR', [])))
+
+
+def claims(ids, req_id):
+    """Whether FOR values claim req_id; one with words after it still does, so
+    the envelope is called malformed instead of skipped as another round's."""
+    return any(v.split()[:1] == [req_id] for v in ids)
+
+
 def extract_result(text, req_id):
     """Pull the envelope answering req_id out of raw pane text.
 
@@ -188,9 +221,13 @@ def extract_result(text, req_id):
 
     matching = []
     for body in blocks:
-        m = FOR_LINE.search(body)
-        if not m or m.group(1) != req_id:
+        ids = result_ids(body)
+        if not claims(ids, req_id):
             continue
+        if ids != [req_id]:
+            given = ' and '.join(f'"{i}"' for i in ids)
+            return None, Note(f'an envelope answering {req_id} gives FOR as {given}; '
+                              f'it must name {req_id} alone', MALFORMED)
         end = END_ID.search(body.rsplit('\n', 1)[-1])
         if not end or end.group(1) != req_id:
             return None, Note(f'an envelope says FOR: {req_id} but closes with '
@@ -206,8 +243,7 @@ def extract_result(text, req_id):
     if matching:
         # The complete one need not be the answer: a rerun of the same id may be
         # streaming right now, so this is the duplicate case caught mid-write.
-        streaming = FOR_LINE.search(partial) if partial else None
-        if streaming and streaming.group(1) == req_id:
+        if partial and claims(result_ids(partial), req_id):
             return None, Note(f'a complete envelope answers {req_id} and another for the '
                               'same id is still being written; resolve by hand', MALFORMED)
         return matching[0], None
@@ -215,10 +251,9 @@ def extract_result(text, req_id):
         return None, Note('an envelope began but this capture holds no END RESULT for it: '
                           'it may still be streaming, or be beyond the line window', NO_ANSWER)
     if blocks:
-        seen = sorted({m.group(1) for body in blocks
-                       if (m := FOR_LINE.search(body))})
+        seen = sorted({i for body in blocks for i in result_ids(body) if i})
         if not seen:
-            return None, Note('a complete envelope is present but carries no FOR line; '
+            return None, Note('a complete envelope is present but carries no FOR id; '
                               'it is malformed', MALFORMED)
         return None, Note(f'this capture holds no envelope for {req_id}; '
                           f'it answers {", ".join(seen)}', NO_ANSWER)
@@ -226,31 +261,50 @@ def extract_result(text, req_id):
 
 
 def check(kind, text):
-    """Shape only. Says nothing about whether the content is true."""
+    """Shape only. Says nothing about whether the content is true. A result's
+    fields come from its head (head_fields), so its answer may quote field
+    lines; a request's ID, FROM and FILES from every line before its DELTA or
+    TASK, since those may span lines and quote a field line."""
     problems = []
     if not re.search(LEAD + re.escape(MARKER[kind]), text):
         problems.append(f'missing the {kind} header line')
+    if kind == 'result':
+        fields = head_fields(kind, text)
+    else:
+        body = re.search(LEAD + r'(?:DELTA|TASK):', text, re.M)
+        head = text[:body.start()] if body else text
+        fields = {f: re.findall(LEAD + f + r':[ \t]*(.*?)[ \t]*$',
+                                text if f in ('DELTA', 'TASK') else head, re.M)
+                  for f in FIELDS[kind]}
     for field in FIELDS[kind]:
-        if not re.search(LEAD + field + ':', text, re.M):
+        if not fields.get(field):
             problems.append(f'missing required field {field}')
     # FILES is the ownership contract; a blank one leaves it unstated.
-    if re.search(LEAD + r'FILES:\s*$', text, re.M):
+    if '' in fields.get('FILES', []):
         problems.append('FILES is blank; list the paths, or "none"')
 
     marker = TERMINATOR[kind]
     close = re.search(LEAD + marker + r'\s+(\S+)', text, re.M)
+    id_field = FIELDS[kind][0]
+    ids = fields.get(id_field, [])
+    if '' in ids:
+        problems.append(f'{id_field} is blank; it carries the envelope id')
+    problems += [f'{id_field} "{v}" is not a single id'
+                 for v in sorted(set(ids)) if v and v.split() != [v]]
+    opened = next((v.split()[0] for v in ids if v), None)
     if not close:
         problems.append(f'missing the closing {marker} <id> line')
-    else:
-        opened = re.search(LEAD + FIELDS[kind][0] + r':\s*(\S+)', text, re.M)
-        if opened and opened.group(1) != close.group(1):
-            problems.append(f'{marker} names {close.group(1)} but the envelope is '
-                            f'{opened.group(1)}')
+    elif opened and opened != close.group(1):
+        problems.append(f'{marker} names {close.group(1)} but the envelope is {opened}')
 
     if kind == 'result':
-        status = re.search(LEAD + r'STATUS:\s*(.+?)\s*$', text, re.M)
-        if status and status.group(1) not in STATUSES:
-            problems.append(f'STATUS "{status.group(1)}" is not one of {", ".join(STATUSES)}')
+        statuses = sorted(set(fields.get('STATUS', [])))
+        problems += [f'STATUS "{s}" is not one of {", ".join(STATUSES)}'
+                     for s in statuses if s not in STATUSES]
+        fors = sorted({v for v in fields.get('FOR', []) if v})
+        for field, values in (('FOR', fors), ('STATUS', statuses)):
+            if len(values) > 1:
+                problems.append(f'the envelope gives {field} as both {" and ".join(values)}')
     return problems
 
 
@@ -311,7 +365,7 @@ def main():
             print('no peer agent shares this worktree')
             return 1
         for p in found:
-            print(f'{p["pane_id"]}\t{p["agent"]}\t{p.get("agent_status", "?")}')
+            print(f'{p["pane_id"]}\t{p.get("agent", "unknown")}\t{p.get("agent_status", "?")}')
         if len(found) > 1:
             print('several peers match; choose one deliberately', file=sys.stderr)
         return 0

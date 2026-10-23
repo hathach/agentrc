@@ -416,16 +416,23 @@ def membrowse_sizes(elf, filters):
 
 @functools.cache
 def load_module(name, path):
-    """The Python file at `path`, imported once as `name`."""
+    """The Python file at `path`, imported once as `name` and registered in sys.modules while it executes, as
+    import does (a dataclass looks its module up there); `name` is process-wide, so a caller picks one no other
+    module uses."""
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
     return module
 
 
 @functools.cache
 def _linkermap():
-    return load_module('linkermap', profile.linkermap_path())
+    return load_module('code_size_linkermap', profile.linkermap_path())
 
 
 def linkermap_sizes(elf, filters):

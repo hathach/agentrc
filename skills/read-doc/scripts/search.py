@@ -15,7 +15,7 @@ application notes that use it.
 
 Exit 0 matched, 1 nothing matched, 2 bad usage, 3 the library is unavailable.
 
-Each lookup, here and in locate.py find, is appended to HISTORY and named on
+Each lookup, here and in locate.py find and page, is appended to HISTORY and named on
 stderr by its id; history.py lists and shows them. READ_DOC_HISTORY=0 skips it.
 """
 import argparse
@@ -354,7 +354,7 @@ def main(argv):
     if error:
         print(error, file=sys.stderr)
     log_lookup(LIB, "search", {"keywords": args.keyword, "any": args.any, "kind": args.kind,
-                               "limit": args.limit}, started, code, error, result)
+                               "limit": args.limit, "path": args.path}, started, code, error, result)
     return code
 
 

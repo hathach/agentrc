@@ -7,8 +7,8 @@ Counts, never bodies: the status and reason, the head and mode, the proposed
 event and why, findings by status and severity, coverage lost (dropped scan
 units, unverified findings, claims left unjudged), the CI and HIL evidence the
 verdict used, the threads held from resolving (ids and why), and the draft's size. Every count is labelled with the finding
-statuses the workflow uses (open, fixed, covered, withdrawn, na) and the
-verdicts of the thread claims (confirmed, refuted, stale). The draft's text
+statuses the workflow uses (open, fixed, na, withdrawn, upheld, disputed) and
+the verdicts of the thread claims (confirmed, refuted, stale). The draft's text
 stays in the file for the human, and on the ledger once saved.
 
 stdout ends with one JSON line; {"error": ...}, exit 2, when FILE is not a

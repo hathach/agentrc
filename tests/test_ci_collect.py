@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -43,21 +44,6 @@ def greptile_run(title=BELOW_TITLE, summary=BELOW_SUMMARY, **over):
     return {'id': 118615785789, 'name': 'Greptile Review', 'head_sha': HEAD, 'status': 'completed', 'conclusion': 'failure',
             'started_at': '2026-10-20T12:02:14Z', 'completed_at': '2026-10-20T12:06:54Z', 'details_url': GREPTILE,
             'app': {'slug': 'greptile-apps'}, 'output': {'title': title, 'summary': summary, 'text': None}, **over}
-
-
-
-class RateLimitParity(unittest.TestCase):
-    def test_collect_reads_a_rate_limit_as_facts_does(self):
-        cases = [('HTTP 403: API rate limit exceeded for user ID 1.', {'core': {'remaining': 0, 'reset': 1790000060}}),
-                 ('HTTP 403: You have exceeded a secondary rate limit.', {'core': {'remaining': 4000, 'reset': 1790000060}}),
-                 ('HTTP 429: Too Many Requests', {'graphql': {'remaining': 0, 'reset': 1790000000}}),
-                 ('HTTP 403: API rate limit exceeded', None), ('HTTP 502: Bad Gateway', {})]
-        for stderr, resources in cases:
-            with self.subTest(stderr):
-                out = b'not json' if resources is None else json.dumps({'resources': resources}).encode()
-                answer = lambda argv, **kw: mock.Mock(returncode=0, stdout=out)
-                with mock.patch('subprocess.run', answer), mock.patch('time.time', return_value=1789990000):
-                    self.assertEqual(collect.rate_limit(stderr), FACTS.rate_limit(stderr))
 
 
 def unsealed(text):
@@ -253,9 +239,28 @@ class InventoryTest(unittest.TestCase):
         rc, r = self.main('--brief')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []))
         self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'status', 'waiting'], 'the same members as a whole line')
+        self.assertNotIn(['api', 'repos/o/r/actions/jobs/4'], self.calls, 'a check nobody is shown is not resolved')
+        self.assertEqual(r['waiting'], self.main()[1]['waiting'], 'the pending checks it hides still fingerprint the wait')
         self.listings = [[self.check('hil', 'pass', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((r['status'], [c['link'] for c in r['checks']]), ('red', [JOB.format(4)]), 'settled: the whole inventory')
+        self.assertIn(['api', 'repos/o/r/actions/jobs/4'], self.calls)
+
+    def test_brief_resolves_and_reads_the_head_again_when_mergeable_settles_after_the_listing(self):
+        self.heads = [HEAD]
+        self.mergeable = ['UNKNOWN', 'MERGEABLE']
+        self.listings = [[self.check('lint', 'fail', JOB.format(4))]]
+        rc, r = self.main('--brief')
+        self.assertEqual((rc, r['status'], [c['link'] for c in r['checks']]), (0, 'red', [JOB.format(4)]))
+        at = lambda call: max(i for i, c in enumerate(self.calls) if c == call)
+        self.assertGreater(at(['pr', 'view']), at(['api', 'repos/o/r/actions/jobs/4']), 'the head is read again after resolving')
+
+    def test_brief_shows_no_check_when_mergeable_turns_unknown_after_the_listing(self):
+        self.heads = [HEAD]
+        self.mergeable = ['MERGEABLE', 'UNKNOWN']
+        self.listings = [[self.check('lint', 'fail', JOB.format(4))]]
+        rc, r = self.main('--brief')
+        self.assertEqual((rc, r['status'], r['mergeable'], r['checks']), (0, 'running', 'UNKNOWN', []))
 
     def test_no_wait_budget_reports_what_stands(self):
         self.heads = [HEAD]
@@ -467,6 +472,11 @@ STEP = ['##[group]Run build', 'Build Summary: 1 OK, 0 Failed', '##[endgroup]', '
         '##[error]Process completed with exit code 1.', '##[group]Run upload', '##[endgroup]']
 
 
+def runner_log(*rows, failed=True):
+    """A job log whose hil_test.py step prints rows, and fails when failed."""
+    return log(*STEP[4:7], *rows, *['##[error]Process completed with exit code 1.'] * failed)
+
+
 class FailuresTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -487,6 +497,7 @@ class FailuresTest(unittest.TestCase):
                          '70': [{'name': 'hil (x.json)', 'conclusion': 'failure', 'databaseId': 40}]}
         self.changed = ['src/host/msc.c', 'test/hil/tiny usb.json']
         self.check_runs = []   # the head's check runs, one page; 'limited' refuses the read
+        self.workflow_id = 1000   # every run's; None answers a run record without one
         self.calls = []
 
         def run(argv, **kw):
@@ -511,13 +522,19 @@ class FailuresTest(unittest.TestCase):
                 if self.changed is None:
                     return mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 500')
                 return ok([[{'filename': f, 'patch': '@@'} for f in self.changed]])
+            if argv[1:3] == ['run', 'list'] and argv[argv.index('--workflow') + 1] != str(self.workflow_id):
+                return mock.Mock(returncode=1, stdout=b'', stderr=f'could not find any workflows named {argv[argv.index("--workflow") + 1]}'.encode())
             if argv[1:3] == ['run', 'list'] and '--commit' in argv:
+                if self.commit_runs == 'limited':
+                    return limited
                 return ok(self.commit_runs) if self.commit_runs is not None else mock.Mock(returncode=1, stdout=b'', stderr=b'HTTP 502')
             if argv[1:3] == ['run', 'list']:
                 return ok(self.base_runs)
             if argv[1:3] == ['run', 'view']:
                 return ok({'jobs': self.run_jobs[argv[3]]})
             path = argv[2]
+            if re.fullmatch(r'repos/o/r/actions/runs/\d+', path):
+                return ok({'id': int(path.rsplit('/', 1)[1]), 'workflow_id': self.workflow_id})
             job = path.split('/jobs/')[1].split('/')[0]
             if path.endswith('/logs') and self.logs[job] == 'limited':
                 return limited
@@ -608,10 +625,23 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(self.entries(JOB.format(3))[0]['base']['runId'], 70)
         self.assertEqual([c[2] for c in self.calls if c[:2] == ['run', 'view']], ['72', '70'], 'another branch\'s run is never read, a run listed twice is read once')
 
-    def test_a_failed_base_commit_listing_is_an_error_not_a_fallback(self):
+    def test_a_failed_base_lookup_is_a_base_error_not_a_fallback(self):
         self.commit_runs = None
-        self.assertIn('HTTP 502', self.entries(JOB.format(3))[0]['error'])
-        self.assertFalse([c for c in self.calls if c[:2] == ['run', 'list'] and '--branch' in c])
+        c = self.entries(JOB.format(3))[0]
+        self.assertEqual((c['error'], c['base'], [x['onBase'] for x in c['cells']], c['firstError']),
+                         (None, None, [None, None], STEP[8]), 'the log, its evidence and cells stay')
+        self.assertIn('HTTP 502', c['baseError'])
+        self.assertFalse([c for c in self.calls if c[:2] == ['run', 'list'] and '--branch' in c], 'no stale-branch fallback (#52)')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(3)]), 1,
+                             'bases has no base to compare: a placed verdict is judged again')
+        self.assertIn('HTTP 502', json.loads(out.getvalue())['error'])
+        self.commit_runs, self.workflow_id = [], None
+        self.assertEqual(self.entries(JOB.format(3))[0]['baseError'], 'run 7 names no workflow id')
+        self.workflow_id, self.commit_runs = 1000, 'limited'
+        rc, r = self.main(JOB.format(3))
+        self.assertEqual((rc, r['rateLimit']['resetAt']), (1, collect.utc(1790000060)), 'a rate limit still ends the call')
 
     def test_a_base_run_that_passed_carries_no_lines(self):
         self.run_jobs['70'][0]['conclusion'] = 'success'
@@ -629,11 +659,12 @@ class FailuresTest(unittest.TestCase):
         self.assertNotIn('cellsError', c)
 
     def test_a_cell_reads_other_failure_passed_or_other_on_base(self):
-        self.logs['40'] = log('pico  host/msc  ...  Failed: stall  I (24) boot: compile time 07:16  in 1.0s', 'rp2  device/hid  ...  OK in 1.0s')
+        self.logs['40'] = runner_log('pico  host/msc  ...  Failed: stall  I (24) boot: compile time 07:16  in 1.0s', 'rp2  device/hid  ...  OK in 1.0s')
         self.assertEqual([(x['onBase'], x['baseLine']) for x in self.entries(JOB.format(3))[0]['cells']],
                          [('other-failure', 'pico  host/msc  ...  Failed: stall  I (24) boot: compile time 07:16  in 1.0s'),
                           ('passed', 'rp2  device/hid  ...  OK in 1.0s')])
-        self.logs['40'] = log('pico  host/msc  ...  Skipped: no board', 'rp2  device/hid  ...  Failed: not enumerated  I (24) boot: compile time 07:16  in 5.0s')
+        self.logs['40'] = runner_log('pico  host/msc  ...  Skipped: no board', 'rp2  device/hid  ...  Failed: not enumerated  I (24) boot: compile time 07:16  in 5.0s',
+                                     failed=False)
         self.assertEqual([x['onBase'] for x in self.entries(JOB.format(3))[0]['cells']], ['other', 'same-failure'])
 
     def test_without_a_comparable_base_run_a_cell_is_not_placed(self):
@@ -641,9 +672,9 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual({x['onBase'] for x in self.entries(JOB.format(3))[0]['cells']}, {None})
 
     def test_a_retried_cell_counts_by_its_last_row_and_flash_failures_lose_the_command(self):
-        self.logs['3'] = log('pico  host/msc  ...  Failed: timeout in 9.4s', 'pico  host/msc  ...  OK in 3.0s',
-                             'rp2  device/hid  ...  Flash Failed: probe lost  COMMAND FAILED: openocd -f x.cfg',
-                             'rp2  device/cdc  ...  Skipped: no board', '##[error]Process completed with exit code 1.')
+        self.logs['3'] = runner_log('pico  host/msc  ...  Failed: timeout in 9.4s', 'pico  host/msc  ...  OK in 3.0s',
+                                    'rp2  device/hid  ...  Flash Failed: probe lost  COMMAND FAILED: openocd -f x.cfg',
+                                    'rp2  device/cdc  ...  Skipped: no board')
         self.assertEqual([(x['cell'], x['signature']) for x in self.entries(JOB.format(3))[0]['cells']],
                          [('rp2 device/hid', 'rp2 device/hid: Flash Failed: probe lost')])
 
@@ -659,6 +690,23 @@ class FailuresTest(unittest.TestCase):
         self.logs['3'] = log(*STEP[:7], 'Traceback (most recent call last):', 'RuntimeError: no boards', *STEP[11:])
         c = self.entries(JOB.format(3))[0]
         self.assertEqual((c['cells'], c['cellsError']), ([], 'a failed hil_test.py step printed no result row or report this reads; read its log'))
+
+    def test_cells_come_only_from_a_failed_step_whose_run_script_invokes_the_runner(self):
+        # tinyusb's pre-commit tests hil_test.py itself and prints a runner-shaped row; tinyuf2's names it in a traceback
+        hook = ['##[group]Run pre-commit run --all-files', '##[endgroup]', '.b  device/usbtest  ...  Failed: usbtest did not run',
+                '  File "/home/runner/work/r/r/test/hil/hil_test.py", line 257, in select_route', 'RuntimeError: no route',
+                '##[error]Process completed with exit code 1.']
+        self.logs['3'] = log(*hook)
+        c = self.entries(JOB.format(3))[0]
+        self.assertEqual((c['cells'], 'cellsError' in c), ([], False))
+        self.assertEqual(c['diagnostics'][0], hook[2], 'the hook\'s output stays its evidence')
+        self.logs['3'] = log(*hook[:2], *hook[3:])
+        self.assertNotIn('cellsError', self.entries(JOB.format(3))[0], 'naming the runner is not running it')
+        self.logs['3'] = log(*STEP[4:7], *STEP[7:11], *hook)
+        self.assertEqual([x['cell'] for x in self.entries(JOB.format(3))[0]['cells']], [], 'a runner step that passed reads no failure')
+        self.logs['3'] = log('##[group]Run # one report dir per run', 'python3 test/hil/hil_test.py $ARGS', '##[endgroup]', *STEP[7:])
+        self.assertEqual([x['cell'] for x in self.entries(JOB.format(3))[0]['cells']], ['pico host/msc', 'rp2 device/hid'],
+                         'the runner named in the script, not on the Run line')
 
     def uf2_log(self, *reports):
         lines = [(UF2 / r).read_text().strip() if r.endswith('.json') else r for r in reports]
@@ -926,7 +974,7 @@ class FailuresTest(unittest.TestCase):
         self.remember_on(OTHER, [judged, {**judged, 'verdict': 'real'}])
         self.assertEqual([v['verdict'] for v in self.cell_priors()[0]], ['rig-side', 'real'], 'both, for the judge to weigh: ambiguous')
         self.remember_on(OTHER, [{**judged, 'workflow': ''}])
-        self.jobs['3']['workflow_name'] = ''
+        self.checks[0]['workflow'] = ''
         self.assertEqual(self.cell_priors()[0], None, 'no workflow name on either side matches nothing')
 
     def test_each_cell_takes_the_newest_other_head_that_judged_it(self):
@@ -1185,6 +1233,13 @@ class FailuresTest(unittest.TestCase):
             rc = collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(12)])
         self.assertEqual((rc, [b['link'] for b in unsealed(out.getvalue())['bases']]), (0, [JOB.format(12)]))
 
+    def test_only_the_runs_of_the_asked_links_are_resolved(self):
+        other = 'https://github.com/o/r/actions/runs/8/job/5'
+        self.checks.append({'name': 'lint', 'workflow': 'Lint', 'bucket': 'fail', 'link': other})
+        self.entries(JOB.format(3))
+        self.assertIn(['api', 'repos/o/r/actions/jobs/3'], self.calls)
+        self.assertNotIn(['api', 'repos/o/r/actions/jobs/5'], self.calls, 'a check of another run is not asked about')
+
     def test_a_job_from_another_head_is_refused(self):
         self.jobs['3']['head_sha'] = OTHER
         c = self.entries(JOB.format(3))[0]
@@ -1213,10 +1268,21 @@ class FailuresTest(unittest.TestCase):
         self.assertEqual(c['error'], None)
         self.assertIn('time\ufffdout', c['firstError'])
 
-    def test_a_workflow_named_like_a_cache_key_keeps_its_own_base_runs(self):
-        for key in ('token', 'runs', 'rtd-token'):
-            self.jobs['3']['workflow_name'] = key
-            self.assertEqual(self.entries(RTD.format(9), JOB.format(3))[1]['base']['runId'], 70, key)
+    def test_a_run_name_is_not_the_workflows_name(self):
+        # a workflow's run-name: (tinyuf2's `HIL PR #<n>`) is what a job record's workflow_name carries
+        for job in ('3', '40'):
+            self.jobs[job]['workflow_name'] = 'HIL PR #5'
+        judged = {'workflow': 'Build', 'check': 'hil (x.json)', 'cell': 'pico host/msc', 'signature': 'pico host/msc: Failed: src/host/msc.c timeout',
+                  'verdict': 'rig-side', 'firstError': 'probe'}
+        self.remember_on(OTHER, [judged])
+        c = self.entries(JOB.format(3))[0]
+        self.assertEqual((c['error'], c['workflow'], c['base']['runId'], c['cells'][0]['prior'][0]['head']), (None, 'Build', 70, OTHER),
+                         'the inventory\'s workflow, which verdicts are stored under')
+        self.assertEqual({x[x.index('--workflow') + 1] for x in self.calls if x[:2] == ['run', 'list']}, {'1000'}, 'base runs by workflow id')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(3)])
+        self.assertEqual(unsealed(out.getvalue())['bases'], [{'link': JOB.format(3), 'base': '70:40:failure'}])
 
     SONAR = 'https://sonarcloud.io/dashboard?id=o_r&pullRequest=5'
 

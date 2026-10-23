@@ -3,6 +3,7 @@
 
   collect.py inventory --repo OWNER/NAME --pr N --head SHA [--wait-seconds S] [--brief] [--ignore-check NAME...] [--stop-file PATH]
   collect.py failures --repo OWNER/NAME --pr N --head SHA [--check LINK...] [--gate LINK...]
+  collect.py bases --repo OWNER/NAME --pr N --head SHA --check LINK...
   collect.py remember --repo OWNER/NAME --pr N --head SHA < VERDICTS.json
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
@@ -56,15 +57,19 @@ check's entry holds its saved `log` and the diagnostic lines of every step that 
 The log is the job's whole log without ANSI codes, NULs and timestamps for an
 Actions job, but only tails for the others: the last 150 lines of each failed
 CircleCI step and Read the Docs' notes with 40-line tails of failed commands.
-For an Actions job the entry also holds `runAttempt`, the attempt that
+For an Actions job the entry also holds `workflow`, the inventory's name for
+it, `runAttempt`, the attempt that
 executed it, and `executedBefore`, whether an earlier attempt executed the same
-job (null when that cannot be told), and the newest run on the PR's base commit
+job (null when that cannot be told), and the newest run of its workflow (by id: a
+`run-name:` renames the run) on the PR's base commit
 in which the same job ran, else the newest such run on the base branch (the
 detail file's baseSha tells which), with its conclusion and the diagnostic lines both
-share, and `cells`. A job cancelled before any step ran (no steps, no
+share, and `cells`. A base run that could not be looked up leaves `base` null
+and `baseError` saying why. A job cancelled before any step ran (no steps, no
 runner) has no log: its entry has `cancelledBeforeStart`, `log` and `base`
 null, no cells, and NEVER_STARTED as firstError and signature.
-Cells are an adapter for tinyusb's test/hil/hil_test.py:
+Cells are an adapter for tinyusb's test/hil/hil_test.py, read only from the
+output of a step whose Run script invokes hil_test.py (on the head, a failed one):
 each terminal failure row (`Failed:` or `Flash Failed:`) of its result table,
 `[<time> ]<board>  <test>  ...  <outcome>`, as {cell "<board> <test>",
 signature ("<cell>: " and the outcome up to the two spaces before the board's
@@ -93,7 +98,7 @@ one when ambiguous, and is absent when none match; this head's own store counts
 only for runs a re-run replaced, not for the checks read now. The detail file's
 `priorErrors` names each head whose store could not be read and was left out. A cell row is left out of
 `diagnostics` and `shared`, on both sides; `firstError` still reads it. A failed
-step that ran hil_test.py but printed no parsed failure row or report gets `cellsError` instead.
+step whose Run script invokes hil_test.py but that printed no parsed failure row or report gets `cellsError` instead.
 When any check was read, the detail file lists the PR's `changed`
 paths (null with `changedError` when they could not be read or may be
 incomplete), and the PR head is read again after them. A --check that is no longer a failing check of the head is a stale
@@ -157,10 +162,12 @@ import rtd  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile  # noqa: E402
 import windows  # noqa: E402
+from seal import fnv1a, rate_limit, sealed, utc  # noqa: E402
 
 POLL = 30
+ACTIONS_JOB = re.compile(r'^https://github\.com/[^/]+/[^/]+/actions/runs/\d+/job/(\d+)')
 ATTEMPT = (
-    ('actions', re.compile(r'^https://github\.com/[^/]+/[^/]+/actions/runs/\d+/job/(\d+)')),
+    ('actions', ACTIONS_JOB),
     ('circleci', re.compile(r'^https://circleci\.com/gh/[^/]+/[^/]+/(\d+)$')),
 )
 
@@ -176,6 +183,7 @@ RECALL_BYTES = 8192  # unmeasured: a relay copied 3.5 KB whole and failed at 28 
 SHA = re.compile(r'[0-9a-f]{40}')
 HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HIL_PROFILE=1 prefixes epoch seconds
 HIL_FAILED = ('Failed:', 'Flash Failed:')
+RUNNER = 'hil_test.py'
 PYTHON = re.compile(r'python[\d.]*')
 LINE = 500
 SONARCLOUD = 'https://sonarcloud.io'
@@ -192,24 +200,6 @@ class Failed(Exception):
     def __init__(self, message, limit=None):
         super().__init__(message)
         self.limit = limit
-
-
-def utc(seconds):
-    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(seconds))
-
-
-def rate_limit(stderr):
-    """rateLimit for a gh failure GitHub refused for a rate limit, else None: a copy of pr-babysit facts.py's, which
-    test_ci_collect holds equal."""
-    if not re.search(r'rate limit|HTTP 429', stderr, re.I):
-        return None
-    try:
-        resources = json.loads(subprocess.run(['gh', 'api', 'rate_limit'], capture_output=True).stdout)['resources']
-        spent = [r['reset'] for r in resources.values() if r.get('remaining') == 0 and isinstance(r.get('reset'), int)]
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        spent = []
-    return {'observedAt': utc(time.time()), 'resetAt': utc(max(spent)) if spent else None,
-            'secondary': not spent or 'secondary' in stderr.lower()}
 
 
 def gh(*args, raw=False):
@@ -306,7 +296,7 @@ def origin(repo, record, cache):
 
 
 def with_job(link, job):
-    m = ATTEMPT[0][1].match(link)
+    m = ACTIONS_JOB.match(link)
     return link[:m.start(1)] + str(job) + link[m.end(1):]
 
 
@@ -354,7 +344,15 @@ def unfinished_held(repo, checks, workflows):
     return [{**c, 'bucket': 'pending'} if c['link'] in held else c for c in checks]
 
 
-def inventory(repo, pr, head, wait, ignore=()):
+def run_of(link):
+    """An Actions job link without its job: the run every copy of that job is listed in."""
+    m = ACTIONS_JOB.match(link or '')
+    return link[:m.start(1)] if m else link
+
+
+def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None):
+    """brief: the caller is shown no failing check while running, by the last mergeable read; links: the only checks
+    it asks about, by link."""
     view = before = pull(repo, pr)
     if before['state'] != 'OPEN':
         return ended(before)
@@ -376,53 +374,46 @@ def inventory(repo, pr, head, wait, ignore=()):
         if view['state'] != 'OPEN':
             return ended(view)
     listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
-    cache = {}
-    listed = [resolved(repo, head, c, cache) if c['bucket'] in ('fail', 'cancel') and (c['attempt'] or '').startswith('actions:') else c
-              for c in listed]
-    # The listing reads the PR's last commit: a push during it would describe another head.
-    after = pull(repo, pr)
+
+    # A job read per failing Actions check, and its run's attempts after a re-run: only for checks the caller sees.
+    runs = None if links is None else {run_of(link) for link in links}
+
+    def resolve(cs):
+        cache = {}
+        return [resolved(repo, head, c, cache) if c['bucket'] in ('fail', 'cancel') and (c['attempt'] or '').startswith('actions:')
+                and (runs is None or run_of(c['link']) in runs) else c for c in cs]
+
+    def read_after():
+        # The listing reads the PR's last commit: a push during it would describe another head.
+        view = pull(repo, pr)
+        if view['state'] == 'OPEN' and view['headRefOid'] != head:
+            raise Failed(f'PR #{pr} head moved to {view["headRefOid"]} while collecting')
+        return view
+
+    hidden = brief and status == 'running'
+    if not hidden:
+        listed = resolve(listed)
+    after = read_after()
+    if after['state'] == 'OPEN' and hidden and summary(checks, after.get('mergeable'))[0] != 'running':
+        # mergeable settled since the listing: the checks are shown after all, and the head is read again after them.
+        listed, after = resolve(listed), read_after()
     if after['state'] != 'OPEN':
         return ended(after)
-    if after['headRefOid'] != head:
-        raise Failed(f'PR #{pr} head moved to {after["headRefOid"]} while collecting')
-    return {'head': head, 'baseRef': before['baseRefName'], 'baseSha': before['baseRefOid'], 'status': summary(checks, after.get('mergeable'))[0],
+    status = summary(checks, after.get('mergeable'))[0]
+    if brief and status == 'running':
+        listed = [c for c in listed if c['bucket'] == 'pending']   # the waiting fingerprint still reads them
+    return {'head': head, 'baseRef': before['baseRefName'], 'baseSha': before['baseRefOid'], 'status': status,
             'mergeable': after['mergeable'], 'counts': counts, 'ignored': ignored, 'checks': listed}
-
-
-def fnv1a(text):
-    """The workflow's fnv1a: 32-bit FNV-1a over code points, 8 hex digits."""
-    h = 0x811c9dc5
-    for ch in text:
-        h = ((h ^ ord(ch)) * 0x01000193) & 0xffffffff
-    return f'{h:08x}'
-
-
-def sealed(facts):
-    """facts plus the seal pr-babysit checks a relayed copy against: fnv1a over the
-    canonical JSON with null members left out, so a copy that drops one still matches.
-    A copy of facts.py's, so ci-rerun stays usable without pr-babysit; test_ci_collect holds them equal."""
-    def bare(v):
-        # Keys in UTF-16 code-unit order, as JavaScript's sort() compares them.
-        if isinstance(v, dict):
-            return {k: bare(v[k]) for k in sorted(v, key=lambda k: k.encode('utf-16-be', 'surrogatepass')) if v[k] is not None}
-        if isinstance(v, list):
-            return [bare(x) for x in v]
-        return v
-    # Top-level error stays out: a checked line has none, and a relay may fill in error: ''.
-    text = json.dumps(bare({k: v for k, v in facts.items() if k != 'error'}), separators=(',', ':'), ensure_ascii=False)
-    # JSON.stringify escapes a lone surrogate; ensure_ascii=False would hash it raw.
-    return {**facts, 'seal': fnv1a(re.sub('[\ud800-\udfff]', lambda m: f'\\u{ord(m.group()):04x}', text))}
 
 
 INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for failures and bases
 
 
-def printed(inv, brief=False):
-    """What the caller reads: the failing checks by name, the pending ones by count; brief, none while still running.
+def printed(inv):
+    """What the caller reads: the failing checks inventory shows by name, the pending ones by count.
     registered counts every check; waiting, '' unless running, fingerprints the pending checks and mergeable, so a
     caller can tell a wait that saw nothing move from one that did."""
-    listed = [] if brief and inv['status'] == 'running' else \
-        [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]
+    listed = [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]
     pending = sorted([c['name'], c.get('link') or '', c.get('attempt') or ''] for c in inv['checks'] if c['bucket'] == 'pending')
     return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
             'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
@@ -589,6 +580,23 @@ def evidence(lines, exit_line, omit=()):
             'diagnostics': [line for line in found if line not in omit][:KEEP]}
 
 
+def runner_output(lines, failed_only=False):
+    """(the log with every line blanked but the output of each step whose Run script invokes hil_test.py, the failed
+    ones only when failed_only; whether there was such a step). Line numbers stay the saved log's. Another step can
+    print a runner-shaped row or name the runner, as a pre-commit job testing hil_test.py itself does."""
+    keep, found = set(), False
+    runs = [i for i, line in enumerate(lines) if line.startswith('##[group]Run ')]
+    for run, end in zip(runs, [*runs[1:], len(lines)]):
+        body = next((i for i in range(run, end) if lines[i].startswith('##[endgroup]')), run)
+        if not any(RUNNER in line for line in lines[run:body + 1]):
+            continue
+        if failed_only and not any(line.startswith('##[error]') for line in lines[body:end]):
+            continue
+        found = True
+        keep.update(range(body + 1, end))
+    return [line if i in keep else '' for i, line in enumerate(lines)], found
+
+
 def hil_rows(lines):
     """({cell: (outcome, line number, line)}, the line numbers of the log's TinyUF2 reports): the last row per
     cell, a retried cell's final result. A log holding several reports gives no rows: no one report stands for it."""
@@ -729,13 +737,24 @@ def actions_log(repo, job):
     return clean(gh('api', f'repos/{repo}/actions/jobs/{job}/logs', '--allow-escape-sequences', raw=True))
 
 
+def actions_workflow_id(repo, run, cache):
+    """The run's workflow id: a job record's workflow_name is the run's name, which a workflow's run-name: replaces."""
+    ids = cache.setdefault('workflows', {})
+    if run not in ids:
+        ids[run] = gh('api', f'repos/{repo}/actions/runs/{run}').get('workflow_id')
+        if not isinstance(ids[run], int):
+            raise Failed(f'run {run} names no workflow id')
+    return ids[run]
+
+
 def base_run(repo, base_ref, base_sha, workflow, name, cache):
-    """The newest completed run on the base commit in which a job of this name ran, else the newest on the base branch."""
+    """The newest completed run of the workflow (its id) on the base commit in which a job of this name ran,
+    else the newest on the base branch."""
     runs, jobs = cache.setdefault('runs', {}), cache.setdefault('jobs', {})
     # GitHub's branch listing has served runs a month stale (#52); the commit listing names the exact base.
     for key, filt in (((workflow, base_sha), ('--commit', base_sha)), ((workflow, base_ref), ('--branch', base_ref))):
         if key not in runs:
-            runs[key] = [run for run in gh('run', 'list', '--repo', repo, *filt, '--workflow', workflow,
+            runs[key] = [run for run in gh('run', 'list', '--repo', repo, *filt, '--workflow', str(workflow),
                                            '--limit', '20', '--json', 'databaseId,headSha,headBranch,status')
                          if run['status'] == 'completed' and run['headBranch'] == base_ref
                          and (filt[0] == '--branch' or run['headSha'] == base_sha)]
@@ -753,25 +772,32 @@ def never_started(record):
     return record.get('conclusion') == 'cancelled' and record.get('steps') == [] and record.get('runner_id', -1) in (None, 0)
 
 
-def actions(repo, head, base_ref, base_sha, job, folder, cache, record=None):
+def actions(repo, head, base_ref, base_sha, job, workflow, folder, cache, record=None):
+    """`workflow` is the inventory's name for the check's workflow, which stored verdicts are keyed by."""
     record = record or gh('api', f'repos/{repo}/actions/jobs/{job}')
     if record.get('head_sha') != head:
         raise Failed(f'job {job} ran on {record.get("head_sha")}, not the head {head}')
-    entry = {'name': record['name'], 'workflow': record.get('workflow_name', ''), 'runId': record.get('run_id'),
+    entry = {'name': record['name'], 'workflow': workflow, 'runId': record.get('run_id'),
              'runAttempt': record.get('run_attempt')}
     if never_started(record):
         return {**entry, 'log': None, 'cancelledBeforeStart': True, **evidence([], NEVER_STARTED), 'base': None, 'cells': []}
     full = actions_log(repo, job)
     section, exit_line = failed_steps(full)
-    rows, reports = hil_rows(full)
+    runner, ran = runner_output(full, failed_only=True)
+    rows, reports = hil_rows(runner)
     failed = failed_rows(rows)
     entry.update(log=save(folder, f'actions-{job}.log', full),
                  **evidence(with_rows(section, full, rows), exit_line, {row[2] for row in failed.values()}))
-    base = base_run(repo, base_ref, base_sha, entry['workflow'], record['name'], cache)
+    try:
+        base = base_run(repo, base_ref, base_sha, actions_workflow_id(repo, record['run_id'], cache), record['name'], cache)
+    except Failed as e:
+        if e.limit:
+            raise
+        base, entry['baseError'] = None, str(e)
     base_rows = None
     if base and (base['conclusion'] == 'failure' or (failed and base['conclusion'] == 'success')):
         base_full = actions_log(repo, base['jobId'])
-        base_rows, base_reports = hil_rows(base_full)
+        base_rows, base_reports = hil_rows(runner_output(base_full)[0])
         base = {**base, 'log': save(folder, f'base-actions-{base["jobId"]}.log', base_full)}
         if base['conclusion'] == 'failure':
             theirs = [line for line in diagnostics(with_rows(failed_steps(base_full)[0], base_full, base_rows))
@@ -784,8 +810,8 @@ def actions(repo, head, base_ref, base_sha, job, folder, cache, record=None):
     entry['cells'] = cells(failed, base_rows)
     if len(reports) > 1:
         entry['cellsError'] = several_reports(reports)
-    elif not failed and not reports and any('hil_test.py' in line for line in section):
-        entry['cellsError'] = 'a failed hil_test.py step printed no result row or report this reads; read its log'
+    elif not failed and not reports and ran:
+        entry['cellsError'] = f'a failed {RUNNER} step printed no result row or report this reads; read its log'
     return entry
 
 
@@ -966,7 +992,7 @@ def changed_paths(repo, pr):
 
 
 def failures(repo, pr, head, links, gates=()):
-    now = inventory(repo, pr, head, 0)
+    now = inventory(repo, pr, head, 0, links=links)
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
     stale = [link for link in (*links, *gates) if link not in failing]
     if stale:
@@ -981,7 +1007,7 @@ def failures(repo, pr, head, links, gates=()):
         try:
             if kind == 'actions':
                 entry['executedBefore'] = check['executedBefore']
-                entry.update(actions(repo, head, now['baseRef'], now['baseSha'], ident, folder, cache, check.get('record')))
+                entry.update(actions(repo, head, now['baseRef'], now['baseSha'], ident, check['workflow'], folder, cache, check.get('record')))
             elif kind == 'readthedocs':
                 entry.update(readthedocs(link, folder, cache))
             elif kind == 'circleci':
@@ -1017,7 +1043,7 @@ def base_token(base):
 
 def bases(repo, pr, head, links):
     """Each --check's base job token as `failures` prints it, without reading a log."""
-    now = inventory(repo, pr, head, 0)
+    now = inventory(repo, pr, head, 0, links=links)
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
     stale = [link for link in links if link not in failing]
     if stale:
@@ -1031,7 +1057,7 @@ def bases(repo, pr, head, links):
             if record.get('head_sha') != head:
                 raise Failed(f'job {ident} ran on {record.get("head_sha")}, not the head {head}')
             if not never_started(record):
-                base = base_run(repo, now['baseRef'], now['baseSha'], record.get('workflow_name', ''), record['name'], cache)
+                base = base_run(repo, now['baseRef'], now['baseSha'], actions_workflow_id(repo, record['run_id'], cache), record['name'], cache)
         out.append({'link': link, 'base': base_token(base)})
     after = pull(repo, pr)['headRefOid']
     if after != head:
@@ -1075,7 +1101,7 @@ def main(argv=None):
     STOP_FILE = a.stop_file
     try:
         if a.command == 'inventory':
-            out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds), set(a.ignore_check)), a.brief)
+            out = printed(inventory(a.repo, a.pr, a.head, max(0, a.wait_seconds), set(a.ignore_check), a.brief))
         elif a.command == 'failures':
             out = failures(a.repo, a.pr, a.head, a.check, a.gate)
         elif a.command == 'bases':

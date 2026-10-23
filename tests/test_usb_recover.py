@@ -705,6 +705,14 @@ class RootCycle(VerbTree):
         self.assertIn("has serial '', expected 'PROBE-SN'", self.cycle('13-1.6', 'PROBE-SN', code=3))
         self.assertEqual(self.ran(), [])
 
+    def test_a_serial_that_does_not_answer_warns_and_proceeds(self):
+        self.fifo(self.dev / '13-1.6' / 'serial')               # the wedge: a read that never answers
+        out = self.cycle('13-1.6', 'PROBE-SN', code=0, REENUM='1')
+        self.assertIn("root-cycle: WARNING 13-1.6's serial did not answer (it is wedged), so 'PROBE-SN' could NOT"
+                      " be confirmed; proceeding", out)
+        self.assertEqual(self.ran(), ['check', 'off', 'on'])
+        self.assertIn('root-cycled 13 port 1: 13-1.6 re-enumerated', out)
+
     def test_a_check_that_fails_hangs_or_survives_ends_before_the_power_off(self):
         for mode, says in (('fail', 'check of bus 13 port 1 failed (1); nothing switched'),
                            ('hang', 'check of bus 13 port 1 failed (124); nothing switched'),

@@ -152,23 +152,28 @@ class SurvivorGuard(unittest.TestCase):
             self.assertEqual(helpers.descendants(), {parent: (os.getpid(), 'S', '1')})
 
     def test_a_survivor_reparented_while_a_walk_runs_is_still_found(self):
-        baseline = {(pid, st[2]) for pid, st in helpers.descendants().items()}
-        p = subprocess.Popen(['sleep', '60'])
-        self.addCleanup(p.wait)
-        self.addCleanup(p.kill)
-        real, missed = helpers.children, []
+        # the command text is diagnostic only: /proc may show it empty (#232)
+        for unnamed in (False, True):
+            with self.subTest(unnamed=unnamed):
+                baseline = {(pid, st[2]) for pid, st in helpers.descendants().items()}
+                p = subprocess.Popen(['sleep', '60'])
+                self.addCleanup(p.wait)
+                self.addCleanup(p.kill)
+                real, missed = helpers.children, []
 
-        def first_walk_misses_it(pid):    # its parent exited after the list was read, so no list held it
-            kids = real(pid)
-            if pid == os.getpid() and not missed:
-                missed.append(p.pid)
-                return [k for k in kids if k != p.pid]
-            return kids
-        with mock.patch.object(helpers, 'children', first_walk_misses_it), \
-                mock.patch.object(helpers, 'SURVIVOR_GRACE', 0), \
-                self.assertRaisesRegex(AssertionError, f'outlived their test: {p.pid} sleep 60'):
-            helpers.check_no_survivors(baseline)
-        self.assertEqual(missed, [p.pid])
+                def first_walk_misses_it(pid):    # its parent exited after the list was read, so no list held it
+                    kids = real(pid)
+                    if pid == os.getpid() and not missed:
+                        missed.append(p.pid)
+                        return [k for k in kids if k != p.pid]
+                    return kids
+                with mock.patch.object(helpers, 'children', first_walk_misses_it), \
+                        mock.patch.object(helpers, 'SURVIVOR_GRACE', 0), \
+                        mock.patch.object(helpers, 'cmdline', (lambda pid: '') if unnamed else helpers.cmdline), \
+                        self.assertRaisesRegex(AssertionError, rf'outlived their test: {p.pid} (sleep 60)?$'):
+                    helpers.check_no_survivors(baseline)
+                self.assertEqual(missed, [p.pid])
+                self.assertIsNotNone(p.poll(), 'the check ended it')
 
     def test_a_flag_it_cannot_set_or_restore_fails(self):
         class Case:

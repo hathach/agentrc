@@ -34,6 +34,8 @@ if args[:2] == ['worktree', 'list']:
     entry = {'path': path, 'is_linked_worktree': True}
     if path == os.environ['STUB_OPEN'] and 'closed' not in mode:
         entry['open_workspace_id'] = 'w1'
+    if 'strlinked' in mode:
+        entry['is_linked_worktree'] = 'false'
     print(json.dumps({'result': {'worktrees': [entry]}}))
 elif args[:2] == ['plugin', 'list']:
     root = '/elsewhere' if 'elsewhere' in mode else os.environ['STUB_ROOT']
@@ -137,6 +139,10 @@ class Remove(unittest.TestCase):
         self.mode.write_text('closed')
         self.assertRefused(f'herdr worktree open --path {self.parent}')
 
+    def test_a_malformed_herdr_entry_is_refused(self):
+        self.mode.write_text('strlinked')
+        self.assertRefused('malformed entry')
+
     def test_an_unreachable_herdr_is_refused(self):
         self.mode.write_text('down')
         self.assertRefused('herdr server unreachable')
@@ -156,7 +162,7 @@ class Remove(unittest.TestCase):
                                  cwd=self.parent)
         self.addCleanup(chief.wait)
         self.addCleanup(chief.kill)
-        self.assertRefused(f'pid {chief.pid}')
+        self.assertRefused(f'a chief session (headless or interactive) runs in it: pid {chief.pid}')
         chief.kill()
         chief.wait()
         box = Path(sh(self.parent, 'rev-parse', '--absolute-git-dir')) / 'cowork' / 'claude' / 'main'
@@ -173,6 +179,12 @@ class Remove(unittest.TestCase):
         state.symlink_to(self.parent / 'build')  # resolved: a log reached through a link counts too
         with mock.patch.object(wr, 'PLUGIN_LOG', state / 'log'):
             self.assertRefused(f'{state / "log"} lies inside a worktree this removes')
+
+    def test_a_tree_changing_after_its_check_is_refused(self):
+        self.sibling('b')
+        for err in (wr.wc.Keep('cannot list /x: Permission denied'), FileNotFoundError(2, 'gone', '/x/link')):
+            with self.subTest(err=err), mock.patch.object(wr, 'links_leaving', side_effect=err):
+                self.assertRefused('listing the symlinks leaving the removed trees')
 
     def test_a_failed_github_lookup_is_refused(self):
         with mock.patch.object(wr.wc, 'GITHUB', re.compile('')):
@@ -199,6 +211,49 @@ class Remove(unittest.TestCase):
         rc, out = self.run_remove('--proceed', self.token(out))
         self.assertEqual(rc, 0, out)
         self.assertEqual(len(self.removals()), 1)
+
+    def test_a_staying_siblings_own_children_and_link_targets_stay(self):
+        target = self.sibling('dep-x')
+        owner = self.sibling('z')
+        (owner / 'wip.txt').write_text('wip')
+        (owner / 'dep').symlink_to(target)
+        owned = self.sibling('z--dep')
+        rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 4, out)
+        self.assertIn(f'{target}: stays: parent--z, which stays, links into it', out)
+        self.assertIn(f'{owned}: stays: owned by parent--z, which stays', out)
+        self.assertIn('parent--dep-x stays: parent--z, which stays, links into it', out)
+        self.assertNotIn('the plugin removes it', out)
+
+    def test_every_sibling_a_staying_siblings_link_passes_through_stays(self):
+        bridge, target = self.sibling('bridge'), self.sibling('dep')
+        owner = self.sibling('z')
+        (owner / 'use').symlink_to(bridge / 'build' / 'forward')
+        (bridge / 'build').mkdir()
+        (bridge / 'build' / 'forward').symlink_to(target)
+        rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 4, out)
+        for sibling in (bridge, target):
+            self.assertIn(f'{sibling}: stays: parent--z, which stays, links into it', out)
+
+    def test_a_staying_siblings_link_through_a_sibling_and_back_out_holds_both(self):
+        passed, target = self.sibling('a'), self.sibling('b')
+        owner = self.sibling('z')
+        (owner / 'use').symlink_to(f'{passed}/../{target.name}')
+        rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 4, out)
+        for sibling in (passed, target):
+            self.assertIn(f'{sibling}: stays: parent--z, which stays, links into it', out)
+
+    def test_siblings_linking_in_a_cycle_stay(self):
+        a, b = self.sibling('a'), self.sibling('b')
+        for one, other in ((a, b), (b, a)):
+            (one / 'build').mkdir()
+            (one / 'build' / 'peer').symlink_to(other)
+        rc, out = self.run_remove('--dry-run')
+        self.assertEqual(rc, 4, out)
+        self.assertIn(f'{a}: stays: links with parent--b in a cycle', out)
+        self.assertIn(f'{b}: stays: links with parent--a in a cycle', out)
 
     def test_a_list_that_changed_since_the_token_stops_again(self):
         rc, out = self.run_remove('--pending', 'file the flaky test')
@@ -306,11 +361,12 @@ class Remove(unittest.TestCase):
         (sibling / 'build' / 'inner').symlink_to(sibling / '.gitignore')
         rc, out = self.run_remove('--dry-run')
         self.assertEqual(rc, 0, out)
-        self.assertIn(f'{self.parent}: removed by herdr; branch parent goes: on origin', out)
-        self.assertIn(f'{sibling}: removed by the plugin; branch b goes: on origin', out)
+        self.assertIn(f'{self.parent}: herdr removes it; branch parent goes: on origin', out)
+        self.assertIn(f'{sibling}: the plugin removes it; branch b goes: on origin', out)
         self.assertIn(f'{self.parent}/build/deps -> {target}', out)
         self.assertNotIn('inner', out)
-        self.assertIn('removal requested; the plugin log has the result', out)
+        self.assertIn(f'Plan to remove {self.parent}', out)
+        self.assertNotRegex(out, 'requested|has the result')
         self.assertEqual(self.removals(), [])
         self.assertFalse(self.reports.exists())
         self.assertTrue(sibling.is_dir() and sh(self.main, 'branch', '--list', 'b'))

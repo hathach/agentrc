@@ -3,9 +3,12 @@
 
 Renesas publishes no document API and its product pages render client-side, so the
 catalogue is recovered from the **sitemap**: pages 2-59 of
-`https://www.renesas.com/sitemap.xml?page=N` are document URLs. That scan is cached
-under ~/.cache/download-doc/renesas/ra_rx_docs.json; re-run scripts/renesas_scan to
-refresh it.
+`https://www.renesas.com/sitemap.xml?page=N` are document URLs. This adapter only
+reads that scan, from ~/.cache/download-doc/renesas/ra_rx_docs.json; no script here
+builds it. The file is a JSON list with one `{"url", "slug", "type"}` object per
+document URL in those pages: `type` is the path segment after `/document/` (`dst`)
+and `slug` the last one. Rebuild it by hand when it is missing or stale; its
+freshness is otherwise unknown.
 
 The document URL *is* the PDF (no landing page), and the type code sits in the path:
 `/en/document/dst/rx210-group-datasheet-rev150`.
@@ -74,8 +77,8 @@ def _rev(slug: str) -> str | None:
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
     if not CACHE.exists():
-        print(f"  no cached sitemap scan at {CACHE} — run the scan first", file=sys.stderr)
-        return []
+        raise SystemExit(f"{CACHE} is missing: build it from the Renesas sitemap as this "
+                         f"module's docstring describes")
     want = {f.upper() for f in families} if families else None
     seen, docs = set(), []
     # The sitemap carries every document once per locale (2,475 en + 1,736 ja), same

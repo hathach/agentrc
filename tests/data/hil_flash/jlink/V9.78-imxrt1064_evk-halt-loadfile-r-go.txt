@@ -1,0 +1,102 @@
+SEGGER J-Link Commander V9.78 (Compiled Sep 16 2026 16:34:54)
+DLL version V9.78, compiled Sep 16 2026 16:34:09
+
+J-Link Commander will now exit on Error
+
+J-Link Command File read successfully.
+Processing script file...
+J-Link>halt
+J-Link connection not established yet but required for command.
+Connecting to J-Link ...O.K.
+Firmware: J-Link LPCXpresso V2 compiled Aug 25 2023 12:01:15
+Hardware version: V1.00
+J-Link uptime (since boot): 22d 22h 26m 53s
+S/N: 725299165
+VTref=3.300V
+Target connection not established yet but required for command.
+Device "MIMXRT1064XXX6A" selected.
+
+
+Connecting to target via SWD
+InitTarget() start
+InitTarget() end - Took 4.12ms
+Found SW-DP with ID 0x0BD11477
+DPIDR: 0x0BD11477
+CoreSight SoC-400 or earlier
+Scanning AP map to find all available APs
+AP[1]: Stopped AP scan as end of AP map has been reached
+AP[0]: AHB-AP (IDR: 0x04770041, ADDR: 0x00000000)
+Iterating through AP map to find AHB-AP to use
+AP[0]: Core found
+AP[0]: AHB-AP ROM base: 0xE00FD000
+CPUID register: 0x411FC271. Implementer code: 0x41 (ARM)
+Cache: L1 I/D-cache present
+Found Cortex-M7 r1p1, Little endian.
+Cortex-M: The connected J-Link (S/N 725299165) uses an old firmware module: V1 (current is 3)
+FPUnit: 8 code (BP) slots and 0 literal slots
+CoreSight components:
+ROMTbl[0] @ E00FD000
+[0][0]: E00FE000 CID B105100D PID 000BB4C8 ROM Table
+ROMTbl[1] @ E00FE000
+[1][0]: E00FF000 CID B105100D PID 000BB4C7 ROM Table
+ROMTbl[2] @ E00FF000
+[2][0]: E000E000 CID B105E00D PID 000BB00C SCS-M7
+[2][1]: E0001000 CID B105E00D PID 000BB002 DWT
+[2][2]: E0002000 CID B105E00D PID 000BB00E FPB-M7
+[2][3]: E0000000 CID B105E00D PID 000BB001 ITM
+[1][1]: E0041000 CID B105900D PID 001BB975 ETM-M7
+[1][2]: E0042000 CID B105900D PID 004BB906 CTI
+[0][1]: E0040000 CID B105900D PID 000BB9A9 TPIU-M7
+[0][2]: E0043000 CID B105F00D PID 001BB101 TSG
+I-Cache L1: 32 KB, 512 Sets, 32 Bytes/Line, 2-Way
+D-Cache L1: 32 KB, 256 Sets, 32 Bytes/Line, 4-Way
+Memory zones:
+  Zone: "Default" Description: Default access mode
+Cortex-M7 identified.
+PC = 700027FC, CycleCnt = 02AACD9D
+R0 = 00000001, R1 = 00000000, R2 = 00C00000, R3 = 400C0000
+R4 = 00000000, R5 = 000975E0, R6 = FFFFFFFF, R7 = 000003E8
+R8 = 00200300, R9 = 00000000, R10= 00000000, R11= 400F8000
+R12= 00000812
+SP(R13)= 2001FFF8, MSP= 2001FFF8, PSP= 20020000, R14(LR) = 70002675
+XPSR = 81000000: APSR = Nzcvq, EPSR = 01000000, IPSR = 000 (NoException)
+CFBP = 00000000, CONTROL = 00, FAULTMASK = 00, BASEPRI = 00, PRIMASK = 00
+
+FPS0 = 00000000, FPS1 = 00000000, FPS2 = 00000000, FPS3 = 00000000
+FPS4 = 00000000, FPS5 = 00000000, FPS6 = 00000000, FPS7 = 00000000
+FPS8 = 00000000, FPS9 = 00000000, FPS10= 00000000, FPS11= 00000000
+FPS12= 00000000, FPS13= 00000000, FPS14= 00000000, FPS15= FFFFFFFF
+FPS16= 00000000, FPS17= 00000000, FPS18= 00000000, FPS19= 00000000
+FPS20= 00000000, FPS21= 00000000, FPS22= 00000000, FPS23= 00000000
+FPS24= 00000000, FPS25= 00000000, FPS26= 00000000, FPS27= 00000000
+FPS28= 00000000, FPS29= 00000000, FPS30= 00000000, FPS31= FFFFFFFF
+FPSCR= 00000000
+J-Link>loadfile /x/tinyuf2.hex
+'loadfile': Performing implicit reset & halt of MCU.
+ResetTarget() start
+ResetTarget() end - Took 125ms
+Device specific reset executed.
+AfterResetTarget() start
+AfterResetTarget() end - Took 1.61ms
+Downloading file [/x/tinyuf2.hex]...
+Comparing flash   [000%]000%]050%]100%] Done.
+Erasing flash     [000%]000%]100%] Done.
+Programming flash [000%]000%]000%]000%]000%]000%]000%]000%]005%]005%]005%]005%]005%]005%]010%]010%]010%]010%]010%]010%]015%]015%]015%]015%]015%]015%]020%]020%]020%]020%]020%]020%]025%]025%]025%]025%]025%]025%]025%]025%]030%]030%]030%]030%]030%]030%]035%]035%]035%]035%]035%]035%]040%]040%]040%]040%]040%]040%]045%]100%] Done.
+J-Link: Flash download: Bank 0 @ 0x70000000: 1 range affected (65536 bytes)
+J-Link: Flash download: Total: 0.707s (Prepare: 0.066s, Compare: 0.083s, Erase: 0.305s, Program & Verify: 0.217s, Restore: 0.034s)
+J-Link: Flash download: Program & Verify speed: 295 KB/s
+O.K.
+J-Link>r
+Reset delay: 0 ms
+ResetTarget() start
+Could not find valid reset vector.
+Target halted on flash header read.
+ResetTarget() end - Took 122ms
+Device specific reset executed.
+AfterResetTarget() start
+AfterResetTarget() end - Took 1.66ms
+J-Link>go
+Memory map 'after startup completion point' is active
+J-Link>exit
+
+Script processing completed.

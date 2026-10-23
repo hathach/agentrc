@@ -23,9 +23,11 @@ reparents here: it is stopped the same way and reported under orphans, its side 
 
 The report gives each side's spawn and exit times (seconds after the first spawn) and the window
 in which both processes existed. An exit time is when this script saw the exit, within one 50 ms
-poll, so it and the window's end are upper bounds. The window is when both ran, not when both were
-capturing: a tool's readiness (usbmon attached, an RTT block found, a port opened) is its own
-output's to show, and this script claims none.
+poll, so it and the window's end are upper bounds. A side still unreaped 5 s after its SIGKILL (a
+tool in D state) has a null exit time and return code, and its pid; the window then ends at the
+other side's exit, and its end and length are null when neither exited. The window is when both
+ran, not when both were capturing: a tool's readiness (usbmon attached, an RTT block found, a port
+opened) is its own output's to show, and this script claims none.
 
 Exit: 0 both sides exited 0 within the bound and left nothing running; 1 a side exited non-zero
 or had to be stopped, or the run was interrupted (each side reported); 2 bad usage; 3 a side
@@ -273,17 +275,23 @@ def main(argv=None):
         if 'startError' in s:
             row['startError'] = s['startError']
         if 'proc' in s:
-            row.update(spawnedAt=round(s['spawned'] - t0, 3), exitedAt=round(s['exited'] - t0, 3),
+            note_exit(s)    # once more: an exit only lingering() saw has its time and code here, read once
+            exited = s.get('exited')
+            row.update(spawnedAt=round(s['spawned'] - t0, 3),
+                       exitedAt=None if exited is None else round(exited - t0, 3),
                        returncode=s['proc'].returncode, stopped=s in running, killed=s.get('killed', False),
                        stdoutBytes=os.path.getsize(s['stdout']), stderrBytes=os.path.getsize(s['stderr']))
+            if exited is None:
+                row['pid'] = s['proc'].pid    # unreaped past its SIGKILL: D state?
             remaining = sorted(left(s['seen']))
             if remaining:
                 row['descendantsLeft'] = remaining
         rows.append(row)
     result = {'out': a.out, 'timeout': a.timeout, 'sides': rows}
     if len(started) == 2:
-        lo, hi = max(r['spawnedAt'] for r in rows), min(r['exitedAt'] for r in rows)
-        result['bothRunning'] = {'from': lo, 'to': hi, 'seconds': round(max(0.0, hi - lo), 3)}
+        lo = max(r['spawnedAt'] for r in rows)
+        hi = min((r['exitedAt'] for r in rows if r['exitedAt'] is not None), default=None)
+        result['bothRunning'] = {'from': lo, 'to': hi, 'seconds': None if hi is None else round(max(0.0, hi - lo), 3)}
     if strays:
         result['orphans'] = {'pids': sorted(strays), 'left': sorted(left(strays))}
     if signals:

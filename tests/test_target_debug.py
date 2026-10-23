@@ -81,7 +81,7 @@ def fake_tools(case, d, tools):
     for name, body in tools:
         stub = make_tool(d, name, body)
         with mock.patch.dict(os.environ, {'PATH': env['PATH']}):
-            found = pc_sample.which(nt_name(name))
+            found = probe_state.which(nt_name(name))
         case.assertEqual(found and Path(found).resolve(), stub.resolve(), name)
     return env
 
@@ -91,16 +91,21 @@ def setUpModule():
 
 
 class CopiedAloneTest(unittest.TestCase):
-    def test_pc_sample_and_probe_state_load_without_the_rest_of_agentrc(self):
-        # the pair is copied to rigs as is: nothing outside these two files may be imported
-        d = tmpdir(self)
+    def test_pc_sample_and_probe_state_load_with_lib_windows_alone(self):
+        # nothing outside the pair and lib/windows.py may be imported
+        root = tmpdir(self)
+        d = root / 'skills' / 'target-debug' / 'scripts'
+        d.mkdir(parents=True)
+        (root / 'lib').mkdir()
+        shutil.copy(SCRIPT.parents[3] / 'lib' / 'windows.py', root / 'lib' / 'windows.py')
         for name in ('pc_sample.py', 'probe_state.py'):
             shutil.copy(SCRIPT.parent / name, d / name)
-        code = 'import sys; sys.path.insert(0, sys.argv[1]); import pc_sample; print(pc_sample.probe_state_module().__file__)'
+        code = 'import sys; sys.path.insert(0, sys.argv[1]); import pc_sample\nprint(pc_sample.probe_state.__file__)'
         r = subprocess.run([sys.executable, '-I', '-c', code, str(d)], capture_output=True, text=True, cwd=d, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(Path(r.stdout.strip()).resolve(), d / 'probe_state.py')
-        # and identifies its J-Link with nothing else beside it
+        # probe_state.py needs nothing of its client, and identifies its J-Link with nothing else beside it
+        (d / 'pc_sample.py').unlink()
         code = ('import sys; sys.path.insert(0, sys.argv[1]); import probe_state as p\n'
                 'j = p.JLink("000681295394", "X", "swd", "4000"); j._identify("S/N: 681295394")\n'
                 'try:\n    j._identify("S/N: 123")\nexcept p.ToolError as e:\n    print(j.connection["serial"], e)')
@@ -295,7 +300,7 @@ class CliTest(unittest.TestCase):
         os.chdir(cwd)
         with mock.patch.dict(os.environ, {'PATH': str(self.elf.parent / 'empty')}):
             os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)    # the Windows default; restored on exit
-            self.assertIsNone(pc_sample.which('fake-addr2line'))
+            self.assertIsNone(probe_state.which('fake-addr2line'))
             with self.assertRaisesRegex(probe_state.ToolError, f'{JLINK} not found'):
                 probe_state.tool('PROBE_STATE_JLINK_EXE_UNSET', 'JLinkExe', 'JLink.exe')
 
@@ -311,11 +316,11 @@ class CliTest(unittest.TestCase):
         os.chdir(cwd)
         for entry in ('.', 'bin', os.path.splitdrive(str(cwd))[1]):
             with self.subTest(entry=entry), mock.patch.dict(os.environ, {'PATH': entry}):
-                self.assertIsNone(pc_sample.which('fake-addr2line'))
+                self.assertIsNone(probe_state.which('fake-addr2line'))
                 with self.assertRaisesRegex(probe_state.ToolError, f'{JLINK} not found'):
                     probe_state.tool('PROBE_STATE_JLINK_EXE_UNSET', 'JLinkExe', 'JLink.exe')
         with mock.patch.dict(os.environ, {'PATH': str(cwd / 'bin')}):
-            self.assertEqual(pc_sample.which('fake-addr2line'), os.path.join(cwd / 'bin', 'fake-addr2line.exe'))
+            self.assertEqual(probe_state.which('fake-addr2line'), os.path.join(cwd / 'bin', 'fake-addr2line.exe'))
 
     def test_raw_never_overwrites(self):
         raw = Path(self._dir.name) / 'pcs.txt'
@@ -659,6 +664,67 @@ SYMS = [('g_count', 0x2000_0010, 4, OBJ, BSS), ('g_flag', 0x2000_0014, 1, OBJ, B
 
 
 class ProbeStateUnitTest(unittest.TestCase):
+    def feeder_interrupted_as_it_starts(self, on_signal):
+        """run() on Windows' stdin path whose feeder's start() is interrupted by on_signal once the writer is blocked
+        on a tool that reads nothing and outlives its kill: its exception, and the time run() took."""
+        real, procs = subprocess.Popen, []
+
+        class Survivor(real):
+            killed = False
+
+            def kill(self):
+                self.killed = True
+
+            def poll(self):
+                return None if self.killed else super().poll()
+
+            def wait(self, timeout=None):
+                if self.killed:
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                return super().wait(timeout)
+
+        def popen(*args, **kwargs):
+            procs.append(Survivor(*args, **kwargs))
+            self.addCleanup(real.wait, procs[-1], 10)
+            self.addCleanup(real.kill, procs[-1])
+            return procs[-1]
+
+        class Thread(threading.Thread):
+            def start(self):
+                super().start()
+                time.sleep(0.2)    # the writer is past its start, blocked on the full pipe
+                signal.raise_signal(signal.SIGTERM)    # lands before start() returns
+
+        previous = signal.signal(signal.SIGTERM, on_signal)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        release = threading.Timer(5, lambda: procs and real.kill(procs[0]))    # unblocks a cleanup that closed it
+        self.addCleanup(release.cancel)
+        release.start()
+        nt = types.SimpleNamespace(name='nt', path=os.path, environ=os.environ)
+        start = time.monotonic()
+        with mock.patch.object(probe_state, 'os', nt), mock.patch.object(probe_state, 'KILL_WAIT', 0.1), \
+                mock.patch.object(probe_state.subprocess, 'Popen', popen), \
+                mock.patch.object(probe_state, 'threading', types.SimpleNamespace(Thread=Thread, Lock=threading.Lock)):
+            with self.assertRaises(probe_state.Unreaped) as cm:
+                probe_state.run([sys.executable, '-c', 'import time; time.sleep(30)'], 30, stdin='x' * (1 << 20))
+        return cm.exception, time.monotonic() - start
+
+    @unittest.skipIf(os.name == 'nt', 'the stood-in tool is never really killed; POSIX kills it at the end')
+    def test_a_stdin_feeder_a_signal_interrupts_as_it_starts_keeps_the_pipe(self):
+        # closing the pipe under a writer blocked on a tool that does not read would block until the tool goes
+        err, took = self.feeder_interrupted_as_it_starts(lambda n, _: probe_state.stop_running(n))
+        self.assertIsInstance(err.__cause__, probe_state.Cancelled)
+        self.assertLess(took, 3)
+
+    @unittest.skipIf(os.name == 'nt', 'the stood-in tool is never really killed; POSIX kills it at the end')
+    def test_a_stdin_feeder_any_exception_interrupts_as_it_starts_keeps_the_pipe(self):
+        # Python's default SIGINT handler, or autopsy's, raises wherever it lands
+        def raising(*_):
+            raise KeyboardInterrupt
+        err, took = self.feeder_interrupted_as_it_starts(raising)
+        self.assertIsInstance(err.__cause__, KeyboardInterrupt)
+        self.assertLess(took, 3)
+
     def test_a_stdin_feeder_that_never_started_does_not_hang_the_cleanup(self):
         # Windows feeds stdin from a thread; joining one that never started raised, and the cleanup retried forever
         class Unstartable:
@@ -679,14 +745,160 @@ class ProbeStateUnitTest(unittest.TestCase):
             except RuntimeError as e:
                 errors.append(e)
 
-        windows = types.SimpleNamespace(name='nt', path=os.path, environ=os.environ)    # kill(): taskkill, then kill
+        windows = types.SimpleNamespace(name='nt', path=os.path, environ=os.environ)
         with mock.patch.object(probe_state, 'os', windows), \
-                mock.patch.object(probe_state, 'threading', types.SimpleNamespace(Thread=Unstartable)):
+                mock.patch.object(probe_state, 'threading',
+                                  types.SimpleNamespace(Thread=Unstartable, Lock=threading.Lock)):
             caller = threading.Thread(target=call, daemon=True)
             caller.start()
             caller.join(20)
         self.assertFalse(caller.is_alive(), 'run() never returned')
         self.assertEqual([str(e) for e in errors], ["can't start new thread"])
+
+    GUARDED_TOOL = [sys.executable, '-c', 'import time; print("GUARDED", flush=True); time.sleep(30)']
+
+    def unreaped_popen(self, procs, waits):
+        """A Popen whose tool, once killed, never exits, as one in D state; waits gets each wait's timeout."""
+        real = subprocess.Popen
+
+        class Unreaped(real):
+            killed = False
+
+            def kill(self):
+                self.killed = True
+                super().kill()
+
+            def poll(self):
+                return None if self.killed else super().poll()
+
+            def wait(self, timeout=None):
+                if not self.killed:
+                    return super().wait(timeout)
+                waits.append(timeout)
+                if timeout is None:
+                    threading.Event().wait(30)    # never returns, as for the stuck tool
+                raise subprocess.TimeoutExpired(self.args, timeout)
+
+        def popen(*args, **kwargs):
+            procs.append(Unreaped(*args, **kwargs))
+            self.addCleanup(real.wait, procs[-1], 10)
+            return procs[-1]
+        return popen
+
+    def stop_on(self, signum, after):
+        """Send signum to this process after `after` s, with a handler that stops the run() in progress."""
+        previous = signal.signal(signum, lambda n, _: probe_state.stop_running(n))
+        self.addCleanup(signal.signal, signum, previous)
+        timer = threading.Timer(after, os.kill, (os.getpid(), signum))
+        self.addCleanup(timer.cancel)
+        timer.start()
+
+    def test_a_tool_that_outlives_its_kill_fails_naming_its_pid(self):
+        # a tool in D state does not die on SIGKILL: its wait after the kill must be bounded
+        procs, waits, errors = [], [], []
+
+        def call():
+            try:
+                probe_state.run(self.GUARDED_TOOL, 1)
+            except probe_state.ToolError as e:
+                errors.append(e)
+
+        with mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)):
+            caller = threading.Thread(target=call, daemon=True)
+            caller.start()
+            caller.join(20)
+        self.assertFalse(caller.is_alive(), 'run() never returned')
+        self.assertEqual(len(waits), 1)
+        self.assertTrue(9 < waits[0] <= 10, waits)
+        self.assertIsInstance(errors[0], probe_state.Unreaped)
+        self.assertEqual(str(errors[0]), f'{os.path.basename(sys.executable)} pid {procs[0].pid} still ran 10 s after '
+                                         f'its kill began (D state?): see usb-kernel-recover')
+        self.assertIn('GUARDED', errors[0].text)
+        self.assertEqual(probe_state._running, [])
+
+    def test_on_windows_a_timed_out_tool_is_killed_with_its_tree_bounded(self):
+        def kill_tree(proc, timeout, **_):
+            proc.kill()    # the real child, which the helper's taskkill would have ended
+            return proc.wait(5)
+
+        nt = types.SimpleNamespace(name='nt', path=os.path, environ=os.environ)
+        with mock.patch.object(probe_state, 'os', nt), \
+                mock.patch.object(probe_state.windows, 'kill_tree', side_effect=kill_tree) as helper:
+            with self.assertRaisesRegex(probe_state.ToolError, 'did not finish within 0 s'):
+                probe_state.run([sys.executable, '-c', 'import time; time.sleep(30)'], 0.3)
+        helper.assert_called_once()
+        proc, budget = helper.call_args.args
+        self.assertTrue(0 < budget <= probe_state.KILL_WAIT, budget)
+        self.assertEqual(helper.call_args.kwargs, {'total': True})    # taskkill and the wait share the budget
+        self.assertIsNotNone(proc.poll())
+
+    @unittest.skipIf(os.name == 'nt', 'os.kill would terminate the process on Windows')
+    def test_a_signal_during_a_session_unwinds_it_promptly_with_its_output(self):
+        self.stop_on(signal.SIGTERM, 0.5)
+        start = time.monotonic()
+        with mock.patch.object(probe_state.windows, 'kill_tree', wraps=probe_state.windows.kill_tree) as kill_tree:
+            with self.assertRaises(probe_state.Cancelled) as cm:
+                probe_state.run(self.GUARDED_TOOL, 20)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(str(cm.exception), f'interrupted by signal {int(signal.SIGTERM)}')
+        self.assertIn('GUARDED', cm.exception.text)
+        kill_tree.assert_called_once()
+        self.assertIsNotNone(kill_tree.call_args.args[0].poll())
+        self.assertEqual(probe_state._running, [])
+
+    @unittest.skipIf(os.name == 'nt', 'os.kill would terminate the process on Windows')
+    def test_a_tool_that_outlives_its_kill_after_a_signal_costs_one_bounded_wait(self):
+        procs, waits, errors = [], [], []
+        self.stop_on(signal.SIGTERM, 0.5)
+        with mock.patch.object(probe_state.subprocess, 'Popen', self.unreaped_popen(procs, waits)):
+            try:
+                probe_state.run(self.GUARDED_TOOL, 20)
+            except probe_state.ToolError as e:
+                errors.append(e)
+        self.assertEqual(len(waits), 1, waits)
+        self.assertTrue(waits[0] <= 10, waits)
+        self.assertIsInstance(errors[0], probe_state.Unreaped)
+        self.assertIsInstance(errors[0].__cause__, probe_state.Cancelled)
+        self.assertIn('GUARDED', errors[0].text)
+
+    def test_cleanup_retries_after_an_interrupting_handler_share_one_deadline(self):
+        class Stop(Exception):
+            pass
+
+        def on_signal(*_):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)    # raise once, like the scripts' handlers
+            raise Stop()
+        previous = signal.signal(signal.SIGTERM, on_signal)
+        self.addCleanup(signal.signal, signal.SIGTERM, previous)
+        budgets = []
+
+        def kill_tree(proc, timeout, **_):
+            budgets.append(timeout)
+            if len(budgets) == 1:
+                time.sleep(0.3)
+                signal.raise_signal(signal.SIGTERM)    # the handler raises inside the cleanup's kill
+            proc.kill()
+            return proc.wait(5)
+        with mock.patch.object(probe_state.windows, 'kill_tree', kill_tree):
+            with self.assertRaises(Stop) as cm:
+                probe_state.run(self.GUARDED_TOOL, 1)
+        self.assertEqual(len(budgets), 2, budgets)
+        self.assertTrue(budgets[0] <= probe_state.KILL_WAIT, budgets)
+        self.assertLess(budgets[1], budgets[0] - 0.25)
+        self.assertIn('GUARDED', cm.exception.text)
+
+    def test_a_jlink_tool_that_outlives_its_kill_stays_unreaped_whatever_probe_it_reached(self):
+        stuck = probe_state.Unreaped('JLinkExe pid 4242 still ran 10 s after its kill began (D state?): '
+                                     'see usb-kernel-recover')
+        stuck.text = 'S/N: 123\nJ-Link>E000ED00 = 410FC241\nJ-Link>E000EDF0 = 01010001\n'
+        jlink = object.__new__(probe_state.JLink)
+        jlink.probe, jlink.cmd, jlink.connection = '000681295394', ['JLinkExe'], {}
+        with mock.patch.object(probe_state, 'run', side_effect=stuck):
+            with self.assertRaises(probe_state.Unreaped) as cm:
+                jlink.observe(probe_state.Capture(1, 0, False, []), 30)
+        self.assertEqual(str(cm.exception), f'connected to J-Link S/N 123, not the requested 000681295394; {stuck}')
+        self.assertEqual(cm.exception.text, stuck.text)
+        self.assertEqual(cm.exception.partial, [])    # another probe's reads say nothing about this core
 
     def test_dhcsr_bits(self):
         self.assertEqual(probe_state.dhcsr_state(0x03030003),
@@ -988,16 +1200,6 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertFalse(self.log.exists())    # refused before openocd ran
         self.assertEqual(list(braced.iterdir()), [])    # and the script file removed
 
-    @unittest.skipUnless(os.name == 'nt', 'POSIX kill() runs no taskkill')
-    def test_a_hung_taskkill_still_kills_the_tool(self):
-        proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
-        self.addCleanup(proc.wait)
-        with mock.patch.object(probe_state.subprocess, 'run',
-                               side_effect=subprocess.TimeoutExpired('taskkill', 10)) as taskkill:
-            probe_state.kill(proc)
-        self.assertEqual(taskkill.call_args.kwargs['timeout'], 10)
-        self.assertIsNotNone(proc.wait(10))
-
     def test_the_halting_fallback_is_labelled_apart(self):
         r = self.run_cli('max32', '--samples', '2', '--halt-samples', '3', FAKE_PCSR='FFFFFFFF',
                          FAKE_HALT_PCS='08003000,08003000,08004000')
@@ -1060,10 +1262,12 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         backend.current, backend.others, backend.batch = 'max32665.cpu', {}, batch
         return backend
 
-    def halt_with_signal(self, raises):
-        """halt_reads over a session that takes SIGTERM; raises: the failure it then ends with."""
+    def halt_with_signal(self, raises, signalled=True):
+        """halt_reads over a session that takes SIGTERM unless not signalled; raises: the failure it then ends
+        with."""
         def batch(body, timeout):
-            signal.raise_signal(signal.SIGTERM)    # os.kill would terminate the process on Windows
+            if signalled:
+                signal.raise_signal(signal.SIGTERM)    # os.kill would terminate the process on Windows
             if raises:
                 raise raises
             return 'R DHCSR 0x01010001\nGUARDED\nH 0x08001000\nR DHCSR 0x01010001\n', \
@@ -1075,12 +1279,44 @@ class PcSampleOpenOCDTest(FakeToolsCase):
             with self.assertRaises(probe_state.ToolError) as cm:
                 backend.halt_reads(1, 500, 10, 30)
         self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+        self.assertNotIsInstance(cm.exception, probe_state.HaltRefused)
+        self.assertEqual(isinstance(cm.exception, probe_state.Unreaped), isinstance(raises, probe_state.Unreaped))
         return str(cm.exception), recover.call_count
 
+    STUCK = 'openocd pid 4242 still ran 10 s after its kill began (D state?): see usb-kernel-recover'
+
+    def stuck(self, text):
+        failure = probe_state.Unreaped(self.STUCK)
+        failure.text = text
+        return failure
+
     def test_a_signal_that_stopped_the_fallback_past_its_guards_recovers(self):
-        failure = probe_state.ToolError('openocd exited -9')
+        failure = probe_state.Cancelled('interrupted by signal 15')
         failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
         self.assertEqual(self.halt_with_signal(failure), ('halting fallback: interrupted by signal 15; recovered', 1))
+        failure = probe_state.ToolError('openocd exited 1')    # a failure of its own as the signal landed
+        failure.text = 'R DHCSR 0x01010001\nGUARDED\n'
+        self.assertEqual(self.halt_with_signal(failure),
+                         ('halting fallback: interrupted by signal 15; openocd exited 1; recovered', 1))
+
+    def test_a_signal_that_left_the_fallback_tool_running_still_names_it(self):
+        # the tool may still hold the probe: no recovery session, and the core state is unknown
+        self.assertEqual(self.halt_with_signal(self.stuck('R DHCSR 0x01010001\nGUARDED\n')),
+                         (f'halting fallback: interrupted by signal 15; {self.STUCK}; {probe_state.UNREAPED_NOTE}', 0))
+
+    def test_a_fallback_tool_that_outlives_its_kill_ends_the_fallback(self):
+        # terminal before its output is read: neither past its guards nor refusing a halted core
+        for text in ('R DHCSR 0x01010001\nGUARDED\n',
+                     'R DHCSR 0x01030003\nERROR refused halted: the core is halted now (DHCSR 0x01030003)\n'):
+            with self.subTest(text=text):
+                self.assertEqual(self.halt_with_signal(self.stuck(text), signalled=False),
+                                 (f'halting fallback: {self.STUCK}; {probe_state.UNREAPED_NOTE}', 0))
+
+    def test_a_recovery_session_that_outlives_its_kill_invites_no_other(self):
+        backend = self.single_core(mock.Mock(side_effect=self.stuck('R DHCSR 0x01030003\n')))
+        self.assertEqual(backend.recover(30), f'; the recovery session failed too ({self.STUCK}); '
+                                              f'{probe_state.UNREAPED_NOTE}')
+        backend.batch.assert_called_once()
 
     def test_incomplete_output_past_the_guards_is_recovered(self):
         backend = self.single_core(lambda body, timeout: ('R DHCSR 0x01010001\nGUARDED\n', [('DHCSR', 0x01010001)]))
@@ -1429,6 +1665,28 @@ class ProbeStateCliTest(FakeToolsCase):
                                     FAKE_MEM_BASE='20000000')
         self.assertEqual(rc, 0, err)
         self.assertEqual(out['reads']['values'][0]['value'], 0)
+
+    def test_rp2040_flash_verify_is_refused_before_the_probe(self):
+        elf, raw = self.d / 'fw.elf', self.d / 'fw.bin'
+        raw.write_bytes(b'firmware')
+        for segments in ([(0x1000_0000, b'abcd')], [(0x2000_0000, b'ram!'), (0x1000_0000, b'abcd')],
+                         [(0x0FFF_FFFC, bytes(8))], [(0x1FFF_FFFC, b'abcd')]):
+            elf.write_bytes(elf32(segments))
+            rc, out, err = self.run_cli('pico', '--verify', str(elf))
+            self.assertEqual(rc, 2, segments)
+            self.assertIn('RP2040 XIP region', err)
+            self.assertIn('rp2040_verify.py', err)
+        rc, out, err = self.run_cli('pico', '--verify', str(raw), '--base', '0x10000000')
+        self.assertEqual(rc, 2)
+        self.assertIn('rp2040_verify.py', err)
+        self.assertFalse(self.log.exists())
+        mem = self.d / 'mem.bin'
+        mem.write_bytes(b'abcd')
+        for board, addr in (('pico', 0x2000_0000), ('pico', 0x0FFF_FFFC), ('max32', 0x1000_0000)):
+            elf.write_bytes(elf32([(addr, b'abcd')]))
+            rc, out, err = self.run_cli(board, '--verify', str(elf), FAKE_MEM=str(mem), FAKE_MEM_BASE=f'{addr:x}')
+            self.assertEqual(rc, 0, (board, addr, err))
+            self.assertEqual(out['verify']['result'], 'match')
 
     def test_a_core_that_is_not_m_profile_is_not_interpreted(self):
         rc, out, err = self.run_cli('max32', FAKE_CPUID='00000000')
@@ -1780,6 +2038,61 @@ class AutopsyCliTest(FakeToolsCase):
         self.assertNotIn('ran after the attach', out['error'])
         self.assertFalse(out['after']['cores']['core']['halted'])
         self.assertEqual((self.d / 'state').read_text(), '01010001')
+
+    @staticmethod
+    def autopsy_module():
+        spec = importlib.util.spec_from_file_location('autopsy_inproc', AUTOPSY)
+        autopsy = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(autopsy)
+        return autopsy
+
+    def test_a_start_anchor_that_outlives_its_kill_starts_no_other_session(self):
+        autopsy = self.autopsy_module()
+        ps = autopsy.probe_state
+        stuck = ps.Unreaped('JLinkExe pid 4242 still ran 10 s after its kill began (D state?): see usb-kernel-recover')
+        stuck.partial = [0x410FC241, 0x01010001]    # found running: any other failure is followed by a restart
+        with mock.patch.object(autopsy, 'anchor') as anchor:
+            for route in ('jlink', 'openocd'):
+                self.assertEqual(autopsy.start_anchor_recovery(route, object(), stuck), f'; {ps.UNREAPED_NOTE}')
+            anchor.assert_not_called()
+            failed = ps.ToolError('incomplete capture')
+            failed.partial = [0x410FC241, 0x01010001]
+            anchor.side_effect = stuck    # the restarting session itself is left running
+            left = autopsy.start_anchor_recovery('jlink', object(), failed)
+        self.assertEqual(left, f'; the core was found running and the restarting session failed too ({stuck}); '
+                               f'{ps.UNREAPED_NOTE}')
+
+    def test_a_restoring_session_that_outlives_its_kill_ends_the_run(self):
+        autopsy = self.autopsy_module()
+        ps = autopsy.probe_state
+        stuck = ps.Unreaped('openocd pid 4242 still ran 10 s after its kill began (D state?): see usb-kernel-recover')
+        real_batch, real_anchor, anchors = ps.OpenOCD.batch, autopsy.anchor, []
+
+        def batch(backend, body, timeout):
+            if body == autopsy.OCD_RESTORE:
+                raise stuck
+            return real_batch(backend, body, timeout)
+
+        def anchor(*args, **kw):
+            anchors.append(None)
+            return real_anchor(*args, **kw)
+
+        argv = ['--hil-config', str(self.config), '--board', 'max32', '--elf', str(self.elf), '--out',
+                str(self.d / 'out')]
+        stdout = io.StringIO()
+        for sig in autopsy.STOP_SIGNALS:    # main() installs its own handlers
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        with mock.patch.dict(os.environ, {**self.env, 'FAKE_GDB_NORESUME': '1'}, clear=True), \
+                mock.patch.object(ps.OpenOCD, 'batch', batch), mock.patch.object(autopsy, 'anchor', anchor), \
+                contextlib.redirect_stdout(stdout):
+            rc = autopsy.main(argv)
+        out = json.loads(stdout.getvalue())
+        self.assertEqual(rc, 3)
+        self.assertIn(f'restoring session: {stuck}; {ps.UNREAPED_NOTE}', out['error'])
+        self.assertEqual(len(anchors), 2)    # the pre-attach and end anchors; none after the restoring session
+        self.assertTrue(out['afterServer']['cores']['max32665.cpu']['halted'])
+        self.assertNotIn('restored', out)
+        self.assertNotIn('after', out)
 
     @unittest.skipIf(os.name == 'nt', 'Windows sends no SIGTERM')
     def test_signals_still_run_cleanup_and_the_end_anchor(self):

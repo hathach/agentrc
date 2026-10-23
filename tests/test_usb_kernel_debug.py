@@ -155,7 +155,8 @@ class CliTest(unittest.TestCase):
         env = {**os.environ, 'PATH': str(self.bin)}
         r = subprocess.run([sys.executable, str(SCRIPT), '046d:c52b', '3', str(out)], capture_output=True, text=True, env=env)
         self.assertEqual(r.returncode, 1)
-        self.assertIn('tshark, capinfos not on PATH', r.stderr)
+        self.assertIn('tshark, capinfos not on PATH (SKILL.md, usbmon — capture)', r.stderr)
+        self.assertIn('\n## usbmon — capture', (SCRIPT.parents[1] / 'SKILL.md').read_text(encoding='utf-8'))
         self.assertNotIn('Traceback', r.stderr)
         self.assertFalse(out.exists())
 
@@ -251,6 +252,8 @@ drivers/usb/host/xhci-hub.c:559 [xhci_hcd]xhci_disable_port =_ "Ignoring request
 drivers/usb/host/xhci-ring.c:10 [xhci_hcd]xhci_ring =flmt "no print flag\\n"
 '''
 
+CAT = f'#!/bin/sh\n{shutil.which("cat")} "$@"; rc=$?\necho >> "$CAT_DONE"\nexit $rc\n'   # resolved before the stub shadows it
+
 
 @unittest.skipIf(os.name == 'nt', 'kernel dynamic debug requires Linux')
 class DyndbgTest(unittest.TestCase):
@@ -332,9 +335,16 @@ class DyndbgTest(unittest.TestCase):
     def kernel(self, order, obeys=True):
         """Serve the control path like the kernel does: a read lists the sites, a write is a
         command that changes their flags. A FIFO cannot tell which comes next, so the
-        script's opens are given in `order` ('r'/'w'); a mismatch times the script out."""
+        script's opens are given in `order` ('r'/'w'); a mismatch times the script out.
+        The script reads only through `cat`, whose PATH stub logs each finished read."""
         self.ctl.unlink()
         os.mkfifo(self.ctl)
+        self.bin = Path(self.tmp.name) / 'bin'
+        self.bin.mkdir(exist_ok=True)
+        (self.bin / 'cat').write_text(CAT)
+        (self.bin / 'cat').chmod(0o755)
+        self.cat_done = Path(self.tmp.name) / 'cat.done'
+        self.cat_done.write_text('')
         lines = CONTROL.splitlines(keepends=True)
         self.commands = []
 
@@ -348,22 +358,15 @@ class DyndbgTest(unittest.TestCase):
                     flags = ('p' if flag == '+p' else '') + flags or '_'
                     lines[n] = f'{parts[0]} {parts[1]} ={flags} "{fmt}'
 
-        def held_by_others(path):
-            for fd in Path('/proc').glob('[0-9]*/fd/*'):
-                try:
-                    if fd.parts[2] != str(os.getpid()) and os.readlink(fd) == str(path):
-                        return True
-                except OSError:
-                    pass
-            return False
-
         def serve():
+            reads = 0
             for op in order:
+                while self.cat_done.read_text().count('\n') < reads:   # or this listing lands in the last reader
+                    time.sleep(0.005)
                 if op == 'r':
                     with open(self.ctl, 'w') as f:
                         f.write(''.join(lines))
-                    while held_by_others(self.ctl):   # or the next listing lands in this reader
-                        time.sleep(0.005)
+                    reads += 1
                 else:
                     with open(self.ctl) as f:
                         self.commands.append(f.read())
@@ -372,7 +375,8 @@ class DyndbgTest(unittest.TestCase):
         threading.Thread(target=serve, daemon=True).start()
 
     def _run_served(self, *args):
-        env = {**os.environ, 'USB_DYNDBG_CTL': str(self.ctl)}
+        env = {**os.environ, 'USB_DYNDBG_CTL': str(self.ctl), 'PATH': f'{self.bin}:{os.environ["PATH"]}',
+               'CAT_DONE': str(self.cat_done)}
         return subprocess.run(['bash', str(DYNDBG), *args], capture_output=True, text=True, env=env, timeout=20)
 
     def test_on_and_off_change_every_site_and_say_how_many(self):

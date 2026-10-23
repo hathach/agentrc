@@ -11,6 +11,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
@@ -60,6 +62,14 @@ def running(pid):
 
 def setUpModule():
     guard_survivors(__name__)
+
+
+class RepoConfigTest(unittest.TestCase):
+    def test_the_suite_hook_runs_for_a_change_to_any_tracked_file(self):
+        config = yaml.safe_load((SCRIPT.parents[3] / hooks.CONFIG).read_text(encoding='utf-8'))
+        hook = next(h for repo in config['repos'] for h in repo['hooks'] if h['id'] == 'skill-tests')
+        # a path filter, or the default `types: [file]` that skips a symlink-only change, would leave a component untested
+        self.assertTrue(hook.get('always_run'))
 
 
 @unittest.skipUnless(shutil.which('pre-commit'), 'pre-commit is not installed')

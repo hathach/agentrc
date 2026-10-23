@@ -13,13 +13,17 @@ complete) is listed by its cell per check, and --keys adds each one's key.
 `result` keeps every top-level result field verbatim except history, observation
 and state, which are condensed; receipts are kept verbatim, each reply receipt
 with its `batch` and `findingVerdicts`, the verdicts of this harvest's findings on
-its comment (a refutedPosts reply answers stale findings as well as invalid ones).
+its comment (a refutedPosts reply answers stale findings as well as invalid ones),
+and `botAsks` the trigger scripts' comments asking a bot to review (`already`
+found one standing, `uncertain` posted one that did not read back).
 `budget` is the returned state's
 cyclesUsed and maxCycles; `pinned` its config, the arguments a continuation
 passes unchanged, read from the --state-ref output when the launch returned no state. `blockers` lists what the caller must settle before
 trusting or continuing the launch, a spent cycle budget and a refused launch
 included, the latter with the caller's response, and a stop another launch on the same state would repeat,
 with what must change first; `notes` what is absent but harmless.
+`findingsTable` is the launch's findings and CI failures as one Markdown table, a row each, with its outcome, commit
+and reply, under a coverage line naming a lane the launch did not observe; an older output without rows says so.
 A launch that stopped on a merged or closed PR is terminal: a note says so, and a
 spent budget is no blocker.
 `logs` leaves out lines another field carries whole and folds repeated ones into one.
@@ -33,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import Parser, Unusable, git, report  # noqa: E402
+from state_transfer import MAX  # noqa: E402
 
 CONDENSED = ('history', 'observation', 'state')
 NOT_FIXING = re.compile(r'^cycle \d+: [\w -]+ CI failure \(not fixing\): ')
@@ -49,10 +54,7 @@ ADOPTION_REFUSED = 'the adoption was refused: investigate and report it, never a
 BASE_FETCH = ('; this one lacks the base: fetch the base branch from the PR\'s base repository (not assuming the push remote, '
               'changing no credentials), then retry the same adoption with the same stateRef and adoptHead; '
               'a base that moved again can need another retry')
-# budget-exhausted-unverified is no longer produced; kept so an older launch's output still reads.
 REFUSED = {
-    'budget-exhausted-unverified': 'the launch stopped before loading its state, whose copy showed the cycle budget spent; '
-                                   'the launch that saved that state is the authority: read it before relaunching',
     'state-transfer-failed': 'the state did not load: keep the output file it came from and report it, never reset or reconstruct the state',
     'state-mismatch': "the PR or its remote differs from the state's pin (compare the result's pin with expected): report it; "
                       "starting over is the user's decision, never a reset or a fresh launch",
@@ -71,6 +73,9 @@ REFUSED = {
     'stale-workflow': "this session's cached workflow definition calls a script the install lacks: relaunch from a fresh session, never by hand",
     'pr-state-unread': 'the PR state could not be read before a GitHub write, so that write did not run: relaunch once `gh pr view` answers',
 }
+USER_ASKS = ('the user comments `@coderabbitai review` on the PR or accepts the head '
+             'unreviewed, and a relaunch helps only once CodeRabbit reviewed the head, or on a new head')
+CR_UNREVIEWED = 'CodeRabbit has not reviewed the head, and a coderabbitTrigger launch made its review required for every head of this run'
 ENDED = {'pr-merged': 'the PR is merged; nothing to continue', 'pr-closed': 'the PR is closed; nothing to continue'}
 # Stops another launch on the same state repeats: what must change first (chief's rule against relaunching on an unchanged blocker).
 STALLED = {
@@ -84,12 +89,8 @@ STALLED = {
                            'this run: its request failed, was uncertain (the detail names the attempt record) or ambiguous, or no '
                            'review came within the cap after it; read `bots` and the PR, and relaunch once Greptile reviewed the head; '
                            "shipping the head unreviewed is the user's decision",
-    'coderabbit-unreviewed': 'CodeRabbit has not reviewed the head, and a coderabbitTrigger launch made its review required for every '
-                             'head of this run: its trigger failed or no review came within the cap after it, or it was skipped or '
-                             'rate-limited with nothing more to ask; a run asks once per head, so read `bots` and the PR: a limited '
-                             'record whose retryAt is past and that was never asked gets its one ask from a relaunch with '
-                             'coderabbitTrigger, otherwise relaunch once CodeRabbit reviewed the head (on a request the user made, or '
-                             "a new head); shipping the head unreviewed is the user's decision",
+    'coderabbit-unreviewed': CR_UNREVIEWED + '; this output does not record its asks, and a failed tick leaves nothing on the PR, '
+                             'so a relaunch may not ask again: ' + USER_ASKS,
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
     'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
                 'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
@@ -98,9 +99,32 @@ STALLED = {
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       'python3 on PATH lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared',
+    'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
+                         'expired gh login or a module the python3 on PATH lacks, or relaunch once a passing cause (a GitHub outage) cleared',
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
                      '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',
 }
+
+
+ASKS = {'tick': 'a Trigger review tick', 'request': 'an `@coderabbitai review` comment'}
+
+
+def relaunch_ask(ask):
+    """Whether a relaunch asks CodeRabbit on the head, from the run's own record of its asks (#243: a relaunch for an ask
+    already spent)."""
+    if ask.get('relaunchAsks') == 'tick':
+        return 'it skipped the head for a manual review and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once'
+    if ask.get('relaunchAsks') == 'request':
+        return (f"it is rate-limited until {ask.get('retryAt')} and this run never asked on the head: a relaunch with "
+                'coderabbitTrigger after that comments `@coderabbitai review` once')
+    asked = '; '.join(f"{ASKS.get(a.get('ask'), a.get('ask'))} {'at ' + a['at'] if a.get('at') else 'that failed'}"
+                      for a in ask.get('asked') or [])
+    why = f'this run already used its one ask on the head ({asked})' if asked else "nothing in CodeRabbit's state is ours to ask"
+    return f'{why}, so a relaunch will not ask CodeRabbit on this head'
+
+
+def coderabbit_blocker(ask):
+    return f'{CR_UNREVIEWED}; {relaunch_ask(ask)}' + ('' if ask.get('relaunchAsks') in ASKS else f': {USER_ASKS}')
 
 
 def load_output(path):
@@ -119,9 +143,9 @@ def load_output(path):
     return output
 
 
-def cut(text):
+def cut(text, limit=CUT):
     text = ' '.join(str(text).split())
-    return text if len(text) <= CUT else text[:CUT] + '…'
+    return text if len(text) <= limit else text[:limit] + '…'
 
 
 def elapsed(progress):
@@ -137,7 +161,7 @@ def finding_verdicts(findings, comment_id):
 
 
 def receipts(cycles, findings):
-    """Pushes, replies and the adoption every cycle of the launch recorded, verbatim, and what about them blocks.
+    """Pushes, replies, bot asks and the adoption every cycle of the launch recorded, verbatim, and what about them blocks.
 
     A reply batch's `pass` is the workflow's own verdict that every comment it
     owed is settled, its detail naming any that is not; the receipts are evidence.
@@ -145,8 +169,9 @@ def receipts(cycles, findings):
     retries what that one left unsettled. Each receipt carries the verdicts its
     own cycle harvested, the last harvest where a cycle recorded none.
     """
-    pushes, replies, blocking, adoption, batches = [], [], [], None, {}
+    pushes, replies, asks, blocking, adoption, batches = [], [], [], [], None, {}
     for actions in cycles:
+        asks += actions.get('botAsks') or []
         harvest = actions.get('findings', findings)
         for lane in ('reviewPush', 'ciPush'):
             p = actions.get(lane)
@@ -164,7 +189,7 @@ def receipts(cycles, findings):
                  for kind, posts in batches.items() if posts.get('pass') is not True]
     if adoption and adoption.get('publication') not in ('pushed', 'already-published', None):
         blocking.append(f'uncertain publication: adoption {adoption.get("from", "")[:8]}..{adoption.get("to", "")[:8]}: {adoption.get("publication")}')
-    return {'pushes': pushes, 'replies': replies, 'adoption': adoption}, blocking
+    return {'pushes': pushes, 'replies': replies, 'botAsks': asks, 'adoption': adoption}, blocking
 
 
 ATTENTION = ('check', 'cell', 'state', 'verdict', 'key', 'complete', 'files')
@@ -247,6 +272,45 @@ def pinned_by(ref, notes):
     return config
 
 
+TABLE_CUT = 90
+
+
+def md_cell(text, limit=TABLE_CUT):
+    """One table cell: cut as cut() does, then its backslashes and pipes escaped."""
+    text = cut('' if text is None else text, limit)
+    return text.replace('\\', '\\\\').replace('|', '\\|') or '-'
+
+
+def reply_text(reply):
+    if not reply:
+        return '-'
+    how = {'refutedPosts': 'refutation', 'deferralPosts': 'deferral', 'fixNotePosts': 'fix note'}.get(reply.get('how'), reply.get('how'))
+    return ' '.join(x for x in (how, str(reply['replyId']) if reply.get('replyId') else '', 'settled' if reply.get('settled') else
+                                f"not settled: {reply.get('error') or 'unknown'}") if x)
+
+
+def findings_table(rollup):
+    """The launch's rows as Markdown under a coverage line; never an empty table read as a clean launch."""
+    if not isinstance(rollup, dict):
+        return 'findings unavailable'
+    if 'rows' not in rollup:
+        return 'findings unavailable (older output)'
+    rows, observed = rollup.get('rows') or [], rollup.get('observed') or {}
+    coverage = []
+    for lane, key, name in (('review', 'reviews', 'reviews'), ('ci', 'ci', 'CI')):
+        count = sum(r.get('lane') == lane for r in rows)
+        coverage.append(f'{name}: {count} row(s)' if count else f'{name}: no findings reported' if observed.get(key) else f'{name} not observed')
+    if not rows:
+        return '; '.join(coverage)
+    head = ['Source', 'Where', 'Finding', 'Verdict', 'Outcome', 'Commit', 'Reply']
+    body = [[md_cell(r.get('source'), 24), md_cell(r.get('at') if r.get('lane') == 'review' else r.get('cell'), 40),
+             md_cell(r.get('claim') if r.get('lane') == 'review' else r.get('firstError')), md_cell(r.get('verdict'), 12),
+             md_cell(r.get('outcome')), md_cell((r.get('repair') or {}).get('sha'), 40), md_cell(reply_text(r.get('reply')), 60)] for r in rows]
+    width = [max(len(c) for c in col) for col in zip(head, *body)]
+    line = lambda cells: '| ' + ' | '.join(c.ljust(w) for c, w in zip(cells, width)) + ' |'
+    return '\n'.join(['; '.join(coverage), '', line(head), line(['-' * w for w in width]), *map(line, body)])
+
+
 def checkout(path):
     return {'branch': git('-C', path, 'rev-parse', '--abbrev-ref', 'HEAD').strip(),
             'head': git('-C', path, 'rev-parse', 'HEAD').strip(),
@@ -256,7 +320,7 @@ def checkout(path):
 def summarize(output, output_path, state_ref=None, tree=None, keys=False):
     blockers, notes = [], []
     summary = {'launch': None, 'result': None, 'stateRef': None, 'budget': None, 'pinned': None, 'observation': None, 'receipts': None,
-               'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
+               'findingsTable': 'findings unavailable', 'logs': [], 'checkout': tree, 'blockers': blockers, 'notes': notes}
     result = output.get('result') if output else None
     if output is None:
         blockers.append('the output file is empty: the launch threw before returning a result (its error is in the Workflow tool result)')
@@ -267,6 +331,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             blockers.append('the output carries no result object')
     if isinstance(result, dict):
         summary['result'] = {k: v for k, v in result.items() if k not in CONDENSED}
+        summary['findingsTable'] = findings_table(result.get('rollup'))
         if result.get('state') and result.get('stateDigest'):
             summary['stateRef'] = {'outputFile': output_path, 'digest': result['stateDigest']}
             used, most = result['state'].get('cyclesUsed'), result['state'].get('maxCycles')
@@ -274,20 +339,29 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
             summary['pinned'] = result['state'].get('config')
             if result.get('pass') is not True and result.get('reason') not in ENDED and isinstance(used, int) and isinstance(most, int) and used >= most:
                 blockers.append(f'cycle budget spent: {used} of {most}; a relaunch needs a larger maxCycles, the user\'s decision')
+        if result.get('stateTooLarge'):
+            blockers.append(f"the returned state is {result['stateTooLarge']} bytes, over the {MAX} a launch loads: no launch can continue "
+                            'from it; keep the output file and report it, never reset or reconstruct the state')
         if result.get('reason') in REFUSED:
             blockers.append(REFUSED[result['reason']])
         if result.get('reason') in ENDED:
             notes.append(ENDED[result['reason']])
-        if result.get('reason') in STALLED:
-            blockers.append(STALLED[result['reason']])
+        ask = result.get('coderabbitAsk') if isinstance(result.get('coderabbitAsk'), dict) else None
+        if ask and result.get('reason') == 'coderabbit-unreviewed':
+            blockers.append(coderabbit_blocker(ask))
+        else:
+            if result.get('reason') in STALLED:
+                blockers.append(STALLED[result['reason']])
+            if ask:
+                notes.append(f'CodeRabbit has not reviewed the head; {relaunch_ask(ask)}')
         if result.get('reason') == 'held-awaiting-caller':
             blockers += [f"finding {h.get('findingId')} on comment {h.get('commentId')} is held for the caller, and another launch "
                          f"cannot lift it: {cut(h.get('reason') or '')}" for h in result.get('held') or []]
         obs = result.get('observation') or {}
         reviews, ci, actions = obs.get('reviews') or {}, obs.get('ci'), obs.get('actions') or {}
         summary['observation'] = {
-            'lane': obs.get('lane'), 'reviewedHead': obs.get('reviewedHead'),
-            'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'kind': b.get('kind'), 'sha': (b.get('sha') or '')[:8] or None,
+            'lane': obs.get('lane'), 'reviewedHead': obs.get('reviewedHead'), 'fingerprint': reviews.get('fingerprint'),
+            'bots': [{'bot': b.get('bot'), 'state': b.get('state'), 'kind': b.get('kind'), 'sha': b.get('sha'),
                       'reason': cut(b.get('reason') or ''), 'evidence': [cut(e) for e in b.get('evidence') or []], 'retryAt': b.get('retryAt')}
                      for b in reviews.get('bots') or []],
             'findings': [{'id': f.get('findingId'), 'digest': f.get('commentDigest'), 'source': f.get('source'), 'verdict': f.get('verdict'),
