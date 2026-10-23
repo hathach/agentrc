@@ -19,7 +19,8 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
 1. **Before launching**: take the target from the assignment, formed as the
    Report rule in `agents/chief.md` forms it (`owner/repo#N` and the task),
    asking only when it is ambiguous, and name `--out` after it. A task that publishes to a PR carries
-   its grant verbatim, per the README's headless recipe.
+   its grant verbatim and its `Merge grant:` line, per the README's headless
+   recipe.
 2. **Launch** in the foreground: it checks the arguments, starts the
    launcher in its own session, prints its pid and returns. A chief
    runs as long as it needs; a background command would end it at the tool's
@@ -59,9 +60,9 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    or with `cost none` and why.
    Open the message that reports the exit, with or without `report.md`, with
    the target, and, unasked, relay verbatim the Launches
-   table with its State line and chief's `Worth a look:` line, the Usage table
-   and chief's decisions for the user; a row that dwarfs the work it did is worth
-   a word.
+   table with its State line and chief's `Worth a look:` line, the Usage table,
+   each launch's `Findings` table from chief's report and chief's decisions for
+   the user; a row that dwarfs the work it did is worth a word.
    The exit code, the number on the `launcher: exit` line, says how the run
    ended, not whether the task passed:
 

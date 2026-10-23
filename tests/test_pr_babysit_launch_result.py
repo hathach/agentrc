@@ -35,7 +35,7 @@ def output(**over):
         'rollup': {'cycles': [2], 'findings': {'total': 1, 'fixed': 1}, 'ci': {'total': 2}, 'reran': 0, 'pushed': [NEXT[:8]], 'replies': 1},
         'pending': [{'bot': 'greptile', 'state': 'absent', 'reason': 'no check run'}],
         'observation': {'reviewedHead': HEAD, 'lane': 'both',
-                        'reviews': {'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
+                        'reviews': {'fingerprint': f'coderabbit|coderabbit|{"f" * 32}', 'bots': [{'bot': 'coderabbit', 'state': 'reviewed', 'sha': HEAD}],
                                     'findings': [{'findingId': '7#1', 'commentId': 7, 'commentDigest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid',
                                                   'file': 'a.c', 'line': 3}]},
                         'ci': {'status': 'red', 'headSha': HEAD, 'infraRerun': [],
@@ -89,6 +89,8 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['stateRef'], {'outputFile': (self.dir / 'w.output').resolve().as_posix(), 'digest': '0123abcd'},
                          'with slashes: the workflow puts it in a shell command')
         self.assertEqual(s['blockers'], [], 'a push past the reviewed head is not a disagreement')
+        self.assertEqual((s['observation']['fingerprint'], s['observation']['bots'][0]['sha']), (f'coderabbit|coderabbit|{"f" * 32}', HEAD),
+                         'the review evidence a merge compares, and the full SHA a bot reviewed')
         self.assertEqual(s['observation']['findings'], [{'id': '7#1', 'digest': 'c0ffee00', 'source': 'coderabbit', 'verdict': 'valid', 'at': 'a.c:3'}])
         ci = s['observation']['ci']
         self.assertEqual(ci['verdicts'], {'rig-side': 1, 'real': 1})
@@ -110,6 +112,34 @@ class LaunchResultTest(unittest.TestCase):
         self.assertEqual(s['notes'], [])
         self.assertEqual(s['logs'][-1], '(1 "not fixing" CI failure lines, one per failure listed under ci)')
         self.assertTrue(s['logs'][1].endswith('whole line in the output\'s logs)'))
+
+    def test_the_findings_table_quotes_every_row_with_its_outcome(self):
+        sha = 'c' * 40
+        rows = [
+            {'lane': 'review', 'source': 'greptile', 'at': 'a.c:3', 'claim': 'pipe | back\\slash\nnewline ' + 'x' * 200, 'verdict': 'valid', 'state': 'valid',
+             'repair': {'outcome': 'pushed', 'sha': sha}, 'outcome': 'fixed + pushed, since already fixed', 'reply': {'how': 'fixNotePosts', 'replyId': 9, 'settled': True}},
+            {'lane': 'review', 'source': 'coderabbit', 'at': 'b.c:1', 'claim': 'old body', 'verdict': 'invalid', 'state': 'refuted', 'repair': None,
+             'outcome': 'comment edited since; refuted', 'reply': {'how': 'refutedPosts', 'replyId': None, 'settled': False, 'error': 'offered, no receipt shows it posted'}},
+            {'lane': 'ci', 'source': 'ci:build', 'cell': 'f072 cdc', 'firstError': 'boom', 'verdict': 'real', 'state': 'greptileGate', 'repair': None,
+             'outcome': 'left red: a Greptile confidence gate, not a CI-lane fix'},
+        ]
+        table = launch_result.findings_table({'rows': rows, 'observed': {'reviews': True, 'ci': True}}).split('\n')
+        self.assertEqual(table[0], 'reviews: 2 row(s); CI: 1 row(s)')
+        self.assertEqual(len(table), 3 + 1 + len(rows))
+        first = ' '.join(table[4].split())
+        self.assertIn('pipe \\| back\\\\slash newline', first, 'escaped, on one line')
+        self.assertIn('…', first, 'a long claim is cut')
+        self.assertIn(f'fixed + pushed, since already fixed | {sha} | fix note 9 settled', first, 'the workflow\'s outcome text and the full SHA')
+        self.assertIn('refutation not settled: offered, no receipt shows it posted', table[5])
+        self.assertIn('| f072 cdc |', table[6])
+        for row in table[2:]:
+            self.assertEqual(row.count(' | '), 6, row)
+        self.assertEqual(launch_result.md_cell(None), '-')
+        self.assertEqual(launch_result.md_cell('y' * 200, 10), 'y' * 10 + '…')
+        self.assertEqual(launch_result.findings_table({'rows': [], 'observed': {'reviews': True, 'ci': False}}), 'reviews: no findings reported; CI not observed')
+        self.assertEqual(launch_result.findings_table({'cycles': [1]}), 'findings unavailable (older output)')
+        rc, s = self.run_it(output())
+        self.assertEqual(s['findingsTable'], 'findings unavailable (older output)', 'the fixture predates rows')
 
     def test_a_failure_is_settled_by_the_state_the_workflow_gave_it_not_its_verdict(self):
         gate = {**failure('gate', verdict='rig-side'), 'check': 'SonarCloud Code Analysis', 'workflow': '', 'cell': None, 'state': 'sonarGate'}
@@ -292,7 +322,7 @@ class LaunchResultTest(unittest.TestCase):
             {'bot': 'copilot', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'the requesting user reached the Copilot quota',
              'evidence': ['review 3313 on aaaaaaaa'], 'retryAt': None}]
         bots = self.run_it(data)[1]['observation']['bots']
-        self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD[:8], 'reason': 'Review rate limited',
+        self.assertEqual(bots[0], {'bot': 'coderabbit', 'state': 'settled', 'kind': 'limited', 'sha': HEAD, 'reason': 'Review rate limited',
                                    'evidence': ['comment 5'], 'retryAt': '2026-10-13T10:55:19Z'})
         self.assertEqual((bots[1]['bot'], bots[1]['kind'], bots[1]['evidence']), ('copilot', 'limited', ['review 3313 on aaaaaaaa']))
 

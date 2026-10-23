@@ -300,6 +300,13 @@ class Engine(unittest.TestCase):
         self.hold('hil_reserve', role=lk.CLEANUP_ROLE)
         self.assertEqual(self.check()['status'], 'blocked')
 
+    def test_a_held_board_with_a_takeover_journal_is_blocked_not_locked(self):
+        self.hold()
+        (self.locks / ('b' + lk.JOURNAL)).write_text(json.dumps({'token': 't', 'locks': ['b']}))
+        row = self.check()
+        self.assertEqual((row['status'], self.ran), ('blocked', []))
+        self.assertIn('takeover journal', row['note'][-1])
+
     def test_an_unusable_lock_is_an_error_not_a_holder(self):
         self.locks.mkdir()
         os.mkdir(self.locks / 'b.lock')
@@ -346,6 +353,70 @@ class Engine(unittest.TestCase):
         answers.append('done')
         self.assertEqual(ctx.open_runs(), [])
         self.assertEqual((ctx.ledger[0]['cleanup'], ctx.ledger[0]['receipt']), ('done', None), 'a late answer still counts')
+
+    # --- a session the provider left running (ctx.retain) ---------------------------------------
+    def test_a_retained_session_is_pending_once_and_never_rechecked(self):
+        patch(self, eng.hil_process, 'recheck', lambda r: self.fail(f'rechecked {r!r}'))
+        ctx = eng.Context(self.args, str(self.state))
+        ctx.retain('openocd_esp session', [])
+        self.assertEqual(ctx.ledger, [], 'no receipts, no entry')
+        for _ in range(2):
+            ctx.retain('openocd_esp session', ['/s/r1.json'])
+        ctx.retain('openocd_esp session', [{'pid': 7, 'startTime': '1', 'log': '/s/l'}])
+        self.assertEqual([e['retained'] for e in ctx.ledger], [['/s/r1.json'], [{'pid': 7, 'startTime': '1', 'log': '/s/l'}]])
+        self.assertEqual({e['cleanup'] for e in ctx.open_runs()}, {'pending'})
+        with self.assertRaisesRegex(eng.Outstanding, 'openocd_esp session'):
+            ctx.run(['reset'], timeout=5)
+        self.assertEqual(self.ran, [])
+        with self.assertRaises(TypeError):
+            ctx.retain('openocd_esp session', [object()])
+
+    def retain_after_reset(self, receipts):
+        """The profile's reset leaves a session the provider kept running, as openocd_esp's can."""
+        reset = self.p.reset
+
+        def retaining(ctx, board):
+            try:
+                return reset(ctx, board)
+            finally:
+                ctx.retain('openocd_esp session', receipts)
+        self.p.reset = retaining
+
+    def test_a_retained_session_hands_the_board_to_a_cleanup_holder_released_once_it_ended(self):
+        receipt = self.d / ('r' * 200) / ('r' * 200) / ('r' * 200 + '.json')     # past the detail's 500 characters
+        receipts = [str(receipt)]
+        self.retain_after_reset(receipts)
+        patch(self, eng, 'HOLDER_READY', 5)
+        row = self.check()
+        self.assertEqual((row['status'], row['cleanup']['blocker'], row['cleanup']['retained']),
+                         ('blocked', 'cleanup-holder', receipts))
+        rec = lk.read_record('b')
+        self.assertTrue(lk.is_cleanup_holder(rec))
+        self.assertEqual(rec['retained'], receipts)
+        self.assertIn('`hil_openocd_esp.py end --receipt`', row['note'][-1])
+        self.assertIn('release --token refuses until each ended', row['note'][-1])
+        token = row['cleanup']['token']
+        with self.assertRaisesRegex(lk.ReleaseRefused, 'retained sessions are not proven ended'):
+            lk.release_token(token)
+        self.assertEqual(lk.read_record('b'), rec)
+        receipt.parent.mkdir(parents=True)
+        # as `hil_openocd_esp.py end` leaves it
+        receipt.write_text(json.dumps({'tool': 'hil_openocd_esp', 'closed': True, 'cleanup': 'done'}))
+        lk.release_token(token)
+        self.assertIsNone(lk.read_record('b'))
+
+    def test_a_failed_handoff_keeps_the_retained_receipts_in_the_protected_record(self):
+        receipts = ['/s/r1.json', {'pid': 7, 'startTime': '1', 'log': '/s/l'}]
+        self.retain_after_reset(receipts)
+        patch(self, eng, 'HOLDER_READY', 1)
+        patch(self, lk, '_holder_argv', lambda job: ['/nonexistent/holder'])
+        row = self.check()
+        self.assert_failed_handoff(row)
+        self.assertEqual(row['cleanup']['retained'], receipts)
+        rec = lk.read_record('b')
+        self.assertEqual((rec['protected'], rec['retained']), (True, receipts))
+        self.assertNotIn('role', rec)
+        self.assertIn('a takeover does not check them', row['note'][-1])
 
     # --- handing a survivor's board to a cleanup holder -----------------------------------------
     def handoff(self, argv=None, popen=None):

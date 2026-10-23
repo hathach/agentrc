@@ -863,6 +863,330 @@ class StlinkLm4flashEsptool(unittest.TestCase):
 ODD = 'a b;$(touch PWNED)`id`*'   # spaces and shell metacharacters, none of which may act
 
 
+JLINK_CORPUS = DATA / 'jlink'
+
+
+def jlink_fixture(name):
+    return (JLINK_CORPUS / name).read_text()
+
+
+class JLinkJudgment(unittest.TestCase):
+    """Each J-Link command judged from its own chunk of a recorded transcript (MANIFEST.json: host,
+    board, device, JLinkExe version and the command file each was recorded with)."""
+    FLASH = 'V9.78-imxrt1064_evk-halt-loadfile-r-go.txt'
+    RESET = 'V9.78-nrf52840dk-halt-r-go.txt'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = json.loads((JLINK_CORPUS / 'MANIFEST.json').read_text())
+
+    def commands(self, name):
+        return self.manifest[name]['commands']
+
+    def test_every_recorded_session_completes(self):
+        self.assertGreaterEqual({m['version'] for m in self.manifest.values()}, {'V9.78', 'V9.84'})
+        self.assertTrue(any('Skipped. Contents already match' in jlink_fixture(n) for n in self.manifest),
+                        'an already-matching image is recorded too')
+        for name, m in self.manifest.items():
+            with self.subTest(name):
+                self.assertEqual(hf.jlink_judgment(jlink_fixture(name), m['commands']),
+                                 {'ok': True, 'problem': '', 'commands': mock.ANY})
+                script = '\n'.join([*m['commands'], 'exit']) + '\n'
+                self.assertEqual(hf.jlink_problem(op_of((0, jlink_fixture(name), None), script=script)), '')
+
+    def test_a_failed_chunk_fails_whatever_the_rest_says(self):
+        good = jlink_fixture(self.FLASH)
+        cases = {'no probe, exit 0': ('J-Link>halt\nJ-Link connection not established yet but required for command.\n'
+                                      'Connecting to J-Link ...FAILED: Cannot connect to J-Link.\n', 'echoed'),
+                 'a failed reset outlived': (re.sub(r'(?s)J-Link>r\n.*?J-Link>go', 'J-Link>r\nReset delay: 0 ms\n'
+                                                    'ResetTarget() start\nResetTarget failed (-1).\nJ-Link>go', good),
+                                             "'r' failed"),
+                 'loadfile without O.K.': (good.replace('O.K.\n', ''), 'did not complete'),
+                 'a DLL error in go': (good.replace('J-Link>exit', '****** Error: CPU is not halted\nJ-Link>exit'),
+                                       "'go' failed"),
+                 'no exit': (good.replace('J-Link>exit\n', ''), 'echoed'),
+                 'cut short': (good.replace('Script processing completed.', ''), "'exit' did not complete"),
+                 'an extra echo': (good.replace('J-Link>exit', 'J-Link>go\nJ-Link>exit'), 'echoed'),
+                 'an echo without its arguments': (good.replace('J-Link>go', 'J-Link>sleep\nJ-Link>go'), 'echoed'),
+                 'nothing': ('', 'echoed')}
+        for what, (out, why) in cases.items():
+            with self.subTest(what):
+                j = hf.jlink_judgment(out, self.commands(self.FLASH))
+                self.assertFalse(j['ok'])
+                self.assertIn(why, j['problem'])
+
+    def test_a_failed_verify_ends_the_script_and_fails(self):
+        name = 'V9.84-metro_m7_1011-h-verifybin-r-g.txt'
+        out = jlink_fixture(name)
+        cut = out[:out.index('Verify successful.')] + 'Verify failed @ address 0x60000400.\nERROR: Verify failed.\n' \
+            'Script processing completed.\n'
+        self.assertIn('echoed', hf.jlink_judgment(cut, self.commands(name))['problem'])
+
+    def test_repeated_commands_are_judged_per_occurrence(self):
+        name = 'V9.78-lpcxpresso55s69-h-verifybin-verifybin-r-g.txt'
+        cmds = self.commands(name)
+        self.assertEqual(sum(c.startswith('verifybin') for c in cmds), 2)
+        self.assertTrue(hf.jlink_judgment(jlink_fixture(name), cmds)['ok'])
+        once = [c for i, c in enumerate(cmds) if not (c.startswith('verifybin') and i == cmds.index(c))]
+        self.assertFalse(hf.jlink_judgment(jlink_fixture(name), once)['ok'])
+
+    def test_a_command_without_a_completion_rule_never_passes(self):
+        out = 'J-Link>erase\nErasing done.\nJ-Link>exit\nScript processing completed.\n'
+        self.assertEqual(hf.jlink_judgment(out, ['erase'])['problem'], "'erase' has no completion rule")
+
+    def test_reset_after_target_hooks(self):
+        """A device script's AfterResetTarget() closes `r` (MK64, LPC4088); nothing else may."""
+        out = jlink_fixture('V9.78-frdm_k64f-halt-r-go.txt')
+        self.assertTrue(hf.jlink_judgment(out, ['halt', 'r', 'go'])['ok'])
+        self.assertFalse(hf.jlink_judgment(out.replace('AfterResetTarget() end', 'Something else\nAfterResetTarget() end'),
+                                           ['halt', 'r', 'go'])['ok'])
+
+    def test_the_problem_of_an_operation_is_its_last_attempt_judged_against_its_command_file(self):
+        good = jlink_fixture(self.RESET)
+
+        op = op_of
+        self.assertEqual(hf.jlink_problem(op((0, good, None))), '')
+        self.assertEqual(hf.jlink_problem(op((0, good, None), (-11, '', None))), 'JLinkExe exit -11')
+        self.assertIn('echoed', hf.jlink_problem(op((-11, good, None), (0, '', None))), 'an earlier attempt never counts')
+        self.assertEqual(hf.jlink_problem(op((1, good, None))), 'JLinkExe exit 1')
+        self.assertEqual(hf.jlink_problem(op((None, good, subprocess.TimeoutExpired('JLinkExe', 5)))),
+                         'JLinkExe timed out')
+        self.assertIn('echoed', hf.jlink_problem(op((0, good, None), script='halt\nloadfile /x/a.hex\nr\ngo\nexit\n')))
+        self.assertEqual(hf.jlink_problem(op((0, good, None), script=None)),
+                         'no command file ending in exit to judge against')
+
+    def test_a_failure_line_anywhere_fails_a_session_that_completed(self):
+        good = jlink_fixture(self.RESET)
+        r = good.index('Reset delay:')
+        for said in ('Could not connect to target.', 'CPU may not have been reset (DHCSR.S_RESET_ST never gets set).',
+                     'CPU did not halt after reset.'):
+            with self.subTest(said=said):
+                self.assertIn("'r' failed", hf.jlink_problem(op_of((0, good[:r] + said + '\n' + good[r:], None))))
+                self.assertIn('before the first command', hf.jlink_problem(op_of((0, said + '\n' + good, None))))
+                self.assertIn('on stderr', hf.jlink_problem(op_of((0, good, None), stderr=said)))
+
+    def test_the_providers_scripts_are_judged_as_they_run(self):
+        """flash_jlink and reset_jlink's own command files are the recorded ones."""
+        for fn, name, extra in ((hf.flash_jlink, self.FLASH, ('/x/tinyuf2.hex',)), (hf.reset_jlink, self.RESET, ())):
+            with self.subTest(fn.__name__):
+                out = jlink_fixture(name)
+                if extra:
+                    out = re.sub(r'loadfile \S+', f'loadfile {extra[0]}', out)
+                with tempfile.TemporaryDirectory() as d:
+                    op = fn(JLINK, *extra, timeout=5, workdir=d,
+                            run=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ''))
+                self.assertEqual(hf.jlink_problem(op), '')
+
+
+def op_of(*outs, script='halt\nr\ngo\nexit\n', stderr=''):
+    """A reset_jlink Operation of these (rc, stdout, error) attempts."""
+    return hf.Operation([hf._record(['JLinkExe'], script, subprocess.CompletedProcess([], rc, out, stderr), err)
+                         for rc, out, err in outs])
+
+
+ESPTOOL_CORPUS = DATA / 'esptool'
+
+
+def esptool_synthetic(offsets, *, stub=True, uncompressed=False):
+    """A write_flash transcript in the shape tinyuf2's bench recorded with esptool 5.2.0 (CSI
+    codes, the underscore spellings' warning); without the stub, or a stub run that found
+    compression would not shrink a segment (5.3.1), each write uncompressed."""
+    out = "\x1b[0;33mWarning:\x1b[0m Deprecated: Command 'write_flash' is deprecated. Use 'write-flash' instead.\n"
+    for off in offsets:
+        if stub and uncompressed:
+            out += 'Note: Cannot compress \'x.bin\' more than the original size, will flash uncompressed.\n'
+        out += (f'Writing at 0x{off:08x} [====] 100.0% \x1b[1A\x1b[2K\nWrote 9 bytes '
+                f'{"(9 compressed) " if stub and not uncompressed else ""}at 0x{off:08x} in 0.1 seconds (100.0 kbit/s).\n'
+                'Verifying written data...\nHash of data verified.\n')
+    return out + '\nHard resetting via RTS pin...\n'
+
+
+class EsptoolJudgment(unittest.TestCase):
+    OFFSETS = [0x0, 0x8000, 0xe000, 0x410000]
+
+    def test_recorded_and_documented_forms_pass(self):
+        manifest = json.loads((ESPTOOL_CORPUS / 'MANIFEST.json').read_text())
+        for name, m in manifest.items():
+            with self.subTest(name):
+                self.assertEqual(hf.esptool_flash_judgment((ESPTOOL_CORPUS / name).read_text(), m['offsets']),
+                                 {'ok': True, 'problem': '', 'wrote': m['offsets']})
+        for form, kw in (('stub', {}), ('--no-stub', {'stub': False}), ('uncompressed', {'uncompressed': True})):
+            with self.subTest(form):
+                out = esptool_synthetic(self.OFFSETS, **kw)
+                self.assertTrue(hf.esptool_flash_judgment(out, self.OFFSETS)['ok'])
+                self.assertTrue(hf.esptool_flash_judgment(out.replace('Wrote', '\x1b[2K\x1b[1AWrote'), self.OFFSETS)['ok'])
+
+    def test_every_write_needs_its_own_verify_and_the_reset_follows(self):
+        out = (ESPTOOL_CORPUS / '5.3.1-espressif_esp32s3_devkitm_1-stub.txt').read_text()
+        first = out.index('Hash of data verified.')
+        moved = out[:first] + out[first + len('Hash of data verified.'):]
+        moved = moved.replace('Hard resetting', 'Hash of data verified.\nHard resetting', 1)
+        last = out.rindex('Hash of data verified.')
+        past_reset = out[:last] + out[last + len('Hash of data verified.'):] + 'Hash of data verified.\n'
+        cases = {'a write missing': (out.replace('at 0x00008000 in', 'at 0x00009000 in'), 'not the requested'),
+                 'a write twice': (out.replace('at 0x0000e000 in', 'at 0x00008000 in'), 'not the requested'),
+                 'an extra write': (out + 'Wrote 1 bytes at 0x00500000 in 0.1 seconds.\n', 'not the requested'),
+                 'an unknown write line': (out + 'Wrote 1 bytes at 0x500000 in 0.1 seconds.\n', 'unknown shape'),
+                 'a verify missing': (out.replace('Hash of data verified.\n', '', 1), 'no verify between the write at 0x0 '),
+                 'a verify moved to the last write': (moved, 'no verify between the write at 0x0 '),
+                 'the last verify past the reset': (past_reset, 'no verify between the write at 0x410000 '),
+                 'no hard reset': (out.replace('Hard resetting via RTS pin...', ''), 'no hard reset'),
+                 'a fatal error': (out + 'A fatal error occurred: Packet content transfer stopped\n', 'fatal error'),
+                 'not reset': (out.replace('Hard resetting via RTS pin...', 'Chip was NOT reset.'), 'NOT reset'),
+                 'an unknown format': ('Flashed 4 regions OK\n', 'not the requested'),
+                 'nothing': ('', 'not the requested')}
+        for what, (text, why) in cases.items():
+            with self.subTest(what):
+                j = hf.esptool_flash_judgment(text, self.OFFSETS)
+                self.assertFalse(j['ok'])
+                self.assertIn(why, j['problem'])
+        self.assertEqual(hf.esptool_flash_judgment(out, [])['problem'], 'no offsets requested')
+        twice = esptool_synthetic([0, 0])
+        self.assertIn('repeat', hf.esptool_flash_judgment(twice, [0, 0])['problem'])
+
+    def test_the_problem_of_a_flash_is_its_last_attempt_judged_against_what_it_wrote(self):
+        good = esptool_synthetic(self.OFFSETS)
+        args = '--flash-mode dio 0x0 "boot loader.bin" 0x8000 p.bin 0xe000 o.bin 0x410000 a.bin'
+
+        def op(*outs, flash_args=args):
+            cmd = hf.esptool_argv('esptool', '-p', '/dev/x', 'write_flash', *shlex.split(flash_args))
+            return hf.Operation([hf._record(cmd, None, subprocess.CompletedProcess([], rc, out, ''), err)
+                                 for rc, out, err in outs])
+        self.assertEqual(hf.esptool_problem(op((0, good, None))), '')
+        self.assertEqual(hf.esptool_problem(op((2, good, None))), 'esptool exit 2')
+        self.assertEqual(hf.esptool_problem(op((None, good, subprocess.TimeoutExpired('esptool', 5)))),
+                         'esptool timed out')
+        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), (0, '', None))))
+        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), flash_args='0x0 b.bin 0x9000 p.bin')))
+        for bad in (['esptool', 'chip_id'], ['esptool', 'write_flash', '--flash-mode', 'dio']):
+            with self.subTest(cmd=bad):
+                o = hf.Operation([hf._record(bad, None, subprocess.CompletedProcess([], 0, good, ''), None)])
+                self.assertIn('no write_flash arguments to judge against', hf.esptool_problem(o))
+
+    def test_the_offsets_are_the_flash_args_pairs(self):
+        self.assertEqual(hf.esptool_offsets('--flash-mode dio --flash-size 8MB 0x0 b.bin 0x8000 p.bin'), [0, 0x8000])
+        with self.assertRaises(ValueError):
+            hf.esptool_offsets('--flash-mode dio')
+
+
+class EsptoolRuntime(unittest.TestCase):
+    """One esptool: the executable on PATH and its interpreter's package report one version."""
+
+    def setUp(self):
+        self.d = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (self.d / 'pkg' / 'esptool').mkdir(parents=True)
+        self.env = self.enterContext(mock.patch.dict(os.environ, {'PYTHONNOUSERSITE': '1', 'PYTHONPATH': ''}))
+
+    def exe(self, says='9.9.9', shebang=None, package='9.9.9', name='esptool'):
+        if package is not None:
+            (self.d / 'pkg' / 'esptool' / '__init__.py').write_text(f'__version__ = {package!r}\n')
+            os.environ['PYTHONPATH'] = str(self.d / 'pkg')
+        exe = self.d / name
+        exe.write_text(f'{shebang or "#!" + sys.executable}\nprint("esptool v{says}")\nprint("{says}")\n')
+        exe.chmod(0o755)
+        return str(exe)
+
+    def test_one_package_and_its_version(self):
+        exe = self.exe()
+        self.assertEqual(hf.esptool_runtime(exe), {'exe': exe, 'python': sys.executable, 'version': '9.9.9',
+                                                   'package': str(self.d / 'pkg' / 'esptool' / '__init__.py')})
+        with contextlib.chdir(self.d):
+            self.assertEqual(hf.esptool_runtime('./esptool')['exe'], exe)
+
+    def test_a_package_the_helper_sessions_do_not_import_is_refused(self):
+        (self.d / 'esptool').mkdir()
+        (self.d / 'esptool' / '__init__.py').write_text("__version__ = '9.9.9'\n")   # beside it: first on its path
+        no_other = subprocess.run([sys.executable, '-c', 'import esptool'], capture_output=True).returncode != 0
+        for what, package in (('another package', '9.9.9'), ('no package', None)):
+            with self.subTest(what):
+                if package is None and not no_other:
+                    self.skipTest('this interpreter has an esptool package outside the user site')
+                os.environ['PYTHONPATH'] = ''
+                exe = self.exe(name='esptool-cli', package=package)
+                with self.assertRaisesRegex(RuntimeError, 'for helper sessions in .*, not '
+                                            + re.escape(str(self.d / 'esptool' / '__init__.py'))):
+                    hf.esptool_runtime(exe)
+
+    def test_a_failed_or_malformed_import_probe_is_refused(self):
+        said = subprocess.CompletedProcess([], 0, 'esptool v9.9.9\n', '')
+        for what, probe in (('exit 1', subprocess.CompletedProcess([], 1, '["9.9.9", "/p"]\n', 'boom')),
+                            ('no package path', subprocess.CompletedProcess([], 0, '["9.9.9", null]\n', '')),
+                            ('not a pair', subprocess.CompletedProcess([], 0, '"9.9.9"\n', ''))):
+            with self.subTest(what), mock.patch.object(hf.subprocess, 'run', side_effect=[probe, probe, said]), \
+                    self.assertRaisesRegex(RuntimeError, 'imports no esptool package'):
+                hf.esptool_runtime(self.exe())
+
+    def test_refusals(self):
+        cases = (('a mismatched executable', {'says': '1.0'}, 'does not report 9.9.9'),
+                 ('no python shebang', {'shebang': '#!/bin/sh'}, 'want an absolute python shebang'))
+        for what, kw, why in cases:
+            with self.subTest(what), self.assertRaisesRegex(RuntimeError, why):
+                hf.esptool_runtime(self.exe(**kw))
+        with self.assertRaisesRegex(RuntimeError, 'is not on PATH'):
+            hf.esptool_runtime(str(self.d / 'missing'))
+        unreadable = self.exe(name='esptool-unreadable')
+        os.chmod(unreadable, 0o111)
+        if not os.access(unreadable, os.R_OK):   # root reads it anyway
+            with self.assertRaisesRegex(RuntimeError, 'Permission denied'):
+                hf.esptool_runtime(unreadable)
+        with mock.patch.object(hf.subprocess, 'run', side_effect=subprocess.TimeoutExpired('x', 1)), \
+                self.assertRaisesRegex(RuntimeError, 'timed out'):
+            hf.esptool_runtime(self.exe())
+
+    def test_no_package_for_its_interpreter(self):
+        exe = self.exe(package=None)
+        probe = subprocess.run([sys.executable, '-c', 'import esptool'], capture_output=True)
+        if probe.returncode == 0:
+            self.skipTest('this interpreter has an esptool package outside the user site')
+        with self.assertRaisesRegex(RuntimeError, 'imports no esptool package'):
+            hf.esptool_runtime(exe)
+
+
+class EsptoolPort(unittest.TestCase):
+    def setUp(self):
+        self.byid = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.object(hf, 'SERIAL_BY_ID', str(self.byid)))
+
+    def link(self, name, target='/dev/null'):
+        (self.byid / name).symlink_to(target)
+
+    def test_one_bridge_link_to_a_character_device(self):
+        self.link('usb-Silicon_Labs_CP2102N_USB_to_UART_abc123-if00-port0')
+        self.link('usb-Silicon_Labs_CP2102N_USB_to_UART_abc1234-if00-port0')   # another serial with this prefix
+        self.assertEqual(hf.esptool_port('abc123'), '/dev/null')
+
+    def test_refusals(self):
+        regular = self.byid.parent / 'regular'
+        regular.write_text('')
+        self.addCleanup(regular.unlink)
+        cases = (('none', [], 'found none'),
+                 ('two interfaces', [('usb-FTDI_Dual_RS232_ab1-if00-port0', '/dev/null'),
+                                     ('usb-FTDI_Dual_RS232_ab1-if01-port0', '/dev/zero')], 'found ['),
+                 ('dangling', [('usb-x_ab1-if00-port0', '/nonexistent/tty')], 'No such file'),
+                 ('not a device', [('usb-x_ab1-if00-port0', str(regular))], 'not a character device'))
+        for what, links, why in cases:
+            with self.subTest(what):
+                for p in self.byid.iterdir():
+                    p.unlink()
+                for name, target in links:
+                    self.link(name, target)
+                with self.assertRaisesRegex(RuntimeError, re.escape(why)):
+                    hf.esptool_port('ab1')
+        for uid in ('', 'a*b', 'a[1]', None):
+            with self.subTest(uid=uid), self.assertRaisesRegex(RuntimeError, 'want a probe serial'):
+                hf.esptool_port(uid)
+
+    def test_a_usj_serial_goes_to_usj_tty_only(self):
+        seen = []
+        fake = types.SimpleNamespace(usj_tty=lambda serial: seen.append(serial) or '/dev/ttyACM3')
+        with mock.patch.object(hf.hil_load, 'load_file', lambda rel: fake if rel.endswith('hil_openocd_esp.py')
+                               else self.fail(rel)):
+            self.assertEqual(hf.esptool_port('30:ED:A0:E0:C9:02'), '/dev/ttyACM3')
+            self.link('usb-x_ab1-if00-port0')
+            self.assertEqual(hf.esptool_port('ab1'), '/dev/null')
+        self.assertEqual(seen, ['30:ED:A0:E0:C9:02'])
+
+
 class ResetProblem(unittest.TestCase):
     """A reset that exited 0 counts only with the target's answer in its output."""
 
@@ -870,10 +1194,14 @@ class ResetProblem(unittest.TestCase):
     def op(stdout='', stderr=None):
         return subprocess.CompletedProcess([], 0, stdout, stderr)
 
+    def test_jlink_is_its_session_judged(self):
+        good = jlink_fixture(JLinkJudgment.RESET)
+        self.assertEqual(hf.reset_problem('JLink', op_of((0, good, None))), '')
+        self.assertIn('echoed', hf.reset_problem('jlink', op_of((0, 'J-Link>exit\nScript processing completed.\n',
+                                                                  None))))
+
     def test_each_backend_needs_its_contact_line(self):
-        cases = [('jlink', 'Found SW-DP with ID 0x2BA01477\nCortex-M4 identified.\n', ''),
-                 ('JLink', 'J-Link>go\nScript processing completed.\n', 'no line shows the target answering'),
-                 ('stlink', 'Device ID   : 0x413\n', ''),
+        cases = [('stlink', 'Device ID   : 0x413\n', ''),
                  ('stlink', 'ST-LINK SN  : P\n', 'no line shows the target answering'),
                  ('openocd', 'Info : [rp2040.core0] Examination succeed\n', ''),
                  ('openocd', 'Info : wlink_init ok\nInfo : [riscv.cpu] Examined RISC-V core\n', ''),
@@ -887,8 +1215,7 @@ class ResetProblem(unittest.TestCase):
                 self.assertIn(why, got)
 
     def test_a_refuting_line_wins_whatever_else_answered(self):
-        cases = [('jlink', 'Cortex-M4 identified.\nReset: CPU may not have been reset (DHCSR.S_RESET_ST never gets set).'),
-                 ('openocd', 'Info : SWD DPIDR 0x0bc12477\nWarn : target max32665.cpu examination failed'),
+        cases = [('openocd', 'Info : SWD DPIDR 0x0bc12477\nWarn : target max32665.cpu examination failed'),
                  ('openocd', 'Info : [rp2040.core0] Examination succeed\n'
                              'Error: [rp2040.core0] Execution of event reset-assert failed:\nboom'),
                  ('pyocd', 'Core 0 is not accessible after reset'),

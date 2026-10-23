@@ -24,7 +24,7 @@ except ImportError:  # Windows
     import msvcrt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
-from seal import fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
+from seal import canonical, fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
 
 FULL_SHA = re.compile(r'\A[0-9a-f]{40}\Z')  # \Z: $ would let a trailing newline through
 # The human is the sole author: no line may credit an agent, model, tool or session, nor link a Claude or ChatGPT session anywhere.
