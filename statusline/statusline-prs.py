@@ -188,7 +188,7 @@ def fetch(prs):
     doc, repos = query(prs)
     done = subprocess.run(['gh', 'api', 'graphql', '-f', f'query={doc}'], capture_output=True, encoding='utf-8',
                           errors='replace', timeout=GH_TIMEOUT_S,
-                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))  # the worker has no console
+                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))  # however the worker started
     answer = json.loads(done.stdout)
     if done.returncode or not isinstance(answer, dict) or answer.get('errors') or not isinstance(answer.get('data'), dict):
         raise ValueError(f'gh api graphql failed: {done.stderr.strip()[:200]}')
@@ -267,8 +267,10 @@ def sweep(cache_dir, now):
 
 
 def spawn_refresh(cache_dir, session_id, transcript):
+    # Windows: a console of its own with no window, not none (DETACHED_PROCESS): a venv's python.exe starts the
+    # real one as a child, which would open a visible console of its own
     detach = {'start_new_session': True} if os.name != 'nt' else \
-        {'creationflags': subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+        {'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
     try:
         subprocess.Popen([sys.executable, os.path.abspath(__file__), 'refresh', str(cache_dir), session_id, transcript],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **detach)

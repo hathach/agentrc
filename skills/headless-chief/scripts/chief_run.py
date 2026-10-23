@@ -234,13 +234,15 @@ def main(argv=None):
     finally:
         release()
     if os.name == 'nt':
-        # no fork: this process's own command line runs again as the launcher, without a console or the caller's
-        # group; the task goes on its stdin, as a forked launcher keeps the file open whatever the caller does with it
+        # no fork: this process's own command line runs again as the launcher, outside the caller's console and
+        # group; the task goes on its stdin, as a forked launcher keeps the file open whatever the caller does with it.
+        # A console of its own with no window, not none: a venv's python.exe starts the real one as a child, which
+        # DETACHED_PROCESS would leave to open a visible console for the whole run
         with task:
             data = task.read()
         with (a.out / 'stderr.log').open('ab') as log:
             launcher = subprocess.Popen([sys.executable, *sys.orig_argv[1:], '--_detached'], stdin=subprocess.PIPE, stdout=log,
-                                        stderr=log, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+                                        stderr=log, creationflags=NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
         try:
             with launcher.stdin:
                 launcher.stdin.write(data)
@@ -317,7 +319,7 @@ def launch(a, task):
         try:
             if claude is None:
                 raise FileNotFoundError('claude is not on PATH')
-            # a detached launcher has no console: CREATE_NO_WINDOW keeps claude's tools from opening windows
+            # a console of its own with no window, in the foreground too: claude's tools open none
             child = subprocess.Popen(cmd, cwd=a.worktree, stdin=task, stdout=subprocess.PIPE, stderr=err, env=child_env(),
                                      creationflags=NO_WINDOW)
         except OSError as e:

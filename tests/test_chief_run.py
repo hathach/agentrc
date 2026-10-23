@@ -4,6 +4,7 @@ data/chief_run/stream.jsonl is a trimmed real capture (claude 2.1.280, one subag
 the subagent's reply reaches the stream only inside a top-level user tool_result, and no
 worker assistant event was streamed, so worker exclusion is shown on the event types
 that do appear."""
+import ctypes
 import importlib.util
 import io
 import json
@@ -64,13 +65,11 @@ def result(body='chief: stage · done', is_error=False, subtype='success'):
     return {'type': 'result', 'subtype': subtype, 'is_error': is_error, 'result': body}
 
 
-def has_console(pid):
-    """Windows: does the process have a console; AttachConsole asks it from a process without one."""
-    probe = ('import ctypes, sys; k = ctypes.WinDLL("kernel32", use_last_error=True); '
-             f'sys.exit(0 if k.AttachConsole({pid}) else ctypes.get_last_error())')
-    rc = subprocess.run([sys.executable, '-c', probe], creationflags=subprocess.DETACHED_PROCESS).returncode
-    assert rc in (0, 6), f'AttachConsole failed with {rc}'   # 6: ERROR_INVALID_HANDLE, the process has no console
-    return rc == 0
+def console_pids():
+    """Windows: the pids attached to this process's console, none without one."""
+    pids = (ctypes.c_uint32 * 1024)()
+    n = ctypes.WinDLL('kernel32').GetConsoleProcessList(pids, len(pids))
+    return set(pids[:n])
 
 
 def kill(pid):
@@ -418,11 +417,12 @@ class ChiefRun(unittest.TestCase):
         self.wait_until('the status line', lambda: self.logged('chief: stage · live'))
         if hasattr(os, 'getsid'):
             self.assertNotEqual(os.getsid(pid), os.getsid(0), 'a caller ending its process group does not reach it')
-        else:   # Windows: DETACHED_PROCESS stands for the session, so no console event from the caller reaches it
-            control = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], creationflags=subprocess.CREATE_NO_WINDOW)
+        else:   # Windows: a console of its own stands for the session, so no console event from the caller reaches it
+            control = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
             self.addCleanup(lambda: (control.kill(), control.wait()))
-            self.wait_until('the probe to see a console where there is one', lambda: has_console(control.pid))
-            self.assertFalse(has_console(pid), 'the launcher has no console')
+            if console_pids():   # a runner without a console has none for the launcher to share
+                self.wait_until('a plain child to share our console', lambda: control.pid in console_pids())
+                self.assertNotIn(pid, console_pids(), "the launcher is outside the caller's console")
         (self.fake / 'go').touch()
         self.wait_until('the exit line', lambda: self.logged('launcher: exit 0 (result ok)'))
         self.assertEqual((self.out / 'report.md').read_text(encoding='utf-8'), 'chief: stage · done\n')
