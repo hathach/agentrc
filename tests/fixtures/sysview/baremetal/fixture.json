@@ -1,0 +1,10 @@
+{
+  "name": "baremetal",
+  "source": "tusb-pr/stm32f407disco-1/stm32f407disco-capture.SVDat",
+  "start": 0,
+  "end": 637,
+  "raw_sha256": "7fc960b250c4597472ea3109f05d3d0658bf39a634e828481db53963998157c5",
+  "event_count": 120,
+  "gui": "SystemView 4.10b, ci.lan, 2026-10-23; wrapped reuses the verified 2026-10-22 export",
+  "gui_events_sha256": "33dbb9415375a500a84d4fd9351e9d4a69de4f8c308a94dc838e31ed370e6f3c"
+}

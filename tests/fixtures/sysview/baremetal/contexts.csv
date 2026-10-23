@@ -1,0 +1,5 @@
+Name,Type,Core,Stack Information,Activations,Total Blocked Time,Total Run Time,Time Interrupted,CPU Load,Last Run Time,Min Run Time,Max Run Time,Min Blocked Time,Max Blocked Time,Run Time/s,Min Run Time/s,Max Run Time/s
+SysTick,#15,Core 0,,0,,0.000 000 000 s,0.000 000 ms,0.00 %,0.000 000 ms,0.000 000 ms,0.000 000 ms,,,0.000 000 ms,0.000 000 ms,0.000 000 ms
+ISR 83,#83,Core 0,,27,,0.000 182 048 s,0.000 000 ms,0.05 %,0.007 143 ms,0.004 589 ms,0.013 589 ms,,,0.182 048 ms,0.000 000 ms,0.000 000 ms
+Scheduler,,Core 0,,0,,0.000 000 000 s,0.000 000 ms,0.00 %,0.000 000 ms,0.000 000 ms,0.000 000 ms,,,0.000 000 ms,0.000 000 ms,0.000 000 ms
+Idle,,Core 0,,0,,0.000 000 000 s,0.000 000 ms,0.00 %,0.000 000 ms,0.000 000 ms,0.000 000 ms,,,0.000 000 ms,0.000 000 ms,0.000 000 ms

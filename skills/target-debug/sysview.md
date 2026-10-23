@@ -1,7 +1,8 @@
 # SystemView — scheduling-level timing over RTT
 
 Part of the `target-debug` skill (its technique ladder says when to reach for this; its Delegated sessions, Rig
-discipline and Warnings apply). Linux hosts only: the recorder drives the SEGGER SystemView application under Xvfb.
+discipline and Warnings apply). Live recording and GUI export require Linux; native offline decoding uses only
+Python on Linux, macOS or Windows.
 
 SystemView answers where CPU time goes: per-task and per-ISR load, ISR durations, ready→run latency, the timing of
 spans and functions the firmware marks, task stack high-water, heap totals, and, from a post-mortem build, what ran
@@ -60,9 +61,11 @@ the control block.
 - A target whose debug link cannot read RAM while the core runs gets the dump only: WCH QingKe over SDI (`rtt`,
   transport matrix), and only on parts whose attach keeps RAM (`families.md`, WCH QingKe). Never reset it inside a
   session.
-- Decoding any route launches the SystemView GUI (`--from-raw`), so host setup and licensing below apply to all three.
+- `--from-raw` decodes natively. Add `--gui` for the SEGGER export; the GUI host setup and licensing below apply to
+  that path and to live recording.
 
-Every route runs on the probe's host with the board taken under the project's `HIL contract:` (`hil` skill).
+Capture runs on the probe's host with the board taken under the project's `HIL contract:` (`hil` skill). Offline
+decoding of an existing file needs neither a probe nor a board lock.
 `<scripts>` is this skill's `scripts/` directory.
 
 ### Live recorder
@@ -147,14 +150,14 @@ sudo apt-get install -y xvfb xdotool imagemagick
 # SystemView: segger.com/downloads/systemview (Linux .deb, installs /usr/bin/systemview); JLinkExe: segger.com/jlink
 ```
 
-- SystemView deletes `/tmp/sv-*` at startup: `sysview_record.py` refuses an `--out`, `--from-raw`, `--elf` or
-  `--hil-config` there, but nothing guards another build or capture directory. carried over (a build tree erased
-  mid-session).
-- Linux only, and `unshare --user --map-root-user --mount` must work for the operator (unprivileged user
-  namespaces). SystemView's J-Link DLL opens every J-Link it can reach at startup, live or decode, whichever probe
-  `-usb` names: on a rig that raised a terms-of-use notice per other board's on-board probe and a "Communication timed
-  out" while CI flashed. `sysview_record.py` runs SystemView in a namespace whose `/dev/bus/usb` holds only the
-  recording probe's node, none when decoding.
+- SystemView deletes `/tmp/sv-*` at startup (a build tree was erased mid-session that way). `sysview_record.py`
+  gives it a private `/tmp` holding only the X server's socket directory and, under `/tmp/.sysview_record`, its
+  temporary HOME and `--out`, so the host's `/tmp` is out of its reach.
+- Live recording and `--gui` are Linux only. `unshare --user --map-root-user --mount` must work for the operator
+  (unprivileged user namespaces). SystemView's J-Link DLL opens every J-Link it can reach at startup, live or decode,
+  whichever probe `-usb` names: on a rig that raised a terms-of-use notice per other board's on-board probe and a
+  "Communication timed out" while CI flashed. `sysview_record.py` runs SystemView in a namespace whose `/dev/bus/usb`
+  holds only the recording probe's node, none when decoding.
 - The licence dialog on an unregistered install is answered "Continue under SFL", which asserts non-commercial or
   educational use on the operator's behalf; commercial use needs a SEGGER commercial licence. The target sources are
   BSD-licensed, so a built image carries no condition. A registered key stops the dialog; killing SystemView has been
@@ -178,22 +181,58 @@ from the caller.
 sysview_record.py --out DIR (--hil-config FILE --board NAME | --probe SN --device NAME) --interface swd|jtag
                   --speed KHZ (--elf FILE | --addr ADDR) --duration-ms N [--workload CMD]
                   [--no-events] [--export-terminal]
-sysview_record.py --out DIR --from-raw FILE [--no-events] [--export-terminal]
+sysview_record.py --out DIR --from-raw FILE [--no-events] [--gui [--export-terminal]]
 ```
 
 - Live recording is J-Link only (SystemView's own recorder); a `--hil-config` board must be a `jlink` entry. The RTT
   control block comes from `--elf` (ELF32 little-endian symbol table, no `nm`) or `--addr`.
 - `--out` must not exist, or be an empty directory. It receives `contexts.csv`, `events.txt` (unless `--no-events`),
-  `terminal.csv` (with `--export-terminal`), `recording.SVDat` (live only), `systemview.log`, and `record.json`: the
-  inputs, tool versions and the start and end time of the recording. `debug.png` is added on a failure.
+  and `record.json` with the inputs, decoder or tool versions and run times. Native decoding adds `decode.json` with
+  packet diagnostics. The GUI path adds `systemview.log`, `terminal.csv` with `--export-terminal`, and `debug.png` on
+  failure; live recording also saves `recording.SVDat`.
 - `--workload CMD` runs through the shell in its own process group from the start of the recording. Stopping it when
   `--duration-ms` expires is the normal end, not a failure; it exiting non-zero before then fails the run (exit 3).
   `record.json` holds its exit status and how it ended (`exited` or `deadline`).
-- `--from-raw` decodes bytes another route captured (`rtt.py --channel N`, `sysview_dump.py`), with no probe.
+- `--from-raw` decodes bytes another route captured (`rtt.py --channel N`, `sysview_dump.py`), with no probe. Native
+  decoding bypasses Linux, tool and namespace setup. `--gui` selects the existing SEGGER export. Native
+  `--export-terminal` is refused with a message directing the caller to `--gui`.
 - `record.json` `dialogsAnswered` counts each dialog answered, by title fragment, and `systemviewErrors` the
   SystemView error dialogs among them; `sysview_report.py` warns when it is nonzero.
-- Exit: 0 recorded and exported; 2 bad usage or not Linux; 3 a tool, the probe (none or several USB devices carrying
-  its serial), the workload or an export failed, or a signal stopped the run (`record.json` says which).
+- Exit: 0 recorded and exported; 2 bad usage or a GUI request off Linux; 3 decoding, a tool, the probe (none or several
+  USB devices carrying its serial), the workload or an export failed, or a signal stopped the run (`record.json`
+  says which).
+
+### `sysview_decode.py` — native offline decoding
+
+```text
+sysview_decode.py FILE --out DIR [--no-events]
+```
+
+- The decoder accepts the pinned single-core SystemView RTT streams, chronological post-mortem rings, and the text
+  header of GUI-saved `.SVDat` files. It writes the event/context columns consumed by `sysview_report.py`; OS API
+  description files, ELF symbol rendering and terminal export are outside this subset. Registered modules require
+  `--gui`. Unknown length-delimited events retain their packet bytes. With an OS description, IDs 32–511 are OS
+  events; otherwise they are unnamed functions. IDs from 512 are user functions.
+- A wrapped head is discarded up to the ten-zero synchronization record. Truncated trailing packets are reported
+  in `decode.json` and excluded without counting a timing loss. Resynchronization or a frequency change ends the
+  timed segment:
+  earlier timestamps and metrics remain valid, later timestamps are blank. Init supplies no epoch, cycle samples
+  wrap, and OS time samples are taken separately from the packet clock, so none re-anchor its exact timeline.
+  Missing Init withholds report timing. Complete deltas accumulate without a host-side counter wrap.
+- Malformed content inside a complete length-delimited packet is diagnosed without losing the next packet boundary.
+  Its event ID remains visible, its arguments are withheld, and a readable trailing delta preserves clock continuity.
+  Dependent call/marker spans and heap totals are invalidated. A large unsigned delta alone is not evidence of a
+  negative delta; the target format permits the full unsigned range.
+- Overflow invalidates open call, marker, ready and interrupt spans and heap state. The native decoder does not
+  splice those spans across loss. Aggregate context runtime includes observed partial execution at EOF; duration
+  samples include complete spans only.
+- Native task blocked time is blank; use `--gui` when the GUI aggregate statistics are required.
+- `decode.json` records the source, decoded event count, timestamp frequency and byte offsets/reasons for damaged
+  input. The event rows retain valid-prefix timestamps and mark loss boundaries; the report needs no `decode.json`
+  to retain prefix metrics, count timing loss in `overflow`, or warn about malformed payloads. A successful decode
+  can have diagnostics; inspect them before using the report. Exit 0 means a usable prefix was decoded, not that the
+  capture is complete; exit 2 means invalid input or output directory.
+- Corpus runner and manifest: `bench/sysview/`; provenance and reproduction: `tests/fixtures/sysview/README.md`.
 
 ### `sysview_report.py` — numbers from an export directory
 
@@ -229,6 +268,9 @@ warnings:   [str]
   (`--no-events`); every time-derived one (the contexts' load and times, the duration tables, the window figures)
   without a usable time base: no Init record (no timestamp frequency) or non-monotonic timestamps. `[]` means measured
   and none seen.
+  An explicit native timing-loss boundary followed entirely by blank timestamps retains the established prefix's
+  event and context timing; duration annotations in the untimed suffix are ignored. Unmarked unreadable timestamps
+  withhold all time-derived metrics, including the full-capture context timings.
 - `--post-mortem` declares a decoded post-mortem ring. More than one task switch or ISR entry at the first timestamp
   then marks an untimed head: the events up to the first later timestamp are left out of every events-derived field,
   the contexts' times are `null`, who ran before the first task switch after them is unknown (busy shares overlapping

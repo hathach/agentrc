@@ -158,8 +158,23 @@ landed before building on any name below. `sysview.md` has the routes and how to
     overflow 0.
   - ch32v307v_r1_1v0 `cdc_msc` post-mortem dump of its 4 KB ring: 0.147 s, the function table populated and no ISR
     rows.
-- nanoch32v203's tick runs at 838.5 Hz with or without SystemView: `board_millis()` and every timeout derived from it
-  run 16% slow, a board clock bug.
+- nanoch32v203's 838.5 Hz tick is a probe artifact, not a board clock bug (tinyusb#4296, 2026-10-23, WCH-LinkE with
+  OpenOCD 0.12.0+dev-02620 `wlinke`): attaching to the running CH32V203 left it on HSI ×15 with HSE off
+  (RCC_CTLR `0x03008a83`, CFGR0 `0x00b4040a`; tick 838.3–838.8 Hz) until a reset; `reset halt` then `resume` in the same
+  connection restored HSE ×18 (`0x03038a83`, `0x00bd040a`) and 999.6–1000.1 Hz. Time that setup only after a reset
+  inside the session; a post-mortem dump taken over such an attach carries the perturbation, so withhold its timing.
+  Whether `rtt.py`'s `reset_before_attach` avoids it is not established, and the rtt skill's rule against live WCH reads
+  stands.
+- max32666fthr (2026-10-23, `cdc_msc` level 4, debugprobe CMSIS-DAP, OpenOCD `target/max32665.cfg`):
+  - Timestamps are TMR0 at `PeripheralClock` 48 MHz; the 0.30 s + 1.0 s CDC burst cadence decodes as 1.300–1.301 s.
+  - `max32665.cfg` sets no adapter speed, so OpenOCD runs SWD at 100 kHz and drains RTT at 6–7 KB/s: every capture
+    stopped near 100 KB with a 64 KB ring's backlog undrained, a ~8 s window for a 15 s workload. Pass
+    `-c "adapter speed 4000"` on the capture route (the 4 MHz limit is not checked: the MAX32666 datasheet is not in
+    the library); loss stays nonzero even at 10 MHz.
+  - Bare-metal builds leave the USB IRQ at priority 0, which the BASEPRI 0x20 RTT lock never masks: the ISR
+    corrupts half-built packets (wrong function ids, negative timestamp deltas the GUI turns into +0.699 s each).
+    Moving the IRQ to priority 1 removed every corrupt packet. Until tinyusb#4294's lock fix lands, distrust a
+    bare-metal capture showing `ISR` contexts other than the USB one or function ids outside 512-519.
 
 ## Espressif integration
 

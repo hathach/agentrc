@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Unattended SEGGER SystemView on a headless Linux host: record live over a J-Link, or decode a raw capture, and
-export the analysis for sysview_report.py. The contract (arguments, files in --out, exit codes) is the target-debug
+"""Record SEGGER SystemView on Linux over a J-Link, or decode a raw capture natively on any platform,
+and export the analysis for sysview_report.py. The contract (arguments, files in --out, exit codes) is the target-debug
 skill's sysview.md, "Script interface".
 
   sysview_record.py --out DIR (--hil-config FILE --board NAME | --probe SN --device NAME) --interface swd|jtag
                     --speed KHZ (--elf FILE | --addr ADDR) --duration-ms N [--workload CMD]
                     [--no-events] [--export-terminal]
-  sysview_record.py --out DIR --from-raw FILE [--no-events] [--export-terminal]
+  sysview_record.py --out DIR --from-raw FILE [--no-events] [--gui [--export-terminal]]
 
 SystemView runs under an Xvfb of its own (-displayfd picks a free display) with a temporary HOME, so its ini and
 recent-file state never touch the user's; the SEGGER registry file (license key) and JLinkDLL.ini are copied in. It
@@ -25,11 +25,12 @@ to the run, repeats the load until the title names that copy, and only then expo
 SystemView has closed the file and its size holds.
 
 The license notice ("Continue under SFL": non-commercial or educational use) and the J-Link terms of use are
-accepted, as the operator has directed for every SEGGER notice. SystemView deletes /tmp/sv-* at startup, so an
---out, --from-raw, --elf or --hil-config there is refused.
+accepted, as the operator has directed for every SEGGER notice. SystemView deletes /tmp/sv-* at startup, so the
+namespace also gives it a private /tmp holding only the X server's socket directory and, under NS_TMP, its HOME and
+--out: the host's /tmp is out of its reach, and the commands it is sent name those namespace paths.
 
-Exit: 0 recorded and exported; 2 bad usage or not Linux; 3 a tool, the probe, the workload or an export failed, or a
-signal stopped the run (record.json says which).
+Exit: 0 recorded and exported; 2 bad usage or a GUI request off Linux; 3 decoding, a tool, the probe, the workload or
+an export failed, or a signal stopped the run (record.json says which).
 """
 import argparse
 import datetime
@@ -54,6 +55,7 @@ from sysview_dump import control_block, prepare_out  # noqa: E402
 
 TOOLS = ('systemview', 'Xvfb', 'xdotool', 'unshare')
 USB_SYSFS, USB_DEV = Path('/sys/bus/usb/devices'), Path('/dev/bus/usb')
+X11_DIR, NS_TMP = Path('/tmp/.X11-unix'), Path('/tmp/.sysview_record')
 REGISTRY = ('SEGGER_REG_HKEY_CURRENT_USER.xml', 'JLinkDLL.ini')
 BANNER = re.compile(rb'SEGGER SystemView V(\S+) Command Server')
 # title fragment -> keys that answer it: mnemonics or the default button, never screen positions
@@ -173,10 +175,12 @@ def usb_node(serial):
     return hits[0]
 
 
-def usb_jail(cmd, keep, scratch):
-    """cmd in a user and mount namespace whose /dev/bus/usb holds only the device nodes in keep, at their own paths.
-    Each node is bind-mounted aside before the empty tmpfs covers /dev/bus/usb, then back in place; unshare execs
-    sh, which execs cmd, so the pid stays cmd's."""
+def usb_jail(cmd, keep, scratch, dirs):
+    """cmd in a user and mount namespace whose /dev/bus/usb holds only the device nodes in keep, at their own paths,
+    and whose /tmp is a private tmpfs holding X11_DIR and each host directory of dirs ({name: path}) at
+    NS_TMP/name. Each node is bind-mounted aside before the empty tmpfs covers /dev/bus/usb, then back in place; the
+    new /tmp is built on a tmpfs staged in scratch while the host's paths are still visible, then moved over /tmp.
+    unshare execs sh, which execs cmd, so the pid stays cmd's."""
     q = shlex.quote
     steps = []
     for i, node in enumerate(keep):
@@ -187,6 +191,16 @@ def usb_jail(cmd, keep, scratch):
     for i, node in enumerate(keep):
         steps += [f'mkdir -p {q(str(node.parent))}', f'touch {q(str(node))}',
                   f'mount --bind {q(str(scratch / f"usb{i}"))} {q(str(node))}']
+    stage = scratch / 'tmp'
+    stage.mkdir()
+    steps.append(f'mount -t tmpfs none {q(str(stage))}')
+    binds = {NS_TMP / name: Path(path) for name, path in dirs.items()}
+    if X11_DIR.is_dir():
+        binds[X11_DIR] = X11_DIR
+    for seen, src in binds.items():
+        dest = stage / seen.relative_to('/tmp')
+        steps += [f'mkdir -p {q(str(dest))}', f'mount --bind {q(str(src))} {q(str(dest))}']
+    steps.append(f'mount --move {q(str(stage))} /tmp')
     return ['unshare', '--user', '--map-root-user', '--mount', 'sh', '-ec', '; '.join(steps + ['exec "$@"']), 'sh',
             *cmd]
 
@@ -209,10 +223,11 @@ class SystemView:
                     shutil.copy2(src, segger / name)
                     self.copied.append(name)
             self.display = self.start_xvfb()
-            self.env = {**os.environ, 'HOME': str(self.home), 'XDG_CONFIG_HOME': str(self.home / '.config'),
-                        'DISPLAY': self.display}
+            self.ns = {'home': self.home, 'out': out}
+            self.env = {**os.environ, 'HOME': str(self.ns_path(self.home)),
+                        'XDG_CONFIG_HOME': str(self.ns_path(self.home / '.config')), 'DISPLAY': self.display}
             self.log = open(out / 'systemview.log', 'wb')
-            cmd = usb_jail(['systemview', *args, '-single', '-port', str(self.port)], usb_nodes, self.home)
+            cmd = usb_jail(['systemview', *args, '-single', '-port', str(self.port)], usb_nodes, self.home, self.ns)
             self.sv = subprocess.Popen(cmd, env=self.env,
                                        stdout=self.log, stderr=subprocess.STDOUT, start_new_session=True)
         except BaseException as e:
@@ -221,6 +236,13 @@ class SystemView:
             except (Failure, OSError, subprocess.SubprocessError) as cleanup:
                 e.cleanup_error = str(cleanup)
             raise
+
+    def ns_path(self, path):
+        """path, inside HOME or --out, as SystemView sees it in its namespace."""
+        for name, base in self.ns.items():
+            if path == base or base in path.parents:
+                return NS_TMP / name / path.relative_to(base)
+        raise ValueError(f'{path} is outside the directories SystemView sees')
 
     def start_xvfb(self):
         read, write = os.pipe()
@@ -323,7 +345,7 @@ class SystemView:
         deadline, resend = time.monotonic() + LOAD_S, 0
         while time.monotonic() < deadline:
             if time.monotonic() >= resend:
-                self.send(f'-load {copy}')
+                self.send(f'-load {self.ns_path(copy)}')
                 resend = time.monotonic() + LOAD_RETRY_S
             title = self.poll()
             if shown.search(title):
@@ -334,12 +356,13 @@ class SystemView:
     def write(self, command, path):
         """Run a command that writes path, which does not exist yet; its size once SystemView has closed it and
         the size holds."""
-        self.send(f'{command} {path}')
+        seen = self.ns_path(path)
+        self.send(f'{command} {seen}')
         deadline, last, still = time.monotonic() + EXPORT_S, -1, 0
         while time.monotonic() < deadline:
             self.poll()
             size = path.stat().st_size if path.exists() else -1
-            done = size > 0 and size == last and str(path) not in fd_links(self.sv.pid)
+            done = size > 0 and size == last and str(seen) not in fd_links(self.sv.pid)
             still = still + 1 if done else 0
             if still >= 2:
                 return size
@@ -469,11 +492,6 @@ def resolve_live(a, p):
     return control_block(a, p)
 
 
-def in_sv_tmp(path):
-    resolved = Path(path).resolve()
-    return any(d.parent == Path('/tmp') and d.name.startswith('sv-') for d in (resolved, *resolved.parents))
-
-
 def on_signal(signum, _frame):
     raise Failure(f'stopped by signal {signum}')
 
@@ -482,6 +500,7 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--out', required=True, help='new or empty output directory')
     p.add_argument('--from-raw', metavar='FILE', help='decode this raw capture instead of recording')
+    p.add_argument('--gui', action='store_true', help='use the Linux SystemView GUI to decode --from-raw')
     p.add_argument('--hil-config', metavar='FILE', help="the project's HIL config json (a jlink entry)")
     p.add_argument('--board', metavar='NAME', help='board name in --hil-config')
     p.add_argument('--probe', help='J-Link serial')
@@ -494,9 +513,12 @@ def main(argv=None):
     p.add_argument('--workload', metavar='CMD', help='shell command run for the recording, stopped at its end')
     p.add_argument('--no-events', action='store_true', help='skip events.txt (large: megabytes per second)')
     p.add_argument('--export-terminal', action='store_true', help='also export terminal.csv')
+    from sysview_decode import DecodeError, decode_file
+
     a = p.parse_args(argv)
-    if sys.platform != 'linux':
-        p.error(f'Linux-only (Xvfb, /proc, POSIX process groups); this is {sys.platform}')
+    native = bool(a.from_raw and not a.gui)
+    if a.gui and not a.from_raw:
+        p.error('--gui is for --from-raw; live recording already uses the GUI')
     if a.from_raw:
         live = [f for f in ('hil_config', 'board', 'probe', 'device', 'interface', 'speed', 'elf', 'addr',
                             'duration_ms', 'workload') if getattr(a, f) is not None]
@@ -505,19 +527,23 @@ def main(argv=None):
         raw = Path(a.from_raw).resolve()
         if not raw.is_file() or not raw.stat().st_size:
             p.error(f'--from-raw {a.from_raw}: no such non-empty file')
-    else:
+        if not a.gui:
+            if a.export_terminal:
+                p.error('--export-terminal requires --gui; native decoding does not export the terminal channel')
+    if not native and sys.platform != 'linux':
+        p.error(f'Linux-only (Xvfb, /proc, POSIX process groups); this is {sys.platform}')
+    if not a.from_raw:
         cb = resolve_live(a, p)
-    missing = [t for t in TOOLS if not shutil.which(t)]
+    missing = [t for t in TOOLS if not shutil.which(t)] if not native else []
     if missing:
         p.error(f"not on PATH: {', '.join(missing)} (SystemView's deb, xvfb, xdotool, util-linux)")
     out = Path(a.out).resolve()
-    for flag, path in (('--out', a.out), ('--from-raw', a.from_raw), ('--elf', a.elf), ('--hil-config', a.hil_config)):
-        if path and in_sv_tmp(path):
-            p.error(f'{flag} {path}: SystemView deletes /tmp/sv-* at startup')
     prepare_out(p, str(out))
 
     record = {'started': now(), 'argv': [shlex.quote(x) for x in (argv if argv is not None else sys.argv[1:])],
               'mode': 'decode' if a.from_raw else 'live', 'exports': {}}
+    if native:
+        record['decoder'] = 'native'
     if a.from_raw:
         sv_args = []
     else:
@@ -527,18 +553,24 @@ def main(argv=None):
             record['workload'] = {'cmd': a.workload}
         sv_args = ['-recorder', 'J-Link', '-device', a.device, '-usb', a.probe, '-if', a.interface.upper(),
                    '-speed', a.speed, '-rttcbaddr', f'0x{cb:08X}']
-    previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    previous = {sig: signal.signal(sig, on_signal) for sig in ps.STOP_SIGNALS}
     rc, sv = 0, None
     try:
         try:
-            sv = SystemView(out, sv_args, () if a.from_raw else (usb_node(a.probe),))
-            record.update(display=sv.display, port=sv.port, registryCopied=sv.copied)
-            sv.wait_ready()
-            if a.from_raw:
-                decode(sv, out, a, record, raw)
+            if native:
+                record['decode'] = decode_file(raw, out, a.no_events)
+                for name in ('contexts.csv', 'events.txt'):
+                    if (out / name).is_file():
+                        record['exports'][name] = (out / name).stat().st_size
             else:
-                record_live(sv, out, a, record)
-        except (Failure, OSError, subprocess.SubprocessError, KeyboardInterrupt) as e:
+                sv = SystemView(out, sv_args, () if a.from_raw else (usb_node(a.probe),))
+                record.update(display=sv.display, port=sv.port, registryCopied=sv.copied)
+                sv.wait_ready()
+                if a.from_raw:
+                    decode(sv, out, a, record, raw)
+                else:
+                    record_live(sv, out, a, record)
+        except (Failure, OSError, DecodeError, subprocess.SubprocessError, KeyboardInterrupt) as e:
             record['error'] = str(e) or type(e).__name__
             if hasattr(e, 'cleanup_error'):
                 record['cleanupError'] = e.cleanup_error
@@ -559,7 +591,7 @@ def main(argv=None):
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         record['ended'] = now()
-        (out / 'record.json').write_text(json.dumps(record, indent=1))
+        (out / 'record.json').write_text(json.dumps(record, indent=1), encoding='utf-8')
     print(json.dumps(record))
     return rc
 

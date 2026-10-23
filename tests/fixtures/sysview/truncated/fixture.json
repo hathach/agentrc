@@ -1,0 +1,10 @@
+{
+  "name": "truncated",
+  "source": "campaign/cut2.SVDat",
+  "start": 0,
+  "end": 2263,
+  "raw_sha256": "75ee183fc3dc54a7a68479610c2943144ebf22c3b538ae0dd2f667d42f69cb43",
+  "event_count": 379,
+  "gui": "SystemView 4.10b, ci.lan, 2026-10-23; wrapped reuses the verified 2026-10-22 export",
+  "gui_events_sha256": "f604903cafe696c63fb6b0e6e460d9d07e08b0a234191f1aa621f7a0a310d7fa"
+}

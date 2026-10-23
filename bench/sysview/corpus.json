@@ -1,0 +1,498 @@
+{
+  "version": 1,
+  "provenance": "ci.lan SystemView campaign and TinyUSB SYSVIEW=4 cdc_msc captures, 2026-10-22/23; h743 export generated 2026-10-23 with SystemView 4.10b; MAX32666 run1 copied read-only from ci.lan sysview-followups/max-out/run1 on 2026-10-23 (tinyusb#4294)",
+  "missing_categories": [
+    "early-crash/no-Init"
+  ],
+  "files": {
+    "tusb-pr/stm32f407disco-1/stm32f407disco-capture.SVDat": {
+      "sha256": "61de2daf5359d5e677c6ad63a51053e9c0b7246f41d97da7c4794df51f43b945",
+      "bytes": 879517
+    },
+    "tusb-pr/stm32f407disco-1/stm32f407disco-decoded/events.txt": {
+      "sha256": "d066511862e877c9793121bd4b773c8dc75b4a41135e8cb707ef0227649fae06",
+      "bytes": 27544683
+    },
+    "tusb-pr/stm32f407disco-1/stm32f407disco-decoded/contexts.csv": {
+      "sha256": "828cda66201901ad0841106f10003f4648d7385cfb18cfb9ca3328ac8e6696ef",
+      "bytes": 774
+    },
+    "tusb-pr/stm32f407disco-1/stm32f407disco-decoded/record.json": {
+      "sha256": "df970b2d3edb7b4716012c64300e2be5cce26cfd9908d98cd4f815d1ea52de2a",
+      "bytes": 706
+    },
+    "tusb-pr/raspberry_pi_pico-1/raspberry_pi_pico-capture.SVDat": {
+      "sha256": "a9b45580f4ccd1769d6983d72342e10a727523a5552bdbc24a9f9e25b1b3c6be",
+      "bytes": 850677
+    },
+    "tusb-pr/raspberry_pi_pico-1/raspberry_pi_pico-decoded/events.txt": {
+      "sha256": "6ca19a1b16ba0bc91f443b9a52994e79b054db3683485bcf64d73f999aabcb8c",
+      "bytes": 30541203
+    },
+    "tusb-pr/raspberry_pi_pico-1/raspberry_pi_pico-decoded/contexts.csv": {
+      "sha256": "b998ed71bde4e063f449993de85a3240f2d58086614dc52c22ceb78df7d31fc2",
+      "bytes": 774
+    },
+    "tusb-pr/raspberry_pi_pico-1/raspberry_pi_pico-decoded/record.json": {
+      "sha256": "34eb9a91fe2b6775846b7aeac19f66cfee552c8196834cbdd206e3dbc5815631",
+      "bytes": 693
+    },
+    "campaign/ch32-pm/capture.SVDat": {
+      "sha256": "8ed57cc9af69c2c2bccfafac44db29558be9e6b6a1c3b90715d1a97c89a93f66",
+      "bytes": 4096
+    },
+    "campaign/ch32-pm-dec/events.txt": {
+      "sha256": "a2a16243b4239e3015e2610b887c3d1688f0ebfc20c8ce51d3aa5c95219a4957",
+      "bytes": 95256
+    },
+    "campaign/ch32-pm-dec/contexts.csv": {
+      "sha256": "b0e8a8d3936436ff9de1bfdc99e3594a078fdca29474f46f57ff3e10d6dda827",
+      "bytes": 630
+    },
+    "campaign/ch32-pm-dec/record.json": {
+      "sha256": "fd3ed8a5407621a203b92509a132b118b71501c92fb1cf3c3fe59f410e3ba92f",
+      "bytes": 632
+    },
+    "campaign/cut2.SVDat": {
+      "sha256": "8aed32c1dd55d87004b9d95ee0019e432d4e6c6696aec5acb895380a570895f1",
+      "bytes": 2264
+    },
+    "campaign/cut2-dec/events.txt": {
+      "sha256": "fd04a48a3b55959dfa0a838937e7b1e387fe9a3e21614f52e2d317f218a5d51c",
+      "bytes": 58301
+    },
+    "campaign/cut2-dec/contexts.csv": {
+      "sha256": "27088b02bd917870deab9ffe8396789e9029b70778d4517f17dc157bdfeb9241",
+      "bytes": 1589
+    },
+    "campaign/cut2-dec/record.json": {
+      "sha256": "71b3ac9731550032036e76aac8fb2b9d3dbee63dcc37da899342cdd7fb585c52",
+      "bytes": 641
+    },
+    "campaign/f407-pm/capture.SVDat": {
+      "sha256": "df407f1fa1e45d35690b5974d70962c78f50af10ab65f3b774df5cef55066f34",
+      "bytes": 65536
+    },
+    "campaign/f407-pm-dec/events.txt": {
+      "sha256": "e4dd5c1ad293c4bd184ac98369348bfd3237fc6fe8882e0dc71b4d2577a3c3e0",
+      "bytes": 1851385
+    },
+    "campaign/f407-pm-dec/contexts.csv": {
+      "sha256": "e913e4335ee605d2f615f4411370a7f5285a67c8644202adad244ea3447ace8d",
+      "bytes": 1594
+    },
+    "campaign/f407-pm-dec/record.json": {
+      "sha256": "d44575c83dcf7dd4affca27f7f25c8e37cd82c6b780837f505b41686e630098b",
+      "bytes": 617
+    },
+    "campaign/hw2/jl-ok/capture.SVDat": {
+      "sha256": "66cc0c945548650e95fcb4c299a40302a31e2458f632479dbd14671c3469e88c",
+      "bytes": 65536
+    },
+    "campaign/hw2/jl-ok-dec/events.txt": {
+      "sha256": "5a18b0f0d0b08f41799b4e57321ca3b6ad597e4cb22bb45c8268557c0a0f8782",
+      "bytes": 1559272
+    },
+    "campaign/hw2/jl-ok-dec/contexts.csv": {
+      "sha256": "e8d0ae4ad6423bd79e3d1acadc0ad53d637280bff7e697e40fed1d40cb1638f6",
+      "bytes": 1735
+    },
+    "campaign/hw2/jl-ok-dec/record.json": {
+      "sha256": "6dc9ed0a472fa318974ee3cc911968fc9d928aa83cce4035f1bff331f77a3a11",
+      "bytes": 633
+    },
+    "campaign/hw2/oc-ok/capture.SVDat": {
+      "sha256": "6c1a4d62066ca6fc02b11c50bb99d8fe58767964fe608aeca497e9430ecda93c",
+      "bytes": 65536
+    },
+    "campaign/hw2/oc-ok-dec/events.txt": {
+      "sha256": "bc2fb8967d8bcdb850713f4bccd30e5cd259474b41331273ab32da30c0a15463",
+      "bytes": 1701214
+    },
+    "campaign/hw2/oc-ok-dec/contexts.csv": {
+      "sha256": "f1d1045d7e878acc841d312291a8604b5c998fbc9fce029c77852234fa4abcdf",
+      "bytes": 1724
+    },
+    "campaign/hw2/oc-ok-dec/record.json": {
+      "sha256": "1470317a7343eeb4eaf0ce053359fde4462abb3dad8eddacbdd8ed3951004678",
+      "bytes": 633
+    },
+    "campaign/f407-live/recording.SVDat": {
+      "sha256": "6000344bb833f8170dea99af48d776976408fe59478bbd9a23039bdceb02ff98",
+      "bytes": 1263823
+    },
+    "campaign/f407-live/events.txt": {
+      "sha256": "34ce69797a75516e6f86506738eaa475d1a46403d903b9cc326978868fdfe788",
+      "bytes": 30475029
+    },
+    "campaign/f407-live/contexts.csv": {
+      "sha256": "d4e81a1b0aa9e9a8c290dfc21c258a24a9fb43fd6a024535c5e16f6996608201",
+      "bytes": 1971
+    },
+    "campaign/f407-live/record.json": {
+      "sha256": "7d2a48a9450953068f40fbfcc0d2bde30cc9d6df4eaae6cb86ec29e395d7a84a",
+      "bytes": 1445
+    },
+    "campaign/metro-live/recording.SVDat": {
+      "sha256": "6c3642e5ba72ae3a3f7045b7dc2954a1e9efc4a77fc6e208d4fc880f41e855e5",
+      "bytes": 524424
+    },
+    "campaign/metro-live/events.txt": {
+      "sha256": "76e244c4cab0b1790fcca5e1fcaf460e1c0978ba3f9ed5004ecef40bfc02fb1c",
+      "bytes": 13861129
+    },
+    "campaign/metro-live/contexts.csv": {
+      "sha256": "fdeaa0d2f1807703736a143b280474ec0e2574cd3d6a9b6be1b264b39388c025",
+      "bytes": 2028
+    },
+    "campaign/metro-live/record.json": {
+      "sha256": "e51b1603fdeafd656a91bf51fc69143dbe30e32c4edc56b719607f079866c09e",
+      "bytes": 1567
+    },
+    "campaign/f407-oocd.SVDat": {
+      "sha256": "92ec10c83a9d65c13f449935ebbcfbad8c993a8515b2b68649a846f296485f85",
+      "bytes": 1001473
+    },
+    "campaign/f407-oocd-dec/events.txt": {
+      "sha256": "ff8b930ba6768223738c5bad0ae06319189bad6baf75e480017b2c0805408139",
+      "bytes": 26764744
+    },
+    "campaign/f407-oocd-dec/contexts.csv": {
+      "sha256": "66aded2b3a76c3979ca396846477018ecd294334d75c732044309f1a15e7811c",
+      "bytes": 1765
+    },
+    "campaign/f407-oocd-dec/record.json": {
+      "sha256": "c5c30551e30f4d6bbc4d263211938e589c8bf7b2ed2fd2317fa935969505b932",
+      "bytes": 675
+    },
+    "campaign/pico-oocd.SVDat": {
+      "sha256": "3ace224a8c67b3193c1fac973f553c612be170fa48ab1662d30658a25ac4c861",
+      "bytes": 500889
+    },
+    "campaign/pico-oocd-dec/events.txt": {
+      "sha256": "b2f6447bd7a29c6d52f4ef07663471bdefa212a421ea3d675ed146dbc1753678",
+      "bytes": 18361155
+    },
+    "campaign/pico-oocd-dec/contexts.csv": {
+      "sha256": "700bc7c11f7dd596afe7391aa15048f0fb7bc6a5608d43b9322d53a19badf79b",
+      "bytes": 773
+    },
+    "campaign/pico-oocd-dec/record.json": {
+      "sha256": "46e50dd64b713078483b64ff7197e56c59e03c0d7982d8e528354df33b97ad52",
+      "bytes": 601
+    },
+    "campaign/h743-oocd.SVDat": {
+      "sha256": "f3c08f90ea5d43a6cf7a55ad6513f2bea96e923a9f825711f232ee2836eab00c",
+      "bytes": 2808358
+    },
+    "campaign/h743-oocd-dec/events.txt": {
+      "sha256": "30479beb2c171cdd6f1b75dd5a4ce2b0ce81944236a5953093aadee1ec7de49f",
+      "bytes": 68790205
+    },
+    "campaign/h743-oocd-dec/contexts.csv": {
+      "sha256": "58635083b1854d413e2906263905e5db6b396c13c014819db10d8105f81b8e44",
+      "bytes": 1970
+    },
+    "campaign/h743-oocd-dec/record.json": {
+      "sha256": "7144fa1b4983f97cf337f868179e706916c07e2aee7603b1740506b07845ca22",
+      "bytes": 714
+    },
+    "campaign/ch32-pm/dump.json": {
+      "sha256": "16d8dca0926eea9aa7aed37d578357c9f758b35829036313974c78a64fa2c6f4",
+      "bytes": 999
+    },
+    "campaign/f407-live/report.json": {
+      "sha256": "7396cd1f623ed4baae54ba391cdcee8e3b5b520c52c938db6651279089e51f46",
+      "bytes": 2866
+    },
+    "campaign/f407-live.json": {
+      "sha256": "3f2ebec4fc3849dd2178fc99ecef4a41cf3edd61aee51c2feeb42c2b59dfa2fc",
+      "bytes": 880
+    },
+    "campaign/f407-pm/dump.json": {
+      "sha256": "1ce579ed8410c3d9397ce9763cbf91a01b05b0350343e0f32b4aef14d41a97b1",
+      "bytes": 924
+    },
+    "campaign/f407-pm-dec2/contexts.csv": {
+      "sha256": "e913e4335ee605d2f615f4411370a7f5285a67c8644202adad244ea3447ace8d",
+      "bytes": 1594
+    },
+    "campaign/f407-pm-dec2/events.txt": {
+      "sha256": "e4dd5c1ad293c4bd184ac98369348bfd3237fc6fe8882e0dc71b4d2577a3c3e0",
+      "bytes": 1851385
+    },
+    "campaign/f407-pm-dec2/record.json": {
+      "sha256": "c8ff4c1ddcd0bcfa968603beaacb0495d503cb269c050c369f2193c227b0d696",
+      "bytes": 600
+    },
+    "campaign/hw2/jl-check1/capture.SVDat": {
+      "sha256": "d893e1974daade2e9350a876bf1f3126357bab971583584996b11e12796b97b4",
+      "bytes": 65536
+    },
+    "campaign/hw2/jl-check1/dump.json": {
+      "sha256": "8a457164b50889804f8c548182c061728100bd4ce0e7e23f96165b99493691bb",
+      "bytes": 722
+    },
+    "campaign/hw2/jl-check2/capture.SVDat": {
+      "sha256": "a763ce49981c86ac9f63c48fe701ead4948eb7ae4c8dc7a1fe2bae2c8c1d4d35",
+      "bytes": 65536
+    },
+    "campaign/hw2/jl-check2/dump.json": {
+      "sha256": "f7515d61b4472f3cf504cf4e90dbba52ebac9e11370629745c91d461cc65046c",
+      "bytes": 723
+    },
+    "campaign/hw2/jl-check3/capture.SVDat": {
+      "sha256": "1b11af2fd3493912dfb643317ba2bbd55cd3acd9fda172078d862463ac8ac5bf",
+      "bytes": 65536
+    },
+    "campaign/hw2/jl-check3/dump.json": {
+      "sha256": "b34b35b0e01c98d57dbcd8838617e2cd01e7a16f57e63cb536dea4c81f263904",
+      "bytes": 991
+    },
+    "campaign/hw2/jl-fail/dump.json": {
+      "sha256": "547a25cb2dc360ac4311d3e86e0ff929c27bb5cdeb1c76e652a161c2b14f9022",
+      "bytes": 286
+    },
+    "campaign/hw2/jl-ok/dump.json": {
+      "sha256": "e3f3bdbc526d21f12027582e33c83e7aece9292f82511595fa9697cb09808ad4",
+      "bytes": 724
+    },
+    "campaign/hw2/jl-term1/dump.json": {
+      "sha256": "01232d1558fb011f554f0f7eb04d00aebea75a006da4e01dc3fa58f1d5204508",
+      "bytes": 214
+    },
+    "campaign/hw2/jl-term2/dump.json": {
+      "sha256": "e843f0fd5fc381955bacfff22b39cf68ecf3971c031ce972a1b1f8bd899c1f7a",
+      "bytes": 214
+    },
+    "campaign/hw2/oc-check1/capture.SVDat": {
+      "sha256": "39e53ce790f1f9c823042c746a4ff4d7659ee10428165698c595766b2eb3f6f7",
+      "bytes": 65536
+    },
+    "campaign/hw2/oc-check1/dump.json": {
+      "sha256": "f6654b4955b6fbf8fe64065cdaa371184e84fd69bc7eb2cf83911fd634340590",
+      "bytes": 785
+    },
+    "campaign/hw2/oc-check2/dump.json": {
+      "sha256": "b8a54a9aba900ec701f6015b9f8e72e2117d338618bac23f1a5a6b1e37a3276c",
+      "bytes": 548
+    },
+    "campaign/hw2/oc-check3/capture.SVDat": {
+      "sha256": "e2120a81ecf6a546ddbe85dc2a6ed66ece53705eeb0535a6b8f3251fb4b47e35",
+      "bytes": 65536
+    },
+    "campaign/hw2/oc-check3/dump.json": {
+      "sha256": "19d489655f12d6f0cd24e4336129e8b57b35812928d3974da4a471fd0a59d2b8",
+      "bytes": 786
+    },
+    "campaign/hw2/oc-fail/dump.json": {
+      "sha256": "9071ef3d8d8d39cf3c24db061d133b9d69dfaf75c4ed03bd25d8c6411a6bbdd5",
+      "bytes": 304
+    },
+    "campaign/hw2/oc-ok/dump.json": {
+      "sha256": "8e195219f9fa08f13170001ce8586c527d33e4535eb25da3ee799a2ef3f92884",
+      "bytes": 787
+    },
+    "campaign/hw2/oc-term1/dump.json": {
+      "sha256": "85942b1c3ff24f79843f2d24929b5dfc586c12b5c974a78d6c16a000a331e369",
+      "bytes": 275
+    },
+    "campaign/hw2/oc-term2/capture.SVDat": {
+      "sha256": "4cbb892a50685f00fbfdc4ed2c3f2c88c38178ab2863f992576cb7c923199f9c",
+      "bytes": 65536
+    },
+    "campaign/hw2/oc-term2/dump.json": {
+      "sha256": "1cadb10504f39fbed7939d01607b02ddeae6feba3d2117bee0c93ad863009f13",
+      "bytes": 785
+    },
+    "campaign/recheck-dec/contexts.csv": {
+      "sha256": "e913e4335ee605d2f615f4411370a7f5285a67c8644202adad244ea3447ace8d",
+      "bytes": 1594
+    },
+    "campaign/recheck-dec/events.txt": {
+      "sha256": "e4dd5c1ad293c4bd184ac98369348bfd3237fc6fe8882e0dc71b4d2577a3c3e0",
+      "bytes": 1851385
+    },
+    "campaign/recheck-dec/record.json": {
+      "sha256": "47bc8ffba8f1378b28ebdbdb156ee5893cd41489b0100d2d93eeae74a75c5624",
+      "bytes": 629
+    },
+    "campaign/recheck.json": {
+      "sha256": "587ee7abb6d70a043bd1517cb6288bee64099a68ab1a4246bc87fd1ded278ad6",
+      "bytes": 584
+    },
+    "tusb-pr/raspberry_pi_pico-1/sysview-raspberry_pi_pico.json": {
+      "sha256": "81523f5c7a6679d8a9606321567150d77dc17481ab7d8b4b80f0beb006bcc532",
+      "bytes": 1404
+    },
+    "tusb-pr/stm32f407disco-1/sysview-stm32f407disco.json": {
+      "sha256": "720a7c619677063e0b53c4c54d2431d1166416b1dba5ee04793d554ab9481178",
+      "bytes": 1514
+    },
+    "campaign/max32666-run1/max32666fthr-capture.SVDat": {
+      "sha256": "8f8948a12c67f10946d54bda0cde8ce5da5d1e5aa23b50dcb1c1772cc558ee1c",
+      "bytes": 101376
+    },
+    "campaign/max32666-run1/max32666fthr-decoded/contexts.csv": {
+      "sha256": "746164dd3ce58dbd133a6ce5fcabe9ea3665acf7d853444012eaec66f48b1120",
+      "bytes": 2012
+    },
+    "campaign/max32666-run1/max32666fthr-decoded/events.txt": {
+      "sha256": "336a781882d2858298499ebb6c8a40a67a622bd85d66fa95a3e3d796735b2de1",
+      "bytes": 2627903
+    },
+    "campaign/max32666-run1/max32666fthr-decoded/record.json": {
+      "sha256": "c06a1f4e1ee23765631c43f5c70d9af8e5b8e0fd4e09c9c51bfb77f416449e85",
+      "bytes": 776
+    },
+    "campaign/max32666-run1/max32666fthr-decoded/systemview.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    }
+  },
+  "captures": [
+    {
+      "name": "f407-baremetal",
+      "raw": "tusb-pr/stm32f407disco-1/stm32f407disco-capture.SVDat",
+      "gui": "tusb-pr/stm32f407disco-1/stm32f407disco-decoded",
+      "categories": [
+        "baremetal",
+        "clean"
+      ]
+    },
+    {
+      "name": "pico-baremetal",
+      "raw": "tusb-pr/raspberry_pi_pico-1/raspberry_pi_pico-capture.SVDat",
+      "gui": "tusb-pr/raspberry_pi_pico-1/raspberry_pi_pico-decoded",
+      "categories": [
+        "baremetal",
+        "clean"
+      ]
+    },
+    {
+      "name": "ch32-wrapped",
+      "raw": "campaign/ch32-pm/capture.SVDat",
+      "gui": "campaign/ch32-pm-dec",
+      "categories": [
+        "wrapped"
+      ]
+    },
+    {
+      "name": "cut2",
+      "raw": "campaign/cut2.SVDat",
+      "gui": "campaign/cut2-dec",
+      "categories": [
+        "truncated"
+      ]
+    },
+    {
+      "name": "f407-wrapped",
+      "raw": "campaign/f407-pm/capture.SVDat",
+      "gui": "campaign/f407-pm-dec",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "jl-wrapped",
+      "raw": "campaign/hw2/jl-ok/capture.SVDat",
+      "gui": "campaign/hw2/jl-ok-dec",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "oc-wrapped",
+      "raw": "campaign/hw2/oc-ok/capture.SVDat",
+      "gui": "campaign/hw2/oc-ok-dec",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "f407-live",
+      "raw": "campaign/f407-live/recording.SVDat",
+      "gui": "campaign/f407-live",
+      "categories": [
+        "overflow",
+        "freertos"
+      ]
+    },
+    {
+      "name": "metro-live",
+      "raw": "campaign/metro-live/recording.SVDat",
+      "gui": "campaign/metro-live",
+      "categories": [
+        "overflow",
+        "freertos"
+      ]
+    },
+    {
+      "name": "f407-oocd",
+      "raw": "campaign/f407-oocd.SVDat",
+      "gui": "campaign/f407-oocd-dec",
+      "categories": [
+        "overflow",
+        "freertos"
+      ]
+    },
+    {
+      "name": "pico-oocd",
+      "raw": "campaign/pico-oocd.SVDat",
+      "gui": "campaign/pico-oocd-dec",
+      "categories": [
+        "baremetal",
+        "clean"
+      ]
+    },
+    {
+      "name": "h743-oocd",
+      "raw": "campaign/h743-oocd.SVDat",
+      "gui": "campaign/h743-oocd-dec",
+      "categories": [
+        "overflow",
+        "freertos",
+        "timer-wrap"
+      ]
+    },
+    {
+      "name": "f407-wrapped-repeat",
+      "raw": "campaign/f407-pm/capture.SVDat",
+      "gui": "campaign/f407-pm-dec2",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "f407-wrapped-recheck",
+      "raw": "campaign/f407-pm/capture.SVDat",
+      "gui": "campaign/recheck-dec",
+      "categories": [
+        "wrapped",
+        "freertos"
+      ]
+    },
+    {
+      "name": "max32666-corrupt",
+      "raw": "campaign/max32666-run1/max32666fthr-capture.SVDat",
+      "gui": "campaign/max32666-run1/max32666fthr-decoded",
+      "categories": [
+        "corrupt-content",
+        "baremetal"
+      ],
+      "mode": "robustness"
+    }
+  ],
+  "unpaired": [
+    "campaign/hw2/jl-check1/capture.SVDat",
+    "campaign/hw2/jl-check2/capture.SVDat",
+    "campaign/hw2/jl-check3/capture.SVDat",
+    "campaign/hw2/oc-check1/capture.SVDat",
+    "campaign/hw2/oc-check3/capture.SVDat",
+    "campaign/hw2/oc-term2/capture.SVDat"
+  ]
+}

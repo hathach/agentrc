@@ -21,6 +21,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sysview_decode import MALFORMED, TIMING_LOST  # noqa: E402
+
 # SystemView's text forms in its event export (SystemView 4.10b, Linux)
 TIME_RE = re.compile(r'([\d. ]+)\s*(s|ms|us)$')
 RUNS_RE = re.compile(r'Runs for (\S+) (us|ms)')
@@ -114,7 +117,7 @@ SCHEDULER = 'Scheduler'
 def read_csv(path, columns, what):
     """The rows of a SystemView export with every column it needs; Usage for anything else."""
     try:
-        with open(path, newline='', errors='replace') as f:
+        with open(path, encoding='utf-8', newline='', errors='replace') as f:
             reader = csv.DictReader(f)
             fields = set(reader.fieldnames or ())
             rows = list(reader)
@@ -162,8 +165,7 @@ def timestamp(row):
 
 def time_base(rows, warnings):
     """Timestamp frequency in Hz, or None when the export gives no usable one."""
-    init = next((r for r in rows if r['event'] == 'Init'), None)
-    m = FREQ_RE.search(init['detail']) if init else None
+    m = next((m for r in rows if r['event'] == 'Init' for m in [FREQ_RE.search(r['detail'])] if m), None)
     if not m or not int(m.group(1)):
         warnings.append('no Init record with the timestamp frequency: time-derived metrics withheld')
         return None
@@ -208,10 +210,10 @@ class Scan:
             event, detail, ctx, ts = row['event'], row['detail'], row['context'], row['ts']
             # a switch whose return context was lost renders as "Returns to *** OVERFLOW ***" with no Overflow row of
             # its own: most of the loss in a heavily overflowing capture
-            lost = event == '*** Overflow ***' or '*** OVERFLOW ***' in detail
+            lost = event == '*** Overflow ***' or '*** OVERFLOW ***' in detail or TIMING_LOST in detail
             if lost:
                 self.overflow += 1
-                if not self.losses or self.losses[-1][1] is not None:
+                if ts is not None and (not self.losses or self.losses[-1][1] is not None):
                     self.losses.append([ts, None])
                 # a call open across the gap may have lost its return; SystemView would splice it to a later one
                 self.dropped_pairs += sum(map(len, open_calls.values()))
@@ -241,15 +243,20 @@ class Scan:
                 last = ts
             mark = MARK_RE.match(event)
             func = FUNC_RE.match(event)
-            if lost:
+            malformed = detail.startswith(MALFORMED)
+            if malformed:
+                self.dropped_pairs += sum(map(len, open_calls.values()))
+                open_calls.clear()
+                self.mark_open = False
+            if lost or malformed:
                 pass
             elif event == 'ISR Enter':
                 m = RUNS_RE.search(detail)
-                if m:
+                if m and ts is not None:
                     self.isr.setdefault(ctx, []).append(matched_seconds(m))
             elif event == 'Task Ready':
                 m = READY_RE.search(detail)
-                if m:
+                if m and ts is not None:
                     self.ready.setdefault(detail.split(',')[0], []).append(matched_seconds(m))
             elif event == 'Stack Info':
                 m = STACK_RE.match(detail)
@@ -269,10 +276,10 @@ class Scan:
                 else:
                     call_ts = open_calls[key].pop()
                     m = RETURNS_RE.search(detail)
-                    if m:
-                        self.funcs.setdefault(fid, []).append(matched_seconds(m))
-                    elif call_ts is None or ts is None:
+                    if call_ts is None or ts is None:
                         self.dropped_pairs += 1
+                    elif m:
+                        self.funcs.setdefault(fid, []).append(matched_seconds(m))
                     else:
                         self.funcs.setdefault(fid, []).append((call_ts, ts))
                 if workload_event == fid and ts is not None:
@@ -281,7 +288,7 @@ class Scan:
                 mid = int(mark.group(2), 16)
                 if mark.group(1) == 'Stop':
                     m = RAN_RE.search(detail)
-                    if m:
+                    if m and ts is not None:
                         self.markers.setdefault(mid, []).append(matched_seconds(m))
                 if mid == workload_marker and ts is not None:
                     if mark.group(1) == 'Start':
@@ -371,18 +378,32 @@ def report(args):
         rows = read_csv(ev_path, EVENT_COLUMNS, 'events')
         for r in rows:
             r['ts'] = timestamp(r)
-        freq = time_base(rows, warnings)
-        head = timed_from(rows) if freq else 0
+        timed = next((i for i, r in enumerate(rows) if r['ts'] is None), len(rows))
+        losses = [r for r in rows if TIMING_LOST in r['detail']]
+        # Native exports scope contexts.csv to this marked prefix; unreadable GUI rows establish no such scope.
+        native_prefix = (timed < len(rows) and TIMING_LOST in rows[timed]['detail']
+                         and all(not r['timestampint'].strip() for r in rows[timed:]))
+        if native_prefix:
+            warnings.append(f'native timing lost at event {timed}: time-derived metrics cover '
+                            f'the first {timed} events; {len(losses)} timing loss boundary(s)')
+        malformed = sum(r['detail'].startswith(MALFORMED) for r in rows)
+        if malformed:
+            warnings.append(f'{malformed} malformed payload(s): dependent call, marker and heap spans withheld')
+        for r in rows[timed:]:
+            r['ts'] = None
+        freq = time_base(rows[:timed] if native_prefix else rows, warnings)
+        head = timed_from(rows[:timed]) if freq else 0
         if head and not args.post_mortem:
             warnings.append(f'the first {head} events share the first timestamp with more than one context switch: '
                             f'if this is a decoded post-mortem ring they are untimed, pass --post-mortem')
             head = 0
         elif head:
             warnings.append(f'the first {head} events share one timestamp and are left out as untimed: '
-                            f'event and time metrics cover the {len(rows) - head} timed events after them; '
+                            f'event and time metrics cover the {timed - head} timed events after them; '
                             f'contexts.csv times withheld')
             rows = rows[head:]
-            if len(rows) < 2 or rows[-1]['ts'] <= rows[0]['ts']:
+            timed -= head
+            if timed < 2 or rows[timed - 1]['ts'] <= rows[0]['ts']:
                 warnings.append('the timed events span nothing: time-derived metrics withheld')
                 freq = None
         scan = Scan(rows, args.workload_marker, args.workload_event, unknown_start=bool(head))
@@ -391,7 +412,8 @@ def report(args):
             net, allocs, frees = map(int, scan.heap.groups())
             heap = {'allocs': allocs, 'frees': frees, 'net_bytes': net}
         result.update(stack=[{'name': k, 'bytes_used': v} for k, v in scan.stack.items()], heap=heap,
-                      overflow=scan.overflow, dropped_pairs=scan.dropped_pairs)
+                      overflow=scan.overflow,
+                      dropped_pairs=scan.dropped_pairs)
     if freq is None or head:
         for c in result['contexts']:
             c.update(dict.fromkeys(CONTEXT_TIMES))

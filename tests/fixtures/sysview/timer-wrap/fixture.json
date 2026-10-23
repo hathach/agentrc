@@ -1,0 +1,21 @@
+{
+  "name": "timer-wrap",
+  "source": "campaign/h743-oocd.SVDat",
+  "start": 0,
+  "end": 1634504,
+  "raw_sha256": "d04c3b5696c9451d041a9609b3f7b96c3ab7bae1479e53d04d90b935dcecece3",
+  "event_count": 218411,
+  "gui": "SystemView 4.10b, ci.lan, 2026-10-23; wrapped reuses the verified 2026-10-22 export",
+  "gui_events_sha256": "68476e8e2009f175fd39df644fa71fa4e8437d48537374c10bbbb2743cff1972",
+  "wrap_evidence": {
+    "first_wrap_row": 218401,
+    "first_wrap_offset": 1634449,
+    "first_wrap_timestamp": 4295596724,
+    "minimal_contiguous_prefix_bytes": 1634452,
+    "minimal_prefix_gzip_bytes": 357416,
+    "init_rows": [
+      1
+    ],
+    "reason": "The only Init is at byte 12. The decoder starts relative time at zero, so a contiguous slice retaining Init and crossing 2^32 must retain every preceding delta. The minimal prefix is only 16 gzip bytes smaller than this fixture; deleting the middle would falsify the timer history."
+  }
+}

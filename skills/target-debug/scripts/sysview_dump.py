@@ -42,7 +42,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_state as ps  # noqa: E402
-from probe_state import ToolError  # noqa: E402
+from probe_state import STOP_SIGNALS, ToolError  # noqa: E402
 
 RTT_MAGIC = b'SEGGER RTT'
 AUP = 0x18          # SEGGER_RTT_CB: char acID[16]; int MaxNumUpBuffers; int MaxNumDownBuffers; aUp[]
@@ -51,7 +51,6 @@ MAX_RING = 1 << 20
 NAME = b'SysView'   # SEGGER_SYSVIEW_Init_Ex's label for its channel
 S_HALT = 1 << 17
 S1_READS = [ps.DHCSR, ps.CPUID, ps.DHCSR]    # DHCSR, CPUID, h, DHCSR: CPUID tells the two DHCSR reads apart
-STOP_SIGNALS = tuple(filter(None, (getattr(signal, n, None) for n in ('SIGTERM', 'SIGHUP'))))
 
 
 def header_len(channel):

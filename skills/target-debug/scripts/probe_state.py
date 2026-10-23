@@ -36,7 +36,7 @@ PC and resumes. It is OpenOCD-only: J-Link Commander cannot branch, so it could 
 core it finds halted untouched, and the flag is refused for a J-Link board. A multi-core
 target is refused before that session, since an SMP halt stops every core. A core found
 halted when that session starts is reported and not touched. A session that fails, times
-out or is stopped by SIGINT or SIGTERM after its guards passed is followed by one that
+out or is stopped by SIGINT, SIGTERM or SIGHUP after its guards passed is followed by one that
 polls the core and resumes it when it was left halted, unless its tool still ran KILL_WAIT s
 after its kill (D state): no session follows that one, and the core's state is unknown.
 
@@ -452,8 +452,12 @@ def tool(env, posix, nt_name=None):
     return exe
 
 
+STOP_SIGNALS = tuple(s for s in (getattr(signal, n, None) for n in ('SIGTERM', 'SIGHUP')) if s is not None)
 _running = []    # [the tool once its wait begins, a signal stop_running() took before that] of each run()
 KILL_WAIT = 10    # s a killed tool has to exit, taskkill included; one in D state on a wedged USB host outlives SIGKILL
+# s of KILL_WAIT a POSIX tool gets to exit on SIGTERM before SIGKILL: an openocd SIGKILLed on a J-Link never
+# unregisters from the probe, which refuses new connections once the leaked registrations add up (agentrc#286)
+TERM_GRACE = 3
 
 
 def ansi_codec():
@@ -495,6 +499,26 @@ def stop_running(signum):
             raise Cancelled(f'interrupted by signal {signum}')
 
 
+@contextlib.contextmanager
+def stop_signals_cancel():
+    """While the block runs, SIGTERM and SIGHUP cancel the run() in progress (stop_running) instead of ending this
+    process, which would leave its tool running, still holding the probe; one that arrived outside a run() is
+    raised as Cancelled when the block ends. The handlers in place before are restored."""
+    got = []
+
+    def on_signal(signum, _frame):
+        got.append(signum)
+        stop_running(signum)
+    previous = {sig: signal.signal(sig, on_signal) for sig in STOP_SIGNALS}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if got:
+        raise Cancelled(f'interrupted by signal {got[0]}')
+
+
 class Feeder:
     """The tool's stdin written from a thread (communicate() on Windows writes it outside its timeout). A writer
     blocked on a tool that reads nothing holds the pipe's lock, and close() would wait for it: release() closes the
@@ -532,8 +556,9 @@ class Feeder:
 def run(cmd, timeout, stdin=None):
     """The tool's stdout and stderr as one text. Its output goes to a file, so a session that times out
     or is interrupted (any exception, a signal handler's included) still carries what it printed, as
-    the exception's .text; the tool is killed then, with its tree. A tool still running KILL_WAIT s
-    after its kill began fails the session naming its pid (Unreaped). The timeout covers feeding stdin too."""
+    the exception's .text; the tool is killed then, with its tree, on POSIX after TERM_GRACE s of a SIGTERM.
+    A tool still running KILL_WAIT s after its kill began fails the session naming its pid (Unreaped). The
+    timeout covers feeding stdin too."""
     with tempfile.TemporaryFile() as out:
         entry = [None, None]
         _running.append(entry)
@@ -543,7 +568,7 @@ def run(cmd, timeout, stdin=None):
         except BaseException:
             _running.remove(entry)
             raise
-        caught, feeder, unreaped = None, None, False
+        caught, feeder, unreaped, termed = None, None, False, False
         try:
             if os.name == 'nt' and stdin is not None:
                 feeder = Feeder(proc.stdin, stdin.encode())    # before start(), which any exception can interrupt
@@ -558,7 +583,7 @@ def run(cmd, timeout, stdin=None):
                 proc.communicate(None if stdin is None else stdin.encode(), timeout=timeout)
         except BaseException as e:
             caught = e
-        deadline = None    # set in the loop: a call out here could run a handler outside every try
+        deadline = term_deadline = None    # set in the loop: a call out here could run a handler outside every try
         while True:
             # a signal handler's exception during this cleanup is kept and the cleanup retried, so the tool
             # is always killed and its output never lost; the retries share one KILL_WAIT
@@ -567,6 +592,14 @@ def run(cmd, timeout, stdin=None):
                     _running.remove(entry)
                 if deadline is None:
                     deadline = time.monotonic() + KILL_WAIT
+                if os.name != 'nt' and not termed and proc.poll() is None:
+                    if term_deadline is None:
+                        term_deadline = min(deadline, time.monotonic() + TERM_GRACE)
+                    proc.terminate()    # resent on a retry when a handler raised before it was delivered
+                    termed = True
+                if term_deadline is not None:
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        proc.wait(max(0, term_deadline - time.monotonic()))
                 if not unreaped and proc.poll() is None:
                     unreaped = windows.kill_tree(proc, max(0, deadline - time.monotonic()), total=True) is None
                 if feeder:
@@ -872,7 +905,7 @@ class OpenOCD:
                             f'every core')
         if timeout is None:
             timeout = n * (halt_timeout_ms + interval_ms + 100) / 1000 + 20
-        signals, stopping = [], True
+        signals, stopping, named = [], True, False
 
         def on_signal(signum, _frame):
             # the halting session's run() is cancelled, kills its tool and fails with its output, which decides
@@ -881,46 +914,57 @@ class OpenOCD:
             if stopping:
                 stop_running(signum)
 
-        previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, signal.SIGTERM)}
+        previous = {sig: signal.signal(sig, on_signal) for sig in (signal.SIGINT, *STOP_SIGNALS)}
         try:
-            failure, text = None, ''
             try:
-                text, reads = self.batch(self.halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
-                pcs = [int(v, 16) for v in re.findall(r'^H 0x([0-9a-f]{8})$', text, re.M)]
-                dhcsr = [v for name, v in reads if name == 'DHCSR']
-                if len(pcs) != n or len(dhcsr) != 2:
-                    raise ToolError(f'{len(pcs)}/{n} halt reads; last output:\n{tail(text)}')
-            except ToolError as e:
-                failure, text = e, getattr(e, 'text', text)
-            stopping = False
-            if failure is None and not signals:
-                return pcs, dhcsr[0], dhcsr[1]
-            what = str(failure)
-            if signals:
-                what = f'interrupted by signal {signals[0]}'
-                if failure is not None and not isinstance(failure, Cancelled):
-                    what += f'; {failure}'
-            if isinstance(failure, Unreaped):
-                stuck = Unreaped(f'halting fallback: {what}; {UNREAPED_NOTE}')
-                stuck.text = text
-                raise stuck from failure
-            refused = re.search(r'^ERROR refused (halted|multicore): ', text, re.M)
-            first = next((int(v, 16) for name, v in _OCD_READ_RE.findall(text) if name == 'DHCSR'), None)
-            if refused and refused.group(1) == 'halted' and first is not None and not signals:
-                raise HaltRefused(f'halting fallback: {failure}', first) from failure
-            if failure is None:
-                after = ''    # the loop finished, resume included, before the signal could stop it
-            elif re.search(r'^GUARDED$', text, re.M):
-                after = self.recover(30)
-            elif refused:
-                after = ''
-            else:
-                after = ('; it stopped before its guards passed, so it halted nothing: check the core with '
-                         'probe_state.py')
-            raise ToolError(f'halting fallback: {what}{after}') from failure
-        finally:
-            for sig, handler in previous.items():
-                signal.signal(sig, handler)
+                failure, text = None, ''
+                try:
+                    text, reads = self.batch(self.halt_tcl(n, halt_timeout_ms, interval_ms), timeout)
+                    pcs = [int(v, 16) for v in re.findall(r'^H 0x([0-9a-f]{8})$', text, re.M)]
+                    dhcsr = [v for name, v in reads if name == 'DHCSR']
+                    if len(pcs) != n or len(dhcsr) != 2:
+                        raise ToolError(f'{len(pcs)}/{n} halt reads; last output:\n{tail(text)}')
+                except ToolError as e:
+                    failure, text = e, getattr(e, 'text', text)
+                stopping = False
+                if failure is not None or signals:
+                    what = str(failure)
+                    if signals:
+                        named, what = True, f'interrupted by signal {signals[0]}'
+                        if failure is not None and not isinstance(failure, Cancelled):
+                            what += f'; {failure}'
+                    if isinstance(failure, Unreaped):
+                        stuck = Unreaped(f'halting fallback: {what}; {UNREAPED_NOTE}')
+                        stuck.text = text
+                        raise stuck from failure
+                    refused = re.search(r'^ERROR refused (halted|multicore): ', text, re.M)
+                    first = next((int(v, 16) for name, v in _OCD_READ_RE.findall(text) if name == 'DHCSR'), None)
+                    if refused and refused.group(1) == 'halted' and first is not None and not signals:
+                        raise HaltRefused(f'halting fallback: {failure}', first) from failure
+                    if failure is None:
+                        after = ''    # the loop finished, resume included, before the signal could stop it
+                    elif re.search(r'^GUARDED$', text, re.M):
+                        after = self.recover(30)
+                    elif refused:
+                        after = ''
+                    else:
+                        after = ('; it stopped before its guards passed, so it halted nothing: check the core with '
+                                 'probe_state.py')
+                    raise ToolError(f'halting fallback: {what}{after}') from failure
+            finally:
+                for sig, handler in reversed(previous.items()):    # SIGINT last: one mid-restore is recorded
+                    signal.signal(sig, handler)
+        except ToolError as e:
+            if not signals or named:
+                raise
+            # landed while the handlers were restored: report it, keeping an Unreaped tool's warning
+            late = (Unreaped if isinstance(e, Unreaped) else ToolError)(
+                f'halting fallback: interrupted by signal {signals[0]}; {str(e).removeprefix("halting fallback: ")}')
+            late.text = getattr(e, 'text', '')
+            raise late from e
+        if signals:    # landed while the handlers were restored; the loop had resumed the core
+            raise ToolError(f'halting fallback: interrupted by signal {signals[0]}')
+        return pcs, dhcsr[0], dhcsr[1]
 
 
 def resolve(a, p):
@@ -1102,7 +1146,8 @@ def main(argv=None):
         try:
             cap = Capture(a.samples, a.interval_ms, a.budget, dumps)
             t0 = time.monotonic()
-            vals = cap.unpack(backend.observe(cap, timeout))
+            with stop_signals_cancel():
+                vals = cap.unpack(backend.observe(cap, timeout))
             result['sessionMs'] = round((time.monotonic() - t0) * 1000)
             readback = []
             for path, _, _ in dumps[:len(segments) + len(reads)]:

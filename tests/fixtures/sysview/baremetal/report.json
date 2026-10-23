@@ -1,0 +1,60 @@
+{
+  "contexts": [
+    {
+      "name": "ISR 83",
+      "activations": 27,
+      "cpu_pct": 0.05,
+      "total_ms": 0.182,
+      "blocked_ms": null,
+      "min_us": 4.6,
+      "avg_us": 6.7,
+      "max_us": 13.6
+    }
+  ],
+  "isr": [
+    {
+      "name": "ISR 83",
+      "n": 27,
+      "p50_us": 6.7,
+      "p99_us": 13.6,
+      "max_us": 13.6
+    }
+  ],
+  "ready_run": [],
+  "functions": [
+    {
+      "id": 512,
+      "name": "#512",
+      "n": 16,
+      "p50_us": 6.7,
+      "p99_us": 17.2,
+      "max_us": 17.2
+    },
+    {
+      "id": 513,
+      "name": "#513",
+      "n": 6,
+      "p50_us": 7.9,
+      "p99_us": 10.0,
+      "max_us": 10.0
+    },
+    {
+      "id": 514,
+      "name": "#514",
+      "n": 7,
+      "p50_us": 5.7,
+      "p99_us": 6.5,
+      "max_us": 6.5
+    }
+  ],
+  "markers": [],
+  "stack": [],
+  "heap": null,
+  "overflow": 0,
+  "dropped_pairs": 2,
+  "live_window_s": 0.386219,
+  "workload_window_s": null,
+  "workload_anchor": null,
+  "contexts_workload": null,
+  "warnings": []
+}
