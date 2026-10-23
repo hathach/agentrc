@@ -170,7 +170,8 @@ def main(argv=None):
     timeout = a.timeout if a.timeout is not None else a.samples * (a.interval_ms + 50) / 1000 + 20
     halted_pcs, halted_dhcsr, fallback_error = [], [], None
     try:
-        pcs, dhcsr, others = sample(backend, a.samples, a.interval_ms, timeout)
+        with probe_state.stop_signals_cancel():
+            pcs, dhcsr, others = sample(backend, a.samples, a.interval_ms, timeout)
         if a.raw:
             with open(a.raw, 'w', newline='\n') as f:
                 f.writelines(f'{pc:08x}\n' for pc in pcs)

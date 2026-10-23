@@ -764,6 +764,9 @@ class ProbeStateUnitTest(unittest.TestCase):
         class Unreaped(real):
             killed = False
 
+            def terminate(self):
+                pass    # a tool in D state does not act on SIGTERM either
+
             def kill(self):
                 self.killed = True
                 super().kill()
@@ -809,7 +812,8 @@ class ProbeStateUnitTest(unittest.TestCase):
             caller.join(20)
         self.assertFalse(caller.is_alive(), 'run() never returned')
         self.assertEqual(len(waits), 1)
-        self.assertTrue(9 < waits[0] <= 10, waits)
+        grace = 0 if os.name == 'nt' else probe_state.TERM_GRACE    # Windows has no SIGTERM step
+        self.assertTrue(probe_state.KILL_WAIT - grace - 1 < waits[0] <= probe_state.KILL_WAIT - grace, waits)
         self.assertIsInstance(errors[0], probe_state.Unreaped)
         self.assertEqual(str(errors[0]), f'{os.path.basename(sys.executable)} pid {procs[0].pid} still ran 10 s after '
                                          f'its kill began (D state?): see usb-kernel-recover')
@@ -842,8 +846,100 @@ class ProbeStateUnitTest(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 5)
         self.assertEqual(str(cm.exception), f'interrupted by signal {int(signal.SIGTERM)}')
         self.assertIn('GUARDED', cm.exception.text)
+        kill_tree.assert_not_called()    # it ended on SIGTERM, so it ran its own shutdown
+        self.assertEqual(probe_state._running, [])
+
+    TERM_IGNORING_TOOL = [sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+                                                'print("GUARDED", flush=True); time.sleep(30)']
+
+    @unittest.skipIf(os.name == 'nt', 'SIGTERM first is POSIX only')
+    def test_a_tool_that_ignores_sigterm_is_killed_after_the_grace(self):
+        start = time.monotonic()
+        with mock.patch.object(probe_state, 'TERM_GRACE', 0.5), \
+                mock.patch.object(probe_state.windows, 'kill_tree', wraps=probe_state.windows.kill_tree) as kill_tree:
+            with self.assertRaisesRegex(probe_state.ToolError, 'did not finish within 0 s') as cm:
+                probe_state.run(self.TERM_IGNORING_TOOL, 0.3)
+        took = time.monotonic() - start
+        self.assertTrue(0.75 < took < 3, took)
+        kill_tree.assert_called_once()
+        proc, budget = kill_tree.call_args.args
+        self.assertTrue(probe_state.KILL_WAIT - 0.5 - 0.5 < budget <= probe_state.KILL_WAIT - 0.5, budget)
+        self.assertIsNotNone(proc.poll())
+        self.assertIn('GUARDED', cm.exception.text)
+
+    @unittest.skipIf(os.name == 'nt', 'SIGTERM first is POSIX only')
+    def test_a_sigterm_interrupted_before_delivery_is_sent_on_the_retry(self):
+        class Stop(Exception):
+            pass
+        real = subprocess.Popen
+        procs, terms = [], []
+
+        class Interrupted(real):
+            def terminate(self):
+                terms.append(time.monotonic())
+                if len(terms) == 1:
+                    raise Stop()    # a raising handler that lands as terminate() starts, before the signal is sent
+                super().terminate()
+
+        def popen(*args, **kwargs):
+            procs.append(Interrupted(*args, **kwargs))
+            self.addCleanup(real.wait, procs[-1], 10)
+            return procs[-1]
+        with mock.patch.object(probe_state.subprocess, 'Popen', popen), \
+                mock.patch.object(probe_state.windows, 'kill_tree', wraps=probe_state.windows.kill_tree) as kill_tree:
+            with self.assertRaises(Stop) as cm:
+                probe_state.run(self.GUARDED_TOOL, 0.3)
+        self.assertIn('GUARDED', cm.exception.text)
+        self.assertEqual(len(terms), 2)
+        kill_tree.assert_not_called()
+        self.assertEqual(procs[0].returncode, -signal.SIGTERM)
+
+    @unittest.skipIf(os.name == 'nt', 'os.kill would terminate the process on Windows')
+    def test_stop_signals_cancel_the_session_and_restore_the_handlers(self):
+        before = signal.getsignal(signal.SIGTERM)
+        timer = threading.Timer(0.5, os.kill, (os.getpid(), signal.SIGTERM))
+        self.addCleanup(timer.cancel)
+        timer.start()
+        with mock.patch.object(probe_state.windows, 'kill_tree', wraps=probe_state.windows.kill_tree) as kill_tree:
+            with self.assertRaises(probe_state.Cancelled) as cm:
+                with probe_state.stop_signals_cancel():
+                    probe_state.run(self.GUARDED_TOOL, 20)
+        self.assertIn('GUARDED', cm.exception.text)
+        kill_tree.assert_not_called()    # the tool ended on its SIGTERM
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+        # a signal between sessions is raised when the block ends, not lost
+        with self.assertRaisesRegex(probe_state.Cancelled, f'signal {int(signal.SIGHUP)}'):
+            with probe_state.stop_signals_cancel():
+                os.kill(os.getpid(), signal.SIGHUP)
+                time.sleep(0.1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    @unittest.skipIf(os.name == 'nt', 'SIGTERM first is POSIX only')
+    def test_a_repeated_interrupt_during_the_grace_does_not_restart_it(self):
+        class Stop(Exception):
+            pass
+        stops = []
+
+        def on_signal(*_):
+            stops.append(time.monotonic())
+            raise Stop()
+        previous = signal.signal(signal.SIGUSR1, on_signal)
+        self.addCleanup(signal.signal, signal.SIGUSR1, previous)
+        timers = [threading.Timer(t, os.kill, (os.getpid(), signal.SIGUSR1)) for t in (0.3, 0.8, 1.3)]
+        for timer in timers:
+            self.addCleanup(timer.cancel)
+            timer.start()
+        start = time.monotonic()
+        with mock.patch.object(probe_state, 'TERM_GRACE', 1.5), \
+                mock.patch.object(probe_state.windows, 'kill_tree', wraps=probe_state.windows.kill_tree) as kill_tree:
+            with self.assertRaises(Stop) as cm:
+                probe_state.run(self.TERM_IGNORING_TOOL, 20)
+        took = time.monotonic() - start
+        self.assertEqual(len(stops), 3)
+        self.assertTrue(1.75 < took < 3, took)    # one grace from the first interrupt, not one per interrupt
         kill_tree.assert_called_once()
         self.assertIsNotNone(kill_tree.call_args.args[0].poll())
+        self.assertIn('GUARDED', cm.exception.text)
         self.assertEqual(probe_state._running, [])
 
     @unittest.skipIf(os.name == 'nt', 'os.kill would terminate the process on Windows')
@@ -879,9 +975,10 @@ class ProbeStateUnitTest(unittest.TestCase):
                 signal.raise_signal(signal.SIGTERM)    # the handler raises inside the cleanup's kill
             proc.kill()
             return proc.wait(5)
-        with mock.patch.object(probe_state.windows, 'kill_tree', kill_tree):
+        with mock.patch.object(probe_state.windows, 'kill_tree', kill_tree), \
+                mock.patch.object(probe_state, 'TERM_GRACE', 0.2):
             with self.assertRaises(Stop) as cm:
-                probe_state.run(self.GUARDED_TOOL, 1)
+                probe_state.run(self.TERM_IGNORING_TOOL, 1)
         self.assertEqual(len(budgets), 2, budgets)
         self.assertTrue(budgets[0] <= probe_state.KILL_WAIT, budgets)
         self.assertLess(budgets[1], budgets[0] - 0.25)
@@ -1352,13 +1449,15 @@ class PcSampleOpenOCDTest(FakeToolsCase):
             raise Stop()
         previous = signal.signal(signal.SIGTERM, on_signal)
         self.addCleanup(signal.signal, signal.SIGTERM, previous)
-        real_kill, procs = subprocess.Popen.kill, []
+        # the cleanup's first signal to the tool: SIGTERM on POSIX, the kill on Windows
+        first = 'kill' if os.name == 'nt' else 'terminate'
+        real_send, procs = getattr(subprocess.Popen, first), []
 
-        def kill(proc):
+        def send(proc):
             procs.append(proc)
-            signal.raise_signal(signal.SIGTERM)    # lands during the timeout's cleanup, before the kill
-            real_kill(proc)
-        with mock.patch.object(subprocess.Popen, 'kill', kill):
+            signal.raise_signal(signal.SIGTERM)    # lands during the timeout's cleanup, before the tool is signalled
+            real_send(proc)
+        with mock.patch.object(subprocess.Popen, first, send):
             with self.assertRaises(Stop) as cm:
                 probe_state.run([sys.executable, '-c', 'import time; print("GUARDED", flush=True); time.sleep(30)'],
                                 1)
