@@ -1380,6 +1380,7 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         self.assertIs(signal.getsignal(sig), previous)
         self.assertNotIsInstance(cm.exception, probe_state.HaltRefused)
         self.assertEqual(isinstance(cm.exception, probe_state.Unreaped), isinstance(raises, probe_state.Unreaped))
+        self.raised = cm.exception
         return str(cm.exception), recover.call_count
 
     STUCK = 'openocd pid 4242 still ran 10 s after its kill began (D state?): see usb-kernel-recover'
@@ -1454,7 +1455,57 @@ class PcSampleOpenOCDTest(FakeToolsCase):
         with mock.patch.object(signal, 'signal', restore):
             self.assertEqual(self.halt_with_signal(None, signalled=False),
                              ('halting fallback: interrupted by signal 15', 0))
-        self.assertEqual(raised, [signal.SIGINT])
+        self.assertEqual(raised, [probe_state.STOP_SIGNALS[-1]])    # restored in reverse, SIGINT last
+
+    def test_a_signal_while_the_handlers_are_restored_after_a_failure_is_reported(self):
+        # the failure's own recovery decision stands: the batch is over, so no session follows the signal
+        real_signal, raised = signal.signal, []
+
+        def restore(sig, handler):
+            if getattr(handler, '__name__', '') != 'on_signal' and not raised:
+                raised.append(sig)
+                signal.raise_signal(signal.SIGTERM)    # on_signal still holds SIGTERM
+            return real_signal(sig, handler)
+        refused = probe_state.ToolError('openocd exited 1')
+        refused.text = 'R DHCSR 0x01030003\nERROR refused halted: the core is halted now (DHCSR 0x01030003)\n'
+        early = probe_state.ToolError('openocd exited 1')
+        early.text = 'R DHCSR 0x01010001\n'
+        stuck = self.stuck('R DHCSR 0x01010001\nGUARDED\n')
+        for failure, end, cause in (
+                (refused, 'openocd exited 1', probe_state.HaltRefused),
+                (early, 'openocd exited 1; it stopped before its guards passed, so it halted nothing: check the core '
+                        'with probe_state.py', probe_state.ToolError),
+                (stuck, f'{self.STUCK}; {probe_state.UNREAPED_NOTE}', probe_state.Unreaped)):
+            with self.subTest(end=end):
+                raised.clear()
+                with mock.patch.object(signal, 'signal', restore):
+                    self.assertEqual(self.halt_with_signal(failure, signalled=False),
+                                     (f'halting fallback: interrupted by signal 15; {end}', 0))
+                self.assertIs(type(self.raised.__cause__), cause)
+                self.assertEqual(str(self.raised.__cause__), f'halting fallback: {end}')
+
+    def test_an_interrupt_while_the_handlers_are_restored_is_reported(self):
+        class Escaped(Exception):
+            pass
+
+        def guard(*_):
+            raise Escaped()
+        for sig in (signal.SIGINT, *probe_state.STOP_SIGNALS):
+            self.addCleanup(signal.signal, sig, signal.getsignal(sig))
+        signal.signal(signal.SIGINT, guard)
+        real_signal, raised = signal.signal, []
+
+        def restore(sig, handler):
+            result = real_signal(sig, handler)
+            if getattr(handler, '__name__', '') != 'on_signal' and not raised:
+                raised.append(sig)
+                signal.raise_signal(signal.SIGINT)    # right after the first restore: mid-restore if SIGINT came first
+            return result
+        before = {sig: signal.getsignal(sig) for sig in probe_state.STOP_SIGNALS}
+        with mock.patch.object(signal, 'signal', restore):
+            self.assertEqual(self.halt_with_signal(None, signalled=False, sig=signal.SIGINT),
+                             ('halting fallback: interrupted by signal 2', 0))
+        self.assertEqual({sig: signal.getsignal(sig) for sig in probe_state.STOP_SIGNALS}, before)
 
     def test_run_feeds_stdin_within_the_timeout(self):
         start = time.monotonic()
