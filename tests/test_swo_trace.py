@@ -631,9 +631,16 @@ class Capture(unittest.TestCase):
                 raise cap.ToolError('memU8: E31')
             return gate_open()
         t.gate_open = fail_after_restore
+        stall, tpiu_after = t.stall, []
+
+        def record_tpiu_after_restore(addr):
+            if (FakeRA.PRCR, 0xA500) in t.writes and cap.TPIU <= addr < cap.TPIU + 0x1000:
+                tpiu_after.append(addr)
+            stall(addr)
+        t.stall = record_tpiu_after_restore
         record, failures = self.run_capture(t, setup=self.setup('ra6m5'))
-        self.assertEqual((failures, record['errors'], record['restore'], t.stalled),
-                         (['after: TRCKCR: memU8: E31'], ['after: TRCKCR: memU8: E31'], 'complete', []))
+        self.assertEqual((failures, record['errors'], record['restore'], t.stalled, tpiu_after),
+                         (['after: TRCKCR: memU8: E31'], ['after: TRCKCR: memU8: E31'], 'complete', [], []))
         self.assertEqual((t.mem[FakeRA.TRCKCR], t.mem[FakeRA.PRCR]), (0x01, 0))
 
     def test_ra_without_its_setup_or_observing_is_refused_untouched(self):

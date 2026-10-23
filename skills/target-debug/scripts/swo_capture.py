@@ -1285,7 +1285,7 @@ def capture(a, b, out_dir):
         cap['after'] = snapshot(b, list(before))
         try:
             reachable = not b.gate or b.gate_open()   # the restore stops a trace clock the setup started
-        except (ToolError, OSError) as e:
+        except ToolError as e:
             reachable = False
             failures.append(f"after: {b.gate['name']}: {e}")
         cap['trace_unit_after'] = snapshot(b, (unit_regs if reachable else []) + setup_writes + setup_watch)
