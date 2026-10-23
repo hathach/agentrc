@@ -3,15 +3,31 @@
 Validated boards for `swo_capture.py` (`swo-dwt.md`). Read the row and its notes before capturing on a board; add both
 when a board is validated. A family's register requirements are its `--setup` entry in `scripts/swo_boards.json`,
 whose `ref` fields cite the documents; this file holds what was measured. Board names are TinyUSB BSP aliases. The
-firmware behind the stm32 rows is TinyUSB's `examples/device/board_test` built with `SWO_FIXTURE=1`, whose timers,
-nested interrupt, ITM marker and watched variable have known rates; ra6m5_ek ran unmodified `cdc_msc`, so its row
-has no fixture golden checks and no injected-failure cleanup.
+firmware behind the stm32 rows is the fixture below, whose timers, nested interrupt, ITM marker and watched variable
+have known rates; ra6m5_ek ran unmodified `cdc_msc`, so its row has no fixture golden checks and no injected-failure
+cleanup.
 
 | Board           | Probe, route                        | Setup   | Trace clock         | Exact SWO rates used | Verified                                                                |
 |-----------------|-------------------------------------|---------|---------------------|----------------------|-------------------------------------------------------------------------|
 | stm32f407disco  | on-board J-Link (ST-Link reflashed) | stm32f4 | HCLK 168 MHz        | 1.5 MHz (4.5 MHz/3)  | exc, LTS, ITM, data trace, PC sample, observe, comparator, PB3, restore |
 | stm32h743nucleo | STLINK-V3, OpenOCD `stlink-dap.cfg` | stm32h7 | 400 MHz (see notes) | 16 MHz               | exc, LTS, ITM, data trace, PC sample, PB3, restore                      |
 | ra6m5_ek        | on-board J-Link OB (S124)           | ra6m5   | TRCLK 100 MHz       | 500 kHz (3 MHz/6)    | exc, LTS, trace clock gate, restore                                     |
+
+## Fixture
+
+`tests/fixtures/swo` in this repository: one C file on TinyUSB's board support (clocks, LED), for stm32f407disco and
+stm32h743nucleo. Its comments give the workload and its timing layout; `swo_fixture_last` holds the counts of
+the last complete phase, the values a capture is checked against. Build it against a TinyUSB checkout at the commit
+in `tinyusb.pin`:
+
+```bash
+python3 <tinyusb>/tools/get_deps.py -b <board>
+cmake -S tests/fixtures/swo -B tests/fixtures/swo/_build/<board> -DBOARD=<board> -DTINYUSB_PATH=<tinyusb>
+cmake --build tests/fixtures/swo/_build/<board>
+```
+
+Another board needs a port of its timers and spare interrupt, which are vendor peripherals, and its own timing check
+on hardware before its row can cite the fixture.
 
 ## stm32f407disco
 

@@ -145,9 +145,9 @@ one fails the capture's read-back. The comparator stays disarmed after the captu
 
 ## Feature matrix
 
-Verified means a run of `swo_capture.py` on the named board against TinyUSB's `board_test` with `SWO_FIXTURE=1`,
-decoded to the fixture's known rates (`swo-boards.md`), unless the row names other firmware; the encodings table above
-was also checked by hand on a Cortex-M7.
+Verified means a run of `swo_capture.py` on the named board against the SWO fixture, decoded to its known rates
+(`swo-boards.md`), unless the row names other firmware; the encodings table above was also checked by hand on a
+Cortex-M7.
 
 | Feature                                                   | Implemented | Verified through swo_capture.py                     |
 |-----------------------------------------------------------|-------------|-----------------------------------------------------|

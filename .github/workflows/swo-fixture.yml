@@ -1,0 +1,47 @@
+name: swo-fixture
+
+on:
+  pull_request:
+    paths: ['tests/fixtures/swo/**', '.github/workflows/swo-fixture.yml']
+  push:
+    branches: [main]
+    paths: ['tests/fixtures/swo/**', '.github/workflows/swo-fixture.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BOARDS: stm32f407disco stm32h743nucleo
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - id: pin
+        run: echo "sha=$(cat tests/fixtures/swo/tinyusb.pin)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+        with:
+          repository: hathach/tinyusb
+          ref: ${{ steps.pin.outputs.sha }}
+          path: tinyusb
+          persist-credentials: false
+      # the arm-gcc release the pinned TinyUSB's own CI builds with
+      - run: |
+          tinyusb/.github/actions/setup_toolchain/download/fetch.sh arm-gcc "$RUNNER_TEMP/arm-gcc.tar.xz"
+          mkdir "$RUNNER_TEMP/arm-gcc"
+          tar -C "$RUNNER_TEMP/arm-gcc" --strip-components=1 -xJf "$RUNNER_TEMP/arm-gcc.tar.xz"
+          echo "$RUNNER_TEMP/arm-gcc/bin" >> "$GITHUB_PATH"
+      - run: python3 tinyusb/tools/get_deps.py $(printf -- '-b %s ' $BOARDS)
+      - run: |
+          for board in $BOARDS; do
+            cmake -S tests/fixtures/swo -B "tests/fixtures/swo/_build/$board" -DBOARD=$board -DTINYUSB_PATH="$GITHUB_WORKSPACE/tinyusb"
+            cmake --build "tests/fixtures/swo/_build/$board"
+          done
