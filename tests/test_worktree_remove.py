@@ -424,7 +424,8 @@ class Remove(Rig):
     def test_a_worktree_herdr_opens_or_loses_sight_of_after_the_plan_is_refused(self):
         plan = wr.plan
         for later, text in (('', f'{self.parent} is now open in herdr workspace w1'),
-                            ('down', 'herdr server unreachable')):
+                            ('down', f'herdr and {self.parent}: herdr could not list it '
+                                     '(exit 1: herdr server unreachable)')):
             with self.subTest(later=later):
                 self.mode.write_text('closed')  # open in no workspace while the plan looks it up
 
