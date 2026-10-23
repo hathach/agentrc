@@ -50,7 +50,6 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import probe_state as ps  # noqa: E402
-from pc_sample import hil_merge  # noqa: E402
 from sysview_dump import control_block, prepare_out  # noqa: E402
 
 TOOLS = ('systemview', 'Xvfb', 'xdotool', 'unshare')
@@ -456,7 +455,7 @@ def resolve_live(a, p):
             if flasher['name'] != 'jlink':
                 raise ValueError(f"--board {a.board} is flashed over {flasher['name']!r}; SystemView records live "
                                  f"over a J-Link only (capture raw RTT with rtt.py, then --from-raw)")
-            hil_merge(a, a.board, probe=flasher.get('uid'), device=ps.hil_jlink_device(a.board, flasher))
+            ps.hil_merge(a, a.board, probe=flasher.get('uid'), device=ps.hil_jlink_device(a.board, flasher))
         except ValueError as e:
             p.error(str(e))
     if not (a.probe and a.device):
