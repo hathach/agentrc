@@ -399,10 +399,30 @@ def check(child):
     return content_check(child)
 
 
+def anchored(path, here):
+    """(the directory path resolves from, the names after it): path's own drive and root when it has
+    a root (here's drive when it names none, as Windows reads `\\x`), else here. Windows' `\\\\?\\`
+    prefix, which readlink can return, is dropped and either separator splits. A drive-relative path
+    (`C:x`), relative to that drive's working directory, raises OSError."""
+    if os.altsep:
+        path = path.replace(os.altsep, os.sep)
+    if os.name == 'nt' and path.startswith('\\\\?\\'):  # a volume GUID path keeps it: no other names it
+        path = ('\\\\' + path[8:] if path[4:8].upper() == 'UNC\\' else
+                path[4:] if re.match(r'[A-Za-z]:', path[4:]) else path)
+    drive, tail = os.path.splitdrive(path)
+    if not tail.startswith(os.sep):
+        if drive:
+            raise OSError(f'cannot resolve the drive-relative path {path}')
+        return here, tail.split(os.sep)
+    return (drive or os.path.splitdrive(here)[0]) + os.sep, tail.lstrip(os.sep).split(os.sep)
+
+
 def link_hops(link):
     """Every path resolving link enters, each directory resolved: a link reaches every tree on the
-    way, through a symlink or a `..`, not only its final target."""
-    hops, path, rest, links = [], os.sep, os.path.abspath(link).split(os.sep), 0
+    way, through a symlink or a `..`, not only its final target. Each hop is absolute, from the
+    anchor (`/`, a drive's root or a UNC share's), which `..` never climbs above."""
+    hops, links = [], 0
+    path, rest = anchored(os.path.abspath(link), '')
     while rest:
         name = rest.pop(0)
         if name in ('', '.'):
@@ -418,9 +438,8 @@ def link_hops(link):
         links += 1
         if links > 40:  # Linux's own limit: a loop
             raise OSError(f'too many levels of symbolic links in {link}')
-        target = os.readlink(step)
-        path = os.sep if os.path.isabs(target) else path
-        rest = target.split(os.sep) + rest
+        path, names = anchored(os.readlink(step), path)
+        rest = names + rest
     return hops
 
 
@@ -448,10 +467,10 @@ def holds(leaving, staying, scan):
                 held[path] = f'owned by {stay.name}, which stays'
             else:
                 targets, blind = reach(stay, scan)  # searched only when a name does not settle it
-                root = os.path.realpath(path)
+                root = os.path.normcase(os.path.realpath(path))  # a target may spell its case otherwise
                 if blind:
                     held[path] = f'cannot tell whether {stay.name}, which stays, links into it: {blind}'
-                elif any(t == root or t.startswith(root + os.sep) for t in targets):
+                elif any(t == root or t.startswith(root + os.sep) for t in map(os.path.normcase, targets)):
                     held[path] = f'{stay.name}, which stays, links into it'
                 else:
                     continue

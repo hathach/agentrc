@@ -421,6 +421,27 @@ class Remove(Rig):
         self.assertEqual(rc, 5, out)
         self.assertIn('worktree_remove_failed', out)
 
+    def test_a_worktree_herdr_opens_or_loses_sight_of_after_the_plan_is_refused(self):
+        plan = wr.plan
+        for later, text in (('', f'{self.parent} is now open in herdr workspace w1'),
+                            ('down', 'herdr server unreachable')):
+            with self.subTest(later=later):
+                self.mode.write_text('closed')  # open in no workspace while the plan looks it up
+
+                def then(*args):
+                    p = plan(*args)
+                    self.mode.write_text(later)
+                    return p
+
+                with mock.patch.object(wr, 'plan', then):
+                    rc, out = self.run_remove()
+                self.assertEqual(rc, 3, out)
+                self.assertIn(f'refused, nothing changed: {text}', out)
+                self.assertEqual(self.removals(), [])
+                self.assertFalse(self.reports.exists())
+                self.assertTrue(self.parent.is_dir())
+                self.assertIn(str(self.parent), sh(self.main, 'worktree', 'list'))
+
 
 class NoHerdr(Rig):
     """No herdr: none at HERDR_BIN_PATH, HERDR_ENV unset."""

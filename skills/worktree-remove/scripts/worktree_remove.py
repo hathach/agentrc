@@ -32,7 +32,8 @@ commits on its remote that the remote's default branch lacks, with no PR at that
 and each branch the plugin will keep, with the reason (a never-pushed commit, say); each --pending
 item. The token digests the list, so a list that changed since the human saw it stops again.
 
-Then PATH's content check runs again, the report goes to
+Then PATH's content check runs again; for PATH open in no herdr workspace, so is herdr's (refused,
+exit 3, when a workspace opened PATH during the lookups or herdr cannot say); the report goes to
 ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the inventory,
 symlinks leaving each removed tree, the gate, the log, the command), and the removal runs, with
 --force only for a checkout with submodules (git refuses those otherwise):
@@ -288,6 +289,16 @@ def main(argv=None):
     except (wc.Keep, OSError) as why:
         print(f'worktree_remove: refused, nothing changed: {p["root"]} changed: {why}', file=sys.stderr)
         return 3
+    if not p['workspace']:  # git would bypass a workspace herdr opened during the lookups, and its panes
+        try:
+            ws = workspace(p['root'])
+        except Refused as e:
+            ws, why = None, e
+        else:
+            why = ws and f'{p["root"]} is now open in herdr workspace {ws}'
+        if why:
+            print(f'worktree_remove: refused, nothing changed: {why}', file=sys.stderr)
+            return 3
     out = REPORTS / f'{stamp}-{p["root"].name}.md'
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report(p, f'worktree-remove {p["root"].name}, {stamp}'))
