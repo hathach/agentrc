@@ -65,9 +65,28 @@ class InventoryTest(unittest.TestCase):
         self.calls = []
         self.clock = [0]
         self.resources = {}   # `gh api rate_limit`'s resources
+        # The base branch's required checks: classic protection, rulesets; the head's check runs and statuses.
+        self.protection = {'required_status_checks': {'contexts': [], 'checks': [], 'enforcement_level': 'non_admins'}}
+        self.rules = []
+        self.runs = []      # check runs per read, last one repeats
+        self.commit_statuses = []
 
         def run(argv, **kw):
             self.calls.append(argv[1:3])
+            path = argv[4] if argv[1:3] == ['api', '--paginate'] else argv[2] if argv[1] == 'api' else ''
+            ok = lambda out: mock.Mock(returncode=0, stdout=json.dumps(out).encode())
+            if path == 'repos/o/r/branches/master':
+                return ok({'name': 'master', 'protection': self.protection})
+            if path.startswith('repos/o/r/rules/branches/master?'):
+                return ok([self.rules])
+            if path.startswith(f'repos/o/r/commits/{HEAD}/check-runs?'):
+                self.calls.append(['check-runs'])
+                runs = self.runs.pop(0) if self.runs and isinstance(self.runs[0], list) and len(self.runs) > 1 else \
+                    (self.runs[0] if self.runs and isinstance(self.runs[0], list) else self.runs)
+                return ok([{'total_count': len(runs), 'check_runs': runs}])
+            if path.startswith(f'repos/o/r/commits/{HEAD}/statuses?'):
+                self.calls.append(['statuses'])
+                return ok([self.commit_statuses])
             if argv[1:3] == ['pr', 'view']:
                 head = self.heads.pop(0) if len(self.heads) > 1 else self.heads[0]
                 mergeable = self.mergeable.pop(0) if len(self.mergeable) > 1 else self.mergeable[0]
@@ -122,7 +141,7 @@ class InventoryTest(unittest.TestCase):
                           self.check('lint', 'cancel', 'https://example.com/x')]]
         rc, r = self.main()
         self.assertEqual((rc, r['status'], r['pending']), (0, 'red', 0))
-        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'status', 'waiting'], 'only what the workflow reads, and no null error')
+        self.assertEqual(sorted(r), ['baseRef', 'checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'requiredChecks', 'status', 'waiting'], 'only what the workflow reads, and no null error')
         self.assertEqual([(c['name'], c['bucket'], c['link']) for c in r['checks']],
                          [('hil', 'fail', JOB.format(3)), ('docs', 'fail', RTD.format(9)), ('lint', 'cancel', 'https://example.com/x')])
         self.assertEqual([c['aliases'] for c in r['checks']], [[], [], []], 'printed empty, so a relay has nothing to add (#50)')
@@ -197,6 +216,202 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('a', 'pass', JOB.format(1)), self.check('b', 'skipping', JOB.format(2))]]
         self.assertEqual(self.main()[1]['status'], 'green')
 
+    @staticmethod
+    def run_of(i, name, status='completed', conclusion='success', app=1, start='2026-10-01T00:00:00Z'):
+        return {'id': i, 'name': name, 'status': status, 'conclusion': conclusion, 'app': {'id': app}, 'started_at': start}
+
+    def require(self, *contexts, app=None):
+        self.rules = [{'type': 'required_status_checks', 'parameters': {'required_status_checks': [
+            {'context': c, **({'integration_id': app} if app is not None else {})} for c in contexts]}}]
+
+    def test_required_checks_from_protection_and_rules_fold_into_the_status(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.protection = {'required_status_checks': {'contexts': ['lint'], 'checks': [{'context': 'test', 'app_id': None}], 'enforcement_level': 'everyone'}}
+        self.require('build')
+        self.runs = [self.run_of(1, 'build', conclusion='failure'), self.run_of(2, 'build', start='2026-10-01T01:00:00Z'),
+                     self.run_of(3, 'test', conclusion='neutral')]
+        self.commit_statuses = [{'id': 9, 'context': 'lint', 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'}]
+        rc, r = self.main()
+        self.assertEqual((rc, r['status'], r['baseRef'], r['waiting']), (0, 'green', 'master', ''), 'a rerun that passed, a neutral run, a success status')
+        self.assertEqual(r['requiredChecks'], [{'context': 'build', 'app': -1, 'state': 'completed/success', 'bucket': 'pass'},
+                                               {'context': 'lint', 'app': -1, 'state': 'success', 'bucket': 'pass'},
+                                               {'context': 'test', 'app': -1, 'state': 'completed/neutral', 'bucket': 'pass'}])
+        self.runs = [self.run_of(5, 'lint', conclusion='failure'), *self.runs[1:]]
+        self.assertEqual(self.main()[1]['status'], 'red', 'a run outranks a success status')
+        self.runs = [self.run_of(5, 'lint', status='in_progress', conclusion=None), *self.runs[1:]]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['pending'], r['registered']), ('running', 0, 1), 'pending and registered count listed checks only')
+        self.assertNotEqual(r['waiting'], '')
+
+    def test_a_required_check_never_registered_keeps_it_running_and_the_wait_names_it(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.require('build', 'docs')
+        self.runs = [self.run_of(1, 'build')]
+        rc, r = self.main('--wait-seconds', '90')
+        self.assertEqual((r['status'], self.clock[0]), ('running', 90), 'waited for it')
+        self.assertEqual(r['requiredChecks'][1], {'context': 'docs', 'app': -1, 'state': 'not registered', 'bucket': 'missing'})
+        missing = r['waiting']
+        self.runs = [self.run_of(1, 'build'), self.run_of(2, 'docs', status='queued', conclusion=None)]
+        self.assertNotEqual(self.main()[1]['waiting'], missing)
+        queued = self.main()[1]['waiting']
+        self.runs[1] = {**self.runs[1], 'id': 3}
+        self.assertNotEqual(self.main()[1]['waiting'], queued, 'a new run of an unmet requirement is movement')
+
+    def test_a_check_required_from_an_app_passes_only_on_that_app_s_run(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.require('build', app=42)
+        self.runs = [self.run_of(2, 'build', app=99)]
+        self.commit_statuses = [{'id': 9, 'context': 'build', 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'}]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['requiredChecks']), ('running', [
+            {'context': 'build', 'app': 42, 'state': 'not registered by app 42 (only by app 99)', 'bucket': 'missing'}]))
+        self.assertNotIn(['statuses'], self.calls, 'a status names no app, so it never stands in for one')
+        self.runs[0]['app']['id'] = 42
+        self.assertEqual(self.main()[1]['status'], 'green')
+        self.protection = {'required_status_checks': {'contexts': ['build'], 'checks': [{'context': 'build', 'app_id': -1}], 'enforcement_level': 'everyone'}}
+        self.runs[0]['app']['id'] = 99
+        self.assertEqual([c['app'] for c in self.main()[1]['requiredChecks']], [42], 'the named app outranks any')
+
+    def test_a_status_never_stands_in_for_an_app_s_check_beside_an_any_app_one(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.rules = [{'type': 'required_status_checks', 'parameters': {'required_status_checks': [
+            {'context': 'a-status'}, {'context': 'build', 'integration_id': 42}]}}]
+        self.commit_statuses = [{'id': i, 'context': c, 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'} for i, c in enumerate(('a-status', 'build'))]
+        rc, r = self.main()
+        self.assertEqual((r['status'], [c['bucket'] for c in r['requiredChecks']]), ('running', ['pass', 'missing']))
+
+    def test_a_malformed_run_or_status_is_an_error(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.require('build')
+        for name, broken in (('no app', {'app': None}), ('no name', {'name': None}), ('no status', {'status': None, 'started_at': None})):
+            with self.subTest(name):
+                self.runs = [{**self.run_of(1, 'build'), **broken}]
+                rc, r = self.main()
+                self.assertEqual(rc, 1)
+                self.assertIn('lacks a name, status or app id', r['error'])
+        self.runs = []
+        self.commit_statuses = [{'id': 9, 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'}]
+        self.assertIn('has no context', self.main()[1]['error'])
+
+    def test_a_run_and_a_status_of_one_required_name_must_both_pass(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.require('CodeRabbit')
+        self.runs = [self.run_of(1, 'CodeRabbit')]
+        for state, want in (('failure', 'red'), ('pending', 'running'), ('success', 'green')):
+            with self.subTest(state):
+                self.commit_statuses = [{'id': 9, 'context': 'CodeRabbit', 'state': state, 'updated_at': '2026-10-01T00:00:00Z'}]
+                rc, r = self.main('--ignore-check', 'CodeRabbit')
+                self.assertEqual((r['status'], r['requiredChecks'][0]['state']), (want, f'completed/success; status {state}'))
+        for run, state in ((self.run_of(1, 'CodeRabbit', status='queued', conclusion=None), 'failure'), (self.run_of(1, 'CodeRabbit', conclusion='failure'), 'pending')):
+            with self.subTest(run=run['status'], status=state):
+                self.runs = [run]
+                self.commit_statuses = [{'id': 9, 'context': 'CodeRabbit', 'state': state, 'updated_at': '2026-10-01T00:00:00Z'}]
+                rc, r = self.main('--ignore-check', 'CodeRabbit')
+                self.assertEqual((r['status'], r['requiredChecks'][0]['bucket']), ('running', 'pending'), 'a re-run may yet pass')
+                waiting = r['waiting']
+                self.commit_statuses[0]['id'] = 10
+                self.assertNotEqual(self.main('--ignore-check', 'CodeRabbit')[1]['waiting'], waiting, 'both sources are the wait\'s evidence')
+
+    def test_an_ignored_check_still_counts_when_required(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('CodeRabbit', 'fail', ''), self.check('build', 'pass', JOB.format(1))]]
+        self.require('CodeRabbit')
+        self.commit_statuses = [{'id': 9, 'context': 'CodeRabbit', 'state': 'failure', 'updated_at': '2026-10-01T00:00:00Z'}]
+        rc, r = self.main('--ignore-check', 'CodeRabbit')
+        self.assertEqual((r['status'], r['checks'], r['ignored'], r['requiredChecks'][0]['bucket']), ('red', [], ['CodeRabbit'], 'fail'))
+        self.commit_statuses[0]['state'] = 'pending'
+        self.assertEqual(self.main('--ignore-check', 'CodeRabbit')[1]['status'], 'running')
+        self.commit_statuses[0]['state'] = 'failure'
+        self.listings = [[self.check('CodeRabbit', 'fail', '')]]
+        rc, r = self.main('--ignore-check', 'CodeRabbit')
+        self.assertEqual((r['status'], r['registered'], r['pending']), ('red', 0, 0), 'a failed requirement is red with nothing else listed')
+        self.commit_statuses[0]['state'] = 'success'
+        self.assertEqual(self.main('--ignore-check', 'CodeRabbit')[1]['status'], 'running', 'nothing listed and nothing failed: as before')
+
+    def test_required_run_states(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.require('build')
+        cases = {('waiting', None): 'running', ('requested', None): 'running', ('completed', 'skipped'): 'green',
+                 ('completed', 'timed_out'): 'red', ('completed', 'action_required'): 'red', ('completed', 'stale'): 'red'}
+        for (status, conclusion), want in cases.items():
+            with self.subTest(status=status, conclusion=conclusion):
+                self.runs = [self.run_of(1, 'build', status=status, conclusion=conclusion)]
+                self.assertEqual(self.main()[1]['status'], want)
+        self.runs = [self.run_of(1, 'build', status='completed', conclusion='surprise')]
+        rc, r = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("is completed/surprise, which collect.py does not read", r['error'])
+        self.runs = []
+        self.commit_statuses = [{'id': 9, 'context': 'build', 'state': 'unknown', 'updated_at': '2026-10-01T00:00:00Z'}]
+        self.assertIn("is 'unknown', which collect.py does not read", self.main()[1]['error'])
+        self.commit_statuses = []
+        self.runs = [self.run_of(1, 'build'), self.run_of(2, 'build', status='queued', conclusion=None, start=None)]
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['requiredChecks'][0]['bucket']), ('running', 'pending'), 'a re-run not started yet')
+        self.assertIn('cannot be ordered', r['requiredChecks'][0]['state'])
+
+    def test_required_checks_are_read_only_when_judged(self):
+        self.heads = [HEAD]
+        self.require('build')
+        self.runs = [self.run_of(1, 'build')]
+        self.listings = [[self.check('build', 'pending', JOB.format(1))]] * 2 + [[self.check('build', 'pass', JOB.format(1))]]
+        rc, r = self.main('--wait-seconds', '600')
+        self.assertEqual((r['status'], self.calls.count(['check-runs'])), ('green', 1), 'not while other checks still run')
+        self.assertEqual(self.calls.count(['api', 'repos/o/r/branches/master']), 1, 'the requirements once per call')
+        self.calls.clear()
+        self.rules = []
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.main()
+        self.assertNotIn(['check-runs'], self.calls, 'no requirement, no check-run read')
+        self.calls.clear()
+        self.listings = [[self.check('build', 'pending', JOB.format(1))]]
+        rc, r = self.main('--wait-seconds', '60')
+        self.assertEqual((r['status'], r['requiredChecks']), ('running', []), 'a listed check still pending: nothing judged')
+        self.assertNotIn(['api', 'repos/o/r/branches/master'], self.calls)
+        self.require('build')
+        self.listings, self.runs = [[]], []
+        rc, r = self.main()
+        self.assertEqual(r['requiredChecks'][0]['bucket'], 'missing', 'nothing listed: judged, for the workflow\'s no-check rule')
+        self.calls.clear()
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        self.runs = [self.run_of(1, 'build')]
+        self.mergeable = ['UNKNOWN', 'MERGEABLE']
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['requiredChecks'][0]['bucket']), ('green', 'pass'), 'judged on the final read that settled it')
+        self.calls.clear()
+        self.mergeable = ['CONFLICTING']
+        rc, r = self.main()
+        self.assertEqual((r['status'], r['requiredChecks']), ('conflicting', []))
+        self.assertNotIn(['api', 'repos/o/r/branches/master'], self.calls, 'a conflicting PR judges nothing')
+        self.calls.clear()
+        self.mergeable = ['MERGEABLE']
+        self.rules = []
+        self.protection = {'required_status_checks': {'contexts': ['lint'], 'checks': [], 'enforcement_level': 'off'}}
+        self.assertEqual(self.main()[1]['requiredChecks'], [], 'protection that enforces nothing requires nothing')
+
+    def test_a_base_retargeted_while_collecting_is_an_error(self):
+        self.heads = [HEAD]
+        self.listings = [[self.check('build', 'pass', JOB.format(1))]]
+        bases = iter(['master', 'next'])
+        run = collect.subprocess.run
+
+        def view(argv, **kw):
+            got = run(argv, **kw)
+            if argv[1:3] == ['pr', 'view']:
+                got.stdout = json.dumps({**json.loads(got.stdout), 'baseRefName': next(bases)}).encode()
+            return got
+        with mock.patch.object(collect.subprocess, 'run', view):
+            rc, r = self.main()
+        self.assertEqual(rc, 1)
+        self.assertIn('base moved to next', r['error'])
+
     def test_waits_while_pending_then_reports_the_settled_state(self):
         self.heads = [HEAD]
         self.listings = [[self.check('hil', 'pending', JOB.format(3))]] * 3 + [[self.check('hil', 'fail', JOB.format(3))]]
@@ -238,7 +453,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[self.check('hil', 'pending', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
         rc, r = self.main('--brief')
         self.assertEqual((rc, r['status'], r['pending'], r['checks']), (0, 'running', 1, []))
-        self.assertEqual(sorted(r), ['checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'status', 'waiting'], 'the same members as a whole line')
+        self.assertEqual(sorted(r), ['baseRef', 'checks', 'head', 'ignored', 'mergeable', 'observedAt', 'pending', 'registered', 'requiredChecks', 'status', 'waiting'], 'the same members as a whole line')
         self.assertNotIn(['api', 'repos/o/r/actions/jobs/4'], self.calls, 'a check nobody is shown is not resolved')
         self.assertEqual(r['waiting'], self.main()[1]['waiting'], 'the pending checks it hides still fingerprint the wait')
         self.listings = [[self.check('hil', 'pass', JOB.format(3)), self.check('lint', 'fail', JOB.format(4))]]
@@ -383,7 +598,7 @@ class InventoryTest(unittest.TestCase):
         self.listings = [[]]
         with mock.patch.object(collect.subprocess, 'run', wraps=collect.subprocess.run) as spy:
             self.main()
-        self.assertTrue(all(['--repo', 'o/r'] == c.args[0][4:6] for c in spy.call_args_list))
+        self.assertTrue(all(['--repo', 'o/r'] == c.args[0][4:6] for c in spy.call_args_list if c.args[0][1] != 'api'))
 
     def test_an_ignored_check_is_left_out_by_its_exact_name_in_any_bucket(self):
         self.heads = [HEAD]
@@ -507,6 +722,10 @@ class FailuresTest(unittest.TestCase):
                 return ok({'headRefOid': HEAD, 'baseRefName': 'master', 'baseRefOid': BASE, 'mergeable': 'MERGEABLE', 'state': 'OPEN'})
             if argv[1:3] == ['pr', 'checks']:
                 return ok(self.checks)
+            if argv[1:3] == ['api', 'repos/o/r/branches/master']:
+                return ok({'name': 'master', 'protection': {'enabled': False}})
+            if argv[1:3] == ['api', '--paginate'] and argv[4].startswith('repos/o/r/rules/branches/master?'):
+                return ok([[]])
             if argv[1:3] == ['api', '--paginate'] and '/attempts/' in argv[4]:
                 n = int(argv[4].split('/attempts/')[1].split('/')[0])
                 jobs = self.attempts.get(n, [])
@@ -1228,10 +1447,12 @@ class FailuresTest(unittest.TestCase):
 
     def test_bases_reads_the_job_that_executed(self):
         self.listed_as(self.run_job(13, 2, self.T2), {1: [self.run_job(12, 1, self.T2)]})
+        self.calls.clear()
         out = io.StringIO()
         with redirect_stdout(out):
             rc = collect.main(['bases', '--repo', 'o/r', '--pr', '5', '--head', HEAD, '--check', JOB.format(12)])
         self.assertEqual((rc, [b['link'] for b in unsealed(out.getvalue())['bases']]), (0, [JOB.format(12)]))
+        self.assertFalse([c for c in self.calls if 'branches/master' in ' '.join(map(str, c))], 'bases judges no required check')
 
     def test_only_the_runs_of_the_asked_links_are_resolved(self):
         other = 'https://github.com/o/r/actions/runs/8/job/5'

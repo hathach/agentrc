@@ -8,7 +8,8 @@
   collect.py recall --repo OWNER/NAME --pr N --head SHA --check LINK... [--offset N]
 
 inventory: waits up to S seconds (default 0) while the status is running, then
-prints one JSON object {head, status, mergeable, pending, registered, ignored, waiting, checks, observedAt}, plus `error` when set
+prints one JSON object {head, baseRef, status, mergeable, pending, registered, ignored, waiting, checks, requiredChecks,
+observedAt}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error), and
 `rateLimit` {observedAt, resetAt, secondary} beside an error from a gh call GitHub
 refused for a rate limit, as pr-babysit's facts.py reports it; every
@@ -25,7 +26,8 @@ listing nothing, its head whatever the PR's last one was), else
 conflicting (GitHub's `mergeable` is CONFLICTING: the pull_request workflows
 may not have run, so no check result stands for the PR), else running (a check
 pending, no checks registered yet, or mergeable UNKNOWN), else red (a check
-failed or was cancelled) or green; `mergeable` is GitHub's, read last;
+failed or was cancelled) or green, with the base branch's required checks folded in (below); `mergeable` is
+GitHub's, read last;
 `pending` counts the pending checks, `registered` every check. `waiting`, '' unless
 running, fingerprints the pending checks (name, link, attempt) and mergeable: two
 reads with the same one saw nothing move. `observedAt` is the UTC time of the
@@ -44,7 +46,20 @@ the same execution: a failing Actions job listed as such a copy is given as the
 job that executed it, its link and attempt, with `aliases`, the copies' links,
 when exactly one job of the earlier attempt is that execution; `aliases` is
 otherwise empty, never left out, so a relay has nothing to add. `repo` must own the
-PR number, which for a fork PR is not the head repository. Exit 0 with the
+PR number, which for a fork PR is not the head repository. `requiredChecks` is
+each check `baseRef`'s branch protection or rulesets require, {context, app,
+state, bucket}: `app` the GitHub App id that must provide it, -1 for any
+source (a commit status counts only there);
+`bucket` pass, pending, fail or missing (none registered, or only by another
+app: `state` says which), read from the head's check runs and statuses, an
+--ignore-check NAME included: one pending or missing keeps the status running,
+one failed makes it red, and `waiting` covers them. It is [] when nothing was
+judged, which is only when the requirements cannot change the status: a
+merged, closed or conflicting PR, GitHub's mergeable UNKNOWN, or a listed
+check still pending. Where the base requires a context from any source, its
+newest check run and newest commit status of that name must both pass where
+both exist, as GitHub requires. A base retargeted while collecting is an
+error. `baseRef` is the PR's base branch. Exit 0 with the
 object, 1 with `error` set (a gh failure, or the PR head is no longer --head),
 2 on a usage error.
 
@@ -161,6 +176,7 @@ import circleci  # noqa: E402
 import rtd  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile  # noqa: E402
+from check_runs import latest_run, newest  # noqa: E402
 import windows  # noqa: E402
 from seal import fnv1a, rate_limit, sealed, utc  # noqa: E402
 
@@ -191,6 +207,12 @@ NEVER_STARTED = 'GitHub Actions job cancelled before any step ran'
 COMPARATOR = {'GT': '>', 'LT': '<'}
 CONDITION = ('metricKey', 'actualValue', 'comparator', 'errorThreshold')
 NO_RUN = 'no reader for this check: its link names no run'
+ANY_APP = -1  # a required check any source may provide
+# GitHub counts these as a passed required check.
+PASSED = ('success', 'neutral', 'skipped')
+RUN_PENDING = ('queued', 'in_progress', 'waiting', 'requested', 'pending')
+RUN_FAILED = ('failure', 'cancelled', 'timed_out', 'action_required', 'startup_failure', 'stale')
+STATUS_BUCKET = {'pending': 'pending', 'success': 'pass', 'failure': 'fail', 'error': 'fail'}
 
 
 STOP_FILE = None  # inventory --stop-file
@@ -231,7 +253,7 @@ def pull(repo, pr):
 def ended(view):
     """A merged or closed PR's inventory, nothing waited for or listed: a merged PR's mergeable stays UNKNOWN, running for good."""
     return {'head': view['headRefOid'], 'baseRef': view['baseRefName'], 'baseSha': view['baseRefOid'], 'status': view['state'].lower(),
-            'mergeable': view['mergeable'], 'counts': {}, 'ignored': [], 'checks': []}
+            'mergeable': view['mergeable'], 'counts': {}, 'ignored': [], 'checks': [], 'required': []}
 
 
 def listing(repo, pr):
@@ -313,17 +335,21 @@ def resolved(repo, head, check, cache):
     return {**out, 'aliases': [with_job(check['link'], c) for c in copies]} if copies else out
 
 
-def summary(checks, mergeable):
+def summary(checks, mergeable, required=()):
+    """(status, counts of the listed checks by bucket), the required checks folded in: one pending or missing keeps it
+    running, one failed makes it red unless a listed check is still pending; nothing listed is running, unless a required
+    check failed."""
     if mergeable not in ('MERGEABLE', 'CONFLICTING', 'UNKNOWN'):
         raise Failed(f'the PR\'s mergeable is {mergeable!r}')
     counts = {}
     for c in checks:
         counts[c['bucket']] = counts.get(c['bucket'], 0) + 1
+    buckets = {r['bucket'] for r in required}
     if mergeable == 'CONFLICTING':
         return 'conflicting', counts
-    if not checks or counts.get('pending') or mergeable == 'UNKNOWN':
+    if counts.get('pending') or mergeable == 'UNKNOWN' or buckets & {'pending', 'missing'} or not (checks or 'fail' in buckets):
         return 'running', counts
-    return ('red' if counts.get('fail') or counts.get('cancel') else 'green'), counts
+    return ('red' if counts.get('fail') or counts.get('cancel') or 'fail' in buckets else 'green'), counts
 
 
 def unfinished_held(repo, checks, workflows):
@@ -350,21 +376,117 @@ def run_of(link):
     return link[:m.start(1)] if m else link
 
 
-def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None):
+def listed(path, key=None):
+    """Every item of a paginated REST list, 100 a page; `key` names the list inside an object-wrapped page."""
+    pages = gh('api', '--paginate', '--slurp', f"{path}{'&' if '?' in path else '?'}per_page=100")
+    return [x for page in pages for x in (page.get(key) or [] if key else page)]
+
+
+def required_checks(repo, base):
+    """The base branch's required checks, [{context, app}] sorted, app ANY_APP where any source may provide it: classic
+    protection's and the rulesets'; a context required from a named app needs that one, not also any."""
+    protection = gh('api', f'repos/{repo}/branches/{base}').get('protection') or {}
+    checks = protection.get('required_status_checks') or {}
+    if checks.get('enforcement_level') == 'off':
+        checks = {}
+    source = lambda app: ANY_APP if app in (None, -1) else app
+    wanted = [(c, ANY_APP) for c in checks.get('contexts') or []]
+    wanted += [(c.get('context'), source(c.get('app_id'))) for c in checks.get('checks') or []]
+    wanted += [(c.get('context'), source(c.get('integration_id'))) for rule in listed(f'repos/{repo}/rules/branches/{base}')
+               if rule.get('type') == 'required_status_checks' for c in (rule.get('parameters') or {}).get('required_status_checks') or []]
+    bad = [w for w in wanted if not isinstance(w[0], str) or not w[0] or not isinstance(w[1], int)]
+    if bad:
+        raise Failed(f'the required checks of {base} read in a shape collect.py does not: {bad[:3]}')
+    named = {c for c, app in wanted if app != ANY_APP}
+    return [{'context': c, 'app': app} for c, app in sorted(set(wanted)) if app != ANY_APP or c not in named]
+
+
+def run_bucket(run):
+    status, conclusion = run.get('status'), run.get('conclusion')
+    if status in RUN_PENDING:
+        return 'pending'
+    if status == 'completed' and conclusion in PASSED:
+        return 'pass'
+    if status == 'completed' and conclusion in RUN_FAILED:
+        return 'fail'
+    raise Failed(f"check run {run.get('id')} {run.get('name')!r} is {status}/{conclusion}, which collect.py does not read")
+
+
+def judged(repo, head, required):
+    """Each required check with what the head shows for it: {context, app, state, bucket, evidence}. A check required
+    from an app passes only on that app's run. A commit status names no app, so it counts only where any source may
+    provide the check, and there GitHub needs the newest run and the newest status of that name both to pass where
+    both exist: either pending is pending, else either failed is a failure. Runs that cannot be ordered are pending: a
+    re-run GitHub has not started."""
+    if not required:
+        return []
+    runs = listed(f'repos/{repo}/commits/{head}/check-runs', 'check_runs')
+    bad = next((x for x in runs if not (isinstance(x.get('name'), str) and isinstance(x.get('status'), str)
+                                        and isinstance((x.get('app') or {}).get('id'), int))), None)
+    if bad is not None:
+        raise Failed(f"check run {bad.get('id')} lacks a name, status or app id: {json.dumps(bad)[:200]}")
+    statuses = listed(f'repos/{repo}/commits/{head}/statuses') if any(r['app'] == ANY_APP for r in required) else []
+    bad = next((x for x in statuses if not isinstance(x.get('context'), str)), None)
+    if bad is not None:
+        raise Failed(f"commit status {bad.get('id')} has no context: {json.dumps(bad)[:200]}")
+    out = []
+    for r in required:
+        any_app = r['app'] == ANY_APP
+        named = [x for x in runs if x['name'] == r['context']]
+        mine = named if any_app else [x for x in named if x['app']['id'] == r['app']]
+        status = newest([x for x in statuses if x['context'] == r['context']], 'updated_at') if any_app else None
+        readings = []   # (bucket, state, evidence) of the run and of the status
+        if mine:
+            run, why = latest_run(mine)
+            state = f"{run['status']}/{run.get('conclusion')}" if run else f'its runs cannot be ordered: {why}'
+            readings.append((run_bucket(run), state, f"run:{run.get('id')}:{state}") if run else ('pending', state, why))
+        if status:
+            if status.get('state') not in STATUS_BUCKET:
+                raise Failed(f"commit status {status.get('id')} {r['context']!r} is {status.get('state')!r}, which collect.py does not read")
+            state = f"status {status['state']}" if readings else status['state']
+            readings.append((STATUS_BUCKET[status['state']], state, f"status:{status.get('id')}:{status['state']}"))
+        if readings:
+            buckets = {b for b, _, _ in readings}
+            # A run still to finish outranks a failure, as running outranks red: a re-run may yet pass.
+            got = {'bucket': next(b for b in ('pending', 'fail', 'pass') if b in buckets),
+                   'state': '; '.join(st for _, st, _ in readings), 'evidence': ' '.join(e for *_, e in readings)}
+        else:
+            others = sorted({str(x['app']['id']) for x in named})
+            state = 'not registered' if any_app else f"not registered by app {r['app']}"
+            if others:
+                state += f" (only by app {', '.join(others)})"
+            got = {'bucket': 'missing', 'state': state, 'evidence': 'missing'}
+        out.append({**r, **got})
+    return out
+
+
+def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None, required=True):
     """brief: the caller is shown no failing check while running, by the last mergeable read; links: the only checks
-    it asks about, by link."""
+    it asks about, by link; required False skips the required checks (failures and bases, which judge none)."""
     view = before = pull(repo, pr)
     if before['state'] != 'OPEN':
         return ended(before)
     if before['headRefOid'] != head:
         raise Failed(f'PR #{pr} head is {before["headRefOid"]}, not {head}')
     start = time.monotonic()
-    workflows = {}
+    workflows, definitions = {}, None
+
+    def judge(view, counts):
+        """The required checks judged, read once per call and only where they can change the status: GitHub knows the PR
+        mergeable and no listed check is pending; [] otherwise."""
+        nonlocal definitions
+        if not required or view.get('mergeable') != 'MERGEABLE' or counts.get('pending'):
+            return []
+        if definitions is None:
+            definitions = required_checks(repo, before['baseRefName'])
+        return judged(repo, head, definitions)
     while True:
         everything = listing(repo, pr)
         ignored = sorted({c['name'] for c in everything if c['name'] in ignore})
         checks = unfinished_held(repo, [c for c in everything if c['name'] not in ignore], workflows)
-        status, counts = summary(checks, view.get('mergeable'))
+        counts = summary(checks, view.get('mergeable'))[1]
+        reqs = judge(view, counts)
+        status = summary(checks, view.get('mergeable'), reqs)[0]
         waited = int(time.monotonic() - start)
         if status != 'running' or waited + POLL > wait:
             break
@@ -373,7 +495,7 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None):
         view = pull(repo, pr)
         if view['state'] != 'OPEN':
             return ended(view)
-    listed = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
+    shown = [{**c, 'attempt': attempt(c.get('link'))} for c in checks if c['bucket'] not in ('pass', 'skipping')]
 
     # A job read per failing Actions check, and its run's attempts after a re-run: only for checks the caller sees.
     runs = None if links is None else {run_of(link) for link in links}
@@ -386,24 +508,36 @@ def inventory(repo, pr, head, wait, ignore=(), brief=False, links=None):
     def read_after():
         # The listing reads the PR's last commit: a push during it would describe another head.
         view = pull(repo, pr)
-        if view['state'] == 'OPEN' and view['headRefOid'] != head:
+        if view['state'] != 'OPEN':
+            return view
+        if view['headRefOid'] != head:
             raise Failed(f'PR #{pr} head moved to {view["headRefOid"]} while collecting')
+        if view['baseRefName'] != before['baseRefName']:
+            raise Failed(f'PR #{pr} base moved to {view["baseRefName"]} while collecting')
         return view
+
+    judgements = {view.get('mergeable'): reqs}   # a re-read judges the required checks again only for a new mergeable
+
+    def reqs_at(view):
+        if view.get('mergeable') not in judgements:
+            judgements[view.get('mergeable')] = judge(view, counts)
+        return judgements[view.get('mergeable')]
 
     hidden = brief and status == 'running'
     if not hidden:
-        listed = resolve(listed)
+        shown = resolve(shown)
     after = read_after()
-    if after['state'] == 'OPEN' and hidden and summary(checks, after.get('mergeable'))[0] != 'running':
+    if after['state'] == 'OPEN' and hidden and summary(checks, after.get('mergeable'), reqs_at(after))[0] != 'running':
         # mergeable settled since the listing: the checks are shown after all, and the head is read again after them.
-        listed, after = resolve(listed), read_after()
+        shown, after = resolve(shown), read_after()
     if after['state'] != 'OPEN':
         return ended(after)
-    status = summary(checks, after.get('mergeable'))[0]
+    reqs = reqs_at(after)
+    status = summary(checks, after.get('mergeable'), reqs)[0]
     if brief and status == 'running':
-        listed = [c for c in listed if c['bucket'] == 'pending']   # the waiting fingerprint still reads them
+        shown = [c for c in shown if c['bucket'] == 'pending']   # the waiting fingerprint still reads them
     return {'head': head, 'baseRef': before['baseRefName'], 'baseSha': before['baseRefOid'], 'status': status,
-            'mergeable': after['mergeable'], 'counts': counts, 'ignored': ignored, 'checks': listed}
+            'mergeable': after['mergeable'], 'counts': counts, 'ignored': ignored, 'checks': shown, 'required': reqs}
 
 
 INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for failures and bases
@@ -411,13 +545,15 @@ INTERNAL = ('executedBefore', 'record')   # what resolving a check leaves for fa
 
 def printed(inv):
     """What the caller reads: the failing checks inventory shows by name, the pending ones by count.
-    registered counts every check; waiting, '' unless running, fingerprints the pending checks and mergeable, so a
-    caller can tell a wait that saw nothing move from one that did."""
+    registered counts every check; waiting, '' unless running, fingerprints the pending checks, the unmet required ones
+    by the run or status read for them, and mergeable, so a caller can tell a wait that saw nothing move from one that did."""
     listed = [{'aliases': [], **{k: v for k, v in c.items() if k not in INTERNAL}} for c in inv['checks'] if c['bucket'] in ('fail', 'cancel')]
     pending = sorted([c['name'], c.get('link') or '', c.get('attempt') or ''] for c in inv['checks'] if c['bucket'] == 'pending')
-    return {'head': inv['head'], 'status': inv['status'], 'mergeable': inv['mergeable'], 'pending': inv['counts'].get('pending', 0),
-            'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
-            'waiting': fnv1a(json.dumps([inv['mergeable'], pending])) if inv['status'] == 'running' else '', 'checks': listed,
+    unmet = [[r['context'], r['app'], r['bucket'], r['evidence']] for r in inv['required'] if r['bucket'] in ('pending', 'missing')]
+    return {'head': inv['head'], 'baseRef': inv['baseRef'], 'status': inv['status'], 'mergeable': inv['mergeable'],
+            'pending': inv['counts'].get('pending', 0), 'registered': sum(inv['counts'].values()), 'ignored': inv['ignored'],
+            'waiting': fnv1a(json.dumps([inv['mergeable'], pending, *([unmet] if unmet else [])])) if inv['status'] == 'running' else '',
+            'checks': listed, 'requiredChecks': [{k: r[k] for k in ('context', 'app', 'state', 'bucket')} for r in inv['required']],
             'observedAt': utc(time.time())}
 
 
@@ -992,7 +1128,7 @@ def changed_paths(repo, pr):
 
 
 def failures(repo, pr, head, links, gates=()):
-    now = inventory(repo, pr, head, 0, links=links)
+    now = inventory(repo, pr, head, 0, links=links, required=False)
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
     stale = [link for link in (*links, *gates) if link not in failing]
     if stale:
@@ -1043,7 +1179,7 @@ def base_token(base):
 
 def bases(repo, pr, head, links):
     """Each --check's base job token as `failures` prints it, without reading a log."""
-    now = inventory(repo, pr, head, 0, links=links)
+    now = inventory(repo, pr, head, 0, links=links, required=False)
     failing = {c['link']: c for c in now['checks'] if c['bucket'] in ('fail', 'cancel')}
     stale = [link for link in links if link not in failing]
     if stale:

@@ -60,6 +60,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scrip
 import comment_digest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import greptile as greptile_check  # noqa: E402  the confidence check's recogniser, which collect.py shares
+from check_runs import latest_run, newest, newest_reading, stamp  # noqa: E402,F401  which collect.py shares
 
 KNOWN = ('copilot', 'coderabbit', 'greptile', 'code-scanning')
 SETTLED = ('coderabbit', 'greptile')
@@ -110,10 +111,6 @@ def digest(body):
     return comment_digest.sha12(body or '')
 
 
-def stamp(t):
-    return datetime.fromisoformat(t.replace('Z', '+00:00')) if t else None
-
-
 def record(bot, state, reason, evidence=(), sha=None, kind=None, retry_at=None):
     return {'bot': bot, 'state': state, 'kind': kind, 'sha': sha, 'evidence': list(evidence), 'reason': reason, 'retryAt': retry_at}
 
@@ -133,34 +130,6 @@ def retry_at(notice):
 def after(notice, wait):
     """The notice's last edit plus wait, as an ISO 8601 UTC string."""
     return (stamp(notice['updated_at']) + wait).strftime('%Y-%m-%dT%H:%M:%SZ')
-
-
-def newest(items, key):
-    dated = [x for x in items if x.get(key)]
-    return max(dated, key=lambda x: stamp(x[key])) if dated else None
-
-
-def newest_reading(items, key, reading):
-    """(the newest item, '') or (None, why) when one is undated, or the newest share one timestamp and read differently."""
-    undated = next((x for x in items if not x.get(key)), None)
-    if undated:
-        return None, f"{undated.get('id')} has no {key} to order it by"
-    top = newest(items, key)
-    tied = [x for x in items if top and x.get(key) and stamp(x[key]) == stamp(top[key])]
-    if len({repr(reading(x)) for x in tied}) > 1:
-        return None, f"{', '.join(str(x.get('id')) for x in tied)} share {top[key]} and read differently"
-    return top, ''
-
-
-def latest_run(runs):
-    """(the newest check run, '') or (None, why) when runs cannot be ordered: one has no start time
-    (GitHub leaves a queued run undated), or the newest start differently."""
-    undated = [r for r in runs if not r.get('started_at')]
-    if undated and len(runs) > 1:
-        return None, f"check run {undated[0]['id']} has no start time to order it by"
-    if undated:
-        return undated[0], ''
-    return newest_reading(runs, 'started_at', lambda r: (r['status'], r.get('conclusion'), (r.get('output') or {}).get('summary')))
 
 
 def applies(created, event_at):

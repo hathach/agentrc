@@ -298,7 +298,8 @@ async function run(opts = {}) {
         // opts.inventoryWait(calls, label): hold an inventory read, as a wait still polling.
         if (opts.inventoryWait) await opts.inventoryWait(calls, label)
         answer = {
-          head: ci.headSha ?? head, status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
+          head: ci.headSha ?? head, baseRef: 'master', status: ci.status, mergeable: ci.mergeable ?? (ci.status === 'conflicting' ? 'CONFLICTING' : 'MERGEABLE'),
+          requiredChecks: ci.requiredChecks ?? [],
           pending: ci.pending ?? (ci.status === 'running' ? 1 : 0), checks: failed,
           // Every read sees CI move unless a fixture fixes what it waits on.
           registered: ci.registered ?? Math.max(1, failed.length), waiting: ci.status === 'running' ? ci.waiting ?? label : '',
@@ -1625,6 +1626,38 @@ test('CI that saw nothing move through two whole waits on one head stops ci-stuc
   assert.notEqual(shortNone.result.pass, true)
 })
 
+test('a required check not yet passed is waited for, never read as green, and stops ci-stuck by name', async () => {
+  const missing = { context: 'build', app: -1, state: 'not registered', bucket: 'missing' }
+  const none = { ...RUNNING, pending: 0, registered: 0, waiting: 'same', requiredChecks: [missing] }
+  const { result, logs } = await run({ ci: none, args: { maxCycles: 4 } })
+  assert.equal(result.reason, 'ci-stuck', 'no check registered is no green while one is required')
+  assert.deepEqual([result.cycles, result.unmet], [2, ['build']])
+  assert.ok(logs.some(l => l.includes('required check(s) not passed: build after two whole waits')), logs.join('\n'))
+  const named = await run({ ci: { ...none, requiredChecks: [{ ...missing, app: 42 }] }, args: { maxCycles: 4 } })
+  assert.deepEqual(named.result.unmet, ['build (app 42)'])
+  const onlyBot = await run({ ci: { ...none, ignored: ['CodeRabbit'] }, reviews: WAITING, args: { maxCycles: 2 } })
+  assert.equal(onlyBot.logs.some(l => l.includes('which the review lane waits on')), false, 'nor is the review lane left to wait on it')
+  const claimed = await run({ ci: { ...GREEN, requiredChecks: [missing] }, args: { maxCycles: 1 } })
+  assert.ok(claimed.logs.some(l => /CI inventory is inconsistent/.test(l)), claimed.logs.join('\n'))
+  assert.notEqual(claimed.result.pass, true)
+})
+
+test('a failed required check stops required-check-failed, and an accepted failure never covers it', async () => {
+  const failed = { context: 'CodeRabbit', app: -1, state: 'failure', bucket: 'fail' }
+  const only = await run({ ci: { status: 'red', infraRerun: [], realFailures: [], requiredChecks: [failed] }, args: { maxCycles: 3 } })
+  assert.equal(only.result.reason, 'required-check-failed', 'an ignored bot status the CI lane lists no failure for')
+  assert.deepEqual(only.result.requiredFailed, [{ context: 'CodeRabbit', app: -1 }])
+  assert.equal(only.labels.some(l => l.startsWith('ci:judge#')), false)
+  const alone = await run({ ci: { status: 'red', infraRerun: [], realFailures: [], registered: 0, pending: 0, ignored: ['CodeRabbit'], requiredChecks: [failed] }, args: { maxCycles: 3 } })
+  assert.equal(alone.result.reason, 'required-check-failed', 'collect.py\'s red with nothing else registered')
+  const store = new Map()
+  const red = { ci: { ...redWith(PVS).ci, requiredChecks: [{ ...failed, context: 'pvs / analyze' }] } }
+  const first = await run({ ...red, store, args: { ...YIELD, acceptedFailures: [byKey()] }, reviews: WAITING })
+  const done = await run({ ...red, store, args: { ...YIELD, acceptedFailures: [byKey()], state: first.result.state } })
+  assert.equal(done.result.reason, 'required-check-failed', JSON.stringify(done.result.reason))
+  assert.equal(done.result.history.at(-1).ci.requiredFailed.length, 1, 'the observation keeps it')
+})
+
 test('a head with no check registered after a whole wait is read at once on later cycles, until checks appear', async () => {
   const none = { ...RUNNING, pending: 0, registered: 0, waiting: 'none' }
   const green = await run({ ci: none })
@@ -2375,7 +2408,7 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
 
 test('a collector failing the same way on two cycles running stops ci-collect-failed; a passing failure re-arms after a backoff', async () => {
   const failing = (error, when = () => true) => (l, a) => l.startsWith('ci:collect#') && when(cycleOf(l))
-    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], observedAt: '', seal: '' }
+    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', baseRef: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], requiredChecks: [], observedAt: '', seal: '' }
     : a
   const auth = await run({ args: { maxCycles: 4 }, garble: failing('gh: authentication expired') })
   assert.deepEqual([auth.result.reason, auth.result.detail, auth.result.cycles], ['ci-collect-failed', 'gh: authentication expired', 2], auth.logs.join('\n'))

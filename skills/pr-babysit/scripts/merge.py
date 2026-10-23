@@ -9,10 +9,10 @@ FILE the last launch's saved Workflow output and D its stateDigest. Every condit
 or pending publication, its state matching D and its own digest, pinned to that PR), one head everywhere (the
 checkout's, the state's, the reviewed one, the reviews', CI's and the PR's), a fresh harvest (harvest.py with the
 launch's reviewers, from its fingerprint: the same fingerprint, CodeRabbit and Greptile both `reviewed` on the head),
-a fresh CI inventory (collect.py with no ignored check: green, mergeable, nothing pending), the base branch's required
-checks each succeeded on the head, and the PR (OPEN, not a draft, its base and head repositories and branches the
-bound ones, squash allowed, no merge queue, merge state CLEAN, or BLOCKED, when it merges with --admin). Unknown or
-unreadable evidence is a blocker.
+a fresh CI inventory (collect.py with no ignored check: green, mergeable, nothing pending, for the granted base,
+the base branch's required checks each passed on the head from the app it must come from), and the PR (OPEN, not a
+draft, its base and head repositories and branches the bound ones, squash allowed, no merge queue, merge state CLEAN,
+or BLOCKED, when it merges with --admin). Unknown or unreadable evidence is a blocker.
 
 Without --merge nothing is written. With it and no blocker, it runs
 `gh pr merge N -R REPO --squash --match-head-commit HEAD --subject "<title> (#N)" --body ""`, with --admin only on
@@ -43,8 +43,6 @@ import launch_result  # noqa: E402
 BOTS = ('coderabbit', 'greptile')
 PR_URL = re.compile(r'\Ahttps://github\.com/([^/\s]+)/([^/\s]+)/pull/([1-9][0-9]*)\Z')
 COLLECT = Path(__file__).resolve().parents[2] / 'ci-rerun' / 'scripts' / 'collect.py'
-# GitHub counts these as a passed required check.
-PASSED = ('success', 'neutral', 'skipped')
 ALREADY_MERGED = re.compile(r'was already merged', re.I)
 READBACK_TRIES = 5
 READBACK_WAIT = 3  # seconds between reads after a merge
@@ -162,59 +160,19 @@ def pr_blockers(pr, url, base, state):
     return blockers
 
 
-def rules(repo, base):
-    """(the base branch's required checks as {context, app}, app the GitHub App id that must provide it or None for any,
-    whether its rules allow a squash merge, whether they require a merge queue)."""
-    branch = harvest.gh_json('api', f'repos/{repo}/branches/{base}')
-    checks = (((branch.get('protection') or {}).get('required_status_checks')) or {})
-    source = lambda app: None if app in (None, -1) else app
-    required = [{'context': c, 'app': None} for c in checks.get('contexts') or []]
-    required += [{'context': c['context'], 'app': source(c.get('app_id'))} for c in checks.get('checks') or []]
-    squash, queue = True, False
+def merge_rules(repo, base):
+    """Blockers from the base branch's rules: a squash merge they do not allow, a merge queue they require."""
+    blockers, squash, queue = [], True, False
     for rule in harvest.pages(f'repos/{repo}/rules/branches/{base}'):
         params = rule.get('parameters') or {}
-        if rule.get('type') == 'required_status_checks':
-            required += [{'context': c['context'], 'app': source(c.get('integration_id'))} for c in params.get('required_status_checks') or []]
         if rule.get('type') == 'pull_request' and params.get('allowed_merge_methods') is not None:
             squash = squash and 'squash' in params['allowed_merge_methods']
         queue = queue or rule.get('type') == 'merge_queue'
-    # A context required from a named app and also from any app needs the named one.
-    named = {r['context'] for r in required if r['app'] is not None}
-    unique = {(r['context'], r['app']): r for r in required if r['app'] is not None or r['context'] not in named}
-    return sorted(unique.values(), key=lambda r: (r['context'], r['app'] or 0)), squash, queue
-
-
-def required_checks(repo, base, head):
-    """(blockers, each required check with what the head shows for it): a check required from an app passes only on
-    that app's run; a commit status names no app, so it passes only a check any source may provide."""
-    required, squash, queue = rules(repo, base)
-    blockers = [] if squash else ['github: the base branch rules do not allow a squash merge']
+    if not squash:
+        blockers.append('github: the base branch rules do not allow a squash merge')
     if queue:
         blockers.append('github: the base branch rules require a merge queue')
-    if not required:
-        return blockers, []
-    runs = harvest.pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs')
-    statuses = None
-    seen = []
-    for r in required:
-        mine = [x for x in runs if x.get('name') == r['context'] and (r['app'] is None or (x.get('app') or {}).get('id') == r['app'])]
-        latest_run, unordered = harvest.latest_run(mine) if mine else (None, '')
-        # A commit status names no app, so it stands in only where any source may provide the check and no run does.
-        if not mine and r['app'] is None and statuses is None:
-            statuses = harvest.pages(f'repos/{repo}/commits/{head}/statuses')
-        latest_status = harvest.newest([x for x in statuses or [] if x.get('context') == r['context']], 'updated_at') if not mine and r['app'] is None else None
-        if unordered:
-            state, ok = f'its runs cannot be ordered: {unordered}', False
-        elif latest_run:
-            state, ok = f"{latest_run.get('status')}/{latest_run.get('conclusion')}", latest_run.get('status') == 'completed' and latest_run.get('conclusion') in PASSED
-        elif latest_status:
-            state, ok = latest_status.get('state'), latest_status.get('state') == 'success'
-        else:
-            state, ok = 'not registered' + (f" by app {r['app']}" if r['app'] is not None else ''), False
-        seen.append({**r, 'state': state})
-        if not ok:
-            blockers.append(f"github: required check {r['context']!r} on the head: {state}")
-    return blockers, seen
+    return blockers
 
 
 def review_blockers(repo, n, fingerprint, head):
@@ -235,20 +193,28 @@ def review_blockers(repo, n, fingerprint, head):
     return blockers
 
 
-def ci_blockers(repo, n, head):
+def ci_blockers(repo, n, head, base):
+    """(blockers, each required check as {context, app, state}, app None for any source): collect.py judges them."""
     code, out, err = attempt(sys.executable, str(COLLECT), 'inventory', '--repo', repo, '--pr', str(n), '--head', head)
     try:
         inv = json.loads(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
         raise Unusable(f'collect.py inventory exited {code} with no JSON line: {err.strip()[-300:]}')
     if inv.get('error'):
-        return [f"ci: {launch_result.cut(inv['error'])}"]
+        return [f"ci: {launch_result.cut(inv['error'])}"], []
+    required = inv.get('requiredChecks')
+    readable = lambda r: (isinstance(r, dict) and isinstance(r.get('context'), str) and isinstance(r.get('state'), str)
+                          and type(r.get('app')) is int and r.get('bucket') in ('pass', 'pending', 'fail', 'missing'))
+    if not isinstance(required, list) or not all(map(readable, required)):
+        return [f'ci: the inventory names no readable requiredChecks: {launch_result.cut(json.dumps(required))}'], []
+    blockers = [] if inv.get('baseRef') == base else [f"ci: the inventory is for base {inv.get('baseRef')!r}, not {base!r}"]
     got = (inv.get('status'), inv.get('head'), inv.get('mergeable'), inv.get('pending'), inv.get('ignored'))
     if got != ('green', head, 'MERGEABLE', 0, []) or not inv.get('registered'):
         failed = ', '.join(c.get('name', '') for c in inv.get('checks') or [])
-        return [f"ci: status {got[0]}, head {got[1]}, mergeable {got[2]}, {got[3]} pending, {inv.get('registered')} registered"
-                f"{f'; failed: {failed}' if failed else ''}"]
-    return []
+        blockers.append(f"ci: status {got[0]}, head {got[1]}, mergeable {got[2]}, {got[3]} pending, {inv.get('registered')} registered"
+                        f"{f'; failed: {failed}' if failed else ''}")
+    blockers += [f"github: required check {r['context']!r} on the head: {r['state']}" for r in required if r['bucket'] != 'pass']
+    return blockers, [{'context': r['context'], 'app': None if r['app'] == -1 else r['app'], 'state': r['state']} for r in required]
 
 
 def readback(repo, n, merged_any):
@@ -299,10 +265,10 @@ def collect(argv):
     if pr['headRefOid'] != head:
         blockers.append(f"github: the PR head is {pr['headRefOid']}, not the launch's {head}: it rejoins through adoptHead and needs fresh reviews")
         return receipt(n, head, 'not-ready', blockers, pr=pr, detail='the head moved: reviews, CI and required checks were not inspected')
-    required, checks = required_checks(repo, a.base, head)
-    blockers += required
+    blockers += merge_rules(repo, a.base)
     blockers += review_blockers(repo, n, facts['fingerprint'], head)
-    blockers += ci_blockers(repo, n, head)
+    ci, checks = ci_blockers(repo, n, head, a.base)
+    blockers += ci
     # Read just before merging: the checks above take a while, and the PR may have been retargeted or moved meanwhile.
     last = settled_view(repo, n)
     # A merge state that changed may name a requirement the checks above never read: run again to read it.

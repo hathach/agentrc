@@ -92,8 +92,12 @@ STALLED = {
     'coderabbit-unreviewed': CR_UNREVIEWED + '; this output does not record its asks, and a failed tick leaves nothing on the PR, '
                              'so a relaunch may not ask again: ' + USER_ASKS,
     'ci-red-unclassified': 'a CI failure is unplaced: investigate it and pass the evidence as ciNotes before relaunching',
-    'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head, or a re-run named in `unregistered` never '
-                'registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
+    'ci-stuck': 'the same checks stayed pending through two whole CI waits on this head (`unmet` names the required checks not yet '
+                'passed: one never registered may be a renamed job or an app that no longer runs), or a re-run named in '
+                '`unregistered` never registered within ciWait: observe them once (a hung job, a missing runner) before relaunching',
+    'required-check-failed': 'a check the base branch requires failed (`requiredFailed`) with no failure left to repair or re-run, '
+                             'or only accepted ones, which never cover a required check: fix or re-run it, or change the '
+                             "requirement; GitHub refuses the merge until it passes, and that decision is the user's",
     'github-rate-limited': 'GitHub refused a call for a rate limit (`rateLimit`): relaunch from the stateRef after its resetAt, '
                            'or after a few minutes for a secondary limit',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',

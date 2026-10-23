@@ -63,13 +63,10 @@ class World:
 
     def __init__(self):
         self.views = [live()]
-        self.protection = {'required_status_checks': {'contexts': [], 'checks': []}}
         self.rules = []
-        self.runs = []
-        self.statuses = []
         self.fresh = {'headSha': HEAD, 'fingerprint': FP, 'bots': [bot('coderabbit'), bot('copilot', 'absent', None), bot('greptile')]}
-        self.inventory = {'head': HEAD, 'status': 'green', 'mergeable': 'MERGEABLE', 'pending': 0, 'registered': 12, 'ignored': [],
-                          'waiting': '', 'checks': [], 'observedAt': 'now'}
+        self.inventory = {'head': HEAD, 'baseRef': 'main', 'status': 'green', 'mergeable': 'MERGEABLE', 'pending': 0, 'registered': 12,
+                          'ignored': [], 'waiting': '', 'checks': [], 'requiredChecks': [], 'observedAt': 'now'}
         self.merged = (0, '', '')
         self.ran = []
         self.harvested = []
@@ -80,15 +77,8 @@ class World:
             if isinstance(got, Exception):
                 raise got
             return got
-        path = argv[-1]
-        if path == 'repos/o/r/branches/main':
-            return {'protection': self.protection}
-        if path.startswith('repos/o/r/rules/branches/main'):
+        if argv[-1].startswith('repos/o/r/rules/branches/main'):
             return [self.rules]
-        if path.startswith(f'repos/o/r/commits/{HEAD}/check-runs'):
-            return [{'check_runs': self.runs}]
-        if path.startswith(f'repos/o/r/commits/{HEAD}/statuses'):
-            return [self.statuses]
         raise AssertionError(f'unexpected gh {argv}')
 
     def collect(self, argv):
@@ -167,42 +157,36 @@ class MergeTest(unittest.TestCase):
                 self.world.views = [live(mergeStateStatus=state)]
                 self.assertBlocked(self.run_it(None, '--merge'), f'merge state {state}')
 
+    def required(self, *checks):
+        self.world.inventory['requiredChecks'] = [{'context': c, 'app': app, 'state': state, 'bucket': bucket} for c, app, state, bucket in checks]
+        if any(bucket != 'pass' for *_, bucket in checks):
+            self.world.inventory['status'] = 'running'
+
     def test_a_blocked_pr_with_a_required_check_missing_is_not_merged_by_admin(self):
         self.world.views = [live(mergeStateStatus='BLOCKED')]
-        self.world.rules = [{'type': 'required_status_checks', 'parameters': {'required_status_checks': [{'context': 'build'}]}}]
+        self.required(('build', -1, 'not registered', 'missing'))
         self.assertBlocked(self.run_it(None, '--merge'), "required check 'build' on the head: not registered")
 
-    def test_required_checks_from_protection_and_rules(self):
-        self.world.protection = {'required_status_checks': {'contexts': ['lint'], 'checks': [{'context': 'test'}]}}
-        self.world.rules = [{'type': 'required_status_checks', 'parameters': {'required_status_checks': [{'context': 'build'}]}}]
-        self.world.runs = [{'id': 1, 'name': 'build', 'status': 'completed', 'conclusion': 'failure', 'started_at': '2026-10-01T00:00:00Z'},
-                           {'id': 2, 'name': 'build', 'status': 'completed', 'conclusion': 'success', 'started_at': '2026-10-01T01:00:00Z'},
-                           {'id': 3, 'name': 'test', 'status': 'completed', 'conclusion': 'neutral', 'started_at': '2026-10-01T00:00:00Z'}]
-        self.world.statuses = [{'context': 'lint', 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'}]
+    def test_the_inventory_s_required_checks_are_the_receipt_s_evidence(self):
+        self.required(('build', -1, 'completed/success', 'pass'), ('lint', 42, 'success', 'pass'))
         got = self.run_it()
-        self.assertEqual(got['outcome'], 'ready', 'a rerun that passed, a neutral run and a success status pass')
+        self.assertEqual(got['outcome'], 'ready')
         self.assertEqual(got['requirements']['requiredChecks'], [{'context': 'build', 'app': None, 'state': 'completed/success'},
-                                                                 {'context': 'lint', 'app': None, 'state': 'success'},
-                                                                 {'context': 'test', 'app': None, 'state': 'completed/neutral'}])
-        self.world.runs[2]['status'] = 'in_progress'
-        self.assertBlocked(self.run_it(), "required check 'test' on the head: in_progress")
-        self.world.runs[2]['status'] = 'completed'
-        self.world.runs.append({**self.world.runs[2], 'id': 4, 'conclusion': 'failure'})
-        self.assertBlocked(self.run_it(), "required check 'test' on the head: its runs cannot be ordered")
-        self.world.runs = [{'id': 5, 'name': 'lint', 'status': 'completed', 'conclusion': 'failure', 'started_at': '2026-10-01T00:00:00Z'}]
-        self.assertBlocked(self.run_it(), "required check 'lint' on the head: completed/failure")  # a run outranks a success status
+                                                                 {'context': 'lint', 'app': 42, 'state': 'success'}])
+        self.required(('build', 42, 'not registered by app 42 (only by app 99)', 'missing'))
+        self.assertBlocked(self.run_it(), r"required check 'build' on the head: not registered by app 42 \(only by app 99\)")
 
-    def test_a_check_required_from_an_app_passes_only_on_that_app_s_run(self):
-        self.world.rules = [{'type': 'required_status_checks', 'parameters': {'required_status_checks': [{'context': 'build', 'integration_id': 42}]}}]
-        self.world.runs = [{'id': 2, 'name': 'build', 'status': 'completed', 'conclusion': 'success', 'app': {'id': 99}, 'started_at': '2026-10-01T00:00:00Z'}]
-        self.world.statuses = [{'context': 'build', 'state': 'success', 'updated_at': '2026-10-01T00:00:00Z'}]
-        self.world.views = [live(mergeStateStatus='BLOCKED')]
-        self.assertBlocked(self.run_it(None, '--merge'), "required check 'build' on the head: not registered by app 42")
-        self.world.runs[0]['app']['id'] = 42
-        self.assertEqual(self.run_it()['outcome'], 'ready')
-        self.world.protection = {'required_status_checks': {'contexts': ['build'], 'checks': [{'context': 'build', 'app_id': -1}]}}
-        self.world.runs[0]['app']['id'] = 99
-        self.assertBlocked(self.run_it(), 'not registered by app 42', )
+    def test_an_inventory_without_readable_required_checks_or_for_another_base_blocks(self):
+        GOOD = {'context': 'build', 'app': -1, 'state': 'success', 'bucket': 'pass'}
+        for name, change, pattern in (('none', lambda inv: inv.pop('requiredChecks'), 'no readable requiredChecks'),
+                                      ('malformed', lambda inv: inv.__setitem__('requiredChecks', [{'context': 'build'}]), 'no readable requiredChecks'),
+                                      *((f'bad {k}', lambda inv, k=k, v=v: inv.__setitem__('requiredChecks', [{**GOOD, k: v}]), 'no readable requiredChecks')
+                                        for k, v in (('context', None), ('state', None), ('app', '42'), ('app', True), ('bucket', 'ok'))),
+                                      ('another base', lambda inv: inv.__setitem__('baseRef', 'next'), "for base 'next', not 'main'")):
+            with self.subTest(name):
+                self.world.__init__()
+                change(self.world.inventory)
+                self.assertBlocked(self.run_it(None, '--merge'), pattern)
 
     def test_squash_must_be_allowed_and_no_queue(self):
         cases = {

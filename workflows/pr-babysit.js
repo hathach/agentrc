@@ -361,12 +361,16 @@ const RATE_LIMIT = {
   type: ['object', 'null'], additionalProperties: false, required: ['observedAt', 'resetAt', 'secondary'],
   properties: { observedAt: { type: 'string' }, resetAt: { type: ['string', 'null'] }, secondary: { type: 'boolean' } },
 }
+const REQUIRED_CHECK = {
+  type: 'object', additionalProperties: false, required: ['context', 'app', 'state', 'bucket'],
+  properties: { context: { type: 'string' }, app: { type: 'integer' }, state: { type: 'string' }, bucket: { enum: ['pass', 'pending', 'fail', 'missing'] } },
+}
 const INVENTORY = withSeal({
-  type: 'object', required: ['head', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'observedAt'],
+  type: 'object', required: ['head', 'baseRef', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'requiredChecks', 'observedAt'],
   properties: {
-    error: { type: ['string', 'null'] }, head: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
+    error: { type: ['string', 'null'] }, head: { type: 'string' }, baseRef: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
     pending: { type: 'integer' }, registered: { type: 'integer' }, ignored: { type: 'array', items: { type: 'string' } }, waiting: { type: 'string' },
-    checks: { type: 'array', items: COLLECT_CHECK }, observedAt: { type: 'string' }, rateLimit: RATE_LIMIT,
+    checks: { type: 'array', items: COLLECT_CHECK }, requiredChecks: { type: 'array', items: REQUIRED_CHECK }, observedAt: { type: 'string' }, rateLimit: RATE_LIMIT,
   },
 })
 const GATE = {
@@ -1114,7 +1118,10 @@ const owesDismissal = (commentId) => {
 }
 // findingId, not the location: a fix moves the line and a re-harvest rewords the claim (pr-review-validator.md).
 const dismissalKey = (f) => f.findingId
-const acceptedOnly = (c) => c.status === 'red' && c.realFailures.length > 0 && c.realFailures.every(rf => rf.accepted) && c.infraRerun.length === 0
+// Red with no infra re-run under way and no failure left but accepted ones.
+const nothingToRepair = (c) => c.status === 'red' && c.infraRerun.length === 0 && c.realFailures.every(rf => rf.accepted)
+// An accepted failure never covers a failed required check: GitHub still refuses the merge.
+const acceptedOnly = (c) => nothingToRepair(c) && c.realFailures.length > 0 && !c.requiredFailed
 
 const stop = (cycles, reason, extra) => ({ pass: false, cycles, history, reason, ...extra })
 // A PR no longer open ends the launch whatever else is pending: there is nothing left to babysit.
@@ -1745,6 +1752,7 @@ const backoff = (cycle) => 60000 * Math.min(cycle, 10)
 // Set where a cycle continues only to wait (CI, bots, owed replies, a SonarCloud re-read); any other continuation pauses yieldOnChange.
 let waited = false
 const rearm = () => { waited = true; return null }
+const requiredName = (r) => r.app === -1 ? r.context : `${r.context} (app ${r.app})`
 // The cycle before this one, the state's last included: history holds this cycle's entry already.
 const before = (k) => history.length > 1 ? history[history.length - 2][k] : null
 
@@ -2113,11 +2121,14 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   }
   // A head on which a whole wait found no check registered is read again at once, not waited out every cycle.
   const prior = before('ciWaited')
-  const unregistered = !!prior && prior.head === expectedHead && prior.registered === 0
+  const unregistered = !!prior && prior.head === expectedHead && prior.registered === 0 && !prior.unmet
   const ignoring = ciIgnored.map(name => ` --ignore-check ${shq(name)}`).join('')
   // Only the review lane's checks registered, and its pass is done: they are its to wait on. The pass is a grace
   // period for checks that register late, not proof none will.
-  const noneRegistered = (inv) => inv.status === 'running' && inv.registered === 0 && inv.mergeable === 'MERGEABLE'
+  // A required check not yet passed is something to wait for, registered or not.
+  const unmetOf = (inv) => inv.requiredChecks.filter(r => r.bucket === 'pending' || r.bucket === 'missing')
+  const noneRegistered = (inv) => inv.status === 'running' && inv.registered === 0 && inv.mergeable === 'MERGEABLE' &&
+    inv.requiredChecks.every(r => r.bucket === 'pass')
   const reviewOnly = (inv) => lanes.reviewDone && inv.ignored.length > 0 && noneRegistered(inv)
   // collect.py polls every 30 s, so a shorter slice would only list.
   let inv = null
@@ -2145,8 +2156,10 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   }
   if (['merged', 'closed'].includes(inv.status)) return endLanes(inv)
   const failing = inv.checks.filter(c => c.bucket === 'fail' || c.bucket === 'cancel')
+  const unmet = unmetOf(inv)
+  const failedRequired = inv.requiredChecks.filter(r => r.bucket === 'fail')
   const shown = inv.mergeable === 'CONFLICTING' ? 'conflicting'
-    : inv.pending > 0 || inv.mergeable === 'UNKNOWN' ? 'running' : failing.length ? 'red' : null
+    : inv.pending > 0 || inv.mergeable === 'UNKNOWN' || unmet.length ? 'running' : failing.length || failedRequired.length ? 'red' : null
   if (inv.head !== expectedHead || (shown ? inv.status !== shown : !['green', 'running'].includes(inv.status))) {
     log(`cycle ${cycle}: CI inventory is inconsistent — head ${inv.head.slice(0, 7) || 'none'} for ${expectedHead.slice(0, 7)}, ${inv.status} with ${failing.length} failing check(s); re-arming`)
     return null
@@ -2162,7 +2175,10 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     log(`cycle ${cycle}: no CI check registered on ${inv.head.slice(0, 7)} after a whole ${ciWait}-minute wait — nothing to wait for`)
     return { headSha: inv.head, status: 'green', infraRerun: [], realFailures: [] }
   }
-  if (exhausted) entry.ciWaited = { head: inv.head, registered: inv.registered, pending: inv.pending, waiting: inv.waiting }
+  if (exhausted) {
+    entry.ciWaited = { head: inv.head, registered: inv.registered, pending: inv.pending, waiting: inv.waiting,
+      ...(unmet.length ? { unmet: unmet.map(requiredName) } : {}) }
+  }
   // No registered check stands for a PR GitHub cannot merge: judge nothing until the base is merged in.
   if (inv.status === 'conflicting') return { headSha: inv.head, status: 'conflicting', infraRerun: [], realFailures: [] }
   const gated = failing.filter(c => gateOf({ check: c.name, workflow: c.workflow }))
@@ -2242,6 +2258,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     // A re-run not yet registered reads as a red the inventory returns at once: the re-arm waits instead (#123).
     ...(settling.length && inv.status !== 'running' ? { settling: true } : {}),
     ...(overdue.length ? { unregistered: overdue.map(c => `${c.workflow} / ${c.name}`) } : {}),
+    ...(failedRequired.length ? { requiredFailed: failedRequired.map(({ context, app }) => ({ context, app })) } : {}),
     realFailures: cached.flatMap(c => keyed(c, JSON.parse(JSON.stringify(ciVerdicts.get(c.link).failures)))),
   }
   if (cached.length) log(`cycle ${cycle}: CI verdicts reused for ${cached.length} check(s) already judged on this head`)
@@ -2879,9 +2896,10 @@ const runLanes = async (cycle, entry, lanes) => {
       return null
     }
     const now = entry.ciWaited, prev = before('ciWaited')
-    if (c.status === 'running' && now && now.registered > 0 && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
-      log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s) after two whole waits — observe them before relaunching`)
-      return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending })
+    if (c.status === 'running' && now && (now.registered > 0 || now.unmet) && prev && ['head', 'registered', 'pending', 'waiting'].every(k => now[k] === prev[k])) {
+      const required = now.unmet ? `; required check(s) not passed: ${now.unmet.join(', ')}` : ''
+      log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)} still running with the same ${now.pending} pending check(s)${required} after two whole waits — observe them before relaunching`)
+      return stop(cycle, 'ci-stuck', { head: now.head, pending: now.pending, ...(now.unmet ? { unmet: now.unmet } : {}) })
     }
     if (c.unregistered) {
       log(`cycle ${cycle}: CI on ${expectedHead.slice(0, 7)}: the re-run of ${c.unregistered.join(', ')} has not registered within ${ciWait} minutes — observe it before relaunching`)
@@ -2890,6 +2908,12 @@ const runLanes = async (cycle, entry, lanes) => {
     if (!reviewLane) {
       log(`cycle ${cycle}: ci lane only — reviews not observed, no verdict this launch`)
       return null
+    }
+    // A required check that failed with nothing left to repair or re-run: no fix here makes GitHub accept the merge.
+    if (nothingToRepair(c) && c.requiredFailed) {
+      const names = c.requiredFailed.map(requiredName)
+      log(`cycle ${cycle}: CI red from required check(s) ${names.join(', ')} with no failure left to repair — stopping`)
+      return stop(cycle, 'required-check-failed', { head: expectedHead, requiredFailed: c.requiredFailed, outstanding: outstanding() })
     }
     if (reviewsSettled && (c.status === 'green' || acceptedOnly(c))) {
       const owedNow = outstanding()
