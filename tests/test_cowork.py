@@ -1056,7 +1056,7 @@ class CoworkTest(unittest.TestCase):
     @unittest.skipIf(os.name != 'nt', 'the job object is the Windows backend')
     def test_kill_takes_a_daemon_whose_parent_already_exited(self):
         daemon = ("import subprocess, sys; open('daemon.pid', 'w').write(str(subprocess.Popen("
-                  f"{SLEEP!r}, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP).pid))")
+                  f"{SLEEP!r}, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP).pid))")
         self.codex_does(f'import subprocess; subprocess.run([sys.executable, "-c", {daemon!r}])')
         proc, request = self.send_gated('--task', 'x')
         until(lambda: (self.root / 'daemon.pid').exists() and (self.root / 'daemon.pid').read_text())
@@ -1335,7 +1335,7 @@ class CoworkTest(unittest.TestCase):
         self.assertTrue((box / 'codex-x.task').exists(), 'unread')
 
     def test_kill_takes_tools_that_left_the_process_group(self):
-        away = ('creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP' if os.name == 'nt'
+        away = ('creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP' if os.name == 'nt'
                 else 'start_new_session=True')
         self.codex_does(f"import subprocess; open('tool.pid', 'w').write(str(subprocess.Popen({SLEEP!r}, {away}).pid))")
         proc, request = self.send_gated('--task', 'x')
@@ -1351,7 +1351,7 @@ class CoworkTest(unittest.TestCase):
         if os.name == 'nt':  # no sh or setsid: detached Pythons, which the runner's job still holds
             late = ("import subprocess, sys, time\nwhile True:\n    subprocess.Popen([sys.executable, '-c', "
                     "'import pathlib, time; time.sleep(1); pathlib.Path(\"late\").touch()'], "
-                    "creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)\n    time.sleep(0.05)")
+                    "creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)\n    time.sleep(0.05)")
             self.codex_does(f'import subprocess; subprocess.Popen([sys.executable, "-c", {late!r}])')
         else:
             self.codex_does('import subprocess; subprocess.Popen(["sh", "-c", "while :; do setsid sh -c \\"sleep 1; touch late\\" & sleep 0.05; done"])')
