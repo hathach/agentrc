@@ -25,6 +25,9 @@ python3 $S reset codex|claude <lane>|all
 python3 $S default [astra|sol]   # the Codex default tier's preset on this host
 ```
 
+On Windows, `python3` is a native CPython, `python` on a stock install
+(`REFERENCE.md`).
+
 In Claude Code, run `send --detach` in the foreground and arm Monitor, at
 its maximum `timeout_ms`, on `python3 $S read --wait --out <scratch file> <id> 2>&1`
 as the request's only reader: Monitor survives the memory pressure that may

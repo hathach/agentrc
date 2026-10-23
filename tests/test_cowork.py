@@ -155,7 +155,7 @@ def letting_go(holder):
             if holder:
                 holder.close()
             raise
-    with mock.patch.object(cowork.windows, 'retry', lambda step, *tries: retry(lambda: attempt(step), *tries)):
+    with mock.patch.object(cowork.windows, 'retry', lambda step, tries=50: retry(lambda: attempt(step), tries)):
         yield met
 
 
@@ -382,6 +382,24 @@ class CoworkTest(unittest.TestCase):
         self.gate.unlink()
         self.send('--task', 'c')
         self.assertNotIn('resume', self.calls()[-1]['argv'])
+
+    def test_a_read_only_reset_refuses_any_other_lane_under_its_lock(self):
+        # The coworker relay resets only read-only lanes; a lane remade as a worktree lane between
+        # a status read and the reset must not lose its tree.
+        self.commit('a.txt', 'a')
+        self.send('--task', 'a')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        self.send('--lane', 'review', '--task', 'q')
+        for lane, what in (('main', 'main'), ('impl', 'worktree')):
+            code, _, err = self.run_cli('reset', 'codex', lane, '--read-only')
+            self.assertEqual(code, cowork.BUSY, lane)
+            self.assertIn(f'codex/{lane} is {what}, not read-only', err)
+            self.assertTrue((self.box(lane=lane) / 'session').exists(), lane)
+        code, _, err = self.run_cli('reset', 'codex', 'all', '--read-only')
+        self.assertEqual(code, cowork.FAILED)
+        self.assertIn('not all', err)
+        code, out, _ = self.run_cli('reset', 'codex', 'review', '--read-only')
+        self.assertEqual((code, out.strip()), (0, 'codex/review: session forgotten'))
 
     # --- model and effort ---------------------------------------------------------
 
@@ -901,6 +919,13 @@ class CoworkTest(unittest.TestCase):
         for path, found in (((first, second), first / 'codex.cmd'), ((second, first), second / 'codex.exe')):
             with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': os.pathsep.join(map(str, path))}):
                 self.assertEqual(cowork.nt_cli(['codex', 'exec']), [str(found), 'exec'], 'PATH order, then .exe first')
+
+    def test_a_cli_only_a_relative_path_entry_reaches_is_not_found(self):
+        (self.root / 'codex.exe').touch()  # the checkout, the working directory
+        for path, cwd in (('.', self.root), (os.pathsep.join(('', self.root.name)), self.root.parent)):
+            with self.subTest(path=path), mock.patch.dict('os.environ', {'PATH': path}), contextlib.chdir(cwd), \
+                    self.assertRaisesRegex(FileNotFoundError, 'codex is not on PATH as codex.exe, codex.cmd, codex.bat'):
+                cowork.nt_cli(['codex', 'exec'])
 
     @unittest.skipIf(os.name != 'nt', 'CreateProcess searches the current directory on Windows only')
     def test_git_is_found_on_path_alone_never_in_the_checkout(self):

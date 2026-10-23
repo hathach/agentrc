@@ -6,7 +6,7 @@
   cowork.py kill <id>
   cowork.py read [--wait] [--out FILE] <id>
   cowork.py status [--all]
-  cowork.py reset <side> <lane>|all
+  cowork.py reset <side> <lane>|all [--read-only]
 
 A lane is one resumed session of a side, with files under
 <git dir>/cowork/<side>/<lane>/: `session` holds the session id, the model
@@ -40,18 +40,22 @@ release with --wait and refusing a running request otherwise, and with --out
 writing what it would print to that file in one step, printing only a short
 receipt that names it; status lists the lanes holding a request and counts
 the idle ones, --all lists every lane; reset removes
-everything of a lane, its worktree included once its branch is merged.
+everything of a lane, its worktree included once its branch is merged, and
+with --read-only only a read-only lane, checked under the lane's lock.
 
 Exit codes: 0 success, for a delivery a reply; 1 the turn failed, was
 killed or died, or never ran because a --no-edit tree could not be read
-before it, or a setup, git or argument-validation error; 2 a command line
-argparse rejects; 3 refused, with no receipt: an unknown or delivered
-request, a running one under plain read, a read --out FILE that cannot be
-written (the request kept), a busy lane, a lane of another kind than the
-flags assert or not ready (pinned, kindless, its worktree unusable or not
-creatable), or reset refused; 4 an empty reply, a writer's reply without
-its "Files touched" line, or a --no-edit turn that changed the tree or
-after which it could not be checked.
+before it, or a setup or argument-validation error, or a git command that
+failed, creating or removing a lane's worktree among them; 2 a command line
+argparse rejects, a --tier, --model or --effort for the other side's lane
+among them; 3 refused, with no receipt: an unknown or delivered request, a
+running one under plain read, a read --out FILE that cannot be written (the
+request kept), a busy lane, a lane of another kind than the flags assert or
+not ready (pinned, kindless, its worktree unusable, or not creatable from a
+detached host, beside a branch with no recorded base or when herdr cannot
+place it), or reset refused; 4 an empty reply, a writer's reply without its
+"Files touched" line, or a --no-edit turn that changed the tree or after
+which it could not be checked.
 """
 
 import argparse
@@ -1196,7 +1200,7 @@ def start(box, root, side, task, no_edit, read_only, worktree, model, effort, ti
     return request
 
 
-def reset(root, gitdir, side, lane):
+def reset(root, gitdir, side, lane, read_only=False):
     """Forget a lane: its session, requests, marker, base and worktree. The
     box and its admission lock stay, so a send waiting on that lock is not
     left holding an unlinked inode."""
@@ -1208,7 +1212,10 @@ def reset(root, gitdir, side, lane):
         busy = running(box)
         if busy:
             die(f'{side}/{lane} is busy with {busy}; not resetting under it', BUSY)
-        if kind(box) in ('worktree', None):  # a kindless lane may still have a tree
+        lane_kind = kind(box)
+        if read_only and lane_kind != 'read-only':
+            die(f'{side}/{lane} is {lane_kind or "kindless"}, not read-only; not resetting it', BUSY)
+        if lane_kind in ('worktree', None):  # a kindless lane may still have a tree
             drop_lane(root, box)
         gone = requests(box)
         try:
@@ -1260,6 +1267,7 @@ def main(argv=None):
                                           'the next send starts anew')
     reset_.add_argument('side', choices=SIDES)
     reset_.add_argument('lane', help='a lane name, or all')
+    reset_.add_argument('--read-only', action='store_true', help='reset only a read-only lane, checked under its lock')
     # the detached child of `send`; on Windows, also the middle process that starts it
     for cmd in ('_run',) + (() if fcntl else ('_detach',)):
         runner = sub.add_parser(cmd, help=argparse.SUPPRESS)
@@ -1371,8 +1379,10 @@ def main(argv=None):
     if a.cmd == 'reset':
         if a.lane != 'all' and not LANE.match(a.lane):
             die(f'lane names are [a-z0-9-], up to 40: {a.lane!r}')
+        if a.read_only and a.lane == 'all':
+            die('--read-only resets one named lane, not all')
         for lane in lanes(gitdir, a.side) if a.lane == 'all' else [a.lane]:
-            reset(root, gitdir, a.side, lane)
+            reset(root, gitdir, a.side, lane, a.read_only)
         return 0
 
 

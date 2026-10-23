@@ -167,17 +167,6 @@ def extractor():
     return cmd
 
 
-def retried(op, *args):
-    """op(*args); on Windows a reader or a scanner with the file open refuses it for a moment."""
-    for attempt in range(50):
-        try:
-            return op(*args)
-        except PermissionError:
-            if os.name != "nt" or attempt == 49:
-                raise
-            time.sleep(0.02)
-
-
 def page_count(src):
     """Pages according to pdfinfo. Explicitly unavailable when it cannot say."""
     done = subprocess.run([pdfinfo(), src], capture_output=True, encoding="utf-8", errors="replace")
@@ -219,7 +208,7 @@ def extract(bid, src):
                 "extractor": EXTRACTOR, "version": VERSION}
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(json.dumps(meta) + "\n" + body)
-        retried(os.replace, tmp, text_path(bid))
+        windows.replace(tmp, text_path(bid))
         return meta
     finally:
         if os.path.exists(tmp):
@@ -395,7 +384,7 @@ def prune(db):
         m = re.fullmatch(r"(\d+)\.txt(?:\.tmp\d+)?", name)  # only names this script writes
         path = os.path.join(INDEX, name)
         if m and int(m.group(1)) not in alive and os.path.isfile(path):
-            retried(os.remove, path)
+            windows.retry(lambda: os.remove(path))
             removed += 1
     return removed
 
