@@ -400,7 +400,8 @@ class Engine(unittest.TestCase):
             lk.release_token(token)
         self.assertEqual(lk.read_record('b'), rec)
         receipt.parent.mkdir(parents=True)
-        receipt.write_text(json.dumps({'closed': True, 'cleanup': 'done'}))    # as `hil_openocd_esp.py end` leaves it
+        # as `hil_openocd_esp.py end` leaves it
+        receipt.write_text(json.dumps({'tool': 'hil_openocd_esp', 'closed': True, 'cleanup': 'done'}))
         lk.release_token(token)
         self.assertIsNone(lk.read_record('b'))
 

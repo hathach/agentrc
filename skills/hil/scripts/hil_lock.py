@@ -608,9 +608,10 @@ def _release_receipts(recs, key='receipts') -> list:
 
 def _retained_state(receipt) -> str:
     """'ended' once the session receipt at path `receipt` (esp_session's receipt format) is
-    closed after its provider's reviewed end, as `hil_openocd_esp.py end` leaves it on exit 0
-    (`closed` true, `cleanup` 'done'), else why not. A receipt kept as a record, not a path, is
-    never reread, so never ended: its board needs a recovery takeover."""
+    hil_openocd_esp's, closed after its reviewed end, as `hil_openocd_esp.py end` leaves it on
+    exit 0 (`tool` 'hil_openocd_esp', `closed` true, `cleanup` 'done'), else why not. A receipt
+    kept as a record, not a path, is never reread, so never ended: its board needs a recovery
+    takeover."""
     if not isinstance(receipt, str):
         return 'not a receipt path, so never proven ended'
     try:
@@ -621,7 +622,9 @@ def _retained_state(receipt) -> str:
             rec = json.load(f)
     except (OSError, ValueError) as e:
         return f'unreadable ({e!r:.80})'
-    if not isinstance(rec, dict) or rec.get('closed') is not True:
+    if not isinstance(rec, dict) or rec.get('tool') != 'hil_openocd_esp':
+        return 'not a hil_openocd_esp session receipt'
+    if rec.get('closed') is not True:
         return 'not closed'
     return 'ended' if rec.get('cleanup') == 'done' else f'closed with cleanup {rec.get("cleanup")!r:.40}'
 

@@ -1534,8 +1534,9 @@ class HandOver(LockDir):
         self.assertEqual(hil_lock.read_record(BOARD)['retained'], [str(receipt)])
         sent = self.signals()
         receipt.parent.mkdir()
-        for content, state in ((None, 'unreadable'), ({'closed': False, 'cleanup': None}, 'not closed'),
-                               ({'closed': True, 'cleanup': 'unknown'}, "closed with cleanup 'unknown'")):
+        tool = {'tool': 'hil_openocd_esp'}
+        for content, state in ((None, 'unreadable'), ({**tool, 'closed': False, 'cleanup': None}, 'not closed'),
+                               ({**tool, 'closed': True, 'cleanup': 'unknown'}, "closed with cleanup 'unknown'")):
             if content is not None:
                 receipt.write_text(json.dumps(content))
             with self.assertRaisesRegex(hil_lock.ReleaseRefused,
@@ -1551,7 +1552,7 @@ class HandOver(LockDir):
             with self.assertRaisesRegex(hil_lock.ReleaseRefused, f'signalled, but holder pid {pid} left its records'):
                 hil_lock.release_token(token)
         self.assertEqual((sent, hil_lock.read_record(BOARD)), ([signal.SIGUSR1], rec))
-        receipt.write_text(json.dumps({'closed': True, 'cleanup': 'done'}))
+        receipt.write_text(json.dumps({'tool': 'hil_openocd_esp', 'closed': True, 'cleanup': 'done'}))
         self.patch(hil_lock, 'RELEASE_WAIT', 5)
         self.assertEqual(hil_lock.release_token(token), (pid, [BOARD]))
         self.assertIsNone(hil_lock.read_record(BOARD))
@@ -1566,7 +1567,11 @@ class HandOver(LockDir):
         fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
         self.addCleanup(fh.close)
         ended = Path(self.dir, 'ended.json')
-        ended.write_text(json.dumps({'closed': True, 'cleanup': 'done'}))
+        ended.write_text(json.dumps({'tool': 'hil_openocd_esp', 'closed': True, 'cleanup': 'done'}))
+        for rec in ({'closed': True, 'cleanup': 'done'}, {'tool': 'other', 'closed': True, 'cleanup': 'done'}):
+            foreign = Path(self.dir, 'foreign.json')
+            foreign.write_text(json.dumps(rec))
+            self.assertEqual(hil_lock._retained_state(str(foreign)), 'not a hil_openocd_esp session receipt', rec)
         for retained, releasable in (([str(ended)], True), ([str(ended), str(fifo)], False), ('x', False)):
             hil_lock.write_record(fh, 'selftest run', retained=retained)
             self.assertEqual(hil_lock._releasable([fh]), releasable, retained)
