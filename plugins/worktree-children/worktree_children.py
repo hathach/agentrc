@@ -402,14 +402,17 @@ def check(child):
 def anchored(path, here):
     """(the directory path resolves from, the names after it): path's own drive and root when it has
     a root (here's drive when it names none, as Windows reads `\\x`), else here. Windows' `\\\\?\\`
-    prefix, which readlink can return, is dropped and either separator splits. A drive-relative path
-    (`C:x`), relative to that drive's working directory, raises OSError."""
+    prefix, which readlink can return, is dropped and either separator splits. A bare UNC share
+    (`\\\\srv\\share`) is its own root. A drive-relative path (`C:x`), relative to that drive's working
+    directory, raises OSError."""
     if os.altsep:
         path = path.replace(os.altsep, os.sep)
     if os.name == 'nt' and path.startswith('\\\\?\\'):  # a volume GUID path keeps it: no other names it
         path = ('\\\\' + path[8:] if path[4:8].upper() == 'UNC\\' else
                 path[4:] if re.match(r'[A-Za-z]:', path[4:]) else path)
     drive, tail = os.path.splitdrive(path)
+    if os.name == 'nt' and drive.startswith(os.sep * 2) and not tail:  # a UNC share names no directory
+        return drive + os.sep, []
     if not tail.startswith(os.sep):
         if drive:
             raise OSError(f'cannot resolve the drive-relative path {path}')
