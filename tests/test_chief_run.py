@@ -418,9 +418,10 @@ class ChiefRun(unittest.TestCase):
         if hasattr(os, 'getsid'):
             self.assertNotEqual(os.getsid(pid), os.getsid(0), 'a caller ending its process group does not reach it')
         else:   # Windows: a console of its own stands for the session, so no console event from the caller reaches it
-            control = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
-            self.addCleanup(lambda: (control.kill(), control.wait()))
             if console_pids():   # a runner without a console has none for the launcher to share
+                # started only here: without a console of ours, a plain child would get its own, window and all
+                control = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+                self.addCleanup(lambda: (control.kill(), control.wait()))
                 self.wait_until('a plain child to share our console', lambda: control.pid in console_pids())
                 self.assertNotIn(pid, console_pids(), "the launcher is outside the caller's console")
         (self.fake / 'go').touch()
