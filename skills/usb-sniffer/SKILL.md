@@ -52,9 +52,13 @@ $S capture raw.pcapng --speed hs --seconds 15 --serial 4433459538463a    # expli
   summary name the unit; the pcapng does not, so keep the serial with the file.
 - Several units capture at once from separate shells, each with its own
   `--serial` and output, within the kernel's one usbfs buffer limit (the Setup
-  udev rule raises it); `capture` refuses one that would not fit and prints
-  the value to set. Other usbfs users share the limit, so a capture can still
-  die with `LIBUSB_ERROR_NO_MEM`. A unit refused as in use may be another
+  udev rule raises it); `capture` refuses one that, by its estimate from the
+  captures already running, would not fit, and prints the value to set. The
+  checks take no lock and see a capture only once its tool has started, so
+  two started at the same moment can both pass them, overrunning the limit
+  or taking the same unit: start them one after another. Other usbfs users
+  share the limit too, so a capture can still die with
+  `LIBUSB_ERROR_NO_MEM`. A unit refused as in use may be another
   session's capture: wait or take another unit, and stop the holder only when
   it is your own abandoned one.
 - The speed must be the tapped **segment's**: an FS device behind an HS hub
