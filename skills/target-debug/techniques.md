@@ -23,7 +23,10 @@ or 0xFFFFFFFF (Armv8-M). The probe tools set it at connect: J-Link Commander V9.
 cleared by hand, held clear for 2 s with the core running, set again at the next connect) and OpenOCD, whose cortex_m
 examine replaces DEMCR with TRCENA plus its own vector-catch bits (`cortex_m.c` in 0.12.0+dev-g0ce743125). Through them
 it reads set; a tool that leaves it clear needs it set from a debugger session (read DEMCR, `w4 E000EDFC` with bit 24
-added). The script itself never writes.
+added). The script itself never writes. A J-Link Commander close leaves CYCCNT stopped on a running core until the
+next connect; it ran on after an OpenOCD session (V9.78, verified 2026-10-23 stm32f407disco). A cleared TRCENA is the
+suspected mechanism, not observed, since every connect sets it before it can be read. A firmware timestamp taken
+from CYCCNT stands still meanwhile.
 
 The histogram's top entries are the spin site; a flat histogram = core is servicing normally — and an idle loop has a
 hot spot of its own: learn it from a healthy run before reading a wedged one. The sentinel means the target halted or

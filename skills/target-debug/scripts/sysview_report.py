@@ -138,6 +138,8 @@ def read_contexts(path):
             cpu = float(cpu) if cpu else None
         except ValueError:
             raise Usage(f'{path}: line {i} has an unreadable Activations or CPU Load value')
+        if cpu is not None and not math.isfinite(cpu):    # SystemView's load over a capture that spans no time
+            cpu = None
         total = seconds(row['Total Run Time'])
         if act == 0 and not total:
             continue
@@ -176,9 +178,10 @@ def time_base(rows, warnings):
 
 
 def timed_from(rows):
-    """Index of the first row past a possible untimed head, else 0. SystemView exports the events of a post-mortem
-    ring that precede its time origin at the first timestamp; more than one context switch there marks one, though a
-    coarse timestamp clock can tie a live capture's switches too, so only the caller knows which it is."""
+    """Index of the first row past a possible untimed head, else 0. Events written with zero time deltas, as while
+    the target's timestamp counter stood still (sysview.md, "Post-mortem dump"), export at the first timestamp; more
+    than one context switch there marks one, though a coarse timestamp clock can tie a live capture's switches too, so
+    only the caller knows which it is."""
     k = next((i for i, r in enumerate(rows) if r['ts'] != rows[0]['ts']), len(rows))
     switches = sum(r['event'] in SWITCHES for r in rows[:k])
     return k if switches > 1 else 0
@@ -375,8 +378,8 @@ def report(args):
                             f'if this is a decoded post-mortem ring they are untimed, pass --post-mortem')
             head = 0
         elif head:
-            warnings.append(f'the first {head} events are untimed (SystemView times only the end of a post-mortem '
-                            f'ring): event and time metrics cover the {len(rows) - head} timed events after them; '
+            warnings.append(f'the first {head} events share one timestamp and are left out as untimed: '
+                            f'event and time metrics cover the {len(rows) - head} timed events after them; '
                             f'contexts.csv times withheld')
             rows = rows[head:]
             if len(rows) < 2 or rows[-1]['ts'] <= rows[0]['ts']:
@@ -456,7 +459,7 @@ def main(argv=None):
     p.add_argument('--json', action='store_true', help='one JSON object instead of tables')
     p.add_argument('--event-map', metavar='FILE', help='JSON object: absolute event id (decimal string) -> name')
     p.add_argument('--post-mortem', action='store_true',
-                   help='a decoded post-mortem ring: leave out the events before its time origin')
+                   help='a decoded post-mortem ring: leave out its untimed head')
     anchor = p.add_mutually_exclusive_group()
     anchor.add_argument('--window', type=window_arg, metavar='T0:T1', help='seconds from the first event')
     anchor.add_argument('--workload-marker', type=int, metavar='ID', help='first Start to last Stop of this marker')

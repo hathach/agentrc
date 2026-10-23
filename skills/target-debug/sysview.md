@@ -112,9 +112,12 @@ The ring is an overwrite buffer: at bulk USB rates a few kilobytes hold tens of 
 project notes give measured windows). The core stays halted unless `--resume`. On WCH recover by reflashing: a
 `reset run` under SDI does not come back (`rtt`).
 
-SystemView 4.10b times only the end of a decoded ring: the events before its time origin come out at the first
-timestamp, and most of a large ring can be untimed (the project notes give a measured one). The ring still shows
-what ran, in order; `sysview_report.py --post-mortem` takes durations and load from the timed tail only and says so.
+A J-Link Commander session that closes on the running core stops CYCCNT, SystemView's Cortex-M timestamp (observed,
+`techniques.md` under DEMCR.TRCENA): the ring then holds zero time deltas back to that close and is timed only from
+the dump's own connect, an untimed head that can be most of a large ring (the project notes give a measured one). For
+a timed ring, reset first and close no J-Link session on the running core before the dump; to resume, use OpenOCD,
+since a J-Link `--resume` is such a close. The ring still shows what ran, in order; `sysview_report.py --post-mortem`
+takes durations and load from the timed tail only and says so.
 
 ## Reading results
 

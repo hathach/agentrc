@@ -282,6 +282,12 @@ class Unavailable(Case):
     def test_cpu_pct_is_systemviews_value(self):
         self.assertEqual(self.run_report(rows=calls(2))['contexts'][0]['cpu_pct'], 0.33)
 
+    def test_a_non_finite_cpu_load_is_null(self):
+        systick = CTX_ROW.replace('ISR 83,#83', 'SysTick,#15')
+        rows = CTX_ROW.replace('0.33 %', 'nan %') + systick.replace('0.33 %', 'inf %')
+        r = self.run_report(rows=calls(2), contexts=rows)
+        self.assertEqual([c['cpu_pct'] for c in r['contexts']], [None, None])
+
     def test_missing_contexts_is_bad_usage(self):
         err = io.StringIO()
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:

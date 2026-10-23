@@ -149,7 +149,9 @@ landed before building on any name below. `sysview.md` has the routes and how to
     over both streaming routes: live J-Link 8.4 s, ISR 83 p50/p99 18.1/21.1 µs, SysTick 8.8/10.1, `tud_task` (#512)
     23.4/26.2, ready→run 7.2, overflow 131; OpenOCD RTT (`interface/jlink.cfg`) 17.1 s, ISR 83 18.1/22.4, SysTick
     8.8/10.1, overflow 1136, and SystemView reported errors loading the capture (-161).
-  - Its post-mortem build's 64 KiB ring decoded to 12205 events, only the last 158 (6 ms) timed.
+  - Its post-mortem build's 64 KiB ring decoded to 12205 events, only the last 158 (6 ms) timed, consistent with an
+    earlier J-Link session's close having stopped CYCCNT (2026-10-23: dumped after a reflash, 9187 events over 243 ms,
+    all timed).
   - metro_m4_express `cdc_msc_freertos` live J-Link: a 21.7 s window for `--duration-ms 8000` (the trace starts at
     boot; why is not established), ISR 96/98/99 p50 35.8/37.4/32.6 µs, overflow 10.
   - raspberry_pi_pico `cdc_msc` OpenOCD RTT: 17.7 s, ISR 21 (n 19829) p50/p99 8/15 µs in whole microseconds,
