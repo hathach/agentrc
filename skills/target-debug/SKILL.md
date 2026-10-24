@@ -36,7 +36,7 @@ These skills know probes, not projects. Three things come from the project, and 
 - **What its symbols and symptoms mean**: kept here, in `projects/`, for the projects this skill has been used on — see
   "Project notes" at the end.
 
-A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it directly
+A HIL config json maps board → probe, and `rtt.py`, `pc_sample.py` and `swo_capture.py` read it directly
 (`--hil-config <file> --board <name>`; a flag given as well must agree):
 
 | `flasher` field | Means | Becomes |
@@ -47,8 +47,9 @@ A HIL config json maps board → probe, and `rtt.py` and `pc_sample.py` read it 
 | `vid_pid`       | the probe model's USB IDs, openocd only | `--vid-pid` |
 
 A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and `--speed` stay explicit; on
-the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` and `probe_state.py` take
-`jlink` and `openocd` entries; `probe_state.py` reads only the HIL config. `etm_capture.py` does not read it —
+the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py`, `probe_state.py` and
+`swo_capture.py` take `jlink` and `openocd` entries, `swo_capture.py` also `stlink` with your `--cfg`; `probe_state.py`
+reads only the HIL config. `etm_capture.py` does not read it —
 a J-Trace is one probe moved between boards, named with `--probe`.
 
 ## Delegated sessions
@@ -144,7 +145,7 @@ The Core column says where a technique exists; a row that names a core family do
 | Technique                          | Core                                                                                          | Intrusiveness                                           | Reach for it when                                                                                              |
 | ---------------------------------- | --------------------------------------------------------------------------------------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | PC-sampling (DWT_PCSR polled)      | Cortex-M3 and later; ARMv6-M (M0, M0+, M1) only where PCSR is implemented (`techniques.md`)   | no deliberate halt, no firmware change                  | core wedged/spinning somewhere unknown                                                                         |
-| SWO exception trace / hw PC-sample | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                               | none                                                    | ISR ordering/timing with zero code change                                                                      |
+| SWO exception trace / hw PC-sample | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                               | none                                                    | ISR ordering, nesting and duration, a CPU profile, with zero code change                                       |
 | DWT data trace                     | Cortex-M with the ITM: ARMv7-M, Armv8-M Mainline; SWO pin wired                               | none                                                    | stream one address's accesses: value + accessor PC                                                             |
 | Vector catch                       | Cortex-M (ARMv6-M: HardFault and reset only)                                                  | none until a fault fires                                | crash-shaped wedges — autopsy AT the faulting pc                                                               |
 | RAM ring-buffer                    | any; one ring per writing core                                                                | ~tens of cycles per event                               | ISR ordering/timing bugs                                                                                       |
@@ -161,7 +162,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
   explicit halting fallback for a core without a usable PCSR.
 - Probe-state snapshot (DHCSR anchor, PCSR samples, breakpoint budget, symbol reads, region saves, image read-back for
   Cleanup's verification): `techniques.md`, "Probe state" — `probe_state.py`.
-- SWO exception trace, hardware PC-sampling, DWT data trace: `swo-dwt.md`.
+- SWO exception trace, hardware PC-sampling, DWT data trace, ITM stimulus: `swo-dwt.md` — `swo_capture.py`,
+  `swo_decode.py`; per-board notes in `swo-boards.md`.
 - Vector catch and the fault registers: `fault-autopsy.md`.
 - RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code, the `nm` check, the GDB dump.
 - SystemView: `sysview.md` — `sysview_record.py` (live J-Link recording, decoding a raw capture),
