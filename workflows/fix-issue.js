@@ -164,7 +164,7 @@ const hash6 = text => {  // FNV-1a: the sandbox has no crypto
 }
 const lane = args.planLane || `fixplan-${triage.issue ? triage.issue : `t${hash6(target)}`}-${head.slice(0, 7).toLowerCase()}`
 const coplan = { lane, status: 'unresolved', rounds: 0, plan: null, decisions: [], remaining: [], exchanges: [] }
-const fresh = `reset codex/${lane} (python3 ~/.claude/skills/cowork/scripts/cowork.py reset codex ${lane}) and re-run`
+const fresh = `reset codex/${lane} (python3 ~/.claude/skills/cowork/scripts/cowork.py reset codex ${lane} --read-only) and re-run`
 const NEXT = {
   'coplan-unavailable': `Codex co-planning failed; read the transport diagnostic in coplan.exchanges, fix it, then ${fresh}`,
   'checkout-busy': `the checkout changed during a read-only Codex exchange; inspect the changes and identify their source, then rerun with exclusive ownership of the checkout: ${fresh}`,

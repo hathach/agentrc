@@ -198,7 +198,7 @@ test('an existing lane, an unreadable status or a dead status unit stops before 
     if (status && status.stderr) assert.equal(result.coplan.exchanges[0].relay.stderr, 'not a git repository', 'the raw relay is kept')
   }
   assert.equal((await run({ 'plan:status': { stdout: 'codex: no lane\nclaude: no lane\n' } })).result.pass, true, 'no Codex lane at all')
-  assert.match((await run({ 'plan:status': { stdout: `codex/${LANE}: session y\n` } })).result.next, new RegExp(`reset codex ${LANE}`))
+  assert.match((await run({ 'plan:status': { stdout: `codex/${LANE}: session y\n` } })).result.next, new RegExp(`reset codex ${LANE} --read-only`))
   const overridden = await run({ args: { target: '28', planLane: 'other-lane' } })
   assert.equal(overridden.result.reason, 'plan-lane-exists', 'an override lane is checked too')
 })
@@ -244,7 +244,7 @@ test('a checkout that changed during a no-edit Codex turn stops as checkout-busy
     const { result } = await run({ [label]: { requestId: id, ...changed(id) } })
     assert.equal(result.reason, 'checkout-busy', label)
     assert.match(result.next, /checkout changed during a read-only Codex exchange; inspect the changes and identify their source/, label)
-    assert.match(result.next, new RegExp(`reset codex ${LANE}`), label)
+    assert.match(result.next, new RegExp(`reset codex ${LANE} --read-only`), label)
     assert.match(result.coplan.exchanges.find(e => e.label === label).relay.stderr, /tree changed during a --no-edit turn/, `${label}: the diagnostic is kept`)
   }
   const id = `codex-${LANE}-busy`
