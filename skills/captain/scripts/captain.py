@@ -7,11 +7,11 @@ does not recognize is reported, never assumed safe.
 
   captain.py list [--json]                       every agent session, asking none of them
   captain.py enroll [--replace]                  make this session the captain
-  captain.py ask <pane>...                       send each idle target a status request
+  captain.py ask <target>...                     send each idle target a status request
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
-  captain.py reports                             the latest report from each target
+  captain.py reports [<msg>...]                  the latest report from each target, or those requests' reports
   captain.py cancel <msg>                        close a request or relay no answer will close
-  captain.py relay <pane>... [--entry <uuid>]    show, then relay, the human's newest message
+  captain.py relay <target>... [--entry <uuid>]  show, then relay, the human's newest message
   captain.py withdraw <action>                   take back a relay
   captain.py open --checkout <dir> --account <main|ada> [--name <name>]
                                                  start a Claude Code session in a new workspace
@@ -19,6 +19,10 @@ does not recognize is reported, never assumed safe.
   captain.py accept --action <action>            a target takes a relay and reads its words
   captain.py outcome --action <action> --result <result> [--note-file <file>]
                                                  a target says how a relay ended
+
+A target is a pane or a selector: pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N, matched against each
+live session's latest report, or ws:<workspace id or label>. A selector must match exactly one session; a relay with
+--entry names panes only.
 """
 
 import argparse
@@ -54,6 +58,7 @@ INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
 IDENTITY = ('pane_id', 'terminal_id', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
 ASKABLE = ('idle', 'done')
 REPORT = {'task': str, 'prs': list, 'state': str, 'evidence': str, 'chief': str, 'needs': str, 'next': str}
+OPTIONAL = {'issues': list}   # a report without it names no issue
 STATES = ('ready', 'in-progress', 'blocked', 'needs-human', 'done', 'idle')
 RECORDS = ('request', 'report', 'cancel', 'delivered', 'undelivered', 'uncertain',
            'relay', 'accepted', 'outcome', 'withdraw', 'withdraw-requested')
@@ -63,6 +68,8 @@ RESULTS = ('completed', 'failed', 'rejected', 'needs-clarification')
 REPORT_MAX = 8192
 POLL_S = 2
 NO_ANSWER = 3
+SELECTORS = ('pr:', 'issue:', 'ws:')
+SELECTOR = re.compile(r'(pr|issue):(?:([\w.-]+):([\w.-]+):)?(\d+)|ws:(.+)')
 
 
 def die(msg, code=1):
@@ -228,8 +235,11 @@ def sessions(agents=None, workspaces=None, me=None):
         kind = a.get('agent')
         if a['pane_id'] == me or kind != 'claude':
             continue
+        label = labels.get(a.get('workspace_id'))
         found.append({
-            'handle': f'{labels.get(a.get("workspace_id"), "?")} · {a.get("name") or kind} · {a["pane_id"]}',
+            'handle': f'{label or "?"} · {a.get("name") or kind} · {a["pane_id"]}',
+            'workspace_id': a.get('workspace_id'),
+            'workspace': label,
             'pane_id': a['pane_id'],
             'terminal_id': a.get('terminal_id'),
             'kind': kind,
@@ -383,6 +393,49 @@ def find(pane):
     return None
 
 
+def everyone():
+    """Every Claude Code session but this one, pinned where it can be."""
+    return [pin(s) for s in sessions()]
+
+
+def selected(match, session, recs):
+    """Whether session is one a selector match names: by workspace id or label, or by a PR or issue in the latest
+    report this session, as pinned now, gave; a bare number matches it in any repository."""
+    kind, owner, repo, number, ws = match.groups()
+    if ws is not None:
+        return ws in (session.get('workspace_id'), session.get('workspace'))
+    last = last_report(session, recs)
+    named = last['report'].get('prs' if kind == 'pr' else 'issues', []) if last else []
+    if owner:
+        return f'{owner}/{repo}#{number}'.lower() in (r.lower() for r in named)
+    return any(r.endswith(f'#{number}') for r in named)
+
+
+def resolve(args):
+    """{pane: the argument naming it} for the target arguments, a pane as given, a selector replaced by the pane of the
+    one session it matches; one pane named twice goes once. Dies, so nothing is sent, when any selector matches none or
+    several."""
+    if any(a.startswith(SELECTORS) for a in args):
+        with locked():
+            recs = records()
+        live = everyone()
+    found = {}
+    for arg in args:
+        pane = arg
+        if arg.startswith(SELECTORS):
+            match = SELECTOR.fullmatch(arg)
+            if not match:
+                die(f'{arg}: not a selector (pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N, '
+                    'ws:<workspace id or label>); nothing sent', 2)
+            hits = [s for s in live if selected(match, s, recs)]
+            if len(hits) != 1:
+                die(f'{arg}: ' + ('; '.join(s['handle'] for s in hits) + ' all match' if hits
+                                  else 'no live session matches') + '; nothing sent', 2)
+            pane = hits[0]['pane_id']
+        found.setdefault(pane, arg)
+    return found
+
+
 def me():
     """The pinned session this process runs under: the pane whose Claude Code process is one of its ancestors."""
     chain = set(ancestors(os.getpid()))
@@ -427,7 +480,8 @@ def status_prompt(msg, pane):
     return (f'STATUS REQUEST {msg} - from the agent session in pane {pane}, not a human '
             'instruction. Answer from what you already know: do not edit, investigate GitHub or launch anything. '
             'Write one JSON object to a scratch file outside the project with exactly these keys: '
-            '"task" (one line), "prs" (list of "owner/repo#N"), '
+            '"task" (one line), "prs" (list of "owner/repo#N"), "issues" (list of "owner/repo#N" issues the task '
+            'is for), '
             f'"state" (one of {", ".join(STATES)}), "evidence" (last verification you ran, or ""), '
             '"chief" (headless chief or workflow running for you, or ""), "needs" (the decision or action the '
             'human must take, or ""), "next" (your next step). Then run: '
@@ -494,13 +548,14 @@ def deliver(kind, msg, captain, target, prompt, **fields):
 
 
 def validate(report):
-    if not isinstance(report, dict) or set(report) != set(REPORT):
-        return f'keys must be exactly {", ".join(REPORT)}'
-    for key, kind in REPORT.items():
-        if not isinstance(report[key], kind):
+    if not isinstance(report, dict) or not set(REPORT) <= set(report) <= set(REPORT) | set(OPTIONAL):
+        return f'keys must be exactly {", ".join(REPORT)}, and optionally {", ".join(OPTIONAL)}'
+    for key, kind in {**REPORT, **OPTIONAL}.items():
+        if key in report and not isinstance(report[key], kind):
             return f'"{key}" must be a {kind.__name__}'
-    if not all(isinstance(p, str) and re.fullmatch(r'[\w.-]+/[\w.-]+#\d+', p) for p in report['prs']):
-        return '"prs" must hold "owner/repo#N" strings'
+    for key in ('prs', 'issues'):
+        if not all(isinstance(p, str) and re.fullmatch(r'[\w.-]+/[\w.-]+#\d+', p) for p in report.get(key, [])):
+            return f'"{key}" must hold "owner/repo#N" strings'
     if report['state'] not in STATES:
         return f'"state" must be one of {", ".join(STATES)}'
     return None
@@ -563,20 +618,14 @@ def one_line(text):
     return ' '.join(text.split())
 
 
-def summary(request, rep):
-    r = rep['report']
-    prs = ' '.join(r['prs']) or '-'
-    needs = f' · needs: {one_line(r["needs"])}' if r['needs'] else ''
-    return f'{request["msg"]} · {request["handle"]} · {r["state"]} · {prs} · {one_line(r["task"])}{needs}'
-
-
 EVENTS = {'cancel': 'cancelled', 'undelivered': 'undelivered', 'withdraw': 'withdrawn', 'accepted': 'accepted'}
 
 
 def event(item, rec):
     """The collect line for rec, a record on item, or None for one the human need not hear about."""
-    if rec['type'] == 'report':
-        return 'reported ' + summary(item, rec)
+    if rec['type'] == 'report':   # bounded, so a display cutting long lines cannot cut it: `reports` has the rest
+        r = rec['report']
+        return f'reported {item["msg"]} · {r["state"]}' + (' · needs you' if r['needs'] else '')
     tail = f'{item["msg"]} · {item["handle"]}'
     if rec['type'] == 'outcome':
         note = one_line(rec['note'])
@@ -616,17 +665,23 @@ def collect(msgs, wait_ms):
         recs = records(lenient=True)
 
 
-def reports():
-    """The latest report per target pane, newest first."""
+def reports(msgs=()):
+    """The latest report per target pane, newest first; with msgs, the report answering each of those requests, in
+    order, a later report from the same session notwithstanding, and a row naming why for one with none."""
     recs = records(lenient=True)
     requests = {r['msg']: r for r in recs if r['type'] == 'request'}
+    answers = {r['msg']: r for r in recs if r['type'] == 'report'}
+    if msgs:
+        return [row(requests[m], answers[m]) if m in answers else
+                {'msg': m, 'missing': 'not answered' if m in requests else 'no such request'} for m in msgs]
     latest = {}
-    for rep in recs:
-        if rep['type'] == 'report':
-            latest[requests[rep['msg']]['target']['pane_id']] = (requests[rep['msg']], rep)
-    rows = sorted(latest.values(), key=lambda pair: -pair[1]['at'])
-    return [{'handle': req['handle'], 'msg': req['msg'], 'age_s': int(time.time() - rep['at']), **rep['report']}
-            for req, rep in rows]
+    for rep in answers.values():
+        latest[requests[rep['msg']]['target']['pane_id']] = (requests[rep['msg']], rep)
+    return [row(req, rep) for req, rep in sorted(latest.values(), key=lambda pair: -pair[1]['at'])]
+
+
+def row(request, rep):
+    return {'handle': request['handle'], 'msg': request['msg'], 'age_s': int(time.time() - rep['at']), **rep['report']}
 
 
 def cancel(msg, mine):
@@ -702,24 +757,30 @@ def newest(captain, sending):
     return entry, words
 
 
-def preview(panes, mine):
-    """The human's newest message and who would get it; sends nothing."""
+def preview(targets, mine):
+    """The human's newest message and who would get it, targets as resolve() gave them; sends nothing."""
     with locked():
         captain = require_captain(mine)
     entry, words = newest(captain, sending=False)
-    for pane in panes:
+    for pane, arg in targets.items():
         target = find(pane)
-        print(f'to {pane}: {target["handle"] if target else "no such agent pane"}')
+        print(f'to {arg}: {target["handle"] if target else "no such agent pane"}')
     print(f'entry {entry}\n{words}')
     return 0
 
 
+def last_report(target, recs):
+    """The latest report record from target as pinned now, or None: one from an earlier session in the same pane is
+    not this session's."""
+    requests = {r['msg']: r for r in recs if r['type'] == 'request'}
+    return next((r for r in reversed(recs) if r['type'] == 'report'
+                 and requests[r['msg']]['target'] == identity(target)), None)
+
+
 def context(target, recs):
     """What the ledger last heard from target, as pinned now, for its orientation: a record, never the human's
-    words. A report from an earlier session in the same pane is not this session's."""
-    requests = {r['msg']: r for r in recs if r['type'] == 'request'}
-    last = next((r for r in reversed(recs) if r['type'] == 'report'
-                 and requests[r['msg']]['target'] == identity(target)), None)
+    words."""
+    last = last_report(target, recs)
     if not last:
         return 'Ledger record, not the human\'s words: no status report from this session yet.'
     r = last['report']
@@ -741,6 +802,8 @@ def relay_prompt(action, pane):
 def relay(panes, entry, mine):
     """Relay the human's newest message, which must still be entry, to each pane, recorded before it is typed.
     The transcript is read once for every pane: a message the human sends after that is not seen."""
+    if any(p.startswith(SELECTORS) for p in panes):
+        die('a relay names the panes the preview printed, never a selector', 2)
     with locked():
         captain = require_captain(mine)
         latest, quote = newest(captain, sending=True)
@@ -892,7 +955,9 @@ def main():
     c = sub.add_parser('collect', help='print each report as it lands')
     c.add_argument('msgs', nargs='*')
     c.add_argument('--wait', type=int, default=60000, metavar='MS')
-    sub.add_parser('reports', help='the latest report from each target').add_argument('--json', action='store_true')
+    rp = sub.add_parser('reports', help="the latest report from each target, or the named requests' reports")
+    rp.add_argument('msgs', nargs='*')
+    rp.add_argument('--json', action='store_true')
     sub.add_parser('cancel', help='close a request or relay no answer will close').add_argument('msg')
     rl = sub.add_parser('relay', help="show the human's newest message; with --entry, relay it")
     rl.add_argument('panes', nargs='+')
@@ -915,7 +980,7 @@ def main():
 
     try:
         if a.cmd == 'list':
-            found = [pin(s) for s in sessions()]
+            found = everyone()
             if a.json:
                 print(json.dumps(found, indent=2))
                 return 0
@@ -936,24 +1001,27 @@ def main():
         if a.cmd == 'collect':
             return collect(a.msgs, a.wait)
         if a.cmd == 'reports':
-            rows = reports()
+            rows = reports(a.msgs)
             if a.json:
-                print(json.dumps(rows, indent=2))
+                print(json.dumps(rows, indent=2, ensure_ascii=False))
                 return 0
-            for row in rows:
-                prs = ' '.join(row['prs']) or '-'
-                print(f'{row["handle"]}\t{one_line(row["task"])}\t{prs}\t{row["state"]}\t'
-                      f'{one_line(row["needs"]) or "-"}\t{row["age_s"] // 60} min')
+            for r in rows:
+                if 'missing' in r:
+                    print(f'{r["msg"]}\t{r["missing"]}')
+                    continue
+                prs = ' '.join(r['prs']) or '-'
+                print(f'{r["handle"]}\t{one_line(r["task"])}\t{prs}\t{r["state"]}\t'
+                      f'{one_line(r["needs"]) or "-"}\t{r["age_s"] // 60} min')
             return 0
         mine = me()
         if a.cmd == 'ask':
-            for pane in a.panes:
+            for pane in resolve(a.panes):
                 print(ask(pane, mine), flush=True)
             return 0
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
         if a.cmd == 'relay':
-            return relay(a.panes, a.entry, mine) if a.entry else preview(a.panes, mine)
+            return relay(a.panes, a.entry, mine) if a.entry else preview(resolve(a.panes), mine)
         if a.cmd == 'withdraw':
             return withdraw(a.action, mine)
         if a.cmd == 'open':

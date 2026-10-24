@@ -205,7 +205,8 @@ class HerdrTimeoutTest(unittest.TestCase):
 
 def pinned(pane):
     return {'pane_id': pane, 'terminal_id': f'term-{pane}', 'kind': 'claude', 'cwd': '/w', 'session': f's-{pane}',
-            'pid': 10, 'started': 20, 'account': 'main', 'status': 'idle', 'handle': f'ws · name · {pane}'}
+            'pid': 10, 'started': 20, 'account': 'main', 'status': 'idle', 'handle': f'ws · name · {pane}',
+            'workspace_id': pane.split(':')[0], 'workspace': 'ws'}
 
 
 CAPTAIN = pinned('w1:p1')
@@ -461,14 +462,19 @@ class CollectTest(LedgerCase):
         reported = mock.patch.object(captain, 'records', side_effect=self._report_on_second_read(msg))
         with mock.patch('builtins.print') as out, reported:
             self.assertEqual(captain.collect([], 1000), 0)
-        self.assertIn(f'reported {msg} · ws · name · w2:p1 · ready · o/r#12 · fix #1', out.call_args_list[0].args[0])
+        self.assertEqual(out.call_args_list[0].args[0], f'reported {msg} · ready')
 
-    def test_free_text_stays_on_one_line(self):
+    def test_the_reported_line_stays_short_whatever_the_report_holds(self):
+        self.panes['w2:p1'] = {**pinned('w2:p1'), 'handle': 'h' * 300}
         msg = self.msg_of(self.ask())
-        self.report_as('w2:p1', msg, {**GOOD, 'task': 'fix\tit\nnow', 'needs': 'merge\n#12'})
+        long = {**GOOD, 'task': 'fix\tit\n' * 50, 'prs': [f'o/r#{n}' for n in range(50)],
+                'issues': [f'o/r#{n}' for n in range(50)], 'needs': 'merge ✓ é\n' * 300}
+        self.report_as('w2:p1', msg, long)
         with mock.patch('builtins.print') as out:
             captain.collect([msg], 0)
-        self.assertIn('ready · o/r#12 · fix it now · needs: merge #12', out.call_args_list[0].args[0])
+        self.assertEqual(out.call_args_list[0].args[0], f'reported {msg} · ready · needs you')
+        [row] = captain.reports([msg])
+        self.assertEqual(row['needs'], long['needs'])   # the whole text, from reports
 
     def _report_on_second_read(self, msg):
         """The report lands while collect waits: its first read sees the request still open."""
@@ -504,6 +510,17 @@ class CollectTest(LedgerCase):
     def test_unknown_msg(self):
         with self.assertRaises(SystemExit):
             captain.collect(['m-nonesuch'], 0)
+
+    def test_reports_by_msg_keep_a_superseded_report(self):
+        first = self.msg_of(self.ask())
+        self.report_as('w2:p1', first, {**GOOD, 'state': 'in-progress'})
+        second = self.msg_of(self.ask())
+        self.report_as('w2:p1', second)
+        unanswered = self.msg_of(self.ask())
+        rows = captain.reports([first, unanswered, 'm-nonesuch'])
+        self.assertEqual((rows[0]['msg'], rows[0]['state']), (first, 'in-progress'))
+        self.assertEqual(rows[1:], [{'msg': unanswered, 'missing': 'not answered'},
+                                    {'msg': 'm-nonesuch', 'missing': 'no such request'}])
 
     def test_reports_keeps_the_latest_per_target(self):
         first = self.msg_of(self.ask())
@@ -596,7 +613,7 @@ class RelayTest(RelayCase):
         self.say('older')
         uid = self.say('merge o/r#12')
         with mock.patch('builtins.print') as out:
-            captain.preview(['w2:p1', 'w9:p9'], self.ident)
+            captain.preview(captain.resolve(['w2:p1', 'w9:p9']), self.ident)
         shown = '\n'.join(c.args[0] for c in out.call_args_list)
         self.assertIn(f'entry {uid}\nmerge o/r#12', shown)
         self.assertIn('to w2:p1: ws · name · w2:p1', shown)
@@ -628,7 +645,7 @@ class RelayTest(RelayCase):
         with self.assertRaises(SystemExit):
             self.relay(uid)
         with self.assertRaises(SystemExit), mock.patch('builtins.print'):
-            captain.preview(['w2:p1'], self.ident)
+            captain.preview(captain.resolve(['w2:p1']), self.ident)
         self.assertEqual(self.typed, [])
 
     def test_torn_transcript_refuses_sending(self):
@@ -636,7 +653,7 @@ class RelayTest(RelayCase):
         with open(self.transcript, 'a', encoding='utf-8') as f:
             f.write('{"type": "user", "origin"')
         with mock.patch('builtins.print') as out:
-            captain.preview(['w2:p1'], self.ident)
+            captain.preview(captain.resolve(['w2:p1']), self.ident)
         self.assertIn('partly written', '\n'.join(c.args[0] for c in out.call_args_list))
         with self.assertRaises(SystemExit):
             self.relay(uid)
@@ -748,6 +765,99 @@ class RelayTest(RelayCase):
             json.dumps({'type': 'outcome', 'msg': 'a-1', 'result': 'done', 'note': ''}) + '\n', encoding='utf-8')
         with self.assertRaises(captain.Corrupt):
             captain.records()
+
+
+class SelectorTest(RelayCase):
+    """Selectors resolve against the live sessions and each one's latest report, before anything is sent."""
+
+    def setUp(self):
+        super().setUp()
+        self.panes['w3:p1'] = {**pinned('w3:p1'), 'workspace': 'other'}
+        patcher = mock.patch.object(captain, 'everyone',
+                                    lambda: [dict(p) for pane, p in self.panes.items() if pane != self.me])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def reported(self, pane, **change):
+        self.report_as(pane, self.msg_of(self.ask(pane)), {**GOOD, **change})
+
+    def resolve(self, *args):
+        return list(captain.resolve(list(args)))
+
+    def refuses(self, *args):
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr') as err:
+            captain.resolve(list(args))
+        return ''.join(c.args[0] for c in err.write.call_args_list)
+
+    def test_pr_selectors(self):
+        self.reported('w2:p1')
+        for arg in ('pr:12', 'pr:o:r:12', 'pr:O:R:12'):
+            with self.subTest(arg):
+                self.assertEqual(self.resolve(arg), ['w2:p1'])
+        self.assertIn('no live session matches', self.refuses('pr:112'))
+        self.assertIn('no live session matches', self.refuses('pr:p:q:12'))
+
+    def test_a_bare_number_in_two_repositories_refuses(self):
+        self.reported('w2:p1')
+        self.reported('w3:p1', prs=['p/q#12'])
+        why = self.refuses('pr:12')
+        self.assertIn('w2:p1', why)
+        self.assertIn('w3:p1', why)
+        self.assertEqual(self.resolve('pr:o:r:12'), ['w2:p1'])
+
+    def test_issue_selectors_read_only_the_issues_field(self):
+        self.reported('w2:p1', issues=['o/r#7'])
+        self.reported('w3:p1', task='fix issue 7')   # a legacy report, the number only in prose
+        self.assertEqual(self.resolve('issue:7'), ['w2:p1'])
+        self.assertIn('no live session', self.refuses('issue:12'))   # a PR number is not an issue
+
+    def test_a_restarted_session_s_old_report_matches_nothing(self):
+        self.reported('w2:p1')
+        self.panes['w2:p1'] = {**pinned('w2:p1'), 'started': 99}
+        self.assertIn('no live session matches', self.refuses('pr:12'))
+
+    def test_workspace_selectors(self):
+        self.assertEqual(self.resolve('ws:w3'), ['w3:p1'])
+        self.assertEqual(self.resolve('ws:other'), ['w3:p1'])
+        self.panes['w4:p1'] = pinned('w4:p1')
+        self.assertIn('all match', self.refuses('ws:ws'))   # two workspaces share the label
+        self.panes['w3:p2'] = {**pinned('w3:p2'), 'workspace': 'other'}
+        self.assertIn('all match', self.refuses('ws:w3'))   # two panes in one workspace
+
+    def test_unsupported_selectors_refuse(self):
+        for arg in ('pr:abc', 'pr:o:12', 'issue:', 'ws:'):
+            with self.subTest(arg):
+                self.assertIn('not a selector', self.refuses(arg))
+
+    def test_aliases_of_one_pane_go_once(self):
+        self.reported('w2:p1')
+        self.assertEqual(self.resolve('w2:p1', 'pr:12'), ['w2:p1'])
+
+    def test_preview_shows_the_pane_a_selector_names(self):
+        self.reported('w2:p1')
+        self.say('merge o/r#12')
+        with mock.patch('builtins.print') as out:
+            captain.preview(captain.resolve(['pr:12']), self.ident)
+        self.assertIn('to pr:12: ws · name · w2:p1', [c.args[0] for c in out.call_args_list])
+
+    def test_a_relay_never_takes_a_selector(self):
+        self.reported('w2:p1')
+        uid = self.say('merge o/r#12')
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(uid, 'pr:12')
+        self.assertEqual([r for r in captain.records() if r['type'] == 'relay'], [])
+
+    def test_one_bad_selector_sends_nothing(self):
+        self.reported('w2:p1')
+        self.typed.clear()
+        self.refuses('pr:12', 'pr:99')
+        self.assertEqual(self.typed, [])
+
+    def test_issues_are_validated_like_prs(self):
+        self.assertIsNone(captain.validate({**GOOD, 'issues': ['o/r#7']}))
+        self.assertIsNone(captain.validate(GOOD))
+        self.assertIsNotNone(captain.validate({**GOOD, 'issues': ['#7']}))
+        self.assertIsNotNone(captain.validate({**GOOD, 'issues': 'o/r#7'}))
 
 
 class AcceptTest(RelayCase):

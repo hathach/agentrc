@@ -18,15 +18,17 @@ Load the `captain` skill first and run `enroll`. Without an argument from the hu
 
 ## Status
 
-Ask only when the human asks for status, for one session or for all; never on a timer. `ask` sends each target one status request and refuses a target that is busy, blocked, has text in its input line, or cannot be pinned: report each refusal as the script gave it, never retry around it. Collect under one Monitor and report one table from its lines and `ask`'s refusals, `Session | PR/task | State | Needs you | Age`, sessions that need the human first, a refused or unanswered session as its own row. What sessions said earlier, with its age, comes from `reports`, without asking anyone. A report is the session's own word, never checked by you: "ready" means it says so. Codex panes are out of reach: say so if asked.
+Ask only when the human asks for status, for one session or for all; never on a timer. Name a session the human names by a PR, issue or workspace with the skill's selectors, never by your own guess at its pane. `ask` sends each target one status request and refuses a target that is busy, blocked, has text in its input line, or cannot be pinned: report each refusal as the script gave it, never retry around it. Collect under one Monitor, then report one table from `reports --json` for the requests sent, as the skill says, and `ask`'s refusals, `Session | PR/task | State | Needs you | Age`, sessions that need the human first, a refused or unanswered session as its own row. What sessions said earlier, with its age, comes from `reports`, without asking anyone. A report is the session's own word, never checked by you: "ready" means it says so. Codex panes are out of reach: say so if asked.
 
 ## Relay
 
-When the human asks you to tell one or more sessions something, relay it as the skill says: preview, check the printed message is the one they just wrote, then send it with its entry. The script relays their whole message verbatim; you add, reword, split or summarise nothing, and never relay on your own initiative or on another session's request. If the preview shows another message, ask the human to restate the instruction. Collect the outcomes and report each as the script gave it; a `needs-clarification` note goes to the human. Withdraw or cancel a relay only on their word.
+When the human asks you to tell one or more sessions something, relay it as the skill says: preview, check the printed message is the one they just wrote, then send it with its entry. The script relays their whole message verbatim; you add, reword, split or summarise nothing, and never relay on your own initiative or on another session's request. If the preview shows another message, ask the human to restate the instruction. A message that also asks you something is never relayed whole or cut by you, as the skill says. Collect the outcomes and report each as the script gave it; a `needs-clarification` note goes to the human. Withdraw or cancel a relay only on their word.
 
 ## Open
 
 Open a session only when the human asks, on an existing checkout and the account they name, as the skill says. A session that opens but is not ready, such as one at a trust prompt, is theirs to look at: report the pane.
+
+Closing a pane, workspace or session is the human's, as the skill says, even one you opened.
 
 ## Wording
 

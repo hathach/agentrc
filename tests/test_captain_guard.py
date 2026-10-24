@@ -68,7 +68,8 @@ class VerdictTest(unittest.TestCase):
     def test_plain_script_calls_pass(self):
         home_script = (Path.home() / '.claude/skills/captain/scripts/captain.py').as_posix()
         for cmd in [f'{RUN} list', f'{RUN} list --json', f'{RUN} enroll', f'{RUN} enroll --replace',
-                    f'{RUN} ask w2:p1 w3:p4', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
+                    f'{RUN} ask w2:p1 w3:p4', f'{RUN} ask pr:12 pr:hathach:agentrc:12 issue:7 ws:w54 ws:my-label',
+                    f'{RUN} relay pr:12 w2:p1', f'{RUN} collect m-0a1b --wait 1740000', f'{RUN} reports',
                     f'{RUN} cancel m-0a1b', f'{RUN} relay w2:p1 w3:p4',
                     f'{RUN} relay w2:p1 --entry f0a4846d-6b04-428a-8e4d-a4fc931e6cff', f'{RUN} withdraw a-0a1b',
                     f'{RUN} open --checkout /home/u/code/repo --account ada --name repo',
@@ -87,7 +88,9 @@ class VerdictTest(unittest.TestCase):
                     f'{RUN} ask w2:p1 --file=/etc/passwd', f'{RUN} accept --action a-1',
                     f'{RUN} outcome --action a-1 --result completed', f'{RUN} ask /etc/passwd',
                     f'{RUN} open --checkout /home/u/../../etc --account main', f'{RUN} open --name /tmp/x',
-                    f'{RUN} open --checkout ~root/x --account main', None]:
+                    f'{RUN} open --checkout ~root/x --account main', 'herdr pane close w2:p1',
+                    'herdr workspace close w2', 'herdr agent prompt w2:p1 /exit', 'kill 1234', 'pkill claude',
+                    f'{RUN} close w2:p1', f'{RUN} kill w2:p1', None]:
             with self.subTest(cmd):
                 self.assertIsNotNone(self.verdict('Bash', command=cmd))
 
@@ -95,7 +98,7 @@ class VerdictTest(unittest.TestCase):
         """The captain runs what SKILL.md shows; a recipe the guard denies would strand it."""
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
         sample = {'<pane>...': 'w2:p1', '<msg>...': 'm-1', '<msg>': 'm-1', '<ms>': '1740000', 'MS': '1740000',
-                  '<uuid>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<action>': 'a-1',
+                  '<uuid>': 'f0a4846d-6b04-428a-8e4d-a4fc931e6cff', '<action>': 'a-1', '<target>...': 'pr:12',
                   '<dir>': '/home/u/code/repo', '<main|ada>': 'ada', '<name>': 'repo'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain\.py [^`#\n]*)', text)
         self.assertGreaterEqual(len(found), 10)

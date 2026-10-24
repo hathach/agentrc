@@ -13,11 +13,11 @@ process tree, so a Codex target could never prove which pane answers, and `list`
 ```bash
 python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every agent session, asking none
 python3 ~/.claude/skills/captain/scripts/captain.py enroll [--replace]              # make this session the captain
-python3 ~/.claude/skills/captain/scripts/captain.py ask <pane>...                   # one status request per idle target
+python3 ~/.claude/skills/captain/scripts/captain.py ask <target>...                 # one status request per idle target
 python3 ~/.claude/skills/captain/scripts/captain.py collect [<msg>...] [--wait MS]  # each answer as it lands
-python3 ~/.claude/skills/captain/scripts/captain.py reports [--json]                # the latest report per session
+python3 ~/.claude/skills/captain/scripts/captain.py reports [--json] [<msg>...]     # latest per session, or by request
 python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request or relay left open
-python3 ~/.claude/skills/captain/scripts/captain.py relay <pane>...                 # show the human's newest message
+python3 ~/.claude/skills/captain/scripts/captain.py relay <target>...               # show the human's newest message
 python3 ~/.claude/skills/captain/scripts/captain.py relay <pane>... --entry <uuid>  # relay exactly that message
 python3 ~/.claude/skills/captain/scripts/captain.py withdraw <action>               # take back a relay
 python3 ~/.claude/skills/captain/scripts/captain.py open --checkout <dir> --account <main|ada> [--name <name>]
@@ -25,6 +25,12 @@ python3 ~/.claude/skills/captain/scripts/captain.py open --checkout <dir> --acco
 
 Run each exactly so, the script spelled out, with no variable, `cd`, pipe or redirection: the guard allows nothing
 else.
+
+A target is a pane id or a selector the human's words give you: `pr:N`, `pr:<owner>:<repo>:N`, `issue:N`,
+`issue:<owner>:<repo>:N`, matched against each live session's latest report from that same session, or
+`ws:<workspace id or label>`. A selector must match exactly one session: none or several refuse the whole call,
+nothing sent, the candidates listed; name a label the guard refuses, such as one with a space, by its workspace id. A
+send (`--entry`) takes only the panes the preview printed, so a report landing in between cannot redirect it.
 
 ## Captain
 
@@ -38,11 +44,12 @@ else.
   transcript: you never pass the words. Relay only when the human asks you to tell a session something. Run `relay`
   with the target panes first; it sends nothing and prints the message and its entry. If that message is the
   instruction to relay, run it again with `--entry <uuid>`; if not (the human has written since, or it is not
-  plain text), ask the human to restate it. The send refuses unless that entry is still the human's newest message,
-  and each message goes to a pane once. The target runs `accept` to read the message from the ledger and acts on it
-  under its own rules, then records an outcome: `completed`, `failed`, `rejected` or `needs-clarification`, with a
-  note. A message the human writes after the send's check is not seen; the target acts only on what `accept`
-  printed.
+  plain text), ask the human to restate it. If it also asks you something, relay none of it and never cut the
+  instruction out yourself: answer the question, then ask the human for the instruction alone.
+  The send refuses unless that entry is still the human's newest message, and each message goes to a pane once. The
+  target runs `accept` to read the message from the ledger and acts on it under its own rules, then records an outcome:
+  `completed`, `failed`, `rejected` or `needs-clarification`, with a note. A message the human writes after the send's
+  check is not seen; the target acts only on what `accept` printed.
 - **Withdraw** a relay only on the human's word. Before the target accepts it, it can no longer be accepted; after,
   the request is recorded but nothing stops the target: say so, and `cancel` it on the human's word if no outcome
   will come.
@@ -50,12 +57,20 @@ else.
   creates a workspace there and starts Claude Code under that account's config dir. `ready` means it is pinned there
   with an empty input line. Anything else - a trust prompt, a login, an unknown screen - is the human's: report the
   pane and leave it; nothing is answered, closed or retried. It never creates a worktree or resumes a session.
+- **Closing** a pane, workspace or session is the human's, one you opened included: you may report a session done,
+  but never close one, type `/exit`, kill a process or ask a target to close itself. `cancel` closes a ledger item
+  only. A relayed instruction that ends a target's own work, such as removing its worktree, is the target's to do
+  under its own rules.
 - **Collect** under one Monitor, at its maximum `timeout_ms`, on
   `python3 ~/.claude/skills/captain/scripts/captain.py collect <msg>... --wait <ms>` with the ids `ask` and `relay`
   printed and `<ms>` a minute under the timeout: without ids it waits only for what is still open, and misses an
-  answer that already landed. A failure shows as the Monitor's exit code. Each line is `reported`, `accepted`, an
-  outcome, `withdrawn`, `cancelled` or `undelivered`; `pending <msg>...` means the wait lapsed: re-arm, or `cancel`
-  what will not answer.
+  answer that already landed. A failure shows as the Monitor's exit code. Each line is `reported <msg> · <state>`,
+  with `· needs you` when the report names a need, `accepted`, an outcome, `withdrawn`, `cancelled` or
+  `undelivered`; `pending <msg>...` means the wait lapsed: re-arm, or `cancel` what will not answer.
+- **The table** comes from `reports --json <msg>...` with this collection's request ids, run once `collect` ended or
+  lapsed, never from Monitor lines, which a long line can cut: each id gets the report that answered it, even one a
+  later report from that session superseded. If the output itself is abbreviated, run it again with fewer ids, down
+  to one; a row still cut says so, its needs never pieced together.
 - **Exit 4** is a corrupt ledger: nothing is decided until it is repaired by hand. Report it.
 
 ## Target
