@@ -1214,6 +1214,9 @@ def reset(root, gitdir, side, lane, read_only=False):
             die(f'{side}/{lane} is busy with {busy}; not resetting under it', BUSY)
         lane_kind = kind(box)
         if read_only and lane_kind != 'read-only':
+            if not (lane_kind or (box / 'session').exists() or requests(box) or lane_trees(root, box)):
+                print(f'{side}/{lane}: no session')  # already reset: nothing a writable lane could lose
+                return
             die(f'{side}/{lane} is {lane_kind or "kindless"}, not read-only; not resetting it', BUSY)
         if lane_kind in ('worktree', None):  # a kindless lane may still have a tree
             drop_lane(root, box)

@@ -400,6 +400,8 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('not all', err)
         code, out, _ = self.run_cli('reset', 'codex', 'review', '--read-only')
         self.assertEqual((code, out.strip()), (0, 'codex/review: session forgotten'))
+        code, out, _ = self.run_cli('reset', 'codex', 'review', '--read-only')  # a hint followed twice
+        self.assertEqual((code, out.strip()), (0, 'codex/review: no session'))
 
     # --- model and effort ---------------------------------------------------------
 
