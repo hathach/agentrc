@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Remove the sibling child worktrees of a herdr worktree once herdr has removed it.
+"""Remove the sibling child worktrees of a worktree once herdr, or worktree-remove without herdr, has removed it.
 
     worktree_children.py event               # herdr's worktree.removed hook (HERDR_PLUGIN_EVENT_JSON)
     worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
@@ -14,7 +14,8 @@ A child is removed only when every check below passes; otherwise it is kept and 
 `git worktree remove` re-checks cleanliness at removal; `--force`, which skips that, is used only
 for a child with submodules (git refuses those otherwise), so a write racing its checks is lost.
 - herdr confirms it is not open as its own workspace (`herdr worktree list --cwd <child>`);
-  herdr unreachable or an unexpected answer keeps it;
+  herdr unreachable or an unexpected answer keeps it. With no herdr (none at HERDR_BIN_PATH or
+  on PATH) none can be open; HERDR_ENV set without one keeps it;
 - no chief session (headless or interactive) runs in it and none of its cowork lanes holds a
   request (running or undelivered); the skills' own code decides, and code that cannot load keeps it;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
@@ -66,6 +67,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -249,8 +251,18 @@ def linked_workspace(path, herdr=None):
     return entry['is_linked_worktree'] and entry.get('open_workspace_id') is not None
 
 
+def herdr_found():
+    """Whether there is a herdr to ask; without one no checkout is open in a herdr workspace. Keep when
+    HERDR_ENV says this runs under herdr but none is found."""
+    if shutil.which(HERDR):
+        return True
+    if os.environ.get('HERDR_ENV'):
+        raise Keep(f'HERDR_ENV is set but {HERDR} is not found: cannot tell what herdr has open')
+    return False
+
+
 def check_herdr(child):
-    workspace = herdr_entry(child).get('open_workspace_id')
+    workspace = herdr_found() and herdr_entry(child).get('open_workspace_id')
     if workspace:
         raise Keep(f'open in herdr workspace {workspace}')
 
@@ -387,10 +399,33 @@ def check(child):
     return content_check(child)
 
 
+def anchored(path, here):
+    """(the directory path resolves from, the names after it): path's own drive and root when it has
+    a root (here's drive when it names none, as Windows reads `\\x`), else here. Windows' `\\\\?\\`
+    prefix, which readlink can return, is dropped and either separator splits. A bare UNC share
+    (`\\\\srv\\share`) is its own root. A drive-relative path (`C:x`), relative to that drive's working
+    directory, raises OSError."""
+    if os.altsep:
+        path = path.replace(os.altsep, os.sep)
+    if os.name == 'nt' and path.startswith('\\\\?\\'):  # a volume GUID path keeps it: no other names it
+        path = ('\\\\' + path[8:] if path[4:8].upper() == 'UNC\\' else
+                path[4:] if re.match(r'[A-Za-z]:', path[4:]) else path)
+    drive, tail = os.path.splitdrive(path)
+    if os.name == 'nt' and drive.startswith(os.sep * 2) and not tail:  # a UNC share names no directory
+        return drive + os.sep, []
+    if not tail.startswith(os.sep):
+        if drive:
+            raise OSError(f'cannot resolve the drive-relative path {path}')
+        return here, tail.split(os.sep)
+    return (drive or os.path.splitdrive(here)[0]) + os.sep, tail.lstrip(os.sep).split(os.sep)
+
+
 def link_hops(link):
     """Every path resolving link enters, each directory resolved: a link reaches every tree on the
-    way, through a symlink or a `..`, not only its final target."""
-    hops, path, rest, links = [], os.sep, os.path.abspath(link).split(os.sep), 0
+    way, through a symlink or a `..`, not only its final target. Each hop is absolute, from the
+    anchor (`/`, a drive's root or a UNC share's), which `..` never climbs above."""
+    hops, links = [], 0
+    path, rest = anchored(os.path.abspath(link), '')
     while rest:
         name = rest.pop(0)
         if name in ('', '.'):
@@ -406,9 +441,8 @@ def link_hops(link):
         links += 1
         if links > 40:  # Linux's own limit: a loop
             raise OSError(f'too many levels of symbolic links in {link}')
-        target = os.readlink(step)
-        path = os.sep if os.path.isabs(target) else path
-        rest = target.split(os.sep) + rest
+        path, names = anchored(os.readlink(step), path)
+        rest = names + rest
     return hops
 
 
@@ -436,10 +470,10 @@ def holds(leaving, staying, scan):
                 held[path] = f'owned by {stay.name}, which stays'
             else:
                 targets, blind = reach(stay, scan)  # searched only when a name does not settle it
-                root = os.path.realpath(path)
+                root = os.path.normcase(os.path.realpath(path))  # a target may spell its case otherwise
                 if blind:
                     held[path] = f'cannot tell whether {stay.name}, which stays, links into it: {blind}'
-                elif any(t == root or t.startswith(root + os.sep) for t in targets):
+                elif any(t == root or t.startswith(root + os.sep) for t in map(os.path.normcase, targets)):
                     held[path] = f'{stay.name}, which stays, links into it'
                 else:
                     continue
