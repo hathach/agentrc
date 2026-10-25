@@ -1,10 +1,10 @@
 {
   "name": "freertos",
-  "source": "campaign/h743-oocd.SVDat",
+  "source": "captures/h743-oocd/capture.SVDat",
   "start": 0,
   "end": 1610,
   "raw_sha256": "96a261b7cc3e952ecad9e9dbc13f3b79ba16b9c8f1f2c451fa71c82f40140270",
   "event_count": 179,
-  "gui": "SystemView 4.10b, ci.lan, 2026-10-23; wrapped reuses the verified 2026-10-22 export",
+  "gui": "SystemView 4.10b, 2026-10-23",
   "gui_events_sha256": "9ba79d2ac8e3008c354792ed06099c848a968d7b22ce21b69ab5b83071e3da1d"
 }

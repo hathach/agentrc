@@ -1,10 +1,10 @@
 {
   "name": "wrapped",
-  "source": "campaign/ch32-pm/capture.SVDat",
+  "source": "captures/ch32-wrapped/capture.SVDat",
   "start": 0,
   "end": 4096,
   "raw_sha256": "8ed57cc9af69c2c2bccfafac44db29558be9e6b6a1c3b90715d1a97c89a93f66",
   "event_count": 656,
-  "gui": "SystemView 4.10b, ci.lan, 2026-10-23; wrapped reuses the verified 2026-10-22 export",
+  "gui": "SystemView 4.10b, 2026-10-23; wrapped reuses the verified 2026-10-22 export",
   "gui_events_sha256": "a2a16243b4239e3015e2610b887c3d1688f0ebfc20c8ce51d3aa5c95219a4957"
 }

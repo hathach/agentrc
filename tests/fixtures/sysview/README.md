@@ -1,7 +1,8 @@
 # SystemView decoder references
 
-These are real capture slices, not generated packet streams. `fixture.json` gives the original corpus path, byte
-interval, uncompressed SHA-256 and GUI row count; retained row indices are the event CSV `sequencenum` values.
+These are real capture slices, not generated packet streams. `fixture.json` gives the source capture's path in the full
+corpus archive, byte interval, uncompressed SHA-256 and GUI row count; retained row indices are the event CSV
+`sequencenum` values.
 `capture.SVDat.gz` is lossless gzip with a fixed mtime. The small cases retain every GUI row. Overflow retains
 initialization and the loss/recovery tail;
 timer-wrap retains initialization and the boundary tail, with the complete raw prefix needed to reconstruct time.
@@ -34,37 +35,15 @@ the test independently finds the first crossing and verifies the only Init and m
 
 The corpus has no early-crash/no-Init capture. Unit tests construct that case, malformed varints, unknown payloads,
 resynchronization, markers, heap/stack records and nested interrupts; they do not establish hardware coverage for
-those cases. The new decoder has no board-facing operations. Linux GUI exports ran on ci.lan; macOS/Windows native
+those cases. The new decoder has no board-facing operations. GUI exports ran on Linux; macOS/Windows native
 routing is tested with platform mocks, not on native OS installations.
 
 ## Full corpus
 
-The durable working copy is outside the repository:
-
-```text
-/home/hathach/.cache/agentrc-sysview-followups-2026-10-23/corpus/
-/home/hathach/.cache/agentrc-sysview-followups-2026-10-23/corpus-manifest.json
-```
-
-`bench/sysview/corpus.json` is the checked-in copy of that manifest. It includes SHA-256 and sizes for the original
-captures,
-GUI exports, campaign reports and dump metadata. Capture provenance is the ci.lan campaign on 2026-10-22/23 and
-TinyUSB's `SYSVIEW=4` cdc_msc recordings. The original `record.json` and `dump.json` files retain the commands and
-capture metadata. The H743 export, initially absent, was generated on ci.lan with SystemView 4.10b on 2026-10-23.
-The `trimmed/` directory in the working copy retains the full GUI exports of the fixtures, including rows omitted
-from the repository. Fixture GUI exports used the same version; `wrapped` reuses the byte-verified original export
-because a fresh GUI process crashed during startup. These recordings are not hosted at a public download URL.
-The MAX32666 pair was copied read-only from
-`ci.lan:~/sysview-followups/max-out/run1/{max32666fthr-capture.SVDat,max32666fthr-decoded/}` on 2026-10-23.
-
-Retrieve from that maintained cache (or copy it from the dev host using the same absolute path), preserving the
-relative paths; do not substitute a later recording with the same board name. To reproduce:
-
-```bash
-python bench/sysview/sysview_corpus.py \
-  --root /home/hathach/.cache/agentrc-sysview-followups-2026-10-23/corpus \
-  --manifest bench/sysview/corpus.json --out /tmp/sysview-corpus-diffs
-```
+`bench/sysview/README.md` says how to download the full corpus and run `bench/sysview/sysview_corpus.py` over it.
+Every GUI export, the fixtures' included, was made by SystemView 4.10b on Linux; `wrapped` reuses the byte-verified
+original export because a fresh GUI process crashed during startup. The untrimmed GUI exports of the fixtures are not
+published.
 
 `--out` must be new or empty. The runner verifies the manifest and every GUI event's `eventoffset`, `eventsize` and
 `eventdata` against the raw file before decoding. It writes one JSON diff per capture and `summary.json`, prints one
@@ -197,9 +176,9 @@ Calibre book **2464**, *SEGGER SystemView User Guide*, UM08027, software 4.10, r
   Section 6.1.2, pp. 141–142, lookup `c887eeace880`. Native decoding retains that request until the outer ISR exits;
   the MAX32666 GUI rows and synthetic nested-interrupt tests check that behavior.
 
-A separate synthetic GUI probe on ci.lan confirmed that context IDs retain their encoded ID even with ID Shift=2,
+A separate synthetic GUI probe confirmed that context IDs retain their encoded ID even with ID Shift=2,
 while heap sizes expand by that shift and include allocation metadata. This probe is not a hardware corpus case.
-A second probe is retained under the cache's `analysis/blocked-synthetic/` directory. Its `wake` task has 100 us
+A second, unpublished synthetic probe isolates blocked time. Its `wake` task has 100 us
 ready-to-run latency and a 300 us scheduler interval after blocking; the GUI reports 300 us total blocked time,
 but 100 us minimum/maximum blocked time. Its `sched` task excludes a 30 us Task Stop/Run scheduler interval from
 total blocked time. These observations rule out equating that total with summed ready-to-run or preemption time;

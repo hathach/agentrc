@@ -23,6 +23,7 @@ statusline/    the Claude Code status line, its Codex usage fetcher and its sess
 plugins/       herdr plugins, one folder each with a herdr-plugin.toml
 lib/           helpers the scripts share through their resolved path: windows.py (Windows runtime), greptile.py
 tests/         unit tests for skill scripts, hooks and the installer
+bench/         benchmark corpora and their runners; data too large for git is a test-data release asset
 ```
 
 ## Install
