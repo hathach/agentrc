@@ -17,8 +17,9 @@ cleanup.
 
 `tests/fixtures/swo` in this repository: one C file on TinyUSB's board support (clocks, LED), for stm32f407disco and
 stm32h743nucleo. Its comments give the workload and its timing layout; `swo_fixture_last` holds the counts of
-the last complete phase, the values a capture is checked against. Build it against a TinyUSB checkout at the commit
-in `tinyusb.pin`:
+the last complete phase, the values a capture is checked against. Build it against a local TinyUSB checkout, named by
+`TINYUSB_PATH` as below or in the environment. Its rates rest on the BSP's clocks, measured with TinyUSB 13f9a36a:
+re-check them on hardware after a change to a board's clock setup.
 
 ```bash
 python3 <tinyusb>/tools/get_deps.py -b <board>
