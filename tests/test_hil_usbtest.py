@@ -74,7 +74,7 @@ class Binding(unittest.TestCase):
         patch(self, hu, 'DRIVER', self.driver)
         patch(self, hu, 'run', self.run_child)
         patch(self, hu, '_root_soft', self.root_soft)
-        patch(self, hu, 'needs_sudo', lambda node: False)
+        patch(self, hu, 'node_writable', lambda node: True)
         patch(self, hu, 'dmesg_tail', lambda: 'usbtest dmesg')
         patch(self, hu.platform, 'system', lambda: 'Linux')
         patch(self, hu.platform, 'machine', lambda: 'x86_64')
@@ -113,7 +113,7 @@ class Binding(unittest.TestCase):
                                       hu.CONNECT_TIMEOUT)])
 
     def test_an_unwritable_node_is_a_named_exit_never_sudo(self):
-        patch(self, hu, 'needs_sudo', lambda node: True)
+        patch(self, hu, 'node_writable', lambda node: False)
         self.assertIn(f'{self.NODE} is not writable', self.exit_of())
         self.assertEqual(self.runs, [])
 

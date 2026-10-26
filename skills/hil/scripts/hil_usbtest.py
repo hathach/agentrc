@@ -83,7 +83,7 @@ _DEV_CACHE: dict = {}   # (vid, pid, serial lowercased) -> what find_device last
 
 def run(cmd, **kw):
     # NOT subprocess.run(timeout=): CPython's post-timeout path is an UNBOUNDED wait() that
-    # never returns on a D-state child -- the hang sysfs_write's timeout exists to catch.
+    # never returns on a D-state child -- a CONNECT or modprobe stuck on a device lock.
     timeout = kw.pop('timeout', None)
     kw.pop('capture_output', None)        # subprocess.run-only kwarg: expressed by the PIPEs below
     kw.setdefault('text', True)
@@ -157,9 +157,14 @@ def dmesg_tail():
     return '\n'.join(r.stdout.splitlines()[-8:])
 
 
+def node_writable(node):
+    """The usbfs node opens for writing: root, or the project's udev rule."""
+    return os.geteuid() == 0 or os.access(node, os.W_OK)
+
+
 def needs_sudo(node):
-    """Device nodes are usually opened directly (udev rule); sudo only if not."""
-    return not os.access(node, os.W_OK) and os.geteuid() != 0
+    """testusb runs under sudo only on a node this user cannot write."""
+    return not node_writable(node)
 
 
 # speed_show's values (v6.12 drivers/usb/core/sysfs.c:145-177) less 'unknown', which names no speed
@@ -337,7 +342,7 @@ def ensure_usbtest_bound(interface, node):
     load_usbtest()
     held = bound_driver(interface)
     if held is None:
-        if needs_sudo(node):
+        if not node_writable(node):
             sys.exit(f'{interface} is unbound and {node} is not writable: the usbfs CONNECT that '
                      "reprobes it needs write access to the node (the project's udev rule)")
         if platform.system() != 'Linux' or platform.machine() not in GENERIC_IOCTL_MACHINES:
