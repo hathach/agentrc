@@ -261,6 +261,22 @@ class HostileRepoTest(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn('outside', done.stderr)
 
+    def test_a_worktree_in_another_checkout_is_refused(self):
+        """filtered() reads from the worktree root, where git would find the other checkout's own repository."""
+        other = self.home / 'code' / 'other'
+        self.git('init', '-q', '-b', 'main', str(other), cwd=self.home)
+        (other / 'a.txt').write_text('changed\n', encoding='utf-8')
+        (self.repo / '.git' / 'info' / 'attributes').write_text('* filter=spy\n', encoding='utf-8')
+        self.git('config', 'filter.spy.clean', str(self.home / 'bin' / 'clean'))
+        self.git('config', 'core.worktree', str(other))
+        self.marks_left()
+        for args in [('status',), ('diff',)]:
+            with self.subTest(args):
+                done = self.read(*args)
+                self.assertEqual(done.returncode, 2, done.stdout)
+                self.assertIn('another repository', done.stderr)
+                self.assertEqual(self.marks_left(), [])
+
     def test_a_refused_call_runs_nothing(self):
         done = self.read('config', 'core.pager', 'x')
         self.assertEqual(done.returncode, 2)

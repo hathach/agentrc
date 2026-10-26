@@ -326,15 +326,19 @@ def plain(git, env, *args, data=None):
 
 
 def located(git, env):
-    """(worktree root, None), or (None, why) when git would work outside the approved roots: core.worktree or a
-    gitfile can send it there."""
-    found = plain(git, env, 'rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir')
+    """(worktree root, None), or (None, why) when git would work outside the approved roots, core.worktree or a
+    gitfile can send it there, or when git run from that root finds another repository, as core.worktree pointing
+    at another checkout makes it: filtered() reads from the root, so it must see the repository git works with."""
+    where = ('rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir')
+    found = plain(git, env, *where)
     places = found.stdout.decode(errors='replace').splitlines()
     if found.returncode or len(places) != 3:
         return None, 'not a checkout with a worktree'
     outside = [p for p in map(os.path.realpath, places) if not approved(p)]
     if outside:
         return None, f'git works in {outside[0]}, outside {", ".join(GIT_ROOTS)}'
+    if plain(['git', *HARDEN, '-C', places[0]], env, *where).stdout != found.stdout:
+        return None, f'git works in {places[0]}, where git finds another repository or none'
     return places[0], None
 
 
