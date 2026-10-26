@@ -23,6 +23,7 @@ import threading
 import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
@@ -1090,6 +1091,31 @@ class RootCycleScript(Fixture):
         self.assertIn('command exited 1', line)
         self.assertEqual(self.runs(), ['check', 'off', 'on'])
         self.assert_cleanup_holder(p, token_of(line))
+
+
+class RecoverScriptChoice(unittest.TestCase):
+    """A rig's installed usb_recover wins, even a broken entry (sudo then fails): falling back to a
+    checkout a CI user can write would run that as root."""
+
+    def choice(self, error):
+        real = os.lstat
+
+        def lstat(p, *a, **k):
+            if p == '/usr/local/sbin/usb_recover':
+                if error:
+                    raise error
+                return real('/')
+            return real(p, *a, **k)
+        sp = importlib.util.spec_from_file_location('hil_reserve_choice', SCRIPT)
+        mod = importlib.util.module_from_spec(sp)
+        with mock.patch.object(hr.hil_root.os, 'lstat', lstat):
+            sp.loader.exec_module(mod)
+        return mod.RECOVER_SCRIPT
+
+    def test_installed_unless_nothing_is_there(self):
+        for error in (None, PermissionError(13, 'denied'), NotADirectoryError(20, 'not a dir')):
+            self.assertEqual(self.choice(error), '/usr/local/sbin/usb_recover', error)
+        self.assertTrue(self.choice(FileNotFoundError(2, 'gone')).endswith('skills/usb-kernel-recover/scripts/usb_recover.sh'))
 
 
 if __name__ == '__main__':

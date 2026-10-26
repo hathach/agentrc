@@ -8,33 +8,28 @@ endpoint halt (v6.12 xhci-ring.c xhci_clear_hub_tt_buffer). Once no buffer is fr
 NAKs every start-split, so every later transfer to the port times out, re-enumeration
 included. Reset_TT (11.24.2.9) frees them without resetting the port or the device.
 
-The request runs in a child, `python3 -I <this file> NODE PORT` (under `sudo -n` unless
-root), bounded by HELPER_TIMEOUT through `run` (default hil_process.run_cmd), called as
-`run(cmd, timeout=..., quiet=True)` and expected to return rc 124 when it had to kill. The
-child loads nothing but this file and the standard library. When to reset is the caller's.
+The request is hil_root.py's `reset-tt BUSPORT` (hil_root.argv: the rig's installed copy
+under sudo when it has one), which re-derives and checks the hub itself, bounded by
+HELPER_TIMEOUT through `run` (default hil_process.run_cmd), called as
+`run(cmd, timeout=..., quiet=True)` and expected to return rc 124 when it had to kill. When
+to reset is the caller's.
 """
 
 from __future__ import annotations
 
-import fcntl
 import importlib.util
 import os
-import struct
 import sys
 from contextlib import redirect_stdout
-from pathlib import Path
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py')
-SYS_USB = Path('/sys/bus/usb/devices')
-_CTRLTRANSFER = struct.Struct('@BBHHHIP')                   # struct usbdevfs_ctrltransfer
-USBDEVFS_CONTROL = 0xC0005500 | _CTRLTRANSFER.size << 16   # _IOWR('U', 0, ...)
-RESET_TT = 9
+FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_process.py', 'skills/hil/scripts/hil_root.py')
 HELPER_TIMEOUT = 10
 
-# Hubs whose helper timed out in this process. The usbfs ioctl waits for the HUB's device
-# lock, which the hub driver holds while it enumerates any of its ports: the helper may
-# still be waiting there, so another would only queue behind it.
+# Hubs (by busport, which the helper resolves again) whose helper timed out in this process.
+# The usbfs ioctl waits for the HUB's device lock, which the hub driver holds while it
+# enumerates any of its ports: the helper may still be waiting there, so another would only
+# queue behind it.
 _unconfirmed: set = set()
 
 
@@ -50,63 +45,29 @@ def _hil_load():
     return sys.modules[spec.name].load(spec.name, spec.origin)
 
 
-if __name__ != '__main__':      # the root child loads nothing but this file
-    hil_load = _hil_load()
-    hil_load.require(__file__, FILES)
+hil_load = _hil_load()
+hil_load.require(__file__, FILES)
+hil_root = hil_load.load_file('skills/hil/scripts/hil_root.py')
 
 
 def _process():
     return hil_load.load_file('skills/hil/scripts/hil_process.py')
 
 
-def tt_port(busport, speed):
-    """(hub usbfs node, TT port) behind which a full-/low-speed device sits, or None: a
-    high-speed device, a root port, or a hub that is not running one TT per port -- a
-    single-TT hub's reset would disturb every full-/low-speed device on it, and a hub
-    running at full speed has no TT."""
-    if speed not in ('12', '1.5'):
-        return None
-    parent, _, port = busport.rpartition('.')
-    if not parent:
-        return None
-    hub = SYS_USB / parent
-    try:
-        # sysfs lists only the active configuration's interfaces; a hub has one, and it runs
-        # one TT per port only while that interface is the multi-TT one (11.23.1)
-        intf = list(hub.glob(f'{parent}:*.0'))
-        if len(intf) != 1 or (intf[0] / 'bInterfaceProtocol').read_text().strip() != '02':
-            return None
-        node = '/dev/bus/usb/%03d/%03d' % (int((hub / 'busnum').read_text()),
-                                           int((hub / 'devnum').read_text()))
-    except (OSError, ValueError):
-        return None
-    return node, int(port)
-
-
-def reset_tt_ioctl(node, port):
-    # bmRequestType 0x23: class request to a hub port
-    arg = _CTRLTRANSFER.pack(0x23, RESET_TT, 0, port, 0, 1000, 0)
-    with open(node, 'wb', buffering=0) as f:
-        fcntl.ioctl(f, USBDEVFS_CONTROL, arg)
-
-
-def child_argv(node, port) -> list:
-    cmd = [sys.executable, '-I', os.path.abspath(__file__), node, str(port)]
-    if os.geteuid() != 0:
-        cmd = ['sudo', '-n'] + cmd
-    return cmd
-
-
 def reset_tt(busport, speed, *, run=None) -> bool:
     """Reset the device's TT if it has one of its own. False when that could not be
     confirmed: this hub's helper timed out, now or earlier in this process."""
-    tt = tt_port(busport, speed)
-    if not tt:
-        return True
-    node, port = tt
-    if node in _unconfirmed:
+    hub = busport.rpartition('.')[0]
+    if hub in _unconfirmed:     # before discovery: a hub mid-reconfiguration may not resolve now
         return False
-    cmd = child_argv(node, port)
+    if speed not in ('12', '1.5'):
+        return True
+    try:    # the same rule the root side applies again: high speed, a root port, a single TT -> nothing to reset
+        _, port, busnum, devnum, _ = hil_root.tt_hub(busport)
+    except hil_root.Refused:
+        return True
+    node = f'/dev/bus/usb/{busnum:03d}/{devnum:03d}'
+    cmd = hil_root.argv('reset-tt', busport)
     try:
         # stderr: run_cmd prints a timeout banner, and a caller's stdout may be its JSON report
         with redirect_stdout(sys.stderr):
@@ -115,7 +76,7 @@ def reset_tt(busport, speed, *, run=None) -> bool:
         print(f'Reset_TT {node} port {port} failed: {e}', file=sys.stderr)
         return True
     if r.returncode == 124:
-        _unconfirmed.add(node)
+        _unconfirmed.add(hub)
         print(f'Reset_TT {node} port {port}: helper timed out, possible hub-lock contention',
               file=sys.stderr)
         return False
@@ -123,7 +84,3 @@ def reset_tt(busport, speed, *, run=None) -> bool:
         out = _process().cmd_stdout_text(r.stdout)
         print(f'Reset_TT {node} port {port} failed: {out.strip()}', file=sys.stderr)
     return True
-
-
-if __name__ == '__main__':
-    reset_tt_ioctl(sys.argv[1], int(sys.argv[2]))

@@ -28,7 +28,8 @@ that differs between the walks, or a walk over budget refuses, naming each.
 
 run: check (hub-cycle: under the parent hub, and the target must not be a hub), take every
 lock (all-or-nothing), check again, run
-`sudo -n <usb-kernel-recover>/scripts/usb_recover.sh <verb> <busport> <serial>` with
+`sudo -n <usb-kernel-recover>/scripts/usb_recover.sh <verb> <busport> <serial>` (the rig's
+/usr/local/sbin/usb_recover when installed) with
 the target's sysfs serial, or its udev one when sysfs did not answer (the script then warns
 and proceeds, as its own guard says), then validate: the command exited 0, no descendant
 survives (this process is a child subreaper, so orphans reparent to it), and the subtree is
@@ -71,7 +72,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/hil_lock.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/usb_observe.py', 'skills/usb-kernel-recover/scripts/usb_recover.sh',
-         'skills/usb-kernel-recover/scripts/root_port_cycle.py')
+         'skills/usb-kernel-recover/scripts/root_port_cycle.py', 'skills/hil/scripts/hil_root.py')
 
 
 def _hil_load():
@@ -90,6 +91,7 @@ hil_load = _hil_load()
 hil_load.require(__file__, FILES)
 hil_lock = hil_load.load_file('skills/hil/scripts/hil_lock.py')
 uo = hil_load.load_file('skills/hil/scripts/usb_observe.py')
+hil_root = hil_load.load_file('skills/hil/scripts/hil_root.py')
 
 LOCK_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]*$')
 UDEV_UNSAFE_RE = re.compile(r'[^A-Za-z0-9#+.:=@_-]')   # what usb_id turns into '_' after whitespace runs
@@ -102,8 +104,11 @@ DEFAULT_BUDGET = 60.0
 PROGRESS_EVERY = 60.0
 WAIT_POLL = 0.05           # s between looks at whether the command has ended
 RESTORE_POLL = 0.5         # between restoration looks; a node back later than this before the deadline is missed
-# the one command `run` builds; a test points this at a stub through the module, never the CLI
-RECOVER_SCRIPT = os.path.normpath(os.path.join(HERE, '..', '..', 'usb-kernel-recover', 'scripts', 'usb_recover.sh'))
+# the one command `run` builds; a test points this at a stub through the module, never the CLI.
+# A rig's root-owned copy, pinned with the rig, wins over this checkout's, even a broken entry (hil_root.present).
+INSTALLED_RECOVER = '/usr/local/sbin/usb_recover'
+RECOVER_SCRIPT = INSTALLED_RECOVER if hil_root.present(INSTALLED_RECOVER) else \
+    os.path.normpath(os.path.join(HERE, '..', '..', 'usb-kernel-recover', 'scripts', 'usb_recover.sh'))
 PR_SET_CHILD_SUBREAPER = 36
 HANDLED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 SPAWN_SIGDEF = (signal.SIGPIPE, signal.SIGXFSZ)     # what Python ignores and Popen restores in a child

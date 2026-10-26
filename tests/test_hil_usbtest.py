@@ -73,7 +73,7 @@ class Binding(unittest.TestCase):
         patch(self, hu, 'SYS_USB', self.sys_usb)
         patch(self, hu, 'DRIVER', self.driver)
         patch(self, hu, 'run', self.run_child)
-        patch(self, hu, '_sudo_soft', self.sudo_soft)
+        patch(self, hu, '_root_soft', self.root_soft)
         patch(self, hu, 'needs_sudo', lambda node: False)
         patch(self, hu, 'dmesg_tail', lambda: 'usbtest dmesg')
         patch(self, hu.platform, 'system', lambda: 'Linux')
@@ -90,11 +90,11 @@ class Binding(unittest.TestCase):
             self.bind(self.attach)
         return subprocess.CompletedProcess(cmd, self.rc, '', errno.errorcode.get(self.rc, '') if self.rc else '')
 
-    def sudo_soft(self, cmd, **kw):
-        self.helpers.append(cmd)
-        if cmd == ['modprobe', 'usbtest']:
+    def root_soft(self, *cmd, **kw):
+        self.helpers.append(list(cmd))
+        if cmd == ('modprobe',):
             self.driver.mkdir(parents=True, exist_ok=True)
-        return subprocess.CompletedProcess(cmd, 0, '', '')
+        return subprocess.CompletedProcess(list(cmd), 0, '', '')
 
     def exit_of(self):
         with self.assertRaises(SystemExit) as cm:
@@ -112,12 +112,10 @@ class Binding(unittest.TestCase):
         self.assertEqual(self.runs, [([sys.executable, '-I', script, 'connect', self.NODE, '1-1:1.0'],
                                       hu.CONNECT_TIMEOUT)])
 
-    def test_an_unwritable_node_runs_the_child_through_sudo(self):
+    def test_an_unwritable_node_is_a_named_exit_never_sudo(self):
         patch(self, hu, 'needs_sudo', lambda node: True)
-        sudoed = []
-        patch(self, hu, 'sudo', lambda cmd, **kw: sudoed.append(cmd) or self.run_child(cmd, **kw))
-        hu.ensure_usbtest_bound('1-1:1.0', self.NODE)
-        self.assertEqual(sudoed, [self.runs[0][0]])
+        self.assertIn(f'{self.NODE} is not writable', self.exit_of())
+        self.assertEqual(self.runs, [])
 
     def test_an_unknown_ioctl_abi_is_refused_before_any_child(self):
         patch(self, hu.platform, 'machine', lambda: 'ppc64le')
@@ -157,11 +155,11 @@ class Binding(unittest.TestCase):
     def test_loads_the_module_when_missing(self):
         shutil.rmtree(self.driver)
         hu.ensure_usbtest_bound('1-1:1.0', self.NODE)
-        self.assertEqual(self.helpers, [['modprobe', 'usbtest']])
+        self.assertEqual(self.helpers, [['modprobe']])
 
     def test_a_module_that_will_not_load_is_a_named_exit(self):
         shutil.rmtree(self.driver)
-        patch(self, hu, '_sudo_soft', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, '', 'not found'))
+        patch(self, hu, '_root_soft', lambda *cmd, **kw: subprocess.CompletedProcess(list(cmd), 1, '', 'not found'))
         self.assertIn('cannot load usbtest module: not found', self.exit_of())
         self.assertEqual(self.runs, [])
 
@@ -221,7 +219,7 @@ class UsbfsConnect(unittest.TestCase):
         self.assertIn('usage: hil_usbtest.py connect NODE INTERFACE', r.stderr)
 
     def test_the_child_runs_from_this_file_alone(self):
-        # stdlib only, as under sudo: no hil_load bootstrap, no sibling module (setUp's fstat
+        # stdlib only: no hil_load bootstrap, no sibling module (setUp's fstat
         # patch is process-wide, so the copy is a plain read and write)
         alone = self.root / 'alone'
         alone.mkdir()
@@ -238,10 +236,10 @@ class Pattern(unittest.TestCase):
         self.param = Path(td.name) / 'pattern'
         self.writes = []
         patch(self, hu, 'PATTERN_PARAM', self.param)
-        patch(self, hu, 'sysfs_write', lambda path, data: self.writes.append((path, data)))
+        patch(self, hu, 'sysfs_write', lambda verb, *args: self.writes.append((verb, *args)))
 
     def test_written_only_when_it_differs(self):
-        for current, writes in (('0\n', []), ('1\n', [(self.param, '0')])):
+        for current, writes in (('0\n', []), ('1\n', [('pattern', '0')])):
             self.writes.clear()
             self.param.write_text(current)
             hu.set_pattern(0)
@@ -418,11 +416,7 @@ class RunCaseConfirmsByReap(unittest.TestCase):
 
 
 class RunHelper(unittest.TestCase):
-    """run() is the bounded replacement for subprocess.run: sysfs_write feeds it input=."""
-
-    def test_input_kwarg_is_honoured(self):
-        r = hu.run(['cat'], input='payload', timeout=10)
-        self.assertEqual((r.returncode, r.stdout), (0, 'payload'))
+    """run() is the bounded replacement for subprocess.run the root helpers go through."""
 
     def test_capture_output_kwarg_is_accepted(self):
         r = hu.run(['printf', 'x'], capture_output=True, timeout=10)
@@ -460,32 +454,34 @@ class RunHelper(unittest.TestCase):
         self.assertEqual(seen['timeout'], hu.HELPER_TIMEOUT)
 
 
-class Sudo(unittest.TestCase):
+class Root(unittest.TestCase):
+    """root() runs a hil_root.py verb through hil_root.argv (test_hil_root.py has the argv)."""
+
     def test_a_password_prompt_is_a_named_exit(self):
         patch(self, hu, 'run', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, '', 'a password is required'))
-        patch(self, hu.os, 'geteuid', lambda: 1000)
+        patch(self, hu.hil_root, 'argv', lambda *a: ['sudo', '-n', '/x/hil_root.py', *a])
         with self.assertRaises(SystemExit) as cm:
-            hu.sudo(['dmesg'])
-        self.assertIn('sudo needs a password for: sudo -n dmesg', str(cm.exception))
+            hu.root('dmesg')
+        self.assertIn('sudo needs a password for: sudo -n /x/hil_root.py dmesg', str(cm.exception))
 
-    def test_root_runs_it_bare(self):
+    def test_the_verb_goes_through_argv_with_the_callers_bound(self):
         seen = []
-        patch(self, hu, 'run', lambda cmd, **kw: seen.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', ''))
-        patch(self, hu.os, 'geteuid', lambda: 0)
-        hu.sudo(['dmesg'])
-        self.assertEqual(seen, [['dmesg']])
+        patch(self, hu, 'run', lambda cmd, **kw: seen.append((cmd, kw)) or subprocess.CompletedProcess(cmd, 0, '', ''))
+        patch(self, hu.hil_root, 'argv', lambda *a: ['H', *a])
+        hu.root('renesas-fw', '0000:03:00.0', timeout=4)
+        self.assertEqual(seen, [(['H', 'renesas-fw', '0000:03:00.0'], {'timeout': 4})])
 
 
-class SudoSoftNeverRaises(unittest.TestCase):
+class RootSoftNeverRaises(unittest.TestCase):
     """Two of its call sites are inside run_case's timeout handler, where ANY raise costs the
-    HUNG verdict -- and sudo() sys.exit()s on 'a password is required'."""
+    HUNG verdict -- and root() sys.exit()s on 'a password is required'."""
 
     def check(self, exc):
         def boom(*a, **k):
             raise exc
-        patch(self, hu, 'sudo', boom)
+        patch(self, hu, 'root', boom)
         with redirect_stderr(io.StringIO()):
-            r = hu._sudo_soft(['dmesg'])            # must not propagate
+            r = hu._root_soft('dmesg')            # must not propagate
         self.assertEqual(r.returncode, 1)
         self.assertIn(f'dmesg: {type(exc).__name__}: {exc}', r.stderr)   # callers quote it
 
@@ -503,30 +499,29 @@ class SysfsWrite(unittest.TestCase):
     def test_a_blocked_write_is_a_bounded_named_exit(self):
         seen = {}
 
-        def blocked(cmd, **kw):
+        def blocked(*cmd, **kw):
             seen.update(kw)
             raise subprocess.TimeoutExpired(cmd, kw.get('timeout'))
-        patch(self, hu, 'sudo', blocked)
+        patch(self, hu, 'root', blocked)
         with self.assertRaises(SystemExit) as cm:
-            hu.sysfs_write('/sys/module/usbtest/parameters/pattern', '0')
+            hu.sysfs_write('pattern', '0')
         self.assertEqual(seen.get('timeout'), 15)
         self.assertIn('blocked >15s', str(cm.exception))
 
-    def test_tee_gets_the_data_and_a_failure_is_a_named_exit(self):
+    def test_the_verb_passes_through_and_a_failure_is_a_named_exit(self):
         calls = []
-        patch(self, hu, 'sudo', lambda cmd, **kw: calls.append((cmd, kw['input']))
-              or subprocess.CompletedProcess(cmd, 1, '', 'denied\n'))
+        patch(self, hu, 'root', lambda *cmd, **kw: calls.append(cmd) or subprocess.CompletedProcess(cmd, 1, '', 'denied\n'))
         with self.assertRaises(SystemExit) as cm:
-            hu.sysfs_write('/p', 'x')
-        self.assertEqual(calls[0], (['tee', '/p'], 'x'))
-        self.assertIn('write "x" > /p failed: denied', str(cm.exception))
+            hu.sysfs_write('pattern', '1')
+        self.assertEqual(calls, [('pattern', '1')])
+        self.assertIn('hil_root pattern 1 failed: denied', str(cm.exception))
 
 
 class DmesgTail(unittest.TestCase):
-    def test_the_last_eight_usbtest_lines(self):
-        lines = [f'usbtest {i}' if i % 2 else f'other {i}' for i in range(30)]
-        patch(self, hu, '_sudo_soft', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, '\n'.join(lines), ''))
-        self.assertEqual(hu.dmesg_tail().splitlines(), [f'usbtest {i}' for i in range(15, 30, 2)])
+    def test_the_last_eight_lines_of_the_helpers_usbtest_log(self):
+        lines = [f'usbtest {i}' for i in range(30)]
+        patch(self, hu, '_root_soft', lambda *cmd, **kw: subprocess.CompletedProcess(cmd, 0, '\n'.join(lines), ''))
+        self.assertEqual(hu.dmesg_tail().splitlines(), lines[-8:])
 
 
 class FindDevice(unittest.TestCase):
@@ -727,7 +722,7 @@ class HostCompat(unittest.TestCase):
         (root / 'devices' / 'usb5').symlink_to(pci / 'usb5')
         patch(self, hu, 'SYS_USB', root / 'devices')
         self.setpci = []
-        patch(self, hu, '_sudo_soft', lambda cmd, **kw: self.setpci.append(cmd) or (
+        patch(self, hu, '_root_soft', lambda *cmd, **kw: self.setpci.append(list(cmd)) or (
             subprocess.CompletedProcess(cmd, 0, fw, '') if fw else subprocess.CompletedProcess(cmd, 1, '', 'no')))
 
     def check(self):
@@ -742,8 +737,11 @@ class HostCompat(unittest.TestCase):
     def test_renesas_needs_current_firmware(self):
         self.host('0x1912', '0x0014', fw='00202609\n')
         self.check()
-        self.assertEqual(self.setpci, [['setpci', '-s', '0000:03:00.0', '0x6c.l']])
-        for fw, says in (('00202500\n', 'firmware 0x00202500 < 0x00202609'), (None, 'cannot read')):
+        self.assertEqual(self.setpci, [['renesas-fw', '0000:03:00.0']])
+        self.host('0x1912', '0x0014', fw='ff202609\n')      # bits 31:24 are not the version
+        self.check()
+        for fw, says in (('00202500\n', 'firmware 0x00202500 is older than 2.0.2.6'),
+                         ('ffffffff\n', 'cannot read'), (None, 'cannot read')):
             with self.subTest(fw=fw):
                 self.host('0x1912', '0x0015', fw=fw)
                 with self.assertRaises(SystemExit) as cm:

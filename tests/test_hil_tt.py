@@ -1,8 +1,7 @@
 """skills/hil/scripts/hil_tt.py is the Reset_TT helper the HIL harnesses share, moved from
-tinyusb's test/hil/helper/hil_tt.py with its TtPort/Request/Helper tests: which TT a DUT sits
-behind (a fake sysfs tree), the request bytes, the helper's outcomes through a real child,
-and the child's launch closure (this file alone). Whether the hub frees the buffer is proven
-on the rig."""
+tinyusb's test/hil/helper/hil_tt.py with its TtPort/Helper tests: which TT a DUT sits behind
+(a fake sysfs tree) and the helper's outcomes through a real child. The request itself is
+hil_root.py's (test_hil_root.py). Whether the hub frees the buffer is proven on the rig."""
 import os
 import unittest
 
@@ -11,8 +10,6 @@ if os.name == 'nt':
 
 import importlib.util
 import io
-import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -41,29 +38,50 @@ def setUpModule():
     guard_survivors(__name__)
 
 
-class TtPort(unittest.TestCase):
+class WhenToReset(unittest.TestCase):
+    """Whether a reset is requested is hil_root.tt_hub's rule, from a fake sysfs tree: only a
+    full-/low-speed device behind a hub running one TT per port gets one."""
+
     def setUp(self):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         self.sys = Path(td.name)
-        patcher = mock.patch.object(tt, 'SYS_USB', self.sys)
+        for name, value in (('SYS_USB', self.sys),):
+            patcher = mock.patch.object(tt.hil_root, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(tt, '_unconfirmed', set())
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def hub(self, name, protocol='02', busnum=5, devnum=58, config=1):
+    def hub(self, name, protocol='02', busnum=5, devnum=58, config=1, maxchild=7):
         intf = self.sys / name / f'{name}:{config}.0'
         intf.mkdir(parents=True)
         (intf / 'bInterfaceProtocol').write_text(protocol + '\n')
-        (self.sys / name / 'busnum').write_text(f'{busnum}\n')
-        (self.sys / name / 'devnum').write_text(f'{devnum}\n')
+        for k, v in (('busnum', busnum), ('devnum', devnum), ('maxchild', maxchild), ('idVendor', '05e3'),
+                     ('idProduct', '0610')):
+            (self.sys / name / k).write_text(f'{v}\n')
+
+    def dev(self, busport, speed='12'):
+        (self.sys / busport).mkdir(parents=True, exist_ok=True)
+        (self.sys / busport / 'speed').write_text(speed + '\n')
+
+    def requested(self, busport, speed):
+        sent = []
+        with redirect_stderr(io.StringIO()):
+            tt.reset_tt(busport, speed, run=lambda cmd, **kw: sent.append(cmd) or subprocess.CompletedProcess(cmd, 0, '', None))
+        return bool(sent)
 
     def test_full_speed_device_behind_a_multi_tt_hub(self):
         self.hub('5-1')
-        self.assertEqual(tt.tt_port('5-1.2', '12'), ('/dev/bus/usb/005/058', 2))
+        self.dev('5-1.2')
+        self.assertEqual(tt.hil_root.tt_hub('5-1.2'), ('5-1', 2, 5, 58, (0x05e3, 0x0610)))
+        self.assertTrue(self.requested('5-1.2', '12'))
 
     def test_nested_hub_and_any_configuration_value(self):
         self.hub('3-1.4', busnum=3, devnum=7, config=2)
-        self.assertEqual(tt.tt_port('3-1.4.7', '1.5'), ('/dev/bus/usb/003/007', 7))
+        self.dev('3-1.4.7', '1.5')
+        self.assertEqual(tt.hil_root.tt_hub('3-1.4.7')[:4], ('3-1.4', 7, 3, 7))
 
     def test_no_reset_where_it_cannot_help_or_would_disturb_others(self):
         self.hub('5-1')
@@ -73,22 +91,8 @@ class TtPort(unittest.TestCase):
                                ('5-1', '12'),      # root port
                                ('6-1.1', '12'), ('7-1.1', '12'),
                                ('8-1.1', '12')):   # hub gone
-            self.assertIsNone(tt.tt_port(busport, speed), busport)
-
-
-class Request(unittest.TestCase):
-    def test_reset_tt_request_bytes(self):
-        sent = []
-        with tempfile.TemporaryDirectory() as td, \
-                mock.patch.object(tt.fcntl, 'ioctl', lambda f, req, arg: sent.append((req, arg))):
-            node = os.path.join(td, 'node')
-            open(node, 'w').close()
-            tt.reset_tt_ioctl(node, 3)
-        (req, arg), = sent
-        # bmRequestType, bRequest, wValue, wIndex, wLength, timeout ms, data pointer
-        self.assertEqual(struct.unpack('@BBHHHIP', arg), (0x23, 9, 0, 3, 0, 1000, 0))
-        if struct.calcsize('P') == 8:   # the ioctl the rig's LP64 kernel answers
-            self.assertEqual((req, len(arg)), (0xC0185500, 24))
+            self.dev(busport, speed)
+            self.assertFalse(self.requested(busport, speed), busport)
 
 
 class Helper(unittest.TestCase):
@@ -96,8 +100,8 @@ class Helper(unittest.TestCase):
     hub; any other failure only reports."""
 
     def setUp(self):
-        for name, value in (('tt_port', lambda b, s: ('/dev/bus/usb/005/058', 2)), ('_unconfirmed', set())):
-            patcher = mock.patch.object(tt, name, value)
+        for obj, name, value in ((tt.hil_root, 'tt_hub', lambda b: ('5-1', 2, 5, 58, (0, 0))), (tt, '_unconfirmed', set())):
+            patcher = mock.patch.object(obj, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -131,12 +135,20 @@ class Helper(unittest.TestCase):
             _, calls, _ = self.reset(0)
         self.assertEqual(calls[0][1], {'timeout': 7, 'quiet': True})
 
-    def test_the_child_argv_is_this_file_isolated_under_sudo_unless_root(self):
-        here = os.path.join(SCRIPTS, 'hil_tt.py')
-        for euid, prefix in ((1000, ['sudo', '-n']), (0, [])):
-            with mock.patch.object(tt.os, 'geteuid', lambda: euid):
-                _, calls, _ = self.reset(0)
-            self.assertEqual(calls[0][0], prefix + [sys.executable, '-I', here, '/dev/bus/usb/005/058', '2'])
+    def test_the_request_is_hil_roots_reset_tt_of_the_busport(self):
+        with mock.patch.object(tt.hil_root, 'argv', lambda *a: ['H', *a]):
+            _, calls, _ = self.reset(0)
+        self.assertEqual(calls[0][0], ['H', 'reset-tt', '5-1.2'])
+
+    def test_a_timeout_is_remembered_by_hub_busport(self):
+        self.reset(124)
+        self.assertEqual(tt._unconfirmed, {'5-1'})
+
+    def test_a_timed_out_hub_stays_unconfirmed_when_it_no_longer_resolves(self):
+        self.reset(124)
+        with mock.patch.object(tt.hil_root, 'tt_hub', mock.Mock(side_effect=tt.hil_root.Refused('gone'))), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(tt.reset_tt('5-1.2', '12', run=lambda *a, **k: self.fail('no helper')))
 
     def test_a_real_timeout_keeps_its_banner_off_stdout(self):
         out, err = io.StringIO(), io.StringIO()
@@ -147,48 +159,18 @@ class Helper(unittest.TestCase):
         self.assertIn('helper timed out', err.getvalue())
 
 
-class ChildClosure(unittest.TestCase):
-    """The child is launched from the pinned file by its own path and needs nothing beside it:
-    a copy of hil_tt.py alone in an empty dir reaches the ioctl. A regular file as the node
-    answers that ioctl with ENOTTY, so no USB device is touched."""
+class RealHelper(unittest.TestCase):
+    """The default runner launches the real hil_root.py, which re-derives the hub from sysfs
+    itself: a busport no host has is refused there, before any device is opened."""
 
-    def setUp(self):
-        td = tempfile.TemporaryDirectory()
-        self.addCleanup(td.cleanup)
-        self.dir = Path(td.name)
-        self.node = self.dir / 'node'
-        self.node.write_text('')
-        patcher = mock.patch.object(os, 'geteuid', lambda: 0)   # no sudo prefix in a test
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def reset(self, mod, run=None):
+    def test_the_default_runner_launches_hil_root(self):
         err = io.StringIO()
-        with mock.patch.object(mod, 'tt_port', lambda b, s: (str(self.node), 2)), \
-                mock.patch.object(mod, '_unconfirmed', set()), redirect_stderr(err):
-            ok = mod.reset_tt('5-1.2', '12', run=run)
-        return ok, err.getvalue()
-
-    def test_a_lone_copy_reaches_the_ioctl(self):
-        alone = self.dir / 'alone'
-        alone.mkdir()
-        shutil.copy(SCRIPTS / 'hil_tt.py', alone / 'hil_tt.py')
-        r = subprocess.run([sys.executable, '-I', str(alone / 'hil_tt.py'), str(self.node), '2'],
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=tt.HELPER_TIMEOUT)
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn('Inappropriate ioctl', r.stdout)
-        self.assertNotIn('Error while finding', r.stdout)
-        self.assertNotIn('ModuleNotFoundError', r.stdout)
-        self.assertEqual([p.name for p in alone.glob('*.py')], ['hil_tt.py'])
-
-    def test_the_child_is_this_file(self):
-        self.assertEqual(tt.child_argv('node', 2)[1:3], ['-I', str(SCRIPTS / 'hil_tt.py')])
-
-    def test_the_default_runner_launches_the_real_child(self):
-        ok, err = self.reset(tt)
+        with mock.patch.object(tt.hil_root, 'tt_hub', lambda b: ('999-1', 1, 999, 2, (0, 0))), \
+                mock.patch.object(tt, '_unconfirmed', set()), \
+                mock.patch.object(os, 'geteuid', lambda: 0), redirect_stderr(err):   # no sudo in a test
+            ok = tt.reset_tt('999-1.1', '12')
         self.assertTrue(ok)
-        self.assertIn(f'Reset_TT {self.node} port 2 failed:', err)
-        self.assertIn('Inappropriate ioctl', err)
+        self.assertIn('Reset_TT /dev/bus/usb/999/002 port 1 failed: hil_root: refused: hub 999-1 ', err.getvalue())
 
 
 if __name__ == '__main__':
