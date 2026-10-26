@@ -2,19 +2,17 @@
 """Linux usbtest/testusb mechanics shared by the HIL harnesses (`hil` skill). Linux only,
 stdlib only.
 
-The device lookup, driver registration and binding, the bounded testusb case run and its
+The device lookup, driver loading and binding, the bounded testusb case run and its
 parsing, and the upstream host controller check. Every project value is a parameter: the
-device VID:PID, the reference id whose capability profile it inherits, the interface, the
-usbfs node, the case, its testusb options and every bound. Which cases run, their options,
+device VID:PID, the interface, the usbfs node, the case, its testusb options and every bound. Which cases run, their options,
 throughput, recovery and the report are the caller's.
 
 Failures that make a battery meaningless exit (SystemExit with the reason), as a CLI
 battery does; a case's own outcome is its result dict.
 
-Binding uses the 5-field new_id form referencing a known usbtest id so the dynamic id
-inherits its capability profile. Never register a plain "vid pid" dynamic id with usbtest:
-the dynid then has driver_info == 0 and usbtest_probe() dereferences it without a NULL
-check (kernel oops).
+The device must carry an id in usbtest's static table (Gadget Zero 0525:a4a0 for a full
+source/sink profile): usbtest has no new_id since 6.12.108 (upstream 00e2071f6d56), and its
+GENERIC vendor/product params bind with a profile lacking ctrl_out, iso and intr.
 
 testusb reporting quirks run_case works around:
 - its exit code is always 0 when the device exists: results are parsed from stdout
@@ -24,23 +22,27 @@ testusb reporting quirks run_case works around:
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import importlib.util
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 SYS_USB = Path('/sys/bus/usb/devices')
+SYS_DEV_CHAR = Path('/sys/dev/char')
 DRIVER = Path('/sys/bus/usb/drivers/usbtest')
 PATTERN_PARAM = Path('/sys/module/usbtest/parameters/pattern')
-# In the board-lock dir, shared by every run on the rig, but not a *.lock: hil_lock treats
-# those as boards (status, release --all)
-REGISTER_LOCK_NAME = 'usbtest-new_id.registry'
-REGISTER_LOCK_TIMEOUT = 30  # a holder only checks and writes new_id, itself bounded at 15 s
 HELPER_TIMEOUT = 30         # default bound for sudo helpers (dmesg/modprobe/setpci/tee)
+CONNECT_TIMEOUT = 15        # the usbfs open, CONNECT and close each take the device lock
+# struct usbdevfs_ioctl and its requests (v6.12 include/uapi/linux/usbdevice_fs.h)
+_USBDEVFS_IOCTL_ARG = struct.Struct('@iiP')
+USBDEVFS_IOCTL = 0xC0005500 | _USBDEVFS_IOCTL_ARG.size << 16 | 18   # _IOWR('U', 18, ...)
+USBDEVFS_CONNECT = 0x5517                                         # _IO('U', 23)
 
 RE_PASS = re.compile(r'test (\d+),\s*(\d+)\.(\d+) secs')
 RE_FAIL = re.compile(r'test (\d+) --> (\d+) \((.*)\)')
@@ -136,18 +138,6 @@ def _sudo_soft(cmd, **kw):
 
 
 def sysfs_write(path, data, check=True):
-    # A driver-registry write (new_id/remove_id/bind) blocks in D state while a device lock
-    # is held: fail fast instead of piling up unkillable writers. A timeout alone does not
-    # say which holder: a peer's in-flight testusb case holds its lock for the whole case
-    # (usbdev_do_ioctl), a wedged device holds it for good.
-    #
-    # Verified in v6.12.96: unbind_store -> device_driver_detach ->
-    # device_release_driver_internal -> __device_driver_lock (drivers/base/dd.c), which
-    # takes device_lock() -- the UNINTERRUPTIBLE variant, unlike the sysfs read path -- and
-    # ALSO device_lock(parent), because usb_bus_type sets need_parent_lock = true
-    # (drivers/usb/core/driver.c:2048). So one such write against a wedged device blocks
-    # unkillably while holding the HUB's lock: that is the mechanism by which a single
-    # wedged port takes its whole bus down, and why this fails fast instead.
     try:
         r = sudo(['tee', str(path)], input=data, timeout=15)
     except subprocess.TimeoutExpired:
@@ -320,67 +310,66 @@ def check_host_compat(node):
                      'reverts to ROM on every power cycle).')
 
 
-def register_usbtest_id(vid, pid, ref, lock_dir):
-    """Register `vid`:`pid` with usbtest, inheriting the capability profile of `ref`
-    ('vvvv pppp'): one new_id write per module load, before any battery.
-
-    Every new_id write runs driver_attach, which takes the device lock of every matching
-    interface on the rig; a peer's testusb case holds its lock for the whole case, so a write
-    beside running batteries waits for the slowest case and trips sysfs_write's bound. The
-    kernel keeps no duplicate check and lists the id before driver_attach runs, so the check
-    and the write share one flock in `lock_dir` (the rig's board-lock dir): two initializers
-    make one write, and neither returns while the other's attach is in flight. A wrong entry
-    is repaired by a module reload, never by remove_id + this."""
-    ref_ids = ref.split(' ')
-    # the listing is lowercase '%04x %04x': a vid/pid spelled otherwise never matches and every
-    # run would append another entry; ref is held to the same spelling as an input contract
-    if not all(_HEX4.match(x) for x in (vid, pid, *ref_ids)) or len(ref_ids) != 2:
-        raise ValueError(f'usbtest id {vid!r}:{pid!r} ref {ref!r}: '
-                         "expected lowercase 4-digit hex ids and ref 'vvvv pppp'")
+def load_usbtest():
+    """modprobe usbtest unless loaded: udev usually loads it on the device's modalias."""
     if not DRIVER.exists():
         r = _sudo_soft(['modprobe', 'usbtest'])
         if r.returncode != 0 or not DRIVER.exists():
             sys.exit(f'cannot load usbtest module: {r.stderr.strip()}')
-    path = os.path.join(lock_dir, REGISTER_LOCK_NAME)
-    try:
-        os.makedirs(lock_dir, exist_ok=True)
-        fh = open(path, 'a')
-    except OSError as e:
-        sys.exit(f'usbtest id registration lock {path}: {e.strerror}')
-    with fh:
-        deadline = time.monotonic() + REGISTER_LOCK_TIMEOUT
-        while True:
-            try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() > deadline:
-                    sys.exit(f'usbtest id registration lock {path} held >{REGISTER_LOCK_TIMEOUT}s')
-                time.sleep(0.1)
-            except OSError as e:
-                sys.exit(f'usbtest id registration lock {path}: {e.strerror}')
+
+
+def bound_driver(interface):
+    drv = SYS_USB / interface / 'driver'
+    return drv.resolve().name if drv.is_symlink() else None
+
+
+def ensure_usbtest_bound(interface, node):
+    """Bind `interface` (sysfs name, e.g. '1-1:1.0') of the device at usbfs `node` to usbtest.
+
+    usbtest matches the device's static id itself, so an unbound interface needs only a usbfs
+    CONNECT (device_attach, v6.12 devio.c proc_ioctl), which any opener with write access may
+    issue. It runs in a child bounded at CONNECT_TIMEOUT, since the open, the ioctl and the
+    close each take the device lock. An interface held by another driver (a usbfs claim, a
+    foreign driver) is a named exit, never stolen."""
+    load_usbtest()
+    held = bound_driver(interface)
+    if held is None:
+        cmd = [sys.executable, '-I', os.path.abspath(__file__), 'connect', node, interface]
         try:
-            listed = (DRIVER / 'new_id').read_text().splitlines()
-        except OSError as e:
-            sys.exit(f'cannot read {DRIVER / "new_id"}: {e.strerror}')
-        if f'{vid} {pid}' not in listed:
-            sysfs_write(DRIVER / 'new_id', f'{vid} {pid} 0 {ref}')
+            r = run(['sudo', '-n'] + cmd if needs_sudo(node) else cmd, timeout=CONNECT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            sys.exit(f'usbfs CONNECT on {interface} blocked >{CONNECT_TIMEOUT}s: its device lock is '
+                     'held -- a peer case or a wedged device. Check dmesg before any recovery '
+                     '(usb-kernel-recover skill).')
+        held = bound_driver(interface)   # EBUSY may mean a concurrent probe won: recheck
+        if held is None:
+            why = errno.errorcode.get(r.returncode, r.stderr.strip() or f'exit {r.returncode}')
+            sys.exit(f'{interface} did not bind to usbtest (CONNECT {why}):\n{dmesg_tail()}')
+    if held != 'usbtest':
+        sys.exit(f'{interface} is held by {held}, not usbtest: release it, then rerun')
 
 
-def bind_usbtest(interface):
-    """Bind `interface` (sysfs name, e.g. '1-1:1.0') to usbtest. The id is registered
-    already (register_usbtest_id), so this writes only this interface's own bind/unbind."""
-    deadline = time.monotonic() + 3
-    while time.monotonic() < deadline:
-        drv = SYS_USB / interface / 'driver'
-        if drv.is_symlink():
-            if drv.resolve().name == 'usbtest':
-                return
-            # claimed by a foreign driver: steal the interface
-            sysfs_write(drv / 'unbind', interface)
-        sysfs_write(DRIVER / 'bind', interface, check=False)
-        time.sleep(0.2)
-    sys.exit(f'interface {interface} did not bind to usbtest')
+def _usbfs_connect(node, interface):
+    """ensure_usbtest_bound's child: CONNECT `interface` through `node` once the open fd is
+    confirmed to be that interface's device. 0, or the errno."""
+    device, _, ifc = interface.partition(':')
+    try:
+        fd = os.open(node, os.O_RDWR | os.O_NOFOLLOW)
+    except OSError as e:
+        return e.errno
+    try:
+        rdev = os.fstat(fd).st_rdev
+        # the fd pins one enumeration: a replaced device must not take the CONNECT
+        if os.path.realpath(SYS_DEV_CHAR / f'{os.major(rdev)}:{os.minor(rdev)}') != \
+                os.path.realpath(SYS_USB / device):
+            return errno.ENODEV
+        ifno = int(ifc.split('.')[1])
+        fcntl.ioctl(fd, USBDEVFS_IOCTL, _USBDEVFS_IOCTL_ARG.pack(ifno, USBDEVFS_CONNECT, 0))
+    except OSError as e:
+        return e.errno
+    finally:
+        os.close(fd)
+    return 0
 
 
 def set_pattern(value):
@@ -489,3 +478,9 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
     result.update(status='NOTRUN', detail='case gated off: check binding profile/pattern',
                   stderr=out.strip())
     return result
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 4 or sys.argv[1] != 'connect':
+        sys.exit('usage: hil_usbtest.py connect NODE INTERFACE')
+    sys.exit(_usbfs_connect(sys.argv[2], sys.argv[3]))
