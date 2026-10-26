@@ -6,10 +6,11 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'scripts' / 'captain_guard.py'
 spec = importlib.util.spec_from_file_location('captain_guard', SCRIPT)
@@ -17,6 +18,7 @@ guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
 
 RUN = 'python3 ~/.claude/skills/captain/scripts/captain.py'
+READ = 'python3 ~/.claude/skills/captain/scripts/captain_read.py'
 
 
 def setUpModule():
@@ -46,6 +48,16 @@ class HookTest(unittest.TestCase):
     def test_garbage_denies(self):
         done = subprocess.run([sys.executable, str(SCRIPT)], input='not json', capture_output=True, text=True)
         self.assertEqual(done.returncode, 2)
+
+
+    def test_a_missing_reader_denies(self):
+        """The reader is imported before the hook's excepthook is set; its loss must deny, not pass."""
+        lone = tmpdir(self)
+        (lone / 'captain_guard.py').write_bytes(SCRIPT.read_bytes())
+        payload = json.dumps({'tool_name': 'Bash', 'tool_input': {'command': 'ls'}, 'agent_type': 'captain'})
+        done = subprocess.run([sys.executable, str(lone / 'captain_guard.py')], input=payload, capture_output=True,
+                              text=True)
+        self.assertEqual(done.returncode, 2, done.stderr)
 
 
 class DeclarationTest(unittest.TestCase):
@@ -109,18 +121,71 @@ class VerdictTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
 
+    def test_reader_lookups_pass_and_the_reader_s_refusals_deny(self):
+        for cmd in [f'{READ} git -C ~/.herdr/worktrees/tinyusb/fix2-issue reflog show -n 5',
+                    f'{READ} git -C ~/code/agentrc log --format=dated origin/main..topic',
+                    f'{READ} gh pr view 4165 -R hathach/tinyusb --json number,headRefOid,updatedAt']:
+            with self.subTest(cmd):
+                self.assertIsNone(self.verdict('Bash', command=cmd))
+        for cmd in [f'{READ} git -C ~/code/agentrc push', f'{READ} gh pr merge 1 -R o/r', f'{READ} gh api x',
+                    f'{READ} git -C /etc status', f"{READ} git -C ~/code/a log --format='%h'",
+                    f'{READ} gh pr view 1 -R o/r | sh', f'{READ} git -C ~/code/a log; git push',
+                    f'{RUN} ask a,b', 'python3 skills/captain/scripts/captain_read.py gh pr view 1 -R o/r']:
+            with self.subTest(cmd):
+                self.assertIsNotNone(self.verdict('Bash', command=cmd))
+        self.assertIsNotNone(self.verdict('Monitor', command=f'{READ} gh pr view 1 -R o/r --web'))
+
+    def test_the_skill_s_documented_lookups_pass(self):
+        text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
+        sample = {'<checkout>': '~/code/repo', '<N>': '12', '<owner>/<repo>': 'o/r', '<fields>': 'number,title',
+                  '-n N': '-n 5', 'oneline|dated': 'dated', '<range>': 'main..topic', '<ref>': 'main',
+                  '<directory>': '~/.cache/chief-runs', '<prefix>': 'tinyusb-4165'}
+        found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain_read\.py [^`#\n]*)', text)
+        self.assertGreaterEqual(len(found), 7)
+        for cmd in found:
+            for k, v in sample.items():
+                cmd = cmd.replace(k, v)
+            cmd = re.sub(r'\[([^\]]*)\]', r'\1', cmd.strip())
+            with self.subTest(cmd):
+                self.assertIsNone(self.verdict('Bash', command=cmd))
+
     def test_monitor_only_watches_a_command(self):
         self.assertIsNotNone(self.verdict('Monitor', ws={'url': 'wss://x'}))
 
-    def test_reads_only_state_and_skill(self):
-        state = os.path.join(guard.STATE, 'ledger.jsonl')
-        skill = os.path.join(guard.SKILL, 'SKILL.md')
-        self.assertIsNone(self.verdict('Read', file_path=state))
-        self.assertIsNone(self.verdict('Read', file_path=skill))
+    def test_reads_checkouts_chief_runs_memory_state_and_skill(self):
+        home = os.path.expanduser('~')
+        for path in [os.path.join(guard.STATE, 'ledger.jsonl'), os.path.join(guard.SKILL, 'SKILL.md'),
+                     f'{home}/code/agentrc/README.md', f'{home}/.herdr/worktrees/tinyusb/x/src/tusb.c',
+                     f'{home}/.cache/chief-runs/tinyusb-4165-babysit-1/progress.log',
+                     f'{home}/.claude/projects/-home-u-code-agentrc/memory/MEMORY.md',
+                     os.path.join(guard.MEMORY, 'MEMORY.md')]:
+            with self.subTest(path):
+                self.assertIsNone(self.verdict('Read', file_path=path))
         for path in ['/etc/passwd', os.path.join(guard.STATE, '..', 'x'), 'relative.md', guard.STATE + '-other/x',
-                     None]:
+                     f'{home}/.ssh/id_ed25519', f'{home}/.config/gh/hosts.yml', f'{home}/.claude/.credentials.json',
+                     f'{home}/.claude/projects/-home-u-code-agentrc/abc.jsonl', f'{home}/.claude/projects/memory',
+                     f'{home}/code-other/x', f'{home}/code/../.ssh/id_ed25519', None]:
             with self.subTest(path):
                 self.assertIsNotNone(self.verdict('Read', file_path=path))
+
+    def test_a_symlink_out_of_a_root_is_not_readable(self):
+        root = tmpdir(self)
+        (root / 'out').symlink_to('/etc')
+        with mock.patch.object(guard.captain_read, 'READ_ROOTS', (str(root),)):
+            self.assertIsNone(self.verdict('Read', file_path=str(root / 'in.log')))
+            self.assertIsNotNone(self.verdict('Read', file_path=str(root / 'out' / 'passwd')))
+
+    def test_writes_only_markdown_in_its_memory(self):
+        note = os.path.join(guard.MEMORY, 'MEMORY.md')
+        self.assertIsNone(self.verdict('Write', file_path=note, content='x'))
+        self.assertIsNone(self.verdict('Edit', file_path=note, old_string='a', new_string='b'))
+        for path in [os.path.join(guard.MEMORY, 'run.sh'), guard.MEMORY + '-other/x.md',
+                     os.path.join(guard.MEMORY, '..', 'chief', 'x.md'),
+                     os.path.expanduser('~/.claude/projects/-home-u-code-agentrc/memory/MEMORY.md'),
+                     os.path.expanduser('~/code/agentrc/README.md'), 'MEMORY.md', None]:
+            for tool in ('Write', 'Edit'):
+                with self.subTest(tool=tool, path=path):
+                    self.assertIsNotNone(self.verdict(tool, file_path=path))
 
     def test_other_tools(self):
         self.assertIsNone(self.verdict('Skill', skill='captain'))
@@ -128,7 +193,7 @@ class VerdictTest(unittest.TestCase):
         self.assertIsNone(self.verdict('ToolSearch', query='select:Monitor'))
         self.assertIsNotNone(self.verdict('ToolSearch', query='select:WebFetch'))
         self.assertIsNone(self.verdict('AskUserQuestion', questions=[]))
-        for tool in ('Edit', 'Write', 'Agent', 'Workflow', 'WebFetch', 'WebSearch', 'SendMessage', 'NotebookEdit',
+        for tool in ('Glob', 'Grep', 'Agent', 'Workflow', 'WebFetch', 'WebSearch', 'SendMessage', 'NotebookEdit',
                      'mcp__github__merge_pull_request', 'Artifact', None):
             with self.subTest(tool):
                 self.assertIsNotNone(self.verdict(tool))

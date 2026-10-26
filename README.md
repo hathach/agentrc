@@ -298,11 +298,11 @@ Leave the checkout to chief until it exits.
 Herdr (Codex panes are left out): it lists them, opens new ones on existing
 checkouts under either account, asks the idle ones for status, reports one table
 and carries the human's own words, read from its own transcript, to the sessions
-they name. It never acts itself; its guard,
-`skills/captain/scripts/captain_guard.py`, declared as a hook in the agent file so
-it applies on every account, allows its own calls only to run the installed
-`skills/captain/scripts/captain.py` with a known subcommand, read its state and
-skill, load Monitor and ask the human. It reads sessions from Herdr rather than
+they name. It checks what sessions report with read-only git and gh lookups and
+the files sessions and chiefs leave, and keeps its own memory, but never does the
+sessions' work; its guard, `skills/captain/scripts/captain_guard.py`, declared as a
+hook in the agent file so it applies on every account, names in its docstring the
+calls it allows. It reads sessions from Herdr rather than
 Claude Code's own session list because sessions run under more than one account
 (`CLAUDE_CONFIG_DIR`), each shown with the account its process runs under. Start
 it in its own pane:
@@ -311,6 +311,11 @@ it in its own pane:
 ~/code/agentrc/install.py install --agent --skill
 claude --agent captain
 ```
+
+Its memory is shared across accounts: an account whose config directory is not
+`~/.claude` links its `agent-memory` there, as the ada account does with
+`ln -s ~/.claude/agent-memory ~/.claude-ada/agent-memory`; without that link the
+guard denies its memory writes.
 
 ## Tests
 

@@ -23,6 +23,23 @@ python3 ~/.claude/skills/captain/scripts/captain.py withdraw <action>           
 python3 ~/.claude/skills/captain/scripts/captain.py open --checkout <dir> --account <main|ada> [--name <name>]
 ```
 
+The captain's read-only lookups, each refused unless its subcommand, flags and operands are on the script's
+allowlist (its docstring), and run with repository config that could start a program overridden:
+
+```bash
+python3 ~/.claude/skills/captain/scripts/captain_read.py git -C <checkout> status
+python3 ~/.claude/skills/captain/scripts/captain_read.py git -C <checkout> log [-n N] [--format=oneline|dated] [<range>]
+python3 ~/.claude/skills/captain/scripts/captain_read.py git -C <checkout> reflog show [-n N] [<ref>]
+python3 ~/.claude/skills/captain/scripts/captain_read.py git -C <checkout> worktree list
+python3 ~/.claude/skills/captain/scripts/captain_read.py gh pr view <N> -R <owner>/<repo> [--json <fields>]
+python3 ~/.claude/skills/captain/scripts/captain_read.py gh pr checks <N> -R <owner>/<repo>
+python3 ~/.claude/skills/captain/scripts/captain_read.py list <directory> [<prefix>]   # newest first, e.g. chief runs
+```
+
+A checkout is a path under `~/code` or `~/.herdr/worktrees`; also `branch`, `show`, `diff`, `rev-parse`,
+`merge-base`, `gh pr list|diff --name-only`, `gh issue view|list`, `gh run view|list`. A refusal says what the
+reader does not take.
+
 Run each exactly so, the script spelled out, with no variable, `cd`, pipe or redirection: the guard allows nothing
 else.
 
