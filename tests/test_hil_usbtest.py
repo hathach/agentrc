@@ -238,7 +238,7 @@ class Pattern(unittest.TestCase):
         self.param = Path(td.name) / 'pattern'
         self.writes = []
         patch(self, hu, 'PATTERN_PARAM', self.param)
-        patch(self, hu, 'sysfs_write', lambda path, data, check=True: self.writes.append((path, data)))
+        patch(self, hu, 'sysfs_write', lambda path, data: self.writes.append((path, data)))
 
     def test_written_only_when_it_differs(self):
         for current, writes in (('0\n', []), ('1\n', [(self.param, '0')])):

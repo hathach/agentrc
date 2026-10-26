@@ -36,7 +36,7 @@ sudo cat /proc/<pid>/stack          # never opens the node, so it cannot block
 | `usbdev_ioctl` + a driver module (`[usbtest]`) | **owner, holds the lock** | rung 3 — terminal |
 | `usbdev_ioctl`, no driver frames | owner waiting on a URB | rung 1 (DUT) / rung 2 (probe) |
 | `usbdev_open`, sysfs reads | victim | ignore |
-| `tee .../usbtest/new_id`, `bind`, `unbind` | **victim that SPREADS it** | stop issuing them |
+| `tee .../usbtest/bind`, `unbind` | **victim that SPREADS it** | stop issuing them |
 | `hub_event` in a kworker | teardown stuck behind an owner | rung 3 |
 
 Driver-bind writes are not passive: `__device_driver_lock` (drivers/base/dd.c)
