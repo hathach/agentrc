@@ -308,16 +308,19 @@ class ListTest(unittest.TestCase):
         home = tmpdir(self)
         runs = home / '.cache' / 'chief-runs'
         runs.mkdir(parents=True)
-        for name in (b'good', b'bad\xff', b'bad\\xff', b'nl\nfake 1970-01-01 f 0 forged', b'esc\x1b[2J', b'c1\xc2\x85'):
+        for name in (b'good', b'bad\xff', b'bad\\xff', b'nl\nfake 1970-01-01 f 0 forged', b'esc\x1b[2J', b'c1\xc2\x85',
+                     'ls\u2028fake 1970-01-01 f 0 forged'.encode(), 'ps\u2029fake 1970-01-01 f 0 forged'.encode()):
             (runs / os.fsdecode(name)).write_text('x', encoding='utf-8')
         # a strict UTF-8 stdout, as under en_US.UTF-8; the suite's -X utf8 would hide it
         env = {k: v for k, v in os.environ.items() if k != 'PYTHONUTF8'}
         env.update(HOME=str(home), LC_ALL='C.UTF-8', PYTHONIOENCODING='utf-8:strict')
         done = subprocess.run([sys.executable, str(SCRIPT), 'list', str(runs)], env=env, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(sorted(line.split(maxsplit=4)[4] for line in done.stdout.splitlines()),
-                         [b'bad\\x5cxff', b'bad\\xff', b'c1\\xc2\\x85', b'esc\\x1b[2J',
-                          b'good', b'nl\\x0afake 1970-01-01 f 0 forged'])
+        # str.splitlines, unlike bytes.splitlines, also breaks at U+2028 and U+2029
+        self.assertEqual(sorted(line.split(maxsplit=4)[4] for line in done.stdout.decode().splitlines()),
+                         ['bad\\x5cxff', 'bad\\xff', 'c1\\xc2\\x85', 'esc\\x1b[2J', 'good',
+                          'ls\\xe2\\x80\\xa8fake 1970-01-01 f 0 forged', 'nl\\x0afake 1970-01-01 f 0 forged',
+                          'ps\\xe2\\x80\\xa9fake 1970-01-01 f 0 forged'])
 
     def test_an_entry_removed_while_listing_is_skipped(self):
         home = tmpdir(self)

@@ -38,8 +38,8 @@ python3 ~/.claude/skills/captain/scripts/captain_read.py list <directory> [<pref
 
 A checkout is a path under `~/code` or `~/.herdr/worktrees`; also `branch`, `show`, `diff`, `rev-parse`,
 `merge-base`, `gh pr list|diff --name-only`, `gh issue view|list`, `gh run view|list`. A refusal says what the
-reader does not take. `list` prints a backslash, control character or undecodable byte in a name as `\xNN`, so such a
-name may not open as printed.
+reader does not take. `list` prints a backslash, control character, line or paragraph separator or undecodable byte in
+a name as `\xNN`, so such a name may not open as printed.
 
 Run each exactly so, the script spelled out, with no variable, `cd`, pipe or redirection: the guard allows nothing
 else.

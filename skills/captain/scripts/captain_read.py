@@ -355,9 +355,10 @@ def filtered(top, env):
     return None
 
 
-# a control character could forge a row or drive the terminal, a surrogate (an undecodable byte) fails a strict UTF-8
-# stdout, and a backslash is escaped too so that every \xNN stands for one byte of the name
-UNSHOWN = re.compile(r'[\\\x00-\x1f\x7f-\x9f\udc80-\udcff]')
+# a control character or a Unicode line or paragraph separator could forge a row or drive the terminal, a surrogate
+# (an undecodable byte) fails a strict UTF-8 stdout, and a backslash is escaped too so that every \xNN stands for one
+# byte of the name
+UNSHOWN = re.compile(r'[\\\x00-\x1f\x7f-\x9f\u2028\u2029\udc80-\udcff]')
 
 
 def escaped(match):
