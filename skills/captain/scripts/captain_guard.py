@@ -76,7 +76,7 @@ def verdict(payload):
         return 'captain reads only checkouts, chief runs and memory; captain_read.py list shows a directory'
     if tool in ('Write', 'Edit'):
         path = args.get('file_path')
-        if (isinstance(path, str) and os.path.isabs(path) and path.endswith('.md')
+        if (isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path).endswith('.md')
                 and captain_read.inside(path, MEMORY)):
             return None
         return f'captain writes only Markdown in its memory, {MEMORY}'

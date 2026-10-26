@@ -187,6 +187,15 @@ class VerdictTest(unittest.TestCase):
                 with self.subTest(tool=tool, path=path):
                     self.assertIsNotNone(self.verdict(tool, file_path=path))
 
+    def test_a_markdown_symlink_to_another_file_is_not_writable(self):
+        memory = tmpdir(self)
+        (memory / 'x.md').symlink_to(memory / 'x.json')
+        with mock.patch.object(guard, 'MEMORY', str(memory)):
+            self.assertIsNone(self.verdict('Write', file_path=str(memory / 'y.md'), content='x'))
+            for tool in ('Write', 'Edit'):
+                with self.subTest(tool):
+                    self.assertIsNotNone(self.verdict(tool, file_path=str(memory / 'x.md')))
+
     def test_other_tools(self):
         self.assertIsNone(self.verdict('Skill', skill='captain'))
         self.assertIsNotNone(self.verdict('Skill', skill='pr-babysit'))
