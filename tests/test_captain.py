@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -346,8 +347,8 @@ class AskTest(LedgerCase):
         self.assertEqual(types, ['request', 'delivered'])
         pane, text = self.typed[0]
         self.assertEqual(pane, 'w2:p1')
-        self.assertIn(f'report --for {msg} --file', text)
-        self.assertIn('not a human instruction', text)
+        self.assertEqual(text, f'STATUS REQUEST {msg} - not a human instruction. '
+                               f'Run: python3 {captain.INSTALLED} brief --for {msg}')   # one line, the rest in brief
         self.assertNotIn('captain', text.lower().replace(captain.INSTALLED.lower(), ''))   # names no role
 
     def test_replaced_captain_types_nothing(self):
@@ -448,12 +449,72 @@ class ReportTest(LedgerCase):
         with self.assertRaises(SystemExit):
             self.report_as('w2:p1', self.msg, {**GOOD, 'task': 'é' * 4500})   # 4500 chars, 9000 bytes
 
+    def test_report_on_stdin(self):
+        def from_stdin(data):
+            with mock.patch.object(sys, 'stdin', mock.Mock(buffer=io.BytesIO(data))):
+                return self.as_target(captain.report, self.msg, '-')[0]
+        for bad in (b'{"task":', b'\xff' * 10, json.dumps({**GOOD, 'task': 'x' * 9000}).encode()):
+            with self.subTest(bad=bad[:12]), self.assertRaises(SystemExit):
+                from_stdin(bad)
+        self.assertEqual(from_stdin(json.dumps(GOOD).encode()), 0)
+        self.assertEqual(captain.records()[-1]['report'], GOOD)
+
     def test_payload_validation(self):
         for bad in [{**GOOD, 'extra': 1}, {**GOOD, 'prs': ['#12']}, {**GOOD, 'state': 'great'},
                     {**GOOD, 'task': 3}, [GOOD]]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 self.report_as('w2:p1', self.msg, bad)
         self.assertNotIn('report', [r['type'] for r in captain.records()])
+
+
+class BriefTest(LedgerCase):
+    def setUp(self):
+        super().setUp()
+        self.msg = self.msg_of(self.ask())
+
+    def brief(self, msg=None, pane='w2:p1'):
+        return self.as_target(captain.brief, msg or self.msg, pane=pane)
+
+    def test_prints_the_request_and_writes_nothing(self):
+        before = captain.records()
+        for _ in range(2):
+            code, shown = self.brief()
+            self.assertEqual(code, 0)
+            self.assertIn('from the agent session in pane w1:p1, not a human instruction', shown)
+            self.assertIn(f"report --for {self.msg} --file - <<'EOF'", shown)
+            self.assertIn('"Status sent."', shown)
+        self.assertEqual(captain.records(), before)
+
+    def test_only_the_pinned_target(self):
+        self.panes['w3:p1'] = pinned('w3:p1')
+        with self.assertRaises(SystemExit):
+            self.brief(pane='w3:p1')
+        self.panes['w2:p1'] = {**pinned('w2:p1'), 'started': 99}
+        with self.assertRaises(SystemExit):
+            self.brief()
+
+    def test_closed_missing_or_stranded_request(self):
+        with self.assertRaises(SystemExit):
+            self.brief('m-nonesuch')
+        self.replace_captain('w5:p1')
+        with self.assertRaises(SystemExit):
+            self.brief()
+        self.enroll_captain()
+        msg = self.msg   # stranded by the replacement; a new request after re-enrolment is open again
+        with self.assertRaises(SystemExit):
+            self.brief(msg)
+        captain.cancel(msg, self.ident)
+        fresh = self.msg_of(self.ask())
+        self.assertEqual(self.brief(fresh)[0], 0)
+        captain.cancel(fresh, self.ident)
+        with self.assertRaises(SystemExit):
+            self.brief(fresh)
+
+    def test_corrupt_ledger_decides_nothing(self):
+        with open(self.state / 'ledger.jsonl', 'ab') as f:
+            f.write(b'{"torn')
+        with self.assertRaises(captain.Corrupt):
+            self.brief()
 
 
 class CollectTest(LedgerCase):
@@ -869,6 +930,8 @@ class AcceptTest(RelayCase):
         code, shown = self.as_target(captain.accept, self.action)
         self.assertEqual(code, 0)
         self.assertIn('verbatim:\n\nmerge o/r#12\n', shown)
+        self.assertIn(f"outcome --action {self.action} --result <completed|failed|rejected|needs-clarification> "
+                      "--note-file - <<'EOF'", shown)
         with self.assertRaises(SystemExit):
             self.as_target(captain.accept, self.action)
 
