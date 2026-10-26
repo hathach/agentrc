@@ -5,7 +5,7 @@ whether its input line is empty before anything is typed into it.
 Judgment stays in SKILL.md. Every check refuses rather than guesses: an identity it cannot pin or a screen it
 does not recognize is reported, never assumed safe.
 
-  captain.py list [--json]                       every agent session, asking none of them
+  captain.py list [--json]                       every agent session, latest Herdr change first, asking none
   captain.py enroll [--replace]                  make this session the captain
   captain.py ask <target>...                     send each idle target a status request
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
@@ -246,8 +246,9 @@ def sessions(agents=None, workspaces=None, me=None):
             'cwd': canonical(a.get('cwd')),
             'session': (a.get('agent_session') or {}).get('value'),
             'status': a.get('agent_status', 'unknown'),
+            'seq': a.get('state_change_seq') or 0,
         })
-    return found
+    return sorted(found, key=lambda s: (-s['seq'], s['pane_id']))
 
 
 def pin(session):
@@ -681,7 +682,7 @@ def reports(msgs=()):
 
 
 def row(request, rep):
-    return {'handle': request['handle'], 'msg': request['msg'], 'age_s': int(time.time() - rep['at']), **rep['report']}
+    return {'handle': request['handle'], 'msg': request['msg'], **rep['report']}
 
 
 def cancel(msg, mine):
@@ -948,7 +949,7 @@ def open_session(checkout, account_name, name, mine):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    ls = sub.add_parser('list', help='every agent session in this Herdr, without asking any of them')
+    ls = sub.add_parser('list', help='every agent session in this Herdr, latest change first, without asking any of them')
     ls.add_argument('--json', action='store_true')
     sub.add_parser('enroll', help='make this session the captain').add_argument('--replace', action='store_true')
     sub.add_parser('ask', help='send each target a status request').add_argument('panes', nargs='+')
@@ -1010,8 +1011,7 @@ def main():
                     print(f'{r["msg"]}\t{r["missing"]}')
                     continue
                 prs = ' '.join(r['prs']) or '-'
-                print(f'{r["handle"]}\t{one_line(r["task"])}\t{prs}\t{r["state"]}\t'
-                      f'{one_line(r["needs"]) or "-"}\t{r["age_s"] // 60} min')
+                print(f'{r["handle"]}\t{one_line(r["task"])}\t{prs}\t{r["state"]}\t{one_line(r["needs"]) or "-"}')
             return 0
         mine = me()
         if a.cmd == 'ask':

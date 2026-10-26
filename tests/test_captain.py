@@ -85,6 +85,14 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual([s['handle'] for s in found], ['tinyusb · claude-ada-x · w2:p1'])   # Claude only
         self.assertEqual([s['session'] for s in found], ['uuid-1'])
 
+    def test_latest_herdr_change_first(self):
+        found = captain.sessions(
+            agents=[agent('w1:p1', state_change_seq=5), agent('w3:p1'), agent('w2:p2', state_change_seq=9),
+                    agent('w2:p1', state_change_seq=9)],
+            workspaces=[], me='')
+        self.assertEqual([(s['pane_id'], s['seq']) for s in found], [('w2:p1', 9), ('w2:p2', 9), ('w1:p1', 5),
+                                                                     ('w3:p1', 0)])
+
     def test_missing_or_relative_cwd_stays_unknown(self):
         for cwd in (None, '', 'rel/dir'):
             with self.subTest(cwd=cwd):

@@ -8,10 +8,11 @@ description: Collect status from the human's other Claude Code sessions in Herdr
 `scripts/captain.py` owns the mechanics: finding sessions, pinning each one's identity, telling whether its input
 line is empty, and a locked ledger under `~/.cache/agentrc/captain/` that holds every request and answer. This page
 is the judgment. Linux only (Herdr, `/proc`). Claude Code sessions only: Codex runs its commands outside its pane's
-process tree, so a Codex target could never prove which pane answers, and `list` leaves Codex panes out.
+process tree, so a Codex target could never prove which pane answers, and `list` leaves Codex panes out. `list`
+orders sessions by Herdr's `state_change_seq`, latest change first: an order, not how long one has been idle.
 
 ```bash
-python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every agent session, asking none
+python3 ~/.claude/skills/captain/scripts/captain.py list [--json]                   # every agent session, latest change first
 python3 ~/.claude/skills/captain/scripts/captain.py enroll [--replace]              # make this session the captain
 python3 ~/.claude/skills/captain/scripts/captain.py ask <target>...                 # one status request per idle target
 python3 ~/.claude/skills/captain/scripts/captain.py collect [<msg>...] [--wait MS]  # each answer as it lands
