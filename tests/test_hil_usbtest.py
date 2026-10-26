@@ -76,6 +76,8 @@ class Binding(unittest.TestCase):
         patch(self, hu, '_sudo_soft', self.sudo_soft)
         patch(self, hu, 'needs_sudo', lambda node: False)
         patch(self, hu, 'dmesg_tail', lambda: 'usbtest dmesg')
+        patch(self, hu.platform, 'system', lambda: 'Linux')
+        patch(self, hu.platform, 'machine', lambda: 'x86_64')
 
     def bind(self, driver):
         d = self.root / 'drivers' / driver
