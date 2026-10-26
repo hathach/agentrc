@@ -104,7 +104,8 @@ def main(argv=None):
     p.add_argument('--device', help='J-Link device name')
     p.add_argument('--hil-config', metavar='FILE',
                    help="the project's HIL config json; with --board it supplies --probe and --device "
-                        "of a J-Link board. A flag given as well must agree")
+                        "of a jlink board (a flag given as well must agree), or the whole connection of "
+                        "an openocd board")
     p.add_argument('--board', metavar='NAME', help='board name in --hil-config')
     p.add_argument('--elf', required=True, help='the flashed firmware ELF, for symbols')
     p.add_argument('--samples', type=int, default=300, help='DWT_PCSR reads (default 300)')

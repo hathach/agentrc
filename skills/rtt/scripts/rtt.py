@@ -796,6 +796,8 @@ def hil_flasher(path, board):
         if key in flasher and (not isinstance(flasher[key], str) or not flasher[key].strip()):
             raise ValueError(f'--board {board}: flasher.{key} in {path} must be a non-empty string, '
                              f'got {flasher[key]!r}')
+    if flasher['name'] == 'stlink' and 'args' in flasher:
+        raise ValueError(f"--board {board}: a stlink entry's args are not openocd's")
     return flasher
 
 
@@ -896,9 +898,6 @@ def main() -> int:
         try:
             flasher = hil_flasher(args.hil_config, args.board)
             route = HIL_PROBE_ROUTES[flasher['name']]
-            if flasher['name'] == 'stlink' and 'args' in flasher:
-                raise ValueError(f"--board {args.board}: a stlink entry's args are not openocd's; "
-                                 f"pass --cfg, and the probe flags, explicitly")
             hil_merge(args, args.board, backend=route, probe=flasher.get('uid'),
                       vid_pid=flasher.get('vid_pid') if route == 'openocd' else None,
                       device=hil_jlink_device(args.board, flasher) if route == 'jlink' else None,

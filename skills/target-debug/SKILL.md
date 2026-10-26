@@ -1,6 +1,6 @@
 ---
 name: target-debug
-description: "Use when firmware misbehaves on real hardware and its own state must explain it — a device that wedges, STALLs, NAKs forever, drops data, an endpoint stuck busy, a HardFault, a stuck ISR, a spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO. Also ETM instruction trace and profiling with a SEGGER J-Trace and Ozone: hot functions, ISR timing, code coverage, what ran before a fault or hang; \"No trace clock present\". Also SEGGER SystemView: per-task and per-ISR CPU load, ready→run latency, the scheduling timeline, a post-mortem trace of what ran before a hang. Also for Espressif chips over the built-in USB-Serial-JTAG (303a:1001) or pad JTAG with openocd-esp32, when openocd says \"could not find or open device\", or the debug port becomes the firmware's USB device."
+description: "Use when firmware misbehaves on real hardware and its own state must explain it — a wedge, STALL, endless NAK, lost data, a stuck endpoint, HardFault, stuck ISR or spinning core. Evidence over a debug probe: logs, GDB autopsy, RAM trace, PC-sampling, SWO. Also ETM trace and profiling with a SEGGER J-Trace and Ozone (hot functions, coverage, what ran before a hang; \"No trace clock present\"); SEGGER SystemView per-task and per-ISR load, latency and the scheduling timeline; Espressif chips over the built-in USB-Serial-JTAG (303a:1001) or pad JTAG with openocd-esp32, \"could not find or open device\", or the debug port becoming the firmware's USB device."
 ---
 
 # target-debug — target-side capture & debugging over a debug probe
@@ -36,21 +36,21 @@ These skills know probes, not projects. Three things come from the project, and 
 - **What its symbols and symptoms mean**: kept here, in `projects/`, for the projects this skill has been used on — see
   "Project notes" at the end.
 
-A HIL config json maps board → probe, and `rtt.py`, `pc_sample.py` and `swo_capture.py` read it directly
-(`--hil-config <file> --board <name>`; a flag given as well must agree):
+A HIL config json maps board → probe (`--hil-config <file> --board <name>`). `rtt.py` and `swo_capture.py` turn a
+board's `flasher` entry into their flags, and a flag given as well must agree:
 
 | `flasher` field | Means | Becomes |
 | --------------- | --- | --- |
 | `name`          | how the rig flashes: `jlink`, `openocd`, `stlink` are probe routes; `esptool`, `lm4flash` are refused: they name no debug probe (Espressif debug transport and selector: `espressif.md`) | the backend (`stlink` → openocd, and then `--cfg` is yours to give) |
 | `uid`           | the probe's serial | `--probe` |
-| `args`          | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments | `--device`, or `--cfg` whole |
+| `args`          | jlink: exactly `-device <name>`; openocd: its `-f`/`-c` arguments; stlink: refused | `--device`, or `--cfg` whole |
 | `vid_pid`       | the probe model's USB IDs, openocd only | `--vid-pid` |
 
 A J-Link entry supplies neither interface nor speed. On the J-Link route `--interface` and `--speed` stay explicit; on
-the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py`, `probe_state.py` and
-`swo_capture.py` take `jlink` and `openocd` entries, `swo_capture.py` also `stlink` with your `--cfg`; `probe_state.py`
-reads only the HIL config. `etm_capture.py` does not read it —
-a J-Trace is one probe moved between boards, named with `--probe`.
+the OpenOCD route they live inside `--cfg` and the two flags are refused. `pc_sample.py` and `sysview_record.py`
+(`jlink` entries only) merge a `jlink` entry the same way; `autopsy.py`, `probe_state.py` and `sysview_dump.py` take
+`jlink` and `openocd` entries from the entry alone, as `pc_sample.py` takes an `openocd` one. `etm_capture.py` does not
+read it — a J-Trace is one probe moved between boards, named with `--probe`.
 
 ## Delegated sessions
 
@@ -168,8 +168,8 @@ Each technique's recipe, read when you reach for it (files beside this one):
 - RAM ring-buffer: `techniques.md`, "RAM ring-buffer trace" — the ring code, the `nm` check, the GDB dump.
 - SystemView: `sysview.md` — `sysview_record.py` (live J-Link recording, decoding a raw capture),
   `sysview_report.py`, `sysview_dump.py` (post-mortem ring); RTT streaming is `rtt.py --channel`.
-- Log lines (RTT, UART): `techniques.md`, "Log capture" — capture commands (`console_capture.py` for a UART), the drain
-  model; the channel itself is the `rtt` skill's.
+- Log lines (RTT, UART): `techniques.md`, "Log capture" — `console_capture.py` for a UART; the RTT channel and its drain
+  model are the `rtt` skill's.
 - ETM instruction trace: `etm-trace.md` — `etm_capture.py`, `etm_profile.py`; per-board notes in `etm-boards.md`.
 - Chip and family constraints (flash reads, reset domains, probe misreads): `families.md`; Espressif chips:
   `espressif.md`.

@@ -187,6 +187,8 @@ def hil_flasher(path, board):
         if key in flasher and (not isinstance(flasher[key], str) or not flasher[key].strip()):
             raise ValueError(f'--board {board}: flasher.{key} in {path} must be a non-empty string, '
                              f'got {flasher[key]!r}')
+    if flasher['name'] == 'stlink' and 'args' in flasher:
+        raise ValueError(f"--board {board}: a stlink entry's args are not openocd's")
     return flasher
 
 

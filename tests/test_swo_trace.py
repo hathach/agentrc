@@ -1344,7 +1344,8 @@ class HilRoster(unittest.TestCase):
         path = Path(d.name, 'hil.json')
         path.write_text(json.dumps({'boards': [
             {'name': 'f407', 'flasher': {'name': 'jlink', 'uid': '773', 'args': '-device STM32F407VG'}},
-            {'name': 'h743', 'flasher': {'name': 'stlink', 'uid': '004C'}}]}))
+            {'name': 'h743', 'flasher': {'name': 'stlink', 'uid': '004C'}},
+            {'name': 'l412', 'flasher': {'name': 'stlink', 'uid': '0673', 'args': '--freq 4M'}}]}))
         return str(path)
 
     def test_a_jlink_entry_fills_probe_and_device_and_a_given_flag_must_agree(self):
@@ -1365,6 +1366,11 @@ class HilRoster(unittest.TestCase):
         a, b = cap.parse_args(['--hil-config', hil, '--board', 'h743', '--cfg', '-f interface/stlink-dap.cfg',
                                '--accept-attach-writes', '--caps'])
         self.assertEqual((b.probe, b.cfg), ('004C', '-f interface/stlink-dap.cfg'))
+
+    def test_an_stlink_entrys_args_are_never_taken_as_openocds(self):
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            cap.parse_args(['--hil-config', self.roster(), '--board', 'l412', '--accept-attach-writes', '--caps'])
+        self.assertIn("a stlink entry's args are not openocd's", err.getvalue())
 
 
 class BoardEntries(unittest.TestCase):

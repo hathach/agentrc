@@ -115,13 +115,12 @@ dump binary memory /tmp/ring.bin &dbg_ring[0] &dbg_ring[512]
 ## Log capture
 
 Build with the stack's moderate log level (the verbose one adds per-transfer noise and much more timing skew) and route
-it over RTT when the probe allows — no UART wiring (the flags are the project's build contract). Stand the channel up
-per the **rtt** skill (servers per probe, transport matrix, control-block gotchas live there):
-
-```bash
-# RTT (J-Link probe; flash + reset first — the console owns the probe):
-python3 <rtt skill dir>/scripts/rtt.py --backend jlink --probe <sn> --device <JLINK_DEVICE> --interface swd --speed auto --seconds 20 > /tmp/rtt.log
-```
+it over RTT when the probe allows — no UART wiring (the flags are the project's build contract). The **rtt** skill
+captures it: the live route per probe and the post-mortem ring read of a wedged build are there. Prefer a J-Link where
+both exist: OpenOCD polls, and a bursty log drops lines. A wedged build whose ring holds no tail (no live drain was
+running) gets the RAM ring above instead. The exemption is a SystemView post-mortem build
+(`sysview.md`, "Post-mortem dump"): its channel is an overwrite ring that holds the most recent events with no drain,
+which answers "what ran right before this hang".
 
 A UART console (the board's debug serial, if wired) goes through `console_capture.py` (`--help`):
 
@@ -144,15 +143,6 @@ A UART write path costs what its driver does: a polled driver blocks only while 
 ring blocks only when the ring is full, and a console that drops when the host does not drain waits as long as its
 driver says before dropping, then loses lines. Espressif consoles (UART0, USB-Serial-JTAG CDC): `espressif.md`
 "Console".
-
-OpenOCD RTT (native probes: ST-Link/CMSIS-DAP): rtt skill §OpenOCD — exact CB address from `nm`, attach-only. OpenOCD
-polls — bursty logs can drop lines; prefer J-Link where both exist. The drain-model warning below applies unchanged.
-
-A wedged RTT build holds a log tail in RAM only if a live drain was running (the default mode drops writes once the ring
-fills): the drain model, the headless-proven server and the manual ring read are the **rtt** skill's post-mortem
-section. Otherwise instrument with the RAM ring above. The exemption is a SystemView post-mortem build (`sysview.md`,
-"Post-mortem dump"): its channel is an overwrite ring that holds the most recent events with no drain, which answers
-"what ran right before this hang".
 
 ## USB: dual-side capture — the default for enumeration/transfer bugs
 
