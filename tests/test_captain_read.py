@@ -304,18 +304,43 @@ class ListTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertRegex(done.stderr, r'\Acaptain_read: [^\n]+\n\Z')
 
-    def test_a_name_that_is_not_utf8_is_listed_escaped(self):
+    def test_an_undecodable_byte_control_character_or_backslash_is_listed_escaped_one_row_each(self):
         home = tmpdir(self)
         runs = home / '.cache' / 'chief-runs'
         runs.mkdir(parents=True)
-        (runs / 'good').write_text('x', encoding='utf-8')
-        (runs / os.fsdecode(b'bad\xff')).write_text('x', encoding='utf-8')
+        for name in (b'good', b'bad\xff', b'bad\\xff', b'nl\nfake 1970-01-01 f 0 forged', b'esc\x1b[2J', b'c1\xc2\x85'):
+            (runs / os.fsdecode(name)).write_text('x', encoding='utf-8')
         # a strict UTF-8 stdout, as under en_US.UTF-8; the suite's -X utf8 would hide it
         env = {k: v for k, v in os.environ.items() if k != 'PYTHONUTF8'}
         env.update(HOME=str(home), LC_ALL='C.UTF-8', PYTHONIOENCODING='utf-8:strict')
         done = subprocess.run([sys.executable, str(SCRIPT), 'list', str(runs)], env=env, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(sorted(line.split()[-1] for line in done.stdout.splitlines()), [b'bad\\xff', b'good'])
+        self.assertEqual(sorted(line.split(maxsplit=4)[4] for line in done.stdout.splitlines()),
+                         [b'bad\\x5cxff', b'bad\\xff', b'c1\\xc2\\x85', b'esc\\x1b[2J',
+                          b'good', b'nl\\x0afake 1970-01-01 f 0 forged'])
+
+    def test_an_entry_removed_while_listing_is_skipped(self):
+        home = tmpdir(self)
+        runs = home / '.cache' / 'chief-runs'
+        runs.mkdir(parents=True)
+        for name in ('gone', 'kept'):
+            (runs / name).write_text('x', encoding='utf-8')
+        code = (f'import os, sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import captain_read\n'
+                'scandir = os.scandir\n'
+                'class Vanishing:\n'
+                '    def __init__(self, path): self.it = scandir(path)\n'
+                '    def __enter__(self): return self\n'
+                '    def __exit__(self, *exc): self.it.close()\n'
+                '    def __iter__(self):\n'
+                '        for entry in self.it:\n'
+                '            if entry.name == "gone": os.unlink(entry.path)\n'
+                '            yield entry\n'
+                'os.scandir = Vanishing\n'
+                f'sys.exit(captain_read.main(["list", {str(runs)!r}]))')
+        done = subprocess.run([sys.executable, '-c', code], env={**os.environ, 'HOME': str(home)},
+                              capture_output=True, text=True, timeout=20)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual([line.split()[-1] for line in done.stdout.splitlines()], ['kept'])
 
 
 @unittest.skipIf(os.name == 'nt', 'the captain runs on Linux')
@@ -328,9 +353,18 @@ class FailureTest(unittest.TestCase):
         self.bin.mkdir()
         self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)}
 
-    def main(self, *args):
-        code = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import captain_read; '
-                f'captain_read.TIMEOUT = 0.5; sys.exit(captain_read.main({list(args)!r}))')
+    def main(self, *args, tight_after_located=False):
+        """With tight_after_located, located() keeps the default TIMEOUT so its answering rev-parse cannot lose a race
+        on a loaded runner; the 0.5 s applies from the call after it."""
+        code = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import captain_read\n'
+                'located = captain_read.located\n'
+                'def tight(*args):\n'
+                '    found = located(*args)\n'
+                '    captain_read.TIMEOUT = 0.5\n'
+                '    return found\n'
+                f'if {tight_after_located}: captain_read.located = tight\n'
+                'else: captain_read.TIMEOUT = 0.5\n'
+                f'sys.exit(captain_read.main({list(args)!r}))')
         done = subprocess.run([sys.executable, '-c', code], env=self.env, capture_output=True, text=True,
                               timeout=20)
         self.assertEqual(done.returncode, 1, done.stderr)
@@ -352,7 +386,7 @@ class FailureTest(unittest.TestCase):
                           '    print(repo, repo + "/.git", repo + "/.git", sep="\\n")\n'
                           'else:\n'
                           '    time.sleep(30)\n')
-                why = self.main('git', '-C', str(self.home / 'code' / 'repo'), 'status')
+                why = self.main('git', '-C', str(self.home / 'code' / 'repo'), 'status', tight_after_located=answers)
                 self.assertIn('timed out', why)
                 self.assertIn(repr(stuck), why)
 

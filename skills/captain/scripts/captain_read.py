@@ -7,7 +7,8 @@
     captain_read.py list <directory> [<name prefix>]
 
 list prints a directory's entries, newest first, without following a symlink, the first ENTRIES of them; a name
-prefix narrows it to reach older ones. The directory is one the captain may read
+prefix narrows it to reach older ones. A backslash, control character or undecodable byte in a name prints as \\xNN,
+so such a name may not open as printed. The directory is one the captain may read
 (readable(), which captain_guard.py applies to Read too), or the projects directory, to find memory directories.
 
 An allowlist of subcommands, flags and operand shapes; anything else is refused with exit 2 and nothing runs. The
@@ -354,17 +355,27 @@ def filtered(top, env):
     return None
 
 
+# a control character could forge a row or drive the terminal, a surrogate (an undecodable byte) fails a strict UTF-8
+# stdout, and a backslash is escaped too so that every \xNN stands for one byte of the name
+UNSHOWN = re.compile(r'[\\\x00-\x1f\x7f-\x9f\udc80-\udcff]')
+
+
+def escaped(match):
+    return ''.join(f'\\x{b:02x}' for b in os.fsencode(match[0]))
+
+
 def listing(path, prefix):
     entries = []
     with os.scandir(path) as it:
         for entry in it:
             if not entry.name.startswith(prefix):
                 continue
-            st = entry.stat(follow_symlinks=False)
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:   # removed since scandir yielded it
+                continue
             kind = 'l' if entry.is_symlink() else 'd' if entry.is_dir(follow_symlinks=False) else 'f'
-            # an undecodable byte shows as \xNN, not as a surrogate a strict UTF-8 stdout cannot encode
-            name = os.fsencode(entry.name).decode(errors='backslashreplace')
-            entries.append((st.st_mtime, kind, st.st_size, name))
+            entries.append((st.st_mtime, kind, st.st_size, UNSHOWN.sub(escaped, entry.name)))
     entries.sort(reverse=True)
     for mtime, kind, size, name in entries[:ENTRIES]:
         print(f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))} {kind} {size:>10} {name}')
