@@ -532,7 +532,8 @@ class ConfigDirTest(unittest.TestCase):
     def test_config_dirs(self):
         self.assertEqual(captain.config_dir('main'), os.path.expanduser('~/.claude'))
         self.assertEqual(captain.config_dir('ada'), captain.CONFIG_DIRS['ada'])
-        self.assertEqual(captain.config_dir('config:/x/y'), '/x/y')
+        absolute = os.path.abspath('/x/y')
+        self.assertEqual(captain.config_dir(f'config:{absolute}'), absolute)
         self.assertIsNone(captain.config_dir('config:rel/dir'))
 
 
