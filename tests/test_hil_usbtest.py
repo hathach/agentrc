@@ -86,7 +86,7 @@ class Binding(unittest.TestCase):
         self.runs.append((cmd, kw.get('timeout')))
         if self.attach:
             self.bind(self.attach)
-        return subprocess.CompletedProcess(cmd, self.rc, '', '')
+        return subprocess.CompletedProcess(cmd, self.rc, '', errno.errorcode.get(self.rc, '') if self.rc else '')
 
     def sudo_soft(self, cmd, **kw):
         self.helpers.append(cmd)
@@ -110,10 +110,17 @@ class Binding(unittest.TestCase):
         self.assertEqual(self.runs, [([sys.executable, '-I', script, 'connect', self.NODE, '1-1:1.0'],
                                       hu.CONNECT_TIMEOUT)])
 
-    def test_an_unwritable_node_runs_the_child_under_sudo(self):
+    def test_an_unwritable_node_runs_the_child_through_sudo(self):
         patch(self, hu, 'needs_sudo', lambda node: True)
+        sudoed = []
+        patch(self, hu, 'sudo', lambda cmd, **kw: sudoed.append(cmd) or self.run_child(cmd, **kw))
         hu.ensure_usbtest_bound('1-1:1.0', self.NODE)
-        self.assertEqual(self.runs[0][0][:2], ['sudo', '-n'])
+        self.assertEqual(sudoed, [self.runs[0][0]])
+
+    def test_an_unknown_ioctl_abi_is_refused_before_any_child(self):
+        patch(self, hu.platform, 'machine', lambda: 'ppc64le')
+        self.assertIn('no known ioctl ABI here (Linux ppc64le)', self.exit_of())
+        self.assertEqual(self.runs, [])
 
     def test_ebusy_from_a_probe_that_won_the_race_is_success(self):
         self.rc = errno.EBUSY
@@ -127,6 +134,11 @@ class Binding(unittest.TestCase):
     def test_a_connect_that_binds_another_driver_is_named(self):
         self.attach = 'cdc_acm'
         self.assertIn('held by cdc_acm, not usbtest', self.exit_of())
+
+    def test_a_child_that_failed_otherwise_is_named_by_its_exit(self):
+        self.attach, self.rc = None, 1
+        patch(self, hu, 'run', lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, '', ''))
+        self.assertIn('(CONNECT exit 1)', self.exit_of())
 
     def test_a_connect_that_binds_nothing_names_the_errno_and_dmesg(self):
         self.attach, self.rc = None, errno.ENODEV
@@ -201,10 +213,20 @@ class UsbfsConnect(unittest.TestCase):
     def test_the_script_entry_exits_with_the_errno(self):
         script = str(SCRIPTS / 'hil_usbtest.py')
         r = subprocess.run([sys.executable, '-I', script, 'connect', str(self.root / 'absent'), '1-1:1.0'],
-                           capture_output=True, timeout=30)
-        self.assertEqual(r.returncode, errno.ENOENT)
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stderr.strip()), (errno.ENOENT, 'ENOENT'))
         r = subprocess.run([sys.executable, '-I', script, 'bind'], capture_output=True, text=True, timeout=30)
         self.assertIn('usage: hil_usbtest.py connect NODE INTERFACE', r.stderr)
+
+    def test_the_child_runs_from_this_file_alone(self):
+        # stdlib only, as under sudo: no hil_load bootstrap, no sibling module (setUp's fstat
+        # patch is process-wide, so the copy is a plain read and write)
+        alone = self.root / 'alone'
+        alone.mkdir()
+        (alone / 'hil_usbtest.py').write_text((SCRIPTS / 'hil_usbtest.py').read_text())
+        r = subprocess.run([sys.executable, '-I', str(alone / 'hil_usbtest.py'), 'connect',
+                            str(self.root / 'absent'), '1-1:1.0'], capture_output=True, text=True, timeout=30)
+        self.assertEqual((r.returncode, r.stderr.strip()), (errno.ENOENT, 'ENOENT'))
 
 
 class Pattern(unittest.TestCase):
@@ -476,7 +498,7 @@ class SudoSoftNeverRaises(unittest.TestCase):
 
 
 class SysfsWrite(unittest.TestCase):
-    def test_a_blocked_write_is_contention_or_a_wedge_and_stays_bounded(self):
+    def test_a_blocked_write_is_a_bounded_named_exit(self):
         seen = {}
 
         def blocked(cmd, **kw):
@@ -484,15 +506,14 @@ class SysfsWrite(unittest.TestCase):
             raise subprocess.TimeoutExpired(cmd, kw.get('timeout'))
         patch(self, hu, 'sudo', blocked)
         with self.assertRaises(SystemExit) as cm:
-            hu.sysfs_write('/sys/bus/usb/drivers/usbtest/new_id', 'cafe 4010 0 0525 a4a0')
+            hu.sysfs_write('/sys/module/usbtest/parameters/pattern', '0')
         self.assertEqual(seen.get('timeout'), 15)
-        self.assertIn('possible device-lock contention or a wedged device', str(cm.exception))
+        self.assertIn('blocked >15s', str(cm.exception))
 
-    def test_tee_gets_the_data_and_check_decides(self):
+    def test_tee_gets_the_data_and_a_failure_is_a_named_exit(self):
         calls = []
         patch(self, hu, 'sudo', lambda cmd, **kw: calls.append((cmd, kw['input']))
               or subprocess.CompletedProcess(cmd, 1, '', 'denied\n'))
-        self.assertFalse(hu.sysfs_write('/p', 'x', check=False))
         with self.assertRaises(SystemExit) as cm:
             hu.sysfs_write('/p', 'x')
         self.assertEqual(calls[0], (['tee', '/p'], 'x'))

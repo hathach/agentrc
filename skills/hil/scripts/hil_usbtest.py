@@ -4,8 +4,8 @@ stdlib only.
 
 The device lookup, driver loading and binding, the bounded testusb case run and its
 parsing, and the upstream host controller check. Every project value is a parameter: the
-device VID:PID, the interface, the usbfs node, the case, its testusb options and every bound. Which cases run, their options,
-throughput, recovery and the report are the caller's.
+device VID:PID, the interface, the usbfs node, the case, its testusb options and every
+bound. Which cases run, their options, throughput, recovery and the report are the caller's.
 
 Failures that make a battery meaningless exit (SystemExit with the reason), as a CLI
 battery does; a case's own outcome is its result dict.
@@ -26,6 +26,7 @@ import errno
 import fcntl
 import importlib.util
 import os
+import platform
 import re
 import struct
 import subprocess
@@ -43,6 +44,7 @@ CONNECT_TIMEOUT = 15        # the usbfs open, CONNECT and close each take the de
 _USBDEVFS_IOCTL_ARG = struct.Struct('@iiP')
 USBDEVFS_IOCTL = 0xC0005500 | _USBDEVFS_IOCTL_ARG.size << 16 | 18   # _IOWR('U', 18, ...)
 USBDEVFS_CONNECT = 0x5517                                         # _IO('U', 23)
+GENERIC_IOCTL_MACHINES = {'x86_64', 'i686', 'aarch64', 'armv7l', 'riscv64'}   # asm-generic/ioctl.h
 
 RE_PASS = re.compile(r'test (\d+),\s*(\d+)\.(\d+) secs')
 RE_FAIL = re.compile(r'test (\d+) --> (\d+) \((.*)\)')
@@ -64,11 +66,12 @@ def _hil_load():
     return sys.modules[spec.name].load(spec.name, spec.origin)
 
 
-hil_load = _hil_load()
-hil_load.require(__file__, FILES)
-# find_device's walk and bounded reads: the process's one usb_observe (hil_load), so the strand
-# memo a harness's path_stranded checks read is the one find_device fed
-usb_observe = hil_load.load_file('skills/hil/scripts/usb_observe.py')
+if __name__ != '__main__':      # the CONNECT child loads nothing but this file
+    hil_load = _hil_load()
+    hil_load.require(__file__, FILES)
+    # find_device's walk and bounded reads: the process's one usb_observe (hil_load), so the
+    # strand memo a harness's path_stranded checks read is the one find_device fed
+    usb_observe = hil_load.load_file('skills/hil/scripts/usb_observe.py')
 
 SERIAL_GRACE = 1.0   # find_device's bound on one `serial` read, tighter than usb_observe's
                      # default on purpose: a runner calls it after every case and in its
@@ -137,16 +140,14 @@ def _sudo_soft(cmd, **kw):
         return subprocess.CompletedProcess(cmd, 1, '', why)
 
 
-def sysfs_write(path, data, check=True):
+def sysfs_write(path, data):
     try:
         r = sudo(['tee', str(path)], input=data, timeout=15)
     except subprocess.TimeoutExpired:
-        sys.exit(f'write "{data}" > {path} blocked >15s: a device lock is held -- possible '
-                 'device-lock contention or a wedged device. Check dmesg before any recovery '
+        sys.exit(f'write "{data}" > {path} blocked >15s. Check dmesg before any recovery '
                  '(usb-kernel-recover skill).')
-    if check and r.returncode != 0:
+    if r.returncode != 0:
         sys.exit(f'write "{data}" > {path} failed: {r.stderr.strip()}')
-    return r.returncode == 0
 
 
 def dmesg_tail():
@@ -326,24 +327,28 @@ def bound_driver(interface):
 def ensure_usbtest_bound(interface, node):
     """Bind `interface` (sysfs name, e.g. '1-1:1.0') of the device at usbfs `node` to usbtest.
 
-    usbtest matches the device's static id itself, so an unbound interface needs only a usbfs
-    CONNECT (device_attach, v6.12 devio.c proc_ioctl), which any opener with write access may
-    issue. It runs in a child bounded at CONNECT_TIMEOUT, since the open, the ioctl and the
-    close each take the device lock. An interface held by another driver (a usbfs claim, a
-    foreign driver) is a named exit, never stolen."""
+    usbtest matches the device's static id itself, so an unbound interface needs only a reprobe:
+    a usbfs CONNECT (device_attach, v6.12 devio.c proc_ioctl) rather than the driver's bind
+    file, since any opener with write access may issue it, no root, and its fd pins one
+    enumeration. Both take the device's and then the interface's lock, so it runs in a child
+    bounded at CONNECT_TIMEOUT. An interface held by another driver (a usbfs claim, a foreign
+    driver) is a named exit, never stolen."""
     load_usbtest()
     held = bound_driver(interface)
     if held is None:
+        if platform.system() != 'Linux' or platform.machine() not in GENERIC_IOCTL_MACHINES:
+            sys.exit(f'{interface} is unbound and usbfs CONNECT has no known ioctl ABI here '
+                     f'({platform.system()} {platform.machine()})')
         cmd = [sys.executable, '-I', os.path.abspath(__file__), 'connect', node, interface]
         try:
-            r = run(['sudo', '-n'] + cmd if needs_sudo(node) else cmd, timeout=CONNECT_TIMEOUT)
+            r = (sudo if needs_sudo(node) else run)(cmd, timeout=CONNECT_TIMEOUT)
         except subprocess.TimeoutExpired:
             sys.exit(f'usbfs CONNECT on {interface} blocked >{CONNECT_TIMEOUT}s: its device lock is '
                      'held -- a peer case or a wedged device. Check dmesg before any recovery '
                      '(usb-kernel-recover skill).')
         held = bound_driver(interface)   # EBUSY may mean a concurrent probe won: recheck
         if held is None:
-            why = errno.errorcode.get(r.returncode, r.stderr.strip() or f'exit {r.returncode}')
+            why = r.stderr.strip() or f'exit {r.returncode}'
             sys.exit(f'{interface} did not bind to usbtest (CONNECT {why}):\n{dmesg_tail()}')
     if held != 'usbtest':
         sys.exit(f'{interface} is held by {held}, not usbtest: release it, then rerun')
@@ -483,4 +488,7 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
 if __name__ == '__main__':
     if len(sys.argv) != 4 or sys.argv[1] != 'connect':
         sys.exit('usage: hil_usbtest.py connect NODE INTERFACE')
-    sys.exit(_usbfs_connect(sys.argv[2], sys.argv[3]))
+    rc = _usbfs_connect(sys.argv[2], sys.argv[3])
+    if rc:
+        print(errno.errorcode.get(rc, rc), file=sys.stderr)
+    sys.exit(rc)
