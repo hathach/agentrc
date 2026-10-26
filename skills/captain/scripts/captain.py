@@ -5,7 +5,7 @@ whether its input line is empty before anything is typed into it.
 Judgment stays in SKILL.md. Every check refuses rather than guesses: an identity it cannot pin or a screen it
 does not recognize is reported, never assumed safe.
 
-  captain.py list [--json]                       every agent session, latest Herdr change first, asking none
+  captain.py list [--json]                       every other Claude Code session, latest Herdr change first, asking none
   captain.py enroll [--replace]                  make this session the captain
   captain.py ask <target>...                     send each idle target a status request
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
@@ -949,7 +949,8 @@ def open_session(checkout, account_name, name, mine):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    ls = sub.add_parser('list', help='every agent session in this Herdr, latest change first, without asking any of them')
+    ls = sub.add_parser('list', help='every other Claude Code session in this Herdr, latest change first, '
+                                      'without asking any of them')
     ls.add_argument('--json', action='store_true')
     sub.add_parser('enroll', help='make this session the captain').add_argument('--replace', action='store_true')
     sub.add_parser('ask', help='send each target a status request').add_argument('panes', nargs='+')
