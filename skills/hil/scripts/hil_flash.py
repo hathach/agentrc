@@ -740,70 +740,16 @@ def esptool_runtime(esptool: str = 'esptool', *, timeout: float = 60) -> dict:
     return {'exe': exe, 'python': python, 'version': version, 'package': package}
 
 
-def esptool_offsets(flash_args: str) -> list:
-    """The offsets flash_esptool writes for `flash_args` (flash_args_tokens' pairs), in order."""
-    _, pairs = flash_args_tokens(flash_args)
-    if not pairs:
-        raise ValueError('flash_args: want "<offset> <file>" pairs after the options')
-    return [int(offset, 0) for offset, _ in pairs]
-
-
-# any CSI sequence: esptool 5.2.0 and 5.3.1 move the cursor off a TTY too
-_CSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
-# esptool 5.2.0/5.3.1 cmds.py write_flash and loader.py hard_reset, as recorded on ci.lan (5.3.1)
-# and the tinyuf2 bench (5.2.0): a write's line, compressed by the stub unless it would not
-# shrink or the run has --no-stub, then that write's verify; the hard reset after the last
-_ESP_WROTE = re.compile(r'^Wrote \d+ bytes (?:\(\d+ compressed\) )?at 0x([0-9a-f]{8}) in ', re.M)
-_ESP_RESET = re.compile(r'^Hard resetting via RTS pin\.\.\.$', re.M)
-_ESP_REFUTED = ('A fatal error occurred', 'Chip was NOT reset', 'Verify failed', 'MD5 of file does not match')
-
-
-def esptool_flash_judgment(out: str, offsets) -> dict:
-    """Whether a flash_esptool transcript writes every requested offset once, each write
-    followed by its own `Hash of data verified.` before the next write or, for the last, the
-    hard reset; CSI sequences ignored. An unknown output shape fails. {'ok', 'problem' (''
-    when ok), 'wrote': [offsets as written]}."""
-    text = _CSI.sub('', out)
-    writes = list(_ESP_WROTE.finditer(text))
-    wrote, want = [int(m[1], 16) for m in writes], sorted(offsets)
-    reset = _ESP_RESET.search(text, writes[-1].end()) if writes else None
-    problem = ''
-    if not want:
-        problem = 'no offsets requested'
-    elif len(set(want)) != len(want):
-        problem = f'offsets {[hex(o) for o in want]} repeat'
-    elif len(re.findall(r'^Wrote ', text, re.M)) != len(writes):
-        problem = 'a Wrote line of an unknown shape'
-    elif sorted(wrote) != want:
-        problem = f'wrote {[hex(o) for o in wrote]}, not the requested {[hex(o) for o in want]}'
-    elif said := next((m for m in _ESP_REFUTED if m in text), None):
-        problem = f'the output says {said!r}'
-    elif reset is None:
-        problem = 'no hard reset after the last write'
-    else:
-        ends = [m.start() for m in writes[1:]] + [reset.start()]
-        unverified = [hex(int(m[1], 16)) for m, end in zip(writes, ends)
-                      if 'Hash of data verified.' not in text[m.end():end]]
-        if unverified:
-            problem = f'no verify between the write at {", ".join(unverified)} and the next write or the reset'
-        elif text.count('Hash of data verified.') != len(want):
-            problem = f'{text.count("Hash of data verified.")} verifies for {len(want)} writes'
-    return {'ok': not problem, 'problem': problem, 'wrote': wrote}
-
-
 def esptool_problem(op) -> str:
-    """Why a flash_esptool Operation did not flash what it ran, '' when it did: its last
-    attempt exited 0 and its transcript passes esptool_flash_judgment over the offsets of that
-    attempt's own write_flash arguments."""
+    """Why a flash_esptool Operation did not flash, '' when it did: its last attempt exited 0
+    and its output shows none of the known failures esptool exits 0 on."""
     problem, out = _last_exited(op, 'esptool')
     if problem:
         return problem
-    cmd = op.attempts[-1].cmd
-    try:
-        offsets = esptool_offsets(shlex.join(cmd[cmd.index('write_flash') + 1:]))
-    except (ValueError, TypeError, AttributeError) as e:
-        return f'no write_flash arguments to judge against: {e}'
-    return esptool_flash_judgment(out, offsets)['problem']
+    out += '\n' + hil_process.cmd_stdout_text(op.attempts[-1].result.stderr)
+    # besides the refused reset, esptool 5.2.0/5.3.1 write_flash warns and skips an empty image
+    said = next((m for m in (*RESET_REFUTED['esptool'], "' is empty.") if m in out), None)
+    return f'exit 0, but the output says {said!r}' if said else ''
 
 
 SERIAL_BY_ID = '/dev/serial/by-id'

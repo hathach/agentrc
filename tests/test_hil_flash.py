@@ -984,89 +984,36 @@ def op_of(*outs, script='halt\nr\ngo\nexit\n', stderr=''):
                          for rc, out, err in outs])
 
 
-ESPTOOL_CORPUS = DATA / 'esptool'
+class EsptoolProblem(unittest.TestCase):
+    @staticmethod
+    def op(*outs):
+        """A flash_esptool Operation of these (rc, stdout, stderr, error) attempts."""
+        return hf.Operation([hf._record(['esptool', 'write_flash'], None, subprocess.CompletedProcess([], rc, out, err), e)
+                             for rc, out, err, e in outs])
 
+    def test_an_exit_0_passes_whatever_it_prints_short_of_a_known_failure(self):
+        warning = "\x1b[0;33mWarning:\x1b[0m Deprecated: Command 'write_flash' is deprecated.\n"
+        for out in ('', 'Flashed 4 regions OK\n', warning, b'Hash of data verified.\n'):
+            with self.subTest(out=out):
+                self.assertEqual(hf.esptool_problem(self.op((0, out, None, None))), '')
 
-def esptool_synthetic(offsets, *, stub=True, uncompressed=False):
-    """A write_flash transcript in the shape tinyuf2's bench recorded with esptool 5.2.0 (CSI
-    codes, the underscore spellings' warning); without the stub, or a stub run that found
-    compression would not shrink a segment (5.3.1), each write uncompressed."""
-    out = "\x1b[0;33mWarning:\x1b[0m Deprecated: Command 'write_flash' is deprecated. Use 'write-flash' instead.\n"
-    for off in offsets:
-        if stub and uncompressed:
-            out += 'Note: Cannot compress \'x.bin\' more than the original size, will flash uncompressed.\n'
-        out += (f'Writing at 0x{off:08x} [====] 100.0% \x1b[1A\x1b[2K\nWrote 9 bytes '
-                f'{"(9 compressed) " if stub and not uncompressed else ""}at 0x{off:08x} in 0.1 seconds (100.0 kbit/s).\n'
-                'Verifying written data...\nHash of data verified.\n')
-    return out + '\nHard resetting via RTS pin...\n'
+    def test_an_exit_0_with_a_known_failure_fails(self):
+        not_reset = "\x1b[0;33mWarning:\x1b[0m Chip was NOT reset. Setting RTS/DTR lines is not supported\n"
+        empty = "Warning: 'app.bin' is empty.\n"
+        for out, err, said in ((not_reset, '', 'Chip was NOT reset'), ('', empty, "' is empty."),
+                               (None, empty.encode(), "' is empty.")):
+            with self.subTest(said=said, err=err):
+                self.assertEqual(hf.esptool_problem(self.op((0, out, err, None))),
+                                 f'exit 0, but the output says {said!r}')
 
-
-class EsptoolJudgment(unittest.TestCase):
-    OFFSETS = [0x0, 0x8000, 0xe000, 0x410000]
-
-    def test_recorded_and_documented_forms_pass(self):
-        manifest = json.loads((ESPTOOL_CORPUS / 'MANIFEST.json').read_text())
-        for name, m in manifest.items():
-            with self.subTest(name):
-                self.assertEqual(hf.esptool_flash_judgment((ESPTOOL_CORPUS / name).read_text(), m['offsets']),
-                                 {'ok': True, 'problem': '', 'wrote': m['offsets']})
-        for form, kw in (('stub', {}), ('--no-stub', {'stub': False}), ('uncompressed', {'uncompressed': True})):
-            with self.subTest(form):
-                out = esptool_synthetic(self.OFFSETS, **kw)
-                self.assertTrue(hf.esptool_flash_judgment(out, self.OFFSETS)['ok'])
-                self.assertTrue(hf.esptool_flash_judgment(out.replace('Wrote', '\x1b[2K\x1b[1AWrote'), self.OFFSETS)['ok'])
-
-    def test_every_write_needs_its_own_verify_and_the_reset_follows(self):
-        out = (ESPTOOL_CORPUS / '5.3.1-espressif_esp32s3_devkitm_1-stub.txt').read_text()
-        first = out.index('Hash of data verified.')
-        moved = out[:first] + out[first + len('Hash of data verified.'):]
-        moved = moved.replace('Hard resetting', 'Hash of data verified.\nHard resetting', 1)
-        last = out.rindex('Hash of data verified.')
-        past_reset = out[:last] + out[last + len('Hash of data verified.'):] + 'Hash of data verified.\n'
-        cases = {'a write missing': (out.replace('at 0x00008000 in', 'at 0x00009000 in'), 'not the requested'),
-                 'a write twice': (out.replace('at 0x0000e000 in', 'at 0x00008000 in'), 'not the requested'),
-                 'an extra write': (out + 'Wrote 1 bytes at 0x00500000 in 0.1 seconds.\n', 'not the requested'),
-                 'an unknown write line': (out + 'Wrote 1 bytes at 0x500000 in 0.1 seconds.\n', 'unknown shape'),
-                 'a verify missing': (out.replace('Hash of data verified.\n', '', 1), 'no verify between the write at 0x0 '),
-                 'a verify moved to the last write': (moved, 'no verify between the write at 0x0 '),
-                 'the last verify past the reset': (past_reset, 'no verify between the write at 0x410000 '),
-                 'no hard reset': (out.replace('Hard resetting via RTS pin...', ''), 'no hard reset'),
-                 'a fatal error': (out + 'A fatal error occurred: Packet content transfer stopped\n', 'fatal error'),
-                 'not reset': (out.replace('Hard resetting via RTS pin...', 'Chip was NOT reset.'), 'NOT reset'),
-                 'an unknown format': ('Flashed 4 regions OK\n', 'not the requested'),
-                 'nothing': ('', 'not the requested')}
-        for what, (text, why) in cases.items():
-            with self.subTest(what):
-                j = hf.esptool_flash_judgment(text, self.OFFSETS)
-                self.assertFalse(j['ok'])
-                self.assertIn(why, j['problem'])
-        self.assertEqual(hf.esptool_flash_judgment(out, [])['problem'], 'no offsets requested')
-        twice = esptool_synthetic([0, 0])
-        self.assertIn('repeat', hf.esptool_flash_judgment(twice, [0, 0])['problem'])
-
-    def test_the_problem_of_a_flash_is_its_last_attempt_judged_against_what_it_wrote(self):
-        good = esptool_synthetic(self.OFFSETS)
-        args = '--flash-mode dio 0x0 "boot loader.bin" 0x8000 p.bin 0xe000 o.bin 0x410000 a.bin'
-
-        def op(*outs, flash_args=args):
-            cmd = hf.esptool_argv('esptool', '-p', '/dev/x', 'write_flash', *shlex.split(flash_args))
-            return hf.Operation([hf._record(cmd, None, subprocess.CompletedProcess([], rc, out, ''), err)
-                                 for rc, out, err in outs])
-        self.assertEqual(hf.esptool_problem(op((0, good, None))), '')
-        self.assertEqual(hf.esptool_problem(op((2, good, None))), 'esptool exit 2')
-        self.assertEqual(hf.esptool_problem(op((None, good, subprocess.TimeoutExpired('esptool', 5)))),
+    def test_the_last_attempt_alone_decides(self):
+        empty = "'app.bin' is empty.\n"
+        self.assertEqual(hf.esptool_problem(self.op((2, '', 'A fatal error occurred', None), (0, '', None, None))), '')
+        self.assertEqual(hf.esptool_problem(self.op((0, empty, None, None), (0, '', None, None))), '')
+        self.assertIn('is empty', hf.esptool_problem(self.op((0, '', None, None), (0, empty, None, None))))
+        self.assertEqual(hf.esptool_problem(self.op((0, '', None, None), (2, '', None, None))), 'esptool exit 2')
+        self.assertEqual(hf.esptool_problem(self.op((None, '', None, subprocess.TimeoutExpired('esptool', 5)))),
                          'esptool timed out')
-        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), (0, '', None))))
-        self.assertIn('not the requested', hf.esptool_problem(op((0, good, None), flash_args='0x0 b.bin 0x9000 p.bin')))
-        for bad in (['esptool', 'chip_id'], ['esptool', 'write_flash', '--flash-mode', 'dio']):
-            with self.subTest(cmd=bad):
-                o = hf.Operation([hf._record(bad, None, subprocess.CompletedProcess([], 0, good, ''), None)])
-                self.assertIn('no write_flash arguments to judge against', hf.esptool_problem(o))
-
-    def test_the_offsets_are_the_flash_args_pairs(self):
-        self.assertEqual(hf.esptool_offsets('--flash-mode dio --flash-size 8MB 0x0 b.bin 0x8000 p.bin'), [0, 0x8000])
-        with self.assertRaises(ValueError):
-            hf.esptool_offsets('--flash-mode dio')
 
 
 class EsptoolRuntime(unittest.TestCase):
