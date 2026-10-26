@@ -304,6 +304,58 @@ class ListTest(unittest.TestCase):
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertRegex(done.stderr, r'\Acaptain_read: [^\n]+\n\Z')
 
+    def test_a_name_that_is_not_utf8_is_listed_escaped(self):
+        home = tmpdir(self)
+        runs = home / '.cache' / 'chief-runs'
+        runs.mkdir(parents=True)
+        (runs / 'good').write_text('x', encoding='utf-8')
+        (runs / os.fsdecode(b'bad\xff')).write_text('x', encoding='utf-8')
+        # a strict UTF-8 stdout, as under en_US.UTF-8; the suite's -X utf8 would hide it
+        env = {k: v for k, v in os.environ.items() if k != 'PYTHONUTF8'}
+        env.update(HOME=str(home), LC_ALL='C.UTF-8', PYTHONIOENCODING='utf-8:strict')
+        done = subprocess.run([sys.executable, str(SCRIPT), 'list', str(runs)], env=env, capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(line.split()[-1] for line in done.stdout.splitlines()), [b'bad\\xff', b'good'])
+
+
+@unittest.skipIf(os.name == 'nt', 'the captain runs on Linux')
+class FailureTest(unittest.TestCase):
+    """A tool that is missing or a preflight that times out ends in one line and exit 1."""
+
+    def setUp(self):
+        self.home = tmpdir(self)
+        self.bin = self.home / 'bin'
+        self.bin.mkdir()
+        self.env = {**os.environ, 'HOME': str(self.home), 'PATH': str(self.bin)}
+
+    def main(self, *args):
+        code = (f'import sys; sys.path.insert(0, {str(SCRIPT.parent)!r}); import captain_read; '
+                f'captain_read.TIMEOUT = 0.5; sys.exit(captain_read.main({list(args)!r}))')
+        done = subprocess.run([sys.executable, '-c', code], env=self.env, capture_output=True, text=True,
+                              timeout=20)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertRegex(done.stderr, r'\Acaptain_read: [^\n]+\n\Z')
+        return done.stderr
+
+    def test_a_missing_git_or_gh(self):
+        for args in (('git', '-C', str(self.home / 'code' / 'repo'), 'log'), ('gh', 'pr', 'view', '1', '-R', 'o/r')):
+            with self.subTest(args[0]):
+                self.assertIn(repr(args[0]), self.main(*args))
+
+    def test_a_preflight_that_times_out(self):
+        """located() times out on the first git call; filtered() on the first after rev-parse answered."""
+        for name, answers, stuck in (('located', False, 'rev-parse'), ('filtered', True, 'ls-files')):
+            with self.subTest(name):
+                make_stub(self.bin, 'git', 'import os, sys, time\n'
+                          f'if {answers} and "rev-parse" in sys.argv:\n'
+                          '    repo = os.path.join(os.environ["HOME"], "code", "repo")\n'
+                          '    print(repo, repo + "/.git", repo + "/.git", sep="\\n")\n'
+                          'else:\n'
+                          '    time.sleep(30)\n')
+                why = self.main('git', '-C', str(self.home / 'code' / 'repo'), 'status')
+                self.assertIn('timed out', why)
+                self.assertIn(repr(stuck), why)
+
 
 @unittest.skipIf(os.name == 'nt', 'the captain runs on Linux')
 class RunTest(unittest.TestCase):

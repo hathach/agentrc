@@ -362,7 +362,9 @@ def listing(path, prefix):
                 continue
             st = entry.stat(follow_symlinks=False)
             kind = 'l' if entry.is_symlink() else 'd' if entry.is_dir(follow_symlinks=False) else 'f'
-            entries.append((st.st_mtime, kind, st.st_size, entry.name))
+            # an undecodable byte shows as \xNN, not as a surrogate a strict UTF-8 stdout cannot encode
+            name = os.fsencode(entry.name).decode(errors='backslashreplace')
+            entries.append((st.st_mtime, kind, st.st_size, name))
     entries.sort(reverse=True)
     for mtime, kind, size, name in entries[:ENTRIES]:
         print(f'{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))} {kind} {size:>10} {name}')
