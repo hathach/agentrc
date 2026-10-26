@@ -234,6 +234,7 @@ class LedgerCase(unittest.TestCase):
             (captain, 'read_screen', lambda pane: self.screens.get(pane, screen('claude-empty'))),
             (captain, 'submit', self._submit),
             (captain, 'me', lambda: captain.identity(self.panes[self.me])),
+            (captain, 'config_dir', lambda account: str(self.state / 'config')),   # never the real ~/.claude
         ]:
             patcher = mock.patch.object(target, attr, value)
             patcher.start()
@@ -465,6 +466,74 @@ class ReportTest(LedgerCase):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 self.report_as('w2:p1', self.msg, bad)
         self.assertNotIn('report', [r['type'] for r in captain.records()])
+
+
+class UnchangedTest(LedgerCase):
+    """The target's transcript as Claude Code writes it: its reporting turn, then whatever came after."""
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.state / 'config' / 'projects' / '-w' / 's-w2:p1.jsonl'
+        self.transcript.parent.mkdir(parents=True)
+        self.msg = self.msg_of(self.ask())
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': captain.status_prompt(self.msg)}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+                 {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'brief text'}]}},
+                 {'type': 'user', 'isMeta': True, 'message': {'content': 'a reminder'}},
+                 {'type': 'attachment'},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Status sent.'}]}})
+        self.report_as('w2:p1', self.msg)
+
+    def log(self, *entries, raw=b''):
+        with open(self.transcript, 'ab') as f:
+            f.write(b''.join(json.dumps(e).encode() + b'\n' for e in entries) + raw)
+
+    def test_nothing_new_is_not_asked(self):
+        line = self.ask()
+        self.assertIn(f'not asked, nothing new since its report {self.msg}', line)
+        self.assertEqual(len(self.typed), 1)
+        self.assertIn('delivered', captain.ask('w2:p1', self.ident, force=True))
+
+    def asked_after(self, change):
+        """Whether ask types a new request once change is made, the transcript restored after."""
+        saved = self.transcript.read_bytes()
+        change()
+        line = self.ask()
+        if line.endswith('delivered'):
+            captain.cancel(self.msg_of(line), self.ident)
+        self.transcript.write_bytes(saved)
+        return line.endswith('delivered')
+
+    def test_any_new_turn_is_asked(self):
+        for turn in ({'type': 'user', 'promptSource': 'typed', 'message': {'content': 'go on'}},
+                     {'type': 'user', 'promptSource': 'system', 'message': {'content': '<task-notification>'}},
+                     {'type': 'user', 'message': {'content': [{'type': 'text', 'text': 'summary'}]}},
+                     {'type': 'user', 'message': 'an unfamiliar shape'}):
+            with self.subTest(turn=turn):
+                self.assertTrue(self.asked_after(lambda: self.log(turn)))
+
+    def test_asked_when_it_cannot_be_shown(self):
+        cases = {'torn line': lambda: self.log(raw=b'{"type": "user", "mess'),
+                 'no transcript': lambda: self.transcript.rename(self.transcript.with_suffix('.old')),
+                 'request not in it': lambda: self.transcript.write_bytes(b'{"type": "user"}\n'),
+                 'only quoted': lambda: self.transcript.write_bytes(json.dumps(
+                     {'type': 'user', 'isCompactSummary': True, 'message': {
+                         'content': f'earlier: {captain.status_prompt(self.msg)}'}}).encode() + b'\n')}
+        for why, change in cases.items():
+            with self.subTest(why):
+                self.assertTrue(self.asked_after(change))
+        with mock.patch.object(captain, 'config_dir', lambda account: None):
+            self.assertTrue(self.asked_after(lambda: None))
+        self.assertIn('not asked', self.ask())
+
+
+class ConfigDirTest(unittest.TestCase):
+    def test_config_dirs(self):
+        self.assertEqual(captain.config_dir('main'), os.path.expanduser('~/.claude'))
+        self.assertEqual(captain.config_dir('ada'), captain.CONFIG_DIRS['ada'])
+        self.assertEqual(captain.config_dir('config:/x/y'), '/x/y')
+        self.assertIsNone(captain.config_dir('config:rel/dir'))
 
 
 class BriefTest(LedgerCase):

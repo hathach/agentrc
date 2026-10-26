@@ -7,7 +7,7 @@ does not recognize is reported, never assumed safe.
 
   captain.py list [--json]                       every agent session, asking none of them
   captain.py enroll [--replace]                  make this session the captain
-  captain.py ask <target>...                     send each idle target a status request
+  captain.py ask <target>... [--force]           send each idle target a status request, unless unchanged
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
   captain.py reports [<msg>...]                  the latest report from each target, or those requests' reports
   captain.py cancel <msg>                        close a request or relay no answer will close
@@ -45,6 +45,7 @@ except ImportError:   # Windows: Herdr and /proc are POSIX-only, so the captain 
     fcntl = None
 
 CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # main is CLAUDE_CONFIG_DIR unset
+DEFAULT_CONFIG = '~/.claude'   # where main, CLAUDE_CONFIG_DIR unset, keeps its transcripts
 START_MS = 60000
 HERDR_TIMEOUT_S = 30
 SGR = re.compile(r'\x1b\[([0-9;]*)m')
@@ -534,7 +535,66 @@ def sendable(pane, recs, mine):
     return (None, why) if why else (target, None)
 
 
-def ask(pane, mine):
+def config_dir(account_name):
+    """The config dir a session under account_name keeps its transcripts in, or None when it cannot be told."""
+    if account_name in CONFIG_DIRS:
+        return CONFIG_DIRS[account_name] or os.path.expanduser(DEFAULT_CONFIG)
+    config = os.path.expanduser(account_name.removeprefix('config:'))
+    return config if account_name.startswith('config:') and os.path.isabs(config) else None
+
+
+def transcripts(config, session):
+    return glob.glob(os.path.join(glob.escape(config), 'projects', '*', glob.escape(session) + '.jsonl'))
+
+
+def content(entry):
+    """A transcript entry's message content, None for any other shape."""
+    message = entry.get('message') if isinstance(entry, dict) else None
+    return message.get('content') if isinstance(message, dict) else None
+
+
+def new_turn(entry):
+    """Whether a transcript entry starts a turn: the human's prompt, a task notification or a compaction summary,
+    not a tool result or text injected into a running turn; an entry of another shape counts as one."""
+    if not isinstance(entry, dict):
+        return True
+    blocks = content(entry)
+    results = isinstance(blocks, list) and blocks and all(
+        isinstance(b, dict) and b.get('type') == 'tool_result' for b in blocks)
+    return entry.get('type') == 'user' and not entry.get('isMeta') and not results
+
+
+def unchanged(target, recs):
+    """target's last report when its transcript starts no turn after the request that report answered, so asking
+    again would only repeat it; None, so the target is asked, whenever that cannot be shown."""
+    last = last_report(target, recs)
+    if not last:
+        return None
+    config = config_dir(target['account'])
+    found = transcripts(config, target['session']) if config else []
+    if len(found) != 1:
+        return None
+    try:
+        with open(found[0], 'rb') as f:
+            data = f.read()
+    except OSError:
+        return None
+    at = data.find(last['msg'].encode())
+    *lines, torn = data[data.rfind(b'\n', 0, at) + 1:].split(b'\n') if at >= 0 else [b'']
+    if not lines or torn:   # not there, or a partly written line that may be a new turn
+        return None
+    try:
+        entries = (json.loads(line) for line in lines)   # lazily: the first new turn ends the walk
+        request = next(entries)
+        words = plain_text(content(request))
+        if not (human_input(request) and words and status_prompt(last['msg']) in words):
+            return None   # a summary or tool output quoting the id is not the request
+        return None if any(new_turn(e) for e in entries) else last
+    except ValueError:
+        return None
+
+
+def ask(pane, mine, force=False):
     """One status request to pane, recorded before it is typed: prints the msg id, or why it was not sent."""
     with locked():
         captain = require_captain(mine)
@@ -542,6 +602,10 @@ def ask(pane, mine):
         target, why = sendable(pane, recs, mine)
         if why:
             return f'{pane}: refused, {why}'
+        last = not force and unchanged(target, recs)
+        if last:
+            at = time.strftime('%H:%M', time.localtime(last['at']))
+            return f'{pane}: not asked, nothing new since its report {last["msg"]} at {at}'
         msg = new_id('m', recs)
         return deliver('request', msg, captain, target, status_prompt(msg))
 
@@ -765,8 +829,7 @@ def transcript(captain):
     """The captain's own Claude Code transcript: the human's words are read from it, never passed by the captain."""
     if os.environ.get('CLAUDE_CODE_SESSION_ID') != captain['session']:
         die("relay runs only in the enrolled captain's own Claude Code session", 2)
-    config = os.path.expanduser(os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude')
-    found = glob.glob(os.path.join(glob.escape(config), 'projects', '*', glob.escape(captain['session']) + '.jsonl'))
+    found = transcripts(os.path.expanduser(os.environ.get('CLAUDE_CONFIG_DIR') or DEFAULT_CONFIG), captain['session'])
     if len(found) != 1:
         die(f"cannot find this session's transcript ({len(found)} match)", 2)
     return found[0]
@@ -983,7 +1046,9 @@ def main():
     ls = sub.add_parser('list', help='every agent session in this Herdr, without asking any of them')
     ls.add_argument('--json', action='store_true')
     sub.add_parser('enroll', help='make this session the captain').add_argument('--replace', action='store_true')
-    sub.add_parser('ask', help='send each target a status request').add_argument('panes', nargs='+')
+    ak = sub.add_parser('ask', help='send each target a status request')
+    ak.add_argument('panes', nargs='+')
+    ak.add_argument('--force', action='store_true', help='ask a target even when nothing is new since its report')
     c = sub.add_parser('collect', help='print each report as it lands')
     c.add_argument('msgs', nargs='*')
     c.add_argument('--wait', type=int, default=60000, metavar='MS')
@@ -1052,7 +1117,7 @@ def main():
         mine = me()
         if a.cmd == 'ask':
             for pane in resolve(a.panes):
-                print(ask(pane, mine), flush=True)
+                print(ask(pane, mine, a.force), flush=True)
             return 0
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
