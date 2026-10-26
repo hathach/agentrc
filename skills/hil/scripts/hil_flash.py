@@ -271,14 +271,18 @@ def run_jlink_commands(flasher: dict, commands: list, *, interface: str, speed, 
 # word, formatted with its arguments, from recorded transcripts (V9.78 and V9.84; SEGGER
 # documents the commands, not their output): `g`/`go` print none, and any line after `r`'s
 # fails. A device script's AfterResetTarget() may close either form of `r` (the MK64 and
-# LPC4088 reset via SYSRESETREQ, V9.78).
+# LPC4088 reset via SYSRESETREQ, V9.78). The DLL's own LPC18xx/43xx reset closes `r` with a
+# boot ROM it does not know (LPC43S67, V8.98): it runs the image, but cannot halt after reset.
 _AFTER_RESET = r'(?:AfterResetTarget\(\) start\n(?:AfterResetTarget\(\)\n)?AfterResetTarget\(\) end - Took .*\n)?'
 _PC = r'^PC = [0-9A-F]{{8}}, '
 JLINK_DONE = {'h': _PC, 'halt': _PC, 'regs': _PC,
               'r': r'^Reset delay: \d+ ms\n(?:(?:.*\n)*?ResetTarget\(\) end - Took .*\nDevice specific reset executed\.\n'
                    + _AFTER_RESET +
                    r'|(?![\s\S]*^ResetTarget\(\) start$)(?:.*\n)*?Reset: Reset device via AIRCR\.SYSRESETREQ\.\n'
-                   + _AFTER_RESET + r')\s*\Z',
+                   + _AFTER_RESET +
+                   r'|LPC18xx/43xx reset: Halting CPU before performing reset\.\.\.\n'
+                   r'LPC18xx/43xx reset: Halted CPU before reset\.\n'
+                   r'Unknown LPC18xx/43xx bootloader variant\. Halting after reset may fail\.\n)\s*\Z',
               'g': '', 'go': '', 'sleep': r'^Sleep\({0}\)$',
               'mem32': r'^{0} = [0-9A-F]{{8}}', 'w4': r'^Writing {1} -> {0}$', 'verifybin': r'^Verify successful\.$',
               'loadfile': r'^O\.K\.$', 'exit': r'^Script processing completed\.$'}
