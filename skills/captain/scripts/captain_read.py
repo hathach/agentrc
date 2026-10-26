@@ -378,6 +378,14 @@ def main(argv):
     except Refused as why:
         print(f'captain_read: {why}', file=sys.stderr)
         return 2
+    try:
+        return dispatch(tool, where, args, tree)
+    except (OSError, subprocess.SubprocessError) as err:
+        print(f'captain_read: {err}', file=sys.stderr)
+        return 1
+
+
+def dispatch(tool, where, args, tree):
     if tool == 'list':
         return listing(*where)
     env = environment(tool)

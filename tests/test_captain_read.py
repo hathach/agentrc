@@ -291,6 +291,19 @@ class ListTest(unittest.TestCase):
                                   capture_output=True, text=True)
         self.assertEqual([line.split()[-1] for line in narrowed.stdout.splitlines()], ['old'])
 
+    def test_a_file_or_missing_directory_fails_in_one_line(self):
+        home = tmpdir(self)
+        runs = home / '.cache' / 'chief-runs'
+        runs.mkdir(parents=True)
+        (runs / 'f.log').write_text('x', encoding='utf-8')
+        env = {**os.environ, 'HOME': str(home)}
+        for path in (runs / 'f.log', runs / 'missing'):
+            with self.subTest(path.name):
+                done = subprocess.run([sys.executable, str(SCRIPT), 'list', str(path)], env=env,
+                                      capture_output=True, text=True)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertRegex(done.stderr, r'\Acaptain_read: [^\n]+\n\Z')
+
 
 @unittest.skipIf(os.name == 'nt', 'the captain runs on Linux')
 class RunTest(unittest.TestCase):
