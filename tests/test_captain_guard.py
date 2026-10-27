@@ -27,6 +27,8 @@ RUN = 'python3 ~/.claude/skills/captain/scripts/captain.py'
 READ = 'python3 ~/.claude/skills/captain/scripts/captain_read.py'
 PUBLISH = 'python3 ~/.claude/skills/followup-issue/scripts/publish.py'
 REPO = '--repo hathach/agentrc --allow-repo hathach/agentrc'
+# a command spells paths with forward slashes: the guard refuses a backslash, an escape in the Bash tool's shell
+DRAFTS, MEMORY = guard.DRAFTS.replace(os.sep, '/'), guard.MEMORY.replace(os.sep, '/')
 
 
 def setUpModule():
@@ -159,8 +161,8 @@ class VerdictTest(unittest.TestCase):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
 
     def test_a_follow_up_issue_publishes_only_as_drafted_for_hathach_agentrc(self):
-        title, body = os.path.join(guard.DRAFTS, 'herdr-timeout-title.md'), os.path.join(guard.DRAFTS, 'herdr.md')
-        tilde = body.replace(os.path.expanduser('~'), '~', 1)
+        title, body = f'{DRAFTS}/herdr-timeout-title.md', f'{DRAFTS}/herdr.md'
+        tilde = body.replace(Path.home().as_posix(), '~', 1)
         home = (Path.home() / '.claude/skills/followup-issue/scripts/publish.py').as_posix()
         create = f'create {REPO} --title-file {title} --body-file {body} --label follow-up'
         for cmd in [f'{PUBLISH} {create}', f'python3 {home} {create}',
@@ -178,10 +180,10 @@ class VerdictTest(unittest.TestCase):
                     f'{PUBLISH} {create.replace("--title-file", "--title")}',
                     f'{PUBLISH} {create.replace("--title-file", "--title-f")}',
                     f'{PUBLISH} {create.replace("--title-file " + title, "--title-file=" + title)}',
-                    f'{PUBLISH} {create.replace(title, os.path.join(guard.DRAFTS, "x.txt"))}',
-                    f'{PUBLISH} {create.replace(title, os.path.join(guard.DRAFTS, "..", "x.md"))}',
-                    f'{PUBLISH} {create.replace(title, guard.DRAFTS + "-other/x.md")}',
-                    f'{PUBLISH} {create.replace(title, os.path.join(guard.MEMORY, "x.md"))}',
+                    f'{PUBLISH} {create.replace(title, DRAFTS + "/x.txt")}',
+                    f'{PUBLISH} {create.replace(title, DRAFTS + "/../x.md")}',
+                    f'{PUBLISH} {create.replace(title, DRAFTS + "-other/x.md")}',
+                    f'{PUBLISH} {create.replace(title, MEMORY + "/x.md")}',
                     f'{PUBLISH} {create.replace(title, "x.md")}', f'{PUBLISH} {create.replace(title, "~root/x.md")}',
                     f'{PUBLISH} {create} extra', f'{PUBLISH} comment {REPO} --issue 0 --body-file {body}',
                     f'{PUBLISH} comment {REPO} --issue x --body-file {body}',
@@ -215,7 +217,7 @@ class VerdictTest(unittest.TestCase):
         (drafts / 'x.md').symlink_to(Path(os.path.expanduser('~')) / 'code' / 'x.md')
         (drafts / 'y.md').write_text('y', encoding='utf-8')
         with mock.patch.object(guard, 'DRAFTS', str(drafts)):
-            ok = f'{PUBLISH} comment {REPO} --issue 3 --body-file {drafts / "y.md"}'
+            ok = f'{PUBLISH} comment {REPO} --issue 3 --body-file {(drafts / "y.md").as_posix()}'
             self.assertIsNone(self.verdict('Bash', command=ok))
             self.assertIsNotNone(self.verdict('Bash', command=ok.replace('y.md', 'x.md')))
             self.assertIsNone(self.verdict('Write', file_path=str(drafts / 'y.md'), content='x'))
@@ -224,7 +226,7 @@ class VerdictTest(unittest.TestCase):
     def test_the_skill_s_documented_publications_pass(self):
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
         sample = {'<title.md>': '~/.cache/agentrc/captain/drafts/herdr-title.md',
-                  '<body.md>': os.path.join(guard.DRAFTS, 'herdr.md'), '<N>': '313'}
+                  '<body.md>': f'{DRAFTS}/herdr.md', '<N>': '313'}
         found = re.findall(r'(python3 ~/\.claude/skills/followup-issue/scripts/publish\.py [^`#\n]*)', text)
         self.assertEqual(len(found), 2)
         for cmd in found:
