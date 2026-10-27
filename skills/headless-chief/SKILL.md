@@ -69,7 +69,7 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    | Exit | Meaning |
    |---|---|
    | 0 | chief ended with a report |
-   | 1 | no final result, an error result, or one without text |
+   | 1 | no final result, an error result, one without text, or one after which the session's end cut off chief's own work (a unit's background command still running, or killed after chief's last message; the exit line and the top of `report.md` name each task) |
    | 2 | bad arguments, `--out` already exists, a chief already runs in the worktree, its run lock cannot be taken (Windows), or its `.claude` shadows agentrc's installed copies or cannot be read |
    | 127 | `claude` could not start |
    | other | claude's own status; 128 + N when killed by signal N (not on Windows); 1 for a Windows NTSTATUS, named in hex on the exit line |

@@ -284,6 +284,53 @@ class ChiefRun(unittest.TestCase):
                 self.assertEqual((self.out / 'report.md').exists(), report)
                 shutil.rmtree(self.out)
 
+    def test_a_result_that_leaves_chiefs_own_work_running_or_killed_is_incomplete(self):
+        # the shapes of claude 2.1.310's task events (agentrc#289): a unit returns while its own background Bash runs
+        def task(sub, tid, **kw):
+            return {'type': 'system', 'subtype': sub, 'task_id': tid, **kw}
+        unit = 'a2fe9c5420ae63043'
+        dispatched = (init(), text('m1', 'chief: stage · W1 dispatched'),
+                      task('task_started', unit, description='Fix R1-2', task_type='local_agent', is_backgrounded=True),
+                      task('task_started', 'b0w29yqzt', description='Rerun full\nsuite', task_type='local_bash',
+                           is_backgrounded=True, parent_task_id=unit),
+                      task('task_updated', unit, patch={'status': 'completed'}),
+                      task('task_notification', unit, status='completed'),
+                      {'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': [
+                          {'task_id': 'b0w29yqzt', 'task_type': 'local_bash', 'description': 'Rerun full\nsuite',
+                           'parent_task_id': unit}]})
+        killed = (task('task_updated', 'b0w29yqzt', patch={'status': 'killed'}),
+                  task('task_notification', 'b0w29yqzt', status='stopped'),
+                  {'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': []})
+        waiting = text('m2', 'W1 is running its suite. Still waiting for its final result.')
+        child = f'b0w29yqzt {{}} "Rerun full suite" under {unit} "Fix R1-2"'
+        cases = [
+            ('result before kill', (*dispatched, waiting, result(waiting['message']['content'][0]['text']), *killed),
+             child.format('stopped')),
+            ('kill before result', (*dispatched, waiting, *killed, result('W1 is running.')), child.format('stopped')),
+            ('a completed unit with a live child', (*dispatched, waiting, result('W1 is running.')), child.format('running')),
+        ]
+        for name, events, cut in cases:
+            with self.subTest(name):
+                self.stream(*events)
+                self.assertEqual(self.run_it().returncode, 1)
+                reason = f"incomplete: the session ended on chief's own work: {cut}"
+                self.assertTrue(self.texts()[-1].startswith(f'launcher: exit 1 ({reason}) · report '), self.texts())
+                self.assertTrue((self.out / 'report.md').read_text(encoding='utf-8').startswith(f'**{reason}**\n\nW1 '))
+                shutil.rmtree(self.out)
+        settled = (task('task_updated', 'b0w29yqzt', patch={'status': 'completed'}),
+                   task('task_notification', 'b0w29yqzt', status='completed'),
+                   {'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': []})
+        stopped = (task('task_started', 'bwait', description='Wait', task_type='local_bash', is_backgrounded=True), *killed[2:],
+                   task('task_updated', 'bwait', patch={'status': 'killed'}), task('task_notification', 'bwait', status='stopped'))
+        for name, events in (('normal completion', (*dispatched, *settled, text('m3', 'chief: stage · done'), result())),
+                             ('a stop chief saw', (init(), *stopped, text('m3', 'chief: stage · done'), result()))):
+            with self.subTest(name):
+                self.stream(*events)
+                self.assertEqual(self.run_it().returncode, 0)
+                self.assertTrue(self.texts()[-1].startswith('launcher: exit 0 (result ok) · report '), self.texts())
+                self.assertEqual((self.out / 'report.md').read_text(encoding='utf-8'), 'chief: stage · done\n')
+                shutil.rmtree(self.out)
+
     def transcript(self, config, dollars=0.2):
         """Session s-1's transcripts under config/projects: chief's and one preflight agent's, on Haiku."""
         session = config / 'projects' / '-wt' / 's-1'

@@ -5,7 +5,8 @@
 
 DIR must not exist. It receives stream.jsonl (every stdout line, raw), progress.log
 (`<seq> <HH:MM:SS> <line>`: the launcher's own lines, chief's status lines and notes),
-report.md (the final result's text), session (the session id), stderr.log and, when
+report.md (the final result's text, led by the exit reason when the session's end cut off
+chief's own tasks), session (the session id), stderr.log and, when
 the session's cost can be tabled, cost.md (run_cost.py's full output; its brief form,
 the Launches and Usage tables, goes into report.md before chief's first `## ` section).
 The exit line ends with that total, or `cost none (<why>)`.
@@ -149,8 +150,51 @@ def child_env():
     return env
 
 
-def verdict(rc, result, body):
-    """(exit code, reason) from claude's status, its final `result` event and that event's text."""
+class Tasks:
+    """The session's own Agent, Bash and workflow tasks from claude's task events. A task the final result leaves
+    running, or one killed after chief's last message, was cut off by the session's end, not settled by chief: a unit
+    that returns while its own background command runs reads `completed`, its command still listed."""
+    ENDED = {'completed', 'failed', 'killed', 'stopped'}
+
+    def __init__(self):
+        self.about, self.status, self.listed, self.killed, self.open = {}, {}, set(), set(), set()
+
+    def event(self, event):
+        kind, sub, task = event.get('type'), event.get('subtype'), event.get('task_id')
+        if kind == 'assistant' and event.get('parent_tool_use_id') is None:
+            self.killed.clear()   # chief's message comes after it: a stop it ordered or has seen
+        elif kind == 'result':
+            self.open = {t for t, s in self.status.items() if s not in self.ENDED} | self.listed
+        elif kind != 'system' or (task is None and sub != 'background_tasks_changed'):
+            return
+        elif sub == 'task_started':
+            self.about[task] = (event.get('description') or '', event.get('parent_task_id'))
+            self.status[task] = 'running'
+        elif sub in ('task_updated', 'task_notification'):
+            status = (event.get('patch') or {}).get('status') if sub == 'task_updated' else event.get('status')
+            if status:
+                self.status[task] = status
+            if status in ('killed', 'stopped'):
+                self.killed.add(task)
+        elif sub == 'background_tasks_changed':
+            self.listed = {t['task_id'] for t in event.get('tasks') or []}
+            for t in event.get('tasks') or []:
+                self.about.setdefault(t['task_id'], (t.get('description') or '', t.get('parent_task_id')))
+
+    def cut(self):
+        """Each task cut off, `<id> <status> "<description>"`, a unit's own followed by ` under <id> "<description>"`."""
+        def said(task):
+            return '"' + ' '.join(self.about.get(task, ('', None))[0].split())[:60] + '"'
+        rows = []
+        for task in sorted(self.open | self.killed):
+            row, parent = f'{task} {self.status.get(task, "running")} {said(task)}', self.about.get(task, ('', None))[1]
+            rows.append(f'{row} under {parent} {said(parent)}' if parent else row)
+        return rows
+
+
+def verdict(rc, result, body, cut=()):
+    """(exit code, reason) from claude's status, its final `result` event, that event's text and the tasks the
+    session's end cut off."""
     if rc < 0:
         return 128 - rc, f'claude killed by signal {-rc}'
     if rc > 0x7FFFFFFF:   # Windows: an NTSTATUS (0xC0000005 a crash, 0xC000013A Ctrl+C), beyond an exit code
@@ -165,6 +209,8 @@ def verdict(rc, result, body):
         return 1, 'no model turn; see stream.jsonl'
     if not body:
         return 1, 'result has no text'
+    if cut:
+        return 1, f'incomplete: the session ended on chief\'s own work: {"; ".join(cut)}'
     return 0, 'result ok'
 
 
@@ -305,7 +351,7 @@ def launch(a, task):
         cmd += ['--permission-mode', a.permission_mode]
 
     progress = Progress(a.out / 'progress.log')
-    seen, result, warned, sid = set(), None, set(), ''
+    seen, result, warned, sid, tasks = set(), None, set(), '', Tasks()
 
     def warn(key, text):
         if key not in warned:
@@ -335,6 +381,7 @@ def launch(a, task):
                 try:
                     event = json.loads(raw)
                     kind = event.get('type')
+                    tasks.event(event)
                     if kind == 'system' and event.get('subtype') == 'init':
                         sid = event.get('session_id', '')
                         (a.out / 'session').write_text(f'{sid}\n', encoding='utf-8', newline='\n')
@@ -373,8 +420,10 @@ def launch(a, task):
     body = str(result.get('result') or '') if result is not None else ''
     if result is not None and result.get('num_turns') == 0:
         body = ''   # a hook refused the prompt: not chief's report
-    code, reason = verdict(rc, result, body.strip())
+    code, reason = verdict(rc, result, body.strip(), tasks.cut())
     report = a.out / 'report.md'
+    if body.strip() and reason.startswith('incomplete'):
+        body = f'**{reason}**\n\n{body}'   # the report alone must not read as chief's last word
     if body.strip():
         report.write_text(body.rstrip('\n') + '\n', encoding='utf-8', newline='\n')   # Markdown: keep its indentation
     progress.line(f'launcher: exit {code} ({reason}) · report {report if body.strip() else "none"} · {cost(a.out, sid, report)}')
