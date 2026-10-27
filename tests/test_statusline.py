@@ -361,7 +361,10 @@ class PrRenderTest(unittest.TestCase):
                 done = subprocess.run([sys.executable, str(ROOT / 'statusline-prs.py'), 'render', d, sid, '/none'],
                                       capture_output=True, text=True)
                 self.assertEqual((done.returncode, done.stdout.strip()), (0, ''), done.stderr)
-            Path(d, 'bad-ids.json').write_text('{"prs": ["broken", "o/r#", "o/r#0", "o/r#1"]}')
+            # a fresh attempt_at keeps render from starting a detached refresh, which would poll the real gh
+            # and write into d after render returns (WinError 145 on cleanup, #298)
+            Path(d, 'bad-ids.json').write_text(json.dumps({'prs': ['broken', 'o/r#', 'o/r#0', 'o/r#1'],
+                                                           'attempt_at': time.time()}))
             done = subprocess.run([sys.executable, str(ROOT / 'statusline-prs.py'), 'render', d, 'bad-ids', '/none'],
                                   capture_output=True, text=True)
             self.assertEqual((done.returncode, plain(done.stdout).strip()), (0, '#1?'), done.stderr)
