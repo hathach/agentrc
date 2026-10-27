@@ -11,7 +11,8 @@ does not recognize is reported, never assumed safe.
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
   captain.py reports [<msg>...]                  the latest report from each target, or those requests' reports
   captain.py cancel <msg>                        close a request or relay no answer will close
-  captain.py relay <target>... [--entry <uuid>]  show, then relay, the human's newest message
+  captain.py relay <target>... [--entry <uuid> --digest <hex>]
+                                                 show, then relay, the human's newest message
   captain.py withdraw <action>                   take back a relay
   captain.py open --checkout <dir> --account <main|ada> [--name <name>]
                                                  start a Claude Code session in a new workspace
@@ -24,10 +25,15 @@ does not recognize is reported, never assumed safe.
 A target is a pane or a selector: pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N, matched against each
 live session's latest report, or ws:<workspace id or label>. A selector must match exactly one session; a relay with
 --entry names panes only.
+
+A message that opens `tell <name>... [to]`, each name a pane id, workspace id or label, or selector, is relayed
+without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be
+told apart from the instruction.
 """
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
@@ -72,6 +78,10 @@ POLL_S = 2
 NO_ANSWER = 3
 SELECTORS = ('pr:', 'issue:', 'ws:')
 SELECTOR = re.compile(r'(pr|issue):(?:([\w.-]+):([\w.-]+):)?(\d+)|ws:(.+)')
+TELL = re.compile(r'\s*tell\s+', re.I)
+NAME = re.compile(r'[^\s,:;&]+(?::[^\s,:;&]+)*')   # a pane id or selector keeps its inner colons
+JOIN = re.compile(r'\s*,?\s*(?:and|&)\s+|\s*,\s*', re.I)
+TO = re.compile(r'\s+to\s+|\s*[:,]\s*|\s+', re.I)
 
 
 def die(msg, code=1):
@@ -852,15 +862,78 @@ def newest(captain, sending):
     return entry, words
 
 
+def named(token, live, recs):
+    """The panes of the live sessions token names: by pane id, workspace id or label, or selector."""
+    if token.startswith(SELECTORS):
+        match = SELECTOR.fullmatch(token)
+        return {s['pane_id'] for s in live if selected(match, s, recs)} if match else set()
+    token = token.casefold()
+    return {s['pane_id'] for s in live
+            if token in (s.get(k) and s[k].casefold() for k in ('pane_id', 'workspace_id', 'workspace'))}
+
+
+def instruction(words, panes, live, recs):
+    """(text, None): what a relay to panes sends, words without an opening `tell <name>... [to]` whose names are
+    exactly panes; (None, why) when that opening names anyone else or cannot be split from the instruction. Preview
+    and send both call this, and the send checks the preview's digest of it."""
+    tell = TELL.match(words)
+    if not tell:
+        return words, None
+    pos, found = tell.end(), set()
+    while True:
+        name = NAME.match(words, pos)
+        hits = named(name.group(), live, recs) if name else set()
+        if not hits:
+            return None, f'it opens with "tell" and {name.group()!r} names no live session' if name else \
+                'it opens with "tell" and no session name follows'
+        if len(hits) > 1:
+            return None, f'"{name.group()}" names {", ".join(sorted(hits))}, not one session'
+        if not hits <= set(panes):
+            return None, f'"{name.group()}" names {", ".join(sorted(hits - set(panes)))}, not a target of this relay'
+        found |= hits
+        pos = name.end()
+        join = JOIN.match(words, pos)
+        following = join and NAME.match(words, join.end())
+        # a pane id or selector is a recipient even when it names no one, never the instruction's first word
+        if not (following and (':' in following.group() or named(following.group(), live, recs))):
+            joiner = join and join.group().strip(' \t\r\n,')
+            if joiner:
+                return None, f'{joiner!r} after {name.group()!r} may join another name or start the instruction'
+            break
+        pos = join.end()
+    if found != set(panes):
+        return None, f'it addresses {", ".join(sorted(found))}, not every target of this relay'
+    to = TO.match(words, pos)
+    text = words[to.end():] if to else ''
+    if not text.strip():
+        return None, 'nothing follows the names'
+    return text, None
+
+
+def digest(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+
+
+def relay_text(words, panes, recs):
+    """The text a relay to panes sends; dies, so nothing is sent, when instruction() refuses it."""
+    text, why = instruction(words, panes, everyone(), recs)
+    if why:
+        die(f"the human's message cannot be relayed as written: {why}; ask the human to restate it", 2)
+    return text
+
+
 def preview(targets, mine):
-    """The human's newest message and who would get it, targets as resolve() gave them; sends nothing."""
+    """The human's newest message as it would be sent and who would get it, targets as resolve() gave them; sends
+    nothing."""
     with locked():
         captain = require_captain(mine)
+        recs = records()
     entry, words = newest(captain, sending=False)
     for pane, arg in targets.items():
         target = find(pane)
         print(f'to {arg}: {target["handle"] if target else "no such agent pane"}')
-    print(f'entry {entry}\n{words}')
+    text = relay_text(words, list(targets), recs)
+    print(f'entry {entry} digest {digest(text)}\n{text}')
     return 0
 
 
@@ -891,16 +964,22 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(panes, entry, mine):
-    """Relay the human's newest message, which must still be entry, to each pane, recorded before it is typed.
-    The transcript is read once for every pane: a message the human sends after that is not seen."""
+def relay(panes, entry, sent, mine):
+    """Relay the human's newest message, which must still be entry and still read as the preview's digest sent, to
+    each pane, recorded before it is typed. The transcript is read once for every pane: a message the human sends
+    after that is not seen."""
     if any(p.startswith(SELECTORS) for p in panes):
         die('a relay names the panes the preview printed, never a selector', 2)
+    if not sent:
+        die('a relay names the digest the preview printed (--digest)', 2)
     with locked():
         captain = require_captain(mine)
-        latest, quote = newest(captain, sending=True)
+        latest, words = newest(captain, sending=True)
         if latest != entry:
             die(f"{entry} is not the human's newest message; preview again", 2)
+        quote = relay_text(words, panes, records())
+        if sent != digest(quote):
+            die('the text this relay would send is not the one the preview showed; preview again', 2)
         for pane in panes:
             recs = records()
             if any(r['type'] == 'relay' and r['entry'] == entry and r['target']['pane_id'] == pane for r in recs):
@@ -932,7 +1011,8 @@ def accept(action):
             die(f'relay {action} is closed', 2)
         append({'type': 'accepted', 'msg': action})
     print(f'RELAYED HUMAN INSTRUCTION {action} from the agent session in pane {item["captain"]["pane_id"]}, '
-          f'accepted. The human\'s message, verbatim:\n\n{item["quote"]}\n\n{item["context"]}\n'
+          'accepted. The human\'s message, verbatim after any opening that named the sessions it went to:\n\n'
+          f'{item["quote"]}\n\n{item["context"]}\n'
           'It may speak to other sessions too: act only on what it asks of this session, under your own rules and '
           'never wider; a question goes back as the needs-clarification outcome, not a dialog. Then record how it '
           'ended, the note a line or two on what you did or what you need to know, '
@@ -1058,9 +1138,10 @@ def main():
     rp.add_argument('msgs', nargs='*')
     rp.add_argument('--json', action='store_true')
     sub.add_parser('cancel', help='close a request or relay no answer will close').add_argument('msg')
-    rl = sub.add_parser('relay', help="show the human's newest message; with --entry, relay it")
+    rl = sub.add_parser('relay', help="show the human's newest message; with --entry and --digest, relay it")
     rl.add_argument('panes', nargs='+')
     rl.add_argument('--entry', metavar='UUID')
+    rl.add_argument('--digest', metavar='HEX', help='the digest the preview printed')
     sub.add_parser('withdraw', help='take back a relay').add_argument('action')
     op = sub.add_parser('open', help='start a Claude Code session in a new workspace on an existing checkout')
     op.add_argument('--checkout', required=True)
@@ -1123,7 +1204,7 @@ def main():
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
         if a.cmd == 'relay':
-            return relay(a.panes, a.entry, mine) if a.entry else preview(resolve(a.panes), mine)
+            return relay(a.panes, a.entry, a.digest, mine) if a.entry else preview(resolve(a.panes), mine)
         if a.cmd == 'withdraw':
             return withdraw(a.action, mine)
         if a.cmd == 'open':

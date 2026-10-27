@@ -19,7 +19,7 @@ python3 ~/.claude/skills/captain/scripts/captain.py collect [<msg>...] [--wait M
 python3 ~/.claude/skills/captain/scripts/captain.py reports [--json] [<msg>...]     # latest per session, or by request
 python3 ~/.claude/skills/captain/scripts/captain.py cancel <msg>                    # close a request or relay left open
 python3 ~/.claude/skills/captain/scripts/captain.py relay <target>...               # show the human's newest message
-python3 ~/.claude/skills/captain/scripts/captain.py relay <pane>... --entry <uuid>  # relay exactly that message
+python3 ~/.claude/skills/captain/scripts/captain.py relay <pane>... --entry <uuid> --digest <hex>  # send what it showed
 python3 ~/.claude/skills/captain/scripts/captain.py withdraw <action>               # take back a relay
 python3 ~/.claude/skills/captain/scripts/captain.py open --checkout <dir> --account <main|ada> [--name <name>]
 ```
@@ -52,7 +52,8 @@ A target is a pane id or a selector the human's words give you: `pr:N`, `pr:<own
 `issue:<owner>:<repo>:N`, matched against each live session's latest report from that same session, or
 `ws:<workspace id or label>`. A selector must match exactly one session: none or several refuse the whole call,
 nothing sent, the candidates listed; name a label the guard refuses, such as one with a space, by its workspace id. A
-send (`--entry`) takes only the panes the preview printed, so a report landing in between cannot redirect it.
+send (`--entry`) takes only the panes the preview printed, so a report landing in between cannot redirect it, and
+the digest the preview printed, so it sends only the text the preview showed.
 
 ## Captain
 
@@ -65,12 +66,16 @@ send (`--entry`) takes only the panes the preview printed, so a report landing i
   transcript starts no turn after the request its last report answered - no prompt, task notification or compaction -
   is not asked: `ask` prints `not asked` with that report's id, which answers for it. `--force` asks anyway, only when
   the human wants a session asked again whatever it last said.
-- **Relay** carries the human's newest message, whole and verbatim, read by the script from this session's own
-  transcript: you never pass the words. Relay only when the human asks you to tell a session something. Run `relay`
-  with the target panes first; it sends nothing and prints the message and its entry. If that message is the
-  instruction to relay, run it again with `--entry <uuid>`; if not (the human has written since, or it is not
-  plain text), ask the human to restate it. If it also asks you something, relay none of it and never cut the
-  instruction out yourself: answer the question, then ask the human for the instruction alone.
+- **Relay** carries the human's newest message, read by the script from this session's own transcript: you never
+  pass the words. It goes verbatim, except that an opening `tell <name>... [to]` whose names - pane ids, workspace
+  ids or labels, or selectors - are exactly the relay's targets is removed by the script: `relay w68:p1` on `tell
+  code to merge 318`, `code` being that pane's workspace, sends `merge 318`. An opening `tell` that names another
+  session, not every target, or anything the script cannot split from the instruction refuses, nothing sent: ask
+  the human to restate it. Relay only when the human asks you to tell a session something. Run `relay` with the
+  target panes first; it sends nothing and prints its entry and digest, then exactly the text it would send. If that
+  is the instruction to relay, run it again with `--entry <uuid> --digest <hex>`; if not (the human has written
+  since, or it is not plain text), ask the human to restate it. If it also asks you something, relay none of it and
+  never cut the instruction out yourself: answer the question, then ask the human for the instruction alone.
   The send refuses unless that entry is still the human's newest message, and each message goes to a pane once. The
   target runs `accept` to read the message from the ledger and acts on it under its own rules, then records an outcome:
   `completed`, `failed`, `rejected` or `needs-clarification`, with a note. A message the human writes after the send's

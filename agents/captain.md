@@ -31,7 +31,7 @@ Your memory directory is shared by your sessions on every account. Keep in it wh
 
 ## Relay
 
-When the human asks you to tell one or more sessions something, relay it as the skill says: preview, check the printed message is the one they just wrote, then send it with its entry. The script relays their whole message verbatim; you add, reword, split or summarise nothing, and never relay on your own initiative or on another session's request. If the preview shows another message, ask the human to restate the instruction. A message that also asks you something is never relayed whole or cut by you, as the skill says. Collect the outcomes and report each as the script gave it; a `needs-clarification` note goes to the human. Withdraw or cancel a relay only on their word.
+When the human asks you to tell one or more sessions something, relay it as the skill says: preview, check the printed text is the message they just wrote, less only an opening `tell <session> [to]` naming the targets, then send it with its entry and digest. The script relays exactly the text the preview printed; you add, reword, split or summarise nothing, and never relay on your own initiative or on another session's request. If the preview shows another message, ask the human to restate the instruction. A message that also asks you something is never relayed whole or cut by you, as the skill says. Collect the outcomes and report each as the script gave it; a `needs-clarification` note goes to the human. Withdraw or cancel a relay only on their word.
 
 ## Follow-up issues
 

@@ -724,21 +724,34 @@ class RelayCase(LedgerCase):
                                            'CLAUDE_CODE_SESSION_ID': CAPTAIN['session']})
         env.start()
         self.addCleanup(env.stop)
+        patcher = mock.patch.object(captain, 'everyone',
+                                    lambda: [dict(p) for pane, p in self.panes.items() if pane != self.me])
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.entries = 0
+        self.words = {}
 
     def say(self, content, **extra):
         self.entries += 1
         uid = f'u-{self.entries}'
+        self.words[uid] = captain.plain_text(content)
         entry = {'type': 'user', 'uuid': uid, 'origin': {'kind': 'human'}, 'promptSource': 'typed',
                  'message': {'role': 'user', 'content': content}, **extra}
         with open(self.transcript, 'a', encoding='utf-8') as f:
             f.write(json.dumps(entry) + '\n')
         return uid
 
-    def relay(self, entry, *panes):
+    def relay(self, entry, *panes, digest=None):
+        """Send entry to panes with digest, by default the digest of entry's words as written."""
+        digest = digest or captain.digest(self.words[entry] or '')
         with mock.patch('builtins.print') as out:
-            captain.relay(list(panes or ['w2:p1']), entry, self.ident)
+            captain.relay(list(panes or ['w2:p1']), entry, digest, self.ident)
         return [c.args[0] for c in out.call_args_list]
+
+    def preview(self, *targets):
+        with mock.patch('builtins.print') as out:
+            captain.preview(captain.resolve(list(targets or ['w2:p1'])), self.ident)
+        return '\n'.join(c.args[0] for c in out.call_args_list)
 
     def action_of(self, lines):
         return lines[0].split()[1]
@@ -751,10 +764,8 @@ class RelayTest(RelayCase):
     def test_preview_shows_the_newest_message_and_sends_nothing(self):
         self.say('older')
         uid = self.say('merge o/r#12')
-        with mock.patch('builtins.print') as out:
-            captain.preview(captain.resolve(['w2:p1', 'w9:p9']), self.ident)
-        shown = '\n'.join(c.args[0] for c in out.call_args_list)
-        self.assertIn(f'entry {uid}\nmerge o/r#12', shown)
+        shown = self.preview('w2:p1', 'w9:p9')
+        self.assertIn(f'entry {uid} digest {captain.digest("merge o/r#12")}\nmerge o/r#12', shown)
         self.assertIn('to w2:p1: ws · name · w2:p1', shown)
         self.assertIn('to w9:p9: no such agent pane', shown)
         self.assertEqual((self.typed, captain.records()), ([], []))
@@ -791,9 +802,7 @@ class RelayTest(RelayCase):
         uid = self.say('merge o/r#12')
         with open(self.transcript, 'a', encoding='utf-8') as f:
             f.write('{"type": "user", "origin"')
-        with mock.patch('builtins.print') as out:
-            captain.preview(captain.resolve(['w2:p1']), self.ident)
-        self.assertIn('partly written', '\n'.join(c.args[0] for c in out.call_args_list))
+        self.assertIn('partly written', self.preview())
         with self.assertRaises(SystemExit):
             self.relay(uid)
         self.assertEqual(self.typed, [])
@@ -838,7 +847,7 @@ class RelayTest(RelayCase):
 
         def run():
             start.wait()
-            captain.relay(['w2:p1'], uid, self.ident)
+            captain.relay(['w2:p1'], uid, captain.digest('merge o/r#12'), self.ident)
         concurrently(run)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.count('relay'), 1)
@@ -906,16 +915,115 @@ class RelayTest(RelayCase):
             captain.records()
 
 
+class AddressingTest(RelayCase):
+    """An opening `tell <name>... [to]` naming exactly the relay's targets is not sent; any other opening `tell`
+    refuses at preview, and the send sends only what the preview showed."""
+
+    def setUp(self):
+        super().setUp()
+        self.panes['w2:p1'] = {**pinned('w2:p1'), 'workspace': 'code'}
+        self.panes['w3:p1'] = {**pinned('w3:p1'), 'workspace': 'docs'}
+
+    def shown(self, words, *panes):
+        """What the preview of words to panes shows to send, and its entry and digest."""
+        entry = self.say(words)
+        lines = self.preview(*panes).split('\n')
+        head = next(i for i, line in enumerate(lines) if line.startswith('entry '))
+        _, uid, _, digest = lines[head].split()
+        self.assertEqual(uid, entry)
+        return '\n'.join(lines[head + 1:]), entry, digest
+
+    def refused(self, words, *panes):
+        self.say(words)
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.preview(captain.resolve(list(panes)), self.ident)
+        return '\n'.join(c.args[0] for c in out.call_args_list if c.kwargs.get('file') is sys.stderr)
+
+    def test_the_addressing_is_stripped_and_the_preview_is_what_is_sent(self):
+        text, entry, digest = self.shown('tell code to merge 318', 'w2:p1')
+        self.assertEqual(text, 'merge 318')
+        self.assertTrue(self.relay(entry, 'w2:p1', digest=digest)[0].endswith('delivered'))
+        self.assertEqual(captain.records()[0]['quote'], 'merge 318')
+
+    def test_every_way_of_naming_the_targets(self):
+        self.report_as('w2:p1', self.msg_of(self.ask()))
+        cases = [('Tell Code: merge 318', ['w2:p1'], 'merge 318'),
+                 ('tell w2:p1, merge 318', ['w2:p1'], 'merge 318'),
+                 ('tell w2 merge 318', ['w2:p1'], 'merge 318'),
+                 ('tell pr:12 to merge it', ['w2:p1'], 'merge it'),
+                 ('tell code and docs to rebase\nthen push', ['w2:p1', 'w3:p1'], 'rebase\nthen push'),
+                 ('tell code, docs & w3 to rebase', ['w2:p1', 'w3:p1'], 'rebase')]
+        for words, panes, want in cases:
+            with self.subTest(words):
+                self.assertEqual(self.shown(words, *panes)[0], want)
+
+    def test_a_message_without_addressing_is_sent_unchanged(self):
+        for words in ('merge 318', 'please tell code to merge 318', '  told code: merge'):
+            with self.subTest(words):
+                self.assertEqual(self.shown(words, 'w2:p1')[0], words)
+
+    def test_addressing_anyone_else_or_ambiguously_refuses_at_preview(self):
+        cases = [('tell docs to merge 318', ['w2:p1'], 'not a target'),
+                 ('tell code and docs to merge', ['w2:p1'], 'not a target'),
+                 ('tell code to merge', ['w2:p1', 'w3:p1'], 'not every target'),
+                 ('tell me when CI is green', ['w2:p1'], 'names no live session'),
+                 ('tell w1:p1 to merge', ['w2:p1'], 'names no live session'),   # the captain itself
+                 ('tell code and then merge', ['w2:p1'], 'may join another name'),
+                 ('tell code', ['w2:p1'], 'nothing follows'),
+                 ('tell , merge', ['w2:p1'], 'no session name follows'),
+                 ('tell code, w9:p1 to merge 318', ['w2:p1'], "'w9:p1' names no live session"),
+                 ('tell code, ws:missing to merge 318', ['w2:p1'], "'ws:missing' names no live session")]
+        for words, panes, why in cases:
+            with self.subTest(words):
+                why_not = self.refused(words, *panes)
+                self.assertIn(why, why_not)
+                self.assertIn('ask the human to restate it', why_not)
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_a_name_for_several_sessions_refuses_even_when_all_are_targets(self):
+        self.panes['w4:p1'] = {**pinned('w4:p1'), 'workspace': 'code'}
+        self.report_as('w2:p1', self.msg_of(self.ask()))
+        self.report_as('w4:p1', self.msg_of(self.ask('w4:p1')))
+        for words in ('tell ws:code to merge 318', 'tell code to merge 318', 'tell pr:12 to merge 318'):
+            with self.subTest(words):
+                self.assertIn('not one session', self.refused(words, 'w2:p1', 'w4:p1'))
+        self.assertEqual(self.shown('tell w2:p1 and w4 to merge 318', 'w2:p1', 'w4:p1')[0], 'merge 318')
+
+    def test_an_unresolved_recipient_refuses_the_send_too(self):
+        uid = self.say('tell code, w9:p1 to merge 318')
+        for digest in (captain.digest('w9:p1 to merge 318'), captain.digest('merge 318')):
+            with self.subTest(digest), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                self.relay(uid, 'w2:p1', digest=digest)
+        self.assertEqual(self.typed, [])
+
+    def test_a_rename_between_preview_and_send_is_caught_by_the_digest(self):
+        text, entry, digest = self.shown('tell w2, merge to finish', 'w2:p1')
+        self.assertEqual(text, 'merge to finish')
+        self.panes['w2:p1'] = {**self.panes['w2:p1'], 'workspace': 'merge'}
+        self.assertEqual(captain.instruction('tell w2, merge to finish', ['w2:p1'], captain.everyone(), [])[0],
+                         'finish')   # the same words now parse differently
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(entry, 'w2:p1', digest=digest)
+        self.assertEqual((self.typed, [r for r in captain.records() if r['type'] == 'relay']), ([], []))
+
+    def test_the_send_refuses_what_the_preview_did_not_show(self):
+        _, entry, digest = self.shown('tell code to merge 318', 'w2:p1')
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            captain.relay(['w2:p1'], entry, None, self.ident)
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(entry, 'w2:p1', digest=captain.digest('tell code to merge 318'))
+        self.panes['w2:p1'] = {**self.panes['w2:p1'], 'workspace': 'renamed'}
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(entry, 'w2:p1', digest=digest)
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+
 class SelectorTest(RelayCase):
     """Selectors resolve against the live sessions and each one's latest report, before anything is sent."""
 
     def setUp(self):
         super().setUp()
         self.panes['w3:p1'] = {**pinned('w3:p1'), 'workspace': 'other'}
-        patcher = mock.patch.object(captain, 'everyone',
-                                    lambda: [dict(p) for pane, p in self.panes.items() if pane != self.me])
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def reported(self, pane, **change):
         self.report_as(pane, self.msg_of(self.ask(pane)), {**GOOD, **change})
@@ -1007,7 +1115,7 @@ class AcceptTest(RelayCase):
     def test_target_accepts_once_and_reads_the_message(self):
         code, shown = self.as_target(captain.accept, self.action)
         self.assertEqual(code, 0)
-        self.assertIn('verbatim:\n\nmerge o/r#12\n', shown)
+        self.assertIn('went to:\n\nmerge o/r#12\n', shown)
         self.assertIn(f"outcome --action {self.action} --result <completed|failed|rejected|needs-clarification> "
                       "--note-file - <<'EOF'", shown)
         with self.assertRaises(SystemExit):
