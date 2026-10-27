@@ -1396,6 +1396,7 @@ class RttPlatformLifecycle(unittest.TestCase):
 
             def communicate(self, timeout=None):
                 self.waits.append(timeout)
+                time.sleep(timeout)
                 raise subprocess.TimeoutExpired('fake-nm', timeout)
 
             def terminate(self):
@@ -1404,17 +1405,19 @@ class RttPlatformLifecycle(unittest.TestCase):
             def kill(self):
                 self.signals.append('kill')
 
+        grace = 0.05
         for stop in (None, mock.Mock(side_effect=(False, True))):
             with self.subTest(stop=stop):
                 proc = StubbornNm()
                 with mock.patch.object(rtt.subprocess, 'Popen', return_value=proc), \
                      mock.patch.object(rtt, '_resolve_exe', lambda name: name), \
-                     mock.patch.object(rtt, 'NM_TIMEOUT', 0.2), \
-                     self.assertRaisesRegex(SystemExit, rf'fake-nm \(pid 4242\) still running {rtt.NM_REAP_GRACE} s'):
+                     mock.patch.object(rtt, 'NM_TIMEOUT', 0.2), mock.patch.object(rtt, 'NM_REAP_GRACE', grace), \
+                     self.assertRaisesRegex(SystemExit, rf'fake-nm \(pid 4242\) still running {grace} s'):
                     rtt.nm_rtt_addr('fake.elf', nm='fake-nm', stop=stop)
                 self.assertEqual(proc.signals, ['terminate', 'kill'])
                 self.assertNotIn(None, proc.waits, 'every wait on nm is bounded')
-                self.assertEqual(proc.waits[-2:], [rtt.NM_REAP_GRACE] * 2)
+                self.assertEqual(proc.waits[-2:], [grace] * 2)
+                self.assertLess(len(proc.waits), 10, 'the lookup waits on nm rather than spinning')
 
     def test_windows_defaults_to_jlink_exe(self):
         with mock.patch.object(rtt, 'IS_WINDOWS', True), \
