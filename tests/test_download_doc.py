@@ -518,7 +518,7 @@ class GuiDetection(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, r"http://localhost:8080/#lib serves no library by that id; "
                                                   r".*'http://localhost:8080/#-' list"):
             lib._run('add', 'x.pdf')
-        self.assertEqual([argv[2] for argv in calls], ['/lib', 'http://localhost:8080/#lib'])
+        self.assertEqual([argv[2] for argv in calls], [str(Path('/lib')), 'http://localhost:8080/#lib'])
 
 
 class LibraryCalls(unittest.TestCase):
