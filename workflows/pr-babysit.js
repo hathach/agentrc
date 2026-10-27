@@ -1990,9 +1990,13 @@ const manualSkip = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && MA
 // The ask CodeRabbit's state leaves a coderabbitTrigger launch on the head of `clock`, one of each per head (#243): a tick of a
 // manual skip's box, or a request after a rate limit with a known reset, whenever that reset comes, or after a failed tick, which
 // spends no comment (#274); null when neither is left.
-const coderabbitAskable = (cr, clock) => manualSkip(cr) && clock.triggeredAt === undefined ? 'tick'
-  : !clock.request && (manualSkip(cr) ? clock.triggeredAt === null : cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null)
-    ? 'request' : null
+const coderabbitAskable = (cr, clock) => {
+  if (manualSkip(cr)) {
+    if (clock.triggeredAt === undefined) return 'tick'
+    return !clock.request && clock.triggeredAt === null ? 'request' : null
+  }
+  return !clock.request && cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null ? 'request' : null
+}
 const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
@@ -2006,7 +2010,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
   if (cr.state === 'settled' && cr.kind === 'limited') return requestCodeRabbit(cycle, r, cr, ended)
-  if (manual && coderabbitTrigger && coderabbitAskable(cr, reviewClock) === 'request') await requestCodeRabbit(cycle, r, cr, ended)
+  if (manual) await requestCodeRabbit(cycle, r, cr, ended)
   // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip after
   // the ask is waited on too: the skip asked about may read otherwise once its box is ticked.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
