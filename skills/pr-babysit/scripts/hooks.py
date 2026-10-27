@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import Unusable, checkout_top, git, report  # noqa: E402
+from facts import Unusable, checkout_top, git, report, status  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
 
@@ -39,11 +39,6 @@ MODIFIED = '- files were modified by this hook'
 # pre-commit pads a hook's name with dots to its result, then prints the
 # hook's `- ` block only when it failed or runs verbose (commands/run.py).
 RESULT = re.compile(r'\.(Passed|Failed)$')
-
-
-def status():
-    # -uall: a new directory's files, not one `?? dir/` record no file scope can hold (#322)
-    return [r for r in git('status', '--porcelain', '-z', '--untracked-files=all').split('\0') if r]
 
 
 def status_paths(records):

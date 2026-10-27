@@ -145,6 +145,12 @@ def git(*argv):
     return run('git', *argv)[1]
 
 
+def status(*paths):
+    """`git status --porcelain -z` records under PATHS, taken literally (all when none): each untracked file its own,
+    not one `?? dir/` record no file scope can hold (#322); a rename's or copy's source is the record after it."""
+    return [r for r in git('--literal-pathspecs', 'status', '--porcelain', '-z', '--untracked-files=all', '--', *paths).split('\0') if r]
+
+
 def checkout_top():
     """The checkout's top level, Unusable unless it is the current directory."""
     top = git('rev-parse', '--show-toplevel').strip()

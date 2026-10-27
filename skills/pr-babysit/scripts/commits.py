@@ -58,7 +58,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run, sealed  # noqa: E402
+from facts import FULL_SHA, Unusable, attempt, attribution_in, git, report, run, sealed, status  # noqa: E402
 
 DETAIL_MAX = 500
 ESCAPE = re.compile(r'\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)?|.)')
@@ -111,7 +111,7 @@ def head(parent, paths):
     full(parent)
     sha = git('rev-parse', 'HEAD').strip()
     c = commit(sha)
-    leftover = records(git('--literal-pathspecs', 'status', '--porcelain', '-z', '--untracked-files=all', '--', *paths))
+    leftover = status(*paths)
     entries = records(git('--literal-pathspecs', 'ls-tree', '-z', sha, '--', *paths))
     now = git('rev-parse', 'HEAD').strip()
     if now != sha:

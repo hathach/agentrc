@@ -76,6 +76,19 @@ class CommitsTest(unittest.TestCase):
         rest = {k: v for k, v in out.items() if k != 'seal'}
         self.assertEqual(out['seal'], sys.modules['facts'].sealed(rest)['seal'], 'the line is sealed over what it says')
 
+    def test_status_names_each_untracked_file_a_renames_source_and_takes_paths_literally(self):
+        status = sys.modules['facts'].status
+        self.write('new/x.c', 'x\n')
+        self.write('new/y.c', 'y\n')
+        self.write('[ab].c', 'glob\n')
+        self.git('mv', 'a.c', 'b.c')
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.repo)
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}, clear=True):
+            self.assertEqual(status(), ['R  b.c', 'a.c', '?? [ab].c', '?? new/x.c', '?? new/y.c'])
+            self.assertEqual(status('[ab].c'), ['?? [ab].c'], 'a pathspec is literal, never a glob over b.c')
+            self.assertEqual(status('new'), ['?? new/x.c', '?? new/y.c'])
+
     def test_the_seal_leaves_null_members_out_and_ignores_key_order(self):
         sealed = sys.modules['facts'].sealed
         self.assertEqual(sealed({'a': 1, 'b': None, 'c': [{'d': None, 'e': 'é'}]})['seal'], sealed({'c': [{'e': 'é'}], 'a': 1})['seal'])

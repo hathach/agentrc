@@ -59,7 +59,7 @@ import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, HOST, Parser, Unusable, bind_repo, git, github_repo, report, run  # noqa: E402
+from facts import FULL_SHA, HOST, Parser, Unusable, bind_repo, git, github_repo, report, run, status  # noqa: E402
 
 
 def origin_of(url):
@@ -102,7 +102,7 @@ def recheck():
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
     return {'branch': branch, 'pushUrls': push_urls(branch)[1], 'head': git('rev-parse', 'HEAD').strip(),
             'staged': records(git('diff', '--cached', '--name-only', '-z')),
-            'status': records(git('status', '--porcelain', '-z', '--untracked-files=all'))}
+            'status': status()}
 
 
 def receipts_dir():
