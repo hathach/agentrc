@@ -142,6 +142,13 @@ class PreflightTest(unittest.TestCase):
         self.git('config', 'remote.origin.gh-resolved', 'base')
         self.assertIn('origin (not a GitHub repository)', self.pin(repo=None)[1]['error'], 'base on a remote off GitHub')
         self.git('config', '--unset', 'remote.origin.gh-resolved')
+        # A worktree's own value overrides the shared one, as git reads it.
+        self.git('config', 'extensions.worktreeConfig', 'true')
+        self.git('config', 'remote.adafruit.gh-resolved', 'sekigon-gonnoc/Pico-PIO-USB')
+        self.git('config', '--worktree', 'remote.adafruit.gh-resolved', 'adafruit/Pico-PIO-USB')
+        self.assertEqual(self.pin(repo=None)[1]['repo'], 'adafruit/Pico-PIO-USB')
+        self.git('config', '--worktree', '--unset', 'remote.adafruit.gh-resolved')
+        self.git('config', '--unset', 'remote.adafruit.gh-resolved')
         for remote in ('adafruit', 'sekigon', 'same'):
             self.git('remote', 'remove', remote)
         self.assertEqual(self.pin(repo=None)[1]['error'], "no remote names a github.com repository: name the PR's repository (--repo OWNER/NAME)")

@@ -78,7 +78,10 @@ def checkout_repo():
     for line in got.splitlines():
         key, _, value = line.partition(' ')
         remote, _, field = key[len('remote.'):].rpartition('.')
-        (urls if field == 'url' else marked).setdefault(remote, value.strip())
+        if field == 'url':
+            urls.setdefault(remote, value.strip())  # git fetches from a remote's first URL
+        else:
+            marked[remote] = value.strip()  # listed system to worktree: the last is git's effective value
     named = ({r: github_repo(urls.get(r, '')) if v == 'base' else v for r, v in marked.items()} if marked
              else {r: n for r, u in urls.items() if (n := github_repo(u))})
     repos = {}
