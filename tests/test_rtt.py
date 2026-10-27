@@ -1328,13 +1328,13 @@ class RttPlatformLifecycle(unittest.TestCase):
 
     def test_symbol_lookup_honors_a_stop_request(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            fake_nm = Path(temp_dir) / 'slow_nm.py'
-            fake_nm.write_text('import time\ntime.sleep(30)\n')
+            fake_nm, started, spawn = self.slow_nm(temp_dir)
             stop = mock.Mock(side_effect=(False, False, True))
-            started = time.monotonic()
-            with self.assertRaises(rtt._StopCapture):
-                rtt.nm_rtt_addr(str(fake_nm), nm=sys.executable, stop=stop)
-        self.assertLess(time.monotonic() - started, 2)
+            begun = time.monotonic()
+            with spawn, self.assertRaises(rtt._StopCapture):
+                rtt.nm_rtt_addr(fake_nm, nm=sys.executable, stop=stop)
+            self.assertIsNotNone(started[0].poll(), 'nm was reaped')
+        self.assertLess(time.monotonic() - begun, 2)
 
     def test_symbol_lookup_reaps_nm_when_interrupted(self):
         class InterruptedNm:
@@ -1364,6 +1364,57 @@ class RttPlatformLifecycle(unittest.TestCase):
             rtt.nm_rtt_addr('fake.elf', nm='fake-nm', stop=lambda: False)
         self.assertTrue(proc.terminated)
         self.assertTrue(proc.reaped)
+
+    def slow_nm(self, temp_dir):
+        """A stub nm that never answers, and the list of the processes nm_rtt_addr starts."""
+        fake_nm = Path(temp_dir) / 'slow_nm.py'
+        fake_nm.write_text('import time\ntime.sleep(30)\n')
+        started, popen = [], subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            started.append(popen(*args, **kwargs))
+            return started[-1]
+        return str(fake_nm), started, mock.patch.object(rtt.subprocess, 'Popen', spawn)
+
+    def test_a_symbol_lookup_that_times_out_reaps_nm(self):
+        for stop in (None, lambda: False):
+            with self.subTest(stop=stop), tempfile.TemporaryDirectory() as temp_dir:
+                fake_nm, started, spawn = self.slow_nm(temp_dir)
+                begun = time.monotonic()
+                with spawn, mock.patch.object(rtt, 'NM_TIMEOUT', 0.3), \
+                        self.assertRaisesRegex(SystemExit, r'did not finish reading .* in 0\.3 s'):
+                    rtt.nm_rtt_addr(fake_nm, nm=sys.executable, stop=stop)
+                self.assertLess(time.monotonic() - begun, 0.3 + 2 * rtt.NM_REAP_GRACE + 1)
+                self.assertIsNotNone(started[0].poll(), 'nm was reaped')
+
+    def test_an_nm_that_outlives_its_kill_is_left_with_a_clear_error(self):
+        class StubbornNm:
+            pid = 4242
+
+            def __init__(self):
+                self.waits, self.signals = [], []
+
+            def communicate(self, timeout=None):
+                self.waits.append(timeout)
+                raise subprocess.TimeoutExpired('fake-nm', timeout)
+
+            def terminate(self):
+                self.signals.append('terminate')
+
+            def kill(self):
+                self.signals.append('kill')
+
+        for stop in (None, mock.Mock(side_effect=(False, True))):
+            with self.subTest(stop=stop):
+                proc = StubbornNm()
+                with mock.patch.object(rtt.subprocess, 'Popen', return_value=proc), \
+                     mock.patch.object(rtt, '_resolve_exe', lambda name: name), \
+                     mock.patch.object(rtt, 'NM_TIMEOUT', 0.2), \
+                     self.assertRaisesRegex(SystemExit, rf'fake-nm \(pid 4242\) still running {rtt.NM_REAP_GRACE} s'):
+                    rtt.nm_rtt_addr('fake.elf', nm='fake-nm', stop=stop)
+                self.assertEqual(proc.signals, ['terminate', 'kill'])
+                self.assertNotIn(None, proc.waits, 'every wait on nm is bounded')
+                self.assertEqual(proc.waits[-2:], [rtt.NM_REAP_GRACE] * 2)
 
     def test_windows_defaults_to_jlink_exe(self):
         with mock.patch.object(rtt, 'IS_WINDOWS', True), \

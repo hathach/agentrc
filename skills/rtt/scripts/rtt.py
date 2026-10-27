@@ -229,53 +229,59 @@ def free_ports(count: int) -> list:
             s.close()
 
 
+NM_TIMEOUT = 30      # s nm gets to read the elf
+NM_REAP_GRACE = 2    # s a stopped nm gets to exit after each of terminate() and kill()
+
+
 def nm_rtt_addr(elf: str, nm: str = None, stop=None) -> int:
     """Control-block address from the FLASHED elf's symbol table. --addr is the way
     out when nm cannot read the file (another architecture, no toolchain)."""
     nm = nm or os.environ.get('RTT_NM', 'arm-none-eabi-nm')
+    stop = stop or (lambda: False)
     try:
         cmd = [_resolve_exe(nm), elf]
-        if stop is None:
-            # errors='replace': an undecodable byte must not crash the check (on Windows
-            # its reader thread died and left stdout/stderr None)
-            r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', timeout=30)
-        else:
-            if stop():
-                raise _StopCapture
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                                    errors='replace')
-            try:
-                deadline = time.monotonic() + 30
-                while True:
-                    if stop():
-                        raise _StopCapture
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise subprocess.TimeoutExpired(cmd, 30)
-                    try:
-                        stdout, stderr = proc.communicate(timeout=min(0.1, remaining))
-                        r = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
-                        break
-                    except subprocess.TimeoutExpired:
-                        pass
-            except BaseException:
-                # Signals and stop-file cancellation must not strand nm after main()
-                # returns. Reap it before preserving the original exception.
-                with contextlib.suppress(OSError):
-                    proc.terminate()
+        if stop():
+            raise _StopCapture
+        # errors='replace': an undecodable byte must not crash the check (on Windows
+        # its reader thread died and left stdout/stderr None)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                errors='replace')
+        try:
+            deadline = time.monotonic() + NM_TIMEOUT
+            while True:
+                if stop():
+                    raise _StopCapture
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, NM_TIMEOUT)
                 try:
-                    proc.communicate(timeout=2)
+                    stdout, stderr = proc.communicate(timeout=min(0.1, remaining))
+                    r = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+                    break
                 except subprocess.TimeoutExpired:
-                    with contextlib.suppress(OSError):
-                        proc.kill()
-                    proc.communicate()
-                raise
-            if stop():
-                raise _StopCapture
+                    pass
+        except BaseException:
+            # Signals, stop-file cancellation and the timeout must not strand nm after
+            # main() returns, nor wait on one in uninterruptible I/O without a bound.
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            try:
+                proc.communicate(timeout=NM_REAP_GRACE)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                try:
+                    proc.communicate(timeout=NM_REAP_GRACE)
+                except subprocess.TimeoutExpired:
+                    raise SystemExit(f'{nm} (pid {proc.pid}) still running {NM_REAP_GRACE} s after its kill; '
+                                     'left behind — pass --addr instead') from None
+            raise
+        if stop():
+            raise _StopCapture
     except FileNotFoundError:
         raise SystemExit(f'{nm} not on PATH — set RTT_NM=<your-nm>, or pass --addr')
     except subprocess.TimeoutExpired:
-        raise SystemExit(f'{nm} did not finish reading {elf} in 30 s — pass --addr instead')
+        raise SystemExit(f'{nm} did not finish reading {elf} in {NM_TIMEOUT} s — pass --addr instead')
     if r.returncode != 0:
         raise SystemExit(f'{nm} could not read {elf}: {r.stderr.strip()[:200]}\n'
                          f'(wrong architecture? set RTT_NM=<your-nm>, or pass --addr)')
