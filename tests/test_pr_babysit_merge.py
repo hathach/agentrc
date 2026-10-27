@@ -316,6 +316,25 @@ class MergeTest(unittest.TestCase):
         self.world.fresh['bots'][1] = bot('copilot', 'settled', None, 'limited')
         self.assertEqual(self.run_it()['outcome'], 'ready', 'Copilot is not a required reviewer')
 
+    def test_only_the_owners_waiver_drops_a_bot_and_never_every_bot(self):
+        # #292: Greptile left out of the launch at the owner's word; CodeRabbit reviewed the head.
+        fp = f'coderabbit,copilot|coderabbit|{"0" * 32}'
+        output = lambda: launch_output(reviews={'fingerprint': fp, 'bots': [bot('coderabbit')]})
+        self.world.fresh = {'headSha': HEAD, 'fingerprint': fp, 'bots': [bot('coderabbit'), bot('copilot', 'absent', None)]}
+        self.assertBlocked(self.run_it(output()), 'did not settle greptile')
+        got = self.run_it(output(), '--waive', 'greptile')
+        self.assertEqual((got['outcome'], got['blockers'], got['waived']), ('ready', [], ['greptile']), got)
+        self.assertEqual(self.world.harvested[-1][2:6], ['--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit'])
+        self.world.fresh['bots'][0] = bot('coderabbit', 'settled', None, 'limited')
+        self.assertBlocked(self.run_it(output(), '--waive', 'greptile', '--merge'), '^coderabbit-unreviewed: ')
+        harvested = len(self.world.harvested)
+        got = self.run_it(output(), '--waive', 'greptile', '--waive', 'coderabbit', '--merge')
+        self.assertBlocked(got, "every review bot is waived .*: a merge needs one bot's review of the head")
+        self.assertEqual((got['waived'], len(self.world.harvested)), (['coderabbit', 'greptile'], harvested))
+        self.assertEqual(self.run_it()['waived'], [], 'no waiver unless named')
+        with self.assertRaises(merge.Unusable):
+            self.run_it(output(), '--waive', 'copilot')
+
     def test_review_evidence_changed_since_the_launch(self):
         self.world.fresh['fingerprint'] = FP[:-1] + '1'
         self.assertBlocked(self.run_it(None, '--merge'), '^fingerprint: .*relaunch a `both` launch')

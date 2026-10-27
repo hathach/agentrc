@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Whether a PR a pr-babysit launch passed is ready to merge, and with --merge, squash-merge it.
 
-  merge.py --pr-url URL --base BRANCH --checkout DIR --output FILE --state-digest D [--merge]
+  merge.py --pr-url URL --base BRANCH --checkout DIR --output FILE --state-digest D [--waive BOT ...] [--merge]
 
 chief's, under its merge exception (agents/chief.md): URL and BRANCH are the PR and base branch the grant names,
 FILE the last launch's saved Workflow output and D its stateDigest. Every condition is read again here: the launch
 (complete, a `both` lane, pass, no blocker launch_result.py reads, no accepted failure, deferral, hold, reply debt
 or pending publication, its state matching D and its own digest, pinned to that PR), one head everywhere (the
 checkout's, the state's, the reviewed one, the reviews', CI's and the PR's), a fresh harvest (harvest.py with the
-launch's reviewers, from its fingerprint: the same fingerprint, CodeRabbit and Greptile both `reviewed` on the head),
+launch's reviewers, from its fingerprint: the same fingerprint, CodeRabbit and Greptile both `reviewed` on the head
+and in its auto-run list, but for a bot --waive names: the owner's word that the merge goes without it, which a bot
+merely left out of auto-run never is; waiving both refuses, a merge needs one bot's review of the head),
 a fresh CI inventory (collect.py with no ignored check: green, mergeable, nothing pending, for the granted base,
 the base branch's required checks each passed on the head from the app it must come from), and the PR (OPEN, not a
 draft, its base and head repositories and branches the bound ones, squash allowed, no merge queue, merge state CLEAN,
@@ -18,8 +20,8 @@ Without --merge nothing is written. With it and no blocker, it runs
 `gh pr merge N -R REPO --squash --match-head-commit HEAD --subject "<title> (#N)" --body ""`, with --admin only on
 BLOCKED, and reads the PR back. Only the head is enforced by GitHub at the merge; the rest is this re-read.
 
-stdout ends with one JSON line {pr, checkedHead, outcome, blockers, admin, requirements, mergeCommit, mergedHead,
-closingIssues, detail, seal}: requirements is what GitHub last reported (mergeStateStatus, mergeable, reviewDecision)
+stdout ends with one JSON line {pr, checkedHead, outcome, blockers, admin, waived, requirements, mergeCommit, mergedHead,
+closingIssues, detail, seal}: waived is the bots --waive named, the record of the owner's waiver; requirements is what GitHub last reported (mergeStateStatus, mergeable, reviewDecision)
 and each required check with the app it must come from and its state on the head, the evidence behind an --admin
 merge; outcome is ready (nothing blocks, nothing merged), not-ready (blockers, or GitHub refused the merge and
 the PR is still open: run it again, which checks everything again), merged (this run's merge, read back), observed-
@@ -175,12 +177,15 @@ def merge_rules(repo, base):
     return blockers
 
 
-def review_blockers(repo, n, fingerprint, head):
+def review_blockers(repo, n, fingerprint, head, waived=()):
+    required = [b for b in BOTS if b not in waived]
+    if not required:
+        return [f"reviews: every review bot is waived ({', '.join(BOTS)}): a merge needs one bot's review of the head"]
     reviewers, auto, _ = (fingerprint.split('|') + ['', '', ''])[:3] if fingerprint else ('', '', '')
     reviewers, auto = [r for r in reviewers.split(',') if r], [r for r in auto.split(',') if r]
-    missing = [b for b in BOTS if b not in auto]
+    missing = [b for b in required if b not in auto]
     if not fingerprint or missing:
-        return [f"reviews: the launch's harvest did not settle {', '.join(missing or BOTS)}"]
+        return [f"reviews: the launch's harvest did not settle {', '.join(missing or required)}"]
     fresh = harvest.collect(['--pr', str(n), '--reviewers', ','.join(reviewers), '--auto-run', ','.join(auto), '--repo', repo])
     blockers = []
     if fresh['headSha'] != head:
@@ -188,7 +193,7 @@ def review_blockers(repo, n, fingerprint, head):
     if fresh['fingerprint'] != fingerprint:
         blockers.append('fingerprint: the review evidence changed since the launch judged it: relaunch a `both` launch on the same state')
     for b in fresh['bots']:
-        if b['bot'] in BOTS and (b['state'], b['sha']) != ('reviewed', head):
+        if b['bot'] in required and (b['state'], b['sha']) != ('reviewed', head):
             blockers.append(f"{b['bot']}-unreviewed: {b['state']}{'/' + b['kind'] if b.get('kind') else ''}: {launch_result.cut(b.get('reason') or '')}")
     return blockers
 
@@ -229,9 +234,9 @@ def readback(repo, n, merged_any):
     return ('uncertain' if merged_any else 'not-ready'), pr
 
 
-def receipt(n, head, outcome, blockers, admin=False, pr=None, detail='', requirements=None):
+def receipt(n, head, outcome, blockers, admin=False, pr=None, detail='', requirements=None, waived=()):
     pr = pr or {}
-    return {'pr': n, 'checkedHead': head, 'outcome': outcome, 'blockers': blockers, 'admin': admin, 'requirements': requirements,
+    return {'pr': n, 'checkedHead': head, 'outcome': outcome, 'blockers': blockers, 'admin': admin, 'waived': list(waived), 'requirements': requirements,
             'mergeCommit': (pr.get('mergeCommit') or {}).get('oid') if outcome in ('merged', 'observed-merged') else None,
             'mergedHead': pr.get('headRefOid') if outcome in ('merged', 'observed-merged') else None,
             'closingIssues': [{'number': i.get('number'), 'state': i.get('state'), 'url': i.get('url')} for i in pr.get('closingIssues') or []],
@@ -245,8 +250,10 @@ def collect(argv):
     p.add_argument('--checkout', required=True)
     p.add_argument('--output', required=True)
     p.add_argument('--state-digest', required=True)
+    p.add_argument('--waive', action='append', default=[], choices=BOTS)
     p.add_argument('--merge', action='store_true')
     a = p.parse_args(argv)
+    waived = sorted(set(a.waive))
     url = pr_identity(a.pr_url)
     if not url:
         raise Unusable(f'--pr-url must be https://github.com/OWNER/REPO/pull/N, not {a.pr_url!r}')
@@ -256,17 +263,17 @@ def collect(argv):
     head = facts['head']
     pr = settled_view(repo, n)
     if pr['state'] == 'MERGED':
-        return receipt(n, head, 'observed-merged', blockers, pr=pr, detail='the PR is already merged')
+        return receipt(n, head, 'observed-merged', blockers, pr=pr, detail='the PR is already merged', waived=waived)
     if pr['state'] == 'CLOSED':
-        return receipt(n, head, 'closed', blockers, pr=pr, detail='the PR is closed')
+        return receipt(n, head, 'closed', blockers, pr=pr, detail='the PR is closed', waived=waived)
     if not FULL_SHA.match(head or ''):
         raise Unusable(f"the launch's state names no full head SHA: {head!r}")
     blockers += pr_blockers(pr, url, a.base, facts['state'])
     if pr['headRefOid'] != head:
         blockers.append(f"github: the PR head is {pr['headRefOid']}, not the launch's {head}: it rejoins through adoptHead and needs fresh reviews")
-        return receipt(n, head, 'not-ready', blockers, pr=pr, detail='the head moved: reviews, CI and required checks were not inspected')
+        return receipt(n, head, 'not-ready', blockers, pr=pr, detail='the head moved: reviews, CI and required checks were not inspected', waived=waived)
     blockers += merge_rules(repo, a.base)
-    blockers += review_blockers(repo, n, facts['fingerprint'], head)
+    blockers += review_blockers(repo, n, facts['fingerprint'], head, waived)
     ci, checks = ci_blockers(repo, n, head, a.base)
     blockers += ci
     # Read just before merging: the checks above take a while, and the PR may have been retargeted or moved meanwhile.
@@ -280,7 +287,7 @@ def collect(argv):
     requirements = {'mergeStateStatus': last['mergeStateStatus'], 'mergeable': last['mergeable'],
                     'reviewDecision': last.get('reviewDecision'), 'requiredChecks': checks}
     if blockers or not a.merge:
-        return receipt(n, head, 'not-ready' if blockers else 'ready', blockers, admin=admin and not blockers, pr=last, requirements=requirements)
+        return receipt(n, head, 'not-ready' if blockers else 'ready', blockers, admin=admin and not blockers, pr=last, requirements=requirements, waived=waived)
     cmd = ['gh', 'pr', 'merge', str(n), '-R', repo, '--squash', '--match-head-commit', head,
            '--subject', f"{last['title']} (#{n})", '--body', '', *(['--admin'] if admin else [])]
     code, out, err = attempt(*cmd)
@@ -290,7 +297,7 @@ def collect(argv):
     outcome, after = readback(repo, n, ours)
     detail = f"gh pr merge exited {code}{': ' + launch_result.cut(said[-1]) if said else ''}"
     refused = [f'github: the merge was refused: {detail}'] if outcome == 'not-ready' else []
-    return receipt(n, head, outcome, refused, admin=admin, pr=after or last, detail=detail, requirements=requirements)
+    return receipt(n, head, outcome, refused, admin=admin, pr=after or last, detail=detail, requirements=requirements, waived=waived)
 
 
 if __name__ == '__main__':

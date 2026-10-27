@@ -34,10 +34,11 @@ python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--
 python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
 python3 $S/state_transfer.py <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
 python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
-python3 $S/merge.py --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--merge]  # chief's merge gate; inspects without --merge
+python3 $S/merge.py --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
 ```
 
-`merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception.
+`merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception, and `--waive` only on the owner's word that
+the merge goes without that bot; a bot left out of `autoRun` alone is never waived, and waiving both is refused.
 
 After an agentrc update, launch the workflow from the installed file (Workflow
 `scriptPath: ~/.claude/workflows/pr-babysit.js`), not by its name in a session
