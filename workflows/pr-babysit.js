@@ -316,6 +316,7 @@ if (args.state !== undefined && args.state !== null) {
       (st.reviewClock.greptileAt == null || Number.isFinite(Date.parse(st.reviewClock.greptileAt))) &&
       (st.reviewClock.request === undefined || (st.reviewClock.request && Number.isFinite(Date.parse(st.reviewClock.request.retryAt)) &&
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
+      (st.reviewClock.requestUnposted === undefined || st.reviewClock.requestUnposted === true) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
         Object.values(st.reviewClock.unknown).every(u => u && typeof u.reading === 'string' && Number.isFinite(Date.parse(u.since)))))))
   if (!shaped) throw new Error(`state is not a pr-babysit state of version ${STATE_VERSION}`)
@@ -610,7 +611,7 @@ const TRIGGER = withSeal({
   required: ['outcome', 'detail', 'at'],
   properties: {
     error: { type: 'string' }, outcome: { type: 'string' }, detail: { type: 'string' }, at: { type: 'string' },
-    retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] },
+    retryAt: { type: ['string', 'null'] }, commentId: { type: ['integer', 'null'] }, phase: { type: ['string', 'null'] },
   },
 })
 const ADOPT_AUDIT = withSeal({
@@ -884,7 +885,8 @@ let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
 // When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
 // triggeredAt: absent until this head's one CodeRabbit trigger, then when the script finished, or null when it failed.
-// greptileAt the same for its one `@greptileai` request.
+// greptileAt the same for its one `@greptileai` request. requestUnposted: a CodeRabbit request failed before its POST and was
+// tried once more, the retry it gets.
 let reviewClock = restored ? restored.reviewClock : null
 // Latched by the first launch with greptileTrigger: from then on every head of this run needs Greptile's review, whatever
 // later launches pass; only posting the request stays with the switch.
@@ -2033,6 +2035,11 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   if (await ended('crrequest')) return
   const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
     ['requested', 'already', 'notDue', 'notLimited', 'failed'])
+  // A failure before the POST posted nothing (#276): one more try, behind the script's own `already` check. One that may have posted is final.
+  if (outcome === 'failed' && t && t.phase === 'read' && !reviewClock.requestUnposted) {
+    reviewClock.requestUnposted = true
+    return retryLater(cr, cycle, 0)
+  }
   const atOk = !!t && Number.isFinite(Date.parse(t.at))
   const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
   if (outcome === 'notDue' && reset && atOk) return retryLater(cr, cycle, Math.max(0, Date.parse(reset) - Date.parse(t.at)))

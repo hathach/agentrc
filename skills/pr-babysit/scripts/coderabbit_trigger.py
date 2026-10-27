@@ -31,15 +31,18 @@ after the reset). The outcome:
               (retryAt null): nothing posted
   notLimited  the PR is not open, SHA is not its head (both read again just
               before posting), or CodeRabbit is not rate-limited on it
-  failed      the post failed or reads back otherwise
+  failed      a read before the post, the post or its read-back failed
 
-and the line adds retryAt, the reset it read, null when it read none.
+and the line adds retryAt, the reset it read, null when it read none. A failed
+line adds phase: `read` when it failed before the POST, so nothing was posted;
+`post` when the POST or its read-back failed, so the comment may stand.
 
 detail names the comment ("comment N") on ticked, already and requested, and
 commentId is its id there; at is the UTC time the script finished, or the
 request comment's time on requested and already. stdout ends with one JSON line
 {outcome, detail, at, commentId?, seal} (seal: facts.sealed). Exit 2 with {"error": ...} when the arguments are wrong or
-GitHub's answer cannot be read. A rerun after a lost line reports `already`.
+GitHub's answer cannot be read (with --request, a read that fails before the POST is a failed line instead). A rerun
+after a lost line reports `already`.
 """
 
 import json
@@ -56,7 +59,9 @@ REQUEST = '@coderabbitai review'
 
 
 class Failed(Exception):
-    pass
+    def __init__(self, why, phase='post'):
+        super().__init__(why)
+        self.phase = phase
 
 
 def skipped(pr, head):
@@ -113,25 +118,37 @@ def unopened(pr, head):
     return pull_at(pr, head)[1]
 
 
-def request(repo, pr, head):
+def unasked(repo, pr, head):
+    """(None, the retryAt member) when the request is to be posted now, else (the outcome, None); it only reads."""
     why = unopened(pr, head)
     if why:
-        return {'outcome': 'notLimited', 'detail': why}
+        return {'outcome': 'notLimited', 'detail': why}, None
     seen = observe(repo, pr, ['coderabbit'], ['coderabbit'])
     cr = seen['bots'][0]
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
-        return {'outcome': 'notLimited', 'detail': f"CodeRabbit is {cr['state']}{f'/' + cr['kind'] if cr['kind'] else ''} on {seen['headSha'][:9]}: {cr['reason']}"}
+        return {'outcome': 'notLimited', 'detail': f"CodeRabbit is {cr['state']}{f'/' + cr['kind'] if cr['kind'] else ''} on {seen['headSha'][:9]}: {cr['reason']}"}, None
     reset = {'retryAt': cr['retryAt']}
     if cr['retryAt'] is None or stamp(cr['retryAt']) > stamp(seen['observedAt']):
-        return {'outcome': 'notDue', 'detail': cr['reason'], **reset}
-    path = f'repos/{{owner}}/{{repo}}/issues/{pr}/comments'
-    asked = [c for c in pages(path) if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= stamp(cr['retryAt'])]
+        return {'outcome': 'notDue', 'detail': cr['reason'], **reset}, None
+    asked = [c for c in pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
+             if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= stamp(cr['retryAt'])]
     if asked:
-        return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}
+        return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}, None
     # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
     why = unopened(pr, head)
     if why:
-        return {'outcome': 'notLimited', 'detail': why}
+        return {'outcome': 'notLimited', 'detail': why}, None
+    return None, reset
+
+
+def request(repo, pr, head):
+    try:
+        out, reset = unasked(repo, pr, head)
+    except Unusable as e:
+        raise Failed(str(e), 'read')
+    if out:
+        return out
+    path = f'repos/{{owner}}/{{repo}}/issues/{pr}/comments'
     code, out, err = attempt('gh', 'api', '-X', 'POST', path, '-f', f'body={REQUEST}')
     if code:
         raise Failed(f'gh api {path}: {err.strip() or f"exit {code}"}')
@@ -158,7 +175,7 @@ def collect(argv):
     try:
         out = request(repo, a.pr, a.head) if a.request else trigger(a.pr, a.head)
     except Failed as e:
-        out = {'outcome': 'failed', 'detail': str(e)}
+        out = {'outcome': 'failed', 'detail': str(e), **({'phase': e.phase} if a.request else {})}
     except (KeyError, TypeError, AttributeError) as e:
         raise Unusable(f'gh answered in a shape coderabbit_trigger.py does not read ({e!r})')
     if a.request:

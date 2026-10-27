@@ -230,9 +230,24 @@ class Request(unittest.TestCase):
         for what, rig in (('post failed', RequestRig(post_code=1)), ('read back differs', RequestRig(readback='something else'))):
             with self.subTest(what):
                 code, out = self.run_with(rig)
-                self.assertEqual((code, out['outcome'], out['retryAt']), (0, 'failed', None))
+                self.assertEqual((code, out['outcome'], out['retryAt'], out['phase']), (0, 'failed', None, 'post'), 'it may have posted')
                 self.assertNotIn('commentId', out)
                 self.assertIsInstance(out['detail'], str)
+
+    def test_a_read_that_fails_before_the_post_says_nothing_was_posted(self):
+        # #276: a 503 on the pull read, which comes before the POST.
+        rig = RequestRig()
+
+        def unavailable(*argv, ok=(0,)):
+            raise trigger.Unusable('gh api repos/{owner}/{repo}/pulls/7: gh: HTTP 503')
+        rig.run = unavailable
+        code, out = self.run_with(rig)
+        self.assertEqual((code, out['outcome'], out['phase'], out['detail']), (0, 'failed', 'read', 'gh api repos/{owner}/{repo}/pulls/7: gh: HTTP 503'))
+        self.assertEqual(rig.posts, [])
+        mine = {'id': 50, 'body': '@coderabbitai review', 'created_at': '2026-10-13T10:56:00Z'}
+        self.assertEqual(self.run_with(retry := RequestRig(comments=[mine]))[1]['outcome'], 'already', 'a retry still finds a standing request first')
+        self.assertEqual(retry.posts, [])
+        self.assertNotIn('phase', self.run_with(RequestRig())[1], 'only a failed line has a phase')
 
 
 if __name__ == '__main__':

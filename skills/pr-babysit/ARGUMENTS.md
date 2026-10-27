@@ -37,7 +37,9 @@ listed here throws before anything runs.
   skipped that way, then waits for the review up to the silent-bot cap. Once
   per head too, when CodeRabbit is rate-limited with a reset time under an
   hour away, naps until the reset and comments `@coderabbitai review` (a limit
-  notice has no box), then waits the same way. The first launch with the
+  notice has no box), then waits the same way; a request that failed before
+  its post, so posted nothing, is tried once more, one that may have posted is
+  not. The first launch with the
   switch latches the run, as `greptileTrigger` does: every later head needs
   CodeRabbit's review, a launch without the switch waits on an earlier ask and
   asks nothing, and a head left unreviewed (a failed tick, no review within

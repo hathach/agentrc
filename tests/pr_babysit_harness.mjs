@@ -7286,6 +7286,37 @@ test('a fresh limit after the request, or a request that failed, stops CodeRabbi
   }
 })
 
+test('a request that failed before its POST is asked once more; one that may have posted, or a second such failure, is final (#276)', async () => {
+  const unposted = { outcome: 'failed', detail: 'gh api repos/{owner}/{repo}/pulls/263: gh: HTTP 503', retryAt: null, phase: 'read' }
+  let n = 0
+  const once = await run({
+    args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 21,
+    crRequest: (label) => label === 'crrequest#2' ? unposted : { outcome: 'requested', detail: 'comment 99', commentId: 99, retryAt: at(20) },
+    reviewsPerCycle: () => quiet([++n < 4 ? limitedCr(at(20)) : bot('coderabbit')]),
+  })
+  assert.equal(once.result.pass, true, once.result.reason)
+  assert.deepEqual(requests(once.labels), ['crrequest#2', 'crrequest#3'])
+  assert.ok(once.logs.includes(`cycle 2: crrequest#2: failed (${unposted.detail})`), once.logs.join('\n'))
+  assert.ok(once.logs.includes('cycle 3: crrequest#3: requested (comment 99)'), once.logs.join('\n'))
+  for (const [name, crRequest, want] of [['twice', unposted, ['crrequest#2', 'crrequest#3']], ['posted', { ...unposted, phase: 'post' }, ['crrequest#2']],
+    ['no phase', { ...unposted, phase: undefined }, ['crrequest#2']]]) {
+    const { result, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 5 }, minutesPerCycle: 21, crRequest, reviews: quiet([limitedCr(at(20))]) })
+    assert.equal(result.reason, 'coderabbit-unreviewed', name)
+    assert.deepEqual(requests(labels), want, name)
+    assert.equal(result.state.reviewClock.request.at, null, name)
+    assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'request', at: null }] }, `${name}: a relaunch asks nothing`)
+  }
+  // The retry carries across a resume: a launch out of cycles leaves it to the relaunch, which asks once.
+  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 1 }, clockOffset: 21, crRequest: unposted, reviews: quiet([limitedCr(at(20))]) })
+  assert.equal(a.result.state.reviewClock.requestUnposted, true)
+  assert.equal(a.result.state.reviewClock.request, undefined)
+  assert.deepEqual(a.result.coderabbitAsk, { relaunchAsks: 'request', asked: [], retryAt: at(20) })
+  const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, state: a.result.state }, clockOffset: 22, crRequest: unposted, reviews: quiet([limitedCr(at(20))]) })
+  assert.deepEqual(requests(b.labels), ['crrequest#2'])
+  assert.equal(b.result.state.reviewClock.request.at, null, 'its second unposted failure is final')
+  await assert.rejects(run({ args: { maxCycles: 3, state: seal({ ...a.result.state, reviewClock: { ...a.result.state.reviewClock, requestUnposted: 1 } }) } }), /not a pr-babysit state/)
+})
+
 test('after a request, the same limit or a queued review waits from the request, and notLimited waits for the next harvest', async () => {
   // The limit is its reset time: other evidence around the same reset is the same limit.
   let m = 0
