@@ -1647,7 +1647,7 @@ class EnumerationComplete(unittest.TestCase):
 
     def test_an_adapter_with_one_index_page_reports_its_failure(self):
         cases = {vendor_allwinner: lambda *a, **k: b'<html>' + b' ' * 3000,
-                 vendor_wch: lambda *a, **k: b'{"code": 1}',
+                 vendor_wch: lambda *a, **k: b'{"code": 0, "message": null, "data": null}',
                  vendor_st: lambda *a, **k: b'{"rows": []}'}
         self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
         sleep = unittest.mock.patch.object(vendor_st.time, 'sleep', lambda s: None)
@@ -1658,6 +1658,18 @@ class EnumerationComplete(unittest.TestCase):
                 self.patch(mod)
                 self.assertFalse(self.complete(mod, self.fails, refresh=True))
                 self.assertTrue(self.complete(mod, answers, refresh=True))
+
+    def test_wch_reports_an_unsuccessful_answer_from_a_related_page(self):
+        # The seed answers; the page it links to answers with an error code instead.
+        def http_get(url, *a, **k):
+            if 'CH32V307DS0_PDF' in url:
+                return json.dumps({'code': 0, 'data': {
+                    'id': 1, 'name': 'CH32V307DS0.PDF', 'content': 'CH32V307 datasheet',
+                    'relationFileList': [{'name': 'CH32FV2x_V3xRM.PDF'}]}}).encode()
+            return b'{"code": 500, "message": "busy", "data": null}' if 'V3XRM' in url.upper() else \
+                b'{"code": 0, "message": null, "data": null}'
+        self.patch(vendor_wch, SEEDS=['CH32V307DS0_PDF.html'])
+        self.assertFalse(self.complete(vendor_wch, http_get))
 
     def test_st_falls_back_to_its_cached_grid(self):
         self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')

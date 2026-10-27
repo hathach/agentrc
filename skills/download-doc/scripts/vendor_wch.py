@@ -67,7 +67,13 @@ def _fetch(file_name: str) -> dict | None:
         ENUMERATION_COMPLETE = False
         return None
     j = json.loads(d)
-    return j.get("data") if j.get("code") == 0 else None
+    # An unknown name is {"code": 0, "data": null} (seen 2026-10-27); any other code is a
+    # failure that proves nothing about the page.
+    if j.get("code") != 0:
+        print(f"  {file_name}: API answered code {j.get('code')!r}: {j.get('message')}", file=sys.stderr)
+        ENUMERATION_COMPLETE = False
+        return None
+    return j.get("data")
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
