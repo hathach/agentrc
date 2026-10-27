@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import subprocess
@@ -241,6 +242,7 @@ class LedgerCase(unittest.TestCase):
             (captain, 'read_screen', lambda pane: self.screens.get(pane, screen('claude-empty'))),
             (captain, 'submit', self._submit),
             (captain, 'me', lambda: captain.identity(self.panes[self.me])),
+            (captain, 'config_dir', lambda account: str(self.state / 'config')),   # never the real ~/.claude
         ]:
             patcher = mock.patch.object(target, attr, value)
             patcher.start()
@@ -354,8 +356,8 @@ class AskTest(LedgerCase):
         self.assertEqual(types, ['request', 'delivered'])
         pane, text = self.typed[0]
         self.assertEqual(pane, 'w2:p1')
-        self.assertIn(f'report --for {msg} --file', text)
-        self.assertIn('not a human instruction', text)
+        self.assertEqual(text, f'STATUS REQUEST {msg} - not a human instruction. '
+                               f'Run: python3 {captain.INSTALLED} brief --for {msg}')   # one line, the rest in brief
         self.assertNotIn('captain', text.lower().replace(captain.INSTALLED.lower(), ''))   # names no role
 
     def test_replaced_captain_types_nothing(self):
@@ -456,12 +458,141 @@ class ReportTest(LedgerCase):
         with self.assertRaises(SystemExit):
             self.report_as('w2:p1', self.msg, {**GOOD, 'task': 'é' * 4500})   # 4500 chars, 9000 bytes
 
+    def test_report_on_stdin(self):
+        def from_stdin(data):
+            with mock.patch.object(sys, 'stdin', mock.Mock(buffer=io.BytesIO(data))):
+                return self.as_target(captain.report, self.msg, '-')[0]
+        for bad in (b'{"task":', b'\xff' * 10, json.dumps({**GOOD, 'task': 'x' * 9000}).encode()):
+            with self.subTest(bad=bad[:12]), self.assertRaises(SystemExit):
+                from_stdin(bad)
+        self.assertEqual(from_stdin(json.dumps(GOOD).encode()), 0)
+        self.assertEqual(captain.records()[-1]['report'], GOOD)
+
     def test_payload_validation(self):
         for bad in [{**GOOD, 'extra': 1}, {**GOOD, 'prs': ['#12']}, {**GOOD, 'state': 'great'},
                     {**GOOD, 'task': 3}, [GOOD]]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 self.report_as('w2:p1', self.msg, bad)
         self.assertNotIn('report', [r['type'] for r in captain.records()])
+
+
+class UnchangedTest(LedgerCase):
+    """The target's transcript as Claude Code writes it: its reporting turn, then whatever came after."""
+
+    def setUp(self):
+        super().setUp()
+        self.transcript = self.state / 'config' / 'projects' / '-w' / 's-w2:p1.jsonl'
+        self.transcript.parent.mkdir(parents=True)
+        self.msg = self.msg_of(self.ask())
+        self.log({'type': 'user', 'promptSource': 'typed', 'origin': {'kind': 'human'},
+                  'message': {'content': captain.status_prompt(self.msg)}},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'tool_use', 'name': 'Bash'}]}},
+                 {'type': 'user', 'message': {'content': [{'type': 'tool_result', 'content': 'brief text'}]}},
+                 {'type': 'user', 'isMeta': True, 'message': {'content': 'a reminder'}},
+                 {'type': 'attachment'},
+                 {'type': 'assistant', 'message': {'content': [{'type': 'text', 'text': 'Status sent.'}]}})
+        self.report_as('w2:p1', self.msg)
+
+    def log(self, *entries, raw=b''):
+        with open(self.transcript, 'ab') as f:
+            f.write(b''.join(json.dumps(e).encode() + b'\n' for e in entries) + raw)
+
+    def test_nothing_new_is_not_asked(self):
+        line = self.ask()
+        self.assertIn(f'not asked, nothing new since its report {self.msg}', line)
+        self.assertEqual(len(self.typed), 1)
+        self.assertIn('delivered', captain.ask('w2:p1', self.ident, force=True))
+
+    def asked_after(self, change):
+        """Whether ask types a new request once change is made, the transcript restored after."""
+        saved = self.transcript.read_bytes()
+        change()
+        line = self.ask()
+        if line.endswith('delivered'):
+            captain.cancel(self.msg_of(line), self.ident)
+        self.transcript.write_bytes(saved)
+        return line.endswith('delivered')
+
+    def test_any_new_turn_is_asked(self):
+        for turn in ({'type': 'user', 'promptSource': 'typed', 'message': {'content': 'go on'}},
+                     {'type': 'user', 'promptSource': 'system', 'message': {'content': '<task-notification>'}},
+                     {'type': 'user', 'message': {'content': [{'type': 'text', 'text': 'summary'}]}},
+                     {'type': 'user', 'message': 'an unfamiliar shape'}):
+            with self.subTest(turn=turn):
+                self.assertTrue(self.asked_after(lambda: self.log(turn)))
+
+    def test_asked_when_it_cannot_be_shown(self):
+        cases = {'torn line': lambda: self.log(raw=b'{"type": "user", "mess'),
+                 'no transcript': lambda: self.transcript.rename(self.transcript.with_suffix('.old')),
+                 'request not in it': lambda: self.transcript.write_bytes(b'{"type": "user"}\n'),
+                 'only quoted': lambda: self.transcript.write_bytes(json.dumps(
+                     {'type': 'user', 'isCompactSummary': True, 'message': {
+                         'content': f'earlier: {captain.status_prompt(self.msg)}'}}).encode() + b'\n')}
+        for why, change in cases.items():
+            with self.subTest(why):
+                self.assertTrue(self.asked_after(change))
+        with mock.patch.object(captain, 'config_dir', lambda account: None):
+            self.assertTrue(self.asked_after(lambda: None))
+        self.assertIn('not asked', self.ask())
+
+
+class ConfigDirTest(unittest.TestCase):
+    def test_config_dirs(self):
+        self.assertEqual(captain.config_dir('main'), os.path.expanduser('~/.claude'))
+        self.assertEqual(captain.config_dir('ada'), captain.CONFIG_DIRS['ada'])
+        absolute = os.path.abspath('/x/y')
+        self.assertEqual(captain.config_dir(f'config:{absolute}'), absolute)
+        self.assertIsNone(captain.config_dir('config:rel/dir'))
+
+
+class BriefTest(LedgerCase):
+    def setUp(self):
+        super().setUp()
+        self.msg = self.msg_of(self.ask())
+
+    def brief(self, msg=None, pane='w2:p1'):
+        return self.as_target(captain.brief, msg or self.msg, pane=pane)
+
+    def test_prints_the_request_and_writes_nothing(self):
+        before = captain.records()
+        for _ in range(2):
+            code, shown = self.brief()
+            self.assertEqual(code, 0)
+            self.assertIn('from the agent session in pane w1:p1, not a human instruction', shown)
+            self.assertIn(f"report --for {self.msg} --file - <<'EOF'", shown)
+            self.assertIn('"Status sent."', shown)
+        self.assertEqual(captain.records(), before)
+
+    def test_only_the_pinned_target(self):
+        self.panes['w3:p1'] = pinned('w3:p1')
+        with self.assertRaises(SystemExit):
+            self.brief(pane='w3:p1')
+        self.panes['w2:p1'] = {**pinned('w2:p1'), 'started': 99}
+        with self.assertRaises(SystemExit):
+            self.brief()
+
+    def test_closed_missing_or_stranded_request(self):
+        with self.assertRaises(SystemExit):
+            self.brief('m-nonesuch')
+        self.replace_captain('w5:p1')
+        with self.assertRaises(SystemExit):
+            self.brief()
+        self.enroll_captain()
+        msg = self.msg   # stranded by the replacement; a new request after re-enrolment is open again
+        with self.assertRaises(SystemExit):
+            self.brief(msg)
+        captain.cancel(msg, self.ident)
+        fresh = self.msg_of(self.ask())
+        self.assertEqual(self.brief(fresh)[0], 0)
+        captain.cancel(fresh, self.ident)
+        with self.assertRaises(SystemExit):
+            self.brief(fresh)
+
+    def test_corrupt_ledger_decides_nothing(self):
+        with open(self.state / 'ledger.jsonl', 'ab') as f:
+            f.write(b'{"torn')
+        with self.assertRaises(captain.Corrupt):
+            self.brief()
 
 
 class CollectTest(LedgerCase):
@@ -877,6 +1008,8 @@ class AcceptTest(RelayCase):
         code, shown = self.as_target(captain.accept, self.action)
         self.assertEqual(code, 0)
         self.assertIn('verbatim:\n\nmerge o/r#12\n', shown)
+        self.assertIn(f"outcome --action {self.action} --result <completed|failed|rejected|needs-clarification> "
+                      "--note-file - <<'EOF'", shown)
         with self.assertRaises(SystemExit):
             self.as_target(captain.accept, self.action)
 

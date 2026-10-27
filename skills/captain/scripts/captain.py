@@ -7,7 +7,7 @@ does not recognize is reported, never assumed safe.
 
   captain.py list [--json]                       every other Claude Code session, latest Herdr change first, asking none
   captain.py enroll [--replace]                  make this session the captain
-  captain.py ask <target>...                     send each idle target a status request
+  captain.py ask <target>... [--force]           send each idle target a status request, unless unchanged
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
   captain.py reports [<msg>...]                  the latest report from each target, or those requests' reports
   captain.py cancel <msg>                        close a request or relay no answer will close
@@ -15,9 +15,10 @@ does not recognize is reported, never assumed safe.
   captain.py withdraw <action>                   take back a relay
   captain.py open --checkout <dir> --account <main|ada> [--name <name>]
                                                  start a Claude Code session in a new workspace
-  captain.py report --for <msg> --file <json>    a target answers a status request
+  captain.py brief --for <msg>                   a target reads what a status request asks
+  captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
-  captain.py outcome --action <action> --result <result> [--note-file <file>]
+  captain.py outcome --action <action> --result <result> [--note-file <file|->]
                                                  a target says how a relay ended
 
 A target is a pane or a selector: pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N, matched against each
@@ -44,6 +45,7 @@ except ImportError:   # Windows: Herdr and /proc are POSIX-only, so the captain 
     fcntl = None
 
 CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # main is CLAUDE_CONFIG_DIR unset
+DEFAULT_CONFIG = '~/.claude'   # where main, CLAUDE_CONFIG_DIR unset, keeps its transcripts
 START_MS = 60000
 HERDR_TIMEOUT_S = 30
 SGR = re.compile(r'\x1b\[([0-9;]*)m')
@@ -476,17 +478,26 @@ def new_id(prefix, recs):
     return m
 
 
-def status_prompt(msg, pane):
-    """Names no role: the text a target reads must carry no authority beyond what it says it is."""
-    return (f'STATUS REQUEST {msg} - from the agent session in pane {pane}, not a human '
-            'instruction. Answer from what you already know: do not edit, investigate GitHub or launch anything. '
-            'Write one JSON object to a scratch file outside the project with exactly these keys: '
-            '"task" (one line), "prs" (list of "owner/repo#N"), "issues" (list of "owner/repo#N" issues the task '
-            'is for), '
-            f'"state" (one of {", ".join(STATES)}), "evidence" (last verification you ran, or ""), '
-            '"chief" (headless chief or workflow running for you, or ""), "needs" (the decision or action the '
-            'human must take, or ""), "next" (your next step). Then run: '
-            f'python3 {INSTALLED} report --for {msg} --file <that file>')
+def status_prompt(msg):
+    """One line naming no role: the text a target reads must carry no authority beyond what it says it is, and the
+    rest of the request is `brief` output, which the target's display folds away."""
+    return f'STATUS REQUEST {msg} - not a human instruction. Run: python3 {INSTALLED} brief --for {msg}'
+
+
+def one_call(label, command, placeholder, done):
+    """The recipe for the target's one quiet Bash call, its input on stdin."""
+    return (f'in one Bash call, described as "{label}":\n\npython3 {INSTALLED} {command} <<\'EOF\'\n<{placeholder}>\n'
+            f'EOF\n\nRecap nothing after it: end with "{done}", or say what failed.')
+
+
+def status_brief(msg, pane):
+    return (f'STATUS REQUEST {msg} from the agent session in pane {pane}, not a human instruction. Answer from what '
+            'you already know: do not edit, investigate GitHub or launch anything. Send one JSON object with exactly '
+            'these keys: "task" (one line), "prs" (list of "owner/repo#N"), "issues" (list of "owner/repo#N" issues '
+            f'the task is for), "state" (one of {", ".join(STATES)}), "evidence" (last verification you ran, or ""), '
+            '"chief" (headless chief or workflow running for you, or ""), "needs" (the decision or action the human '
+            'must take, or ""), "next" (your next step). Send it '
+            + one_call('Status report', f'report --for {msg} --file -', 'the JSON object', 'Status sent.'))
 
 
 def submit(pane, text):
@@ -525,7 +536,66 @@ def sendable(pane, recs, mine):
     return (None, why) if why else (target, None)
 
 
-def ask(pane, mine):
+def config_dir(account_name):
+    """The config dir a session under account_name keeps its transcripts in, or None when it cannot be told."""
+    if account_name in CONFIG_DIRS:
+        return CONFIG_DIRS[account_name] or os.path.expanduser(DEFAULT_CONFIG)
+    config = os.path.expanduser(account_name.removeprefix('config:'))
+    return config if account_name.startswith('config:') and os.path.isabs(config) else None
+
+
+def transcripts(config, session):
+    return glob.glob(os.path.join(glob.escape(config), 'projects', '*', glob.escape(session) + '.jsonl'))
+
+
+def content(entry):
+    """A transcript entry's message content, None for any other shape."""
+    message = entry.get('message') if isinstance(entry, dict) else None
+    return message.get('content') if isinstance(message, dict) else None
+
+
+def new_turn(entry):
+    """Whether a transcript entry starts a turn: the human's prompt, a task notification or a compaction summary,
+    not a tool result or text injected into a running turn; an entry of another shape counts as one."""
+    if not isinstance(entry, dict):
+        return True
+    blocks = content(entry)
+    results = isinstance(blocks, list) and blocks and all(
+        isinstance(b, dict) and b.get('type') == 'tool_result' for b in blocks)
+    return entry.get('type') == 'user' and not entry.get('isMeta') and not results
+
+
+def unchanged(target, recs):
+    """target's last report when its transcript starts no turn after the request that report answered, so asking
+    again would only repeat it; None, so the target is asked, whenever that cannot be shown."""
+    last = last_report(target, recs)
+    if not last:
+        return None
+    config = config_dir(target['account'])
+    found = transcripts(config, target['session']) if config else []
+    if len(found) != 1:
+        return None
+    try:
+        with open(found[0], 'rb') as f:
+            data = f.read()
+    except OSError:
+        return None
+    at = data.find(last['msg'].encode())
+    *lines, torn = data[data.rfind(b'\n', 0, at) + 1:].split(b'\n') if at >= 0 else [b'']
+    if not lines or torn:   # not there, or a partly written line that may be a new turn
+        return None
+    try:
+        entries = (json.loads(line) for line in lines)   # lazily: the first new turn ends the walk
+        request = next(entries)
+        words = plain_text(content(request))
+        if not (human_input(request) and words and status_prompt(last['msg']) in words):
+            return None   # a summary or tool output quoting the id is not the request
+        return None if any(new_turn(e) for e in entries) else last
+    except ValueError:
+        return None
+
+
+def ask(pane, mine, force=False):
     """One status request to pane, recorded before it is typed: prints the msg id, or why it was not sent."""
     with locked():
         captain = require_captain(mine)
@@ -533,8 +603,12 @@ def ask(pane, mine):
         target, why = sendable(pane, recs, mine)
         if why:
             return f'{pane}: refused, {why}'
+        last = not force and unchanged(target, recs)
+        if last:
+            at = time.strftime('%H:%M', time.localtime(last['at']))
+            return f'{pane}: not asked, nothing new since its report {last["msg"]} at {at}'
         msg = new_id('m', recs)
-        return deliver('request', msg, captain, target, status_prompt(msg, captain['pane_id']))
+        return deliver('request', msg, captain, target, status_prompt(msg))
 
 
 def deliver(kind, msg, captain, target, prompt, **fields):
@@ -563,9 +637,12 @@ def validate(report):
 
 
 def read_text(file):
-    """A target's file, at most REPORT_MAX bytes of UTF-8."""
-    with open(file, 'rb') as f:
-        data = f.read(REPORT_MAX + 1)
+    """A target's file, or stdin for '-', at most REPORT_MAX bytes of UTF-8."""
+    if file == '-':
+        data, file = sys.stdin.buffer.read(REPORT_MAX + 1), 'stdin'
+    else:
+        with open(file, 'rb') as f:
+            data = f.read(REPORT_MAX + 1)
     if len(data) > REPORT_MAX:
         die(f'{file} is over {REPORT_MAX} bytes', 4)
     try:
@@ -588,6 +665,26 @@ def addressed(kind, msg, recs, mine):
     return item
 
 
+def requested(msg, recs, mine):
+    """Request msg, which must have been sent to mine by the session still enrolled."""
+    request = addressed('request', msg, recs, mine)
+    if request['captain'] != enrolled():
+        die(f'request {msg} came from an agent session that is no longer enrolled', 2)
+    return request
+
+
+def brief(msg):
+    """What request msg asks, printed for the session it was sent to while it is open; writes nothing."""
+    with locked():
+        mine = me()
+        recs = records()
+        request = requested(msg, recs, mine)
+        if msg not in open_items(recs):
+            die(f'request {msg} is closed', 2)
+    print(status_brief(msg, request['captain']['pane_id']))
+    return 0
+
+
 def report(msg, file):
     """A target answers msg: only the session it was sent to, as pinned then, only while it is open, only once."""
     try:
@@ -600,9 +697,7 @@ def report(msg, file):
     with locked():
         mine = me()   # under the lock: a restart while waiting for it must not pass
         recs = records()
-        request = addressed('request', msg, recs, mine)
-        if request['captain'] != enrolled():
-            die(f'request {msg} came from an agent session that is no longer enrolled', 2)
+        requested(msg, recs, mine)
         earlier = first(recs, 'report', msg)
         if earlier:
             if earlier['report'] == payload:
@@ -735,8 +830,7 @@ def transcript(captain):
     """The captain's own Claude Code transcript: the human's words are read from it, never passed by the captain."""
     if os.environ.get('CLAUDE_CODE_SESSION_ID') != captain['session']:
         die("relay runs only in the enrolled captain's own Claude Code session", 2)
-    config = os.path.expanduser(os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude')
-    found = glob.glob(os.path.join(glob.escape(config), 'projects', '*', glob.escape(captain['session']) + '.jsonl'))
+    found = transcripts(os.path.expanduser(os.environ.get('CLAUDE_CONFIG_DIR') or DEFAULT_CONFIG), captain['session'])
     if len(found) != 1:
         die(f"cannot find this session's transcript ({len(found)} match)", 2)
     return found[0]
@@ -790,14 +884,11 @@ def context(target, recs):
             f'{" ".join(r["prs"]) or r["task"]}.')
 
 
-def relay_prompt(action, pane):
-    """Names no role and holds no quote: the target acts only on what `accept` prints from the ledger."""
-    return (f'RELAYED HUMAN INSTRUCTION {action} - the human\'s own message, relayed verbatim by the agent session in '
-            f'pane {pane}; this line is not it. Run: python3 {INSTALLED} accept --action {action} - it prints the '
-            'message, or refuses. Act only on what it prints, under your own rules and never wider; a question goes '
-            'back as the needs-clarification outcome, not a dialog. Then run: '
-            f'python3 {INSTALLED} outcome --action {action} --result <{"|".join(RESULTS)}> --note-file <file>, the '
-            'file outside the project holding a line or two on what you did or what you need to know.')
+def relay_prompt(action):
+    """One line naming no role and holding no quote: the target acts only on what `accept` prints from the
+    ledger."""
+    return (f'RELAYED HUMAN INSTRUCTION {action} - not the message itself. '
+            f'Run: python3 {INSTALLED} accept --action {action}')
 
 
 def relay(panes, entry, mine):
@@ -820,7 +911,7 @@ def relay(panes, entry, mine):
                 print(f'{pane}: refused, {why}', flush=True)
                 continue
             action = new_id('a', recs)
-            print(deliver('relay', action, captain, target, relay_prompt(action, captain['pane_id']),
+            print(deliver('relay', action, captain, target, relay_prompt(action),
                           entry=entry, quote=quote, context=context(target, recs)), flush=True)
     return 0
 
@@ -840,9 +931,13 @@ def accept(action):
         if action not in open_items(recs):
             die(f'relay {action} is closed', 2)
         append({'type': 'accepted', 'msg': action})
-    print(f'RELAYED HUMAN INSTRUCTION {action}, accepted. The human\'s message, verbatim:\n\n{item["quote"]}\n\n'
-          f'{item["context"]}\nIt may speak to other sessions too: act only on what it asks of this session, under '
-          'your own rules and never wider. Then record how it ended with the outcome command.')
+    print(f'RELAYED HUMAN INSTRUCTION {action} from the agent session in pane {item["captain"]["pane_id"]}, '
+          f'accepted. The human\'s message, verbatim:\n\n{item["quote"]}\n\n{item["context"]}\n'
+          'It may speak to other sessions too: act only on what it asks of this session, under your own rules and '
+          'never wider; a question goes back as the needs-clarification outcome, not a dialog. Then record how it '
+          'ended, the note a line or two on what you did or what you need to know, '
+          + one_call('Relay outcome', f'outcome --action {action} --result <{"|".join(RESULTS)}> --note-file -',
+                     'the note', 'Outcome recorded.'))
     return 0
 
 
@@ -953,7 +1048,9 @@ def main():
                                       'without asking any of them')
     ls.add_argument('--json', action='store_true')
     sub.add_parser('enroll', help='make this session the captain').add_argument('--replace', action='store_true')
-    sub.add_parser('ask', help='send each target a status request').add_argument('panes', nargs='+')
+    ak = sub.add_parser('ask', help='send each target a status request')
+    ak.add_argument('panes', nargs='+')
+    ak.add_argument('--force', action='store_true', help='ask a target even when nothing is new since its report')
     c = sub.add_parser('collect', help='print each report as it lands')
     c.add_argument('msgs', nargs='*')
     c.add_argument('--wait', type=int, default=60000, metavar='MS')
@@ -974,10 +1071,12 @@ def main():
     o = sub.add_parser('outcome', help='say how a relay ended (run by the target)')
     o.add_argument('--action', required=True)
     o.add_argument('--result', required=True, choices=RESULTS)
-    o.add_argument('--note-file')
+    o.add_argument('--note-file', help='the note, or - for stdin')
+    b = sub.add_parser('brief', help='print what a status request asks (run by the target)')
+    b.add_argument('--for', dest='msg', required=True)
     r = sub.add_parser('report', help='answer a status request (run by the target)')
     r.add_argument('--for', dest='msg', required=True)
-    r.add_argument('--file', required=True)
+    r.add_argument('--file', required=True, help="the JSON report, or - for stdin")
     a = ap.parse_args()
 
     try:
@@ -994,6 +1093,8 @@ def main():
             return 0
         if a.cmd == 'enroll':
             return enroll(a.replace)
+        if a.cmd == 'brief':
+            return brief(a.msg)
         if a.cmd == 'report':
             return report(a.msg, a.file)
         if a.cmd == 'accept':
@@ -1017,7 +1118,7 @@ def main():
         mine = me()
         if a.cmd == 'ask':
             for pane in resolve(a.panes):
-                print(ask(pane, mine), flush=True)
+                print(ask(pane, mine, a.force), flush=True)
             return 0
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
