@@ -233,7 +233,8 @@ async function run(opts = {}) {
       return patch({ ...PIN, head, prHead }, opts.preflight)
     }
     if (label === 'adopt:audit' || label === 'adopt:audit.retry') {
-      const fallback = chainAudit([opts.args?.adoptHead], undefined, { from: opts.args?.state?.expectedHead ?? HEAD })
+      // commits.py echoes the FROM it was given: the state's expectedHead, or the live PR head without a pinned state.
+      const fallback = chainAudit([opts.args?.adoptHead], undefined, { from: String(prompt).match(/commits\.py chain ([0-9a-f]{40}) /)[1] })
       const answer = typeof opts.adoptAudit === 'function' ? await opts.adoptAudit(label)
         : opts.adoptAudit === undefined ? fallback : opts.adoptAudit
       if (answer instanceof Error) throw answer
@@ -6092,12 +6093,9 @@ test('a chain the audit script cannot read back is refused with its error', asyn
 test('adoptHead argument errors throw before any agent runs', async () => {
   const malformed = adoptionState()
   const equal = adoptionState()
-  const unpinned = adoptionState({ pin: null })
   for (const [name, args] of [
-    ['no state', { adoptHead: ADOPT }],
     ['malformed SHA', adoptionArgs(malformed, { adoptHead: 'not-a-full-sha' })],
     ['candidate equals expected head', adoptionArgs(equal, { adoptHead: HEAD })],
-    ['state has no pin', adoptionArgs(unpinned)],
   ]) {
     const trace = []
     await assert.rejects(run({ args, trace }), /adoptHead|adopt head/i, name)
@@ -6196,6 +6194,46 @@ test('adoption refuses a local head other than the candidate and a remote head o
   assert.equal(remote.result.head, FOREIGN)
   assert.deepEqual(remote.result.expected, [HEAD, ADOPT])
   assert.deepEqual(remote.labels, ['preflight', 'adopt:audit'], 'only the audit can say which commits the chain holds')
+})
+
+// #260: a first launch adopts local commits on the live PR head; the wrong-head stop's own state continues the same way.
+test('a launch without a pinned state adopts a local chain whose base is the live PR head', async () => {
+  const first = await run({ args: { maxCycles: 4 }, preflight: { head: ADOPT, prHead: HEAD } })
+  assert.equal(first.result.reason, 'wrong-head')
+  assert.equal(first.result.state.pin, null)
+  for (const [name, args] of [['stateless', { maxCycles: 4 }], ["the wrong-head stop's state", { maxCycles: 4, state: first.result.state }]]) {
+    const { result, labels, calls } = await run({ args: { ...args, adoptHead: ADOPT, autoPush: true }, preflight: { head: ADOPT, prHead: HEAD } })
+    assert.deepEqual(labels.slice(0, 3), ['preflight', 'adopt:audit', 'adopt:push'], name)
+    assert.ok(calls.find(c => c.label === 'adopt:audit').prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} `), name)
+    assert.deepEqual(result.history[0].adoption.commits, [ADOPT], name)
+    assert.equal(result.history[0].adoption.publication, 'pushed', name)
+    assert.equal(result.state.expectedHead, ADOPT, name)
+  }
+  const dry = await run({ args: { adoptHead: ADOPT, autoPush: false }, preflight: { head: ADOPT, prHead: HEAD } })
+  assert.equal(dry.result.reason, 'adopt-needs-push', 'publishing still needs autoPush')
+})
+
+test('a launch without a pinned state refuses a diverged chain, a moved PR head and a candidate that is the PR head', async () => {
+  // commits.py refuses a chain whose first link does not sit on FROM: a local chain off the PR head, or a PR head pushed since.
+  for (const [name, prHead, refusal] of [
+    ['diverged', HEAD, `1111111 sits on ${FOREIGN.slice(0, 7)}, not ${HEAD.slice(0, 7)}`],
+    ['moved PR head', FOREIGN, `1111111 sits on ${HEAD.slice(0, 7)}, not ${FOREIGN.slice(0, 7)}`],
+  ]) {
+    const { result, labels } = await run({
+      args: { adoptHead: ADOPT, autoPush: true }, preflight: { head: ADOPT, prHead },
+      adoptAudit: chainAudit([ADOPT], undefined, { from: prHead, refusal }),
+    })
+    assert.equal(result.reason, 'adopt-audit-failed', name)
+    assert.equal(result.detail, refusal, name)
+    assert.deepEqual(labels, ['preflight', 'adopt:audit'], `${name}: nothing pushed`)
+    assert.equal(result.state.expectedHead, '', `${name}: no head fabricated`)
+  }
+  const same = await run({ args: { adoptHead: HEAD, autoPush: true } })
+  assert.equal(same.result.reason, 'adopt-audit-failed')
+  assert.match(same.result.detail, /is the PR head: launch without it/)
+  assert.deepEqual(same.labels, ['preflight'])
+  const local = await run({ args: { adoptHead: ADOPT, autoPush: true } })
+  assert.equal(local.result.reason, 'adopt-head-mismatch', 'the checkout must be at the candidate')
 })
 
 test('a PR head pushed outside the workflow inside the audited chain is adopted up to the candidate', async () => {

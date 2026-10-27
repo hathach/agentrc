@@ -65,8 +65,9 @@ REFUSED = {
     'stale-head': "HEAD moved off the state's head since the last launch: commits on top of it rejoin by adoptHead; "
                   'a rewritten history (rebase, force-push) rejoins by rebasedHead naming the PR head, only on the user\'s word; '
                   'report anything else, never reset the state',
-    'wrong-head': 'the checkout HEAD is not the PR head: check out the PR head, or name the local chain that holds it '
-                  'as adoptHead; report anything else, never reset the state',
+    'wrong-head': 'the checkout HEAD is not the PR head: check out the PR head, or, when HEAD is a chain of local commits '
+                  "on the PR head (on the state's head, once a launch pinned one), relaunch with adoptHead naming HEAD and "
+                  'the same stateRef, if any; report anything else, never reset the state',
     'deferral-refused': 'a deferral was refused: it needs a new decision before it is passed again',
     'pr-conflicting': 'the PR conflicts with its base, so passing checks establish nothing: resolve the conflict in a merge from the base, '
                       "then relaunch with adoptHead naming that merge; rebasedHead is only for a rewrite on the user's word",

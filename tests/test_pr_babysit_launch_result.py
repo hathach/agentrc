@@ -213,7 +213,7 @@ class LaunchResultTest(unittest.TestCase):
                              ('adopt-base-missing', 'retry the same adoption with the same stateRef and adoptHead'),
                              ('rebase-refused', 'the re-pin was refused'),
                              ('stale-head', "only on the user's word"),
-                             ('wrong-head', 'check out the PR head'),
+                             ('wrong-head', 'relaunch with adoptHead naming HEAD and the same stateRef, if any'),
                              ('deferral-refused', 'it needs a new decision'),
                              ('pr-conflicting', 'relaunch with adoptHead naming that merge'),
                              ('stale-workflow', 'relaunch from a fresh session'),

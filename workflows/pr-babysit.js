@@ -344,9 +344,7 @@ let cyclesUsed = restored ? restored.cyclesUsed : 0
 const adoptHead = args.adoptHead === undefined || args.adoptHead === null ? null : args.adoptHead
 if (adoptHead !== null) {
   if (typeof adoptHead !== 'string' || !/^[0-9a-f]{40}$/.test(adoptHead)) throw new Error('adoptHead must be a full 40-hex commit SHA')
-  if (!restored) throw new Error('adoptHead continues a previous launch: it needs that launch\'s state')
-  if (!restored.pin) throw new Error('adoptHead needs a state whose preflight pinned the PR head')
-  if (adoptHead === restored.expectedHead) throw new Error('adoptHead equals the state\'s expectedHead: there is nothing to adopt')
+  if (restored && restored.pin && adoptHead === restored.expectedHead) throw new Error('adoptHead equals the state\'s expectedHead: there is nothing to adopt')
 }
 // The user's word that the PR's history was rewritten (#45): the published head replaces the state's, unaudited, since this run publishes none of it.
 const rebasedHead = args.rebasedHead === undefined || args.rebasedHead === null ? null : args.rebasedHead
@@ -3162,18 +3160,23 @@ if (pinned.badPushUrl) {
   return finish(stop(cyclesUsed, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected }))
 }
 // Adoption replaces the head checks: checkout at adoptHead, PR at the state's head or a chain commit, the chain audited commit by commit.
+// Without a pinned state (a first launch, or one that stopped before its pin) the chain starts at the live PR head (#260).
 let adoption = null
 if (adoptHead !== null) {
-  const X = restored.expectedHead
   const prHead = pinned.prHead.trim()
+  const X = restored && restored.pin ? restored.expectedHead : prHead
   const base = pinned.prBase.trim()
   const tip = pinned.prBaseTip.trim()
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
     return finish(stop(cyclesUsed, 'adopt-head-mismatch', { head: pinned.head.trim(), expected: adoptHead }))
   }
+  if (adoptHead === X) {
+    log(`preflight: adoption refused — ${adoptHead.slice(0, 7)} is the PR head: there is nothing to adopt`)
+    return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: `adoptHead ${adoptHead.slice(0, 7)} is the PR head: launch without it` }))
+  }
   // An unpublished candidate is decided by a retry of the same adoption or, while the PR heads the state's head, a chain from it; never one this run's audit refused.
-  const p = restored.pending
+  const p = restored && restored.pending
   const retry = !!p && p.lane === 'adopt' && p.sha === adoptHead
   if (p && !retry && (prHead !== X || p.stage === 'audit-blocked')) {
     log(`preflight: the state holds an unpublished candidate (${p.stage}); resolve it before adopting`)

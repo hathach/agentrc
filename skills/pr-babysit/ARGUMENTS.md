@@ -125,7 +125,9 @@ listed here throws before anything runs.
 - `adoptHead`: full SHA of audited commits on top of the state's
   `expectedHead` (a caller's repair, or a push made outside the workflow):
   the chain is audited, published under `autoPush`, and the run continues
-  from it; per launch. A merge from the PR's base branch is one link, its
+  from it; per launch. Without a pinned state (a first launch, or the state
+  of one that stopped before its pin, such as `wrong-head`), the chain's base
+  is the live PR head. A merge from the PR's base branch is one link, its
   paths those it leaves unlike both parents; it is from the base when the
   branch's live tip or the base GitHub recorded holds its second parent. That
   record is stale until the head is pushed, so a merge newer than it needs the
