@@ -129,7 +129,12 @@ Board caveats (beyond the table):
   arm-phase death at 0.107 s, two captures died mid-stream at 3.273 s and
   3.543 s; `--no-timestamps` did not help. The August soak is historical,
   not proof of a currently clean 150 MHz link; lower the core clock if a
-  retry still dies mid-stream.
+  retry still dies mid-stream. **2026-10-22 at TinyUSB 702e55db3** (cdc_msc,
+  stock 150 MHz, htpc J-Trace `jtrace`): one 10 s capture, zero overflow,
+  profile exported, the board still enumerated and answered an MSC read
+  after; Ozone logged one `Invalid trace timestamp detected` at halt. One
+  run does not clear the regression: repeat 3x plus the cdc_msc_throughput
+  soak before calling the link clean.
   **Other rates need a hand-built clock** (the compile definitions: the project's
   build contract). Measured: 180000 = 90 MHz TRACECLK, loaded eye
   +4000..+5000 ps (3/3); 240000 = **the J-Trace PRO V2 ceiling** (120 MHz
