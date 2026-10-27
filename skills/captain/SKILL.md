@@ -95,8 +95,8 @@ send (`--entry`) takes only the panes the preview printed, so a report landing i
   once `collect` ended or lapsed, never from Monitor lines, which a long line can cut: each id gets the report that
   answered it, even one a later report from that session superseded. If the output itself is abbreviated, run it again
   with fewer ids, down to one; a row still cut says so, its needs never pieced together.
-- **File** a follow-up issue in hathach/agentrc, for a defect in your own tooling and on the human's word, as
-  `agents/captain.md` says, from a title and a body drafted under `~/.cache/agentrc/captain/drafts/`:
+- **File** a follow-up issue as `agents/captain.md` says, from a title and a body drafted under
+  `~/.cache/agentrc/captain/drafts/`:
 
   ```bash
   python3 ~/.claude/skills/followup-issue/scripts/publish.py create --repo hathach/agentrc --allow-repo hathach/agentrc --title-file <title.md> --body-file <body.md> --label follow-up

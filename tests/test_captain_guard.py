@@ -1,10 +1,12 @@
 import importlib.util
+import io
 import json
 import os
 import re
 import subprocess
 import sys
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +18,10 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'scripts' 
 spec = importlib.util.spec_from_file_location('captain_guard', SCRIPT)
 guard = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(guard)
+PUBLISHER = Path(__file__).resolve().parents[1] / 'skills' / 'followup-issue' / 'scripts' / 'publish.py'
+spec = importlib.util.spec_from_file_location('followup_publish', PUBLISHER)
+publish = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(publish)
 
 RUN = 'python3 ~/.claude/skills/captain/scripts/captain.py'
 READ = 'python3 ~/.claude/skills/captain/scripts/captain_read.py'
@@ -186,6 +192,23 @@ class VerdictTest(unittest.TestCase):
                     f'python3 /tmp/publish.py {create}']:
             with self.subTest(cmd):
                 self.assertIsNotNone(self.verdict('Bash', command=cmd))
+
+    def test_every_admitted_publication_is_one_publish_py_parses(self):
+        """The guard keeps its own copy of publish.py's options: each shape it admits must reach publish.py's checks,
+        here its refusal of a draft that does not exist, never an argparse usage error."""
+        drafts = tmpdir(self)
+        missing = str(drafts / 'never-written.md')
+        for action, values in guard.PUBLISH.items():
+            argv = [action] + [w for name, value in values.items()
+                               for w in (name, value or ('3' if name == '--issue' else missing))]
+            with self.subTest(action), mock.patch.object(guard, 'DRAFTS', str(drafts)):
+                self.assertIsNone(guard.publication(argv))
+                out = io.StringIO()
+                with redirect_stdout(out), mock.patch.object(publish, 'gh', side_effect=AssertionError('no call')):
+                    code = publish.main(argv)
+                receipt = json.loads(out.getvalue().splitlines()[-1])
+                self.assertEqual((code, receipt['outcome']), (2, 'refused'))
+                self.assertIn('cannot read', receipt['error'])
 
     def test_a_draft_symlinked_out_of_the_drafts_is_refused(self):
         drafts = tmpdir(self)

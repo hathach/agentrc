@@ -38,7 +38,8 @@ STATE, SKILL, MEMORY, PROJECTS = captain_read.STATE, captain_read.SKILL, captain
 SCRIPTS = ('~/.claude/skills/captain/scripts/captain.py',
            os.path.join(SKILL, 'scripts', 'captain.py').replace(os.sep, '/'))
 READERS = tuple(s.replace('captain.py', 'captain_read.py') for s in SCRIPTS)
-PUBLISHERS = tuple(s.replace('captain/scripts/captain.py', 'followup-issue/scripts/publish.py') for s in SCRIPTS)
+PUBLISHERS = ('~/.claude/skills/followup-issue/scripts/publish.py',
+              os.path.join(captain_read.FOLLOWUP, 'scripts', 'publish.py').replace(os.sep, '/'))
 DRAFTS = os.path.join(STATE, 'drafts')
 REPO = 'hathach/agentrc'
 # publish.py's options for each action, every one given once as `--option value`
