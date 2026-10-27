@@ -3457,6 +3457,13 @@ test("a commit copy that fails its seal is recovered from the script's receipt, 
   assert.deepEqual([refused.result.history[0].reviewPushFailed.committed, refused.result.history[0].reviewPushFailed.detail], [false, 'trailing-whitespace....Failed'])
   assert.equal(refused.labels.some(l => l.startsWith('audit#')), false, 'no commit to audit')
 
+  // A relay that lost the script's line returns an error line; the receipt the script saved still settles it.
+  const lostLine = await run({ reviews: oneValid, commit: { committed: false, detail: 'hook failed' },
+    garble: (l, a) => l === 'commit#1-review' ? { error: 'no output line', committed: false, detail: '', seal: '' } : a })
+  assert.ok(lostLine.labels.includes('receipt:commit#1-review'))
+  assert.ok(lostLine.logs.includes("commit#1-review: recovered from the commit script's receipt: no commit — hook failed"), lostLine.logs.join('\n'))
+  assert.deepEqual([lostLine.result.history[0].reviewPushFailed.committed, lostLine.result.history[0].reviewPushFailed.detail], [false, 'hook failed'])
+
   // A receipt the script did not save, or one for another commit, is no receipt: the HEAD read-back settles it as before.
   for (const commitReceipt of [{ error: 'no receipt at /tmp/x: the commit script saved none' }, { parent: FOREIGN }, { scope: ['src/z.c'] }]) {
     const fallback = await run({ reviews: oneValid, commitReceipt, garble: garbled })
