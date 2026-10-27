@@ -550,7 +550,11 @@ class ChiefGuard(unittest.TestCase):
                          ("printf 'git push' | { cd /dev/fd; bash 0; }", 'stdin'),
                          ("printf 'git push' | { cd /proc/self/fd && source ./0; }", 'stdin'),
                          ('PATH=/tmp/links source s.sh', 'PATH'), ('export PATH=/tmp/links; bash s.sh', 'PATH'),
-                         ("bash -c 'PATH=/tmp/links; . s.sh'", 'PATH'), ('env PATH+=:/tmp/links sh s.sh', 'PATH'),
+                         ("bash -c 'PATH=/tmp/links; . s.sh'", 'PATH'), ('env PATH=/tmp/links sh s.sh', 'PATH'),
+                         # read from the assignment words as bash takes them, anywhere in the call
+                         ('PA\\\nTH=/tmp/bin bash s.sh', 'PATH'), ("export P'ATH'=/tmp/bin; bash s.sh", 'PATH'),
+                         ('echo "$(bash s.sh)"; export PATH=/tmp/links', 'PATH'),
+                         ('eval "PATH=/tmp/links source s.sh"', 'PATH'),
                          # bash tilde-expands after `=` in a word shaped like an assignment
                          ('HOME=/dev/fd; bash a=~/0', 'tilde'), ('source a=~/0', 'tilde'), ('. a:~/s.sh', 'tilde'),
                          # an interactive shell, the only one reading ENV, is never passed
@@ -558,7 +562,8 @@ class ChiefGuard(unittest.TestCase):
             with self.subTest(c=c):
                 self.assert_denied(c, named)
         for c in ('PATH=/tmp/bin source /tmp/env.sh', 'export PATH=/tmp/bin; bash ./s.sh', 'source s.sh', 'bash s.sh',
-                  'ENV=dev bash -c true', 'bash /tmp/a=b.sh'):
+                  'ENV=dev bash -c true', 'bash /tmp/a=b.sh', 'bash s.sh # PATH=/tmp/bin', "echo 'PATH=/tmp/bin'; bash s.sh",
+                  "bash -c 'echo PATH=/tmp/bin'; source s.sh"):
             with self.subTest(c=c):
                 self.assert_allowed(c)
 

@@ -228,8 +228,8 @@ STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cann
 # a script operand naming a descriptor (/dev/stdin, /dev/fd/0, /proc/self/fd/0), or a bare number from a descriptor
 # directory as the cwd or in PATH, reads the commands piped in
 STDIN_PATH = re.compile(r'(^|/)(stdin|\d+)$')
-# a PATH assignment anywhere in the call: `source`, `.` and bash search it for a slash-less script operand
-PATH_SET = re.compile(r'(?<![\w$])PATH\+?=')
+# an assignment word setting PATH, where `source`, `.` and bash search for a slash-less script operand
+PATH_SET = re.compile(r'PATH\+?=')
 # bash expands a tilde leading a word or following `=` or `:` in it
 TILDE = re.compile(r'(^|[=:])~')
 WRITE_RULE = 'chief writes only its artifacts, named by a literal absolute path outside the task worktree; a worktree change goes to a writer'
@@ -472,7 +472,8 @@ def operators(token):
 
 class Guard:
     def __init__(self, payload):
-        self.payload, self.root, self.evaluated, self.path_set = payload, None, False, False
+        self.payload, self.root, self.evaluated = payload, None, False
+        self.path_set, self.scripts = False, []   # anywhere in the call, read once it is all checked
 
     def inside(self, path, ancestors=False):
         """Is this absolute path in the worktree, chief's own directory apart, or with ancestors one holding it; the
@@ -505,9 +506,10 @@ class Guard:
     def command(self, command, depth=0):
         if not isinstance(command, str):
             raise TypeError(f'the command is a {type(command).__name__}')  # lexed() would read a list's items
-        if depth == 0:
-            self.path_set = bool(PATH_SET.search(command))
         self.frame(*lexed(command)[:2], depth)
+        if depth == 0 and self.path_set and any('/' not in s.translate(UNQUOTED) for s in self.scripts):
+            raise Denied('a slash-less script is searched in the PATH this command sets, which may resolve it to stdin; '
+                         'name it by a path with a `/`')
 
     def frame(self, text, subs, depth):
         if depth > 3:
@@ -539,7 +541,10 @@ class Guard:
                 self.writes(words[k + 1], 'the redirect')
         if os.name == 'nt' and any(re.match(r'(MSYS|CYGWIN)\+?=.*winsymlinks', w) for w in words):
             raise Denied('winsymlinks makes links this guard cannot follow on Windows; dispatch the step to a unit')
-        words, xargs, replace, bare = unwrap([w.replace(QUOTING, '') for w in marked])
+        given = [w.replace(QUOTING, '') for w in marked]
+        words, xargs, replace, bare = unwrap(given)
+        # unwrap passed over the prefix assignments and env's or sudo's own
+        self.path_set |= any(PATH_SET.match(w) for w in given[:len(given) - len(words)])
         if not words:
             if (indirect or xargs) and not bare:
                 raise Denied('a wrapper under xargs or find -exec with no program runs one known only at run time; name the '
@@ -579,6 +584,7 @@ class Guard:
             for a in args:
                 if ASSIGNMENT.match(a):
                     forbidden_env(a)
+                    self.path_set |= bool(PATH_SET.match(a))
         if cmd in ('declare', 'typeset', 'local'):
             # bash reads an operand as declare's assignment only past an unquoted command word that keywords and
             # assignments alone precede, and with its name and `=` unquoted; eval's operands it splits and globs first.
@@ -609,7 +615,7 @@ class Guard:
         if cmd in SHELLS:
             return self.shell(args, depth)
         if cmd in ('source', '.'):
-            return script(args[1:] if args[:1] == ['--'] else args, self.path_set)
+            return self.scripts.append(script(args[1:] if args[:1] == ['--'] else args))
         if cmd == 'eval':
             self.evaluated = True
             return self.command(code(args), depth + 1)
@@ -714,7 +720,7 @@ class Guard:
             command = command or 'c' in a[1:] and not a.startswith('--')
         if command:
             return self.command(code(args[k:k + 1]), depth + 1)
-        script(args[k:], self.path_set)
+        self.scripts.append(script(args[k:]))
 
     def find_exec(self, args, depth):
         """`find -exec`/`-execdir`/`-ok`/`-okdir` runs a command on the paths it finds, known only at run time: only a
@@ -773,18 +779,16 @@ def code(words):
     return ' '.join(words).translate(UNQUOTED)
 
 
-def script(operands, path_set):
-    """A shell's or `source`'s script operand, not followed like any program's file, unless it is stdin, a value
-    known only at run time, or a slash-less name searched in a PATH the same call sets."""
+def script(operands):
+    """A shell's or `source`'s script operand, not followed like any program's file, unless it is stdin or a value
+    known only at run time."""
     operand = operands[0] if operands else None
     if operand is not None and (expanded(operand) or TILDE.search(operand)):
         raise Denied('this script is a value known only at run time (a substitution, a variable, a tilde or a glob), '
                      'which this guard cannot read; name the script file, a tilde or glob character quoted')
     if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
         raise Denied(STDIN_RULE)
-    if path_set and '/' not in operand.translate(UNQUOTED):
-        raise Denied('this script is searched in the PATH this command sets, which may resolve it to stdin; name it by a '
-                     'path with a `/`')
+    return operand
 
 
 def spelled(args, longs, letters, valued='', valued_longs=None):
