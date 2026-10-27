@@ -1510,7 +1510,15 @@ def wait_local(runs, run_id, timeout, *, poll=POLL_SECS, start_grace=START_SECS)
     deadline = begun + timeout
     while True:
         if done.is_file():
-            return 0, {'state': 'done', **json.loads(done.read_text())}
+            try:
+                return 0, {'state': 'done', **json.loads(done.read_text())}
+            except (PermissionError, ValueError) as e:
+                # write_json replaces it whole, yet Windows can refuse the open of a fresh file for a moment
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    fail(f'run {run_id} finished, but its done record {done} stayed unreadable: {e}')
+                time.sleep(min(poll, left))
+                continue
         try:
             rec = json.loads(started.read_text())
         except FileNotFoundError:
