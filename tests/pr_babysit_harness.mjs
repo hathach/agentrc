@@ -402,7 +402,7 @@ async function run(opts = {}) {
       const entries = JSON.parse(String(prompt).match(/Manifest: (\{.*\})$/)[1]).replies
       // reply.py's error line before anything is posted (replyError), as the relay is told to return it.
       const scriptError = opts.replyError && opts.replyError(label)
-      if (scriptError) return conforms(options.schema, { error: scriptError, receipts: [] }, label)
+      if (scriptError) return conforms(options.schema, { ...(typeof scriptError === 'string' ? { error: scriptError } : scriptError), receipts: [] }, label)
       const failed = opts.dropDoneIds && opts.dropDoneIds(label)
       const receipt = ({ commentId, digest }) => failed
         ? { commentId, kind: 'review', replyId: null, digest, sent: false, posted: false, verified: false, resolved: null, error: 'posting failed' }
@@ -4447,8 +4447,9 @@ test('reply.py\'s error line fails the batch with that error, not a seal mismatc
 
 test('a pending review of the posting account stops the launch with a blocker naming it, never retried each cycle (#321)', async () => {
   const PENDING = 'pending review 5661141307 of hathach on PR #3888 blocks replies: GitHub refuses a review reply while its author holds a pending review; a human submits or deletes it'
+  const line = { error: PENDING, pendingReview: { id: 5661141307, login: 'hathach' } }
   const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
-  const { result, labels, logs } = await run({ reviews, replyError: (label) => label.startsWith('replies#') && PENDING, args: { autoPush: true, maxCycles: 4 } })
+  const { result, labels, logs } = await run({ reviews, replyError: (label) => label.startsWith('replies#') && line, args: { autoPush: true, maxCycles: 4 } })
   assert.equal(result.reason, 'pending-review')
   assert.deepEqual([result.review, result.login, result.detail], [5661141307, 'hathach', PENDING])
   assert.equal(result.cycles, 1, 'the next cycle would meet the same refusal')
@@ -4456,6 +4457,8 @@ test('a pending review of the posting account stops the launch with a blocker na
   assert.ok(logs.some(l => l.includes('holds pending review 5661141307 on PR #3888') && l.includes("the human's to submit or delete")), logs.join('\n'))
   const other = await run({ reviews, replyError: (label) => label.startsWith('replies#') && RATE.replace('rate limit', 'oops'), args: { autoPush: true, maxCycles: 1 } })
   assert.notEqual(other.result.reason, 'pending-review', 'only reply.py\'s pending-review line stops so')
+  const textOnly = await run({ reviews, replyError: (label) => label.startsWith('replies#') && PENDING, args: { autoPush: true, maxCycles: 1 } })
+  assert.notEqual(textOnly.result.reason, 'pending-review', 'the pendingReview member stops it, never the error text')
 })
 
 test('reply.py\'s error line refuses a settlement with that error (#115)', async () => {

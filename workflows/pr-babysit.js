@@ -800,15 +800,14 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
   `\`${PY} ${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
-  'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\'. ' +
+  'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\', and its pendingReview member when it has one. ' +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
 ).then(out => {
   // reply.py names a rate limit only in error text: the line's, or a sealed receipt's when it struck mid-batch.
   const said = !out ? undefined : (out.error ? [out.error] : out.receipts.map(r => r.error)).find(e => e && /rate limit|HTTP 429/i.test(e))
   if (said) noteLimit({ error: `reply.py: ${said}`, observedAt: null, resetAt: null, secondary: /secondary/i.test(said) })
-  const pending = out && out.error && /^pending review (\d+) of (\S+) on PR #\d+ blocks replies/.exec(out.error)
-  if (pending && !pendingReview) pendingReview = { review: Number(pending[1]), login: pending[2], detail: out.error }
+  if (out && out.error && out.pendingReview && !pendingReview) pendingReview = { review: out.pendingReview.id, login: out.pendingReview.login, detail: out.error }
   return out
 })
 // The posting account's pending review, which GitHub refuses every review reply beside (#321): a human submits or deletes it.
@@ -834,6 +833,7 @@ const RECEIPTS = withSeal({
   required: ['receipts'],
   properties: {
     error: { type: 'string' },
+    pendingReview: { type: 'object', additionalProperties: false, required: ['id', 'login'], properties: { id: { type: 'integer' }, login: { type: 'string' } } },
     receipts: {
       type: 'array',
       items: {

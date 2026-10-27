@@ -44,7 +44,8 @@ when finding the repo (gh repo view) or our login (gh api user) fails, with
 {"error": ...} as the last stdout line. A manifest posts nothing while our login
 holds a PENDING review on the PR, which GitHub refuses review replies beside:
 exit 2 with the error "pending review <id> of <login> on PR #<N> blocks
-replies: ...", for a human to submit or delete; this script never does either.
+replies: ..." and the member "pendingReview": {"id", "login"} beside it, for a
+human to submit or delete; this script never does either.
 A failed listing of the reviews is exit 2 too, nothing posted.
 A failed call's error is gh's diagnostic plus the message and errors GitHub
 answered with, at most BODY_MAX characters of them. A null resolved or
@@ -543,10 +544,10 @@ def saved_receipt(path, request):
     return line, saved['code']
 
 
-def failed(message):
+def failed(message, **members):
     """Exit 2 before anything is posted: a relay copies the last stdout line, and with none it improvises (#115)."""
     print(f'reply.py: {message}', file=sys.stderr)
-    print(json.dumps({'error': message}))
+    print(json.dumps({'error': message, **members}))
     return 2
 
 
@@ -607,9 +608,9 @@ def main(argv=None):
         # A later listing that succeeds could still hold one: nothing is posted unchecked.
         return failed(f'the reviews on PR #{a.pr} could not be listed to check for a pending review of ours: {e}')
     if pending:
-        # pr-babysit.js matches this text to stop as pending-review
         return failed(f"pending review {pending['id']} of {poster.me} on PR #{a.pr} blocks replies: GitHub refuses a review reply "
-                      'while its author holds a pending review; a human submits or deletes it')
+                      'while its author holds a pending review; a human submits or deletes it',
+                      pendingReview={'id': pending['id'], 'login': poster.me})
     if reuses:
         receipts = settle_all(reuses, lambda i: reuse(poster, i), lambda i: receipt(i['commentId'], i['replyId'], i['bodyDigest']))
     elif edits:

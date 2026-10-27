@@ -400,6 +400,7 @@ class ReplyTest(ReplyCase):
         rc, out = self.main('--manifest', self.json_file({'replies': [{'commentId': 10, 'body': 'a', 'digest': reply.fnv1a('a')}]}))
         self.assertEqual(rc, 2)
         self.assertTrue(out['error'].startswith(f'pending review 77 of {ME} on PR #{PR} blocks replies: '), out)
+        self.assertEqual(out['pendingReview'], {'id': 77, 'login': ME}, 'pr-babysit reads the member, not the text')
         self.assertEqual(self.gh.mutations, [], 'nothing posted, and the review is neither submitted nor deleted')
         # Settling on a reply already there posts nothing, so the pending review does not stop it.
         self.gh.review_comment(11, 'ok', ME, thread='T10', parent=10)
