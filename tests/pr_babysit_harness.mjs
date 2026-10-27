@@ -3080,6 +3080,21 @@ test('a report carrying both a rate limit and a harvest error takes the rate-lim
   assert.equal(result.state.cyclesUsed, 0)
 })
 
+test('a harvest that printed no JSON line is retried and reported by its last stderr line, a rate limit first (#240)', async () => {
+  const validator = readFileSync(new URL('../agents/pr-review-validator.md', import.meta.url), 'utf8')
+  assert.ok(validator.includes('or no JSON line at all (a traceback, or nothing), run it once more'), 'the same single retry')
+  assert.ok(validator.includes('the last non-empty line of its stderr verbatim, else `harvest.py printed nothing (exit <its exit code>)`'))
+  const failed = { headSha: '', observedAt: '', headEventAt: null, headEventEvidence: 'harvest failed', fingerprint: '', bots: [], botsWhole: true, findings: [], replies: [] }
+  for (const error of ["PermissionError: [Errno 13] Permission denied: 'gh'", 'harvest.py printed nothing (exit 1)']) {
+    const { result, labels } = await run({ reviews: { ...failed, harvestError: error }, args: { maxCycles: 4 } })
+    assert.deepEqual([result.reason, result.detail], ['harvest-failed', error])
+    assert.deepEqual(labels.filter(l => l.startsWith('reviews#')), ['reviews#1'], 'stopped, no cycle spent re-reading it')
+  }
+  // A traceback, then a rate-limited retry: the limit decides.
+  const limited = await run({ reviews: { ...LIMITED_REVIEWS, harvestError: 'ModuleNotFoundError: No module named greptile' }, args: { maxCycles: 4 } })
+  assert.equal(limited.result.reason, 'github-rate-limited')
+})
+
 test('a dead review validator still settles the CI lane', async () => {
   const { result, logs, labels } = await run({ reviews: new Error('validator exploded') })
   assert.equal(result.reason, 'review-validator-died')

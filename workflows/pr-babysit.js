@@ -523,7 +523,7 @@ const REVIEWS = {
         properties: { commentId: { type: 'integer' }, body: { type: 'string' } },
       },
     },
-    // harvest.py's error, verbatim, when it failed twice for any other reason (#205).
+    // harvest.py's error, verbatim, when it failed twice for any other reason (#205); its last stderr line when it printed no JSON line (#240).
     harvestError: { type: 'string' },
     // harvest.py's error line when GitHub refused it for a rate limit, with that error.
     rateLimit: { ...RATE_LIMIT, required: [...RATE_LIMIT.required, 'error'], properties: { ...RATE_LIMIT.properties, error: { type: 'string' } } },
