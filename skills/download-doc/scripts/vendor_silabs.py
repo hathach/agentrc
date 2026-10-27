@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, absent, begin_enumeration, http_get, last_modified, partial_enumeration   # noqa: E402
+from doclib import Doc, NotFound, begin_enumeration, http_get, last_modified, partial_enumeration   # noqa: E402
 
 AUTHOR = "Silicon Labs"
 BSP = Path.home() / "code" / "tinyusb" / "hw" / "bsp" / "efm32"
@@ -73,9 +73,10 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
             try:
                 http_get(url, timeout=30, accept="application/pdf",
                          validate=lambda b: b.startswith(b"%PDF"))
+            except NotFound:   # a family with no document of that kind
+                continue
             except RuntimeError:
-                if not absent(url):   # a 404 is a family with no document of that kind
-                    partial_enumeration(f"{url}: fetch failed")
+                partial_enumeration(f"{url}: fetch failed")
                 continue
             docs.append(Doc(
                 vendor="silabs", doc_id=f"{fam}-{kind}", doc_type=kind,

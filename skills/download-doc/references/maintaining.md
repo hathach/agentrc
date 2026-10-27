@@ -231,7 +231,7 @@ An adapter that fetches over the network starts `enumerate_docs()` with
 fails and it carries on without what that fetch would have listed; `sync.py` then
 calls the list partial (an empty one "enumeration failed", not "no documents") and records
 no family as USB-less from it. A probe that finds nothing is a failure too unless the
-server said so: `doclib.absent(url)` (404 or 410).
+server said so: `doclib.http_get` raises `doclib.NotFound`, a `RuntimeError`, on a 404 or 410.
 
 Normalize `doc_type` to the shared tag vocabulary (`sync.KINDS`) so the library stays
 searchable across vendors, set `verify_id=False` where the ID is not printed in the

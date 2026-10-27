@@ -53,21 +53,35 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 # been observed to differ between processes on the same host at the same moment.
 # So: retry with the other client, then back off — and don't hard-code a winner.
 
-def _wget(url: str, timeout: int, accept: str) -> bytes:
+GONE = ("404", "410")
+
+
+class NotFound(RuntimeError):
+    """The server answered 404 or 410: no document there, as opposed to a fetch that
+    failed and proves nothing."""
+
+
+def _wget(url: str, timeout: int, accept: str) -> tuple:
+    """-> (payload, ""): wget reports no status, so curl's decides absence."""
     try:
         p = subprocess.run(["wget", "-q", "-O", "-", "-T", str(timeout), "-t", "2",
                             f"--user-agent={UA}", f"--header=Accept: {accept}", url],
                            capture_output=True)
     except FileNotFoundError:  # no wget, as on stock Windows: curl alone
-        return b""
-    return p.stdout if p.returncode == 0 else b""
+        return b"", ""
+    return (p.stdout if p.returncode == 0 else b""), ""
 
 
-def _curl(url: str, timeout: int, accept: str) -> bytes:
-    # -g is mandatory: NXP's brace-wrapped query is a literal path segment.
-    p = subprocess.run(["curl", "-sg", "--compressed", "-m", str(timeout),
-                        "-A", UA, "-H", f"Accept: {accept}", url], capture_output=True)
-    return p.stdout if p.returncode == 0 else b""
+def _curl(url: str, timeout: int, accept: str) -> tuple:
+    """-> (payload, final HTTP status), both empty when no response completed."""
+    # -g is mandatory: NXP's brace-wrapped query is a literal path segment. No -L: a
+    # redirect stays its own 3xx status, a failed fetch rather than a missing document.
+    p = subprocess.run(["curl", "-sg", "--compressed", "-m", str(timeout), "-A", UA,
+                        "-H", f"Accept: {accept}", "-w", "\n%{http_code}", url], capture_output=True)
+    if p.returncode:
+        return b"", ""
+    body, _, status = p.stdout.rpartition(b"\n")
+    return body, status.decode("ascii", "replace")
 
 
 def last_modified(url: str) -> str | None:
@@ -86,29 +100,26 @@ def last_modified(url: str) -> str | None:
     return None
 
 
-def absent(url: str) -> bool:
-    """Whether the server answers 404 or 410 for `url`: a probe that found no document,
-    as opposed to a fetch that failed and proves nothing."""
-    p = subprocess.run(["curl", "-sgIL", "--compressed", "-o", os.devnull, "-m", "25", "-A", UA,
-                        "-w", "%{http_code}", url], capture_output=True, text=True)
-    return p.stdout.strip() in ("404", "410")
-
-
 def http_get(url: str, timeout: int = 60, accept: str = "application/json",
              validate=None) -> bytes:
-    """GET a URL, returning validated bytes. Raises RuntimeError if no client
-    produced a payload that passes `validate`."""
+    """GET a URL, returning validated bytes. Raises NotFound if the server answered 404
+    or 410, RuntimeError if no client produced a payload that passes `validate`."""
     problems = []
     for name, client in (("wget", _wget), ("curl", _curl)):
-        data = client(url, timeout, accept)
+        data, status = client(url, timeout, accept)
+        if status in GONE:   # the server's own answer, whatever page it sent with it
+            problems.append(f"{name}: HTTP {status}")
+            continue
+        why = f"HTTP {status}, " if status else ""
         if not data:
-            problems.append(f"{name}: no payload")
+            problems.append(f"{name}: {why}no payload")
             continue
         if validate and not validate(data):
-            problems.append(f"{name}: {len(data)} bytes but failed validation")
+            problems.append(f"{name}: {why}{len(data)} bytes but failed validation")
             continue
         return data
-    raise RuntimeError(f"fetch failed [{'; '.join(problems)}]: {url}")
+    # curl runs last, so `status` is its answer.
+    raise (NotFound if status in GONE else RuntimeError)(f"fetch failed [{'; '.join(problems)}]: {url}")
 
 
 def _is_json(b: bytes) -> bool:

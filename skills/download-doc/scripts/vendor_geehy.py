@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, absent, begin_enumeration, http_get, partial_enumeration, rev_newer   # noqa: E402
+from doclib import Doc, NotFound, begin_enumeration, http_get, partial_enumeration, rev_newer   # noqa: E402
 
 AUTHOR = "Geehy Semiconductor"
 BASE = "https://www.geehy.com/uploads/tool/"
@@ -58,10 +58,10 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
                     try:
                         http_get(url, timeout=20, accept="application/pdf",
                                  validate=lambda b: b.startswith(b"%PDF"))
-                    except RuntimeError:
-                        # Most of the grid is 404 by design; anything else may hide a document.
-                        if not absent(url):
-                            partial_enumeration(f"{url}: fetch failed")
+                    except NotFound:   # most of the grid by design
+                        continue
+                    except RuntimeError:   # may hide a document
+                        partial_enumeration(f"{url}: fetch failed")
                         continue
                     key = (part, kind)
                     v = ver.lstrip("Vv")

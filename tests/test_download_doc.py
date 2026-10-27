@@ -582,7 +582,7 @@ class LastModified(unittest.TestCase):
         def run(argv, **kw):
             if argv[0] == 'wget':
                 raise FileNotFoundError(2, 'No such file', 'wget')
-            return subprocess.CompletedProcess(argv, 0, b'{"ok": 1}', b'')
+            return subprocess.CompletedProcess(argv, 0, b'{"ok": 1}\n200', b'')
         with unittest.mock.patch.object(doclib.subprocess, 'run', run):
             self.assertEqual(doclib.get_json('https://example.com/x.json'), {'ok': 1})
 
@@ -596,6 +596,35 @@ class LastModified(unittest.TestCase):
                 version, err = self.head(lambda argv, **kw: subprocess.CompletedProcess(argv, code, out, ''))
                 self.assertIsNone(version)
                 self.assertIn(f'no Last-Modified from https://example.com/x.pdf ({why})', err)
+
+
+class HttpGet(unittest.TestCase):
+    """Only the server's 404 or 410 says a document is missing; any other failure proves nothing."""
+
+    def get(self, curl_out, curl_exit=0):
+        """http_get for a PDF with wget failing and curl printing `curl_out` (body, then its -w status)."""
+        def run(argv, **kw):
+            if argv[0] == 'wget':
+                return subprocess.CompletedProcess(argv, 8, b'', b'')
+            return subprocess.CompletedProcess(argv, curl_exit, curl_out, b'')
+        with unittest.mock.patch.object(doclib.subprocess, 'run', run):
+            return doclib.http_get('https://example.com/x.pdf', validate=lambda b: b.startswith(b'%PDF'))
+
+    def test_a_pdf_comes_back_without_the_status(self):
+        self.assertEqual(self.get(b'%PDF-1.7\nbody\n200'), b'%PDF-1.7\nbody')
+
+    def test_only_a_completed_404_or_410_is_a_missing_document(self):
+        for out, code, missing in ((b'<html>gone</html>\n404', 0, True),
+                                   (b'<html>gone</html>\n410', 0, True),
+                                   (b'%PDF-1.7 not the document\n404', 0, True),
+                                   (b'\n301', 0, False),
+                                   (b'<html>busy</html>\n503', 0, False),
+                                   (b'<html>login</html>\n200', 0, False),
+                                   (b'\n000', 28, False),
+                                   (b'<html>gone</html>\n404', 56, False)):
+            with self.subTest(out=out, code=code), self.assertRaises(RuntimeError) as raised:
+                self.get(out, code)
+            self.assertEqual(isinstance(raised.exception, doclib.NotFound), missing, out)
 
 
 class MicrochipNumber(unittest.TestCase):
@@ -627,16 +656,15 @@ class TiParts(unittest.TestCase):
     """Named parts replace the BSP scan; a named part with no datasheet is an error."""
 
     def setUp(self):
-        saved = (vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp, vendor_ti.absent)
+        saved = (vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp)
         self.addCleanup(lambda: setattr_all(saved))
         vendor_ti.last_modified = lambda url: 'Fri, 27 Mar 2026 05:34:41 GMT'
-        vendor_ti.absent = lambda url: True
         vendor_ti._parts_from_bsp = lambda: self.fail('BSP scanned despite named parts')
 
     def serve(self, *present):
         def http_get(url, **kw):
             if not any(url.endswith(f'/{p}.pdf') for p in present):
-                raise RuntimeError('404')
+                raise doclib.NotFound('404')
             return b'%PDF'
         vendor_ti.http_get = http_get
 
@@ -923,7 +951,7 @@ class AddOne(unittest.TestCase):
 
 
 def setattr_all(saved):
-    vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp, vendor_ti.absent = saved
+    vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp = saved
 
 
 
@@ -1718,9 +1746,10 @@ class EnumerationComplete(unittest.TestCase):
         for mod, attrs in cases.items():
             with self.subTest(mod.__name__):
                 self.patch(mod, **attrs)
-                for missing in (True, False):
-                    with unittest.mock.patch.object(mod, 'absent', lambda url: missing):
-                        self.assertEqual(self.complete(mod, self.fails), missing)
+                for error, missing in ((doclib.NotFound, True), (RuntimeError, False)):
+                    def http_get(*a, **k):
+                        raise error('fetch failed')
+                    self.assertEqual(self.complete(mod, http_get), missing)
 
     def test_nxp_reports_an_empty_page_short_of_its_total(self):
         self.patch(vendor_nxp, PACE_SECONDS=0)
