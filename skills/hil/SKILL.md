@@ -282,7 +282,8 @@ recovery stay the contract's. Linux only.
   cleanup `pending` with the session's receipt for the caller's cleanup
   holder, and no retry, restore or test may overlap it.
   `session_state(receipt)` is a session's state for lock retention, by pid
-  and start time alone. The module and function docstrings have the
+  and start time alone, from `hil_openocd_esp_receipt.py`, which loads alone
+  for a lock keeper. The module and function docstrings have the
   mechanics, `usj_tty` and `usj_node` included.
 - `scripts/hil_openocd_esp.py end --receipt <receipt> [--timeout S]` ends such
   a pending session with `reset run` and a confirmed shutdown, within one
@@ -318,6 +319,7 @@ recovery stay the contract's.
 | `hil_process.py` | `run_cmd`, a bounded command; `run_tracked` and `recheck`, a command whose end is proven |
 | `hil_farm_check.py` | the farm check engine a project's launcher drives with its profile (Farm check above) |
 | `hil_report_notice.py` | the unavailable notice and the report writer lock, loadable when the core is not (`write_unavailable`) |
+| `hil_openocd_esp_receipt.py` | an `openocd_esp` session's state from its receipt, loadable without the provider (`session_state`) |
 | `hil_report_core.py` | the report document: `_hil` metadata and roster identity, attempt archive, withdrawal and publish recovery, adopting a fetched report, the Markdown view, run and sequence verdicts |
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
@@ -333,7 +335,8 @@ recovery stay the contract's.
 - Each script exports `FILES`, a literal of the agentrc-root-relative files it
   loads or launches by path, transitively, and refuses at import naming any
   that is missing. What a harness requires and stages is each script it loads
-  plus its `FILES`, never a restated list; `hil_report_notice.py` loads alone.
+  plus its `FILES`, never a restated list; `hil_report_notice.py` and
+  `hil_openocd_esp_receipt.py` load alone.
 - The farm check engine releases a board it reserved (`protected=True`) only
   once every process it started there is proven ended: `run_tracked`'s
   `done`, or a `recheck` of its receipt that answers `done`. Anything else

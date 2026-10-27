@@ -10,6 +10,7 @@ if os.name == 'nt':
 import hashlib
 import importlib.util
 import json
+import shutil
 import signal
 import socket
 import stat
@@ -1620,7 +1621,7 @@ class SessionState(unittest.TestCase):
             if str(path) == f'/proc/{self.p.pid}/stat':
                 raise PermissionError(13, 'Permission denied', str(path))
             return real(path, *a, **kw)
-        with mock.patch.object(oe, 'open', guarded, create=True):
+        with mock.patch.object(oe.receipt_state, 'open', guarded, create=True):
             self.assertEqual(oe.session_state(self.rec), 'running')
 
     def test_a_receipt_that_is_not_well_formed_is_unreadable(self):
@@ -1631,6 +1632,36 @@ class SessionState(unittest.TestCase):
                         {**self.rec, 'startTime': None}, {k: v for k, v in self.rec.items() if k != 'pid'}, []):
             with self.subTest(receipt=receipt):
                 self.assertEqual(oe.session_state(receipt), 'unreadable')
+
+    def test_the_receipt_reader_loads_alone_with_every_state(self):
+        # a lock keeper loads only the reader, so none of the provider's dependencies may be needed
+        self.assertIs(oe.session_state, oe.receipt_state.session_state)
+        with tempfile.TemporaryDirectory() as td:
+            shutil.copy2(SCRIPTS / 'hil_openocd_esp_receipt.py', td)
+            gone = subprocess.Popen(['true'])
+            gone.wait()
+            cases = [({**self.rec, 'closed': True, 'cleanup': 'done'}, 'ended'),
+                     ({**self.rec, 'closed': True, 'cleanup': 'pending'}, 'unresolved'),
+                     (self.rec, 'running'),
+                     ({**self.rec, 'startTime': str(int(self.rec['startTime']) + 1)}, 'unresolved'),
+                     ({**self.rec, 'pid': gone.pid}, 'unresolved'),
+                     (self.write(self.rec), 'running'),
+                     (str(Path(td) / 'none.json'), 'unreadable'),
+                     ({**self.rec, 'pid': True}, 'unreadable')]
+            r = subprocess.run(
+                [sys.executable, '-I', '-c',
+                 'import importlib.util, json, sys\n'
+                 'spec = importlib.util.spec_from_file_location("r", sys.argv[1])\n'
+                 'mod = importlib.util.module_from_spec(spec)\n'
+                 'spec.loader.exec_module(mod)\n'
+                 'print(json.dumps([mod.session_state(c) for c in json.loads(sys.argv[2])]))\n'
+                 'print(mod.FILES, sorted(n for n in sys.modules if n.startswith("agentrc_")))',
+                 str(Path(td) / 'hil_openocd_esp_receipt.py'), json.dumps([c for c, _ in cases])],
+                capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        states, loaded = r.stdout.splitlines()
+        self.assertEqual(json.loads(states), [want for _, want in cases])
+        self.assertEqual(loaded, '() []')
 
 
 class UsjTtyNode(unittest.TestCase):

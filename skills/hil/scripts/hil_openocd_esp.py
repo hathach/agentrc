@@ -67,7 +67,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FILES = ('skills/hil/scripts/hil_load.py', 'skills/hil/scripts/usb_observe.py', 'skills/hil/scripts/hil_process.py',
          'skills/hil/scripts/hil_flash.py', 'skills/hil/scripts/pyocd/run_pyocd.py',
          'skills/hil/scripts/pyocd/user_script.py', 'skills/target-debug/scripts/esp_session.py',
-         'skills/hil/scripts/esptool_session.py')
+         'skills/hil/scripts/esptool_session.py', 'skills/hil/scripts/hil_openocd_esp_receipt.py')
 ESPTOOL_SESSION = os.path.join(HERE, 'esptool_session.py')   # read_security's child
 
 
@@ -90,6 +90,8 @@ hil_process = hil_load.load_file('skills/hil/scripts/hil_process.py')
 hil_flash = hil_load.load_file('skills/hil/scripts/hil_flash.py')
 # Tcl token check, receipts and process identity
 esp_session = hil_load.load_file('skills/target-debug/scripts/esp_session.py')
+receipt_state = hil_load.load_file('skills/hil/scripts/hil_openocd_esp_receipt.py')
+session_state, _int = receipt_state.session_state, receipt_state._int
 
 # The build whose program_esp, flash write_image/read_bank, esp_usb_jtag and shutdown paths were
 # read; another build is refused until its source is checked again. The pin also covers the `esp`
@@ -624,10 +626,6 @@ SECTOR = 4096           # FLASH_SECTOR_SIZE of every esp32*.c flash driver
 _SEGMENT_KEYS = {'offset', 'file', 'size', 'encrypted', 'sha256'}
 
 
-def _int(v):
-    return isinstance(v, int) and not isinstance(v, bool)
-
-
 _HEX = frozenset(b'0123456789abcdefABCDEF')
 
 
@@ -1025,39 +1023,6 @@ def reset_openocd_esp(flasher: dict, *, workdir, timeout, openocd=None, retains_
 END_TIMEOUT = 60
 _RECEIPT_KEYS = ('pid', 'startTime', 'argv', 'ports', 'token', 'log', 'closed', 'init', 'submitted')
 NEEDS_RECOVERY = 'the board stays held and needs a separately reviewed recovery'
-
-
-def session_state(receipt) -> str:
-    """The state of the session a receipt names (its path, or the record itself when the provider
-    could not write it), reread on every call, for lock retention: 'ended' (closed after the
-    reviewed end), 'unresolved' (closed without it, or its process gone), 'running' (a process
-    with the receipt's pid and start time, a zombie included, or one whose /proc entry could not
-    be read) or 'unreadable' (no well-formed receipt). Liveness by pid and start time only, never
-    the argv: whether `end` may address the server is esp_session.same_process's (argv and start
-    time), which a 'running' session need not satisfy."""
-    rec = receipt
-    if not isinstance(rec, dict):
-        try:
-            with open(receipt) as f:
-                rec = json.load(f)
-        except (OSError, ValueError, TypeError):
-            return 'unreadable'
-    try:
-        closed, pid, start = rec['closed'], rec['pid'], rec['startTime']
-        if not isinstance(closed, bool) or not _int(pid) or pid <= 0 or not str(start).isdigit():
-            return 'unreadable'
-    except (KeyError, TypeError):
-        return 'unreadable'
-    if closed:
-        return 'ended' if rec.get('cleanup') == 'done' else 'unresolved'
-    try:
-        with open(f'/proc/{pid}/stat') as f:
-            fields = f.read().rsplit(')', 1)[1].split()
-    except (FileNotFoundError, ProcessLookupError):
-        return 'unresolved'
-    except OSError:
-        return 'running'
-    return 'running' if len(fields) > 19 and fields[19] == str(start) else 'unresolved'
 
 
 def _exited(pidfd, deadline) -> bool:
