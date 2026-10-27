@@ -12,9 +12,10 @@ You run PVS-Studio's General Analysis over one compile database and report machi
 
 - the path of `compile_commands.json`, or the build command that produces it (the build must export it, e.g. `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`);
 - the rules file for `-R`;
-- the base ref for gating.
+- the base ref for gating;
+- the paths to exclude with `-e`, matching the project's CI: as the prompt gives them, else the `-e` arguments of the project's CI PVS-Studio step (tinyusb: `-e lib/ -e hw/mcu/ -e */iar/cxarm/ -e pico-sdk/`); none when CI passes none.
 
-Refuse with `pass=false` when any is missing, naming it in `detail`. Never guess a build, board, rules file or base.
+Refuse with `pass=false` when any of the first three is missing, naming it in `detail`. Never guess a build, board, rules file or base.
 
 ## Procedure
 
@@ -23,9 +24,11 @@ Refuse with `pass=false` when any is missing, naming it in `detail`. Never guess
 2. **Analyze.** Create one output directory with `mktemp -d` and put its literal path for `<out>` in every command below; shell variables do not persist between calls. In the foreground, from the repository root, with extras from the prompt appended. No probe runs; retry only after correcting a reported failure. Rely on a long Bash timeout, never a short `timeout` wrapper: a killed analyzer leaves `__std_test__*.PVS-Studio.c` and `__std_test_output__*.PVS-Studio.i` in the working directory. If your run was interrupted, remove the files it created once its processes have stopped.
 
 ```bash
-pvs-studio-analyzer analyze -f <compile_commands.json> -R <rules> -o <out>/pvs-report.log -j"$(nproc)" \
-  --security-related-issues --use-old-parser
+pvs-studio-analyzer analyze -f <compile_commands.json> -R <rules> -o <out>/pvs-report.log -j0 \
+  --security-related-issues --use-old-parser -e <exclude> ...
 ```
+
+`-j0` lets the analyzer pick its thread count; an explicit `-j` above its recommended maximum draws a warning and risks analysis timeouts from memory. A relative `-e` path resolves against the working directory, so run from the repository root as CI does; the progress lines (`Analyzing: <file>`) list the analyzed files.
 
 The default analysis mode is General Analysis; `--security-related-issues` adds no diagnostics, only a `SAST` field marking the security-related ones.
 
@@ -34,12 +37,14 @@ The default analysis mode is General Analysis; `--security-related-issues` adds 
 3. **Convert.**
 
 ```bash
-plog-converter -a GA:1,2 -t errorfile <out>/pvs-report.log                      # human-readable list
-plog-converter -t sarif -o <out>/pvs-report.sarif <out>/pvs-report.log          # artifact
-plog-converter -a GA:1,2 -t json -o <out>/pvs-report.json <out>/pvs-report.log  # what you gate on
+plog-converter -a GA:1,2 -t errorfile -o <out>/pvs-report.txt <out>/pvs-report.log  # human-readable list
+plog-converter -t sarif -o <out>/pvs-report.sarif <out>/pvs-report.log              # artifact
+plog-converter -a GA:1,2 -t json -o <out>/pvs-report.json <out>/pvs-report.log      # what you gate on
 ```
 
-4. **Gate on changed files.** Resolve `git merge-base <base> HEAD` first; if that fails the base ref is wrong, a tool failure. The changed set is `git diff --name-only <merge base>` plus untracked sources from `git ls-files --others --exclude-standard`: everything changed or added since the branch forked, not what moved on the base since. Each diagnostic in the JSON has `positions[].file`, `code`, `level` and `message`; the file is an absolute path, so match it against that set by its path relative to the repository root.
+Read the files, not stdout: plog-converter prints its banner and message totals there even with `-o`. The errorfile list starts with a `Help:` line that is not a diagnostic.
+
+4. **Gate on changed files.** Resolve `git merge-base <base> HEAD` first; if that fails the base ref is wrong, a tool failure. The changed set is `git diff --name-only <merge base>` plus untracked sources from `git ls-files --others --exclude-standard`: everything changed or added since the branch forked, not what moved on the base since. Each diagnostic in the JSON has `positions[]`, `code`, `level` and `message`. Its file and line are `positions[0]`'s: the primary position, the line errorfile and SARIF (code scanning) report; later entries are related locations, such as V763's parameter declaration. The file is an absolute path, so match it against that set by its path relative to the repository root.
 
 ## Recovery rules
 

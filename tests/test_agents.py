@@ -119,6 +119,19 @@ class AgentFiles(unittest.TestCase):
         debugger = ' '.join((AGENTS / 'hw-debugger.md').read_text().split())
         self.assertIn('zero new hardware use, and `n-a` for every hardware cleanup action it did not perform', debugger)
 
+    def test_pvs_studio_recipe_matches_ci_and_reads_converter_files(self):
+        """(c) recipe form: CI's excludes, the analyzer's own thread count, findings from -o files only."""
+        body = (AGENTS / 'pvs-studio.md').read_text()
+        analyze = re.search(r'pvs-studio-analyzer analyze .*?\n```', body, re.S).group(0)
+        self.assertIn('-j0', analyze)
+        self.assertNotIn('nproc', analyze)
+        self.assertIn('-e <exclude>', analyze)
+        converters = [line for line in body.splitlines() if line.startswith('plog-converter ')]
+        self.assertEqual(len(converters), 3)
+        for line in converters:
+            self.assertIn(' -o <out>/', line)
+        self.assertIn("Its file and line are `positions[0]`'s", ' '.join(body.split()))
+
     def test_commit_recipes_put_options_before_the_pathspec(self):
         """An option after `--` is read as a path, so the recipe must carry -m before it."""
         for path in (AGENTS / 'chief.md', AGENTS / 'hw-debugger.md', AGENTS.parent / 'workflows' / 'fix-issue.js'):
