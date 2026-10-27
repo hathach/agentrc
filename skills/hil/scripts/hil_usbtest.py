@@ -264,7 +264,7 @@ def check_host_compat(node):
     the MosChip MCS9990 (9710:9990) outright (buggy FRINDEX silicon: EHCI never
     schedules int-OUT URBs and mangles unlinked reads - verified A/B 2026-07-09). A Renesas
     uPD720201/02 needs firmware >= 2.0.2.6, or its command ring dies under unlink stress: a rig
-    setup prerequisite, checked by the rig when its runner starts, not here."""
+    setup prerequisite its owner checks after each reboot, not checked here."""
     for attempt in range(3):
         try:
             root = SYS_USB / f"usb{int(node.split('/')[-2])}"

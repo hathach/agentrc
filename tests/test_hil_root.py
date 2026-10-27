@@ -100,8 +100,8 @@ class Sysfs(unittest.TestCase):
 
 class Usage(Sysfs):
     def test_unknown_verb_and_wrong_argc_refuse(self):
-        # new-id, bind and unbind went with usbtest's new_id (kernel 6.12.108), renesas-fw to the rig's
-        # runner-start check: refused like any unknown verb
+        # new-id, bind and unbind went with usbtest's new_id (kernel 6.12.108), renesas-fw to the rig
+        # owner's manual check: refused like any unknown verb
         for args in ((), ('chmod', '/etc/shadow'), ('dmesg', 'x'), ('new-id', 'cafe', '4010', '0525', 'a4a0'),
                      ('bind', '1-2:1.0'), ('unbind', '1-2:1.0'), ('renesas-fw', '0000:03:00.0')):
             with self.subTest(args=args):
