@@ -290,12 +290,14 @@ class PreflightTest(unittest.TestCase):
         self.fake_gh('', 1)
         (self.repo / 'a name.c').write_text('x')
         (self.repo / 'staged.c').write_text('x')
+        (self.repo / 'new').mkdir()
+        (self.repo / 'new' / 'x.c').write_text('x')
         self.git('add', 'staged.c')
         code, out = self.pin('--recheck')
         self.assertEqual((code, self.gh_calls()), (0, []))
         self.assertEqual(out, {'branch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
                                'head': self.git('rev-parse', 'HEAD').strip(), 'staged': ['staged.c'],
-                               'status': ['A  staged.c', '?? a name.c']})
+                               'status': ['A  staged.c', '?? a name.c', '?? new/x.c']}, 'a new directory by its files (#322)')
 
     def test_a_script_the_workflow_needs_and_lacks_is_a_stale_definition(self):
         there = self.root / 'there.py'

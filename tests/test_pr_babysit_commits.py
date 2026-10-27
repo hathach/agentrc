@@ -96,6 +96,8 @@ class CommitsTest(unittest.TestCase):
         self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c'), 'the commit carries unowned path(s): b.c')
         self.write('c.c', 'c\n')
         self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c', 'c.c'), 'the commit left owned change(s) behind: ?? c.c')
+        self.write('new/d.c', 'd\n')
+        self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c', 'new/d.c'), 'the commit left owned change(s) behind: ?? new/d.c')
         self.git('commit', '-q', '--amend', '--allow-empty-message', '-m', '')
         self.assertEqual(self.refusal('head', '--parent', self.base, 'a.c', 'b.c'), 'the commit has no message')
         # A merge whose first parent is right still brings history nothing audited.

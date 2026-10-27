@@ -213,6 +213,19 @@ class HooksTest(unittest.TestCase):
         self.assertEqual(snap['b.txt'], ['absent', '-'])
         self.assertEqual(snap['c.txt'][0], '644')
 
+    def test_files_in_a_new_directory_are_each_a_record_and_snapshotted(self):
+        # One `?? new/` record matched no scope file and refused the fix (#322); a stray neighbour stays outside.
+        self.configure()
+        for f in ('new/x.txt', 'new/y.txt', 'stray/z.txt'):
+            (self.repo / f).parent.mkdir(exist_ok=True)
+            (self.repo / f).write_text(f'{f}\n')
+        scope = ['new/x.txt', 'new/y.txt']
+        code, out = self.run_script(*scope)
+        self.assertEqual(code, 0)
+        self.assertEqual(out['before'], ['?? new/x.txt', '?? new/y.txt', '?? stray/z.txt'])
+        self.assertEqual([r[3:] for r in out['before'] if r[3:] not in scope], ['stray/z.txt'])
+        self.assertEqual(set(self.snap(out['snapshotAfter'])), {*scope, 'stray/z.txt'})
+
     def test_an_executable_is_snapshotted_with_the_mode_git_commits(self):
         self.configure()
         if os.name == 'nt':

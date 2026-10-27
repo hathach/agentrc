@@ -40,7 +40,7 @@ nothing is pinned.
 
 --recheck reads, before a commit, what the pin must still match, without gh:
 branch, pushUrls and head as above, staged (`git diff --cached --name-only -z`
-records) and status (`git status --porcelain -z` records).
+records) and status (`git status --porcelain -z --untracked-files=all` records).
 
 --state reads PR N's state alone (`gh pr view N --json state`): state, as
 prState above.
@@ -102,7 +102,7 @@ def recheck():
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
     return {'branch': branch, 'pushUrls': push_urls(branch)[1], 'head': git('rev-parse', 'HEAD').strip(),
             'staged': records(git('diff', '--cached', '--name-only', '-z')),
-            'status': records(git('status', '--porcelain', '-z'))}
+            'status': records(git('status', '--porcelain', '-z', '--untracked-files=all'))}
 
 
 def receipts_dir():

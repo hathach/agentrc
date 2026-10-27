@@ -33,7 +33,7 @@ not ending at TO, or a link refused.
 it reads is an error. It reports parent and scope (PATH) as given, sha, entries
 (`git ls-tree -z <sha> -- PATH` lines) and refusal, "" or why the commit cannot
 be published: HEAD still at P, the link refused, a path outside PATH, a change
-to PATH left uncommitted (`git status --porcelain -z -- PATH`), or a blank
+to PATH left uncommitted (`git status --porcelain -z --untracked-files=all -- PATH`), or a blank
 message. PATH is never read as an option or as pathspec magic.
 
 stdout ends with one JSON line: `head` prints {parent, scope, sha, entries,
@@ -98,7 +98,7 @@ def head(parent, paths):
     full(parent)
     sha = git('rev-parse', 'HEAD').strip()
     c = commit(sha)
-    leftover = records(git('--literal-pathspecs', 'status', '--porcelain', '-z', '--', *paths))
+    leftover = records(git('--literal-pathspecs', 'status', '--porcelain', '-z', '--untracked-files=all', '--', *paths))
     entries = records(git('--literal-pathspecs', 'ls-tree', '-z', sha, '--', *paths))
     now = git('rev-parse', 'HEAD').strip()
     if now != sha:
