@@ -85,6 +85,7 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(group['matcher'], 'Bash')
         self.assertEqual(entry['type'], 'command')
         self.assertEqual(entry['command'], f'python3 ~/.claude/skills/cowork/scripts/{SCRIPT.name}')
+        self.assertEqual(entry['onFailure'], 'block')
 
     def test_the_hook_exports_the_marker_cowork_reads(self):
         self.assertEqual(guard.MARKER, cowork.READ_ONLY)
