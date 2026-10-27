@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, absent, http_get, last_modified   # noqa: E402
+from doclib import Doc, absent, begin_enumeration, http_get, last_modified, partial_enumeration   # noqa: E402
 
 AUTHOR = "Texas Instruments"
 BSP = Path.home() / "code" / "tinyusb" / "hw" / "bsp"
@@ -33,8 +33,6 @@ DS = "https://www.ti.com/lit/ds/symlink/{}.pdf"
 
 USB_SCOPE = None
 USB_SCOPE_NOTE = "USB capability is read from each part's datasheet"
-# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
-ENUMERATION_COMPLETE = True
 
 # BSP directory -> family label, and the part-number shape to look for inside it.
 FAMILIES = {
@@ -64,8 +62,7 @@ def _parts_from_bsp() -> dict:
 
 
 def enumerate_docs(families=None, types=None, refresh=False, parts=None) -> list:
-    global ENUMERATION_COMPLETE
-    ENUMERATION_COMPLETE = True
+    begin_enumeration()
     if types and "datasheet" not in types:
         return []
     want = {f.upper() for f in families} if families else None
@@ -82,8 +79,7 @@ def enumerate_docs(families=None, types=None, refresh=False, parts=None) -> list
             if absent(url):
                 print(f"  no datasheet at ti.com/lit/ds/symlink/{part}", file=sys.stderr)
             else:
-                print(f"  {url}: fetch failed", file=sys.stderr)
-                ENUMERATION_COMPLETE = False
+                partial_enumeration(f"{url}: fetch failed")
             missing.append(part)
             continue
         docs.append(Doc(

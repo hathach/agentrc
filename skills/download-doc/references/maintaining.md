@@ -47,7 +47,7 @@ Derive USB-capable part lists from current datasheets (`pdftotext -f 1 -l 6 … 
 rather than model recall, which can omit newer parts.
 
 A family is recorded as USB-less only from a run over the default scope whose adapter
-reported its enumeration complete (`ENUMERATION_COMPLETE`, below); such a verdict carries
+reported no partial enumeration (`doclib.partial_enumeration`, below); such a verdict carries
 `"complete": true` in `usb-capability.json`. A negative without it predates that contract
 and is treated as unresolved until a complete run reads the family again.
 
@@ -224,11 +224,11 @@ Write `scripts/vendor_<name>.py` exposing:
 AUTHOR = "<company name as Calibre files it>"
 enumerate_docs(...) -> list[doclib.Doc]   # Doc(vendor, doc_id, doc_type, version,
                                           #     title, url, author, family, desc)
-ENUMERATION_COMPLETE = True               # reset by each enumerate_docs() call
 ```
 
-An adapter that fetches over the network sets `ENUMERATION_COMPLETE = False` whenever a
-fetch fails and it carries on without what that fetch would have listed; `sync.py` then
+An adapter that fetches over the network starts `enumerate_docs()` with
+`doclib.begin_enumeration()` and calls `doclib.partial_enumeration(why)` whenever a fetch
+fails and it carries on without what that fetch would have listed; `sync.py` then
 calls the list partial (an empty one "enumeration failed", not "no documents") and records
 no family as USB-less from it. A probe that finds nothing is a failure too unless the
 server said so: `doclib.absent(url)` (404 or 410).

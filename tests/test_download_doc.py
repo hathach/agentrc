@@ -1349,6 +1349,21 @@ class VendorSync(unittest.TestCase):
 
     enumerate_vendor = staticmethod(sync.enumerate_vendor)
 
+    def test_a_vendor_that_never_reports_is_not_partial_after_one_that_did(self):
+        self.docs = [st_doc('AN1', [])]
+
+        def enumerate_vendor(vendor, args):
+            if vendor == 'st':
+                doclib.partial_enumeration('SS1: fetch failed')
+            return list(self.docs)
+        sync.enumerate_vendor = enumerate_vendor
+        code, _, err = run_sync('st')
+        self.assertEqual(code, 0, err)
+        self.assertIn('enumeration incomplete', err)
+        code, _, err = run_sync('rpi')
+        self.assertEqual(code, 0, err)
+        self.assertNotIn('enumeration incomplete', err)
+
     def test_any_vendor_plans_at_most_the_limit(self):
         self.docs = [st_doc(f'DS{n}', []) for n in range(5)]
         self.adapter('rpi')
@@ -1432,7 +1447,7 @@ class VendorSync(unittest.TestCase):
                                          'localizedLinks': {'en': f'/{d}.pdf'}} for d in grids[gid][1]]}).encode()
         shutil.rmtree(self.root / 'st', ignore_errors=True)
         for name, value in (('SERIES', {g: fam for g, (fam, _) in grids.items()}), ('CACHE', self.root / 'st'),
-                            ('http_get', http_get), ('ENUMERATION_COMPLETE', True)):
+                            ('http_get', http_get)):
             patch = unittest.mock.patch.object(vendor_st, name, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -1477,8 +1492,7 @@ class VendorSync(unittest.TestCase):
                 return {'totalcount': 4, 'results': [
                     {'metaData': {'code': c}, 'url': f'https://nxp.com/{c}.pdf', 'title': c} for c in codes]}
             with unittest.mock.patch.object(vendor_nxp, '_page', page), \
-                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None), \
-                    unittest.mock.patch.object(vendor_nxp, 'ENUMERATION_COMPLETE', True):
+                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None):
                 return run_sync('nxp')
         sync.enumerate_vendor = self.enumerate_vendor
         self.peek_usb_in('LPC99DS3')
@@ -1503,8 +1517,7 @@ class VendorSync(unittest.TestCase):
             cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
             cache.unlink(missing_ok=True)
             with unittest.mock.patch.object(vendor_nxp, '_page', page), \
-                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None), \
-                    unittest.mock.patch.object(vendor_nxp, 'ENUMERATION_COMPLETE', True):
+                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None):
                 code, _, err = run_sync('nxp')
             return code, err, json.loads(cache.read_text()) if cache.exists() else {}
         sync.enumerate_vendor = self.enumerate_vendor
@@ -1635,17 +1648,17 @@ class EnumerationComplete(unittest.TestCase):
         self.root = Path(tmp.name)
 
     def patch(self, mod, **attrs):
-        for name, value in {'ENUMERATION_COMPLETE': True, **attrs}.items():
+        for name, value in attrs.items():
             patch = unittest.mock.patch.object(mod, name, value)
             patch.start()
             self.addCleanup(patch.stop)
 
     def complete(self, mod, http_get, **kw):
-        """mod.enumerate_docs(**kw) with http_get answering -> its ENUMERATION_COMPLETE afterwards."""
+        """mod.enumerate_docs(**kw) with http_get answering -> whether it reported its list complete."""
         with unittest.mock.patch.object(mod, 'http_get', http_get), \
                 contextlib.redirect_stderr(io.StringIO()):
             mod.enumerate_docs(**kw)
-        return mod.ENUMERATION_COMPLETE
+        return doclib.enumeration_complete
 
     @staticmethod
     def fails(*a, **k):
@@ -1661,9 +1674,17 @@ class EnumerationComplete(unittest.TestCase):
         self.addCleanup(sleep.stop)
         for mod, answers in cases.items():
             with self.subTest(mod.__name__):
-                self.patch(mod)
                 self.assertFalse(self.complete(mod, self.fails, refresh=True))
                 self.assertTrue(self.complete(mod, answers, refresh=True))
+
+    def test_each_enumeration_reports_only_its_own_fetches(self):
+        page = lambda *a, **k: b'<html>' + b' ' * 3000
+        self.assertEqual([self.complete(vendor_allwinner, get) for get in (self.fails, page, self.fails, page)],
+                         [False, True, False, True])
+
+    def test_a_partial_enumeration_does_not_carry_over_to_another_vendor(self):
+        self.assertFalse(self.complete(vendor_allwinner, self.fails))
+        self.assertTrue(self.complete(vendor_wch, lambda *a, **k: b'{"code": 0, "message": null, "data": null}'))
 
     def test_wch_reports_an_unsuccessful_answer_from_a_related_page(self):
         # The seed answers; the page it links to answers with an error code instead.
@@ -1708,7 +1729,7 @@ class EnumerationComplete(unittest.TestCase):
                     unittest.mock.patch.object(vendor_nxp, '_page', lambda *a: {'totalcount': total, 'results': []}), \
                     contextlib.redirect_stderr(io.StringIO()):
                 vendor_nxp.enumerate_docs(types=['errata'])
-                self.assertIs(vendor_nxp.ENUMERATION_COMPLETE, complete)
+                self.assertIs(doclib.enumeration_complete, complete)
 
 
 class DocumentLimit(unittest.TestCase):

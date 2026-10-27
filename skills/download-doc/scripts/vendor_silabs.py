@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, absent, http_get, last_modified   # noqa: E402
+from doclib import Doc, absent, begin_enumeration, http_get, last_modified, partial_enumeration   # noqa: E402
 
 AUTHOR = "Silicon Labs"
 BSP = Path.home() / "code" / "tinyusb" / "hw" / "bsp" / "efm32"
@@ -29,8 +29,6 @@ BASE = "https://www.silabs.com/documents/public"
 
 USB_SCOPE = None
 USB_SCOPE_NOTE = "USB capability is read from each family's datasheet"
-# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
-ENUMERATION_COMPLETE = True
 
 KINDS = {
     "datasheet":        ("data-sheets", "{}-datasheet.pdf"),
@@ -62,8 +60,7 @@ def _families_from_bsp() -> set:
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
-    global ENUMERATION_COMPLETE
-    ENUMERATION_COMPLETE = True
+    begin_enumeration()
     want = {f.lower() for f in families} if families else None
     docs = []
     for fam in sorted(_families_from_bsp()):
@@ -78,8 +75,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
                          validate=lambda b: b.startswith(b"%PDF"))
             except RuntimeError:
                 if not absent(url):   # a 404 is a family with no document of that kind
-                    print(f"  {url}: fetch failed", file=sys.stderr)
-                    ENUMERATION_COMPLETE = False
+                    partial_enumeration(f"{url}: fetch failed")
                 continue
             docs.append(Doc(
                 vendor="silabs", doc_id=f"{fam}-{kind}", doc_type=kind,

@@ -546,9 +546,11 @@ def sync_vendor(args, tmp: Path) -> int:
                   file=sys.stderr)
 
     print(f"enumerating {args.vendor} ...", file=sys.stderr)
+    # Reset here too: an adapter that never reports must not inherit an earlier run's verdict.
+    doclib.begin_enumeration()
     docs = enumerate_vendor(args.vendor, args)
     # An adapter that kept what it had past a failed fetch says so; the list is partial.
-    enumerated = getattr(mod, "ENUMERATION_COMPLETE", True)
+    enumerated = doclib.enumeration_complete
     complete = complete and enumerated
     if not docs:
         print(f"{args.vendor}: no documents for the requested scope" if enumerated else

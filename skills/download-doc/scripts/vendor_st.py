@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, cap_families, http_get   # noqa: E402
+from doclib import Doc, begin_enumeration, cap_families, http_get, partial_enumeration   # noqa: E402
 
 GRID = "https://www.st.com/bin/st/selectors/cxst/en.cxst-rs-grid.html/{}.all.json"
 BASE = "https://www.st.com"
@@ -32,8 +32,6 @@ USB_SCOPE_NOTE = ("USB capability is not stated per series anywhere in the resou
 AUTHOR = "STMicroelectronics"
 CACHE = Path.home() / ".cache" / "download-doc" / "st"
 PACE_SECONDS = 3          # be a polite guest; ST throttles fast loops
-# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
-ENUMERATION_COMPLETE = True
 
 # Grid ID -> family tag. CL1734 is the class-wide grid (no family of its own).
 SERIES = {
@@ -63,7 +61,6 @@ TYPE_MAP = {
 
 def _grid(grid_id: str, refresh: bool = False) -> list:
     """Fetch one grid, cached. Returns rows (possibly empty if ST is throttling)."""
-    global ENUMERATION_COMPLETE
     CACHE.mkdir(parents=True, exist_ok=True)
     f = CACHE / f"{grid_id}.json"
     if f.exists() and not refresh:
@@ -74,9 +71,8 @@ def _grid(grid_id: str, refresh: bool = False) -> list:
         if f.exists():
             print(f"  {grid_id}: fetch failed, using cached copy", file=sys.stderr)
             return json.loads(f.read_text(encoding="utf-8")).get("rows", [])
-        print(f"  {grid_id}: fetch failed and nothing cached — ST is likely throttling; "
-              f"wait a few minutes and re-run (progress is cached)", file=sys.stderr)
-        ENUMERATION_COMPLETE = False
+        partial_enumeration(f"{grid_id}: fetch failed and nothing cached — ST is likely throttling; "
+                            f"wait a few minutes and re-run (progress is cached)")
         return []
     f.write_bytes(data)
     time.sleep(PACE_SECONDS)
@@ -96,8 +92,7 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
     families: e.g. ['STM32H7'] — None means every grid (slow; ~25 fetches).
     types:    normalized kinds, e.g. ['datasheet', 'errata'].
     """
-    global ENUMERATION_COMPLETE
-    ENUMERATION_COMPLETE = True
+    begin_enumeration()
     grids = [g for g, fam in SERIES.items()
              if families is None or fam is None or fam in families]
     if families:   # a named family implies its grid; drop the class-wide one unless asked

@@ -325,6 +325,24 @@ DOCID_IN_PDF = re.compile(r"\b(DS|RM|ES|PM|UM|AN|TN)\s?(\d{3,5})\b\s*[-–]?\s*R
 
 # ---------------------------------------------------------------- documents
 
+# Whether the latest enumeration listed its whole scope. An adapter that carries on past
+# a failed fetch reports it here; sync.py then records no family as USB-less from the list.
+enumeration_complete = True
+
+
+def begin_enumeration() -> None:
+    """Called first by every enumerate_docs(), so one failed run does not mark the next."""
+    global enumeration_complete
+    enumeration_complete = True
+
+
+def partial_enumeration(why: str) -> None:
+    """Report a fetch the enumeration carried on without: its list is now partial."""
+    global enumeration_complete
+    print(f"  {why}", file=sys.stderr)
+    enumeration_complete = False
+
+
 # The default document scope. "Technical" here means the documents you consult to
 # actually program a part — not product briefs, presentations, packaging or
 # certification paperwork, which are the bulk of a vendor catalogue and noise in a

@@ -26,7 +26,7 @@ from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get   # noqa: E402
+from doclib import Doc, begin_enumeration, http_get, partial_enumeration   # noqa: E402
 
 AUTHOR = "Nanjing Qinheng Microelectronics (WCH)"
 API = "https://www.wch-ic.com/api/official/website/common/relationFiles?fileName={}"
@@ -34,8 +34,6 @@ FILE = "https://www.wch-ic.com/download/file?id={}"
 
 USB_SCOPE = None
 USB_SCOPE_NOTE = "USB capability is read from each part's datasheet"
-# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
-ENUMERATION_COMPLETE = True
 
 # Seeds: TinyUSB ports these families, and each seed pulls in its relatives.
 SEEDS = ["CH32V307DS0_PDF.html", "CH32V203DS0_PDF.html", "CH32V103DS0_PDF.html",
@@ -57,28 +55,24 @@ def _kind(name: str) -> str | None:
 
 
 def _fetch(file_name: str) -> dict | None:
-    global ENUMERATION_COMPLETE
     try:
         d = http_get(API.format(file_name), timeout=30, accept="application/json",
                      validate=lambda b: b.lstrip()[:1] == b"{")
     except RuntimeError:
         # Its relatives are reached only through this page, so the crawl is now partial.
-        print(f"  {file_name}: fetch failed", file=sys.stderr)
-        ENUMERATION_COMPLETE = False
+        partial_enumeration(f"{file_name}: fetch failed")
         return None
     j = json.loads(d)
     # An unknown name is {"code": 0, "data": null} (seen 2026-10-27); any other code is a
     # failure that proves nothing about the page.
     if j.get("code") != 0:
-        print(f"  {file_name}: API answered code {j.get('code')!r}: {j.get('message')}", file=sys.stderr)
-        ENUMERATION_COMPLETE = False
+        partial_enumeration(f"{file_name}: API answered code {j.get('code')!r}: {j.get('message')}")
         return None
     return j.get("data")
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
-    global ENUMERATION_COMPLETE
-    ENUMERATION_COMPLETE = True
+    begin_enumeration()
     want = {f.upper() for f in families} if families else None
     seen, docs, queue, have = set(), [], deque(SEEDS), set()
     while queue:

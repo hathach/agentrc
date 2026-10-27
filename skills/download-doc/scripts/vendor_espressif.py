@@ -19,7 +19,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get   # noqa: E402
+from doclib import Doc, begin_enumeration, http_get, partial_enumeration   # noqa: E402
 
 INDEX = "https://www.espressif.com/en/support/documents/technical-documents"
 AUTHOR = "Espressif Systems"
@@ -42,8 +42,6 @@ CACHE = Path.home() / ".cache" / "download-doc" / "espressif"
 # documents by default; naming a chip explicitly bypasses this either way.
 USB_SCOPE = {"ESP32-S2", "ESP32-S3", "ESP32-S31", "ESP32-P4"}
 USB_SCOPE_NOTE = "chips with a programmable USB (OTG) controller; USB-Serial/JTAG-only parts excluded"
-# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
-ENUMERATION_COMPLETE = True
 
 OTG_CHIPS = {
     "esp32-s2": "ESP32-S2",     # USB OTG, Full-Speed
@@ -98,7 +96,6 @@ def _resolve_pdf(url: str) -> str | None:
     filter. Those pages carry a link to their own PDF build, so follow it rather
     than guessing the filename: the obvious `...-en-latest-<chip>.pdf` 404s while
     the real one is `...-en-master-<chip>.pdf`."""
-    global ENUMERATION_COMPLETE
     if url.lower().endswith(".pdf"):
         return url
     if "docs.espressif.com" not in url:
@@ -107,8 +104,7 @@ def _resolve_pdf(url: str) -> str | None:
         page = http_get(url, timeout=30, accept="text/html",
                         validate=lambda b: b"<html" in b.lower()).decode("utf-8", "replace")
     except RuntimeError:
-        print(f"  {url}: fetch failed", file=sys.stderr)
-        ENUMERATION_COMPLETE = False
+        partial_enumeration(f"{url}: fetch failed")
         return None
     m = re.search(r'href="([^"]+\.pdf)"', page)
     return urljoin(url, m.group(1)) if m else None
@@ -120,8 +116,7 @@ def enumerate_docs(chips=None, types=None, refresh=False) -> list:
     chips: filenames/titles must mention one of these (default: the USB-OTG parts).
            Pass an empty list to disable chip filtering entirely.
     """
-    global ENUMERATION_COMPLETE
-    ENUMERATION_COMPLETE = True
+    begin_enumeration()
     want = OTG_CHIPS if chips is None else {c.lower(): c.upper() for c in chips}
     docs, seen = [], set()
     for row in _ROW.findall(_index_html(refresh)):
