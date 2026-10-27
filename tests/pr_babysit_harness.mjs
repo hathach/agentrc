@@ -6202,17 +6202,17 @@ test('a chain the audit script cannot read back is refused with its error', asyn
   assert.deepEqual(labels, ['preflight', 'adopt:audit'])
 })
 
-test('adoptHead argument errors throw before any agent runs', async () => {
-  const malformed = adoptionState()
-  const equal = adoptionState()
-  for (const [name, args] of [
-    ['malformed SHA', adoptionArgs(malformed, { adoptHead: 'not-a-full-sha' })],
-    ['candidate equals expected head', adoptionArgs(equal, { adoptHead: HEAD })],
-  ]) {
-    const trace = []
-    await assert.rejects(run({ args, trace }), /adoptHead|adopt head/i, name)
-    assert.deepEqual(trace, [], `${name}: argument validation precedes preflight`)
-  }
+test('a malformed adoptHead throws before any agent runs', async () => {
+  const trace = []
+  await assert.rejects(run({ args: adoptionArgs(adoptionState(), { adoptHead: 'not-a-full-sha' }), trace }), /adoptHead must be a full 40-hex commit SHA/)
+  assert.deepEqual(trace, [], 'argument validation precedes preflight')
+})
+
+test("an adoptHead equal to the state's expectedHead stops at preflight, naming the state's head", async () => {
+  const { result, labels } = await run({ args: adoptionArgs(adoptionState(), { adoptHead: HEAD }) })
+  assert.equal(result.reason, 'adopt-audit-failed')
+  assert.equal(result.detail, `adoptHead ${HEAD.slice(0, 7)} is the state's expectedHead: launch without it`)
+  assert.deepEqual(labels, ['preflight'])
 })
 
 // #45: the user's word that the PR history was rewritten re-pins the state to the published head.
