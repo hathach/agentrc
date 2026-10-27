@@ -32,6 +32,7 @@ SYS_USB = Path('/sys/bus/usb/devices')
 PATTERN_PARAM = Path('/sys/module/usbtest/parameters/pattern')
 DEV_USB = '/dev/bus/usb'
 DMESG, MODPROBE = '/usr/bin/dmesg', '/usr/sbin/modprobe'
+ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'}   # fixed, not the caller's: modprobe takes options from MODPROBE_OPTIONS
 USB_MAJOR = 189                               # usb_device char major (v6.12 include/linux/usb.h)
 
 _BUSPORT = re.compile(r'[1-9][0-9]*-[1-9][0-9]*(\.[1-9][0-9]*)*\Z')
@@ -83,7 +84,7 @@ def pattern(value):
 
 
 def _run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+    r = subprocess.run(cmd, capture_output=True, text=True, errors='replace', env=ENV)
     sys.stderr.write(r.stderr)
     return r
 

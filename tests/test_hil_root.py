@@ -128,22 +128,23 @@ class Programs(Sysfs):
         seen = []
 
         def run(cmd, **kw):
-            seen.append(cmd)
+            seen.append((cmd, kw.get('env')))
             return subprocess.CompletedProcess(cmd, rc, stdout, '')
-        p = mock.patch.object(hr.subprocess, 'run', run)
-        p.start()
-        self.addCleanup(p.stop)
+        for p in (mock.patch.object(hr.subprocess, 'run', run),
+                  mock.patch.dict(os.environ, {'MODPROBE_OPTIONS': '-C /tmp/evil.conf'})):
+            p.start()
+            self.addCleanup(p.stop)
         return seen
 
     def test_dmesg_keeps_only_usbtest_lines(self):
         seen = self.run_with('[1] usbtest 1-2:1.0: x\n[2] secret\n[3] usbtest y\n')
         self.assertEqual(self.main('dmesg'), (0, '[1] usbtest 1-2:1.0: x\n[3] usbtest y\n', ''))
-        self.assertEqual(seen, [[hr.DMESG]])
+        self.assertEqual(seen, [([hr.DMESG], {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'})])
 
-    def test_modprobe_is_usbtest_only(self):
+    def test_modprobe_is_usbtest_only_without_the_callers_environment(self):
         seen = self.run_with()
         self.assertEqual(self.main('modprobe')[0], 0)
-        self.assertEqual(seen, [[hr.MODPROBE, 'usbtest']])
+        self.assertEqual(seen, [([hr.MODPROBE, 'usbtest'], {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin'})])
 
 
 class ResetTt(Sysfs):
