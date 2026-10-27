@@ -306,14 +306,15 @@ def ensure_usbtest_bound(interface, node):
     a usbfs CONNECT (device_attach, v6.12 devio.c proc_ioctl) rather than the driver's bind
     file, since any opener with write access may issue it, no root, and its fd pins one
     enumeration. Both take the device's and then the interface's lock, so it runs in a child
-    bounded at CONNECT_TIMEOUT. A node this user cannot write and an interface held by another
-    driver (a usbfs claim, a foreign driver) are named exits, never sudo or a steal."""
+    bounded at CONNECT_TIMEOUT. A node this user cannot write (testusb needs it too, so bound
+    or not) and an interface held by another driver (a usbfs claim, a foreign driver) are named
+    exits, never sudo or a steal."""
+    if not node_writable(node):
+        sys.exit(f"{node} is not writable: testusb and the usbfs CONNECT need write access to it "
+                 "(the project's udev rule)")
     load_usbtest()
     held = bound_driver(interface)
     if held is None:
-        if not node_writable(node):
-            sys.exit(f'{interface} is unbound and {node} is not writable: the usbfs CONNECT that '
-                     "reprobes it needs write access to the node (the project's udev rule)")
         if platform.system() != 'Linux' or platform.machine() not in GENERIC_IOCTL_MACHINES:
             sys.exit(f'{interface} is unbound and usbfs CONNECT has no known ioctl ABI here '
                      f'({platform.system()} {platform.machine()})')

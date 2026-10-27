@@ -112,10 +112,14 @@ class Binding(unittest.TestCase):
         self.assertEqual(self.runs, [([sys.executable, '-I', script, 'connect', self.NODE, '1-1:1.0'],
                                       hu.CONNECT_TIMEOUT)])
 
-    def test_an_unwritable_node_is_a_named_exit_never_sudo(self):
+    def test_an_unwritable_node_is_a_named_exit_before_any_load_or_connect(self):
         patch(self, hu, 'node_writable', lambda node: False)
-        self.assertIn(f'{self.NODE} is not writable', self.exit_of())
-        self.assertEqual(self.runs, [])
+        for bound in (False, True):
+            with self.subTest(bound=bound):
+                if bound:
+                    self.bind('usbtest')
+                self.assertIn(f'{self.NODE} is not writable', self.exit_of())
+                self.assertEqual((self.runs, self.helpers), ([], []))
 
     def test_an_unknown_ioctl_abi_is_refused_before_any_child(self):
         patch(self, hu.platform, 'machine', lambda: 'ppc64le')
@@ -699,7 +703,7 @@ class FindDevice(unittest.TestCase):
 class HostCompat(unittest.TestCase):
     """The upstream controller of the node's bus, from a fake sysfs: usbN -> its PCI function."""
 
-    def host(self, vendor, device, driver='xhci_hcd'):
+    def host(self, vendor, device):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
@@ -707,8 +711,6 @@ class HostCompat(unittest.TestCase):
         (pci / 'usb5').mkdir(parents=True)
         (pci / 'vendor').write_text(vendor + '\n')
         (pci / 'device').write_text(device + '\n')
-        (root / 'drivers' / driver).mkdir(parents=True)
-        (pci / 'driver').symlink_to(root / 'drivers' / driver)
         (root / 'devices').mkdir()
         (root / 'devices' / 'usb5').symlink_to(pci / 'usb5')
         patch(self, hu, 'SYS_USB', root / 'devices')
@@ -719,7 +721,7 @@ class HostCompat(unittest.TestCase):
         hu.check_host_compat('/dev/bus/usb/005/007')
 
     def test_moschip_is_refused(self):
-        self.host('0x9710', '0x9990', driver='ehci-pci')
+        self.host('0x9710', '0x9990')
         with self.assertRaises(SystemExit) as cm:
             self.check()
         self.assertIn('MosChip MCS9990 (0000:03:00.0)', str(cm.exception))
