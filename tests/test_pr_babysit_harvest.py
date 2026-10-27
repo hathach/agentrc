@@ -645,6 +645,23 @@ class EndToEnd(unittest.TestCase):
         self.assertIn('secondary rate limit', got['error'])
         self.assertEqual((got['rateLimit']['resetAt'], got['rateLimit']['secondary']), (None, True))
 
+    def test_a_workflow_read_that_fails_twice_leaves_the_head_undated_and_says_so(self):
+        """#242: the runs date the head, but a failed read of the workflow that would date it is not "nothing dates the head"."""
+        path = f'api repos/o/r/contents/.github/workflows/build.yml?ref={HEAD}'
+        answers = self.answers([HEAD])
+        answers[path] = [{'stderr': 'HTTP 503'}, workflow('on: [push, pull_request]\n')]
+        with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
+            code, got = self.harvest(answers)
+        self.assertEqual((code, got['headEventAt']), (0, '2026-09-25T08:00:00Z'), 'one failed read is read again')
+        harvest.pr_types.cache_clear()
+        answers[path] = [{'stderr': 'HTTP 503'}]
+        with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
+            code, got = self.harvest(answers)
+        self.assertEqual((code, got['headEventAt']), (0, None), got)
+        self.assertIn('workflow .github/workflows/build.yml at aaaaaaaaa could not be read', got['headEventEvidence'])
+        self.assertIn('HTTP 503', got['headEventEvidence'])
+        self.assertNotIn('no push or head-activity', got['headEventEvidence'])
+
     def test_a_malformed_answer_is_an_error(self):
         answers = self.answers([HEAD])
         answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'] = [[[{'id': 30, 'user': None}]]]

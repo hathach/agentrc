@@ -195,6 +195,33 @@ class Trigger(unittest.TestCase):
         self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
         self.assertEqual(self.run_with(Rig(runs=()))[1]['outcome'], 'requested')
 
+    def test_an_unreadable_workflow_that_would_date_the_head_is_an_error_line_not_an_unknown_time(self):
+        # #242: a pull_request run dates the head, and its workflow file does not read twice.
+        reads = []
+
+        def unreadable(rig):
+            answer = rig.run
+
+            def run(*argv, ok=(0,)):
+                if '/contents/' in argv[-1]:
+                    reads.append(argv[-1])
+                    raise harvest.Unusable('gh api: HTTP 503')
+                return answer(*argv, ok=ok)
+            rig.run = run
+            return rig
+        standing = {'id': 50, 'body': '@greptileai', 'created_at': '2026-10-21T09:00:00Z'}
+        rig = unreadable(Rig(comments=[standing], runs=(dict(RUN, event='pull_request'),)))
+        with mock.patch.object(harvest, 'WORKFLOW_RETRY_S', 0):
+            code, out = self.run_with(rig)
+        self.assertEqual(code, 2)
+        self.assertIn('workflow .github/workflows/ci.yml at aaaaaaaaa could not be read (gh api: HTTP 503)', out['error'])
+        self.assertEqual(len(reads), 2, 'read again once')
+        self.assertEqual(rig.posts, [])
+        self.assertFalse((self.dir / f'o-r-7-{HEAD}.json').exists(), 'nothing claimed')
+        fresh = unreadable(Rig(runs=(dict(RUN, event='pull_request'),)))
+        self.assertEqual(self.run_with(fresh)[1]['outcome'], 'requested', 'with no request standing the head time is not needed')
+        self.assertEqual(len(reads), 2, 'nor read')
+
     def test_nothing_is_posted_unless_the_pr_is_open_at_the_head(self):
         for what, rig in (('closed', Rig(state='closed')), ('another head', Rig(head='b' * 40))):
             with self.subTest(what):

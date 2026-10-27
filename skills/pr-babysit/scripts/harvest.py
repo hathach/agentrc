@@ -15,7 +15,8 @@ evidence it cannot order, or a read that failed makes that bot `unknown`,
 never `absent`.
 
 stdout ends with one JSON line: headSha, observedAt, headEventAt (null when no
-run or timeline event dates the head, or no bot auto-runs), headEventEvidence (saying so when, without
+run or timeline event dates the head, when the workflow file of a run that might date it could not be read twice, or
+when no bot auto-runs), headEventEvidence (naming that unread file, or saying so when, without
 PyYAML, no pull_request run on the head could be read to date it), bots (one record per
 --reviewers name: bot, state, kind, sha, evidence, reason, retryAt: when a rate-limited
 bot's notice says its next review is available, an hour after a CodeRabbit notice
@@ -43,6 +44,7 @@ import hashlib
 import json
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -87,6 +89,11 @@ GREPTILE_STATUS = '<!-- greptile-status -->'
 GREPTILE_REVIEW_WAIT = timedelta(minutes=10)
 FAILED_RUN = ('failure', 'cancelled', 'timed_out', 'action_required')
 RUN_PROGRESS = {'queued': ('queued', 'check run queued'), 'in_progress': ('working', 'check run in progress')}
+WORKFLOW_RETRY_S = 2
+
+
+class Unreadable(Unusable):
+    """A workflow file a run on the head names could not be read, so whether that run dates the head is not known."""
 
 
 def gh_json(*argv):
@@ -383,15 +390,14 @@ def dates_head(repo, run_, branch, head_repo):
 
 @functools.cache
 def pr_types(repo, path, sha):
-    """The pull_request activity types a workflow revision runs on, or None when they cannot be read, PyYAML missing too."""
+    """The pull_request activity types a workflow revision runs on, or None when its file does not parse into them, PyYAML
+    missing too; a file that does not read raises Unreadable."""
     if yaml is None:
         return None
+    meta = workflow_file(repo, path, sha)
     try:
-        meta = gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
         doc = yaml.safe_load(base64.b64decode(meta['content']).decode())
-    except RateLimited:
-        raise
-    except (Unusable, KeyError, ValueError, yaml.YAMLError):
+    except (KeyError, ValueError, yaml.YAMLError):
         return None
     on = doc.get('on', doc.get(True)) if isinstance(doc, dict) else None  # YAML 1.1 reads a bare `on` as True
     if isinstance(on, str):
@@ -405,6 +411,20 @@ def pr_types(repo, path, sha):
     if types is None:
         return {'opened', 'synchronize', 'reopened'}
     return set([types] if isinstance(types, str) else types)
+
+
+def workflow_file(repo, path, sha):
+    """The contents API's answer for a workflow revision, read twice; Unreadable after that, never taken for a workflow
+    without pull_request (#242)."""
+    for left in (1, 0):
+        try:
+            return gh_json('api', f'repos/{repo}/contents/{path}?ref={sha}')
+        except RateLimited:
+            raise
+        except Unusable as e:
+            if not left:
+                raise Unreadable(f'workflow {path} at {sha[:9]} could not be read ({e})')
+            time.sleep(WORKFLOW_RETRY_S)
 
 
 def entry(kind, c, src, body, created, updated, path=None, line=None, commit=None, reply_to=None):
@@ -457,7 +477,10 @@ def observe(repo, n, reviewers, auto):
     head = view['headRefOid']
     if not FULL_SHA.match(head or ''):
         raise Unusable(f'gh pr view {n}: no head SHA')
-    event_at, event_why = head_event(repo, n, view, head) if auto else (None, 'no reviewer auto-runs, so no head event is read')
+    try:
+        event_at, event_why = head_event(repo, n, view, head) if auto else (None, 'no reviewer auto-runs, so no head event is read')
+    except Unreadable as e:
+        event_at, event_why = None, f'{e}, so whether its run dates the head is not known'
     statuses = pages(f'repos/{repo}/commits/{head}/statuses') if 'coderabbit' in auto else []
     checks = pages(f'repos/{repo}/commits/{head}/check-runs', 'check_runs') if auto else []
     issue = pages(f'repos/{repo}/issues/{n}/comments') if auto else None
