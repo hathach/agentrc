@@ -761,8 +761,7 @@ const noteLimit = (limit, from = '') => {
     { label: 'stop:ci', phase: 'Triage', model: 'haiku', effort: 'low', schema: STOPPED },
   )
 }
-// A copy that fails its script's seal is no answer; an error line carries no seal. The copy is kept by label for a read-back to compare.
-const rejectedCopies = new Map()
+// A copy that fails its script's seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
   const v = await agent(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
@@ -777,7 +776,6 @@ const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
     // Bounded: the copy can carry a whole hook log (#266).
     const copy = JSON.stringify(v)
     log(`${opts.label}: the rejected copy: ${copy.length > 600 ? `${copy.slice(0, 600)}… (${copy.length} characters)` : copy}`)
-    rejectedCopies.set(opts.label, v)
     return null
   }
   if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
@@ -1710,10 +1708,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   let lost = made ? made.error : 'commit agent died'
   const receipt = made ? null : await readCommitReceipt(commitLabel, receiptFile, scope)
   if (receipt) {
-    const copy = rejectedCopies.get(commitLabel)
-    const differ = copy ? ['committed', 'detail'].filter(k => JSON.stringify(copy[k]) !== JSON.stringify(receipt[k])) : []
-    log(`${commitLabel}: recovered from the commit script's receipt: ${receipt.committed ? `committed ${receipt.sha.slice(0, 7)}` : 'no commit'} — ${receipt.detail}` +
-      (copy ? `; the rejected copy differed in ${differ.join(', ') || 'no member this receipt holds'}` : ''))
+    log(`${commitLabel}: recovered from the commit script's receipt: ${receipt.committed ? `committed ${receipt.sha.slice(0, 7)}` : 'no commit'} — ${receipt.detail}`)
     lost = null
   }
   const said = receipt || made

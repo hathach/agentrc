@@ -3444,7 +3444,7 @@ test("a commit copy that fails its seal is recovered from the script's receipt, 
   assert.ok(labels.includes('receipt:commit#1-review'))
   assert.ok(logs.includes('commit#1-review: the relayed copy does not match its seal'), logs.join('\n'))
   assert.ok(logs.some(l => l.startsWith('commit#1-review: the rejected copy: {') && l.includes('"detail":"committed."')), logs.join('\n'))
-  assert.ok(logs.includes(`commit#1-review: recovered from the commit script's receipt: committed ${shaFor(1).slice(0, 7)} — committed; the rejected copy differed in detail`), logs.join('\n'))
+  assert.ok(logs.includes(`commit#1-review: recovered from the commit script's receipt: committed ${shaFor(1).slice(0, 7)} — committed`), logs.join('\n'))
   assert.equal(logs.some(l => l.includes('commit agent died')), false)
   assert.ok(labels.some(l => l.startsWith('push#')), 'the recovered commit is audited and pushed')
   assert.equal(result.history[0].reviewPushFailed, undefined)
