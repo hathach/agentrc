@@ -287,6 +287,18 @@ class VerdictTest(unittest.TestCase):
                 with self.subTest(tool):
                     self.assertIsNotNone(self.verdict(tool, file_path=str(memory / 'x.md')))
 
+    def test_a_parent_step_is_refused_before_links_resolve(self):
+        base = tmpdir(self)
+        memory, out = base / 'memory', base / 'out'
+        (memory / 'sub').mkdir(parents=True)
+        out.mkdir()
+        (out / 'link').symlink_to(memory / 'sub')   # resolved, link/../x.md is memory/x.md; as written, out/x.md
+        with mock.patch.object(guard, 'MEMORY', str(memory)):
+            self.assertIsNone(self.verdict('Write', file_path=str(memory / 'sub' / 'x.md'), content='x'))
+            for path in (os.path.join(out, 'link', '..', 'x.md'), os.path.join(memory, 'sub', '..', 'x.md')):
+                with self.subTest(path):
+                    self.assertIsNotNone(self.verdict('Write', file_path=path, content='x'))
+
     def test_other_tools(self):
         self.assertIsNone(self.verdict('Skill', skill='captain'))
         self.assertIsNone(self.verdict('Skill', skill='followup-issue'))

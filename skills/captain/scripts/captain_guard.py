@@ -54,9 +54,10 @@ SHELL = re.compile(r'[^A-Za-z0-9 :._=/~,-]')   # any quoting, expansion, redirec
 
 
 def markdown_in(path, root):
-    """A Markdown file inside root, symlinks resolved."""
-    return (isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path).endswith('.md')
-            and captain_read.inside(path, root))
+    """A Markdown file inside root, symlinks resolved. No `..`: realpath steps up from a link's target, a tool that
+    normalizes the path first from the link itself."""
+    return (isinstance(path, str) and os.path.isabs(path) and '..' not in path.replace(os.sep, '/').split('/')
+            and os.path.realpath(path).endswith('.md') and captain_read.inside(path, root))
 
 
 def publication(args):
