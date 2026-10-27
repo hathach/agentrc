@@ -289,12 +289,17 @@ class ChiefRun(unittest.TestCase):
         def task(sub, tid, **kw):
             return {'type': 'system', 'subtype': sub, 'task_id': tid, **kw}
 
-        def thinking(msg_id):
-            return {'type': 'assistant', 'parent_tool_use_id': None,
+        def thinking(msg_id, parent=None):
+            return {'type': 'assistant', 'parent_tool_use_id': parent,
                     'message': {'id': msg_id, 'content': [{'type': 'thinking', 'thinking': ''}]}}
-        unit = 'a2fe9c5420ae63043'
-        dispatched = (init(), text('m1', 'chief: stage · W1 dispatched'),
-                      task('task_started', unit, description='Fix R1-2', task_type='local_agent', is_backgrounded=True),
+
+        def stop(msg_id, tid):
+            return {'type': 'assistant', 'parent_tool_use_id': None, 'message': {'id': msg_id, 'content': [
+                {'type': 'tool_use', 'id': 't1', 'name': 'TaskStop', 'input': {'task_id': tid}}]}}
+        unit, tool = 'a2fe9c5420ae63043', 'toolu_w1'
+        started = task('task_started', unit, description='Fix R1-2', task_type='local_agent', is_backgrounded=True,
+                       tool_use_id=tool, run_id='r1')
+        dispatched = (init(), text('m1', 'chief: stage · W1 dispatched'), started,
                       task('task_started', 'b0w29yqzt', description='Rerun full\nsuite', task_type='local_bash',
                            is_backgrounded=True, parent_task_id=unit),
                       task('task_updated', unit, patch={'status': 'completed'}),
@@ -306,7 +311,12 @@ class ChiefRun(unittest.TestCase):
                   task('task_notification', 'b0w29yqzt', status='stopped'),
                   {'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': []})
         waiting = text('m2', 'W1 is running its suite. Still waiting for its final result.')
-        wait = (task('task_started', 'bwait', description='Wait', task_type='local_bash', is_backgrounded=True),)
+        wait = (task('task_started', 'bwait', description='Wait', task_type='local_bash', is_backgrounded=True, run_id='r1'),)
+        rewait = (task('task_started', 'bwait', description='Wait', task_type='local_bash', is_backgrounded=True, run_id='r2'),)
+        unit_done = (task('task_updated', unit, patch={'status': 'completed'}), task('task_notification', unit, status='completed'))
+        # a unit's bookkeeping after its child's kill is no turn of its model on it
+        bookkeeping = (*dispatched[:4], *killed, task('task_progress', unit), task('task_updated', unit, patch={'is_backgrounded': True}),
+                       *unit_done)
         wait_killed = (task('task_updated', 'bwait', patch={'status': 'killed'}), task('task_notification', 'bwait', status='stopped'))
         child = f'b0w29yqzt {{}} "Rerun full suite" under {unit} "Fix R1-2"'
         cases = [
@@ -317,6 +327,16 @@ class ChiefRun(unittest.TestCase):
             # one message straddles the kill: its later block is no proof chief took the kill in
             ("a kill inside chief's last message", (init(), *wait, thinking('m2'), *wait_killed,
                                                      text('m2', 'W1 is done.'), result('W1 is done.')), 'bwait stopped "Wait"'),
+            ("a child kill followed by its unit's bookkeeping", (*bookkeeping, text('m2', 'W1 is done.'), result('W1 is done.')),
+             child.format('stopped')),
+            # a stop or a notification names one run: a resumed run's kill needs its own
+            ('a resumed run killed after a TaskStop of the first', (init(), *wait, stop('m2', 'bwait'), *wait_killed, *rewait,
+                                                                    *wait_killed, text('m3', 'W1 is done.'), result('W1 is done.')),
+             'bwait stopped "Wait"'),
+            ("a resumed run killed, the first run's notification taken in", (
+                init(), *wait, *wait_killed, {**result('x'), 'origin': {'kind': 'task-notification', 'runId': 'r1'}}, *rewait,
+                *wait_killed, text('m3', 'W1 is done.'), {**result('W1 is done.'), 'origin': {'kind': 'task-notification', 'runId': 'r1'}}),
+             'bwait stopped "Wait"'),
         ]
         for name, events, cut in cases:
             with self.subTest(name):
@@ -329,14 +349,20 @@ class ChiefRun(unittest.TestCase):
         settled = (task('task_updated', 'b0w29yqzt', patch={'status': 'completed'}),
                    task('task_notification', 'b0w29yqzt', status='completed'),
                    {'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': []})
-        stop = {'type': 'assistant', 'parent_tool_use_id': None, 'message': {'id': 'm2', 'content': [
-            {'type': 'tool_use', 'id': 't1', 'name': 'TaskStop', 'input': {'task_id': 'bwait'}}]}}
-        unit_went_on = (*dispatched[:4], *killed, task('task_progress', unit), *dispatched[4:6])
+        # the unit's model took a turn on the kill: a tool result then a new message, or a run resumed on its notification
+        unit_turn = (*dispatched[:4], *killed, {'type': 'user', 'parent_tool_use_id': tool, 'message': {'content': []}},
+                     thinking('u1', tool), *unit_done)
+        notified = {**started, 'run_id': 'r2', 'prompt': '<task-notification>\n<task-id>b0w29yqzt</task-id>\n</task-notification>'}
+        resumed = (*dispatched, *killed, notified, thinking('u1', tool), *unit_done)
         done = (text('m3', 'chief: stage · done'), result())
         for name, events in (('normal completion', (*dispatched, *settled, *done)),
-                             ('a TaskStop naming it', (init(), *wait, stop, *wait_killed, *done)),
+                             ('a TaskStop naming it', (init(), *wait, stop('m2', 'bwait'), *wait_killed, *done)),
                              ("chief's next turn after the kill", (init(), *wait, *wait_killed, init(), *done)),
-                             ('its unit went on past the kill', (*unit_went_on, *done))):
+                             ('its unit took a turn past the kill', (*unit_turn, *done)),
+                             ('its unit resumed on the kill', (*resumed, *done)),
+                             ("the killed run's own notification taken in", (
+                                 init(), *wait, *wait_killed, text('m3', 'chief: stage · done'),
+                                 {**result(), 'origin': {'kind': 'task-notification', 'runId': 'r1'}}))):
             with self.subTest(name):
                 self.stream(*events)
                 self.assertEqual(self.run_it().returncode, 0)

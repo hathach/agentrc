@@ -152,61 +152,73 @@ def child_env():
 
 class Tasks:
     """The session's own Agent, Bash and workflow tasks from claude's task events. A task the final result leaves
-    running, or one killed without a `TaskStop` naming it and before its owner's next turn (chief's: a new top-level
-    `init`, or a result whose `origin.runId` is the task's; a unit's: a later event of that unit), was cut off by the
-    session's end, not settled: a unit that returns while its own background command runs reads `completed`, its
-    command still listed."""
+    running, or a run of one killed that its owner never took in, was cut off, not settled: a unit that returns while
+    its own background command runs reads `completed`, its command still listed. An owner took a kill in when it
+    stopped that run with `TaskStop`, or took a model turn on it: a message first seen after a tool result that
+    followed the kill, or after a run of the unit claude resumed with that kill's notification as its prompt (chief's
+    messages or the unit's own, by `parent_tool_use_id`), and for chief also a later top-level `init` or a result
+    whose `origin.runId` is the killed run."""
     ENDED = {'completed', 'failed', 'killed', 'stopped'}
 
     def __init__(self):
-        self.about, self.status, self.runs, self.stops = {}, {}, {}, set()
-        self.listed, self.killed, self.open = set(), set(), set()
+        self.about, self.status, self.tool, self.run, self.stops, self.messages = {}, {}, {}, {}, set(), set()
+        self.listed, self.killed, self.open = set(), {}, set()   # killed: task -> [its run, a tool result since]
 
-    def owned_by(self, parent):
-        return {t for t in self.killed if self.about.get(t, ('', None))[1] == parent}
+    def owner(self, task):
+        """The `parent_tool_use_id` its owner's messages carry: None for chief's, '?' for a unit never started here."""
+        parent = self.about.get(task, ('', None))[1]
+        return parent and self.tool.get(parent, '?')
 
     def event(self, event):
         kind, sub, task = event.get('type'), event.get('subtype'), event.get('task_id')
-        if kind == 'assistant':   # chief or a unit stopping its own task
-            self.stops.update(str((b.get('input') or {}).get('task_id')) for b in event['message']['content']
+        scope = event.get('parent_tool_use_id')
+        if kind == 'assistant':
+            content = event['message']['content']
+            self.stops.update(str((b.get('input') or {}).get('task_id')) for b in content
                               if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('name') == 'TaskStop')
-            self.killed -= self.stops
+            if (msg := event['message'].get('id')) not in self.messages:
+                self.messages.add(msg)
+                self.forget(lambda t, k: k[1] and self.owner(t) == scope)
+            self.forget(lambda t, k: t in self.stops)
+        elif kind == 'user':
+            for t, k in self.killed.items():
+                k[1] = k[1] or self.owner(t) == scope
         elif kind == 'result':
             if (origin := event.get('origin') or {}).get('kind') == 'task-notification':
-                self.killed.discard(self.runs.get(origin.get('runId')))
+                self.forget(lambda t, k: k[0] == origin.get('runId'))
             self.open = {t for t, s in self.status.items() if s not in self.ENDED} | self.listed
         elif kind != 'system':
             return
         elif sub == 'init':
-            self.killed -= self.owned_by(None)
-        elif task is None and sub != 'background_tasks_changed':
-            return
+            self.forget(lambda t, k: self.owner(t) is None)
         elif sub == 'background_tasks_changed':
             self.listed = {t['task_id'] for t in event.get('tasks') or []}
             for t in event.get('tasks') or []:
                 self.about.setdefault(t['task_id'], (t.get('description') or '', t.get('parent_task_id')))
-        else:
-            if run := event.get('run_id'):
-                self.runs[run] = task
-            if sub == 'task_started':
-                self.about[task] = (event.get('description') or '', event.get('parent_task_id'))
-                self.status[task] = 'running'
-                self.killed.discard(task)
-            elif sub in ('task_updated', 'task_notification'):
-                status = (event.get('patch') or {}).get('status') if sub == 'task_updated' else event.get('status')
-                if status:
-                    self.status[task] = status
-                if status in ('killed', 'stopped') and task not in self.stops:
-                    self.killed.add(task)
-            if self.status.get(task) not in ('killed', 'stopped'):
-                self.killed -= self.owned_by(task)   # the unit went on past its own task's kill
+        elif task is None:
+            return
+        elif sub == 'task_started':
+            self.about[task] = (event.get('description') or '', event.get('parent_task_id'))
+            self.status[task], self.tool[task], self.run[task] = 'running', event.get('tool_use_id'), event.get('run_id')
+            self.stops.discard(task)   # a stop names a run: the resumed one is not covered
+            for t, k in self.killed.items():
+                k[1] = k[1] or f'<task-id>{t}</task-id>' in (event.get('prompt') or '')
+        elif sub in ('task_updated', 'task_notification'):
+            status = (event.get('patch') or {}).get('status') if sub == 'task_updated' else event.get('status')
+            if status:
+                self.status[task] = status
+            if status in ('killed', 'stopped') and task not in self.stops and task not in self.killed:
+                self.killed[task] = [event.get('run_id') or self.run.get(task), False]
+
+    def forget(self, taken):
+        self.killed = {t: k for t, k in self.killed.items() if not taken(t, k)}
 
     def cut(self):
         """Each task cut off, `<id> <status> "<description>"`, a unit's own followed by ` under <id> "<description>"`."""
         def said(task):
             return '"' + ' '.join(self.about.get(task, ('', None))[0].split())[:60] + '"'
         rows = []
-        for task in sorted(self.open | self.killed):
+        for task in sorted(self.open | set(self.killed)):
             row, parent = f'{task} {self.status.get(task, "running")} {said(task)}', self.about.get(task, ('', None))[1]
             rows.append(f'{row} under {parent} {said(parent)}' if parent else row)
         return rows
