@@ -72,6 +72,9 @@ CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 CR_RATE_STATUS = 'review rate limited'
+# A repository CodeRabbit reviews only on request: an unticked box in its summary comment, or these words beside it (#324).
+CR_TRIGGER_BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
+CR_MANUAL_ONLY = 'does not receive automatic reviews'
 CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
 COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
 # CodeRabbit's included reviews come back within the hour: the reset a notice without a countdown is given.
@@ -198,13 +201,13 @@ def coderabbit(head, statuses, checks, issue, event_at):
         limited, why = newest_reading(fresh, 'created_at', retry_at)
         return limited_record('rate-limited after the head event', limited or fresh[0], why, ev, None)
     if s and run_ and s_at == run_at:
-        a, b = coderabbit_status(s, ev, head), coderabbit_run(run_, ev, head)
+        a, b = coderabbit_status(s, ev, head), coderabbit_run(run_, ev, head, stickies)
         if (a['state'], a['kind']) != (b['state'], b['kind']):
             return record('coderabbit', 'unknown', 'its status and check run disagree at one timestamp', ev)
     if s and (run_ is None or s_at >= run_at):
         return coderabbit_status(s, ev, head)
     if run_:
-        return coderabbit_run(run_, ev, head)
+        return coderabbit_run(run_, ev, head, stickies)
     return record('coderabbit', 'absent', 'no status and no check run on the head')
 
 
@@ -240,14 +243,31 @@ def coderabbit_status(s, ev, head):
     return record('coderabbit', 'unknown', f'status state {state!r} is not one this reads', ev)
 
 
-def coderabbit_run(run_, ev, head):
+def coderabbit_run(run_, ev, head, stickies):
     if run_['status'] in RUN_PROGRESS:
         return record('coderabbit', *RUN_PROGRESS[run_['status']], ev, head)
     if run_['status'] == 'completed' and run_.get('conclusion') == 'success':
         return record('coderabbit', 'reviewed', 'check run completed', ev, head)
     if run_['status'] == 'completed' and run_.get('conclusion') in ('failure', 'cancelled', 'timed_out'):
         return record('coderabbit', 'settled', f"check run {run_['conclusion']}", ev, head, 'failed')
+    title = ((run_.get('output') or {}).get('title') or '').strip()
+    if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped' and title.lower().startswith('review skipped'):
+        # A check run gives no skip reason: the summary comment tells a manual-review skip, read as its status says it, from any other.
+        why = manual_only(stickies)
+        return record('coderabbit', 'settled', f'Review skipped: manual review required (check run; {why})' if why else f'check run skipped: {title}',
+                      ev, head, 'skipped')
     return record('coderabbit', 'unknown', f"check run {run_['status']}/{run_.get('conclusion')} is not one this reads", ev)
+
+
+def manual_only(stickies):
+    """Which CodeRabbit comment says it reviews the repository only on request, None when none does."""
+    for c in stickies:
+        body = c.get('body') or ''
+        if any(m['mark'] == ' ' for m in CR_TRIGGER_BOX.finditer(body)):
+            return f"comment {c['id']} holds an unticked Trigger review box"
+        if CR_MANUAL_ONLY in body:
+            return f"comment {c['id']} says the repository gets no automatic reviews"
+    return None
 
 
 def greptile(head, checks, issue, reviews, event_at, now=None):

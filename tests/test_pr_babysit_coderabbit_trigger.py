@@ -21,6 +21,10 @@ BOX = '> - [ ] <!-- {"checkboxId":"e9bb8d72-00e8-4f67-9cb2-caf3b22574fe"} --> ðŸ
 BOT = 'coderabbitai[bot]'
 SKIP = {'context': 'CodeRabbit', 'state': 'success', 'updated_at': '2026-10-12T11:41:10Z',
         'description': 'Review skipped: manual review required for this OSS repository'}
+# #324: hathach/agentrc#323's head, which CodeRabbit skipped through a check run and no status.
+SKIP_RUN = {'id': 12, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-10-12T11:41:09Z',
+            'completed_at': '2026-10-12T11:41:10Z', 'output': {'title': 'Review skipped', 'summary': 'Result: Skipped - Review skipped'}}
+NO_AUTO = 'This repository does not receive automatic reviews because it has fewer than 10 stars.'
 
 
 def setUpModule():
@@ -28,10 +32,11 @@ def setUpModule():
 
 
 class Rig:
-    """A fake `gh api`: the PR, the head's statuses and the PR's comments as GET pages (run), recording each PATCH (attempt)."""
+    """A fake `gh api`: the PR, the head's statuses and check runs and the PR's comments as GET pages (run), recording each
+    PATCH (attempt)."""
 
-    def __init__(self, statuses=(SKIP,), comments=None, head=HEAD, readback=None):
-        self.head, self.statuses, self.patches, self.readback = head, list(statuses), [], readback
+    def __init__(self, statuses=(SKIP,), comments=None, head=HEAD, readback=None, checks=()):
+        self.head, self.statuses, self.checks, self.patches, self.readback = head, list(statuses), list(checks), [], readback
         self.comments = comments if comments is not None else [{'id': 5, 'user': {'login': BOT}, 'body': f'summary\n{BOX}\nend'}]
 
     def attempt(self, *argv, input=None):
@@ -46,6 +51,8 @@ class Rig:
             return 0, json.dumps({'head': {'sha': self.head}})
         if '/statuses?' in path:
             return 0, json.dumps([self.statuses])
+        if '/check-runs?' in path:
+            return 0, json.dumps([{'check_runs': self.checks}])
         if '/comments?' in path:
             return 0, json.dumps([self.comments])
         raise trigger.Unusable(f'unexpected {path}')
@@ -83,6 +90,27 @@ class Trigger(unittest.TestCase):
                 self.assertEqual(out['outcome'], 'notSkipped')
                 self.assertNotIn('commentId', out)
                 self.assertEqual(rig.patches, [])
+
+    def test_a_check_run_skip_is_ticked_only_when_the_summary_says_manual_review(self):
+        rig = Rig(statuses=(), checks=(SKIP_RUN,))
+        self.assertEqual(self.run_with(rig)[1]['outcome'], 'ticked', 'its unticked box says it')
+        self.assertEqual(len(rig.patches), 1)
+        words = Rig(statuses=(), checks=(SKIP_RUN,), comments=[{'id': 5, 'user': {'login': BOT}, 'body': f'summary\n> {NO_AUTO}'}])
+        code, out = self.run_with(words)
+        self.assertEqual((out['outcome'], out['detail']), ('failed', '0 CodeRabbit comments hold one Trigger review box, not 1'),
+                         'its words say it, and no box is left to tick')
+        cases = {'another skip': Rig(statuses=(), checks=(SKIP_RUN,), comments=[{'id': 5, 'user': {'login': BOT}, 'body': 'summary'}]),
+                 'a newer status': Rig(statuses=(dict(SKIP, description='Review completed', updated_at='2026-10-12T11:45:00Z'),), checks=(SKIP_RUN,)),
+                 'a status that reads otherwise at its second': Rig(statuses=(dict(SKIP, state='pending', description='Review in progress'),),
+                                                                    checks=(SKIP_RUN,)),
+                 'a newer run in progress': Rig(statuses=(), checks=(SKIP_RUN, dict(SKIP_RUN, id=13, status='in_progress', conclusion=None,
+                                                                                     started_at='2026-10-12T11:50:00Z', completed_at=None)))}
+        for what, rig in cases.items():
+            with self.subTest(what):
+                out = self.run_with(rig)[1]
+                self.assertEqual(out['outcome'], 'notSkipped', out)
+                self.assertEqual(rig.patches, [])
+        self.assertIn('check run skipped: Review skipped', self.run_with(cases['another skip'])[1]['detail'])
 
     def test_failures(self):
         other = {'id': 6, 'user': {'login': 'someone'}, 'body': BOX}

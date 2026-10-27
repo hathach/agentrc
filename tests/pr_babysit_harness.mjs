@@ -7173,8 +7173,17 @@ test('a CodeRabbit queued after its trigger waits out the cap from the trigger, 
   assert.equal(headLine(late.logs)[2], 'cycle 3 summary — CI green, reviews: coderabbit queued, wait expired after 10m: head unreviewed (review requested)')
 })
 
+test('a manual-review skip read from a check run and its summary is ticked like the status one (#324)', async () => {
+  let n = 0
+  const viaRun = 'Review skipped: manual review required (check run; comment 5 holds an unticked Trigger review box)'
+  const { result, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, reviewsPerCycle: () => quiet([++n === 1 ? skippedCr(viaRun) : bot('coderabbit')]) })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual(triggers(labels), ['crtrigger#1'])
+})
+
 test('no trigger without coderabbitTrigger or for another skip, and the switch needs autoPush and coderabbit auto-running', async () => {
-  for (const [args, reason, want] of [[{}, MANUAL, undefined], [{ coderabbitTrigger: true }, 'Review skipped: draft pull request', 'coderabbit-unreviewed']]) {
+  for (const [args, reason, want] of [[{}, MANUAL, undefined], [{ coderabbitTrigger: true }, 'Review skipped: draft pull request', 'coderabbit-unreviewed'],
+    [{ coderabbitTrigger: true }, 'check run skipped: Review skipped', 'coderabbit-unreviewed']]) {
     const { result, labels } = await run({ args, reviews: quiet([skippedCr(reason)]) })
     assert.equal(result.reason, want, 'a review the switch asked for is required, whatever the skip')
     assert.deepEqual(triggers(labels), [])

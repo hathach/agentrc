@@ -88,6 +88,35 @@ class SettleRules(unittest.TestCase):
             r = harvest.coderabbit(HEAD, statuses, checks, [], EVENT)
             self.assertEqual((r['state'], r['kind']), want, (statuses, checks))
 
+    def test_a_skipped_coderabbit_check_run_is_a_manual_review_skip_only_when_its_summary_says_so(self):
+        # #324: hathach/agentrc#323's head, which CodeRabbit skipped through a check run and no status.
+        run_ = {'id': 12, 'name': 'CodeRabbit', 'status': 'completed', 'conclusion': 'skipped', 'started_at': '2026-09-25T09:00:00Z',
+                'completed_at': '2026-09-25T09:00:01Z', 'output': {'title': 'Review skipped', 'summary': 'Result: Skipped - Review skipped'}}
+        box = '> - [ ] <!-- {"checkboxId":"e9bb8d72"} --> 🔍 Trigger review'
+        words = 'This repository does not receive automatic reviews because it has fewer than 10 stars.'
+        bot = 'coderabbitai[bot]'
+        for what, issue, want in (
+                ('an unticked box', [comment(bot, f'summary\n{box}', id_=5)], 'comment 5 holds an unticked Trigger review box'),
+                ('its words', [comment(bot, f'summary\n> {words}', id_=6)], 'comment 6 says the repository gets no automatic reviews')):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
+                self.assertEqual((r['state'], r['kind'], r['sha']), ('settled', 'skipped', HEAD))
+                self.assertEqual(r['reason'], f'Review skipped: manual review required (check run; {want})')
+        for what, issue in (('no summary', []), ('a ticked box', [comment(bot, box.replace('[ ]', '[x]'), id_=5)]),
+                            ("someone else's words", [comment('hathach', f'{box}\n{words}', id_=7)])):
+            with self.subTest(what):
+                r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
+                self.assertEqual((r['state'], r['kind'], r['reason']), ('settled', 'skipped', 'check run skipped: Review skipped'), 'another skip')
+        manual = [comment(bot, box, id_=5)]
+        other = dict(run_, output={'title': 'Something else'})
+        self.assertEqual(harvest.coderabbit(HEAD, [], [other], manual, EVENT)['state'], 'unknown', 'a skip it does not know')
+        self.assertEqual(harvest.coderabbit(HEAD, [status('success', 'Review completed', '2026-09-25T09:05:00Z')], [run_], manual, EVENT)['state'],
+                         'reviewed', 'a newer status wins')
+        self.assertEqual(harvest.coderabbit(HEAD, [status('pending', 'Review in progress', '2026-09-25T09:00:01Z')], [run_], manual, EVENT)['state'],
+                         'unknown', 'a status that reads otherwise at its second')
+        agrees = status('success', 'Review skipped: manual review required for this OSS repository', '2026-09-25T09:00:01Z')
+        self.assertEqual(harvest.coderabbit(HEAD, [agrees], [run_], manual, EVENT)['kind'], 'skipped', 'one that agrees')
+
     def test_coderabbit_pause_and_rate_limit(self):
         bot = 'coderabbitai[bot]'
         paused = comment(bot, 'x ' + harvest.CR_PAUSED, at='2026-09-25T07:00:00Z', updated='2026-09-25T09:30:00Z')

@@ -5,16 +5,18 @@ or, with --request, ask it to review once its rate limit on HEAD has reset.
   coderabbit_trigger.py --pr N --head SHA [--request] [--repo OWNER/NAME]
 
 A repository below CodeRabbit's open-source threshold gets, on each push, a
-CodeRabbit status "Review skipped: manual review required ..." and an unticked
-"Trigger review" box in its summary comment; ticking the box starts the review.
+CodeRabbit status "Review skipped: manual review required ...", or a skipped check
+run while its summary comment holds an unticked "Trigger review" box or says the
+repository gets no automatic reviews, read as harvest.py reads them; ticking the
+box starts the review.
 Run from the PR checkout; PR N is --repo's, else the checkout's one repository
 (facts.bind_repo). The outcome:
 
   ticked    the box was unticked; the comment was edited to tick it and read back
   already   the box is already ticked
-  notSkipped  CodeRabbit's newest status on SHA is not that skip, cannot be told
-            (undated, or a tie that reads differently), or SHA is not PR N's head:
-            nothing to do
+  notSkipped  CodeRabbit's newest status or check run on SHA is not that skip,
+            cannot be told (undated, or a tie that reads differently), or SHA is
+            not PR N's head: nothing to do
   failed    the edit failed, its read-back disagrees, or not exactly one
             CodeRabbit comment holds the box; detail says which
 
@@ -41,18 +43,16 @@ GitHub's answer cannot be read. A rerun after a lost line reports `already`.
 """
 
 import json
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, report  # noqa: E402
-from harvest import gh_json, newest_reading, observe, pages, stamp  # noqa: E402
+from harvest import CR_TRIGGER_BOX as BOX, coderabbit, gh_json, observe, pages, stamp  # noqa: E402
 
 SKIP = 'review skipped: manual review required'
 REQUEST = '@coderabbitai review'
-BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
 
 
 class Failed(Exception):
@@ -60,26 +60,25 @@ class Failed(Exception):
 
 
 def skipped(pr, head):
-    """None when HEAD is PR N's head and CodeRabbit's newest status on it is the manual-review skip, else why not."""
+    """(None, the PR's comments) when HEAD is PR N's head and CodeRabbit's newest status or check run on it is the
+    manual-review skip, (why not, None) otherwise."""
     if gh_json('api', f'repos/{{owner}}/{{repo}}/pulls/{pr}')['head']['sha'] != head:
-        return f'{head[:9]} is not the head of PR {pr}'
-    statuses = [s for s in pages(f'repos/{{owner}}/{{repo}}/commits/{head}/statuses') if s.get('context') == 'CodeRabbit']
-    if not statuses:
-        return 'no CodeRabbit status on the head'
-    s, why = newest_reading(statuses, 'updated_at', lambda x: (x['state'], x.get('description')))
-    if why:
-        return f'CodeRabbit statuses: {why}'
-    desc = s.get('description') or ''
-    if s['state'] != 'success' or not desc.lower().startswith(SKIP):
-        return f"CodeRabbit status is {s['state']} '{desc}'"
-    return None
+        return f'{head[:9]} is not the head of PR {pr}', None
+    statuses = pages(f'repos/{{owner}}/{{repo}}/commits/{head}/statuses')
+    checks = pages(f'repos/{{owner}}/{{repo}}/commits/{head}/check-runs', 'check_runs')
+    comments = pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
+    # No head event: a SHA-less notice newer than the status or run cannot be placed, and reads unknown.
+    cr = coderabbit(head, statuses, checks, comments, None)
+    if (cr['state'], cr['kind']) != ('settled', 'skipped') or not cr['reason'].lower().startswith(SKIP):
+        return f"CodeRabbit is {cr['state']}{'/' + cr['kind'] if cr['kind'] else ''}: {cr['reason']}", None
+    return None, comments
 
 
 def trigger(pr, head):
-    why = skipped(pr, head)
+    why, comments = skipped(pr, head)
     if why:
         return {'outcome': 'notSkipped', 'detail': why}
-    holders = [c for c in pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
+    holders = [c for c in comments
                if 'coderabbit' in ((c.get('user') or {}).get('login') or '').lower() and len(BOX.findall(c.get('body') or '')) == 1]
     if len(holders) != 1:
         raise Failed(f'{len(holders)} CodeRabbit comments hold one Trigger review box, not 1')
@@ -160,6 +159,8 @@ def collect(argv):
         out = request(repo, a.pr, a.head) if a.request else trigger(a.pr, a.head)
     except Failed as e:
         out = {'outcome': 'failed', 'detail': str(e)}
+    except (KeyError, TypeError, AttributeError) as e:
+        raise Unusable(f'gh answered in a shape coderabbit_trigger.py does not read ({e!r})')
     if a.request:
         out = {'retryAt': None, **out}
     return {'at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'), **out}
