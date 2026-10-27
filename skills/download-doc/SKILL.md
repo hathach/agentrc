@@ -15,7 +15,7 @@ the web for a manual, so its value depends on being complete and *not stale*.
 | `scripts/sync.py` | CLI: sync a vendor (enumerate → plan → `--apply` imports/replaces), or `add`, `refresh` or `remove` one document. Dry run by default. |
 | `scripts/vendor_<name>.py` | One adapter per vendor; `sync.py --help` lists them, each docstring gives its scope. Renesas, Microchip and HPMicro only read a hand-harvested cache; their docstrings say how to build it |
 | `scripts/doclib.py` | Shared core: transport, revisions, Calibre I/O, planning |
-| `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry run by default. |
+| `scripts/retitle.py` | Move each document number to the front of its Calibre title. Dry run by default; `--rollback <tsv>` restores the titles an `--apply` saved. |
 | `references/st.md`, `references/nxp.md` | Per-vendor endpoints, quirks, the NXP gated-download flow |
 | `references/maintaining.md` | Why the conventions, the failure modes, adding a vendor |
 

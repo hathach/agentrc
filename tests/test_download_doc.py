@@ -246,6 +246,111 @@ class RetitlePlan(unittest.TestCase):
         self.assertEqual(calls, [])
 
 
+    def rollback_tsv(self, *rows):
+        tsv = self.lib / 'retitle.tsv'
+        tsv.write_text(''.join(f'{row}\n' for row in rows), encoding='utf-8')
+        return tsv
+
+    def test_a_rollback_restores_only_books_still_titled_as_the_rename_left_them(self):
+        self.book(1, 'UM10503 LPC43xx manual')
+        self.book(2, 'LPC43xx guide (UM10503)')
+        self.book(3, 'UM10503 LPC43xx notes, edited')
+        self.book(4, 'UM10503 LPC43xx sheet', folder=False)
+        self.book(5, 'UM10503 LPC43xx book', formats={'PDF': True, 'EPUB': False})
+        tsv = self.rollback_tsv(*(f'{n}\tLPC43xx {kind} (UM10503)\tUM10503 LPC43xx {kind}' for n, kind in
+                                  ((1, 'manual'), (2, 'guide'), (3, 'notes'), (4, 'sheet'), (5, 'book'), (9, 'card'))))
+        plan, withheld, restored = retitle.rollback_plan(tsv)
+        self.assertEqual(plan, [(1, 'UM10503 LPC43xx manual', 'LPC43xx manual (UM10503)')])
+        self.assertEqual(withheld, [(3, "retitled since: 'UM10503 LPC43xx notes, edited'"),
+                                    (4, 'the database names files that are not on disk'),
+                                    (5, 'the database names files that are not on disk'), (9, 'no such book')])
+        self.assertEqual(restored, 1)
+
+    def test_a_title_is_split_from_the_next_row_by_a_newline_alone(self):
+        self.book(1, 'UM10503 LPC43xx\u2028manual')
+        tsv = self.rollback_tsv('1\tLPC43xx\u2028manual (UM10503)\tUM10503 LPC43xx\u2028manual')
+        self.assertEqual(retitle.rollback_plan(tsv)[0], [(1, 'UM10503 LPC43xx\u2028manual', 'LPC43xx\u2028manual (UM10503)')])
+        tsv.write_text('', encoding='utf-8')
+        self.assertEqual(retitle.rollback_plan(tsv), ([], [], 0))
+
+    def test_a_file_that_is_not_an_apply_tsv_is_refused_whole(self):
+        self.book(1, 'UM10503 LPC43xx manual')
+        row = '1\tLPC43xx manual (UM10503)\tUM10503 LPC43xx manual'
+        for bad in ('x\told\tnew', '2\tonly two', row, '2\t\tnew', '2\told\tnew\textra'):
+            with self.subTest(bad):
+                with self.assertRaisesRegex(ValueError, 'not a row of a retitle --apply TSV'):
+                    retitle.rollback_plan(self.rollback_tsv(row, bad))
+                err = io.StringIO()
+                with unittest.mock.patch.object(retitle.doclib, 'Library', lambda path: self.fail('touched calibre')), \
+                        unittest.mock.patch.object(sys, 'argv', ['retitle.py', '--rollback', str(self.lib / 'retitle.tsv'),
+                                                                 '--apply']), \
+                        contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    self.assertEqual(retitle.main(), 2)
+                self.assertIn('REFUSED', err.getvalue())
+
+
+@unittest.skipUnless(shutil.which('calibredb'), 'renames go through calibredb')
+class RetitleRollbackInCalibre(unittest.TestCase):
+    """--rollback renames back through calibredb in a real library, and each book's PDF moves with it."""
+
+    def setUp(self):
+        if doclib.Library._gui_running():
+            self.skipTest("the Calibre GUI's lock refuses calibredb on every library")
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.lib = self.root / 'library'
+        env = {k: v for k, v in os.environ.items() if k != 'DOWNLOAD_DOC_SECRET'}
+        for patch in (unittest.mock.patch.dict(os.environ, dict(env, CALIBRE_CONFIG_DIRECTORY=str(self.root / 'config')),
+                                               clear=True),
+                      unittest.mock.patch.object(retitle, 'LIB', self.lib),
+                      unittest.mock.patch.object(Path, 'home', lambda: self.root)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        pdf = self.root / 'manual.pdf'
+        pdf.write_bytes(pdf_with('UM10503 LPC43xx manual'))
+        for title in ('LPC43xx manual (UM10503)', 'LPC43xx guide (UM10503)'):
+            self.calibredb('add', '-t', title, '-a', 'NXP Semiconductors', '-I', 'nxp:UM10503', str(pdf))
+
+    def calibredb(self, *args):
+        return subprocess.run(['calibredb', '--with-library', str(self.lib), *args], check=True,
+                              capture_output=True, text=True).stdout
+
+    def titles(self):
+        return {b['id']: b['title'] for b in json.loads(self.calibredb('list', '--for-machine', '-f', 'title'))}
+
+    def assert_pdfs_on_disk(self):
+        _, files, books = retitle.read_library()
+        for book, _, folder in books:
+            self.assertEqual([f.suffix for f in files[book]], ['.pdf'])
+            self.assertTrue(retitle.on_disk(folder, files[book]), folder)
+
+    def retitle(self, *argv):
+        out = io.StringIO()
+        with unittest.mock.patch.object(sys, 'argv', ['retitle.py', *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            return retitle.main(), out.getvalue()
+
+    def test_a_rollback_restores_the_titles_and_a_second_one_changes_nothing(self):
+        code, out = self.retitle('--no-pdf', '--apply')
+        self.assertEqual(code, 0, out)
+        tsv = out.split('rollback: ')[1].split()[0]
+        self.assertEqual(self.titles(), {1: 'UM10503 LPC43xx manual', 2: 'UM10503 LPC43xx guide'})
+        self.assert_pdfs_on_disk()
+        self.calibredb('set_metadata', '--field', 'title:UM10503 LPC43xx guide v2', '2')
+        code, out = self.retitle('--rollback', tsv, '--apply')
+        self.assertEqual(code, 1, out)
+        self.assertIn('#2 withheld: retitled since', out)
+        restored = {1: 'LPC43xx manual (UM10503)', 2: 'UM10503 LPC43xx guide v2'}
+        self.assertEqual(self.titles(), restored)
+        self.assert_pdfs_on_disk()
+        code, out = self.retitle('--rollback', tsv, '--apply')
+        self.assertIn('0 titles to restore, 1 already restored', out)
+        self.assertNotIn('rollback: ', out)
+        self.assertEqual(self.titles(), restored)
+        self.assert_pdfs_on_disk()
+
+
 class GuiDetection(unittest.TestCase):
     """Only the Calibre GUI holds the library; its workers and other tools do not."""
 
