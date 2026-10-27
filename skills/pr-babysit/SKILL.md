@@ -38,6 +38,13 @@ python3 $S/merge.py --pr-url <url> --base <branch> --checkout DIR --output <save
 
 `merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception.
 
+After an agentrc update, launch the workflow from the installed file (Workflow
+`scriptPath: ~/.claude/workflows/pr-babysit.js`), not by its name in a session
+started before the update: that session may hold an older copy of the script
+while the skills' scripts are already new. A copy whose collector output it
+cannot read stops `collector-skew` (collect.py's `contract`), one calling a
+script the install lacks `stale-workflow`.
+
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch, lists the `blockers` to settle before continuing, and shows as `pinned`
 the arguments the state is fixed to, which a continuation passes unchanged.

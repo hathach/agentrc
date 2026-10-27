@@ -47,14 +47,23 @@ def greptile_run(title=BELOW_TITLE, summary=BELOW_SUMMARY, **over):
 
 
 def unsealed(text):
-    """The printed line without its seal, which must be facts.py's over the rest; an error line has none."""
+    """The printed line without its seal, which must be facts.py's over the rest, nor its contract, which must be
+    collect.CONTRACT; an error line has neither."""
     line = json.loads(text)
     if 'error' in line:
-        assert 'seal' not in line, line
+        assert 'seal' not in line and 'contract' not in line, line
         return line
     rest = {k: v for k, v in line.items() if k != 'seal'}
     assert line['seal'] == FACTS.sealed(rest)['seal'], line
+    assert rest.pop('contract') == collect.CONTRACT, line
     return rest
+
+class ContractTest(unittest.TestCase):
+    def test_the_output_contract_is_the_one_pr_babysit_reads(self):
+        """#293: a bump on one side alone reads as a workflow copy older or newer than the collector on every launch."""
+        body = (Path(__file__).resolve().parents[1] / 'workflows' / 'pr-babysit.js').read_text(encoding='utf-8')
+        self.assertEqual(int(re.search(r'^const COLLECT_CONTRACT = (\d+)$', body, re.M)[1]), collect.CONTRACT)
+
 
 class InventoryTest(unittest.TestCase):
     def setUp(self):

@@ -13,7 +13,7 @@ observedAt}, plus `error` when set
 (a relaying agent can drop a trailing null, so no line carries a null error), and
 `rateLimit` {observedAt, resetAt, secondary} beside an error from a gh call GitHub
 refused for a rate limit, as pr-babysit's facts.py reports it; every
-line but an error one also carries `seal`, pr-babysit's facts.py seal. With --brief, a
+line but an error one also carries `contract`, CONTRACT, and `seal`, pr-babysit's facts.py seal. With --brief, a
 status still running lists no checks (a waiting relay copies nothing it will read
 again). The PR is read again on every poll; once --stop-file PATH exists (the
 caller met a GitHub rate limit elsewhere) it ends as an error before its next
@@ -195,6 +195,9 @@ DIAGNOSTIC = re.compile(r'\b(?:error|Error|ERROR|FAIL|FAILED|Failed|failed|[Aa]s
 DURATION = re.compile(r'\s+in \d+(?:\.\d+)?s\b')
 FILES = re.compile(r'[\w./-]+\.(?:c|h|cc|cpp|hpp|py|S|s|ld|cmake|mk|ya?ml|json)\b')
 KEEP = 20
+# The members every command's line holds, as pr-babysit's relay schema reads them: bump it, and the workflow's COLLECT_CONTRACT
+# with it, on any change to them, so a workflow copy older or newer than this file is told apart from a mis-copied line (#293).
+CONTRACT = 1
 RECALL_BYTES = 8192  # unmeasured: a relay copied 3.5 KB whole and failed at 28 KB and 51 KB (agentrc#9, #23, #20)
 SHA = re.compile(r'[0-9a-f]{40}')
 HIL_ROW = re.compile(r'^(?:\d+\.\d{3} )?(\S+)\s+(\S+)\s+\.\.\.\s+(\S.*)$')  # HIL_PROFILE=1 prefixes epoch seconds
@@ -613,8 +616,12 @@ def line(head, verdicts=(), left=()):
     return {'head': head, 'verdicts': list(verdicts), 'left': list(left)}
 
 
+def finished(out):
+    return sealed({**out, 'contract': CONTRACT})
+
+
 def fits_line(out):
-    return len(json.dumps(sealed(out))) + 1 <= RECALL_BYTES
+    return len(json.dumps(finished(out))) + 1 <= RECALL_BYTES
 
 
 def page(entry, start, end):
@@ -1246,7 +1253,7 @@ def main(argv=None):
             out = remember(a.repo, a.pr, a.head, sys.stdin.buffer.read())
         else:
             out = recall(a.repo, a.pr, a.head, a.check, a.offset)
-        out, rc = sealed(out), 0
+        out, rc = finished(out), 0
     except Failed as e:
         out, rc = {'head': a.head, 'error': str(e), **({'rateLimit': e.limit} if e.limit else {})}, 1
     print(json.dumps(out))

@@ -389,7 +389,11 @@ const REQUIRED_CHECK = {
   type: 'object', additionalProperties: false, required: ['context', 'app', 'state', 'bucket'],
   properties: { context: { type: 'string' }, app: { type: 'integer' }, state: { type: 'string' }, bucket: { enum: ['pass', 'pending', 'fail', 'missing'] } },
 }
-const INVENTORY = withSeal({
+// collect.py's CONTRACT: the members its lines hold, which these schemas read. A line of another is a collector older or newer
+// than this workflow copy, whose relayed copy can never pass its seal: told apart before the seal (#293).
+const COLLECT_CONTRACT = 1
+const collectorLine = (schema) => withSeal({ ...schema, required: [...schema.required, 'contract'], properties: { ...schema.properties, contract: { type: 'integer' } } })
+const INVENTORY = collectorLine({
   type: 'object', required: ['head', 'baseRef', 'status', 'mergeable', 'pending', 'registered', 'ignored', 'waiting', 'checks', 'requiredChecks', 'observedAt'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, baseRef: { type: 'string' }, status: { type: 'string' }, mergeable: { type: 'string' },
@@ -411,7 +415,7 @@ const GATE = {
   },
 }
 // `bases`: each --check's base job as `run:job:conclusion`, null without one.
-const EVIDENCE = withSeal({
+const EVIDENCE = collectorLine({
   type: 'object', required: ['head', 'detail', 'gates', 'bases'],
   properties: {
     rateLimit: RATE_LIMIT,
@@ -422,7 +426,7 @@ const EVIDENCE = withSeal({
     },
   },
 })
-const BASES = withSeal({
+const BASES = collectorLine({
   type: 'object', required: ['head', 'bases'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' }, bases: EVIDENCE.properties.bases },
 })
@@ -433,7 +437,7 @@ const VERDICT = {
 // collect.py's RECALL_BYTES bounds a recall line; a failed seal costs only its own batch (#9).
 const RECALL_PER_CALL = 5
 // `left`: links collect.py held back for room, with where their pages start.
-const RECALLED = withSeal({
+const RECALLED = collectorLine({
   type: 'object', required: ['head', 'verdicts', 'left'],
   properties: {
     error: { type: ['string', 'null'] }, head: { type: 'string' }, verdicts: { type: 'array', items: VERDICT },
@@ -443,7 +447,7 @@ const RECALLED = withSeal({
     },
   },
 })
-const REMEMBERED = withSeal({
+const REMEMBERED = collectorLine({
   type: 'object', required: ['head'],
   properties: { error: { type: ['string', 'null'] }, head: { type: 'string' } },
 })
@@ -750,8 +754,14 @@ const noteLimit = (limit, from = '') => {
 }
 // A copy that fails its script's seal is no answer; an error line carries no seal.
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
-const relayAgent = async (prompt, { fileTool, ...opts }) => {
+const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
   const v = await agent(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
+  // Before the seal, which a line of another contract never matches however often it is copied (#293).
+  if (v && !v.error && contract !== undefined && v.contract !== contract) {
+    return { ...v, skew: true, error: `collect.py prints output contract ${v.contract}, and this launch's workflow script reads ${contract}: ` +
+      'the launch runs a workflow copy older or newer than the installed collector. Relaunch from the installed file (Workflow ' +
+      'scriptPath ~/.claude/workflows/pr-babysit.js), in a fresh session after an agentrc update; no retry clears it' }
+  }
   if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
     log(`${opts.label}: the relayed copy does not match its seal`)
     return null
@@ -2112,12 +2122,17 @@ const ciLaneRun = async (cycle, lanes, entry) => {
       `run exactly \`${PY} ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
       (payload ? `\n${JSON.stringify(payload)}` : '')
-    const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }
+    const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema, contract: COLLECT_CONTRACT }
+    // A skew stops the cycle (runLanes); to every reader here its line is an error.
+    const skewed = (got) => {
+      if (got && got.skew) entry.collectorSkew = got.error
+      return got
+    }
     return relayRun(prompt(command), opts).then(got => {
       // A retry after a rate limit would only call GitHub again.
-      if (got || githubLimit) return got
+      if (got || githubLimit) return skewed(got)
       shortened = shortened || /--wait-seconds [1-9]/.test(command)
-      return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts)
+      return relayRetry(prompt(command.replace(/--wait-seconds \d+/, '--wait-seconds 0')), opts).then(skewed)
     })
   }
   // A slice retried without its wait leaves the budget short of a whole wait.
@@ -2848,6 +2863,11 @@ const runLanes = async (cycle, entry, lanes) => {
       return null
     }
     const c = await ciPromise
+    if (entry.collectorSkew) {
+      log(`cycle ${cycle}: ${entry.collectorSkew}`)
+      entry.error = `collector skew: ${entry.collectorSkew}`
+      return stop(cycle, 'collector-skew', { detail: entry.collectorSkew })
+    }
     if (!c) {
       const now = entry.ciCollectFailed, prev = before('ciCollectFailed')
       if (now && prev && now.head === prev.head && now.error === prev.error) {

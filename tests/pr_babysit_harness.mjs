@@ -65,6 +65,8 @@ const keyOf = (f) => {
   for (const ch of JSON.stringify([f.workflow === '' ? '' : 'ci', f.check, f.signature])) h = ((h ^ BigInt(ch.codePointAt(0))) * 0x100000001b3n) & 0xffffffffffffffffn
   return h.toString(16).padStart(16, '0')
 }
+// collect.py's output contract, as the workflow reads it.
+const COLLECT_CONTRACT = Number(body.match(/^const COLLECT_CONTRACT = (\d+)$/m)[1])
 // The checks a CI judge prompt asks about.
 // The values a relay prompt passes a script, each shell-quoted as --flag='value'.
 const flagValues = (prompt, flag) => [...String(prompt).matchAll(new RegExp(`--${flag}='((?:[^']|'\\\\'')*)'`, 'g'))].map(m => m[1].replaceAll("'\\''", "'"))
@@ -318,8 +320,11 @@ async function run(opts = {}) {
         answer = { head: ci.headSha ?? head, detail: '/tmp/ci-collect/failures-1.json', gates, bases: links.map(link => ({ link, base: baseOf(link) })) }
         if (opts.gates) answer = opts.gates(answer)
       }
-      // collect.py prints every member, a null one too, but no null error.
-      return answer === null ? null : conforms(options.schema, answer, label)
+      // collect.py prints every member, a null one too, but no null error, and the output contract this workflow reads;
+      // opts.collector(line, label) is another collect.py's line, held to no schema.
+      if (answer === null) return null
+      const line = conforms(options.schema, { contract: COLLECT_CONTRACT, ...answer }, label)
+      return opts.collector ? opts.collector(line, label) : line
     }
     if (label.startsWith('ci:judge#')) {
       const ci = ciOf(label)
@@ -2507,7 +2512,7 @@ test('a collector that dies gets one fresh agent; a second death leaves the cycl
 
 test('a collector failing the same way on two cycles running stops ci-collect-failed; a passing failure re-arms after a backoff', async () => {
   const failing = (error, when = () => true) => (l, a) => l.startsWith('ci:collect#') && when(cycleOf(l))
-    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', baseRef: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], requiredChecks: [], observedAt: '', seal: '' }
+    ? { error: typeof error === 'function' ? error(cycleOf(l)) : error, head: '', baseRef: '', status: '', mergeable: '', pending: 0, registered: 0, ignored: [], waiting: '', checks: [], requiredChecks: [], observedAt: '', contract: 0, seal: '' }
     : a
   const auth = await run({ args: { maxCycles: 4 }, garble: failing('gh: authentication expired') })
   assert.deepEqual([auth.result.reason, auth.result.detail, auth.result.cycles], ['ci-collect-failed', 'gh: authentication expired', 2], auth.logs.join('\n'))
@@ -2534,6 +2539,31 @@ test('a collector failing the same way on two cycles running stops ci-collect-fa
   assert.equal(pushed.result.state.last.ciCollectFailed.head, HEAD)
   const onPushed = await run({ preflight: { head: moved, prHead: moved }, args: { maxCycles: 3, yieldAfterCycle: true, state: pushed.result.state }, garble: failing('gh: HTTP 502') })
   assert.notEqual(onPushed.result.reason, 'ci-collect-failed', 'one failure on each of two heads')
+})
+
+test('a collector of another output contract stops collector-skew at once; a mis-copied line is a dead relay (#293)', async () => {
+  const relayed = (over) => (l, a) => l.startsWith('ci:collect#') && !a.error ? over(a) : a
+  const SKEW = (got) => new RegExp(`^collect\\.py prints output contract ${got}, and this launch's workflow script reads ${COLLECT_CONTRACT}: ` +
+    '.*Relaunch from the installed file \\(Workflow scriptPath ~/\\.claude/workflows/pr-babysit\\.js\\)')
+  for (const [name, collector, garble, got] of [
+    // An older collect.py: no contract, nor a member added since, which the relay fills in to meet its schema.
+    ['older', ({ contract, requiredChecks, ...line }) => line, relayed(a => ({ contract: 0, requiredChecks: [], ...a })), 0],
+    // A newer one: a member this copy's schema lacks, which the relay leaves out.
+    ['newer', (line) => ({ ...line, contract: COLLECT_CONTRACT + 1, added: [] }), relayed(({ added, ...a }) => a), COLLECT_CONTRACT + 1],
+  ]) {
+    const { result, labels, logs } = await run({ args: { maxCycles: 4 }, collector, garble })
+    assert.equal(result.reason, 'collector-skew', name)
+    assert.match(result.detail, SKEW(got), name)
+    assert.equal(result.cycles, 1, `${name}: stopped at once, not after two cycles`)
+    assert.deepEqual(labels.filter(l => l.startsWith('ci:collect#')), ['ci:collect#1.1'], `${name}: no retry, no further read`)
+    assert.ok(logs.some(l => SKEW(got).test(l.replace(/^cycle 1: /, ''))), logs.join('\n'))
+    assert.equal(logs.some(l => /collector died|does not match its seal/.test(l)), false, name)
+  }
+  // The same contract, a member altered in the copy: the seal catches it, as before.
+  const altered = await run({ args: { maxCycles: 1 }, garble: relayed(a => ({ ...a, observedAt: '2026-01-01T00:00:00Z' })) })
+  assert.notEqual(altered.result.reason, 'collector-skew')
+  assert.ok(altered.logs.includes('ci:collect#1.1: the relayed copy does not match its seal'), altered.logs.join('\n'))
+  assert.ok(altered.logs.some(l => l === 'cycle 1: CI inventory failed — the collector died'), altered.logs.join('\n'))
 })
 
 test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
