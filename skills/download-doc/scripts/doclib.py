@@ -426,12 +426,13 @@ class Library:
         typed into a command by hand:
 
             calibre:
-              server_url: http://localhost:8080
+              server_url: http://localhost:8080/#calibre-library
               username: <name>
               password: <secret>
 
-        They are used only for the library the GUI has open (served_url); a `library`
-        key, which used to declare it, is no longer read.
+        `#<id>` is calibre's id for the library the GUI has open; writes go through the
+        server only for that library and only with that id (served_url). A `library`
+        key, which used to declare the library, is no longer read.
 
         Calibre's content server accepts reads unauthenticated but answers writes with
         "Forbidden" until a user exists (Preferences -> Sharing over the net -> Require
@@ -474,13 +475,13 @@ class Library:
 
         Only the GUI's own library qualifies: the GUI's lock refuses calibredb on every
         library, so a scratch library's run would otherwise write the served one. Its id
-        is taken from the server's own list, not derived: calibre names a library by its
-        folder name, spaces as `_`, numbering a repeat (`My_Library`, `My_Library1`) in
-        the order it met them, and refuses an id it does not serve but not a same-named
-        library of another path. The GUI's library is always in that list, so exactly one
-        id of its name is it; two or more are ambiguous unless `server_url` names one
-        (`...#My_Library1`). Without any id the server writes its default library, the
-        first it lists and not necessarily the GUI's.
+        must be named in `server_url`: nothing the server answers proves which library an
+        id is. calibre names a library by its folder name, spaces as `_`, numbering a
+        repeat (`My_Library`, `My_Library1`) in the order it met them; it refuses an id
+        it does not serve, but not a same-named library of another path; and its list of
+        ids shows only what the account may see, so a lone `My_Library1` there can be
+        another library while the GUI's is hidden. Without any id the server writes its
+        default library, the first it lists and not necessarily the GUI's.
         """
         if self._url:
             return self._url
@@ -493,17 +494,11 @@ class Library:
         url = url.rstrip("/")
         if not given:
             p = self._server_call(f"{url}/#-", "list")
-            if p.returncode != 0:
-                raise RuntimeError(f"cannot list the libraries {url} serves: "
-                                   + (p.stderr or p.stdout or "").strip()[:160])
-            ids = p.stdout.split()
-            name = Path(os.path.abspath(gui)).name.replace(" ", "_")   # calibre's: symlinks unresolved
-            alike = [i for i in ids if re.fullmatch(re.escape(name) + r"\d*", i)]
-            if len(alike) != 1:
-                raise RuntimeError(
-                    f"{url} serves {len(alike)} libraries named like {name} ({', '.join(ids) or 'none'}); "
-                    f"name the one for {gui} in secret.yml's server_url as {url}/#<id>")
-            given = alike[0]
+            shown = (", ".join(p.stdout.split()) or "none") if p.returncode == 0 else \
+                f"unlisted: {(p.stderr or p.stdout or '').strip()[:120]}"
+            raise RuntimeError(f"secret.yml's server_url names no library id; set it to {url}/#<id> "
+                               f"with the id {url} gives the GUI's library {gui} (ids it shows "
+                               f"this account: {shown})")
         self._url = f"{url}/#{given}"
         return self._url
 

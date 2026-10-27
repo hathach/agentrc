@@ -490,30 +490,22 @@ class GuiDetection(unittest.TestCase):
             lib._run('add', 'x.pdf')
         self.assertEqual([argv[2] for argv in calls], [str(scratch)])
 
-    def test_the_library_id_is_the_one_the_server_lists_for_the_guis_library(self):
+    def test_a_server_url_without_a_library_id_is_refused_whatever_the_server_lists(self):
+        # calibre 8.5 lists only the ids an account may see: GUI library /gui/My Library is
+        # My_Library, /other/My_Library is My_Library1, and an account allowed only the
+        # latter sees a lone My_Library1, which is not the GUI's library.
         self.running(*self.GUI)
         target = self.secret()
         self.gui_on(target)
-        lib, calls = self.lock_then(['lock', 'My_Library\nother\n', 'via server'],
-                                    server=doclib.Library(target).server, path=target)
-        self.assertEqual(lib._run('add', 'x.pdf'), 'via server')
-        self.assertEqual([argv[2] for argv in calls],
-                         [str(target), 'http://localhost:8080/#-', 'http://localhost:8080/#My_Library'])
-
-    def test_libraries_of_one_name_are_refused_unless_server_url_names_one(self):
-        # calibre 8.5: /other/My Library is My_Library, /target/My Library My_Library1; a
-        # derived #My_Library would write the other one.
-        self.running(*self.GUI)
-        target = self.secret()
-        self.gui_on(target)
-        for ids in ('My_Library\nMy_Library1\n', 'other\n'):
+        for ids in ('My_Library1\n', 'My_Library\n', 'My_Library\nMy_Library1\n', ''):
             with self.subTest(ids):
                 lib, calls = self.lock_then(['lock', ids, ids], server=doclib.Library(target).server, path=target)
-                with self.assertRaisesRegex(RuntimeError, 'libraries named like My_Library .*'
-                                                          r'server_url as http://localhost:8080/#<id>'):
+                with self.assertRaisesRegex(RuntimeError, r"server_url names no library id; set it to "
+                                                          r"http://localhost:8080/#<id> .*ids it shows this account: "
+                                                          + (', '.join(ids.split()) or 'none')):
                     lib._run('add', 'x.pdf')
-                self.assertEqual(len(calls), 2)
-                self.assertIn('libraries named like My_Library', lib.blockers()[0])
+                self.assertEqual([argv[2] for argv in calls], [str(target), 'http://localhost:8080/#-'])
+                self.assertIn('server_url names no library id', lib.blockers()[0])
         self.secret(server_url='http://localhost:8080/#My_Library1')
         lib, calls = self.lock_then(['lock', 'via server'], server=doclib.Library(target).server, path=target)
         self.assertEqual(lib._run('add', 'x.pdf'), 'via server')

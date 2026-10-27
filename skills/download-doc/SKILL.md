@@ -103,10 +103,12 @@ Dedup depends on matching these exactly; `maintaining.md` gives the reasons.
 - `--apply` refuses while something holds the library. **The Calibre GUI's write lock**:
   ask the user to close it, never kill it — or configure a content-server user in the
   gitignored `secret.yml` beside this file (`calibre:` block; `Library._server_creds`
-  documents it). The server is used only for the library the GUI has open; with the GUI open,
-  no other library (a scratch copy included) can be written. **A FreeFileSync
-  `calibre-library.ffs_batch` mirror** to omv: let it finish. On Windows the mirror
-  check cannot see command lines; pause the mirror yourself before `--apply`.
+  documents it), its `server_url` ending in `#<id>`, calibre's id for the GUI's library
+  (`calibre-library` for `~/Documents/calibre-library`). The server is used only for the
+  library the GUI has open; with the GUI open, no other library (a scratch copy included)
+  can be written. **A FreeFileSync `calibre-library.ffs_batch` mirror** to omv: let it
+  finish. On Windows the mirror check cannot see command lines; pause the mirror yourself
+  before `--apply`.
 - Replacing or removing a book moves the old one to Calibre's Recycle Bin (kept 14
   days by default; restore it there); remove through `refresh` or `sync.py remove`,
   never `calibredb remove` by hand.
