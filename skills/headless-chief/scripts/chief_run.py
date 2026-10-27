@@ -152,34 +152,54 @@ def child_env():
 
 class Tasks:
     """The session's own Agent, Bash and workflow tasks from claude's task events. A task the final result leaves
-    running, or one killed after chief's last message, was cut off by the session's end, not settled by chief: a unit
-    that returns while its own background command runs reads `completed`, its command still listed."""
+    running, or one killed without a `TaskStop` naming it and before its owner's next turn (chief's: a new top-level
+    `init`, or a result whose `origin.runId` is the task's; a unit's: a later event of that unit), was cut off by the
+    session's end, not settled: a unit that returns while its own background command runs reads `completed`, its
+    command still listed."""
     ENDED = {'completed', 'failed', 'killed', 'stopped'}
 
     def __init__(self):
-        self.about, self.status, self.listed, self.killed, self.open = {}, {}, set(), set(), set()
+        self.about, self.status, self.runs, self.stops = {}, {}, {}, set()
+        self.listed, self.killed, self.open = set(), set(), set()
+
+    def owned_by(self, parent):
+        return {t for t in self.killed if self.about.get(t, ('', None))[1] == parent}
 
     def event(self, event):
         kind, sub, task = event.get('type'), event.get('subtype'), event.get('task_id')
-        if kind == 'assistant' and event.get('parent_tool_use_id') is None:
-            self.killed.clear()   # chief's message comes after it: a stop it ordered or has seen
+        if kind == 'assistant':   # chief or a unit stopping its own task
+            self.stops.update(str((b.get('input') or {}).get('task_id')) for b in event['message']['content']
+                              if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('name') == 'TaskStop')
+            self.killed -= self.stops
         elif kind == 'result':
+            if (origin := event.get('origin') or {}).get('kind') == 'task-notification':
+                self.killed.discard(self.runs.get(origin.get('runId')))
             self.open = {t for t, s in self.status.items() if s not in self.ENDED} | self.listed
-        elif kind != 'system' or (task is None and sub != 'background_tasks_changed'):
+        elif kind != 'system':
             return
-        elif sub == 'task_started':
-            self.about[task] = (event.get('description') or '', event.get('parent_task_id'))
-            self.status[task] = 'running'
-        elif sub in ('task_updated', 'task_notification'):
-            status = (event.get('patch') or {}).get('status') if sub == 'task_updated' else event.get('status')
-            if status:
-                self.status[task] = status
-            if status in ('killed', 'stopped'):
-                self.killed.add(task)
+        elif sub == 'init':
+            self.killed -= self.owned_by(None)
+        elif task is None and sub != 'background_tasks_changed':
+            return
         elif sub == 'background_tasks_changed':
             self.listed = {t['task_id'] for t in event.get('tasks') or []}
             for t in event.get('tasks') or []:
                 self.about.setdefault(t['task_id'], (t.get('description') or '', t.get('parent_task_id')))
+        else:
+            if run := event.get('run_id'):
+                self.runs[run] = task
+            if sub == 'task_started':
+                self.about[task] = (event.get('description') or '', event.get('parent_task_id'))
+                self.status[task] = 'running'
+                self.killed.discard(task)
+            elif sub in ('task_updated', 'task_notification'):
+                status = (event.get('patch') or {}).get('status') if sub == 'task_updated' else event.get('status')
+                if status:
+                    self.status[task] = status
+                if status in ('killed', 'stopped') and task not in self.stops:
+                    self.killed.add(task)
+            if self.status.get(task) not in ('killed', 'stopped'):
+                self.killed -= self.owned_by(task)   # the unit went on past its own task's kill
 
     def cut(self):
         """Each task cut off, `<id> <status> "<description>"`, a unit's own followed by ` under <id> "<description>"`."""
@@ -381,7 +401,6 @@ def launch(a, task):
                 try:
                     event = json.loads(raw)
                     kind = event.get('type')
-                    tasks.event(event)
                     if kind == 'system' and event.get('subtype') == 'init':
                         sid = event.get('session_id', '')
                         (a.out / 'session').write_text(f'{sid}\n', encoding='utf-8', newline='\n')
@@ -404,6 +423,7 @@ def launch(a, task):
                                 warn('late', 'a status line later in a message was not forwarded; see stream.jsonl')
                     elif kind == 'result':
                         result = event
+                    tasks.event(event)
                 except Exception as e:   # noqa: BLE001 - any bad record is skipped: chief's stdout must keep draining
                     err.write(f'chief_run: unusable stdout line ({type(e).__name__}: {e}): '.encode() + raw)
                     err.flush()

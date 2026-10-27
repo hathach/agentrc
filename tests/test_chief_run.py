@@ -288,6 +288,10 @@ class ChiefRun(unittest.TestCase):
         # the shapes of claude 2.1.310's task events (agentrc#289): a unit returns while its own background Bash runs
         def task(sub, tid, **kw):
             return {'type': 'system', 'subtype': sub, 'task_id': tid, **kw}
+
+        def thinking(msg_id):
+            return {'type': 'assistant', 'parent_tool_use_id': None,
+                    'message': {'id': msg_id, 'content': [{'type': 'thinking', 'thinking': ''}]}}
         unit = 'a2fe9c5420ae63043'
         dispatched = (init(), text('m1', 'chief: stage · W1 dispatched'),
                       task('task_started', unit, description='Fix R1-2', task_type='local_agent', is_backgrounded=True),
@@ -302,12 +306,17 @@ class ChiefRun(unittest.TestCase):
                   task('task_notification', 'b0w29yqzt', status='stopped'),
                   {'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': []})
         waiting = text('m2', 'W1 is running its suite. Still waiting for its final result.')
+        wait = (task('task_started', 'bwait', description='Wait', task_type='local_bash', is_backgrounded=True),)
+        wait_killed = (task('task_updated', 'bwait', patch={'status': 'killed'}), task('task_notification', 'bwait', status='stopped'))
         child = f'b0w29yqzt {{}} "Rerun full suite" under {unit} "Fix R1-2"'
         cases = [
             ('result before kill', (*dispatched, waiting, result(waiting['message']['content'][0]['text']), *killed),
              child.format('stopped')),
             ('kill before result', (*dispatched, waiting, *killed, result('W1 is running.')), child.format('stopped')),
             ('a completed unit with a live child', (*dispatched, waiting, result('W1 is running.')), child.format('running')),
+            # one message straddles the kill: its later block is no proof chief took the kill in
+            ("a kill inside chief's last message", (init(), *wait, thinking('m2'), *wait_killed,
+                                                     text('m2', 'W1 is done.'), result('W1 is done.')), 'bwait stopped "Wait"'),
         ]
         for name, events, cut in cases:
             with self.subTest(name):
@@ -320,10 +329,14 @@ class ChiefRun(unittest.TestCase):
         settled = (task('task_updated', 'b0w29yqzt', patch={'status': 'completed'}),
                    task('task_notification', 'b0w29yqzt', status='completed'),
                    {'type': 'system', 'subtype': 'background_tasks_changed', 'tasks': []})
-        stopped = (task('task_started', 'bwait', description='Wait', task_type='local_bash', is_backgrounded=True), *killed[2:],
-                   task('task_updated', 'bwait', patch={'status': 'killed'}), task('task_notification', 'bwait', status='stopped'))
-        for name, events in (('normal completion', (*dispatched, *settled, text('m3', 'chief: stage · done'), result())),
-                             ('a stop chief saw', (init(), *stopped, text('m3', 'chief: stage · done'), result()))):
+        stop = {'type': 'assistant', 'parent_tool_use_id': None, 'message': {'id': 'm2', 'content': [
+            {'type': 'tool_use', 'id': 't1', 'name': 'TaskStop', 'input': {'task_id': 'bwait'}}]}}
+        unit_went_on = (*dispatched[:4], *killed, task('task_progress', unit), *dispatched[4:6])
+        done = (text('m3', 'chief: stage · done'), result())
+        for name, events in (('normal completion', (*dispatched, *settled, *done)),
+                             ('a TaskStop naming it', (init(), *wait, stop, *wait_killed, *done)),
+                             ("chief's next turn after the kill", (init(), *wait, *wait_killed, init(), *done)),
+                             ('its unit went on past the kill', (*unit_went_on, *done))):
             with self.subTest(name):
                 self.stream(*events)
                 self.assertEqual(self.run_it().returncode, 0)
