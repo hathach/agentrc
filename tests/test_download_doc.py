@@ -318,12 +318,15 @@ class GuiDetection(unittest.TestCase):
         self.assertIn('FreeFileSync', lib.blockers()[0])
 
     def lock_then(self, results, server=None):
-        """A Library whose calibredb answers each call from `results` (a lock error or output)."""
+        """A Library whose calibredb answers each call from `results` (a lock error, a
+        ('fail', stderr) or output)."""
         calls = []
 
         def run(argv, capture_output, text):
             calls.append(argv)
             out = results.pop(0)
+            if isinstance(out, tuple):
+                return subprocess.CompletedProcess(argv, 1, '', out[1])
             return subprocess.CompletedProcess(argv, 1 if out == 'lock' else 0, out, 'Another calibre program is running' if out == 'lock' else '')
         saved = (doclib.subprocess.run, doclib.time.sleep)
         self.addCleanup(lambda: (setattr(doclib.subprocess, 'run', saved[0]), setattr(doclib.time, 'sleep', saved[1])))
@@ -349,13 +352,14 @@ class GuiDetection(unittest.TestCase):
         self.assertEqual(lib._run('list'), 'via server')
         self.assertEqual(calls[1][2], 'http://localhost:8080/#lib')
 
-    def secret(self, serves_scratch=False):
+    def secret(self, serves_scratch=False, server_url=None):
         """Content-server credentials in a secret.yml -> a scratch library, which the server
         serves only when serves_scratch says so; otherwise it serves the default library."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         scratch = Path(tmp.name) / 'scratch library'
         served = f'  library: {scratch}\n' if serves_scratch else ''
+        served += f'  server_url: {server_url}\n' if server_url else ''
         (Path(tmp.name) / 'secret.yml').write_text(f'calibre:\n  username: u\n  password: pw\n{served}',
                                                    encoding='utf-8')
         env = unittest.mock.patch.dict(os.environ, {'DOWNLOAD_DOC_SECRET': str(Path(tmp.name) / 'secret.yml')})
@@ -385,7 +389,25 @@ class GuiDetection(unittest.TestCase):
         self.assertEqual(lib.blockers(), [])
         _, calls = self.lock_then(['lock', 'via server'])
         self.assertEqual(lib._run('list'), 'via server')
-        self.assertEqual(calls[1][2], 'http://localhost:8080')
+        self.assertEqual(calls[1][2], 'http://localhost:8080/#scratch_library')
+
+    def test_writes_name_the_served_library_by_calibres_id(self):
+        # Without an id the server writes its default library, which need not be the one declared.
+        self.secret()
+        self.assertEqual(doclib.Library(doclib.DEFAULT_LIBRARY).server[0], 'http://localhost:8080/#calibre-library')
+        self.secret(server_url='http://127.0.0.1:8081/')
+        self.assertEqual(doclib.Library(doclib.DEFAULT_LIBRARY).server[0], 'http://127.0.0.1:8081/#calibre-library')
+        # calibre numbers a second library of the same folder name; the given id is kept.
+        self.secret(server_url='http://localhost:8080/#calibre-library1')
+        self.assertEqual(doclib.Library(doclib.DEFAULT_LIBRARY).server[0], 'http://localhost:8080/#calibre-library1')
+
+    def test_an_id_the_server_does_not_serve_is_refused_not_retried_without_it(self):
+        self.running(*self.GUI)
+        lib, calls = self.lock_then(['lock', ('fail', 'Not Found')], server=('http://localhost:8080/#lib', 'u', 'pw'))
+        with self.assertRaisesRegex(RuntimeError, r"http://localhost:8080/#lib serves no library by that id; "
+                                                  r".*'http://localhost:8080/#-' list"):
+            lib._run('add', 'x.pdf')
+        self.assertEqual([argv[2] for argv in calls], ['/lib', 'http://localhost:8080/#lib'])
 
 
 class LibraryCalls(unittest.TestCase):

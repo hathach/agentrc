@@ -435,6 +435,14 @@ class Library:
         calibredb on every library, so without that check a run aimed at a scratch
         library would read and write the served one.
 
+        Writes name the library by calibre's id for it, `server_url#<id>`: the folder name
+        with spaces as `_`, or the fragment `server_url` already carries. Without one the
+        server writes its default library, the first it lists and not necessarily the
+        GUI's; with one it refuses an id it does not serve ("Not Found"). The id cannot
+        replace `library`, though: it is only the folder name, so calibre 8.5 took
+        `#calibre-library` aimed at another library's `.../calibre-library` and wrote the
+        served one.
+
         Calibre's content server accepts reads unauthenticated but answers writes with
         "Forbidden" until a user exists (Preferences -> Sharing over the net -> Require
         username and password -> Add user, with write access). With one defined,
@@ -458,7 +466,9 @@ class Library:
         served = Path(g.get("library") or DEFAULT_LIBRARY).expanduser()
         if served.resolve() != Path(path).expanduser().resolve():
             return None
-        return (g.get("server_url", "http://localhost:8080"), g["username"], g["password"])
+        url, _, library_id = g.get("server_url", "http://localhost:8080").partition("#")
+        library_id = library_id or served.resolve().name.replace(" ", "_")
+        return (f"{url.rstrip('/')}/#{library_id}", g["username"], g["password"])
 
     # calibredb reports "Another calibre program ... is running" even when Calibre is
     # closed, if a FreeFileSync mirror is touching the library directory at that moment.
@@ -507,8 +517,11 @@ class Library:
                                 pass
                         if p2.returncode == 0:
                             return p2.stdout
-                        raise RuntimeError("content-server write failed: "
-                                           + (p2.stderr or p2.stdout or "").strip()[:160])
+                        why = (p2.stderr or p2.stdout or "").strip()[:160]
+                        if why == "Not Found":
+                            why = (f"{url} serves no library by that id; `calibredb --with-library "
+                                   f"'{url.partition('#')[0]}#-' list` lists the ids it serves")
+                        raise RuntimeError("content-server write failed: " + why)
                     raise RuntimeError(
                         "the Calibre GUI is open and holds the library's write lock. "
                         "Close it, or define a content-server user and put the credentials "
