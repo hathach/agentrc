@@ -356,7 +356,10 @@ class FailClosed(unittest.TestCase):
         overview = '<!-- ccr-overview-v2 -->\n### Approval recommended'
         excluded = harvest.COPILOT_NO_FILES + ' Check if the **Files changed** are included in default exclusions.'
         cases = [
-            ([v(harvest.COPILOT_QUOTA)], ('settled', 'limited', HEAD)),
+            ([v(harvest.COPILOT_QUOTA[0])], ('settled', 'limited', HEAD)),
+            ([v('Copilot was unable to review this pull request because the user who requested the review has insufficient remaining quota.')],
+             ('settled', 'limited', HEAD)),
+            ([v('Copilot was unable to review this pull request because the user who requested the review has no seat.')], ('unknown', None, None)),
             ([v(excluded)], ('settled', 'skipped', HEAD)),
             ([v(overview)], ('reviewed', None, HEAD)),
             ([v('## Pull request overview\nx')], ('reviewed', None, HEAD)),
@@ -367,9 +370,9 @@ class FailClosed(unittest.TestCase):
             ([v(overview, state='DISMISSED')], ('absent', None, None)),
             ([review('coderabbitai[bot]', HEAD, overview)], ('absent', None, None)),
             ([], ('absent', None, None)),
-            ([v(overview, at='2026-09-25T09:00:00Z', id_=1), v(harvest.COPILOT_QUOTA, at='2026-09-25T10:00:00Z', id_=2)], ('settled', 'limited', HEAD)),
-            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA, id_=2)], ('unknown', None, None)),
-            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA, at=None, id_=2)], ('unknown', None, None)),
+            ([v(overview, at='2026-09-25T09:00:00Z', id_=1), v(harvest.COPILOT_QUOTA[0], at='2026-09-25T10:00:00Z', id_=2)], ('settled', 'limited', HEAD)),
+            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA[0], id_=2)], ('unknown', None, None)),
+            ([v(overview, id_=1), v(harvest.COPILOT_QUOTA[0], at=None, id_=2)], ('unknown', None, None)),
         ]
         for reviews, want in cases:
             r = harvest.copilot(HEAD, reviews)
@@ -583,18 +586,18 @@ class EndToEnd(unittest.TestCase):
     def test_a_copilot_refusal_has_no_body_and_reads_settled(self):
         answers = self.answers([HEAD])
         answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'][0][0].append(
-            review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA, id_=33) | {'state': 'COMMENTED'})
+            review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA[0], id_=33) | {'state': 'COMMENTED'})
         code, got = self.harvest(answers)
         self.assertEqual(code, 0, got)
         mine = [c for c in got['comments'] if c['source'] == 'copilot']
         self.assertEqual([(c['commentId'], c['body'], c['bodyOmitted'], c['digest']) for c in mine],
-                         [(33, None, 'copilot-refusal', harvest.digest(harvest.COPILOT_QUOTA))])
+                         [(33, None, 'copilot-refusal', harvest.digest(harvest.COPILOT_QUOTA[0]))])
         self.assertEqual([(b['state'], b['kind'], b['evidence']) for b in got['bots'] if b['bot'] == 'copilot'],
                          [('settled', 'limited', [f'review 33 on {HEAD[:8]}'])])
 
     def test_each_comment_endpoint_is_read_once(self):
         answers = self.answers([HEAD])
-        quota = review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA, id_=33) | {'state': 'COMMENTED'}
+        quota = review('copilot-pull-request-reviewer[bot]', HEAD, harvest.COPILOT_QUOTA[0], id_=33) | {'state': 'COMMENTED'}
         # A second read would get the second page set, with no Copilot review in it.
         answers['api --paginate --slurp repos/o/r/pulls/7/reviews?per_page=100'] = [[[quota]], [[]]]
         answers['api --paginate --slurp repos/o/r/issues/7/comments?per_page=100'].append([[]])

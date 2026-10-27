@@ -74,7 +74,9 @@ CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
 COUNTDOWN_TERM = re.compile(r'(\d+) (hour|minute|second)s?')
 # CodeRabbit's included reviews come back within the hour: the reset a notice without a countdown is given.
 ESTIMATED_RESET = timedelta(hours=1)
-COPILOT_QUOTA = 'Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.'
+# The quota notice's known wordings (#308); any other "unable to review" body stays unknown.
+COPILOT_QUOTA = ('Copilot was unable to review this pull request because the user who requested the review has reached their quota limit.',
+                 'Copilot was unable to review this pull request because the user who requested the review has insufficient remaining quota.')
 COPILOT_NO_FILES = "Copilot wasn't able to review any files in this pull request."
 COPILOT_OVERVIEW = ('<!-- ccr-overview', '## Pull request overview')
 REVIEW_SUBMITTED = ('COMMENTED', 'APPROVED', 'CHANGES_REQUESTED')
@@ -330,7 +332,7 @@ def greptile_paused(head, reviews, harvested):
 def copilot_reading(body):
     """(state, kind, reason) for a Copilot review body."""
     body = (body or '').strip()
-    if body == COPILOT_QUOTA:
+    if body in COPILOT_QUOTA:
         return 'settled', 'limited', 'the requesting user reached the Copilot quota'
     if body.startswith(COPILOT_NO_FILES):
         return 'settled', 'skipped', 'no file in the PR is one Copilot reviews'
