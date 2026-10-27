@@ -9,7 +9,7 @@ export const meta = {
 if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
 }
-const ARG_NAMES = ['pr', 'repo', 'reviewers', 'autoRun', 'maxCycles', 'autoPush', 'markSonar', 'coderabbitTrigger', 'greptileTrigger', 'checkoutDir',
+const ARG_NAMES = ['pr', 'repo', 'python', 'reviewers', 'autoRun', 'maxCycles', 'autoPush', 'markSonar', 'coderabbitTrigger', 'greptileTrigger', 'checkoutDir',
   'protected', 'generated', 'ciWait', 'ciNotes', 'acceptedFailures', 'deferrals', 'replySettlements', 'build', 'yieldAfterCycle', 'yieldOnChange',
   'lane', 'state', 'stateRef', 'adoptHead', 'adoptProtected', 'adoptReviewedProtected', 'rebasedHead', 'rejudge']
 if (!args || !args.pr) {
@@ -27,6 +27,12 @@ const REPO_NAME = /^[A-Za-z0-9][A-Za-z0-9-]*\/(?!\.\.?$)[A-Za-z0-9._-]+$/
 if (args.repo != null && (typeof args.repo !== 'string' || !REPO_NAME.test(args.repo))) {
   throw new Error('repo must be OWNER/NAME, the repository PR pr belongs to (a fork PR\'s base repository)')
 }
+// One interpreter for every script (#234): the caller's, else the one `python3` names, by the absolute path preflight reports; never a search.
+const pythonArg = args.python ?? null
+if (pythonArg !== null && (typeof pythonArg !== 'string' || !pythonArg.trim() || /[\x00-\x1f]/.test(pythonArg))) {
+  throw new Error('python must be the interpreter every script runs under, a path or command name on one line')
+}
+let PY = pythonArg === null ? 'python3' : shq(pythonArg)
 const checkoutDir = args.checkoutDir || '.'
 if (typeof checkoutDir !== 'string') {
   throw new Error('checkoutDir must be a path string')
@@ -260,7 +266,7 @@ if (args.stateRef != null) {
     const groups = missing ? [false, true].flatMap(pad => groupsOf(missing.filter(i => padded(i) === pad), PER_CALL).map(asked => ({ asked, pad })))
       : [{ asked: null, pad: false }]
     const replies = await parallel(groups.map(({ asked, pad }) => () => agent(
-      `Run exactly: python3 ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}${pad ? ' --pad' : ''}` : ''}\n` +
+      `Run exactly: ${PY} ${STATE_SCRIPT} '${file}'${asked ? ` --chunks ${asked.join(',')}${pad ? ' --pad' : ''}` : ''}\n` +
       'Its last stdout line is one JSON object: return it unchanged as your answer. The chunk data is opaque base64; ' +
       'copy every character exactly and change, reorder, drop or add nothing.',
       { label: `state:load#${++call}`, agentType: 'relay', model: 'sonnet', effort: 'low', schema: ENVELOPE },
@@ -692,7 +698,7 @@ const SCOPE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/scope_check.py'
 const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
 const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
-const shq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`
+function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
 const relayed = (schema) => {
   const EMPTY = { boolean: 'false', string: "''", array: '[]', integer: '0' }
   const empty = schema.required.map(k => {
@@ -769,7 +775,7 @@ const settles = (r) => r.verified === true && r.replyId !== null &&
 // saved receipt instead, so a reply that run posted is not reported as found there (#53).
 const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   `${IN_CHECKOUT}${task}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-  `\`python3 ${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
+  `\`${PY} ${REPLY_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --${mode} '<that file>' --receipt ${shq(`${pinned.receipts.trim()}/${label}.json`)}\`, then return its last stdout line unchanged: every member it prints, a null one too, and none it leaves out. ` +
   'If that line is {"error": ...}, or there is none, return its error, or what went wrong, as error, with receipts = [], seal = \'\'. ' +
   rules + payload,
   { label, phase: 'Push', model: 'haiku', schema: RECEIPTS },
@@ -1286,7 +1292,7 @@ const buildCheck = async (tag, owned) => {
   if (plan.command === null) { log(`build#${tag}: no build applies — ${plan.reason}`); return null }
   // --flag=value throughout: a value such as -DBOARD=x must not read as a flag.
   const r = await relayRun(
-    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
+    `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${PY} ${BUILD_SCRIPT}${owned.map(f => ` --path=${shq(f)}`).join('')} --command=${shq(plan.command)}` +
     `${plan.setup ? ` --setup=${shq(plan.setup)}` : ''}${plan.requires.map(t => ` --require=${shq(t)}`).join('')}\` ` +
     relayed(BUILD_RUN),
     { label: `build#${tag}`, phase: 'Fix', model: 'haiku', effort: 'low', schema: BUILD_RUN },
@@ -1358,7 +1364,7 @@ const fixAndVerify = async (workIn, tag, rejectable = false) => {
   const plain = candidates.filter(f => !refusal.has(f))
   if (plain.length > 0) {
     const v = await relayRun(
-      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`python3 ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
+      `${IN_CHECKOUT}From the checkout's top level, editing nothing, run exactly \`${PY} ${SCOPE_SCRIPT}${plain.map(f => ` --path=${shq(f)}`).join('')}\` ` +
       relayed(SCOPE_CHECK),
       { label: 'scope:check', phase: 'Fix', model: 'haiku', effort: 'low', schema: SCOPE_CHECK },
     )
@@ -1567,7 +1573,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   }
   // Identity is an exact SHA, never a count.
   const now = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --recheck\` ` + relayed(RECHECK),
     { label: `recheck#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: RECHECK },
   )
   if (!now) return { pass: false, committed: false, detail: 'recheck agent died', sha: '' }
@@ -1595,7 +1601,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   // A required hook may regenerate files outside the scope: run the hooks first and admit only what appeared after they reported changes, the checked files unchanged; the committer never picks a path.
   const quoted = checked.map(shq).join(' ')
   const hooks = await relayRun(
-    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`python3 ${HOOKS_SCRIPT} ${quoted}\` ` +
+    `${IN_CHECKOUT}Editing nothing by hand, from the checkout's top level run exactly \`${PY} ${HOOKS_SCRIPT} ${quoted}\` ` +
     // A repository's hooks may run its whole test suite: hooks.py stops them before this limit (#140).
     `in the foreground with a Bash timeout of 600000 ms, the tool's maximum, ` +
     relayed(HOOKS),
@@ -1659,7 +1665,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
-    `Then run exactly \`python3 ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
     'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
@@ -1670,7 +1676,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   if (!lost && !made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
 
   const seen = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
     relayed(AUDIT),
     { label: `audit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: AUDIT },
   )
@@ -1717,7 +1723,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
 // Push one audited SHA, never the branch. Landed only when every pinned URL (and the PR, for an adoption) reads it back; failed only when every URL answered without it; else unknown. null when the agent died.
 const pushExact = async (sha, label, prToo = false) => {
   const prompt = `${IN_CHECKOUT}Committing, amending and forcing nothing, run exactly ` +
-    `\`python3 ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
+    `\`${PY} ${PUSH_SCRIPT} --remote '${pinned.remote.trim()}' --branch '${pinned.prBranch.trim()}' --sha ${sha} ` +
     `${pinned.pushUrls.map(u => `--push-url '${u}'`).join(' ')} --open-pr ${args.pr}${prToo ? ` --pr ${args.pr}` : ''} --repo ${shq(repo)}\` ` +
     relayed(PUSH)
   const opts = { label, phase: 'Push', model: 'haiku', effort: 'low', schema: PUSH }
@@ -1749,7 +1755,7 @@ const pushExact = async (sha, label, prToo = false) => {
 
 const PR_STATE = withSeal({ type: 'object', additionalProperties: false, required: ['state'], properties: { error: { type: 'string' }, state: { type: 'string' } } })
 const readPrState = async (tag) => {
-  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --state ${args.pr} --repo ${shq(repo)}\` ` + relayed(PR_STATE),
+  const r = await relayOnce(`${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --state ${args.pr} --repo ${shq(repo)}\` ` + relayed(PR_STATE),
     { label: `prstate#${tag}`, phase: 'Triage', model: 'haiku', effort: 'low', schema: PR_STATE })
   if (!r || r.error || !['OPEN', 'MERGED', 'CLOSED'].includes(r.state)) log(`prstate#${tag}: PR #${args.pr} state unread — ${!r ? 'the relay died' : r.error || JSON.stringify(r.state)}`)
   return r && !r.error ? r.state : null
@@ -1910,7 +1916,7 @@ const settleSonar = async (cycle, entry, ended) => {
   const receipt = `${pinned.receipts.trim()}/sonar-${cycle}-${fnv1a(JSON.stringify({ head: expectedHead, items }))}.json`
   const r = await relayOnce(
     `${IN_CHECKOUT}Mark SonarCloud issues on PR #${args.pr}: write exactly this JSON to a new temporary file, a name without quotes, and run ` +
-    `\`python3 ${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
+    `\`${PY} ${SONAR_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead} --manifest '<that file>' --receipt ${shq(receipt)}\` ` + relayed(SONAR) +
     ` Change nothing on SonarCloud or GitHub yourself. Manifest: ${JSON.stringify({ items })}`,
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: SONAR })
   if (!r) { log(`${label}: no answer — the issues stay owed`); return 0 }
@@ -1953,7 +1959,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
 const relayTrigger = async (cycle, kind, script, task, flag, outcomes) => {
   const label = `${kind}#${cycle}`
   const t = await relayOnce(
-    `${IN_CHECKOUT}${task}: run \`python3 ${script} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead}${flag}\` ` +
+    `${IN_CHECKOUT}${task}: run \`${PY} ${script} --pr ${args.pr} --repo ${shq(repo)} --head ${expectedHead}${flag}\` ` +
     relayed(TRIGGER) + ' Change nothing on GitHub yourself.',
     { label, phase: 'Push', model: 'haiku', effort: 'low', schema: TRIGGER })
   const known = !!t && !t.error && outcomes.includes(t.outcome)
@@ -2103,7 +2109,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const head = queried = expectedHead
     const prompt = (command) =>
       `${IN_CHECKOUT}Editing and committing nothing, ${payload ? 'write exactly the JSON below to a new temporary file, a name without quotes, and ' : ''}` +
-      `run exactly \`python3 ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
+      `run exactly \`${PY} ${COLLECT_SCRIPT} ${command} --repo ${shq(repo)} --pr ${args.pr} --head ${head}${payload ? " < '<that file>'" : ''}\` ` +
       'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum, ' + relayed(schema) +
       (payload ? `\n${JSON.stringify(payload)}` : '')
     const opts = { label, phase: 'Triage', model: 'haiku', effort: 'low', schema }
@@ -2307,7 +2313,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
   if (await prGate(lanes, `${cycle}-judge`) || superseded()) return report
   const judged = await agent(
     `${IN_CHECKOUT}Judge the failing CI checks of PR #${args.pr} of ${repo} at head ${report.headSha} per your procedure. ` +
-    `The collector's evidence for them is in ${ev.detail}. The checks, each needing exactly one entry in your reply: ` +
+    `The collector's evidence for them is in ${ev.detail}. Run any ci-rerun script under ${PY}. The checks, each needing exactly one entry in your reply: ` +
     JSON.stringify(judging.map(c => ({
       link: c.link, check: c.name, workflow: c.workflow, bucket: c.bucket,
       ...(partial.includes(c) ? {
@@ -2412,7 +2418,7 @@ const runLanes = async (cycle, entry, lanes) => {
     const owedLastCycle = outstanding().map(commentId => ({ commentId, findingIds: owedIds(commentId) }))
     const reviewPrompt =
       `Validate the bot review findings on PR #${args.pr} per your procedure. ${IN_CHECKOUT}` +
-      `Harvest with exactly \`python3 ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
+      `Harvest with exactly \`${PY} ${HARVEST_SCRIPT} --pr ${args.pr} --repo ${shq(repo)} --reviewers ${reviewers.join(',')}${waitedOn.length ? ` --auto-run ${waitedOn.join(',')}` : ''}\`. ` +
       `A drafted reply is posted only when each point has at most ${REPLY_WORDS} words and no line is over ${REPLY_LINE_CHARS} characters. ` +
       (owedLastCycle.length > 0
         ? 'These comments still owe an answer from an earlier cycle; report every finding on each as its body stands now, ' +
@@ -3024,9 +3030,10 @@ const runLanes = async (cycle, entry, lanes) => {
 // Pin what later steps must still find, and refuse a dirty tree: a pre-existing edit would be indistinguishable from a writer's.
 const PIN = withSeal({
   type: 'object', additionalProperties: false,
-  required: ['repo', 'branch', 'prBranch', 'prHead', 'prBase', 'prBaseBranch', 'prBaseTip', 'prRepo', 'prUrl', 'prState', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
+  required: ['python', 'missing', 'repo', 'branch', 'prBranch', 'prHead', 'prBase', 'prBaseBranch', 'prBaseTip', 'prRepo', 'prUrl', 'prState', 'remote', 'upstreamBranch', 'pushUrls', 'head', 'dirty', 'pr', 'badPushUrl', 'receipts'],
   properties: {
     error: { type: 'string' },
+    python: { type: 'string' }, missing: { type: 'array', items: { type: 'string' } },
     repo: { type: 'string' }, branch: { type: 'string' }, prBranch: { type: 'string' },
     prHead: { type: 'string' }, prBase: { type: 'string' }, prBaseBranch: { type: 'string' }, prBaseTip: { type: 'string' },
     prRepo: { type: 'string' }, prUrl: { type: 'string' }, prState: { type: 'string' },
@@ -3036,12 +3043,16 @@ const PIN = withSeal({
     pr: { type: 'integer' }, badPushUrl: { type: 'string' }, receipts: { type: 'string' },
   },
 })
+// The modules the enabled lanes import beyond the standard library: harvest.py dates a head for the bots waited on from workflow files.
+const MODULES = reviewLane && reviewers.length && waitedOn.length ? ['yaml'] : []
+const PACKAGE = { yaml: 'PyYAML' }
 if (cyclesUsed >= maxCycles) {
   log(`state: ${cyclesUsed} of ${maxCycles} cycles already used — nothing left to run`)
   return finish(stop(cyclesUsed, 'budget-exhausted'))
 }
 const pinned = await relayOnce(
-  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}${repo ? ` --repo ${shq(repo)}` : ''}\` ` +
+  `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}` +
+  `${MODULES.map(m => ` --module ${m}`).join('')}${repo ? ` --repo ${shq(repo)}` : ''}\` ` +
   relayed(PIN),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 )
@@ -3070,6 +3081,14 @@ if (pinned.prState !== 'OPEN') {
   log(`preflight: PR #${args.pr} is ${pinned.prState.toLowerCase()} — nothing to babysit`)
   return finish(prEnded(cyclesUsed, pinned.prState.toLowerCase()))
 }
+const unusable = !pinned.python.trim() ? 'preflight names no interpreter'
+  : pinned.missing.length ? `${pinned.python} cannot import ${pinned.missing.map(m => `${m} (${PACKAGE[m] || m})`).join(', ')}, which this launch's lanes need: ` +
+    'install it for that interpreter, or launch with python naming one that has it' : null
+if (unusable) {
+  log(`preflight: ${unusable}`)
+  return finish(stop(cyclesUsed, 'python-unusable', { detail: unusable }))
+}
+if (pythonArg === null) PY = shq(pinned.python)
 const dirty = withoutIdeDrift(pinned.dirty)
 if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
 if (dirty.length) {
@@ -3129,7 +3148,7 @@ if (adoptHead !== null) {
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   if (tip !== base) log(`preflight: ${pinned.prBaseBranch} is at ${tip.slice(0, 7)}, not the base ${base.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`)
   const audit = await relayOnce(
-    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`python3 ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} chain ${X} ${adoptHead} --published ${prHead} --base ${base} --tip ${tip}\` ` +
     relayed(ADOPT_AUDIT),
     { label: 'adopt:audit', phase: 'Triage', model: 'haiku', effort: 'low', schema: ADOPT_AUDIT },
   )

@@ -11,6 +11,12 @@ listed here throws before anything runs.
   repository any remote names; with several and none marked, preflight stops
   rather than guess. A state continues only its own repository: another refuses
   the launch. Per launch.
+- `python`: the interpreter every script runs under, a path or command name,
+  the `stateRef` load included. Omitted, the load and preflight run `python3`,
+  and every later script the absolute path that interpreter reports; nothing
+  searches for another. Preflight checks it imports what the lanes need (PyYAML
+  while a bot is waited on) and stops `python-unusable` naming what is missing.
+  Per launch.
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default

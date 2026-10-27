@@ -17,7 +17,7 @@ remotes name several with none marked `gh-resolved` (`facts.py`'s `bind_repo`).
 
 ```bash
 S=~/.claude/skills/pr-babysit/scripts
-python3 $S/preflight.py --pr N [--repo R] [--needs P]  # the checkout and the PR it must stay; P a script the workflow calls
+python3 $S/preflight.py --pr N [--repo R] [--needs P] [--module M]  # the checkout, the PR it must stay and this interpreter; P a script the workflow calls, M a module it needs
 python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
 python3 $S/preflight.py --state N [--repo R]  # before a GitHub write: is the PR still OPEN?
 python3 $S/harvest.py --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments

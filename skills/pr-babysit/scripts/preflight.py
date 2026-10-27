@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Pin the checkout and the PR that pr-babysit is about to babysit.
 
-  preflight.py --pr N [--repo OWNER/NAME] [--needs PATH...]
+  preflight.py --pr N [--repo OWNER/NAME] [--needs PATH...] [--module NAME...]
   preflight.py --recheck
   preflight.py --state N [--repo OWNER/NAME]
 
@@ -9,7 +9,9 @@ Every gh call names the repository PR N belongs to (facts.bind_repo): --repo,
 else the one the checkout's remotes name, refusing a checkout whose remotes
 name several and mark none gh-resolved.
 
-Reports what every later step must still be true of: repo, the repository so
+Reports what every later step must still be true of: python, this
+interpreter's sys.executable, `/`-separated, the one every later script runs
+under; missing, the --module names it cannot import; repo, the repository so
 named; branch (`git rev-parse
 --abbrev-ref HEAD`), prBranch, prHead, prBase (the base head GitHub last
 recorded for the PR, stale once the base moves until the head is pushed),
@@ -47,6 +49,7 @@ which pr-babysit checks its relayed copy against. Exit 0 with it; exit 2
 with {"error": ...} when git or gh cannot answer; the caller then pins nothing.
 """
 
+import importlib.util
 import json
 import re
 import sys
@@ -131,7 +134,14 @@ def pr_view(pr, fields):
         raise Unusable(f'gh pr view {pr}: unexpected answer ({e!r})')
 
 
-def pin(pr, repo):
+def interpreter(modules):
+    python = Path(sys.executable).as_posix() if sys.executable else ''
+    if not python:
+        raise Unusable('this interpreter does not know its own path (sys.executable is empty)')
+    return {'python': python, 'missing': [m for m in modules if importlib.util.find_spec(m) is None]}
+
+
+def pin(pr, repo, modules):
     branch = git('rev-parse', '--abbrev-ref', 'HEAD').strip()
     view = pr_view(pr, 'headRefName,headRefOid,baseRefOid,baseRefName,headRepositoryOwner,headRepository,url,state')
     try:
@@ -147,7 +157,7 @@ def pin(pr, repo):
     pr_facts['prBaseTip'] = base_tip(pr_facts['prBaseBranch']) if view['state'] == 'OPEN' else ''
     remote, urls = push_urls(branch)
     expected = f"{HOST}/{pr_facts['prRepo'].lower()}"
-    return {'repo': repo, 'branch': branch, **pr_facts, 'remote': remote, 'upstreamBranch': upstream_branch(branch, remote),
+    return {**interpreter(modules), 'repo': repo, 'branch': branch, **pr_facts, 'remote': remote, 'upstreamBranch': upstream_branch(branch, remote),
             'pushUrls': urls,
             'head': git('rev-parse', 'HEAD').strip(),
             'dirty': git('status', '--porcelain').splitlines(),
@@ -163,9 +173,12 @@ def collect(argv):
     which.add_argument('--state', type=int, metavar='N')
     p.add_argument('--needs', action='append', default=[])
     p.add_argument('--repo')
+    p.add_argument('--module', action='append', default=[])
     a = p.parse_args(argv)
-    if a.pr is None and a.needs:
-        p.error('--needs is for --pr')
+    if a.pr is None and (a.needs or a.module):
+        p.error('--needs and --module are for --pr')
+    if not all(m.isidentifier() for m in a.module):
+        p.error(f'--module takes a top-level module name: {a.module}')
     if a.recheck and a.repo:
         p.error('--repo is for --pr and --state')
     missing = [n for n in a.needs if not Path(n).expanduser().is_file()]
@@ -174,7 +187,7 @@ def collect(argv):
     if a.recheck:
         return recheck()
     repo = bind_repo(a.repo)
-    return {'state': pr_view(a.state, 'state')['state']} if a.state is not None else pin(a.pr, repo)
+    return {'state': pr_view(a.state, 'state')['state']} if a.state is not None else pin(a.pr, repo, a.module)
 
 
 if __name__ == '__main__':

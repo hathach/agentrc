@@ -81,7 +81,7 @@ const BASE = 'ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e'
 const TIP = '7e57e57e57e57e57e57e57e57e57e57e57e57e57'
 // What the preflight pins, and what the pre-publish recheck must still find.
 const PIN = {
-  repo: 'hathach/tinyusb', branch: 'claude/foo', prBranch: 'claude/foo',
+  python: '/usr/bin/python3', missing: [], repo: 'hathach/tinyusb', branch: 'claude/foo', prBranch: 'claude/foo',
   prHead: HEAD, prBase: BASE, prBaseBranch: 'master', prBaseTip: TIP, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888', prState: 'OPEN',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
@@ -765,7 +765,7 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'receipts', 'remote', 'repo', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'missing', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'python', 'receipts', 'remote', 'repo', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
 })
@@ -778,7 +778,7 @@ const GH_SCRIPT = /(?:harvest|push|sonar|coderabbit_trigger|greptile_trigger|rep
 
 test('an unknown or malformed argument throws before any agent runs (#311)', async () => {
   for (const [args, expected] of [
-    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, reviewers/],
+    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, python, reviewers/],
     [{ repo: 'adafruit' }, /repo must be OWNER\/NAME/], [{ repo: `${PICO}/x` }, /repo must be OWNER\/NAME/], [{ repo: 7 }, /repo must be OWNER\/NAME/],
   ]) {
     const trace = []
@@ -832,6 +832,41 @@ test('a resumed launch names its state\'s repository, and refuses another (#311)
   assert.ok(resumed.calls[0].prompt.includes("--repo 'hathach/tinyusb'`"), resumed.calls[0].prompt)
   const cased = await run({ args: adoptionArgs(state, { adoptHead: undefined, repo: 'HATHACH/TinyUSB' }) })
   assert.ok(cased.calls[0].prompt.includes("--repo 'HATHACH/TinyUSB'`"), cased.calls[0].prompt)
+})
+
+// #234: a bare python3 that resolved to an interpreter without PyYAML failed every harvest on an MSYS2 host.
+const SCRIPT_RUN = /[\s`]('[^']*'(?:\\''[^']*')*|[^\s`']+) ~\/\.claude\/skills\/[\w./-]+\.py/
+const interpreters = (calls) => [...new Set(calls.map(c => SCRIPT_RUN.exec(c.prompt)?.[1]).filter(Boolean))]
+
+test('every script runs under the interpreter preflight reports, quoted, or the one python names (#234)', async () => {
+  const reviews = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+  const spaced = '/c/Program Files/Python 3/python.exe'
+  const reported = await run({ reviews, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 2 }, preflight: { python: spaced } })
+  assert.equal(SCRIPT_RUN.exec(reported.calls[0].prompt)[1], 'python3', 'preflight runs under python3, no search')
+  assert.deepEqual(interpreters(reported.calls.slice(1)), [`'${spaced}'`], 'then every script under the path it reported')
+  assert.ok(reported.calls.filter(c => SCRIPT_RUN.test(c.prompt)).length > 8, reported.labels.join(', '))
+  const judged = await run({ ...redWith({ check: 'build', firstError: 'error: x', files: [] }), preflight: { python: spaced } })
+  assert.ok(judged.calls.find(c => c.label === 'ci:judge#1').prompt.includes(`Run any ci-rerun script under '${spaced}'.`))
+  const named = await run({ reviews, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 2, python: "/opt/it's py/python3" } })
+  assert.deepEqual(interpreters(named.calls), ["'/opt/it'\\''s py/python3'"], 'the one python names, preflight included, whatever preflight reports')
+  await assert.rejects(run({ args: { python: '' } }), /python must be the interpreter/)
+  await assert.rejects(run({ args: { python: 'py\n3' } }), /python must be the interpreter/)
+})
+
+test('an interpreter missing a module the lanes need stops at preflight, naming it (#234)', async () => {
+  const { result, labels, calls } = await run({ reviews: oneValid, preflight: { missing: ['yaml'] } })
+  assert.match(calls[0].prompt, / --module yaml[ `]/, 'auto-run bots are dated from workflow files')
+  assert.equal(result.reason, 'python-unusable')
+  assert.equal(result.detail, "/usr/bin/python3 cannot import yaml (PyYAML), which this launch's lanes need: install it for that interpreter, or launch with python naming one that has it")
+  assert.deepEqual(labels, ['preflight'])
+  const unnamed = await run({ reviews: oneValid, preflight: { python: ' ' } })
+  assert.deepEqual([unnamed.result.reason, unnamed.result.detail], ['python-unusable', 'preflight names no interpreter'])
+  // A CI-only launch, or one waiting on no bot, imports nothing beyond the standard library.
+  for (const args of [{ reviewers: [] }, { lane: 'ci', yieldAfterCycle: true }, { reviewers: ['copilot'] }]) {
+    const ci = await run({ args })
+    assert.doesNotMatch(ci.calls[0].prompt, /--module/, JSON.stringify(args))
+    assert.equal(ci.result.reason === 'python-unusable', false)
+  }
 })
 
 test('a dirty start refuses before any writer runs', async () => {
@@ -2786,7 +2821,7 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
   assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
   const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
   assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
-  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `python3 ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
+  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `'\/usr\/bin\/python3' ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
   // A copy that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
   const miscopied = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
   assert.equal(miscopied.result.reason, 'pr-state-unread')
@@ -7445,6 +7480,18 @@ test('a mis-copied, missing or duplicated chunk is asked for again alone', async
     : { ...env, chunks: [...env.chunks, { ...transferOf(state).chunks[last] }] })
   assert.deepEqual(asks(extra.calls), ['all', '0+pad'])
   assert.equal(extra.labels[2], 'preflight')
+})
+
+test('the stateRef bootstrap runs under the interpreter python names, before preflight (#234)', async () => {
+  const { state, stateRef } = await savedForLoad()
+  const named = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef, python: '/opt/My Python/python3' }, load: state })
+  assert.deepEqual(named.labels.slice(0, 2), ['state:load#1', 'preflight'])
+  assert.match(named.calls[0].prompt, /^Run exactly: '\/opt\/My Python\/python3' ~\/\.claude\/skills\/pr-babysit\/scripts\/state_transfer\.py /)
+  assert.deepEqual(interpreters(named.calls), ["'/opt/My Python/python3'"])
+  assert.equal(named.result.state.cyclesUsed, 2)
+  const bare = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state })
+  assert.match(bare.calls[0].prompt, /^Run exactly: python3 ~\//)
+  assert.equal(SCRIPT_RUN.exec(bare.calls.find(c => c.label === 'preflight').prompt)[1], 'python3')
 })
 
 test('a mis-copied chunk is asked again padded, so its text differs, then plain (#147)', async () => {

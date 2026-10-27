@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'preflight.py'
@@ -92,7 +93,7 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual((Path(receipts).parent, list(Path(receipts).iterdir())), (self.root / 'pr-babysit-receipts', []), 'a new empty directory')
         self.assertNotEqual(self.pin()[1]['receipts'], receipts, 'one per launch')
         self.assertEqual(out, {
-            'repo': 'hathach/tinyusb', 'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prBaseBranch': 'master', 'prBaseTip': 'c' * 40,
+            'python': Path(sys.executable).as_posix(), 'missing': [], 'repo': 'hathach/tinyusb', 'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prBaseBranch': 'master', 'prBaseTip': 'c' * 40,
             'prRepo': 'someone/tinyusb',
             'prUrl': VIEW['url'], 'prState': 'OPEN', 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
             'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o'],
@@ -275,7 +276,7 @@ class PreflightTest(unittest.TestCase):
             self.assertEqual(status, 2, answer)
             self.assertIn(want, out['error'], answer)
         status, out = self.pin('--state', '7', '--needs', 'x')
-        self.assertEqual((status, out['error']), (2, 'usage: --needs is for --pr'))
+        self.assertEqual((status, out['error']), (2, 'usage: --needs and --module are for --pr'))
 
     def test_recheck_reads_the_local_facts_without_gh(self):
         self.git('remote', 'set-url', '--push', 'origin', 'git@github.com:someone/tinyusb.git')
@@ -299,6 +300,19 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(out['error'], f"stale workflow definition: {self.root / 'gone.py'}, {self.root} missing; "
                                        'reload the workflow (a fresh session) before relaunching')
+
+    def test_the_interpreter_names_itself_and_the_modules_it_cannot_import(self):
+        code, out = self.pin('--pr', '7', '--module', 'json', '--module', 'no_such_module_x')
+        self.assertEqual((code, out['python'], out['missing']), (0, Path(sys.executable).as_posix(), ['no_such_module_x']))
+        with mock.patch.object(importlib.util, 'find_spec', lambda name: None if name == 'yaml' else object()):
+            self.assertEqual(self.pin('--pr', '7', '--module', 'yaml')[1]['missing'], ['yaml'], 'PyYAML missing')
+        # preflight's own sys: the fake gh runs under the real sys.executable.
+        with mock.patch.object(preflight, 'sys', SimpleNamespace(executable='/opt/My Python/bin/python3')):
+            self.assertEqual(self.pin()[1]['python'], '/opt/My Python/bin/python3', 'a path with spaces, as is')
+        with mock.patch.object(preflight, 'sys', SimpleNamespace(executable='')):
+            self.assertEqual(self.pin()[1]['error'], 'this interpreter does not know its own path (sys.executable is empty)')
+        for argv in (['--recheck', '--module', 'yaml'], ['--pr', '7', '--module', 'os.path']):
+            self.assertIn('usage', self.pin(*argv)[1]['error'], argv)
 
     def test_usage(self):
         for argv in (['--pr', 'x'], ['--pr', '7', '--recheck'], ['--frob'], ['--recheck', '--needs', 'x'], ['--recheck', '--repo', 'o/r']):

@@ -102,9 +102,11 @@ STALLED = {
                            'or after a few minutes for a secondary limit',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
-                      'python3 on PATH lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared',
+                      "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "
-                         'expired gh login or a module the python3 on PATH lacks, or relaunch once a passing cause (a GitHub outage) cleared',
+                         "expired gh login or a module the launch's interpreter lacks, or relaunch once a passing cause (a GitHub outage) cleared",
+    'python-unusable': "the interpreter the launch runs its scripts under cannot import a module its lanes need (`detail`): "
+                       'install it for that interpreter, or relaunch with python naming one that has it',
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "
                      '(an artifact harvest.py does not know, a tie, a failed read) and relaunch once it changed or harvest.py reads it',
 }
