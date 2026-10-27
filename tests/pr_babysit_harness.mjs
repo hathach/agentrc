@@ -859,10 +859,11 @@ test('every script runs under the interpreter preflight reports, quoted, or the 
 })
 
 test('an interpreter missing a module the lanes need stops at preflight, naming it (#234)', async () => {
-  const { result, labels, calls } = await run({ reviews: oneValid, preflight: { missing: ['yaml'] } })
+  const { result, labels, calls } = await run({ reviews: oneValid, preflight: { missing: ["yaml: ModuleNotFoundError: No module named 'yaml'"] } })
   assert.match(calls[0].prompt, / --module yaml[ `]/, 'auto-run bots are dated from workflow files')
   assert.equal(result.reason, 'python-unusable')
-  assert.equal(result.detail, "/usr/bin/python3 cannot import yaml (PyYAML), which this launch's lanes need: install it for that interpreter, or launch with python naming one that has it")
+  assert.equal(result.detail, "/usr/bin/python3 cannot import yaml: ModuleNotFoundError: No module named 'yaml' (PyYAML), which this launch's lanes need: " +
+    'install it for that interpreter, or launch with python naming one that has it')
   assert.deepEqual(labels, ['preflight'])
   const unnamed = await run({ reviews: oneValid, preflight: { python: ' ' } })
   assert.deepEqual([unnamed.result.reason, unnamed.result.detail], ['python-unusable', 'preflight names no interpreter'])

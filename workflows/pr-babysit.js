@@ -3102,7 +3102,7 @@ if (pinned.prState !== 'OPEN') {
   return finish(prEnded(cyclesUsed, pinned.prState.toLowerCase()))
 }
 const unusable = !pinned.python.trim() ? 'preflight names no interpreter'
-  : pinned.missing.length ? `${pinned.python} cannot import ${pinned.missing.map(m => `${m} (${PACKAGE[m] || m})`).join(', ')}, which this launch's lanes need: ` +
+  : pinned.missing.length ? `${pinned.python} cannot import ${pinned.missing.map(m => { const p = PACKAGE[m.split(':')[0]]; return p ? `${m} (${p})` : m }).join('; ')}, which this launch's lanes need: ` +
     'install it for that interpreter, or launch with python naming one that has it' : null
 if (unusable) {
   log(`preflight: ${unusable}`)

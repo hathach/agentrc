@@ -310,9 +310,15 @@ class PreflightTest(unittest.TestCase):
 
     def test_the_interpreter_names_itself_and_the_modules_it_cannot_import(self):
         code, out = self.pin('--pr', '7', '--module', 'json', '--module', 'no_such_module_x')
-        self.assertEqual((code, out['python'], out['missing']), (0, Path(sys.executable).as_posix(), ['no_such_module_x']))
-        with mock.patch.object(importlib.util, 'find_spec', lambda name: None if name == 'yaml' else object()):
-            self.assertEqual(self.pin('--pr', '7', '--module', 'yaml')[1]['missing'], ['yaml'], 'PyYAML missing')
+        self.assertEqual((code, out['python'], out['missing']),
+                         (0, Path(sys.executable).as_posix(), ["no_such_module_x: ModuleNotFoundError: No module named 'no_such_module_x'"]))
+        # Found but not loadable: a yaml.py that raises, as a broken install would.
+        lib = self.root / 'lib'
+        lib.mkdir()
+        (lib / 'broken_yaml_x.py').write_text("raise ImportError('libyaml.so: cannot open shared object file')\n")
+        self.enterContext(mock.patch.object(sys, 'path', [str(lib), *sys.path]))
+        self.assertEqual(self.pin('--pr', '7', '--module', 'broken_yaml_x')[1]['missing'],
+                         ['broken_yaml_x: ImportError: libyaml.so: cannot open shared object file'])
         # preflight's own sys: the fake gh runs under the real sys.executable.
         with mock.patch.object(preflight, 'sys', SimpleNamespace(executable='/opt/My Python/bin/python3')):
             self.assertEqual(self.pin()[1]['python'], '/opt/My Python/bin/python3', 'a path with spaces, as is')

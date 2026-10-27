@@ -11,7 +11,8 @@ name several and mark none gh-resolved.
 
 Reports what every later step must still be true of: python, this
 interpreter's sys.executable, `/`-separated, the one every later script runs
-under; missing, the --module names it cannot import; repo, the repository so
+under; missing, `<module>: <exception>` for each --module importing it
+here raised; repo, the repository so
 named; branch (`git rev-parse
 --abbrev-ref HEAD`), prBranch, prHead, prBase (the base head GitHub last
 recorded for the PR, stale once the base moves until the head is pushed),
@@ -49,7 +50,7 @@ which pr-babysit checks its relayed copy against. Exit 0 with it; exit 2
 with {"error": ...} when git or gh cannot answer; the caller then pins nothing.
 """
 
-import importlib.util
+import importlib
 import json
 import re
 import sys
@@ -138,7 +139,16 @@ def interpreter(modules):
     python = Path(sys.executable).as_posix() if sys.executable else ''
     if not python:
         raise Unusable('this interpreter does not know its own path (sys.executable is empty)')
-    return {'python': python, 'missing': [m for m in modules if importlib.util.find_spec(m) is None]}
+    return {'python': python, 'missing': [why for why in map(import_failure, modules) if why]}
+
+
+def import_failure(module):
+    """'<module>: <exception>' when importing it raises, '' when it loads: found is not loadable."""
+    try:
+        importlib.import_module(module)
+    except Exception as e:
+        return f'{module}: {type(e).__name__}: {e}'
+    return ''
 
 
 def pin(pr, repo, modules):
