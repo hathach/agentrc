@@ -72,7 +72,7 @@ CR_PAUSED = '<!-- This is an auto-generated comment: review paused by coderabbit
 CR_RATE = '<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->'
 CR_WALKTHROUGH = '<!-- This is an auto-generated comment: summarize by coderabbit.ai -->'
 CR_RATE_STATUS = 'review rate limited'
-# A repository CodeRabbit reviews only on request: an unticked box in its summary comment, or these words beside it (#324).
+# A repository CodeRabbit reviews only on request: a box in its summary comment, ticked once asked, or these words beside it (#324).
 CR_TRIGGER_BOX = re.compile(r'^(?P<pre>(?:> )?- \[)(?P<mark>[ xX])(?P<post>\][^\n]*Trigger (?:a manual )?review[^\n]*)$', re.M)
 CR_MANUAL_ONLY = 'does not receive automatic reviews'
 CR_COUNTDOWN = re.compile(r'Next included review available in ([^.*\n]+)\.')
@@ -263,8 +263,8 @@ def manual_only(stickies):
     """Which CodeRabbit comment says it reviews the repository only on request, None when none does."""
     for c in stickies:
         body = c.get('body') or ''
-        if any(m['mark'] == ' ' for m in CR_TRIGGER_BOX.finditer(body)):
-            return f"comment {c['id']} holds an unticked Trigger review box"
+        if CR_TRIGGER_BOX.search(body):
+            return f"comment {c['id']} holds a Trigger review box"
         if CR_MANUAL_ONLY in body:
             return f"comment {c['id']} says the repository gets no automatic reviews"
     return None

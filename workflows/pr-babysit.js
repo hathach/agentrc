@@ -1966,9 +1966,10 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   }
   if (cr.state === 'settled' && cr.kind === 'limited') return requestCodeRabbit(cycle, r, cr, ended)
   if (manual && coderabbitTrigger && coderabbitAskable(cr, reviewClock) === 'request') await requestCodeRabbit(cycle, r, cr, ended)
-  // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone.
+  // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip after
+  // the ask is waited on too: the skip asked about may read otherwise once its box is ticked.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
-  if (!asks.length || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
+  if (!asks.length || !(cr.state === 'settled' && cr.kind === 'skipped' || cr.state === 'queued' || cr.state === 'absent')) return
   waitAfter(cr, asks.reduce((a, b) => Date.parse(a) >= Date.parse(b) ? a : b), r.observedAt)
 }
 // One trigger script's run through a relay: its line, and the outcome, `failed` for a line it cannot read.

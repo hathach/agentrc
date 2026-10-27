@@ -7181,6 +7181,17 @@ test('a manual-review skip read from a check run and its summary is ticked like 
   assert.deepEqual(triggers(labels), ['crtrigger#1'])
 })
 
+test('a skip that reads otherwise once its box is ticked is still waited on from the tick', async () => {
+  let n = 0
+  const other = 'check run skipped: Review skipped'
+  const { result, labels, logs } = await run({ args: { coderabbitTrigger: true, maxCycles: 4 },
+    reviewsPerCycle: () => quiet([++n === 1 ? skippedCr() : n === 2 ? skippedCr(other) : bot('coderabbit')]) })
+  assert.equal(result.pass, true, result.reason)
+  assert.equal(result.cycles, 3)
+  assert.deepEqual([triggers(labels), requests(labels)], [['crtrigger#1'], []])
+  assert.ok(headLine(logs)[1].includes(`coderabbit review triggered (${other},`), headLine(logs)[1])
+})
+
 test('no trigger without coderabbitTrigger or for another skip, and the switch needs autoPush and coderabbit auto-running', async () => {
   for (const [args, reason, want] of [[{}, MANUAL, undefined], [{ coderabbitTrigger: true }, 'Review skipped: draft pull request', 'coderabbit-unreviewed'],
     [{ coderabbitTrigger: true }, 'check run skipped: Review skipped', 'coderabbit-unreviewed']]) {

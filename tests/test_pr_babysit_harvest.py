@@ -96,13 +96,14 @@ class SettleRules(unittest.TestCase):
         words = 'This repository does not receive automatic reviews because it has fewer than 10 stars.'
         bot = 'coderabbitai[bot]'
         for what, issue, want in (
-                ('an unticked box', [comment(bot, f'summary\n{box}', id_=5)], 'comment 5 holds an unticked Trigger review box'),
+                ('an unticked box', [comment(bot, f'summary\n{box}', id_=5)], 'comment 5 holds a Trigger review box'),
+                ('a box ticked since, by the ask', [comment(bot, box.replace('[ ]', '[x]'), id_=5)], 'comment 5 holds a Trigger review box'),
                 ('its words', [comment(bot, f'summary\n> {words}', id_=6)], 'comment 6 says the repository gets no automatic reviews')):
             with self.subTest(what):
                 r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
                 self.assertEqual((r['state'], r['kind'], r['sha']), ('settled', 'skipped', HEAD))
                 self.assertEqual(r['reason'], f'Review skipped: manual review required (check run; {want})')
-        for what, issue in (('no summary', []), ('a ticked box', [comment(bot, box.replace('[ ]', '[x]'), id_=5)]),
+        for what, issue in (('no summary', []),
                             ("someone else's words", [comment('hathach', f'{box}\n{words}', id_=7)])):
             with self.subTest(what):
                 r = harvest.coderabbit(HEAD, [], [run_], issue, EVENT)
