@@ -162,11 +162,6 @@ def node_writable(node):
     return os.geteuid() == 0 or os.access(node, os.W_OK)
 
 
-def needs_sudo(node):
-    """testusb runs under sudo only on a node this user cannot write."""
-    return not node_writable(node)
-
-
 # speed_show's values (v6.12 drivers/usb/core/sysfs.c:145-177) less 'unknown', which names no speed
 _SPEEDS = ('1.5', '12', '480', '5000', '10000', '20000')
 
@@ -395,27 +390,24 @@ def set_pattern(value):
                  'the "pattern" param, or it is not readable')
 
 
-def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidden):
+def run_case(testusb, node, num, params, timeout, *, wedge_confirm):
     """Run testusb case `num` with options `params` (argv list) on usbfs `node`, bounded by
     `timeout` s. Returns the verdict fields: status PASS (secs), FAIL (detail; dmesg, stderr
     or late_cleared where they apply), NOTRUN or HUNG.
 
     HUNG means the killed child was not reaped within 5 s and then not within `wedge_confirm`
-    s more; it carries `_proc`, the surviving child for the caller's recovery to watch, or
-    None under sudo, whose wrapper's reaping proves nothing. `sudo_forbidden` refuses a
-    sudo-wrapped testusb (a caller that must confirm a recovery)."""
+    s more; it carries `_proc`, the surviving child for the caller's recovery to watch. A node
+    this user cannot write fails without running testusb: never under sudo, whose wrapper's
+    reaping proves nothing."""
     # -A <node> confines testusb's ftw() device scan to the DUT: with -D alone it opens every
     # usbfs node, blocking on any peer's held device lock (hathach/tinyusb#4047). -A must
     # precede -D, it clears it.
     cmd = [testusb, '-A', node, '-D', node, '-t', str(num), *params]
     result = {}
-    if needs_sudo(node):
-        if sudo_forbidden:
-            # a re-enumeration after the caller's check can hand back a node only root may open
-            result.update(status='FAIL', detail=f'{node} is not writable: refusing a '
-                          'sudo-wrapped testusb under a recovery request')
-            return result
-        cmd = ['sudo', '-n'] + cmd
+    if not node_writable(node):
+        # a re-enumeration after the caller's check can hand back a node only root may open
+        result.update(status='FAIL', detail=f'{node} is not writable: install the project\'s udev rule')
+        return result
 
     # NO start_new_session: testusb must stay in OUR process group so the caller's outer
     # killpg still reaps it.
@@ -426,11 +418,6 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
     try:
         out, _ = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        # Under sudo we only kill the wrapper; its root-owned testusb keeps the inherited
-        # stdout pipe, so the reap below times out and the overrun is reported as HUNG.
-        # Accepted rather than escalated: the rig's udev rules make the device node
-        # writable, so sudo is the exception, and the harness must never sudo-kill a pid
-        # it cannot prove is its own.
         try:
             p.kill()
         except OSError:
@@ -441,24 +428,22 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
             # SIGKILL had no effect: the child is in uninterruptible sleep on the DUT's
             # device lock or an in-kernel usbfs ioctl. A finite hold is reaped once it ends,
             # so watch the child for `wedge_confirm` before calling it a wedge
-            # (hathach/tinyusb#3944). Under sudo the child is the wrapper and reaps at once,
-            # which proves nothing.
-            if cmd[0] != 'sudo':
-                t0 = time.monotonic()
-                try:
-                    p.wait(timeout=wedge_confirm)
-                    waited = time.monotonic() - t0
-                    result.update(status='FAIL', dmesg=dmesg_tail(), late_cleared=True,
-                                  detail=f'timeout after {timeout}s (the kill landed '
-                                         f'{waited:.0f}s late; testusb reaped during the '
-                                         f'confirmation watch)')
-                    return result
-                except subprocess.TimeoutExpired:
-                    pass
+            # (hathach/tinyusb#3944).
+            t0 = time.monotonic()
+            try:
+                p.wait(timeout=wedge_confirm)
+                waited = time.monotonic() - t0
+                result.update(status='FAIL', dmesg=dmesg_tail(), late_cleared=True,
+                              detail=f'timeout after {timeout}s (the kill landed '
+                                     f'{waited:.0f}s late; testusb reaped during the '
+                                     f'confirmation watch)')
+                return result
+            except subprocess.TimeoutExpired:
+                pass
             result.update(status='HUNG', detail=f'testusb stuck in D state after {timeout}s',
                           dmesg=dmesg_tail())
-            # not JSON: the caller watches the child after its recovery step (sudo: cannot)
-            result['_proc'] = None if cmd[0] == 'sudo' else p
+            # not JSON: the caller watches the child after its recovery step
+            result['_proc'] = p
             return result
         result.update(status='FAIL', detail=f'timeout after {timeout}s', dmesg=dmesg_tail())
         return result
@@ -472,11 +457,6 @@ def run_case(testusb, node, num, params, timeout, *, wedge_confirm, sudo_forbidd
     if m and int(m.group(1)) == num:
         result.update(status='FAIL', detail=f'errno {m.group(2)} ({m.group(3)})',
                       dmesg=dmesg_tail())
-        return result
-
-    if cmd[0] == 'sudo' and ('password is required' in out or 'a terminal is required' in out):
-        result.update(status='FAIL', detail='sudo needs a password to run testusb: the device node '
-                      'is not writable')
         return result
 
     # testusb prints '<speed> speed\t<node>\t<ifnum>' once it has opened the node
