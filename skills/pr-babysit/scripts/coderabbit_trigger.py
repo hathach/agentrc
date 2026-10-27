@@ -70,6 +70,19 @@ class Failed(Exception):
         self.phase = phase
 
 
+def on_comment(outcome, c, **members):
+    """OUTCOME naming comment C: detail "comment N" unless MEMBERS give one, and commentId."""
+    return {'outcome': outcome, 'detail': f"comment {c['id']}", 'commentId': c['id'], **members}
+
+
+def by_coderabbit(c):
+    return 'coderabbit' in ((c.get('user') or {}).get('login') or '').lower()
+
+
+def state_of(cr):
+    return f"CodeRabbit is {cr['state']}{'/' + cr['kind'] if cr['kind'] else ''}"
+
+
 def skipped(pr, head):
     """(None, the PR's comments) when HEAD is PR N's head and CodeRabbit's newest status or check run on it is the
     manual-review skip, (why not, None) otherwise."""
@@ -81,7 +94,7 @@ def skipped(pr, head):
     # No head event: a SHA-less notice newer than the status or run cannot be placed, and reads unknown.
     cr = coderabbit(head, statuses, checks, comments, None)
     if (cr['state'], cr['kind']) != ('settled', 'skipped') or not cr['reason'].lower().startswith(SKIP):
-        return f"CodeRabbit is {cr['state']}{'/' + cr['kind'] if cr['kind'] else ''}: {cr['reason']}", None
+        return f"{state_of(cr)}: {cr['reason']}", None
     return None, comments
 
 
@@ -89,13 +102,12 @@ def trigger(pr, head):
     why, comments = skipped(pr, head)
     if why:
         return {'outcome': 'notSkipped', 'detail': why}
-    holders = [c for c in comments
-               if 'coderabbit' in ((c.get('user') or {}).get('login') or '').lower() and len(BOX.findall(c.get('body') or '')) == 1]
+    holders = [c for c in comments if by_coderabbit(c) and len(BOX.findall(c.get('body') or '')) == 1]
     if len(holders) != 1:
         raise Failed(f'{len(holders)} CodeRabbit comments hold one Trigger review box, not 1')
     c = holders[0]
     if BOX.search(c['body'])['mark'] != ' ':
-        return {'outcome': 'already', 'detail': f"comment {c['id']}", 'commentId': c['id']}
+        return on_comment('already', c)
     body = BOX.sub(lambda m: f"{m['pre']}x{m['post']}", c['body'])
     path = f'repos/{{owner}}/{{repo}}/issues/comments/{c["id"]}'
     # On stdin: a long summary comment can pass the kernel's 128 KiB limit on one argument.
@@ -108,7 +120,7 @@ def trigger(pr, head):
         m = None
     if not m or m['mark'] == ' ':
         raise Failed(f'comment {c["id"]} reads back without the box ticked')
-    return {'outcome': 'ticked', 'detail': f"comment {c['id']}", 'commentId': c['id']}
+    return on_comment('ticked', c)
 
 
 def pull_at(pr, head):
@@ -134,14 +146,14 @@ def unasked(repo, pr, head):
     if seen['headSha'] == head and (cr['state'], cr['kind']) == ('settled', 'skipped') and cr['reason'].lower().startswith(SKIP):
         return unasked_skip(pr, head, seen['headEventAt'])
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
-        return {'outcome': 'notLimited', 'detail': f"CodeRabbit is {cr['state']}{f'/' + cr['kind'] if cr['kind'] else ''} on {seen['headSha'][:9]}: {cr['reason']}"}, None
+        return {'outcome': 'notLimited', 'detail': f"{state_of(cr)} on {seen['headSha'][:9]}: {cr['reason']}"}, None
     reset = {'retryAt': cr['retryAt']}
     if cr['retryAt'] is None or stamp(cr['retryAt']) > stamp(seen['observedAt']):
         return {'outcome': 'notDue', 'detail': cr['reason'], **reset}, None
     asked = [c for c in pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
              if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= stamp(cr['retryAt'])]
     if asked:
-        return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}, None
+        return on_comment('already', asked[0], at=asked[0]['created_at'], **reset), None
     # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
     why = unopened(pr, head)
     if why:
@@ -153,18 +165,17 @@ def unasked_skip(pr, head, event_at):
     """unasked's answer on a manual-review skip: an ask stands when the box is ticked or a request follows the head event."""
     comments = pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
     reset = {'retryAt': None}
-    ticked = [c for c in comments if 'coderabbit' in ((c.get('user') or {}).get('login') or '').lower()
-              and any(m['mark'] != ' ' for m in BOX.finditer(c.get('body') or ''))]
+    ticked = [c for c in comments if by_coderabbit(c) and any(m['mark'] != ' ' for m in BOX.finditer(c.get('body') or ''))]
     if ticked:
         c = ticked[0]
-        return {'outcome': 'already', 'detail': f"comment {c['id']} has its Trigger review box ticked", 'commentId': c['id'], 'at': c['updated_at'], **reset}, None
+        return on_comment('already', c, detail=f"comment {c['id']} has its Trigger review box ticked", at=c['updated_at'], **reset), None
     standing = [c for c in comments if (c.get('body') or '').strip() == REQUEST]
     if standing and event_at is None:
         raise Failed(f"the head event time is unknown, so comment {standing[-1]['id']} cannot be placed before or after it: nothing posted", 'read')
     # One at the head event's own second is taken as asked: a duplicate comment is the worse error here.
     asked = [c for c in standing if stamp(c['created_at']) >= stamp(event_at)]
     if asked:
-        return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}, None
+        return on_comment('already', asked[0], at=asked[0]['created_at'], **reset), None
     why = unopened(pr, head)
     if why:
         return {'outcome': 'notLimited', 'detail': why}, None
@@ -189,7 +200,7 @@ def request(repo, pr, head):
         raise Failed(f'the posted request does not read back ({e})')
     if (back.get('body') or '').strip() != REQUEST:
         raise Failed(f"comment {posted['id']} reads back as another body")
-    return {'outcome': 'requested', 'detail': f"comment {posted['id']}", 'commentId': posted['id'], 'at': back['created_at'], **reset}
+    return on_comment('requested', posted, at=back['created_at'], **reset)
 
 
 def collect(argv):
