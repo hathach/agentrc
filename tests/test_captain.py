@@ -962,6 +962,14 @@ class AddressingTest(RelayCase):
             with self.subTest(words):
                 self.assertEqual(self.shown(words, 'w2:p1')[0], words)
 
+    def test_only_an_addressed_message_lists_the_sessions(self):
+        listed, everyone = [], captain.everyone
+        with mock.patch.object(captain, 'everyone', lambda: listed.append(1) or everyone()):
+            self.assertEqual(captain.relay_text('merge 318', ['w2:p1'], []), 'merge 318')
+            self.assertEqual(listed, [])
+            self.assertEqual(captain.relay_text('tell code to merge 318', ['w2:p1'], []), 'merge 318')
+            self.assertEqual(listed, [1])
+
     def test_addressing_anyone_else_or_ambiguously_refuses_at_preview(self):
         cases = [('tell docs to merge 318', ['w2:p1'], 'not a target'),
                  ('tell code and docs to merge', ['w2:p1'], 'not a target'),

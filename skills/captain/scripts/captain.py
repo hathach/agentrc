@@ -916,6 +916,8 @@ def digest(text):
 
 def relay_text(words, panes, recs):
     """The text a relay to panes sends; dies, so nothing is sent, when instruction() refuses it."""
+    if not TELL.match(words):   # unaddressed: sent as written, no session listing needed
+        return words
     text, why = instruction(words, panes, everyone(), recs)
     if why:
         die(f"the human's message cannot be relayed as written: {why}; ask the human to restate it", 2)
