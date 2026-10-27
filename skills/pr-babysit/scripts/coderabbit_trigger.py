@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Tick CodeRabbit's "Trigger review" box on PR N when it skipped HEAD for a manual review,
-or, with --request, ask it to review once its rate limit on HEAD has reset.
+or, with --request, ask it to review once its rate limit on HEAD has reset, or when no tick asked for a skipped HEAD.
 
   coderabbit_trigger.py --pr N --head SHA [--request] [--repo OWNER/NAME]
 
@@ -22,16 +22,22 @@ Run from the PR checkout; PR N is --repo's, else the checkout's one repository
 
 With --request, CodeRabbit is read as harvest.py reads it, and a rate-limit
 notice leaves no box to tick (CodeRabbit's docs: comment `@coderabbitai review`
-after the reset). The outcome:
+after the reset); nor does a manual-review skip whose summary lost its box, or
+whose tick failed (#274). The outcome:
 
-  requested   it is limited on HEAD, its reset has passed, and the comment
-              was posted and read back
-  already     such a comment was posted at or after the reset
+  requested   it is limited on HEAD and its reset has passed, or it skipped
+              HEAD for a manual review and no box is ticked; the comment was
+              posted and read back
+  already     such a comment was posted at or after the reset, or, on a skip,
+              after the head event (harvest.py's), or the box is ticked
   notDue      the reset is still ahead (retryAt) or no reset time can be read
               (retryAt null): nothing posted
   notLimited  the PR is not open, SHA is not its head (both read again just
-              before posting), or CodeRabbit is not rate-limited on it
-  failed      a read before the post, the post or its read-back failed
+              before posting), or CodeRabbit is neither rate-limited on it nor
+              skipped it for a manual review
+  failed      a read before the post, the post or its read-back failed, or on
+              a skip a standing comment cannot be placed against an unknown
+              head event time
 
 and the line adds retryAt, the reset it read, null when it read none. A failed
 line adds phase: `read` when it failed before the POST, so nothing was posted;
@@ -125,6 +131,8 @@ def unasked(repo, pr, head):
         return {'outcome': 'notLimited', 'detail': why}, None
     seen = observe(repo, pr, ['coderabbit'], ['coderabbit'])
     cr = seen['bots'][0]
+    if seen['headSha'] == head and (cr['state'], cr['kind']) == ('settled', 'skipped') and cr['reason'].lower().startswith(SKIP):
+        return unasked_skip(pr, head, seen['headEventAt'])
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
         return {'outcome': 'notLimited', 'detail': f"CodeRabbit is {cr['state']}{f'/' + cr['kind'] if cr['kind'] else ''} on {seen['headSha'][:9]}: {cr['reason']}"}, None
     reset = {'retryAt': cr['retryAt']}
@@ -135,6 +143,27 @@ def unasked(repo, pr, head):
     if asked:
         return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}, None
     # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
+    why = unopened(pr, head)
+    if why:
+        return {'outcome': 'notLimited', 'detail': why}, None
+    return None, reset
+
+
+def unasked_skip(pr, head, event_at):
+    """unasked's answer on a manual-review skip: an ask stands when the box is ticked or a request follows the head event."""
+    comments = pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
+    reset = {'retryAt': None}
+    ticked = [c for c in comments if 'coderabbit' in ((c.get('user') or {}).get('login') or '').lower()
+              and any(m['mark'] != ' ' for m in BOX.finditer(c.get('body') or ''))]
+    if ticked:
+        c = ticked[0]
+        return {'outcome': 'already', 'detail': f"comment {c['id']} has its Trigger review box ticked", 'commentId': c['id'], 'at': c['updated_at'], **reset}, None
+    standing = [c for c in comments if (c.get('body') or '').strip() == REQUEST]
+    if standing and event_at is None:
+        raise Failed(f"the head event time is unknown, so comment {standing[-1]['id']} cannot be placed before or after it: nothing posted", 'read')
+    asked = [c for c in standing if stamp(c['created_at']) > stamp(event_at)]
+    if asked:
+        return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}, None
     why = unopened(pr, head)
     if why:
         return {'outcome': 'notLimited', 'detail': why}, None

@@ -146,14 +146,15 @@ NOW = '2026-10-13T11:00:00Z'
 class RequestRig:
     """A fake `gh api` for --request: the PR, harvest.observe's reading, the PR's comments, and each POST with its read-back."""
 
-    def __init__(self, cr=LIMITED, observed=NOW, comments=(), state='open', head=HEAD, readback=trigger.REQUEST, post_code=0, later=None):
-        self.cr, self.observed, self.comments, self.state, self.head = dict(cr), observed, list(comments), state, head
+    def __init__(self, cr=LIMITED, observed=NOW, comments=(), state='open', head=HEAD, readback=trigger.REQUEST, post_code=0, later=None,
+                 event_at='2026-10-13T09:00:00Z'):
+        self.cr, self.observed, self.comments, self.state, self.head, self.event_at = dict(cr), observed, list(comments), state, head, event_at
         self.later, self.pulls = later, 0  # later: the PR's (state, head) on the read just before posting
         self.readback, self.post_code, self.posts = readback, post_code, []
 
     def observe(self, repo, n, reviewers, auto):
         assert (repo, n, reviewers, auto) == ('o/r', 7, ['coderabbit'], ['coderabbit'])
-        return {'headSha': self.head, 'observedAt': self.observed, 'bots': [self.cr], 'comments': []}
+        return {'headSha': self.head, 'observedAt': self.observed, 'headEventAt': self.event_at, 'bots': [self.cr], 'comments': []}
 
     def attempt(self, *argv, input=None):
         assert argv[2:5] == ('-X', 'POST', 'repos/{owner}/{repo}/issues/7/comments') and argv[5:] == ('-f', f'body={trigger.REQUEST}'), argv
@@ -225,6 +226,31 @@ class Request(unittest.TestCase):
                 code, out = self.run_with(rig)
                 self.assertEqual((code, out['outcome']), (0, 'notLimited'))
                 self.assertEqual(rig.posts, [])
+
+    def test_a_manual_review_skip_no_tick_asked_for_is_asked_once_by_comment(self):
+        # #274: hathach/agentrc#300's head, whose refreshed summary held no Trigger review box.
+        skip = dict(LIMITED, kind='skipped', reason=SKIP['description'], retryAt=None)
+        cases = {'no box': [], 'an unticked box, its tick failed': [{'id': 5, 'user': {'login': BOT}, 'body': BOX, 'updated_at': NOW}],
+                 "an older head's request": [{'id': 50, 'body': '@coderabbitai review', 'created_at': '2026-10-13T08:00:00Z'}]}
+        for what, comments in cases.items():
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(cr=skip, comments=comments))
+                self.assertEqual((code, out['outcome'], out['commentId'], out['retryAt']), (0, 'requested', 99, None))
+                self.assertEqual(len(rig.posts), 1)
+        ticked = {'id': 5, 'user': {'login': BOT}, 'body': BOX.replace('[ ]', '[x]'), 'updated_at': '2026-10-13T10:00:00Z'}
+        mine = {'id': 51, 'body': '@coderabbitai review', 'created_at': '2026-10-13T09:30:00Z'}
+        for what, comments, want in (('a ticked box', [ticked], (5, '2026-10-13T10:00:00Z')), ('a request after the head event', [mine], (51, mine['created_at']))):
+            with self.subTest(what):
+                code, out = self.run_with(rig := RequestRig(cr=skip, comments=comments))
+                self.assertEqual((out['outcome'], out['commentId'], out['at']), ('already', *want), 'never a second ask on the head')
+                self.assertEqual(rig.posts, [])
+        code, out = self.run_with(rig := RequestRig(cr=skip, comments=[mine], event_at=None))
+        self.assertEqual((out['outcome'], out['phase']), ('failed', 'read'), 'a request it cannot place')
+        self.assertEqual(rig.posts, [])
+        self.assertEqual(self.run_with(RequestRig(cr=skip, event_at=None))[1]['outcome'], 'requested', 'none to place')
+        other = dict(skip, reason='check run skipped: Review skipped')
+        self.assertEqual(self.run_with(rig := RequestRig(cr=other))[1]['outcome'], 'notLimited', 'another skip is not asked about')
+        self.assertEqual(rig.posts, [])
 
     def test_a_failed_or_unconfirmed_post_is_failed_with_its_limit(self):
         for what, rig in (('post failed', RequestRig(post_code=1)), ('read back differs', RequestRig(readback='something else'))):

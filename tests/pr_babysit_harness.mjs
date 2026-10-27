@@ -7351,23 +7351,62 @@ test('a request carries across a resume, and a malformed one is refused', async 
   }
 })
 
-test('a failed or lost trigger stops CodeRabbit unreviewed, logged and not asked again', async () => {
+test('a failed or lost trigger, and then a failed request, stops CodeRabbit unreviewed, logged and not asked again', async () => {
   const cases = [
     [{ outcome: 'failed', detail: '0 CodeRabbit comments hold one Trigger review box, not 1' }, 'failed (0 CodeRabbit comments hold one Trigger review box, not 1)'],
     [{ error: 'gh: HTTP 502', outcome: '', detail: '', at: '' }, 'failed (gh: HTTP 502)'],
     [null, 'failed (no answer)'],
   ]
+  const crRequest = { outcome: 'failed', detail: 'gh api: boom', retryAt: null, phase: 'post' }
   for (const [crTrigger, line] of cases) {
-    const { result, logs, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, crTrigger, reviews: quiet([skippedCr()]) })
+    const { result, logs, labels } = await run({ args: { coderabbitTrigger: true, maxCycles: 2 }, crTrigger, crRequest, reviews: quiet([skippedCr()]) })
     assert.equal(result.reason, 'coderabbit-unreviewed')
     assert.equal(result.cycles, 1)
     assert.deepEqual(triggers(labels), crTrigger === null ? ['crtrigger#1', 'crtrigger#1.retry'] : ['crtrigger#1'])
+    assert.deepEqual(requests(labels), ['crrequest#1'])
     assert.ok(logs.includes(`cycle 1: crtrigger#1: ${line}`), logs.join('\n'))
+    assert.ok(logs.includes('cycle 1: crrequest#1: failed (gh api: boom)'), logs.join('\n'))
     assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit settled (skipped: ${MANUAL})`)
-    assert.equal(result.state.reviewClock.triggeredAt, null, 'tried and not waiting')
+    assert.deepEqual([result.state.reviewClock.triggeredAt, result.state.reviewClock.request], [null, { at: null, retryAt: null }], 'tried and not waiting')
     assert.equal(result.observation.actions.botAsks, undefined, 'no comment named, no receipt')
-    assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }] }, 'a failed tick is not tried again')
+    assert.deepEqual(result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }, { ask: 'request', at: null }] }, 'neither is tried again')
   }
+})
+
+test('a failed tick spends no comment: one `@coderabbitai review` asks for the skipped head instead, never a second (#274)', async () => {
+  const noBox = { outcome: 'failed', detail: '0 CodeRabbit comments hold one Trigger review box, not 1' }
+  let n = 0
+  const { result, logs, labels, calls } = await run({
+    args: { coderabbitTrigger: true, maxCycles: 3 }, crTrigger: noBox, reviewsPerCycle: () => quiet([++n === 1 ? skippedCr() : bot('coderabbit')]),
+  })
+  assert.equal(result.pass, true, result.reason)
+  assert.deepEqual([triggers(labels), requests(labels)], [['crtrigger#1'], ['crrequest#1']])
+  const call = calls.find(c => c.label === 'crrequest#1')
+  assert.ok(call.prompt.includes(`coderabbit_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --request\``), call.prompt)
+  assert.ok(call.prompt.includes('that it skipped for a manual review'), call.prompt)
+  assert.ok(logs.includes('cycle 1: crrequest#1: requested (comment 99)'), logs.join('\n'))
+  assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 10m to cap)`)
+  assert.deepEqual(result.state.reviewClock, { sha: HEAD, eventAt: null, since: at(0), triggeredAt: null, request: { at: at(0), retryAt: null } })
+  assert.deepEqual(result.observation.launchActions[0].botAsks, [{ bot: 'coderabbit', kind: 'request', outcome: 'requested', commentId: 99, at: at(0), sha: HEAD }])
+  // Skipped is not reviewed: the cap after the comment stops it unreviewed, asked once.
+  const capped = await run({ args: { coderabbitTrigger: true, maxCycles: 4 }, minutesPerCycle: 5, crTrigger: noBox, reviews: quiet([skippedCr()]) })
+  assert.equal(capped.result.reason, 'coderabbit-unreviewed')
+  assert.deepEqual([triggers(capped.labels), requests(capped.labels)], [['crtrigger#1'], ['crrequest#1']])
+  assert.deepEqual(capped.result.coderabbitAsk, { relaunchAsks: null, asked: [{ ask: 'tick', at: null }, { ask: 'request', at: at(0) }] })
+  // A relaunch on a state whose tick failed before the fallback existed (hathach/agentrc#300) comments once, and the next asks nothing.
+  const a = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true }, reviews: quiet([skippedCr()]) })
+  const { request, ...clock } = { ...a.result.state.reviewClock, triggeredAt: null }
+  const failedTick = seal({ ...a.result.state, reviewClock: clock })
+  const b = await run({ args: { coderabbitTrigger: true, maxCycles: 3, yieldAfterCycle: true, state: failedTick }, clockOffset: 12, reviews: quiet([skippedCr()]) })
+  assert.deepEqual([triggers(b.labels), requests(b.labels)], [[], ['crrequest#2']])
+  assert.deepEqual(b.result.state.reviewClock.request, { at: at(12), retryAt: null })
+  const c = await run({ args: { coderabbitTrigger: true, maxCycles: 3, state: b.result.state }, clockOffset: 24, reviews: quiet([skippedCr()]) })
+  assert.deepEqual([triggers(c.labels), requests(c.labels)], [[], []], 'never a second comment on the head')
+  assert.equal(c.result.reason, 'coderabbit-unreviewed')
+  const d = await run({ args: { coderabbitTrigger: true, maxCycles: 3 }, crTrigger: noBox, crRequest: { outcome: 'already', detail: 'comment 51', commentId: 51, retryAt: null },
+    reviews: quiet([skippedCr()]) })
+  assert.deepEqual(requests(d.labels), ['crrequest#1'])
+  assert.equal(d.result.state.reviewClock.request.at, at(0), "the script's own check finds the standing comment, and it is waited on")
 })
 
 test('a cycle that asked a bot to review and then met a GitHub rate limit stays charged', async () => {

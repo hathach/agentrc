@@ -27,7 +27,7 @@ python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD,
 python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N] [--repo R]
 python3 $S/sonar.py --pr N [--repo R] --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
-python3 $S/coderabbit_trigger.py --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset
+python3 $S/coderabbit_trigger.py --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, or on such a skip no tick asked for
 python3 $S/greptile_trigger.py --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
 python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
 python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create

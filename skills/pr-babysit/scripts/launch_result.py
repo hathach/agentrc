@@ -123,6 +123,9 @@ def relaunch_ask(ask):
     already spent)."""
     if ask.get('relaunchAsks') == 'tick':
         return 'it skipped the head for a manual review and this run never ticked its box on it: a relaunch with coderabbitTrigger ticks it once'
+    if ask.get('relaunchAsks') == 'request' and ask.get('retryAt') is None:
+        return ('it skipped the head for a manual review and no tick asked for its review: a relaunch with coderabbitTrigger '
+                'comments `@coderabbitai review` once')
     if ask.get('relaunchAsks') == 'request':
         return (f"it is rate-limited until {ask.get('retryAt')} and this run never asked on the head: a relaunch with "
                 'coderabbitTrigger after that comments `@coderabbitai review` once')

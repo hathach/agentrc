@@ -314,7 +314,8 @@ if (args.state !== undefined && args.state !== null) {
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
       (st.reviewClock.greptileAt == null || Number.isFinite(Date.parse(st.reviewClock.greptileAt))) &&
-      (st.reviewClock.request === undefined || (st.reviewClock.request && Number.isFinite(Date.parse(st.reviewClock.request.retryAt)) &&
+      (st.reviewClock.request === undefined || (st.reviewClock.request &&
+        (st.reviewClock.request.retryAt === null || Number.isFinite(Date.parse(st.reviewClock.request.retryAt))) &&
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
       (st.reviewClock.requestUnposted === undefined || st.reviewClock.requestUnposted === true) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
@@ -1230,7 +1231,7 @@ const botCell = (b, headWaitedMin) => {
   if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
   if (!waitedOn.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
   const waitedMin = b.triggeredMin ?? headWaitedMin
-  if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again after ${b.retryAt})`
+  if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again ${b.retryAt ? `after ${b.retryAt}` : 'next cycle'})`
   if (b.state === 'settled' && b.triggeredMin !== undefined) {
     return b.done ? `settled (${b.kind}: ${b.reason}; no review ${waitedMin}m after its trigger)`
       : `review triggered (${b.reason}, ${Math.max(0, REVIEW_CAP_MIN - waitedMin)}m to cap)`
@@ -1946,9 +1947,11 @@ const settleSonar = async (cycle, entry, ended) => {
 const MANUAL_SKIP = /^review skipped: manual review required/i
 const manualSkip = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
 // The ask CodeRabbit's state leaves a coderabbitTrigger launch on the head of `clock`, one of each per head (#243): a tick of a
-// manual skip's box, or a request after a rate limit with a known reset, whenever that reset comes; null when neither is left.
+// manual skip's box, or a request after a rate limit with a known reset, whenever that reset comes, or after a failed tick, which
+// spends no comment (#274); null when neither is left.
 const coderabbitAskable = (cr, clock) => manualSkip(cr) && clock.triggeredAt === undefined ? 'tick'
-  : cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null && !clock.request ? 'request' : null
+  : !clock.request && (manualSkip(cr) ? clock.triggeredAt === null : cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null)
+    ? 'request' : null
 const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
@@ -1962,6 +1965,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
   if (cr.state === 'settled' && cr.kind === 'limited') return requestCodeRabbit(cycle, r, cr, ended)
+  if (manual && coderabbitTrigger && coderabbitAskable(cr, reviewClock) === 'request') await requestCodeRabbit(cycle, r, cr, ended)
   // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone.
   const asks = [reviewClock.triggeredAt, reviewClock.request && reviewClock.request.at].filter(t => typeof t === 'string')
   if (!asks.length || !(manual || cr.state === 'queued' || cr.state === 'absent')) return
@@ -2014,7 +2018,8 @@ const waitAfter = (cr, askedAt, observedAt) => {
   cr.triggeredMin = Math.floor((Date.parse(observedAt) - Date.parse(askedAt)) / 60000)
   cr.done = cr.triggeredMin >= REVIEW_CAP_MIN
 }
-// A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again.
+// A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again. So does a manual
+// skip whose tick failed, at once.
 const RETRY_WAIT_MAX_MS = 60 * 60000
 const retryLater = (cr, cycle, ms) => {
   if (ms > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
@@ -2030,10 +2035,11 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
     return
   }
   if (!coderabbitTrigger || coderabbitAskable(cr, reviewClock) !== 'request') return
-  const dueMs = Date.parse(cr.retryAt) - Date.parse(r.observedAt)
+  const dueMs = cr.retryAt === null ? 0 : Date.parse(cr.retryAt) - Date.parse(r.observedAt)
   if (dueMs > 0) return retryLater(cr, cycle, dueMs)
   if (await ended('crrequest')) return
-  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} after its rate limit`, ' --request',
+  const why = cr.kind === 'limited' ? 'after its rate limit' : 'that it skipped for a manual review'
+  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`, ' --request',
     ['requested', 'already', 'notDue', 'notLimited', 'failed'])
   // A failure before the POST posted nothing (#276): one more try, behind the script's own `already` check. One that may have posted is final.
   if (outcome === 'failed' && t && t.phase === 'read' && !reviewClock.requestUnposted) {

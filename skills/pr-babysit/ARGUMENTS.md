@@ -35,15 +35,18 @@ listed here throws before anything runs.
   repository below its open-source threshold). Once per head, ticks
   the "Trigger review" box of CodeRabbit's summary comment when the head was
   skipped that way, then waits for the review up to the silent-bot cap. Once
-  per head too, when CodeRabbit is rate-limited with a reset time under an
-  hour away, naps until the reset and comments `@coderabbitai review` (a limit
-  notice has no box), then waits the same way; a request that failed before
-  its post, so posted nothing, is tried once more, one that may have posted is
-  not. The first launch with the
-  switch latches the run, as `greptileTrigger` does: every later head needs
+  per head too, it comments `@coderabbitai review` instead: when that tick
+  failed (a summary with no box to tick, a failed edit), unless the box reads
+  ticked or such a comment follows the head event, or when CodeRabbit is
+  rate-limited with a reset time under an hour away, after napping until the
+  reset (a limit notice has no box); then it waits the same way. A request that
+  failed before its post, so posted nothing, is tried once more, one that may
+  have posted is not. A tick that failed before this fallback existed, recorded
+  in a state, still gets its one comment from a relaunch. The first launch with
+  the switch latches the run, as `greptileTrigger` does: every later head needs
   CodeRabbit's review, a launch without the switch waits on an earlier ask and
-  asks nothing, and a head left unreviewed (a failed tick, no review within
-  the cap, a skip or limit with nothing more to ask) stops
+  asks nothing, and a head left unreviewed (a failed tick and request, no review
+  within the cap, a skip or limit with nothing more to ask) stops
   `coderabbit-unreviewed`, never a pass. That stop, and any other with
   CodeRabbit's last reading of the head no review, returns `coderabbitAsk`:
   the asks made on the head and the one a relaunch would still make, if any.
