@@ -42,7 +42,7 @@ def setUpModule():
 class Argv(unittest.TestCase):
     def argv(self, euid, installed):
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / 'hil_usbtest'
+            path = Path(td) / 'hil_root'
             if installed == 'dangling':
                 path.symlink_to(Path(td) / 'gone')
             elif installed:
@@ -79,8 +79,7 @@ class Sysfs(unittest.TestCase):
         self.usb = self.root / 'devices'
         self.param = self.root / 'pattern'
         self.param.write_text('0')
-        self.pci = self.root / 'pci'
-        for name, value in (('SYS_USB', self.usb), ('PATTERN_PARAM', self.param), ('SYS_PCI', self.pci)):
+        for name, value in (('SYS_USB', self.usb), ('PATTERN_PARAM', self.param)):
             p = mock.patch.object(hr, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -101,9 +100,10 @@ class Sysfs(unittest.TestCase):
 
 class Usage(Sysfs):
     def test_unknown_verb_and_wrong_argc_refuse(self):
-        # new-id, bind and unbind went with usbtest's new_id (kernel 6.12.108): refused like any unknown verb
+        # new-id, bind and unbind went with usbtest's new_id (kernel 6.12.108), renesas-fw to the rig's
+        # runner-start check: refused like any unknown verb
         for args in ((), ('chmod', '/etc/shadow'), ('dmesg', 'x'), ('new-id', 'cafe', '4010', '0525', 'a4a0'),
-                     ('bind', '1-2:1.0'), ('unbind', '1-2:1.0')):
+                     ('bind', '1-2:1.0'), ('unbind', '1-2:1.0'), ('renesas-fw', '0000:03:00.0')):
             with self.subTest(args=args):
                 self.assertEqual(self.main(*args)[0], 2)
 
@@ -144,23 +144,6 @@ class Programs(Sysfs):
         seen = self.run_with()
         self.assertEqual(self.main('modprobe')[0], 0)
         self.assertEqual(seen, [[hr.MODPROBE, 'usbtest']])
-
-    def pci_dev(self, bdf, vendor, device):
-        d = self.pci / bdf
-        d.mkdir(parents=True)
-        (d / 'vendor').write_text(vendor + '\n')
-        (d / 'device').write_text(device + '\n')
-
-    def test_renesas_fw_reads_only_a_renesas_controller(self):
-        seen = self.run_with('00202609\n')
-        self.pci_dev('0000:03:00.0', '0x1912', '0x0015')
-        self.assertEqual(self.main('renesas-fw', '0000:03:00.0')[:2], (0, '00202609\n'))
-        self.assertEqual(seen, [[hr.SETPCI, '-s', '0000:03:00.0', '0x6c.l']])
-        self.pci_dev('0000:04:00.0', '0x8086', '0xa36d')
-        for bdf in ('0000:04:00.0', '0000:05:00.0', '03:00.0', '0000:03:00.0 0x10.l'):
-            with self.subTest(bdf=bdf):
-                self.assertEqual(self.main('renesas-fw', bdf)[0], 2)
-        self.assertEqual(len(seen), 1)
 
 
 class ResetTt(Sysfs):
@@ -243,7 +226,7 @@ class Standalone(unittest.TestCase):
     def test_a_lone_copy_runs_and_refuses(self):
         """The installed copy has nothing beside it."""
         with tempfile.TemporaryDirectory() as td:
-            lone = Path(td) / 'hil_usbtest'
+            lone = Path(td) / 'hil_root'
             lone.write_bytes(Path(HERE_ROOT).read_bytes())
             r = subprocess.run([sys.executable, '-I', str(lone), 'reset-tt', '999-1.1'],
                                capture_output=True, text=True, timeout=30)

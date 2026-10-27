@@ -262,12 +262,12 @@ def find_device(vid, pid, serial=None, timeout=SERIAL_GRACE):
 def check_host_compat(node):
     """Refuse to run when the DUT's upstream host controller is known-incompatible:
     the MosChip MCS9990 (9710:9990) outright (buggy FRINDEX silicon: EHCI never
-    schedules int-OUT URBs and mangles unlinked reads - verified A/B 2026-07-09),
-    and the Renesas uPD720201/02 unless it runs firmware >= 2.0.2.6 (see below)."""
+    schedules int-OUT URBs and mangles unlinked reads - verified A/B 2026-07-09). A Renesas
+    uPD720201/02 needs firmware >= 2.0.2.6, or its command ring dies under unlink stress: a rig
+    setup prerequisite, checked by the rig when its runner starts, not here."""
     for attempt in range(3):
         try:
             root = SYS_USB / f"usb{int(node.split('/')[-2])}"
-            drv = (root / '../driver').resolve().name
             pci = (root / '..').resolve()
             vid_did = ((pci / 'vendor').read_text().strip(), (pci / 'device').read_text().strip())
             break
@@ -284,32 +284,6 @@ def check_host_compat(node):
                  'incompatible with usbtest: broken FRINDEX silicon - int-OUT URBs are never '
                  'placed in the EHCI periodic schedule and unlinked reads complete as short '
                  'transfers (EREMOTEIO). Move the DUT to an xHCI port.')
-    if drv.startswith('xhci') and vid_did in (('0x1912', '0x0014'), ('0x1912', '0x0015')):
-        # The Renesas uPD720201/uPD720202 must run firmware >= 2.0.2.6 (K2026090.mem;
-        # RAM-uploaded, so it reverts to ROM on every power cycle): on ROM firmware its
-        # command ring dies under unlink stress and the hub worker deadlocks holding the
-        # device lock, needing a host power cycle (ch32v307 2026-07-10; ra6m5 test 24,
-        # mimxrt1015 2026-07-11). Both parts expose the FW version at PCI config 0x6c.
-        # Necessary, not sufficient -- batteries have killed the controller on current
-        # firmware too, which per-board skips in the rig config handle.
-        fw = None
-        try:
-            r = _root_soft('renesas-fw', pci.name)
-            if r.returncode == 0:
-                fw = int(r.stdout.strip(), 16)
-        except (OSError, ValueError):
-            pass
-        if fw is None or fw == 0xffffffff:     # all ones: config space unreadable, no version
-            sys.exit(f'REFUSING to run: cannot read host xHCI Renesas ({pci.name}) firmware '
-                     'version (setpci missing, not permitted, or all ones) - usbtest requires '
-                     'verified firmware 2.0.2.6 or later (0x2026 in config 0x6c bits 23:8); on '
-                     'older firmware the command ring dies under unlink stress. Install pciutils '
-                     '/ fix sudo, or load the firmware and re-check.')
-        if (fw >> 8) & 0xffff < 0x2026:          # the version is bits 23:8 (2.0.2.6 = 0x2026)
-            sys.exit(f'REFUSING to run: host xHCI Renesas ({pci.name}) firmware 0x{fw:08x} '
-                     'is older than 2.0.2.6 (bits 23:8 < 0x2026) - its command ring dies under usbtest unlink '
-                     'stress. Load the latest firmware (K2026090.mem; it is RAM-uploaded and '
-                     'reverts to ROM on every power cycle).')
 
 
 def load_usbtest():

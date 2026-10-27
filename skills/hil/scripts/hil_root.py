@@ -9,7 +9,6 @@ arguments against the one sysfs file, device or program it touches.
   hil_root.py pattern 0|1                usbtest's pattern parameter
   hil_root.py modprobe                   modprobe usbtest
   hil_root.py dmesg                      the kernel log lines naming usbtest
-  hil_root.py renesas-fw BDF             PCI config dword 0x6c of a Renesas uPD720201/2
   hil_root.py reset-tt BUSPORT           Reset_TT on the multi-TT hub port BUSPORT names
 
 Exit 2 refuses a request; otherwise the operation's own status, its error on stderr.
@@ -28,17 +27,14 @@ import sys
 from pathlib import Path
 
 FILES = ()                                  # it loads and launches nothing by path
-INSTALLED = '/usr/local/sbin/hil_usbtest'   # a rig's root-owned copy, the CI user's sudo grant
+INSTALLED = '/usr/local/sbin/hil_root'      # a rig's root-owned copy, the CI user's sudo grant
 SYS_USB = Path('/sys/bus/usb/devices')
 PATTERN_PARAM = Path('/sys/module/usbtest/parameters/pattern')
-SYS_PCI = Path('/sys/bus/pci/devices')
 DEV_USB = '/dev/bus/usb'
-DMESG, SETPCI, MODPROBE = '/usr/bin/dmesg', '/usr/bin/setpci', '/usr/sbin/modprobe'
-RENESAS = {('0x1912', '0x0014'), ('0x1912', '0x0015')}   # uPD720201, uPD720202
+DMESG, MODPROBE = '/usr/bin/dmesg', '/usr/sbin/modprobe'
 USB_MAJOR = 189                               # usb_device char major (v6.12 include/linux/usb.h)
 
 _BUSPORT = re.compile(r'[1-9][0-9]*-[1-9][0-9]*(\.[1-9][0-9]*)*\Z')
-_BDF = re.compile(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]\Z')
 _CTRLTRANSFER = struct.Struct('@BBHHHIP')                   # struct usbdevfs_ctrltransfer
 USBDEVFS_CONTROL = 0xC0005500 | _CTRLTRANSFER.size << 16   # _IOWR('U', 0, ...)
 RESET_TT = 9
@@ -102,20 +98,6 @@ def dmesg():
     return r.returncode
 
 
-def renesas_fw(bdf):
-    if not _BDF.match(bdf):
-        raise Refused(f'BDF {bdf!r}: expected dddd:bb:dd.f in lowercase hex')
-    try:
-        ids = (_read(SYS_PCI / bdf / 'vendor'), _read(SYS_PCI / bdf / 'device'))
-    except OSError as e:
-        raise Refused(f'{bdf}: {e.strerror}')
-    if ids not in RENESAS:
-        raise Refused(f'{bdf} is {ids[0]}:{ids[1]}, not a Renesas uPD720201/2')
-    r = _run([SETPCI, '-s', bdf, '0x6c.l'])
-    sys.stdout.write(r.stdout)
-    return r.returncode
-
-
 def tt_hub(busport):
     """(hub busport, port, busnum, devnum, (idVendor, idProduct)) of the hub port whose own TT
     would serve a full-/low-speed device at `busport`: a hub running one TT per port (USB 2.0
@@ -160,7 +142,7 @@ def reset_tt(busport):
         os.close(fd)
 
 
-VERBS = {'pattern': pattern, 'modprobe': modprobe, 'dmesg': dmesg, 'renesas-fw': renesas_fw, 'reset-tt': reset_tt}
+VERBS = {'pattern': pattern, 'modprobe': modprobe, 'dmesg': dmesg, 'reset-tt': reset_tt}
 
 
 def main(args) -> int:

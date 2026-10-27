@@ -459,8 +459,8 @@ class Root(unittest.TestCase):
         seen = []
         patch(self, hu, 'run', lambda cmd, **kw: seen.append((cmd, kw)) or subprocess.CompletedProcess(cmd, 0, '', ''))
         patch(self, hu.hil_root, 'argv', lambda *a: ['H', *a])
-        hu.root('renesas-fw', '0000:03:00.0', timeout=4)
-        self.assertEqual(seen, [(['H', 'renesas-fw', '0000:03:00.0'], {'timeout': 4})])
+        hu.root('pattern', '1', timeout=4)
+        self.assertEqual(seen, [(['H', 'pattern', '1'], {'timeout': 4})])
 
 
 class RootSoftNeverRaises(unittest.TestCase):
@@ -699,7 +699,7 @@ class FindDevice(unittest.TestCase):
 class HostCompat(unittest.TestCase):
     """The upstream controller of the node's bus, from a fake sysfs: usbN -> its PCI function."""
 
-    def host(self, vendor, device, driver='xhci_hcd', fw=None):
+    def host(self, vendor, device, driver='xhci_hcd'):
         td = tempfile.TemporaryDirectory()
         self.addCleanup(td.cleanup)
         root = Path(td.name)
@@ -712,9 +712,8 @@ class HostCompat(unittest.TestCase):
         (root / 'devices').mkdir()
         (root / 'devices' / 'usb5').symlink_to(pci / 'usb5')
         patch(self, hu, 'SYS_USB', root / 'devices')
-        self.setpci = []
-        patch(self, hu, '_root_soft', lambda *cmd, **kw: self.setpci.append(list(cmd)) or (
-            subprocess.CompletedProcess(cmd, 0, fw, '') if fw else subprocess.CompletedProcess(cmd, 1, '', 'no')))
+        self.rooted = []
+        patch(self, hu, '_root_soft', lambda *cmd, **kw: self.rooted.append(list(cmd)))
 
     def check(self):
         hu.check_host_compat('/dev/bus/usb/005/007')
@@ -725,24 +724,12 @@ class HostCompat(unittest.TestCase):
             self.check()
         self.assertIn('MosChip MCS9990 (0000:03:00.0)', str(cm.exception))
 
-    def test_renesas_needs_current_firmware(self):
-        self.host('0x1912', '0x0014', fw='00202609\n')
-        self.check()
-        self.assertEqual(self.setpci, [['renesas-fw', '0000:03:00.0']])
-        self.host('0x1912', '0x0014', fw='ff202609\n')      # bits 31:24 are not the version
-        self.check()
-        for fw, says in (('00202500\n', 'firmware 0x00202500 is older than 2.0.2.6'),
-                         ('ffffffff\n', 'cannot read'), (None, 'cannot read')):
-            with self.subTest(fw=fw):
-                self.host('0x1912', '0x0015', fw=fw)
-                with self.assertRaises(SystemExit) as cm:
-                    self.check()
-                self.assertIn(says, str(cm.exception))
-
-    def test_other_hosts_pass_without_setpci(self):
-        self.host('0x8086', '0xa36d')
-        self.check()
-        self.assertEqual(self.setpci, [])
+    def test_other_hosts_pass_without_a_root_call(self):
+        for vendor, device in (('0x8086', '0xa36d'), ('0x1912', '0x0014'), ('0x1912', '0x0015')):
+            with self.subTest(host=(vendor, device)):
+                self.host(vendor, device)
+                self.check()
+                self.assertEqual(self.rooted, [])
 
     def test_an_unprobeable_host_warns_and_passes(self):
         td = tempfile.TemporaryDirectory()
