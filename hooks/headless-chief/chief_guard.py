@@ -19,7 +19,10 @@ is not a defect to patch one by one. Likewise a variable named in arithmetic or 
 bash evaluates as code (#223): `let`, `declare -i`, `${!name}` and `${name@P}`, which evaluate a value the same way,
 are denied, but no value is followed; so are a `-c` or eval string the outer shell expands first, where a value
 becomes commands, and the forms that run a command later or out of sight: `coproc`, `function`, a trap action and a
-script that is a substitution (#229).
+script that is a substitution (#229). A script file is not followed either, so a file holding piped commands runs
+them unseen, whether a link to /dev/stdin or a copy the same command writes; denied are only the script operands that
+reach stdin themselves: a descriptor path, a bare number a descriptor directory resolves as the cwd (`cd /dev/fd;
+bash 0`), and a slash-less name searched in a PATH the same command sets (#239).
 
 The cost is what chief can no longer run directly: piping commands into a shell, shell or wrapper options
 outside the small tables, git or a writer fed by xargs or find -exec, globs in a write target even
@@ -123,7 +126,8 @@ WRAPPER_FLAGS = {
 # every GIT_CONFIG* variable (they inject configuration, core.fsmonitor included)
 PAGER_ENV = {'PAGER', 'GIT_PAGER'}
 RUN_ENV = {'GIT_SSH', 'GIT_SSH_COMMAND', 'GIT_PROXY_COMMAND', 'GIT_ASKPASS', 'SSH_ASKPASS', 'GIT_EDITOR',
-           'EDITOR', 'VISUAL', 'GIT_SEQUENCE_EDITOR', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'BASHOPTS', 'TAR_OPTIONS'}
+           'EDITOR', 'VISUAL', 'GIT_SEQUENCE_EDITOR', 'GIT_EXTERNAL_DIFF', 'GIT_EXEC_PATH', 'BASHOPTS', 'TAR_OPTIONS',
+           'BASH_ENV'}   # ENV is read only by an interactive shell, which shell() never passes (-i, -s, stdin)
 # GIT_TRACE* values git reads as off or stderr; any other is an fd, an absolute path or a socket it appends trace to
 GIT_TRACE_QUIET = {'', '0', 'false', '1', '2', 'true'}
 # git's trace destinations: GIT_TRACE, each GIT_TRACE_* key but two booleans, and the three Trace2 targets; the other
@@ -221,8 +225,13 @@ DECLARED = re.compile(r'[A-Za-z_]\w*(\[[^]]*\])?\+?=')  # declare's assignment, 
 UNKNOWN = '\0'
 STDIN_RULE = ('a shell here reads its commands from stdin, which this guard cannot see; pass them to `-c`, run them as '
               'plain words, or dispatch to a unit')
-# a script operand naming a descriptor (/dev/stdin, /dev/fd/0, /proc/self/fd/0) reads the commands piped in
-STDIN_PATH = re.compile(r'(^|/)(stdin|fd/\d+)$')
+# a script operand naming a descriptor (/dev/stdin, /dev/fd/0, /proc/self/fd/0), or a bare number from a descriptor
+# directory as the cwd or in PATH, reads the commands piped in
+STDIN_PATH = re.compile(r'(^|/)(stdin|\d+)$')
+# a PATH assignment anywhere in the call: `source`, `.` and bash search it for a slash-less script operand
+PATH_SET = re.compile(r'(?<![\w$])PATH\+?=')
+# bash expands a tilde leading a word or following `=` or `:` in it
+TILDE = re.compile(r'(^|[=:])~')
 WRITE_RULE = 'chief writes only its artifacts, named by a literal absolute path outside the task worktree; a worktree change goes to a writer'
 LINK_RULE = ('on Windows a link to the task worktree is a path this guard cannot follow; a link names a literal absolute '
              'source outside it, not one holding it') if os.name == 'nt' else \
@@ -463,7 +472,7 @@ def operators(token):
 
 class Guard:
     def __init__(self, payload):
-        self.payload, self.root, self.evaluated = payload, None, False
+        self.payload, self.root, self.evaluated, self.path_set = payload, None, False, False
 
     def inside(self, path, ancestors=False):
         """Is this absolute path in the worktree, chief's own directory apart, or with ancestors one holding it; the
@@ -496,6 +505,8 @@ class Guard:
     def command(self, command, depth=0):
         if not isinstance(command, str):
             raise TypeError(f'the command is a {type(command).__name__}')  # lexed() would read a list's items
+        if depth == 0:
+            self.path_set = bool(PATH_SET.search(command))
         self.frame(*lexed(command)[:2], depth)
 
     def frame(self, text, subs, depth):
@@ -598,7 +609,7 @@ class Guard:
         if cmd in SHELLS:
             return self.shell(args, depth)
         if cmd in ('source', '.'):
-            return script(args[1:] if args[:1] == ['--'] else args)
+            return script(args[1:] if args[:1] == ['--'] else args, self.path_set)
         if cmd == 'eval':
             self.evaluated = True
             return self.command(code(args), depth + 1)
@@ -703,7 +714,7 @@ class Guard:
             command = command or 'c' in a[1:] and not a.startswith('--')
         if command:
             return self.command(code(args[k:k + 1]), depth + 1)
-        script(args[k:])
+        script(args[k:], self.path_set)
 
     def find_exec(self, args, depth):
         """`find -exec`/`-execdir`/`-ok`/`-okdir` runs a command on the paths it finds, known only at run time: only a
@@ -756,21 +767,24 @@ def expanded(word):
 def code(words):
     """The `-c` or eval words as the inner shell reads them, joined; one the outer shell expands first, by a variable, a
     substitution, a tilde, a glob or a brace list, is denied, since a value there becomes commands."""
-    if any(expanded(w) or re.search(r'(^|[=:])~', w) for w in words):
+    if any(expanded(w) or TILDE.search(w) for w in words):
         raise Denied('this string is expanded before bash runs it as commands, so a value becomes commands this guard '
                      'cannot see; single-quote it')
     return ' '.join(words).translate(UNQUOTED)
 
 
-def script(operands):
-    """A shell's or `source`'s script operand, not followed like any program's file, unless it is stdin or a value
-    known only at run time."""
+def script(operands, path_set):
+    """A shell's or `source`'s script operand, not followed like any program's file, unless it is stdin, a value
+    known only at run time, or a slash-less name searched in a PATH the same call sets."""
     operand = operands[0] if operands else None
-    if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
-        raise Denied(STDIN_RULE)
-    if expanded(operand) or operand.startswith('~'):
+    if operand is not None and (expanded(operand) or TILDE.search(operand)):
         raise Denied('this script is a value known only at run time (a substitution, a variable, a tilde or a glob), '
                      'which this guard cannot read; name the script file, a tilde or glob character quoted')
+    if operand is None or operand == '-' or STDIN_PATH.search(posixpath.normpath(operand.translate(UNQUOTED))):
+        raise Denied(STDIN_RULE)
+    if path_set and '/' not in operand.translate(UNQUOTED):
+        raise Denied('this script is searched in the PATH this command sets, which may resolve it to stdin; name it by a '
+                     'path with a `/`')
 
 
 def spelled(args, longs, letters, valued='', valued_longs=None):

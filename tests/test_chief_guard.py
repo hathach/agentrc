@@ -538,6 +538,30 @@ class ChiefGuard(unittest.TestCase):
                   'sh -ec -x "git log"', "bash '~/s.sh'", 'bash \\~/s.sh'):
             self.assert_allowed(c)
 
+    def test_stdin_reached_through_the_environment_path_or_cwd_is_denied(self):
+        # bash sources BASH_ENV, searches PATH for a slash-less script, and reads a bare number in /dev/fd as stdin
+        for c, named in (("printf 'git push' | BASH_ENV=/dev/stdin bash -c true", 'BASH_ENV'),
+                         ("HOME=/dev; printf 'git push' | BASH_ENV=~/stdin bash -c :", 'BASH_ENV'),
+                         ("export BASH_ENV=/dev/stdin; printf 'git push' | bash -c true", 'BASH_ENV'),
+                         ("printf 'git push' | env BASH_ENV=/dev/stdin bash -c true", 'BASH_ENV'),
+                         ("printf 'git push' | PATH=/dev/fd source 0", 'stdin'),
+                         ("printf 'git push' | PATH=/dev/fd . 0", 'stdin'),
+                         ("printf 'git push' | PATH=/dev/fd /bin/bash 0", 'stdin'),
+                         ("printf 'git push' | { cd /dev/fd; bash 0; }", 'stdin'),
+                         ("printf 'git push' | { cd /proc/self/fd && source ./0; }", 'stdin'),
+                         ('PATH=/tmp/links source s.sh', 'PATH'), ('export PATH=/tmp/links; bash s.sh', 'PATH'),
+                         ("bash -c 'PATH=/tmp/links; . s.sh'", 'PATH'), ('env PATH+=:/tmp/links sh s.sh', 'PATH'),
+                         # bash tilde-expands after `=` in a word shaped like an assignment
+                         ('HOME=/dev/fd; bash a=~/0', 'tilde'), ('source a=~/0', 'tilde'), ('. a:~/s.sh', 'tilde'),
+                         # an interactive shell, the only one reading ENV, is never passed
+                         ("printf 'git push' | ENV=/dev/stdin sh -i", 'shell option')):
+            with self.subTest(c=c):
+                self.assert_denied(c, named)
+        for c in ('PATH=/tmp/bin source /tmp/env.sh', 'export PATH=/tmp/bin; bash ./s.sh', 'source s.sh', 'bash s.sh',
+                  'ENV=dev bash -c true', 'bash /tmp/a=b.sh'):
+            with self.subTest(c=c):
+                self.assert_allowed(c)
+
     def test_aliases_are_denied(self):
         for c in ('shopt -s expand_aliases', 'shopt -qs expand_aliases', 'shopt -s -q expand_aliases',
                   'shopt expand_aliases && git log', "bash -c 'shopt -s expand_aliases'", "alias g='git push'",
