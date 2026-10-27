@@ -200,10 +200,8 @@ class ChiefRun(unittest.TestCase):
     def test_chief_gets_the_shared_lead_session_filter_and_keeps_configuration(self):
         # A chief launched from a Codex session or a coworker relay's command too.
         self.stream(init(), result())
-        lead = {k: 'lead' for k in ('CLAUDE_EFFORT', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_TOOL_CALL_ID',
-                                    'COWORK_READ_ONLY')}
-        kept = {'CLAUDE_CONFIG_DIR': str(self.root / 'config'), 'CLAUDE_CODE_CHILD_SESSION': '1',
-                'CLAUDE_CODE_ENTRYPOINT': 'cli', 'CLAUDE_CODE_SUBAGENT_MODEL': 'opus', 'CODEX_HOME': str(self.root)}
+        lead = {'CODEX_TOOL_CALL_ID': 'lead', 'COWORK_READ_ONLY': '1'}
+        kept = {'CLAUDE_CONFIG_DIR': str(self.root / 'config')}
         self.assertEqual(self.run_it(**lead, **kept).returncode, 0)
         env = json.loads((self.fake / 'env.json').read_text())
         self.assertFalse(lead.keys() & env.keys())

@@ -13,10 +13,12 @@ from helpers import guard_survivors  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / 'skills' / 'cowork' / 'scripts' / 'coworker_guard.py'
+spec = importlib.util.spec_from_file_location('coworker_guard', SCRIPT)
+guard = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(guard)
 spec = importlib.util.spec_from_file_location('cowork', SCRIPT.with_name('cowork.py'))
 cowork = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cowork)
-PREFIX = f'export {cowork.READ_ONLY}=1; readonly {cowork.READ_ONLY}'   # what every command runs after
 
 
 def setUpModule():
@@ -38,7 +40,7 @@ class HookTest(unittest.TestCase):
         self.assertEqual((done.returncode, done.stderr), (0, ''))
         out = json.loads(done.stdout)['hookSpecificOutput']
         self.assertEqual(out['hookEventName'], 'PreToolUse')
-        self.assertEqual(out['updatedInput'], {'command': f'{PREFIX}\n{command}', 'timeout': 600000,
+        self.assertEqual(out['updatedInput'], {'command': f'{guard.PREFIX}\n{command}', 'timeout': 600000,
                                                'run_in_background': True})
 
     def rewritten_run(self, command):
@@ -52,15 +54,14 @@ class HookTest(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'needs a POSIX bash')
     def test_a_heredoc_task_naming_the_marker_reaches_the_script_with_it_set(self):
         script = 'import os, sys; print(repr(os.environ.get(sys.argv[1])), sys.stdin.read(), end="")'
-        task = f'Review {cowork.READ_ONLY} handling in cowork.py.\n'
-        ran = self.rewritten_run(f"{sys.executable} -c '{script}' {cowork.READ_ONLY} <<'END'\n{task}END")
+        task = f'Review {guard.MARKER} handling in cowork.py.\n'
+        ran = self.rewritten_run(f"{sys.executable} -c '{script}' {guard.MARKER} <<'END'\n{task}END")
         self.assertEqual(ran.stdout, f"'1' {task}", ran.stderr)
 
     @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'needs a POSIX bash')
     def test_an_unset_or_assignment_after_the_prefix_leaves_the_marker_set(self):
-        show = f"{sys.executable} -c 'import os, sys; print(os.environ.get(sys.argv[1]))' {cowork.READ_ONLY}"
-        for command in (f'unset {cowork.READ_ONLY}; {show}', f'{cowork.READ_ONLY}= {show}',
-                        f'{cowork.READ_ONLY}=0; {show}'):
+        show = f"{sys.executable} -c 'import os, sys; print(os.environ.get(sys.argv[1]))' {guard.MARKER}"
+        for command in (f'unset {guard.MARKER}; {show}', f'{guard.MARKER}= {show}', f'{guard.MARKER}=0; {show}'):
             with self.subTest(command):
                 ran = self.rewritten_run(command)
                 self.assertIn('readonly variable', ran.stderr)
@@ -86,9 +87,6 @@ class DeclarationTest(unittest.TestCase):
         self.assertEqual(entry['command'], f'python3 ~/.claude/skills/cowork/scripts/{SCRIPT.name}')
 
     def test_the_hook_exports_the_marker_cowork_reads(self):
-        spec = importlib.util.spec_from_file_location('coworker_guard', SCRIPT)
-        guard = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(guard)
         self.assertEqual(guard.MARKER, cowork.READ_ONLY)
 
     def test_script_is_executable(self):

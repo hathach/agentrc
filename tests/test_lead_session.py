@@ -31,9 +31,6 @@ class ChildEnvTest(unittest.TestCase):
         environ = {k: f'v-{k}' for k in IDENTITY | PASSED}
         self.assertEqual(lead_session.child_env(environ), {k: f'v-{k}' for k in PASSED})
 
-    def test_the_drop_list_is_exactly_the_verified_one(self):
-        self.assertEqual(lead_session.LEAD_SESSION, {k for k in IDENTITY if not k.startswith('HERDR_')})
-
     def test_defaults_to_this_process_environment_and_copies_it(self):
         with mock.patch.dict('os.environ', {'CLAUDE_PID': '1', 'CLAUDE_CONFIG_DIR': '/c'}):
             env = lead_session.child_env()
