@@ -75,7 +75,7 @@ def _wget(url: str, timeout: int, accept: str) -> tuple:
 def _curl(url: str, timeout: int, accept: str) -> tuple:
     """-> (payload, final HTTP status), both empty when no response completed."""
     # -g is mandatory: NXP's brace-wrapped query is a literal path segment. No -L: a
-    # redirect stays its own 3xx status, a failed fetch rather than a missing document.
+    # redirect is not followed, so it never reads as a missing document.
     p = subprocess.run(["curl", "-sg", "--compressed", "-m", str(timeout), "-A", UA,
                         "-H", f"Accept: {accept}", "-w", "\n%{http_code}", url], capture_output=True)
     if p.returncode:
