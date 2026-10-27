@@ -923,9 +923,13 @@ class UsbIndex:
             return None
         return v
 
-    def set(self, vendor: str, family: str, usb, source: str, evidence: str = "", **extra):
-        self.data[f"{vendor}:{family}"] = {"usb": usb, "source": source,
-                                           "evidence": evidence[:120], **extra}
+    def set(self, vendor: str, family: str, usb, source: str, evidence: str = "",
+            complete: bool = False):
+        """`complete`: read from a whole default scope that enumerated in full (see get)."""
+        entry = {"usb": usb, "source": source, "evidence": evidence[:120]}
+        if complete:
+            entry["complete"] = True
+        self.data[f"{vendor}:{family}"] = entry
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True), encoding="utf-8")
 

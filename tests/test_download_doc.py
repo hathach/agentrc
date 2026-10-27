@@ -1580,6 +1580,23 @@ class UsbResolution(unittest.TestCase):
         self.assertEqual(index.get('st', 'STM32X0')['usb'], None)
         self.assertEqual(index.get('st', 'STM32X0')['source'], 'pdf:sampled 6/8')
 
+    def test_only_a_negative_set_complete_is_kept_as_a_verdict(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / 'usb.json'
+        index = doclib.UsbIndex(path)
+        index.set('st', 'STM32X0', False, 'pdf:3 docs', 'no USB peripheral found', complete=True)
+        index.set('st', 'STM32Y0', False, 'pdf:3 docs', 'no USB peripheral found')
+        index.set('st', 'STM32Z0', True, 'vendor index', 'USB OTG')
+        self.assertEqual(json.loads(path.read_text()), {
+            'st:STM32X0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'no USB peripheral found',
+                           'complete': True},
+            'st:STM32Y0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'no USB peripheral found'},
+            'st:STM32Z0': {'usb': True, 'source': 'vendor index', 'evidence': 'USB OTG'}})
+        index = doclib.UsbIndex(path)
+        self.assertEqual([index.get('st', f) is not None for f in ('STM32X0', 'STM32Y0', 'STM32Z0')],
+                         [True, False, True])
+
     def test_a_manual_whose_text_cannot_be_extracted_is_unread_not_usb_less(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
