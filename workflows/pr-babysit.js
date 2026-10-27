@@ -1307,6 +1307,8 @@ const buildCheck = async (tag, owned) => {
         "command = the shell command, run from the checkout's top level, that builds what these paths affect, with `<BUILD>` where the contract takes a fresh build directory; " +
         'setup = the shell lines the contract says must run first in the same shell (sourcing a toolchain\'s environment script, say), else null; ' +
         'requires = the executables command runs that setup or the system must put on PATH, each a bare name; ' +
+        // #309: a wrapper building one board per family needed Espressif's export.sh and idf.py, and a missing idf.py failed the batch.
+        'when command builds several targets or board families, a wrapper script\'s included, setup and requires hold every one\'s: each family\'s own setup the contract names (such as `. "$IDF_PATH/export.sh"` before an Espressif build) and each tool its build invokes, through the wrapper too (such as idf.py), so a missing one stops the shell before the build; ' +
         'contract = every instruction, doc and build-system file you read the contract from, any of these paths among them; command = null, with reason, when no build applies to these paths; error = why the contract could not be resolved, else null.',
         { label: `build:resolve#${tag}`, phase: 'Fix', model: 'sonnet', schema: BUILD_PLAN },
       ).catch(quiet(`build:resolve#${tag}`))

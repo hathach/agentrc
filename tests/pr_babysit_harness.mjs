@@ -1311,6 +1311,20 @@ test('a contract setup and its tools go to build.py, and a shell that stopped be
   assert.match(unknown.result.detail, /the build did not count: the receipt names no step it stopped in \("elsewhere"\)/)
 })
 
+test('the resolver is asked for every built family\'s setup and wrapper tools, and a family\'s absent tool is unverifiable (#309)', async () => {
+  const buildPlan = {
+    command: 'python3 tools/check_build.py --scope hw/bsp/ch32v30x/family.c', setup: '. "$IDF_PATH/export.sh"',
+    requires: ['python3', 'riscv-none-elf-gcc', 'idf.py'],
+  }
+  const { result, calls } = await run({ reviews: oneValid, buildPlan, candidate: { stage: 'prerequisite', exit: 127 } })
+  const resolve = calls.find(c => c.label === 'build:resolve#1-review').prompt
+  assert.match(resolve, /several targets or board families, a wrapper script's included, setup and requires hold every one's/)
+  assert.match(resolve, /each tool its build invokes, through the wrapper too \(such as idf\.py\)/)
+  assert.match(calls.find(c => c.label === 'build#1-review').prompt, /--setup='\. "\$IDF_PATH\/export\.sh"' --require='python3' --require='riscv-none-elf-gcc' --require='idf\.py'`/)
+  assert.equal(result.reason, 'build-unverifiable', 'not fix-verification-failed')
+  assert.match(result.detail, /its prerequisite step stopped the shell \(exit 127\)/)
+})
+
 test('a batch no build applies to is published with the reason logged', async () => {
   const { result, labels, logs } = await run({ reviews: oneValid, buildPlan: { command: null, reason: 'docs only' } })
   assert.equal(result.history[0].reviewPush.pass, true)

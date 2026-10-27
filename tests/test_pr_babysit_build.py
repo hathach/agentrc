@@ -143,6 +143,9 @@ class BuildTest(unittest.TestCase):
             self.assertFalse((self.repo / 'built').exists(), argv)
         _, out = self.run_script('--path=.', '--require=no-such-tool', '--command', 'true')
         self.assertIn('missing tool: no-such-tool', Path(out['log']).read_text())
+        # The limit: a tool only the command's wrapper runs, named in no --require, is found missing by the build itself.
+        _, out = self.run_script('--path=.', '--command', 'sh -c no-such-tool')
+        self.assertEqual((out['stage'], out['exit']), ('build', 127))
 
     def test_a_build_that_fails_or_kills_its_shell_is_a_build_failure(self):
         for command, exit in (('exit 3', 3), ('kill -9 $$', -9)):

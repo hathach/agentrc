@@ -76,8 +76,11 @@ listed here throws before anything runs.
   that the repository hooks validate it.
 - `build`: verify command, `<BUILD>` for a fresh build directory, carrying any
   environment setup it needs; default the repository's build contract, its
-  setup and the tools it requires resolved with it, a missing one stopping
-  `build-unverifiable` rather than failing the batch; per launch.
+  setup and the tools it requires resolved with it, every built target's or
+  board family's included, a missing one stopping `build-unverifiable` rather
+  than failing the batch; per launch. Only a tool the resolver names is checked
+  before the build: one only a build wrapper invokes and the contract never
+  names still fails the build as unverified.
 - `ciWait`: minutes to wait on pending checks, default 30. CodeRabbit's own
   check is left out when coderabbit is in `autoRun` and the review lane runs:
   the review lane waits on it. A head with no other check registered settles
