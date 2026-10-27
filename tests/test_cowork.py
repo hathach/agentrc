@@ -721,6 +721,22 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(call['cwd'], str(self.root))
         self.assertEqual(set(call['env']), {'COWORK_TURN'}, 'no HERDR_* and no CLAUDECODE reach the coworker')
 
+    def test_the_coworker_gets_the_shared_lead_session_filter_and_keeps_configuration(self):
+        seen = Path(self.tmp.name) / 'env.json'
+        self.codex_does(f"open({str(seen)!r}, 'w').write(json.dumps(dict(os.environ)))")
+        lead = {k: 'lead' for k in ('CLAUDE_PID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_SESSION_ATTENDED',
+                                    'CLAUDE_EFFORT', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
+                                    'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID',
+                                    'CODEX_TOOL_CALL_ID', cowork.READ_ONLY)}
+        kept = {'CLAUDE_CONFIG_DIR': str(Path(self.tmp.name) / 'config'), 'CLAUDE_CODE_CHILD_SESSION': '1',
+                'CLAUDE_CODE_ENTRYPOINT': 'cli', 'CLAUDE_CODE_SUBAGENT_MODEL': 'opus'}
+        code, request, _, err = self.send('--lane', 'review', '--task', 'x', **lead, **kept)
+        self.assertEqual(code, 0, err)
+        env = json.loads(seen.read_text())
+        self.assertFalse((lead.keys() | {'CLAUDECODE'}) & env.keys(), 'the relay\'s marker included')
+        self.assertEqual({k: env.get(k) for k in kept}, kept)
+        self.assertEqual((env['COWORK_TURN'], env['CODEX_HOME']), (request, os.environ['CODEX_HOME']))
+
     def test_task_sources(self):
         task = self.root / 'task.md'
         task.write_text('from file')

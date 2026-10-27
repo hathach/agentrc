@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_cost  # noqa: E402
 from shadows import on_path, refusal  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import lead_session  # noqa: E402
 import windows  # noqa: E402
 
 MARKER = 'chief: '
@@ -137,14 +138,9 @@ def stop(child):
     windows.kill_tree(child, 10)
 
 
-# the caller's session: chief inheriting it would run as nested in, pass for, or message as the lead
-LEAD_SESSION = {'CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_MESSAGING_SOCKET',
-                'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_BRIDGE_SESSION_ID', 'CLAUDE_CODE_SESSION_ATTENDED'}
-
-
 def child_env():
-    # a fresh top-level session: the caller's pane variables would let pane-keyed hooks act on its pane
-    env = {k: v for k, v in os.environ.items() if k not in LEAD_SESSION and not k.startswith('HERDR_')}
+    # a fresh top-level session: inheriting the caller's, chief would run as nested in, pass for, or message as the lead
+    env = lead_session.child_env()
     env['CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS'] = '0'   # else -p kills units still running 10 min after chief's turn ends
     return env
 

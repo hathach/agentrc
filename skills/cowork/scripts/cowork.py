@@ -91,6 +91,7 @@ except ImportError:  # Windows: the nt_* backend below
 
 AGENTRC = Path(__file__).resolve().parents[3]   # the agentrc checkout this script runs from
 sys.path.insert(0, str(AGENTRC / 'lib'))
+import lead_session  # noqa: E402
 import windows  # noqa: E402
 
 SIDES = ('codex', 'claude')
@@ -842,8 +843,7 @@ def run(side, box, host, request, no_edit, lock_fd):
                          box.name, where)
         task.unlink()
         argv, new_session = command(side, session, reply, no_edit, model, effort)
-        env = {k: v for k, v in os.environ.items()  # the coworker is nobody's driver
-               if not k.startswith('HERDR_') and k not in ('CLAUDECODE', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID')}
+        env = lead_session.child_env()  # the coworker is nobody's driver
         env['COWORK_TURN'] = request  # tells the simplify gate to stay out
         before = tree_state(root) if no_edit else None  # unreadable: an error, and no turn
         with tempfile.TemporaryFile() as stdin, stream.open('ab') as out:
