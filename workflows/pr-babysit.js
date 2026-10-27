@@ -1705,7 +1705,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   )
   // A lost or error copy is recovered from the script's own receipt, never by a second commit; with none, the HEAD read-back settles it, else committed stays null.
   let lost = made ? made.error : 'commit agent died'
-  const receipt = !made || made.error ? await readCommitReceipt(commitLabel, receiptFile, scope) : null
+  const receipt = lost ? await readCommitReceipt(commitLabel, receiptFile, scope) : null
   if (receipt) {
     log(`${commitLabel}: recovered from the commit script's receipt: ${receipt.committed ? `committed ${receipt.sha.slice(0, 7)}` : 'no commit'} — ${receipt.detail}`)
     lost = null
