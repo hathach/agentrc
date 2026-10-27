@@ -19,13 +19,18 @@ import doclib  # noqa: E402
 import retitle  # noqa: E402
 import sync  # noqa: E402
 import titles  # noqa: E402
+import vendor_allwinner  # noqa: E402
 import vendor_arm  # noqa: E402
+import vendor_espressif  # noqa: E402
+import vendor_geehy  # noqa: E402
 import vendor_hpmicro  # noqa: E402
 import vendor_microchip  # noqa: E402
 import vendor_nxp  # noqa: E402
 import vendor_renesas  # noqa: E402
+import vendor_silabs  # noqa: E402
 import vendor_st  # noqa: E402
 import vendor_ti  # noqa: E402
+import vendor_wch  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from helpers import guard_survivors  # noqa: E402
 
@@ -489,9 +494,10 @@ class TiParts(unittest.TestCase):
     """Named parts replace the BSP scan; a named part with no datasheet is an error."""
 
     def setUp(self):
-        saved = (vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp)
+        saved = (vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp, vendor_ti.absent)
         self.addCleanup(lambda: setattr_all(saved))
         vendor_ti.last_modified = lambda url: 'Fri, 27 Mar 2026 05:34:41 GMT'
+        vendor_ti.absent = lambda url: True
         vendor_ti._parts_from_bsp = lambda: self.fail('BSP scanned despite named parts')
 
     def serve(self, *present):
@@ -784,7 +790,7 @@ class AddOne(unittest.TestCase):
 
 
 def setattr_all(saved):
-    vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp = saved
+    vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp, vendor_ti.absent = saved
 
 
 
@@ -1257,7 +1263,8 @@ class VendorSync(unittest.TestCase):
     def test_a_recorded_negative_is_honoured(self):
         cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
         cache.parent.mkdir(parents=True)
-        cache.write_text(json.dumps({'st:STM32X0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'old'}}))
+        cache.write_text(json.dumps({'st:STM32X0': {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'old',
+                                                    'complete': True}}))
         self.docs = [st_doc(f'DS{n}', ['STM32X0']) for n in range(1, 4)]
         self.adapter('st')
         self.peek_usb_in('DS1')
@@ -1265,6 +1272,89 @@ class VendorSync(unittest.TestCase):
         self.assertEqual(code, 1, err)
         self.assertIn('left out: 3 document(s)', err)
         self.assertEqual(json.loads(cache.read_text())['st:STM32X0']['source'], 'pdf:3 docs')
+
+    def test_a_negative_recorded_before_adapters_reported_partial_lists_is_read_again(self):
+        cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
+        cache.parent.mkdir(parents=True)
+        stale = {'usb': False, 'source': 'pdf:3 docs', 'evidence': 'old'}
+        self.docs = [st_doc(f'DS{n}', ['STM32X0']) for n in range(1, 5)]
+        self.adapter('st')
+        self.peek_usb_in('none')
+        cache.write_text(json.dumps({'st:STM32X0': stale}))
+        code, out, err = run_sync('st', '--types', 'datasheet')
+        self.assertEqual((code, out.count('NEW       ')), (0, 4), err)
+        self.assertEqual(json.loads(cache.read_text())['st:STM32X0'], stale)
+        self.peek_usb_in('DS4')
+        code, out, err = run_sync('st')
+        self.assertEqual((code, out.count('NEW       ')), (0, 4), err)
+        self.assertIs(json.loads(cache.read_text())['st:STM32X0']['usb'], True)
+
+    def st_grids(self, grids, failing=()):
+        """vendor_st over `grids` {grid id: (family, [doc ids])}, its cache under self.root, `failing` unreachable."""
+        def http_get(url, *a, **k):
+            gid = url.rsplit('/', 1)[1].split('.')[0]
+            if gid in failing:
+                raise RuntimeError('fetch failed')
+            return json.dumps({'rows': [{'resourceType': 'Datasheet', 'title': d, 'version': '1.0',
+                                         'localizedLinks': {'en': f'/{d}.pdf'}} for d in grids[gid][1]]}).encode()
+        shutil.rmtree(self.root / 'st', ignore_errors=True)
+        for name, value in (('SERIES', {g: fam for g, (fam, _) in grids.items()}), ('CACHE', self.root / 'st'),
+                            ('http_get', http_get), ('ENUMERATION_COMPLETE', True)):
+            patch = unittest.mock.patch.object(vendor_st, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        sync.enumerate_vendor = self.enumerate_vendor
+
+    def test_a_grid_st_could_not_fetch_records_no_negative(self):
+        cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
+        self.peek_usb_in('none')
+        grids = {'SS1': ('STM32X0', ['DS1', 'DS2', 'DS3']), 'SS2': ('STM32Y0', ['DS9'])}
+        with unittest.mock.patch.object(vendor_st.time, 'sleep', lambda s: None):
+            self.st_grids(grids, failing={'SS2'})
+            code, out, err = run_sync('st')
+            self.assertEqual((code, out.count('NEW       ')), (0, 3), err)
+            self.assertIn('enumeration incomplete', err)
+            self.assertFalse(cache.exists())
+            self.st_grids(grids, failing={'SS1', 'SS2'})
+            code, _, err = run_sync('st')
+            self.assertEqual(code, 1)
+            self.assertIn('st: enumeration failed (see above) — nothing to plan', err)
+            # The default types are the default scope; the same list named explicitly narrows the run.
+            self.st_grids(grids)
+            code, _, err = run_sync('st', '--types', ','.join(sorted(doclib.TECHNICAL_TYPES)))
+            self.assertEqual(code, 0, err)
+            self.assertFalse(cache.exists())
+            code, _, err = run_sync('st')
+            self.assertEqual(code, 0, err)
+            self.assertNotIn('enumeration incomplete', err)
+        verdicts = json.loads(cache.read_text())
+        self.assertEqual((verdicts['st:STM32X0']['usb'], verdicts['st:STM32X0']['complete']), (False, True))
+
+    def test_a_failed_page_recovers_on_the_next_run(self):
+        # Page two holds the one document showing USB; a run without it must not settle the family.
+        cache = self.root / '.cache' / 'download-doc' / 'usb-capability.json'
+
+        def nxp_run(fail):
+            def page(tax, device_tax, start):
+                if tax != vendor_nxp.TYPE_TAX['datasheet']:
+                    return {'totalcount': 0, 'results': []}
+                if start and fail:
+                    raise RuntimeError('HTTP 503')
+                codes = ['LPC99DS0', 'LPC99DS1', 'LPC99DS2'] if not start else ['LPC99DS3']
+                return {'totalcount': 4, 'results': [
+                    {'metaData': {'code': c}, 'url': f'https://nxp.com/{c}.pdf', 'title': c} for c in codes]}
+            with unittest.mock.patch.object(vendor_nxp, '_page', page), \
+                    unittest.mock.patch.object(vendor_nxp.time, 'sleep', lambda s: None), \
+                    unittest.mock.patch.object(vendor_nxp, 'ENUMERATION_COMPLETE', True):
+                return run_sync('nxp')
+        sync.enumerate_vendor = self.enumerate_vendor
+        self.peek_usb_in('LPC99DS3')
+        code, out, err = nxp_run(fail=True)
+        self.assertEqual((code, out.count('NEW       ')), (0, 3), err)
+        self.assertFalse(cache.exists())
+        code, out, err = nxp_run(fail=False)
+        self.assertEqual((code, out.count('NEW       ')), (0, 4), err)
+        self.assertIs(json.loads(cache.read_text())['nxp:LPC99']['usb'], True)
 
     def test_a_failed_index_page_does_not_exclude_a_family_from_later_runs(self):
         # Three readable datasheets without USB settle "no USB", unless a page went missing.
@@ -1333,6 +1423,79 @@ class UsbResolution(unittest.TestCase):
                 self.assertIsNone(index.peek(rm, Path(tmp.name)))
                 self.assertIsNone(index.resolve('st', 'STM32X0', [rm], Path(tmp.name), complete=True))
                 self.assertFalse((Path(tmp.name) / f'{name}.json').exists())
+
+
+class EnumerationComplete(unittest.TestCase):
+    """An adapter whose fetch failed says its list is partial; a 404 or an empty answer is the vendor's own."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+
+    def patch(self, mod, **attrs):
+        for name, value in {'ENUMERATION_COMPLETE': True, **attrs}.items():
+            patch = unittest.mock.patch.object(mod, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def complete(self, mod, http_get, **kw):
+        """mod.enumerate_docs(**kw) with http_get answering -> its ENUMERATION_COMPLETE afterwards."""
+        with unittest.mock.patch.object(mod, 'http_get', http_get), \
+                contextlib.redirect_stderr(io.StringIO()):
+            mod.enumerate_docs(**kw)
+        return mod.ENUMERATION_COMPLETE
+
+    @staticmethod
+    def fails(*a, **k):
+        raise RuntimeError('fetch failed')
+
+    def test_an_adapter_with_one_index_page_reports_its_failure(self):
+        cases = {vendor_allwinner: lambda *a, **k: b'<html>' + b' ' * 3000,
+                 vendor_wch: lambda *a, **k: b'{"code": 1}',
+                 vendor_st: lambda *a, **k: b'{"rows": []}'}
+        self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
+        sleep = unittest.mock.patch.object(vendor_st.time, 'sleep', lambda s: None)
+        sleep.start()
+        self.addCleanup(sleep.stop)
+        for mod, answers in cases.items():
+            with self.subTest(mod.__name__):
+                self.patch(mod)
+                self.assertFalse(self.complete(mod, self.fails, refresh=True))
+                self.assertTrue(self.complete(mod, answers, refresh=True))
+
+    def test_st_falls_back_to_its_cached_grid(self):
+        self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
+        (self.root / 'st').mkdir()
+        (self.root / 'st' / 'SS1.json').write_text('{"rows": []}')
+        self.assertTrue(self.complete(vendor_st, self.fails, refresh=True))
+
+    def test_espressif_reports_a_document_page_it_could_not_fetch(self):
+        row = ('<tr><td class="views-field-title">ESP32-S3 Datasheet</td>'
+               '<a href="https://docs.espressif.com/esp32-s3/ds.html">x</a></tr>')
+        self.patch(vendor_espressif, _index_html=lambda refresh: row)
+        self.assertFalse(self.complete(vendor_espressif, self.fails))
+        self.assertTrue(self.complete(vendor_espressif, lambda *a, **k: b'<html><a href="ds.pdf"></a></html>'))
+
+    def test_a_probing_adapter_tells_a_missing_document_from_a_failed_fetch(self):
+        cases = {vendor_silabs: dict(_families_from_bsp=lambda: {'efm32gg12'}),
+                 vendor_ti: dict(_parts_from_bsp=lambda: {'tm4c123gh6pm': 'TM4C'}),
+                 vendor_geehy: dict(VERSIONS=['V1.0'])}
+        for mod, attrs in cases.items():
+            with self.subTest(mod.__name__):
+                self.patch(mod, **attrs)
+                for missing in (True, False):
+                    with unittest.mock.patch.object(mod, 'absent', lambda url: missing):
+                        self.assertEqual(self.complete(mod, self.fails), missing)
+
+    def test_nxp_reports_an_empty_page_short_of_its_total(self):
+        self.patch(vendor_nxp, PACE_SECONDS=0)
+        for total, complete in ((5, False), (0, True)):
+            with self.subTest(total), \
+                    unittest.mock.patch.object(vendor_nxp, '_page', lambda *a: {'totalcount': total, 'results': []}), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                vendor_nxp.enumerate_docs(types=['errata'])
+                self.assertIs(vendor_nxp.ENUMERATION_COMPLETE, complete)
 
 
 class DocumentLimit(unittest.TestCase):

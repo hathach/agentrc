@@ -531,12 +531,15 @@ def main() -> int:
     print(f"enumerating {args.vendor} ...", file=sys.stderr)
     docs = enumerate_vendor(args.vendor, args)
     # An adapter that kept what it had past a failed fetch says so; the list is partial.
-    complete = complete and getattr(mod, "ENUMERATION_COMPLETE", True)
+    enumerated = getattr(mod, "ENUMERATION_COMPLETE", True)
+    complete = complete and enumerated
     if not docs:
-        # An empty list cannot tell a failed fetch from a scope that matches nothing;
-        # the adapter's own messages above are the only evidence of which.
-        print(f"{args.vendor}: no documents for the requested scope", file=sys.stderr)
+        print(f"{args.vendor}: no documents for the requested scope" if enumerated else
+              f"{args.vendor}: enumeration failed (see above) — nothing to plan", file=sys.stderr)
         return 1
+    if not enumerated:
+        print("note: enumeration incomplete (see above) — the plan is partial and no "
+              "family is recorded as USB-less from it", file=sys.stderr)
 
     # Resolve USB capability per family, peeking into one document per unresolved
     # family. Declared scopes and cached verdicts cost nothing; only genuinely unknown

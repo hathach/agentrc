@@ -127,6 +127,10 @@ def enumerate_docs(types=None, device=DEFAULT_DEVICE, limit=None) -> list:
             total = int(d.get("totalcount") or 0)
             results = d.get("results") or []
             if not results:
+                if start < total:
+                    print(f"  {kind}: page at {start} came back empty of {total}; keeping what we have",
+                          file=sys.stderr)
+                    ENUMERATION_COMPLETE = False
                 break
             for r in results:
                 md = r.get("metaData") or {}

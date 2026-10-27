@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from doclib import Doc, http_get, rev_newer   # noqa: E402
+from doclib import Doc, absent, http_get, rev_newer   # noqa: E402
 
 AUTHOR = "Geehy Semiconductor"
 BASE = "https://www.geehy.com/uploads/tool/"
@@ -34,6 +34,8 @@ NBSP = "%C2%A0"
 
 USB_SCOPE = None
 USB_SCOPE_NOTE = "USB capability is read from the part datasheet"
+# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
+ENUMERATION_COMPLETE = True
 
 # From hw/bsp/apm32f0xx. Add parts here as TinyUSB gains ports.
 PARTS = ["APM32F072x8xB"]
@@ -42,6 +44,8 @@ VERSIONS = [f"V{a}.{b}" for a in (1, 2) for b in range(0, 8)]
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
+    global ENUMERATION_COMPLETE
+    ENUMERATION_COMPLETE = True
     want = {f.upper() for f in families} if families else None
     best: dict = {}
     for part in PARTS:
@@ -58,6 +62,10 @@ def enumerate_docs(families=None, types=None, refresh=False) -> list:
                         http_get(url, timeout=20, accept="application/pdf",
                                  validate=lambda b: b.startswith(b"%PDF"))
                     except RuntimeError:
+                        # Most of the grid is 404 by design; anything else may hide a document.
+                        if not absent(url):
+                            print(f"  {url}: fetch failed", file=sys.stderr)
+                            ENUMERATION_COMPLETE = False
                         continue
                     key = (part, kind)
                     v = ver.lstrip("Vv")

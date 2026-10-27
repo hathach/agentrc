@@ -34,6 +34,8 @@ FILE = "https://www.wch-ic.com/download/file?id={}"
 
 USB_SCOPE = None
 USB_SCOPE_NOTE = "USB capability is read from each part's datasheet"
+# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
+ENUMERATION_COMPLETE = True
 
 # Seeds: TinyUSB ports these families, and each seed pulls in its relatives.
 SEEDS = ["CH32V307DS0_PDF.html", "CH32V203DS0_PDF.html", "CH32V103DS0_PDF.html",
@@ -55,16 +57,22 @@ def _kind(name: str) -> str | None:
 
 
 def _fetch(file_name: str) -> dict | None:
+    global ENUMERATION_COMPLETE
     try:
         d = http_get(API.format(file_name), timeout=30, accept="application/json",
                      validate=lambda b: b.lstrip()[:1] == b"{")
     except RuntimeError:
+        # Its relatives are reached only through this page, so the crawl is now partial.
+        print(f"  {file_name}: fetch failed", file=sys.stderr)
+        ENUMERATION_COMPLETE = False
         return None
     j = json.loads(d)
     return j.get("data") if j.get("code") == 0 else None
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
+    global ENUMERATION_COMPLETE
+    ENUMERATION_COMPLETE = True
     want = {f.upper() for f in families} if families else None
     seen, docs, queue, have = set(), [], deque(SEEDS), set()
     while queue:

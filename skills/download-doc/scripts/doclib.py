@@ -86,6 +86,14 @@ def last_modified(url: str) -> str | None:
     return None
 
 
+def absent(url: str) -> bool:
+    """Whether the server answers 404 or 410 for `url`: a probe that found no document,
+    as opposed to a fetch that failed and proves nothing."""
+    p = subprocess.run(["curl", "-sgIL", "--compressed", "-o", os.devnull, "-m", "25", "-A", UA,
+                        "-w", "%{http_code}", url], capture_output=True, text=True)
+    return p.stdout.strip() in ("404", "410")
+
+
 def http_get(url: str, timeout: int = 60, accept: str = "application/json",
              validate=None) -> bytes:
     """GET a URL, returning validated bytes. Raises RuntimeError if no client
@@ -825,11 +833,16 @@ class UsbIndex:
         self.data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
     def get(self, vendor: str, family: str):
-        return self.data.get(f"{vendor}:{family}")
+        v = self.data.get(f"{vendor}:{family}")
+        # A negative without `complete` predates adapters reporting a partial enumeration,
+        # so it may come from one: treat it as unresolved until a complete run re-reads it.
+        if v and v["usb"] is False and not v.get("complete"):
+            return None
+        return v
 
-    def set(self, vendor: str, family: str, usb, source: str, evidence: str = ""):
+    def set(self, vendor: str, family: str, usb, source: str, evidence: str = "", **extra):
         self.data[f"{vendor}:{family}"] = {"usb": usb, "source": source,
-                                           "evidence": evidence[:120]}
+                                           "evidence": evidence[:120], **extra}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, indent=1, sort_keys=True), encoding="utf-8")
 
@@ -907,7 +920,7 @@ class UsbIndex:
             return None
         self.set(vendor, family, False, f"pdf:{len(cands[:budget])} docs"
                  + (" incl. reference manual" if seen_rm else ""),
-                 "no USB peripheral found")
+                 "no USB peripheral found", complete=True)
         return False
 
     def peek(self, doc: "Doc", tmp: Path) -> bool | None:

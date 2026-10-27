@@ -28,6 +28,8 @@ PDF = re.compile(r"https://linux-sunxi\.org/images/[^\s\"']+\.pdf")
 
 USB_SCOPE = None
 USB_SCOPE_NOTE = "USB capability is read from the user manual"
+# False after an enumerate_docs() that lost a fetch: its list is partial (see sync.py).
+ENUMERATION_COMPLETE = True
 
 KIND = [
     (re.compile(r"user[_ -]?manual", re.I), "reference-manual"),
@@ -43,11 +45,14 @@ def _kind(name: str) -> str | None:
 
 
 def enumerate_docs(families=None, types=None, refresh=False) -> list:
+    global ENUMERATION_COMPLETE
+    ENUMERATION_COMPLETE = True
     try:
         html = http_get(PAGE, timeout=30, accept="text/html",
                         validate=lambda b: len(b) > 2000).decode("utf-8", "replace")
     except RuntimeError:
         print("  linux-sunxi wiki unreachable", file=sys.stderr)
+        ENUMERATION_COMPLETE = False
         return []
     want = {f.upper() for f in families} if families else None
     docs, seen = [], set()
