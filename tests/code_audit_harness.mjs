@@ -26,8 +26,8 @@ const confirmedAs = (f, id, over = {}) => {
 
 // Drive the workflow against stub agents keyed by label prefix. `scans` maps
 // "<dir>|<dim>" to a findings array (null = dead scanner); `verdicts` maps a
-// finding's `why` to real, or to a full verdict object (null = dead verifier). `reverse` makes later
-// verifiers of a batch resolve before earlier ones; `finished` records the
+// finding's `why` to real, or to a full verdict object (null = dead verifier). `reverse` holds the verifiers
+// called together and releases them one at a time, highest finding index first; `finished` records the
 // order in which verifiers actually returned. `scanDelay` holds a scan's reply for the given ms, and `returned`
 // records each scan's key as it replies.
 async function run(args, { scans = {}, verdicts = {}, reverse = false, batchReply = (label, ids, reply) => reply, scanDelay = {} } = {}) {
@@ -35,6 +35,15 @@ async function run(args, { scans = {}, verdicts = {}, reverse = false, batchRepl
   const calls = []
   const logs = []
   const finished = []
+  // Once every verifier started in this turn is held (setImmediate runs after the microtasks that start them),
+  // each is released after the previous one has returned.
+  const held = []
+  const inTurn = k => new Promise(release => {
+    if (!held.length) setImmediate(async () => {
+      for (const h of held.splice(0).sort((a, b) => b.k - a.k)) await new Promise(done => h.release(done))
+    })
+    held.push({ k, release })
+  })
   const agent = async (prompt, options) => {
     calls.push({ label: options.label, agentType: options.agentType, prompt: String(prompt), schema: options.schema, options })
     if (options.label.startsWith('scan:')) {
@@ -60,8 +69,9 @@ async function run(args, { scans = {}, verdicts = {}, reverse = false, batchRepl
       const f = JSON.parse(/^Finding: (.+)$/m.exec(prompt)[1])
       assert.ok(f.why in verdicts, `unstubbed verdict ${f.why}`)
       const real = verdicts[f.why]
-      if (reverse) await new Promise(r => setTimeout(r, 20 - 5 * Number(options.label.split(':')[2])))
+      const releaseNext = reverse ? await inTurn(Number(options.label.split(':')[2])) : () => {}
       finished.push(f.why)
+      releaseNext()
       return real === null ? null : typeof real === 'object' ? real : graded(real)
     }
     throw new Error(`unexpected label ${options.label}`)
