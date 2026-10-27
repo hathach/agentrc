@@ -141,7 +141,8 @@ class VerdictTest(unittest.TestCase):
         text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
         sample = {'<checkout>': '~/code/repo', '<N>': '12', '<owner>/<repo>': 'o/r', '<fields>': 'number,title',
                   '-n N': '-n 5', 'oneline|dated': 'dated', '<range>': 'main..topic', '<ref>': 'main',
-                  '<directory>': '~/.cache/chief-runs', '<prefix>': 'tinyusb-4165'}
+                  '<directory>': '~/.cache/chief-runs', '<prefix>': 'tinyusb-4165', '<word>': 'captain',
+                  '--limit N': '--limit 500'}
         found = re.findall(r'(python3 ~/\.claude/skills/captain/scripts/captain_read\.py [^`#\n]*)', text)
         self.assertGreaterEqual(len(found), 7)
         for cmd in found:
@@ -196,6 +197,18 @@ class VerdictTest(unittest.TestCase):
             self.assertIsNotNone(self.verdict('Bash', command=ok.replace('y.md', 'x.md')))
             self.assertIsNone(self.verdict('Write', file_path=str(drafts / 'y.md'), content='x'))
             self.assertIsNotNone(self.verdict('Write', file_path=str(drafts / 'x.md'), content='x'))
+
+    def test_the_skill_s_documented_publications_pass(self):
+        text = (Path(__file__).resolve().parents[1] / 'skills' / 'captain' / 'SKILL.md').read_text(encoding='utf-8')
+        sample = {'<title.md>': '~/.cache/agentrc/captain/drafts/herdr-title.md',
+                  '<body.md>': os.path.join(guard.DRAFTS, 'herdr.md'), '<N>': '313'}
+        found = re.findall(r'(python3 ~/\.claude/skills/followup-issue/scripts/publish\.py [^`#\n]*)', text)
+        self.assertEqual(len(found), 2)
+        for cmd in found:
+            for k, v in sample.items():
+                cmd = cmd.replace(k, v)
+            with self.subTest(cmd):
+                self.assertIsNone(self.verdict('Bash', command=cmd.strip()))
 
     def test_monitor_only_watches_a_command(self):
         self.assertIsNotNone(self.verdict('Monitor', ws={'url': 'wss://x'}))

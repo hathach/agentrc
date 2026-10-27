@@ -34,12 +34,15 @@ python3 ~/.claude/skills/captain/scripts/captain_read.py git -C <checkout> workt
 python3 ~/.claude/skills/captain/scripts/captain_read.py gh pr view <N> -R <owner>/<repo> [--json <fields>]
 python3 ~/.claude/skills/captain/scripts/captain_read.py gh pr checks <N> -R <owner>/<repo>
 python3 ~/.claude/skills/captain/scripts/captain_read.py list <directory> [<prefix>]   # newest first, e.g. chief runs
+python3 ~/.claude/skills/captain/scripts/captain_read.py gh issue list -R <owner>/<repo> --state all --search <word> [--limit N]
+python3 ~/.claude/skills/captain/scripts/captain_read.py gh issue view <N> -R <owner>/<repo> --json number,title,state,stateReason,body,comments
 ```
 
 A checkout is a path under `~/code` or `~/.herdr/worktrees`; also `branch`, `show`, `diff`, `rev-parse`,
-`merge-base`, `gh pr list|diff --name-only`, `gh issue view|list`, `gh run view|list`. A refusal says what the
-reader does not take. `list` prints a backslash, control character, line or paragraph separator or undecodable byte in
-a name as `\xNN`, so such a name may not open as printed.
+`merge-base`, `gh pr list|diff --name-only`, `gh run view|list`. An issue search takes one word of letters, digits,
+`.`, `_` or `-` per call, and lists up to 500 issues. A refusal says what the reader does not take. `list` prints a
+backslash, control character, line or paragraph separator or undecodable byte in a name as `\xNN`, so such a name may
+not open as printed.
 
 Run each exactly so, the script spelled out, with no variable, `cd`, pipe or redirection: the guard allows nothing
 else.
@@ -92,6 +95,15 @@ send (`--entry`) takes only the panes the preview printed, so a report landing i
   once `collect` ended or lapsed, never from Monitor lines, which a long line can cut: each id gets the report that
   answered it, even one a later report from that session superseded. If the output itself is abbreviated, run it again
   with fewer ids, down to one; a row still cut says so, its needs never pieced together.
+- **File** a follow-up issue in hathach/agentrc, for a defect in your own tooling and on the human's word, as
+  `agents/captain.md` says, from a title and a body drafted under `~/.cache/agentrc/captain/drafts/`:
+
+  ```bash
+  python3 ~/.claude/skills/followup-issue/scripts/publish.py create --repo hathach/agentrc --allow-repo hathach/agentrc --title-file <title.md> --body-file <body.md> --label follow-up
+  python3 ~/.claude/skills/followup-issue/scripts/publish.py comment --repo hathach/agentrc --allow-repo hathach/agentrc --issue <N> --body-file <body.md>
+  ```
+
+  The guard runs exactly these, every option given, the paths absolute or under `~/`, never under Monitor.
 - **Exit 4** is a corrupt ledger: nothing is decided until it is repaired by hand. Report it.
 
 ## Target
