@@ -2595,6 +2595,31 @@ test('a collector of another output contract stops collector-skew at once; a mis
   assert.ok(altered.logs.some(l => l === 'cycle 1: CI inventory failed — the collector died'), altered.logs.join('\n'))
 })
 
+test('a resumed launch collects and judges once more a stored CircleCI verdict judged incomplete (#319)', async () => {
+  const RAM = { check: 'ci/circleci: build', link: 'https://circleci.com/gh/hathach/tinyusb/508184', signature: "ld: region `RAM' overflowed by 744 bytes",
+    firstError: "ld: region `RAM' overflowed by 744 bytes", files: [], verdict: 'rig-side' }
+  const accepted = { key: keyOf(RAM), reason: 'master overflows RAM on this board', scope: 'until master fixes it' }
+  const tail = j => ({ ...j, checks: j.checks.map(c => ({ ...c, failures: c.failures.map(f => ({ ...f, complete: false })) })) })
+  const store = new Map()
+  const args = { ...YIELD, acceptedFailures: [accepted] }
+  const first = await run({ store, args, reviews: WAITING, ci: redWith(RAM).ci, judge: tail })
+  assert.ok(first.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), first.logs.join('\n'))
+  const again = await run({ store, args: { ...args, state: first.result.state }, reviews: WAITING, ci: redWith(RAM).ci })
+  assert.deepEqual(ciLabels(again.labels).slice(0, 4), ['ci:collect#2.1', 'ci:collect#2.r1', 'ci:collect#2.f', 'ci:judge#2'])
+  assert.ok(again.logs.some(l => l.endsWith('collected and judged again for ci/circleci: build')), again.logs.join('\n'))
+  assert.equal(again.logs.some(l => /not accepted/.test(l)), false, 'the whole log made the listing complete, so the acceptance applies')
+  // Still incomplete after its refresh, it stands as judged: one more judge per launch, never one per cycle.
+  const still = await run({ store, args: { ...args, state: first.result.state, maxCycles: 4, yieldAfterCycle: undefined, yieldOnChange: true }, reviews: WAITING, ci: redWith(RAM).ci, judge: tail })
+  assert.equal(still.labels.filter(l => l.startsWith('ci:judge#')).length, 1, still.labels.join('\n'))
+  assert.ok(still.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)))
+  // An Actions job's log was always whole: its stored verdict is reused as before.
+  const actions = { ...RAM, check: 'build / arm', link: undefined }
+  const kept = new Map()
+  const judged = await run({ store: kept, args: YIELD, reviews: WAITING, ci: redWith(actions).ci, judge: tail })
+  const resumed = await run({ store: kept, args: { ...YIELD, state: judged.result.state }, reviews: WAITING, ci: redWith(actions).ci })
+  assert.equal(resumed.labels.some(l => l.startsWith('ci:judge#')), false)
+})
+
 test('a verdict the store lost or garbled is reused by its launch, then judged again', async () => {
   const garble = (answer, store) => { for (const [k, v] of store) store.set(k, { ...v, bucket: 'cancel' }); return answer }
   const lose = (answer, store) => { store.clear(); return answer }

@@ -869,6 +869,8 @@ const noteRerun = (r) => {
   else if (r.sure) ciReruns[i] = r
 }
 const ciVerdicts = new Map()
+// Checks this launch judged, or sent back to be judged, from what the collector reads now (#319).
+const tailsRefreshed = new Set()
 // Saved entries are of the state's expectedHead; one saved before the head was left out names it too.
 if (restored) for (const e of restored.ciCache.entries) ciVerdicts.set(e.link, { ...e, head: restored.expectedHead })
 const ciChecks = { judged: 0, partial: 0, reused: 0, unchanged: 0 }
@@ -2324,6 +2326,12 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     }
   }
   await parallel(groupsOf(unread, RECALL_PER_CALL).map((batch, k) => () => recallBatch(batch, k)))
+  // A CircleCI verdict judged incomplete may predate the whole-log collector (#319): collected and judged again once per
+  // launch, so a resumed launch reads the whole log; still incomplete after that, it stands as judged.
+  const tails = failing.filter(c => reusable(c) && c.attempt.startsWith('circleci:') && !tailsRefreshed.has(c.link) &&
+    ciVerdicts.get(c.link).failures.some(f => !f.complete))
+  for (const c of tails) { tailsRefreshed.add(c.link); ciVerdicts.delete(c.link) }
+  if (tails.length) log(`cycle ${cycle}: CI verdicts judged on an incomplete log collected and judged again for ${tails.map(c => c.name).join(', ')}`)
   // A stored check is judged again only for its unclassified failures, when its stored list is complete and distinct.
   const storedOf = (c) => ciVerdicts.get(c.link).failures
   const unplaced = (c) => storedOf(c).filter(f => f.verdict === 'unclassified')
@@ -2450,6 +2458,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     const base = ev.bases.find(b => b.link === v.link)?.base ?? null
     const placedWith = v.failures.some(f => f.verdict === 'unclassified') ? { placedWith: placedKey(base) } : {}
     ciVerdicts.set(v.link, { head: inv.head, digest: verdictDigest(v), ...v, ...placedWith })
+    tailsRefreshed.add(v.link)
   }
   // After a push these verdicts are never recalled; a lost one fails its digest and is judged again.
   if (fresh.length && !lanes.reviewPublishing) {
