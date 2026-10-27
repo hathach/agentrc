@@ -19,6 +19,8 @@ spec.loader.exec_module(guard)
 
 RUN = 'python3 ~/.claude/skills/captain/scripts/captain.py'
 READ = 'python3 ~/.claude/skills/captain/scripts/captain_read.py'
+PUBLISH = 'python3 ~/.claude/skills/followup-issue/scripts/publish.py'
+REPO = '--repo hathach/agentrc --allow-repo hathach/agentrc'
 
 
 def setUpModule():
@@ -149,6 +151,52 @@ class VerdictTest(unittest.TestCase):
             with self.subTest(cmd):
                 self.assertIsNone(self.verdict('Bash', command=cmd))
 
+    def test_a_follow_up_issue_publishes_only_as_drafted_for_hathach_agentrc(self):
+        title, body = os.path.join(guard.DRAFTS, 'herdr-timeout-title.md'), os.path.join(guard.DRAFTS, 'herdr.md')
+        tilde = body.replace(os.path.expanduser('~'), '~', 1)
+        home = (Path.home() / '.claude/skills/followup-issue/scripts/publish.py').as_posix()
+        create = f'create {REPO} --title-file {title} --body-file {body} --label follow-up'
+        for cmd in [f'{PUBLISH} {create}', f'python3 {home} {create}',
+                    f'{PUBLISH} create --label follow-up --body-file {tilde} --title-file {title} {REPO}',
+                    f'{PUBLISH} comment {REPO} --issue 313 --body-file {body}']:
+            with self.subTest(cmd):
+                self.assertIsNone(self.verdict('Bash', command=cmd))
+                self.assertIsNotNone(self.verdict('Monitor', command=cmd, timeout_ms=1800000))
+        for cmd in [f'{PUBLISH}', f'{PUBLISH} edit {REPO} --issue 1 --body-file {body}',
+                    f'{PUBLISH} {create} --label bug', f'{PUBLISH} {create} --repo hathach/agentrc',
+                    f'{PUBLISH} {create.replace("--label follow-up", "")}',
+                    f'{PUBLISH} {create.replace("--label follow-up", "--label bug")}',
+                    f'{PUBLISH} {create.replace("--repo hathach/agentrc", "--repo hathach/tinyusb")}',
+                    f'{PUBLISH} {create} --allow-repo hathach/tinyusb',
+                    f'{PUBLISH} {create.replace("--title-file", "--title")}',
+                    f'{PUBLISH} {create.replace("--title-file", "--title-f")}',
+                    f'{PUBLISH} {create.replace("--title-file " + title, "--title-file=" + title)}',
+                    f'{PUBLISH} {create.replace(title, os.path.join(guard.DRAFTS, "x.txt"))}',
+                    f'{PUBLISH} {create.replace(title, os.path.join(guard.DRAFTS, "..", "x.md"))}',
+                    f'{PUBLISH} {create.replace(title, guard.DRAFTS + "-other/x.md")}',
+                    f'{PUBLISH} {create.replace(title, os.path.join(guard.MEMORY, "x.md"))}',
+                    f'{PUBLISH} {create.replace(title, "x.md")}', f'{PUBLISH} {create.replace(title, "~root/x.md")}',
+                    f'{PUBLISH} {create} extra', f'{PUBLISH} comment {REPO} --issue 0 --body-file {body}',
+                    f'{PUBLISH} comment {REPO} --issue x --body-file {body}',
+                    f'{PUBLISH} comment {REPO} --issue 3 --body-file {body} --label follow-up',
+                    f'{PUBLISH} comment {REPO} --issue 3 --issue 4 --body-file {body}',
+                    f'{PUBLISH} {create}; git push', f'{PUBLISH} {create} > /tmp/x',
+                    f'python3 skills/followup-issue/scripts/publish.py {create}',
+                    f'python3 /tmp/publish.py {create}']:
+            with self.subTest(cmd):
+                self.assertIsNotNone(self.verdict('Bash', command=cmd))
+
+    def test_a_draft_symlinked_out_of_the_drafts_is_refused(self):
+        drafts = tmpdir(self)
+        (drafts / 'x.md').symlink_to(Path(os.path.expanduser('~')) / 'code' / 'x.md')
+        (drafts / 'y.md').write_text('y', encoding='utf-8')
+        with mock.patch.object(guard, 'DRAFTS', str(drafts)):
+            ok = f'{PUBLISH} comment {REPO} --issue 3 --body-file {drafts / "y.md"}'
+            self.assertIsNone(self.verdict('Bash', command=ok))
+            self.assertIsNotNone(self.verdict('Bash', command=ok.replace('y.md', 'x.md')))
+            self.assertIsNone(self.verdict('Write', file_path=str(drafts / 'y.md'), content='x'))
+            self.assertIsNotNone(self.verdict('Write', file_path=str(drafts / 'x.md'), content='x'))
+
     def test_monitor_only_watches_a_command(self):
         self.assertIsNotNone(self.verdict('Monitor', ws={'url': 'wss://x'}))
 
@@ -158,7 +206,8 @@ class VerdictTest(unittest.TestCase):
                      f'{home}/code/agentrc/README.md', f'{home}/.herdr/worktrees/tinyusb/x/src/tusb.c',
                      f'{home}/.cache/chief-runs/tinyusb-4165-babysit-1/progress.log',
                      f'{home}/.claude/projects/-home-u-code-agentrc/memory/MEMORY.md',
-                     os.path.join(guard.MEMORY, 'MEMORY.md')]:
+                     os.path.join(guard.MEMORY, 'MEMORY.md'),
+                     f'{home}/.claude/skills/followup-issue/SKILL.md']:
             with self.subTest(path):
                 self.assertIsNone(self.verdict('Read', file_path=path))
         for path in ['/etc/passwd', os.path.join(guard.STATE, '..', 'x'), 'relative.md', guard.STATE + '-other/x',
@@ -175,11 +224,13 @@ class VerdictTest(unittest.TestCase):
             self.assertIsNone(self.verdict('Read', file_path=str(root / 'in.log')))
             self.assertIsNotNone(self.verdict('Read', file_path=str(root / 'out' / 'passwd')))
 
-    def test_writes_only_markdown_in_its_memory(self):
-        note = os.path.join(guard.MEMORY, 'MEMORY.md')
-        self.assertIsNone(self.verdict('Write', file_path=note, content='x'))
-        self.assertIsNone(self.verdict('Edit', file_path=note, old_string='a', new_string='b'))
+    def test_writes_only_markdown_in_its_memory_and_drafts(self):
+        for note in (os.path.join(guard.MEMORY, 'MEMORY.md'), os.path.join(guard.DRAFTS, 'herdr-title.md')):
+            self.assertIsNone(self.verdict('Write', file_path=note, content='x'))
+            self.assertIsNone(self.verdict('Edit', file_path=note, old_string='a', new_string='b'))
         for path in [os.path.join(guard.MEMORY, 'run.sh'), guard.MEMORY + '-other/x.md',
+                     os.path.join(guard.DRAFTS, 'x.json'), os.path.join(guard.DRAFTS, '..', 'ledger.md'),
+                     guard.DRAFTS + '-other/x.md',
                      os.path.join(guard.MEMORY, '..', 'chief', 'x.md'),
                      os.path.expanduser('~/.claude/projects/-home-u-code-agentrc/memory/MEMORY.md'),
                      os.path.expanduser('~/code/agentrc/README.md'), 'MEMORY.md', None]:
@@ -198,6 +249,7 @@ class VerdictTest(unittest.TestCase):
 
     def test_other_tools(self):
         self.assertIsNone(self.verdict('Skill', skill='captain'))
+        self.assertIsNone(self.verdict('Skill', skill='followup-issue'))
         self.assertIsNotNone(self.verdict('Skill', skill='pr-babysit'))
         self.assertIsNone(self.verdict('ToolSearch', query='select:Monitor'))
         self.assertIsNotNone(self.verdict('ToolSearch', query='select:WebFetch'))

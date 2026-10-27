@@ -2,7 +2,9 @@
 """PreToolUse hook on every tool, declared in agents/captain.md so it runs wherever that agent does, on any
 account: captain relays, reports and checks, so its own calls may run the installed captain.py with a known
 subcommand or captain_read.py with a lookup it accepts, read the places sessions leave evidence, write its
-own memory, load its skill and Monitor, and ask the human; every other call is denied.
+own memory and drafts, load its skill and Monitor, and ask the human; every other call is denied. Its one
+publication: the installed followup-issue publish.py, creating or commenting on a hathach/agentrc follow-up issue
+whose title and body it drafted under DRAFTS; whether the human asked for it stays captain's judgment.
 
 Only captain's calls are checked, as a backstop to the declaration: the payload names agent_type `captain`,
 whether captain runs as the session's agent or as another session's subagent. An allowlist, so a tool or command
@@ -36,19 +38,55 @@ STATE, SKILL, MEMORY, PROJECTS = captain_read.STATE, captain_read.SKILL, captain
 SCRIPTS = ('~/.claude/skills/captain/scripts/captain.py',
            os.path.join(SKILL, 'scripts', 'captain.py').replace(os.sep, '/'))
 READERS = tuple(s.replace('captain.py', 'captain_read.py') for s in SCRIPTS)
+PUBLISHERS = tuple(s.replace('captain/scripts/captain.py', 'followup-issue/scripts/publish.py') for s in SCRIPTS)
+DRAFTS = os.path.join(STATE, 'drafts')
+REPO = 'hathach/agentrc'
+# publish.py's options for each action, every one given once as `--option value`
+PUBLISH = {'create': {'--repo': REPO, '--allow-repo': REPO, '--title-file': None, '--body-file': None,
+                      '--label': 'follow-up'},
+           'comment': {'--repo': REPO, '--allow-repo': REPO, '--issue': None, '--body-file': None}}
+ISSUE = re.compile(r'[1-9][0-9]{0,11}')
 SUBCOMMANDS = ('list', 'enroll', 'ask', 'collect', 'reports', 'cancel', 'relay', 'withdraw', 'open')
 TOKEN = re.compile(r'[A-Za-z0-9][A-Za-z0-9:._=-]*|--[a-z][a-z-]*')
 CHECKOUT = re.compile(r'(?:/|~/)[A-Za-z0-9._/-]*')   # a path, only as the value of open's --checkout
 SHELL = re.compile(r'[^A-Za-z0-9 :._=/~,-]')   # any quoting, expansion, redirection, separator or newline
 
 
-def command(cmd):
+def markdown_in(path, root):
+    """A Markdown file inside root, symlinks resolved."""
+    return (isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path).endswith('.md')
+            and captain_read.inside(path, root))
+
+
+def publication(args):
+    """Why args are not one create or comment that PUBLISH describes, or None."""
+    if not args or args[0] not in PUBLISH:
+        return f'publish.py runs only {" or ".join(PUBLISH)}'
+    want, pairs = PUBLISH[args[0]], args[1:]
+    names = pairs[::2]
+    if len(pairs) % 2 or sorted(names) != sorted(want):
+        return f'publish.py {args[0]} takes exactly {" ".join(want)}, each once with its value'
+    for name, value in zip(names, pairs[1::2]):
+        if name in ('--title-file', '--body-file'):
+            if not markdown_in(os.path.expanduser(value), DRAFTS):
+                return f'{name} is a Markdown draft in {DRAFTS}'
+        elif name == '--issue':
+            if not ISSUE.fullmatch(value):
+                return '--issue is an issue number'
+        elif value != want[name]:
+            return f'{name} is {want[name]}'
+    return None
+
+
+def command(cmd, monitor=False):
     """Why a Bash or Monitor command is not a plain captain.py call, or None."""
     if not isinstance(cmd, str) or SHELL.search(cmd):
         return 'only a plain `python3 ~/.claude/skills/captain/scripts/captain.py|captain_read.py ...` runs here'
     words = cmd.split()
     if len(words) >= 2 and words[0] == 'python3' and words[1] in READERS:
         return captain_read.refusal(words[2:])
+    if len(words) >= 2 and words[0] == 'python3' and words[1] in PUBLISHERS:
+        return 'Monitor never publishes' if monitor else publication(words[2:])
     if len(words) < 3 or words[0] != 'python3' or words[1] not in SCRIPTS:
         return ('only the installed captain.py or captain_read.py runs here, as '
                 '`python3 ~/.claude/skills/captain/scripts/<script>`')
@@ -69,19 +107,21 @@ def verdict(payload):
     if tool == 'Bash':
         return command(args.get('command'))
     if tool == 'Monitor':
-        return 'Monitor here watches a captain.py command only' if 'ws' in args else command(args.get('command'))
+        return ('Monitor here watches a captain.py command only' if 'ws' in args
+                else command(args.get('command'), monitor=True))
     if tool == 'Read':
         if captain_read.readable(args.get('file_path')):
             return None
         return 'captain reads only checkouts, chief runs and memory; captain_read.py list shows a directory'
     if tool in ('Write', 'Edit'):
         path = args.get('file_path')
-        if (isinstance(path, str) and os.path.isabs(path) and os.path.realpath(path).endswith('.md')
-                and captain_read.inside(path, MEMORY)):
+        if markdown_in(path, MEMORY) or markdown_in(path, DRAFTS):
             return None
-        return f'captain writes only Markdown in its memory, {MEMORY}'
+        return f'captain writes only Markdown in its memory, {MEMORY}, or its drafts, {DRAFTS}'
     if tool == 'Skill':
-        return None if args.get('skill') == 'captain' else 'captain loads only its own skill'
+        if args.get('skill') in ('captain', 'followup-issue'):
+            return None
+        return 'captain loads only its own skill and followup-issue'
     if tool == 'ToolSearch':
         return None if args.get('query') == 'select:Monitor' else 'captain loads only Monitor'
     if tool == 'AskUserQuestion':

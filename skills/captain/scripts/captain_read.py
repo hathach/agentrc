@@ -34,7 +34,8 @@ SKILL = os.path.join(HOME, '.claude', 'skills', 'captain')
 # every account's agent-memory links to this one, so captains on both accounts share one memory
 MEMORY = os.path.join(HOME, '.claude', 'agent-memory', 'captain')
 PROJECTS = os.path.join(HOME, '.claude', 'projects')   # the human's memory is <project>/memory
-READ_ROOTS = (STATE, SKILL, MEMORY, *GIT_ROOTS, os.path.join(HOME, '.cache', 'chief-runs'))
+FOLLOWUP = os.path.join(HOME, '.claude', 'skills', 'followup-issue')   # the one skill captain publishes through
+READ_ROOTS = (STATE, SKILL, FOLLOWUP, MEMORY, *GIT_ROOTS, os.path.join(HOME, '.cache', 'chief-runs'))
 ENTRIES = 200   # listed per directory
 PREFIX = re.compile(r'[A-Za-z0-9._-]+')
 CAP = 200_000   # bytes of output kept
