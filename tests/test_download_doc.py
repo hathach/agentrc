@@ -236,6 +236,7 @@ class RetitlePlan(unittest.TestCase):
         err = io.StringIO()
         with unittest.mock.patch.dict(os.environ, {'DOWNLOAD_DOC_SECRET': str(secret)}), \
                 unittest.mock.patch.object(doclib.Library, '_cmdlines', gui), \
+                unittest.mock.patch.object(doclib.Library, '_gui_library', staticmethod(lambda: str(doclib.DEFAULT_LIBRARY))), \
                 unittest.mock.patch.object(doclib.subprocess, 'run', run), \
                 unittest.mock.patch.object(retitle, 'build_plan', lambda use_pdf: plan), \
                 unittest.mock.patch.object(sys, 'argv', ['retitle.py', '--apply']), \
@@ -422,7 +423,7 @@ class GuiDetection(unittest.TestCase):
         self.running(['/usr/bin/FreeFileSync_x86_64', '/home/u/calibre-library.ffs_batch'])
         self.assertIn('FreeFileSync', lib.blockers()[0])
 
-    def lock_then(self, results, server=None):
+    def lock_then(self, results, server=None, path=Path('/lib')):
         """A Library whose calibredb answers each call from `results` (a lock error, a
         ('fail', stderr) or output)."""
         calls = []
@@ -438,8 +439,14 @@ class GuiDetection(unittest.TestCase):
         doclib.subprocess.run = run
         doclib.time.sleep = lambda s: None
         lib = doclib.Library.__new__(doclib.Library)
-        lib.path, lib.server = Path('/lib'), server
+        lib.path, lib.server, lib._url = path, server, None
         return lib, calls
+
+    def gui_on(self, library):
+        """The GUI has `library` open, as calibre's prefs record it."""
+        patch = unittest.mock.patch.object(doclib.Library, '_gui_library', staticmethod(lambda: str(library)))
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def test_a_lock_with_only_a_worker_running_is_retried(self):
         self.running(*self.WORKER)
@@ -450,6 +457,7 @@ class GuiDetection(unittest.TestCase):
 
     def test_a_lock_with_the_gui_open_is_not_retried(self):
         self.running(*self.GUI)
+        self.gui_on('/lib')
         lib, calls = self.lock_then(['lock'])
         with self.assertRaisesRegex(RuntimeError, 'GUI is open'):
             lib._run('list')
@@ -457,57 +465,63 @@ class GuiDetection(unittest.TestCase):
         self.assertEqual(lib._run('list'), 'via server')
         self.assertEqual(calls[1][2], 'http://localhost:8080/#lib')
 
-    def secret(self, serves_scratch=False, server_url=None):
-        """Content-server credentials in a secret.yml -> a scratch library, which the server
-        serves only when serves_scratch says so; otherwise it serves the default library."""
+    def secret(self, server_url=None):
+        """Content-server credentials in a secret.yml -> a scratch library path."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        scratch = Path(tmp.name) / 'scratch library'
-        served = f'  library: {scratch}\n' if serves_scratch else ''
-        served += f'  server_url: {server_url}\n' if server_url else ''
-        (Path(tmp.name) / 'secret.yml').write_text(f'calibre:\n  username: u\n  password: pw\n{served}',
+        url = f'  server_url: {server_url}\n' if server_url else ''
+        (Path(tmp.name) / 'secret.yml').write_text(f'calibre:\n  username: u\n  password: pw\n{url}',
                                                    encoding='utf-8')
         env = unittest.mock.patch.dict(os.environ, {'DOWNLOAD_DOC_SECRET': str(Path(tmp.name) / 'secret.yml')})
         env.start()
         self.addCleanup(env.stop)
-        return scratch
+        return Path(tmp.name) / 'My Library'
 
-    def test_the_content_server_is_used_only_for_the_library_it_serves(self):
+    def test_the_content_server_is_used_only_for_the_library_the_gui_has_open(self):
         # The GUI's lock refuses calibredb on every library, so a scratch library run
         # with the GUI open must stop, not read and write the GUI's library instead.
         self.running(*self.GUI)
         scratch = self.secret()
-        self.assertIsNotNone(doclib.Library(doclib.DEFAULT_LIBRARY).server)
+        self.gui_on(doclib.DEFAULT_LIBRARY)
         lib = doclib.Library(scratch)
-        self.assertIsNone(lib.server)
-        self.assertIn('GUI is open', lib.blockers()[0])
-        _, calls = self.lock_then(['lock'])
+        self.assertIn(f'GUI is open on {doclib.DEFAULT_LIBRARY}, not {scratch}', lib.blockers()[0])
+        lib, calls = self.lock_then(['lock'], server=lib.server, path=scratch)
         with self.assertRaisesRegex(RuntimeError, 'GUI is open'):
             lib._run('add', 'x.pdf')
         self.assertEqual([argv[2] for argv in calls], [str(scratch)])
 
-    def test_a_library_key_names_the_library_the_server_serves(self):
+    def test_the_library_id_is_the_one_the_server_lists_for_the_guis_library(self):
         self.running(*self.GUI)
-        scratch = self.secret(serves_scratch=True)
-        self.assertIsNone(doclib.Library(doclib.DEFAULT_LIBRARY).server)
-        lib = doclib.Library(scratch)
-        self.assertEqual(lib.blockers(), [])
-        _, calls = self.lock_then(['lock', 'via server'])
-        self.assertEqual(lib._run('list'), 'via server')
-        self.assertEqual(calls[1][2], 'http://localhost:8080/#scratch_library')
+        target = self.secret()
+        self.gui_on(target)
+        lib, calls = self.lock_then(['lock', 'My_Library\nother\n', 'via server'],
+                                    server=doclib.Library(target).server, path=target)
+        self.assertEqual(lib._run('add', 'x.pdf'), 'via server')
+        self.assertEqual([argv[2] for argv in calls],
+                         [str(target), 'http://localhost:8080/#-', 'http://localhost:8080/#My_Library'])
 
-    def test_writes_name_the_served_library_by_calibres_id(self):
-        # Without an id the server writes its default library, which need not be the one declared.
-        self.secret()
-        self.assertEqual(doclib.Library(doclib.DEFAULT_LIBRARY).server[0], 'http://localhost:8080/#calibre-library')
-        self.secret(server_url='http://127.0.0.1:8081/')
-        self.assertEqual(doclib.Library(doclib.DEFAULT_LIBRARY).server[0], 'http://127.0.0.1:8081/#calibre-library')
-        # calibre numbers a second library of the same folder name; the given id is kept.
-        self.secret(server_url='http://localhost:8080/#calibre-library1')
-        self.assertEqual(doclib.Library(doclib.DEFAULT_LIBRARY).server[0], 'http://localhost:8080/#calibre-library1')
+    def test_libraries_of_one_name_are_refused_unless_server_url_names_one(self):
+        # calibre 8.5: /other/My Library is My_Library, /target/My Library My_Library1; a
+        # derived #My_Library would write the other one.
+        self.running(*self.GUI)
+        target = self.secret()
+        self.gui_on(target)
+        for ids in ('My_Library\nMy_Library1\n', 'other\n'):
+            with self.subTest(ids):
+                lib, calls = self.lock_then(['lock', ids, ids], server=doclib.Library(target).server, path=target)
+                with self.assertRaisesRegex(RuntimeError, 'libraries named like My_Library .*'
+                                                          r'server_url as http://localhost:8080/#<id>'):
+                    lib._run('add', 'x.pdf')
+                self.assertEqual(len(calls), 2)
+                self.assertIn('libraries named like My_Library', lib.blockers()[0])
+        self.secret(server_url='http://localhost:8080/#My_Library1')
+        lib, calls = self.lock_then(['lock', 'via server'], server=doclib.Library(target).server, path=target)
+        self.assertEqual(lib._run('add', 'x.pdf'), 'via server')
+        self.assertEqual(calls[1][2], 'http://localhost:8080/#My_Library1')
 
     def test_an_id_the_server_does_not_serve_is_refused_not_retried_without_it(self):
         self.running(*self.GUI)
+        self.gui_on('/lib')
         lib, calls = self.lock_then(['lock', ('fail', 'Not Found')], server=('http://localhost:8080/#lib', 'u', 'pw'))
         with self.assertRaisesRegex(RuntimeError, r"http://localhost:8080/#lib serves no library by that id; "
                                                   r".*'http://localhost:8080/#-' list"):
@@ -735,7 +749,7 @@ def patch_library(test):
     test.addCleanup(restore)
     doclib.Library._run = lambda lib, *a, **k: test.library.run(*a, **k)
     doclib.Library.blockers = lambda lib: []
-    doclib.Library._server_creds = staticmethod(lambda path: None)
+    doclib.Library._server_creds = staticmethod(lambda: None)
 
 
 class FakeCalibre:

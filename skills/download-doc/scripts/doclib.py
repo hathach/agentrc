@@ -410,16 +410,17 @@ class Library:
     """calibredb wrapper.
 
     The GUI takes an exclusive write lock, so imports need it closed unless
-    content-server credentials are configured for this library (see _server_creds),
-    in which case writes go through the running GUI's server instead.
+    content-server credentials are configured (see _server_creds) and this is the
+    library the GUI has open, in which case writes go through its server instead.
     """
 
     def __init__(self, path: Path = LIBRARY):
         self.path = path
-        self.server = self._server_creds(path)
+        self.server = self._server_creds()
+        self._url = None
 
     @staticmethod
-    def _server_creds(path: Path):
+    def _server_creds():
         """Optional write-through-the-GUI credentials, read from the gitignored
         `secret.yml` beside SKILL.md (or `$DOWNLOAD_DOC_SECRET`) so they are never
         typed into a command by hand:
@@ -428,20 +429,9 @@ class Library:
               server_url: http://localhost:8080
               username: <name>
               password: <secret>
-              library: ~/Documents/calibre-library
 
-        `library` is the library the server serves, unquoted, defaulting to
-        DEFAULT_LIBRARY; for any other `path` this returns None. The GUI's lock refuses
-        calibredb on every library, so without that check a run aimed at a scratch
-        library would read and write the served one.
-
-        Writes name the library by calibre's id for it, `server_url#<id>`: the folder name
-        with spaces as `_`, or the fragment `server_url` already carries. Without one the
-        server writes its default library, the first it lists and not necessarily the
-        GUI's; with one it refuses an id it does not serve ("Not Found"). The id cannot
-        replace `library`, though: it is only the folder name, so calibre 8.5 took
-        `#calibre-library` aimed at another library's `.../calibre-library` and wrote the
-        served one.
+        They are used only for the library the GUI has open (served_url); a `library`
+        key, which used to declare it, is no longer read.
 
         Calibre's content server accepts reads unauthenticated but answers writes with
         "Forbidden" until a user exists (Preferences -> Sharing over the net -> Require
@@ -463,12 +453,88 @@ class Library:
         g = dict(re.findall(r"^\s+(\w+):[ \t]*(\S.*?)[ \t]*$", blk.group(1), re.M))
         if not (g.get("username") and g.get("password")):
             return None
-        served = Path(g.get("library") or DEFAULT_LIBRARY).expanduser()
-        if served.resolve() != Path(path).expanduser().resolve():
+        return (g.get("server_url", "http://localhost:8080"), g["username"], g["password"])
+
+    @staticmethod
+    def _gui_library() -> str | None:
+        """The library the GUI has open, as calibre records it: prefs['library_path'],
+        saved at start and on every switch. None when calibre-debug cannot say."""
+        code = ("import sys; from calibre.utils.config import prefs; "
+                "sys.stdout.buffer.write((prefs['library_path'] or '').encode('utf-8'))")
+        try:
+            p = subprocess.run(["calibre-debug", "-c", code], capture_output=True)
+        except OSError:
             return None
-        url, _, library_id = g.get("server_url", "http://localhost:8080").partition("#")
-        library_id = library_id or served.resolve().name.replace(" ", "_")
-        return (f"{url.rstrip('/')}/#{library_id}", g["username"], g["password"])
+        out = p.stdout.decode("utf-8", "replace").strip()
+        return out if p.returncode == 0 and out else None
+
+    def served_url(self) -> str:
+        """`server_url#<library id>` addressing this library through the GUI's content
+        server, or RuntimeError why it cannot be.
+
+        Only the GUI's own library qualifies: the GUI's lock refuses calibredb on every
+        library, so a scratch library's run would otherwise write the served one. Its id
+        is taken from the server's own list, not derived: calibre names a library by its
+        folder name, spaces as `_`, numbering a repeat (`My_Library`, `My_Library1`) in
+        the order it met them, and refuses an id it does not serve but not a same-named
+        library of another path. The GUI's library is always in that list, so exactly one
+        id of its name is it; two or more are ambiguous unless `server_url` names one
+        (`...#My_Library1`). Without any id the server writes its default library, the
+        first it lists and not necessarily the GUI's.
+        """
+        if self._url:
+            return self._url
+        gui = self._gui_library()
+        if gui is None or os.path.normcase(str(Path(gui).resolve())) != \
+                os.path.normcase(str(Path(self.path).expanduser().resolve())):
+            raise RuntimeError(f"The Calibre GUI is open on {gui or 'a library calibre-debug cannot name'}, "
+                               f"not {self.path}, and holds the write lock — close it before importing.")
+        url, _, given = self.server[0].partition("#")
+        url = url.rstrip("/")
+        if not given:
+            p = self._server_call(f"{url}/#-", "list")
+            if p.returncode != 0:
+                raise RuntimeError(f"cannot list the libraries {url} serves: "
+                                   + (p.stderr or p.stdout or "").strip()[:160])
+            ids = p.stdout.split()
+            name = Path(os.path.abspath(gui)).name.replace(" ", "_")   # calibre's: symlinks unresolved
+            alike = [i for i in ids if re.fullmatch(re.escape(name) + r"\d*", i)]
+            if len(alike) != 1:
+                raise RuntimeError(
+                    f"{url} serves {len(alike)} libraries named like {name} ({', '.join(ids) or 'none'}); "
+                    f"name the one for {gui} in secret.yml's server_url as {url}/#<id>")
+            given = alike[0]
+        self._url = f"{url}/#{given}"
+        return self._url
+
+    def _server_call(self, url: str, *args) -> subprocess.CompletedProcess:
+        """calibredb against the content server at url, with the stored credentials."""
+        _, user, pw = self.server
+        # Never put the password in argv: /proc/<pid>/cmdline is world
+        # readable, so `ps` would show it for the life of every call —
+        # which would defeat keeping it in a gitignored file at all.
+        # calibredb takes `<f:PATH>`, decodes it as UTF-8 and rstrip()s it,
+        # so hand it a private file (0600 in $XDG_RUNTIME_DIR or /tmp; the
+        # user's temp dir on Windows) and delete it immediately. Its
+        # other option, `<stdin>`, routes through
+        # getpass() and needs a TTY we do not have here.
+        rt = Path(os.environ.get("XDG_RUNTIME_DIR",
+                                 tempfile.gettempdir() if os.name == "nt" else "/tmp"))
+        fd, tmp_pw = tempfile.mkstemp(dir=str(rt), prefix=".calpw-")
+        try:
+            if hasattr(os, "fchmod"):  # mkstemp already made it 0600; Windows has no modes
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(pw)
+            return subprocess.run(
+                ["calibredb", "--with-library", url, "--username", user,
+                 "--password", f"<f:{tmp_pw}>", *args],
+                capture_output=True, text=True)
+        finally:
+            try:
+                os.unlink(tmp_pw)
+            except OSError:
+                pass
 
     # calibredb reports "Another calibre program ... is running" even when Calibre is
     # closed, if a FreeFileSync mirror is touching the library directory at that moment.
@@ -489,32 +555,8 @@ class Library:
                     if self.server:
                         # Write through the running GUI's own content server rather than
                         # wait for a lock that cannot clear while the GUI is open.
-                        url, user, pw = self.server
-                        # Never put the password in argv: /proc/<pid>/cmdline is world
-                        # readable, so `ps` would show it for the life of every call —
-                        # which would defeat keeping it in a gitignored file at all.
-                        # calibredb takes `<f:PATH>`, decodes it as UTF-8 and rstrip()s it,
-                        # so hand it a private file (0600 in $XDG_RUNTIME_DIR or /tmp; the
-                        # user's temp dir on Windows) and delete it immediately. Its
-                        # other option, `<stdin>`, routes through
-                        # getpass() and needs a TTY we do not have here.
-                        rt = Path(os.environ.get("XDG_RUNTIME_DIR",
-                                                 tempfile.gettempdir() if os.name == "nt" else "/tmp"))
-                        fd, tmp_pw = tempfile.mkstemp(dir=str(rt), prefix=".calpw-")
-                        try:
-                            if hasattr(os, "fchmod"):  # mkstemp already made it 0600; Windows has no modes
-                                os.fchmod(fd, 0o600)
-                            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                                fh.write(pw)
-                            p2 = subprocess.run(
-                                ["calibredb", "--with-library", url, "--username", user,
-                                 "--password", f"<f:{tmp_pw}>", *args],
-                                capture_output=True, text=True)
-                        finally:
-                            try:
-                                os.unlink(tmp_pw)
-                            except OSError:
-                                pass
+                        url = self.served_url()
+                        p2 = self._server_call(url, *args)
                         if p2.returncode == 0:
                             return p2.stdout
                         why = (p2.stderr or p2.stdout or "").strip()[:160]
@@ -525,8 +567,7 @@ class Library:
                     raise RuntimeError(
                         "the Calibre GUI is open and holds the library's write lock. "
                         "Close it, or define a content-server user and put the credentials "
-                        "and this library's path in secret.yml under `calibre:` "
-                        "(see Library._server_creds).")
+                        "in secret.yml under `calibre:` (see Library._server_creds).")
                 if attempt < tries - 1:
                     print(f"  calibredb reported a lock (attempt {attempt + 1}/{tries}); "
                           f"retrying — a sync is probably touching the library",
@@ -606,9 +647,14 @@ class Library:
         if gui and not self.server:
             out.append("The Calibre GUI is open and holds the library's write lock — "
                        "close it before importing.")
-        # With content-server credentials configured, an open GUI is not a blocker:
-        # _run writes through its server instead of competing for the lock. Reporting
-        # it anyway made sync.py refuse imports that would have succeeded.
+        elif gui:
+            # With content-server credentials, an open GUI is not a blocker for its own
+            # library: _run writes through its server instead of competing for the lock.
+            # Reporting it anyway made sync.py refuse imports that would have succeeded.
+            try:
+                self.served_url()
+            except RuntimeError as e:
+                out.append(str(e))
         # Linux only: it needs the program's arguments to find the calibre-library batch.
         # On Windows _cmdlines() has image names alone (FreeFileSync_x64.exe,
         # RealTimeSync.exe), and blocking on the name would let a resident RealTimeSync
