@@ -339,7 +339,7 @@ def located(git, env):
     at another checkout makes it: filtered() reads from the root, so it must see the repository git works with."""
     where = ('rev-parse', '--path-format=absolute', '--show-toplevel', '--git-dir', '--git-common-dir')
     found = plain(git, env, *where)
-    places = found.stdout.decode(errors='replace').splitlines()
+    places = os.fsdecode(found.stdout).splitlines()   # surrogateescape: a name that is not UTF-8 still opens
     if found.returncode or len(places) != 3:
         return None, 'not a checkout with a worktree'
     outside = [p for p in map(os.path.realpath, places) if not approved(p)]

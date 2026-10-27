@@ -284,6 +284,20 @@ class HostileRepoTest(unittest.TestCase):
                 self.assertIn('another repository', done.stderr)
                 self.assertEqual(self.marks_left(), [])
 
+    @unittest.skipIf(os.name == 'nt', 'Windows paths are Unicode, never undecodable bytes')
+    def test_a_checkout_under_a_name_that_is_not_utf8_answers(self):
+        try:
+            odd = self.home / 'code' / os.fsdecode(b'odd\xff')
+            odd.mkdir()
+        except (OSError, UnicodeEncodeError):
+            self.skipTest('this filesystem refuses a name that is not UTF-8')
+        moved = odd / 'repo'
+        self.repo.rename(moved)
+        done = subprocess.run([sys.executable, str(SCRIPT), 'git', '-C', str(moved), 'log', '-n', '1'], env=self.env,
+                              capture_output=True, text=True, errors='replace')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.strip())
+
     def test_a_refused_call_runs_nothing(self):
         done = self.read('config', 'core.pager', 'x')
         self.assertEqual(done.returncode, 2)
