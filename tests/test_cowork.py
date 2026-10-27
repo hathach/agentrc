@@ -403,6 +403,70 @@ class CoworkTest(unittest.TestCase):
         code, out, _ = self.run_cli('reset', 'codex', 'review', '--read-only')  # a hint followed twice
         self.assertEqual((code, out.strip()), (0, 'codex/review: no session'))
 
+    def test_the_relays_marker_holds_send_and_reset_to_read_only_lanes_whatever_the_flags(self):
+        # The coworker agent's hook exports it: a relay that leaves out --read-only, or follows a prompt
+        # naming a writable lane, still reaches only read-only lanes.
+        self.commit('a.txt', 'a')
+        self.send('--task', 'a')
+        self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        ran = len(self.calls())
+        with mock.patch.dict('os.environ', {cowork.READ_ONLY: '1'}):
+            for argv, why in ((('--task', 'b'), 'main is this checkout and writable'),
+                              (('--lane', 'impl', '--task', 'y'), 'codex/impl is a worktree lane'),
+                              (('--lane', 'new', '--worktree', '--task', 'z'), f'{cowork.READ_ONLY} is set')):
+                code, _, _, err = self.send(*argv)
+                self.assertEqual(code, cowork.BUSY, argv)
+                self.assertIn(why, err)
+            self.assertEqual(len(self.calls()), ran)
+            self.assertFalse(self.box(lane='new').exists())
+            for lane, what in (('main', 'main'), ('impl', 'worktree')):
+                code, _, err = self.run_cli('reset', 'codex', lane)
+                self.assertEqual(code, cowork.BUSY, lane)
+                self.assertIn(f'codex/{lane} is {what}, not read-only', err)
+                self.assertTrue((self.box(lane=lane) / 'session').exists(), lane)
+            code, _, err = self.run_cli('reset', 'codex', 'all')
+            self.assertEqual(code, cowork.FAILED)
+            self.assertIn('not all', err)
+            code, _, _, err = self.send('--lane', 'review', '--task', 'q')
+            self.assertEqual(code, 0, err)
+            self.assertIn('Scope: do not edit anything', self.calls()[-1]['stdin'])
+            code, out, _ = self.run_cli('reset', 'codex', 'review')
+            self.assertEqual((code, out.strip()), (0, 'codex/review: session forgotten'))
+        self.assertTrue((self.root / '.worktrees' / 'cowork-codex-impl').exists())
+
+    def test_the_relays_marker_kills_only_a_read_only_lanes_request_checked_under_its_lock(self):
+        main_proc, writable = self.send_gated('--task', 'slow')
+        review_proc, request = self.send_gated('--lane', 'review', '--task', 'slow')
+        review = self.box(lane='review')
+        self.started(writable)
+        until(lambda: cowork.cli_pid(review / f'{request}.lock') != '')
+        real = cowork.admission
+
+        @contextlib.contextmanager
+        def replaced(box):  # the lane remade as a worktree lane between the request's lookup and the lock
+            (box / 'read-only').unlink()
+            (box / 'base').write_text('0' * 40 + '\n')
+            with real(box):
+                yield
+
+        with mock.patch.dict('os.environ', {cowork.READ_ONLY: '1'}):
+            code, _, err = self.run_cli('kill', writable)
+            self.assertEqual(code, cowork.BUSY)
+            self.assertIn(f'codex/main is main, not read-only; not killing {writable}', err)
+            with mock.patch.object(cowork, 'admission', replaced):
+                code, _, err = self.run_cli('kill', request)
+            self.assertEqual(code, cowork.BUSY)
+            self.assertIn('codex/review is worktree, not read-only', err)
+            self.assertEqual(cowork.state(self.box(), writable), 'running')
+            self.assertEqual(cowork.state(review, request), 'running')
+            (review / 'base').unlink()
+            (review / 'read-only').touch()
+            code, out, _ = self.run_cli('kill', request)
+            self.assertEqual((code, out.strip()), (0, f'{request}: killed'))
+        review_proc.wait(timeout=30)
+        self.gate.touch()
+        main_proc.wait(timeout=30)
+
     # --- model and effort ---------------------------------------------------------
 
     def test_a_new_lane_starts_at_its_sides_default_whatever_drives_it(self):

@@ -42,6 +42,10 @@ receipt that names it; status lists the lanes holding a request and counts
 the idle ones, --all lists every lane; reset removes
 everything of a lane, its worktree included once its branch is merged, and
 with --read-only only a read-only lane, checked under the lane's lock.
+COWORK_READ_ONLY set to anything, as the coworker agent's hook exports it
+(coworker_guard.py), makes send and reset --read-only whatever the flags,
+refuses send --worktree, and lets kill stop only a read-only lane's request,
+its lane checked under the lane's lock.
 
 Exit codes: 0 success, for a delivery a reply; 1 the turn failed, was
 killed or died, or never ran because a --no-edit tree could not be read
@@ -53,7 +57,8 @@ running one under plain read, a read --out FILE that cannot be written (the
 request kept), a busy lane, a lane of another kind than the flags assert or
 not ready (pinned, kindless, its worktree unusable, or not creatable from a
 detached host, beside a branch with no recorded base or when herdr cannot
-place it), or reset refused; 4 an empty reply, a writer's reply without its
+place it), or reset refused, or a kill under COWORK_READ_ONLY of a request on
+a lane that is not read-only; 4 an empty reply, a writer's reply without its
 "Files touched" line, or a --no-edit turn that changed the tree or after
 which it could not be checked.
 """
@@ -116,6 +121,7 @@ PRESET = 'sol'  # the Codex default while no preference file names one
 FIELDS = ('session', 'model', 'effort', 'tier')
 GIT_ENCODING = 'utf-8' if fcntl is None else None  # git speaks UTF-8 there, not the ANSI code page; else the locale's
 PLUGIN = AGENTRC / 'plugins' / 'worktree-children' / 'worktree_children.py'
+READ_ONLY = 'COWORK_READ_ONLY'
 
 
 def die(message, code=FAILED):
@@ -1296,6 +1302,7 @@ def main(argv=None):
         return 0
 
     root, gitdir = git_dir()
+    forced = bool(os.environ.get(READ_ONLY))
     if a.cmd == '_run':
         lock_fd = int(a.lock_fd) if fcntl else msvcrt.open_osfhandle(int(a.lock_fd), os.O_RDWR)
         run(a.side, box_of(gitdir, a.side, a.lane), root, a.request, a.no_edit == '1', lock_fd)
@@ -1311,6 +1318,8 @@ def main(argv=None):
             preset()  # a bad preference file is refused before the lane is touched
         if not LANE.match(a.lane):
             die(f'lane names are [a-z0-9-], up to 40, and not "all": {a.lane!r}')
+        if forced and a.worktree:
+            die(f'{READ_ONLY} is set: read-only lanes only, no --worktree', BUSY)
         box = box_of(gitdir, side, a.lane)
         box.mkdir(parents=True, exist_ok=True)
         try:
@@ -1321,7 +1330,7 @@ def main(argv=None):
             die('--task - must be UTF-8')  # stdin is read as UTF-8 there, not in the ANSI code page
         if not task.strip():
             die('the task resolved to nothing')
-        request = start(box, root, side, task, a.no_edit, a.read_only, a.worktree, a.model, a.effort, a.tier)
+        request = start(box, root, side, task, a.no_edit, a.read_only or forced, a.worktree, a.model, a.effort, a.tier)
         print(request, flush=True)
         if a.detach:
             return 0
@@ -1340,6 +1349,10 @@ def main(argv=None):
         with admission(box):  # not after a delivery removed the request, which would leave an orphan verdict
             if not lock.exists():
                 die(f'no request {a.request} in this worktree: delivered already', BUSY)
+            lane_kind = kind(box)
+            if forced and lane_kind != 'read-only':
+                die(f'{box.parent.name}/{box.name} is {lane_kind or "kindless"}, not read-only; '
+                    f'not killing {a.request}', BUSY)
             pid = cli_pid(lock)
             if publish(exit_file, 'killed\n') and pid:  # our CLI, orphaned or not; a runner still there sees it too
                 with holder(int(pid), lock) as process:
@@ -1382,10 +1395,10 @@ def main(argv=None):
     if a.cmd == 'reset':
         if a.lane != 'all' and not LANE.match(a.lane):
             die(f'lane names are [a-z0-9-], up to 40: {a.lane!r}')
-        if a.read_only and a.lane == 'all':
+        if (a.read_only or forced) and a.lane == 'all':
             die('--read-only resets one named lane, not all')
         for lane in lanes(gitdir, a.side) if a.lane == 'all' else [a.lane]:
-            reset(root, gitdir, a.side, lane, a.read_only)
+            reset(root, gitdir, a.side, lane, a.read_only or forced)
         return 0
 
 

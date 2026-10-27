@@ -7,7 +7,9 @@ are the source of truth.
 
 `--to codex|claude` picks the coworker, by default the other CLI: Codex from
 Claude Code, Claude from Codex. `--read-only` asserts a read-only lane,
-refused on `main` or a worktree lane.
+refused on `main` or a worktree lane. `COWORK_READ_ONLY`, which the
+`coworker` agent's hook exports, forces it on `send` and `reset` and keeps
+`kill` to read-only lanes.
 `--model M` and `--effort E` set a Claude lane's pair; `--tier` is for Codex
 lanes. Either on the wrong side is refused.
 
