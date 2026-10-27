@@ -434,6 +434,13 @@ class CoworkTest(unittest.TestCase):
             self.assertEqual((code, out.strip()), (0, 'codex/review: session forgotten'))
         self.assertTrue((self.root / '.worktrees' / 'cowork-codex-impl').exists())
 
+    def test_an_empty_relay_marker_is_still_the_marker(self):
+        with mock.patch.dict('os.environ', {cowork.READ_ONLY: ''}):
+            code, _, _, err = self.send('--task', 'b')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('main is this checkout and writable', err)
+        self.assertEqual(self.calls(), [])
+
     def test_the_relays_marker_kills_only_a_read_only_lanes_request_checked_under_its_lock(self):
         main_proc, writable = self.send_gated('--task', 'slow')
         review_proc, request = self.send_gated('--lane', 'review', '--task', 'slow')

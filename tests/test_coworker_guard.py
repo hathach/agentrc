@@ -16,6 +16,7 @@ SCRIPT = REPO / 'skills' / 'cowork' / 'scripts' / 'coworker_guard.py'
 spec = importlib.util.spec_from_file_location('cowork', SCRIPT.with_name('cowork.py'))
 cowork = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cowork)
+PREFIX = f'export {cowork.READ_ONLY}=1; readonly {cowork.READ_ONLY}'   # what every command runs after
 
 
 def setUpModule():
@@ -37,29 +38,33 @@ class HookTest(unittest.TestCase):
         self.assertEqual((done.returncode, done.stderr), (0, ''))
         out = json.loads(done.stdout)['hookSpecificOutput']
         self.assertEqual(out['hookEventName'], 'PreToolUse')
-        self.assertEqual(out['updatedInput'], {'command': f'export {cowork.READ_ONLY}=1\n{command}', 'timeout': 600000,
+        self.assertEqual(out['updatedInput'], {'command': f'{PREFIX}\n{command}', 'timeout': 600000,
                                                'run_in_background': True})
 
-    @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'needs a POSIX bash')
-    def test_the_marker_reaches_a_heredoc_command(self):
-        # names no marker, which the hook would deny
-        script = ('import os, sys; '
-                  'print([k + "=" + v for k, v in os.environ.items() if k.startswith("COWORK_")], end=" ")')
-        command = f"{sys.executable} -c '{script}; print(sys.stdin.read())' <<'END'\ntask\nEND"
+    def rewritten_run(self, command):
+        """The command as the hook rewrites it, run through bash outside any marker; its completed process."""
         done = hook({'tool_name': 'Bash', 'tool_input': {'command': command}})
+        self.assertEqual((done.returncode, done.stderr), (0, ''))
         rewritten = json.loads(done.stdout)['hookSpecificOutput']['updatedInput']['command']
         env = {k: v for k, v in os.environ.items() if not k.startswith('COWORK_')}
-        ran = subprocess.run(['bash', '-c', rewritten], capture_output=True, text=True, env=env)
-        self.assertEqual(ran.stdout, f"['{cowork.READ_ONLY}=1'] task\n\n", ran.stderr)
+        return subprocess.run(['bash', '-c', rewritten], capture_output=True, text=True, env=env)
 
-    def test_a_command_naming_the_marker_is_denied(self):
-        for command in (f'unset {cowork.READ_ONLY}; python3 cowork.py reset codex impl',
-                        f'{cowork.READ_ONLY}= python3 cowork.py kill codex-main-1'):
+    @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'needs a POSIX bash')
+    def test_a_heredoc_task_naming_the_marker_reaches_the_script_with_it_set(self):
+        script = 'import os, sys; print(repr(os.environ.get(sys.argv[1])), sys.stdin.read(), end="")'
+        task = f'Review {cowork.READ_ONLY} handling in cowork.py.\n'
+        ran = self.rewritten_run(f"{sys.executable} -c '{script}' {cowork.READ_ONLY} <<'END'\n{task}END")
+        self.assertEqual(ran.stdout, f"'1' {task}", ran.stderr)
+
+    @unittest.skipIf(os.name == 'nt' or shutil.which('bash') is None, 'needs a POSIX bash')
+    def test_an_unset_or_assignment_after_the_prefix_leaves_the_marker_set(self):
+        show = f"{sys.executable} -c 'import os, sys; print(os.environ.get(sys.argv[1]))' {cowork.READ_ONLY}"
+        for command in (f'unset {cowork.READ_ONLY}; {show}', f'{cowork.READ_ONLY}= {show}',
+                        f'{cowork.READ_ONLY}=0; {show}'):
             with self.subTest(command):
-                done = hook({'tool_name': 'Bash', 'tool_input': {'command': command}})
-                self.assertEqual(done.returncode, 2)
-                self.assertIn(f'{cowork.READ_ONLY} is this hook\'s to set', done.stderr)
-                self.assertEqual(done.stdout, '')
+                ran = self.rewritten_run(command)
+                self.assertIn('readonly variable', ran.stderr)
+                self.assertIn(ran.stdout, ('1\n', ''), 'the marker kept, or the command not run')
 
     def test_garbage_or_a_missing_command_denies(self):
         for payload in ('not json', {'tool_name': 'Bash', 'tool_input': {}}):

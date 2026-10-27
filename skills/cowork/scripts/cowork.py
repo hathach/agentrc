@@ -42,10 +42,10 @@ receipt that names it; status lists the lanes holding a request and counts
 the idle ones, --all lists every lane; reset removes
 everything of a lane, its worktree included once its branch is merged, and
 with --read-only only a read-only lane, checked under the lane's lock.
-COWORK_READ_ONLY set to anything, as the coworker agent's hook exports it
-(coworker_guard.py), makes send and reset --read-only whatever the flags,
-refuses send --worktree, and lets kill stop only a read-only lane's request,
-its lane checked under the lane's lock.
+COWORK_READ_ONLY in the environment, even empty, as the coworker agent's
+hook exports it (coworker_guard.py), makes send and reset --read-only
+whatever the flags, refuses send --worktree, and lets kill stop only a
+read-only lane's request, its lane checked under the lane's lock.
 
 Exit codes: 0 success, for a delivery a reply; 1 the turn failed, was
 killed or died, or never ran because a --no-edit tree could not be read
@@ -1302,7 +1302,7 @@ def main(argv=None):
         return 0
 
     root, gitdir = git_dir()
-    forced = bool(os.environ.get(READ_ONLY))
+    forced = READ_ONLY in os.environ
     if a.cmd == '_run':
         lock_fd = int(a.lock_fd) if fcntl else msvcrt.open_osfhandle(int(a.lock_fd), os.O_RDWR)
         run(a.side, box_of(gitdir, a.side, a.lane), root, a.request, a.no_edit == '1', lock_fd)
