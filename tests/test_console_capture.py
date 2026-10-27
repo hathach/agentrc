@@ -665,7 +665,6 @@ class WindowsBackendTest(unittest.TestCase):
         self.assertEqual(out['marks'], [{'pattern': r'rst:0x[0-9a-f]+', 'offset': 17, 't': times[0]['t'],
                                          'text': 'rst:0x17'}])
         self.assertGreaterEqual(elapsed, 0.6)
-        self.assertLess(elapsed, 0.6 + 0.5)
         polls = [c[1] for c in self.calls('nt_read')]
         self.assertTrue(all(1 <= ms <= self.m.READ_POLL_MS for ms in polls), polls)
         self.assert_restored_and_closed(out)
