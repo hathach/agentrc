@@ -162,7 +162,8 @@ class Tasks:
 
     def __init__(self):
         self.about, self.status, self.tool, self.run, self.stops, self.messages = {}, {}, {}, {}, set(), set()
-        self.listed, self.killed, self.open = set(), {}, set()   # killed: task -> [its run, a tool result since]
+        # killed and stops by (task, run): a resumed task keeps its id under a new run
+        self.listed, self.killed, self.open = set(), {}, set()   # killed: -> a tool result or resume since
 
     def owner(self, task):
         """The `parent_tool_use_id` its owner's messages carry: None for chief's, '?' for a unit never started here."""
@@ -174,23 +175,24 @@ class Tasks:
         scope = event.get('parent_tool_use_id')
         if kind == 'assistant':
             content = event['message']['content']
-            self.stops.update(str((b.get('input') or {}).get('task_id')) for b in content
-                              if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('name') == 'TaskStop')
+            stopped = (str((b.get('input') or {}).get('task_id')) for b in content
+                       if isinstance(b, dict) and b.get('type') == 'tool_use' and b.get('name') == 'TaskStop')
+            self.stops.update((t, self.run.get(t)) for t in stopped)
             if (msg := event['message'].get('id')) not in self.messages:
                 self.messages.add(msg)
-                self.forget(lambda t, k: k[1] and self.owner(t) == scope)
-            self.forget(lambda t, k: t in self.stops)
+                self.forget(lambda key, fed: fed and self.owner(key[0]) == scope)
+            self.forget(lambda key, fed: key in self.stops)
         elif kind == 'user':
-            for t, k in self.killed.items():
-                k[1] = k[1] or self.owner(t) == scope
+            for key in self.killed:
+                self.killed[key] = self.killed[key] or self.owner(key[0]) == scope
         elif kind == 'result':
             if (origin := event.get('origin') or {}).get('kind') == 'task-notification':
-                self.forget(lambda t, k: k[0] == origin.get('runId'))
+                self.forget(lambda key, fed: key[1] == origin.get('runId'))
             self.open = {t for t, s in self.status.items() if s not in self.ENDED} | self.listed
         elif kind != 'system':
             return
         elif sub == 'init':
-            self.forget(lambda t, k: self.owner(t) is None)
+            self.forget(lambda key, fed: self.owner(key[0]) is None)
         elif sub == 'background_tasks_changed':
             self.listed = {t['task_id'] for t in event.get('tasks') or []}
             for t in event.get('tasks') or []:
@@ -200,25 +202,26 @@ class Tasks:
         elif sub == 'task_started':
             self.about[task] = (event.get('description') or '', event.get('parent_task_id'))
             self.status[task], self.tool[task], self.run[task] = 'running', event.get('tool_use_id'), event.get('run_id')
-            self.stops.discard(task)   # a stop names a run: the resumed one is not covered
-            for t, k in self.killed.items():
-                k[1] = k[1] or f'<task-id>{t}</task-id>' in (event.get('prompt') or '')
+            for key in self.killed:   # a notification of the latest run's end
+                self.killed[key] = self.killed[key] or (key[1] == self.run.get(key[0]) and
+                                                        f'<task-id>{key[0]}</task-id>' in (event.get('prompt') or ''))
         elif sub in ('task_updated', 'task_notification'):
             status = (event.get('patch') or {}).get('status') if sub == 'task_updated' else event.get('status')
             if status:
                 self.status[task] = status
-            if status in ('killed', 'stopped') and task not in self.stops and task not in self.killed:
-                self.killed[task] = [event.get('run_id') or self.run.get(task), False]
+            key = (task, event.get('run_id') or self.run.get(task))
+            if status in ('killed', 'stopped') and key not in self.stops:
+                self.killed.setdefault(key, False)
 
     def forget(self, taken):
-        self.killed = {t: k for t, k in self.killed.items() if not taken(t, k)}
+        self.killed = {key: fed for key, fed in self.killed.items() if not taken(key, fed)}
 
     def cut(self):
         """Each task cut off, `<id> <status> "<description>"`, a unit's own followed by ` under <id> "<description>"`."""
         def said(task):
             return '"' + ' '.join(self.about.get(task, ('', None))[0].split())[:60] + '"'
         rows = []
-        for task in sorted(self.open | set(self.killed)):
+        for task in sorted(self.open | {t for t, _ in self.killed}):
             row, parent = f'{task} {self.status.get(task, "running")} {said(task)}', self.about.get(task, ('', None))[1]
             rows.append(f'{row} under {parent} {said(parent)}' if parent else row)
         return rows

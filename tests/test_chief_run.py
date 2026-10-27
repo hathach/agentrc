@@ -337,6 +337,9 @@ class ChiefRun(unittest.TestCase):
                 init(), *wait, *wait_killed, {**result('x'), 'origin': {'kind': 'task-notification', 'runId': 'r1'}}, *rewait,
                 *wait_killed, text('m3', 'W1 is done.'), {**result('W1 is done.'), 'origin': {'kind': 'task-notification', 'runId': 'r1'}}),
              'bwait stopped "Wait"'),
+            ("a resumed run killed while the first run's kill is open", (
+                init(), *wait, *wait_killed, *rewait, *wait_killed, text('m3', 'W1 is done.'),
+                {**result('W1 is done.'), 'origin': {'kind': 'task-notification', 'runId': 'r1'}}), 'bwait stopped "Wait"'),
         ]
         for name, events, cut in cases:
             with self.subTest(name):
