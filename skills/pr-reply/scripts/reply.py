@@ -45,6 +45,7 @@ when finding the repo (gh repo view) or our login (gh api user) fails, with
 holds a PENDING review on the PR, which GitHub refuses review replies beside:
 exit 2 with the error "pending review <id> of <login> on PR #<N> blocks
 replies: ...", for a human to submit or delete; this script never does either.
+A failed listing of the reviews is exit 2 too, nothing posted.
 A failed call's error is gh's diagnostic plus the message and errors GitHub
 answered with, at most BODY_MAX characters of them. A null resolved or
 error is left out of the line: a model relaying it drops a trailing null. An
@@ -194,11 +195,8 @@ class Poster:
         return self._reviews
 
     def pending_review(self):
-        """Our PENDING review on the PR, None when there is none or the listing failed (each entry then meets that failure)."""
-        try:
-            return next((r for r in self.reviews() if r.get('state') == 'PENDING' and (r.get('user') or {}).get('login') == self.me), None)
-        except ApiError:
-            return None
+        """Our PENDING review on the PR, None when there is none; ApiError when the reviews could not be listed."""
+        return next((r for r in self.reviews() if r.get('state') == 'PENDING' and (r.get('user') or {}).get('login') == self.me), None)
 
     def kind_of(self, comment_id):
         """('review', comment) for an inline review comment on this PR, ('issue',
@@ -603,7 +601,11 @@ def main(argv=None):
         inspected = [inspect(poster, c, r) for c, r in a.inspect]
         print(json.dumps(sealed({'inspected': inspected})))
         return 0 if all(i['error'] is None for i in inspected) else 1
-    pending = poster.pending_review() if replies else None
+    try:
+        pending = poster.pending_review() if replies else None
+    except ApiError as e:
+        # A later listing that succeeds could still hold one: nothing is posted unchecked.
+        return failed(f'the reviews on PR #{a.pr} could not be listed to check for a pending review of ours: {e}')
     if pending:
         # pr-babysit.js matches this text to stop as pending-review
         return failed(f"pending review {pending['id']} of {poster.me} on PR #{a.pr} blocks replies: GitHub refuses a review reply "

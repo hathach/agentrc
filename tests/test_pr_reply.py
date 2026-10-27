@@ -233,7 +233,8 @@ class ReplyTest(ReplyCase):
         self.assertEqual(self.gh.mutations, [])
 
     def test_failed_lookup_is_not_none(self):
-        self.gh.down.add(f'repos/{REPO}/pulls/{PR}/reviews')
+        # The reviews listing failing stops a manifest outright (the pending-review check); the issue comments' is per entry.
+        self.gh.down.add(f'repos/{REPO}/issues/{PR}/comments')
         rc, receipts = self.run_script([{'commentId': 99, 'body': 'x'}])
         self.assertEqual(rc, 1)
         self.assertEqual((receipts[0]['kind'], receipts[0]['sent']), (None, False))
@@ -404,6 +405,27 @@ class ReplyTest(ReplyCase):
         self.gh.review_comment(11, 'ok', ME, thread='T10', parent=10)
         rc, receipts = self.reuse({'commentId': 10, 'replyId': 11, 'bodyDigest': reply.fnv1a('ok'), 'originalDigest': reply.original_digest(self.gh.review[10])})
         self.assertEqual((rc, receipts[0]['verified']), (0, True))
+
+    def test_a_failed_pending_review_check_posts_nothing(self):
+        # The next listing could hold our pending review: a failed check is never read as none.
+        self.gh.review_comment(10)
+        self.gh.add_review(77, body='', login=ME, state='PENDING')
+        real = self.gh.gh
+        answers = iter([(1, '', 'gh: Service Unavailable (HTTP 503)'), (1, '', 'gh: API rate limit exceeded for user ID 1 (HTTP 403)')])
+
+        def gh(args, stdin=None):
+            if args[:4] == ['api', '-X', 'GET', f'repos/{REPO}/pulls/{PR}/reviews?per_page=100']:
+                self.gh.calls.append(args)
+                return next(answers)
+            return real(args, stdin)
+        for said in ('HTTP 503', 'rate limit'):
+            with mock.patch.object(reply, 'gh', gh):
+                rc, out = self.main('--manifest', self.json_file({'replies': [{'commentId': 10, 'body': 'a', 'digest': reply.fnv1a('a')}]}))
+            self.assertEqual(rc, 2)
+            self.assertTrue(out['error'].startswith(f'the reviews on PR #{PR} could not be listed to check for a pending review of ours: '), out)
+            self.assertIn(said, out['error'])
+            self.assertEqual(self.gh.mutations, [])
+            self.assertFalse(any(a[:3] == ['api', '-X', 'POST'] for a in self.gh.calls), 'no POST attempted')
 
     def test_another_accounts_pending_review_or_our_submitted_one_posts(self):
         self.gh.review_comment(10)
