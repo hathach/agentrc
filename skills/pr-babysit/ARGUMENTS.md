@@ -1,8 +1,16 @@
 # pr-babysit arguments
 
-The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workflows/pr-babysit.js`).
+The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workflows/pr-babysit.js`). A key not
+listed here throws before anything runs.
 
 - `pr` (number, required).
+- `repo`: `OWNER/NAME`, the repository `pr` belongs to (a fork PR's base
+  repository); every script's gh call names it. Omitted, a resumed launch takes
+  its state's, and a first launch the one the checkout's remotes name alone:
+  the remote marked `gh-resolved` (`gh repo set-default`), else the only GitHub
+  repository any remote names; with several and none marked, preflight stops
+  rather than guess. A state continues only its own repository: another refuses
+  the launch. Per launch.
 - `reviewers`: of `copilot`, `coderabbit`, `greptile`, `code-scanning`;
   default `['coderabbit', 'greptile', 'code-scanning']`; `[]` runs no review lane.
 - `autoRun`: the reviewers that run on every push and gate done; default

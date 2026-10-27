@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Mark the SonarCloud issues behind a PR's code-scanning comments false positive.
 
-  sonar.py --pr N --head SHA --manifest FILE [--receipt PATH]
+  sonar.py --pr N --head SHA --manifest FILE [--receipt PATH] [--repo OWNER/NAME]
 
 FILE holds {"items": [{"commentId", "commentDigest", "how", "note", "digest"}]}:
 how is "refutation" or "fixNote", digest the workflow's fnv1a of note, and
 commentDigest harvest.py's digest of the comment body the note answered. Each
-comment is read from GitHub; only a github-advanced-security[bot] comment on
+comment is read from GitHub, in --repo else the checkout's one repository
+(facts.bind_repo); only a github-advanced-security[bot] comment on
 PR N, still that body, carrying a SONAR_ISSUE_KEY and a sonarcloud.io link to
 PR N names an issue. The issue is read on the PR from SonarCloud with
 $SONAR_TOKEN, which goes to https://sonarcloud.io only. Each item's outcome:
@@ -44,7 +45,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, attempt, fnv1a, report, sealed  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, fnv1a, report, sealed  # noqa: E402
 from harvest import digest  # noqa: E402
 
 HOST = 'https://sonarcloud.io'
@@ -201,6 +202,7 @@ def mark(argv):
     p.add_argument('--head', required=True)
     p.add_argument('--manifest', required=True)
     p.add_argument('--receipt')
+    p.add_argument('--repo')
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.head):
         raise Unusable(f'not a full SHA: {a.head!r}')
@@ -209,6 +211,7 @@ def mark(argv):
     saved = saved_results(a.receipt, request) if a.receipt else None
     if saved is not None:
         return {'results': saved}
+    bind_repo(a.repo)
     token = os.environ.get('SONAR_TOKEN', '').strip()
     if not token:
         raise Unusable('SONAR_TOKEN is not set')

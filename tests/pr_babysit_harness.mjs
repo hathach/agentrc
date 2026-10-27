@@ -81,7 +81,7 @@ const BASE = 'ba5eba5eba5eba5eba5eba5eba5eba5eba5eba5e'
 const TIP = '7e57e57e57e57e57e57e57e57e57e57e57e57e57'
 // What the preflight pins, and what the pre-publish recheck must still find.
 const PIN = {
-  branch: 'claude/foo', prBranch: 'claude/foo',
+  repo: 'hathach/tinyusb', branch: 'claude/foo', prBranch: 'claude/foo',
   prHead: HEAD, prBase: BASE, prBaseBranch: 'master', prBaseTip: TIP, prRepo: 'hathach/tinyusb', prUrl: 'https://github.com/hathach/tinyusb/pull/3888', prState: 'OPEN',
   remote: 'origin', upstreamBranch: 'claude/foo',
   pushUrls: ['git@github.com:hathach/tinyusb.git'], head: HEAD, dirty: [],
@@ -765,9 +765,73 @@ test('the preflight pins the checkout without touching it', async () => {
   const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
-    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'receipts', 'remote', 'upstreamBranch'])
+    ['badPushUrl', 'branch', 'dirty', 'head', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'receipts', 'remote', 'repo', 'upstreamBranch'])
   assert.ok(logs.some(l =>
     l === 'preflight: hathach/tinyusb claude/foo@0f1e2d3 tracking origin, clean'))
+})
+
+// #311: a fork-of-a-fork checkout made gh read PR 9 in the wrong repository, and a `repo` argument was ignored.
+const PICO = 'adafruit/Pico-PIO-USB'
+const picoPin = { repo: PICO, prUrl: `https://github.com/${PICO}/pull/3888` }
+// The scripts that call gh, as a prompt runs them: each must name the PR's repository.
+const GH_SCRIPT = /(?:harvest|push|sonar|coderabbit_trigger|greptile_trigger|reply|collect)\.py|preflight\.py --(?:pr|state)/
+
+test('an unknown or malformed argument throws before any agent runs (#311)', async () => {
+  for (const [args, expected] of [
+    [{ repository: PICO }, /unknown argument\(s\) \["repository"\]: pr-babysit takes only pr, repo, reviewers/],
+    [{ repo: 'adafruit' }, /repo must be OWNER\/NAME/], [{ repo: `${PICO}/x` }, /repo must be OWNER\/NAME/], [{ repo: 7 }, /repo must be OWNER\/NAME/],
+  ]) {
+    const trace = []
+    await assert.rejects(run({ args, trace }), expected, JSON.stringify(args))
+    assert.deepEqual(trace, [], JSON.stringify(args))
+  }
+})
+
+test('the repo named is the one every gh-calling script is run against (#311)', async () => {
+  const reviews = { findings: [finding({ commentId: 1 }), invalidFinding({ commentId: 2, line: 4 })], replies: [{ commentId: 2, body: 'not so' }], bots: 'reviewed' }
+  const named = await run({ reviews, scope: ['src/a.c'], args: { repo: PICO, autoPush: true, maxCycles: 2 }, preflight: picoPin })
+  assert.ok(named.calls[0].prompt.includes(`--repo '${PICO}'\``), named.calls[0].prompt)
+  const gh = named.calls.filter(c => GH_SCRIPT.test(c.prompt))
+  assert.ok(['reviews#1', 'replies#1', 'push#1-review', 'ci:collect#1.1', 'prstate#1-replies'].every(l => gh.some(c => c.label === l)), gh.map(c => c.label).join(', '))
+  for (const c of gh) assert.ok(c.prompt.includes(`--repo '${PICO}'`), `${c.label}: ${c.prompt}`)
+  // Omitted, the repository preflight found the checkout naming is the one every later call names.
+  const found = await run({ reviews, scope: ['src/a.c'], args: { autoPush: true, maxCycles: 2 }, preflight: picoPin })
+  assert.doesNotMatch(found.calls[0].prompt, /--repo/)
+  for (const c of found.calls.filter(c => GH_SCRIPT.test(c.prompt)).slice(1)) assert.ok(c.prompt.includes(`--repo '${PICO}'`), `${c.label}: ${c.prompt}`)
+  const judged = await run({ ...redWith({ check: 'build', firstError: 'error: x', files: [] }), args: { repo: PICO }, preflight: picoPin })
+  assert.match(judged.calls.find(c => c.label === 'ci:judge#1').prompt, /Judge the failing CI checks of PR #3888 of adafruit\/Pico-PIO-USB at head/)
+})
+
+test('a pin of another repository than the one named or read stops at preflight (#311)', async () => {
+  for (const [args, preflight, detail] of [
+    // The same PR number in another repository: what an unpinned gh read in a fork-of-a-fork checkout.
+    [{ repo: PICO }, { repo: PICO, prUrl: 'https://github.com/sekigon-gonnoc/Pico-PIO-USB/pull/3888' },
+      'adafruit/Pico-PIO-USB read PR #3888 as https://github.com/sekigon-gonnoc/Pico-PIO-USB/pull/3888'],
+    [{ repo: PICO }, { repo: 'sekigon-gonnoc/Pico-PIO-USB', prUrl: 'https://github.com/sekigon-gonnoc/Pico-PIO-USB/pull/3888' },
+      'the pin is of sekigon-gonnoc/Pico-PIO-USB, not adafruit/Pico-PIO-USB'],
+    [{}, { prUrl: `https://github.com/${PICO}/pull/3888` }, `hathach/tinyusb read PR #3888 as https://github.com/${PICO}/pull/3888`],
+    [{}, { ...picoPin, prUrl: `https://github.com/${PICO}/pull/38` }, `${PICO} read PR #3888 as https://github.com/${PICO}/pull/38`],
+    [{}, { repo: '' }, 'the pin names no repository OWNER/NAME ("")'],
+  ]) {
+    const { result, labels } = await run({ reviews: oneValid, args, preflight })
+    assert.deepEqual([result.reason, result.detail], ['preflight-failed', detail])
+    assert.deepEqual(labels, ['preflight'])
+  }
+  // Case is no other repository.
+  const cased = await run({ args: { repo: 'ADAFRUIT/pico-pio-usb' }, preflight: picoPin })
+  assert.equal(cased.result.pass, true, cased.result.reason)
+})
+
+test('a resumed launch names its state\'s repository, and refuses another (#311)', async () => {
+  const state = adoptionState()
+  const trace = []
+  await assert.rejects(run({ args: adoptionArgs(state, { adoptHead: undefined, repo: PICO }), trace }),
+    /repo adafruit\/Pico-PIO-USB is not the state's hathach\/tinyusb: a state continues only the PR it pinned/)
+  assert.deepEqual(trace, [])
+  const resumed = await run({ args: adoptionArgs(state, { adoptHead: undefined }) })
+  assert.ok(resumed.calls[0].prompt.includes("--repo 'hathach/tinyusb'`"), resumed.calls[0].prompt)
+  const cased = await run({ args: adoptionArgs(state, { adoptHead: undefined, repo: 'HATHACH/TinyUSB' }) })
+  assert.ok(cased.calls[0].prompt.includes("--repo 'HATHACH/TinyUSB'`"), cased.calls[0].prompt)
 })
 
 test('a dirty start refuses before any writer runs', async () => {
@@ -1511,7 +1575,7 @@ test('the publisher stages exactly the owned paths, never a protected one', asyn
   const push = calls.find(c => c.label === 'push#1-review')
   // The exact refspec is the point: pushing the branch would publish whatever
   // HEAD became after the audit, not the commit that was audited.
-  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888\``), push.prompt)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${shaFor(1)} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --repo 'hathach/tinyusb'\``), push.prompt)
   assert.match(push.prompt, /Committing, amending and forcing nothing/)
   // The stage cannot commit and already knows the SHA, so it is asked for neither.
   assert.deepEqual(push.schema.required, ['pushed', 'detail', 'heads', 'prState'])
@@ -2722,7 +2786,7 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
   assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
   const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
   assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
-  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `python3 ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888` /)
+  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `python3 ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
   // A copy that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
   const miscopied = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
   assert.equal(miscopied.result.reason, 'pr-state-unread')
@@ -2790,7 +2854,7 @@ test('a push refused because the PR is no longer open stops the launch, its comm
   assert.equal(result.reason, 'pr-merged')
   assert.equal(result.history[0].reviewPushFailed.prState, 'merged')
   assert.equal(result.state.pending.stage, 'push-failed')
-  assert.match(calls.find(c => c.label === 'push#1-review').prompt, / --open-pr 3888`/)
+  assert.match(calls.find(c => c.label === 'push#1-review').prompt, / --open-pr 3888 --repo 'hathach\/tinyusb'`/)
 })
 
 test('a PR conflicting with its base stops, judging nothing, whatever its checks say (#51)', async () => {
@@ -4128,7 +4192,7 @@ test('a reply is published by the script from a workflow-built manifest', async 
   for (const label of ['replies#1', 'resolve#1']) {
     const c = calls.find(x => x.label === label)
     assert.ok(c, `${label} ran`)
-    assert.match(c.prompt, /skills\/pr-reply\/scripts\/reply\.py --pr 3888 --manifest/, `${label} runs the script`)
+    assert.match(c.prompt, /skills\/pr-reply\/scripts\/reply\.py --pr 3888 --repo 'hathach\/tinyusb' --manifest/, `${label} runs the script`)
     assert.doesNotMatch(c.prompt, /gh api/, `${label} types no gh call`)
     assert.equal(c.schema.properties.receipts.items.additionalProperties, false, `${label} takes receipts only`)
   }
@@ -5710,7 +5774,7 @@ test('a resumed launch refuses a checkout that is another PR, even at the expect
   const first = await run({ args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true }, reviews: owing, challenge: upheld })
   const second = await run({
     args: { autoPush: true, maxCycles: 3, yieldAfterCycle: true, state: first.result.state },
-    preflight: { prRepo: 'someone/tinyusb', prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'] },
+    preflight: { prRepo: 'someone/tinyusb', pushUrls: ['git@github.com:someone/tinyusb.git'] },
     reviews: owing,
   })
   assert.equal(second.result.reason, 'state-mismatch')
@@ -5838,7 +5902,7 @@ test('adoption publishes before cycle watchers and reviews the adopted head', as
   assert.ok(audit.prompt.includes(`commits.py chain ${HEAD} ${ADOPT} --published ${HEAD} --base ${BASE} --tip ${TIP}\``), audit.prompt)
   const push = calls.find(c => c.label === 'adopt:push')
   assert.equal(push.phase, 'Push')
-  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --pr 3888\``), push.prompt)
+  assert.ok(push.prompt.includes(`push.py --remote 'origin' --branch 'claude/foo' --sha ${ADOPT} --push-url 'git@github.com:hathach/tinyusb.git' --open-pr 3888 --pr 3888 --repo 'hathach/tinyusb'\``), push.prompt)
 })
 
 test('a lost adoption push receipt gets one fresh agent, which reads the push back', async () => {
@@ -6008,8 +6072,7 @@ test('adoption keeps ordinary preflight refusals ahead of its own checks', async
     ['dirty-start', adoptionState(), { head: ADOPT, prHead: FOREIGN, dirty: [' M src/a.c'] }],
     ['wrong-branch', adoptionState(), { head: ADOPT, prHead: FOREIGN, branch: 'main', upstreamBranch: 'main' }],
     ['state-mismatch', adoptionState(), {
-      head: ADOPT, prHead: FOREIGN, prRepo: 'someone/tinyusb',
-      prUrl: 'https://github.com/someone/tinyusb/pull/3888', pushUrls: ['git@github.com:someone/tinyusb.git'],
+      head: ADOPT, prHead: FOREIGN, prRepo: 'someone/tinyusb', pushUrls: ['git@github.com:someone/tinyusb.git'],
     }],
     ['wrong-remote', adoptionState({ pin: { ...STATE_PIN, pushUrls: [badPush] } }), {
       head: ADOPT, prHead: FOREIGN, pushUrls: [badPush], badPushUrl: badPush,
@@ -6970,7 +7033,7 @@ test('coderabbitTrigger ticks the Trigger review box on a manual-review skip, th
   assert.equal(result.cycles, 2)
   assert.deepEqual(triggers(labels), ['crtrigger#1'])
   const call = calls.find(c => c.label === 'crtrigger#1')
-  assert.ok(call.prompt.includes(`coderabbit_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
+  assert.ok(call.prompt.includes(`coderabbit_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD}\``), call.prompt)
   assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
   assert.ok(logs.includes('cycle 1: crtrigger#1: ticked (comment 5)'), logs.join('\n'))
   assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit review triggered (${MANUAL}, 10m to cap)`)
@@ -7053,7 +7116,7 @@ test('a rate-limited CodeRabbit is asked once after its reset, then waited for',
   assert.equal(result.pass, true, result.reason)
   assert.equal(result.cycles, 3)
   assert.deepEqual(requests(labels), ['crrequest#2'])
-  assert.ok(calls.find(c => c.label === 'crrequest#2').prompt.includes(`coderabbit_trigger.py --pr 3888 --head ${HEAD} --request\``))
+  assert.ok(calls.find(c => c.label === 'crrequest#2').prompt.includes(`coderabbit_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --request\``))
   assert.equal(napMs[0], 21 * 60000, 'one nap to a minute past the reset')
   assert.equal(headLine(logs)[0], `cycle 1 summary — CI green, reviews: coderabbit settled (limited: Review rate limited; asking again after ${at(20)})`)
   assert.ok(logs.includes('cycle 2: crrequest#2: requested (comment 99)'), logs.join('\n'))
@@ -7531,7 +7594,7 @@ test('markSonar marks the SonarCloud issue of a refuted code-scanning comment wi
   assert.ok(labels.indexOf('sonar#1') > labels.findIndex(l => l.startsWith('replies#')), labels.join(', '))
   const [item] = payloadOf(calls.find(c => c.label === 'sonar#1').prompt, 'Manifest').items
   assert.deepEqual(item, { commentId: 3, commentDigest: 'd3', how: 'refutation', note: 'Not injectable: a list argv.', digest: fnv1a('Not injectable: a list argv.') })
-  assert.match(calls.find(c => c.label === 'sonar#1').prompt, new RegExp(`--pr 3888 --head ${HEAD} --manifest`))
+  assert.match(calls.find(c => c.label === 'sonar#1').prompt, new RegExp(`--pr 3888 --repo 'hathach/tinyusb' --head ${HEAD} --manifest`))
   assert.deepEqual(result.history[0].sonar, [{ commentId: 3, issue: 'K3', outcome: 'marked', detail: 'false positive' }])
   assert.equal('sonarUnmarked' in result, false)
   assert.deepEqual(sonarOf(result.state), [])
@@ -8068,7 +8131,7 @@ test('greptileTrigger waits out a grace with Greptile absent, asks once, then wa
   assert.equal(result.cycles, 5)
   assert.deepEqual(gAsks(labels), ['greptile#3'], 'two minutes after the first observation, once')
   const call = calls.find(c => c.label === 'greptile#3')
-  assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --head ${HEAD}\``), call.prompt)
+  assert.ok(call.prompt.includes(`greptile_trigger.py --pr 3888 --repo 'hathach/tinyusb' --head ${HEAD}\``), call.prompt)
   assert.deepEqual([call.agentType, call.model, call.phase], ['relay', 'haiku', 'Push'])
   assert.equal(labels.some(l => l.startsWith('prstate#')), false, 'the script reads the PR open at the head itself, just before it posts')
   assert.deepEqual(harvestFlags(calls.find(c => c.label === 'reviews#1').prompt)[1], ['coderabbit', 'greptile'])

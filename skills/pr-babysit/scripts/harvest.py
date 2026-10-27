@@ -6,7 +6,7 @@
 --auto-run names the bots settled from their artifacts, only coderabbit and greptile. Copilot is read
 from its newest submitted review on the head; any other reviewer is `harvested`, its state not read.
 
-Run from the PR checkout; --repo names the PR's repository instead of the checkout's. It settles first and harvests second: the bots'
+Run from the PR checkout; --repo names the PR's repository, else the checkout's one repository does (facts.bind_repo). It settles first and harvests second: the bots'
 artifacts are read, then the three comment endpoints, then the head again; a
 head that moved restarts the read once on the new head, and one that moves
 again is an error. The settle rules are this file's, and its tests', and read
@@ -53,7 +53,7 @@ except ImportError:
     yaml = None
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, RateLimited, Unusable, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, RateLimited, Unusable, bind_repo, report, run  # noqa: E402
 
 # reply.py checks a comment against the same digest, so both skills share one definition.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-reply' / 'scripts'))
@@ -492,8 +492,8 @@ def collect(argv):
     unknown = [r for r in reviewers if r not in KNOWN] + [r for r in auto if r not in SETTLED]
     if unknown or not set(auto) <= set(reviewers):
         raise Unusable(f'reviewers are {", ".join(KNOWN)}, and --auto-run a subset of them among {", ".join(SETTLED)}: {unknown or auto}')
+    repo = bind_repo(a.repo)
     try:
-        repo = a.repo or gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner']
         for _ in range(2):
             seen = observe(repo, a.pr, reviewers, auto)
             again = gh_json('pr', 'view', str(a.pr), '-R', repo, '--json', 'headRefOid')['headRefOid']

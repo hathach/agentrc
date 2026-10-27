@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Ask Greptile to review PR N's head: post exactly `@greptileai` as a top-level comment, once per head.
 
-  greptile_trigger.py --pr N --head SHA
+  greptile_trigger.py --pr N --head SHA [--repo OWNER/NAME]
 
 A repository whose Greptile config reviews only on PR open has a pushed head
-reviewed only on request. Run from the PR checkout. Each head's attempt is
+reviewed only on request. Run from the PR checkout; PR N is --repo's, else the
+checkout's one repository (facts.bind_repo). Each head's attempt is
 recorded under the checkout's git common dir, in
 pr-babysit/greptile/<owner>-<repo>-<N>-<SHA>.json: claimed, with the exact
 `@greptileai` comments already on the PR, before the POST, and given the
@@ -49,7 +50,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from coderabbit_trigger import pull_at  # noqa: E402
-from facts import FULL_SHA, Parser, Unusable, attempt, git, locked, report, utc  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, git, locked, report, utc  # noqa: E402
 from harvest import gh_json, head_event, newest, pages, stamp  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 import windows  # noqa: E402
@@ -166,9 +167,11 @@ def collect(argv):
     p = Parser(prog='greptile_trigger.py')
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True)
+    p.add_argument('--repo')
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.head):
         raise Unusable(f'not a full SHA: {a.head!r}')
+    bind_repo(a.repo)
     try:
         return {'at': utc(time.time()), **request(a.pr, a.head)}
     except (KeyError, TypeError, AttributeError) as e:

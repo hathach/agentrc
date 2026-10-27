@@ -486,8 +486,7 @@ class EndToEnd(unittest.TestCase):
         view = lambda h: {'headRefOid': h, 'headRefName': 'fix', 'headRepository': {'name': 'r', 'nameWithOwner': 'o/r'}}
         run = lambda id_, event, path, at, h=HEAD: {'id': id_, 'event': event, 'path': path, 'created_at': at, 'head_sha': h,
                                                     'head_branch': 'fix', 'head_repository': {'full_name': 'o/r'}}
-        a = {'repo view --json nameWithOwner': [{'nameWithOwner': R}],
-             f'pr view {N} -R {R} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
+        a = {f'pr view {N} -R {R} --json headRefOid,headRefName,headRepository': [view(h) for h in heads],
              f'pr view {N} -R {R} --json headRefOid': [{'headRefOid': h} for h in heads[1:] + heads[-1:]]}
         for h in set(heads):
             a[f'api --paginate --slurp repos/{R}/actions/runs?head_sha={h}&per_page=100'] = [[{'workflow_runs': [
@@ -511,7 +510,8 @@ class EndToEnd(unittest.TestCase):
         gh = FakeGh(self.root, answers)
         out = io.StringIO()
         with run_gh_as(gh.stub), redirect_stdout(out):
-            code = harvest.report(harvest.collect, list(argv) or ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit'], limits=True)
+            argv = list(argv) or ['--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit']
+            code = harvest.report(harvest.collect, argv if '--repo' in argv else [*argv, '--repo', 'o/r'], limits=True)
         return code, json.loads(out.getvalue().splitlines()[-1])
 
     def test_one_read(self):
@@ -528,7 +528,7 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(self.harvest(self.answers([HEAD]))[1]['fingerprint'], got['fingerprint'], 'a second read of the same evidence')
 
     def test_the_repo_named_is_read_instead_of_the_checkouts(self):
-        answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items() if not k.startswith('repo view')}
+        answers = {k.replace('o/r', 'up/r'): v for k, v in self.answers([HEAD]).items()}
         code, got = self.harvest(answers, '--pr', '7', '--reviewers', 'coderabbit,copilot', '--auto-run', 'coderabbit', '--repo', 'up/r')
         self.assertEqual((code, got['headSha']), (0, HEAD), got)
 

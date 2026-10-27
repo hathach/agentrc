@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Push one commit to a branch and read back where it landed.
 
-  push.py --remote R --branch B --sha S --push-url U [--push-url U ...] [--open-pr N] [--pr N]
+  push.py --remote R --branch B --sha S --push-url U [--push-url U ...] [--open-pr N] [--pr N] [--repo OWNER/NAME]
 
 Refuses unless R's push URLs (`git remote get-url --push --all R`) are exactly
 the U given, in order: those are the destinations the caller vetted. With
@@ -11,7 +11,8 @@ unreadable. Then runs
 `git push R S:refs/heads/B`, no flags, and reads refs/heads/B back from every
 U with `git ls-remote`, never through R, whose fetch URL may differ. With
 --pr, it also reads the PR's head from GitHub, retrying while it is not S,
-since GitHub takes a moment to see a push.
+since GitHub takes a moment to see a push. Both read PR N of --repo, else of
+the checkout's one repository (facts.bind_repo).
 
 stdout ends with one JSON line {pushed, detail, heads: [{url, head}],
 prState? (--open-pr), prHead? (--pr), seal} (seal: facts.sealed): pushed is git push's exit status, detail git's refusal line or else
@@ -27,7 +28,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, attempt, report  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, report  # noqa: E402
 
 PR_TRIES = 5
 PR_WAIT = 3  # seconds between reads of the PR head
@@ -66,9 +67,12 @@ def publish(argv):
     p.add_argument('--push-url', action='append', required=True, dest='urls')
     p.add_argument('--open-pr', type=int)
     p.add_argument('--pr', type=int)
+    p.add_argument('--repo')
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.sha):
         raise Unusable(f'not a full SHA: {a.sha!r}')
+    if a.open_pr is not None or a.pr is not None:
+        bind_repo(a.repo)
     code, out, err = attempt('git', 'remote', 'get-url', '--push', '--all', a.remote)
     if code:
         raise Unusable(f'git remote get-url --push --all {a.remote}: {err.strip()}')

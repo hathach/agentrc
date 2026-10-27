@@ -2,12 +2,13 @@
 """Tick CodeRabbit's "Trigger review" box on PR N when it skipped HEAD for a manual review,
 or, with --request, ask it to review once its rate limit on HEAD has reset.
 
-  coderabbit_trigger.py --pr N --head SHA [--request]
+  coderabbit_trigger.py --pr N --head SHA [--request] [--repo OWNER/NAME]
 
 A repository below CodeRabbit's open-source threshold gets, on each push, a
 CodeRabbit status "Review skipped: manual review required ..." and an unticked
 "Trigger review" box in its summary comment; ticking the box starts the review.
-Run from the PR checkout. The outcome:
+Run from the PR checkout; PR N is --repo's, else the checkout's one repository
+(facts.bind_repo). The outcome:
 
   ticked    the box was unticked; the comment was edited to tick it and read back
   already   the box is already ticked
@@ -46,7 +47,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from facts import FULL_SHA, Parser, Unusable, attempt, report  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, attempt, bind_repo, report  # noqa: E402
 from harvest import gh_json, newest_reading, observe, pages, stamp  # noqa: E402
 
 SKIP = 'review skipped: manual review required'
@@ -113,11 +114,11 @@ def unopened(pr, head):
     return pull_at(pr, head)[1]
 
 
-def request(pr, head):
+def request(repo, pr, head):
     why = unopened(pr, head)
     if why:
         return {'outcome': 'notLimited', 'detail': why}
-    seen = observe(gh_json('repo', 'view', '--json', 'nameWithOwner')['nameWithOwner'], pr, ['coderabbit'], ['coderabbit'])
+    seen = observe(repo, pr, ['coderabbit'], ['coderabbit'])
     cr = seen['bots'][0]
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
         return {'outcome': 'notLimited', 'detail': f"CodeRabbit is {cr['state']}{f'/' + cr['kind'] if cr['kind'] else ''} on {seen['headSha'][:9]}: {cr['reason']}"}
@@ -150,11 +151,13 @@ def collect(argv):
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True)
     p.add_argument('--request', action='store_true')
+    p.add_argument('--repo')
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.head):
         raise Unusable(f'not a full SHA: {a.head!r}')
+    repo = bind_repo(a.repo)
     try:
-        out = request(a.pr, a.head) if a.request else trigger(a.pr, a.head)
+        out = request(repo, a.pr, a.head) if a.request else trigger(a.pr, a.head)
     except Failed as e:
         out = {'outcome': 'failed', 'detail': str(e)}
     if a.request:

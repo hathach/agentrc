@@ -54,23 +54,27 @@ class PreflightTest(unittest.TestCase):
         return subprocess.run(['git', *argv], check=check, capture_output=True, text=True).stdout
 
     def fake_gh(self, answer, code=0, ref=json.dumps(REF), ref_code=0):
-        """`gh pr ...` answers answer, `gh api ...` ref; each call's argv is appended to gh.log."""
+        """`gh pr ...` answers answer, `gh api ...` ref; each call's argv is appended to gh.log, its GH_REPO to gh.repo."""
         (self.root / 'answer').write_text(answer)
         (self.root / 'ref').write_text(ref)
-        (self.root / 'gh.py').write_text('import sys\n'
+        (self.root / 'gh.py').write_text('import os, sys\n'
                                          f'open({str(self.root / "gh.log")!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
+                                         f'open({str(self.root / "gh.repo")!r}, "a").write(os.environ.get("GH_REPO", "-") + "\\n")\n'
                                          f'api = sys.argv[1:2] == ["api"]\n'
                                          f'sys.stdout.write(open({str(self.root / "ref")!r} if api else {str(self.root / "answer")!r}).read())\n'
                                          f'sys.exit({ref_code} if api else {code})\n')
 
-    def gh_calls(self):
-        log = self.root / 'gh.log'
+    def gh_calls(self, log='gh.log'):
+        log = self.root / log
         return log.read_text().splitlines() if log.exists() else []
 
-    def pin(self, *argv):
+    def pin(self, *argv, repo='hathach/tinyusb'):
+        """preflight.py's line for argv (default --pr 7), --repo repo added unless argv is --recheck or repo is None."""
+        argv = list(argv) or ['--pr', '7']
+        argv += ['--repo', repo] if repo and '--recheck' not in argv else []
         out = io.StringIO()
         with redirect_stdout(out):
-            code = preflight.report(preflight.collect, list(argv) or ['--pr', '7'], seal=True)
+            code = preflight.report(preflight.collect, argv, seal=True)
         line = json.loads(out.getvalue().splitlines()[-1])
         if 'error' in line:
             return code, line
@@ -88,12 +92,58 @@ class PreflightTest(unittest.TestCase):
         self.assertEqual((Path(receipts).parent, list(Path(receipts).iterdir())), (self.root / 'pr-babysit-receipts', []), 'a new empty directory')
         self.assertNotEqual(self.pin()[1]['receipts'], receipts, 'one per launch')
         self.assertEqual(out, {
-            'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prBaseBranch': 'master', 'prBaseTip': 'c' * 40,
+            'repo': 'hathach/tinyusb', 'branch': 'fix', 'prBranch': 'fix', 'prHead': 'f' * 40, 'prBase': 'b' * 40, 'prBaseBranch': 'master', 'prBaseTip': 'c' * 40,
             'prRepo': 'someone/tinyusb',
             'prUrl': VIEW['url'], 'prState': 'OPEN', 'remote': 'origin', 'upstreamBranch': 'fix', 'pushUrls': ['git@github.com:someone/tinyusb.git'],
             'head': self.git('rev-parse', 'HEAD').strip(), 'dirty': ['?? junk.o'],
             'pr': 7, 'badPushUrl': ''})
         self.assertEqual(self.gh_calls()[-1], 'api repos/{owner}/{repo}/git/ref/heads/master', 'the base repository gh resolves for the PR')
+        self.assertEqual(set(self.gh_calls('gh.repo')), {'hathach/tinyusb'}, 'every gh call names the repository')
+
+    def test_the_same_pr_number_in_two_repositories_is_read_in_the_one_named(self):
+        for repo in ('adafruit/Pico-PIO-USB', 'sekigon-gonnoc/Pico-PIO-USB'):
+            (self.root / f"answer-{repo.split('/')[0]}").write_text(json.dumps({**VIEW, 'url': f'https://github.com/{repo}/pull/7'}))
+        (self.root / 'gh.py').write_text('import os, sys\n'
+                                         'api = sys.argv[1:2] == ["api"]\n'
+                                         f'name = {str(self.root)!r} + ("/ref" if api else "/answer-" + os.environ["GH_REPO"].split("/")[0])\n'
+                                         'sys.stdout.write(open(name).read())\n')
+        for repo in ('adafruit/Pico-PIO-USB', 'sekigon-gonnoc/Pico-PIO-USB'):
+            code, out = self.pin(repo=repo)
+            self.assertEqual((code, out['repo'], out['prUrl']), (0, repo, f'https://github.com/{repo}/pull/7'))
+
+    def test_without_repo_the_checkouts_one_github_repository_is_named(self):
+        self.git('remote', 'add', 'adafruit', 'https://github.com/adafruit/Pico-PIO-USB.git')
+        code, out = self.pin(repo=None)
+        self.assertEqual((code, out['repo']), (0, 'adafruit/Pico-PIO-USB'), 'origin is a local path, no GitHub repository')
+        self.assertEqual(set(self.gh_calls('gh.repo')), {'adafruit/Pico-PIO-USB'})
+        self.git('remote', 'add', 'sekigon', 'git@github.com:sekigon-gonnoc/Pico-PIO-USB.git')
+        self.git('remote', 'add', 'same', 'https://github.com/ADAFRUIT/pico-pio-usb')
+        before = self.gh_calls()
+        code, out = self.pin(repo=None)
+        self.assertEqual((code, out['error']), (2, 'the remotes name 2 GitHub repositories (adafruit adafruit/Pico-PIO-USB, same ADAFRUIT/pico-pio-usb, '
+                                                    'sekigon sekigon-gonnoc/Pico-PIO-USB) and none is marked gh-resolved: '
+                                                    "name the PR's repository (--repo OWNER/NAME)"))
+        self.assertEqual(self.gh_calls(), before, 'nothing is read from a guessed repository')
+        for marks, want in (({'sekigon': 'base'}, 'sekigon-gonnoc/Pico-PIO-USB'), ({'origin': 'adafruit/Pico-PIO-USB'}, 'adafruit/Pico-PIO-USB'),
+                            ({'adafruit': 'base', 'same': 'base'}, 'adafruit/Pico-PIO-USB')):
+            with self.subTest(marks):
+                for remote, mark in marks.items():
+                    self.git('config', f'remote.{remote}.gh-resolved', mark)
+                code, out = self.pin(repo=None)
+                self.assertEqual((code, out['repo']), (0, want))
+                for remote in marks:
+                    self.git('config', '--unset', f'remote.{remote}.gh-resolved')
+        self.git('config', 'remote.adafruit.gh-resolved', 'base')
+        self.git('config', 'remote.sekigon.gh-resolved', 'base')
+        self.assertIn('the remotes marked gh-resolved name adafruit adafruit/Pico-PIO-USB, sekigon sekigon-gonnoc/Pico-PIO-USB:',
+                      self.pin(repo=None)[1]['error'])
+        self.git('config', '--unset', 'remote.sekigon.gh-resolved')
+        self.git('config', 'remote.origin.gh-resolved', 'base')
+        self.assertIn('origin (not a GitHub repository)', self.pin(repo=None)[1]['error'], 'base on a remote off GitHub')
+        self.git('config', '--unset', 'remote.origin.gh-resolved')
+        for remote in ('adafruit', 'sekigon', 'same'):
+            self.git('remote', 'remove', remote)
+        self.assertEqual(self.pin(repo=None)[1]['error'], "no remote names a github.com repository: name the PR's repository (--repo OWNER/NAME)")
 
     def test_the_base_branch_is_requested_quoted(self):
         name = 'rel/v1#x{branch}'
@@ -217,6 +267,7 @@ class PreflightTest(unittest.TestCase):
             self.fake_gh(json.dumps({'state': state}))
             self.assertEqual(self.pin('--state', '7'), (0, {'state': state}))
         self.assertEqual(self.gh_calls()[-1], 'pr view 7 --json state')
+        self.assertEqual(set(self.gh_calls('gh.repo')), {'hathach/tinyusb'})
         for answer, code, want in (('', 1, 'gh pr view'), ('not json', 0, 'unexpected answer'), ('{}', 0, 'unexpected answer'),
                                    (json.dumps({'state': 'DRAFT'}), 0, "state 'DRAFT'")):
             self.fake_gh(answer, code)
@@ -250,8 +301,11 @@ class PreflightTest(unittest.TestCase):
                                        'reload the workflow (a fresh session) before relaunching')
 
     def test_usage(self):
-        for argv in (['--pr', 'x'], ['--pr', '7', '--recheck'], ['--frob'], ['--recheck', '--needs', 'x']):
+        for argv in (['--pr', 'x'], ['--pr', '7', '--recheck'], ['--frob'], ['--recheck', '--needs', 'x'], ['--recheck', '--repo', 'o/r']):
             self.assertIn('usage', self.pin(*argv)[1]['error'], argv)
+        for repo in ('o', 'o/r/x', '_o/r', 'o/..', 'o/r x'):
+            self.assertEqual(self.pin(repo=repo)[1]['error'], f'not a repository OWNER/NAME: {repo!r}')
+        self.assertEqual(self.gh_calls(), [])
 
 
 if __name__ == '__main__':

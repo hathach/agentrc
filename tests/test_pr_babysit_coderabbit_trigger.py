@@ -52,7 +52,7 @@ class Rig:
 
 
 class Trigger(unittest.TestCase):
-    def run_with(self, rig, argv=('--pr', '7', '--head', HEAD)):
+    def run_with(self, rig, argv=('--pr', '7', '--head', HEAD, '--repo', 'o/r')):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), redirect_stdout(out):
             code = trigger.report(trigger.collect, list(argv), seal=True)
@@ -104,7 +104,7 @@ class Trigger(unittest.TestCase):
         self.assertEqual(rig.patches, [])
 
     def test_a_short_sha_is_refused(self):
-        code, out = self.run_with(Rig(), ('--pr', '7', '--head', 'abc'))
+        code, out = self.run_with(Rig(), ('--pr', '7', '--head', 'abc', '--repo', 'o/r'))
         self.assertEqual(code, 2)
         self.assertIn('full SHA', out['error'])
 
@@ -152,7 +152,7 @@ class Request(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
                 mock.patch.object(trigger, 'observe', rig.observe), redirect_stdout(out):
-            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--request'], seal=True)
+            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r', '--request'], seal=True)
         return code, json.loads(out.getvalue())
 
     def test_a_reset_limit_is_asked_once_and_read_back(self):

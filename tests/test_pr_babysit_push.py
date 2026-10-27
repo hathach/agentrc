@@ -57,7 +57,7 @@ class PushTest(unittest.TestCase):
         return out.split('\t')[0] if out else ''
 
     def publish(self, *urls, sha=None, pr=None, open_pr=None):
-        argv = ['--remote', 'origin', '--branch', 'fix', '--sha', sha or self.sha]
+        argv = ['--remote', 'origin', '--branch', 'fix', '--sha', sha or self.sha, '--repo', 'o/r']
         for u in urls:
             argv += ['--push-url', u]
         if open_pr is not None:
@@ -143,12 +143,13 @@ class PushTest(unittest.TestCase):
 
     def test_a_pr_no_longer_open_is_not_pushed_to(self):
         for state in ('MERGED', 'CLOSED'):
-            self.fake_gh(f'open({str(self.root / "gh.log")!r}, "a").write(" ".join(sys.argv[1:]) + "\\n"); print({state!r})')
+            self.fake_gh('import os\n'
+                         f'open({str(self.root / "gh.log")!r}, "a").write(os.environ["GH_REPO"] + " " + " ".join(sys.argv[1:]) + "\\n"); print({state!r})')
             code, out = self.publish(self.a, open_pr=7)
             self.assertEqual((code, out['pushed'], out['heads'], out['prState']), (0, False, [], state))
             self.assertEqual(out['detail'], f'PR #7 is {state.lower()}: nothing pushed')
             self.assertEqual(self.remote_head(self.a), '')
-        self.assertIn('pr view 7 --json state -q .state', (self.root / 'gh.log').read_text())
+        self.assertIn('o/r pr view 7 --json state -q .state', (self.root / 'gh.log').read_text(), "PR 7 of the --repo named")
 
     def test_an_open_pr_is_pushed_to(self):
         self.fake_gh("print('OPEN')")

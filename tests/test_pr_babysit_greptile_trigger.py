@@ -82,7 +82,7 @@ class Trigger(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
                 mock.patch.object(trigger, 'record_dir', lambda: self.dir), redirect_stdout(out):
-            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD], seal=True)
+            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r'], seal=True)
         return code, json.loads(out.getvalue())
 
     def record(self):
@@ -208,7 +208,7 @@ class Trigger(unittest.TestCase):
         outs = []
 
         def one():
-            outs.append(trigger.collect(['--pr', '7', '--head', HEAD]))
+            outs.append(trigger.collect(['--pr', '7', '--head', HEAD, '--repo', 'o/r']))
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
                 mock.patch.object(trigger, 'record_dir', lambda: self.dir):
             threads = [threading.Thread(target=one) for _ in range(2)]
@@ -221,7 +221,7 @@ class Trigger(unittest.TestCase):
 
     def test_a_short_sha_or_a_foreign_record_is_an_error_line(self):
         with redirect_stdout(code_out := io.StringIO()):
-            rc = trigger.report(trigger.collect, ['--pr', '7', '--head', 'abc'], seal=True)
+            rc = trigger.report(trigger.collect, ['--pr', '7', '--head', 'abc', '--repo', 'o/r'], seal=True)
         self.assertEqual(rc, 2)
         self.assertIn('full SHA', json.loads(code_out.getvalue())['error'])
         (self.dir / f'o-r-7-{HEAD}.json').write_text('{"something": "else"}')

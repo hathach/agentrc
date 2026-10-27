@@ -81,7 +81,7 @@ class SonarTest(unittest.TestCase):
             {'commentId': c, 'commentDigest': self.digest(c), 'how': how, 'note': note, 'digest': sonar.fnv1a(note)}
             for c, how, note in items]}, ensure_ascii=False), encoding='utf-8')
         out, self.stderr = io.StringIO(), io.StringIO()
-        argv = ['--pr', '7', '--head', head, '--manifest', str(self.manifest)] + (['--receipt', str(receipt)] if receipt else [])
+        argv = ['--pr', '7', '--head', head, '--manifest', str(self.manifest), '--repo', 'o/r'] + (['--receipt', str(receipt)] if receipt else [])
         with mock.patch.object(sonar, 'sonar', fake), redirect_stdout(out), redirect_stderr(self.stderr):
             code = sonar.report(sonar.mark, argv, seal=True)
         line = json.loads(out.getvalue().splitlines()[-1])

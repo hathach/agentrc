@@ -1,4 +1,4 @@
-"""What pr-babysit's scripts share: the {"error"} line contract and strict reads.
+"""What pr-babysit's scripts share: the {"error"} line contract, strict reads and the repository gh names.
 
 A gh call GitHub refused for a rate limit raises RateLimited; a script whose
 caller reads it (report(limits=True)) also prints rateLimit {observedAt, resetAt,
@@ -27,6 +27,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 from seal import canonical, fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
 
 FULL_SHA = re.compile(r'\A[0-9a-f]{40}\Z')  # \Z: $ would let a trailing newline through
+REPO = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9-]*/(?!\.\.?\Z)[A-Za-z0-9._-]+\Z')  # OWNER/NAME
+HOST = 'github.com'
+# scp-like needs `:` and a URL `/` after the host: accepting either makes `git@github.com/owner/repo` look right while git reads a local path.
+ORIGIN = re.compile(r'(?:(?:https|ssh)://(?:[^@/]*@)?([^/:]+)(?::[0-9]+)?/|(?:[^@/\s]+@)([^/:]+):)([^/]+)/([^/]+?)(?:\.git)?')
+# The repository bind_repo named: every gh call run and attempt make carries it as GH_REPO.
+GH_REPO = None
 # The human is the sole author: no line may credit an agent, model, tool or session, nor link a Claude or ChatGPT session anywhere.
 # ASCII on purpose: \b ends at a non-ASCII letter, and Unicode case folds (ſession) are not recognized spellings.
 ATTRIBUTION = tuple(re.compile(p, re.I | re.ASCII) for p in (
@@ -58,10 +64,54 @@ class Parser(argparse.ArgumentParser):
         raise Unusable(f'usage: {message}')
 
 
+def github_repo(url):
+    """OWNER/NAME of a github.com remote URL as spelled there, '' for any other URL."""
+    m = ORIGIN.fullmatch(url.strip().rstrip('/'))
+    return f'{m[3]}/{m[4]}' if m and (m[1] or m[2]).lower() == HOST else ''
+
+
+def checkout_repo():
+    """The one GitHub repository the checkout's remotes name: those `gh repo set-default` marked gh-resolved (`base`
+    for the remote's own), else every remote URL; Unusable when they name none or several."""
+    got = run('git', 'config', '--get-regexp', r'^remote\..+\.(url|gh-resolved)$', ok=(0, 1))[1]
+    urls, marked = {}, {}
+    for line in got.splitlines():
+        key, _, value = line.partition(' ')
+        remote, _, field = key[len('remote.'):].rpartition('.')
+        (urls if field == 'url' else marked).setdefault(remote, value.strip())
+    named = ({r: github_repo(urls.get(r, '')) if v == 'base' else v for r, v in marked.items()} if marked
+             else {r: n for r, u in urls.items() if (n := github_repo(u))})
+    repos = {}
+    for n in named.values():
+        repos.setdefault(n.lower(), n)  # GitHub names ignore case: one repository, spelled as its first remote does
+    if len(repos) == 1 and '' not in repos:
+        return next(iter(repos.values()))
+    which = ', '.join(f'{r} {n or "(not a GitHub repository)"}' for r, n in sorted(named.items()))
+    why = (f'the remotes marked gh-resolved name {which}' if marked
+           else f'the remotes name {len(repos)} GitHub repositories ({which}) and none is marked gh-resolved' if repos
+           else 'no remote names a github.com repository')
+    raise Unusable(f'{why}: name the PR\'s repository (--repo OWNER/NAME)')
+
+
+def bind_repo(name=None):
+    """Name OWNER/NAME, else the checkout's one repository, in every later gh call: GH_REPO, which `gh pr` and gh api's
+    {owner}/{repo} follow over the checkout's remotes (`gh repo view` does not, so no script asks it)."""
+    global GH_REPO
+    name = checkout_repo() if name is None else name
+    if not REPO.match(name):
+        raise Unusable(f'not a repository OWNER/NAME: {name!r}')
+    GH_REPO = name
+    return name
+
+
+def gh_env(argv):
+    return {**os.environ, 'GH_REPO': GH_REPO} if argv[0] == 'gh' and GH_REPO else None
+
+
 def run(*argv, ok=(0,)):
     """(exit status, stdout); a status outside ok, or stdout that is not UTF-8, is Unusable."""
     try:
-        done = subprocess.run(argv, capture_output=True)
+        done = subprocess.run(argv, capture_output=True, env=gh_env(argv))
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')
     if done.returncode not in ok:
@@ -80,7 +130,8 @@ def attempt(*argv, input=None):
     """(exit status, stdout, stderr), replacing bad bytes: unlike run, a failure is part of the receipt."""
     try:
         # bytes in: a text-mode stdin on Windows writes each \n as \r\n
-        done = subprocess.run(argv, capture_output=True, input=None if input is None else input.encode('utf-8', 'replace'))
+        done = subprocess.run(argv, capture_output=True, env=gh_env(argv),
+                              input=None if input is None else input.encode('utf-8', 'replace'))
     except FileNotFoundError:
         raise Unusable(f'{argv[0]} is not installed')
     text = lambda b: b.decode('utf-8', 'replace').replace('\r\n', '\n').replace('\r', '\n')  # as text mode reads it
