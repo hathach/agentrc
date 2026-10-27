@@ -1583,15 +1583,13 @@ def run_diff(args, requested_sha, unsupported, baseline_repo):
                              for e in profile.elfs(build_dirs[side], example)}
                             for side in ('base', 'current')]
                     paired = sorted(elfs[0].keys() & elfs[1].keys())
-                    # Bloaty expects one regex; OR-join all filters (current side
-                    # for the new ELF, base side for the base ELF).
-                    bloaty_regex = '(' + '|'.join(re.escape(f) for f in (cur_filters + base_filters)) + ')'
-                    bloaty_common = ['bloaty', '--domain=vm', f'--source-filter={bloaty_regex}']
+                    # No compile-unit level: the trees' differing unit paths would print as NEW/REMOVED,
+                    # and --source-filter matches only shown levels, so this view is the whole elf.
                     for elf_id in paired:
-                        for title, options in (('sections', ['-d', 'compileunits,sections']),
-                                               ('symbols', ['-d', 'compileunits,symbols', '-s', 'vm'])):
+                        for title, options in (('sections', ['-d', 'sections']),
+                                               ('symbols', ['-d', 'symbols', '-s', 'vm'])):
                             print(f'--- bloaty {title}' + (f' {elf_id}' if len(paired) > 1 else '') + ' ---')
-                            ret = run(bloaty_common + options + [elfs[1][elf_id], '--', elfs[0][elf_id]])
+                            ret = run(['bloaty', '--domain=vm'] + options + [elfs[1][elf_id], '--', elfs[0][elf_id]])
                             if ret.returncode == 0:
                                 print(ret.stdout)
                             else:
@@ -2234,8 +2232,8 @@ def main(project, argv=None):
     parser.add_argument('--base-branch', default=profile.BASE_BRANCH,
                         help=f'Base branch to compare against (default: {profile.BASE_BRANCH})')
     parser.add_argument('--bloaty', action='store_true',
-                        help='Also print bloaty\'s section and symbol diff of each compared elf, -e narrowing '
-                             'them (console only, whatever --engine)')
+                        help='Also print bloaty\'s whole-elf section and symbol diff of each compared elf, -e '
+                             'narrowing them (console only, whatever --engine)')
     if has('ci_boards'):
         parser.add_argument('--ci', action='store_true',
                             help='Add the boards CI sizes. Implies --combined.')

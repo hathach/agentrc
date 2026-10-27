@@ -1904,9 +1904,12 @@ class MainFailure(ProfileCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(sd.shutil, 'which', return_value='/usr/bin/bloaty'):
             code, out = self._run_main(tmp, ['-b', 'b', '--bloaty'], build, lambda *_a, **_k: sizes, run)
         self.assertEqual(code, 0)
-        self.assertEqual([c[-3:] for c in bloaty_cmds[::2]],
-                         [[os.path.join(tmp, 'b', 'build', d, e), '--', os.path.join(tmp, 'b', 'base', d, e)]
-                          for d, e in (('a', 'a.elf'), ('b', 'b.elf'))])
+        # the trees' unit paths differ, so no compile-unit level (and no source filter on it)
+        self.assertEqual(bloaty_cmds,
+                         [['bloaty', '--domain=vm'] + options
+                          + [os.path.join(tmp, 'b', 'build', d, e), '--', os.path.join(tmp, 'b', 'base', d, e)]
+                          for d, e in (('a', 'a.elf'), ('b', 'b.elf'))
+                          for options in (['-d', 'sections'], ['-d', 'symbols', '-s', 'vm'])])
         self.assertIn('--- bloaty sections a/a.elf ---', out)
 
     def test_a_failed_base_setup_still_removes_the_worktree(self):
