@@ -1075,7 +1075,21 @@ class BuildOutput(ProfileCase):
 
 
     def test_a_timeout_returns_124_and_keeps_the_output_as_text(self):
-        ret = sd.run(['sh', '-c', 'printf err >&2; echo out; exec sleep 30'], timeout=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            ready = Path(tmp, 'ready')
+            cmd = ['sh', '-c', 'printf err >&2; echo out; : > "$0"; exec sleep 30', ready.as_posix()]
+            communicate = subprocess.Popen.communicate
+
+            def after_the_output(proc, *args, **kwargs):
+                # the 1 s starts once the output is written, not with sh's start-up (over 1 s on Windows CI, #267)
+                deadline = time.monotonic() + 30
+                while proc.args is cmd and not ready.exists():
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+                return communicate(proc, *args, **kwargs)
+
+            with mock.patch.object(subprocess.Popen, 'communicate', after_the_output):
+                ret = sd.run(cmd, timeout=1)
         self.assertEqual(ret.returncode, 124)
         self.assertEqual(ret.stdout, 'out\n')
         self.assertTrue(ret.stderr.startswith('err\nCommand timed out after 1s'))
