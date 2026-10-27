@@ -22,7 +22,8 @@ python3 $S/preflight.py --recheck            # before a commit: has the checkout
 python3 $S/preflight.py --state N [--repo R]  # before a GitHub write: is the PR still OPEN?
 python3 $S/harvest.py --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
 python3 $S/hooks.py [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540)
-python3 $S/commits.py commit 'src/a.c' < msg    # commit exactly these paths, the message on stdin
+python3 $S/commits.py commit [--receipt <file> --request <r>] 'src/a.c' < msg  # commit exactly these paths, the message on stdin; the line saved to a new <file>
+python3 $S/commits.py receipt <file> --request <r> --parent <sha> 'src/a.c'  # what that commit printed, for this request, parent and paths only
 python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
 python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
 python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N] [--repo R]
@@ -50,7 +51,7 @@ launch, lists the `blockers` to settle before continuing, and shows as `pinned`
 the arguments the state is fixed to, which a continuation passes unchanged.
 A launch on a PR no longer open stops `pr-merged` or `pr-closed`, at preflight or at the CI lane's next read; nothing is left to continue. Every GitHub or SonarCloud write reads the state first (`preflight.py --state`, or `push.py --open-pr` for a push) and goes on only for an OPEN PR; an unreadable state stops `pr-state-unread`.
 `preflight.py`, `harvest.py`, `scope_check.py`, `state_transfer.py`, `launch_result.py` and `commits.py` only read, except that
-`preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths; `hooks.py` runs the repository's
+`preflight.py` creates the launch's receipts directory and `commits.py commit` stages and commits exactly its paths, saving its receipt; `hooks.py` runs the repository's
 hooks, which may rewrite files; `build.py` builds the checkout in a fresh build directory; `push.py` publishes `<sha>` and reads back
 where it landed, `sonar.py` comments on and resolves SonarCloud issues, and `coderabbit_trigger.py` edits
 CodeRabbit's summary comment to tick its Trigger review box, or with `--request` posts one `@coderabbitai review` comment, and `greptile_trigger.py` posts one `@greptileai` comment, and `merge.py --merge` merges the PR. Run any of them by hand only with the user's authorization to publish there.

@@ -162,7 +162,7 @@ const quotedAfter = (prefix) => (prompt) => {
   const m = String(prompt).match(new RegExp(`${prefix.source} ((?:${SHQ.source} ?)+)`))
   return m ? [...m[1].matchAll(SHQ)].map(t => t[0].slice(1, -1).replaceAll(`'\\''`, `'`)) : []
 }
-const pathLine = quotedAfter(/commits\.py commit/)
+const pathLine = quotedAfter(/commits\.py commit --receipt '[^']*' --request '[^']*'/)
 const auditScope = quotedAfter(/commits\.py head --parent [0-9a-f]{40}/)
 // A deterministic 40-hex blob id per path, shared by the hook snapshot and the audit's ls-tree.
 const blobOf = (f) => [...f].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 0xffffffff, 7).toString(16).padStart(40, '0')
@@ -212,6 +212,7 @@ async function run(opts = {}) {
   const receiptFiles = new Map() // reply.py or sonar.py --receipt path -> the line its first run saved there
   const sonarMarked = new Set() // comments whose SonarCloud issue a sonar.py run marked
   const replied = new Set() // comments a reply.py run posted to, which a rerun finds there (rerunReuses)
+  const commitReceipts = new Map() // commits.py --receipt path -> the line it saved, with its bindings
 
   const agent = async (prompt, options) => {
     const label = options.label
@@ -445,7 +446,19 @@ async function run(opts = {}) {
       // commit whose SHA equals its parent, so reusing one would fail in cycle 2.
       staged = pathLine(prompt)
       made = shaFor(++commits)
-      return { committed: true, detail: 'committed', ...opts.commit }
+      const line = { committed: true, detail: 'committed', ...opts.commit }
+      // commits.py's --receipt file: the line, bound to the request, the parent and the scope.
+      const [, file, request] = String(prompt).match(/ --receipt '([^']*)' --request '([^']*)' /)
+      if (!line.error) commitReceipts.set(file, { request, parent: head, scope: staged, ...line, sha: line.committed ? made : '' })
+      return line
+    }
+    if (label.startsWith('receipt:commit#')) {
+      if (opts.commitReceipt === null) return null
+      const [, file, request, parent] = String(prompt).match(/commits\.py receipt '([^']*)' --request '([^']*)' --parent ([0-9a-f]{40}) /)
+      const saved = commitReceipts.get(file)
+      if (!saved) return { error: `no receipt at ${file}: the commit script saved none` }
+      if (saved.request !== request || saved.parent !== parent) return { error: `receipt ${file} is for another request` }
+      return { ...saved, ...opts.commitReceipt }
     }
     if (label.startsWith('audit#')) {
       if (opts.audit === null) return null // a dead read-back agent
@@ -1241,7 +1254,7 @@ test('the committer gets the claims without their hints, and the message on stdi
   const commit = calls.find(c => c.label === 'commit#1-review').prompt
   assert.doesNotMatch(commit, /hint:|rewrite it all/)
   assert.match(commit, /The fixes: \["src\/a\.c:\d+ /)
-  assert.match(commit, /commits\.py commit 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
+  assert.match(commit, /commits\.py commit --receipt '\/tmp\/pr-babysit-receipts-x\/commit#1-review\.json' --request 'commit#1-review' 'src\/a\.c' < '<that file>'; rm -f '<that file>'`/)
   const quoted = calls.filter(c => c.prompt.includes("'<that file>'"))
   assert.ok(quoted.some(c => c.label.startsWith('reply')) || quoted.length > 1, 'more than the commit quotes its file')
   for (const c of quoted) assert.match(c.prompt, /a new temporary file[^:]*, a name without quotes/, c.label)
@@ -3372,6 +3385,39 @@ test('a publisher receipt whose copy does not match its seal is no answer, never
   assert.ok(commit.logs.some(l => l.startsWith('commit#') && l.endsWith('the relayed copy does not match its seal')))
   assert.ok(commit.labels.some(l => l.startsWith('push#')), 'the push went ahead')
   assert.equal(commit.result.history[0].reviewPushFailed, undefined)
+})
+
+test("a commit copy that fails its seal is recovered from the script's receipt, never by a second commit (#266)", async () => {
+  const garbled = (l, a) => l === 'commit#1-review' ? { ...a, detail: `${a.detail}.` } : a
+  const { result, labels, logs } = await run({ reviews: oneValid, garble: garbled })
+  assert.equal(labels.filter(l => l.startsWith('commit#')).length, 1, 'the committing script runs once')
+  assert.ok(labels.includes('receipt:commit#1-review'))
+  assert.ok(logs.includes('commit#1-review: the relayed copy does not match its seal'), logs.join('\n'))
+  assert.ok(logs.some(l => l.startsWith('commit#1-review: the rejected copy: {') && l.includes('"detail":"committed."')), logs.join('\n'))
+  assert.ok(logs.includes(`commit#1-review: recovered from the commit script's receipt: committed ${shaFor(1).slice(0, 7)} — committed; the rejected copy differed in detail`), logs.join('\n'))
+  assert.equal(logs.some(l => l.includes('commit agent died')), false)
+  assert.ok(labels.some(l => l.startsWith('push#')), 'the recovered commit is audited and pushed')
+  assert.equal(result.history[0].reviewPushFailed, undefined)
+
+  const long = await run({ reviews: oneValid, garble: (l, a) => l === 'commit#1-review' ? { ...a, detail: 'x'.repeat(5000) } : a })
+  const rejected = long.logs.find(l => l.startsWith('commit#1-review: the rejected copy: '))
+  assert.ok(rejected.length < 800 && /… \(\d+ characters\)$/.test(rejected), rejected.slice(-80))
+
+  const refused = await run({ reviews: oneValid, commit: { committed: false, detail: 'trailing-whitespace....Failed' }, garble: garbled })
+  assert.deepEqual([refused.result.history[0].reviewPushFailed.committed, refused.result.history[0].reviewPushFailed.detail], [false, 'trailing-whitespace....Failed'])
+  assert.equal(refused.labels.some(l => l.startsWith('audit#')), false, 'no commit to audit')
+
+  // A receipt the script did not save, or one for another commit, is no receipt: the HEAD read-back settles it as before.
+  for (const commitReceipt of [{ error: 'no receipt at /tmp/x: the commit script saved none' }, { parent: FOREIGN }, { scope: ['src/z.c'] }]) {
+    const fallback = await run({ reviews: oneValid, commitReceipt, garble: garbled })
+    assert.ok(fallback.logs.some(l => l.startsWith('commit#1-review: no commit receipt read back: ')), JSON.stringify(commitReceipt))
+    assert.ok(fallback.logs.some(l => /commit#1-review.*HEAD moved to|HEAD moved to .*auditing it/.test(l)), JSON.stringify(commitReceipt))
+    assert.ok(fallback.labels.some(l => l.startsWith('push#')), JSON.stringify(commitReceipt))
+  }
+  // A receipt naming another commit than HEAD is never published.
+  const other = await run({ reviews: oneValid, commitReceipt: { sha: FOREIGN }, garble: garbled })
+  assert.match(other.result.history[0].reviewPushFailed.detail, /receipt names c0ffee1/)
+  assert.equal(other.labels.some(l => l.startsWith('push#')), false)
 })
 
 test("a relay that fills in error: '' on a sealed line still matches its seal", async () => {
@@ -6705,8 +6751,10 @@ test('a commit that landed but was not pushed is a pending candidate in the stat
   assert.equal(blocked.result.state.expectedHead, HEAD)
   const rejected = await run({ ...publishing, push: null })
   assert.equal(rejected.result.state.pending.stage, 'push-failed')
-  const unknown = await run({ ...publishing, audit: null, garble: (l, a) => l.startsWith('commit#') ? null : a })
+  const unknown = await run({ ...publishing, audit: null, commitReceipt: null, garble: (l, a) => l.startsWith('commit#') ? null : a })
   assert.deepEqual(unknown.result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'push-unknown' })
+  const landed = await run({ ...publishing, audit: null, garble: (l, a) => l.startsWith('commit#') ? null : a })
+  assert.deepEqual(landed.result.state.pending, { sha: null, parent: HEAD, lane: 'review', stage: 'audit-unknown' }, 'the receipt says the commit landed')
   const recovered = await run({ ...publishing, garble: (l, a) => l.startsWith('commit#') ? null : a })
   assert.equal(recovered.result.state.pending, null, 'the read-back found the commit, which was audited and pushed')
   assert.equal(recovered.result.state.expectedHead, shaFor(1))

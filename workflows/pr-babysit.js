@@ -636,6 +636,15 @@ const COMMIT = withSeal({
   required: ['committed', 'detail'],
   properties: { error: { type: 'string' }, committed: { type: 'boolean' }, detail: { type: 'string' } },
 })
+// commits.py's saved commit line, read back when the committer's copy was lost (#266).
+const COMMIT_RECEIPT = withSeal({
+  type: 'object', additionalProperties: false,
+  required: ['request', 'parent', 'scope', 'committed', 'detail', 'sha'],
+  properties: {
+    error: { type: 'string' }, request: { type: 'string' }, parent: { type: 'string' }, scope: { type: 'array', items: { type: 'string' } },
+    committed: { type: 'boolean' }, detail: { type: 'string' }, sha: { type: 'string' },
+  },
+})
 const RECHECK = withSeal({
   type: 'object', additionalProperties: false,
   required: ['branch', 'pushUrls', 'head', 'staged', 'status'],
@@ -752,7 +761,8 @@ const noteLimit = (limit, from = '') => {
     { label: 'stop:ci', phase: 'Triage', model: 'haiku', effort: 'low', schema: STOPPED },
   )
 }
-// A copy that fails its script's seal is no answer; an error line carries no seal.
+// A copy that fails its script's seal is no answer; an error line carries no seal. The copy is kept by label for a read-back to compare.
+const rejectedCopies = new Map()
 // The Bash-only relay type carries no skill index; fileTool keeps the default subagent for a prompt that writes with a file tool.
 const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
   const v = await agent(prompt, { ...(fileTool ? {} : { agentType: 'relay' }), ...opts, schema: lenient(opts.schema) }).then(x => x && withNulls(opts.schema, x))
@@ -764,6 +774,10 @@ const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
   }
   if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
     log(`${opts.label}: the relayed copy does not match its seal`)
+    // Bounded: the copy can carry a whole hook log (#266).
+    const copy = JSON.stringify(v)
+    log(`${opts.label}: the rejected copy: ${copy.length > 600 ? `${copy.slice(0, 600)}… (${copy.length} characters)` : copy}`)
+    rejectedCopies.set(opts.label, v)
     return null
   }
   if (v && v.rateLimit) noteLimit({ error: v.error, ...v.rateLimit }, opts.label)
@@ -1670,21 +1684,32 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
   }
 
   // Commit and push are separate turns so the commit is audited before it leaves.
+  const commitLabel = `commit#${cycle}-${what}`
+  const receiptFile = shq(`${pinned.receipts.trim()}/${commitLabel}.json`)
   const made = await relayRun(
     `${IN_CHECKOUT}On branch ${pinned.branch}, write a commit message with your file tool to a new temporary file outside the checkout, a name without quotes: an imperative subject summarizing the cycle-${cycle} ${what} fixes for PR #${args.pr}, ` +
     'in the style `git log -5 --format=%s` shows, and a body only for a why the diff cannot show; ' +
     'no trailer or line crediting an agent, model, tool or session — no Co-Authored-By, Claude-Session, Generated-with or the like: the repository\'s human is the sole author. ' +
     `The fixes: ${JSON.stringify(brief.claims)}; read \`git --literal-pathspecs diff -- ${scope.map(shq).join(' ')}\` for what changed. ` +
     // A file, not a here-document: no delimiter can collide with the message.
-    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
+    `Then run exactly \`${PY} ${COMMITS_SCRIPT} commit --receipt ${receiptFile} --request ${shq(commitLabel)} ${scope.map(shq).join(' ')} < '<that file>'; rm -f '<that file>'\` ` +
     'in the foreground with a Bash timeout of 600000 ms, the tool\'s maximum: an installed pre-commit hook runs again on the commit. ' +
     'Do not push. Change nothing else, and never add a file a hook touched and retry. ' +
     relayed(COMMIT),
-    { label: `commit#${cycle}-${what}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
+    { label: commitLabel, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT, fileTool: true },
   )
-  // A dead committer or relay error leaves no receipt: the read-back settles it, else committed stays null.
-  const lost = made ? made.error : 'commit agent died'
-  if (!lost && !made.committed) return { pass: false, committed: false, detail: made.detail || 'no commit was created', sha: '' }
+  // A lost copy is recovered from the script's own receipt, never by a second commit; with none, the HEAD read-back settles it, else committed stays null.
+  let lost = made ? made.error : 'commit agent died'
+  const receipt = made ? null : await readCommitReceipt(commitLabel, receiptFile, scope)
+  if (receipt) {
+    const copy = rejectedCopies.get(commitLabel)
+    const differ = copy ? ['committed', 'detail'].filter(k => JSON.stringify(copy[k]) !== JSON.stringify(receipt[k])) : []
+    log(`${commitLabel}: recovered from the commit script's receipt: ${receipt.committed ? `committed ${receipt.sha.slice(0, 7)}` : 'no commit'} — ${receipt.detail}` +
+      (copy ? `; the rejected copy differed in ${differ.join(', ') || 'no member this receipt holds'}` : ''))
+    lost = null
+  }
+  const said = receipt || made
+  if (!lost && !said.committed) return { pass: false, committed: false, detail: said.detail || 'no commit was created', sha: '' }
 
   const seen = await relayOnce(
     `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} head --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
@@ -1712,6 +1737,7 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     return !got || want.blob !== got.blob || want.mode !== got.mode
   })
   const why = seen.error ? `the commit could not be read back: ${seen.error}`
+    : receipt && sha !== receipt.sha ? `HEAD is ${sha.slice(0, 7)}, but the commit script's receipt names ${receipt.sha.slice(0, 7)}`
     : seen.parent !== expectedHead || seen.scope.join('\0') !== scope.join('\0') ? `the audit read ${seen.scope.join(', ')} on ${seen.parent.slice(0, 7)}, not this commit`
     : !FULL_SHA.test(sha) ? `commit reported no full SHA: ${JSON.stringify(seen.sha)}`
     : seen.refusal || (unbound.length ? `commit content differs from what the hooks left: ${unbound.join(', ')}` : null)
@@ -1729,6 +1755,20 @@ const commitAndPush = async (cycle, what, owned = [], brief, beforePush = () => 
     for (const [key, plan] of buildPlans) if (contractTouched(plan, scopeSet)) buildPlans.delete(key)
   }
   return { ...push, committed: true, sha, ...(generatedPaths.length ? { generated: generatedPaths } : {}) }
+}
+
+// Read-only, so a lost copy gets the usual fresh agent; a receipt bound to another request, parent or scope is none.
+const readCommitReceipt = async (label, file, scope) => {
+  const r = await relayOnce(
+    `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${COMMITS_SCRIPT} receipt ${file} --request ${shq(label)} --parent ${expectedHead} ${scope.map(shq).join(' ')}\` ` +
+    relayed(COMMIT_RECEIPT),
+    { label: `receipt:${label}`, phase: 'Push', model: 'haiku', effort: 'low', schema: COMMIT_RECEIPT },
+  )
+  const why = !r ? 'the read-back agent died' : r.error ? r.error
+    : r.request !== label || r.parent !== expectedHead || r.scope.join('\0') !== scope.join('\0') ? `it is for ${r.request} on ${r.parent.slice(0, 7)}, not this commit`
+    : r.committed && !FULL_SHA.test(r.sha) ? `it names no full SHA: ${JSON.stringify(r.sha)}` : null
+  if (why) log(`${label}: no commit receipt read back: ${why}`)
+  return why ? null : r
 }
 
 // Push one audited SHA, never the branch. Landed only when every pinned URL (and the PR, for an adoption) reads it back; failed only when every URL answered without it; else unknown. null when the agent died.

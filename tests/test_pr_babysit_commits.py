@@ -451,6 +451,48 @@ class CommitsTest(unittest.TestCase):
         self.assertIn('blank', out['detail'])
         self.assertEqual(self.git('status', '--porcelain'), ' M a.c\n', 'nothing was staged')
 
+    def test_hook_output_is_bounded_and_rid_of_escapes_and_control_characters(self):
+        # #266: a long or escaped hook detail is what a relay mis-copies.
+        self.hook('printf "\\033[31mFailed\\033[0m\\ttab\\a \\"q\\"\\n" >&2\nhead -c 4000 /dev/zero | tr "\\0" x >&2\nexit 1')
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', 'a.c', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, False), out)
+        self.assertEqual(len(out['detail']), commits.DETAIL_MAX)
+        self.assertTrue(out['detail'].startswith('Failed tab  "q" / xxx'), out['detail'][:40])
+        self.assertTrue(out['detail'].endswith('x…'))
+        self.assertTrue(out['detail'].isprintable())
+
+    def test_a_receipt_keeps_the_line_for_its_request_parent_and_scope_only(self):
+        receipt = str(self.repo.parent / f'{self.repo.name}-commit#1-review.json')
+        self.addCleanup(lambda: Path(receipt).unlink(missing_ok=True))
+        self.write('a.c', 'changed\n')
+        code, out = self.run_script('commit', '--receipt', receipt, '--request', 'commit#1-review', 'a.c', stdin='Fix\n')
+        self.assertEqual((code, out['committed']), (0, True), out)
+        sha = self.git('rev-parse', 'HEAD').strip()
+        read = ['receipt', receipt, '--request', 'commit#1-review', '--parent', self.base, 'a.c']
+        code, back = self.run_script(*read)
+        self.assertEqual(code, 0, back)
+        self.assertEqual({k: v for k, v in back.items() if k != 'seal'},
+                         {'request': 'commit#1-review', 'parent': self.base, 'scope': ['a.c'], 'committed': True, 'detail': out['detail'], 'sha': sha})
+        self.assertEqual(self.git('rev-parse', 'HEAD').strip(), sha, 'reading commits nothing')
+        for i, want in ((3, 'another request'), (5, 'another parent'), (6, 'another scope')):
+            argv = list(read)
+            argv[i] = {3: 'commit#2-review', 5: sha, 6: 'b.c'}[i]
+            code, stale = self.run_script(*argv)
+            self.assertEqual(code, 2)
+            self.assertIn(want, stale['error'])
+        self.write('a.c', 'again\n')
+        code, out = self.run_script('commit', '--receipt', receipt, '--request', 'commit#1-review', 'a.c', stdin='Fix\n')
+        self.assertEqual(code, 2)
+        self.assertIn('already exists', out['error'])
+        self.assertEqual(self.git('rev-parse', 'HEAD').strip(), sha, 'a stale receipt stops the commit before it starts')
+        saved = json.loads(Path(receipt).read_text(encoding='utf-8'))
+        saved['line']['detail'] = 'edited'
+        Path(receipt).write_text(json.dumps(saved), encoding='utf-8')
+        self.assertIn('does not match its seal', self.run_script(*read)[1]['error'])
+        Path(receipt).unlink()
+        self.assertIn('no receipt at', self.run_script(*read)[1]['error'])
+
     def test_a_full_sha_is_exactly_forty_lowercase_hex(self):
         self.assertTrue(commits.FULL_SHA.match('a' * 40))
         for bad in ('a' * 40 + '\n', 'a' * 40 + ' ', 'a' * 39, 'a' * 41, 'A' * 40, '\n' + 'a' * 40):
