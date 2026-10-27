@@ -1137,6 +1137,22 @@ class RunRecords(unittest.TestCase):
         self.assertIn('stayed unreadable: [Errno 13] Permission denied', e.exception.code)
         self.assertLess(time.monotonic() - begun, 2, 'the retries end with the timeout')
 
+    def test_a_done_record_refused_for_a_moment_is_read_again_soon(self):
+        self.run_('r17', lambda: (0, []))
+        begun = time.monotonic()
+        with self.reading_done('r17', PermissionError(13, 'Permission denied')):
+            self.assertEqual(rc_.wait_local(self.runs, 'r17', 60, poll=5)[1]['state'], 'done')
+        self.assertLess(time.monotonic() - begun, 2, 'a refused read is retried well before the next poll')
+
+    def test_a_done_record_unreadable_for_long_fails_before_the_timeout(self):
+        self.run_('r18', lambda: (0, []))
+        begun = time.monotonic()
+        with self.reading_done('r18', *[PermissionError(13, 'Permission denied')] * 1000), \
+                mock.patch.object(rc_, 'DONE_READ_SECS', 0.3), self.assertRaises(RemoteError) as e:
+            rc_.wait_local(self.runs, 'r18', 60, poll=5)
+        self.assertIn('stayed unreadable: [Errno 13] Permission denied', e.exception.code)
+        self.assertLess(time.monotonic() - begun, 2, 'the retries end with their own cap, not the run timeout')
+
     def test_the_start_grace_ends_with_the_timeout(self):
         begun = time.monotonic()
         with self.assertRaises(RemoteError) as e:

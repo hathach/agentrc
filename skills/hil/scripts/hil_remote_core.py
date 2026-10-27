@@ -90,6 +90,9 @@ RIG_SECS = 180       # one rig helper call: the lease wait (60 s) and a slow lin
 # under the Bash tool's 10-min foreground cap, so one wait is one tool call
 WAIT_SECS = 570
 POLL_SECS = 5
+# a done record Windows refuses for a moment is read again this often, for at most DONE_READ_SECS
+DONE_RETRY_SECS = 0.2
+DONE_READ_SECS = 3
 STATUS_MIN_SECS = 15   # a wait's last status poll: past its deadline by at most this
 # a background launch writes its started record within this, or it never started
 START_SECS = 30
@@ -1508,16 +1511,18 @@ def wait_local(runs, run_id, timeout, *, poll=POLL_SECS, start_grace=START_SECS)
     started, done = run_paths(runs, run_id)
     begun = time.monotonic()
     deadline = begun + timeout
+    give_up = None
     while True:
         if done.is_file():
             try:
                 return 0, {'state': 'done', **json.loads(done.read_text())}
             except (PermissionError, ValueError) as e:
                 # write_json replaces it whole, yet Windows can refuse the open of a fresh file for a moment
-                left = deadline - time.monotonic()
-                if left <= 0:
+                now = time.monotonic()
+                give_up = give_up or min(now + DONE_READ_SECS, deadline)
+                if now >= give_up:
                     fail(f'run {run_id} finished, but its done record {done} stayed unreadable: {e}')
-                time.sleep(min(poll, left))
+                time.sleep(min(DONE_RETRY_SECS, give_up - now))
                 continue
         try:
             rec = json.loads(started.read_text())
