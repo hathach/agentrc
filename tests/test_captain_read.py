@@ -40,6 +40,9 @@ class RefusalTest(unittest.TestCase):
                      'gh pr checks 12 -R o/r', 'gh pr diff 12 -R o/r --name-only',
                      'gh pr list -R o/r --state all --limit 30 --head fix-1 --base main', 'gh issue view 7 --repo o/r',
                      'gh issue list -R o/r -s closed -L 5', 'gh run view 123 -R o/r',
+                     'gh issue list -R o/r --state all --search captain_guard --limit 500',
+                     'gh issue list -R o/r --search=herdr --json number,title,state,stateReason',
+                     'gh issue view 7 -R o/r --json number,title,state,stateReason,body,comments',
                      'gh run list -R o/r --branch main --commit a3c6b767e --limit 3', f'list {co}',
                      'list ~/.cache/chief-runs', 'list ~/.cache/chief-runs tinyusb-4165', 'list ~/.claude/projects',
                      'list ~/.claude/projects/p/memory']:
@@ -78,6 +81,10 @@ class RefusalTest(unittest.TestCase):
                      'gh pr diff 1 -R o/r --name-only --json number', 'gh pr list -R o/r --limit 31',
                      'gh pr list -R o/r --state draft', 'gh pr list -R o/r 12', 'gh pr list -R o/r --search x',
                      'gh issue list -R o/r --json body', 'gh run list -R o/r --state open',
+                     'gh issue list -R o/r --limit 501', 'gh issue list -R o/r --json comments',
+                     'gh issue list -R o/r --search -x', 'gh issue list -R o/r --search is:open',
+                     'gh issue list -R o/r --search a,b', 'gh issue list -R o/r --search a/b',
+                     'gh issue list -R o/r --search x --search y', 'gh pr view 1 -R o/r --json stateReason',
                      'gh run list -R o/r --commit xyz', 'gh run view 1 -R o/r --log', 'gh run view 1 -R o/r --web',
                      'gh repo delete o/r', 'gh auth token', 'gh extension install x', 'gh pr view 1 -R o/r -X',
                      'gh pr view 1 -R o/r --repo a/b', f'git -C {co} log -n 2 --max-count=3', 'list /etc',
@@ -443,6 +450,23 @@ class GhTest(unittest.TestCase):
         argv, host, prompt = json.loads(line)
         self.assertEqual(argv, ['pr', 'list', '-R', 'o/r', '--limit', '10', '--json', reader.GH['pr', 'list'][2]])
         self.assertEqual((host, prompt), ('github.com', '1'))
+
+    def test_an_issue_search_runs_with_its_limit_and_a_cut_output_says_so(self):
+        home = tmpdir(self)
+        calls = home / 'calls.jsonl'
+        bin_dir = home / 'bin'
+        bin_dir.mkdir()
+        make_stub(bin_dir, 'gh', 'import json, sys\n'
+                  f'open({str(calls)!r}, "a").write(json.dumps(sys.argv[1:]) + "\\n")\n'
+                  f'sys.stdout.write("x" * {reader.CAP + 10})\n')
+        env = {**os.environ, 'PATH': f'{bin_dir}{os.pathsep}{os.environ["PATH"]}'}
+        done = subprocess.run([sys.executable, str(SCRIPT), 'gh', 'issue', 'list', '-R', 'o/r', '--state', 'all',
+                               '--search', 'captain', '--limit', '500'], env=env, capture_output=True, text=True)
+        self.assertEqual(len(done.stdout), reader.CAP)
+        self.assertIn(f'output cut at {reader.CAP} bytes', done.stderr)
+        [argv] = map(json.loads, calls.read_text(encoding='utf-8').splitlines())
+        self.assertEqual(argv, ['issue', 'list', '-R', 'o/r', '--limit', '500', '--state', 'all', '--search',
+                                'captain', '--json', reader.GH['issue', 'list'][2]])
 
 
 if __name__ == '__main__':

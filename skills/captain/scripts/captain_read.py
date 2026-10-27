@@ -52,10 +52,13 @@ ALIASES = {'-n': '--max-count', '-R': '--repo', '-L': '--limit', '-s': '--state'
 REPO = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
 NUMBER = re.compile(r'[0-9]{1,12}')
 SHA = re.compile(r'[0-9a-f]{7,40}')
-# scalar --json fields only: a nested one (comments, reviews, files, statusCheckRollup) multiplies the request
+KEYWORD = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')   # one search word: no space, qualifier or option
+# scalar --json fields only: a nested one (reviews, files, statusCheckRollup) multiplies the request; comments is
+# taken on one issue's view, where gh reads every page of them for that issue alone
 PR = ('number,title,state,isDraft,author,url,headRefName,headRefOid,headRepositoryOwner,baseRefName,createdAt,'
       'updatedAt,mergedAt,closedAt,mergeable,mergeStateStatus,reviewDecision')
 ISSUE = 'number,title,state,author,url,createdAt,updatedAt,closedAt'
+ISSUE_FIELDS = ISSUE + ',stateReason'
 RUN = 'databaseId,name,workflowName,displayTitle,status,conclusion,event,headBranch,headSha,url,createdAt,updatedAt'
 CHECKS = 'name,state,bucket,workflow,link,startedAt,completedAt'
 # (noun, verb): (value flags besides --repo, --json fields allowed, default); None for pr diff, which takes none
@@ -64,11 +67,12 @@ GH = {('pr', 'view'): ((), PR, PR),
       ('pr', 'diff'): None,
       ('pr', 'list'): (('--limit', '--state', '--head', '--base'), PR,
                        'number,title,state,isDraft,author,headRefName,updatedAt,url'),
-      ('issue', 'view'): ((), ISSUE + ',body', ISSUE + ',body'),
-      ('issue', 'list'): (('--limit', '--state'), ISSUE, 'number,title,state,author,updatedAt,url'),
+      ('issue', 'view'): ((), ISSUE_FIELDS + ',body,comments', ISSUE + ',body'),
+      ('issue', 'list'): (('--limit', '--state', '--search'), ISSUE_FIELDS, 'number,title,state,author,updatedAt,url'),
       ('run', 'view'): ((), RUN, RUN),
       ('run', 'list'): (('--limit', '--branch', '--commit'), RUN, RUN)}
 LIMIT, DEFAULT_LIMIT = 30, 10
+ISSUE_LIMIT = 500   # a follow-up search lists every open issue before it files a new one
 
 
 class Refused(Exception):
@@ -253,12 +257,15 @@ def gh_command(args):
     if not fields or set(fields.split(',')) - set(allowed.split(',')):
         raise Refused(f'--json fields are among {allowed}')
     if verb == 'list':
-        out += ['--limit', str(bounded(values.pop('--limit', None), DEFAULT_LIMIT, LIMIT, '--limit'))]
+        cap = ISSUE_LIMIT if noun == 'issue' else LIMIT
+        out += ['--limit', str(bounded(values.pop('--limit', None), DEFAULT_LIMIT, cap, '--limit'))]
     for name, value in values.items():
         if name == '--state' and value not in ('open', 'closed', 'merged', 'all'):
             raise Refused('--state is open, closed, merged or all')
         if name == '--commit' and not SHA.fullmatch(value):
             raise Refused('--commit is a hex SHA')
+        if name == '--search' and not KEYWORD.fullmatch(value):
+            raise Refused('--search is one word of letters, digits, ., _ or -')
         out += [name, rev(value) if name in ('--head', '--base', '--branch') else value]
     return out + ['--json', fields]
 
