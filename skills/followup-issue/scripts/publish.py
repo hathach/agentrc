@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Open one follow-up issue, or add one comment to an open one, and prove it landed.
 
-  publish.py create --repo OWNER/NAME --allow-repo OWNER/NAME [...] --title T --body-file F [--label L ...]
+  publish.py create --repo OWNER/NAME --allow-repo OWNER/NAME [...] (--title T | --title-file F) --body-file F
+                    [--label L ...]
   publish.py comment --repo OWNER/NAME --allow-repo OWNER/NAME [...] --issue N --body-file F
 
 Nothing is sent to a repository outside --allow-repo, with a title or body that
 credits an agent or links a Claude or ChatGPT session, or with a label the
 repository lacks; the allowlist guards the caller's grant, it grants nothing. The
 attribution patterns are pr-babysit's (scripts/facts.py), installed beside it.
+A --title-file holds one line, for a caller that cannot quote one.
 create first lists the open issues: ours with the same title and body is the
 earlier run's issue, another with the same title is a collision for the caller
 to judge, so nothing is created; a listing that fails creates nothing. comment
@@ -235,6 +237,14 @@ def recover_comment(gi, args, body, why):
     return receipt(repo, 'comment', 'uncertain', number, posted=None, error=f'{why}; not found on relisting')
 
 
+def read(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError) as e:
+        raise Refused(f'cannot read {path}: {e}') from None
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split('\n')[1])
     sub = p.add_subparsers(dest='action', required=True)
@@ -244,7 +254,9 @@ def main(argv=None):
         s.add_argument('--allow-repo', action='append', required=True)
         s.add_argument('--body-file', required=True)
         if name == 'create':
-            s.add_argument('--title', required=True)
+            title = s.add_mutually_exclusive_group(required=True)
+            title.add_argument('--title')
+            title.add_argument('--title-file')
             s.add_argument('--label', action='append', default=[])
         else:
             s.add_argument('--issue', type=int, required=True)
@@ -253,8 +265,11 @@ def main(argv=None):
     try:
         if args.repo not in args.allow_repo:
             raise Refused(f'{args.repo} is not in --allow-repo {", ".join(args.allow_repo)}')
-        with open(args.body_file, encoding='utf-8') as f:
-            body = f.read()
+        body = read(args.body_file)
+        if getattr(args, 'title_file', None) is not None:
+            args.title = read(args.title_file).removesuffix('\n')
+            if not args.title.strip() or '\n' in args.title:   # text mode reads every line ending as \n
+                raise Refused('the title file holds one non-empty line')
         if not body.strip():
             raise Refused('empty body')
         found = attribution_in(f'{getattr(args, "title", "")}\n{body}')
