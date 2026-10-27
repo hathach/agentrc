@@ -1879,6 +1879,25 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(code, cowork.BUSY)
         self.assertIn('has no record of its base', err)
         self.assertEqual(len(self.calls()), ran)
+        code, _, err = self.run_cli('reset', 'codex', 'impl', '--read-only')
+        self.assertEqual(code, cowork.BUSY)
+        self.assertIn('codex/impl is kindless, not read-only', err)
+        self.assertTrue((self.root / '.worktrees' / 'cowork-codex-impl').exists())
+
+    def test_a_read_only_reset_refuses_a_kindless_lane_holding_a_session_or_a_request(self):
+        self.commit('a.txt', 'a')
+        self.send('--lane', 'review', '--task', 'x')
+        request = self.send('--lane', 'pending', '--detach', '--task', 'y')[1]
+        until(lambda: not cowork.held(self.box(lane='pending') / f'{request}.lock'))
+        (self.box(lane='pending') / 'session').unlink()
+        for lane, kept in (('review', 'session'), ('pending', f'{request}.lock')):
+            box = self.box(lane=lane)
+            (box / 'read-only').unlink()
+            self.assertEqual(sorted(p.name for p in box.iterdir() if p.name in ('session', f'{request}.lock')), [kept])
+            code, _, err = self.run_cli('reset', 'codex', lane, '--read-only')
+            self.assertEqual(code, cowork.BUSY, lane)
+            self.assertIn(f'codex/{lane} is kindless, not read-only', err)
+            self.assertTrue((box / kept).exists(), lane)
 
     def test_the_recorded_base_is_the_commit_the_worktree_was_made_from(self):
         base = self.commit('a.txt', 'a')
