@@ -29,7 +29,7 @@ whose tick failed (#274). The outcome:
               HEAD for a manual review and no box is ticked; the comment was
               posted and read back
   already     such a comment was posted at or after the reset, or, on a skip,
-              after the head event (harvest.py's), or the box is ticked
+              at or after the head event (harvest.py's), or the box is ticked
   notDue      the reset is still ahead (retryAt) or no reset time can be read
               (retryAt null): nothing posted
   notLimited  the PR is not open, SHA is not its head (both read again just
@@ -161,7 +161,8 @@ def unasked_skip(pr, head, event_at):
     standing = [c for c in comments if (c.get('body') or '').strip() == REQUEST]
     if standing and event_at is None:
         raise Failed(f"the head event time is unknown, so comment {standing[-1]['id']} cannot be placed before or after it: nothing posted", 'read')
-    asked = [c for c in standing if stamp(c['created_at']) > stamp(event_at)]
+    # One at the head event's own second is taken as asked: a duplicate comment is the worse error here.
+    asked = [c for c in standing if stamp(c['created_at']) >= stamp(event_at)]
     if asked:
         return {'outcome': 'already', 'detail': f"comment {asked[0]['id']}", 'commentId': asked[0]['id'], 'at': asked[0]['created_at'], **reset}, None
     why = unopened(pr, head)

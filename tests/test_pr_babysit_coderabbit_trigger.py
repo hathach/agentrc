@@ -239,7 +239,9 @@ class Request(unittest.TestCase):
                 self.assertEqual(len(rig.posts), 1)
         ticked = {'id': 5, 'user': {'login': BOT}, 'body': BOX.replace('[ ]', '[x]'), 'updated_at': '2026-10-13T10:00:00Z'}
         mine = {'id': 51, 'body': '@coderabbitai review', 'created_at': '2026-10-13T09:30:00Z'}
-        for what, comments, want in (('a ticked box', [ticked], (5, '2026-10-13T10:00:00Z')), ('a request after the head event', [mine], (51, mine['created_at']))):
+        at_event = dict(mine, id=52, created_at='2026-10-13T09:00:00Z')
+        for what, comments, want in (('a ticked box', [ticked], (5, '2026-10-13T10:00:00Z')), ('a request after the head event', [mine], (51, mine['created_at'])),
+                                     ("a request at the head event's second", [at_event], (52, at_event['created_at']))):
             with self.subTest(what):
                 code, out = self.run_with(rig := RequestRig(cr=skip, comments=comments))
                 self.assertEqual((out['outcome'], out['commentId'], out['at']), ('already', *want), 'never a second ask on the head')
