@@ -48,6 +48,10 @@ and `--receipt` replay.
   were given; do not paraphrase, shorten, quote or annotate it. A reply that
   is a PR comment gets the original's URL as a quote line above the text, so
   the reader can find what it answers; the script adds that itself.
+- **A pending review of ours blocks.** GitHub refuses our review replies while
+  our account holds a PENDING review on the PR, so a manifest then posts
+  nothing and exits 2 naming it. Report it for the human to submit or delete;
+  never submit or delete it yourself.
 - **Once.** Never post or edit by hand with `gh api`, never a trial or
   placeholder comment, never a delete. If a run's outcome is unknown, run
   the script again with the same manifest: it reuses what it finds and posts

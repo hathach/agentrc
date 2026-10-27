@@ -807,8 +807,12 @@ const runReplyScript = (label, mode, task, rules, payload) => relayOnce(
   // reply.py names a rate limit only in error text: the line's, or a sealed receipt's when it struck mid-batch.
   const said = !out ? undefined : (out.error ? [out.error] : out.receipts.map(r => r.error)).find(e => e && /rate limit|HTTP 429/i.test(e))
   if (said) noteLimit({ error: `reply.py: ${said}`, observedAt: null, resetAt: null, secondary: /secondary/i.test(said) })
+  const pending = out && out.error && /^pending review (\d+) of (\S+) on PR #\d+ blocks replies/.exec(out.error)
+  if (pending && !pendingReview) pendingReview = { review: Number(pending[1]), login: pending[2], detail: out.error }
   return out
 })
+// The posting account's pending review, which GitHub refuses every review reply beside (#321): a human submits or deletes it.
+let pendingReview = null
 function fromBase64 (text) {
   if (typeof text !== 'string' || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(text)) return null
   const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -1909,6 +1913,7 @@ const publishReplies = async (label, drafts, how, cycle, digestOf) => {
   }
   // Every draft went to the caller: the handoffs name them, and no batch was sent.
   if (replies.length === 0) return null
+  if (pendingReview) return { pass: false, detail: `not sent: pending review ${pendingReview.review} of ${pendingReview.login}`, receipts: [], replied: [] }
   const out = await runReplyScript(label, 'manifest', `Publish these replies on PR #${args.pr}`,
     'Do not post, edit or delete anything yourself and do not change a body; the script posts once, reads back and resolves. ',
     `Manifest: ${JSON.stringify({ replies })}`)
@@ -2470,6 +2475,11 @@ const runCycle = async (cycle, entry) => {
     const { error, resetAt, secondary } = githubLimit
     log(`cycle ${cycle}: GitHub refused a call for a ${secondary ? 'secondary ' : ''}rate limit (${error}) — stopping; relaunch ${resetAt ? `after ${resetAt}` : 'once it clears'}`)
     return stop(cycle, 'github-rate-limited', { rateLimit: githubLimit })
+  }
+  // Every later reply batch meets the same refusal until a human submits or deletes the review.
+  if (pendingReview) {
+    log(`cycle ${cycle}: ${pendingReview.login} holds pending review ${pendingReview.review} on PR #${args.pr}, so GitHub refuses its replies — stopping; it is the human's to submit or delete`)
+    return stop(cycle, 'pending-review', { ...pendingReview })
   }
   return verdict
 }

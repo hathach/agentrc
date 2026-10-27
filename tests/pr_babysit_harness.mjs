@@ -4420,6 +4420,19 @@ test('reply.py\'s error line fails the batch with that error, not a seal mismatc
   assert.equal(result.history[0].fixNotePosts.detail, `reply.py: ${RATE}`)
 })
 
+test('a pending review of the posting account stops the launch with a blocker naming it, never retried each cycle (#321)', async () => {
+  const PENDING = 'pending review 5661141307 of hathach on PR #3888 blocks replies: GitHub refuses a review reply while its author holds a pending review; a human submits or deletes it'
+  const reviews = { findings: [invalidFinding()], replies: [{ commentId: 1, body: 'not so' }], bots: 'reviewed' }
+  const { result, labels, logs } = await run({ reviews, replyError: (label) => label.startsWith('replies#') && PENDING, args: { autoPush: true, maxCycles: 4 } })
+  assert.equal(result.reason, 'pending-review')
+  assert.deepEqual([result.review, result.login, result.detail], [5661141307, 'hathach', PENDING])
+  assert.equal(result.cycles, 1, 'the next cycle would meet the same refusal')
+  assert.deepEqual(labels.filter(l => /^(replies|resolve|defer)#/.test(l)), ['replies#1'], 'no reply batch is sent after it')
+  assert.ok(logs.some(l => l.includes('holds pending review 5661141307 on PR #3888') && l.includes("the human's to submit or delete")), logs.join('\n'))
+  const other = await run({ reviews, replyError: (label) => label.startsWith('replies#') && RATE.replace('rate limit', 'oops'), args: { autoPush: true, maxCycles: 1 } })
+  assert.notEqual(other.result.reason, 'pending-review', 'only reply.py\'s pending-review line stops so')
+})
+
 test('reply.py\'s error line refuses a settlement with that error (#115)', async () => {
   const { edited, at, state, settlement } = await reanswered()
   const { result } = await run({ reviews: edited, preflight: at, replyError: (label) => label.startsWith('reuse#') && RATE, args: { ...YIELD, maxCycles: 6, state, replySettlements: [settlement] } })

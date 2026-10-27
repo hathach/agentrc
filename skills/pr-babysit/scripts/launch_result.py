@@ -102,6 +102,9 @@ STALLED = {
     'github-rate-limited': 'GitHub refused a call for a rate limit (`rateLimit`): relaunch from the stateRef after its resetAt, '
                            'or after a few minutes for a secondary limit',
     'unactionable': 'the launch found nothing to act on: relaunch only on a named change (a push, a review, a CI result)',
+    'pending-review': 'the posting account holds a pending review on the PR (`review`, by `login`), and GitHub refuses its replies '
+                      'while it does: report it for the human to submit or delete, never submit or delete it yourself, and relaunch '
+                      'from the stateRef once it is gone',
     'harvest-failed': "harvest.py failed twice in a row (`detail`): fix what its error names, such as a module the "
                       "launch's interpreter lacks, or relaunch once a passing cause (a head still moving, a GitHub outage) cleared",
     'ci-collect-failed': "collect.py failed the same way on two cycles running (`detail`): fix what its error names, such as an "

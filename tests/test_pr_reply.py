@@ -51,8 +51,8 @@ class FakeGitHub:
         t = thread or f'T{cid}'
         self.threads.setdefault(t, {'ids': [], 'resolved': False})['ids'].append(cid)
 
-    def add_review(self, rid, body='bot review body', login='bot'):
-        self.reviews[rid] = {'id': rid, 'body': body, 'user': {'login': login},
+    def add_review(self, rid, body='bot review body', login='bot', state='COMMENTED'):
+        self.reviews[rid] = {'id': rid, 'body': body, 'user': {'login': login}, 'state': state,
                              'html_url': f'https://github.com/{REPO}/pull/{PR}#pullrequestreview-{rid}'}
 
     def issue_comment(self, cid, body='bot summary', login='bot'):
@@ -366,6 +366,51 @@ class ReplyTest(ReplyCase):
             self.assertEqual(r, {'commentId': cid, 'kind': None, 'replyId': None, 'digest': reply.fnv1a(body), 'sent': False, 'posted': False,
                                  'verified': False, 'resolved': None, 'error': 'not tried: GitHub refused an earlier call in this batch for a rate limit'})
         self.assertEqual(self.gh.mutations, [])
+
+    def test_a_refused_post_keeps_githubs_message_beside_ghs(self):
+        # #321: gh prints the bare status on stderr and GitHub's reason only in the body on stdout.
+        self.gh.review_comment(10)
+        real = self.gh.gh
+        answer = {'message': 'Validation Failed', 'errors': [{'resource': 'PullRequestReviewComment', 'code': 'custom',
+                                                               'message': 'user_id can only have one pending review per pull request'}],
+                  'documentation_url': 'https://docs.github.com/rest', 'status': '422'}
+
+        def gh(args, stdin=None):
+            if args[:3] == ['api', '-X', 'POST']:
+                return 1, json.dumps(answer), 'gh: Validation Failed (HTTP 422)\n'
+            return real(args, stdin)
+        with mock.patch.object(reply, 'gh', gh):
+            rc, receipts = self.run_script([{'commentId': 10, 'body': 'a'}])
+        self.assertEqual(rc, 1)
+        error = receipts[0]['error']
+        self.assertTrue(error.startswith('gh: Validation Failed (HTTP 422): Validation Failed; [{'), error)
+        self.assertIn('one pending review per pull request', error)
+        answer['errors'] = [{'message': 'x' * 2000}]
+        with mock.patch.object(reply, 'gh', gh):
+            _, receipts = self.run_script([{'commentId': 10, 'body': 'a'}])
+        self.assertEqual(len(receipts[0]['error']), len('gh: Validation Failed (HTTP 422): ') + reply.BODY_MAX)
+        self.assertTrue(receipts[0]['error'].endswith('…'))
+        self.assertEqual(reply.failure('', 'gh: Not Found (HTTP 404)\n'), 'gh: Not Found (HTTP 404)')
+        self.assertEqual(reply.failure('plain words\n', ''), 'plain words', 'with nothing on stderr, stdout is the diagnostic')
+
+    def test_a_pending_review_of_ours_stops_a_manifest_before_anything_is_posted(self):
+        self.gh.review_comment(10)
+        self.gh.add_review(77, body='', login=ME, state='PENDING')
+        rc, out = self.main('--manifest', self.json_file({'replies': [{'commentId': 10, 'body': 'a', 'digest': reply.fnv1a('a')}]}))
+        self.assertEqual(rc, 2)
+        self.assertTrue(out['error'].startswith(f'pending review 77 of {ME} on PR #{PR} blocks replies: '), out)
+        self.assertEqual(self.gh.mutations, [], 'nothing posted, and the review is neither submitted nor deleted')
+        # Settling on a reply already there posts nothing, so the pending review does not stop it.
+        self.gh.review_comment(11, 'ok', ME, thread='T10', parent=10)
+        rc, receipts = self.reuse({'commentId': 10, 'replyId': 11, 'bodyDigest': reply.fnv1a('ok'), 'originalDigest': reply.original_digest(self.gh.review[10])})
+        self.assertEqual((rc, receipts[0]['verified']), (0, True))
+
+    def test_another_accounts_pending_review_or_our_submitted_one_posts(self):
+        self.gh.review_comment(10)
+        self.gh.add_review(77, login='someone', state='PENDING')
+        self.gh.add_review(78, login=ME, state='COMMENTED')
+        rc, receipts = self.run_script([{'commentId': 10, 'body': 'a'}])
+        self.assertEqual((rc, receipts[0]['verified']), (0, True))
 
     def test_a_rate_limit_ends_a_reuse_or_edit_batch_too(self):
         listing = f'repos/{REPO}/pulls/{PR}/comments?per_page=100'
