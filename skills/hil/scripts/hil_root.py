@@ -2,9 +2,9 @@
 """The HIL harnesses' root operations, one fixed verb each (`hil` skill). Linux only, stdlib
 only, and it imports nothing beside it.
 
-A rig may grant its CI user sudo on an installed copy of this file (INSTALLED) and nothing
-else, so it takes no path, command or environment from its caller: each verb checks its
-arguments against the one sysfs file, device or program it touches.
+A rig may grant its CI user sudo on an installed copy of this file (INSTALLED), so it takes
+no path, command or environment from its caller: each verb checks its arguments against the
+one sysfs file, device or program it touches. Recovery's usb_recover is a separate grant.
 
   hil_root.py pattern 0|1                usbtest's pattern parameter
   hil_root.py modprobe                   modprobe usbtest

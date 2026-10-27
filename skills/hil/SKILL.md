@@ -321,7 +321,7 @@ recovery stay the contract's.
 | `hil_report_core.py` | the report document: `_hil` metadata and roster identity, attempt archive, withdrawal and publish recovery, adopting a fetched report, the Markdown view, run and sequence verdicts |
 | `hil_remote_core.py` | trees and attempts on a rig: staging, launch, status, fetch and copy-back |
 | `hil_tt.py` | Reset_TT of the hub TT a full- or low-speed device sits behind |
-| `hil_root.py` | every root operation the scripts need, one checked verb each; a rig grants its CI user sudo on its installed copy (`/usr/local/sbin/hil_root`) and nothing else |
+| `hil_root.py` | every root operation of the usbtest and TT scripts, one checked verb each; a rig grants its CI user sudo on its installed copy (`/usr/local/sbin/hil_root`), and separately on `/usr/local/sbin/usb_recover` for `hil_reserve.py run` recovery |
 | `hil_usbtest.py` | usbtest binding, the device under test by serial (`find_device`), and bounded testusb case runs |
 | `usb_dfu.py`, `esptool_session.py` | a DFU runtime request, one esptool connection, each a child the runner can kill |
 
