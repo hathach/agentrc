@@ -91,11 +91,19 @@ def verified(pdf: Path, doc, mod) -> tuple:
 
 
 def fetch(doc, mod, tmp: Path) -> tuple:
-    """Download, then verify -> (pdf, identity verdict) or (None, why)."""
-    got, why = doclib.fetch_document(doc.url, tmp / f"{doc.doc_id}.pdf", doc.doc_id)
+    """Download, then verify -> (pdf, identity verdict) or (None, why). A copy already in
+    tmp (the run's USB peek) is used only once it passes the same payload and identity
+    checks; otherwise it is downloaded again."""
+    dest = tmp / f"{doc.doc_id}.pdf"
+    if dest.is_file():
+        if dest.stat().st_size > 512 and doclib.classify_payload(head(dest)) == "pdf":
+            pdf, why = verified(dest, doc, mod)
+            if pdf is not None:
+                return pdf, why
+        dest.unlink()
+    got, why = doclib.fetch_document(doc.url, dest, doc.doc_id)
     if got is None and mod is vendor_nxp:
-        got, why = doclib.fetch_document(vendor_nxp.direct_url(doc),
-                                         tmp / f"{doc.doc_id}.pdf", doc.doc_id)
+        got, why = doclib.fetch_document(vendor_nxp.direct_url(doc), dest, doc.doc_id)
     if got is None:
         return None, why
     return verified(got, doc, mod)
@@ -492,7 +500,16 @@ def main() -> int:
             ap.error(f"--{opt} does not apply to {args.vendor} (only {', '.join(sorted(vendors))})")
     if args.limit is not None and args.limit < 1:
         ap.error("--limit must be a positive number")
+    # One download dir for the run, so a document the USB peek fetched is not fetched again.
+    tmp = Path(tempfile.mkdtemp(prefix="download-doc-"))
+    try:
+        return sync_vendor(args, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
+
+def sync_vendor(args, tmp: Path) -> int:
+    """Enumerate, plan and (with --apply) import one vendor, downloading into tmp."""
     lib = doclib.Library()
     if blocked(lib, args.apply):
         return 2
@@ -556,18 +573,17 @@ def main() -> int:
         if unresolved:
             print(f"resolving USB capability for {len(unresolved)} famil(ies) by reading "
                   f"one document each: {', '.join(unresolved)}", file=sys.stderr)
-        # Only the verdict is reused (usb-capability.json); a resolved family is never
-        # peeked again, so the PDFs live for this run alone.
-        with tempfile.TemporaryDirectory(prefix="download-doc-peek-") as peek_tmp:
-            for fam in unresolved:
-                cands = doclib.peek_order([d for d in docs if fam in (d.family or [])])
-                usb.resolve(args.vendor, fam, cands, Path(peek_tmp), complete)
-                v = usb.get(args.vendor, fam)
-                label = ("USB" if v and v["usb"] is True else
-                         "no USB" if v and v["usb"] is False else "unresolved")
-                print(f"  {fam:<12} {label:<10} "
-                      f"({v['source'] if v else 'unresolved'}: "
-                      f"{v['evidence'][:48] if v else '-'})", file=sys.stderr)
+        # Only the verdict outlives the run (usb-capability.json); the peeked PDFs stay in
+        # tmp for the import below.
+        for fam in unresolved:
+            cands = doclib.peek_order([d for d in docs if fam in (d.family or [])])
+            usb.resolve(args.vendor, fam, cands, tmp, complete)
+            v = usb.get(args.vendor, fam)
+            label = ("USB" if v and v["usb"] is True else
+                     "no USB" if v and v["usb"] is False else "unresolved")
+            print(f"  {fam:<12} {label:<10} "
+                  f"({v['source'] if v else 'unresolved'}: "
+                  f"{v['evidence'][:48] if v else '-'})", file=sys.stderr)
         keep = []
         for d in docs:
             fams_d = [f for f in (d.family or []) if f not in PSEUDO]
@@ -651,49 +667,45 @@ def main() -> int:
               "then re-run with --apply", file=sys.stderr)
         return 0
 
-    tmp = Path(tempfile.mkdtemp(prefix="download-doc-"))
     added = replaced = failed = unsafe = 0
     skipped: list = []
     no_metadata: list = []
-    try:
-        for doc in fetchable:
-            pdf, why = fetch(doc, mod, tmp)
-            if pdf is None:
-                skipped.append((doc.doc_id, why))
-                failed += 1
-                continue
-            try:
-                book_id = lib.add(doc, pdf)
-            except RuntimeError as e:
-                skipped.append((doc.doc_id, str(e) or type(e).__name__))
-                failed += 1
-                continue
-            if book_id:
-                added += 1
-                if lib.last_add_status == "added-no-metadata":
-                    no_metadata.append((doc.doc_id, book_id))
-            elif lib.last_add_status == "duplicate":
-                skipped.append((doc.doc_id, "already in the library under this title"))
-            else:
-                skipped.append((doc.doc_id, "calibredb add reported no book id"))
-                failed += 1
+    for doc in fetchable:
+        pdf, why = fetch(doc, mod, tmp)
+        if pdf is None:
+            skipped.append((doc.doc_id, why))
+            failed += 1
+            continue
+        try:
+            book_id = lib.add(doc, pdf)
+        except RuntimeError as e:
+            skipped.append((doc.doc_id, str(e) or type(e).__name__))
+            failed += 1
+            continue
+        if book_id:
+            added += 1
+            if lib.last_add_status == "added-no-metadata":
+                no_metadata.append((doc.doc_id, book_id))
+        elif lib.last_add_status == "duplicate":
+            skipped.append((doc.doc_id, "already in the library under this title"))
+        else:
+            skipped.append((doc.doc_id, "calibredb add reported no book id"))
+            failed += 1
 
-        for doc, have in p["outdated"]:
-            pdf, why = fetch(doc, mod, tmp)
-            if pdf is None:
-                skipped.append((doc.doc_id, f"{why}; local copy left alone"))
-                failed += 1
-                continue
-            book_id, failure = replace(lib, have["id"], doc, pdf)
-            if failure:
-                skipped.append((doc.doc_id, failure))
-                unsafe += 1
-            else:
-                replaced += 1
-                if lib.last_add_status == "added-no-metadata":
-                    no_metadata.append((doc.doc_id, book_id))
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+    for doc, have in p["outdated"]:
+        pdf, why = fetch(doc, mod, tmp)
+        if pdf is None:
+            skipped.append((doc.doc_id, f"{why}; local copy left alone"))
+            failed += 1
+            continue
+        book_id, failure = replace(lib, have["id"], doc, pdf)
+        if failure:
+            skipped.append((doc.doc_id, failure))
+            unsafe += 1
+        else:
+            replaced += 1
+            if lib.last_add_status == "added-no-metadata":
+                no_metadata.append((doc.doc_id, book_id))
 
     print("\n" + "=" * 68)
     print(f"IMPORTED  {added} new" + (f" + {replaced} replaced" if replaced else ""))

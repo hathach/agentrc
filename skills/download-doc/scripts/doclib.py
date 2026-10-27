@@ -925,7 +925,7 @@ class UsbIndex:
 
     def peek(self, doc: "Doc", tmp: Path) -> bool | None:
         """Settle a family by reading one of its documents. Returns the verdict."""
-        pdf = tmp / f"peek-{doc.doc_id}.pdf"
+        pdf = tmp / f"{doc.doc_id}.pdf"     # where the import looks for it (sync.fetch)
         got = pdf if pdf.exists() and pdf.stat().st_size > 1024 else download(doc.url, pdf)
         if got is None:
             return None

@@ -1147,7 +1147,7 @@ class VendorSync(unittest.TestCase):
             def resolve(self, vendor, fam, cands, tmp, complete):
                 if resolved is None:
                     return None
-                (tmp / f'peek-{fam}.pdf').write_bytes(b'%PDF')
+                (tmp / f'{fam}.pdf').write_bytes(b'%PDF')
                 resolved.append(tmp)
                 verdicts[fam] = True
         doclib.UsbIndex = Usb
@@ -1204,7 +1204,7 @@ class VendorSync(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(len(resolved), 1)
         self.assertFalse(resolved[0].exists())
-        self.assertEqual(list(self.root.rglob('peek-*')), [])
+        self.assertEqual(list(self.root.rglob('*.pdf')), [])
 
     def adapter(self, vendor):
         """Dispatch through sync's own enumerate_vendor to `vendor`'s adapter, answering self.docs."""
@@ -1410,7 +1410,7 @@ class UsbResolution(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         rm = st_doc('RM1', ['STM32X0'], 'reference-manual')
-        (Path(tmp.name) / 'peek-RM1.pdf').write_bytes(b'%PDF' + b' ' * 2048)   # already downloaded
+        (Path(tmp.name) / 'RM1.pdf').write_bytes(b'%PDF' + b' ' * 2048)   # already downloaded
         no_usb = 'STM32X0 reference manual: GPIO, SPI, I2C'
         cases = {'no pdftotext': (None, no_usb, 0), 'pdftotext fails': ('pdftotext', no_usb, 1),
                  'no text layer': ('pdftotext', ' \n\f ', 0)}
@@ -1423,6 +1423,74 @@ class UsbResolution(unittest.TestCase):
                 self.assertIsNone(index.peek(rm, Path(tmp.name)))
                 self.assertIsNone(index.resolve('st', 'STM32X0', [rm], Path(tmp.name), complete=True))
                 self.assertFalse((Path(tmp.name) / f'{name}.json').exists())
+
+
+@unittest.skipUnless(shutil.which('pdftotext'), 'the USB peek and the identity check read the PDF with pdftotext')
+class RunDownloads(unittest.TestCase):
+    """A document the USB peek downloaded is imported from the run's one download dir,
+    once it passes the checks a fresh download would; the dir goes with the run."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        (self.root / 'tmp').mkdir()
+        self.library = FakeCalibre()
+        patch_library(self)
+        self.good = pdf_with('DS1234 Rev 1 STM32X0 MCU with USB OTG full speed')
+        self.fetched = []
+        doc = st_doc('DS1234', ['STM32X0'])
+        for target, name, value in ((sync, 'enumerate_vendor', lambda vendor, args: [doc]),
+                                    (doclib, 'http_get', self.http_get), (Path, 'home', lambda: self.root),
+                                    (tempfile, 'tempdir', str(self.root / 'tmp'))):
+            patch = unittest.mock.patch.object(target, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def http_get(self, url, *a, **k):
+        self.fetched.append(url)
+        return self.good
+
+    def peeked(self, data):
+        """UsbIndex.peek leaving `data` where a peek's download lands, and finding USB."""
+        def peek(index, doc, tmp):
+            (tmp / f'{doc.doc_id}.pdf').write_bytes(data)
+            index.last_evidence = 'USB OTG'
+            return True
+        patch = unittest.mock.patch.object(doclib.UsbIndex, 'peek', peek)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_a_peeked_document_is_downloaded_once(self):
+        code, out, err = run_sync('st', '--apply')
+        self.assertEqual(code, 0, err)
+        self.assertIn('IMPORTED  1 new', out)
+        self.assertEqual(self.fetched, ['https://st.com/DS1234.pdf'])
+        self.assertEqual(self.library.added, [self.good])
+
+    def test_a_peeked_copy_that_fails_the_import_checks_is_downloaded_again(self):
+        for name, data in (('not a pdf', b'<html>' + b'x' * 2048), ('too short', b'%PDF-1.4'),
+                           ('another document', pdf_with('DS9999 Rev 2 STM32X0 USB OTG'))):
+            with self.subTest(name):
+                self.fetched.clear()
+                self.library = FakeCalibre()
+                self.peeked(data)
+                code, out, err = run_sync('st', '--apply')
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fetched, ['https://st.com/DS1234.pdf'])
+                self.assertEqual(self.library.added, [self.good])
+
+    def test_the_download_dir_goes_with_the_run(self):
+        self.peeked(self.good)
+        for argv in (('st',), ('st', '--apply')):
+            with self.subTest(argv):
+                code, _, err = run_sync(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(list((self.root / 'tmp').iterdir()), [])
+        self.library.fail['list'] = 'database read failed'
+        code, _, err = run_sync('st', '--apply')
+        self.assertEqual(code, 2, err)
+        self.assertEqual(list((self.root / 'tmp').iterdir()), [])
 
 
 class EnumerationComplete(unittest.TestCase):
