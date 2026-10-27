@@ -35,6 +35,7 @@ import json
 import re
 import sys
 import time
+from functools import partial
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -254,6 +255,7 @@ def collect(argv):
     p.add_argument('--merge', action='store_true')
     a = p.parse_args(argv)
     waived = sorted(set(a.waive))
+    answer = partial(receipt, waived=waived)
     url = pr_identity(a.pr_url)
     if not url:
         raise Unusable(f'--pr-url must be https://github.com/OWNER/REPO/pull/N, not {a.pr_url!r}')
@@ -263,15 +265,15 @@ def collect(argv):
     head = facts['head']
     pr = settled_view(repo, n)
     if pr['state'] == 'MERGED':
-        return receipt(n, head, 'observed-merged', blockers, pr=pr, detail='the PR is already merged', waived=waived)
+        return answer(n, head, 'observed-merged', blockers, pr=pr, detail='the PR is already merged')
     if pr['state'] == 'CLOSED':
-        return receipt(n, head, 'closed', blockers, pr=pr, detail='the PR is closed', waived=waived)
+        return answer(n, head, 'closed', blockers, pr=pr, detail='the PR is closed')
     if not FULL_SHA.match(head or ''):
         raise Unusable(f"the launch's state names no full head SHA: {head!r}")
     blockers += pr_blockers(pr, url, a.base, facts['state'])
     if pr['headRefOid'] != head:
         blockers.append(f"github: the PR head is {pr['headRefOid']}, not the launch's {head}: it rejoins through adoptHead and needs fresh reviews")
-        return receipt(n, head, 'not-ready', blockers, pr=pr, detail='the head moved: reviews, CI and required checks were not inspected', waived=waived)
+        return answer(n, head, 'not-ready', blockers, pr=pr, detail='the head moved: reviews, CI and required checks were not inspected')
     blockers += merge_rules(repo, a.base)
     blockers += review_blockers(repo, n, facts['fingerprint'], head, waived)
     ci, checks = ci_blockers(repo, n, head, a.base)
@@ -287,7 +289,7 @@ def collect(argv):
     requirements = {'mergeStateStatus': last['mergeStateStatus'], 'mergeable': last['mergeable'],
                     'reviewDecision': last.get('reviewDecision'), 'requiredChecks': checks}
     if blockers or not a.merge:
-        return receipt(n, head, 'not-ready' if blockers else 'ready', blockers, admin=admin and not blockers, pr=last, requirements=requirements, waived=waived)
+        return answer(n, head, 'not-ready' if blockers else 'ready', blockers, admin=admin and not blockers, pr=last, requirements=requirements)
     cmd = ['gh', 'pr', 'merge', str(n), '-R', repo, '--squash', '--match-head-commit', head,
            '--subject', f"{last['title']} (#{n})", '--body', '', *(['--admin'] if admin else [])]
     code, out, err = attempt(*cmd)
@@ -297,7 +299,7 @@ def collect(argv):
     outcome, after = readback(repo, n, ours)
     detail = f"gh pr merge exited {code}{': ' + launch_result.cut(said[-1]) if said else ''}"
     refused = [f'github: the merge was refused: {detail}'] if outcome == 'not-ready' else []
-    return receipt(n, head, outcome, refused, admin=admin, pr=after or last, detail=detail, requirements=requirements, waived=waived)
+    return answer(n, head, outcome, refused, admin=admin, pr=after or last, detail=detail, requirements=requirements)
 
 
 if __name__ == '__main__':
