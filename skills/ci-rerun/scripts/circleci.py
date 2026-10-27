@@ -13,7 +13,7 @@ for the caller to retry. stdout ends with one JSON line
 "jobs", "status"}], "errors": [...]}. Exit 0 when every workflow was re-run, 3
 when none failed but some are still running, 1 when any errored, 2 on a usage
 error.
-log: prints the last N lines (default 150) of every failed step of the job.
+log: prints the last N lines (default 150, 0 for all) of every failed step of the job.
 
 The job lookup is the public v1.1 endpoint and the workflow status the public
 v2 one, no token needed.
@@ -28,6 +28,8 @@ import sys
 import urllib.request
 
 UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+# Lines kept of one step's output; past it the output is cut, so not whole.
+MAX_LINES = 20000
 # The v2 Workflow.status enum, split by whether the workflow has finished.
 UNFINISHED = ('running', 'failing', 'on_hold', 'queued')
 FINISHED = ('success', 'not_run', 'failed', 'error', 'canceled', 'unauthorized')
@@ -95,18 +97,25 @@ def rerun(repo, numbers):
     return 1 if errors else 3 if running else 0
 
 
-def failed_steps(repo, number, lines):
-    """(step name, its output's last `lines` lines) for each failed step."""
-    failed = [(s['name'], a['output_url']) for s in job(repo, number).get('steps', [])
-              for a in s.get('actions', []) if a.get('status') not in ('success', 'skipped') and a.get('output_url')]
-    if not failed:
+def failed_steps(repo, number, lines=None):
+    """(step name, its output, whole) for each failed step: the last `lines` lines, else all of it up to MAX_LINES.
+    whole only for all of an output CircleCI's action record says it did not truncate (`truncated` false);
+    a failed step with no output is listed empty and not whole."""
+    failed = [(s['name'], a) for s in job(repo, number).get('steps', [])
+              for a in s.get('actions', []) if a.get('status') not in ('success', 'skipped')]
+    if not any(a.get('output_url') for _, a in failed):
         raise Failed(f'job {number}: no failed step with output')
-    return [(name, '\n'.join(''.join(x.get('message', '') for x in fetch(url)).splitlines()[-lines:])) for name, url in failed]
+    out = []
+    for name, a in failed:
+        text = ''.join(x.get('message', '') for x in fetch(a['output_url'])).splitlines() if a.get('output_url') else []
+        keep = lines or MAX_LINES
+        out.append((name, '\n'.join(text[-keep:]), not lines and bool(a.get('output_url')) and a.get('truncated') is False and len(text) <= keep))
+    return out
 
 
 def log(repo, number, lines):
-    for name, tail in failed_steps(repo, number, lines):
-        print(f'== {name}\n{tail}')
+    for name, text, _ in failed_steps(repo, number, lines):
+        print(f'== {name}\n{text}')
     return 0
 
 

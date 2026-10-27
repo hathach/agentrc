@@ -3102,6 +3102,17 @@ test('an acceptance needs a complete listing of the job', async () => {
   assert.ok(logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), logs.join('\n'))
 })
 
+test('an accepted CircleCI failure passes only on a complete listing, which a whole log lets the watcher give (#319)', async () => {
+  const RAM = { check: 'ci/circleci: build---one-random-make-apm32f10x-large-arm-gcc', workflow: 'ci', job: 'build', cell: 'apm32f103_dev_board device/net_lwip_webserver',
+    signature: "ld: region `RAM' overflowed by 744 bytes", firstError: "ld: region `RAM' overflowed by 744 bytes", files: [], verdict: 'rig-side' }
+  const accepted = { key: keyOf(RAM), reason: 'master overflows RAM on this board', scope: 'until master fixes it' }
+  const whole = await run({ ...redWith({ ...RAM, complete: true }), args: { acceptedFailures: [accepted] } })
+  assert.equal(whole.result.pass, true, whole.logs.join('\n'))
+  const tail = await run({ ...redWith({ ...RAM, complete: false }), args: { acceptedFailures: [accepted] } })
+  assert.notEqual(tail.result.pass, true)
+  assert.ok(tail.logs.some(l => /not accepted — the watcher did not list every failure of its job/.test(l)), tail.logs.join('\n'))
+})
+
 test('an acceptance not renewed on a resumed launch no longer applies, and says so', async () => {
   const first = await run({ ...redWith(PVS), args: { acceptedFailures: [byKey()], maxCycles: 3, yieldAfterCycle: true } })
   const { result, logs } = await run({ ...redWith(PVS), args: { maxCycles: 3, state: first.result.state } })

@@ -152,6 +152,28 @@ class CircleciTest(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(out, '== Build\nline2\nFAILED: x\n')
 
+    def test_failed_steps_read_whole_outputs_and_say_when_one_is_not_whole(self):
+        # #319: the failure sat on line 1 of 200, outside the old 150-line tail.
+        out = [{'message': 'region RAM overflowed\n' + ''.join(f'line {i}\n' for i in range(199))}]
+        self.job(9, W1, [{'name': 'Build', 'actions': [{'status': 'failed', 'output_url': 'u1', 'truncated': False}]}])
+        self.outputs['u1'] = out
+        [(name, text, whole)] = ci.failed_steps('o/r', 9)
+        self.assertEqual((name, text.splitlines()[0], len(text.splitlines()), whole), ('Build', 'region RAM overflowed', 200, True))
+        self.assertFalse(ci.failed_steps('o/r', 9, 150)[0][2], 'a tail is never whole')
+        for action in ({'truncated': True}, {}, {'truncated': None}):
+            self.job(9, W1, [{'name': 'Build', 'actions': [{'status': 'failed', 'output_url': 'u1', **action}]}])
+            self.assertFalse(ci.failed_steps('o/r', 9)[0][2], action)
+        with mock.patch.object(ci, 'MAX_LINES', 100):
+            self.job(9, W1, [{'name': 'Build', 'actions': [{'status': 'failed', 'output_url': 'u1', 'truncated': False}]}])
+            [(_, text, whole)] = ci.failed_steps('o/r', 9)
+            self.assertEqual((len(text.splitlines()), whole), (100, False))
+        self.job(9, W1, [{'name': 'Build', 'actions': [{'status': 'failed', 'output_url': 'u1', 'truncated': False}]},
+                         {'name': 'Upload', 'actions': [{'status': 'failed'}]}])
+        self.assertEqual([(n, t == '', w) for n, t, w in ci.failed_steps('o/r', 9)], [('Build', False, True), ('Upload', True, False)],
+                         'a failed step with no output is listed, not whole')
+        rc, printed, _ = self.main('log', '9', '--lines', '0')
+        self.assertEqual((rc, printed.count('line ')), (0, 199), '--lines 0 prints all of it')
+
     def test_log_without_a_failed_step_is_an_error(self):
         self.job(9, W1, [{'name': 'Build', 'actions': [{'status': 'success', 'output_url': 'u0'}]}])
         rc, _, err = self.main('log', '9')

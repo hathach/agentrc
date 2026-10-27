@@ -1307,8 +1307,37 @@ class FailuresTest(unittest.TestCase):
 
     def test_read_the_docs_evidence_is_the_failed_commands_last_line(self):
         c = self.entries(RTD.format(9))[0]
-        self.assertEqual((c['provider'], c['firstError'], c['base'], c['error']),
-                         ('readthedocs', 'fatal: reference is not a tree: abc', None, None))
+        self.assertEqual((c['provider'], c['firstError'], c['base'], c['error'], c['wholeLog']),
+                         ('readthedocs', 'fatal: reference is not a tree: abc', None, None, False))
+
+    def test_circleci_evidence_is_every_failed_steps_whole_output_and_says_whether_it_is_whole(self):
+        # #319: the job's one failure lay before the last 150 lines of the step, where the old tail cut it off.
+        self.checks.append({'name': 'ci/circleci: build', 'workflow': '', 'bucket': 'fail', 'link': CIRCLE.format(508184)})
+        output = [{'message': "ld: region `RAM' overflowed by 744 bytes\ncollect2: error: ld returned 1 exit status\n" + ''.join(f'[{i}/300] Building C object\n' for i in range(300)) +
+                   '\x1b[31mBuild Summary: 30 OK, 1 Failed\x1b[0m\n'}]
+        truncated = [False]
+
+        def fetch(url):
+            if url.endswith('/508184'):
+                return {'workflows': {'workflow_id': '3a705162-e09b-4ef8-9488-d034f9818421'},
+                        'steps': [{'name': 'Build', 'actions': [{'status': 'failed', 'output_url': 'out', 'truncated': truncated[0]}]}]}
+            if '/api/v2/workflow/' in url:
+                return {'status': 'failed'}
+            if isinstance(output[0], Exception):
+                raise output[0]
+            return output
+        with mock.patch.object(collect.circleci, 'fetch', fetch):
+            c = self.entries(CIRCLE.format(508184))[0]
+            self.assertEqual((c['provider'], c['error'], c['wholeLog']), ('circleci', None, True))
+            self.assertEqual(c['firstError'], 'collect2: error: ld returned 1 exit status')
+            saved = Path(c['log']).read_text(encoding='utf-8').splitlines()
+            self.assertEqual((saved[0], saved[-1], len(saved)), ('== Build', 'Build Summary: 30 OK, 1 Failed', 304))
+            truncated[0] = True
+            self.assertFalse(self.entries(CIRCLE.format(508184))[0]['wholeLog'], 'a truncated step is not the whole log')
+            output.clear()
+            output.append(collect.circleci.Failed('out: HTTP Error 502'))
+            c = self.entries(CIRCLE.format(508184))[0]
+            self.assertEqual((c['error'], 'wholeLog' in c), ('out: HTTP Error 502', False), 'an unreadable step output is an error, never whole')
 
     def test_a_link_without_a_run_is_an_entry_error_not_a_guess(self):
         c = self.entries('https://greptile.com/')[0]

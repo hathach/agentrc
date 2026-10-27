@@ -11,7 +11,7 @@ into the job's workflow and acts on that.
 
 ```bash
 C=~/.claude/skills/ci-rerun/scripts/circleci.py
-python3 $C log 391824                 # the failed steps' last 150 lines, to classify the failure
+python3 $C log 391824                 # the failed steps' last 150 lines (--lines 0: all), to classify the failure
 python3 $C rerun 391824 391728 ...    # each job's workflow, once, from its failed jobs
 ```
 
