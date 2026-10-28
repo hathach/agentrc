@@ -83,7 +83,7 @@ class CommitsTest(unittest.TestCase):
         self.git('mv', 'a.c', 'b.c')
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(self.repo)
-        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}, clear=True):
+        with mock.patch.dict(os.environ, git_env(), clear=True):
             self.assertEqual(status(), ['R  b.c', 'a.c', '?? [ab].c', '?? new/x.c', '?? new/y.c'])
             self.assertEqual(status('[ab].c'), ['?? [ab].c'], 'a pathspec is literal, never a glob over b.c')
             self.assertEqual(status('new'), ['?? new/x.c', '?? new/y.c'])

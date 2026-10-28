@@ -17,7 +17,6 @@ from helpers import guard_survivors  # noqa: E402
 
 try:
     import termios
-    import tty
 except ImportError:  # Windows: only the Win32 backend cases run
     termios = None
 
@@ -36,7 +35,6 @@ class ConsoleCaptureTest(unittest.TestCase):
         self.d = Path(self._dir.name)
         self.master, self.slave = os.openpty()
         self.addCleanup(self.close)
-        tty.setraw(self.slave)  # bytes fed before the capture sets raw must not be cooked (\r to \n)
         self.port = os.ttyname(self.slave)
         self.out = self.d / 'cap.bin'
 
@@ -60,6 +58,10 @@ class ConsoleCaptureTest(unittest.TestCase):
     def feed(self, *parts, delay=0.3):
         def go():
             time.sleep(delay)
+            # bytes that reach the line discipline before the capture's raw switch are cooked (\r to \n)
+            deadline = time.monotonic() + 10
+            while not self.slave_is_raw() and time.monotonic() < deadline:
+                time.sleep(0.01)
             for part in parts:
                 os.write(self.master, part)
                 time.sleep(0.1)
@@ -67,8 +69,16 @@ class ConsoleCaptureTest(unittest.TestCase):
         t.start()
         self.addCleanup(t.join)
 
+    def slave_is_raw(self):
+        try:
+            iflag, _, _, lflag = termios.tcgetattr(self.slave)[:4]
+        except termios.error:
+            return False
+        return not (iflag & termios.ICRNL or lflag & termios.ICANON)
+
     def test_bytes_times_marks_and_restored_settings(self):
         before = termios.tcgetattr(self.slave)
+        self.assertFalse(self.slave_is_raw())
         self.feed(b'ESP-ROM:esp32p4\r\nrst:0x17 (CHIP_USB_UART_RESET)\r\n', b'\x00\xff binary\n')
         rc, out, err = self.run_cli('--seconds', '1.5', '--lines', 'leave', '--mark', r'rst:0x[0-9a-f]+')
         self.assertEqual(rc, 0, err)
