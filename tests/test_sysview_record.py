@@ -452,6 +452,60 @@ class Recorder(unittest.TestCase):
         self.assertRegex(r['cleanupError'], r'still running after SIGKILL: SystemView \(group \d+\), Xvfb')
         self.assert_nothing_left()
 
+    def signal_before(self, target, sent):
+        """record.`target` (stop_group, or group_gone) patched to SIGTERM this process at its first call for each
+        group, before the real one runs, appending that group's process to sent."""
+        real = getattr(record, target)
+
+        def signalled(proc, *a):
+            if proc not in sent:
+                sent.append(proc)
+                os.kill(os.getpid(), signal.SIGTERM)
+            return real(proc, *a)
+        return mock.patch.object(record, target, signalled)
+
+    def test_a_stop_signal_during_cleanup_is_delivered_once_every_group_is_stopped(self):
+        before = signal.getsignal(signal.SIGTERM)
+        for target in ('stop_group', 'group_gone'):
+            with self.subTest(target):
+                sent = []
+                with self.signal_before(target, sent):
+                    rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
+                self.assertTrue(sent)
+                self.assertEqual((rc, 'error' in r, r.get('cleanupError')), (3, False, 'stopped by signal 15'))
+                self.assert_nothing_left()
+                self.assertIs(signal.getsignal(signal.SIGTERM), before)
+                shutil.rmtree(self.out)
+
+    def test_a_cleanup_failure_outranks_a_stop_signal_held_during_it(self):
+        sent = []
+        with self.survivors(), self.signal_before('stop_group', sent):
+            rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
+        self.assertEqual(rc, 3)
+        self.assertRegex(r['cleanupError'], r'still running after SIGKILL: SystemView \(group \d+\), Xvfb')
+        self.assert_nothing_left()
+
+    def test_a_stop_signal_during_a_startup_cleanup_still_stops_xvfb(self):
+        sent = []
+        with self.signal_before('stop_group', sent):
+            rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_XVFB_SILENT='1')
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(rc, 3)
+        self.assertIn('Xvfb reported no display', r['error'])
+        self.assertEqual(r['cleanupError'], 'stopped by signal 15')
+        self.assert_nothing_left()
+
+    def test_a_stop_signal_while_the_workload_is_stopped_still_stops_it(self):
+        pidfile = self.dir / 'workload.pid'
+        sent = []
+        with self.signal_before('stop_group', sent):
+            rc, r = self.live('--workload', f'trap "" TERM; echo $$ > {pidfile}; sleep 30')
+        self.assertEqual(rc, 3)
+        self.assertEqual(r['error'], 'stopped by signal 15')
+        self.assertTrue(r['workload']['stopped'])
+        self.assertFalse(pid_alive(int(pidfile.read_text())))
+        self.assert_nothing_left()
+
     def test_a_startup_failure_survives_a_failed_cleanup(self):
         with self.survivors():
             rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_XVFB_SILENT='1')
