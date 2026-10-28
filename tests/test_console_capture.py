@@ -17,6 +17,7 @@ from helpers import guard_survivors  # noqa: E402
 
 try:
     import termios
+    import tty
 except ImportError:  # Windows: only the Win32 backend cases run
     termios = None
 
@@ -35,6 +36,7 @@ class ConsoleCaptureTest(unittest.TestCase):
         self.d = Path(self._dir.name)
         self.master, self.slave = os.openpty()
         self.addCleanup(self.close)
+        tty.setraw(self.slave)  # bytes fed before the capture sets raw must not be cooked (\r to \n)
         self.port = os.ttyname(self.slave)
         self.out = self.d / 'cap.bin'
 
@@ -75,11 +77,15 @@ class ConsoleCaptureTest(unittest.TestCase):
         self.assertEqual(out['bytes'], len(data))
         self.assertEqual(out['ended'], 'time')
         self.assertEqual(out['baseline'], 'the open')
-        self.assertGreater(out['firstByteAt'], 0.1)
         self.assertIsNone(out['lines']['afterSetup'])    # a pty has no modem lines
         self.assertTrue(out['terminalRestored'])
         times = [json.loads(line) for line in Path(out['times']).read_text().splitlines()]
         self.assertEqual(sum(t['len'] for t in times), len(data))
+        # no wall-clock floor: under load the capture may open after the feed, its bytes already waiting
+        self.assertEqual(out['firstByteAt'], times[0]['t'])
+        stamps = [t['t'] for t in times]
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertGreaterEqual(stamps[0], 0)
         self.assertEqual(out['marks'], [{'pattern': r'rst:0x[0-9a-f]+', 'offset': 17, 't': times[0]['t'],
                                          'text': 'rst:0x17'}])
         self.assertEqual(termios.tcgetattr(self.slave), before)
