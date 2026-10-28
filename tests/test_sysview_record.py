@@ -469,10 +469,12 @@ class Recorder(unittest.TestCase):
         for target in ('stop_group', 'group_gone'):
             with self.subTest(target):
                 sent = []
-                with self.signal_before(target, sent):
+                # a body timeout would add an 'error'; bounds a loaded host cannot hit keep the run's body clean
+                with self.signal_before(target, sent), mock.patch.multiple(
+                        record, DISPLAY_S=60, STARTUP_S=60, SETTLE_S=60, LOAD_S=60, EXPORT_S=60):
                     rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
                 self.assertTrue(sent)
-                self.assertEqual((rc, 'error' in r, r.get('cleanupError')), (3, False, 'stopped by signal 15'))
+                self.assertEqual((rc, 'error' in r, r.get('cleanupError')), (3, False, 'stopped by signal 15'), r)
                 self.assert_nothing_left()
                 self.assertIs(signal.getsignal(signal.SIGTERM), before)
                 shutil.rmtree(self.out)
