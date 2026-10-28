@@ -54,7 +54,10 @@ def make_repo(path):
 
 def setUpModule():
     guard_survivors(__name__)
-    unittest.enterModuleContext(mock.patch.dict(os.environ, git_env(), clear=True))  # the hook's git too
+    # the hook's git too, with the core.autocrlf Git for Windows' system config would give, which git_env drops
+    autocrlf = {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.autocrlf',
+                'GIT_CONFIG_VALUE_0': 'true' if os.name == 'nt' else 'false'}
+    unittest.enterModuleContext(mock.patch.dict(os.environ, git_env(**autocrlf), clear=True))
 
 
 class Session:
