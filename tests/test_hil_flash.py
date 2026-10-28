@@ -941,6 +941,16 @@ class JLinkJudgment(unittest.TestCase):
         self.assertFalse(hf.jlink_judgment(out.replace('AfterResetTarget() end', 'Something else\nAfterResetTarget() end'),
                                            ['halt', 'r', 'go'])['ok'])
 
+    def test_lpc43_reset_with_an_unknown_boot_rom(self):
+        """The DLL's LPC18xx/43xx reset closes `r` only with all three of its lines and nothing after."""
+        name = 'V8.98-lpcxpresso43s67-halt-loadfile-r-go.txt'
+        out, cmds = jlink_fixture(name), self.commands(name)
+        self.assertTrue(hf.jlink_judgment(out, cmds)['ok'])
+        variant = 'Unknown LPC18xx/43xx bootloader variant. Halting after reset may fail.\nJ-Link>go'
+        for what, bad in {'cut short': 'J-Link>go', 'a line after': variant.replace('\nJ-Link>go', '\nSomething else\nJ-Link>go')}.items():
+            with self.subTest(what):
+                self.assertEqual(hf.jlink_judgment(out.replace(variant, bad), cmds)['problem'], "'r' did not complete")
+
     def test_the_problem_of_an_operation_is_its_last_attempt_judged_against_its_command_file(self):
         good = jlink_fixture(self.RESET)
 

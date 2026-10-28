@@ -1,4 +1,41 @@
 {
+ "V8.98-lpcxpresso43s67-halt-loadfile-r-go.txt": {
+  "argv": [
+   "JLinkExe",
+   "-USB",
+   "728973776",
+   "-device",
+   "LPC43S67_M4",
+   "-if",
+   "swd",
+   "-JTAGConf",
+   "-1,-1",
+   "-speed",
+   "auto",
+   "-NoGui",
+   "1",
+   "-ExitOnError",
+   "1",
+   "-CommandFile",
+   "/x/hil_jlink_rec.jlink"
+  ],
+  "board": "lpcxpresso43s67",
+  "cleanup": "done (lock released)",
+  "commands": [
+   "halt",
+   "loadfile /x/cdc_msc.hex",
+   "r",
+   "go"
+  ],
+  "device": "LPC43S67_M4",
+  "exe": "/opt/SEGGER/JLink_V898/JLinkExe",
+  "host": "tusb",
+  "returncode": 0,
+  "returncodeEvidence": "recorded with the shell's $? (0); the new image enumerated after go",
+  "route": "swd",
+  "source": "hathach/tinyusb hfp rig, hil_flash's flash script by hand after the LPC43S67 was replaced, 2026-10-26",
+  "version": "V8.98"
+ },
  "V9.78-ea4088_quickstart-halt-r-go.txt": {
   "argv": [
    "JLinkExe",
