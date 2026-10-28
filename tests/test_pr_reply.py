@@ -12,7 +12,7 @@ from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, remotes_checkout  # noqa: E402
+from helpers import git_env, guard_survivors, remotes_checkout  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-reply' / 'scripts' / 'reply.py'
 spec = importlib.util.spec_from_file_location('pr_reply', SCRIPT)
@@ -692,7 +692,8 @@ class ReceiptFileTest(ReplyCase):
 class DefaultRepoTest(ReplyCase):
     def run_without_repo(self, *remotes):
         out = io.StringIO()
-        with chdir(remotes_checkout(self, *remotes)), redirect_stdout(out), redirect_stderr(io.StringIO()):
+        with chdir(remotes_checkout(self, *remotes)), redirect_stdout(out), redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, git_env(), clear=True):
             rc = reply.main(['--pr', str(PR), '--inspect', '10:25'])
         return rc, json.loads(out.getvalue().strip().splitlines()[-1])
 

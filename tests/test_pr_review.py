@@ -27,7 +27,7 @@ import prepare  # noqa: E402
 import result  # noqa: E402
 import threads  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, remotes_checkout  # noqa: E402
+from helpers import git_env, guard_survivors, remotes_checkout  # noqa: E402
 
 REPO, PR, ME = 'o/r', 7, 'reviewer'
 REAL_RUN = facts.run
@@ -1806,10 +1806,12 @@ class Store(unittest.TestCase):
 
 class RepoOf(unittest.TestCase):
     def test_without_repo_the_checkouts_one_github_repository_is_named(self):
-        with contextlib.chdir(remotes_checkout(self, ('origin', 'https://github.com/o/r.git'))):
+        with contextlib.chdir(remotes_checkout(self, ('origin', 'https://github.com/o/r.git'))), \
+                mock.patch.dict(os.environ, git_env(), clear=True):
             self.assertEqual(ledger.repo_of(None), 'o/r')
         with contextlib.chdir(remotes_checkout(self, ('origin', 'https://github.com/me/r.git'),
                                                ('upstream', 'https://github.com/o/r.git'))), \
+                mock.patch.dict(os.environ, git_env(), clear=True), \
                 self.assertRaisesRegex(ledger.Unusable, 'none is marked gh-resolved: name the repository'):
             ledger.repo_of(None)
 
