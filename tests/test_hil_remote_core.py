@@ -852,6 +852,23 @@ class FetchStream(unittest.TestCase):
     """read_fetch against synthetic streams: anything malformed or self-contradictory is None, a
     transport failure, before anything is published."""
 
+    def test_a_complete_stream_is_not_a_transport_failure_while_its_tail_is_still_written(self):
+        # the rig's tar.close() and flush write padding past the end-of-archive blocks read_fetch stops at;
+        # 1 MiB of it outlasts any read-ahead and the pipe buffer, so closing the pipe early always breaks it
+        producer = ('import sys\n'
+                    'try:\n'
+                    '    sys.stdout.buffer.write(open(sys.argv[1], "rb").read() + bytes(1 << 20)); sys.stdout.buffer.flush()\n'
+                    'except BrokenPipeError:\n'
+                    '    sys.exit(120)\n')
+        tree = rc_.Tree('rig', '/rig/tree', '/rig/tree.lock', 'tok', Path('.'))
+        with tempfile.TemporaryDirectory() as tmp:
+            archive, into = Path(tmp) / 'archive.tar', Path(tmp) / 'into'
+            archive.write_bytes(stream(('report.json', b'{"ok": 1}'), status_entry(**{'report.json': 'ok'})))
+            into.mkdir()
+            with mock.patch.object(rc_, 'ssh_argv', lambda host, cmd: [sys.executable, '-c', producer, str(archive)]):
+                self.assertEqual(rc_._fetch(tree, ['report.json'], into), {'report.json': 'ok'})
+            self.assertEqual((into / 'report.json').read_bytes(), b'{"ok": 1}')
+
     def read(self, data, members=('report.json', 'run/')):
         with tempfile.TemporaryDirectory() as into:
             return rc_.read_fetch(io.BytesIO(data), list(members), Path(into))
