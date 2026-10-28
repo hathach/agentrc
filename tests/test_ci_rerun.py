@@ -9,11 +9,11 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import chdir, redirect_stdout, redirect_stderr
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, remotes_checkout  # noqa: E402
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'ci-rerun' / 'scripts'
 
@@ -179,6 +179,26 @@ class CircleciTest(unittest.TestCase):
         rc, _, err = self.main('log', '9')
         self.assertEqual(rc, 1)
         self.assertIn('no failed step', err)
+
+    def run_without_repo(self, *remotes):
+        out, err = io.StringIO(), io.StringIO()
+        with chdir(remotes_checkout(self, *remotes)), redirect_stdout(out), redirect_stderr(err):
+            rc = ci.main(['rerun', '1'])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_without_repo_the_checkouts_one_github_repository_is_named(self):
+        self.job(1, W1)
+        rc, out, _ = self.run_without_repo(('origin', 'git@github.com:o/r.git'))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.strip().splitlines()[-1])['reruns'], [{'workflow': W1, 'jobs': [1], 'newWorkflow': NEW}])
+
+    def test_without_repo_several_repositories_refuse_before_any_call(self):
+        fetched = []
+        self.enterContext(mock.patch.object(ci, 'fetch', lambda url: fetched.append(url)))
+        rc, _, err = self.run_without_repo(('origin', 'https://github.com/me/r.git'), ('upstream', 'https://github.com/o/r.git'))
+        self.assertEqual(rc, 2)
+        self.assertIn('none is marked gh-resolved: name the repository (--repo OWNER/NAME)', err)
+        self.assertEqual((fetched, self.cli), ([], []))
 
 
 API = 'https://app.readthedocs.org/api/v3/projects/tinyusb'

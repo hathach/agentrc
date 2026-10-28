@@ -80,6 +80,15 @@ def git_env(**extra):
             'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', **extra}
 
 
+def remotes_checkout(case, *remotes):
+    """A temporary repository with these (name, url) remotes, in order, and nothing else configured."""
+    path = tmpdir(case)
+    subprocess.run(['git', 'init', '-q', str(path)], check=True, env=git_env())
+    for name, url in remotes:
+        subprocess.run(['git', '-C', str(path), 'remote', 'add', name, url], check=True, env=git_env())
+    return path
+
+
 def tmpdir(case):
     """A temporary directory removed after the test, resolved as git, getcwd and realpath name it: on Windows the
     long name, not the 8.3 one a runner's TEMP may hold (RUNNER~1)."""

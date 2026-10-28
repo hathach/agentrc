@@ -25,12 +25,10 @@ except ImportError:  # Windows
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
 from seal import canonical, fnv1a, rate_limit, sealed, utc  # noqa: E402,F401  re-exported for the scripts
+import gh_repo  # noqa: E402
+from gh_repo import HOST, REPO, github_repo  # noqa: E402,F401  re-exported for the scripts
 
 FULL_SHA = re.compile(r'\A[0-9a-f]{40}\Z')  # \Z: $ would let a trailing newline through
-REPO = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9-]*/(?!\.\.?\Z)[A-Za-z0-9._-]+\Z')  # OWNER/NAME
-HOST = 'github.com'
-# scp-like needs `:` and a URL `/` after the host: accepting either makes `git@github.com/owner/repo` look right while git reads a local path.
-ORIGIN = re.compile(r'(?:(?:https|ssh)://(?:[^@/]*@)?([^/:]+)(?::[0-9]+)?/|(?:[^@/\s]+@)([^/:]+):)([^/]+)/([^/]+?)(?:\.git)?')
 # The repository bind_repo named: every gh call run and attempt make carries it as GH_REPO.
 GH_REPO = None
 # The human is the sole author: no line may credit an agent, model, tool or session, nor link a Claude or ChatGPT session anywhere.
@@ -64,36 +62,11 @@ class Parser(argparse.ArgumentParser):
         raise Unusable(f'usage: {message}')
 
 
-def github_repo(url):
-    """OWNER/NAME of a github.com remote URL as spelled there, '' for any other URL."""
-    m = ORIGIN.fullmatch(url.strip().rstrip('/'))
-    return f'{m[3]}/{m[4]}' if m and (m[1] or m[2]).lower() == HOST else ''
-
-
 def checkout_repo():
-    """The one GitHub repository the checkout's remotes name: those `gh repo set-default` marked gh-resolved (`base`
-    for the remote's own), else every remote URL; Unusable when they name none or several."""
-    got = run('git', 'config', '--get-regexp', r'^remote\..+\.(url|gh-resolved)$', ok=(0, 1))[1]
-    urls, marked = {}, {}
-    for line in got.splitlines():
-        key, _, value = line.partition(' ')
-        remote, _, field = key[len('remote.'):].rpartition('.')
-        if field == 'url':
-            urls.setdefault(remote, value.strip())  # git fetches from a remote's first URL
-        else:
-            marked[remote] = value.strip()  # listed system to worktree: the last is git's effective value
-    named = ({r: github_repo(urls.get(r, '')) if v == 'base' else v for r, v in marked.items()} if marked
-             else {r: n for r, u in urls.items() if (n := github_repo(u))})
-    repos = {}
-    for n in named.values():
-        repos.setdefault(n.lower(), n)  # GitHub names ignore case: one repository, spelled as its first remote does
-    if len(repos) == 1 and '' not in repos:
-        return next(iter(repos.values()))
-    which = ', '.join(f'{r} {n or "(not a GitHub repository)"}' for r, n in sorted(named.items()))
-    why = (f'the remotes marked gh-resolved name {which}' if marked
-           else f'the remotes name {len(repos)} GitHub repositories ({which}) and none is marked gh-resolved' if repos
-           else 'no remote names a github.com repository')
-    raise Unusable(f'{why}: name the PR\'s repository (--repo OWNER/NAME)')
+    try:
+        return gh_repo.checkout_repo()
+    except gh_repo.Unresolved as e:
+        raise Unusable(f"{e}: name the PR's repository (--repo OWNER/NAME)") from None
 
 
 def bind_repo(name=None):

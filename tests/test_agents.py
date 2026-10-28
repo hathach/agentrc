@@ -233,11 +233,11 @@ class AgentFiles(unittest.TestCase):
 
     def test_chief_launches_pr_babysit_with_the_arguments_the_workflow_parses(self):
         chief = ' '.join((AGENTS / 'chief.md').read_text().split())
-        self.assertIn('Launch it as `{ pr, autoPush, markSonar, yieldOnChange: true, stateRef }`, `markSonar` set with '
-                      '`autoPush` unless the human withheld Sonar marking', chief)
+        self.assertIn('Launch it as `{ pr, repo, autoPush, markSonar, yieldOnChange: true, stateRef }`, `repo` the PR\'s base '
+                      'repository as the task names it, `markSonar` set with `autoPush` unless the human withheld Sonar marking', chief)
         self.assertIn('with `yieldAfterCycle: true` in place of `yieldOnChange`', chief)
         workflow = (AGENTS.parent / 'workflows' / 'pr-babysit.js').read_text()
-        for arg in ('yieldOnChange', 'yieldAfterCycle', 'markSonar', 'stateRef'):
+        for arg in ('repo', 'yieldOnChange', 'yieldAfterCycle', 'markSonar', 'stateRef'):
             self.assertIn(f'args.{arg}', workflow)
         self.assertNotIn('the grant includes SonarCloud marking', chief)
         self.assertIn('a relaunch sets `markSonar` only from the grant, unless the human withheld Sonar marking', chief)
