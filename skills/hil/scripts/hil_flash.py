@@ -699,12 +699,18 @@ def esptool_runtime(esptool: str = 'esptool', *, timeout: float = 60) -> dict:
     (the venv path kept, never resolved past its symlink), that interpreter importing one esptool
     package both from the sys.path the script gets (its resolved directory first, unless
     PYTHONSAFEPATH) and from the one a helper session beside this file gets, and the executable's
-    `version` naming the same version. {'exe', 'python', 'version', 'package'}; RuntimeError
-    otherwise. Not cached: a caller keeps the identity for its run."""
+    `version` naming the same version. A relative or empty PYTHONPATH entry is refused: each run
+    (a flash in its build dir, a session in its caller's) would resolve it in its own directory.
+    {'exe', 'python', 'version', 'package'}; RuntimeError otherwise. Not cached: a caller keeps
+    the identity for its run."""
     exe = shutil.which(esptool)
     if exe is None:
         raise RuntimeError(f'{esptool} is not on PATH')
     exe = os.path.abspath(exe)
+    relative = [e for e in os.environ.get('PYTHONPATH', '').split(os.pathsep) if not os.path.isabs(e)]
+    if os.environ.get('PYTHONPATH') and relative:
+        raise RuntimeError(f'PYTHONPATH entries {relative!r} are not absolute: each esptool run would resolve them '
+                           'in its own working directory')
     python = tool_python(exe)
     probe = ('import json, sys\n'
              'if not getattr(sys.flags, "safe_path", False): sys.path[0] = sys.argv[1]\n'

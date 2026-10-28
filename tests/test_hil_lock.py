@@ -1534,7 +1534,7 @@ class HandOver(LockDir):
         self.assertEqual(hil_lock.read_record(BOARD)['retained'], [str(receipt)])
         sent = self.signals()
         receipt.parent.mkdir()
-        tool = {'tool': 'hil_openocd_esp'}
+        tool = {'tool': 'hil_openocd_esp', 'pid': 4242, 'startTime': '123456'}
         for content, state in ((None, 'unreadable'), ({**tool, 'closed': False, 'cleanup': None}, 'not closed'),
                                ({**tool, 'closed': True, 'cleanup': 'unknown'}, "closed with cleanup 'unknown'")):
             if content is not None:
@@ -1552,7 +1552,7 @@ class HandOver(LockDir):
             with self.assertRaisesRegex(hil_lock.ReleaseRefused, f'signalled, but holder pid {pid} left its records'):
                 hil_lock.release_token(token)
         self.assertEqual((sent, hil_lock.read_record(BOARD)), ([signal.SIGUSR1], rec))
-        receipt.write_text(json.dumps({'tool': 'hil_openocd_esp', 'closed': True, 'cleanup': 'done'}))
+        receipt.write_text(json.dumps({**tool, 'closed': True, 'cleanup': 'done'}))
         self.patch(hil_lock, 'RELEASE_WAIT', 5)
         self.assertEqual(hil_lock.release_token(token), (pid, [BOARD]))
         self.assertIsNone(hil_lock.read_record(BOARD))
@@ -1567,11 +1567,24 @@ class HandOver(LockDir):
         fh = hil_lock.take_board_lock(BOARD, 'selftest run', protected=True)
         self.addCleanup(fh.close)
         ended = Path(self.dir, 'ended.json')
-        ended.write_text(json.dumps({'tool': 'hil_openocd_esp', 'closed': True, 'cleanup': 'done'}))
+        whole = {'tool': 'hil_openocd_esp', 'pid': 4242, 'startTime': '123456', 'closed': True, 'cleanup': 'done'}
+        ended.write_text(json.dumps(whole))
+        self.assertEqual(hil_lock._retained_state(str(ended)), 'ended')
         for rec in ({'closed': True, 'cleanup': 'done'}, {'tool': 'other', 'closed': True, 'cleanup': 'done'}):
             foreign = Path(self.dir, 'foreign.json')
             foreign.write_text(json.dumps(rec))
             self.assertEqual(hil_lock._retained_state(str(foreign)), 'not a hil_openocd_esp session receipt', rec)
+        # what hil_openocd_esp_receipt.session_state calls unreadable is never ended here either
+        for broken in ({'pid': None}, {'pid': True}, {'pid': 0}, {'pid': '4242'}, {'startTime': None},
+                       {'startTime': '12x'}, {'closed': 1}):
+            partial = Path(self.dir, 'partial.json')
+            partial.write_text(json.dumps({**whole, **broken}))
+            self.assertEqual(hil_lock._retained_state(str(partial)), 'not a whole session receipt (pid, startTime, closed)',
+                             broken)
+        for missing in ('pid', 'startTime', 'closed'):
+            partial.write_text(json.dumps({k: v for k, v in whole.items() if k != missing}))
+            self.assertEqual(hil_lock._retained_state(str(partial)), 'not a whole session receipt (pid, startTime, closed)',
+                             missing)
         for retained, releasable in (([str(ended)], True), ([str(ended), str(fifo)], False), ('x', False)):
             hil_lock.write_record(fh, 'selftest run', retained=retained)
             self.assertEqual(hil_lock._releasable([fh]), releasable, retained)
