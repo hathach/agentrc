@@ -512,7 +512,7 @@ test('the happy path passes with the branch commits and a safe next step naming 
   // What the code composes into the handoff: the plan's checks, the HIL build, the lane, the validation command, the cost line.
   for (const part of ['perform every coplan.plan.validation check', 'when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD',
     `on the plan lane ${LANE} with --tier review, with ${TRIAGE.verify} as its validation`,
-    '`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run\'s journal.jsonl> --full <a new temporary file>`']) {
+    '`python3 "${AGENTRC_DIR:-$HOME/.claude}"/skills/headless-chief/scripts/run_cost.py --journal <this run\'s journal.jsonl> --full <a new temporary file>`']) {
     assert.ok(result.next.includes(part), part)
   }
   assert.match(result.next, /then the human opens the PR$/)

@@ -21,18 +21,18 @@ answer (a `Fixed in ` note, or anything else) still blocks it. Its receipts are
 the evidence; a `201` from GitHub is not.
 
 ```bash
-R=~/.claude/skills/pr-reply/scripts/reply.py
-python3 $R --pr <N> --manifest <file.json>
+R="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-reply/scripts/reply.py"
+python3 "$R" --pr <N> --manifest <file.json>
 # file.json: {"replies": [{"commentId": 4013179956, "body": "...", "digest": "<8 hex>"}]}
-python3 $R --digest "$body"      # the digest of a body, for a manifest written by hand
-python3 $R --pr <N> --inspect <commentId>:<replyId> ...   # read our replies, post nothing
-python3 $R --pr <N> --inspect <commentId>   # our newest reply; its `original` and `originalDigest` too,
-                                           # also on exit 1 "no reply of ours": how to read the comment itself
-python3 $R --pr <N> --reuse <file.json>
+python3 "$R" --digest "$body"      # the digest of a body, for a manifest written by hand
+python3 "$R" --pr <N> --inspect <commentId>:<replyId> ...   # read our replies, post nothing
+python3 "$R" --pr <N> --inspect <commentId>   # our newest reply; its `original` and `originalDigest` too,
+                                             # also on exit 1 "no reply of ours": how to read the comment itself
+python3 "$R" --pr <N> --reuse <file.json>
 # file.json: {"reuses": [{"commentId": ..., "replyId": ..., "bodyDigest": "...", "originalDigest": "..."}]}
-python3 $R --pr <N> --edit <file.json>
+python3 "$R" --pr <N> --edit <file.json>
 # file.json: {"edits": [{"commentId": ..., "replyId": ..., "body": "...", "digest": "...", "bodyDigest": "...", "originalDigest": "..."}]}
-python3 $R --pr <N> --manifest <file.json> --receipt <path>   # also --reuse, --edit: replay a saved run
+python3 "$R" --pr <N> --manifest <file.json> --receipt <path>   # also --reuse, --edit: replay a saved run
 ```
 
 Every entry carries its body's digest (`--digest` by hand); the script refuses

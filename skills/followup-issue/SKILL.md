@@ -9,13 +9,14 @@ description: Open one follow-up issue, or comment new evidence on the open issue
 a repository; its docstring defines the checks, the receipt and the exit codes.
 
 ```bash
-P=~/.claude/skills/followup-issue/scripts/publish.py
-python3 $P create --repo <o/r> --allow-repo <o/r> [--allow-repo hathach/agentrc] --title "<t>" --body-file <f> [--label <l>]
-python3 $P comment --repo <o/r> --allow-repo <o/r> --issue <N> --body-file <f>
+P="${AGENTRC_DIR:-$HOME/.claude}/skills/followup-issue/scripts/publish.py"
+python3 "$P" create --repo <o/r> --allow-repo <o/r> [--allow-repo hathach/agentrc] --title "<t>" --body-file <f> [--label <l>]
+python3 "$P" comment --repo <o/r> --allow-repo <o/r> --issue <N> --body-file <f>
 ```
 
 `--title-file <f>`, a file holding the title line, stands in for `--title`. Captain, whose guard admits no quoting,
-runs these steps with the recipes in `skills/captain/SKILL.md`: one-word searches, a title file and a body file.
+runs these steps with the recipes in `../captain/SKILL.md` from this skill's directory, its symlink resolved first:
+one-word searches, a title file and a body file.
 
 ## Judgment
 

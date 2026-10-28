@@ -11,8 +11,8 @@ with a status line (the rule in `agents/chief.md`); the script copies those
 first lines to `progress.log`, so the caller tails a file.
 
 ```bash
-R=~/.claude/skills/headless-chief/scripts/chief_run.py
-python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
+R="${AGENTRC_DIR:-$HOME/.claude}/skills/headless-chief/scripts/chief_run.py"
+python3 "$R" --out <new dir> --worktree <task worktree> --task-file <task.md> \
   --permission-mode bypassPermissions
 ```
 
@@ -27,7 +27,8 @@ python3 $R --out <new dir> --worktree <task worktree> --task-file <task.md> \
    time limit. A refused argument exits 2 at once. So does a worktree whose
    `.claude/workflows` or `.claude/agents` entries differ from the same-named
    agentrc copies installed in the user scope (`$CLAUDE_CONFIG_DIR`, else
-   `~/.claude`), which they would shadow; the message names the fix. The
+   `~/.claude`), which they would shadow (an `install.py --project` link to
+   this checkout is no copy); the message names the fix. The
    skill's hook denies `Workflow` and `Agent` calls in such a worktree for
    interactive sessions too. The `launcher: exit` line in `progress.log` is
    the end of the run;

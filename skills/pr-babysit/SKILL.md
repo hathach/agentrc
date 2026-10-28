@@ -16,36 +16,37 @@ else the one the checkout's remotes name alone, and refuses a checkout whose
 remotes name several with none marked `gh-resolved` (`facts.py`'s `bind_repo`).
 
 ```bash
-S=~/.claude/skills/pr-babysit/scripts
-python3 $S/preflight.py --pr N [--repo R] [--needs P] [--module M]  # the checkout, the PR it must stay and this interpreter; P a script the workflow calls, M a module it needs
-python3 $S/preflight.py --recheck            # before a commit: has the checkout moved?
-python3 $S/preflight.py --state N [--repo R]  # before a GitHub write: is the PR still OPEN?
-python3 $S/harvest.py --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
-python3 $S/hooks.py [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540)
-python3 $S/commits.py commit [--receipt <file> --request <r>] 'src/a.c' < msg  # commit exactly these paths, the message on stdin; the line saved to a new <file>
-python3 $S/commits.py receipt <file> --request <r> --parent <sha> 'src/a.c'  # what that commit printed, for this request, parent and paths only
-python3 $S/commits.py head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
-python3 $S/commits.py chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
-python3 $S/push.py --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N] [--repo R]
-python3 $S/sonar.py --pr N [--repo R] --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
-python3 $S/coderabbit_trigger.py --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, or on such a skip no tick asked for
-python3 $S/greptile_trigger.py --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
-python3 $S/build.py --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
-python3 $S/scope_check.py --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
-python3 $S/state_transfer.py <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
-python3 $S/launch_result.py --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
-python3 $S/merge.py --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
+S="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/scripts"
+python3 "$S/preflight.py" --pr N [--repo R] [--needs P] [--module M]  # the checkout, the PR it must stay and this interpreter; P a script the workflow calls, M a module it needs
+python3 "$S/preflight.py" --recheck            # before a commit: has the checkout moved?
+python3 "$S/preflight.py" --state N [--repo R]  # before a GitHub write: is the PR still OPEN?
+python3 "$S/harvest.py" --pr N [--repo R] --reviewers coderabbit,greptile --auto-run coderabbit  # bot states + review comments
+python3 "$S/hooks.py" [--deadline-seconds N] 'src/a.c' 'docs/b.rst'   # from the checkout's top level; killed past N s (540)
+python3 "$S/commits.py" commit [--receipt <file> --request <r>] 'src/a.c' < msg  # commit exactly these paths, the message on stdin; the line saved to a new <file>
+python3 "$S/commits.py" receipt <file> --request <r> --parent <sha> 'src/a.c'  # what that commit printed, for this request, parent and paths only
+python3 "$S/commits.py" head --parent <sha> 'src/a.c'  # audit the commit at HEAD, made on <sha> from these paths
+python3 "$S/commits.py" chain <from> <to> --published <pr-head> --base <base-head> --tip <base-tip>  # audit from..to for adoption, full SHAs; preflight's prBase and prBaseTip
+python3 "$S/push.py" --remote origin --branch <b> --sha <sha> --push-url <url> [--open-pr N] [--pr N] [--repo R]
+python3 "$S/sonar.py" --pr N [--repo R] --head <sha> --manifest <file> [--receipt <path>]  # mark answered code-scanning comments' SonarCloud issues false positive; a saved --receipt replays
+python3 "$S/coderabbit_trigger.py" --pr N [--repo R] --head <sha> [--request]  # tick CodeRabbit's Trigger review box when it skipped the head for a manual review; --request comments `@coderabbitai review` once its rate limit has reset, or on such a skip no tick asked for
+python3 "$S/greptile_trigger.py" --pr N [--repo R] --head <sha>  # comment `@greptileai` once per head, recorded under the git common dir
+python3 "$S/build.py" --path 'src/a.c' --command 'make -C <BUILD>' [--setup L] [--require T]  # build the checkout as it stands
+python3 "$S/scope_check.py" --path 'src/a.c' --path 'test/test_a.c'  # which paths a fix writer may edit or create
+python3 "$S/state_transfer.py" <saved output> [--chunks I,J] [--pad]  # a stateRef's state as checksummed base64 chunks; --pad shifts their text
+python3 "$S/launch_result.py" --output <saved output> [--state-ref F:D] [--checkout DIR] [--keys]  # the caller's reading of a launch; --keys: settled failures' keys too
+python3 "$S/merge.py" --pr-url <url> --base <branch> --checkout DIR --output <saved output> --state-digest D [--waive BOT] [--merge]  # chief's merge gate; inspects without --merge; --waive drops a bot from the required reviews on the owner's word, recorded as `waived`
 ```
 
 `merge.py --merge` is chief-only, under `agents/chief.md`'s merge exception, and `--waive` only on the owner's word that
 the merge goes without that bot; a bot left out of `autoRun` alone is never waived, and waiving both is refused.
 
 After an agentrc update, launch the workflow from the installed file (Workflow
-`scriptPath: ~/.claude/workflows/pr-babysit.js`), not by its name in a session
-started before the update: that session may hold an older copy of the script
-while the skills' scripts are already new. A copy whose collector output it
-cannot read stops `collector-skew` (collect.py's `contract`), one calling a
-script the install lacks `stale-workflow`.
+`scriptPath: "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js"`, expanded
+in the shell first), not by its name in a session started before the update:
+that session may hold an older copy of the script while the skills' scripts are
+already new. A copy whose collector output it cannot read stops
+`collector-skew` (collect.py's `contract`), one calling a script the install
+lacks `stale-workflow`.
 
 `launch_result.py` is the caller's, not the workflow's: it condenses a finished
 launch, lists the `blockers` to settle before continuing, and shows as `pinned`

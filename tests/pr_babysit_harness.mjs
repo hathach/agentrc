@@ -781,7 +781,8 @@ test('the preflight pins the checkout without touching it', async () => {
   assert.equal(pre.label, 'preflight')
   assert.match(pre.prompt, /Editing and committing nothing/)
   assert.ok(pre.prompt.includes('preflight.py --pr 3888 --needs '), pre.prompt)
-  const scripts = new Set([...body.matchAll(/'(~\/\.claude\/skills\/[\w./-]+\.py)'/g)].map(m => m[1]).filter(p => !p.endsWith('/preflight.py')))
+  const scripts = new Set([...body.matchAll(/`\$\{AGENTRC\}(\/skills\/[\w./-]+\.py)`/g)].map(m => '"${AGENTRC_DIR:-$HOME/.claude}"' + m[1]).filter(p => !p.endsWith('/preflight.py')))
+  assert.ok(scripts.size >= 10, 'the script constants were found')
   assert.deepEqual([...pre.prompt.matchAll(/ --needs (\S+?)(?=[ `])/g)].map(m => m[1]).sort(), [...scripts].sort(), 'every script the workflow calls is checked')
   assert.deepEqual(pre.schema.required.slice().sort(),
     ['badPushUrl', 'branch', 'dirty', 'head', 'missing', 'pr', 'prBase', 'prBaseBranch', 'prBaseTip', 'prBranch', 'prHead', 'prRepo', 'prState', 'prUrl', 'pushUrls', 'python', 'receipts', 'remote', 'repo', 'upstreamBranch'])
@@ -854,7 +855,7 @@ test('a resumed launch names its state\'s repository, and refuses another (#311)
 })
 
 // #234: a bare python3 that resolved to an interpreter without PyYAML failed every harvest on an MSYS2 host.
-const SCRIPT_RUN = /[\s`]('[^']*'(?:\\''[^']*')*|[^\s`']+) ~\/\.claude\/skills\/[\w./-]+\.py/
+const SCRIPT_RUN = /[\s`]('[^']*'(?:\\''[^']*')*|[^\s`']+) "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/[\w./-]+\.py/
 const interpreters = (calls) => [...new Set(calls.map(c => SCRIPT_RUN.exec(c.prompt)?.[1]).filter(Boolean))]
 
 test('every script runs under the interpreter preflight reports, quoted, or the one python names (#234)', async () => {
@@ -2573,7 +2574,7 @@ test('a collector failing the same way on two cycles running stops ci-collect-fa
 test('a collector of another output contract stops collector-skew at once; a mis-copied line is a dead relay (#293)', async () => {
   const relayed = (over) => (l, a) => l.startsWith('ci:collect#') && !a.error ? over(a) : a
   const SKEW = (got) => new RegExp(`^collect\\.py prints output contract ${got}, and this launch's workflow script reads ${COLLECT_CONTRACT}: ` +
-    '.*Relaunch from the installed file \\(Workflow scriptPath ~/\\.claude/workflows/pr-babysit\\.js\\)')
+    '.*Relaunch from the installed file \\(Workflow scriptPath "\\$\\{AGENTRC_DIR:-\\$HOME/\\.claude\\}/workflows/pr-babysit\\.js", expanded in the shell first\\)')
   for (const [name, collector, garble, got] of [
     // An older collect.py: no contract, nor a member added since, which the relay fills in to meet its schema.
     ['older', ({ contract, requiredChecks, ...line }) => line, relayed(a => ({ contract: 0, requiredChecks: [], ...a })), 0],
@@ -2905,7 +2906,7 @@ test('a GitHub write reads the PR state first, and goes on only for a verified O
   assert.deepEqual(writes(watched.labels), ['prstate#1-replies', 'replies#1'])
   const unread = await run({ reviews: refuting, prState: null, args: { autoPush: true, maxCycles: 3 } })
   assert.ok(unread.logs.some(l => l === 'prstate#1-replies: PR #3888 state unread — the relay died'), unread.logs.join('\n'))
-  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `'\/usr\/bin\/python3' ~\/\.claude\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
+  assert.match(unread.calls.find(c => c.label === 'prstate#1-replies').prompt, /run exactly `'\/usr\/bin\/python3' "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/preflight\.py --state 3888 --repo 'hathach\/tinyusb'` /)
   // A copy that turns MERGED into OPEN fails the script's seal: it is no answer, and nothing is posted.
   const miscopied = await run({ reviews: refuting, prState: 'MERGED', garble: (l, a) => l.startsWith('prstate#') && a ? { ...a, state: 'OPEN' } : a, args: { autoPush: true, maxCycles: 3 } })
   assert.equal(miscopied.result.reason, 'pr-state-unread')
@@ -7781,11 +7782,11 @@ test('the stateRef bootstrap runs under the interpreter python names, before pre
   const { state, stateRef } = await savedForLoad()
   const named = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef, python: '/opt/My Python/python3' }, load: state })
   assert.deepEqual(named.labels.slice(0, 2), ['state:load#1', 'preflight'])
-  assert.match(named.calls[0].prompt, /^Run exactly: '\/opt\/My Python\/python3' ~\/\.claude\/skills\/pr-babysit\/scripts\/state_transfer\.py /)
+  assert.match(named.calls[0].prompt, /^Run exactly: '\/opt\/My Python\/python3' "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\/skills\/pr-babysit\/scripts\/state_transfer\.py /)
   assert.deepEqual(interpreters(named.calls), ["'/opt/My Python/python3'"])
   assert.equal(named.result.state.cyclesUsed, 2)
   const bare = await run({ args: { yieldAfterCycle: true, maxCycles: 3, stateRef }, load: state })
-  assert.match(bare.calls[0].prompt, /^Run exactly: python3 ~\//)
+  assert.match(bare.calls[0].prompt, /^Run exactly: python3 "\$\{AGENTRC_DIR:-\$HOME\/\.claude\}"\//)
   assert.equal(SCRIPT_RUN.exec(bare.calls.find(c => c.label === 'preflight').prompt)[1], 'python3')
 })
 

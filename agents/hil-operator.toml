@@ -1,7 +1,7 @@
 name = "hil-operator"
-description = "Load the canonical hil-operator agent from ~/.codex/agents/hil-operator.md."
+description = "Load the canonical hil-operator agent from \"${AGENTRC_DIR:-$HOME/.codex}/agents/hil-operator.md\"."
 model = "gpt-5.6-terra"
 model_reasoning_effort = "high"
 developer_instructions = """
-Before acting, read ~/.codex/agents/hil-operator.md completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
+Before acting, read "${AGENTRC_DIR:-$HOME/.codex}/agents/hil-operator.md" completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
 """

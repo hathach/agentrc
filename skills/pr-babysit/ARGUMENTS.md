@@ -1,7 +1,7 @@
 # pr-babysit arguments
 
-The `args` object `workflows/pr-babysit.js` takes (installed as `~/.claude/workflows/pr-babysit.js`). A key not
-listed here throws before anything runs.
+The `args` object `workflows/pr-babysit.js` takes (installed as `"${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js"`).
+A key not listed here throws before anything runs.
 
 - `pr` (number, required).
 - `repo`: `OWNER/NAME`, the repository `pr` belongs to (a fork PR's base

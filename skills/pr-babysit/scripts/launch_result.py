@@ -111,7 +111,7 @@ STALLED = {
                          "expired gh login or a module the launch's interpreter lacks, or relaunch once a passing cause (a GitHub outage) cleared",
     'collector-skew': "collect.py prints another output contract than the launch's workflow script reads (`detail`): the session "
                       'ran a workflow copy older or newer than the installed scripts; relaunch from the installed file (Workflow '
-                      'scriptPath ~/.claude/workflows/pr-babysit.js), never the same copy again',
+                      'scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first), never the same copy again',
     'python-unusable': "the interpreter the launch runs its scripts under cannot import a module its lanes need (`detail`): "
                        'install it for that interpreter, or relaunch with python naming one that has it',
     'reviews-stuck': "a review bot's state stayed unreadable, unchanged, for the wait cap: read its evidence in `bots` "

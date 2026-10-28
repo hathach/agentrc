@@ -44,9 +44,16 @@ def user_scope():
     return Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
 
 
+def project_install(path):
+    """A link `install.py --project` made: it resolves to this checkout's entry of the same name."""
+    return path.is_symlink() and os.path.normcase(os.path.realpath(path)) == \
+        os.path.normcase(os.path.realpath(AGENTRC / path.parent.name / path.name))
+
+
 def shadows(worktree):
     """The worktree's `.claude/workflows` and `.claude/agents` entries that differ from the same-named
-    agentrc ones installed in the user scope; an entry it cannot read raises OSError."""
+    agentrc ones installed in the user scope, except the links a project install made to this checkout;
+    an entry it cannot read raises OSError."""
     stale, scope = [], user_scope()
     for kind, suffix in KINDS.items():
         with os.scandir(AGENTRC / kind) as entries:
@@ -55,7 +62,7 @@ def shadows(worktree):
         if not d.is_dir():
             continue
         with os.scandir(d) as entries:
-            candidates = sorted(e.name for e in entries if FOLD(e.name) in names)
+            candidates = sorted(e.name for e in entries if FOLD(e.name) in names and not project_install(d / e.name))
         # an absent or dangling peer is no installed copy to shadow
         stale += [f'.claude/{kind}/{name}' for name in candidates
                   if (scope / kind / name).is_file() and not filecmp.cmp(d / name, scope / kind / name, shallow=False)]

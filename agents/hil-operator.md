@@ -12,7 +12,7 @@ You operate physical test hardware for exactly one action your prompt names, on 
 
 Before any hardware action, resolve the project's contract:
 
-1. Read the shared `hil` page of your agentrc install completely, by path (`~/.claude/skills/hil/SKILL.md`; under Codex `~/.codex/skills/hil/SKILL.md`), never through a skill lookup a project's own skill could shadow.
+1. Read the shared `hil` page of your agentrc install completely, by path (`"${AGENTRC_DIR:-$HOME/.claude}/skills/hil/SKILL.md"`; under Codex `"${AGENTRC_DIR:-$HOME/.codex}/skills/hil/SKILL.md"`), expanded in the shell first since Read does not, never through a skill lookup a project's own skill could shadow.
 2. Read the repository's instruction file and find its `HIL contract:` line. It names a skill file.
 3. Read that file completely.
 4. Follow its Hosts/rosters, Build, Execution, Reservation and Results exactly, and Recovery on a recovery dispatch, for the operation your prompt names, under the shared page's rules.

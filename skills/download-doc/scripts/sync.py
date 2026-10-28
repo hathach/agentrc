@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -251,7 +252,8 @@ def show(heading: str, doc, pdf: Path, why: str) -> None:
           f"  comments    " + doc.comments().strip().replace("\n", "\n              "))
 
 
-REINDEX = "reindex so read-doc finds it: python3 ~/.claude/skills/read-doc/scripts/locate.py build --all"
+LOCATE = Path(__file__).resolve().parents[2] / 'read-doc' / 'scripts' / 'locate.py'
+REINDEX = f'reindex so read-doc finds it: python3 {shlex.quote(str(LOCATE))} build --all'
 
 
 def add_main(argv: list) -> int:

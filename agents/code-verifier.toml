@@ -1,7 +1,7 @@
 name = "code-verifier"
-description = "Load the canonical code-verifier agent from ~/.codex/agents/code-verifier.md."
+description = "Load the canonical code-verifier agent from \"${AGENTRC_DIR:-$HOME/.codex}/agents/code-verifier.md\"."
 model = "gpt-6-sol"
 model_reasoning_effort = "xhigh"
 developer_instructions = """
-Before acting, read ~/.codex/agents/code-verifier.md completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
+Before acting, read "${AGENTRC_DIR:-$HOME/.codex}/agents/code-verifier.md" completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
 """

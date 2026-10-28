@@ -3,11 +3,12 @@
 and run a bounded read-only Codex YAGNI challenge over what changed in between.
 
 `install.py install --skill` registers the two events (see
-hooks.json beside this file); they call `simplify-gate`, which runs this script
-only where the marker file `<git common dir>/simplify-gate` exists. The
-`simplify-gate` skill owns that marker, per repository and all of its
-worktrees, and may set `model=`/`effort=` lines in it to override the defaults
-below.
+hooks.json beside this file) in `~/.claude/settings.json`, or with
+`--project <dir>` in `<dir>/.claude/settings.local.json`; they call
+`simplify-gate`, which runs this script only where the marker file
+`<git common dir>/simplify-gate` exists. The `simplify-gate` skill owns that
+marker, per repository and all of its worktrees, and may set
+`model=`/`effort=` lines in it to override the defaults below.
 
     /simplify-gate [on [--model M] [--effort E] | off]
 

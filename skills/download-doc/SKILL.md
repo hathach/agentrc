@@ -35,7 +35,7 @@ entirely wrong plan. Then apply and reindex so `read-doc` finds the new pages:
 ```bash
 python3 <skill dir>/scripts/sync.py st --family STM32H7 --types datasheet,errata --apply
 python3 <skill dir>/scripts/sync.py nxp --types errata --device "i.MX RT" --apply
-python3 ~/.claude/skills/read-doc/scripts/locate.py build --all
+python3 "${AGENTRC_DIR:-$HOME/.claude}/skills/read-doc/scripts/locate.py" build --all
 ```
 
 A bare run fetches **technical documents only** (datasheet, errata, reference/user/

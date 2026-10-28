@@ -1,10 +1,11 @@
 export const meta = {
   name: 'pr-babysit',
   description: 'Drive a PR to green: validate bot review findings, fix, verify, push and reply, overlapped with a CI watch-and-judge lane',
-  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true, or yieldOnChange: true to pause only after a cycle that needs it, and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: ~/.claude/skills/pr-babysit/ARGUMENTS.md.',
+  whenToUse: 'After opening a PR, from a clean checkout of its head with no other writer: an edit to a path the run owns would be published. Dry run by default; autoPush: true pushes and posts replies, markSonar: true also marks SonarCloud issues. A caller other than chief launches with yieldAfterCycle: true, or yieldOnChange: true to pause only after a cycle that needs it, and takes each launch\'s repairs through its completion review before relaunching, publishing more or reporting done. Arguments: "${AGENTRC_DIR:-$HOME/.claude}/skills/pr-babysit/ARGUMENTS.md", expanded in the shell before reading.',
   phases: [{ title: 'Triage' }, { title: 'Fix' }, { title: 'Push' }],
 }
 
+const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: see skills/pr-babysit/ARGUMENTS.md.
 if (typeof args === 'string') {
   try { args = JSON.parse(args) } catch (e) { throw new Error(`args is not valid JSON (${e.message}); pass an object, and a state by stateRef`) }
@@ -203,7 +204,7 @@ if (adoptReviewedProtected.length && args.adoptHead == null) throw new Error('ad
 const reviewedChange = (sha, f) => adoptReviewedProtected.some(e => e.sha === sha && e.paths.includes(f))
 
 if (args.state != null && args.stateRef != null) throw new Error('pass state or stateRef, not both')
-const STATE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/state_transfer.py'
+const STATE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/state_transfer.py`
 // state_transfer.py's MAX, over its own measure: compact JSON with every non-ASCII UTF-16 unit escaped as \uXXXX.
 const STATE_MAX = 64 * 1024
 const stateBytes = (st) => { const s = JSON.stringify(st); return s.length + 5 * (s.match(/[^\x00-\x7e]/g) || []).length }
@@ -696,18 +697,18 @@ const SCOPE_CHECK = withSeal({
   },
 })
 // Replies go only through reply.py, whose read-back receipts are the only proof: an agent's own "posted" once put a file path into 13 public replies, all 201.
-const REPLY_SCRIPT = '~/.claude/skills/pr-reply/scripts/reply.py'
-const HOOKS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/hooks.py'
-const COMMITS_SCRIPT = '~/.claude/skills/pr-babysit/scripts/commits.py'
-const PUSH_SCRIPT = '~/.claude/skills/pr-babysit/scripts/push.py'
-const SONAR_SCRIPT = '~/.claude/skills/pr-babysit/scripts/sonar.py'
-const CRTRIGGER_SCRIPT = '~/.claude/skills/pr-babysit/scripts/coderabbit_trigger.py'
-const GTRIGGER_SCRIPT = '~/.claude/skills/pr-babysit/scripts/greptile_trigger.py'
-const PREFLIGHT_SCRIPT = '~/.claude/skills/pr-babysit/scripts/preflight.py'
-const HARVEST_SCRIPT = '~/.claude/skills/pr-babysit/scripts/harvest.py'
-const BUILD_SCRIPT = '~/.claude/skills/pr-babysit/scripts/build.py'
-const SCOPE_SCRIPT = '~/.claude/skills/pr-babysit/scripts/scope_check.py'
-const COLLECT_SCRIPT = '~/.claude/skills/ci-rerun/scripts/collect.py'
+const REPLY_SCRIPT = `${AGENTRC}/skills/pr-reply/scripts/reply.py`
+const HOOKS_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/hooks.py`
+const COMMITS_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/commits.py`
+const PUSH_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/push.py`
+const SONAR_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/sonar.py`
+const CRTRIGGER_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/coderabbit_trigger.py`
+const GTRIGGER_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/greptile_trigger.py`
+const PREFLIGHT_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/preflight.py`
+const HARVEST_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/harvest.py`
+const BUILD_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/build.py`
+const SCOPE_SCRIPT = `${AGENTRC}/skills/pr-babysit/scripts/scope_check.py`
+const COLLECT_SCRIPT = `${AGENTRC}/skills/ci-rerun/scripts/collect.py`
 // The preflight checks each is installed: a session's cached workflow definition can outlive a script it calls (#38).
 const NEEDED = [REPLY_SCRIPT, HOOKS_SCRIPT, COMMITS_SCRIPT, PUSH_SCRIPT, SONAR_SCRIPT, CRTRIGGER_SCRIPT, GTRIGGER_SCRIPT, HARVEST_SCRIPT, BUILD_SCRIPT, SCOPE_SCRIPT, COLLECT_SCRIPT, STATE_SCRIPT]
 function shq (s) { return `'${String(s).replace(/'/g, `'\\''`)}'` }
@@ -768,7 +769,7 @@ const relayAgent = async (prompt, { fileTool, contract, ...opts }) => {
   if (v && !v.error && contract !== undefined && v.contract !== contract) {
     return { ...v, skew: true, error: `collect.py prints output contract ${v.contract}, and this launch's workflow script reads ${contract}: ` +
       'the launch runs a workflow copy older or newer than the installed collector. Relaunch from the installed file (Workflow ' +
-      'scriptPath ~/.claude/workflows/pr-babysit.js), in a fresh session after an agentrc update; no retry clears it' }
+      'scriptPath "${AGENTRC_DIR:-$HOME/.claude}/workflows/pr-babysit.js", expanded in the shell first), in a fresh session after an agentrc update; no retry clears it' }
   }
   if (v && !v.error && opts.schema.properties.seal && !sealMatches(v)) {
     log(`${opts.label}: the relayed copy does not match its seal`)

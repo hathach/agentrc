@@ -125,7 +125,7 @@ const env = () => ({
   cases: cases.map(c => c.id).sort(),
   claude: execFileSync(CLAUDE[0], [...CLAUDE.slice(1), '--version'], { encoding: 'utf8' }).trim(),
   userInstructions: fileDigest(join(homedir(), '.claude', 'CLAUDE.md')),
-  role: fileDigest(join(homedir(), '.claude', 'agents', 'finding-verifier.md')),
+  role: fileDigest(join(process.env.AGENTRC_DIR || join(homedir(), '.claude'), 'agents', 'finding-verifier.md')),  // a project install's checkout
   settings: fileDigest(join(homedir(), '.claude', 'settings.json')),
   skills: treeDigest(join(homedir(), '.claude', 'skills')),
   heads: Object.fromEntries([...groups.keys()].map(key => {

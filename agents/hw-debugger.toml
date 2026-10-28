@@ -1,7 +1,7 @@
 name = "hw-debugger"
-description = "Load the canonical hw-debugger agent from ~/.codex/agents/hw-debugger.md."
+description = "Load the canonical hw-debugger agent from \"${AGENTRC_DIR:-$HOME/.codex}/agents/hw-debugger.md\"."
 model = "gpt-6-sol"
 model_reasoning_effort = "xhigh"
 developer_instructions = """
-Before acting, read ~/.codex/agents/hw-debugger.md completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
+Before acting, read "${AGENTRC_DIR:-$HOME/.codex}/agents/hw-debugger.md" completely and follow its body as your role instructions. Ignore its Claude-specific YAML frontmatter.
 """

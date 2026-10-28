@@ -26,7 +26,8 @@ and says the turn's earlier edits are not reviewed.
 Status shows `on`/`off`, then the model and effort with their source: `(repo)`
 from the marker, `(default)` from `hooks/simplify-gate/simplify_gate.py`. The
 hooks are registered in `~/.claude/settings.json` when the agentrc checkout's `install.py install --skill` installs
-the skill; if status says on but no challenge ever runs, check that first.
+the skill, or in `<dir>/.claude/settings.local.json` for `--project <dir>`; if status says on but no challenge ever
+runs, check that first.
 
 `prune` works on the user's gate cache (`$XDG_CACHE_HOME/agentrc/simplify-gate`),
 not a repository, and is a dry run until `--apply`. Sessions share one copy of

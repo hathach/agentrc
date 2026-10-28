@@ -13,17 +13,17 @@ repo view`). Scripts print one JSON line, the last on stdout; `{"error"}` with
 exit 2 means the facts could not be read, and nothing is filled in.
 
 ```bash
-S=~/.claude/skills/pr-review/scripts
-python3 $S/prepare.py --pr N [--repo O/R] [--full]            # checkout top level: pin, worktree, mode
-python3 $S/prepare.py --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
-python3 $S/prepare.py --release --pr N --token T                # any worktree: unlock that run's review tree
-python3 $S/threads.py --pr N --out FILE                         # every comment and thread, bodies in FILE
-python3 $S/ledger.py show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge
-python3 $S/ledger.py save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
-python3 $S/post.py --pr N --expected-head SHA [--auto]         # a pending GitHub review; --auto: submit it
-python3 $S/post.py --pr N --expected-head SHA --decline --reason TEXT
-python3 $S/post.py --pr N --sync                                # record what the human did on GitHub (prepare runs it)
-python3 $S/result.py --output FILE                              # a launch, condensed: counts, never bodies
+S="${AGENTRC_DIR:-$HOME/.claude}/skills/pr-review/scripts"
+python3 "$S/prepare.py" --pr N [--repo O/R] [--full]            # checkout top level: pin, worktree, mode
+python3 "$S/prepare.py" --check --pr N --expected-head SHA       # review worktree: still that head, clean, its pins
+python3 "$S/prepare.py" --release --pr N --token T                # any worktree: unlock that run's review tree
+python3 "$S/threads.py" --pr N --out FILE                         # every comment and thread, bodies in FILE
+python3 "$S/ledger.py" show --pr N [--finding ID | --draft | --pending | --threads FILE [--head SHA]]  # standing findings, unpublished answers; --draft: the saved review; --pending: the newest one not yet submitted or confirmed, which plain show never lists; --head: replies on our threads still to judge
+python3 "$S/ledger.py" save --pr N --output FILE [--reason TEXT]  # a finished launch's result, as a pending draft
+python3 "$S/post.py" --pr N --expected-head SHA [--auto]         # a pending GitHub review; --auto: submit it
+python3 "$S/post.py" --pr N --expected-head SHA --decline --reason TEXT
+python3 "$S/post.py" --pr N --sync                                # record what the human did on GitHub (prepare runs it)
+python3 "$S/result.py" --output FILE                              # a launch, condensed: counts, never bodies
 ```
 
 ## 1. Pin
@@ -116,8 +116,8 @@ entry), the mode, the grant exchange for auto-post, and this sequence:
    local board's entry is added or enabled in the worktree's rig config,
    uncommitted, by the hardware unit, and restored before step 3. Each row it
    passes on is built from the report that run wrote, by the verdicts of the
-   shared `hil` page, read by path (`~/.claude/skills/hil/SKILL.md`; under
-   Codex `~/.codex/skills/hil/SKILL.md`), never through a skill lookup a
+   shared `hil` page, read by path (`../hil/SKILL.md` from this skill's directory, its
+   symlink resolved first), never through a skill lookup a
    project's own skill could shadow, with the HIL contract's Results
    predicates: `{board, verdict:
    pass|fail|not-run, regression: verified|none|unknown, testedHead, report}`. A

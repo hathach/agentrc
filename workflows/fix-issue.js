@@ -5,6 +5,7 @@ export const meta = {
   phases: [{ title: 'Triage' }, { title: 'Co-plan' }, { title: 'Implement' }, { title: 'Verify' }, { title: 'Report' }],
 }
 
+const AGENTRC = '"${AGENTRC_DIR:-$HOME/.claude}"'  // shell text, quoted so a path with spaces stays one word: the agentrc checkout a project install names in AGENTRC_DIR, else the user install
 // args: the target string (slash form) or { target, repo?, verify?, scope?, batch?, planLane? }.
 // A string is never JSON-parsed: "28" is a target, not a number.
 if (typeof args === 'string' || typeof args === 'number') args = { target: String(args) }
@@ -164,7 +165,7 @@ const hash6 = text => {  // FNV-1a: the sandbox has no crypto
 }
 const lane = args.planLane || `fixplan-${triage.issue ? triage.issue : `t${hash6(target)}`}-${head.slice(0, 7).toLowerCase()}`
 const coplan = { lane, status: 'unresolved', rounds: 0, plan: null, decisions: [], remaining: [], exchanges: [] }
-const fresh = `reset codex/${lane} (python3 ~/.claude/skills/cowork/scripts/cowork.py reset codex ${lane} --read-only) and re-run`
+const fresh = `reset codex/${lane} (python3 ${AGENTRC}/skills/cowork/scripts/cowork.py reset codex ${lane} --read-only) and re-run`
 const NEXT = {
   'coplan-unavailable': `Codex co-planning failed; read the transport diagnostic in coplan.exchanges, fix it, then ${fresh}`,
   'checkout-busy': `the checkout changed during a read-only Codex exchange; inspect the changes and identify their source, then rerun with exclusive ownership of the checkout: ${fresh}`,
@@ -365,7 +366,7 @@ if (reason) log(`verify: ${reason} — ${verified.detail}`)
 ran('verify', 'haiku', reason || 'pass', `${verified.commits.length} commit(s) on ${verified.branch || '?'}, ${head}..${verified.commits.length ? verified.commits[0].split(' ')[0] : head}; ${cut(verified.detail)}`)
 const next = reason
   ? `recover: ${reason} (${verified.detail}) — dispatch a writer owning the branch state to fix it, then re-run the state check; no validation, review or PR before it passes`
-  : `confirm the implement notes carry hook evidence; ${HANDOFF}; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence), its Codex co-review on the plan lane ${lane} with --tier review, with ${verify} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and names the co-plan's outcome, remaining disagreement and request ids, and, unless your report already tables the session's spend (chief does), ends with \`python3 ~/.claude/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl> --full <a new temporary file>\`'s output verbatim; then the human opens the PR`
+  : `confirm the implement notes carry hook evidence; ${HANDOFF}; when the task needs a HIL run, have one Sonnet unit build its firmware on this clean HEAD, every variant the run selects, plus the build receipt the repository's HIL contract defines for that run, if any, before any review; then run your completion review (CLAUDE.md; chief uses its own sequence), its Codex co-review on the plan lane ${lane} with --tier review, with ${verify} as its validation, rebuilding on the new clean HEAD when that review or a build-rewritten tracked file moves it; state its outcome in your report, which restates this run's logged stage table with every caller row updated from its evidence (HIL to done or not needed) and names the co-plan's outcome, remaining disagreement and request ids, and, unless your report already tables the session's spend (chief does), ends with \`python3 ${AGENTRC}/skills/headless-chief/scripts/run_cost.py --journal <this run's journal.jsonl> --full <a new temporary file>\`'s output verbatim; then the human opens the PR`
 return finish({
   pass: !reason, reason, target, issue: triage.issue, kind: triage.kind, disposition: triage.disposition,
   triage, contract, coplan, implement: dev, commits: verified.commits, verify: verified, next,

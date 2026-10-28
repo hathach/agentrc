@@ -5,6 +5,7 @@ import io
 import json
 import os
 import runpy
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -32,7 +33,7 @@ import vendor_st  # noqa: E402
 import vendor_ti  # noqa: E402
 import vendor_wch  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 
 def doc(doc_id, aliases=()):
@@ -837,6 +838,36 @@ class PageOneText(unittest.TestCase):
         self.assertEqual(retitle.from_pdf(self.pdf), ('ES0182', 'both', None))
 
 
+class ReindexPath(unittest.TestCase):
+    """The reindex command sync.py prints names read-doc's locate.py through an install link."""
+
+    def test_the_reindex_path_follows_an_installed_link_to_read_doc(self):
+        skills = Path(__file__).resolve().parents[1] / 'skills'
+        link = tmpdir(self) / 'download-doc'
+        try:
+            link.symlink_to(skills / 'download-doc', target_is_directory=True)
+        except OSError as e:
+            self.skipTest(f'no symlink: {e}')
+        with unittest.mock.patch.object(sys, 'path', list(sys.path)):
+            linked = runpy.run_path(str(link / 'scripts' / 'sync.py'))
+        self.assertEqual(linked['LOCATE'], skills / 'read-doc' / 'scripts' / 'locate.py')
+        self.assertTrue(linked['LOCATE'].is_file())
+
+    def test_the_reindex_command_keeps_a_path_with_shell_characters_one_argument(self):
+        skills = tmpdir(self) / 'a b$c`d"e'
+        scripts = skills / 'download-doc' / 'scripts'
+        try:
+            scripts.mkdir(parents=True)
+        except OSError as e:
+            self.skipTest(f'no such directory name: {e}')
+        shutil.copy(Path(sync.__file__), scripts / 'sync.py')
+        with unittest.mock.patch.object(sys, 'path', list(sys.path)):
+            copied = runpy.run_path(str(scripts / 'sync.py'))
+        locate = skills / 'read-doc' / 'scripts' / 'locate.py'
+        self.assertEqual(shlex.split(copied['REINDEX'].partition(': ')[2]),
+                         ['python3', str(locate), 'build', '--all'])
+
+
 @unittest.skipUnless(shutil.which('pdftotext'), 'identity checks read the PDF with pdftotext')
 class AddOne(unittest.TestCase):
     """`sync.py add` files one document the way an adapter's import would, or refuses."""
@@ -885,7 +916,8 @@ class AddOne(unittest.TestCase):
             'identifiers': {'nordic': 'PS1234'}, 'publisher': 'Nordic Semiconductor',
             'comments': f'\n\nDocument ID: PS1234\nRevision: 1.4\nSource: {self.URL}'}])
         self.assertIn('IMPORTED #1 nordic:PS1234', out)
-        self.assertIn('locate.py build --all', out)
+        locate = Path(__file__).resolve().parents[1] / 'skills' / 'read-doc' / 'scripts' / 'locate.py'
+        self.assertIn(f'python3 {shlex.quote(str(locate))} build --all', out)
 
     def test_an_identifier_already_filed_is_refused_before_any_download(self):
         self.library = FakeCalibre({'id': 7, 'title': 'PS1234 old', 'authors': 'Nordic Semiconductor',
