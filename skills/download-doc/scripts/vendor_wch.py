@@ -14,7 +14,7 @@ vendor is reachable without Chrome; finding that took looking at the page's own 
 requests rather than its HTML.
 
 Enumeration follows `relationFileList`: each document names its siblings, so a handful
-of seeds derived from the TinyUSB BSP directory names reaches the rest of the family by
+of seeds, one or two per family we work with, reaches the rest of the family by
 breadth-first crawl. That is the only enumeration WCH offers — there is no index.
 """
 from __future__ import annotations
@@ -35,10 +35,12 @@ FILE = "https://www.wch-ic.com/download/file?id={}"
 USB_SCOPE = None
 USB_SCOPE_NOTE = "USB capability is read from each part's datasheet"
 
-# Seeds: TinyUSB ports these families, and each seed pulls in its relatives.
+# Seeds: TinyUSB families plus parts we hold boards for; each seed pulls in the relatives
+# its page lists. CH32V407DS0 lists none, so its RM is seeded too.
 SEEDS = ["CH32V307DS0_PDF.html", "CH32V203DS0_PDF.html", "CH32V103DS0_PDF.html",
          "CH32F103DS0_PDF.html", "CH32F203DS0_PDF.html", "CH583DS1_PDF.html",
-         "CH32FV2x_V3xRM_PDF.html", "CH32V10xRM_PDF.html", "CH585DS1_PDF.html"]
+         "CH32FV2x_V3xRM_PDF.html", "CH32V10xRM_PDF.html", "CH585DS1_PDF.html",
+         "CH32V407DS0_PDF.html", "CH32V407RM_PDF.html"]
 
 KIND = [
     (re.compile(r"RM\b|reference", re.I), "reference-manual"),
