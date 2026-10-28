@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'scope_check.py'
 STAR = [] if os.name == 'nt' else ['src/*.c']  # NTFS forbids * in a file name
@@ -23,9 +23,7 @@ class ScopeCheckTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name) / 'repo'
         self.repo.mkdir()
-        # a test running git in a temp repo must not inherit a caller's GIT_* (pre-commit sets some)
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
-        self.env.update({'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'})
+        self.env = git_env()  # pre-commit exports GIT_* a test's git in its temp repo must not inherit
         files = {'src/a.c': 'int a;\n', 'src/keep me.c': '', **dict.fromkeys(STAR, ''), 'test/unit/test_a.c': '', '.gitignore': '*.generated.c\nbuild/\n!build/again.c\n',
                  'build/keep.c': ''}
         for path, text in files.items():

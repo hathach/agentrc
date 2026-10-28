@@ -18,7 +18,7 @@ HOOK = Path(__file__).resolve().parents[1] / 'hooks' / 'simplify-gate' / 'simpli
 WRAPPER = HOOK.with_name('simplify-gate')
 GATE = Path(__file__).resolve().parents[1] / 'skills' / 'simplify-gate' / 'scripts' / 'gate.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, tmpdir  # noqa: E402
+from helpers import git_env, guard_survivors, tmpdir  # noqa: E402
 spec = importlib.util.spec_from_file_location('simplify_gate', HOOK)
 gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
@@ -54,6 +54,7 @@ def make_repo(path):
 
 def setUpModule():
     guard_survivors(__name__)
+    unittest.enterModuleContext(mock.patch.dict(os.environ, git_env(), clear=True))  # the hook's git too
 
 
 class Session:

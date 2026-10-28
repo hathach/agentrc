@@ -9,7 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('launch_result', ROOT / 'skills/pr-babysit/scripts/launch_result.py')
@@ -76,8 +76,8 @@ class LaunchResultTest(unittest.TestCase):
 
     def repo(self):
         repo = self.dir / 'repo'
-        subprocess.run(['git', 'init', '-q', '-b', 'pr', str(repo)], check=True)
-        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--allow-empty', '-m', 'x'], check=True)
+        subprocess.run(['git', 'init', '-q', '-b', 'pr', str(repo)], check=True, env=git_env())
+        subprocess.run(['git', '-C', str(repo), 'commit', '-q', '--allow-empty', '-m', 'x'], check=True, env=git_env())
         (repo / 'left.txt').write_text('x')
         return str(repo)
 

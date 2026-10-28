@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'build.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_build', SCRIPT)
@@ -27,8 +27,7 @@ class BuildTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name) / 'repo'
         self.repo.mkdir()
-        self.env = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
-                    'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
+        self.env = git_env()
         self.git('init', '-q')
         (self.repo / 'src.c').write_text('int ok;\n')
         self.git('add', '-A')

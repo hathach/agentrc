@@ -72,6 +72,14 @@ def run_gh_as(stub):
     return mock.patch.object(subprocess, 'run', run)
 
 
+def git_env(**extra):
+    """os.environ without git's GIT_* variables, with a fixture identity and no global or system config: a test's git
+    never signs (each signed commit leaves a key file in TMPDIR) or reads the developer's settings."""
+    return {**{k: v for k, v in os.environ.items() if not k.startswith('GIT_')},
+            'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+            'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', **extra}
+
+
 def tmpdir(case):
     """A temporary directory removed after the test, resolved as git, getcwd and realpath name it: on Windows the
     long name, not the 8.3 one a runner's TEMP may hold (RUNNER~1)."""
