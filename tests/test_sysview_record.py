@@ -59,7 +59,9 @@ json.dump(args, open(state + '.args', 'w'))
 def windows(w=None):
     if w is None:
         return json.load(open(state))
-    json.dump(w, open(state, 'w'))
+    with open(f'{state}.{os.getpid()}', 'w') as f:    # replaced whole: a concurrent reader never sees it half-written
+        json.dump(w, f)
+    os.replace(f.name, state)
 dialog = os.environ.get('FAKE_DIALOG')
 windows({'1': 'SEGGER SystemView V4.10b - Sample_Multicore.SVDat', **({'2': dialog} if dialog else {})})
 while '2' in windows():
@@ -109,7 +111,9 @@ elif a[0] == 'getwindowname':
     print(w.get(a[1], ''))
 elif a[0] == 'key':
     w = {k: v for k, v in w.items() if not any(f in v for f in closes.get(a[-1], ()))}
-    json.dump(w, open(state, 'w'))
+    with open(f'{state}.{os.getpid()}', 'w') as f:
+        json.dump(w, f)
+    os.replace(f.name, state)
 '''
 
 # unshare as usb_jail calls it: log the namespace script, then exec the command after it with FAKE_NS mapping each
