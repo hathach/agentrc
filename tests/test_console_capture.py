@@ -91,7 +91,7 @@ class ConsoleCaptureTest(unittest.TestCase):
         self.assertTrue(out['terminalRestored'])
         times = [json.loads(line) for line in Path(out['times']).read_text().splitlines()]
         self.assertEqual(sum(t['len'] for t in times), len(data))
-        # no wall-clock floor: under load the capture may open after the feed, its bytes already waiting
+        # no wall-clock floor: under load the capture may open after the feed's delay; it writes at the raw switch
         self.assertEqual(out['firstByteAt'], times[0]['t'])
         stamps = [t['t'] for t in times]
         self.assertEqual(stamps, sorted(stamps))
