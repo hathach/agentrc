@@ -707,8 +707,8 @@ def esptool_runtime(esptool: str = 'esptool', *, timeout: float = 60) -> dict:
     if exe is None:
         raise RuntimeError(f'{esptool} is not on PATH')
     exe = os.path.abspath(exe)
-    relative = [e for e in os.environ.get('PYTHONPATH', '').split(os.pathsep) if not os.path.isabs(e)]
-    if os.environ.get('PYTHONPATH') and relative:
+    pythonpath = os.environ.get('PYTHONPATH')
+    if pythonpath and (relative := [e for e in pythonpath.split(os.pathsep) if not os.path.isabs(e)]):
         raise RuntimeError(f'PYTHONPATH entries {relative!r} are not absolute: each esptool run would resolve them '
                            'in its own working directory')
     python = tool_python(exe)

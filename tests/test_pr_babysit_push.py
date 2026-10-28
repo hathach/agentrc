@@ -19,7 +19,6 @@ push = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(push)
 
 
-
 def setUpModule():
     guard_survivors(__name__)
 

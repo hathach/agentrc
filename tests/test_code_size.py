@@ -1366,13 +1366,23 @@ class WindowsHost(ProfileCase):
         self.assertEqual(sd._relative_key(r'cdc_msc.dir\D_\A\TinyUSB\src\Device\usbd.c.obj',
                                           ['/nomatch/', '/a/tinyusb/src/']), 'Device/usbd.c')
 
-
     def test_a_timeout_kills_the_command_tree(self):
-        with mock.patch('subprocess.run') as taskkill:
+        def kill_tree(proc, timeout, total=False):
+            proc.kill()
+            return proc.wait(timeout)
+        with mock.patch.object(sd.windows, 'kill_tree', side_effect=kill_tree) as killed:
             ret = sd.run([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.5)
         self.assertEqual(ret.returncode, 124)
-        argv = taskkill.call_args.args[0]
-        self.assertEqual(argv[:2] + argv[3:], ['taskkill', '/PID', '/T', '/F'])
+        self.assertEqual((killed.call_args.args[1:], killed.call_args.kwargs), ((sd.TASKKILL_S + sd.KILL_DRAIN,), {'total': True}))
+
+    def test_a_failed_tree_kill_keeps_the_timeout(self):
+        def kill_tree(proc, timeout, total=False):
+            proc.kill()
+            proc.wait(timeout)
+            raise PermissionError('access denied')
+        with mock.patch.object(sd.windows, 'kill_tree', side_effect=kill_tree):
+            ret = sd.run([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.5)
+        self.assertEqual(ret.returncode, 124)
 
     @unittest.skipUnless(os.name == 'nt', 'a real Windows process tree')
     def test_a_timeout_stops_a_grandchild_holding_the_pipes(self):
@@ -1409,7 +1419,7 @@ class WindowsHost(ProfileCase):
             real_run, got = subprocess.run, {}
 
             def taskkill_fails(argv, *a, **kw):
-                if argv[0] == 'taskkill':
+                if os.path.basename(argv[0]).lower() == 'taskkill.exe':
                     return subprocess.CompletedProcess(argv, 128, b'', b'')
                 return real_run(argv, *a, **kw)
             worker = threading.Thread(target=lambda: got.update(ret=sd.run([sys.executable, '-c', parent], timeout=5)),

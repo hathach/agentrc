@@ -92,7 +92,10 @@ import sys
 import tempfile
 import time
 
-FILES = ()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', '..', 'lib'))
+import windows  # noqa: E402
+
+FILES = ('lib/windows.py',)   # imported from the checkout's lib/
 WINDOWS = os.name == 'nt'
 if WINDOWS:
     import msvcrt
@@ -1010,21 +1013,17 @@ def _run_nt(cmd, timeout):
     """run() on Windows. The output goes to files: a descendant the tree kill missed may hold it open, and a pipe it
     held would keep Popen's reader threads, and so run(), waiting for its exit (#330). No wait is unbounded."""
     def text(f):
-        f.seek(0)   # decoded as Popen's text mode would: UTF-8 with replacement, universal newlines
-        return io.TextIOWrapper(io.BytesIO(f.read()), encoding='utf-8', errors='replace').read()
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        f.seek(0)
+        return f.read()
+    # decoded as Popen's text mode would: UTF-8 with replacement, universal newlines
+    with tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as out, \
+            tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as err:
         proc = subprocess.Popen(cmd, stdout=out, stderr=err)
         try:
             proc.communicate(timeout=timeout)
         except BaseException as stopped:
-            # terminate() and kill() stop only the command, not ninja's compilers
-            with contextlib.suppress(OSError, subprocess.SubprocessError):
-                subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'], capture_output=True,
-                               timeout=TASKKILL_S)
-            with contextlib.suppress(OSError):
-                proc.kill()
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(KILL_DRAIN)
+            with contextlib.suppress(OSError):  # the stop being handled outranks a failed kill
+                windows.kill_tree(proc, TASKKILL_S + KILL_DRAIN, total=True)   # ninja's compilers too
             if not isinstance(stopped, subprocess.TimeoutExpired):
                 raise
             return _timed_out(cmd, timeout, text(out), text(err))

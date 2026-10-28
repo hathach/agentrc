@@ -1,4 +1,5 @@
 """Tests for pr-review's scripts: real git in temporary repositories, a fake GitHub behind gh."""
+import contextlib
 import errno
 import importlib.util
 import json
@@ -26,7 +27,7 @@ import prepare  # noqa: E402
 import result  # noqa: E402
 import threads  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, remotes_checkout  # noqa: E402
 
 REPO, PR, ME = 'o/r', 7, 'reviewer'
 REAL_RUN = facts.run
@@ -129,8 +130,6 @@ class FakeGitHub:
                                   'baseRefName': 'main'})
         if argv[:2] == ['pr', 'checks']:
             return self.checks_code, json.dumps(self.checks) if self.checks else ''
-        if argv[:2] == ['repo', 'view']:
-            return 0, REPO + '\n'
         if argv[:2] == ['api', 'user']:
             return 0, json.dumps({'login': ME})
         if argv[:2] == ['api', 'graphql']:
@@ -253,7 +252,7 @@ class Case(unittest.TestCase):
         return code, out, err[0] if err else ''
 
     def call(self, module, argv):
-        patches = [mock.patch.object(m, 'run', self.fake_run) for m in (facts, harvest, ledger, prepare)]
+        patches = [mock.patch.object(m, 'run', self.fake_run) for m in (facts, harvest, prepare)]
         patches.append(mock.patch.object(post, 'attempt', self.fake_attempt))
         for p in patches:
             p.start()
@@ -1803,6 +1802,16 @@ class Store(unittest.TestCase):
         self.addCleanup(later.join)
         ledger.store(path, {'v': 1})
         self.assertEqual(json.loads(path.read_text(encoding='utf-8')), {'v': 1})
+
+
+class RepoOf(unittest.TestCase):
+    def test_without_repo_the_checkouts_one_github_repository_is_named(self):
+        with contextlib.chdir(remotes_checkout(self, ('origin', 'https://github.com/o/r.git'))):
+            self.assertEqual(ledger.repo_of(None), 'o/r')
+        with contextlib.chdir(remotes_checkout(self, ('origin', 'https://github.com/me/r.git'),
+                                               ('upstream', 'https://github.com/o/r.git'))), \
+                self.assertRaisesRegex(ledger.Unusable, 'none is marked gh-resolved: name the repository'):
+            ledger.repo_of(None)
 
 
 class Result(unittest.TestCase):

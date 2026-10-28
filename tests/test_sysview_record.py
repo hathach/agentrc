@@ -498,7 +498,7 @@ class Recorder(unittest.TestCase):
     def test_a_stop_signal_while_the_workload_is_stopped_still_stops_it(self):
         pidfile = self.dir / 'workload.pid'
         sent = []
-        with self.signal_before('stop_group', sent):
+        with self.signal_before('stop_group', sent), mock.patch.object(record, 'GROUP_S', 0.5):
             rc, r = self.live('--workload', f'trap "" TERM; echo $$ > {pidfile}; sleep 30')
         self.assertEqual(rc, 3)
         self.assertEqual(r['error'], 'stopped by signal 15')
