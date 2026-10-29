@@ -1170,8 +1170,8 @@ class LinkHops(unittest.TestCase):
             self.assertTrue(all(os.path.isabs(h) and h.startswith(anchor) for h in hops), hops)
             self.assertIn(str(kept / name), hops)
             self.assertEqual(hops[-2:], [str(clean), str(clean / 'lib')])
-        self.link(kept / 'up', os.sep.join(['..'] * (len(self.t.parts) + 3)))  # `..` stops at the anchor
-        self.assertEqual(self.wc.link_hops(str(kept / 'up'))[-1], str(kept / 'up'))
+        self.link(kept / 'up', os.sep.join(['..'] * (len(self.t.parts) + 3) + ['zz']))  # `..` stops at the anchor
+        self.assertEqual(self.wc.link_hops(str(kept / 'up'))[-2:], [str(kept / 'up'), anchor + 'zz'])
 
     def test_a_kept_siblings_symlink_keeps_the_clean_sibling_it_reaches(self):
         kept, clean, plain = self.t / 'parent--z', self.t / 'parent--b', self.t / 'parent--w'
@@ -1181,6 +1181,26 @@ class LinkHops(unittest.TestCase):
         self.assertEqual(self.wc.removal_plan([clean, plain], [kept]),
                          ([plain], {clean: 'parent--z, which stays, links into it'}))
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows spells a path in any case')
+    def test_a_link_spelled_in_another_case_still_holds_its_target(self):
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        self.link(kept / 'dep', str(clean / 'lib').swapcase())
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_a_link_ending_at_a_junction_holds_the_junctions_target(self):
+        import _winapi
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        _winapi.CreateJunction(str(clean / 'lib'), str(self.t / 'alias'))
+        self.link(kept / 'dep', self.t / 'alias')
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
     @unittest.skipUnless(os.name == 'nt', 'Windows path forms')
     def test_windows_targets_are_anchored_on_their_own_drive(self):
         anchored = self.wc.anchored
@@ -1188,6 +1208,8 @@ class LinkHops(unittest.TestCase):
         self.assertEqual(anchored('\\\\?\\UNC\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
         self.assertEqual(anchored('\\\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
         self.assertEqual(anchored('\\\\?\\UNC\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
+        self.assertEqual(anchored('\\\\?\\unc\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
+        self.assertEqual(anchored('\\\\?\\Volume{1}\\x', 'C:\\w'), ('\\\\?\\Volume{1}\\', ['x']))
         self.assertEqual(anchored('D:/x/y', 'C:\\w'), ('D:\\', ['x', 'y']))
         self.assertEqual(anchored('\\x', 'C:\\w'), ('C:\\', ['x']))
         self.assertEqual(anchored('x/y', 'C:\\w'), ('C:\\w', ['x', 'y']))

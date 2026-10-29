@@ -123,6 +123,25 @@ class Rig(unittest.TestCase):
     def token(self, out):
         return re.search(r'--proceed (\w+)', out).group(1)
 
+    def after_plan(self, change):
+        """wr.plan patched to make change once the plan is made, as if between the gate and the removal."""
+        plan = wr.plan
+
+        def then(*args):
+            p = plan(*args)
+            change()
+            return p
+
+        return mock.patch.object(wr, 'plan', then)
+
+    def assertRefused(self, text, *argv):
+        rc, out = self.run_remove(*argv)
+        self.assertEqual(rc, 3, out)
+        self.assertIn(text, out)
+        self.assertEqual(self.removals(), [])
+        self.assertFalse(self.reports.exists())
+        self.assertTrue(self.parent.is_dir())
+
     def assert_removed_by_git(self):
         sibling, dirty = self.sibling('b'), self.sibling('dirty')
         (dirty / 'wip.txt').write_text('wip')
@@ -148,20 +167,22 @@ class Rig(unittest.TestCase):
 class Remove(Rig):
     # --- refused --------------------------------------------------------------------
 
-    def assertRefused(self, text, *argv):
-        rc, out = self.run_remove(*argv)
-        self.assertEqual(rc, 3, out)
-        self.assertIn(text, out)
-        self.assertEqual(self.removals(), [])
-        self.assertFalse(self.reports.exists())
-
     def test_the_primary_checkout_is_refused(self):
         self.parent = self.main
         self.assertRefused('a primary checkout')
 
-    def test_a_worktree_herdr_has_not_open_is_removed_by_git_and_the_plugins_cleanup(self):
-        self.mode.write_text('closed')
+    def test_a_worktree_herdr_has_not_open_is_removed_by_git_and_the_plugins_cleanup_unlinked(self):
+        self.mode.write_text('closed noplugin')
         self.assert_removed_by_git()
+
+    def test_a_token_from_the_git_route_stops_once_herdr_has_it_open(self):
+        self.mode.write_text('closed')
+        rc, out = self.run_remove('--pending', 'x')
+        self.assertEqual(rc, 4, out)
+        self.mode.write_text('')
+        rc, out = self.run_remove('--pending', 'x', '--proceed', self.token(out))
+        self.assertEqual(rc, 4, out)
+        self.assertEqual(self.removals(), [])
 
     def test_a_malformed_herdr_entry_is_refused(self):
         self.mode.write_text('strlinked')
@@ -422,19 +443,12 @@ class Remove(Rig):
         self.assertIn('worktree_remove_failed', out)
 
     def test_a_worktree_herdr_opens_or_loses_sight_of_after_the_plan_is_refused(self):
-        plan = wr.plan
         for later, text in (('', f'{self.parent} is now open in herdr workspace w1'),
                             ('down', f'herdr and {self.parent}: herdr could not list it '
                                      '(exit 1: herdr server unreachable)')):
             with self.subTest(later=later):
                 self.mode.write_text('closed')  # open in no workspace while the plan looks it up
-
-                def then(*args):
-                    p = plan(*args)
-                    self.mode.write_text(later)
-                    return p
-
-                with mock.patch.object(wr, 'plan', then):
+                with self.after_plan(lambda: self.mode.write_text(later)):
                     rc, out = self.run_remove()
                 self.assertEqual(rc, 3, out)
                 self.assertIn(f'refused, nothing changed: {text}', out)
@@ -466,21 +480,46 @@ class NoHerdr(Rig):
 
     def test_herdr_env_without_a_herdr_is_refused(self):
         with mock.patch.dict(os.environ, {'HERDR_ENV': '1'}):
-            rc, out = self.run_remove()
-        self.assertEqual(rc, 3, out)
-        self.assertIn('HERDR_ENV is set', out)
-        self.assertTrue(self.parent.is_dir())
+            self.assertRefused('HERDR_ENV is set')
 
-    def test_a_working_directory_inside_a_removed_tree_is_refused(self):
+    def test_a_working_directory_inside_the_worktree_or_any_sibling_is_refused(self):
         here = os.getcwd()
         self.addCleanup(os.chdir, here)
-        for inside in (self.parent, self.sibling('b') / 'build'):
+        dirty = self.sibling('dirty')  # kept now, but cleanup removes it should it turn clean meanwhile
+        (dirty / 'wip.txt').write_text('wip')
+        for inside in (self.parent, self.sibling('b') / 'build', dirty):
             inside.mkdir(exist_ok=True)
             os.chdir(inside)
+            self.assertRefused('run this from outside them')
+        os.chdir(self.main)
+        rc, out = self.run_remove()
+        self.assertEqual(rc, 4, out)
+        self.assertIn('parent--dirty stays: uncommitted or untracked changes', out)
+
+    def test_a_branch_switched_after_the_gate_is_refused(self):
+        with self.after_plan(lambda: sh(self.parent, 'switch', '-q', '-c', 'other')):
+            self.assertRefused('its branch or tip moved since the gate')
+
+    def test_a_parent_with_submodules_is_removed_by_git_with_force(self):
+        sub = self.repo('sub')
+        sh(self.parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(self.t / 'sub.git'), 'lib/sub')
+        sh(self.parent, 'commit', '-qm', 'sub')
+        sh(self.parent, 'push', '-q', 'origin', 'parent', 'parent:master')
+        rc, out = self.run_remove()
+        self.assertEqual(rc, 0, out)
+        self.assertIn('worktree remove --force', out)
+        self.assertFalse(self.parent.exists())
+        self.assertTrue(sub.is_dir())
+
+    def test_a_failed_git_removal_is_exit_5_and_cleans_up_nothing(self):
+        sibling = self.sibling('b')
+        failed = wr.wc.Keep('`git worktree remove` failed, possibly part way: boom')
+        with mock.patch.object(wr.wc, 'remove', side_effect=failed):
             rc, out = self.run_remove()
-            self.assertEqual(rc, 3, out)
-            self.assertIn('run this from outside it', out)
-        self.assertTrue(self.parent.is_dir())
+        self.assertEqual(rc, 5, out)
+        self.assertIn(f'worktree_remove: {self.parent}: `git worktree remove` failed, possibly part way: boom', out)
+        self.assertTrue(self.parent.is_dir() and sibling.is_dir())
+        self.assertTrue(sh(self.main, 'branch', '--list', 'parent', 'b'))
 
 
 if __name__ == '__main__':

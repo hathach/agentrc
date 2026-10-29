@@ -27,10 +27,12 @@ python3 <skill dir>/scripts/worktree_remove.py [PATH] --dry-run [--pending "<ite
   herdr closes the workspace and its panes, this session's included. Tell the
   human before running it that the outcome is in the plugin log the report
   names.
-- Open in no herdr workspace, run it from outside the worktree, naming it as
-  PATH (it refuses a working directory inside); it prints the outcome and logs
-  it beside the report. On Windows a session started inside the worktree holds
-  it open, so ask the human to run it from another session.
+- Open in no herdr workspace, run it from outside the worktree and its
+  siblings, naming it as PATH (it refuses a working directory inside them, a
+  kept sibling included); it prints the outcome and logs it beside the report.
+  The script checks only its own working directory: a session started inside
+  the worktree loses it with the removal (on Windows holds it open, failing
+  the removal part way), so ask the human to run it from another session.
 - Exit 3 or 5: report the message; never work around a refusal, such as with
   `git worktree remove` or herdr's own menu, which skips the gate. A chief
   session found in the worktree, yours included, means a chief cannot remove

@@ -16,8 +16,8 @@ Refused (exit 3), nothing changed:
   with no herdr found (whether herdr has PATH open is unknown);
 - open in herdr: herdr has the plugin unlinked, disabled, or linked from another checkout than
   this script's;
-- open in no herdr workspace: the working directory lies inside PATH or a sibling to be removed
-  (run it from outside, naming PATH);
+- open in no herdr workspace: the working directory lies inside PATH or any sibling, a kept one
+  included (run it from outside them, naming PATH);
 - PATH fails the plugin's content check, the one each sibling gets (its docstring lists them);
   a chief session in PATH, headless or interactive and the caller's own included, refuses it: a
   chief cannot remove its own worktree, so the human runs this from a plain session;
@@ -30,10 +30,12 @@ sibling's, each against its own repository (its PRs from that repository's branc
 fork's to its parent included): an open PR; an unresolved review thread on its latest merged PR;
 commits on its remote that the remote's default branch lacks, with no PR at that tip; each sibling
 and each branch the plugin will keep, with the reason (a never-pushed commit, say); each --pending
-item. The token digests the list, so a list that changed since the human saw it stops again.
+item. The token digests the list and the herdr workspace, so a list that changed since the human
+saw it, or a removal herdr would now run, stops again.
 
-Then PATH's content check runs again; for PATH open in no herdr workspace, so is herdr's (refused,
-exit 3, when a workspace opened PATH during the lookups or herdr cannot say); the report goes to
+Then PATH's content check runs again, refused (exit 3) also when its branch or tip moved; for PATH
+open in no herdr workspace, so is herdr's (refused, exit 3, when a workspace opened PATH during the
+lookups or herdr cannot say); the report goes to
 ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the inventory,
 symlinks leaving each removed tree, the gate, the log, the command), and the removal runs, with
 --force only for a checkout with submodules (git refuses those otherwise):
@@ -42,7 +44,8 @@ symlinks leaving each removed tree, the gate, the log, the command), and the rem
   outcome.
 - otherwise: `git worktree remove <PATH>`, then the plugin's cleanup of PATH with PATH's branch,
   which prints its actions and appends them to the log beside the reports. A process whose
-  working directory is inside PATH can make git fail part way (Windows refuses to delete it).
+  working directory is inside PATH can make git fail part way (Windows refuses to delete it);
+  then the siblings and branches are left alone.
 
 --dry-run runs every check and lookup (fetching remote-tracking refs) and prints the report
 without writing it or removing anything.
@@ -100,9 +103,8 @@ def herdr(*args):
 
 
 def workspace(root):
-    """The id of the herdr workspace that has root open, None when none has or there is no herdr."""
     try:
-        return wc.herdr_found() and wc.herdr_entry(root).get('open_workspace_id') or None
+        return wc.open_workspace(root)
     except wc.Keep as why:
         raise Refused(f'herdr and {root}: {why}')
 
@@ -209,9 +211,14 @@ def plan(path, pending):
     for needed in (Path(__file__).resolve(), PLUGIN_DIR, REPORTS, log):
         if wc.is_within(needed, leaving):
             raise Refused(f'{needed} lies inside a worktree this removes')
-    if not ws and wc.is_within(os.getcwd(), leaving):  # herdr closes the panes in it; git cannot
-        raise Refused(f'the working directory {os.getcwd()} lies inside a worktree this removes; '
-                      'run this from outside it, naming the worktree')
+    if not ws:  # herdr closes the panes in it; git cannot. Any sibling: cleanup may find a kept one clean
+        try:
+            cwd = os.getcwd()
+        except OSError as why:
+            raise Refused(f'cannot read the working directory: {why}; run this from an existing one')
+        if wc.is_within(cwd, [root] + [s['path'] for s in siblings]):
+            raise Refused(f'the working directory {cwd} lies inside {root.name} or a sibling; '
+                          'run this from outside them, naming the worktree')
 
     checkouts = [dict(path=root, why=None, head=wc.head_branch(root), common=os.path.realpath(common))] + siblings
     items = list(pending)
@@ -233,7 +240,7 @@ def plan(path, pending):
         links = [l for tree in leaving for l in links_leaving(tree)]
     except (wc.Keep, OSError) as why:  # a tree changed since its check
         raise Refused(f'listing the symlinks leaving the removed trees: {why}')
-    token = hashlib.sha256('\n'.join(items).encode()).hexdigest()[:12]
+    token = hashlib.sha256('\n'.join([f'workspace {ws}'] + items).encode()).hexdigest()[:12]
     return dict(root=root, workspace=ws, log=log, force=force, checkouts=checkouts, links=links, items=items,
                 token=token)
 
@@ -286,19 +293,17 @@ def main(argv=None):
         return 0
     try:
         wc.content_check(p['root'])
+        if wc.head_branch(p['root']) != p['checkouts'][0]['head']:
+            raise wc.Keep('its branch or tip moved since the gate')
+        # git would bypass a workspace herdr opened during the lookups, and its panes
+        if not p['workspace'] and (ws := workspace(p['root'])):
+            raise Refused(f'{p["root"]} is now open in herdr workspace {ws}')
     except (wc.Keep, OSError) as why:
         print(f'worktree_remove: refused, nothing changed: {p["root"]} changed: {why}', file=sys.stderr)
         return 3
-    if not p['workspace']:  # git would bypass a workspace herdr opened during the lookups, and its panes
-        try:
-            ws = workspace(p['root'])
-        except Refused as e:
-            ws, why = None, e
-        else:
-            why = ws and f'{p["root"]} is now open in herdr workspace {ws}'
-        if why:
-            print(f'worktree_remove: refused, nothing changed: {why}', file=sys.stderr)
-            return 3
+    except Refused as why:
+        print(f'worktree_remove: refused, nothing changed: {why}', file=sys.stderr)
+        return 3
     out = REPORTS / f'{stamp}-{p["root"].name}.md'
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(report(p, f'worktree-remove {p["root"].name}, {stamp}'))
@@ -319,9 +324,11 @@ def remove_here(p):
     wc.LOG = p['log']
     root, common, head = p['root'], p['checkouts'][0]['common'], p['checkouts'][0]['head']
     wc.log(f'running: {" ".join(command(p))}')
-    done = wc.run(command(p))
-    if done.returncode:
-        wc.log(f'git did not remove {root} (exit {done.returncode}), possibly part way: {done.stderr.strip()}')
+    try:
+        wc.remove(root, common, p['force'])
+    except wc.Keep as why:
+        wc.log(f'git did not remove {root}; siblings and branches untouched')
+        print(f'worktree_remove: {root}: {why}', file=sys.stderr)
         return 5
     wc.log(f'removed {root}')
     wc.cleanup(root, [(common, *head)] if head else [])

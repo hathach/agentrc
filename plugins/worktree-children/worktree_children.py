@@ -41,9 +41,9 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   keeps them all. Removals go holders first, and a child whose removal fails keeps what it holds;
   children linking in a cycle, which no order protects, are kept with what they hold.
 Deleted by policy: ignored files and commits only a reflog still names. No `git worktree prune`
-runs: it would touch unrelated worktrees. herdr removes the parent before this runs, with its
-own checks only: the worktree-remove skill's pending-work gate is skipped by a removal from
-herdr's menu.
+runs: it would touch unrelated worktrees. herdr, or worktree-remove for a parent open in no herdr
+workspace, removes the parent before this runs; herdr with its own checks only: the
+worktree-remove skill's pending-work gate is skipped by a removal from herdr's menu.
 
 Branches: the parent's (the event's branch in its `repo_key` repository) and each removed
 child's are deleted when nothing but the branch name is lost, otherwise kept with a reason:
@@ -261,8 +261,13 @@ def herdr_found():
     return False
 
 
+def open_workspace(path):
+    """The id of the herdr workspace that has path open, None when none has or there is no herdr."""
+    return herdr_found() and herdr_entry(path).get('open_workspace_id') or None
+
+
 def check_herdr(child):
-    workspace = herdr_found() and herdr_entry(child).get('open_workspace_id')
+    workspace = open_workspace(child)
     if workspace:
         raise Keep(f'open in herdr workspace {workspace}')
 
@@ -407,7 +412,7 @@ def anchored(path, here):
     directory, raises OSError."""
     if os.altsep:
         path = path.replace(os.altsep, os.sep)
-    if os.name == 'nt' and path.startswith('\\\\?\\'):  # a volume GUID path keeps it: no other names it
+    if os.name == 'nt' and path.startswith('\\\\?\\'):  # a volume GUID path keeps it: a drive letter need not name it
         path = ('\\\\' + path[8:] if path[4:8].upper() == 'UNC\\' else
                 path[4:] if re.match(r'[A-Za-z]:', path[4:]) else path)
     drive, tail = os.path.splitdrive(path)
@@ -448,11 +453,19 @@ def link_hops(link):
 
 def reach(tree, scan):
     """(the paths tree's symlinks enter, the error that stopped searching it or None), searched once
-    per scan, the cache of one planning pass: a big tree takes tens of seconds to walk."""
+    per scan, the cache of one planning pass: a big tree takes tens of seconds to walk. On Windows,
+    where link_hops follows symlinks only, not the junctions, subst or mapped drives on the way,
+    each hop is case-folded twice as holds spells its roots: with its directory resolved, so a
+    symlink hop still names the tree it sits in, and resolved whole, for where it ends up."""
     if tree not in scan:
         try:
-            scan[tree] = [hop for top, _, _, links in walk(tree) for name in links
-                          for hop in link_hops(os.path.join(top, name))], None
+            hops = [hop for top, _, _, links in walk(tree) for name in links
+                    for hop in link_hops(os.path.join(top, name))]
+            if os.name == 'nt':
+                hops = [os.path.normcase(h) for hop in set(hops) for h in (
+                    os.path.join(os.path.realpath(os.path.dirname(hop)), os.path.basename(hop)),
+                    os.path.realpath(hop))]
+            scan[tree] = hops, None
         except (Keep, OSError) as err:
             scan[tree] = [], err
     return scan[tree]
@@ -470,10 +483,10 @@ def holds(leaving, staying, scan):
                 held[path] = f'owned by {stay.name}, which stays'
             else:
                 targets, blind = reach(stay, scan)  # searched only when a name does not settle it
-                root = os.path.normcase(os.path.realpath(path))  # a target may spell its case otherwise
+                root = os.path.normcase(os.path.realpath(path))
                 if blind:
                     held[path] = f'cannot tell whether {stay.name}, which stays, links into it: {blind}'
-                elif any(t == root or t.startswith(root + os.sep) for t in map(os.path.normcase, targets)):
+                elif any(t == root or t.startswith(root + os.sep) for t in targets):
                     held[path] = f'{stay.name}, which stays, links into it'
                 else:
                     continue

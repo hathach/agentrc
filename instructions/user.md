@@ -54,8 +54,7 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   .worktrees/<branch> -b <branch>`, or without `-b` for an existing branch)
   only when there is none. Before removing one, inspect its dependency
   symlinks or junctions and verify that removal deletes only the links and
-  worktree, not their shared targets; the `worktree-remove` skill does, with
-  or without herdr.
+  worktree, not their shared targets.
 - herdr worktrees: when `herdr worktree list --cwd .` shows the current
   checkout with `is_linked_worktree` true and an open workspace, create task
   worktrees, of this repo or another, as its siblings `<checkout>--<branch>`
