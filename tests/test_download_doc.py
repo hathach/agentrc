@@ -1780,6 +1780,24 @@ class EnumerationComplete(unittest.TestCase):
         self.patch(vendor_wch, SEEDS=['CH32V307DS0_PDF.html'])
         self.assertFalse(self.complete(vendor_wch, http_get))
 
+    def test_wch_seeds_reach_a_datasheet_page_with_no_relatives(self):
+        # Live 2026-10-29: the CH32V407 datasheet lists no relatives; its RM lists the datasheet.
+        pages = {'CH32V407DS0_PDF': {'id': 442, 'name': 'CH32V407DS0.PDF', 'version': '1.3',
+                                     'content': 'CH32V407 datasheet', 'relationFileList': []},
+                 'CH32V407RM_PDF': {'id': 455, 'name': 'CH32V407RM.PDF', 'version': '1.2',
+                                    'content': 'CH32V407 reference manual',
+                                    'relationFileList': [{'name': 'CH32V407DS0.PDF'}]}}
+
+        def http_get(url, *a, **k):
+            page = next((v for n, v in pages.items() if n in url), None)
+            return json.dumps({'code': 0, 'data': page}).encode()
+        with unittest.mock.patch.object(vendor_wch, 'http_get', http_get), \
+                contextlib.redirect_stderr(io.StringIO()):
+            docs = vendor_wch.enumerate_docs(families=['CH32V407'])
+        self.assertEqual(sorted((d.doc_id, d.doc_type, d.family[0]) for d in docs),
+                         [('CH32V407DS0', 'datasheet', 'CH32V407'),
+                          ('CH32V407RM', 'reference-manual', 'CH32V407')])
+
     def test_st_falls_back_to_its_cached_grid(self):
         self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
         (self.root / 'st').mkdir()
