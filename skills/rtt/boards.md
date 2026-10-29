@@ -85,7 +85,7 @@ always pass them (`--probe` / `adapter serial`).
   TinyUSB a `LOGGER=rtt` build traps on WCH QingKe (the vendored generic RISC-V
   `SEGGER_RTT_LOCK` reads `mstatus` CSRs → mcause=2) unless it also sets
   `SYSVIEW=1..4`, whose force-included `sysview_rtt_conf.h` brings TinyUSB's
-  QingKe-safe lock on ch32v20x, ch32v30x and ch583; ch32v10x refuses `SYSVIEW`,
+  own lock on ch32v20x, ch32v30x and ch583; ch32v10x refuses `SYSVIEW`,
   so there every `LOGGER=rtt` build traps (`target-debug`'s
   `projects/tinyusb.md`). SDI permits no live streaming anyway
   (transport matrix).

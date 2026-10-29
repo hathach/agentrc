@@ -157,8 +157,12 @@ python3 <skill dir>/scripts/rtt.py --backend jlink --dump ring.bin \
   RTT console output is NOT lossless under load; for high-bandwidth streams
   size the buffer up (SystemView needs 2048–8192) and watch for overflow.
 - Non-ARM ports must supply `SEGGER_RTT_LOCK/UNLOCK`: the vendored generic
-  RISC-V lock uses `mstatus` CSRs that trap (mcause=2) on WCH QingKe, which
-  needs a save/restore of its own interrupt-enable CSR (0x800) instead.
+  RISC-V lock uses `mstatus` CSRs that trap (mcause=2) on WCH QingKe, whose
+  vendor startup runs `main` in User mode. QingKe V4 masks through `gintenr`
+  (CSR 0x800, the User-mode map of MIE/MPIE): save it, clear 0x88, then
+  `fence.i`, which the QingKe V4 manual requires after masking through a CSR;
+  restore the saved value to unlock. QingKe V3A has no `gintenr` (QingKe V3
+  manual), so this lock does not apply there.
 
 ## Common mistakes
 
