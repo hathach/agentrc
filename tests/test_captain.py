@@ -1070,13 +1070,16 @@ class BroadcastTest(AddressedCase):
                 self.assertIn('ask the human to restate it', why_not)
         self.assertEqual((self.typed, captain.records()), ([], []))
 
-    def test_all_joined_to_a_name_refuses_even_as_a_label(self):
+    def test_all_joined_to_a_name_refuses(self):
         for words in ('tell code, everyone: continue', 'tell code, all to continue', 'tell code & every: go'):
             with self.subTest(words):
                 self.assertIn('not one to join', self.refused(words, 'w2:p1'))
-                with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
-                    captain.relay(['w2:p1'], self.say(words), 'any', self.ident)
-                self.assertIn('not one to join', out.call_args.args[0])
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.relay(['w2:p1'], self.say('tell code, everyone: continue'), 'any', self.ident)
+        self.assertIn('not one to join', out.call_args.args[0])
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_all_joined_to_a_name_refuses_even_as_a_label(self):
         self.panes['w4:p1'] = {**pinned('w4:p1'), 'workspace': 'all'}
         self.assertIn('not one to join', self.refused('tell code and all to merge', 'w2:p1', 'w4:p1'))
         self.assertEqual((self.typed, captain.records()), ([], []))

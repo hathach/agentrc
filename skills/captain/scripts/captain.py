@@ -28,10 +28,9 @@ live session's latest report, or ws:<workspace id or label>. A selector must mat
 
 A message that opens `tell <name>... [to]`, each name a pane id, workspace id or label, or selector, is relayed
 without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be
-told apart from the instruction. One that opens `tell all [session|sessions] to|:`, `tell everyone to|:` or `tell
-every session to|:` is relayed without it when the targets are exactly the live sessions `list` shows, at the preview
-and again at the send; a session opening or closing in between refuses the send. The digest a preview prints covers
-the text and the target panes, so the send goes to those panes only.
+told apart from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed
+without it when the targets are exactly the live sessions, at the preview and at the send; the preview's digest covers
+the text and the target panes.
 """
 
 import argparse

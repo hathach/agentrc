@@ -72,18 +72,14 @@ the digest the preview printed, which covers the text and the panes, so it sends
   code to merge 318`, `code` being that pane's workspace, sends `merge 318`. An opening `tell` that names another
   session, not every target, or anything the script cannot split from the instruction refuses, nothing sent: ask
   the human to restate it. A message addressed to every session - `tell all`, `tell all session(s)`, `tell everyone`
-  or `tell every session`, then `to` or `:` - takes every pane `list` printed as its targets, and the script removes
-  that opening only when the targets are exactly the live sessions, at the preview and again at the send. A comma or
-  bare space after it (`tell all continue`), a qualifier (`all tinyusb sessions`), another name beside it, or an
-  opening word that also names a live session (address that one alone as `ws:<label>`) refuses: ask the human to
-  restate it. Targets that are not exactly the live sessions refuse at the preview, and a session that opened or
-  closed since then refuses the send: `list` and preview again. A busy session stays a target, its status shown in
-  the preview, and is refused at the send as any relay is; once it is idle, send again with the same panes, entry and
-  digest, and the sessions that have the message are not sent it twice.
-  Relay only when the human asks you to tell a session something. Run `relay` with the
-  target panes first; it sends nothing and prints its entry and digest, then exactly the text it would send. If that
-  is the instruction to relay, run it again with `--entry <uuid> --digest <hex>`; if not (the human has written
-  since, or it is not plain text), ask the human to restate it. If it also asks you something, relay none of it and
+  or `tell every session`, then `to` or `:` - takes every pane `list` printed as its targets; any other form of it
+  refuses: ask the human to restate it. Targets that are not exactly the live sessions refuse, at the preview or at
+  the send: `list` and preview again. A busy target is refused at the send; once it is idle, send again with the same
+  complete pane list, entry and digest.
+  Relay only when the human asks you to tell a session something. Run `relay` with the target panes first; it sends
+  nothing and prints its entry and digest, then exactly the text it would send. If that is the instruction to relay,
+  run it again with `--entry <uuid> --digest <hex>`; if not (the human has written since, or it is not plain text),
+  ask the human to restate it. If it also asks you something, relay none of it and
   never cut the instruction out yourself: answer the question, then ask the human for the instruction alone.
   The send refuses unless that entry is still the human's newest message, and each message goes to a pane once. The
   target runs `accept` to read the message from the ledger and acts on it under its own rules, then records an outcome:
