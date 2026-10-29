@@ -394,6 +394,7 @@ class Doc:
     # the adapter can derive it (Microchip). The title leads with it; without one, a stem
     # trails the title in parentheses, as older books have it, and keeps it unique.
     number: str | None = None
+    language: str = "eng"   # ISO 639-2 code, Calibre's languages field
 
     @property
     def ident(self) -> str:
@@ -727,7 +728,7 @@ class Library:
 
     def add(self, doc: Doc, pdf: Path) -> int | None:
         out = self._run("add", "-t", doc.calibre_title(), "-a", doc.author,
-                        "-T", ",".join(doc.tags()), "-I", doc.ident, "-l", "eng", str(pdf))
+                        "-T", ",".join(doc.tags()), "-I", doc.ident, "-l", doc.language, str(pdf))
         m = re.search(r"Added book ids?:\s*(\d+)", out)
         book_id = int(m.group(1)) if m else None
         if book_id is None:
@@ -898,9 +899,14 @@ def unparseable_revisions(docs: list) -> dict:
 # document itself — once per family, cached, with the evidence kept so a verdict can
 # be audited instead of trusted.
 
+# Controller names count unspaced only (USBFS, USBD: all the CH32F103/V103 manual says in
+# the pages a peek reads): "USB HS" is in the ordering legend of every CH32 datasheet, the
+# USB-less CH32V003's included. Chinese datasheets say 全速 USB (full-speed USB) or
+# USB 总线主机和设备控制器 (USB bus host and device controller).
 USB_EVIDENCE = re.compile(
     r"(?i)universal serial bus|USB OTG|USB[- ]?2\.0|USB full[- ]speed|USB high[- ]speed|"
-    r"\bOTG_[FH]S\b|USB device controller|USB host controller")
+    r"\bOTG_[FH]S\b|USB device controller|USB host controller|\bUSB(?:FS|HS|HD|D)\b|"
+    r"[全高低]速\s*USB|USB\s*(?:总线)?\s*(?:主机|设备|和)*\s*控制器")
 # "USB-Serial/JTAG" and "USB power delivery" name peripherals you cannot write a USB
 # stack against, so they must not count on their own.
 USB_DECOYS = re.compile(r"(?i)USB[- ]serial/?JTAG|USB power delivery|USB[- ]PD\b|USB Type-C")
@@ -1080,8 +1086,10 @@ def plan(docs: list, idx: dict, legacy: dict | None = None) -> dict:
                 # "RP2040 Datasheet: A microcontroller by Raspberry Pi. Feb 2025".
                 # Match on a whole-word prefix so "Pico Datasheet" still can't claim
                 # "Pico W Datasheet". A document code (RM0433) is as distinctive; a
-                # part number is not: "TM4C123GH6PM Errata" is not its datasheet.
-                hit = next((v for k, v in (legacy or {}).items() if k.startswith(key + " ")), None)
+                # part number is not: "TM4C123GH6PM Errata" is not its datasheet. Nor is
+                # "CH32FV2x_V3xRM-CN" the English manual: a Chinese edition is its own book.
+                hit = next((v for k, v in (legacy or {}).items() if k.startswith(key + " ")
+                            and k[len(key) + 1:].split()[0] != "cn"), None)
         (out["legacy"].append((d, hit)) if hit else out["new"].append(d))
     return out
 

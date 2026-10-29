@@ -94,7 +94,8 @@ Dedup depends on matching these exactly; `maintaining.md` gives the reasons.
 - `title` — `<DOCID> <description> Rev <n>`, e.g. `ES0392 STM32H7 device errata Rev 15`;
   an unprinted ID trails in parentheses (`retitle.py` fixes id-last ones)
 - `identifiers` — `<vendor>:<DOCID>`, set at import time; the only record of "do we
-  have this?" — no import log beside it
+  have this?" — no import log beside it. A Chinese edition filed beside the English one
+  takes `<DOCID>-CN`
 - `tags` — kind (`datasheet`, `errata`, `reference-manual`, …) + vendor + family
 - `comments` — description, Document ID, Revision, Source URL
 

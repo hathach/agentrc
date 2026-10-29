@@ -51,6 +51,10 @@ both; the count line says whether errata exist. Nothing → retry with fewer
 keywords (the part number alone; "datasheet" and "manual" are rarely in the
 metadata). Still nothing → report the document missing, never answer from memory.
 
+A Chinese edition (`-CN` after the document ID) sits beside some English ones:
+read the English, and open the Chinese only for what the English lacks; it is
+often a revision ahead.
+
 ## Find the page
 
 Never read a manual hunting for one register:
