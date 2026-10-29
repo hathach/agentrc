@@ -28,7 +28,10 @@ live session's latest report, or ws:<workspace id or label>. A selector must mat
 
 A message that opens `tell <name>... [to]`, each name a pane id, workspace id or label, or selector, is relayed
 without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be
-told apart from the instruction.
+told apart from the instruction. One that opens `tell all [session|sessions] to|:`, `tell everyone to|:` or `tell
+every session to|:` is relayed without it when the targets are exactly the live sessions `list` shows, at the preview
+and again at the send; a session opening or closing in between refuses the send. The digest a preview prints covers
+the text and the target panes, so the send goes to those panes only.
 """
 
 import argparse
@@ -82,6 +85,9 @@ TELL = re.compile(r'\s*tell\s+', re.I)
 NAME = re.compile(r'[^\s,:;&]+(?::[^\s,:;&]+)*')   # a pane id or selector keeps its inner colons
 JOIN = re.compile(r'\s*,?\s*(?:and|&)\s+|\s*,\s*', re.I)
 TO = re.compile(r'\s+to\s+|\s*[:,]\s*|\s+', re.I)
+EVERY_WORD = re.compile(r'(?:all|everyone|every)(?=[\s:]|$)', re.I)   # never one recipient: every session
+# No comma or bare space after it: "all, code" and "all tinyusb sessions" cannot be told from the instruction.
+EVERY_ONE = re.compile(r'(?:all(?:\s+sessions?)?|everyone|every\s+session)(?:\s+to(?:\s+|$)|\s*:\s*)', re.I)
 
 
 def die(msg, code=1):
@@ -880,8 +886,13 @@ def instruction(words, panes, live, recs):
     if not tell:
         return words, None
     pos, found = tell.end(), set()
+    first = EVERY_WORD.match(words, pos)
+    if first:
+        return broadcast(words, first, panes, live, recs)
     while True:
         name = NAME.match(words, pos)
+        if name and EVERY_WORD.fullmatch(name.group()):
+            return None, f'"{name.group()}" addresses every session, not one to join with other names'
         hits = named(name.group(), live, recs) if name else set()
         if not hits:
             return None, f'it opens with "tell" and {name.group()!r} names no live session' if name else \
@@ -895,7 +906,8 @@ def instruction(words, panes, live, recs):
         join = JOIN.match(words, pos)
         following = join and NAME.match(words, join.end())
         # a pane id or selector is a recipient even when it names no one, never the instruction's first word
-        if not (following and (':' in following.group() or named(following.group(), live, recs))):
+        if not (following and (':' in following.group() or EVERY_WORD.fullmatch(following.group())
+                               or named(following.group(), live, recs))):
             joiner = join and join.group().strip(' \t\r\n,')
             if joiner:
                 return None, f'{joiner!r} after {name.group()!r} may join another name or start the instruction'
@@ -910,8 +922,33 @@ def instruction(words, panes, live, recs):
     return text, None
 
 
-def digest(text):
-    return hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+class Stale(str):
+    """A refusal a new preview cures: the sessions changed, not the human's words."""
+
+
+def broadcast(words, first, panes, live, recs):
+    """instruction() for a message opening `tell all|everyone|every session`, first its opening word."""
+    if named(first.group(), live, recs):
+        return None, f'"{first.group()}" also names a session; address it by ws:<label>, or every session another way'
+    every = EVERY_ONE.match(words, first.start())
+    if not every:
+        return None, (f'it opens with "tell {first.group()}" but not as "all [session|sessions]", "everyone" or '
+                      '"every session" followed by "to" or ":"')
+    text = words[every.end():]
+    if not text.strip():
+        return None, 'nothing follows the names'
+    alive, targets = {s['pane_id'] for s in live}, set(panes)
+    missing, extra = alive - targets, targets - alive
+    if missing or extra or not targets:
+        return None, Stale('it addresses every session, and the targets are not exactly the live sessions'
+                           + (f'; not targeted: {", ".join(sorted(missing))}' if missing else '')
+                           + (f'; not live: {", ".join(sorted(extra))}' if extra else ''))
+    return text, None
+
+
+def digest(text, panes):
+    """The preview's digest of what goes where: target order does not change it."""
+    return hashlib.sha256(json.dumps([text, sorted(set(panes))]).encode('utf-8')).hexdigest()[:16]
 
 
 def relay_text(words, panes, recs):
@@ -919,6 +956,8 @@ def relay_text(words, panes, recs):
     if not TELL.match(words):   # unaddressed: sent as written, no session listing needed
         return words
     text, why = instruction(words, panes, everyone(), recs)
+    if isinstance(why, Stale):
+        die(f'{why}: run list, then preview again with every pane it shows', 2)
     if why:
         die(f"the human's message cannot be relayed as written: {why}; ask the human to restate it", 2)
     return text
@@ -933,9 +972,9 @@ def preview(targets, mine):
     entry, words = newest(captain, sending=False)
     for pane, arg in targets.items():
         target = find(pane)
-        print(f'to {arg}: {target["handle"] if target else "no such agent pane"}')
+        print(f'to {arg}: {target["handle"]} ({target["status"]})' if target else f'to {arg}: no such agent pane')
     text = relay_text(words, list(targets), recs)
-    print(f'entry {entry} digest {digest(text)}\n{text}')
+    print(f'entry {entry} digest {digest(text, targets)}\n{text}')
     return 0
 
 
@@ -980,8 +1019,8 @@ def relay(panes, entry, sent, mine):
         if latest != entry:
             die(f"{entry} is not the human's newest message; preview again", 2)
         quote = relay_text(words, panes, records())
-        if sent != digest(quote):
-            die('the text this relay would send is not the one the preview showed; preview again', 2)
+        if sent != digest(quote, panes):
+            die('the text or panes this relay would send to are not the ones the preview showed; preview again', 2)
         for pane in panes:
             recs = records()
             if any(r['type'] == 'relay' and r['entry'] == entry and r['target']['pane_id'] == pane for r in recs):

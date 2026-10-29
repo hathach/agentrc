@@ -53,7 +53,7 @@ A target is a pane id or a selector the human's words give you: `pr:N`, `pr:<own
 `ws:<workspace id or label>`. A selector must match exactly one session: none or several refuse the whole call,
 nothing sent, the candidates listed; name a label the guard refuses, such as one with a space, by its workspace id. A
 send (`--entry`) takes only the panes the preview printed, so a report landing in between cannot redirect it, and
-the digest the preview printed, so it sends only the text the preview showed.
+the digest the preview printed, which covers the text and the panes, so it sends only that text to those panes.
 
 ## Captain
 
@@ -71,7 +71,16 @@ the digest the preview printed, so it sends only the text the preview showed.
   ids or labels, or selectors - are exactly the relay's targets is removed by the script: `relay w68:p1` on `tell
   code to merge 318`, `code` being that pane's workspace, sends `merge 318`. An opening `tell` that names another
   session, not every target, or anything the script cannot split from the instruction refuses, nothing sent: ask
-  the human to restate it. Relay only when the human asks you to tell a session something. Run `relay` with the
+  the human to restate it. A message addressed to every session - `tell all`, `tell all session(s)`, `tell everyone`
+  or `tell every session`, then `to` or `:` - takes every pane `list` printed as its targets, and the script removes
+  that opening only when the targets are exactly the live sessions, at the preview and again at the send. A comma or
+  bare space after it (`tell all continue`), a qualifier (`all tinyusb sessions`), another name beside it, or an
+  opening word that also names a live session (address that one alone as `ws:<label>`) refuses: ask the human to
+  restate it. Targets that are not exactly the live sessions refuse at the preview, and a session that opened or
+  closed since then refuses the send: `list` and preview again. A busy session stays a target, its status shown in
+  the preview, and is refused at the send as any relay is; once it is idle, send again with the same panes, entry and
+  digest, and the sessions that have the message are not sent it twice.
+  Relay only when the human asks you to tell a session something. Run `relay` with the
   target panes first; it sends nothing and prints its entry and digest, then exactly the text it would send. If that
   is the instruction to relay, run it again with `--entry <uuid> --digest <hex>`; if not (the human has written
   since, or it is not plain text), ask the human to restate it. If it also asks you something, relay none of it and
