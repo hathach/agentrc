@@ -61,6 +61,13 @@ class DecodeError(ValueError):
     pass
 
 
+class Truncated(DecodeError):
+    """The data ended inside a field; in_varint when it ended inside a varint rather than a declared length."""
+    def __init__(self, message='truncated packet', in_varint=False):
+        super().__init__(message)
+        self.in_varint = in_varint
+
+
 class Reader:
     def __init__(self, data, pos=0, end=None):
         self.data, self.pos = data, pos
@@ -68,7 +75,7 @@ class Reader:
 
     def take(self, size):
         if size > self.end - self.pos:
-            raise DecodeError('truncated packet')
+            raise Truncated()
         result = self.data[self.pos:self.pos + size]
         self.pos += size
         return result
@@ -77,7 +84,7 @@ class Reader:
         value = 0
         for shift in range(0, 35, 7):
             if self.pos >= self.end:
-                raise DecodeError('truncated packet')
+                raise Truncated(in_varint=True)
             b = self.data[self.pos]
             self.pos += 1
             if shift == 28 and b > 15:
@@ -151,6 +158,9 @@ def packet_at(data, offset):
             args, text = [], ''
     try:
         delta = r.uint()
+    except Truncated as e:
+        # a payload already known malformed is no clean cut, whatever the delta's state
+        raise Truncated('timestamp delta: ' + str(e), e.in_varint and not problem) from e
     except DecodeError as e:
         raise DecodeError('timestamp delta: ' + str(e)) from e
     return Packet(event, args, text, delta, offset, data[offset:r.pos], problem=problem), r.pos
@@ -216,6 +226,28 @@ def stream(data, diagnostics):
             continue
         packet.gap, gap = gap, None
         yield packet
+
+
+def incomplete_tail(data):
+    """(offset, size) of a syntactically incomplete terminal packet, whose bytes end inside a varint with no declared
+    length involved, else None. A GUI-load heuristic, not provenance: a corrupt continuation bit reads the same.
+    Raises DecodeError for framing stream() does not read (no synchronization, multicore)."""
+    diagnostics = []
+    for _ in stream(data, diagnostics):
+        pass
+    if not diagnostics:
+        return None
+    last = diagnostics[-1]
+    if last.get('timingLost') or last['offset'] + last['bytes'] != len(data) or 'truncated' not in last['reason']:
+        return None
+    try:
+        packet_at(data, last['offset'])
+    except Truncated as e:
+        if e.in_varint:
+            return last['offset'], last['bytes']
+    except DecodeError:
+        pass
+    return None
 
 
 @dataclass

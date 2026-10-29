@@ -352,11 +352,15 @@ class SystemView:
             time.sleep(POLL_S)
         raise Failure(f'the SystemView window did not settle in {SETTLE_S} s (title {self.poll()!r})')
 
-    def load(self, path):
-        """Load a copy of path named for this run only; the main title once it names that copy."""
+    def load(self, path, length=None):
+        """Load a copy of path, or of its first length bytes, named for this run only; the main title once it names
+        that copy."""
         self.settle()
         copy = self.home / f'sysview-{uuid.uuid4().hex}.SVDat'
-        shutil.copyfile(path, copy)
+        if length is None:
+            shutil.copyfile(path, copy)
+        else:
+            copy.write_bytes(path.read_bytes()[:length])
         shown = re.compile(r' - ' + re.escape(copy.name) + r'(?: - | \||$)')
         deadline, resend = time.monotonic() + LOAD_S, 0
         while time.monotonic() < deadline:
@@ -431,8 +435,29 @@ def exports(out, a):
     return rows
 
 
+def gui_input(path):
+    """How much of path the GUI loads, and the record of it. SystemView reports a syntactically incomplete terminal
+    packet as 'SystemView Error' dialogs, so it gets the file up to that packet; the file and the native diagnostics
+    keep every byte."""
+    from sysview_decode import DecodeError, incomplete_tail
+    data = path.read_bytes()
+    info = {'source': str(path), 'size': len(data), 'trimmed': None}
+    try:
+        tail = incomplete_tail(data)
+    except DecodeError as e:
+        info['note'] = f'not checked for an incomplete terminal packet: {e}'
+        return None, info
+    if tail:
+        info['trimmed'] = {'offset': tail[0], 'bytes': tail[1], 'reason': 'syntactically incomplete terminal packet'}
+        return tail[0], info
+    return None, info
+
+
 def decode(sv, out, a, record, path):
-    record['loadedTitle'] = sv.load(path)
+    length = None
+    if a.from_raw:    # a live recording is SystemView's own save
+        length, record['guiInput'] = gui_input(path)
+    record['loadedTitle'] = sv.load(path, length)
     for cmd, dest in exports(out, a):
         record['exports'][dest.name] = sv.write(cmd, dest)
 

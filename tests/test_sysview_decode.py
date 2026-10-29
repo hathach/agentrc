@@ -425,6 +425,55 @@ class Packets(unittest.TestCase):
             decode.Decoder().decode(b'; Offset Core0 0\n; Offset Core1 5\n' + header())
 
 
+class IncompleteTail(unittest.TestCase):
+    def test_a_stream_ending_on_a_packet_boundary_has_none(self):
+        self.assertIsNone(decode.incomplete_tail(header() + packet(512)))
+
+    def test_eof_inside_a_varint_is_a_candidate(self):
+        head = header() + packet(512)
+        for name, tail in (('timestamp delta', packet(28, 512, delta=300)[:-1]),
+                           ('event id', uint(600)[:1]),
+                           ('fixed-layout argument', packet(2, 300)[:2]),
+                           ('declared size', uint(25) + uint(300)[:1])):
+            with self.subTest(name=name):
+                self.assertEqual(decode.incomplete_tail(head + tail), (len(head), len(tail)))
+
+    def test_a_corrupt_continuation_bit_reads_the_same_as_a_cut(self):
+        # 03 87 is 03 87 01 cut short, or a complete 03 07 with its continuation bit flipped: the heuristic says cut
+        head = header() + packet(512)
+        self.assertEqual(decode.incomplete_tail(head + b'\x03\x87'), (len(head), 2))
+
+    def test_a_declared_length_past_eof_is_no_candidate(self):
+        for name, tail in (('payload', uint(25) + uint(5) + b'ab'),
+                           ('string', uint(14) + bytes([20]) + b'N=Tiny'),
+                           ('corrupt length then a complete packet', uint(25) + uint(100) + packet(512))):
+            with self.subTest(name=name):
+                self.assertIsNone(decode.incomplete_tail(header() + tail))
+
+    def test_a_malformed_payload_cut_in_its_delta_is_no_candidate(self):
+        # the bounded payload's own problem stands, whatever the timestamp delta's state
+        for name, tail in (('unterminated varint in a bounded payload', b'\x1c\x01\x80'),
+                           ('Init without its parameters', b'\x18\x00')):
+            with self.subTest(name=name):
+                self.assertIsNone(decode.incomplete_tail(header() + tail))
+
+    def test_padding_and_other_errors_reaching_eof_are_no_candidate(self):
+        for name, tail in (('padding', packet(512) + b'\0'),
+                           ('oversized varint then a complete packet', b'\xff\xff\xff\xff\x10' + packet(512))):
+            with self.subTest(name=name):
+                self.assertIsNone(decode.incomplete_tail(header() + tail))
+
+    def test_a_cut_after_a_resynchronized_error_is_a_candidate(self):
+        head = header() + b'\xff\xff\xff\xff\x10' + header() + packet(512)
+        tail = packet(28, 512, delta=300)[:-1]
+        self.assertEqual(decode.incomplete_tail(head + tail), (len(head), len(tail)))
+
+    def test_framing_the_decoder_does_not_read_raises(self):
+        for data in (b'noise', b'; Offset Core0 0\n; Offset Core1 5\n' + header()):
+            with self.subTest(data=data[:12]), self.assertRaises(decode.DecodeError):
+                decode.incomplete_tail(data)
+
+
 class Analysis(unittest.TestCase):
     def test_partial_isrs_interrupt_ancestors_at_eof_and_stop_without_samples(self):
         for nested in (False, True):
