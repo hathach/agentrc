@@ -177,7 +177,17 @@ class AgentFiles(unittest.TestCase):
                        '`replySettlements: [{ commentId, commentDigest, replyId, bodyDigest, headSha }]`'):
             self.assertIn(phrase, takeover)
         review = body.split('Exception for a headless PR review launch:')[1].split('Standing exception for pr-review pending reviews:')[0]
-        self.assertIn('a new chief invocation, including a restart or resumed recovery, requires a fresh exchange', review)
+        for phrase in ("the human's own message asking pr-review to review a PR with auto-post, carried and accepted under the headless PR launch exception's provenance",
+                       'A relaunch of the same unfinished review on the same head first reconciles any earlier post',
+                       'never submitting a second review'):
+            self.assertIn(phrase, review)
+        self.assertNotIn('fresh exchange', review)
+        skill = ' '.join((AGENTS.parent / 'skills' / 'pr-review' / 'SKILL.md').read_text().split())
+        self.assertNotIn('AskUserQuestion', skill)
+        for phrase in ("absent words mean pending, no hardware and prepare's mode",
+                       'never substitute, drop or default a choice the words made',
+                       "no board runs: step 3 takes `hil: {choice: 'none'}`"):
+            self.assertIn(phrase, skill)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
         rules = ' '.join((AGENTS.parent / 'instructions' / 'user.md').read_text().split())
         for phrase in ('Right after opening a new non-draft PR on my request, launch a headless `chief` in its worktree to babysit it',
@@ -186,6 +196,7 @@ class AgentFiles(unittest.TestCase):
             self.assertIn(phrase, rules)
         self.assertIn('through `pr-babysit` with `autoPush: true` and `markSonar: true`', rules)
         self.assertIn('Merging stays off. My own words asking to merge a named PR', rules)
+        self.assertIn('submitting any review stays mine, unless that request names auto-post', rules)
         self.assertIn("Each pr-babysit launch gets a `Findings` subsection holding its reading's `findingsTable` verbatim", body)
         readme = ' '.join((AGENTS.parent / 'README.md').read_text().split())
         self.assertIn('A relaunch for the same PR task copies the grant verbatim from the earlier launch task, without asking again, '
