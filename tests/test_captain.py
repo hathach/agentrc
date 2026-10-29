@@ -741,10 +741,14 @@ class RelayCase(LedgerCase):
             f.write(json.dumps(entry) + '\n')
         return uid
 
+    def digest(self, text, panes):
+        """The digest of text to the sessions in panes now."""
+        return captain.digest(text, captain.pins({pane: captain.find(pane) for pane in panes}))
+
     def relay(self, entry, *panes, digest=None):
         """Send entry to panes with digest, by default the digest of entry's words as written to those panes."""
         panes = list(panes or ['w2:p1'])
-        digest = digest or captain.digest(self.words[entry] or '', panes)
+        digest = digest or self.digest(self.words[entry] or '', panes)
         with mock.patch('builtins.print') as out:
             captain.relay(panes, entry, digest, self.ident)
         return [c.args[0] for c in out.call_args_list]
@@ -766,7 +770,7 @@ class RelayTest(RelayCase):
         self.say('older')
         uid = self.say('merge o/r#12')
         shown = self.preview('w2:p1', 'w9:p9')
-        self.assertIn(f'entry {uid} digest {captain.digest("merge o/r#12", ["w2:p1", "w9:p9"])}\nmerge o/r#12', shown)
+        self.assertIn(f'entry {uid} digest {self.digest("merge o/r#12", ["w2:p1", "w9:p9"])}\nmerge o/r#12', shown)
         self.assertIn('to w2:p1: ws · name · w2:p1', shown)
         self.assertIn('to w9:p9: no such agent pane', shown)
         self.assertEqual((self.typed, captain.records()), ([], []))
@@ -848,7 +852,7 @@ class RelayTest(RelayCase):
 
         def run():
             start.wait()
-            captain.relay(['w2:p1'], uid, captain.digest('merge o/r#12', ['w2:p1']), self.ident)
+            captain.relay(['w2:p1'], uid, self.digest('merge o/r#12', ['w2:p1']), self.ident)
         concurrently(run)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.count('relay'), 1)
@@ -1004,7 +1008,7 @@ class AddressingTest(AddressedCase):
 
     def test_an_unresolved_recipient_refuses_the_send_too(self):
         uid = self.say('tell code, w9:p1 to merge 318')
-        for digest in (captain.digest('w9:p1 to merge 318', ['w2:p1']), captain.digest('merge 318', ['w2:p1'])):
+        for digest in (self.digest('w9:p1 to merge 318', ['w2:p1']), self.digest('merge 318', ['w2:p1'])):
             with self.subTest(digest), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
                 self.relay(uid, 'w2:p1', digest=digest)
         self.assertEqual(self.typed, [])
@@ -1024,7 +1028,7 @@ class AddressingTest(AddressedCase):
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             captain.relay(['w2:p1'], entry, None, self.ident)
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay(entry, 'w2:p1', digest=captain.digest('tell code to merge 318', ['w2:p1']))
+            self.relay(entry, 'w2:p1', digest=self.digest('tell code to merge 318', ['w2:p1']))
         self.panes['w2:p1'] = {**self.panes['w2:p1'], 'workspace': 'renamed'}
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             self.relay(entry, 'w2:p1', digest=digest)
@@ -1111,6 +1115,26 @@ class BroadcastTest(AddressedCase):
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             self.relay(entry, *self.EVERY, digest=digest)
         self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_a_session_replaced_in_a_pane_after_the_preview_refuses_the_send(self):
+        _, entry, digest = self.shown('tell all to continue', *self.EVERY)
+        self.panes['w3:p1'] = {**self.panes['w3:p1'], 'pid': 11, 'started': 21, 'session': 's-new'}
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.relay(list(self.EVERY), entry, digest, self.ident)
+        self.assertIn('preview again', out.call_args.args[0])
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_a_session_replaced_during_the_send_is_refused(self):
+        _, entry, digest = self.shown('tell all to continue', *self.EVERY)
+
+        def replace_w3(pane, text):
+            self.panes['w3:p1'] = {**self.panes['w3:p1'], 'pid': 11, 'started': 21, 'session': 's-new'}
+            return self._submit(pane, text)
+        with mock.patch.object(captain, 'submit', replace_w3):
+            lines = self.relay(entry, *self.EVERY, digest=digest)
+        self.assertTrue(lines[0].endswith('delivered'))
+        self.assertIn('not the one the preview showed', lines[1])
+        self.assertEqual([pane for pane, _ in self.typed], ['w2:p1'])
 
     def test_a_name_that_is_also_a_session_refuses(self):
         self.panes['w3:p1'] = {**pinned('w3:p1'), 'workspace': 'all'}

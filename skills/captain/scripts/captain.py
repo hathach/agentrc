@@ -30,7 +30,7 @@ A message that opens `tell <name>... [to]`, each name a pane id, workspace id or
 without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be
 told apart from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed
 without it when the targets are exactly the live sessions, at the preview and at the send; the preview's digest covers
-the text and the target panes.
+the text, the target panes and the session pinned in each.
 """
 
 import argparse
@@ -945,9 +945,15 @@ def broadcast(words, first, panes, live, recs):
     return text, None
 
 
-def digest(text, panes):
-    """The preview's digest of what goes where: target order does not change it."""
-    return hashlib.sha256(json.dumps([text, sorted(set(panes))]).encode('utf-8')).hexdigest()[:16]
+def pins(found):
+    """{pane: the identity of the session found in it, None for none}."""
+    return {pane: identity(s) if s else None for pane, s in found.items()}
+
+
+def digest(text, pinned):
+    """The preview's digest of what goes to which session, pinned as pins() gives it: target order or a status change
+    does not change it, a session opened, closed or replaced in a target pane does."""
+    return hashlib.sha256(json.dumps([text, sorted(pinned.items())]).encode('utf-8')).hexdigest()[:16]
 
 
 def relay_text(words, panes, recs):
@@ -969,11 +975,12 @@ def preview(targets, mine):
         captain = require_captain(mine)
         recs = records()
     entry, words = newest(captain, sending=False)
+    found = {pane: find(pane) for pane in targets}
     for pane, arg in targets.items():
-        target = find(pane)
+        target = found[pane]
         print(f'to {arg}: {target["handle"]} ({target["status"]})' if target else f'to {arg}: no such agent pane')
     text = relay_text(words, list(targets), recs)
-    print(f'entry {entry} digest {digest(text, targets)}\n{text}')
+    print(f'entry {entry} digest {digest(text, pins(found))}\n{text}')
     return 0
 
 
@@ -1017,15 +1024,19 @@ def relay(panes, entry, sent, mine):
         latest, words = newest(captain, sending=True)
         if latest != entry:
             die(f"{entry} is not the human's newest message; preview again", 2)
+        pinned = pins({pane: find(pane) for pane in panes})
         quote = relay_text(words, panes, records())
-        if sent != digest(quote, panes):
-            die('the text or panes this relay would send to are not the ones the preview showed; preview again', 2)
+        if sent != digest(quote, pinned):
+            die('the text, panes or sessions this relay would send to are not the ones the preview showed; '
+                'preview again', 2)
         for pane in panes:
             recs = records()
             if any(r['type'] == 'relay' and r['entry'] == entry and r['target']['pane_id'] == pane for r in recs):
                 print(f'{pane}: refused, this message was relayed to it already', flush=True)
                 continue
             target, why = sendable(pane, recs, mine)
+            if not why and identity(target) != pinned[pane]:   # replaced while earlier panes were typed into
+                why = 'its session is not the one the preview showed; preview again'
             if why:
                 print(f'{pane}: refused, {why}', flush=True)
                 continue

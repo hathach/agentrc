@@ -53,7 +53,8 @@ A target is a pane id or a selector the human's words give you: `pr:N`, `pr:<own
 `ws:<workspace id or label>`. A selector must match exactly one session: none or several refuse the whole call,
 nothing sent, the candidates listed; name a label the guard refuses, such as one with a space, by its workspace id. A
 send (`--entry`) takes only the panes the preview printed, so a report landing in between cannot redirect it, and
-the digest the preview printed, which covers the text and the panes, so it sends only that text to those panes.
+the digest the preview printed, which covers the text, the panes and the session pinned in each, so it sends only
+that text to those sessions: one closed, opened or replaced in a target pane since refuses, and you preview again.
 
 ## Captain
 
