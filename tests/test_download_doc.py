@@ -887,9 +887,9 @@ class AddOne(unittest.TestCase):
         self.fetched.append(url)
         return self.served
 
-    def add(self, *args, doc_id='PS1234', source=('--url', URL)):
+    def add(self, *args, doc_id='PS1234', doc_type='datasheet', source=('--url', URL)):
         argv = ['--vendor', 'nordic', '--author', 'Nordic Semiconductor', '--id', doc_id,
-                '--type', 'datasheet', '--title', 'nRF52820 Product Specification',
+                '--type', doc_type, '--title', 'nRF52820 Product Specification',
                 *source, '--revision', '1.4', '--family', 'nRF52', *args]
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
@@ -967,6 +967,11 @@ class AddOne(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertIn('title       nRF52820 Product Specification — Datasheet (nRF52820-datasheet) Rev 1.4', out)
         self.assertIn('identity skipped', out)
+
+    def test_a_schematic_is_filed_under_its_own_kind(self):
+        code, out, err = self.add('--id-not-printed', doc_id='nRF52820-schematic', doc_type='schematic')
+        self.assertEqual(code, 0, err)
+        self.assertIn('tags        schematic, nordic, nRF52', out)
 
     def test_a_document_that_neither_confirms_nor_contradicts_the_id_is_refused(self):
         self.served = pdf_with('Some unrelated application note without a number')
