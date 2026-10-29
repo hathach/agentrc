@@ -555,6 +555,15 @@ class LibraryCalls(unittest.TestCase):
         self.assertIn('book #5 filed without comments/revision: database read failed', err.getvalue())
 
 
+    def test_a_book_is_filed_in_its_documents_language(self):
+        calls = []
+        lib = doclib.Library.__new__(doclib.Library)
+        lib._run = lambda *argv: calls.append(argv) or 'Added book ids: 5'
+        for language in ('eng', 'zho'):
+            lib.add(doclib.Doc('wch', 'CH32V407DS0', 'datasheet', '1.4', 'x', 'u', 'WCH', language=language),
+                    Path('x.pdf'))
+        self.assertEqual([argv[argv.index('-l') + 1] for argv in calls if argv[0] == 'add'], ['eng', 'zho'])
+
 class LastModified(unittest.TestCase):
     def head(self, run):
         saved = doclib.subprocess.run
@@ -985,6 +994,14 @@ class AddOne(unittest.TestCase):
             sync.add_main(['--vendor', 'nordic', '--id', 'PS1234', '--type', 'datasheet',
                            '--title', 't', '--url', self.URL])
         self.assertIn('--author is required', err.getvalue())
+
+    def test_a_chinese_edition_is_filed_in_chinese(self):
+        for doc_id, language in (('CH32V407DS0', 'eng'), ('CH32V407DS0-CN', 'zho')):
+            ap = sync.doc_parser('sync.py add', '')
+            ap.add_argument('--revision')
+            _, doc, _ = sync.parse_doc(ap, ['--vendor', 'wch', '--id', doc_id, '--type', 'datasheet',
+                                            '--title', 't', '--url', self.URL])
+            self.assertEqual(doc.language, language, doc_id)
 
 
 def setattr_all(saved):
@@ -1653,6 +1670,20 @@ class UsbResolution(unittest.TestCase):
                 self.assertFalse((Path(tmp.name) / f'{name}.json').exists())
 
 
+    def test_wch_controller_names_are_usb_evidence_and_pd_is_not(self):
+        # Live 2026-10-29: CH32xRM, CH53x and CH32M030 (yes); CH521, CH641 and CH32V003 (no).
+        def usb(text):
+            return bool(doclib.USB_EVIDENCE.search(doclib.USB_DECOYS.sub('', text)))
+        for text in ('USBFS', 'USBHS', 'USBHD', 'CAN/DAC/USBD', 'USBD peripheral', 'USBFS控制器',
+                     '支持USBFS和USBHD', 'OTG_FS控制器',
+                     '支持 12Mbps 全速 USB 传输', '内嵌 USB 总线设备控制器', 'USB 设备控制器，支持全速',
+                     'USB 总线主机和设备控制器', '集成 6 组 USB 总线控制器'):
+            self.assertTrue(usb(text), text)
+        for text in ('USBPD', 'USBDP', 'USB data line', 'USB power delivery', '05 = Connected, USB HS, CAN',
+                     'USB FS', 'USBFSX', 'XUSBD', 'USBD_x', '支持 USB PD 及 Type C',
+                     '通过专用 USB 编程器烧录', 'USB 转串口功能'):
+            self.assertFalse(usb(text), text)
+
 @unittest.skipUnless(shutil.which('pdftotext'), 'the USB peek and the identity check read the PDF with pdftotext')
 class RunDownloads(unittest.TestCase):
     """A document the USB peek downloaded is imported from the run's one download dir,
@@ -1746,9 +1777,12 @@ class EnumerationComplete(unittest.TestCase):
     def fails(*a, **k):
         raise RuntimeError('fetch failed')
 
+    # A WCH page with no relatives; an unknown seed would make the run partial.
+    WCH_LEAF = staticmethod(lambda *a, **k: b'{"code": 0, "data": {"id": 1, "name": "README.PDF"}}')
+
     def test_an_adapter_with_one_index_page_reports_its_failure(self):
         cases = {vendor_allwinner: lambda *a, **k: b'<html>' + b' ' * 3000,
-                 vendor_wch: lambda *a, **k: b'{"code": 0, "message": null, "data": null}',
+                 vendor_wch: self.WCH_LEAF,
                  vendor_st: lambda *a, **k: b'{"rows": []}'}
         self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
         sleep = unittest.mock.patch.object(vendor_st.time, 'sleep', lambda s: None)
@@ -1766,7 +1800,7 @@ class EnumerationComplete(unittest.TestCase):
 
     def test_a_partial_enumeration_does_not_carry_over_to_another_vendor(self):
         self.assertFalse(self.complete(vendor_allwinner, self.fails))
-        self.assertTrue(self.complete(vendor_wch, lambda *a, **k: b'{"code": 0, "message": null, "data": null}'))
+        self.assertTrue(self.complete(vendor_wch, self.WCH_LEAF))
 
     def test_wch_reports_an_unsuccessful_answer_from_a_related_page(self):
         # The seed answers; the page it links to answers with an error code instead.
@@ -1780,23 +1814,92 @@ class EnumerationComplete(unittest.TestCase):
         self.patch(vendor_wch, SEEDS=['CH32V307DS0_PDF.html'])
         self.assertFalse(self.complete(vendor_wch, http_get))
 
-    def test_wch_seeds_reach_a_datasheet_page_with_no_relatives(self):
-        # Live 2026-10-29: the CH32V407 datasheet lists no relatives; its RM lists the datasheet.
-        pages = {'CH32V407DS0_PDF': {'id': 442, 'name': 'CH32V407DS0.PDF', 'version': '1.3',
-                                     'content': 'CH32V407 datasheet', 'relationFileList': []},
-                 'CH32V407RM_PDF': {'id': 455, 'name': 'CH32V407RM.PDF', 'version': '1.2',
-                                    'content': 'CH32V407 reference manual',
-                                    'relationFileList': [{'name': 'CH32V407DS0.PDF'}]}}
+    def wch(self, pages, **kw):
+        """vendor_wch.enumerate_docs(**kw) over `pages` (name stem -> page), served by both
+        sites -> {doc_id: Doc}, the stems fetched per site."""
+        fetched = []
 
         def http_get(url, *a, **k):
-            page = next((v for n, v in pages.items() if n in url), None)
+            name = url.rsplit('=', 1)[1].upper()
+            fetched.append((url.split('/')[2], name))
+            page = next((v for n, v in pages.items() if n.upper() + '_PDF.HTML' == name), None)
             return json.dumps({'code': 0, 'data': page}).encode()
         with unittest.mock.patch.object(vendor_wch, 'http_get', http_get), \
                 contextlib.redirect_stderr(io.StringIO()):
-            docs = vendor_wch.enumerate_docs(families=['CH32V407'])
-        self.assertEqual(sorted((d.doc_id, d.doc_type, d.family[0]) for d in docs),
+            docs = vendor_wch.enumerate_docs(**kw)
+        return {d.doc_id: d for d in docs}, fetched
+
+    @staticmethod
+    def page(id_, name, *relatives, version='1.0'):
+        return {'id': id_, 'name': name + '.PDF', 'version': version, 'content': f'{name} document',
+                'relationFileList': [{'name': r} for r in relatives]}
+
+    def test_wch_seeds_reach_a_datasheet_page_with_no_relatives(self):
+        # Live 2026-10-29: the CH32V407 datasheet lists no relatives; its RM lists the datasheet.
+        pages = {'CH32V407DS0': self.page(442, 'CH32V407DS0', version='1.3'),
+                 'CH32V407RM': self.page(455, 'CH32V407RM', 'CH32V407DS0.PDF', version='1.2')}
+        docs, _ = self.wch(pages, families=['CH32V407'])
+        self.assertEqual(sorted((i, d.doc_type, d.family[0]) for i, d in docs.items()),
                          [('CH32V407DS0', 'datasheet', 'CH32V407'),
-                          ('CH32V407RM', 'reference-manual', 'CH32V407')])
+                          ('CH32V407DS0-CN', 'datasheet', 'CH32V407'),
+                          ('CH32V407RM', 'reference-manual', 'CH32V407'),
+                          ('CH32V407RM-CN', 'reference-manual', 'CH32V407')])
+
+    def test_wch_files_the_chinese_edition_beside_the_english_one(self):
+        docs, _ = self.wch({'CH32V407DS0': self.page(558, 'CH32V407DS0')}, families=['CH32V407'])
+        self.assertEqual(docs['CH32V407DS0'].url, 'https://www.wch-ic.com/download/file?id=558')
+        self.assertEqual(docs['CH32V407DS0-CN'].url, 'https://file.wch.cn/download/file?id=558')
+        self.assertEqual((docs['CH32V407DS0'].language, docs['CH32V407DS0-CN'].language), ('eng', 'zho'))
+
+    def test_a_hand_filed_chinese_edition_is_not_the_english_one(self):
+        en, cn = (doclib.Doc('wch', f'CH32FV2x_V3xRM{s}', 'reference-manual', '2.5', 'RM', 'u', 'WCH',
+                             aliases=[f'CH32FV2x_V3xRM{s}']) for s in ('', '-CN'))
+        legacy = {doclib.norm_title('CH32FV2x_V3xRM-CN rev 2.2'): {'id': 9, 'title': 'x'}}
+        p = doclib.plan([en, cn], {}, legacy)
+        self.assertEqual(p['new'], [en])
+        self.assertEqual(p['legacy'], [(cn, {'id': 9, 'title': 'x'})])
+
+    def test_wch_family_keeps_x_placeholders_and_drops_the_document_token(self):
+        pages = {'CH32V307DS0': self.page(1, 'CH32V307DS0', 'CH32FV2x_V3xRM.PDF', 'CH32xRM.PDF',
+                                          'CH32V00XRM.PDF', 'CH583DS1.PDF', 'QingKeV4_Processor_Manual.PDF')}
+        for name in ('CH32FV2x_V3xRM', 'CH32xRM', 'CH32V00XRM', 'CH583DS1', 'QingKeV4_Processor_Manual'):
+            pages[name] = self.page(2, name)
+        docs, _ = self.wch(pages)
+        self.assertEqual({i: (d.family[0], d.doc_type) for i, d in docs.items() if '-CN' not in i},
+                         {'CH32V307DS0': ('CH32V307', 'datasheet'),
+                          'CH32FV2x_V3xRM': ('CH32FV2x_V3x', 'reference-manual'),
+                          'CH32xRM': ('CH32x', 'reference-manual'),
+                          'CH32V00XRM': ('CH32V00X', 'reference-manual'),
+                          'CH583DS1': ('CH583', 'datasheet'),
+                          'QingKeV4_Processor_Manual': ('QingKeV4', 'programming-manual')})
+
+    def test_wch_never_fetches_a_page_outside_the_mcu_families(self):
+        # Live: CH569 lists the CH132 ULPI PHY, whose page leads on to the USB bridges.
+        pages = {'CH569DS1': self.page(1, 'CH569DS1', 'CH132DS1.PDF', 'CH569EVT.ZIP'),
+                 'CH132DS1': self.page(2, 'CH132DS1', 'CH374DS1.PDF'),
+                 'CH374DS1': self.page(3, 'CH374DS1')}
+        docs, fetched = self.wch(pages)
+        self.assertEqual(sorted(docs), ['CH569DS1', 'CH569DS1-CN'])
+        names = {n for _, n in fetched}
+        self.assertFalse(names & {'CH132DS1_PDF.HTML', 'CH374DS1_PDF.HTML'})
+        self.assertFalse(any('EVT' in n for n in names))
+
+    def test_wch_title_is_the_first_clause_with_version_points_kept(self):
+        cases = {'CH32V303/305/307/317 datasheet, this series is': 'CH32V303/305/307/317 datasheet',
+                 '超高速USB3.0双核MCU芯片CH32H417数据手册，青稞V5F': '超高速USB3.0双核MCU芯片CH32H417数据手册',
+                 '2.4G无线MCU CH572，内置': '2.4G无线MCU CH572',
+                 'CH545 datasheet. Multi-host': 'CH545 datasheet',
+                 'CH32H417 SuperSpeed USB3.0 dual-core MCU': 'CH32H417 SuperSpeed USB3.0 dual-core MCU',
+                 'Information change in the download page (Software introduction/application scope): '
+                 'CH643 series reference manual, developed': 'CH643 series reference manual'}
+        for content, title in cases.items():
+            self.assertEqual(vendor_wch._title(content), title)
+
+    def test_wch_reports_a_seed_the_api_does_not_know(self):
+        def http_get(url, *a, **k):
+            return b'{"code": 0, "data": null}' if 'www.wch.cn' in url else self.WCH_LEAF()
+        self.patch(vendor_wch, SEEDS=['CH32V10xRM_PDF.html'])
+        self.assertFalse(self.complete(vendor_wch, http_get))
 
     def test_st_falls_back_to_its_cached_grid(self):
         self.patch(vendor_st, SERIES={'SS1': 'STM32X0'}, CACHE=self.root / 'st')
