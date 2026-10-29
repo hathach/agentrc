@@ -31,7 +31,7 @@ the control block.
   the report's `overflow` says when it is too small.
 - **RTOS hooks.** Per-task tables (load, ready→run, stack) need the RTOS's SystemView trace hooks compiled in (for
   FreeRTOS, in its `FreeRTOSConfig.h`). A build without them still links and records ISRs and user events, and leaves
-  the task tables empty.
+  the scheduling tables empty; task names and stack use appear only if the integration sends task info itself.
 - **Coverage.** Only what the integration wraps is recorded: an ISR or function it does not wrap records nothing, and
   an integration that folds nested ISR entries into one span hides the nesting. The project notes say what theirs
   covers.
@@ -40,6 +40,9 @@ the control block.
   over (five configurations).
 - **`SEGGER_SYSVIEW_LOCK` masks interrupts** around every record, so recorder calls in an interrupt-latency-sensitive
   path add to its latency. Keep a periodic call site cheap.
+- **A record in a USB ISR can be bus time.** On a controller that NAKs until the ISR clears its transfer flag, a
+  traced build's throughput and transfer gaps can differ from the untraced firmware's: compare them only between builds
+  with the same instrumentation, and measure throughput untraced. The project notes name such controllers.
 - **The recorder adds stack**: task stacks sized for an uninstrumented build can overflow.
 - **Named-object ids** are offsets from `SEGGER_SYSVIEW_SetRAMBase()`'s base: a base above the part's SRAM gives
   garbage task and mutex names. Set it to the SRAM origin from the linker script.
