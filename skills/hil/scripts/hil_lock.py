@@ -608,10 +608,10 @@ def _release_receipts(recs, key='receipts') -> list:
 
 def _retained_state(receipt) -> str:
     """'ended' once the session receipt at path `receipt` (esp_session's receipt format) is
-    hil_openocd_esp's, closed after its reviewed end, as `hil_openocd_esp.py end` leaves it on
-    exit 0 (`tool` 'hil_openocd_esp', `closed` true, `cleanup` 'done'), else why not. A receipt
-    kept as a record, not a path, is never reread, so never ended: its board needs a recovery
-    takeover."""
+    hil_openocd_esp's, whole and closed after its reviewed end, as `hil_openocd_esp.py end` leaves
+    it on exit 0 (`tool` 'hil_openocd_esp', its `pid` and `startTime`, `closed` true, `cleanup`
+    'done'), else why not. A receipt kept as a record, not a path, is never reread, so never
+    ended: its board needs a recovery takeover."""
     if not isinstance(receipt, str):
         return 'not a receipt path, so never proven ended'
     try:
@@ -624,7 +624,12 @@ def _retained_state(receipt) -> str:
         return f'unreadable ({e!r:.80})'
     if not isinstance(rec, dict) or rec.get('tool') != 'hil_openocd_esp':
         return 'not a hil_openocd_esp session receipt'
-    if rec.get('closed') is not True:
+    pid = rec.get('pid')
+    # as hil_openocd_esp_receipt.session_state reads a receipt, which calls one without these unreadable
+    if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 and str(rec.get('startTime')).isdigit()
+            and isinstance(rec.get('closed'), bool)):
+        return 'not a whole session receipt (pid, startTime, closed)'
+    if not rec['closed']:
         return 'not closed'
     return 'ended' if rec.get('cleanup') == 'done' else f'closed with cleanup {rec.get("cleanup")!r:.40}'
 

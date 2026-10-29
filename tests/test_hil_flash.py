@@ -1050,6 +1050,20 @@ class EsptoolRuntime(unittest.TestCase):
         with contextlib.chdir(self.d):
             self.assertEqual(hf.esptool_runtime('./esptool')['exe'], exe)
 
+    def test_a_relative_or_empty_pythonpath_entry_is_refused(self):
+        exe = self.exe()
+        for path in ('pkg', f'{self.d / "pkg"}{os.pathsep}', f'{os.pathsep}{self.d / "pkg"}'):
+            os.environ['PYTHONPATH'] = path
+            with self.subTest(path), contextlib.chdir(self.d), self.assertRaisesRegex(RuntimeError, 'not absolute'):
+                hf.esptool_runtime(exe)
+
+    def test_with_pythonsafepath_no_directory_goes_first(self):
+        (self.d / 'esptool').mkdir()
+        (self.d / 'esptool' / '__init__.py').write_text("__version__ = '9.9.9'\n")   # beside it, which safe_path skips
+        exe = self.exe(name='esptool-cli')
+        os.environ['PYTHONSAFEPATH'] = '1'
+        self.assertEqual(hf.esptool_runtime(exe)['package'], str(self.d / 'pkg' / 'esptool' / '__init__.py'))
+
     def test_a_package_the_helper_sessions_do_not_import_is_refused(self):
         (self.d / 'esptool').mkdir()
         (self.d / 'esptool' / '__init__.py').write_text("__version__ = '9.9.9'\n")   # beside it: first on its path

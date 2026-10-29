@@ -194,8 +194,9 @@ class Context:
         pending until the contract's recovery ends it, so nothing more starts on the board and
         its lock passes to a cleanup holder. `receipts` (JSON values) are the provider's own,
         never rechecked here; the row and the holder's record carry them whole, and the holder
-        releases only once each is a receipt path its provider closed as ended (hil_lock's
-        release predicate). No receipts, no entry; the same detail and receipts are entered once."""
+        releases only once each is a receipt path hil_openocd_esp closed as ended (hil_lock's
+        release predicate); any other provider's keeps the board held. No receipts, no entry;
+        the same detail and receipts are entered once."""
         receipts = list(receipts)
         json.dumps(receipts)          # a TypeError now, not a finalization failure later
         entry = {'cmd': detail, 'cleanup': 'pending', 'receipt': None, 'retained': receipts}

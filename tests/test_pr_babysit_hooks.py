@@ -14,7 +14,7 @@ from unittest import mock
 
 import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'hooks.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_hooks', SCRIPT)
@@ -79,9 +79,7 @@ class HooksTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = Path(tmp.name) / 'repo'
         self.repo.mkdir()
-        self.env = {**os.environ, 'PRE_COMMIT_HOME': str(Path(tmp.name) / 'cache'),
-                    'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
-                    'GIT_COMMITTER_EMAIL': 't@t'}
+        self.env = git_env(PRE_COMMIT_HOME=str(Path(tmp.name) / 'cache'))
         self.git('init', '-q')
         (self.repo / 'hooks').mkdir()
         for name, body in SCRIPTS.items():

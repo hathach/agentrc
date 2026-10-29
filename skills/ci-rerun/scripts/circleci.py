@@ -26,6 +26,10 @@ import re
 import subprocess
 import sys
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import gh_repo  # noqa: E402
 
 UUID = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 # Lines kept of one step's output; past it the output is cut, so not whole.
@@ -123,17 +127,16 @@ def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('command', choices=['rerun', 'log'])
     p.add_argument('jobs', nargs='+', type=int, metavar='job-number')
-    p.add_argument('--repo', help='OWNER/NAME (default: gh repo view)')
+    p.add_argument('--repo', help="OWNER/NAME (default: the one GitHub repository the checkout's remotes name)")
     p.add_argument('--lines', type=int, default=150)
     a = p.parse_args(argv)
     repo = a.repo
     if not repo:
-        done = subprocess.run(['gh', 'repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'],
-                              capture_output=True, encoding='utf-8', errors='replace')
-        if done.returncode != 0:
-            print(f'circleci.py: {done.stderr.strip()}', file=sys.stderr)
+        try:
+            repo = gh_repo.checkout_repo()
+        except gh_repo.Unresolved as e:
+            print(f'circleci.py: {e}: name the repository (--repo OWNER/NAME)', file=sys.stderr)
             return 2
-        repo = done.stdout.strip()
     if a.command == 'log' and len(a.jobs) != 1:
         p.error('log takes one job number')
     try:

@@ -8,8 +8,8 @@ description: Review a pull request, mostly another contributor's - run the pr-re
 This file is the launcher's recipe, run in the interactive session the human
 talks to. The normal run hands the pinned PR to a headless `chief`, which
 runs the hardware and the workflow; an interactive session may run the same
-steps itself. Every script but `result.py` takes `--repo O/R` (default: `gh
-repo view`). Scripts print one JSON line, the last on stdout; `{"error"}` with
+steps itself. Every script but `result.py` takes `--repo O/R` (default: the
+one GitHub repository the checkout's remotes name). Scripts print one JSON line, the last on stdout; `{"error"}` with
 exit 2 means the facts could not be read, and nothing is filled in.
 
 ```bash

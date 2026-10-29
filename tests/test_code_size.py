@@ -21,6 +21,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -1141,9 +1142,11 @@ class BuildOutput(ProfileCase):
                             os.kill(child, signal.SIGKILL)
 
     def test_a_command_ignoring_sigterm_is_killed_after_the_grace(self):
+        start = time.monotonic()
         with mock.patch.object(sd, 'TERMINATE_GRACE', 0.5):
             ret = sd.run(['sh', '-c', "trap '' TERM; while :; do sleep 0.1; done"], timeout=1)
         self.assertEqual(ret.returncode, 124)
+        self.assertLess(time.monotonic() - start, 30, '#330: 301 s on windows-2022')
 
     @posix_only
     def test_a_child_holding_the_pipes_after_the_kill_does_not_hang_it(self):
@@ -1363,13 +1366,23 @@ class WindowsHost(ProfileCase):
         self.assertEqual(sd._relative_key(r'cdc_msc.dir\D_\A\TinyUSB\src\Device\usbd.c.obj',
                                           ['/nomatch/', '/a/tinyusb/src/']), 'Device/usbd.c')
 
-
     def test_a_timeout_kills_the_command_tree(self):
-        with mock.patch('subprocess.run') as taskkill:
+        def kill_tree(proc, timeout, total=False):
+            proc.kill()
+            return proc.wait(timeout)
+        with mock.patch.object(sd.windows, 'kill_tree', side_effect=kill_tree) as killed:
             ret = sd.run([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.5)
         self.assertEqual(ret.returncode, 124)
-        argv = taskkill.call_args.args[0]
-        self.assertEqual(argv[:2] + argv[3:], ['taskkill', '/PID', '/T', '/F'])
+        self.assertEqual((killed.call_args.args[1:], killed.call_args.kwargs), ((sd.TASKKILL_S + sd.KILL_DRAIN,), {'total': True}))
+
+    def test_a_failed_tree_kill_keeps_the_timeout(self):
+        def kill_tree(proc, timeout, total=False):
+            proc.kill()
+            proc.wait(timeout)
+            raise PermissionError('access denied')
+        with mock.patch.object(sd.windows, 'kill_tree', side_effect=kill_tree):
+            ret = sd.run([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=0.5)
+        self.assertEqual(ret.returncode, 124)
 
     @unittest.skipUnless(os.name == 'nt', 'a real Windows process tree')
     def test_a_timeout_stops_a_grandchild_holding_the_pipes(self):
@@ -1393,6 +1406,36 @@ class WindowsHost(ProfileCase):
             if pid.isdigit():
                 subprocess.run(['taskkill', '/PID', pid, '/F'], capture_output=True)
 
+
+    @unittest.skipUnless(os.name == 'nt', 'a real Windows process tree')
+    def test_a_timeout_returns_while_a_grandchild_the_tree_kill_missed_holds_the_output(self):
+        # #330: taskkill cut off (or failing) stops only the direct child; what it missed keeps the output open
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp, 'pid')
+            parent = ('import subprocess, sys, time; '
+                      'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], '
+                      'stdout=sys.stdout, stderr=sys.stderr); '
+                      f'open({str(pidfile)!r}, "w").write(str(p.pid)); print("out", flush=True); time.sleep(60)')
+            real_run, got = subprocess.run, {}
+
+            def taskkill_fails(argv, *a, **kw):
+                if os.path.basename(argv[0]).lower() == 'taskkill.exe':
+                    return subprocess.CompletedProcess(argv, 128, b'', b'')
+                return real_run(argv, *a, **kw)
+            worker = threading.Thread(target=lambda: got.update(ret=sd.run([sys.executable, '-c', parent], timeout=5)),
+                                      daemon=True)
+            try:
+                with mock.patch.object(subprocess, 'run', taskkill_fails):
+                    worker.start()
+                    worker.join(40)   # the watchdog: before the fix run() waited out the grandchild's 60 s
+                self.assertFalse(worker.is_alive(), 'run() is still waiting on the output the grandchild holds')
+                ret = got['ret']
+                self.assertEqual((ret.returncode, ret.stdout), (124, 'out\n'))
+                self.assertIn('Command timed out after 5s', ret.stderr)
+            finally:
+                if pidfile.exists():
+                    subprocess.run(['taskkill', '/PID', pidfile.read_text(), '/F'], capture_output=True)
+                worker.join(70)
 
     def test_a_path_on_another_drive_is_shown_absolute(self):
         with mock.patch('os.path.relpath', side_effect=ValueError('path is on mount C:, start on mount D:')):

@@ -58,6 +58,10 @@ class ConsoleCaptureTest(unittest.TestCase):
     def feed(self, *parts, delay=0.3):
         def go():
             time.sleep(delay)
+            # bytes that reach the line discipline before the capture's raw switch are cooked (\r to \n)
+            deadline = time.monotonic() + 10
+            while not self.slave_is_raw() and time.monotonic() < deadline:
+                time.sleep(0.01)
             for part in parts:
                 os.write(self.master, part)
                 time.sleep(0.1)
@@ -65,8 +69,16 @@ class ConsoleCaptureTest(unittest.TestCase):
         t.start()
         self.addCleanup(t.join)
 
+    def slave_is_raw(self):
+        try:
+            iflag, _, _, lflag = termios.tcgetattr(self.slave)[:4]
+        except termios.error:
+            return False
+        return not (iflag & termios.ICRNL or lflag & termios.ICANON)
+
     def test_bytes_times_marks_and_restored_settings(self):
         before = termios.tcgetattr(self.slave)
+        self.assertFalse(self.slave_is_raw())
         self.feed(b'ESP-ROM:esp32p4\r\nrst:0x17 (CHIP_USB_UART_RESET)\r\n', b'\x00\xff binary\n')
         rc, out, err = self.run_cli('--seconds', '1.5', '--lines', 'leave', '--mark', r'rst:0x[0-9a-f]+')
         self.assertEqual(rc, 0, err)
@@ -75,11 +87,15 @@ class ConsoleCaptureTest(unittest.TestCase):
         self.assertEqual(out['bytes'], len(data))
         self.assertEqual(out['ended'], 'time')
         self.assertEqual(out['baseline'], 'the open')
-        self.assertGreater(out['firstByteAt'], 0.1)
         self.assertIsNone(out['lines']['afterSetup'])    # a pty has no modem lines
         self.assertTrue(out['terminalRestored'])
         times = [json.loads(line) for line in Path(out['times']).read_text().splitlines()]
         self.assertEqual(sum(t['len'] for t in times), len(data))
+        # no wall-clock floor: under load the capture may open after the feed's delay; it writes at the raw switch
+        self.assertEqual(out['firstByteAt'], times[0]['t'])
+        stamps = [t['t'] for t in times]
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertGreaterEqual(stamps[0], 0)
         self.assertEqual(out['marks'], [{'pattern': r'rst:0x[0-9a-f]+', 'offset': 17, 't': times[0]['t'],
                                          'text': 'rst:0x17'}])
         self.assertEqual(termios.tcgetattr(self.slave), before)

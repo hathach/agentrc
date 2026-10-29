@@ -33,6 +33,7 @@ Exit: 0 recorded and exported; 2 bad usage or a GUI request off Linux; 3 decodin
 an export failed, or a signal stopped the run (record.json says which).
 """
 import argparse
+import contextlib
 import datetime
 import json
 import os
@@ -143,6 +144,21 @@ def group_gone(proc, timeout):
             return True
         time.sleep(0.05)
     return False
+
+
+@contextlib.contextmanager
+def held_stops():
+    """Stop signals held while a cleanup runs and delivered once it is done: one raised inside it would leave the
+    groups it had not stopped yet running, each in a session of its own. A cleanup that fails keeps its own error."""
+    held = []
+    previous = {sig: signal.signal(sig, lambda signum, _frame: held.append(signum)) for sig in ps.STOP_SIGNALS}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if held:
+        signal.raise_signal(held[0])
 
 
 def stop_group(proc):
@@ -383,26 +399,27 @@ class SystemView:
         when SystemView dies inside a transaction, hence the -quit first. Failure naming a group that outlived
         SIGKILL, once everything else is cleaned up."""
         left = []
-        try:
-            if self.sv:
-                if self.owned and self.sv.poll() is None:
-                    try:
-                        self.send('-quit')
-                        self.sv.wait(QUIT_S)
-                    except (OSError, Failure, subprocess.TimeoutExpired):
-                        pass
-                if not stop_group(self.sv):
-                    left.append(f'SystemView (group {self.sv.pid})')
-        finally:
+        with held_stops():
             try:
-                if self.xvfb and not stop_group(self.xvfb):
-                    left.append(f'Xvfb (group {self.xvfb.pid})')
+                if self.sv:
+                    if self.owned and self.sv.poll() is None:
+                        try:
+                            self.send('-quit')
+                            self.sv.wait(QUIT_S)
+                        except (OSError, Failure, subprocess.TimeoutExpired):
+                            pass
+                    if not stop_group(self.sv):
+                        left.append(f'SystemView (group {self.sv.pid})')
             finally:
-                if self.log:
-                    self.log.close()
-                shutil.rmtree(self.home, ignore_errors=True)
-        if left:
-            raise Failure(f"still running after SIGKILL: {', '.join(left)}")
+                try:
+                    if self.xvfb and not stop_group(self.xvfb):
+                        left.append(f'Xvfb (group {self.xvfb.pid})')
+                finally:
+                    if self.log:
+                        self.log.close()
+                    shutil.rmtree(self.home, ignore_errors=True)
+            if left:
+                raise Failure(f"still running after SIGKILL: {', '.join(left)}")
 
 
 def exports(out, a):
@@ -454,9 +471,10 @@ def record_live(sv, out, a, record):
         record['recordingEnd'] = now()
     finally:
         if workload:
-            ended = 'exited' if workload.poll() is not None else 'deadline'
-            stopped = stop_group(workload)
-            record['workload'].update(exit=workload.returncode, ended=ended, stopped=stopped)
+            with held_stops():
+                ended = 'exited' if workload.poll() is not None else 'deadline'
+                stopped = stop_group(workload)
+                record['workload'].update(exit=workload.returncode, ended=ended, stopped=stopped)
             if not stopped:
                 failure = Failure(f'the workload (group {workload.pid}) outlived SIGKILL')
             elif ended == 'exited' and workload.returncode != 0:

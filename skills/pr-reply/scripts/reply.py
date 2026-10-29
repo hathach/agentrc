@@ -40,7 +40,8 @@ be fetched. `reply.py --digest TEXT` prints TEXT's digest for a manifest
 written by hand. Exit 0 when every reply is verified and, for a review
 reply, resolved; 1 otherwise, a failed comment lookup (an inaccessible --repo or a
 rate limit included) being a receipt's error; 2 on a usage or manifest error, or
-when finding the repo (gh repo view) or our login (gh api user) fails, with
+when finding the repo (the one GitHub repository the checkout's remotes name,
+lib/gh_repo.py) or our login (gh api user) fails, with
 {"error": ...} as the last stdout line. A manifest posts nothing while our login
 holds a PENDING review on the PR, which GitHub refuses review replies beside:
 exit 2 with the error "pending review <id> of <login> on PR #<N> blocks
@@ -100,6 +101,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import comment_digest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import gh_repo  # noqa: E402
 from seal import RATE_LIMITED, fnv1a, sealed  # noqa: E402
 
 THREADS_QUERY = ('query($o:String!,$r:String!,$p:Int!,$c:String){repository(owner:$o,name:$r){'
@@ -565,7 +567,7 @@ def main(argv=None):
     mode.add_argument('--inspect', nargs='+', type=pair, metavar='COMMENT[:REPLY]')
     mode.add_argument('--reuse', metavar='FILE')
     mode.add_argument('--edit', metavar='FILE')
-    p.add_argument('--repo', help='OWNER/NAME (default: gh repo view)')
+    p.add_argument('--repo', help="OWNER/NAME (default: the one GitHub repository the checkout's remotes name)")
     p.add_argument('--digest', metavar='TEXT', help='print the digest of TEXT and exit')
     p.add_argument('--receipt', metavar='PATH', help='replay the receipt saved at PATH, else save this run\'s there')
     a = p.parse_args(argv)
@@ -590,10 +592,10 @@ def main(argv=None):
         return saved[1]
     repo = a.repo
     if not repo:
-        rc, out, err = gh(['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'])
-        if rc != 0:
-            return failed(err.strip())
-        repo = out.strip()
+        try:
+            repo = gh_repo.checkout_repo()
+        except gh_repo.Unresolved as e:
+            return failed(f'{e}: name the repository (--repo OWNER/NAME)')
     try:
         poster = Poster(repo, a.pr)
     except ApiError as e:

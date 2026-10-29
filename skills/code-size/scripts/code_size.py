@@ -89,9 +89,13 @@ import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 
-FILES = ()
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), '..', '..', '..', 'lib'))
+import windows  # noqa: E402
+
+FILES = ('lib/windows.py',)   # imported from the checkout's lib/
 WINDOWS = os.name == 'nt'
 if WINDOWS:
     import msvcrt
@@ -965,6 +969,7 @@ def filter_arg(path):
 verbose = False
 TERMINATE_GRACE = 10  # s a timed-out command gets to exit on SIGTERM before SIGKILL
 KILL_DRAIN = 1  # s to read what a killed command left in its pipes
+TASKKILL_S = 10  # s taskkill gets to stop a Windows command's tree
 
 
 def run(cmd, timeout=None):
@@ -978,38 +983,56 @@ def run(cmd, timeout=None):
         raise TypeError('run() requires a list, got str — fix the caller')
     if verbose:
         print(f'  $ {" ".join(shlex.quote(str(c)) for c in cmd)}')
+    if WINDOWS:
+        return _run_nt(cmd, timeout)
     # a group of its own, so a stop reaches what a wrapper (a project's build script) started, not only the wrapper
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=not WINDOWS,
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
                           encoding='utf-8', errors='replace') as proc:
         try:
             out, err = proc.communicate(timeout=timeout)
         except BaseException as stopped:
-            if WINDOWS:  # terminate() and kill() stop only the command, not ninja's compilers
-                with contextlib.suppress(OSError, subprocess.SubprocessError):
-                    subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
-                                   capture_output=True, timeout=TERMINATE_GRACE)
             # SIGTERM lets ninja stop its jobs, which it runs in process groups of their own;
             # a descendant can outlive the SIGKILL holding the pipes open, so stop reading then
-            kill = getattr(signal, 'SIGKILL', signal.SIGTERM)  # Windows: both are TerminateProcess
-            for sig, wait in ((signal.SIGTERM, TERMINATE_GRACE), (kill, KILL_DRAIN)):
-                if WINDOWS:
-                    proc.send_signal(sig)
-                else:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(proc.pid, sig)
+            for sig, wait in ((signal.SIGTERM, TERMINATE_GRACE), (signal.SIGKILL, KILL_DRAIN)):
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, sig)
                 try:
                     out, err = proc.communicate(timeout=wait)
                     break
                 except subprocess.TimeoutExpired as e:
                     out, err = ((b or b'').decode(errors='replace') for b in (e.stdout, e.stderr))
-            if not WINDOWS:  # what ignored SIGTERM may outlive the command without holding its pipes
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(proc.pid, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):  # what ignored SIGTERM may outlive the command
+                os.killpg(proc.pid, signal.SIGKILL)
             if not isinstance(stopped, subprocess.TimeoutExpired):
                 raise
-            msg = f'Command timed out after {timeout}s: {" ".join(shlex.quote(str(c)) for c in cmd)}'
-            return subprocess.CompletedProcess(cmd, 124, stdout=out, stderr=err + ('\n' if err else '') + msg)
+            return _timed_out(cmd, timeout, out, err)
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout=out, stderr=err)
+
+
+def _run_nt(cmd, timeout):
+    """run() on Windows. The output goes to files: a descendant the tree kill missed may hold it open, and a pipe it
+    held would keep Popen's reader threads, and so run(), waiting for its exit (#330). No wait is unbounded."""
+    def text(f):
+        f.seek(0)
+        return f.read()
+    # decoded as Popen's text mode would: UTF-8 with replacement, universal newlines
+    with tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as out, \
+            tempfile.TemporaryFile('w+', encoding='utf-8', errors='replace') as err:
+        proc = subprocess.Popen(cmd, stdout=out, stderr=err)
+        try:
+            proc.communicate(timeout=timeout)
+        except BaseException as stopped:
+            with contextlib.suppress(OSError):  # the stop being handled outranks a failed kill
+                windows.kill_tree(proc, TASKKILL_S + KILL_DRAIN, total=True)   # ninja's compilers too
+            if not isinstance(stopped, subprocess.TimeoutExpired):
+                raise
+            return _timed_out(cmd, timeout, text(out), text(err))
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout=text(out), stderr=text(err))
+
+
+def _timed_out(cmd, timeout, out, err):
+    msg = f'Command timed out after {timeout}s: {" ".join(shlex.quote(str(c)) for c in cmd)}'
+    return subprocess.CompletedProcess(cmd, 124, stdout=out, stderr=err + ('\n' if err else '') + msg)
 
 
 def exit_on_termination():

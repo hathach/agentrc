@@ -9,15 +9,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'commits.py'
 spec = importlib.util.spec_from_file_location('pr_babysit_commits', SCRIPT)
 commits = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(commits)
 
-ENV = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't',
-       'GIT_COMMITTER_EMAIL': 't@t'}
+ENV = git_env()
 # Names git quotes outside -z; NTFS forbids " and a newline, so Windows takes non-ASCII ones git quotes too.
 QUOTED = 'src/quote"name.c' if os.name != 'nt' else 'src/naïve name.c'
 NEWLINE = 'c\nd.c' if os.name != 'nt' else 'cé d.c'
@@ -84,7 +83,7 @@ class CommitsTest(unittest.TestCase):
         self.git('mv', 'a.c', 'b.c')
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(self.repo)
-        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}, clear=True):
+        with mock.patch.dict(os.environ, git_env(), clear=True):
             self.assertEqual(status(), ['R  b.c', 'a.c', '?? [ab].c', '?? new/x.c', '?? new/y.c'])
             self.assertEqual(status('[ab].c'), ['?? [ab].c'], 'a pathspec is literal, never a glob over b.c')
             self.assertEqual(status('new'), ['?? new/x.c', '?? new/y.c'])

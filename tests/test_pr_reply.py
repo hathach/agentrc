@@ -8,11 +8,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import chdir, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import git_env, guard_survivors, remotes_checkout  # noqa: E402
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-reply' / 'scripts' / 'reply.py'
 spec = importlib.util.spec_from_file_location('pr_reply', SCRIPT)
@@ -687,6 +687,27 @@ class ReceiptFileTest(ReplyCase):
         with redirect_stdout(out), redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             reply.main(['--pr', str(PR), '--repo', REPO, '--inspect', '10', '--receipt', os.path.join(self.tmp, 'x')])
         self.assertEqual(json.loads(out.getvalue()), {'error': 'usage: --receipt is for --manifest, --reuse and --edit'})
+
+
+class DefaultRepoTest(ReplyCase):
+    def run_without_repo(self, *remotes):
+        out = io.StringIO()
+        with chdir(remotes_checkout(self, *remotes)), redirect_stdout(out), redirect_stderr(io.StringIO()), \
+                mock.patch.dict(os.environ, git_env(), clear=True):
+            rc = reply.main(['--pr', str(PR), '--inspect', '10:25'])
+        return rc, json.loads(out.getvalue().strip().splitlines()[-1])
+
+    def test_without_repo_the_checkouts_one_github_repository_is_named(self):
+        self.gh.review_comment(10)
+        self.gh.review_comment(25, 'deliberately', ME, thread='T10', parent=10)
+        rc, out = self.run_without_repo(('origin', f'https://github.com/{REPO}.git'))
+        self.assertEqual((rc, out['inspected'][0]['body']), (0, 'deliberately'))
+
+    def test_without_repo_several_repositories_refuse_before_any_gh_call(self):
+        rc, out = self.run_without_repo(('origin', 'https://github.com/me/fork.git'), ('upstream', f'https://github.com/{REPO}.git'))
+        self.assertEqual((rc, out), (2, {'error': 'the remotes name 2 GitHub repositories (origin me/fork, upstream o/r) and none '
+                                                  'is marked gh-resolved: name the repository (--repo OWNER/NAME)'}))
+        self.assertEqual(self.gh.calls, [])
 
 
 class SealTest(ReplyCase):

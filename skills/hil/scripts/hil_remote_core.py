@@ -555,6 +555,10 @@ def _fetch(tree, members, into):
         p = subprocess.Popen(ssh_argv(tree.host, cmd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err)
         try:
             status = read_fetch(p.stdout, members, into)
+            # read_fetch stops at the end-of-archive blocks; closing before the padding the rig still
+            # writes would fail its flush, and a complete copy-back would read as transport
+            while status is not None and p.stdout.read(65536):
+                pass
         finally:
             p.stdout.close()
             rc = p.wait()

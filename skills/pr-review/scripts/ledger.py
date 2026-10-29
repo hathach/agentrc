@@ -59,9 +59,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'pr-babysit' / 'scripts'))
-from facts import FULL_SHA, Parser, Unusable, git, locked, report, run  # noqa: E402
+from facts import FULL_SHA, Parser, Unusable, git, locked, report  # noqa: E402
 from launch_result import load_output  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))
+import gh_repo  # noqa: E402
 import windows  # noqa: E402
 
 VERSION = 2
@@ -108,10 +109,13 @@ def refuse_off_scale(result):
 
 def repo_of(repo):
     if repo:
-        if not re.fullmatch(r'[\w.-]+/[\w.-]+', repo):
+        if not gh_repo.REPO.match(repo):
             raise Unusable(f'--repo must be OWNER/NAME, not {repo!r}')
         return repo
-    return run('gh', 'repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner')[1].strip()
+    try:
+        return gh_repo.checkout_repo()
+    except gh_repo.Unresolved as e:
+        raise Unusable(f'{e}: name the repository (--repo OWNER/NAME)') from None
 
 
 def ledger_dir(repo):

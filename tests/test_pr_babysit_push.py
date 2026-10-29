@@ -13,12 +13,10 @@ from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'skills' / 'pr-babysit' / 'scripts' / 'push.py'
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors, run_gh_as  # noqa: E402
+from helpers import git_env, guard_survivors, run_gh_as  # noqa: E402
 spec = importlib.util.spec_from_file_location('pr_babysit_push', SCRIPT)
 push = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(push)
-
-ENV = {'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
 
 
 def setUpModule():
@@ -30,7 +28,7 @@ class PushTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.root = Path(tmp.name)
-        self.enterContext(mock.patch.dict(os.environ, ENV))
+        self.enterContext(mock.patch.dict(os.environ, git_env(), clear=True))
         self.enterContext(mock.patch.object(push, 'PR_WAIT', 0))
         self.enterContext(run_gh_as(self.root / 'gh.py'))
         self.a, self.b = str(self.root / 'a.git'), str(self.root / 'b.git')
