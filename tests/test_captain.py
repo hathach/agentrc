@@ -741,11 +741,16 @@ class RelayCase(LedgerCase):
             f.write(json.dumps(entry) + '\n')
         return uid
 
+    def digest(self, text, panes):
+        """The digest of text to the sessions in panes now."""
+        return captain.digest(text, captain.pins({pane: captain.find(pane) for pane in panes}))
+
     def relay(self, entry, *panes, digest=None):
-        """Send entry to panes with digest, by default the digest of entry's words as written."""
-        digest = digest or captain.digest(self.words[entry] or '')
+        """Send entry to panes with digest, by default the digest of entry's words as written to those panes."""
+        panes = list(panes or ['w2:p1'])
+        digest = digest or self.digest(self.words[entry] or '', panes)
         with mock.patch('builtins.print') as out:
-            captain.relay(list(panes or ['w2:p1']), entry, digest, self.ident)
+            captain.relay(panes, entry, digest, self.ident)
         return [c.args[0] for c in out.call_args_list]
 
     def preview(self, *targets):
@@ -765,7 +770,7 @@ class RelayTest(RelayCase):
         self.say('older')
         uid = self.say('merge o/r#12')
         shown = self.preview('w2:p1', 'w9:p9')
-        self.assertIn(f'entry {uid} digest {captain.digest("merge o/r#12")}\nmerge o/r#12', shown)
+        self.assertIn(f'entry {uid} digest {self.digest("merge o/r#12", ["w2:p1", "w9:p9"])}\nmerge o/r#12', shown)
         self.assertIn('to w2:p1: ws · name · w2:p1', shown)
         self.assertIn('to w9:p9: no such agent pane', shown)
         self.assertEqual((self.typed, captain.records()), ([], []))
@@ -847,7 +852,7 @@ class RelayTest(RelayCase):
 
         def run():
             start.wait()
-            captain.relay(['w2:p1'], uid, captain.digest('merge o/r#12'), self.ident)
+            captain.relay(['w2:p1'], uid, self.digest('merge o/r#12', ['w2:p1']), self.ident)
         concurrently(run)
         self.assertEqual(len(self.typed), 1)
         self.assertEqual(self.count('relay'), 1)
@@ -915,9 +920,8 @@ class RelayTest(RelayCase):
             captain.records()
 
 
-class AddressingTest(RelayCase):
-    """An opening `tell <name>... [to]` naming exactly the relay's targets is not sent; any other opening `tell`
-    refuses at preview, and the send sends only what the preview showed."""
+class AddressedCase(RelayCase):
+    """Two live sessions besides the captain, in workspaces labelled code and docs."""
 
     def setUp(self):
         super().setUp()
@@ -938,6 +942,11 @@ class AddressingTest(RelayCase):
         with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
             captain.preview(captain.resolve(list(panes)), self.ident)
         return '\n'.join(c.args[0] for c in out.call_args_list if c.kwargs.get('file') is sys.stderr)
+
+
+class AddressingTest(AddressedCase):
+    """An opening `tell <name>... [to]` naming exactly the relay's targets is not sent; any other opening `tell`
+    refuses at preview, and the send sends only what the preview showed."""
 
     def test_the_addressing_is_stripped_and_the_preview_is_what_is_sent(self):
         text, entry, digest = self.shown('tell code to merge 318', 'w2:p1')
@@ -999,7 +1008,7 @@ class AddressingTest(RelayCase):
 
     def test_an_unresolved_recipient_refuses_the_send_too(self):
         uid = self.say('tell code, w9:p1 to merge 318')
-        for digest in (captain.digest('w9:p1 to merge 318'), captain.digest('merge 318')):
+        for digest in (self.digest('w9:p1 to merge 318', ['w2:p1']), self.digest('merge 318', ['w2:p1'])):
             with self.subTest(digest), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
                 self.relay(uid, 'w2:p1', digest=digest)
         self.assertEqual(self.typed, [])
@@ -1019,10 +1028,153 @@ class AddressingTest(RelayCase):
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             captain.relay(['w2:p1'], entry, None, self.ident)
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
-            self.relay(entry, 'w2:p1', digest=captain.digest('tell code to merge 318'))
+            self.relay(entry, 'w2:p1', digest=self.digest('tell code to merge 318', ['w2:p1']))
         self.panes['w2:p1'] = {**self.panes['w2:p1'], 'workspace': 'renamed'}
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             self.relay(entry, 'w2:p1', digest=digest)
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+
+class BroadcastTest(AddressedCase):
+    """`tell all|everyone|every session to|:` is stripped only when the targets are exactly the live sessions, at
+    the preview and again at the send."""
+
+    EVERY = ('w2:p1', 'w3:p1')
+
+    def test_tell_all_previews_and_sends_to_every_live_session(self):
+        text, entry, digest = self.shown('tell all to continue', *self.EVERY)
+        self.assertEqual(text, 'continue')
+        lines = self.relay(entry, *self.EVERY, digest=digest)
+        self.assertTrue(all(line.endswith('delivered') for line in lines), lines)
+        self.assertEqual(sorted(pane for pane, _ in self.typed), list(self.EVERY))
+        self.assertEqual([r['quote'] for r in captain.records() if r['type'] == 'relay'], ['continue'] * 2)
+
+    def test_every_spelling_of_all(self):
+        cases = [('tell all sessions to continue', 'continue'), ('tell all session to continue', 'continue'),
+                 ('Tell ALL: continue', 'continue'), ('tell all:continue', 'continue'),
+                 ('tell everyone:continue', 'continue'), ('tell everyone to continue', 'continue'),
+                 ('tell every session: continue', 'continue'), ('tell all to rebase\nthen push', 'rebase\nthen push')]
+        for words, want in cases:
+            with self.subTest(words):
+                self.assertEqual(self.shown(words, *self.EVERY)[0], want)
+
+    def test_a_qualified_or_mixed_all_refuses_at_preview(self):
+        cases = [('tell all tinyusb sessions to merge', 'not as "all'),
+                 ('tell all and code to merge', 'not as "all'),
+                 ('tell all, code to merge', 'not one to join'),
+                 ('tell all continue', 'not as "all'),
+                 ('tell every sessions to merge', 'not as "all'),
+                 ('tell code and all to merge', 'not one to join'),
+                 ('tell all to   ', 'nothing follows'),
+                 ('tell everyone:', 'nothing follows')]
+        for words, why in cases:
+            with self.subTest(words):
+                why_not = self.refused(words, *self.EVERY)
+                self.assertIn(why, why_not)
+                self.assertIn('ask the human to restate it', why_not)
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_all_joined_to_a_name_refuses(self):
+        for words in ('tell code, everyone: continue', 'tell code, all to continue', 'tell code & every: go'):
+            with self.subTest(words):
+                self.assertIn('not one to join', self.refused(words, 'w2:p1'))
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.relay(['w2:p1'], self.say('tell code, everyone: continue'), 'any', self.ident)
+        self.assertIn('not one to join', out.call_args.args[0])
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_all_joined_to_a_name_refuses_even_as_a_label(self):
+        self.panes['w4:p1'] = {**pinned('w4:p1'), 'workspace': 'all'}
+        self.assertIn('not one to join', self.refused('tell code and all to merge', 'w2:p1', 'w4:p1'))
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_all_needs_exactly_the_live_sessions(self):
+        for panes, why in ((['w2:p1'], 'not targeted: w3:p1'), ([*self.EVERY, 'w9:p9'], 'not live: w9:p9')):
+            with self.subTest(panes):
+                why_not = self.refused('tell all to continue', *panes)
+                self.assertIn(why, why_not)
+                self.assertIn('preview again', why_not)
+                self.assertNotIn('restate', why_not)
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_no_target_or_no_live_session_is_not_every_session(self):
+        live = captain.everyone()
+        for panes, sessions in (([], live), (['w2:p1'], []), ([], [])):
+            with self.subTest(panes=panes, live=len(sessions)):
+                text, why = captain.instruction('tell all to continue', panes, sessions, [])
+                self.assertIsNone(text)
+                self.assertIsInstance(why, captain.Stale)
+
+    def test_a_session_opening_or_closing_after_the_preview_refuses_the_send(self):
+        _, entry, digest = self.shown('tell all to continue', *self.EVERY)
+        self.panes['w4:p1'] = pinned('w4:p1')
+        for panes in (self.EVERY, (*self.EVERY, 'w4:p1')):
+            with self.subTest(panes), self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+                self.relay(entry, *panes, digest=digest)
+        del self.panes['w4:p1'], self.panes['w3:p1']
+        with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
+            self.relay(entry, *self.EVERY, digest=digest)
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_a_session_replaced_in_a_pane_after_the_preview_refuses_the_send(self):
+        _, entry, digest = self.shown('tell all to continue', *self.EVERY)
+        self.panes['w3:p1'] = {**self.panes['w3:p1'], 'pid': 11, 'started': 21, 'session': 's-new'}
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.relay(list(self.EVERY), entry, digest, self.ident)
+        self.assertIn('preview again', out.call_args.args[0])
+        self.assertEqual((self.typed, captain.records()), ([], []))
+
+    def test_a_session_replaced_during_the_send_is_refused(self):
+        _, entry, digest = self.shown('tell all to continue', *self.EVERY)
+
+        def replace_w3(pane, text):
+            self.panes['w3:p1'] = {**self.panes['w3:p1'], 'pid': 11, 'started': 21, 'session': 's-new'}
+            return self._submit(pane, text)
+        with mock.patch.object(captain, 'submit', replace_w3):
+            lines = self.relay(entry, *self.EVERY, digest=digest)
+        self.assertTrue(lines[0].endswith('delivered'))
+        self.assertIn('not the one the preview showed', lines[1])
+        self.assertEqual([pane for pane, _ in self.typed], ['w2:p1'])
+
+    def test_a_name_that_is_also_a_session_refuses(self):
+        self.panes['w3:p1'] = {**pinned('w3:p1'), 'workspace': 'all'}
+        for words in ('tell all to merge', 'tell all:merge'):
+            with self.subTest(words):
+                self.assertIn('also names a session', self.refused(words, *self.EVERY))
+        self.assertEqual(self.shown('tell ws:all to merge', 'w3:p1')[0], 'merge')
+
+    def test_a_working_session_is_a_target_refused_at_the_send_and_retried(self):
+        self.panes['w3:p1'] = {**self.panes['w3:p1'], 'status': 'working'}
+        text, entry, digest = self.shown('tell all to continue', *self.EVERY)
+        self.assertIn('(working)', self.preview(*self.EVERY))
+        first = self.relay(entry, *self.EVERY, digest=digest)
+        self.assertTrue(first[0].endswith('delivered'))
+        self.assertIn('working', first[1])
+        self.panes['w3:p1'] = {**self.panes['w3:p1'], 'status': 'idle'}
+        again = self.relay(entry, *reversed(self.EVERY), digest=digest)   # target order does not matter
+        self.assertTrue(again[0].endswith('delivered'))
+        self.assertIn('already', again[1])
+        self.assertEqual([pane for pane, _ in self.typed], ['w2:p1', 'w3:p1'])
+
+
+class DigestTest(AddressedCase):
+    """The preview's digest covers the target panes too, so a send goes only where the preview showed."""
+
+    def test_an_unaddressed_message_goes_only_to_the_previewed_panes(self):
+        _, entry, digest = self.shown('merge 318', 'w2:p1')
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.relay(['w2:p1', 'w3:p1'], entry, digest, self.ident)
+        self.assertIn('panes', out.call_args.args[0])
+        self.assertEqual(self.typed, [])
+        self.assertTrue(self.relay(entry, 'w2:p1', digest=digest)[0].endswith('delivered'))
+
+    def test_a_name_moved_to_another_pane_after_the_preview_refuses(self):
+        _, entry, digest = self.shown('tell code to merge 318', 'w2:p1')
+        self.panes['w2:p1'] = {**self.panes['w2:p1'], 'workspace': 'other'}
+        self.panes['w3:p1'] = {**self.panes['w3:p1'], 'workspace': 'code'}
+        with self.assertRaises(SystemExit), mock.patch('builtins.print') as out:
+            captain.relay(['w3:p1'], entry, digest, self.ident)
+        self.assertIn('not the ones the preview showed', out.call_args.args[0])
         self.assertEqual((self.typed, captain.records()), ([], []))
 
 
@@ -1093,7 +1245,7 @@ class SelectorTest(RelayCase):
         self.say('merge o/r#12')
         with mock.patch('builtins.print') as out:
             captain.preview(captain.resolve(['pr:12']), self.ident)
-        self.assertIn('to pr:12: ws · name · w2:p1', [c.args[0] for c in out.call_args_list])
+        self.assertIn('to pr:12: ws · name · w2:p1 (idle)', [c.args[0] for c in out.call_args_list])
 
     def test_a_relay_never_takes_a_selector(self):
         self.reported('w2:p1')
