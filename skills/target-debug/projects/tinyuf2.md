@@ -43,9 +43,9 @@ it in the checkout in front of you.**
 
 ## espressif
 
-- The bootloader enumerates as 239a:00a5 on the devkitc (`USB_PID` in its `board.h`, shared with the S2 saola wrover, a
-  TODO there), its USB serial the chip's factory MAC in hex. verified 2026-10-13 2b558bd espressif_esp32s3_devkitc_1:
-  sysfs and `lsusb`.
+- The bootloader enumerates as 303a:7002 on the devkitc (Espressif's allocation, `USB_PID` in its `board.h` since
+  9517e55 #627; 0.35.0 and earlier releases: 239a:00a5), its USB serial the chip's factory MAC in hex. verified
+  2026-10-29 9517e55 espressif_esp32s3_devkitc_1 on htpc: sysfs and `lsusb`.
 - An app enters TinyUF2 with reset hint 0x11F2 (`ports/espressif/README.md`); the second-stage bootloader
   (`bootloader_components/main/bootloader_start.c`, `APP_REQUEST_UF2_RESET_HINT`) honours it only after a software reset
   (`RESET_REASON_CORE_SW`/`CPU0_SW`) from a non-factory boot, then clears it. verified 2026-10-13 2b558bd
@@ -62,17 +62,17 @@ it in the checkout in front of you.**
   stop if both holds cannot be acquired. `ports/espressif/sdkconfig.defaults` and the blinky, dfu_runtime,
   erase_firmware and update_tinyuf2 apps set `CONFIG_FREERTOS_WATCHPOINT_END_OF_STACK=y` (fd60fc5): on a RISC-V port
   under openocd that is the halt storm `espressif.md` describes ("The end-of-stack watchpoint").
-- P4 (`espressif_p4_function_ev`, 8e75969 #532): 239a:00a5 as well (the shared-PID TODO in `board.h`), UF2 board id
+- P4 (`espressif_p4_function_ev`, 8e75969 #532): 303a:7012 since 9517e55 #627 (239a:00a5 before), UF2 board id
   `ESP32P4-FunctionEV-v1.4`, volume `P4FEVBOOT`, button GPIO35. A software restart on the P4 left the OTG HS device
   attached, so the host kept a device that no longer answered and a UF2 copy's `mcopy` hung ~60 s on SCSI resets;
   0ed85c1 (2026-10-14) detaches OTG HS before the restart. verified 2026-10-14 htpc: 10/10 UF2 copies and 5/5 DFU_DETACH
   cycles clean after the fix.
-- S31 (`espressif_esp32s31_func_core`, ba97530 #554, 2026-10-15): 239a:00a5 shared too, board id `ESP32S31-FCB1-v1.0`,
-  button GPIO61, NeoPixel GPIO60. The USB serial is the 6-byte factory MAC via `esp_read_mac(ESP_MAC_EFUSE_FACTORY)`
-  (`esp_efuse_mac_get_default` returns the 8-byte EUI-64 on 802.15.4-capable targets). The P4 detach-before-restart path
-  covers the S31. The second-stage bootloader drives the NeoPixel through dedicated GPIO channel 0 with
-  `NEOPIXEL_T0H_NS=250` (`bootloader_start.c:322-329`). source-checked at ba97530, 2026-10-16; none of it exercised on
-  hardware in this skill's sessions.
+- S31 (`espressif_esp32s31_func_core`, ba97530 #554, 2026-10-15): 239a:00a5, the S2 saola wrover's PID, board id
+  `ESP32S31-FCB1-v1.0`, button GPIO61, NeoPixel GPIO60. The USB serial is the 6-byte factory MAC via
+  `esp_read_mac(ESP_MAC_EFUSE_FACTORY)` (`esp_efuse_mac_get_default` returns the 8-byte EUI-64 on 802.15.4-capable
+  targets). The P4 detach-before-restart path covers the S31. The second-stage bootloader drives the NeoPixel through
+  dedicated GPIO channel 0 with `NEOPIXEL_T0H_NS=250` (`bootloader_start.c:322-329`). source-checked at ba97530,
+  2026-10-16; none of it exercised on hardware in this skill's sessions.
 - S31 commissioning, htpc 2026-10-21, tinyuf2 2346572, esptool 5.3.1 (5.2.0 cannot reach its flash over the USJ):
   chip revision v0.0, uid 30EDA0F40A94, 16 MB flash (0x46/0x4018). `get-security-info` (stub and `--no-stub` ROM) and
   `espefuse summary` read secure boot, flash encryption and secure download off; those field meanings rest on esptool
