@@ -78,9 +78,10 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   otherwise; `board_getchar` checked in fad6bd546.
 - A `LOGGER=rtt` build traps on WCH QingKe (ch32v): the vendored generic lock does (`rtt`, "Buffer modes and locking"),
   so tinyusb needs its own `SEGGER_RTT_LOCK/UNLOCK` there. carried over. tinyusb#4293 added one for `SYSVIEW` builds
-  only, so `LOGGER=rtt` still traps: `hw/bsp/<family>/sysview_rtt_conf.h` in ch32v20x, ch32v30x and ch583
-  (brace-scoped save/restore of CSR 0x800), force-included by its `family.cmake` to win the include-guard race against
-  the vendored conf. ch32v10x refuses `SYSVIEW`: masking CSR 0x800 hung its QingKe V3.
+  only, so a `LOGGER=rtt` build without `SYSVIEW` still traps, while one with `SYSVIEW=1..4` gets the QingKe-safe lock:
+  `hw/bsp/<family>/sysview_rtt_conf.h` in ch32v20x, ch32v30x and ch583 (brace-scoped save/restore of CSR 0x800),
+  force-included by its `family.cmake` to win the include-guard race against the vendored conf. ch32v10x refuses
+  `SYSVIEW` (masking CSR 0x800 hung its QingKe V3), so every `LOGGER=rtt` build there traps.
 
 ## Profiling and trace
 
