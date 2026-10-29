@@ -902,10 +902,12 @@ def unparseable_revisions(docs: list) -> dict:
 # Controller names count unspaced only (USBFS, USBD: all the CH32F103/V103 manual says in
 # the pages a peek reads): "USB HS" is in the ordering legend of every CH32 datasheet, the
 # USB-less CH32V003's included. Chinese datasheets say 全速 USB (full-speed USB) or
-# USB 总线主机和设备控制器 (USB bus host and device controller).
+# USB 总线主机和设备控制器 (USB bus host and device controller). Names are bounded by ASCII
+# identifier characters, not \b: CJK is a word character, so \b misses USBFS控制器.
 USB_EVIDENCE = re.compile(
     r"(?i)universal serial bus|USB OTG|USB[- ]?2\.0|USB full[- ]speed|USB high[- ]speed|"
-    r"\bOTG_[FH]S\b|USB device controller|USB host controller|\bUSB(?:FS|HS|HD|D)\b|"
+    r"(?<![A-Za-z0-9_])(?:OTG_[FH]S|USB(?:FS|HS|HD|D))(?![A-Za-z0-9_])|"
+    r"USB device controller|USB host controller|"
     r"[全高低]速\s*USB|USB\s*(?:总线)?\s*(?:主机|设备|和)*\s*控制器")
 # "USB-Serial/JTAG" and "USB power delivery" name peripherals you cannot write a USB
 # stack against, so they must not count on their own.

@@ -215,7 +215,8 @@ def parse_doc(ap: argparse.ArgumentParser, argv: list) -> tuple:
     doc = doclib.Doc(vendor=a.vendor, doc_id=a.doc_id, doc_type=a.type, version=a.revision,
                      title=a.title, url=a.url or a.source, author=author,
                      family=a.family.split(",") if a.family else [], desc=a.desc,
-                     verify_id=not a.id_not_printed)
+                     verify_id=not a.id_not_printed,
+                     language="zho" if a.doc_id.endswith("-CN") else "eng")
     return a, doc, mod
 
 

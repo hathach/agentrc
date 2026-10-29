@@ -995,6 +995,14 @@ class AddOne(unittest.TestCase):
                            '--title', 't', '--url', self.URL])
         self.assertIn('--author is required', err.getvalue())
 
+    def test_a_chinese_edition_is_filed_in_chinese(self):
+        for doc_id, language in (('CH32V407DS0', 'eng'), ('CH32V407DS0-CN', 'zho')):
+            ap = sync.doc_parser('sync.py add', '')
+            ap.add_argument('--revision')
+            _, doc, _ = sync.parse_doc(ap, ['--vendor', 'wch', '--id', doc_id, '--type', 'datasheet',
+                                            '--title', 't', '--url', self.URL])
+            self.assertEqual(doc.language, language, doc_id)
+
 
 def setattr_all(saved):
     vendor_ti.http_get, vendor_ti.last_modified, vendor_ti._parts_from_bsp = saved
@@ -1666,12 +1674,13 @@ class UsbResolution(unittest.TestCase):
         # Live 2026-10-29: CH32xRM, CH53x and CH32M030 (yes); CH521, CH641 and CH32V003 (no).
         def usb(text):
             return bool(doclib.USB_EVIDENCE.search(doclib.USB_DECOYS.sub('', text)))
-        for text in ('USBFS', 'USBHS', 'USBHD', 'CAN/DAC/USBD', 'USBD peripheral',
+        for text in ('USBFS', 'USBHS', 'USBHD', 'CAN/DAC/USBD', 'USBD peripheral', 'USBFS控制器',
+                     '支持USBFS和USBHD', 'OTG_FS控制器',
                      '支持 12Mbps 全速 USB 传输', '内嵌 USB 总线设备控制器', 'USB 设备控制器，支持全速',
                      'USB 总线主机和设备控制器', '集成 6 组 USB 总线控制器'):
             self.assertTrue(usb(text), text)
         for text in ('USBPD', 'USBDP', 'USB data line', 'USB power delivery', '05 = Connected, USB HS, CAN',
-                     'USB FS', '支持 USB PD 及 Type C',
+                     'USB FS', 'USBFSX', 'XUSBD', 'USBD_x', '支持 USB PD 及 Type C',
                      '通过专用 USB 编程器烧录', 'USB 转串口功能'):
             self.assertFalse(usb(text), text)
 
