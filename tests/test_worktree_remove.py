@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -202,6 +202,50 @@ class Remove(Rig):
         rc, out = self.run_remove()
         self.assertEqual(rc, 4, out)
         self.assertIn('parent--dirty stays: uncommitted or untracked changes', out)
+
+    def assertJunctionRefusedOrKept(self, junction):
+        """junction(path) makes a junction at path: one in PATH refuses it, one in a sibling keeps the sibling."""
+        sibling = self.sibling('b')
+        for tree in (self.parent, sibling):
+            (tree / 'build').mkdir()
+            junction(tree / 'build' / 'dep')
+        why = 'holds a junction at {}, which `git worktree remove` leaves in place: remove the junction first'
+        self.assertRefused(f'{self.parent}: ' + why.format(self.parent / 'build' / 'dep'))
+        os.rmdir(self.parent / 'build' / 'dep')  # the junction itself, not its target
+        rc, out = self.run_remove()
+        self.assertEqual(rc, 4, out)
+        self.assertIn('parent--b stays: ' + why.format(sibling / 'build' / 'dep'), out)
+
+    def test_a_junction_in_the_worktree_is_refused_and_one_in_a_sibling_keeps_it(self):
+        scandir, isjunction = os.scandir, os.path.isjunction
+
+        class Entry:  # a directory named dep reports itself a junction, as on Windows
+            def __init__(self, entry):
+                self.entry = entry
+
+            def __getattr__(self, name):
+                return getattr(self.entry, name)
+
+            def is_junction(self):
+                return self.entry.name == 'dep' or self.entry.is_junction()
+
+        @contextmanager
+        def junctions(path='.'):
+            with scandir(path) as listing:
+                yield (Entry(entry) for entry in listing)
+
+        with mock.patch('os.scandir', junctions), \
+                mock.patch('os.path.isjunction', lambda p: os.path.basename(p) == 'dep' or isjunction(p)):
+            self.assertJunctionRefusedOrKept(os.mkdir)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_a_real_junction_in_the_worktree_is_refused_and_one_in_a_sibling_keeps_it(self):
+        import _winapi
+        target = self.t / 'elsewhere'
+        target.mkdir()
+        (target / 'keep').write_text('shared target')
+        self.assertJunctionRefusedOrKept(lambda path: _winapi.CreateJunction(str(target), str(path)))
+        self.assertEqual((target / 'keep').read_text(), 'shared target')
 
     def test_a_branch_switched_after_the_gate_is_refused(self):
         with self.after_plan(lambda: sh(self.parent, 'switch', '-q', '-c', 'other')):

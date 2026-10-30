@@ -1033,6 +1033,19 @@ class WorktreeChildren(unittest.TestCase):
         self.assertFalse(self.log.exists())
         self.assertFalse(state.exists())
 
+    def test_a_retry_with_the_log_under_the_removed_parent_is_refused(self):
+        child = self.child()
+        tip = self.git('rev-parse', 'HEAD', cwd=self.parent).strip()
+        self.drop_parent()
+        state = self.parent / 'build' / 'state'
+        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip,
+                               env={'XDG_STATE_HOME': str(state)})
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn(f'refused: the log {state / "agentrc" / "worktree-remove" / "log"} lies inside {self.parent}',
+                      done.stderr)
+        self.assertFalse(os.path.lexists(self.parent))
+        self.assertTrue(child.is_dir() and self.branch_exists('parent'))
+
     def test_an_incomplete_cleanup_logs_a_retry_that_finishes_it_from_outside(self):
         dirty, unpushed = self.child('dirty'), self.child('side', push=False)
         (dirty / 'notes.txt').write_text('wip')

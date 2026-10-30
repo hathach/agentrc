@@ -24,6 +24,7 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   refs/worktree/reviewr/turn-base and base-pick, is not checked;
 - no repository (bare ones included) or worktree is nested anywhere below it (ignored
   directories included) other than its submodules;
+- no Windows junction anywhere below it: `git worktree remove` would leave it and the directories above it;
 - every repository whose storage the removal deletes (submodule git dirs inside the child or
   inside its git dir, initialized or not) has no stash, no linked worktree (even one inside the
   child or pruned), its main worktree inside that boundary, and
@@ -54,9 +55,9 @@ The ref is deleted against its recorded id (`update-ref -d`), then its `branch.<
 
 Each action is printed and appended to ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/log,
 each branch's retry arguments before its checkout is removed and the retry command after anything
-kept. A retry is refused (exit 2) from a working directory inside a child, or with this file or the
-log inside or reached through one. Exit 0 every child and branch removed (or none found), 1 something
-kept or a removal failed, 2 bad input or a parent that exists again.
+kept. A retry is refused (exit 2) from a working directory inside the parent's path or a child, or
+with this file or the log inside or reached through one. Exit 0 every child and branch removed (or
+none found), 1 something kept or a removal failed, 2 bad input or a parent that exists again.
 """
 import functools
 import json
@@ -241,9 +242,14 @@ def submodules(child):
 def nested_repo(child, allowed):
     """A .git file or directory or a bare repository below child other than at child and its submodules,
     or None. The whole tree: a repository initialized inside a tracked directory shows in no status or
-    ignored listing."""
+    ignored listing. Keep for a Windows junction below child: Git for Windows' removal (dir.c
+    remove_dir_recurse) neither enters nor deletes one, nor any directory above it."""
     allowed = {os.path.realpath(p) for p in [child, *allowed]}
-    for top, dirs, files, _ in walk(child):
+    for top, dirs, files, links in walk(child):
+        junction = next((p for p in (os.path.join(top, n) for n in links) if os.path.isjunction(p)), None)
+        if junction:
+            raise Keep(f'holds a junction at {junction}, which `git worktree remove` leaves in place: '
+                       'remove the junction first')
         if ('.git' in dirs or '.git' in files or is_store(dirs, files)) and os.path.realpath(top) not in allowed:
             return top
         if '.git' in dirs:
@@ -709,7 +715,7 @@ def main(argv=None):
         rest = argv[2:]
         if len(rest) % 4 == 0 and all(f == '--branch' for f in rest[::4]):
             parent = os.path.abspath(argv[1])
-            why = outside(children(parent))
+            why = outside([parent, *children(parent)])
             if why:
                 print(f'worktree_children: refused: {why}', file=sys.stderr)
                 return 2

@@ -266,5 +266,6 @@ def remove(p):
 
 
 if __name__ == '__main__':
-    sys.stdout.reconfigure(errors='backslashreplace')  # a narrow code page must not stop a removal part way
+    if sys.stdout:  # None under pythonw
+        sys.stdout.reconfigure(errors='backslashreplace')  # a narrow code page must not stop a removal part way
     sys.exit(main())
