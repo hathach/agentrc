@@ -200,7 +200,7 @@ class Case(unittest.TestCase):
     """A bare 'remote' at .../o/r.git with main and refs/pull/7/head, and a clone of it."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # git reports the long name, not a runner's 8.3 TEMP (RUNNER~1)
         self.remote = self.tmp / 'o' / 'r.git'
         self.remote.parent.mkdir()
         sh(self.tmp, 'git', 'init', '--quiet', '--bare', '-b', 'main', str(self.remote))
@@ -350,11 +350,6 @@ class Prepare(Case):
         with self.assertRaisesRegex(facts.Unusable, 'not a head this script pinned'):
             self.prepare()
 
-    @staticmethod
-    def place(path):
-        """path as git reports it: resolved, so long on Windows where tempfile can give an 8.3 short name."""
-        return Path(os.path.realpath(path)).as_posix()
-
     def linked(self):
         """Make the clone a linked worktree, on main, of a primary checkout beside it."""
         primary = self.tmp / 'primary'
@@ -370,13 +365,13 @@ class Prepare(Case):
         sibling = self.tmp / f'clone--pr-review-{PR}'
         self.linked()
         p = self.prepare()
-        self.assertEqual(p['worktree'], self.place(sibling))
+        self.assertEqual(p['worktree'], sibling.as_posix())
         self.assertEqual(sh(sibling, 'git', 'rev-parse', 'HEAD'), head)
         self.assertFalse((self.clone / '.worktrees').exists())
         token = p['lock']['token']
         with mock.patch.object(prepare, 'beside', side_effect=AssertionError('placed again')):
             q = self.prepare('--token', token)  # an existing tree is reused, under the lock of the run that prepared it
-        self.assertEqual((q['worktree'], q['lock']), (self.place(sibling), {'state': 'held', 'token': token}))
+        self.assertEqual((q['worktree'], q['lock']), (sibling.as_posix(), {'state': 'held', 'token': token}))
         Path(sibling, 'src/core/a.c').write_text('local edit\n')
         with self.assertRaisesRegex(facts.Unusable, 'uncommitted changes'):
             self.prepare('--token', token)
@@ -388,7 +383,7 @@ class Prepare(Case):
     def test_a_review_worktree_nests_in_a_primary_checkout_and_refuses_when_git_cannot_say(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')
         self.push_pr()
-        nested = self.place(self.clone / '.worktrees' / f'pr-review-{PR}')
+        nested = (self.clone / '.worktrees' / f'pr-review-{PR}').as_posix()
         self.assertEqual(self.prepare()['worktree'], nested)
         sh(self.clone, 'git', 'worktree', 'remove', nested)
         real, missing = prepare.git, (self.tmp / 'missing').as_posix()
@@ -418,10 +413,10 @@ class Prepare(Case):
         stub = make_stub(bin_dir, 'herdr', f'import sys\nopen({str(log)!r}, "a").write("called\\n")\nsys.exit(1)\n')
         os.environ.update(HERDR_ENV='1', HERDR_BIN_PATH=str(stub), PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
         p = self.prepare()
-        self.assertEqual(p['worktree'], self.place(self.clone / '.worktrees' / f'pr-review-{PR}'), 'a primary nests')
+        self.assertEqual(p['worktree'], (self.clone / '.worktrees' / f'pr-review-{PR}').as_posix(), 'a primary nests')
         sh(self.clone, 'git', 'worktree', 'remove', p['worktree'])
         self.linked()
-        self.assertEqual(self.prepare()['worktree'], self.place(self.tmp / f'clone--pr-review-{PR}'),
+        self.assertEqual(self.prepare()['worktree'], (self.tmp / f'clone--pr-review-{PR}').as_posix(),
                          'a linked checkout gets it beside')
         self.assertFalse(log.exists(), 'herdr is never run')
 
