@@ -24,13 +24,13 @@ def newest_reading(items, key, reading):
     return top, ''
 
 
-def latest_run(runs):
+def latest_run(runs, title=False):
     """(the newest check run, '') or (None, why) when runs cannot be ordered: one has no start time
-    (GitHub leaves a queued run undated), or the newest start differently."""
+    (GitHub leaves a queued run undated), or the newest start differently; output.title counts only with title."""
     undated = [r for r in runs if not r.get('started_at')]
     if undated and len(runs) > 1:
         return None, f"check run {undated[0]['id']} has no start time to order it by"
     if undated:
         return undated[0], ''
-    return newest_reading(runs, 'started_at', lambda r: (r['status'], r.get('conclusion'), (r.get('output') or {}).get('title'),
-                                                         (r.get('output') or {}).get('summary')))
+    return newest_reading(runs, 'started_at', lambda r: (r['status'], r.get('conclusion'), (r.get('output') or {}).get('summary'),
+                                                         (r.get('output') or {}).get('title') if title else None))

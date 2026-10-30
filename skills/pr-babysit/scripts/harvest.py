@@ -155,7 +155,7 @@ def coderabbit(head, statuses, checks, issue, event_at):
     s, tied = newest_reading([x for x in statuses if x.get('context') == 'CodeRabbit'], 'updated_at', lambda x: (x['state'], x.get('description')))
     if tied:
         return record('coderabbit', 'unknown', f'statuses {tied}')
-    run_, unordered = latest_run([c for c in checks if c.get('name') == 'CodeRabbit'])
+    run_, unordered = latest_run([c for c in checks if c.get('name') == 'CodeRabbit'], title=True)
     if unordered:
         return record('coderabbit', 'unknown', unordered)
     ev = []
@@ -289,7 +289,7 @@ def manual_only(stickies):
 
 def greptile(head, checks, issue, reviews, event_at, now=None):
     runs = [c for c in checks if (c.get('app') or {}).get('slug') == greptile_check.APP and c.get('name') == greptile_check.CHECK]
-    r, unordered = latest_run(runs)
+    r, unordered = latest_run(runs, title=True)
     if unordered:
         return record('greptile', 'unknown', unordered)
     refusals = []

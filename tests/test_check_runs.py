@@ -22,8 +22,9 @@ def load(name, path):
     return module
 
 
-def run(i, start, conclusion='success', summary=None):
-    return {'id': i, 'status': 'completed', 'conclusion': conclusion, 'started_at': start, 'output': {'summary': summary}}
+def run(i, start, conclusion='success', summary=None, title=None):
+    return {'id': i, 'status': 'completed', 'conclusion': conclusion, 'started_at': start,
+            'output': {'title': title, 'summary': summary}}
 
 
 class LatestRunTest(unittest.TestCase):
@@ -39,6 +40,11 @@ class LatestRunTest(unittest.TestCase):
         for runs, want in cases:
             with self.subTest(runs=runs):
                 self.assertEqual(check_runs.latest_run(runs), want)
+
+    def test_a_title_tells_tied_runs_apart_only_when_asked(self):
+        a, b = run(1, '2026-10-01T00:00:00Z', title='a'), run(2, '2026-10-01T00:00:00Z', title='b')
+        self.assertEqual(check_runs.latest_run([a, b]), (a, ''))
+        self.assertEqual(check_runs.latest_run([a, b], title=True), (None, '1, 2 share 2026-10-01T00:00:00Z and read differently'))
 
     def test_newest_skips_undated_items(self):
         items = [{'id': 1, 'at': None}, {'id': 2, 'at': '2026-10-01T00:00:00Z'}, {'id': 3, 'at': '2026-09-30T00:00:00Z'}]
