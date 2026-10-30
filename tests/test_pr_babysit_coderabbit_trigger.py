@@ -177,12 +177,63 @@ class RequestRig:
 
 
 class Request(unittest.TestCase):
-    def run_with(self, rig):
+    def run_with(self, rig, *extra):
         out = io.StringIO()
         with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
                 mock.patch.object(trigger, 'observe', rig.observe), redirect_stdout(out):
-            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r', '--request'], seal=True)
+            code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r', '--request', *extra], seal=True)
         return code, json.loads(out.getvalue())
+
+    def test_the_request_waits_a_minute_past_the_reset(self):
+        for observed, outcome in (('2026-10-13T10:55:19Z', 'notDue'), ('2026-10-13T10:56:18Z', 'notDue'), ('2026-10-13T10:56:19Z', 'requested')):
+            with self.subTest(observed):
+                rig = RequestRig(observed=observed)
+                self.assertEqual(self.run_with(rig)[1]['outcome'], outcome)
+                self.assertEqual(len(rig.posts), outcome == 'requested')
+
+    def test_an_unchanged_limit_is_asked_again_once_past_the_callers_deadline(self):
+        first = {'id': 50, 'body': trigger.REQUEST, 'created_at': '2026-10-13T10:57:00Z'}
+        later = '2026-10-13T11:57:00Z'
+        for observed, outcome in (('2026-10-13T11:30:00Z', 'notDue'), ('2026-10-13T11:57:00Z', 'requested')):
+            with self.subTest(observed):
+                rig = RequestRig(observed=observed, comments=[first])
+                code, out = self.run_with(rig, '--not-before', later)
+                self.assertEqual((code, out['outcome'], out['retryAt']), (0, outcome, LIMITED['retryAt']), 'the line keeps CodeRabbit\'s own reset')
+                self.assertEqual(len(rig.posts), outcome == 'requested', 'the request before the deadline is the last window\'s')
+        second = dict(first, id=51, created_at='2026-10-13T11:57:30Z')
+        rig = RequestRig(observed='2026-10-13T12:10:00Z', comments=[first, second])
+        self.assertEqual(self.run_with(rig, '--not-before', later)[1]['outcome'], 'already')
+        self.assertEqual(rig.posts, [])
+
+    def test_a_reset_read_later_than_the_callers_deadline_still_waits_its_minute(self):
+        moved = dict(LIMITED, retryAt='2026-10-13T11:40:00Z')
+        for observed, outcome in (('2026-10-13T11:40:00Z', 'notDue'), ('2026-10-13T11:41:00Z', 'requested')):
+            with self.subTest(observed):
+                rig = RequestRig(cr=moved, observed=observed)
+                self.assertEqual(self.run_with(rig, '--not-before', '2026-10-13T11:10:00Z')[1]['outcome'], outcome)
+        mine = {'id': 52, 'body': trigger.REQUEST, 'created_at': '2026-10-13T11:41:00Z'}
+        rig = RequestRig(cr=moved, observed='2026-10-13T11:50:00Z', comments=[mine])
+        self.assertEqual(self.run_with(rig, '--not-before', '2026-10-13T11:10:00Z')[1]['outcome'], 'already')
+        self.assertEqual(rig.posts, [])
+
+    def test_a_limit_with_no_reset_is_asked_after_the_callers_deadline(self):
+        rig = RequestRig(cr=dict(LIMITED, retryAt=None))
+        code, out = self.run_with(rig, '--not-before', '2026-10-13T10:59:00Z')
+        self.assertEqual((code, out['outcome'], out['retryAt']), (0, 'requested', None))
+        rig = RequestRig(cr=dict(LIMITED, retryAt=None))
+        self.assertEqual(self.run_with(rig, '--not-before', '2026-10-13T11:30:00Z')[1]['outcome'], 'notDue')
+        self.assertEqual(rig.posts, [])
+
+    def test_not_before_needs_request_and_a_utc_time(self):
+        for argv in (['--not-before', '2026-10-13T11:00:00Z'], ['--request', '--not-before', '2026-10-13 11:00'], ['--request', '--not-before', 'soon'],
+                     ['--request', '--not-before', '2026-02-30T11:00:00Z'], ['--request', '--not-before', '2026-10-13T11:00:00Z\n']):
+            with self.subTest(argv):
+                out, rig = io.StringIO(), RequestRig()
+                with mock.patch.object(trigger, 'attempt', rig.attempt), mock.patch.object(harvest, 'run', rig.run), \
+                        mock.patch.object(trigger, 'observe', rig.observe), redirect_stdout(out):
+                    code = trigger.report(trigger.collect, ['--pr', '7', '--head', HEAD, '--repo', 'o/r', *argv], seal=True)
+                self.assertEqual((code, rig.pulls, rig.posts), (2, 0, []), 'refused before any read')
+                self.assertIn('--not-before', json.loads(out.getvalue())['error'])
 
     def test_a_reset_limit_is_asked_once_and_read_back(self):
         rig = RequestRig()

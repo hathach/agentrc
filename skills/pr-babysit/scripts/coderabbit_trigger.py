@@ -2,7 +2,7 @@
 """Tick CodeRabbit's "Trigger review" box on PR N when it skipped HEAD for a manual review,
 or, with --request, ask it to review once its rate limit on HEAD has reset, or when no tick asked for a skipped HEAD.
 
-  coderabbit_trigger.py --pr N --head SHA [--request] [--repo OWNER/NAME]
+  coderabbit_trigger.py --pr N --head SHA [--request [--not-before ISO]] [--repo OWNER/NAME]
 
 A repository below CodeRabbit's open-source threshold gets, on each push, a
 CodeRabbit status "Review skipped: manual review required ...", or a skipped check
@@ -25,13 +25,19 @@ notice leaves no box to tick (CodeRabbit's docs: comment `@coderabbitai review`
 after the reset); nor does a manual-review skip whose summary lost its box, or
 whose tick failed (#274). The outcome:
 
-  requested   it is limited on HEAD and its reset has passed, or it skipped
-              HEAD for a manual review and no box is ticked; the comment was
-              posted and read back
+  requested   it is limited on HEAD and its reset plus a minute has passed, or
+              it skipped HEAD for a manual review and no box is ticked; the
+              comment was posted and read back
   already     such a comment was posted at or after the reset, or, on a skip,
               at or after the head event (harvest.py's), or the box is ticked
-  notDue      the reset is still ahead (retryAt) or no reset time can be read
-              (retryAt null): nothing posted
+  notDue      the reset plus a minute is still ahead (retryAt), or no reset
+              time can be read (retryAt null) and no --not-before stands in:
+              nothing posted
+
+--not-before, the caller's own deadline for this limit (pr-babysit's: an hour
+after its last request, or after it first saw a limit with no reset time),
+moves the reset later, never earlier: a request is posted only once both have
+passed, and only one posted at or after both counts as already.
   notLimited  the PR is not open, SHA is not its head (both read again just
               before posting), or CodeRabbit is neither rate-limited on it nor
               skipped it for a manual review
@@ -52,8 +58,9 @@ after a lost line reports `already`.
 """
 
 import json
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -62,12 +69,26 @@ from harvest import CR_TRIGGER_BOX as BOX, coderabbit, gh_json, observe, pages, 
 
 SKIP = 'review skipped: manual review required'
 REQUEST = '@coderabbitai review'
+# Asked a minute past the reset, not at it, as pr-babysit naps to it.
+MARGIN = timedelta(minutes=1)
+ISO = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ')
 
 
 class Failed(Exception):
     def __init__(self, why, phase='post'):
         super().__init__(why)
         self.phase = phase
+
+
+def utc(text):
+    """Whether TEXT is a real UTC time written as GitHub writes one."""
+    if not ISO.fullmatch(text):
+        return False
+    try:
+        stamp(text)
+    except ValueError:
+        return False
+    return True
 
 
 def on_comment(outcome, c, **members):
@@ -136,7 +157,7 @@ def unopened(pr, head):
     return pull_at(pr, head)[1]
 
 
-def unasked(repo, pr, head):
+def unasked(repo, pr, head, not_before=None):
     """(None, the retryAt member) when the request is to be posted now, else (the outcome, None); it only reads."""
     why = unopened(pr, head)
     if why:
@@ -148,10 +169,12 @@ def unasked(repo, pr, head):
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
         return {'outcome': 'notLimited', 'detail': f"{state_of(cr)} on {seen['headSha'][:9]}: {cr['reason']}"}, None
     reset = {'retryAt': cr['retryAt']}
-    if cr['retryAt'] is None or stamp(cr['retryAt']) > stamp(seen['observedAt']):
+    starts = [stamp(x) for x in (cr['retryAt'], not_before) if x]
+    due = [stamp(cr['retryAt']) + MARGIN] if cr['retryAt'] else []
+    if not starts or max(due + starts) > stamp(seen['observedAt']):
         return {'outcome': 'notDue', 'detail': cr['reason'], **reset}, None
     asked = [c for c in pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
-             if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= stamp(cr['retryAt'])]
+             if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= max(starts)]
     if asked:
         return on_comment('already', asked[0], at=asked[0]['created_at'], **reset), None
     # The reads above take a while: a PR closed or pushed meanwhile is not asked about.
@@ -182,9 +205,9 @@ def unasked_skip(pr, head, event_at):
     return None, reset
 
 
-def request(repo, pr, head):
+def request(repo, pr, head, not_before=None):
     try:
-        out, reset = unasked(repo, pr, head)
+        out, reset = unasked(repo, pr, head, not_before)
     except Unusable as e:
         raise Failed(str(e), 'read')
     if out:
@@ -208,13 +231,16 @@ def collect(argv):
     p.add_argument('--pr', type=int, required=True)
     p.add_argument('--head', required=True)
     p.add_argument('--request', action='store_true')
+    p.add_argument('--not-before')
     p.add_argument('--repo')
     a = p.parse_args(argv)
     if not FULL_SHA.match(a.head):
         raise Unusable(f'not a full SHA: {a.head!r}')
+    if a.not_before is not None and (not a.request or not utc(a.not_before)):
+        raise Unusable(f'--not-before takes a UTC time like 2026-10-13T11:00:00Z, with --request: {a.not_before!r}')
     repo = bind_repo(a.repo)
     try:
-        out = request(repo, a.pr, a.head) if a.request else trigger(a.pr, a.head)
+        out = request(repo, a.pr, a.head, a.not_before) if a.request else trigger(a.pr, a.head)
     except Failed as e:
         out = {'outcome': 'failed', 'detail': str(e), **({'phase': e.phase} if a.request else {})}
     except (KeyError, TypeError, AttributeError) as e:
