@@ -18,10 +18,9 @@ own worktree .worktrees/cowork-<side>-<lane> on branch
 cowork/<host branch>/<side>-<lane>, created at this checkout's HEAD, the
 lane's `base`, and never moved by cowork; a send to it is refused while the
 tree is dirty. Its kind is the `read-only` marker file or the `base` file.
-When herdr lists this checkout as a linked worktree open in a workspace, a
-new or recreated tree is the sibling <checkout>--cowork-<side>-<lane> instead
-(herdr_sibling); a lane uses whichever of the two holds its tree, refused when
-both do. While a sibling tree's lane has a request outstanding, the tree holds
+When this checkout is a linked worktree, a new or recreated tree is the
+sibling <checkout>--cowork-<side>-<lane> instead (beside); a lane uses
+whichever of the two holds its tree, refused when both do. While a sibling tree's lane has a request outstanding, the tree holds
 the lane's `git worktree lock` (guard).
 A request has files only from send until its reply is delivered; the
 coworker's own session store keeps the turn. Meanwhile: .task until the
@@ -56,7 +55,7 @@ among them; 3 refused, with no receipt: an unknown or delivered request, a
 running one under plain read, a read --out FILE that cannot be written (the
 request kept), a busy lane, a lane of another kind than the flags assert or
 not ready (pinned, kindless, its worktree unusable, or not creatable from a
-detached host, beside a branch with no recorded base or when herdr cannot
+detached host, beside a branch with no recorded base or when git cannot
 place it), or reset refused, or a kill under COWORK_READ_ONLY of a request on
 a lane that is not read-only; 4 an empty reply, a writer's reply without its
 "Files touched" line, or a --no-edit turn that changed the tree or after
@@ -68,7 +67,6 @@ import contextlib
 import datetime
 import errno
 import functools
-import importlib.util
 import json
 import os
 import re
@@ -121,7 +119,6 @@ PRESETS = {'astra': ('gpt-6-astra', 'high'), 'sol': ('gpt-6.1-sol', 'high')}
 PRESET = 'sol'  # the Codex default while no preference file names one
 FIELDS = ('session', 'model', 'effort', 'tier')
 GIT_ENCODING = 'utf-8' if fcntl is None else None  # git speaks UTF-8 there, not the ANSI code page; else the locale's
-PLUGIN = AGENTRC / 'plugins' / 'worktree-children' / 'worktree_children.py'
 READ_ONLY = 'COWORK_READ_ONLY'
 
 
@@ -184,7 +181,7 @@ def kind(box):
 
 
 def places(root, box):
-    """A worktree lane's two possible trees: nested in the checkout, or its herdr sibling."""
+    """A worktree lane's two possible trees: nested in the checkout, or its sibling."""
     name = f'cowork-{box.parent.name}-{box.name}'
     return root / '.worktrees' / name, root.parent / f'{root.name}--{name}'
 
@@ -202,23 +199,14 @@ def lane_root(root, box):
     return found[0] if found else places(root, box)[0]
 
 
-def herdr_sibling(root):
-    """Whether a new lane's tree goes beside the checkout: herdr lists it as a linked worktree open in a
-    workspace, and herdr's removal of it would take a nested tree along whatever it holds."""
-    herdr = os.environ.get('HERDR_BIN_PATH') or (shutil.which('herdr') if fcntl
-                                                  else windows.on_path('herdr', ('.exe',)))
-    if not (herdr and os.path.isfile(herdr)):
-        if os.environ.get('HERDR_ENV'):
-            die(f'HERDR_ENV is set but herdr is not on PATH ({herdr or "none"}): cannot tell where the lane\'s '
-                f'worktree goes', BUSY)
-        return False
-    try:
-        spec = importlib.util.spec_from_file_location('worktree_children', PLUGIN)
-        plugin = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(plugin)
-        return plugin.linked_workspace(root, herdr)  # the herdr found here, never one the checkout holds
-    except Exception as failure:  # the plugin's Keep, or a plugin that cannot load
-        die(f'cannot ask herdr where the lane\'s worktree goes: {failure}', BUSY)
+def beside(root):
+    """Whether a new lane's tree goes beside the checkout: it is a linked worktree, which worktree-remove
+    refuses to remove while a worktree is nested in it."""
+    got = git(root, 'rev-parse', '--path-format=absolute', '--absolute-git-dir', '--git-common-dir', check=False)
+    dirs = got.stdout.splitlines()
+    if got.returncode or len(dirs) != 2 or not all(os.path.isabs(d) for d in dirs):
+        die(f'cannot tell where the lane\'s worktree goes: {got.stderr.strip() or got.stdout.strip()}', BUSY)
+    return os.path.realpath(dirs[0]) != os.path.realpath(dirs[1])
 
 
 def foreign(root, tree):
@@ -244,8 +232,7 @@ def lock_reason(box):
 
 def guard(root, box, tree, gitdir):
     """Lock the lane's tree, when it is its sibling, for its outstanding requests, running or undelivered:
-    herdr's removal of the checkout lets the worktree-children plugin sweep a clean sibling, and the plugin
-    keeps a locked one. The lane's lock is shared by its requests; a lock already there, the lane's or
+    worktree-remove's cleanup of the checkout sweeps a clean sibling and keeps a locked one. The lane's lock is shared by its requests; a lock already there, the lane's or
     anyone's, is left as it is. Under admission, on a tree claim() has checked (its git dir). True if it locked."""
     if tree == places(root, box)[1] and not (gitdir / 'locked').exists():
         git(root, 'worktree', 'lock', '--reason', lock_reason(box), str(tree))
@@ -295,11 +282,11 @@ def sync_lane(root, box):
     """The lane's worktree, created at the host's HEAD on first use, or
     recreated on its branch when the tree is gone; refused while dirty. The
     lane's commits stay where the coworker made them: integrating them is the
-    host's. Where a new or recreated tree goes is herdr_sibling's. Under admission. Returns the tree and
+    host's. Where a new or recreated tree goes is beside's. Under admission. Returns the tree and
     its git dir."""
     tree, lane = lane_root(root, box), box.name
     if not (tree.exists() or tree.is_symlink()):
-        tree = places(root, box)[1 if herdr_sibling(root) else 0]
+        tree = places(root, box)[1 if beside(root) else 0]
         git(root, 'worktree', 'prune')
         host = git(root, 'symbolic-ref', '--short', 'HEAD', check=False)
         if host.returncode:

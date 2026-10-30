@@ -66,7 +66,7 @@ STORE = '.blobs'  # the shared blob store, beside session directories named by a
 TEMP = '.tmp-'  # prefix of a blob file still being written
 PRUNE_DAYS, REPORT_DAYS = 30, 90
 SCRIPT = Path(__file__).resolve()
-PLUGIN = SCRIPT.parents[2] / 'plugins' / 'worktree-children' / 'worktree_children.py'
+WORKTREE_CHILDREN = SCRIPT.parents[2] / 'lib' / 'worktree_children.py'
 SCHEMA = {
     'type': 'object', 'additionalProperties': False, 'required': ['findings'],
     'properties': {'findings': {'type': 'array', 'items': {
@@ -324,26 +324,26 @@ def snapshot_tree(tree, blobs, previous=None, prefix=''):
 
 
 def sibling_worktrees(root, listed):
-    """`root`'s `<root>--*` siblings that are linked worktrees of any repository, as the
-    worktree-children plugin finds and defines them; the user rule reserves that prefix for
+    """`root`'s `<root>--*` siblings that are linked worktrees of any repository, as
+    lib/worktree_children.py finds and defines them; the user rule reserves that prefix for
     them. Those `git worktree list` gave (`listed`) are root's own; any other is checked
-    with the plugin, and one that is neither a pruned leftover nor a linked worktree is an
+    with that module, and one that is neither a pruned leftover nor a linked worktree is an
     error, not out of scope."""
     try:
-        spec = importlib.util.spec_from_file_location('worktree_children', PLUGIN)
-        plugin = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(plugin)
+        spec = importlib.util.spec_from_file_location('worktree_children', WORKTREE_CHILDREN)
+        wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wc)
     except Exception as error:  # no scope without the predicate
-        raise ValueError(f'cannot load the worktree-children plugin from {PLUGIN}: {error!r}')
+        raise ValueError(f'cannot load worktree_children from {WORKTREE_CHILDREN}: {error!r}')
     own = {os.path.realpath(t) for t in listed}
     trees = []
-    for child in plugin.children(root):
+    for child in wc.children(root):
         if os.path.realpath(child) not in own:
             if pruned(child):
                 continue
             try:
-                plugin.linked_worktree(child)
-            except plugin.Keep as reason:
+                wc.linked_worktree(child)
+            except wc.Keep as reason:
                 raise ValueError(f'{child}: {reason}')
         trees.append(child)
     return trees
@@ -371,7 +371,7 @@ def tree_of(root, name):
 def snapshot(root, blobs, previous=None):
     """`root`, the worktrees nested in it and its sibling worktrees, keyed relative
     to `root` (`../<sibling>/...`): a task worktree under `.worktrees/` or, in a
-    herdr checkout, beside it is where the session's edits often land while the
+    linked checkout, beside it is where the session's edits often land while the
     project directory still names the checkout. Any other worktree is another
     session's checkout. `previous`, the last snapshot, spares re-reading a tree
     that has not changed (snapshot_tree)."""

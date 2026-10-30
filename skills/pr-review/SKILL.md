@@ -36,7 +36,7 @@ while one is still pending or a post was never confirmed: stop and report what
 it names for the human to finish, delete or reconcile; auto-post never submits
 an older pending review. It makes
 `.worktrees/pr-review-<N>`, or the sibling `<checkout>--pr-review-<N>` when
-herdr has the checkout open as a linked worktree, on branch `pr-review-<N>` at
+the checkout is a linked worktree, on branch `pr-review-<N>` at
 the PR head (an existing tree at either place is reused) and picks
 the mode: `full` on a first review or after a force-push or rebase,
 `incremental` when the last reviewed head is an ancestor and the merge base is
@@ -46,8 +46,8 @@ unchanged, `same` when this head was reviewed already. On `same`, launch in
 with the request's words as `--reason`. An `overCap` answer merged everything
 into one group: report it and launch.
 
-A sibling tree is locked for the run, so herdr's removal of the checkout keeps
-it; `lock.token` names the lock. Pass `--token <it>` to a repeated prepare for the
+A sibling tree is locked for the run, so worktree-remove's cleanup of the
+checkout keeps it; `lock.token` names the lock. Pass `--token <it>` to a repeated prepare for the
 same run (`--full` after `same`), and release it with `--release` when no launch
 follows. A sibling another run of this PR has locked refuses, naming that run's
 token: once you know that run ended, release its lock with that token, then

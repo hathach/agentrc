@@ -103,14 +103,6 @@ def until(condition, timeout=10):
         time.sleep(0.02)
 
 
-# A herdr that lists the checkout as a linked worktree open in a workspace (or STUB_HERDR_ENTRY), logging each call.
-HERDR_STUB = '''import json, os, sys
-open(os.environ['STUB_HERDR_LOG'], 'a').write(' '.join(sys.argv[1:]) + '\\n')
-if os.environ.get('STUB_HERDR_DOWN'):
-    sys.exit('herdr server unreachable')
-entry = json.loads(os.environ.get('STUB_HERDR_ENTRY') or '{"is_linked_worktree": true, "open_workspace_id": "w1"}')
-print(json.dumps({'result': {'worktrees': [{**entry, 'path': sys.argv[-1]}]}}))
-'''
 SLEEP = [sys.executable, '-c', 'import time; time.sleep(30)']
 KILLED = 1 if os.name == 'nt' else -9  # what taskkill /F leaves for an exit code
 
@@ -190,6 +182,7 @@ class CoworkTest(unittest.TestCase):
         self.root = base / 'repo'
         self.root.mkdir()
         sh(self.root, 'git', 'init', '-q', '-b', 'main')
+        self.gitdir = self.root / '.git'
         self.bin = base / 'bin'
         self.bin.mkdir()
         self.stubs = base / 'stubs' if os.name == 'nt' else self.bin  # what the fake CLIs run
@@ -205,7 +198,6 @@ class CoworkTest(unittest.TestCase):
             **clean, 'PATH': f'{self.bin}{os.pathsep}{os.environ["PATH"]}', 'FAKE_LOG': str(self.log), 'CLAUDECODE': '1',
             'HOME': str(base / 'home'), 'USERPROFILE': str(base / 'home'),
             'XDG_CONFIG_HOME': str(base / 'config'), 'CODEX_HOME': str(base / 'codex'),
-            'HERDR_BIN_PATH': str(base / 'no-herdr'),  # no herdr: worktree lanes nest
             'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@t',
             'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
             # Git for Windows enables fsmonitor system-wide: its daemon would outlive each repo, holding the dir
@@ -224,7 +216,7 @@ class CoworkTest(unittest.TestCase):
             for pipe in (proc.stdout, proc.stderr):
                 if pipe:
                     pipe.close()
-        for box in Path(self.tmp.name).glob('repo/.git/cowork/*/*'):  # runners hang off init, not off us
+        for box in self.gitdir.glob('cowork/*/*'):  # runners hang off init, not off us
             for request in cowork.requests(box):
                 lock = box / f'{request}.lock'
                 if os.name == 'nt':  # the runner then terminates its CLI's job, as on `kill`
@@ -289,7 +281,7 @@ class CoworkTest(unittest.TestCase):
         return proc, proc.stdout.readline().strip()
 
     def box(self, side='codex', lane='main'):
-        return self.root / '.git' / 'cowork' / side / lane
+        return self.gitdir / 'cowork' / side / lane
 
     def started(self, request):
         until(lambda: cowork.cli_pid(self.box() / f'{request}.lock') != '')
@@ -2128,21 +2120,17 @@ class CoworkTest(unittest.TestCase):
         self.assertIn('detached', err)
         self.assertEqual(self.calls(), [])
 
-    # --- herdr sibling lanes ----------------------------------------------------
+    # --- sibling lanes ----------------------------------------------------------
 
-    def herdr(self, down=False):
-        """A stub herdr on HERDR_BIN_PATH (HERDR_STUB); `down`: it cannot answer. Returns its call log."""
-        stub, log = Path(self.tmp.name).resolve() / 'herdr', Path(self.tmp.name).resolve() / 'herdr.log'
-        stub.write_text(f'#!{sys.executable}\n{HERDR_STUB}')
-        stub.chmod(0o755)
-        os.environ.update(HERDR_BIN_PATH=str(stub), STUB_HERDR_LOG=str(log))
-        os.environ.pop('STUB_HERDR_DOWN', None)
-        if down:
-            os.environ['STUB_HERDR_DOWN'] = '1'
-        return log
-
-    def no_herdr(self):
-        os.environ['HERDR_BIN_PATH'] = str(Path(self.tmp.name) / 'no-herdr')
+    def linked(self):
+        """Make the checkout a linked worktree, on its branch, of a primary checkout beside it."""
+        primary = self.root.parent / 'primary'
+        os.chdir(primary.parent)
+        self.root.rename(primary)
+        sh(primary, 'git', 'checkout', '-q', '--detach')
+        sh(primary, 'git', 'worktree', 'add', '-q', str(self.root), 'main')
+        os.chdir(self.root)
+        self.gitdir = Path(sh(self.root, 'git', 'rev-parse', '--path-format=absolute', '--git-dir').strip())
 
     def sibling(self, lane='impl'):
         return self.root.parent / f'repo--cowork-codex-{lane}'
@@ -2158,10 +2146,9 @@ class CoworkTest(unittest.TestCase):
         until(lambda: cowork.cli_pid(self.box(lane=lane) / f'{request}.lock') != '')
         return request
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
-    def test_a_herdr_checkout_gets_its_worktree_lane_beside_it(self):
+    def test_a_linked_checkout_gets_its_worktree_lane_beside_it(self):
         base = self.commit('a.txt', 'a')
-        log = self.herdr()
+        self.linked()
         tree = self.sibling()
         code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x')
         self.assertEqual(code, 0, err)
@@ -2170,61 +2157,68 @@ class CoworkTest(unittest.TestCase):
         self.assertFalse((self.root / '.worktrees').exists())
         self.assertIn(f'in {tree}', self.run_cli('status', '--all')[1])
         self.assertIsNone(self.lock_of(tree), 'nothing outstanding: unlocked')
-        asked = log.read_text()
-        self.herdr(down=True)
-        code, _, _, err = self.send('--lane', 'impl', '--task', 'y')
+        with mock.patch.object(cowork, 'beside', side_effect=AssertionError('placed again')):
+            code, _, _, err = self.send('--lane', 'impl', '--task', 'y')
         self.assertEqual(code, 0, err)
-        self.assertEqual(self.calls()[-1]['cwd'], str(tree), 'the tree found beside the checkout')
-        self.assertEqual(log.read_text(), asked, 'herdr is asked only for a new tree')
+        self.assertEqual(self.calls()[-1]['cwd'], str(tree), 'the tree found beside the checkout, never placed again')
         code, out, err = self.run_cli('reset', 'codex', 'impl')
         self.assertEqual(code, 0, err)
         self.assertIn(f'worktree {tree} removed', out)
         self.assertFalse(tree.exists())
-        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'z')
-        self.assertEqual(code, cowork.BUSY)
-        self.assertIn("cannot ask herdr where the lane's worktree goes", err)
-        self.assertIn('unreachable', err)
-        self.no_herdr()
         self.assertEqual(self.send('--lane', 'impl', '--worktree', '--task', 'z')[0], 0, 'placed anew after a reset')
-        self.assertEqual(self.calls()[-1]['cwd'], str(self.root / '.worktrees' / 'cowork-codex-impl'))
+        self.assertEqual(self.calls()[-1]['cwd'], str(tree))
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
-    def test_a_new_lane_is_refused_when_herdr_cannot_place_it(self):
+    def test_a_new_lane_is_refused_when_git_cannot_place_it(self):
         self.commit('a.txt', 'a')
-        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x', HERDR_ENV='1')
-        self.assertEqual(code, cowork.BUSY)
-        self.assertIn('HERDR_ENV is set but', err)
-        self.herdr()
-        with mock.patch.object(cowork, 'PLUGIN', Path(self.tmp.name) / 'missing.py'):
-            code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x')
-        self.assertEqual(code, cowork.BUSY)
-        self.assertIn("cannot ask herdr where the lane's worktree goes", err)
-        code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x',
-                                    STUB_HERDR_ENTRY=json.dumps({'is_linked_worktree': 'false', 'open_workspace_id': 'w1'}))
-        self.assertEqual(code, cowork.BUSY)
-        self.assertIn('malformed entry', err, "the plugin's check: its tests list the rest")
+        real, missing = cowork.git, Path(self.tmp.name) / 'missing'
+        for name, answer in (('git failing', None), ('one line', f'{self.gitdir}\n'),
+                             ('a relative line', 'relative\nother\n'), ('an empty line', f'{self.gitdir}\n\n')):
+            def git(cwd, *args, check=True):
+                if '--absolute-git-dir' not in args:
+                    return real(cwd, *args, check=check)
+                if answer is None:
+                    return real(cwd, '-C', str(missing), *args, check=check)
+                return subprocess.CompletedProcess(args, 0, answer, '')
+            with self.subTest(name), mock.patch.object(cowork, 'git', git):
+                code, _, _, err = self.send('--lane', 'impl', '--worktree', '--task', 'x')
+                self.assertEqual(code, cowork.BUSY)
+                self.assertIn("cannot tell where the lane's worktree goes", err)
         self.assertEqual(self.calls(), [])
         self.assertEqual(sorted(p.name for p in self.box(lane='impl').iterdir()), ['lock'])
+        self.assertFalse((self.root / '.worktrees').exists() or self.sibling().exists())
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    def test_herdr_on_path_or_in_the_environment_never_changes_where_a_lane_goes(self):
+        self.commit('a.txt', 'a')
+        log = Path(self.tmp.name) / 'herdr.log'
+        stub = make_stub(self.bin, 'herdr', f'import sys\nopen({str(log)!r}, "a").write("called\\n")\nsys.exit(1)\n')
+        env = {'HERDR_ENV': '1', 'HERDR_BIN_PATH': str(stub)}
+        self.assertEqual(self.send('--lane', 'a', '--worktree', '--task', 'x', **env)[0], 0)
+        self.assertEqual(self.calls()[-1]['cwd'], str(self.root / '.worktrees' / 'cowork-codex-a'), 'a primary nests')
+        self.linked()
+        self.assertEqual(self.send('--lane', 'b', '--worktree', '--task', 'x', **env)[0], 0)
+        self.assertEqual(self.calls()[-1]['cwd'], str(self.sibling('b')), 'a linked checkout gets it beside')
+        self.assertFalse(log.exists(), 'herdr is never run')
+
     def test_a_nested_lane_stays_nested_until_its_tree_is_made_anew(self):
         self.commit('a.txt', 'a')
+        self.linked()
         nested = self.root / '.worktrees' / 'cowork-codex-impl'
-        self.send('--lane', 'impl', '--worktree', '--task', 'x')
-        log = self.herdr()
-        self.send('--lane', 'impl', '--task', 'y')
-        self.assertEqual(self.calls()[-1]['cwd'], str(nested))
-        self.assertFalse(log.exists(), 'herdr is not asked about a tree that exists')
+        with mock.patch.object(cowork, 'beside', return_value=False):  # placed before the checkout was linked
+            self.send('--lane', 'impl', '--worktree', '--task', 'x')
+        with mock.patch.object(cowork, 'beside', side_effect=AssertionError('placed again')):
+            code, _, _, err = self.send('--lane', 'impl', '--task', 'y')
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.calls()[-1]['cwd'], str(nested), 'a tree that exists is not placed again')
         sh(self.root, 'git', 'worktree', 'remove', str(nested))
         code, _, _, err = self.send('--lane', 'impl', '--task', 'z')
         self.assertEqual(code, 0, err)
         self.assertEqual(self.calls()[-1]['cwd'], str(self.sibling()), 'a recreated tree is placed anew')
         self.assertEqual(sh(self.sibling(), 'git', 'branch', '--show-current').strip(), 'cowork/main/codex-impl')
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
+    @unittest.skipIf(os.name == 'nt', 'a symlink')
     def test_reset_refuses_a_dangling_symlink_at_the_lane_place_and_forgets_nothing(self):
         self.commit('a.txt', 'a')
-        self.herdr()
+        self.linked()
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
         request = self.detached()
         self.gate.touch()
@@ -2240,7 +2234,6 @@ class CoworkTest(unittest.TestCase):
         self.assertIn(request, cowork.requests(box))
         self.assertTrue((box / 'base').exists() and (box / 'session').exists())
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_a_lane_with_a_tree_at_both_places_is_refused(self):
         self.commit('a.txt', 'a')
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
@@ -2254,10 +2247,9 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(len(self.calls()), ran)
         self.assertIn(' and ', self.run_cli('status', '--all')[1], 'status still lists the lane')
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_a_sibling_lane_is_locked_while_any_request_is_outstanding(self):
         self.commit('a.txt', 'a')
-        self.herdr()
+        self.linked()
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
         tree, reason = self.sibling(), 'cowork codex/impl has a request outstanding'
         first = self.detached()
@@ -2273,10 +2265,9 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(self.run_cli('read', first)[0], 0)
         self.assertIsNone(self.lock_of(tree), 'the last delivery unlocks')
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_a_killed_or_unwritten_reply_keeps_the_lock_until_delivered(self):
         self.commit('a.txt', 'a')
-        self.herdr()
+        self.linked()
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
         tree = self.sibling()
         request = self.detached()
@@ -2289,10 +2280,9 @@ class CoworkTest(unittest.TestCase):
         self.assertEqual(self.run_cli('read', request)[0], cowork.FAILED)
         self.assertIsNone(self.lock_of(tree))
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_a_send_that_records_no_request_releases_only_the_lock_it_took(self):
         self.commit('a.txt', 'a')
-        self.herdr()
+        self.linked()
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
         tree, box = self.sibling(), self.box(lane='impl')
         request = self.detached()
@@ -2314,10 +2304,9 @@ class CoworkTest(unittest.TestCase):
         self.assertIsNone(self.lock_of(tree), 'a lock taken for a request never recorded is released')
         self.assertEqual(cowork.requests(box), [])
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_reset_unlocks_only_after_its_checks_and_never_a_foreign_lock(self):
         self.commit('a.txt', 'a')
-        self.herdr()
+        self.linked()
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
         tree = self.sibling()
         request = self.detached()
@@ -2355,7 +2344,7 @@ class CoworkTest(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt' or os.geteuid() == 0, 'POSIX permissions, which root ignores')
     def test_an_unlock_that_fails_after_delivery_is_advisory(self):
         self.commit('a.txt', 'a')
-        self.herdr()
+        self.linked()
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
         tree = self.sibling()
         request = self.detached()
@@ -2377,7 +2366,7 @@ class CoworkTest(unittest.TestCase):
     @unittest.skipIf(os.name == 'nt', 'a symlink')
     def test_a_lane_tree_that_is_not_our_linked_worktree_is_never_touched(self):
         self.commit('a.txt', 'a')
-        self.herdr()
+        self.linked()
         self.send('--lane', 'impl', '--worktree', '--task', 'x')
         tree, ran = self.sibling(), len(self.calls())
         sh(self.root, 'git', 'worktree', 'remove', str(tree))

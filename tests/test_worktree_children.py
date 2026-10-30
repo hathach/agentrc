@@ -10,38 +10,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import guard_survivors  # noqa: E402
+from helpers import guard_survivors, tmpdir  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / 'plugins' / 'worktree-children' / 'worktree_children.py'
-
-STUB = r'''#!/usr/bin/env python3
-import json, os, sys
-with open(os.environ['STUB_LOG'], 'a') as f:
-    f.write(json.dumps(sys.argv[1:]) + '\n')
-mode = open(os.environ['STUB_MODE']).read().strip()
-if sys.argv[1:3] == ['worktree', 'list']:
-    if mode == 'down':
-        sys.exit('herdr server unreachable')
-    if mode == 'recreate':
-        os.makedirs(os.environ['STUB_PARENT'], exist_ok=True)
-    if mode == 'dangle' and not os.path.lexists(os.environ['STUB_PARENT']):
-        os.symlink(os.environ['STUB_PARENT'] + '-gone', os.environ['STUB_PARENT'])
-    path = sys.argv[sys.argv.index('--cwd') + 1]
-    entry = {'path': path, 'is_linked_worktree': True}
-    if mode == 'open':
-        entry['open_workspace_id'] = 'w9'
-    if mode == 'falsy':
-        entry['open_workspace_id'] = False
-    print(json.dumps({'result': {'worktrees': [None] if mode == 'null' else [entry]}}))
-    sys.exit(1 if mode == 'failed' else 0)
-'''
-
-# herdr answering `worktree list` with the entry in entry.json beside it, its path filled in
-ENTRY = r'''import json, os, sys
-entry = json.loads(open(os.path.join(os.path.dirname(__file__), 'entry.json')).read())
-print(json.dumps({'result': {'worktrees': [{**entry, 'path': sys.argv[-1]}]}}))
-'''
+SCRIPT = ROOT / 'lib' / 'worktree_children.py'
 
 # gh: `repo view` names t/repo; `api graphql` prints the search page in $STUB_PRS, else fails
 GH = r'''#!/usr/bin/env python3
@@ -112,13 +84,8 @@ class WorktreeChildren(unittest.TestCase):
         for k in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
                   'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE'):
             self.env.pop(k, None)
-        stub = self.t / 'herdr'
-        stub.write_text(STUB)
-        stub.chmod(0o755)
-        self.calls, self.mode = self.t / 'calls', self.t / 'mode'
-        self.mode.write_text('closed')
-        self.env.update(HERDR_BIN_PATH=str(stub), STUB_LOG=str(self.calls), STUB_MODE=str(self.mode),
-                        HERDR_PLUGIN_STATE_DIR=str(self.t / 'state'), STUB_PARENT=str(self.t / 'wt' / 'parent'))
+        self.calls, self.log = self.t / 'calls', self.t / 'state' / 'agentrc' / 'worktree-remove' / 'log'
+        self.env.update(STUB_LOG=str(self.calls), XDG_STATE_HOME=str(self.t / 'state'))
         gh_dir = self.t / 'gh-bin'
         gh_dir.mkdir()
         (gh_dir / 'gh').write_text(GH)
@@ -158,7 +125,7 @@ class WorktreeChildren(unittest.TestCase):
 
     def repo(self, name, github=False):
         """A repository at t/<name> on master, pushed to its bare origin t/<name>.git, or with github
-        t/github.com/<name>.git, a path the plugin takes for a GitHub remote."""
+        t/github.com/<name>.git, a path the module takes for a GitHub remote."""
         path = self.t / name
         origin = self.t / ('github.com' if github else '') / f'{name}.git'
         self.git('init', '-q', '--bare', '-b', 'master', str(origin), cwd=self.t)
@@ -224,27 +191,44 @@ class WorktreeChildren(unittest.TestCase):
     def drop_parent(self):
         self.git('worktree', 'remove', '--force', str(self.parent), cwd=self.main)
 
-    def run_script(self, *argv, env=None):
+    def replace_parent(self, mode):
+        """Shell moving a replacement in at the parent path, a directory or with `dangle` a dangling symlink,
+        unless one is there."""
+        parent = shlex.quote(str(self.parent))
+        make = f'ln -s {parent}-gone {parent}' if mode == 'dangle' else f'mkdir {parent}'
+        return f'[ -e {parent} ] || [ -L {parent} ] || {make}'
+
+    def run_script(self, *argv, env=None, cwd=None):
         return subprocess.run([sys.executable, str(SCRIPT), *argv], env={**self.env, **(env or {})},
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, cwd=cwd)
 
     def cleanup(self):
         self.drop_parent()
         return self.run_script('cleanup', str(self.parent))
 
-    def notifications(self):
+    def retry(self, *branches):
+        """The retry command the script logs for the parent and branches, (common, name, tip) each."""
+        return shlex.join([sys.executable, str(SCRIPT), 'cleanup', str(self.parent),
+                           *[a for b in branches for a in ('--branch', *map(str, b))]])
+
+    def logged_retries(self):
+        """The retry commands in the log, each split into its arguments."""
+        lines = [line.split(' ', 2)[2] for line in self.log.read_text(encoding='utf-8').splitlines()]
+        return [shlex.split(line.removeprefix('retry: ')) for line in lines if line.startswith('retry: ')]
+
+    def gh_calls(self):
         if not self.calls.exists():
             return []
-        return [c for c in map(json.loads, self.calls.read_text().splitlines()) if c[:2] == ['notification', 'show']]
+        return [c for c in map(json.loads, self.calls.read_text().splitlines()) if c[:1] == ['gh']]
 
     def assert_kept(self, child, reason):
         done = self.cleanup()
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertTrue(child.is_dir())
+        self.assertIn(f'kept {child}: ', done.stdout)
         self.assertIn(reason, done.stdout)
-        [note] = self.notifications()
-        self.assertIn(child.name, note[note.index('--body') + 1])
-        self.assertIn(f'cleanup {self.parent}', note[note.index('--body') + 1])
+        self.assertIn(f'retry: {self.retry()}\n', done.stdout)
+        self.assertIn(f'retry: {self.retry()}\n', self.log.read_text(encoding='utf-8'))
 
     def assert_removed(self, *children):
         done = self.cleanup()
@@ -265,8 +249,8 @@ class WorktreeChildren(unittest.TestCase):
         self.assertIn('deleted branch child', done.stdout)
         self.assertEqual((self.sentinel / 'keep').read_text(), 'shared target')
         self.assertNotIn(str(child), self.git('worktree', 'list', cwd=self.main))
-        self.assertEqual(self.notifications(), [])
-        self.assertIn(f'removed {child}', (self.t / 'state' / 'log').read_text())
+        self.assertNotIn('retry: ', done.stdout)
+        self.assertIn(f'removed {child}', self.log.read_text(encoding='utf-8'))
 
     def test_grandchildren_and_children_of_other_repositories_go_too_and_other_entries_stay(self):
         other = self.repo('other')
@@ -394,26 +378,6 @@ class WorktreeChildren(unittest.TestCase):
         gitdir = Path(self.git('rev-parse', '--absolute-git-dir', cwd=child).strip())
         (gitdir / 'MERGE_HEAD').write_text(self.git('rev-parse', 'HEAD', cwd=child))
         self.assert_kept(child, 'MERGE_HEAD in progress')
-
-    def test_an_open_or_unconfirmed_herdr_workspace_keeps_the_child(self):
-        for mode, reason in (('open', 'open in herdr workspace w9'), ('down', 'herdr could not list it'),
-                             ('failed', 'herdr could not list it'), ('null', 'herdr could not list it'),
-                             ('falsy', 'malformed entry')):
-            with self.subTest(mode):
-                self.tearDown()
-                self.setUp()
-                child = self.child()
-                self.mode.write_text(mode)
-                self.assert_kept(child, reason)
-
-    def test_a_missing_herdr_keeps_every_child_and_reports_them(self):
-        kids = [self.child(), self.child('second')]
-        self.drop_parent()
-        done = self.run_script('cleanup', str(self.parent), env={'HERDR_BIN_PATH': str(self.t / 'no-herdr')})
-        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        for kid in kids:
-            self.assertTrue(kid.is_dir())
-            self.assertIn(f'kept {kid}: herdr could not list it', done.stdout)
 
     def test_a_private_ref_on_a_unique_commit_keeps_the_child(self):
         child = self.child()
@@ -660,20 +624,6 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual((child / 'late.txt').read_text(), 'late\n')
         self.assertIn(f'kept {child}: `git worktree remove` failed', done.stdout)
 
-    def test_a_long_report_keeps_the_retry_command_in_the_notification(self):
-        kids = [self.child(f'k{i}') for i in range(3)]
-        for kid in kids:
-            deep = kid / 'build' / '/'.join(['d' * 200] * 3)
-            self.git('init', '-q', str(deep), cwd=kid)
-        self.drop_parent()
-        done = self.run_script('cleanup', str(self.parent))
-        self.assertEqual(done.returncode, 1)
-        [note] = self.notifications()
-        body = note[note.index('--body') + 1]
-        self.assertIn(f'cleanup {self.parent}', body)
-        self.assertIn(str(self.t / 'state' / 'log'), body)
-        self.assertLessEqual(len(body), 1000)
-
     # --- branches ----------------------------------------------------------------------
 
     def oid(self, ref, repo=None):
@@ -704,12 +654,10 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertFalse(child.exists())
         self.assertTrue(self.branch_exists('child'))
-        self.assertIn('kept branch child', done.stdout)
-        [note] = self.notifications()
-        self.assertIn('branch child: commits on no origin branch', note[note.index('--body') + 1])
-        log = (self.t / 'state' / 'log').read_text()
+        self.assertIn(f'kept branch child in {self.main / ".git"}: commits on no origin branch', done.stdout)
+        log = self.log.read_text(encoding='utf-8')
         retry = ['cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'child', tip]
-        self.assertIn(f'its branch is retried by: {shlex.join([str(SCRIPT), *retry])}', log)
+        self.assertIn(f'its branch is retried by: {self.retry((self.main / ".git", "child", tip))}', log)
         self.assertLess(log.index('its branch is retried by'), log.index(f'removed {child}'))
         self.git('push', '-q', 'origin', 'child', cwd=self.main)
         done = self.run_script(*retry)
@@ -724,7 +672,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn('kept branch foreign', done.stdout)
         self.assertIn('commits on no origin branch and no PR head', done.stdout)
-        self.assertEqual([c for c in map(json.loads, self.calls.read_text().splitlines()) if c[:1] == ['gh']], [])
+        self.assertEqual(self.gh_calls(), [])
 
     def test_a_pr_head_branch_goes_and_a_wrong_head_or_failed_lookup_keeps_it(self):
         child, tip = self.squashed('feat')
@@ -836,43 +784,33 @@ class WorktreeChildren(unittest.TestCase):
         for kid in kids:
             self.assertFalse(kid.exists())
         self.assertEqual(done.stdout.count('malformed answer'), 2)
-        [retry] = [shlex.split(l.removeprefix('retry: '))[2:] for l in done.stdout.splitlines() if l.startswith('retry: ')]
+        [retry] = [shlex.split(l.removeprefix('retry: '))[3:] for l in done.stdout.splitlines() if l.startswith('retry: ')]
         node = {'headRefName': 'a', 'headRefOid': self.oid('a'), 'state': 'OPEN', 'mergedAt': None, 'number': 1}
         for missing in ('number', 'headRefOid'):
             answer = {'nodes': [{k: v for k, v in node.items() if k != missing}], 'issueCount': 1}
             (self.t / 'prs').write_text(json.dumps(answer))
-            self.calls.unlink()
             done = self.run_script('cleanup', *retry, env={'STUB_PRS': str(self.t / 'prs')})
             self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
             self.assertIn('kept branch a in', done.stdout)
             self.assertIn('malformed answer', done.stdout)
             self.assertIn('kept branch b in', done.stdout)
-            [note] = self.notifications()
-            self.assertIn('2 branch(es)', note[note.index('show') + 1])
+            self.assertIn(f"retry: {shlex.join([sys.executable, str(SCRIPT), 'cleanup', *retry])}\n", done.stdout)
         self.assertTrue(self.branch_exists('a') and self.branch_exists('b'))
 
-    def test_the_event_settles_the_parents_branch_from_its_workspace_snapshot(self):
+    def test_the_parents_branch_is_settled_from_its_branch_arguments_and_a_repeat_finds_nothing_to_do(self):
         self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
+        tip = self.oid('parent')
         child = self.child()
         self.drop_parent()
-        event = {'event': 'worktree.removed', 'data': {
-            'type': 'worktree_removed', 'workspace_id': 'w1', 'forced': False,
-            'workspace': {'workspace_id': 'w1', 'worktree': {
-                'repo_key': str(self.main / '.git'), 'repo_name': 'main', 'repo_root': str(self.main),
-                'checkout_path': str(self.parent), 'is_linked_worktree': True}},
-            'worktree': {'path': str(self.parent), 'branch': 'parent', 'is_bare': False, 'is_detached': False,
-                         'is_prunable': False, 'is_linked_worktree': True, 'label': 'parent'}}}
-        done = self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': json.dumps(event)})
+        retry = ['cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip]
+        done = self.run_script(*retry)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertFalse(self.branch_exists('parent'))
         self.assertFalse(child.exists())
         self.assertFalse(self.branch_exists('child'))
-        self.git('branch', 'parent', 'master', cwd=self.main)
-        del event['data']['workspace']
-        done = self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': json.dumps(event)})
-        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn('kept branch parent: the event names no repository', done.stdout)
-        self.assertTrue(self.branch_exists('parent'))
+        done = self.run_script('cleanup', str(self.parent))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn('retry: ', done.stdout)
 
     # --- agents ----------------------------------------------------------------------
 
@@ -907,9 +845,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertIn(f'kept {owned}: owned by parent--z, which stays', done.stdout)
         self.assertIn(f'kept {target}: parent--z, which stays, links into it', done.stdout)
         self.assertIn(f'kept {chained}: parent--z--dep, which stays, links into it', done.stdout)
-        [note] = self.notifications()
-        for kid in (target, chained, owned):
-            self.assertIn(kid.name, note[note.index('--body') + 1])
+        self.assertEqual(self.logged_retries(), [shlex.split(self.retry())])
 
     def test_every_child_a_staying_childs_link_passes_through_stays(self):
         bridge, target = self.child('bridge'), self.child('dep')
@@ -986,8 +922,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertTrue(child.is_dir())
         self.assertTrue(self.branch_exists('parent'))
         self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists', done.stdout)
-        command = [str(SCRIPT), 'cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip]
-        self.assertIn(f'retry: {shlex.join(command)}', done.stdout)
+        self.assertIn(f'retry: {self.retry((self.main / ".git", "parent", tip))}', done.stdout)
 
     def test_a_dangling_symlink_at_the_parent_path_stops_the_sweep(self):
         child = self.child()
@@ -997,6 +932,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertTrue(child.is_dir())
         self.assertIn(f'{self.parent} exists: not touching its children', done.stdout)
+        self.assertIn(f'retry: {self.retry()}\n', done.stdout)
 
     def test_a_parent_recreated_during_the_checks_stops_the_sweep(self):
         for mode in ('recreate', 'dangle'):  # a dangling symlink occupies the path too
@@ -1006,9 +942,11 @@ class WorktreeChildren(unittest.TestCase):
                 kids = [self.child(), self.child('second')]
                 self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
                 tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
-                self.mode.write_text(mode)
                 self.drop_parent()
-                done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
+                checked = self.t / 'checked'
+                done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip,
+                                       env=self.git_wrapper(f'*" --show-toplevel "*) echo "$*" >> "{checked}"; '
+                                                            f'{self.replace_parent(mode)}'))
                 self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
                 self.assertTrue(os.path.lexists(self.parent))
                 for kid in kids:
@@ -1016,11 +954,9 @@ class WorktreeChildren(unittest.TestCase):
                     self.assertNotIn(f'removed {kid}', done.stdout)
                 self.assertTrue(self.branch_exists('parent'), done.stdout)
                 self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
-                self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}",
-                              done.stdout)
-                calls = map(json.loads, self.calls.read_text().splitlines())
-                lists = [c for c in calls if c[:2] == ['worktree', 'list']]
-                self.assertEqual(len(lists), 1, 'the second child is not checked once the parent is back')
+                self.assertIn(f'retry: {self.retry((self.main / ".git", "parent", tip))}\n', done.stdout)
+                [check] = checked.read_text().splitlines()
+                self.assertIn(f'-C {kids[0]} ', check, 'the second child is not checked once the parent is back')
 
     def test_a_parent_seen_once_during_the_checks_stops_the_sweep_though_it_is_gone_again(self):
         kids = [self.child(), self.child('second')]
@@ -1035,6 +971,13 @@ class WorktreeChildren(unittest.TestCase):
             self.assertTrue(kid.is_dir(), done.stdout)
         self.assertTrue(self.branch_exists('parent') and self.branch_exists('child'), done.stdout)
         self.assertIn(f'{self.parent} exists again: not touching its children', done.stdout)
+        self.assertIn(f'retry: {self.retry((self.main / ".git", "parent", tip))}\n', done.stdout)
+        done = subprocess.run([sys.executable, '-c', BLINK, str(SCRIPT), 'cleanup', str(self.parent)],
+                              env=self.env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        for kid in kids:
+            self.assertTrue(kid.is_dir(), done.stdout)
+        self.assertIn(f'retry: {self.retry()}\n', done.stdout)
 
     def test_a_parent_recreated_during_a_failing_check_keeps_the_queued_branches(self):
         for mode in ('recreate', 'dangle'):
@@ -1045,68 +988,99 @@ class WorktreeChildren(unittest.TestCase):
                 (kid / 'dirty.txt').write_text('uncommitted')
                 self.git('push', '-q', 'origin', 'parent', cwd=self.parent)
                 tip = self.git('rev-parse', 'parent', cwd=self.main).strip()
-                self.mode.write_text(mode)
                 self.drop_parent()
-                done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
+                done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip,
+                                       env=self.git_wrapper(f'*" status --porcelain "*) {self.replace_parent(mode)}'))
                 self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                self.assertIn(f'kept {kid}: uncommitted or untracked changes', done.stdout)
                 self.assertTrue(kid.is_dir(), done.stdout)
                 self.assertTrue(self.branch_exists('parent'), done.stdout)
                 self.assertIn(f'kept branch parent in {self.main / ".git"}: {self.parent} exists again', done.stdout)
-                self.assertIn(f"retry: {shlex.join([str(SCRIPT), 'cleanup', str(self.parent), '--branch'])}",
-                              done.stdout)
+                self.assertIn(f'retry: {self.retry((self.main / ".git", "parent", tip))}\n', done.stdout)
 
-    def test_the_event_reads_herdrs_envelope_and_bad_events_are_usage_errors(self):
+    def test_an_unknown_subcommand_or_malformed_arguments_print_usage_and_change_nothing(self):
         child = self.child()
         self.drop_parent()
-        event = {'event': 'worktree.removed', 'data': {'type': 'worktree_removed', 'workspace_id': 'w1',
-                 'worktree': {'path': str(self.parent)}, 'forced': True}}
-        done = self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': json.dumps(event)})
+        for argv in ([], ['event'], ['frobnicate', str(self.parent)], ['cleanup'],
+                     ['cleanup', str(self.parent), '--branch', 'a', 'b'], ['cleanup', str(self.parent), 'x']):
+            done = self.run_script(*argv)
+            self.assertEqual(done.returncode, 2, argv)
+            self.assertIn('cleanup <parent> [--branch', done.stderr, argv)
+            self.assertTrue(child.is_dir(), argv)
+        self.assertFalse(self.log.exists())
+
+    def test_a_retry_from_inside_a_child_or_with_the_script_or_log_inside_one_is_refused(self):
+        clean, dirty = self.child(), self.child('dirty')
+        (dirty / 'notes.txt').write_text('wip')
+        self.drop_parent()
+        copy = dirty / 'build' / 'lib' / 'worktree_children.py'
+        copy.parent.mkdir()
+        shutil.copy(SCRIPT, copy)
+        state = dirty / 'build' / 'state'
+        log = state / 'agentrc' / 'worktree-remove' / 'log'
+        for what, path, script, env, cwd in (
+                ('the working directory', dirty / 'build', SCRIPT, {}, dirty / 'build'),
+                ('the log', log, SCRIPT, {'XDG_STATE_HOME': str(state)}, None),
+                ('worktree_children', copy, copy, {}, None)):
+            with self.subTest(what):
+                done = subprocess.run([sys.executable, str(script), 'cleanup', str(self.parent)],
+                                      env={**self.env, **env}, cwd=cwd, capture_output=True, text=True)
+                self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                self.assertIn(f'refused: {what} {path} lies inside {dirty}; run this from outside it', done.stderr)
+                self.assertEqual(done.stdout, '')
+                self.assertTrue(clean.is_dir() and dirty.is_dir())
+                self.assertTrue(self.branch_exists('child'))
+        self.assertFalse(self.log.exists())
+        self.assertFalse(state.exists())
+
+    def test_a_retry_with_the_log_under_the_removed_parent_is_refused(self):
+        child = self.child()
+        tip = self.git('rev-parse', 'HEAD', cwd=self.parent).strip()
+        self.drop_parent()
+        state = self.parent / 'build' / 'state'
+        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip,
+                               env={'XDG_STATE_HOME': str(state)})
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn(f'refused: the log {state / "agentrc" / "worktree-remove" / "log"} lies inside {self.parent}',
+                      done.stderr)
+        self.assertFalse(os.path.lexists(self.parent))
+        self.assertTrue(child.is_dir() and self.branch_exists('parent'))
+
+    def test_an_incomplete_cleanup_logs_a_retry_that_finishes_it_from_outside(self):
+        dirty, unpushed = self.child('dirty'), self.child('side', push=False)
+        (dirty / 'notes.txt').write_text('wip')
+        side = self.commit(unpushed, 'side.txt', 'side')
+        tip = self.commit(self.parent, 'parent.txt', 'parent')
+        self.drop_parent()
+        done = self.run_script('cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'parent', tip)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn(f'kept {dirty}: uncommitted or untracked changes', done.stdout)
+        self.assertFalse(unpushed.exists())
+        self.assertTrue(self.branch_exists('parent') and self.branch_exists('side'))
+        [retry] = self.logged_retries()
+        common = str(self.main / '.git')
+        self.assertEqual(retry[:4], [sys.executable, str(SCRIPT), 'cleanup', str(self.parent)])
+        self.assertEqual(sorted(zip(*[iter(retry[4:])] * 4)),
+                         [('--branch', common, 'parent', tip), ('--branch', common, 'side', side)])
+        (dirty / 'notes.txt').unlink()
+        self.git('push', '-q', 'origin', 'parent', 'side', cwd=self.main)
+        done = subprocess.run(retry, env=self.env, cwd=self.t, capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertFalse(child.exists())
-        self.assertEqual(self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': json.dumps(event)}).returncode, 0,
-                         'a repeated event finds nothing to do')
-        for bad in ('{}', 'not json', json.dumps({'data': {'worktree': {'path': 'relative'}}})):
-            self.assertEqual(self.run_script('event', env={'HERDR_PLUGIN_EVENT_JSON': bad}).returncode, 2, bad)
-        for argv in ([], ['cleanup', str(self.parent), '--branch', 'a', 'b'], ['cleanup', str(self.parent), 'x']):
-            self.assertEqual(self.run_script(*argv).returncode, 2, argv)
+        self.assertFalse(dirty.exists())
+        for branch in ('parent', 'side', 'dirty'):
+            self.assertFalse(self.branch_exists(branch), branch)
+        self.assertEqual(self.logged_retries(), [retry])
 
-
-
-@unittest.skipIf(os.name == 'nt', 'a stub executable')
-class LinkedWorkspace(unittest.TestCase):
-    def test_a_linked_open_checkout_answers_true_and_a_malformed_entry_is_kept(self):
-        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
-        wc = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(wc)
-        with tempfile.TemporaryDirectory() as tmp:
-            stub, entry = Path(tmp) / 'herdr', Path(tmp) / 'entry.json'
-            stub.write_text(f'#!{sys.executable}\n{ENTRY}')
-            stub.chmod(0o755)
-            for answer, want in (({'is_linked_worktree': True, 'open_workspace_id': 'w1'}, True),
-                                 ({'is_linked_worktree': True}, False),
-                                 ({'is_linked_worktree': True, 'open_workspace_id': None}, False),
-                                 ({'is_linked_worktree': False, 'open_workspace_id': 'w1'}, False)):
-                entry.write_text(json.dumps(answer))
-                self.assertEqual(wc.linked_workspace(tmp, str(stub)), want, answer)
-            for answer in ({'open_workspace_id': 'w1'}, {'is_linked_worktree': 'false', 'open_workspace_id': 'w1'},
-                           {'is_linked_worktree': True, 'open_workspace_id': ''},
-                           {'is_linked_worktree': True, 'open_workspace_id': 1},
-                           {'is_linked_worktree': True, 'open_workspace_id': False},
-                           {'is_linked_worktree': True, 'open_workspace_id': 0}):
-                entry.write_text(json.dumps(answer))
-                for consumer in (lambda: wc.linked_workspace(tmp, str(stub)), lambda: wc.check_herdr(tmp)):
-                    with self.subTest(answer=answer), mock.patch.object(wc, 'HERDR', str(stub)), \
-                            self.assertRaisesRegex(wc.Keep, 'malformed entry'):
-                        consumer()
-            # the removal check keeps any open workspace, whatever the linked flag
-            for answer, kept in (({'is_linked_worktree': True}, False),
-                                 ({'is_linked_worktree': False, 'open_workspace_id': 'w1'}, True)):
-                entry.write_text(json.dumps(answer))
-                with mock.patch.object(wc, 'HERDR', str(stub)):
-                    if kept:
-                        self.assertRaisesRegex(wc.Keep, 'open in herdr workspace w1', wc.check_herdr, tmp)
-                    else:
-                        wc.check_herdr(tmp)
+    def test_a_retry_is_logged_when_only_children_were_kept(self):
+        kept, gone = self.child('a'), self.child('b')
+        (kept / 'notes.txt').write_text('wip')
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertTrue(kept.is_dir())
+        self.assertFalse(gone.exists() or self.branch_exists('b'))
+        self.assertNotIn('kept branch', done.stdout)
+        self.assertEqual(self.logged_retries(), [shlex.split(self.retry())])
+        self.assertTrue(self.log.read_text(encoding='utf-8').endswith(f' retry: {self.retry()}\n'))
 
 
 @unittest.skipIf(os.name == 'nt', 'symlinks')
@@ -1136,7 +1110,111 @@ class Planning(unittest.TestCase):
             self.assertEqual(sorted(walked), ['a', 'b', 'c', 'd'])
 
 
-# prints the locale encoding, then the bytes of linked_worktree(argv[2]) as UTF-8 JSON, with the plugin at argv[1]
+class LinkHops(unittest.TestCase):
+    """link_hops and holds on this platform's own paths, Windows drives included."""
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        self.wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.wc)
+        self.t = tmpdir(self)
+        try:
+            self.link(self.t / 'probe', self.t)
+        except (OSError, NotImplementedError) as err:  # Windows without the symlink privilege
+            self.skipTest(f'cannot create a symlink here: {err}')
+
+    def link(self, link, target):
+        os.symlink(target, link, target_is_directory=True)
+
+    def test_hops_are_absolute_from_the_anchor(self):
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        self.link(kept / 'abs', clean / 'lib')
+        self.link(kept / 'rel', Path('..') / clean.name / 'lib')
+        anchor = os.path.splitdrive(str(self.t))[0] + os.sep
+        for name in ('abs', 'rel'):
+            hops = self.wc.link_hops(str(kept / name))
+            self.assertTrue(all(os.path.isabs(h) and h.startswith(anchor) for h in hops), hops)
+            self.assertIn(str(kept / name), hops)
+            self.assertEqual(hops[-2:], [str(clean), str(clean / 'lib')])
+        self.link(kept / 'up', os.sep.join(['..'] * (len(self.t.parts) + 3) + ['zz']))  # `..` stops at the anchor
+        self.assertEqual(self.wc.link_hops(str(kept / 'up'))[-2:], [str(kept / 'up'), anchor + 'zz'])
+
+    def test_a_kept_siblings_symlink_keeps_the_clean_sibling_it_reaches(self):
+        kept, clean, plain = self.t / 'parent--z', self.t / 'parent--b', self.t / 'parent--w'
+        for tree in (kept, clean / 'lib', plain):
+            tree.mkdir(parents=True)
+        self.link(kept / 'dep', clean / 'lib')
+        self.assertEqual(self.wc.removal_plan([clean, plain], [kept]),
+                         ([plain], {clean: 'parent--z, which stays, links into it'}))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows spells a path in any case')
+    def test_a_link_spelled_in_another_case_still_holds_its_target(self):
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        self.link(kept / 'dep', str(clean / 'lib').swapcase())
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_a_link_ending_at_a_junction_holds_the_junctions_target(self):
+        import _winapi
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        _winapi.CreateJunction(str(clean / 'lib'), str(self.t / 'alias'))
+        self.link(kept / 'dep', self.t / 'alias')
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_a_kept_siblings_junction_keeps_the_clean_sibling_it_reaches(self):
+        import _winapi
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        _winapi.CreateJunction(str(clean / 'lib'), str(kept / 'dep'))
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
+    def assertJunctionThroughASymlinkHolds(self, junction):
+        """junction(path, target) makes a junction: kept/dep through clean/lib, a symlink out of it, holds clean."""
+        kept, clean, outside = self.t / 'parent--z', self.t / 'parent--b', self.t / 'outside'
+        for tree in (kept, clean, outside):
+            tree.mkdir()
+        self.link(clean / 'lib', outside)
+        junction(kept / 'dep', clean / 'lib')
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
+    def test_a_junction_through_a_symlink_in_the_clean_sibling_holds_it(self):
+        islink, isjunction = os.path.islink, os.path.isjunction  # dep a symlink that reports itself a junction
+        with mock.patch('os.path.islink', lambda p: os.path.basename(p) != 'dep' and islink(p)), \
+                mock.patch('os.path.isjunction', lambda p: os.path.basename(p) == 'dep' or isjunction(p)):
+            self.assertJunctionThroughASymlinkHolds(self.link)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_a_real_junction_through_a_symlink_in_the_clean_sibling_holds_it(self):
+        import _winapi
+        self.assertJunctionThroughASymlinkHolds(lambda path, target: _winapi.CreateJunction(str(target), str(path)))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows path forms')
+    def test_windows_targets_are_anchored_on_their_own_drive(self):
+        anchored = self.wc.anchored
+        self.assertEqual(anchored('\\\\?\\D:\\x\\y', 'C:\\w'), ('D:\\', ['x', 'y']))
+        self.assertEqual(anchored('\\\\?\\UNC\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
+        self.assertEqual(anchored('\\\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
+        self.assertEqual(anchored('\\\\?\\UNC\\srv\\share', 'C:\\w'), ('\\\\srv\\share\\', []))
+        self.assertEqual(anchored('\\\\?\\unc\\srv\\share\\x', 'C:\\w'), ('\\\\srv\\share\\', ['x']))
+        self.assertEqual(anchored('\\\\?\\Volume{1}\\x', 'C:\\w'), ('\\\\?\\Volume{1}\\', ['x']))
+        self.assertEqual(anchored('D:/x/y', 'C:\\w'), ('D:\\', ['x', 'y']))
+        self.assertEqual(anchored('\\x', 'C:\\w'), ('C:\\', ['x']))
+        self.assertEqual(anchored('x/y', 'C:\\w'), ('C:\\w', ['x', 'y']))
+        self.assertRaises(OSError, anchored, 'D:x', 'C:\\w')
+
+
+# prints the locale encoding, then the bytes of linked_worktree(argv[2]) as UTF-8 JSON, with the module at argv[1]
 LINKED = r'''import importlib.util, json, locale, os, sys
 spec = importlib.util.spec_from_file_location('worktree_children', sys.argv[1])
 wc = importlib.util.module_from_spec(spec)
@@ -1145,9 +1223,19 @@ print(locale.getpreferredencoding(False))
 print(json.dumps([os.fsencode(p).decode('utf-8') for p in wc.linked_worktree(sys.argv[2])]))
 '''
 
+# prints the locale encoding, then logs each line JSON-encoded in argv[2:]
+LOGGED = r'''import importlib.util, json, locale, sys
+spec = importlib.util.spec_from_file_location('worktree_children', sys.argv[1])
+wc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wc)
+print(locale.getpreferredencoding(False), flush=True)
+for line in sys.argv[2:]:
+    wc.log(json.loads(line))
+'''
 
-@unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
+
 class NonUtf8Locale(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
     def test_a_non_ascii_path_round_trips_whatever_the_locale(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         env.update(HOME=tempfile.gettempdir(), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
@@ -1165,6 +1253,35 @@ class NonUtf8Locale(unittest.TestCase):
                 self.skipTest(f'the C locale encoding is {encoding} here')
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(json.loads(answer), [str(main / '.git' / 'worktrees' / 'ré--kid'), str(main / '.git')])
+
+    @unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
+    def test_a_line_the_locale_cannot_encode_is_printed_and_logged_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, 'XDG_STATE_HOME': tmp, 'LC_ALL': 'C', 'PYTHONCOERCECLOCALE': '0', 'PYTHONUTF8': '0'}
+            env.pop('PYTHONIOENCODING', None)
+            done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LOGGED, str(SCRIPT),
+                                   json.dumps('kept /r\u00e9--k' + os.fsdecode(b'\xff'))], env=env, capture_output=True)
+            encoding, _, printed = done.stdout.partition(b'\n')
+            if encoding.decode().lower().replace('-', '') == 'utf8':
+                self.skipTest(f'the C locale encoding is {encoding.decode()} here')
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(printed, b'kept /r\\xe9--k\\udcff\n')
+            log = Path(tmp) / 'agentrc' / 'worktree-remove' / 'log'
+            self.assertTrue(log.read_bytes().endswith(b' kept /r\xc3\xa9--k\xff\n'))
+
+    def test_a_line_a_narrow_code_page_cannot_encode_is_escaped_and_still_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, 'XDG_STATE_HOME': tmp, 'PYTHONIOENCODING': 'cp1252:strict'}
+            done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LOGGED, str(SCRIPT),
+                                   json.dumps('kept /r\u00e9--\u4e2d'), json.dumps('kept /x\ud800y'),
+                                   json.dumps('kept /m\udcff\ud800')],
+                                  env=env, capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout.splitlines()[1:],
+                             [b'kept /r\xe9--\\u4e2d', b'kept /x\\ud800y', b'kept /m\\udcff\\ud800'])
+            log = (Path(tmp) / 'agentrc' / 'worktree-remove' / 'log').read_bytes()
+            self.assertEqual([line.split(b' ', 2)[2] for line in log.split(os.linesep.encode())[:-1]],
+                             [b'kept /r\xc3\xa9--\xe4\xb8\xad', b'kept /x\\ud800y', b'kept /m\xff\\ud800'])
 
 
 if __name__ == '__main__':

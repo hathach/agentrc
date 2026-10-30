@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Remove the sibling child worktrees of a herdr worktree once herdr has removed it.
+"""Remove the sibling child worktrees of a linked worktree once the worktree-remove skill has removed it.
 
-    worktree_children.py event               # herdr's worktree.removed hook (HERDR_PLUGIN_EVENT_JSON)
-    worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
+    python3 lib/worktree_children.py cleanup <parent> [--branch <common git dir> <branch> <oid>]...  # a retry
 
 Children of `<dir>/<name>` are the entries `<dir>/<name>--*` (grandchildren `<name>--a--b`
 too, unless `<name>--a` stays) with a `.git` file that are linked git worktrees of any repository: the `<name>--`
@@ -13,8 +12,6 @@ replacement parent.
 A child is removed only when every check below passes; otherwise it is kept and its reasons reported.
 `git worktree remove` re-checks cleanliness at removal; `--force`, which skips that, is used only
 for a child with submodules (git refuses those otherwise), so a write racing its checks is lost.
-- herdr confirms it is not open as its own workspace (`herdr worktree list --cwd <child>`);
-  herdr unreachable or an unexpected answer keeps it;
 - no chief session (headless or interactive) runs in it and none of its cowork lanes holds a
   request (running or undelivered); the skills' own code decides, and code that cannot load keeps it;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
@@ -27,6 +24,8 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   refs/worktree/reviewr/turn-base and base-pick, is not checked;
 - no repository (bare ones included) or worktree is nested anywhere below it (ignored
   directories included) other than its submodules;
+- no Windows junction below it: `git worktree remove` would leave it and the directories above it;
+  one in git's own storage, its submodules' `.git` directories or its git dir, is not looked for;
 - every repository whose storage the removal deletes (submodule git dirs inside the child or
   inside its git dir, initialized or not) has no stash, no linked worktree (even one inside the
   child or pruned), its main worktree inside that boundary, and
@@ -40,11 +39,10 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   keeps them all. Removals go holders first, and a child whose removal fails keeps what it holds;
   children linking in a cycle, which no order protects, are kept with what they hold.
 Deleted by policy: ignored files and commits only a reflog still names. No `git worktree prune`
-runs: it would touch unrelated worktrees. herdr removes the parent before this runs, with its
-own checks only: the worktree-remove skill's pending-work gate is skipped by a removal from
-herdr's menu.
+runs: it would touch unrelated worktrees. worktree-remove removes the parent, after its pending-work
+gate, before this runs.
 
-Branches: the parent's (the event's branch in its `repo_key` repository) and each removed
+Branches: the parent's (worktree-remove passes its branch and tip) and each removed
 child's are deleted when nothing but the branch name is lost, otherwise kept with a reason:
 - not symbolic, at the object id recorded before the removal, checked out in no worktree,
   and not the default branch its remote advertises;
@@ -56,10 +54,11 @@ child's are deleted when nothing but the branch name is lost, otherwise kept wit
 - any failed or incomplete lookup keeps it.
 The ref is deleted against its recorded id (`update-ref -d`), then its `branch.<name>` config.
 
-Each action is printed and appended to $HERDR_PLUGIN_STATE_DIR/log, each branch's retry
-arguments before its checkout is removed; anything kept or failed also raises one herdr
-notification naming the retry command. Exit 0 every child and branch removed (or none found),
-1 something kept or a removal failed, 2 bad input or a parent that exists again.
+Each action is printed and appended to ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/log,
+each branch's retry arguments before its checkout is removed and the retry command after anything
+kept. A retry is refused (exit 2) from a working directory inside the parent's path or a child, or
+with this file or the log inside or reached through one. Exit 0 every child and branch removed (or
+none found), 1 something kept or a removal failed, 2 bad input or a parent that exists again.
 """
 import functools
 import json
@@ -78,10 +77,8 @@ GIT_LOCATION = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 
                 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_NAMESPACE')
 ENV = {k: v for k, v in os.environ.items() if k not in GIT_LOCATION}  # so `git -C <child>` means the child
 OPERATIONS = ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'BISECT_LOG')
-HERDR = os.environ.get('HERDR_BIN_PATH') or 'herdr'
-STATE = os.environ.get('HERDR_PLUGIN_STATE_DIR')
-LOG = Path(STATE) / 'log' if STATE else None
-SKILLS = Path(__file__).resolve().parents[2] / 'skills'
+LOG = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state') / 'agentrc' / 'worktree-remove' / 'log'
+SKILLS = Path(__file__).resolve().parents[1] / 'skills'
 SEARCH = '''query($q: String!, $endCursor: String) {
   search(query: $q, type: ISSUE, first: 100, after: $endCursor) {
     issueCount
@@ -156,9 +153,10 @@ def common_dir(gitdir):
 
 
 def walk(top):
-    """Top-down os.walk (symlinks listed, not entered) that also yields each directory's symlink names,
-    and keeps the child on an entry it cannot list or classify, a symlink whose target cannot be read
-    included: os.walk and os.path.isdir file an entry whose stat fails as a non-directory."""
+    """Top-down os.walk (symlinks and Windows junctions listed, not entered) that also yields each
+    directory's symlink and junction names, and keeps the child on an entry it cannot list or classify,
+    a symlink whose target cannot be read included: os.walk and os.path.isdir file an entry whose stat
+    fails as a non-directory."""
     stack = [top]
     while stack:
         top = stack.pop()
@@ -167,9 +165,10 @@ def walk(top):
             with os.scandir(top) as listing:
                 for entry in listing:
                     try:
-                        if entry.is_symlink():
+                        link = entry.is_symlink() or entry.is_junction()  # is_symlink() is False for a junction
+                        if link:
                             links.append(entry.name)
-                        if entry.is_dir(follow_symlinks=False):
+                        if entry.is_dir(follow_symlinks=False) and not link:
                             real.add(entry.name)
                         elif not entry.is_dir():  # a dangling link is a file; a looping one raises
                             files.append(entry.name)
@@ -221,40 +220,6 @@ def linked_worktree(child):
     return Path(gitdir), Path(common)
 
 
-def herdr_entry(path, herdr=None):
-    """herdr's `worktree list` entry for the checkout at path, asking `herdr` (default HERDR), its
-    `is_linked_worktree` a bool and its `open_workspace_id` absent, null or a nonempty string; Keep when
-    herdr cannot say or answers with a malformed entry."""
-    done = run([herdr or HERDR, 'worktree', 'list', '--cwd', str(path)])
-    try:
-        if done.returncode:
-            raise ValueError
-        mine = [w for w in json.loads(done.stdout)['result']['worktrees']
-                if os.path.realpath(w['path']) == os.path.realpath(path)]
-    except (ValueError, KeyError, TypeError):
-        raise Keep(f'herdr could not list it (exit {done.returncode}: {done.stderr.strip()[:200]})')
-    if len(mine) != 1:
-        raise Keep('herdr does not list it')
-    linked, workspace = mine[0].get('is_linked_worktree'), mine[0].get('open_workspace_id')
-    if not isinstance(linked, bool) or not (workspace is None or isinstance(workspace, str) and workspace):
-        raise Keep(f'herdr answered `worktree list` for {path} with a malformed entry: {mine[0]}')
-    return mine[0]
-
-
-def linked_workspace(path, herdr=None):
-    """Whether herdr lists the checkout at path as a linked worktree open in a workspace, where a new
-    worktree of the cowork and pr-review skills goes beside it; Keep when herdr cannot say or answers
-    with a malformed entry."""
-    entry = herdr_entry(path, herdr)
-    return entry['is_linked_worktree'] and entry.get('open_workspace_id') is not None
-
-
-def check_herdr(child):
-    workspace = herdr_entry(child).get('open_workspace_id')
-    if workspace:
-        raise Keep(f'open in herdr workspace {workspace}')
-
-
 def check_repo(path):
     """Uncommitted state of one checkout (the child or a submodule); returns its git dir."""
     if git('status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none', cwd=path).strip():
@@ -278,9 +243,14 @@ def submodules(child):
 def nested_repo(child, allowed):
     """A .git file or directory or a bare repository below child other than at child and its submodules,
     or None. The whole tree: a repository initialized inside a tracked directory shows in no status or
-    ignored listing."""
+    ignored listing. Keep for a Windows junction below child outside the .git directories it skips: Git
+    for Windows' removal (dir.c remove_dir_recurse) neither enters nor deletes one, nor any directory above it."""
     allowed = {os.path.realpath(p) for p in [child, *allowed]}
-    for top, dirs, files, _ in walk(child):
+    for top, dirs, files, links in walk(child):
+        junction = next((p for p in (os.path.join(top, n) for n in links) if os.path.isjunction(p)), None)
+        if junction:
+            raise Keep(f'holds a junction at {junction}, which `git worktree remove` leaves in place: '
+                       'remove the junction first')
         if ('.git' in dirs or '.git' in files or is_store(dirs, files)) and os.path.realpath(top) not in allowed:
             return top
         if '.git' in dirs:
@@ -381,16 +351,34 @@ def content_check(child):
     return common, bool(subs) or (gitdir / 'modules').exists()
 
 
-def check(child):
-    """content_check for a child herdr has not open as a workspace of its own."""
-    check_herdr(child)
-    return content_check(child)
+def anchored(path, here):
+    """(the directory path resolves from, the names after it): path's own drive and root when it has
+    a root (here's drive when it names none, as Windows reads `\\x`), else here. Windows' `\\\\?\\`
+    prefix, which readlink can return, is dropped and either separator splits. A bare UNC share
+    (`\\\\srv\\share`) is its own root. A drive-relative path (`C:x`), relative to that drive's working
+    directory, raises OSError."""
+    if os.altsep:
+        path = path.replace(os.altsep, os.sep)
+    if os.name == 'nt' and path.startswith('\\\\?\\'):  # a volume GUID path keeps it: a drive letter need not name it
+        path = ('\\\\' + path[8:] if path[4:8].upper() == 'UNC\\' else
+                path[4:] if re.match(r'[A-Za-z]:', path[4:]) else path)
+    drive, tail = os.path.splitdrive(path)
+    if os.name == 'nt' and drive.startswith(os.sep * 2) and not tail:  # a UNC share names no directory
+        return drive + os.sep, []
+    if not tail.startswith(os.sep):
+        if drive:
+            raise OSError(f'cannot resolve the drive-relative path {path}')
+        return here, tail.split(os.sep)
+    return (drive or os.path.splitdrive(here)[0]) + os.sep, tail.lstrip(os.sep).split(os.sep)
 
 
 def link_hops(link):
     """Every path resolving link enters, each directory resolved: a link reaches every tree on the
-    way, through a symlink or a `..`, not only its final target."""
-    hops, path, rest, links = [], os.sep, os.path.abspath(link).split(os.sep), 0
+    way, through a symlink, a Windows junction or a `..`, not only its final target. Each hop is
+    absolute, from the anchor (`/`, a drive's root or a UNC share's), which `..` never climbs above."""
+    hops, links, link = [], 0, os.fspath(link)
+    # not abspath: it would drop a `..` before the symlink it climbs out of is followed
+    path, rest = anchored(link if os.path.isabs(link) else os.path.join(os.getcwd(), link), '')
     while rest:
         name = rest.pop(0)
         if name in ('', '.'):
@@ -400,25 +388,32 @@ def link_hops(link):
             continue
         step = os.path.join(path, name)
         hops.append(step)
-        if not os.path.islink(step):
+        if not (os.path.islink(step) or os.path.isjunction(step)):  # islink is False for a junction
             path = step
             continue
         links += 1
         if links > 40:  # Linux's own limit: a loop
             raise OSError(f'too many levels of symbolic links in {link}')
-        target = os.readlink(step)
-        path = os.sep if os.path.isabs(target) else path
-        rest = target.split(os.sep) + rest
+        path, names = anchored(os.readlink(step), path)
+        rest = names + rest
     return hops
 
 
 def reach(tree, scan):
     """(the paths tree's symlinks enter, the error that stopped searching it or None), searched once
-    per scan, the cache of one planning pass: a big tree takes tens of seconds to walk."""
+    per scan, the cache of one planning pass: a big tree takes tens of seconds to walk. On Windows,
+    where link_hops follows symlinks and junctions only, not the subst or mapped drives on the way,
+    each hop is case-folded twice as holds spells its roots: with its directory resolved, so a
+    symlink hop still names the tree it sits in, and resolved whole, for where it ends up."""
     if tree not in scan:
         try:
-            scan[tree] = [hop for top, _, _, links in walk(tree) for name in links
-                          for hop in link_hops(os.path.join(top, name))], None
+            hops = [hop for top, _, _, links in walk(tree) for name in links
+                    for hop in link_hops(os.path.join(top, name))]
+            if os.name == 'nt':
+                hops = [os.path.normcase(h) for hop in set(hops) for h in (
+                    os.path.join(os.path.realpath(os.path.dirname(hop)), os.path.basename(hop)),
+                    os.path.realpath(hop))]
+            scan[tree] = hops, None
         except (Keep, OSError) as err:
             scan[tree] = [], err
     return scan[tree]
@@ -436,7 +431,7 @@ def holds(leaving, staying, scan):
                 held[path] = f'owned by {stay.name}, which stays'
             else:
                 targets, blind = reach(stay, scan)  # searched only when a name does not settle it
-                root = os.path.realpath(path)
+                root = os.path.normcase(os.path.realpath(path))
                 if blind:
                     held[path] = f'cannot tell whether {stay.name}, which stays, links into it: {blind}'
                 elif any(t == root or t.startswith(root + os.sep) for t in targets):
@@ -590,52 +585,50 @@ def delete_branch(common, branch, tip):
     return proof
 
 
+def remove_argv(child, common, force):
+    return ['git', '--git-dir', str(common), 'worktree', 'remove', *['--force'] * force, str(child)]
+
+
 def remove(child, common, force):
-    done = run(['git', '--git-dir', str(common), 'worktree', 'remove', *['--force'] * force, str(child)])
+    done = run(remove_argv(child, common, force))
     if done.returncode:
         raise Keep(f'`git worktree remove` failed, possibly part way: {done.stderr.strip()}')
 
 
+def stored(text):
+    """text as the log and reports keep it: UTF-8 in the platform's line ends, each byte os.fsdecode
+    escaped restored and any other lone surrogate, as a Windows name can hold, backslash-escaped."""
+    text = re.sub('[\ud800-\udc7f\udd00-\udfff]', lambda m: f'\\u{ord(m[0]):04x}', text)
+    return text.replace('\n', os.linesep).encode('utf-8', 'surrogateescape')
+
+
 def log(line):
-    print(line, flush=True)
-    if LOG:
-        LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(LOG, 'a') as f:
-            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:  # a stdout in a narrower code page; the log below keeps the exact line
+        print(line.encode(sys.stdout.encoding, 'backslashreplace').decode(sys.stdout.encoding), flush=True)
+    data = stored(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG, 'ab') as f:
+        f.write(data)
 
 
 def retry(parent, branches):
-    return shlex.join([str(Path(__file__).resolve()), 'cleanup', str(parent),
+    return shlex.join([sys.executable, str(Path(__file__).resolve()), 'cleanup', str(parent),
                        *[a for b in branches for a in ('--branch', *map(str, b))]])
 
 
-def notify(parent, kept, branches, retried):
-    tail = f' Retry: {Path(__file__).resolve()} cleanup {parent}'
-    tail += ' with the --branch arguments the log names' if retried else ''
-    tail += f' Full report: {LOG}' if LOG else ''
-    reasons = '; '.join(f'{name}: {why}' for name, why in kept + [(f'branch {b}', why) for b, why in branches])
-    room = 999 - len(tail)  # a toast, not the report: 1000 characters, the '.' included
-    if len(reasons) > room:
-        reasons = reasons[:max(0, room - 3)] + '...'
-    run([HERDR, 'notification', 'show',
-         f'Kept {len(kept)} child worktree(s) and {len(branches)} branch(es) of {Path(parent).name}',
-         '--body', reasons + '.' + tail, '--sound', 'request'])
-
-
-def cleanup(parent, branches=(), kept_branches=()):
+def cleanup(parent, branches=()):
     """Remove parent's clean children, then delete the given branches and each removed child's;
-    a branch is (common git dir, name, tip); kept_branches pairs a branch name with why it stays."""
+    a branch is (common git dir, name, tip)."""
     parent = Path(parent)
-    for name, why in kept_branches:
-        log(f'kept branch {name}: {why}')
     if os.path.lexists(parent):
         log(f'{parent} exists: not touching its children')
         for branch in branches:
             log(f'kept branch {branch[1]} in {branch[0]}: {parent} exists')
-        if branches:
-            log(f'retry: {retry(parent, branches)}')
+        log(f'retry: {retry(parent, branches)}')
         return 2
-    kept, kept_branches, unsettled = [], list(kept_branches), []
+    kept, unsettled = [], []
 
     def keep(child, why):
         kept.append((child.name, str(why)))
@@ -650,7 +643,7 @@ def cleanup(parent, branches=(), kept_branches=()):
         if stopped:
             break
         try:
-            removals[child] = check(child)
+            removals[child] = content_check(child)
         except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
             keep(child, why)
     stopped, scan = stopped or os.path.lexists(parent), {}
@@ -690,27 +683,32 @@ def cleanup(parent, branches=(), kept_branches=()):
                 raise Keep(f'{parent} exists again')
             log(f'deleted branch {branch[1]} in {branch[0]}: {delete_branch(*branch)}')
         except (Keep, OSError) as why:
-            kept_branches.append((branch[1], str(why)))
             unsettled.append(branch)
             log(f'kept branch {branch[1]} in {branch[0]}: {why}')
     if unsettled:
         log(f'retry: {retry(parent, unsettled)}')
-    if kept or kept_branches:
-        notify(parent, kept, kept_branches, unsettled)
-    return 2 if stopped else 1 if kept or kept_branches else 0
+    elif kept or stopped:
+        log(f'retry: {retry(parent, [])}')
+    return 2 if stopped else 1 if kept or unsettled else 0
 
 
-def event_branch(data):
-    """The removed parent's branch as (common git dir, name, tip); Keep when the event names a
-    branch it gives no repository holding; None when it names no branch."""
-    branch = (data['worktree'].get('branch') or '').strip()
-    if not branch:
-        return None
-    space = (data.get('workspace') or {}).get('worktree') or {}
-    common = space.get('repo_key') or (space.get('repo_root') and common_dir(Path(space['repo_root']) / '.git'))
-    if not common:
-        raise Keep('the event names no repository')
-    return common, branch, git('rev-parse', '--verify', f'refs/heads/{branch}', gitdir=common).strip()
+def outside(trees, extra=()):
+    """Why a run that may remove trees cannot run here, or None: the working directory (git cannot close
+    the sessions in a tree it removes), this module, the log or an extra (what, path) lies inside one or
+    is reached through one (link_hops), as a log under a symlink in a removed tree would be."""
+    try:
+        here = os.getcwd()
+    except OSError as why:
+        return f'cannot read the working directory: {why}; run this from an existing one'
+    for what, path in (('the working directory', here), ('worktree_children', __file__), ('the log', LOG), *extra):
+        try:
+            hops = [path, *link_hops(path)]
+        except OSError as why:
+            return f'cannot resolve {what} {path}: {why}'
+        for tree in trees:
+            if any(is_within(hop, [tree]) for hop in hops):
+                return f'{what} {path} lies inside {tree}; run this from outside it'
+    return None
 
 
 def main(argv=None):
@@ -718,21 +716,12 @@ def main(argv=None):
     if argv[:1] == ['cleanup'] and len(argv) >= 2:
         rest = argv[2:]
         if len(rest) % 4 == 0 and all(f == '--branch' for f in rest[::4]):
-            return cleanup(os.path.abspath(argv[1]), [tuple(rest[i + 1:i + 4]) for i in range(0, len(rest), 4)])
-    if argv == ['event']:
-        try:
-            data = json.loads(os.environ['HERDR_PLUGIN_EVENT_JSON'])['data']
-            path = data['worktree']['path']
-            if not os.path.isabs(path):
-                raise ValueError(f'{path!r} is not absolute')
-        except (KeyError, ValueError, TypeError) as err:
-            print(f'worktree.removed event without an absolute data.worktree.path: {err!r}', file=sys.stderr)
-            return 2
-        try:
-            branch = event_branch(data)
-        except Keep as why:  # the parent's branch stays; its children are still cleaned up
-            return cleanup(path, kept_branches=[(data['worktree']['branch'], str(why))])
-        return cleanup(path, [branch] if branch else [])
+            parent = os.path.abspath(argv[1])
+            why = outside([parent, *children(parent)])
+            if why:
+                print(f'worktree_children: refused: {why}', file=sys.stderr)
+                return 2
+            return cleanup(parent, [tuple(rest[i + 1:i + 4]) for i in range(0, len(rest), 4)])
     print(__doc__.split('\n\n')[1], file=sys.stderr)
     return 2
 

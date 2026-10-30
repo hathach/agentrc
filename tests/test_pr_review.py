@@ -27,7 +27,7 @@ import prepare  # noqa: E402
 import result  # noqa: E402
 import threads  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from helpers import git_env, guard_survivors, remotes_checkout  # noqa: E402
+from helpers import git_env, guard_survivors, make_stub, remotes_checkout  # noqa: E402
 
 REPO, PR, ME = 'o/r', 7, 'reviewer'
 REAL_RUN = facts.run
@@ -200,7 +200,7 @@ class Case(unittest.TestCase):
     """A bare 'remote' at .../o/r.git with main and refs/pull/7/head, and a clone of it."""
 
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp()).resolve()  # git reports the long name, not a runner's 8.3 TEMP (RUNNER~1)
         self.remote = self.tmp / 'o' / 'r.git'
         self.remote.parent.mkdir()
         sh(self.tmp, 'git', 'init', '--quiet', '--bare', '-b', 'main', str(self.remote))
@@ -208,10 +208,8 @@ class Case(unittest.TestCase):
         sh(self.tmp, 'git', 'clone', '--quiet', self.remote.as_posix(), str(self.work))
         for k, v in (('user.name', 't'), ('user.email', 't@t'), ('commit.gpgsign', 'false')):
             sh(self.work, 'git', 'config', k, v)
-        self.env = mock.patch.dict(os.environ, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'commit.gpgsign', 'GIT_CONFIG_VALUE_0': 'false',
-                                                'HERDR_BIN_PATH': str(self.tmp / 'no-herdr')})  # no herdr: worktrees nest
+        self.env = mock.patch.dict(os.environ, {'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'commit.gpgsign', 'GIT_CONFIG_VALUE_0': 'false'})
         self.env.start()
-        os.environ.pop('HERDR_ENV', None)
         self.commit('src/core/a.c', 'int a;\n' * 20, 'base')
         sh(self.work, 'git', 'push', '--quiet', 'origin', 'HEAD:main')
         self.base = sh(self.work, 'git', 'rev-parse', 'HEAD')
@@ -352,27 +350,27 @@ class Prepare(Case):
         with self.assertRaisesRegex(facts.Unusable, 'not a head this script pinned'):
             self.prepare()
 
-    def herdr(self, entry=None):
-        """A stub herdr answering `worktree list` with entry (path filled in), or failing without one."""
-        stub = self.tmp / 'herdr'
-        body = f"print(json.dumps({{'result': {{'worktrees': [{{**{entry!r}, 'path': sys.argv[-1]}}]}}}}))" if entry \
-            else "sys.exit('herdr server unreachable')"
-        stub.write_text(f'#!{sys.executable}\nimport json, sys\n{body}\n')
-        stub.chmod(0o755)
-        os.environ['HERDR_BIN_PATH'] = str(stub)
+    def linked(self):
+        """Make the clone a linked worktree, on main, of a primary checkout beside it."""
+        primary = self.tmp / 'primary'
+        os.chdir(self.tmp)
+        self.clone.rename(primary)
+        sh(primary, 'git', 'checkout', '--quiet', '--detach')
+        sh(primary, 'git', 'worktree', 'add', '--quiet', str(self.clone), 'main')
+        os.chdir(self.clone)
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
-    def test_a_herdr_worktree_gets_its_review_worktree_beside_it(self):
+    def test_a_linked_checkout_gets_its_review_worktree_beside_it(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')
         head = self.push_pr()
         sibling = self.tmp / f'clone--pr-review-{PR}'
-        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
+        self.linked()
         p = self.prepare()
         self.assertEqual(p['worktree'], sibling.as_posix())
         self.assertEqual(sh(sibling, 'git', 'rev-parse', 'HEAD'), head)
-        self.herdr()  # an existing tree is reused without asking herdr, under the lock of the run that prepared it
+        self.assertFalse((self.clone / '.worktrees').exists())
         token = p['lock']['token']
-        q = self.prepare('--token', token)
+        with mock.patch.object(prepare, 'beside', side_effect=AssertionError('placed again')):
+            q = self.prepare('--token', token)  # an existing tree is reused, under the lock of the run that prepared it
         self.assertEqual((q['worktree'], q['lock']), (sibling.as_posix(), {'state': 'held', 'token': token}))
         Path(sibling, 'src/core/a.c').write_text('local edit\n')
         with self.assertRaisesRegex(facts.Unusable, 'uncommitted changes'):
@@ -382,29 +380,45 @@ class Prepare(Case):
         with self.assertRaisesRegex(facts.Unusable, 'both .* exist'):
             self.prepare('--token', token)
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
-    def test_a_review_worktree_nests_unless_herdr_has_the_checkout_open_and_refuses_when_herdr_cannot_say(self):
+    def test_a_review_worktree_nests_in_a_primary_checkout_and_refuses_when_git_cannot_say(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')
         self.push_pr()
         nested = (self.clone / '.worktrees' / f'pr-review-{PR}').as_posix()
-        self.herdr({'is_linked_worktree': False, 'open_workspace_id': 'w1'})
         self.assertEqual(self.prepare()['worktree'], nested)
-        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
-        self.assertEqual(self.prepare()['worktree'], nested, 'a nested tree from before is reused where it is')
         sh(self.clone, 'git', 'worktree', 'remove', nested)
-        self.herdr()
-        with self.assertRaisesRegex(facts.Unusable, 'cannot ask herdr .*unreachable'):
-            self.prepare()
-        self.herdr({'is_linked_worktree': False})
-        with mock.patch.object(prepare, 'PLUGIN', self.tmp / 'missing.py'), \
-                self.assertRaisesRegex(facts.Unusable, 'cannot ask herdr .*missing.py'):
-            self.prepare()
-        os.environ['HERDR_BIN_PATH'] = str(self.tmp / 'no-herdr')
-        os.environ['HERDR_ENV'] = '1'
-        with self.assertRaisesRegex(facts.Unusable, 'HERDR_ENV is set but .* not on PATH'):
-            self.prepare()
+        real, missing = prepare.git, (self.tmp / 'missing').as_posix()
+        for answer, message in ((None, f'git -C {re.escape(missing)} rev-parse .*--absolute-git-dir'),
+                                (f'{self.tmp}\n', 'cannot tell where the review worktree goes'),
+                                ('relative\nother\n', 'cannot tell where the review worktree goes'),
+                                (f'{self.tmp}\n\n', 'cannot tell where the review worktree goes')):
+            def git(*argv):
+                if '--absolute-git-dir' not in argv:
+                    return real(*argv)
+                return real('-C', missing, *argv[2:]) if answer is None else answer
+            with self.subTest(answer=answer), mock.patch.object(prepare, 'git', git), \
+                    self.assertRaisesRegex(facts.Unusable, message):
+                self.prepare()
         self.assertFalse(Path(nested).exists())
         self.assertFalse((self.tmp / f'clone--pr-review-{PR}').exists())
+        self.linked()
+        with mock.patch.object(prepare, 'beside', return_value=False):  # placed before the checkout was linked
+            self.assertEqual(self.prepare()['worktree'], nested)
+        self.assertEqual(self.prepare()['worktree'], nested, 'a nested tree from before is reused where it is')
+
+    def test_herdr_on_path_or_in_the_environment_never_changes_where_a_review_worktree_goes(self):
+        self.commit('src/core/a.c', 'int b;\n', 'b')
+        self.push_pr()
+        bin_dir, log = self.tmp / 'bin', self.tmp / 'herdr.log'
+        bin_dir.mkdir()
+        stub = make_stub(bin_dir, 'herdr', f'import sys\nopen({str(log)!r}, "a").write("called\\n")\nsys.exit(1)\n')
+        os.environ.update(HERDR_ENV='1', HERDR_BIN_PATH=str(stub), PATH=f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+        p = self.prepare()
+        self.assertEqual(p['worktree'], (self.clone / '.worktrees' / f'pr-review-{PR}').as_posix(), 'a primary nests')
+        sh(self.clone, 'git', 'worktree', 'remove', p['worktree'])
+        self.linked()
+        self.assertEqual(self.prepare()['worktree'], (self.tmp / f'clone--pr-review-{PR}').as_posix(),
+                         'a linked checkout gets it beside')
+        self.assertFalse(log.exists(), 'herdr is never run')
 
     def release(self, token):
         return self.call(prepare, ['--release', '--pr', str(PR), '--repo', REPO, '--token', token])
@@ -416,9 +430,8 @@ class Prepare(Case):
         """A pinned PR whose next prepare places its tree beside the checkout."""
         self.commit('src/core/a.c', 'int b;\n', 'b')
         self.push_pr()
-        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
+        self.linked()
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_a_sibling_review_tree_is_locked_for_its_run_and_a_nested_one_is_not(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')
         self.push_pr()
@@ -426,14 +439,13 @@ class Prepare(Case):
         self.assertEqual(p['lock'], {'state': 'none', 'token': None})
         self.assertEqual(prepare.locks(), {})
         sh(self.clone, 'git', 'worktree', 'remove', p['worktree'])
-        self.herdr({'is_linked_worktree': True, 'open_workspace_id': 'w1'})
+        self.linked()
         q = self.prepare()
         token = q['lock']['token']
         self.assertEqual(q['lock']['state'], 'taken')
         self.assertRegex(token, r'^[0-9a-f]{16}$')
         self.assertEqual(self.reason(q['worktree']), f'pr-review {PR} running {token}')
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_another_run_holding_the_sibling_refuses_before_anything_is_checked_out(self):
         self.sibling_run()
         a = self.prepare()  # its launcher killed: nothing saved or published, the lock stays
@@ -447,7 +459,6 @@ class Prepare(Case):
         self.assertEqual(sh(self.clone, 'git', 'rev-parse', f'pr-review-{PR}'), a['head'])
         self.assertEqual(self.reason(a['worktree']), f'pr-review {PR} running {token}')
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_release_unlocks_only_the_runs_own_lock_once_and_a_stale_release_is_refused(self):
         self.sibling_run()
         a = self.prepare()
@@ -462,7 +473,6 @@ class Prepare(Case):
         self.assertEqual(self.reason(tree), f'pr-review {PR} running {new}')
         self.assertEqual(self.release(new)['released'], [tree])
 
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
     def test_a_foreign_lock_is_left_by_prepare_and_release(self):
         self.sibling_run()
         p = self.prepare()
@@ -515,16 +525,6 @@ class Prepare(Case):
             self.prepare()
         self.assertEqual((sh(self.clone, 'git', 'branch', '--show-current'), sh(self.clone, 'git', 'rev-parse', 'HEAD')),
                          launcher)
-
-    @unittest.skipIf(os.name == 'nt', 'a stub executable')
-    def test_a_malformed_herdr_entry_is_refused(self):
-        self.commit('src/core/a.c', 'int b;\n', 'b')
-        self.push_pr()
-        self.herdr({'is_linked_worktree': 'false', 'open_workspace_id': 'w1'})  # the plugin's check: its tests list the rest
-        with self.assertRaisesRegex(facts.Unusable, 'cannot ask herdr .*malformed entry'):
-            self.prepare()
-        self.herdr({'is_linked_worktree': True, 'open_workspace_id': None})
-        self.assertEqual(self.prepare()['worktree'], (self.clone / '.worktrees' / f'pr-review-{PR}').as_posix())
 
     def test_ci_states(self):
         self.commit('src/core/a.c', 'int b;\n', 'b')

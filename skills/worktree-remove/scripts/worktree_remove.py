@@ -1,44 +1,44 @@
 #!/usr/bin/env python3
-"""Remove a herdr worktree, with its clean `<name>--*` siblings, once nothing pending would be lost.
+"""Remove a linked worktree, with its clean `<name>--*` siblings, once nothing pending would be lost.
 
     worktree_remove.py [PATH] [--dry-run] [--pending TEXT]... [--proceed TOKEN]
 
-PATH (default: the current checkout) is a linked worktree open as a herdr workspace. herdr
-removes it (`herdr worktree remove`); agentrc's worktree-children plugin, run by herdr on that
-removal, removes its clean siblings and deletes the branches it proves pushed or a PR head.
-This script acts on nothing the plugin decides: it predicts the plugin's verdicts with the
-plugin's own code, gates on pending work, writes a report and asks herdr to remove, last.
+PATH (default: the current checkout) is a linked worktree. This script removes it (`git worktree
+remove`), then runs worktree_children's cleanup of PATH, which removes its clean siblings and deletes
+the branches it proves pushed or a PR head. The verdicts are that module's: this script predicts them
+with its code, gates on pending work, writes a report and removes, last.
 
 Refused (exit 3), nothing changed:
-- PATH is a primary checkout or no linked worktree, or herdr lists it open in no workspace
-  (`herdr worktree open --path <PATH>` first); herdr unreachable;
-- herdr has the plugin unlinked, disabled, or linked from another checkout than this script's;
-- PATH fails the plugin's content check, the one each sibling gets (its docstring lists them);
+- PATH is a primary checkout or no linked worktree;
+- the working directory, this script, the module, the report directory or the log lies inside, or
+  is reached through, PATH or any sibling, a kept one included (run it from outside them, naming
+  PATH): git cannot close the sessions in it; checked before anything else;
+- PATH fails the module's content check, the one each sibling gets (its docstring lists them);
   a chief session in PATH, headless or interactive and the caller's own included, refuses it: a
   chief cannot remove its own worktree, so the human runs this from a plain session;
-- this script, the plugin, the report directory or the plugin's log lies inside PATH or a
-  sibling to be removed;
 - a git or GitHub lookup the gate needs fails or comes back incomplete.
 
 Pending (exit 4 unless --proceed names the token the list printed), for PATH's branch and each
 sibling's, each against its own repository (its PRs from that repository's branch of that name, a
 fork's to its parent included): an open PR; an unresolved review thread on its latest merged PR;
 commits on its remote that the remote's default branch lacks, with no PR at that tip; each sibling
-and each branch the plugin will keep, with the reason (a never-pushed commit, say); each --pending
+and each branch the cleanup will keep, with the reason (a never-pushed commit, say); each --pending
 item. The token digests the list, so a list that changed since the human saw it stops again.
 
-Then PATH's content check runs again, the report goes to
-${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the inventory,
-symlinks leaving each removed tree, the gate, the plugin log, the command), and
-`herdr worktree remove --workspace <id>` runs, with --force only for a checkout with submodules
-(git refuses those otherwise; herdr then stops the workspace's panes first). herdr closes the
-workspace, this script's pane included, so the plugin log holds the outcome.
+Then PATH's content check runs again, refused (exit 3) also when its branch or tip moved; the report
+goes to ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/<UTC time>-<name>.md (the
+inventory, symlinks leaving each removed tree, the gate, the log, the command), and
+`git worktree remove <PATH>` runs, with --force only for a checkout with submodules (git refuses
+those otherwise), then the cleanup of PATH with PATH's branch, which prints its actions and appends
+them to the log beside the reports. A process whose working directory is inside PATH can make git
+fail part way (Windows refuses to delete it); then the siblings and branches are left alone.
 
 --dry-run runs every check and lookup (fetching remote-tracking refs) and prints the report
 without writing it or removing anything.
 
-Exit 0 removal requested (or a dry run with nothing pending), 2 usage, 3 refused, 4 pending,
-5 herdr refused or failed the removal.
+Exit 0 removed with every sibling and branch the plan let go (or a dry run with nothing pending),
+2 usage, 3 refused, 4 pending, 5 git refused or failed the removal, 6 removed but the cleanup kept
+a sibling or branch, or stopped at a replacement parent (the log has why and the retry).
 """
 import argparse
 import hashlib
@@ -49,11 +49,7 @@ import sys
 import time
 from pathlib import Path
 
-PLUGIN_DIR = Path(__file__).resolve().parents[3] / 'plugins' / 'worktree-children'
-PLUGIN_ID = 'agentrc.worktree-children'
-STATE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local' / 'state')
-REPORTS = STATE / 'agentrc' / 'worktree-remove'
-PLUGIN_LOG = STATE / 'herdr' / 'plugins' / PLUGIN_ID / 'log'
+MODULE = Path(__file__).resolve().parents[3] / 'lib' / 'worktree_children.py'
 THREADS = '''query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
     reviewThreads(first: 100, after: $endCursor) {
@@ -65,51 +61,17 @@ class Refused(Exception):
     pass
 
 
-def load_plugin():
+def load_module():
     try:
-        spec = importlib.util.spec_from_file_location('worktree_children', PLUGIN_DIR / 'worktree_children.py')
+        spec = importlib.util.spec_from_file_location('worktree_children', MODULE)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
-    except Exception as err:  # the verdicts are the plugin's: without it nothing can be predicted
-        raise Refused(f'cannot load the worktree-children plugin from {PLUGIN_DIR}: {err!r}')
+    except Exception as err:  # the verdicts are the module's: without it nothing can be predicted
+        raise Refused(f'cannot load worktree_children from {MODULE}: {err!r}')
 
 
 wc = None
-
-
-def herdr(*args):
-    done = wc.run([wc.HERDR, *args])
-    try:
-        if done.returncode:
-            raise ValueError
-        return json.loads(done.stdout)['result']
-    except (ValueError, KeyError, TypeError):
-        raise Refused(f'`herdr {" ".join(args)}` failed (exit {done.returncode}): {done.stderr.strip()[:300]}')
-
-
-def workspace(root):
-    """The id of the herdr workspace that has root open as a linked worktree."""
-    try:
-        entry = wc.herdr_entry(root)
-    except wc.Keep as why:
-        raise Refused(f'herdr and {root}: {why}')
-    if not entry.get('is_linked_worktree') or not entry.get('open_workspace_id'):
-        raise Refused(f'herdr has {root} open as no linked worktree workspace; open it with '
-                      f'`herdr worktree open --path {root}` and rerun')
-    return entry['open_workspace_id']
-
-
-def check_plugin():
-    try:
-        mine = [p for p in herdr('plugin', 'list', '--json')['plugins'] if p.get('plugin_id') == PLUGIN_ID]
-    except (KeyError, TypeError, AttributeError):
-        raise Refused('herdr answered `plugin list` without its plugins')
-    if not mine or not mine[0].get('enabled'):
-        raise Refused(f'herdr has no enabled {PLUGIN_ID}; `install.py install --herdr-plugin` links it')
-    if os.path.realpath(mine[0].get('plugin_root') or '') != os.path.realpath(PLUGIN_DIR):
-        raise Refused(f'herdr runs {PLUGIN_ID} from {mine[0].get("plugin_root")}, not {PLUGIN_DIR}, '
-                      'so its verdicts may differ from these')
 
 
 def unresolved_threads(repo, number):
@@ -172,22 +134,25 @@ def links_leaving(tree):
 def plan(path, pending):
     """Every check and fact the removal needs, changing nothing but fetched remote-tracking refs."""
     global wc
-    wc = wc or load_plugin()
+    wc = wc or load_module()
     top = wc.run(['git', '-C', str(path), 'rev-parse', '--show-toplevel'])
     if top.returncode:
         raise Refused(f'{path} is in no git checkout: {top.stderr.strip()}')
     root = Path(os.path.realpath(top.stdout.strip()))
+    found = wc.children(root)
+    # any sibling: the cleanup may find a kept one clean
+    why = wc.outside([root, *found], [('this script', Path(__file__).resolve()), ('the reports', wc.LOG.parent)])
+    if why:
+        raise Refused(why)
     try:
         common, force = wc.content_check(root)
     except (wc.Keep, OSError) as why:
         raise Refused(f'{root}: {why}')
-    ws = workspace(root)
-    check_plugin()
 
     siblings = []
-    for child in wc.children(root):
+    for child in found:
         try:
-            wc.check(child)
+            wc.content_check(child)
             why = None
         except (wc.Keep, OSError) as err:
             why = str(err)
@@ -197,11 +162,8 @@ def plan(path, pending):
     for s in siblings:
         s['why'] = s['why'] or held.get(s['path'])
     leaving = [root] + [s['path'] for s in siblings if s['why'] is None]
-    for needed in (Path(__file__).resolve(), PLUGIN_DIR, REPORTS, PLUGIN_LOG):
-        if wc.is_within(needed, leaving):
-            raise Refused(f'{needed} lies inside a worktree this removes')
-
-    checkouts = [dict(path=root, why=None, head=wc.head_branch(root), common=os.path.realpath(common))] + siblings
+    head, common = wc.head_branch(root), os.path.realpath(common)
+    checkouts = [dict(path=root, why=None, head=head, common=common)] + siblings
     items = list(pending)
     for s in checkouts:
         s['branch'] = None
@@ -222,20 +184,22 @@ def plan(path, pending):
     except (wc.Keep, OSError) as why:  # a tree changed since its check
         raise Refused(f'listing the symlinks leaving the removed trees: {why}')
     token = hashlib.sha256('\n'.join(items).encode()).hexdigest()[:12]
-    return dict(root=root, workspace=ws, force=force, checkouts=checkouts, links=links, items=items, token=token)
+    return dict(root=root, common=common, head=head, force=force, checkouts=checkouts, links=links, items=items,
+                token=token)
 
 
 def command(p):
-    return [wc.HERDR, 'worktree', 'remove', '--workspace', p['workspace'], *['--force'] * p['force']]
+    return wc.remove_argv(p['root'], p['common'], p['force'])
 
 
 def report(p, heading):
     lines = [f'# {heading}', '',
-             f'Plan to remove {p["root"]} (herdr workspace {p["workspace"]}); the plugin log records what '
-             f'the removal does: {PLUGIN_LOG}', '', f'Command: `{" ".join(command(p))}`', '', '## Inventory', '']
+             f'Plan to remove {p["root"]}; the log records what the removal does: {wc.LOG}', '',
+             f'Command: `{" ".join(command(p))}`, then the cleanup of its siblings and branches', '',
+             '## Inventory', '']
     for s in p['checkouts']:
-        fate = ('herdr removes it' if s['path'] == p['root'] else
-                'the plugin removes it' if s['why'] is None else f'stays: {s["why"]}')
+        fate = ('git removes it' if s['path'] == p['root'] else
+                'the cleanup removes it' if s['why'] is None else f'stays: {s["why"]}')
         lines.append(f'- {s["path"]}: {fate}' + (f'; {s["branch"]}' if s['branch'] else ''))
     lines += ['', '## Symlinks leaving the removed trees', '']
     lines += [f'- {link} -> {target}' for link, target in p['links']] or ['- none']
@@ -268,20 +232,40 @@ def main(argv=None):
         return 0
     try:
         wc.content_check(p['root'])
+        if wc.head_branch(p['root']) != p['head']:
+            raise wc.Keep('its branch or tip moved since the gate')
     except (wc.Keep, OSError) as why:
         print(f'worktree_remove: refused, nothing changed: {p["root"]} changed: {why}', file=sys.stderr)
         return 3
-    out = REPORTS / f'{stamp}-{p["root"].name}.md'
+    out = wc.LOG.parent / f'{stamp}-{p["root"].name}.md'
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(report(p, f'worktree-remove {p["root"].name}, {stamp}'))
-    print(f'report: {out}\nrunning: {" ".join(command(p))} (this pane closes with the workspace)', flush=True)
-    done = wc.run(command(p))
-    if done.returncode:
-        print(f'worktree_remove: herdr did not remove {p["root"]} (exit {done.returncode}): '
-              f'{(done.stdout + done.stderr).strip()}', file=sys.stderr)
+    out.write_bytes(wc.stored(report(p, f'worktree-remove {p["root"].name}, {stamp}')))
+    print(f'report: {out}', flush=True)
+    return remove(p)
+
+
+def remove(p):
+    """git's removal of the worktree, then the cleanup of its siblings and branches."""
+    root, common, head = p['root'], p['common'], p['head']
+    wc.log(f'running: {" ".join(command(p))}')
+    try:
+        wc.remove(root, common, p['force'])
+    except wc.Keep as why:
+        wc.log(f'git did not remove {root}; siblings and branches untouched')
+        print(f'worktree_remove: {root}: {why}', file=sys.stderr)
         return 5
-    return 0
+    wc.log(f'removed {root}')
+    left = wc.cleanup(root, [(common, *head)] if head else [])
+    if left == 2:
+        print(f'worktree_remove: removed {root}, but something appeared at that path again, so its siblings '
+              f'and branches were left alone; the log has the retry: {wc.LOG}', file=sys.stderr)
+    elif left:
+        print(f'worktree_remove: removed {root}, but the cleanup kept a sibling or branch; the log has why '
+              f'and the retry: {wc.LOG}', file=sys.stderr)
+    return 6 if left else 0
 
 
 if __name__ == '__main__':
+    if sys.stdout:  # None under pythonw
+        sys.stdout.reconfigure(errors='backslashreplace')  # a narrow code page must not stop a removal part way
     sys.exit(main())

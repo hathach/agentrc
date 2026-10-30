@@ -46,7 +46,7 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   That scope never authorizes destroying unrelated data, and a headless
   session still needs me for a host or VM reboot.
 - Worktrees: for branch or multi-step work use a worktree under the primary
-  checkout's `.worktrees/<branch>`, or the herdr sibling below; never switch
+  checkout's `.worktrees/<branch>`, or the sibling below; never switch
   the primary checkout. Before creating one, inspect the active branch and
   existing worktrees. If the target branch or changes are already active in
   another checkout, ask whether to reuse it instead of creating another branch
@@ -55,16 +55,16 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   only when there is none. Before removing one, inspect its dependency
   symlinks or junctions and verify that removal deletes only the links and
   worktree, not their shared targets.
-- herdr worktrees: when `herdr worktree list --cwd .` shows the current
-  checkout with `is_linked_worktree` true and an open workspace, create task
-  worktrees, of this repo or another, as its siblings `<checkout>--<branch>`
-  (`/` as `-`), never inside it; the `<checkout>--` prefix is reserved for them.
-  A dependency checked out as a worktree of another repository is a sibling
-  too, `<checkout>--dep-<name>`, symlinked into the checkout, never nested.
-  Remove a checkout with the `worktree-remove` skill; its clean siblings and
-  their pushed or PR-head branches go with it (agentrc's `worktree-children`
-  plugin, whose docstring has the rules). The skill refuses a checkout holding
-  nested worktrees, which herdr's own menu would delete whatever they hold.
+- Linked checkouts: when the current checkout is itself a linked worktree,
+  create task worktrees, of this repo or another, as its siblings
+  `<checkout>--<branch>` (`/` as `-`), never inside it; the `<checkout>--`
+  prefix is reserved for them. A dependency checked out as a worktree of
+  another repository is a sibling too, `<checkout>--dep-<name>`, symlinked into
+  the checkout, never nested. Remove a linked checkout only with the
+  `worktree-remove` skill, never a terminal app's Remove (herdr-app's worktree
+  menu), which skips its gate; its clean siblings and their pushed or PR-head
+  branches go with it (agentrc's `lib/worktree_children.py`, whose docstring
+  has the rules). The skill refuses a checkout holding nested worktrees.
 
 # Coding style
 - Comment only when the code cannot say it itself: a non-obvious *why*, a

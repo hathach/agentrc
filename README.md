@@ -20,16 +20,15 @@ hooks/         Claude Code hooks, one folder each with a hooks.json
 workflows/     saved workflows (Claude only)
 bin/           commands for the human, such as lsusbt
 statusline/    the Claude Code status line, its Codex usage fetcher and its session-PR helper
-plugins/       herdr plugins, one folder each with a herdr-plugin.toml
-lib/           helpers the scripts share through their resolved path: windows.py (Windows runtime), greptile.py
+lib/           helpers the scripts share through their resolved path: windows.py (Windows runtime), greptile.py,
+               worktree_children.py (worktree-remove's sibling cleanup)
 tests/         unit tests for skill scripts, hooks and the installer
 bench/         benchmark corpora and their runners; data too large for git is a test-data release asset
 ```
 
 ## Install
 
-Every entry is a symlink or, for herdr plugins, a herdr link, so edits are
-live. Each flag takes every entry of its kind; nothing is installed by default.
+Every entry is a symlink, so edits are live. Each flag takes every entry of its kind; nothing is installed by default.
 For use in a project, install into its work tree ([Per project](#per-project)):
 
 ```sh
@@ -42,7 +41,7 @@ The user-wide install is the owner's personal mode; its `--claude-md` makes
 every session's instructions:
 
 ```sh
-~/code/agentrc/install.py install --skill --agent --workflow --bin --claude-md --statusline --herdr-plugin
+~/code/agentrc/install.py install --skill --agent --workflow --bin --claude-md --statusline
 ~/code/agentrc/install.py remove --skill
 ```
 
@@ -60,22 +59,15 @@ every session's instructions:
 - `--statusline`: the `statusline/` files into `~/.claude`, and `statusLine`
   in `~/.claude/settings.json`; `install` refuses if another one is set. The
   command names `$HOME/.claude`, so another `CLAUDE_CONFIG_DIR` can reuse it.
-- `--herdr-plugin`: each `plugins/*` folder through `herdr plugin link --enabled`.
-  `install` refuses if herdr holds the id from elsewhere; `remove` unlinks only
-  plugins linked from this checkout, which needs a running herdr server. herdr
-  steps run first, so a refusal of herdr's (such as `min_herdr_version`) changes
-  nothing.
-  `worktree-children` removes a herdr worktree's `<name>--*` sibling worktrees
-  when herdr removes it, keeping and reporting any that hold work, and deletes
-  the removed worktrees' branches whose commits are on their remote or a PR
-  head (its docstring lists the checks); `worktree_children.py cleanup <parent>`
-  retries, with the `--branch` arguments its log names.
 
 The target directories stay real, so local entries sit beside the links.
 `install` refuses before touching anything if a target is a file or a
 nonempty directory; `remove` never deletes one, and leaves CLAUDE.md links
 that point elsewhere. Rerun after adding an entry: dead links into this repo
 are pruned.
+
+On a host that ran the former `install.py install --herdr-plugin`, run `herdr plugin unlink agentrc.worktree-children`
+once to drop herdr's registration of the removed plugin.
 
 Project repos such as tinyusb call these skills by bare name and expect this
 install, user-wide or per project.
@@ -131,8 +123,8 @@ and touches nothing under `~/.claude`, `~/.codex` or `~/.local`:
 - Both actions refuse a symlinked directory between `<dir>` and a destination,
   `.claude` itself included, which would carry them out of the work tree, and a
   `settings.local.json` that is tracked or a link, since they rewrite it.
-- Project mode is Claude Code only: `--bin`, `--statusline` and
-  `--herdr-plugin` are user-wide and refused with `--project`, and Codex's
+- Project mode is Claude Code only: `--bin` and `--statusline` are user-wide
+  and refused with `--project`, and Codex's
   own skills and agents have no project install. A Codex coworker needs no
   `CLAUDE.local.md`: `cowork` sends it its rules.
 - A user-wide install on the same host is not supported beside a project
@@ -201,8 +193,6 @@ the skipped tests and notes for a port:
   under Xvfb and tracks its processes through `/proc` and process groups.
 - `target-debug`'s `esp_session.py`, which refuses there: it detaches openocd
   as a POSIX session and identifies it through `/proc` (#130).
-- `install.py --herdr-plugin` refuses on Windows; `worktree-remove` has no
-  Windows test.
 
 The hardware-debug scripts run on Windows but are unverified on a board there
 (#130), and their tests skip the cases that drive POSIX stub executables or
@@ -223,7 +213,7 @@ Agent collaboration and PRs:
 | [`pr-review`](skills/pr-review/SKILL.md) | review someone else's PR in one request, such as `/pr-review N auto-post boards: <ids>`: pin it, run the pr-review workflow on the boards named (none by default), leave a pending review for you to submit (or submit it under auto-post); re-review after a push | `prepare.py --pr N` |
 | [`ci-rerun`](skills/ci-rerun/SKILL.md) | read a failed CircleCI job's or Read the Docs build's log, rerun it once after an infra failure | `circleci.py log <job>`, `rerun <job>...`, `rtd.py log <url>` |
 | [`headless-chief`](skills/headless-chief/SKILL.md) | launch a headless `chief` and follow its status lines while it runs, its report when it exits | `chief_run.py --out <dir> --worktree <wt> --task-file <task>` |
-| [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a herdr worktree when its task is done: check it, gate on pending follow-ups and PR state, then herdr removes it and the `worktree-children` plugin its siblings and branches | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
+| [`worktree-remove`](skills/worktree-remove/SKILL.md) | remove a worktree when its task is done, run from outside it: check it, gate on pending follow-ups and PR state, then git removes it and `lib/worktree_children.py` its clean `<name>--*` siblings and its branches whose commits are on their remote or a PR head | `worktree_remove.py [PATH] --dry-run [--pending <item>]`, `--proceed <token>` |
 
 Hardware documentation, from the Calibre library at `~/Documents/calibre-library`
 (`CALIBRE_LIBRARY` overrides):
@@ -332,8 +322,8 @@ worktree:
 git worktree add .worktrees/<branch> -b <branch> <base> && cd .worktrees/<branch> && claude --agent chief
 ```
 
-From a herdr worktree the task worktree is its sibling `<checkout>--<branch>`
-instead (`instructions/user.md`, herdr worktrees).
+From a linked checkout the task worktree is its sibling `<checkout>--<branch>`
+instead (`instructions/user.md`, linked checkouts).
 
 Headless, launch it through the [`headless-chief`](skills/headless-chief/SKILL.md)
 skill, which runs `claude -p --agent chief` and gives the caller chief's status
