@@ -52,7 +52,7 @@ HC_TIMEOUT_S = 30
 SEND_TIMEOUT_S = 120   # hc send waits for a person at the target to pause typing
 SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*\Z')  # a request id is a file name in the store
 # What send and reply type: a bash comment holding nothing a shell without comments (zsh's default) would expand.
-INERT = re.compile(r"#[A-Za-z0-9 _./:,'\\-]*\Z")  # a backslash only inside a quoted Windows path
+INERT = re.compile(r"#[\w ./:,'\\-]*\Z")  # \w: Unicode letters, digits, _; a backslash only inside a quoted Windows path
 FIELDS = {
     'request': ['ID', 'FROM', 'FILES', 'DELTA', 'TASK'],
     'result': ['FOR', 'FROM', 'STATUS', 'FILES'],
@@ -563,29 +563,35 @@ def await_result(record, res, wait_ms):
     if record.get('delivery') == 'not sent':
         return None, f'{record["id"]} was never sent: {record.get("error")}'
     deadline = time.monotonic() + wait_ms / 1000
-    quiet_since = None
+    quiet_since = reason = None
+
+    def lapsed(why):
+        return None, f'no result for {record["id"]} after {wait_ms} ms; {why}'
+
     while True:
         body = stored_result(res, record['id'])
         if body is not None:
             return body, None
-        try:
-            info, failure = terminal(target), None
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return lapsed(reason or f'{target} is working')
+        try:  # the lookup gets only what is left of the wait
+            info, failure = hc.get(target, timeout=min(HC_TIMEOUT_S, left)), None
         except hc.Error as e:
             info, failure = None, e
         body = stored_result(res, record['id'])
         if body is not None:
             return body, None
-        if failure:
-            raise failure
-        reason, final = quiet_reason(record, info)
         now = time.monotonic()
+        if failure:
+            if now < deadline:
+                raise failure
+            return lapsed(f'hc did not answer: {failure}')
+        reason, final = quiet_reason(record, info)
         quiet_since = (now if quiet_since is None else quiet_since) if reason else None
         if final or (reason and now - quiet_since >= SETTLE_S):
             return None, reason
-        left = deadline - now
-        if left <= 0:
-            return None, f'no result for {record["id"]} after {wait_ms} ms; {reason or f"{target} is working"}'
-        time.sleep(min(POLL_S, left))
+        time.sleep(max(min(POLL_S, deadline - now), 0))
 
 
 def cmd_read(a):

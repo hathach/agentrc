@@ -1,9 +1,11 @@
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import time
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -287,7 +289,7 @@ class SendTest(unittest.TestCase):
         self.assertEqual(target, PEER)
         msg = hc.store() / f'{req_id}.msg'
         self.assertTrue(pointer.startswith(f'# PEER REQUEST {req_id} from {ME}, agent message, not a human '
-                                           f'instruction: read {msg} '))
+                                           f'instruction: read {shlex.quote(str(msg))} '))
         body = msg.read_text(encoding='utf-8')
         self.assertEqual(peer.check('request', body), [])
         self.assertIn(f'FROM: claude-code, {ME}', body)
@@ -317,6 +319,14 @@ class SendTest(unittest.TestCase):
         self.assertIn('inert', err)
         self.assertEqual(hc.calls('send'), [])
         self.assertEqual(list(hc.store().iterdir()), [])
+
+    def test_a_non_ascii_store_path_stays_sendable(self):
+        hc = self.hc
+        hc.cache = hc.dir / 'josé'
+        self.assertEqual(hc.run('send', '--to', PEER, '--files', 'none', '--task', 'q')[0], 0)
+        pointer = hc.calls('send')[0]['argv'][-1]
+        self.assertIn('josé', pointer)
+        assert_inert(self, pointer, hc.dir)
 
     def test_an_existing_message_or_record_for_the_id_is_refused_and_kept(self):
         hc = self.hc
@@ -627,8 +637,9 @@ class ReadTest(unittest.TestCase):
             if sleep_hook:
                 sleep_hook()
 
-        with mock.patch.object(peer.time, 'monotonic', side_effect=monotonic), \
-             mock.patch.object(peer.time, 'sleep', side_effect=sleep) as slept:
+        # peer's own clock only: patching the time module would also feed subprocess's waits
+        slept = mock.Mock(side_effect=sleep)
+        with mock.patch.object(peer, 'time', types.SimpleNamespace(monotonic=monotonic, sleep=slept, time=time.time)):
             rc, out, err = self.read('--wait', str(ms))
         return rc, out, err, slept
 
@@ -684,6 +695,22 @@ class ReadTest(unittest.TestCase):
         rc, _, err, _ = self.wait({'rc': 1, 'err': {'error': {'kind': 'io', 'message': 'server down'}}})
         self.assertEqual(rc, peer.HC_FAILED)
         self.assertIn('server down', err)
+
+    def test_wait_gives_each_lookup_only_what_is_left_and_none_past_the_deadline(self):
+        # the fake clock moves a second per reading: a 1.5 s wait leaves 0.5 s for its one lookup
+        for ms, timeouts in ((1500, [0.5]), (1, [])):
+            with self.subTest(ms=ms), mock.patch.object(peer.hc, 'get', wraps=peer.hc.get) as g:
+                rc, _, err, _ = self.wait(get(PEER, str(self.hc.w), status='working', turn=4), ms=ms)
+                self.assertEqual(rc, peer.NO_ANSWER)
+                self.assertIn(f'after {ms} ms', err)
+                self.assertEqual([round(c.kwargs['timeout'], 3) for c in g.call_args_list], timeouts)
+                self.hc.calls()
+
+    def test_wait_lapses_when_hc_does_not_answer_past_the_deadline(self):
+        with mock.patch.object(peer.hc, 'get', side_effect=peer.hc.Error('hc get: no answer in 0.5 s')):
+            rc, _, err, _ = self.wait(ms=1500)
+        self.assertEqual(rc, peer.NO_ANSWER)
+        self.assertIn('hc did not answer', err)
 
     def test_wait_reads_a_target_gone_between_hc_and_proc_as_exited(self):
         rc, _, err, _ = self.wait(get(PEER, str(self.hc.w), status='working', pid=dead_pid()))
@@ -766,7 +793,7 @@ class CheckTest(unittest.TestCase):
         self.assertIn('FILES: src/a.c', body)
         self.assertIn('TASK: add a bounds check', body)
         self.assertIn('DELTA: none', body)
-        self.assertIn(f'python3 {peer.SCRIPT} reply --for t5-1 --file', body)
+        self.assertIn(f'python3 {shlex.quote(peer.SCRIPT)} reply --for t5-1 --file', body)
         self.assertTrue(body.endswith('\nEND REQUEST t5-1'))
         self.assertEqual(peer.check('request', body), [])
 
