@@ -201,6 +201,11 @@ sysview_record.py --out DIR --from-raw FILE [--no-events] [--gui [--export-termi
   `--export-terminal` is refused with a message directing the caller to `--gui`.
 - `record.json` `dialogsAnswered` counts each dialog answered, by title fragment, and `systemviewErrors` the
   SystemView error dialogs among them; `sysview_report.py` warns when it is nonzero.
+- SystemView reports a syntactically incomplete terminal packet (the bytes end inside a varint, no declared length
+  involved) as error dialogs, so `--from-raw --gui` loads the file only up to such a packet, and `record.json`
+  `guiInput` records `source`, `size` and `trimmed` (`offset`, `bytes`, `reason`), or null with a `note` when the
+  native framing cannot be read. A heuristic: a corrupt final varint reads the same. The file and native decoding
+  keep every byte.
 - Exit: 0 recorded and exported; 2 bad usage or a GUI request off Linux; 3 decoding, a tool, the probe (none or several
   USB devices carrying its serial), the workload or an export failed, or a signal stopped the run (`record.json`
   says which).

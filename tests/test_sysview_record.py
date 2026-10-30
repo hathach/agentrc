@@ -25,6 +25,7 @@ from helpers import guard_survivors, make_stub, pid_alive, tmpdir  # noqa: E402
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills' / 'target-debug' / 'scripts'
 sys.path.insert(0, str(SCRIPTS))
 import sysview_decode as decode  # noqa: E402
+from test_sysview_decode import header, packet  # noqa: E402
 
 spec = importlib.util.spec_from_file_location('sysview_record', SCRIPTS / 'sysview_record.py')
 record = importlib.util.module_from_spec(spec)
@@ -42,7 +43,7 @@ while True:
 
 # Windows live in FAKE_STATE (json {wid: title}); FAKE_DIALOG names a dialog shown at start, which the license
 # mnemonic alt+c removes (any other stays); FAKE_TITLE overrides the title a load gives; FAKE_NO_EXPORT skips writing
-# exports; FAKE_SLOW_EXPORT writes each export in two halves a second apart, the file held open between them;
+# exports (a load keeps the bytes it read in FAKE_STATE.loaded); FAKE_SLOW_EXPORT writes each export in two halves a second apart, the file held open between them;
 # FAKE_DROP_LOADS and FAKE_DROP_STARTS ignore that many first loads and starts; a start opens the Recorder Configuration
 # dialog; FAKE_EXIT_AFTER_START exits once recording; FAKE_START_TITLE is the title -start gives, empty for no main
 # window. Every command received is appended to FAKE_STATE.log.
@@ -81,6 +82,7 @@ while True:
         pass
     elif verb == '-load':
         name = os.path.basename(arg)
+        open(state + '.loaded', 'wb').write(open(host(arg), 'rb').read())
         windows({'1': os.environ.get('FAKE_TITLE', f'SEGGER SystemView V4.10b - {name} | Non-Commercial Use')})
     elif verb == '-start':
         title = os.environ.get('FAKE_START_TITLE',
@@ -366,6 +368,41 @@ class Recorder(unittest.TestCase):
     def test_workload_finishing_cleanly_is_fine(self):
         rc, r = self.live('--workload', 'true')
         self.assertEqual((rc, r['workload']['ended'], r['workload']['exit']), (0, 'exited', 0))
+
+    def loaded(self):
+        return Path(str(self.state) + '.loaded').read_bytes()
+
+    def test_a_capture_cut_mid_packet_loads_without_its_incomplete_last_packet(self):
+        head = header() + packet(512)
+        self.raw.write_bytes(head + packet(28, 512, delta=300)[:-1])
+        before = self.raw.read_bytes()
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
+        self.assertEqual(rc, 0, r)
+        self.assertEqual(self.loaded(), head)
+        self.assertEqual(self.raw.read_bytes(), before)
+        self.assertEqual(r['guiInput'], {'source': str(self.raw.resolve()), 'size': len(before), 'trimmed': {
+            'offset': len(head), 'bytes': len(before) - len(head), 'reason': 'syntactically incomplete terminal packet'}})
+
+    def test_a_capture_ending_on_a_packet_boundary_loads_whole(self):
+        self.raw.write_bytes(header() + packet(512))
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw))
+        self.assertEqual(rc, 0, r)
+        self.assertEqual(self.loaded(), self.raw.read_bytes())
+        self.assertIsNone(r['guiInput']['trimmed'])
+        self.assertNotIn('note', r['guiInput'])
+
+    def test_a_live_recording_loads_whole_without_a_gui_input_record(self):
+        rc, r = self.live()
+        self.assertEqual(rc, 0, r)
+        self.assertEqual(self.loaded(), b'\0' * 10 + b'recording')
+        self.assertNotIn('guiInput', r)
+
+    def test_framing_the_native_decoder_does_not_read_loads_whole_with_a_note(self):
+        rc, r = self.run_main('--gui', '--from-raw', str(self.raw))    # ten zero bytes: no Start after the sync
+        self.assertEqual(rc, 0, r)
+        self.assertEqual(self.loaded(), b'\0' * 10)
+        self.assertIsNone(r['guiInput']['trimmed'])
+        self.assertIn('not checked for an incomplete terminal packet', r['guiInput']['note'])
 
     def test_an_error_dialog_is_answered_and_counted(self):
         rc, r = self.run_main('--gui', '--from-raw', str(self.raw), FAKE_DIALOG='SystemView Error')

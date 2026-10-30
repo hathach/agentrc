@@ -76,12 +76,20 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   to `printf` locally. `cdc_msc` never polls the console: keystrokes sent to it prove nothing — read the down-buffer's
   `WrOff` over the probe instead (went 5 → 8 for 3 bytes, verified 2026-09-18 fad6bd546 raspberry_pi_pico). carried over
   otherwise; `board_getchar` checked in fad6bd546.
+- Cortex-M `SYSVIEW` and `LOGGER=rtt` builds with GCC or Clang lock RTT with PRIMASK (`hw/bsp/rtt_conf_cortexm.h`,
+  force-included, from tinyusb#4356), not the vendored BASEPRI lock, which a USB IRQ at priority 0 slips past; other
+  compilers and other cores keep the vendored lock (WCH: next bullet). A priority-0 ISR printing against the main loop
+  corrupted 27 and 29 lines in 60 s under BASEPRI, 0 and 0 under PRIMASK; verified 2026-10-30 18400f951 stm32f407disco.
+  Separate `cdc_msc` `LOGGER=rtt` runs without `SYSVIEW` (2026-10-30) peaked at 2.3 µs priority-0 entry latency under
+  PRIMASK, against 0.29 µs under BASEPRI. Cost with `SYSVIEW` on the same board (2026-10-29): sampled priority-0
+  interrupt entry latency up to 2.6 µs, against 0.27 µs under BASEPRI; an untraced build whose USB IRQ shares that
+  priority 0, master's layout, is already late by 6 µs and more.
 - A `LOGGER=rtt` build traps on WCH QingKe (ch32v): the vendored generic lock does (`rtt`, "Buffer modes and locking"),
   so tinyusb needs its own `SEGGER_RTT_LOCK/UNLOCK` there. carried over. tinyusb#4293 added one for `SYSVIEW` builds
   only, so a `LOGGER=rtt` build without `SYSVIEW` still traps, while one with `SYSVIEW=1..4` gets the QingKe-safe lock:
   `hw/bsp/<family>/sysview_rtt_conf.h` in ch32v20x, ch32v30x and ch583 (brace-scoped save/restore of CSR 0x800),
   force-included by its `family.cmake` to win the include-guard race against the vendored conf. ch32v10x refuses
-  `SYSVIEW` (masking CSR 0x800 hung its QingKe V3), so every `LOGGER=rtt` build there traps.
+  `SYSVIEW` (masking CSR 0x800 hung its QingKe V3), so every `LOGGER=rtt` build there traps. Tracked in tinyusb#4363.
 
 ## Profiling and trace
 
@@ -110,12 +118,16 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
 
 ## SystemView
 
-The firmware landed with tinyusb#4293 (190f1ac7a), where the names below were checked. The measurements dated
-2026-10-22 and earlier used the experimental firmware of PR #3880 at 49e49f810. `sysview.md` has the routes and how to
-read the numbers; tinyusb's `test/hil/sysview_ci.py capture` takes the RTT streaming route.
+The firmware landed with tinyusb#4293 (190f1ac7a); the names, diagnostics and routes below were checked at its
+follow-ups, tinyusb#4356 (892f03b9a). 190f1ac7a has `CFG_TUD_SYSVIEW`/`CFG_TUH_SYSVIEW` instead of `CFG_TUSB_SYSVIEW`, a
+CMake warning instead of the FreeRTOS hook's compiler note, and the TMR timestamps on MAX32665/MAX32666 only. The
+measurements dated 2026-10-22 and earlier used the experimental firmware of PR #3880 at 49e49f810. `sysview.md` has the
+routes and how to read the numbers. tinyusb's CI capture takes the RTT streaming route: `hil_test.py --sysview-out`
+records the raw stream on the rig before the board's final park, and `sysview_ci.py decode` decodes it off the rig.
 
 - Build: CMake `-DSYSVIEW=1..4` (1 the USB ISR, 2 adds the `usbd`/`usbh` core, 3 the `dcd`/`hcd` API, 4 the class
-  drivers), `-DSYSVIEW_POST_MORTEM=1` on top for the dump route, and `-DSYSVIEW_BUFFER_SIZE`. `make` refuses it.
+  drivers), `-DSYSVIEW_POST_MORTEM=1` on top for the dump route, and `-DSYSVIEW_BUFFER_SIZE`. `make` refuses it. The
+  level reaches the code as `CFG_TUSB_SYSVIEW`, one level for device and host.
   `SysView` is up-buffer 1. User events use the fixed base `TU_SV_EVENT_BASE` (512), named host-side with
   `--event-map`.
 - ISR spans come from whichever entry the port uses: the `tud_int_handler`/`tuh_int_handler` macros, or the driver's
@@ -125,14 +137,16 @@ read the numbers; tinyusb's `test/hil/sysview_ci.py capture` takes the RTT strea
   (ch32v20x's high-priority one) records no span of its own.
 - FreeRTOS task tables need the SystemView block (`SEGGER_SYSVIEW_FreeRTOS.h`) at the end of the family's
   `FreeRTOSConfig.h`; wired in `nrf`, `samd5x_e5x`, `stm32f4`, `stm32f7` and `stm32h7`. Other FreeRTOS families build
-  with a CMake warning and no scheduling tables (CPU load, ready→run), though `tu_sysview_stack_report` still sends
+  with a compiler note and no scheduling tables (CPU load, ready→run), though `tu_sysview_stack_report` still sends
   task names and stack use at levels 2-4. tinyusb records no heap events, so `heap` is always `null`.
 - Buffer: RAM-rich families default `SYSVIEW_BUFFER_SIZE` to 65536, the rest to 4096. At 4096 mimxrt1064_evk lost
   96.7% of its ISR exits at ~109 Hz; at 65536 stm32h743nucleo and raspberry_pi_pico lost nothing in a 15 s CDC burst
   over OpenOCD while feather_nrf52840_express, on an OpenOCD-over-J-Link path, lost in 73 bursts.
+- RTT and SystemView share one lock: PRIMASK on Cortex-M with GCC or Clang ("Logs and RTT").
 - `cdc_msc_freertos`'s 1024-byte task stacks overflowed during enumeration at level 4; the example raises them under
-  `CFG_TUD_SYSVIEW`. `SYSVIEW_RAM_BASE` defaults to `0x20000000`; families whose SRAM starts elsewhere
-  (lpc11/13/15/17/18/40/43, kinetis_k, kinetis_kl) set `SYSVIEW_RAM_BASE_DEFAULT` in their `family.cmake`.
+  `BOARD_STACK_INSTRUMENTED` (`CFG_TUSB_DEBUG || CFG_TUSB_SYSVIEW`). `SYSVIEW_RAM_BASE` defaults to `0x20000000`;
+  families whose SRAM starts elsewhere (lpc11/13/15/17/18/40/43, kinetis_k, kinetis_kl) set `SYSVIEW_RAM_BASE_DEFAULT`
+  in their `family.cmake`.
 - WCH's USBFS/USBHS device drivers NAK the bus while the ISR holds the transfer flag (`INT_BUSY`); tinyusb
   `docs/reference/device_issues.rst` (`wch-trace-timing`) says what that does to traced timings.
 - An idle enumerated CDC device emits a USB event about every 2.016 s: a rate check with no traffic reads the median
@@ -175,8 +189,19 @@ read the numbers; tinyusb's `test/hil/sysview_ci.py capture` takes the RTT strea
     the library); loss stays nonzero even at 10 MHz.
   - Bare-metal builds leave the USB IRQ at priority 0, which the BASEPRI 0x20 RTT lock never masks: the ISR
     corrupts half-built packets (wrong function ids, negative timestamp deltas the GUI turns into +0.699 s each).
-    Moving the IRQ to priority 1 removed every corrupt packet. Until tinyusb#4294's lock fix lands, distrust a
-    bare-metal capture showing `ISR` contexts other than the USB one or function ids outside 512-519.
+    Moving the IRQ to priority 1 removed every corrupt packet. The PRIMASK lock (tinyusb#4294) fixes it at any
+    priority: 0 corrupt rows in three 4 MHz captures, 2026-10-29.
+- max32650 and max32690 take the same TMR timestamp route (`hw/bsp/maxim/sysview_max32_tmr.h`) from tinyusb#4356
+  (8bfefdc83): their user guides do not document the DWT cycle counter. Build-verified only; on hardware, still to
+  check: `board_init` completing (max32690's MSDK timer init waits on clock-ready and write-done without a bound), the
+  counter's progress and rate, max32690's carry between its cascaded 16-bit halves, the full rollover, and decoded
+  captures under USB and FreeRTOS load.
+- stm32f407disco `cdc_msc_freertos` at level 4 produces about 50k events/s under the CDC burst, more than an RTT read
+  drains (tinyusb#4351, 2026-10-29, 64 KiB buffer): OpenOCD at its 2 MHz SWD clock delivered 58-67 KB/s and lost 79 %
+  of the events, and J-Link firmware on the on-board ST-LINK at 4 MHz lost 61 %. OpenOCD's 1024-byte RTT read per poll
+  is not the limit: a build reading 8 KiB moved 64.5 KB/s against 60.7, the same cost per byte. Bare-metal `cdc_msc`
+  (about 11k events/s) loses nothing over a 15 s CDC burst with its 1 s idle gaps; 0.5 s and 0.1 s gaps, the only
+  shorter ones tried, overflowed.
 
 ## Espressif integration
 
