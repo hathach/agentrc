@@ -92,7 +92,9 @@ class SessionsTest(unittest.TestCase):
         self.assertEqual((found[0]['space_id'], found[0]['space'], found[0]['created']), ('sp2', 'tinyusb', 30))
 
     def test_the_foreground_process_s_cwd_not_the_terminal_s(self):
-        self.assertEqual(self.sessions({'t2': terminal('t2')})[0]['cwd'], '/w')
+        t, cwd = terminal('t2'), os.path.abspath('/w')   # '/w' is not absolute on Windows
+        t['foreground'] = {**t['foreground'], 'cwd': cwd}
+        self.assertEqual(self.sessions({'t2': t})[0]['cwd'], os.path.realpath(cwd))
 
     def test_a_terminal_gone_or_finished_since_ls_is_left_out(self):
         ls = [{'address': 't2', 'agent': 'claude-code'}, {'address': 't3', 'agent': 'claude-code'}]
