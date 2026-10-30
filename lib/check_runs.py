@@ -32,4 +32,5 @@ def latest_run(runs):
         return None, f"check run {undated[0]['id']} has no start time to order it by"
     if undated:
         return undated[0], ''
-    return newest_reading(runs, 'started_at', lambda r: (r['status'], r.get('conclusion'), (r.get('output') or {}).get('summary')))
+    return newest_reading(runs, 'started_at', lambda r: (r['status'], r.get('conclusion'), (r.get('output') or {}).get('title'),
+                                                         (r.get('output') or {}).get('summary')))
