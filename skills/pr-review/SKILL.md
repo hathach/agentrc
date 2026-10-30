@@ -159,7 +159,9 @@ sequence:
    `reviewed`, `ledger.py save --pr N --output <it>`. Any other status saves
    and posts nothing: step 6 reports it with its reason.
 5. One unit runs `post.py` (pending) or `post.py --auto` (auto-post) with
-   `--expected-head`. Its exit 1 names what it could not confirm.
+   `--expected-head`; a `discussion` run always takes plain `post.py`, since
+   its answers only go into a pending review. Its exit 1 names what it could
+   not confirm.
 6. Report the verdict and its reasons, the counts, coverage lost, the CI and
    HIL rows, the receipts, `post.py`'s `overLength` and the result's
    `heldThreads`; never the draft's text.

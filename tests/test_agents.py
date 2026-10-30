@@ -186,7 +186,8 @@ class AgentFiles(unittest.TestCase):
         self.assertNotIn('AskUserQuestion', skill)
         for phrase in ("absent words mean pending, no hardware and prepare's mode",
                        'never substitute, drop or default a choice the words made',
-                       "no board runs: step 3 takes `hil: {choice: 'none'}`"):
+                       "no board runs: step 3 takes `hil: {choice: 'none'}`",
+                       'a `discussion` run always takes plain `post.py`'):
             self.assertIn(phrase, skill)
         self.assertIn('pushed SHAs, posted comment IDs and resolved thread IDs', body)
         rules = ' '.join((AGENTS.parent / 'instructions' / 'user.md').read_text().split())
