@@ -1178,6 +1178,27 @@ class LinkHops(unittest.TestCase):
         self.assertEqual(self.wc.removal_plan([clean], [kept]),
                          ([], {clean: 'parent--z, which stays, links into it'}))
 
+    def assertJunctionThroughASymlinkHolds(self, junction):
+        """junction(path, target) makes a junction: kept/dep through clean/lib, a symlink out of it, holds clean."""
+        kept, clean, outside = self.t / 'parent--z', self.t / 'parent--b', self.t / 'outside'
+        for tree in (kept, clean, outside):
+            tree.mkdir()
+        self.link(clean / 'lib', outside)
+        junction(kept / 'dep', clean / 'lib')
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
+    def test_a_junction_through_a_symlink_in_the_clean_sibling_holds_it(self):
+        islink, isjunction = os.path.islink, os.path.isjunction  # dep a symlink that reports itself a junction
+        with mock.patch('os.path.islink', lambda p: os.path.basename(p) != 'dep' and islink(p)), \
+                mock.patch('os.path.isjunction', lambda p: os.path.basename(p) == 'dep' or isjunction(p)):
+            self.assertJunctionThroughASymlinkHolds(self.link)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_a_real_junction_through_a_symlink_in_the_clean_sibling_holds_it(self):
+        import _winapi
+        self.assertJunctionThroughASymlinkHolds(lambda path, target: _winapi.CreateJunction(str(target), str(path)))
+
     @unittest.skipUnless(os.name == 'nt', 'Windows path forms')
     def test_windows_targets_are_anchored_on_their_own_drive(self):
         anchored = self.wc.anchored

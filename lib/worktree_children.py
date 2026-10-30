@@ -24,7 +24,8 @@ for a child with submodules (git refuses those otherwise), so a write racing its
   refs/worktree/reviewr/turn-base and base-pick, is not checked;
 - no repository (bare ones included) or worktree is nested anywhere below it (ignored
   directories included) other than its submodules;
-- no Windows junction anywhere below it: `git worktree remove` would leave it and the directories above it;
+- no Windows junction below it: `git worktree remove` would leave it and the directories above it;
+  one in git's own storage, its submodules' `.git` directories or its git dir, is not looked for;
 - every repository whose storage the removal deletes (submodule git dirs inside the child or
   inside its git dir, initialized or not) has no stash, no linked worktree (even one inside the
   child or pruned), its main worktree inside that boundary, and
@@ -242,8 +243,8 @@ def submodules(child):
 def nested_repo(child, allowed):
     """A .git file or directory or a bare repository below child other than at child and its submodules,
     or None. The whole tree: a repository initialized inside a tracked directory shows in no status or
-    ignored listing. Keep for a Windows junction below child: Git for Windows' removal (dir.c
-    remove_dir_recurse) neither enters nor deletes one, nor any directory above it."""
+    ignored listing. Keep for a Windows junction below child outside the .git directories it skips: Git
+    for Windows' removal (dir.c remove_dir_recurse) neither enters nor deletes one, nor any directory above it."""
     allowed = {os.path.realpath(p) for p in [child, *allowed]}
     for top, dirs, files, links in walk(child):
         junction = next((p for p in (os.path.join(top, n) for n in links) if os.path.isjunction(p)), None)
@@ -373,10 +374,11 @@ def anchored(path, here):
 
 def link_hops(link):
     """Every path resolving link enters, each directory resolved: a link reaches every tree on the
-    way, through a symlink or a `..`, not only its final target. Each hop is absolute, from the
-    anchor (`/`, a drive's root or a UNC share's), which `..` never climbs above."""
-    hops, links = [], 0
-    path, rest = anchored(os.path.abspath(link), '')
+    way, through a symlink, a Windows junction or a `..`, not only its final target. Each hop is
+    absolute, from the anchor (`/`, a drive's root or a UNC share's), which `..` never climbs above."""
+    hops, links, link = [], 0, os.fspath(link)
+    # not abspath: it would drop a `..` before the symlink it climbs out of is followed
+    path, rest = anchored(link if os.path.isabs(link) else os.path.join(os.getcwd(), link), '')
     while rest:
         name = rest.pop(0)
         if name in ('', '.'):
@@ -386,7 +388,7 @@ def link_hops(link):
             continue
         step = os.path.join(path, name)
         hops.append(step)
-        if not os.path.islink(step):
+        if not (os.path.islink(step) or os.path.isjunction(step)):  # islink is False for a junction
             path = step
             continue
         links += 1
@@ -400,7 +402,7 @@ def link_hops(link):
 def reach(tree, scan):
     """(the paths tree's symlinks enter, the error that stopped searching it or None), searched once
     per scan, the cache of one planning pass: a big tree takes tens of seconds to walk. On Windows,
-    where link_hops follows symlinks only, not the junctions, subst or mapped drives on the way,
+    where link_hops follows symlinks and junctions only, not the subst or mapped drives on the way,
     each hop is case-folded twice as holds spells its roots: with its directory resolved, so a
     symlink hop still names the tree it sits in, and resolved whole, for where it ends up."""
     if tree not in scan:

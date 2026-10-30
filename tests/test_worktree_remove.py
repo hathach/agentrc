@@ -156,6 +156,15 @@ class Remove(Rig):
             self.assertRefused(f'the log {state / "log"} lies inside {self.parent}')
 
     @posix
+    def test_a_log_climbing_out_of_a_link_into_the_worktree_is_refused(self):
+        (self.t / 'home').mkdir()
+        (self.parent / 'build').mkdir()
+        (self.t / 'home' / 'alias').symlink_to(self.parent / 'build')  # dangling once PATH goes: no mkdir past it
+        log = self.t / 'home' / 'alias' / '..' / '..' / 'state' / 'log'
+        with mock.patch.object(wr.wc, 'LOG', log):
+            self.assertRefused(f'the log {log} lies inside {self.parent}')
+
+    @posix
     def test_a_log_under_a_link_in_the_worktree_out_of_it_is_refused(self):
         elsewhere = self.t / 'elsewhere'
         elsewhere.mkdir()
