@@ -1179,6 +1179,15 @@ print(locale.getpreferredencoding(False))
 print(json.dumps([os.fsencode(p).decode('utf-8') for p in wc.linked_worktree(sys.argv[2])]))
 '''
 
+# prints the locale encoding, then logs a line holding a non-ASCII name and an undecodable byte
+LOGGED = r'''import importlib.util, locale, os, sys
+spec = importlib.util.spec_from_file_location('worktree_children', sys.argv[1])
+wc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(wc)
+print(locale.getpreferredencoding(False), flush=True)
+wc.log('kept /r\u00e9--k' + os.fsdecode(b'\xff'))
+'''
+
 
 @unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
 class NonUtf8Locale(unittest.TestCase):
@@ -1199,6 +1208,20 @@ class NonUtf8Locale(unittest.TestCase):
                 self.skipTest(f'the C locale encoding is {encoding} here')
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(json.loads(answer), [str(main / '.git' / 'worktrees' / 'ré--kid'), str(main / '.git')])
+
+    def test_a_line_the_locale_cannot_encode_is_printed_and_logged_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, 'XDG_STATE_HOME': tmp, 'LC_ALL': 'C', 'PYTHONCOERCECLOCALE': '0', 'PYTHONUTF8': '0'}
+            env.pop('PYTHONIOENCODING', None)
+            done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LOGGED, str(SCRIPT)],
+                                  env=env, capture_output=True)
+            encoding, _, printed = done.stdout.partition(b'\n')
+            if encoding.decode().lower().replace('-', '') == 'utf8':
+                self.skipTest(f'the C locale encoding is {encoding.decode()} here')
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(printed, b'kept /r\\xe9--k\\udcff\n')
+            log = Path(tmp) / 'agentrc' / 'worktree-remove' / 'log'
+            self.assertTrue(log.read_bytes().endswith(b' kept /r\xc3\xa9--k\xff\n'))
 
 
 if __name__ == '__main__':

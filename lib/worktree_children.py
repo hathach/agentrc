@@ -586,9 +586,12 @@ def remove(child, common, force):
 
 
 def log(line):
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:  # a stdout in a narrower code page; the log below keeps the exact line
+        print(line.encode(sys.stdout.encoding, 'backslashreplace').decode(sys.stdout.encoding), flush=True)
     LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(LOG, 'a') as f:
+    with open(LOG, 'a', encoding='utf-8', errors='surrogateescape') as f:
         f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
 
 
