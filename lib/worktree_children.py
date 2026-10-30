@@ -75,6 +75,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # loaded by path (worktree_remove.py), lib is not on it
+import windows  # noqa: E402
+
 PRIVATE_REFS = ('refs/worktree/', 'refs/bisect/', 'refs/rewritten/')
 # herdr-reviewr's pane state (last-turn snapshot tree, base pick blob), rewritten every turn, never work
 REVIEWR_REFS = ('refs/worktree/reviewr/turn-base', 'refs/worktree/reviewr/base-pick')
@@ -327,7 +330,10 @@ def check_agents(path, gitdir):
 
 
 def hc_path():
-    """herdr-core's `hc`, or None when it is not installed."""
+    """herdr-core's `hc`, or None when it is not installed; on Windows from PATH alone, never the working
+    directory's, which shutil.which searches first."""
+    if os.name == 'nt':
+        return windows.on_path('hc', ('.exe',), ENV.get('PATH', '').split(os.pathsep))
     return shutil.which('hc', path=ENV.get('PATH'))
 
 
@@ -755,11 +761,11 @@ def cleanup(parent, branches=()):
             branch = head and (str(removal[0]), *head)
             if branch:
                 log(f'removing {child}; its branch is retried by: {retry(parent, [branch])}')
-            if os.path.lexists(parent):
+            check_terminals(child)  # again: its checks above can take long
+            if os.path.lexists(parent):  # last: hc may take long too
                 log(f'{parent} exists again: not touching {child} or the children after it')
                 stopped = True
                 break
-            check_terminals(child)  # again: its checks above can take long
             remove(child, *removal)
             log(f'removed {child}')
         except (Keep, OSError) as why:

@@ -939,6 +939,18 @@ class WorktreeChildren(unittest.TestCase):
                       done.stdout)
         self.assertTrue(child.is_dir())
 
+    def test_a_parent_recreated_during_a_childs_last_terminal_check_keeps_it(self):
+        child = self.child()
+        # the second `hc ls` is the one just before the removal
+        recreate = (f'if sys.argv[1:2] == ["ls"] and os.path.exists(os.environ["STUB_HC"] + ".calls"):\n'
+                    f'    os.makedirs({str(self.parent)!r}, exist_ok=True)\n')
+        make_stub(self.hc_stub.parent, 'hc', HC.replace('\ntry:', f'\n{recreate}try:', 1))
+        hc_inventory(self.hc, [])
+        done = self.cleanup()
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn(f'{self.parent} exists again: not touching {child}', done.stdout)
+        self.assertTrue(child.is_dir())
+
     def test_no_hc_installed_skips_the_terminal_check(self):
         child = self.child()
         self.env['PATH'] = without_hc(self.env['PATH'], self.hc_stub)
@@ -1135,6 +1147,7 @@ class WorktreeChildren(unittest.TestCase):
         copy = dirty / 'build' / 'lib' / 'worktree_children.py'
         copy.parent.mkdir()
         shutil.copy(SCRIPT, copy)
+        shutil.copy(SCRIPT.with_name('windows.py'), copy.parent)
         state = dirty / 'build' / 'state'
         log = state / 'agentrc' / 'worktree-remove' / 'log'
         for what, path, script, env, cwd in (
@@ -1227,6 +1240,28 @@ class Planning(unittest.TestCase):
             walked.clear()
             self.assertEqual(wc.removal_plan([a, b, c, d], []), ([a, b, c, d], {}))
             self.assertEqual(sorted(walked), ['a', 'b', 'c', 'd'])
+
+
+class HcPath(unittest.TestCase):
+    def test_hc_comes_from_path_alone_never_the_working_directory(self):
+        spec = importlib.util.spec_from_file_location('worktree_children', SCRIPT)
+        wc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wc)
+        t = tmpdir(self)
+        name = 'hc.exe' if os.name == 'nt' else 'hc'
+        empty, bin_dir, here = t / 'empty', t / 'bin', t / 'here'
+        for d in (empty, bin_dir, here):
+            d.mkdir()
+        for d in (bin_dir, here):
+            (d / name).write_text('')
+            (d / name).chmod(0o755)
+        cwd = os.getcwd()
+        os.chdir(here)  # a checkout holding an hc: shutil.which on Windows takes it first
+        self.addCleanup(os.chdir, cwd)
+        with mock.patch.dict(wc.ENV, PATH=str(empty)):
+            self.assertIsNone(wc.hc_path())
+        with mock.patch.dict(wc.ENV, PATH=os.pathsep.join([str(empty), str(bin_dir)])):
+            self.assertEqual(os.path.normcase(wc.hc_path()), os.path.normcase(str(bin_dir / name)))
 
 
 class LinkHops(unittest.TestCase):
