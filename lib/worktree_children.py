@@ -14,6 +14,10 @@ A child is removed only when every check below passes; otherwise it is kept and 
 for a child with submodules (git refuses those otherwise), so a write racing its checks is lost.
 - no chief session (headless or interactive) runs in it and none of its cowork lanes holds a
   request (running or undelivered); the skills' own code decides, and code that cannot load keeps it;
+- no live herdr-core terminal of this machine, one in no herdr-app space included, has its program's or
+  foreground process's working directory in it (`hc ls`, `hc get`), checked again right before its removal:
+  it would lose that directory, and on Windows hold it open; an `hc` that fails or answers incompletely
+  keeps it, none installed skips this. Other processes working in it go unseen;
 - not locked; HEAD on a branch, or a detached HEAD reachable from the branches, tags or remotes,
   the remotes' only after fetching each configured remote as branches are (below), first;
 - in the child and in every initialized submodule, recursively: `git status` shows no tracked
@@ -65,6 +69,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -85,20 +90,24 @@ SEARCH = '''query($q: String!, $endCursor: String) {
     nodes { ... on PullRequest { number state headRefName headRefOid mergedAt headRepositoryOwner { login } } }
     pageInfo { hasNextPage endCursor } } }'''
 GITHUB = re.compile(r'github\.com[:/]')
+HC_TIMEOUT = 30   # s an hc command may take: a hung one leaves the inventory unknown
 
 
 class Keep(Exception):
     """A reason this child stays."""
 
 
-def run(args, cwd=None, input=None):
-    """A finished command; one that cannot start reads as exit 127, so its check keeps the child."""
+def run(args, cwd=None, input=None, timeout=None):
+    """A finished command; one that cannot start reads as exit 127, one killed at timeout (s) as 124, so its check
+    keeps the child."""
     try:
         # decoded as os.fsdecode does, so paths round-trip: UTF-8 on Windows (git's), not the locale code page
         return subprocess.run(args, cwd=cwd, input=input, capture_output=True, encoding=sys.getfilesystemencoding(),
-                              errors='surrogateescape', env=ENV)
+                              errors='surrogateescape', env=ENV, timeout=timeout)
     except OSError as e:
         return subprocess.CompletedProcess(args, 127, '', str(e))
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args, 124, '', f'no answer in {timeout} s')
 
 
 def git(*args, cwd=None, gitdir=None, input=None):
@@ -317,10 +326,86 @@ def check_agents(path, gitdir):
             raise Keep(f'cowork lane {box.parent.name}/{box.name} holds a running or undelivered request')
 
 
+def hc_path():
+    """herdr-core's `hc`, or None when it is not installed."""
+    return shutil.which('hc', path=ENV.get('PATH'))
+
+
+def hc_json(hc, *args):
+    """hc's JSON object answering args, or None for a terminal that is gone (hc's not_found, exit 3); Keep for any
+    other answer: an inventory hc cannot give whole is unknown."""
+    done = run([hc, *args, '--json'], timeout=HC_TIMEOUT)
+    try:
+        if not done.returncode:
+            out = json.loads(done.stdout)
+            if isinstance(out, dict):
+                return out
+        elif done.returncode == 3 and json.loads(done.stderr)['error']['kind'] == 'not_found':
+            return None
+    except (ValueError, KeyError, TypeError):
+        pass
+    raise Keep(f'cannot list herdr-core terminals: `hc {" ".join(args)}` exit {done.returncode}: '
+               f'{(done.stdout + done.stderr).strip()[:300]}; retry once `hc ls` answers')
+
+
+def absolute(path):
+    """Whether path is a nonempty absolute path: a relative one would resolve against this process's cwd."""
+    return isinstance(path, str) and os.path.isabs(path)
+
+
+def terminals_in(trees):
+    """{tree: [terminal]} of the trees a live local herdr-core terminal works in: its program's working directory,
+    as `hc ls` or else `hc get` gives it, or its foreground process's, a terminal in no herdr-app space included.
+    hc's own terminals only; with no hc installed nothing is checked; Keep for an inventory hc cannot give whole.
+    `hc ls` starts a core when none runs (so does `hc server status`): one that does lists nothing."""
+    hc = hc_path()
+    if not hc:
+        return {}
+    terminals = (hc_json(hc, 'ls') or {}).get('terminals')
+    if not isinstance(terminals, list):
+        raise Keep('cannot list herdr-core terminals: `hc ls` gave no terminal list; retry once `hc ls` answers')
+    busy = {}
+    for t in terminals:
+        if not (isinstance(t, dict) and isinstance(t.get('address'), str) and t.get('state') in ('live', 'finished')):
+            raise Keep(f'cannot list herdr-core terminals: `hc ls` gave an incomplete entry: {str(t)[:300]}')
+        addr = t['address']
+        if '/' in addr or t['state'] == 'finished':  # another machine's (`machine/t7`)
+            continue
+        if not absolute(t.get('cwd')):
+            raise Keep(f'cannot list herdr-core terminals: `hc ls` gave {addr} no absolute cwd: {str(t)[:300]}')
+        cwds = [t['cwd']]
+        if not is_within(t['cwd'], trees):  # a hit already settles it
+            got = hc_json(hc, 'get', addr)
+            if got is None:  # ended since the listing
+                continue
+            fg = got.get('foreground', ())  # null: no foreground process; absent: an incomplete answer
+            if not absolute(got.get('cwd')) or not (fg is None or isinstance(fg, dict) and absolute(fg.get('cwd'))):
+                raise Keep(f'cannot list herdr-core terminals: `hc get {addr}` gave no absolute cwd or foreground '
+                           f'cwd: {str(got)[:300]}')
+            cwds += [got['cwd'], *([fg['cwd']] if fg else [])]
+        for tree in trees:
+            where = next((d for d in cwds if is_within(d, [tree])), None)
+            if where:
+                name = f'{addr} {t["name"]}' if t.get('name') else addr
+                busy.setdefault(tree, []).append(f'{name} ({t.get("where") or "in no herdr-app space"}) in {where}')
+    return busy
+
+
+def busy_with(terminals):
+    return f'herdr-core terminals work there: {"; ".join(terminals)}; close them, then retry'
+
+
+def check_terminals(*trees):
+    """Keep when a live local herdr-core terminal works in one of trees (terminals_in)."""
+    busy = terminals_in(trees)
+    if busy:
+        raise Keep(busy_with([t for terminals in busy.values() for t in terminals]))
+
+
 def content_check(child):
     """Raise Keep when removing the linked worktree child could lose anything but ignored files and
     reflog-only commits, or would cut off a running agent; returns the common git dir to remove it
-    with and whether that needs --force."""
+    with and whether that needs --force. Terminals working in it are terminals_in's."""
     gitdir, common = linked_worktree(child)
     check_agents(child, gitdir)
     if (gitdir / 'locked').exists():
@@ -638,10 +723,19 @@ def cleanup(parent, branches=()):
         log(f'branches to settle: {retry(parent, branches)}')
     branches = list(branches)
     found, removals, stopped = children(parent), {}, False
+    if found and not hc_path():
+        log('no hc installed: herdr-core terminals in the children not checked')
+    try:  # first: a child a terminal works in stays, which may hold others
+        busy = {child: busy_with(terminals) for child, terminals in terminals_in(found).items()}
+    except Keep as why:
+        busy = dict.fromkeys(found, str(why))
     for child in found:  # every check first: a child that stays may hold one sorted before it
         stopped = os.path.lexists(parent)  # once seen, stays seen: the replacement may be mid-move
         if stopped:
             break
+        if child in busy:
+            keep(child, busy[child])
+            continue
         try:
             removals[child] = content_check(child)
         except (Keep, OSError) as why:  # an unexpected filesystem error keeps the child too
@@ -665,6 +759,7 @@ def cleanup(parent, branches=()):
                 log(f'{parent} exists again: not touching {child} or the children after it')
                 stopped = True
                 break
+            check_terminals(child)  # again: its checks above can take long
             remove(child, *removal)
             log(f'removed {child}')
         except (Keep, OSError) as why:

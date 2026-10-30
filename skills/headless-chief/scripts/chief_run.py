@@ -14,8 +14,10 @@ The exit line ends with that total, or `cost none (<why>)`.
 A status line is the first line of one of chief's own messages (agents/chief.md);
 a note is a progress note, joined onto one line, that chief's model returns as a `thinking`
 block. It returns at once and leaves the launcher in its own session, so no caller's
-command timeout ends the run; --foreground runs it in place. Windows has no fork: there
-the launcher is this command run again, detached. Exit codes and usage are in SKILL.md.
+command timeout ends the run; --foreground runs it in place. The launcher is this command
+run again, detached, with the environment a fresh session gets (lead_session): herdr-core
+ends every process carrying the caller's terminal's HC_SCOPE with that terminal. Exit codes
+and usage are in SKILL.md.
 """
 import argparse
 import errno
@@ -38,6 +40,7 @@ import lead_session  # noqa: E402
 import windows  # noqa: E402
 
 MARKER = 'chief: '
+RELAUNCH = [sys.executable, *sys.orig_argv[1:], '--_detached']   # this command again, as the launcher
 HELD = []   # the run.lock this launcher holds until it exits
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0   # a detached launcher's console children
 
@@ -283,10 +286,9 @@ def main(argv=None):
     p.add_argument('--task-file', required=True, type=Path)
     p.add_argument('--permission-mode')
     p.add_argument('--foreground', action='store_true')
-    if os.name == 'nt':
-        p.add_argument('--_detached', action='store_true', help=argparse.SUPPRESS)   # the launcher, run again
+    p.add_argument('--_detached', action='store_true', help=argparse.SUPPRESS)   # the launcher, run again
     a = p.parse_args(argv)
-    if getattr(a, '_detached', False):
+    if a._detached:
         detached(a, lambda: detached_launch(a))
     if a.out.exists():
         fail(f'{a.out} exists; each run needs a new directory')
@@ -310,33 +312,28 @@ def main(argv=None):
             return launch(a, task)
     finally:
         release()
-    if os.name == 'nt':
-        # no fork: this process's own command line runs again as the launcher, outside the caller's console and
-        # group; the task goes on its stdin, as a forked launcher keeps the file open whatever the caller does with it.
-        # A console of its own with no window, not none: a venv's python.exe starts the real one as a child, which
-        # DETACHED_PROCESS would leave to open a visible console for the whole run
-        with task:
-            data = task.read()
-        with (a.out / 'stderr.log').open('ab') as log:
-            launcher = subprocess.Popen([sys.executable, *sys.orig_argv[1:], '--_detached'], stdin=subprocess.PIPE, stdout=log,
-                                        stderr=log, creationflags=NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+    # this process's own command line runs again as the launcher, with a fresh session's environment (herdr-core
+    # ends every process that started with the caller's terminal's HC_SCOPE), outside the caller's session (POSIX)
+    # or console and group (Windows). It gets the task on its stdin: the open file on POSIX; piped on Windows, where
+    # an open file would stop the caller deleting it. A console of its own with no window, not none: a venv's
+    # python.exe starts the real one as a child, which DETACHED_PROCESS would leave to open a visible console
+    nt = os.name == 'nt'
+    with task, (a.out / 'stderr.log').open('ab') as log:
+        data = task.read() if nt else None
+        try:
+            launcher = subprocess.Popen(RELAUNCH, stdout=log, stderr=log, env=lead_session.child_env(), **(
+                dict(stdin=subprocess.PIPE, creationflags=NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP) if nt
+                else dict(stdin=task, start_new_session=True)))
+        except OSError as e:
+            fail(f'cannot start the launcher: {e}')
+    if nt:
         try:
             with launcher.stdin:
                 launcher.stdin.write(data)
         except OSError as e:
             fail(f'the launcher (pid {launcher.pid}) did not take the task: {e}; see {a.out / "stderr.log"}')
-        print(f'chief_run: launcher pid {launcher.pid}, progress {a.out / "progress.log"}')
-        return 0
-    if pid := os.fork():
-        print(f'chief_run: launcher pid {pid}, progress {a.out / "progress.log"}')
-        return 0
-    os.setsid()
-    for fd, path, flags in ((0, os.devnull, os.O_RDONLY), (1, a.out / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND)):
-        opened = os.open(path, flags, 0o644)
-        os.dup2(opened, fd)
-        os.close(opened)
-    os.dup2(1, 2)
-    detached(a, lambda: launch(a, task))
+    print(f'chief_run: launcher pid {launcher.pid}, progress {a.out / "progress.log"}')
+    return 0
 
 
 def detached(a, run):
@@ -355,20 +352,22 @@ def detached(a, run):
 
 
 def detached_launch(a):
-    """Windows: the launcher run again, the task on its stdin; it checks again what its caller checked, and takes the
-    run lock its caller only checked."""
-    task = tempfile.TemporaryFile()
-    task.write(sys.stdin.buffer.read())
-    task.seek(0)
+    """The launcher run again, the task on its stdin; it checks again what its caller checked, and on Windows takes
+    the run lock its caller only checked."""
+    task = sys.stdin.buffer
+    if not task.seekable():   # Windows' pipe: copied, so claude gets a file
+        task = tempfile.TemporaryFile()
+        task.write(sys.stdin.buffer.read())
+        task.seek(0)
     if not a.out.is_dir() or (a.out / 'progress.log').exists():
         print(f'chief_run: --_detached is the launcher chief_run starts, in the new --out it made; {a.out} is not one',
               file=sys.stderr)
         return 2
-    # the inherited log handle has no append mode: it would write over claude's stderr
-    opened = os.open(a.out / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    os.dup2(opened, 1)
-    os.close(opened)
-    os.dup2(1, 2)
+    if os.name == 'nt':   # the inherited log handle has no append mode: it would write over claude's stderr
+        opened = os.open(a.out / 'stderr.log', os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(opened, 1)
+        os.close(opened)
+        os.dup2(1, 2)
     why = None if a.worktree.is_dir() else f'{a.worktree} is not a directory'
     if why := why or refusal(a.worktree, 'relaunch with a new --out') or lock_held(a.worktree, keep=True, wait=5):
         Progress(a.out / 'progress.log').line(f'launcher: exit 2 ({why}) · report none')

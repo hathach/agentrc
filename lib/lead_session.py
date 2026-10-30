@@ -9,6 +9,9 @@ so a session started from one of those inherits them:
   messaging endpoint and remote-control bridge.
 - Codex: CODEX_THREAD_ID, CODEX_SESSION_ID and CODEX_TOOL_CALL_ID.
 - Herdr: HERDR_*, the pane the session runs in.
+- herdr-core (hc 0.1.14): HC_TERMINAL_ID and HC_TERMINAL_SOCKET, the lead's terminal and its core, which hc takes
+  as the caller of any hc command (a child's message would come from the lead, its terminals be the lead's); and
+  HC_SCOPE, which ties a process to that terminal's cleanup. HC_SESSION and HC_SOCKET select the core and pass.
 - cowork: COWORK_READ_ONLY, the coworker relay's own scope (coworker_guard.py).
 Kept: CLAUDE_CODE_CHILD_SESSION, which Claude Code reads as "started by a model-driven session" and which is true of
 the child too; CLAUDE_CODE_ENTRYPOINT, the host's launch surface, which Claude Code re-derives for -p (cli becomes
@@ -21,6 +24,7 @@ LEAD_SESSION = frozenset({
     'CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_EFFORT',
     'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN', 'CLAUDE_CODE_BRIDGE_SESSION_ID',
     'CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'CODEX_TOOL_CALL_ID',
+    'HC_TERMINAL_ID', 'HC_TERMINAL_SOCKET', 'HC_SCOPE',
     'COWORK_READ_ONLY'})
 
 

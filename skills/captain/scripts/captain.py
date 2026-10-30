@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Mechanics of the captain: find the agent sessions in this Herdr, pin each one's identity, and tell
-whether its input line is empty before anything is typed into it.
+"""Mechanics of the captain: find the Claude Code sessions in this host's hc terminals, pin each one's identity, and
+tell whether its input line is empty before anything is typed into it.
 
 Judgment stays in SKILL.md. Every check refuses rather than guesses: an identity it cannot pin or a screen it
 does not recognize is reported, never assumed safe.
 
-  captain.py list [--json]                       every other Claude Code session, latest Herdr change first, asking none
+  captain.py list [--json]                       every other Claude Code session, latest status report first
   captain.py enroll [--replace]                  make this session the captain
   captain.py ask <target>... [--force]           send each idle target a status request, unless unchanged
   captain.py collect [<msg>...] [--wait MS]      print each report as it lands
@@ -15,22 +15,22 @@ does not recognize is reported, never assumed safe.
                                                  show, then relay, the human's newest message
   captain.py withdraw <action>                   take back a relay
   captain.py open --checkout <dir> --account <main|ada> [--name <name>]
-                                                 start a Claude Code session in a new workspace
+                                                 start a Claude Code session in a new terminal
   captain.py brief --for <msg>                   a target reads what a status request asks
   captain.py report --for <msg> --file <json|->  a target answers a status request
   captain.py accept --action <action>            a target takes a relay and reads its words
   captain.py outcome --action <action> --result <result> [--note-file <file|->]
                                                  a target says how a relay ended
 
-A target is a pane or a selector: pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N, matched against each
-live session's latest report, or ws:<workspace id or label>. A selector must match exactly one session; a relay with
---entry names panes only.
+A target is a terminal address (t7) or a selector: pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N,
+matched against each live session's latest report, or space:<herdr space id or name>. A selector must match exactly
+one session; a relay with --entry names addresses only.
 
-A message that opens `tell <name>... [to]`, each name a pane id, workspace id or label, or selector, is relayed
-without that opening when the names are exactly the relay's targets, and refused when they are not or cannot be
-told apart from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed
-without it when the targets are exactly the live sessions, at the preview and at the send; the preview's digest covers
-the text, the target panes and the session pinned in each.
+A message that opens `tell <name>... [to]`, each name an address, space id or name, or selector, is relayed without
+that opening when the names are exactly the relay's targets, and refused when they are not or cannot be told apart
+from the instruction. One addressed to every session (`tell all|everyone|every session to|:`) is relayed without it
+when the targets are exactly the live sessions, at the preview and at the send; the preview's digest covers the text,
+the target terminals and the session pinned in each. A message hc pasted (`<hc from=...>`) is never the human's.
 """
 
 import argparse
@@ -39,33 +39,40 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import time
 import uuid
-from collections import namedtuple
 from contextlib import contextmanager
+from pathlib import Path
 
 try:
     import fcntl
-except ImportError:   # Windows: Herdr and /proc are POSIX-only, so the captain is too
+except ImportError:   # Windows: /proc is Linux-only, so the captain is too
     fcntl = None
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'lib'))   # the agentrc checkout this runs from
+import hc  # noqa: E402
 
 CONFIG_DIRS = {'main': None, 'ada': os.path.expanduser('~/.claude-ada')}   # main is CLAUDE_CONFIG_DIR unset
 DEFAULT_CONFIG = '~/.claude'   # where main, CLAUDE_CONFIG_DIR unset, keeps its transcripts
-START_MS = 60000
-HERDR_TIMEOUT_S = 30
-SGR = re.compile(r'\x1b\[([0-9;]*)m')
-OTHER_ESCAPE = re.compile(r'\x1b\[[0-9;?]*[A-Za-ln-z]')
+START_S = 60   # how long open waits for Claude Code to report a status
+HC_TIMEOUT_S = 30
+ENV = '/usr/bin/env'   # starts Claude Code with the account's environment
+CLAUDE_APP = 'claude-code'
+TERMINAL_NAME = re.compile(r'[a-z0-9_-]{1,32}')   # what hc takes as a terminal name
 RULE = re.compile(r'^─{20,}')  # the top rule may end in a session label: ──── alo68 ─
-BLANK = '  \t\r'
-AGENT_KINDS = ('claude', 'codex')
+BLANK = ' \xa0\t\r'
 CLAUDE_HINTS = re.compile(r'⏵⏵|\? for shortcuts|shift\+tab|esc to interrupt')
+# hc wraps what it pastes into an agent as <hc from="t7 name" ...>text</hc>; a tag anywhere else, or a forged one,
+# is another program's text all the same
+HC_TAG = re.compile(r'<\s*/?\s*hc\b', re.I)
+HC_WRAPPED = re.compile(r'<hc from="[^"<>]*"(?: [a-z]+="[^"<>]*")*>(.*)</hc>', re.S)
 STATE = os.environ.get('AGENTRC_CAPTAIN_DIR') or os.path.expanduser('~/.cache/agentrc/captain')
+LEDGER, ENROLLED = 'ledger-hc.jsonl', 'enrolled-hc.json'   # ledger.jsonl and enrolled.json pinned Herdr panes
 INSTALLED = (os.environ.get('AGENTRC_CAPTAIN_SCRIPT')
              or os.path.expanduser('~/.claude/skills/captain/scripts/captain.py'))
-IDENTITY = ('pane_id', 'terminal_id', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
+IDENTITY = ('address', 'created', 'kind', 'cwd', 'session', 'pid', 'started', 'account')
 ASKABLE = ('idle', 'done')
 REPORT = {'task': str, 'prs': list, 'state': str, 'evidence': str, 'chief': str, 'needs': str, 'next': str}
 OPTIONAL = {'issues': list}   # a report without it names no issue
@@ -78,10 +85,11 @@ RESULTS = ('completed', 'failed', 'rejected', 'needs-clarification')
 REPORT_MAX = 8192
 POLL_S = 2
 NO_ANSWER = 3
-SELECTORS = ('pr:', 'issue:', 'ws:')
-SELECTOR = re.compile(r'(pr|issue):(?:([\w.-]+):([\w.-]+):)?(\d+)|ws:(.+)')
+SELECTORS = ('pr:', 'issue:', 'space:')
+SELECTOR = re.compile(r'(pr|issue):(?:([\w.-]+):([\w.-]+):)?(\d+)|space:(.+)')
 TELL = re.compile(r'\s*tell\s+', re.I)
-NAME = re.compile(r'[^\s,:;&]+(?::[^\s,:;&]+)*')   # a pane id or selector keeps its inner colons
+NAME = re.compile(r'[^\s,:;&]+(?::[^\s,:;&]+)*')   # a selector keeps its inner colons
+ADDRESS = re.compile(r't[0-9][0-9a-z]*', re.I)   # a local hc terminal: t7, t1b
 JOIN = re.compile(r'\s*,?\s*(?:and|&)\s+|\s*,\s*', re.I)
 TO = re.compile(r'\s+to\s+|\s*[:,]\s*|\s+', re.I)
 EVERY_WORD = re.compile(r'(?:all|everyone|every)(?=[\s:]|$)', re.I)   # never one recipient: every session
@@ -94,115 +102,41 @@ def die(msg, code=1):
     raise SystemExit(code)
 
 
-def run_herdr(*args, timeout=HERDR_TIMEOUT_S):
-    """A hung herdr must not hold the ledger lock: past timeout it fails like any herdr error."""
-    try:
-        return subprocess.run(['herdr', *args], capture_output=True, encoding='utf-8', timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return subprocess.CompletedProcess(['herdr', *args], 124, '', f'no answer within {timeout} s')
-
-
-def herdr_text(*args):
-    out = run_herdr(*args)
-    if out.returncode != 0:
-        die(f'herdr {" ".join(args)} failed: {out.stderr.strip()}', 5)
-    return out.stdout
-
-
-def herdr(*args):
-    return json.loads(herdr_text(*args))['result']
-
-
-Cell = namedtuple('Cell', 'char dim')
-
-
-def styled(line):
-    """The Cells of one ANSI line, dim marking faint text: Claude Code draws its suggestions dim."""
-    dim = False
-    cells = []
-    pos = 0
-    line = OTHER_ESCAPE.sub('', line)
-    for m in SGR.finditer(line):
-        cells += [Cell(c, dim) for c in line[pos:m.start()]]
-        pos = m.end()
-        codes = (m.group(1) or '0').split(';')
-        i = 0
-        while i < len(codes):
-            n = int(codes[i]) if codes[i].isdigit() else 0
-            if n in (0, 22):
-                dim = False
-            elif n == 2:
-                dim = True
-            elif n in (38, 48):   # 38;2;r;g;b or 38;5;n: their numbers are not codes
-                i += 4 if codes[i + 1:i + 2] == ['2'] else 2
-            i += 1
-    cells += [Cell(c, dim) for c in line[pos:]]
-    return cells
-
-
-def typed(cells):
-    """What a human typed on these cells: neither a suggestion (dim) nor blank."""
-    return ''.join(c.char for c in cells if not c.dim and c.char not in BLANK)
-
-
-def plain(cells):
-    return ''.join(c.char for c in cells).rstrip(BLANK)
+def get(address):
+    """`hc get` for one terminal, None when hc knows none by that address."""
+    return hc.get(address, timeout=HC_TIMEOUT_S)
 
 
 def footer_only(lines):
     """Below the input only Claude Code's own footer may follow: its hint line, and at most one row above it, the
     user's statusline, which may say anything; all indented and without ❯. Anything else, such as a dialog, means
     the box found is not the live input."""
-    shown = [plain(cells) for cells in lines if plain(cells)]
+    shown = [line for line in lines if line]
     return (1 <= len(shown) <= 2 and all(t[0] in BLANK and '❯' not in t for t in shown)
             and bool(CLAUDE_HINTS.search(shown[-1])))
 
 
 def input_state(screen):
-    """'empty', 'draft' or 'unknown' for the input line on an ANSI screen capture; only 'empty' is safe to type
-    into, since herdr's prompt appends to whatever a human has half typed. Claude Code draws its input between
-    the last two full-width rules, the first line led by ❯."""
-    lines = [styled(line) for line in screen.splitlines()]
-    rules = [i for i, cells in enumerate(lines) if RULE.match(plain(cells))]
+    """'empty', 'text' or 'unknown' for the input line on an `hc read` screen; only 'empty' is safe to type into,
+    since a paste appends to whatever a human has half typed. hc read is plain text, so Claude Code's dim suggestion
+    cannot be told from a draft: any text counts. Claude Code draws its input between the last two full-width rules,
+    the first line led by ❯."""
+    lines = [line.rstrip(BLANK) for line in screen.splitlines()]
+    rules = [i for i, line in enumerate(lines) if RULE.match(line)]
     if len(rules) < 2 or rules[-1] - rules[-2] < 2 or not footer_only(lines[rules[-1] + 1:]):
         return 'unknown'
-    box = lines[rules[-2] + 1:rules[-1]]
-    head = [c.char for c in box[0]]
-    if not plain(box[0]).lstrip(BLANK).startswith('❯'):
+    head, *rest = (line.lstrip(BLANK) for line in lines[rules[-2] + 1:rules[-1]])
+    if not head.startswith('❯'):
         return 'unknown'
-    first = box[0][head.index('❯') + 1:]
-    return 'draft' if typed(first) or any(typed(cells) for cells in box[1:]) else 'empty'
+    return 'text' if head[1:].strip(BLANK) or any(rest) else 'empty'
 
 
-def read_screen(pane):
-    return herdr_text('agent', 'read', pane, '--source', 'visible', '--ansi')
-
-
-def stat(pid):
-    """The /proc/<pid>/stat fields after the command name, which may itself hold spaces and parentheses."""
-    with open(f'/proc/{pid}/stat') as f:
-        return f.read().rsplit(')', 1)[1].split()
-
-
-def started(pid):
-    """Process start time in clock ticks since boot: a pid alone may be reused by a restarted agent."""
-    return int(stat(pid)[19])
-
-
-def ancestors(pid):
-    """pid and every process above it."""
-    chain = []
-    while pid > 1:
-        chain.append(pid)
-        try:
-            pid = int(stat(pid)[1])
-        except (OSError, ValueError, IndexError):
-            break
-    return chain
+def read_screen(address):
+    return hc.read(address, timeout=HC_TIMEOUT_S)
 
 
 def account(pid):
-    """The Claude account a process runs under, from its own environment, never its pane name. main only with
+    """The Claude account a process runs under, from its own environment, never its terminal's name. main only with
     CLAUDE_CONFIG_DIR unset: set, even to ~/.claude, Claude Code keeps its state in <dir>/.claude.json rather than
     ~/.claude.json, another install. Any other dir reads config:<dir>, which no account name can equal."""
     try:
@@ -220,18 +154,24 @@ def account(pid):
                 f'config:{config}')
 
 
-def incarnation(pane):
-    """The pane's single foreground agent process as (pid, start ticks), else None: with none or several, a
-    restart in the same pane could not be told from the session we pinned."""
-    procs = herdr('pane', 'process-info', '--pane', pane)['process_info'].get('foreground_processes', [])
-    agents = [p for p in procs if p.get('name') in AGENT_KINDS]
-    if len(agents) != 1 or agents[0]['name'] != 'claude':
+def registered(pid, start, account_name):
+    """The session id Claude Code registered for process pid, started at start ticks, in sessions/<pid>.json under
+    the config dir of the account it runs under; None when that entry is missing or names another process, or when
+    another account's dir holds one for the same process too."""
+    own = config_dir(account_name)
+    if not own:
         return None
-    pid = agents[0]['pid']
-    try:
-        return pid, started(pid)
-    except (OSError, ValueError, IndexError):
-        return None
+    own = os.path.realpath(own)
+    found = []
+    for d in {own, *(os.path.realpath(config_dir(name)) for name in CONFIG_DIRS)}:
+        try:
+            with open(os.path.join(d, 'sessions', f'{pid}.json'), encoding='utf-8') as f:
+                entry = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(entry, dict) and entry.get('pid') == pid and entry.get('procStart') == str(start):
+            found.append((d, entry.get('sessionId')))
+    return found[0][1] if len(found) == 1 and found[0][0] == own and text(found[0][1]) else None
 
 
 def canonical(cwd):
@@ -239,46 +179,56 @@ def canonical(cwd):
     return os.path.realpath(cwd) if cwd and os.path.isabs(cwd) else None
 
 
-def sessions(agents=None, workspaces=None, me=None):
-    """Every Claude Code pane but me (this pane by default, '' for none), each with a handle for the human. Codex
-    panes are left out: Codex runs its commands outside its pane's process tree, so a Codex target could never
-    prove which pane answers."""
-    agents = herdr('agent', 'list')['agents'] if agents is None else agents
-    workspaces = herdr('workspace', 'list')['workspaces'] if workspaces is None else workspaces
-    labels = {w['workspace_id']: w.get('label', w['workspace_id']) for w in workspaces}
-    me = os.environ.get('HERDR_PANE_ID') if me is None else me
-    found = []
-    for a in agents:
-        kind = a.get('agent')
-        if a['pane_id'] == me or kind != 'claude':
-            continue
-        label = labels.get(a.get('workspace_id'))
-        found.append({
-            'handle': f'{label or "?"} · {a.get("name") or kind} · {a["pane_id"]}',
-            'workspace_id': a.get('workspace_id'),
-            'workspace': label,
-            'pane_id': a['pane_id'],
-            'terminal_id': a.get('terminal_id'),
-            'kind': kind,
-            'cwd': canonical(a.get('cwd')),
-            'session': (a.get('agent_session') or {}).get('value'),
-            'status': a.get('agent_status', 'unknown'),
-            'seq': a.get('state_change_seq') or 0,
-        })
-    return sorted(found, key=lambda s: (-s['seq'], s['pane_id']))
+def described(t):
+    """The session fields `hc get` shows for a live local Claude Code terminal, or None for any other. Its cwd and
+    pid are its foreground process's: the terminal's own are the shell's it may have started from."""
+    status = (t or {}).get('status') or {}
+    if not t or t.get('state') != 'live' or status.get('app') != CLAUDE_APP or not hc.is_local(t.get('address')):
+        return None
+    labels = t.get('labels') or {}
+    where, fg = labels.get('where'), t.get('foreground') or {}
+    return {
+        'handle': f'{where or "?"} · {t.get("name") or "claude"} · {t["address"]}',
+        'space_id': labels.get('herdr.space'),
+        'space': where.rsplit(' / ', 1)[0] if where else None,   # where is "<space> / <tab>"
+        'address': t['address'],
+        'created': t.get('created_ms'),
+        'kind': 'claude',
+        'cwd': canonical(fg.get('cwd')),
+        'foreground': fg.get('pid'),
+        'status': status.get('state') or 'unknown',
+        'status_ms': t.get('status_ms') or 0,
+    }
+
+
+def sessions(terminals=None, me=None):
+    """Every live local Claude Code terminal but me (this terminal by default, '' for none), each with a handle for
+    the human, the latest status report first. Codex terminals are left out: a Codex target could never prove which
+    terminal answers."""
+    terminals = hc.terminals(timeout=HC_TIMEOUT_S) if terminals is None else terminals
+    me = os.environ.get('HC_TERMINAL_ID') if me is None else me
+    found = [described(get(t['address'])) for t in terminals
+             if t.get('agent') == CLAUDE_APP and t.get('address') != me and hc.is_local(t.get('address'))]
+    return sorted((s for s in found if s), key=lambda s: (-s['status_ms'], s['address']))
 
 
 def pin(session):
-    """Add the process incarnation and the account it runs under; None where they cannot be read."""
-    inc = incarnation(session['pane_id'])
-    session['pid'], session['started'] = inc or (None, None)
-    session['account'] = account(inc[0]) if inc else None
+    """Add the foreground process's incarnation, the account it runs under and the Claude Code session it
+    registered; None where they cannot be read."""
+    pid = session.get('foreground')
+    try:
+        start = hc.proc_start(pid) if type(pid) is int and pid > 0 else None
+    except (hc.Gone, hc.Error):
+        start = None
+    session['pid'], session['started'] = (pid, start) if start else (None, None)
+    session['account'] = account(pid) if start else None
+    session['session'] = registered(pid, start, session['account']) if session['account'] else None
     return session
 
 
 def unpinned(session):
     """The identity fields a pinned session lacks; a session missing any is never typed into."""
-    return [k for k in ('cwd', 'terminal_id', 'pid', 'started', 'session', 'account') if not session.get(k)]
+    return [k for k in ('cwd', 'created', 'pid', 'started', 'session', 'account') if not session.get(k)]
 
 
 class Corrupt(Exception):
@@ -322,9 +272,9 @@ def pinned_identity(ident):
     """A whole identity as identity() records it: every field unpinned() requires present and typed."""
     if not isinstance(ident, dict) or ident.get('kind') != 'claude':
         return False
-    return (all(text(ident.get(k)) for k in ('pane_id', 'terminal_id', 'cwd', 'session', 'account'))
+    return (all(text(ident.get(k)) for k in ('address', 'cwd', 'session', 'account'))
             and os.path.isabs(ident['cwd'])
-            and all(type(ident.get(k)) is int and ident[k] > 0 for k in ('pid', 'started')))
+            and all(type(ident.get(k)) is int and ident[k] > 0 for k in ('created', 'pid', 'started')))
 
 
 def text(value):
@@ -335,21 +285,21 @@ def records(lenient=False):
     """The ledger's records in order. A torn or garbled line raises Corrupt; lenient (collect and reports, which
     decide nothing) instead stops before a torn last line another process may still be writing."""
     try:
-        with open(path('ledger.jsonl'), 'rb') as f:
+        with open(path(LEDGER), 'rb') as f:
             data = f.read()
     except FileNotFoundError:
         return []
     lines = data.split(b'\n')
     if lines[-1] and not lenient:
-        raise Corrupt(f'{path("ledger.jsonl")}: the last line is unterminated')
+        raise Corrupt(f'{path(LEDGER)}: the last line is unterminated')
     out = []
     for n, line in enumerate(lines[:-1], 1):
         try:
             rec = json.loads(line)
         except ValueError:
-            raise Corrupt(f'{path("ledger.jsonl")}:{n} is not a JSON record') from None
+            raise Corrupt(f'{path(LEDGER)}:{n} is not a JSON record') from None
         if not well_formed(rec):
-            raise Corrupt(f'{path("ledger.jsonl")}:{n} is not a well-formed record')
+            raise Corrupt(f'{path(LEDGER)}:{n} is not a well-formed record')
         out.append(rec)
     return out
 
@@ -368,8 +318,8 @@ def append(record):
     write raises before anything is typed anywhere."""
     record = {**record, 'at': time.time()}
     data = json.dumps(record, ensure_ascii=False).encode() + b'\n'
-    created = not os.path.exists(path('ledger.jsonl'))
-    fd = os.open(path('ledger.jsonl'), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    created = not os.path.exists(path(LEDGER))
+    fd = os.open(path(LEDGER), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
         while data:
             data = data[os.write(fd, data):]
@@ -383,7 +333,7 @@ def append(record):
 
 def enrolled():
     try:
-        with open(path('enrolled.json'), encoding='utf-8') as f:
+        with open(path(ENROLLED), encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
         return None
@@ -403,12 +353,11 @@ def identity(session):
     return {k: session.get(k) for k in IDENTITY}
 
 
-def find(pane):
-    """The pinned session in pane, with its handle and status, or None."""
-    for s in sessions(me=''):
-        if s['pane_id'] == pane:
-            return pin(s)
-    return None
+def find(address):
+    """The pinned session in the local terminal at address, with its handle and status, or None: a name hc would
+    resolve is not an address."""
+    s = described(get(address)) if hc.is_local(address) else None
+    return pin(s) if s and s['address'] == address else None
 
 
 def everyone():
@@ -417,11 +366,11 @@ def everyone():
 
 
 def selected(match, session, recs):
-    """Whether session is one a selector match names: by workspace id or label, or by a PR or issue in the latest
+    """Whether session is one a selector match names: by herdr space id or name, or by a PR or issue in the latest
     report this session, as pinned now, gave; a bare number matches it in any repository."""
-    kind, owner, repo, number, ws = match.groups()
-    if ws is not None:
-        return ws in (session.get('workspace_id'), session.get('workspace'))
+    kind, owner, repo, number, space = match.groups()
+    if space is not None:
+        return space in (session.get('space_id'), session.get('space'))
     last = last_report(session, recs)
     named = last['report'].get('prs' if kind == 'pr' else 'issues', []) if last else []
     if owner:
@@ -430,44 +379,45 @@ def selected(match, session, recs):
 
 
 def resolve(args):
-    """{pane: the argument naming it} for the target arguments, a pane as given, a selector replaced by the pane of the
-    one session it matches; one pane named twice goes once. Dies, so nothing is sent, when any selector matches none or
-    several."""
+    """{address: the argument naming it} for the target arguments, an address as given, a selector replaced by the
+    address of the one session it matches; one terminal named twice goes once. Dies, so nothing is sent, when any
+    selector matches none or several."""
     if any(a.startswith(SELECTORS) for a in args):
         with locked():
             recs = records()
         live = everyone()
     found = {}
     for arg in args:
-        pane = arg
+        address = arg
         if arg.startswith(SELECTORS):
             match = SELECTOR.fullmatch(arg)
             if not match:
                 die(f'{arg}: not a selector (pr:N, pr:<owner>:<repo>:N, issue:N, issue:<owner>:<repo>:N, '
-                    'ws:<workspace id or label>); nothing sent', 2)
+                    'space:<space id or name>); nothing sent', 2)
             hits = [s for s in live if selected(match, s, recs)]
             if len(hits) != 1:
                 die(f'{arg}: ' + ('; '.join(s['handle'] for s in hits) + ' all match' if hits
                                   else 'no live session matches') + '; nothing sent', 2)
-            pane = hits[0]['pane_id']
-        found.setdefault(pane, arg)
+            address = hits[0]['address']
+        found.setdefault(address, arg)
     return found
 
 
 def me():
-    """The pinned session this process runs under: the pane whose Claude Code process is one of its ancestors."""
-    chain = set(ancestors(os.getpid()))
-    mine = [s for s in (pin(s) for s in sessions(me='')) if s['pid'] in chain]
+    """The pinned session this process runs under: the terminal whose Claude Code process is one of its ancestors,
+    never HC_TERMINAL_ID, which any process can set."""
+    chain = set(hc.ancestors(os.getpid()))
+    mine = [pin(s) for s in sessions(me='') if s['foreground'] in chain]   # pinning reads /proc: only these
     if len(mine) != 1:
         die(f'cannot tell which agent session runs this ({len(mine)} match)', 2)
     if unpinned(mine[0]):
-        die(f'cannot pin this session ({mine[0]["pane_id"]}): {", ".join(unpinned(mine[0]))}', 2)
+        die(f'cannot pin this session ({mine[0]["address"]}): {", ".join(unpinned(mine[0]))}', 2)
     return identity(mine[0])
 
 
 def live(ident):
-    """Whether the session ident pinned still runs in its pane."""
-    now = find(ident['pane_id'])
+    """Whether the session ident pinned still runs in its terminal."""
+    now = find(ident['address'])
     return bool(now) and identity(now) == ident
 
 
@@ -505,49 +455,48 @@ def one_call(label, command, placeholder, done):
             f'EOF\n\nRecap nothing after it: end with "{done}", or say what failed.')
 
 
-def status_brief(msg, pane):
-    return (f'STATUS REQUEST {msg} from the agent session in pane {pane}, not a human instruction. Answer from what '
-            'you already know: do not edit, investigate GitHub or launch anything. Send one JSON object with exactly '
-            'these keys: "task" (one line), "prs" (list of "owner/repo#N"), "issues" (list of "owner/repo#N" issues '
-            f'the task is for), "state" (one of {", ".join(STATES)}), "evidence" (last verification you ran, or ""), '
-            '"chief" (headless chief or workflow running for you, or ""), "needs" (the decision or action the human '
-            'must take, or ""), "next" (your next step). Send it '
+def status_brief(msg, address):
+    return (f'STATUS REQUEST {msg} from the agent session in terminal {address}, not a human instruction. Answer '
+            'from what you already know: do not edit, investigate GitHub or launch anything. Send one JSON object '
+            'with exactly these keys: "task" (one line), "prs" (list of "owner/repo#N"), "issues" (list of '
+            f'"owner/repo#N" issues the task is for), "state" (one of {", ".join(STATES)}), "evidence" (last '
+            'verification you ran, or ""), "chief" (headless chief or workflow running for you, or ""), "needs" (the '
+            'decision or action the human must take, or ""), "next" (your next step). Send it '
             + one_call('Status report', f'report --for {msg} --file -', 'the JSON object', 'Status sent.'))
 
 
-def submit(pane, text):
-    """Type text into pane as a prompt: 'delivered', 'undelivered' when herdr refused before sending any input,
-    else 'uncertain'."""
-    out = run_herdr('agent', 'prompt', pane, text)
-    if out.returncode == 0:
-        return 'delivered', ''
-    try:
-        code = json.loads(out.stdout or out.stderr)['error']['code']
-    except (ValueError, KeyError, TypeError):
-        code = None
-    return ('undelivered' if code == 'agent_blocked' else 'uncertain'), (out.stderr or out.stdout).strip()
+DELIVERY = {hc.SENT: 'delivered', hc.NOT_TYPED_OUTCOME: 'undelivered', hc.UNCERTAIN: 'uncertain'}
+
+
+def submit(address, text, status):
+    """Paste text into address and press Enter: 'delivered', 'undelivered' when hc refused before typing anything,
+    else 'uncertain'. An idle target is sent `--if idle`, so hc refuses one that started working since the check;
+    hc has no such check for done, and one that starts a turn in between gets the text as its next input."""
+    outcome, detail = hc.send(address, text, timeout=HC_TIMEOUT_S, only_if='idle' if status == 'idle' else None)
+    return DELIVERY[outcome], '' if outcome == hc.SENT else str(detail)
 
 
 def refusal(target):
     """Why target must not be typed into now, or None: re-read right before every submit."""
     if not target:
-        return 'no such agent pane'
+        return 'no Claude Code terminal at that address'
     if unpinned(target):
         return f'identity not pinned: {", ".join(unpinned(target))}'
     if target['status'] not in ASKABLE:
         return f'it is {target["status"]}'
-    state = input_state(read_screen(target['pane_id']))
+    state = input_state(read_screen(target['address']))
     if state != 'empty':
-        return 'its input line holds a draft' if state == 'draft' else 'its screen is not a recognized input line'
+        return ('its input line shows text, a draft or a suggestion hc read cannot tell apart' if state == 'text'
+                else 'its screen is not a recognized input line')
     return None
 
 
-def sendable(pane, recs, mine):
-    """(the pinned session in pane, None) when it may be typed into now, else (None, why not)."""
-    if any(r['target']['pane_id'] == pane for r in open_items(recs).values()):
+def sendable(address, recs, mine):
+    """(the pinned session in address, None) when it may be typed into now, else (None, why not)."""
+    if any(r['target']['address'] == address for r in open_items(recs).values()):
         return None, 'a request or relay to it is still open (collect it, or cancel it)'
-    target = find(pane)
-    why = 'it is this session' if target and target['pane_id'] == mine['pane_id'] else refusal(target)
+    target = find(address)
+    why = 'it is this session' if target and target['address'] == mine['address'] else refusal(target)
     return (None, why) if why else (target, None)
 
 
@@ -601,27 +550,29 @@ def unchanged(target, recs):
         return None
     try:
         entries = (json.loads(line) for line in lines)   # lazily: the first new turn ends the walk
-        request = next(entries)
-        words = plain_text(content(request))
-        if not (human_input(request) and words and status_prompt(last['msg']) in words):
-            return None   # a summary or tool output quoting the id is not the request
-        return None if any(new_turn(e) for e in entries) else last
+        for entry in entries:   # a record of the API request that carried it may quote it first
+            words = plain_text(content(entry))
+            if human_input(entry) and words and unwrapped(words) == status_prompt(last['msg']):
+                return None if any(new_turn(e) for e in entries) else last
+            if new_turn(entry):
+                return None   # a summary or tool output quoting the id is not the request
+        return None
     except ValueError:
         return None
 
 
-def ask(pane, mine, force=False):
-    """One status request to pane, recorded before it is typed: prints the msg id, or why it was not sent."""
+def ask(address, mine, force=False):
+    """One status request to address, recorded before it is typed: prints the msg id, or why it was not sent."""
     with locked():
         captain = require_captain(mine)
         recs = records()
-        target, why = sendable(pane, recs, mine)
+        target, why = sendable(address, recs, mine)
         if why:
-            return f'{pane}: refused, {why}'
+            return f'{address}: refused, {why}'
         last = not force and unchanged(target, recs)
         if last:
             at = time.strftime('%H:%M', time.localtime(last['at']))
-            return f'{pane}: not asked, nothing new since its report {last["msg"]} at {at}'
+            return f'{address}: not asked, nothing new since its report {last["msg"]} at {at}'
         msg = new_id('m', recs)
         return deliver('request', msg, captain, target, status_prompt(msg))
 
@@ -631,10 +582,10 @@ def deliver(kind, msg, captain, target, prompt, **fields):
     typed unrecorded."""
     append({'type': kind, 'msg': msg, 'captain': captain, 'target': identity(target), 'handle': target['handle'],
             **fields})
-    pane = target['pane_id']
-    outcome, err = submit(pane, prompt)
+    address = target['address']
+    outcome, err = submit(address, prompt, target['status'])
     append({'type': outcome, 'msg': msg, 'error': err} if err else {'type': outcome, 'msg': msg})
-    return f'{pane}: {msg} {outcome}' + (f' ({err})' if err else '')
+    return f'{address}: {msg} {outcome}' + (f' ({err})' if err else '')
 
 
 def validate(report):
@@ -676,7 +627,7 @@ def addressed(kind, msg, recs, mine):
     if not item:
         die(f'no {kind} {msg}', 3)
     if item['target'] != mine:
-        die(f'{kind} {msg} was sent to {item["target"]["pane_id"]}, not this session as pinned', 2)
+        die(f'{kind} {msg} was sent to {item["target"]["address"]}, not this session as pinned', 2)
     return item
 
 
@@ -696,7 +647,7 @@ def brief(msg):
         request = requested(msg, recs, mine)
         if msg not in open_items(recs):
             die(f'request {msg} is closed', 2)
-    print(status_brief(msg, request['captain']['pane_id']))
+    print(status_brief(msg, request['captain']['address']))
     return 0
 
 
@@ -777,7 +728,7 @@ def collect(msgs, wait_ms):
 
 
 def reports(msgs=()):
-    """The latest report per target pane, newest first; with msgs, the report answering each of those requests, in
+    """The latest report per target terminal, newest first; with msgs, the report answering each of those requests, in
     order, a later report from the same session notwithstanding, and a row naming why for one with none."""
     recs = records(lenient=True)
     requests = {r['msg']: r for r in recs if r['type'] == 'request'}
@@ -787,7 +738,7 @@ def reports(msgs=()):
                 {'msg': m, 'missing': 'not answered' if m in requests else 'no such request'} for m in msgs]
     latest = {}
     for rep in answers.values():
-        latest[requests[rep['msg']]['target']['pane_id']] = (requests[rep['msg']], rep)
+        latest[requests[rep['msg']]['target']['address']] = (requests[rep['msg']], rep)
     return [row(req, rep) for req, rep in sorted(latest.values(), key=lambda pair: -pair[1]['at'])]
 
 
@@ -815,8 +766,15 @@ def plain_text(content):
     return None
 
 
+def unwrapped(words):
+    """words without the one <hc from=...> wrapper hc puts around what it pastes into an agent, if it has one."""
+    wrapped = HC_WRAPPED.fullmatch(words)
+    return wrapped.group(1) if wrapped else words
+
+
 def human_input(entry):
-    """Whether a transcript entry is a message the human typed or queued, not hook, skill or task text."""
+    """Whether a transcript entry is a message typed or queued at the terminal, not hook, skill or task text; one
+    hc pasted is typed too, so human_inputs() tells it apart."""
     origin = entry.get('origin') if isinstance(entry, dict) else None
     return (isinstance(origin, dict) and origin.get('kind') == 'human' and entry.get('type') == 'user'
             and entry.get('promptSource') in ('typed', 'queued') and not entry.get('isMeta')
@@ -825,7 +783,8 @@ def human_input(entry):
 
 def human_inputs(file):
     """(inputs, torn): the human's messages in a transcript, in order, each (uuid, text or None when not plain
-    text); torn when a line is not whole JSON, which may hide a newer message."""
+    text); torn when a line is not whole JSON, which may hide a newer message. One that opens with an hc tag is
+    another program's, hc's paste or made to look like one, and is left out."""
     with open(file, 'rb') as f:
         lines = f.read().split(b'\n')
     torn = bool(lines[-1])
@@ -836,8 +795,11 @@ def human_inputs(file):
         except ValueError:
             torn = True
             continue
-        if human_input(entry):
-            inputs.append((entry.get('uuid'), plain_text((entry.get('message') or {}).get('content'))))
+        if not human_input(entry):
+            continue
+        words = plain_text(content(entry))
+        if not (words and HC_TAG.match(words.lstrip())):
+            inputs.append((entry.get('uuid'), words))
     return inputs, torn
 
 
@@ -862,24 +824,27 @@ def newest(captain, sending):
     entry, words = inputs[-1]
     if words is None:
         die(f"the human's newest message ({entry}) is not plain text, so it cannot be relayed verbatim", 2)
+    if HC_TAG.search(words):   # hc pastes into a half-typed draft: what follows the tag is not the human's
+        die(f"the human's newest message ({entry}) holds an hc tag, so it may carry another program's words; "
+            'ask the human to restate it', 2)
     if torn:
         print('the transcript ends in a partly written line: relaying refuses until it is whole')
     return entry, words
 
 
 def named(token, live, recs):
-    """The panes of the live sessions token names: by pane id, workspace id or label, or selector."""
+    """The addresses of the live sessions token names: by address, herdr space id or name, or selector."""
     if token.startswith(SELECTORS):
         match = SELECTOR.fullmatch(token)
-        return {s['pane_id'] for s in live if selected(match, s, recs)} if match else set()
+        return {s['address'] for s in live if selected(match, s, recs)} if match else set()
     token = token.casefold()
-    return {s['pane_id'] for s in live
-            if token in (s.get(k) and s[k].casefold() for k in ('pane_id', 'workspace_id', 'workspace'))}
+    return {s['address'] for s in live
+            if token in (s.get(k) and s[k].casefold() for k in ('address', 'space_id', 'space'))}
 
 
-def instruction(words, panes, live, recs):
-    """(text, None): what a relay to panes sends, words without an opening `tell <name>... [to]` whose names are
-    exactly panes; (None, why) when that opening names anyone else or cannot be split from the instruction. Preview
+def instruction(words, addresses, live, recs):
+    """(text, None): what a relay to addresses sends, words without an opening `tell <name>... [to]` whose names are
+    exactly addresses; (None, why) when that opening names anyone else or cannot be split from the instruction. Preview
     and send both call this, and the send checks the preview's digest of it."""
     tell = TELL.match(words)
     if not tell:
@@ -887,7 +852,7 @@ def instruction(words, panes, live, recs):
     pos, found = tell.end(), set()
     first = EVERY_WORD.match(words, pos)
     if first:
-        return broadcast(words, first, panes, live, recs)
+        return broadcast(words, first, addresses, live, recs)
     while True:
         name = NAME.match(words, pos)
         if name and EVERY_WORD.fullmatch(name.group()):
@@ -898,21 +863,23 @@ def instruction(words, panes, live, recs):
                 'it opens with "tell" and no session name follows'
         if len(hits) > 1:
             return None, f'"{name.group()}" names {", ".join(sorted(hits))}, not one session'
-        if not hits <= set(panes):
-            return None, f'"{name.group()}" names {", ".join(sorted(hits - set(panes)))}, not a target of this relay'
+        if not hits <= set(addresses):
+            return None, (f'"{name.group()}" names {", ".join(sorted(hits - set(addresses)))}, '
+                          'not a target of this relay')
         found |= hits
         pos = name.end()
         join = JOIN.match(words, pos)
         following = join and NAME.match(words, join.end())
-        # a pane id or selector is a recipient even when it names no one, never the instruction's first word
-        if not (following and (':' in following.group() or EVERY_WORD.fullmatch(following.group())
+        # an address or selector is a recipient even when it names no one, never the instruction's first word
+        if not (following and (':' in following.group() or ADDRESS.fullmatch(following.group())
+                               or EVERY_WORD.fullmatch(following.group())
                                or named(following.group(), live, recs))):
             joiner = join and join.group().strip(' \t\r\n,')
             if joiner:
                 return None, f'{joiner!r} after {name.group()!r} may join another name or start the instruction'
             break
         pos = join.end()
-    if found != set(panes):
+    if found != set(addresses):
         return None, f'it addresses {", ".join(sorted(found))}, not every target of this relay'
     to = TO.match(words, pos)
     text = words[to.end():] if to else ''
@@ -925,10 +892,10 @@ class Stale(str):
     """A refusal a new preview cures: the sessions changed, not the human's words."""
 
 
-def broadcast(words, first, panes, live, recs):
+def broadcast(words, first, addresses, live, recs):
     """instruction() for a message opening `tell all|everyone|every session`, first its opening word."""
     if named(first.group(), live, recs):
-        return None, f'"{first.group()}" also names a session; address it by ws:<label>, or every session another way'
+        return None, f'"{first.group()}" also names a session; address it by space:<name>, or every session another way'
     every = EVERY_ONE.match(words, first.start())
     if not every:
         return None, (f'it opens with "tell {first.group()}" but not as "all [session|sessions]", "everyone" or '
@@ -936,7 +903,7 @@ def broadcast(words, first, panes, live, recs):
     text = words[every.end():]
     if not text.strip():
         return None, 'nothing follows the names'
-    alive, targets = {s['pane_id'] for s in live}, set(panes)
+    alive, targets = {s['address'] for s in live}, set(addresses)
     missing, extra = alive - targets, targets - alive
     if missing or extra or not targets:
         return None, Stale('it addresses every session, and the targets are not exactly the live sessions'
@@ -946,23 +913,23 @@ def broadcast(words, first, panes, live, recs):
 
 
 def pins(found):
-    """{pane: the identity of the session found in it, None for none}."""
-    return {pane: identity(s) if s else None for pane, s in found.items()}
+    """{address: the identity of the session found in it, None for none}."""
+    return {address: identity(s) if s else None for address, s in found.items()}
 
 
 def digest(text, pinned):
     """The preview's digest of what goes to which session, pinned as pins() gives it: target order or a status change
-    does not change it, a session opened, closed or replaced in a target pane does."""
+    does not change it, a session opened, closed or replaced in a target terminal does."""
     return hashlib.sha256(json.dumps([text, sorted(pinned.items())]).encode('utf-8')).hexdigest()[:16]
 
 
-def relay_text(words, panes, recs):
-    """The text a relay to panes sends; dies, so nothing is sent, when instruction() refuses it."""
+def relay_text(words, addresses, recs):
+    """The text a relay to addresses sends; dies, so nothing is sent, when instruction() refuses it."""
     if not TELL.match(words):   # unaddressed: sent as written, no session listing needed
         return words
-    text, why = instruction(words, panes, everyone(), recs)
+    text, why = instruction(words, addresses, everyone(), recs)
     if isinstance(why, Stale):
-        die(f'{why}: run list, then preview again with every pane it shows', 2)
+        die(f'{why}: run list, then preview again with every address it shows', 2)
     if why:
         die(f"the human's message cannot be relayed as written: {why}; ask the human to restate it", 2)
     return text
@@ -975,17 +942,18 @@ def preview(targets, mine):
         captain = require_captain(mine)
         recs = records()
     entry, words = newest(captain, sending=False)
-    found = {pane: find(pane) for pane in targets}
-    for pane, arg in targets.items():
-        target = found[pane]
-        print(f'to {arg}: {target["handle"]} ({target["status"]})' if target else f'to {arg}: no such agent pane')
+    found = {address: find(address) for address in targets}
+    for address, arg in targets.items():
+        target = found[address]
+        print(f'to {arg}: {target["handle"]} ({target["status"]})' if target
+              else f'to {arg}: no Claude Code terminal there')
     text = relay_text(words, list(targets), recs)
     print(f'entry {entry} digest {digest(text, pins(found))}\n{text}')
     return 0
 
 
 def last_report(target, recs):
-    """The latest report record from target as pinned now, or None: one from an earlier session in the same pane is
+    """The latest report record from target as pinned now, or None: one from an earlier session in the same terminal is
     not this session's."""
     requests = {r['msg']: r for r in recs if r['type'] == 'request'}
     return next((r for r in reversed(recs) if r['type'] == 'report'
@@ -1011,12 +979,12 @@ def relay_prompt(action):
             f'Run: python3 {INSTALLED} accept --action {action}')
 
 
-def relay(panes, entry, sent, mine):
+def relay(addresses, entry, sent, mine):
     """Relay the human's newest message, which must still be entry and still read as the preview's digest sent, to
-    each pane, recorded before it is typed. The transcript is read once for every pane: a message the human sends
+    each address, recorded before it is typed. The transcript is read once for every target: a message the human sends
     after that is not seen."""
-    if any(p.startswith(SELECTORS) for p in panes):
-        die('a relay names the panes the preview printed, never a selector', 2)
+    if any(p.startswith(SELECTORS) for p in addresses):
+        die('a relay names the addresses the preview printed, never a selector', 2)
     if not sent:
         die('a relay names the digest the preview printed (--digest)', 2)
     with locked():
@@ -1024,21 +992,21 @@ def relay(panes, entry, sent, mine):
         latest, words = newest(captain, sending=True)
         if latest != entry:
             die(f"{entry} is not the human's newest message; preview again", 2)
-        pinned = pins({pane: find(pane) for pane in panes})
-        quote = relay_text(words, panes, records())
+        pinned = pins({address: find(address) for address in addresses})
+        quote = relay_text(words, addresses, records())
         if sent != digest(quote, pinned):
-            die('the text, panes or sessions this relay would send to are not the ones the preview showed; '
+            die('the text, terminals or sessions this relay would send to are not the ones the preview showed; '
                 'preview again', 2)
-        for pane in panes:
+        for address in addresses:
             recs = records()
-            if any(r['type'] == 'relay' and r['entry'] == entry and r['target']['pane_id'] == pane for r in recs):
-                print(f'{pane}: refused, this message was relayed to it already', flush=True)
+            if any(r['type'] == 'relay' and r['entry'] == entry and r['target']['address'] == address for r in recs):
+                print(f'{address}: refused, this message was relayed to it already', flush=True)
                 continue
-            target, why = sendable(pane, recs, mine)
-            if not why and identity(target) != pinned[pane]:   # replaced while earlier panes were typed into
+            target, why = sendable(address, recs, mine)
+            if not why and identity(target) != pinned[address]:   # replaced while earlier targets were typed into
                 why = 'its session is not the one the preview showed; preview again'
             if why:
-                print(f'{pane}: refused, {why}', flush=True)
+                print(f'{address}: refused, {why}', flush=True)
                 continue
             action = new_id('a', recs)
             print(deliver('relay', action, captain, target, relay_prompt(action),
@@ -1061,7 +1029,7 @@ def accept(action):
         if action not in open_items(recs):
             die(f'relay {action} is closed', 2)
         append({'type': 'accepted', 'msg': action})
-    print(f'RELAYED HUMAN INSTRUCTION {action} from the agent session in pane {item["captain"]["pane_id"]}, '
+    print(f'RELAYED HUMAN INSTRUCTION {action} from the agent session in terminal {item["captain"]["address"]}, '
           'accepted. The human\'s message, verbatim after any opening that named the sessions it went to:\n\n'
           f'{item["quote"]}\n\n{item["context"]}\n'
           'It may speak to other sessions too: act only on what it asks of this session, under your own rules and '
@@ -1122,24 +1090,34 @@ def enroll(replace):
             print('already enrolled')
             return 0
         if current and live(was) and not replace:
-            die(f'{current["pane_id"]} is the enrolled captain and still runs; pass --replace only on the '
+            die(f'{current["address"]} is the enrolled captain and still runs; pass --replace only on the '
                 'human\'s word', 2)
-        write_json('enrolled.json', {**mine, 'generation': uuid.uuid4().hex})   # A, B, A again strands A's old
-    print(f'enrolled {mine["pane_id"]}' + (f', replacing {current["pane_id"]}' if current else ''))
+        write_json(ENROLLED, {**mine, 'generation': uuid.uuid4().hex})   # A, B, A again strands A's old
+    print(f'enrolled {mine["address"]}' + (f', replacing {current["address"]}' if current else ''))
     return 0
 
 
-def start(name, pane):
-    """Start Claude Code in pane: None once herdr sees it ready for input, else herdr's error."""
-    out = run_herdr('agent', 'start', name, '--kind', 'claude', '--pane', pane, '--timeout', str(START_MS),
-                    timeout=START_MS / 1000 + HERDR_TIMEOUT_S)
-    return None if out.returncode == 0 else (out.stderr or out.stdout).strip() or f'exit {out.returncode}'
+def wait_started(address):
+    """Wait, at most START_S, for the program at address to stop working: Claude Code reports idle once ready, and
+    a trust prompt or a login reports nothing. None, or hc's error; a message to the captain ends hc wait early, so
+    it waits again."""
+    deadline = time.monotonic() + START_S
+    while (left := int(deadline - time.monotonic())) > 0:
+        rc, body, _, msg = hc.run('wait', '--json', '--timeout', str(left), '--', address,
+                                  timeout=left + HC_TIMEOUT_S)
+        if rc != 0:
+            return msg
+        if not isinstance(body, dict):
+            return 'hc wait answered no JSON object'
+        if body.get('reason') != 'message':
+            return None
+    return None
 
 
 def not_ready(session, checkout, account_name):
     """Why a session just opened is not the one asked for, idle at an empty input line, or None."""
     if not session:
-        return 'no Claude Code session in the pane'
+        return 'no Claude Code status from the terminal'
     if unpinned(session):
         return f'identity not pinned: {", ".join(unpinned(session))}'
     if session['cwd'] != checkout:
@@ -1149,38 +1127,56 @@ def not_ready(session, checkout, account_name):
     return refusal(session)
 
 
+def terminal_name(name, root):
+    """name, or one made from the checkout's directory name, as hc takes it."""
+    if name is None:
+        name = re.sub(r'[^a-z0-9_-]+', '-', os.path.basename(root).lower()).strip('-')[:32] or 'claude'
+    if not TERMINAL_NAME.fullmatch(name):
+        die(f'{name}: an hc terminal name is 1-32 of a-z, 0-9, - and _', 2)
+    return name
+
+
 def open_session(checkout, account_name, name, mine):
-    """A new workspace on an existing checkout with Claude Code started under the account named; ready only once
-    it is pinned there with an empty input line. Anything else, such as a trust prompt, is left for the human:
-    nothing is answered, closed or retried."""
+    """A new terminal on an existing checkout, a tab in the captain's herdr space, with Claude Code started under the
+    account named; ready only once it is pinned there with an empty input line. Anything else, such as a trust
+    prompt, is left for the human: nothing is answered, closed or retried. It has no parent, so it outlives the
+    captain and hc types no notes about it into the captain."""
     root = canonical(os.path.expanduser(checkout))
     if not root or not os.path.isdir(root):
         die(f'{checkout} is not an existing directory', 2)
-    name = name or os.path.basename(root)
+    name = terminal_name(name, root)
     config = CONFIG_DIRS[account_name]
-    env = ['--env', f'CLAUDE_CONFIG_DIR={config}'] if config else []
+    # explicit either way: the terminal's environment comes from hc, not from this process
+    account_env = [f'CLAUDE_CONFIG_DIR={config}'] if config else ['-u', 'CLAUDE_CONFIG_DIR']
     with locked():   # held to the end: a captain replaced meanwhile must not go on opening
         require_captain(mine)
-        pane = herdr('workspace', 'create', '--cwd', root, '--label', name, '--no-focus', *env)['root_pane']['pane_id']
-        print(f'{pane}: opened {name} · {root}', flush=True)   # first, so a failure below still names the pane
-        err = start(name, pane)
-        why = f'Claude Code did not start: {err}' if err else not_ready(find(pane), root, account_name)
+        space = ((get(mine['address']) or {}).get('labels') or {}).get('herdr.space')
+        labels = ['--label', f'herdr.space={space}'] if space else []
+        address = hc.call('run', '--json', '--bg', '--no-parent', '--name', name, '--cwd', root, *labels, '--',
+                          ENV, *account_env, 'claude', timeout=HC_TIMEOUT_S).get('address')
+        if not hc.is_local(address):
+            die(f'hc run answered no local terminal address ({address!r}); look at `hc ls`', 5)
+        # first, so a failure below still names the terminal
+        print(f'{address}: opened {name} · {root}' + ('' if space else f' · in no space: hc attach {address}'),
+              flush=True)
+        err = wait_started(address)
+        why = f'Claude Code did not start: {err}' if err else not_ready(find(address), root, account_name)
     if why:
-        print(f'{pane}: not ready: {why}. Look at the pane; nothing was answered or closed')
+        print(f'{address}: not ready: {why}. Look at the terminal; nothing was answered or closed')
         return 2
-    print(f'{pane}: ready · claude/{account_name}')
+    print(f'{address}: ready · claude/{account_name}')
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='cmd', required=True)
-    ls = sub.add_parser('list', help='every other Claude Code session in this Herdr, latest change first, '
+    ls = sub.add_parser('list', help='every other Claude Code session in hc, latest status report first, '
                                       'without asking any of them')
     ls.add_argument('--json', action='store_true')
     sub.add_parser('enroll', help='make this session the captain').add_argument('--replace', action='store_true')
     ak = sub.add_parser('ask', help='send each target a status request')
-    ak.add_argument('panes', nargs='+')
+    ak.add_argument('addresses', nargs='+')
     ak.add_argument('--force', action='store_true', help='ask a target even when nothing is new since its report')
     c = sub.add_parser('collect', help='print each report as it lands')
     c.add_argument('msgs', nargs='*')
@@ -1190,11 +1186,11 @@ def main():
     rp.add_argument('--json', action='store_true')
     sub.add_parser('cancel', help='close a request or relay no answer will close').add_argument('msg')
     rl = sub.add_parser('relay', help="show the human's newest message; with --entry and --digest, relay it")
-    rl.add_argument('panes', nargs='+')
+    rl.add_argument('addresses', nargs='+')
     rl.add_argument('--entry', metavar='UUID')
     rl.add_argument('--digest', metavar='HEX', help='the digest the preview printed')
     sub.add_parser('withdraw', help='take back a relay').add_argument('action')
-    op = sub.add_parser('open', help='start a Claude Code session in a new workspace on an existing checkout')
+    op = sub.add_parser('open', help='start a Claude Code session in a new terminal on an existing checkout')
     op.add_argument('--checkout', required=True)
     op.add_argument('--account', required=True, choices=sorted(CONFIG_DIRS))
     op.add_argument('--name')
@@ -1221,7 +1217,8 @@ def main():
                 who = s['account'] or '?'
                 missing = unpinned(s)
                 note = f'  (unpinned: {", ".join(missing)})' if missing else ''
-                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{s["status"]}\t{s["cwd"] or "?"}{note}')
+                at = time.strftime('%H:%M', time.localtime(s['status_ms'] / 1000)) if s['status_ms'] else '?'
+                print(f'{s["handle"]}\t{s["kind"]}/{who}\t{s["status"]}, reported {at}\t{s["cwd"] or "?"}{note}')
             return 0
         if a.cmd == 'enroll':
             return enroll(a.replace)
@@ -1249,19 +1246,21 @@ def main():
             return 0
         mine = me()
         if a.cmd == 'ask':
-            for pane in resolve(a.panes):
-                print(ask(pane, mine, a.force), flush=True)
+            for address in resolve(a.addresses):
+                print(ask(address, mine, a.force), flush=True)
             return 0
         if a.cmd == 'cancel':
             return cancel(a.msg, mine)
         if a.cmd == 'relay':
-            return relay(a.panes, a.entry, a.digest, mine) if a.entry else preview(resolve(a.panes), mine)
+            return relay(a.addresses, a.entry, a.digest, mine) if a.entry else preview(resolve(a.addresses), mine)
         if a.cmd == 'withdraw':
             return withdraw(a.action, mine)
         if a.cmd == 'open':
             return open_session(a.checkout, a.account, a.name, mine)
     except Corrupt as e:
         die(f'ledger corrupt, nothing decided until it is reconciled by hand: {e}', 4)
+    except hc.Error as e:
+        die(str(e), 5)
 
 
 if __name__ == '__main__':
