@@ -3077,7 +3077,9 @@ const runLanes = async (cycle, entry, lanes) => {
         return unresolvedVerdict(cycle, owedNow)
       }
       const bots = entry.bots ? entry.bots.bots : []
-      const missing = REQUIRED.map(r => ({ r, b: bots.find(b => b.bot === r.bot && b.state !== 'reviewed') })).filter(m => m.b)
+      // Greptile's limit is monthly: a limited Greptile is not waited for, and the pass names it unreviewed.
+      const missing = REQUIRED.map(r => ({ r, b: bots.find(b => b.bot === r.bot && b.state !== 'reviewed' && !(r.bot === 'greptile' && limited(b))) }))
+        .filter(m => m.b)
       if (missing.length) {
         const why = missing.map(({ r, b }) => `${r.name} has not reviewed ${expectedHead.slice(0, 7)}, and ${r.bot}Trigger made its review required: ` +
           botCell(b, entry.bots.waitedMin)).join('; ')

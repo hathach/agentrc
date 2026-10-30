@@ -8796,6 +8796,28 @@ test('without the switch Greptile is harvested only; the switch needs autoPush a
   assert.deepEqual(gAsks(auto.labels), ['greptile#2'])
 })
 
+test('a rate-limited Greptile is not waited for: the pass names it unreviewed, beside a CodeRabbit limit waited out', async () => {
+  const limitedG = bot('greptile', { state: 'settled', kind: 'limited', evidence: ['review 9 on 0f1e2d3'], reason: 'paused notice on the head: Greptile did not review it' })
+  const { result, labels } = await run({ args: { ...GT, maxCycles: 4 }, reviews: quiet([bot('coderabbit'), limitedG]) })
+  assert.equal(result.pass, true, result.reason)
+  assert.equal(result.cycles, 1)
+  assert.deepEqual(gAsks(labels), [], 'nothing to ask a paused Greptile')
+  assert.deepEqual(result.unreviewed.map(b => [b.bot, b.state, b.kind]), [['greptile', 'settled', 'limited']])
+  let n = 0
+  const both = await run({
+    args: { ...GT, coderabbitTrigger: true, maxCycles: 1 }, napClock: true,
+    reviewsPerCycle: () => quiet([++n < 3 ? limitedCr(at(20)) : bot('coderabbit'), limitedG]),
+  })
+  assert.equal(both.result.pass, true, both.result.reason)
+  assert.deepEqual(requests(both.labels), ['crrequest#2'], 'CodeRabbit is still waited out')
+  assert.deepEqual(both.result.unreviewed.map(b => b.bot), ['greptile'])
+  for (const other of [absent('greptile', { reason: 'no check run' }), bot('greptile', { state: 'settled', kind: 'failed', evidence: ['run 1'], reason: 'check run failure' })]) {
+    const { result: r } = await run({ args: { ...G, greptileTrigger: true, maxCycles: 1 }, gTrigger: { outcome: 'requested', detail: 'comment 9', commentId: 9 },
+      reviews: quiet([bot('coderabbit'), other]) })
+    assert.notEqual(r.pass, true, `${other.state}/${other.kind}: still required`)
+  }
+})
+
 test('the requirement latches for the run: a head adopted without the switch is still waited on and blocks unreviewed', async () => {
   const YG = { ...G, maxCycles: 6, yieldAfterCycle: true }
   const reviewedG = quiet([bot('coderabbit'), bot('greptile')])
