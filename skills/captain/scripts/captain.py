@@ -468,11 +468,13 @@ def status_brief(msg, address):
 DELIVERY = {hc.SENT: 'delivered', hc.NOT_TYPED_OUTCOME: 'undelivered', hc.UNCERTAIN: 'uncertain'}
 
 
-def submit(address, text, status):
+def submit(address, text, status, caller):
     """Paste text into address and press Enter: 'delivered', 'undelivered' when hc refused before typing anything,
     else 'uncertain'. An idle target is sent `--if idle`, so hc refuses one that started working since the check;
-    hc has no such check for done, and one that starts a turn in between gets the text as its next input."""
-    outcome, detail = hc.send(address, text, timeout=HC_TIMEOUT_S, only_if='idle' if status == 'idle' else None)
+    hc has no such check for done, and one that starts a turn in between gets the text as its next input. caller,
+    the captain's pinned address, tags the text as from it, never an inherited HC_TERMINAL_ID."""
+    outcome, detail = hc.send(address, text, timeout=HC_TIMEOUT_S, only_if='idle' if status == 'idle' else None,
+                              caller=caller)
     return DELIVERY[outcome], '' if outcome == hc.SENT else str(detail)
 
 
@@ -583,7 +585,7 @@ def deliver(kind, msg, captain, target, prompt, **fields):
     append({'type': kind, 'msg': msg, 'captain': captain, 'target': identity(target), 'handle': target['handle'],
             **fields})
     address = target['address']
-    outcome, err = submit(address, prompt, target['status'])
+    outcome, err = submit(address, prompt, target['status'], captain['address'])
     append({'type': outcome, 'msg': msg, 'error': err} if err else {'type': outcome, 'msg': msg})
     return f'{address}: {msg} {outcome}' + (f' ({err})' if err else '')
 

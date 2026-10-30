@@ -270,7 +270,7 @@ class HcTest(unittest.TestCase):
 
     def test_timed_out_call_fails(self):
         with mock.patch.object(subprocess, 'run', side_effect=self.hangs) as run:
-            self.assertEqual(captain.submit('t2', 'hi', 'idle')[0], 'uncertain')
+            self.assertEqual(captain.submit('t2', 'hi', 'idle', 't1')[0], 'uncertain')
             self.assertEqual(run.call_args.kwargs['timeout'], captain.HC_TIMEOUT_S)
             self.assertTrue(captain.wait_started('t2'))
             for call in (lambda: captain.get('t2'), lambda: captain.read_screen('t2')):
@@ -307,7 +307,7 @@ class HcTest(unittest.TestCase):
 class SubmitTest(unittest.TestCase):
     def submit(self, status='idle', answer=ran(body={'started': True, 'status': 'idle', 'turn': 0})):
         with mock.patch.object(captain.hc, 'run', return_value=answer) as run:
-            return captain.submit('t2', 'STATUS REQUEST m-1', status), run.call_args.args
+            return captain.submit('t2', 'STATUS REQUEST m-1', status, 't1'), run.call_args.args
 
     def test_an_idle_target_is_typed_into_only_while_idle(self):
         result, args = self.submit()
@@ -325,6 +325,13 @@ class SubmitTest(unittest.TestCase):
                        ran(0, {'started': False}), ran(0, None), ran(0, [])):
             with self.subTest(answer=answer):
                 self.assertEqual(self.submit(answer=answer)[0][0], 'uncertain')
+
+    def test_the_text_is_sent_as_the_captain_not_the_inherited_caller(self):
+        answer = mock.Mock(returncode=0, stdout='{"started": true}', stderr='')
+        with mock.patch.object(subprocess, 'run', return_value=answer) as run, \
+             mock.patch.dict(os.environ, {'HC_TERMINAL_ID': 't9'}):
+            self.assertEqual(captain.submit('t2', 'STATUS REQUEST m-1', 'idle', 't1'), ('delivered', ''))
+        self.assertEqual(run.call_args.kwargs['env']['HC_TERMINAL_ID'], 't1')
 
 
 def pinned(address):
@@ -364,7 +371,8 @@ class LedgerCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
         self.enroll_captain()
 
-    def _submit(self, address, text, status):
+    def _submit(self, address, text, status, caller):
+        self.assertEqual(caller, self.ident['address'])
         self.typed.append((address, text))
         return self.submit_result
 
@@ -1269,9 +1277,9 @@ class BroadcastTest(AddressedCase):
     def test_a_session_replaced_during_the_send_is_refused(self):
         _, entry, digest = self.shown('tell all to continue', *self.EVERY)
 
-        def replace_w3(address, text, status):
+        def replace_w3(address, text, status, caller):
             self.terminals['t3'] = {**self.terminals['t3'], 'pid': 11, 'started': 21, 'session': 's-new'}
-            return self._submit(address, text, status)
+            return self._submit(address, text, status, caller)
         with mock.patch.object(captain, 'submit', replace_w3):
             lines = self.relay(entry, *self.EVERY, digest=digest)
         self.assertTrue(lines[0].endswith('delivered'))
