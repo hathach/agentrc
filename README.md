@@ -66,6 +66,9 @@ nonempty directory; `remove` never deletes one, and leaves CLAUDE.md links
 that point elsewhere. Rerun after adding an entry: dead links into this repo
 are pruned.
 
+On a host that ran the former `install.py install --herdr-plugin`, run `herdr plugin unlink agentrc.worktree-children`
+once to drop herdr's registration of the removed plugin.
+
 Project repos such as tinyusb call these skills by bare name and expect this
 install, user-wide or per project.
 
