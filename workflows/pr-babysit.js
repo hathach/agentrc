@@ -302,6 +302,7 @@ if (args.state !== undefined && args.state !== null) {
   const shaped = st && st.version === STATE_VERSION && (st.pin === null || (st.pin && typeof st.pin === 'object')) &&
     Number.isInteger(st.maxCycles) && st.maxCycles >= 1 &&
     st.config && typeof st.config === 'object' && Number.isInteger(st.cyclesUsed) && st.cyclesUsed >= 0 &&
+    (st.lastCycle === undefined || (Number.isInteger(st.lastCycle) && st.lastCycle >= st.cyclesUsed)) &&
     typeof st.expectedHead === 'string' && Array.isArray(st.answeredWith) && Array.isArray(st.debt) &&
     [st.deferrals, st.acceptedFailures, st.decisions, st.holds].every(Array.isArray) &&
     st.acceptedFailures.every(a => typeof a === 'string') && (st.build === null || typeof st.build === 'string') &&
@@ -315,8 +316,11 @@ if (args.state !== undefined && args.state !== null) {
       Number.isFinite(Date.parse(st.reviewClock.since)) && (st.reviewClock.eventAt === null || Number.isFinite(Date.parse(st.reviewClock.eventAt))) &&
       (st.reviewClock.triggeredAt == null || Number.isFinite(Date.parse(st.reviewClock.triggeredAt))) &&
       (st.reviewClock.greptileAt == null || Number.isFinite(Date.parse(st.reviewClock.greptileAt))) &&
+      (st.reviewClock.limitSeen === undefined || Number.isFinite(Date.parse(st.reviewClock.limitSeen))) &&
+      (st.reviewClock.requests === undefined || (Number.isInteger(st.reviewClock.requests) && st.reviewClock.requests >= 0)) &&
       (st.reviewClock.request === undefined || (st.reviewClock.request &&
         (st.reviewClock.request.retryAt === null || Number.isFinite(Date.parse(st.reviewClock.request.retryAt))) &&
+        (st.reviewClock.request.tried === undefined || Number.isFinite(Date.parse(st.reviewClock.request.tried))) &&
         (st.reviewClock.request.at === null || Number.isFinite(Date.parse(st.reviewClock.request.at))))) &&
       (st.reviewClock.requestUnposted === undefined || st.reviewClock.requestUnposted === true) &&
       (st.reviewClock.unknown === undefined || (st.reviewClock.unknown && typeof st.reviewClock.unknown === 'object' &&
@@ -342,6 +346,9 @@ let repo = args.repo ?? stateRepo
 const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 16)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
 let cyclesUsed = restored ? restored.cyclesUsed : 0
+// Whether a cycle after this one is still within the charged budget.
+const budgetLeft = () => cyclesUsed + 1 < maxCycles
+let lastCycle = restored ? restored.lastCycle ?? cyclesUsed : 0
 const adoptHead = args.adoptHead === undefined || args.adoptHead === null ? null : args.adoptHead
 if (adoptHead !== null) {
   if (typeof adoptHead !== 'string' || !/^[0-9a-f]{40}$/.test(adoptHead)) throw new Error('adoptHead must be a full 40-hex commit SHA')
@@ -902,8 +909,8 @@ let expectedHead = restored ? restored.expectedHead : ''
 let pin = restored ? restored.pin : null
 // When the wait for a silent bot began, per head; kept across launches so a resume does not restart the cap.
 // triggeredAt: absent until this head's one CodeRabbit trigger, then when the script finished, or null when it failed.
-// greptileAt the same for its one `@greptileai` request. requestUnposted: a CodeRabbit request failed before its POST and was
-// tried once more, the retry it gets.
+// greptileAt the same for its one `@greptileai` request. limitSeen dates the first limit, request the last attempt, requests
+// counts attempts on this head. requestUnposted holds the one pre-POST retry allowance until that attempt is recorded.
 let reviewClock = restored ? restored.reviewClock : null
 // Latched by the first launch with greptileTrigger: from then on every head of this run needs Greptile's review, whatever
 // later launches pass; only posting the request stays with the switch.
@@ -938,7 +945,7 @@ const pendingOf = () => {
 const stateOut = () => {
   const crRead = coderabbitRead()
   const st = {
-    version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, maxCycles,
+    version: STATE_VERSION, pin, expectedHead, reviewClock, pending: pendingOf(), config, build: buildCmd, cyclesUsed, lastCycle, maxCycles,
     ...(greptileRequired ? { greptileRequired } : {}),
     ...(coderabbitRequired ? { coderabbitRequired } : {}),
     ...(crRead ? { coderabbitRead: crRead } : {}),
@@ -1227,10 +1234,13 @@ const settleBots = (r) => {
   else if (r.headEventAt !== null && (reviewClock.eventAt === null || Date.parse(r.headEventAt) > Date.parse(reviewClock.eventAt))) {
     reviewClock.eventAt = r.headEventAt // a reopen or ready on the same SHA restarts the wait
   }
+  // A state from before `tried` dates a failed request no earlier than the first observation that resumes it.
+  if (reviewClock.request && reviewClock.request.at === null && reviewClock.request.tried === undefined) reviewClock.request.tried = r.observedAt
   const start = reviewClock.eventAt ?? reviewClock.since
   const waitedMin = Math.floor((Date.parse(r.observedAt) - Date.parse(start)) / 60000)
   const unknown = {}
   const bots = r.bots.map(b => {
+    if (b.bot === 'coderabbit' && limited(b) && reviewClock.limitSeen === undefined) reviewClock.limitSeen = r.observedAt
     const done = !waitedOn.includes(b.bot) || b.state === 'reviewed' || b.state === 'settled' ||
       ((b.state === 'queued' || b.state === 'absent') && waitedMin >= REVIEW_CAP_MIN)
     if (done || b.state !== 'unknown') return { ...b, done }
@@ -1247,11 +1257,11 @@ const botCell = (b, headWaitedMin) => {
   if (b.state === 'reviewed') return `reviewed ${b.sha.slice(0, 7)}`
   if (!waitedOn.includes(b.bot)) return `${b.state} (${b.kind ? `${b.kind}: ` : ''}${b.reason}; not waited on)`
   const waitedMin = b.triggeredMin ?? headWaitedMin
-  if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again ${b.retryAt ? `after ${b.retryAt}` : 'next cycle'})`
   if (b.state === 'settled' && b.triggeredMin !== undefined) {
     return b.done ? `settled (${b.kind}: ${b.reason}; no review ${waitedMin}m after its trigger)`
       : `review triggered (${b.reason}, ${Math.max(0, REVIEW_CAP_MIN - waitedMin)}m to cap)`
   }
+  if (b.retryWaitMs !== undefined) return `settled (${b.kind}: ${b.reason}; asking again ${b.retryAt ? `after ${b.retryAt}` : 'next cycle'})`
   if (b.state === 'settled') return `settled (${b.kind}: ${b.reason})`
   if (b.state === 'queued' || b.state === 'absent') {
     return b.done ? `${b.state}, wait expired after ${waitedMin}m: head unreviewed (${b.reason})`
@@ -1988,16 +1998,29 @@ const settleSonar = async (cycle, entry, ended) => {
 // A repository below CodeRabbit's open-source threshold gets a manual-review skip on every push until its Trigger review box is ticked.
 const MANUAL_SKIP = /^review skipped: manual review required/i
 const manualSkip = (cr) => cr.state === 'settled' && cr.kind === 'skipped' && MANUAL_SKIP.test(cr.reason)
-// The ask CodeRabbit's state leaves a coderabbitTrigger launch on the head of `clock`, one of each per head (#243): a tick of a
-// manual skip's box, or a request after a rate limit with a known reset, whenever that reset comes, or after a failed tick, which
-// spends no comment (#274); null when neither is left.
+const limited = (cr) => cr.state === 'settled' && cr.kind === 'limited'
+// Manual skips get one tick and one fallback per head; a rate limit gets a request each reset window.
 const coderabbitAskable = (cr, clock) => {
   if (manualSkip(cr)) {
     if (clock.triggeredAt === undefined) return 'tick'
     return !clock.request && clock.triggeredAt === null ? 'request' : null
   }
-  return !clock.request && cr.state === 'settled' && cr.kind === 'limited' && cr.retryAt !== null ? 'request' : null
+  return limited(cr) ? 'request' : null
 }
+const requestTried = (clock) => clock.request.tried ?? clock.request.at
+const requestCount = (clock) => clock.requests ?? (clock.request ? 1 : 0)
+// CodeRabbit's quota window: harvest.py's ESTIMATED_RESET; the margin is coderabbit_trigger.py's MARGIN.
+const HOUR_MS = 60 * 60000
+const RESET_MARGIN_MS = 60000
+// A margin past the later of the reset (an hour after the limit was first seen when none reads) and an hour after the last
+// attempt: an edited countdown never shortens the window.
+const requestDeadline = (cr, clock) => {
+  const own = cr.retryAt ? Date.parse(cr.retryAt) : Date.parse(clock.limitSeen ?? clock.since) + HOUR_MS
+  const last = clock.request ? Date.parse(requestTried(clock)) + HOUR_MS : -Infinity
+  return Math.max(own, last) + RESET_MARGIN_MS
+}
+// Whole seconds, as coderabbit_trigger.py reads them.
+const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
@@ -2010,7 +2033,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
     // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
-  if (cr.state === 'settled' && cr.kind === 'limited') return requestCodeRabbit(cycle, r, cr, ended)
+  if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended)
   if (manual) await requestCodeRabbit(cycle, r, cr, ended)
   // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip after
   // the ask is waited on too: the skip asked about may read otherwise once its box is ticked.
@@ -2057,49 +2080,61 @@ const unreviewedCodeRabbit = () => {
 const coderabbitAskOf = (cr) => {
   const clock = reviewClock && reviewClock.sha === expectedHead ? reviewClock : {}
   const asked = [...(clock.triggeredAt !== undefined ? [{ ask: 'tick', at: clock.triggeredAt }] : []),
-    ...(clock.request ? [{ ask: 'request', at: clock.request.at }] : [])]
+    ...(clock.request ? [{ ask: 'request', at: clock.request.at, requests: requestCount(clock) }] : [])]
   const relaunchAsks = coderabbitAskable(cr, clock)
-  return { relaunchAsks, asked, ...(relaunchAsks === 'request' ? { retryAt: cr.retryAt } : {}) }
+  // A limit always reports nextAt, null when no clock of this head dates it.
+  const next = limited(cr) ? requestDeadline(cr, clock) : NaN
+  return { relaunchAsks, asked, ...(limited(cr) ? { nextAt: Number.isFinite(next) ? isoSeconds(next) : null }
+    : relaunchAsks === 'request' ? { retryAt: cr.retryAt } : {}) }
 }
 const waitAfter = (cr, askedAt, observedAt) => {
   cr.triggeredMin = Math.floor((Date.parse(observedAt) - Date.parse(askedAt)) / 60000)
   cr.done = cr.triggeredMin >= REVIEW_CAP_MIN
 }
-// A rate limit leaves no box to tick: once its reset passes, one `@coderabbitai review` per head asks again. So does a manual
-// skip whose tick failed, at once.
-const RETRY_WAIT_MAX_MS = 60 * 60000
-const retryLater = (cr, cycle, ms) => {
-  if (ms > RETRY_WAIT_MAX_MS || cycle >= maxCycles) return
+const retryLater = (cr, ms) => {
   cr.done = false
-  // A minute past the reset, never past the cap: an estimated reset is exactly an hour out (#138).
-  cr.retryWaitMs = Math.min(ms + 60000, RETRY_WAIT_MAX_MS)
+  // Never under a minute: a reset just behind the clock would otherwise run the next cycle at once.
+  cr.retryWaitMs = Math.min(Math.max(60000, ms), HOUR_MS)
 }
 const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const asked = reviewClock.request
-  if (asked) {
-    // The limit asked past still showing waits for the answer; a later reset is CodeRabbit refusing again.
+  const quota = limited(cr) && coderabbitTrigger
+  if (asked && !quota) {
     if (asked.at !== null && Date.parse(asked.retryAt) === Date.parse(cr.retryAt)) waitAfter(cr, asked.at, r.observedAt)
     return
   }
   if (!coderabbitTrigger || coderabbitAskable(cr, reviewClock) !== 'request') return
-  const dueMs = cr.retryAt === null ? 0 : Date.parse(cr.retryAt) - Date.parse(r.observedAt)
-  if (dueMs > 0) return retryLater(cr, cycle, dueMs)
+  const deadline = quota ? requestDeadline(cr, reviewClock) : null
+  const observed = Date.parse(r.observedAt)
+  if (quota && deadline > observed) {
+    const cap = asked ? Date.parse(requestTried(reviewClock)) + REVIEW_CAP_MIN * 60000 : 0
+    if (cap > observed && asked.at !== null) waitAfter(cr, asked.at, r.observedAt)
+    return retryLater(cr, Math.min(deadline, cap > observed ? cap : Infinity) - observed)
+  }
   if (await ended('crrequest')) return
-  const why = cr.kind === 'limited' ? 'after its rate limit' : 'that it skipped for a manual review'
-  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`, ' --request',
-    ['requested', 'already', 'notDue', 'notLimited', 'failed'])
-  // A failure before the POST posted nothing (#276): one more try, behind the script's own `already` check. One that may have posted is final.
+  const why = limited(cr) ? 'after its rate limit' : 'that it skipped for a manual review'
+  const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`,
+    ` --request${quota ? ` --not-before ${shq(isoSeconds(deadline))}` : ''}`, ['requested', 'already', 'notDue', 'notLimited', 'failed'])
+  // A failure before the POST gets one retry (#276); a possibly posted attempt waits for the next window.
   if (outcome === 'failed' && t && t.phase === 'read' && !reviewClock.requestUnposted) {
     reviewClock.requestUnposted = true
-    return retryLater(cr, cycle, 0)
+    if (quota || budgetLeft()) retryLater(cr, 60000)
+    return
   }
   const atOk = !!t && Number.isFinite(Date.parse(t.at))
   const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
-  if (outcome === 'notDue' && reset && atOk) return retryLater(cr, cycle, Math.max(0, Date.parse(reset) - Date.parse(t.at)))
+  if (outcome === 'notDue' && reset && atOk) {
+    if (!(Date.parse(cr.retryAt) >= Date.parse(reset))) cr.retryAt = reset // reported and saved; an earlier one never shortens
+    return retryLater(cr, Math.max(Date.parse(reset) + RESET_MARGIN_MS, quota ? deadline : 0) - Date.parse(t.at))
+  }
   // notLimited waits too: what changed since the harvest is for the next harvest to read.
+  if (quota && outcome === 'notLimited') { cr.done = false; return }
   const asking = ['requested', 'already', 'notLimited'].includes(outcome) && atOk
-  reviewClock.request = { at: asking ? t.at : null, retryAt: reset ?? cr.retryAt }
+  reviewClock.requests = requestCount(reviewClock) + 1
+  reviewClock.request = { at: asking ? t.at : null, retryAt: reset ?? cr.retryAt, tried: atOk ? t.at : r.observedAt }
+  delete reviewClock.requestUnposted
   if (asking) waitAfter(cr, t.at, r.observedAt)
+  if (quota) retryLater(cr, asking ? REVIEW_CAP_MIN * 60000 : requestDeadline(cr, reviewClock) - Date.parse(reviewClock.request.tried))
 }
 
 // A Greptile that reviews only on PR open never sees a pushed head unasked: under greptileTrigger, one `@greptileai` per
@@ -2238,6 +2273,7 @@ const ciLaneRun = async (cycle, lanes, entry) => {
     ciStopFile = null
     if (githubLimit) await ciStopSent
     if (inventoryFailed(inv)) return null
+    if (inv.status === 'running') entry.ciRunning = true
     left -= slice
     if (inv.status !== 'running' || last || lanes.reviewPublishing || lanes.ended || reviewOnly(inv) || githubLimit) break
   }
@@ -2932,7 +2968,10 @@ const runLanes = async (cycle, entry, lanes) => {
     lanes.reviewDone = true
     if (!ciLane) {
       log(`cycle ${cycle}: reviews lane only — CI not observed, no verdict this launch`)
-      return null
+      const waiting = entry.bots ? entry.bots.bots.filter(b => !b.done) : []
+      if (!quotaPending(waiting)) return null
+      napMs = waiting[0].retryWaitMs
+      return rearm()
     }
     const c = await ciPromise
     if (entry.collectorSkew) {
@@ -3036,7 +3075,7 @@ const runLanes = async (cycle, entry, lanes) => {
         }
         // Another cycle cannot answer a comment handed to the caller, or one held for the caller's decision: stop rather than burn the budget waiting.
         const progressing = owedNow.filter(id => !handedOff(id) && !callerHeld(id))
-        if (cycle < maxCycles && progressing.length) {
+        if (budgetLeft() && progressing.length) {
           log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'} but ${owedNow.length} comment(s) still owed an answer — re-arming`)
           napMs = backoff(cycle)
           return rearm()
@@ -3049,7 +3088,9 @@ const runLanes = async (cycle, entry, lanes) => {
         return unresolvedVerdict(cycle, owedNow)
       }
       const bots = entry.bots ? entry.bots.bots : []
-      const missing = REQUIRED.map(r => ({ r, b: bots.find(b => b.bot === r.bot && b.state !== 'reviewed') })).filter(m => m.b)
+      // Greptile's limit is monthly: a limited Greptile is not waited for, and the pass names it unreviewed.
+      const missing = REQUIRED.map(r => ({ r, b: bots.find(b => b.bot === r.bot && b.state !== 'reviewed' && !(r.bot === 'greptile' && limited(b))) }))
+        .filter(m => m.b)
       if (missing.length) {
         const why = missing.map(({ r, b }) => `${r.name} has not reviewed ${expectedHead.slice(0, 7)}, and ${r.bot}Trigger made its review required: ` +
           botCell(b, entry.bots.waitedMin)).join('; ')
@@ -3103,9 +3144,10 @@ const runLanes = async (cycle, entry, lanes) => {
         log(`cycle ${cycle}: auto-review unreadable, unchanged for ${REVIEW_CAP_MIN}m or more (${who}) — stopping`)
         return stop(cycle, 'reviews-stuck', { head: expectedHead, bots: pendingBots.map(botOut) })
       }
-      if (cycle < maxCycles) {
+      if (budgetLeft() || quotaPending(pendingBots)) {
         log(`cycle ${cycle}: auto-review still pending (${who}) — re-arming after a wait`)
-        napMs = Math.max(backoff(cycle), ...pendingBots.map(b => b.retryWaitMs ?? 0))
+        napMs = quotaPending(pendingBots) ? pendingBots[0].retryWaitMs
+          : Math.max(backoff(cycle), ...pendingBots.map(b => b.retryWaitMs ?? 0))
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)
       }
@@ -3140,7 +3182,7 @@ const MODULES = reviewLane && reviewers.length && waitedOn.length ? ['yaml'] : [
 const PACKAGE = { yaml: 'PyYAML' }
 if (cyclesUsed >= maxCycles) {
   log(`state: ${cyclesUsed} of ${maxCycles} cycles already used — nothing left to run`)
-  return finish(stop(cyclesUsed, 'budget-exhausted'))
+  return finish(stop(lastCycle, 'budget-exhausted'))
 }
 const pinned = await relayOnce(
   `${IN_CHECKOUT}Editing and committing nothing, run exactly \`${PY} ${PREFLIGHT_SCRIPT} --pr ${args.pr}${NEEDED.map(p => ` --needs ${p}`).join('')}` +
@@ -3148,15 +3190,15 @@ const pinned = await relayOnce(
   relayed(PIN),
   { label: 'preflight', phase: 'Triage', model: 'haiku', effort: 'low', schema: PIN },
 )
-if (!pinned) return finish(stop(cyclesUsed, 'preflight-died'))
+if (!pinned) return finish(stop(lastCycle, 'preflight-died'))
 if (pinned.error) {
   log(`preflight: nothing pinned — ${pinned.error}`)
-  if (pinned.error.startsWith('stale workflow definition')) return finish(stop(cyclesUsed, 'stale-workflow', { detail: pinned.error }))
-  return finish(stop(cyclesUsed, 'preflight-failed', { detail: pinned.error }))
+  if (pinned.error.startsWith('stale workflow definition')) return finish(stop(lastCycle, 'stale-workflow', { detail: pinned.error }))
+  return finish(stop(lastCycle, 'preflight-failed', { detail: pinned.error }))
 }
 if (pinned.pr !== args.pr) {
   log(`preflight: the pin is of PR #${pinned.pr}, not #${args.pr}`)
-  return finish(stop(cyclesUsed, 'preflight-failed', { detail: `the pin is of PR #${pinned.pr}` }))
+  return finish(stop(lastCycle, 'preflight-failed', { detail: `the pin is of PR #${pinned.pr}` }))
 }
 // The repository every later call names must be the one asked for and the one the PR read lives in.
 const pinnedRepo = pinned.repo.trim()
@@ -3166,58 +3208,58 @@ const notRepo = !REPO_NAME.test(pinnedRepo) ? `the pin names no repository OWNER
     ? `${pinnedRepo} read PR #${args.pr} as ${pinned.prUrl}` : null
 if (notRepo) {
   log(`preflight: ${notRepo}`)
-  return finish(stop(cyclesUsed, 'preflight-failed', { detail: notRepo }))
+  return finish(stop(lastCycle, 'preflight-failed', { detail: notRepo }))
 }
 repo = pinnedRepo
 if (pinned.prState !== 'OPEN') {
   log(`preflight: PR #${args.pr} is ${pinned.prState.toLowerCase()} — nothing to babysit`)
-  return finish(prEnded(cyclesUsed, pinned.prState.toLowerCase()))
+  return finish(prEnded(lastCycle, pinned.prState.toLowerCase()))
 }
 const unusable = !pinned.python.trim() ? 'preflight names no interpreter'
   : pinned.missing.length ? `${pinned.python} cannot import ${pinned.missing.map(m => { const p = PACKAGE[m.split(':')[0]]; return p ? `${m} (${p})` : m }).join('; ')}, which this launch's lanes need: ` +
     'install it for that interpreter, or launch with python naming one that has it' : null
 if (unusable) {
   log(`preflight: ${unusable}`)
-  return finish(stop(cyclesUsed, 'python-unusable', { detail: unusable }))
+  return finish(stop(lastCycle, 'python-unusable', { detail: unusable }))
 }
 if (pythonArg === null) PY = shq(pinned.python)
 const dirty = withoutIdeDrift(pinned.dirty)
 if (dirty.length !== pinned.dirty.length) log(`preflight: ignoring ${pinned.dirty.length - dirty.length} dirty .idea/ path(s) (IDE metadata)`)
 if (dirty.length) {
   log(`preflight: the checkout is dirty — ${dirty.length} path(s); commit or stash before babysitting`)
-  return finish(stop(cyclesUsed, 'dirty-start', { dirty }))
+  return finish(stop(lastCycle, 'dirty-start', { dirty }))
 }
 // A local branch may carry another name if it tracks the PR head branch.
 if (pinned.prBranch.trim() !== pinned.branch.trim() && pinned.upstreamBranch.trim() !== pinned.prBranch.trim()) {
   log(`preflight: checked out ${pinned.branch}, but PR #${args.pr} heads ${pinned.prBranch}`)
-  return finish(stop(cyclesUsed, 'wrong-branch', { branch: pinned.branch, expected: pinned.prBranch.trim() }))
+  return finish(stop(lastCycle, 'wrong-branch', { branch: pinned.branch, expected: pinned.prBranch.trim() }))
 }
 // A branch name is not an identity.
 if (adoptHead === null && pinned.head.trim() !== pinned.prHead.trim()) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but PR #${args.pr} heads ${pinned.prHead.slice(0, 7)}`)
-  return finish(stop(cyclesUsed, 'wrong-head', { head: pinned.head.trim(), expected: pinned.prHead.trim() }))
+  return finish(stop(lastCycle, 'wrong-head', { head: pinned.head.trim(), expected: pinned.prHead.trim() }))
 }
 const currentPin = { prRepo: pinned.prRepo.trim(), prBranch: pinned.prBranch.trim(), prUrl: pinned.prUrl, remote: pinned.remote, pushUrls: pinned.pushUrls }
 if (restored && restored.pin && JSON.stringify(currentPin) !== JSON.stringify(restored.pin)) {
   log(`preflight: this is not the PR the state belongs to — ${JSON.stringify(currentPin)} vs ${JSON.stringify(restored.pin)}`)
-  return finish(stop(cyclesUsed, 'state-mismatch', { pin: currentPin, expected: restored.pin }))
+  return finish(stop(lastCycle, 'state-mismatch', { pin: currentPin, expected: restored.pin }))
 }
 if (rebasedHead !== null) {
   const why = pinned.head.trim() !== rebasedHead ? `HEAD is ${pinned.head.slice(0, 7)}, not the rebasedHead ${rebasedHead.slice(0, 7)}`
     : restored.pending ? `the state holds an unpublished candidate (${restored.pending.stage}); resolve it first` : null
   if (why) {
     log(`preflight: re-pin refused — ${why}`)
-    return finish(stop(cyclesUsed, 'rebase-refused', { detail: why }))
+    return finish(stop(lastCycle, 'rebase-refused', { detail: why }))
   }
 }
 if (adoptHead === null && rebasedHead === null && restored && restored.pin && pinned.head.trim() !== restored.expectedHead) {
   log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, but the previous launch left ${restored.expectedHead.slice(0, 7)}`)
-  return finish(stop(cyclesUsed, 'stale-head', { head: pinned.head.trim(), expected: restored.expectedHead }))
+  return finish(stop(lastCycle, 'stale-head', { head: pinned.head.trim(), expected: restored.expectedHead }))
 }
 if (pinned.badPushUrl) {
   const expected = `github.com/${pinned.prRepo.trim().toLowerCase()}`
   log(`preflight: ${pinned.remote} pushes to ${pinned.badPushUrl}, not PR #${args.pr}'s head repository ${expected} (only github.com over https or ssh)`)
-  return finish(stop(cyclesUsed, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected }))
+  return finish(stop(lastCycle, 'wrong-remote', { remoteUrl: pinned.badPushUrl, expected }))
 }
 // Adoption replaces the head checks: checkout at adoptHead, PR at the state's head or a chain commit, the chain audited commit by commit.
 // Without a pinned state (a first launch, or one that stopped before its pin) the chain starts at the live PR head (#260).
@@ -3229,19 +3271,19 @@ if (adoptHead !== null) {
   const tip = pinned.prBaseTip.trim()
   if (pinned.head.trim() !== adoptHead) {
     log(`preflight: HEAD is ${pinned.head.slice(0, 7)}, not the ${adoptHead.slice(0, 7)} to adopt`)
-    return finish(stop(cyclesUsed, 'adopt-head-mismatch', { head: pinned.head.trim(), expected: adoptHead }))
+    return finish(stop(lastCycle, 'adopt-head-mismatch', { head: pinned.head.trim(), expected: adoptHead }))
   }
   if (adoptHead === X) {
     const what = restored && restored.pin ? 'the state\'s expectedHead' : 'the PR head'
     log(`preflight: adoption refused — ${adoptHead.slice(0, 7)} is ${what}: there is nothing to adopt`)
-    return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: `adoptHead ${adoptHead.slice(0, 7)} is ${what}: launch without it` }))
+    return finish(stop(lastCycle, 'adopt-audit-failed', { detail: `adoptHead ${adoptHead.slice(0, 7)} is ${what}: launch without it` }))
   }
   // An unpublished candidate is decided by a retry of the same adoption or, while the PR heads the state's head, a chain from it; never one this run's audit refused.
   const p = restored && restored.pending
   const retry = !!p && p.lane === 'adopt' && p.sha === adoptHead
   if (p && !retry && (prHead !== X || p.stage === 'audit-blocked')) {
     log(`preflight: the state holds an unpublished candidate (${p.stage}); resolve it before adopting`)
-    return finish(stop(cyclesUsed, 'adopt-pending', { pending: p }))
+    return finish(stop(lastCycle, 'adopt-pending', { pending: p }))
   }
   if (p && !retry) log(`preflight: the unpublished candidate (${p.stage}) is left to this adoption of ${adoptHead.slice(0, 7)}: PR #${args.pr} heads ${X.slice(0, 7)}, and only the audited chain may publish`)
   if (tip !== base) log(`preflight: ${pinned.prBaseBranch} is at ${tip.slice(0, 7)}, not the base ${base.slice(0, 7)} GitHub recorded at the PR's last push; a merge may come from either`)
@@ -3281,19 +3323,19 @@ if (adoptHead !== null) {
     log(`preflight: adoption refused — ${why}`)
     // commits.py's missing-base error: the base moved again after the merge, so a fetch and the same adoption recover it
     if (audit && /^the PR's base [0-9a-f]{40} is not in the checkout: fetch it$/.test(audit.error || '')) {
-      return finish(stop(cyclesUsed, 'adopt-base-missing', { detail: why }))
+      return finish(stop(lastCycle, 'adopt-base-missing', { detail: why }))
     }
-    return finish(stop(cyclesUsed, 'adopt-audit-failed', { detail: why }))
+    return finish(stop(lastCycle, 'adopt-audit-failed', { detail: why }))
   }
   if (waived.length) log(`preflight: adopting a base merge's change to protected path(s) ${waived.join(', ')}, named in adoptProtected`)
   if (reviewed.length) log(`preflight: adopting reviewed change(s) to protected path(s) ${reviewed.join(', ')}, named in adoptReviewedProtected`)
   if (prHead !== X && !shas.includes(prHead)) {
     log(`preflight: PR #${args.pr} heads ${prHead.slice(0, 7)}, neither the state's ${X.slice(0, 7)} nor a commit of the chain to ${adoptHead.slice(0, 7)}`)
-    return finish(stop(cyclesUsed, 'wrong-head', { head: prHead, expected: [X, adoptHead] }))
+    return finish(stop(lastCycle, 'wrong-head', { head: prHead, expected: [X, adoptHead] }))
   }
   if (prHead !== adoptHead && args.autoPush !== true) {
     log(`preflight: ${adoptHead.slice(0, 7)} is audited but unpublished, and this is a dry run`)
-    return finish(stop(cyclesUsed, 'adopt-needs-push', { dryRun: true }))
+    return finish(stop(lastCycle, 'adopt-needs-push', { dryRun: true }))
   }
   adoption = { from: X, to: adoptHead, commits: shas, paths: [...new Set(paths.map(canon))], published: prHead === adoptHead }
 }
@@ -3332,21 +3374,27 @@ const adopt = async (entry) => {
   return null
 }
 
-const worked = (e) => Object.entries(actionsOf(e)).some(([k, v]) => k !== 'error' && (Array.isArray(v) ? v.length > 0 : !!v)) ||
+const worked = (e, exceptAsks = false) => Object.entries(actionsOf(e)).some(([k, v]) => k !== 'error' &&
+  !(exceptAsks && k === 'botAsks') && (Array.isArray(v) ? v.length > 0 : !!v)) ||
   !!(e.sonar && e.sonar.length) || !!e.ciReran
+const quotaPending = (bots) => coderabbitTrigger && bots.length > 0 &&
+  bots.every(b => b.bot === 'coderabbit' && limited(b) && b.retryWaitMs !== undefined)
+const quotaWait = (entry, before) => waited && entry.head === expectedHead && entry.bots &&
+  quotaPending(entry.bots.bots.filter(b => !b.done)) && !worked(entry, true) &&
+  (!ciLane || (!!entry.ci && !entry.ciRunning && entry.ci.status !== 'running' && entry.ci.infraRerun.length === 0)) &&
+  JSON.stringify(handoffList()) === before.handoffs && corrections.length === before.corrections
 const yielded = (cycle) => finish(stop(cycle, 'yielded', { outstanding: outstanding() }), 'paused')
 // yieldOnChange returns after a cycle the caller must see: a push, changed handoffs or corrections, or no usable observation.
 const changeOf = (entry, before) => entry.reviewPush || entry.ciPush ? 'a repair was pushed'
   : JSON.stringify(handoffList()) !== before.handoffs ? 'the handoffs changed'
   : corrections.length !== before.corrections ? 'a correction was recorded'
   : !waited ? 'the cycle ended without a usable observation' : null
-const firstCycle = cyclesUsed + 1
-const lastCycle = yieldAfterCycle ? firstCycle : maxCycles
-for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
+const firstCycle = lastCycle + 1
+for (let cycle = firstCycle; cyclesUsed < maxCycles; cycle++) {
   if (napMs > 0) { await nap(napMs); napMs = 0 }
   waited = false
   githubLimit = null
-  const before = yieldOnChange ? { handoffs: JSON.stringify(handoffList()), corrections: corrections.length } : null
+  const before = { handoffs: JSON.stringify(handoffList()), corrections: corrections.length }
   const entry = { cycle, head: expectedHead, ...(rebased && cycle === firstCycle ? { rebased } : {}) }
   retired.clear()
   history.push(entry)
@@ -3361,23 +3409,25 @@ for (let cycle = firstCycle; cycle <= lastCycle; cycle++) {
   } finally {
     entry.summary = cycleSummary(entry)
     log(entry.summary)
-    cyclesUsed = cycle
+    lastCycle = cycle
   }
-  // A cycle that only met the rate limit observed nothing: it is not charged.
-  if (verdict && verdict.reason === 'github-rate-limited' && !worked(entry)) cyclesUsed = cycle - 1
+  // Quota-only waits and a GitHub refusal before any work consume an id, but no repair budget.
+  const uncharged = verdict ? verdict.reason === 'github-rate-limited' && !worked(entry) : quotaWait(entry, before)
+  if (!uncharged) cyclesUsed++
   if (verdict) return finish(verdict)
-  const change = yieldOnChange && cycle < maxCycles ? changeOf(entry, before) : null
+  const change = yieldOnChange && cyclesUsed < maxCycles ? changeOf(entry, before) : null
   if (change) {
     log(`cycle ${cycle}: pausing for the caller — ${change}`)
     return yielded(cycle)
   }
+  if (yieldAfterCycle) break
 }
-if (yieldAfterCycle && cyclesUsed < maxCycles) return yielded(cyclesUsed)
+if (yieldAfterCycle && cyclesUsed < maxCycles) return yielded(lastCycle)
 // Reply debt outranks a silent bot; a last cycle that pushed says nothing about the new head.
 const last = history[history.length - 1]
 const stillPending = last.bots && last.head === expectedHead ? last.bots.bots.filter(b => !b.done) : []
 return finish(outstanding().length > 0
-  ? unresolvedVerdict(maxCycles, outstanding(), args.autoPush !== true)
+  ? unresolvedVerdict(lastCycle, outstanding(), args.autoPush !== true)
   : stillPending.length > 0
-    ? stop(maxCycles, 'reviews-pending', { head: expectedHead, pending: stillPending.map(botOut) })
-    : stop(maxCycles, 'budget-exhausted'))
+    ? stop(lastCycle, 'reviews-pending', { head: expectedHead, pending: stillPending.map(botOut) })
+    : stop(lastCycle, 'budget-exhausted'))

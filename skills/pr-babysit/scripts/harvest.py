@@ -155,7 +155,7 @@ def coderabbit(head, statuses, checks, issue, event_at):
     s, tied = newest_reading([x for x in statuses if x.get('context') == 'CodeRabbit'], 'updated_at', lambda x: (x['state'], x.get('description')))
     if tied:
         return record('coderabbit', 'unknown', f'statuses {tied}')
-    run_, unordered = latest_run([c for c in checks if c.get('name') == 'CodeRabbit'])
+    run_, unordered = latest_run([c for c in checks if c.get('name') == 'CodeRabbit'], title=True)
     if unordered:
         return record('coderabbit', 'unknown', unordered)
     ev = []
@@ -173,21 +173,26 @@ def coderabbit(head, statuses, checks, issue, event_at):
     if why:
         return record('coderabbit', 'unknown', f'pause comments: {why}', ev)
     rate = [c for c in stickies if CR_RATE in (c.get('body') or '')]
-    # CodeRabbit's own rate-limit status on the head dates the notice it edits alongside it.
-    by_status = bool(s) and s['state'] == 'success' and (s.get('description') or '').lower().startswith(CR_RATE_STATUS) and (run_at is None or run_at < s_at)
-    tied = next((c for c in [pause, *([] if by_status else rate)] if c and latest_at is not None and stamp(c['updated_at']) == latest_at), None)
+    # CodeRabbit's own rate-limit status or check run on the head dates the notice it edits alongside it.
+    by_status = bool(s) and s['state'] == 'success' and (s.get('description') or '').lower().startswith(CR_RATE_STATUS) and \
+        (run_at is None or run_at < s_at or run_at == s_at and rate_run(run_))
+    by_run = bool(run_) and rate_run(run_) and run_at is not None and (s_at is None or s_at < run_at)
+    tied = next((c for c in [pause, *([] if by_status or by_run else rate)] if c and latest_at is not None and stamp(c['updated_at']) == latest_at), None)
     if tied:
         return record('coderabbit', 'unknown', 'a notice and a status or run on the head share one timestamp', [*ev, f"comment {tied['id']}"])
     if pause and (latest_at is None or stamp(pause['updated_at']) > latest_at):
         return record('coderabbit', 'settled', 'reviews paused on this PR', [*ev, f"pause in comment {pause['id']}"], None, 'paused')
-    if by_status:
-        # Its notice may be edited a second before the status (#138): one after the head event with no other
-        # CodeRabbit status or run between them is the status's too.
-        before = [stamp(x['updated_at']) for x in statuses if x.get('context') == 'CodeRabbit' and x is not s and stamp(x['updated_at']) < s_at]
-        floor = max([t for t in (event_at and stamp(event_at), run_at, *before) if t], default=None)
-        paired = [c for c in rate if stamp(c['updated_at']) >= s_at or (floor is not None and stamp(c['updated_at']) > floor)]
+    if by_status or by_run:
+        # Its notice may be edited a second before the status or run (#138, #336): one after the head event with no
+        # other CodeRabbit status or run between them is the limit's too.
+        at = s_at if by_status else run_at
+        dated = [stamp(x['updated_at']) for x in statuses if x.get('context') == 'CodeRabbit'] + \
+            [stamp(x.get('completed_at') or x.get('started_at')) for x in checks if x.get('name') == 'CodeRabbit']
+        floor = max([t for t in (event_at and stamp(event_at), *(t for t in dated if t and t < at)) if t], default=None)
+        paired = [c for c in rate if stamp(c['updated_at']) >= at or (floor is not None and stamp(c['updated_at']) > floor)]
         notice, why = newest_reading(paired, 'updated_at', retry_at)
-        return limited_record(s.get('description'), notice, why, ev, head)
+        reason = s.get('description') if by_status else f"check run: {(run_.get('output') or {}).get('title')}"
+        return limited_record(reason, notice, why, ev, head, at)
     # A notice last touched before a status or run on the head is superseded, and an edited
     # one last touched before the head event is about an older push; any other edit hides when it was posted.
     rate = [c for c in rate if latest_at is None or stamp(c['updated_at']) > latest_at]
@@ -211,11 +216,15 @@ def coderabbit(head, statuses, checks, issue, event_at):
     return record('coderabbit', 'absent', 'no status and no check run on the head')
 
 
-def limited_record(reason, notice, why, ev, sha):
+def limited_record(reason, notice, why, ev, sha, limited_at=None):
     """CodeRabbit settled as rate-limited, with the notice's reset time, or an hour after the notice when it gives no
-    countdown (#138), none when its countdown does not read; `why` says why the notices give none."""
+    countdown (#138), or after the limiting status or run (limited_at) when no notice is paired with it; none when a
+    countdown does not read; `why` says why the notices give none."""
     at = None if why else retry_at(notice)
-    if not at and notice and not why:
+    if not at and not notice and not why and limited_at:
+        at = (limited_at + ESTIMATED_RESET).strftime('%Y-%m-%dT%H:%M:%SZ')
+        reason += '; no notice, reset estimated an hour after the limit'
+    elif not at and notice and not why:
         if CR_COUNTDOWN.search(notice.get('body') or ''):
             reason += '; its countdown did not read, no reset time'
         else:
@@ -250,6 +259,8 @@ def coderabbit_run(run_, ev, head, stickies):
         return record('coderabbit', 'reviewed', 'check run completed', ev, head)
     if run_['status'] == 'completed' and run_.get('conclusion') in ('failure', 'cancelled', 'timed_out'):
         return record('coderabbit', 'settled', f"check run {run_['conclusion']}", ev, head, 'failed')
+    if rate_run(run_):
+        return record('coderabbit', 'settled', f"check run: {(run_.get('output') or {}).get('title')}", ev, head, 'limited')
     title = ((run_.get('output') or {}).get('title') or '').strip()
     if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped' and title.lower().startswith('review skipped'):
         # A check run gives no skip reason: the summary comment tells a manual-review skip, read as its status says it, from any other.
@@ -257,6 +268,12 @@ def coderabbit_run(run_, ev, head, stickies):
         return record('coderabbit', 'settled', f'Review skipped: manual review required (check run; {why})' if why else f'check run skipped: {title}',
                       ev, head, 'skipped')
     return record('coderabbit', 'unknown', f"check run {run_['status']}/{run_.get('conclusion')} is not one this reads", ev)
+
+
+def rate_run(run_):
+    """CodeRabbit's check run for a rate-limited head (#336): completed neutral, titled as the rate-limit status reads."""
+    return run_['status'] == 'completed' and run_.get('conclusion') == 'neutral' and \
+        ((run_.get('output') or {}).get('title') or '').strip().lower().startswith(CR_RATE_STATUS)
 
 
 def manual_only(stickies):
@@ -272,7 +289,7 @@ def manual_only(stickies):
 
 def greptile(head, checks, issue, reviews, event_at, now=None):
     runs = [c for c in checks if (c.get('app') or {}).get('slug') == greptile_check.APP and c.get('name') == greptile_check.CHECK]
-    r, unordered = latest_run(runs)
+    r, unordered = latest_run(runs, title=True)
     if unordered:
         return record('greptile', 'unknown', unordered)
     refusals = []

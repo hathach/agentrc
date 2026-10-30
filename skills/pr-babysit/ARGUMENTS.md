@@ -25,7 +25,8 @@ A key not listed here throws before anything runs.
   not a review: a pass lists each reviewer whose state was read and is not a
   review of the head in `unreviewed`. Only a trigger switch makes one required.
 - `maxCycles`: cycle ceiling, default 16, counting a cycle that only waited on
-  CI or bots; a resumed launch defaults to its state's.
+  CI or bots, but not one that only waited out a CodeRabbit rate limit under
+  `coderabbitTrigger`; a resumed launch defaults to its state's.
 - `autoPush` (default false, a dry run: fixes left uncommitted, nothing posted)
   and `markSonar` (needs `autoPush` and `SONAR_TOKEN`: marks the SonarCloud
   issue behind a refuted code-scanning comment, or a fixed one SonarCloud still
@@ -35,21 +36,25 @@ A key not listed here throws before anything runs.
   repository below its open-source threshold). Once per head, ticks
   the "Trigger review" box of CodeRabbit's summary comment when the head was
   skipped that way, then waits for the review up to the silent-bot cap. Once
-  per head too, it comments `@coderabbitai review` instead: when that tick
+  per head too, it comments `@coderabbitai review` instead when that tick
   failed (a summary with no box to tick, a failed edit), unless the box reads
-  ticked or such a comment follows the head event, or when CodeRabbit is
-  rate-limited with a reset time under an hour away, after napping until the
-  reset (a limit notice has no box); then it waits the same way. A request that
-  failed before its post, so posted nothing, is tried once more, one that may
-  have posted is not. A tick that failed before this fallback existed, recorded
-  in a state, still gets its one comment from a relaunch. The first launch with
-  the switch latches the run, as `greptileTrigger` does: every later head needs
-  CodeRabbit's review, a launch without the switch waits on an earlier ask and
-  asks nothing, and a head left unreviewed (a failed tick and request, no review
-  within the cap, a skip or limit with nothing more to ask) stops
-  `coderabbit-unreviewed`, never a pass. That stop, and any other with
-  CodeRabbit's last reading of the head no review, returns `coderabbitAsk`:
-  the asks made on the head and the one a relaunch would still make, if any.
+  ticked or such a comment follows the head event. A rate limit leaves no box:
+  several PRs share the repository's hourly quota, so the launch waits the
+  limit out with no ceiling and never stops for it, commenting
+  `@coderabbitai review` once per reset window, a minute past the later of the
+  reset (an hour after it first saw the limit when no reset reads) and an hour
+  after its last attempt, then waiting for the review up to the cap. A request that
+  failed before its post, so posted nothing, is tried once more; one that may
+  have posted waits for the next window. A tick that failed before this
+  fallback existed, recorded in a state, still gets its one comment from a
+  relaunch. The first launch with the switch latches the run, as
+  `greptileTrigger` does: every later head needs CodeRabbit's review, a launch
+  without the switch waits on an earlier ask and asks nothing, and a head left
+  unreviewed (a failed tick and request, no review within the cap, a skip with
+  nothing more to ask) stops `coderabbit-unreviewed`, never a pass. That stop,
+  and any other with CodeRabbit's last reading of the head no review, returns
+  `coderabbitAsk`: the asks made on the head, the one a relaunch would still
+  make, if any, and for a limit `nextAt`, when the next request is due.
   Needs `autoPush` and `coderabbit` in `autoRun`; the switch itself is never
   restored from a state.
 - `greptileTrigger` (boolean, default false): set in the repository's
@@ -62,7 +67,9 @@ A key not listed here throws before anything runs.
   latches the run: its state requires Greptile's review of every later head,
   so a launch without the switch keeps waiting on Greptile, asking nothing. A
   failed, uncertain or ambiguous request, or no review within the cap, stops
-  `greptile-unreviewed`, never a pass. Needs `autoPush` and `greptile` in
+  `greptile-unreviewed`, never a pass. A rate-limited Greptile (its pause
+  notice; the limit is monthly) is not waited for: the pass lists it in
+  `unreviewed`. Needs `autoPush` and `greptile` in
   `reviewers`; the switch itself is never restored from a state.
 - `checkoutDir`: the PR checkout, default the session directory. Dirty `.idea/`
   paths are ignored; any other pre-existing edit refuses the start.
