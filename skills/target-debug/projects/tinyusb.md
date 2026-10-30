@@ -86,10 +86,12 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   priority 0, master's layout, is already late by 6 µs and more.
 - A `LOGGER=rtt` build traps on WCH QingKe (ch32v): the vendored generic lock does (`rtt`, "Buffer modes and locking"),
   so tinyusb needs its own `SEGGER_RTT_LOCK/UNLOCK` there. carried over. tinyusb#4293 added one for `SYSVIEW` builds
-  only, so a `LOGGER=rtt` build without `SYSVIEW` still traps, while one with `SYSVIEW=1..4` gets the QingKe-safe lock:
+  only, so a `LOGGER=rtt` build without `SYSVIEW` still traps, while one with `SYSVIEW=1..4` gets tinyusb's lock:
   `hw/bsp/<family>/sysview_rtt_conf.h` in ch32v20x, ch32v30x and ch583 (brace-scoped save/restore of CSR 0x800),
-  force-included by its `family.cmake` to win the include-guard race against the vendored conf. ch32v10x refuses
-  `SYSVIEW` (masking CSR 0x800 hung its QingKe V3), so every `LOGGER=rtt` build there traps. Tracked in tinyusb#4363.
+  force-included by its `family.cmake` to win the include-guard race against the vendored conf. All three follow the
+  mask with `fence.i` (ch32v20x and ch32v30x since tinyusb#4354), checked in c3193e650.
+  ch32v10x refuses `SYSVIEW`: its QingKe V3A has no `gintenr` (`rtt`), and writing CSR 0x800 hung the board, so every
+  `LOGGER=rtt` build there traps. Tracked in tinyusb#4363.
 
 ## Profiling and trace
 
