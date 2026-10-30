@@ -590,9 +590,14 @@ def log(line):
         print(line, flush=True)
     except UnicodeEncodeError:  # a stdout in a narrower code page; the log below keeps the exact line
         print(line.encode(sys.stdout.encoding, 'backslashreplace').decode(sys.stdout.encoding), flush=True)
+    text = f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n'
+    try:
+        data = text.encode('utf-8', 'surrogateescape')
+    except UnicodeEncodeError:  # a lone surrogate that is no escaped byte, as a Windows name can hold
+        data = text.encode('utf-8', 'backslashreplace')
     LOG.parent.mkdir(parents=True, exist_ok=True)
-    with open(LOG, 'a', encoding='utf-8', errors='surrogateescape') as f:
-        f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
+    with open(LOG, 'ab') as f:
+        f.write(data)
 
 
 def retry(parent, branches):

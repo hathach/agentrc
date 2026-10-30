@@ -409,7 +409,7 @@ class Remove(Rig):
         self.assertEqual(reports[0], [report.name], 'the report is written before git removes the worktree')
         self.assertIn(f'report: {report}', out)
         self.assertIn(f'{self.parent}: git removes it; branch parent goes: on origin', report.read_text())
-        log = (self.reports / 'log').read_text()
+        log = (self.reports / 'log').read_text(encoding='utf-8')
         for line in (f'removed {self.parent}', f'removed {sibling}', 'deleted branch parent', 'deleted branch b'):
             self.assertIn(line, log)
             self.assertIn(line, out)
@@ -426,7 +426,7 @@ class Remove(Rig):
         self.assertTrue((dirty / 'wip.txt').is_file())
         self.assertEqual(sh(self.main, 'branch', '--list', 'parent', 'b'), '')
         self.assertTrue(sh(self.main, 'branch', '--list', 'dirty'))
-        log = (self.reports / 'log').read_text()
+        log = (self.reports / 'log').read_text(encoding='utf-8')
         for line in (f'removed {sibling}', f'kept {dirty}: uncommitted or untracked changes', 'retry: '):
             self.assertIn(line, log)
 
@@ -438,7 +438,7 @@ class Remove(Rig):
         rc, out = self.run_remove('--proceed', self.token(out))
         self.assertCleanupKept(rc, out)
         self.assertTrue(sh(self.main, 'branch', '--list', 'parent'))
-        self.assertIn('kept branch parent', (self.reports / 'log').read_text())
+        self.assertIn('kept branch parent', (self.reports / 'log').read_text(encoding='utf-8'))
 
     def test_something_appearing_at_the_path_during_the_cleanup_is_exit_6_and_cleans_up_nothing(self):
         sibling = self.sibling('b')
@@ -455,7 +455,7 @@ class Remove(Rig):
         self.assertIn(f'worktree_remove: removed {self.parent}, but something appeared at that path again', out)
         self.assertTrue(sibling.is_dir())
         self.assertEqual(self.tips('parent', 'b'), tips)
-        log = (self.reports / 'log').read_text()
+        log = (self.reports / 'log').read_text(encoding='utf-8')
         self.assertIn(f'{self.parent} exists: not touching its children', log)
         self.assertIn('retry: ', log)
 

@@ -213,7 +213,7 @@ class WorktreeChildren(unittest.TestCase):
 
     def logged_retries(self):
         """The retry commands in the log, each split into its arguments."""
-        lines = [line.split(' ', 2)[2] for line in self.log.read_text().splitlines()]
+        lines = [line.split(' ', 2)[2] for line in self.log.read_text(encoding='utf-8').splitlines()]
         return [shlex.split(line.removeprefix('retry: ')) for line in lines if line.startswith('retry: ')]
 
     def gh_calls(self):
@@ -228,7 +228,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertIn(f'kept {child}: ', done.stdout)
         self.assertIn(reason, done.stdout)
         self.assertIn(f'retry: {self.retry()}\n', done.stdout)
-        self.assertIn(f'retry: {self.retry()}\n', self.log.read_text())
+        self.assertIn(f'retry: {self.retry()}\n', self.log.read_text(encoding='utf-8'))
 
     def assert_removed(self, *children):
         done = self.cleanup()
@@ -250,7 +250,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertEqual((self.sentinel / 'keep').read_text(), 'shared target')
         self.assertNotIn(str(child), self.git('worktree', 'list', cwd=self.main))
         self.assertNotIn('retry: ', done.stdout)
-        self.assertIn(f'removed {child}', self.log.read_text())
+        self.assertIn(f'removed {child}', self.log.read_text(encoding='utf-8'))
 
     def test_grandchildren_and_children_of_other_repositories_go_too_and_other_entries_stay(self):
         other = self.repo('other')
@@ -655,7 +655,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertFalse(child.exists())
         self.assertTrue(self.branch_exists('child'))
         self.assertIn(f'kept branch child in {self.main / ".git"}: commits on no origin branch', done.stdout)
-        log = self.log.read_text()
+        log = self.log.read_text(encoding='utf-8')
         retry = ['cleanup', str(self.parent), '--branch', str(self.main / '.git'), 'child', tip]
         self.assertIn(f'its branch is retried by: {self.retry((self.main / ".git", "child", tip))}', log)
         self.assertLess(log.index('its branch is retried by'), log.index(f'removed {child}'))
@@ -1067,7 +1067,7 @@ class WorktreeChildren(unittest.TestCase):
         self.assertFalse(gone.exists() or self.branch_exists('b'))
         self.assertNotIn('kept branch', done.stdout)
         self.assertEqual(self.logged_retries(), [shlex.split(self.retry())])
-        self.assertTrue(self.log.read_text().endswith(f' retry: {self.retry()}\n'))
+        self.assertTrue(self.log.read_text(encoding='utf-8').endswith(f' retry: {self.retry()}\n'))
 
 
 @unittest.skipIf(os.name == 'nt', 'symlinks')
@@ -1179,18 +1179,19 @@ print(locale.getpreferredencoding(False))
 print(json.dumps([os.fsencode(p).decode('utf-8') for p in wc.linked_worktree(sys.argv[2])]))
 '''
 
-# prints the locale encoding, then logs a line holding a non-ASCII name and an undecodable byte
-LOGGED = r'''import importlib.util, locale, os, sys
+# prints the locale encoding, then logs each line JSON-encoded in argv[2:]
+LOGGED = r'''import importlib.util, json, locale, sys
 spec = importlib.util.spec_from_file_location('worktree_children', sys.argv[1])
 wc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wc)
 print(locale.getpreferredencoding(False), flush=True)
-wc.log('kept /r\u00e9--k' + os.fsdecode(b'\xff'))
+for line in sys.argv[2:]:
+    wc.log(json.loads(line))
 '''
 
 
-@unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
 class NonUtf8Locale(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
     def test_a_non_ascii_path_round_trips_whatever_the_locale(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith('GIT_')}
         env.update(HOME=tempfile.gettempdir(), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
@@ -1209,12 +1210,13 @@ class NonUtf8Locale(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(json.loads(answer), [str(main / '.git' / 'worktrees' / 'ré--kid'), str(main / '.git')])
 
+    @unittest.skipIf(os.name == 'nt', 'the C locale stands in for a non-UTF-8 code page')
     def test_a_line_the_locale_cannot_encode_is_printed_and_logged_whole(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {**os.environ, 'XDG_STATE_HOME': tmp, 'LC_ALL': 'C', 'PYTHONCOERCECLOCALE': '0', 'PYTHONUTF8': '0'}
             env.pop('PYTHONIOENCODING', None)
-            done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LOGGED, str(SCRIPT)],
-                                  env=env, capture_output=True)
+            done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LOGGED, str(SCRIPT),
+                                   json.dumps('kept /r\u00e9--k' + os.fsdecode(b'\xff'))], env=env, capture_output=True)
             encoding, _, printed = done.stdout.partition(b'\n')
             if encoding.decode().lower().replace('-', '') == 'utf8':
                 self.skipTest(f'the C locale encoding is {encoding.decode()} here')
@@ -1222,6 +1224,18 @@ class NonUtf8Locale(unittest.TestCase):
             self.assertEqual(printed, b'kept /r\\xe9--k\\udcff\n')
             log = Path(tmp) / 'agentrc' / 'worktree-remove' / 'log'
             self.assertTrue(log.read_bytes().endswith(b' kept /r\xc3\xa9--k\xff\n'))
+
+    def test_a_line_a_narrow_code_page_cannot_encode_is_escaped_and_still_logged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {**os.environ, 'XDG_STATE_HOME': tmp, 'PYTHONIOENCODING': 'cp1252:strict'}
+            done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LOGGED, str(SCRIPT),
+                                   json.dumps('kept /r\u00e9--\u4e2d'), json.dumps('kept /x\ud800y')],
+                                  env=env, capture_output=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout.splitlines()[1:], [b'kept /r\xe9--\\u4e2d', b'kept /x\\ud800y'])
+            log = (Path(tmp) / 'agentrc' / 'worktree-remove' / 'log').read_bytes()
+            self.assertEqual([line.split(b' ', 2)[2] for line in log.split(b'\n')[:-1]],
+                             [b'kept /r\xc3\xa9--\xe4\xb8\xad', b'kept /x\\ud800y'])
 
 
 if __name__ == '__main__':
