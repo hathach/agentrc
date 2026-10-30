@@ -110,10 +110,12 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
 
 ## SystemView
 
-The firmware landed with tinyusb#4293 (190f1ac7a), where the names below were checked. The measurements dated
-2026-10-22 and earlier used the experimental firmware of PR #3880 at 49e49f810. `sysview.md` has the routes and how to
-read the numbers. tinyusb's CI capture takes the RTT streaming route: `hil_test.py --sysview-out` records the raw stream
-on the rig before the board's final park, and `sysview_ci.py decode` decodes it off the rig.
+The firmware landed with tinyusb#4293 (190f1ac7a); the names, diagnostics and routes below were checked at its
+follow-ups, tinyusb#4356 (892f03b9a). 190f1ac7a has `CFG_TUD_SYSVIEW`/`CFG_TUH_SYSVIEW` instead of `CFG_TUSB_SYSVIEW`, a
+CMake warning instead of the FreeRTOS hook's compiler note, and the TMR timestamps on MAX32665/MAX32666 only. The
+measurements dated 2026-10-22 and earlier used the experimental firmware of PR #3880 at 49e49f810. `sysview.md` has the
+routes and how to read the numbers. tinyusb's CI capture takes the RTT streaming route: `hil_test.py --sysview-out`
+records the raw stream on the rig before the board's final park, and `sysview_ci.py decode` decodes it off the rig.
 
 - Build: CMake `-DSYSVIEW=1..4` (1 the USB ISR, 2 adds the `usbd`/`usbh` core, 3 the `dcd`/`hcd` API, 4 the class
   drivers), `-DSYSVIEW_POST_MORTEM=1` on top for the dump route, and `-DSYSVIEW_BUFFER_SIZE`. `make` refuses it. The
@@ -185,11 +187,11 @@ on the rig before the board's final park, and `sysview_ci.py decode` decodes it 
     corrupts half-built packets (wrong function ids, negative timestamp deltas the GUI turns into +0.699 s each).
     Moving the IRQ to priority 1 removed every corrupt packet. The PRIMASK lock (tinyusb#4294) fixes it at any
     priority: 0 corrupt rows in three 4 MHz captures, 2026-10-29.
-- max32650 and max32690 take the same TMR timestamp route (`hw/bsp/maxim/sysview_max32_tmr.h`): their user guides do
-  not document the DWT cycle counter. Build-verified only; on hardware, still to check: `board_init` completing
-  (max32690's MSDK timer init waits on clock-ready and write-done without a bound), the counter's progress and rate,
-  max32690's carry between its cascaded 16-bit halves, the full rollover, and decoded captures under USB and FreeRTOS
-  load.
+- max32650 and max32690 take the same TMR timestamp route (`hw/bsp/maxim/sysview_max32_tmr.h`) from tinyusb#4356
+  (8bfefdc83): their user guides do not document the DWT cycle counter. Build-verified only; on hardware, still to
+  check: `board_init` completing (max32690's MSDK timer init waits on clock-ready and write-done without a bound), the
+  counter's progress and rate, max32690's carry between its cascaded 16-bit halves, the full rollover, and decoded
+  captures under USB and FreeRTOS load.
 - stm32f407disco `cdc_msc_freertos` at level 4 produces about 50k events/s under the CDC burst, more than an RTT read
   drains (tinyusb#4351, 2026-10-29, 64 KiB buffer): OpenOCD at its 2 MHz SWD clock delivered 58-67 KB/s and lost 79 %
   of the events, and J-Link firmware on the on-board ST-LINK at 4 MHz lost 61 %. OpenOCD's 1024-byte RTT read per poll
