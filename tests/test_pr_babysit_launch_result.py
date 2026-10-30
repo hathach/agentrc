@@ -296,6 +296,8 @@ class LaunchResultTest(unittest.TestCase):
                 ({'relaunchAsks': 'request', 'asked': [{'ask': 'request', 'at': None, 'requests': 1}], 'nextAt': '2026-10-23T03:08:00Z'},
                  'next after 2026-10-23T03:08:00Z (1 request attempt on this head so far)'),
                 ({'relaunchAsks': 'request', 'asked': [], 'nextAt': '2026-10-23T02:08:00Z'}, 'next after 2026-10-23T02:08:00Z'),
+                ({'relaunchAsks': 'request', 'asked': [], 'nextAt': None}, 'it is rate-limited, and a launch with coderabbitTrigger waits it out, '
+                 'commenting `@coderabbitai review` once per reset window, next once a launch dates the limit'),
                 ({'relaunchAsks': 'request', 'asked': [{'ask': 'tick', 'at': None}], 'retryAt': None},
                  'no tick asked for its review: a relaunch with coderabbitTrigger comments `@coderabbitai review` once')):
             with self.subTest(ask):

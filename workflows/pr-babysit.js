@@ -346,6 +346,8 @@ let repo = args.repo ?? stateRepo
 const maxCycles = args.maxCycles ?? (restored ? restored.maxCycles : 16)
 if (restored && restored.maxCycles !== maxCycles) log(`cycle ceiling changed since the last launch: ${restored.maxCycles} → ${maxCycles}, ${restored.cyclesUsed} used`)
 let cyclesUsed = restored ? restored.cyclesUsed : 0
+// Whether a cycle after this one is still within the charged budget.
+const budgetLeft = () => cyclesUsed + 1 < maxCycles
 let lastCycle = restored ? restored.lastCycle ?? cyclesUsed : 0
 const adoptHead = args.adoptHead === undefined || args.adoptHead === null ? null : args.adoptHead
 if (adoptHead !== null) {
@@ -2005,13 +2007,18 @@ const coderabbitAskable = (cr, clock) => {
 }
 const requestTried = (clock) => clock.request.tried ?? clock.request.at ?? clock.since
 const requestCount = (clock) => clock.requests ?? (clock.request ? 1 : 0)
-// A minute past the later of the reset (an hour after the limit was first seen when none reads) and an hour after the last
-// attempt: an edited countdown never shortens the window. Whole seconds, as coderabbit_trigger.py reads them.
+// CodeRabbit's quota window: harvest.py's ESTIMATED_RESET; the margin is coderabbit_trigger.py's MARGIN.
+const HOUR_MS = 60 * 60000
+const RESET_MARGIN_MS = 60000
+// A margin past the later of the reset (an hour after the limit was first seen when none reads) and an hour after the last
+// attempt: an edited countdown never shortens the window.
 const requestDeadline = (cr, clock) => {
-  const own = cr.retryAt ? Date.parse(cr.retryAt) : Date.parse(clock.limitSeen ?? clock.since) + 60 * 60000
-  const last = clock.request ? Date.parse(requestTried(clock)) + 60 * 60000 : -Infinity
-  return new Date(Math.max(own, last) + 60000).toISOString().replace(/\.\d{3}Z$/, 'Z')
+  const own = cr.retryAt ? Date.parse(cr.retryAt) : Date.parse(clock.limitSeen ?? clock.since) + HOUR_MS
+  const last = clock.request ? Date.parse(requestTried(clock)) + HOUR_MS : -Infinity
+  return Math.max(own, last) + RESET_MARGIN_MS
 }
+// Whole seconds, as coderabbit_trigger.py reads them.
+const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 const triggerCodeRabbit = async (cycle, r, bots, ended) => {
   const cr = bots.bots.find(b => b.bot === 'coderabbit')
   if (!coderabbitRequired || !cr) return
@@ -2024,7 +2031,7 @@ const triggerCodeRabbit = async (cycle, r, bots, ended) => {
     // notSkipped waits too: a review that started since the harvest, or a newer head, is for the next harvest to read.
     reviewClock.triggeredAt = outcome === 'failed' ? null : Number.isFinite(Date.parse(t.at)) ? t.at : r.observedAt
   }
-  if (cr.state === 'settled' && cr.kind === 'limited') return requestCodeRabbit(cycle, r, cr, ended)
+  if (limited(cr)) return requestCodeRabbit(cycle, r, cr, ended)
   if (manual) await requestCodeRabbit(cycle, r, cr, ended)
   // Waits like a queued bot, its cap counted from the latest ask; working and reviewed go by settleBots alone. Any skip after
   // the ask is waited on too: the skip asked about may read otherwise once its box is ticked.
@@ -2073,7 +2080,9 @@ const coderabbitAskOf = (cr) => {
   const asked = [...(clock.triggeredAt !== undefined ? [{ ask: 'tick', at: clock.triggeredAt }] : []),
     ...(clock.request ? [{ ask: 'request', at: clock.request.at, requests: requestCount(clock) }] : [])]
   const relaunchAsks = coderabbitAskable(cr, clock)
-  return { relaunchAsks, asked, ...(limited(cr) ? { nextAt: requestDeadline(cr, clock) }
+  // A limit always reports nextAt, null when no clock of this head dates it.
+  const next = limited(cr) ? requestDeadline(cr, clock) : NaN
+  return { relaunchAsks, asked, ...(limited(cr) ? { nextAt: Number.isFinite(next) ? isoSeconds(next) : null }
     : relaunchAsks === 'request' ? { retryAt: cr.retryAt } : {}) }
 }
 const waitAfter = (cr, askedAt, observedAt) => {
@@ -2083,7 +2092,7 @@ const waitAfter = (cr, askedAt, observedAt) => {
 const retryLater = (cr, ms) => {
   cr.done = false
   // Never under a minute: a reset just behind the clock would otherwise run the next cycle at once.
-  cr.retryWaitMs = Math.min(Math.max(60000, ms), 60 * 60000)
+  cr.retryWaitMs = Math.min(Math.max(60000, ms), HOUR_MS)
 }
 const requestCodeRabbit = async (cycle, r, cr, ended) => {
   const asked = reviewClock.request
@@ -2095,25 +2104,25 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   if (!coderabbitTrigger || coderabbitAskable(cr, reviewClock) !== 'request') return
   const deadline = quota ? requestDeadline(cr, reviewClock) : null
   const observed = Date.parse(r.observedAt)
-  if (quota && Date.parse(deadline) > observed) {
+  if (quota && deadline > observed) {
     const cap = asked ? Date.parse(requestTried(reviewClock)) + REVIEW_CAP_MIN * 60000 : 0
     if (cap > observed && asked.at !== null) waitAfter(cr, asked.at, r.observedAt)
-    return retryLater(cr, Math.min(Date.parse(deadline), cap > observed ? cap : Infinity) - observed)
+    return retryLater(cr, Math.min(deadline, cap > observed ? cap : Infinity) - observed)
   }
   if (await ended('crrequest')) return
-  const why = cr.kind === 'limited' ? 'after its rate limit' : 'that it skipped for a manual review'
+  const why = limited(cr) ? 'after its rate limit' : 'that it skipped for a manual review'
   const { t, outcome } = await relayTrigger(cycle, 'crrequest', CRTRIGGER_SCRIPT, `Ask CodeRabbit to review PR #${args.pr} ${why}`,
-    ` --request${quota ? ` --not-before ${shq(deadline)}` : ''}`, ['requested', 'already', 'notDue', 'notLimited', 'failed', 'uncertain'])
+    ` --request${quota ? ` --not-before ${shq(isoSeconds(deadline))}` : ''}`, ['requested', 'already', 'notDue', 'notLimited', 'failed'])
   // A failure before the POST gets one retry (#276); a possibly posted attempt waits for the next window.
   if (outcome === 'failed' && t && t.phase === 'read' && !reviewClock.requestUnposted) {
     reviewClock.requestUnposted = true
-    if (quota || cyclesUsed + 1 < maxCycles) retryLater(cr, 60000)
+    if (quota || budgetLeft()) retryLater(cr, 60000)
     return
   }
   const atOk = !!t && Number.isFinite(Date.parse(t.at))
   const reset = t && Number.isFinite(Date.parse(t.retryAt)) ? t.retryAt : null
   if (outcome === 'notDue' && reset && atOk) {
-    return retryLater(cr, Math.max(Date.parse(reset) + 60000, quota ? Date.parse(deadline) : 0) - Date.parse(t.at))
+    return retryLater(cr, Math.max(Date.parse(reset) + RESET_MARGIN_MS, quota ? deadline : 0) - Date.parse(t.at))
   }
   // notLimited waits too: what changed since the harvest is for the next harvest to read.
   if (quota && outcome === 'notLimited') { cr.done = false; return }
@@ -2122,8 +2131,7 @@ const requestCodeRabbit = async (cycle, r, cr, ended) => {
   reviewClock.request = { at: asking ? t.at : null, retryAt: reset ?? cr.retryAt, tried: atOk ? t.at : r.observedAt }
   delete reviewClock.requestUnposted
   if (asking) waitAfter(cr, t.at, r.observedAt)
-  if (quota) retryLater(cr, asking ? REVIEW_CAP_MIN * 60000
-    : Date.parse(requestDeadline(cr, reviewClock)) - Date.parse(reviewClock.request.tried))
+  if (quota) retryLater(cr, asking ? REVIEW_CAP_MIN * 60000 : requestDeadline(cr, reviewClock) - Date.parse(reviewClock.request.tried))
 }
 
 // A Greptile that reviews only on PR open never sees a pushed head unasked: under greptileTrigger, one `@greptileai` per
@@ -3064,7 +3072,7 @@ const runLanes = async (cycle, entry, lanes) => {
         }
         // Another cycle cannot answer a comment handed to the caller, or one held for the caller's decision: stop rather than burn the budget waiting.
         const progressing = owedNow.filter(id => !handedOff(id) && !callerHeld(id))
-        if (cyclesUsed + 1 < maxCycles && progressing.length) {
+        if (budgetLeft() && progressing.length) {
           log(`cycle ${cycle}: ${acceptedOnly(c) ? 'CI red only from accepted failures' : 'PR green'} but ${owedNow.length} comment(s) still owed an answer — re-arming`)
           napMs = backoff(cycle)
           return rearm()
@@ -3133,9 +3141,9 @@ const runLanes = async (cycle, entry, lanes) => {
         log(`cycle ${cycle}: auto-review unreadable, unchanged for ${REVIEW_CAP_MIN}m or more (${who}) — stopping`)
         return stop(cycle, 'reviews-stuck', { head: expectedHead, bots: pendingBots.map(botOut) })
       }
-      if (cyclesUsed + 1 < maxCycles || quotaPending(pendingBots)) {
+      if (budgetLeft() || quotaPending(pendingBots)) {
         log(`cycle ${cycle}: auto-review still pending (${who}) — re-arming after a wait`)
-        napMs = quotaPending(pendingBots) && pendingBots[0].retryWaitMs !== undefined ? pendingBots[0].retryWaitMs
+        napMs = quotaPending(pendingBots) ? pendingBots[0].retryWaitMs
           : Math.max(backoff(cycle), ...pendingBots.map(b => b.retryWaitMs ?? 0))
       } else {
         log(`cycle ${cycle}: auto-review still pending (${who}) — cycle budget exhausted`)

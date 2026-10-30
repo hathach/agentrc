@@ -260,7 +260,7 @@ def coderabbit_run(run_, ev, head, stickies):
     if run_['status'] == 'completed' and run_.get('conclusion') in ('failure', 'cancelled', 'timed_out'):
         return record('coderabbit', 'settled', f"check run {run_['conclusion']}", ev, head, 'failed')
     if rate_run(run_):
-        return record('coderabbit', 'settled', 'check run: Review rate limited', ev, head, 'limited')
+        return record('coderabbit', 'settled', f"check run: {(run_.get('output') or {}).get('title')}", ev, head, 'limited')
     title = ((run_.get('output') or {}).get('title') or '').strip()
     if run_['status'] == 'completed' and run_.get('conclusion') == 'skipped' and title.lower().startswith('review skipped'):
         # A check run gives no skip reason: the summary comment tells a manual-review skip, read as its status says it, from any other.

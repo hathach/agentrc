@@ -169,12 +169,15 @@ def unasked(repo, pr, head, not_before=None):
     if seen['headSha'] != head or (cr['state'], cr['kind']) != ('settled', 'limited'):
         return {'outcome': 'notLimited', 'detail': f"{state_of(cr)} on {seen['headSha'][:9]}: {cr['reason']}"}, None
     reset = {'retryAt': cr['retryAt']}
-    starts = [stamp(x) for x in (cr['retryAt'], not_before) if x]
-    due = [stamp(cr['retryAt']) + MARGIN] if cr['retryAt'] else []
-    if not starts or max(due + starts) > stamp(seen['observedAt']):
+    reset_at, caller = stamp(cr['retryAt']), not_before and stamp(not_before)
+    if not reset_at and not caller:
+        return {'outcome': 'notDue', 'detail': cr['reason'], **reset}, None
+    # Posted only a margin past the reset; a request at or after the reset already counts.
+    window = max(t for t in (reset_at, caller) if t)
+    if max(t for t in (reset_at and reset_at + MARGIN, caller) if t) > stamp(seen['observedAt']):
         return {'outcome': 'notDue', 'detail': cr['reason'], **reset}, None
     asked = [c for c in pages(f'repos/{{owner}}/{{repo}}/issues/{pr}/comments')
-             if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= max(starts)]
+             if (c.get('body') or '').strip() == REQUEST and stamp(c['created_at']) >= window]
     if asked:
         return on_comment('already', asked[0], at=asked[0]['created_at'], **reset), None
     # The reads above take a while: a PR closed or pushed meanwhile is not asked about.

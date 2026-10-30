@@ -7481,11 +7481,10 @@ test('a newer refusal waits for its own reset and an hour after the last attempt
   }
 })
 
-test('failed or uncertain requests wait a full window, neither duplicated immediately nor stopped', async () => {
+test('failed or lost requests wait a full window, neither duplicated immediately nor stopped', async () => {
   for (const crRequest of [
     { outcome: 'failed', detail: 'post failed', phase: 'post' },
     { outcome: 'failed', detail: 'unknown phase' },
-    { outcome: 'uncertain', detail: 'lost readback', commentId: 99 },
     { outcome: 'notDue', detail: 'no reset', retryAt: null },
     { outcome: 'failed', detail: 'no timestamp', at: 'invalid' },
     null,
@@ -7540,8 +7539,7 @@ test('a pre-POST read failure gets one retry per attempt, including across launc
 
 test('a possibly posted request keeps its hourly floor when the reset moves across a resume', async () => {
   const args = { coderabbitTrigger: true, maxCycles: 1, yieldAfterCycle: true }
-  for (const crRequest of [{ outcome: 'failed', detail: 'post failed', phase: 'post' },
-    { outcome: 'uncertain', detail: 'lost readback', commentId: 99 }]) {
+  for (const crRequest of [{ outcome: 'failed', detail: 'post failed', phase: 'post' }, null]) {
     for (const reset of [10, 25, 100]) {
       const a = await run({ args, clockOffset: 21, crRequest, reviews: quiet([limitedCr(at(20))]) })
       assert.deepEqual(a.result.state.reviewClock.request, { at: null, retryAt: at(20), tried: at(21) })
@@ -7549,7 +7547,7 @@ test('a possibly posted request keeps its hourly floor when the reset moves acro
       let state = a.result.state
       for (const minute of [32, 81, due - 1 / 60]) {
         const b = await run({ args: { ...args, state }, clockOffset: minute, reviews: quiet([limitedCr(at(reset))]) })
-        assert.equal(b.result.reason, 'yielded', `${crRequest.outcome}, reset ${reset}, minute ${minute}`)
+        assert.equal(b.result.reason, 'yielded', `${crRequest ? crRequest.outcome : "lost"}, reset ${reset}, minute ${minute}`)
         assert.deepEqual(requests(b.labels), [], 'neither a changed countdown nor the last second permits another request')
         assert.equal(b.result.state.cyclesUsed, 0)
         assert.equal(b.result.state.reviewClock.requests, 1)
