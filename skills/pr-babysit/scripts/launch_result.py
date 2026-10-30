@@ -395,7 +395,7 @@ def summarize(output, output_path, state_ref=None, tree=None, keys=False):
         for h in result.get('handoffs') or []:
             blockers.append(f"comment {h.get('commentId')} is the caller's to answer (chief's reply takeover rule), then to settle through replySettlements: {cut(h.get('why') or '')}"
                             + (f"; draft: {cut(h['draft'])}" if h.get('draft') else '')
-                            + (f"; the user's rejudge request: {cut(h['rejudge'].get('reason') or '')}" if isinstance(h.get('rejudge'), dict) else '')
+                            + (f"; rejudge requested: {cut(h['rejudge'].get('reason') or '')}" if isinstance(h.get('rejudge'), dict) else '')
                             + (f"; {unsettled.pop(h.get('commentId'))}" if h.get('commentId') in unsettled else ''))
         blockers += [f'comment {c}: {why}' for c, why in unsettled.items()]
         if result.get('unreviewed'):

@@ -156,9 +156,10 @@ A key not listed here throws before anything runs.
   candidate, the state is re-pinned to it unaudited, keeping cycles used,
   answers, decisions, holds and deferrals; passed only on the user's word,
   never with `adoptHead`; per launch.
-- `rejudge`: `[{ commentId, reason }]`: answered comments the user named for
-  the caller to judge again, such as replies citing code a rewrite dropped,
-  resolved threads included; passed only on the user's word. Each must have
+- `rejudge`: `[{ commentId, reason }]`: answered comments for the caller to
+  judge again, such as replies citing code a rewrite dropped, resolved threads
+  included; passed on the user's word, or under chief's rule for a reply of
+  ours it has evidence is stale or wrong. Each must have
   an answer of ours in the state. It is handed off, `rejudge: { reason }` on
   the handoff beside any repair or edit, and stays so across launches until a
   `replySettlements` entry settles the comment; omit it once settled, since

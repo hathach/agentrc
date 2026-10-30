@@ -119,11 +119,11 @@ const settlementShaped = (s) => s && typeof s === 'object' && [s.commentId, s.re
 if (!Array.isArray(settlementsArg) || !settlementsArg.every(settlementShaped) || new Set(settlementsArg.map(s => s.commentId)).size !== settlementsArg.length) {
   throw new Error('replySettlements must be [{ commentId, commentDigest, replyId, bodyDigest, headSha: the full SHA its answer was judged at, sonar?: { how: refutation|fixNote, note: the reply body bodyDigest digests } }], one per comment')
 }
-// Answered comments the user named for the caller to judge again (a rewrite dropped the code our reply cites, say).
+// Answered comments for the caller to judge again (a rewrite dropped the code our reply cites, say).
 const rejudgeArg = args.rejudge ?? []
 if (!Array.isArray(rejudgeArg) || !rejudgeArg.every(x => x && Number.isInteger(x.commentId) && x.commentId > 0 && typeof x.reason === 'string' && x.reason.trim()) ||
   new Set(rejudgeArg.map(x => x.commentId)).size !== rejudgeArg.length) {
-  throw new Error('rejudge must be [{ commentId, reason }], one per comment the user named')
+  throw new Error('rejudge must be [{ commentId, reason }], one per answered comment')
 }
 const pathRe = (name) => {
   if (args[name] === undefined || args[name] === null) return null
@@ -1147,7 +1147,7 @@ const handoffWhy = (commentId) => {
   return d && d.edited ? 'edited after its finding ids were carried'
     : reanswer.has(commentId) ? 'edited after we answered it'
     : d && d.repair ? `${d.repair.replyId ? `reply ${d.repair.replyId}: ` : ''}${d.repair.error}`
-    : d && d.rejudge ? `the user asked to judge our answer again: ${d.rejudge.reason}`
+    : d && d.rejudge ? `our answer is to be judged again: ${d.rejudge.reason}`
     : null
 }
 const handedOff = (commentId) => !!handoffWhy(commentId)

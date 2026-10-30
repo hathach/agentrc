@@ -62,7 +62,7 @@ and `--receipt` replay.
   on that reply only when someone judged the body `--inspect` returned to
   answer every point the comment is owed now: `--reuse` with the digests from
   that inspection reads both again, posts nothing and resolves the thread.
-  A reply your task's own recorded attempt posted may instead be put right
+  A reply of ours the caller's grant lets it correct is instead put right
   with `--edit`, the offered body or an evidence-backed correction of it, and
   the same inspection's digests: it reads both again, edits only that reply,
   reads it back and resolves the thread. Otherwise it stays for the caller.
