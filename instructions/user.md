@@ -222,7 +222,8 @@ Bias toward caution over speed. For trivial tasks, use judgment.
   bare `claude -p --agent chief`, even where a repo recipe names one.
 - Standing grant: on a PR I asked `pr-review` to review, its `post.py` may
   create a pending review and later resolve our own threads whose reply I
-  submitted; submitting any review stays mine.
+  submitted; submitting any review stays mine, unless that request names
+  auto-post, which grants `post.py --auto` that one review.
 - Fixing a review bot's finding outside `pr-babysit`: work from the bot's
   original feedback, not a relay, with its AI fix prompt (Greptile `Prompt
   To Fix With AI`, CodeRabbit `🤖 Prompt for AI Agents`) when it has one, and
