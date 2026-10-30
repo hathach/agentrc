@@ -76,12 +76,20 @@ symptoms point to, hypotheses with the check that discriminates, not verdicts. c
   to `printf` locally. `cdc_msc` never polls the console: keystrokes sent to it prove nothing — read the down-buffer's
   `WrOff` over the probe instead (went 5 → 8 for 3 bytes, verified 2026-09-18 fad6bd546 raspberry_pi_pico). carried over
   otherwise; `board_getchar` checked in fad6bd546.
+- Cortex-M `SYSVIEW` and `LOGGER=rtt` builds with GCC or Clang lock RTT with PRIMASK (`hw/bsp/rtt_conf_cortexm.h`,
+  force-included, from tinyusb#4356), not the vendored BASEPRI lock, which a USB IRQ at priority 0 slips past; other
+  compilers and other cores keep the vendored lock (WCH: next bullet). A priority-0 ISR printing against the main loop
+  corrupted 27 and 29 lines in 60 s under BASEPRI, 0 and 0 under PRIMASK; verified 2026-10-30 18400f951 stm32f407disco.
+  Separate `cdc_msc` `LOGGER=rtt` runs without `SYSVIEW` (2026-10-30) peaked at 2.3 µs priority-0 entry latency under
+  PRIMASK, against 0.29 µs under BASEPRI. Cost with `SYSVIEW` on the same board (2026-10-29): sampled priority-0
+  interrupt entry latency up to 2.6 µs, against 0.27 µs under BASEPRI; an untraced build whose USB IRQ shares that
+  priority 0, master's layout, is already late by 6 µs and more.
 - A `LOGGER=rtt` build traps on WCH QingKe (ch32v): the vendored generic lock does (`rtt`, "Buffer modes and locking"),
   so tinyusb needs its own `SEGGER_RTT_LOCK/UNLOCK` there. carried over. tinyusb#4293 added one for `SYSVIEW` builds
   only, so a `LOGGER=rtt` build without `SYSVIEW` still traps, while one with `SYSVIEW=1..4` gets the QingKe-safe lock:
   `hw/bsp/<family>/sysview_rtt_conf.h` in ch32v20x, ch32v30x and ch583 (brace-scoped save/restore of CSR 0x800),
   force-included by its `family.cmake` to win the include-guard race against the vendored conf. ch32v10x refuses
-  `SYSVIEW` (masking CSR 0x800 hung its QingKe V3), so every `LOGGER=rtt` build there traps.
+  `SYSVIEW` (masking CSR 0x800 hung its QingKe V3), so every `LOGGER=rtt` build there traps. Tracked in tinyusb#4363.
 
 ## Profiling and trace
 
@@ -134,11 +142,7 @@ records the raw stream on the rig before the board's final park, and `sysview_ci
 - Buffer: RAM-rich families default `SYSVIEW_BUFFER_SIZE` to 65536, the rest to 4096. At 4096 mimxrt1064_evk lost
   96.7% of its ISR exits at ~109 Hz; at 65536 stm32h743nucleo and raspberry_pi_pico lost nothing in a 15 s CDC burst
   over OpenOCD while feather_nrf52840_express, on an OpenOCD-over-J-Link path, lost in 73 bursts.
-- Cortex-M `SYSVIEW` builds with GCC or Clang lock RTT and SystemView with PRIMASK (`hw/bsp/sysview_rtt_conf_cortexm.h`,
-  force-included), not the vendored BASEPRI lock, which a USB IRQ at priority 0 slipped past; `LOGGER=rtt` builds
-  without `SYSVIEW` and other compilers keep the vendored lock. Cost on stm32f407disco (2026-10-29): sampled
-  priority-0 interrupt entry latency up to 2.6 µs, against 0.27 µs under BASEPRI; an untraced build whose USB IRQ
-  shares that priority 0, master's layout, is already late by 6 µs and more.
+- RTT and SystemView share one lock: PRIMASK on Cortex-M with GCC or Clang ("Logs and RTT").
 - `cdc_msc_freertos`'s 1024-byte task stacks overflowed during enumeration at level 4; the example raises them under
   `BOARD_STACK_INSTRUMENTED` (`CFG_TUSB_DEBUG || CFG_TUSB_SYSVIEW`). `SYSVIEW_RAM_BASE` defaults to `0x20000000`;
   families whose SRAM starts elsewhere (lpc11/13/15/17/18/40/43, kinetis_k, kinetis_kl) set `SYSVIEW_RAM_BASE_DEFAULT`
