@@ -55,8 +55,8 @@ The ref is deleted against its recorded id (`update-ref -d`), then its `branch.<
 Each action is printed and appended to ${XDG_STATE_HOME:-~/.local/state}/agentrc/worktree-remove/log,
 each branch's retry arguments before its checkout is removed and the retry command after anything
 kept. A retry is refused (exit 2) from a working directory inside a child, or with this file or the
-log inside one. Exit 0 every child and branch removed (or none found), 1 something kept or a
-removal failed, 2 bad input or a parent that exists again.
+log inside or reached through one. Exit 0 every child and branch removed (or none found), 1 something
+kept or a removal failed, 2 bad input or a parent that exists again.
 """
 import functools
 import json
@@ -151,9 +151,10 @@ def common_dir(gitdir):
 
 
 def walk(top):
-    """Top-down os.walk (symlinks listed, not entered) that also yields each directory's symlink names,
-    and keeps the child on an entry it cannot list or classify, a symlink whose target cannot be read
-    included: os.walk and os.path.isdir file an entry whose stat fails as a non-directory."""
+    """Top-down os.walk (symlinks and Windows junctions listed, not entered) that also yields each
+    directory's symlink and junction names, and keeps the child on an entry it cannot list or classify,
+    a symlink whose target cannot be read included: os.walk and os.path.isdir file an entry whose stat
+    fails as a non-directory."""
     stack = [top]
     while stack:
         top = stack.pop()
@@ -162,9 +163,10 @@ def walk(top):
             with os.scandir(top) as listing:
                 for entry in listing:
                     try:
-                        if entry.is_symlink():
+                        link = entry.is_symlink() or entry.is_junction()  # is_symlink() is False for a junction
+                        if link:
                             links.append(entry.name)
-                        if entry.is_dir(follow_symlinks=False):
+                        if entry.is_dir(follow_symlinks=False) and not link:
                             real.add(entry.name)
                         elif not entry.is_dir():  # a dangling link is a file; a looping one raises
                             files.append(entry.name)
@@ -585,16 +587,19 @@ def remove(child, common, force):
         raise Keep(f'`git worktree remove` failed, possibly part way: {done.stderr.strip()}')
 
 
+def stored(text):
+    """text as the log and reports keep it: UTF-8 in the platform's line ends, each byte os.fsdecode
+    escaped restored and any other lone surrogate, as a Windows name can hold, backslash-escaped."""
+    text = re.sub('[\ud800-\udc7f\udd00-\udfff]', lambda m: f'\\u{ord(m[0]):04x}', text)
+    return text.replace('\n', os.linesep).encode('utf-8', 'surrogateescape')
+
+
 def log(line):
     try:
         print(line, flush=True)
     except UnicodeEncodeError:  # a stdout in a narrower code page; the log below keeps the exact line
         print(line.encode(sys.stdout.encoding, 'backslashreplace').decode(sys.stdout.encoding), flush=True)
-    text = f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n'
-    try:
-        data = text.encode('utf-8', 'surrogateescape')
-    except UnicodeEncodeError:  # a lone surrogate that is no escaped byte, as a Windows name can hold
-        data = text.encode('utf-8', 'backslashreplace')
+    data = stored(f'{time.strftime("%Y-%m-%d %H:%M:%S")} {line}\n')
     LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(LOG, 'ab') as f:
         f.write(data)
@@ -681,14 +686,19 @@ def cleanup(parent, branches=()):
 
 def outside(trees, extra=()):
     """Why a run that may remove trees cannot run here, or None: the working directory (git cannot close
-    the sessions in a tree it removes), this module, the log or an extra (what, path) lies inside one."""
+    the sessions in a tree it removes), this module, the log or an extra (what, path) lies inside one or
+    is reached through one (link_hops), as a log under a symlink in a removed tree would be."""
     try:
         here = os.getcwd()
     except OSError as why:
         return f'cannot read the working directory: {why}; run this from an existing one'
     for what, path in (('the working directory', here), ('worktree_children', __file__), ('the log', LOG), *extra):
+        try:
+            hops = [path, *link_hops(path)]
+        except OSError as why:
+            return f'cannot resolve {what} {path}: {why}'
         for tree in trees:
-            if is_within(path, [tree]):
+            if any(is_within(hop, [tree]) for hop in hops):
                 return f'{what} {path} lies inside {tree}; run this from outside it'
     return None
 

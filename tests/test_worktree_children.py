@@ -1155,6 +1155,16 @@ class LinkHops(unittest.TestCase):
         self.assertEqual(self.wc.removal_plan([clean], [kept]),
                          ([], {clean: 'parent--z, which stays, links into it'}))
 
+    @unittest.skipUnless(os.name == 'nt', 'Windows junctions')
+    def test_a_kept_siblings_junction_keeps_the_clean_sibling_it_reaches(self):
+        import _winapi
+        kept, clean = self.t / 'parent--z', self.t / 'parent--b'
+        for tree in (kept, clean / 'lib'):
+            tree.mkdir(parents=True)
+        _winapi.CreateJunction(str(clean / 'lib'), str(kept / 'dep'))
+        self.assertEqual(self.wc.removal_plan([clean], [kept]),
+                         ([], {clean: 'parent--z, which stays, links into it'}))
+
     @unittest.skipUnless(os.name == 'nt', 'Windows path forms')
     def test_windows_targets_are_anchored_on_their_own_drive(self):
         anchored = self.wc.anchored
@@ -1229,13 +1239,15 @@ class NonUtf8Locale(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             env = {**os.environ, 'XDG_STATE_HOME': tmp, 'PYTHONIOENCODING': 'cp1252:strict'}
             done = subprocess.run([sys.executable, '-X', 'utf8=0', '-c', LOGGED, str(SCRIPT),
-                                   json.dumps('kept /r\u00e9--\u4e2d'), json.dumps('kept /x\ud800y')],
+                                   json.dumps('kept /r\u00e9--\u4e2d'), json.dumps('kept /x\ud800y'),
+                                   json.dumps('kept /m\udcff\ud800')],
                                   env=env, capture_output=True)
             self.assertEqual(done.returncode, 0, done.stderr)
-            self.assertEqual(done.stdout.splitlines()[1:], [b'kept /r\xe9--\\u4e2d', b'kept /x\\ud800y'])
+            self.assertEqual(done.stdout.splitlines()[1:],
+                             [b'kept /r\xe9--\\u4e2d', b'kept /x\\ud800y', b'kept /m\\udcff\\ud800'])
             log = (Path(tmp) / 'agentrc' / 'worktree-remove' / 'log').read_bytes()
-            self.assertEqual([line.split(b' ', 2)[2] for line in log.split(b'\n')[:-1]],
-                             [b'kept /r\xc3\xa9--\xe4\xb8\xad', b'kept /x\\ud800y'])
+            self.assertEqual([line.split(b' ', 2)[2] for line in log.split(os.linesep.encode())[:-1]],
+                             [b'kept /r\xc3\xa9--\xe4\xb8\xad', b'kept /x\\ud800y', b'kept /m\xff\\ud800'])
 
 
 if __name__ == '__main__':

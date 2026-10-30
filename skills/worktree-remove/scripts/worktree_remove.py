@@ -10,9 +10,9 @@ with its code, gates on pending work, writes a report and removes, last.
 
 Refused (exit 3), nothing changed:
 - PATH is a primary checkout or no linked worktree;
-- the working directory, this script, the module, the report directory or the log lies inside PATH
-  or any sibling, a kept one included (run it from outside them, naming PATH): git cannot close the
-  sessions in it; checked before anything else;
+- the working directory, this script, the module, the report directory or the log lies inside, or
+  is reached through, PATH or any sibling, a kept one included (run it from outside them, naming
+  PATH): git cannot close the sessions in it; checked before anything else;
 - PATH fails the module's content check, the one each sibling gets (its docstring lists them);
   a chief session in PATH, headless or interactive and the caller's own included, refuses it: a
   chief cannot remove its own worktree, so the human runs this from a plain session;
@@ -239,7 +239,7 @@ def main(argv=None):
         return 3
     out = wc.LOG.parent / f'{stamp}-{p["root"].name}.md'
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(report(p, f'worktree-remove {p["root"].name}, {stamp}'))
+    out.write_bytes(wc.stored(report(p, f'worktree-remove {p["root"].name}, {stamp}')))
     print(f'report: {out}', flush=True)
     return remove(p)
 
@@ -266,4 +266,5 @@ def remove(p):
 
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(errors='backslashreplace')  # a narrow code page must not stop a removal part way
     sys.exit(main())

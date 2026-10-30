@@ -155,6 +155,17 @@ class Remove(Rig):
         with mock.patch.object(wr.wc, 'LOG', state / 'log'):
             self.assertRefused(f'the log {state / "log"} lies inside {self.parent}')
 
+    @posix
+    def test_a_log_under_a_link_in_the_worktree_out_of_it_is_refused(self):
+        elsewhere = self.t / 'elsewhere'
+        elsewhere.mkdir()
+        (self.parent / 'build').mkdir()
+        (self.parent / 'build' / 'state').symlink_to(elsewhere)  # git would delete the link, the log recreate it
+        log = self.parent / 'build' / 'state' / 'log'
+        unchecked = mock.patch.object(wr.wc, 'content_check', side_effect=AssertionError('content_check ran'))
+        with unchecked, mock.patch.object(wr.wc, 'LOG', log):
+            self.assertRefused(f'the log {log} lies inside {self.parent}; run this from outside it')
+
     def test_the_inside_refusal_comes_before_any_content_check(self):
         here = os.getcwd()
         self.addCleanup(os.chdir, here)
@@ -458,6 +469,21 @@ class Remove(Rig):
         log = (self.reports / 'log').read_text(encoding='utf-8')
         self.assertIn(f'{self.parent} exists: not touching its children', log)
         self.assertIn('retry: ', log)
+
+    def test_a_worktree_name_a_narrow_code_page_cannot_encode_is_removed(self):
+        self.parent = self.wt / 'parent-\u4e2d'
+        sh(self.main, 'worktree', 'add', '-q', str(self.parent), '-b', 'zh')
+        sh(self.parent, 'push', '-q', 'origin', 'zh')
+        # cp1252 stands in for a Windows code page; the C locale makes the POSIX default encoding narrow too
+        env = {**os.environ, 'PYTHONIOENCODING': 'cp1252:strict', 'LC_ALL': 'C', 'PYTHONCOERCECLOCALE': '0',
+               'PYTHONUTF8': '0'}
+        done = subprocess.run([sys.executable, '-X', 'utf8=0', str(SCRIPT), str(self.parent)], env=env,
+                              capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertFalse(self.parent.exists())
+        self.assertIn(b'report: ', done.stdout)
+        [report] = self.reports.glob('*.md')
+        self.assertIn(f'{self.parent}: git removes it', report.read_text(encoding='utf-8'))
 
     def test_a_herdr_on_path_or_in_the_environment_is_never_asked(self):
         asked = self.t / 'herdr-asked'
