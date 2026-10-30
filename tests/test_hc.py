@@ -183,6 +183,37 @@ class ReadTest(StubbedHc):
             hc.read('t7', timeout=5)
 
 
+class ProgramTest(StubbedHc):
+    @unittest.skipUnless(os.name == 'nt', 'CreateProcess tries the working directory before PATH')
+    def test_an_hc_in_the_working_directory_is_never_run(self):
+        checkout, empty = self.dir / 'checkout', self.dir / 'empty'
+        checkout.mkdir()
+        empty.mkdir()
+        make_stub(checkout, 'hc', STUB)
+        cwd = os.getcwd()
+        os.chdir(checkout)
+        self.addCleanup(os.chdir, cwd)
+        with mock.patch.dict('os.environ', {'PATH': os.pathsep.join(['', '.', str(empty)])}):
+            os.environ.pop('NoDefaultCurrentDirectoryInExePath', None)
+            self.assertEqual(hc.run('ls', timeout=5)[::2], (None, 'spawn_failed'))
+            with self.assertRaisesRegex(hc.Error, 'did not start'):
+                hc.read('t7', timeout=5)
+        self.assertFalse(self.log.exists(), 'the checkout-local hc ran')
+
+    def test_hc_on_path_is_run_by_its_path_on_windows_and_by_name_elsewhere(self):
+        if os.name != 'nt':
+            self.assertEqual(hc.program(), 'hc')
+            return
+        self.assertEqual(Path(hc.program()), self.dir / 'bin' / 'hc.exe')
+
+    def test_a_missing_hc_reads_as_not_started(self):
+        with mock.patch.object(hc, 'program', return_value=None), \
+             mock.patch.object(hc.subprocess, 'run', side_effect=AssertionError('a bare name was launched')):
+            self.assertEqual(hc.run('ls', timeout=5)[::2], (None, 'spawn_failed'))
+            with self.assertRaisesRegex(hc.Error, 'hc read did not start'):
+                hc.read('t7', timeout=5)
+
+
 class ProcessTest(unittest.TestCase):
     def test_is_local(self):
         self.assertEqual([hc.is_local(a) for a in ('t7', 'ci/t3', '', None)], [True, False, False, False])

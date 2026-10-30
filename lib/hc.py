@@ -13,6 +13,8 @@ import os
 import subprocess
 import sys
 
+import windows
+
 NOT_FOUND = 3   # hc's exit code for an unknown terminal
 # hc send error kinds raised before anything is typed, and a failure to start hc at all. Anything else, a timeout
 # and a success that does not say the program started working, may have typed: uncertain.
@@ -33,14 +35,23 @@ class Unverified(Exception):
     process is not one of this process's ancestors."""
 
 
+def program():
+    """hc to launch: 'hc', or on Windows the hc.exe PATH alone finds, never one in the working directory, which
+    CreateProcess tries first; None when there is none."""
+    return windows.on_path('hc', ('.exe',)) if os.name == 'nt' else 'hc'
+
+
 def run(*args, timeout, caller=None):
     """(exit status, parsed stdout or None, error kind or None, message) of `hc args`; exit None with kind 'timeout'
     past the deadline, or 'spawn_failed' when hc did not start (not on PATH, an argument past the OS limit). caller,
     a verified terminal address, is passed as HC_TERMINAL_ID, which hc takes as the caller (the rest of the
     environment as is): a shell that dropped it, as Codex's tool shells do, would otherwise send untagged."""
     env = {**os.environ, 'HC_TERMINAL_ID': caller} if caller else None
+    exe = program()
+    if exe is None:
+        return None, None, 'spawn_failed', f'hc {args[0]} did not start: no hc.exe on PATH'
     try:
-        out = subprocess.run(['hc', *args], capture_output=True, text=True, encoding='utf-8', errors='replace',
+        out = subprocess.run([exe, *args], capture_output=True, text=True, encoding='utf-8', errors='replace',
                              timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return None, None, 'timeout', f'hc {args[0]} gave no answer within {timeout} s'
@@ -89,8 +100,11 @@ def terminals(*, timeout):
 
 def read(address, *, timeout, lines=None):
     """`hc read`: the terminal's screen and history as plain text, unaltered."""
+    exe = program()
+    if exe is None:
+        raise Error('hc read did not start: no hc.exe on PATH')
     try:
-        out = subprocess.run(['hc', 'read', *(['--lines', str(lines)] if lines else []), '--', address],
+        out = subprocess.run([exe, 'read', *(['--lines', str(lines)] if lines else []), '--', address],
                              capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout)
     except subprocess.TimeoutExpired:
         raise Error(f'hc read {address} gave no answer within {timeout} s') from None
