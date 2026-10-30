@@ -615,7 +615,7 @@ def cleanup(parent, branches=()):
             log(f'kept branch {branch[1]} in {branch[0]}: {parent} exists')
         log(f'retry: {retry(parent, branches)}')
         return 2
-    kept, kept_branches, unsettled = [], [], []
+    kept, unsettled = [], []
 
     def keep(child, why):
         kept.append((child.name, str(why)))
@@ -670,14 +670,13 @@ def cleanup(parent, branches=()):
                 raise Keep(f'{parent} exists again')
             log(f'deleted branch {branch[1]} in {branch[0]}: {delete_branch(*branch)}')
         except (Keep, OSError) as why:
-            kept_branches.append((branch[1], str(why)))
             unsettled.append(branch)
             log(f'kept branch {branch[1]} in {branch[0]}: {why}')
     if unsettled:
         log(f'retry: {retry(parent, unsettled)}')
     elif kept or stopped:
         log(f'retry: {retry(parent, [])}')
-    return 2 if stopped else 1 if kept or kept_branches else 0
+    return 2 if stopped else 1 if kept or unsettled else 0
 
 
 def outside(trees, extra=()):
